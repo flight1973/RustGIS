@@ -23,7 +23,7 @@ RUN rustup target add wasm32-unknown-unknown
 
 # The Trunk release web-deploy.yml and docs-preview.yml pin (keep them in step), for the build
 # machine, checksum-verified. The steps are chained with &&, so a wrong checksum stops the build
-# in any shell (Podman, for one, ignores SHELL).
+# in any shell (older Podman ignores SHELL).
 ARG BUILDARCH
 RUN case "$BUILDARCH" in \
       amd64) arch=x86_64; sum=f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b ;; \
