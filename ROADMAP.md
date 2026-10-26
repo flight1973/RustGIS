@@ -155,7 +155,6 @@ built-in version must justify itself on one of those.
   only used by tests ([#557](https://github.com/opengeos/RustGIS/issues/557)).
 - A catalog of data cubes for the time slider
   ([#683](https://github.com/opengeos/RustGIS/issues/683)).
-- A Dockerfile for self-hosting the web app.
 - Rebindable keyboard shortcuts ([#562](https://github.com/opengeos/RustGIS/issues/562)).
 
 ## Exploratory
@@ -176,9 +175,9 @@ Open questions rather than plans; discuss before building.
   Data Source for layers and tile archives ([#879](https://github.com/opengeos/RustGIS/issues/879)).
 - Layered workspace, command registry with undo, project files (`.rgis`), `rustgis-cli`, the
   web app (WebAssembly, installable with offline start, opened with a project or data by its
-  web address), 18 interface languages; a ribbon laid out in the order of the work (Home, Data,
-  Style, Edit, Analyze, View, Publish), start-up preferences, Check for Updates, autosave and
-  crash recovery in the desktop app.
+  web address, self-hostable with the `Dockerfile`), 18 interface languages; a ribbon laid out in
+  the order of the work (Home, Data, Style, Edit, Analyze, View, Publish), start-up preferences,
+  Check for Updates, autosave and crash recovery in the desktop app.
 - Data: files by their web address; GeoJSON, CSV/TSV (x/y in any EPSG system, or WKT), Excel
   and OpenDocument spreadsheets, GeoRSS, LandXML, encoded polylines, Shapefile (zipped too,
   with the coordinate system in its `.prj`), GeoPackage, GeoParquet, FlatGeobuf, KML/KMZ

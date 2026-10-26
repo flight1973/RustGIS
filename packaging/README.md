@@ -2,7 +2,9 @@
 
 `package.sh` builds the release files for one platform (see its header); the Release workflow
 runs it on every platform and attaches the files to the GitHub Release. `downloads/` is the
-[downloads.rustgis.app](https://downloads.rustgis.app) site.
+[downloads.rustgis.app](https://downloads.rustgis.app) site. `docker/` holds the nginx
+configuration of the `Dockerfile` at the repository root, which builds the web app into an image
+to host yourself (see [Installation](../docs/installation.md#self-host-the-web-app-with-docker)).
 
 ## Package managers
 

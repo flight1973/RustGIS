@@ -128,9 +128,10 @@ project, so `m.undo()` undoes only what Python did since.
 
 The app is the [web app](installation.md), loaded from https://web.rustgis.app, so the
 notebook needs to be online. `Map(url=...)` or the `RUSTGIS_WEB_URL` environment variable points
-it at another copy (a self-hosted one, or `trunk serve` in `apps/rustgis-web`). Settings you
-change in the widget last until the cell is run again: an embedded app keeps nothing in the
-browser.
+it at another copy (a self-hosted one, such as one built with the
+[Dockerfile](installation.md#self-host-the-web-app-with-docker), or `trunk serve` in
+`apps/rustgis-web`). Settings you change in the widget last until the cell is run again: an
+embedded app keeps nothing in the browser.
 
 The project, with the data that travels with it, goes to that app through the browser
 (`postMessage`); nothing goes to a server. The app runs in your browser, so with the default

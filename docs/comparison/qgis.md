@@ -153,7 +153,7 @@ The same World Atlas data, styled the same way, in each app.
 | **Scripting** | Engine commands: CLI, Python package, notebooks, Script pane, MCP; UI-only commands stay in the app | PyQGIS, `qgis_process`, Python console |
 | **Plugins** | Sandboxed WebAssembly; unsandboxed desktop/CLI process and Python plugins; registry | Python, thousands in the official repository |
 | **AI** | Built-in assistant using engine commands and project undo; MCP server | Through plugins |
-| **Server and mobile** | Static web build you can host | QGIS Server; QField and Mergin Maps |
+| **Server and mobile** | Static web build or Dockerfile you can host | QGIS Server; QField and Mergin Maps |
 | **Project file** | `.rgis` (open JSON) | `.qgs` / `.qgz` (open XML) |
 
 ## RustGIS for QGIS users

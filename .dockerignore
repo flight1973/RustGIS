@@ -1,0 +1,16 @@
+# Kept out of the Dockerfile's build context: build output, local state and secrets. The Dockerfile
+# itself is read separately, so leaving it out means editing it doesn't rebuild the app.
+/target
+/dist
+/site
+/plan
+/private
+# Every dot-file and dot-folder at the root (.git, .github, editors' and tools' local state) but
+# .cargo, which holds the `cargo xtask` alias the build uses; and .env files at any depth.
+/.*
+!/.cargo
+**/.env
+**/.env.*
+**/__pycache__
+**/.DS_Store
+Dockerfile

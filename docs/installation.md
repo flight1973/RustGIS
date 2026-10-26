@@ -206,6 +206,34 @@ cargo xtask web-pwa ../../dist/web   # add the service worker (offline start), a
 The service worker is left out of `trunk serve`, so a development build is never served from a
 stale cache.
 
+### Self-host the web app with Docker
+
+The `Dockerfile` at the root of the repository builds the web app the way the deploy does and
+serves it with nginx, so you need only [Docker](https://docs.docker.com/get-docker/):
+
+```sh
+docker build -t rustgis-web .
+docker run --rm -p 8080:8080 rustgis-web   # http://localhost:8080
+```
+
+The image holds only the built files and runs nginx as a non-root user on port 8080. Its pages
+check for a newer build on every load, so the app's new-version notice offers the next image you
+deploy. Unlike web.rustgis.app, it carries no analytics. Put it behind a reverse proxy that
+serves HTTPS: browsers install the app and start its service worker only over HTTPS (or on
+`localhost`). The app's addresses are relative, so the proxy can also serve it under a path,
+such as `https://example.com/rustgis/`, passing requests on without the path. Signing in to
+ArcGIS from your copy needs an OAuth app of your own whose redirect URLs list the copy's
+`oauth-callback.html`, as RustGIS's own app accepts only web.rustgis.app's (see
+[Secured ArcGIS services](user-guide/data-formats.md#secured-arcgis-services)).
+
+The image is for the platform of the machine that builds it. To build it for another, such as
+on an Apple silicon Mac for an x86-64 server, add `--platform linux/amd64` to `docker build`.
+With a builder that can build several platforms (one made by `docker buildx create --use`, or
+Docker Desktop's containerd image store),
+`docker buildx build --platform linux/amd64,linux/arm64 -t <registry>/rustgis-web --push .`
+publishes one image for both. The app itself is WebAssembly, so it is compiled once, on the
+machine that builds it, whichever platforms the image is for.
+
 ## Fonts
 
 RustGIS uses an installed sans-serif when it finds one (Segoe UI, San Francisco, Arial, Inter,

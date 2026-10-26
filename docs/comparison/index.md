@@ -106,7 +106,7 @@ machine; remote features, such as web data and AI providers, send requests over 
 | **Plugins** | Permission-controlled WebAssembly plugins on desktop, CLI and web; unsandboxed process/Python plugins on desktop and CLI; a registry, custom ribbon tabs and panels, assistant skills | TypeScript plugin API, a registry | **Largest**: thousands of Python plugins | .NET add-ins, Python toolboxes | App templates |
 | **AI assistant** | Acts through engine commands, with undo for project edits; Anthropic, OpenAI, Gemini, OpenRouter, Ollama or any OpenAI-compatible model; bring your own key or sign in with ChatGPT; also on the command line; MCP for external agents | Natural-language assistant with undoable operations; bring your own key | Via plugins | Copilot features | AI assistants |
 | **Collaboration** | — | Real-time (MVP), review comments | No | No | Shared hosted layers |
-| **Self-hosting** | Serve the static web build anywhere | Docker image or static build | QGIS Server | ArcGIS Enterprise (paid) | — |
+| **Self-hosting** | Dockerfile or static build of the web app | Docker image or static build | QGIS Server | ArcGIS Enterprise (paid) | — |
 
 ## Where each one is the right choice
 
