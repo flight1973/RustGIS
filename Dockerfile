@@ -6,16 +6,17 @@
 #   docker build -t rustgis-web .
 #   docker run --rm -p 8080:8080 rustgis-web     # http://localhost:8080
 #
-# It builds as .github/workflows/web-deploy.yml does, without the analytics tag that only the
-# official deploy adds, and with relative addresses (as the docs preview's build), so it can also
-# be served under a path. Dependabot keeps the base images current.
+# It builds as .github/workflows/web-deploy.yml does, with three differences: no analytics tag
+# (only the official deploy adds one), relative addresses (as the docs preview's build) so it can
+# also be served under a path, and --locked, so it uses exactly Cargo.lock's versions.
+# Dependabot keeps the base images current.
 
 # The app is WebAssembly, the same on every platform, so it is built once on the build machine's
 # own platform, also when the image is for another (`--platform linux/amd64,linux/arm64`).
 FROM --platform=$BUILDPLATFORM rust:1.99.1-slim@sha256:1a939748a7cbab172de91a014e3804a97af1394a8c844faa67fce9401c4e40fb AS build
 
-# clang compiles the Zstandard decoder in rustgis-data to WebAssembly; curl downloads Trunk and
-# the Natural Earth sample data that crates/render/build.rs embeds.
+# clang compiles the Zstandard decoder in rustgis-data to WebAssembly; curl downloads Trunk, and
+# crates/render/build.rs uses curl to fetch the Natural Earth sample data it embeds.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates clang curl \
     && rm -rf /var/lib/apt/lists/*
@@ -28,7 +29,7 @@ ARG BUILDARCH
 RUN case "$BUILDARCH" in \
       amd64) arch=x86_64; sum=f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b ;; \
       arm64) arch=aarch64; sum=b1d8e60e454f7fc182d9a4d95d1506ffbae947d8ba90f8f6f02da93b60f980f9 ;; \
-      *) echo "no Trunk release for $BUILDARCH" >&2; exit 1 ;; \
+      *) echo "no Trunk release for BUILDARCH='$BUILDARCH' (BuildKit sets it)" >&2; exit 1 ;; \
     esac \
     && curl -sSfL -o /tmp/trunk.tar.gz "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-${arch}-unknown-linux-gnu.tar.gz" \
     && echo "${sum}  /tmp/trunk.tar.gz" > /tmp/trunk.sha256 \
