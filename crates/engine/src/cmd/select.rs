@@ -142,8 +142,7 @@ pub fn set(s: &mut Session, id: u32, rows: Vec<usize>, m: Mode) {
         Mode::Remove => l.selection.retain(|r| !rows.contains(r)),
         Mode::Subset => l.selection.retain(|r| rows.contains(r)),
     }
-    l.selection.sort_unstable();
-    l.selection.dedup();
+    l.normalize_selection();
 }
 
 fn by_attributes(s: &mut Session, p: &Value) -> CmdResult {

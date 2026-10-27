@@ -159,6 +159,16 @@ fn a_saved_selection_is_read_in_range_in_order_and_once() {
     let p = Project::from_json(&v.to_string()).unwrap();
     let countries = p.map().layers.iter().find(|l| l.name == "Countries").unwrap();
     assert_eq!(countries.selection, [1, 3]);
+    // An offline area's snapshot, edited the same way, opens with the selection put right too.
+    let mut s = world();
+    s.run("offline.download", &json!({"name": "Paris", "extent": [1.0, 48.0, 4.0, 50.0]})).unwrap();
+    let cities = s.project.offline_areas[0].data.layers.iter_mut().find(|l| l.name == "Cities").unwrap();
+    let last = cities.dataset.features.len() - 1;
+    cities.selection = vec![last, 0, last, last + 1];
+    s.run("offline.open", &json!({"name": "Paris"})).unwrap();
+    let mut want = vec![0, last];
+    want.dedup();
+    assert_eq!(s.map().layer_by_name("Cities").unwrap().selection, want);
 }
 
 #[test]

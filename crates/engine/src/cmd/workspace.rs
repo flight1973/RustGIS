@@ -219,6 +219,10 @@ pub fn commands() -> Vec<C> {
             } else {
                 let mut m = a.data.clone();
                 m.name = map_name;
+                // The snapshot was read from the project file as it was written.
+                for l in &mut m.layers {
+                    l.normalize_selection();
+                }
                 s.project.maps.push(m);
                 s.project.active_map = s.project.maps.len() - 1;
             }

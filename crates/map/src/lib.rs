@@ -697,6 +697,16 @@ impl Layer {
         self.geometry_rev = self.geometry_rev.wrapping_add(1);
     }
 
+    /// Keeps the selection as selecting makes it: rows in range, in order, each once. A selection
+    /// read from a file is put this way too, or a row repeated in it would be counted, and run,
+    /// twice.
+    pub fn normalize_selection(&mut self) {
+        let n = self.dataset.features.len();
+        self.selection.retain(|r| *r < n);
+        self.selection.sort_unstable();
+        self.selection.dedup();
+    }
+
     /// Whether the layer draws at a scale denominator.
     pub fn in_scale_range(&self, scale: f64) -> bool {
         self.min_scale.is_none_or(|m| scale <= m) && self.max_scale.is_none_or(|m| scale >= m)
