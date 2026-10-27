@@ -219,7 +219,8 @@ pub fn commands() -> Vec<C> {
             } else {
                 let mut m = a.data.clone();
                 m.name = map_name;
-                // The snapshot was read from the project file as it was written.
+                // Reading a project checks only maps' layers, not offline snapshots', so their
+                // selections are put right here.
                 for l in &mut m.layers {
                     l.normalize_selection();
                 }
