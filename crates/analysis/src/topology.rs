@@ -3,7 +3,7 @@
 
 use geo::{Area, BooleanOps, BoundingRect, Contains, Intersects, Orient, orient::Direction};
 use rustgis_data::{Dataset, Geometry};
-use rustgis_geom::{Coord, lonlat_to_plane, plane_to_lonlat};
+use rustgis_geom::{Coord, MAX_LAT, POLE_TOLERANCE, lonlat_to_plane, plane_to_lonlat};
 
 use crate::convert::{from_multipolygon, to_multipolygon};
 
@@ -228,15 +228,22 @@ pub fn dangles(ds: &Dataset, rows: &[usize], tol_m: f64) -> Checked {
             _ => None,
         })
         .collect();
-    let mut ext = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    for c in lines.iter().flat_map(|(_, ps)| ps.iter().flatten()) {
-        ext = (ext.0.min(c.x), ext.1.min(c.y), ext.2.max(c.x), ext.3.max(c.y));
-    }
     // Tolerance in Mercator metres grows with latitude; index with the largest it can be here.
-    // That's at 85° within Web Mercator's square, and as far poleward as lines beyond it reach (#1033).
-    let poleward = plane_to_lonlat(Coord::new(0.0, ext.1)).y.abs().max(plane_to_lonlat(Coord::new(0.0, ext.3)).y.abs());
-    let widest = if poleward > rustgis_geom::MAX_LAT { poleward } else { 85.0 };
-    let max_tol = tol_m / widest.to_radians().cos().max(0.01);
+    let max_tol = tol_m / 85f64.to_radians().cos();
+    // The parts reaching each pole (#1033): an end at a pole meets any other part reaching it,
+    // however far off in the plane, where a pole is a line.
+    let pole_y = |lat: f64| lonlat_to_plane(Coord::new(0.0, lat)).y;
+    let (north, south) = (pole_y(90.0 - POLE_TOLERANCE), pole_y(-90.0 + POLE_TOLERANCE));
+    let (mut at_north, mut at_south) = (0usize, 0usize);
+    let mut ext = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for part in lines.iter().flat_map(|(_, ps)| ps) {
+        let (mut n, mut s) = (false, false);
+        for c in part {
+            ext = (ext.0.min(c.x), ext.1.min(c.y), ext.2.max(c.x), ext.3.max(c.y));
+            (n, s) = (n || c.y >= north, s || c.y <= south);
+        }
+        (at_north, at_south) = (at_north + usize::from(n), at_south + usize::from(s));
+    }
     let span = (ext.2 - ext.0).max(ext.3 - ext.1).max(1.0);
     let cell = (span / 512.0).max(max_tol.min(span)).max(1e-6);
     let key = |x: f64, y: f64| (((x - ext.0) / cell).floor() as i64, ((y - ext.1) / cell).floor() as i64);
@@ -272,21 +279,30 @@ pub fn dangles(ds: &Dataset, rows: &[usize], tol_m: f64) -> Checked {
                 continue;
             }
             for end in [part.first(), part.last()].into_iter().flatten() {
-                let tol = tol_m / plane_to_lonlat(*end).y.to_radians().cos().max(0.01);
-                let near = grid.get(&key(end.x, end.y)).map(Vec::as_slice).unwrap_or(&[]);
+                let lat = plane_to_lonlat(*end).y;
+                let tol = tol_m / lat.to_radians().cos().max(0.01);
                 // The end's own part counts too, past the stretch next to the end (a line curling
                 // back onto itself, like a 6, doesn't dangle there).
                 let at_start = part.first() == Some(end);
                 let own_rest = rest_of_part(part, at_start, 2.0 * tol);
-                let touches = !own_rest.is_empty() && rustgis_data::geometry::seg_dist2(&own_rest, *end) <= tol * tol
-                    || near.iter().any(|&(oli, opi)| {
-                        work += 1;
-                        (oli != li || opi != pi)
-                            && lines
-                                .get(oli)
-                                .and_then(|(_, ps)| ps.get(opi))
-                                .is_some_and(|op| op.len() >= 2 && rustgis_data::geometry::seg_dist2(op, *end) <= tol * tol)
-                    });
+                let mut meets = |oli: usize, opi: usize| {
+                    work += 1;
+                    (oli != li || opi != pi)
+                        && lines
+                            .get(oli)
+                            .and_then(|(_, ps)| ps.get(opi))
+                            .is_some_and(|op| op.len() >= 2 && rustgis_data::geometry::seg_dist2(op, *end) <= tol * tol)
+                };
+                let touches = (end.y >= north && at_north > 1)
+                    || (end.y <= south && at_south > 1)
+                    || !own_rest.is_empty() && rustgis_data::geometry::seg_dist2(&own_rest, *end) <= tol * tol
+                    || if lat.abs() > MAX_LAT {
+                        // Beyond Web Mercator's square an end's tolerance outgrows the index's
+                        // widening (#1033): every part is looked at.
+                        lines.iter().enumerate().any(|(oli, (_, ps))| (0..ps.len()).any(|opi| meets(oli, opi)))
+                    } else {
+                        grid.get(&key(end.x, end.y)).is_some_and(|near| near.iter().any(|&(oli, opi)| meets(oli, opi)))
+                    };
                 if work > MAX_WORK {
                     return Checked::partial(out);
                 }

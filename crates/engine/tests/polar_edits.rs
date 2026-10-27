@@ -105,6 +105,38 @@ fn polar_neighbors_moved_together_still_share_their_corners() {
     let (a, b) = (ring_of(&s, id, 0), ring_of(&s, id, 1));
     // The first's east side is the second's west side, vertex for vertex.
     assert!(a[1] == b[0] && a[2] == b[3], "{a:?} {b:?}");
+    // And after a move clear over the pole, to the other side of it.
+    s.run("edit.move", &json!({"dx": 0.0, "dy": -500.0, "units": "Kilometers"})).unwrap();
+    let (a, b) = (ring_of(&s, id, 0), ring_of(&s, id, 1));
+    assert!(a[1] == b[0] && a[2] == b[3], "{a:?} {b:?}");
+}
+
+#[test]
+fn a_polygon_moved_over_a_pole_keeps_its_hole_inside() {
+    let c = Coord::new;
+    // Around 0°E from 87°S to 89°S, the shell starting west of 0°E and the hole east of it: over
+    // the pole they land around 180°, where a ring left to itself could take either side.
+    let shell = vec![c(-5.0, -89.0), c(5.0, -89.0), c(5.0, -87.0), c(-5.0, -87.0), c(-5.0, -89.0)];
+    let hole = vec![c(1.0, -88.5), c(1.0, -87.5), c(-1.0, -87.5), c(-1.0, -88.5), c(1.0, -88.5)];
+    let (mut s, id) = layer(GeometryType::Polygon, vec![Geometry::Polygon(vec![vec![shell, hole]])]);
+    s.run("edit.move", &json!({"dx": 0.0, "dy": -500.0, "units": "Kilometers"})).unwrap();
+    let Some(Geometry::Polygon(p)) = &s.map().layer(id).unwrap().dataset.features[0].geometry else { panic!() };
+    let span = |r: &[Coord]| r.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c.x), hi.max(c.x)));
+    let ((slo, shi), (hlo, hhi)) = (span(&p[0][0]), span(&p[0][1]));
+    assert!(slo < hlo && hhi < shi && shi - slo < 20.0, "{p:?}");
+}
+
+#[test]
+fn a_point_moved_from_84_degrees_over_the_pole_lands_beyond_it() {
+    // 1,000 km north of 84°N, on the ground: over the pole (666 km) and 334 km down 180°.
+    let start = Coord::new(0.0, 84.0);
+    let (mut s, id) = layer(GeometryType::Point, vec![Geometry::Point(start)]);
+    s.run("edit.move", &json!({"dx": 0.0, "dy": 1000.0, "units": "Kilometers"})).unwrap();
+    let Some(Geometry::Point(p)) = &s.map().layer(id).unwrap().dataset.features[0].geometry else { panic!() };
+    assert!(
+        (wgs84_distance_m(start, *p) - 1_000_000.0).abs() < 1.0 && (p.x.abs() - 180.0).abs() < 1e-6 && (p.y - 87.0).abs() < 0.05,
+        "{p:?}"
+    );
 }
 
 #[test]

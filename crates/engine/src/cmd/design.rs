@@ -3,7 +3,10 @@
 //! Corrections. Every feature edit goes through [`apply`], which enforces the layer's design.
 
 use rustgis_data::{Feature, FieldType, Geometry, GeometryType, Value};
-use rustgis_geom::{Aeqd, Coord, MAX_LAT, POLE_TOLERANCE, SphericalMean, lonlat_to_merc, lonlat_to_plane, merc_to_lonlat, plane_to_lonlat};
+use rustgis_geom::{
+    Aeqd, Coord, Extent, MAX_LAT, POLE_TOLERANCE, SphericalMean, extent_to_merc, lonlat_to_merc, lonlat_to_plane, merc_to_lonlat,
+    plane_to_lonlat,
+};
 use rustgis_map::design::{
     AttributeRule, ContingentSet, Domain, DomainKind, Elevation, FeatureTemplate, Relationship, RuleKind, Subtype, Subtypes, TopologyRule,
 };
@@ -310,9 +313,9 @@ pub fn commands() -> Vec<C> {
             if !(dx.is_finite() && dy.is_finite()) || dx.abs() > 4e7 || dy.abs() > 4e7 {
                 return Err("dx and dy must be finite distances in the command's units (limit: 40,000 km per axis after ground-to-grid)".into());
             }
-            let polar = polar_move_plane(s)?;
+            let polar = polar_move_plane(s, dy)?;
             modify(s, |g| match &polar {
-                Some(plane) => polar_transform(g, plane, |p| Coord::new(p.x + dx, p.y + dy)).map(Some),
+                Some((plane, lon)) => polar_transform(g, plane, *lon, |p| Coord::new(p.x + dx, p.y + dy)).map(Some),
                 None => Ok(Some(g.map_coords(&|c: Coord| shift(c, dx, dy)))),
             })
         })
@@ -328,9 +331,14 @@ pub fn commands() -> Vec<C> {
                     return Ok(None);
                 }
                 let (sin, cos) = (-deg.to_radians()).sin_cos();
-                if !within_mercator(g) {
-                    let plane = feature_plane(g)?;
-                    return polar_transform(g, &plane, |p| Coord::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos)).map(Some);
+                // Turned, no corner of its box goes farther from its center.
+                let turned = |m: &Extent, c: Coord| {
+                    let r = (m.min_x - c.x).abs().max((m.max_x - c.x).abs()).hypot((m.min_y - c.y).abs().max((m.max_y - c.y).abs()));
+                    (c.y - r, c.y + r)
+                };
+                if !stays_in_mercator(g, turned) {
+                    let (plane, lon) = feature_plane(g)?;
+                    return polar_transform(g, &plane, lon, |p| Coord::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos)).map(Some);
                 }
                 let c = lonlat_to_merc(g.extent().center());
                 Ok(Some(g.map_coords(&|p: Coord| {
@@ -349,8 +357,9 @@ pub fn commands() -> Vec<C> {
                 if matches!(g, Geometry::Point(_)) {
                     return Ok(None);
                 }
-                if !within_mercator(g) {
-                    return polar_transform(g, &feature_plane(g)?, |p| Coord::new(p.x * k, p.y * k)).map(Some);
+                if !stays_in_mercator(g, |m, c| (c.y + (m.min_y - c.y) * k, c.y + (m.max_y - c.y) * k)) {
+                    let (plane, lon) = feature_plane(g)?;
+                    return polar_transform(g, &plane, lon, |p| Coord::new(p.x * k, p.y * k)).map(Some);
                 }
                 let c = lonlat_to_merc(g.extent().center());
                 Ok(Some(g.map_coords(&|p: Coord| {
@@ -454,17 +463,41 @@ fn ground_to_grid(dx: f64, dy: f64, k: f64, rot_deg: f64) -> (f64, f64) {
     ((dx * cos - dy * sin) * k, (dx * sin + dy * cos) * k)
 }
 
-/// Whether every vertex of `g` lies within Web Mercator's square (±85.05°), where the modify tools
-/// work in Web Mercator as they always have.
-fn within_mercator(g: &Geometry) -> bool {
+/// Whether every vertex of `g` lies within Web Mercator's square (±85.05°), and would still after
+/// an edit that puts its northings in Web Mercator within `span` of its box and center there
+/// (lowest, highest): then the modify tools work in Web Mercator as they always have (#1033).
+fn stays_in_mercator(g: &Geometry, span: impl Fn(&Extent, Coord) -> (f64, f64)) -> bool {
     let e = g.extent();
-    e.min_y >= -MAX_LAT && e.max_y <= MAX_LAT
+    if !(e.min_y >= -MAX_LAT && e.max_y <= MAX_LAT) {
+        return false;
+    }
+    let edge = |lat: f64| lonlat_to_merc(Coord::new(0.0, lat)).y;
+    let (lo, hi) = span(&extent_to_merc(&e), lonlat_to_merc(e.center()));
+    lo >= edge(-MAX_LAT) && hi <= edge(MAX_LAT)
 }
 
-/// The azimuthal equidistant plane a move works in when a selected feature reaches beyond Web
-/// Mercator's square (#1033): one, at the center of every selected vertex, so features that share
-/// a vertex still share it after; `None` when they all lie within the square.
-fn polar_move_plane(s: &Session) -> Result<Option<Aeqd>, String> {
+/// The whole turns of 360° that bring longitude `x` nearest `was`.
+fn turns(x: f64, was: f64) -> f64 {
+    360.0 * ((was - x) / 360.0).round()
+}
+
+/// The center of `vertices` on the sphere (each once: a closed ring's repeated last point would
+/// pull it toward its first), in the plane edits beyond Web Mercator's square work in, with its
+/// longitude in the range the first vertex is in.
+fn plane_at(vertices: impl FnOnce(&mut dyn FnMut(Coord))) -> Option<(Aeqd, f64)> {
+    let (mut mean, mut first) = (SphericalMean::default(), None);
+    vertices(&mut |c| {
+        mean.add(c);
+        first = first.or(Some(c.x));
+    });
+    let c = mean.center()?;
+    Some((Aeqd::new(c), c.x + first.map_or(0.0, |f| turns(c.x, f))))
+}
+
+/// The plane a move works in when a selected feature reaches or would go beyond Web Mercator's
+/// square, and its center's longitude (#1033): one, at the center of every selected vertex, so
+/// features that share a vertex still share it after; `None` when they all stay within the square.
+fn polar_move_plane(s: &Session, dy: f64) -> Result<Option<(Aeqd, f64)>, String> {
     let selected = || {
         s.map()
             .layers
@@ -472,20 +505,24 @@ fn polar_move_plane(s: &Session) -> Result<Option<Aeqd>, String> {
             .filter(|l| !l.is_raster())
             .flat_map(|l| l.selection.iter().filter_map(|r| l.dataset.features.get(*r)?.geometry.as_ref()))
     };
-    if selected().all(within_mercator) {
+    // `shift` moves a vertex dy·sec(latitude) north in Web Mercator: no farther than at the
+    // feature's most poleward latitude.
+    let stays = |g: &Geometry| {
+        let e = g.extent();
+        let most = dy.abs() / e.min_y.abs().max(e.max_y.abs()).to_radians().cos().max(0.01);
+        stays_in_mercator(g, |m, _| (m.min_y - most, m.max_y + most))
+    };
+    if selected().all(stays) {
         return Ok(None);
     }
-    let mut mean = SphericalMean::default();
-    // Each vertex once: a closed ring's repeated last point would pull the center toward its first.
-    selected().for_each(|g| g.for_each_vertex(|_, c| mean.add(c)));
-    mean.center().map(|c| Some(Aeqd::new(c))).ok_or_else(|| "the selection has no center to move it about".into())
+    plane_at(|add| selected().for_each(|g| g.for_each_vertex(|_, c| add(c))))
+        .map(Some)
+        .ok_or_else(|| "the selection has no center to move it about".into())
 }
 
-/// The azimuthal equidistant plane at a feature's center, which it turns and scales about.
-fn feature_plane(g: &Geometry) -> Result<Aeqd, String> {
-    let mut mean = SphericalMean::default();
-    g.for_each_vertex(|_, c| mean.add(c));
-    mean.center().map(Aeqd::new).ok_or_else(|| "the feature has no center to turn or scale it about".into())
+/// The plane at a feature's center, which it turns and scales about, and the center's longitude.
+fn feature_plane(g: &Geometry) -> Result<(Aeqd, f64), String> {
+    plane_at(|add| g.for_each_vertex(|_, c| add(c))).ok_or_else(|| "the feature has no center to turn or scale it about".into())
 }
 
 /// How near a pole (meters) a moved line or ring may come: nearer, it's taken to reach it.
@@ -496,11 +533,14 @@ const POLE_CLEARANCE_M: f64 = 0.02;
 /// a line or ring can't survive where it reaches or goes around a pole: one that reaches a pole (as
 /// rings cut at ±180° and closed along it do), has an edge spanning more than 180° of longitude, or
 /// would be carried onto or around a pole is refused. Longitudes run on across ±180° as the
-/// vertices do, each part keeping the range of longitudes it had. Edges stay straight in
-/// longitude/latitude between the moved vertices.
-fn polar_transform(g: &Geometry, plane: &Aeqd, f: impl Fn(Coord) -> Coord) -> Result<Geometry, String> {
+/// vertices do, every part and point in the range nearest `lon`, the plane's center's longitude
+/// (moved with it), so a polygon's rings and features sharing vertices land in the same one.
+/// Edges stay straight in longitude/latitude between the moved vertices.
+fn polar_transform(g: &Geometry, plane: &Aeqd, lon: f64, f: impl Fn(Coord) -> Coord) -> Result<Geometry, String> {
     use rustgis_data::geometry::{ring_contains, seg_dist2};
     let poles = [plane.forward(Coord::new(0.0, 90.0)), plane.forward(Coord::new(0.0, -90.0))];
+    let center = plane.inverse(f(Coord::new(0.0, 0.0))).x;
+    let center = center + turns(center, lon);
     // A path (a line's part, a ring, or one point) moved, back in longitude/latitude.
     let path = |pts: &[Coord], ring: bool, point: bool| -> Result<Vec<Coord>, String> {
         if !point {
@@ -508,10 +548,7 @@ fn polar_transform(g: &Geometry, plane: &Aeqd, f: impl Fn(Coord) -> Coord) -> Re
                 return Err("a line or polygon that reaches a pole can't be moved, rotated or scaled yet".into());
             }
             if pts.windows(2).any(|w| matches!(w, [a, b] if (b.x - a.x).abs() > 180.0)) {
-                return Err(
-                    "a line or polygon with an edge spanning more than 180° of longitude can't be moved, rotated or scaled near a pole yet"
-                        .into(),
-                );
+                return Err("a line or polygon with an edge spanning more than 180° of longitude can't be moved, rotated or scaled on the ground yet (as features beyond 85.05° are)".into());
             }
         }
         let mut out: Vec<Coord> = pts.iter().map(|c| f(plane.forward(*c))).collect();
@@ -520,24 +557,15 @@ fn polar_transform(g: &Geometry, plane: &Aeqd, f: impl Fn(Coord) -> Coord) -> Re
             return Err("that would carry a line or polygon onto or around a pole, which it can't cross yet".into());
         }
         out.iter_mut().for_each(|p| *p = plane.inverse(*p));
-        // The whole turns of 360° that bring longitude `x` nearest `was`.
-        let turn = |x: f64, was: f64| 360.0 * ((was - x) / 360.0).round();
         if point {
-            // Each point in the range of longitudes it was in.
-            out.iter_mut().zip(pts).for_each(|(c, was)| c.x += turn(c.x, was.x));
+            out.iter_mut().for_each(|c| c.x += turns(c.x, center));
         } else {
             // Each vertex's longitude carried on from the one before, not wrapped at ±180°, and
-            // the path as a whole in the range of longitudes it was in.
+            // the path as a whole in the range nearest the center.
             let mut before: Option<f64> = None;
             for c in &mut out {
-                if let Some(b) = before {
-                    c.x += turn(c.x, b);
-                }
+                c.x += turns(c.x, before.unwrap_or(center));
                 before = Some(c.x);
-            }
-            if let (Some(first), Some(was)) = (out.first().map(|c| c.x), pts.first()) {
-                let k = turn(first, was.x);
-                out.iter_mut().for_each(|c| c.x += k);
             }
         }
         Ok(out)

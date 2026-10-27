@@ -168,7 +168,7 @@ fn a_radius_reaches_polar_shapes_along_their_edges() {
     let reach = |ds: &Dataset, at: Coord, r: f64| rustgis_analysis::network::within(ds, &[0], at, r).first().map(|(_, d)| *d);
     // Inside a box from 84°N to 89°N: no distance at all.
     assert_eq!(reach(&shapes(square(0.0, 84.0, 90.0, 89.0)), c(45.0, 85.0), 50_000.0), Some(0.0));
-    // A cap cut at ±180°, its edge along 85.5°N half a degree north: not at the pole, 556 km away.
+    // A cap cut at ±180°, its edge along 85.5°N half a degree north: that far, not as far as the pole.
     let cap = Geometry::Polygon(vec![vec![vec![c(-180.0, 85.5), c(180.0, 85.5), c(180.0, 90.0), c(-180.0, 90.0), c(-180.0, 85.5)]]]);
     let d = reach(&shapes(cap), c(0.0, 85.0), 100_000.0);
     assert!(d.is_some_and(|d| (d - ground(c(0.0, 85.0), c(0.0, 85.5))).abs() < 10.0), "{d:?}");
@@ -177,6 +177,20 @@ fn a_radius_reaches_polar_shapes_along_their_edges() {
     line.push(Some(Geometry::Line(vec![vec![c(0.0, -90.0), c(0.0, 90.0)]])), vec![]);
     let d = reach(&line, c(1.0, 45.0), 100_000.0);
     assert!(d.is_some_and(|d| (d - ground(c(1.0, 45.0), c(0.0, 45.0))).abs() < 100.0), "{d:?}");
+    // From 80°N, 2,300 km reaches a point on the far side of the pole, 2,233 km away over it.
+    let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+    pts.push(Some(Geometry::Point(c(180.0, 80.0))), vec![]);
+    let d = reach(&pts, c(0.0, 80.0), 2_300_000.0);
+    assert!(d.is_some_and(|d| (d - ground(c(0.0, 80.0), c(180.0, 80.0))).abs() < 100.0), "{d:?}");
+    // A line from near the center (180°, 89°N; 55 km off at its nearest) down to 89°S and along it
+    // past the center's antipode (0°, 89°S), where the plane at the center draws neighboring steps
+    // on opposite sides of it, their chord 40 km from the center: not within 50 km.
+    let mut line = Dataset::new("far", GeometryType::Polyline, vec![]);
+    // (Steps from 150.25°E fall either side of 0°, not on it.)
+    line.push(Some(Geometry::Line(vec![vec![c(150.25, 89.5), c(150.25, -89.0), c(-170.0, -89.0)]])), vec![]);
+    assert_eq!(reach(&line, c(180.0, 89.0), 50_000.0), None);
+    let d = reach(&line, c(180.0, 89.0), 60_000.0);
+    assert!(d.is_some_and(|d| (52_000.0..58_000.0).contains(&d)), "{d:?}");
 }
 
 #[test]
@@ -190,6 +204,15 @@ fn line_ends_near_a_pole_meet_within_the_tolerance() {
     }
     let checked = rustgis_analysis::topology::dangles(&ds, &[0, 1], 10.0);
     assert!(checked.complete && checked.errors.is_empty(), "{:?}", checked.errors.iter().map(|e| e.at).collect::<Vec<_>>());
+
+    // Meridians at 0°E and 90°E from 80°N meet at the North Pole: only their ends at 80°N dangle.
+    let mut ds = Dataset::new("meridians", GeometryType::Polyline, vec![]);
+    for x in [0.0, 90.0] {
+        ds.push(Some(Geometry::Line(vec![vec![c(x, 80.0), c(x, 90.0)]])), vec![]);
+    }
+    let checked = rustgis_analysis::topology::dangles(&ds, &[0, 1], 10.0);
+    let at: Vec<f64> = checked.errors.iter().map(|e| e.at.y).collect();
+    assert!(checked.complete && at.len() == 2 && at.iter().all(|y| (y - 80.0).abs() < 1e-9), "{at:?}");
 }
 
 #[test]
