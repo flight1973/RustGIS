@@ -115,3 +115,34 @@ fn a_radius_near_a_pole_reaches_as_far_as_it_says() {
     let d = found.first().map(|(_, d)| *d).unwrap_or_default();
     assert!((d - 33_507.0).abs() < 50.0, "{d}");
 }
+
+#[test]
+fn features_reaching_the_same_pole_meet_there() {
+    // Wedges from 89°S to the South Pole at 0°E and 90°E: apart in the plane, where the pole is a
+    // line, but one place on the ground. One at 0°E reaching the North Pole meets neither.
+    let wedge = |x: f64, s: f64| square(x, s * 90.0, x + 10.0, s * 89.0);
+    let m = Map(HashMap::from([
+        layer("south0", vec![wedge(0.0, -1.0)]),
+        layer("south90", vec![wedge(90.0, -1.0)]),
+        layer("north0", vec![wedge(0.0, 1.0)]),
+    ]));
+    let selected = |input: &str, select: &str| {
+        let r = rustgis_analysis::run("selectByLocation", &m, &serde_json::json!({"input": input, "select": select})).unwrap();
+        let Output::Selection { rows, .. } = r.output else { panic!("expected a selection") };
+        rows
+    };
+    assert_eq!((selected("south0", "south90"), selected("north0", "south90")), (vec![0], vec![]));
+    let joined = |target: &str, join: &str, how: &str| {
+        let mut params = serde_json::json!({"target": target, "join": join, "match": how});
+        if how == "Closest" {
+            params["distanceField"] = serde_json::json!("gap");
+        }
+        run(&m, "spatialJoin", params)
+    };
+    let sj = joined("south0", "south90", "Intersects");
+    assert_eq!(sj.value(0, sj.field_index("join_count").unwrap()), &Value::Int(1));
+    let sj = joined("north0", "south90", "Intersects");
+    assert_eq!(sj.value(0, sj.field_index("join_count").unwrap()), &Value::Int(0));
+    let sj = joined("south0", "south90", "Closest");
+    assert_eq!(sj.value(0, sj.field_index("gap").unwrap()), &Value::Float(0.0));
+}
