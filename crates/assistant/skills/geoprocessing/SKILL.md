@@ -17,7 +17,8 @@ Based on the RustGIS user guide, Analysis › Geoprocessing tools
      (the same, plus the parts outside every overlay polygon), `union` (both polygon layers:
      every piece either covers)
    - generalization: `dissolve` (`input`, `field`), `simplify` (`input`, `tolerance`)
-   - geometry: `convexHull`, `featureToPoint`, `featureVerticesToPoints`, `xyTableToPoint`
+   - geometry: `convexHull`, `featureToPoint`, `featureVerticesToPoints`, `pointsAlongLines`
+     (`input`, `distance`, `units`, `startOffset`, `endOffset`, `includeEnd`), `xyTableToPoint`
      (`input`, `x`, `y`, `crs`), `calculateGeometry`
    - selection: `selectByLocation` (`input`, `select`, `distance`, `invert`), `selectByAttributes`
      (`input`, `where`)

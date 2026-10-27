@@ -95,6 +95,7 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Minimum Bounding Geometry | `convexHull` | Data Management › Features |
 | Feature To Point | `featureToPoint` | Data Management › Features |
 | Feature Vertices To Points | `featureVerticesToPoints` | Data Management › Features |
+| Points Along Lines | `pointsAlongLines` | Data Management › Features |
 | XY Table To Point | `xyTableToPoint` | Data Management › Features |
 | Calculate Geometry Attributes | `calculateGeometry` | Data Management › Features |
 | Simplify | `simplify` | Cartography › Generalization |
@@ -201,6 +202,42 @@ fewer features, or simplify ones with many vertices.
 
 ```text
 gp.run={"tool":"featureVerticesToPoints","params":{"input":"Rivers","output":"river_vertices"}}
+```
+
+**Points Along Lines** (`pointsAlongLines`) writes points at a set `distance` along each part of
+the `input` layer's lines, or each ring of its polygons (holes too), measured on the WGS 84
+ellipsoid as Buffer's distances are, in `units` (Kilometers by default). Each part and ring is
+walked on its own from its first vertex, so the gap between two parts never counts, except that
+parts which meet on the antimeridian are one line, as a GeoJSON file splits a line that crosses it:
+a point at `startOffset` (0 by default), then one every `distance`, stopping `endOffset` before the
+part's end. `includeEnd` adds a point where they stop when the distance doesn't land there. A ring ends
+where it starts, so a point there is made once; a part shorter than its offsets gets none. Each
+point has its feature's attributes and three fields: `orig_fid`, the feature's OID, as Feature
+Vertices To Points writes it, and, named as in QGIS's Points along geometry, `distance` (how far
+along its part, in `units`, the start offset included) and `angle` (the line's direction there, in
+degrees clockwise from north; on a vertex, halfway between the segments either side). A new field
+whose name the input already has gets a suffix (`distance_2`). Unlike QGIS's tool, which works in
+the layer's units, the distance is on the ground in any coordinate system. Each edge is the
+shortest path between its vertices on the ellipsoid, as Calculate Geometry Attributes measures it
+and the globe draws it; the flat map draws edges straight in longitude and latitude instead, so on
+it a point on a long edge can sit off the line (about 2 m on an edge 10 km long, 200 m on one
+100 km long): add vertices to long edges first if the points must follow the drawn line. An edge
+between opposite sides of the Earth has no single shortest path, and the tool takes the one
+GeographicLib does (over a pole for two points on the equator). The angle is the bearing from
+true north, which near a pole turns quickly along even a straight line (by 33° in 30 m, 11 m from
+the North Pole); at a pole itself, where every direction is south, it follows GeographicLib's
+convention, from the meridian of the longitude the vertex is written with. On a map in another
+projection than Web Mercator, north isn't straight up everywhere, so there the angle differs from
+the line's direction on the map. A vertex less than a millimeter from the one before is passed
+over, so a near-duplicate doesn't turn a point's angle.
+The points keep the input's coordinate system, with longitudes between -180 and 180, so a point
+past the antimeridian is on the far side of the map. The points are counted first and may take
+up to about 4 GiB (some 20 million points with a few fields): a distance that would make more,
+or more than the browser can give in the web app, stops the tool with a message before anything
+is built. Use a larger distance, or select fewer features.
+
+```text
+gp.run={"tool":"pointsAlongLines","params":{"input":"Rivers","distance":500,"units":"Meters","includeEnd":true}}
 ```
 
 **IDW Interpolation** works like the QGIS tool of the same name: every point weighs on every

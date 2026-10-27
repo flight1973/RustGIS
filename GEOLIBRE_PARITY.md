@@ -169,8 +169,9 @@ model-builder.md, segmentation.md, obia.md_
 - [x] **Spatial join, intersect, union** ([#959](https://github.com/opengeos/RustGIS/issues/959)):
   spatial join, clip, erase, intersect, identity, union and near are built in.
 - [ ] **More built-in vector tools**: attribute join, merge, extract vertices, points along lines,
-  fix/check geometry, random extract, buffer options. Partial: extract vertices is built in,
-  as Feature Vertices To Points (_Roadmap: solid ground_).
+  fix/check geometry, random extract, buffer options. Partial: extract vertices and points along
+  lines are built in, as Feature Vertices To Points and Points Along Lines (_Roadmap: solid
+  ground_).
 - [ ] **Routing services**: isochrones, service areas, OD matrix, multi-stop routing,
   turn-by-turn (Valhalla/OSRM). Partial: shortest path over a line layer (_Roadmap: analysis_).
 - [ ] **Geocoding**: forward, batch and reverse, with multiple providers and a place search box.
