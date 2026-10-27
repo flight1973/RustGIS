@@ -71,5 +71,7 @@ build on the pull request.
 ## Looking at the app
 - `cargo run --release -p rustgis` (opens the World Atlas sample).
 - Headless screenshots: `cargo run --release -p rustgis-ui-egui --example ui_shot -- script.jsonl`
-  (see the example header). For UI work, look at the PNG.
+  (see the example header). For UI work, render the actual changed UI and look at the PNG.
+  For substantial visible changes, include screenshots in the PR (before/after where useful);
+  see [attachment guidance](docs/contributing.md#documentation).
 - CLI: `rustgis-cli run --sample --cmd 'gp.run={"tool":"buffer","params":{"input":"Cities","distance":100}}' --cmd 'share.exportMap={"path":"out.png"}'`.

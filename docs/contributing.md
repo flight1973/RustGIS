@@ -166,6 +166,10 @@ zensical serve        # http://localhost:8000
 Images live in [rustgis-assets](https://github.com/opengeos/rustgis-assets) and are linked by
 URL; don't commit images to this repository.
 
+For PR screenshots, GitHub web attachments are fine. The optional
+[`gh image` extension](https://github.com/drogers0/gh-image) can automate uploads and return
+image links; `gh` itself has no native standalone attachment-upload command.
+
 The screenshots are rendered by the app itself. From the repository root, run
 `crates/ui-egui/examples/shots/render.sh`; it needs ImageMagick (`magick`) and network access for
 tiles, plugins and the sample DEM. It runs the `ui_shot` scripts beside it and writes WebP files

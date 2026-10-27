@@ -530,7 +530,10 @@ fn template(p: &Project) -> Project {
                 rl.embedded = None;
             }
         }
-        m.layers.retain(|l| !l.is_raster() || l.raster.as_ref().is_some_and(|r| r.path.is_some()));
+        let dropped: Vec<u32> =
+            m.layers.iter().filter(|l| l.is_raster() && l.raster.as_ref().is_none_or(|r| r.path.is_none())).map(|l| l.id).collect();
+        m.release_tiles(&dropped);
+        m.layers.retain(|l| !dropped.contains(&l.id));
     }
     for t in &mut t.tables {
         t.features.clear();
@@ -565,6 +568,8 @@ fn package_map(s: &Session, mobile: bool, tol: f64) -> Result<Vec<u8>, String> {
     if mobile {
         // Groups folded into their layers: a hidden group's layers are dropped with the others.
         m.bake_groups();
+        let hidden: Vec<u32> = m.layers.iter().filter(|l| !l.visible).map(|l| l.id).collect();
+        m.release_tiles(&hidden);
         m.layers.retain(|l| l.visible);
         for l in &mut m.layers {
             if l.is_raster() || tol <= 0.0 {

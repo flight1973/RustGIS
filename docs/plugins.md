@@ -21,6 +21,8 @@ Open **Plugins › Plugin Manager**. The **Plugins** tab also has **Install From
 - **Browse** lists the plugins in the registry, with search and a category filter. **Install**
   downloads the plugin, checks its SHA-256 and id against the registry entry, and shows what
   the plugin may do before it loads.
+  Descriptions stay on one line; hover over one to read its full text and, for a withdrawn
+  plugin, the withdrawal reason in a single tooltip.
 - **Installed** lists your plugins: turn them on or off, update them, or uninstall them.
 - **Settings** has **Install From File…** for a `.rgplugin` file; you can also drop the file on
   the window. It also sets the registry address (empty means the RustGIS registry). On the

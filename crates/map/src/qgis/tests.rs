@@ -1,6 +1,7 @@
 //! A small QGIS project and style, written by hand in the shapes QGIS writes them.
 
 use super::*;
+use crate::layout::TextAlign;
 use crate::symbology::{Glyph, LabelPlacement, LineCap, LineMark, Marker, Placements};
 
 const PROJECT: &str = r#"<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
@@ -186,7 +187,15 @@ fn a_project_reads_into_layers_in_tree_order_with_their_styles() {
     // What didn't carry over is said, once for each thing.
     let said =
         |layer: &str, kind: NoteKind, part: &str| report.notes.iter().any(|n| n.layer == layer && n.kind == kind && n.text.contains(part));
-    assert!(said("Land", NoteKind::Approximated, "line pattern"));
+    // Its second class's line pattern fill: hatch lines of its blue line, 2 mm apart, at QGIS's
+    // 45°, half see-through as the symbol is; read, not noted.
+    assert!(!said("Land", NoteKind::Approximated, "line pattern"));
+    let Some(Renderer::Graduated { class_fills, .. }) = &land.style.renderer else { panic!() };
+    let hatch = class_fills.get(&1).and_then(|f| f.first()).copied().unwrap();
+    assert_eq!(hatch.color, Some(Rgba::new(0, 0, 255, 128)));
+    let crate::fills::FillPattern::Hatch { angle, spacing, .. } = hatch.pattern else { panic!("{hatch:?}") };
+    assert!(angle == 45.0 && (spacing - 2.0 * 96.0 / 25.4).abs() < 1e-3, "{hatch:?}");
+    assert!(!class_fills.contains_key(&0), "a plain colour is the symbol's fill, as before");
     assert!(said("Land", NoteKind::Approximated, "above the last"), "values outside the ranges are noted");
     // A QGIS font family is the label class's font, drawn in it where it's installed.
     assert!(!said("Land", NoteKind::Approximated, "Liberation Sans Narrow"), "no longer approximated");
@@ -306,6 +315,97 @@ fn merged_categories_and_dashes_carry_over() {
     assert!((dash.steps()[0] - 2.5 * mm).abs() < 1e-3 && (dash.steps()[1] - 0.5 * mm).abs() < 1e-3, "{:?}", dash.steps());
     assert_eq!(class_strokes["c"][0].dash.unwrap().steps(), &[3.0, 6.0]);
     assert!(!report.notes.iter().any(|n| n.text.contains("dash")), "{:?}", report.notes);
+}
+
+/// Pattern fills as stacked fills: a simple fill's hatched brushes as Qt draws them, line and point
+/// pattern fills in their units, several fills bottom first; one plain colour stays the symbol's
+/// fill alone, as before; a class's fills go with its class.
+#[test]
+fn pattern_fills_carry_over_as_stacked_fills() {
+    use crate::fills::{FillLayer, FillPattern};
+    let qml = |layers: &str| {
+        format!(
+            r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="fill" name="0" alpha="1">{layers}</symbol></symbols></renderer-v2></qgis>"#
+        )
+    };
+    let read = |layers: &str| {
+        let mut report = Report::default();
+        let s = read_style(&qml(layers), "Fields", &mut report).unwrap();
+        (s.fill_layers.unwrap_or_default(), s.renderer, report)
+    };
+    let simple = |style: &str| {
+        format!(
+            r#"<layer class="SimpleFill" enabled="1"><Option type="Map"><Option name="color" value="255,0,0,255"/><Option name="style" value="{style}"/><Option name="outline_style" value="no"/></Option></layer>"#
+        )
+    };
+    // One colour: the symbol's fill, no stack, as before.
+    let (fills, renderer, _) = read(&simple("solid"));
+    assert!(fills.is_empty());
+    assert!(matches!(renderer, Some(Renderer::Single(s)) if s.fill == Rgba::rgb(255, 0, 0)));
+    // Qt's hatched brushes: 8 points apart, the diagonals 8 along a row; b_diagonal rises.
+    let angles = |style: &str| -> Vec<(f32, f32)> {
+        read(&simple(style))
+            .0
+            .iter()
+            .map(|f| match f.pattern {
+                FillPattern::Hatch { angle, spacing, .. } => (angle, (spacing * 100.0).round() / 100.0),
+                _ => (-1.0, 0.0),
+            })
+            .collect()
+    };
+    assert_eq!(angles("horizontal"), [(0.0, 8.0)]);
+    assert_eq!(angles("vertical"), [(90.0, 8.0)]);
+    assert_eq!(angles("b_diagonal"), [(45.0, 5.66)]);
+    assert_eq!(angles("f_diagonal"), [(135.0, 5.66)]);
+    assert_eq!(angles("cross"), [(0.0, 8.0), (90.0, 8.0)]);
+    assert_eq!(angles("diagonal_x"), [(45.0, 5.66), (135.0, 5.66)]);
+    let (fills, _, report) = read(&simple("dense4"));
+    assert!(fills.is_empty(), "a dense dot brush is a tint, one colour: {fills:?}");
+    assert!(report.notes.iter().any(|n| n.text.contains("dense dots")), "{:?}", report.notes);
+    // SMV25's point pattern: blue dots 0.7 mm apart, the marker its sub-symbol's, over a fill.
+    let dots = r#"<layer class="PointPatternFill" enabled="1"><Option type="Map"><Option name="distance_x" value="0.7"/><Option name="distance_x_unit" value="MM"/>
+        <Option name="distance_y" value="0.7"/><Option name="distance_y_unit" value="MM"/><Option name="displacement_x" value="0.35"/><Option name="displacement_x_unit" value="MM"/></Option>
+        <symbol type="marker" name="@0@1" alpha="1"><layer class="SimpleMarker" enabled="1"><Option type="Map"><Option name="name" value="circle"/><Option name="color" value="0,0,255,255"/>
+        <Option name="size" value="0.2"/><Option name="size_unit" value="MM"/><Option name="outline_style" value="no"/></Option></layer></symbol></layer>"#;
+    let (fills, renderer, report) = read(&format!("{}{dots}", simple("solid")));
+    assert_eq!(fills.len(), 2, "{fills:?}");
+    assert_eq!(fills[0], FillLayer { color: Some(Rgba::rgb(255, 0, 0)), pattern: FillPattern::Solid }, "bottom first");
+    let mm = |v: f32| v * 96.0 / 25.4;
+    let FillPattern::Dots { size, spacing, displacement, outline, .. } = fills[1].pattern else { panic!("{fills:?}") };
+    assert_eq!(fills[1].color, Some(Rgba::rgb(0, 0, 255)));
+    assert!((size - mm(0.2)).abs() < 1e-3 && (spacing[0] - mm(0.7)).abs() < 1e-3 && (displacement[0] - mm(0.35)).abs() < 1e-3, "{fills:?}");
+    assert_eq!(outline, None);
+    assert!(!report.notes.iter().any(|n| n.text.contains("point pattern")), "read, not noted: {:?}", report.notes);
+    assert!(matches!(renderer, Some(Renderer::Single(s)) if s.fill == Rgba::rgb(0, 0, 255).with_alpha(s.fill.a())), "{renderer:?}");
+    // A line pattern in its units, with its line's colour and width.
+    let lines = r#"<layer class="LinePatternFill" enabled="1"><Option type="Map"><Option name="lineangle" value="30"/><Option name="distance" value="1"/><Option name="distance_unit" value="MM"/>
+        <Option name="offset" value="0.5"/><Option name="offset_unit" value="MM"/></Option>
+        <symbol type="line" name="@0@0" alpha="1"><layer class="SimpleLine" enabled="1"><Option type="Map"><Option name="line_color" value="0,128,0,255"/><Option name="line_width" value="0.3"/></Option></layer></symbol></layer>"#;
+    let (fills, ..) = read(lines);
+    assert_eq!(fills.len(), 1, "a pattern alone is a stack of one");
+    let FillPattern::Hatch { angle, spacing, width, offset } = fills[0].pattern else { panic!("{fills:?}") };
+    assert_eq!(fills[0].color, Some(Rgba::rgb(0, 128, 0)));
+    assert!(
+        angle == 30.0 && (spacing - mm(1.0)).abs() < 1e-3 && (width - mm(0.3)).abs() < 1e-3 && (offset - mm(0.5)).abs() < 1e-3,
+        "{fills:?}"
+    );
+    // Two colours stacked: both, the top one over the bottom.
+    let half = r#"<layer class="SimpleFill" enabled="1"><Option type="Map"><Option name="color" value="0,0,0,64"/><Option name="style" value="solid"/></Option></layer>"#;
+    let (fills, ..) = read(&format!("{}{half}", simple("solid")));
+    assert_eq!(fills.iter().map(|f| f.color).collect::<Vec<_>>(), [Some(Rgba::rgb(255, 0, 0)), Some(Rgba::new(0, 0, 0, 64))]);
+    // In classes: a categorized layer's class with a hatch has fills of its own.
+    let cat = format!(
+        r#"<qgis version="4.2.3"><renderer-v2 type="categorizedSymbol" attr="kind"><categories><category value="a" symbol="0" render="true"/><category value="b" symbol="1" render="true"/></categories>
+        <symbols><symbol type="fill" name="0" alpha="1">{}</symbol><symbol type="fill" name="1" alpha="1">{}</symbol></symbols></renderer-v2></qgis>"#,
+        simple("solid"),
+        simple("cross")
+    );
+    let mut report = Report::default();
+    let s = read_style(&cat, "Fields", &mut report).unwrap();
+    let Some(Renderer::Unique { class_fills, .. }) = &s.renderer else { panic!("{:?}", s.renderer) };
+    assert_eq!(class_fills.keys().collect::<Vec<_>>(), ["b"]);
+    assert_eq!(class_fills["b"].len(), 2);
+    assert_eq!(s.fill_layers, Some(Vec::new()), "the layer's own: none");
 }
 
 #[test]
@@ -461,6 +561,69 @@ fn a_labels_background_and_offset_carry_over_in_their_units() {
 }
 
 #[test]
+fn a_labels_wrapping_and_repeat_carry_over() {
+    let read = |settings: &str| {
+        let qml = format!(
+            r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="line" name="0" alpha="1"><layer class="SimpleLine" enabled="1"/></symbol></symbols></renderer-v2>
+            <labeling type="simple"><settings><text-style fieldName="name"/>{settings}</settings></labeling></qgis>"#
+        );
+        let mut report = Report::default();
+        let s = read_style(&qml, "Roads", &mut report).unwrap();
+        (s.labels.unwrap().default, report)
+    };
+    // The corpus's: a space as the wrap character, ten characters a line, centred lines.
+    let (c, report) = read(
+        r#"<text-format wrapChar=" " autoWrapLength="10" useMaxLineLengthForAutoWrap="1" multilineAlign="1"/><placement placement="2"/>"#,
+    );
+    assert_eq!((c.wrap_char.as_deref(), c.wrap_length, c.line_align), (Some(" "), 10, TextAlign::Center));
+    assert_eq!(c.wrap("Ober Winterthur"), "Ober\nWinterthur");
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    // Lines following the placement: right-aligned left of the feature, left-aligned right of it.
+    let follow =
+        |quad: &str| read(&format!(r#"<text-format multilineAlign="3"/><placement placement="1" quadOffset="{quad}"/>"#)).0.line_align;
+    assert_eq!((follow("3"), follow("5"), follow("4")), (TextAlign::Right, TextAlign::Left, TextAlign::Center));
+    // Without a `<text-format>` too, as QGIS defaults to following the placement.
+    assert_eq!(read(r#"<placement placement="1" quadOffset="3"/>"#).0.line_align, TextAlign::Right);
+    // A shortest line length, and justified lines: as near as RustGIS draws them, and noted.
+    let (c, report) = read(r#"<text-format autoWrapLength="1e9" useMaxLineLengthForAutoWrap="0" multilineAlign="4"/>"#);
+    assert_eq!((c.wrap_length, c.line_align), (crate::symbology::MAX_WRAP_LENGTH, TextAlign::Center));
+    for part in ["shortest line length", "justified"] {
+        assert!(report.notes.iter().any(|n| n.text.contains(part)), "{part}: {:?}", report.notes);
+    }
+    // A repeat along curved labels, in millimetres (the corpus's 30 mm); none for labels off lines.
+    let (c, _) = read(r#"<placement placement="3" repeatDistance="30" repeatDistanceUnits="MM"/>"#);
+    assert!(c.repeat.is_some_and(|r| (r - 30.0 * 72.0 / 25.4).abs() < 1e-3), "{:?}", c.repeat);
+    let (c, report) = read(r#"<placement placement="1" repeatDistance="30"/>"#);
+    assert_eq!(c.repeat, None);
+    assert!(report.notes.is_empty(), "QGIS repeats no label off a line: {:?}", report.notes);
+    // Within RustGIS's range; one of no number is none.
+    let (c, _) = read(r#"<placement placement="2" repeatDistance="0.001" repeatDistanceUnits="Point"/>"#);
+    assert_eq!(c.repeat, Some(10.0));
+    let (c, _) = read(r#"<placement placement="2" repeatDistance="lots"/>"#);
+    assert_eq!(c.repeat, None);
+    // A unit saved before QGIS 3, as a number: 0 points, else millimetres.
+    let (c, _) = read(r#"<placement placement="2" repeatDistance="30" repeatDistanceUnit="0"/>"#);
+    assert_eq!(c.repeat, Some(30.0));
+    let (c, _) = read(r#"<placement placement="2" repeatDistance="30" repeatDistanceUnit="1"/>"#);
+    assert!(c.repeat.is_some_and(|r| (r - 30.0 * 72.0 / 25.4).abs() < 1e-3), "{:?}", c.repeat);
+    // Round polygons RustGIS labels once, and says so.
+    let (c, report) = read(r#"<placement placement="7" repeatDistance="30"/>"#);
+    assert_eq!(c.repeat, None);
+    assert!(report.notes.iter().any(|n| n.text.contains("repeated round polygons")), "{:?}", report.notes);
+    let qgs = r#"<qgis version="4.2.3"><projectlayers><maplayer type="vector" geometry="Polygon" labelsEnabled="1"><id>p</id><datasource>/d/p.shp</datasource><layername>P</layername><provider>ogr</provider>
+        <labeling type="simple"><settings><text-style fieldName="nr"/><placement placement="2" repeatDistance="30"/></settings></labeling></maplayer></projectlayers></qgis>"#;
+    let mut report = Report::default();
+    let p = read_project(qgs, "", &mut report).unwrap();
+    assert_eq!(p.layers[0].style.labels.as_ref().unwrap().default.repeat, None);
+    assert!(report.notes.iter().any(|n| n.text.contains("repeated round polygons")), "{:?}", report.notes);
+    // A placement QGIS doesn't repeat (horizontal, inside the polygon) keeps the distance unused:
+    // not noted.
+    let mut report = Report::default();
+    read_project(&qgs.replace(r#"placement="2""#, r#"placement="4""#), "", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("repeated round polygons")), "{:?}", report.notes);
+}
+
+#[test]
 fn files_of_qgis_1_and_2_read_by_their_old_names() {
     // Before QGIS 3: no layer tree but a legend, the canvas's coordinate system, scale limits named
     // the other way round, opacity as transparency, and QGIS 2's names for line and fill settings.
@@ -560,7 +723,6 @@ fn what_rustgis_has_no_place_for_is_noted() {
         "diagrams",
         "order-by",
         "draw effects",
-        "wrapped labels",
         "label distances",
         "label priorities",
         "callouts",
@@ -570,7 +732,8 @@ fn what_rustgis_has_no_place_for_is_noted() {
     }
     // The renderer's effect is noted once; the symbol layer's, only plain drawing, isn't an effect.
     assert_eq!(report.notes.iter().find(|n| n.text.contains("draw effects")).map(|n| n.count), Some(1));
-    assert!(!said("A", "repeated"), "a repeat distance of 0 is none");
+    // Wrapping and repeats along lines are read now, not noted.
+    assert!(!said("A", "wrapped") && !said("A", "repeated"), "{:?}", report.notes);
 }
 
 /// A raster style file with `renderer` as its renderer and `pipe` after it in the pipe.

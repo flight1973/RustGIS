@@ -794,7 +794,8 @@ fn browse_row(ui: &mut egui::Ui, t: &Tokens, e: &Entry, web: bool) -> bool {
     if let Some(r) = &reason {
         tip = format!("{tip}\n\n{r}");
     }
-    let desc = ui.add(egui::Label::new(egui::RichText::new(description).size(12.0)).truncate());
+    // The explicit tooltip below includes the withdrawal reason; don't also show egui's elision tooltip.
+    let desc = ui.add(egui::Label::new(egui::RichText::new(description).size(12.0)).truncate().show_tooltip_when_elided(false));
     if !tip.trim().is_empty() {
         desc.on_hover_text(tip);
     }

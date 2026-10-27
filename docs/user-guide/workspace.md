@@ -75,13 +75,16 @@ The browser app doesn't autosave yet; it warns before you leave a page with unsa
 
 A QGIS project (`.qgs`, or a `.qgz` archive) opens as a new map of the current project: **Open**
 on the desktop, or **Project › New › QGIS Project…** (`project.importQgis={"path": "…/towns.qgs"}`).
+The QGIS Project picker filters for `.qgs` and `.qgz` files on both desktop and web.
 Its layers come in the layer tree's order, each from its file (GeoPackage, Shapefile, GeoJSON,
-GeoTIFF and the other formats RustGIS reads, relative paths from the project's folder), a CSV of
+GeoTIFF and the other formats RustGIS reads), a CSV of
 points, XYZ tiles or a WMS layer, unchecked layers and groups hidden. The map takes the project's
 coordinate system and its saved view (or its layers' extent, when that view shows none of them),
 with no basemap and no graticule, as QGIS draws it. A project in degrees (EPSG:4326 and other supported
 longitude/latitude systems) opens in the Equirectangular projection, the plate carrée QGIS draws
 it in. The import is one undo step.
+Relative layer paths resolve from the project's folder on desktop. In the browser, relative
+file sources cannot be resolved and are listed in the import notes.
 
 Each layer keeps its look:
 
@@ -96,7 +99,11 @@ Each layer keeps its look:
   middle), turned with the line, their markers' offsets and angles kept; font markers as
   characters of their font, on points and along lines; a marker symbol of several layers, or one
   shifted, turned or anchored off its centre, as a point's marks; a marker angle taken from a
-  field (`"field"` or `- "field"`) as the layer's rotation field.
+  field (`"field"` or `- "field"`) as the layer's rotation field; a fill symbol of several layers
+  as stacked fills, its brush patterns (horizontal, vertical, diagonal, cross) and line pattern
+  fills as hatch lines, point pattern fills as markers on their grid, and the fills not drawn yet
+  (gradient and shapeburst fills in their first colour; dense brushes, SVG, raster and random fills as
+  a tint of their colour).
 - **Layer settings**: opacity, blending, visibility range, filter (subset string), and the
   reference scale.
 - **Rasters**: singleband grey as a stretch from black to white, singleband pseudocolour as a
@@ -110,9 +117,11 @@ Each layer keeps its look:
   bold, italic and letter spacing, its font family (drawn in it where it is installed, else in
   RustGIS's label font), its buffer as a halo of its colour, opacity and size, its background as
   a rectangle (filled and outlined as its fill symbol says, padded by its size, its corners
-  rounded), its placement (Parallel and Curved along lines, around and over points), its offset
-  from a point (and on a point layer, its distance around the point, as an offset upwards) and
-  its scale range.
+  rounded), its wrapping (its wrap character and length, and how its lines line up, "follow
+  placement", QGIS's default, as the side the label sits on: centred over a point, so a value
+  of several lines comes in centred as QGIS draws it), its placement (Parallel and Curved along lines,
+  around and over points), its repeat distance along lines, its offset from a point (and on a
+  point layer, its distance around the point, as an offset upwards) and its scale range.
 
 Projects and styles from QGIS 1 and 2 read too: their legend gives the layers' order, and the
 older names of the same settings are read.
@@ -120,10 +129,11 @@ older names of the same settings are read.
 QGIS expressions carry over where they are SQL: fields compared with values, `LIKE`, `IN`,
 `IS NULL`, joined by `AND`, `OR` and `NOT`. What RustGIS doesn't draw as QGIS does is drawn as
 near as it can, or left out, and said: the import's notes list, layer by layer, what was
-approximated (pattern fills drawn as a tint of their colour, SVG markers as circles,
+approximated (gradient and shapeburst fills drawn in their first colour, SVG, raster and random fills and dense brushes as a tint of their colour, SVG markers as circles,
 dashed polygon outlines solid, label halos with sharp corners drawn round and blended ones drawn
 over the map, label backgrounds of other shapes drawn as rectangles, label distances from lines
-and polygons, a distance around points moved straight up, and wrapping, values outside a graduated renderer's ranges in its first or last class, file options
+and polygons, a distance around points moved straight up, labels wrapped at a shortest line
+length or justified, values outside a graduated renderer's ranges in its first or last class, file options
 such as `layerid` that RustGIS doesn't read) and what was skipped (arrow lines, other data-defined
 settings, draw effects, label callouts, labels from expressions, contours and other raster
 renderers RustGIS has no match for, PostGIS, WFS

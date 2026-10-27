@@ -36,7 +36,7 @@ const DIALOGS: &[(&str, &str)] = &[("select.byAttributes", "selectByAttributes")
 /// Starts showing where a step's command is; returns what to tell the user.
 pub fn start(app: &mut RustGisApp, st: &TaskStep) -> String {
     let id = st.command.as_str();
-    if matches!(id, "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.symbology" | "layer.transparency") {
+    if matches!(id, "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.fillLayers" | "layer.symbology" | "layer.transparency") {
         // Making the step's layer the active one is what shows its symbology. It runs on the
         // session directly, so a recording doesn't keep it as a step.
         // A null layer (a task from a file may hold one) is the active layer, as the command reads it.

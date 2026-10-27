@@ -65,12 +65,12 @@ pub const NETWORK: &[&str] = &[
 pub fn commands() -> Vec<C> {
     vec![
         C::new("map.addTiles", "Add Tile Layer", "Home › Add", add).params(
-            r#"{"url": "https://…/{z}/{x}/{y}.png" | vector tiles ".pbf" or TileJSON | MapLibre style.json | a PMTiles archive (web address or file path) | an MBTiles file path, "kind"?: "raster"|"vector"|"style"|"pmtiles"|"mbtiles" (guessed from the url), "name"?: text, "bounds"?: [west, south, east, north] (longitude/latitude coverage, when known), "attribution"?: text, "minZoom"?: number, "maxZoom"?: number, "tileSize"?: 256|512, "tms"?: bool, "subdomains"?: [text], "layers"?: [vector tile layer names, drawn in colours of their own], "styleLayers"?: [MapLibre style layers drawing vector tiles instead (their source is the tiles')], "opacity"?: 0–1, "blend"?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"difference" (how it combines with what is beneath), "overlay"?: bool (a transparent layer kept on top; one with the same address and role is replaced when it has the same name or the same look), "replace"?: bool (removes the other tile basemaps, not overlays), "id"?: catalog id, "view"?: bool (a MapLibre style: go to the place, zoom, bearing and pitch its root properties give, once it loads), "start"?, "end"?: dates a url with date placeholders ({date:YYYY-MM-DD}, {YYYY}) spans, turning the time slider on (or, when it is on, setting its span), "unit"?, "interval"?, "dates"?: its steps (as in time.set), "legend"?: "the web address of its legend picture (PNG or JPEG)" | [address | {"url": address, "minScale"?: scale denominator, "maxScale"?: one (the scales it is for, from minScale up to below maxScale)}] (at most 16; the Layers pane shows the one for the map's scale under the layer; service.add gives a WMS or WMTS layer its service's)}"#,
+            r#"{"url": "https://…/{z}/{x}/{y}.png" | vector tiles ".pbf" or TileJSON | MapLibre style.json | a PMTiles archive (web address or file path) | an MBTiles file path, "kind"?: "raster"|"vector"|"style"|"pmtiles"|"mbtiles" (guessed from the url), "name"?: text, "bounds"?: [west, south, east, north] (longitude/latitude coverage, when known), "attribution"?: text, "minZoom"?: number, "maxZoom"?: number, "tileSize"?: 256|512, "tms"?: bool, "subdomains"?: [text], "layers"?: [vector tile layer names, drawn in colours of their own], "styleLayers"?: [MapLibre style layers drawing vector tiles instead (their source is the tiles')], "opacity"?: 0–1, "blend"?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"difference" (how it combines with what is beneath), "overlay"?: bool (on top of the map's layers, as every new layer goes; without it a basemap, under them; one with the same address and role is replaced when it has the same name or the same look), "top"?: bool (on top of the map's layers, as a layer added as data goes; by default an overlay's place), "replace"?: bool (removes the other tile basemaps, not overlays), "id"?: catalog id, "view"?: bool (a MapLibre style: go to the place, zoom, bearing and pitch its root properties give, once it loads), "start"?, "end"?: dates a url with date placeholders ({date:YYYY-MM-DD}, {YYYY}) spans, turning the time slider on (or, when it is on, setting its span), "unit"?, "interval"?, "dates"?: its steps (as in time.set), "legend"?: "the web address of its legend picture (PNG or JPEG)" | [address | {"url": address, "minScale"?: scale denominator, "maxScale"?: one (the scales it is for, from minScale up to below maxScale)}] (at most 16; the Layers pane shows the one for the map's scale under the layer; service.add gives a WMS or WMTS layer its service's)}"#,
         ),
         C::new("map.removeTiles", "Remove Tile Layer", "Home › Add", remove)
             .params(r#"{"name"?: text, "index"?: number, "id"?: catalog id} (removes every tile layer when none is given)"#),
         C::new("map.setTiles", "Tile Layer Properties", "Home › Add", set).params(
-            r#"{"name"?: text | "index"?: number (0 = top) | "id"?: catalog id, "visible"?: bool, "opacity"?: 0–1, "blend"?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"difference", "move"?: "up"|"down"|"top"|"bottom", "rename"?: text, "bands"?: [red, green, blue] | [band] (a cloud-optimised GeoTIFF's bands shown, from 1; [] for its own), "range"?: [low, high] (the values shown from black to full colour; null: each band's 2nd–98th percentile), "dequantize"?: "aef" (AlphaEarth's quantised embeddings) | "none", "legend"?: as map.addTiles's, or null for none}"#,
+            r#"{"name"?: text | "index"?: number (0 = top) | "id"?: catalog id, "visible"?: bool, "opacity"?: 0–1, "blend"?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"difference", "move"?: "up"|"down"|"top"|"bottom" (past the next layer in the drawing order of all the map's layers, a feature or raster layer too), "to"?: number (its place in that order among the other layers, 0 = top; the Layers pane lists it), "rename"?: text, "bands"?: [red, green, blue] | [band] (a cloud-optimised GeoTIFF's bands shown, from 1; [] for its own), "range"?: [low, high] (the values shown from black to full colour; null: each band's 2nd–98th percentile), "dequantize"?: "aef" (AlphaEarth's quantised embeddings) | "none", "legend"?: as map.addTiles's, or null for none}"#,
         ),
         C::new("map.tiles", "Tile Layers", "Home › Add", |s, _| Ok(list(s, false))).view(),
         // As `layer.expand` for a layer's classes: what the pane shows, not an edit to undo.
@@ -153,6 +153,8 @@ pub(crate) fn list(s: &Session, redact: bool) -> Value {
                 let url = if redact { crate::sources::redact(&t.url) } else { t.url.clone() };
                 let mut o = json!({"index": i, "name": t.name, "id": t.id, "kind": t.kind.code(), "url": url, "visible": t.visible, "error": t.error,
                     "opacity": t.opacity, "blend": t.blend.code(), "overlay": t.overlay, "attribution": t.attribution, "minZoom": t.min_zoom, "maxZoom": t.max_zoom});
+                // Its place in the drawing order: over this map layer, or (none) under them all.
+                o["over"] = json!(s.map().tile_slot(t).and_then(|id| s.map().layer(id)).map(|l| l.name.clone()));
                 // Its legends, for a layer that has them, and whether they show in the Layers pane.
                 if !t.legends.is_empty() {
                     let legends: Vec<_> = t
@@ -264,8 +266,12 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     if m.tiles.len() >= MAX_TILE_LAYERS {
         return Err(format!("a map holds at most {MAX_TILE_LAYERS} tile layers"));
     }
-    // Overlays go on top; basemaps go on top of the other basemaps, under the overlays.
-    let at = if t.overlay { 0 } else { m.tiles.iter().position(|o| !o.overlay).unwrap_or(m.tiles.len()) };
+    // Overlays and data (an archive or GeoTIFF added as data) go on top of everything, the map's
+    // layers too, as every new layer does (#808); basemaps go on top of the other basemaps,
+    // under the map's layers and the overlays.
+    let top = b(p, "top").unwrap_or(t.overlay);
+    t.over = if top { m.layers.first().map(|l| l.id) } else { None };
+    let at = if top { 0 } else { m.tiles.iter().position(|o| !o.overlay && o.over.is_none()).unwrap_or(m.tiles.len()) };
     let mut out = json!({"name": t.name, "kind": t.kind.code(), "index": at});
     if t.time_url.is_some() {
         out["url"] = json!(t.url);
@@ -556,7 +562,6 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
         Some(v) => Some(legends(v)?),
     };
     let m = s.map_mut();
-    let n = m.tiles.len();
     let Some(t) = m.tiles.get_mut(i) else { return Err("no tile layer at that index".into()) };
     // Refused before anything changes.
     if look.is_some() && t.kind != TileKind::Cog {
@@ -597,16 +602,17 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
         }
         t.url = url;
     }
-    if let Some(mv) = ps(p, "move") {
-        let to = match mv {
-            "up" => i.saturating_sub(1),
-            "down" => (i + 1).min(n - 1),
-            "top" => 0,
-            "bottom" => n - 1,
-            other => return Err(format!("unknown move '{other}' (up, down, top or bottom)")),
-        };
-        let t = m.tiles.remove(i);
-        m.tiles.insert(to, t);
+    // In the drawing order of all the map's layers: past the next layer, a map layer too (#808).
+    match (ps(p, "move"), p.get("to").filter(|v| !v.is_null())) {
+        (Some(_), Some(_)) => return Err("give move or to, not both".into()),
+        (Some(mv), None) => {
+            m.move_tile(i, mv)?;
+        }
+        (None, Some(to)) => {
+            let to = to.as_u64().ok_or("to is a place in the drawing order: a whole number, 0 at the top")?;
+            m.place_tile(i, usize::try_from(to).unwrap_or(usize::MAX))?;
+        }
+        (None, None) => {}
     }
     Ok(list(s, false))
 }

@@ -28,6 +28,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Tables with an estimated row count above this aren't counted exactly when opened.
 const EXACT_COUNT_BELOW: f64 = 2_000_000.0;
 
+/// The most rows a layer loaded to be edited holds ([`PostgisSource::read_editable`]); a table of
+/// several geometry types loads each as its own layer.
+pub const MAX_EDITABLE: usize = 100_000;
+
 /// How long counting or measuring a table when it opens may take (one never analyzed has no
 /// estimate, and could be large): past it the count or extent is left unknown.
 const PROBE_TIMEOUT: &str = "10s";
@@ -153,6 +157,8 @@ enum Tls {
 pub struct Conn {
     config: postgres::Config,
     tls: Tls,
+    /// A connection that saves edits ([`connect_writable`]); every other one is read only.
+    writable: bool,
     client: Mutex<Option<postgres::Client>>,
 }
 
@@ -163,7 +169,7 @@ impl Conn {
         let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
         for attempt in 0..2 {
             if guard.as_ref().is_none_or(postgres::Client::is_closed) {
-                *guard = Some(open_client(&self.config, &self.tls)?);
+                *guard = Some(open_client(&self.config, &self.tls, self.writable)?);
             }
             let client = guard.as_mut().ok_or_else(|| DataError::Format("not connected".into()))?;
             let r = f(client);
@@ -176,6 +182,28 @@ impl Conn {
             }
         }
         Err(DataError::Format("not connected".into()))
+    }
+
+    /// Runs `f` once, without the reconnect of [`Conn::with`]: a write that failed when the connection
+    /// dropped may have been committed, so it must not run again on a new one.
+    fn once<T>(&self, f: impl FnOnce(&mut postgres::Client) -> std::result::Result<T, postgres::Error>) -> Result<T> {
+        let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_none_or(postgres::Client::is_closed) {
+            *guard = Some(open_client(&self.config, &self.tls, self.writable)?);
+        }
+        let client = guard.as_mut().ok_or_else(|| DataError::Format("not connected".into()))?;
+        let r = f(client);
+        let dropped = client.is_closed();
+        if dropped {
+            *guard = None;
+        }
+        match r {
+            Ok(v) => Ok(v),
+            Err(_) if dropped => {
+                Err(DataError::Format("the connection dropped during the save: it may have been saved, so check the table".into()))
+            }
+            Err(e) => Err(redacted(&self.config, err(e))),
+        }
     }
 
     /// Runs `f` in a read-only transaction seeing one snapshot of the database (`REPEATABLE
@@ -198,8 +226,8 @@ impl Conn {
 }
 
 /// Connects, with the password taken out of any error: a server or the client may echo what it was given.
-fn open_client(config: &postgres::Config, tls: &Tls) -> Result<postgres::Client> {
-    connect_client(config, tls).map_err(|e| redacted(config, e))
+fn open_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Result<postgres::Client> {
+    connect_client(config, tls, writable).map_err(|e| redacted(config, e))
 }
 
 fn redacted(config: &postgres::Config, error: DataError) -> DataError {
@@ -209,7 +237,7 @@ fn redacted(config: &postgres::Config, error: DataError) -> DataError {
     }
 }
 
-fn connect_client(config: &postgres::Config, tls: &Tls) -> Result<postgres::Client> {
+fn connect_client(config: &postgres::Config, tls: &Tls, writable: bool) -> Result<postgres::Client> {
     let mut client = match tls {
         Tls::Disable => config.connect(postgres::NoTls),
         Tls::Unverified | Tls::Verified(_) => config.connect(tokio_postgres_rustls::MakeRustlsConnect::new(rustls_config(tls)?)),
@@ -223,11 +251,8 @@ fn connect_client(config: &postgres::Config, tls: &Tls) -> Result<postgres::Clie
         };
         if refused_login(&e) { DataError::Login(message) } else { DataError::Format(message) }
     })?;
-    client
-        .batch_execute(&format!(
-            "SET default_transaction_read_only = on; SET statement_timeout = '{STATEMENT_TIMEOUT}'; SET extra_float_digits = 3;"
-        ))
-        .map_err(err)?;
+    let read_only = if writable { "" } else { "SET default_transaction_read_only = on; " };
+    client.batch_execute(&format!("{read_only}SET statement_timeout = '{STATEMENT_TIMEOUT}'; SET extra_float_digits = 3;")).map_err(err)?;
     Ok(client)
 }
 
@@ -297,8 +322,9 @@ impl rustls::client::danger::ServerCertVerifier for Unchecked {
     }
 }
 
-/// A live connection: its connection string and the password it was opened with.
-type Live = (String, Option<String>, Weak<Conn>);
+/// A live connection: its connection string, the password it was opened with, and whether it
+/// writes.
+type Live = (String, Option<String>, bool, Weak<Conn>);
 
 /// Live connections, so layers of one server share one.
 fn live() -> &'static Mutex<Vec<Live>> {
@@ -314,6 +340,16 @@ fn live() -> &'static Mutex<Vec<Live>> {
 /// database), libpq's `PGPASSWORD` and password file serve too; a project opening never hands
 /// them to the server it names.
 pub fn connect(dsn: &str, ask: bool) -> Result<Arc<Conn>> {
+    connect_as(dsn, ask, false)
+}
+
+/// Connects to a database to save edits: as [`connect`], but the session isn't read only. Never
+/// shared with the connections that read layers, which stay read only.
+pub fn connect_writable(dsn: &str, ask: bool) -> Result<Arc<Conn>> {
+    connect_as(dsn, ask, true)
+}
+
+fn connect_as(dsn: &str, ask: bool, writable: bool) -> Result<Arc<Conn>> {
     let (mut config, tls) = config(dsn)?;
     let password = super::duckdb::remembered_password(dsn).or_else(|| {
         if !ask {
@@ -323,8 +359,8 @@ pub fn connect(dsn: &str, ask: bool) -> Result<Arc<Conn>> {
     });
     // A connection opened with another password (one given since) isn't shared.
     let find = |live: &mut Vec<Live>| {
-        live.retain(|(_, _, w)| w.strong_count() > 0);
-        live.iter().find(|(d, p, _)| d == dsn && *p == password).and_then(|(_, _, w)| w.upgrade())
+        live.retain(|(_, _, _, w)| w.strong_count() > 0);
+        live.iter().find(|(d, p, wr, _)| d == dsn && *p == password && *wr == writable).and_then(|(_, _, _, w)| w.upgrade())
     };
     if let Some(c) = find(&mut live().lock().unwrap_or_else(|e| e.into_inner())) {
         return Ok(c);
@@ -333,14 +369,14 @@ pub fn connect(dsn: &str, ask: bool) -> Result<Arc<Conn>> {
         config.password(p);
     }
     // Connecting can take as long as the timeout: other connections don't wait for it.
-    let client = open_client(&config, &tls)?;
+    let client = open_client(&config, &tls, writable)?;
     let mut live = live().lock().unwrap_or_else(|e| e.into_inner());
     // Another layer may have connected meanwhile; this one's client then just closes.
     if let Some(c) = find(&mut live) {
         return Ok(c);
     }
-    let conn = Arc::new(Conn { config, tls, client: Mutex::new(Some(client)) });
-    live.push((dsn.to_string(), password, Arc::downgrade(&conn)));
+    let conn = Arc::new(Conn { config, tls, writable, client: Mutex::new(Some(client)) });
+    live.push((dsn.to_string(), password, writable, Arc::downgrade(&conn)));
     Ok(conn)
 }
 
@@ -635,6 +671,19 @@ pub fn families(conn: &Conn, table: &Table) -> Result<Vec<Family>> {
 // ---------------------------------------------------------------------------------------------
 // The source
 
+/// A table's rows read to be edited ([`PostgisSource::read_editable`]).
+#[derive(Debug, Default)]
+pub struct Editable {
+    /// The rows, in key order; each feature's id is its key.
+    pub features: Vec<Feature>,
+    /// Each row's key and version (`xmin`), as read.
+    pub versions: Vec<(u64, i64)>,
+    /// The rows the condition keeps, of which `features` holds the first.
+    pub matched: u64,
+    /// Whether this connection's user may insert, update and delete the table's rows.
+    pub writable: bool,
+}
+
 /// One geometry column of a table (one family of it, for a column of mixed types), read live.
 pub struct PostgisSource {
     info: SourceInfo,
@@ -648,6 +697,9 @@ pub struct PostgisSource {
     raw_srid: i32,
     /// The geometry, in its own coordinates.
     native: String,
+    /// The table's single-column integer primary key, which gives the ids: rows can be told
+    /// apart to be edited only with one.
+    key: Option<String>,
     /// The expression of each column read: the id, the geometry (as WKB, longitude/latitude),
     /// then the fields.
     select: Vec<String>,
@@ -765,6 +817,7 @@ impl PostgisSource {
         }
         let mut select = vec![id, wkb];
         select.extend(casts);
+        let key = pk;
 
         let family = family.or(table.declared_family());
         let reproject = match srid {
@@ -790,6 +843,7 @@ impl PostgisSource {
             srid,
             raw_srid,
             native,
+            key,
             select,
             reproject,
         };
@@ -797,6 +851,90 @@ impl PostgisSource {
         src.info.count = src.count_rows();
         src.info.extent = src.extent();
         Ok(src)
+    }
+
+    /// The table's single-column integer primary key, if it has one.
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    /// The SRID of the geometry read (0 when it says none).
+    pub fn srid(&self) -> i32 {
+        self.srid
+    }
+
+    /// The table and geometry column read.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Reads the rows to edit: at most `limit` of them (and [`MAX_EDITABLE`]) in key order, those
+    /// `condition` (an SQL expression on the table's columns) keeps, each with its version
+    /// (`xmin`), which saving checks the database against. One snapshot, read only: the
+    /// condition can't change anything. Needs the table's integer primary key.
+    pub fn read_editable(&self, condition: Option<&str>, limit: usize) -> Result<Editable> {
+        let key = self.key.as_deref().ok_or_else(|| {
+            DataError::Format(format!(
+                "{}: no single-column integer primary key, so its rows can't be told apart to edit",
+                self.table.label()
+            ))
+        })?;
+        let limit = limit.clamp(1, MAX_EDITABLE);
+        let from = self.table.sql_from();
+        let mut filter = self.filter(false);
+        if let Some(c) = condition.map(str::trim).filter(|c| !c.is_empty()) {
+            if c.contains(';') {
+                return Err(DataError::Format("the condition: one SQL expression, without ';'".into()));
+            }
+            filter = format!("{filter} AND ({c})");
+        }
+        let version = self.select.len();
+        let mut cols: Vec<String> = self.select.iter().enumerate().map(|(i, e)| format!("{e} AS c{i}")).collect();
+        cols.push(format!("xmin::text::int8 AS c{version}"));
+        let sql = format!("SELECT {} FROM {from} WHERE {filter} ORDER BY {} LIMIT {limit}", cols.join(", "), ident(key));
+        let rel = format!("{}.{}", ident(&self.table.schema), ident(&self.table.name));
+        let (matched, rows, writable) = self.conn.snapshot(None, |t| {
+            let n: i64 = t.query_one(format!("SELECT count(*) FROM {from} WHERE {filter}").as_str(), &[])?.try_get(0)?;
+            let writable: bool = t
+                .query_one(
+                    "SELECT has_table_privilege($1::text::regclass, 'INSERT') AND has_table_privilege($1::text::regclass, 'UPDATE')                      AND has_table_privilege($1::text::regclass, 'DELETE')",
+                    &[&rel],
+                )?
+                .try_get(0)?;
+            Ok((u64::try_from(n).unwrap_or(0), t.query(sql.as_str(), &[])?, writable))
+        })?;
+        let mut out = Editable { features: Vec::with_capacity(rows.len()), versions: Vec::with_capacity(rows.len()), matched, writable };
+        for r in &rows {
+            let (Some(f), Some(v)) = (self.feature(r), r.try_get::<_, Option<i64>>(version).ok().flatten()) else { continue };
+            out.versions.push((f.id, v));
+            out.features.push(f);
+        }
+        Ok(out)
+    }
+
+    /// A row read as a feature: the id, the geometry (WKB) and the fields, in the order of
+    /// `select`. `None` without an id or a geometry RustGIS reads.
+    fn feature(&self, r: &postgres::Row) -> Option<Feature> {
+        let id = r.try_get::<_, Option<i64>>(0).ok().flatten()?;
+        let geometry = r.try_get::<_, Option<Vec<u8>>>(1).ok().flatten().and_then(|b| wkb::decode(&b))?;
+        let attrs = self
+            .info
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let i = i + 2;
+                match f.ty {
+                    FieldType::Integer => r.try_get::<_, Option<i64>>(i).ok().flatten().map(Value::Int),
+                    FieldType::Double => r.try_get::<_, Option<f64>>(i).ok().flatten().map(Value::Float),
+                    FieldType::Boolean => r.try_get::<_, Option<bool>>(i).ok().flatten().map(Value::Bool),
+                    FieldType::Text => r.try_get::<_, Option<String>>(i).ok().flatten().map(Value::Text),
+                }
+                .unwrap_or(Value::Null)
+            })
+            .collect();
+        // A negative key keeps its bits: still one id per row, and the same on every read.
+        Some(Feature { id: id.cast_unsigned(), geometry: Some(geometry), attrs })
     }
 
     /// The table's spatial index on the column, if it has one (a view has none of its own).
@@ -940,6 +1078,315 @@ impl PostgisSource {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Saving edits
+
+/// Edits to save to a table ([`PostgisSource::save`]), by its key.
+#[derive(Debug, Default)]
+pub struct Edits {
+    /// Rows changed: each as it is now, with the version it was read at.
+    pub updates: Vec<(Feature, i64)>,
+    /// Rows deleted: their keys and the versions they were read at.
+    pub deletes: Vec<(u64, i64)>,
+    /// New rows. Each gets its key field's value when that is a whole number, else the table's
+    /// default key when it has one, else its feature id.
+    pub inserts: Vec<Feature>,
+}
+
+impl Edits {
+    pub fn is_empty(&self) -> bool {
+        self.updates.is_empty() && self.deletes.is_empty() && self.inserts.is_empty()
+    }
+}
+
+/// Why edits weren't saved: a row in the database isn't as it was read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conflict {
+    /// A row changed in the database since it was read.
+    Changed(u64),
+    /// A row deleted from the database since it was read.
+    Deleted(u64),
+    /// A new row's key is already taken.
+    Exists(u64),
+}
+
+impl std::fmt::Display for Conflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Keys keep their sign (feature ids hold their bits).
+        match self {
+            Conflict::Changed(k) => write!(f, "row {} was changed in the database since it was read", k.cast_signed()),
+            Conflict::Deleted(k) => write!(f, "row {} was deleted from the database since it was read", k.cast_signed()),
+            Conflict::Exists(k) => write!(f, "a row with key {} is already in the database", k.cast_signed()),
+        }
+    }
+}
+
+/// What saving edits did.
+#[derive(Debug, Default)]
+pub struct Saved {
+    /// Each new row's feature id and the key it was saved with.
+    pub inserted: Vec<(u64, u64)>,
+    pub updated: usize,
+    /// Rows edited only in what the table doesn't hold, left as they are.
+    pub unchanged: usize,
+    pub deleted: usize,
+    /// The version of each row inserted or updated, as saved.
+    pub versions: Vec<(u64, i64)>,
+    /// The layer's fields the table has no column for, which weren't saved.
+    pub skipped_fields: Vec<String>,
+}
+
+/// A column a value is written to: the layer's field, its type in the table, and the field of
+/// the rows as read that holds its value.
+struct Target {
+    field: usize,
+    name: String,
+    ty: String,
+    read: usize,
+}
+
+/// A parameter of a statement.
+type Param = Box<dyn ToSql + Sync>;
+
+fn refs(params: &[Param]) -> Vec<&(dyn ToSql + Sync)> {
+    params.iter().map(|p| p.as_ref() as &(dyn ToSql + Sync)).collect()
+}
+
+/// A value as text for the server to cast to its column's type (`NULL` for none).
+fn text_value(v: &Value) -> Option<String> {
+    match v {
+        Value::Null => None,
+        Value::Int(i) => Some(i.to_string()),
+        Value::Float(x) if x.is_nan() => Some("NaN".into()),
+        Value::Float(x) if x.is_infinite() => Some(if *x > 0.0 { "Infinity" } else { "-Infinity" }.into()),
+        Value::Float(x) => Some(x.to_string()),
+        Value::Text(t) => Some(t.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+    }
+}
+
+impl PostgisSource {
+    /// The geometry of parameter `$n` (WKB in longitude/latitude) as the column holds it: in its
+    /// coordinate system, its single or multi type, and its dimensions.
+    fn geometry_in(&self, n: usize, dims: i32) -> String {
+        let t = &self.table;
+        let mut e = format!("ST_SetSRID(ST_GeomFromWKB(${n}::bytea), 4326)");
+        if !t.geography {
+            if self.srid != 0 && self.srid != 4326 {
+                e = format!("ST_Transform({e}, {})", self.srid);
+            }
+            // A column without a coordinate system of its own: the rows' (or none).
+            if self.raw_srid != self.srid || self.srid == 0 {
+                e = format!("ST_SetSRID({e}, {})", self.raw_srid);
+            }
+        }
+        let kind = t.kind.to_ascii_uppercase();
+        let has_m = kind.ends_with('M') && !kind.ends_with("ZM") && dims == 3;
+        let base = kind.trim_end_matches(['Z', 'M']);
+        // RustGIS holds lines and polygons as multi-part: one part goes in a single-type column as
+        // that type, more fail there as the server says. A column of any type keeps what it holds.
+        if base.starts_with("MULTI") {
+            e = format!("ST_Multi({e})");
+        } else if base != "GEOMETRYCOLLECTION" && base != "GEOMETRY" {
+            e = format!("(SELECT CASE WHEN ST_NumGeometries(g) = 1 THEN ST_GeometryN(g, 1) ELSE g END FROM (SELECT {e} AS g) s)");
+        }
+        e = match dims {
+            4 => format!("ST_Force4D({e})"),
+            3 if has_m => format!("ST_Force3DM({e})"),
+            3 => format!("ST_Force3DZ({e})"),
+            _ => e,
+        };
+        if t.geography { format!("({e})::geography") } else { e }
+    }
+
+    /// Saves edits to the table in one transaction: every row changed or deleted is locked and
+    /// must be at the version it was read at, and every new row's key free; otherwise nothing is
+    /// saved and the conflicts are the answer. Only the columns whose values changed are
+    /// written (a value read through a cast, such as a `numeric` as a number, is left as it is
+    /// unless it changed). `fields` are the layer's, matched to the table's columns by name.
+    /// Needs a connection from [`connect_writable`].
+    pub fn save(&self, edits: &Edits, fields: &[Field]) -> Result<std::result::Result<Saved, Vec<Conflict>>> {
+        let key = self.key.as_deref().ok_or_else(|| {
+            DataError::Format(format!(
+                "{}: no single-column integer primary key, so its rows can't be told apart to save",
+                self.table.label()
+            ))
+        })?;
+        if !self.conn.writable {
+            return Err(DataError::Format("this connection only reads".into()));
+        }
+        let k = ident(key);
+        let from = self.table.sql_from();
+        let rel = format!("{}.{}", ident(&self.table.schema), ident(&self.table.name));
+        let column = ident(&self.table.column);
+        let key_field = fields.iter().position(|f| f.name == key);
+        self.conn.once(|c| {
+            let mut t = c.build_transaction().isolation_level(postgres::IsolationLevel::ReadCommitted).start()?;
+            // The table's columns: their types, whether they are computed, and whether they have
+            // a default.
+            let columns: std::collections::HashMap<String, (String, bool, bool)> = t
+                .query(
+                    "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), \
+                     COALESCE(to_jsonb(a) ->> 'attgenerated', '') <> '', \
+                     a.atthasdef OR COALESCE(to_jsonb(a) ->> 'attidentity', '') <> '' \
+                     FROM pg_attribute a WHERE a.attrelid = $1::text::regclass AND a.attnum > 0 AND NOT a.attisdropped",
+                    &[&rel],
+                )?
+                .iter()
+                .filter_map(|r| Some((r.try_get(0).ok()?, (r.try_get(1).ok()?, r.try_get(2).ok()?, r.try_get(3).ok()?))))
+                .collect();
+            let key_default = columns.get(key).is_some_and(|c| c.2);
+            let mut saved = Saved::default();
+            let mut targets = Vec::new();
+            for (i, f) in fields.iter().enumerate() {
+                if f.name == key || f.name == self.table.column {
+                    continue;
+                }
+                match (columns.get(&f.name), self.info.fields.iter().position(|g| g.name == f.name)) {
+                    (Some((ty, false, _)), Some(read)) => targets.push(Target { field: i, name: f.name.clone(), ty: ty.clone(), read }),
+                    // Computed by the database.
+                    (Some((_, true, _)), _) => {}
+                    _ => saved.skipped_fields.push(f.name.clone()),
+                }
+            }
+            let dims: i32 = t
+                .query_opt(
+                    "SELECT coord_dimension FROM geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2 AND f_geometry_column = $3 \
+                     UNION ALL SELECT coord_dimension FROM geography_columns WHERE f_table_schema = $1 AND f_table_name = $2 AND f_geography_column = $3 \
+                     LIMIT 1",
+                    &[&self.table.schema, &self.table.name, &self.table.column],
+                )?
+                .and_then(|r| r.try_get(0).ok())
+                .unwrap_or(2);
+
+            // The rows read: locked, and still as they were.
+            let read: Vec<i64> =
+                edits.updates.iter().map(|(f, _)| f.id.cast_signed()).chain(edits.deletes.iter().map(|(k, _)| k.cast_signed())).collect();
+            let now: std::collections::HashMap<i64, i64> = t
+                .query(format!("SELECT {k}::int8, xmin::text::int8 FROM {from} WHERE {k} = ANY($1::int8[]) FOR UPDATE").as_str(), &[&read])?
+                .iter()
+                .filter_map(|r| Some((r.try_get(0).ok()?, r.try_get(1).ok()?)))
+                .collect();
+            let mut conflicts = Vec::new();
+            for (id, version) in edits.updates.iter().map(|(f, v)| (f.id, *v)).chain(edits.deletes.iter().copied()) {
+                match now.get(&id.cast_signed()) {
+                    None => conflicts.push(Conflict::Deleted(id)),
+                    Some(v) if *v != version => conflicts.push(Conflict::Changed(id)),
+                    Some(_) => {}
+                }
+            }
+            // New rows' keys: free, and each once.
+            let new_key = |f: &Feature| -> Option<i64> {
+                match key_field.and_then(|i| f.attrs.get(i)) {
+                    Some(Value::Int(v)) => Some(*v),
+                    _ if key_default => None,
+                    _ => Some(f.id.cast_signed()),
+                }
+            };
+            let given: Vec<i64> = edits.inserts.iter().filter_map(new_key).collect();
+            let mut seen = std::collections::HashSet::new();
+            for g in &given {
+                if !seen.insert(*g) {
+                    conflicts.push(Conflict::Exists(g.cast_unsigned()));
+                }
+            }
+            for r in t.query(format!("SELECT {k}::int8 FROM {from} WHERE {k} = ANY($1::int8[])").as_str(), &[&given])? {
+                if let Ok(g) = r.try_get::<_, i64>(0) {
+                    conflicts.push(Conflict::Exists(g.cast_unsigned()));
+                }
+            }
+            if !conflicts.is_empty() {
+                // Dropped unsaved: rolled back, the locks let go.
+                return Ok(Err(conflicts));
+            }
+
+            // Updates: the columns whose values differ from the rows as they are (as they were
+            // read, since their versions match).
+            let mut written: Vec<i64> = Vec::new();
+            let ids: Vec<i64> = edits.updates.iter().map(|(f, _)| f.id.cast_signed()).collect();
+            let cols: Vec<String> = self.select.iter().enumerate().map(|(i, e)| format!("{e} AS c{i}")).collect();
+            let current: std::collections::HashMap<u64, Feature> = t
+                .query(format!("SELECT {} FROM {from} WHERE {k} = ANY($1::int8[])", cols.join(", ")).as_str(), &[&ids])?
+                .iter()
+                .filter_map(|r| self.feature(r))
+                .map(|f| (f.id, f))
+                .collect();
+            for (f, _) in &edits.updates {
+                let was = current.get(&f.id);
+                let mut sets = Vec::new();
+                let mut params: Vec<Param> = Vec::new();
+                for tg in &targets {
+                    let value = f.attrs.get(tg.field).unwrap_or(&Value::Null);
+                    if was.and_then(|w| w.attrs.get(tg.read)) == Some(value) {
+                        continue;
+                    }
+                    params.push(Box::new(text_value(value)));
+                    sets.push(format!("{} = CAST(${}::text AS {})", ident(&tg.name), params.len(), tg.ty));
+                }
+                if let Some(g) = &f.geometry
+                    && was.and_then(|w| w.geometry.as_ref()) != Some(g)
+                {
+                    params.push(Box::new(wkb::encode(g)));
+                    sets.push(format!("{column} = {}", self.geometry_in(params.len(), dims)));
+                }
+                if sets.is_empty() {
+                    saved.unchanged += 1;
+                    continue;
+                }
+                params.push(Box::new(f.id.cast_signed()));
+                let sql = format!("UPDATE {from} SET {} WHERE {k} = ${}::int8", sets.join(", "), params.len());
+                t.execute(sql.as_str(), &refs(&params))?;
+                saved.updated += 1;
+                written.push(f.id.cast_signed());
+            }
+
+            // New rows: their values, the defaults for the rest.
+            for f in &edits.inserts {
+                let (mut names, mut values, mut params): (Vec<String>, Vec<String>, Vec<Param>) = Default::default();
+                if let Some(v) = new_key(f) {
+                    params.push(Box::new(v));
+                    names.push(k.clone());
+                    values.push(format!("${}::int8", params.len()));
+                }
+                for tg in &targets {
+                    let value = f.attrs.get(tg.field).unwrap_or(&Value::Null);
+                    if *value == Value::Null {
+                        continue;
+                    }
+                    params.push(Box::new(text_value(value)));
+                    names.push(ident(&tg.name));
+                    values.push(format!("CAST(${}::text AS {})", params.len(), tg.ty));
+                }
+                if let Some(g) = &f.geometry {
+                    params.push(Box::new(wkb::encode(g)));
+                    names.push(column.clone());
+                    values.push(self.geometry_in(params.len(), dims));
+                }
+                let sql = if names.is_empty() {
+                    format!("INSERT INTO {from} DEFAULT VALUES RETURNING {k}::int8")
+                } else {
+                    format!("INSERT INTO {from} ({}) VALUES ({}) RETURNING {k}::int8", names.join(", "), values.join(", "))
+                };
+                let id: i64 = t.query_one(sql.as_str(), &refs(&params))?.try_get(0)?;
+                saved.inserted.push((f.id, id.cast_unsigned()));
+                written.push(id);
+            }
+
+            let gone: Vec<i64> = edits.deletes.iter().map(|(k, _)| k.cast_signed()).collect();
+            if !gone.is_empty() {
+                saved.deleted = usize::try_from(t.execute(format!("DELETE FROM {from} WHERE {k} = ANY($1::int8[])").as_str(), &[&gone])?).unwrap_or(0);
+            }
+            saved.versions = t
+                .query(format!("SELECT {k}::int8, xmin::text::int8 FROM {from} WHERE {k} = ANY($1::int8[])").as_str(), &[&written])?
+                .iter()
+                .filter_map(|r| Some((r.try_get::<_, i64>(0).ok()?.cast_unsigned(), r.try_get(1).ok()?)))
+                .collect();
+            t.commit()?;
+            Ok(Ok(saved))
+        })
+    }
+}
+
 fn row_extent(r: &postgres::Row) -> Option<Extent> {
     let v: Vec<f64> = (0..4).filter_map(|i| r.try_get::<_, Option<f64>>(i).ok().flatten()).collect();
     match v.as_slice() {
@@ -988,35 +1435,18 @@ impl FeatureSource for PostgisSource {
         })?;
         out.matched = matched;
         for r in &rows {
-            let id = r.try_get::<_, Option<i64>>(0).ok().flatten();
-            let geom = r.try_get::<_, Option<Vec<u8>>>(1).ok().flatten().and_then(|b| wkb::decode(&b));
-            let (Some(id), Some(geometry)) = (id, geom) else {
+            let Some(feature) = self.feature(r) else {
                 out.skipped += 1;
                 continue;
             };
             // The index matched the request's box in the table's coordinates, which holds more
             // than the request when they are projected.
-            if !in_request(&geometry, req) {
+            if let Some(geometry) = &feature.geometry
+                && !in_request(geometry, req)
+            {
                 continue;
             }
-            let attrs = self
-                .info
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(i, f)| {
-                    let i = i + 2;
-                    match f.ty {
-                        FieldType::Integer => r.try_get::<_, Option<i64>>(i).ok().flatten().map(Value::Int),
-                        FieldType::Double => r.try_get::<_, Option<f64>>(i).ok().flatten().map(Value::Float),
-                        FieldType::Boolean => r.try_get::<_, Option<bool>>(i).ok().flatten().map(Value::Bool),
-                        FieldType::Text => r.try_get::<_, Option<String>>(i).ok().flatten().map(Value::Text),
-                    }
-                    .unwrap_or(Value::Null)
-                })
-                .collect();
-            // A negative key keeps its bits: still one id per row, and the same on every read.
-            out.features.push(Feature { id: id.cast_unsigned(), geometry: Some(geometry), attrs });
+            out.features.push(feature);
         }
         out.complete = step <= 1 && (rows.len() as u64) >= out.matched;
         Ok(out)
@@ -1036,6 +1466,43 @@ mod tests {
         assert_eq!(family_of("CURVEPOLYGON"), Some(Family::Polygons));
         assert_eq!(family_of("GEOMETRY"), None);
         assert_eq!(family_of("GEOMETRYCOLLECTION"), None);
+    }
+
+    #[test]
+    fn unconstrained_geometry_keeps_its_parts() {
+        let source = |kind: &str| PostgisSource {
+            info: SourceInfo {
+                name: "t".into(),
+                format: "PostGIS",
+                geometry_type: GeometryType::Polygon,
+                fields: Vec::new(),
+                extent: Extent::EMPTY,
+                count: None,
+                crs: "EPSG:4326".into(),
+                indexed: false,
+                notes: Vec::new(),
+            },
+            conn: Arc::new(Conn { config: postgres::Config::new(), tls: Tls::Disable, writable: false, client: Mutex::new(None) }),
+            table: Table {
+                schema: "public".into(),
+                name: "t".into(),
+                column: "geom".into(),
+                srid: 0,
+                kind: kind.into(),
+                geography: false,
+                several: false,
+            },
+            family: None,
+            srid: 0,
+            raw_srid: 0,
+            native: String::new(),
+            key: None,
+            select: Vec::new(),
+            reproject: None,
+        };
+        // A typed column takes one part as its type; an unconstrained one keeps the geometry as it is.
+        assert!(source("POLYGON").geometry_in(1, 2).contains("ST_NumGeometries"));
+        assert!(!source("GEOMETRY").geometry_in(1, 2).contains("ST_NumGeometries"));
     }
 
     #[test]

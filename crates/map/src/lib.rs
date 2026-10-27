@@ -6,6 +6,7 @@ pub mod camera;
 pub mod color;
 pub mod design;
 pub mod effects;
+pub mod fills;
 pub mod globe;
 pub mod graphics;
 pub mod layout;
@@ -149,6 +150,11 @@ pub struct Layer {
     /// [`LineStroke`]); a stroke without markers draws nothing there.
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "symbology::de_strokes")]
     pub line_strokes: Vec<symbology::LineStroke>,
+    /// A polygon layer's stacked fills, drawn bottom first inside each polygon in place of its
+    /// symbol's fill (none: that fill alone); the outline is drawn over them (see
+    /// [`fills::FillLayer`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "fills::de_fills")]
+    pub fill_layers: Vec<fills::FillLayer>,
     /// Draws the stacked strokes in levels (symbol levels): every feature's strokes of one
     /// [`LineStroke::level`] before any of the next, so road casings join under the cores
     /// instead of cutting across them where lines meet.
@@ -176,6 +182,10 @@ pub struct Layer {
     /// Set for streamed layers, whose `dataset` holds the features of the last view read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<source::SourceLayer>,
+    /// Set for a layer loaded whole from a PostGIS table to be edited: the table its edits are
+    /// saved to, and the rows' versions as loaded (desktop only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgis: Option<source::PostgisEdit>,
     /// Shared, like the features: an undo snapshot or other copy of the layer doesn't copy it.
     #[serde(skip)]
     projected: std::sync::Arc<Vec<Option<Geometry>>>,
@@ -313,6 +323,7 @@ impl Layer {
             aggregation: None,
             extrusion: None,
             line_strokes: Vec::new(),
+            fill_layers: Vec::new(),
             stroke_levels: false,
             marker_rotation: None,
             reference_scale: None,
@@ -320,6 +331,7 @@ impl Layer {
             design: design::Design::default(),
             raster: None,
             source: None,
+            postgis: None,
             projected: Default::default(),
             projected_extents: Default::default(),
             projected_vertices: 0,
@@ -554,6 +566,36 @@ impl Layer {
     /// Whether some feature may be drawn with stacked strokes ([`Layer::strokes`]).
     pub fn has_strokes(&self) -> bool {
         !self.graphics && (!self.line_strokes.is_empty() || self.renderer.has_class_strokes())
+    }
+
+    /// A polygon row's stacked fills: its class's own, else the layer's `fill_layers` (none: its
+    /// symbol's single fill).
+    pub fn fills(&self, row: usize) -> &[fills::FillLayer] {
+        if self.graphics {
+            return &[];
+        }
+        // A class without fills of its own takes the layer's: a layer with no class fills isn't
+        // classed for them.
+        if !self.renderer.has_class_fills() {
+            return &self.fill_layers;
+        }
+        self.renderer.fills_for(&self.dataset, row).unwrap_or(&self.fill_layers)
+    }
+
+    /// A polygon row's symbol, stacked strokes and stacked fills ([`Layer::style`],
+    /// [`Layer::fills`]), the feature classed once for all three.
+    pub fn style_and_fills(&self, row: usize) -> (Symbol, &[LineStroke], &[fills::FillLayer]) {
+        if self.graphics || !self.renderer.has_class_fills() {
+            let (symbol, strokes) = self.style(row);
+            return (symbol, strokes, self.fills(row));
+        }
+        let (symbol, strokes, fills) = self.renderer.style_fills_for(&self.dataset, row);
+        (symbol, strokes.unwrap_or(&self.line_strokes), fills.unwrap_or(&self.fill_layers))
+    }
+
+    /// Whether some feature may be drawn with stacked fills ([`Layer::fills`]).
+    pub fn has_fills(&self) -> bool {
+        !self.graphics && (!self.fill_layers.is_empty() || self.renderer.has_class_fills())
     }
 
     pub fn is_raster(&self) -> bool {
@@ -884,6 +926,15 @@ impl LayerGroup {
     }
 }
 
+/// An entry in the drawing order of all a map's layers ([`Map::stack`]), by index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drawn {
+    /// A map layer: `Map::layers[i]`.
+    Layer(usize),
+    /// A web tile layer: `Map::tiles[i]`.
+    Tile(usize),
+}
+
 /// A map: an ordered list of layers (index 0 draws on top), a basemap and a camera.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Map {
@@ -895,7 +946,8 @@ pub struct Map {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<LayerGroup>,
     pub basemap: Basemap,
-    /// Web tile basemaps and overlays over the basemap and under the layers (index 0 on top).
+    /// Web tile basemaps and overlays (index 0 on top), each drawn over the map layer it names
+    /// (`TileLayer::over`), or under all of them; see [`Map::stack`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tiles: Vec<TileLayer>,
     pub camera: Camera,
@@ -1149,6 +1201,7 @@ impl Map {
     pub fn add_group(&mut self, mut group: LayerGroup) -> u32 {
         group.id = self.next_id();
         let id = group.id;
+        self.settle_tiles();
         for g in &mut self.groups {
             g.children.retain(|c| !group.children.contains(c));
         }
@@ -1156,6 +1209,7 @@ impl Map {
             self.lift_out(*c);
         }
         self.groups.push(group);
+        self.settle_tiles();
         id
     }
 
@@ -1168,7 +1222,13 @@ impl Map {
         while at > 0 && self.splits_group(at) {
             at -= 1;
         }
-        self.layers.insert(at.min(self.layers.len()), l);
+        self.layers.insert(i, l);
+        if at != i {
+            // Moving: the tile layers drawn over it keep their place.
+            self.release_tiles(&[layer]);
+            let l = self.layers.remove(i);
+            self.layers.insert(at.min(self.layers.len()), l);
+        }
     }
 
     pub fn group(&self, id: u32) -> Option<&LayerGroup> {
@@ -1210,6 +1270,7 @@ impl Map {
     /// Folds each group's visibility, transparency and scale range into its children and drops
     /// the groups: for exports that know only layers.
     pub fn bake_groups(&mut self) {
+        self.settle_tiles();
         for g in std::mem::take(&mut self.groups) {
             for l in self.layers.iter_mut().filter(|l| g.children.contains(&l.id)) {
                 l.visible &= g.visible;
@@ -1233,14 +1294,18 @@ impl Map {
         if group.is_some() && self.group_of(layer).map(|g| g.id) == group {
             return;
         }
+        self.settle_tiles();
         for g in &mut self.groups {
             g.children.retain(|c| *c != layer);
         }
         self.lift_out(layer);
-        let Some(gid) = group else { return };
-        let Some(g) = self.groups.iter_mut().find(|g| g.id == gid) else { return };
-        g.children.push(layer);
-        self.gather_group(gid);
+        if let Some(gid) = group
+            && let Some(g) = self.groups.iter_mut().find(|g| g.id == gid)
+        {
+            g.children.push(layer);
+            self.gather_group(gid);
+        }
+        self.settle_tiles();
     }
 
     /// Puts a layer in a group, or out of any (`None`), and in the drawing order just above the
@@ -1266,6 +1331,8 @@ impl Map {
                 return Err("the layer to go before isn't in the group".into());
             }
         }
+        let places = self.pin_tile_places();
+        self.release_tiles(&[layer]);
         for g in &mut self.groups {
             g.children.retain(|c| *c != layer);
         }
@@ -1282,10 +1349,14 @@ impl Map {
                 at -= 1;
             }
         }
-        self.layers.insert(at.min(self.layers.len()), l);
+        let at = at.min(self.layers.len());
+        self.layers.insert(at, l);
         if let Some(g) = group.and_then(|g| self.groups.iter_mut().find(|x| x.id == g)) {
             g.children.push(layer);
         }
+        // (Back where it was taken from: nothing moved.)
+        self.keep_tiles_if_unmoved(at == from, places);
+        self.settle_tiles();
         Ok(())
     }
 
@@ -1293,6 +1364,12 @@ impl Map {
     /// the bottom); a position inside another group's run moves up above that group.
     pub fn move_group(&mut self, group: u32, to: usize) -> Result<(), String> {
         let children = self.group(group).ok_or("no such group")?.children.clone();
+        let places = self.pin_tile_places();
+        // Where the group's layers are now: put back at the start of their run, unbroken, they
+        // haven't moved.
+        let run: Vec<usize> = self.layers.iter().enumerate().filter(|(_, l)| children.contains(&l.id)).map(|(i, _)| i).collect();
+        let start = run.first().copied().filter(|s| run.iter().enumerate().all(|(k, i)| *i == s + k));
+        self.release_tiles(&children);
         let (members, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.layers).into_iter().partition(|l| children.contains(&l.id));
         self.layers = rest;
         if members.is_empty() {
@@ -1305,6 +1382,8 @@ impl Map {
         let tail = self.layers.split_off(at);
         self.layers.extend(members);
         self.layers.extend(tail);
+        self.keep_tiles_if_unmoved(start == Some(at), places);
+        self.settle_tiles();
         Ok(())
     }
 
@@ -1326,6 +1405,7 @@ impl Map {
         rest.extend(members);
         rest.extend(tail);
         self.layers = rest;
+        self.settle_tiles();
     }
 
     /// The map's layers as they stand (their ids in order, and the next id), cheap to take before
@@ -1342,23 +1422,219 @@ impl Map {
         self.next_layer_id = mark.next;
     }
 
-    /// Inserts a layer on top of the layers of its kind: points above lines above polygons above
-    /// rasters, as GIS apps insert them.
-    fn insert_ranked(&mut self, layer: Layer) {
-        let rank = |l: &Layer| match (l.is_raster(), l.geometry_type()) {
-            (true, _) => 4,
-            (_, GeometryType::Point) => 0,
-            (_, GeometryType::Polyline) => 1,
-            (_, GeometryType::Polygon) => 2,
-            (_, GeometryType::None) => 3,
-        };
-        let r = rank(&layer);
-        let mut pos = self.layers.iter().position(|l| rank(l) >= r).unwrap_or(self.layers.len());
-        // Never between two layers of one group: above the group instead.
-        while pos > 0 && self.splits_group(pos) {
-            pos -= 1;
+    /// Inserts a layer on top of the drawing order, whatever its kind, as GeoLibre adds them
+    /// (#808): above every layer, and above the tile layers drawn over them.
+    fn insert_on_top(&mut self, layer: Layer) {
+        self.layers.insert(0, layer);
+    }
+
+    /// The map's layers as the Layers pane lists them, top first: each layer outside a group
+    /// alone, each group's layers together (in order), service groups aside.
+    fn units(&self) -> Vec<Vec<u32>> {
+        let group: std::collections::HashMap<u32, u32> =
+            self.groups.iter().flat_map(|g| g.children.iter().map(move |c| (*c, g.id))).collect();
+        let mut units: Vec<Vec<u32>> = Vec::new();
+        // A group's unit, by group.
+        let mut at: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+        for l in &self.layers {
+            match group.get(&l.id) {
+                Some(g) => match at.get(g).and_then(|k| units.get_mut(*k)) {
+                    Some(u) => u.push(l.id),
+                    None => {
+                        at.insert(*g, units.len());
+                        units.push(vec![l.id]);
+                    }
+                },
+                None => units.push(vec![l.id]),
+            }
         }
-        self.layers.insert(pos, layer);
+        units
+    }
+
+    /// Where each tile layer is drawn, by index: just over this map layer (the topmost of its
+    /// group, as a tile layer never goes inside one), or under all of them (None, as for a layer
+    /// it names that the map no longer has).
+    pub fn tile_slots(&self) -> Vec<Option<u32>> {
+        if self.tiles.iter().all(|t| t.over.is_none()) {
+            return vec![None; self.tiles.len()];
+        }
+        let top: std::collections::HashMap<u32, u32> = self
+            .units()
+            .into_iter()
+            .filter_map(|u| u.first().copied().map(|t| (u, t)))
+            .flat_map(|(u, t)| u.into_iter().map(move |l| (l, t)))
+            .collect();
+        self.tiles.iter().map(|t| t.over.and_then(|o| top.get(&o).copied())).collect()
+    }
+
+    /// Where `tile` is drawn (see [`Map::tile_slots`]).
+    pub fn tile_slot(&self, tile: &TileLayer) -> Option<u32> {
+        let over = tile.over?;
+        self.units().into_iter().find(|u| u.contains(&over)).and_then(|u| u.first().copied())
+    }
+
+    /// The drawing order of all the map's layers, top first: the map layers, each with the
+    /// tile layers drawn over it above it, and the tile layers under them all last (#808).
+    pub fn stack(&self) -> Vec<Drawn> {
+        let slots = self.tile_slots();
+        let over = |id: Option<u32>| slots.iter().enumerate().filter(move |(_, s)| **s == id).map(|(i, _)| Drawn::Tile(i));
+        let mut out = Vec::with_capacity(self.layers.len() + self.tiles.len());
+        for (i, l) in self.layers.iter().enumerate() {
+            out.extend(over(Some(l.id)));
+            out.push(Drawn::Layer(i));
+        }
+        out.extend(over(None));
+        out
+    }
+
+    /// The tile layers drawn just over the map layer `over` (None: under all of them), top
+    /// first, by index.
+    pub fn tiles_over(&self, over: Option<u32>) -> Vec<usize> {
+        self.tile_slots().into_iter().enumerate().filter(|(_, s)| *s == over).map(|(i, _)| i).collect()
+    }
+
+    /// Stores each tile layer's place as the layer it's drawn over now (a group's topmost), so a
+    /// change to the groups later leaves it where it is.
+    fn pin_tiles(&mut self) {
+        let slots = self.tile_slots();
+        for (t, s) in self.tiles.iter_mut().zip(slots) {
+            t.over = s;
+        }
+    }
+
+    /// Puts the tile layers in their drawing order (index 0 on top, as the pop-ups, the AI
+    /// Assistant and `map.tiles` read them). Returns where `index` went.
+    fn sort_tiles(&mut self, index: usize) -> usize {
+        let order: Vec<usize> = self.stack().into_iter().filter_map(|d| if let Drawn::Tile(i) = d { Some(i) } else { None }).collect();
+        let mut old: Vec<Option<TileLayer>> = std::mem::take(&mut self.tiles).into_iter().map(Some).collect();
+        self.tiles = order.iter().filter_map(|i| old.get_mut(*i).and_then(Option::take)).collect();
+        // (none is left out: the stack lists every tile layer once)
+        self.tiles.extend(old.into_iter().flatten());
+        order.iter().position(|i| *i == index).unwrap_or(index)
+    }
+
+    /// Moves the tile layer at `index` in the drawing order of all the map's layers: past the
+    /// next tile layer, or past the next map layer (a group's layers at once); `"top"` and
+    /// `"bottom"` take it to the ends. Returns its new index among the tile layers.
+    pub fn move_tile(&mut self, index: usize, to: &str) -> Result<usize, String> {
+        if index >= self.tiles.len() {
+            return Err("no such tile layer".into());
+        }
+        self.pin_tiles();
+        let index = self.sort_tiles(index);
+        // The places a tile layer can be, top first: over each group or layer, then under all.
+        let mut places: Vec<Option<u32>> = self.units().iter().filter_map(|u| u.first().copied()).map(Some).collect();
+        places.push(None);
+        // Sorted, the tile layers of a place are next to each other, in their order.
+        let here = self.tiles.get(index).and_then(|t| t.over);
+        let k = places.iter().position(|p| *p == here).unwrap_or(places.len() - 1);
+        let mates = self.tiles_over(here);
+        let at = mates.iter().position(|i| *i == index).unwrap_or(0);
+        // (the place, and whether it goes on top of the tile layers already there)
+        let (place, on_top, swap) = match to {
+            "up" if at > 0 => (here, false, mates.get(at - 1).copied()),
+            "up" if k > 0 => (places.get(k - 1).copied().flatten(), false, None),
+            "down" if at + 1 < mates.len() => (here, false, mates.get(at + 1).copied()),
+            "down" if k + 1 < places.len() => (places.get(k + 1).copied().flatten(), true, None),
+            "top" => (places.first().copied().flatten(), true, None),
+            "bottom" => (None, false, None),
+            "up" | "down" => return Err("the tile layer can't move further".into()),
+            _ => return Err(format!("unknown move {to:?}: up, down, top or bottom")),
+        };
+        if let Some(other) = swap {
+            self.tiles.swap(index, other);
+            return Ok(other);
+        }
+        let mut t = self.tiles.remove(index);
+        t.over = place;
+        let mates = self.tiles_over(place);
+        let at = if on_top { mates.first().copied().unwrap_or(0) } else { mates.last().map_or(self.tiles.len(), |i| i + 1) };
+        let at = at.min(self.tiles.len());
+        self.tiles.insert(at, t);
+        Ok(self.sort_tiles(at))
+    }
+
+    /// Puts the tile layer at `index` at place `to` in the drawing order of all the map's
+    /// layers without it ([`Map::stack`], 0 = top; past the end, the bottom): over the map layer
+    /// below that place (above its group, as a tile layer never goes inside one). Returns its
+    /// new index among the tile layers.
+    pub fn place_tile(&mut self, index: usize, to: usize) -> Result<usize, String> {
+        if index >= self.tiles.len() {
+            return Err("no such tile layer".into());
+        }
+        self.pin_tiles();
+        let mut t = self.tiles.remove(index);
+        let stack = self.stack();
+        let to = to.min(stack.len());
+        let (above, below) = stack.split_at(to);
+        t.over = below.iter().find_map(|d| match d {
+            Drawn::Layer(i) => self.layers.get(*i).map(|l| l.id),
+            Drawn::Tile(_) => None,
+        });
+        t.over = self.tile_slot(&t);
+        let mates = self.tiles_over(t.over);
+        // After the tile layers of its place drawn above it; else before the others there.
+        let higher = above.iter().filter_map(|d| if let Drawn::Tile(i) = d { Some(*i) } else { None }).filter(|i| mates.contains(i)).max();
+        let at = higher.map_or_else(|| mates.first().copied().unwrap_or(0), |i| i + 1).min(self.tiles.len());
+        self.tiles.insert(at, t);
+        Ok(self.sort_tiles(at))
+    }
+
+    /// Hands the tile layers drawn over any of the layers `moving` (about to move or go) to the
+    /// layer they then sit over: the next one down that stays, so they keep their place.
+    pub fn release_tiles(&mut self, moving: &[u32]) {
+        if self.tiles.iter().all(|t| t.over.is_none()) {
+            return;
+        }
+        self.pin_tiles();
+        let layers = &self.layers;
+        for t in &mut self.tiles {
+            let Some(over) = t.over.filter(|o| moving.contains(o)) else { continue };
+            let from = layers.iter().position(|l| l.id == over).unwrap_or(layers.len());
+            t.over = layers.iter().skip(from).map(|l| l.id).find(|id| !moving.contains(id));
+        }
+        self.sort_tiles(0);
+    }
+
+    /// The tile layers in their drawing order and places, each pinned to the layer it is drawn over now
+    /// under the groups as they are (a move inside a group leaves `over` on a layer that is no
+    /// longer the group's top), as [`Map::release_tiles`] pins them, and sorted into the drawing
+    /// order (`self.tiles` itself, so tile layer indices may change, as `release_tiles` changes
+    /// them too). `None` when no tile layer has a place. Kept whole: a tile layer's `id` may be empty or shared, so it can't tell them
+    /// apart.
+    fn pin_tile_places(&mut self) -> Option<Vec<TileLayer>> {
+        if self.tiles.iter().all(|t| t.over.is_none()) {
+            return None;
+        }
+        self.pin_tiles();
+        // In the drawing order as it is, which a later merge of their places (a layer put in a
+        // group) keeps: the list may be out of it (a change to the groups re-seats tile layers
+        // without sorting them).
+        self.sort_tiles(0);
+        Some(self.tiles.clone())
+    }
+
+    /// Puts the tile layers back as `places` had them, in their drawing order, when the layers
+    /// were `unmoved`: put back where they were taken from (a layer placed on its own spot, a
+    /// group moved to where it is), told by their places, not their ids (which a project may
+    /// repeat). Such a move doesn't hand the tile layers over them to the layer below, as
+    /// [`Map::release_tiles`] did. A layer that only changed group (put in the group just above
+    /// it, say) keeps its tile layers too, and the caller's [`Map::settle_tiles`] then seats them
+    /// over that group's topmost layer, as [`Map::set_group`] does.
+    fn keep_tiles_if_unmoved(&mut self, unmoved: bool, places: Option<Vec<TileLayer>>) {
+        let Some(places) = places else { return };
+        if unmoved {
+            self.tiles = places;
+            self.sort_tiles(0);
+        }
+    }
+
+    /// After a change to the groups: each tile layer's place is a group's topmost layer, or
+    /// one outside a group (see [`Map::pin_tiles`]).
+    pub fn settle_tiles(&mut self) {
+        if self.tiles.iter().any(|t| t.over.is_some()) {
+            self.pin_tiles();
+        }
     }
 
     /// Whether a layer put at `pos` in the drawing order would sit between two layers of one group.
@@ -1385,6 +1661,7 @@ impl Map {
         if to == from {
             return Err("the layer can't move further".into());
         }
+        self.release_tiles(&[id]);
         let l = self.layers.remove(from);
         let mut to = to;
         if self.group_of(id).is_none() {
@@ -1400,17 +1677,17 @@ impl Map {
     /// Adds a dataset as a new layer; returns its id.
     pub fn add_dataset(&mut self, ds: Dataset) -> u32 {
         let id = self.next_id();
-        self.insert_ranked(Layer::new(id, ds));
+        self.insert_on_top(Layer::new(id, ds));
         id
     }
 
-    /// Adds a layer (from a layer file) with a fresh id among the layers of its kind; returns the id.
+    /// Adds a layer (from a layer file) with a fresh id on top of the drawing order; returns the id.
     pub fn add_layer(&mut self, mut layer: Layer) -> u32 {
         let id = self.next_id();
         layer.id = id;
         layer.selection.clear();
         layer.touch_geometry();
-        self.insert_ranked(layer);
+        self.insert_on_top(layer);
         id
     }
 
@@ -1427,7 +1704,7 @@ impl Map {
         let mut l = Layer::new_streamed(id, source);
         l.name = name.into();
         l.dataset.name = l.name.clone();
-        self.insert_ranked(l);
+        self.insert_on_top(l);
         id
     }
 
@@ -1481,7 +1758,7 @@ impl Map {
     /// Adds a raster layer; returns its id.
     pub fn add_raster(&mut self, name: impl Into<String>, raster: RasterLayer) -> u32 {
         let id = self.next_id();
-        self.insert_ranked(Layer::new_raster(id, name, raster));
+        self.insert_on_top(Layer::new_raster(id, name, raster));
         id
     }
 
@@ -1926,6 +2203,8 @@ mod tests {
             other_label: None,
             class_strokes: [("a".to_string(), wild.clone()), ("b".to_string(), Vec::new())].into_iter().collect(),
             other_strokes: wild.clone(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         let back: Layer = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
         let Renderer::Unique { class_strokes, other_strokes, .. } = &back.renderer else { panic!("unique renderer expected") };
@@ -1940,6 +2219,7 @@ mod tests {
             classes: 1,
             class_labels: Default::default(),
             class_strokes: [(0, wild)].into_iter().collect(),
+            class_fills: Default::default(),
         };
         let back: Layer = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
         let Renderer::Graduated { class_strokes, .. } = &back.renderer else { panic!("graduated renderer expected") };
@@ -2158,6 +2438,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         let labels = |l: &Layer, scale| l.shown_legend(scale).map(|v| v.into_iter().map(|e| e.label).collect::<Vec<_>>());
         assert_eq!(labels(l, 1e6), Some(vec!["1".to_string(), "2".to_string()]), "no 9, no <all other values>");

@@ -32,6 +32,8 @@ mod earthaccessui;
 mod editpanes;
 mod embeddingsui;
 mod failureui;
+mod fieldmenu;
+mod fill_editor;
 mod geocodeui;
 mod geometrycalc;
 mod globe_drape;
@@ -251,6 +253,10 @@ pub struct Services {
     /// `None` turns autosave off: the browser for now, and a second copy of the desktop app
     /// running alongside the first, which mustn't touch its copy.
     pub recovery: Option<Box<dyn RecoveryStore>>,
+    /// Reads the system clipboard's text into the slot (the browser's `navigator.clipboard`,
+    /// which may ask the user first), for a text field's Paste; `None` where the window sends
+    /// it (the desktop) or the browser can't read it (a page not served over HTTPS).
+    pub read_clipboard: Option<Box<dyn Fn(Slot<Result<String, String>>)>>,
     /// Signs in to an ArcGIS portal (its address and an OAuth client id, either blank for ArcGIS
     /// Online and RustGIS's own app) in a pop-up window, putting who signed in, or why not, in the
     /// slot (the browser; the desktop runs `arcgis.signIn`).
@@ -617,6 +623,8 @@ pub struct UiState {
     pub stac: stacui::State,
     /// WMS and WMTS layers' legend pictures, as the Layers pane shows them (#942).
     pub tile_legends: tilelegend::Legends,
+    /// A text field's right-click menu: the field it's open on, and the row picked.
+    pub field_menu: fieldmenu::FieldMenu,
     /// S3…: the connection form, the bucket browsed and the listing under way.
     pub s3: s3ui::State,
     /// New/Edit Connection: the form and the Test under way.
@@ -764,6 +772,7 @@ impl Default for UiState {
             csw: Default::default(),
             stac: Default::default(),
             tile_legends: Default::default(),
+            field_menu: Default::default(),
             s3: Default::default(),
             connection: Default::default(),
             s3_chooser: Default::default(),
@@ -1792,10 +1801,11 @@ impl RustGisApp {
         // updates its step; anything else, a second selection on the same layer included, is a
         // step of its own.
         if let Some(last) = steps.last_mut()
-            && matches!(id, "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.transparency")
+            && matches!(id, "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.fillLayers" | "layer.transparency")
             && last.command == id
             && params.get("layer").is_some()
             && last.params.get("layer") == params.get("layer")
+            && ["value", "index", "other"].iter().all(|k| last.params.get(*k) == params.get(*k))
         {
             last.params = params.clone();
             return;
@@ -2651,7 +2661,11 @@ impl RustGisApp {
                 };
                 if let Some(open) = &self.services.open_async {
                     self.ui.pending_open = Some(cmd);
-                    open(if kind == "ramps" { "ramp" } else { "item" });
+                    open(match kind {
+                        "ramps" => "ramp",
+                        "qgisProject" => "qgisProject",
+                        _ => "item",
+                    });
                 } else if let Some(path) = dialogs::pick_open(exts, tl!(label)) {
                     let r = self.run_by_user(cmd, json!({"path": path}));
                     self.map.invalidate();
@@ -3703,6 +3717,8 @@ impl RustGisApp {
         }
         i18n::set_current(self.lang());
         let t = theme::Tokens::get(&ctx);
+        // Before the shortcuts and the fields: the row picked in a text field's menu, as its keys.
+        fieldmenu::play(self, &ctx);
         chrome::shortcuts(self, &ctx);
         panes::follow_layer_filter(self);
         if self.ui.backstage {
@@ -3735,6 +3751,8 @@ impl RustGisApp {
         #[cfg(not(target_arch = "wasm32"))]
         agentthreads::windows(self, &ctx);
         chrome::notices(self, &ctx);
+        // After every field is drawn: one right-clicked opens its menu.
+        fieldmenu::show(self, &ctx);
         if let Some(text) = self.ui.copy_out.take() {
             ctx.copy_text(text);
         }
@@ -3846,6 +3864,8 @@ const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
     "share.webLayer",
     "share.webStyle",
     "share.locator",
+    "pg.saveEdits",
+    "pg.discardEdits",
     "zarr.reduce",
     "cube.trend",
     "cube.reduce",

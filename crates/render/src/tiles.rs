@@ -1,4 +1,5 @@
-//! The map's web tile layers, drawn over the basemap and under the layers.
+//! The map's web tile layers, drawn over the basemap, each at its place among the map's layers
+//! (see `Map::stack`).
 //!
 //! On the flat Web Mercator map tiles draw straight into the map. In any other projection, and
 //! on the globe, they draw into a Web Mercator mosaic of the area in view, which is then warped
@@ -26,6 +27,20 @@ pub(crate) struct TileOutput {
     pub attribution: Vec<String>,
     pub pending: bool,
     pub errors: Vec<String>,
+}
+
+impl TileOutput {
+    /// Adds what another draw of tile layers gave (those at another place in the drawing order).
+    pub fn add(&mut self, o: TileOutput) {
+        self.labels.extend(o.labels);
+        for a in o.attribution {
+            if !self.attribution.contains(&a) {
+                self.attribution.push(a);
+            }
+        }
+        self.pending |= o.pending;
+        self.errors.extend(o.errors);
+    }
 }
 
 /// A tile style's label as the map places it (in its logical points), with its priority:
@@ -257,11 +272,20 @@ pub fn live(spec: &Spec, opacity: f32, view: &View) -> Option<Live> {
     Some(Live { quads: p.tiles.iter().map(|q| quad(q, origin)).collect(), pending: p.pending })
 }
 
-/// Draws the map's visible tile layers, bottom first. With `gpu`, on the flat Web Mercator map,
-/// raster tile layers are placed as tiles for the GPU instead.
-pub(crate) fn draw(pm: &mut Pixmap, map: &Map, view: &View, place: Place, labels: bool, mut gpu: Option<Gpu<'_>>) -> TileOutput {
+/// Draws the map's visible tile layers at `which` (indices, top first), bottom first. With
+/// `gpu`, on the flat Web Mercator map, raster tile layers are placed as tiles for the GPU
+/// instead.
+pub(crate) fn draw(
+    pm: &mut Pixmap,
+    map: &Map,
+    which: &[usize],
+    view: &View,
+    place: Place,
+    labels: bool,
+    mut gpu: Option<Gpu<'_>>,
+) -> TileOutput {
     let mut out = TileOutput::default();
-    let layers: Vec<&TileLayer> = map.tiles.iter().rev().filter(|t| t.draws() && t.opacity > 0.0).collect();
+    let layers: Vec<&TileLayer> = which.iter().rev().filter_map(|i| map.tiles.get(*i)).filter(|t| t.draws() && t.opacity > 0.0).collect();
     if layers.is_empty() {
         return out;
     }
@@ -677,6 +701,41 @@ mod tests {
         let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
         let p = pm.pixel(100, 50).unwrap();
         [p.red(), p.green(), p.blue(), p.alpha()]
+    }
+
+    /// A tile layer draws at its place in the drawing order (#808): under all the map's layers
+    /// without one (as every tile layer did), over the layer it's placed over, and under a layer
+    /// added later.
+    #[test]
+    fn tile_layers_draw_at_their_place_among_the_layers() {
+        use rustgis_data::{Dataset, Geometry, GeometryType};
+        serve();
+        let mut m = Map::new("Map");
+        m.graticule = false;
+        let square = |m: &mut Map, name: &str, rgb: (u8, u8, u8)| {
+            let mut d = Dataset::new(name, GeometryType::Polygon, vec![]);
+            let ring =
+                vec![Coord::new(0.0, 40.0), Coord::new(20.0, 40.0), Coord::new(20.0, 60.0), Coord::new(0.0, 60.0), Coord::new(0.0, 40.0)];
+            d.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+            let id = m.add_dataset(d);
+            if let Some(l) = m.layer_mut(id) {
+                let mut s = l.renderer.base_symbol();
+                s.fill = rustgis_map::Rgba::rgb(rgb.0, rgb.1, rgb.2);
+                s.stroke = s.fill;
+                l.renderer = rustgis_map::Renderer::Single(s);
+            }
+            id
+        };
+        let green = square(&mut m, "Green", (20, 200, 20));
+        m.tiles.push(TileLayer::new("Red", TileKind::Raster, "https://tiles.test/red/{z}/{x}/{y}.png"));
+        assert_eq!(pixel(&mut m), [20, 200, 20, 255], "under the layers");
+        m.tiles[0].over = Some(green);
+        assert_eq!(pixel(&mut m), [220, 20, 20, 255], "over the layer it's placed over");
+        square(&mut m, "Blue", (20, 20, 200));
+        assert_eq!(pixel(&mut m), [20, 20, 200, 255], "under a layer added after it");
+        // A layer it names that the map no longer has: under them all.
+        m.tiles[0].over = Some(9999);
+        assert_eq!(pixel(&mut m), [20, 20, 200, 255]);
     }
 
     #[test]

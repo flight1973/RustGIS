@@ -124,6 +124,11 @@ pub struct TileLayer {
     /// A transparent layer meant to sit over a basemap (labels, roads, traffic).
     #[serde(default, skip_serializing_if = "is_false")]
     pub overlay: bool,
+    /// The map layer it's drawn just over, under the next one up (#808): new overlays go on top
+    /// of the map's layers, as every new layer does. None: under all the map layers, where
+    /// basemaps sit, as every tile layer did before (and does in a project saved then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over: Option<u32>,
     /// How it blends with the tile layers and basemap beneath (Multiply drapes imagery over a
     /// hillshade).
     #[serde(default, skip_serializing_if = "is_normal")]
@@ -289,6 +294,7 @@ impl TileLayer {
             visible: true,
             opacity: 1.0,
             overlay: false,
+            over: None,
             blend: crate::effects::Blend::Normal,
             id: String::new(),
             layers: Vec::new(),

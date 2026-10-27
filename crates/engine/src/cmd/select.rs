@@ -320,14 +320,35 @@ fn identify(s: &mut Session, p: &Value) -> CmdResult {
         None => Vec::new(),
     };
     let map = s.map();
-    let mut results: Vec<Value> = hits.iter().filter_map(|(id, row)| feature_json(map, *id, *row)).collect();
-    // Then the features of vector tile layers, beneath the layers; tiles are never selectable.
-    if matches!(mode, PopupMode::Topmost | PopupMode::Visible) && (!first_layer || results.is_empty()) {
-        let room = MAX_IDENTIFIED.saturating_sub(results.len());
-        results.extend(tile_features(s, lon, lat, tol_px, first_layer, room));
+    // Features and the vector tile layers' features (tiles are never selectable), in the drawing
+    // order of all the map's layers (#808): topmost takes the layer drawn on top of those with any.
+    let order = map.stack();
+    let place = |d: rustgis_map::Drawn| order.iter().position(|o| *o == d).unwrap_or(usize::MAX);
+    let mut ranked: Vec<(usize, Value)> = hits
+        .iter()
+        .filter_map(|(id, row)| Some((place(rustgis_map::Drawn::Layer(map.layer_index(*id)?)), feature_json(map, *id, *row)?)))
+        .collect();
+    let web = matches!(mode, PopupMode::Topmost | PopupMode::Visible);
+    if web {
+        // Topmost reads only those drawn over the feature found, up to the first with any.
+        let found = ranked.iter().map(|(at, _)| *at).min().unwrap_or(usize::MAX);
+        let keep = |i: usize| !first_layer || place(rustgis_map::Drawn::Tile(i)) < found;
+        let tiles = tile_features(s, lon, lat, tol_px, MAX_IDENTIFIED, first_layer, keep);
+        ranked.extend(tiles.into_iter().map(|(i, v)| (place(rustgis_map::Drawn::Tile(i)), v)));
     }
-    // And the WMS layers drawn there are asked (their answers come later).
-    let asks = if matches!(mode, PopupMode::Topmost | PopupMode::Visible) && (!first_layer || results.is_empty()) {
+    ranked.sort_by_key(|(at, _)| *at);
+    let top = ranked.first().map(|(at, _)| *at);
+    if first_layer {
+        ranked.retain(|(at, _)| Some(*at) == top);
+    }
+    ranked.truncate(MAX_IDENTIFIED);
+    let results: Vec<Value> = ranked.into_iter().map(|(_, v)| v).collect();
+    // And the WMS layers drawn there are asked (their answers come later): for topmost, when
+    // nothing was found, or the topmost one there has a place over what was (a tile layer under
+    // all the map's layers, as all were before #808, isn't asked over what they found).
+    let over_top =
+        |i: usize| map.tiles.get(i).is_some_and(|t| t.over.is_some()) && top.is_some_and(|top| place(rustgis_map::Drawn::Tile(i)) < top);
+    let asks = if web && (!first_layer || results.is_empty() || info::topmost(s, lon, lat).is_some_and(over_top)) {
         info::requests(s, lon, lat, first_layer)
     } else {
         Vec::new()
@@ -355,18 +376,27 @@ fn identify(s: &mut Session, p: &Value) -> CmdResult {
     Ok(out)
 }
 
-/// The features of the vector tile layers drawn under a point, topmost layer first (only the
-/// first layer with any when `first_layer`): archives, vector tiles and overlays added as data,
-/// not basemaps from the catalog or MapLibre styles. The tiles looked at are those drawn there.
-fn tile_features(s: &Session, lon: f64, lat: f64, tol_px: f64, first_layer: bool, limit: usize) -> Vec<Value> {
+/// The features of the vector tile layers drawn under a point, topmost layer first, each with
+/// its tile layer's index (only those `keep` takes; only the first layer with any when
+/// `first_layer`): archives, vector tiles and overlays added as data, not basemaps from the
+/// catalog or MapLibre styles. The tiles looked at are those drawn there.
+fn tile_features(
+    s: &Session,
+    lon: f64,
+    lat: f64,
+    tol_px: f64,
+    limit: usize,
+    first_layer: bool,
+    keep: impl Fn(usize) -> bool,
+) -> Vec<(usize, Value)> {
     use rustgis_map::tiles::TileKind;
     use rustgis_render::rustgis_tiles::{draw, mvt};
     let map = s.map();
     let Some((at, m_per_px)) = info::merc_at(s, lon, lat).filter(|_| limit > 0) else { return Vec::new() };
     let mut out = Vec::new();
-    for t in &map.tiles {
+    for (i, t) in map.tiles.iter().enumerate() {
         let data = matches!(t.kind, TileKind::PmTiles | TileKind::MbTiles | TileKind::Vector) && (t.id.is_empty() || t.overlay);
-        if !data || !t.draws() || t.opacity <= 0.0 {
+        if !data || !t.draws() || t.opacity <= 0.0 || !keep(i) {
             continue;
         }
         let picked = draw::pick(&rustgis_render::tile_spec(t), at.x, at.y, m_per_px, tol_px as f32, limit - out.len());
@@ -384,7 +414,7 @@ fn tile_features(s: &Session, lon: f64, lat: f64, tol_px: f64, first_layer: bool
                     (k.clone(), json!(text))
                 })
                 .collect();
-            out.push(json!({"layer": format!("{} › {}", t.name, p.source_layer), "tileLayer": t.name, "sourceLayer": p.source_layer, "attributes": attrs}));
+            out.push((i, json!({"layer": format!("{} › {}", t.name, p.source_layer), "tileLayer": t.name, "sourceLayer": p.source_layer, "attributes": attrs})));
         }
         if out.len() >= limit || (first_layer && !picked.is_empty()) {
             break;

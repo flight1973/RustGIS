@@ -403,6 +403,8 @@ fn main() -> eframe::Result {
     {
         viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
     }
+    // macOS: the bundle's rustgis.icns is the Dock icon; a window icon would replace it with the bare logo.
+    #[cfg(not(target_os = "macos"))]
     if let Some((size, rgba)) = rustgis_engine::render::logo::rgba(256) {
         viewport = viewport.with_icon(egui::IconData { rgba, width: size, height: size });
     }

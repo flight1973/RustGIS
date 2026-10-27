@@ -99,7 +99,7 @@ Every screenshot is RustGIS itself, rendered offscreen by `cargo run -p rustgis-
 | **Web tiles** | XYZ/TMS/WMS raster tiles, Mapbox Vector Tiles and MapLibre styles (sprites, patterns, expressions), cached and fetched in the background |
 | **Cartography** | Single symbol, unique values, graduated colours, proportional symbols; label classes with SQL queries, straight and curved line placement, installed font families, scale ranges and annotation; stacked and dashed line strokes, symbol levels, reference scales and polygons without fill; masking, display filters, aggregation bins, 2.5D extrusion; graphics and dynamic text |
 | **Editing** | Create, move, rotate, scale, merge, split and explode features; snapping, templates, elevation, traverse, topology rules; domains, subtypes, attribute rules, relationships, archiving; undo for everything |
-| **Analysis** | Selection by attributes (SQL) and location; Buffer, Clip, Erase, Intersect, Identity, Union, Dissolve, Summarize Within, Summary Statistics, Spatial Join, Zonal Statistics, A5 grids and a geometry calculator; viewshed, line of sight, IDW, ordinary kriging, shortest path, suitability modelling; ModelBuilder on a node canvas and scripts with command, parameter and value completion; 1,000+ [GeoLibre](https://github.com/opengeos/geolibre-rust) and Whitebox raster, vector, LiDAR, hydrology and terrain tools |
+| **Analysis** | Selection by attributes (SQL) and location; Buffer, Near, Clip, Erase, Intersect, Identity, Union, Dissolve, Summarize Within, Summary Statistics, Spatial Join, Zonal Statistics, A5 grids and a geometry calculator; viewshed, line of sight, IDW, ordinary kriging, shortest path, suitability modelling; ModelBuilder on a node canvas and scripts with command, parameter and value completion; 1,000+ [GeoLibre](https://github.com/opengeos/geolibre-rust) and Whitebox raster, vector, LiDAR, hydrology and terrain tools |
 | **Imagery** | Ortho and reality mapping, pixel classification (k-means, minimum distance, a trainable neural network), mensuration, hosted imagery tiles |
 | **Layouts and reports** | Page layouts with map frames, legends, scale bars, grids and map series; publication sheets and figures in one command, format panes, guides, snapping and element locks; reports with groups, statistics, charts and subreports; presentations (HTML slideshow, PDF); notebooks (Jupyter in and out) |
 | **Sharing** | PNG export at any DPI; PDF; web map pages, OGC API Features collections, MapLibre styles, glTF scenes, locators; project, map and mobile map packages; offline areas with sync |
@@ -199,7 +199,7 @@ If you use RustGIS in your work, please cite it. RustGIS is archived on [Zenodo]
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23633281.svg)](https://doi.org/10.5281/zenodo.23633281)
 
-> Wu, Q., Rincón Albarracín, J. G., Filho, E., Hofbauer, D., & Fitzgerald, M. (2026). RustGIS: A fast, free and open-source GIS in pure Rust for mapping, analyzing and sharing geospatial data. Zenodo. <https://doi.org/10.5281/zenodo.23633281>
+> Wu, Q., Rincón Albarracín, J. G., Filho, E., Hofbauer, D., Fitzgerald, M., & Strebel, D. (2026). RustGIS: A fast, free and open-source GIS in pure Rust for mapping, analyzing and sharing geospatial data. Zenodo. <https://doi.org/10.5281/zenodo.23633281>
 
 You can also use GitHub's **"Cite this repository"** button (which reads [`CITATION.cff`](CITATION.cff)) to copy a ready-made APA or BibTeX entry. See the [How to Cite](https://rustgis.app/citation/) page for more formats.
 

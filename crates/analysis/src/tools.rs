@@ -108,6 +108,27 @@ pub static TOOLS: &[ToolSpec] = &[
         run: dissolve,
     },
     ToolSpec {
+        id: "near",
+        name: "Near",
+        toolbox: "Analysis › Proximity",
+        summary: "Adds the distance to the nearest feature of another layer, its id and the nearest point on it.",
+        params: &[
+            P { name: "input", label: "Input Features", kind: K::Layer, required: true, default: "", help: "" },
+            P { name: "near", label: "Near Features", kind: K::Layer, required: true, default: "", help: "" },
+            P {
+                name: "distance",
+                label: "Search Distance",
+                kind: K::Number,
+                required: false,
+                default: "",
+                help: "Features with nothing this near get empty values. Leave empty to search without a limit.",
+            },
+            P { name: "units", label: "Distance Units", kind: K::Choice(UNITS), required: false, default: "\"Kilometers\"", help: "" },
+            P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
+        ],
+        run: near,
+    },
+    ToolSpec {
         id: "convexHull",
         name: "Minimum Bounding Geometry",
         toolbox: "Data Management › Features",
@@ -810,6 +831,13 @@ struct Zone {
     poly: MultiPolygon<f64>,
 }
 
+/// A feature's polygons as a mask for the overlay: parts of one feature may overlap, which the
+/// overlay can't take as they are, so several are unioned; one polygon is only oriented, so its
+/// edges stay exactly where they are.
+fn mask_of(poly: MultiPolygon<f64>) -> MultiPolygon<f64> {
+    if poly.0.len() > 1 { union_all(poly.0.iter()) } else { poly.orient(Direction::Default) }
+}
+
 /// The overlay layer of an overlay tool (its `overlay` parameter), which must be polygons, and its
 /// (selected) features with geometry as [`Zone`]s, in order.
 fn overlay_zones<'a>(inp: &'a dyn Inputs, p: &Json) -> Result<(&'a Dataset, Vec<Zone>), String> {
@@ -821,11 +849,7 @@ fn overlay_zones<'a>(inp: &'a dyn Inputs, p: &Json) -> Result<(&'a Dataset, Vec<
         .into_iter()
         .filter_map(|row| {
             let g = ov.features.get(row)?.geometry.as_ref()?;
-            // Parts of one feature may overlap, which the overlay can't take as they are; one
-            // polygon is only oriented, so its edges stay exactly where they are.
-            let poly = to_multipolygon(g)?;
-            let poly = if poly.0.len() > 1 { union_all(poly.0.iter()) } else { poly.orient(Direction::Default) };
-            Some(Zone { row, ext: g.extent(), poly })
+            Some(Zone { row, ext: g.extent(), poly: mask_of(to_multipolygon(g)?) })
         })
         .collect();
     Ok((ov, zones))
@@ -880,7 +904,9 @@ impl Overlay {
 /// them all, with empty overlay attributes. Union then adds each overlay polygon's part outside
 /// every input polygon, with empty input attributes. Parts that only touch are left out, and
 /// features of one layer that overlap each other are not split against each other. Intersect
-/// leaves out input features without geometry; Identity and Union keep them, as they are.
+/// leaves out input features without geometry; Identity and Union keep them, as they are, and an
+/// input feature no overlay polygon meets too, coordinates untouched (a feature that is cut comes
+/// out rebuilt, its overlapping parts unioned).
 fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     if ds.geometry_type == GeometryType::None {
@@ -905,11 +931,17 @@ fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String
             continue;
         };
         let ext = g.extent();
-        // A feature of overlapping parts is unioned once, for all the zones it meets.
-        let whole = dissolved(g);
+        let meets: Vec<(usize, &Zone)> = index
+            .candidates(&ext)
+            .into_iter()
+            .filter_map(|zi| Some((zi, zones.get(zi)?)))
+            .filter(|(_, z)| ext.intersects(&z.ext))
+            .collect();
+        // A feature of overlapping parts is unioned once, for all the zones it may meet, and only
+        // when it may meet one.
+        let whole = if meets.is_empty() { std::borrow::Cow::Borrowed(g) } else { dissolved(g) };
         let mut hit: Vec<usize> = Vec::new();
-        for zi in index.candidates(&ext) {
-            let Some(z) = zones.get(zi).filter(|z| ext.intersects(&z.ext)) else { continue };
+        for (zi, z) in meets {
             if let Some(inside) = part(&whole, &z.poly, true) {
                 out.push_next(Some(inside), overlay_row(ds, Some(&f.attrs), ov, zone_attrs(z)));
                 hit.push(zi);
@@ -1986,6 +2018,254 @@ impl ExtentIndex {
     }
 }
 
+/// A feature to join or measure to: its row in its layer, its extent, and its geometry in Web
+/// Mercator (`geo`) and in lon/lat (`geom`).
+struct Located<'a> {
+    row: usize,
+    ext: Extent,
+    geo: geo::Geometry<f64>,
+    geom: &'a Geometry,
+}
+
+/// Features to measure ground distances to (Spatial Join's join features, Near's near features),
+/// looked up through an index of their extents. Features are named by their place in `feats`.
+struct Nearby<'a, 'b> {
+    feats: &'b [Located<'a>],
+    index: &'b ExtentIndex,
+}
+
+impl Nearby<'_, '_> {
+    /// The features within `reach` metres of a target (`t`, with its extent, and its geometry in Web
+    /// Mercator), in order, with their distances. With `nearest`, only the nearest is wanted: a
+    /// feature that can't be as near as the nearest so far isn't measured, so some farther ones
+    /// may be missing. The feature in row `exclude` is left out (the target itself, when both are
+    /// one layer). `measured` keeps each feature's distance, measured once per target.
+    fn within(
+        &self,
+        t: &Geometry,
+        t_ext: &Extent,
+        t_geo: &geo::Geometry<f64>,
+        reach: f64,
+        nearest: bool,
+        exclude: Option<usize>,
+        measured: &mut std::collections::HashMap<usize, Option<f64>>,
+    ) -> Vec<(usize, f64)> {
+        let looked = match crate::join::search_box(t_ext, reach) {
+            Some(b) => self.index.candidates(&b),
+            None => (0..self.feats.len()).collect(),
+        };
+        let mut near = Vec::new();
+        let mut bound = reach;
+        for idx in looked {
+            let Some(j) = self.feats.get(idx).filter(|j| Some(j.row) != exclude) else { continue };
+            if !crate::join::may_be_within(t_ext, &j.ext, bound) {
+                continue;
+            }
+            let d = *measured.entry(idx).or_insert_with(|| ground_distance(t, t_geo, j.geom, &j.geo));
+            if let Some(d) = d.filter(|d| *d <= reach * (1.0 + 1e-9) + 1e-6) {
+                near.push((idx, d));
+                if nearest {
+                    bound = bound.min(d);
+                }
+            }
+        }
+        near
+    }
+
+    /// Every feature within `reach` metres of a target, nearest first; equal distances keep the
+    /// features' order.
+    fn all_within(&self, t: &Geometry, t_ext: &Extent, t_geo: &geo::Geometry<f64>, reach: f64) -> Vec<(usize, f64)> {
+        let mut near = self.within(t, t_ext, t_geo, reach, false, None, &mut std::collections::HashMap::new());
+        near.sort_by(|a, b| a.1.total_cmp(&b.1));
+        near
+    }
+
+    /// The feature nearest a target, within `limit` metres when there is one, and its distance;
+    /// of equally near features, the first. The feature in row `exclude` is left out.
+    ///
+    /// Searches widen from about a grid cell, doubling until one finds a feature within its
+    /// distance (no nearer one can lie outside it), up to the limit. Without an index, one search
+    /// of everything. (A grid of coincident features has cells of no size: the first search reaches
+    /// at least `MIN_REACH_M`.)
+    fn closest(
+        &self,
+        t: &Geometry,
+        t_ext: &Extent,
+        t_geo: &geo::Geometry<f64>,
+        limit: Option<f64>,
+        exclude: Option<usize>,
+    ) -> Option<(usize, f64)> {
+        let mut measured = std::collections::HashMap::new();
+        let mut reach = match self.index.cell_size() {
+            Some(cell) => (cell.to_radians() * rustgis_geom::EARTH_RADIUS_M).max(MIN_REACH_M),
+            None => f64::INFINITY,
+        };
+        let mut near = loop {
+            let r = limit.map_or(reach, |l| reach.min(l));
+            // A search reaching a pole or across the antimeridian looks at every feature anyway: it
+            // measures them out to the limit.
+            if crate::join::search_box(t_ext, r).is_none() {
+                break self.within(t, t_ext, t_geo, limit.unwrap_or(f64::INFINITY), true, exclude, &mut measured);
+            }
+            let found = self.within(t, t_ext, t_geo, r, true, exclude, &mut measured);
+            if !found.is_empty() || limit.is_some_and(|l| r >= l) {
+                break found;
+            }
+            reach *= 2.0;
+        };
+        near.sort_by(|a, b| a.1.total_cmp(&b.1));
+        near.into_iter().next()
+    }
+}
+
+/// A point (lon/lat) two intersecting features share: one of the points of either on the other;
+/// else a point of their overlap, when one is polygons; else a point where their edges meet. The
+/// geometries come with their Web Mercator forms, where the test and the overlay work.
+fn shared_point(a: &Geometry, a_geo: &geo::Geometry<f64>, b: &Geometry, b_geo: &geo::Geometry<f64>) -> Option<Coord> {
+    use geo::LinesIter;
+    let back = |c: geo::Coord<f64>| rustgis_geom::merc_to_lonlat(Coord::new(c.x, c.y));
+    // Points answer with their own coordinates, not ones back from Web Mercator.
+    let point_on = |pts: &Geometry, other: &geo::Geometry<f64>| -> Option<Option<Coord>> {
+        let pts: &[Coord] = match pts {
+            Geometry::Point(c) => std::slice::from_ref(c),
+            Geometry::MultiPoint(v) => v,
+            _ => return None,
+        };
+        Some(pts.iter().copied().find(|c| {
+            let m = rustgis_geom::lonlat_to_merc(*c);
+            other.intersects(&geo::Point::new(m.x, m.y))
+        }))
+    };
+    if let Some(found) = point_on(a, b_geo).or_else(|| point_on(b, a_geo)) {
+        return found;
+    }
+    let overlap = match (a_geo, b_geo) {
+        (_, geo::Geometry::MultiPolygon(m)) => part(&dissolved(a), &mask_of(m.clone()), true),
+        (geo::Geometry::MultiPolygon(m), _) => part(&dissolved(b), &mask_of(m.clone()), true),
+        _ => None,
+    };
+    if let Some(c) = overlap.as_ref().and_then(crate::join::first_coord) {
+        return Some(c);
+    }
+    // Lines, or polygons that only touch: the first point where an edge of `a` meets one of `b`. `b`'s
+    // edges are sorted by their west end, so the search for each of `a`'s stops at the first that
+    // starts east of it, and a pair whose boxes don't meet is skipped before the exact test; pairs
+    // within that window are still each tried, so two long touching borders cost about the product
+    // of their edges. This runs once per output row, for the nearest feature only.
+    let edges = |g: &geo::Geometry<f64>| -> Vec<geo::Line<f64>> {
+        let mut v: Vec<geo::Line<f64>> = match g {
+            geo::Geometry::MultiLineString(m) => m.lines_iter().collect(),
+            geo::Geometry::MultiPolygon(m) => m.lines_iter().collect(),
+            _ => Vec::new(),
+        };
+        v.sort_by(|x, y| x.start.x.min(x.end.x).total_cmp(&y.start.x.min(y.end.x)));
+        v
+    };
+    let (ea, eb) = (edges(a_geo), edges(b_geo));
+    for la in &ea {
+        let (x0, x1) = (la.start.x.min(la.end.x), la.start.x.max(la.end.x));
+        let (y0, y1) = (la.start.y.min(la.end.y), la.start.y.max(la.end.y));
+        for lb in &eb {
+            if lb.start.x.min(lb.end.x) > x1 {
+                break;
+            }
+            if lb.start.x.max(lb.end.x) < x0 || lb.start.y.max(lb.end.y) < y0 || lb.start.y.min(lb.end.y) > y1 {
+                continue;
+            }
+            match geo::line_intersection::line_intersection(*la, *lb) {
+                Some(geo::LineIntersection::SinglePoint { intersection, .. }) => return Some(back(intersection)),
+                Some(geo::LineIntersection::Collinear { intersection }) => return Some(back(intersection.start)),
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+/// Near: a copy of the input features with the nearest near feature's OID (`near_fid`), the ground
+/// distance to it (`near_dist`, in `units`) and the point on it nearest the input feature
+/// (`near_x`, `near_y`, lon/lat; a point they share when they intersect). Within a search distance
+/// when one is given; features with nothing that near, or without geometry, get empty values.
+/// With one layer as both, a feature's nearest is another feature.
+fn near(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    let ds = input(inp, p, "input")?;
+    let near_ds = input(inp, p, "near")?;
+    if ds.geometry_type == GeometryType::None || near_ds.geometry_type == GeometryType::None {
+        return Err(format!("'{}' has no geometry", if ds.geometry_type == GeometryType::None { &ds.name } else { &near_ds.name }));
+    }
+    let given = p.get("distance").filter(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
+    let limit = match given {
+        None => None,
+        Some(_) => {
+            let d = num(p, "distance").ok_or("Search Distance must be a number")?;
+            if d < 0.0 {
+                return Err("Search Distance can't be negative".into());
+            }
+            Some(to_metres(d, s(p, "units"))?)
+        }
+    };
+    let unit_m = to_metres(1.0, s(p, "units"))?;
+    // The same layer as both: leave each feature out of its own search.
+    let same = std::ptr::eq(ds, near_ds);
+
+    // In layer order, whatever order the selection was made in: of equally near features, the
+    // first in the layer wins.
+    let mut near_rows = rows(inp, p, "near", near_ds);
+    near_rows.sort_unstable();
+    let feats: Vec<Located<'_>> = near_rows
+        .into_iter()
+        .filter_map(|row| {
+            let g = near_ds.features.get(row)?.geometry.as_ref()?;
+            Some(Located { row, ext: g.extent(), geo: to_geo(g), geom: g })
+        })
+        .collect();
+    let index = ExtentIndex::new(feats.iter().map(|f| f.ext));
+    let nearby = Nearby { feats: &feats, index: &index };
+
+    let mut out = copy_schema(ds, out_name(p, format!("{}_Near", ds.name)), ds.geometry_type);
+    out.crs = ds.crs;
+    for (name, ty) in
+        [("near_fid", FieldType::Integer), ("near_dist", FieldType::Double), ("near_x", FieldType::Double), ("near_y", FieldType::Double)]
+    {
+        let name = unique_field(&out, name);
+        out.fields.push(Field::new(name, ty));
+    }
+    let (mut found, mut total) = (0usize, 0usize);
+    for r in rows(inp, p, "input", ds) {
+        let Some(f) = ds.features.get(r) else { continue };
+        total += 1;
+        let hit = f.geometry.as_ref().and_then(|g| {
+            let (t_ext, t_geo) = (g.extent(), to_geo(g));
+            let (idx, d) = nearby.closest(g, &t_ext, &t_geo, limit, same.then_some(r))?;
+            let j = feats.get(idx)?;
+            // Where they touch, a point they share; else, or when none is found in the map's plane (the
+            // same place at −180° and 180°), the nearest points' pair.
+            let shared = if d > 0.0 { None } else { shared_point(g, &t_geo, j.geom, &j.geo) };
+            let at = shared.or_else(|| crate::join::nearest_points(g, j.geom).map(|(_, q)| q));
+            // The plane's longitudes run on past ±180°, and so can a shared point's: back within
+            // [−180°, 180°).
+            let at = at.map(|c| Coord::new((c.x + 180.0).rem_euclid(360.0) - 180.0, c.y));
+            Some((near_ds.features.get(j.row)?.id, d, at))
+        });
+        let mut attrs: Vec<Value> = (0..ds.fields.len()).map(|i| f.attrs.get(i).cloned().unwrap_or(Value::Null)).collect();
+        match hit {
+            Some((fid, d, at)) => {
+                found += 1;
+                let xy = |v: Option<f64>| v.map_or(Value::Null, Value::Float);
+                attrs.extend([
+                    i64::try_from(fid).map_or(Value::Null, Value::Int),
+                    Value::Float(d / unit_m),
+                    xy(at.map(|c| c.x)),
+                    xy(at.map(|c| c.y)),
+                ]);
+            }
+            None => attrs.extend([Value::Null, Value::Null, Value::Null, Value::Null]),
+        }
+        out.push_next(f.geometry.clone(), attrs);
+    }
+    result(out, format!("Near: {found} of {total} features have a near feature"))
+}
+
 /// Joins normalized lon/lat geometries, retaining the target's source CRS for export.
 fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let target = input(inp, p, "target")?;
@@ -2036,19 +2316,13 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let target_rows = rows(inp, p, "target", target);
     let join_rows = rows(inp, p, "join", join);
 
-    struct JoinGeom<'a> {
-        row: usize,
-        ext: Extent,
-        geo: geo::Geometry<f64>,
-        geom: &'a Geometry,
-    }
-    let mut join_geoms: Vec<JoinGeom<'_>> = Vec::with_capacity(join_rows.len());
+    let mut join_geoms: Vec<Located<'_>> = Vec::with_capacity(join_rows.len());
     for &jr in &join_rows {
         if let Some(f) = join.features.get(jr)
             && let Some(g) = f.geometry.as_ref()
         {
             let geo = if mode == JoinMatch::LargestOverlap { oriented(g) } else { to_geo(g) };
-            join_geoms.push(JoinGeom { row: jr, ext: g.extent(), geo, geom: g });
+            join_geoms.push(Located { row: jr, ext: g.extent(), geo, geom: g });
         }
     }
 
@@ -2078,6 +2352,7 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let index = ExtentIndex::new(join_geoms.iter().map(|j| j.ext));
     // The join features whose extents may meet `ext`, in join order.
     let candidates = |ext: &Extent| index.candidates(ext);
+    let nearby = Nearby { feats: &join_geoms, index: &index };
 
     let mut total_matches = 0usize;
     let mut written_features = 0usize;
@@ -2129,67 +2404,12 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
                     matches.extend(best.map(|(row, _)| (row, None)));
                 }
                 JoinMatch::Closest | JoinMatch::WithinDistance => {
-                    // The join features within `reach` metres, in join order, measured once each.
-                    let mut measured: std::collections::HashMap<usize, Option<f64>> = std::collections::HashMap::new();
-                    let mut within = |reach: f64| -> Vec<(usize, f64)> {
-                        let looked = match crate::join::search_box(&t_ext, reach) {
-                            Some(b) => candidates(&b),
-                            None => (0..join_geoms.len()).collect(),
-                        };
-                        let mut near = Vec::new();
-                        // Closest wants only the nearest: a feature that can't be as near as the
-                        // nearest so far isn't measured.
-                        let mut bound = reach;
-                        for idx in looked {
-                            let Some(j) = at(idx) else { continue };
-                            if !crate::join::may_be_within(&t_ext, &j.ext, bound) {
-                                continue;
-                            }
-                            let d = *measured.entry(idx).or_insert_with(|| ground_distance(tg, &t_geo, j.geom, &j.geo));
-                            if let Some(d) = d.filter(|d| *d <= reach * (1.0 + 1e-9) + 1e-6) {
-                                near.push((j.row, d));
-                                if mode == JoinMatch::Closest {
-                                    bound = bound.min(d);
-                                }
-                            }
-                        }
-                        near
-                    };
-                    let mut near = match (mode, limit) {
-                        (JoinMatch::WithinDistance, Some(l)) => within(l),
+                    let near = match (mode, limit) {
+                        (JoinMatch::WithinDistance, Some(l)) => nearby.all_within(tg, &t_ext, &t_geo, l),
                         (JoinMatch::WithinDistance, None) => Vec::new(),
-                        // Closest: searches widening from about a grid cell, doubling until one
-                        // finds a feature within its distance (no nearer one can lie outside it),
-                        // up to the search distance. Without an index, one search of everything.
-                        // (A grid of coincident features has cells of no size: the first search
-                        // reaches at least `MIN_REACH_M`.)
-                        _ => {
-                            let mut reach = if let Some(cell) = index.cell_size() {
-                                (cell.to_radians() * rustgis_geom::EARTH_RADIUS_M).max(MIN_REACH_M)
-                            } else {
-                                f64::INFINITY
-                            };
-                            loop {
-                                let r = limit.map_or(reach, |l| reach.min(l));
-                                // A search reaching a pole or across the antimeridian looks at every
-                                // feature anyway: it measures them out to the search distance.
-                                if crate::join::search_box(&t_ext, r).is_none() {
-                                    break within(limit.unwrap_or(f64::INFINITY));
-                                }
-                                let found = within(r);
-                                if !found.is_empty() || limit.is_some_and(|l| r >= l) {
-                                    break found;
-                                }
-                                reach *= 2.0;
-                            }
-                        }
+                        _ => nearby.closest(tg, &t_ext, &t_geo, limit, None).into_iter().collect(),
                     };
-                    // Nearest first; equal distances keep the join order.
-                    near.sort_by(|a, b| a.1.total_cmp(&b.1));
-                    if mode == JoinMatch::Closest {
-                        near.truncate(1);
-                    }
-                    matches.extend(near.into_iter().map(|(row, d)| (row, Some(d))));
+                    matches.extend(near.into_iter().filter_map(|(idx, d)| Some((at(idx)?.row, Some(d)))));
                 }
             }
         }
@@ -3590,6 +3810,8 @@ mod tests {
             serde_json::json!({"input": "polys", "overlay": "polys"}),
             serde_json::json!({"input": "pts", "overlay": "pts", "output": ""}),
             serde_json::json!({"input": 3, "overlay": ["polys"]}),
+            serde_json::json!({"input": "pts", "near": "pts", "distance": -0.0, "units": "Feet"}),
+            serde_json::json!({"input": "polys", "near": "pts", "distance": 1e308}),
         ];
         for t in TOOLS {
             for p in &junk {
@@ -3772,6 +3994,29 @@ mod tests {
     }
 
     #[test]
+    fn identity_and_union_copy_an_uncut_input_feature_unchanged() {
+        // Two overlapping squares as one parcel, far from the zone; and a triangle whose extent
+        // meets the zone's but whose shape doesn't reach it.
+        let ring = |x: f64| {
+            vec![Coord::new(x, 10.0), Coord::new(x + 2.0, 10.0), Coord::new(x + 2.0, 12.0), Coord::new(x, 12.0), Coord::new(x, 10.0)]
+        };
+        let overlapping = Geometry::Polygon(vec![vec![ring(0.0)], vec![ring(1.0)]]);
+        let triangle =
+            Geometry::Polygon(vec![vec![vec![Coord::new(0.0, 0.0), Coord::new(4.0, 0.0), Coord::new(0.0, 4.0), Coord::new(0.0, 0.0)]]]);
+        let mut parcels = Dataset::new("parcels", GeometryType::Polygon, vec![]);
+        parcels.push(Some(overlapping.clone()), vec![]);
+        parcels.push(Some(triangle.clone()), vec![]);
+        let mut zones = Dataset::new("zones", GeometryType::Polygon, vec![]);
+        zones.push(Some(sq(3.0, 3.0, 1.0)), vec![]);
+        let m = Map(HashMap::from([("parcels".to_string(), parcels), ("zones".to_string(), zones)]));
+        for tool in ["identity", "union"] {
+            let out = layer(crate::run(tool, &m, &serde_json::json!({"input": "parcels", "overlay": "zones"})).unwrap());
+            let got: Vec<Option<&Geometry>> = out.features.iter().take(2).map(|f| f.geometry.as_ref()).collect();
+            assert_eq!(got, [Some(&overlapping), Some(&triangle)], "{tool}: copied as they are, parts and coordinates");
+        }
+    }
+
+    #[test]
     fn identity_keeps_points_outside_every_polygon() {
         let m = inputs();
         let out = layer(crate::run("identity", &m, &serde_json::json!({"input": "pts", "overlay": "polys"})).unwrap());
@@ -3793,6 +4038,69 @@ mod tests {
         assert_eq!(out.features[4].attrs[3], Value::Text("C2".into()));
         let e = crate::run("union", &inputs(), &serde_json::json!({"input": "pts", "overlay": "polys"})).unwrap_err();
         assert!(e.contains("not a polygon layer"), "{e}");
+    }
+
+    /// Near's four fields of row `r`: the near feature's id, the distance and the point.
+    fn near_fields(out: &Dataset, r: usize) -> (Option<i64>, Option<f64>, Option<f64>, Option<f64>) {
+        let n = out.fields.len();
+        let v = |k: usize| out.features[r].attrs[n - 4 + k].clone();
+        (v(0).as_f64().map(|f| f as i64), v(1).as_f64(), v(2).as_f64(), v(3).as_f64())
+    }
+
+    #[test]
+    fn near_finds_the_nearest_feature_its_distance_and_point() {
+        let m = inputs();
+        let out = layer(crate::run("near", &m, &serde_json::json!({"input": "pts", "near": "polys", "units": "Meters"})).unwrap());
+        assert_eq!(out.name, "pts_Near");
+        let names: Vec<&str> = out.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["v", "near_fid", "near_dist", "near_x", "near_y"]);
+        assert_eq!(out.features.len(), 3);
+        // Inside the first square: no distance, and the point itself is the nearest point.
+        assert_eq!(near_fields(&out, 0), (Some(1), Some(0.0), Some(0.5), Some(0.5)));
+        // (1.5, 1.5) is in both overlapping squares: the first wins the tie.
+        assert_eq!(near_fields(&out, 1).0, Some(1));
+        // (50, 50) is nearest the third square's far corner, (11, 11), on the ground.
+        let (fid, d, x, y) = near_fields(&out, 2);
+        assert_eq!(fid, Some(3));
+        let want = rustgis_geom::wgs84_distance_m(Coord::new(50.0, 50.0), Coord::new(11.0, 11.0));
+        assert!((d.unwrap() - want).abs() < 1e-4 * want, "{d:?} vs {want}");
+        assert!((x.unwrap() - 11.0).abs() < 1e-7 && (y.unwrap() - 11.0).abs() < 1e-7, "{x:?} {y:?}");
+    }
+
+    #[test]
+    fn near_leaves_features_beyond_the_search_distance_empty() {
+        let m = inputs();
+        let out = layer(crate::run("near", &m, &serde_json::json!({"input": "pts", "near": "polys", "distance": 100})).unwrap());
+        assert_eq!(near_fields(&out, 0).0, Some(1));
+        assert_eq!(near_fields(&out, 2), (None, None, None, None), "(50, 50) is thousands of km away");
+        for bad in [serde_json::json!(-1), serde_json::json!("far")] {
+            assert!(crate::run("near", &m, &serde_json::json!({"input": "pts", "near": "polys", "distance": bad})).is_err());
+        }
+    }
+
+    #[test]
+    fn near_within_one_layer_skips_the_feature_itself() {
+        let m = inputs();
+        let out = layer(crate::run("near", &m, &serde_json::json!({"input": "pts", "near": "pts"})).unwrap());
+        // Each point's nearest is another point, not itself at no distance.
+        assert_eq!(near_fields(&out, 0).0, Some(2));
+        assert_eq!(near_fields(&out, 1).0, Some(1));
+        assert!(near_fields(&out, 0).1.is_some_and(|d| d > 0.0));
+    }
+
+    #[test]
+    fn near_gives_a_shared_point_for_crossing_lines() {
+        let line = |a: (f64, f64), b: (f64, f64)| Geometry::Line(vec![vec![Coord::new(a.0, a.1), Coord::new(b.0, b.1)]]);
+        let mut a = Dataset::new("a", GeometryType::Polyline, vec![]);
+        a.push(Some(line((0.0, 0.0), (2.0, 2.0))), vec![]);
+        let mut b = Dataset::new("b", GeometryType::Polyline, vec![]);
+        b.push(Some(line((0.0, 2.0), (2.0, 0.0))), vec![]);
+        let m = Map(HashMap::from([("a".to_string(), a), ("b".to_string(), b)]));
+        let out = layer(crate::run("near", &m, &serde_json::json!({"input": "a", "near": "b"})).unwrap());
+        let (fid, d, x, y) = near_fields(&out, 0);
+        assert_eq!((fid, d), (Some(1), Some(0.0)));
+        // Where they cross: (1, 1), give or take the map's straight lines.
+        assert!((x.unwrap() - 1.0).abs() < 1e-3 && (y.unwrap() - 1.0).abs() < 1e-3, "{x:?} {y:?}");
     }
 
     /// Layers with a selection in each, as the Tools pane passes them.
@@ -3838,6 +4146,105 @@ mod tests {
         let (got, want) = (out.features[1].geometry.as_ref().unwrap().extent(), sq(1.0, 0.0, 2.0).extent());
         for (g, w) in [(got.min_x, want.min_x), (got.max_x, want.max_x), (got.min_y, want.min_y), (got.max_y, want.max_y)] {
             assert!((g - w).abs() < 1e-9, "{got:?}");
+        }
+    }
+
+    /// A point layer named `name` with a feature at each lon/lat in `at`, ids 1, 2, ….
+    fn points(name: &str, at: &[(f64, f64)]) -> Dataset {
+        let mut ds = Dataset::new(name, GeometryType::Point, vec![]);
+        for (x, y) in at {
+            ds.push_next(Some(Geometry::Point(Coord::new(*x, *y))), vec![]);
+        }
+        ds
+    }
+
+    #[test]
+    fn near_searches_the_grid_and_breaks_ties_in_layer_order() {
+        // Enough points for a grid: a row 1° apart on the equator, and one far along it.
+        let mut at: Vec<(f64, f64)> = (0..20).map(|i| (f64::from(i), 0.0)).collect();
+        at.push((100.0, 0.0));
+        let m = Map(HashMap::from([("row".to_string(), points("row", &at))]));
+        let out = layer(crate::run("near", &m, &serde_json::json!({"input": "row", "near": "row"})).unwrap());
+        // The first point's nearest is the second, not itself.
+        assert_eq!(near_fields(&out, 0).0, Some(2));
+        // The eleventh (10°) is as near the tenth as the twelfth: the tenth wins.
+        let (fid, d, _, _) = near_fields(&out, 10);
+        assert_eq!(fid, Some(10));
+        let degree = rustgis_geom::wgs84_distance_m(Coord::new(0.0, 0.0), Coord::new(1.0, 0.0)) / 1000.0;
+        assert!((d.unwrap() - degree).abs() < 1e-6 * degree, "{d:?} km vs {degree} km");
+        // The far point's search widens until it reaches the last of the row, 81° away.
+        assert_eq!(near_fields(&out, 20).0, Some(20));
+    }
+
+    #[test]
+    fn near_measures_across_the_antimeridian() {
+        let m = Map(HashMap::from([
+            ("a".to_string(), points("a", &[(179.9, 0.0)])),
+            ("b".to_string(), points("b", &[(178.0, 0.0), (-179.9, 0.0)])),
+        ]));
+        let out = layer(crate::run("near", &m, &serde_json::json!({"input": "a", "near": "b", "units": "Meters"})).unwrap());
+        let (fid, d, x, y) = near_fields(&out, 0);
+        assert_eq!(fid, Some(2), "0.2° away across ±180°, not 1.9° on this side");
+        let want = rustgis_geom::wgs84_distance_m(Coord::new(179.9, 0.0), Coord::new(-179.9, 0.0));
+        assert!((d.unwrap() - want).abs() < 1e-6 * want, "{d:?} vs {want}");
+        assert!((x.unwrap() + 179.9).abs() < 1e-7 && y.unwrap().abs() < 1e-7, "{x:?} {y:?}");
+    }
+
+    #[test]
+    fn near_gives_a_shared_point_within_180_degrees_of_the_meridian() {
+        let mut polys = Dataset::new("polys", GeometryType::Polygon, vec![]);
+        polys.push(Some(sq(190.0, -1.0, 20.0)), vec![]);
+        let m = Map(HashMap::from([("a".to_string(), points("a", &[(200.0, 0.0)])), ("b".to_string(), polys)]));
+        let out = layer(crate::run("near", &m, &serde_json::json!({"input": "a", "near": "b"})).unwrap());
+        let (fid, d, x, y) = near_fields(&out, 0);
+        assert_eq!((fid, d), (Some(1), Some(0.0)));
+        // 200° is the meridian of −160°: the shared point comes back in [−180°, 180°) as the nearest points do.
+        assert!((x.unwrap() + 160.0).abs() < 1e-7 && y.unwrap().abs() < 1e-7, "{x:?} {y:?}");
+    }
+
+    #[test]
+    fn near_gives_a_point_for_the_same_place_on_both_sides_of_the_antimeridian() {
+        let m = Map(HashMap::from([("a".to_string(), points("a", &[(180.0, 0.0)])), ("b".to_string(), points("b", &[(-180.0, 0.0)]))]));
+        let out = layer(crate::run("near", &m, &serde_json::json!({"input": "a", "near": "b", "units": "Meters"})).unwrap());
+        let (fid, d, x, y) = near_fields(&out, 0);
+        assert_eq!(fid, Some(1));
+        assert!(d.is_some_and(|d| d.abs() < 1e-6), "{d:?}");
+        assert!(x.is_some_and(|x| (x.abs() - 180.0).abs() < 1e-7) && y.is_some_and(|y| y.abs() < 1e-7), "{x:?} {y:?}");
+    }
+
+    #[test]
+    fn near_finds_the_nearest_point_along_a_line_within_the_search_distance() {
+        let line = |a: (f64, f64), b: (f64, f64)| Geometry::Line(vec![vec![Coord::new(a.0, a.1), Coord::new(b.0, b.1)]]);
+        let mut roads = Dataset::new("roads", GeometryType::Polyline, vec![]);
+        roads.push(Some(line((-1.0, 0.0), (1.0, 0.0))), vec![]);
+        roads.push(Some(line((0.0, 5.0), (1.0, 5.0))), vec![]);
+        let m = Map(HashMap::from([("pts".to_string(), points("pts", &[(0.0, 1.0)])), ("roads".to_string(), roads)]));
+        let run = |p: serde_json::Value| layer(crate::run("near", &m, &p).unwrap());
+        // A degree north of the first road's middle: the point below it, about 110.6 km away.
+        let (fid, d, x, y) = near_fields(&run(serde_json::json!({"input": "pts", "near": "roads"})), 0);
+        assert_eq!(fid, Some(1));
+        let want = rustgis_geom::wgs84_distance_m(Coord::new(0.0, 1.0), Coord::new(0.0, 0.0)) / 1000.0;
+        assert!((d.unwrap() - want).abs() < 1e-4 * want, "{d:?} vs {want}");
+        // Found on the plane's straight edge, within 0.01 % of the distance of the geodesic's point.
+        assert!(x.unwrap().abs() < 1e-4 && y.unwrap().abs() < 1e-4, "{x:?} {y:?}");
+        let far = run(serde_json::json!({"input": "pts", "near": "roads", "distance": 100}));
+        assert_eq!(near_fields(&far, 0), (None, None, None, None));
+        // Only the second road selected: it is the nearest.
+        let m = Selected(m, HashMap::from([("roads".to_string(), vec![1])]));
+        let out = layer(crate::run("near", &m, &serde_json::json!({"input": "pts", "near": "roads"})).unwrap());
+        assert_eq!(near_fields(&out, 0).0, Some(2));
+    }
+
+    #[test]
+    fn near_gives_a_point_in_the_overlap_of_polygons() {
+        let m = inputs();
+        let out = layer(crate::run("near", &m, &serde_json::json!({"input": "polys", "near": "polys"})).unwrap());
+        // The first two squares overlap (x 1–2): each is the other's nearest, at a point they share.
+        for r in [0, 1] {
+            let (fid, d, x, y) = near_fields(&out, r);
+            assert_eq!((fid, d), (Some(2 - r as i64), Some(0.0)));
+            let (x, y) = (x.unwrap(), y.unwrap());
+            assert!((1.0 - 1e-9..=2.0 + 1e-9).contains(&x) && (-1e-9..=2.0 + 1e-9).contains(&y), "{x} {y}");
         }
     }
 

@@ -852,7 +852,8 @@ fn web_basemaps(ui: &mut Ui, app: &mut RustGisApp, t: &Tokens) {
     });
 }
 
-/// The map's web tile layers (top first): shown, opacity, order and removal, and adding one.
+/// The map's web tile layers (top first, in the drawing order): shown, opacity, order among
+/// them and removal, and adding one.
 fn tile_layers(ui: &mut Ui, app: &mut RustGisApp, t: &Tokens) {
     ui.add_space(6.0);
     ui.separator();
@@ -861,8 +862,24 @@ fn tile_layers(ui: &mut Ui, app: &mut RustGisApp, t: &Tokens) {
     if tiles.is_empty() {
         ui.label(egui::RichText::new(tl!("None. Add one by address, or from a basemap plugin.")).weak().small());
     }
+    // Each tile layer's place in the drawing order of all the map's layers (#808), top first,
+    // and the map layer it's drawn over.
+    let slots = app.session.map().tile_slots();
+    let places: Vec<(usize, usize)> = app
+        .session
+        .map()
+        .stack()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(at, d)| if let rustgis_engine::map::Drawn::Tile(i) = d { Some((i, at)) } else { None })
+        .collect();
     let mut action: Option<(&str, Value)> = None;
-    for (i, layer) in tiles.iter().enumerate() {
+    for (k, (i, _)) in places.iter().copied().enumerate() {
+        let Some(layer) = tiles.get(i) else { continue };
+        // Up or down past the tile layer next to it over the same map layer (a basemap among the
+        // basemaps): past the map's layers, the Layers pane moves it.
+        let same = |o: &&(usize, usize)| slots.get(o.0) == slots.get(i);
+        let (above, below) = (k.checked_sub(1).and_then(|k| places.get(k)).filter(same), places.get(k + 1).filter(same));
         ui.horizontal(|ui| {
             let mut vis = layer.visible;
             if ui.checkbox(&mut vis, "").on_hover_text(tl!("Show or hide")).changed() {
@@ -878,12 +895,17 @@ fn tile_layers(ui: &mut Ui, app: &mut RustGisApp, t: &Tokens) {
             if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
                 action = Some(("map.setTiles", json!({"index": i, "opacity": o / 100.0})));
             }
-            if ui.add_enabled(i > 0, egui::Button::new("▲").small()).on_hover_text(tl!("Move up")).clicked() {
-                action = Some(("map.setTiles", json!({"index": i, "move": "up"})));
+            if ui.add_enabled(above.is_some(), egui::Button::new("▲").small()).on_hover_text(tl!("Move up")).clicked()
+                && let Some((_, to)) = above
+            {
+                action = Some(("map.setTiles", json!({"index": i, "to": to})));
                 ui.close();
             }
-            if ui.add_enabled(i + 1 < tiles.len(), egui::Button::new("▼").small()).on_hover_text(tl!("Move down")).clicked() {
-                action = Some(("map.setTiles", json!({"index": i, "move": "down"})));
+            // (Without it, the place below the next one is that one's place now.)
+            if ui.add_enabled(below.is_some(), egui::Button::new("▼").small()).on_hover_text(tl!("Move down")).clicked()
+                && let Some((_, to)) = below
+            {
+                action = Some(("map.setTiles", json!({"index": i, "to": to})));
                 ui.close();
             }
             if crate::widgets::icon_button(ui, "close", tl!("Remove")).clicked() {
@@ -2347,6 +2369,33 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
             small(ui, app, "redo", "Redo", "Redo the change you undid.", "edit.redo", Value::Null, false);
             small(ui, app, "history", "Status", "Edits since the project was saved.", "ui.pane.editing", Value::Null, pane);
         });
+        // A layer loaded from PostGIS for editing saves its edits to its table, not the project
+        // (desktop only: the browser doesn't reach databases).
+        #[cfg(not(target_arch = "wasm32"))]
+        if app.session.map().layers.iter().any(|l| l.postgis.is_some()) {
+            col(ui, |ui| {
+                small(
+                    ui,
+                    app,
+                    "save",
+                    "Save to PostGIS…",
+                    "Save a PostGIS layer's edits to its table, unless rows changed there since.",
+                    "ui.dialog",
+                    json!({"name": "pgSave"}),
+                    false,
+                );
+                small(
+                    ui,
+                    app,
+                    "update",
+                    "Discard PostGIS Edits…",
+                    "Load a PostGIS layer's rows again as they are in the database, dropping its edits.",
+                    "ui.dialog",
+                    json!({"name": "pgDiscard"}),
+                    false,
+                );
+            });
+        }
         col(ui, |ui| {
             small(ui, app, "settings", "Settings", "Editing settings.", "ui.pane.editing", Value::Null, pane);
             small(

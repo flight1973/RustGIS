@@ -167,6 +167,8 @@ fn move_group(s: &mut Session, p: &Value) -> CmdResult {
 
 fn ungroup(s: &mut Session, p: &Value) -> CmdResult {
     let id = group_id(s.map(), p)?;
+    // The tile layers over the group stay over its layers, where they were.
+    s.map_mut().settle_tiles();
     s.map_mut().groups.retain(|g| g.id != id);
     Ok(Value::Null)
 }

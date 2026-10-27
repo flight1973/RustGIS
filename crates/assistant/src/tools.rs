@@ -29,7 +29,7 @@ pub fn defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "list_layers",
-            description: "Everything about the open project in one call: its path and unsaved changes, the view (centre, lon/lat extent, scale, projection), the active layer, its layers in table-of-contents order, top first (id, name, group, type, source, lon/lat extent, feature count, selection, definition query, renderer, labels, fields, visibility), its web tile layers (XYZ, WMS, vector tiles; index 0 on top, changed with map.setTiles), basemap, tables and layouts with their map frames.",
+            description: "Everything about the open project in one call: its path and unsaved changes, the view (centre, lon/lat extent, scale, projection), the active layer, its layers in table-of-contents order, top first (id, name, group, type, source, lon/lat extent, feature count, selection, definition query, renderer, labels, fields, visibility), its web tile layers (XYZ, WMS, vector tiles; index 0 on top, each with the layer it's drawn over, changed with map.setTiles), basemap, tables and layouts with their map frames.",
             schema: json!({
                 "type": "object",
                 "properties": {
@@ -721,13 +721,18 @@ pub fn context(s: &Session) -> String {
         out.push_str(&format!("\n… and {} more (list_layers lists them all).", m.layers.len() - 60));
     }
     if !m.tiles.is_empty() {
-        out.push_str("\nWeb tile layers under them (top first, index for map.setTiles):");
+        out.push_str("\nWeb tile layers (top first, index for map.setTiles), each drawn over the layer it names, or under them all:");
     }
+    let slots = m.tile_slots();
     for (i, t) in m.tiles.iter().enumerate() {
         // The name is clipped, not the line: the index and flags after it are what the model needs.
         let mut line = format!("\n- \"{}\" (index {i}, {}", clip(&t.name, 200), t.kind.code());
         if t.overlay {
             line.push_str(", overlay");
+        }
+        match slots.get(i).copied().flatten().and_then(|id| m.layer(id)) {
+            Some(l) => line.push_str(&format!(", over \"{}\"", clip(&l.name, 200))),
+            None => line.push_str(", under the layers"),
         }
         if !t.visible {
             line.push_str(", hidden");

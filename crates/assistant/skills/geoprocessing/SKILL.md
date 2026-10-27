@@ -10,7 +10,8 @@ Based on the RustGIS user guide, Analysis › Geoprocessing tools
 
 1. **Find the tool:** `search_tools` with words ("buffer", "overlay", "count points"), then
    `describe_tool` for its parameters. Never guess parameter names. The built-in tools are:
-   - proximity: `buffer` (`input`, `distance`, `units`, `dissolve`)
+   - proximity: `buffer` (`input`, `distance`, `units`, `dissolve`), `near` (`input`, `near`,
+     `distance`, `units`: adds the nearest feature's id, its distance and the nearest point)
    - overlay: `clip` (`input`, `clip`), `erase` (`input`, `erase`), `intersect` (`input`,
      `overlay`: the parts in each overlay polygon, with both layers' attributes), `identity`
      (the same, plus the parts outside every overlay polygon), `union` (both polygon layers:

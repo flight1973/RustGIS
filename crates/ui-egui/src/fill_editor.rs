@@ -1,0 +1,378 @@
+//! The Fills section of a polygon layer's symbology (#882 piece 5): fills stacked in one symbol,
+//! each a colour, hatch lines or markers on a grid, as the Strokes section stacks a line's. Listed
+//! top first, as they are seen; a layer with classes can stack fills for one class of its own,
+//! picked at the top. Every change runs `layer.fillLayers`.
+
+use egui::{CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
+use rustgis_engine::map::fills::{FillLayer, FillPattern, MAX_DOT_SIZE, MAX_FILLS, MAX_HATCH_WIDTH, MAX_PATTERN_OFFSET, PATTERN_SPACING};
+use rustgis_engine::map::symbology::ClassRef;
+use rustgis_engine::map::{Layer, Marker, Symbol};
+use serde_json::{Value, json};
+
+use crate::RustGisApp;
+use crate::theme::{Tokens, c32, rgba, semibold};
+
+/// The fill's settings as `layer.fillLayers` takes them.
+fn fill_json(f: &FillLayer) -> Value {
+    let color = f.color.map(|c| c.hex());
+    match f.pattern {
+        FillPattern::Solid => json!({"color": color, "pattern": "solid"}),
+        FillPattern::Hatch { angle, spacing, width, offset } => {
+            json!({"color": color, "pattern": "hatch", "angle": angle, "spacing": spacing, "width": width, "offset": offset})
+        }
+        FillPattern::Dots { marker, size, outline, outline_width, spacing, displacement, offset } => {
+            let mut o = json!({
+                "color": color, "pattern": "dots", "marker": marker.label(), "size": size, "outline": outline.map(|c| c.hex()),
+                "outlineWidth": outline_width, "spacing": spacing, "displacement": displacement, "offset": offset,
+            });
+            // A character of a font (from a QGIS font marker): its char and family, as the command takes them.
+            if let Marker::Char(g) = marker {
+                o["marker"] = Value::Null;
+                o["char"] = json!(g.ch.to_string());
+                o["font"] = json!(g.font.as_str());
+            }
+            o
+        }
+    }
+}
+
+/// Runs `layer.fillLayers` with `fills` for the class picked (`None`: the layer's).
+fn set_fills(app: &mut RustGisApp, class: Option<&ClassRef>, fills: &[FillLayer]) {
+    let mut p = json!({"fills": fills.iter().map(fill_json).collect::<Vec<_>>()});
+    match class {
+        Some(ClassRef::Value(v)) => p["value"] = json!(v),
+        Some(ClassRef::Index(i)) => p["index"] = json!(i),
+        Some(ClassRef::Other) => p["other"] = json!(true),
+        None => {}
+    }
+    let _ = app.run("layer.fillLayers", p);
+}
+
+/// A fill's kind, as the Draw list names it.
+fn kind(f: &FillLayer) -> &'static str {
+    match f.pattern {
+        FillPattern::Solid => "Solid",
+        FillPattern::Hatch { .. } => "Hatch lines",
+        FillPattern::Dots { .. } => "Markers",
+    }
+}
+
+pub(crate) fn fills_editor(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
+    let classes = crate::panes::stroke_classes(&l.renderer);
+    let picked_id = egui::Id::unique(("fill_class", l.id));
+    // The class being edited, while the renderer still has it; `None` is the layer's own fills.
+    let picked: Option<ClassRef> =
+        ui.data(|d| d.get_temp::<Option<ClassRef>>(picked_id)).flatten().filter(|c| classes.iter().any(|(k, ..)| k == c));
+    let class = picked.as_ref();
+    let base = class.and_then(|c| classes.iter().find(|(k, ..)| k == c)).map_or_else(|| l.renderer.base_symbol(), |(.., s)| *s);
+    let own = class.and_then(|c| l.renderer.class_fills(c).ok()).map(<[FillLayer]>::to_vec);
+    // What the class draws: its own fills, else the layer's.
+    let fills = match &own {
+        Some(v) if !v.is_empty() => v.clone(),
+        Some(_) | None => l.fill_layers.clone(),
+    };
+    let borrowed = own.as_ref().is_some_and(Vec::is_empty);
+    egui::Frame::NONE.fill(t.pane_header).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(tl!("Fills")).font(semibold(12.5)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let add = ui.add_enabled(fills.len() < MAX_FILLS, egui::Button::new(tl!("Add Fill")).small());
+                if add.on_hover_text(tl!("Stack another fill on top")).clicked() {
+                    let mut next = fills.clone();
+                    // The first stands for the symbol's own fill; the next hatches over it.
+                    next.push(if next.is_empty() { FillLayer::default() } else { FillLayer::hatch(45.0, 6.0, 1.0) });
+                    set_fills(app, class, &next);
+                }
+            });
+        });
+        if !classes.is_empty() {
+            ui.horizontal(|ui| {
+                let input_label = ui.label(egui::RichText::new(tl!("Fills for")).size(11.5).color(t.text_dim));
+                let name = |c: Option<&ClassRef>| match c.and_then(|c| classes.iter().find(|(k, ..)| k == c)) {
+                    Some((_, label, _)) => label.clone(),
+                    None => tl!("All classes").to_string(),
+                };
+                egui::ComboBox::from_id_salt(("fill_class_pick", l.id))
+                    .selected_text(name(class))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(class.is_none(), tl!("All classes")).on_hover_text(tl!("The layer's fills")).clicked() {
+                            ui.data_mut(|d| d.insert_temp::<Option<ClassRef>>(picked_id, None));
+                        }
+                        for (k, label, _) in &classes {
+                            // A class with fills of its own is marked.
+                            let has_own = l.renderer.class_fills(k).is_ok_and(|f| !f.is_empty());
+                            let text = if has_own { crate::i18n::fmt("{label} •", &[("label", label)]) } else { label.clone() };
+                            if ui.selectable_label(class == Some(k), text).clicked() {
+                                ui.data_mut(|d| d.insert_temp(picked_id, Some(k.clone())));
+                            }
+                        }
+                    })
+                    .response
+                    .labelled_by(input_label.id);
+            });
+        }
+        // The stacked fills on a square, bottom first, as the map draws them.
+        let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
+        ui.painter().rect_filled(r, CornerRadius::same(4), t.ribbon);
+        let swatch = Rect::from_center_size(r.center(), vec2(r.width().min(120.0) - 8.0, r.height() - 10.0));
+        preview(ui, swatch, &fills, &base);
+        if borrowed {
+            ui.label(
+                egui::RichText::new(tl!("This class is drawn with the layer's fills. Changing them here gives it its own."))
+                    .size(11.5)
+                    .color(t.text_dim),
+            );
+        }
+        if fills.is_empty() {
+            ui.label(
+                egui::RichText::new(tl!("One fill, from the symbol. Add fills to stack colours, hatch lines and markers."))
+                    .size(11.5)
+                    .color(t.text_dim),
+            );
+            return;
+        }
+        let n = fills.len();
+        for i in (0..n).rev() {
+            let Some(f) = fills.get(i).copied() else { continue };
+            ui.add_space(4.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                let title = crate::i18n::fmt("Fill {n}", &[("n", &(n - i).to_string())]);
+                ui.label(egui::RichText::new(title).size(11.5).color(t.text_dim));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if crate::widgets::icon_button(ui, "close", tl!("Remove")).clicked() {
+                        let mut next = fills.clone();
+                        next.remove(i);
+                        set_fills(app, class, &next);
+                    }
+                    if ui.add_enabled(i > 0, egui::Button::new("↓").small()).on_hover_text(tl!("Move down")).clicked() {
+                        let mut next = fills.clone();
+                        next.swap(i, i - 1);
+                        set_fills(app, class, &next);
+                    }
+                    if ui.add_enabled(i + 1 < n, egui::Button::new("↑").small()).on_hover_text(tl!("Move up")).clicked() {
+                        let mut next = fills.clone();
+                        next.swap(i, i + 1);
+                        set_fills(app, class, &next);
+                    }
+                });
+            });
+            let set = |app: &mut RustGisApp, new: FillLayer| {
+                let mut next = fills.clone();
+                if let Some(slot) = next.get_mut(i) {
+                    *slot = new;
+                }
+                set_fills(app, class, &next);
+            };
+            egui::Grid::new(("fill_grid", i)).num_columns(2).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
+                let input_label = ui.label(tl!("Draw"));
+                egui::ComboBox::from_id_salt(("fill_draw", i))
+                    .selected_text(tl!(kind(&f)))
+                    .show_ui(ui, |ui| {
+                        let options = [
+                            FillLayer { pattern: FillPattern::Solid, ..f },
+                            FillLayer::hatch(45.0, 6.0, 1.0),
+                            FillLayer {
+                                pattern: FillPattern::Dots {
+                                    marker: Marker::Circle,
+                                    size: 3.0,
+                                    outline: None,
+                                    outline_width: 0.0,
+                                    spacing: [8.0, 8.0],
+                                    displacement: [4.0, 0.0],
+                                    offset: [0.0, 0.0],
+                                },
+                                ..f
+                            },
+                        ];
+                        for option in options {
+                            let option = FillLayer { color: f.color, ..option };
+                            if ui.selectable_label(kind(&option) == kind(&f), tl!(kind(&option))).clicked() && kind(&option) != kind(&f) {
+                                set(app, option);
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(tl!("A colour, hatch lines, or markers on a grid"))
+                    .labelled_by(input_label.id);
+                ui.end_row();
+                ui.label(tl!("Color"));
+                ui.horizontal(|ui| {
+                    let c = f.color.unwrap_or(base.fill);
+                    let mut cc = c32(c);
+                    if crate::widgets::color_button(ui, &mut cc).changed() {
+                        set(app, FillLayer { color: Some(rgba(cc)), ..f });
+                    }
+                    let mut from_symbol = f.color.is_none();
+                    if ui.checkbox(&mut from_symbol, tl!("From symbol")).on_hover_text(tl!("Use each feature's fill color")).changed() {
+                        set(app, FillLayer { color: if from_symbol { None } else { Some(c) }, ..f });
+                    }
+                });
+                ui.end_row();
+                let number = |ui: &mut Ui, label: &str, v: f32, range: std::ops::RangeInclusive<f32>, suffix: &str| -> Option<f32> {
+                    let input_label = ui.label(tl!(label));
+                    let mut x = v;
+                    let r = ui.add(egui::DragValue::new(&mut x).range(range).speed(0.1).suffix(suffix)).labelled_by(input_label.id);
+                    ui.end_row();
+                    (r.changed() && x != v).then_some(x)
+                };
+                match f.pattern {
+                    FillPattern::Solid => {}
+                    FillPattern::Hatch { angle, spacing, width, offset } => {
+                        let hatch = |angle, spacing, width, offset| FillLayer {
+                            pattern: FillPattern::Hatch { angle, spacing, width, offset },
+                            ..f
+                        };
+                        if let Some(a) = number(ui, "Angle", angle, 0.0..=360.0, "°") {
+                            set(app, hatch(a, spacing, width, offset));
+                        }
+                        if let Some(s) = number(ui, "Spacing", spacing, PATTERN_SPACING, " pt") {
+                            set(app, hatch(angle, s, width, offset));
+                        }
+                        if let Some(w) = number(ui, "Line width", width, 0.0..=MAX_HATCH_WIDTH, " pt") {
+                            set(app, hatch(angle, spacing, w, offset));
+                        }
+                        if let Some(o) = number(ui, "Offset", offset, -MAX_PATTERN_OFFSET..=MAX_PATTERN_OFFSET, " pt") {
+                            set(app, hatch(angle, spacing, width, o));
+                        }
+                    }
+                    FillPattern::Dots { marker, size, outline, outline_width, spacing, displacement, offset } => {
+                        let dots = |marker, size, spacing: [f32; 2], displacement: [f32; 2]| FillLayer {
+                            pattern: FillPattern::Dots { marker, size, outline, outline_width, spacing, displacement, offset },
+                            ..f
+                        };
+                        let input_label = ui.label(tl!("Marker"));
+                        egui::ComboBox::from_id_salt(("fill_marker", i))
+                            .selected_text(tl!(marker.label()))
+                            .show_ui(ui, |ui| {
+                                for m in Marker::ALL {
+                                    if ui.selectable_label(m == marker, tl!(m.label())).clicked() && m != marker {
+                                        set(app, dots(m, size, spacing, displacement));
+                                    }
+                                }
+                            })
+                            .response
+                            .labelled_by(input_label.id);
+                        ui.end_row();
+                        if let Some(s) = number(ui, "Size", size, 0.0..=MAX_DOT_SIZE, " pt") {
+                            set(app, dots(marker, s, spacing, displacement));
+                        }
+                        if let Some(s) = number(ui, "Spacing across", spacing[0], PATTERN_SPACING, " pt") {
+                            set(app, dots(marker, size, [s, spacing[1]], displacement));
+                        }
+                        if let Some(s) = number(ui, "Spacing down", spacing[1], PATTERN_SPACING, " pt") {
+                            set(app, dots(marker, size, [spacing[0], s], displacement));
+                        }
+                        if let Some(d) = number(ui, "Rows shifted", displacement[0], 0.0..=(spacing[0] - 0.01).max(0.0), " pt") {
+                            set(app, dots(marker, size, spacing, [d, displacement[1]]));
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// The stacked `fills` on `r`, bottom first: a colour fills it, hatch lines cross it at their
+/// angle and spacing, markers sit on their grid (as circles), each in its colour or `base`'s.
+fn preview(ui: &Ui, r: Rect, fills: &[FillLayer], base: &Symbol) {
+    let p = ui.painter().with_clip_rect(r);
+    let one = [FillLayer::default()];
+    let shown = if fills.is_empty() { &one[..] } else { fills };
+    // (Only what the map draws: a hatch of no width, a marker of no size, no colour to show.)
+    for f in shown.iter().filter(|f| f.draws(base.fill)) {
+        let c = c32(f.color.unwrap_or(base.fill));
+        match f.pattern {
+            FillPattern::Solid => {
+                p.rect_filled(r, CornerRadius::ZERO, c);
+            }
+            FillPattern::Hatch { angle, spacing, width, .. } => {
+                // Lines across the swatch, `spacing` apart along their normal.
+                let (sin, cos) = (-angle.to_radians()).sin_cos();
+                let (dir, normal) = (vec2(cos, sin), vec2(-sin, cos));
+                let reach = r.width().hypot(r.height());
+                let step = spacing.max(1.0);
+                let mut k = -reach;
+                while k <= reach {
+                    let mid = r.center() + normal * k;
+                    p.line_segment([mid - dir * reach, mid + dir * reach], Stroke::new(width.max(0.5), c));
+                    k += step;
+                }
+            }
+            FillPattern::Dots { size, spacing, displacement, .. } => {
+                // (No finer than 4 points in the swatch: it is a picture, not every dot.)
+                let [dx, dy] = spacing.map(|s| s.max(4.0));
+                // (Shifts widened with the spacing, so a half shift stays a half.)
+                let shift = [0, 1].map(|i| displacement[i] * if spacing[i] > 0.0 { [dx, dy][i] / spacing[i] } else { 1.0 });
+                // As the map lays them: odd rows shifted across, odd columns down (a row and a
+                // column more each way for the shifts).
+                let (cols, rows) = ((r.width() / dx).ceil() as i32 + 1, (r.height() / dy).ceil() as i32 + 1);
+                for row in -1..=rows {
+                    for col in -1..=cols {
+                        let x = r.min.x + (col as f32 + 0.5) * dx + if row.rem_euclid(2) == 1 { shift[0] } else { 0.0 };
+                        let y = r.min.y + (row as f32 + 0.5) * dy + if col.rem_euclid(2) == 1 { shift[1] } else { 0.0 };
+                        p.circle_filled(pos2(x, y), (size / 2.0).max(0.5), c);
+                    }
+                }
+            }
+        }
+    }
+    // The symbol's outline over them.
+    if base.stroke_width > 0.0 {
+        p.rect_stroke(r, CornerRadius::ZERO, Stroke::new(base.stroke_width.min(3.0), c32(base.stroke)), egui::StrokeKind::Inside);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use egui_kittest::kittest::Queryable;
+
+    use super::*;
+
+    /// Fills are added (the first the symbol's colour, the next hatch lines over it), drawn as
+    /// markers or removed, each a `layer.fillLayers`.
+    #[test]
+    fn fills_are_stacked_and_changed_in_the_editor() {
+        let app = RustGisApp::with_sample();
+        // The section's fonts (its semibold heading) are installed on the first frame, as the app does.
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(420.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let Some(l) = app.session.map().layer_by_name("Countries").cloned() else { return };
+                fills_editor(app, ui, &l, &Tokens::light());
+            },
+            app,
+        );
+        h.run();
+        let fills =
+            |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer_by_name("Countries").unwrap().fill_layers.clone();
+        assert!(fills(&h).is_empty());
+        assert!(h.query_by_label("Fill 1").is_none());
+        h.get_by_label("Add Fill").click();
+        h.run();
+        assert_eq!(fills(&h), [FillLayer::default()], "the symbol's colour first");
+        h.get_by_label("Add Fill").click();
+        h.run();
+        let f = fills(&h);
+        assert_eq!(f.len(), 2);
+        assert!(matches!(f[1].pattern, FillPattern::Hatch { .. }), "hatch lines over it: {f:?}");
+        assert!(h.query_by_label("Fill 2").is_some() && h.query_by_label("Angle").is_some());
+        // The top one (listed first) drawn as markers.
+        h.query_all_by_label("Draw").next().unwrap().click();
+        h.run();
+        h.get_by_label("Markers").click();
+        h.run();
+        assert!(matches!(fills(&h)[1].pattern, FillPattern::Dots { .. }), "{:?}", fills(&h));
+        // Removed: the first remove button is the top fill's.
+        h.query_all_by_label("Remove").next().unwrap().click();
+        h.run();
+        assert_eq!(fills(&h), [FillLayer::default()]);
+    }
+}

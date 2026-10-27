@@ -7,6 +7,7 @@ use rustgis_data::{Dataset, FieldType, GeometryType};
 use serde::{Deserialize, Serialize};
 
 use crate::color::{Ramp, Rgba};
+use crate::fills::FillLayer;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Marker {
@@ -686,6 +687,13 @@ pub enum Renderer {
         /// The stacked strokes of `other`; empty takes the layer's.
         #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "de_strokes")]
         other_strokes: Vec<LineStroke>,
+        /// A polygon layer's stacked fills for one class, by class value: drawn for that class's
+        /// features instead of the layer's `fill_layers`. A class without its own takes the layer's.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "crate::fills::de_class_fills")]
+        class_fills: BTreeMap<String, Vec<FillLayer>>,
+        /// The stacked fills of `other`; empty takes the layer's.
+        #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "crate::fills::de_fills")]
+        other_fills: Vec<FillLayer>,
     },
     /// Upper bounds of each class (ascending) and one symbol per class.
     Graduated {
@@ -707,6 +715,9 @@ pub enum Renderer {
         /// A line layer's stacked strokes for one class, by class index, as Unique Values'.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "de_class_strokes")]
         class_strokes: BTreeMap<usize, Vec<LineStroke>>,
+        /// A polygon layer's stacked fills for one class, by class index, as Unique Values'.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "crate::fills::de_class_fills")]
+        class_fills: BTreeMap<usize, Vec<FillLayer>>,
     },
     /// Marker size grows with the value.
     Proportional {
@@ -828,6 +839,8 @@ impl Renderer {
             other_label: None,
             class_strokes: BTreeMap::new(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         })
     }
 
@@ -915,6 +928,7 @@ impl Renderer {
             classes: n,
             class_labels: BTreeMap::new(),
             class_strokes: BTreeMap::new(),
+            class_fills: Default::default(),
         })
     }
 
@@ -1004,12 +1018,65 @@ impl Renderer {
         (!strokes.is_empty()).then_some(strokes.as_slice())
     }
 
+    /// The stacked fills a polygon feature row's class has of its own (`class_fills`), or `None`
+    /// when its class has none (the layer's `fill_layers` apply).
+    pub fn fills_for(&self, ds: &Dataset, row: usize) -> Option<&[FillLayer]> {
+        self.fills_in(self.class_of(ds, row))
+    }
+
+    /// The symbol, class strokes and class fills of a feature row ([`Renderer::style_for`],
+    /// [`Renderer::fills_for`]), the feature classed once for all three.
+    pub fn style_fills_for(&self, ds: &Dataset, row: usize) -> (Symbol, Option<&[LineStroke]>, Option<&[FillLayer]>) {
+        let slot = self.class_of(ds, row);
+        (self.symbol_in(ds, row, slot), self.strokes_in(slot), self.fills_in(slot))
+    }
+
+    fn fills_in(&self, slot: Option<Slot>) -> Option<&[FillLayer]> {
+        let fills = match (self, slot?) {
+            (Renderer::Unique { classes, class_fills, .. }, Slot::Class(i)) => class_fills.get(&classes.get(i)?.0)?,
+            (Renderer::Unique { other_fills, .. }, Slot::Other) => other_fills,
+            (Renderer::Graduated { class_fills, .. }, Slot::Class(i)) => class_fills.get(&i)?,
+            _ => return None,
+        };
+        (!fills.is_empty()).then_some(fills.as_slice())
+    }
+
+    /// Whether any class has stacked fills of its own.
+    pub fn has_class_fills(&self) -> bool {
+        match self {
+            Renderer::Unique { class_fills, other_fills, .. } => !class_fills.is_empty() || !other_fills.is_empty(),
+            Renderer::Graduated { class_fills, .. } => !class_fills.is_empty(),
+            Renderer::Single(_) | Renderer::Proportional { .. } => false,
+        }
+    }
+
     /// Whether any class has stacked strokes of its own.
     pub fn has_class_strokes(&self) -> bool {
         match self {
             Renderer::Unique { class_strokes, other_strokes, .. } => !class_strokes.is_empty() || !other_strokes.is_empty(),
             Renderer::Graduated { class_strokes, .. } => !class_strokes.is_empty(),
             Renderer::Single(_) | Renderer::Proportional { .. } => false,
+        }
+    }
+
+    /// One class's own stacked fills (empty: it takes the layer's), as [`Renderer::class_strokes`].
+    pub fn class_fills(&self, class: &ClassRef) -> Result<&[FillLayer], String> {
+        let none: &[FillLayer] = &[];
+        match (self, class) {
+            (Renderer::Unique { classes, class_fills, .. }, ClassRef::Value(v)) => {
+                if !classes.iter().any(|(k, _)| k == v) {
+                    return Err(format!("no class with the value '{v}'"));
+                }
+                Ok(class_fills.get(v).map_or(none, Vec::as_slice))
+            }
+            (Renderer::Unique { other_fills, .. }, ClassRef::Other) => Ok(other_fills),
+            (Renderer::Graduated { symbols, class_fills, .. }, ClassRef::Index(i)) => {
+                if *i >= symbols.len() {
+                    return Err(no_class(*i, symbols.len()));
+                }
+                Ok(class_fills.get(i).map_or(none, Vec::as_slice))
+            }
+            _ => Err(class_mismatch(self)),
         }
     }
 
@@ -1032,6 +1099,41 @@ impl Renderer {
             }
             _ => Err(class_mismatch(self)),
         }
+    }
+
+    /// Sets one class's stacked fills (empty: the layer's again), as [`Renderer::set_class_strokes`]
+    /// does strokes.
+    pub fn set_class_fills(&mut self, class: &ClassRef, fills: Vec<FillLayer>) -> Result<(), String> {
+        use crate::fills::MAX_FILLS;
+        if fills.len() > MAX_FILLS {
+            return Err(format!("at most {MAX_FILLS} fills"));
+        }
+        let fills: Vec<FillLayer> = fills.into_iter().map(FillLayer::clamped).collect();
+        match (&mut *self, class) {
+            (Renderer::Unique { classes, class_fills, .. }, ClassRef::Value(v)) => {
+                if !classes.iter().any(|(k, _)| k == v) {
+                    return Err(format!("no class with the value '{v}'"));
+                }
+                if fills.is_empty() {
+                    class_fills.remove(v);
+                } else {
+                    class_fills.insert(v.clone(), fills);
+                }
+            }
+            (Renderer::Unique { other_fills, .. }, ClassRef::Other) => *other_fills = fills,
+            (Renderer::Graduated { symbols, class_fills, .. }, ClassRef::Index(i)) => {
+                if *i >= symbols.len() {
+                    return Err(no_class(*i, symbols.len()));
+                }
+                if fills.is_empty() {
+                    class_fills.remove(i);
+                } else {
+                    class_fills.insert(*i, fills);
+                }
+            }
+            _ => return Err(class_mismatch(self)),
+        }
+        Ok(())
     }
 
     /// Sets one class's own stacked strokes, at most [`MAX_STROKES`], each brought into range;
@@ -1305,7 +1407,18 @@ impl Renderer {
     pub fn carry_edits_from(&mut self, old: &Renderer, g: GeometryType) {
         match (self, old) {
             (
-                Renderer::Unique { field, classes, other, ramp, class_labels, other_label, class_strokes, other_strokes },
+                Renderer::Unique {
+                    field,
+                    classes,
+                    other,
+                    ramp,
+                    class_labels,
+                    other_label,
+                    class_strokes,
+                    other_strokes,
+                    class_fills,
+                    other_fills,
+                },
                 Renderer::Unique {
                     field: of,
                     classes: oc,
@@ -1315,18 +1428,25 @@ impl Renderer {
                     other_label: ool,
                     class_strokes: ost,
                     other_strokes: oos,
+                    class_fills: ocf,
+                    other_fills: oof,
                 },
             ) if field == of => {
                 let same_scheme = ramp == or;
                 let n = oc.len();
-                // Strokes are drawn by hand, as labels are: a class keeps them whatever the scheme.
+                // Strokes and fills are drawn by hand, as labels are: a class keeps them whatever
+                // the scheme.
                 other_strokes.clone_from(oos);
+                other_fills.clone_from(oof);
                 for (k, s) in classes.iter_mut() {
                     if let Some(t) = ol.get(k.as_str()) {
                         class_labels.insert(k.clone(), t.clone());
                     }
                     if let Some(st) = ost.get(k.as_str()) {
                         class_strokes.insert(k.clone(), st.clone());
+                    }
+                    if let Some(f) = ocf.get(k.as_str()) {
+                        class_fills.insert(k.clone(), f.clone());
                     }
                     if same_scheme
                         && let Some(j) = oc.iter().position(|(ok, _)| ok == k)
@@ -1341,8 +1461,18 @@ impl Renderer {
                 }
             }
             (
-                Renderer::Graduated { field, breaks, symbols, ramp, min, class_labels, class_strokes, .. },
-                Renderer::Graduated { field: of, breaks: ob, symbols: os, ramp: or, min: om, class_labels: ol, class_strokes: ost, .. },
+                Renderer::Graduated { field, breaks, symbols, ramp, min, class_labels, class_strokes, class_fills, .. },
+                Renderer::Graduated {
+                    field: of,
+                    breaks: ob,
+                    symbols: os,
+                    ramp: or,
+                    min: om,
+                    class_labels: ol,
+                    class_strokes: ost,
+                    class_fills: ocf,
+                    ..
+                },
             ) if field == of => {
                 // A Graduated Colors edit belongs to a range: it stays only while the ranges do.
                 if breaks != ob || min != om {
@@ -1350,6 +1480,7 @@ impl Renderer {
                 }
                 class_labels.clone_from(ol);
                 class_strokes.clone_from(ost);
+                class_fills.clone_from(ocf);
                 if ramp == or && symbols.len() == os.len() {
                     let n = os.len();
                     for (i, (s, o)) in symbols.iter_mut().zip(os).enumerate() {
@@ -1735,6 +1866,97 @@ pub struct LabelClass {
     /// A shape drawn behind the text, as QGIS's label background; none draws the text alone.
     #[serde(default, deserialize_with = "de_background", skip_serializing_if = "Option::is_none")]
     pub background: Option<LabelBackground>,
+    /// Breaks the text into lines wherever this occurs, left out (QGIS's wrap character, a
+    /// character or a few: a space puts each word on a line of its own); none breaks none.
+    #[serde(default, deserialize_with = "de_wrap_char", skip_serializing_if = "Option::is_none")]
+    pub wrap_char: Option<String>,
+    /// Breaks lines longer than this many characters between their words, as QGIS's automatic
+    /// wrap length (at most [`MAX_WRAP_LENGTH`]); 0 breaks none.
+    #[serde(default, deserialize_with = "de_wrap_length", skip_serializing_if = "is_zero_u32")]
+    pub wrap_length: u32,
+    /// How a label's lines line up: left, as labels always have, centred or right.
+    #[serde(default, skip_serializing_if = "is_left")]
+    pub line_align: crate::layout::TextAlign,
+    /// Along a line, a label every this many points (within [`LABEL_REPEAT`]), spaced out from
+    /// the one at its middle, as QGIS's repeat distance; none is the one at its middle.
+    #[serde(default, deserialize_with = "de_repeat", skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<f32>,
+}
+
+/// The longest wrap character kept (characters).
+pub const MAX_WRAP_CHAR: usize = 8;
+/// The longest line length wrapping keeps to (characters).
+pub const MAX_WRAP_LENGTH: u32 = 500;
+/// How far apart repeated labels along a line may be (points): from about a word to a few metres
+/// of paper.
+pub const LABEL_REPEAT: std::ops::RangeInclusive<f64> = 10.0..=10_000.0;
+
+/// A wrap character as a class keeps it: at most [`MAX_WRAP_CHAR`] characters, line breaks left
+/// out, none when empty (a space is one: it is a character to break at).
+pub fn wrap_char(c: &str) -> Option<String> {
+    let c: String = c.chars().filter(|c| *c != '\n' && *c != '\r').take(MAX_WRAP_CHAR).collect();
+    (!c.is_empty()).then_some(c)
+}
+
+fn de_wrap_char<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(lenient::<D, String>(d)?.and_then(|c| wrap_char(&c)))
+}
+
+fn de_wrap_length<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    Ok(lenient::<D, f64>(d)?.filter(|v| v.is_finite() && *v > 0.0).map_or(0, |v| (v.min(f64::from(MAX_WRAP_LENGTH))) as u32))
+}
+
+/// A repeat distance, within [`LABEL_REPEAT`]; one that isn't a positive number is none.
+pub fn label_repeat(v: f64) -> Option<f32> {
+    (v.is_finite() && v > 0.0).then(|| v.clamp(*LABEL_REPEAT.start(), *LABEL_REPEAT.end()) as f32)
+}
+
+fn de_repeat<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(lenient::<D, f64>(d)?.and_then(label_repeat))
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_left(a: &crate::layout::TextAlign) -> bool {
+    *a == crate::layout::TextAlign::Left
+}
+
+/// `text` broken into lines as `wrap_char` and `wrap_length` say: at each wrap character (left
+/// out), then each line longer than `wrap_length` characters between its words (a word longer
+/// than that keeps a line of its own). Lines the text already has stay lines. A line that fits keeps
+/// its spacing; a longer one is rebuilt from its words, so its extra spaces are dropped.
+pub fn wrapped(text: &str, wrap_char: Option<&str>, wrap_length: u32) -> String {
+    let broken = match wrap_char.filter(|c| !c.is_empty()) {
+        Some(c) => text.replace(c, "\n"),
+        None => text.to_string(),
+    };
+    if wrap_length == 0 {
+        return broken;
+    }
+    let most = wrap_length as usize;
+    let mut out: Vec<String> = Vec::new();
+    for line in broken.split('\n') {
+        // A line that fits stays as it is, as QGIS's word wrap keeps it.
+        if line.chars().count() <= most {
+            out.push(line.to_string());
+            continue;
+        }
+        let mut current = String::new();
+        for word in line.split_whitespace() {
+            let (have, add) = (current.chars().count(), word.chars().count());
+            if have > 0 && have + 1 + add > most {
+                out.push(std::mem::take(&mut current));
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        out.push(current);
+    }
+    out.join("\n")
 }
 
 /// How far a label's offset moves it each way (points).
@@ -2060,7 +2282,16 @@ impl LabelClass {
             spacing: 0.0,
             offset: [0.0; 2],
             background: None,
+            wrap_char: None,
+            wrap_length: 0,
+            line_align: crate::layout::TextAlign::Left,
+            repeat: None,
         }
+    }
+
+    /// `text` broken into lines as this class wraps it ([`wrapped`]).
+    pub fn wrap(&self, text: &str) -> String {
+        wrapped(text, self.wrap_char.as_deref(), self.wrap_length)
     }
 
     /// The halo's colour behind text of colour `text`: its own, else one that stands out.
@@ -2086,9 +2317,10 @@ impl LabelClass {
     }
 }
 
-/// A label on the map, as (layer id, row, label class in `Labeling::in_order`): a feature has a
-/// label for each class labelling it (#732).
-pub type LabelKey = (u32, usize, usize);
+/// A label on the map, as (layer id, row, label class in `Labeling::in_order`, repeat): a feature
+/// has a label for each class labelling it (#732), and along a line each repeat is one of its own
+/// (0 for the one at the line's middle, and for every label not repeated).
+pub type LabelKey = (u32, usize, usize, usize);
 
 /// A layer's label classes read against its data, in `Labeling::in_order`: every class whose
 /// clause takes a row labels it.
@@ -2250,6 +2482,58 @@ mod tests {
         assert_eq!(l.default.halo_color_for(Rgba::rgb(0, 0, 0)), Rgba::rgb(255, 238, 0));
         assert_eq!(old.default.halo_color_for(Rgba::rgb(0, 0, 0)), Rgba::new(255, 255, 255, 225));
         assert_eq!(old.default.halo_color_for(Rgba::rgb(255, 255, 255)), Rgba::new(20, 22, 26, 210));
+    }
+
+    /// Wrapping breaks a text at its wrap character and between words past its length; with the
+    /// lines' alignment and a repeat along lines it is kept, a label without them is written as it
+    /// always was, and a crafted value reads as none (or within its range).
+    #[test]
+    fn a_labels_wrapping_and_repeat_are_kept_and_old_labels_save_as_before() {
+        // At each wrap character (left out), then between words past the length.
+        assert_eq!(wrapped("Winterthur Altstadt", Some(" "), 0), "Winterthur\nAltstadt");
+        assert_eq!(wrapped("Zürich/Winterthur", Some("/"), 0), "Zürich\nWinterthur");
+        assert_eq!(wrapped("the quick brown fox jumps", None, 10), "the quick\nbrown fox\njumps");
+        assert_eq!(wrapped("Kantonsspital Winterthur", None, 5), "Kantonsspital\nWinterthur", "a long word keeps its own line");
+        assert_eq!(wrapped("Höhe über Meer", None, 9), "Höhe über\nMeer", "characters, not bytes");
+        assert_eq!(wrapped("a\nb c d", None, 3), "a\nb c\nd", "lines it has stay lines");
+        assert_eq!(wrapped(" Ober  Winterthur", None, 20), " Ober  Winterthur", "a line that fits stays as it is");
+        assert_eq!(wrapped("unchanged text", None, 0), "unchanged text");
+        let base = serde_json::json!({"enabled": true, "field": "name", "size": 9.0, "color": [0, 0, 0, 255], "halo": true, "bold": false});
+        let read = |extra: serde_json::Value| {
+            let mut v = base.clone();
+            if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            serde_json::from_value::<Labeling>(v).unwrap()
+        };
+        let old = read(serde_json::json!({}));
+        let c = &old.default;
+        assert_eq!((c.wrap_char.as_deref(), c.wrap_length, c.line_align, c.repeat), (None, 0, crate::layout::TextAlign::Left, None));
+        let saved = serde_json::to_value(&old).unwrap();
+        for k in ["wrap_char", "wrap_length", "line_align", "repeat"] {
+            assert!(saved.get(k).is_none(), "{k} written for a label without it");
+        }
+        let l = read(serde_json::json!({"wrap_char": " ", "wrap_length": 12, "line_align": "Center", "repeat": 85.0}));
+        let c = &l.default;
+        assert_eq!(
+            (c.wrap_char.as_deref(), c.wrap_length, c.line_align, c.repeat),
+            (Some(" "), 12, crate::layout::TextAlign::Center, Some(85.0))
+        );
+        assert_eq!(serde_json::from_value::<Labeling>(serde_json::to_value(&l).unwrap()).unwrap(), l);
+        assert_eq!(c.wrap("Ober Winterthur"), "Ober\nWinterthur");
+        // Crafted: none, or within range.
+        let junk = read(serde_json::json!({"wrap_char": 7, "wrap_length": "long", "repeat": "often"}));
+        let c = &junk.default;
+        assert_eq!((c.wrap_char.as_deref(), c.wrap_length, c.repeat, c.field.as_str()), (None, 0, None, "name"));
+        let far = read(serde_json::json!({"wrap_char": "\n\n".to_string() + &"x".repeat(50), "wrap_length": 1e30, "repeat": 1e30}));
+        let c = &far.default;
+        assert_eq!(
+            (c.wrap_char.as_ref().map(|w| w.chars().count()), c.wrap_length, c.repeat),
+            (Some(MAX_WRAP_CHAR), MAX_WRAP_LENGTH, Some(10_000.0))
+        );
+        assert_eq!((label_repeat(0.5), label_repeat(-1.0), label_repeat(f64::NAN)), (Some(10.0), None, None));
+        assert_eq!(wrap_char(""), None);
+        assert_eq!(wrap_char("\n"), None, "a line break isn't a character to break at");
     }
 
     /// An offset and a background are kept; a label without them is written as it always was; a
@@ -2449,6 +2733,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         let labels = |rows: &[bool]| r.legend_for(&d, rows).into_iter().map(|e| e.label).collect::<Vec<_>>();
         assert_eq!(labels(&[]), ["a", "b", "<all other values>"]);
@@ -2468,6 +2754,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         let shown = twice.legend_for(&d, &[]);
         assert_eq!(shown.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(), ["a", "b", "<all other values>"]);
@@ -2482,6 +2770,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         assert_eq!(gone.legend_for(&d, &[]).len(), 1);
         // The fallback row is marked as such, whatever a class is called.
@@ -2494,6 +2784,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         let mut d2 = d.clone();
         d2.push(None, vec![Value::Text(OTHER_VALUES.into())]);
@@ -2525,6 +2817,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         let labels = |r: &Renderer, rows: &[bool]| r.legend_for(&d, rows).into_iter().map(|e| e.label).collect::<Vec<_>>();
         assert_eq!(labels(&r, &[]), ["a"], "z falls in the invisible fallback");
@@ -2541,6 +2835,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         assert_eq!(labels(&r2, &[]), ["a", OTHER_VALUES]);
         // A line's fill draws nothing: a fallback with only a fill is invisible on lines.
@@ -2557,6 +2853,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         assert!(r3.legend_for(&lines, &[]).is_empty());
         assert_eq!(labels(&r3, &[]), ["a", OTHER_VALUES], "a polygon fill still shows");
@@ -2585,6 +2883,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         };
         let legend = renderer.legend();
         assert_eq!(
@@ -2821,6 +3121,8 @@ mod tests {
             other_label: None,
             class_strokes: Default::default(),
             other_strokes: Vec::new(),
+            class_fills: Default::default(),
+            other_fills: Vec::new(),
         }
     }
 
@@ -2835,6 +3137,7 @@ mod tests {
             classes: breaks.len(),
             class_labels: Default::default(),
             class_strokes: Default::default(),
+            class_fills: Default::default(),
         }
     }
 

@@ -27,6 +27,7 @@ pub mod layout;
 pub mod navigate;
 pub mod nldi;
 pub mod notebook;
+pub mod pg;
 pub mod plugins;
 pub mod portals;
 pub mod presentation;
@@ -98,6 +99,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(history::commands());
     v.extend(share::commands());
     v.extend(sql::commands());
+    v.extend(pg::commands());
     v.extend(plugins::commands());
     v.extend(sharing::commands());
     v.extend(stac::commands());

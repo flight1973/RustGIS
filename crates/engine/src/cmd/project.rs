@@ -313,7 +313,8 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
             "id": g.id, "name": g.name, "visible": g.visible, "transparency": g.transparency,
             "minScale": g.min_scale, "maxScale": g.max_scale, "layers": g.children,
         })).collect::<Vec<_>>(),
-        // Web tile layers (XYZ, WMS, vector tiles, styles, archives) draw under the layers above.
+        // Web tile layers (XYZ, WMS, vector tiles, styles, archives), each drawn over the map layer
+        // its `over` names, or under them all.
         // Their addresses lose keys and tokens: the AI Assistant sends this to its provider.
         "tileLayers": super::tiles::list(s, true),
         "tables": s.project.tables.iter().filter(|t| named(&t.name)).map(|t| {

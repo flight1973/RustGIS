@@ -132,12 +132,22 @@ pub fn commands() -> Vec<C> {
         C::new("labels.placement", "Label Placement", "Labeling › Label Placement", |s, p| {
             let pos = match ps(p, "position") {
                 Some(code) => Some(LabelPlacement::from_code(code).ok_or_else(|| format!("unknown placement '{code}'"))?),
-                None if p.get("offset").is_some() => None,
-                None => return Err("position is required (or an offset)".into()),
+                None if p.get("offset").is_some() || p.get("repeat").is_some() => None,
+                None => return Err("position is required (or an offset or a repeat)".into()),
             };
             let offset = match p.get("offset") {
                 None => None,
                 Some(o) => Some(label_offset(o).ok_or("offset must be [right, down] in points")?),
+            };
+            // Along a line, a label every so many points (null or 0: the one at its middle).
+            let repeat = match p.get("repeat") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(v) => match number(v) {
+                    Some(0.0) => Some(None),
+                    Some(r) if r > 0.0 => Some(rustgis_map::symbology::label_repeat(r)),
+                    _ => return Err("repeat must be a number of points, or 0 or null for none".into()),
+                },
             };
             with_class(s, p, |c| {
                 if let Some(pos) = pos {
@@ -146,11 +156,14 @@ pub fn commands() -> Vec<C> {
                 if let Some(o) = offset {
                     c.offset = o;
                 }
+                if let Some(r) = repeat {
+                    c.repeat = r;
+                }
             })
         })
         .when(need_feature_layer)
         .params(
-            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved)}"#,
+            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset or repeat), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only)}"#,
         ),
         // Label classes: each labels every feature its clause takes, as in ArcGIS Pro; the classes
         // listed first, Default last, are placed first (`Labeling`, #732).

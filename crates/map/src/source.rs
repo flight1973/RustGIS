@@ -126,6 +126,165 @@ pub struct PostgisOrigin {
     pub crs: Option<String>,
 }
 
+/// A PostGIS table a layer was loaded from whole to be edited: what saving its edits writes to
+/// (desktop only). The layer's feature ids are the table's key.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PostgisEdit {
+    /// The connection (never with its password), the table and the family loaded.
+    pub origin: PostgisOrigin,
+    /// The table's integer primary key column.
+    pub key: String,
+    /// The SRID of the table's geometry.
+    pub srid: i32,
+    /// Whether the user it was loaded as may insert, update and delete rows.
+    pub writable: bool,
+    /// The SQL condition the rows were loaded with, if any (loaded again with it when edits
+    /// are discarded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    /// The most rows loaded.
+    #[serde(default)]
+    pub limit: usize,
+    /// Each loaded row's version and what it held, by its key, as read: saving checks the
+    /// database against them, so a row changed or deleted by someone else since is a conflict,
+    /// not overwritten.
+    #[serde(default)]
+    pub versions: Versions,
+}
+
+/// How a loaded row is told apart from the same row edited: a hash of its geometry and
+/// attributes (FNV-1a over their JSON, the same in every build).
+pub fn row_hash(f: &rustgis_data::Feature) -> u64 {
+    /// FNV-1a over the bytes written to it, kept as they come (no buffer per row).
+    struct Fnv(u64);
+    impl std::io::Write for Fnv {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = buf.iter().fold(self.0, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+    // As before, a row that can't be written hashes as no bytes.
+    if serde_json::to_writer(&mut h, &(&f.geometry, &f.attrs)).is_err() {
+        return 0xcbf2_9ce4_8422_2325;
+    }
+    h.0
+}
+
+/// A loaded row: its version (PostgreSQL's `xmin`) and [`row_hash`] as read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowVersion {
+    pub version: i64,
+    pub hash: u64,
+}
+
+/// Loaded rows by key, shared until changed like a dataset's features: an undo snapshot copies
+/// a pointer, not the map.
+#[derive(Clone, Default, PartialEq)]
+pub struct Versions(Arc<std::collections::BTreeMap<u64, RowVersion>>);
+
+impl Versions {
+    /// The row with key `id`, if it was loaded.
+    pub fn get(&self, id: u64) -> Option<RowVersion> {
+        self.0.get(&id).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether two are the same rows in memory (one cloned from the other).
+    pub fn shares(&self, other: &Versions) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Whether anything but this holds the same rows (a layer, an undo step).
+    pub fn held_elsewhere(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
+    }
+
+    /// The keys and rows, in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, RowVersion)> + '_ {
+        self.0.iter().map(|(k, v)| (*k, *v))
+    }
+}
+
+impl FromIterator<(u64, RowVersion)> for Versions {
+    fn from_iter<I: IntoIterator<Item = (u64, RowVersion)>>(it: I) -> Versions {
+        Versions(Arc::new(it.into_iter().collect()))
+    }
+}
+
+impl std::fmt::Debug for Versions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Versions({} rows)", self.0.len())
+    }
+}
+
+/// Saved as `[[key, version, hash], …]` (JSON object keys would be text).
+impl Serialize for Versions {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.0.iter().map(|(k, r)| (k, r.version, r.hash)))
+    }
+}
+
+impl<'de> Deserialize<'de> for Versions {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Versions, D::Error> {
+        Vec::<(u64, i64, u64)>::deserialize(d).map(|v| v.into_iter().map(|(k, version, hash)| (k, RowVersion { version, hash })).collect())
+    }
+}
+
+/// What changed in a layer loaded from PostGIS since it was loaded (or last saved), by
+/// comparing its features with the rows as read.
+#[derive(Debug, Default)]
+pub struct PostgisChanges {
+    /// Features of loaded rows that differ from them, with the rows' versions.
+    pub updates: Vec<(rustgis_data::Feature, i64)>,
+    /// Loaded rows no feature holds any more: their keys and versions.
+    pub deletes: Vec<(u64, i64)>,
+    /// Features of no loaded row.
+    pub inserts: Vec<rustgis_data::Feature>,
+    /// Where each of `inserts` is among the features.
+    pub insert_rows: Vec<usize>,
+}
+
+impl PostgisChanges {
+    pub fn is_empty(&self) -> bool {
+        self.updates.is_empty() && self.deletes.is_empty() && self.inserts.is_empty()
+    }
+}
+
+impl PostgisEdit {
+    /// What changed in `features` since the rows were read. A feature whose id is a loaded row's
+    /// is that row (once: a copy with the same id is new).
+    pub fn changes(&self, features: &[rustgis_data::Feature]) -> PostgisChanges {
+        let mut out = PostgisChanges::default();
+        let mut seen = std::collections::HashSet::new();
+        for (i, f) in features.iter().enumerate() {
+            match self.versions.get(f.id) {
+                Some(row) if seen.insert(f.id) => {
+                    if row_hash(f) != row.hash {
+                        out.updates.push((f.clone(), row.version));
+                    }
+                }
+                _ => {
+                    out.inserts.push(f.clone());
+                    out.insert_rows.push(i);
+                }
+            }
+        }
+        out.deletes = self.versions.iter().filter(|(k, _)| !seen.contains(k)).map(|(k, r)| (k, r.version)).collect();
+        out
+    }
+}
+
 /// A MySQL or MariaDB table a layer reads live.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MysqlOrigin {
@@ -884,4 +1043,77 @@ pub fn set_waker(f: impl Fn() + Send + Sync + 'static) {
 /// Bumped whenever a background read finishes, so a cached map image knows to redraw.
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn postgis_edits_keep_their_row_versions() {
+        let edit = super::PostgisEdit {
+            origin: super::PostgisOrigin { database: "postgres:host=h dbname=g".into(), table: "roads".into(), family: None, crs: None },
+            key: "gid".into(),
+            srid: 3857,
+            writable: true,
+            condition: Some("lanes > 2".into()),
+            limit: 100,
+            versions: [(1, 700), (2, 701), (u64::MAX, 9)]
+                .into_iter()
+                .map(|(k, version)| (k, super::RowVersion { version, hash: k ^ 5 }))
+                .collect(),
+        };
+        let text = serde_json::to_string(&edit).unwrap_or_default();
+        assert!(text.contains("\"versions\":[[1,700,4],[2,701,7],"), "{text}");
+        let back: super::PostgisEdit = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(back, edit);
+        assert_eq!((back.versions.get(2).map(|r| r.version), back.versions.get(3), back.versions.len()), (Some(701), None, 3));
+        // A copy (an undo snapshot) shares the versions.
+        let copy = edit.clone();
+        assert!(std::sync::Arc::ptr_eq(&copy.versions.0, &edit.versions.0));
+    }
+
+    /// The hash is FNV-1a over the row's JSON, the same as the projects saved with it hold.
+    #[test]
+    fn row_hashes_are_fnv_over_the_rows_json() {
+        use rustgis_data::{Coord, Feature, Geometry, Value};
+        let f = Feature {
+            id: 3,
+            geometry: Some(Geometry::Point(Coord { x: 1.5, y: -2.0 })),
+            attrs: vec![Value::Text("Main St".into()), Value::Int(4), Value::Null],
+        };
+        let bytes = serde_json::to_vec(&(&f.geometry, &f.attrs)).unwrap();
+        let fnv = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
+        assert_eq!(super::row_hash(&f), fnv);
+        // And the value itself: a change in how rows are written would show every saved row edited.
+        assert_eq!(super::row_hash(&f), 8_547_063_913_914_077_080);
+    }
+
+    #[test]
+    fn changes_are_what_differs_from_the_rows_as_read() {
+        use rustgis_data::{Coord, Feature, Geometry, Value};
+        let row = |id: u64, name: &str| Feature {
+            id,
+            geometry: Some(Geometry::Point(Coord { x: id as f64, y: 1.0 })),
+            attrs: vec![Value::Text(name.into())],
+        };
+        let loaded = [row(1, "a"), row(2, "b"), row(3, "c")];
+        let edit = super::PostgisEdit {
+            origin: super::PostgisOrigin { database: "postgres:dbname=g".into(), table: "t".into(), family: None, crs: None },
+            key: "id".into(),
+            srid: 4326,
+            writable: true,
+            condition: None,
+            limit: 0,
+            versions: loaded.iter().map(|f| (f.id, super::RowVersion { version: f.id as i64 * 10, hash: super::row_hash(f) })).collect(),
+        };
+        assert!(edit.changes(&loaded).is_empty());
+        // Row 1 as it was, row 2 renamed, row 3 deleted, a new feature and a copy of row 1.
+        let now = [row(1, "a"), row(2, "bee"), row(9, "new"), row(1, "copy")];
+        let c = edit.changes(&now);
+        assert_eq!(c.updates.iter().map(|(f, v)| (f.id, *v)).collect::<Vec<_>>(), vec![(2, 20)]);
+        assert_eq!(c.deletes, vec![(3, 30)]);
+        assert_eq!(c.inserts.iter().map(|f| f.id).collect::<Vec<_>>(), vec![9, 1]);
+        assert_eq!(c.insert_rows, vec![2, 3]);
+        // The hash is the same however often it is taken.
+        assert_eq!(super::row_hash(&now[1]), super::row_hash(&row(2, "bee")));
+    }
 }

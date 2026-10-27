@@ -560,6 +560,7 @@ fn text_symbol(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
         ui.end_row();
         letter_spacing(app, ui, l, c);
         ui.end_row();
+        wrapping(app, ui, l, c);
         if c.it.halo {
             halo_style(app, ui, l, c);
         }
@@ -644,6 +645,64 @@ fn background(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
     number(app, ui, "Padding across", b.padding[0], BACKGROUND_PADDING, "across");
     number(app, ui, "Padding up and down", b.padding[1], BACKGROUND_PADDING, "upDown");
     number(app, ui, "Corner radius", b.radius, BACKGROUND_PADDING, "radius");
+}
+
+/// Wrapping: a character the text breaks at (typed, set once the field is left), a longest line
+/// in characters (0: none), and how the lines line up.
+fn wrapping(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
+    use rustgis_engine::map::layout::TextAlign;
+    use rustgis_engine::map::symbology::MAX_WRAP_LENGTH;
+    let input_label = ui.label(tl!("Wrap at"));
+    let key = layer_key(app, l).with(("label_pane_wrap_char", c.name));
+    let current = c.it.wrap_char.clone().unwrap_or_default();
+    let mut buf = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| current.clone());
+    let r = ui
+        .add(egui::TextEdit::singleline(&mut buf).char_limit(rustgis_engine::map::symbology::MAX_WRAP_CHAR).desired_width(60.0))
+        .labelled_by(input_label.id)
+        .on_hover_text(tl!("A line break wherever this occurs, left out (a space puts each word on its own line)."));
+    if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(key, buf));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(key));
+        if r.lost_focus() && buf != current {
+            run(app, "labels.style", c.params(json!({"wrapChar": buf})));
+        }
+    }
+    ui.end_row();
+    let input_label = ui.label(tl!("Wrap length"));
+    let mut n = f64::from(c.it.wrap_length);
+    let r = ui
+        .add(egui::DragValue::new(&mut n).range(0..=MAX_WRAP_LENGTH).speed(0.2).max_decimals(0).custom_formatter(|v, _| {
+            if v <= 0.0 { tl!("Off").to_string() } else { crate::i18n::fmt("{n} characters", &[("n", &v.to_string())]) }
+        }))
+        .labelled_by(input_label.id)
+        .on_hover_text(tl!("Lines longer than this are broken between their words."));
+    let id = l.id;
+    crate::ribbon::live_drag(
+        app,
+        ui,
+        &r,
+        f64::from(c.it.wrap_length),
+        n,
+        |app, x| {
+            if let Some(k) = app.session.map_mut().layer_mut(id).and_then(|l| class_mut(&mut l.labels, c.name)) {
+                k.wrap_length = x.clamp(0.0, f64::from(MAX_WRAP_LENGTH)) as u32;
+            }
+        },
+        |app, x| {
+            run(app, "labels.style", c.params(json!({"wrapLength": x.round()})));
+        },
+    );
+    ui.end_row();
+    ui.label(tl!("Line alignment"));
+    ui.horizontal(|ui| {
+        for a in TextAlign::ALL {
+            if ui.selectable_label(c.it.line_align == a, tl!(a.label())).clicked() && c.it.line_align != a {
+                run(app, "labels.style", c.params(json!({"lineAlign": a.code()})));
+            }
+        }
+    });
+    ui.end_row();
 }
 
 /// The space between the letters, in points (negative: tighter).
@@ -815,9 +874,51 @@ fn position(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
             pick(app, ui, LabelPlacement::Parallel);
             pick(app, ui, LabelPlacement::Curved);
         });
+        if cur.along_line() {
+            repeat(app, ui, l, c);
+        }
     }
     ui.add_space(6.0);
     offset(app, ui, l, c);
+}
+
+/// Along a line, a label every so many points, spaced out from the one at its middle; off, the one
+/// at its middle.
+fn repeat(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
+    use rustgis_engine::map::symbology::LABEL_REPEAT;
+    let id = l.id;
+    grid(ui, "repeat", |ui| {
+        let input_label = ui.label(tl!("Repeat"));
+        ui.horizontal(|ui| {
+            let mut on = c.it.repeat.is_some();
+            if ui.checkbox(&mut on, "").labelled_by(input_label.id).on_hover_text(tl!("A label every so far along the line.")).changed() {
+                // On, every 2 inches of paper (144 points) to start with.
+                let v = if on { json!(144.0) } else { json!(null) };
+                run(app, "labels.placement", c.params(json!({"repeat": v})));
+            }
+            let Some(every) = c.it.repeat else { return };
+            let mut v = f64::from(every);
+            let r = ui
+                .add(egui::DragValue::new(&mut v).range(LABEL_REPEAT).speed(1.0).max_decimals(1).prefix(tl!("every ")).suffix(" pt"))
+                .labelled_by(input_label.id);
+            crate::ribbon::live_drag(
+                app,
+                ui,
+                &r,
+                f64::from(every),
+                v,
+                |app, x| {
+                    if let Some(k) = app.session.map_mut().layer_mut(id).and_then(|l| class_mut(&mut l.labels, c.name)) {
+                        k.repeat = rustgis_engine::map::symbology::label_repeat(x);
+                    }
+                },
+                |app, x| {
+                    run(app, "labels.placement", c.params(json!({"repeat": x})));
+                },
+            );
+        });
+        ui.end_row();
+    });
 }
 
 /// How far the label moves from where its placement puts it, right and down, in points.
@@ -1136,6 +1237,49 @@ mod tests {
         h.get_by_label("Halo").click();
         h.run();
         assert!(h.query_by_label("Automatic").is_none() && h.query_by_label("Thin").is_none());
+    }
+
+    /// Wrapping in the Symbol tab (the character typed and set once the field is left, a length,
+    /// the lines' alignment), and in the Position tab a line's repeat, shown for a placement along
+    /// lines only.
+    #[test]
+    fn wrapping_and_the_repeat_along_lines_are_set_in_the_pane() {
+        use egui::accesskit::Role;
+        use rustgis_engine::map::layout::TextAlign;
+        super::families::installed();
+        let mut app = RustGisApp::with_sample();
+        let id = layer_id(&app, "Rivers");
+        app.session.run("layer.select", &json!({"layer": id})).unwrap();
+        let mut h = harness(app);
+        h.run();
+        let class = |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.map().layer(id).unwrap().labels.default.clone();
+        open_tab(&mut h, "Symbol");
+        assert!(h.query_by_role_and_label(Role::SpinButton, "Wrap length").is_some());
+        h.get_by_role_and_label(Role::TextInput, "Wrap at").focus();
+        h.run();
+        h.get_by_role_and_label(Role::TextInput, "Wrap at").type_text("/");
+        h.run();
+        assert_eq!(class(&h).wrap_char, None, "not while typing");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(class(&h).wrap_char.as_deref(), Some("/"));
+        h.get_by_label("Center").click();
+        h.run();
+        assert_eq!(class(&h).line_align, TextAlign::Center);
+        // Repeat: only for a placement along lines.
+        open_tab(&mut h, "Position");
+        h.state_mut().session.run("labels.placement", &json!({"layer": id, "position": "above"})).unwrap();
+        h.run();
+        assert!(h.query_by_label("Repeat").is_none(), "not off the line");
+        h.state_mut().session.run("labels.placement", &json!({"layer": id, "position": "parallel"})).unwrap();
+        h.run();
+        h.get_by_role_and_label(Role::CheckBox, "Repeat").click();
+        h.run();
+        assert_eq!(class(&h).repeat, Some(144.0));
+        assert!(h.query_by_role_and_label(Role::SpinButton, "Repeat").is_some(), "its distance to set");
+        h.get_by_role_and_label(Role::CheckBox, "Repeat").click();
+        h.run();
+        assert_eq!(class(&h).repeat, None);
     }
 
     #[test]

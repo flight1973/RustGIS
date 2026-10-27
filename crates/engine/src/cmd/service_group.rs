@@ -295,7 +295,7 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
             child.layer = layer.id;
             // Locked labels name rows of the old features.
             if let Some(lock) = &mut s.map_mut().label_lock {
-                lock.retain(|(id, _, _)| *id != child.layer);
+                lock.retain(|(id, _, _, _)| *id != child.layer);
             }
         } else {
             child.layer = crate::cmd::layer::add_dataset(s, dataset);
@@ -310,7 +310,7 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
         let gone: Vec<u32> = old.children.iter().map(|c| c.layer).filter(|id| !ids.contains(id)).collect();
         crate::cmd::layer::drop_layers(s, &gone);
         if let Some(lock) = &mut s.map_mut().label_lock {
-            lock.retain(|(id, _, _)| !gone.contains(id));
+            lock.retain(|(id, _, _, _)| !gone.contains(id));
         }
     }
     let map = s.map_mut();

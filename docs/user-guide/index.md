@@ -27,7 +27,8 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
   (Start, New, Open, Save, Save As and About).
 - **Quick Access Toolbar** (top left): New, Open, Save, Undo and Redo, plus any commands you add
   under **Settings › Customize › Quick Access**.
-- **Layers pane** (left): the map's layers in drawing order, with their legends. Tick a layer to
+- **Layers pane** (left): the map's layers in drawing order, with their legends. A new layer goes
+  on top, whatever its kind (a feature, raster or web layer, an analysis result). Tick a layer to
   show or hide it; drag it up or down to change the drawing order; right-click it to zoom to it,
   rename or remove it and more. The entire layer block, including its expanded legend and
   classes, is split 50/50: drop in its upper half to insert above, or its lower half to insert
@@ -112,7 +113,7 @@ ribbon, arrows at its ends scroll it.
 | **Data** | Layer Templates, Data Source (Repair Source); for a feature layer: Definition Query, Table, Selection, Data Design, Archiving, Relationship and Export; for a raster layer: Information and Export; then Offline and Feature Cache |
 | **Style** | For the layer selected in Layers. A feature layer: Visibility Range, Effects, Drawing, Drawing Effects, Extrusion for polygons (with Faces and Light and Shadow once on) and Layer. A raster layer: Visibility Range, Effects, Compare, Raster Effects, Rendering, Enhancement and Layer. Both: Styles |
 | **Labeling** | For the feature layer selected in Layers: Labels (Label, Properties), Label Class (Class, Field), Text Symbol (Size, Color, Bold, Halo), Label Placement and Label Range. Whatever is selected: Map Labeling (Lock, Pause, View Unplaced, Convert) |
-| **Edit** | Manage Edits (Edit, Save, Undo, Redo, Status, Settings, Templates, Topology), Snapping, Features (Create, Delete, Edit Vertices, Modify), Tools, Elevation, Corrections, Graphics, Graphics and Text, Clipboard |
+| **Edit** | Manage Edits (Edit, Save, Undo, Redo, Status, Save to PostGIS and Discard PostGIS Edits on the desktop while a [PostGIS layer is loaded for editing](data.md#editing-postgis-tables), Settings, Templates, Topology), Snapping, Features (Create, Delete, Edit Vertices, Modify), Tools, Elevation, Corrections, Graphics, Graphics and Text, Clipboard |
 | **Analyze** | Geoprocessing (History, Tools, Model Builder, Script, SQL, Environments), Tasks (the Tasks pane; Task: Record Task, New Task From History, Import Task, run a task), AI (AI Assistant), Portal (Feature Analysis, Raster Analysis), Workflows, Raster (Raster Functions, Function Editor), Tools (the tool gallery), Selection, Notebook, the imagery groups (Ortho Mapping, Reality Mapping, Alignment, Image Analysis, Image Classification, Imagery Sharing, Mensuration, Imagery Tools) |
 | **View** | Display (Graticule, Dark Mode, GPU Rendering), View (Globe, Projection, Global; Local on the desktop), Effects, Scene, Windows, Navigation, Link, Workspace, Animation, Time (Time Slider), Profile (Profile; Time Series on the desktop) |
 | **Publish** | While a layout is open, its groups first (Page, Map Frames, Map Surrounds, Shapes, Text, Export); then Report, Presentation, Output (Export Map, Export Features, Print Map, Capture To Clipboard, Report, Presentation, Export To 3D), Package, Share As, Layout, Save As, Thumbnail |

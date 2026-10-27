@@ -92,6 +92,12 @@ pub(super) fn requests(s: &Session, lon: f64, lat: f64, first_layer: bool) -> Ve
     s.map().tiles.iter().filter(|t| askable(t)).filter_map(|t| next_fetch(t, lon, lat, at, m_per_px)).take(wanted).collect()
 }
 
+/// The index of the topmost WMS tile layer that can be asked what is at a point (it covers it).
+pub(super) fn topmost(s: &Session, lon: f64, lat: f64) -> Option<usize> {
+    let (at, m_per_px) = merc_at(s, lon, lat)?;
+    s.map().tiles.iter().position(|t| askable(t) && next_fetch(t, lon, lat, at, m_per_px).is_some())
+}
+
 /// The answer's features as identify's results.
 fn results(layer: &str, features: Vec<InfoFeature>) -> Value {
     let list: Vec<Value> = features

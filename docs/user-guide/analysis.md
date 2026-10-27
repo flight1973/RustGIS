@@ -84,6 +84,7 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Tool | Id | Toolbox |
 | --- | --- | --- |
 | Buffer | `buffer` | Analysis › Proximity |
+| Near | `near` | Analysis › Proximity |
 | Clip | `clip` | Analysis › Extract |
 | Erase | `erase` | Analysis › Overlay |
 | Intersect | `intersect` | Analysis › Overlay |
@@ -192,14 +193,30 @@ gp.run={"tool":"intersect","params":{"input":"parcels","overlay":"floodplain","o
 
 **Identity** (`identity`) takes the same parameters. Each input feature gives its Intersect
 features, then its part outside every overlay polygon, with empty overlay attributes. Every parcel
-is then in the result, in or out of the floodplain; one without geometry is kept as it is (Intersect
-leaves it out). **Union** (`union`) takes two polygon
+is then in the result, in or out of the floodplain: one no overlay polygon meets, or without
+geometry, as it is (Intersect leaves those out). **Union** (`union`) takes two polygon
 layers and adds, after Identity's features, each overlay polygon's part outside every input polygon,
 with empty input attributes: together the features cover everything either layer covers. Both
 follow Intersect's rules for field names, touching parts and selections. Where overlay polygons
 overlap each other, an input feature's part in both comes out once for each, and Union adds each
 overlay polygon's own remainder, so the overlay's overlap outside the input comes out once for each
 too.
+
+**Near** (`near`) copies `input` and adds, for each feature, the nearest feature of `near`: its OID
+as the attribute table shows it (`near_fid`), the distance to it (`near_dist`, in `units`,
+Kilometers by default) and the point on it nearest the input feature (`near_x` and `near_y`, in
+longitude from −180° up to 180° and latitude). Distances are measured as Spatial Join's **Closest**
+measures them: on the ground, between the features' nearest points, and zero for features that
+intersect, whose point is one they share. The point is found as the distance is, in a plane centred
+between the features, so on a long edge it can sit off the geodesic by up to about 0.01 % of the
+distance (5 m at 50 km). A `distance` limits how far it looks; features with nothing that near, or
+without geometry, get empty values. Of equally near features, the first in the near layer wins.
+With the same layer as both, each feature's nearest is another feature, not itself. A field name
+the input already has gets a suffix (`near_dist_2`). Selections in both layers are honoured:
+
+```text
+gp.run={"tool":"near","params":{"input":"addresses","near":"hydrants","units":"Feet"}}
+```
 
 **Spatial Join** (`spatialJoin`, also `gp.spatialJoin`) copies attributes from `join` features
 to `target` features. Layers may have different source coordinate systems: their geometry is

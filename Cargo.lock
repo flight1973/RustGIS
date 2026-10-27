@@ -4737,6 +4737,7 @@ dependencies = [
  "iana-time-zone",
  "image",
  "log",
+ "postgres",
  "rusqlite",
  "rustgis-analysis",
  "rustgis-data",

@@ -4062,12 +4062,14 @@ fn list_layers_includes_web_tile_layers() {
     assert!(radar.is_some_and(|t| t["url"].as_str().is_some_and(|u| u.contains("LAYERS=a") && !u.contains("s3cret"))), "{out}");
     assert!(s.run("map.tiles", &Value::Null).unwrap().to_string().contains("apikey=s3cret"));
     let ctx = tools::context(&s);
-    assert!(ctx.contains("\"Rain radar\" (index ") && ctx.contains("raster, overlay, hidden)"), "{ctx}");
+    // On top of the map's layers, as a new layer goes (#808): over Cities.
+    assert!(ctx.contains("\"Rain radar\" (index ") && ctx.contains("raster, overlay, over \"Cities\", hidden)"), "{ctx}");
+    assert_eq!(radar.map(|t| t["over"].clone()), Some(json!("Cities")), "{out}");
     // A long name (commands and project files cap them, but not everything that builds a map) is
     // cut, not the index and flags after it.
     if let Some(t) = s.map_mut().tiles.iter_mut().find(|t| t.name == "Rain radar") {
         t.name = "r".repeat(5000);
     }
     let ctx = tools::context(&s);
-    assert!(ctx.contains("characters in all)\" (index ") && ctx.contains("raster, overlay, hidden)"), "{ctx}");
+    assert!(ctx.contains("characters in all)\" (index ") && ctx.contains("raster, overlay, over \"Cities\", hidden)"), "{ctx}");
 }

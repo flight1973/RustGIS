@@ -7,6 +7,7 @@ use roxmltree::Node;
 
 use super::{Report, color, data_defined_on, has_effect, points, prop, props, signed_points};
 use crate::Rgba;
+use crate::fills::{FillLayer, FillPattern};
 use crate::symbology::{
     Dash, Glyph, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_DASH_STEPS, MAX_STROKES, Marker, MarkerRotation, Placements,
     Symbol,
@@ -27,6 +28,9 @@ pub(super) struct Converted {
     pub strokes: Vec<LineStroke>,
     /// A marker symbol turned by a field (its data-defined angle).
     pub rotation: Option<MarkerRotation>,
+    /// A fill symbol's stacked fills, bottom first: empty when its one fill is a colour (the
+    /// symbol's own), as before patterns were read.
+    pub fills: Vec<FillLayer>,
 }
 
 impl Converted {
@@ -99,6 +103,12 @@ pub(super) fn read(sym: Node, reference: Option<f64>, turned: bool, layer: &str,
         s.color = s.color.map(fade);
         if let Some(m) = &mut s.markers {
             m.outline = m.outline.map(fade);
+        }
+    }
+    for f in &mut out.fills {
+        f.color = f.color.map(fade);
+        if let FillPattern::Dots { outline, .. } = &mut f.pattern {
+            *outline = outline.map(fade);
         }
     }
     out
@@ -195,18 +205,53 @@ fn dash(p: &[(String, String)], width: f32, reference: Option<f64>, layer: &str,
     d
 }
 
+/// A Qt brush's hatch lines (QGIS's simple fill styles), as (angle anticlockwise from east, points
+/// across between lines): 1 px lines 8 px apart, the diagonals 8 px apart along a row (measured on
+/// QGIS 4.2.3 at 96 dpi: `b_diagonal` rises to the right, `f_diagonal` falls).
+fn brush_hatches(style: &str) -> Option<&'static [(f32, f32)]> {
+    const DIAG: f32 = 8.0 * std::f32::consts::FRAC_1_SQRT_2;
+    Some(match style {
+        "horizontal" => &[(0.0, 8.0)],
+        "vertical" => &[(90.0, 8.0)],
+        "b_diagonal" => &[(45.0, DIAG)],
+        "f_diagonal" => &[(135.0, DIAG)],
+        "cross" => &[(0.0, 8.0), (90.0, 8.0)],
+        "diagonal_x" => &[(45.0, DIAG), (135.0, DIAG)],
+        _ => return None,
+    })
+}
+
 fn fill(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &mut Report) -> Converted {
     let none = Rgba::new(0, 0, 0, 0);
     let (mut fill, mut stroke, mut width) = (None::<Rgba>, None::<Rgba>, 0.0f32);
+    // Its fills, bottom first, as QGIS lists its layers; the symbol's fill stays the colour a
+    // legend shows (a pattern's as a tint of it).
+    let mut stack: Vec<FillLayer> = Vec::new();
+    let num = |p: &Props, k: &str| prop(p, k).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite());
     for (l, p) in layers {
         match l.attribute("class").unwrap_or_default() {
             "SimpleFill" => {
                 let c = prop(p, "color").and_then(color).unwrap_or(none);
-                fill = Some(match prop(p, "style").unwrap_or("solid") {
-                    "solid" => c,
+                let style = prop(p, "style").unwrap_or("solid");
+                fill = Some(match style {
+                    "solid" => {
+                        stack.push(FillLayer { color: Some(c), pattern: FillPattern::Solid });
+                        c
+                    }
                     "no" => fill.unwrap_or(none),
-                    _ => {
-                        report.approximated(layer, "hatched fills, drawn as a light tint of their colour");
+                    hatched => {
+                        match brush_hatches(hatched) {
+                            Some(lines) => {
+                                for &(angle, spacing) in lines {
+                                    stack.push(FillLayer { color: Some(c), ..FillLayer::hatch(angle, spacing, 1.0) });
+                                }
+                            }
+                            // Qt's dense dot brushes.
+                            None => {
+                                report.approximated(layer, "fills of dense dots, drawn as a light tint of their colour");
+                                stack.push(FillLayer { color: Some(tint(c)), pattern: FillPattern::Solid });
+                            }
+                        }
                         tint(c)
                     }
                 });
@@ -229,14 +274,83 @@ fn fill(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &
             }
             "GradientFill" | "ShapeburstFill" => {
                 report.approximated(layer, "gradient fills, drawn in their first colour");
-                fill = prop(p, "color").or(prop(p, "color1")).and_then(color).or(fill);
+                let c = prop(p, "color").or(prop(p, "color1")).and_then(color);
+                if let Some(c) = c {
+                    stack.push(FillLayer { color: Some(c), pattern: FillPattern::Solid });
+                }
+                fill = c.or(fill);
             }
-            class @ ("LinePatternFill" | "PointPatternFill" | "SVGFill" | "RasterFill" | "RandomMarkerFill") => {
+            // Hatch lines: its line's colour and width, its angle and spacing.
+            "LinePatternFill" => {
+                let sub = l.children().find(|c| c.has_tag_name("symbol")).map(|s| read(s, reference, false, layer, report));
+                let angle = num(p, "lineangle").unwrap_or(45.0);
+                // QGIS's default: 5 mm apart.
+                let spacing = size(p, "distance", reference, layer, report).unwrap_or(5.0 * 96.0 / 25.4);
+                let shift = offset(p, "offset", reference, layer, report).unwrap_or(0.0);
+                // A hatch for each of the line's strokes, bottom first (a cased line hatches with
+                // its casing under its core); a line of one stroke is its symbol's line.
+                let base = sub.as_ref().map(|s| s.symbol);
+                let lines: Vec<(Option<Rgba>, Option<f32>)> = match sub.as_ref().map(|s| s.strokes.as_slice()) {
+                    Some(strokes) if !strokes.is_empty() => {
+                        if strokes.iter().any(|st| st.dash.is_some() || st.markers.is_some()) {
+                            report.approximated(layer, "dashed and marker lines in line pattern fills, drawn solid");
+                        }
+                        strokes.iter().map(|st| (st.color, st.width)).collect()
+                    }
+                    _ => vec![(None, None)],
+                };
+                for (c, w) in lines {
+                    let c = c.or_else(|| base.map(|s| s.stroke)).or_else(|| prop(p, "color").and_then(color)).unwrap_or(Rgba::rgb(0, 0, 0));
+                    let w = w.or_else(|| base.map(|s| s.stroke_width)).unwrap_or(0.26 * 96.0 / 25.4);
+                    let pattern = FillPattern::Hatch { angle, spacing, width: w, offset: shift };
+                    stack.push(FillLayer { color: Some(c), pattern }.clamped());
+                    fill = Some(tint(c));
+                }
+            }
+            // Markers on a grid: its marker, its spacing and shifted rows and columns.
+            "PointPatternFill" => {
+                let sub = l.children().find(|c| c.has_tag_name("symbol")).map(|s| read(s, reference, false, layer, report));
+                let m = sub.as_ref().map_or_else(
+                    || Symbol {
+                        fill: Rgba::rgb(0, 0, 0),
+                        stroke: Rgba::new(0, 0, 0, 0),
+                        stroke_width: 0.0,
+                        size: 2.0 * 96.0 / 25.4,
+                        marker: Marker::Circle,
+                    },
+                    |s| s.symbol,
+                );
+                // QGIS's default: 15 mm apart each way.
+                let apart = |k: &str, report: &mut Report| size(p, k, reference, layer, report).unwrap_or(15.0 * 96.0 / 25.4);
+                let shift = |k: &str, report: &mut Report| offset(p, k, reference, layer, report).unwrap_or(0.0);
+                let spacing = [apart("distance_x", report), apart("distance_y", report)];
+                let displacement = [shift("displacement_x", report), shift("displacement_y", report)];
+                let moved = [shift("offset_x", report), shift("offset_y", report)];
+                let outline = (m.stroke.a() > 0 && m.stroke_width > 0.0).then_some(m.stroke);
+                stack.push(
+                    FillLayer {
+                        color: Some(m.fill),
+                        pattern: FillPattern::Dots {
+                            marker: m.marker,
+                            size: m.size,
+                            outline,
+                            outline_width: m.stroke_width,
+                            spacing,
+                            displacement,
+                            offset: moved,
+                        },
+                    }
+                    .clamped(),
+                );
+                fill = Some(tint(if m.fill.a() > 0 { m.fill } else { m.stroke }));
+            }
+            class @ ("SVGFill" | "RasterFill" | "RandomMarkerFill") => {
                 // The pattern's own symbol's colour, as a tint over what's below.
                 let sub = l.children().find(|c| c.has_tag_name("symbol")).map(|s| read(s, reference, false, layer, &mut Report::default()));
                 let c = sub.map(|s| if s.symbol.stroke.a() > 0 && s.symbol.fill.a() == 0 { s.symbol.stroke } else { s.symbol.fill });
                 if let Some(c) = c.or_else(|| prop(p, "color").and_then(color)) {
                     fill = Some(tint(c));
+                    stack.push(FillLayer { color: Some(tint(c)), pattern: FillPattern::Solid });
                 }
                 report.approximated(layer, format!("{} fills, drawn as a light tint of their colour", pattern_name(class)));
             }
@@ -244,9 +358,17 @@ fn fill(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &
             other => report.skipped(layer, format!("{other} symbol layers")),
         }
     }
+    // One colour and nothing over it is the symbol's fill alone, as before fills were stacked.
+    if stack.len() <= 1 && stack.iter().all(|f| f.pattern == FillPattern::Solid) {
+        stack.clear();
+    }
+    if stack.len() > crate::fills::MAX_FILLS {
+        report.skipped(layer, format!("fills past the first {}", crate::fills::MAX_FILLS));
+        stack.truncate(crate::fills::MAX_FILLS);
+    }
     let symbol =
         Symbol { fill: fill.unwrap_or(none), stroke: stroke.unwrap_or(none), stroke_width: width, size: 0.0, marker: Marker::Circle };
-    Converted { symbol, strokes: Vec::new(), rotation: None }
+    Converted { symbol, strokes: Vec::new(), rotation: None, fills: stack }
 }
 
 fn line(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &mut Report) -> Converted {
@@ -302,7 +424,7 @@ fn line(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &
         }
         None => hidden(),
     };
-    Converted { symbol, strokes, rotation: None }
+    Converted { symbol, strokes, rotation: None, fills: Vec::new() }
 }
 
 /// A marker line (`hash` false) or hashed line as strokes of markers or hash marks along the line:
@@ -553,7 +675,7 @@ fn marker(layers: &[(Node, Props)], reference: Option<f64>, still: bool, layer: 
         && marks.len() <= 1
         && marks.iter().all(|m| m.offset == 0.0 && m.markers.is_some_and(|k| k.offset_along == 0.0 && k.angle == 0.0));
     let strokes = if alone { Vec::new() } else { marks.into_iter().map(LineStroke::clamped).collect() };
-    Converted { symbol, strokes, rotation: None }
+    Converted { symbol, strokes, rotation: None, fills: Vec::new() }
 }
 
 /// A point marker layer's offset (`offset`, "x,y" in its unit: right and down) in points, its

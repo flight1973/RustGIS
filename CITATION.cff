@@ -19,6 +19,7 @@ authors:
     family-names: Fitzgerald
   - given-names: Dominik
     family-names: Strebel
+    orcid: "https://orcid.org/0000-0002-3529-1798"
 version: 0.4.0
 date-released: 2026-10-25
 doi: "10.5281/zenodo.23633281"

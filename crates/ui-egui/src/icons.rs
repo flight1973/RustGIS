@@ -509,7 +509,8 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.rect(9.0, 9.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
         }
         "identity" => {
-            // Intersect's squares, the input's square all kept: its part outside lighter.
+            // Intersect's two squares, with all of the input's square kept: the overlap marked, the
+            // rest of the input lighter.
             p.rect(3.0, 3.0, 12.0, 12.0, Some(p.tint(60)), None, 0.0);
             p.rect(9.0, 9.0, 6.0, 6.0, Some(accent), None, 0.0);
             p.rect(3.0, 3.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
@@ -522,6 +523,13 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.rect(9.0, 9.0, 6.0, 6.0, Some(accent), None, 0.0);
             p.rect(3.0, 3.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
             p.rect(9.0, 9.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
+        }
+        "near" => {
+            // A point, and the shortest line from it to a polygon.
+            p.polygon_shape(&[(12.0, 3.0), (21.0, 4.0), (20.0, 12.0), (13.0, 11.0)], 60);
+            p.line(&[(6.0, 18.0), (13.0, 11.0)], 1.2, ink);
+            p.circle(13.0, 11.0, 1.6, Some(ink), None);
+            p.circle(6.0, 18.0, 2.8, Some(red), Some((1.0, Color32::WHITE)));
         }
         "dissolve" => {
             p.polygon_shape(&[(2.0, 6.0), (12.0, 3.0), (22.0, 6.0), (20.0, 19.0), (4.0, 19.0)], 110);
@@ -1226,6 +1234,7 @@ pub const ALL: &[&str] = &[
     "intersect",
     "identity",
     "union",
+    "near",
     "dissolve",
     "hull",
     "centroid",

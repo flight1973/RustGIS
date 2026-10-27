@@ -503,7 +503,7 @@ pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: V
     // An MBTiles archive: held in memory and drawn as a tile layer.
     if rustgis_data::mbtiles::is_mbtiles_name(&name) {
         let url = crate::render::rustgis_tiles::mbtiles::register(&name, &bytes)?;
-        let mut q = json!({"url": url, "kind": "mbtiles"});
+        let mut q = json!({"url": url, "kind": "mbtiles", "top": true});
         if let Some(n) = ps(p, "name") {
             q["name"] = json!(n);
         }

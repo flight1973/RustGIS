@@ -217,6 +217,31 @@ start, back from its end, on from its middle), `"averageAngle"` turns a mark at 
 the line over that stretch of it (smoother on a line of many short bends), `"rotate": false`
 keeps marks upright, and `"outline"` gives markers an outline as wide as the stroke.
 
+### Fills
+
+A polygon layer fills with one colour by default. The **Fills** section of the Symbology pane
+stacks fills inside the outline, as a wetland gets a pale green under blue hatch lines: **Add
+Fill** puts one on top (the first is the symbol's colour, the next hatch lines over it), the
+arrows move one up or down and the cross removes it; the top fill is listed first. **Draw** picks
+**Solid**, **Hatch lines** (parallel lines at an **Angle**, anticlockwise from east, **Spacing**
+apart, of a **Line width**, shifted across by an **Offset**) or **Markers** (a **Marker** shape
+of a **Size** on a grid **Spacing across** and **Spacing down** apart, **Rows shifted** to
+stagger them). A colour set to **From symbol** follows the renderer, so the fills take each
+class's colour. The polygon's outline is drawn over the fills. Patterns are fixed to the map, so
+neighbouring polygons' hatch lines meet, and keep their size in points as the map zooms. A Unique
+Values or Graduated Colors class can stack fills of its own, picked under **Fills for** as for
+strokes. By command, `layer.fillLayers`:
+
+```text
+layer.fillLayers={"layer":"Wetlands","fills":[{"color":"#DDEEDD"},{"color":"#3366CC","pattern":"hatch","angle":0,"spacing":6,"width":0.8}]}
+layer.fillLayers={"layer":"Orchards","fills":[{"color":"#F2F5E6"},{"color":"#4E7A2E","pattern":"dots","marker":"circle","size":3,"spacing":[8,8],"displacement":[4,0]}]}
+layer.fillLayers={"layer":"Land use","value":"Forest","fills":[{"color":null},{"color":"#2D5A27","pattern":"hatch","angle":45}]}
+```
+
+`[]` goes back to the single fill (for a class, to the layer's fills). Fills draw on the CPU (on the
+globe, patterns keep to the screen rather than the map as it turns); the
+legend shows the symbol's colour.
+
 ### Reference scale
 
 Symbol and label sizes are set in points, and normally keep that size on screen at every scale.
@@ -328,6 +353,21 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   left or up), growing with the labels at a reference scale. A label along a line isn't moved
   (`labels.placement={"layer": "Cities", "position": "aboveRight", "offset": [5.7, -2.8]}`; an
   offset can be given without a position).
+- **Wrapping**: a label's text broken into lines (Labeling pane › Symbol): **Wrap at** a
+  character (or a few, up to 8), a line break wherever it occurs, left out (a space puts each
+  word on its own line, `/` breaks `Zürich/Winterthur`), and **Wrap length**, the longest line in characters, broken
+  between words (a longer word keeps a line of its own). **Line alignment** lines the lines up
+  left (as labels always have), centred or right. A label curved along a line, character by
+  character, isn't wrapped
+  (`labels.style={"layer": "Cities", "wrapChar": " ", "wrapLength": 12, "lineAlign": "center"}`;
+  `""` and `0` wrap none).
+- **Repeat along lines**: a label placed along a line (Parallel or Curved) repeated every so many
+  points (Labeling pane › Position › **Repeat**, 10 to 10,000): the one at the line's middle where
+  it always is, and more either side of it, nearest first, at most 32 a line. Each is a label of
+  its own: it collides like any other (one that doesn't fit is left out, the others stay), and
+  Lock keeps the ones placed. The distance grows with the labels at a reference scale
+  (`labels.placement={"layer": "Rivers", "position": "curved", "repeat": 144}`; `null` or `0` is
+  the one at the middle).
 - **Font**: the labels' font family, any installed on the computer (Labeling pane › Symbol
   › **Font**; type part of a name to find it), or the label font the interface uses. Bold and
   italic take the family's own bold and italic faces where it has them. The family is saved by

@@ -1,15 +1,17 @@
 //! QGIS labels (`<labeling type="simple|rule-based">`) as RustGIS label classes: each rule a
 //! class whose SQL clause is its filter (and its parents'), an else rule the features no other
 //! rule takes; the text's field, size, colour, weight, slant and letter spacing, its buffer as a
-//! halo of its colour and size, its background as a rectangle behind it, its placement and offset,
-//! and its scale range.
+//! halo of its colour and size, its background as a rectangle behind it, its wrapping and how its
+//! lines line up, its placement, offset and repeat along lines, and its scale range.
 
 use roxmltree::Node;
 
 use super::{QGIS_SCALE, Report, child, color, data_defined_on, expr, prop, props};
 use crate::Rgba;
+use crate::layout::TextAlign;
 use crate::symbology::{
     DEFAULT_LABEL_CLASS, HALO_WIDTH, LABEL_OFFSET, LABEL_SIZE, LabelBackground, LabelClass, LabelPlacement, Labeling, MAX_LABEL_CLASSES,
+    MAX_WRAP_LENGTH,
 };
 
 /// A layer's labels from its `<labeling>`, or `None` when none can be carried over. `geometry` is
@@ -213,6 +215,10 @@ fn class(
     }
     let placement = child(settings, "placement").map_or(LabelPlacement::Auto, |p| placement(p, layer, report));
     let offset = child(settings, "placement").map_or([0.0; 2], |p| offset(p, geometry, layer, report));
+    // (Without a `<text-format>`, QGIS's lines follow the placement too.)
+    let (wrap_char, wrap_length, line_align) =
+        child(settings, "text-format").map_or((None, 0, follow_placement(placement)), |f| wrapping(f, placement, layer, report));
+    let repeat = child(settings, "placement").and_then(|p| repeat(p, placement, geometry, layer, report));
     unread(settings, geometry, layer, report);
     // The settings' own scale range, else the rule's.
     let rendering = child(settings, "rendering");
@@ -242,7 +248,70 @@ fn class(
         spacing: spacing.clamp(spacing_min, spacing_max) as f32,
         offset,
         background,
+        wrap_char,
+        wrap_length,
+        line_align,
+        repeat,
     })
+}
+
+/// A label's wrapping (QGIS's `<text-format>`): its wrap character, its automatic wrap length
+/// (characters), and how its lines line up (QGIS's "follow placement" as the side the label
+/// sits on: right-aligned left of its feature, left-aligned right of it, centred otherwise).
+fn wrapping(f: Node, placement: LabelPlacement, layer: &str, report: &mut Report) -> (Option<String>, u32, TextAlign) {
+    let num = |k: &str| f.attribute(k).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite());
+    let wrap_char = f.attribute("wrapChar").and_then(crate::symbology::wrap_char);
+    let length = num("autoWrapLength").filter(|v| *v > 0.0).map_or(0, |v| v.min(f64::from(MAX_WRAP_LENGTH)) as u32);
+    if length > 0 && f.attribute("useMaxLineLengthForAutoWrap") == Some("0") {
+        report.approximated(layer, "labels wrapped at a shortest line length, wrapped at that length at most");
+    }
+    let align = match f.attribute("multilineAlign").unwrap_or("3") {
+        "0" => TextAlign::Left,
+        "1" => TextAlign::Center,
+        "2" => TextAlign::Right,
+        "4" => {
+            report.approximated(layer, "justified label lines, centred");
+            TextAlign::Center
+        }
+        _ => follow_placement(placement),
+    };
+    (wrap_char, length, align)
+}
+
+/// QGIS's "follow placement" for a label's lines: right-aligned left of its feature, left-aligned
+/// right of it, centred otherwise.
+fn follow_placement(placement: LabelPlacement) -> TextAlign {
+    match placement {
+        LabelPlacement::Left | LabelPlacement::AboveLeft | LabelPlacement::BelowLeft => TextAlign::Right,
+        LabelPlacement::Right | LabelPlacement::AboveRight | LabelPlacement::BelowRight => TextAlign::Left,
+        _ => TextAlign::Center,
+    }
+}
+
+/// A label's repeat along its line, in points: QGIS's repeat distance in its units, for a label
+/// placed along a line. Round a polygon's outline (QGIS's placement along a polygon layer's lines,
+/// or round its perimeter) RustGIS labels it once, and says so.
+fn repeat(p: Node, placement: LabelPlacement, geometry: Option<&str>, layer: &str, report: &mut Report) -> Option<f32> {
+    let d = p.attribute("repeatDistance").and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0)?;
+    // (QGIS repeats only along lines: a polygon's outline with Line or Curved, or round its
+    // perimeter, curved.)
+    let placed = p.attribute("placement");
+    let round_polygons = (geometry == Some("Polygon") && matches!(placed, Some("2" | "3"))) || placed == Some("7");
+    if round_polygons {
+        report.approximated(layer, "labels repeated round polygons, drawn once");
+        return None;
+    }
+    if !placement.along_line() {
+        return None;
+    }
+    // Before QGIS 3 the unit was a number (0 points, 1 millimetres, 2 map units), which QGIS
+    // reads when the named one isn't there.
+    let unit = p.attribute("repeatDistanceUnits").unwrap_or(match p.attribute("repeatDistanceUnit") {
+        Some("0") => "Point",
+        Some("2") => "MapUnit",
+        _ => "MM",
+    });
+    crate::symbology::label_repeat(points(d, unit, "label repeat distances", layer, report))
 }
 
 /// A label's background as RustGIS's rectangle: QGIS's rectangle (its square, ellipse and circle
@@ -377,16 +446,8 @@ fn unread(settings: Node, geometry: Option<&str>, layer: &str, report: &mut Repo
     if used && num(p, "dist").is_some_and(|d| d != 0.0) {
         report.approximated(layer, "label distances from their features, left out");
     }
-    if num(p, "repeatDistance").is_some_and(|d| d > 0.0) {
-        report.approximated(layer, "labels repeated along lines, drawn once");
-    }
     if num(p, "priority").is_some_and(|d| d != 5.0) {
         report.approximated(layer, "label priorities, left out");
-    }
-    let format = child(settings, "text-format");
-    if format.and_then(|f| f.attribute("wrapChar")).is_some_and(|w| !w.is_empty()) || num(format, "autoWrapLength").is_some_and(|w| w > 0.0)
-    {
-        report.approximated(layer, "wrapped labels, drawn on one line");
     }
     if child(settings, "callout").is_some_and(|c| prop(&props(c), "enabled") == Some("1")) {
         report.skipped(layer, "label callouts (lines from a label to its feature)");

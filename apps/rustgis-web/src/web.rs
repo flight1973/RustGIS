@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use rustgis_ui_egui::{Inbox, RustGisApp, Services};
+use rustgis_ui_egui::{Inbox, RustGisApp, Services, Slot};
 
 use crate::parts::Notes;
 use wasm_bindgen::JsCast as _;
@@ -777,6 +777,16 @@ async fn http(
     Ok(rustgis_ui_egui::rustgis_assistant::HttpResponse { status, body: bytes.to_vec(), headers })
 }
 
+/// The browser's clipboard, where a page may read it: a secure context (HTTPS, or this computer)
+/// whose `navigator.clipboard` has `readText`.
+fn clipboard() -> Option<web_sys::Clipboard> {
+    let window = web_sys::window().filter(web_sys::Window::is_secure_context)?;
+    let navigator = window.navigator();
+    let clipboard = js_sys::Reflect::get(&navigator, &"clipboard".into()).ok().filter(|c| !c.is_null_or_undefined())?;
+    js_sys::Reflect::get(&clipboard, &"readText".into()).ok().filter(wasm_bindgen::JsValue::is_function)?;
+    Some(navigator.clipboard())
+}
+
 /// The browser's services. Embedded, settings live in memory for the visit: the page that embeds
 /// the app must not read what the user saved on the site.
 fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, embedded: bool) -> Services {
@@ -827,7 +837,24 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
         )
     };
     let arcgis_ctx = ctx.clone();
+    let clipboard_ctx = ctx.clone();
     Services {
+        // A text field's Paste: the page reads the clipboard (Firefox and Safari show a Paste
+        // button to confirm, Chrome asks once); only over HTTPS, where the browser offers it.
+        read_clipboard: clipboard().map(|clipboard| -> Box<dyn Fn(Slot<Result<String, String>>)> {
+            Box::new(move |slot| {
+                let (clipboard, ctx) = (clipboard.clone(), clipboard_ctx.clone());
+                wasm_bindgen_futures::spawn_local(async move {
+                    let read = wasm_bindgen_futures::JsFuture::from(clipboard.read_text()).await;
+                    let text = read.map(|v| v.as_string().unwrap_or_default()).map_err(|e| {
+                        // A refusal is a DOMException: its name says why (NotAllowedError).
+                        js_sys::Reflect::get(&e, &"name".into()).ok().and_then(|n| n.as_string()).unwrap_or_else(|| format!("{e:?}"))
+                    });
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+                    ctx.request_repaint();
+                });
+            })
+        }),
         arcgis_sign_in: Some(Box::new(move |portal, client_id, slot| crate::arcgis::sign_in(portal, client_id, slot, arcgis_ctx.clone()))),
         load_pref: Some(load_pref),
         save_pref: Some(save_pref),
@@ -873,6 +900,8 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 rfd::AsyncFileDialog::new().add_filter("Shapefile", &["shp", "dbf", "shx", "prj", "cpg", "zip"])
             } else if purpose == "project" {
                 rfd::AsyncFileDialog::new().add_filter("RustGIS project", &["rgis", "rgisx", "rgispkg"])
+            } else if purpose == "qgisProject" {
+                rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("QGIS project"), &["qgs", "qgz"])
             } else if purpose == "item" {
                 rfd::AsyncFileDialog::new().add_filter(
                     "RustGIS items",

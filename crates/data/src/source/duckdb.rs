@@ -112,8 +112,10 @@ impl Database {
         match self {
             Database::File(p) => p.file_stem().and_then(|s| s.to_str()).unwrap_or("database").to_string(),
             Database::Postgres(d) => {
-                let get = |k: &str| d.split_whitespace().find_map(|kv| kv.strip_prefix(&format!("{k}=")).map(str::to_string));
-                get("dbname")
+                // Quoted values (`dbname='my gis'`) as libpq reads them.
+                super::pgconn::keyword_pairs(d)
+                    .into_iter()
+                    .find_map(|(k, v)| (k == "dbname").then_some(v))
                     .unwrap_or_else(|| d.rsplit('/').next().unwrap_or("postgres").split('?').next().unwrap_or("postgres").to_string())
             }
             Database::Mysql(a) => super::myconn::database_name(a).unwrap_or_else(|| "mysql".into()),
@@ -940,6 +942,9 @@ mod tests {
         assert_eq!(d, Database::Postgres("host=db.example dbname=gis user=me".into()));
         assert_eq!(d.label(), "postgres:host=db.example dbname=gis user=me");
         assert_eq!(d.short(), "gis");
+        // Quoted values (as `pg.connect` writes them) are named without their quotes, whole.
+        assert_eq!(Database::Postgres("host='h' dbname='my gis' user='o\\'neil'".into()).short(), "my gis");
+        assert_eq!(Database::Postgres("host='h' dbname='gis'".into()).short(), "gis");
         assert_eq!(password(Some(&d)).as_deref(), Some("pw1"));
         assert_eq!(Database::parse(&d.label()), d);
         let u = Database::parse("postgresql://me:pw2@db.example:5433/osm?sslmode=require");

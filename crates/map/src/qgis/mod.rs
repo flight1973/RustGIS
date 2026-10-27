@@ -103,6 +103,8 @@ pub struct Style {
     /// A line layer's stacked strokes (a single-symbol line with more than one line, or an
     /// offset one).
     pub line_strokes: Option<Vec<LineStroke>>,
+    /// A polygon layer's stacked fills (a single-symbol fill with patterns, or several fills).
+    pub fill_layers: Option<Vec<crate::fills::FillLayer>>,
     pub stroke_levels: Option<bool>,
     /// Point markers turned by a field (`Some(None)`: not turned).
     pub marker_rotation: Option<Option<MarkerRotation>>,
@@ -147,6 +149,10 @@ impl Style {
         }
         if let Some(s) = &self.line_strokes {
             layer.line_strokes = s.clone();
+        }
+        // (Only a polygon layer's fills draw.)
+        if let Some(f) = self.fill_layers.as_ref().filter(|_| layer.geometry_type() == rustgis_data::GeometryType::Polygon) {
+            layer.fill_layers = f.clone();
         }
         if let Some(on) = self.stroke_levels {
             layer.stroke_levels = on;

@@ -342,6 +342,83 @@ fn editing_features_and_fields() {
     assert_eq!(s.map().layer_by_name("Cities").unwrap().dataset.features.len(), n - 1);
 }
 
+/// A polygon layer stacks fills (a colour, hatch lines, markers on a grid), for the layer or a
+/// class of its own; junk is refused and numbers held within range; each change undoes, and the
+/// project keeps them (a layer without them saves as before).
+#[test]
+fn fill_layers_stack_and_survive_save_and_undo() {
+    use rustgis_map::Rgba;
+    use rustgis_map::fills::{FillLayer, FillPattern, MAX_FILLS};
+    let mut s = world();
+    let before = serde_json::to_string(&s.project).unwrap();
+    assert!(!before.contains("fill_layers") && !before.contains("class_fills"), "nothing written for layers without them");
+    let depth = s.undo_depth();
+    let fills = json!([
+        {"color": "#E8F0D0", "pattern": "solid"},
+        {"color": "#336633", "pattern": "hatch", "angle": 45, "spacing": 6, "width": 0.75},
+        {"pattern": "dots", "marker": "square", "size": 2, "spacing": [8, 6], "displacement": [4, 0], "outline": "#000000", "outlineWidth": 0.5}
+    ]);
+    assert_eq!(s.run("layer.fillLayers", &json!({"layer": "Countries", "fills": fills})).unwrap(), json!({"fills": 3}));
+    assert_eq!(s.undo_depth(), depth + 1, "one undo step");
+    let got = |s: &Session| s.map().layer_by_name("Countries").unwrap().fill_layers.clone();
+    let f = got(&s);
+    assert_eq!(f[0], FillLayer { color: Some(Rgba::rgb(0xE8, 0xF0, 0xD0)), pattern: FillPattern::Solid });
+    assert_eq!(f[1].pattern, FillPattern::Hatch { angle: 45.0, spacing: 6.0, width: 0.75, offset: 0.0 });
+    let FillPattern::Dots { marker, spacing, outline, .. } = f[2].pattern else { panic!("{f:?}") };
+    assert_eq!((marker, spacing, outline, f[2].color), (rustgis_map::Marker::Square, [8.0, 6.0], Some(Rgba::rgb(0, 0, 0)), None));
+    // Kept with the project, and undone.
+    let text = serde_json::to_string(&s.project).unwrap();
+    let reopened = Session::new(serde_json::from_str(&text).unwrap());
+    assert_eq!(got(&reopened), f);
+    s.run("edit.undo", &json!({})).unwrap();
+    assert!(got(&s).is_empty());
+    // Held within range; a number given for both ways.
+    s.run("layer.fillLayers", &json!({"layer": "Countries", "fills": [{"pattern": "hatch", "spacing": 1e300, "width": -4, "angle": -45}, {"pattern": "dots", "spacing": 1e9}]}))
+        .unwrap();
+    let f = got(&s);
+    assert_eq!(f[0].pattern, FillPattern::Hatch { angle: 315.0, spacing: 500.0, width: 0.0, offset: 0.0 });
+    assert!(matches!(f[1].pattern, FillPattern::Dots { spacing: [500.0, 500.0], .. }), "{f:?}");
+    // A character of a font as the dots (a QGIS font marker's), kept with its family; not with a
+    // shape too.
+    s.run("layer.fillLayers", &json!({"layer": "Countries", "fills": [{"pattern": "dots", "char": "★", "font": "Noto Sans"}]})).unwrap();
+    let FillPattern::Dots { marker: rustgis_map::Marker::Char(g), .. } = got(&s)[0].pattern else { panic!("{:?}", got(&s)) };
+    assert_eq!((g.ch, g.font.as_str()), ('★', "Noto Sans"));
+    assert!(
+        s.run("layer.fillLayers", &json!({"layer": "Countries", "fills": [{"pattern": "dots", "marker": "square", "char": "x"}]})).is_err()
+    );
+    // A class's own (Unique Values), then back to the layer's.
+    s.run("layer.symbology", &json!({"layer": "Countries", "type": "unique", "field": "continent"})).unwrap();
+    let value = match &s.map().layer_by_name("Countries").unwrap().renderer {
+        rustgis_map::Renderer::Unique { classes, .. } => classes[0].0.clone(),
+        r => panic!("{r:?}"),
+    };
+    s.run("layer.fillLayers", &json!({"layer": "Countries", "value": value, "fills": [{"pattern": "hatch"}]})).unwrap();
+    let class_fills = |s: &Session| match &s.map().layer_by_name("Countries").unwrap().renderer {
+        rustgis_map::Renderer::Unique { class_fills, .. } => class_fills.clone(),
+        _ => Default::default(),
+    };
+    assert_eq!(class_fills(&s).get(&value).map(Vec::len), Some(1));
+    s.run("layer.fillLayers", &json!({"layer": "Countries", "value": value, "fills": []})).unwrap();
+    assert!(class_fills(&s).is_empty());
+    assert!(s.run("layer.fillLayers", &json!({"layer": "Countries", "value": "no such class", "fills": []})).is_err());
+    // Junk, and a layer that isn't polygons.
+    let many: Vec<Value> = (0..=MAX_FILLS).map(|_| json!({})).collect();
+    for bad in [
+        json!({"layer": "Countries"}),
+        json!({"layer": "Countries", "fills": "hatch"}),
+        json!({"layer": "Countries", "fills": many}),
+        json!({"layer": "Countries", "fills": [7]}),
+        json!({"layer": "Countries", "fills": [{"pattern": "stripes"}]}),
+        json!({"layer": "Countries", "fills": [{"color": "red"}]}),
+        json!({"layer": "Countries", "fills": [{"pattern": "hatch", "spacing": "wide"}]}),
+        json!({"layer": "Countries", "fills": [{"pattern": "dots", "spacing": [1]}]}),
+        json!({"layer": "Countries", "fills": [{"pattern": "dots", "marker": "blob"}]}),
+        json!({"layer": "Rivers", "fills": []}),
+    ] {
+        assert!(s.run("layer.fillLayers", &bad).is_err(), "{bad}");
+    }
+}
+
 #[test]
 fn line_strokes_stack_and_survive_save_and_undo() {
     use rustgis_map::{LineCap, LineJoin, LineStroke, Rgba};
@@ -1580,8 +1657,8 @@ fn custom_projections_switch_keep_scale_query_and_render() {
 #[test]
 fn raster_layers_open_style_identify_and_round_trip() {
     let mut s = with_raster();
-    let l = s.map().layers.last().unwrap();
-    assert!(l.is_raster(), "rasters go under the vector layers");
+    let l = s.map().layers.first().unwrap();
+    assert!(l.is_raster(), "a new raster goes on top, as every new layer does (#808)");
     assert_eq!(l.name, "scene");
     assert_eq!(s.active_layer, Some(l.id));
     let e = l.extent();
@@ -1608,7 +1685,7 @@ fn raster_layers_open_style_identify_and_round_trip() {
     s.run("raster.resampling", &json!({"type": "bilinear"})).unwrap();
     s.run("raster.enhance", &json!({"brightness": 20, "contrast": -10, "gamma": 1.4})).unwrap();
     s.run("layer.ramp", &json!({"ramp": "Aurora"})).unwrap();
-    let st = s.map().layers.last().unwrap().raster.as_ref().unwrap().style.clone();
+    let st = s.map().layers.first().unwrap().raster.as_ref().unwrap().style.clone();
     assert_eq!(st.renderer, rustgis_map::RasterRenderer::Rgb { red: 2, green: 1, blue: 0 });
     assert!(st.dra && st.gamma == 1.4);
     // Feature-only commands are off for rasters, and layer conditions follow a named layer.
@@ -2181,6 +2258,62 @@ fn labels_take_a_halo_colour_and_width_and_letter_spacing() {
         p["layer"] = json!("Cities");
         assert!(s.run("labels.style", &p).is_err(), "{bad}");
     }
+}
+
+/// A label class takes wrapping and its lines' alignment with its text symbol, and a repeat along
+/// lines with its placement; junk is refused, numbers kept within their ranges, each change undoes
+/// and the project keeps them.
+#[test]
+fn labels_take_wrapping_and_a_repeat_along_lines() {
+    use rustgis_map::layout::TextAlign;
+    let mut s = world();
+    let class = |s: &Session| {
+        let c = &s.map().layer_by_name("Rivers").unwrap().labels.default;
+        (c.wrap_char.clone(), c.wrap_length, c.line_align, c.repeat, c.placement)
+    };
+    let placement = class(&s).4;
+    assert_eq!(class(&s), (None, 0, TextAlign::Left, None, placement));
+    let mark = s.notice_mark();
+    s.run("labels.style", &json!({"layer": "Rivers", "wrapChar": " ", "wrapLength": "12", "lineAlign": "CENTER"})).unwrap();
+    s.run("labels.placement", &json!({"layer": "Rivers", "repeat": 144})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("ignores")), "every key is read");
+    assert_eq!(class(&s), (Some(" ".into()), 12, TextAlign::Center, Some(144.0), placement), "a repeat alone keeps the position");
+    // Within their ranges; none again.
+    s.run("labels.style", &json!({"layer": "Rivers", "wrapChar": "abcdefghijk", "wrapLength": 1e9})).unwrap();
+    s.run("labels.placement", &json!({"layer": "Rivers", "repeat": 0.5})).unwrap();
+    let c = class(&s);
+    assert_eq!((c.0.as_deref(), c.1, c.3), (Some("abcdefgh"), rustgis_map::symbology::MAX_WRAP_LENGTH, Some(10.0)));
+    s.run("labels.placement", &json!({"layer": "Rivers", "repeat": 1e9})).unwrap();
+    assert_eq!(class(&s).3, Some(10_000.0));
+    s.run("labels.style", &json!({"layer": "Rivers", "wrapChar": "", "wrapLength": 0})).unwrap();
+    s.run("labels.placement", &json!({"layer": "Rivers", "repeat": null})).unwrap();
+    assert_eq!((class(&s).0, class(&s).1, class(&s).3), (None, 0, None));
+    s.run("edit.undo", &json!({})).unwrap();
+    assert_eq!(class(&s).3, Some(10_000.0), "undoes");
+    s.run("labels.placement", &json!({"layer": "Rivers", "repeat": 0})).unwrap();
+    assert_eq!(class(&s).3, None, "0 is none");
+    for bad in [
+        json!({"wrapChar": 7}),
+        json!({"wrapLength": -3}),
+        json!({"wrapLength": "long"}),
+        json!({"lineAlign": "justify"}),
+        json!({"lineAlign": 1}),
+    ] {
+        let mut p = bad.clone();
+        p["layer"] = json!("Rivers");
+        assert!(s.run("labels.style", &p).is_err(), "{bad}");
+    }
+    for bad in [json!({"repeat": -5}), json!({"repeat": "often"}), json!({"repeat": [1]})] {
+        let mut p = bad.clone();
+        p["layer"] = json!("Rivers");
+        assert!(s.run("labels.placement", &p).is_err(), "{bad}");
+    }
+    // Kept with the project.
+    s.run("labels.style", &json!({"layer": "Rivers", "wrapChar": "/", "lineAlign": "right"})).unwrap();
+    s.run("labels.placement", &json!({"layer": "Rivers", "position": "curved", "repeat": 200})).unwrap();
+    let text = serde_json::to_string(&s.project).unwrap();
+    let reopened = Session::new(serde_json::from_str(&text).unwrap());
+    assert_eq!(class(&reopened), class(&s));
 }
 
 /// A label class takes an offset with its placement and a background with its text symbol; junk
@@ -4800,7 +4933,7 @@ fn custom_colour_ramps_add_apply_save_and_travel() {
     let mut r = with_raster();
     r.run("ramp.add", &json!({"path": path("mine.rgisramp")})).unwrap();
     r.run("raster.symbology", &json!({"type": "stretch", "ramp": "Phosphor Frostfire"})).unwrap();
-    let style = |r: &Session| r.map().layers.last().unwrap().raster.as_ref().unwrap().style.renderer.clone();
+    let style = |r: &Session| r.map().layers.first().unwrap().raster.as_ref().unwrap().style.renderer.clone();
     assert!(matches!(style(&r), RasterRenderer::Stretch { ramp: Ramp::Custom(_), .. }));
     r.run("raster.symbology", &json!({"type": "classify", "classes": 3})).unwrap();
     assert!(matches!(style(&r), RasterRenderer::Classify { ramp: Ramp::Custom(_), .. }), "classify keeps the ramp");
@@ -8229,6 +8362,12 @@ fn mbtiles_archives_become_tile_layers() {
     u.run("layer.addDataBytes", &json!({"fileName": "uploaded.mbtiles", "data": b64})).unwrap();
     assert_eq!(u.map().tiles[0].url, "upload:uploaded.mbtiles");
     draws_red(&mut u);
+
+    // Added as data to a map with layers, it goes on top of them (#808), and draws there.
+    let mut w = world();
+    w.run("layer.addData", &json!({"path": p})).unwrap();
+    assert_eq!(stack_names(&w)[0], "~red");
+    draws_red(&mut w);
 
     // Not an archive, a relative path, a network share, an upload never made.
     let junk = dir.join("junk.mbtiles");
@@ -15515,7 +15654,7 @@ fn ogc_group_refresh_keeps_children_across_rotated_keys_and_rejects_bad_answers(
     let group = added["group"].clone();
     let ids: Vec<u32> = s.map().service_groups[0].children.iter().map(|c| c.layer).collect();
     s.run("layer.rename", &json!({"layer":ids[0], "name":"Renamed"})).unwrap();
-    s.map_mut().label_lock = Some(vec![(ids[0], 0, 0), (ids[1], 0, 0)]);
+    s.map_mut().label_lock = Some(vec![(ids[0], 0, 0, 0), (ids[1], 0, 0, 0)]);
 
     // A rotated key changes every source address but not the collections: the children stay.
     let mut q = doc("rotated-key");
@@ -15725,11 +15864,11 @@ fn raster_stretch_custom_bounds_per_band() {
     use rustgis_map::Stretch;
     let mut s = with_raster();
     let layer = |s: &Session, i: usize| s.map().layers.get(i).and_then(|l| l.raster.as_ref()).unwrap().clone();
-    let stretch = |s: &Session| layer(s, s.map().layers.len() - 1).style.stretch;
+    let stretch = |s: &Session| layer(s, 0).style.stretch;
     // Three bands with ranges of their own.
     let ranges = [[0.0, 100.0], [0.0, 200.0], [10.0, 50.0]];
     {
-        let rl = s.map_mut().layers.last_mut().and_then(|l| l.raster.as_mut()).unwrap();
+        let rl = s.map_mut().layers.first_mut().and_then(|l| l.raster.as_mut()).unwrap();
         let mut d = (**rl.data.as_ref().unwrap()).clone();
         assert!(d.bands.len() >= 3);
         for (b, [lo, hi]) in d.bands.iter_mut().zip(ranges) {
@@ -15805,8 +15944,8 @@ fn raster_stretch_custom_bounds() {
     let mut s = with_raster();
     // One band: a missing bound is that band's own statistic (on RGB it is the range drawn now).
     s.run("raster.symbology", &json!({"type": "stretch", "band": 1})).unwrap();
-    let stretch = |s: &Session| s.map().layers.last().unwrap().raster.as_ref().unwrap().style.stretch;
-    let stats = s.map().layers.last().unwrap().raster.as_ref().unwrap().data.as_ref().unwrap().bands[0].stats.clone();
+    let stretch = |s: &Session| s.map().layers.first().unwrap().raster.as_ref().unwrap().style.stretch;
+    let stats = s.map().layers.first().unwrap().raster.as_ref().unwrap().data.as_ref().unwrap().bands[0].stats.clone();
     s.run("raster.stretch", &json!({"type": "custom", "min": 10, "max": 200})).unwrap();
     assert_eq!(stretch(&s), Stretch::custom(10.0, 200.0));
     // A missing bound is the layer's own statistic.
@@ -15829,7 +15968,7 @@ fn raster_stretch_custom_bounds() {
     let mut flat = with_raster();
     flat.run("raster.symbology", &json!({"type": "stretch", "band": 1})).unwrap();
     {
-        let rl = flat.map_mut().layers.last_mut().and_then(|l| l.raster.as_mut()).unwrap();
+        let rl = flat.map_mut().layers.first_mut().and_then(|l| l.raster.as_mut()).unwrap();
         let mut d = (**rl.data.as_ref().unwrap()).clone();
         d.bands[0].stats.min = 7.0;
         d.bands[0].stats.max = 7.0;
@@ -15839,7 +15978,7 @@ fn raster_stretch_custom_bounds() {
     assert_eq!(stretch(&flat), Stretch::custom(6.5, 7.5));
     // The padding follows the value's size, and statistics that aren't numbers are refused.
     let set_stats = |s: &mut Session, v: f64| {
-        let rl = s.map_mut().layers.last_mut().and_then(|l| l.raster.as_mut()).unwrap();
+        let rl = s.map_mut().layers.first_mut().and_then(|l| l.raster.as_mut()).unwrap();
         let mut d = (**rl.data.as_ref().unwrap()).clone();
         d.bands[0].stats.min = v;
         d.bands[0].stats.max = v;
@@ -16071,13 +16210,265 @@ fn hand_edited_layer_groups_open_bounded_and_unambiguous() {
 fn a_new_layer_goes_above_a_group_rather_than_into_it() {
     let mut s = world();
     let names = |s: &Session| s.map().layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>();
-    // Rivers (lines) over Countries (polygons) in one group: a new polygon layer ranks just above
-    // Countries, which would split the group.
-    s.run("group.add", &json!({"name": "Base", "layers": ["Rivers", "Countries"]})).unwrap();
-    assert_eq!(names(&s), ["Cities", "Rivers", "Countries", "Lakes"]);
+    // A group at the top of the drawing order: a new layer goes on top (#808), above the group.
+    s.run("group.add", &json!({"name": "Base", "layers": ["Cities", "Rivers"]})).unwrap();
+    assert_eq!(names(&s), ["Cities", "Rivers", "Lakes", "Countries"]);
     let square = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}}]}"#;
     s.run("layer.addDataText", &json!({"fileName": "p.geojson", "text": square, "name": "Square"})).unwrap();
-    assert_eq!(names(&s), ["Cities", "Square", "Rivers", "Countries", "Lakes"]);
+    assert_eq!(names(&s), ["Square", "Cities", "Rivers", "Lakes", "Countries"]);
+    assert!(s.map().groups[0].children.iter().all(|c| s.map().layer(*c).is_some_and(|l| l.name != "Square")));
+}
+
+/// The drawing order of all the active map's layers, top first: map layers by name, tile layers
+/// as `~name`.
+fn stack_names(s: &Session) -> Vec<String> {
+    let m = s.map();
+    m.stack()
+        .into_iter()
+        .map(|d| match d {
+            rustgis_map::Drawn::Layer(i) => m.layers[i].name.clone(),
+            rustgis_map::Drawn::Tile(i) => format!("~{}", m.tiles[i].name),
+        })
+        .collect()
+}
+
+const SQUARE: &str = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}}]}"#;
+const POINT: &str =
+    r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[0,0]}}]}"#;
+
+/// Every new layer goes on top of the drawing order, whatever its kind, as GeoLibre adds them
+/// (#808): polygons over points, rasters over vectors, a web overlay (a WMS layer, Add Tile
+/// Layer's Overlay) over the map's layers, and a later layer over it. A basemap stays under them.
+#[test]
+fn new_layers_go_on_top_whatever_their_kind() {
+    let mut s = world();
+    assert_eq!(stack_names(&s), ["Cities", "Rivers", "Lakes", "Countries"]);
+    s.run("layer.addDataText", &json!({"fileName": "p.geojson", "text": SQUARE, "name": "Square"})).unwrap();
+    assert_eq!(stack_names(&s)[0], "Square", "a polygon layer over the points");
+    s.run("layer.addDataBytes", &json!({"fileName": "scene.tif", "data": utm_tiff_b64()})).unwrap();
+    assert_eq!(stack_names(&s)[..2], ["scene", "Square"], "a raster over the vectors");
+    s.run("map.addTiles", &json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
+    assert_eq!(stack_names(&s)[..2], ["~Depths", "scene"], "an overlay over the map's layers");
+    s.run("layer.addDataText", &json!({"fileName": "q.geojson", "text": POINT, "name": "Pin"})).unwrap();
+    assert_eq!(stack_names(&s)[..3], ["Pin", "~Depths", "scene"], "a later layer over the overlay");
+    assert_eq!(s.map().layer_by_name("Pin").map(|l| l.id), s.active_layer, "and active");
+    s.run("map.addTiles", &json!({"url": "https://base.example.org/{z}/{x}/{y}.png", "name": "Streets"})).unwrap();
+    assert_eq!(stack_names(&s).last().map(String::as_str), Some("~Streets"), "a basemap under them all");
+    // The layers already there kept their order.
+    assert_eq!(stack_names(&s)[3..], ["Square", "Cities", "Rivers", "Lakes", "Countries", "~Streets"]);
+}
+
+/// A tile layer moves past map layers (a group's at once), by a step or to a place, and keeps its
+/// place when the layer under it moves or goes.
+#[test]
+fn tile_layers_move_among_the_map_layers() {
+    let mut s = world();
+    s.run("map.addTiles", &json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
+    let mv = |s: &mut Session, to: Value| s.run("map.setTiles", &json!({"name": "Depths", "move": to})).map(|_| stack_names(s));
+    assert!(mv(&mut s, json!("up")).is_err(), "already on top");
+    assert_eq!(mv(&mut s, json!("down")).unwrap(), ["Cities", "~Depths", "Rivers", "Lakes", "Countries"]);
+    s.run("group.add", &json!({"name": "Water", "layers": ["Rivers", "Lakes"]})).unwrap();
+    assert_eq!(mv(&mut s, json!("down")).unwrap(), ["Cities", "Rivers", "Lakes", "~Depths", "Countries"], "past the group");
+    assert_eq!(mv(&mut s, json!("up")).unwrap(), ["Cities", "~Depths", "Rivers", "Lakes", "Countries"]);
+    assert_eq!(mv(&mut s, json!("bottom")).unwrap(), ["Cities", "Rivers", "Lakes", "Countries", "~Depths"]);
+    assert!(mv(&mut s, json!("down")).is_err(), "already at the bottom");
+    assert_eq!(mv(&mut s, json!("top")).unwrap(), ["~Depths", "Cities", "Rivers", "Lakes", "Countries"]);
+    // To a place among the other layers.
+    s.run("map.setTiles", &json!({"name": "Depths", "to": 3})).unwrap();
+    assert_eq!(stack_names(&s), ["Cities", "Rivers", "Lakes", "~Depths", "Countries"]);
+    // Into a group's run: above the group.
+    s.run("map.setTiles", &json!({"name": "Depths", "to": 2})).unwrap();
+    assert_eq!(stack_names(&s), ["Cities", "~Depths", "Rivers", "Lakes", "Countries"]);
+    // The layer under it moves away, or goes: it stays where it was.
+    s.run("map.setTiles", &json!({"name": "Depths", "to": 4})).unwrap();
+    assert_eq!(stack_names(&s), ["Cities", "Rivers", "Lakes", "Countries", "~Depths"]);
+    s.run("map.setTiles", &json!({"name": "Depths", "to": 3})).unwrap();
+    s.run("layer.move", &json!({"layer": "Countries", "to": 0})).unwrap();
+    assert_eq!(stack_names(&s), ["Countries", "Cities", "Rivers", "Lakes", "~Depths"]);
+    s.run("map.setTiles", &json!({"name": "Depths", "to": 1})).unwrap();
+    assert_eq!(stack_names(&s), ["Countries", "~Depths", "Cities", "Rivers", "Lakes"]);
+    s.run("layer.remove", &json!({"layer": "Cities"})).unwrap();
+    assert_eq!(stack_names(&s), ["Countries", "~Depths", "Rivers", "Lakes"]);
+    s.undo();
+    assert_eq!(stack_names(&s), ["Countries", "~Depths", "Cities", "Rivers", "Lakes"]);
+    assert!(s.run("map.setTiles", &json!({"name": "Depths", "move": "sideways"})).is_err());
+    for bad in [json!({"to": -1}), json!({"to": "3"}), json!({"to": 1, "move": "up"})] {
+        let mut p = bad.clone();
+        p["name"] = json!("Depths");
+        assert!(s.run("map.setTiles", &p).is_err(), "{bad}");
+    }
+}
+
+/// A tile layer put into a group's run sits above the group, and stays there when the group is
+/// dissolved or a layer leaves it; the tile layers are listed in their drawing order (index 0
+/// on top) whatever moves them.
+#[test]
+fn tile_layers_keep_their_place_when_groups_change() {
+    let mut s = world();
+    s.run("map.addTiles", &json!({"url": "https://base.example.org/{z}/{x}/{y}.png", "name": "Streets"})).unwrap();
+    s.run("map.addTiles", &json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
+    s.run("group.add", &json!({"name": "Water", "layers": ["Rivers", "Lakes"]})).unwrap();
+    // Between Rivers and Lakes, inside the group's run.
+    s.run("map.setTiles", &json!({"name": "Depths", "to": 2})).unwrap();
+    assert_eq!(stack_names(&s), ["Cities", "~Depths", "Rivers", "Lakes", "Countries", "~Streets"]);
+    let group = s.map().groups[0].id;
+    s.run("group.ungroup", &json!({"group": group})).unwrap();
+    assert_eq!(stack_names(&s), ["Cities", "~Depths", "Rivers", "Lakes", "Countries", "~Streets"]);
+    s.undo();
+    s.run("layer.group", &json!({"layer": "Rivers", "group": null})).unwrap();
+    assert_eq!(stack_names(&s)[..2], ["Cities", "~Depths"]);
+    // The basemap goes under the overlay: the list follows the drawing order.
+    s.run("map.setTiles", &json!({"name": "Streets", "move": "top"})).unwrap();
+    let names: Vec<&str> = s.map().tiles.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["Streets", "Depths"]);
+    s.run("map.setTiles", &json!({"index": 0, "move": "bottom"})).unwrap();
+    let names: Vec<&str> = s.map().tiles.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["Depths", "Streets"]);
+}
+
+/// A layer placed on its own spot, or a group moved to where it is, leaves the tile layers over
+/// them in their places: only a move hands them to the layer below.
+#[test]
+fn tile_layers_stay_over_a_layer_or_group_that_stays() {
+    let mut s = world();
+    s.run("map.addTiles", &json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
+    s.run("map.setTiles", &json!({"name": "Depths", "to": 2})).unwrap();
+    let before = stack_names(&s);
+    assert_eq!(before, ["Cities", "Rivers", "~Depths", "Lakes", "Countries"]);
+    // Lakes placed just above Countries, where it is.
+    s.run("layer.group", &json!({"layer": "Lakes", "group": null, "before": "Countries"})).unwrap();
+    assert_eq!(stack_names(&s), before);
+    // A group of Lakes and Countries moved to its own place.
+    s.run("group.add", &json!({"name": "Water", "layers": ["Lakes", "Countries"]})).unwrap();
+    let grouped = stack_names(&s);
+    s.run("group.move", &json!({"group": "Water", "to": 2})).unwrap();
+    assert_eq!(stack_names(&s), grouped);
+    // Moved, the group hands the tile layer over its layers on to the next layer down that
+    // stays: none here, so it goes under all.
+    s.run("group.move", &json!({"group": "Water", "to": 0})).unwrap();
+    assert_eq!(stack_names(&s), ["Lakes", "Countries", "Cities", "Rivers", "~Depths"]);
+}
+
+/// Two tile layers with no catalog id (and so the same one) keep their own places and order when
+/// a move leaves the layers where they were.
+#[test]
+fn tile_layers_without_ids_keep_their_places_when_nothing_moves() {
+    let mut s = world();
+    for name in ["Upper", "Lower"] {
+        s.run("map.addTiles", &json!({"url": format!("https://{name}.example.org/{{z}}/{{x}}/{{y}}.png"), "name": name, "overlay": true}))
+            .unwrap();
+    }
+    // Upper over Lakes (the layer placed next, on its own spot), Lower over Countries.
+    s.run("map.setTiles", &json!({"name": "Upper", "to": 3})).unwrap();
+    s.run("map.setTiles", &json!({"name": "Lower", "to": 4})).unwrap();
+    for t in &mut s.map_mut().tiles {
+        t.id.clear();
+    }
+    let before = stack_names(&s);
+    assert_eq!(before, ["Cities", "Rivers", "~Upper", "Lakes", "~Lower", "Countries"]);
+    s.run("layer.group", &json!({"layer": "Lakes", "group": null, "before": "Countries"})).unwrap();
+    assert_eq!(stack_names(&s), before);
+}
+
+/// The tile layers' list follows the drawing order after a move that leaves the layers where
+/// they were, as after any other (map.tiles, the pop-ups and the AI Assistant read it).
+#[test]
+fn tile_layers_are_listed_in_drawing_order_after_a_move_in_place() {
+    let mut s = world();
+    // (`to` is the place among the other layers: the tile layer goes above the one there.)
+    for (i, (name, to)) in [("Over Countries", 3), ("Over Lakes", 2)].into_iter().enumerate() {
+        let url = format!("https://tiles{i}.example.org/{{z}}/{{x}}/{{y}}.png");
+        s.run("map.addTiles", &json!({"url": url, "name": name, "overlay": true})).unwrap();
+        s.run("map.setTiles", &json!({"name": name, "to": to})).unwrap();
+    }
+    // The list out of the drawing order (as a change to the groups, which re-seats the tile
+    // layers without sorting them, can leave it), then a layer placed where it is.
+    s.map_mut().tiles.reverse();
+    s.run("layer.group", &json!({"layer": "Countries", "group": null, "before": null})).unwrap();
+    let in_stack: Vec<String> = stack_names(&s).into_iter().filter_map(|n| n.strip_prefix('~').map(String::from)).collect();
+    let listed: Vec<String> = s.map().tiles.iter().map(|t| t.name.clone()).collect();
+    assert_eq!(listed, in_stack);
+}
+
+/// Two tile layers whose places merge in a move that leaves the layers where they are (a layer
+/// put in the group below it) keep the order they were drawn in, even with the list out of order
+/// before (as a change to the groups can leave it).
+#[test]
+fn tile_layers_keep_their_drawing_order_when_their_places_merge_in_place() {
+    let mut s = world();
+    for (i, (name, to)) in [("Over Rivers", 1), ("Over Lakes", 3)].into_iter().enumerate() {
+        let url = format!("https://tiles{i}.example.org/{{z}}/{{x}}/{{y}}.png");
+        s.run("map.addTiles", &json!({"url": url, "name": name, "overlay": true})).unwrap();
+        s.run("map.setTiles", &json!({"name": name, "to": to})).unwrap();
+    }
+    assert_eq!(stack_names(&s), ["Cities", "~Over Rivers", "Rivers", "~Over Lakes", "Lakes", "Countries"]);
+    s.run("group.add", &json!({"name": "Water", "layers": ["Lakes"]})).unwrap();
+    s.map_mut().tiles.reverse();
+    // Rivers joins the group, above Lakes, where it is: both tile layers now sit over it.
+    s.run("layer.group", &json!({"layer": "Rivers", "group": "Water", "before": "Lakes"})).unwrap();
+    assert_eq!(stack_names(&s), ["Cities", "~Over Rivers", "~Over Lakes", "Rivers", "Lakes", "Countries"]);
+}
+
+/// Layers sharing an id (a project may repeat one) are told apart by their places: a real move of
+/// one of them hands the tile layer over it on, as any move does.
+#[test]
+fn a_move_among_layers_sharing_an_id_still_hands_tile_layers_on() {
+    let mut s = world();
+    s.run("map.addTiles", &json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
+    s.run("map.setTiles", &json!({"name": "Depths", "to": 0})).unwrap();
+    assert_eq!(stack_names(&s), ["~Depths", "Cities", "Rivers", "Lakes", "Countries"]);
+    let m = s.map_mut();
+    let (x, lakes) = (m.layers[0].id, m.layers[2].id);
+    m.layers[1].id = x;
+    // Cities (the first with the id) goes above Lakes: the tile layer over it goes on to Lakes.
+    m.place_layer(x, None, Some(lakes)).unwrap();
+    assert_eq!(stack_names(&s), ["Rivers", "Cities", "~Depths", "Lakes", "Countries"]);
+}
+
+/// A tile layer over a group, after a move inside the group, stays over it when the group's
+/// bottom layer is taken out in place: its place is the group's top as it is, not the layer
+/// that was the top before the move.
+#[test]
+fn a_tile_layer_over_a_group_stays_when_its_bottom_layer_leaves_in_place() {
+    let mut s = world();
+    s.run("group.add", &json!({"name": "Water", "layers": ["Rivers", "Lakes"]})).unwrap();
+    s.run("map.addTiles", &json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
+    s.run("map.setTiles", &json!({"name": "Depths", "to": 1})).unwrap();
+    assert_eq!(stack_names(&s), ["Cities", "~Depths", "Rivers", "Lakes", "Countries"]);
+    s.run("layer.move", &json!({"layer": "Lakes", "to": 1})).unwrap();
+    assert_eq!(stack_names(&s), ["Cities", "~Depths", "Lakes", "Rivers", "Countries"]);
+    s.run("layer.group", &json!({"layer": "Rivers", "group": null, "before": "Countries"})).unwrap();
+    assert_eq!(stack_names(&s), ["Cities", "~Depths", "Lakes", "Rivers", "Countries"]);
+}
+
+/// A tile layer added as data (an archive, a GeoTIFF read in place) goes on top as an overlay
+/// does, without being one.
+#[test]
+fn a_tile_layer_added_as_data_goes_on_top() {
+    let mut s = world();
+    s.run("map.addTiles", &json!({"url": "https://data.example.org/{z}/{x}/{y}.png", "name": "Archive", "top": true})).unwrap();
+    assert_eq!(stack_names(&s)[0], "~Archive");
+    assert!(!s.map().tiles[0].overlay);
+}
+
+/// A project saved before tile layers had places draws them under its layers, as then; a place
+/// is saved and read back.
+#[test]
+fn a_saved_projects_tile_layers_keep_their_place() {
+    let mut s = world();
+    s.run("map.addTiles", &json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
+    s.run("map.setTiles", &json!({"name": "Depths", "to": 2})).unwrap();
+    let placed = stack_names(&s);
+    let mut v = serde_json::to_value(&s.project).unwrap();
+    let text = v.to_string();
+    let read = Session::new(Project::from_json(&text).unwrap());
+    assert_eq!(stack_names(&read), placed);
+    // Without `over`, as saved before: under every layer.
+    for t in v["maps"][0]["tiles"].as_array_mut().unwrap() {
+        t.as_object_mut().unwrap().remove("over");
+    }
+    let old = Session::new(Project::from_json(&v.to_string()).unwrap());
+    assert_eq!(stack_names(&old), ["Cities", "Rivers", "Lakes", "Countries", "~Depths"]);
 }
 
 #[test]
@@ -17451,6 +17842,261 @@ fn scans_have_no_coordinates_to_give_away() {
     s.run("raster.georeference", &json!({"layer": "flat", "extent": [10.0, 40.0, 12.0, 41.0]})).unwrap();
     assert!(s.run("share.exportRaster", &json!({"path": out.display().to_string()})).is_ok());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The PostGIS editing commands need a connection first, and a connection that isn't there fails
+/// as an error that never shows its password, leaving the session unconnected.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn postgis_tab_needs_a_connection() {
+    let mut s = Session::new(Project::default());
+    assert_eq!(s.run("pg.status", &json!({})).unwrap()["connected"], false);
+    for (id, p) in [("pg.tables", json!({})), ("pg.addLayer", json!({"table": "roads"})), ("pg.disconnect", json!({}))] {
+        let e = s.run(id, &p).unwrap_err();
+        assert!(e.contains("connect to a PostGIS database first"), "{id}: {e}");
+    }
+    let before = s.map().layers.len();
+    let e =
+        s.run("pg.connect", &json!({"host": "127.0.0.1", "port": 1, "database": "gis", "user": "me", "password": "s3cret"})).unwrap_err();
+    assert!(e.starts_with("gis: ") && !e.contains("s3cret"), "{e}");
+    let e = s.run("pg.connect", &json!({"connection": "postgresql://me:s3cret@127.0.0.1:1/gis"})).unwrap_err();
+    assert!(!e.contains("s3cret"), "{e}");
+    assert!(s.postgis.is_none());
+    assert_eq!(s.map().layers.len(), before);
+}
+
+/// A live PostGIS database through the PostGIS editing commands: `RUSTGIS_TEST_POSTGIS` names one
+/// (as for `postgis_live_end_to_end`) with a table that has an integer primary key.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore]
+fn postgis_tab_live() {
+    let Ok(dsn) = std::env::var("RUSTGIS_TEST_POSTGIS") else { return };
+    let mut s = Session::new(Project::default());
+    let dsn = dsn.trim_start_matches("postgres:").to_string();
+    let r = s.run("pg.connect", &json!({"connection": dsn})).unwrap();
+    assert_eq!(r["connected"], true);
+    assert_eq!(s.run("pg.status", &json!({})).unwrap()["connected"], true);
+    let listed = s.run("pg.tables", &json!({})).unwrap();
+    let names: Vec<String> = listed["tables"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).map(str::to_string).collect();
+    assert!(!names.is_empty());
+    // The first table with an integer key loads whole, every row with its version.
+    let r = names.iter().find_map(|n| s.run("pg.addLayer", &json!({"table": n, "limit": 500})).ok()).expect("a table with an integer key");
+    let id = r["layers"][0].as_u64().unwrap() as u32;
+    let l = s.map().layer(id).unwrap();
+    assert!(!l.is_streamed() && !l.dataset.features.is_empty());
+    let pg = l.postgis.as_ref().unwrap();
+    assert_eq!(pg.versions.len(), l.dataset.features.len());
+    assert!(l.dataset.features.iter().all(|f| pg.versions.get(f.id).is_some()));
+    // Saved with the project (never with a password), and read back.
+    let text = serde_json::to_string(l).unwrap();
+    assert!(text.contains("\"versions\"") && !text.contains("password"), "{}", &text[..text.len().min(400)]);
+    // A condition no row meets loads nothing, and a bad one is the server's error.
+    let table = l.postgis.as_ref().unwrap().origin.table.clone();
+    assert!(s.run("pg.addLayer", &json!({"table": table, "where": "1 = 1; DROP TABLE x"})).unwrap_err().contains("without ';'"));
+    assert!(s.run("pg.addLayer", &json!({"table": table, "where": "no_such_column > 1"})).is_err());
+    s.run("pg.disconnect", &json!({})).unwrap();
+    assert!(s.postgis.is_none());
+}
+
+/// A layer loaded from PostGIS knows what changed in it, and saving refuses what it can't do
+/// before it reaches a database: no edits, a user who can't write, a layer not from PostGIS.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn postgis_edits_are_counted_and_checked() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    use rustgis_map::source::{PostgisEdit, PostgisOrigin, RowVersion, row_hash};
+    let mut s = Session::new(Project::default());
+    let mut ds =
+        Dataset::new("roads", GeometryType::Point, vec![Field::new("id", FieldType::Integer), Field::new("name", FieldType::Text)]);
+    for (i, n) in ["a", "b", "c"].iter().enumerate() {
+        ds.push_next(Some(Geometry::Point(Coord { x: i as f64, y: 0.0 })), vec![Value::Int(i as i64 + 1), Value::Text(n.to_string())]);
+    }
+    let versions = ds.features.iter().map(|f| (f.id, RowVersion { version: 7, hash: row_hash(f) })).collect();
+    let id = crate::cmd::layer::add_dataset(&mut s, ds);
+    s.map_mut().layer_mut(id).unwrap().postgis = Some(PostgisEdit {
+        origin: PostgisOrigin {
+            database: "postgres:host=127.0.0.1 port=1 dbname=gis".into(),
+            table: "roads".into(),
+            family: None,
+            crs: None,
+        },
+        key: "id".into(),
+        srid: 4326,
+        writable: false,
+        condition: None,
+        limit: 0,
+        versions,
+    });
+    let p = json!({"layer": "roads"});
+    let r = s.run("pg.pendingEdits", &p).unwrap();
+    assert_eq!((r["inserts"].as_u64(), r["updates"].as_u64(), r["deletes"].as_u64()), (Some(0), Some(0), Some(0)), "{r}");
+    assert_eq!(s.run("pg.saveEdits", &p).unwrap()["saved"], false);
+    // An edit, a deletion and a new feature, counted as such.
+    s.map_mut().editing.settings.enabled = true;
+    s.run("edit.setValue", &json!({"layer": "roads", "row": 0, "field": "name", "value": "aa"})).unwrap();
+    s.run(
+        "edit.addFeature",
+        &json!({"layer": "roads", "geometry": {"type": "Point", "coordinates": [5, 5]}, "attributes": {"name": "new"}}),
+    )
+    .unwrap();
+    {
+        let l = s.map_mut().layer_mut(id).unwrap();
+        l.dataset.features.remove(1);
+        l.touch_geometry();
+    }
+    let r = s.run("pg.pendingEdits", &p).unwrap();
+    assert_eq!((r["inserts"].as_u64(), r["updates"].as_u64(), r["deletes"].as_u64()), (Some(1), Some(1), Some(1)), "{r}");
+    // A user who can't write saves nothing; nor does a database that isn't there.
+    let e = s.run("pg.saveEdits", &p).unwrap_err();
+    assert!(e.contains("can't insert, update or delete"), "{e}");
+    s.map_mut().layer_mut(id).unwrap().postgis.as_mut().unwrap().writable = true;
+    let e = s.run("pg.saveEdits", &p).unwrap_err();
+    assert!(e.starts_with("gis: "), "{e}");
+    assert!(s.run("pg.discardEdits", &p).is_err());
+    // The edits are still there to save.
+    assert_eq!(s.run("pg.pendingEdits", &p).unwrap()["updates"], 1);
+    // Back on rows a save wrote over (undone past it): its edits, new rows too, aren't written
+    // again, and no database is asked.
+    let read = s.map().layer(id).unwrap().postgis.as_ref().unwrap().versions.clone();
+    s.pg_saved_over.push(read.clone());
+    let e = s.run("pg.saveEdits", &p).unwrap_err();
+    assert!(e.contains("back before an edit saved to roads"), "{e}");
+    // Rows read again are a baseline of their own.
+    s.map_mut().layer_mut(id).unwrap().postgis.as_mut().unwrap().versions = read.iter().collect();
+    let e = s.run("pg.saveEdits", &p).unwrap_err();
+    assert!(e.starts_with("gis: "), "{e}");
+    s.pg_saved_over.clear();
+    // A layer not from PostGIS has no edits to save there.
+    crate::cmd::layer::add_dataset(&mut s, Dataset::new("plain", GeometryType::Point, Vec::new()));
+    let e = s.run("pg.saveEdits", &json!({"layer": "plain"})).unwrap_err();
+    assert!(e.contains("not a PostGIS layer loaded for editing"), "{e}");
+}
+
+/// Edits saved to a live PostGIS database and read back, and every conflict refused:
+/// `RUSTGIS_TEST_POSTGIS` names a database (`postgresql://…`) where the test may make and drop
+/// two tables of its own.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+#[ignore]
+fn postgis_edits_live() {
+    /// Drops the test's tables, however the test ends.
+    struct Cleanup(String, String, String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Ok(mut c) = postgres::Client::connect(&self.0, postgres::NoTls) {
+                let _ = c.batch_execute(&format!("DROP TABLE IF EXISTS public.{}; DROP TABLE IF EXISTS public.{}", self.1, self.2));
+            }
+        }
+    }
+    let Ok(url) = std::env::var("RUSTGIS_TEST_POSTGIS") else { return };
+    let url = url.trim_start_matches("postgres:").to_string();
+    let mut db = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let serial = format!("rustgis_edit_test_{}", std::process::id());
+    let keyed = format!("{serial}_k");
+    let _cleanup = Cleanup(url.clone(), serial.clone(), keyed.clone());
+    db.batch_execute(&format!(
+        "CREATE TABLE public.{serial} (id serial PRIMARY KEY, name text, pop numeric(12,3), geom geometry(Polygon, 3857));
+         INSERT INTO public.{serial} (name, pop, geom) VALUES
+           ('a', 12345.678, ST_Transform(ST_MakeEnvelope(10, 10, 10.1, 10.1, 4326), 3857)),
+           ('b', 1.001, ST_Transform(ST_MakeEnvelope(11, 10, 11.1, 10.1, 4326), 3857)),
+           ('c', 2.002, ST_Transform(ST_MakeEnvelope(12, 10, 12.1, 10.1, 4326), 3857));
+         CREATE TABLE public.{keyed} (id int PRIMARY KEY, name text, geom geometry(Point, 4326));
+         INSERT INTO public.{keyed} VALUES (1, 'one', ST_SetSRID(ST_MakePoint(1, 1), 4326)), (2, 'two', ST_SetSRID(ST_MakePoint(2, 2), 4326));"
+    ))
+    .unwrap();
+    let name_of = |db: &mut postgres::Client, id: i32| -> Option<String> {
+        db.query_opt(format!("SELECT name FROM public.{serial} WHERE id = $1").as_str(), &[&id]).unwrap().map(|r| r.get(0))
+    };
+
+    let mut s = Session::new(Project::default());
+    s.run("pg.connect", &json!({"connection": url})).unwrap();
+    let r = s.run("pg.addLayer", &json!({"table": format!("public.{serial}"), "name": "T"})).unwrap();
+    let id = r["layers"][0].as_u64().unwrap() as u32;
+    s.map_mut().editing.settings.enabled = true;
+    let row_of = |s: &Session, key: u64| s.map().layer(id).unwrap().dataset.features.iter().position(|f| f.id == key).unwrap();
+
+    // Rename row 1, delete row 3, add a polygon: saved in one go.
+    let r1 = row_of(&s, 1);
+    s.run("edit.setValue", &json!({"layer": "T", "row": r1, "field": "name", "value": "renamed"})).unwrap();
+    let r3 = row_of(&s, 3);
+    s.map_mut().layer_mut(id).unwrap().selection = vec![r3];
+    s.active_layer = Some(id);
+    s.run("edit.delete", &json!({})).unwrap();
+    s.run(
+        "edit.addFeature",
+        &json!({"layer": "T", "geometry": {"type": "Polygon", "coordinates": [[[13, 10], [13.1, 10], [13.1, 10.1], [13, 10.1], [13, 10]]]}, "attributes": {"name": "new", "pop": 4.5}}),
+    )
+    .unwrap();
+    let r = s.run("pg.saveEdits", &json!({"layer": "T"})).unwrap();
+    assert_eq!((r["inserted"].as_u64(), r["updated"].as_u64(), r["deleted"].as_u64()), (Some(1), Some(1), Some(1)), "{r}");
+    let new_key = r["keys"][0].as_i64().unwrap() as i32;
+    // Undone, the save isn't made again (its new row inserted twice); redone, it is the layer
+    // as saved.
+    assert!(s.undo());
+    let e = s.run("pg.saveEdits", &json!({"layer": "T"})).unwrap_err();
+    assert!(e.contains("back before an edit saved"), "{e}");
+    assert!(s.redo());
+    assert_eq!(s.run("pg.saveEdits", &json!({"layer": "T"})).unwrap()["saved"], false);
+    assert_eq!(name_of(&mut db, 1).as_deref(), Some("renamed"));
+    assert_eq!(name_of(&mut db, 3), None);
+    let row = db
+        .query_one(
+            format!(
+                "SELECT name, pop::text, ST_GeometryType(geom), ST_SRID(geom), round(ST_XMin(ST_Transform(geom, 4326))::numeric, 6)::text FROM public.{serial} WHERE id = $1"
+            )
+            .as_str(),
+            &[&new_key],
+        )
+        .unwrap();
+    assert_eq!(
+        (row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, i32>(3), row.get::<_, String>(4)),
+        ("new".into(), "4.500".into(), "ST_Polygon".into(), 3857, "13.000000".into())
+    );
+    // The numeric of a row whose name changed is as it was, to the last digit.
+    let pop: String = db.query_one(format!("SELECT pop::text FROM public.{serial} WHERE id = 1").as_str(), &[]).unwrap().get(0);
+    assert_eq!(pop, "12345.678");
+    // The new feature took its key; nothing is left to save.
+    assert!(s.map().layer(id).unwrap().dataset.features.iter().any(|f| f.id == new_key as u64));
+    let r = s.run("pg.pendingEdits", &json!({"layer": "T"})).unwrap();
+    assert_eq!((r["inserts"].as_u64(), r["updates"].as_u64(), r["deletes"].as_u64()), (Some(0), Some(0), Some(0)), "{r}");
+
+    // Someone else renames row 1 while it is edited here: nothing is saved.
+    db.execute(format!("UPDATE public.{serial} SET name = 'theirs' WHERE id = 1").as_str(), &[]).unwrap();
+    let r1 = row_of(&s, 1);
+    s.run("edit.setValue", &json!({"layer": "T", "row": r1, "field": "name", "value": "mine"})).unwrap();
+    let e = s.run("pg.saveEdits", &json!({"layer": "T"})).unwrap_err();
+    assert!(e.contains("row 1 was changed in the database"), "{e}");
+    assert_eq!(name_of(&mut db, 1).as_deref(), Some("theirs"));
+    // Discarded: the rows as they are now; and a row someone else changed that isn't edited here
+    // is no conflict.
+    s.run("pg.discardEdits", &json!({"layer": "T"})).unwrap();
+    db.execute(format!("UPDATE public.{serial} SET name = 'theirs too' WHERE id = 2").as_str(), &[]).unwrap();
+    let r1 = row_of(&s, 1);
+    assert_eq!(s.map().layer(id).unwrap().dataset.value(r1, 1), &rustgis_data::Value::Text("theirs".into()));
+    s.run("edit.setValue", &json!({"layer": "T", "row": r1, "field": "name", "value": "mine"})).unwrap();
+    assert_eq!(s.run("pg.saveEdits", &json!({"layer": "T"})).unwrap()["updated"], 1);
+    assert_eq!((name_of(&mut db, 1).as_deref(), name_of(&mut db, 2).as_deref()), (Some("mine"), Some("theirs too")));
+    // A row someone else deleted can't be saved.
+    db.execute(format!("DELETE FROM public.{serial} WHERE id = 1").as_str(), &[]).unwrap();
+    let r1 = row_of(&s, 1);
+    s.run("edit.setValue", &json!({"layer": "T", "row": r1, "field": "name", "value": "gone"})).unwrap();
+    let e = s.run("pg.saveEdits", &json!({"layer": "T"})).unwrap_err();
+    assert!(e.contains("row 1 was deleted from the database"), "{e}");
+
+    // A table without a default key: a new row's key is its key field, which must be free.
+    let r = s.run("pg.addLayer", &json!({"table": format!("public.{keyed}"), "name": "K"})).unwrap();
+    let kid = r["layers"][0].as_u64().unwrap() as u32;
+    let point = |id: i64, name: &str| json!({"layer": "K", "geometry": {"type": "Point", "coordinates": [3, 3]}, "attributes": {"id": id, "name": name}});
+    s.run("edit.addFeature", &point(2, "taken")).unwrap();
+    let e = s.run("pg.saveEdits", &json!({"layer": "K"})).unwrap_err();
+    assert!(e.contains("a row with key 2 is already in the database"), "{e}");
+    let rows = s.map().layer(kid).unwrap().dataset.features.len();
+    s.map_mut().layer_mut(kid).unwrap().dataset.features.truncate(rows - 1);
+    s.run("edit.addFeature", &point(7, "seven")).unwrap();
+    assert_eq!(s.run("pg.saveEdits", &json!({"layer": "K"})).unwrap()["keys"][0], 7);
+    let n: i64 = db.query_one(format!("SELECT count(*) FROM public.{keyed} WHERE id = 7 AND name = 'seven'").as_str(), &[]).unwrap().get(0);
+    assert_eq!(n, 1);
 }
 
 #[test]

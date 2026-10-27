@@ -3561,3 +3561,18 @@ Zoom: the map's zoom level, as web maps count it. Bearing: the direction the top
 ⌘+Enter	⌘+Enter
 ⌘K	⌘K
 ▶ Simulate	▶ Simulasikan
+Condition	Kondisi
+optional, such as population > 10000	opsional, misalnya population > 10000
+Most rows	Baris maksimum
+Most rows: a whole number	Baris maksimum: bilangan bulat
+{n} tables with geometry	{n} tabel dengan geometri
+Save a PostGIS layer's edits to its table, unless rows changed there since.	Simpan edit layer PostGIS ke tabelnya, kecuali ada baris yang sudah berubah di sana.
+Load a PostGIS layer's rows again as they are in the database, dropping its edits.	Muat ulang baris layer PostGIS sesuai isi database, dan buang editnya.
+Discard PostGIS Edits	Batalkan Edit PostGIS
+New rows	Baris baru
+Changed rows	Baris berubah
+Deleted rows	Baris terhapus
+Saves the layer's edits to its table in one transaction. When a row you changed or deleted was changed or deleted in the database since it was loaded, or a new row's key is taken, nothing is saved and the rows are listed.	Menyimpan edit layer ke tabelnya dalam satu transaksi. Jika baris yang Anda ubah atau hapus sudah diubah atau dihapus di database sejak dimuat, atau key baris baru sudah dipakai, tidak ada yang disimpan dan baris-baris itu ditampilkan.
+Loads the layer's rows again as they are in the database now. Its edits that weren't saved are dropped (Undo brings them back).	Memuat ulang baris layer sesuai isi database saat ini. Edit yang belum disimpan dibuang (Undo bisa mengembalikannya).
+Connect PostGIS	Hubungkan PostGIS
+Add PostGIS Layer	Tambah Layer PostGIS

@@ -1675,6 +1675,8 @@ mod tests {
                 other_label: None,
                 class_strokes: Default::default(),
                 other_strokes: Vec::new(),
+                class_fills: Default::default(),
+                other_fills: Vec::new(),
             };
         }
         // How far down the legend draws, in pixels.
@@ -1782,6 +1784,7 @@ mod tests {
                 classes: 0,
                 class_labels: Default::default(),
                 class_strokes: Default::default(),
+                class_fills: Default::default(),
             };
         }
         map.layers.retain(|l| l.id == pts);
