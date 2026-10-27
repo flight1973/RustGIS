@@ -47,7 +47,7 @@ The bugs users hit, the docs and a few quick wins: good first pull requests.
   ([#707](https://github.com/opengeos/RustGIS/issues/707)), Load Off-Map Data
   ([#661](https://github.com/opengeos/RustGIS/issues/661)).
 - A pass over the user guide, the comparison pages and the README against what the app does
-  today (no page says layout PDFs are pictures of each page; the built-in tool count), and short
+  today (no page says layout PDFs are pictures of each page), and short
   task tutorials for newcomers: buffer, select and export a list; edit a layer and save the
   result; a print layout _(open)_.
 
@@ -68,7 +68,7 @@ Correct, robust and recoverable, with the foundations other themes stand on.
 - Spatial Join by distance, closest, centre in and largest overlap, with merge rules (sum, mean,
   first…) for one-to-one joins ([#851](https://github.com/opengeos/RustGIS/issues/851)).
 - Vector tools, each writing a new layer: join field (a one-off attribute join), merge (append
-  layers), extract vertices, points along lines, check and fix geometry _(open)_; summary fields
+  layers), points along lines, check and fix geometry _(open)_; summary fields
   (sum, mean, first…) on Dissolve and Summarize Within _(open)_.
 - Batch runs: one tool over many layers or a folder of files.
 
@@ -220,11 +220,11 @@ Open questions rather than plans; discuss before building.
   templates, elevation, topology; domains, subtypes, attribute rules, contingent values,
   relationships, archiving.
 - Analysis: selection by attributes and location; polygon, lasso and radius on the map; overlay
-  (clip, erase, intersect), proximity (buffer) and summary tools, spatial join, zonal statistics,
-  A5 grids, kriging and Calculate Geometry with metric or imperial units; guided workflows
-  (viewshed, line of sight, IDW, shortest path, suitability); ModelBuilder on a node canvas,
-  scripts with command, parameter and value completion, and history copied as code; the GeoLibre
-  and Whitebox suite (1,000+ tools) natively and in the browser.
+  (clip, erase, intersect), proximity (buffer) and summary tools, spatial join, feature vertices to
+  points, zonal statistics, A5 grids, kriging and Calculate Geometry with metric or imperial units;
+  guided workflows (viewshed, line of sight, IDW, shortest path, suitability); ModelBuilder on a
+  node canvas, scripts with command, parameter and value completion, and history copied as code;
+  the GeoLibre and Whitebox suite (1,000+ tools) natively and in the browser.
 - Layouts (map frames, surrounds, map series, publication sheets and figures in one command,
   format panes, guides, snapping, element locking and PDF), reports, presentations and
   notebooks; the web app embeddable in a page (`?embed`).

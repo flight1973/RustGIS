@@ -78,7 +78,7 @@ written some other way (a token typed into a SQL query, say) can still be there:
 before sharing it. A point buffered where the
 map was clicked is copied as the command that buffered it, with the point.
 
-There are 22 built-in tools; GeoLibre and plugin tools join them when available.
+There are 23 built-in tools; GeoLibre and plugin tools join them when available.
 Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available tools and their parameters):
 
 | Tool | Id | Toolbox |
@@ -91,6 +91,7 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Dissolve | `dissolve` | Data Management › Generalization |
 | Minimum Bounding Geometry | `convexHull` | Data Management › Features |
 | Feature To Point | `featureToPoint` | Data Management › Features |
+| Feature Vertices To Points | `featureVerticesToPoints` | Data Management › Features |
 | XY Table To Point | `xyTableToPoint` | Data Management › Features |
 | Calculate Geometry Attributes | `calculateGeometry` | Data Management › Features |
 | Simplify | `simplify` | Cartography › Generalization |
@@ -135,6 +136,22 @@ complement. Edges follow the shortest geodesics between vertices. The output fie
 `area_km2`, `perimeter_km` and `length_km`; point coordinates are unchanged.
 Spatial Join's **Largest overlap** still measures area on a sphere of radius 6,371 km; it can
 differ from the ellipsoid by up to about 0.9 % (a small area near a pole).
+
+**Feature Vertices To Points** (`featureVerticesToPoints`) writes a point at each vertex of the
+`input` layer's features (a point layer's points are their own vertices, and a multipoint's points
+its parts), with its feature's attributes and four fields. `orig_fid` is the feature's OID, linking
+each point to its feature as ArcGIS's tool of the same name does. Three say where the point lies,
+named as in QGIS's Extract Vertices: `vertex_part` (the part of a multipart feature),
+`vertex_part_ring` (the polygon ring: 0 for the outer ring, and for lines and points) and
+`vertex_part_index` (the place along the part or ring, from 0). Unlike QGIS's tool, it doesn't
+write a polygon ring's closing point, which repeats its first. A new field whose name the input
+already has gets a suffix (`vertex_part_2`). The points keep the input's coordinate system. In the
+web app, the tool stops with a message if the browser can't give it the points' memory: select
+fewer features, or simplify ones with many vertices.
+
+```text
+gp.run={"tool":"featureVerticesToPoints","params":{"input":"Rivers","output":"river_vertices"}}
+```
 
 **IDW Interpolation** works like the QGIS tool of the same name: every point weighs on every
 cell by 1/distanceᴾ, where P is the distance coefficient (2 by default). Lines and polygons

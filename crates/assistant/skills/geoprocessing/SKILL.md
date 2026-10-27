@@ -14,8 +14,8 @@ Based on the RustGIS user guide, Analysis › Geoprocessing tools
    - overlay: `clip` (`input`, `clip`), `erase` (`input`, `erase`), `intersect` (`input`,
      `overlay`: the parts in each overlay polygon, with both layers' attributes)
    - generalization: `dissolve` (`input`, `field`), `simplify` (`input`, `tolerance`)
-   - geometry: `convexHull`, `featureToPoint`, `xyTableToPoint` (`input`, `x`, `y`, `crs`),
-     `calculateGeometry`
+   - geometry: `convexHull`, `featureToPoint`, `featureVerticesToPoints`, `xyTableToPoint`
+     (`input`, `x`, `y`, `crs`), `calculateGeometry`
    - selection: `selectByLocation` (`input`, `select`, `distance`, `invert`), `selectByAttributes`
      (`input`, `where`)
    - statistics: `countPoints` (Summarize Within: `polygons`, `points`), `summaryStatistics`
