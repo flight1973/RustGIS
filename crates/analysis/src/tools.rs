@@ -1084,9 +1084,9 @@ fn vertex_point_bytes(own: &[Value], width: usize) -> u64 {
         .saturating_add(allocations.saturating_mul(ALLOCATION_OVERHEAD))
 }
 
-/// The vertices of `feats` and, when `estimate`, the memory of their points (see
-/// [`vertex_point_bytes`]), each copying `kept` of its feature's attributes into `width`.
-fn count_vertex_points<'a>(
+/// How many points the vertices of `feats` make and, when `estimate`, the memory they take (see
+/// [`vertex_point_bytes`]), each point copying `kept` of its feature's attributes into `width`.
+fn size_vertex_points<'a>(
     feats: impl IntoIterator<Item = &'a rustgis_data::Feature>,
     kept: usize,
     width: usize,
@@ -1097,7 +1097,8 @@ fn count_vertex_points<'a>(
         let Some(g) = &f.geometry else { continue };
         let mut k = 0usize;
         g.for_each_vertex(|_, _| k += 1);
-        // Saturating: a selection restored from a project can repeat rows.
+        // Saturating, as sizes from input are. A row repeated in the selection (a project can
+        // restore one) is counted again, and its points are written twice.
         n = n.saturating_add(k);
         if estimate {
             let own = f.attrs.get(..kept).unwrap_or(&f.attrs);
@@ -1195,7 +1196,7 @@ fn feature_vertices_to_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, 
     // copy it and briefly hold it twice. In the browser, whose memory has a ceiling, the points'
     // memory is also estimated and asked for before anything is built.
     let web = cfg!(target_arch = "wasm32");
-    let (n, need) = count_vertex_points(feats(), kept, width, web);
+    let (n, need) = size_vertex_points(feats(), kept, width, web);
     check_room(n, need, web_has_room)?;
     // The point list and each point's attributes are allocated fallibly, so running out of memory
     // while they're built stops the tool with a message. (A desktop system that overcommits memory
@@ -2810,8 +2811,8 @@ mod tests {
         attrs.push(Value::Text("not copied".into()));
         let a = Feature { id: 1, geometry: Some(line), attrs };
         let b = Feature { id: 2, geometry: None, attrs: vec![] };
-        assert_eq!(count_vertex_points([&a, &b], 2, 6, false), (3, 0));
-        assert_eq!(count_vertex_points([&a, &b], 2, 6, true), (3, 3 * vertex_point_bytes(&own, 6)));
+        assert_eq!(size_vertex_points([&a, &b], 2, 6, false), (3, 0));
+        assert_eq!(size_vertex_points([&a, &b], 2, 6, true), (3, 3 * vertex_point_bytes(&own, 6)));
         // Refused when the memory isn't there, saying what the points would need.
         assert!(check_room(3, 1 << 20, |_| true).is_ok());
         let e = check_room(3, (1 << 20) + 1, |need| need < 1 << 20).unwrap_err();
