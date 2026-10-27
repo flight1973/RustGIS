@@ -167,6 +167,7 @@ fn a_saved_selection_is_read_in_range_in_order_and_once() {
     cities.selection = vec![last, 0, last, last + 1];
     s.run("offline.open", &json!({"name": "Paris"})).unwrap();
     let mut want = vec![0, last];
+    // Row 0 and the last row, once each: one row when the layer has a single feature.
     want.dedup();
     assert_eq!(s.map().layer_by_name("Cities").unwrap().selection, want);
 }

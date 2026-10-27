@@ -697,9 +697,9 @@ impl Layer {
         self.geometry_rev = self.geometry_rev.wrapping_add(1);
     }
 
-    /// Keeps the selection as selecting makes it: rows in range, in order, each once. A selection
-    /// read from a file is put this way too, or a row repeated in it would be counted, and run,
-    /// twice.
+    /// Puts the selection in range, in order and with each row once: the state selecting leaves
+    /// it in. A selection read from a file goes through this too, or a repeated row would be
+    /// counted, and run, twice.
     pub fn normalize_selection(&mut self) {
         let n = self.dataset.features.len();
         self.selection.retain(|r| *r < n);
