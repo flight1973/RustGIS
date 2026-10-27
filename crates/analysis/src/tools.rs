@@ -770,7 +770,7 @@ fn part(g: &Geometry, mask: &MultiPolygon<f64>, inside: bool) -> Option<Geometry
                 .iter()
                 .copied()
                 .filter(|c| {
-                    let m = rustgis_geom::lonlat_to_merc(*c);
+                    let m = rustgis_geom::lonlat_to_plane(*c);
                     mask.intersects(&geo::Point::new(m.x, m.y)) == inside
                 })
                 .collect();
@@ -1037,7 +1037,7 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         let Some(g) = &f.geometry else { continue };
         let mut these = Vec::new();
         g.for_each_coord(|c| {
-            let m = rustgis_geom::lonlat_to_merc(c);
+            let m = rustgis_geom::lonlat_to_plane(c);
             these.push(geo::Point::new(m.x, m.y));
         });
         if each {
@@ -1927,11 +1927,11 @@ impl Nearby<'_, '_> {
 
 /// A point (lon/lat) two intersecting features share: one of the points of either on the other;
 /// else a point of their overlap, when one is polygons; else a point where their edges meet. The
-/// geometries come with their Web Mercator forms, where the test and the overlay work.
+/// geometries come with their forms in the analysis plane, where the test and the overlay work.
 fn shared_point(a: &Geometry, a_geo: &geo::Geometry<f64>, b: &Geometry, b_geo: &geo::Geometry<f64>) -> Option<Coord> {
     use geo::LinesIter;
-    let back = |c: geo::Coord<f64>| rustgis_geom::merc_to_lonlat(Coord::new(c.x, c.y));
-    // Points answer with their own coordinates, not ones back from Web Mercator.
+    let back = |c: geo::Coord<f64>| rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y));
+    // Points answer with their own coordinates, not ones back from the plane.
     let point_on = |pts: &Geometry, other: &geo::Geometry<f64>| -> Option<Option<Coord>> {
         let pts: &[Coord] = match pts {
             Geometry::Point(c) => std::slice::from_ref(c),
@@ -1939,7 +1939,7 @@ fn shared_point(a: &Geometry, a_geo: &geo::Geometry<f64>, b: &Geometry, b_geo: &
             _ => return None,
         };
         Some(pts.iter().copied().find(|c| {
-            let m = rustgis_geom::lonlat_to_merc(*c);
+            let m = rustgis_geom::lonlat_to_plane(*c);
             other.intersects(&geo::Point::new(m.x, m.y))
         }))
     };

@@ -3,7 +3,7 @@
 //! Corrections. Every feature edit goes through [`apply`], which enforces the layer's design.
 
 use rustgis_data::{Feature, FieldType, Geometry, GeometryType, Value};
-use rustgis_geom::{Coord, lonlat_to_merc, merc_to_lonlat};
+use rustgis_geom::{Aeqd, Coord, MAX_LAT, lonlat_to_merc, lonlat_to_plane, merc_to_lonlat, plane_to_lonlat, spherical_centre};
 use rustgis_map::design::{
     AttributeRule, ContingentSet, Domain, DomainKind, Elevation, FeatureTemplate, Relationship, RuleKind, Subtype, Subtypes, TopologyRule,
 };
@@ -310,7 +310,12 @@ pub fn commands() -> Vec<C> {
             if !(dx.is_finite() && dy.is_finite()) || dx.abs() > 4e7 || dy.abs() > 4e7 {
                 return Err("dx and dy must be finite distances in the command's units (limit: 40,000 km per axis after ground-to-grid)".into());
             }
-            modify(s, |g| Some(g.map_coords(&|c: Coord| shift(c, dx, dy))))
+            modify(s, |g| {
+                if !within_mercator(g) {
+                    return polar_transform(g, |p| Coord::new(p.x + dx, p.y + dy)).map(Some);
+                }
+                Ok(Some(g.map_coords(&|c: Coord| shift(c, dx, dy))))
+            })
         })
         .when(need_editable_selection)
         .params(r#"{"dx": distance east, "dy": distance north, "units"?: "Meters" (default)|"Feet"|"Kilometers"|"Miles"}"#),
@@ -321,15 +326,18 @@ pub fn commands() -> Vec<C> {
                 // selection of points alone fails rather than recording an edit that changes
                 // nothing (and an undo step).
                 if matches!(g, Geometry::Point(_)) {
-                    return None;
+                    return Ok(None);
+                }
+                let (sin, cos) = (-deg.to_radians()).sin_cos();
+                if !within_mercator(g) {
+                    return polar_transform(g, |p| Coord::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos)).map(Some);
                 }
                 let c = lonlat_to_merc(g.extent().center());
-                let (sin, cos) = (-deg.to_radians()).sin_cos();
-                Some(g.map_coords(&|p: Coord| {
+                Ok(Some(g.map_coords(&|p: Coord| {
                     let m = lonlat_to_merc(p);
                     let (x, y) = (m.x - c.x, m.y - c.y);
                     merc_to_lonlat(Coord::new(c.x + x * cos - y * sin, c.y + x * sin + y * cos))
-                }))
+                })))
             })
         })
         .when(need_editable_selection)
@@ -339,21 +347,24 @@ pub fn commands() -> Vec<C> {
             modify(s, |g| {
                 // Any point, a feature's or a text graphic's, scales on itself: left out, as above.
                 if matches!(g, Geometry::Point(_)) {
-                    return None;
+                    return Ok(None);
+                }
+                if !within_mercator(g) {
+                    return polar_transform(g, |p| Coord::new(p.x * k, p.y * k)).map(Some);
                 }
                 let c = lonlat_to_merc(g.extent().center());
-                Some(g.map_coords(&|p: Coord| {
+                Ok(Some(g.map_coords(&|p: Coord| {
                     let m = lonlat_to_merc(p);
                     merc_to_lonlat(Coord::new(c.x + (m.x - c.x) * k, c.y + (m.y - c.y) * k))
-                }))
+                })))
             })
         })
         .when(need_editable_selection)
         .params(r#"{"factor": number}"#),
         C::new("edit.flip", "Flip Line", "Edit › Features › Modify", |s, _| {
             modify(s, |g| match g {
-                Geometry::Line(parts) => Some(Geometry::Line(parts.iter().rev().map(|p| p.iter().rev().copied().collect()).collect())),
-                _ => None,
+                Geometry::Line(parts) => Ok(Some(Geometry::Line(parts.iter().rev().map(|p| p.iter().rev().copied().collect()).collect()))),
+                _ => Ok(None),
             })
         })
         .when(need_editable_selection),
@@ -443,17 +454,52 @@ fn ground_to_grid(dx: f64, dy: f64, k: f64, rot_deg: f64) -> (f64, f64) {
     ((dx * cos - dy * sin) * k, (dx * sin + dy * cos) * k)
 }
 
+/// Whether every vertex of `g` lies within Web Mercator's square (±85.05°), where the modify tools
+/// work in Web Mercator as they always have.
+fn within_mercator(g: &Geometry) -> bool {
+    let e = g.extent();
+    e.min_y >= -MAX_LAT && e.max_y <= MAX_LAT
+}
+
+/// `g`, a feature reaching beyond Web Mercator's square, moved, turned or scaled rigidly in an
+/// azimuthal equidistant plane at its center, where `f` takes each vertex's meters east and north
+/// of the center (#1033). A feature that reaches a pole is refused: its rings go round the pole in
+/// a form (cut at ±180°, closed along ±90°) that moving the vertices one by one would break.
+fn polar_transform(g: &Geometry, f: impl Fn(Coord) -> Coord) -> Result<Geometry, String> {
+    // Each vertex once: a closed ring's repeated last point would pull the center toward its first.
+    let mut vertices = Vec::new();
+    g.for_each_vertex(|_, c| vertices.push(c));
+    if vertices.iter().any(|c| c.y.abs() >= 90.0 - 1e-9) {
+        return Err("a feature that reaches a pole can't be moved, rotated or scaled yet".into());
+    }
+    let center = spherical_centre(&vertices).ok_or("the feature has no center to move it about")?;
+    let plane = Aeqd::new(center);
+    Ok(g.map_coords(&|c: Coord| plane.inverse(f(plane.forward(c)))))
+}
+
 /// Applies a geometry change to every selected feature of every layer (in the selection's layers).
-fn modify(s: &mut Session, change: impl Fn(&Geometry) -> Option<Geometry>) -> CmdResult {
+/// Every change is worked out before any is made, so a feature that can't be changed (an error)
+/// leaves every layer as it was.
+fn modify(s: &mut Session, change: impl Fn(&Geometry) -> Result<Option<Geometry>, String>) -> CmdResult {
     let mut n = 0;
     let ids: Vec<u32> = s.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster()).map(|l| l.id).collect();
+    let mut plans = Vec::new();
     for id in ids {
+        let l = s.map().layer(id).ok_or("no such layer")?;
+        let mut new = Vec::new();
+        for &r in &l.selection {
+            let Some(g) = l.dataset.features.get(r).and_then(|f| f.geometry.as_ref()) else { continue };
+            let Some(g) = change(g)? else { continue };
+            super::edit::validate(&g)?;
+            new.push((r, g));
+        }
+        plans.push((id, new));
+    }
+    for (id, new) in plans {
         let mut changes = Vec::new();
         let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-        for r in l.selection.clone() {
+        for (r, g) in new {
             let Some(f) = l.dataset.features.get_mut(r) else { continue };
-            let Some(g) = f.geometry.as_ref().and_then(&change) else { continue };
-            super::edit::validate(&g)?;
             let before = f.clone();
             f.geometry = Some(g);
             changes.push(Change { before: Some(before), row: Some(r) });
@@ -622,20 +668,21 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     for r in l.selection.clone() {
         let Some(f) = l.dataset.features.get(r).cloned() else { continue };
         let Some(Geometry::Line(parts)) = &f.geometry else { continue };
-        // The nearest segment of the nearest part.
-        let m = lonlat_to_merc(at);
+        // The nearest segment of the nearest part, in the analysis plane (Web Mercator within
+        // ±85.05°, not clamped beyond it, #1033).
+        let m = lonlat_to_plane(at);
         let mut best: Option<(f64, usize, usize, Coord)> = None;
         for (pi, part) in parts.iter().enumerate() {
             for (si, w) in part.windows(2).enumerate() {
                 let (Some(a), Some(b2)) = (w.first(), w.get(1)) else { continue };
-                let (a, b2) = (lonlat_to_merc(*a), lonlat_to_merc(*b2));
+                let (a, b2) = (lonlat_to_plane(*a), lonlat_to_plane(*b2));
                 let (dx, dy) = (b2.x - a.x, b2.y - a.y);
                 let len2 = dx * dx + dy * dy;
                 let t = if len2 > 0.0 { (((m.x - a.x) * dx + (m.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
                 let q = Coord::new(a.x + t * dx, a.y + t * dy);
                 let d = (q.x - m.x).powi(2) + (q.y - m.y).powi(2);
                 if best.is_none_or(|b| d < b.0) {
-                    best = Some((d, pi, si, merc_to_lonlat(q)));
+                    best = Some((d, pi, si, plane_to_lonlat(q)));
                 }
             }
         }

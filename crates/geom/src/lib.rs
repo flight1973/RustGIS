@@ -159,6 +159,47 @@ pub fn merc_to_lonlat(c: Coord) -> Coord {
     Coord::new(lon, lat)
 }
 
+/// Web Mercator's northing at [`MAX_LAT`] north and south, each as [`lonlat_to_merc`] rounds it
+/// (the two differ by a rounding), and how fast it grows there (meters a radian of latitude,
+/// R·sec [`MAX_LAT`]): where [`lonlat_to_plane`] carries it on to the poles.
+static MERC_EDGE: LazyLock<(f64, f64, f64)> = LazyLock::new(|| {
+    let edge = |lat: f64| lonlat_to_merc(Coord::new(0.0, lat)).y;
+    (edge(MAX_LAT), edge(-MAX_LAT), MERCATOR_R / MAX_LAT.to_radians().cos())
+});
+
+/// Longitude/latitude (degrees) → the plane the analysis tools work in (meters): Web Mercator
+/// within ±[`MAX_LAT`], exactly as [`lonlat_to_merc`] gives it, and beyond, where Web Mercator
+/// stops, continued straight in latitude at the rate it reaches there, so the two meet smoothly and
+/// the poles lie at ±26,424 km. Nothing is clamped, so a polar feature keeps its shape through an
+/// overlay; beyond 85.05° edges are straight in longitude and latitude, as the map draws them.
+pub fn lonlat_to_plane(c: Coord) -> Coord {
+    let lat = c.y.clamp(-90.0, 90.0);
+    // False for NaN, which then stays NaN below.
+    if lat.abs() <= MAX_LAT {
+        return lonlat_to_merc(c);
+    }
+    let (north, south, rate) = *MERC_EDGE;
+    let beyond = (lat.abs() - MAX_LAT).to_radians() * rate;
+    Coord::new(MERCATOR_R * c.x.to_radians(), if lat > 0.0 { north + beyond } else { south - beyond })
+}
+
+/// The analysis plane's meters → longitude/latitude (degrees), undoing [`lonlat_to_plane`]:
+/// [`merc_to_lonlat`] within Web Mercator's square, and beyond it back along the continuation, to
+/// ±90° at most.
+pub fn plane_to_lonlat(p: Coord) -> Coord {
+    let (north, south, rate) = *MERC_EDGE;
+    let beyond = if p.y > north {
+        p.y - north
+    } else if p.y < south {
+        south - p.y
+    } else {
+        // Within the square, or NaN, which merc_to_lonlat keeps NaN.
+        return merc_to_lonlat(p);
+    };
+    let lat = (MAX_LAT + (beyond / rate).to_degrees()).min(90.0);
+    Coord::new((p.x / MERCATOR_R).to_degrees(), lat.copysign(p.y))
+}
+
 /// Projects a lon/lat extent to Web Mercator.
 pub fn extent_to_merc(e: &Extent) -> Extent {
     if e.is_empty() {
@@ -477,6 +518,43 @@ mod tests {
         assert!((geodesic_interpolate(Coord::new(179.0, 0.0), Coord::new(-179.0, 0.0), 0.5).x - 180.0).abs() < 1e-9);
         assert_eq!(spherical_centre(&[Coord::new(179.0, 0.0), Coord::new(-179.0, 0.0)]).map(|c| c.x.abs().round()), Some(180.0));
         assert!(spherical_centre(&[]).is_none());
+    }
+
+    #[test]
+    fn the_analysis_plane_is_web_mercator_within_its_square_and_reaches_the_poles() {
+        // Within ±MAX_LAT, to the bit what the tools used before, both ways, longitudes past ±180 too.
+        for i in -40..=40 {
+            let lat = MAX_LAT * f64::from(i) / 40.0;
+            for lon in [-540.0, -180.0, -0.5, 0.0, 33.3, 179.999, 180.0, 541.25] {
+                let c = Coord::new(lon, lat);
+                let (m, p) = (lonlat_to_merc(c), lonlat_to_plane(c));
+                assert!(m.x.to_bits() == p.x.to_bits() && m.y.to_bits() == p.y.to_bits(), "{c:?}");
+                let (a, b) = (merc_to_lonlat(m), plane_to_lonlat(m));
+                assert!(a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits(), "{c:?}");
+            }
+        }
+        // Beyond, nothing is clamped: latitude climbs on to the poles, about 26,424 km out, meeting
+        // Web Mercator at its edge with the same slope (R·sec 85.05° a radian), and comes back.
+        let y = |lat: f64| lonlat_to_plane(Coord::new(10.0, lat)).y;
+        assert!((y(90.0) - 26_423_921.0).abs() < 1e3 && (y(-90.0) + y(90.0)).abs() < 1e-6, "{}", y(90.0));
+        let h = 1e-6;
+        let (below, above) = ((y(MAX_LAT) - y(MAX_LAT - h)) / h, (y(MAX_LAT + h) - y(MAX_LAT)) / h);
+        assert!((above / below - 1.0).abs() < 1e-5, "{below} {above}");
+        let mut last = y(MAX_LAT);
+        for i in 1..=100 {
+            let lat = MAX_LAT + (90.0 - MAX_LAT) * f64::from(i) / 100.0;
+            assert!(y(lat) > last, "{lat}");
+            last = y(lat);
+            for sign in [1.0, -1.0] {
+                let back = plane_to_lonlat(lonlat_to_plane(Coord::new(-170.25, sign * lat)));
+                assert!((back.y - sign * lat).abs() < 1e-9 && (back.x + 170.25).abs() < 1e-12, "{lat}: {back:?}");
+            }
+        }
+        // Junk stays junk or lands on a pole, never panics or goes past one.
+        assert!(lonlat_to_plane(Coord::new(0.0, f64::NAN)).y.is_nan() && plane_to_lonlat(Coord::new(0.0, f64::NAN)).y.is_nan());
+        assert_eq!(lonlat_to_plane(Coord::new(0.0, f64::INFINITY)).y, y(90.0));
+        assert_eq!(lonlat_to_plane(Coord::new(0.0, -1e300)).y, y(-90.0));
+        assert_eq!((plane_to_lonlat(Coord::new(0.0, 1e300)).y, plane_to_lonlat(Coord::new(0.0, f64::NEG_INFINITY)).y), (90.0, -90.0));
     }
 
     #[test]

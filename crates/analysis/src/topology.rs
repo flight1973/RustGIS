@@ -3,7 +3,7 @@
 
 use geo::{Area, BooleanOps, BoundingRect, Contains, Intersects, Orient, orient::Direction};
 use rustgis_data::{Dataset, Geometry};
-use rustgis_geom::{Coord, lonlat_to_merc, merc_to_lonlat};
+use rustgis_geom::{Coord, lonlat_to_plane, plane_to_lonlat};
 
 use crate::convert::{from_multipolygon, to_multipolygon};
 
@@ -85,7 +85,7 @@ fn polygons(ds: &Dataset, rows: &[usize]) -> Vec<(usize, geo::MultiPolygon<f64>,
 
 fn centre(mp: &geo::MultiPolygon<f64>) -> Coord {
     use geo::InteriorPoint;
-    mp.interior_point().map(|p| merc_to_lonlat(Coord::new(p.x(), p.y()))).unwrap_or_default()
+    mp.interior_point().map(|p| plane_to_lonlat(Coord::new(p.x(), p.y()))).unwrap_or_default()
 }
 
 fn rects_touch(a: &geo::Rect<f64>, b: &geo::Rect<f64>) -> bool {
@@ -205,9 +205,9 @@ pub fn self_intersections(ds: &Dataset, rows: &[usize]) -> Checked {
             _ => Vec::new(),
         };
         for (p, closed) in paths {
-            let m: Vec<Coord> = p.iter().map(|c| lonlat_to_merc(*c)).collect();
+            let m: Vec<Coord> = p.iter().map(|c| lonlat_to_plane(*c)).collect();
             if let Some(c) = self_crossing(&m, closed) {
-                out.push(TopologyError { rows: vec![*r], at: merc_to_lonlat(c) });
+                out.push(TopologyError { rows: vec![*r], at: plane_to_lonlat(c) });
                 break;
             }
         }
@@ -224,7 +224,7 @@ pub fn dangles(ds: &Dataset, rows: &[usize], tol_m: f64) -> Checked {
     let lines: Vec<(usize, Vec<Vec<Coord>>)> = rows
         .iter()
         .filter_map(|r| match ds.features.get(*r)?.geometry.as_ref()? {
-            Geometry::Line(parts) => Some((*r, parts.iter().map(|p| p.iter().map(|c| lonlat_to_merc(*c)).collect()).collect())),
+            Geometry::Line(parts) => Some((*r, parts.iter().map(|p| p.iter().map(|c| lonlat_to_plane(*c)).collect()).collect())),
             _ => None,
         })
         .collect();
@@ -269,7 +269,7 @@ pub fn dangles(ds: &Dataset, rows: &[usize], tol_m: f64) -> Checked {
                 continue;
             }
             for end in [part.first(), part.last()].into_iter().flatten() {
-                let tol = tol_m / merc_to_lonlat(*end).y.to_radians().cos().max(0.01);
+                let tol = tol_m / plane_to_lonlat(*end).y.to_radians().cos().max(0.01);
                 let near = grid.get(&key(end.x, end.y)).map(Vec::as_slice).unwrap_or(&[]);
                 // The end's own part counts too, past the stretch next to the end (a line curling
                 // back onto itself, like a 6, doesn't dangle there).
@@ -288,7 +288,7 @@ pub fn dangles(ds: &Dataset, rows: &[usize], tol_m: f64) -> Checked {
                     return Checked::partial(out);
                 }
                 if !touches {
-                    out.push(TopologyError { rows: vec![*r], at: merc_to_lonlat(*end) });
+                    out.push(TopologyError { rows: vec![*r], at: plane_to_lonlat(*end) });
                 }
             }
         }
@@ -326,7 +326,7 @@ pub fn not_covered(ds: &Dataset, rows: &[usize], by: &Dataset) -> Checked {
             _ => continue,
         };
         for c in pts {
-            let m = lonlat_to_merc(c);
+            let m = lonlat_to_plane(c);
             let p = geo::Point::new(m.x, m.y);
             if !polys.iter().any(|(_, mp, bb)| rects_touch(bb, &geo::Rect::new(p.0, p.0)) && mp.contains(&p)) {
                 out.push(TopologyError { rows: vec![*r], at: c });

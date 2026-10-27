@@ -1,16 +1,18 @@
-//! Conversions between RustGIS geometry and `geo` types (in Web Mercator metres).
+//! Conversions between RustGIS geometry and `geo` types, in the analysis plane
+//! ([`rustgis_geom::lonlat_to_plane`]): Web Mercator meters within ±85.05°, carried on to the poles
+//! beyond, so polar geometry isn't clamped onto 85.05° (#1033).
 
 use geo::{Coord as GC, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use rustgis_data::Geometry;
-use rustgis_geom::{Coord, lonlat_to_merc, merc_to_lonlat};
+use rustgis_geom::{Coord, lonlat_to_plane, plane_to_lonlat};
 
 fn gc(c: Coord) -> GC<f64> {
-    let m = lonlat_to_merc(c);
+    let m = lonlat_to_plane(c);
     GC { x: m.x, y: m.y }
 }
 
 fn back(c: &GC<f64>) -> Coord {
-    merc_to_lonlat(Coord::new(c.x, c.y))
+    plane_to_lonlat(Coord::new(c.x, c.y))
 }
 
 pub fn ring(r: &[Coord]) -> LineString<f64> {

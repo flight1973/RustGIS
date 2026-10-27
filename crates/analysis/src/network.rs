@@ -363,8 +363,12 @@ pub fn radius_boundary_point(at: Coord, radius_m: f64, angle_rad: f64) -> Option
 
 /// Rows of `ds` whose geometry comes within `radius_m` of a point, with their distances.
 pub fn within(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> Vec<(usize, f64)> {
+    use rustgis_geom::MAX_LAT;
     let m = rustgis_geom::lonlat_to_merc(at);
     let k = radius_scale(at);
+    // Web Mercator ends at 85.05°: where the point or a shape is beyond it, the distance is
+    // measured on the ground, in an azimuthal equidistant plane centered on the point (#1033).
+    let ground = rustgis_geom::Aeqd::new(at);
     let mut out: Vec<(usize, f64)> = rows
         .iter()
         .filter_map(|r| {
@@ -372,6 +376,16 @@ pub fn within(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> Vec<(us
             // Skip shapes whose box is farther than the radius before projecting them.
             let e = g.extent();
             let dlat = radius_m / 111_320.0;
+            if at.y.abs() > MAX_LAT || e.min_y < -MAX_LAT || e.max_y > MAX_LAT {
+                // Near a pole only latitude bounds the reach: longitudes converge there.
+                if at.y < e.min_y - dlat || at.y > e.max_y + dlat {
+                    return None;
+                }
+                let pg = g.map_coords(&|c| ground.forward(c));
+                let origin = Coord::new(0.0, 0.0);
+                let d = if pg.hit(origin, 0.0) { 0.0 } else { pg_dist(&pg, origin) };
+                return (d <= radius_m).then_some((*r, d));
+            }
             let dlon = dlat * k;
             if at.x < e.min_x - dlon || at.x > e.max_x + dlon || at.y < e.min_y - dlat || at.y > e.max_y + dlat {
                 return None;
