@@ -687,8 +687,12 @@ impl Project {
                         log::warn!("{}: {e}", l.name);
                     }
                 }
+                // A saved selection is read as selecting makes one: in range, in order, each row
+                // once. A row repeated in the file would otherwise be counted, and run, twice.
                 let n = l.dataset.features.len();
                 l.selection.retain(|r| *r < n);
+                l.selection.sort_unstable();
+                l.selection.dedup();
                 let fields = l.dataset.fields.len();
                 for f in &mut l.dataset.features {
                     f.attrs.resize(fields, rustgis_data::Value::Null);
