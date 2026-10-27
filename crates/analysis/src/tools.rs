@@ -2647,11 +2647,10 @@ mod tests {
     #[test]
     fn feature_vertices_to_points_estimates_and_asks_for_memory() {
         let own = [Value::Text("abc".into()), Value::Int(1)];
-        // On a 64-bit target: the row (64 B), the map's projected geometry and extent (32 + 32 B),
-        // 6 values (6 × 24 B), the text (3 B) and two allocations (2 × 16 B).
-        if cfg!(target_pointer_width = "64") {
-            assert_eq!(vertex_point_bytes(&own, 6), 64 + 32 + 32 + 6 * 24 + 3 + 2 * 16);
-        }
+        // The row, the map's projected geometry and extent, 6 values, the text (3 B) and two
+        // allocations (2 × 16 B).
+        let fixed = size_of::<rustgis_data::Feature>() + size_of::<Option<Geometry>>() + size_of::<Extent>();
+        assert_eq!(vertex_point_bytes(&own, 6), u64::try_from(fixed + 6 * size_of::<Value>() + 3 + 2 * 16).unwrap());
         // An empty text allocates nothing, so it costs what a null does.
         assert_eq!(vertex_point_bytes(&[Value::Text(String::new())], 6), vertex_point_bytes(&[Value::Null], 6));
         // Every vertex is counted; the memory only when asked, for the attributes copied.

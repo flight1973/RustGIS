@@ -242,27 +242,44 @@ fn open_len(path: &[Coord], ring: bool) -> usize {
 }
 
 impl Geometry {
-    /// The paths vertices lie on, with their part and ring and whether each is a polygon ring.
-    fn paths(&self) -> Vec<(usize, usize, &[Coord], bool)> {
+    /// Calls `f` with each path vertices lie on: its part and ring, and whether it is a polygon
+    /// ring. Nothing is allocated, so a geometry of many parts costs no memory to walk.
+    fn for_each_path(&self, mut f: impl FnMut(usize, usize, &[Coord], bool)) {
         match self {
-            Geometry::Point(c) => vec![(0, 0, std::slice::from_ref(c), false)],
-            Geometry::MultiPoint(v) => vec![(0, 0, v.as_slice(), false)],
-            Geometry::Line(parts) => parts.iter().enumerate().map(|(i, p)| (i, 0, p.as_slice(), false)).collect(),
-            Geometry::Polygon(polys) => polys
-                .iter()
-                .enumerate()
-                .flat_map(|(i, rings)| rings.iter().enumerate().map(move |(j, r)| (i, j, r.as_slice(), true)))
-                .collect(),
+            Geometry::Point(c) => f(0, 0, std::slice::from_ref(c), false),
+            Geometry::MultiPoint(v) => f(0, 0, v.as_slice(), false),
+            Geometry::Line(parts) => {
+                for (i, p) in parts.iter().enumerate() {
+                    f(i, 0, p.as_slice(), false);
+                }
+            }
+            Geometry::Polygon(polys) => {
+                for (i, rings) in polys.iter().enumerate() {
+                    for (j, r) in rings.iter().enumerate() {
+                        f(i, j, r.as_slice(), true);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The path a vertex lies on, and whether it is a polygon ring.
+    fn path(&self, part: usize, ring: usize) -> Option<(&[Coord], bool)> {
+        match self {
+            Geometry::Point(c) => (part == 0 && ring == 0).then_some((std::slice::from_ref(c), false)),
+            Geometry::MultiPoint(v) => (part == 0 && ring == 0).then_some((v.as_slice(), false)),
+            Geometry::Line(parts) => parts.get(part).filter(|_| ring == 0).map(|p| (p.as_slice(), false)),
+            Geometry::Polygon(polys) => polys.get(part).and_then(|rings| rings.get(ring)).map(|r| (r.as_slice(), true)),
         }
     }
 
     /// Calls `f` with every vertex, a closed ring's repeated last point left out.
     pub fn for_each_vertex(&self, mut f: impl FnMut(VertexId, Coord)) {
-        for (part, ring, path, closed) in self.paths() {
+        self.for_each_path(|part, ring, path, closed| {
             for (index, c) in path.iter().take(open_len(path, closed)).enumerate() {
                 f(VertexId { part, ring, index }, *c);
             }
-        }
+        });
     }
 
     /// Every vertex, a closed ring's repeated last point left out.
@@ -279,7 +296,7 @@ impl Geometry {
         if matches!(self, Geometry::Point(_) | Geometry::MultiPoint(_)) {
             return;
         }
-        for (part, ring, path, closed) in self.paths() {
+        self.for_each_path(|part, ring, path, closed| {
             let n = open_len(path, closed);
             let count = if closed && n > 2 { n } else { n.saturating_sub(1) };
             for index in 0..count {
@@ -287,7 +304,7 @@ impl Geometry {
                     f(VertexId { part, ring, index }, *a, *b);
                 }
             }
-        }
+        });
     }
 
     /// Every edge of a line or polygon (see [`Geometry::for_each_edge`]).
@@ -299,7 +316,7 @@ impl Geometry {
 
     /// The vertex's position, if it has one.
     pub fn vertex(&self, v: VertexId) -> Option<Coord> {
-        let (_, _, path, closed) = self.paths().into_iter().find(|p| p.0 == v.part && p.1 == v.ring)?;
+        let (path, closed) = self.path(v.part, v.ring)?;
         (v.index < open_len(path, closed)).then(|| path.get(v.index).copied()).flatten()
     }
 
