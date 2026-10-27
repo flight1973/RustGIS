@@ -341,7 +341,7 @@ fn read_style_node(node: Node, layer: &str, report: &mut Report) -> Style {
     if let Some(l) = child(node, "labeling") {
         // Set up but switched off: carried over, switched off.
         let off = node.attribute("labelsEnabled") == Some("0");
-        style.labels = labels::read(l, layer, report).map(|mut l| {
+        style.labels = labels::read(l, node.attribute("geometry"), layer, report).map(|mut l| {
             l.enabled &= !off;
             l
         });

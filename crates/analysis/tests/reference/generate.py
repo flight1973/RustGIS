@@ -235,13 +235,27 @@ def main():
     # Intersect: each input feature's part in each zone, keyed by both ids ("P1|Z1"), in input
     # order, then zone order. Parts that only touch (a shared edge or corner) are left out. The
     # zones' `id` is taken by the parcels', so it comes out as `id_2`.
-    def pieces(name, rows, part):
-        out = []
+    # Identity adds each input feature's part outside the zones it has a part in, keyed "P1|" (no
+    # zone id); Union adds each zone's part outside the parcels that have a part in it, "|Z1".
+    def pieces(name, rows, part, rest=False, zone_rest=False):
+        out, covering = [], {zi: [] for zi, _ in ZONES}
         for i, g in rows:
+            hit = []
             for zi, z in ZONES:
                 r = part(m(g).intersection(m(z)))
                 if r is not None and not r.is_empty:
                     out.append((f"{i}|{zi}", ll(r)))
+                    hit.append(m(z))
+                    covering[zi].append(m(g))
+            if rest:
+                r = part(m(g).difference(unary_union(hit))) if hit else m(g)
+                if r is not None and not r.is_empty:
+                    out.append((f"{i}|", ll(r)))
+        if zone_rest:
+            for zi, z in ZONES:
+                r = polygonal(m(z).difference(unary_union(covering[zi]))) if covering[zi] else m(z)
+                if r is not None and not r.is_empty:
+                    out.append((f"|{zi}", ll(r)))
         return write_expected(name, out)
 
     both = ["id", "id_2"]
@@ -251,6 +265,17 @@ def main():
          {"features": pieces("intersect_roads", ROADS, linear), "key": both})
     case("intersect points", "intersect", {"input": "points", "overlay": "zones"},
          {"ids": [f"{i}|{zi}" for i, g in POINTS for zi, z in ZONES if m(z).intersects(m(g))], "key": both})
+    case("identity polygons", "identity", {"input": "parcels", "overlay": "zones"},
+         {"features": pieces("identity_parcels", parcels, polygonal, rest=True), "key": both})
+    case("identity lines", "identity", {"input": "roads", "overlay": "zones"},
+         {"features": pieces("identity_roads", ROADS, linear, rest=True), "key": both})
+    ids = []
+    for i, g in POINTS:
+        hits = [f"{i}|{zi}" for zi, z in ZONES if m(z).intersects(m(g))]
+        ids += hits or [f"{i}|"]
+    case("identity points", "identity", {"input": "points", "overlay": "zones"}, {"ids": ids, "key": both})
+    case("union", "union", {"input": "parcels", "overlay": "zones"},
+         {"features": pieces("union_parcels", parcels, polygonal, rest=True, zone_rest=True), "key": both})
 
     # Dissolve: one feature per code, the union of its parcels.
     codes = sorted({c for _, c, _ in PARCELS})

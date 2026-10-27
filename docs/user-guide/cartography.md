@@ -314,6 +314,20 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   too. The width and the spacing grow with the labels at a reference scale
   (`labels.style={"layer": "Rivers", "haloColor": "#FFFFFF", "haloWidth": 1.4, "spacing": 0.5}`;
   `"haloColor": ""` and `"haloWidth": null` go back to the automatic colour and the thin halo).
+- **Background**: a rectangle behind the text (Labeling pane › Symbol › **Background**), white
+  with a thin dark outline when turned on: its **Fill** and **Outline** (each can be none), the
+  outline's width, its padding across and up and down (how far it reaches past the text, 0–50
+  points) and its **Corner radius**. Other labels keep off it as they keep off a halo, and it
+  turns with a label along a line; a label curved along a line, character by character, has
+  none. Its sizes grow with the labels at a reference scale
+  (`labels.style={"layer": "Roads", "background": {"fill": "#FFFFFF", "stroke": "#262626", "strokeWidth": 0.3, "padding": [1.2, 0.3], "radius": 0.7}}`;
+  `"background": true` turns on the default one, `false` takes it away, and what an object leaves
+  out is kept).
+- **Offset**: a label moved from where its position puts it, right and down in points
+  (Labeling pane › Position › **Offset right**, **Offset down**, −200 to 200; negative moves it
+  left or up), growing with the labels at a reference scale. A label along a line isn't moved
+  (`labels.placement={"layer": "Cities", "position": "aboveRight", "offset": [5.7, -2.8]}`; an
+  offset can be given without a position).
 - **Font**: the labels' font family, any installed on the computer (Labeling pane › Symbol
   › **Font**; type part of a name to find it), or the label font the interface uses. Bold and
   italic take the family's own bold and italic faces where it has them. The family is saved by

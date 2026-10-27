@@ -12,7 +12,9 @@ Based on the RustGIS user guide, Analysis › Geoprocessing tools
    `describe_tool` for its parameters. Never guess parameter names. The built-in tools are:
    - proximity: `buffer` (`input`, `distance`, `units`, `dissolve`)
    - overlay: `clip` (`input`, `clip`), `erase` (`input`, `erase`), `intersect` (`input`,
-     `overlay`: the parts in each overlay polygon, with both layers' attributes)
+     `overlay`: the parts in each overlay polygon, with both layers' attributes), `identity`
+     (the same, plus the parts outside every overlay polygon), `union` (both polygon layers:
+     every piece either covers)
    - generalization: `dissolve` (`input`, `field`), `simplify` (`input`, `tolerance`)
    - geometry: `convexHull`, `featureToPoint`, `featureVerticesToPoints`, `xyTableToPoint`
      (`input`, `x`, `y`, `crs`), `calculateGeometry`

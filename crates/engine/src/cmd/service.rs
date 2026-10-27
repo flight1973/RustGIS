@@ -382,7 +382,14 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
                 Some(t) => template.replace("{Time}", t),
                 None => template.to_string(),
             };
-            let r = super::tiles::add(s, &json!({"url": template, "kind": "raster", "name": name, "overlay": true, "bounds": layer.bbox}))?;
+            // With its legends, as its service gives them (none: no key, as before).
+            let mut add = json!({"url": template, "kind": "raster", "name": name, "overlay": true, "bounds": layer.bbox});
+            // (Those the layer wouldn't keep, an address too long, are left out, not refused.)
+            let legends = rustgis_map::tiles::checked_legends(layer.legends.iter().cloned());
+            if !legends.is_empty() {
+                add["legend"] = json!(legends);
+            }
+            let r = super::tiles::add(s, &add)?;
             // A WMS layer's GetFeatureInfo request, for identify.
             let added = r["index"].as_u64().and_then(|i| usize::try_from(i).ok());
             if let Some(t) = added.and_then(|i| s.map_mut().tiles.get_mut(i)) {

@@ -106,6 +106,78 @@
    }
   },
   {
+   "name": "identity polygons",
+   "tool": "identity",
+   "params": {
+    "input": "parcels",
+    "overlay": "zones"
+   },
+   "expect": {
+    "features": "expected/identity_parcels.geojson",
+    "key": [
+     "id",
+     "id_2"
+    ]
+   }
+  },
+  {
+   "name": "identity lines",
+   "tool": "identity",
+   "params": {
+    "input": "roads",
+    "overlay": "zones"
+   },
+   "expect": {
+    "features": "expected/identity_roads.geojson",
+    "key": [
+     "id",
+     "id_2"
+    ]
+   }
+  },
+  {
+   "name": "identity points",
+   "tool": "identity",
+   "params": {
+    "input": "points",
+    "overlay": "zones"
+   },
+   "expect": {
+    "ids": [
+     "a|",
+     "b|Z1",
+     "c|",
+     "d|Z4",
+     "e|Z1",
+     "e|Z4",
+     "f|",
+     "g|",
+     "h|",
+     "i|",
+     "j|Z5"
+    ],
+    "key": [
+     "id",
+     "id_2"
+    ]
+   }
+  },
+  {
+   "name": "union",
+   "tool": "union",
+   "params": {
+    "input": "parcels",
+    "overlay": "zones"
+   },
+   "expect": {
+    "features": "expected/union_parcels.geojson",
+    "key": [
+     "id",
+     "id_2"
+    ]
+   }
+  },
+  {
    "name": "dissolve by field",
    "tool": "dissolve",
    "params": {

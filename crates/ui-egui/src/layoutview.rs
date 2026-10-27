@@ -6,9 +6,9 @@
 
 use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::map::layout::{
-    Arrange, ArrowStyle, CoordFormat, ElementKind, Grid, GridStyle, Layout, LineHead, MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH,
-    MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TickSide, frame_camera,
-    line_angle, line_length,
+    Arrange, ArrowStyle, CoordFormat, ElementKind, Grid, GridKind, GridStyle, Layout, LineHead, MAX_COLORBAR_TICKS, MAX_FRAME_SCALE,
+    MAX_GRID_WIDTH, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TickSide,
+    frame_camera, line_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -1192,18 +1192,45 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
     let Some(g) = grid else { return };
     // Each number kept across a drag until it is let go (#607).
     let key = |field: &str| egui::Id::unique(("grid_drag", id, field));
+    let measured = g.kind == GridKind::Measured;
     egui::Grid::new(("grid_props", id)).num_columns(2).spacing(vec2(8.0, 6.0)).show(ui, |ui| {
+        // Latitudes and longitudes, or eastings and northings (ArcGIS Pro's measured grid).
+        let input_label = ui.label(tl!("Type"));
+        egui::ComboBox::from_id_salt(("grid_kind", id))
+            .selected_text(tl!(g.kind.label()))
+            .show_ui(ui, |ui| {
+                for v in GridKind::ALL {
+                    if ui.selectable_label(g.kind == v, tl!(v.label())).clicked() && g.kind != v {
+                        set(app, json!({"type": v.code()}));
+                    }
+                }
+            })
+            .response
+            .labelled_by(input_label.id);
+        ui.end_row();
+        if measured {
+            crs_row(app, ui, g, id, set);
+        }
         let input_label = ui.label(tl!("Interval"));
         let mut step = g.step;
         let drag = Dragged::lend(ui, key("step"), &mut step);
+        let (most, speed) = if measured {
+            (rustgis_engine::map::layout::MAX_MEASURED_STEP, 10.0)
+        } else {
+            (rustgis_engine::map::layout::MAX_GRATICULE_STEP, 0.05)
+        };
         let r = ui
-            .add(
-                egui::DragValue::new(&mut step)
-                    .range(0.0..=90.0)
-                    .speed(0.05)
-                    .max_decimals(4)
-                    .custom_formatter(|v, _| if v <= 0.0 { tl!("Auto").to_string() } else { format!("{v}°") }),
-            )
+            .add(egui::DragValue::new(&mut step).range(0.0..=most).speed(speed).max_decimals(4).custom_formatter(|v, _| {
+                if v <= 0.0 {
+                    tl!("Auto").to_string()
+                } else if measured {
+                    // (The system's units: metres for UTM.)
+                    format!("{v}")
+                } else {
+                    format!("{v}°")
+                }
+            }))
+            .on_hover_text(if measured { tl!("In the coordinate system's units: metres for UTM.") } else { tl!("In degrees.") })
             .labelled_by(input_label.id);
         if drag.settled(ui, &r, &mut step) && (step - g.step).abs() > 1e-9 {
             set(app, json!({"step": step}));
@@ -1259,22 +1286,41 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
         if !g.labels {
             return;
         }
-        ui.label(tl!("Format"));
-        ui.horizontal(|ui| {
-            for (label, v, code) in [("Decimal", CoordFormat::Decimal, "decimal"), ("DMS", CoordFormat::Dms, "dms")] {
-                if ui.selectable_label(g.format == v, tl!(label)).clicked() && g.format != v {
-                    set(app, json!({"format": code}));
-                }
+        if measured {
+            let input_label = ui.label(tl!("Short labels"));
+            let mut short = g.short;
+            if ui
+                .checkbox(&mut short, "")
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("The kilometres' last two digits, as topographic maps print them: 43 for 543000."))
+                .changed()
+            {
+                set(app, json!({"short": short}));
             }
-        });
-        ui.end_row();
-        let input_label = ui.label(tl!("N/S/E/W"));
-        let mut hemi = g.hemisphere;
-        if ui.checkbox(&mut hemi, "").labelled_by(input_label.id).on_hover_text(tl!("Off, west and south are negative: -112.5°.")).changed()
-        {
-            set(app, json!({"hemisphere": hemi}));
+            ui.end_row();
+        } else {
+            // Degrees: decimal or degrees, minutes and seconds, with hemisphere letters or signs.
+            ui.label(tl!("Format"));
+            ui.horizontal(|ui| {
+                for (label, v, code) in [("Decimal", CoordFormat::Decimal, "decimal"), ("DMS", CoordFormat::Dms, "dms")] {
+                    if ui.selectable_label(g.format == v, tl!(label)).clicked() && g.format != v {
+                        set(app, json!({"format": code}));
+                    }
+                }
+            });
+            ui.end_row();
+            let input_label = ui.label(tl!("N/S/E/W"));
+            let mut hemi = g.hemisphere;
+            if ui
+                .checkbox(&mut hemi, "")
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("Off, west and south are negative: -112.5°."))
+                .changed()
+            {
+                set(app, json!({"hemisphere": hemi}));
+            }
+            ui.end_row();
         }
-        ui.end_row();
         // Two rows, so the four edges fit the panel's width.
         let e = g.edges;
         let all = [("Top", "top", e.top), ("Bottom", "bottom", e.bottom), ("Left", "left", e.left), ("Right", "right", e.right)];
@@ -1306,6 +1352,28 @@ fn grid_properties(app: &mut RustGisApp, ui: &mut Ui, grid: Option<&Grid>, id: u
         });
         ui.end_row();
     });
+}
+
+/// A measured grid's coordinate system, typed (EPSG:25832, WKT or a PROJ string) and set when the
+/// field is left; empty is the map's when projected, else the UTM zone at the frame's centre.
+fn crs_row(app: &mut RustGisApp, ui: &mut Ui, g: &Grid, id: u32, set: &dyn Fn(&mut RustGisApp, Value)) {
+    let input_label = ui.label(tl!("Coordinate system"));
+    let key = egui::Id::unique(("grid_crs", id));
+    let current = g.crs.clone().unwrap_or_default();
+    let mut buf = ui.data(|d| d.get_temp::<String>(key)).unwrap_or_else(|| current.clone());
+    let r = ui
+        .add(egui::TextEdit::singleline(&mut buf).hint_text(tl!("The map's, else its UTM zone")).desired_width(150.0))
+        .labelled_by(input_label.id)
+        .on_hover_text(tl!("EPSG:25832, WKT or a PROJ string; empty: the map's when projected, else the UTM zone at the frame's centre."));
+    if r.has_focus() {
+        ui.data_mut(|d| d.insert_temp(key, buf));
+    } else {
+        ui.data_mut(|d| d.remove::<String>(key));
+        if r.lost_focus() && buf.trim() != current {
+            set(app, json!({"crs": buf.trim()}));
+        }
+    }
+    ui.end_row();
 }
 
 /// The Format pane (#516): the selected layout element's properties, while its layout is on
@@ -2719,6 +2787,56 @@ mod tests {
         }
         super::show(app, ui);
         super::save_drafts(app);
+    }
+
+    /// A frame's grid in the Format pane: a graticule's degree rows, or a measured grid's
+    /// coordinate system (typed, set once left) and short labels.
+    #[test]
+    fn a_measured_grid_is_set_in_the_format_pane() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Hike"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let frame = app.session.project.layouts[li].elements.iter().find(|e| e.kind.code() == "mapFrame").unwrap().id;
+        app.run("layout.addElement", json!({"kind": "grid"})).unwrap();
+        app.run("ui.pane.format", json!({})).unwrap();
+        app.layout.selected = Some(frame);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 1400.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let grid = |h: &egui_kittest::Harness<'_, RustGisApp>| match &h.state().session.project.layouts[li].element(frame).unwrap().kind {
+            ElementKind::MapFrame { grid, .. } => grid.clone().unwrap(),
+            _ => panic!("not a frame"),
+        };
+        assert!(h.query_by_label("N/S/E/W").is_some() && h.query_by_label("Coordinate system").is_none(), "a graticule's rows");
+        h.state_mut().run("layout.update", json!({"element": frame, "grid": {"type": "measured"}})).unwrap();
+        h.run_steps(3);
+        assert!(h.query_by_label("N/S/E/W").is_none(), "no degrees for a measured grid");
+        assert!(h.query_by_label("Short labels").is_some());
+        // A system typed is set once the field is left; until then, the grid's stays.
+        h.get_by_role_and_label(Role::TextInput, "Coordinate system").focus();
+        h.run_steps(2);
+        h.get_by_role_and_label(Role::TextInput, "Coordinate system").type_text("EPSG:2056");
+        h.run_steps(2);
+        assert_eq!(grid(&h).crs, None, "not while typing");
+        h.key_press(egui::Key::Enter);
+        h.run_steps(3);
+        assert_eq!(grid(&h).crs.as_deref(), Some("EPSG:2056"));
+        h.get_by_label("Short labels").click();
+        h.run_steps(2);
+        assert!(grid(&h).short);
     }
 
     /// Selecting an element opens the Format pane, a tab like the others (#516). Closing it keeps

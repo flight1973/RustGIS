@@ -76,6 +76,7 @@ mod table;
 mod textform;
 pub mod theme;
 mod tilelayer;
+mod tilelegend;
 mod tilt_drape;
 mod tilt_settle;
 mod timebar;
@@ -614,6 +615,8 @@ pub struct UiState {
     pub csw: cswui::State,
     /// STAC Search: its choices, results and the request under way.
     pub stac: stacui::State,
+    /// WMS and WMTS layers' legend pictures, as the Layers pane shows them (#942).
+    pub tile_legends: tilelegend::Legends,
     /// S3…: the connection form, the bucket browsed and the listing under way.
     pub s3: s3ui::State,
     /// New/Edit Connection: the form and the Test under way.
@@ -760,6 +763,7 @@ impl Default for UiState {
             service_group_name: "My OGC Layer".into(),
             csw: Default::default(),
             stac: Default::default(),
+            tile_legends: Default::default(),
             s3: Default::default(),
             connection: Default::default(),
             s3_chooser: Default::default(),

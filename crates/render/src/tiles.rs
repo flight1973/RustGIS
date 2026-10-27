@@ -84,6 +84,7 @@ pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> 
             angle: l.angle,
             collide: l.collide,
             glyphs: Vec::new(),
+            background: None,
         },
         l.priority,
     ))

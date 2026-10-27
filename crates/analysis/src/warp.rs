@@ -11,6 +11,8 @@
 //! between, as GDAL's approximate transformer does: where the midpoint of a stretch is off by more
 //! than [`TOLERANCE`] image pixels, the whole stretch is computed exactly.
 
+use std::collections::HashMap;
+
 use rustgis_data::raster::{ColorHint, Crs, GeoTransform, MAX_SAMPLES, Raster, Transformer};
 use rustgis_geom::Coord;
 
@@ -393,7 +395,8 @@ pub enum Method {
     Sample(Resampling),
     /// The mean of the source pixels in the cell.
     Average,
-    /// The most frequent value of the source pixels in the cell, the least of those tied.
+    /// The most frequent value of the source pixels in the cell; of those tied, the one that
+    /// reaches the top count first, the pixels taken row by row (as GDAL's `mode`).
     Mode,
 }
 
@@ -624,10 +627,10 @@ fn sampled(
     canvas.finish(r, g, bands, name)
 }
 
-/// `r` on the grid `g`, each cell the mean (or, with `mode`, the most frequent value, the least
-/// of those tied) of the pixels whose centres fall in it. A cell's corners are placed on the
-/// image (`source`) and the pixel centres inside the quadrilateral they make are taken; one with
-/// none takes the pixel under its centre. A palette image takes the mode.
+/// `r` on the grid `g`, each cell the mean (or, with `mode`, the most frequent value, with GDAL's
+/// tie rule: see [`mode_of`]) of the pixels whose centres fall in it. A cell's corners are placed
+/// on the image (`source`) and the pixel centres inside the quadrilateral they make are taken; one
+/// with none takes the pixel under its centre. A palette image takes the mode.
 fn aggregated(
     r: &Raster,
     g: &Grid,
@@ -709,9 +712,9 @@ fn aggregated(
                         // see-through ones count for nothing, as in the mean. A cell where none
                         // shows takes the mode of all (see-through, alpha 0).
                         let shows = |(x, k): (&f32, &f32)| if alpha == Some(b) { *x > 0.0 } else { *k > 0.0 };
-                        let mut shown: Vec<f32> = v.iter().zip(k).filter(|p| shows(*p)).map(|(x, _)| *x).collect();
+                        let shown: Vec<f32> = v.iter().zip(k).filter(|p| shows(*p)).map(|(x, _)| *x).collect();
                         match (shown.is_empty(), alpha) {
-                            (false, _) => mode_of(&mut shown),
+                            (false, _) => mode_of(&shown),
                             // No pixel that shows has a colour here: none is taken from one that
                             // doesn't.
                             (true, Some(a)) if a != b => f32::NAN,
@@ -762,15 +765,19 @@ fn mean_of((sum, weight): (f64, f64), round: bool) -> f32 {
     if round { m.round() } else { m }
 }
 
-/// The most frequent value of `v`, the least of those tied; NaN when it is empty. Sorts `v`.
-fn mode_of(v: &mut [f32]) -> f32 {
-    v.sort_unstable_by(f32::total_cmp);
+/// The most frequent value of `v`; NaN when it is empty. Of the values tied, the one that reaches
+/// the top count first, `v` taken in its order (the cell's pixels, row by row), as GDAL's `mode`
+/// does: a cell of 3, 5, 5, 3 takes 5, one of 5, 3, 3, 5 takes 3.
+fn mode_of(v: &[f32]) -> f32 {
+    // Capped: a cell can take many pixels, and a few distinct values are the common case.
+    let mut counts: HashMap<u32, usize> = HashMap::with_capacity(v.len().min(256));
     let (mut best, mut best_n) = (f32::NAN, 0usize);
-    // Sorted ascending: a later run only wins with more, so ties keep the least value. Each run
-    // holds one value at least (a NaN is a run of its own), so this always moves on.
-    for run in v.chunk_by(|a, b| a == b) {
-        if let Some(&x) = run.first().filter(|_| run.len() > best_n) {
-            (best, best_n) = (x, run.len());
+    for &x in v {
+        // `+ 0.0` counts -0.0 and 0.0 as one value, as `==` does.
+        let n = counts.entry((x + 0.0).to_bits()).or_insert(0);
+        *n += 1;
+        if *n > best_n {
+            (best, best_n) = (x, *n);
         }
     }
     best
@@ -970,7 +977,7 @@ mod tests {
     }
 
     /// Average and mode take every pixel whose centre falls in a cell, no-data skipped; mode's
-    /// ties go to the least value.
+    /// ties go to the value that reaches the top count first, row by row, as in GDAL.
     #[test]
     fn average_and_mode_take_every_pixel_in_a_cell() {
         // 4 × 4 pixels, value = column + 10 · row; pixel (1, 0) is no-data.
@@ -982,11 +989,19 @@ mod tests {
         let avg = project(&r, &g, Method::Average, "a".into()).unwrap();
         // Top left: 0, 10 and 11 (1 is no-data); top right: 2, 3, 12, 13.
         assert_eq!(values(&avg), vec![Some(7.0), Some(7.5), Some(25.5), Some(27.5)]);
-        // Classes: a cell of 3, 5, 5, 3 ties and takes 3; one of 7, 7, 7, 2 takes 7.
-        let classes = vec![3.0, 5.0, 7.0, 7.0, 5.0, 3.0, 7.0, 2.0, 1.0, 1.0, 4.0, 4.0, 1.0, 9.0, 4.0, 4.0];
-        let r = utm(4, 4, classes, "UInt8");
+        // Classes: a cell of 3, 5, 5, 3 ties and takes 5, which reaches two first; one of 7, 7, 7, 2
+        // takes 7. GDAL 3.12.2 and 3.13.1 (`gdalwarp -r mode -tr 2 2`) give 5, 7, 1, 4.
+        let mut classes = vec![3.0, 5.0, 7.0, 7.0, 5.0, 3.0, 7.0, 2.0, 1.0, 1.0, 4.0, 4.0, 1.0, 9.0, 4.0, 4.0];
+        let r = utm(4, 4, classes.clone(), "UInt8");
         let mode = project(&r, &g, Method::Mode, "m".into()).unwrap();
-        assert_eq!(values(&mode), vec![Some(3.0), Some(7.0), Some(1.0), Some(4.0)]);
+        assert_eq!(values(&mode), vec![Some(5.0), Some(7.0), Some(1.0), Some(4.0)]);
+        // The order decides, not the value: 5, 3, 3, 5 takes 3 (GDAL too).
+        classes[..2].copy_from_slice(&[5.0, 3.0]);
+        classes[4..6].copy_from_slice(&[3.0, 5.0]);
+        let mirrored = project(&utm(4, 4, classes, "UInt8"), &g, Method::Mode, "m".into()).unwrap();
+        assert_eq!(values(&mirrored)[0], Some(3.0));
+        // -0.0 and 0.0 are one value: the zero reaches two first, the 1 before it doesn't.
+        assert_eq!(mode_of(&[1.0, -0.0, 0.0]), 0.0);
         // A whole-number type's mean is rounded: (3 + 5 + 5 + 3) / 4 = 4, (7 + 7 + 7 + 2) / 4 = 5.75.
         let avg = project(&r, &g, Method::Average, "a".into()).unwrap();
         assert_eq!(values(&avg)[..2], [Some(4.0), Some(6.0)]);

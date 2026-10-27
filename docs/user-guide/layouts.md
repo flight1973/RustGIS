@@ -116,6 +116,21 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   `layout.addElement={"kind":"grid","step":0.5,"style":"ticks","format":"dms","edges":["top","bottom","left","right"],"labelOrientation":"vertical"}`
   (given again, it changes only the options it names), or `layout.update` with
   `"grid": {…}` (`false` removes the grid).
+- **Measured grids**: a grid's **Type** is a **Graticule** (latitudes and longitudes, as above)
+  or a **Measured grid**, as ArcGIS Pro has them: eastings and northings in a projected coordinate
+  system, for maps read with UTM or national grid coordinates (a hiking map at 1:25,000 with a
+  line every kilometre). Its **Coordinate system** is the one typed (`EPSG:25832`, WKT or a PROJ
+  string); left empty, the map's own when the map is in a projected system, else the UTM zone
+  (WGS 84) at the frame's centre. Its **Interval** is in that system's units, metres for UTM
+  (**Auto** picks 1, 2 or 5 times a power of ten that suits the frame; one too fine for the frame
+  is widened to about 50 lines). Its lines are drawn through the coordinate system onto the map,
+  so on a map in another projection they lean or bend as they do there; eastings are labelled
+  along the top and bottom and northings along the sides, whole (`543000`) or, with **Short
+  labels**, as topographic maps print them, the kilometres' last two digits (`43`). Style, ticks,
+  colour, width, edges and side label orientation are as for a graticule. A system that isn't
+  projected (a latitude/longitude one) is refused: that is a graticule's job. From a command:
+  `layout.update={"element":1,"grid":{"type":"measured","crs":"EPSG:25832","step":1000,"short":true}}`;
+  a change of type without a step picks one, as degrees and metres don't carry over.
 - **Map surrounds**: north arrow, scale bar, legend, colorbar, table frame (a layer's attribute table) and
   chart frame (a bar chart of a numeric field), plus a neatline or backdrop. A north arrow's
   properties pick its **Style** (classic arrow, compass rose, triangle or star) and its **Fill**

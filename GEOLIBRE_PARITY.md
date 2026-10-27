@@ -166,8 +166,8 @@ _GeoLibre: docs/features.md › Attribute data and expressions; docs/arcgis-edit
 _GeoLibre: docs/features.md › Processing and analysis; docs/user-guide/processing.md,
 model-builder.md, segmentation.md, obia.md_
 
-- [ ] **Spatial join, intersect, union**. Partial: spatial join, clip, erase and intersect are
-  built in; union, identity and near are missing (_Roadmap: solid ground_).
+- [ ] **Spatial join, intersect, union**. Partial: spatial join, clip, erase, intersect, identity
+  and union are built in; near is missing (_Roadmap: solid ground_).
 - [ ] **More built-in vector tools**: attribute join, merge, extract vertices, points along lines,
   fix/check geometry, random extract, buffer options. Partial: extract vertices is built in,
   as Feature Vertices To Points (_Roadmap: solid ground_).

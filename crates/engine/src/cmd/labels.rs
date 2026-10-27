@@ -3,12 +3,87 @@
 
 use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
 use rustgis_map::symbology::{MAX_LABEL_CLASSES, label_class_name};
-use rustgis_map::{LabelClass, LabelMatcher, LabelPlacement, Labeling, Renderer, Rgba, Symbol};
+use rustgis_map::{LabelBackground, LabelClass, LabelMatcher, LabelPlacement, Labeling, Renderer, Rgba, Symbol};
 use serde_json::{Value, json};
 
 use super::layer::s_req;
 use super::{b, f, need_feature_layer, ps};
 use crate::{CmdResult, CommandSpec as C, Session};
+
+/// A number, or a number written as text (as `f` reads a parameter).
+fn number(v: &Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).filter(|x: &f64| x.is_finite())
+}
+
+/// A label offset given as `[right, down]` (points), each kept within the range a class keeps.
+fn label_offset(v: &Value) -> Option<[f32; 2]> {
+    let range = rustgis_map::symbology::LABEL_OFFSET;
+    let [x, y] = v.as_array()?.as_slice() else { return None };
+    let within = |v: &Value| number(v).map(|v| v.clamp(*range.start(), *range.end()) as f32);
+    Some([within(x)?, within(y)?])
+}
+
+/// What `labels.style`'s `background` does to a class's background.
+pub(super) type BackgroundChange = Box<dyn Fn(Option<LabelBackground>) -> Option<LabelBackground>>;
+
+/// Reads `labels.style`'s `background`: false or null takes it away, true puts one on (the default,
+/// or the one it has), and an object sets the parts it gives on the one it has (else on the
+/// default). Anything else, or a part that isn't what it should be, is an error.
+pub(super) fn background_change(v: &Value) -> Result<BackgroundChange, String> {
+    let o = match v {
+        Value::Null | Value::Bool(false) => return Ok(Box::new(|_| None)),
+        Value::Bool(true) => return Ok(Box::new(|b| Some(b.unwrap_or_default()))),
+        Value::Object(o) => o,
+        _ => return Err("background must be true, false, null or {fill, stroke, strokeWidth, padding, radius}".into()),
+    };
+    // A colour, or "" or null for none.
+    let color = |k: &str| -> Result<Option<Option<Rgba>>, String> {
+        match o.get(k) {
+            None => Ok(None),
+            Some(Value::Null) => Ok(Some(None)),
+            Some(Value::String(c)) if c.trim().is_empty() => Ok(Some(None)),
+            Some(Value::String(c)) => Rgba::from_hex(c.trim())
+                .map(|c| Some(Some(c)))
+                .ok_or_else(|| format!("background.{k} must be #RRGGBB or #RRGGBBAA, or \"\"")),
+            Some(_) => Err(format!("background.{k} must be #RRGGBB or #RRGGBBAA, or \"\"")),
+        }
+    };
+    let number = |v: &Value| number(v).map(|v| v as f32);
+    let points = |k: &str| -> Result<Option<f32>, String> {
+        o.get(k).map(|v| number(v).ok_or_else(|| format!("background.{k} must be a number of points"))).transpose()
+    };
+    let (fill, stroke) = (color("fill")?, color("stroke")?);
+    let (stroke_width, radius) = (points("strokeWidth")?, points("radius")?);
+    let padding = match o.get("padding") {
+        None => None,
+        Some(v) => match v.as_array().map(Vec::as_slice) {
+            Some([x, y]) => Some([number(x), number(y)]),
+            _ => None,
+        }
+        .and_then(|[x, y]| Some([x?, y?]))
+        .map(Some)
+        .ok_or("background.padding must be [across, up and down] in points")?,
+    };
+    Ok(Box::new(move |b| {
+        let mut b = b.unwrap_or_default();
+        if let Some(c) = fill {
+            b.fill = c;
+        }
+        if let Some(c) = stroke {
+            b.stroke = c;
+        }
+        if let Some(w) = stroke_width {
+            b.stroke_width = w;
+        }
+        if let Some(p) = padding {
+            b.padding = p;
+        }
+        if let Some(r) = radius {
+            b.radius = r;
+        }
+        Some(b.checked())
+    }))
+}
 
 pub fn commands() -> Vec<C> {
     vec![
@@ -55,13 +130,27 @@ pub fn commands() -> Vec<C> {
             .when(need_feature_layer)
             .params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "closest"?: metres|null, "farthest"?: metres|null, "clear"?: bool}"#),
         C::new("labels.placement", "Label Placement", "Labeling › Label Placement", |s, p| {
-            let code = ps(p, "position").ok_or("position is required")?;
-            let pos = LabelPlacement::from_code(code).ok_or_else(|| format!("unknown placement '{code}'"))?;
-            with_class(s, p, |c| c.placement = pos)
+            let pos = match ps(p, "position") {
+                Some(code) => Some(LabelPlacement::from_code(code).ok_or_else(|| format!("unknown placement '{code}'"))?),
+                None if p.get("offset").is_some() => None,
+                None => return Err("position is required (or an offset)".into()),
+            };
+            let offset = match p.get("offset") {
+                None => None,
+                Some(o) => Some(label_offset(o).ok_or("offset must be [right, down] in points")?),
+            };
+            with_class(s, p, |c| {
+                if let Some(pos) = pos {
+                    c.placement = pos;
+                }
+                if let Some(o) = offset {
+                    c.offset = o;
+                }
+            })
         })
         .when(need_feature_layer)
         .params(
-            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position": "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends)}"#,
+            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved)}"#,
         ),
         // Label classes: each labels every feature its clause takes, as in ArcGIS Pro; the classes
         // listed first, Default last, are placed first (`Labeling`, #732).

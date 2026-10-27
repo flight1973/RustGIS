@@ -143,8 +143,8 @@ Stated plainly, so the tables above are worth trusting:
 - **Coordinate systems.** Vector data is stored in longitude/latitude; there is no full PROJ.
 - **Editing depth.** Vertex move, insert and delete are supported, but not versioned or
   multi-user database editing. Edits are kept in the project and exported, not written back to databases.
-- **Specialized analysis.** Built-in spatial joins, intersect and shortest paths on line networks
-  are available, but full network datasets, overlay union and identity tools and advanced spatial
+- **Specialized analysis.** Built-in spatial joins, overlays (intersect, identity, union) and
+  shortest paths on line networks are available, but full network datasets and advanced spatial
   statistics depend on the external suite or another GIS.
 - **Python.** The [`rustgis` package](../python.md) runs commands headlessly, but there is no
   Python console inside the app. Python process plugins are supported on desktop and CLI, without a sandbox.

@@ -1728,6 +1728,118 @@ pub struct LabelClass {
     /// spacing; negative draws them tighter.
     #[serde(default, deserialize_with = "de_letter_spacing", skip_serializing_if = "is_zero")]
     pub spacing: f32,
+    /// How far the label is moved from where its placement puts it (points, right and down, each
+    /// within [`LABEL_OFFSET`]), as QGIS's offset from a point; a label along a line isn't moved.
+    #[serde(default, deserialize_with = "de_label_offset", skip_serializing_if = "is_no_offset")]
+    pub offset: [f32; 2],
+    /// A shape drawn behind the text, as QGIS's label background; none draws the text alone.
+    #[serde(default, deserialize_with = "de_background", skip_serializing_if = "Option::is_none")]
+    pub background: Option<LabelBackground>,
+}
+
+/// How far a label's offset moves it each way (points).
+pub const LABEL_OFFSET: std::ops::RangeInclusive<f64> = -200.0..=200.0;
+
+/// A rectangle behind a label's text, as QGIS's rectangle background: the text's block grown by
+/// its padding, filled and outlined, its corners rounded.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LabelBackground {
+    /// Its fill; none leaves it see-through.
+    #[serde(deserialize_with = "de_halo_color")]
+    pub fill: Option<Rgba>,
+    /// Its outline's colour; none draws no outline.
+    #[serde(deserialize_with = "de_halo_color")]
+    pub stroke: Option<Rgba>,
+    /// Its outline's width (points, within [`BACKGROUND_STROKE`]).
+    #[serde(deserialize_with = "de_background_stroke")]
+    pub stroke_width: f32,
+    /// How far it reaches past the text's block, across and up and down (points, each within
+    /// [`BACKGROUND_PADDING`]).
+    #[serde(deserialize_with = "de_background_padding")]
+    pub padding: [f32; 2],
+    /// Its corners' radius (points, within [`BACKGROUND_PADDING`]); 0 is square.
+    #[serde(deserialize_with = "de_background_radius")]
+    pub radius: f32,
+}
+
+impl Default for LabelBackground {
+    /// White, with a thin dark outline (SMV25's road numbers): what Background turns on.
+    fn default() -> Self {
+        LabelBackground {
+            fill: Some(Rgba::rgb(255, 255, 255)),
+            stroke: Some(Rgba::rgb(38, 38, 38)),
+            stroke_width: 0.3,
+            padding: [1.0, 0.5],
+            radius: 0.0,
+        }
+    }
+}
+
+impl LabelBackground {
+    /// Kept within its ranges (a command's or a crafted file's numbers).
+    pub fn checked(self) -> LabelBackground {
+        // (One past f32's range, infinite, is the most; none of no number.)
+        let within = |v: f32, r: &std::ops::RangeInclusive<f64>| if v.is_nan() { 0.0 } else { v.clamp(*r.start() as f32, *r.end() as f32) };
+        LabelBackground {
+            stroke_width: within(self.stroke_width, &BACKGROUND_STROKE),
+            padding: self.padding.map(|p| within(p, &BACKGROUND_PADDING)),
+            radius: within(self.radius, &BACKGROUND_PADDING),
+            ..self
+        }
+    }
+
+    /// Grown `factor` times, as its label is by a reference scale.
+    pub fn scaled(&self, factor: f32) -> LabelBackground {
+        LabelBackground {
+            stroke_width: self.stroke_width * factor,
+            padding: self.padding.map(|p| p * factor),
+            radius: self.radius * factor,
+            ..self.clone()
+        }
+    }
+
+    /// Whether it draws anything: a fill or an outline that shows.
+    pub fn draws(&self) -> bool {
+        self.fill.is_some_and(|f| f.a() > 0) || (self.stroke.is_some_and(|s| s.a() > 0) && self.stroke_width > 0.0)
+    }
+}
+
+/// The widths a label background's outline takes (points).
+pub const BACKGROUND_STROKE: std::ops::RangeInclusive<f64> = 0.0..=10.0;
+/// The paddings and corner radii a label background takes (points).
+pub const BACKGROUND_PADDING: std::ops::RangeInclusive<f64> = 0.0..=50.0;
+
+/// A label's offset, each way within [`LABEL_OFFSET`]; one that isn't two numbers is none.
+fn de_label_offset<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[f32; 2], D::Error> {
+    let within = |v: f64| if v.is_finite() { v.clamp(*LABEL_OFFSET.start(), *LABEL_OFFSET.end()) as f32 } else { 0.0 };
+    Ok(lenient::<D, [f64; 2]>(d)?.map_or([0.0; 2], |o| o.map(within)))
+}
+
+fn is_no_offset(o: &[f32; 2]) -> bool {
+    *o == [0.0; 2]
+}
+
+/// A label's background, kept within its ranges; one that isn't a background is none.
+fn de_background<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<LabelBackground>, D::Error> {
+    Ok(lenient::<D, LabelBackground>(d)?.map(LabelBackground::checked))
+}
+
+fn de_background_stroke<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    Ok(lenient::<D, f64>(d)?
+        .filter(|v| v.is_finite())
+        .map_or(0.0, |v| v.clamp(*BACKGROUND_STROKE.start(), *BACKGROUND_STROKE.end()) as f32))
+}
+
+fn de_background_padding<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[f32; 2], D::Error> {
+    let within = |v: f64| if v.is_finite() { v.clamp(*BACKGROUND_PADDING.start(), *BACKGROUND_PADDING.end()) as f32 } else { 0.0 };
+    Ok(lenient::<D, [f64; 2]>(d)?.map_or([0.0; 2], |p| p.map(within)))
+}
+
+fn de_background_radius<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    Ok(lenient::<D, f64>(d)?
+        .filter(|v| v.is_finite())
+        .map_or(0.0, |v| v.clamp(*BACKGROUND_PADDING.start(), *BACKGROUND_PADDING.end()) as f32))
 }
 
 /// The widths a label's halo takes (points).
@@ -1946,6 +2058,8 @@ impl LabelClass {
             halo_color: None,
             halo_width: None,
             spacing: 0.0,
+            offset: [0.0; 2],
+            background: None,
         }
     }
 
@@ -2136,6 +2250,54 @@ mod tests {
         assert_eq!(l.default.halo_color_for(Rgba::rgb(0, 0, 0)), Rgba::rgb(255, 238, 0));
         assert_eq!(old.default.halo_color_for(Rgba::rgb(0, 0, 0)), Rgba::new(255, 255, 255, 225));
         assert_eq!(old.default.halo_color_for(Rgba::rgb(255, 255, 255)), Rgba::new(20, 22, 26, 210));
+    }
+
+    /// An offset and a background are kept; a label without them is written as it always was; a
+    /// crafted value reads as none (or within its range) and the rest of the labels still read.
+    #[test]
+    fn a_labels_offset_and_background_are_kept_and_old_labels_save_as_before() {
+        let base = serde_json::json!({"enabled": true, "field": "name", "size": 9.0, "color": [0, 0, 0, 255], "halo": true, "bold": false});
+        let read = |extra: serde_json::Value| {
+            let mut v = base.clone();
+            if let (Some(o), Some(e)) = (v.as_object_mut(), extra.as_object()) {
+                o.extend(e.clone());
+            }
+            serde_json::from_value::<Labeling>(v).unwrap()
+        };
+        let old = read(serde_json::json!({}));
+        assert_eq!((old.default.offset, old.default.background.as_ref()), ([0.0; 2], None));
+        let saved = serde_json::to_value(&old).unwrap();
+        for k in ["offset", "background"] {
+            assert!(saved.get(k).is_none(), "{k} written for a label without it");
+        }
+        let bg = serde_json::json!({"fill": [255, 255, 255, 255], "stroke": null, "stroke_width": 0.28, "padding": [1.22, 0.28], "radius": 0.71});
+        let l = read(serde_json::json!({"offset": [5.67, -2.83], "background": bg}));
+        assert_eq!(l.default.offset, [5.67, -2.83]);
+        let want =
+            LabelBackground { fill: Some(Rgba::rgb(255, 255, 255)), stroke: None, stroke_width: 0.28, padding: [1.22, 0.28], radius: 0.71 };
+        assert_eq!(l.default.background.as_ref(), Some(&want));
+        assert_eq!(serde_json::from_value::<Labeling>(serde_json::to_value(&l).unwrap()).unwrap(), l);
+        // What a background leaves out is the default's.
+        let part = read(serde_json::json!({"background": {"radius": 2}}));
+        assert_eq!(part.default.background, Some(LabelBackground { radius: 2.0, ..LabelBackground::default() }));
+        // Crafted values: none, or within their ranges.
+        let junk = read(serde_json::json!({"offset": "far", "background": "box"}));
+        assert_eq!((junk.default.offset, junk.default.background.as_ref(), junk.default.field.as_str()), ([0.0; 2], None, "name"));
+        let far = read(
+            serde_json::json!({"offset": [1e30, -1e30], "background": {"fill": "pink", "stroke_width": 99, "padding": [-1, 1e9], "radius": "round"}}),
+        );
+        assert_eq!(far.default.offset, [200.0, -200.0]);
+        let b = far.default.background.unwrap();
+        assert_eq!((b.fill, b.stroke_width, b.padding, b.radius), (None, 10.0, [0.0, 50.0], 0.0));
+        assert!(read(serde_json::json!({"offset": [1]})).default.offset == [0.0; 2]);
+        // A background shows with a fill or an outline that shows.
+        assert!(LabelBackground::default().draws());
+        assert!(!LabelBackground { fill: None, stroke: None, ..LabelBackground::default() }.draws());
+        assert!(!LabelBackground { fill: None, stroke_width: 0.0, ..LabelBackground::default() }.draws());
+        assert!(!LabelBackground { fill: Some(Rgba::new(0, 0, 0, 0)), stroke: None, ..LabelBackground::default() }.draws());
+        // Grown with its label.
+        let g = want.scaled(2.0);
+        assert_eq!((g.stroke_width, g.padding, g.radius, g.fill), (0.56, [2.44, 0.56], 1.42, want.fill));
     }
 
     /// The shapes are written as they always were; a character with its family, which a crafted

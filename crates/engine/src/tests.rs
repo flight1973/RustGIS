@@ -2183,6 +2183,81 @@ fn labels_take_a_halo_colour_and_width_and_letter_spacing() {
     }
 }
 
+/// A label class takes an offset with its placement and a background with its text symbol; junk
+/// is refused, numbers kept within their ranges, and each change undoes.
+#[test]
+fn labels_take_an_offset_and_a_background() {
+    use rustgis_map::{LabelBackground, Rgba};
+    let mut s = world();
+    let class = |s: &Session| {
+        let c = &s.map().layer_by_name("Cities").unwrap().labels.default;
+        (c.placement, c.offset, c.background.clone())
+    };
+    let (placement, offset, background) = class(&s);
+    assert_eq!((offset, background), ([0.0; 2], None));
+    // An offset alone keeps the placement; both together set both.
+    let mark = s.notice_mark();
+    s.run("labels.placement", &json!({"layer": "Cities", "offset": [3, "-2.5"]})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("ignores")), "every key is read");
+    assert_eq!((class(&s).0, class(&s).1), (placement, [3.0, -2.5]));
+    s.run("labels.placement", &json!({"layer": "Cities", "position": "right", "offset": [1e9, -1e9]})).unwrap();
+    assert_eq!((class(&s).0, class(&s).1), (rustgis_map::LabelPlacement::Right, [200.0, -200.0]));
+    s.run("labels.placement", &json!({"layer": "Cities", "position": "below"})).unwrap();
+    assert_eq!(class(&s).1, [200.0, -200.0], "a position alone keeps the offset");
+    s.run("edit.undo", &json!({})).unwrap();
+    assert_eq!(class(&s).0, rustgis_map::LabelPlacement::Right, "undoes");
+    for bad in [json!({}), json!({"offset": "far"}), json!({"offset": [1]}), json!({"offset": [1, "x"]}), json!({"offset": null})] {
+        let mut p = bad.clone();
+        p["layer"] = json!("Cities");
+        assert!(s.run("labels.placement", &p).is_err(), "{bad}");
+    }
+    // A background: on (the default's), parts set on it, off.
+    s.run("labels.style", &json!({"layer": "Cities", "background": true})).unwrap();
+    assert_eq!(class(&s).2, Some(LabelBackground::default()));
+    let mark = s.notice_mark();
+    let parts = json!({"fill": "#FFEE00", "stroke": "", "strokeWidth": 99, "padding": [2, "1"], "radius": -1});
+    s.run("labels.style", &json!({"layer": "Cities", "background": parts})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("ignores")), "every key is read");
+    let want = LabelBackground { fill: Some(Rgba::rgb(0xFF, 0xEE, 0)), stroke: None, stroke_width: 10.0, padding: [2.0, 1.0], radius: 0.0 };
+    assert_eq!(class(&s).2, Some(want.clone()));
+    s.run("labels.style", &json!({"layer": "Cities", "background": {"radius": 1e300}})).unwrap();
+    assert_eq!(class(&s).2.map(|b| b.radius), Some(50.0), "past f32's range: the most");
+    s.run("labels.style", &json!({"layer": "Cities", "background": {"radius": 3}})).unwrap();
+    assert_eq!(class(&s).2, Some(LabelBackground { radius: 3.0, ..want.clone() }), "what isn't given is kept");
+    s.run("labels.style", &json!({"layer": "Cities", "background": true})).unwrap();
+    assert_eq!(class(&s).2.map(|b| b.radius), Some(3.0), "on again keeps it");
+    s.run("labels.style", &json!({"layer": "Cities", "size": 12})).unwrap();
+    assert!(class(&s).2.is_some(), "other settings leave it");
+    s.run("labels.style", &json!({"layer": "Cities", "background": false})).unwrap();
+    assert_eq!(class(&s).2, None);
+    s.run("edit.undo", &json!({})).unwrap();
+    assert!(class(&s).2.is_some(), "undoes");
+    s.run("labels.style", &json!({"layer": "Cities", "background": null})).unwrap();
+    assert_eq!(class(&s).2, None);
+    // Set on none, the parts go on the default's.
+    s.run("labels.style", &json!({"layer": "Cities", "background": {"fill": ""}})).unwrap();
+    assert_eq!(class(&s).2, Some(LabelBackground { fill: None, ..LabelBackground::default() }));
+    for bad in [
+        json!({"background": "box"}),
+        json!({"background": 1}),
+        json!({"background": {"fill": "pink"}}),
+        json!({"background": {"stroke": 7}}),
+        json!({"background": {"strokeWidth": "wide"}}),
+        json!({"background": {"padding": 2}}),
+        json!({"background": {"padding": [2]}}),
+        json!({"background": {"radius": null}}),
+    ] {
+        let mut p = bad.clone();
+        p["layer"] = json!("Cities");
+        assert!(s.run("labels.style", &p).is_err(), "{bad}");
+    }
+    // The project keeps them.
+    s.run("labels.placement", &json!({"layer": "Cities", "offset": [1, 2]})).unwrap();
+    let text = serde_json::to_string(&s.project).unwrap();
+    let reopened = Session::new(serde_json::from_str(&text).unwrap());
+    assert_eq!(class(&reopened), class(&s));
+}
+
 /// A lock names each label by its class's place in the list: a change to the list (a class added,
 /// moved or removed) locks the labels again on the next frame, a change within a class keeps the
 /// lock (#732).
@@ -3455,6 +3530,77 @@ fn layout_legends_list_what_the_frame_draws() {
     // Layouts saved before the option open with it off.
     let old: rustgis_map::layout::ElementKind = serde_json::from_str(r#"{"Legend":{"frame":1,"title":"L"}}"#).unwrap();
     assert!(matches!(old, rustgis_map::layout::ElementKind::Legend { all_classes: false, hide_other: false, .. }));
+}
+
+/// A map frame's grid can be a measured grid (#1008): eastings and northings in a projected
+/// system its step apart in metres, with whole or short labels; a system that isn't projected, or
+/// isn't one, is refused; a change of type starts its step afresh.
+#[test]
+fn a_frames_grid_can_be_a_measured_grid() {
+    use rustgis_map::layout::{ElementKind, GridKind};
+    let mut s = world();
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    let frame = s.project.layouts[0].elements.iter().find(|e| e.kind.code() == "mapFrame").unwrap().id;
+    let grid = |s: &Session| match &s.project.layouts[0].element(frame).unwrap().kind {
+        ElementKind::MapFrame { grid, .. } => grid.clone(),
+        k => panic!("{k:?}"),
+    };
+    s.run("layout.addElement", &json!({"kind": "grid", "step": 15})).unwrap();
+    assert_eq!(grid(&s).unwrap().step, 15.0);
+    // Measured: the step in metres (a graticule's 15° isn't carried over), the system named.
+    s.run("layout.update", &json!({"element": frame, "grid": {"type": "measured", "crs": " EPSG:25832 "}})).unwrap();
+    let g = grid(&s).unwrap();
+    assert_eq!((g.kind, g.step, g.crs.as_deref(), g.short), (GridKind::Measured, 0.0, Some("EPSG:25832"), false));
+    s.run("layout.update", &json!({"element": frame, "grid": {"step": 1000, "short": true}})).unwrap();
+    let g = grid(&s).unwrap();
+    assert_eq!((g.step, g.short), (1000.0, true));
+    // Steps in metres: from a metre to 10,000 km, 0 picks one; past 90 isn't a graticule's limit.
+    for (step, want) in [(0.25, 1.0), (1e12, rustgis_map::layout::MAX_MEASURED_STEP), (-5.0, 0.0), (250_000.0, 250_000.0)] {
+        s.run("layout.update", &json!({"element": frame, "grid": {"step": step}})).unwrap();
+        assert_eq!(grid(&s).unwrap().step, want, "{step}");
+    }
+    // A system by WKT or PROJ string too; "" goes back to the map's (or the UTM zone).
+    s.run("layout.update", &json!({"element": frame, "grid": {"crs": "+proj=utm +zone=33 +datum=WGS84 +units=m +no_defs"}})).unwrap();
+    assert!(grid(&s).unwrap().crs.unwrap().starts_with("+proj=utm"));
+    s.run("layout.update", &json!({"element": frame, "grid": {"crs": ""}})).unwrap();
+    assert_eq!(grid(&s).unwrap().crs, None);
+    let before = grid(&s);
+    for bad in [
+        json!({"type": "utm"}),
+        json!({"crs": "EPSG:4326"}),
+        json!({"crs": "EPSG:1"}),
+        json!({"crs": "not a system"}),
+        json!({"crs": 25832}),
+        json!({"crs": format!("EPSG:25832 {}", "x".repeat(rustgis_map::layout::MAX_GRID_CRS))}),
+    ] {
+        assert!(s.run("layout.update", &json!({"element": frame, "grid": bad})).is_err(), "{bad}");
+        let mut p = bad.clone();
+        p["kind"] = json!("grid");
+        assert!(s.run("layout.addElement", &p).is_err(), "{bad}");
+    }
+    assert_eq!(grid(&s), before, "a refusal changes nothing");
+    // Back to a graticule: degrees again, the step starting afresh; kept with the project.
+    s.run("layout.update", &json!({"element": frame, "grid": {"type": "measured", "crs": "EPSG:2056", "step": 500}})).unwrap();
+    let text = serde_json::to_string(&s.project).unwrap();
+    let reopened = Session::new(serde_json::from_str(&text).unwrap());
+    assert_eq!(
+        match &reopened.project.layouts[0].element(frame).unwrap().kind {
+            ElementKind::MapFrame { grid, .. } => grid.clone(),
+            _ => None,
+        },
+        grid(&s)
+    );
+    s.run("layout.update", &json!({"element": frame, "grid": {"type": "graticule"}})).unwrap();
+    let g = grid(&s).unwrap();
+    assert_eq!((g.kind, g.step), (GridKind::Graticule, 0.0));
+    s.run("layout.update", &json!({"element": frame, "grid": {"step": 500}})).unwrap();
+    assert_eq!(grid(&s).unwrap().step, 90.0, "a graticule's step is degrees");
+    // It draws (a PNG of the page).
+    let path = std::env::temp_dir().join(format!("rustgis-measured-{}.png", std::process::id()));
+    s.run("layout.update", &json!({"element": frame, "grid": {"type": "measured", "step": 1000000}})).unwrap();
+    s.run("layout.export", &json!({"path": path, "dpi": 72})).unwrap();
+    assert!(std::fs::metadata(&path).is_ok_and(|m| m.len() > 1000));
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Grids, north arrows and scale bars take their cartographic options through commands (#327):
@@ -7303,6 +7449,16 @@ fn web_style_carries_the_layers_scale_limits_as_zooms() {
     assert_eq!(halo(&s), "rgba(20,22,26,0.824)");
     s.map_mut().layer_mut(id).unwrap().labels.default.halo_color = Some(rustgis_map::Rgba::new(255, 0, 0, 128));
     assert_eq!(halo(&s), "rgba(255,0,0,0.502)");
+    // An offset in ems, as MapLibre has it; none without one.
+    let offset = |s: &Session| {
+        let style = crate::cmd::sharing::web_style(s.map().layer(id).unwrap());
+        let label = style["layers"].as_array().unwrap().iter().find(|l| l["type"] == "symbol").cloned().unwrap();
+        label["layout"].get("text-offset").cloned()
+    };
+    assert_eq!(offset(&s), None);
+    let c = &mut s.map_mut().layer_mut(id).unwrap().labels.default;
+    (c.size, c.offset) = (10.0, [5.0, -2.5]);
+    assert_eq!(offset(&s), Some(json!([0.5, -0.25])));
     s.map_mut().layer_mut(id).unwrap().labels.default.visible = false;
     assert!(!labelled(&s));
 }
@@ -8609,6 +8765,87 @@ fn an_arcgis_token_in_a_service_address_reaches_its_layers() {
     let wms = "https://wms914.example.org/rest/services/wms?token=keep-it";
     let kept = crate::cmd::service::without_token(&json!({"url": wms, "type": "wms"})).unwrap();
     assert!(kept.is_none() && arcgis_auth::authorization(wms).is_none());
+}
+
+/// A WMS layer added from its service takes its legends (the service's GetLegendGraphic, then
+/// its style's picture); any tile layer can be given one, or several for their scales; they and
+/// whether they show are kept with the project and undo; junk is refused.
+#[test]
+fn tile_layers_take_their_services_legends() {
+    const WMS: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.com/wms?"/></Get></HTTP></DCPType></GetMap>
+<GetLegendGraphic><Format>image/png</Format></GetLegendGraphic></Request>
+<Layer><CRS>EPSG:3857</CRS><Layer><Name>roads</Name><Title>Roads</Title>
+<Style><Name>default</Name><LegendURL><Format>image/png</Format><OnlineResource xlink:href="https://maps.example.com/legends/roads.png"/></LegendURL></Style></Layer>
+<Layer><Name>bare</Name><Title>Bare</Title></Layer></Layer></Capability></WMS_Capabilities>"#;
+    let mut s = Session::new(Project::default());
+    s.run("service.add", &json!({"url": "https://maps.example.com/wms", "layer": "roads", "text": WMS})).unwrap();
+    let legends = |s: &Session, name: &str| {
+        let t = s.map().tiles.iter().find(|t| t.name == name).unwrap();
+        (t.legends.iter().map(|l| l.url.clone()).collect::<Vec<_>>(), t.expanded)
+    };
+    assert_eq!(
+        legends(&s, "Roads"),
+        (
+            vec![
+                "https://maps.example.com/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetLegendGraphic&LAYER=roads&FORMAT=image%2Fpng&SLD_VERSION=1.1.0"
+                    .to_string(),
+                "https://maps.example.com/legends/roads.png".to_string()
+            ],
+            false
+        )
+    );
+    // Listed, and shown when expanded: what the pane shows, not an edit (as a layer's classes).
+    let listed = s.run("map.tiles", &json!({})).unwrap();
+    let roads = listed.as_array().unwrap().iter().find(|t| t["name"] == "Roads").unwrap().clone();
+    assert_eq!(roads["legends"][1]["url"], "https://maps.example.com/legends/roads.png");
+    assert_eq!(roads["expanded"], false);
+    let steps = s.undo_depth();
+    let dirty = s.dirty();
+    s.run("map.expandTiles", &json!({"name": "Roads"})).unwrap();
+    assert!(legends(&s, "Roads").1);
+    assert_eq!((s.undo_depth(), s.dirty()), (steps, dirty), "no undo step, nothing to save");
+    s.run("map.expandTiles", &json!({"name": "Roads", "on": true})).unwrap();
+    assert!(legends(&s, "Roads").1, "on keeps it shown");
+    s.run("map.expandTiles", &json!({"name": "Roads"})).unwrap();
+    assert!(!legends(&s, "Roads").1, "toggles");
+    s.run("map.expandTiles", &json!({"name": "Roads", "on": true})).unwrap();
+    assert!(s.run("map.expandTiles", &json!({"name": "Nope"})).is_err());
+    // A layer the service gives no legend has none, and none is listed.
+    s.run("service.add", &json!({"url": "https://maps.example.com/wms", "layer": "bare", "text": WMS.replace("<GetLegendGraphic><Format>image/png</Format></GetLegendGraphic>", "")})).unwrap();
+    assert_eq!(legends(&s, "Bare").0, Vec::<String>::new());
+    let listed = s.run("map.tiles", &json!({})).unwrap();
+    assert!(listed.as_array().unwrap().iter().find(|t| t["name"] == "Bare").unwrap().get("legends").is_none());
+    // Given by hand: an address, or a list with scales; set again, or taken away.
+    s.run(
+        "map.addTiles",
+        &json!({"url": "https://tiles.example.com/{z}/{x}/{y}.png", "name": "Topo", "legend": "https://tiles.example.com/legend.png"}),
+    )
+    .unwrap();
+    assert_eq!(legends(&s, "Topo").0, ["https://tiles.example.com/legend.png"]);
+    let scaled = json!(["https://t.example.com/near.png", {"url": "https://t.example.com/far.png", "minScale": "50000"}]);
+    s.run("map.setTiles", &json!({"name": "Topo", "legend": scaled})).unwrap();
+    let t = s.map().tiles.iter().find(|t| t.name == "Topo").unwrap();
+    assert_eq!((t.legends.len(), t.legends[1].min_scale), (2, Some(50_000.0)));
+    // Kept with the project.
+    let text = serde_json::to_string(&s.project).unwrap();
+    let reopened = Session::new(serde_json::from_str(&text).unwrap());
+    assert_eq!(legends(&reopened, "Roads"), legends(&s, "Roads"));
+    assert_eq!(legends(&reopened, "Topo"), legends(&s, "Topo"));
+    s.run("map.setTiles", &json!({"name": "Topo", "legend": null})).unwrap();
+    assert_eq!(legends(&s, "Topo").0, Vec::<String>::new());
+    for bad in [
+        json!("file:///etc/legend.png"),
+        json!(7),
+        json!([{"url": 3}]),
+        json!([{"href": "https://x.org/l.png"}]),
+        json!((0..20).map(|i| format!("https://x.org/{i}.png")).collect::<Vec<_>>()),
+    ] {
+        assert!(s.run("map.setTiles", &json!({"name": "Topo", "legend": bad})).is_err(), "{bad}");
+        assert!(s.run("map.addTiles", &json!({"url": "https://other.example.com/{z}/{x}/{y}.png", "legend": bad})).is_err(), "{bad}");
+    }
+    assert_eq!(legends(&s, "Topo").0, Vec::<String>::new(), "a refusal changes nothing");
 }
 
 /// Identify asks a WMS layer what is at the point (GetFeatureInfo): the request from the
@@ -12183,7 +12420,9 @@ fn recovery_copies_keep_no_layer_tokens_and_restore_none() {
 fn saved_projects_keep_no_layer_tokens() {
     let mut s = world();
     let url = "https://gis.example/arcgis/rest/services/a/MapServer/tile/{z}/{y}/{x}?token=s3cret";
-    s.run("map.addTiles", &json!({"url":url,"name":"Secured"})).unwrap();
+    // Its legend, built from the service's address, with the key in it too.
+    let legend = "https://gis.example/wms?key=l3g&SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER=a";
+    s.run("map.addTiles", &json!({"url":url,"name":"Secured","legend":legend})).unwrap();
     let layer = s.map().layers[0].id;
     s.map_mut().layers[0].dataset.source = Some("https://u:pw@gis.example/f?f=json&access_token=tok2".into());
     s.map_mut().service_groups.push(rustgis_map::ServiceGroup {
@@ -12201,10 +12440,10 @@ fn saved_projects_keep_no_layer_tokens() {
     let path = std::env::temp_dir().join(format!("rustgis-token-audit-{}.rgis", std::process::id()));
     let result = s.run("project.saveAs", &json!({"path":path})).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
-    for secret in ["s3cret", "pw@", "tok2", "k3y", "sig=x"] {
+    for secret in ["s3cret", "pw@", "tok2", "k3y", "sig=x", "l3g"] {
         assert!(!text.contains(secret), "{secret} leaked into the file");
     }
-    assert!(text.contains("MapServer/tile/{z}/{y}/{x}") && text.contains("map=m"));
+    assert!(text.contains("MapServer/tile/{z}/{y}/{x}") && text.contains("map=m") && text.contains("REQUEST=GetLegendGraphic"));
     assert!(result["stripped"].as_u64().unwrap() >= 4);
     assert!(s.notices.iter().any(|n| n.text.contains("saved without their keys")));
     assert!(s.map().tiles.iter().any(|t| t.url == url));
@@ -12212,7 +12451,7 @@ fn saved_projects_keep_no_layer_tokens() {
         let (_, bytes) = crate::cmd::items::item_bytes(&mut s, kind, &Value::Null).unwrap();
         let packaged =
             if kind == "map" { String::from_utf8(bytes.clone()).unwrap() } else { crate::cmd::items::package_text(&bytes).unwrap() };
-        for secret in ["s3cret", "pw@", "tok2", "k3y", "sig=x"] {
+        for secret in ["s3cret", "pw@", "tok2", "k3y", "sig=x", "l3g"] {
             assert!(!packaged.contains(secret), "{kind} leaked {secret}");
         }
         if kind == "projectPackage" {

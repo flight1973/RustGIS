@@ -435,6 +435,45 @@ pub fn label_width(l: &PlacedLabel) -> f32 {
     lines(&l.text).map(|line| line_width(l, line, 1.0)).fold(0.0, f32::max)
 }
 
+/// The rectangle a label's background fills (points: [left, top, right, bottom], upright about
+/// the label's centre): its text's block, as tall as its lines are drawn, grown by the padding;
+/// none without a background that draws.
+pub fn background_box(l: &PlacedLabel) -> Option<[f32; 4]> {
+    let b = l.background.as_ref().filter(|b| b.draws() && l.glyphs.is_empty() && !l.text.is_empty())?;
+    let w = label_width(l);
+    let h = l.size * 1.33 * 1.2 + line_count(&l.text).saturating_sub(1) as f32 * line_pitch(l.size);
+    let (px, py) = (b.padding[0] * 1.33, b.padding[1] * 1.33);
+    let cx = l.center_x();
+    let r = [cx - w / 2.0 - px, l.y - h / 2.0 - py, cx + w / 2.0 + px, l.y + h / 2.0 + py];
+    r.iter().all(|v| v.is_finite()).then_some(r)
+}
+
+/// How far a label's background, its outline's outer half included, reaches past the box its
+/// text collides with (points: across, and up and down), none without one: other labels keep off
+/// it as off a halo.
+pub fn background_reach(l: &PlacedLabel) -> [f32; 2] {
+    let (Some([x0, y0, _, y1]), Some(b)) = (background_box(l), l.background.as_ref()) else { return [0.0; 2] };
+    let outline = if b.stroke.is_some_and(|s| s.a() > 0) { b.stroke_width * 1.33 / 2.0 } else { 0.0 };
+    let across = l.center_x() - label_width(l) / 2.0 - x0;
+    let up_down = (y1 - y0) / 2.0 - block_height(&l.text, l.size) / 2.0;
+    [across, up_down].map(|r| (r + outline).max(0.0))
+}
+
+/// Draws a label's background (logical coordinates, upright) at `ppp` pixels a point.
+fn draw_background(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32) {
+    let (Some(r), Some(b)) = (background_box(l), l.background.as_ref()) else { return };
+    let [x0, y0, x1, y1] = r.map(|v| v * ppp);
+    let Some(rect) = Rect::from_ltrb(x0, y0, x1, y1) else { return };
+    let path = crate::layout::rounded_rect(rect, b.radius * 1.33 * ppp).unwrap_or_else(|| tiny_skia::PathBuilder::from_rect(rect));
+    if let Some(f) = b.fill.filter(|f| f.a() > 0) {
+        pm.fill_path(&path, &crate::paint(f, 1.0), tiny_skia::FillRule::Winding, Transform::identity(), None);
+    }
+    if let Some(c) = b.stroke.filter(|c| c.a() > 0 && b.stroke_width > 0.0) {
+        let stroke = tiny_skia::Stroke { width: b.stroke_width * 1.33 * ppp, ..tiny_skia::Stroke::default() };
+        pm.stroke_path(&path, &crate::paint(c, 1.0), &stroke, Transform::identity(), None);
+    }
+}
+
 /// The selection frame [`draw`] puts round a label, in points: [left, top, right, bottom].
 fn frame_box(l: &PlacedLabel) -> [f32; 4] {
     let (w, pad) = (label_width(l), 3.0);
@@ -604,7 +643,10 @@ fn draw_turned(pm: &mut Pixmap, l: &PlacedLabel, angle: f32, ppp: f32, ink: Ink)
     let (w, h) = (label_width(l), block_height(&l.text, l.size).max(line_pitch(l.size)));
     // Room for the halo, and for the glyphs reaching past the line.
     // (The halo is drawn at most MAX_HALO_PX wide, so no more room is kept for it.)
-    let pad = 4.0 + l.size * 0.5 + drawn_halo_reach(l).min(MAX_HALO_PX / ppp.max(f32::EPSILON));
+    let pad = 4.0
+        + l.size * 0.5
+        + drawn_halo_reach(l).min(MAX_HALO_PX / ppp.max(f32::EPSILON))
+        + background_reach(l).into_iter().fold(0.0, f32::max);
     let (pw, ph) = (((w + 2.0 * pad) * ppp).ceil(), ((h + 2.0 * pad) * ppp).ceil());
     if !(pw.is_finite() && ph.is_finite()) || pw > 4096.0 || ph > 4096.0 {
         return;
@@ -656,6 +698,10 @@ fn draw_upright(pm: &mut Pixmap, l: &PlacedLabel, ppp: f32, ink: Ink) {
             draw_text(pm, line, left + lw / 2.0, y, px, color, l.bold, (dx, dy));
         }
     };
+    // Its background under everything.
+    if ink != Ink::Text {
+        draw_background(pm, l, ppp);
+    }
     // Every line's halo first, so none covers the line above it.
     if let Some(h) = l.halo.filter(|_| ink != Ink::Text) {
         match l.halo_width {
@@ -894,6 +940,7 @@ pub fn scale_bar(pm: &mut Pixmap, view: &View, ground_per_pt: f64) {
         angle: None,
         collide: Default::default(),
         glyphs: Vec::new(),
+        background: None,
     };
     draw(pm, &label, ppp);
 }
@@ -997,6 +1044,7 @@ mod spread_tests {
             angle: None,
             collide: Default::default(),
             glyphs: Vec::new(),
+            background: None,
         };
         // At 3 pixels a point: the letter's row through its middle (170 points down).
         let (w, row) = (3000usize, 510usize);

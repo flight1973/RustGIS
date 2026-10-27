@@ -6,7 +6,9 @@
 //! only layers RustGIS can draw are listed (the rest are counted in a note).
 
 use roxmltree::{Node, ParsingOptions};
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use std::rc::Rc;
 
 #[path = "ogc_info.rs"]
 mod info;
@@ -77,6 +79,54 @@ pub struct ServiceLayer {
     pub time: Option<LayerTime>,
     /// A WMS layer's GetFeatureInfo request (its formats empty when the layer isn't queryable).
     pub feature_info: Option<FeatureInfo>,
+    /// A WMS or WMTS layer's legend pictures, the first to show first: a WMS layer's from the
+    /// service's GetLegendGraphic, then its default style's picture; a WMTS layer's default
+    /// style's, each for its scales. None when the service gives none.
+    pub legends: Vec<Legend>,
+}
+
+/// A map layer's legend picture as its service gives it: its address and, as a WMTS style's
+/// legend may say, the scales it is for.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Legend {
+    pub url: String,
+    /// The scale denominators it is for (WMTS 1.0.0's `minScaleDenominator`, inclusive, and
+    /// `maxScaleDenominator`, exclusive); none is open-ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_scale: Option<f64>,
+}
+
+impl Legend {
+    /// Whether it is for the map at scale 1:`scale`.
+    pub fn covers(&self, scale: f64) -> bool {
+        self.min_scale.is_none_or(|m| scale >= m) && self.max_scale.is_none_or(|m| scale < m)
+    }
+}
+
+/// The legends among a layer's for the map at scale 1:`scale`, the one to show first first (the
+/// next is for when it can't be shown).
+pub fn legends_at(legends: &[Legend], scale: f64) -> impl Iterator<Item = &Legend> {
+    legends.iter().filter(move |l| l.covers(scale))
+}
+
+/// The most legend pictures a layer keeps.
+pub const MAX_LEGENDS: usize = 16;
+
+/// Whether a legend picture's format is one RustGIS shows (PNG or JPEG); a legend that names
+/// none is taken to be one.
+fn legend_format(format: Option<&str>) -> bool {
+    format.is_none_or(|f| {
+        let f = f.trim().to_ascii_lowercase();
+        f.is_empty() || f.starts_with("image/png") || f.starts_with("image/jpeg") || f.starts_with("image/jpg")
+    })
+}
+
+/// A scale denominator a legend gives: a positive number.
+fn scale_attr(n: &Node, key: &str) -> Option<f64> {
+    n.attribute(key).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0)
 }
 
 /// A service's capabilities: its kind (`WMS`, `WMTS`, `WFS`, `OGC API Features`), title, the
@@ -415,17 +465,25 @@ fn wms(url: &str, root: &Node) -> Service {
     let mut skipped = 0;
     // Layers inherit their parents' coordinate systems, nearest valid geographic bounds and
     // queryable attribute.
-    let mut stack: Vec<(Node, Vec<String>, Option<[f64; 4]>, bool)> = root
+    // The SLD profile's GetLegendGraphic (WMS 1.3.0 with SLD 1.1, 1.1.1 with SLD 1.0), when the
+    // service offers it in a format RustGIS shows: a layer's legend, drawn from its default style.
+    let legend_graphic = wms_legend_graphic(root, url, &get_map, version);
+    // (What a layer passes on is shared by its sublayers, not copied for each: a hostile document
+    // may give one layer a great many.)
+    type Inherited<'a, 'i> = (Node<'a, 'i>, Rc<[String]>, Option<[f64; 4]>, bool, Rc<[Node<'a, 'i>]>);
+    let mut stack: Vec<Inherited<'_, '_>> = root
         .descendants()
         .filter(|n| n.is_element() && local(n) == "Capability")
         .flat_map(|c| children(&c, "Layer").collect::<Vec<_>>())
-        .map(|l| (l, Vec::new(), None, false))
+        .map(|l| (l, Rc::from([]), None, false, Rc::from([])))
         .collect();
-    while let Some((layer, mut crs, inherited_bbox, inherited_queryable)) = stack.pop() {
+    while let Some((layer, inherited_crs, inherited_bbox, inherited_queryable, inherited_styles)) = stack.pop() {
         if service.layers.len() >= MAX_LAYERS {
             break;
         }
+        let mut crs = inherited_crs.to_vec();
         crs.extend(layer.children().filter(|c| c.is_element() && matches!(local(c), "CRS" | "SRS")).map(|c| text_of(&c)));
+        let crs: Rc<[String]> = crs.into();
         let bbox = child(&layer, "EX_GeographicBoundingBox")
             .and_then(|b| {
                 let f = |k: &str| child_text(&b, k).and_then(|t| t.parse::<f64>().ok());
@@ -439,8 +497,10 @@ fn wms(url: &str, root: &Node) -> Service {
             .or(inherited_bbox);
         let queryable =
             layer.attribute("queryable").map_or(inherited_queryable, |q| q.trim() == "1" || q.trim().eq_ignore_ascii_case("true"));
+        // Its own styles first, then those it inherits (a few: its parents' are each kept).
+        let styles: Rc<[Node]> = children(&layer, "Style").chain(inherited_styles.iter().copied()).take(MAX_STYLES).collect();
         for sub in children(&layer, "Layer") {
-            stack.push((sub, crs.clone(), bbox, queryable));
+            stack.push((sub, Rc::clone(&crs), bbox, queryable, Rc::clone(&styles)));
         }
         let Some(name) = child_text(&layer, "Name") else { continue };
         if !crs.iter().any(|c| c.split_whitespace().any(is_web_mercator)) {
@@ -464,13 +524,75 @@ fn wms(url: &str, root: &Node) -> Service {
                 .as_ref()
                 .map_or_else(|| FeatureInfo { layer: name.clone(), ..FeatureInfo::default() }, |r| r.for_layer(&name, queryable)),
         );
-        service.layers.push(ServiceLayer { name, title, offer: Offer::Tiles { template }, bbox, tilesets: None, time: None, feature_info });
+        // Its legend: the one the service draws from the layer's styling (the SLD profile's
+        // GetLegendGraphic, symbols with their names, as ArcGIS Pro and QGIS show a WMS layer's),
+        // then its default style's `LegendURL` picture (WMS 1.3.0 §7.2.4.6.4, 1.1.1 §7.1.4.5.14: of
+        // its own styles and those it inherits), which some services make a cover page only; the
+        // Layers pane shows the first it can.
+        let mut legends: Vec<Legend> = legend_graphic.as_ref().map(|g| g(&name)).into_iter().collect();
+        if let Some(l) = wms_legend(url, &styles).filter(|l| !legends.contains(l)) {
+            legends.push(l);
+        }
+        service.layers.push(ServiceLayer {
+            name,
+            title,
+            offer: Offer::Tiles { template },
+            bbox,
+            tilesets: None,
+            time: None,
+            feature_info,
+            legends,
+        });
     }
     service.layers.reverse();
     if skipped > 0 {
         service.notes.push(format!("{skipped} layers aren't offered in Web Mercator (EPSG:3857) and are left out"));
     }
     service
+}
+
+/// The most styles a WMS layer's legend is looked for among, its own and those it inherits.
+const MAX_STYLES: usize = 64;
+
+/// A WMS layer's legend: its default style's (the one a GetMap with `STYLES=` draws: the one
+/// named `default`, else the first), the first of its `LegendURL`s in a format RustGIS shows.
+fn wms_legend(url: &str, styles: &[Node]) -> Option<Legend> {
+    let style =
+        styles.iter().find(|s| child_text(s, "Name").is_some_and(|n| n.eq_ignore_ascii_case("default"))).or_else(|| styles.first())?;
+    children(style, "LegendURL").find_map(|l| {
+        if !legend_format(child_text(&l, "Format").as_deref()) {
+            return None;
+        }
+        let href = child(&l, "OnlineResource").and_then(|o| href(&o))?;
+        let url = resolve(url, &href).filter(|h| is_web(h))?;
+        Some(Legend { url, ..Legend::default() })
+    })
+}
+
+/// A service's GetLegendGraphic request for a layer, when its capabilities offer one (the SLD
+/// profile's `GetLegendGraphic` among its requests) in PNG or JPEG.
+fn wms_legend_graphic(root: &Node, url: &str, get_map: &str, version: &str) -> Option<impl Fn(&str) -> Legend + use<>> {
+    let request = root.descendants().find(|n| n.is_element() && local(n) == "GetLegendGraphic")?;
+    let formats: Vec<String> = children(&request, "Format").map(|f| text_of(&f)).collect();
+    let format = ["image/png", "image/jpeg"].into_iter().find(|f| formats.iter().any(|g| g.trim().eq_ignore_ascii_case(f)))?;
+    let get = request
+        .descendants()
+        .find(|n| n.is_element() && local(n) == "Get")
+        .and_then(|g| child(&g, "OnlineResource"))
+        .and_then(|o| href(&o))
+        .and_then(|h| resolve(url, &h))
+        .filter(|h| is_web(h))
+        .unwrap_or_else(|| get_map.to_string());
+    // WMS 1.3.0 asks for the SLD version the request is of (SLD 1.1.0's profile).
+    let sld = if version.starts_with("1.3") { "&SLD_VERSION=1.1.0" } else { "" };
+    let version = version.to_string();
+    Some(move |layer: &str| Legend {
+        url: with_query(
+            &get,
+            &format!("SERVICE=WMS&VERSION={version}&REQUEST=GetLegendGraphic&LAYER={}&FORMAT={}{sld}", encode(layer), encode(format)),
+        ),
+        ..Legend::default()
+    })
 }
 
 /// Percent-encodes a query value.
@@ -537,11 +659,19 @@ fn wmts(url: &str, root: &Node) -> Service {
     for layer in children(&contents, "Layer").take(MAX_LAYERS) {
         let Some(name) = child_text(&layer, "Identifier") else { continue };
         let title = child_text(&layer, "Title").unwrap_or_else(|| name.clone());
-        let style = children(&layer, "Style")
-            .find(|s| s.attribute("isDefault") == Some("true"))
-            .or_else(|| child(&layer, "Style"))
-            .and_then(|s| child_text(&s, "Identifier"))
-            .unwrap_or_else(|| "default".into());
+        let default_style = children(&layer, "Style").find(|s| s.attribute("isDefault") == Some("true")).or_else(|| child(&layer, "Style"));
+        let style = default_style.and_then(|s| child_text(&s, "Identifier")).unwrap_or_else(|| "default".into());
+        // Its default style's legends (WMTS 1.0.0 §7.1.1.1.1), each for the scales it gives.
+        let legends: Vec<Legend> = default_style
+            .iter()
+            .flat_map(|s| children(s, "LegendURL"))
+            .filter(|l| legend_format(l.attribute("format")))
+            .filter_map(|l| {
+                let url = href(&l).and_then(|h| resolve(url, &h)).filter(|h| is_web(h))?;
+                Some(Legend { url, min_scale: scale_attr(&l, "minScaleDenominator"), max_scale: scale_attr(&l, "maxScaleDenominator") })
+            })
+            .take(MAX_LEGENDS)
+            .collect();
         let linked: Vec<String> = children(&layer, "TileMatrixSetLink").filter_map(|l| child_text(&l, "TileMatrixSet")).collect();
         let Some((set, matrices)) = sets.iter().find(|(id, _)| linked.contains(id)) else {
             skipped += 1;
@@ -615,7 +745,16 @@ fn wmts(url: &str, root: &Node) -> Service {
             let hi: Vec<f64> = child_text(&b, "UpperCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
             lonlat_box(*lo.first()?, *lo.get(1)?, *hi.first()?, *hi.get(1)?)
         });
-        service.layers.push(ServiceLayer { name, title, offer: Offer::Tiles { template }, bbox, tilesets: None, time, feature_info: None });
+        service.layers.push(ServiceLayer {
+            name,
+            title,
+            offer: Offer::Tiles { template },
+            bbox,
+            tilesets: None,
+            time,
+            feature_info: None,
+            legends,
+        });
     }
     if skipped > 0 {
         service.notes.push(format!("{skipped} layers have no Web Mercator tile matrix set RustGIS can draw and are left out"));
@@ -722,6 +861,7 @@ fn wfs(url: &str, root: &Node) -> Service {
             tilesets: None,
             time: None,
             feature_info: None,
+            legends: Vec::new(),
         });
     }
     service
@@ -854,6 +994,7 @@ fn wcs(url: &str, root: &Node) -> Service {
             tilesets: None,
             time: None,
             feature_info: None,
+            legends: Vec::new(),
         });
     };
     let mut n = 0;
@@ -1269,6 +1410,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 tilesets: None,
                 time: None,
                 feature_info: None,
+                legends: Vec::new(),
             });
         }
     };
@@ -1291,6 +1433,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             tilesets: None,
             time: None,
             feature_info: None,
+            legends: Vec::new(),
         });
         features(&mut service);
         // A dynamic map's layers, each drawn alone (`layers=show:<id>`): a national layer is
@@ -1311,6 +1454,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                     tilesets: None,
                     time: None,
                     feature_info: None,
+                    legends: Vec::new(),
                 });
             }
         }
@@ -1325,6 +1469,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             tilesets: None,
             time: None,
             feature_info: None,
+            legends: Vec::new(),
         });
     } else if lower.ends_with("/vectortileserver") {
         service.kind = "ArcGIS VectorTileServer".into();
@@ -1341,6 +1486,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             tilesets: None,
             time: None,
             feature_info: None,
+            legends: Vec::new(),
         });
     } else {
         return Err("an ArcGIS address, but not a FeatureServer, MapServer, ImageServer or VectorTileServer".into());
@@ -1425,6 +1571,7 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
             tilesets: None,
             time: None,
             feature_info: None,
+            legends: Vec::new(),
         });
     }
     for s in v.get("services").and_then(|s| s.as_array()).into_iter().flatten().take(MAX_LAYERS) {
@@ -1449,6 +1596,7 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
             tilesets: None,
             time: None,
             feature_info: None,
+            legends: Vec::new(),
         });
     }
     if skipped > 0 {
@@ -1482,6 +1630,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 tilesets: Some(list),
                 time: None,
                 feature_info: None,
+                legends: Vec::new(),
             });
         }
         if !service.layers.is_empty() || service.collections_url.is_some() {
@@ -1522,6 +1671,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 tilesets: Some(list.clone()),
                 time: None,
                 feature_info: None,
+                legends: Vec::new(),
             });
         }
         if let Some((t, list)) = &vector {
@@ -1533,6 +1683,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                 tilesets: Some(list.clone()),
                 time: None,
                 feature_info: None,
+                legends: Vec::new(),
             });
         }
         if map.is_some() || vector.is_some() {
@@ -1570,6 +1721,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             tilesets: None,
             time: None,
             feature_info: None,
+            legends: Vec::new(),
         });
     }
     if unreadable > 0 {
@@ -2787,6 +2939,106 @@ mod tests {
         let water = s.layers.iter().find(|l| l.name == "water bodies").unwrap();
         assert!(matches!(&water.offer, Offer::Tiles { template } if template.contains("LAYERS=water%20bodies")));
         assert!(s.notes.iter().any(|n| n.contains("1 layers")));
+    }
+
+    /// A WMS layer's legend: the one the service draws (GetLegendGraphic, when its capabilities
+    /// offer it in PNG or JPEG), then its default style's `LegendURL` picture (the style named
+    /// `default`, else the first, of its own and those it inherits; the first `LegendURL` in a
+    /// format RustGIS shows); WMS 1.1.1's alike, without the SLD version.
+    #[test]
+    fn wms_legends_from_the_service_and_the_default_style() {
+        let caps = |version: &str, request: &str| {
+            format!(
+                r#"<WMS_Capabilities version="{version}" xmlns="http://www.opengis.net/wms" xmlns:sld="http://www.opengis.net/sld" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.org/wms?"/></Get></HTTP></DCPType></GetMap>{request}</Request>
+<Layer><CRS>EPSG:3857</CRS><SRS>EPSG:3857</SRS>
+  <Style><Name>parent</Name><LegendURL><Format>image/png</Format><OnlineResource xlink:href="https://maps.example.org/legend/parent.png"/></LegendURL></Style>
+  <Layer><Name>inherits</Name></Layer>
+  <Layer><Name>own</Name>
+    <Style><Name>first</Name><LegendURL><Format>image/gif</Format><OnlineResource xlink:href="https://maps.example.org/legend/first.gif"/></LegendURL>
+      <LegendURL><Format>image/png</Format><OnlineResource xlink:href="/legend/first.png"/></LegendURL></Style>
+  </Layer>
+  <Layer><Name>named default</Name>
+    <Style><Name>other</Name><LegendURL><Format>image/png</Format><OnlineResource xlink:href="https://maps.example.org/legend/other.png"/></LegendURL></Style>
+    <Style><Name>default</Name><LegendURL><Format>image/png; mode=8bit</Format><OnlineResource xlink:href="https://maps.example.org/legend/default.png"/></LegendURL></Style>
+  </Layer>
+  <Layer><Name>only svg</Name><Style><Name>s</Name><LegendURL><Format>image/svg+xml</Format><OnlineResource xlink:href="https://maps.example.org/l.svg"/></LegendURL></Style></Layer>
+  <Layer><Name>not on the web</Name><Style><Name>s</Name><LegendURL><Format>image/png</Format><OnlineResource xlink:href="file:///etc/legend.png"/></LegendURL></Style></Layer>
+</Layer></Capability></WMS_Capabilities>"#
+            )
+        };
+        let urls = |s: &Service, name: &str| -> Vec<String> {
+            s.layers.iter().find(|l| l.name == name).unwrap().legends.iter().map(|l| l.url.clone()).collect()
+        };
+        // Without GetLegendGraphic: the default style's pictures.
+        let s = parse("https://maps.example.org/wms", caps("1.3.0", "").as_bytes()).unwrap();
+        assert_eq!(urls(&s, "inherits"), ["https://maps.example.org/legend/parent.png"]);
+        assert_eq!(urls(&s, "own"), ["https://maps.example.org/legend/first.png"], "its own style first; the GIF passed over; resolved");
+        assert_eq!(urls(&s, "named default"), ["https://maps.example.org/legend/default.png"]);
+        // A picture RustGIS doesn't show, or not on the web: the parent's, or none.
+        assert_eq!(urls(&s, "only svg"), Vec::<String>::new());
+        assert_eq!(urls(&s, "not on the web"), Vec::<String>::new());
+        assert!(s.layers.iter().flat_map(|l| &l.legends).all(|l| l.min_scale.is_none() && l.max_scale.is_none()));
+        // With it (swisstopo's, in its SLD namespace): the service's legend first, the style's after.
+        let glg = r#"<sld:GetLegendGraphic><Format>image/gif</Format><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.org/de/?"/></Get></HTTP></DCPType></sld:GetLegendGraphic>"#;
+        let s = parse("https://maps.example.org/wms", caps("1.3.0", glg).as_bytes()).unwrap();
+        assert_eq!(
+            urls(&s, "own"),
+            [
+                "https://maps.example.org/de/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetLegendGraphic&LAYER=own&FORMAT=image%2Fpng&SLD_VERSION=1.1.0",
+                "https://maps.example.org/legend/first.png"
+            ]
+        );
+        assert_eq!(
+            urls(&s, "only svg"),
+            [
+                "https://maps.example.org/de/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetLegendGraphic&LAYER=only%20svg&FORMAT=image%2Fpng&SLD_VERSION=1.1.0"
+            ]
+        );
+        // WMS 1.1.1 (SLD 1.0): no SLD version; its own address, else GetMap's.
+        let glg = r#"<GetLegendGraphic><Format>image/jpeg</Format></GetLegendGraphic>"#;
+        let s = parse("https://maps.example.org/wms", caps("1.1.1", glg).as_bytes()).unwrap();
+        assert_eq!(
+            urls(&s, "inherits").first().map(String::as_str),
+            Some("https://maps.example.org/wms?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetLegendGraphic&LAYER=inherits&FORMAT=image%2Fjpeg")
+        );
+        // Offered only in formats RustGIS doesn't show: not asked.
+        let glg = r#"<GetLegendGraphic><Format>image/gif</Format></GetLegendGraphic>"#;
+        let s = parse("https://maps.example.org/wms", caps("1.3.0", glg).as_bytes()).unwrap();
+        assert_eq!(urls(&s, "own"), ["https://maps.example.org/legend/first.png"]);
+    }
+
+    /// A WMTS layer's legends: its default style's (`isDefault`, else the first), each with the
+    /// scales it is for, in formats RustGIS shows.
+    #[test]
+    fn wmts_legends_for_their_scales() {
+        let xml = r#"<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.0.0"><Contents>
+<Layer><ows:Title>Land</ows:Title><ows:Identifier>land</ows:Identifier>
+ <Style><ows:Identifier>dark</ows:Identifier><LegendURL format="image/png" xlink:href="https://t.example.org/dark.png"/></Style>
+ <Style isDefault="true"><ows:Identifier>light</ows:Identifier>
+  <LegendURL format="image/png" xlink:href="https://t.example.org/near.png" maxScaleDenominator="50000"/>
+  <LegendURL format="image/svg+xml" xlink:href="https://t.example.org/far.svg" minScaleDenominator="50000"/>
+  <LegendURL format="image/jpeg" xlink:href="far.jpg" minScaleDenominator="50000" maxScaleDenominator="junk"/></Style>
+ <TileMatrixSetLink><TileMatrixSet>gm</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL format="image/png" resourceType="tile" template="https://t.example.org/{Style}/{TileMatrix}/{TileRow}/{TileCol}.png"/></Layer>
+<TileMatrixSet><ows:Identifier>gm</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG::3857</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>559082264.0287178</ScaleDenominator><TopLeftCorner>-20037508.34278925 20037508.34278925</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight></TileMatrix></TileMatrixSet>
+</Contents></Capabilities>"#;
+        let s = parse("https://t.example.org/1.0.0/WMTSCapabilities.xml", xml.as_bytes()).unwrap();
+        let legends = &s.layers[0].legends;
+        assert_eq!(
+            legends,
+            &[
+                Legend { url: "https://t.example.org/near.png".into(), min_scale: None, max_scale: Some(50_000.0) },
+                Legend { url: "https://t.example.org/1.0.0/far.jpg".into(), min_scale: Some(50_000.0), max_scale: None },
+            ]
+        );
+        // The one for the map's scale: up to below the maximum, from the minimum.
+        let at = |scale: f64| legends_at(legends, scale).map(|l| l.url.as_str()).collect::<Vec<_>>();
+        assert_eq!(at(10_000.0), ["https://t.example.org/near.png"]);
+        assert_eq!(at(50_000.0), ["https://t.example.org/1.0.0/far.jpg"]);
+        assert_eq!(at(1e9), ["https://t.example.org/1.0.0/far.jpg"]);
+        assert!(legends_at(&legends[..1], 50_000.0).next().is_none(), "none at a scale none is for");
     }
 
     #[test]

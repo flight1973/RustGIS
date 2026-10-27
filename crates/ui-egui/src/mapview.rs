@@ -1338,7 +1338,10 @@ fn draw_label_ink(p: &egui::Painter, l: &PlacedLabel, at: Pos2, halo: bool, text
     };
     // A label turned with the map (along a street): turned about its centre, at `at`.
     if let Some(angle) = l.angle.filter(|a| a.is_finite() && a.abs() > 1e-3) {
-        let (pos, _) = place_galley(Align2::CENTER_CENTER, at, &galley);
+        let (pos, r) = place_galley(Align2::CENTER_CENTER, at, &galley);
+        if halo {
+            draw_background(p, l, r, angle);
+        }
         let shape = |offset: egui::Vec2, color: Color32| {
             egui::epaint::TextShape::new(pos + offset, galley.clone(), color)
                 .with_override_text_color(color)
@@ -1356,6 +1359,9 @@ fn draw_label_ink(p: &egui::Painter, l: &PlacedLabel, at: Pos2, halo: bool, text
         return;
     }
     let (pos, r) = place_galley(anchor, at, &galley);
+    if halo {
+        draw_background(p, l, r, 0.0);
+    }
     // A selected text graphic: framed as laid out, under the text.
     if l.framed {
         let cyan = c32(rustgis_engine::render::SELECTION);
@@ -1370,6 +1376,58 @@ fn draw_label_ink(p: &egui::Painter, l: &PlacedLabel, at: Pos2, halo: bool, text
     if text {
         p.galley_with_override_text_color(pos, galley, c32(l.color));
     }
+}
+
+/// Draws a label's background behind its text laid out in `text` (points), turned by `angle`
+/// (radians, clockwise) about the text's centre: the rectangle grown by its padding, its corners
+/// rounded, filled and outlined.
+fn draw_background(p: &egui::Painter, l: &PlacedLabel, text: Rect, angle: f32) {
+    if !l.glyphs.is_empty() {
+        return;
+    }
+    let Some(b) = l.background.as_ref().filter(|b| b.draws()) else { return };
+    let r = text.expand2(vec2(b.padding[0], b.padding[1]) * 1.33);
+    let points = background_outline(r, b.radius * 1.33, angle);
+    if points.len() < 3 {
+        return;
+    }
+    let fill = b.fill.map_or(Color32::TRANSPARENT, c32);
+    let stroke = match b.stroke {
+        Some(c) if b.stroke_width > 0.0 => Stroke::new(b.stroke_width * 1.33, c32(c)),
+        _ => Stroke::NONE,
+    };
+    p.add(egui::Shape::convex_polygon(points, fill, stroke));
+}
+
+/// A rectangle's outline with its corners rounded by `radius` (at most half its shorter side),
+/// turned by `angle` about its centre: the corners as a few points each.
+fn background_outline(r: Rect, radius: f32, angle: f32) -> Vec<Pos2> {
+    if !(r.is_finite() && r.width() > 0.0 && r.height() > 0.0) {
+        return Vec::new();
+    }
+    let radius = if radius.is_finite() { radius.clamp(0.0, r.width().min(r.height()) / 2.0) } else { 0.0 };
+    let steps = if radius > 0.0 { 4 } else { 0 };
+    // Each corner's centre and the angle its arc starts at, clockwise from the top left.
+    let corners = [
+        (pos2(r.min.x + radius, r.min.y + radius), std::f32::consts::PI),
+        (pos2(r.max.x - radius, r.min.y + radius), -std::f32::consts::FRAC_PI_2),
+        (pos2(r.max.x - radius, r.max.y - radius), 0.0),
+        (pos2(r.min.x + radius, r.max.y - radius), std::f32::consts::FRAC_PI_2),
+    ];
+    let (sin, cos) = angle.sin_cos();
+    let c = r.center();
+    let turn = |q: Pos2| {
+        let d = q - c;
+        pos2(c.x + d.x * cos - d.y * sin, c.y + d.x * sin + d.y * cos)
+    };
+    let mut out = Vec::with_capacity(4 * (steps + 1));
+    for (centre, start) in corners {
+        for i in 0..=steps {
+            let a = start + std::f32::consts::FRAC_PI_2 * i as f32 / steps.max(1) as f32;
+            out.push(turn(centre + vec2(a.cos(), a.sin()) * radius));
+        }
+    }
+    out
 }
 
 /// The most copies of a label's text a halo of its own width is drawn with.
@@ -3615,6 +3673,29 @@ mod halo_tests {
     use super::*;
     use rustgis_engine::map::Rgba;
 
+    #[test]
+    fn a_backgrounds_outline_is_its_rectangle_rounded_and_turned() {
+        let r = Rect::from_min_max(pos2(10.0, 20.0), pos2(50.0, 30.0));
+        // Square: its four corners, clockwise from the top left.
+        assert_eq!(background_outline(r, 0.0, 0.0), vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()]);
+        // Rounded: five points a corner, all within it, the corners themselves cut off.
+        let round = background_outline(r, 3.0, 0.0);
+        assert_eq!(round.len(), 20);
+        assert!(round.iter().all(|p| r.expand(1e-3).contains(*p)));
+        assert!(!round.contains(&r.left_top()));
+        // A radius past half the shorter side is held to it.
+        let most = background_outline(r, 99.0, 0.0);
+        assert!(most.iter().all(|p| r.expand(1e-3).contains(*p)));
+        // Turned a quarter about its centre: as tall as it was wide.
+        let turned = background_outline(r, 0.0, std::f32::consts::FRAC_PI_2);
+        let b = Rect::from_points(&turned);
+        assert!((b.width() - 10.0).abs() < 1e-3 && (b.height() - 40.0).abs() < 1e-3 && (b.center() - r.center()).length() < 1e-3, "{b:?}");
+        // Nothing for a rectangle of no size or no number.
+        assert!(background_outline(Rect::from_min_max(pos2(0.0, 0.0), pos2(0.0, 5.0)), 0.0, 0.0).is_empty());
+        assert!(background_outline(Rect::from_min_max(pos2(0.0, 0.0), pos2(f32::NAN, 5.0)), 0.0, 0.0).is_empty());
+        assert_eq!(background_outline(r, f32::NAN, 0.0).len(), 4);
+    }
+
     fn label(halo_width: Option<f32>) -> PlacedLabel {
         PlacedLabel {
             text: "A".into(),
@@ -3635,6 +3716,7 @@ mod halo_tests {
             angle: None,
             collide: Default::default(),
             glyphs: Vec::new(),
+            background: None,
         }
     }
 

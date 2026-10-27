@@ -161,6 +161,46 @@ pub struct TileLayer {
     /// can be saved, should projects keep it.
     #[serde(skip)]
     pub feature_info: Option<rustgis_data::ogc::FeatureInfo>,
+    /// Its legend pictures (a WMS or WMTS layer's, from its service's default style, or given to
+    /// `map.addTiles`): the Layers pane shows the one for the map's scale under it, as ArcGIS
+    /// Pro's Contents pane does. Web addresses only, at most [`MAX_LEGENDS`](rustgis_data::ogc::MAX_LEGENDS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_legends")]
+    pub legends: Vec<rustgis_data::ogc::Legend>,
+    /// Expanded in the Layers pane, its legend showing.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expanded: bool,
+}
+
+/// The longest legend address kept.
+pub const MAX_LEGEND_URL: usize = 4096;
+
+/// Legend pictures as a tile layer keeps them: web addresses of a sane length, scales that are
+/// positive numbers (others are open-ended), at most [`MAX_LEGENDS`](rustgis_data::ogc::MAX_LEGENDS).
+pub fn checked_legends(legends: impl IntoIterator<Item = rustgis_data::ogc::Legend>) -> Vec<rustgis_data::ogc::Legend> {
+    let scale = |v: Option<f64>| v.filter(|v| v.is_finite() && *v > 0.0);
+    legends
+        .into_iter()
+        .map(|l| rustgis_data::ogc::Legend { url: l.url.trim().to_string(), min_scale: scale(l.min_scale), max_scale: scale(l.max_scale) })
+        .filter(|l| is_web(&l.url) && l.url.len() <= MAX_LEGEND_URL)
+        .take(rustgis_data::ogc::MAX_LEGENDS)
+        .collect()
+}
+
+/// A project's legends, checked; one that isn't a legend is left out, and a value that isn't a
+/// list is none, so a damaged entry doesn't make the project unreadable.
+fn lenient_legends<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<rustgis_data::ogc::Legend>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let list = match value {
+        serde_json::Value::Array(list) => list,
+        _ => Vec::new(),
+    };
+    // Each read field by field: a scale of no number is open-ended, not the legend's loss.
+    let legend = |v: serde_json::Value| {
+        let url = v.get("url")?.as_str()?.to_string();
+        let scale = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
+        Some(rustgis_data::ogc::Legend { url, min_scale: scale("minScale"), max_scale: scale("maxScale") })
+    };
+    Ok(checked_legends(list.into_iter().filter_map(legend)))
 }
 
 /// The most dates a tile layer lists (as the time slider steps through at most).
@@ -259,6 +299,8 @@ impl TileLayer {
             time_hidden: false,
             error: None,
             feature_info: None,
+            legends: Vec::new(),
+            expanded: false,
         }
     }
 
@@ -461,5 +503,49 @@ mod tests {
             serde_json::from_str(r#"{"name": "OSM", "kind": "raster", "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png"}"#)
                 .unwrap_or_else(|e| panic!("{e}"));
         assert!(t.visible && t.opacity == 1.0 && t.max_zoom == 19 && t.tile_size == 256);
+    }
+
+    /// A tile layer's legends and whether they show are kept; a layer without them is written as
+    /// it always was; damaged legends are left out without the rest failing to read.
+    #[test]
+    fn legends_are_kept_and_old_layers_save_as_before() {
+        use rustgis_data::ogc::{Legend, MAX_LEGENDS};
+        let old = r#"{"name":"WMS","kind":"raster","url":"https://maps.example.org/wms?{bbox-epsg-3857}"}"#;
+        let t: TileLayer = serde_json::from_str(old).unwrap();
+        assert!(t.legends.is_empty() && !t.expanded);
+        let saved = serde_json::to_value(&t).unwrap();
+        assert!(saved.get("legends").is_none() && saved.get("expanded").is_none());
+        let mut t = t;
+        t.legends = vec![
+            Legend { url: "https://maps.example.org/legend.png".into(), ..Legend::default() },
+            Legend { url: "https://maps.example.org/far.png".into(), min_scale: Some(5e4), max_scale: None },
+        ];
+        t.expanded = true;
+        let text = serde_json::to_string(&t).unwrap();
+        assert!(
+            text.contains(
+                r#""legends":[{"url":"https://maps.example.org/legend.png"},{"url":"https://maps.example.org/far.png","minScale":50000.0}]"#
+            ),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<TileLayer>(&text).unwrap(), t);
+        // Damaged: entries that aren't legends, not on the web, scales of no number, too many.
+        let many: Vec<String> = (0..40).map(|i| format!(r#""https://x.org/{i}.png""#)).collect();
+        for (legends, want) in [
+            (r#""pink""#.to_string(), 0),
+            (
+                r#"[7, {"url": 3}, {"url": "file:///etc/passwd"}, {"url": "https://ok.org/l.png", "minScale": -4, "maxScale": "x"}]"#
+                    .into(),
+                1,
+            ),
+            (format!("[{}]", many.iter().map(|u| format!(r#"{{"url": {u}}}"#)).collect::<Vec<_>>().join(",")), MAX_LEGENDS),
+        ] {
+            let t: TileLayer =
+                serde_json::from_str(&format!(r#"{{"name":"W","kind":"raster","url":"https://w.org/{{z}}","legends":{legends}}}"#))
+                    .unwrap_or_else(|e| panic!("{legends}: {e}"));
+            assert_eq!(t.legends.len(), want, "{legends}");
+            assert!(t.legends.iter().all(|l| l.min_scale.is_none() && l.max_scale.is_none() || l.min_scale.is_some_and(|m| m > 0.0)));
+        }
+        assert_eq!(checked_legends([Legend { url: format!("https://x.org/{}", "a".repeat(MAX_LEGEND_URL)), ..Legend::default() }]), []);
     }
 }

@@ -4,8 +4,8 @@
 use rustgis_data::GeometryType;
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
-    ArrowStyle, ColorScale, ElementKind, FrameShape, Grid, Layout, LineHead, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TextAlign,
-    TickSide, frame_camera,
+    ArrowStyle, ColorScale, ElementKind, FrameShape, Grid, GridKind, Layout, LineHead, Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits,
+    TextAlign, TickSide, frame_camera,
 };
 use rustgis_map::symbology::LegendEntry;
 use rustgis_map::{Map, Rgba};
@@ -417,7 +417,7 @@ pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, ru
 
 /// A rectangle with its corners rounded by `rad` pixels (at most half its shorter side), each a
 /// quarter circle drawn as a cubic; `None` for square corners, drawn as the plain rectangle.
-fn rounded_rect(r: tiny_skia::Rect, rad: f32) -> Option<tiny_skia::Path> {
+pub(crate) fn rounded_rect(r: tiny_skia::Rect, rad: f32) -> Option<tiny_skia::Path> {
     let rad = rad.min(r.width() / 2.0).min(r.height() / 2.0);
     if rad.is_nan() || rad <= 0.0 {
         return None;
@@ -529,6 +529,98 @@ fn grid_label(g: &Grid, v: f64, lon: bool, step: f64) -> String {
     if text::covers(&s, false) { s } else { s.replace('′', "'").replace('″', "\"") }
 }
 
+/// A graticule's lines over `ext` (longitude/latitude), each with its label.
+fn graticule_lines(g: &Grid, ext: Extent, comma: bool, lines: &mut Vec<(Vec<Coord>, String, bool)>) {
+    if ext.is_empty() {
+        return;
+    }
+    let span = ext.width().max(ext.height());
+    let step = if g.step > 0.0 {
+        g.step.max(0.001)
+    } else {
+        *[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 45.0].iter().find(|s| span / **s <= 8.0).unwrap_or(&60.0)
+    };
+    // Lines run a little past the frame so they cross its edges rather than end on them.
+    let pad = span * 0.02;
+    let (lat0, lat1) = ((ext.min_y - pad).max(-89.9), (ext.max_y + pad).min(89.9));
+    let (lon0, lon1) = (ext.min_x - pad, ext.max_x + pad);
+    let mut n = 0;
+    let mut lon = (ext.min_x / step).floor() * step;
+    while lon <= ext.max_x + step * 1e-9 && n < 200 {
+        let pts = (0..=48).map(|i| Coord::new(lon, lat0 + (lat1 - lat0) * i as f64 / 48.0)).collect();
+        lines.push((pts, decimal(grid_label(g, lon, true, step), comma), true));
+        lon += step;
+        n += 1;
+    }
+    let mut lat = (ext.min_y / step).floor() * step;
+    while lat <= ext.max_y + step * 1e-9 && n < 400 {
+        if lat.abs() <= 90.0 {
+            let pts = (0..=48).map(|i| Coord::new(lon0 + (lon1 - lon0) * i as f64 / 48.0, lat)).collect();
+            lines.push((pts, decimal(grid_label(g, lat, false, step), comma), false));
+        }
+        lat += step;
+        n += 1;
+    }
+}
+
+/// The most lines a measured grid draws each way: past them its step is widened to draw at most
+/// [`WIDENED_LINES`].
+const MAX_MEASURED_LINES: f64 = 100.0;
+/// About how many lines a step too fine for the frame is widened to.
+const WIDENED_LINES: f64 = 50.0;
+
+/// A measured grid's lines over the frame whose edges are `lonlats`, in the coordinate system of
+/// `tr`: eastings (north–south) and northings, each back in longitude/latitude, with its label.
+fn measured_lines(
+    g: &Grid,
+    tr: &rustgis_data::raster::Transformer,
+    lonlats: &[Coord],
+    comma: bool,
+    lines: &mut Vec<(Vec<Coord>, String, bool)>,
+) {
+    let mut ext = Extent::EMPTY;
+    for c in lonlats.iter().filter_map(|c| tr.from_lonlat(*c)) {
+        ext.expand(c);
+    }
+    if ext.is_empty() || !(ext.width().is_finite() && ext.height().is_finite()) {
+        return;
+    }
+    let span = ext.width().max(ext.height());
+    let given = g.step.clamp(0.0, rustgis_map::layout::MAX_MEASURED_STEP);
+    let step = if given > 0.0 {
+        given.max(rustgis_map::layout::MIN_MEASURED_STEP)
+    } else {
+        nice_step(span, rustgis_map::layout::MIN_MEASURED_STEP)
+    };
+    // A step too fine for the frame (a 1 m grid over a country) is widened, not drawn as a blur.
+    let step = if span / step > MAX_MEASURED_LINES { nice_step(span * 8.0 / WIDENED_LINES, step) } else { step };
+    let pad = span * 0.02;
+    let (x0, x1, y0, y1) = (ext.min_x - pad, ext.max_x + pad, ext.min_y - pad, ext.max_y + pad);
+    let back = |x: f64, y: f64| tr.to_lonlat(Coord::new(x, y));
+    // Counted too: at coordinates far larger than the step, adding it may not move a line on.
+    let most = 2 * MAX_MEASURED_LINES as usize;
+    let first = |min: f64| (min / step).floor() * step;
+    for (i, x) in
+        std::iter::successors(Some(first(ext.min_x)), |x| Some(x + step)).take_while(|x| *x <= ext.max_x + step * 1e-9).enumerate()
+    {
+        if i >= most {
+            break;
+        }
+        // (A point that doesn't convert is left out.)
+        let pts: Vec<Coord> = (0..=48).filter_map(|i| back(x, y0 + (y1 - y0) * f64::from(i) / 48.0)).collect();
+        lines.push((pts, decimal(g.measured_label(x, step), comma), true));
+    }
+    for (i, y) in
+        std::iter::successors(Some(first(ext.min_y)), |y| Some(y + step)).take_while(|y| *y <= ext.max_y + step * 1e-9).enumerate()
+    {
+        if i >= most {
+            break;
+        }
+        let pts: Vec<Coord> = (0..=48).filter_map(|i| back(x0 + (x1 - x0) * f64::from(i) / 48.0, y)).collect();
+        lines.push((pts, decimal(g.measured_label(y, step), comma), false));
+    }
+}
+
 /// Where a polyline (in pixels) crosses the edges of a `w` × `h` frame, as (edge, position along
 /// it): the top and bottom edges give x, the left and right ones y.
 fn edge_crossings(pts: &[(f32, f32)], w: f32, h: f32) -> Vec<(Edge, f32)> {
@@ -562,30 +654,78 @@ enum Edge {
     Right,
 }
 
-/// A graticule over a frame: lines across it, ticks along its edges or both, labelled at the
-/// edges the grid names.
+/// The coordinate system of a measured grid on `map`: the grid's own, else the map's when it is
+/// projected, else the WGS 84 UTM zone at `center` (longitude/latitude). `None` for one that
+/// can't be read or isn't projected.
+pub fn measured_crs(g: &Grid, map: &Map, center: Coord) -> Option<rustgis_data::raster::Crs> {
+    use rustgis_data::raster::Crs;
+    let named = g.crs.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let crs = match named {
+        // (One longer than a command keeps, from a crafted project, isn't read each frame.)
+        Some(c) if c.chars().count() > rustgis_map::layout::MAX_GRID_CRS => return None,
+        Some(c) => Crs::parse(c).ok()?,
+        // The map's own: its code (a preset, EPSG:, ESRI: or local:) as its PROJ definition.
+        None => match &map.projection {
+            rustgis_map::Projection::Custom(code) => rustgis_map::projection::lookup(code)
+                .ok()
+                .and_then(|(def, _)| Crs::parse(&def).ok())
+                .or_else(|| Crs::parse(code).ok())
+                .filter(|c| !c.is_geographic()),
+            _ => None,
+        }
+        .map_or_else(|| Crs::from_epsg(rustgis_map::layout::utm_epsg(center.x, center.y)), Some)?,
+    };
+    (!crs.is_geographic()).then_some(crs)
+}
+
+/// A step that draws about eight lines across `span`: 1, 2 or 5 times a power of ten.
+fn nice_step(span: f64, smallest: f64) -> f64 {
+    let rough = (span / 8.0).max(smallest);
+    let p = 10f64.powf(rough.log10().floor());
+    [1.0, 2.0, 5.0, 10.0].iter().map(|k| k * p).find(|s| *s >= rough).unwrap_or(10.0 * p)
+}
+
+/// A grid over a frame: lines across it, ticks along its edges or both, labelled at the edges the
+/// grid names. A graticule's lines are latitudes and longitudes; a measured grid's are eastings and
+/// northings in its coordinate system, bent through it onto the map.
 fn draw_grid(pm: &mut Pixmap, map: &Map, view: &View, g: &Grid, comma: bool) {
     let ppp = view.pixels_per_point as f32;
     let (w, h) = (view.width, view.height);
+    // The frame's edges in longitude/latitude: its corners and points along each side.
+    let mut edge_points = Vec::new();
+    for i in 0..=8 {
+        let t = f64::from(i) / 8.0;
+        edge_points.extend([(w * t, 0.0), (w * t, h), (0.0, h * t), (w, h * t)]);
+    }
+    let lonlats: Vec<Coord> = edge_points.iter().filter_map(|&(sx, sy)| map.to_lonlat(view.camera.to_map(sx, sy, w, h))).collect();
     let mut ext = Extent::EMPTY;
-    for (sx, sy) in [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h), (w / 2.0, 0.0), (w / 2.0, h), (0.0, h / 2.0), (w, h / 2.0)] {
-        if let Some(c) = map.to_lonlat(view.camera.to_map(sx, sy, w, h)) {
-            ext.expand(c);
-        }
+    for c in &lonlats {
+        ext.expand(*c);
     }
     if ext.is_empty() {
         return;
     }
-    let span = ext.width().max(ext.height());
-    let step = if g.step > 0.0 {
-        g.step.max(0.001)
-    } else {
-        *[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 45.0].iter().find(|s| span / **s <= 8.0).unwrap_or(&60.0)
-    };
-    // Lines run a little past the frame so they cross its edges rather than end on them.
-    let pad = span * 0.02;
-    let (lat0, lat1) = ((ext.min_y - pad).max(-89.9), (ext.max_y + pad).min(89.9));
-    let (lon0, lon1) = (ext.min_x - pad, ext.max_x + pad);
+    // Each line: its points in longitude/latitude, its label, and whether it runs north–south
+    // (labelled along the top and bottom first).
+    let mut lines: Vec<(Vec<Coord>, String, bool)> = Vec::new();
+    match g.kind {
+        GridKind::Graticule => {
+            // Over the extent of the frame's corners and midpoints, as it always was (its step and
+            // lines unchanged for the layouts made before measured grids).
+            let mut corners = Extent::EMPTY;
+            for (sx, sy) in [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h), (w / 2.0, 0.0), (w / 2.0, h), (0.0, h / 2.0), (w, h / 2.0)] {
+                if let Some(c) = map.to_lonlat(view.camera.to_map(sx, sy, w, h)) {
+                    corners.expand(c);
+                }
+            }
+            graticule_lines(g, corners, comma, &mut lines);
+        }
+        GridKind::Measured => {
+            let center = map.to_lonlat(view.camera.to_map(w / 2.0, h / 2.0, w, h)).unwrap_or_else(|| ext.center());
+            let Some(tr) = measured_crs(g, map, center).and_then(|c| c.transformer().ok()) else { return };
+            measured_lines(g, &tr, &lonlats, comma, &mut lines);
+        }
+    }
     // A tilted frame's lines break where they pass behind the eye.
     let to_px = |c: Coord| {
         map.to_map(c)
@@ -603,7 +743,7 @@ fn draw_grid(pm: &mut Pixmap, map: &Map, view: &View, g: &Grid, comma: bool) {
     let mut pb = PathBuilder::new();
     // Each label's edge, place along it, text, and whether it is a meridian's.
     let mut labels: Vec<(Edge, f32, String, bool)> = Vec::new();
-    let mut draw_line = |pb: &mut PathBuilder, pts: Vec<Coord>, v: f64, lon: bool| {
+    let mut draw_line = |pb: &mut PathBuilder, pts: Vec<Coord>, label: String, lon: bool| {
         let px: Vec<Option<(f32, f32)>> = pts.into_iter().map(to_px).collect();
         // Runs of points that projected, so a line breaks where its projection does.
         for run in px.split(|p| p.is_none()) {
@@ -631,27 +771,13 @@ fn draw_grid(pm: &mut Pixmap, map: &Map, view: &View, g: &Grid, comma: bool) {
                     Edge::Right => g.edges.right,
                 };
                 if g.labels && shown {
-                    labels.push((edge, at, decimal(grid_label(g, v, lon, step), comma), lon));
+                    labels.push((edge, at, label.clone(), lon));
                 }
             }
         }
     };
-    let mut n = 0;
-    let mut lon = (ext.min_x / step).floor() * step;
-    while lon <= ext.max_x + step * 1e-9 && n < 200 {
-        let pts = (0..=48).map(|i| Coord::new(lon, lat0 + (lat1 - lat0) * i as f64 / 48.0)).collect();
-        draw_line(&mut pb, pts, lon, true);
-        lon += step;
-        n += 1;
-    }
-    let mut lat = (ext.min_y / step).floor() * step;
-    while lat <= ext.max_y + step * 1e-9 && n < 400 {
-        if lat.abs() <= 90.0 {
-            let pts = (0..=48).map(|i| Coord::new(lon0 + (lon1 - lon0) * i as f64 / 48.0, lat)).collect();
-            draw_line(&mut pb, pts, lat, false);
-        }
-        lat += step;
-        n += 1;
+    for (pts, label, lon) in lines {
+        draw_line(&mut pb, pts, label, lon);
     }
     if let Some(p) = pb.finish() {
         pm.stroke_path(&p, &paint_line, &stroke, Transform::identity(), None);
@@ -2032,6 +2158,121 @@ mod tests {
 
     fn ink(p: tiny_skia::PremultipliedColorU8) -> bool {
         p.red() < 90 && p.green() < 90 && p.blue() < 90
+    }
+
+    /// A page whose 80 mm frame shows Winterthur at 1:25,000 (2 km across) on a map in `projection`.
+    fn winterthur_page(grid: rustgis_map::layout::Grid, projection: rustgis_map::Projection) -> Pixmap {
+        let mut m = Map::new("m");
+        m.projection = projection;
+        let mut maps = vec![m];
+        let mut l = Layout::new("Layout", 100.0, 100.0);
+        l.add(
+            "Map",
+            (10.0, 10.0, 80.0, 80.0),
+            ElementKind::MapFrame {
+                map: "m".into(),
+                center: Coord::new(8.73, 47.5),
+                scale: 25_000.0,
+                shape: FrameShape::Rectangle,
+                grid: Some(grid),
+                extent_of: None,
+                extent_color: rustgis_map::layout::INDICATOR_COLOR,
+                extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+            },
+        );
+        render(&l, &mut maps, 96.0, &PageInfo::default()).unwrap()
+    }
+
+    /// Where red runs cross a row of the page (page millimetres): the middle of each run.
+    fn red_runs(pm: &Pixmap, y_mm: f64) -> Vec<f64> {
+        let y = (y_mm * PT_PER_MM) as u32;
+        let mut out = Vec::new();
+        let mut start = None;
+        for x in 0..pm.width() {
+            match (pm.pixel(x, y).is_some_and(red), start) {
+                (true, None) => start = Some(x),
+                (false, Some(s)) => {
+                    out.push(f64::from(s + x - 1) / 2.0 / PT_PER_MM);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A measured grid: eastings and northings its step apart in its coordinate system (1 km is
+    /// 40 mm at 1:25,000), bent onto the map's projection, straight on a map in that system; the
+    /// map's own system, else the frame's UTM zone, when it names none; nothing for a system it
+    /// can't draw.
+    #[test]
+    fn measured_grids_draw_eastings_and_northings() {
+        use rustgis_map::layout::{Grid, GridKind};
+        let utm = Grid {
+            kind: GridKind::Measured,
+            crs: Some("EPSG:25832".into()),
+            step: 1000.0,
+            color: Rgba::rgb(0xFF, 0, 0),
+            labels: false,
+            width: 1.5,
+            ..Grid::default()
+        };
+        let gaps = |xs: &[f64]| xs.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
+        // On Web Mercator: 1 km is 40 mm on paper, give or take Mercator's scale at 47.5°N.
+        let pm = winterthur_page(utm.clone(), rustgis_map::Projection::WebMercator);
+        let xs = red_runs(&pm, 50.0);
+        assert!(xs.len() >= 2, "{xs:?}");
+        assert!(gaps(&xs).iter().all(|g| (g - 40.0).abs() < 1.5), "{xs:?}");
+        // On a map in EPSG:25832 itself: exactly 40 mm, and straight (the same at the top and bottom).
+        let own = rustgis_map::Projection::Custom("EPSG:25832".into());
+        let pm = winterthur_page(utm.clone(), own.clone());
+        let (top, bottom) = (red_runs(&pm, 20.0), red_runs(&pm, 80.0));
+        assert!(gaps(&top).iter().all(|g| (g - 40.0).abs() < 0.3), "{top:?}");
+        assert_eq!(top.len(), bottom.len());
+        assert!(top.iter().zip(&bottom).all(|(a, b)| (a - b).abs() < 0.3), "{top:?} {bottom:?}");
+        // Naming none: the map's own system draws the same grid; on Web Mercator, UTM 32N's
+        // (EPSG:32632, the same eastings as 25832 to a metre) does.
+        let unnamed = Grid { crs: None, ..utm.clone() };
+        assert!(red_runs(&winterthur_page(unnamed.clone(), own), 20.0).iter().zip(&top).all(|(a, b)| (a - b).abs() < 0.3));
+        let mercator = red_runs(&winterthur_page(utm.clone(), rustgis_map::Projection::WebMercator), 20.0);
+        let zone = red_runs(&winterthur_page(unnamed, rustgis_map::Projection::WebMercator), 20.0);
+        assert_eq!(mercator.len(), zone.len());
+        assert!(mercator.iter().zip(&zone).all(|(a, b)| (a - b).abs() < 0.3), "{mercator:?} {zone:?}");
+        // A map in an ESRI system (or a preset): its own, by its PROJ definition, straight on it.
+        let esri = rustgis_map::Projection::Custom("ESRI:102031".into());
+        let pm = winterthur_page(Grid { crs: None, ..utm.clone() }, esri);
+        let (top, bottom) = (red_runs(&pm, 20.0), red_runs(&pm, 80.0));
+        assert!(top.len() >= 2 && top.len() == bottom.len(), "{top:?} {bottom:?}");
+        assert!(top.iter().zip(&bottom).all(|(a, b)| (a - b).abs() < 0.3), "the map's own system: straight {top:?} {bottom:?}");
+        // A system it can't draw (geographic, unknown): nothing.
+        for crs in ["EPSG:4326", "EPSG:1", "not a system"] {
+            let pm = winterthur_page(Grid { crs: Some(crs.into()), ..utm.clone() }, rustgis_map::Projection::WebMercator);
+            assert_eq!(count(&pm, (10.0, 10.0, 90.0, 90.0), red), 0, "{crs}");
+        }
+        // A step too fine for the frame is widened rather than drawn as a blur.
+        let fine = winterthur_page(Grid { step: 1.0, ..utm.clone() }, rustgis_map::Projection::WebMercator);
+        // (About 2 km across: 50 m apart, some 40 lines across the frame.)
+        let across = red_runs(&fine, 50.0).len();
+        assert!((20..=55).contains(&across), "{across} lines across: not a red blur");
+        // Its labels: eastings and northings, whole or short, a step apart.
+        let tr = rustgis_data::raster::Crs::parse("EPSG:25832").unwrap().transformer().unwrap();
+        let frame: Vec<Coord> =
+            [(8.71, 47.49), (8.75, 47.49), (8.75, 47.51), (8.71, 47.51)].iter().map(|&(x, y)| Coord::new(x, y)).collect();
+        let mut lines = Vec::new();
+        measured_lines(&utm, &tr, &frame, false, &mut lines);
+        let eastings: Vec<&str> = lines.iter().filter(|l| l.2).map(|l| l.1.as_str()).collect();
+        assert!(eastings.contains(&"479000") && eastings.contains(&"480000"), "{eastings:?}");
+        assert!(lines.iter().filter(|l| !l.2).any(|l| l.1 == "5261000"), "{lines:?}");
+        let mut short = Vec::new();
+        measured_lines(&Grid { short: true, ..utm.clone() }, &tr, &frame, false, &mut short);
+        assert!(short.iter().any(|l| l.2 && l.1 == "79") && short.iter().any(|l| !l.2 && l.1 == "61"));
+        // A frame of no extent draws none.
+        let mut none = Vec::new();
+        measured_lines(&utm, &tr, &[], false, &mut none);
+        assert!(none.is_empty());
+        assert_eq!((nice_step(2000.0, 1.0), nice_step(7000.0, 1.0), nice_step(1.0, 1.0)), (500.0, 1000.0, 1.0));
     }
 
     #[test]

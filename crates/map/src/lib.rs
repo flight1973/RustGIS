@@ -31,8 +31,8 @@ pub use color::{Ramp, RampGroup, Rgba};
 pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
-    ClassMethod, FontName, Glyph, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin, LineMark, LineMarkers,
-    LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
+    ClassMethod, FontName, Glyph, LabelBackground, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin,
+    LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
 
@@ -1067,6 +1067,10 @@ impl Map {
             }
             for (_, url) in &mut tile.time_urls {
                 addresses.push(url);
+            }
+            // (A legend's address is built from the service's, its key or password included.)
+            for legend in &mut tile.legends {
+                addresses.push(&mut legend.url);
             }
         }
         if let Some(view::Terrain { source: view::TerrainSource::Tiles { url, .. }, .. }) = &mut self.view.terrain {

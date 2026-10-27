@@ -1422,11 +1422,25 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, count: usize, reorder: 
     let shown = if tile.overlay { format!("{} · {}", tile.name, tl!("overlay")) } else { tile.name.clone() };
     let name = row_name(ui, shown.clone(), regular(12.5), ui.available_width() - NAME_X - 8.0);
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), name.row_h), Sense::click());
+    // Named for screen readers as a layer's row is.
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &tile.name));
     if resp.hovered() {
         ui.painter().rect_filled(r.shrink2(vec2(4.0, 1.0)), CornerRadius::same(5), t.hover);
     }
-    // Lined up with the layer rows' checkboxes, icons and names.
+    // Lined up with the layer rows' arrows, checkboxes, icons and names.
     let cy = r.min.y + 13.0;
+    // A WMS or WMTS layer's legend opens under it, as a feature layer's classes do.
+    let has_legend = !tile.legends.is_empty();
+    let ar = Rect::from_center_size(pos2(r.min.x + 16.0, cy), vec2(14.0, 14.0));
+    if has_legend {
+        icons::paint(ui.painter(), ar, if tile.expanded { "chevron_down" } else { "chevron_right" }, t.text_dim, t.accent);
+    }
+    let ar_resp = has_legend.then(|| {
+        let r = ui.interact(hit(ar), egui::Id::unique(("tile_expand", i)), Sense::click());
+        let what = if tile.expanded { tl!("Hide legend") } else { tl!("Show legend") };
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, what));
+        r
+    });
     let mut x = r.min.x + 26.0;
     let cb = Rect::from_center_size(pos2(x + 7.0, cy), vec2(14.0, 14.0));
     let cb_resp = ui.interact(hit(cb), egui::Id::unique(("tile_vis", i)), Sense::click()).on_hover_text(tl!("Show or hide"));
@@ -1448,6 +1462,8 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, count: usize, reorder: 
     let mut action: Option<(&str, Value)> = None;
     if cb_resp.clicked() {
         action = Some(("map.setTiles", json!({"index": i, "visible": !tile.visible})));
+    } else if ar_resp.is_some_and(|a| a.clicked()) {
+        action = Some(("map.expandTiles", json!({"index": i})));
     }
     let mut hover = if elided { format!("{shown}\n{}", tile.url) } else { tile.url.clone() };
     if let Some(error) = &tile.error {
@@ -1500,6 +1516,9 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, count: usize, reorder: 
             ui.close();
         }
     });
+    if has_legend && tile.expanded {
+        crate::tilelegend::show(app, ui, i, tile, t);
+    }
     if let Some((cmd, p)) = action {
         let _ = app.run(cmd, p);
     }
@@ -3394,6 +3413,8 @@ pub fn tool_icon(id: &str) -> &'static str {
         "clip" => "clip",
         "erase" => "erase",
         "intersect" => "intersect",
+        "identity" => "identity",
+        "union" => "union",
         "dissolve" => "dissolve",
         "convexHull" => "hull",
         "featureToPoint" => "centroid",

@@ -1850,9 +1850,11 @@ mod tests {
         h.event(egui::Event::Text("y".into()));
         h.run_steps(60);
         h.get_by_label("labels.style");
-        // Scroll the box back to its top, away from the cursor.
+        // Scroll the box back to its top, away from the cursor: the pointer low in the pane, clear
+        // of the list and its help above the cursor (which a command with many parameters makes
+        // tall), so the wheel scrolls the box rather than the list.
         let at = h.get_by_role(egui::accesskit::Role::MultilineTextInput).rect().center();
-        h.event(egui::Event::PointerMoved(egui::pos2(at.x, 200.0)));
+        h.event(egui::Event::PointerMoved(egui::pos2(at.x, 640.0)));
         h.event(egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, 100_000.0),

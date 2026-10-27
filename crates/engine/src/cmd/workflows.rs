@@ -190,6 +190,8 @@ pub fn gallery_list(kind: &str) -> CmdResult {
             "clip",
             "erase",
             "intersect",
+            "identity",
+            "union",
             "dissolve",
             "convexHull",
             "featureToPoint",
