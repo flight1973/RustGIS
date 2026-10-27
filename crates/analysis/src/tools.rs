@@ -1102,8 +1102,10 @@ fn count_vertex_points(feats: &[&rustgis_data::Feature], kept: usize, width: usi
 
 /// Whether the browser can give the web app `need` bytes now, and a quarter more as a margin for
 /// what the estimate leaves out, such as the renderer's buffers. The allocator is asked for them
-/// in one block, freed at once, so its real ceiling (2 GiB on some devices, 4 GiB at most) and the
-/// free space inside memory both count. Elsewhere the system manages memory, so this is `true`.
+/// in one block, freed at once, so the free space inside memory counts. On wasm32 a single block
+/// can't exceed `isize::MAX` (2 GiB), so the probe can't confirm more than that: a larger estimate
+/// is refused even where the browser could give more. Elsewhere the system manages memory, so this
+/// is `true`.
 fn web_has_room(need: u64) -> bool {
     #[cfg(target_arch = "wasm32")]
     {
@@ -1127,7 +1129,7 @@ fn check_room(n: usize, need: u64, has_room: impl FnOnce(u64) -> bool) -> Result
         return Ok(());
     }
     Err(format!(
-        "Feature Vertices To Points: {n} points would need about {} MB, more than the browser can give now: select fewer features, or simplify ones with many vertices",
+        "Feature Vertices To Points: {n} points would need about {} MiB, more than the browser can give now: select fewer features, or simplify ones with many vertices",
         need.div_ceil(1 << 20)
     ))
 }
@@ -2801,7 +2803,7 @@ mod tests {
         // Refused when the memory isn't there, saying what the points would need.
         assert!(check_room(3, 1 << 20, |_| true).is_ok());
         let e = check_room(3, (1 << 20) + 1, |need| need < 1 << 20).unwrap_err();
-        assert!(e.contains("3 points would need about 2 MB, more than the browser can give now"), "{e}");
+        assert!(e.contains("3 points would need about 2 MiB, more than the browser can give now"), "{e}");
     }
 
     #[test]

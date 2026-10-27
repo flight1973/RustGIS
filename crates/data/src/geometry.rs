@@ -242,7 +242,7 @@ fn open_len(path: &[Coord], ring: bool) -> usize {
 }
 
 impl Geometry {
-    /// Calls `f` with each path vertices lie on: its part and ring, and whether it is a polygon
+    /// Calls `f` with each path that vertices lie on: its part and ring, and whether it is a polygon
     /// ring. Nothing is allocated, so a geometry of many parts costs no memory to walk.
     fn for_each_path(&self, mut f: impl FnMut(usize, usize, &[Coord], bool)) {
         match self {
