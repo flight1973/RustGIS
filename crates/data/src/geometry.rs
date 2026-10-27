@@ -263,7 +263,9 @@ impl Geometry {
         }
     }
 
-    /// The path a vertex lies on, and whether it is a polygon ring.
+    /// The path a vertex lies on, and whether it is a polygon ring. It picks out the same path that
+    /// [`Geometry::for_each_path`] passes to its callback for these indices, so the two must change
+    /// together.
     fn path(&self, part: usize, ring: usize) -> Option<(&[Coord], bool)> {
         match self {
             Geometry::Point(c) => (part == 0 && ring == 0).then_some((std::slice::from_ref(c), false)),
