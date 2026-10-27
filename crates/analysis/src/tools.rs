@@ -1083,7 +1083,12 @@ fn vertex_point_bytes(own: &[Value], width: usize) -> u64 {
 
 /// The vertices of `feats` and, when `estimate`, the memory of their points (see
 /// [`vertex_point_bytes`]), each copying `kept` of its feature's attributes into `width`.
-fn count_vertex_points(feats: &[&rustgis_data::Feature], kept: usize, width: usize, estimate: bool) -> (usize, u64) {
+fn count_vertex_points<'a>(
+    feats: impl IntoIterator<Item = &'a rustgis_data::Feature>,
+    kept: usize,
+    width: usize,
+    estimate: bool,
+) -> (usize, u64) {
     let (mut n, mut need) = (0usize, 0u64);
     for f in feats {
         let Some(g) = &f.geometry else { continue };
@@ -1171,19 +1176,23 @@ fn feature_vertices_to_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, 
     }
     let mut out = copy_schema(ds, out_name(p, format!("{}_Vertices", ds.name)), GeometryType::Point);
     out.crs = ds.crs;
-    // A name the input already has keeps its field, and the new one gets a number, as Spatial
-    // Join's fields do.
+    // A name the input already has keeps its field, and the new one gets a suffix, as Intersect's
+    // and Spatial Join's do.
     for name in VERTEX_FIELDS {
         let field = Field::new(unique_field(&out, name), FieldType::Integer);
         out.fields.push(field);
     }
     let (kept, width) = (ds.fields.len(), out.fields.len());
-    let feats: Vec<_> = rows(inp, p, "input", ds).into_iter().filter_map(|r| ds.features.get(r)).collect();
+    // The selected features, or all of them, walked in place rather than listed as `rows` does:
+    // nothing is allocated before the memory is checked.
+    let sel = inp.selection(s(p, "input"));
+    let all = 0..if sel.is_empty() { ds.features.len() } else { 0 };
+    let feats = || sel.iter().copied().chain(all.clone()).filter_map(|r| ds.features.get(r));
     // Counted first, so the points are allocated once at their final size: growing the list would
     // copy it and briefly hold it twice. In the browser, whose memory has a ceiling, the points'
     // memory is also estimated and asked for before anything is built.
     let web = cfg!(target_arch = "wasm32");
-    let (n, need) = count_vertex_points(&feats, kept, width, web);
+    let (n, need) = count_vertex_points(feats(), kept, width, web);
     check_room(n, need, web_has_room)?;
     // The point list and each point's attributes are allocated fallibly, so running out of memory
     // while they're built stops the tool with a message. (A desktop system that overcommits memory
@@ -1193,7 +1202,7 @@ fn feature_vertices_to_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, 
     points.try_reserve_exact(n).map_err(no_memory)?;
     let int = |k: usize| Value::Int(i64::try_from(k).unwrap_or(i64::MAX));
     let (mut id, mut failed) = (0u64, None);
-    for f in feats {
+    for f in feats() {
         let Some(g) = &f.geometry else { continue };
         let own = f.attrs.get(..kept).unwrap_or(&f.attrs);
         // An id a reader wrapped from a negative key (a GeoPackage's) is that key again.
@@ -2798,8 +2807,8 @@ mod tests {
         attrs.push(Value::Text("not copied".into()));
         let a = Feature { id: 1, geometry: Some(line), attrs };
         let b = Feature { id: 2, geometry: None, attrs: vec![] };
-        assert_eq!(count_vertex_points(&[&a, &b], 2, 6, false), (3, 0));
-        assert_eq!(count_vertex_points(&[&a, &b], 2, 6, true), (3, 3 * vertex_point_bytes(&own, 6)));
+        assert_eq!(count_vertex_points([&a, &b], 2, 6, false), (3, 0));
+        assert_eq!(count_vertex_points([&a, &b], 2, 6, true), (3, 3 * vertex_point_bytes(&own, 6)));
         // Refused when the memory isn't there, saying what the points would need.
         assert!(check_room(3, 1 << 20, |_| true).is_ok());
         let e = check_room(3, (1 << 20) + 1, |need| need < 1 << 20).unwrap_err();
