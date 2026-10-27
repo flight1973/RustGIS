@@ -3313,17 +3313,21 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 let hint = match p.kind {
                     ParamKind::Number => tl!("number"),
                     ParamKind::Path => tl!("file path"),
+                    ParamKind::SaveFile { .. } if cfg!(target_arch = "wasm32") => tl!("File name"),
+                    ParamKind::SaveFile { .. } => tl!("file path"),
                     _ => "",
                 };
                 let mut browse = false;
                 // Browse picks a file to read: on the desktop for any file input (GeoLibre's too);
                 // in the browser, where the file itself goes with the run, only for plugins.
-                let browsable = p.kind == ParamKind::Path && (app.services.open_async.is_none() || plugin_tool);
+                let browsable = (p.kind == ParamKind::Path && (app.services.open_async.is_none() || plugin_tool))
+                    || (matches!(p.kind, ParamKind::SaveFile { .. }) && !cfg!(target_arch = "wasm32"));
                 let changed = if browsable {
                     // One row: the path box takes what the button leaves.
                     let row = vec2(ui.available_width(), ui.spacing().interact_size.y);
                     ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        browse = ui.button(tl!("Browse")).clicked();
+                        browse =
+                            ui.button(if matches!(p.kind, ParamKind::SaveFile { .. }) { tl!("Save As") } else { tl!("Browse") }).clicked();
                         ui.add(egui::TextEdit::singleline(&mut v).hint_text(hint).desired_width(f32::INFINITY))
                             .on_hover_text(tl!(p.label))
                             .changed()
@@ -3346,14 +3350,41 @@ fn geoprocessing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         ui.add_space(4.0);
     }
-    if let Some(param) = browse_for {
-        browse_file(app, spec.id, param);
+    if let Some(param) = browse_for
+        && let Some(p) = spec.params.iter().find(|p| p.name == param)
+    {
+        if let ParamKind::SaveFile { ext } = p.kind {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let name = app.gp.values.get(param).filter(|v| !v.trim().is_empty()).cloned().unwrap_or_else(|| {
+                    format!("{}.{}", first_layer.and_then(|n| app.gp.values.get(n)).map(String::as_str).unwrap_or("output"), ext)
+                });
+                if let Some(path) = crate::dialogs::pick_save(&name, &[ext], tl!(p.label)) {
+                    app.gp.values.insert(param, path);
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            let _ = ext;
+        } else {
+            browse_file(app, spec.id, param);
+        }
     }
     ui.add_space(8.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
         // One browser run at a time, and one plugin run.
         let idle = app.gp.web_run.is_none() && app.gp.plugin_run.is_none();
         if crate::widgets::primary_button(ui, tl!("Run"), idle, vec2(96.0, 30.0)).clicked() {
+            // A blank output opens Save As before any work starts. Cancelling writes nothing.
+            #[cfg(not(target_arch = "wasm32"))]
+            for p in spec.params {
+                if let ParamKind::SaveFile { ext } = p.kind
+                    && app.gp.values.get(p.name).is_none_or(|v| v.trim().is_empty())
+                {
+                    let input = first_layer.and_then(|n| app.gp.values.get(n)).map(String::as_str).unwrap_or("output");
+                    let Some(path) = crate::dialogs::pick_save(&format!("{input}.{ext}"), &[ext], tl!(p.label)) else { return };
+                    app.gp.values.insert(p.name, path);
+                }
+            }
             let mut params = serde_json::Map::new();
             // The tools of a suite or a plugin read their inputs as text; a plugin's is handed
             // every parameter, so it gets only those it declares.

@@ -1102,7 +1102,10 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
             return Err(format!("{path} is too large to open"));
         }
         let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-        return add_sheet(s, p, path, &bytes);
+        // Read from disk: the table keeps the workbook's path, so an export can't replace it.
+        let mut read = read_sheet(p, path, &bytes)?;
+        read.0.source = Some(std::path::absolute(path).map_or_else(|_| path.to_string(), |a| a.display().to_string()));
+        return add_read(s, p, read);
     }
     #[cfg(not(target_arch = "wasm32"))]
     if large_osm(path) {
@@ -2346,11 +2349,15 @@ fn add_encoded_polyline(s: &mut Session, p: &Value) -> CmdResult {
 /// Adds a sheet of a spreadsheet (`"layer"` names it; the first by default), read like delimited
 /// text with the same options.
 pub(crate) fn add_sheet(s: &mut Session, p: &Value, file_name: &str, bytes: &[u8]) -> CmdResult {
+    let read = read_sheet(p, file_name, bytes)?;
+    add_read(s, p, read)
+}
+
+fn read_sheet(p: &Value, file_name: &str, bytes: &[u8]) -> Result<(rustgis_data::Dataset, rustgis_data::ReadReport), String> {
     let stem = Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or("sheet");
     let opts = csv_options(p)?.unwrap_or_default();
     let sheet = ps(p, "layer").map(str::trim).filter(|l| !l.is_empty());
-    let read = rustgis_data::sheets::read(bytes, stem, sheet, &opts).map_err(|e| format!("{file_name}: {e}"))?;
-    add_read(s, p, read)
+    rustgis_data::sheets::read(bytes, stem, sheet, &opts).map_err(|e| format!("{file_name}: {e}"))
 }
 
 /// The `x`, `y`, `wkt`, `crs` and `delimiter` parameters for a delimited text file, when any is

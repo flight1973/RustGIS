@@ -257,7 +257,7 @@ fn undo_steps_share_the_layers_they_leave_alone() {
     s.run("layer.rename", &json!({"layer": "Nations", "name": "States"})).unwrap();
     let live = s.map().layer_by_name("States").unwrap();
     let id = live.id;
-    for (snap, _, _, _, _) in &s.undo {
+    for (snap, ..) in &s.undo {
         let old = snap.maps.iter().flat_map(|m| &m.layers).find(|l| l.id == id).unwrap();
         assert!(old.dataset.features.shares(&live.dataset.features), "the snapshot copied the features");
         assert_eq!(old.projected_cache().as_ptr(), live.projected_cache().as_ptr(), "the snapshot copied the projected geometry");
@@ -266,7 +266,7 @@ fn undo_steps_share_the_layers_they_leave_alone() {
     let before = s.map().layer_by_name("Cities").unwrap().dataset.features.len();
     s.run("edit.addFeature", &json!({"layer": "Cities", "geometry": {"type": "Point", "coordinates": [1.0, 2.0]}})).unwrap();
     let cities = s.map().layer_by_name("Cities").unwrap();
-    let (snap, _, _, _, _) = s.undo.last().unwrap();
+    let (snap, ..) = s.undo.last().unwrap();
     let old = snap.maps.iter().flat_map(|m| &m.layers).find(|l| l.id == cities.id).unwrap();
     assert!(!old.dataset.features.shares(&cities.dataset.features));
     assert_eq!((old.dataset.features.len(), cities.dataset.features.len()), (before, before + 1));
@@ -7527,6 +7527,77 @@ fn tools_read_streamed_layers_whole() {
     s.run("gp.run", &json!({"tool": "calculateGeometry", "params": {"input": "tools"}})).unwrap();
     assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 2500);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn pmtiles_exports_selected_streamed_features_by_id_and_honors_extent_without_selection() {
+    use crate::render::rustgis_tiles::mvt;
+    use std::collections::BTreeSet;
+    let path = grid_fgb("pmtiles-streamed-selection", 20);
+    let mut s = Session::new(Project::default());
+    s.queue_gp_files = true;
+    s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap();
+    let view = view_of(&mut s, rustgis_geom::Extent::new(0.0, 0.0, 40.0, 40.0));
+    crate::render::render_png(s.map_mut(), &view).unwrap();
+    let layer = &s.map().layers[0];
+    assert!(layer.dataset.windowed);
+    assert!(layer.dataset.features.len() >= 2 && layer.dataset.features.len() < 400);
+    let id = layer.id;
+    let name = layer.name.clone();
+    let selected = vec![layer.dataset.features.len() - 1, 0];
+    let expected: BTreeSet<_> = selected
+        .iter()
+        .map(|row| {
+            let f = &layer.dataset.features[*row];
+            (f.id, f.attrs[0].as_f64().unwrap() as i64)
+        })
+        .collect();
+    let full = layer.load_all().unwrap();
+    assert!(selected.iter().any(|row| full.features[*row].id != layer.dataset.features[*row].id));
+    s.map_mut().layer_mut(id).unwrap().selection = selected;
+    // Selection takes precedence over the environment, even when it is outside the extent.
+    let extent = rustgis_geom::Extent::new(-150.0, -70.0, -100.0, -30.0);
+    s.project.gp_env.extent = Some(extent);
+    let export = |s: &mut Session| -> BTreeSet<(u64, i64)> {
+        s.run("gp.run", &json!({"tool": "vectorToPmtiles", "params": {"input": name, "minZoom": 0, "maxZoom": 0}})).unwrap();
+        let files = s.take_gp_files();
+        assert_eq!(files.len(), 1);
+        let bytes = &files[0].2;
+        let offset = u64::from_le_bytes(bytes[56..64].try_into().unwrap()) as usize;
+        let len = u64::from_le_bytes(bytes[64..72].try_into().unwrap()) as usize;
+        let tile = mvt::decode(&bytes[offset..offset + len]).unwrap();
+        assert_eq!(tile.layers.len(), 1);
+        tile.layers[0]
+            .features
+            .iter()
+            .map(|f| {
+                let Some(mvt::Value::Number(value)) = f.prop("i") else { panic!("missing source attribute") };
+                (f.id.unwrap(), *value as i64)
+            })
+            .collect()
+    };
+    assert_eq!(export(&mut s), expected, "no unselected rows may leak into the archive");
+    assert!(s.map().layer(id).unwrap().is_streamed());
+    assert!(s.map().layer(id).unwrap().dataset.windowed);
+    s.map_mut().layer_mut(id).unwrap().selection = vec![usize::MAX];
+    let error = s.run("gp.run", &json!({"tool": "vectorToPmtiles", "params": {"input": name, "minZoom": 0, "maxZoom": 0}})).unwrap_err();
+    assert!(error.contains("a selected feature is no longer in the source"), "{error}");
+    assert!(s.take_gp_files().is_empty(), "an invalid selection must not become an all-features export");
+    s.map_mut().layer_mut(id).unwrap().selection.clear();
+    let inside: BTreeSet<_> = full
+        .features
+        .iter()
+        .filter(|f| f.geometry.as_ref().is_some_and(|g| g.extent().intersects(&extent)))
+        .map(|f| (f.id, f.attrs[0].as_f64().unwrap() as i64))
+        .collect();
+    assert!(!inside.is_empty() && inside.len() < 400);
+    assert_eq!(export(&mut s), inside, "an unselected streamed export uses the full source's extent rows");
+    s.project.gp_env.extent = Some(rustgis_geom::Extent::new(179.5, 85.0, 180.0, 86.0));
+    assert!(s.run("gp.run", &json!({"tool": "vectorToPmtiles", "params": {"input": name, "minZoom": 0, "maxZoom": 0}})).is_err());
+    assert!(s.take_gp_files().is_empty(), "an empty extent must not fall back to exporting every feature");
+    s.project.gp_env.extent = None;
+    assert_eq!(export(&mut s).len(), 400, "an unselected export without an extent reads every source row");
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

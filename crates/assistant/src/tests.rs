@@ -264,6 +264,15 @@ fn gate_rules() {
     assert!(g("run_command", json!({"command": "edit.undo"})).is_none());
     assert!(g("run_command", json!({"command": "layer.addData", "params": {"path": "/etc/passwd"}})).is_some());
     assert!(g("run_command", json!({"command": "project.new"})).is_some());
+    // File-producing built-ins need approval even with a plain name or a default filename.
+    for output in [None, Some("archive"), Some("cities.pmtiles")] {
+        let mut params = json!({"input": "Cities", "minZoom": 0, "maxZoom": 0});
+        if let Some(output) = output {
+            params["output"] = json!(output);
+        }
+        assert!(g("run_tool", json!({"tool": "vectorToPmtiles", "params": params})).is_some());
+        assert!(g("run_command", json!({"command": "gp.run", "params": {"tool": "vectorToPmtiles", "params": params}})).is_some());
+    }
     // A QGIS project given as text names its files and addresses inside: asked, as with a path.
     let qgis = g("run_command", json!({"command": "project.importQgis", "params": {"text": "<qgis/>"}}));
     assert!(qgis.as_deref().is_some_and(|w| w.contains("QGIS project")), "{qgis:?}");

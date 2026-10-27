@@ -63,6 +63,11 @@ pub enum ParamKind {
     Bool,
     /// A file path typed by the user (for data RustGIS doesn't open as a layer, such as LiDAR).
     Path,
+    /// A file written by the tool, not an input to read. Native callers supply a destination;
+    /// browser callers supply a download name (or use the tool's suggested name).
+    SaveFile {
+        ext: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -90,6 +95,8 @@ pub enum Output {
     Table(Dataset),
     /// Several new layers and tables (external tools can write more than one output).
     Layers(Vec<OutputLayer>),
+    /// A downloadable file, never added to the map as a layer.
+    File { file_name: String, bytes: Vec<u8> },
 }
 
 /// One output of [`Output::Layers`].
@@ -146,6 +153,18 @@ pub trait Inputs {
     /// The longitude/latitude extent the map's view shows, when there is a view.
     fn view_extent(&self) -> Option<rustgis_geom::Extent> {
         None
+    }
+
+    /// Builds a vector-tile archive without coupling the analysis crate to the tile crate.
+    fn vector_to_pmtiles(
+        &self,
+        _dataset: &Dataset,
+        _rows: &[usize],
+        _min_zoom: u8,
+        _max_zoom: u8,
+        _source_layer: &str,
+    ) -> Result<(Vec<u8>, Vec<String>), String> {
+        Err("vector-to-PMTiles export is unavailable in this input provider".into())
     }
 }
 

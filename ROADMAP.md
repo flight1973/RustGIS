@@ -149,8 +149,6 @@ built-in version must justify itself on one of those.
 - An on-map right-click menu: copy the coordinate, run a buffer or viewshed from the point.
 - More than two synced maps side by side.
 - Auto-refresh for web service layers.
-- Vector to PMTiles export: the PMTiles writer and MVT encoder in `rustgis-tiles` exist but are
-  only used by tests ([#557](https://github.com/opengeos/RustGIS/issues/557)).
 - A catalog of data cubes for the time slider
   ([#683](https://github.com/opengeos/RustGIS/issues/683)).
 - Rebindable keyboard shortcuts ([#562](https://github.com/opengeos/RustGIS/issues/562)).
@@ -219,11 +217,11 @@ Open questions rather than plans; discuss before building.
   relationships, archiving.
 - Analysis: selection by attributes and location; polygon, lasso and radius on the map; overlay
   (clip, erase, intersect, identity, union), proximity (buffer, near) and summary tools, spatial
-  join, feature vertices to points, zonal statistics, A5 grids, kriging and Calculate Geometry with
-  metric or imperial units; guided workflows (viewshed, line of sight, IDW, shortest path,
-  suitability); ModelBuilder on a node canvas, scripts with command, parameter and value
-  completion, and history copied as code; the GeoLibre and Whitebox suite (1,000+ tools) natively
-  and in the browser.
+  join, feature vertices to points, zonal statistics, A5 grids, kriging, Calculate Geometry with
+  metric or imperial units, and Vector to PMTiles export (#557); guided workflows (viewshed, line
+  of sight, IDW, shortest path, suitability); ModelBuilder on a node canvas, scripts with command,
+  parameter and value completion, and history copied as code; the GeoLibre and Whitebox suite
+  (1,000+ tools) natively and in the browser.
 - Layouts (map frames, surrounds, map series, publication sheets and figures in one command,
   format panes, guides, snapping, element locking and PDF), reports, presentations and
   notebooks; the web app embeddable in a page (`?embed`).

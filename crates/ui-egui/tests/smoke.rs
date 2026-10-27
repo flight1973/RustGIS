@@ -2185,7 +2185,10 @@ fn web_save_asks_for_the_file_name() {
     let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<u8>)>::new()));
     let log = got.clone();
     let services = rustgis_ui_egui::Services {
-        download: Some(Box::new(move |name: &str, bytes: Vec<u8>| log.lock().unwrap().push((name.to_string(), bytes)))),
+        download: Some(Box::new(move |name: &str, bytes: Vec<u8>| {
+            log.lock().unwrap().push((name.to_string(), bytes));
+            Ok(())
+        })),
         ..Default::default()
     };
     let app = RustGisApp::with_sample().with_services(services);

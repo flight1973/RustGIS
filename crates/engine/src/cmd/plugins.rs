@@ -350,6 +350,11 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     if spec.id == "gp.run" && ps(params, "tool").and_then(rustgis_analysis::tool).is_some_and(super::gp::reads_files) {
         return Some(Reach::Files);
     }
+    if spec.id == "gp.run"
+        && ps(params, "tool").and_then(super::gp::tool_id).and_then(rustgis_analysis::tool).is_some_and(super::gp::writes_files)
+    {
+        return Some(Reach::Files);
+    }
     // A catalog's Zarr entry is opened as `layer.addZarr` is, a database's way.
     if spec.id == "cube.open" && super::cube_catalog::opens_zarr(params) {
         return Some(Reach::Files);

@@ -39,6 +39,7 @@ pub mod style;
 pub mod symbols;
 pub mod template;
 pub mod usgis;
+pub mod vector_export;
 
 pub use draw::{Drawn, Frame, PlacedTiles, Placement, draw, place, place_raster};
 pub use picture::{Pace, Unfinished, pace, paced, unfinished};

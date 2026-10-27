@@ -604,6 +604,48 @@ pub static TOOLS: &[ToolSpec] = &[
         ],
         run: zonal_stats,
     },
+    ToolSpec {
+        id: "vectorToPmtiles",
+        name: "Vector to PMTiles",
+        toolbox: "Analyze › Tools",
+        summary: "Exports a vector layer as a Web Mercator vector-tile PMTiles archive.",
+        params: &[
+            P { name: "input", label: "Input Layer", kind: K::VectorLayer, required: true, default: "", help: "" },
+            P {
+                name: "minZoom",
+                label: "Minimum Zoom",
+                kind: K::Number,
+                required: true,
+                default: "",
+                help: "Minimum tile zoom, an integer from 0 to 16.",
+            },
+            P {
+                name: "maxZoom",
+                label: "Maximum Zoom",
+                kind: K::Number,
+                required: true,
+                default: "",
+                help: "Maximum tile zoom, an integer from minZoom to 16.",
+            },
+            P {
+                name: "sourceLayer",
+                label: "Source-layer Name",
+                kind: K::Text,
+                required: false,
+                default: "",
+                help: "Name inside the vector-tile archive; defaults to the input layer name.",
+            },
+            P {
+                name: "output",
+                label: "Output",
+                kind: K::SaveFile { ext: "pmtiles" },
+                required: false,
+                default: "",
+                help: "Write a .pmtiles archive.",
+            },
+        ],
+        run: vector_to_pmtiles,
+    },
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -633,11 +675,36 @@ fn rows(inp: &dyn Inputs, p: &Json, k: &str, ds: &Dataset) -> Vec<usize> {
     if sel.is_empty() { (0..ds.features.len()).collect() } else { sel.iter().copied().filter(|r| *r < ds.features.len()).collect() }
 }
 
-/// The name of a tool's new layer, from its `output` parameter. Every built-in tool names its
-/// output layer through here, and an `output` is only ever a layer name in the session, never a
-/// file: `touches_files` in rustgis-engine relies on this to let tasks, models and notebooks from
-/// files name their outputs. A built-in tool that writes a file must take its path under another
-/// parameter (`path`), which stays refused.
+fn vector_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    let ds = input(inp, p, "input")?;
+    let zoom = |name: &str| -> Result<u8, String> {
+        let value = p.get(name).ok_or_else(|| format!("{name} is required"))?;
+        let parsed = match value {
+            Json::Number(n) => n.as_f64().filter(|n| n.is_finite() && (0.0..=16.0).contains(n) && n.fract() == 0.0).map(|n| n as u8),
+            Json::String(s) => s.trim().parse::<u8>().ok().filter(|n| *n <= 16),
+            _ => None,
+        };
+        parsed.ok_or_else(|| format!("{name} must be an integer from 0 to 16"))
+    };
+    let min_zoom = zoom("minZoom")?;
+    let max_zoom = zoom("maxZoom")?;
+    if min_zoom > max_zoom {
+        return Err("minZoom must not exceed maxZoom".into());
+    }
+    let source_layer = {
+        let name = s(p, "sourceLayer").trim();
+        if name.is_empty() { &ds.name } else { name }
+    };
+    let output = s(p, "output").trim();
+    let default_name = ds.name.rsplit(['/', '\\']).find(|name| !name.is_empty()).unwrap_or("output");
+    let file_name = if output.is_empty() { format!("{default_name}.pmtiles") } else { output.to_string() };
+    let selected = inp.selection(s(p, "input"));
+    let (bytes, messages) = inp.vector_to_pmtiles(ds, selected, min_zoom, max_zoom, source_layer)?;
+    Ok(ToolResult { output: Output::File { file_name, bytes }, messages })
+}
+
+/// The name of a tool's new layer, from its `output` parameter.
+/// File-producing tools use `ParamKind::SaveFile` and `Output::File` instead.
 fn out_name(p: &Json, default: String) -> String {
     let n = s(p, "output").trim();
     if n.is_empty() { default } else { n.to_string() }
@@ -2806,7 +2873,7 @@ mod tests {
     fn layer(r: ToolResult) -> Dataset {
         match r.output {
             Output::Layer(d) | Output::Table(d) | Output::Update { dataset: d, .. } => d,
-            Output::Selection { .. } | Output::Layers(_) => panic!("expected a dataset"),
+            Output::Selection { .. } | Output::Layers(_) | Output::File { .. } => panic!("expected a dataset"),
         }
     }
 
@@ -3290,15 +3357,15 @@ mod tests {
     }
 
     /// `touches_files` in rustgis-engine lets tasks, models and notebooks from files set a built-in
-    /// tool's `output`, because it only names the new layer (`out_name`). Hold every built-in tool
-    /// to that: an `output` parameter is plain text, a run names its layer after it, and no tool
-    /// here writes a file at all (it hands back layers; the engine adds them), so `output` can't
-    /// be made a place by a tool's body either.
+    /// tool's `output` when it names a new layer. Layer outputs remain plain text; the explicit
+    /// `vectorToPmtiles` file output is handled separately by the engine.
     #[test]
-    fn a_built_in_tools_output_only_names_its_layer() {
+    fn built_in_tool_outputs_have_explicit_contracts() {
         for spec in TOOLS {
             for p in spec.params.iter().filter(|p| p.name.eq_ignore_ascii_case("output")) {
-                assert!(matches!(p.kind, K::Text), "{}: output must be a layer name (Text), not {:?}", spec.id, p.kind);
+                let valid =
+                    if spec.id == "vectorToPmtiles" { matches!(p.kind, K::SaveFile { ext: "pmtiles" }) } else { matches!(p.kind, K::Text) };
+                assert!(valid, "{}: unexpected output kind {:?}", spec.id, p.kind);
             }
         }
         let m = inputs();
@@ -3357,18 +3424,22 @@ mod tests {
         assert!(cfg!(target_arch = "wasm32") || scanned > 5, "the sources were read");
     }
 
-    /// The runtime side of the guard above: every built-in tool, run with `output` set to a path
-    /// in an empty folder (other parameters from their defaults, layers from `inputs`), leaves
-    /// that folder empty. A tool that can't run on these inputs fails before writing anything,
-    /// so this catches a tool that writes its output wherever it runs.
+    /// The runtime side of the guard above: layer-producing tools, run with `output` set to a path
+    /// in an empty folder (other parameters from their defaults, layers from `inputs`), leave
+    /// that folder empty. File outputs are intentionally excluded.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn no_built_in_tool_writes_its_output_as_a_file() {
+    fn no_layer_tool_writes_its_output_as_a_file() {
         let dir = std::env::temp_dir().join(format!("rustgis-tool-output-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let m = inputs();
+        let mut tested = 0;
         let mut ran = 0;
         for spec in TOOLS {
+            if !spec.params.iter().any(|p| p.name.eq_ignore_ascii_case("output") && matches!(p.kind, K::Text)) {
+                continue;
+            }
+            tested += 1;
             let mut p = serde_json::Map::new();
             for param in spec.params {
                 let value = match serde_json::from_str::<serde_json::Value>(param.default) {
@@ -3397,7 +3468,7 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir(&dir);
-        assert!(ran * 2 >= TOOLS.len(), "only {ran} of {} tools ran on these inputs", TOOLS.len());
+        assert!(ran * 2 >= tested, "only {ran} of {tested} layer tools ran on these inputs");
     }
 
     #[test]

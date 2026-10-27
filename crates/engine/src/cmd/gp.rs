@@ -45,6 +45,8 @@ pub fn commands() -> Vec<C> {
         C::new("gp.uninstallGeolibre", "Uninstall GeoLibre Tools", "Analyze › Geoprocessing", |_, _| uninstall_geolibre()).view(),
         C::new("gp.finish", "Finish Tool Run", "Analyze › Geoprocessing", finish)
             .params(r#"{"id": a finished run (the browser's GeoLibre tools run asynchronously)}"#),
+        C::new("gp.fileDelivered", "Finish File Export", "Analyze › Geoprocessing", file_delivered)
+            .params(r#"{"id": pending file id, "error"?: download failure message}"#),
         C::new("gp.setGeolibre", "Locate GeoLibre Runner", "Analyze › Geoprocessing", set_geolibre)
             .view()
             .params(r#"{"path"?: "the geolibre executable (empty: look in the usual places)"}"#),
@@ -427,10 +429,9 @@ fn fingerprint(d: &Dataset) -> Option<u64> {
     Some(w.0.finish())
 }
 
-/// Fits a tool's result to the map: a selection it made on a streamed layer it read whole
-/// becomes rows of the layer's window in view, and an update of a streamed layer it read only
-/// in part (its selection, from the window in view), which would replace the whole layer with
-/// that part, is refused.
+/// Fits a tool's result to the map: a selection made on the complete streamed source becomes
+/// rows of the current window. An update from a selection is still refused: it would replace
+/// the complete source with just those selected features.
 fn fit_to_windows(s: &Session, res: &mut Result<rustgis_analysis::ToolResult, String>, full_ids: &FullIds) {
     if let Ok(r) = res
         && let Output::Selection { layer, rows } = &mut r.output
@@ -442,8 +443,9 @@ fn fit_to_windows(s: &Session, res: &mut Result<rustgis_analysis::ToolResult, St
     }
     if let Ok(r) = res
         && let Output::Update { layer, .. } = &r.output
-        && !full_ids.contains_key(&layer.to_ascii_lowercase())
-        && s.map().layer_by_name(layer).is_some_and(|l| l.is_streamed())
+        && s.map()
+            .layer_by_name(layer)
+            .is_some_and(|l| l.is_streamed() && (!l.selection.is_empty() || !full_ids.contains_key(&layer.to_ascii_lowercase())))
     {
         *res = Err(format!("{layer} is read in place from its file; Load All Features (layer.loadAll) before a tool updates it"));
     }
@@ -496,13 +498,32 @@ impl MapInputs<'_> {
 
 fn map_inputs<'a>(s: &'a Session, spec: Option<&rustgis_analysis::ToolSpec>, params: &Value) -> Result<MapInputs<'a>, String> {
     let full = streamed_inputs(s.map(), spec, params)?;
-    let rows = env_inputs(s.map(), &full, &s.project.gp_env, params)?;
+    let mut rows = env_inputs(s.map(), &full, &s.project.gp_env, params)?;
+    for (name, dataset) in &full {
+        let Some(layer) = s.map().layer_by_name(name).filter(|l| !l.selection.is_empty()) else { continue };
+        let missing = || format!("{}: a selected feature is no longer in the source", layer.name);
+        let mut by_id = layer
+            .selection
+            .iter()
+            .map(|row| layer.dataset.features.get(*row).map(|f| (f.id, None)).ok_or_else(missing))
+            .collect::<Result<std::collections::HashMap<u64, Option<usize>>, _>>()?;
+        for (row, feature) in dataset.features.iter().enumerate() {
+            if let Some(selected_row) = by_id.get_mut(&feature.id) {
+                *selected_row = Some(row);
+            }
+        }
+        let selected = layer
+            .selection
+            .iter()
+            .map(|row| layer.dataset.features.get(*row).and_then(|f| by_id.get(&f.id)).copied().flatten().ok_or_else(missing))
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.insert(name.clone(), selected);
+    }
     Ok(MapInputs { session: s, rows, loaded: full, flat: std::cell::OnceCell::new(), view: std::cell::OnceCell::new() })
 }
 
-/// Every feature of the streamed layers a tool's parameters name (those without a selection,
-/// whose rows the tool reads from the window in view): a tool runs on all the data, not on what
-/// the view happened to read.
+/// Complete streamed inputs without selections, plus selected PMTiles inputs: that exporter
+/// requires the complete source. Their selected window rows are remapped in `map_inputs`.
 fn streamed_inputs(
     map: &rustgis_map::Map,
     spec: Option<&rustgis_analysis::ToolSpec>,
@@ -514,7 +535,9 @@ fn streamed_inputs(
         if full.contains_key(&key) {
             continue;
         }
-        if let Some(l) = map.layer_by_name(n).filter(|l| l.is_streamed() && l.selection.is_empty()) {
+        if let Some(l) =
+            map.layer_by_name(n).filter(|l| l.is_streamed() && (l.selection.is_empty() || spec.is_some_and(|t| t.id == "vectorToPmtiles")))
+        {
             full.insert(key, l.load_all().map_err(|e| format!("{}: {e}", l.name))?);
         }
     }
@@ -595,6 +618,17 @@ fn env_rows(
 }
 
 impl Inputs for MapInputs<'_> {
+    fn vector_to_pmtiles(
+        &self,
+        dataset: &Dataset,
+        rows: &[usize],
+        min_zoom: u8,
+        max_zoom: u8,
+        source_layer: &str,
+    ) -> Result<(Vec<u8>, Vec<String>), String> {
+        let out = crate::render::rustgis_tiles::vector_export::export(dataset, rows, min_zoom, max_zoom, source_layer)?;
+        Ok((out.bytes, out.messages))
+    }
     fn dataset(&self, layer: &str) -> Option<&Dataset> {
         self.loaded
             .get(&layer.to_ascii_lowercase())
@@ -610,13 +644,10 @@ impl Inputs for MapInputs<'_> {
         self.session.project.tables.iter().find(|t| t.id == id).map(|t| &t.dataset)
     }
     fn selection(&self, layer: &str) -> &[usize] {
-        match self.session.map().layer_by_name(layer) {
-            Some(l) if !l.selection.is_empty() => &l.selection,
-            // No selection: the environment's extent picks the rows (an extent holding none is
-            // refused before the tool runs, by `env_inputs`).
-            Some(l) => self.rows.get(&l.name.to_ascii_lowercase()).map(Vec::as_slice).unwrap_or(&[]),
-            None => &[],
-        }
+        let Some(l) = self.session.map().layer_by_name(layer) else { return &[] };
+        // Loaded selections and environment extents are already rows of the dataset returned
+        // above. An extent containing none is refused before the run by `env_inputs`.
+        self.rows.get(&l.name.to_ascii_lowercase()).map(Vec::as_slice).unwrap_or(&l.selection)
     }
     fn projection_name(&self) -> Option<String> {
         self.flat().map(|(name, _, _)| name.clone())
@@ -732,6 +763,64 @@ pub fn reads_files(spec: &rustgis_analysis::ToolSpec) -> bool {
     spec.params.iter().any(|p| p.kind == rustgis_analysis::ParamKind::Path)
 }
 
+/// Whether a tool produces a file rather than a map layer.
+pub fn writes_files(spec: &rustgis_analysis::ToolSpec) -> bool {
+    spec.params.iter().any(|p| matches!(p.kind, rustgis_analysis::ParamKind::SaveFile { .. }))
+}
+
+/// A browser file export waiting for delivery, without a success record until acknowledged.
+pub(crate) struct PendingFile {
+    pub(crate) id: u64,
+    pub(crate) file_name: String,
+    pub(crate) bytes: Option<Vec<u8>>,
+    record: GpRecord,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn queue_file(s: &mut Session, file_name: String, bytes: Vec<u8>, record: GpRecord) -> CmdResult {
+    let file_name =
+        record.params.get("output").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).unwrap_or(&file_name).to_string();
+    if file_name.is_empty() || file_name.contains(['/', '\\']) {
+        return Err("output must be a file name, not a path, in the browser".into());
+    }
+    const MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+    let held = s.file_outputs.iter().filter_map(|f| f.bytes.as_ref()).map(Vec::len).sum::<usize>();
+    if s.file_outputs.len() >= 8 || bytes.len() > MAX_PENDING_BYTES.saturating_sub(held) {
+        return Err("file export queue limit reached (8 files or 256 MiB); split the task, model, or script into smaller runs".into());
+    }
+    s.next_pending = s.next_pending.wrapping_add(1);
+    let id = s.next_pending;
+    s.file_outputs.push(PendingFile { id, file_name: file_name.clone(), bytes: Some(bytes), record });
+    s.request_only = true;
+    Ok(json!({"pending": true, "download": id, "file": file_name}))
+}
+
+fn file_delivered(s: &mut Session, p: &Value) -> CmdResult {
+    let id = p.get("id").and_then(Value::as_u64).ok_or("id is required")?;
+    let i = s.file_outputs.iter().position(|f| f.id == id).ok_or("no pending file with that id")?;
+    if s.file_outputs[i].bytes.is_some() {
+        return Err("the file has not been handed to the download service".into());
+    }
+    let mut file = s.file_outputs.remove(i);
+    let error = p.get("error").and_then(Value::as_str);
+    file.record.ok = error.is_none();
+    if let Some(error) = error {
+        file.record.messages.push(error.to_string());
+    }
+    if let Some(report) = &mut s.model_run {
+        report.file_delivered(id, error);
+    }
+    for message in &file.record.messages {
+        s.notify(message.clone(), !file.record.ok);
+    }
+    let out = json!({"file": file.file_name, "delivered": file.record.ok, "messages": file.record.messages});
+    s.project.gp_history.push(file.record);
+    if s.project.gp_history.len() > 500 {
+        s.project.gp_history.remove(0);
+    }
+    Ok(out)
+}
+
 /// The parameters as the history keeps them: a file picked in the browser (`{"name", "data"}`)
 /// by its name, not its contents.
 fn recorded(spec: Option<&rustgis_analysis::ToolSpec>, mut params: Value) -> Value {
@@ -756,6 +845,61 @@ struct Ran {
     started: u64,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn write_file_output(s: &Session, path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    // A new file has no canonical path yet: resolve its folder, so a file created inside a loaded
+    // source directory is refused as well as one replaced there.
+    let resolved = path.canonicalize().or_else(|error| {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        path.file_name().map(|name| parent.canonicalize().map(|p| p.join(name))).unwrap_or(Err(error))
+    });
+    if let Ok(destination) = resolved {
+        if s.path.iter().chain(s.opened_package.iter()).any(|project| project.canonicalize().is_ok_and(|project| project == destination)) {
+            return Err("destination is the open project's file; choose a different output file".into());
+        }
+        for map in &s.project.maps {
+            for layer in &map.layers {
+                let sources = [
+                    layer.source.as_ref().and_then(|source| source.path.as_deref()),
+                    layer.dataset.source.as_deref(),
+                    layer.raster.as_ref().and_then(|raster| raster.path.as_deref()),
+                ];
+                if sources.into_iter().flatten().any(|source| names_file(source, &destination)) {
+                    return Err(format!("destination is the source of layer '{}'; choose a different output file", layer.name));
+                }
+            }
+            for tile in &map.tiles {
+                let archive = tile.url.strip_prefix("file://").unwrap_or(tile.url.as_str());
+                let local = matches!(tile.kind, rustgis_map::TileKind::PmTiles | rustgis_map::TileKind::MbTiles);
+                if local && rustgis_map::tiles::is_local_archive(&tile.url) && names_file(archive, &destination) {
+                    return Err(format!("destination is the archive of tile layer '{}'; choose a different output file", tile.name));
+                }
+            }
+        }
+        for table in &s.project.tables {
+            if table.dataset.source.as_deref().is_some_and(|source| names_file(source, &destination)) {
+                return Err(format!("destination is the source of table '{}'; choose a different output file", table.dataset.name));
+            }
+        }
+    }
+    rustgis_data::io::write_atomic(path, bytes).map_err(|error| error.to_string())
+}
+
+/// Whether a loaded source reads `destination`: the file itself, a directory's contents, the
+/// archive a ZIP member's path (`archive.zip/member`) lies in, or a Shapefile's companion file.
+#[cfg(not(target_arch = "wasm32"))]
+fn names_file(source: &str, destination: &std::path::Path) -> bool {
+    let source = std::path::Path::new(source);
+    if source.canonicalize().is_ok_and(|p| destination.starts_with(p))
+        || source.ancestors().skip(1).any(|p| p.canonicalize().is_ok_and(|p| p.as_path() == destination))
+    {
+        return true;
+    }
+    let shapefile = source.extension().is_some_and(|e| e.eq_ignore_ascii_case("shp"));
+    let companion = |ext: &str| source.with_extension(ext).canonicalize().is_ok_and(|p| p.as_path() == destination);
+    shapefile && ["dbf", "shx", "prj", "cpg"].iter().any(|&ext| companion(ext) || companion(ext.to_ascii_uppercase().as_str()))
+}
+
 /// Adds a tool's result to the map and the history.
 fn apply(s: &mut Session, ran: Ran, params: Value, res: Result<rustgis_analysis::ToolResult, String>, millis: u64) -> CmdResult {
     let Ran { name, id, command, started } = ran;
@@ -778,6 +922,47 @@ fn apply(s: &mut Session, ran: Ran, params: Value, res: Result<rustgis_analysis:
         Ok(r) => r,
     };
     let out = match result.output {
+        Output::File { file_name, bytes } => {
+            #[cfg(test)]
+            if s.queue_gp_files {
+                return queue_file(
+                    s,
+                    file_name,
+                    bytes,
+                    GpRecord { tool: name, id, params, command, at, ok: false, messages: result.messages, millis, outputs: Vec::new() },
+                );
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let path = params.get("output").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).unwrap_or(&file_name);
+                if let Err(error) = write_file_output(s, std::path::Path::new(path), &bytes) {
+                    let error = format!("{path}: {error}");
+                    result.messages.push(error.clone());
+                    s.project.gp_history.push(GpRecord {
+                        tool: name,
+                        id,
+                        params,
+                        command,
+                        at,
+                        ok: false,
+                        messages: result.messages,
+                        millis,
+                        outputs: Vec::new(),
+                    });
+                    return Err(error);
+                }
+                json!({"file": path, "bytes": bytes.len()})
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                return queue_file(
+                    s,
+                    file_name,
+                    bytes,
+                    GpRecord { tool: name, id, params, command, at, ok: false, messages: result.messages, millis, outputs: Vec::new() },
+                );
+            }
+        }
         Output::Layer(ds) => {
             let id = super::layer::add_dataset(s, ds);
             json!({"layer": id})
@@ -847,4 +1032,718 @@ fn apply(s: &mut Session, ran: Ran, params: Value, res: Result<rustgis_analysis:
         s.project.gp_history.remove(0);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod file_tests {
+    use super::*;
+
+    fn record() -> GpRecord {
+        GpRecord {
+            tool: "File export".into(),
+            id: "vectorToPmtiles".into(),
+            params: json!({"input": "Cities"}),
+            command: None,
+            at: 1,
+            ok: false,
+            messages: vec!["Exported data".into()],
+            millis: 3,
+            outputs: Vec::new(),
+        }
+    }
+
+    fn task_session(steps: Value) -> Session {
+        let mut s = Session::new(crate::Project::default());
+        let mut cities = Dataset::new("Cities", rustgis_data::GeometryType::Point, Vec::new());
+        cities.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(20.0, 30.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, cities));
+        s.queue_gp_files = true;
+        s.run("task.new", &json!({"name": "Export task", "steps": steps})).unwrap();
+        s.mark_saved();
+        s
+    }
+
+    #[test]
+    fn task_with_a_prior_edit_and_final_queued_export_has_one_restorable_undo_step() {
+        let mut s = task_session(json!([
+            {"title": "Make buffer", "command": "gp.bufferPoint",
+             "params": {"lon": 20, "lat": 30, "distance": 100, "name": "Task buffer"}},
+            {"title": "Export buffer", "command": "gp.run",
+             "params": {"tool": "vectorToPmtiles", "params": {"input": "Task buffer", "minZoom": 0, "maxZoom": 0}}}
+        ]));
+        let depth = s.undo_depth();
+        let result = s.run("task.run", &json!({"task": "Export task"})).unwrap();
+        assert_eq!(result["ran"][1]["result"]["pending"], true);
+        assert!(s.map().layer_by_name("Task buffer").is_some());
+        assert_eq!(s.project.gp_history.len(), 1, "the buffer completed, the export has not");
+        assert!(s.dirty());
+        assert_eq!(s.undo_depth(), depth + 1, "direct step handlers share one task transaction");
+        let files = s.take_gp_files();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].2.starts_with(b"PMTiles\x03"), "the task ran the real exporter");
+        assert!(s.undo());
+        assert!(s.map().layer_by_name("Task buffer").is_none());
+        assert_eq!(s.map().layers.len(), 1);
+        assert!(s.project.gp_history.is_empty());
+        assert!(!s.dirty(), "undo restores the saved pre-task project");
+    }
+
+    #[test]
+    fn file_only_task_with_multiple_exports_and_a_view_step_stays_request_only() {
+        let mut s = task_session(json!([
+            {"title": "Export first", "command": "gp.run",
+             "params": {"tool": "vectorToPmtiles", "params": {"input": "Cities", "minZoom": 0, "maxZoom": 0}}},
+            {"title": "Export second", "command": "gp.run",
+             "params": {"tool": "vectorToPmtiles", "params": {"input": "Cities", "minZoom": 0, "maxZoom": 0}}},
+            {"title": "List tools", "command": "gp.tools"}
+        ]));
+        let depth = s.undo_depth();
+        let result = s.run("task.run", &json!({"task": "Export task"})).unwrap();
+        assert_eq!(result["ran"][0]["result"]["pending"], true);
+        assert_eq!(result["ran"][1]["result"]["pending"], true);
+        assert_eq!(s.take_gp_files().len(), 2);
+        assert!(s.project.gp_history.is_empty());
+        assert!(!s.dirty());
+        assert_eq!(s.undo_depth(), depth);
+    }
+
+    #[test]
+    fn queueing_a_file_is_not_an_edit_before_delivery() {
+        let mut s = Session::new(crate::Project::default());
+        s.mark_saved();
+        let depth = s.undo_depth();
+        let pending = s.guarded("File export", true, |s| queue_file(s, "cities.pmtiles".into(), vec![1, 2, 3], record())).unwrap();
+        assert!(!s.dirty(), "generated bytes alone do not change the project");
+        assert_eq!(s.undo_depth(), depth, "queueing must not add an empty undo step");
+        assert!(s.project.gp_history.is_empty());
+        s.take_gp_files();
+        let out = s.run("gp.fileDelivered", &json!({"id": pending["download"]})).unwrap();
+        assert_eq!(out["delivered"], true);
+        assert!(s.dirty(), "acknowledged delivery adds history");
+        assert_eq!(s.undo_depth(), depth + 1);
+        assert_eq!(s.project.gp_history.len(), 1);
+    }
+
+    #[test]
+    fn file_download_history_waits_for_delivery_and_records_failure() {
+        let mut s = Session::new(crate::Project::default());
+        let pending = queue_file(&mut s, "cities.pmtiles".into(), vec![1, 2, 3], record()).unwrap();
+        let id = pending["download"].as_u64().unwrap();
+        assert_eq!(pending["pending"], true);
+        assert!(s.project.gp_history.is_empty());
+        assert!(s.run("gp.fileDelivered", &json!({"id": id})).is_err());
+        assert!(s.project.gp_history.is_empty());
+        assert_eq!(s.take_gp_files(), vec![(id, "cities.pmtiles".into(), vec![1, 2, 3])]);
+        assert!(s.take_gp_files().is_empty(), "bytes are handed over once");
+        let out = s.run("gp.fileDelivered", &json!({"id": id, "error": "browser rejected download"})).unwrap();
+        assert_eq!(out["delivered"], false);
+        assert_eq!(s.project.gp_history.len(), 1);
+        assert!(!s.project.gp_history[0].ok);
+        assert!(s.project.gp_history[0].outputs.is_empty());
+        assert!(s.project.gp_history[0].messages.iter().any(|m| m == "browser rejected download"));
+        assert!(s.run("gp.fileDelivered", &json!({"id": id})).is_err(), "acknowledged once");
+    }
+
+    #[test]
+    fn file_download_success_and_project_replacement() {
+        let mut s = Session::new(crate::Project::default());
+        let pending = queue_file(&mut s, "cities.pmtiles".into(), vec![4], record()).unwrap();
+        let id = pending["download"].as_u64().unwrap();
+        s.take_gp_files();
+        let out = s.run("gp.fileDelivered", &json!({"id": id})).unwrap();
+        assert_eq!(out["delivered"], true);
+        assert!(s.project.gp_history[0].ok);
+        assert!(s.project.gp_history[0].outputs.is_empty(), "a file is not a layer");
+        let old = queue_file(&mut s, "old.pmtiles".into(), vec![5], record()).unwrap();
+        s.run("project.new", &json!({})).unwrap();
+        assert!(s.take_gp_files().is_empty());
+        assert!(s.run("gp.fileDelivered", &json!({"id": old["download"]})).is_err());
+    }
+
+    #[test]
+    fn failed_commands_drop_pending_file_deliveries() {
+        let mut s = Session::new(crate::Project::default());
+        let r = s.guarded("Failed export task", true, |s| {
+            queue_file(s, "cancelled.pmtiles".into(), vec![1], record())?;
+            Err("task cancelled".into())
+        });
+        assert!(r.is_err());
+        assert!(s.take_gp_files().is_empty());
+        assert!(s.project.gp_history.is_empty());
+        for _ in 0..8 {
+            queue_file(&mut s, "bounded.pmtiles".into(), vec![1], record()).unwrap();
+        }
+        assert!(queue_file(&mut s, "too-many.pmtiles".into(), vec![1], record()).is_err());
+        assert_eq!(s.take_gp_files().len(), 8);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_export_preserves_the_saved_project_file() {
+        let root = std::env::temp_dir().join(format!("rustgis-project-output-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let project = root.join("Map.rgis");
+        let mut s = Session::new(crate::Project::default());
+        let mut points = Dataset::new("Points", rustgis_data::GeometryType::Point, Vec::new());
+        points.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(20.0, 30.0))), Vec::new());
+        s.map_mut().add_dataset(points);
+        s.run("project.saveAs", &json!({"path": project})).unwrap();
+        let original = std::fs::read(&project).unwrap();
+        let destinations = vec![project.clone(), root.join("nested").join("..").join("Map.rgis")];
+        #[cfg(unix)]
+        let destinations = {
+            let mut destinations = destinations;
+            let alias = root.join("alias.rgis");
+            std::os::unix::fs::symlink(&project, &alias).unwrap();
+            destinations.push(alias);
+            destinations
+        };
+        for destination in destinations {
+            let result = s.run(
+                "gp.run",
+                &json!({"tool": "vectorToPmtiles", "params": {
+                    "input": "Points", "minZoom": 0, "maxZoom": 0, "output": destination
+                }}),
+            );
+            assert!(result.is_err(), "export must refuse the saved project: {result:?}");
+            assert!(result.unwrap_err().contains("open project's file"));
+            assert_eq!(std::fs::read(&project).unwrap(), original);
+            assert_eq!(s.path.as_deref(), Some(project.as_path()));
+            assert!(s.project.gp_history.last().is_some_and(|record| !record.ok));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_export_preserves_the_opened_project_package() {
+        let root = std::env::temp_dir().join(format!("rustgis-package-output-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let package = root.join("Map.rgispkg");
+        let mut s = Session::new(crate::Project::default());
+        let mut points = Dataset::new("Points", rustgis_data::GeometryType::Point, Vec::new());
+        points.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(20.0, 30.0))), Vec::new());
+        s.map_mut().add_dataset(points.clone());
+        s.run("project.package", &json!({"path": package})).unwrap();
+        let original = std::fs::read(&package).unwrap();
+        s.run("project.open", &json!({"path": package})).unwrap();
+        assert!(s.path.is_none(), "opening a package must still require Save As");
+        assert!(s.run("project.save", &Value::Null).is_err());
+        let destinations = vec![package.clone(), root.join("nested").join("..").join("Map.rgispkg")];
+        #[cfg(unix)]
+        let destinations = {
+            let mut destinations = destinations;
+            let alias = root.join("alias.rgispkg");
+            std::os::unix::fs::symlink(&package, &alias).unwrap();
+            destinations.push(alias);
+            destinations
+        };
+        let export = |s: &mut Session, destination: &std::path::Path| {
+            s.run(
+                "gp.run",
+                &json!({"tool": "vectorToPmtiles", "params": {
+                    "input": "Points", "minZoom": 0, "maxZoom": 0, "output": destination
+                }}),
+            )
+        };
+        for destination in destinations {
+            let result = export(&mut s, &destination);
+            assert!(result.is_err(), "export must refuse the opened package: {result:?}");
+            assert!(result.unwrap_err().contains("open project's file"));
+            assert_eq!(std::fs::read(&package).unwrap(), original);
+            assert!(s.project.gp_history.last().is_some_and(|record| !record.ok));
+        }
+        let failed = s.guarded("Failed project replacement", true, |s| {
+            s.run("project.new", &json!({}))?;
+            Err("later step failed".into())
+        });
+        assert!(failed.is_err());
+        assert!(export(&mut s, &package).is_err(), "rollback must restore package protection");
+        assert_eq!(std::fs::read(&package).unwrap(), original);
+        assert!(s.path.is_none());
+        let saved = root.join("Saved.rgis");
+        s.run("project.saveAs", &json!({"path": saved})).unwrap();
+        assert_eq!(s.path.as_deref(), Some(saved.as_path()));
+        assert!(export(&mut s, &package).is_err(), "Save As must not forget the package origin");
+        assert_eq!(std::fs::read(&package).unwrap(), original);
+        s.run("project.new", &json!({})).unwrap();
+        s.map_mut().add_dataset(points);
+        export(&mut s, &package).unwrap();
+        assert!(std::fs::read(&package).unwrap().starts_with(b"PMTiles\x03"), "the previous package is no longer open");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn points_session() -> Session {
+        let mut s = Session::new(crate::Project::default());
+        let mut points = Dataset::new("Points", rustgis_data::GeometryType::Point, Vec::new());
+        points.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(20.0, 30.0))), Vec::new());
+        s.map_mut().add_dataset(points);
+        s
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_project_origins_survive_cwd_changes() {
+        if std::env::var_os("RUSTGIS_TEST_PROJECT_ORIGIN_CWD").is_none() {
+            let root = std::env::temp_dir().join(format!("rustgis-origin-cwd-{}-{}", std::process::id(), now_ms()));
+            std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+            let mut s = points_session();
+            s.run("project.saveAs", &json!({"path": root.join("Opened.rgis")})).unwrap();
+            s.run("project.package", &json!({"path": root.join("Pack.rgispkg")})).unwrap();
+            // cwd is process-wide: never change it in the parallel suite's parent process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cmd::gp::file_tests::native_project_origins_survive_cwd_changes", "--nocapture"])
+                .env("RUSTGIS_TEST_PROJECT_ORIGIN_CWD", "1")
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+            assert!(stdout.contains("1 passed; 0 failed"), "the isolated child must exercise the guard: {stdout}");
+            return;
+        }
+        let root = std::env::current_dir().unwrap();
+        for (mode, name) in [("package", "Pack.rgispkg"), ("project", "Opened.rgis"), ("save", "Saved.rgis")] {
+            std::env::set_current_dir(&root).unwrap();
+            let mut s = Session::new(crate::Project::default());
+            let input = if mode == "save" { "Opened.rgis" } else { name };
+            s.run("project.open", &json!({"path": input})).unwrap();
+            if mode == "save" {
+                s.run("project.saveAs", &json!({"path": name})).unwrap();
+            }
+            if mode == "package" {
+                assert!(s.path.is_none(), "the anchored package is still not a save destination");
+            }
+            let destination = root.join(name);
+            let original = std::fs::read(&destination).unwrap();
+            std::env::set_current_dir(root.join("elsewhere")).unwrap();
+            let result = s.run(
+                "gp.run",
+                &json!({"tool": "vectorToPmtiles", "params": {
+                    "input": "Points", "minZoom": 0, "maxZoom": 0, "output": destination
+                }}),
+            );
+            assert!(result.is_err(), "{mode}: cwd changes must not allow overwriting the origin: {result:?}");
+            assert!(result.unwrap_err().contains("open project's file"));
+            assert_eq!(std::fs::read(&destination).unwrap(), original);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_project_origins_follow_undo_redo() {
+        let root = std::env::temp_dir().join(format!("rustgis-origin-undo-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        for package in [true, false] {
+            let mut s = points_session();
+            let source = root.join(if package { "Pack.rgispkg" } else { "Saved.rgis" });
+            if package {
+                s.run("project.package", &json!({"path": source})).unwrap();
+                s.run("project.open", &json!({"path": source})).unwrap();
+            } else {
+                s.run("project.saveAs", &json!({"path": source})).unwrap();
+            }
+            let original = std::fs::read(&source).unwrap();
+            let points = s.map().layer_by_name("Points").unwrap().dataset.clone();
+            s.guarded("Replace project", true, |s| s.run("project.new", &json!({"name": "Other"}))).unwrap();
+            assert!(s.undo());
+            let result = s.run(
+                "gp.run",
+                &json!({"tool": "vectorToPmtiles", "params": {
+                    "input": "Points", "minZoom": 0, "maxZoom": 0, "output": source
+                }}),
+            );
+            assert!(result.is_err(), "undo must restore the project's file protection: {result:?}");
+            assert!(result.unwrap_err().contains("open project's file"));
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+            assert!(s.redo());
+            assert!(s.map().layer_by_name("Points").is_none());
+            s.run("script.run", &json!({"script": "edit.undo {}"})).unwrap();
+            assert!(s.map().layer_by_name("Points").is_some());
+            assert!(s.undo(), "undoing a script that used undo must restore its original file origins");
+            assert!(s.map().layer_by_name("Points").is_none());
+            s.map_mut().add_dataset(points);
+            s.run(
+                "gp.run",
+                &json!({"tool": "vectorToPmtiles", "params": {
+                    "input": "Points", "minZoom": 0, "maxZoom": 0, "output": source
+                }}),
+            )
+            .unwrap();
+            assert!(std::fs::read(&source).unwrap().starts_with(b"PMTiles\x03"), "redo must not retain the previous project's guard");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_project_origins_survive_failed_nested_undo() {
+        let root = std::env::temp_dir().join(format!("rustgis-origin-rollback-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut s = points_session();
+        let first = root.join("First.rgispkg");
+        let second = root.join("Second.rgispkg");
+        for source in [&first, &second] {
+            s.run("project.package", &json!({"path": source})).unwrap();
+        }
+        let original = std::fs::read(&second).unwrap();
+        s.run("project.open", &json!({"path": first})).unwrap();
+        let open_second = format!("project.open {}", json!({"path": second}));
+        s.run("script.run", &json!({"script": open_second})).unwrap();
+        assert!(s.run("script.run", &json!({"script": "edit.undo {}\nmissing.command {}"})).is_err());
+        let result = s.run(
+            "gp.run",
+            &json!({"tool": "vectorToPmtiles", "params": {
+                "input": "Points", "minZoom": 0, "maxZoom": 0, "output": second
+            }}),
+        );
+        assert!(result.is_err(), "a failed script must restore the active package origin: {result:?}");
+        assert!(result.unwrap_err().contains("open project's file"));
+        assert_eq!(std::fs::read(&second).unwrap(), original);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_project_origins_restore_unsaved_after_replacement_saved_later() {
+        let root = std::env::temp_dir().join(format!("rustgis-origin-later-save-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        for nested in [false, true] {
+            let mut s = points_session();
+            s.project.name = "A".into();
+            s.run("script.run", &json!({"script": "project.new {\"name\":\"B\"}"})).unwrap();
+            if nested {
+                s.run("script.run", &json!({"script": "edit.undo {}"})).unwrap();
+            }
+            let saved = root.join(if nested { "A.rgis" } else { "B.rgis" });
+            s.run("project.saveAs", &json!({"path": saved})).unwrap();
+            let original = std::fs::read(&saved).unwrap();
+            assert!(s.undo());
+            assert_eq!(s.project.name, if nested { "B" } else { "A" });
+            assert!(s.run("project.save", &Value::Null).is_err(), "the restored unsaved project must not save over the later destination");
+            assert_eq!(std::fs::read(&saved).unwrap(), original);
+            assert!(s.redo());
+            assert_eq!(s.path.as_deref(), Some(saved.as_path()));
+            s.run("project.save", &Value::Null).unwrap();
+            assert_eq!(crate::Project::load(&saved).unwrap().name, if nested { "A" } else { "B" });
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_project_origin_keeps_save_as_after_nonreplacement_undo() {
+        let root = std::env::temp_dir().join(format!("rustgis-origin-save-as-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        for round_trip in [false, true] {
+            let mut s = points_session();
+            if round_trip {
+                let points = s.map().layer_by_name("Points").unwrap().dataset.clone();
+                s.run("script.run", &json!({"script": "project.new {}"})).unwrap();
+                s.map_mut().add_dataset(points);
+                s.run("script.run", &json!({"script": "edit.undo {}\nedit.redo {}"})).unwrap();
+            } else {
+                s.run("map.rename", &json!({"name": "Edited map"})).unwrap();
+            }
+            let saved = root.join(if round_trip { "Roundtrip.rgis" } else { "Edited.rgis" });
+            s.run("project.saveAs", &json!({"path": saved})).unwrap();
+            let original = std::fs::read(&saved).unwrap();
+            assert!(s.undo());
+            assert_eq!(s.path.as_deref(), Some(saved.as_path()), "undoing a nonreplacement must not undo a later Save As");
+            let result = s.run(
+                "gp.run",
+                &json!({"tool": "vectorToPmtiles", "params": {
+                    "input": "Points", "minZoom": 0, "maxZoom": 0, "output": saved
+                }}),
+            );
+            assert!(result.is_err(), "the Save As destination must remain protected: {result:?}");
+            assert_eq!(std::fs::read(&saved).unwrap(), original);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_project_origins_keep_earliest_files_when_steps_merge() {
+        let root = std::env::temp_dir().join(format!("rustgis-origin-merge-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut s = points_session();
+        let first = root.join("A.rgis");
+        let second = root.join("B.rgis");
+        let third = root.join("C.rgis");
+        s.run("project.saveAs", &json!({"path": first})).unwrap();
+        s.merge_undo("file-edits");
+        s.run("map.rename", &json!({"name": "Edited map"})).unwrap();
+        for destination in [&second, &third] {
+            s.merge_undo("file-edits");
+            let script = format!("project.saveAs {}", json!({"path": destination}));
+            s.run("script.run", &json!({"script": script})).unwrap();
+        }
+        let second_bytes = std::fs::read(&second).unwrap();
+        let third_bytes = std::fs::read(&third).unwrap();
+        assert!(s.undo());
+        assert_eq!(s.path.as_deref(), Some(first.as_path()), "merged origin changes must retain the earliest destination");
+        s.run("project.save", &Value::Null).unwrap();
+        assert_eq!(std::fs::read(&second).unwrap(), second_bytes);
+        assert_eq!(std::fs::read(&third).unwrap(), third_bytes);
+        assert!(s.redo());
+        assert_eq!(s.path.as_deref(), Some(third.as_path()), "redo must restore the final destination");
+        s.run("project.save", &Value::Null).unwrap();
+        assert_eq!(crate::Project::load(&third).unwrap().name, "C");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_export_preserves_standalone_table_sources() {
+        let root = std::env::temp_dir().join(format!("rustgis-table-output-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let source = root.join("Counts.csv");
+        let bytes = b"name,value\nalpha,7\n";
+        std::fs::write(&source, bytes).unwrap();
+        let mut s = Session::new(crate::Project::default());
+        let mut points = Dataset::new("Points", rustgis_data::GeometryType::Point, Vec::new());
+        points.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(20.0, 30.0))), Vec::new());
+        s.map_mut().add_dataset(points);
+        s.run("layer.addData", &json!({"path": source})).unwrap();
+        let table = s.project.tables.first().unwrap();
+        assert_eq!(table.dataset.name, "Counts");
+        assert_eq!(table.dataset.source.as_deref(), source.to_str());
+        for destination in [&source, &root.join("nested").join("..").join("Counts.csv")] {
+            let result = s.run(
+                "gp.run",
+                &json!({"tool": "vectorToPmtiles", "params": {
+                    "input": "Points", "minZoom": 0, "maxZoom": 0, "output": destination
+                }}),
+            );
+            assert!(result.is_err(), "export must refuse a loaded table source: {result:?}");
+            assert!(result.unwrap_err().contains("source of table 'Counts'"));
+            assert_eq!(std::fs::read(&source).unwrap(), bytes);
+            assert!(s.project.gp_history.last().is_some_and(|record| !record.ok));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_export_preserves_loaded_workbooks() {
+        let root = std::env::temp_dir().join(format!("rustgis-workbook-output-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let book = root.join("Counts.xlsx");
+        let bytes = rustgis_data::sheets::xlsx(&[("Counts", &[&["name", "value"], &["alpha", "7"]])]);
+        std::fs::write(&book, &bytes).unwrap();
+        let mut s = points_session();
+        s.run("layer.addData", &json!({"path": book})).unwrap();
+        assert_eq!(s.project.tables.first().map(|t| t.dataset.source.as_deref()), Some(book.to_str()));
+        for destination in [&book, &root.join("nested").join("..").join("Counts.xlsx")] {
+            let result = s.run(
+                "gp.run",
+                &json!({"tool": "vectorToPmtiles", "params": {
+                    "input": "Points", "minZoom": 0, "maxZoom": 0, "output": destination
+                }}),
+            );
+            assert!(result.is_err(), "export must refuse a loaded workbook: {result:?}");
+            assert!(result.unwrap_err().contains("source of table"));
+            assert_eq!(std::fs::read(&book).unwrap(), bytes);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_export_preserves_loaded_source_directories() {
+        let root = std::env::temp_dir().join(format!("rustgis-directory-output-{}-{}", std::process::id(), now_ms()));
+        let source = root.join("Store.gdb");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        let catalog = source.join("a00000001.gdbtable");
+        let rows = source.join("nested").join("rows.bin");
+        std::fs::write(&catalog, b"source catalog").unwrap();
+        std::fs::write(&rows, b"source rows").unwrap();
+        let mut s = points_session();
+        let mut table = Dataset::new("Counts", rustgis_data::GeometryType::None, Vec::new());
+        table.source = Some(source.display().to_string());
+        s.project.add_table(table);
+        let destinations = vec![catalog.clone(), source.join("nested").join("..").join("a00000001.gdbtable"), rows.clone()];
+        #[cfg(unix)]
+        let destinations = {
+            let mut destinations = destinations;
+            let alias = root.join("database-link");
+            std::os::unix::fs::symlink(&source, &alias).unwrap();
+            destinations.push(alias.join("a00000001.gdbtable"));
+            let file_alias = root.join("catalog-link.pmtiles");
+            std::os::unix::fs::symlink(&catalog, &file_alias).unwrap();
+            destinations.push(file_alias);
+            destinations
+        };
+        for destination in destinations {
+            let result = s.run(
+                "gp.run",
+                &json!({"tool": "vectorToPmtiles", "params": {
+                    "input": "Points", "minZoom": 0, "maxZoom": 0, "output": destination
+                }}),
+            );
+            assert!(result.is_err(), "export must refuse a file in a loaded source directory: {result:?}");
+            assert!(result.unwrap_err().contains("source of table 'Counts'"));
+            assert_eq!(std::fs::read(&catalog).unwrap(), b"source catalog");
+            assert_eq!(std::fs::read(&rows).unwrap(), b"source rows");
+        }
+        for created in [source.join("new.pmtiles"), source.join("nested").join("new.pmtiles")] {
+            let result = s.run(
+                "gp.run",
+                &json!({"tool": "vectorToPmtiles", "params": {
+                    "input": "Points", "minZoom": 0, "maxZoom": 0, "output": created
+                }}),
+            );
+            assert!(result.is_err(), "export must refuse a new file in a loaded source directory: {result:?}");
+            assert!(!created.exists(), "nothing may be written into the source directory");
+        }
+        let sibling = root.join("Store.gdb.pmtiles");
+        std::fs::write(&sibling, b"old output").unwrap();
+        s.run(
+            "gp.run",
+            &json!({"tool": "vectorToPmtiles", "params": {
+                "input": "Points", "minZoom": 0, "maxZoom": 0, "output": sibling
+            }}),
+        )
+        .unwrap();
+        assert!(std::fs::read(&sibling).unwrap().starts_with(b"PMTiles\x03"), "a shared name prefix is not directory membership");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_export_preserves_loaded_sources_and_path_aliases() {
+        let root = std::env::temp_dir().join(format!("rustgis-source-output-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let source = root.join("sites.geojson");
+        let bytes = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"Site"},"geometry":{"type":"Point","coordinates":[20,30]}}]}"#;
+        std::fs::write(&source, bytes).unwrap();
+        let destinations = vec![source.clone(), root.join("nested").join("..").join("sites.geojson")];
+        #[cfg(unix)]
+        let destinations = {
+            let mut destinations = destinations;
+            let alias = root.join("alias.geojson");
+            std::os::unix::fs::symlink(&source, &alias).unwrap();
+            destinations.push(alias);
+            destinations
+        };
+        for stream in [false, true] {
+            let mut s = Session::new(crate::Project::default());
+            s.run("layer.addData", &json!({"path": source, "name": "Sites", "stream": stream})).unwrap();
+            for destination in &destinations {
+                let error = s
+                    .run(
+                        "gp.run",
+                        &json!({"tool": "vectorToPmtiles", "params": {
+                            "input": "Sites", "minZoom": 0, "maxZoom": 0, "output": destination
+                        }}),
+                    )
+                    .unwrap_err();
+                assert!(error.contains("source of layer 'Sites'"), "{error}");
+                assert_eq!(std::fs::read(&source).unwrap(), bytes, "source must survive a refused export");
+                assert!(s.project.gp_history.last().is_some_and(|record| !record.ok));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn source_paths_name_zip_archives_and_shapefile_companions() {
+        let root = std::env::temp_dir().join(format!("rustgis-source-names-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&root).unwrap();
+        let archive = root.join("roads.zip");
+        let companion = root.join("roads.DBF");
+        std::fs::write(&archive, b"zip").unwrap();
+        std::fs::write(&companion, b"dbf").unwrap();
+        let archive_file = archive.canonicalize().unwrap();
+        let companion_file = companion.canonicalize().unwrap();
+        assert!(names_file(&archive.join("roads.shp").display().to_string(), &archive_file));
+        assert!(names_file(&root.join("roads.shp").display().to_string(), &companion_file));
+        assert!(!names_file(&root.join("roads.dbf").display().to_string(), &archive_file));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_file_exports_are_atomic_and_never_map_layers() {
+        let mut s = Session::new(crate::Project::default());
+        let root = std::env::temp_dir().join(format!("rustgis-gp-file-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir(&root).unwrap();
+        let destination = root.join("cities.pmtiles");
+        std::fs::write(&destination, b"previous").unwrap();
+        let file = || {
+            Ok(rustgis_analysis::ToolResult {
+                output: Output::File { file_name: "cities.pmtiles".into(), bytes: b"archive".to_vec() },
+                messages: vec!["Exported data".into()],
+            })
+        };
+        let ran = || Ran { name: "File export".into(), id: "vectorToPmtiles".into(), command: None, started: 1000 };
+        let params = json!({"output": destination.display().to_string()});
+        let out = apply(&mut s, ran(), params, file(), 3).unwrap();
+        assert_eq!(out["bytes"], 7);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"archive");
+        assert!(s.map().layers.is_empty());
+        assert!(s.project.gp_history[0].ok);
+        assert!(s.project.gp_history[0].outputs.is_empty());
+        let occupied = root.join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("keep"), b"unchanged").unwrap();
+        let params = json!({"output": occupied.display().to_string()});
+        assert!(s.guarded("File export", true, |s| apply(s, ran(), params, file(), 3)).is_err());
+        assert_eq!(std::fs::read(occupied.join("keep")).unwrap(), b"unchanged");
+        assert_eq!(s.project.gp_history.len(), 2, "a failed save must be recorded");
+        let failed = &s.project.gp_history[1];
+        assert!(!failed.ok);
+        assert_eq!(failed.id, "vectorToPmtiles");
+        assert_eq!(failed.params["output"], occupied.display().to_string());
+        assert_eq!(failed.at, 1);
+        assert_eq!(failed.millis, 3);
+        assert!(failed.outputs.is_empty());
+        assert_eq!(failed.messages.first().map(String::as_str), Some("Exported data"));
+        assert!(failed.messages.last().is_some_and(|m| m.contains(occupied.to_string_lossy().as_ref())));
+        let previous = s.project.gp_history[0].clone();
+        s.project.gp_history.resize(500, previous);
+        let params = json!({"output": occupied.display().to_string()});
+        assert!(
+            s.guarded("Failed export task", true, |s| { s.guarded("File export", true, |s| apply(s, ran(), params, file(), 3)) }).is_err()
+        );
+        assert_eq!(s.project.gp_history.len(), 500);
+        assert!(s.project.gp_history.last().is_some_and(|record| !record.ok));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2, "no partial staging file");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod file_permission_tests {
+    use super::*;
+
+    #[test]
+    fn file_tools_are_file_access_even_without_an_output_path() {
+        let s = Session::new(crate::Project::default());
+        let tool = rustgis_analysis::tool("vectorToPmtiles").expect("registered file export tool");
+        assert!(writes_files(tool));
+        assert!(!reads_files(tool), "output files are not input paths");
+        for output in [None, Some("archive"), Some("cities.pmtiles")] {
+            let mut params = json!({"input": "Cities", "minZoom": 0, "maxZoom": 0});
+            if let Some(output) = output {
+                params["output"] = json!(output);
+            }
+            let p = json!({"tool": "vectorToPmtiles", "params": params});
+            assert!(crate::cmd::items::touches_files("gp.run", &p));
+            let reaches = s.registry.get("gp.run").and_then(|spec| crate::cmd::plugins::reaches(spec, &p));
+            assert!(matches!(reaches, Some(crate::cmd::plugins::Reach::Files)));
+        }
+        let node = crate::project::ModelNode {
+            kind: crate::project::ModelNodeKind::Tool,
+            tool: Some("vectorToPmtiles".into()),
+            ..Default::default()
+        };
+        assert!(crate::model::output_ports(&node).is_empty(), "files must not be wired as layers");
+    }
 }

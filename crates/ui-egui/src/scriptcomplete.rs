@@ -787,6 +787,8 @@ fn param_line(p: &rustgis_engine::analysis::ParamSpec) -> String {
         K::Text => tl_raw!("text"),
         K::Bool => tl_raw!("bool"),
         K::Path => tl_raw!("file path"),
+        K::SaveFile { .. } if cfg!(target_arch = "wasm32") => tl_raw!("File name"),
+        K::SaveFile { .. } => tl_raw!("file path"),
         K::Choice(options) => {
             choices = options.iter().map(|o| format!("\"{o}\"")).collect::<Vec<_>>().join(" | ");
             choices.as_str()

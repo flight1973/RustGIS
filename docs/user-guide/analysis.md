@@ -106,9 +106,56 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Summarize Within | `countPoints` | Analysis › Summarize |
 | Summary Statistics | `summaryStatistics` | Analysis › Statistics |
 | Export Features | `exportFeatures` | Conversion |
-| Zonal Statistics | `zonalStats` | Analysis › Raster |
+| Vector to PMTiles | `vectorToPmtiles` | Analyze › Tools |
 | IDW Interpolation | `idwInterpolation` | Analysis › Interpolation |
 | Ordinary Kriging | `kriging` | Analysis › Interpolation |
+| Zonal Statistics | `zonalStats` | Analysis › Raster |
+
+**Vector to PMTiles** (`vectorToPmtiles`) writes a single-layer MVT archive in standard Web
+Mercator. Choose `minZoom` and `maxZoom` from 0 to 16; `sourceLayer` defaults to the input
+layer's name. The output file is saved atomically on desktop or downloaded in the browser.
+Without `output`, CLI, script and task calls write `<layer>.pmtiles` in the process's working
+directory, where `<layer>` is the layer's name without any folder part; an existing destination
+is replaced atomically. The desktop tool pane instead asks for a destination with Save As.
+Native exports refuse to replace the open/saved project file, the package this project was
+opened from, or a file that a loaded layer, raster, standalone table or tile archive reads.
+For directory-backed sources such as File Geodatabases, files inside the source directory are
+protected as well.
+This includes path aliases, ZIP archives holding loaded members, and Shapefile companion
+files. Project/package paths stay anchored across changes to the working directory, and their
+origins are restored when a project replacement is undone or redone. Browser downloads cannot
+check the eventual save destination; choose a different file in the browser's save dialog to
+avoid replacing an input.
+An active selection is exported; otherwise the geoprocessing extent applies, and streamed
+sources are read in full rather than limited to the visible map window. It exports points,
+lines and polygons, including multipart geometry, attributes and feature IDs—not the map's
+style or labels. Antimeridian paths are unwrapped and clipped with an 8/4096-tile buffer;
+latitudes beyond Web Mercator's limit are clamped and reported. Geometry parts collapsed by
+integer quantization and features without geometry are reported. Null properties are omitted;
+integer attributes outside ±2^53 are rejected to avoid precision loss.
+
+This is an in-memory export, limited to 10,000 distinct output tiles and a conservative
+256 MiB working-memory budget, including the input, clipping/encoding temporaries and final
+archive. This budget is checked after streamed-source materialization, not during provider
+loading: the existing full-read limits (2,000,000 features on desktop, 500,000 in the browser)
+apply first, and loading may use more than 256 MiB before export refuses the input. Reduce a
+large source before loading it for export. Geometry allocation estimates are linear in the
+number of vertices and rings.
+Each geometry component's buffered candidate rectangle is limited to 40,000 tiles per zoom,
+including candidates where clipping produces no output. A separate **100,000,000-unit
+geometry-work budget** accumulates across all exported features, components and zooms:
+each candidate tile costs the component's vertex count, and each polygon validity check
+(before clipping and after integer quantization) costs `(vertices + rings)²`. The extra
+vertex per ring allows for implicit ring closure. The work-limit error is distinct from
+the memory-limit error: simplify polygon rings, reduce the input extent, or narrow the zoom
+range. These limits reject the whole export rather than sampling or truncating it.
+Browser task, model and script runs can queue at most eight files or 256 MiB of archive bytes
+before downloads are submitted; split larger batches into separate runs. Browser success
+means the download was submitted, not confirmation that the browser saved it. Example:
+
+```text
+gp.run={"tool":"vectorToPmtiles","params":{"input":"Roads","minZoom":0,"maxZoom":12,"sourceLayer":"roads","output":"roads.pmtiles"}}
+```
 
 **Simplify** uses Douglas–Peucker with a tolerance in kilometres. Each polygon ring keeps at
 least three different, non-collinear corners (plus the closing vertex), so a tolerance larger
@@ -120,8 +167,8 @@ use a smaller value for local boundaries.
 Most feature tools process only the selected rows when an input has a selection. Selection tools
 instead replace the input's selection; Select Layer By Location honours the selecting layer's
 selection. Summarize Within counts the selected points against **all** input polygons, and
-Calculate Geometry Attributes updates **all** rows. A built-in tool's `output` is a layer name in
-the project, never a file path.
+Calculate Geometry Attributes updates **all** rows. For tools that create a map layer, `output`
+is the layer name; `vectorToPmtiles` uses it as a file destination.
 
 **Buffer** distances, and the distance of **Select Layer By Location**, are measured on the Earth
 (the WGS 84 ellipsoid, as PROJ and GeographicLib measure it), not in the map's display
