@@ -26,6 +26,9 @@ pub const WGS84_MIN_RADIUS_M: f64 = 6_335_439.327_293;
 pub const MERCATOR_R: f64 = 6_378_137.0;
 /// Latitude limit of Web Mercator.
 pub const MAX_LAT: f64 = 85.051_128_78;
+/// How near ±90° (degrees) a latitude is at the pole: about a centimeter, more than the overlays'
+/// grid moves a pole vertex (around 1e-8° there), so a polygon reaching a pole still does after one.
+pub const POLE_TOLERANCE: f64 = 1e-7;
 /// Screen pixel size assumed when converting resolution to a map scale (0.28 mm, OGC).
 pub const PIXEL_M: f64 = 0.000_28;
 
@@ -171,7 +174,8 @@ static MERC_EDGE: LazyLock<(f64, f64, f64)> = LazyLock::new(|| {
 /// within ±[`MAX_LAT`], exactly as [`lonlat_to_merc`] gives it, and beyond, where Web Mercator
 /// stops, continued straight in latitude at the rate it reaches there, so the two meet smoothly and
 /// the poles lie at ±26,424 km. Nothing is clamped, so a polar feature keeps its shape through an
-/// overlay; beyond 85.05° edges are straight in longitude and latitude, as the map draws them.
+/// overlay. Beyond 85.05°, where the plane is linear in latitude, an edge straight in the plane is
+/// straight in longitude and latitude too (Web Mercator's view still draws it clamped to its edge).
 pub fn lonlat_to_plane(c: Coord) -> Coord {
     let lat = c.y.clamp(-90.0, 90.0);
     // False for NaN, which then stays NaN below.
@@ -267,11 +271,29 @@ fn wrap_lon(d: f64) -> f64 {
 /// The centre of lon/lat points on the sphere (their mean direction from the Earth's centre),
 /// or `None` when there are none or they balance out (such as two antipodes).
 pub fn spherical_centre(pts: &[Coord]) -> Option<Coord> {
-    let mut s = [0.0; 3];
-    for v in pts.iter().filter(|c| c.is_finite()).map(|c| unit_vector(*c)) {
-        s = [s[0] + v[0], s[1] + v[1], s[2] + v[2]];
+    let mut mean = SphericalMean::default();
+    pts.iter().for_each(|c| mean.add(*c));
+    mean.center()
+}
+
+/// [`spherical_centre`] of points taken one at a time, for points that aren't in a list (such as
+/// a selection's vertices).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SphericalMean([f64; 3]);
+
+impl SphericalMean {
+    /// Takes in a point; a non-finite one is left out.
+    pub fn add(&mut self, c: Coord) {
+        if c.is_finite() {
+            let (s, v) = (self.0, unit_vector(c));
+            self.0 = [s[0] + v[0], s[1] + v[1], s[2] + v[2]];
+        }
     }
-    from_vector(s)
+
+    /// The center of the points so far, as [`spherical_centre`] gives it.
+    pub fn center(&self) -> Option<Coord> {
+        from_vector(self.0)
+    }
 }
 
 /// The point `dist_m` metres from `c` along the geodesic leaving it at `azimuth_deg` (clockwise
@@ -536,7 +558,7 @@ mod tests {
         // Beyond, nothing is clamped: latitude climbs on to the poles, about 26,424 km out, meeting
         // Web Mercator at its edge with the same slope (R·sec 85.05° a radian), and comes back.
         let y = |lat: f64| lonlat_to_plane(Coord::new(10.0, lat)).y;
-        assert!((y(90.0) - 26_423_921.0).abs() < 1e3 && (y(-90.0) + y(90.0)).abs() < 1e-6, "{}", y(90.0));
+        assert!((y(90.0) - 26_423_582.9).abs() < 1.0 && (y(-90.0) + y(90.0)).abs() < 1e-6, "{}", y(90.0));
         let h = 1e-6;
         let (below, above) = ((y(MAX_LAT) - y(MAX_LAT - h)) / h, (y(MAX_LAT + h) - y(MAX_LAT)) / h);
         assert!((above / below - 1.0).abs() < 1e-5, "{below} {above}");

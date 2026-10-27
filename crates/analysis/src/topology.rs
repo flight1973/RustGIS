@@ -228,12 +228,15 @@ pub fn dangles(ds: &Dataset, rows: &[usize], tol_m: f64) -> Checked {
             _ => None,
         })
         .collect();
-    // Tolerance in Mercator metres grows with latitude; index with the largest it can be here.
-    let max_tol = tol_m / 85f64.to_radians().cos();
     let mut ext = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for c in lines.iter().flat_map(|(_, ps)| ps.iter().flatten()) {
         ext = (ext.0.min(c.x), ext.1.min(c.y), ext.2.max(c.x), ext.3.max(c.y));
     }
+    // Tolerance in Mercator metres grows with latitude; index with the largest it can be here.
+    // That's at 85° within Web Mercator's square, and as far poleward as lines beyond it reach (#1033).
+    let poleward = plane_to_lonlat(Coord::new(0.0, ext.1)).y.abs().max(plane_to_lonlat(Coord::new(0.0, ext.3)).y.abs());
+    let widest = if poleward > rustgis_geom::MAX_LAT { poleward } else { 85.0 };
+    let max_tol = tol_m / widest.to_radians().cos().max(0.01);
     let span = (ext.2 - ext.0).max(ext.3 - ext.1).max(1.0);
     let cell = (span / 512.0).max(max_tol.min(span)).max(1e-6);
     let key = |x: f64, y: f64| (((x - ext.0) / cell).floor() as i64, ((y - ext.1) / cell).floor() as i64);

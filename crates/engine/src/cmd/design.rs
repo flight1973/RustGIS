@@ -3,7 +3,7 @@
 //! Corrections. Every feature edit goes through [`apply`], which enforces the layer's design.
 
 use rustgis_data::{Feature, FieldType, Geometry, GeometryType, Value};
-use rustgis_geom::{Aeqd, Coord, MAX_LAT, lonlat_to_merc, lonlat_to_plane, merc_to_lonlat, plane_to_lonlat, spherical_centre};
+use rustgis_geom::{Aeqd, Coord, MAX_LAT, POLE_TOLERANCE, SphericalMean, lonlat_to_merc, lonlat_to_plane, merc_to_lonlat, plane_to_lonlat};
 use rustgis_map::design::{
     AttributeRule, ContingentSet, Domain, DomainKind, Elevation, FeatureTemplate, Relationship, RuleKind, Subtype, Subtypes, TopologyRule,
 };
@@ -310,11 +310,10 @@ pub fn commands() -> Vec<C> {
             if !(dx.is_finite() && dy.is_finite()) || dx.abs() > 4e7 || dy.abs() > 4e7 {
                 return Err("dx and dy must be finite distances in the command's units (limit: 40,000 km per axis after ground-to-grid)".into());
             }
-            modify(s, |g| {
-                if !within_mercator(g) {
-                    return polar_transform(g, |p| Coord::new(p.x + dx, p.y + dy)).map(Some);
-                }
-                Ok(Some(g.map_coords(&|c: Coord| shift(c, dx, dy))))
+            let polar = polar_move_plane(s)?;
+            modify(s, |g| match &polar {
+                Some(plane) => polar_transform(g, plane, |p| Coord::new(p.x + dx, p.y + dy)).map(Some),
+                None => Ok(Some(g.map_coords(&|c: Coord| shift(c, dx, dy)))),
             })
         })
         .when(need_editable_selection)
@@ -330,7 +329,8 @@ pub fn commands() -> Vec<C> {
                 }
                 let (sin, cos) = (-deg.to_radians()).sin_cos();
                 if !within_mercator(g) {
-                    return polar_transform(g, |p| Coord::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos)).map(Some);
+                    let plane = feature_plane(g)?;
+                    return polar_transform(g, &plane, |p| Coord::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos)).map(Some);
                 }
                 let c = lonlat_to_merc(g.extent().center());
                 Ok(Some(g.map_coords(&|p: Coord| {
@@ -350,7 +350,7 @@ pub fn commands() -> Vec<C> {
                     return Ok(None);
                 }
                 if !within_mercator(g) {
-                    return polar_transform(g, |p| Coord::new(p.x * k, p.y * k)).map(Some);
+                    return polar_transform(g, &feature_plane(g)?, |p| Coord::new(p.x * k, p.y * k)).map(Some);
                 }
                 let c = lonlat_to_merc(g.extent().center());
                 Ok(Some(g.map_coords(&|p: Coord| {
@@ -461,45 +461,108 @@ fn within_mercator(g: &Geometry) -> bool {
     e.min_y >= -MAX_LAT && e.max_y <= MAX_LAT
 }
 
-/// `g`, a feature reaching beyond Web Mercator's square, moved, turned or scaled rigidly in an
-/// azimuthal equidistant plane at its center, where `f` takes each vertex's meters east and north
-/// of the center (#1033). A feature that reaches a pole is refused: its rings go round the pole in
-/// a form (cut at ±180°, closed along ±90°) that moving the vertices one by one would break.
-fn polar_transform(g: &Geometry, f: impl Fn(Coord) -> Coord) -> Result<Geometry, String> {
-    // Each vertex once: a closed ring's repeated last point would pull the center toward its first.
-    let mut vertices = Vec::new();
-    g.for_each_vertex(|_, c| vertices.push(c));
-    if vertices.iter().any(|c| c.y.abs() >= 90.0 - 1e-9) {
-        return Err("a feature that reaches a pole can't be moved, rotated or scaled yet".into());
+/// The azimuthal equidistant plane a move works in when a selected feature reaches beyond Web
+/// Mercator's square (#1033): one, at the center of every selected vertex, so features that share
+/// a vertex still share it after; `None` when they all lie within the square.
+fn polar_move_plane(s: &Session) -> Result<Option<Aeqd>, String> {
+    let selected = || {
+        s.map()
+            .layers
+            .iter()
+            .filter(|l| !l.is_raster())
+            .flat_map(|l| l.selection.iter().filter_map(|r| l.dataset.features.get(*r)?.geometry.as_ref()))
+    };
+    if selected().all(within_mercator) {
+        return Ok(None);
     }
-    let center = spherical_centre(&vertices).ok_or("the feature has no center to move it about")?;
-    let plane = Aeqd::new(center);
-    Ok(g.map_coords(&|c: Coord| plane.inverse(f(plane.forward(c)))))
+    let mut mean = SphericalMean::default();
+    // Each vertex once: a closed ring's repeated last point would pull the center toward its first.
+    selected().for_each(|g| g.for_each_vertex(|_, c| mean.add(c)));
+    mean.center().map(|c| Some(Aeqd::new(c))).ok_or_else(|| "the selection has no center to move it about".into())
+}
+
+/// The azimuthal equidistant plane at a feature's center, which it turns and scales about.
+fn feature_plane(g: &Geometry) -> Result<Aeqd, String> {
+    let mut mean = SphericalMean::default();
+    g.for_each_vertex(|_, c| mean.add(c));
+    mean.center().map(Aeqd::new).ok_or_else(|| "the feature has no center to turn or scale it about".into())
+}
+
+/// How near a pole (meters) a moved line or ring may come: nearer, it's taken to reach it.
+const POLE_CLEARANCE_M: f64 = 0.02;
+
+/// `g` moved, turned or scaled rigidly in `plane`, an azimuthal equidistant plane, where `f` takes
+/// each vertex's meters east and north of its center (#1033). Vertices are moved one by one, which
+/// a line or ring can't survive where it reaches or goes around a pole: one that reaches a pole (as
+/// rings cut at ±180° and closed along it do), has an edge spanning more than 180° of longitude, or
+/// would be carried onto or around a pole is refused. Longitudes run on across ±180° as the
+/// vertices do, each part keeping the range of longitudes it had. Edges stay straight in
+/// longitude/latitude between the moved vertices.
+fn polar_transform(g: &Geometry, plane: &Aeqd, f: impl Fn(Coord) -> Coord) -> Result<Geometry, String> {
+    use rustgis_data::geometry::{ring_contains, seg_dist2};
+    let poles = [plane.forward(Coord::new(0.0, 90.0)), plane.forward(Coord::new(0.0, -90.0))];
+    // A path (a line's part, a ring, or one point) moved, back in longitude/latitude.
+    let path = |pts: &[Coord], ring: bool, point: bool| -> Result<Vec<Coord>, String> {
+        if !point {
+            if pts.iter().any(|c| c.y.abs() >= 90.0 - POLE_TOLERANCE) {
+                return Err("a line or polygon that reaches a pole can't be moved, rotated or scaled yet".into());
+            }
+            if pts.windows(2).any(|w| matches!(w, [a, b] if (b.x - a.x).abs() > 180.0)) {
+                return Err(
+                    "a line or polygon with an edge spanning more than 180° of longitude can't be moved, rotated or scaled near a pole yet"
+                        .into(),
+                );
+            }
+        }
+        let mut out: Vec<Coord> = pts.iter().map(|c| f(plane.forward(*c))).collect();
+        let near = |p: Coord| seg_dist2(&out, p) <= POLE_CLEARANCE_M * POLE_CLEARANCE_M;
+        if !point && poles.iter().any(|p| near(*p) || (ring && ring_contains(&out, *p))) {
+            return Err("that would carry a line or polygon onto or around a pole, which it can't cross yet".into());
+        }
+        out.iter_mut().for_each(|p| *p = plane.inverse(*p));
+        // The whole turns of 360° that bring longitude `x` nearest `was`.
+        let turn = |x: f64, was: f64| 360.0 * ((was - x) / 360.0).round();
+        if point {
+            // Each point in the range of longitudes it was in.
+            out.iter_mut().zip(pts).for_each(|(c, was)| c.x += turn(c.x, was.x));
+        } else {
+            // Each vertex's longitude carried on from the one before, not wrapped at ±180°, and
+            // the path as a whole in the range of longitudes it was in.
+            let mut before: Option<f64> = None;
+            for c in &mut out {
+                if let Some(b) = before {
+                    c.x += turn(c.x, b);
+                }
+                before = Some(c.x);
+            }
+            if let (Some(first), Some(was)) = (out.first().map(|c| c.x), pts.first()) {
+                let k = turn(first, was.x);
+                out.iter_mut().for_each(|c| c.x += k);
+            }
+        }
+        Ok(out)
+    };
+    Ok(match g {
+        Geometry::Point(c) => Geometry::Point(path(std::slice::from_ref(c), false, true)?.first().copied().unwrap_or(*c)),
+        Geometry::MultiPoint(v) => Geometry::MultiPoint(path(v, false, true)?),
+        Geometry::Line(parts) => Geometry::Line(parts.iter().map(|p| path(p, false, false)).collect::<Result<_, _>>()?),
+        Geometry::Polygon(polys) => Geometry::Polygon(
+            polys.iter().map(|rings| rings.iter().map(|r| path(r, true, false)).collect::<Result<_, _>>()).collect::<Result<_, _>>()?,
+        ),
+    })
 }
 
 /// Applies a geometry change to every selected feature of every layer (in the selection's layers).
-/// Every change is worked out before any is made, so a feature that can't be changed (an error)
-/// leaves every layer as it was.
 fn modify(s: &mut Session, change: impl Fn(&Geometry) -> Result<Option<Geometry>, String>) -> CmdResult {
     let mut n = 0;
     let ids: Vec<u32> = s.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster()).map(|l| l.id).collect();
-    let mut plans = Vec::new();
     for id in ids {
-        let l = s.map().layer(id).ok_or("no such layer")?;
-        let mut new = Vec::new();
-        for &r in &l.selection {
-            let Some(g) = l.dataset.features.get(r).and_then(|f| f.geometry.as_ref()) else { continue };
-            let Some(g) = change(g)? else { continue };
-            super::edit::validate(&g)?;
-            new.push((r, g));
-        }
-        plans.push((id, new));
-    }
-    for (id, new) in plans {
         let mut changes = Vec::new();
         let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-        for (r, g) in new {
+        for r in l.selection.clone() {
             let Some(f) = l.dataset.features.get_mut(r) else { continue };
+            let Some(g) = f.geometry.as_ref().map(&change).transpose()?.flatten() else { continue };
+            super::edit::validate(&g)?;
             let before = f.clone();
             f.geometry = Some(g);
             changes.push(Change { before: Some(before), row: Some(r) });

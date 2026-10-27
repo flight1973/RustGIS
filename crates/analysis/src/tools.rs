@@ -3,7 +3,7 @@
 use geo::{BooleanOps, Contains, ConvexHull, InteriorPoint, Intersects, MultiPolygon, Orient, Simplify, orient::Direction};
 use rustgis_data::raster::Crs;
 use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value};
-use rustgis_geom::Extent;
+use rustgis_geom::{Extent, POLE_TOLERANCE};
 use serde_json::Value as Json;
 
 use crate::convert::{from_line, from_multipolygon, from_point, to_geo, to_multiline, to_multipolygon};
@@ -1237,7 +1237,7 @@ fn select_by_location(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         .map(|g| {
             let b = if dist > 0.0 { geodesic_buffer(g, dist) } else { None };
             let g = b.as_ref().unwrap_or(g);
-            (to_geo(g), poles(g))
+            (to_geo(g), poles(&g.extent()))
         })
         .collect();
     let polar = selectors.iter().any(|(_, (n, s))| *n || *s);
@@ -1247,7 +1247,7 @@ fn select_by_location(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             let Some(g) = ds.features.get(*r).and_then(|f| f.geometry.as_ref()) else {
                 return false;
             };
-            let (gg, at_poles) = (to_geo(g), if polar { poles(g) } else { (false, false) });
+            let (gg, at_poles) = (to_geo(g), if polar { poles(&g.extent()) } else { (false, false) });
             let hit = selectors.iter().any(|(s, sp)| meet_at_a_pole(at_poles, *sp) || s.intersects(&gg));
             hit != invert
         })
@@ -1697,30 +1697,26 @@ impl JoinMatch {
 /// The least distance Closest's first search reaches, in metres.
 const MIN_REACH_M: f64 = 10.0;
 
-/// The poles a geometry reaches with a vertex: north, then south.
-fn poles(g: &Geometry) -> (bool, bool) {
-    let (mut north, mut south) = (false, false);
-    g.for_each_coord(|c| {
-        north |= c.y >= 90.0 - 1e-9;
-        south |= c.y <= -90.0 + 1e-9;
-    });
-    (north, south)
+/// The poles a feature with this extent reaches: north, then south.
+fn poles(e: &Extent) -> (bool, bool) {
+    (e.max_y >= 90.0 - POLE_TOLERANCE, e.min_y <= -90.0 + POLE_TOLERANCE)
 }
 
-/// Whether two geometries meet at a pole, given the poles each reaches. The analysis plane, like
+/// Whether two features meet at a pole, given the poles each reaches. The analysis plane, like
 /// longitude and latitude, draws a pole as a line, so (0°, −90°) and (90°, −90°) are apart there
-/// though they are one place on the ground (#1033).
+/// though they are one place on the ground (#1033). (Distances already meet there: they're
+/// measured on the ground.)
 fn meet_at_a_pole((an, as_): (bool, bool), (bn, bs): (bool, bool)) -> bool {
     (an && bn) || (as_ && bs)
 }
 
 /// The ground distance between two features in metres: zero when they intersect.
-fn ground_distance(t: &Geometry, t_geo: &geo::Geometry<f64>, t_poles: (bool, bool), j: &Located) -> Option<f64> {
-    if t_geo.intersects(&j.geo) || meet_at_a_pole(t_poles, j.poles) { Some(0.0) } else { crate::join::distance_m(t, j.geom) }
+fn ground_distance(t: &Geometry, t_geo: &geo::Geometry<f64>, j: &Geometry, j_geo: &geo::Geometry<f64>) -> Option<f64> {
+    if t_geo.intersects(j_geo) { Some(0.0) } else { crate::join::distance_m(t, j) }
 }
 
 /// How much of a target lies in a join polygon: the ground area of a polygon's overlap, the ground
-/// length of a line's. The geometries are in Web Mercator, polygons oriented for the overlay; the
+/// length of a line's. The geometries are in the analysis plane, polygons oriented for the overlay; the
 /// overlap found is measured on the ground, in longitude/latitude.
 fn overlap(t_geo: &geo::Geometry<f64>, j_geo: &geo::Geometry<f64>) -> f64 {
     match (t_geo, j_geo) {
@@ -1734,7 +1730,7 @@ fn overlap(t_geo: &geo::Geometry<f64>, j_geo: &geo::Geometry<f64>) -> f64 {
     }
 }
 
-/// A geometry in Web Mercator, polygons oriented as the overlay needs.
+/// A geometry in the analysis plane, polygons oriented as the overlay needs.
 fn oriented(g: &Geometry) -> geo::Geometry<f64> {
     match to_geo(g) {
         geo::Geometry::MultiPolygon(m) => geo::Geometry::MultiPolygon(m.orient(Direction::Default)),
@@ -1845,20 +1841,13 @@ impl ExtentIndex {
     }
 }
 
-/// A feature to join or measure to: its row in its layer, its extent, its geometry in Web
-/// Mercator (`geo`) and in lon/lat (`geom`), and the poles it reaches.
+/// A feature to join or measure to: its row in its layer, its extent, and its geometry in the
+/// analysis plane (`geo`) and in lon/lat (`geom`).
 struct Located<'a> {
     row: usize,
     ext: Extent,
     geo: geo::Geometry<f64>,
     geom: &'a Geometry,
-    poles: (bool, bool),
-}
-
-impl<'a> Located<'a> {
-    fn new(row: usize, g: &'a Geometry, geo: geo::Geometry<f64>) -> Self {
-        Located { row, ext: g.extent(), geo, geom: g, poles: poles(g) }
-    }
 }
 
 /// Features to measure ground distances to (Spatial Join's join features, Near's near features),
@@ -1890,13 +1879,12 @@ impl Nearby<'_, '_> {
         };
         let mut near = Vec::new();
         let mut bound = reach;
-        let t_poles = poles(t);
         for idx in looked {
             let Some(j) = self.feats.get(idx).filter(|j| Some(j.row) != exclude) else { continue };
             if !crate::join::may_be_within(t_ext, &j.ext, bound) {
                 continue;
             }
-            let d = *measured.entry(idx).or_insert_with(|| ground_distance(t, t_geo, t_poles, j));
+            let d = *measured.entry(idx).or_insert_with(|| ground_distance(t, t_geo, j.geom, &j.geo));
             if let Some(d) = d.filter(|d| *d <= reach * (1.0 + 1e-9) + 1e-6) {
                 near.push((idx, d));
                 if nearest {
@@ -2051,7 +2039,7 @@ fn near(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         .into_iter()
         .filter_map(|row| {
             let g = near_ds.features.get(row)?.geometry.as_ref()?;
-            Some(Located::new(row, g, to_geo(g)))
+            Some(Located { row, ext: g.extent(), geo: to_geo(g), geom: g })
         })
         .collect();
     let index = ExtentIndex::new(feats.iter().map(|f| f.ext));
@@ -2157,7 +2145,7 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             && let Some(g) = f.geometry.as_ref()
         {
             let geo = if mode == JoinMatch::LargestOverlap { oriented(g) } else { to_geo(g) };
-            join_geoms.push(Located::new(jr, g, geo));
+            join_geoms.push(Located { row: jr, ext: g.extent(), geo, geom: g });
         }
     }
 
@@ -2188,13 +2176,16 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     // The join features whose extents may meet `ext`, in join order.
     let candidates = |ext: &Extent| index.candidates(ext);
     let nearby = Nearby { feats: &join_geoms, index: &index };
-    // The join features reaching the North Pole and the South Pole: a target reaching one meets
-    // them there, however far apart their extents' longitudes are.
-    let reaching = |pole: fn(&(bool, bool)) -> bool| -> Vec<usize> {
-        join_geoms.iter().enumerate().filter(|(_, j)| pole(&j.poles)).map(|(i, _)| i).collect()
+    // For Intersects, the join features reaching the North Pole and the South Pole: a target
+    // reaching one meets them there, however far apart their extents' longitudes are.
+    let reaching = |pole: fn((bool, bool)) -> bool| -> Vec<usize> {
+        if mode != JoinMatch::Intersects {
+            return Vec::new();
+        }
+        join_geoms.iter().enumerate().filter(|(_, j)| pole(poles(&j.ext))).map(|(i, _)| i).collect()
     };
     let (north_joins, south_joins) = (reaching(|p| p.0), reaching(|p| p.1));
-    let polar_joins = mode == JoinMatch::Intersects && !(north_joins.is_empty() && south_joins.is_empty());
+    let polar_joins = !(north_joins.is_empty() && south_joins.is_empty());
 
     let mut total_matches = 0usize;
     let mut written_features = 0usize;
@@ -2212,7 +2203,7 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             match mode {
                 JoinMatch::Intersects | JoinMatch::Contains | JoinMatch::Within => {
                     let mut found = candidates(&t_ext);
-                    let t_poles = if polar_joins { poles(tg) } else { (false, false) };
+                    let t_poles = if polar_joins { poles(&t_ext) } else { (false, false) };
                     if t_poles.0 || t_poles.1 {
                         if t_poles.0 {
                             found.extend_from_slice(&north_joins);
@@ -2227,7 +2218,7 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
                         let hit = match mode {
                             JoinMatch::Contains => extent_contains(&t_ext, &j.ext) && Contains::contains(&t_geo, &j.geo),
                             JoinMatch::Within => extent_contains(&j.ext, &t_ext) && Contains::contains(&j.geo, &t_geo),
-                            _ => (t_ext.intersects(&j.ext) && t_geo.intersects(&j.geo)) || meet_at_a_pole(t_poles, j.poles),
+                            _ => (t_ext.intersects(&j.ext) && t_geo.intersects(&j.geo)) || meet_at_a_pole(t_poles, poles(&j.ext)),
                         };
                         if hit {
                             matches.push((j.row, None));

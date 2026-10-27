@@ -369,6 +369,7 @@ pub fn within(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> Vec<(us
     // Web Mercator ends at 85.05°: where the point or a shape is beyond it, the distance is
     // measured on the ground, in an azimuthal equidistant plane centered on the point (#1033).
     let ground = rustgis_geom::Aeqd::new(at);
+    let at_box = rustgis_geom::Extent::new(at.x, at.y, at.x, at.y);
     let mut out: Vec<(usize, f64)> = rows
         .iter()
         .filter_map(|r| {
@@ -377,13 +378,11 @@ pub fn within(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> Vec<(us
             let e = g.extent();
             let dlat = radius_m / 111_320.0;
             if at.y.abs() > MAX_LAT || e.min_y < -MAX_LAT || e.max_y > MAX_LAT {
-                // Near a pole only latitude bounds the reach: longitudes converge there.
-                if at.y < e.min_y - dlat || at.y > e.max_y + dlat {
+                // Near a pole, longitudes converge: the join's bounds allow for it.
+                if !crate::join::may_be_within(&at_box, &e, radius_m) {
                     return None;
                 }
-                let pg = g.map_coords(&|c| ground.forward(c));
-                let origin = Coord::new(0.0, 0.0);
-                let d = if pg.hit(origin, 0.0) { 0.0 } else { pg_dist(&pg, origin) };
+                let d = polar_reach(g, at, &ground);
                 return (d <= radius_m).then_some((*r, d));
             }
             let dlon = dlat * k;
@@ -397,6 +396,57 @@ pub fn within(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> Vec<(us
         .collect();
     out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     out
+}
+
+/// The longest step, in degrees of longitude or latitude, that [`polar_reach`] follows an edge by.
+const REACH_STEP_DEG: f64 = 0.5;
+/// The most steps it takes along one edge (a hostile edge thousands of degrees long included).
+const REACH_STEPS_MAX: f64 = 1024.0;
+
+/// How far `g` comes from `at` on the ground (meters), as [`within`] measures it near a pole: zero
+/// when `at` lies on or in it in the analysis plane, as the other tools see it; otherwise the least
+/// distance to its edges, each followed as the plane draws it (straight in the plane: in longitude
+/// and latitude beyond 85.05°) in steps of at most half a degree, in `ground`, an azimuthal
+/// equidistant plane at `at`. Its vertices alone would draw a long edge as a chord, or one along a
+/// parallel from −180° to 180° as a point.
+fn polar_reach(g: &Geometry, at: Coord, ground: &rustgis_geom::Aeqd) -> f64 {
+    use rustgis_geom::{lonlat_to_plane, plane_to_lonlat};
+    if g.map_coords(&lonlat_to_plane).hit(lonlat_to_plane(at), 0.0) {
+        return 0.0;
+    }
+    let origin = Coord::new(0.0, 0.0);
+    let mut best = f64::INFINITY;
+    let mut edge = |a: Coord, b: Coord| {
+        let span = (b.x - a.x).abs().max((b.y - a.y).abs()) / REACH_STEP_DEG;
+        // NaN (a coordinate missing) takes one step.
+        let n = if span > 1.0 { span.ceil().min(REACH_STEPS_MAX) } else { 1.0 };
+        let (pa, pb) = (lonlat_to_plane(a), lonlat_to_plane(b));
+        let mut last = ground.forward(a);
+        let mut k = 1.0;
+        while k <= n {
+            let t = k / n;
+            let q = if k >= n { b } else { plane_to_lonlat(Coord::new(pa.x + (pb.x - pa.x) * t, pa.y + (pb.y - pa.y) * t)) };
+            let next = ground.forward(q);
+            best = best.min(rustgis_data::geometry::seg_dist2(&[last, next], origin));
+            last = next;
+            k += 1.0;
+        }
+    };
+    let mut path = |pts: &[Coord]| match pts {
+        [only] => edge(*only, *only),
+        _ => pts.windows(2).for_each(|w| {
+            if let (Some(a), Some(b)) = (w.first(), w.get(1)) {
+                edge(*a, *b);
+            }
+        }),
+    };
+    match g {
+        Geometry::Point(c) => path(std::slice::from_ref(c)),
+        Geometry::MultiPoint(v) => v.iter().for_each(|c| path(std::slice::from_ref(c))),
+        Geometry::Line(parts) => parts.iter().for_each(|p| path(p)),
+        Geometry::Polygon(polys) => polys.iter().flatten().for_each(|r| path(r)),
+    }
+    best.sqrt()
 }
 
 fn pg_dist(g: &Geometry, p: Coord) -> f64 {
