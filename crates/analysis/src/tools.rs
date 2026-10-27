@@ -1068,7 +1068,7 @@ const ALLOCATION_OVERHEAD: u64 = 16;
 /// feature (its projected geometry and extent).
 fn vertex_point_bytes(own: &[Value], width: usize) -> u64 {
     let u = |x: usize| u64::try_from(x).unwrap_or(u64::MAX);
-    let (mut text, mut allocations) = (0, 1);
+    let (mut text, mut allocations) = (0u64, 1u64);
     for v in own {
         if let Value::Text(t) = v
             && !t.is_empty()
@@ -1078,7 +1078,10 @@ fn vertex_point_bytes(own: &[Value], width: usize) -> u64 {
         }
     }
     let fixed = size_of::<rustgis_data::Feature>() + size_of::<Option<Geometry>>() + size_of::<Extent>();
-    u(fixed) + u(width) * u(size_of::<Value>()) + text + allocations * ALLOCATION_OVERHEAD
+    u(fixed)
+        .saturating_add(u(width).saturating_mul(u(size_of::<Value>())))
+        .saturating_add(text)
+        .saturating_add(allocations.saturating_mul(ALLOCATION_OVERHEAD))
 }
 
 /// The vertices of `feats` and, when `estimate`, the memory of their points (see
