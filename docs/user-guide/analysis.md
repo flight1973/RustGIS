@@ -78,7 +78,7 @@ written some other way (a token typed into a SQL query, say) can still be there:
 before sharing it. A point buffered where the
 map was clicked is copied as the command that buffered it, with the point.
 
-There are 25 built-in tools; GeoLibre and plugin tools join them when available.
+These are the built-in tools; GeoLibre and plugin tools join them when available.
 Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available tools and their parameters):
 
 | Tool | Id | Toolbox |
