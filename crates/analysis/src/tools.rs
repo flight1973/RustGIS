@@ -1185,12 +1185,13 @@ fn vertex_point_bytes(own: &[Value], width: usize) -> u64 {
 
 /// How many points the vertices of `feats` make and, when `estimate`, the memory they take (see
 /// [`vertex_point_bytes`]), each point copying `kept` of its feature's attributes into `width`.
+/// The memory is `None` when it isn't estimated.
 fn size_vertex_points<'a>(
     feats: impl IntoIterator<Item = &'a rustgis_data::Feature>,
     kept: usize,
     width: usize,
     estimate: bool,
-) -> (usize, u64) {
+) -> (usize, Option<u64>) {
     let (mut n, mut need) = (0usize, 0u64);
     for f in feats {
         let Some(g) = &f.geometry else { continue };
@@ -1205,7 +1206,7 @@ fn size_vertex_points<'a>(
             need = need.saturating_add(k.saturating_mul(vertex_point_bytes(own, width)));
         }
     }
-    (n, need)
+    (n, estimate.then_some(need))
 }
 
 /// Whether the browser can give the web app `need` bytes now, and a quarter more as a margin for
@@ -1296,7 +1297,9 @@ fn feature_vertices_to_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, 
     // memory is also estimated and asked for before anything is built.
     let web = cfg!(target_arch = "wasm32");
     let (n, need) = size_vertex_points(feats(), kept, width, web);
-    check_room(n, need, web_has_room)?;
+    if let Some(need) = need {
+        check_room(n, need, web_has_room)?;
+    }
     // The point list and each point's attributes are allocated fallibly, so running out of memory
     // while they're built stops the tool with a message. (A desktop system that overcommits memory
     // may instead close the app when it runs out.)
@@ -3085,10 +3088,10 @@ mod tests {
     #[test]
     fn feature_vertices_to_points_estimates_and_asks_for_memory() {
         let own = [Value::Text("abc".into()), Value::Int(1)];
-        // The row, the map's projected geometry and extent, 6 values, the text (3 B) and two
-        // allocations (2 × 16 B).
-        let fixed = size_of::<rustgis_data::Feature>() + size_of::<Option<Geometry>>() + size_of::<Extent>();
-        assert_eq!(vertex_point_bytes(&own, 6), u64::try_from(fixed + 6 * size_of::<Value>() + 3 + 2 * 16).unwrap());
+        // A point with no attributes is the base: its fixed part and the row's allocation. On top
+        // of it, each of the 6 values, the text (3 B) and its allocation (16 B).
+        let base = vertex_point_bytes(&[], 0);
+        assert_eq!(vertex_point_bytes(&own, 6), base + u64::try_from(6 * size_of::<Value>() + 3 + 16).unwrap());
         // An empty text allocates nothing, so it costs what a null does.
         assert_eq!(vertex_point_bytes(&[Value::Text(String::new())], 6), vertex_point_bytes(&[Value::Null], 6));
         // Every vertex is counted; the memory only when asked, for the attributes copied.
@@ -3098,8 +3101,8 @@ mod tests {
         attrs.push(Value::Text("not copied".into()));
         let a = Feature { id: 1, geometry: Some(line), attrs };
         let b = Feature { id: 2, geometry: None, attrs: vec![] };
-        assert_eq!(size_vertex_points([&a, &b], 2, 6, false), (3, 0));
-        assert_eq!(size_vertex_points([&a, &b], 2, 6, true), (3, 3 * vertex_point_bytes(&own, 6)));
+        assert_eq!(size_vertex_points([&a, &b], 2, 6, false), (3, None));
+        assert_eq!(size_vertex_points([&a, &b], 2, 6, true), (3, Some(3 * vertex_point_bytes(&own, 6))));
         // Refused when the memory isn't there, saying what the points would need.
         assert!(check_room(3, 1 << 20, |_| true).is_ok());
         let e = check_room(3, (1 << 20) + 1, |need| need < 1 << 20).unwrap_err();
