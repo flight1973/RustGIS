@@ -255,10 +255,10 @@ fn overlapping_zones_still_say_what_lies_outside() {
     assert_eq!(got.iter().map(|(_, n)| n[2]).collect::<Vec<_>>(), [50.0, 50.0]);
 }
 
-/// A class feature reaching beyond the map's latitude limit, and features lacking values in two sum
-/// fields: one notice for each kind.
+/// Features lacking values in two sum fields: one notice for each field, and none for a zone and a
+/// class feature reaching past 85.05°, which are measured there like anywhere else (#1033).
 #[test]
-fn one_notice_per_kind_for_missing_values_and_the_latitude_limit() {
+fn one_notice_per_field_for_missing_values() {
     let polar = |x0: f64, x1: f64, y0: f64, y1: f64| {
         let ring = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)].map(|(x, y)| Coord::new(x, y)).to_vec();
         Some(Geometry::Polygon(vec![vec![ring]]))
@@ -285,10 +285,37 @@ fn one_notice_per_kind_for_missing_values_and_the_latitude_limit() {
             "Tabulate Intersection: 1 row",
             "1 zone overlaps no class feature, so it has no rows",
             "class features with no value in a sum field are left out of its shares: 2 class features in 'pop', 1 class feature in 'income'",
-            "1 zone feature and 1 class feature reach beyond 85.05° latitude, where the map ends: parts there are taken as lying along it, with no area",
             "1 class feature lies partly or wholly outside the zones: its value outside isn't shared out",
         ]
     );
+}
+
+/// Polygons reaching past 85.05°, where the overlay goes on to the poles (#1033): a class feature
+/// from 84°N to 89°N shares out 91.42% of its value to a zone from 80°N to 88°N (on the sphere,
+/// the part from 84° to 88° over the whole), not all of it as when its part beyond 85.05° had no
+/// area; and one wholly beyond, from 86°N to 90°N, has its row in a zone from 80°N to the pole,
+/// 16.03% of it, rather than none.
+#[test]
+fn polygons_past_85_degrees_are_measured_to_the_pole() {
+    let polar = |x0: f64, x1: f64, y0: f64, y1: f64| {
+        let ring = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)].map(|(x, y)| Coord::new(x, y)).to_vec();
+        Some(Geometry::Polygon(vec![vec![ring]]))
+    };
+    let mut z = Dataset::new("zones", GeometryType::Polygon, vec![Field::new("zone", FieldType::Text)]);
+    z.push_next(polar(0.0, 10.0, 80.0, 88.0), vec![Value::Text("A".into())]);
+    z.push_next(polar(20.0, 30.0, 80.0, 90.0), vec![Value::Text("B".into())]);
+    let mut c = Dataset::new("classes", GeometryType::Polygon, vec![Field::new("pop", FieldType::Double)]);
+    c.push_next(polar(0.0, 10.0, 84.0, 89.0), vec![Value::Float(1000.0)]);
+    c.push_next(polar(20.0, 30.0, 86.0, 90.0), vec![Value::Float(500.0)]);
+    let l = layers(z, c);
+    let params = json!({"zones": "zones", "zoneFields": "zone", "classes": "classes", "sumFields": ["pop"]});
+    let got = rows(&table(rustgis_analysis::run("tabulateIntersection", &l, &params).unwrap()));
+    // zone, then area_km2, percentage, pop.
+    assert_eq!(got.len(), 2, "{got:?}");
+    let (a, b) = (&got[0], &got[1]);
+    assert_eq!((a.0[0].as_str(), b.0[0].as_str()), ("A", "B"));
+    assert!((a.1[1] - 33.388).abs() < 0.01 && (a.1[2] - 914.216).abs() < 0.1, "{a:?}");
+    assert!((b.1[1] - 16.034).abs() < 0.01 && (b.1[2] - 500.0).abs() < 1e-6, "{b:?}");
 }
 
 /// Features of about 10 m in zones of half a degree: the overlay rounds their parts to a grid

@@ -1149,7 +1149,10 @@ fn out_name(p: &Json, default: String) -> String {
     if n.is_empty() { default } else { n.to_string() }
 }
 
-/// Scale factor of Web Mercator at a latitude (metres on the map per metre on the ground).
+/// Scale factor of Web Mercator at a latitude (meters on the map per meter on the ground), clamped
+/// at 85°. It scales tolerances for the analysis plane too: beyond 85.05° the plane stretches
+/// north–south by sec(85.05°) and east–west by sec(latitude), both more than sec(85°), so a
+/// tolerance converted with it reaches no farther on the ground than asked there (#1033).
 fn merc_scale(lat: f64) -> f64 {
     1.0 / lat.clamp(-85.0, 85.0).to_radians().cos().max(0.01)
 }
@@ -1398,9 +1401,10 @@ fn dissolved(g: &Geometry) -> std::borrow::Cow<'_, Geometry> {
 /// overlap with it, a line's stretches in it, the points in it or on its edge; outside, the rest.
 /// `None` when nothing is left, or only a shared edge or corner.
 ///
-/// The mask's polygons are in Web Mercator, oriented as `union_all` leaves them. The feature's may
-/// wind either way (the reference corpus has a clockwise parcel), but must not overlap each other:
-/// pass a feature of several polygons through [`dissolved`] first, once for all its masks.
+/// The mask's polygons are in the analysis plane, oriented as `union_all` leaves them. The
+/// feature's may wind either way (the reference corpus has a clockwise parcel), but must not
+/// overlap each other: pass a feature of several polygons through [`dissolved`] first, once for all
+/// its masks.
 fn part(g: &Geometry, mask: &MultiPolygon<f64>, inside: bool) -> Option<Geometry> {
     match g {
         Geometry::Polygon(_) => {
@@ -1417,7 +1421,7 @@ fn part(g: &Geometry, mask: &MultiPolygon<f64>, inside: bool) -> Option<Geometry
                 .iter()
                 .copied()
                 .filter(|c| {
-                    let m = rustgis_geom::lonlat_to_merc(*c);
+                    let m = rustgis_geom::lonlat_to_plane(*c);
                     mask.intersects(&geo::Point::new(m.x, m.y)) == inside
                 })
                 .collect();
@@ -1520,8 +1524,8 @@ fn erase(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     result(out, format!("Erase: {n} features remain"))
 }
 
-/// An overlay polygon: its row in the overlay layer, its extent and its polygons in Web Mercator,
-/// oriented for the overlay, its parts unioned when it has several (as Clip's mask is).
+/// An overlay polygon: its row in the overlay layer, its extent and its polygons in the analysis
+/// plane, oriented for the overlay, its parts unioned when it has several (as Clip's mask is).
 struct Zone {
     row: usize,
     ext: Extent,
@@ -2012,7 +2016,7 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         let Some(g) = &f.geometry else { continue };
         let mut these = Vec::new();
         g.for_each_coord(|c| {
-            let m = rustgis_geom::lonlat_to_merc(c);
+            let m = rustgis_geom::lonlat_to_plane(c);
             these.push(geo::Point::new(m.x, m.y));
         });
         if each {
@@ -2806,6 +2810,17 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
 
     let mut pts: Vec<(Coord, f64)> = Vec::new();
     let mut skipped: usize = 0;
+    // A point the system can't hold is left out, and counted, as one past 85.05° in Web Mercator,
+    // which would land on the map's edge rather than where it is (#1033): its latitude doesn't
+    // come back.
+    let mut beyond: usize = 0;
+    let project = |c: Coord, beyond: &mut usize| {
+        let p = transformer
+            .from_lonlat(c)
+            .filter(|p| p.is_finite() && transformer.to_lonlat(*p).is_some_and(|back| (back.y - c.y).abs() < 1e-4));
+        *beyond += usize::from(p.is_none());
+        p
+    };
     for r in rows(inp, p, "input", ds) {
         let Some(g) = ds.features.get(r).and_then(|f| f.geometry.as_ref()) else {
             skipped += 1;
@@ -2824,21 +2839,17 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
 
         match g {
             Geometry::Point(c) => {
-                if c.is_finite()
-                    && let Some(p_proj) = transformer.from_lonlat(*c)
-                    && p_proj.is_finite()
-                {
-                    pts.push((p_proj, w));
-                } else {
+                if !c.is_finite() {
                     skipped += 1;
+                } else if let Some(p_proj) = project(*c, &mut beyond) {
+                    pts.push((p_proj, w));
                 }
             }
             Geometry::MultiPoint(cs) => {
                 let mut any = false;
                 for c in cs {
                     if c.is_finite()
-                        && let Some(p_proj) = transformer.from_lonlat(*c)
-                        && p_proj.is_finite()
+                        && let Some(p_proj) = project(*c, &mut beyond)
                     {
                         pts.push((p_proj, w));
                         any = true;
@@ -2854,8 +2865,11 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         }
     }
 
+    let beyond_note = (beyond > 0)
+        .then(|| format!("{beyond} point(s) beyond what {} can hold (as past 85.05° in Web Mercator) were left out", crs.label()));
     if pts.is_empty() {
-        return Err("input layer has no valid points with positive weights to analyze".into());
+        let none = "input layer has no valid points with positive weights to analyze";
+        return Err(beyond_note.map_or_else(|| none.to_string(), |note| format!("{none}: {note}")));
     }
 
     let pt_extent = crate::density::points_extent(&pts).ok_or("input layer has no valid points with positive weights to analyze")?;
@@ -2918,7 +2932,7 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
     };
     Ok(ToolResult {
         output: Output::Layers(vec![OutputLayer::Raster { file_name: format!("{name}.tif"), name, bytes }]),
-        messages: vec![msg],
+        messages: std::iter::once(msg).chain(beyond_note).collect(),
     })
 }
 
@@ -2926,11 +2940,11 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
 /// same transform and non-finite-coordinate filtering as [`to_geo`] followed by [`merc_extent`].
 fn projected_extent(g: &Geometry) -> Extent {
     let mut ext = Extent::EMPTY;
-    g.for_each_coord(|c| ext.expand(rustgis_geom::lonlat_to_merc(c)));
+    g.for_each_coord(|c| ext.expand(rustgis_geom::lonlat_to_plane(c)));
     ext
 }
 
-/// The extent of a geometry in Web Mercator, as [`to_geo`] gives it, leaving out non-finite
+/// The extent of a geometry in the analysis plane, as [`to_geo`] gives it, leaving out non-finite
 /// coordinates as [`Extent::expand`] does: one NaN doesn't hide the rest.
 fn merc_extent(g: &impl geo::CoordsIter<Scalar = f64>) -> Extent {
     g.coords_iter().fold(Extent::EMPTY, |mut e, c| {
@@ -2942,8 +2956,7 @@ fn merc_extent(g: &impl geo::CoordsIter<Scalar = f64>) -> Extent {
 /// Summarize Within: each polygon's count of the (selected) point features that meet it, inside it
 /// or on its edge; a feature of several points counts once in each polygon it meets. Each point is
 /// tested only against the polygons whose extents hold it, through an [`ExtentIndex`]. The extents
-/// are in Web Mercator, where the test runs, so a point beyond the map's latitude limit still
-/// meets a polygon reaching that limit.
+/// are in the analysis plane, where the test runs, which goes on past 85.05° to the poles (#1033).
 fn count_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let polys = input(inp, p, "polygons")?;
     let pts = input(inp, p, "points")?;
@@ -3037,54 +3050,87 @@ fn lonlat_ring_area(ring: &[Coord]) -> f64 {
     (ring.iter().zip(ring.iter().cycle().skip(1)).map(|(a, b)| d(a).0 * d(b).1 - d(b).0 * d(a).1).sum::<f64>() / 2.0).abs()
 }
 
-/// The area (square metres, holes taken out) of a lon/lat polygon geometry on a sphere of the
-/// Earth's radius, as the map draws it: each edge a straight line in Web Mercator, which is a rhumb
-/// line, with longitudes as they are (not folded across the antimeridian) and latitudes clamped to
-/// the map's limit, as the overlay takes them. A polygon cut along any straight line on the map
-/// splits this area exactly, so the parts' areas add up to the whole's, up to the overlay's
-/// rounding of the cut ([`OverlayGrid`]). Zero for any other geometry.
+/// The area (square meters, holes taken out) of a lon/lat polygon geometry on a sphere of the
+/// Earth's radius, as the overlay takes it: each edge straight in the analysis plane
+/// ([`rustgis_geom::lonlat_to_plane`]), a rhumb line within ±85.05° and straight in longitude and
+/// latitude beyond (#1033), with longitudes as they are (not folded across the antimeridian). A
+/// polygon cut along any straight line in that plane splits this area exactly, so the parts' areas
+/// add up to the whole's, up to the overlay's rounding of the cut ([`OverlayGrid`]). Zero for any
+/// other geometry.
 fn map_area_m2(g: &Geometry) -> f64 {
     let Geometry::Polygon(polys) = g else { return 0.0 };
     let r2 = rustgis_geom::EARTH_RADIUS_M * rustgis_geom::EARTH_RADIUS_M;
     polys.iter().flat_map(|rings| rings.iter().enumerate()).map(|(i, r)| if i == 0 { 1.0 } else { -1.0 } * rhumb_ring_area(r) * r2).sum()
 }
 
-/// The area of a ring of rhumb lines on the unit sphere, |∮ sin φ dλ|, for [`map_area_m2`]. The
-/// integral is the area element cos φ dφ dλ taken round the ring by Green's theorem, the one
-/// Chamberlain & Duquette (JPL, 2007) evaluate with edges straight in longitude and latitude
-/// ([`rustgis_geom::geodesic_ring_area_m2`]). Along a rhumb line the isometric latitude
-/// ψ = ln tan(π/4 + φ/2), the Mercator y over the radius (Snyder, *Map Projections: A Working
-/// Manual*, USGS Professional Paper 1395, 1987, on the Mercator projection), changes linearly with
-/// the longitude λ, and sin φ = tanh ψ, so an edge's integral is Δλ/Δψ × (ln cosh ψ₂ − ln cosh ψ₁);
-/// for a short Δψ, where that difference cancels, its Taylor series about the middle. Longitudes
-/// are not folded, as on the map, so the ring's Δλ add up to 0 and no ring winds around a pole: a
-/// ring stored around one with a jump across the antimeridian is the flat shape the map draws.
+/// The area of a ring on the unit sphere, |∮ sin φ dλ|, each edge straight in the analysis plane,
+/// for [`map_area_m2`]. The integral is the area element cos φ dφ dλ taken round the ring by
+/// Green's theorem, the one Chamberlain & Duquette (JPL, 2007) evaluate with edges straight in
+/// longitude and latitude ([`rustgis_geom::geodesic_ring_area_m2`]). An edge crossing ±85.05° is
+/// cut where it crosses, found along it in the plane, where longitude and the plane's y change
+/// together. Within ±85.05° a piece is a rhumb line: the isometric latitude ψ = ln tan(π/4 + φ/2),
+/// the Mercator y over the radius (Snyder, *Map Projections: A Working Manual*, USGS Professional
+/// Paper 1395, 1987, on the Mercator projection), changes linearly with the longitude λ, and
+/// sin φ = tanh ψ, so its integral is Δλ/Δψ × (ln cosh ψ₂ − ln cosh ψ₁). Beyond, φ changes
+/// linearly with λ, so it is Δλ × (cos φ₁ − cos φ₂)/Δφ. For a short Δψ or Δφ, where those
+/// differences cancel, each takes its Taylor series about the middle. Longitudes are not folded,
+/// as on the map, so the ring's Δλ add up to 0 and no ring winds around a pole: a ring stored
+/// around one with a jump across the antimeridian is the flat shape the map draws.
 fn rhumb_ring_area(ring: &[Coord]) -> f64 {
-    let iso = |c: &Coord| c.y.clamp(-rustgis_geom::MAX_LAT, rustgis_geom::MAX_LAT).to_radians().tan().asinh();
+    let max_lat = rustgis_geom::MAX_LAT;
+    let iso = |lat: f64| lat.clamp(-max_lat, max_lat).to_radians().tan().asinh();
     let ln_cosh = |x: f64| x.abs() + (-2.0 * x.abs()).exp().ln_1p() - std::f64::consts::LN_2;
+    // The mean of sin φ along a piece from `p` to `q`, straight in the plane on one side of ±85.05°.
+    let mean_sin = |p: Coord, q: Coord| {
+        if p.y.abs().max(q.y.abs()) <= max_lat {
+            let (p1, p2) = (iso(p.y), iso(q.y));
+            let dpsi = p2 - p1;
+            if dpsi.abs() < 1e-4 {
+                // tanh over the piece, averaged: tanh m + Δψ²/24 × tanh″ m, with tanh″ = −2 tanh sech².
+                let t = ((p1 + p2) / 2.0).tanh();
+                t - dpsi * dpsi / 12.0 * t * (1.0 - t * t)
+            } else {
+                (ln_cosh(p2) - ln_cosh(p1)) / dpsi
+            }
+        } else {
+            let (f1, f2) = (p.y.to_radians(), q.y.to_radians());
+            let dphi = f2 - f1;
+            if dphi.abs() < 1e-4 {
+                // sin over the piece, averaged: sin m × (1 − Δφ²/24).
+                ((f1 + f2) / 2.0).sin() * (1.0 - dphi * dphi / 24.0)
+            } else {
+                (f1.cos() - f2.cos()) / dphi
+            }
+        }
+    };
+    let edge_y = |lat: f64| rustgis_geom::lonlat_to_plane(Coord::new(0.0, lat)).y;
+    let (north, south) = (edge_y(max_lat), edge_y(-max_lat));
     let mut total = 0.0;
     for (a, b) in ring.iter().zip(ring.iter().cycle().skip(1)) {
-        let dlon = b.x - a.x;
-        let (p1, p2) = (iso(a), iso(b));
-        let dpsi = p2 - p1;
-        let mean_sin = if dpsi.abs() < 1e-4 {
-            // tanh over the edge, averaged: tanh m + Δψ²/24 × tanh″ m, with tanh″ = −2 tanh sech².
-            let t = ((p1 + p2) / 2.0).tanh();
-            t - dpsi * dpsi / 12.0 * t * (1.0 - t * t)
-        } else {
-            (ln_cosh(p2) - ln_cosh(p1)) / dpsi
-        };
-        total += dlon.to_radians() * mean_sin;
+        let (a, b) = (Coord::new(a.x, a.y.clamp(-90.0, 90.0)), Coord::new(b.x, b.y.clamp(-90.0, 90.0)));
+        let (ya, yb) = (rustgis_geom::lonlat_to_plane(a).y, rustgis_geom::lonlat_to_plane(b).y);
+        // Where the edge crosses 85.05° north or south, in order along it.
+        let mut cuts: Vec<(f64, f64)> = [(north, max_lat), (south, -max_lat)]
+            .into_iter()
+            .map(|(y, lat)| ((y - ya) / (yb - ya), lat))
+            .filter(|(t, _)| *t > 0.0 && *t < 1.0)
+            .collect();
+        cuts.sort_by(|p, q| p.0.total_cmp(&q.0));
+        let mut from = a;
+        for to in cuts.into_iter().map(|(t, lat)| Coord::new(a.x + t * (b.x - a.x), lat)).chain(std::iter::once(b)) {
+            total += (to.x - from.x).to_radians() * mean_sin(from, to);
+            from = to;
+        }
     }
     total.abs()
 }
 
-/// The overlay's grid for a feature cut by masks within a Web Mercator extent. The overlay keeps 29
+/// The overlay's grid for a feature cut by masks within an analysis-plane extent. The overlay keeps 29
 /// integer bits about the centre of its operands' extent (see [`clip`]), a grid step of the extent
 /// over 2^30, so it moves each vertex by less than a step: the area by less than the perimeter times
 /// a step, and a sliver it leaves along an edge is no wider than a step.
 struct OverlayGrid {
-    /// The grid step, in Web Mercator metres, taken over the feature and all its masks.
+    /// The grid step, in the analysis plane's meters, taken over the feature and all its masks.
     step: f64,
     /// How far rounding can move the feature's area, relative to it: twice the perimeter times the
     /// step over the area, from 1e-9 to 1. A part closer than this to the whole may be the whole.
@@ -3118,7 +3164,7 @@ impl OverlayGrid {
     }
 }
 
-/// The planar area and perimeter (holes included) of polygons in Web Mercator metres.
+/// The planar area and perimeter (holes included) of polygons in the analysis plane's meters.
 fn merc_area_perimeter(mp: &MultiPolygon<f64>) -> (f64, f64) {
     use geo::{Area, Euclidean, Length};
     let perimeter = mp.0.iter().flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors())).map(|r| Euclidean.length(r)).sum();
@@ -3463,11 +3509,12 @@ struct TabulateZone {
     key: Vec<Value>,
     /// The lon/lat extent of its features, for the index.
     ext: Extent,
-    /// Its features' polygons in Web Mercator, unioned when there are several, as [`mask_of`] does.
+    /// Its features' polygons in the analysis plane, unioned when there are several, as
+    /// [`mask_of`] does.
     mask: MultiPolygon<f64>,
-    /// The Web Mercator extent of its mask, for [`OverlayGrid`].
+    /// The analysis-plane extent of its mask, for [`OverlayGrid`].
     merc_ext: Extent,
-    /// Its area in square metres as the map draws it ([`map_area_m2`]), overlaps between its
+    /// Its area in square meters as the overlay takes it ([`map_area_m2`]), overlaps between its
     /// features counted once.
     map_area_m2: f64,
 }
@@ -3528,8 +3575,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     };
     // A feature without geometry, with an empty one (`"coordinates": []`), with a line or point in
     // a polygon layer, or whose polygons have no area in its own coordinates (a collapsed ring) has
-    // no polygon, so no area to tabulate. The area is taken in longitude and latitude, so a polygon
-    // the map's latitude limit flattens still counts as one.
+    // no polygon, so no area to tabulate. The area is taken in longitude and latitude.
     let has_shape = |g: &Geometry| matches!(g, Geometry::Polygon(polys) if polys.iter().any(|rings| rings.first().is_some_and(|r| lonlat_ring_area(r) > 0.0)));
     let shapeless = |ds: &Dataset, rs: &[usize]| {
         rs.iter().filter(|&&r| ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_none_or(|g| !has_shape(g))).count()
@@ -3537,15 +3583,6 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     let zone_rows = sorted_rows("zones", zones);
     let class_rows = sorted_rows("classes", classes);
     let (zones_shapeless, classes_shapeless) = (shapeless(zones, &zone_rows), shapeless(classes, &class_rows));
-    // The map ends at the latitude limit: the overlay takes parts beyond it as lying along it.
-    let beyond_limit = |ds: &Dataset, rs: &[usize]| {
-        let beyond = |g: &Geometry| {
-            let e = g.extent();
-            has_shape(g) && (e.max_y > rustgis_geom::MAX_LAT || e.min_y < -rustgis_geom::MAX_LAT)
-        };
-        rs.iter().filter(|&&r| ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(beyond)).count()
-    };
-    let (zones_beyond, classes_beyond) = (beyond_limit(zones, &zone_rows), beyond_limit(classes, &class_rows));
     // Features with a ring that jumps across the antimeridian unsplit: the overlay, like the map,
     // takes such a ring the long way round, while `area_km2` takes its ground shape.
     let unsplit = |ds: &Dataset, rs: &[usize]| {
@@ -3795,19 +3832,6 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
             messages.push(format!("class features with no value in a sum field are left out of its shares: {}", list.join(", ")));
         }
     }
-    let beyond: Vec<String> = [(zones_beyond, "zone"), (classes_beyond, "class")]
-        .into_iter()
-        .filter(|(n, _)| *n > 0)
-        .map(|(n, layer)| features(n, layer))
-        .collect();
-    if !beyond.is_empty() {
-        let verb = if zones_beyond + classes_beyond == 1 { "reaches" } else { "reach" };
-        messages.push(format!(
-            "{} {verb} beyond {:.2}° latitude, where the map ends: parts there are taken as lying along it, with no area",
-            beyond.join(" and "),
-            rustgis_geom::MAX_LAT
-        ));
-    }
     let unsplit: Vec<String> = [(zones_unsplit, "zone"), (classes_unsplit, "class")]
         .into_iter()
         .filter(|(n, _)| *n > 0)
@@ -3929,8 +3953,8 @@ fn ground_distance(t: &Geometry, t_geo: &geo::Geometry<f64>, j: &Geometry, j_geo
 }
 
 /// How much of a target lies in a join polygon: the ground area of a polygon's overlap, the ground
-/// length of a line's. The geometries are in Web Mercator, polygons oriented for the overlay; the
-/// overlap found is measured on the ground, in longitude/latitude.
+/// length of a line's. The geometries are in the analysis plane, polygons oriented for the overlay;
+/// the overlap found is measured on the ground, in longitude/latitude.
 fn overlap(t_geo: &geo::Geometry<f64>, j_geo: &geo::Geometry<f64>) -> f64 {
     match (t_geo, j_geo) {
         (geo::Geometry::MultiPolygon(t), geo::Geometry::MultiPolygon(j)) => {
@@ -3943,7 +3967,7 @@ fn overlap(t_geo: &geo::Geometry<f64>, j_geo: &geo::Geometry<f64>) -> f64 {
     }
 }
 
-/// A geometry in Web Mercator, polygons oriented as the overlay needs.
+/// A geometry in the analysis plane, polygons oriented as the overlay needs.
 fn oriented(g: &Geometry) -> geo::Geometry<f64> {
     match to_geo(g) {
         geo::Geometry::MultiPolygon(m) => geo::Geometry::MultiPolygon(m.orient(Direction::Default)),
@@ -4100,8 +4124,8 @@ impl ExtentIndex {
     }
 }
 
-/// A feature to join or measure to: its row in its layer, its extent, and its geometry in Web
-/// Mercator (`geo`) and in lon/lat (`geom`).
+/// A feature to join or measure to: its row in its layer, its extent, and its geometry in the
+/// analysis plane (`geo`) and in lon/lat (`geom`).
 struct Located<'a> {
     row: usize,
     ext: Extent,
@@ -4117,11 +4141,11 @@ struct Nearby<'a, 'b> {
 }
 
 impl Nearby<'_, '_> {
-    /// The features within `reach` metres of a target (`t`, with its extent, and its geometry in Web
-    /// Mercator), in order, with their distances. With `nearest`, only the nearest is wanted: a
-    /// feature that can't be as near as the nearest so far isn't measured, so some farther ones
-    /// may be missing. The feature in row `exclude` is left out (the target itself, when both are
-    /// one layer). `measured` keeps each feature's distance, measured once per target.
+    /// The features within `reach` meters of a target (`t`, with its extent, and its geometry in
+    /// the analysis plane), in order, with their distances. With `nearest`, only the nearest is
+    /// wanted: a feature that can't be as near as the nearest so far isn't measured, so some
+    /// farther ones may be missing. The feature in row `exclude` is left out (the target itself,
+    /// when both are one layer). `measured` keeps each feature's distance, once per target.
     fn within(
         &self,
         t: &Geometry,
@@ -4202,11 +4226,11 @@ impl Nearby<'_, '_> {
 
 /// A point (lon/lat) two intersecting features share: one of the points of either on the other;
 /// else a point of their overlap, when one is polygons; else a point where their edges meet. The
-/// geometries come with their Web Mercator forms, where the test and the overlay work.
+/// geometries come with their forms in the analysis plane, where the test and the overlay work.
 fn shared_point(a: &Geometry, a_geo: &geo::Geometry<f64>, b: &Geometry, b_geo: &geo::Geometry<f64>) -> Option<Coord> {
     use geo::LinesIter;
-    let back = |c: geo::Coord<f64>| rustgis_geom::merc_to_lonlat(Coord::new(c.x, c.y));
-    // Points answer with their own coordinates, not ones back from Web Mercator.
+    let back = |c: geo::Coord<f64>| rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y));
+    // Points answer with their own coordinates, not ones back from the plane.
     let point_on = |pts: &Geometry, other: &geo::Geometry<f64>| -> Option<Option<Coord>> {
         let pts: &[Coord] = match pts {
             Geometry::Point(c) => std::slice::from_ref(c),
@@ -4214,7 +4238,7 @@ fn shared_point(a: &Geometry, a_geo: &geo::Geometry<f64>, b: &Geometry, b_geo: &
             _ => return None,
         };
         Some(pts.iter().copied().find(|c| {
-            let m = rustgis_geom::lonlat_to_merc(*c);
+            let m = rustgis_geom::lonlat_to_plane(*c);
             other.intersects(&geo::Point::new(m.x, m.y))
         }))
     };
@@ -5936,14 +5960,14 @@ mod tests {
     }
 
     /// Points along each edge of each ring at the fractions `ts`, as the tools draw edges: straight
-    /// in Web Mercator.
+    /// in the analysis plane (Web Mercator within ±85.05°, straight in lon/lat beyond).
     fn along_edges(polys: &[Vec<Vec<Coord>>], ts: &[f64]) -> Vec<Coord> {
-        use rustgis_geom::{lonlat_to_merc, merc_to_lonlat};
+        use rustgis_geom::{lonlat_to_plane, plane_to_lonlat};
         polys
             .iter()
             .flatten()
-            .flat_map(|ring| ring.windows(2).map(|w| (lonlat_to_merc(w[0]), lonlat_to_merc(w[1]))).collect::<Vec<_>>())
-            .flat_map(|(a, b)| ts.iter().map(move |t| merc_to_lonlat(Coord::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)))))
+            .flat_map(|ring| ring.windows(2).map(|w| (lonlat_to_plane(w[0]), lonlat_to_plane(w[1]))).collect::<Vec<_>>())
+            .flat_map(|(a, b)| ts.iter().map(move |t| plane_to_lonlat(Coord::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)))))
             .collect()
     }
 
@@ -5992,7 +6016,7 @@ mod tests {
     /// The outline keeps its distance between its vertices too, not only at them (#1159): edges
     /// drawn straight in the projection came back to lon/lat as straight lines there, so the long
     /// sides of a 2 km buffer of a 96 km east–west line sat up to 190 m off. Every vertex, and every
-    /// edge's quarter points and midpoint as the tools draw edges (straight in Web Mercator), is now
+    /// edge's quarter points and midpoint as the tools draw edges (straight in the analysis plane), is now
     /// within 0.012% of the distance (or 1 cm) along a line's sides, and no further inside an arc
     /// than 0.031% of the distance in the projection plane (#1221). The old 32-edge circles
     /// and 15-edge caps cut about 0.5% inside and fail these bounds.
@@ -6044,11 +6068,13 @@ mod tests {
             }
         }
 
-        // Near a pole: a circle reaching past Web Mercator's 85.05° keeps its distance up to 85°
-        // (an edge across 85.05° was left whole, its visible part 80 km out). Within the last
-        // twentieth of a degree, where Mercator stretches its edges most, it can be 0.03% out.
+        // Near a pole: a circle reaching past 85.05°, and over the pole, keeps its distance all the
+        // way round (an edge across 85.05° was once left whole, its visible part 80 km out; edges
+        // beyond it were left whole until #1033). The edges closing the cap, up ±180° to the pole
+        // and along it, aren't on the circle.
         let north = Coord::new(10.0, 83.0);
-        for c in points(&buffered(Geometry::Point(north), 1000.0)).into_iter().filter(|c| c.y.abs() < 85.0) {
+        let closing = |c: &Coord| c.y.abs() >= 90.0 || c.x.abs() >= 180.0 - 1e-9;
+        for c in points(&buffered(Geometry::Point(north), 1000.0)).into_iter().filter(|c| !closing(c)) {
             let d = on_wgs84_m(north, c);
             assert!(d < 1_000_000.0 * (1.0 + 1.2e-4) && d > 1_000_000.0 - arc_error(1_000_000.0) - 100.0, "{c:?} is {d} m from {north:?}");
         }
@@ -6366,6 +6392,35 @@ mod tests {
             _ => panic!("expected raster"),
         };
         assert!((pred_inter.bands[0].data[0] - 20.0).abs() < 1e-4, "expected 20.0 at (0.5, 0.5), got {}", pred_inter.bands[0].data[0]);
+    }
+
+    #[test]
+    fn kernel_density_skips_points_its_system_cant_hold() {
+        // In Web Mercator, points past 85.05° would land on the map's edge: they're left out and
+        // counted, not piled up on the raster's top row (#1033), a multipoint's members each.
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+        for c in [Coord::new(0.0, 87.0), Coord::new(1.0, 89.0), Coord::new(0.0, 60.0), Coord::new(0.01, 60.0)] {
+            pts.push(Some(Geometry::Point(c)), vec![]);
+        }
+        pts.push(Some(Geometry::MultiPoint(vec![Coord::new(0.0, 60.02), Coord::new(0.0, 87.0)])), vec![]);
+        let m = Map(HashMap::from([("pts".to_string(), pts)]));
+        let params = serde_json::json!({"input": "pts", "crs": "EPSG:3857", "radius": 5000.0, "pixelSize": 1000.0});
+        let res = crate::run("kernelDensity", &m, &params).unwrap();
+        assert!(res.messages.iter().any(|m| m.contains("from 3 points (bandwidth")), "{:?}", res.messages);
+        assert!(res.messages.iter().any(|m| m.starts_with("3 point(s) beyond what") && m.contains("85.05°")), "{:?}", res.messages);
+        // With none it can hold, the error says why.
+        let mut far = Dataset::new("far", GeometryType::Point, vec![]);
+        far.push(Some(Geometry::Point(Coord::new(0.0, 87.0))), vec![]);
+        let m = Map(HashMap::from([("far".to_string(), far)]));
+        let params = serde_json::json!({"input": "far", "crs": "EPSG:3857", "radius": 5000.0, "pixelSize": 1000.0});
+        let err = crate::run("kernelDensity", &m, &params).err().unwrap_or_default();
+        assert!(err.contains("1 point(s) beyond what"), "{err}");
+        // Points it can hold say nothing of the kind.
+        let mut near = Dataset::new("near", GeometryType::Point, vec![]);
+        near.push(Some(Geometry::Point(Coord::new(0.0, 60.0))), vec![]);
+        let m = Map(HashMap::from([("near".to_string(), near)]));
+        let params = serde_json::json!({"input": "near", "crs": "EPSG:3857", "radius": 5000.0, "pixelSize": 1000.0});
+        assert!(crate::run("kernelDensity", &m, &params).unwrap().messages.iter().all(|m| !m.contains("beyond")));
     }
 
     #[test]

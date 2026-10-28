@@ -8,7 +8,9 @@
 //!
 //! The outline keeps its distance between its vertices too, not only at them (#1159): an edge
 //! drawn straight in the plane is split before it comes back to lon/lat wherever a straight edge
-//! there would stray from it ([`OUTLINE_TOLERANCE`]), so up to 85° of latitude the sides are
+//! there would stray from it ([`OUTLINE_TOLERANCE`]), straight as the tools draw edges (in the
+//! analysis plane: Web Mercator within ±85.05°, straight in lon/lat beyond, #1033), so at any
+//! latitude, as far as [`MAX_SPLITS`] halvings reach, the sides are
 //! within 0.012% of the distance (or 1 cm) wherever the feature is within 150 km of its
 //! projection's centre: the projection's own error, under 0.0093% there, and the edges' 0.002%.
 //! A winding line or outline buffered in stretches can have vertices up to [`STRETCH_M`] from a
@@ -26,7 +28,7 @@ use geo::{
     orient::Direction,
 };
 use rustgis_data::{Coord, Geometry};
-use rustgis_geom::{Aeqd, geodesic_interpolate, haversine_m, lonlat_to_merc, merc_to_lonlat, spherical_centre};
+use rustgis_geom::{Aeqd, geodesic_interpolate, haversine_m, lonlat_to_plane, plane_to_lonlat, spherical_centre};
 
 /// A feature within this distance of its centre is buffered in one projection (the error is
 /// under 0.01%).
@@ -240,9 +242,9 @@ impl Plane {
     }
 
     /// The points to add between `a` and `b`, an edge straight in the plane, so that back in lon/lat
-    /// straight edges between them stay within `tolerance` metres of it. The edge's quarter points
-    /// and midpoint are compared with the same points of the straight edge in Web Mercator, the
-    /// plane the tools draw edges in (one point alone misses a stray that changes side, as along a
+    /// straight edges between them stay within `tolerance` meters of it. The edge's quarter points
+    /// and midpoint are compared with the same points of the straight edge in the analysis plane,
+    /// the plane the tools draw edges in (one point alone misses a stray that changes side, as along a
     /// line crossing the equator); an edge that strays is halved, and each half checked again, up
     /// to [`MAX_SPLITS`] times, while the ring's `budget` of added points lasts. Each point, the
     /// ends and those added to `out`, comes with its place in lon/lat.
@@ -273,27 +275,19 @@ impl Plane {
     }
 
     /// Whether the edge from `a` to `b` (straight in the plane, `la` and `lb` in lon/lat) strays
-    /// from the same edge straight in Web Mercator by more than `tolerance` metres at its quarter
-    /// points or midpoint.
+    /// from the same edge straight in the analysis plane ([`lonlat_to_plane`]: Web Mercator within
+    /// ±85.05°, straight in lon/lat beyond) by more than `tolerance` meters at its quarter points
+    /// or midpoint.
     fn strays(&self, a: GC<f64>, b: GC<f64>, la: Coord, lb: Coord, tolerance: f64) -> bool {
         let at = |t: f64| self.0.inverse(Coord::new(a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)));
-        let beyond = |c: Coord| c.y.abs() >= rustgis_geom::MAX_LAT;
-        match (beyond(la), beyond(lb)) {
-            // Beyond Web Mercator's 85.05° there's no straight edge to compare with.
-            (true, true) => false,
-            // Across that edge: halved until each piece is on one side of it or too short to stray.
-            (true, false) | (false, true) => true,
-            (false, false) => {
-                // `b` on `a`'s side of the antimeridian, so the straight edge is the short one.
-                let near_b = Coord::new(la.x + wrap(lb.x - la.x), lb.y);
-                let (ma, mb) = (lonlat_to_merc(la), lonlat_to_merc(near_b));
-                [0.25, 0.5, 0.75].into_iter().any(|t| {
-                    let p = at(t);
-                    let chord = merc_to_lonlat(Coord::new(ma.x + t * (mb.x - ma.x), ma.y + t * (mb.y - ma.y)));
-                    haversine_m(p, Coord::new(p.x + wrap(chord.x - p.x), chord.y)) > tolerance
-                })
-            }
-        }
+        // `b` on `a`'s side of the antimeridian, so the straight edge is the short one.
+        let near_b = Coord::new(la.x + wrap(lb.x - la.x), lb.y);
+        let (ma, mb) = (lonlat_to_plane(la), lonlat_to_plane(near_b));
+        [0.25, 0.5, 0.75].into_iter().any(|t| {
+            let p = at(t);
+            let chord = plane_to_lonlat(Coord::new(ma.x + t * (mb.x - ma.x), ma.y + t * (mb.y - ma.y)));
+            haversine_m(p, Coord::new(p.x + wrap(chord.x - p.x), chord.y)) > tolerance
+        })
     }
 
     /// A ring round a pole, which goes once round the globe in longitude, as a lon/lat ring: cut at
@@ -333,8 +327,10 @@ impl Plane {
 }
 
 /// Whether the edge from `a` to `b` in the plane (`la` and `lb` in lon/lat) can stray as far as
-/// `tolerance` from the same edge straight in Web Mercator, so that [`Plane::strays`] must look.
-/// Straight in Web Mercator is a rhumb line, which runs off the geodesic by about L² tan φ / 8R
+/// `tolerance` from the same edge straight in the analysis plane, so that [`Plane::strays`] must
+/// look. An edge reaching beyond 85.05°, where the analysis plane's straight edges are straight in
+/// lon/lat (spirals about a pole, not rhumb lines), is always looked at. Within ±85.05° straight in
+/// the analysis plane is straight in Web Mercator, a rhumb line, which runs off the geodesic by about L² tan φ / 8R
 /// at latitude φ, the heading of a geodesic turning by L tan φ / R along it: 2.0e-8 per square
 /// metre at 46°, 1.9e-7 at 84°, as measured for [`STRAY_PER_M2`], plus [`FLAT_ALLOWANCE`] for the
 /// ellipsoid and near the equator. Straight in the plane is the
@@ -347,6 +343,9 @@ fn may_stray(a: GC<f64>, b: GC<f64>, la: Coord, lb: Coord, tolerance: f64) -> bo
     let length2 = (b.x - a.x).powi(2) + (b.y - a.y).powi(2);
     if STRAY_PER_M2 * length2 <= tolerance {
         return false;
+    }
+    if la.y.abs().max(lb.y.abs()) > rustgis_geom::MAX_LAT {
+        return true;
     }
     let length = length2.sqrt();
     let lat = la.y.abs().max(lb.y.abs()).to_radians() + length / EARTH_R_M;
@@ -534,6 +533,44 @@ mod tests {
         let n = zigzag.len();
         let ring = plane.ring(&LineString::new(zigzag), MIN_TOLERANCE_M);
         assert_eq!(ring.0.len(), n + MAX_ADDED as usize);
+    }
+
+    #[test]
+    fn an_outline_beyond_85_degrees_follows_its_edges_as_the_tools_draw_them() {
+        // An octagon 100 km around 87°N in its projection, edges of about 77 km, all beyond 85.05°,
+        // where the tools draw an edge straight in lon/lat (#1033). Back in lon/lat, each edge of
+        // the outline, drawn as the tools draw it, stays within the tolerance of the octagon's: it
+        // gains the points that keep it there.
+        let plane = Plane::new(Coord::new(10.0, 87.0), 10.0);
+        let corner = |k: usize| {
+            let (s, c) = (k as f64 * std::f64::consts::FRAC_PI_4).sin_cos();
+            GC { x: 100_000.0 * c, y: 100_000.0 * s }
+        };
+        let octagon: Vec<GC<f64>> = (0..=8).map(corner).collect();
+        let tolerance = 100_000.0 * OUTLINE_TOLERANCE;
+        let ring = plane.ring(&LineString::new(octagon.clone()), tolerance);
+        assert!(ring.0.len() > octagon.len(), "{}", ring.0.len());
+        let mut worst = 0.0_f64;
+        for w in ring.0.windows(2) {
+            let [a, b] = w else { continue };
+            let (pa, pb) = (lonlat_to_plane(Coord::new(a.x, a.y)), lonlat_to_plane(Coord::new(b.x, b.y)));
+            for t in [0.25, 0.5, 0.75] {
+                let drawn = plane_to_lonlat(Coord::new(pa.x + t * (pb.x - pa.x), pa.y + t * (pb.y - pa.y)));
+                let p = plane.0.forward(drawn);
+                let off = octagon
+                    .windows(2)
+                    .filter_map(|e| {
+                        Some(rustgis_data::geometry::seg_dist2(
+                            &[Coord::new(e.first()?.x, e.first()?.y), Coord::new(e.get(1)?.x, e.get(1)?.y)],
+                            p,
+                        ))
+                    })
+                    .fold(f64::INFINITY, f64::min)
+                    .sqrt();
+                worst = worst.max(off);
+            }
+        }
+        assert!(worst <= 2.0 * tolerance, "{worst} m off the octagon, tolerance {tolerance} m");
     }
 
     #[test]

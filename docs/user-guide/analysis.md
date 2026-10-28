@@ -94,6 +94,21 @@ written some other way (a token typed into a SQL query, say) can still be there:
 before sharing it. A point buffered where the
 map was clicked is copied as the command that buffered it, with the point.
 
+**Near the poles.** The geometry tools and the topology checks work on Web Mercator's coordinates,
+carried on beyond 85.05°, where Web Mercator stops, to the poles instead of clamped there, so polar
+features keep their shape. An edge wholly beyond 85.05° is straight in longitude and latitude. One
+that crosses 85.05° is straight in the tools, but the Web Mercator map clamps its far end onto
+85.05° and draws it straight to there, so a cut along such an edge can fall well east or west of
+where that map shows it: about 48 km at 84.5°N for an edge from (0°, 80°N) to (10°E, 89°N). A
+pole is a line in these coordinates, not a point, so Minimum Bounding Geometry of points spread
+around a pole spans their longitudes (a sliver, for points on one parallel), not the cap they
+enclose on the ground. The globe draws a long edge along the great circle between its ends, so near
+a pole it shows a little poleward of where the tools take it: about 850 m at the middle of a 10°
+edge along 88°N (as everywhere, the tools take an edge as straight on the map, not on the globe).
+Beyond 85.05°, the dangle check measures line ends about their pole (on WGS 84's curvature there,
+within 0.13% out to 85°), right up to the pole and across ±180°. Radius selections and the
+Neighborhood Explorer still measure in local Web Mercator.
+
 These are the built-in tools; GeoLibre and plugin tools join them when available.
 Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available tools and their parameters):
 
@@ -212,7 +227,8 @@ e.g. `EPSG:32618`).
 Because bandwidth and cell size are measured in coordinate-space linear units, global cylindrical
 projections such as Web Mercator (EPSG:3857) introduce scale distortion that increases with latitude;
 use a local projected coordinate system (such as UTM or State Plane) when accurate ground distances
-are required. Leaving `radius` empty or setting it to `0` automatically estimates the bandwidth
+are required. A point the system can't hold, such as one beyond 85.05° in Web Mercator, is left
+out, and the tool says how many were. Leaving `radius` empty or setting it to `0` automatically estimates the bandwidth
 using Silverman's rule of thumb based on the points' spatial distribution (falling back to extent span / 30,
 or 1000 coordinate-space linear units for a single point or coincident points). When `pixelSize` is
 omitted, an adaptive cell size is calculated to span approximately 250 cells along the longer side
@@ -342,7 +358,8 @@ along it are kept, but polygons that only share an edge or a corner, and a line 
 one, give nothing. The input can be points, lines or polygons and keeps its geometry type; the
 overlay must be polygons. An overlay field whose name the input already has gets a suffix (`id_2`).
 Overlapping features within one layer are not split against each other. Like Clip and Erase, the
-overlay works on the map's Web Mercator coordinates, so the parts' edges are straight on the map.
+overlay works on the map's Web Mercator coordinates, so the parts' edges are straight on the map
+within ±85.05° (beyond it, see **Near the poles** above).
 Selections in both layers are honoured. To measure each part, run Calculate Geometry Attributes on
 the result:
 
@@ -617,10 +634,12 @@ billion), so a part that leaves nothing outside its zone wider than that grid is
 and only parts outside every zone wider than the grid are reported. A feature so narrow next to its
 zones that the rounding can move its area by more than 1% is measured only roughly, unless it lies
 wholly inside a zone, and the tool says how many there are. The percentages of classes that overlap
-each other can add up to more than 100. Like the other overlay tools, it works on the map, which
-ends at 85.05° north and south: parts of polygons beyond that are taken as lying along it, so
-overlaps there have no area ([#1033](https://github.com/opengeos/RustGIS/issues/1033)); the tool
-says how many features reach beyond it.
+each other can add up to more than 100. Like the other overlay tools, it works on the map's
+coordinates carried on past 85.05° to the poles (see **Near the poles** above), so polygons there
+keep their area. Near a pole an edge along a parallel runs far from the shortest way between its
+ends, which `area_km2` follows, so the two measures can differ widely: for a quarter cap from 88°N
+to the pole, written with one edge along 88°N, `area_km2` is about 64% of the area its
+percentage is taken from. Add vertices along such edges to bring them together.
 
 The tool says how many zone and class features have no polygon (no geometry, an empty one, a line or
 point, or a ring collapsed to no area; they are left out), how many cross the antimeridian without
