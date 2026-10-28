@@ -20947,3 +20947,85 @@ fn geolibre_offline_snapshots_cannot_persist_or_restore_pending_downloads() {
     assert!(recovered.offline_areas[0].data.layers.iter().all(|l| l.dataset.source.as_deref() != Some("geolibre-pending:offline-test")));
     assert!(!recovered.offline_areas[0].data.layers.is_empty());
 }
+
+#[test]
+fn merge_reads_complete_streamed_inputs_and_supports_undo() {
+    let path = grid_fgb("merge", 3);
+    let mut s = Session::new(Project::default());
+    let loaded = s.run("layer.addData", &json!({"path":path,"stream":true})).unwrap();
+    let id = loaded["layer"].as_u64().unwrap() as u32;
+    let name = s.map().layer(id).unwrap().name.clone();
+    let total = s.map().layer(id).unwrap().load_all().unwrap().features.len();
+    assert_eq!(total, 9);
+    // A streamed map layer only holds its current window, not every source feature.
+    s.map_mut().layer_mut(id).unwrap().dataset.features.truncate(1);
+    assert!(s.map().layer(id).unwrap().dataset.features.len() < total);
+    let mut other = rustgis_data::Dataset::new("Other", rustgis_data::GeometryType::Point, vec![]);
+    other.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![]);
+    s.map_mut().add_dataset(other);
+    for inputs in [json!(format!("{name};Other")), json!([name, "Other"]), json!([path.to_string_lossy(), "Other"])] {
+        let before = s.map().layers.len();
+        s.run("gp.run", &json!({"tool":"merge","params":{"inputs":inputs,"output":"Merged"}})).unwrap();
+        assert_eq!(s.map().layer_by_name("Merged").unwrap().dataset.features.len(), total + 1);
+        assert_eq!(s.map().layers.len(), before + 1);
+        assert!(s.undo());
+        assert!(s.map().layer_by_name("Merged").is_none());
+        assert!(s.map().layer(id).unwrap().is_streamed());
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn merge_file_inputs_use_the_existing_file_access_check() {
+    let s = Session::new(Project::default());
+    for tool in ["merge", "Merge"] {
+        let reach = crate::cmd::plugins::reaches(
+            s.registry.get("gp.run").unwrap(),
+            &json!({"tool":tool,"params":{"inputs":["survey.geojson","observations.geojson"]}}),
+        );
+        assert_eq!(reach, Some(crate::cmd::plugins::Reach::Files));
+    }
+}
+
+#[test]
+fn merge_keeps_import_warnings_from_direct_file_inputs() {
+    let path = std::env::temp_dir().join(format!("rustgis-merge-warnings-{}.geojson", std::process::id()));
+    std::fs::write(&path, r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},"properties":{}},{"type":"Feature","geometry":{"type":"Point","coordinates":["bad",2]},"properties":{}}]}"#).unwrap();
+    let mut s = Session::new(Project::default());
+    let mut ds = rustgis_data::Dataset::new("Other", rustgis_data::GeometryType::Point, vec![]);
+    ds.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))), vec![]);
+    s.map_mut().add_dataset(ds);
+    let mark = s.notice_mark();
+    let result = s.run("gp.run", &json!({"tool":"merge","params":{"inputs":[path.to_string_lossy(),"Other"]}})).unwrap();
+    let id = result["layer"].as_u64().unwrap() as u32;
+    assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 2);
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("unreadable geometry")));
+    assert!(s.project.gp_history.last().unwrap().messages.iter().any(|s| s.contains("unreadable geometry")));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn merge_distinguishes_case_sensitive_file_paths() {
+    let dir = std::env::temp_dir().join(format!("rustgis-merge-case-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("a.geojson");
+    let b = dir.join("A.geojson");
+    for (path, x) in [(&a, 1), (&b, 2)] {
+        std::fs::write(path, json!({"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[x,0]},"properties":{}}]}).to_string()).unwrap();
+    }
+    let mut s = world();
+    let result = s.run("gp.run", &json!({"tool":"merge","params":{"inputs":[a.to_string_lossy(),b.to_string_lossy()]}})).unwrap();
+    let id = result["layer"].as_u64().unwrap() as u32;
+    let ds = &s.map().layer(id).unwrap().dataset;
+    let coordinates: Vec<f64> = ds
+        .features
+        .iter()
+        .map(|f| match f.geometry.as_ref().unwrap() {
+            rustgis_data::Geometry::Point(c) => c.x,
+            _ => panic!("expected point"),
+        })
+        .collect();
+    assert_eq!(coordinates, [1.0, 2.0]);
+    std::fs::remove_dir_all(dir).unwrap();
+}

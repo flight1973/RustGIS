@@ -354,7 +354,9 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
         return Some(Reach::Files);
     }
     // So do tools with a file parameter (a plugin's `file`): they're handed the file.
-    if spec.id == "gp.run" && ps(params, "tool").and_then(rustgis_analysis::tool).is_some_and(super::gp::reads_files) {
+    if spec.id == "gp.run"
+        && ps(params, "tool").and_then(super::gp::tool_id).and_then(rustgis_analysis::tool).is_some_and(super::gp::reads_files)
+    {
         return Some(Reach::Files);
     }
     if spec.id == "gp.run"

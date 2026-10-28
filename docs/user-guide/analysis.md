@@ -94,6 +94,7 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Dissolve | `dissolve` | Data Management › Generalization |
 | Minimum Bounding Geometry | `convexHull` | Data Management › Features |
 | Feature To Point | `featureToPoint` | Data Management › Features |
+| Merge | `merge` | Data Management › General |
 | Feature Vertices To Points | `featureVerticesToPoints` | Data Management › Features |
 | Points Along Lines | `pointsAlongLines` | Data Management › Features |
 | XY Table To Point | `xyTableToPoint` | Data Management › Features |
@@ -188,6 +189,25 @@ complement. Edges follow the shortest geodesics between vertices. The output fie
 `area_km2`, `perimeter_km` and `length_km`; point coordinates are unchanged.
 Spatial Join's **Largest overlap** still measures area on a sphere of radius 6,371 km; it can
 differ from the ellipsoid by up to about 0.9 % (a small area near a pole).
+
+**Merge** (`merge`, Data Management › General) appends loaded vector layers of the same geometry
+type (points, lines or polygons) into a new layer. It needs no GeoLibre runner. Choose **Input
+Layers** and **Preserve Attributes** in the tool pane, or pass names separated by `;` or a JSON
+array. Desktop runs can also name local vector files without adding them to the map first.
+In the browser, load the files as layers first. Each layer contributes its selection, or all its
+features when it has no selection; read-in-place layers without a selection contribute their
+complete source.
+
+```json
+{"tool":"merge","params":{"inputs":["Survey A","Survey B"],"attributes":true,"output":"Combined survey"}}
+```
+
+Matching field names (case-insensitive) and types share a column. Other fields are added and
+missing values are empty. Incompatible types remain separate columns with unique suffixes,
+such as `count_2`, preserving their original values and types. Turn off **Preserve Attributes**
+for geometry only. Multipart geometry and holes are kept unchanged, new feature ids are assigned,
+and export defaults to the first input's coordinate system; internal coordinates stay longitude
+and latitude. The inputs stay unchanged, and the new layer can be undone.
 
 **Feature Vertices To Points** (`featureVerticesToPoints`) writes a point at each vertex of the
 `input` layer's features (a point layer's points are their own vertices, and a multipoint's points

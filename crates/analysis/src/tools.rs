@@ -153,6 +153,32 @@ pub static TOOLS: &[ToolSpec] = &[
         run: feature_to_point,
     },
     ToolSpec {
+        id: "merge",
+        name: "Merge",
+        toolbox: "Data Management › General",
+        summary: "Appends vector layers of the same geometry type into a new layer, optionally combining their attributes.",
+        params: &[
+            P {
+                name: "inputs",
+                label: "Input Layers",
+                kind: K::VectorLayers,
+                required: true,
+                default: "",
+                help: "Layer names or local file paths (desktop), in order; selections are honored in each layer.",
+            },
+            P {
+                name: "attributes",
+                label: "Preserve Attributes",
+                kind: K::Bool,
+                required: false,
+                default: "true",
+                help: "Combines matching fields. Incompatible field types get separate names; missing values are empty.",
+            },
+            P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
+        ],
+        run: crate::merge::run,
+    },
+    ToolSpec {
         id: "featureVerticesToPoints",
         name: "Feature Vertices To Points",
         toolbox: "Data Management › Features",
@@ -1394,7 +1420,7 @@ fn check_room(tool: &str, n: usize, need: u64, advice: &str, has_room: impl FnOn
 
 /// A copy of `v` whose allocation (a text's) fails into an error rather than aborting the process.
 /// The variants are listed, so one that owns memory can't be added without deciding how.
-fn try_clone_value(v: &Value) -> Result<Value, TryReserveError> {
+pub(crate) fn try_clone_value(v: &Value) -> Result<Value, TryReserveError> {
     Ok(match v {
         Value::Text(t) => {
             let mut s = String::new();
@@ -2723,7 +2749,7 @@ fn oriented(g: &Geometry) -> geo::Geometry<f64> {
 }
 
 /// A unique field name in `out`: `base`, else `base_2`, `base_3`, ….
-fn unique_field(out: &Dataset, base: &str) -> String {
+pub(crate) fn unique_field(out: &Dataset, base: &str) -> String {
     let mut name = base.to_string();
     let mut k = 1usize;
     while out.field_index(&name).is_some() {

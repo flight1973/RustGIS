@@ -16,6 +16,7 @@ pub mod geodesic;
 pub mod georef;
 mod join;
 pub mod kriging;
+mod merge;
 pub mod network;
 pub mod neural;
 pub mod rasterops;
@@ -372,6 +373,22 @@ fn choice(spec: &ToolSpec, ps: &ParamSpec, choices: &[&str], v: &Value) -> Resul
         Some(c) => Ok(Value::String((*c).to_string())),
         None => Err(format!("{}: '{}' must be one of {} (not {v})", spec.name, ps.label, choices.join(", "))),
     }
+}
+
+/// A multi-layer parameter: semicolon-separated names or an array of names.
+pub fn layer_list(value: &Value) -> Result<Vec<&str>, String> {
+    let names: Vec<&str> = match value {
+        Value::String(text) => text.split(';').map(str::trim).filter(|n| !n.is_empty()).collect(),
+        Value::Array(values) => values
+            .iter()
+            .map(|v| v.as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or("input layers must be nonempty names"))
+            .collect::<Result<_, _>>()?,
+        _ => return Err("input layers must be names separated by ; or an array of names".into()),
+    };
+    if names.is_empty() {
+        return Err("at least one input layer is required".into());
+    }
+    Ok(names)
 }
 
 /// Runs a tool with JSON parameters, filling defaults and checking required ones.

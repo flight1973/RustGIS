@@ -468,6 +468,8 @@ struct MapInputs<'a> {
     rows: std::collections::HashMap<String, Vec<usize>>,
     /// Streamed layers the tool reads, loaded whole (by lowercase name).
     loaded: std::collections::HashMap<String, Dataset>,
+    /// Import warnings from local file inputs, kept in the tool result and history.
+    messages: Vec<String>,
     /// The flat map's projection (its name, the projection and its unit in metres), built the
     /// first time a tool asks for it (Tissot's indicatrix does), once for the run; `None` on the
     /// globe.
@@ -498,6 +500,23 @@ impl MapInputs<'_> {
 
 fn map_inputs<'a>(s: &'a Session, spec: Option<&rustgis_analysis::ToolSpec>, params: &Value) -> Result<MapInputs<'a>, String> {
     let full = streamed_inputs(s.map(), spec, params)?;
+    let messages = Vec::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut messages = messages;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut full = full;
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(spec) = spec.filter(|t| rustgis_analysis::external_source(t).is_none()) {
+        for parameter in spec.params.iter().filter(|p| p.kind == rustgis_analysis::ParamKind::VectorLayers) {
+            for name in rustgis_analysis::layer_list(params.get(parameter.name).unwrap_or(&Value::Null))? {
+                if s.map().layer_by_name(name).is_none() && !full.contains_key(name) {
+                    let (dataset, report) = rustgis_data::io::read_path(std::path::Path::new(name)).map_err(|e| format!("{name}: {e}"))?;
+                    messages.extend(report.messages.into_iter().map(|message| format!("{name}: {message}")));
+                    full.insert(name.to_string(), dataset);
+                }
+            }
+        }
+    }
     let mut rows = env_inputs(s.map(), &full, &s.project.gp_env, params)?;
     for (name, dataset) in &full {
         let Some(layer) = s.map().layer_by_name(name).filter(|l| !l.selection.is_empty()) else { continue };
@@ -519,7 +538,7 @@ fn map_inputs<'a>(s: &'a Session, spec: Option<&rustgis_analysis::ToolSpec>, par
             .collect::<Result<Vec<_>, _>>()?;
         rows.insert(name.clone(), selected);
     }
-    Ok(MapInputs { session: s, rows, loaded: full, flat: std::cell::OnceCell::new(), view: std::cell::OnceCell::new() })
+    Ok(MapInputs { session: s, rows, loaded: full, messages, flat: std::cell::OnceCell::new(), view: std::cell::OnceCell::new() })
 }
 
 /// Complete streamed inputs without selections, plus selected PMTiles inputs: that exporter
@@ -559,9 +578,15 @@ fn layer_names<'v>(spec: Option<&rustgis_analysis::ToolSpec>, params: &'v Value)
     let mut named = Vec::new();
     match spec {
         Some(spec) => {
-            for p in spec.params.iter().filter(|p| matches!(p.kind, K::Layer | K::PolygonLayer | K::PointLayer | K::VectorLayer)) {
+            for p in spec.params {
                 if let Some(v) = params.get(p.name) {
-                    names(v, &mut named);
+                    if p.kind == K::VectorLayers {
+                        if let Ok(layers) = rustgis_analysis::layer_list(v) {
+                            named.extend(layers);
+                        }
+                    } else if matches!(p.kind, K::Layer | K::PolygonLayer | K::PointLayer | K::VectorLayer) {
+                        names(v, &mut named);
+                    }
                 }
             }
         }
@@ -631,7 +656,8 @@ impl Inputs for MapInputs<'_> {
     }
     fn dataset(&self, layer: &str) -> Option<&Dataset> {
         self.loaded
-            .get(&layer.to_ascii_lowercase())
+            .get(layer)
+            .or_else(|| self.loaded.get(&layer.to_ascii_lowercase()))
             .or_else(|| self.session.map().layer_by_name(layer).map(|l| &l.dataset))
             // A table as commands find one: by its name, else (names can repeat) by its id.
             .or_else(|| {
@@ -749,6 +775,9 @@ pub fn run_tool(s: &mut Session, tool: &str, params: &Value) -> CmdResult {
     let t0 = now_ms();
     let inputs = map_inputs(s, rustgis_analysis::tool(&tool), &params)?;
     let mut res = rustgis_analysis::run(&tool, &inputs, &params);
+    if let Ok(result) = &mut res {
+        result.messages.extend(inputs.messages.iter().cloned());
+    }
     let ids = full_ids(&inputs.loaded);
     drop(inputs);
     fit_to_windows(s, &mut res, &ids);
@@ -758,9 +787,9 @@ pub fn run_tool(s: &mut Session, tool: &str, params: &Value) -> CmdResult {
     apply(s, Ran { name, id: tool, command: None, started: t0 }, recorded(spec, params), res, millis)
 }
 
-/// Whether a tool reads a file a parameter names (a plugin's `file`).
+/// Whether a tool can read files named by a path or vector-layer-list parameter.
 pub fn reads_files(spec: &rustgis_analysis::ToolSpec) -> bool {
-    spec.params.iter().any(|p| p.kind == rustgis_analysis::ParamKind::Path)
+    spec.params.iter().any(|p| matches!(p.kind, rustgis_analysis::ParamKind::Path | rustgis_analysis::ParamKind::VectorLayers))
 }
 
 /// Whether a tool produces a file rather than a map layer.
