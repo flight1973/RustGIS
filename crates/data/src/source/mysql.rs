@@ -368,8 +368,8 @@ fn live() -> &'static Mutex<Vec<Live>> {
 /// server it names.
 pub fn connect(address: &str, ask: bool) -> Result<Arc<Conn>> {
     let config = config(address)?;
-    let password = super::duckdb::remembered_password(address)
-        .or_else(|| if ask { std::env::var("MYSQL_PWD").ok().filter(|p| !p.is_empty()) } else { None });
+    let password =
+        super::duckdb::remembered_password(address).or_else(|| if ask { super::duckdb::ambient_password("mysql") } else { None });
     let find = |live: &mut Vec<Live>| {
         live.retain(|(_, _, w)| w.strong_count() > 0);
         live.iter().find(|(a, p, _)| a == address && *p == password).and_then(|(_, _, w)| w.upgrade())

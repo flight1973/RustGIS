@@ -12,8 +12,6 @@ use serde_json::json;
 #[cfg(target_os = "macos")]
 mod macos;
 
-mod keychain;
-
 /// The app, and this run's marker (see [`running`]), cleared when eframe closes it.
 struct App(RustGisApp, running::Shared);
 
@@ -29,33 +27,25 @@ mod prefs {
     }
 
     fn read() -> Map<String, Value> {
-        dir()
-            .and_then(|d| std::fs::read_to_string(d.join("prefs.json")).ok())
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default()
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        rustgis_engine::prefs::read().unwrap_or_else(|error| {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("{error}");
+            }
+            Map::new()
+        })
     }
 
     pub fn services() -> Services {
         let secrets: std::sync::Arc<dyn rustgis_engine::data::secrets::SecretStore> =
-            std::sync::Arc::new(crate::keychain::Keychain::default());
+            std::sync::Arc::new(rustgis_keychain::Keychain::default());
         // The ChatGPT sign-in's tokens go to the same keychain (its accounts stay in the file).
         rustgis_assistant::chatgpt::set_secret_store(Some(secrets.clone()));
         Services {
             load_pref: Some(Box::new(|key: &str| read().get(key).and_then(Value::as_str).map(str::to_string))),
             save_pref: Some(Box::new(|key: &str, value: &str| {
-                let Some(d) = dir() else { return };
-                let mut map = read();
-                map.insert(key.to_string(), Value::String(value.to_string()));
-                let text = Value::Object(map).to_string();
-                // Write a temporary file and rename it over the old one, so a crash mid-write
-                // never leaves a truncated prefs.json.
-                let tmp = d.join("prefs.json.tmp");
-                let saved = std::fs::create_dir_all(&d)
-                    .and_then(|_| std::fs::write(&tmp, text))
-                    .and_then(|_| std::fs::rename(&tmp, d.join("prefs.json")));
-                if let Err(e) = saved {
-                    log::warn!("could not save preferences: {e}");
+                if let Err(error) = rustgis_engine::prefs::write(key, value) {
+                    log::warn!("{error}");
                 }
             })),
             secrets: Some(secrets),
@@ -399,11 +389,17 @@ fn main() -> eframe::Result {
         .with_min_inner_size([900.0, 560.0])
         .with_drag_and_drop(true);
     // macOS: the header is the title bar, with the window buttons floating over its left end.
+    // The bundle's rustgis.icns is the Dock icon. A window icon would replace it with the bare
+    // logo, and no icon makes eframe fall back to egui's; an empty icon opts out of both (eframe
+    // 0.37: its icon setter skips an empty one). Check the Dock again when eframe is updated.
     #[cfg(target_os = "macos")]
     {
-        viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
+        viewport = viewport
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
+            .with_icon(egui::IconData::default());
     }
-    // macOS: the bundle's rustgis.icns is the Dock icon; a window icon would replace it with the bare logo.
     #[cfg(not(target_os = "macos"))]
     if let Some((size, rgba)) = rustgis_engine::render::logo::rgba(256) {
         viewport = viewport.with_icon(egui::IconData { rgba, width: size, height: size });

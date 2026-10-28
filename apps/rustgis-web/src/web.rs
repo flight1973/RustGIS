@@ -158,9 +158,9 @@ pub fn start() {
                             None => log::warn!("?lang={code}: no such interface language; following the browser's"),
                         }
                     }
-                    // `?project=<url>` opens a project (`.rgis`) by its web address: a whole map,
-                    // its layers, symbology and view, shared as one link. It replaces the project
-                    // when it lands, so the links that add to a project are left out beside it.
+                    // `?project=<url>` opens a native project or imports a GeoLibre map asynchronously.
+                    // Keep this startup path exclusive: other links could otherwise add data
+                    // to different maps depending on when the import completes.
                     if let Some(url) = &project {
                         if let Err(e) = app.run("ui.openUrl", serde_json::json!({"url": url})) {
                             app.session.notify(format!("?project={url}: {e}"), true);
@@ -169,7 +169,13 @@ pub fn start() {
                             ["data", "stac", "style", "tiles", "zarr"].into_iter().filter(|k| !params(&q, k, 1).is_empty()).collect();
                         if !skipped.is_empty() {
                             let list = skipped.iter().map(|k| format!("?{k}=")).collect::<Vec<_>>().join(", ");
-                            app.session.notify(format!("?project= opens a whole project, so {list} links were left out"), false);
+                            app.session.notify(
+                                rustgis_ui_egui::i18n::fmt(
+                                    "?project= opens a project or imports a map, so {list} links were left out",
+                                    &[("list", &list)],
+                                ),
+                                false,
+                            );
                         }
                     }
                     let links = if project.is_some() { "" } else { q.as_str() };
@@ -721,6 +727,44 @@ async fn post_json(url: &str, body: &str) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
+/// Asks for an address's headers (`HEAD`): a TIFF header's announced length and the type. The
+/// browser shows a page `X-TIFF-Header-Length` only when the server exposes it
+/// (`Access-Control-Expose-Headers`); without it, the header is read as any other file's.
+async fn head(url: &str) -> Result<rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::Head, String> {
+    use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{cache, s3};
+    let err = |e: wasm_bindgen::JsValue| format!("{e:?}");
+    let window = web_sys::window().ok_or("no window")?;
+    let prepared = s3::prepare(url)?;
+    // A request signed for S3 is signed for a GET.
+    if prepared.signed {
+        return Ok(cache::Head::default());
+    }
+    let init = web_sys::RequestInit::new();
+    init.set_method("HEAD");
+    if !prepared.headers.is_empty() {
+        let headers = web_sys::Headers::new().map_err(err)?;
+        for (k, v) in &prepared.headers {
+            headers.set(k, v).map_err(err)?;
+        }
+        init.set_headers(&headers);
+    }
+    let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str_and_init(&prepared.url, &init))
+        .await
+        .map_err(|_| "the browser couldn't reach it (offline, or the server doesn't accept requests from web pages)".to_string())?
+        .dyn_into()
+        .map_err(err)?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    let header = |k: &str| resp.headers().get(k).ok().flatten();
+    Ok(cache::Head {
+        tiff_header_length: header("x-tiff-header-length").as_deref().and_then(cache::tiff_header_length),
+        content_type: header("content-type"),
+        // Seen only where the server exposes it to pages.
+        accepts_ranges: header("accept-ranges").as_deref().is_some_and(cache::accepts_byte_ranges),
+    })
+}
+
 /// Makes an HTTP request (the AI assistant's calls to its model), returning the response of any
 /// status.
 async fn http(
@@ -806,6 +850,10 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 }
             }
         });
+    });
+    // So are HEAD requests (a GeoTIFF made on request saying how long its header is).
+    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::set_header(|url, done| {
+        wasm_bindgen_futures::spawn_local(async move { done(head(&url).await) });
     });
     // So are JSON documents POSTed (the NLDI's flowtrace).
     rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::set_poster(|url, body, done| {
@@ -899,7 +947,10 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             } else if purpose == "shapefile" {
                 rfd::AsyncFileDialog::new().add_filter("Shapefile", &["shp", "dbf", "shx", "prj", "cpg", "zip"])
             } else if purpose == "project" {
-                rfd::AsyncFileDialog::new().add_filter("RustGIS project", &["rgis", "rgisx", "rgispkg"])
+                rfd::AsyncFileDialog::new().add_filter(
+                    rustgis_ui_egui::tl!("Projects and JSON data (RustGIS, GeoLibre)"),
+                    &["rgis", "rgisx", "rgispkg", "geolibre", "json"],
+                )
             } else if purpose == "qgisProject" {
                 rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("QGIS project"), &["qgs", "qgz"])
             } else if purpose == "item" {

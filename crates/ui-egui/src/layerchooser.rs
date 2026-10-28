@@ -49,8 +49,9 @@ pub fn lists_layers(path: &str) -> bool {
 pub fn add_file(app: &mut RustGisApp, path: &str) -> Result<Value, String> {
     // Opening a project replaces this one: asked about first when it has unsaved changes. Only
     // the interface comes here (drops, Add Data, the Browser pane, `ui.addFile`).
-    if rustgis_engine::project::opens_as_project(path) {
-        return app.run_by_user("project.open", json!({"path": path}));
+    let command = rustgis_engine::project::open_command(path);
+    if command != "layer.addData" {
+        return app.run_by_user(command, json!({"path": path}));
     }
     if !(app.ui.ask_layers && lists_layers(path)) {
         return app.run("layer.addData", json!({"path": path}));
@@ -215,6 +216,25 @@ mod tests {
 <Placemark><name>A</name><Point><coordinates>8.5,47.4</coordinates></Point></Placemark>
 <Placemark><name>B</name><LineString><coordinates>8.5,47.4 8.6,47.5</coordinates></LineString></Placemark>
 </Document></kml>"#;
+
+    #[test]
+    fn geolibre_local_drop_and_browser_route_import_without_replacing_work() {
+        let dir = std::env::temp_dir().join(format!("rustgis-geolibre-add-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = json!({"version":"0.2.0","name":"Dropped map","mapView":{},"basemapStyleUrl":"","layers":[]}).to_string();
+        for name in ["map.geolibre", "map.geolibre.json"] {
+            let path = dir.join(name);
+            std::fs::write(&path, &text).unwrap();
+            let mut app = RustGisApp::with_sample();
+            let original = app.session.map().name.clone();
+            let maps = app.session.project.maps.len();
+            add_file(&mut app, &path.to_string_lossy()).unwrap();
+            assert_eq!(app.session.project.maps.len(), maps + 1);
+            assert_eq!(app.session.project.maps[0].name, original);
+            assert_eq!(app.session.map().name, "Dropped map");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A file with several layers lists them, all ticked, and adds the ones chosen, each by name;
     /// one with a single layer, or that can't be listed, is added as before.

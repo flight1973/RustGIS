@@ -18,8 +18,14 @@ doctest = false
 
 [dependencies]
 rustgis-engine = { workspace = true, features = ["geolibre"] }
+rustgis-keychain = { workspace = true }
 serde_json = { workspace = true }
 pyo3 = { version = "0.30", features = ["abi3-py312", "generate-import-lib"] }
 
 [build-dependencies]
 pyo3-build-config = "0.30"
+
+[features]
+# Adds an injectable credential store only for deterministic Python tests.
+# Not enabled for distributed wheels.
+test-stores = []

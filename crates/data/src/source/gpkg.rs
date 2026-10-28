@@ -13,6 +13,8 @@ use rustgis_geom::Extent;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+pub mod edit;
+
 /// Rows fetched by id per query.
 const CHUNK: usize = 500;
 
@@ -378,8 +380,11 @@ fn blob(g: &crate::Geometry, multi_points: bool, srs_id: i32) -> Vec<u8> {
         crate::Geometry::Point(c) if multi_points => &crate::Geometry::MultiPoint(vec![*c]),
         g => g,
     };
-    let e = g.extent();
-    let mut out = Vec::with_capacity(40 + g.coord_count() * 16);
+    header_blob(&wkb::encode(g), &g.extent(), srs_id)
+}
+
+fn header_blob(wkb: &[u8], e: &Extent, srs_id: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40 + wkb.len());
     out.extend_from_slice(b"GP");
     out.push(0);
     if e.is_empty() {
@@ -393,7 +398,7 @@ fn blob(g: &crate::Geometry, multi_points: bool, srs_id: i32) -> Vec<u8> {
             out.extend_from_slice(&v.to_le_bytes());
         }
     }
-    out.extend_from_slice(&wkb::encode(g));
+    out.extend_from_slice(wkb);
     out
 }
 
@@ -586,20 +591,7 @@ fn build(conn: &Connection, ds: &crate::Dataset, crs: Crs) -> Result<()> {
                 row.push(f.geometry.as_ref().map(|x| Sql::Blob(blob(x, multi_points, srs_id))).unwrap_or(Sql::Null));
             }
             for (k, fd) in ds.fields.iter().enumerate() {
-                row.push(match (f.attrs.get(k).unwrap_or(&Value::Null), fd.ty) {
-                    (Value::Null, _) => Sql::Null,
-                    (Value::Int(x), _) => Sql::Integer(*x),
-                    (Value::Float(x), _) if x.is_finite() => Sql::Real(*x),
-                    (Value::Float(_), _) => Sql::Null,
-                    (Value::Bool(b), _) => Sql::Integer(i64::from(*b)),
-                    (Value::Text(s), FieldType::Text) => Sql::Text(s.clone()),
-                    (v, ty) => match Value::parse(&v.to_string(), ty) {
-                        Value::Int(x) => Sql::Integer(x),
-                        Value::Float(x) if x.is_finite() => Sql::Real(x),
-                        Value::Bool(b) => Sql::Integer(i64::from(b)),
-                        _ => Sql::Null,
-                    },
-                });
+                row.push(sql_value(f.attrs.get(k).unwrap_or(&Value::Null), fd.ty));
             }
             st.execute(params_from_iter(row)).map_err(err)?;
             let e = f.geometry.as_ref().map(|x| x.extent()).unwrap_or(Extent::EMPTY);
@@ -658,6 +650,24 @@ fn build(conn: &Connection, ds: &crate::Dataset, crs: Crs) -> Result<()> {
     }
     conn.execute_batch("COMMIT;").map_err(err)?;
     Ok(())
+}
+
+fn sql_value(v: &Value, ty: FieldType) -> rusqlite::types::Value {
+    use rusqlite::types::Value as Sql;
+    match (v, ty) {
+        (Value::Null, _) => Sql::Null,
+        (Value::Int(x), _) => Sql::Integer(*x),
+        (Value::Float(x), _) if x.is_finite() => Sql::Real(*x),
+        (Value::Float(_), _) => Sql::Null,
+        (Value::Bool(b), _) => Sql::Integer(i64::from(*b)),
+        (Value::Text(s), FieldType::Text) => Sql::Text(s.clone()),
+        (v, ty) => match Value::parse(&v.to_string(), ty) {
+            Value::Int(x) => Sql::Integer(x),
+            Value::Float(x) if x.is_finite() => Sql::Real(x),
+            Value::Bool(b) => Sql::Integer(i64::from(b)),
+            _ => Sql::Null,
+        },
+    }
 }
 
 fn value(v: ValueRef<'_>, ty: FieldType) -> Value {

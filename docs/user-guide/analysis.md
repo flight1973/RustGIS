@@ -106,6 +106,7 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Select Layer By Attribute | `selectByAttributes` | Data Management › Layers and Table Views |
 | Summarize Within | `countPoints` | Analysis › Summarize |
 | Summary Statistics | `summaryStatistics` | Analysis › Statistics |
+| Pivot Table | `pivotTable` | Analysis › Statistics |
 | Export Features | `exportFeatures` | Conversion |
 | Vector to PMTiles | `vectorToPmtiles` | Analyze › Tools |
 | IDW Interpolation | `idwInterpolation` | Analysis › Interpolation |
@@ -344,6 +345,86 @@ hold. For example, the total units permitted in each district:
 ```text
 gp.run={"tool":"spatialJoin","params":{"target":"districts","join":"permits","merge":[{"field":"units","rule":"sum"}]}}
 ```
+
+**Summary Statistics** (`summaryStatistics`) makes a standalone table of statistics: one row for
+the whole table (none for an empty one), or one for each combination of values of the `case`
+fields (one field, or several as a list such as `["county", "year"]`). Rows are sorted by those
+values; records with no value form a group of their own, first. Statistics follow record order
+(`FIRST`, `LAST`, `CONCATENATE`) and use only the selected records when the table has a
+selection. Each row has the case fields, then `FREQUENCY` (the group's records), then a field
+`<STAT>_<field>` for each statistic asked for. Name the statistics in `statistics`, a list of up
+to 256 (field, statistic) pairs in the order the fields should appear:
+
+```text
+gp.run={"tool":"summaryStatistics","params":{"input":"parcels","case":["county","year"],"statistics":[{"field":"income","statistic":"MEAN"},{"field":"income","statistic":"MEDIAN"},{"field":"zoning","statistic":"MODE"}]}}
+```
+
+| Statistic | What it is |
+| --- | --- |
+| `COUNT` | Values that aren't empty |
+| `SUM`, `MEAN`, `MIN`, `MAX` | The usual; `MIN` and `MAX` of text compare by character code, so ISO dates order as dates |
+| `RANGE` | `MAX` − `MIN` |
+| `STD`, `VARIANCE` | Population standard deviation and variance (divided by the count) |
+| `MEDIAN` | The middle value; for an even count, the mean of the middle two |
+| `P1` to `P99` | Percentiles, interpolated linearly between ranks (as a spreadsheet's `PERCENTILE.INC`), so `P50` is the median |
+| `IQR` | `P75` − `P25` |
+| `CV` | Coefficient of variation, `STD` / `MEAN`; empty when the mean is 0 |
+| `MODE`, `MINORITY` | The most and least common value; on a tie, the lowest |
+| `UNIQUE` | The number of distinct values |
+| `FIRST`, `LAST` | The first and last value, in record order |
+| `CONCATENATE` | The values in record order, joined by `separator` (`, ` by default; 256 bytes at most) |
+| `NULLS` | Records with no value |
+
+Every statistic but `NULLS` leaves out empty values. A text field takes `COUNT`, `MIN`, `MAX`,
+`FIRST`, `LAST`, `UNIQUE`, `CONCATENATE`, `MODE`, `MINORITY` and `NULLS`; the rest need a numeric
+field. A group with no values gets empty statistics, except a `COUNT` and `UNIQUE` of 0 (its
+`NULLS` is its `FREQUENCY`). Two output fields can't share a name, so a case field can't be called
+`FREQUENCY` or `<STAT>_<field>` for a statistic asked for. Counts
+are whole numbers, `CONCATENATE` and the statistics of a text field are text, and the others are
+decimal. Without `statistics`, `field` gives that field's `COUNT`, `SUM`, `MEAN`, `MIN`, `MAX` and
+`STD`, reading its values as numbers.
+
+**Pivot Table** (`pivotTable`) turns the values of one field into fields of their own. It makes a
+standalone table with a row for each combination of values of the row `fields` (one field, or
+several as a list); with no row fields there is one row for the whole table, or none for an empty
+table. Then it adds a field for each value of the `pivot` field, sorted by value. Each cell holds
+the `value` field's value for that row and pivot value, or is empty when no record has them. A
+table with a record per county and year becomes one with a row per county and a field per year:
+
+```text
+gp.run={"tool":"pivotTable","params":{"input":"incomes","fields":"county","pivot":"year","value":"income"}}
+```
+
+| county | year2020 | year2021 | year2022 |
+| --- | --- | --- | --- |
+| A | 10 | 11 | |
+| B | 20 | | 22 |
+
+Without `statistic`, each row and pivot value can have one record at most; the tool names the
+first pair with more, and the cells keep the value field's type. Give a `statistic` to combine the
+records instead, such as the mean income by county and year from a table of households. It
+takes any statistic from Summary Statistics (above), with the same rules for text fields, empty
+values and output types; `separator` joins `CONCATENATE`'s values. A cell with no records is
+empty even for `COUNT`, which tells it apart from records that have no value (a `COUNT` of 0):
+
+```text
+gp.run={"tool":"pivotTable","params":{"input":"households","fields":"county","pivot":"year","value":"income","statistic":"MEAN"}}
+```
+
+Field names come from the pivot values. A number, or true and false, follows the pivot field's name
+(`year2020`, `rate2_5` for 2.5, `temp_3` for −3). Text keeps its letters, digits and underscores,
+each run of other characters becoming one underscore (none right after an underscore) and
+underscores at its ends dropped (`North east` and `North_-east` give `North_east`), and follows the
+field's name when it would start with a digit or have nothing left. At most 64 characters of a
+value are kept; a name already taken, ignoring case, gets `_2`, `_3` and so on in the order of the
+pivot values. A record with no pivot value (or a number that isn't one, NaN) is an error: fill
+those in, or select the other records. The pivot field can have at most 1,000 values, and the table
+at most 10 million cells. Only selected records are used when the table has a selection, and the
+output is named `<input>_Pivot` unless `output` names it.
+
+The AI Assistant uses Pivot Table for questions such as "mean household income by county and year":
+it runs the tool with `county` as the row field, `year` as the pivot field and `MEAN`, then reads
+the table it names with `read_features`, a row per county.
 
 <figure markdown="span">
   ![Tissot's indicatrix on the Robinson projection: circles of 800 km every 30°, stretched and sheared toward the poles](https://assets.rustgis.app/images/tissot.webp)
@@ -694,7 +775,8 @@ and a **Mann–Kendall** test of whether the trend is significant.
   - an entry of the catalog of data cubes (see [Web data](web-data.md)), by its id: `{"cube":
     "bdc-mod13q1-ndvi", "bbox": [-46, -10.95, -40.35, -2.7], "start": "2001", "end": "2025"}`
     fills in the collection's API, band, cell size and cloud cap, or a Zarr entry's store and
-    variable.
+    variable. In the app, **Trend Analysis…** on a cube of Home › Add › Web Data › Data Cubes opens
+    this section on it: a STAC cube is read where the map is, a Zarr cube whole.
 
   For the mean of a finer layer's pixels in each cell, or for a grid of your own, put the rasters
   on one grid first with Project Raster (`"grid"`, the first one's, and `"resampling":
@@ -825,7 +907,7 @@ data is unavailable, shows the available band range for invalid band input, and 
 only selected polygons will appear in the output. Both tools report parts omitted during raster-grid
 projection while retaining the valid parts.
 
-Field parameters in Dissolve, XY Table to Point, IDW, Kriging and Summary Statistics accept
+Field parameters in Dissolve, XY Table to Point, IDW, Kriging, Summary Statistics and Pivot Table accept
 case-insensitive names. An exact spelling takes precedence; otherwise a name matching several
 fields is rejected as ambiguous. This prevents silently using the wrong field.
 

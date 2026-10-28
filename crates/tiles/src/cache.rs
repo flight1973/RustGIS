@@ -648,6 +648,64 @@ pub fn post_json_blocking(url: &str, body: &str) -> Result<Vec<u8>, String> {
     native::post_with(&native::public_agent(BLOCKING_TIMEOUT), url, body)
 }
 
+/// What a `HEAD` request says of a file before any of it is read: the length of its TIFF header
+/// that a server making GeoTIFFs on request announces (`X-TIFF-Header-Length`, Vantor's Transform
+/// API), so a cloud-optimised GeoTIFF's header comes in one range read; its type; and whether
+/// the server says it answers byte ranges (`Accept-Ranges: bytes`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Head {
+    pub tiff_header_length: Option<u64>,
+    pub content_type: Option<String>,
+    pub accepts_ranges: bool,
+}
+
+/// Whether an `Accept-Ranges` value says byte ranges are answered.
+pub fn accepts_byte_ranges(value: &str) -> bool {
+    value.split(',').any(|unit| unit.trim().eq_ignore_ascii_case("bytes"))
+}
+
+/// Called once with what a `HEAD` request said.
+pub type HeadDone = Box<dyn FnOnce(Result<Head, String>) + Send>;
+/// How a `HEAD` request is made (the browser's `fetch`), as [`set_header`] installs it.
+pub type Header = Box<dyn Fn(String, HeadDone) + Send + Sync>;
+
+fn header() -> &'static Mutex<Option<Arc<Header>>> {
+    static H: OnceLock<Mutex<Option<Arc<Header>>>> = OnceLock::new();
+    H.get_or_init(Mutex::default)
+}
+
+/// Replaces how `HEAD` requests are made (the browser's `fetch`, which sees
+/// `X-TIFF-Header-Length` only when the server exposes it to pages). `done` must be called once,
+/// an error status as `HTTP <status>`.
+pub fn set_header(f: impl Fn(String, HeadDone) + Send + Sync + 'static) {
+    *header().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Box::new(f)));
+}
+
+/// An `X-TIFF-Header-Length` value: a length in bytes, none when it isn't one.
+pub fn tiff_header_length(value: &str) -> Option<u64> {
+    value.trim().parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// Asks for `url`'s headers (`HEAD`), off the frame (a thread natively, the browser's fetch on
+/// the web), counted as a fetch under way. A request signed for S3 isn't made (its signature is
+/// for a GET): it answers with nothing known.
+pub fn head(url: &str, done: HeadDone) {
+    if let Err(e) = crate::address::check(url, None) {
+        done(Err(e));
+        return;
+    }
+    IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    let done: HeadDone = Box::new(move |r| {
+        done(r);
+        finished();
+    });
+    let h = header().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match h {
+        Some(h) => h(url.to_string(), done),
+        None => native::head(url.to_string(), done),
+    }
+}
+
 /// Fetches an address's bytes, uncached (through the browser's fetcher, or the worker threads).
 pub(crate) fn fetch_bytes(url: String, done: Done) {
     let f = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -986,6 +1044,64 @@ mod native {
         ureq::Agent::with_parts(config, ureq::unversioned::transport::DefaultConnector::default(), PublicOnly::default())
     }
 
+    /// Asks for an address's headers on a thread of its own.
+    pub(super) fn head(url: String, done: super::HeadDone) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Past this many under way, a file is read without asking (the usual first read), so
+        // many addresses added at once never hold up as many threads and connections.
+        const MAX_HEADS: usize = 8;
+        static HEADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+        if HEADS.fetch_add(1, Relaxed) >= MAX_HEADS {
+            HEADS.fetch_sub(1, Relaxed);
+            done(Ok(super::Head::default()));
+            return;
+        }
+        std::thread::spawn(move || {
+            let r = head_with(AGENT.get_or_init(agent), &url);
+            HEADS.fetch_sub(1, Relaxed);
+            done(r);
+        });
+    }
+
+    /// Asks for `url`'s headers, following up to 5 redirects, each checked as [`get`] checks
+    /// them.
+    pub(super) fn head_with(agent: &ureq::Agent, url: &str) -> Result<super::Head, String> {
+        let prepared = crate::s3::prepare(url)?;
+        if prepared.signed {
+            return Ok(super::Head::default());
+        }
+        let mut at = prepared.url.clone();
+        for redirects in 0..=5 {
+            let mut req = agent.head(&at);
+            if redirects == 0 {
+                for (k, v) in &prepared.headers {
+                    req = req.header(k.as_str(), v.as_str());
+                }
+            }
+            let resp = req.config().http_status_as_error(false).build().call().map_err(|e| e.to_string())?;
+            let header = |k: &str| resp.headers().get(k).and_then(|v| v.to_str().ok());
+            if resp.status().is_redirection() {
+                let next = crate::template::join(&at, header("location").ok_or("a redirect with no Location")?);
+                crate::address::check(&next, Some(&at))?;
+                if at.starts_with("https://") && !next.starts_with("https://") {
+                    return Err(format!("{next}: a redirect from https to http"));
+                }
+                at = next;
+                continue;
+            }
+            if resp.status().as_u16() >= 400 {
+                return Err(format!("http status: {}", resp.status().as_u16()));
+            }
+            return Ok(super::Head {
+                tiff_header_length: header("x-tiff-header-length").and_then(super::tiff_header_length),
+                content_type: header("content-type").map(str::to_string),
+                accepts_ranges: header("accept-ranges").is_some_and(super::accepts_byte_ranges),
+            });
+        }
+        Err("too many redirects".into())
+    }
+
     /// POSTs a JSON document on a thread of its own.
     pub(super) fn post(url: String, body: String, done: Done) {
         // Internet addresses only: a name that resolves into the local network gets no body.
@@ -1308,6 +1424,10 @@ mod native {
         done(Err(format!("{url}: this build has no way to send requests")));
     }
 
+    pub(super) fn head(url: String, done: super::HeadDone) {
+        done(Err(format!("{url}: this build has no way to send requests")));
+    }
+
     pub(super) fn fetch_local(url: String, done: Done) {
         let (path, _) = super::split_range(&url);
         done(Err(format!("{path}: the web app reads PMTiles archives from web addresses only")));
@@ -1324,6 +1444,15 @@ mod tests {
     fn public_downloads_refuse_names_that_resolve_locally() {
         let err = download_public_within("http://localhost:9/doc.json", 1024, std::time::Duration::from_secs(5)).unwrap_err();
         assert!(err.contains("resolves to this computer or the local network"), "{err}");
+    }
+
+    #[test]
+    fn announced_tiff_header_lengths() {
+        assert_eq!(tiff_header_length(" 16384 "), Some(16384));
+        assert!(accepts_byte_ranges("bytes") && accepts_byte_ranges("none, Bytes") && !accepts_byte_ranges("none"));
+        for bad in ["", "0", "-5", "12kb", "18446744073709551616"] {
+            assert_eq!(tiff_header_length(bad), None, "{bad}");
+        }
     }
 
     #[test]

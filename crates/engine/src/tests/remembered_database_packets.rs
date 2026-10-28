@@ -3,7 +3,7 @@ use rustgis_data::secrets::{MemorySecrets, SecretStore};
 use std::io::{Read, Write};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
 
@@ -169,6 +169,65 @@ fn remember(s: &mut Session, name: &str, address: &str, password: &str) -> Strin
     id
 }
 
+/// A store that counts its loads, so a test can say what a login asked of the keychain.
+struct Counting {
+    inner: Arc<MemorySecrets>,
+    loads: AtomicUsize,
+}
+impl Counting {
+    fn over(inner: Arc<MemorySecrets>) -> Arc<Self> {
+        Arc::new(Self { inner, loads: AtomicUsize::new(0) })
+    }
+    fn loads(&self) -> usize {
+        self.loads.load(Ordering::SeqCst)
+    }
+}
+impl SecretStore for Counting {
+    fn load(&self, account: &str) -> Result<Option<rustgis_data::secrets::Secret>, rustgis_data::secrets::SecretError> {
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        self.inner.load(account)
+    }
+    fn save(&self, account: &str, value: &rustgis_data::secrets::Secret) -> Result<(), rustgis_data::secrets::SecretError> {
+        self.inner.save(account, value)
+    }
+    fn delete(&self, account: &str) -> Result<(), rustgis_data::secrets::SecretError> {
+        self.inner.delete(account)
+    }
+}
+
+/// A session over any store, holding the saved connections `prefs` names, as the command line and
+/// Python open one with `--use-saved-secrets` / `use_saved_secrets`.
+fn session_with(store: Arc<dyn SecretStore>, prefs: &str) -> Session {
+    let mut s = Session::new(Project::default());
+    let prefs = serde_json::Map::from_iter([(crate::connections::PREF.to_string(), Value::String(prefs.to_string()))]);
+    crate::prefs::use_saved_secrets(&mut s, &prefs, store);
+    s
+}
+
+/// Saves a connection of any database kind with its password, as `remember` does for PostgreSQL.
+fn remember_kind(s: &mut Session, kind: &str, address: &str, password: &str) -> String {
+    let id = s.run("connection.new", &json!({"kind":kind,"name":kind,"address":address})).unwrap()["id"].as_str().unwrap().to_string();
+    assert_eq!(s.run("connection.login", &json!({"id":id,"password":password,"remember":true})).unwrap()["passwordSaved"], true);
+    id
+}
+
+/// A project whose first layer reads `address` through `origin` (`postgis`, `mysql`, `sqlserver`).
+fn database_project(origin: &str, address: &str) -> String {
+    let mut p = world().project;
+    for layer in p.map_mut().layers.iter_mut().take(1) {
+        layer.source = Some(serde_json::from_value(json!({(origin):{"database":address,"table":"roads","family":"Lines"}})).unwrap());
+    }
+    serde_json::to_string(&p).unwrap()
+}
+
+/// The three database kinds: the kind, the layer origin that names it, and an address nothing
+/// listens at.
+const KINDS: [(&str, &str, &str); 3] = [
+    ("postgres", "postgis", "postgres:host=127.0.0.1 port=1 user=kinds dbname=gis sslmode=disable"),
+    ("mysql", "mysql", "mysql://kinds@127.0.0.1:1/gis?ssl-mode=DISABLED"),
+    ("sqlserver", "sqlserver", "mssql://kinds@127.0.0.1:1/gis?encrypt=false"),
+];
+
 // Driver passwords are process-global. Isolate packet scenarios from unrelated full-suite
 // project resets (and ambient-password precedence tests) without mutating the parent's environment.
 fn isolated(name: &str) -> bool {
@@ -185,7 +244,9 @@ fn isolated_with(name: &str, extra: &[(&str, &str)]) -> bool {
         .args(["--exact", &format!("tests::remembered_database_packets::{name}"), "--test-threads=1"])
         .env("RUSTGIS_PACKET_SCENARIO", name)
         .env_remove("PGPASSWORD")
-        .env_remove("PGPASSFILE");
+        .env_remove("PGPASSFILE")
+        .env_remove("MYSQL_PWD")
+        .env_remove("SQLCMDPASSWORD");
     for (key, value) in extra {
         command.env(key, value);
     }
@@ -311,24 +372,158 @@ fn remembered_database_exact_address_and_explicit_precedence_packets() {
     server.empty();
 }
 
-/// An explicitly initiated connection prefers the saved password to an ambient one (`PGPASSWORD`).
+/// With the saved-secrets opt-in, a saved connection's password from the environment
+/// (`PGPASSWORD`) beats the keychain's, for an explicit command and for opening a project, and the
+/// keychain is never asked; the desktop (no opt-in) keeps sending the saved one. A password given
+/// to a command, or typed for the address, beats the environment; the environment reaches no
+/// address the saved connection doesn't name exactly, nor a connection kept without a password.
 /// The ambient value is set in a child process: it is process-global, and the rest of the suite
 /// must not see it.
 #[test]
-fn remembered_database_saved_password_wins_over_ambient_environment() {
-    if isolated_with("remembered_database_saved_password_wins_over_ambient_environment", &[("PGPASSWORD", "ambient-wrong-sentinel")]) {
+fn remembered_database_environment_password_wins_over_saved_for_postgres() {
+    let name = "remembered_database_environment_password_wins_over_saved_for_postgres";
+    if isolated_with(name, &[("PGPASSWORD", "environment-sentinel")]) {
         return;
     }
     let server = Server::new();
-    let store = Arc::new(MemorySecrets::new());
-    let mut seed = app(store.clone(), "{}");
-    let id = remember(&mut seed, "Ambient", &server.address, "ambient-saved-sentinel");
-    let mut s = app(store, &seed.connections.to_json());
-    // `connection.test` is explicitly initiated, so the driver may consult the ambient password:
-    // the saved one must be sent instead.
-    assert!(s.run("connection.test", &json!({"id":id})).is_err(), "the refusing server must fail the listing");
-    assert_eq!(server.take(), b"ambient-saved-sentinel\0");
+    let seeded = Arc::new(MemorySecrets::new());
+    let mut seed = app(seeded.clone(), "{}");
+    let id = remember(&mut seed, "Env", &server.address, "saved-sentinel");
+    let prefs = seed.connections.to_json();
+    // Seeding activated the typed password for the driver; the sessions below start without it.
+    rustgis_data::source::duckdb::forget_connection_passwords();
+    // The desktop (a store without the opt-in) never reads the environment: the saved one is sent.
+    let mut desktop = app(seeded.clone(), &prefs);
+    assert!(desktop.run("connection.test", &json!({"id":id})).is_err());
+    assert_eq!(server.take(), b"saved-sentinel\0");
     server.empty();
+    rustgis_data::source::duckdb::forget_connection_passwords();
+    let store = Counting::over(seeded);
+    let (_, key) = crate::connections::database_key(&server.address).unwrap();
+
+    // The environment's password is for the saved address only.
+    let mut s = session_with(store.clone(), &prefs);
+    s.run("project.openText", &json!({"text":project(&server.address.replace("user=packet_user", "user=other"))})).unwrap();
+    server.empty();
+    let mut unsaved = session_with(store.clone(), "{}");
+    unsaved.run("connection.new", &json!({"kind":"postgres","name":"Plain","address":server.address})).unwrap();
+    unsaved.run("project.openText", &json!({"text":project(&server.address)})).unwrap();
+    server.empty();
+    assert_eq!(store.loads(), 0);
+
+    // An explicit command: the environment's password is sent, not the saved one, and the
+    // keychain isn't read.
+    let mut s = session_with(store.clone(), &prefs);
+    assert!(s.run("connection.test", &json!({"id":id})).is_err(), "the refusing server must fail the listing");
+    assert_eq!(server.take(), b"environment-sentinel\0");
+    server.empty();
+    assert_eq!(store.loads(), 0);
+
+    // Opening a project: the same.
+    let mut s = session_with(store.clone(), &prefs);
+    s.run("project.openText", &json!({"text":project(&server.address)})).unwrap();
+    assert_eq!(server.take(), b"environment-sentinel\0");
+    server.empty();
+    assert_eq!(store.loads(), 0);
+    // A refused environment password isn't sent again, nor replaced by the saved one unasked.
+    assert!(s.database_logins.is_rejected(&id));
+    assert_eq!(s.run("connection.login", &json!({"id":id})).unwrap_err(), "password is required");
+    server.empty();
+    assert_eq!(store.loads(), 0);
+    // A password given to the command wins over the environment's.
+    s.run("connection.login", &json!({"id":id,"password":"typed-sentinel"})).unwrap();
+    assert_eq!(server.take(), b"typed-sentinel\0");
+    server.empty();
+
+    // A password typed for the address wins over the environment's as well.
+    rustgis_data::source::duckdb::remember_password(&key, "address-sentinel");
+    let mut s = session_with(store.clone(), &prefs);
+    assert!(s.run("connection.test", &json!({"id":id})).is_err());
+    assert_eq!(server.take(), b"address-sentinel\0");
+    server.empty();
+    assert_eq!(store.loads(), 0);
+}
+
+/// Every database kind takes the saved connection's password from the environment of its own
+/// client (`PGPASSWORD`, `MYSQL_PWD`, `SQLCMDPASSWORD`) before the keychain, for a login and for a
+/// project, and then never asks the keychain, which here fails if it is asked.
+#[test]
+fn remembered_database_environment_password_wins_for_every_database_kind() {
+    let name = "remembered_database_environment_password_wins_for_every_database_kind";
+    if isolated_with(name, &[("PGPASSWORD", "env-pg"), ("MYSQL_PWD", "env-my"), ("SQLCMDPASSWORD", "env-ms")]) {
+        return;
+    }
+    for (kind, origin, address) in KINDS {
+        let expected = match kind {
+            "postgres" => "env-pg",
+            "mysql" => "env-my",
+            _ => "env-ms",
+        };
+        let (_, key) = crate::connections::database_key(address).unwrap();
+        let mut seed = app(Arc::new(MemorySecrets::new()), "{}");
+        remember_kind(&mut seed, kind, address, &format!("saved-{kind}"));
+        let prefs = seed.connections.to_json();
+        rustgis_data::source::duckdb::forget_connection_passwords();
+        let unreadable = Arc::new(MemorySecrets::failing(rustgis_data::secrets::SecretError::Unavailable("no keychain here".into())));
+        let store = Counting::over(unreadable);
+
+        let mut s = session_with(store.clone(), &prefs);
+        let listed = s.run("connection.list", &Value::Null).unwrap();
+        let id = listed["connections"][0]["id"].as_str().unwrap().to_string();
+        let shown = s.run("connection.login", &json!({"id":id})).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        assert_eq!(shown["loggedIn"], true, "{kind}");
+        assert_eq!(s.database_logins.known_password(&id).unwrap().expose(), expected, "{kind}");
+        assert!(rustgis_data::source::duckdb::has_connection_password(&key, &id), "{kind}");
+        assert_eq!(store.loads(), 0, "{kind}: a login the environment satisfies doesn't ask the keychain");
+
+        rustgis_data::source::duckdb::forget_connection_passwords();
+        let mut s = session_with(store.clone(), &prefs);
+        s.run("project.openText", &json!({"text":database_project(origin, address)})).unwrap();
+        assert_eq!(s.database_logins.known_password(&id).unwrap().expose(), expected, "{kind}");
+        assert!(rustgis_data::source::duckdb::has_connection_password(&key, &id), "{kind}");
+        assert!(s.database_logins.activations().contains(&(key.clone(), id.clone())), "{kind}");
+        assert_eq!(store.loads(), 0, "{kind}: opening a project the environment satisfies doesn't ask the keychain");
+        assert!(!s.notices.iter().any(|n| n.text.contains(expected)), "{kind}");
+
+        // A password given to the command is the one used, and the environment's isn't.
+        let shown = s.run("connection.login", &json!({"id":id,"password":format!("typed-{kind}")})).unwrap();
+        assert_eq!(shown["loggedIn"], true, "{kind}");
+        assert_eq!(s.database_logins.known_password(&id).unwrap().expose(), format!("typed-{kind}"), "{kind}");
+        assert_eq!(store.loads(), 0, "{kind}");
+        rustgis_data::source::duckdb::forget_connection_passwords();
+    }
+}
+
+/// Without an environment password the keychain's serves, read once, for every database kind: the
+/// environment's precedence takes nothing from the saved passwords.
+#[test]
+fn remembered_database_saved_password_serves_when_the_environment_has_none() {
+    let name = "remembered_database_saved_password_serves_when_the_environment_has_none";
+    if isolated(name) {
+        return;
+    }
+    for (kind, origin, address) in KINDS {
+        let (_, key) = crate::connections::database_key(address).unwrap();
+        let seeded = Arc::new(MemorySecrets::new());
+        let mut seed = app(seeded.clone(), "{}");
+        let id = remember_kind(&mut seed, kind, address, &format!("saved-{kind}"));
+        let prefs = seed.connections.to_json();
+        rustgis_data::source::duckdb::forget_connection_passwords();
+        let store = Counting::over(seeded);
+
+        let mut s = session_with(store.clone(), &prefs);
+        assert_eq!(s.run("connection.login", &json!({"id":id})).unwrap()["loggedIn"], true, "{kind}");
+        assert_eq!(s.database_logins.known_password(&id).unwrap().expose(), format!("saved-{kind}"), "{kind}");
+        assert_eq!(store.loads(), 1, "{kind}");
+
+        rustgis_data::source::duckdb::forget_connection_passwords();
+        let mut s = session_with(store.clone(), &prefs);
+        s.run("project.openText", &json!({"text":database_project(origin, address)})).unwrap();
+        assert_eq!(s.database_logins.known_password(&id).unwrap().expose(), format!("saved-{kind}"), "{kind}");
+        assert!(rustgis_data::source::duckdb::has_connection_password(&key, &id), "{kind}");
+        assert_eq!(store.loads(), 2, "{kind}");
+        rustgis_data::source::duckdb::forget_connection_passwords();
+    }
 }
 
 #[test]

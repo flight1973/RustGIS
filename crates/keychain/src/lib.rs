@@ -1,9 +1,12 @@
-//! The system's secret store (macOS Keychain, Windows Credential Manager, the Secret Service on
-//! Linux and the BSDs) behind `Services::secrets`.
+//! The one crate that talks to the OS secret store (macOS Keychain, Windows Credential Manager,
+//! Secret Service), used by the desktop, `rustgis-cli --use-saved-secrets` and Python's
+//! `use_saved_secrets`.
+
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::sync::{Arc, OnceLock};
 
-use rustgis_engine::data::secrets::{SERVICE, Secret, SecretError, SecretStore, check_account};
+use rustgis_data::secrets::{SERVICE, Secret, SecretError, SecretStore, check_account};
 
 /// The OS credential store, opened on the first call: constructing this hook never touches
 /// D-Bus or triggers a prompt. Callers such as Assistant key migration use a worker thread.

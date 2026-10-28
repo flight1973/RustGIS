@@ -15,12 +15,11 @@ rustgis-engine = { workspace = true, features = ["geolibre"] }
 rustgis-ui-egui = { workspace = true }
 # The ChatGPT sign-in, given the keychain at start-up.
 rustgis-assistant = { workspace = true }
+rustgis-keychain = { workspace = true }
 eframe = { workspace = true, features = ["clipboard", "default_fonts", "links", "wgpu", "accesskit", "wayland", "x11"] }
 egui = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
-# The system's secret store (`Services::secrets`): the generic API, and one backend per OS below.
-keyring-core = "1"
 
 # The Windows exe icon (build.rs). Gated on the host, so other platforms build neither.
 [target.'cfg(windows)'.build-dependencies]
@@ -32,12 +31,6 @@ embed-resource = "3"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSButton", "NSControl", "NSView", "NSResponder"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSUserDefaults"] }
-# The login Keychain behind `Services::secrets`.
-apple-native-keyring-store = { version = "1", features = ["keychain"] }
-
-# Windows Credential Manager behind `Services::secrets`.
-[target.'cfg(windows)'.dependencies]
-windows-native-keyring-store = "1"
 
 # Linux: GNOME on Wayland leaves the title bar to the app. winit draws an Adwaita one (title,
 # minimise, maximise, close, following the light/dark theme) instead of its plain grey fallback.
@@ -45,6 +38,3 @@ windows-native-keyring-store = "1"
 # winit` lists one winit). A different one would build a second winit and lose the title bar.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
-# The Secret Service (GNOME Keyring, KWallet) behind `Services::secrets`, over pure-Rust D-Bus:
-# no openssl, libdbus or tokio. Keep the `cfg` list identical to the one in `src/keychain.rs`.
-zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }

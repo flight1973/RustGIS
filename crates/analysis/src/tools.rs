@@ -5,7 +5,7 @@ use rustgis_data::raster::Crs;
 use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value};
 use rustgis_geom::Extent;
 use serde_json::Value as Json;
-use std::collections::TryReserveError;
+use std::collections::{HashMap, HashSet, TryReserveError};
 use std::ops::ControlFlow;
 
 use crate::convert::{from_line, from_multipolygon, from_point, to_geo, to_multiline, to_multipolygon};
@@ -385,13 +385,94 @@ pub static TOOLS: &[ToolSpec] = &[
         id: "summaryStatistics",
         name: "Summary Statistics",
         toolbox: "Analysis › Statistics",
-        summary: "Count, sum, mean, min, max and standard deviation of a field, optionally per case field.",
+        summary: "Statistics of fields, for the whole table or for each group of records sharing the case fields' values.",
         params: &[
             P { name: "input", label: "Input Table", kind: K::Layer, required: true, default: "", help: "" },
-            P { name: "field", label: "Statistics Field", kind: K::NumericField, required: true, default: "", help: "" },
-            P { name: "case", label: "Case Field", kind: K::Field, required: false, default: "", help: "" },
+            P {
+                name: "statistics",
+                label: "Statistics",
+                kind: K::Text,
+                required: false,
+                default: "",
+                help: "The statistics to compute, as (field, statistic) pairs, e.g. [{\"field\": \"income\", \"statistic\": \"MEDIAN\"}]. Statistics: COUNT, SUM, MEAN, MIN, MAX, RANGE, STD, VARIANCE, MEDIAN, P1 to P99, IQR, CV, MODE, MINORITY, UNIQUE, FIRST, LAST, CONCATENATE, NULLS; a text field takes COUNT, MIN, MAX, FIRST, LAST, UNIQUE, CONCATENATE, MODE, MINORITY and NULLS. Leave empty to use Statistics Field.",
+            },
+            P {
+                name: "field",
+                label: "Statistics Field",
+                kind: K::NumericField,
+                required: false,
+                default: "",
+                help: "Without Statistics: the field whose count, sum, mean, min, max and standard deviation are computed.",
+            },
+            P {
+                name: "case",
+                label: "Case Field",
+                kind: K::Field,
+                required: false,
+                default: "",
+                help: "Groups records by this field's values. Scripts and the AI Assistant can give several fields as a list.",
+            },
+            P {
+                name: "separator",
+                label: "Separator",
+                kind: K::Text,
+                required: false,
+                default: "\", \"",
+                help: "Put between the values CONCATENATE joins.",
+            },
         ],
         run: summary_statistics,
+    },
+    ToolSpec {
+        id: "pivotTable",
+        name: "Pivot Table",
+        toolbox: "Analysis › Statistics",
+        summary: "Turns a field's values into fields: a row for each combination of the row fields' values, a column for each value of the pivot field.",
+        params: &[
+            P { name: "input", label: "Input Table", kind: K::Layer, required: true, default: "", help: "" },
+            P {
+                name: "fields",
+                label: "Row Field",
+                kind: K::Field,
+                required: false,
+                default: "",
+                help: "Makes a row for each of this field's values. Scripts and the AI Assistant can give several fields as a list. Leave empty for one row for the whole table.",
+            },
+            P {
+                name: "pivot",
+                label: "Pivot Field",
+                kind: K::Field,
+                required: true,
+                default: "",
+                help: "Makes a field for each of this field's values, sorted by value.",
+            },
+            P {
+                name: "value",
+                label: "Value Field",
+                kind: K::Field,
+                required: true,
+                default: "",
+                help: "The field whose values fill the table.",
+            },
+            P {
+                name: "statistic",
+                label: "Statistic",
+                kind: K::Text,
+                required: false,
+                default: "",
+                help: "Combines the values of the records sharing a row and a column: COUNT, SUM, MEAN, MIN, MAX, RANGE, STD, VARIANCE, MEDIAN, P1 to P99, IQR, CV, MODE, MINORITY, UNIQUE, FIRST, LAST, CONCATENATE or NULLS; a text field takes COUNT, MIN, MAX, FIRST, LAST, UNIQUE, CONCATENATE, MODE, MINORITY and NULLS. Leave empty to place each value as it is; then a row and column can hold one record at most.",
+            },
+            P {
+                name: "separator",
+                label: "Separator",
+                kind: K::Text,
+                required: false,
+                default: "\", \"",
+                help: "Put between the values CONCATENATE joins.",
+            },
+            P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
+        ],
+        run: pivot_table,
     },
     ToolSpec {
         id: "exportFeatures",
@@ -2249,54 +2330,283 @@ fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     })
 }
 
+/// The longest separator Summary Statistics joins CONCATENATE's values with, in bytes: each value
+/// adds one, so a long one would multiply the output's size.
+const MAX_SEPARATOR: usize = 256;
+
+/// Summary Statistics: a row for each group of records sharing the case fields' values, holding
+/// the case fields, `FREQUENCY` (the group's records) and each requested statistic as
+/// `<STAT>_<field>`. Without `statistics`, `field` takes COUNT, SUM, MEAN, MIN, MAX and STD, its
+/// values read as numbers whatever its type, as before the statistics list.
 fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    use crate::stats::{self, Request, Stat};
     let ds = input(inp, p, "input")?;
-    let field = s(p, "field");
-    let fi = find_field_case_insensitive(ds, field)?;
-    let case = s(p, "case").trim();
-    let ci = if case.is_empty() { None } else { Some(find_field_case_insensitive(ds, case)?) };
-    let mut groups: Vec<(Value, Vec<f64>)> = Vec::new();
-    for r in rows(inp, p, "input", ds) {
-        let key = ci.map(|c| ds.value(r, c).clone()).unwrap_or(Value::Null);
-        let v = ds.value(r, fi).as_f64();
-        let g = match groups.iter_mut().position(|(k, _)| *k == key) {
-            Some(i) => i,
-            None => {
-                groups.push((key, Vec::new()));
-                groups.len() - 1
-            }
-        };
-        if let (Some(v), Some(g)) = (v, groups.get_mut(g)) {
-            g.1.push(v);
+    let mut requests = stats::parse_requests(ds, p.get("statistics"))?;
+    let field_only = requests.is_empty();
+    if field_only {
+        let field = s(p, "field").trim();
+        if field.is_empty() {
+            return Err("give the statistics to compute, or a Statistics Field".into());
         }
+        let fi = find_field_case_insensitive(ds, field)?;
+        requests = [Stat::Count, Stat::Sum, Stat::Mean, Stat::Min, Stat::Max, Stat::Std].map(|stat| Request { field: fi, stat }).to_vec();
     }
-    let fname = ds.fields.get(fi).map(|f| f.name.clone()).unwrap_or_default();
-    let mut fields = Vec::new();
-    if let Some(c) = ci.and_then(|c| ds.fields.get(c)) {
-        fields.push(c.clone());
+    let cases = key_fields(ds, p.get("case"), "Case Field")?;
+    let separator = concatenate_separator(p)?;
+    let mut fields: Vec<Field> = cases.iter().filter_map(|&c| ds.fields.get(c).cloned()).collect();
+    fields.push(Field::new("FREQUENCY", FieldType::Integer));
+    for r in &requests {
+        let (name, numeric) = ds.fields.get(r.field).map(|f| (f.name.as_str(), f.ty.is_numeric())).unwrap_or_default();
+        let field = Field::new(format!("{}_{name}", r.stat.name()), r.stat.output_type(numeric || field_only));
+        if fields.iter().any(|f| f.name.eq_ignore_ascii_case(&field.name)) {
+            return Err(format!("the output would have two fields named '{}'", field.name));
+        }
+        fields.push(field);
     }
-    for st in ["COUNT", "SUM", "MEAN", "MIN", "MAX", "STD"] {
-        fields.push(Field::new(format!("{st}_{fname}"), if st == "COUNT" { FieldType::Integer } else { FieldType::Double }));
+    if let Some(c) = cases.iter().filter_map(|&c| ds.fields.get(c)).find(|f| f.name.eq_ignore_ascii_case("FREQUENCY")) {
+        return Err(format!("the case field '{}' has the name of the output's FREQUENCY field", c.name));
     }
     let mut out = Dataset::new(format!("{}_Statistics", ds.name), GeometryType::None, fields);
-    groups.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    for (key, v) in groups {
-        let n = v.len() as f64;
-        let sum: f64 = v.iter().sum();
-        let mean = if n > 0.0 { sum / n } else { 0.0 };
-        let sd = if n > 0.0 { (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n).sqrt() } else { 0.0 };
-        let min = v.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let mut row = Vec::new();
-        if ci.is_some() {
-            row.push(key);
+    // Record order, each record once, whatever order the selection lists them in: FIRST, LAST and
+    // CONCATENATE follow it.
+    let mut rs = rows(inp, p, "input", ds);
+    rs.sort_unstable();
+    rs.dedup();
+    for group in stats::group_rows(ds, &rs, &cases) {
+        let mut row = group.key;
+        row.push(stats::count(group.rows.len()));
+        // Each field's values are read once, however many of its statistics are asked for.
+        let mut read: Vec<(usize, stats::Column)> = Vec::new();
+        for r in &requests {
+            let i = match read.iter().position(|(f, _)| *f == r.field) {
+                Some(i) => i,
+                None => {
+                    read.push((r.field, stats::column(ds, &group.rows, r.field, field_only)));
+                    read.len() - 1
+                }
+            };
+            row.push(read.get(i).map_or(Value::Null, |(_, c)| stats::compute(r.stat, c, separator)));
         }
-        let f = |x: f64| if x.is_finite() { Value::Float(x) } else { Value::Null };
-        row.extend([Value::Int(n as i64), f(sum), f(mean), f(min), f(max), f(sd)]);
-        out.push(None, row);
+        // One past the last id: `push` would search them all for each group.
+        out.push_next(None, row);
     }
     let n = out.features.len();
     Ok(ToolResult { output: Output::Table(out), messages: vec![format!("Summary Statistics: {n} rows")] })
+}
+
+/// The key fields a table tool groups by, such as Summary Statistics' case fields: one field's name,
+/// several as a list, or none. `label` is the parameter's label, singular, for messages. A field
+/// named twice is an error.
+fn key_fields(ds: &Dataset, v: Option<&Json>, label: &str) -> Result<Vec<usize>, String> {
+    let lower = label.to_lowercase();
+    let names: Vec<&str> = match v {
+        None | Some(Json::Null) => Vec::new(),
+        Some(Json::String(t)) => vec![t.trim()],
+        Some(Json::Array(items)) => items
+            .iter()
+            .map(|i| i.as_str().map(str::trim).ok_or_else(|| format!("{label}s must be field names")))
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(format!("{label} must be a field name or a list of them")),
+    };
+    let mut out = Vec::with_capacity(names.len());
+    for name in names.into_iter().filter(|n| !n.is_empty()) {
+        let c = find_field_case_insensitive(ds, name)?;
+        if out.contains(&c) {
+            return Err(format!("{lower} '{name}' is listed twice"));
+        }
+        // Output names must differ in more than case, for lookups that ignore it.
+        let same = |o: &usize| ds.fields.get(*o).zip(ds.fields.get(c)).is_some_and(|(a, b)| a.name.eq_ignore_ascii_case(&b.name));
+        if out.iter().any(same) {
+            return Err(format!("{lower}s can't differ only in case ('{name}')"));
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+
+/// The separator CONCATENATE joins values with: `, ` unless given. A bad one is refused whatever
+/// the statistics; the Tools pane leaves it out of runs without CONCATENATE.
+fn concatenate_separator(p: &Json) -> Result<&str, String> {
+    match p.get("separator") {
+        None | Some(Json::Null) => Ok(", "),
+        Some(Json::String(t)) if t.len() <= MAX_SEPARATOR => Ok(t.as_str()),
+        Some(Json::String(_)) => Err(format!("Separator can be at most {MAX_SEPARATOR} bytes")),
+        Some(_) => Err("Separator must be text".into()),
+    }
+}
+
+/// The most columns Pivot Table makes from the pivot field's values: each is an output field.
+const MAX_PIVOT_COLUMNS: usize = 1000;
+
+/// The most cells (rows times output fields: the row fields and the pivot fields) Pivot Table
+/// makes: its output is held in memory.
+const MAX_PIVOT_CELLS: usize = 10_000_000;
+
+/// The most characters of a pivot value Pivot Table keeps in a field name, besides the pivot
+/// field's name and any suffix that tells two names apart.
+const MAX_PIVOT_NAME: usize = 64;
+
+/// Pivot Table: a row for each combination of the row fields' values (one row without them), then
+/// a field for each value of the pivot field, sorted by value, holding the value field's values in
+/// that row. Without a statistic, a row and column can hold one record at most, and its value is
+/// copied with the value field's type; with one, the statistic combines that cell's records, as in
+/// Summary Statistics. A cell with no records is null. A record without a pivot value is an error.
+fn pivot_table(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    use crate::stats::{self, Stat};
+    let ds = input(inp, p, "input")?;
+    let keys = key_fields(ds, p.get("fields"), "Row Field")?;
+    let named = |k: &str, label: &str| -> Result<usize, String> {
+        if p.get(k).is_some_and(|v| !v.is_string() && !v.is_null()) {
+            return Err(format!("'{label}' must be a field name"));
+        }
+        let name = s(p, k).trim();
+        if name.is_empty() {
+            return Err(format!("'{label}' is required"));
+        }
+        find_field_case_insensitive(ds, name)
+    };
+    let pivot = named("pivot", "Pivot Field")?;
+    let value = named("value", "Value Field")?;
+    let field_name = |i: usize| ds.fields.get(i).map_or("", |f| f.name.as_str());
+    if keys.contains(&pivot) {
+        return Err(format!("the pivot field '{}' can't also be a row field", field_name(pivot)));
+    }
+    let value_type = ds.fields.get(value).map_or(FieldType::Text, |f| f.ty);
+    if p.get("statistic").is_some_and(|v| !v.is_string() && !v.is_null()) {
+        return Err("Statistic must be text".into());
+    }
+    let stat = match s(p, "statistic").trim() {
+        "" => None,
+        name => {
+            let stat = Stat::parse(name).ok_or_else(|| format!("Statistic must be one of {} (not '{name}')", stats::STAT_NAMES))?;
+            if !value_type.is_numeric() && !stat.fits_text() {
+                return Err(format!("{} needs a numeric value field ('{}' is not)", stat.name(), field_name(value)));
+            }
+            Some(stat)
+        }
+    };
+    let separator = concatenate_separator(p)?;
+    // Record order, each record once, as FIRST, LAST and CONCATENATE follow it.
+    let mut rs = rows(inp, p, "input", ds);
+    rs.sort_unstable();
+    rs.dedup();
+    let columns = stats::group_rows(ds, &rs, &[pivot]);
+    let missing: usize = columns.iter().filter(|c| c.key.first().is_none_or(no_pivot_value)).map(|c| c.rows.len()).sum();
+    if missing > 0 {
+        let records = if missing == 1 { "1 record".to_string() } else { format!("{missing} records") };
+        return Err(format!("the pivot field '{}' has no value in {records}: fill them in, or select the others", field_name(pivot)));
+    }
+    if columns.len() > MAX_PIVOT_COLUMNS {
+        return Err(format!(
+            "the pivot field '{}' has {} values, which would make more than {MAX_PIVOT_COLUMNS} fields",
+            field_name(pivot),
+            columns.len()
+        ));
+    }
+    let groups = stats::group_rows(ds, &rs, &keys);
+    let width = keys.len() + columns.len();
+    if groups.len().saturating_mul(width) > MAX_PIVOT_CELLS {
+        return Err(format!("{} rows by {width} fields would make more than {MAX_PIVOT_CELLS} values; select fewer records", groups.len()));
+    }
+    let mut fields: Vec<Field> = keys.iter().filter_map(|&k| ds.fields.get(k).cloned()).collect();
+    let ty = stat.map_or(value_type, |st| st.output_type(value_type.is_numeric()));
+    let values = columns.iter().map(|c| c.key.first().unwrap_or(&Value::Null));
+    let names = pivot_field_names(field_name(pivot), values, &fields);
+    fields.extend(names.into_iter().map(|name| Field::new(name, ty)));
+    let mut column_of: HashMap<usize, usize> = HashMap::with_capacity(rs.len());
+    for (c, column) in columns.iter().enumerate() {
+        column_of.extend(column.rows.iter().map(|&r| (r, c)));
+    }
+    let mut out = Dataset::new(out_name(p, format!("{}_Pivot", ds.name)), GeometryType::None, fields);
+    for group in groups {
+        // The group's records by column; the sort is stable, so each cell keeps record order.
+        let mut cells: Vec<(usize, usize)> = group.rows.iter().filter_map(|&r| column_of.get(&r).map(|&c| (c, r))).collect();
+        cells.sort_by_key(|&(c, _)| c);
+        let mut row = group.key;
+        // Where the pivot fields start, after the row fields.
+        let pivot_start = row.len();
+        for cell in cells.chunk_by(|a, b| a.0 == b.0) {
+            let Some(&(c, r)) = cell.first() else { continue };
+            let v = match stat {
+                None if cell.len() > 1 => {
+                    let mut cell_key: Vec<String> = keys.iter().zip(&row).map(|(&k, v)| format!("{} = {v}", field_name(k))).collect();
+                    cell_key.push(format!("{} = {}", field_name(pivot), ds.value(r, pivot)));
+                    return Err(format!(
+                        "{} records have {}: give a Statistic to combine them, or choose Row Fields that tell them apart",
+                        cell.len(),
+                        cell_key.join(", ")
+                    ));
+                }
+                None => ds.value(r, value).clone(),
+                Some(st) => {
+                    let records: Vec<usize> = cell.iter().map(|&(_, r)| r).collect();
+                    stats::compute(st, &stats::column(ds, &records, value, false), separator)
+                }
+            };
+            row.resize(pivot_start + c, Value::Null);
+            row.push(v);
+        }
+        row.resize(pivot_start + columns.len(), Value::Null);
+        // One past the last id: `push` would search them all for each row.
+        out.push_next(None, row);
+    }
+    let n = out.features.len();
+    Ok(ToolResult { output: Output::Table(out), messages: vec![format!("Pivot Table: {n} rows, {} pivot fields", columns.len())] })
+}
+
+/// Whether a pivot value is missing: null, or a number that isn't one.
+fn no_pivot_value(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::Float(f) => f.is_nan(),
+        _ => false,
+    }
+}
+
+/// The names of the fields Pivot Table makes for the pivot field `field`'s `values`, in order,
+/// after the fields `before` it: each value's [`pivot_column_name`], with a suffix (`_2`, `_3`, …)
+/// for one already taken, ignoring case, in the order of the values.
+fn pivot_field_names<'a>(field: &str, values: impl Iterator<Item = &'a Value>, before: &[Field]) -> Vec<String> {
+    let mut taken: HashSet<String> = before.iter().map(|f| f.name.to_ascii_lowercase()).collect();
+    let mut out = Vec::new();
+    for v in values {
+        let base = pivot_column_name(field, v);
+        let mut name = base.clone();
+        let mut n = 2;
+        while !taken.insert(name.to_ascii_lowercase()) {
+            name = format!("{base}_{n}");
+            n += 1;
+        }
+        out.push(name);
+    }
+    out
+}
+
+/// The name of the field Pivot Table makes for a value of the pivot field `field`. Letters, digits
+/// and underscores are kept, and each run of other characters becomes one underscore, or none right
+/// after an underscore (`North_-east` gives `North_east`); text also loses underscores at its ends.
+/// At most [`MAX_PIVOT_NAME`] characters of the value are kept. A number (in full) or true/false
+/// follows the field's name (`year2020`, `rate2_5`, `temp_3` for −3); so does text that would start
+/// with a digit or have nothing left.
+fn pivot_column_name(field: &str, v: &Value) -> String {
+    // A decimal in full (the shortest text that reads back as it), not rounded as values are shown.
+    let shown = match v {
+        Value::Float(f) => f.to_string(),
+        _ => v.to_string(),
+    };
+    let mut name = String::new();
+    for ch in shown.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            name.push(ch);
+        } else if !name.ends_with('_') {
+            name.push('_');
+        }
+    }
+    let text = matches!(v, Value::Text(_));
+    // Cut, then trimmed, so a cut at a run of other characters leaves no underscore at the end.
+    let kept: String = name.chars().take(MAX_PIVOT_NAME).collect();
+    let name = if text { kept.trim_matches('_').to_string() } else { kept };
+    if !text || name.is_empty() || name.starts_with(char::is_numeric) { format!("{field}{name}") } else { name }
 }
 
 fn export_features(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -2324,7 +2634,9 @@ fn extent_contains(a: &Extent, b: &Extent) -> bool {
 /// Whether a tool's parameter applies, given the values of the others (`value` gives one's
 /// value as text, empty when unset, which stands for its default). The Tools pane hides and leaves
 /// out one that doesn't. Spatial Join's search distance, units and distance field apply only to the
-/// match options that measure distances, its merge rules only to one-to-one joins.
+/// match options that measure distances, its merge rules only to one-to-one joins. Summary
+/// Statistics' field applies only without a statistics list, its separator only to one with
+/// CONCATENATE; Pivot Table's separator only to the CONCATENATE statistic.
 pub fn param_applies(tool: &str, param: &str, value: &dyn Fn(&str) -> String) -> bool {
     match (tool, param) {
         ("spatialJoin", "distance" | "units" | "distanceField") => {
@@ -2332,6 +2644,18 @@ pub fn param_applies(tool: &str, param: &str, value: &dyn Fn(&str) -> String) ->
             DISTANCE_MATCHES.iter().any(|d| d.eq_ignore_ascii_case(m.trim()))
         }
         ("spatialJoin", "merge") => !value("operation").trim().eq_ignore_ascii_case("Join one to many"),
+        ("summaryStatistics", "field") => {
+            // Shown until the list holds a pair, so an empty list doesn't hide the field it falls back to.
+            let list = serde_json::from_str::<Json>(&value("statistics")).unwrap_or(Json::Null);
+            !list.as_array().is_some_and(|items| !items.is_empty())
+        }
+        ("pivotTable", "separator") => value("statistic").trim().eq_ignore_ascii_case("CONCATENATE"),
+        ("summaryStatistics", "separator") => {
+            let list = serde_json::from_str::<Json>(&value("statistics")).unwrap_or(Json::Null);
+            let concatenates =
+                |i: &Json| i.get("statistic").and_then(Json::as_str).is_some_and(|s| s.trim().eq_ignore_ascii_case("CONCATENATE"));
+            list.as_array().is_some_and(|items| items.iter().any(concatenates))
+        }
         _ => true,
     }
 }
@@ -3384,7 +3708,7 @@ mod tests {
         let cnt = layer(crate::run("countPoints", &m, &j(serde_json::json!({"polygons": "polys", "points": "pts"}))).unwrap());
         assert_eq!(cnt.value(0, 1), &Value::Int(2));
         let st = layer(crate::run("summaryStatistics", &m, &j(serde_json::json!({"input": "pts", "field": "v"}))).unwrap());
-        assert_eq!(st.value(0, 2), &Value::Float(2.0));
+        assert_eq!(st.value(0, st.field_index("MEAN_v").unwrap()), &Value::Float(2.0));
         match crate::run("selectByLocation", &m, &j(serde_json::json!({"input": "pts", "select": "polys"}))).unwrap().output {
             Output::Selection { rows, .. } => assert_eq!(rows, vec![0, 1]),
             _ => panic!(),
@@ -4675,6 +4999,12 @@ mod tests {
             serde_json::json!({"input": 3, "overlay": ["polys"]}),
             serde_json::json!({"input": "pts", "near": "pts", "distance": -0.0, "units": "Feet"}),
             serde_json::json!({"input": "polys", "near": "pts", "distance": 1e308}),
+            serde_json::json!({"input": "pts", "statistics": [{"field": "v", "statistic": "P0"}, 7], "case": ["k", 3], "separator": 5}),
+            serde_json::json!({"input": "polys", "statistics": "[{\"field\": \"k\", \"statistic\": \"CONCATENATE\"}]", "case": "k,k"}),
+            serde_json::json!({"input": "pts", "statistics": {"field": "v"}, "case": {"k": 1}, "field": ["v"]}),
+            serde_json::json!({"input": "pts", "fields": ["k", 3], "pivot": "k", "value": "v", "statistic": "P100"}),
+            serde_json::json!({"input": "polys", "fields": {"k": 1}, "pivot": 5, "value": ["v"], "statistic": 7, "separator": []}),
+            serde_json::json!({"input": "pts", "fields": "", "pivot": "v", "value": "k", "statistic": "concatenate", "output": ""}),
         ];
         for t in TOOLS {
             for p in &junk {
@@ -5541,6 +5871,366 @@ mod tests {
         assert_eq!(names, ["edge"]);
         let d = within.value(0, within.field_index("d").unwrap()).as_f64().unwrap();
         assert!((d - 9_999.994_808).abs() < 1e-5, "{d}");
+    }
+
+    /// Parcels with a zone, a district, a value (null in one) and an owner name, for Summary Statistics.
+    fn parcels() -> Map {
+        let fields = vec![
+            Field::new("zone", FieldType::Text),
+            Field::new("district", FieldType::Integer),
+            Field::new("value", FieldType::Double),
+            Field::new("owner", FieldType::Text),
+        ];
+        let mut ds = Dataset::new("parcels", GeometryType::None, fields);
+        for (zone, district, value, owner) in [
+            (Value::Text("R".into()), 2, Value::Float(100.0), Value::Text("Lee".into())),
+            (Value::Text("C".into()), 1, Value::Float(400.0), Value::Text("Ng".into())),
+            (Value::Text("R".into()), 1, Value::Float(300.0), Value::Text("Ali".into())),
+            (Value::Text("R".into()), 2, Value::Float(200.0), Value::Null),
+            (Value::Text("R".into()), 1, Value::Float(500.0), Value::Text("Ali".into())),
+            (Value::Null, 3, Value::Null, Value::Text("Bo".into())),
+        ] {
+            ds.push(None, vec![zone, Value::Int(district), value, owner]);
+        }
+        Map(HashMap::from([("parcels".to_string(), ds)]))
+    }
+
+    /// The column of an output field, by name.
+    fn column(ds: &Dataset, name: &str) -> Vec<Value> {
+        let i = ds.field_index(name).unwrap_or_else(|| panic!("no field {name}"));
+        (0..ds.features.len()).map(|r| ds.value(r, i).clone()).collect()
+    }
+
+    /// A field alone, as calls made before the statistics list did, still gives its six statistics
+    /// under the same names, now after FREQUENCY; a group with no values reports null rather than 0.
+    #[test]
+    fn summary_statistics_keeps_the_field_only_call() {
+        let m = parcels();
+        let out =
+            layer(crate::run("summaryStatistics", &m, &serde_json::json!({"input": "parcels", "field": "value", "case": "zone"})).unwrap());
+        let names: Vec<&str> = out.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["zone", "FREQUENCY", "COUNT_value", "SUM_value", "MEAN_value", "MIN_value", "MAX_value", "STD_value"]);
+        assert_eq!(column(&out, "zone"), [Value::Null, Value::Text("C".into()), Value::Text("R".into())], "null keys group first");
+        assert_eq!(column(&out, "FREQUENCY"), [Value::Int(1), Value::Int(1), Value::Int(4)]);
+        assert_eq!(column(&out, "COUNT_value"), [Value::Int(0), Value::Int(1), Value::Int(4)]);
+        assert_eq!(column(&out, "MEAN_value"), [Value::Null, Value::Float(400.0), Value::Float(275.0)]);
+        assert_eq!(column(&out, "SUM_value"), [Value::Null, Value::Float(400.0), Value::Float(1100.0)]);
+        assert_eq!(column(&out, "STD_value").first(), Some(&Value::Null));
+        let types: Vec<FieldType> = out.fields.iter().skip(1).map(|f| f.ty).collect();
+        assert_eq!(
+            types,
+            [
+                FieldType::Integer,
+                FieldType::Integer,
+                FieldType::Double,
+                FieldType::Double,
+                FieldType::Double,
+                FieldType::Double,
+                FieldType::Double
+            ]
+        );
+        // No case field: one row for the table.
+        let all = layer(crate::run("summaryStatistics", &m, &serde_json::json!({"input": "parcels", "field": "value"})).unwrap());
+        assert_eq!(
+            (all.features.len(), column(&all, "FREQUENCY"), column(&all, "MAX_value")),
+            (1, vec![Value::Int(6)], vec![Value::Float(500.0)])
+        );
+        // A text field still reads as numbers, as it did: names aren't numbers, so none count.
+        let text = layer(crate::run("summaryStatistics", &m, &serde_json::json!({"input": "parcels", "field": "owner"})).unwrap());
+        assert_eq!((column(&text, "COUNT_owner"), column(&text, "MEAN_owner")), (vec![Value::Int(0)], vec![Value::Null]));
+        assert_eq!(text.fields.get(3).map(|f| f.ty), Some(FieldType::Double));
+    }
+
+    /// A statistics list over several case fields: groups for each (zone, district), the pairs'
+    /// fields in the order given, text statistics on a text field, and the separator.
+    #[test]
+    fn summary_statistics_lists_and_several_case_fields() {
+        let m = parcels();
+        let stats = serde_json::json!([
+            {"field": "value", "statistic": "median"},
+            {"field": "value", "statistic": "P90"},
+            {"field": "owner", "statistic": "MODE"},
+            {"field": "owner", "statistic": "CONCATENATE"},
+            {"field": "owner", "statistic": "NULLS"},
+        ]);
+        let p = serde_json::json!({"input": "parcels", "statistics": stats, "case": ["Zone", "district"], "separator": "/"});
+        let out = layer(crate::run("summaryStatistics", &m, &p).unwrap());
+        let names: Vec<&str> = out.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["zone", "district", "FREQUENCY", "MEDIAN_value", "P90_value", "MODE_owner", "CONCATENATE_owner", "NULLS_owner"]);
+        assert_eq!(out.fields.get(5).map(|f| f.ty), Some(FieldType::Text));
+        let r1 = [Value::Text("R".into()), Value::Int(1), Value::Int(2), Value::Float(400.0), Value::Float(480.0)];
+        let row = |r: usize| (0..out.fields.len()).map(|i| out.value(r, i).clone()).collect::<Vec<_>>();
+        assert_eq!(out.features.len(), 4);
+        assert_eq!(row(2)[..5], r1[..]);
+        assert_eq!(row(2)[5..], [Value::Text("Ali".into()), Value::Text("Ali/Ali".into()), Value::Int(0)]);
+        assert_eq!(row(3)[5..], [Value::Text("Lee".into()), Value::Text("Lee".into()), Value::Int(1)]);
+        // The statistics list as text works the same.
+        let text = serde_json::json!({"input": "parcels", "statistics": stats.to_string(), "case": ["zone", "district"], "separator": "/"});
+        assert_eq!(layer(crate::run("summaryStatistics", &m, &text).unwrap()).features, out.features);
+        // COUNT and UNIQUE of a text field leave out its nulls.
+        let owners = serde_json::json!({"input": "parcels", "statistics": [{"field": "owner", "statistic": "COUNT"}, {"field": "owner", "statistic": "UNIQUE"}]});
+        let owners = layer(crate::run("summaryStatistics", &m, &owners).unwrap());
+        assert_eq!((column(&owners, "COUNT_owner"), column(&owners, "UNIQUE_owner")), (vec![Value::Int(5)], vec![Value::Int(4)]));
+        // The statistics list takes precedence over a field.
+        let both = serde_json::json!({"input": "parcels", "statistics": [{"field": "value", "statistic": "SUM"}], "field": "district"});
+        let names = layer(crate::run("summaryStatistics", &m, &both).unwrap()).fields.into_iter().map(|f| f.name).collect::<Vec<_>>();
+        assert_eq!(names, ["FREQUENCY", "SUM_value"]);
+    }
+
+    /// Calls that can't be answered are refused with a message naming the problem.
+    #[test]
+    fn summary_statistics_rejects_bad_requests() {
+        let m = parcels();
+        for (p, says) in [
+            (serde_json::json!({"input": "parcels"}), "give the statistics"),
+            (serde_json::json!({"input": "parcels", "statistics": [{"field": "owner", "statistic": "MEAN"}]}), "needs a numeric field"),
+            (serde_json::json!({"input": "parcels", "statistics": [{"field": "value", "statistic": "TOTAL"}]}), "must be one of"),
+            (serde_json::json!({"input": "parcels", "field": "value", "case": ["zone", "ZONE"]}), "listed twice"),
+            (serde_json::json!({"input": "parcels", "field": "value", "case": "zone, district"}), "no field"),
+            (serde_json::json!({"input": "parcels", "field": "value", "case": "nope"}), "no field"),
+            (
+                serde_json::json!({"input": "parcels", "statistics": [{"field": "owner", "statistic": "CONCATENATE"}], "separator": 1}),
+                "Separator must be text",
+            ),
+            (
+                serde_json::json!({"input": "parcels", "statistics": [{"field": "owner", "statistic": "CONCATENATE"}], "separator": "x".repeat(257)}),
+                "at most 256 bytes",
+            ),
+        ] {
+            let err = crate::run("summaryStatistics", &m, &p).err().unwrap_or_default();
+            assert!(err.contains(says), "{p}: {err}");
+        }
+        // A bad separator is refused without CONCATENATE too, as before Pivot Table shared it.
+        for separator in [serde_json::json!(1), serde_json::json!("x".repeat(257))] {
+            let p = serde_json::json!({"input": "parcels", "field": "value", "separator": separator});
+            assert!(crate::run("summaryStatistics", &m, &p).is_err(), "{p}");
+        }
+        // A case field can't share a name with an output field.
+        // Nor can output fields differ only in case.
+        let fields = vec![
+            Field::new("count_v", FieldType::Text),
+            Field::new("v", FieldType::Double),
+            Field::new("Frequency", FieldType::Text),
+            Field::new("V", FieldType::Double),
+        ];
+        let mut t = Dataset::new("t", GeometryType::None, fields);
+        t.push(None, vec![Value::Text("a".into()), Value::Float(1.0), Value::Text("x".into()), Value::Float(2.0)]);
+        let m = Map(HashMap::from([("t".to_string(), t)]));
+        let mean = |f: &str| serde_json::json!({"field": f, "statistic": "MEAN"});
+        for (p, says) in [
+            (serde_json::json!({"input": "t", "field": "v", "case": "count_v"}), "two fields named 'COUNT_v'"),
+            (serde_json::json!({"input": "t", "field": "v", "case": "Frequency"}), "FREQUENCY field"),
+            (serde_json::json!({"input": "t", "field": "count_v", "case": ["v", "V"]}), "differ only in case"),
+            (serde_json::json!({"input": "t", "statistics": [mean("v"), mean("V")]}), "two fields named 'MEAN_V'"),
+        ] {
+            let err = crate::run("summaryStatistics", &m, &p).err().unwrap_or_default();
+            assert!(err.contains(says), "{p}: {err}");
+        }
+    }
+
+    /// The Tools pane shows Statistics Field only without a statistics list, and Separator only for
+    /// a list with CONCATENATE.
+    #[test]
+    fn summary_statistics_parameters_apply() {
+        let with = |list: &'static str| move |k: &str| if k == "statistics" { list.to_string() } else { String::new() };
+        assert!(param_applies("summaryStatistics", "field", &with("")));
+        assert!(param_applies("summaryStatistics", "field", &with("[]")));
+        assert!(param_applies("summaryStatistics", "field", &with("[{")));
+        assert!(!param_applies("summaryStatistics", "field", &with("[{\"field\": \"v\", \"statistic\": \"SUM\"}]")));
+        assert!(!param_applies("summaryStatistics", "separator", &with("")));
+        assert!(param_applies("summaryStatistics", "separator", &with("[{\"field\": \"v\", \"statistic\": \"concatenate\"}]")));
+        assert!(!param_applies("summaryStatistics", "separator", &with("[{\"field\": \"concatenate_ids\", \"statistic\": \"SUM\"}]")));
+        assert!(!param_applies("summaryStatistics", "separator", &with("[{\"field\": ")));
+    }
+
+    /// Incomes by county and year, one record for each, in long form; `rows` adds records.
+    fn long_incomes(rows: &[(&str, i64, f64)]) -> Map {
+        let fields =
+            vec![Field::new("county", FieldType::Text), Field::new("year", FieldType::Integer), Field::new("income", FieldType::Double)];
+        let mut ds = Dataset::new("long", GeometryType::None, fields);
+        for &(county, year, income) in [("B", 2022, 22.0), ("A", 2021, 11.0), ("B", 2020, 20.0), ("A", 2020, 10.0)].iter().chain(rows) {
+            ds.push(None, vec![Value::Text(county.into()), Value::Int(year), Value::Float(income)]);
+        }
+        Map(HashMap::from([("long".to_string(), ds)]))
+    }
+
+    /// Without a statistic, each value moves to the row of its row fields and the field of its
+    /// pivot value, with the value field's type; a combination without a record is null.
+    #[test]
+    fn pivot_table_reshapes_a_long_table() {
+        let m = long_incomes(&[]);
+        let p = serde_json::json!({"input": "long", "fields": "county", "pivot": "year", "value": "income"});
+        let out = layer(crate::run("pivotTable", &m, &p).unwrap());
+        assert_eq!(out.name, "long_Pivot");
+        assert_eq!(out.geometry_type, GeometryType::None);
+        let names: Vec<&str> = out.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["county", "year2020", "year2021", "year2022"]);
+        assert!(out.fields.iter().skip(1).all(|f| f.ty == FieldType::Double));
+        let (a, b) = (Value::Text("A".into()), Value::Text("B".into()));
+        assert_eq!(column(&out, "county"), [a, b]);
+        assert_eq!(column(&out, "year2020"), [Value::Float(10.0), Value::Float(20.0)]);
+        assert_eq!(column(&out, "year2021"), [Value::Float(11.0), Value::Null]);
+        assert_eq!(column(&out, "year2022"), [Value::Null, Value::Float(22.0)]);
+        // Without row fields there is one row, and `output` names the table.
+        let p = serde_json::json!({"input": "long", "pivot": "county", "value": "income", "statistic": "sum", "output": "totals"});
+        let out = layer(crate::run("pivotTable", &m, &p).unwrap());
+        assert_eq!(out.name, "totals");
+        assert_eq!(out.features.len(), 1);
+        assert_eq!((column(&out, "A"), column(&out, "B")), (vec![Value::Float(21.0)], vec![Value::Float(42.0)]));
+        // An empty table has no rows, even without row fields.
+        let empty = Map(HashMap::from([("long".to_string(), Dataset::new("long", GeometryType::None, out.fields.clone()))]));
+        let p = serde_json::json!({"input": "long", "pivot": "A", "value": "B"});
+        assert_eq!(layer(crate::run("pivotTable", &empty, &p).unwrap()).features.len(), 0);
+    }
+
+    /// Two records for one cell are refused without a statistic, naming the cell; a statistic
+    /// combines them in record order.
+    #[test]
+    fn pivot_table_combines_a_cell_only_with_a_statistic() {
+        let m = long_incomes(&[("A", 2020, 30.0)]);
+        let p = serde_json::json!({"input": "long", "fields": ["county"], "pivot": "year", "value": "income"});
+        let err = crate::run("pivotTable", &m, &p).err().unwrap_or_default();
+        assert!(err.contains("2 records have county = A, year = 2020"), "{err}");
+        for (stat, want) in [("MEAN", Value::Float(20.0)), ("COUNT", Value::Int(2)), ("LAST", Value::Float(30.0))] {
+            let p = serde_json::json!({"input": "long", "fields": "county", "pivot": "year", "value": "income", "statistic": stat});
+            let out = layer(crate::run("pivotTable", &m, &p).unwrap());
+            assert_eq!(column(&out, "year2020").first(), Some(&want), "{stat}");
+            // A cell without records is null, even for COUNT.
+            assert_eq!(column(&out, "year2022").first(), Some(&Value::Null), "{stat}");
+        }
+    }
+
+    /// Aggregating parcels: groups and pivot columns are sorted with nulls first; a cell whose
+    /// records have no value gets the statistic of no values (null, or a COUNT of 0); CONCATENATE
+    /// uses the separator; text values take the statistics that fit text.
+    #[test]
+    fn pivot_table_aggregates_parcels() {
+        let m = parcels();
+        let run = |stat: &str, value: &str| {
+            let p = serde_json::json!({"input": "parcels", "fields": "zone", "pivot": "district", "value": value, "statistic": stat, "separator": "/"});
+            layer(crate::run("pivotTable", &m, &p).unwrap())
+        };
+        let sum = run("SUM", "value");
+        // A bad separator is refused whatever the statistic, as in Summary Statistics.
+        let junk = serde_json::json!({"input": "parcels", "fields": "zone", "pivot": "district", "value": "value", "statistic": "SUM", "separator": 1});
+        assert!(crate::run("pivotTable", &m, &junk).is_err_and(|e| e.contains("Separator must be text")));
+        assert_eq!(column(&sum, "zone"), [Value::Null, Value::Text("C".into()), Value::Text("R".into())]);
+        assert_eq!(column(&sum, "district1"), [Value::Null, Value::Float(400.0), Value::Float(800.0)]);
+        assert_eq!(column(&sum, "district2"), [Value::Null, Value::Null, Value::Float(300.0)]);
+        assert_eq!(column(&sum, "district3"), [Value::Null, Value::Null, Value::Null]);
+        let count = run("COUNT", "value");
+        assert_eq!(count.fields.get(1).map(|f| f.ty), Some(FieldType::Integer));
+        assert_eq!(column(&count, "district3"), [Value::Int(0), Value::Null, Value::Null]);
+        let owners = run("CONCATENATE", "owner");
+        assert_eq!(owners.fields.get(1).map(|f| f.ty), Some(FieldType::Text));
+        assert_eq!(column(&owners, "district1").get(2), Some(&Value::Text("Ali/Ali".into())));
+        assert_eq!(column(&owners, "district2").get(2), Some(&Value::Text("Lee".into())));
+        let err = crate::run(
+            "pivotTable",
+            &m,
+            &serde_json::json!({"input": "parcels", "pivot": "district", "value": "owner", "statistic": "MEAN"}),
+        );
+        assert!(err.is_err_and(|e| e.contains("needs a numeric value field")));
+    }
+
+    /// Field names made from pivot values: numbers follow the pivot field's name, text keeps its
+    /// letters and digits, and names alike in all but case, or taken by a row field, get a suffix
+    /// in the order of the pivot values.
+    #[test]
+    fn pivot_table_names_fields_from_pivot_values() {
+        let fields = vec![Field::new("id", FieldType::Integer), Field::new("kind", FieldType::Text), Field::new("rate", FieldType::Double)];
+        let mut ds = Dataset::new("t", GeometryType::None, fields);
+        let kinds = ["north east", "North-east", "2nd", "!!", "_x_", "id", "é", &"y".repeat(100)];
+        for (i, kind) in kinds.iter().enumerate() {
+            ds.push(None, vec![Value::Int(1), Value::Text((*kind).into()), Value::Float(i as f64)]);
+        }
+        let m = Map(HashMap::from([("t".to_string(), ds)]));
+        let p = serde_json::json!({"input": "t", "fields": "id", "pivot": "kind", "value": "rate"});
+        let out = layer(crate::run("pivotTable", &m, &p).unwrap());
+        let names: Vec<String> = out.fields.iter().map(|f| f.name.clone()).collect();
+        let long = "y".repeat(MAX_PIVOT_NAME);
+        assert_eq!(names, ["id", "kind", "kind2nd", "x", "id_2", "north_east", "North_east_2", &long, "é"]);
+        // The value of "north east" lands under its name.
+        assert_eq!(column(&out, "north_east"), [Value::Float(0.0)]);
+
+        let fields = vec![Field::new("k", FieldType::Text), Field::new("rate", FieldType::Double), Field::new("on", FieldType::Boolean)];
+        let mut ds = Dataset::new("n", GeometryType::None, fields);
+        for (rate, on) in [(2.5, true), (-3.0, false), (1.0, true)] {
+            ds.push(None, vec![Value::Text("a".into()), Value::Float(rate), Value::Bool(on)]);
+        }
+        let m = Map(HashMap::from([("n".to_string(), ds)]));
+        let names = |pivot: &str, value: &str| {
+            let p = serde_json::json!({"input": "n", "pivot": pivot, "value": value, "statistic": "COUNT"});
+            layer(crate::run("pivotTable", &m, &p).unwrap()).fields.into_iter().map(|f| f.name).collect::<Vec<_>>()
+        };
+        assert_eq!(names("rate", "k"), ["rate_3", "rate1", "rate2_5"]);
+        assert_eq!(names("on", "k"), ["onFalse", "onTrue"]);
+        // A long field name keeps every value in its fields' names; a digit of any script starts
+        // a number, so the field's name comes first.
+        let long = "f".repeat(100);
+        assert_eq!(pivot_column_name(&long, &Value::Int(7)), format!("{long}7"));
+        assert_eq!(pivot_column_name("k", &Value::Text("٣rd".into())), "k٣rd");
+        // Decimals are named in full, so values closer than a display's rounding keep their own.
+        assert_eq!(pivot_column_name("rate", &Value::Float(0.000_000_1)), "rate0_0000001");
+        assert_eq!(pivot_column_name("rate", &Value::Float(1.000_000_1)), "rate1_0000001");
+        assert_eq!(pivot_column_name("rate", &Value::Float(1.0)), "rate1");
+        // A run of other characters right after an underscore adds none.
+        assert_eq!(pivot_column_name("k", &Value::Text("North_-east".into())), "North_east");
+        // A cut at a run of other characters leaves no underscore at the end.
+        let cut = format!("{}-b", "a".repeat(MAX_PIVOT_NAME - 1));
+        assert_eq!(pivot_column_name("k", &Value::Text(cut)), "a".repeat(MAX_PIVOT_NAME - 1));
+    }
+
+    /// Calls that can't be answered are refused with a message naming the problem, including a
+    /// pivot field with too many values and an output with too many cells.
+    #[test]
+    fn pivot_table_rejects_bad_requests() {
+        let m = parcels();
+        for (p, says) in [
+            (serde_json::json!({"input": "parcels", "value": "value"}), "'Pivot Field' is required"),
+            (serde_json::json!({"input": "parcels", "pivot": "district"}), "'Value Field' is required"),
+            (serde_json::json!({"input": "parcels", "pivot": " ", "value": "value"}), "'Pivot Field' is required"),
+            (serde_json::json!({"input": "parcels", "pivot": 2020, "value": "value"}), "'Pivot Field' must be a field name"),
+            (serde_json::json!({"input": "parcels", "pivot": "district", "value": "value", "statistic": 7}), "Statistic must be text"),
+            (serde_json::json!({"input": "parcels", "pivot": "district", "value": ["value"]}), "'Value Field' must be a field name"),
+            (
+                serde_json::json!({"input": "parcels", "fields": ["district"], "pivot": "DISTRICT", "value": "value"}),
+                "can't also be a row field",
+            ),
+            (serde_json::json!({"input": "parcels", "pivot": "zone", "value": "value", "statistic": "SUM"}), "has no value in 1 record:"),
+            (serde_json::json!({"input": "parcels", "pivot": "district", "value": "value", "statistic": "TOTAL"}), "must be one of"),
+            (serde_json::json!({"input": "parcels", "pivot": "nope", "value": "value"}), "no field"),
+            (serde_json::json!({"input": "parcels", "fields": ["zone", "Zone"], "pivot": "district", "value": "value"}), "listed twice"),
+            (serde_json::json!({"input": "parcels", "fields": 3, "pivot": "district", "value": "value"}), "Row Field must be"),
+            (
+                serde_json::json!({"input": "parcels", "pivot": "district", "value": "owner", "statistic": "CONCATENATE", "separator": 1}),
+                "Separator must be text",
+            ),
+        ] {
+            let err = crate::run("pivotTable", &m, &p).err().unwrap_or_default();
+            assert!(err.contains(says), "{p}: {err}");
+        }
+        let fields = vec![Field::new("k", FieldType::Integer), Field::new("p", FieldType::Integer)];
+        let mut ds = Dataset::new("big", GeometryType::None, fields);
+        for i in 0..=MAX_PIVOT_CELLS / MAX_PIVOT_COLUMNS {
+            ds.push(None, vec![Value::Int(i as i64), Value::Int((i % MAX_PIVOT_COLUMNS) as i64)]);
+        }
+        let m = Map(HashMap::from([("big".to_string(), ds)]));
+        let p = serde_json::json!({"input": "big", "pivot": "k", "value": "p", "statistic": "COUNT"});
+        let err = crate::run("pivotTable", &m, &p).err().unwrap_or_default();
+        assert!(err.contains("more than 1000 fields"), "{err}");
+        let p = serde_json::json!({"input": "big", "fields": "k", "pivot": "p", "value": "k", "statistic": "COUNT"});
+        let err = crate::run("pivotTable", &m, &p).err().unwrap_or_default();
+        assert!(err.contains("10001 rows by 1001 fields would make more than 10000000 values"), "{err}");
+    }
+
+    /// The Tools pane shows Pivot Table's separator only for CONCATENATE.
+    #[test]
+    fn pivot_table_separator_applies_to_concatenate() {
+        let with = |stat: &'static str| move |k: &str| if k == "statistic" { stat.to_string() } else { String::new() };
+        assert!(param_applies("pivotTable", "separator", &with(" concatenate ")));
+        assert!(!param_applies("pivotTable", "separator", &with("")));
+        assert!(!param_applies("pivotTable", "separator", &with("COUNT")));
     }
 
     #[test]

@@ -9,6 +9,8 @@ pub mod cmd;
 pub mod connections;
 pub mod geometry_calc;
 pub mod model;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod prefs;
 pub mod project;
 pub mod s3_connections;
 pub mod s3_keys;
@@ -554,11 +556,11 @@ pub struct Session {
     /// The PostGIS database that layers loaded for editing work with (`pg.connect`): its
     /// connection, never with its password. Kept for the session, not in the project.
     pub postgis: Option<String>,
-    /// The PostGIS layers' row versions that `pg.saveEdits` saved over: a layer back on one
+    /// Source layers' row versions that `pg.saveEdits` or `gpkg.saveEdits` saved over: a layer back on one
     /// (undone, or restored by a failed command, past a save) would write its edits again.
     /// Outside the project, so undo keeps it.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub(crate) pg_saved_over: Vec<rustgis_map::source::Versions>,
+    pub(crate) saved_over: Vec<rustgis_map::source::Versions>,
     /// The feature cache fills itself after projection changes (Data › Feature Cache).
     pub auto_cache: bool,
     /// Mensuration results (Analyze › Mensuration › Results).
@@ -716,22 +718,25 @@ fn edited_streamed(before: &Project, after: &Project) -> Option<String> {
     None
 }
 
-/// New features of a layer loaded from PostGIS never keep the key of a row it loaded (one
+/// New features of a layer loaded for source editing never keep the key of a row it loaded (one
 /// deleted since, whose id an editing tool can hand out again): saved, they would be that row,
 /// changed. They take ids past every key instead. Layers whose rows were loaded or saved again by
 /// the command (their versions replaced) are left alone.
-fn fresh_postgis_ids(before: &Project, after: &mut Project) {
+fn fresh_source_ids(before: &Project, after: &mut Project) {
     for (mb, ma) in before.maps.iter().zip(after.maps.iter_mut()) {
         for la in ma.layers.iter_mut() {
-            let Some(pg) = &la.postgis else { continue };
+            let Some(versions) = la.edit_versions() else { continue };
             let Some(lb) = mb.layers.iter().find(|l| l.id == la.id) else { continue };
-            let same_rows = lb.postgis.as_ref().is_some_and(|b| b.versions.shares(&pg.versions));
+            let same_rows = lb.edit_versions().is_some_and(|b| b.shares(versions));
             if !same_rows || la.dataset.features.shares(&lb.dataset.features) {
                 continue;
             }
+            // A layer bound to both sources (a hand-made project) reserves both baselines' keys.
+            let also = la.postgis.as_ref().and(la.gpkg.as_ref()).map(|g| &g.versions);
+            let loaded = |id: u64| versions.get(id).is_some() || also.is_some_and(|v| v.get(id).is_some());
             let had: std::collections::HashSet<u64> = lb.dataset.features.iter().map(|f| f.id).collect();
             let reused: Vec<usize> = (0..la.dataset.features.len())
-                .filter(|&i| la.dataset.features.get(i).is_some_and(|f| !had.contains(&f.id) && pg.versions.get(f.id).is_some()))
+                .filter(|&i| la.dataset.features.get(i).is_some_and(|f| !had.contains(&f.id) && loaded(f.id)))
                 .collect();
             if reused.is_empty() {
                 continue;
@@ -742,7 +747,8 @@ fn fresh_postgis_ids(before: &Project, after: &mut Project) {
                 .features
                 .iter()
                 .map(|f| f.id)
-                .chain(pg.versions.iter().map(|(k, _)| k))
+                .chain(versions.iter().map(|(k, _)| k))
+                .chain(also.into_iter().flat_map(|v| v.iter().map(|(k, _)| k)))
                 .filter(|&k| k.cast_signed() >= 0)
                 .max()
                 .unwrap_or(0);
@@ -824,7 +830,7 @@ impl Session {
             measurements: Vec::new(),
             auto_cache: false,
             postgis: None,
-            pg_saved_over: Vec::new(),
+            saved_over: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             merge: None,
@@ -915,7 +921,9 @@ impl Session {
     /// requests the next is refused rather than silently dropping one already promised.
     pub fn request_url(&mut self, p: &serde_json::Value) -> Result<serde_json::Value, String> {
         let url = p.get("url").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        if !self.url_requests.iter().any(|q| q.get("url").and_then(serde_json::Value::as_str) == Some(url.as_str())) {
+        if !self.url_requests.iter().any(|q| {
+            q.get("url").and_then(serde_json::Value::as_str) == Some(url.as_str()) && q.get("geolibreLayer") == p.get("geolibreLayer")
+        }) {
             if self.url_requests.len() >= MAX_URL_REQUESTS {
                 return Err(format!("{url}: {MAX_URL_REQUESTS} downloads are already waiting; try again when they have landed"));
             }
@@ -1021,6 +1029,12 @@ impl Session {
         }
         self.merge = merge;
         let res = self.guarded(label, mutates, |s| run(s, params));
+        if id == "layer.addDownload"
+            && res.is_ok()
+            && let Some(token) = params.get("geolibreLayer").and_then(|v| v.get("token")).and_then(serde_json::Value::as_str)
+        {
+            self.retire_import_history(token);
+        }
         // What was added, for the Data Sources pane's Recent list.
         if res.is_ok()
             && let Some(src) = sources::added_by(id, params)
@@ -1028,6 +1042,16 @@ impl Session {
             self.sources.note(src);
         }
         res
+    }
+
+    /// Retires only this consumed reservation, preserving unrelated pending imports in history.
+    pub(crate) fn retire_import_history(&mut self, token: &str) {
+        if token.is_empty() {
+            return;
+        }
+        for (project, ..) in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            project.discard_import_reservation(token);
+        }
     }
 
     /// Why a command can't run on `layer`: it edits features, and the layer is read in place from
@@ -1086,7 +1110,7 @@ impl Session {
             // session's own flag says so, not the answer, which a plugin's command could forge.
             (Ok(_), Some(_)) if std::mem::take(&mut self.request_only) => {}
             (Ok(_), Some(mut snap)) => {
-                fresh_postgis_ids(&snap, &mut self.project);
+                fresh_source_ids(&snap, &mut self.project);
                 // An edit may change the dates the time slider's window filters on: bound layers
                 // whose features or fields the command changed (features are shared with the
                 // snapshot until written) take the window again.

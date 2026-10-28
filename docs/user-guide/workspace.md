@@ -71,6 +71,45 @@ replace the first one's copy; it says so as it starts. Nor does RustGIS autosave
 folder can't lock files (some network or synced folders), where it can't tell a second copy apart.
 The browser app doesn't autosave yet; it warns before you leave a page with unsaved changes.
 
+### GeoLibre projects
+
+**Open** on desktop or **Project › New › GeoLibre Project…** opens a `.geolibre` or legacy
+`.geolibre.json` file as a new map in the current project. Existing maps stay in place.
+The same import is available to scripts:
+
+```text
+project.importGeolibre={"path":"watershed.geolibre"}
+project.importGeolibre={"url":"https://example.org/watershed.geolibre"}
+```
+
+The command also accepts JSON `text`, base64 `data`, and `dir` for moved local data files.
+An absolute data path is tried first, then its filename under `dir` (the project's folder by
+default). A desktop project may reference files outside that folder; import projects you trust
+to select those files. Browser imports can use inline GeoJSON and web addresses; local paths need desktop.
+A web app link such as `?project=https://example.org/watershed.geolibre` imports the same map.
+This startup link takes precedence over other data/style links so download timing cannot change
+which map receives them.
+
+The map keeps its view, bookmarks, background, layer visibility and opacity, and supported vector
+styles and field labels. The result includes `map`, `layers` and per-layer `notes`, distinguishing
+approximated presentation from skipped sources. Newer format versions are read as far as possible
+with a note. Unsupported layer kinds and project sections are reported rather than silently lost.
+
+Colour classes and proportional sizes are supported separately. Combined colour-and-size styles
+keep colour and use a fixed size; graduated colour class boundaries are retained; proportional
+sizes use RustGIS's area scaling. Label halos use RustGIS defaults. Tile overlays draw above feature
+layers, and nested groups become flat folders with inherited visibility and opacity retained.
+Local data paths require a locally opened project or an explicit `dir`; URL and pasted-text imports cannot read local files without that folder.
+URL data downloaded in the browser fills its reserved layer position when it arrives; wait for
+those downloads before saving. Saving is refused while imported layers are still downloading. Recovery copies retain completed work and omit unfinished layers. A browser import can queue at most 16 whole-file downloads
+(fewer if other downloads are queued, active, or awaiting completion); a larger batch is refused before creating its map.
+Split that project into smaller imports or use the desktop app. Streaming tiles and COGs do
+not consume those download slots. Desktop GeoLibre URL imports wait for each download on the calling thread, which can pause the interface.
+Each request, including a remote MBTiles archive, has a 60-second timeout; download larger archives locally before importing. Zarr sources use their saved variable and dimension indices,
+or the first supported variable when those choices are absent. Imported Zarr stores are read
+one at a time with a 128 MiB download-buffer limit; larger slices must be reduced or opened
+through the desktop data workflow.
+
 ### QGIS projects and styles
 
 A QGIS project (`.qgs`, or a `.qgz` archive) opens as a new map of the current project: **Open**
@@ -169,6 +208,19 @@ is available; unavailable commands stay visible but disabled, with the reason on
 Use scripts or the assistant for parameterized commands without an interactive entry point.
 
 ## Keyboard shortcuts
+
+**Settings › Customize › Keyboard Shortcuts** assigns multiple keys to commands and map tools.
+Click **Add…** and press the desired key combination. Escape cancels; **Assign Escape** binds Escape.
+If the combination is already in use, choose **Replace** or **Cancel**.
+Tab, Enter, Space and arrow key bindings can override their usual keyboard navigation actions.
+Click a displayed key to remove it, **Reset {key}** (for example, **Reset Ctrl+T**) to restore a default key, or **Reset All** to restore
+all defaults. These changes are saved as a user preference on this device. Copy, Cut and Paste stay
+fixed. While typing, shortcuts without Ctrl/⌘ are paused, including Shift and Alt combinations. During
+first-person navigation, unmodified shortcuts are paused except Escape, Home and Delete. Browsers may
+reserve some shortcuts. In Command Search, right-click a command and choose **Keyboard Shortcuts**
+to open it in the editor. If saved preferences are unreadable or exceed the supported limits, the
+original value is preserved and edits apply only to the current session. **Reset All** explicitly
+replaces the saved shortcuts with the defaults.
 
 See the [keyboard shortcut reference](index.md#keyboard-shortcuts) for project, map and editing
 shortcuts, macOS bindings and text-field undo behavior. **Help › Shortcuts** lists the active

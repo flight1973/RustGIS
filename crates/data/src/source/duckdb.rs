@@ -211,6 +211,24 @@ pub(crate) fn remembered_password(dsn: &str) -> Option<String> {
     lock().get(dsn).map(|e| e.password.expose().to_string())
 }
 
+/// The password a database client's own environment variable gives for `kind` (`postgres`:
+/// `PGPASSWORD`, `mysql`: `MYSQL_PWD`, `sqlserver`: `SQLCMDPASSWORD`); an empty one is none. The
+/// one rule the drivers' explicit connections and the saved connections share, so an ambient
+/// password ranks the same wherever it is asked for.
+pub fn ambient_password(kind: &str) -> Option<String> {
+    ambient_password_in(kind, |name| std::env::var(name).ok())
+}
+
+fn ambient_password_in(kind: &str, get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let variable = match kind {
+        "postgres" => "PGPASSWORD",
+        "mysql" => "MYSQL_PWD",
+        "sqlserver" => "SQLCMDPASSWORD",
+        _ => return None,
+    };
+    get(variable).filter(|p| !p.is_empty())
+}
+
 /// Whether a password is remembered for a connection this session, typed or activated.
 pub fn has_password(dsn: &str) -> bool {
     lock().contains_key(dsn)
@@ -869,6 +887,22 @@ fn ours(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each kind reads only its own client's variable, and an empty one is none (a fake
+    /// environment: the process's is never changed).
+    #[test]
+    fn ambient_password_follows_each_clients_variable() {
+        let env = |name: &str| match name {
+            "PGPASSWORD" => Some("pg-env".to_string()),
+            "MYSQL_PWD" => Some("my-env".to_string()),
+            "SQLCMDPASSWORD" => Some(String::new()),
+            _ => None,
+        };
+        assert_eq!(ambient_password_in("postgres", env).as_deref(), Some("pg-env"));
+        assert_eq!(ambient_password_in("mysql", env).as_deref(), Some("my-env"));
+        assert_eq!(ambient_password_in("sqlserver", env), None);
+        assert_eq!(ambient_password_in("s3", env), None);
+    }
 
     #[test]
     fn refused_password_does_not_restore_over_a_newer_login_or_forget() {

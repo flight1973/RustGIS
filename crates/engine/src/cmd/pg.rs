@@ -65,29 +65,10 @@ fn postgis_layer(s: &Session, p: &Value) -> Result<(u32, String, rustgis_map::so
     Ok((id, l.name.clone(), edit))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-/// The rows of `features` that are loaded rows, with their versions and what they hold now:
-/// the new baseline after a save (`saved`: the versions written) or a load.
-fn versions_of(
-    features: &[rustgis_data::Feature],
-    old: &rustgis_map::source::Versions,
-    saved: &std::collections::HashMap<u64, i64>,
-) -> rustgis_map::source::Versions {
-    use rustgis_map::source::{RowVersion, row_hash};
-    let mut seen = std::collections::HashSet::new();
-    features
-        .iter()
-        .filter_map(|f| {
-            let version = saved.get(&f.id).copied().or_else(|| old.get(f.id).map(|r| r.version))?;
-            seen.insert(f.id).then(|| (f.id, RowVersion { version, hash: row_hash(f) }))
-        })
-        .collect()
-}
-
 fn pending_edits(s: &mut Session, p: &Value) -> CmdResult {
     let (id, name, edit) = postgis_layer(s, p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
-    let c = edit.changes(&l.dataset.features);
+    let c = edit.versions.changes(&l.dataset.features);
     Ok(serde_json::json!({
         "layer": name,
         "table": edit.origin.table,
@@ -109,7 +90,7 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         use rustgis_data::source::{duckdb::Database, postgis};
         let (id, name, edit) = postgis_layer(s, p)?;
         let l = s.map().layer(id).ok_or("no such layer")?;
-        let changes = edit.changes(&l.dataset.features);
+        let changes = edit.versions.changes(&l.dataset.features);
         let fields = l.dataset.fields.clone();
         if changes.is_empty() {
             s.notify(format!("{name}: no edits to save"), false);
@@ -118,7 +99,7 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         let table = edit.origin.table.clone();
         // Undone past a save: the database holds those edits already, and its new rows would be
         // inserted again.
-        if s.pg_saved_over.iter().any(|v| v.shares(&edit.versions)) {
+        if s.saved_over.iter().any(|v| v.shares(&edit.versions)) {
             return Err(format!(
                 "{name}: the layer is back before an edit saved to {table} (undone), so nothing was saved. Discard Edits loads the rows as they are now"
             ));
@@ -139,7 +120,7 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         let t = postgis::find_table(&conn, &table).map_err(err)?;
         let src = postgis::PostgisSource::open(conn, t, edit.origin.family, edit.origin.crs.as_deref()).map_err(err)?;
         let rows = changes.insert_rows.clone();
-        let edits = postgis::Edits { updates: changes.updates, deletes: changes.deletes, inserts: changes.inserts };
+        let edits = rustgis_data::source::edits::Edits { updates: changes.updates, deletes: changes.deletes, inserts: changes.inserts };
         let saved = match src.save(&edits, &fields).map_err(err)? {
             Ok(saved) => saved,
             Err(conflicts) => {
@@ -167,14 +148,14 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
                     }
                 }
             }
-            let baseline = versions_of(&l.dataset.features, &edit.versions, &versions);
+            let baseline = rustgis_map::source::versions_of(&l.dataset.features, &edit.versions, &versions);
             if let Some(pg) = l.postgis.as_mut() {
                 pg.versions = baseline;
             }
         }
         // The versions saved over, while an undo step can bring them back.
-        s.pg_saved_over.retain(rustgis_map::source::Versions::held_elsewhere);
-        s.pg_saved_over.push(edit.versions);
+        s.saved_over.retain(rustgis_map::source::Versions::held_elsewhere);
+        s.saved_over.push(edit.versions);
         s.notify(
             format!("{name}: saved to {table}: {} new, {} changed, {} deleted", saved.inserted.len(), saved.updated, saved.deleted),
             false,
@@ -223,7 +204,7 @@ fn discard_edits(s: &mut Session, p: &Value) -> CmdResult {
         l.dataset.features = editable.features.into();
         l.selection.clear();
         l.touch_geometry();
-        let baseline = versions_of(&l.dataset.features, &Default::default(), &read);
+        let baseline = rustgis_map::source::versions_of(&l.dataset.features, &Default::default(), &read);
         if let Some(pg) = l.postgis.as_mut() {
             pg.versions = baseline;
             pg.writable = editable.writable;
@@ -393,7 +374,7 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
             ds.crs = u32::try_from(src.srid()).ok().filter(|&c| c != 0 && c != 4326).and_then(rustgis_data::raster::Crs::from_epsg);
             let n = editable.features.len() as u64;
             let read: std::collections::HashMap<u64, i64> = editable.versions.iter().copied().collect();
-            let versions = versions_of(&editable.features, &Default::default(), &read);
+            let versions = rustgis_map::source::versions_of(&editable.features, &Default::default(), &read);
             ds.features = editable.features.into();
             if n < editable.matched {
                 s.notify(

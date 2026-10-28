@@ -326,16 +326,60 @@ fn read(url: &str, at: u64, len: u64, done: Done) {
 }
 
 /// Reads a file's header (then its stretch): the start, then whatever more the IFDs need.
+///
+/// A file an API makes on request (an address not named `.tif`, such as Vantor's
+/// `…/geotiff?…`) is asked for its headers first: one that says how long its TIFF header is
+/// (`X-TIFF-Header-Length`) has it read in one request. One that says it is JSON, text or a page
+/// and doesn't say it answers ranges isn't read as a GeoTIFF at all (a server ignoring the range
+/// would send its whole answer); a GeoTIFF mislabelled so on a server that answers ranges is still
+/// read. Without an answer, the first [`HEAD`] bytes are read as for any other file.
 fn load(url: String, done: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
     if let Err(e) = crate::address::check(&url, None) {
         done(Err(e));
         return;
     }
+    if named_tiff(&url) {
+        return read_header(url, HEAD, done);
+    }
+    let u = url.clone();
+    crate::cache::head(
+        &url,
+        Box::new(move |h| {
+            let h = h.unwrap_or_default();
+            if h.content_type.as_deref().is_some_and(not_tiff_type) && !h.accepts_ranges && h.tiff_header_length.is_none() {
+                return done(Err(format!("{u}: not a GeoTIFF")));
+            }
+            read_header(u, header_length(h.tiff_header_length), done);
+        }),
+    );
+}
+
+/// Whether an address is named as a TIFF (its path's extension).
+fn named_tiff(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    path.ends_with(".tif") || path.ends_with(".tiff")
+}
+
+/// Whether a `Content-Type` is plainly not a TIFF: JSON, text, a page or XML (a service's error,
+/// a feature collection). Anything else, `application/octet-stream` included, is read to see.
+fn not_tiff_type(content_type: &str) -> bool {
+    let t = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    t.starts_with("text/") || t.ends_with("json") || t.ends_with("xml") || t.ends_with("+json")
+}
+
+/// The first read of a file whose server announced its TIFF header's length: that much (one
+/// request), bounded as any header read; [`HEAD`] without an announcement.
+fn header_length(announced: Option<u64>) -> u64 {
+    announced.filter(|n| *n >= 8).map_or(HEAD, |n| n.min(cog::MAX_HEADER).min(MAX_BYTES as u64))
+}
+
+/// Reads a file's first `len` bytes, then whatever more the IFDs need.
+fn read_header(url: String, len: u64, done: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
     let u = url.clone();
     read(
         &url,
         0,
-        HEAD,
+        len,
         Box::new(move |r| match r {
             Ok(b) if cog::is_tiff(&b) => step(u, Sparse::default().with(0, b), 0, done),
             Ok(_) => done(Err(format!("{u}: not a GeoTIFF"))),
@@ -1164,6 +1208,22 @@ pub fn read_values_blocking(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn announced_header_lengths_and_types() {
+        use super::{HEAD, header_length, named_tiff, not_tiff_type};
+        assert_eq!(header_length(Some(8192)), 8192);
+        assert_eq!(header_length(None), HEAD);
+        assert_eq!(header_length(Some(4)), HEAD, "too short for a TIFF header");
+        assert_eq!(header_length(Some(u64::MAX)), crate::cache::MAX_BYTES as u64, "bounded as any read");
+        for t in ["application/json", "application/geo+json; charset=utf-8", "text/html", "application/xml", "TEXT/PLAIN"] {
+            assert!(not_tiff_type(t), "{t}");
+        }
+        for t in ["image/tiff", "image/tiff; application=geotiff", "application/octet-stream", ""] {
+            assert!(!not_tiff_type(t), "{t}");
+        }
+        assert!(named_tiff("https://x.org/a/scene.TIF?sig=1") && !named_tiff("https://x.org/a/geotiff?f=tif"));
+    }
+
     use super::*;
 
     #[test]

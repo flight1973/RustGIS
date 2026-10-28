@@ -135,14 +135,17 @@ opens, and writes MapLibre styles and OGC API Features collections for the web.
 
 Stated plainly, so the tables above are worth trusting:
 
-- **Format breadth.** PostgreSQL/PostGIS, MySQL/MariaDB and SQL Server/Azure SQL are read only,
-  and these live connections and DuckDB files are desktop only. The web app doesn't write
-  GeoPackages. The native File Geodatabase reader is 2D and does not read compressed tables,
+- **Format breadth.** MySQL/MariaDB and SQL Server/Azure SQL are read only;
+  PostGIS and GeoPackage support table write-back on desktop. Live database connections and
+  DuckDB files are desktop only. The web app doesn't write GeoPackages.
+  The native File Geodatabase reader is 2D and does not read compressed tables,
   raster fields or sparse row layouts; GDAL can fill these gaps on desktop. DWG and rasters
   such as JPEG 2000, NetCDF and HDF also need GDAL. SQL queries need DuckDB; both are external programs.
 - **Coordinate systems.** Vector data is stored in longitude/latitude; there is no full PROJ.
-- **Editing depth.** Vertex move, insert and delete are supported, but not versioned or
-  multi-user database editing. Edits are kept in the project and exported, not written back to databases.
+- **Editing depth.** Vertex move, insert and delete are supported, but not versioned multi-user
+  database editing. Desktop GeoPackage and PostGIS layers loaded for editing
+  can save back to their source tables with row-conflict checks; other edits stay in the project
+  until exported.
 - **Specialized analysis.** Built-in spatial joins, overlays (intersect, identity, union) and
   shortest paths on line networks are available, but full network datasets and advanced spatial
   statistics depend on the external suite or another GIS.

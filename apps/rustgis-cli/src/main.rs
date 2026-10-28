@@ -8,6 +8,7 @@
 //! rustgis-cli run [--sample | --project p.rgis | --data f.geojson …] \
 //!     --cmd 'gp.run={"tool":"buffer","params":{"input":"Cities","distance":100}}' \
 //!     --cmd 'share.exportMap={"path":"out.png"}' [--save out.rgis]
+//! rustgis-cli run … --use-saved-secrets            # use what the desktop app saved in the system keychain
 //! rustgis-cli ask [--sample | --project p.rgis | --data f.geojson …] "Which cities have over 10 million people?" \
 //!     [--provider anthropic|openai|chatgpt|gemini|openrouter|ollama|custom] [--model M] [--base-url URL] [--yes] [--save out.rgis] [--trace log.txt]
 //! rustgis-cli ask --models [--provider P]                # list the provider's models
@@ -38,12 +39,14 @@ macro_rules! out {
     }};
 }
 
+use rustgis_assistant::{Config, provider};
+use rustgis_engine::data::secrets::SecretStore;
 use rustgis_engine::{Project, Session};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage:\n  rustgis-cli commands | tools\n  rustgis-cli plugins [install <file|folder> | uninstall <id> | enable <id> | disable <id> | browse | get <id> | prepare <id>] [--registry URL]\n  rustgis-cli skills [add <SKILL.md|folder|.zip> | remove <name> | enable <name> | disable <name>]\n  rustgis-cli info <data>\n  rustgis-cli logo <out.png|out.ico|out.bmp> [--size N] [--canvas WxH --at X,Y (.bmp only)]\n  rustgis-cli render <data|project> <out.png> [--basemap NAME] [--tiles URL] [--width N] [--height N] [--dpi N] [--worldview auto|default|china]\n  rustgis-cli run [--sample] [--project P] [--data F]… --cmd 'id={{json}}'… [--save P] [--worldview auto|default|china]\n  rustgis-cli ask [--sample] [--project P] [--data F]… \"request\" [--provider P] [--model M] [--base-url URL] [--yes] [--save P]\n  rustgis-cli ask --models [--provider P]\n  rustgis-cli ask --login [--another-account] [--account CLIENT_ID] | --logout\n  rustgis-cli ask --accounts | --account CLIENT_ID | --remove-account CLIENT_ID\n  rustgis-cli mcp [--sample] [--project P] [--data F]… [--yes] [--attach [PORT] [--token-file FILE] [--timeout SECONDS (5-600)]]\n  rustgis-cli mcp-register [--client claude] [--name NAME] [--port PORT]"
+        "usage:\n  rustgis-cli commands | tools\n  rustgis-cli plugins [install <file|folder> | uninstall <id> | enable <id> | disable <id> | browse | get <id> | prepare <id>] [--registry URL]\n  rustgis-cli skills [add <SKILL.md|folder|.zip> | remove <name> | enable <name> | disable <name>]\n  rustgis-cli info <data>\n  rustgis-cli logo <out.png|out.ico|out.bmp> [--size N] [--canvas WxH --at X,Y (.bmp only)]\n  rustgis-cli render <data|project> <out.png> [--basemap NAME] [--tiles URL] [--width N] [--height N] [--dpi N] [--worldview auto|default|china]\n  rustgis-cli run [--sample] [--project P] [--data F]… --cmd 'id={{json}}'… [--save P] [--worldview auto|default|china]\n  rustgis-cli ask [--sample] [--project P] [--data F]… \"request\" [--provider P] [--model M] [--base-url URL] [--yes] [--save P]\n  rustgis-cli ask --models [--provider P]\n  rustgis-cli ask --login [--another-account] [--account CLIENT_ID] | --logout\n  rustgis-cli ask --accounts | --account CLIENT_ID | --remove-account CLIENT_ID\n  common options: --use-saved-secrets (use the connections, passwords, keys and ChatGPT sign-in the RustGIS app saved; reads the system keychain)\n  rustgis-cli mcp [--sample] [--project P] [--data F]… [--yes] [--attach [PORT] [--token-file FILE] [--timeout SECONDS (5-600)]]\n  rustgis-cli mcp-register [--client claude] [--name NAME] [--port PORT]"
     );
     ExitCode::from(2)
 }
@@ -182,9 +185,70 @@ fn skills(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// What `--use-saved-secrets` gave this run: the desktop app's preferences (read once, when it
+/// opted in) and its system keychain, which is asked only when a request needs a secret.
+struct Saved {
+    prefs: Map<String, Value>,
+    store: std::sync::Arc<dyn SecretStore>,
+}
+
+/// What `ask` takes from the process environment; tests supply their own.
+struct Environment {
+    /// `RUSTGIS_ASSISTANT_PROVIDER`.
+    provider: Option<String>,
+    /// `RUSTGIS_ASSISTANT_MODEL`.
+    model: Option<String>,
+    /// A provider's defaults with the environment's key and address (`Config::from_env`).
+    config: fn(&str) -> Config,
+}
+
+impl Environment {
+    fn process() -> Self {
+        Environment {
+            provider: std::env::var("RUSTGIS_ASSISTANT_PROVIDER").ok(),
+            model: std::env::var("RUSTGIS_ASSISTANT_MODEL").ok(),
+            config: Config::from_env,
+        }
+    }
+}
+
+/// The provider to use: `--provider`, `RUSTGIS_ASSISTANT_PROVIDER`, the first provider with an
+/// environment key and, with `--use-saved-secrets`, the one the desktop app uses, else `ollama`.
+fn choose_provider(args: &[String], env: &Environment, saved: Option<&Saved>) -> String {
+    provider::choose(opt(args, "--provider"), env.provider.as_deref(), provider::first_keyed(env.config), saved.map(|s| &s.prefs))
+}
+
+/// Builds a request's configuration without reading unrelated credentials during management.
+/// A prompt may use the desktop's API key for its provider and address; model listing uses
+/// only environment API keys, so `--models` never prompts for a saved API key.
+fn configuration(provider: &str, args: &[String], env: &Environment, saved: Option<&Saved>) -> Config {
+    let mut cfg = (env.config)(provider);
+    if cfg.login()
+        && let Some(c) = rustgis_assistant::chatgpt::load_any()
+    {
+        cfg.sign_in(&c);
+    }
+    if let Some(m) = opt(args, "--model").map(str::to_string).or_else(|| env.model.clone()) {
+        cfg.model = m;
+    }
+    if let Some(u) = opt(args, "--base-url") {
+        cfg.base_url = u.to_string();
+    }
+    // An `Err` is ignored: the keychain's wrapper has already said once that it can't be used.
+    if !args.iter().any(|arg| arg == "--models")
+        && let Some(saved) = saved
+        && let Ok(Some(key)) = provider::saved_key(&cfg, &saved.prefs, saved.store.as_ref())
+    {
+        cfg.key = key.expose().to_string();
+    }
+    cfg
+}
+
+const NEEDS_REQUEST: &str = "ask needs a request, e.g. rustgis-cli ask --sample \"Which countries have the largest GDP?\"";
+
 /// `ask "<request>"`: one conversation turn with the AI assistant, which acts on the project.
-fn ask(s: &mut Session, args: &[String]) -> Result<(), String> {
-    use rustgis_assistant::{Agent, Config, Entry, agent, http, provider};
+fn ask(s: &mut Session, args: &[String], saved: Option<&Saved>, env: &Environment) -> Result<(), String> {
+    use rustgis_assistant::{Agent, Entry, agent, http};
     // The first value that isn't an option's.
     let takes_value = [
         "--provider",
@@ -206,14 +270,7 @@ fn ask(s: &mut Session, args: &[String]) -> Result<(), String> {
         .skip(1)
         .find(|(i, a)| !a.starts_with("--") && !args.get(i - 1).is_some_and(|p| takes_value.contains(&p.as_str())))
         .map(|(_, a)| a.clone());
-    let provider = opt(args, "--provider")
-        .map(str::to_string)
-        .or_else(|| std::env::var("RUSTGIS_ASSISTANT_PROVIDER").ok())
-        .or_else(|| {
-            // The first provider with a key in the environment (a ChatGPT sign-in is chosen, not assumed).
-            provider::PRESETS.iter().find(|p| !p.login && !Config::from_env(p.id).key.is_empty()).map(|p| p.id.to_string())
-        })
-        .unwrap_or_else(|| "ollama".into());
+    let provider = choose_provider(args, env, saved);
     if provider::preset(&provider).is_none() {
         let ids: Vec<&str> = provider::PRESETS.iter().map(|p| p.id).collect();
         return Err(format!("unknown provider '{provider}' (one of {})", ids.join(", ")));
@@ -255,18 +312,7 @@ fn ask(s: &mut Session, args: &[String]) -> Result<(), String> {
         eprintln!("removed {}", c.label());
         return Ok(());
     }
-    let mut cfg = Config::from_env(&provider);
-    if cfg.login()
-        && let Some(c) = rustgis_assistant::chatgpt::load_any()
-    {
-        cfg.sign_in(&c);
-    }
-    if let Some(m) = opt(args, "--model").map(str::to_string).or_else(|| std::env::var("RUSTGIS_ASSISTANT_MODEL").ok()) {
-        cfg.model = m;
-    }
-    if let Some(u) = opt(args, "--base-url") {
-        cfg.base_url = u.to_string();
-    }
+    let models = args.iter().any(|a| a == "--models");
     if args.iter().any(|a| a == "--logout") {
         use rustgis_assistant::chatgpt;
         let out = chatgpt::sign_out()?;
@@ -306,10 +352,21 @@ fn ask(s: &mut Session, args: &[String]) -> Result<(), String> {
         let who = if c.email.is_empty() { "your ChatGPT account" } else { c.email.as_str() };
         eprintln!("signed in as {who}; RustGIS now uses your ChatGPT plan (manage usage at {})", chatgpt::USAGE_URL);
         if c.kept == chatgpt::Kept::Session {
-            eprintln!("this sign-in isn't remembered: the command line can't use the system keychain, so it lasts for this command only");
+            if saved.is_none() {
+                eprintln!(
+                    "this sign-in isn't remembered: it lasts for this command only (pass --use-saved-secrets to keep it in the system keychain)"
+                );
+            } else {
+                eprintln!("the system keychain didn't keep this sign-in, so it lasts for this command only");
+            }
         }
         return Ok(());
     }
+    // Account management is done. Read a saved API key only for a prompt, not model listing.
+    if !models && prompt.is_none() {
+        return Err(NEEDS_REQUEST.into());
+    }
+    let mut cfg = configuration(&provider, args, env, saved);
     // A signed-in account's requests renew its tokens as needed.
     // Without a usable sign-in, say how to sign in before asking for anything.
     if cfg.login()
@@ -331,7 +388,7 @@ fn ask(s: &mut Session, args: &[String]) -> Result<(), String> {
         if models.is_empty() {
             return Err("no models are available for this account".into());
         }
-        let explicit = opt(args, "--model").is_some() || std::env::var("RUSTGIS_ASSISTANT_MODEL").is_ok();
+        let explicit = opt(args, "--model").is_some() || env.model.is_some();
         if !explicit {
             cfg.model.clear();
         }
@@ -350,11 +407,15 @@ fn ask(s: &mut Session, args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
-    let prompt = prompt.ok_or("ask needs a request, e.g. rustgis-cli ask --sample \"Which countries have the largest GDP?\"")?;
+    let prompt = prompt.ok_or(NEEDS_REQUEST)?;
     if let Some(why) = cfg.missing() {
         let hint = match provider::preset(&provider) {
             Some(p) if p.login => "run rustgis-cli ask --login".to_string(),
-            Some(p) => format!("set {}", p.key_env.join(" or ")),
+            Some(p) => format!(
+                "set {}{}",
+                p.key_env.join(" or "),
+                if saved.is_none() { ", or pass --use-saved-secrets to use the key saved in the RustGIS app" } else { "" }
+            ),
             None => String::new(),
         };
         return Err(format!("{provider}: {why} ({hint})"));
@@ -651,6 +712,21 @@ fn main() -> ExitCode {
     }
     rustgis_engine::sample::apply_worldview(worldview);
     let mut s = Session::new(Project::default());
+    // `--use-saved-secrets`: the desktop app's saved connections, and the passwords, keys and
+    // ChatGPT sign-in it keeps in the system keychain. Without it, nothing reads the keychain.
+    // Opting in reads the preferences once and touches no secret; the keychain is asked only when
+    // a command needs one, and a keychain that can't be used is warned about once.
+    let saved: Option<Saved> = if args.iter().any(|a| a == "--use-saved-secrets") {
+        let prefs =
+            rustgis_engine::prefs::opt_in(&mut s, rustgis_keychain::Keychain::default(), |w| eprintln!("rustgis-cli: warning: {w}"));
+        // The ChatGPT sign-in shares the session's store.
+        s.database_logins.secret_store().cloned().map(|store| {
+            rustgis_assistant::chatgpt::set_secret_store(Some(store.clone()));
+            Saved { prefs, store }
+        })
+    } else {
+        None
+    };
     let res: Result<(), String> = (|| match cmd {
         "plugins" => {
             let registry = opt(&args, "--registry").map(|u| json!(u)).unwrap_or(Value::Null);
@@ -756,7 +832,7 @@ fn main() -> ExitCode {
         "ask" => {
             open_inputs(&mut s, &args)?;
             // What the assistant did is saved even when it couldn't finish.
-            let asked = ask(&mut s, &args);
+            let asked = ask(&mut s, &args, saved.as_ref(), &Environment::process());
             if let Some(p) = opt(&args, "--save")
                 && !args.iter().any(|a| a == "--models")
             {
@@ -802,5 +878,176 @@ fn main() -> ExitCode {
             eprintln!("rustgis-cli: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use rustgis_engine::data::secrets::{MemorySecrets, Secret, SecretError};
+    use std::sync::{Arc, Mutex};
+
+    /// A store that records the accounts it is asked for.
+    struct Asked {
+        inner: MemorySecrets,
+        accounts: Mutex<Vec<String>>,
+    }
+
+    impl Asked {
+        fn with(inner: MemorySecrets) -> Arc<Asked> {
+            Arc::new(Asked { inner, accounts: Mutex::new(Vec::new()) })
+        }
+
+        fn accounts(&self) -> Vec<String> {
+            self.accounts.lock().unwrap().clone()
+        }
+    }
+
+    impl SecretStore for Asked {
+        fn load(&self, account: &str) -> Result<Option<Secret>, SecretError> {
+            self.accounts.lock().unwrap().push(account.to_string());
+            self.inner.load(account)
+        }
+
+        fn save(&self, account: &str, value: &Secret) -> Result<(), SecretError> {
+            self.inner.save(account, value)
+        }
+
+        fn delete(&self, account: &str) -> Result<(), SecretError> {
+            self.inner.delete(account)
+        }
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// An environment with no keys.
+    fn bare() -> Environment {
+        fn config(provider: &str) -> Config {
+            let mut c = Config::from_env(provider);
+            c.key.clear();
+            c
+        }
+        Environment { provider: None, model: None, config }
+    }
+
+    /// An environment with an OpenAI key.
+    fn with_openai_key() -> Environment {
+        fn config(provider: &str) -> Config {
+            let mut c = Config::from_env(provider);
+            c.key = if provider == "openai" { "env-key".into() } else { String::new() };
+            c
+        }
+        Environment { provider: None, model: None, config }
+    }
+
+    fn desktop(pairs: &[(&str, &str)]) -> Map<String, Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), json!(v))).collect()
+    }
+
+    fn saved(prefs: Map<String, Value>, store: &Arc<Asked>) -> Saved {
+        Saved { prefs, store: store.clone() }
+    }
+
+    fn remembered() -> Map<String, Value> {
+        desktop(&[(provider::PROVIDER_PREF, "anthropic"), (provider::REMEMBER_KEY_PREF, "on")])
+    }
+
+    fn anthropic_key() -> Arc<Asked> {
+        let memory = MemorySecrets::new();
+        memory.save("assistant/anthropic", &Secret::new("stored-sentinel")).unwrap();
+        Asked::with(memory)
+    }
+
+    #[test]
+    fn a_saved_provider_is_used_only_with_the_opt_in_and_after_explicit_and_environment_choices() {
+        let store = anthropic_key();
+        let opted_in = saved(remembered(), &store);
+        let none: [&str; 1] = ["ask"];
+        // Without --use-saved-secrets the desktop's choice is never consulted.
+        assert_eq!(choose_provider(&args(&none), &bare(), None), "ollama");
+        assert_eq!(choose_provider(&args(&none), &bare(), Some(&opted_in)), "anthropic");
+        assert_eq!(choose_provider(&args(&["ask", "--provider", "gemini"]), &bare(), Some(&opted_in)), "gemini");
+        let environment = Environment { provider: Some("openrouter".into()), ..bare() };
+        assert_eq!(choose_provider(&args(&none), &environment, Some(&opted_in)), "openrouter");
+        // A provider with a key in the environment is a more specific choice than a saved one.
+        assert_eq!(choose_provider(&args(&none), &with_openai_key(), Some(&opted_in)), "openai");
+        // Choosing a provider reads no secret.
+        assert!(store.accounts().is_empty());
+    }
+
+    #[test]
+    fn a_prompt_uses_the_saved_key_but_model_listing_does_not_read_it() {
+        let store = anthropic_key();
+        let opted_in = saved(remembered(), &store);
+        let list = configuration("anthropic", &args(&["ask", "--models"]), &bare(), Some(&opted_in));
+        let request = provider::models_request(&list);
+        assert!(request.headers.iter().all(|(_, value)| !value.contains("stored-sentinel")));
+        assert!(store.accounts().is_empty());
+        let environment_list = configuration("openai", &args(&["ask", "--models"]), &with_openai_key(), Some(&opted_in));
+        assert_eq!(environment_list.key, "env-key");
+        assert!(store.accounts().is_empty());
+        let prompt = configuration("anthropic", &args(&["ask", "--provider", "anthropic", "hi"]), &bare(), Some(&opted_in));
+        assert_eq!(prompt.key, "stored-sentinel");
+        assert_eq!(store.accounts(), ["assistant/anthropic"]);
+    }
+
+    #[test]
+    fn without_the_opt_in_or_consent_no_key_is_read_and_the_environment_key_wins() {
+        let store = anthropic_key();
+        // No --use-saved-secrets: the model list goes out without the saved key.
+        let request = provider::models_request(&configuration("anthropic", &args(&["ask", "--models"]), &bare(), None));
+        assert!(request.headers.iter().all(|(_, value)| !value.contains("stored-sentinel")));
+        // Opted in, but the desktop does not remember keys.
+        let off = saved(desktop(&[(provider::REMEMBER_KEY_PREF, "off")]), &store);
+        assert_eq!(configuration("anthropic", &args(&["ask", "hi"]), &bare(), Some(&off)).key, "");
+        // A key from the environment is the one used, and nothing is read.
+        let opted_in = saved(remembered(), &store);
+        assert_eq!(configuration("openai", &args(&["ask", "hi"]), &with_openai_key(), Some(&opted_in)).key, "env-key");
+        // The desktop sends its key to its own address only: another one gets no key.
+        let elsewhere = args(&["ask", "--base-url", "https://elsewhere.example/v1", "hi"]);
+        assert_eq!(configuration("anthropic", &elsewhere, &bare(), Some(&opted_in)).key, "");
+        assert!(store.accounts().is_empty());
+    }
+
+    /// Runs the test `name` again in a child process whose settings folder is a fresh temporary
+    /// one, so the ChatGPT sign-in operations never touch the developer's own. Gives whether
+    /// this is the child, which runs the test's body.
+    fn in_isolated_settings(name: &str) -> bool {
+        if std::env::var_os("RUSTGIS_TEST_ISOLATED").is_some() {
+            return true;
+        }
+        let dir = std::env::temp_dir().join(format!("rustgis-cli-{}-{}", name.rsplit("::").next().unwrap_or(name), std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name])
+            .env("RUSTGIS_TEST_ISOLATED", "1")
+            .env(rustgis_engine::data::dirs::CONFIG_ENV, &dir)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("1 passed"), "the isolated run didn't run {name}:\n{stdout}");
+        false
+    }
+
+    #[test]
+    fn managing_the_chatgpt_sign_in_never_reads_an_api_key() {
+        if !in_isolated_settings("tests::managing_the_chatgpt_sign_in_never_reads_an_api_key") {
+            return;
+        }
+        let store = anthropic_key();
+        let opted_in = saved(remembered(), &store);
+        let mut s = Session::new(Project::default());
+        let env = bare();
+        let management: [&[&str]; 4] =
+            [&["ask", "--accounts"], &["ask", "--logout"], &["ask", "--remove-account", "nobody"], &["ask", "--account", "nobody"]];
+        for management in management {
+            let _ = ask(&mut s, &args(management), Some(&opted_in), &env);
+        }
+        assert!(store.accounts().is_empty(), "asked for {:?}", store.accounts());
     }
 }

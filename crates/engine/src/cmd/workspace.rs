@@ -213,6 +213,7 @@ pub fn commands() -> Vec<C> {
             let n = ps(p, "name").ok_or("name is required")?;
             let a =
                 s.project.offline_areas.iter().find(|a| a.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no offline area '{n}'"))?;
+            crate::project::ensure_map_imports_complete(&a.data)?;
             let map_name = format!("{} (offline)", a.name);
             if let Some(i) = s.project.maps.iter().position(|m| m.name.eq_ignore_ascii_case(&map_name)) {
                 s.project.active_map = i;
@@ -222,6 +223,7 @@ pub fn commands() -> Vec<C> {
                 // Reading a project checks only maps' layers, not offline snapshots', so their
                 // selections are put right here.
                 for l in &mut m.layers {
+                    l.renew_instance_id();
                     l.normalize_selection();
                 }
                 s.project.maps.push(m);
@@ -536,6 +538,7 @@ fn snapshot(m: &mut rustgis_map::Map, e: &Extent) -> rustgis_map::Map {
 const MAX_AREAS: usize = 20;
 
 fn offline_download(s: &mut Session, p: &Value) -> CmdResult {
+    crate::project::ensure_map_imports_complete(s.map())?;
     let e = match p.get("extent").and_then(Value::as_array) {
         Some(a) => {
             let n: Vec<f64> = a.iter().filter_map(Value::as_f64).collect();
@@ -590,6 +593,7 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
         .iter()
         .position(|m| m.name.eq_ignore_ascii_case(&area.map))
         .ok_or_else(|| format!("the source map '{}' is gone", area.map))?;
+    crate::project::ensure_map_imports_complete(s.project.maps.get(si).ok_or("the source map is gone")?)?;
     let (mut updated, mut added, mut deleted, mut skipped) = (0, 0, 0, 0);
     if let Some(src) = s.project.maps.get_mut(si) {
         for ol in &edited.layers {

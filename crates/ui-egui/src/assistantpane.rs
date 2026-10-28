@@ -136,7 +136,7 @@ fn load_config(app: &mut RustGisApp, provider: &str, ctx: &egui::Context) -> Con
     if let Some(m) = pref(app, &format!("assistant_model_{provider}")) {
         c.model = m;
     }
-    if let Some(u) = pref(app, &format!("assistant_url_{provider}")).filter(|_| !c.login()) {
+    if let Some(u) = pref(app, &provider::url_pref(provider)).filter(|_| !c.login()) {
         c.base_url = u;
     }
     if !c.login() {
@@ -162,8 +162,8 @@ fn ensure_loaded(app: &mut RustGisApp, ctx: &egui::Context) {
         return;
     }
     app.assistant.loaded = true;
-    app.assistant.remember_key = pref(app, "assistant_remember_key").as_deref() == Some("on");
-    let provider = pref(app, "assistant_provider")
+    app.assistant.remember_key = provider::remembers_keys(pref(app, provider::REMEMBER_KEY_PREF).as_deref());
+    let provider = pref(app, provider::PROVIDER_PREF)
         .or_else(|| std::env::var("RUSTGIS_ASSISTANT_PROVIDER").ok())
         .filter(|p| provider::preset(p).is_some())
         // The first provider with a key in the environment (a ChatGPT sign-in is chosen, not assumed).
@@ -234,7 +234,7 @@ fn migrate_keys(app: &mut RustGisApp, ctx: &egui::Context) {
         return;
     }
     app.assistant.keys_migrated = true;
-    if pref(app, "assistant_remember_key").as_deref() != Some("on") {
+    if !provider::remembers_keys(pref(app, provider::REMEMBER_KEY_PREF).as_deref()) {
         return;
     }
     for p in PRESETS.iter().filter(|p| !p.login) {
@@ -336,9 +336,9 @@ fn reading(app: &RustGisApp, provider: &str) -> bool {
 
 /// Persists ordinary settings; desktop secrets are queued for the keychain worker.
 fn save_config(app: &mut RustGisApp, c: &Config, ctx: &egui::Context) {
-    save_pref(app, "assistant_provider", &c.provider);
+    save_pref(app, provider::PROVIDER_PREF, &c.provider);
     save_pref(app, &format!("assistant_model_{}", c.provider), c.model.trim());
-    save_pref(app, &format!("assistant_url_{}", c.provider), c.base_url.trim());
+    save_pref(app, &provider::url_pref(&c.provider), c.base_url.trim());
     // A key from the environment stays there; a sign-in's tokens live in their own file.
     let from_env = Config::from_env(&c.provider).key;
     if c.login() {
@@ -584,7 +584,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     if app.assistant.unsaved && !typing(ctx) {
         app.assistant.unsaved = false;
-        save_pref(app, "assistant_remember_key", if app.assistant.remember_key { "on" } else { "off" });
+        save_pref(app, provider::REMEMBER_KEY_PREF, provider::remember_key_value(app.assistant.remember_key));
         if let Some(cfg) = app.assistant.agent.as_ref().map(|a| a.config.clone()) {
             save_config(app, &cfg, ctx);
         }
@@ -861,7 +861,7 @@ fn settings(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     }
     if (cfg.clone(), app.assistant.remember_key) != before {
         if app.assistant.remember_key != before.1 {
-            save_pref(app, "assistant_remember_key", if app.assistant.remember_key { "on" } else { "off" });
+            save_pref(app, provider::REMEMBER_KEY_PREF, provider::remember_key_value(app.assistant.remember_key));
         }
         #[cfg(not(target_arch = "wasm32"))]
         if !cfg.login() {
@@ -1818,8 +1818,8 @@ mod tests {
             sync::{Arc, Mutex},
         };
         let prefs = Arc::new(Mutex::new(BTreeMap::from([
-            ("assistant_provider".into(), "custom".into()),
-            ("assistant_remember_key".into(), if remember { "on" } else { "off" }.into()),
+            (provider::PROVIDER_PREF.into(), "custom".into()),
+            (provider::REMEMBER_KEY_PREF.into(), provider::remember_key_value(remember).into()),
         ])));
         if let Some(key) = legacy {
             prefs.lock().unwrap().insert("assistant_key_custom".into(), key.into());
@@ -1976,7 +1976,7 @@ mod tests {
                     store.save("assistant/openai", &Secret::new("synthetic-stored")).unwrap();
                 }
                 let (mut app, prefs) = keys_app(None, None);
-                prefs.lock().unwrap().insert("assistant_provider".into(), "openai".into());
+                prefs.lock().unwrap().insert(provider::PROVIDER_PREF.into(), "openai".into());
                 prefs.lock().unwrap().insert("assistant_provider_closed".into(), if collapsed { "on" } else { "" }.into());
                 app.assistant = AssistantState::default();
                 app.services.secrets = Some(store);
@@ -2074,7 +2074,7 @@ mod tests {
         settle_keys(h.state_mut());
         assert!(!h.state().assistant.remember_key);
         assert_eq!(store.load("assistant/custom").unwrap(), None);
-        assert_eq!(prefs.lock().unwrap().get("assistant_remember_key").map(String::as_str), Some("off"));
+        assert_eq!(prefs.lock().unwrap().get(provider::REMEMBER_KEY_PREF).map(String::as_str), Some("off"));
     }
 
     /// Ticking Remember after an off startup loads the existing key instead of deleting it.
@@ -2094,7 +2094,7 @@ mod tests {
         assert!(h.state().assistant.remember_key);
         assert_eq!(h.state().assistant.agent.as_ref().unwrap().config.key, "synthetic-stored");
         assert_eq!(store.load("assistant/custom").unwrap(), Some(Secret::new("synthetic-stored")));
-        assert_eq!(prefs.lock().unwrap().get("assistant_remember_key").map(String::as_str), Some("on"));
+        assert_eq!(prefs.lock().unwrap().get(provider::REMEMBER_KEY_PREF).map(String::as_str), Some("on"));
     }
 
     /// Clearing the focused password field deletes its saved key before the field loses focus.
@@ -2156,7 +2156,7 @@ mod tests {
             sync::{Arc, Mutex},
         };
         let prefs = Arc::new(Mutex::new(BTreeMap::from([
-            ("assistant_remember_key".to_string(), "on".to_string()),
+            (provider::REMEMBER_KEY_PREF.to_string(), "on".to_string()),
             ("assistant_key_custom".into(), "first".into()),
             ("assistant_key_anthropic".into(), "second".into()),
         ])));

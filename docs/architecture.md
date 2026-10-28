@@ -52,11 +52,20 @@ commands are skipped.
 
 ## Secrets
 
-`Services::secrets` is the only way to the OS credential store. The desktop app implements it
-with the login Keychain on macOS, Windows Credential Manager (persistence Local), and the Secret
-Service (GNOME Keyring, KWallet) over pure-Rust D-Bus on Linux and the BSDs. It is `None` in the
-browser and the CLI, where callers keep a secret for the session only, as before. Crates below
-`apps/` use only the `rustgis_data::secrets` trait and never an OS API.
+`Services::secrets` gives the desktop app its OS credential store: the login Keychain on macOS,
+Windows Credential Manager (persistence Local), and the Secret Service (GNOME Keyring, KWallet)
+over pure-Rust D-Bus on Linux and the BSDs. It is `None` in the browser, and the session's store
+is `None` on the command line and in Python unless `--use-saved-secrets` / `use_saved_secrets`
+asks for it. Only `rustgis-keychain` uses an OS API; other crates use only the
+`rustgis_data::secrets` trait. CLI and Python call `rustgis_engine::prefs::opt_in` once to read
+the desktop's preferences, load its saved connections without writing changes back, and install
+the lazy store. The generic `rustgis_data::secrets::Reporting` wrapper warns once on failure and
+stops retrying an unavailable backend. The preferences module also owns desktop writes, refuses
+to overwrite unreadable or malformed preferences, and returns read errors for callers to report
+without preference values. Assistant API keys additionally require the desktop's Remember
+preference and matching provider/address; an environment key wins. The CLI uses shared assistant
+preference names and only reads a saved API key for a prompt, never for account management or
+model listing.
 
 - **Keys.** The service is `RustGIS`. The account is `owner/name` with a lowercase owner (for
   example `assistant/<provider>` or `connection/<id>`); each feature defines its own. Values are
@@ -68,6 +77,11 @@ browser and the CLI, where callers keep a secret for the session only, as before
 - **Blocking.** A call can wait on an OS prompt or D-Bus. Make it on a user action or a worker
   thread, never every frame, and keep the value in memory for the session. Don't access one
   account from two threads at once.
+  Python releases the GIL for commands, rendering, data reads and lock waits. A process-wide
+  native-operation gate preserves serialization across Python sessions because driver
+  activations are process-global; a per-session mutex protects each session's state. Diagnostics
+  are logged only after both locks are released. Non-throwing `rustgis` logging cannot replace
+  an operation's result or original error.
   The Assistant queues legacy API-key migrations once at startup and serializes its keychain
   reads, writes and deletions on a worker. An existing keychain key takes precedence over a
   legacy preference. The preference is removed only after a successful read of that key or a
@@ -94,8 +108,9 @@ browser and the CLI, where callers keep a secret for the session only, as before
   it.
 - **macOS.** The system asks again for access when the app's code signature changes, which
   happens with unsigned or re-signed builds.
-- **Tests.** Use `MemorySecrets`, and `MemorySecrets::failing(..)` for error paths. The desktop
-  backend's smoke test is `#[ignore]`d: `cargo test -p rustgis keychain_round_trip -- --ignored`.
+- **Tests.** Use `MemorySecrets`, and `MemorySecrets::failing(..)` for error paths. The shared
+  backend's smoke test is `#[ignore]`d:
+  `cargo test -p rustgis-keychain keychain_round_trip -- --ignored`.
 
 ## Quality gates
 

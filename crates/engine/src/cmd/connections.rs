@@ -49,7 +49,7 @@ pub fn commands() -> Vec<C> {
             r#"{"id"?: "a connection's id or name", "kind"?: "postgres"|"mysql"|"sqlserver"|"service"|"wms"|"wmts"|"wfs"|"wcs"|"ogcapi"|"arcgis"|"csw"|"stac"|"s3", "name"?: text, "group"?: text, "address"?: text, "options"?: "an unsaved connection, as connection.new (when no id)", "password"?: "for a named database, authentication refusal restores prior session credentials; a later listing failure keeps the new password; never persisted", "accessKeyId"?: text, "secretAccessKey"?: text, "sessionToken"?: "as connection.login (logs in first)", "probe"?: "true: only the address the test reads, {fetch} (null for databases, which their driver tests)", "answer"?: "non-database kinds only: what that address returned, when the app fetched it (no network request then); databases ignore answer and test through their driver"}"#,
         ),
         C::new("connection.browse", "Browse Connection", "Home › Add › Data Sources", browse::browse).view().params(
-            r#"{"id": "a connection's id or name", "node"?: "a child's node, as a listing gives it (the connection's top level when absent)", "probe"?: "true: only the address this level reads, {fetch} (null: read without a fetch, or by the database driver); an S3 connection logs in first, as connection.test does", "answer"?: "what that address returned, when the app fetched it", "documents"?: [{"url": "a further document a listing asked for (next)", "text": "its answer"}]} → {connection, node, children: [{key, name, what, detail?, node? (browse it), children? (listed already), add? {command, params}: the command that adds it}], truncated?, matched?, notes?, service? {url, type}, next? (fetch it, then ask again with answer and documents)}"#,
+            r#"{"id": "a connection's id or name", "node"?: "a child's node, as a listing gives it (the connection's top level when absent)", "probe"?: "true: only the address this level reads, {fetch} (null: read without a fetch, or by the database driver); an S3 connection logs in first, as connection.test does", "answer"?: "what that address returned, when the app fetched it", "documents"?: [{"url": "a further document a listing asked for (next)", "text": "its answer"}]} → {connection, node, children: [{key, name, what, detail?, node? (browse it), children? (listed already), add? {command, params}: the command that adds it}], truncated?, matched?, notes?, service? {url, type}, next? (fetch it, then ask again with answer and documents)}. Database roots list schemas; open a schema node to list its tables."#,
         ),
     ]
 }
@@ -711,6 +711,13 @@ fn activate(s: &mut Session, c: &Connection, password: &str) {
     }
 }
 
+/// The password a saved database connection logs in with, best first: one given this session
+/// (typed for it); then, for a connection that keeps a saved password, the environment's for its
+/// kind (`PGPASSWORD`, `MYSQL_PWD`, `SQLCMDPASSWORD`), which never asks the store; then the saved
+/// one. A password typed for the address itself and one passed to a command are ranked above all
+/// of these by the callers. The environment never reaches a connection that isn't saved with a
+/// password, so a project can't name a new address to receive it. The flag is `true` for a saved
+/// password (the server's refusal rejects it), `false` for the others.
 #[cfg(not(target_arch = "wasm32"))]
 fn credential(s: &mut Session, c: &Connection) -> Result<Option<(rustgis_data::secrets::Secret, bool)>, String> {
     if let Some(pw) = s.database_logins.session_password(&c.id) {
@@ -718,6 +725,9 @@ fn credential(s: &mut Session, c: &Connection) -> Result<Option<(rustgis_data::s
     }
     if !c.remembered || s.database_logins.is_rejected(&c.id) {
         return Ok(None);
+    }
+    if let Some(pw) = s.database_logins.ambient(c) {
+        return Ok(Some((pw, false)));
     }
     match s.database_logins.load(c) {
         crate::connections::SavedPassword::Found(pw) => Ok(Some((pw, true))),

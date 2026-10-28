@@ -48,6 +48,21 @@ Each non-null command result goes to standard output as JSON. `--cmd 'id'` runs 
 no parameters; otherwise use `--cmd 'id={json params}'`. What a command reports beside its result,
 which the app shows in its status bar, goes to standard error.
 
+Pass `--use-saved-secrets` to load the desktop app's saved connections and let
+`connection.login` and project sources use their remembered database passwords and S3 keys.
+It also lets `ask` use the API key the app remembers, only for the same provider and address
+when the environment supplies no key, and the ChatGPT sign-in kept in the system keychain.
+Command parameters and environment variables take precedence over saved secrets. Connection
+changes aren't saved back to the desktop preferences. The flag applies to `run`, `ask`, `mcp`,
+`render` and `info`; for example, `rustgis-cli run --use-saved-secrets --cmd connection.list`.
+Without the flag, nothing reads the keychain or desktop preferences, including in CI. Reads are
+lazy: a command that doesn't need a secret neither touches the keychain nor emits a keychain
+warning. If the keychain is unavailable (a headless server or locked keyring, for example), the
+run continues without that saved secret and warns once on standard error. An unreadable or
+malformed preferences file produces a separate warning when opting in; missing preferences are
+normal. On macOS, Keychain may ask once per item whether `rustgis-cli` may read it; **Always
+Allow** stops that question for the executable and item.
+
 Nothing waits on `run` the way a window does, so a long run takes the bounds the app's panes give
 it on a thread: a trend over a data cube (`cube.trend`) may compare up to 20 billion pairs, ten
 times what the Script pane allows, and a trend's or a summary's STAC search up to 10,000 items,
@@ -101,8 +116,11 @@ rustgis-cli ask --sample --provider chatgpt "Zoom to Tokyo"
 ```
 
 The provider is `--provider` (`anthropic`, `openai`, `chatgpt`, `gemini`, `openrouter`, `ollama`, `custom`),
-else `RUSTGIS_ASSISTANT_PROVIDER`, else the first with a key in the environment, else Ollama (a
-ChatGPT sign-in is used only when chosen).
+else `RUSTGIS_ASSISTANT_PROVIDER`, else the first with a key in the environment, else the app's
+saved provider when `--use-saved-secrets` is set, else Ollama. ChatGPT sign-in is used only when
+that provider is selected. Account management and `--models` do not read saved API keys:
+model listing uses environment API keys (or the selected ChatGPT sign-in), whereas a prompt
+can use a remembered API key.
 `--model` (or `RUSTGIS_ASSISTANT_MODEL`) and `--base-url` override the defaults. The answer goes to
 standard output and each command the assistant ran to standard error. Commands that read or write
 files or use the network are declined unless you pass `--yes`; plugin commands, scripts, tasks,
@@ -111,14 +129,15 @@ and response body (never the headers, which carry the key) to a file; the bodies
 data and prompts. `--login` prints a browser sign-in URL so `--provider chatgpt` uses your ChatGPT
 plan. `--another-account` starts a new registration, `--accounts` lists saved registrations,
 `--account <client-id>` selects one, `--remove-account <client-id>` signs it out and forgets it,
-and `--logout` signs out. The command line has no system keychain: it uses a sign-in an earlier
-version saved in the settings folder, but not one the desktop app keeps in the keychain, and its
-own sign-ins last for the command only. A later `--logout` or `--remove-account` of such a sign-in
-clears it on this computer but can't end its session at OpenAI (its token is gone); disconnect
-RustGIS in ChatGPT's settings for that.
-`--logout` and `--remove-account` refuse an account whose token is in the keychain (sign out or
-remove it in the app), so it is never left there unrevoked, and `--login` never replaces such a
-sign-in. See [Signing in with ChatGPT](user-guide/assistant.md#signing-in-with-chatgpt).
+and `--logout` signs out. Without `--use-saved-secrets`, the command line has no system keychain:
+it uses a sign-in an earlier version saved in the settings folder, but not one the desktop app
+keeps in the keychain, and its own sign-ins last for the command only. A later `--logout` or
+`--remove-account` of such a sign-in clears it on this computer but can't end its session at
+OpenAI (its token is gone); disconnect RustGIS in ChatGPT's settings for that. Without the flag,
+those commands refuse an account whose token is in the keychain, and `--login` never replaces
+such a sign-in. With `--use-saved-secrets`, the CLI uses, remembers, signs out and removes
+keychain sign-ins as the app does. See
+[Signing in with ChatGPT](user-guide/assistant.md#signing-in-with-chatgpt).
 
 ## Serving AI agents
 

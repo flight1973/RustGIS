@@ -292,3 +292,35 @@ fn shapefile_disk_index_complete_chunks_preserve_full_reads_and_file_order() {
     });
     std::fs::remove_dir_all(fixture).unwrap();
 }
+
+#[test]
+fn shapefile_record_past_the_cap_is_skipped_not_allocated() {
+    // A record whose header claims more than MAX_RECORD bytes, inside a file grown (sparse where
+    // the file system allows) to hold it: skipped and counted, never given a buffer that size.
+    let fixture = dir();
+    cache::with_index_dir(fixture.join("cache"), || {
+        let p = fixture.join("huge-record.shp");
+        let mut ds = Dataset::new("two", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![]);
+        ds.push(Some(Geometry::Point(Coord::new(3.0, 4.0))), vec![]);
+        write_shapefile(&ds, &p);
+        // The second record's header is at 100 + 28; its content length (16-bit words) at +4.
+        let bytes = MAX_RECORD + 2;
+        let mut shp = std::fs::read(&p).unwrap();
+        shp.splice(132..136, i32::try_from(bytes / 2).unwrap().to_be_bytes());
+        std::fs::write(&p, &shp).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&p).unwrap().set_len(136 + bytes).unwrap();
+        let src = open_path(&p, None).unwrap();
+        let all = src.read(&Request::all()).unwrap();
+        assert_eq!((all.features.len(), all.skipped), (1, 1));
+        let mut chunked = 0;
+        let batch = src
+            .visit_chunks(None, 1 << 20, &mut |f| {
+                chunked += f.len();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!((chunked, batch.skipped), (1, 1));
+    });
+    std::fs::remove_dir_all(fixture).unwrap();
+}

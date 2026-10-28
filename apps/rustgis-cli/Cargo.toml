@@ -13,3 +13,4 @@ workspace = true
 rustgis-engine = { workspace = true, features = ["geolibre"] }
 serde_json = { workspace = true }
 rustgis-assistant = { workspace = true }
+rustgis-keychain = { workspace = true }

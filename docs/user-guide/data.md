@@ -268,6 +268,75 @@ Connecting and adding a layer read the database, so the [AI Assistant](assistant
 before it connects or adds a table, and asks every time before it saves edits. Plugins can't
 connect or save at all.
 
+### Editing GeoPackage tables
+
+On the desktop, **Home › Add › Add Data › Edit GeoPackage Table…** (`gpkg.addLayer`) loads one
+feature table of an existing local `.gpkg` for editing. Choose its table with **List Tables**
+when the file has several. The table needs one `INTEGER PRIMARY KEY`. At most 100,000 rows
+are loaded; **Most rows** can lower that limit. Whole numbers may use comma-grouped thousands
+(for example, `1,000`); fractional values are rejected. RustGIS does not
+directly edit rows outside that load, including rows with unreadable geometry. File-owned
+triggers can change other rows.
+
+**Edit › Manage Edits › Save to GeoPackage…** (`gpkg.saveEdits`) writes pending inserts, updates
+and deletes to that table in one SQLite transaction. If any row you changed or deleted has
+changed or disappeared in the file since it was loaded, nothing is saved. A constraint or
+trigger failure also rolls everything back; pending edits remain in the layer. New features
+get source-assigned keys that cannot alias loaded rows, and unrelated columns and tables remain
+intact. The saved rows are read back within the transaction, so the layer keeps values assigned
+by defaults and triggers before it starts tracking its next edits. If a DELETE trigger recreates
+a target row, that stored row reappears in the layer and is not counted as deleted. If triggers
+change or remove other rows already loaded in the layer, those rows are refreshed or removed
+before the next edits; rows outside the load are not added.
+
+New-feature saves also check the table's persisted `last_change` revision. If it changed since
+the layer was loaded, the save is refused rather than risking duplicate inserts from an older
+project or an undone save reopened in another session. Pending edits remain available to export;
+Discard Edits reloads the source and drops those pending edits. Identical feature values are not
+used to guess whether a new row was saved before.
+
+Spatial indexes use the final stored geometry after table triggers run. Bounds are refreshed
+from the whole table's readable native extents after inserts, geometry edits or deletes; they
+can shrink, and become NULL when no readable nonempty geometry remains. Attribute-only saves
+keep known bounds unless a trigger writes feature rows. Such trigger writes require a whole-table
+spatial rebuild in the transaction; unreadable nonempty geometry, including a body hidden behind
+a valid header envelope, makes that rebuild refuse the entire save rather than guess its index
+coverage. Metadata or index-repair triggers that would change features after the final snapshot
+are also refused, with the transaction rolled back. A geometry type, Z/M declaration or SRS that
+changed since the layer was loaded also refuses the save until Discard Edits reloads it.
+
+**Discard GeoPackage Edits…** (`gpkg.discardEdits`) reloads the scoped rows as they are in the
+file now, including renamed columns and its current geometry type and coordinate system; Undo
+restores the discarded layer edits. A changed geometry family resets its renderer to a compatible
+default. Saving refuses a changed source SRS until the layer is reloaded.
+Undoing a save does not undo file writes: Redo or Discard Edits is needed before saving again.
+Saving the project keeps pending edits in the project only; exporting writes a new file rather
+than changing this table.
+Save and Discard dialogs remain bound to the project, map and specific layer instance where they
+opened. Switching maps or projects, or undoing and re-adding a layer, requires reopening or
+choosing again; a reused layer ID cannot retarget another file.
+Feature-less project templates retain the layer's schema and styling, but no source-edit binding:
+opening a template cannot turn its absent features into source-row deletions. The same holds for
+the simplified layers a publication layout's globe locator map keeps: they can't be saved back.
+
+Geometry is converted back to the table's coordinate system and must match its declared family.
+Single-part columns reject multipart features; collection, curve and surface columns cannot
+receive geometry writes. Geometry writes that would lose existing Z/M dimensions, or insert
+geometry into a table requiring them, are refused; attribute-only edits can still be saved.
+Read-only files cannot be saved. These editing commands are desktop-only; normal GeoPackage
+reading remains available in the browser.
+
+```sh
+rustgis-cli run --cmd 'gpkg.addLayer={"path":"/data/roads.gpkg","table":"roads","name":"Roads"}' \
+  --cmd 'edit.enable={"on":true}' \
+  --cmd 'edit.setValue={"layer":"Roads","row":0,"field":"name","value":"Main St"}' \
+  --cmd 'gpkg.saveEdits={"layer":"Roads"}'
+```
+
+The AI Assistant asks before reading the file and every time before saving edits. Plugins
+need file permission to load or discard rows and cannot save edits back to the table.
+
+
 ## MySQL and MariaDB
 
 **Home › Add › Add Data › Database…** (`layer.addDatabase`) also connects to a MySQL (8 or later) or
@@ -429,9 +498,10 @@ does not read the store or guarantee it is available. In the next session, choos
 testing or logging in to the connection can read its keys from the store with nothing typed
 (the system may ask you to unlock it). Typed keys win over saved ones for that login.
 Temporary credentials (with a session token) are never kept: they work for the session,
-and keys saved earlier stay as they were. If the store is missing or refuses (the web app and the
-command line have none), the login still works for this session and says the keys weren't
-remembered; without keys typed, a connection with nothing available says so, and is not logged in.
+and keys saved earlier stay as they were. If the store is missing or refuses, the login still
+works for this session and says the keys weren't remembered; without keys typed, a connection
+with nothing available says so, and is not logged in. The web app has no system keychain; the
+command line and Python use it only with `--use-saved-secrets` / `use_saved_secrets=True`.
 **Forget Saved Keys** (`connection.forgetSavedKeys`; the connection's right-click menu or its
 form) deletes them from the store and keeps the session's login. Removing a connection deletes
 its saved keys first, and changing its endpoint or switching away from typed keys does too.
@@ -565,17 +635,21 @@ databases). For non-database kinds, pass that response text as `answer` with the
 to parse it without a network request. Database kinds ignore `answer` and test through their
 driver. An anonymous S3 test needs at least one named bucket.
 
-`connection.browse` lists what a connection offers, a level at a time: the tables of a database
-(under their schemas), the layers of a service, the records of a catalogue with the services and
-files they link to, the collections of a STAC API and the items and assets of a collection (for a
-static STAC catalog, its catalogs, collections and items, each item opened for its assets), or
-the buckets, folders and files of an S3 connection. Each child has a `key`, a `name` and what it
-is (`what`); a child with a `node` is browsed by asking again with that `node`; one with `add`
-names the command and parameters that add it (`service.add`, `layer.addDatabase`,
-`stac.addAsset`, `layer.addUrl`). A level lists at most 500 children and says `truncated` when
-it left some out. Like `connection.test`, it reads the address itself on the desktop and the
-command line; with `probe: true` it returns the address to fetch, and the app passes what it
-fetched back as `answer` (and further `documents` when a service asks for them, as `next`).
+`connection.browse` lists what a connection offers, a level at a time: database roots list the
+schemas returned by their provider; opening a schema lists its spatial tables. Services list their
+layers, catalogues their records with the services and files they link to, STAC APIs their
+collections, items and assets (for a static STAC catalog, its catalogs, collections and items,
+each item opened for its assets), and S3 connections their buckets, folders and files. Each child
+has a `key`, a `name` and what it is (`what`); a child with a `node` is browsed by asking again with
+that `node`; one with `add` names the command and parameters that add it (`service.add`,
+`layer.addDatabase`, `stac.addAsset`, `layer.addUrl`). Database browsing adds no table-count cap
+of its own. MySQL/MariaDB and SQL Server providers list at most 10,000 spatial-column rows per
+catalog read, so larger catalogs can omit later tables or schemas; PostGIS has no such provider
+limit.
+Other levels list at most 500 children and say `truncated` when they leave some out. Like
+`connection.test`, it reads the address itself on the desktop and the command line; with
+`probe: true` it returns the address to fetch, and the app passes what it fetched back as `answer`
+(and further `documents` when a service asks for them, as `next`).
 Browsing never changes the project. When a saved database password turns out to be missing, or
 to have been saved for another address, the connection loses its **Saved password** marker; the
 stored entry itself is left for **Forget Saved Password**, an address edit or a removal to delete.
@@ -588,7 +662,8 @@ initially. Checking it opts that submitted password into the operating system's 
 `connection.login {"id":"c1","password":"…","remember":true}`; `remember` defaults to false.
 If the store is missing, unavailable or denies access, the login remains usable for the
 session and a visible warning says it was not remembered (`passwordSaved:false` in the result).
-The browser and command line have no OS-store hook and remain session-only.
+The browser has no OS-store hook and remains session-only. The command line and Python also
+remain session-only unless run with `--use-saved-secrets` (Python: `use_saved_secrets=True`).
 
 The stored database password envelope is bound to the connection's ID, kind and cleaned address,
 including its username. Renaming or regrouping preserves it. Changing the address or username,
@@ -608,17 +683,22 @@ Matching strips passwords and outer wrappers/whitespace, but does not infer that
 libpq forms, reordered parameters, host aliases or different usernames mean the same server.
 Several eligible remembered matches open a chooser with no default; cancel leaves the layers
 unavailable. Choose a connection explicitly, or use `connection.login {"id":"c2"}` to select
-its existing session or remembered password without exposing it. Selection lasts for this
-session, not in the project. `connection.list` reports secret-free `loginRequests` with the
-reason, database label, candidate IDs and affected-layer count; ambiguous layers are not
-attributed to the first saved row. `loggedIn` means this ID has a session password or an already
-loaded remembered password available; it does not certify successful server authentication.
+its existing session, environment or remembered password without exposing it. Selection lasts
+for this session, not in the project. `connection.list` reports secret-free `loginRequests` with
+the reason, database label, candidate IDs and affected-layer count; ambiguous layers are not
+attributed to the first saved row. `loggedIn` means this ID has a session password, an
+environment password selected for it, or an already-loaded remembered password available; it
+does not certify successful server authentication.
 
-Explicit session input or selection takes precedence over a saved password; a saved password
-takes precedence over existing ambient fallbacks on explicitly initiated connections.
-Opening a project never newly authorizes environment/password-file credentials or Windows
-identity. A positively refused saved password is not retried for the rest of the session,
-and no other saved password is tried automatically. Its old OS-store value is retained.
+Explicit command, address and session passwords take precedence over saved credentials. On the
+command line and in Python with `--use-saved-secrets` / `use_saved_secrets=True`, an eligible
+remembered connection's `PGPASSWORD`, `MYSQL_PWD` or `SQLCMDPASSWORD` (according to the database
+kind) wins over the keychain password without reading the store; the desktop app always uses the
+saved password. Project opening may use it only through the same exact-address
+remembered-connection selection; it never newly authorizes an unrelated address, password-file
+credentials or Windows identity. A positively refused saved or environment password is not
+retried automatically for the rest of the session, and no other saved password is tried
+automatically. Its old OS-store value is retained.
 The fresh login form has an empty password and Remember unchecked: an unchecked replacement is
 session-only and does not overwrite or delete the old value; checking Remember and successfully
 saving replaces it. A password the server refuses is not kept as this session's, and is not sent

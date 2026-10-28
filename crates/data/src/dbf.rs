@@ -28,6 +28,9 @@ impl DbfEncoding {
     }
 
     fn from_number(number: u16) -> Option<Self> {
+        // DOS 437, 850, 852, 861 and 865 go to dbase's OEM adapter; DOS 866 and the other pages
+        // decoded here keep encoding_rs, because dbase's yore adapter is strict for those and can
+        // discard records containing malformed text. Any other page isn't decoded (`None`).
         let encoding = match number {
             437 => return Some(Self::Oem(CodePageMark::CP437)),
             850 => return Some(Self::Oem(CodePageMark::CP850)),
@@ -40,6 +43,10 @@ impl DbfEncoding {
             936 => rs::GBK,
             949 => rs::EUC_KR,
             950 => rs::BIG5,
+            10000 => rs::MACINTOSH,
+            // WHATWG's x-mac-cyrillic is Mac Ukrainian (10017): the same Cyrillic letters as
+            // Mac Cyrillic, and the nearest encoding there is.
+            10007 => rs::X_MAC_CYRILLIC,
             1250..=1258 => return Self::from_label(&format!("windows-{number}")),
             65001 => rs::UTF_8,
             _ => return None,
@@ -72,33 +79,45 @@ impl DbfEncoding {
             Err(_) => Self::from_label(&upper),
         }
     }
+}
 
-    fn from_mark(mark: CodePageMark) -> Option<Self> {
-        // Keep encoding_rs for its supported pages: dbase's yore adapter is strict for
-        // those encodings, which can discard records containing malformed text.
-        let encoding = match mark {
-            CodePageMark::CP437 | CodePageMark::CP850 | CodePageMark::CP852 | CodePageMark::CP861 | CodePageMark::CP865 => {
-                return Some(Self::Oem(mark));
-            }
-            CodePageMark::CP1250 => rs::WINDOWS_1250,
-            CodePageMark::CP1251 => rs::WINDOWS_1251,
-            CodePageMark::CP1252 => rs::WINDOWS_1252,
-            CodePageMark::CP1253 => rs::WINDOWS_1253,
-            CodePageMark::CP1254 => rs::WINDOWS_1254,
-            CodePageMark::CP1255 => rs::WINDOWS_1255,
-            CodePageMark::CP1256 => rs::WINDOWS_1256,
-            CodePageMark::CP866 => rs::IBM866,
-            CodePageMark::CP874 => rs::WINDOWS_874,
-            CodePageMark::CP932 => rs::SHIFT_JIS,
-            CodePageMark::CP936 => rs::GBK,
-            CodePageMark::CP949 => rs::EUC_KR,
-            CodePageMark::CP950 => rs::BIG5,
-            CodePageMark::Utf8 => rs::UTF_8,
-            CodePageMark::Undefined => return Some(Self::Utf8),
-            _ => return None,
-        };
-        Some(Self::Standard(encoding))
-    }
+/// The code page a `.dbf`'s language driver ID (byte 29) names: the language driver table as GDAL's
+/// Shapefile driver reads it (#1079), with dbase's own entries. `0x57`, which GDAL reads as
+/// ISO-8859-1, is Windows-1252, its superset, as the shapefile code page documentation has it.
+/// `None` for an ID no table names.
+fn ldid_code_page(ldid: u8) -> Option<u16> {
+    Some(match ldid {
+        0x01 | 0x09 | 0x0B | 0x0D | 0x0F | 0x11 | 0x15 | 0x18 | 0x19 | 0x1B => 437,
+        0x02 | 0x0A | 0x0E | 0x10 | 0x12 | 0x14 | 0x16 | 0x1A | 0x1D | 0x25 | 0x37 => 850,
+        0x03 | 0x57 | 0x58 | 0x59 => 1252,
+        0x04 => 10000,
+        0x08 | 0x17 | 0x66 => 865,
+        0x13 | 0x7B => 932,
+        0x1C | 0x6C => 863,
+        0x1F | 0x22 | 0x23 | 0x40 | 0x64 | 0x87 => 852,
+        0x24 => 860,
+        0x26 | 0x65 => 866,
+        0x4D | 0x7A => 936,
+        0x4E | 0x79 => 949,
+        0x4F | 0x78 => 950,
+        0x50 | 0x7C => 874,
+        0x67 => 861,
+        0x68 => 895,
+        0x69 => 620,
+        0x6A | 0x86 => 737,
+        0x6B | 0x88 => 857,
+        0x7D => 1255,
+        0x7E => 1256,
+        0x96 => 10007,
+        0x97 => 10029,
+        0xC8 => 1250,
+        0xC9 => 1251,
+        0xCA => 1254,
+        0xCB => 1253,
+        0xCC => 1257,
+        0xF0 => 65001,
+        _ => return None,
+    })
 }
 
 pub(crate) fn encoding(cpg: Option<&[u8]>, ldid: u8, notes: &mut Vec<String>) -> DbfEncoding {
@@ -110,14 +129,34 @@ pub(crate) fn encoding(cpg: Option<&[u8]>, ldid: u8, notes: &mut Vec<String>) ->
         }
         notes.push("Shapefile: unsupported or empty .cpg; using the .dbf code page, or UTF-8 if unavailable".into());
     }
-    // Esri's LDID table assigns 0x57 to ANSI 1252 (ArcPad, "Setting the code page
-    // for shapefiles"); dbase does not recognize that widely used marker.
-    let mark = if ldid == 0x57 { CodePageMark::CP1252 } else { CodePageMark::from(ldid) };
-    if let Some(encoding) = DbfEncoding::from_mark(mark) {
+    // No language driver: UTF-8, as it always was, without a note.
+    if ldid == 0 {
+        return DbfEncoding::Utf8;
+    }
+    let page = ldid_code_page(ldid);
+    if let Some(encoding) = page.and_then(DbfEncoding::from_number) {
         return encoding;
     }
-    notes.push(format!("Shapefile: unsupported .dbf code page 0x{ldid:02X}; using UTF-8"));
+    let named = page.map_or_else(String::new, |p| match page_name(p) {
+        Some(name) => format!(" (code page {p}, {name})"),
+        None => format!(" (code page {p})"),
+    });
+    notes.push(format!("Shapefile: unsupported .dbf code page 0x{ldid:02X}{named}; using UTF-8"));
     DbfEncoding::Utf8
+}
+
+/// The name of a code page a language driver may name and RustGIS can't decode, for the note.
+fn page_name(page: u16) -> Option<&'static str> {
+    Some(match page {
+        620 => "DOS Polish (Mazovia)",
+        737 => "DOS Greek",
+        857 => "DOS Turkish",
+        860 => "DOS Portuguese",
+        863 => "DOS French Canadian",
+        895 => "DOS Czech (Kamenický)",
+        10029 => "Mac Central European",
+        _ => return None,
+    })
 }
 
 /// A code-page label should be a few bytes. Bound reads even for a hostile sidecar.
@@ -147,4 +186,64 @@ fn try_read_cpg(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every language driver dbase's own table names and RustGIS read before keeps its code page:
+    /// the table replaced dbase's, and must not lose or change one of its entries.
+    #[test]
+    fn every_language_driver_dbase_names_keeps_its_code_page() {
+        for ldid in 0..=u8::MAX {
+            let before = match CodePageMark::from(ldid) {
+                CodePageMark::CP437 => 437,
+                CodePageMark::CP850 => 850,
+                CodePageMark::CP852 => 852,
+                CodePageMark::CP861 => 861,
+                CodePageMark::CP865 => 865,
+                CodePageMark::CP866 => 866,
+                CodePageMark::CP874 => 874,
+                CodePageMark::CP932 => 932,
+                CodePageMark::CP936 => 936,
+                CodePageMark::CP949 => 949,
+                CodePageMark::CP950 => 950,
+                CodePageMark::CP1250 => 1250,
+                CodePageMark::CP1251 => 1251,
+                CodePageMark::CP1252 => 1252,
+                CodePageMark::CP1253 => 1253,
+                CodePageMark::CP1254 => 1254,
+                CodePageMark::CP1255 => 1255,
+                CodePageMark::CP1256 => 1256,
+                CodePageMark::Utf8 => 65001,
+                // Pages dbase names that RustGIS can't decode: the table names them too.
+                CodePageMark::CP620 => 620,
+                CodePageMark::CP737 => 737,
+                CodePageMark::CP857 => 857,
+                CodePageMark::CP895 => 895,
+                // Not a language driver: only 0, which the table leaves out (read as UTF-8, no note).
+                CodePageMark::Undefined => {
+                    assert_eq!(ldid, 0, "LDID 0x{ldid:02X}");
+                    continue;
+                }
+                // An ID dbase doesn't know. (No other arm: a variant a dbase update adds fails to
+                // compile here.)
+                CodePageMark::Invalid => continue,
+            };
+            assert_eq!(ldid_code_page(ldid), Some(before), "LDID 0x{ldid:02X}");
+            let decoded = !matches!(before, 620 | 737 | 857 | 895);
+            assert_eq!(DbfEncoding::from_number(before).is_some(), decoded, "LDID 0x{ldid:02X}");
+        }
+    }
+
+    #[test]
+    fn a_page_rustgis_cant_decode_is_named_in_the_note() {
+        let mut notes = Vec::new();
+        assert!(matches!(encoding(None, 0x6C, &mut notes), DbfEncoding::Utf8));
+        assert_eq!(notes, ["Shapefile: unsupported .dbf code page 0x6C (code page 863, DOS French Canadian); using UTF-8"]);
+        let mut notes = Vec::new();
+        encoding(None, 0xFF, &mut notes);
+        assert_eq!(notes, ["Shapefile: unsupported .dbf code page 0xFF; using UTF-8"]);
+    }
 }

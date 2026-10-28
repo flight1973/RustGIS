@@ -38,10 +38,10 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layer"?: name|id, "crs": "EPSG:… or WKT; reinterpret native coordinates, without rewriting the source file"}"#),
         C::new("layer.loadAll", "Load All Features", "Layers", load_all).when(need_streamed).params(r#"{"layer"?: name|id}"#),
         C::new("layer.addUrl", "Add Data From URL", "Home › Add › Add Data", add_url).params(
-            r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true zooms to what was added; false keeps the view of a GeoParquet or FlatGeobuf read in place (zoomed to only when the map was empty)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on"}"#,
+            r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true zooms to what was added; false keeps the view of a GeoParquet or FlatGeobuf read in place (zoomed to only when the map was empty)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place (an address without a file name is read in place when its first bytes are a cloud-optimised GeoTIFF)", "cog"?: "bool: the address is a cloud-optimised GeoTIFF whatever its name says (the app's probe found it so)", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on"}"#,
         ),
         C::new("layer.addDownload", "Add Downloaded Data", "Home › Add", add_download)
-            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes and paging are checked), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error)}"#),
+            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes and paging are checked), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error), "geolibreProject"?: bool (internal: downloaded project JSON), "geolibreLayer"?: {"token", "record"} (internal: reserved imported layer and its saved style), "geolibreZarr"?: bool (internal: an imported Zarr slice as GeoTIFF)}"#),
         C::new("layer.addEncodedPolyline", "Add Encoded Polyline", "Home › Add", add_encoded_polyline).params(
             r#"{"polyline": "encoded polyline text" | [texts] (one line each), "precision"?: 5 (Google) | 6 (OSRM, Valhalla), "name"?: text}"#,
         ),
@@ -1031,6 +1031,12 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
             Err(e) => return Err(format!("{path}: {e}")),
         }
     }
+    // A Shapefile past what the whole-file reader takes is kept in place however few its records
+    // (#1055), so it never has to fit in memory whole; "stream": false or Load All loads it.
+    #[cfg(not(target_arch = "wasm32"))]
+    let past_cap = past_cap_shapefile(path, p);
+    #[cfg(not(target_arch = "wasm32"))]
+    let p = past_cap.as_ref().unwrap_or(p);
     #[cfg(not(target_arch = "wasm32"))]
     if path.to_ascii_lowercase().ends_with(".shp")
         && let Some(crs) = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty())
@@ -1668,6 +1674,20 @@ fn lidar_renderer(src: &dyn rustgis_data::source::FeatureSource, seed: u32) -> O
     }
 }
 
+/// The parameters with `"stream": true` for a Shapefile whose `.shp` or `.dbf` is past what the
+/// whole-file reader takes, when they don't say whether to stream; `None` otherwise.
+#[cfg(not(target_arch = "wasm32"))]
+fn past_cap_shapefile(path: &str, p: &Value) -> Option<Value> {
+    let shp = Path::new(path);
+    let past = |f: &Path| std::fs::metadata(f).is_ok_and(|m| m.len() > rustgis_data::io::MAX_BYTES);
+    if !path.to_ascii_lowercase().ends_with(".shp") || b(p, "stream").is_some() || !(past(shp) || past(&shp.with_extension("dbf"))) {
+        return None;
+    }
+    let mut q = p.clone();
+    q.as_object_mut()?.insert("stream".into(), json!(true));
+    Some(q)
+}
+
 /// An OpenStreetMap extract past what the native reader takes, opened through GDAL instead when it
 /// is installed (country-size extracts).
 #[cfg(not(target_arch = "wasm32"))]
@@ -2291,6 +2311,9 @@ fn add_layer_file(s: &mut Session, path: &str) -> CmdResult {
 /// Adds a layer from a layer file's JSON.
 pub(crate) fn add_layer_text(s: &mut Session, text: &str) -> CmdResult {
     let mut layer: rustgis_map::Layer = serde_json::from_str(text).map_err(|e| format!("not a RustGIS layer file: {e}"))?;
+    if layer.dataset.source.as_deref().is_some_and(|source| source.starts_with("geolibre-pending:")) {
+        return Err("a layer file cannot contain runtime GeoLibre download reservations".into());
+    }
     // A binding in a file is no authority to use a login here.
     crate::s3_connections::clear_bindings(layer.addresses_mut());
     // A fresh id and a unique name in this map; the rest goes through project repair.
@@ -2511,6 +2534,9 @@ pub fn url_file_name(url: &str, bytes: &[u8]) -> Result<String, String> {
 /// request is kept for the app ([`Session::request_url`]), which downloads and adds it as its own
 /// Home › Add › Add Data › From URL does, so a plugin, a script or the assistant can add data by address too.
 pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
+    if ["geolibreProject", "geolibreLayer", "geolibreZarr"].iter().any(|key| p.get(key).is_some()) {
+        return Err("GeoLibre download state is internal; use project.importGeolibre".into());
+    }
     let url = ps(p, "url").map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
     // An address read through a saved S3 connection is judged by the address it wraps; the whole
     // address stays what is fetched and kept.
@@ -2552,7 +2578,8 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
     if rustgis_data::source::is_remote_name(url) && scan {
         return Err(format!("{url}: \"as\": \"scan\" opens a TIFF, PNG or JPEG"));
     }
-    if rustgis_data::source::is_remote_name(url) && !super::b(p, "whole").unwrap_or(false) {
+    // An address the app found to be a GeoTIFF (`"cog"`) is one whatever its name says.
+    if rustgis_data::source::is_remote_name(url) && !super::b(p, "whole").unwrap_or(false) && !super::b(p, "cog").unwrap_or(false) {
         // In the browser nothing may wait: the app has fetched what opening needs already.
         #[cfg(target_arch = "wasm32")]
         let opened = rustgis_data::source::open_url_now(url);
@@ -2567,8 +2594,9 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
     }
-    // A GeoTIFF: read in place when it is cloud-optimised (tiled), otherwise downloaded whole.
-    let tiff = is_tiff_url(url);
+    // A GeoTIFF: read in place when it is cloud-optimised (tiled), otherwise downloaded whole. One
+    // the app has probed already says so (`"cog"`).
+    let tiff = is_tiff_url(url) || super::b(p, "cog").unwrap_or(false);
     #[cfg(target_arch = "wasm32")]
     {
         // Nothing may wait here: a GeoTIFF is taken to be cloud-optimised (the layer says if not).
@@ -2582,12 +2610,18 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
     {
         // Errors about the address itself name it already.
         let named = |e: String| if e.starts_with(url) { e } else { format!("{url}: {e}") };
-        if tiff
-            && !scan
-            && !super::b(p, "whole").unwrap_or(false)
-            && crate::render::rustgis_tiles::cog::probe_blocking(url).map_err(named)?
-        {
-            return add_cog(s, p, url);
+        // An address without a file name may be a GeoTIFF too: its first bytes are read to see,
+        // and anything that doesn't answer as one is downloaded whole, as before.
+        let unnamed = !tiff && is_unnamed_url(url);
+        if (tiff || unnamed) && !scan && !super::b(p, "whole").unwrap_or(false) {
+            let cog = match crate::render::rustgis_tiles::cog::probe_blocking(url) {
+                Ok(cog) => cog,
+                Err(_) if unnamed => false,
+                Err(e) => return Err(named(e)),
+            };
+            if cog {
+                return add_cog(s, p, url);
+            }
         }
         let bytes = crate::render::rustgis_tiles::cache::download_blocking(url).map_err(named)?;
         let name = url_file_name(url, &bytes).map_err(named)?;
@@ -2623,6 +2657,16 @@ pub fn is_tiff_url(url: &str) -> bool {
     let url = rustgis_data::s3_address::inner(url);
     let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
     path.ends_with(".tif") || path.ends_with(".tiff")
+}
+
+/// Whether a web address's last path segment has no extension (an API answering with a file,
+/// such as Vantor's `…/geotiff?…`): its first bytes tell whether it is a GeoTIFF to read in place.
+pub fn is_unnamed_url(url: &str) -> bool {
+    let url = rustgis_data::s3_address::inner(url);
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let Some((_, rest)) = path.split_once("://") else { return false };
+    let Some((_, path)) = rest.split_once('/') else { return false };
+    path.rsplit('/').find(|p| !p.is_empty()).is_some_and(|last| !last.contains('.'))
 }
 
 /// Adds a cloud-optimised GeoTIFF by its address as a layer read in place (its tiles by range,
@@ -2691,6 +2735,17 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     let url = ps(p, "url").unwrap_or("data").to_string();
     let i = s.downloaded.iter().position(|(d, _)| *d == id).ok_or("no such download (it was dropped when another project opened)")?;
     let (_, bytes) = s.downloaded.remove(i);
+    if p.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
+        if bytes.len() > rustgis_map::geolibre::MAX_TEXT {
+            return Err("GeoLibre project exceeds 64 MiB".into());
+        }
+        let text = String::from_utf8(bytes).map_err(|_| "GeoLibre project must be UTF-8 JSON")?;
+        return s.run_part("project.importGeolibre", &json!({"text":text}));
+    }
+    if p.get("geolibreLayer").is_some() {
+        let name = if b(p, "geolibreZarr") == Some(true) { "zarr.tif".into() } else { url_file_name(&url, &bytes)? };
+        return super::geolibre::finish_layer(s, p, name, bytes);
+    }
     // A service's features (Add From Service): its answer's axes and paging.
     let bytes = if super::b(p, "service").unwrap_or(false) {
         let label = ps(p, "name").unwrap_or(&url).to_string();

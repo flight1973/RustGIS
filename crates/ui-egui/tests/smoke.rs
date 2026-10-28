@@ -33,6 +33,379 @@ fn search_layer_command(h: &mut egui_kittest::Harness<'_, RustGisApp>, command: 
     assert!(h.state().ui.command_search.is_none());
 }
 
+/// Duplicate names must not redirect a source write or discard to the first matching layer.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_edit_dialogs_target_numeric_ids_with_duplicate_names() {
+    use rustgis_engine::data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value, raster::Crs, source::gpkg};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness();
+    for table in ["alpha", "beta"] {
+        let path = dir.path().join(format!("{table}.gpkg"));
+        let mut data = Dataset::new(table, GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        for x in [0.0, 1.0] {
+            data.push(Some(Geometry::Point(Coord::new(x, 0.0))), vec![Value::Text("original".into())]);
+        }
+        gpkg::write_in(&data, &path, Crs::LonLat).unwrap();
+        let loaded = h.state_mut().run("gpkg.addLayer", json!({"path": path, "table": table})).unwrap();
+        h.state_mut().run("layer.rename", json!({"layer": loaded["layer"], "name": "Duplicate"})).unwrap();
+    }
+    let ids: Vec<_> = h.state().session.map().layers.iter().filter(|l| l.gpkg.is_some()).map(|l| l.id).collect();
+    let (upper, lower) = (ids[0], ids[1]);
+    let source = |h: &egui_kittest::Harness<'_, RustGisApp>, id| {
+        let edit = h.state().session.map().layer(id).unwrap().gpkg.as_ref().unwrap();
+        (std::path::PathBuf::from(&edit.path), edit.table.clone())
+    };
+    let (upper_path, upper_table) = source(&h, upper);
+    let (lower_path, lower_table) = source(&h, lower);
+    let stored = |path: &std::path::Path, table: &str| {
+        gpkg::edit::EditTable::open(path, table).unwrap().read_editable(100).unwrap().features[0].attrs[0].clone()
+    };
+    let pending = |h: &mut egui_kittest::Harness<'_, RustGisApp>, id| {
+        h.state_mut().run("gpkg.pendingEdits", json!({"layer": id})).unwrap()["updates"].as_u64().unwrap()
+    };
+    let choose = |h: &mut egui_kittest::Harness<'_, RustGisApp>, from, to| {
+        let from_label = format!("Duplicate (#{from})");
+        h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some(from_label.as_str())).unwrap().click();
+        h.run_steps(2);
+        h.get_by_label(&format!("Duplicate (#{to})")).click();
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.gpkg_layer, Some(to));
+    };
+    let shown_count = |h: &egui_kittest::Harness<'_, RustGisApp>, count: &str| {
+        let label = h.get_by_label("Changed rows").rect();
+        assert!(
+            h.query_all_by_label(count).any(|n| n.rect().left() > label.right() && (n.rect().center().y - label.center().y).abs() < 3.0),
+            "the Changed rows value must display {count}"
+        );
+    };
+    h.state_mut().run("edit.enable", json!({"on": true})).unwrap();
+    h.state_mut().run("edit.setValue", json!({"layer": upper, "row": 0, "field": "name", "value": "upper pending"})).unwrap();
+    for row in [0, 1] {
+        h.state_mut().run("edit.setValue", json!({"layer": lower, "row": row, "field": "name", "value": "lower saved"})).unwrap();
+    }
+    h.state_mut().run("layer.select", json!({"layer": lower})).unwrap();
+    h.state_mut().run("ui.dialog", json!({"name": "gpkgSave"})).unwrap();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.gpkg_layer, Some(lower), "the lower duplicate is active");
+    h.get_by_label(&lower_table);
+    assert_eq!(h.state().dialogs.list[2], "2");
+    shown_count(&h, "2");
+    choose(&mut h, lower, upper);
+    h.get_by_label(&upper_table);
+    assert_eq!(h.state().dialogs.list[2], "1", "same display name must still invalidate counts");
+    shown_count(&h, "1");
+    choose(&mut h, upper, lower);
+    h.get_by_label(&lower_table);
+    assert_eq!(h.state().dialogs.list[2], "2");
+    shown_count(&h, "2");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Save").click();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+    assert_eq!(pending(&mut h, lower), 0);
+    assert_eq!(pending(&mut h, upper), 1);
+    assert_eq!(stored(&lower_path, &lower_table), Value::Text("lower saved".into()));
+    assert_eq!(stored(&upper_path, &upper_table), Value::Text("original".into()));
+
+    h.state_mut().run("edit.setValue", json!({"layer": lower, "row": 0, "field": "name", "value": "lower discarded"})).unwrap();
+    h.state_mut().run("ui.dialog", json!({"name": "gpkgDiscard"})).unwrap();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.gpkg_layer, Some(lower));
+    h.get_by_label(&lower_table);
+    choose(&mut h, lower, upper);
+    h.get_by_label(&upper_table);
+    choose(&mut h, upper, lower);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Discard").click();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+    assert_eq!(pending(&mut h, lower), 0);
+    assert_eq!(pending(&mut h, upper), 1);
+    assert_eq!(h.state().session.map().layer(lower).unwrap().dataset.features[0].attrs[0], Value::Text("lower saved".into()));
+    assert_eq!(h.state().session.map().layer(upper).unwrap().dataset.features[0].attrs[0], Value::Text("upper pending".into()));
+    assert_eq!(stored(&lower_path, &lower_table), Value::Text("lower saved".into()));
+    assert_eq!(stored(&upper_path, &upper_table), Value::Text("original".into()));
+
+    // Losing the target must never fall back to the active layer or a same-name layer.
+    for (dialog, button) in [("gpkgSave", "Save"), ("gpkgDiscard", "Discard")] {
+        for target in [None, Some(u32::MAX)] {
+            h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+            h.state_mut().dialogs.gpkg_layer = target;
+            h.run_steps(3);
+            assert!(h.state().dialogs.list.is_empty());
+            h.get_by_role_and_label(egui::accesskit::Role::Button, button).click();
+            h.run_steps(3);
+            assert_eq!(h.state().dialogs.open, Some(dialog));
+            assert!(h.state().dialogs.error.is_some());
+            assert_eq!(pending(&mut h, upper), 1);
+            assert_eq!(pending(&mut h, lower), 0);
+            assert_eq!(stored(&upper_path, &upper_table), Value::Text("original".into()));
+        }
+    }
+    h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+    h.state_mut().run("ui.dialog", json!({"name": "gpkgSave"})).unwrap();
+    assert_eq!(h.state().dialogs.gpkg_layer, Some(upper), "a non-editable active layer falls back to the first editable ID");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_dialog_gpkg(path: &std::path::Path) {
+    use rustgis_engine::data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value, raster::Crs, source::gpkg};
+    let mut data = Dataset::new("roads", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+    for x in [0.0, 1.0, 2.0] {
+        data.push(Some(Geometry::Point(Coord::new(x, 20.0))), vec![Value::Text("original".into())]);
+    }
+    gpkg::write_in(&data, path, Crs::LonLat).unwrap();
+}
+
+/// Undo rewinds map-local IDs, not a dialog's ownership of a particular live layer.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_edit_dialogs_refuse_reused_layer_ids() {
+    use rustgis_engine::data::{Value, source::gpkg::edit::EditTable};
+
+    for same_source in [false, true] {
+        for intervening_frame in [false, true] {
+            for (dialog, button) in [("gpkgSave", "Save"), ("gpkgDiscard", "Discard")] {
+                let dir = tempfile::tempdir().unwrap();
+                let a = dir.path().join("alias-a.gpkg");
+                let b = dir.path().join("alias-b.gpkg");
+                write_dialog_gpkg(&a);
+                write_dialog_gpkg(&b);
+                let mut h = harness();
+                h.state_mut().run("project.new", json!({})).unwrap();
+                h.state_mut().run("edit.enable", json!({"on": true})).unwrap();
+                let id = h.state_mut().run("gpkg.addLayer", json!({"path": a, "table": "roads", "name": "R"})).unwrap()["layer"]
+                    .as_u64()
+                    .unwrap() as u32;
+                assert_eq!(id, 1);
+                let instance = h.state().session.map().layer(id).unwrap().instance_id();
+                h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+                h.run_steps(3);
+                assert_eq!(h.state().dialogs.list[4], a.to_string_lossy());
+                assert_eq!(h.state().dialogs.gpkg_instance, Some(instance));
+
+                h.state_mut().run("edit.undo", json!({})).unwrap();
+                assert!(h.state().session.map().layer(id).is_none());
+                let replacement = if same_source { &a } else { &b };
+                let other_id =
+                    h.state_mut().run("gpkg.addLayer", json!({"path": replacement, "table": "roads", "name": "R"})).unwrap()["layer"]
+                        .as_u64()
+                        .unwrap() as u32;
+                assert_eq!(other_id, id);
+                let other_instance = h.state().session.map().layer(id).unwrap().instance_id();
+                assert_ne!(other_instance, instance);
+                h.state_mut().run("edit.setValue", json!({"layer": id, "row": 0, "field": "name", "value": "wrong source saved"})).unwrap();
+                if intervening_frame {
+                    h.run_steps(3);
+                    assert!(h.state().dialogs.list.is_empty(), "a replacement must not inherit the old source preview");
+                }
+                // With no intervening frame this clicks the original rendered confirmation.
+                h.get_by_role_and_label(egui::accesskit::Role::Button, button).click();
+                h.run_steps(3);
+                assert_eq!(h.state().dialogs.open, Some(dialog));
+                assert!(h.state().dialogs.error.is_some());
+                assert_eq!(h.state().dialogs.gpkg_instance, Some(instance), "rendering must never adopt the replacement");
+                assert!(h.state().dialogs.list.is_empty());
+                assert_eq!(
+                    h.state().session.map().layer(id).unwrap().dataset.features[0].attrs[0],
+                    Value::Text("wrong source saved".into()),
+                    "Discard must leave the replacement's pending edit intact"
+                );
+                assert_eq!(h.state_mut().run("gpkg.pendingEdits", json!({"layer": id})).unwrap()["updates"], 1);
+                for path in [&a, &b] {
+                    let stored = EditTable::open(path, "roads").unwrap().read_editable(10).unwrap();
+                    assert_eq!(
+                        stored.features[0].attrs[0],
+                        Value::Text("original".into()),
+                        "{button}: same_source={same_source}, intervening_frame={intervening_frame}, {path:?}"
+                    );
+                }
+                h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+                h.run_steps(3);
+                assert_eq!(h.state().dialogs.gpkg_instance, Some(other_instance));
+                assert_eq!(h.state().dialogs.list[4], replacement.to_string_lossy());
+                assert_eq!(h.state().dialogs.list[2], "1");
+                assert!(h.state().dialogs.error.is_none());
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_edit_dialog_counts_follow_edits_and_surviving_undo_snapshots() {
+    use rustgis_engine::data::{Value, source::gpkg::edit::EditTable};
+
+    for (dialog, button) in [("gpkgSave", "Save"), ("gpkgDiscard", "Discard")] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live-counts.gpkg");
+        write_dialog_gpkg(&path);
+        let mut h = harness();
+        h.state_mut().run("project.new", json!({})).unwrap();
+        h.state_mut().run("edit.enable", json!({"on": true})).unwrap();
+        let id = h.state_mut().run("gpkg.addLayer", json!({"path": path, "table": "roads"})).unwrap()["layer"].as_u64().unwrap() as u32;
+        let instance = h.state().session.map().layer(id).unwrap().instance_id();
+        h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.list[2], "0");
+        for row in [0, 1] {
+            h.state_mut().run("edit.setValue", json!({"layer": id, "row": row, "field": "name", "value": "pending"})).unwrap();
+            h.run_steps(3);
+            assert_eq!(h.state().dialogs.list[2], (row + 1).to_string(), "open counts follow subsequent edits");
+        }
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.list[2], "1");
+        assert_eq!(h.state().session.map().layer(id).unwrap().instance_id(), instance);
+        assert!(h.state().dialogs.error.is_none());
+        h.state_mut().run("edit.redo", json!({})).unwrap();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.list[2], "2");
+        assert_eq!(h.state().session.map().layer(id).unwrap().instance_id(), instance);
+        assert!(h.state().dialogs.error.is_none());
+        let revision = h.state().session.revision;
+        h.run_steps(3);
+        assert_eq!(h.state().session.revision, revision, "pendingEdits must not invalidate its own count cache");
+        // Undoing the layer's addition makes the target unavailable; Redo restores the same
+        // instance, and the stale refusal must go with it rather than sit beside valid counts.
+        for _ in 0..3 {
+            h.state_mut().run("edit.undo", json!({})).unwrap();
+        }
+        h.run_steps(3);
+        assert!(h.state().dialogs.error.as_deref().is_some_and(|e| e.contains("no longer available")), "{:?}", h.state().dialogs.error);
+        for _ in 0..3 {
+            h.state_mut().run("edit.redo", json!({})).unwrap();
+        }
+        h.run_steps(3);
+        assert_eq!(h.state().session.map().layer(id).unwrap().instance_id(), instance);
+        assert_eq!(h.state().dialogs.error, None, "the restored target's stale refusal must clear");
+        assert_eq!(h.state().dialogs.list[2], "2");
+
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Cancel").click();
+        h.run_steps(3);
+        h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.list[2], "2", "reopening counts the current state");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, button).click();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+        let expected = Value::Text(if button == "Save" { "pending" } else { "original" }.into());
+        let stored = EditTable::open(&path, "roads").unwrap().read_editable(10).unwrap();
+        for row in [0, 1] {
+            assert_eq!(stored.features[row].attrs[0], expected);
+            assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features[row].attrs[0], expected);
+        }
+        assert_eq!(h.state_mut().run("gpkg.pendingEdits", json!({"layer": id})).unwrap()["updates"], 0);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_edit_dialogs_refuse_map_and_project_identity_changes() {
+    use rustgis_engine::data::{Value, source::gpkg::edit::EditTable};
+    for project_switch in [false, true] {
+        for (dialog, button) in [("gpkgSave", "Save"), ("gpkgDiscard", "Discard")] {
+            let dir = tempfile::tempdir().unwrap();
+            let a = dir.path().join("a.gpkg");
+            let b = dir.path().join("b.gpkg");
+            write_dialog_gpkg(&a);
+            write_dialog_gpkg(&b);
+            let mut h = harness();
+            h.state_mut().run("map.new", json!({"name": "Editable A"})).unwrap();
+            let id = h.state_mut().run("gpkg.addLayer", json!({"path": a, "table": "roads", "name": "R"})).unwrap()["layer"]
+                .as_u64()
+                .unwrap() as u32;
+            h.state_mut().run("edit.enable", json!({"on": true})).unwrap();
+            h.state_mut().run("edit.setValue", json!({"layer": id, "row": 0, "field": "name", "value": "A pending"})).unwrap();
+            let project = dir.path().join("other.rgis");
+            if project_switch {
+                // Same map index, map name and layer ID: only the opened-project generation differs.
+                let mut other = h.state().session.project.clone();
+                let index = other.active_map;
+                let layer = other.maps[index].layer_mut(id).unwrap();
+                layer.gpkg.as_mut().unwrap().path = b.to_string_lossy().into_owned();
+                layer.dataset.features[0].attrs[0] = Value::Text("B pending".into());
+                let mut session = rustgis_engine::Session::new(other);
+                session.run("project.saveAs", &json!({"path": project})).unwrap();
+            } else {
+                h.state_mut().run("map.new", json!({"name": "Editable B"})).unwrap();
+                let other_id = h.state_mut().run("gpkg.addLayer", json!({"path": b, "table": "roads", "name": "R"})).unwrap()["layer"]
+                    .as_u64()
+                    .unwrap() as u32;
+                assert_eq!(id, other_id, "layer IDs collide across maps");
+                h.state_mut().run("edit.enable", json!({"on": true})).unwrap();
+                h.state_mut().run("edit.setValue", json!({"layer": id, "row": 0, "field": "name", "value": "B pending"})).unwrap();
+                h.state_mut().run("map.activate", json!({"name": "Editable A"})).unwrap();
+            }
+            h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+            h.run_steps(3);
+            assert_eq!(h.state().dialogs.list[4], a.to_string_lossy());
+            if project_switch {
+                h.state_mut().run("project.open", json!({"path": project})).unwrap();
+            } else {
+                h.state_mut().run("map.activate", json!({"name": "Editable B"})).unwrap();
+            }
+            h.run_steps(3);
+            assert!(h.state().dialogs.list.is_empty(), "the old source preview must disappear");
+            h.get_by_role_and_label(egui::accesskit::Role::Button, button).click();
+            h.run_steps(3);
+            assert_eq!(h.state().dialogs.open, Some(dialog));
+            assert!(h.state().dialogs.error.is_some());
+            assert_eq!(h.state().session.map().layer(id).unwrap().dataset.features[0].attrs[0], Value::Text("B pending".into()));
+            assert_eq!(h.state_mut().run("gpkg.pendingEdits", json!({"layer": id})).unwrap()["updates"], 1);
+            for path in [&a, &b] {
+                let stored = EditTable::open(path, "roads").unwrap().read_editable(10).unwrap();
+                assert_eq!(stored.features[0].attrs[0], Value::Text("original".into()), "{project_switch}: {button}: {path:?}");
+            }
+            h.state_mut().run("ui.dialog", json!({"name": dialog})).unwrap();
+            h.run_steps(3);
+            assert_eq!(h.state().dialogs.list[4], b.to_string_lossy(), "reopening targets the current owner");
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_load_dialog_rejects_fractional_row_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rows.gpkg");
+    write_dialog_gpkg(&path);
+    let mut h = harness();
+    h.state_mut().run("ui.dialog", json!({"name": "gpkgAddLayer"})).unwrap();
+    h.state_mut().dialogs.a = path.to_string_lossy().into_owned();
+    h.state_mut().dialogs.c = "roads".into();
+    for input in ["1.5", "0.5", "-1", "1,5", "1,,000", "12,34"] {
+        h.state_mut().dialogs.e = input.into();
+        h.run_steps(3);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Load").click();
+        h.run_steps(3);
+        assert_eq!(h.state().dialogs.open, Some("gpkgAddLayer"));
+        assert!(h.state().dialogs.error.is_some());
+        assert!(h.state().session.map().layers.iter().all(|l| l.gpkg.is_none()));
+    }
+    h.state_mut().dialogs.e = "1".into();
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Load").click();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+    let layer = h.state().session.map().layers.iter().find(|l| l.gpkg.is_some()).unwrap();
+    assert_eq!(layer.dataset.features.len(), 1);
+    assert_eq!(
+        layer.dataset.features[0].geometry,
+        Some(rustgis_engine::data::Geometry::Point(rustgis_engine::data::Coord::new(0.0, 20.0)))
+    );
+    h.state_mut().run("ui.dialog", json!({"name": "gpkgAddLayer"})).unwrap();
+    h.state_mut().dialogs.a = path.to_string_lossy().into_owned();
+    h.state_mut().dialogs.c = "roads".into();
+    h.state_mut().dialogs.e = "1,000".into();
+    h.run_steps(3);
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Load").click();
+    h.run_steps(3);
+    assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+    let layer = h.state().session.map().layers.iter().find(|l| l.gpkg.is_some()).unwrap();
+    assert_eq!(layer.dataset.features.len(), 3, "valid thousands grouping must still load all available rows");
+}
+
 /// Both No Fill controls preserve unique-value styling and undo, and stay hidden for points.
 #[test]
 fn polygon_no_fill_is_reachable_from_the_pane_and_the_ribbon() {
@@ -1406,7 +1779,9 @@ fn data_from_a_web_address_lands_later() {
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         let body = br#"{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [1, 2]}}"#;
-        for stream in listener.incoming().take(1) {
+        // Three requests: an address without a file name is asked for its headers and first
+        // bytes (is it a GeoTIFF?) before it is downloaded.
+        for stream in listener.incoming().take(3) {
             let Ok(mut s) = stream else { continue };
             let mut buf = [0u8; 2048];
             let _ = s.read(&mut buf);
@@ -1432,6 +1807,87 @@ fn data_from_a_web_address_lands_later() {
     assert!(h.state().session.map().layer_by_name("Pin").is_some());
     assert!(h.state().session.notices.iter().any(|n| n.error && n.text.contains("never fetched")));
     assert!(h.state().ui.downloads.is_empty());
+}
+
+/// Add Data From URL reads a cloud-optimised GeoTIFF in place from an address that names no file
+/// (an API such as Vantor's `…/geotiff?…`): its first bytes are probed off the frame, then the
+/// layer reads its tiles by range, never downloading it whole.
+#[test]
+fn an_unnamed_cog_address_is_read_in_place() {
+    use std::io::{Read, Write};
+    let body = rustgis_engine::data::raster::cog::example(2048, 256);
+    let total = body.len();
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = sent.clone();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let read = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..read]).to_ascii_lowercase();
+            // Its headers announce the TIFF header's length, as Vantor's Transform API does.
+            if req.starts_with("head ") {
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nX-TIFF-Header-Length: 8192\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                continue;
+            }
+            let range = req.lines().find_map(|l| l.strip_prefix("range: bytes=")).and_then(|r| {
+                let (a, b) = r.trim().split_once('-')?;
+                Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
+            });
+            let (status, part) = match range {
+                Some((a, b)) if a < body.len() => ("206 Partial Content", &body[a..=b.min(body.len() - 1)]),
+                _ => ("200 OK", &body[..]),
+            };
+            count.fetch_add(part.len(), std::sync::atomic::Ordering::Relaxed);
+            let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", part.len());
+            let _ = s.write_all(part);
+        }
+    });
+    let mut h = harness();
+    h.step();
+    let url = format!("http://{addr}/analytics/v1/raster/ortho-with-overviews/geotiff?function=pansharp_ortho&key=k");
+    h.state_mut().run("ui.addUrl", json!({"url": url, "name": "Ortho"})).unwrap();
+    assert!(h.state().ui.downloads.is_empty(), "probed first, not downloaded");
+    for _ in 0..200 {
+        h.step();
+        if h.state().session.map().tiles.iter().any(|t| t.name == "Ortho") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let t = h.state().session.map().tiles.iter().find(|t| t.name == "Ortho").cloned();
+    assert!(t.is_some_and(|t| t.url == url), "added as a tile layer read in place");
+    assert!(h.state().ui.downloads.is_empty() && h.state().ui.cog_probes.is_empty());
+    let read = sent.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(read < total / 4, "{read} of {total} bytes read");
+    // `"as": null` is no `"as"`: probed too, not downloaded, and read in place.
+    let null_url = format!("{url}&n=2");
+    h.state_mut().run("ui.addUrl", json!({"url": null_url, "name": "Null", "as": null})).unwrap();
+    assert!(h.state().ui.downloads.is_empty() && h.state().ui.cog_probes.len() == 1);
+    for _ in 0..200 {
+        h.step();
+        if h.state().session.map().tiles.iter().any(|t| t.name == "Null") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let t = h.state().session.map().tiles.iter().find(|t| t.name == "Null").cloned();
+    assert!(t.is_some_and(|t| t.url == null_url), "added as a tile layer read in place");
+    // A probe under way when another project opens is dropped: its layer never lands there.
+    h.state_mut().run("ui.addUrl", json!({"url": format!("{url}&n=3"), "name": "Late"})).unwrap();
+    h.state_mut().run("project.new", json!({})).unwrap();
+    assert!(h.state().ui.cog_probes.is_empty());
+    for _ in 0..50 {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(!h.state().session.map().tiles.iter().any(|t| t.name == "Late"));
 }
 
 /// A service layer added from the app (Add From Service, the Connections tree) is read past its

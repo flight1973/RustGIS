@@ -11,6 +11,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::GpRecord;
 
+/// A map export cannot keep runtime-only download reservations, even in a larger project.
+pub(crate) fn ensure_map_imports_complete(map: &Map) -> Result<(), String> {
+    if map.layers.iter().any(|layer| layer.dataset.source.as_deref().is_some_and(|source| source.starts_with("geolibre-pending:")))
+        || map.tiles.iter().any(|tile| tile.id.starts_with("geolibre-pending:"))
+    {
+        return Err("GeoLibre layers are still downloading; wait for them to finish before saving".into());
+    }
+    Ok(())
+}
+
 pub const EXTENSION: &str = "rgis";
 /// The project extension earlier versions wrote; such files still open.
 pub const LEGACY_EXTENSION: &str = "rgisx";
@@ -32,9 +42,16 @@ pub fn opens_as_project(name: &str) -> bool {
 }
 
 /// The command that opens a file given by its path, as the desktop app's command line and a file
-/// dropped on its window do: `project.open` for a project or a package, `layer.addData` otherwise.
+/// dropped on its window do: native projects replace it, GeoLibre projects import a map, and
+/// other files are added as data.
 pub fn open_command(path: &str) -> &'static str {
-    if opens_as_project(path) { "project.open" } else { "layer.addData" }
+    if rustgis_map::geolibre::is_project_file(path) {
+        "project.importGeolibre"
+    } else if opens_as_project(path) {
+        "project.open"
+    } else {
+        "layer.addData"
+    }
 }
 /// Format version written to files.
 pub const FORMAT: u32 = 1;
@@ -711,11 +728,33 @@ impl Project {
         &mut self.maps[i]
     }
 
+    /// A consumed download cannot run again when an older undo snapshot is restored.
+    pub(crate) fn discard_import_reservation(&mut self, token: &str) {
+        for map in &mut self.maps {
+            let removed: std::collections::HashSet<_> =
+                map.layers.iter().filter(|layer| layer.dataset.source.as_deref() == Some(token)).map(|layer| layer.id).collect();
+            map.layers.retain(|layer| !removed.contains(&layer.id));
+            map.tiles.retain(|tile| tile.id != token);
+            for group in &mut map.groups {
+                group.children.retain(|id| !removed.contains(id));
+            }
+        }
+    }
+
+    /// Runtime download reservations cannot be reopened; refuse snapshots until they finish.
+    pub(crate) fn ensure_imports_complete(&self) -> Result<(), String> {
+        for map in self.maps.iter().chain(self.offline_areas.iter().map(|area| &area.data)) {
+            ensure_map_imports_complete(map)?;
+        }
+        Ok(())
+    }
+
     /// The file keeps no passwords, keys, tokens or signatures in layer addresses. The open project
     /// keeps them. This process remembers the 32 most recent distinct saved snapshots with stripped
     /// addresses: opening identical plain project text restores them until that snapshot is evicted
     /// or RustGIS closes. Packages and imports never restore them.
     pub fn saved_text(&mut self, dir: Option<&Path>) -> Result<(String, usize), String> {
+        self.ensure_imports_complete()?;
         let was = strip_addresses(self.addresses_mut());
         let n = was.iter().flatten().count();
         let originals: Vec<Option<String>> = if let Some(d) = dir.and_then(Path::to_str) {
@@ -768,8 +807,23 @@ impl Project {
     /// holds them, absolute: the copy lives in the app's recovery folder and is opened from there,
     /// not from the project's folder. Nor is it remembered as a file this process wrote, so
     /// frequent copies can't push the user's own saves out of the snapshots that restore secrets.
+    /// Runtime import reservations are omitted while completed work remains recoverable.
     /// Text too large to open again is refused.
     pub fn recovery_text(mut self) -> Result<String, String> {
+        // A recovery copy preserves completed work without persisting runtime-only reservations.
+        for map in self.maps.iter_mut().chain(self.offline_areas.iter_mut().map(|area| &mut area.data)) {
+            let pending: std::collections::HashSet<_> = map
+                .layers
+                .iter()
+                .filter(|layer| layer.dataset.source.as_deref().is_some_and(|source| source.starts_with("geolibre-pending:")))
+                .map(|layer| layer.id)
+                .collect();
+            map.layers.retain(|layer| !pending.contains(&layer.id));
+            for group in &mut map.groups {
+                group.children.retain(|id| !pending.contains(id));
+            }
+            map.tiles.retain(|tile| !tile.id.starts_with("geolibre-pending:"));
+        }
         strip_addresses(self.addresses_mut());
         let text = serde_json::to_string(&self).map_err(|e| e.to_string())?;
         if text.len() as u64 > MAX_BYTES {
@@ -813,6 +867,7 @@ impl Project {
             return Err("the project file is too large".into());
         }
         let mut p: Project = serde_json::from_str(text).map_err(|e| format!("not a RustGIS project: {e}"))?;
+        p.ensure_imports_complete().map_err(|_| "a project file cannot contain runtime GeoLibre download reservations".to_string())?;
         if p.format > FORMAT {
             return Err(format!("this project was saved by a newer RustGIS (format {})", p.format));
         }

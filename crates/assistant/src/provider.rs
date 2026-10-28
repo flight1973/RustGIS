@@ -7,6 +7,7 @@
 //! thread and the browser sends with its `fetch`.
 
 use crate::Error;
+use rustgis_engine::data::secrets::{Secret, SecretError, SecretStore};
 use serde_json::{Map, Value, json};
 
 /// A wire format.
@@ -236,6 +237,69 @@ impl Config {
     fn base(&self) -> &str {
         self.base_url.trim().trim_end_matches('/')
     }
+}
+
+/// The desktop preference naming the provider it uses (`prefs.json`).
+pub const PROVIDER_PREF: &str = "assistant_provider";
+
+/// The desktop preference that is "on" when it keeps API keys in the system keychain.
+pub const REMEMBER_KEY_PREF: &str = "assistant_remember_key";
+
+/// The desktop preference holding a provider's address, when it isn't the default.
+pub fn url_pref(provider: &str) -> String {
+    format!("assistant_url_{provider}")
+}
+
+/// The value [`REMEMBER_KEY_PREF`] is saved with.
+pub fn remember_key_value(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
+/// Whether a saved [`REMEMBER_KEY_PREF`] value asks to keep keys in the keychain.
+pub fn remembers_keys(value: Option<&str>) -> bool {
+    value == Some("on")
+}
+
+/// The provider the desktop app chose (its [`PROVIDER_PREF`]), when it is one that exists.
+pub fn saved_provider(prefs: &Map<String, Value>) -> Option<&'static str> {
+    prefs.get(PROVIDER_PREF).and_then(Value::as_str).and_then(preset).map(|p| p.id)
+}
+
+/// The first key-using provider whose API key `config` finds (the environment's, for
+/// `Config::from_env`). A sign-in is chosen, not assumed.
+pub fn first_keyed(config: impl Fn(&str) -> Config) -> Option<&'static str> {
+    PRESETS.iter().find(|p| !p.login && !config(p.id).key.is_empty()).map(|p| p.id)
+}
+
+/// The provider a command-line run uses: the explicit choice, then the environment's choice, then
+/// the first provider with an environment key, then (only when `saved` has the desktop's
+/// preferences) the one the desktop app uses, else `ollama`. Environment credentials win over the
+/// desktop's saved choice, as every environment setting wins over a saved one.
+pub fn choose(explicit: Option<&str>, environment: Option<&str>, keyed: Option<&str>, saved: Option<&Map<String, Value>>) -> String {
+    explicit.or(environment).or(keyed).or_else(|| saved.and_then(saved_provider)).unwrap_or("ollama").to_string()
+}
+
+/// The keychain account of a provider's API key (the desktop's Remember).
+pub fn key_account(provider: &str) -> String {
+    format!("assistant/{provider}")
+}
+
+/// Reads the desktop's remembered API key only for its provider and address, when no key was
+/// supplied by the environment. Sign-in providers never use API-key accounts.
+pub fn saved_key(cfg: &Config, prefs: &Map<String, Value>, store: &dyn SecretStore) -> Result<Option<Secret>, SecretError> {
+    if cfg.login() || !cfg.key.is_empty() || !remembers_keys(prefs.get(REMEMBER_KEY_PREF).and_then(Value::as_str)) {
+        return Ok(None);
+    }
+    let desktop = prefs
+        .get(&url_pref(&cfg.provider))
+        .and_then(Value::as_str)
+        .filter(|url| !url.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Config::from_env(&cfg.provider).base_url);
+    if desktop.trim().trim_end_matches('/') != cfg.base_url.trim().trim_end_matches('/') {
+        return Ok(None);
+    }
+    store.load(&key_account(&cfg.provider)).map(|key| key.filter(|key| !key.expose().trim().is_empty()))
 }
 
 /// An HTTP request to make.

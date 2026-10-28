@@ -184,7 +184,7 @@ impl Default for State {
             connection: None,
             listed: String::new(),
             collections: Vec::new(),
-            collection: "sentinel-2-l2a".into(),
+            collection: "sentinel-2-c1-l2a".into(),
             from: String::new(),
             to: String::new(),
             use_view: true,
@@ -1166,6 +1166,8 @@ mod tests {
             assert_eq!(Preset::from_id(p.id()), Some(p));
         }
         assert_eq!(Preset::from_id("nope"), None);
+        // The dialog opens on Collection 1: the legacy `sentinel-2-l2a` declares an offset that many of its files lack.
+        assert_eq!(State::default().collection, "sentinel-2-c1-l2a");
         let d = days_ago(0);
         assert!(d.len() == 10 && d.starts_with("20"), "{d}");
         let mut app = RustGisApp::with_sample();

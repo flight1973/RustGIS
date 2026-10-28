@@ -4,6 +4,9 @@
 //! and range. The list is read and checked here; opening an entry is the engine's (`cube.open`,
 //! through `stac.addCube` or `layer.addZarr`).
 //!
+//! The list is built into the app, and kept up to date with the app's other assets ([`HOSTED`]),
+//! which is used once read.
+//!
 //! An entry, as the list holds it:
 //!
 //! ```json
@@ -16,6 +19,9 @@
 //! ```
 //!
 //! A Zarr entry has `"format": "zarr"` and `variable` in place of `collection` and `asset`.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
 
@@ -128,18 +134,74 @@ impl Entry {
 
 /// The list built into the app.
 pub fn built_in() -> &'static [Entry] {
-    static LIST: std::sync::OnceLock<Vec<Entry>> = std::sync::OnceLock::new();
-    // Checked by a test, so never empty in a build.
-    LIST.get_or_init(|| parse(BUILT_IN).unwrap_or_default())
+    built_in_arc().as_slice()
 }
 
-/// The built-in entry with this id.
-pub fn find(id: &str) -> Result<&'static Entry, String> {
+fn built_in_arc() -> &'static Arc<Vec<Entry>> {
+    static LIST: OnceLock<Arc<Vec<Entry>>> = OnceLock::new();
+    // Checked by a test, so never empty in a build.
+    LIST.get_or_init(|| Arc::new(parse(BUILT_IN).unwrap_or_default()))
+}
+
+/// The list in use: the hosted one ([`fetch_hosted`]) once it has been read, else the built-in
+/// one.
+pub fn list() -> Arc<Vec<Entry>> {
+    hosted().lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| built_in_arc().clone())
+}
+
+/// The entry with this id, in the list in use.
+pub fn find(id: &str) -> Result<Entry, String> {
     let id = id.trim();
-    built_in()
+    list()
         .iter()
         .find(|e| e.id == id)
+        .cloned()
         .ok_or_else(|| format!("no data cube '{}' in the catalog (cube.catalog lists them)", clip(id, 80)))
+}
+
+/// Where the list is kept up to date between releases (opengeos/rustgis-assets), so a cube is
+/// added, or an address fixed, without a new version of the app.
+pub const HOSTED: &str = "https://assets.rustgis.app/data/data-cubes.json";
+
+fn hosted() -> &'static Mutex<Option<Arc<Vec<Entry>>>> {
+    static HOSTED_LIST: OnceLock<Mutex<Option<Arc<Vec<Entry>>>>> = OnceLock::new();
+    HOSTED_LIST.get_or_init(Mutex::default)
+}
+
+/// Reads the hosted list once a run of the app, in the background (a thread natively, the
+/// browser's fetch on the web), the first time the catalog is shown. Until it is read, and when
+/// it can't be (offline, or a list that doesn't read whole: [`take_hosted`]), the built-in list
+/// is used.
+pub fn fetch_hosted() {
+    static ASKED: AtomicBool = AtomicBool::new(false);
+    if ASKED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    crate::cache::download_limited(
+        HOSTED,
+        MAX_BYTES,
+        Box::new(|r| {
+            if let Err(e) = r.and_then(|bytes| take_hosted(&bytes)) {
+                log::info!("the hosted data cube list wasn't read, so the built-in one is used: {e}");
+            }
+        }),
+    );
+}
+
+/// Takes a hosted list in place of the built-in one: only one that reads whole (every entry
+/// checked, as [`parse`] does) and lists some cube; otherwise the list in use stays, and why is
+/// said. Its number of entries.
+pub fn take_hosted(bytes: &[u8]) -> Result<usize, String> {
+    if bytes.len() > MAX_BYTES {
+        return Err(format!("the data cube list is larger than {} KB", MAX_BYTES >> 10));
+    }
+    let list = parse(std::str::from_utf8(bytes).map_err(|_| "the data cube list isn't text")?)?;
+    if list.is_empty() {
+        return Err("the data cube list has no entries".into());
+    }
+    let n = list.len();
+    *hosted().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(list));
+    Ok(n)
 }
 
 /// The entries of `list` filed under `theme`, whose area meets `area`, with all the words of
@@ -395,6 +457,22 @@ mod tests {
         assert!(parse(&format!("[{good}, {good}]")).unwrap_err().contains("twice"));
         assert!(parse("{}").is_err() && parse("not json").is_err());
         assert!(parse(&format!("[{}]", " ".repeat(MAX_BYTES))).unwrap_err().contains("larger"));
+    }
+
+    /// A hosted list is taken only when it reads whole and lists some cube: a malformed, empty or
+    /// oversized one leaves the list in use as it was.
+    #[test]
+    fn a_hosted_list_is_taken_only_whole() {
+        let before = list().len();
+        for bad in [&b"not json"[..], b"[]", b"{}", b"[{\"id\": \"x\"}]", &[0xff, 0xfe][..]] {
+            assert!(take_hosted(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+        assert!(take_hosted(&vec![b' '; MAX_BYTES + 1]).unwrap_err().contains("larger"));
+        assert_eq!(list().len(), before);
+        // A sound one is taken (the built-in list's own text, so other tests see the same entries).
+        assert_eq!(take_hosted(BUILT_IN.as_bytes()).unwrap(), built_in().len());
+        assert_eq!(list().len(), built_in().len());
+        assert!(HOSTED.starts_with("https://assets.rustgis.app/"));
     }
 
     /// The last full year: the one before this while the cube runs on, its end's once it ended,

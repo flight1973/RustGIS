@@ -152,6 +152,34 @@ pub struct PostgisEdit {
     pub versions: Versions,
 }
 
+/// A GeoPackage feature table loaded whole for desktop editing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GpkgEdit {
+    /// Absolute when loaded; relative to a project saved beside it.
+    pub path: String,
+    pub table: String,
+    /// Its INTEGER PRIMARY KEY column.
+    pub key: String,
+    pub geometry: String,
+    /// The source SRS when these rows were loaded.
+    pub srs_id: i64,
+    /// The declared geometry type (uppercase) and Z/M flags when these rows were loaded.
+    /// Missing in a project means unknown: saving refuses until Discard Edits reloads them.
+    #[serde(default)]
+    pub geometry_type: String,
+    #[serde(default)]
+    pub z: i64,
+    #[serde(default)]
+    pub m: i64,
+    /// The table's durable revision, checked before saving pending inserts.
+    pub revision: String,
+    pub writable: bool,
+    #[serde(default)]
+    pub limit: usize,
+    /// Every column's stored fingerprint and the loaded feature's hash, by key.
+    pub versions: Versions,
+}
+
 /// How a loaded row is told apart from the same row edited: a hash of its geometry and
 /// attributes (FNV-1a over their JSON, the same in every build).
 pub fn row_hash(f: &rustgis_data::Feature) -> u64 {
@@ -174,7 +202,7 @@ pub fn row_hash(f: &rustgis_data::Feature) -> u64 {
     h.0
 }
 
-/// A loaded row: its version (PostgreSQL's `xmin`) and [`row_hash`] as read.
+/// A loaded row: its source version or fingerprint and [`row_hash`] as read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowVersion {
     pub version: i64,
@@ -241,10 +269,10 @@ impl<'de> Deserialize<'de> for Versions {
     }
 }
 
-/// What changed in a layer loaded from PostGIS since it was loaded (or last saved), by
+/// What changed in a source layer since it was loaded (or last saved), by
 /// comparing its features with the rows as read.
 #[derive(Debug, Default)]
-pub struct PostgisChanges {
+pub struct RowChanges {
     /// Features of loaded rows that differ from them, with the rows' versions.
     pub updates: Vec<(rustgis_data::Feature, i64)>,
     /// Loaded rows no feature holds any more: their keys and versions.
@@ -255,20 +283,20 @@ pub struct PostgisChanges {
     pub insert_rows: Vec<usize>,
 }
 
-impl PostgisChanges {
+impl RowChanges {
     pub fn is_empty(&self) -> bool {
         self.updates.is_empty() && self.deletes.is_empty() && self.inserts.is_empty()
     }
 }
 
-impl PostgisEdit {
+impl Versions {
     /// What changed in `features` since the rows were read. A feature whose id is a loaded row's
     /// is that row (once: a copy with the same id is new).
-    pub fn changes(&self, features: &[rustgis_data::Feature]) -> PostgisChanges {
-        let mut out = PostgisChanges::default();
+    pub fn changes(&self, features: &[rustgis_data::Feature]) -> RowChanges {
+        let mut out = RowChanges::default();
         let mut seen = std::collections::HashSet::new();
         for (i, f) in features.iter().enumerate() {
-            match self.versions.get(f.id) {
+            match self.get(f.id) {
                 Some(row) if seen.insert(f.id) => {
                     if row_hash(f) != row.hash {
                         out.updates.push((f.clone(), row.version));
@@ -280,9 +308,21 @@ impl PostgisEdit {
                 }
             }
         }
-        out.deletes = self.versions.iter().filter(|(k, _)| !seen.contains(k)).map(|(k, r)| (k, r.version)).collect();
+        out.deletes = self.iter().filter(|(k, _)| !seen.contains(k)).map(|(k, r)| (k, r.version)).collect();
         out
     }
+}
+
+/// The loaded rows' new baseline after a save or load.
+pub fn versions_of(features: &[rustgis_data::Feature], old: &Versions, saved: &std::collections::HashMap<u64, i64>) -> Versions {
+    let mut seen = std::collections::HashSet::new();
+    features
+        .iter()
+        .filter_map(|f| {
+            let version = saved.get(&f.id).copied().or_else(|| old.get(f.id).map(|r| r.version))?;
+            seen.insert(f.id).then(|| (f.id, RowVersion { version, hash: row_hash(f) }))
+        })
+        .collect()
 }
 
 /// A MySQL or MariaDB table a layer reads live.
@@ -1105,10 +1145,10 @@ mod tests {
             limit: 0,
             versions: loaded.iter().map(|f| (f.id, super::RowVersion { version: f.id as i64 * 10, hash: super::row_hash(f) })).collect(),
         };
-        assert!(edit.changes(&loaded).is_empty());
+        assert!(edit.versions.changes(&loaded).is_empty());
         // Row 1 as it was, row 2 renamed, row 3 deleted, a new feature and a copy of row 1.
         let now = [row(1, "a"), row(2, "bee"), row(9, "new"), row(1, "copy")];
-        let c = edit.changes(&now);
+        let c = edit.versions.changes(&now);
         assert_eq!(c.updates.iter().map(|(f, v)| (f.id, *v)).collect::<Vec<_>>(), vec![(2, 20)]);
         assert_eq!(c.deletes, vec![(3, 30)]);
         assert_eq!(c.inserts.iter().map(|f| f.id).collect::<Vec<_>>(), vec![9, 1]);

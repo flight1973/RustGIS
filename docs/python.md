@@ -180,11 +180,15 @@ both (keyword arguments win). It returns the decoded command result and raises
 `rustgis.RustGISError` when the command fails. UI-only commands (`ui.*`) need
 `Map.run_in_app`, as in the notebook example above.
 
-A command runs to its end before `run` returns, holding Python's interpreter lock: other Python
-threads, and calls to the session from them, wait their turn, and Ctrl+C (`KeyboardInterrupt`) is
-raised only once the command has ended. So a trend over a data cube (`cube.trend`) keeps the Script
-pane's bounds here (2 billion pairs compared, a STAC search of 2,000 items); run a larger one, such
-as a trend over a state, with `rustgis-cli run` (see [the command line](cli.md)).
+A command runs to its end before `run` returns, but not holding Python's interpreter lock (the
+GIL): other Python threads keep running while it works, as do renders, layer reads and the
+keychain reads of `use_saved_secrets`. Native RustGIS calls, including calls on different
+sessions, take turns because connection activations are shared by the process. Waiting for
+another native call also releases the GIL; unrelated Python threads remain free to run.
+Ctrl+C (`KeyboardInterrupt`) is raised only once the command has ended. So a trend over a data
+cube (`cube.trend`) keeps the Script pane's bounds here (2 billion pairs compared, a STAC search
+of 2,000 items); run a larger one, such as a trend over a state, with `rustgis-cli run` (see
+[the command line](cli.md)).
 
 ```python
 s.commands()                                        # every command, with its parameters
@@ -221,6 +225,30 @@ s.add_tiles("https://tile.openstreetmap.org/{z}/{x}/{y}.png", name="OpenStreetMa
 The GeoLibre and Whitebox tools run as they do in the app, through the `geolibre` program
 (see [Analysis](user-guide/analysis.md)). `rustgis.load_plugins()`, or
 `Session(plugins=True)`, loads the [plugins](plugins.md) installed for the desktop app.
+
+### Saved connections and secrets
+
+`rustgis.Session(use_saved_secrets=True)` loads the desktop app's saved connection definitions
+and lets `connection.login` and project sources use their remembered database passwords and S3
+keys. Secrets are read lazily from the system keychain, only when a command needs one, under
+the desktop's rules: the same connection ID, kind and address or S3 endpoint. Parameters given
+to a command, and environment credentials selected by a connection, take precedence over saved
+secrets. Changes to the connection definitions aren't saved back to the desktop preferences.
+
+The default is `False`: nothing reads the keychain or desktop preferences, so scripts and CI
+remain opt-in. If the keychain is unavailable, locked or refuses access, the session emits one
+`WARNING` record through `logging.getLogger("rustgis")` on its first failed access. With no
+logging configured, Python prints it to stderr. Unreadable or malformed desktop preferences
+produce a separate diagnostic during session construction; a missing preferences file is normal.
+
+These are log records, not Python warnings: warning filters cannot replace a successful result
+or hide the original `RustGISError`. Each session reports its own failure. A logging handler or
+filter that raises cannot change the operation's result; the diagnostic falls back to stderr.
+A command that doesn't need a secret neither touches the keychain nor emits a keychain
+diagnostic. On macOS, Keychain may ask once per item whether the Python executable may read it;
+**Always Allow** stops that question for that executable and item. Until such a question is
+answered (or a locked Secret Service on Linux responds), the command that asked waits, and so do
+other RustGIS calls in the process, even on other sessions; other Python threads keep running.
 
 ## Data in and out
 
@@ -277,5 +305,15 @@ python -m pip install "maturin>=1.9.3,<2"
 cd apps/rustgis-python
 maturin develop --release
 ```
+
+Saved-credential regression tests use an injected store, so they never access your keychain:
+
+```sh
+maturin develop --release --features test-stores
+python -m pytest tests/test_saved_secrets.py
+```
+
+Rebuild without `--features test-stores` afterward to restore the OS backend. CI builds one test
+wheel with the injected store and runs the suite once; distributed wheels keep default features.
 
 Its version is the RustGIS version, and each release publishes wheels to PyPI.

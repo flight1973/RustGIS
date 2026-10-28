@@ -22,6 +22,12 @@ use crate::theme::{Tokens, c32, regular, rgba, semibold};
 use crate::widgets::Dragged;
 use crate::{LayersView, LeftPane, RightPane, RustGisApp, icons};
 
+/// The map's narrowest width beside a right pane dragged wide.
+const MIN_MAP_WIDTH: f32 = 320.0;
+/// How wide a right pane can always be dragged, as far as the window has room, even where that
+/// leaves the map less than `MIN_MAP_WIDTH`.
+const RIGHT_PANE_MAX: f32 = 640.0;
+
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let frame = egui::Frame::NONE.fill(t.pane).inner_margin(egui::Margin::ZERO);
@@ -69,9 +75,19 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         app.ui.right_open.push(right);
     }
     if let Some(right) = app.ui.right {
-        // The Web Data pane's searches and lists want room: it keeps its own width.
-        let (id, width) = if right == RightPane::WebData { ("right_pane_web", 440.0) } else { ("right_pane", 320.0) };
-        let pane = egui::Panel::right(id).resizable(true).default_size(width).size_range(260.0..=640.0).frame(frame).show(ui, |ui| {
+        // The pane can take all the room right of the left pane but the map's minimum, so a
+        // notebook or a table can be read side by side with the map (#1056). Where that is less
+        // than `RIGHT_PANE_MAX`, the pane keeps that much (as far as it fits), as it always could.
+        let room = ui.available_width();
+        let max = (room - MIN_MAP_WIDTH).max(RIGHT_PANE_MAX.min(room)).max(260.0);
+        // The Web Data pane's searches and lists want room, and the Notebook opens on half of
+        // it (at least 320 where the room allows), beside the map: each keeps its own width.
+        let (id, width) = match right {
+            RightPane::WebData => ("right_pane_web", 440.0),
+            RightPane::Notebook => ("right_pane_notebook", (room / 2.0).max(320.0).min(max)),
+            _ => ("right_pane", 320.0),
+        };
+        let pane = egui::Panel::right(id).resizable(true).default_size(width).size_range(260.0..=max).frame(frame).show(ui, |ui| {
             // The pane is as wide as the user made it. Content wider than that is clipped, never
             // reported to the panel: egui would keep the panel's edge where the content ends, off
             // the window, and give the map the room it no longer covers (#307).
@@ -200,9 +216,10 @@ fn right_pane(app: &mut RustGisApp, ui: &mut Ui, right: RightPane, t: &Tokens) {
 
 /// The Web Data services shown in the Web Data pane, by the `ui.dialog` name that opens them, and
 /// their titles.
-const WEB_DATA: [(&str, &str); 15] = [
+const WEB_DATA: [(&str, &str); 16] = [
     ("opendata", "Search Open Data"),
     ("stac", "STAC Search"),
+    ("dataCubes", "Data Cubes"),
     ("osm", "OpenStreetMap"),
     ("boundaries", "Administrative Boundaries"),
     ("overture", "Overture Maps"),
@@ -237,6 +254,7 @@ fn web_data(app: &mut RustGisApp, ui: &mut Ui) {
     ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
     match app.ui.web_data {
         "stac" => crate::stacui::dialog(app, ui),
+        "dataCubes" => crate::cubesui::pane(app, ui),
         "osm" => crate::portalsui::osm(app, ui),
         "boundaries" => crate::portalsui::boundaries(app, ui),
         "overture" => crate::catalogsui::overture(app, ui),

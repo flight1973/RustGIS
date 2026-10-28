@@ -5,6 +5,7 @@
 //! `connection.test`: `probe` names the address a level reads, the app fetches it and asks again
 //! with the `answer`. Without an answer, the command line and the assistant read it themselves.
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 
@@ -13,7 +14,7 @@ use crate::connections::{Connection, DESKTOP_ONLY};
 use crate::render::rustgis_tiles::{address, s3, stac};
 use crate::{CmdResult, Session};
 
-/// The most children of one level that are listed.
+/// The most children of a non-database level; database levels use the provider's catalog.
 const MAX_CHILDREN: usize = 500;
 /// The items of a STAC collection that are listed.
 const ITEMS: usize = 20;
@@ -23,6 +24,7 @@ const MAX_NODE: usize = 4096;
 /// What a node of a connection stands for.
 enum Level {
     Database,
+    DatabaseSchema { schema: String },
     Service { url: String, kind: Option<String> },
     Catalogue,
     StacRoot { api: String },
@@ -64,6 +66,18 @@ fn level(c: &Connection, node: &str) -> Result<Level, String> {
         // Judged as a document of the connection would be: a link may not lead into the local network.
         address::check(url, Some(&c.address))?;
         return Ok(Level::Service { url: url.to_string(), kind: (t != "auto").then(|| t.to_string()) });
+    }
+    if let Some(schema) = node.strip_prefix("schema:") {
+        if !matches!(kind, "postgres" | "mysql" | "sqlserver") || schema.is_empty() {
+            return Err(not_a_node());
+        }
+        let schema = URL_SAFE_NO_PAD
+            .decode(schema)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(not_a_node)?;
+        return Ok(Level::DatabaseSchema { schema });
     }
     if let Some(id) = node.strip_prefix("collection:") {
         if kind != "stac" || id.is_empty() {
@@ -120,7 +134,7 @@ fn s3_login(s: &mut Session, c: &Connection, level: &Level) -> Result<Option<s3:
 /// The address a level reads (`None`: nothing is fetched, or the database driver reads it).
 fn fetch_url(s: &Session, c: &Connection, level: &Level, conn: Option<&s3::Connection>) -> Result<Option<String>, String> {
     Ok(match level {
-        Level::Database => None,
+        Level::Database | Level::DatabaseSchema { .. } => None,
         Level::Service { url, kind } => Some(rustgis_data::ogc::capabilities_url(url, kind.as_deref())),
         Level::Catalogue => Some(super::super::service::records_request(s, &json!({"url": c.address}))?),
         Level::StacRoot { api } => Some(if stac::catalog::is_static(api) { api.clone() } else { stac::collections_url(api) }),
@@ -197,7 +211,8 @@ pub(super) fn browse(s: &mut Session, p: &Value) -> CmdResult {
         return Ok(out);
     }
     let found = match &level {
-        Level::Database => database(s, &c)?,
+        Level::Database => database_schemas(s, &c)?,
+        Level::DatabaseSchema { schema } => database_schema(s, &c, schema)?,
         Level::Service { url, kind } => service(s, p, &mut out, url, kind.as_deref())?,
         Level::S3Root if url.is_none() => {
             buckets(c.options.get("buckets").map(String::as_str).unwrap_or("").split(',').map(str::to_string))
@@ -221,7 +236,7 @@ pub(super) fn browse(s: &mut Session, p: &Value) -> CmdResult {
                     let binding = conn.as_ref().and_then(|conn| super::saved_binding(s, &c, conn));
                     objects(bytes, bucket, prefix, binding.as_deref())?
                 }
-                Level::Database | Level::Service { .. } => Found::default(),
+                Level::Database | Level::DatabaseSchema { .. } | Level::Service { .. } => Found::default(),
             }
         }
     };
@@ -235,31 +250,58 @@ pub(super) fn browse(s: &mut Session, p: &Value) -> CmdResult {
     Ok(out)
 }
 
-/// A live database's geometry tables, under their schemas.
-fn database(s: &mut Session, c: &Connection) -> Result<Found, String> {
-    use std::collections::BTreeMap;
-
+/// A live database's schemas, each browsed separately so one large schema cannot hide later ones.
+fn database_schemas(s: &mut Session, c: &Connection) -> Result<Found, String> {
     let tables = super::connection_use::tables(s, c, None)?;
+    Ok(schemas(&tables))
+}
+
+/// The names of every schema represented by the database's geometry tables.
+fn schemas(tables: &[Value]) -> Found {
+    let mut names = std::collections::BTreeSet::new();
+    for table in tables {
+        if let Some(schema) = table.get("schema").and_then(Value::as_str) {
+            names.insert(schema);
+        }
+    }
+    Found {
+        children: names
+            .into_iter()
+            .map(|schema| {
+                let mut node = String::with_capacity(7 + schema.len().div_ceil(3) * 4);
+                node.push_str("schema:");
+                URL_SAFE_NO_PAD.encode_string(schema, &mut node);
+                json!({"key": node, "node": node, "name": schema, "what": "schema"})
+            })
+            .collect(),
+        ..Found::default()
+    }
+}
+
+/// A live database schema's geometry tables.
+fn database_schema(s: &mut Session, c: &Connection, schema: &str) -> Result<Found, String> {
+    let tables = super::connection_use::tables(s, c, None)?;
+    Ok(schema_tables(&tables, schema, &c.address))
+}
+
+/// Every geometry table in the opened schema; lazy expansion must not hide tables after a cap.
+fn schema_tables(tables: &[Value], schema: &str, address: &str) -> Found {
     let text = |t: &Value, k: &str| t.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let mut schemas: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    let truncated = tables.len() > MAX_CHILDREN;
-    for t in tables.iter().take(MAX_CHILDREN) {
-        let (label, name) = (text(t, "label"), text(t, "name"));
+    let mut children = Vec::new();
+    for t in tables.iter().filter(|t| t.get("schema").and_then(Value::as_str) == Some(schema)) {
+        let label = text(t, "label");
+        let name = text(t, "name");
         let shown = if label.contains(':') { format!("{name}:{}", text(t, "column")) } else { name };
-        schemas.entry(text(t, "schema")).or_default().push(json!({
+        children.push(json!({
             "key": label,
             "name": shown,
             "what": "table",
             "detail": text(t, "kind"),
-            "add": {"command": "layer.addDatabase", "params": {"database": c.address, "layer": label}},
+            "add": {"command": "layer.addDatabase", "params": {"database": address, "layer": label}},
             "options": true,
         }));
     }
-    let children = schemas
-        .into_iter()
-        .map(|(s, tables)| json!({"key": format!("schema:{s}"), "name": s, "what": "schema", "children": tables}))
-        .collect();
-    Ok(Found { children, truncated, matched: None })
+    Found { children, ..Found::default() }
 }
 
 /// A service's layers (capabilities read here, or the app's `answer` and `documents`).
@@ -530,11 +572,84 @@ fn objects(bytes: &[u8], bucket: &str, prefix: &str, binding: Option<&str>) -> R
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
     #[test]
     fn failed_saved_login_addresses_mark_the_object_listing_incomplete() {
         let xml = b"<ListBucketResult><Contents><Key>object.fgb</Key><Size>42</Size></Contents></ListBucketResult>";
         let result = super::objects(xml, "data", "", Some("not-a-live-binding")).unwrap();
         assert!(result.truncated);
         assert!(result.children.is_empty());
+    }
+
+    fn table(schema: &str, name: &str) -> Value {
+        json!({"schema": schema, "name": name, "label": format!("{schema}.{name}"), "kind": "MultiPolygon"})
+    }
+
+    #[test]
+    fn every_schema_and_its_tables_are_reachable_past_the_old_cap() {
+        let mut tables: Vec<Value> = (1..=832).map(|i| table("public", &format!("t_{i:04}"))).collect();
+        tables.extend(["addr", "edges", "zip"].map(|name| table("tiger", name)));
+
+        let root = super::schemas(&tables);
+        assert_eq!(root.children.len(), 2);
+        assert_eq!(root.children[0]["name"], "public");
+        assert_eq!(root.children[1]["name"], "tiger");
+        for child in &root.children {
+            let node = child["node"].as_str().unwrap();
+            let parsed =
+                super::level(&crate::connections::Connection { kind: "postgres".into(), name: "gis".into(), ..Default::default() }, node)
+                    .unwrap();
+            assert!(matches!(parsed, super::Level::DatabaseSchema { .. }));
+            assert!(
+                super::level(&crate::connections::Connection { kind: "service".into(), name: "gis".into(), ..Default::default() }, node)
+                    .is_err()
+            );
+        }
+
+        let public = super::schema_tables(&tables, "public", "postgres:dbname=gis");
+        assert_eq!(public.children.len(), 832);
+        assert!(!public.truncated);
+        assert_eq!(public.matched, None);
+        assert_eq!(public.children[0]["name"], "t_0001");
+        assert_eq!(public.children.last().unwrap()["add"]["params"]["layer"], "public.t_0832");
+    }
+
+    #[test]
+    fn schema_nodes_round_trip_unusual_identifiers() {
+        for name in ["line\nbreak", "tab\tname", "quote\"\\:name", "réseau\u{85}", "日本語"] {
+            let tables = [table(name, "roads"), table("other", "parks")];
+            let root = super::schemas(&tables);
+            let child = root.children.iter().find(|child| child["name"] == name).unwrap();
+            let node = child["node"].as_str().unwrap();
+            assert!(super::node_ok(node), "generated schema node must pass command validation: {node:?}");
+            for kind in ["postgres", "mysql", "sqlserver"] {
+                let connection = crate::connections::Connection { kind: kind.into(), ..Default::default() };
+                let super::Level::DatabaseSchema { schema } = super::level(&connection, node).unwrap() else {
+                    panic!("schema node must select a database schema");
+                };
+                assert_eq!(schema, name);
+                let found = super::schema_tables(&tables, &schema, "database");
+                assert_eq!(found.children.len(), 1);
+                assert_eq!(found.children[0]["add"]["params"]["layer"], format!("{name}.roads"));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_encoded_schema_nodes_are_rejected() {
+        let connection = crate::connections::Connection { kind: "postgres".into(), ..Default::default() };
+        for node in ["schema:", "schema:!", "schema:_w", "schema:YQ=="] {
+            assert!(super::level(&connection, node).is_err(), "{node}");
+        }
+    }
+
+    #[test]
+    fn opening_a_short_schema_lists_every_table_without_a_truncation_note() {
+        let tables = vec![table("tiger", "addr"), table("tiger", "edges"), table("public", "roads")];
+        let tiger = super::schema_tables(&tables, "tiger", "postgres:dbname=gis");
+        assert_eq!(tiger.children.len(), 2);
+        assert!(!tiger.truncated);
+        assert_eq!(tiger.matched, None);
     }
 }

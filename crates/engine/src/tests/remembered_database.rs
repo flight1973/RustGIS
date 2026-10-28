@@ -128,3 +128,19 @@ fn remembered_database_passwordless_login_reports_cached_credentials_per_id() {
     assert_eq!(listing["connections"][1]["id"], other);
     assert_eq!(listing["connections"][1]["loggedIn"], false);
 }
+
+#[test]
+fn remembered_database_used_by_a_session_given_the_desktop_prefs() {
+    let store = Arc::new(MemorySecrets::new());
+    let mut seed = session(Some(store.clone()));
+    let id = add(&mut seed, "Remembered");
+    seed.run("connection.login", &json!({"id":id,"password":"prefs-sentinel","remember":true})).unwrap();
+    let prefs = serde_json::Map::from_iter([(crate::connections::PREF.into(), Value::String(seed.connections.to_json()))]);
+    let mut fresh = Session::new(Project::default());
+    crate::prefs::use_saved_secrets(&mut fresh, &prefs, store.clone());
+    assert_eq!(fresh.run("connection.login", &json!({"id":id})).unwrap()["loggedIn"], true);
+    let mut empty = Session::new(Project::default());
+    crate::prefs::use_saved_secrets(&mut empty, &serde_json::Map::new(), store);
+    assert_eq!(empty.run("connection.list", &Value::Null).unwrap()["connections"], json!([]));
+    assert!(!fresh.notices.iter().any(|notice| notice.text.contains("prefs-sentinel")));
+}

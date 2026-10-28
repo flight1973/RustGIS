@@ -472,6 +472,8 @@ fn home_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 // Databases are read through DuckDB, a program the browser can't run.
                 #[cfg(not(target_arch = "wasm32"))]
                 menu_item(ui, app, "", "Database…", "ui.dialog", json!({"name": "addDatabase"}));
+                #[cfg(not(target_arch = "wasm32"))]
+                menu_item(ui, app, "", "Edit GeoPackage Table…", "ui.dialog", json!({"name": "gpkgAddLayer"}));
                 menu_item(ui, app, "", "S3…", "ui.dialog", json!({"name": "s3"}));
                 submenu_row(ui, "", tl!("New Connection"), |ui| {
                     for (kind, label) in crate::connectionui::KINDS {
@@ -617,6 +619,7 @@ fn web_data_menu(ui: &mut Ui, app: &mut RustGisApp) {
     let pane = |name: &str| json!({"name": name});
     menu_item(ui, app, "", "ArcGIS Portal…", "ui.searchOpenData", svc("arcgis-portal"));
     menu_item(ui, app, "", "Boundaries…", "ui.dialog", pane("boundaries"));
+    menu_item(ui, app, "", "Data Cubes…", "ui.dialog", pane("dataCubes"));
     menu_item(ui, app, "", "Dynamical…", "ui.searchOpenData", svc("dynamical"));
     menu_item(ui, app, "", "Earthdata GIS…", "ui.searchOpenData", svc("earthdata-gis"));
     menu_item(ui, app, "", "Fields of the World…", "ui.dialog", pane("fieldsOfTheWorld"));
@@ -2396,6 +2399,31 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 );
             });
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if app.session.map().layers.iter().any(|l| l.gpkg.is_some()) {
+            col(ui, |ui| {
+                small(
+                    ui,
+                    app,
+                    "save",
+                    "Save to GeoPackage…",
+                    "Save a GeoPackage layer's edits to its table in the file, unless rows changed there since.",
+                    "ui.dialog",
+                    json!({"name": "gpkgSave"}),
+                    false,
+                );
+                small(
+                    ui,
+                    app,
+                    "update",
+                    "Discard GeoPackage Edits…",
+                    "Load a GeoPackage layer's rows again as they are in the file, dropping its edits.",
+                    "ui.dialog",
+                    json!({"name": "gpkgDiscard"}),
+                    false,
+                );
+            });
+        }
         col(ui, |ui| {
             small(ui, app, "settings", "Settings", "Editing settings.", "ui.pane.editing", Value::Null, pane);
             small(
@@ -3290,6 +3318,7 @@ fn settings_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 }
             }
         });
+        big(ui, app, "command", "Keyboard\nShortcuts", "Customize keyboard shortcuts.", "ui.customizeShortcuts", Value::Null, false, false);
         let qa = app.ui.quick_access.clone();
         big_form_menu(ui, app, "command", "Quick\nAccess", "Choose extra buttons for the Quick Access Toolbar.", move |ui, app| {
             for (id, label) in QUICK {

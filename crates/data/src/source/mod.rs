@@ -10,6 +10,7 @@
 pub mod credentials;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod duckdb;
+pub mod edits;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod external;
 pub mod fgb;
@@ -592,6 +593,18 @@ impl Reproject {
         let Some(t) = &self.t else { return Some(g) };
         let mut ok = true;
         let out = g.map_coords(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
+        out.for_each_coord(|c| ok &= c.is_finite());
+        ok.then_some(out)
+    }
+
+    /// A longitude/latitude geometry in the source's coordinates.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn to_native(&self, g: &Geometry) -> Option<Geometry> {
+        let out = match &self.t {
+            Some(t) => g.map_coords(&|c| t.from_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN))),
+            None => g.clone(),
+        };
+        let mut ok = true;
         out.for_each_coord(|c| ok &= c.is_finite());
         ok.then_some(out)
     }

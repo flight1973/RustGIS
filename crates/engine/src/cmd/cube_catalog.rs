@@ -33,13 +33,15 @@ fn catalog(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(k) = ["theme", "query"].into_iter().find(|k| p.get(*k).is_some_and(|v| !v.is_null() && !v.is_string())) {
         return Err(format!("{k} is text"));
     }
-    let list = cubes::select(cubes::built_in(), ps(p, "theme"), area, ps(p, "query"))?;
+    // The hosted list, once the app has read it; else the built-in one.
+    let all = cubes::list();
+    let list = cubes::select(&all, ps(p, "theme"), area, ps(p, "query"))?;
     Ok(json!({"count": list.len(), "cubes": list.iter().map(|e| e.json()).collect::<Vec<_>>(), "themes": cubes::THEMES}))
 }
 
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let id = ps(p, "id").map(str::trim).filter(|i| !i.is_empty()).ok_or("id is required (an entry of cube.catalog)")?;
-    open_entry(s, cubes::find(id)?, p)
+    open_entry(s, &cubes::find(id)?, p)
 }
 
 /// Adds `e` to the map, with the area, period and options of `p` (as `cube.open` takes them).

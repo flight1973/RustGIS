@@ -29,6 +29,63 @@ fn cfg(provider: &str) -> Config {
     }
 }
 
+#[test]
+fn saved_key_obeys_desktop_consent_address_and_environment() {
+    use rustgis_engine::data::secrets::{MemorySecrets, Secret, SecretError, SecretStore};
+    let store = MemorySecrets::new();
+    store.save("assistant/anthropic", &Secret::new("stored-sentinel")).unwrap();
+    let mut cfg = Config::from_env("anthropic");
+    cfg.key.clear();
+    let mut prefs = serde_json::Map::new();
+    // A failing store makes any accidental read in a skipped branch observable.
+    let denied = MemorySecrets::failing(SecretError::Denied);
+    assert_eq!(saved_key(&cfg, &prefs, &denied).unwrap(), None);
+    prefs.insert(REMEMBER_KEY_PREF.into(), json!(remember_key_value(false)));
+    assert_eq!(saved_key(&cfg, &prefs, &denied).unwrap(), None);
+    prefs.insert(REMEMBER_KEY_PREF.into(), json!(remember_key_value(true)));
+    assert_eq!(saved_key(&cfg, &prefs, &store).unwrap(), Some(Secret::new("stored-sentinel")));
+    cfg.key = "env-key".into();
+    assert_eq!(saved_key(&cfg, &prefs, &denied).unwrap(), None);
+    cfg.key.clear();
+    cfg.base_url = "https://elsewhere.example/v1".into();
+    assert_eq!(saved_key(&cfg, &prefs, &denied).unwrap(), None);
+    prefs.insert(url_pref("anthropic"), json!("https://elsewhere.example/v1/"));
+    assert_eq!(saved_key(&cfg, &prefs, &store).unwrap(), Some(Secret::new("stored-sentinel")));
+    store.save("assistant/anthropic", &Secret::new(" \t")).unwrap();
+    assert_eq!(saved_key(&cfg, &prefs, &store).unwrap(), None);
+    let mut login = Config::from_env("chatgpt");
+    login.key.clear();
+    assert_eq!(saved_key(&login, &prefs, &denied).unwrap(), None);
+}
+
+#[test]
+fn command_line_provider_prefers_explicit_environment_and_keys_over_the_saved_choice() {
+    let mut desktop = serde_json::Map::new();
+    desktop.insert(PROVIDER_PREF.into(), json!("gemini"));
+    // Nothing explicit or in the environment: the saved choice only when it is given (the opt-in).
+    assert_eq!(choose(None, None, None, None), "ollama");
+    assert_eq!(choose(None, None, None, Some(&desktop)), "gemini");
+    // The command line, then RUSTGIS_ASSISTANT_PROVIDER, then a provider with an environment key.
+    assert_eq!(choose(Some("openai"), Some("custom"), Some("anthropic"), Some(&desktop)), "openai");
+    assert_eq!(choose(None, Some("custom"), Some("anthropic"), Some(&desktop)), "custom");
+    assert_eq!(choose(None, None, Some("anthropic"), Some(&desktop)), "anthropic");
+    // A choice the desktop saved that isn't a provider here, or isn't text, is ignored.
+    desktop.insert(PROVIDER_PREF.into(), json!("retired"));
+    assert_eq!(choose(None, None, None, Some(&desktop)), "ollama");
+    desktop.insert(PROVIDER_PREF.into(), json!(3));
+    assert_eq!(choose(None, None, None, Some(&desktop)), "ollama");
+}
+
+#[test]
+fn first_keyed_provider_is_the_first_key_provider_and_never_a_sign_in() {
+    let keyed = |ids: &'static [&'static str]| {
+        move |id: &str| Config { key: if ids.contains(&id) { "k".into() } else { String::new() }, ..cfg(id) }
+    };
+    assert_eq!(first_keyed(keyed(&["gemini", "openai"])), Some("openai"));
+    assert_eq!(first_keyed(keyed(&["chatgpt"])), None, "a sign-in is chosen, not assumed");
+    assert_eq!(first_keyed(keyed(&[])), None);
+}
+
 fn ok(v: Value) -> Result<HttpResponse, String> {
     Ok(HttpResponse { status: 200, body: v.to_string().into_bytes(), headers: vec![] })
 }
@@ -392,6 +449,36 @@ fn map_switch_and_remove_do_not_report_layers_added() {
     .unwrap();
     let added = buffered.get("layersAdded").and_then(Value::as_array);
     assert!(added.is_some_and(|a| !a.is_empty()), "buffer must name the layer it added: {buffered}");
+}
+
+/// A pivot table answers "population by continent and income group" in two calls: `run_tool` names
+/// the table and `read_features` gives its rows, a field for each income group.
+#[test]
+fn read_features_reads_a_pivot_table() {
+    let mut s = sample();
+    let t = |name: &str, args: Value| ToolCall { id: "x".into(), name: name.into(), args };
+    let params = json!({"input": "Countries", "fields": "continent", "pivot": "income_grp", "value": "pop_est", "statistic": "SUM"});
+    let ran: Value =
+        serde_json::from_str(&tools::run(&mut s, &t("run_tool", json!({"tool": "pivotTable", "params": params}))).unwrap()).unwrap();
+    let name = ran["table"].as_str().map(str::to_string).unwrap_or_default();
+    assert_eq!(name, "Countries_Pivot", "{ran}");
+    let read: Value = serde_json::from_str(&tools::run(&mut s, &t("read_features", json!({"table": name}))).unwrap()).unwrap();
+    let rows = read["rows"].as_array().cloned().unwrap_or_default();
+    assert!(!rows.is_empty() && read["total"].as_u64() == Some(rows.len() as u64), "{read}");
+    let mut cells = 0.0;
+    for row in &rows {
+        let groups: Vec<f64> = row
+            .as_object()
+            .map(|o| o.iter().filter(|(k, _)| k.starts_with("income_grp")).filter_map(|(_, v)| v.as_f64()).collect())
+            .unwrap_or_default();
+        assert!(row["continent"].is_string() && !groups.is_empty(), "{row}");
+        cells += groups.iter().sum::<f64>();
+    }
+    // Every country's population is in one cell.
+    let countries = s.map().layer_by_name("Countries").map(|l| l.dataset.clone()).unwrap();
+    let pop = countries.field_index("pop_est").unwrap();
+    let total: f64 = (0..countries.features.len()).filter_map(|r| countries.value(r, pop).as_f64()).sum();
+    assert!((cells - total).abs() < 1.0, "{cells} != {total}");
 }
 
 /// A tool's output table is read back by the name `run_tool` gives, as `table` or as `layer` (the
@@ -4180,4 +4267,22 @@ fn list_layers_includes_web_tile_layers() {
     }
     let ctx = tools::context(&s);
     assert!(ctx.contains("characters in all)\" (index ") && ctx.contains("raster, overlay, over \"Cities\", hidden)"), "{ctx}");
+}
+
+/// Callback completion and a forged UI project-download request disclose their file reach.
+#[test]
+fn geolibre_download_callbacks_require_import_approval() {
+    let s = Session::new(rustgis_engine::project::Project::default());
+    for (command, params) in
+        [("layer.addDownload", json!({"id":1})), ("ui.addUrl", json!({"url":"https://example.org/map.geolibre","geolibreProject":true}))]
+    {
+        let call = ToolCall { id: "callback".into(), name: "run_command".into(), args: json!({"command":command,"params":params}) };
+        assert!(tools::gate(&s, &call).is_some(), "{command}");
+    }
+    for key in ["geolibreProject", "geolibreLayer", "geolibreZarr"] {
+        let mut params = json!({"url":"https://example.org/data"});
+        params[key] = json!(true);
+        let call = ToolCall { id: key.into(), name: "run_command".into(), args: json!({"command":"ui.addUrl","params":params}) };
+        assert!(tools::gate(&s, &call).is_some(), "{key}");
+    }
 }

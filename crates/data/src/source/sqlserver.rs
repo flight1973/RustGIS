@@ -330,8 +330,8 @@ fn integrated_ok() -> &'static Mutex<HashSet<String>> {
 /// never SQLCMDPASSWORD or the Windows identity to an address not explicitly added this session.
 pub fn connect(address: &str, ask: bool) -> Result<Arc<Conn>> {
     let config = config(address)?;
-    let password = super::duckdb::remembered_password(address)
-        .or_else(|| if ask { std::env::var("SQLCMDPASSWORD").ok().filter(|p| !p.is_empty()) } else { None });
+    let password =
+        super::duckdb::remembered_password(address).or_else(|| if ask { super::duckdb::ambient_password("sqlserver") } else { None });
     let _ = auth_method(&config.login, password.as_deref())?;
     if config.login == Login::Integrated && !ask && !integrated_ok().lock().unwrap_or_else(|e| e.into_inner()).contains(address) {
         return Err(DataError::Format("signing in as the Windows user needs the database added this session".into()));

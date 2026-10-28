@@ -270,6 +270,7 @@ fn duplicate_map(s: &mut Session, p: &Value) -> CmdResult {
     m.name = super::copy_name(ps(p, "name"), &m.name, |n| s.project.maps.iter().any(|x| x.name.eq_ignore_ascii_case(n)));
     m.label_lock = None;
     for l in &mut m.layers {
+        l.renew_instance_id();
         l.selection.clear();
     }
     let name = m.name.clone();

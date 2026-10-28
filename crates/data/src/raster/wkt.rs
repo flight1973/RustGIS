@@ -893,6 +893,52 @@ const DATUMS: &[(&str, &str, &str, Option<&str>)] = &[
     ("OSGB36", "OSGB_1936", "airy", Some("446.448,-125.157,542.06,0.15,0.247,0.842,-20.489")),
 ];
 
+/// The national datums the reader recognizes by name ([`national_datum`]), by the geographic
+/// system whose ellipsoid and shift a definition has: named, the reader takes a projection that
+/// needs its datum (the Swiss oblique Mercator, Krovak) from the parameters alone.
+const NATIONAL_DATUMS: &[(u16, &str)] = &[
+    (4149, "CH1903"),
+    (4156, "System_Jednotne_Trigonometricke_Site_Katastralni"),
+    (4265, "Monte_Mario"),
+    (4230, "European_Datum_1950"),
+    (4277, "OSGB_1936"),
+    (4314, "Deutsches_Hauptdreiecksnetz"),
+    (4289, "Amersfoort"),
+    (4121, "Greek_Geodetic_Reference_System_1987"),
+];
+
+/// The WKT name of a definition's national datum, when its ellipsoid and shift are one of
+/// [`NATIONAL_DATUMS`], however they're written (`+ellps=bessel` or its axes, three parameters or
+/// seven).
+fn national_datum_name(def: &str, code: Option<u16>) -> Option<&'static str> {
+    let ((a, b), shift) = earth_of(def)?;
+    let name = NATIONAL_DATUMS
+        .iter()
+        .find(|(c, _)| {
+            epsg_proj4(*c).and_then(earth_of).is_some_and(|((na, nb), ns)| {
+                (a - na).abs() < 0.01 && (b - nb).abs() < 0.01 && shift.iter().zip(ns).all(|(s, n)| (s - n).abs() < 1e-6)
+            })
+        })?
+        .1;
+    // CH1903+ has CH1903's ellipsoid and shift in the table: only their codes tell them apart.
+    Some(if name == "CH1903" && matches!(code, Some(2056 | 4150)) { "CH1903+" } else { name })
+}
+
+/// A definition's ellipsoid axes and its shift to WGS 84 as seven parameters (three padded with
+/// zeros), a named datum's shift included; `None` without a shift.
+fn earth_of(def: &str) -> Option<((f64, f64), [f64; 7])> {
+    let proj = proj4rs::Proj::from_proj_string(def).ok()?;
+    let value = |k: &str| def.split_whitespace().find_map(|t| t.strip_prefix(k));
+    let shift = value("+towgs84=").or_else(|| DATUMS.iter().find(|r| value("+datum=").is_some_and(|d| r.0.eq_ignore_ascii_case(d)))?.3)?;
+    let parts: Vec<f64> = shift.split(',').map(|v| v.trim().parse().ok()).collect::<Option<_>>()?;
+    if parts.len() != 3 && parts.len() != 7 {
+        return None;
+    }
+    let mut seven = [0.0; 7];
+    seven.iter_mut().zip(parts).for_each(|(s, p)| *s = p);
+    Some((proj.ellipse_parameters(), seven))
+}
+
 /// PROJ's ellipsoids by name, with the name WKT gives them and their inverse flattening (0 for a
 /// sphere), as EPSG gives it.
 const ELLIPSOIDS: &[(&str, &str, f64)] = &[
@@ -964,7 +1010,10 @@ pub fn to_wkt(crs: Crs) -> Option<String> {
     };
     let datum_name = match datum {
         Some(d) => d.1.to_string(),
-        None => format!("Unknown based on {ellps_name} ellipsoid"),
+        None => match national_datum_name(&def, code) {
+            Some(n) => n.to_string(),
+            None => format!("Unknown based on {ellps_name} ellipsoid"),
+        },
     };
     // A null shift (ETRS89, NAD83, GDA94…) is left unsaid: readers would take the system as one
     // bound to WGS 84 rather than as itself.
@@ -973,12 +1022,24 @@ pub fn to_wkt(crs: Crs) -> Option<String> {
         .filter(|t| t.split(',').any(|v| v.trim().parse::<f64>().is_ok_and(|v| v != 0.0)))
         .map(|t| format!(",TOWGS84[{t}]"))
         .unwrap_or_default();
-    // A prime meridian by name (`+pm=paris`), a grid shift or axes other than east and north have
-    // no plain WKT1 form.
-    if (text("pm").is_some() && get("pm").is_none()) || flag("nadgrids") || text("axis").is_some_and(|a| a != "enu") {
+    // A grid shift or axes other than east and north have no plain WKT1 form.
+    if flag("nadgrids") || text("axis").is_some_and(|a| a != "enu") {
         return None;
     }
-    let pm = get("pm").unwrap_or(0.0);
+    // A prime meridian by its longitude (`+pm=2.5`) or name (`+pm=paris`, which proj4rs resolves),
+    // in degrees east of Greenwich.
+    let pm = match get("pm") {
+        Some(pm) => pm,
+        None => proj.from_greenwich().to_degrees(),
+    };
+    if !pm.is_finite() {
+        return None;
+    }
+    let pm_name = match text("pm").filter(|_| get("pm").is_none()) {
+        Some(p) => p.get(..1).unwrap_or("").to_ascii_uppercase() + p.get(1..).unwrap_or(""),
+        None if pm == 0.0 => "Greenwich".to_string(),
+        None => "unnamed".to_string(),
+    };
     let geog_name = match datum {
         Some(d) if d.0 == "WGS84" => "WGS 84".to_string(),
         _ => datum_name.trim_start_matches("Unknown based on ").to_string(),
@@ -991,7 +1052,7 @@ pub fn to_wkt(crs: Crs) -> Option<String> {
             quoted(ellps_name),
             num(a),
             num(rf),
-            quoted(if pm == 0.0 { "Greenwich" } else { "unnamed" }),
+            quoted(&pm_name),
             num(pm),
         )
     };
@@ -1102,6 +1163,31 @@ pub fn to_wkt(crs: Crs) -> Option<String> {
         "mill" => {
             ps = vec![("central_meridian", lon0)];
             "Miller_Cylindrical"
+        }
+        // The Swiss oblique Mercator is Hotine's, centred on its origin, with the azimuth and the
+        // grid's angle at 90° (EPSG's method 9815), the form the reader takes it in.
+        "somerc" => {
+            ps = vec![
+                ("latitude_of_center", lat0),
+                ("longitude_of_center", lon0),
+                ("azimuth", 90.0),
+                ("rectified_grid_angle", 90.0),
+                ("scale_factor", k0),
+            ];
+            "Hotine_Oblique_Mercator_Azimuth_Center"
+        }
+        // East and north only: EPSG:5513 and 2065 are the variants with axes pointing south and
+        // west, which a `.prj` with these axes would contradict. proj4rs fixes the azimuth and
+        // pseudo standard parallel, and has its own defaults for the centre and scale.
+        "krovak" if !flag("czech") && !matches!(code, Some(5513 | 2065)) => {
+            ps = vec![
+                ("latitude_of_center", get("lat_0").unwrap_or(49.5)),
+                ("longitude_of_center", get("lon_0").unwrap_or(24.833_333_333_333_33)),
+                ("azimuth", 30.288_139_752_777_78),
+                ("pseudo_standard_parallel_1", 78.5),
+                ("scale_factor", get("k_0").or(get("k")).unwrap_or(0.9999)),
+            ];
+            "Krovak"
         }
         _ => return None,
     };
@@ -1613,5 +1699,73 @@ mod tests {
         assert!(wkt.starts_with("PROJCS[\"My_Grid\"") && !wkt.contains("AUTHORITY"), "{wkt}");
         let back = crs_from_wkt(&wkt).unwrap().transformer().unwrap().to_lonlat(Coord::new(500_000.0, 5_000_000.0)).unwrap();
         assert!((back.x - 3.0).abs() < 1e-6 && (back.y - 45.153_477).abs() < 1e-5, "{back:?}");
+    }
+
+    #[test]
+    fn every_system_east_and_north_gets_a_prj() {
+        // Each EPSG code proj4rs projects is written, and read back by its code, except a
+        // geocentric system, a grid shift, axes other than east and north and EPSG:5513 and 2065,
+        // the Krovak variants pointing south and west.
+        let mut written = 0;
+        for code in 1..=u16::MAX {
+            let Some(def) = epsg_proj4(code) else { continue };
+            if proj4rs::Proj::from_proj_string(def).is_err()
+                || ["+proj=geocent", "+nadgrids", "+axis="].iter().any(|k| def.contains(k))
+                || matches!(code, 5513 | 2065)
+            {
+                continue;
+            }
+            let crs = Crs::from_epsg(u32::from(code)).unwrap();
+            let wkt = to_wkt(crs).unwrap_or_else(|| panic!("EPSG:{code}: {def}"));
+            assert_eq!(crs_from_wkt(&wkt), Ok(crs), "{wkt}");
+            written += 1;
+        }
+        assert!(written > 5000, "{written}");
+        assert_eq!(to_wkt(Crs::from_epsg(5513).unwrap()), None);
+        assert_eq!(to_wkt(Crs::from_epsg(2065).unwrap()), None);
+    }
+
+    #[test]
+    fn oblique_and_national_meridian_systems_read_back_from_their_parameters() {
+        // LV95, LV03 and LV03 on the Bern meridian; Krovak, on Greenwich and on Ferro; France's
+        // NTF Lambert II on the Paris meridian, Austria's Gauss-Krüger on Ferro; geographic NTF,
+        // Bogotá and Batavia (Jakarta). Each with a place in its area.
+        let systems = [
+            (2056u16, (8.54, 47.37), "Hotine_Oblique_Mercator_Azimuth_Center"),
+            (21781, (8.54, 47.37), "Hotine_Oblique_Mercator_Azimuth_Center"),
+            (21780, (8.54, 47.37), "PRIMEM[\"Bern\",7.43958333"),
+            (5514, (14.42, 50.09), "PROJECTION[\"Krovak\"]"),
+            (5221, (14.42, 50.09), "PRIMEM[\"Ferro\",-17.66666666"),
+            (27572, (2.35, 48.86), "PRIMEM[\"Paris\",2.33722916"),
+            (31251, (10.4, 47.3), "PRIMEM[\"Ferro\""),
+            (4807, (2.35, 48.86), "PRIMEM[\"Paris\""),
+            (4802, (-74.08, 4.6), "PRIMEM[\"Bogota\""),
+            (4813, (106.8, -6.2), "PRIMEM[\"Jakarta\""),
+            (3003, (9.19, 45.46), "DATUM[\"Monte_Mario\""),
+        ];
+        for (code, (lon, lat), says) in systems {
+            let crs = Crs::from_epsg(u32::from(code)).unwrap();
+            let wkt = to_wkt(crs).unwrap_or_else(|| panic!("EPSG:{code}"));
+            assert!(wkt.contains(says), "EPSG:{code}: {wkt}");
+            let bare = wkt.replace(&format!(",AUTHORITY[\"EPSG\",\"{code}\"]"), "");
+            let read = crs_from_wkt(&bare).unwrap_or_else(|e| panic!("EPSG:{code}: {e}: {bare}"));
+            let lonlat = Coord::new(lon, lat);
+            let a = crs.transformer().unwrap().from_lonlat(lonlat).unwrap();
+            let b = read.transformer().unwrap().from_lonlat(lonlat).unwrap();
+            let tolerance = if crs.is_geographic() { 1e-8 } else { 0.01 };
+            assert!((a.x - b.x).abs() < tolerance && (a.y - b.y).abs() < tolerance, "EPSG:{code}: {a:?} {b:?}\n{bare}");
+        }
+        // LV95 takes CH1903+'s name, LV03 CH1903's.
+        assert!(to_wkt(Crs::from_epsg(2056).unwrap()).unwrap().contains("DATUM[\"CH1903+\""));
+        assert!(to_wkt(Crs::from_epsg(21781).unwrap()).unwrap().contains("DATUM[\"CH1903\""));
+        // A Swiss system read from a .prj with its shift and no code (its ellipsoid by its axes,
+        // a three-parameter shift) is written with its datum named, and reads back as itself.
+        let lv95 = to_wkt(Crs::from_epsg(2056).unwrap()).unwrap().replace(",AUTHORITY[\"EPSG\",\"2056\"]", "");
+        let lv95 = lv95.replace("TOWGS84[674.374,15.056,405.346,0,0,0,0]", "TOWGS84[674.374,15.056,405.346]");
+        let read = crs_from_wkt(&lv95).unwrap();
+        assert!(read.custom_def().unwrap().proj4.contains("+a="), "{:?}", read.custom_def());
+        let again = to_wkt(read).unwrap();
+        assert!(again.contains("DATUM[\"CH1903+\"") || again.contains("DATUM[\"CH1903\""), "{again}");
+        assert!(crs_from_wkt(&again).is_ok(), "{again}");
     }
 }

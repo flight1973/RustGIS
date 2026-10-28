@@ -72,7 +72,7 @@ impl Completed {
 
 /// Executes one operation without ever putting a secret in diagnostics.
 fn perform(job: Job) -> Completed {
-    let account = format!("assistant/{}", job.provider);
+    let account = rustgis_assistant::provider::key_account(&job.provider);
     let deleting = matches!(job.action, Action::Save(None));
     let reading = matches!(job.action, Action::Load) && job.legacy.is_none();
     let migrating = matches!(job.action, Action::Load) && job.legacy.is_some();

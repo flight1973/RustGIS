@@ -432,6 +432,10 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
     super::connections::clear_active();
     let maps: Vec<Map> = match serde_json::from_str::<Map>(&text) {
         Ok(mut m) => {
+            if crate::project::ensure_map_imports_complete(&m).is_err() {
+                super::connections::restore_active(s);
+                return Err("a map file cannot contain runtime GeoLibre download reservations".into());
+            }
             if let Some(d) = dir.as_deref().and_then(Path::to_str) {
                 crate::project::resolve_file_paths(d, m.file_paths_mut());
             }
@@ -526,6 +530,9 @@ fn template(p: &Project) -> Project {
             l.dataset.features.clear();
             l.selection.clear();
             l.dataset.source = None;
+            // A feature-less template has no loaded rows to save back to a source.
+            l.postgis = None;
+            l.gpkg = None;
             if let Some(rl) = &mut l.raster {
                 rl.embedded = None;
             }
@@ -541,7 +548,9 @@ fn template(p: &Project) -> Project {
     t
 }
 
+/// Packages only completed imports; runtime download reservations cannot be reopened.
 fn package_project(s: &Session) -> Result<Vec<u8>, String> {
+    s.project.ensure_imports_complete()?;
     let mut p = s.project.clone();
     let mut budget = MAX_EMBED;
     for m in &mut p.maps {
@@ -583,6 +592,7 @@ fn package_map(s: &Session, mobile: bool, tol: f64) -> Result<Vec<u8>, String> {
             l.touch_geometry();
         }
     }
+    crate::project::ensure_map_imports_complete(&m)?;
     crate::project::strip_addresses(m.addresses_mut());
     let text = serde_json::to_string(&m).map_err(|e| e.to_string())?;
     let kind = if mobile { "mobile map package" } else { "map package" };
@@ -1001,6 +1011,7 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
                 Some(n) => s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no map '{n}'"))?,
                 None => s.map(),
             };
+            crate::project::ensure_map_imports_complete(map)?;
             let mut map = embedded_map(map, &mut MAX_EMBED.clone());
             crate::project::strip_addresses(map.addresses_mut());
             (map.name.clone(), to_json(&map)?)
@@ -1008,6 +1019,9 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
         "layer" => {
             let id = s.layer_id(p)?;
             let l = s.map().layer(id).ok_or("no such layer")?.clone();
+            if l.dataset.source.as_deref().is_some_and(|source| source.starts_with("geolibre-pending:")) {
+                return Err("this layer is still downloading; wait for it to finish before saving".into());
+            }
             let mut layer = embed_layer(l, &mut MAX_EMBED.clone());
             crate::project::strip_addresses(layer.addresses_mut().collect());
             (layer.name.clone(), to_json(&layer)?)
@@ -1025,6 +1039,7 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
             ("ramps".to_string(), to_json(&s.project.ramps)?)
         }
         "template" => {
+            s.project.ensure_imports_complete()?;
             let mut t = template(&s.project);
             if let Some(n) = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
                 t.name = n.chars().take(200).collect();

@@ -69,6 +69,10 @@ pub struct ShpSource {
 /// Bytes read ahead from the files: shapes and rows near each other in a read share a fill.
 const BUFFER: usize = 1 << 20;
 
+/// The largest record read: one past it is skipped rather than given a buffer that size, since a
+/// record's length is only checked against the file's, which can be gigabytes (#1055).
+const MAX_RECORD: u64 = crate::io::MAX_BYTES;
+
 impl ShpSource {
     /// Opens `path` (the `.shp`) with the `.dbf` and optional `.prj` and `.cpg` beside it.
     pub fn open_path(path: &Path, name: &str) -> Result<ShpSource> {
@@ -169,6 +173,10 @@ impl FeatureSource for ShpSource {
         let mut features = Vec::new();
         let mut skipped = 0;
         let (matched, complete) = self.index.visit(bounds, limit, |i, place| {
+            if u64::from(place.len) > MAX_RECORD {
+                skipped += 1;
+                return Ok(());
+            }
             buf.resize(place.len as usize, 0);
             if shp.read_at(u64::from(place.offset), &mut buf).is_err() {
                 skipped += 1;
@@ -233,6 +241,10 @@ impl FeatureSource for ShpSource {
         // Every record id fits u32. This format bound visits them all while keeping SQLite's
         // LIMIT within its signed integer range on 64-bit hosts.
         let (matched, complete) = self.index.visit_complete(bounds, |i, place| {
+            if u64::from(place.len) > MAX_RECORD {
+                skipped += 1;
+                return Ok(());
+            }
             buf.resize(place.len as usize, 0);
             if shp.read_at(u64::from(place.offset), &mut buf).is_err() {
                 skipped += 1;

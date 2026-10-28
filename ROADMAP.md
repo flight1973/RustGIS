@@ -39,6 +39,8 @@ comment on its issue or pull request and open a draft pull request early.
 - Georeferencer: side-by-side window, transform picker, more formats
   ([#609](https://github.com/opengeos/RustGIS/issues/609)).
 
+- Rebindable keyboard shortcuts ([#562](https://github.com/opengeos/RustGIS/issues/562)).
+
 ## Next
 
 ### Fixes and quick wins
@@ -96,11 +98,9 @@ And alongside it:
 - A histogram for raster stretches; raster attribute tables.
 
 ### Data at the source
-- Write edits back to GeoPackage and PostGIS (edits stay in the project today). _Coordinate
-  first._
-- Open GeoLibre `.geolibre` projects as maps, the way supported QGIS projects open
-  ([#962](https://github.com/opengeos/RustGIS/issues/962)). GeoLibre opening
-  `.rgis` projects comes later, once RustGIS's project format and supported data types settle.
+- GeoLibre opening RustGIS `.rgis` projects, once RustGIS's project format and supported
+  data types settle. RustGIS imports GeoLibre projects; combined colour and size rendering
+  is tracked in [#1017](https://github.com/opengeos/RustGIS/issues/1017).
 - A date and date-time field type, read and written as dates (they are text today)
   ([#853](https://github.com/opengeos/RustGIS/issues/853)). _Coordinate first_ (it changes
   `FieldType`).
@@ -151,7 +151,6 @@ built-in version must justify itself on one of those.
 - Auto-refresh for web service layers.
 - A catalog of data cubes for the time slider
   ([#683](https://github.com/opengeos/RustGIS/issues/683)).
-- Rebindable keyboard shortcuts ([#562](https://github.com/opengeos/RustGIS/issues/562)).
 
 ## Exploratory
 Open questions rather than plans; discuss before building.
@@ -167,6 +166,8 @@ Open questions rather than plans; discuss before building.
 - An in-app Python console; an R package.
 
 ## Done
+- Save edits back to existing GeoPackage and PostGIS tables on desktop, with atomic saves,
+  conflict detection and discard/reload ([#1041](https://github.com/opengeos/RustGIS/issues/1041)).
 - Projects that survive a move: local data paths relative to the project and undoable Repair
   Data Source for layers and tile archives ([#879](https://github.com/opengeos/RustGIS/issues/879)).
 - Layered workspace, command registry with undo, project files (`.rgis`), `rustgis-cli`, the
@@ -186,8 +187,8 @@ Open questions rather than plans; discuss before building.
   standalone tables; geotagged photos and KML ground overlays; geocoding (Find Place, address
   tables); a Data Sources pane (favourites, recent, saved services, a library, reusable
   connections and dataset browsing) and an SQL pane (DuckDB Spatial); layer, map, style,
-  template, task and package files; supported QGIS `.qgs`/`.qgz` projects opened as maps, with
-  layer styles.
+  template, task and package files; supported QGIS `.qgs`/`.qgz` and GeoLibre `.geolibre` projects opened as maps,
+  with supported layer styles and notes on import differences.
 - Open data: STAC search (Planetary Computer assets), NASA Earthdata (desktop), Hugging Face,
   Overture Maps, Source Cooperative, OpenStreetMap by area (Overpass), geoBoundaries, CKAN,
   Socrata and ArcGIS Hub portals, and S3 buckets with signed connections and a bucket browser.

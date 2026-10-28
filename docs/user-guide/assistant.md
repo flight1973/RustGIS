@@ -302,9 +302,12 @@ that account. **Sign out** revokes the session at OpenAI and deletes its token; 
 can't be read, you are still signed out on this computer, and the settings say the session
 couldn't be ended at OpenAI. **Remove account** also forgets the account, once any keychain item it
 had is deleted: while the keychain can't be read or can't delete it, removal refuses, so no token
-is left behind in it. The command line has no keychain (it uses a sign-in from an earlier version still
-in the file), so its sign-ins last for the command only, and it can't use, sign out or remove an
-account whose token is in the keychain. The ChatGPT provider's address is fixed, so only the
+is left behind in it. Without `--use-saved-secrets`, the command line has no keychain (it uses a
+sign-in from an earlier version still in the file), so its sign-ins last for the command only,
+and it can't use, sign out or remove an account whose token is in the keychain. With the flag,
+it uses the keychain as the app does. Python's `Session(use_saved_secrets=True)` similarly opts
+connection commands into the system store; it does not add an assistant API. The ChatGPT
+provider's address is fixed, so only the
 OpenAI API receives the tokens. Renewals are serialized across RustGIS processes (a refresh token
 can be used only once), and the keychain is read under the same lock.
 Plain HTTP is only used for servers on your computer or local network.

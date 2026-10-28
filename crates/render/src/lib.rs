@@ -394,6 +394,19 @@ fn paint(c: Rgba, opacity: f32) -> Paint<'static> {
     p
 }
 
+/// The size, in device pixels across, up to which a filled polygon's outline is mitred
+/// (`Ctx::fill_outline`).
+const SMALL_POLYGON_PX: f32 = 4.0;
+
+/// The widest outline, in device pixels, mitred on a small polygon: the default 0.7 pt outline on
+/// a 2× screen (1.4 px), not one at print resolution, whose corners would show.
+const THIN_OUTLINE_PX: f32 = 2.0;
+
+/// How far, in outline widths, a mitred corner may reach (`Ctx::outline_px`). A limit of 2 bevels
+/// corners sharper than 60°, whose mitres would stand out as spikes on a polygon a few pixels
+/// across; a 90° corner, the commonest, reaches 0.7 widths past its vertex and stays mitred.
+const MITRE_LIMIT: f32 = 2.0;
+
 /// The most dashes a dashed stroke is cut into along one path (`Ctx::dash`).
 const MAX_DASHES: f32 = 100_000.0;
 
@@ -624,10 +637,31 @@ impl Ctx<'_> {
 
     /// A polygon's outline `w` points wide (round joins); none for no width.
     pub(crate) fn outline(&self, pm: &mut Pixmap, path: &tiny_skia::Path, p: &Paint, w: f32) {
+        self.outline_px(pm, path, p, w * self.ppp, LineJoin::Round);
+    }
+
+    /// A polygon's outline `w` device pixels wide, with the given `line_join`; none for no width.
+    /// Mitred corners sharper than 60° are bevelled ([`MITRE_LIMIT`]), so they don't grow spikes.
+    fn outline_px(&self, pm: &mut Pixmap, path: &tiny_skia::Path, p: &Paint, w: f32, line_join: LineJoin) {
         if w > 0.0 {
-            let st = Stroke { width: w * self.ppp, line_join: LineJoin::Round, ..Stroke::default() };
+            // Only mitred joins read the limit.
+            let st = Stroke { width: w, line_join, miter_limit: MITRE_LIMIT, ..Stroke::default() };
             pm.stroke_path(path, p, &st, Transform::identity(), None);
         }
+    }
+
+    /// A filled polygon's outline `w` points wide: with mitred joins (#1064) when the polygon is at
+    /// most [`SMALL_POLYGON_PX`] across and the outline at most [`THIN_OUTLINE_PX`] wide, round
+    /// otherwise. Round joins are curves the stroker builds at every vertex, which takes most of
+    /// the time a layer of many small polygons draws in; at that size a mitred corner covers nearly
+    /// the same pixels (a corner pixel may differ a little; the layer's tone doesn't). A wider
+    /// outline (an export at print resolution, a thick line) or a larger polygon keeps its round
+    /// corners.
+    fn fill_outline(&self, pm: &mut Pixmap, path: &tiny_skia::Path, p: &Paint, w: f32) {
+        let px = w * self.ppp;
+        let b = path.bounds();
+        let small = b.width().max(b.height()) <= SMALL_POLYGON_PX && px <= THIN_OUTLINE_PX;
+        self.outline_px(pm, path, p, px, if small { LineJoin::Miter } else { LineJoin::Round });
     }
 
     fn line(&self, pm: &mut Pixmap, parts: &[Vec<Coord>], p: &Paint, w: f32) {
@@ -844,7 +878,14 @@ impl Ctx<'_> {
             Geometry::Polygon(polys) if self.wireframe => {
                 self.polygon(pm, polys, None, Some((paint(s.stroke.with_alpha(255), 1.0), s.stroke_width.max(1.0))))
             }
-            Geometry::Polygon(polys) => self.polygon(pm, polys, Some(paint(s.fill, 1.0)), Some((paint(s.stroke, 1.0), s.stroke_width))),
+            // A small filled polygon's outline may be mitred; one without a fill is its outline
+            // alone, which keeps its round joins.
+            Geometry::Polygon(polys) if s.fill.a() > 0 => {
+                let Some(path) = self.polygon_path(polys) else { return };
+                pm.fill_path(&path, &paint(s.fill, 1.0), FillRule::EvenOdd, Transform::identity(), None);
+                self.fill_outline(pm, &path, &paint(s.stroke, 1.0), s.stroke_width);
+            }
+            Geometry::Polygon(polys) => self.polygon(pm, polys, None, Some((paint(s.stroke, 1.0), s.stroke_width))),
         }
     }
 
@@ -6028,6 +6069,98 @@ mod tests {
         // A 3 pt outline at 2× is 6 px wide: drawn as a ring, not a dot.
         let thick = Symbol { stroke_width: 3.0, ..thin };
         assert!(!ctx.splat(&mut pm, &g.extent(), &g, &thick));
+    }
+
+    /// A filled polygon a few pixels across has its 1.4 px outline mitred, which covers nearly the
+    /// same pixels as round joins at that size; a larger polygon, an outline-only one and a wide
+    /// outline keep round joins (#1064).
+    #[test]
+    fn small_filled_polygons_have_mitred_outlines_that_look_the_same() {
+        let view = View {
+            width: 100.0,
+            height: 100.0,
+            pixels_per_point: 2.0,
+            camera: Camera { center: Coord::new(0.0, 0.0), res: 1.0, bearing: 0.0, pitch: 0.0 },
+            sky: false,
+        };
+        let ctx = Ctx { view: &view, ppp: 2.0, wireframe: false, cull: Extent::EMPTY, globe: None, sprites: Default::default() };
+        let sym =
+            Symbol { fill: Rgba::rgb(200, 120, 0), stroke: Rgba::rgb(30, 30, 30), stroke_width: 0.7, size: 0.0, marker: Marker::Circle };
+        // Polygons `cell` map units across (twice that in device px), tiled as land cover is, each
+        // a staircase of 7 steps a side, as land cover traced from a raster is.
+        let grid = |cell: f64| -> Vec<Geometry> {
+            let n = (90.0 / cell) as usize;
+            (0..n)
+                .flat_map(|i| (0..n).map(move |j| (i, j)))
+                .map(|(i, j)| {
+                    let (x, y, s) = (-45.0 + i as f64 * cell, -45.0 + j as f64 * cell, cell / 7.0);
+                    let step = |t: usize| if (i * 31 + j * 17 + t).is_multiple_of(3) { s * 0.3 } else { 0.0 };
+                    let mut ring = Vec::new();
+                    for t in 0..7 {
+                        ring.push(Coord::new(x + t as f64 * s, y + step(t)));
+                        ring.push(Coord::new(x + (t + 1) as f64 * s, y + step(t)));
+                    }
+                    ring.push(Coord::new(x + cell, y + cell));
+                    for t in (1..=7).rev() {
+                        ring.push(Coord::new(x + t as f64 * s, y + cell - step(t + 7)));
+                        ring.push(Coord::new(x + (t - 1) as f64 * s, y + cell - step(t + 7)));
+                    }
+                    ring.push(Coord::new(x, y + step(0)));
+                    Geometry::Polygon(vec![vec![ring]])
+                })
+                .collect()
+        };
+        let draw = |gs: &[Geometry], s: &Symbol, round: bool| {
+            let mut pm = Pixmap::new(200, 200).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            for g in gs {
+                match g {
+                    Geometry::Polygon(polys) if round => {
+                        ctx.polygon(&mut pm, polys, Some(paint(s.fill, 1.0)), Some((paint(s.stroke, 1.0), s.stroke_width)))
+                    }
+                    _ => ctx.feature(&mut pm, g, s),
+                }
+            }
+            pm
+        };
+        // 1.5 and 1.9 points across: 3 and 3.8 device px.
+        for cell in [1.5, 1.9] {
+            let small = grid(cell);
+            let (mitred, round) = (draw(&small, &sym, false), draw(&small, &sym, true));
+            assert_ne!(mitred.data(), round.data(), "{cell}: mitred");
+            let d = mitred.data().iter().zip(round.data()).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / round.data().len() as f64;
+            assert!(d < 0.5, "{cell}: a mean difference of {d} per channel");
+        }
+        // Larger, without a fill or with a wide outline: as before, pixel for pixel.
+        let large = grid(2.5);
+        assert_eq!(draw(&large, &sym, false).data(), draw(&large, &sym, true).data());
+        let small = grid(1.9);
+        let hollow = Symbol { fill: Rgba::new(0, 0, 0, 0), ..sym };
+        assert_eq!(draw(&small, &hollow, false).data(), draw(&small, &hollow, true).data());
+        let wide = Symbol { stroke_width: 1.5, ..sym };
+        assert_eq!(draw(&small, &wide, false).data(), draw(&small, &wide, true).data());
+        // The limits themselves are mitred: a polygon 4 device px across, and a 2 px outline.
+        let four = grid(2.0);
+        assert_ne!(draw(&four, &sym, false).data(), draw(&four, &sym, true).data(), "4 px across");
+        let two = Symbol { stroke_width: 1.0, ..sym };
+        assert_ne!(draw(&small, &two, false).data(), draw(&small, &two, true).data(), "a 2 px outline");
+        // Triangles with corners from 10° to 80°: the sharp ones are bevelled, so no corner grows
+        // a spike. A corner pixel differs as a bevelled one does (98 levels at most here); with
+        // tiny-skia's own limit of 4, mitres reach 141.
+        let triangles: Vec<Geometry> = (0..64)
+            .map(|k| {
+                let (x, y) = (-44.0 + (k % 8) as f64 * 11.0, -44.0 + (k / 8) as f64 * 11.0);
+                let a = (10.0 + k as f64 * 70.0 / 63.0).to_radians();
+                let ring =
+                    vec![Coord::new(x, y), Coord::new(x + 1.9, y), Coord::new(x + 1.9 * a.cos(), y + 1.9 * a.sin()), Coord::new(x, y)];
+                Geometry::Polygon(vec![vec![ring]])
+            })
+            .collect();
+        let (mitred, round) = (draw(&triangles, &sym, false), draw(&triangles, &sym, true));
+        let max = mitred.data().iter().zip(round.data()).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+        assert!(max <= 100, "a pixel {max} levels off");
+        let d = mitred.data().iter().zip(round.data()).map(|(x, y)| x.abs_diff(*y) as f64).sum::<f64>() / round.data().len() as f64;
+        assert!(d < 0.5, "triangles: a mean difference of {d} per channel");
     }
 
     #[test]

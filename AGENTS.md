@@ -22,6 +22,7 @@ Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
 | L1 | `data` | features, typed attributes, GeoJSON/CSV/Shapefile/KML/GPX I/O, GeoPackage/GeoParquet/FlatGeobuf/LiDAR (LAS/LAZ)/PostGIS/MySQL providers (`source`; PostGIS through the pure-Rust `postgres` client, MySQL and MariaDB through the pure-Rust `mysql` client, desktop only; GeoPackages in the browser through the pure-Rust `sqlite` reader; GDAL formats and DuckDB queries through their programs), SQL where clauses, rasters (GeoTIFF/ASCII grid, Zarr stores, EPSG reprojection) |
 | L2 | `map`, `analysis` | layers, symbology, labels, camera, basemaps, web tile layers; geoprocessing tools |
 | L2 | `tiles` | web map tiles: XYZ/TMS/WMS rasters, Mapbox Vector Tiles, PMTiles and MBTiles archives, a MapLibre style subset; the tile cache and background fetching (see `docs/user-guide/maps.md` › Basemaps) |
+| L2 | `keychain` | the system's secret store (macOS Keychain, Windows Credential Manager, Secret Service) behind `SecretStore`; the desktop app, the CLI's `--use-saved-secrets` and Python's `use_saved_secrets` |
 | L3 | `render` | tiny-skia map renderer, label placement, PNG export, font discovery |
 | L3 | `plugins` | plugins: sandboxed WebAssembly modules (`wasmi`) adding commands and tools; `.rgplugin` packages, the plugin registry (see `docs/plugins.md`) |
 | L3 | `geolibre` | the GeoLibre/Whitebox tool suite as geoprocessing tools (engine feature `geolibre`): run by the optional `geolibre` program natively, by geolibre-rust's WASI runner in the browser |

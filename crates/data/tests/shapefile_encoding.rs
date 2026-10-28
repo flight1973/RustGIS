@@ -96,6 +96,50 @@ fn shapefile_uses_dbf_code_page_when_cpg_is_absent() {
     }
 }
 
+/// Language driver IDs dbase doesn't know, as GDAL reads them (#1079): Spanish and Western
+/// European ANSI, the Baltic, Korean and Mac pages, and DOS ones by their other numbers.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn language_drivers_dbase_lacks_decode_text_without_cpg_in_all_readers() {
+    use rustgis_data::source::{FeatureSource, Request, shp::ShpSource};
+    for (ldid, text, expected) in [
+        (0x59, b"\xc1guilas".as_slice(), "Águilas"),
+        (0x58, b"\xc1guilas".as_slice(), "Águilas"),
+        (0xcc, b"\xd0iauliai".as_slice(), "Šiauliai"),
+        (0x4e, b"\xbc\xad\xbf\xef".as_slice(), "서울"),
+        (0x26, b"\x8c\xae\xe1\xaa\xa2\xa0".as_slice(), "Москва"),
+        (0x1f, b"\xacesk\xec".as_slice(), "Český"),
+        (0x37, b"Se\xa4or".as_slice(), "Señor"),
+        (0x04, b"Caf\x8e".as_slice(), "Café"),
+        (0x96, b"\x8a\xe8\xe5\xe2".as_slice(), "Киев"),
+    ] {
+        let files = parts(text, ldid, None);
+        let layers = io::read_zip("places.zip", &rustgis_data::zip::write(&files).unwrap()).unwrap();
+        assert_eq!(layers[0].0.value(0, 0), &Value::Text(expected.into()), "LDID {ldid:02X}");
+        assert!(layers[0].1.messages.is_empty(), "LDID {ldid:02X}: {:?}", layers[0].1.messages);
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in files {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let path = dir.path().join("places.shp");
+        assert_eq!(io::read_path(&path).unwrap().0.value(0, 0), &Value::Text(expected.into()), "LDID {ldid:02X}");
+        let src = ShpSource::open_path(&path, "places").unwrap();
+        assert_eq!(src.read(&Request::all()).unwrap().features[0].attrs, [Value::Text(expected.into())], "LDID {ldid:02X}");
+        assert!(src.info().notes.is_empty(), "LDID {ldid:02X}: {:?}", src.info().notes);
+    }
+}
+
+/// A language driver whose code page RustGIS can't decode (DOS 863, French Canadian) is named in
+/// the note, and the text read as UTF-8.
+#[test]
+fn undecodable_dbf_code_page_is_named_in_the_utf8_fallback() {
+    let files = parts("Montréal".as_bytes(), 0x6c, None);
+    let layers = io::read_zip("places.zip", &rustgis_data::zip::write(&files).unwrap()).unwrap();
+    assert_eq!(layers[0].0.value(0, 0), &Value::Text("Montréal".into()));
+    let said = &layers[0].1.messages;
+    assert!(said.iter().any(|m| m.contains("0x6C (code page 863, DOS French Canadian)") && m.contains("UTF-8")), "{said:?}");
+}
+
 #[test]
 fn unknown_dbf_code_page_reports_utf8_fallback() {
     let files = parts("Montréal".as_bytes(), 0xff, None);

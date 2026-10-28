@@ -30,6 +30,9 @@ struct Key {
     tiles: u64,
     /// Streamed layers' reads finished so far: a new one draws the map again.
     sources: u64,
+    /// Which map, and which of its layers in what order, are shown ([`shown_layers`]): a frame
+    /// is kept through a change to the contents only while this holds.
+    shown: u64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -79,7 +82,13 @@ pub struct Popup {
     pub opened: u64,
     /// The WMS layers being asked what is at the point, whose features join the list.
     pub asks: Vec<Ask>,
+    /// When it opened: it waits for the WMS layers' answers up to [`ASK_WAIT`] from then.
+    since: web_time::Instant,
 }
+
+/// How long a pop-up waits for the WMS layers asked before it shows what was found: then their
+/// answers join it as they come.
+const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// A WMS layer asked what is at a popup's point (GetFeatureInfo), its answer on the way: the
 /// request's, or first its service's capabilities (a layer from a project doesn't know its request).
@@ -120,13 +129,77 @@ impl Popup {
             let request = (!capabilities).then(|| url.to_string());
             asks.push(Ask { layer, also: Vec::new(), capabilities, request, slot });
         }
-        Popup { info, at, index: 0, map, opened, asks }
+        Popup { info, at, index: 0, map, opened, asks, since: web_time::Instant::now() }
+    }
+
+    /// Whether it waits for the WMS layers asked, to show their answers and what was found
+    /// together, in drawing order: a layer drawn over the feature found may answer, and take its
+    /// place.
+    fn asking(&self) -> bool {
+        !self.asks.is_empty() && self.since.elapsed() < ASK_WAIT
     }
 }
 
 /// Whether a popup's value is a feature or pixel found, not only WMS layers still being asked.
 fn is_found(v: &Value) -> bool {
     v.get("layer").is_some() || v.get("attributes").is_some()
+}
+
+/// A popup's results: its list, or the one feature or pixel found; none while it only waits for
+/// WMS layers' answers.
+fn results_of(info: &Value) -> Vec<Value> {
+    match info["results"].as_array() {
+        Some(r) => r.clone(),
+        None if is_found(info) => vec![info.clone()],
+        None => Vec::new(),
+    }
+}
+
+/// Where the result at `index` of `before` is in `after`, the pop-up's results once some were
+/// added or left out: the same one of identical results (a service may answer a feature twice,
+/// and both lists keep their order), or the first when it's gone.
+fn index_after(before: &[Value], index: usize, after: &[Value]) -> usize {
+    let Some(shown) = before.get(index) else { return 0 };
+    let nth = before.iter().take(index).filter(|v| *v == shown).count();
+    after.iter().enumerate().filter(|(_, v)| *v == shown).nth(nth).map_or(0, |(i, _)| i)
+}
+
+/// A popup's results with the WMS layers' answers `found` added, in the map's drawing order, top
+/// first, as identify ranks what it finds itself: a WMS layer drawn over the feature found comes
+/// before it, and with topmost, the map's pop-up mode by default, takes its place once it answers
+/// with features. `None` with nothing to show.
+fn with_answers(map: &rustgis_engine::map::Map, info: &Value, found: Vec<Value>) -> Option<Value> {
+    use rustgis_engine::map::Drawn;
+    let mut all = results_of(info);
+    all.extend(found);
+    // A tile layer's results show while it draws: one hidden since must not keep a later answer
+    // out. Of two layers of one name, the answers are placed by the one drawn (though
+    // identify.featureInfo tells its answer to the first of them, drawn or not).
+    let drawn = |name: &str| map.tiles.iter().position(|t| t.name == name && t.draws());
+    all.retain(|v| v["tileLayer"].as_str().is_none_or(|name| drawn(name).is_some()));
+    let stack = map.stack();
+    // A tile layer's feature by its layer's name (two of one name drawn take the higher one's
+    // place, as their answers are told apart by name too), a map layer's (or raster's pixel) by
+    // its id; anything else after them all.
+    let place = |v: &Value| {
+        let drawn = match v["tileLayer"].as_str() {
+            Some(name) => drawn(name).map(Drawn::Tile),
+            None => v["layerId"].as_u64().and_then(|id| u32::try_from(id).ok()).and_then(|id| map.layer_index(id)).map(Drawn::Layer),
+        };
+        drawn.and_then(|d| stack.iter().position(|o| *o == d)).unwrap_or(usize::MAX)
+    };
+    // Stable: each layer's results keep the order identify or the service gave them.
+    all.sort_by_cached_key(place);
+    if map.popup_mode == rustgis_engine::map::PopupMode::Topmost {
+        let top = all.first().map(place);
+        all.retain(|v| Some(place(v)) == top);
+    }
+    let mut first = all.first().cloned()?;
+    if let Value::Object(o) = &mut first {
+        o.remove("featureInfo");
+        o.insert("results".into(), Value::Array(all));
+    }
+    Some(first)
 }
 
 /// A notice shown as a toast.
@@ -153,6 +226,8 @@ pub struct MapView {
     key: Option<Key>,
     /// A preview is attempted once for each frame key, including when drawing fails.
     preview_attempt: Option<Key>,
+    /// The frame on screen kept through a change to the map's contents, and since when (s).
+    kept: Option<(Key, f64)>,
     tex_camera: Camera,
     /// The size (points) of the view the texture was drawn for: larger than the map while it
     /// moves, so zooming out and panning have more of it to show.
@@ -276,6 +351,7 @@ impl Default for MapView {
             texture: None,
             key: None,
             preview_attempt: None,
+            kept: None,
             tex_camera: Camera::world(),
             tex_size: (0.0, 0.0),
             tex_rect: Rect::NOTHING,
@@ -372,6 +448,7 @@ impl MapView {
     pub fn invalidate(&mut self) {
         self.key = None;
         self.preview_attempt = None;
+        self.kept = None;
         self.gpu_frame = None;
         self.tilt_settle = Default::default();
     }
@@ -675,6 +752,8 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         draft,
         tiles: 0,
         sources: rustgis_engine::map::source::generation(),
+        // Read only for tiled maps (see `keeps_frame`).
+        shown: if app.session.map().tiles.is_empty() { 0 } else { shown_layers(&app.session) },
     };
     // Tiles arriving draw the map again, at most a few times a second.
     static WAKER: std::sync::Once = std::sync::Once::new();
@@ -717,16 +796,33 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     if hold {
         ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(RESIZE_SETTLE));
     }
+    // Exact globe, tilted and tiled flat frames are composed off the UI thread. A drape or
+    // cached flat picture keeps navigation and layer changes responsive while they finish.
+    let tiled_flat = !globe_view && cam.bearing == 0.0 && cam.pitch == 0.0 && !app.session.map().tiles.is_empty();
+    // A change to a tiled flat map's contents that leaves the same layers shown (a layer's colour
+    // or transparency, its labels, an edit) keeps the frame on screen, labels and all, until the
+    // exact frame arrives (#1051).
+    let restyled =
+        tiled_flat && (app.map.texture.is_some() || app.map.gpu_frame.is_some()) && keeps_frame(app.map.key, key, app.map.render_ms);
+    // At most `KEEP_FRAME_S` from when the frame went out of date: the exact frame of a change
+    // can take longer than the last one did. A frame shown meanwhile starts the wait again.
+    if !restyled {
+        app.map.kept = None;
+    } else if app.map.kept.is_none_or(|(k, _)| Some(k) != app.map.key) {
+        app.map.kept = app.map.key.map(|k| (k, time));
+    }
+    let waited = app.map.kept.map_or(0.0, |(_, at)| time - at);
+    let keep_frame = restyled && waited <= KEEP_FRAME_S;
+    if keep_frame {
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64((KEEP_FRAME_S - waited).max(0.0) + 0.01));
+    }
     // Labels belong to the rendered contents. When visibility or data change, old labels
     // must disappear with their layers while a preview stands in for the exact frame.
-    if app.map.key.is_none_or(|k| k.rev != key.rev) {
+    if app.map.key.is_none_or(|k| k.rev != key.rev) && !keep_frame {
         app.map.labels.clear();
         app.map.label_lonlat.clear();
         app.map.label_map.clear();
     }
-    // Exact globe, tilted and tiled flat frames are composed off the UI thread. A drape or
-    // cached flat picture keeps navigation and layer changes responsive while they finish.
-    let tiled_flat = !globe_view && cam.bearing == 0.0 && cam.pitch == 0.0 && !app.session.map().tiles.is_empty();
     let settling = (tilted || globe_view || tiled_flat) && !moving && app.ws.playing.is_none() && !hold;
     let mut tilt_draped = tilt_draped;
     // A frame finishing during a new gesture is obsolete. Drain it now so it neither holds
@@ -764,8 +860,9 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             if same_view(k, key) && done.rendered.is_none() {
                 app.map.filling = false;
             }
-            // One drawn before tiles or data arrived still shows; the next follows.
-            if same_view(k, key)
+            // One drawn before tiles or data arrived still shows; the next follows. So does one
+            // of a change made since, for a view whose frame on screen is older still.
+            if (same_view(k, key) || (tiled_flat && shows_finished(k, key, app.map.key)))
                 && let Some(r) = done.rendered
             {
                 // With tile pictures still to draw, a draft: the next frame draws more.
@@ -810,7 +907,8 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 draped = app.map.drape.prepare(ui.ctx(), app.session.map_mut(), drape_key, tiles, w, h, ppp, time);
             } else if tilted {
                 tilt_draped = app.map.tilt_drape.prepare(ui.ctx(), app.session.map_mut(), drape_key, tiles, w, h, ppp, time);
-            } else if app.map.preview_attempt != Some(key) && !reprojects {
+            } else if app.map.preview_attempt != Some(key) && !reprojects && !(keep_frame && app.map.tilt_settle.busy()) {
+                // A kept frame waits for the exact one; if that couldn't be drawn, a preview.
                 // A small preview shows a visibility change immediately. The exact frame is
                 // already on its way. Even a failed preview is attempted only once per key.
                 app.map.preview_attempt = Some(key);
@@ -1720,7 +1818,8 @@ fn finish_area_selection(app: &mut RustGisApp, ui: &Ui, rect: Rect) {
 
 fn selection_interact(app: &mut RustGisApp, ui: &Ui, resp: &egui::Response, rect: Rect) {
     let tool = app.session.tool;
-    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+    // While a shortcut is being captured, Escape cancels the capture, not the sketch.
+    if !app.ui.shortcut_editor.capturing() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         app.map.cancel_sketch();
         return;
     }
@@ -1996,7 +2095,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         }
     }
     // First-person navigation: W A S D walk, Q and E fly up and down.
-    if app.session.map().view.first_person && !ui.ctx().egui_wants_keyboard_input() {
+    if app.session.map().view.first_person && !app.ui.shortcut_editor.capturing() && !ui.ctx().egui_wants_keyboard_input() {
         let (mut fw, mut rt, mut up) = (0.0, 0.0, 0.0);
         ui.input(|i| {
             // Shortcuts (Ctrl+S, Ctrl+E…) aren't steps.
@@ -2914,7 +3013,8 @@ fn follow_popup(app: &mut RustGisApp) {
     let here: Vec<bool> = results
         .iter()
         .map(|r| match home(r) {
-            Home::NoLayer => true,
+            // A tile layer's answer, while the layer draws (as `with_answers` keeps them).
+            Home::NoLayer => r["tileLayer"].as_str().is_none_or(|name| map.tiles.iter().any(|t| t.name == name && t.draws())),
             Home::LayerGone => false,
             // A streamed layer holds a window of its features: one outside it isn't gone.
             Home::Layer(l) => r["fid"].as_u64().is_none_or(|fid| l.dataset.windowed || found.contains(&(l.id, fid))),
@@ -2928,10 +3028,9 @@ fn follow_popup(app: &mut RustGisApp) {
     if here.iter().all(|h| *h) {
         return;
     }
-    let shown = results.get(index).cloned();
-    let kept: Vec<Value> = results.into_iter().zip(here).filter(|(_, h)| *h).map(|(r, _)| r).collect();
+    let kept: Vec<Value> = results.iter().zip(here).filter(|(_, h)| *h).map(|(r, _)| r.clone()).collect();
     let Some(mut info) = kept.first().cloned() else { return };
-    pp.index = shown.and_then(|s| kept.iter().position(|k| *k == s)).unwrap_or(0);
+    pp.index = index_after(&results, index, &kept);
     if let Value::Object(o) = &mut info {
         o.insert("results".into(), Value::Array(kept));
     }
@@ -2967,10 +3066,12 @@ fn follow_asks(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     let mut found = Vec::new();
     let mut next = Vec::new();
-    let exists = |app: &RustGisApp, layer: &str| app.session.map().tiles.iter().any(|t| t.name == layer);
+    // Only answers from layers drawn are shown: one hidden while its answer came would otherwise
+    // take the pop-up from a feature in view.
+    let exists = |app: &RustGisApp, layer: &str| app.session.map().tiles.iter().any(|t| t.name == layer && t.draws());
     for (layer, also, capabilities, request, r) in landed {
-        // Layers removed or renamed while the answer came: nothing to show, nothing to tell. The
-        // first of a service's layers still there takes the capabilities for the rest.
+        // Layers removed, renamed or hidden while the answer came: nothing to show, nothing to
+        // tell. The first of a service's layers still there takes the capabilities for the rest.
         let mut group = std::iter::once(layer).chain(also).filter(|l| exists(app, l));
         let Some(layer) = group.next() else { continue };
         let also: Vec<String> = group.collect();
@@ -3012,21 +3113,28 @@ fn follow_asks(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     let Some(pp) = &mut app.map.popup else { return };
     pp.asks.extend(next);
-    if !found.is_empty() {
-        let mut all: Vec<Value> = match pp.info["results"].as_array() {
-            Some(r) => r.clone(),
-            None if is_found(&pp.info) => vec![pp.info.clone()],
-            None => Vec::new(),
-        };
-        all.extend(found);
-        if let Some(mut info) = all.first().cloned() {
-            if let Value::Object(o) = &mut info {
-                o.remove("featureInfo");
-                o.insert("results".into(), Value::Array(all));
-            }
-            pp.info = info;
+    // Answers that land while the pop-up waits for them: it shows nothing yet, so it opens on the
+    // top result, and selects its feature.
+    let waited = pp.since.elapsed() < ASK_WAIT;
+    if !found.is_empty()
+        && let Some(info) = with_answers(app.session.map(), &pp.info, found)
+    {
+        if waited {
+            pp.index = 0;
+        } else {
+            // The result shown stays shown, wherever the answers went; the first when it was left
+            // out (a layer drawn higher answered, with topmost).
+            let before = results_of(&pp.info);
+            // As the pop-up shows it: an index past the end is the last result.
+            let index = pp.index.min(before.len().saturating_sub(1));
+            pp.index = index_after(&before, index, info["results"].as_array().map(Vec::as_slice).unwrap_or_default());
+        }
+        pp.info = info;
+        if waited {
+            select_shown(app);
         }
     }
+    let Some(pp) = &mut app.map.popup else { return };
     if pp.asks.is_empty() && !is_found(&pp.info) {
         app.map.popup = None;
     }
@@ -3041,14 +3149,22 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     if !rect.contains(anchor) {
         return;
     }
-    let results = pp.info["results"].as_array().map_or(0, Vec::len);
+    // Waiting for the WMS layers' answers, it shows none of the results yet.
+    let asking = pp.asking();
+    let results = if asking { 0 } else { pp.info["results"].as_array().map_or(0, Vec::len) };
     let index = pp.index.min(results.saturating_sub(1));
-    let info = if results > 1 { pp.info["results"][index].clone() } else { pp.info.clone() };
+    let info = if asking {
+        Value::Null
+    } else if results > 1 {
+        pp.info["results"][index].clone()
+    } else {
+        pp.info.clone()
+    };
     let mut step: Option<usize> = None;
     let mut zoom = false;
     // The feature shown, as its layer id and feature id (a raster pixel has neither).
     let shown = info["layerId"].as_u64().and_then(|id| u32::try_from(id).ok()).zip(info["fid"].as_u64());
-    // Only WMS layers being asked so far: their names.
+    // Only WMS layers being asked so far, or still waited for: their names.
     let waiting = !is_found(&info);
     let layer = if waiting {
         pp.asks.iter().map(|a| a.layer.as_str()).collect::<Vec<_>>().join(", ")
@@ -3223,22 +3339,27 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
         app.map.popup = None;
     } else if let (Some(i), Some(pp)) = (step, &mut app.map.popup) {
         pp.index = i;
-        // The feature shown is the one selected, as after the click. Not through `select.rows`:
-        // browsing a pop-up mustn't fill the undo history; the new revision redraws the map.
-        // Found again by its feature id: a streamed layer may have read another window since the
-        // click, moving the feature to another row (or out of the layer: then nothing is selected).
-        let shown = pp.info["results"].get(i).and_then(|r| Some((u32::try_from(r["layerId"].as_u64()?).ok()?, r["fid"].as_u64()?)));
-        let found = shown.and_then(|(id, fid)| {
-            let row = app.session.map().layer(id)?.dataset.features.iter().position(|f| f.id == fid)?;
-            Some((id, row))
-        });
-        if let Some((id, row)) = found {
-            rustgis_engine::cmd::select::set(&mut app.session, id, vec![row], rustgis_engine::cmd::select::Mode::New);
-        } else {
-            app.session.map_mut().clear_selection();
-        }
-        app.session.revision = app.session.revision.wrapping_add(1);
+        select_shown(app);
     }
+}
+
+/// Selects the feature the pop-up shows, as after the click. Not through `select.rows`: browsing
+/// a pop-up mustn't fill the undo history; the new revision redraws the map. Found again by its
+/// feature id: a streamed layer may have read another window since the click, moving the feature
+/// to another row (or out of the layer: then nothing is selected).
+fn select_shown(app: &mut RustGisApp) {
+    let Some(pp) = &app.map.popup else { return };
+    let shown = pp.info["results"].get(pp.index).and_then(|r| Some((u32::try_from(r["layerId"].as_u64()?).ok()?, r["fid"].as_u64()?)));
+    let found = shown.and_then(|(id, fid)| {
+        let row = app.session.map().layer(id)?.dataset.features.iter().position(|f| f.id == fid)?;
+        Some((id, row))
+    });
+    if let Some((id, row)) = found {
+        rustgis_engine::cmd::select::set(&mut app.session, id, vec![row], rustgis_engine::cmd::select::Mode::New);
+    } else {
+        app.session.map_mut().clear_selection();
+    }
+    app.session.revision = app.session.revision.wrapping_add(1);
 }
 
 /// Whether an attribute value is a picture (a `data:image/png` or `jpeg` address, as a photo's
@@ -3599,6 +3720,59 @@ fn scene_covers(scene: Camera, cam: Camera, w: f64, h: f64) -> bool {
     !e.is_empty() && e.min_x >= held.min_x && e.min_y >= held.min_y && e.max_x <= held.max_x && e.max_y <= held.max_y
 }
 
+/// How long (ms) the last exact frame may have taken for a change to the map's contents to keep
+/// it on screen until the next one arrives, rather than showing a coarse preview (#1051); and how
+/// long it is kept at most, should the next one take longer.
+const KEEP_FRAME_MS: u64 = 300;
+const KEEP_FRAME_S: f64 = KEEP_FRAME_MS as f64 / 1000.0;
+
+/// Which project and map are open, the map's backdrop, and which of its layers, groups and tile
+/// layers are drawn, in order: a frame of other layers (one hidden, added, removed or moved since,
+/// another basemap, map or project) shows a preview of the change instead of staying on screen.
+fn shown_layers(session: &rustgis_engine::Session) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    let project = &session.project;
+    let map = project.map();
+    (&session.path, &project.name, project.active_map, &map.name, map.basemap, map.graticule).hash(&mut h);
+    for l in &map.layers {
+        (l.id, l.visible).hash(&mut h);
+    }
+    for g in &map.groups {
+        (g.id, g.visible, &g.children).hash(&mut h);
+    }
+    for t in &map.tiles {
+        (&t.name, &t.url, t.draws(), t.over).hash(&mut h);
+    }
+    // What is drawn, not how it looks: view effects and colour vision, like a layer's style,
+    // keep the frame until the exact one (at most `KEEP_FRAME_S`).
+    h.finish()
+}
+
+/// Whether revision `a` is later than `b` (revisions wrap).
+fn later(a: u64, b: u64) -> bool {
+    a.wrapping_sub(b).cast_signed() > 0
+}
+
+/// Whether a change to the map's contents keeps the frame on screen (`shown`) until the exact
+/// frame for `key` arrives, instead of a coarse preview of the whole map: the view and the layers
+/// shown are the same (a layer's colour, transparency, symbology or labels changed, or its
+/// features were edited) and its frames are quick to draw (`render_ms`). A preview of a tiled
+/// map drew the basemap coarsely too, so dragging a layer's colour or transparency slider made
+/// the whole map flicker between blurry and sharp.
+fn keeps_frame(shown: Option<Key>, key: Key, render_ms: u64) -> bool {
+    render_ms <= KEEP_FRAME_MS && shown.is_some_and(|s| later(key.rev, s.rev) && (s.cam, s.size, s.shown) == (key.cam, key.size, key.shown))
+}
+
+/// Whether a frame finished for `done` is shown although the map's contents changed since (to
+/// `key`): it is of the same view and layers, and later than the frame on screen (`shown`), which
+/// is of an older change too. While a slider is dragged every exact frame is out of date when it
+/// finishes; showing none kept the frame from before the drag up until it ended.
+fn shows_finished(done: Key, key: Key, shown: Option<Key>) -> bool {
+    let view = |k: Key| (k.cam, k.size, k.shown);
+    later(key.rev, done.rev) && view(done) == view(key) && shown.is_some_and(|s| later(done.rev, s.rev) && view(s) == view(key))
+}
+
 /// How long (s) after a frame is shown tiles arriving wait before the map is drawn again.
 const TILE_REDRAW_GAP: f64 = 0.25;
 
@@ -3620,10 +3794,10 @@ fn held_tiles(key: Key, drawing: Option<Key>, shown: Option<Key>, since_render: 
 
 #[cfg(test)]
 mod tile_redraw_tests {
-    use super::{Key, held_tiles};
+    use super::{KEEP_FRAME_MS, Key, held_tiles, keeps_frame, shows_finished};
 
     fn key(tiles: u64) -> Key {
-        Key { rev: 4, cam: (1, 2, 3, 0, 0), size: [800, 600], draft: false, tiles, sources: 0 }
+        Key { rev: 4, cam: (1, 2, 3, 0, 0), size: [800, 600], draft: false, tiles, sources: 0, shown: 0 }
     }
 
     #[test]
@@ -3665,6 +3839,62 @@ mod tile_redraw_tests {
         }
         assert_eq!(started, 0);
         assert_eq!(shown, Some(key(28)));
+    }
+
+    #[test]
+    fn a_change_to_the_contents_keeps_a_quick_frame_instead_of_a_preview() {
+        // #1051: a layer's colour changed, the view didn't: the frame on screen stays.
+        let changed = Key { rev: 5, ..key(3) };
+        assert!(keeps_frame(Some(key(3)), changed, 40));
+        assert!(keeps_frame(Some(Key { draft: true, ..key(3) }), changed, 40), "a draft of the view stays too");
+        // Slow frames show a preview: the old picture would stay wrong too long.
+        assert!(!keeps_frame(Some(key(3)), changed, KEEP_FRAME_MS + 1));
+        // Another view, or nothing on screen: a preview.
+        assert!(!keeps_frame(Some(Key { cam: (9, 9, 9, 0, 0), ..key(3) }), changed, 40));
+        assert!(!keeps_frame(Some(Key { size: [400, 300], ..key(3) }), changed, 40));
+        // A layer hidden, added, removed or moved, or another map: a preview.
+        assert!(!keeps_frame(Some(Key { shown: 1, ..key(3) }), changed, 40));
+        assert!(!keeps_frame(None, changed, 40));
+        // Nothing changed: nothing to keep.
+        assert!(!keeps_frame(Some(key(3)), key(3), 40));
+    }
+
+    #[test]
+    fn a_frame_of_an_earlier_change_shows_while_a_slider_is_dragged() {
+        let (on_screen, done, now) = (Key { rev: 4, ..key(0) }, Key { rev: 6, ..key(0) }, Key { rev: 9, ..key(0) });
+        assert!(shows_finished(done, now, Some(on_screen)));
+        // The frame on screen is already of the latest change, or is the finished one.
+        assert!(!shows_finished(done, now, Some(now)));
+        assert!(!shows_finished(done, now, Some(done)));
+        // A frame of another view, or one of the latest change (shown the usual way).
+        assert!(!shows_finished(Key { cam: (9, 9, 9, 0, 0), ..done }, now, Some(on_screen)));
+        assert!(!shows_finished(now, now, Some(on_screen)));
+        assert!(!shows_finished(done, now, None));
+        // Older than the frame on screen, or of other layers: not shown.
+        assert!(!shows_finished(on_screen, now, Some(done)));
+        assert!(!shows_finished(Key { shown: 1, ..done }, now, Some(on_screen)));
+        // Revisions wrap.
+        let (old, newer, latest) = (Key { rev: u64::MAX, ..key(0) }, Key { rev: 1, ..key(0) }, Key { rev: 3, ..key(0) });
+        assert!(shows_finished(newer, latest, Some(old)));
+        assert!(!shows_finished(old, latest, Some(newer)));
+        // Simulated drag: the contents change every frame and each exact frame takes three.
+        // Frames of the drag are shown as they finish, not only the last one after it.
+        let (mut shown, mut drawing, mut shown_during) = (Some(on_screen), None::<(Key, u32)>, 0);
+        for step in 0..30u64 {
+            let k = Key { rev: 10 + step, ..key(0) };
+            if let Some((d, 0)) = drawing {
+                if shows_finished(d, k, shown) {
+                    shown = Some(d);
+                    shown_during += 1;
+                }
+                drawing = None;
+            }
+            drawing = match drawing {
+                Some((d, n)) => Some((d, n - 1)),
+                None => Some((k, 2)),
+            };
+        }
+        assert!(shown_during >= 5, "frames shown during the drag: {shown_during}");
     }
 }
 
@@ -3781,6 +4011,123 @@ mod picture_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pop-up stays on the result shown as answers come and results go, the second of two
+    /// identical ones too, and goes to the first when that one is left out.
+    #[test]
+    fn the_result_shown_stays_shown() {
+        let (a, b, c) = (json!({"layer": "A"}), json!({"layer": "B"}), json!({"layer": "C"}));
+        let before = [a.clone(), b.clone(), b.clone()];
+        // An answer before them: each keeps its place among the identical.
+        let after = [c.clone(), a.clone(), b.clone(), b.clone()];
+        assert_eq!((0..3).map(|i| index_after(&before, i, &after)).collect::<Vec<_>>(), [1, 2, 3]);
+        // The one shown left out; a list shorter than the index.
+        assert_eq!(index_after(&before, 0, &[c.clone(), b.clone()]), 0);
+        assert_eq!(index_after(&before, 5, &after), 0);
+    }
+
+    /// A pop-up asking a WMS layer waits for its answer, up to `ASK_WAIT`, before it shows what
+    /// was found, so a layer drawn over the feature found doesn't take its place once shown; with
+    /// nothing asked, it shows at once.
+    #[test]
+    fn a_popup_waits_for_the_wms_answers_a_while() {
+        let found = json!({"layer": "Countries", "attributes": {"name": "Switzerland"}});
+        let mut pp = Popup::new(found, Coord::new(8.6, 46.65), 0, 0);
+        assert!(!pp.asking(), "nothing asked");
+        pp.asks.push(Ask { layer: "Over".into(), also: Vec::new(), capabilities: false, request: None, slot: Default::default() });
+        assert!(pp.asking(), "asked");
+        if let Some(earlier) = web_time::Instant::now().checked_sub(ASK_WAIT) {
+            pp.since = earlier;
+            assert!(!pp.asking(), "waited long enough");
+        }
+    }
+
+    /// Answers that land while the pop-up waits open it on the top result, with its feature
+    /// selected: drawn over Countries, Over's feature comes first, and Switzerland, selected by the
+    /// click, no longer is.
+    #[test]
+    fn a_popup_opens_on_the_top_result_after_its_wait() {
+        let mut s = rustgis_engine::Session::new(rustgis_engine::sample::world_project());
+        let url = "https://wms.example.org/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=over&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng";
+        s.run("map.addTiles", &json!({"url": url, "name": "Over", "overlay": true})).unwrap();
+        s.run("map.popupMode", &json!({"mode": "visible"})).unwrap();
+        let mut info = s.run("identify", &json!({"lon": 8.6, "lat": 46.65, "tolerancePx": 0})).unwrap();
+        assert_eq!(info["layer"], "Countries");
+        assert_eq!(info["featureInfo"][0]["tileLayer"], "Over", "{info}");
+        s.run("select.rows", &json!({"layer": info["layerId"], "rows": [info["row"]]})).unwrap();
+        // Its answer already in, not fetched.
+        info.as_object_mut().unwrap().remove("featureInfo");
+        let (map, opened) = (s.project.active_map, s.opened);
+        let mut app = RustGisApp::new(s);
+        let mut pp = Popup::new(info, Coord::new(8.6, 46.65), map, opened);
+        let answer = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"Bern"},"geometry":null}]}"#;
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(answer.to_vec()))));
+        pp.asks.push(Ask { layer: "Over".into(), also: Vec::new(), capabilities: false, request: None, slot });
+        app.map.popup = Some(pp);
+        follow_asks(&mut app, &egui::Context::default());
+        let pp = app.map.popup.as_ref().unwrap();
+        let shown: Vec<_> =
+            pp.info["results"].as_array().unwrap().iter().map(|r| r["tileLayer"].as_str().or(r["layer"].as_str()).unwrap()).collect();
+        assert_eq!((shown, pp.index), (vec!["Over", "Countries"], 0));
+        assert!(app.session.map().layer_by_name("Countries").unwrap().selection.is_empty());
+    }
+
+    /// A WMS layer's answer comes in the drawing order (#808): drawn over Countries, its feature
+    /// comes first, and with topmost replaces Switzerland; drawn under the map's layers, it comes
+    /// after them, and topmost keeps Switzerland.
+    #[test]
+    fn a_wms_answer_takes_its_place_in_the_drawing_order() {
+        let mut s = rustgis_engine::Session::new(rustgis_engine::sample::world_project());
+        s.run("map.addTiles", &json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Over", "overlay": true})).unwrap();
+        s.run("map.addTiles", &json!({"url": "https://base.example.org/{z}/{x}/{y}.png", "name": "Under"})).unwrap();
+        let answer = |layer: &str| json!({"layer": layer, "tileLayer": layer, "sourceLayer": null, "attributes": {"name": "Bern"}});
+        let shown = |v: &Value| -> Vec<String> {
+            v["results"].as_array().unwrap().iter().map(|r| r["tileLayer"].as_str().or(r["layer"].as_str()).unwrap().to_string()).collect()
+        };
+        for (mode, over, under) in
+            [("topmost", vec!["Over"], vec!["Countries"]), ("visible", vec!["Over", "Countries"], vec!["Countries", "Under"])]
+        {
+            s.run("map.popupMode", &json!({"mode": mode})).unwrap();
+            let info = s.run("identify", &json!({"lon": 8.6, "lat": 46.65, "tolerancePx": 0, "mode": mode})).unwrap();
+            assert_eq!(info["layer"], "Countries", "{mode}");
+            let v = with_answers(s.map(), &info, vec![answer("Over")]).unwrap();
+            assert_eq!(shown(&v), over, "{mode}: drawn over");
+            assert_eq!(v["layer"], over[0], "{mode}");
+            let v = with_answers(s.map(), &info, vec![answer("Under")]).unwrap();
+            assert_eq!(shown(&v), under, "{mode}: drawn under");
+        }
+        // Hidden since it answered (and took Switzerland's place): its result goes, and doesn't
+        // keep out a later answer from a layer drawn under it.
+        s.run("map.popupMode", &json!({"mode": "topmost"})).unwrap();
+        let info = s.run("identify", &json!({"lon": 8.6, "lat": 46.65, "tolerancePx": 0})).unwrap();
+        let over = with_answers(s.map(), &info, vec![answer("Over")]).unwrap();
+        s.map_mut().tiles.iter_mut().filter(|t| t.name == "Over").for_each(|t| t.visible = false);
+        let v = with_answers(s.map(), &over, vec![answer("Under")]).unwrap();
+        assert_eq!(shown(&v), ["Under"], "hidden");
+        // And with visible, which keeps everything, it isn't shown.
+        s.map_mut().tiles.iter_mut().filter(|t| t.name == "Over").for_each(|t| t.visible = true);
+        s.run("map.popupMode", &json!({"mode": "visible"})).unwrap();
+        let info = s.run("identify", &json!({"lon": 8.6, "lat": 46.65, "tolerancePx": 0})).unwrap();
+        let over = with_answers(s.map(), &info, vec![answer("Over")]).unwrap();
+        s.map_mut().tiles.iter_mut().filter(|t| t.name == "Over").for_each(|t| t.visible = false);
+        let v = with_answers(s.map(), &over, vec![answer("Under")]).unwrap();
+        assert_eq!(shown(&v), ["Countries", "Under"], "hidden, visible");
+        // Hidden with its result in the pop-up and no answer to come: the result goes at once.
+        s.map_mut().tiles.iter_mut().filter(|t| t.name == "Over").for_each(|t| t.visible = true);
+        let (map, opened) = (s.project.active_map, s.opened);
+        let mut app = RustGisApp::new(s);
+        let mut popup = Popup::new(over, Coord::new(8.6, 46.65), map, opened);
+        popup.index = 1;
+        app.map.popup = Some(popup);
+        app.map.popup_rev = app.session.revision.wrapping_add(1);
+        follow_popup(&mut app);
+        assert_eq!(shown(&app.map.popup.as_ref().unwrap().info), ["Over", "Countries"], "drawn, in the pop-up");
+        app.session.map_mut().tiles.iter_mut().filter(|t| t.name == "Over").for_each(|t| t.visible = false);
+        app.map.popup_rev = app.session.revision.wrapping_add(1);
+        follow_popup(&mut app);
+        let popup = app.map.popup.as_ref().unwrap();
+        assert_eq!((shown(&popup.info), popup.index), (vec!["Countries".to_string()], 0), "hidden, in the pop-up");
+    }
 
     fn selection_harness() -> egui_kittest::Harness<'static, RustGisApp> {
         let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
@@ -4008,6 +4355,97 @@ mod tests {
         h.state_mut().run("layer.visibility", json!({"layer": "Countries", "visible": false})).expect("hide countries");
         h.step();
         assert!(h.state().map.labels.is_empty(), "the preview kept labels from the old visibility state");
+    }
+
+    /// A frame is kept only through changes that leave the same layers shown in the same order.
+    #[test]
+    fn the_shown_layers_change_with_visibility_order_and_tile_placement_not_style() {
+        let mut app = RustGisApp::with_sample();
+        app.run("map.addTiles", json!({"url": "http://127.0.0.1:9/{z}/{x}/{y}.png", "name": "Offline"})).expect("tile layer");
+        let before = shown_layers(&app.session);
+        app.run("layer.transparency", json!({"layer": "Countries", "value": 50})).expect("transparency");
+        assert_eq!(shown_layers(&app.session), before, "a style change");
+        let top = app.session.map().layers.first().map(|l| l.id);
+        app.session.map_mut().tiles[0].over = top;
+        assert_ne!(shown_layers(&app.session), before, "a tile layer moved over a map layer");
+        app.session.map_mut().tiles[0].over = None;
+        app.session.map_mut().tiles[0].time_hidden = true;
+        assert_ne!(shown_layers(&app.session), before, "a tile layer hidden by the time slider");
+        app.session.map_mut().tiles[0].time_hidden = false;
+        app.session.map_mut().graticule = !app.session.map().graticule;
+        assert_ne!(shown_layers(&app.session), before, "the graticule turned on or off");
+        app.session.map_mut().graticule = !app.session.map().graticule;
+        app.session.map_mut().layers.swap(0, 1);
+        assert_ne!(shown_layers(&app.session), before, "layers reordered");
+        app.session.map_mut().layers.swap(0, 1);
+        assert_eq!(shown_layers(&app.session), before, "back as they were");
+        app.run("layer.visibility", json!({"layer": "Countries", "visible": false})).expect("hide");
+        assert_ne!(shown_layers(&app.session), before, "a layer hidden");
+    }
+
+    /// #1051: changing a layer's transparency over a tiled basemap kept the exact frame on
+    /// screen until the next one arrived; it showed a coarse preview of the whole map, basemap
+    /// included, so every step of a slider drag made the map flicker.
+    #[test]
+    fn a_style_change_over_tiles_keeps_the_frame_instead_of_a_preview() {
+        let mut app = RustGisApp::with_sample();
+        // Nothing listens there: the tiles fail, the map still draws.
+        app.run("map.addTiles", json!({"url": "http://127.0.0.1:9/{z}/{x}/{y}.png", "name": "Offline"})).expect("tile layer");
+        // Short steps: a kept frame gives way to a preview after `KEEP_FRAME_S` of the harness's time,
+        // 6000 steps here (at least 12 s with the waits below), far longer than a debug frame takes.
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(900.0, 550.0)).with_step_dt(0.000_05).with_max_steps(10_000).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+        let exact = |h: &mut egui_kittest::Harness<'_, RustGisApp>, what: &str| {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                h.step();
+                let st = h.state();
+                if st.map.key.is_some_and(|k| k.rev == st.session.revision) && !st.map.tilt_settle.busy() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < end, "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        exact(&mut h, "the first exact frame did not arrive");
+        // A quick map (a debug build may draw slower than a release one).
+        h.state_mut().map.render_ms = 20;
+        let before = h.state().map.key.expect("a frame");
+        h.state_mut().run("layer.transparency", json!({"layer": "Countries", "value": 50})).expect("transparency");
+        h.step();
+        let kept = h.state().map.key.expect("a frame");
+        assert_eq!((kept.rev, kept.draft), (before.rev, before.draft), "a coarse preview replaced the frame on screen");
+        exact(&mut h, "the exact frame of the change did not arrive");
+        // Changed again while the exact frame of a change is drawn: that frame, of an earlier
+        // change, is shown when it finishes, before the frame of the latest.
+        h.state_mut().map.render_ms = 20;
+        let shown = h.state().map.key.expect("a frame").rev;
+        h.state_mut().run("layer.transparency", json!({"layer": "Countries", "value": 20})).expect("transparency");
+        h.step();
+        let first = h.state().session.revision;
+        assert!(h.state().map.tilt_settle.busy(), "the exact frame of the change is being drawn");
+        h.state_mut().run("layer.transparency", json!({"layer": "Countries", "value": 30})).expect("transparency");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while h.state().map.key.is_some_and(|k| k.rev == shown) {
+            assert!(std::time::Instant::now() < end, "no frame of the changes arrived");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            h.step();
+        }
+        assert_eq!(h.state().map.key.map(|k| k.rev), Some(first), "the earlier change's frame was shown first");
+        exact(&mut h, "the exact frame of the latest change did not arrive");
+        // Hiding a layer isn't kept: its preview shows at once.
+        h.state_mut().map.render_ms = 20;
+        h.state_mut().run("layer.visibility", json!({"layer": "Countries", "visible": false})).expect("hide");
+        h.step();
+        let st = h.state();
+        assert!(st.map.key.is_some_and(|k| k.rev == st.session.revision), "the hidden layer stayed on screen");
     }
 
     /// Dragging a side pane resizes the map view every frame. The map is not drawn again for

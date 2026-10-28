@@ -181,6 +181,9 @@ pub fn gate(s: &Session, call: &ToolCall) -> Option<String> {
     if id.starts_with(rustgis_engine::plugins::PREFIX) {
         return Some("it runs a plugin's command".into());
     }
+    if id == "ui.addUrl" && ["geolibreProject", "geolibreLayer", "geolibreZarr"].iter().any(|key| params.get(key).is_some()) {
+        return Some("it adds the files and web addresses a GeoLibre project names".into());
+    }
     if user_only(&id) && !matches!(id.as_str(), "edit.undo" | "edit.redo") {
         return Some(match id.as_str() {
             "project.new" | "project.open" | "project.openText" | "project.sample" | "project.fromTemplate" => {
@@ -188,6 +191,8 @@ pub fn gate(s: &Session, call: &ToolCall) -> Option<String> {
             }
             // Whether given a path, text or data: the project names the files and web addresses
             // its layers are added from.
+            "layer.addDownload" => "it completes a download that may import a project and its referenced sources".into(),
+            "project.importGeolibre" => "it adds the files and web addresses a GeoLibre project names".into(),
             "project.importQgis" => "it adds the files and web addresses a QGIS project names".into(),
             _ => "it is reserved to you (plugins, scripts, tasks, models and the GeoLibre runner)".into(),
         });

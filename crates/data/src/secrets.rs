@@ -1,6 +1,10 @@
 //! Opaque secrets and stores shared by desktop and wasm callers.
 
-use std::{collections::BTreeMap, fmt, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Mutex, OnceLock},
+};
 
 /// The service name used by every RustGIS secret store.
 pub const SERVICE: &str = "RustGIS";
@@ -75,6 +79,54 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, account: &str) -> Result<(), SecretError>;
 }
 
+/// Calls `warn` once when the keychain fails (not for an invalid account), and stops asking an
+/// unavailable store. Refusals remain per item, so a denied item does not disable other items.
+pub struct Reporting<S: SecretStore> {
+    inner: S,
+    warn: Box<dyn Fn(&SecretError) + Send + Sync>,
+    warned: std::sync::atomic::AtomicBool,
+    gone: OnceLock<SecretError>,
+}
+
+impl<S: SecretStore> Reporting<S> {
+    pub fn new(inner: S, warn: impl Fn(&SecretError) + Send + Sync + 'static) -> Self {
+        Self { inner, warn: Box::new(warn), warned: std::sync::atomic::AtomicBool::new(false), gone: OnceLock::new() }
+    }
+
+    fn call<T>(&self, account: &str, operation: impl FnOnce(&S) -> Result<T, SecretError>) -> Result<T, SecretError> {
+        check_account(account)?;
+        if let Some(error) = self.gone.get() {
+            return Err(error.clone());
+        }
+        let result = operation(&self.inner);
+        if let Err(error) = &result
+            && !matches!(error, SecretError::InvalidAccount(_))
+        {
+            if !self.warned.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                (self.warn)(error);
+            }
+            if matches!(error, SecretError::Unavailable(_)) {
+                let _ = self.gone.set(error.clone());
+            }
+        }
+        result
+    }
+}
+
+impl<S: SecretStore> SecretStore for Reporting<S> {
+    fn load(&self, account: &str) -> Result<Option<Secret>, SecretError> {
+        self.call(account, |inner| inner.load(account))
+    }
+
+    fn save(&self, account: &str, value: &Secret) -> Result<(), SecretError> {
+        self.call(account, |inner| inner.save(account, value))
+    }
+
+    fn delete(&self, account: &str) -> Result<(), SecretError> {
+        self.call(account, |inner| inner.delete(account))
+    }
+}
+
 /// An in-memory store for tests of code that uses secrets; never a fallback for the OS store.
 #[derive(Default)]
 pub struct MemorySecrets {
@@ -125,6 +177,63 @@ impl SecretStore for MemorySecrets {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering::SeqCst},
+    };
+
+    struct Counting {
+        inner: MemorySecrets,
+        loads: Arc<AtomicUsize>,
+    }
+
+    impl SecretStore for Counting {
+        fn load(&self, account: &str) -> Result<Option<Secret>, SecretError> {
+            self.loads.fetch_add(1, SeqCst);
+            self.inner.load(account)
+        }
+        fn save(&self, account: &str, value: &Secret) -> Result<(), SecretError> {
+            self.inner.save(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<(), SecretError> {
+            self.inner.delete(account)
+        }
+    }
+
+    #[test]
+    fn reporting_unavailable_stops_but_denied_retries() {
+        for (error, expected_loads) in [(SecretError::Unavailable("payload".into()), 1), (SecretError::Denied, 2)] {
+            let loads = Arc::new(AtomicUsize::new(0));
+            let warnings = Arc::new(AtomicUsize::new(0));
+            let count = warnings.clone();
+            let store = Reporting::new(Counting { inner: MemorySecrets::failing(error.clone()), loads: loads.clone() }, move |_| {
+                count.fetch_add(1, SeqCst);
+            });
+            for _ in 0..2 {
+                assert_eq!(store.load("test/item"), Err(error.clone()));
+            }
+            assert_eq!(warnings.load(SeqCst), 1);
+            assert_eq!(loads.load(SeqCst), expected_loads);
+        }
+    }
+
+    #[test]
+    fn reporting_success_and_invalid_accounts_do_not_warn() {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let count = warnings.clone();
+        let store = Reporting::new(Counting { inner: MemorySecrets::new(), loads: loads.clone() }, move |_| {
+            count.fetch_add(1, SeqCst);
+        });
+        assert_eq!(store.load("bad"), Err(SecretError::InvalidAccount("bad".into())));
+        assert_eq!(loads.load(SeqCst), 0);
+        let secret = Secret::new("round-trip");
+        store.save("test/item", &secret).unwrap();
+        assert_eq!(store.load("test/item").unwrap(), Some(secret));
+        store.delete("test/item").unwrap();
+        assert_eq!(store.load("test/item").unwrap(), None);
+        assert_eq!(warnings.load(SeqCst), 0);
+    }
 
     #[test]
     fn account_rules() {
