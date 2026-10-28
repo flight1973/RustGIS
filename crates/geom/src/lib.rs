@@ -318,6 +318,38 @@ pub fn spherical_centre(pts: &[Coord]) -> Option<Coord> {
     from_vector(s)
 }
 
+/// The center on the sphere of points taken one at a time, each with a weight (such as stretches
+/// of lines by their lengths): their weighted mean direction from the Earth's center.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SphericalMean {
+    sum: [f64; 3],
+    weight: f64,
+}
+
+impl SphericalMean {
+    /// Takes in a point; a non-finite one is left out.
+    pub fn add(&mut self, c: Coord) {
+        self.add_weighted(c, 1.0);
+    }
+
+    /// Takes in a point counting `weight` times (as a stretch of a line does, by its length); a
+    /// non-finite point or weight, or one not above zero, is left out.
+    pub fn add_weighted(&mut self, c: Coord, weight: f64) {
+        if c.is_finite() && weight.is_finite() && weight > 0.0 {
+            let (s, v) = (self.sum, unit_vector(c));
+            self.sum = [s[0] + v[0] * weight, s[1] + v[1] * weight, s[2] + v[2] * weight];
+            self.weight += weight;
+        }
+    }
+
+    /// The center of the points so far, or `None` when there are none or they balance out (such as
+    /// two antipodes) to within rounding of their total weight.
+    pub fn center(&self) -> Option<Coord> {
+        let [x, y, z] = self.sum;
+        (x.hypot(y).hypot(z) > 1e-12 * self.weight).then(|| from_vector(self.sum)).flatten()
+    }
+}
+
 /// The point `dist_m` metres from `c` along the geodesic leaving it at `azimuth_deg` (clockwise
 /// from north): the direct geodesic problem on the WGS 84 ellipsoid.
 pub fn geodesic_destination(c: Coord, azimuth_deg: f64, dist_m: f64) -> Coord {
@@ -431,6 +463,17 @@ impl Aeqd {
         // At a pole the azimuth is taken from the meridian `lon0`, as `forward` gives it.
         let (lat, lon): (f64, f64) = WGS84.direct(self.lat0, self.lon0, p.x.atan2(p.y).to_degrees(), p.x.hypot(p.y));
         Coord::new(self.lon0 + wrap_lon(lon - self.lon0), lat)
+    }
+
+    /// [`Aeqd::inverse`], with the azimuth (degrees clockwise from north) the geodesic from the
+    /// center arrives there with: a direction carried along it turns as much as that differs from
+    /// the azimuth it left with, `p.x.atan2(p.y)`.
+    pub fn inverse_heading(&self, p: Coord) -> (Coord, f64) {
+        if !(p.x.is_finite() && p.y.is_finite()) {
+            return (Coord::new(f64::NAN, f64::NAN), f64::NAN);
+        }
+        let (lat, lon, azi2): (f64, f64, f64) = WGS84.direct(self.lat0, self.lon0, p.x.atan2(p.y).to_degrees(), p.x.hypot(p.y));
+        (Coord::new(self.lon0 + wrap_lon(lon - self.lon0), lat), azi2)
     }
 }
 
@@ -559,6 +602,38 @@ pub fn format_dms(c: Coord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_weighted_point_counts_as_that_many() {
+        // Weight 2 is the point taken twice; a weight of 0, below 0 or missing, and a point
+        // missing a coordinate, are left out.
+        let (a, b) = (Coord::new(0.0, 0.0), Coord::new(90.0, 0.0));
+        let (mut twice, mut weighted) = (SphericalMean::default(), SphericalMean::default());
+        [a, a, b].into_iter().for_each(|c| twice.add(c));
+        weighted.add_weighted(a, 2.0);
+        weighted.add(b);
+        for (c, w) in [(b, 0.0), (b, -1.0), (b, f64::NAN), (Coord::new(f64::NAN, 0.0), 1.0)] {
+            weighted.add_weighted(c, w);
+        }
+        let (t, w) = (twice.center().unwrap(), weighted.center().unwrap());
+        assert!((t.x - w.x).abs() < 1e-12 && (t.y - w.y).abs() < 1e-12, "{t:?} {w:?}");
+        // Antipodes weighing a million each balance out, to within their rounding.
+        let mut balanced = SphericalMean::default();
+        balanced.add_weighted(a, 1e6);
+        balanced.add_weighted(Coord::new(180.0, 0.0), 1e6);
+        assert_eq!(balanced.center(), None);
+    }
+
+    #[test]
+    fn a_geodesic_arrives_turned_as_far_as_it_has_gone_around_the_pole() {
+        // From 88°N, east 300 km: near a pole the geodesic turns away from it by about as much
+        // longitude as it covers (53° here), arriving heading south of east; a step of a
+        // trillionth of a meter doesn't turn at all.
+        let (at, heading) = Aeqd::new(Coord::new(0.0, 88.0)).inverse_heading(Coord::new(300_000.0, 0.0));
+        assert!(((heading - 90.0) - at.x).abs() < 1.0 && at.x > 45.0, "{at:?} {heading}");
+        let (_, heading) = Aeqd::new(Coord::new(0.0, 88.0)).inverse_heading(Coord::new(1e-12, 0.0));
+        assert!((heading - 90.0).abs() < 1e-9, "{heading}");
+    }
 
     #[test]
     fn mercator_roundtrip() {
