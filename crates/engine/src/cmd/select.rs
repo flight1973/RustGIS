@@ -239,15 +239,36 @@ fn by_radius(s: &mut Session, p: &Value) -> CmdResult {
     flat.validate_selection_path(&boundary)?;
     let scale = s.scale();
     let mut hits = Vec::new();
+    let mut bounded = Vec::new();
     for layer in s.map_mut().selectable_layers(scale) {
         let drawn = layer.drawn_rows(scale);
         let rows: Vec<usize> = drawn.iter().enumerate().filter_map(|(row, shown)| shown.then_some(row)).collect();
-        let rows: Vec<usize> = network::within(&layer.dataset, &rows, center, radius).into_iter().map(|(row, _)| row).collect();
+        let (near, n) = network::within_counted(&layer.dataset, &rows, center, radius);
+        if n > 0 {
+            bounded.push((layer.name.clone(), n));
+        }
+        let rows: Vec<usize> = near.into_iter().map(|(row, _)| row).collect();
         if !rows.is_empty() {
             hits.push((layer.id, rows));
         }
     }
+    warn_bounded(s, &bounded);
     apply_hits(s, hits, m)
+}
+
+/// One warning for the features of each layer a radius search ([`network::within_counted`])
+/// counted at a bound on their distance near a pole, with their counts (#1033); none when there are
+/// none.
+pub(crate) fn warn_bounded(s: &mut Session, bounded: &[(String, usize)]) {
+    if bounded.is_empty() {
+        return;
+    }
+    let total: usize = bounded.iter().map(|(_, n)| n).sum();
+    let layers: Vec<String> = bounded.iter().map(|(layer, n)| format!("{layer} {n}")).collect();
+    s.warn(format!(
+        "{total} feature(s) near a pole ({}) couldn't be measured in full (past a search's 250,000 steps a layer, or along an edge over 512° long) and were counted at the least distance they could be: they may lie farther, even beyond the radius",
+        layers.join(", ")
+    ));
 }
 
 /// The hit count describes the query, regardless of whether its rows are added or removed.

@@ -4,8 +4,9 @@
 //! pure `run` function over datasets. Inputs refer to layers by name through [`Inputs`].
 //! The geometry tools and topology checks work in the analysis plane
 //! ([`rustgis_geom::lonlat_to_plane`]: Web Mercator meters within ±85.05°, continued beyond to
-//! the poles), radius searches in Web Mercator meters, and buffers are geodesic: drawn in a
-//! projection centered on each feature (see [`geodesic`]) so a 100 km buffer is 100 km on the
+//! the poles), radius searches in Web Mercator meters (on the ground when the center or the
+//! feature's box reaches beyond 85.05°, see [`network::within`]), and buffers are geodesic: drawn
+//! in a projection centered on each feature (see [`geodesic`]) so a 100 km buffer is 100 km on the
 //! ground.
 //!
 //! Tools from external suites (the GeoLibre/Whitebox tools in `rustgis-geolibre`, and plugins
