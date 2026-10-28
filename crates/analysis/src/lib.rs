@@ -346,14 +346,22 @@ pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> 
 }
 
 /// A built-in tool's on-off parameter as `true` or `false` (text saying so counts). Anything else is
-/// an error, never a guess at what `"yes"` or `1` meant (#406). A blank value is the default.
+/// an error, never a guess at what `"yes"` or `1` meant (#406). A blank value, or null, is the
+/// default.
 fn boolean(spec: &ToolSpec, ps: &ParamSpec, v: &Value) -> Result<Value, String> {
+    let default = || serde_json::from_str(ps.default).unwrap_or(Value::Null);
     match v {
-        Value::Null | Value::Bool(_) => Ok(v.clone()),
-        Value::String(s) if s.trim().is_empty() => Ok(serde_json::from_str(ps.default).unwrap_or(Value::Null)),
+        Value::Bool(_) => Ok(v.clone()),
+        Value::Null => Ok(default()),
+        Value::String(s) if s.trim().is_empty() => Ok(default()),
         Value::String(s) if s.trim().eq_ignore_ascii_case("true") => Ok(Value::Bool(true)),
         Value::String(s) if s.trim().eq_ignore_ascii_case("false") => Ok(Value::Bool(false)),
-        _ => Err(format!("{}: '{}' must be true or false (not {v})", spec.name, ps.label)),
+        _ => {
+            // Echoed in part: a value can be huge.
+            let full = v.to_string();
+            let shown = if full.chars().count() > 80 { format!("{}…", full.chars().take(80).collect::<String>()) } else { full };
+            Err(format!("{}: '{}' must be true or false (not {shown})", spec.name, ps.label))
+        }
     }
 }
 

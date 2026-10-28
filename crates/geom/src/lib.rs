@@ -219,7 +219,8 @@ pub fn geodesic_interpolate(a: Coord, b: Coord, t: f64) -> Coord {
 
 /// A longitude (degrees) folded into −180..180, unchanged when it is already there. The remainder
 /// is exact, as GeographicLib takes it, so a longitude far out of range still names the meridian
-/// GeographicLib measures from. One that isn't finite is NaN.
+/// GeographicLib measures from. One that isn't finite is NaN (where `wrap_lon`, which folds
+/// differences, gives 0).
 pub fn fold_lon(x: f64) -> f64 {
     let r = x % 360.0;
     if r > 180.0 {

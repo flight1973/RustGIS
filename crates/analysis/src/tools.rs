@@ -230,11 +230,11 @@ pub static TOOLS: &[ToolSpec] = &[
             },
             P {
                 name: "includeEnd",
-                label: "Include End Points",
+                label: "Include End Point",
                 kind: K::Bool,
                 required: false,
                 default: "false",
-                help: "Also a point where each part's points stop, when the distance doesn't land there.",
+                help: "Also a point where each part's points stop, when the distance doesn't land there. (Each part's start always has one.)",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -841,7 +841,7 @@ fn rows(inp: &dyn Inputs, p: &Json, k: &str, ds: &Dataset) -> Vec<usize> {
 
 /// The features [`rows`] lists, walked in place: nothing is allocated, so a tool can count what
 /// it will write before it allocates anything.
-fn selected<'a>(sel: &'a [usize], ds: &'a Dataset) -> impl Iterator<Item = &'a rustgis_data::Feature> + 'a {
+fn selected_features<'a>(sel: &'a [usize], ds: &'a Dataset) -> impl Iterator<Item = &'a rustgis_data::Feature> + 'a {
     selected_rows(sel, ds.features.len()).filter_map(|r| ds.features.get(r))
 }
 
@@ -1436,7 +1436,7 @@ pub(crate) fn try_clone_value(v: &Value) -> Result<Value, TryReserveError> {
 /// fallible.
 fn point_row<const N: usize>(own: &[Value], kept: usize, extra: [Value; N]) -> Result<Vec<Value>, TryReserveError> {
     let mut attrs = Vec::new();
-    attrs.try_reserve_exact(kept + extra.len())?;
+    attrs.try_reserve_exact(kept.saturating_add(extra.len()))?;
     for v in own {
         attrs.push(try_clone_value(v)?);
     }
@@ -1445,27 +1445,53 @@ fn point_row<const N: usize>(own: &[Value], kept: usize, extra: [Value; N]) -> R
     Ok(attrs)
 }
 
-/// The points a tool writes, allocated once for the `n` it counted and filled without growing:
+/// The points a tool writes, allocated once for the `cap` it counted and filled without growing:
 /// growing the list would copy it and briefly hold it twice. Each point's attributes are allocated
 /// fallibly too, so running out of memory stops the tool with a message. (A desktop system that
 /// overcommits memory may instead close the app when it runs out.)
 struct PointList {
     points: Vec<rustgis_data::Feature>,
-    n: usize,
-    failed: Option<TryReserveError>,
+    cap: usize,
+    stopped: Option<Stopped>,
+}
+
+/// Why a [`PointList`] stopped taking points.
+#[derive(Debug)]
+enum Stopped {
+    /// The memory ran out.
+    Memory(TryReserveError),
+    /// A point came past the count it was allocated for: the count was wrong, and the points
+    /// can't be all there.
+    Uncounted,
+}
+
+impl Stopped {
+    /// What a tool that counted `n` points says.
+    fn message(self, tool: &str, n: usize) -> String {
+        match self {
+            Stopped::Memory(e) => format!("{tool}: not enough memory for {n} points: {e}"),
+            Stopped::Uncounted => {
+                format!("{tool}: made more than the {n} points it counted, so stopped rather than leave some out (please report this)")
+            }
+        }
+    }
 }
 
 impl PointList {
-    fn new(n: usize) -> Result<Self, TryReserveError> {
+    fn new(cap: usize) -> Result<Self, TryReserveError> {
         let mut points = Vec::new();
-        points.try_reserve_exact(n)?;
-        Ok(PointList { points, n, failed: None })
+        points.try_reserve_exact(cap)?;
+        Ok(PointList { points, cap, stopped: None })
     }
 
     /// Adds a point at `c` with its feature's `own` attributes (padded to `kept`), then `extra`,
-    /// numbered from 1. Breaks once the memory has run out, or the `n` points are there.
+    /// numbered from 1. Breaks, for good, once the memory has run out or a point comes past `cap`.
     fn push<const N: usize>(&mut self, c: Coord, own: &[Value], kept: usize, extra: [Value; N]) -> ControlFlow<()> {
-        if self.stopped() || self.points.len() == self.n {
+        if self.stopped() {
+            return ControlFlow::Break(());
+        }
+        if self.points.len() == self.cap {
+            self.stopped = Some(Stopped::Uncounted);
             return ControlFlow::Break(());
         }
         match point_row(own, kept, extra) {
@@ -1475,20 +1501,20 @@ impl PointList {
                 ControlFlow::Continue(())
             }
             Err(e) => {
-                self.failed = Some(e);
+                self.stopped = Some(Stopped::Memory(e));
                 ControlFlow::Break(())
             }
         }
     }
 
-    /// Whether the memory ran out.
+    /// Whether it has stopped taking points.
     fn stopped(&self) -> bool {
-        self.failed.is_some()
+        self.stopped.is_some()
     }
 
     /// The points, or what stopped them (the points freed, so that there is memory to say so).
-    fn finish(self) -> Result<Vec<rustgis_data::Feature>, TryReserveError> {
-        match self.failed {
+    fn finish(self) -> Result<Vec<rustgis_data::Feature>, Stopped> {
+        match self.stopped {
             Some(e) => Err(e),
             None => Ok(self.points),
         }
@@ -1513,7 +1539,7 @@ fn feature_vertices_to_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, 
     }
     let (kept, width) = (ds.fields.len(), out.fields.len());
     let sel = inp.selection(s(p, "input"));
-    let feats = || selected(sel, ds);
+    let feats = || selected_features(sel, ds);
     // Counted first, so the points are allocated once at their final size: growing the list would
     // copy it and briefly hold it twice. In the browser, whose memory has a ceiling, the points'
     // memory is also estimated and asked for before anything is built.
@@ -1543,7 +1569,7 @@ fn feature_vertices_to_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, 
             let _ = list.push(c, own, kept, [fid.clone(), int(part), int(v.ring), int(index)]);
         });
     }
-    out.features = list.finish().map_err(no_memory)?.into();
+    out.features = list.finish().map_err(|e| e.message("Feature Vertices To Points", n))?.into();
     let written = out.features.len();
     result(out, format!("Feature Vertices To Points: {written} points"))
 }
@@ -1573,57 +1599,97 @@ struct Spacing {
 impl Spacing {
     /// How close two distances along a part `len` meters long are to be one place: as close as two
     /// vertices are to make a segment ([`MIN_SEGMENT`]), or a billionth of its length (a centimeter
-    /// along 10,000 km) where that is more, well over the rounding in its segments' sum.
-    fn tolerance(len: f64) -> f64 {
-        (len * 1e-9).max(MIN_SEGMENT)
+    /// along 10,000 km) where that is more, well over the rounding in its segments' sum; and under a
+    /// quarter of a step, so two points never take one place (a vertex) between them.
+    fn tolerance(self, len: f64) -> f64 {
+        (len * 1e-9).max(MIN_SEGMENT).min(self.step / 4.0)
     }
 
-    /// The points a part `len` meters long gets: how many fall every `step`, and whether one more
-    /// goes at the end. A ring's end is its start, so with no offsets a point there is made once.
-    /// A part with no length gets none, as does one shorter than its offsets.
-    fn count(self, len: f64, ring: bool) -> (usize, bool) {
-        let last = len - self.end;
+    /// Where the points go on a part `len` meters long. A part with no length gets none, as does
+    /// one shorter than its offsets. Nothing here gets smaller as `len` grows, so counting from a
+    /// bound on a part's length never counts fewer points than its walk makes.
+    fn places(self, len: f64, ring: bool) -> Places {
+        let (last, tol) = (len - self.end, self.tolerance(len));
+        let mut places = Places { spacing: self, regular: 0, with_end: false, last, tol };
         // Written to be false for NaN.
         if !(len > 0.0 && last >= self.start) {
-            return (0, false);
+            return places;
         }
-        let tol = Self::tolerance(len);
         // A point within `tol` past `last` is at `last`. A float casts to an integer saturating, so a
         // step far too small for the part asks for `usize::MAX` points, which the memory budget refuses.
-        let mut regular = (((last - self.start + tol) / self.step).floor() as usize).saturating_add(1);
-        let back_at_start = ring && self.start <= tol && self.end <= tol;
-        if back_at_start && regular > 1 && self.at(regular - 1, regular, last) >= len - tol {
-            regular -= 1;
+        places.regular = (((last - self.start + tol) / self.step).floor() as usize).saturating_add(1);
+        // A ring with no offsets ends at its start, where its first point is: one is made there.
+        // (Offsets are measured against MIN_SEGMENT, not `tol`, which grows with `len`.)
+        let back_at_start = ring && self.start <= MIN_SEGMENT && self.end <= MIN_SEGMENT;
+        if back_at_start && places.regular > 1 && places.at(places.regular - 1) >= len - tol {
+            places.regular -= 1;
         }
-        let with_end = self.with_end && !back_at_start && last - self.at(regular - 1, regular, last) > tol;
-        (regular, with_end)
-    }
-
-    /// How far along its part the `k`th point is, when `regular` points fall every step before
-    /// the end point at `last`.
-    fn at(self, k: usize, regular: usize, last: f64) -> f64 {
-        if k < regular { (self.start + k as f64 * self.step).min(last) } else { last }
+        places.with_end = self.with_end && !back_at_start && last - places.at(places.regular - 1) > tol;
+        places
     }
 }
 
-/// How near the antimeridian a line's part is to end, and the next to begin, for the two to be one
-/// line split there: a hundred-millionth of a degree of longitude, about a millimeter.
-const SEAM: f64 = 1e-8;
+/// The points [`Spacing`] puts on one part: `regular` every step from its start, then with
+/// `with_end` one at `last`, its end less the end offset; distances within `tol` are one place.
+#[derive(Clone, Copy, Debug)]
+struct Places {
+    spacing: Spacing,
+    regular: usize,
+    with_end: bool,
+    last: f64,
+    tol: f64,
+}
+
+impl Places {
+    /// How many points there are.
+    fn n(self) -> usize {
+        self.regular.saturating_add(usize::from(self.with_end))
+    }
+
+    /// How far along its part the `k`th point is.
+    fn at(self, k: usize) -> f64 {
+        let Spacing { start, step, .. } = self.spacing;
+        if k < self.regular { (start + k as f64 * step).min(self.last) } else { self.last }
+    }
+}
+
+/// How near the antimeridian, in degrees of longitude, a line's part is to end and the next to
+/// begin for the two to be one line split there: a billionth of a degree, about 0.1 mm.
+const SEAM: f64 = 1e-9;
 
 /// Whether a line's part ends where the next begins, on the antimeridian: one line split there,
-/// as RFC 7946 asks GeoJSON to split a line that crosses it.
+/// as RFC 7946 asks GeoJSON to split a line that crosses it. The two ends are on opposite sides
+/// (180° and −180°), each part on its own end's side, and within [`MIN_SEGMENT`] of each other, so
+/// the walk passes over the step between them; a part that touches the antimeridian and turns back,
+/// or two that only meet there, stay apart, as parts meeting anywhere else do.
 fn meet_at_seam(part: &[Coord], next: &[Coord]) -> bool {
-    let on_seam = |c: &Coord| 180.0 - rustgis_geom::fold_lon(c.x).abs() <= SEAM;
-    match (part.iter().rev().find(|c| c.is_finite()), next.iter().find(|c| c.is_finite())) {
-        (Some(a), Some(b)) => on_seam(a) && on_seam(b) && (a.y - b.y).abs() <= SEAM,
-        _ => false,
+    fn on_seam(c: &Coord) -> bool {
+        180.0 - rustgis_geom::fold_lon(c.x).abs() <= SEAM
     }
+    // The side of the antimeridian a part reaches it from: its end's, when its nearest vertex off
+    // the antimeridian is on that side too (or it has none).
+    fn side<'a>(end: &Coord, mut rest: impl Iterator<Item = &'a Coord>) -> Option<f64> {
+        let s = rustgis_geom::fold_lon(end.x).signum();
+        rest.find(|c| !on_seam(c)).is_none_or(|c| rustgis_geom::fold_lon(c.x).signum() == s).then_some(s)
+    }
+    let mut before = part.iter().rev().filter(|c| c.is_finite());
+    let mut after = next.iter().filter(|c| c.is_finite());
+    let (Some(a), Some(b)) = (before.next(), after.next()) else { return false };
+    on_seam(a)
+        && on_seam(b)
+        && matches!((side(a, before), side(b, after)), (Some(x), Some(y)) if x != y)
+        && rustgis_geom::wgs84_inverse(*a, *b).0 < MIN_SEGMENT
 }
 
-/// Calls `f` with each line Points Along Lines walks, as the run of parts that make it: each ring of
-/// a polygon on its own (`true`), and each part of a line together with the parts after it that
-/// carry it on across the antimeridian ([`meet_at_seam`]). A point has none.
+/// Calls `f` with each line Points Along Lines walks, as the run of parts that make it, and whether
+/// it is a ring: each ring of a polygon on its own, and each part of a line together with the parts
+/// after it that carry it on across the antimeridian ([`meet_at_seam`]), a ring when it ends where it
+/// starts (a closed line, such as a contour). A point has none.
 fn for_each_line(g: &Geometry, mut f: impl FnMut(&[Vec<Coord>], bool)) {
+    let closed = |run: &[Vec<Coord>]| {
+        let mut v = run.iter().flatten().filter(|c| c.is_finite());
+        matches!((v.next(), v.next_back()), (Some(a), Some(b)) if a == b)
+    };
     match g {
         Geometry::Line(parts) => {
             let mut start = 0;
@@ -1632,13 +1698,13 @@ fn for_each_line(g: &Geometry, mut f: impl FnMut(&[Vec<Coord>], bool)) {
                     && !meet_at_seam(part, next)
                 {
                     if let Some(run) = parts.get(start..=i) {
-                        f(run, false);
+                        f(run, closed(run));
                     }
                     start = i + 1;
                 }
             }
             if let Some(run) = parts.get(start..).filter(|r| !r.is_empty()) {
-                f(run, false);
+                f(run, closed(run));
             }
         }
         Geometry::Polygon(polys) => polys.iter().flatten().for_each(|r| f(std::slice::from_ref(r), true)),
@@ -1728,10 +1794,9 @@ fn bearing(azimuth: f64) -> f64 {
 fn walk_line(segs: &[Segment], ring: bool, spacing: Spacing, mut emit: impl FnMut(Coord, f64, f64) -> ControlFlow<()>) {
     let (Some(head), Some(tail)) = (segs.first(), segs.last()) else { return };
     let len: f64 = segs.iter().map(|s| s.len).sum();
-    let (regular, with_end) = spacing.count(len, ring);
-    let n = regular.saturating_add(usize::from(with_end));
-    let (last, tol) = (len - spacing.end, Spacing::tolerance(len));
-    let at = |k: usize| spacing.at(k, regular, last);
+    let places = spacing.places(len, ring);
+    let (n, tol) = (places.n(), places.tol);
+    let at = |k: usize| places.at(k);
     // The direction the walk arrives at its vertex in: none at a line's start; at a ring's, the one
     // its last segment comes back in.
     let mut arriving = ring.then_some(tail.azi_b);
@@ -1776,14 +1841,19 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         return Err(format!("{TOOL} needs a line or polygon layer"));
     }
     let unit = to_metres(1.0, s(p, "units"))?;
-    let step = num(p, "distance").map(|d| d * unit).filter(|m| m.is_finite() && *m > 0.0).ok_or("Distance must be a number above 0")?;
+    // Finite in meters too: 1e308 miles is not a distance.
+    let step = num(p, "distance")
+        .map(|d| d * unit)
+        .filter(|m| m.is_finite() && *m > 0.0)
+        .ok_or_else(|| format!("{TOOL}: Distance must be a number above 0, and not too large"))?;
     // An offset left blank is none.
     let offset = |k: &str, label: &str| match p.get(k) {
         None | Some(Json::Null) => Ok(0.0),
         Some(Json::String(t)) if t.trim().is_empty() => Ok(0.0),
-        Some(_) => {
-            num(p, k).map(|d| d * unit).filter(|m| m.is_finite() && *m >= 0.0).ok_or_else(|| format!("{label} must be a number, 0 or more"))
-        }
+        Some(_) => num(p, k)
+            .map(|d| d * unit)
+            .filter(|m| m.is_finite() && *m >= 0.0)
+            .ok_or_else(|| format!("{TOOL}: {label} must be a number, 0 or more, and not too large")),
     };
     let spacing = Spacing {
         step,
@@ -1801,29 +1871,45 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     }
     let (kept, width) = (ds.fields.len(), out.fields.len());
     let sel = inp.selection(s(p, "input"));
-    let feats = || selected(sel, ds);
+    let feats = || selected_features(sel, ds);
     // Counted first from each line's length bound, so the points are allocated once, with room to
     // spare of about 0.5 % ([`ELLIPSOID_STRETCH`]), and their memory checked before anything is
-    // built. The longest line sizes the one list its segments are solved into, line by line.
+    // built. The longest line sizes the one list its segments are solved into, line by line. With
+    // `exact`, counted from the lengths the walk measures instead, each segment solved for it.
+    let count = |exact: bool, longest: &mut usize| {
+        size_output_points(feats(), kept, width, true, |g| {
+            let mut k = 0usize;
+            for_each_line(g, |line, ring| {
+                *longest = (*longest).max(line.iter().map(Vec::len).fold(0, usize::saturating_add));
+                let len = if exact { segments(line, ring).map(|s| s.len).sum::<f64>() } else { length_bound(line, ring) };
+                k = k.saturating_add(spacing.places(len, ring).n());
+            });
+            k
+        })
+    };
     let mut longest = 0usize;
-    let (n, need) = size_output_points(feats(), kept, width, true, |g| {
-        let mut k = 0usize;
-        for_each_line(g, |line, ring| {
-            longest = longest.max(line.iter().map(Vec::len).fold(0, usize::saturating_add));
-            let (regular, with_end) = spacing.count(length_bound(line, ring), ring);
-            k = k.saturating_add(regular).saturating_add(usize::from(with_end));
-        });
-        k
-    });
+    let (mut n, mut need) = count(false, &mut longest);
     let u = |x: usize| u64::try_from(x).unwrap_or(u64::MAX);
     let segments_bytes = u(longest).saturating_mul(u(size_of::<Segment>()));
     // Always estimated (`true` above), as the budget holds on every platform; a missing estimate
     // would count as over it, never as needing nothing.
-    let need = need.unwrap_or(u64::MAX).saturating_add(segments_bytes);
-    let advice = "use a larger distance, or select fewer features";
+    let total = |need: Option<u64>| need.unwrap_or(u64::MAX).saturating_add(segments_bytes);
+    if total(need) > ALONG_BUDGET && segments_bytes <= ALONG_BUDGET {
+        // The bound can count more points than there are, by its 0.5 % or an offset within it:
+        // before refusing, count them exactly. Only a run at the budget solves its segments twice.
+        (n, need) = count(true, &mut longest);
+    }
+    let need = total(need);
+    // One line with tens of millions of vertices can be what doesn't fit.
+    let advice = if segments_bytes > need / 2 {
+        "simplify the lines with the most vertices, or select fewer features"
+    } else {
+        "use a larger distance, or select fewer features"
+    };
     if need > ALONG_BUDGET {
         let (mib, gib) = (need.div_ceil(1 << 20), ALONG_BUDGET >> 30);
-        return Err(format!("{TOOL}: up to {n} points would need about {mib} MiB, more than the {gib} GiB it may use: {advice}"));
+        let points = if n == usize::MAX { "more points than it can count".to_string() } else { format!("{n} points") };
+        return Err(format!("{TOOL}: {points} would need about {mib} MiB, more than the {gib} GiB it may use: {advice}"));
     }
     check_room(TOOL, n, need, advice, web_has_room)?;
     let no_memory = |e: TryReserveError| format!("{TOOL}: not enough memory for {n} points: {e}");
@@ -1848,12 +1934,13 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             segs.extend(segments(line, ring));
             walk_line(&segs, ring, spacing, |c, along, angle| {
                 // Folded into −180..180: a point past the antimeridian is on the far side of the map.
-                let c = Coord::new(rustgis_geom::fold_lon(c.x), c.y);
+                // A vertex's latitude past a pole (bad data) is the pole, where the walk measured it.
+                let c = Coord::new(rustgis_geom::fold_lon(c.x), c.y.clamp(-90.0, 90.0));
                 list.push(c, own, kept, [fid.clone(), Value::Float(along / unit), Value::Float(angle)])
             });
         });
     }
-    out.features = list.finish().map_err(no_memory)?.into();
+    out.features = list.finish().map_err(|e| e.message(TOOL, n))?.into();
     let written = out.features.len();
     result(out, format!("{TOOL}: {written} points"))
 }
@@ -4021,15 +4108,18 @@ mod tests {
     fn points_along_lines_survives_hostile_coordinates() {
         let c = Coord::new;
         // Latitudes past the poles, longitudes at the ends of f64, a pole and antipodes: walked
-        // without a panic, every point a number.
-        let line = vec![c(0.0, 1e300), c(1e308, 0.0), c(-1e308, 90.0), c(0.0, -90.0), c(180.0, 0.0), c(0.0, 0.0)];
+        // without a panic, every point on the Earth (a vertex past a pole at the pole, where the
+        // walk measured it).
+        let line = vec![c(0.0, 1e300), c(1e308, 0.0), c(-1e308, 90.0), c(0.0, -90.0), c(180.0, 0.0), c(0.0, 95.0)];
         let m = along_inputs(vec![Geometry::Line(vec![line])]);
-        let v = along(&m, serde_json::json!({"input": "lines", "distance": 1000}));
+        let v = along(&m, serde_json::json!({"input": "lines", "distance": 1000, "includeEnd": true}));
         assert!(!v.features.is_empty());
         for k in 0..v.features.len() {
             let (p, d, angle) = place(&v, k);
-            assert!(p.is_finite() && d.is_finite() && (0.0..360.0).contains(&angle), "{k}: {p:?} {d} {angle}");
+            let on_earth = (-180.0..=180.0).contains(&p.x) && (-90.0..=90.0).contains(&p.y);
+            assert!(on_earth && d.is_finite() && (0.0..360.0).contains(&angle), "{k}: {p:?} {d} {angle}");
         }
+        assert_eq!((place(&v, 0).0.y, place(&v, v.features.len() - 1).0.y), (90.0, 90.0));
     }
 
     #[test]
@@ -4113,6 +4203,133 @@ mod tests {
     }
 
     #[test]
+    fn points_along_lines_joins_parts_only_where_they_cross_the_antimeridian() {
+        let c = Coord::new;
+        let crossing = vec![vec![c(179.99, 0.0), c(180.0, 0.0)], vec![c(-180.0, 0.0), c(-179.99, 0.0)]];
+        // Touching the antimeridian and turning back on the same side; reaching it from opposite
+        // sides but the second part heading back west (its first edge 1° west on the ground); and
+        // ends 2.2 mm apart, more than the walk passes over: each part from 0.
+        let back = vec![vec![c(179.99, 0.0), c(180.0, 0.0)], vec![c(180.0, 0.0), c(179.99, 0.01)]];
+        let turned = vec![vec![c(179.99, 0.0), c(180.0, 0.0)], vec![c(-180.0, 0.0), c(179.99, 0.01)]];
+        let gap = vec![vec![c(179.99, 0.0), c(180.0, 0.0)], vec![c(-180.0, 2e-8), c(-179.99, 0.0)]];
+        let m = along_inputs([crossing, back, turned, gap].into_iter().map(Geometry::Line).collect());
+        let v = along(&m, serde_json::json!({"input": "lines", "distance": 500, "units": "Meters"}));
+        // Each line's points from 0 on: the crossing one line, the others two each.
+        let starts =
+            |fid: i64| (0..v.features.len()).filter(|&k| v.features[k].attrs[1] == Value::Int(fid) && place(&v, k).1 == 0.0).count();
+        assert_eq!([1, 2, 3, 4].map(starts), [1, 2, 2, 2]);
+        // The crossing's point on the antimeridian heads on east, not into a seam of no direction.
+        let at_seam =
+            (0..v.features.len()).find(|&k| v.features[k].attrs[1] == Value::Int(1) && (place(&v, k).0.x.abs() - 180.0).abs() < 1e-9);
+        assert!(at_seam.is_none_or(|k| (place(&v, k).2 - 90.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn points_along_lines_walks_a_closed_line_as_a_ring() {
+        // A closed line, such as a contour, gets the points its polygon's ring would: one at the
+        // start, made once, its angle halfway between the last edge and the first.
+        let c = Coord::new;
+        let ring = vec![c(0.0, 0.0), c(0.01, 0.0), c(0.01, 0.01), c(0.0, 0.01), c(0.0, 0.0)];
+        let m = along_inputs(vec![Geometry::Line(vec![ring.clone()])]);
+        let mut polys = Dataset::new("polys", GeometryType::Polygon, vec![Field::new("name", FieldType::Text)]);
+        polys.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![Value::Text("f0".into())]);
+        let mut m = m;
+        m.0.insert("polys".to_string(), polys);
+        for p in [
+            serde_json::json!({"distance": 1000, "units": "Meters"}),
+            serde_json::json!({"distance": 500, "units": "Meters", "includeEnd": true}),
+        ] {
+            let mut lp = p.clone();
+            lp["input"] = serde_json::json!("lines");
+            let mut pp = p;
+            pp["input"] = serde_json::json!("polys");
+            let (line, poly) = (along(&m, lp), along(&m, pp));
+            assert_eq!(line.features.len(), poly.features.len());
+            for k in 0..line.features.len() {
+                assert_eq!(place(&line, k), place(&poly, k), "{k}");
+            }
+        }
+    }
+
+    #[test]
+    fn points_along_lines_places_points_off_the_equator() {
+        // From (10°, 40°) to (20°, 50°), every 200 km: GeographicLib's own (Python geographiclib 2.1)
+        // places and azimuths along that geodesic.
+        let c = Coord::new;
+        let m = along_inputs(vec![Geometry::Line(vec![vec![c(10.0, 40.0), c(20.0, 50.0)]])]);
+        let v = along(&m, serde_json::json!({"input": "lines", "distance": 200}));
+        let want = [
+            (c(11.266241844369983, 41.52210323065901), 200.0, 32.73068788823587),
+            (c(12.592953843951635, 43.02919798608608), 400.0, 33.6232638576897),
+            (c(16.99576799827547, 47.444160555622474), 1000.0, 36.75244896333238),
+        ];
+        assert_eq!(v.features.len(), 7);
+        for (k, (wp, wd, wa)) in [1, 2, 5].into_iter().zip(want) {
+            let (p, d, a) = place(&v, k);
+            assert!(
+                (p.x - wp.x).abs() < 1e-9 && (p.y - wp.y).abs() < 1e-9 && (d - wd).abs() < 1e-9 && (a - wa).abs() < 1e-9,
+                "{k}: {p:?} {d} {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn points_along_lines_never_counts_fewer_points_than_it_makes() {
+        // The list is sized from a bound on each part's length, up to 0.5 % over: a longer part never
+        // gets fewer points, whatever the step, offsets, end point or ring. Swept over lengths from a
+        // meter to 30,000 km, steps from a millionth of the part to three times it, and offsets
+        // around the tolerance, where a ring's start and end once counted differently.
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut unit = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for _ in 0..200_000 {
+            let len = 10f64.powf(unit() * 7.5);
+            let step = len * 10f64.powf(unit() * 6.5 - 6.0);
+            let mut offset = || match (unit() * 4.0) as u32 {
+                0 => 0.0,
+                1 => unit() * 2e-3,
+                2 => unit() * len * 2e-9,
+                _ => unit() * step,
+            };
+            let spacing = Spacing { step, start: offset(), end: offset(), with_end: unit() < 0.5 };
+            let ring = unit() < 0.5;
+            let (exact, bound) = (spacing.places(len, ring).n(), spacing.places(len * (1.0 + unit() * 0.005), ring).n());
+            assert!(bound >= exact, "{spacing:?} {len} {ring}: {bound} < {exact}");
+        }
+        // The case found: a ring of 1,010.036 km, a step of 4,015 km, a start offset of 1.012 mm.
+        let s = Spacing { step: 4_015_000.0, start: 1.012e-3, end: 0.0, with_end: true };
+        assert_eq!((s.places(1_010_036.0, true).n(), s.places(1_010_036.0 * 1.005, true).n()), (2, 2));
+    }
+
+    #[test]
+    fn points_along_lines_never_piles_points_on_a_vertex() {
+        // A step under the tolerance: every half millimeter along 10 m, each point once, in order.
+        let c = Coord::new;
+        let m = along_inputs(vec![Geometry::Line(vec![vec![c(0.0, 0.0), c(equator_degrees(5.0), 0.0), c(equator_degrees(10.0), 0.0)]])]);
+        let v = along(&m, serde_json::json!({"input": "lines", "distance": 0.0005, "units": "Meters"}));
+        assert_eq!(v.features.len(), 20_001);
+        for k in 1..v.features.len() {
+            let ((a, da, _), (b, db, _)) = (place(&v, k - 1), place(&v, k));
+            assert!(db > da && b.x > a.x, "{k}: {a:?} {da} then {b:?} {db}");
+        }
+    }
+
+    #[test]
+    fn point_list_refuses_more_points_than_it_counted() {
+        let mut list = PointList::new(1).unwrap();
+        let c = Coord::new(0.0, 0.0);
+        assert!(list.push(c, &[], 0, [Value::Int(1)]).is_continue());
+        assert!(list.push(c, &[], 0, [Value::Int(2)]).is_break());
+        assert!(list.stopped());
+        let e = list.finish().unwrap_err().message("Tool", 1);
+        assert_eq!(e, "Tool: made more than the 1 points it counted, so stopped rather than leave some out (please report this)");
+    }
+
+    #[test]
     fn points_along_lines_takes_geographiclibs_path_between_antipodes() {
         // Antipodes on the equator have no single shortest path: GeographicLib's runs north along
         // the prime meridian, over the pole and down the antimeridian, 20,003.931 km. The places
@@ -4131,7 +4348,10 @@ mod tests {
     fn points_along_lines_passes_over_pole_and_seam_edges_of_no_length() {
         // A polar cap as plate carrée files cut it: down the antimeridian to the pole, along the
         // pole (one place), up again, and along 85°S between -180 and 180 (one place). The two edges
-        // along the antimeridian are 558.456 km each (GeographicLib's own value).
+        // along the antimeridian are 558.456 km each (GeographicLib's own value). Edges being the
+        // shortest paths between vertices, the 85°S "edge" (3,504 km in the file's flat sense) has
+        // no length: as the docs say, such a cap gets points only along its cut, without a panic
+        // or a point twice.
         let c = Coord::new;
         let ring = vec![c(180.0, -85.0), c(180.0, -90.0), c(-180.0, -90.0), c(-180.0, -85.0)];
         let mut cap = Dataset::new("cap", GeometryType::Polygon, vec![]);
@@ -4156,11 +4376,20 @@ mod tests {
         assert_eq!(along(&m, serde_json::json!({"input": "lines", "includeEnd": " TRUE "})).features.len(), 13);
         assert_eq!(along(&m, serde_json::json!({"input": "lines", "includeEnd": "false"})).features.len(), 12);
         assert_eq!(along(&m, serde_json::json!({"input": "lines", "includeEnd": ""})).features.len(), 12);
-        // Never a guess at what another value meant.
+        assert_eq!(along(&m, serde_json::json!({"input": "lines", "includeEnd": null})).features.len(), 12);
+        // Never a guess at what another value meant; a long one is quoted only in part.
+        let refuse = |v: &serde_json::Value| {
+            crate::run("pointsAlongLines", &m, &serde_json::json!({"input": "lines", "includeEnd": v})).map(|_| ()).unwrap_err()
+        };
         for v in [serde_json::json!("yes"), serde_json::json!(1), serde_json::json!([true])] {
-            let e = crate::run("pointsAlongLines", &m, &serde_json::json!({"input": "lines", "includeEnd": v})).map(|_| ()).unwrap_err();
-            assert_eq!(e, format!("Points Along Lines: 'Include End Points' must be true or false (not {v})"));
+            assert_eq!(refuse(&v), format!("Points Along Lines: 'Include End Point' must be true or false (not {v})"));
         }
+        let long = serde_json::json!("y".repeat(10_000));
+        assert_eq!(refuse(&long), format!("Points Along Lines: 'Include End Point' must be true or false (not \"{}…)", "y".repeat(79)));
+        // Null is the default for every built-in on-off parameter: Merge's is on.
+        let merge = crate::tool("merge").unwrap();
+        let p = crate::resolve_params(merge, &serde_json::json!({"inputs": ["a"], "attributes": null})).unwrap();
+        assert_eq!(p["attributes"], serde_json::json!(true));
     }
 
     #[test]
@@ -4203,20 +4432,21 @@ mod tests {
         for distance in [serde_json::json!(0), serde_json::json!(-1), serde_json::json!("x"), serde_json::json!(1e308)] {
             assert_eq!(
                 run(serde_json::json!({"input": "lines", "distance": distance, "units": "Miles"})),
-                "Distance must be a number above 0"
+                "Points Along Lines: Distance must be a number above 0, and not too large"
             );
         }
-        assert_eq!(run(serde_json::json!({"input": "lines", "startOffset": -1})), "Start Offset must be a number, 0 or more");
-        assert_eq!(run(serde_json::json!({"input": "lines", "endOffset": "far"})), "End Offset must be a number, 0 or more");
+        let offset = |label: &str| format!("Points Along Lines: {label} must be a number, 0 or more, and not too large");
+        assert_eq!(run(serde_json::json!({"input": "lines", "startOffset": -1})), offset("Start Offset"));
+        assert_eq!(run(serde_json::json!({"input": "lines", "endOffset": "far"})), offset("End Offset"));
         assert!(run(serde_json::json!({"input": "lines", "units": "Parsecs"})).contains("must be one of"));
         // Blank offsets are none.
         let v = along(&m, serde_json::json!({"input": "lines", "startOffset": "", "endOffset": null}));
         assert_eq!(v.features.len(), 12);
-        // Far more points than the memory budget fails at once, from the count, before anything is
-        // allocated or a segment solved, on every platform.
+        // Far more points than the memory budget fails from the count (and, being over, an exact
+        // count of the same lines), before anything is allocated, on every platform.
         let e = run(serde_json::json!({"input": "lines", "distance": 1e-15, "units": "Meters"}));
         let refused = "more than the 4 GiB it may use: use a larger distance, or select fewer features";
-        assert!(e.starts_with("Points Along Lines: up to ") && e.ends_with(refused), "{e}");
+        assert!(e.starts_with("Points Along Lines: 11131949079327356929 points would need about ") && e.ends_with(refused), "{e}");
         // 0.2 mm apart on 11.13 km: some 56 million points, also over the budget.
         let e = run(serde_json::json!({"input": "lines", "distance": 0.0002, "units": "Meters"}));
         assert!(e.ends_with(refused), "{e}");
@@ -4225,26 +4455,30 @@ mod tests {
     #[test]
     fn spacing_counts_each_point_once() {
         let s = |start: f64, end: f64, with_end: bool| Spacing { step: 100.0, start, end, with_end };
+        let count = |s: Spacing, len: f64, ring: bool| {
+            let p = s.places(len, ring);
+            (p.regular, p.with_end)
+        };
         // An open part 300 m long: 0, 100, 200 and 300; asking for the end adds nothing.
-        assert_eq!(s(0.0, 0.0, false).count(300.0, false), (4, false));
-        assert_eq!(s(0.0, 0.0, true).count(300.0, false), (4, false));
+        assert_eq!(count(s(0.0, 0.0, false), 300.0, false), (4, false));
+        assert_eq!(count(s(0.0, 0.0, true), 300.0, false), (4, false));
         // A ring 300 m around: its end is its start, made once, even when asked for.
-        assert_eq!(s(0.0, 0.0, true).count(300.0, true), (3, false));
+        assert_eq!(count(s(0.0, 0.0, true), 300.0, true), (3, false));
         // 350 m: the end at 350 is one more; on a ring too, once an offset moves it off the start.
-        assert_eq!(s(0.0, 0.0, true).count(350.0, false), (4, true));
-        assert_eq!(s(0.0, 10.0, true).count(350.0, true), (4, true));
+        assert_eq!(count(s(0.0, 0.0, true), 350.0, false), (4, true));
+        assert_eq!(count(s(0.0, 10.0, true), 350.0, true), (4, true));
         // Offsets of 50 m: 50, 150 and 250, where they stop.
-        assert_eq!(s(50.0, 50.0, true).count(300.0, false), (3, false));
+        assert_eq!(count(s(50.0, 50.0, true), 300.0, false), (3, false));
         // Rounding in a length that is a multiple of the step neither drops a point nor makes one twice.
-        assert_eq!(s(0.0, 0.0, false).count(300.000_000_000_1, false), (4, false));
-        assert_eq!(s(0.0, 0.0, false).count(299.999_999_999_9, false), (4, false));
+        assert_eq!(count(s(0.0, 0.0, false), 300.000_000_000_1, false), (4, false));
+        assert_eq!(count(s(0.0, 0.0, false), 299.999_999_999_9, false), (4, false));
         // No length, offsets longer than the part, and lengths that aren't numbers: none.
         for (len, start) in [(0.0, 0.0), (300.0, 301.0), (f64::NAN, 0.0), (-1.0, 0.0)] {
-            assert_eq!(s(start, 0.0, true).count(len, false), (0, false), "{len} {start}");
+            assert_eq!(count(s(start, 0.0, true), len, false), (0, false), "{len} {start}");
         }
         // A step far too small saturates the count rather than wrapping it.
         let tiny = Spacing { step: 1e-300, start: 0.0, end: 0.0, with_end: true };
-        assert_eq!(tiny.count(1e10, false).0, usize::MAX);
+        assert_eq!(tiny.places(1e10, false).regular, usize::MAX);
         assert_eq!((mean_azimuth(170.0, -170.0), bearing(-1e-17), bearing(-90.0)), (180.0, 0.0, 270.0));
     }
 
