@@ -24411,3 +24411,30 @@ fn background_runs_follow_a_renamed_map_a_moved_window_and_a_loaded_layer() {
     assert!(s.map().layers[0].dataset.features.iter().any(|f| f.attrs.first().and_then(|v| v.as_f64()) == Some(-1.0)));
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn must_be_covered_by_says_which_polygons_it_left_out_at_a_pole() {
+    // Around the South Pole, a cap from 20°E round to 10°E and the 10° between written a
+    // billion degrees on: the check at the pole can't use that one, reports the point there and
+    // warns why; with a whole cap it says nothing of the kind (#1033).
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    let c = Coord::new;
+    let ring = |w: f64, e: f64| Geometry::Polygon(vec![vec![vec![c(w, -85.0), c(e, -85.0), c(e, -90.0), c(w, -90.0), c(w, -85.0)]]]);
+    for (caps, warned) in [(vec![ring(20.0, 370.0), ring(1e9 + 90.0, 1e9 + 100.0)], true), (vec![ring(-180.0, 180.0)], false)] {
+        let mut s = Session::new(Project::default());
+        let mut by = Dataset::new("Caps", GeometryType::Polygon, vec![]);
+        for g in caps {
+            by.push(Some(g), vec![]);
+        }
+        let mut pts = Dataset::new("Pole", GeometryType::Point, vec![]);
+        pts.push(Some(Geometry::Point(c(0.0, -90.0))), vec![]);
+        s.map_mut().add_dataset(by);
+        s.map_mut().add_dataset(pts);
+        s.run("topology.rules", &json!({"add": {"rule": "mustBeCoveredBy", "layer": "Pole", "by": "Caps"}})).unwrap();
+        let mark = s.notice_mark();
+        let v = s.run("topology.validate", &Value::Null).unwrap();
+        assert_eq!(v["errors"], u64::from(warned));
+        let said = s.notices_since(mark).iter().any(|n| n.text.contains("left out of the check at a pole") && n.text.contains(": 1"));
+        assert_eq!(said, warned, "{:?}", s.notices_since(mark));
+    }
+}

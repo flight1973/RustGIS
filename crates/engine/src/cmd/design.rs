@@ -1240,6 +1240,8 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
     let mut errors = Vec::new();
     // Rules whose check stopped early (an error or work limit): their counts are partial.
     let mut incomplete = Vec::new();
+    // Polygons a check had to leave out, by rule.
+    let mut skipped = Vec::new();
     for rule in s.map().editing.topology.clone() {
         let Some(l) = s.map().layer_by_name(rule.layer()) else { continue };
         let rows: Vec<usize> = l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect();
@@ -1256,6 +1258,9 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
         if !found.complete {
             incomplete.push(rule.label().to_string());
         }
+        if found.skipped > 0 {
+            skipped.push(format!("{} on '{}': {}", rule.label(), l.name, found.skipped));
+        }
         errors.extend(found.errors.into_iter().map(|e| crate::TopologyIssue {
             rule: rule.label().to_string(),
             layer: l.name.clone(),
@@ -1263,6 +1268,12 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
             lon: e.at.x,
             lat: e.at.y,
         }));
+    }
+    if !skipped.is_empty() {
+        s.warn(format!(
+            "Polygons left out of the check at a pole (a coordinate missing or infinite, or a million turns around), so points there they'd cover are reported: {}",
+            skipped.join("; ")
+        ));
     }
     let n = errors.len();
     let out: Vec<Json> =

@@ -568,14 +568,35 @@ fn polar_reach(g: &Geometry, e: &rustgis_geom::Extent, at: Coord, ground: &rustg
         (p, p.x.hypot(p.y))
     };
     if let Geometry::Polygon(_) = g {
-        // The center at its longitude moved by whole turns into the polygon's box (a few at most):
-        // a polygon written across ±180°, or from 0° to 360°, holds a center written a turn or more
-        // away; one whose box holds none of them holds no center.
-        let first = ((e.min_x - at.x) / 360.0).ceil();
-        let mut plane = None;
-        for c in (0..4).map(|k| Coord::new(at.x + 360.0 * (first + f64::from(k)), at.y)).filter(|c| e.contains(*c)) {
-            if plane.get_or_insert_with(|| g.map_coords(&lonlat_to_plane)).hit(lonlat_to_plane(c), 0.0) {
-                return 0.0;
+        // The center at its longitude moved by whole turns into the polygon's box: a polygon
+        // written across ±180°, or from 0° to 360°, holds a center written a turn or more away; one
+        // whose box holds none of them holds no center. Every turn the box spans is tried: the
+        // first four (all an ordinary polygon has) freely, each further one taking as many steps as
+        // the polygon has vertices; once they run out, the polygon counts as holding the center, a
+        // bound.
+        if e.min_y <= at.y && at.y <= e.max_y {
+            let (first, last) = (((e.min_x - at.x) / 360.0).ceil(), ((e.max_x - at.x) / 360.0).floor());
+            let mut plane = None;
+            let mut vertices = None;
+            let mut tried = 0_u32;
+            let mut turn = first;
+            while turn <= last {
+                if tried >= 4 {
+                    let cost = *vertices.get_or_insert_with(|| {
+                        let mut n = 0_usize;
+                        g.for_each_coord(|_| n += 1);
+                        n.max(1)
+                    });
+                    if !steps.take(cost) {
+                        return steps.bound(0.0);
+                    }
+                }
+                let c = Coord::new(at.x + 360.0 * turn, at.y);
+                if plane.get_or_insert_with(|| g.map_coords(&lonlat_to_plane)).hit(lonlat_to_plane(c), 0.0) {
+                    return 0.0;
+                }
+                tried = tried.saturating_add(1);
+                turn = first + f64::from(tried);
             }
         }
     }
@@ -794,6 +815,23 @@ mod tests {
         let mut steps = Steps::new(10);
         let out_of_reach = polar_reach(&pts, &pts.extent(), at, &ground, 1_000.0, &mut steps);
         assert!(out_of_reach.is_infinite() && steps.left == 10 && steps.bound.is_infinite());
+    }
+
+    #[test]
+    fn a_center_is_tried_at_every_turn_a_polygon_spans() {
+        // A strip along 86°N from 0° to 1441°, rising into a block from 1430° to 1441°: a center at
+        // 86.5°N on 0° lies in the block, 1440° on, its fifth turn. A sliver a billion degrees long,
+        // rising from 86°N to 87°N along it, reaches 86.5°N only some 1.4 million turns on: it isn't
+        // tried at every turn for ever, but past the steps counts as holding the center, a bound,
+        // and says so.
+        let c = Coord::new;
+        let mut ds = Dataset::new("strips", GeometryType::Polygon, vec![]);
+        let block = vec![c(0.0, 86.0), c(1441.0, 86.0), c(1441.0, 87.0), c(1430.0, 87.0), c(1430.0, 86.1), c(0.0, 86.1), c(0.0, 86.0)];
+        ds.push(Some(Geometry::Polygon(vec![vec![block]])), vec![]);
+        let long = vec![c(0.0, 86.0), c(1e9, 86.0), c(1e9, 87.0), c(0.0, 86.0)];
+        ds.push(Some(Geometry::Polygon(vec![vec![long]])), vec![]);
+        assert_eq!(within_counted(&ds, &[0], c(0.0, 86.5), 1_000.0), (vec![(0, 0.0)], 0));
+        assert_eq!(within_counted(&ds, &[1], c(0.0, 86.5), 50_000.0), (vec![(1, 0.0)], 1));
     }
 
     #[test]
