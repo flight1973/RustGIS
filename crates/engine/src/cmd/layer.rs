@@ -2703,12 +2703,15 @@ pub fn columns_of(name: &str, bytes: &[u8], p: &Value) -> CmdResult {
     } else if is_delimited_name(name) {
         let bytes = bytes.get(..COLUMNS_PREFIX).unwrap_or(bytes);
         let text = match std::str::from_utf8(bytes) {
-            Ok(text) => text,
+            Ok(text) => text.into(),
             // The part read may end inside a character.
-            Err(e) if e.error_len().is_none() => std::str::from_utf8(bytes.get(..e.valid_up_to()).unwrap_or_default()).unwrap_or_default(),
-            Err(_) => return Err(format!("{name} is not UTF-8 text")),
+            Err(e) if e.error_len().is_none() => {
+                std::str::from_utf8(bytes.get(..e.valid_up_to()).unwrap_or_default()).unwrap_or_default().into()
+            }
+            // Another encoding (Latin-1, UTF-16), as reading the file takes it.
+            Err(_) => rustgis_data::io::delimited_text(name, bytes).map_err(err)?.0,
         };
-        rustgis_data::io::csv_columns(text, parse_delimiter(ps(p, "delimiter"))?).map_err(err)?
+        rustgis_data::io::csv_columns(&text, parse_delimiter(ps(p, "delimiter"))?).map_err(err)?
     } else {
         return Err(format!("{name}: not delimited text (CSV, TSV, TXT) or a spreadsheet"));
     };
@@ -2739,9 +2742,11 @@ fn read_delimited(
     }
     let Some(opts) = csv_options(p)? else { return Ok(None) };
     let bytes = bytes()?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| format!("{name} is not UTF-8 text"))?;
+    let (text, note) = rustgis_data::io::delimited_text(name, &bytes).map_err(|e| e.to_string())?;
     let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
-    rustgis_data::io::read_csv_with(text, stem, &opts).map(Some).map_err(|e| format!("{name}: {e}"))
+    let (ds, mut report) = rustgis_data::io::read_csv_with(&text, stem, &opts).map_err(|e| format!("{name}: {e}"))?;
+    report.messages.extend(note);
+    Ok(Some((ds, report)))
 }
 
 /// The file name for data downloaded from `url`: its last path segment when that has an extension
@@ -3462,8 +3467,16 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
     if expression.is_some() && !matches!(kind.as_str(), "unique" | "uniquevalues") {
         return Err("only Unique Values class by an expression".into());
     }
+    // Applied again by the layer's own expression, as many classes as it has (an imported rule
+    // style's may pass the first MAX_UNIQUE values).
+    let mut keep = rustgis_map::symbology::MAX_UNIQUE;
     let expression = match (p.get("expression"), p.get("field")) {
-        (None, None) => l.renderer.expression().map(str::to_string),
+        (None, None) => {
+            if let Renderer::Unique { classes, expression: Some(_), .. } = &l.renderer {
+                keep = keep.max(classes.len()).min(rustgis_map::symbology::MAX_EXPRESSION_CLASSES);
+            }
+            l.renderer.expression().map(str::to_string)
+        }
         _ => expression,
     };
     // Features past the first values an expression's classes keep.
@@ -3472,7 +3485,7 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
         "single" | "singlesymbol" => Renderer::Single(base),
         "unique" | "uniquevalues" => match &expression {
             Some(e) => {
-                let (mut r, n) = Renderer::unique_by_counted(&l.dataset, &rows()?, e, ramp.unwrap_or(Ramp::Harbour), base)?;
+                let (mut r, n) = Renderer::unique_by_up_to(&l.dataset, &rows()?, e, ramp.unwrap_or(Ramp::Harbour), base, keep)?;
                 rest = n;
                 // (Clearing the expression goes back to the field it had.)
                 if let (Renderer::Unique { field, .. }, Some(last)) = (&mut r, last_field) {
@@ -3511,6 +3524,8 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
         r.map_symbols(show_fill);
     }
     let name = l.name.clone();
+    // Classes are the values given with no map scale: one given only at some scales never is.
+    let by_scale = r.expression().is_some_and(rustgis_map::qgis::reads_scale);
     let out = with(s, p, |l| {
         l.renderer = r;
         take_no_fill(l);
@@ -3518,8 +3533,15 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
     if rest > 0 {
         s.notify(
             format!(
-                "{name}: {rest} features whose value is past the first {} values the expression gives (in text order) are drawn as <all other values>",
-                rustgis_map::symbology::MAX_UNIQUE
+                "{name}: {rest} features whose value is past the first {keep} values the expression gives (in text order) are drawn as <all other values>"
+            ),
+            false,
+        );
+    }
+    if by_scale {
+        s.notify(
+            format!(
+                "{name}: its classes are the values the expression gives without a map scale; values it gives only at some scales, if any, are drawn as <all other values>"
             ),
             false,
         );

@@ -280,7 +280,8 @@ complement. Edges follow the shortest geodesics between vertices. The output fie
 `area_km2`, `perimeter_km` and `length_km`; point coordinates are unchanged.
 Spatial Join's **Largest overlap** still measures area on a sphere of radius 6,371 km; it can
 differ from the ellipsoid by up to about 0.9 % (a small area near a pole). The same WGS 84
-measure backs the attribute table's **Calculate Geometry** (`edit.calculateGeometry`), the map's
+measure backs the attribute table's **Calculate Geometry** (`edit.calculateGeometry`), the
+[expressions](expressions.md#values)' `$area`, `$perimeter` and `$length`, the map's
 **Measure** tools on the Earth, and every network tool's edge and route lengths, so all of these
 read the same number for the same geometry, with two exceptions. A polygon ring with a full-turn
 (-180° to 180°) edge, such as a globe-wide band, is measured on the sphere by the attribute table
@@ -551,10 +552,46 @@ Every statistic but `NULLS` leaves out empty values. A text field takes `COUNT`,
 `FIRST`, `LAST`, `UNIQUE`, `CONCATENATE`, `MODE`, `MINORITY` and `NULLS`; the rest need a numeric
 field. A group with no values gets empty statistics, except a `COUNT` and `UNIQUE` of 0 (its
 `NULLS` is its `FREQUENCY`). Two output fields can't share a name, so a case field can't be called
-`FREQUENCY` or `<STAT>_<field>` for a statistic asked for. Counts
-are whole numbers, `CONCATENATE` and the statistics of a text field are text, and the others are
-decimal. Without `statistics`, `field` gives that field's `COUNT`, `SUM`, `MEAN`, `MIN`, `MAX` and
-`STD`, reading its values as numbers.
+`FREQUENCY` or `<STAT>_<field>` for a statistic asked for. Counts are whole numbers, `CONCATENATE`
+and the statistics of a text field are text, and the others are decimal. A decimal holds whole
+numbers exactly only up to 2^53 (9,007,199,254,740,992): a statistic that should be a whole number
+past it (a `SUM`, `RANGE` or evenly dividing `MEAN` of whole numbers, the `MIN`, `MAX`, `FIRST`,
+`LAST`, `MODE` or `MINORITY` picked, or a whole `MEDIAN`, percentile or `IQR`) is rounded, and the
+tool says how many results were rounded and in which fields. The whole numbers are an Integer
+field's values and whole numbers written as text in a numeric field, which these checks and
+`UNIQUE`, `MODE`, `MINORITY` and `CONCATENATE` take exactly up to the 64-bit integer range. A
+longer one written in digits is read as a decimal, and its statistics aren't checked: the tool
+says how many such values it read and in which fields, as statistics of them may be rounded. A
+number written with a decimal point or an exponent (`6.02e23`) asks for a decimal and gets no
+notice. A Double field's values are decimals already, rounded as decimal arithmetic rounds, and
+get no notice. Without `statistics`, `field` gives that field's `COUNT`, `SUM`, `MEAN`, `MIN`,
+`MAX` and `STD`, reading its values as numbers.
+
+**Dissolve** (`dissolve`) merges the polygons sharing a value of `field` into one feature for
+each value, or all of them into one without a field. Each feature has the value and `count`, the
+polygons merged; records with no value form a feature of their own. **Summarize Within**
+(`countPoints`) copies the polygons and adds `point_count`, the points inside each polygon or on
+its edge; a point where polygons overlap counts in each of them.
+
+Both tools take `statistics` to add summary fields: the list Summary Statistics takes, with the
+same statistics, rules for text fields, empty values and output types (above), and `separator`
+for `CONCATENATE`. Each pair adds a field `<STAT>_<field>` after the tool's own fields:
+
+```text
+gp.run={"tool":"dissolve","params":{"input":"parcels","field":"county","statistics":[{"field":"pop","statistic":"SUM"},{"field":"owner","statistic":"FIRST"}]}}
+gp.run={"tool":"countPoints","params":{"polygons":"districts","points":"schools","statistics":[{"field":"pupils","statistic":"MEAN"}]}}
+```
+
+The first adds `SUM_pop` and `FIRST_owner` after `county` and `count`; the second adds
+`MEAN_pupils` after the districts' fields and `point_count`. Dissolve's statistics are of the
+input's fields, over exactly the records merged into each feature: a record without a polygon is
+left out of them, as it is of `count`. Summarize Within's are of the point layer's fields, over
+the points `point_count` counts; a polygon with no points (or no geometry) gets a `COUNT`,
+`UNIQUE` and `NULLS` of 0 and empty other statistics. Both use only the selected records or
+points when there is a selection, taken in record order for `FIRST`, `LAST` and `CONCATENATE`. A
+summary field can't share a name, in any case, with another output field: Dissolve's dissolve
+field, a field of Summarize Within's polygons, or another summary field. In the Tools pane, use
+**Add statistic** as in Summary Statistics. Without `statistics`, neither tool adds fields.
 
 **Pivot Table** (`pivotTable`) turns the values of one field into fields of their own. It makes a
 standalone table with a row for each combination of values of the row `fields` (one field, or
@@ -1186,9 +1223,10 @@ data is unavailable, shows the available band range for invalid band input, and 
 only selected polygons will appear in the output. Both tools report parts omitted during raster-grid
 projection while retaining the valid parts.
 
-Field parameters in Dissolve, XY Table to Point, IDW, Kriging, Summary Statistics and Pivot Table accept
-case-insensitive names. An exact spelling takes precedence; otherwise a name matching several
-fields is rejected as ambiguous. This prevents silently using the wrong field.
+Field parameters in Dissolve, Summarize Within, XY Table to Point, IDW, Kriging, Summary
+Statistics and Pivot Table accept case-insensitive names. An exact spelling takes precedence;
+otherwise a name matching several fields is rejected as ambiguous. This prevents silently using
+the wrong field.
 
 ## Deep learning and hosted imagery
 

@@ -811,6 +811,66 @@ fn a_symbol_is_set_by_expressions() {
     assert_eq!(s.map().layer_by_name("Cities").unwrap().symbol_by.angle.as_deref(), Some("45"));
 }
 
+/// Applied again by its own expression, an imported rule style keeps as many classes as it has
+/// (past the first 64 values, up to the 200 an import makes); classes by an expression reading the map's scale are said to be
+/// the values given without one.
+#[test]
+fn unique_values_by_expression_keep_their_classes_and_say_scales() {
+    let mut s = world();
+    let mut ds = rustgis_data::Dataset::new(
+        "many",
+        rustgis_data::GeometryType::Point,
+        vec![rustgis_data::Field::new("v", rustgis_data::FieldType::Integer)],
+    );
+    let n = rustgis_map::symbology::MAX_EXPRESSION_CLASSES as i64;
+    for i in 0..n {
+        ds.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(i as f64 / 10.0, 1.0))), vec![rustgis_data::Value::Int(i)]);
+    }
+    let many = s.map_mut().add_dataset(ds);
+    let rules: String =
+        (0..n).map(|i| format!(r#"<rule filter="&quot;v&quot; = {i} AND &quot;v&quot; &gt;= 0" symbol="0" label="R{i:03}"/>"#)).collect();
+    let qml = format!(
+        r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">{rules}</rules><symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#
+    );
+    s.run("style.importQgis", &json!({"layer": many, "text": qml})).unwrap();
+    let classes = |s: &Session| match &s.map().layer(many).unwrap().renderer {
+        rustgis_map::Renderer::Unique { classes, expression: Some(_), .. } => classes.len(),
+        r => panic!("{r:?}"),
+    };
+    assert_eq!(classes(&s), n as usize);
+    let mark = s.notice_mark();
+    s.run("layer.symbology", &json!({"layer": many, "type": "unique", "ramp": "Ember"})).unwrap();
+    assert_eq!(classes(&s), n as usize, "every rule keeps its class, up to the limit");
+    let said = |s: &Session, what: &str| s.notices_since(mark).iter().any(|n| n.text.contains(what));
+    assert!(!said(&s, "past the first"), "{:?}", s.notices_since(mark));
+    assert!(!said(&s, "without a map scale"));
+    // An expression of its own keeps the first 64, and says so.
+    s.run("layer.symbology", &json!({"layer": many, "type": "unique", "expression": "'k' || (1000 + v)"})).unwrap();
+    assert_eq!(classes(&s), rustgis_map::symbology::MAX_UNIQUE);
+    assert!(said(&s, "past the first 64"));
+    // One reading the map's scale is classed without one, and says so.
+    let mark = s.notice_mark();
+    s.run(
+        "layer.symbology",
+        &json!({"layer": many, "type": "unique", "expression": "CASE WHEN @map_scale < 50000 THEN 'detail' ELSE 'overview' END"}),
+    )
+    .unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("without a map scale")), "{:?}", s.notices_since(mark));
+    // Its classes are what it gives with no scale: 'detail' only at some scales isn't one.
+    let rustgis_map::Renderer::Unique { classes: kept, .. } = &s.map().layer(many).unwrap().renderer else { panic!() };
+    assert_eq!(kept.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["overview"]);
+    // So too with the scale written right after a word, which the expression still reads.
+    let mark = s.notice_mark();
+    s.run(
+        "layer.symbology",
+        &json!({"layer": many, "type": "unique", "expression": "CASE WHEN@map_scale < 50000 THEN 'detail' ELSE 'overview' END"}),
+    )
+    .unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("without a map scale")), "{:?}", s.notices_since(mark));
+    let rustgis_map::Renderer::Unique { classes: kept, .. } = &s.map().layer(many).unwrap().renderer else { panic!() };
+    assert_eq!(kept.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["overview"]);
+}
+
 #[test]
 fn unique_values_class_by_an_expression() {
     let mut s = world();
@@ -844,6 +904,11 @@ fn unique_values_class_by_an_expression() {
     s.run("layer.symbology", &json!({"layer": "Cities", "type": "unique", "expression": null})).unwrap();
     assert!(expression(&s).is_none());
     assert_eq!(s.map().layer_by_name("Cities").unwrap().renderer.field(), Some(by.as_str()), "back to the field it had");
+    s.undo();
+    assert_eq!(expression(&s).as_deref(), Some(e));
+    s.run("layer.symbology", &json!({"layer": "Cities", "type": "unique", "expression": "  "})).unwrap();
+    assert!(expression(&s).is_none(), "blank text goes back to the field too");
+    assert_eq!(s.map().layer_by_name("Cities").unwrap().renderer.field(), Some(by.as_str()));
     s.undo();
     assert_eq!(expression(&s).as_deref(), Some(e));
     // A style shared to the web says it draws one symbol; a map draws the classes.
@@ -933,6 +998,25 @@ fn unique_values_class_by_an_expression() {
     let mark = s.notice_mark();
     s.run("edit.deleteField", &json!({"layer": "Cities", "field": "name"})).unwrap();
     assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("single symbol")), "{:?}", s.notices_since(mark));
+}
+
+#[test]
+fn qgis_measures_in_project_units_are_left_out() {
+    // QGIS's $area is in the project's units, which aren't read: left out, noted, not read as m².
+    let mut s = world();
+    let qml = |filter: &str| {
+        format!(
+            r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">
+            <rule filter="{filter}" symbol="0" label="Big"/><rule filter="&quot;pop_est&quot; &gt; 5" symbol="0" label="Kept"/></rules>
+            <symbols><symbol type="fill" name="0"><layer class="SimpleFill" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#
+        )
+    };
+    let r = s.run("style.importQgis", &json!({"layer": "Countries", "text": qml("$area &gt; 2")})).unwrap();
+    let said: Vec<&str> = r["notes"].as_array().unwrap().iter().filter_map(|n| n["text"].as_str()).collect();
+    assert!(said.iter().any(|n| n.contains("the rule \"Big\"") && n.contains("project's units")), "{said:?}");
+    // Named only in quotes, it is text: the rule reads.
+    let r = s.run("style.importQgis", &json!({"layer": "Countries", "text": qml("name &lt;&gt; '$area'")})).unwrap();
+    assert!(!r["notes"].to_string().contains("project's units"), "{r}");
 }
 
 #[test]
@@ -2157,10 +2241,11 @@ fn custom_projections_switch_keep_scale_query_and_render() {
     assert!(crate::cmd::share::map_png(&mut s, Some(400.0), Some(300.0), None).unwrap().len() > 1000);
     assert!(s.run("map.projection", &json!({"type": "EPSG:4326"})).is_err(), "degrees are refused");
     assert!(s.run("map.projection", &json!({"type": "nope"})).is_err());
-    // A known code whose method isn't implemented (Brazil Polyconic) is refused, not drawn in
-    // Web Mercator under its own name; the map keeps its projection (#208).
-    let e = s.run("map.projection", &json!({"type": "EPSG:5880"})).unwrap_err();
-    assert!(e.contains("poly"), "{e}");
+    // A known code whose method isn't implemented (EPSG:8441, Laborde) is refused, not drawn in
+    // Web Mercator under its own name; the map keeps its projection (#208). proj4rs 0.3 grew
+    // Brazil Polyconic, so EPSG:5880 switches now.
+    let e = s.run("map.projection", &json!({"type": "EPSG:8441"})).unwrap_err();
+    assert!(e.contains("labrd"), "{e}");
     assert_eq!(s.map().projection.code(), "EPSG:32617");
     assert!(s.run("map.goToXY", &json!({"lon": 100.0, "lat": 0.0})).is_err(), "folded far side of the UTM zone");
     // Undo and save/reload keep the projection.
@@ -10245,11 +10330,23 @@ fn spreadsheets_feeds_landxml_and_polylines() {
     assert_eq!(c["columns"], json!(["stop;Lon;Lat"]));
     assert!(s.run("info.fileColumns", &json!({"path": csv, "delimiter": ";;"})).is_err());
     assert!(s.run("info.fileColumns", &json!({"path": dir.join("missing.csv").display().to_string()})).is_err());
-    // Only the start of delimited text is read: a character cut at its end isn't an error, bytes
-    // that aren't UTF-8 are.
+    // Only the start of delimited text is read: a character cut at its end isn't an error, and
+    // bytes that aren't UTF-8 are read as Latin-1 (#1303), as the file is.
     let cut = crate::cmd::layer::columns_of("t.csv", b"lon,lat,name\n1,2,\xc3", &json!({})).unwrap();
     assert_eq!(cut["x"], "lon");
-    assert!(crate::cmd::layer::columns_of("t.csv", b"lon,lat\n\xff,2\n", &json!({})).is_err());
+    let latin1 = crate::cmd::layer::columns_of("t.csv", b"lon;lat;munic\xedpio\n\xff;2;x\n", &json!({})).unwrap();
+    assert_eq!(latin1["columns"], json!(["lon", "lat", "município"]));
+    // A Latin-1 file with its x/y columns named, as a public source's CSV is added: read, with
+    // a notice saying how.
+    let cnes = dir.join("cnes.csv");
+    std::fs::write(&cnes, b"NO_FANTASIA;NU_LATITUDE;NU_LONGITUDE\nPOSTO S\xc3O JOS\xc9;-5.09;-42.80\n").unwrap();
+    s.notices.clear();
+    let r = s
+        .run("layer.addData", &json!({"path": cnes.display().to_string(), "x": "NU_LONGITUDE", "y": "NU_LATITUDE", "delimiter": ";"}))
+        .unwrap();
+    let l = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap();
+    assert_eq!(l.dataset.value(0, 0), &rustgis_data::Value::Text("POSTO SÃO JOSÉ".into()));
+    assert!(s.notices.iter().any(|n| n.text.contains("Windows-1252")), "{:?}", s.notices);
     // A GeoRSS feed as plain .xml, by its contents.
     let feed = dir.join("quakes.xml");
     std::fs::write(&feed, r#"<rss xmlns:georss="http://www.georss.org/georss"><channel><item><title>Q</title><georss:point>45 -110</georss:point></item></channel></rss>"#).unwrap();
@@ -11181,6 +11278,34 @@ fn arcgis_features_read_past_the_record_limit() {
     );
 }
 
+/// WFS 2.0 without next links reads every page through service.add, with no loss notice.
+#[test]
+fn wfs_service_reads_offset_pages_without_next_links() {
+    use ogc_server::{Route, Server};
+    let page = |ids: &[u32]| {
+        json!({"type": "FeatureCollection", "features": ids.iter().map(|id| {
+            json!({"type": "Feature", "id": id, "properties": {"n": id}, "geometry": {"type": "Point", "coordinates": [id, 1]}})
+        }).collect::<Vec<_>>()})
+        .to_string()
+    };
+    let query = "SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=roads";
+    let format = "OUTPUTFORMAT=application%2Fjson&SRSNAME=EPSG:4326";
+    let server = Server::new(vec![
+        Route::new(&format!("/wfs?{query}&{format}&COUNT=50000"), &page(&[1, 2])),
+        Route::new(&format!("/wfs?{query}&SRSNAME=EPSG:4326&RESULTTYPE=hits"), r#"<FeatureCollection numberMatched="3"/>"#),
+        Route::new(&format!("/wfs?{query}&{format}&STARTINDEX=2&COUNT=2"), &page(&[3])),
+    ]);
+    let caps = format!(
+        r#"<WFS_Capabilities version="2.0.0"><OperationsMetadata><Operation name="GetFeature"><DCP><HTTP><Get href="{}/wfs?"/></HTTP></DCP></Operation></OperationsMetadata><FeatureTypeList><FeatureType><Name>roads</Name><Title>Roads</Title></FeatureType></FeatureTypeList></WFS_Capabilities>"#,
+        server.base
+    );
+    let mut s = Session::new(Project::default());
+    let result = s.run("service.add", &json!({"url": format!("{}/wfs", server.base), "layer": "roads", "text": caps})).unwrap();
+    assert_eq!(result["features"], 3);
+    assert!(s.notices.is_empty(), "{:?}", s.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
+    assert_eq!(server.requests().len(), 3);
+}
+
 /// A feature layer comes whole unless an area is asked for (#819): then only the features that
 /// cross it, a WFS 1.1 or 2.0 asked with `BBOX` latitude first in urn:ogc:def:crs:EPSG::4326. A
 /// WFS 1.0, or an area across the antimeridian, is asked whole, and says so.
@@ -11216,8 +11341,13 @@ fn service_features_asked_for_over_an_area() {
     add(&mut s, "2.0.0", Some(json!("full")));
     add(&mut s, "2.0.0", Some(json!([170.0, -20.0, -170.0, -10.0])));
     add(&mut s, "1.0.0", Some(piaui.clone()));
-    let boxes: Vec<Option<String>> =
-        server.requests().iter().map(|r| r.query.iter().find(|(k, _)| k == "BBOX").map(|(_, v)| v.clone())).collect();
+    // WFS 2.0 also asks for hits; those requests must preserve the feature query's box.
+    let requests = server.requests();
+    let is_hits = |r: &&ogc_server::Request| r.query.iter().any(|(k, v)| k == "RESULTTYPE" && v == "hits");
+    let bbox = |r: &ogc_server::Request| r.query.iter().find(|(k, _)| k == "BBOX").map(|(_, v)| v.clone());
+    let boxes: Vec<Option<String>> = requests.iter().filter(|r| !is_hits(r)).map(bbox).collect();
+    let hit_boxes: Vec<Option<String>> = requests.iter().filter(is_hits).map(bbox).collect();
+    assert_eq!(hit_boxes, boxes[1..5]);
     assert_eq!(boxes.len(), 6);
     assert_eq!(boxes[0].as_deref(), Some("-10.93,-45.99,-2.74,-40.37,urn:ogc:def:crs:EPSG::4326"));
     assert!(boxes[1].as_deref().is_some_and(|b| b.ends_with(",urn:ogc:def:crs:EPSG::4326")), "{boxes:?}");
@@ -18273,6 +18403,14 @@ fn ogc_refresh_reconciles_fields_and_preserves_compatible_settings() {
             s.run("service.refresh", &target).unwrap();
             let singled = |s: &Session| s.notices.iter().filter(|n| n.text.contains("drawn with a single symbol (1: Places)")).count();
             assert_eq!(singled(&s), 0);
+            // Classes by an expression that still reads are kept too.
+            s.run("layer.symbology", &json!({"layer":layer, "type":"unique", "expression":"value || ''"})).unwrap();
+            let by_expression = s.map().layer(layer).unwrap().renderer.clone();
+            s.run("service.refresh", &target).unwrap();
+            assert_eq!(s.map().layer(layer).unwrap().renderer, by_expression);
+            assert_eq!(singled(&s), 0);
+            s.run("edit.undo", &Value::Null).unwrap();
+            s.run("edit.undo", &Value::Null).unwrap();
             let l = s.map().layer(layer).unwrap();
             assert_eq!(l.renderer, style);
             assert_eq!(l.labels, labels);

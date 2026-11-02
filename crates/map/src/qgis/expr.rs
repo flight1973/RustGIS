@@ -33,10 +33,26 @@ pub(super) fn reads_scale(expr: &str) -> bool {
     rustgis_scales(expr) != expr
 }
 
+/// Whether a QGIS expression measures its geometry (`$area`, `$perimeter`, `$length`), outside
+/// quotes. QGIS measures in the project's units, which the import doesn't read yet, so such an
+/// expression is left out rather than read in square metres and metres.
+pub fn reads_measure(expr: &str) -> bool {
+    map_vars(expr, |c, name| (c == '$' && rustgis_data::Measure::from_key(name).is_some()).then(String::new)) != expr
+}
+
 /// A QGIS expression with its map scale (`@map_scale`, `$scale`, QGIS's at 96 dpi) read as
 /// RustGIS's ([`super::QGIS_SCALE`] of it), so `@map_scale < 50000` picks the same zoom in both;
 /// text within quotes is left as it is.
 pub(super) fn rustgis_scales(expr: &str) -> String {
+    map_vars(expr, |c, name| {
+        ((c == '@' && name.eq_ignore_ascii_case("map_scale")) || (c == '$' && name.eq_ignore_ascii_case("scale")))
+            .then(|| format!("(@map_scale / {})", super::QGIS_SCALE))
+    })
+}
+
+/// `expr` with each variable outside quotes (`@name` or `$name`, its sigil and name passed to
+/// `f`) replaced by what `f` gives, or kept when it gives `None`.
+fn map_vars(expr: &str, f: impl Fn(char, &str) -> Option<String>) -> String {
     let chars: Vec<char> = expr.chars().collect();
     let mut out = String::with_capacity(expr.len());
     let mut quote: Option<char> = None;
@@ -59,13 +75,14 @@ pub(super) fn rustgis_scales(expr: &str) -> String {
                 let end =
                     (i + 1..=chars.len()).find(|j| !chars.get(*j).is_some_and(|d| d.is_alphanumeric() || *d == '_')).unwrap_or(chars.len());
                 let name: String = chars.get(i + 1..end).unwrap_or_default().iter().collect();
-                let after_word = i > 0 && chars.get(i - 1).is_some_and(|d| d.is_alphanumeric() || *d == '_');
-                if !after_word && ((c == '@' && name.eq_ignore_ascii_case("map_scale")) || (c == '$' && name.eq_ignore_ascii_case("scale")))
-                {
-                    out.push_str(&format!("(@map_scale / {})", super::QGIS_SCALE));
-                } else {
-                    out.push(c);
-                    out.push_str(&name);
+                // (Right after a word too: `WHEN@map_scale` reads the scale, in QGIS and in RustGIS,
+                // whose names hold neither `@` nor `$`.)
+                match f(c, &name) {
+                    Some(with) => out.push_str(&with),
+                    None => {
+                        out.push(c);
+                        out.push_str(&name);
+                    }
                 }
                 i = end;
             }
@@ -256,8 +273,15 @@ mod tests {
         assert_eq!(to_sql("@map_scale < 5000").as_deref(), Some(format!("(@map_scale / {k}) < 5000").as_str()));
         assert_eq!(
             super::rustgis_scales("$scale > 1 AND \"@map_scale\" = '$scale' AND @map_scales = 2 AND a$scale"),
-            format!("(@map_scale / {k}) > 1 AND \"@map_scale\" = '$scale' AND @map_scales = 2 AND a$scale")
+            format!("(@map_scale / {k}) > 1 AND \"@map_scale\" = '$scale' AND @map_scales = 2 AND a(@map_scale / {k})")
         );
         assert_eq!(to_sql(&"a".repeat(MAX_LEN + 1)), None);
+        // A scale right after a word is read and converted too, as the expression reads it.
+        assert_eq!(
+            to_sql("CASE WHEN@map_scale < 5 THEN 'a' END").as_deref(),
+            Some(format!("CASE WHEN(@map_scale / {k}) < 5 THEN 'a' END").as_str())
+        );
+        assert!(super::reads_scale("CASE WHEN@map_scale < 5 THEN 'a' END") && super::reads_scale("a$scale"));
+        assert!(!super::reads_scale("\"@map_scale\" = '$scale' AND @map_scales = 2"));
     }
 }
