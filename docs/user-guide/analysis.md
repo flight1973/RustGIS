@@ -229,8 +229,8 @@ gp.run={"tool":"featureVerticesToPoints","params":{"input":"Rivers","output":"ri
 the `input` layer's lines, or each ring of its polygons (holes too), measured on the WGS 84
 ellipsoid as Buffer's distances are, in `units` (Kilometers by default): a point at `startOffset`
 (0 by default), then one every `distance`, stopping `endOffset` before the part's end.
-`includeEnd` adds a point where they stop when the distance doesn't land there (the start always
-has one). Each part and ring is walked on its own from its first vertex, so the gap between two
+`includeEnd` adds a point where they stop when the distance doesn't land there (the first is
+always at the start offset). Each part and ring is walked on its own from its first vertex, so the gap between two
 parts never counts; a line's parts that cross the antimeridian, one ending on it where the next
 begins on its other side, as a GeoJSON file splits a line that crosses it, are one line. A ring
 ends where it starts, so a point there is made once, and a line that ends where it starts (a
@@ -239,9 +239,10 @@ feature's attributes and three fields: `orig_fid`, the feature's OID, as Feature
 Points writes it, and, named as in QGIS's Points along geometry, `distance` (how far along its
 part, in `units`, the start offset included) and `angle` (the line's direction there, in degrees
 clockwise from north; on a vertex, halfway between the segments either side). A new field whose
-name the input already has gets a suffix (`distance_2`). Unlike QGIS's tool, which measures
-`distance` along the whole feature in the layer's units, each part starts again from 0, and the
-distance is on the ground in any coordinate system.
+name the input already has gets a suffix (`distance_2`). QGIS's tool works differently: it
+measures `distance` along the whole feature (a polygon's rings as one, its end offset left out) in
+the layer's units, and walks a closed line as an open one, its start and end each a point. Here
+each part and ring starts again from 0, and the distance is on the ground in any coordinate system.
 
 Each edge is the shortest path between its vertices on the ellipsoid, as Calculate Geometry
 Attributes measures it and the globe draws it. A flat map draws an edge straight in its own
@@ -249,9 +250,10 @@ projection instead (in Web Mercator, along a constant bearing), so a point on a 
 off the drawn line: on an east–west edge 100 km long, by about 200 m at 45° of latitude, 340 m at
 60° and 1.1 km at 80° (on one 10 km long, a hundredth of that; on the equator or along a meridian,
 not at all). Add vertices to long edges first if the points must follow the drawn line. An edge
-spanning more than 180° of longitude is taken the short way round, and one from −180° to 180° has
-no length; a polygon cut at the antimeridian is walked as it is stored, so it gets points along
-the cut too (and a polar cap stored closed along a pole, only along the cut). An edge between
+spanning more than 180° of longitude is taken the short way round, and one from −180° to 180° at
+one latitude has no length; a polygon cut at the antimeridian is walked as it is stored, so it gets
+points along the cut too (a polar cap whose parallel is one edge from −180° to 180°, only along the
+cut). An edge between
 opposite sides of the Earth has no single shortest path, and the tool takes the one GeographicLib
 does (over a pole for two points on the equator).
 
@@ -259,9 +261,11 @@ The angle is the bearing from true north, which near a pole turns quickly along 
 line (by 33° in 30 m, 11 m from the North Pole); at a pole itself, where every direction is south,
 it follows GeographicLib's convention, from the meridian of the longitude the vertex is written
 with. On a map in another projection than Web Mercator, north isn't straight up everywhere, so
-there the angle differs from the line's direction on the map; in Web Mercator it can differ from a
-long edge's drawn direction by a fraction of a degree. A vertex less than a millimeter from the one
-before is passed over, so a near-duplicate doesn't turn a point's angle, and a vertex past a pole
+there the angle differs from the line's direction on the map. In Web Mercator it differs from a long
+edge's drawn direction by about half the edge's span of longitude times the sine of the latitude:
+at the ends of an east–west edge 100 km long, 0.45° at 45° and 2.5° at 80°. A vertex less than a
+millimeter from the one before is passed over, so a near-duplicate doesn't turn a point's angle,
+and a vertex past a pole
 (bad data) is taken as the pole. The points keep the input's coordinate system, with longitudes
 between -180 and 180, so a point past the antimeridian is on the far side of the map. The points
 are counted first and may take up to about 4 GiB (some 20 million points with a few fields): a

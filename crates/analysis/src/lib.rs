@@ -356,13 +356,31 @@ fn boolean(spec: &ToolSpec, ps: &ParamSpec, v: &Value) -> Result<Value, String> 
         Value::String(s) if s.trim().is_empty() => Ok(default()),
         Value::String(s) if s.trim().eq_ignore_ascii_case("true") => Ok(Value::Bool(true)),
         Value::String(s) if s.trim().eq_ignore_ascii_case("false") => Ok(Value::Bool(false)),
-        _ => {
-            // Echoed in part: a value can be huge.
-            let full = v.to_string();
-            let shown = if full.chars().count() > 80 { format!("{}…", full.chars().take(80).collect::<String>()) } else { full };
-            Err(format!("{}: '{}' must be true or false (not {shown})", spec.name, ps.label))
+        _ => Err(format!("{}: '{}' must be true or false (not {})", spec.name, ps.label, shown(v))),
+    }
+}
+
+/// A refused value as JSON for its message: up to 80 characters, then "…". A value can be huge,
+/// and is written out only that far (serde_json stops when its writer does).
+fn shown(v: &Value) -> String {
+    struct Upto(String, usize);
+    impl std::fmt::Write for Upto {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            for c in s.chars() {
+                if self.1 == 0 {
+                    return Err(std::fmt::Error);
+                }
+                self.0.push(c);
+                self.1 -= 1;
+            }
+            Ok(())
         }
     }
+    let mut out = Upto(String::new(), 80);
+    if std::fmt::write(&mut out, format_args!("{v}")).is_err() {
+        out.0.push('…');
+    }
+    out.0
 }
 
 /// A built-in tool's choice parameter as one of its choices, spelled as declared (`"meters"` is
@@ -379,7 +397,7 @@ fn choice(spec: &ToolSpec, ps: &ParamSpec, choices: &[&str], v: &Value) -> Resul
     };
     match choices.iter().find(|c| c.eq_ignore_ascii_case(&given)) {
         Some(c) => Ok(Value::String((*c).to_string())),
-        None => Err(format!("{}: '{}' must be one of {} (not {v})", spec.name, ps.label, choices.join(", "))),
+        None => Err(format!("{}: '{}' must be one of {} (not {})", spec.name, ps.label, choices.join(", "), shown(v))),
     }
 }
 
