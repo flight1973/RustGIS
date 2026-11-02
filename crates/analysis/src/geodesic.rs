@@ -340,12 +340,14 @@ impl Plane {
 /// this passes doesn't stray, and shorter edges, edges nearer the centre and lower latitudes skip
 /// the look that most of a buffer's time went to.
 fn may_stray(a: GC<f64>, b: GC<f64>, la: Coord, lb: Coord, tolerance: f64) -> bool {
+    // Before the short-edge pass: [`STRAY_PER_M2`] holds for rhumb lines, not for the spirals that
+    // straight edges are beyond 85.05°, where even a short edge near a pole strays meters.
+    if la.y.abs().max(lb.y.abs()) > rustgis_geom::MAX_LAT {
+        return true;
+    }
     let length2 = (b.x - a.x).powi(2) + (b.y - a.y).powi(2);
     if STRAY_PER_M2 * length2 <= tolerance {
         return false;
-    }
-    if la.y.abs().max(lb.y.abs()) > rustgis_geom::MAX_LAT {
-        return true;
     }
     let length = length2.sqrt();
     let lat = la.y.abs().max(lb.y.abs()).to_radians() + length / EARTH_R_M;
@@ -546,10 +548,35 @@ mod tests {
             let (s, c) = (k as f64 * std::f64::consts::FRAC_PI_4).sin_cos();
             GC { x: 100_000.0 * c, y: 100_000.0 * s }
         };
-        let octagon: Vec<GC<f64>> = (0..=8).map(corner).collect();
+        let octagon = LineString::new((0..=8).map(corner).collect());
         let tolerance = 100_000.0 * OUTLINE_TOLERANCE;
-        let ring = plane.ring(&LineString::new(octagon.clone()), tolerance);
-        assert!(ring.0.len() > octagon.len(), "{}", ring.0.len());
+        let ring = plane.ring(&octagon, tolerance);
+        assert!(ring.0.len() > octagon.0.len(), "{}", ring.0.len());
+        let worst = farthest_drawn(&plane, &ring, &octagon);
+        assert!(worst <= 2.0 * tolerance, "{worst} m off the octagon, tolerance {tolerance} m");
+    }
+
+    #[test]
+    fn a_small_buffer_near_a_pole_follows_its_circle_as_the_tools_draw_it() {
+        // A point's buffer beyond 85.05° has short edges (49 m for 1 km), but near a pole an edge
+        // straight in lon/lat strays meters even so: each is looked at, not let pass for its length.
+        // Back in lon/lat, each edge of the outline, drawn as the tools draw it, stays within the
+        // tolerance of the circle drawn in the plane. (Each circle stops short of its pole.)
+        for (lat, meters) in [(85.5, 1_000.0), (88.0, 1_000.0), (89.9, 100.0), (89.9, 10_000.0), (89.99, 1_000.0), (-89.99, 1_000.0)] {
+            let c = Coord::new(10.0, lat);
+            let plane = Plane::new(c, c.x);
+            let circle = Point::new(0.0, 0.0).buffer_with_style(buffer_style(meters));
+            let Some(outline) = circle.0.first().map(Polygon::exterior) else { panic!("no circle at {lat}°") };
+            let tolerance = (meters * OUTLINE_TOLERANCE).max(MIN_TOLERANCE_M);
+            let worst = farthest_drawn(&plane, &plane.ring(outline, tolerance), outline);
+            assert!(worst <= 2.0 * tolerance, "{lat}°, {meters} m: {worst} m off the circle, tolerance {tolerance} m");
+        }
+    }
+
+    /// How far, at most, `ring` (in lon/lat, as [`Plane::ring`] gives it) drawn as the tools draw
+    /// its edges (straight in the analysis plane) comes from `outline` in `plane`, at each edge's
+    /// quarter points and midpoint.
+    fn farthest_drawn(plane: &Plane, ring: &LineString<f64>, outline: &LineString<f64>) -> f64 {
         let mut worst = 0.0_f64;
         for w in ring.0.windows(2) {
             let [a, b] = w else { continue };
@@ -557,7 +584,8 @@ mod tests {
             for t in [0.25, 0.5, 0.75] {
                 let drawn = plane_to_lonlat(Coord::new(pa.x + t * (pb.x - pa.x), pa.y + t * (pb.y - pa.y)));
                 let p = plane.0.forward(drawn);
-                let off = octagon
+                let off = outline
+                    .0
                     .windows(2)
                     .filter_map(|e| {
                         Some(rustgis_data::geometry::seg_dist2(
@@ -570,7 +598,7 @@ mod tests {
                 worst = worst.max(off);
             }
         }
-        assert!(worst <= 2.0 * tolerance, "{worst} m off the octagon, tolerance {tolerance} m");
+        worst
     }
 
     #[test]

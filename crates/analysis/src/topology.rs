@@ -338,8 +338,9 @@ pub fn dangles(ds: &Dataset, rows: &[usize], tol_m: f64) -> Checked {
 const POLAR_STRAY_SHARE: f64 = 1e-3;
 /// The least that allowance, in meters.
 const POLAR_STRAY_MIN_M: f64 = 1e-3;
-/// The most pieces [`edge_from`] and [`edge_length`] cut one edge into (a hostile edge thousands of
-/// degrees long included); past that, its pieces stray farther.
+/// The most pieces [`edge_from`] and [`edge_length`] cut one edge into. Only an edge winding round a
+/// pole hundreds of times (thousands of degrees of longitude) needs more: rather than measure it
+/// coarsely, the check stops there, incomplete.
 const POLAR_PIECES_MAX: f64 = 65_536.0;
 /// The longest piece, in radians of longitude, that [`edge_length`] measures an edge in: its chords
 /// fall short of the edge by under 0.006%.
@@ -348,8 +349,22 @@ const POLAR_LENGTH_STEP: f64 = 0.0175;
 /// at worst costs about a quarter of a piece measured in [`edge_from`]. Reads add up across ends.
 const READS_A_WORK: usize = 4;
 
-/// The dangle check passed [`MAX_WORK`]: nothing more is compared.
+/// The dangle check passed [`MAX_WORK`], or met an edge it can't measure in [`POLAR_PIECES_MAX`]
+/// pieces: nothing more is compared, and the check is incomplete.
 struct WorkLimit;
+
+/// How many pieces a count of `n` asks for: one when it's under two, not a number or infinite (a
+/// stretch along a meridian; a missing or infinite coordinate, which [`Reach::spans`] never
+/// measures to), or [`WorkLimit`] past [`POLAR_PIECES_MAX`].
+fn pieces(n: f64) -> Result<f64, WorkLimit> {
+    if !(n > 1.0 && n.is_finite()) {
+        Ok(1.0)
+    } else if n > POLAR_PIECES_MAX {
+        Err(WorkLimit)
+    } else {
+        Ok(n.ceil())
+    }
+}
 
 /// Adds `n` to `work`, or says it passed [`MAX_WORK`].
 fn charge(work: &mut usize, n: usize) -> Result<(), WorkLimit> {
@@ -502,9 +517,7 @@ fn edge_from(
     let dl = ((b.x - a.x) * (t1 - t0) / rustgis_geom::MERCATOR_R).abs();
     let reaches_band = p.y.abs() <= MAX_LAT || q.y.abs() <= MAX_LAT;
     let stray = (tol_m * POLAR_STRAY_SHARE).max(POLAR_STRAY_MIN_M) / if reaches_band { 2.0 } else { 1.0 };
-    let n = (dl * (rho * dl + 2.0 * drho) / (8.0 * stray)).sqrt().ceil();
-    // A count that overflows or isn't a number takes one piece, as does a stretch along a meridian.
-    let pieces = if n > 1.0 && n.is_finite() { n.min(POLAR_PIECES_MAX) } else { 1.0 };
+    let pieces = pieces((dl * (rho * dl + 2.0 * drho) / (8.0 * stray)).sqrt())?;
     charge(work, pieces as usize)?;
     let (mut last, mut d2) = (about_pole(p, north), f64::INFINITY);
     for k in 1..=pieces as usize {
@@ -518,20 +531,23 @@ fn edge_from(
 
 /// How long the edge `a`–`b` (in the analysis plane) is in the frame about a pole (the North Pole
 /// when `north`), measured in pieces of at most [`POLAR_LENGTH_STEP`] of longitude, which count
-/// against `work`.
-fn edge_length((a, b): (Coord, Coord), north: bool, work: &mut usize) -> Result<f64, WorkLimit> {
-    let n = ((b.x - a.x) / rustgis_geom::MERCATOR_R).abs() / POLAR_LENGTH_STEP;
-    // A count that overflows or isn't a number takes one piece.
-    let pieces = if n > 1.0 && n.is_finite() { n.ceil().min(POLAR_PIECES_MAX) } else { 1.0 };
+/// against `work`; and, once that length from `a` passes `skip`, where on the edge (its parameter,
+/// 0 at `a`, at the end of the piece that passes it).
+fn edge_length((a, b): (Coord, Coord), north: bool, skip: f64, work: &mut usize) -> Result<(f64, Option<f64>), WorkLimit> {
+    let pieces = pieces(((b.x - a.x) / rustgis_geom::MERCATOR_R).abs() / POLAR_LENGTH_STEP)?;
     charge(work, pieces as usize)?;
     let at = |t: f64| about_pole(plane_to_lonlat(Coord::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)), north);
-    let (mut last, mut length) = (at(0.0), 0.0);
+    let (mut last, mut length, mut passed) = (at(0.0), 0.0, None);
     for k in 1..=pieces as usize {
-        let next = at(k as f64 / pieces);
+        let t = k as f64 / pieces;
+        let next = at(t);
         length += (next.x - last.x).hypot(next.y - last.y);
+        if passed.is_none() && length > skip {
+            passed = Some(t);
+        }
         last = next;
     }
-    Ok(length)
+    Ok((length, passed))
 }
 
 /// The dangle check's ends beyond 85.05° (#1033). There the analysis plane stretches east–west by
@@ -586,8 +602,8 @@ impl<'a> PolarEnds<'a> {
     /// the stretches of edges within the end's reach ([`Reach`]) are measured. Each cell holding
     /// parts, entry, part opened, edge whose box meets the reach and piece measured counts against
     /// `work`, and edges out of reach count [`READS_A_WORK`] to a unit. The end's own part is read
-    /// once an end, as within the band: its edges within twice the tolerance of the end are
-    /// measured for length (in pieces), the rest as others' are.
+    /// once an end, as within the band: its edges are measured for length (in pieces) until the
+    /// walk passes twice the tolerance, and the rest, from that point on, as others' are.
     fn meets(
         &mut self,
         (li, pi, at_start): (usize, usize, bool),
@@ -599,41 +615,46 @@ impl<'a> PolarEnds<'a> {
         let e = about_pole(at, north);
         let lines = self.lines;
         let reach = Reach::new(end, at.y, tol_m);
-        let near = |a: &Coord, b: &Coord, work: &mut usize| -> Result<bool, WorkLimit> {
+        // Whether the edge `a`–`b`, from its parameter `from` on, comes within the tolerance.
+        let mut near = |a: &Coord, b: &Coord, from: f64, work: &mut usize| -> Result<bool, WorkLimit> {
+            if !reach.boxed(a, b) {
+                return read(&mut self.reads, work).map(|()| false);
+            }
             charge(work, 1)?;
             let mut lonlat = None;
-            for t in reach.spans(a, b).into_iter().flatten() {
+            for (t0, t1) in reach.spans(a, b).into_iter().flatten() {
+                let t0 = t0.max(from);
+                if t0 > t1 {
+                    continue;
+                }
                 let ends = *lonlat.get_or_insert_with(|| (plane_to_lonlat(*a), plane_to_lonlat(*b)));
-                if edge_from(e, (*a, *b), ends, t, north, tol_m, work)? <= tol_m * tol_m {
+                if edge_from(e, (*a, *b), ends, (t0, t1), north, tol_m, work)? <= tol_m * tol_m {
                     return Ok(true);
                 }
             }
             Ok(false)
         };
         // Its own part, from the end on: the rest, past twice the tolerance along it, counts too (a
-        // line curling back onto itself, like a 6, doesn't dangle there).
+        // line curling back onto itself, like a 6, doesn't dangle there). The rest starts where the
+        // walk passes that, inside an edge too: beyond 85.05° an edge is a spiral in the frame, and
+        // one winding round the pole comes back past the end.
         let part = lines.get(li).and_then(|(_, ps)| ps.get(pi)).map(Vec::as_slice).unwrap_or(&[]);
         let n = part.len();
         let (mut walked, mut past) = (0.0, false);
         for i in 0..n.saturating_sub(1) {
             let ends = if at_start { (part.get(i), part.get(i + 1)) } else { (part.get(n - 1 - i), part.get(n - 2 - i)) };
             let (Some(a), Some(b)) = ends else { break };
-            if past {
-                if !reach.boxed(a, b) {
-                    read(&mut self.reads, work)?;
-                } else if near(a, b, work)? {
-                    return Ok(true);
-                }
-                continue;
-            }
-            walked += edge_length((*a, *b), north, work)?;
-            if walked > 2.0 * tol_m {
+            let from = if past {
+                0.0
+            } else {
+                let (length, passed) = edge_length((*a, *b), north, 2.0 * tol_m - walked, work)?;
+                walked += length;
+                let Some(from) = passed else { continue };
                 past = true;
-                // The rest starts at this edge's far end.
-                let far = about_pole(plane_to_lonlat(*b), north);
-                if (far.x - e.x).hypot(far.y - e.y) <= tol_m {
-                    return Ok(true);
-                }
+                from
+            };
+            if near(a, b, from, work)? {
+                return Ok(true);
             }
         }
         let cells = self.cells;
@@ -668,9 +689,7 @@ impl<'a> PolarEnds<'a> {
                         let other = lines.get(oli).and_then(|(_, ps)| ps.get(opi)).map(Vec::as_slice).unwrap_or(&[]);
                         for w in other.windows(2) {
                             let [a, b] = w else { continue };
-                            if !reach.boxed(a, b) {
-                                read(&mut self.reads, work)?;
-                            } else if near(a, b, work)? {
+                            if near(a, b, 0.0, work)? {
                                 return Ok(true);
                             }
                         }
@@ -760,10 +779,11 @@ mod tests {
         // Line 1 meets it there.
         assert_eq!(run(&[(0, vec![own.clone()]), (1, vec![vec![p(1.0, 88.0), p(0.0, 89.0)]])], 0).0, Some(true));
         // Line 1 is 1,000 points at 86°N, far off but in the cell: the end measures its own edge's
-        // length (one piece), reads the cell and its two entries, opens line 1 (one unit) and finds
-        // its 999 edges out of reach (one unit per READS_A_WORK).
+        // length (one piece) and the edge from twice the tolerance on (one unit), reads the cell
+        // and its two entries, opens line 1 (one unit) and finds its 999 edges out of reach (one
+        // unit per READS_A_WORK).
         let apart = [(0, vec![own]), (1, vec![(0..1_000).map(|i| p(90.0 + f64::from(i) * 1e-4, 86.0)).collect()])];
-        assert_eq!(run(&apart, 0), (Some(false), 1 + 1 + 2 + 1 + 999 / READS_A_WORK));
+        assert_eq!(run(&apart, 0), (Some(false), 1 + 1 + 1 + 2 + 1 + 999 / READS_A_WORK));
         // Starting short of the limit, it stops on the first unit past it: its own edge, the cell,
         // an entry, opening line 1, or reading line 1's edges.
         for start in [MAX_WORK, MAX_WORK - 1, MAX_WORK - 2, MAX_WORK - 4, MAX_WORK - 10] {
@@ -779,10 +799,11 @@ mod tests {
         for (met, work) in &mut ends {
             *met = polar.meets((0, 0, false), (end, plane_to_lonlat(end)), 10.0, work).ok();
         }
-        let first = 5 + 999 / READS_A_WORK;
-        assert_eq!(ends, [(Some(false), first), (Some(false), 5 + (2 * 999 / READS_A_WORK - 999 / READS_A_WORK))]);
+        let first = 6 + 999 / READS_A_WORK;
+        assert_eq!(ends, [(Some(false), first), (Some(false), 6 + (2 * 999 / READS_A_WORK - 999 / READS_A_WORK))]);
         // The end's own part's edges out of reach, past twice the tolerance, are read too: nine
-        // toward and along 86°N, with no other line, after its own first edge's piece.
+        // toward and along 86°N, with no other line, after its own first edge's piece and the edge
+        // from twice the tolerance on.
         let own: Vec<Coord> = (0..9).map(|i| p(90.0 + f64::from(i) * 1e-4, 86.0)).chain([p(0.0, 88.0), end]).collect();
         let (lone, mut work) = ([(0, vec![own])], 0);
         let met = PolarEnds::new(&lone, &std::collections::HashMap::new(), cells).meets(
@@ -791,7 +812,7 @@ mod tests {
             10.0,
             &mut work,
         );
-        assert_eq!((met.ok(), work), (Some(false), 1 + 9 / READS_A_WORK));
+        assert_eq!((met.ok(), work), (Some(false), 1 + 1 + 9 / READS_A_WORK));
     }
 
     #[test]
@@ -813,17 +834,55 @@ mod tests {
     fn an_edge_with_a_coordinate_out_of_range_is_one_piece() {
         let (mut work, b) = (0, lonlat_to_plane(Coord::new(0.0, 89.0)));
         for a in [Coord::new(f64::INFINITY, b.y), Coord::new(f64::NAN, b.y)] {
-            let _ = edge_length((a, b), true, &mut work);
+            let _ = edge_length((a, b), true, 0.0, &mut work);
         }
         assert_eq!(work, 2);
+    }
+
+    #[test]
+    fn an_edge_too_long_to_measure_stops_the_check() {
+        // An edge winding round the North Pole about 194 times (70,000° of longitude) needs more
+        // than POLAR_PIECES_MAX pieces: measured coarser, its length and distances would be off
+        // without a word, so the check stops, incomplete, and charges nothing for it.
+        let (a, b) = (lonlat_to_plane(Coord::new(0.0, 88.0)), lonlat_to_plane(Coord::new(70_000.0, 88.0)));
+        let mut work = 0;
+        assert!(edge_length((a, b), true, 0.0, &mut work).is_err());
+        let ends = (plane_to_lonlat(a), plane_to_lonlat(b));
+        let e = about_pole(Coord::new(0.0, 88.0), true);
+        assert!(edge_from(e, (a, b), ends, (0.0, 1.0), true, 1.0, &mut work).is_err());
+        assert_eq!(work, 0);
+        let mut ds = Dataset::new("l", GeometryType::Polyline, vec![]);
+        ds.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 88.0), Coord::new(70_000.0, 88.0)]])), vec![]);
+        assert!(!dangles(&ds, &[0], 10.0).complete);
+        // 60,000° (56,000 pieces of length) is still measured.
+        ds.features.clear();
+        ds.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 88.0), Coord::new(60_000.0, 88.0)]])), vec![]);
+        assert!(dangles(&ds, &[0], 10.0).complete);
+    }
+
+    #[test]
+    fn an_edge_winding_round_a_pole_meets_its_own_end() {
+        // One edge along 88°N through 400° of longitude passes back over both its ends (0° and,
+        // a turn on, 40°): neither dangles, though each is far, along the edge, from where it
+        // passes. Through 300° it doesn't come back, and both do.
+        let line = |to: f64| {
+            let mut ds = Dataset::new("l", GeometryType::Polyline, vec![]);
+            ds.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 88.0), Coord::new(to, 88.0)]])), vec![]);
+            dangles(&ds, &[0], 10.0)
+        };
+        let wound = line(400.0);
+        assert!(wound.complete && wound.errors.is_empty(), "{:?}", wound.errors);
+        let open = line(300.0);
+        assert!(open.complete && open.errors.len() == 2, "{:?}", open.errors);
     }
 
     #[test]
     fn a_polar_end_reads_only_the_cells_holding_parts() {
         // An end 1.1 m from the North Pole reaches every longitude: a whole row of 512 cells, of
         // which only the last holds a part (line 1, far off). The end measures its own edge's
-        // length (one piece) and reads that cell, its entry and line 1 (a unit each); the empty
-        // cells cost nothing, and cells beyond the grid's rows and columns aren't looked in.
+        // length (one piece) and the edge from twice the tolerance on, and reads that cell, its
+        // entry and line 1 (a unit each); the empty cells cost nothing, and cells beyond the grid's
+        // rows and columns aren't looked in.
         let p = |x: f64, y: f64| lonlat_to_plane(Coord::new(x, y));
         let end = p(0.0, 90.0 - 1e-5);
         let lines = [(0, vec![vec![p(0.0, 89.9), end]]), (1, vec![vec![p(90.0, 86.0), p(90.1, 86.0)]])];
@@ -835,7 +894,7 @@ mod tests {
         assert_eq!(cells.last, (511, 0));
         let mut work = 0;
         let met = PolarEnds::new(&lines, &grid, cells).meets((0, 0, false), (end, plane_to_lonlat(end)), 10.0, &mut work);
-        assert_eq!((met.ok(), work), (Some(false), 4));
+        assert_eq!((met.ok(), work), (Some(false), 5));
     }
 
     #[test]

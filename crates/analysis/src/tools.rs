@@ -2906,8 +2906,9 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         }
     }
 
-    let beyond_note = (beyond > 0)
-        .then(|| format!("{beyond} point(s) beyond what {} can hold (as past 85.05° in Web Mercator) were left out", crs.label()));
+    // Only Web Mercator's limit is known to be a latitude.
+    let why = if crs == Crs::WebMercator { " (past 85.05° of latitude)" } else { "" };
+    let beyond_note = (beyond > 0).then(|| format!("{beyond} point(s) beyond what {} can hold{why} were left out", crs.label()));
     if pts.is_empty() {
         let none = "input layer has no valid points with positive weights to analyze";
         return Err(beyond_note.map_or_else(|| none.to_string(), |note| format!("{none}: {note}")));
@@ -6653,6 +6654,17 @@ mod tests {
         let m = Map(HashMap::from([("near".to_string(), near)]));
         let params = serde_json::json!({"input": "near", "crs": "EPSG:3857", "radius": 5000.0, "pixelSize": 1000.0});
         assert!(crate::run("kernelDensity", &m, &params).unwrap().messages.iter().all(|m| !m.contains("beyond")));
+        // In another system the note names it, not Web Mercator's limit: UTM zone 18N can't hold a
+        // point a quarter of the way round the equator from its central meridian (75°W).
+        let mut off = Dataset::new("off", GeometryType::Point, vec![]);
+        for c in [Coord::new(-75.0, 40.0), Coord::new(-74.99, 40.0), Coord::new(15.0, 0.0)] {
+            off.push(Some(Geometry::Point(c)), vec![]);
+        }
+        let m = Map(HashMap::from([("off".to_string(), off)]));
+        let params = serde_json::json!({"input": "off", "crs": "EPSG:32618", "radius": 5000.0, "pixelSize": 1000.0});
+        let res = crate::run("kernelDensity", &m, &params).unwrap();
+        let note = res.messages.iter().find(|m| m.contains("beyond what")).cloned().unwrap_or_default();
+        assert!(note.starts_with("1 point(s) beyond what") && !note.contains("85.05°"), "{:?}", res.messages);
     }
 
     #[test]

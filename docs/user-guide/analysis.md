@@ -106,8 +106,9 @@ enclose on the ground. The globe draws a long edge along the great circle betwee
 a pole it shows a little poleward of where the tools take it: about 850 m at the middle of a 10°
 edge along 88°N (as everywhere, the tools take an edge as straight on the map, not on the globe).
 Beyond 85.05°, the dangle check measures line ends about their pole (on WGS 84's curvature there,
-within 0.13% out to 85°), right up to the pole and across ±180°. Radius selections and the
-Neighborhood Explorer still measure in local Web Mercator.
+within 0.13% out to 85°), right up to the pole and across ±180°; an edge winding round a pole so
+many times that it can't be measured closely stops the check, which then says it's incomplete.
+Radius selections and the Neighborhood Explorer still measure in local Web Mercator.
 
 These are the built-in tools; GeoLibre and plugin tools join them when available.
 Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available tools and their parameters):
