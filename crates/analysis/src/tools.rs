@@ -2856,8 +2856,12 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
     // come back.
     let mut beyond: usize = 0;
     let project = |c: Coord, beyond: &mut usize| {
-        let p = transformer
-            .from_lonlat(c)
+        // Web Mercator's limit is known exactly: the round trip alone would let a latitude a hair
+        // past it through, onto the edge.
+        let held = crs != Crs::WebMercator || c.y.abs() <= rustgis_geom::MAX_LAT;
+        let p = held
+            .then(|| transformer.from_lonlat(c))
+            .flatten()
             .filter(|p| p.is_finite() && transformer.to_lonlat(*p).is_some_and(|back| (back.y - c.y).abs() < 1e-4));
         *beyond += usize::from(p.is_none());
         p
@@ -6630,9 +6634,11 @@ mod tests {
     #[test]
     fn kernel_density_skips_points_its_system_cant_hold() {
         // In Web Mercator, points past 85.05° would land on the map's edge: they're left out and
-        // counted, not piled up on the raster's top row (#1033), a multipoint's members each.
+        // counted, not piled up on the raster's top row (#1033), a multipoint's members each, and
+        // one a hair past the limit (which the projection's round trip alone would let through).
         let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
-        for c in [Coord::new(0.0, 87.0), Coord::new(1.0, 89.0), Coord::new(0.0, 60.0), Coord::new(0.01, 60.0)] {
+        let hair = Coord::new(0.0, rustgis_geom::MAX_LAT + 5e-5);
+        for c in [Coord::new(0.0, 87.0), Coord::new(1.0, 89.0), Coord::new(0.0, 60.0), Coord::new(0.01, 60.0), hair] {
             pts.push(Some(Geometry::Point(c)), vec![]);
         }
         pts.push(Some(Geometry::MultiPoint(vec![Coord::new(0.0, 60.02), Coord::new(0.0, 87.0)])), vec![]);
@@ -6640,7 +6646,7 @@ mod tests {
         let params = serde_json::json!({"input": "pts", "crs": "EPSG:3857", "radius": 5000.0, "pixelSize": 1000.0});
         let res = crate::run("kernelDensity", &m, &params).unwrap();
         assert!(res.messages.iter().any(|m| m.contains("from 3 points (bandwidth")), "{:?}", res.messages);
-        assert!(res.messages.iter().any(|m| m.starts_with("3 point(s) beyond what") && m.contains("85.05°")), "{:?}", res.messages);
+        assert!(res.messages.iter().any(|m| m.starts_with("4 point(s) beyond what") && m.contains("85.05°")), "{:?}", res.messages);
         // With none it can hold, the error says why.
         let mut far = Dataset::new("far", GeometryType::Point, vec![]);
         far.push(Some(Geometry::Point(Coord::new(0.0, 87.0))), vec![]);

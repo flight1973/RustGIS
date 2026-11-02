@@ -314,6 +314,9 @@ fn polygons_past_85_degrees_are_measured_to_the_pole() {
     assert_eq!(got.len(), 2, "{got:?}");
     let (a, b) = (&got[0], &got[1]);
     assert_eq!((a.0[0].as_str(), b.0[0].as_str()), ("A", "B"));
+    // The parts' areas on WGS 84, as polygons of geodesic edges (GeographicLib 2.1 gives 34,625.271
+    // and 17,323.559 km²), not 0 for the stretch beyond 85.05°.
+    assert!((a.1[0] - 34_625.271).abs() < 0.01 && (b.1[0] - 17_323.559).abs() < 0.01, "{a:?} {b:?}");
     assert!((a.1[1] - 33.388).abs() < 0.01 && (a.1[2] - 914.216).abs() < 0.1, "{a:?}");
     assert!((b.1[1] - 16.034).abs() < 0.01 && (b.1[2] - 500.0).abs() < 1e-6, "{b:?}");
 }
