@@ -336,7 +336,7 @@ pub fn commands() -> Vec<C> {
             placed.try_reserve(ground).map_err(|_| "not enough memory to move the selection on the ground")?;
             // Each group's move, worked out once: its planes and its turn's sine and cosine.
             let mut moves: HashMap<(i64, i64), (Aeqd, Aeqd, f64, f64)> = HashMap::new();
-            modify(s, |key, g| match planes.get(&key) {
+            move_features(s, |key, g| match planes.get(&key) {
                 Some(center) => {
                     let (from, to, sin, cos) = *moves.entry(vertex_key(*center)).or_insert_with(|| {
                         let (from, to, turn) = ground_move(*center, dx, dy);
@@ -354,7 +354,7 @@ pub fn commands() -> Vec<C> {
         C::new("edit.rotate", "Rotate", "Edit › Features › Modify", |s, p| {
             let deg = f(p, "angle").ok_or("angle is required")?;
             let mut budget = CENTER_STEPS_TOTAL;
-            modify(s, |_, g| {
+            move_features(s, |_, g| {
                 // Any point, a feature's or a text graphic's, turns on itself: left out, so a
                 // selection of points alone fails rather than recording an edit that changes
                 // nothing (and an undo step).
@@ -378,7 +378,7 @@ pub fn commands() -> Vec<C> {
         C::new("edit.scale", "Scale", "Edit › Features › Modify", |s, p| {
             let k = f(p, "factor").filter(|k| *k > 0.0 && *k < 1e6).ok_or("factor must be a positive number")?;
             let mut budget = CENTER_STEPS_TOTAL;
-            modify(s, |_, g| {
+            move_features(s, |_, g| {
                 // Any point, a feature's or a text graphic's, scales on itself: left out, as above.
                 if matches!(g, Geometry::Point(_)) {
                     return Ok(None);
@@ -846,6 +846,25 @@ fn polar_transform(
             Geometry::Polygon(moved)
         }
     })
+}
+
+/// [`modify`] for a move, turn or scale, which leaves a vertex missing a coordinate where it was:
+/// says how many of the features it changed have one.
+fn move_features(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>) -> CmdResult {
+    let mut missing = 0usize;
+    let done = modify(s, |key, g| {
+        let moved = change(key, g)?;
+        if moved.is_some() {
+            let mut has = false;
+            g.for_each_coord(|c| has |= !c.is_finite());
+            missing += usize::from(has);
+        }
+        Ok(moved)
+    })?;
+    if missing > 0 {
+        s.warn(format!("{missing} feature(s) have a vertex missing a coordinate, which was left where it was"));
+    }
+    Ok(done)
 }
 
 /// Applies a geometry change to every selected feature of every layer (in the selection's layers).

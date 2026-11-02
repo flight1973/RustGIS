@@ -324,6 +324,8 @@ pub fn spherical_centre(pts: &[Coord]) -> Option<Coord> {
 pub struct SphericalMean {
     sum: [f64; 3],
     weight: f64,
+    /// How many times the totals were scaled down by 2⁵¹² to keep them finite.
+    shrunk: i32,
 }
 
 impl SphericalMean {
@@ -336,6 +338,17 @@ impl SphericalMean {
     /// non-finite point or weight, or one not above zero, is left out.
     pub fn add_weighted(&mut self, c: Coord, weight: f64) {
         if c.is_finite() && weight.is_finite() && weight > 0.0 {
+            // Totals that would overflow are scaled down by a power of two, as is every weight
+            // after, which leaves the mean as it was (a weight tiny beside them drops to nothing,
+            // as it would anyway).
+            let shrink = 0.5f64.powi(512);
+            let mut weight = weight * 0.5f64.powi(self.shrunk.saturating_mul(512));
+            if self.weight + weight > 1e300 {
+                self.sum = self.sum.map(|s| s * shrink);
+                self.weight *= shrink;
+                self.shrunk = self.shrunk.saturating_add(1);
+                weight *= shrink;
+            }
             let (s, v) = (self.sum, unit_vector(c));
             self.sum = [s[0] + v[0] * weight, s[1] + v[1] * weight, s[2] + v[2] * weight];
             self.weight += weight;
@@ -345,8 +358,11 @@ impl SphericalMean {
     /// The center of the points so far, or `None` when there are none or they balance out (such as
     /// two antipodes) to within rounding of their total weight.
     pub fn center(&self) -> Option<Coord> {
-        let [x, y, z] = self.sum;
-        (x.hypot(y).hypot(z) > 1e-12 * self.weight).then(|| from_vector(self.sum)).flatten()
+        if self.weight <= 0.0 {
+            return None;
+        }
+        // Their mean direction, as a vector no longer than 1 (the threshold is then relative).
+        from_vector(self.sum.map(|s| s / self.weight))
     }
 }
 
@@ -622,6 +638,29 @@ mod tests {
         balanced.add_weighted(a, 1e6);
         balanced.add_weighted(Coord::new(180.0, 0.0), 1e6);
         assert_eq!(balanced.center(), None);
+    }
+
+    #[test]
+    fn any_weight_gives_the_mean() {
+        // A tiny weight alone is still a center, and the largest weights don't overflow the
+        // totals: a and b at the largest weight each meet halfway, and a third point weighing
+        // the same pulls the center towards it, as at any weight.
+        let (a, b) = (Coord::new(0.0, 0.0), Coord::new(90.0, 0.0));
+        let mut tiny = SphericalMean::default();
+        tiny.add_weighted(b, 1e-13);
+        assert_eq!(tiny.center(), Some(b));
+        let (mut huge, mut unit) = (SphericalMean::default(), SphericalMean::default());
+        for c in [a, b, a] {
+            huge.add_weighted(c, f64::MAX);
+            unit.add_weighted(c, 1.0);
+        }
+        let mut half = SphericalMean::default();
+        half.add_weighted(a, f64::MAX);
+        half.add_weighted(b, f64::MAX);
+        let mid = half.center().unwrap();
+        assert!((mid.x - 45.0).abs() < 1e-9 && mid.y.abs() < 1e-9, "{mid:?}");
+        let (h, u) = (huge.center().unwrap(), unit.center().unwrap());
+        assert!((h.x - u.x).abs() < 1e-9 && (h.y - u.y).abs() < 1e-9, "{h:?} {u:?}");
     }
 
     #[test]

@@ -574,6 +574,33 @@ fn a_missing_coordinate_stays_the_only_one() {
 }
 
 #[test]
+fn a_vertex_missing_a_coordinate_left_where_it_was_is_counted() {
+    // A move, turn or scale says how many features it changed have a vertex missing a coordinate,
+    // which stays where it was: on the ground and within ±85.05°; with every vertex there, it
+    // says nothing.
+    let said = |ring: Vec<Coord>, id: &str, p: serde_json::Value| {
+        let (mut s, _) = session(ring);
+        let mark = s.notice_mark();
+        s.run(id, &p).unwrap();
+        s.notices_since(mark).iter().filter(|n| n.text.contains("missing a coordinate")).map(|n| n.text.clone()).collect::<Vec<_>>()
+    };
+    let edits = [("edit.move", json!({"dx": 1000.0})), ("edit.rotate", json!({"angle": 10.0})), ("edit.scale", json!({"factor": 1.5}))];
+    let near_equator = boxed(10.0, 10.0, 11.0, 11.0);
+    for ring in [polar_ring(), near_equator] {
+        for (id, p) in &edits {
+            let mut lossy = ring.clone();
+            lossy[2].x = f64::NAN;
+            assert_eq!(
+                said(lossy, id, p.clone()),
+                ["1 feature(s) have a vertex missing a coordinate, which was left where it was"],
+                "{id} {ring:?}"
+            );
+            assert!(said(ring.clone(), id, p.clone()).is_empty(), "{id} {ring:?}");
+        }
+    }
+}
+
+#[test]
 fn a_polar_move_turns_the_feature_with_north() {
     // 300 km east of 88°S, the box's center has gone about 53° around the South Pole, so north
     // where it lands is turned that much from north where it was. Moved rigidly, the box keeps
