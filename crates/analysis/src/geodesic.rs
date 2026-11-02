@@ -329,7 +329,8 @@ impl Plane {
 /// Whether the edge from `a` to `b` in the plane (`la` and `lb` in lon/lat) can stray as far as
 /// `tolerance` from the same edge straight in the analysis plane, so that [`Plane::strays`] must
 /// look. Beyond 85.05° the analysis plane's straight edges are straight in lon/lat: spirals about a
-/// pole, not rhumb lines, bounded as such; an edge reaching across 85.05° is always looked at. Within ±85.05° straight in
+/// pole, not rhumb lines, bounded as such; an edge reaching across 85.05°, or with its ends beyond
+/// it about both poles, is always looked at. Within ±85.05° straight in
 /// the analysis plane is straight in Web Mercator, a rhumb line, which runs off the geodesic by about L² tan φ / 8R
 /// at latitude φ, the heading of a geodesic turning by L tan φ / R along it: 2.0e-8 per square
 /// metre at 46°, 1.9e-7 at 84°, as measured for [`STRAY_PER_M2`], plus [`FLAT_ALLOWANCE`] for the
@@ -351,14 +352,12 @@ fn may_stray(a: GC<f64>, b: GC<f64>, la: Coord, lb: Coord, tolerance: f64) -> bo
         if !(beyond_a && beyond_b) || la.y * lb.y <= 0.0 {
             return true;
         }
-        // Straight in lon/lat is, about the pole, a spiral, which strays from its chord there by at
-        // most Δλ(ρΔλ + 2Δρ)/8, ρ being its end farther from the pole (as the dangle check measures
-        // edges). That chord, straight about the pole, turns from the geodesic as this plane's
-        // straight edges do, at its own distance from its center.
-        let from_pole = |c: Coord| (90.0 - c.y.abs()).to_radians() * EARTH_R_M;
+        // Straight in lon/lat is, about the pole, a spiral ([`spiral_stray`]). Its chord there,
+        // straight about the pole, turns from the geodesic as this plane's straight edges do, at
+        // its own distance from its center.
+        let from_pole = |c: Coord| (90.0 - c.y.abs()).to_radians() * rustgis_geom::WGS84_POLAR_RADIUS_M;
         let (pa, pb) = (from_pole(la), from_pole(lb));
-        let dl = wrap(lb.x - la.x).to_radians().abs();
-        let spiral = dl * (pa.max(pb) * dl + 2.0 * (pa - pb).abs()) / 8.0;
+        let spiral = spiral_stray(pa.max(pb), (pa - pb).abs(), wrap(lb.x - la.x).to_radians().abs());
         let turn = (FLAT_ALLOWANCE + PLANE_TURN * (rho + pa.max(pb)) / EARTH_R_M) / (8.0 * EARTH_R_M) * length2;
         let stray = STRAY_MARGIN * (spiral + turn);
         return !stray.is_finite() || stray > tolerance;
@@ -371,6 +370,15 @@ fn may_stray(a: GC<f64>, b: GC<f64>, la: Coord, lb: Coord, tolerance: f64) -> bo
         return true;
     }
     STRAY_MARGIN * (lat.tan() + FLAT_ALLOWANCE + PLANE_TURN * rho / EARTH_R_M) / (8.0 * EARTH_R_M) * length2 > tolerance
+}
+
+/// How far, at most, an edge straight in longitude and latitude strays from its chord in a plane
+/// about its pole (meters): through `dl` radians of longitude, its distance from the pole changing
+/// by `drho` meters, `rho` being its end farther from the pole, it's a spiral, which strays by at
+/// most Δλ(ρΔλ + 2Δρ)/8 (the most its second derivative reaches, over 8). For the buffers' edges
+/// and the dangle check's pieces beyond 85.05°.
+pub(crate) fn spiral_stray(rho: f64, drho: f64, dl: f64) -> f64 {
+    dl * (rho * dl + 2.0 * drho) / 8.0
 }
 
 /// A longitude difference folded into −180..180.

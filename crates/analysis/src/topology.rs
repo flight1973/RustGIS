@@ -340,9 +340,9 @@ pub fn dangles(ds: &Dataset, rows: &[usize], tol_m: f64) -> Checked {
 const POLAR_STRAY_SHARE: f64 = 1e-3;
 /// The least that allowance, in meters.
 const POLAR_STRAY_MIN_M: f64 = 1e-3;
-/// The most pieces [`edge_from`] cuts one stretch into. Only a stretch winding round a pole many
-/// times needs more (a hostile edge thousands of degrees long): it's measured in this many, which
-/// stray farther, and the check says it's incomplete.
+/// The most pieces [`edge_from`] cuts one stretch into, and [`walk_edge`] an edge. Only one winding
+/// round a pole many times needs more (a hostile edge thousands of degrees long): it's measured in
+/// this many, which stray farther, and the check says it's incomplete.
 const POLAR_PIECES_MAX: f64 = 65_536.0;
 /// The longest piece, in radians of longitude, that [`walk_edge`] measures an edge in: its chords
 /// fall short of the edge by under 0.006%.
@@ -500,18 +500,20 @@ fn edge_from(
         }
     };
     let (p, q) = (at(t0), at(t1));
-    // Over Δλ of longitude, a spiral whose distance from the pole changes by Δρ strays from its
-    // chord by at most Δλ(ρΔλ + 2Δρ)/8, ρ being its farther end's distance from the pole.
+    // Pieces short enough that none strays from the spiral by more than `stray`.
     let colat = |c: Coord| (90.0 - if north { c.y } else { -c.y }).to_radians();
     let rho = WGS84_POLAR_RADIUS_M * colat(p).max(colat(q));
     let drho = WGS84_POLAR_RADIUS_M * (colat(p) - colat(q)).abs();
     let dl = ((b.x - a.x) * (t1 - t0) / rustgis_geom::MERCATOR_R).abs();
     let reaches_band = p.y.abs() <= MAX_LAT || q.y.abs() <= MAX_LAT;
     let stray = (tol_m * POLAR_STRAY_SHARE).max(POLAR_STRAY_MIN_M) / if reaches_band { 2.0 } else { 1.0 };
-    let n = (dl * (rho * dl + 2.0 * drho) / (8.0 * stray)).sqrt();
-    // Past the cap (a count that overflows included), the cap; one piece along a meridian, or for
-    // a count that isn't a number.
-    let pieces = if n > POLAR_PIECES_MAX {
+    let n = (crate::geodesic::spiral_stray(rho, drho, dl) / stray).sqrt();
+    // Past the cap, the cap; a count that overflows (coordinates far out of range), one piece, as
+    // along a meridian or for a count that isn't a number. Either is coarse.
+    let pieces = if n.is_infinite() {
+        *coarse = true;
+        1.0
+    } else if n > POLAR_PIECES_MAX {
         *coarse = true;
         POLAR_PIECES_MAX
     } else if n > 1.0 {
@@ -544,10 +546,18 @@ enum Walked {
 /// pole (the North Pole when `north`), passes `skip` meters: in pieces of at most
 /// [`POLAR_LENGTH_STEP`] of longitude, each counting against `work`, up to the one that passes it,
 /// within which the place is found by its length. An edge of a missing or infinite coordinate is
-/// one piece.
-fn walk_edge((a, b): (Coord, Coord), north: bool, skip: f64, work: &mut usize) -> Result<Walked, WorkLimit> {
+/// one piece; one needing more than [`POLAR_PIECES_MAX`] is walked in that many, longer, and sets
+/// `coarse` (their chords fall shorter, so the walk passes later, never early).
+fn walk_edge((a, b): (Coord, Coord), north: bool, skip: f64, work: &mut usize, coarse: &mut bool) -> Result<Walked, WorkLimit> {
     let n = ((b.x - a.x) / rustgis_geom::MERCATOR_R).abs() / POLAR_LENGTH_STEP;
-    let pieces = if n > 1.0 && n.is_finite() { n.ceil() } else { 1.0 };
+    let pieces = if !n.is_finite() {
+        1.0
+    } else if n > POLAR_PIECES_MAX {
+        *coarse = true;
+        POLAR_PIECES_MAX
+    } else {
+        n.ceil().max(1.0)
+    };
     let at = |t: f64| about_pole(plane_to_lonlat(Coord::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)), north);
     let (mut last, mut length, mut k) = (at(0.0), 0.0, 0.0);
     while k < pieces {
@@ -636,7 +646,7 @@ impl<'a> PolarEnds<'a> {
         let lines = self.lines;
         let reach = Reach::new(end, at.y, tol_m);
         // Whether the edge `a`–`b`, from its parameter `from` on, comes within the tolerance.
-        let mut near = |a: &Coord, b: &Coord, from: f64, work: &mut usize| -> Result<bool, WorkLimit> {
+        let mut near = |a: &Coord, b: &Coord, from: f64, work: &mut usize, coarse: &mut bool| -> Result<bool, WorkLimit> {
             if !reach.boxed(a, b) {
                 return read(&mut self.reads, work).map(|()| false);
             }
@@ -648,7 +658,7 @@ impl<'a> PolarEnds<'a> {
                     continue;
                 }
                 let ends = *lonlat.get_or_insert_with(|| (plane_to_lonlat(*a), plane_to_lonlat(*b)));
-                if edge_from(e, (*a, *b), ends, (t0, t1), north, tol_m, work, &mut self.coarse)? <= tol_m * tol_m {
+                if edge_from(e, (*a, *b), ends, (t0, t1), north, tol_m, work, coarse)? <= tol_m * tol_m {
                     return Ok(true);
                 }
             }
@@ -664,10 +674,15 @@ impl<'a> PolarEnds<'a> {
         for i in 0..n.saturating_sub(1) {
             let ends = if at_start { (part.get(i), part.get(i + 1)) } else { (part.get(n - 1 - i), part.get(n - 2 - i)) };
             let (Some(a), Some(b)) = ends else { break };
+            let skip = 2.0 * tol_m - walked;
             let from = if past {
                 0.0
+            } else if skip <= 0.0 && tol_m > 0.0 {
+                // The edges before came to exactly twice the tolerance: the rest is all of this one.
+                past = true;
+                0.0
             } else {
-                match walk_edge((*a, *b), north, 2.0 * tol_m - walked, work)? {
+                match walk_edge((*a, *b), north, skip, work, &mut self.coarse)? {
                     Walked::Short(length) => {
                         walked += length;
                         continue;
@@ -678,7 +693,7 @@ impl<'a> PolarEnds<'a> {
                     }
                 }
             };
-            if near(a, b, from, work)? {
+            if near(a, b, from, work, &mut self.coarse)? {
                 return Ok(true);
             }
         }
@@ -714,7 +729,7 @@ impl<'a> PolarEnds<'a> {
                         let other = lines.get(oli).and_then(|(_, ps)| ps.get(opi)).map(Vec::as_slice).unwrap_or(&[]);
                         for w in other.windows(2) {
                             let [a, b] = w else { continue };
-                            if near(a, b, 0.0, work)? {
+                            if near(a, b, 0.0, work, &mut self.coarse)? {
                                 return Ok(true);
                             }
                         }
@@ -857,30 +872,49 @@ mod tests {
 
     #[test]
     fn an_edge_with_a_coordinate_out_of_range_is_one_piece() {
-        let (mut work, b) = (0, lonlat_to_plane(Coord::new(0.0, 89.0)));
+        let (mut work, mut coarse, b) = (0, false, lonlat_to_plane(Coord::new(0.0, 89.0)));
         for a in [Coord::new(f64::INFINITY, b.y), Coord::new(f64::NAN, b.y)] {
-            let _ = walk_edge((a, b), true, 0.0, &mut work);
+            let _ = walk_edge((a, b), true, 0.0, &mut work, &mut coarse);
         }
         assert_eq!(work, 2);
     }
 
     #[test]
     fn a_long_edge_is_walked_only_as_far_as_it_needs() {
-        // An edge winding round the North Pole about 194 times (70,000° of longitude): the walk
-        // from its start passes 20 m within its first piece, and stops there, at 20 m of its
-        // first 7.8 km. A stretch of it needing more than POLAR_PIECES_MAX pieces is measured in
-        // that many, and says so.
+        // An edge winding round the North Pole about 194 times (70,000° of longitude), more than
+        // POLAR_PIECES_MAX pieces of POLAR_LENGTH_STEP: it's walked in that many, and says so. The
+        // walk from its start passes 20 m within its first piece, and stops there. A stretch of
+        // it needing more than POLAR_PIECES_MAX pieces is measured in that many, and says so too.
         let (a, b) = (lonlat_to_plane(Coord::new(0.0, 88.0)), lonlat_to_plane(Coord::new(70_000.0, 88.0)));
-        let mut work = 0;
-        let Ok(Walked::Past(t)) = walk_edge((a, b), true, 20.0, &mut work) else { panic!("not past") };
-        let pieces = (70_000f64.to_radians() / POLAR_LENGTH_STEP).ceil();
+        assert!(70_000f64.to_radians() / POLAR_LENGTH_STEP > POLAR_PIECES_MAX);
+        let (mut work, mut coarse) = (0, false);
+        let Ok(Walked::Past(t)) = walk_edge((a, b), true, 20.0, &mut work, &mut coarse) else { panic!("not past") };
+        let pieces = POLAR_PIECES_MAX;
         let first = about_pole(plane_to_lonlat(Coord::new(a.x + (b.x - a.x) / pieces, a.y)), true);
         let start = about_pole(Coord::new(0.0, 88.0), true);
         assert!((t * pieces * (first.x - start.x).hypot(first.y - start.y) - 20.0).abs() < 1e-6, "{t}");
-        assert_eq!(work, 1);
-        let (ends, mut coarse) = ((plane_to_lonlat(a), plane_to_lonlat(b)), false);
+        assert!(coarse && work == 1, "{work}");
+        let ends = (plane_to_lonlat(a), plane_to_lonlat(b));
+        coarse = false;
         assert!(edge_from(start, (a, b), ends, (0.0, 1.0), true, 1.0, &mut work, &mut coarse).is_ok());
         assert!(coarse && work == 1 + POLAR_PIECES_MAX as usize, "{work}");
+        // Under the cap (600° of longitude), the walk is as fine as it needs, and not coarse.
+        let (mut work, mut coarse) = (0, false);
+        let short = lonlat_to_plane(Coord::new(600.0, 88.0));
+        assert!(matches!(walk_edge((a, short), true, 20.0, &mut work, &mut coarse), Ok(Walked::Past(_))) && !coarse);
+    }
+
+    #[test]
+    fn an_edge_whose_piece_count_overflows_is_measured_as_one_coarse_piece() {
+        // An edge at 88°N running 1e300 m across the plane (coordinates far out of range): its
+        // piece count overflows. It's measured as one piece, for one unit of work, and is coarse,
+        // not cut into POLAR_PIECES_MAX pieces that measure nothing better.
+        let a = lonlat_to_plane(Coord::new(0.0, 88.0));
+        let b = Coord::new(1e300, a.y);
+        let (ends, mut work, mut coarse) = ((plane_to_lonlat(a), plane_to_lonlat(b)), 0, false);
+        let e = about_pole(Coord::new(0.0, 88.0), true);
+        assert!(edge_from(e, (a, b), ends, (0.0, 1.0), true, 1.0, &mut work, &mut coarse).is_ok());
+        assert!(coarse && work == 1, "{work}");
     }
 
     #[test]
@@ -910,6 +944,22 @@ mod tests {
         let mut ds = Dataset::new("l", GeometryType::Polyline, vec![]);
         ds.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 86.0), Coord::new(0.0019, 86.0), Coord::new(-3.0, 86.0)]])), vec![]);
         let checked = dangles(&ds, &[0], 10.0);
+        let at: Vec<Coord> = checked.errors.iter().map(|e| e.at).collect();
+        assert!(checked.complete && at.len() == 1 && at.iter().all(|c| (c.x + 3.0).abs() < 1e-9), "{at:?}");
+    }
+
+    #[test]
+    fn a_polar_end_meets_its_own_line_from_exactly_twice_the_tolerance() {
+        // The hairpin above at a tolerance of half its first edge's length: the walk comes to
+        // twice the tolerance exactly at that edge's end, so all of the second edge counts, and it
+        // passes back through E within its first piece. E doesn't dangle, only the far end does.
+        let (e, f, g) = (Coord::new(0.0, 86.0), Coord::new(0.0019, 86.0), Coord::new(-3.0, 86.0));
+        let (mut work, mut coarse) = (0, false);
+        let first = (lonlat_to_plane(e), lonlat_to_plane(f));
+        let Ok(Walked::Short(length)) = walk_edge(first, true, f64::INFINITY, &mut work, &mut coarse) else { panic!("not short") };
+        let mut ds = Dataset::new("l", GeometryType::Polyline, vec![]);
+        ds.push(Some(Geometry::Line(vec![vec![e, f, g]])), vec![]);
+        let checked = dangles(&ds, &[0], length / 2.0);
         let at: Vec<Coord> = checked.errors.iter().map(|e| e.at).collect();
         assert!(checked.complete && at.len() == 1 && at.iter().all(|c| (c.x + 3.0).abs() < 1e-9), "{at:?}");
     }
