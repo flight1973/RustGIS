@@ -291,6 +291,10 @@ pub enum Tool {
     CreatePolygon,
     /// Moves, inserts and deletes the vertices of the selected features.
     EditVertices,
+    /// Draws a line across the selected polygons to cut them (`edit.cutPolygon`).
+    CutPolygon,
+    /// Draws a line across the selected feature's boundary to reshape it (`edit.reshape`).
+    Reshape,
     /// Draws a graphic: the shape is one of [`GRAPHIC_TOOLS`]' shapes.
     Graphic(&'static str),
 }
@@ -325,6 +329,8 @@ impl Tool {
             Tool::CreateLine => "createLine",
             Tool::CreatePolygon => "createPolygon",
             Tool::EditVertices => "editVertices",
+            Tool::CutPolygon => "cutPolygon",
+            Tool::Reshape => "reshape",
             Tool::Graphic(shape) => GRAPHIC_TOOLS.iter().find(|g| g.0 == shape).map_or("graphicPoint", |g| g.1),
         }
     }
@@ -345,6 +351,8 @@ impl Tool {
             Tool::CreateLine,
             Tool::CreatePolygon,
             Tool::EditVertices,
+            Tool::CutPolygon,
+            Tool::Reshape,
         ]
         .into_iter()
         .find(|t| t.code().eq_ignore_ascii_case(s.trim()))
@@ -363,11 +371,18 @@ impl Tool {
             Tool::CreateLine => "Create Line",
             Tool::CreatePolygon => "Create Polygon",
             Tool::EditVertices => "Edit Vertices",
+            Tool::CutPolygon => "Cut Polygon",
+            Tool::Reshape => "Reshape",
             Tool::Graphic(shape) => GRAPHIC_TOOLS.iter().find(|g| g.0 == shape).map_or("Point", |g| g.2),
         }
     }
     pub fn creates(self) -> bool {
         matches!(self, Tool::CreatePoint | Tool::CreateLine | Tool::CreatePolygon)
+    }
+    /// Whether the tool draws a line or polygon that edits features: vertices snap, and can
+    /// follow an edge with Trace.
+    pub fn draws_edit(self) -> bool {
+        matches!(self, Tool::CreateLine | Tool::CreatePolygon | Tool::CutPolygon | Tool::Reshape)
     }
 }
 
@@ -1092,9 +1107,9 @@ impl Session {
             }
             // A refused command is said once, without secrets, as the front ends show it.
             if let Err(error) = &res {
-                let text = rustgis_data::diagnostics::redact(error);
-                if !self.notices_since(notice_mark).iter().any(|notice| notice.error && notice.text == text) {
-                    self.notify(text, true);
+                let text = rustgis_data::diagnostics::Redacted::new(error);
+                if !self.notices_since(notice_mark).iter().any(|notice| notice.error && notice.text == text.as_str()) {
+                    self.notify_redacted(text, true);
                 }
             }
             res
@@ -1501,10 +1516,20 @@ impl Session {
     fn notice(&mut self, text: String, severity: rustgis_data::diagnostics::Severity) {
         // Redacted for the status bar and the history alike. `redact` bounds the notice to 8 KiB
         // (an ellipsis marks the cut) and omits one over 16 KiB whole, so a clipped credential
-        // can't survive; the history's copy is bounded further, to a record's 2 KiB, in `push`.
-        let text = rustgis_data::diagnostics::redact(&text);
-        self.diagnostics.push(severity, self.diagnostic_source.unwrap_or("Application"), &text, "");
-        self.notices.push(Notice { text, error: severity == rustgis_data::diagnostics::Severity::Error });
+        // can't survive; the history's copy is bounded further, to a record's 2 KiB.
+        self.notice_redacted(rustgis_data::diagnostics::Redacted::new(&text), severity);
+    }
+
+    /// [`Session::notify`] for text already redacted (a failure the caller redacted to compare it
+    /// with the notices): the type says so, so it isn't redacted again.
+    pub fn notify_redacted(&mut self, text: rustgis_data::diagnostics::Redacted, error: bool) {
+        use rustgis_data::diagnostics::Severity;
+        self.notice_redacted(text, if error { Severity::Error } else { Severity::Info });
+    }
+
+    fn notice_redacted(&mut self, text: rustgis_data::diagnostics::Redacted, severity: rustgis_data::diagnostics::Severity) {
+        self.diagnostics.push_redacted(severity, self.diagnostic_source.unwrap_or("Application"), &text);
+        self.notices.push(Notice { text: text.into_string(), error: severity == rustgis_data::diagnostics::Severity::Error });
         self.notices_given += 1;
         if self.notices.len() > 200 {
             self.notices.remove(0);

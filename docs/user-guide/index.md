@@ -127,18 +127,27 @@ details** for failed requests: their address, method, observed HTTP status and d
 available. Native connection failures and timeouts are identified when the transport knows
 them; an opaque browser failure does not claim a status or a specific DNS, CORS, or connection cause.
 
-Use **All**, **Errors**, **Warnings**, **Info**, or **Network failures** to filter the history.
-**Copy diagnostics** copies the filtered entries and their technical details, including folded
-details. **Clear** clears all entries, not just the selected filter. Closing or reopening the
-pane does not clear it.
+Use **All**, **Errors**, **Warnings**, **Info**, or **Network failures** to filter the history
+(**Network failures** also lists the notes below about omitted absences). **Copy diagnostics**
+copies the filtered entries and their technical details, including folded details, as plain
+text: oldest entry first, with UTC Unix-millisecond timestamps, where the pane shows the newest
+first and a UTC date and time. **Clear** clears all entries, not just the selected filter. Closing
+or reopening the pane does not clear it.
+
+A map tile a server doesn't have (HTTP 404, or 410 where it is gone) is routine, as is a Zarr
+store's absent chunk, so each isn't listed. One **Network** note per server says that such
+absences are omitted, naming the first address. Past 64 servers one more note says that further
+servers aren't listed. A note that has left the 500 entries, or a **Clear**, lets its server be
+noted again.
 
 The last 500 entries are kept in memory for this session, including across project changes;
 older entries are discarded. Each message is limited to 2 KiB and technical details to 8 KiB.
 Nothing is saved in `.rgis` projects or sent automatically. Credentials are removed before
 retention: addresses omit user information, query strings and fragments; credential fields
 and structured payloads are omitted conservatively, which can also remove surrounding context.
+A credential field in the middle of a line is removed when its value is one word or quoted, but
+a value of several words reads as prose and is kept (`… password: correct horse battery`).
 Review copied diagnostics for private layer names or file paths before sharing them.
-
 
 ## The ribbon
 
@@ -187,6 +196,10 @@ other files RustGIS reads and writes.
 
 Changes to the project are commands, and each can be undone (++ctrl+z++) and redone
 (++ctrl+y++). Undo keeps the last 40 changes; starting or opening another project clears it.
+A number dragged or a colour picked in a picker is one change, however far it moves. A number
+typed into a control that changes the map or a layout right away is one change too: it is set
+when you press ++enter++ or click elsewhere, and ++esc++ brings back the value from before. A value
+with its own button, such as the Editing pane's elevation, waits for that button.
 The desktop app also keeps a copy of unsaved work and offers it back after a crash: see
 [Autosave and recovery](workspace.md#autosave-and-recovery).
 Exports and other files already written are not undone.
