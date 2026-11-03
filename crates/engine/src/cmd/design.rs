@@ -821,8 +821,9 @@ fn polar_transform(
         }
         // Written straight in longitude/latitude, a line or ring must still be what was moved: no
         // edge spanning 180° or more (it would run around the other side of a pole), and a closed
-        // ring closed.
-        let wide = out.windows(2).any(|w| matches!(w, [a, b] if (b.x - a.x).abs() >= 180.0));
+        // ring closed. An edge to a vertex missing a coordinate, or with an infinite one, left as
+        // it was, is no edge here.
+        let wide = out.windows(2).any(|w| matches!(w, [a, b] if a.is_finite() && b.is_finite() && (b.x - a.x).abs() >= 180.0));
         let opened = kind == PathKind::Ring && pts.first() == pts.last() && out.first() != out.last();
         if kind != PathKind::Point && (wide || opened) {
             return Err("that would carry a line or polygon onto or around a pole, which it can't cross yet".into());

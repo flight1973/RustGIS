@@ -590,16 +590,18 @@ fn a_vertex_missing_a_coordinate_left_where_it_was_is_counted() {
     let near_equator = boxed(10.0, 10.0, 11.0, 11.0);
     for ring in [polar_ring(), near_equator] {
         for (id, p) in &edits {
-            // Two vertices of one feature, a longitude missing and a latitude infinite: one feature.
+            // Three vertices of one feature, a latitude infinite, a longitude missing and a
+            // longitude infinite: one feature.
             let mut lossy = ring.clone();
             lossy[1].y = f64::INFINITY;
             lossy[2].x = f64::NAN;
+            lossy[3].x = f64::INFINITY;
             let (mut s, layer_id) = session(lossy.clone());
             assert_eq!(said(&mut s, id, p), (true, one.map(String::from).to_vec()), "{id} {ring:?}");
             let after = stored(&s, layer_id);
             let same = |a: Coord, b: Coord| a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits();
-            assert!(same(after[1], lossy[1]) && same(after[2], lossy[2]), "{id} {after:?}");
-            assert!(after.iter().enumerate().all(|(i, c)| i == 1 || i == 2 || c.is_finite()), "{id} {after:?}");
+            assert!((1..=3).all(|i| same(after[i], lossy[i])), "{id} {after:?}");
+            assert!(after.iter().enumerate().all(|(i, c)| (1..=3).contains(&i) || c.is_finite()), "{id} {after:?}");
             let (mut s, _) = session(ring.clone());
             assert_eq!(said(&mut s, id, p), (true, vec![]), "{id} {ring:?}");
         }
