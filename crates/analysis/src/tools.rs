@@ -3831,6 +3831,20 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         rs.iter().filter(|&&r| ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(jumps)).count()
     };
     let (zones_unsplit, classes_unsplit) = (unsplit(zones, &zone_rows), unsplit(classes, &class_rows));
+    // Features with an edge beyond 85.05° that runs east or west: the overlay, like the map, takes
+    // it straight in longitude and latitude there, while `area_km2` takes the shortest way between
+    // its ends, which near a pole runs far poleward of it (#1033).
+    let polar = |ds: &Dataset, rs: &[usize]| {
+        let max = rustgis_geom::MAX_LAT;
+        let across = |g: &Geometry| {
+            has_shape(g)
+                && matches!(g, Geometry::Polygon(polys) if polys.iter().flatten().any(|r| {
+                    r.iter().zip(r.iter().cycle().skip(1)).any(|(a, b)| (a.y.abs() > max || b.y.abs() > max) && a.x != b.x)
+                }))
+        };
+        rs.iter().filter(|&&r| ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(across)).count()
+    };
+    let (zones_polar, classes_polar) = (polar(zones, &zone_rows), polar(classes, &class_rows));
     let zone_list: Vec<TabulateZone> = crate::stats::group_rows(zones, &zone_rows, &zone_keys)
         .into_iter()
         .map(|group| {
@@ -4078,6 +4092,18 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         messages.push(format!(
             "{} {verb} the antimeridian without being split there: the map draws them the long way round, and their percentages and shares follow the map, while area_km2 follows the ground",
             unsplit.join(" and ")
+        ));
+    }
+    let polar: Vec<String> = [(zones_polar, "zone"), (classes_polar, "class")]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, layer)| features(n, layer))
+        .collect();
+    if !polar.is_empty() {
+        let verb = if zones_polar + classes_polar == 1 { "has" } else { "have" };
+        messages.push(format!(
+            "{} {verb} an edge beyond 85.05° running east or west: the map takes it straight in longitude and latitude, and their percentages and shares follow the map, while area_km2 takes the shortest way on the ground, which near a pole can differ widely",
+            polar.join(" and ")
         ));
     }
     match unresolved {
@@ -7206,6 +7232,30 @@ mod tests {
         let around_pole = map_area_m2(&ring(&[(0.0, 60.0), (90.0, 60.0), (180.0, 60.0), (-90.0, 60.0), (0.0, 60.0)]));
         // Zero, up to rounding on the scale of the Earth's radius squared.
         assert!(around_pole.abs() < 1.0, "{around_pole} m²");
+    }
+
+    /// An edge crossing 85.05° and running east or west is cut where it crosses: a rhumb line on one
+    /// side, straight in longitude and latitude on the other. The map measure of a triangle with two
+    /// such edges agrees with ∮ sin φ dλ summed in a million steps along each edge as the plane draws
+    /// it, independently of the cut.
+    #[test]
+    fn map_area_cuts_edges_across_85_degrees() {
+        let ring: Vec<Coord> = [(0.0, 80.0), (20.0, 88.0), (-15.0, 87.0), (0.0, 80.0)].iter().map(|&(x, y)| Coord::new(x, y)).collect();
+        let measured = map_area_m2(&Geometry::Polygon(vec![vec![ring.clone()]]));
+        let steps = 1_000_000;
+        let mut sum = 0.0;
+        for w in ring.windows(2) {
+            let (a, b) = (rustgis_geom::lonlat_to_plane(w[0]), rustgis_geom::lonlat_to_plane(w[1]));
+            let at = |t: f64| rustgis_geom::plane_to_lonlat(Coord::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t));
+            let mut last = at(0.0);
+            for k in 1..=steps {
+                let (next, mid) = (at(f64::from(k) / f64::from(steps)), at((f64::from(k) - 0.5) / f64::from(steps)));
+                sum += mid.y.to_radians().sin() * (next.x - last.x).to_radians();
+                last = next;
+            }
+        }
+        let expected = sum.abs() * rustgis_geom::EARTH_RADIUS_M * rustgis_geom::EARTH_RADIUS_M;
+        assert!((measured / expected - 1.0).abs() < 1e-9, "{measured} m², not {expected}");
     }
 
     /// Parcels and zones for Intersect: `p1` is a 2° square that zone `z1` covers the right half of;

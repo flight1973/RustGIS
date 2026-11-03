@@ -512,9 +512,9 @@ fn edge_from(
     let reaches_band = p.y.abs() <= MAX_LAT || q.y.abs() <= MAX_LAT;
     let stray = (tol_m * POLAR_STRAY_SHARE).max(POLAR_STRAY_MIN_M) / if reaches_band { 2.0 } else { 1.0 };
     let n = (crate::geodesic::spiral_stray(rho, drho, dl) / stray).sqrt();
-    // Past the cap, the cap; a count that overflows (coordinates far out of range), one piece, as
-    // along a meridian or for a count that isn't a number. Either is coarse.
-    let pieces = if n.is_infinite() {
+    // Past the cap, the cap; a count that overflows or isn't a number (a coordinate far out of
+    // range, or missing), one piece. Either is coarse. Along a meridian, one piece, exactly.
+    let pieces = if !n.is_finite() {
         *coarse = true;
         1.0
     } else if n > POLAR_PIECES_MAX {
@@ -550,16 +550,14 @@ enum Walked {
 /// pole (the North Pole when `north`), passes `skip` meters: in pieces of at most
 /// [`POLAR_LENGTH_STEP`] of longitude, each counting against `work`, up to the one that passes it,
 /// within which the place is found by halving the piece, to a millimeter, each halving counting
-/// against `work` too. An edge of a missing coordinate is one piece; one whose length overflows
-/// (coordinates far out of range) is one too, and sets `coarse`, as does one needing more than
+/// against `work` too. An edge whose length overflows or isn't a number (a coordinate far out of
+/// range, or missing) is one piece, and sets `coarse`, as does one needing more than
 /// [`POLAR_PIECES_MAX`], walked in that many, longer (their chords fall shorter, so the walk passes
 /// later, never early).
 fn walk_edge((a, b): (Coord, Coord), north: bool, skip: f64, work: &mut usize, coarse: &mut bool) -> Result<Walked, WorkLimit> {
     let n = ((b.x - a.x) / rustgis_geom::MERCATOR_R).abs() / POLAR_LENGTH_STEP;
-    let pieces = if n.is_infinite() {
+    let pieces = if !n.is_finite() {
         *coarse = true;
-        1.0
-    } else if n.is_nan() {
         1.0
     } else if n > POLAR_PIECES_MAX {
         *coarse = true;
@@ -918,11 +916,21 @@ mod tests {
 
     #[test]
     fn an_edge_with_a_coordinate_out_of_range_is_one_piece() {
-        let (mut work, mut coarse, b) = (0, false, lonlat_to_plane(Coord::new(0.0, 89.0)));
+        // Each is one piece, and coarse; so is a stretch of one in edge_from, a zero-length
+        // stretch of an edge whose length overflows included (∞ × 0 is no number).
+        let b = lonlat_to_plane(Coord::new(0.0, 89.0));
         for a in [Coord::new(f64::INFINITY, b.y), Coord::new(f64::NAN, b.y)] {
+            let (mut work, mut coarse) = (0, false);
             let _ = walk_edge((a, b), true, 0.0, &mut work, &mut coarse);
+            assert!(work == 1 && coarse, "{a:?}");
+            let (mut work, mut coarse, ends) = (0, false, (plane_to_lonlat(a), plane_to_lonlat(b)));
+            let e = about_pole(Coord::new(0.0, 89.0), true);
+            assert!(edge_from(e, (a, b), ends, (0.0, 1.0), true, 1.0, &mut work, &mut coarse).is_ok() && coarse && work == 1, "{a:?}");
         }
-        assert_eq!(work, 2);
+        let (a, b) = (Coord::new(-f64::MAX, b.y), Coord::new(f64::MAX, b.y));
+        let (mut work, mut coarse, ends) = (0, false, (plane_to_lonlat(a), plane_to_lonlat(b)));
+        let e = about_pole(Coord::new(0.0, 89.0), true);
+        assert!(edge_from(e, (a, b), ends, (0.5, 0.5), true, 1.0, &mut work, &mut coarse).is_ok() && coarse && work == 1);
     }
 
     #[test]
