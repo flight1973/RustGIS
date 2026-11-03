@@ -576,28 +576,53 @@ fn a_missing_coordinate_stays_the_only_one() {
 #[test]
 fn a_vertex_missing_a_coordinate_left_where_it_was_is_counted() {
     // A move, turn or scale says how many features it changed have a vertex missing a coordinate,
-    // which stays where it was: on the ground and within ±85.05°; with every vertex there, it
-    // says nothing.
-    let said = |ring: Vec<Coord>, id: &str, p: serde_json::Value| {
-        let (mut s, _) = session(ring);
+    // which stays where it was, to the bit: on the ground and within ±85.05°; with every vertex
+    // there, it says nothing.
+    let said = |s: &mut Session, id: &str, p: &serde_json::Value| {
         let mark = s.notice_mark();
-        s.run(id, &p).unwrap();
-        s.notices_since(mark).iter().filter(|n| n.text.contains("missing a coordinate")).map(|n| n.text.clone()).collect::<Vec<_>>()
+        let ran = s.run(id, p);
+        let said =
+            s.notices_since(mark).iter().filter(|n| n.text.contains("missing a coordinate")).map(|n| n.text.clone()).collect::<Vec<_>>();
+        (ran.is_ok(), said)
     };
+    let one = ["1 feature(s) have a vertex missing a coordinate, which was left where it was"];
     let edits = [("edit.move", json!({"dx": 1000.0})), ("edit.rotate", json!({"angle": 10.0})), ("edit.scale", json!({"factor": 1.5}))];
     let near_equator = boxed(10.0, 10.0, 11.0, 11.0);
     for ring in [polar_ring(), near_equator] {
         for (id, p) in &edits {
+            // Two vertices of one feature, a longitude missing and a latitude infinite: one feature.
             let mut lossy = ring.clone();
+            lossy[1].y = f64::INFINITY;
             lossy[2].x = f64::NAN;
-            assert_eq!(
-                said(lossy, id, p.clone()),
-                ["1 feature(s) have a vertex missing a coordinate, which was left where it was"],
-                "{id} {ring:?}"
-            );
-            assert!(said(ring.clone(), id, p.clone()).is_empty(), "{id} {ring:?}");
+            let (mut s, layer_id) = session(lossy.clone());
+            assert_eq!(said(&mut s, id, p), (true, one.map(String::from).to_vec()), "{id} {ring:?}");
+            let after = stored(&s, layer_id);
+            let same = |a: Coord, b: Coord| a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits();
+            assert!(same(after[1], lossy[1]) && same(after[2], lossy[2]), "{id} {after:?}");
+            assert!(after.iter().enumerate().all(|(i, c)| i == 1 || i == 2 || c.is_finite()), "{id} {after:?}");
+            let (mut s, _) = session(ring.clone());
+            assert_eq!(said(&mut s, id, p), (true, vec![]), "{id} {ring:?}");
         }
     }
+    // Several features: each changed one with a vertex missing a coordinate counts once; a point,
+    // which a turn leaves as it is, and a feature with every vertex don't.
+    let mut two = boxed(10.0, 10.0, 11.0, 11.0);
+    two[1].x = f64::NAN;
+    two[2].x = f64::NAN;
+    let mut once = boxed(20.0, 10.0, 21.0, 11.0);
+    once[3].y = f64::NAN;
+    let polygon = |ring: Vec<Coord>| Geometry::Polygon(vec![vec![ring]]);
+    let features = vec![polygon(two), polygon(once), polygon(boxed(30.0, 10.0, 31.0, 11.0)), Geometry::Point(Coord::new(f64::NAN, 10.0))];
+    let (mut s, _) = layer(GeometryType::Polygon, features);
+    let (ran, text) = said(&mut s, "edit.rotate", &json!({"angle": 10.0}));
+    assert!(ran && text == ["2 feature(s) have a vertex missing a coordinate, which was left where it was"], "{text:?}");
+    // A refused edit (a polygon reaching a pole can't be turned yet) says nothing of the kind.
+    let mut cap = polar_ring();
+    cap[0].y = -90.0;
+    cap[4].y = -90.0;
+    cap[2].x = f64::NAN;
+    let (mut s, _) = session(cap);
+    assert_eq!(said(&mut s, "edit.rotate", &json!({"angle": 10.0})), (false, vec![]));
 }
 
 #[test]

@@ -335,9 +335,10 @@ impl SphericalMean {
     }
 
     /// Takes in a point counting `weight` times (as a stretch of a line does, by its length); a
-    /// non-finite point or weight, or one not above zero, is left out.
+    /// non-finite point, or a weight that isn't a positive normal number (zero, negative,
+    /// subnormal, missing or infinite), is left out: a subnormal one rounds its direction away.
     pub fn add_weighted(&mut self, c: Coord, weight: f64) {
-        if c.is_finite() && weight.is_finite() && weight > 0.0 {
+        if c.is_finite() && weight.is_normal() && weight > 0.0 {
             // Totals that would overflow are scaled down by a power of two, as is every weight
             // after, which leaves the mean as it was (a weight tiny beside them drops to nothing,
             // as it would anyway).
@@ -659,6 +660,16 @@ mod tests {
         half.add_weighted(b, f64::MAX);
         let mid = half.center().unwrap();
         assert!((mid.x - 45.0).abs() < 1e-9 && mid.y.abs() < 1e-9, "{mid:?}");
+        // Totals scaled down once they hold a point: the second 1e300 passes the limit.
+        let mut grown = SphericalMean::default();
+        grown.add_weighted(a, 1e300);
+        grown.add_weighted(b, 1e300);
+        let mid = grown.center().unwrap();
+        assert!((mid.x - 45.0).abs() < 1e-9 && mid.y.abs() < 1e-9, "{mid:?}");
+        // A subnormal weight is left out, as a zero one is: alone, no center.
+        let mut sub = SphericalMean::default();
+        sub.add_weighted(b, 5e-324);
+        assert_eq!(sub.center(), None);
         let (h, u) = (huge.center().unwrap(), unit.center().unwrap());
         assert!((h.x - u.x).abs() < 1e-9 && (h.y - u.y).abs() < 1e-9, "{h:?} {u:?}");
     }

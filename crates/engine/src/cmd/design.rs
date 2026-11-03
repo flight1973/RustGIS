@@ -321,7 +321,8 @@ pub fn commands() -> Vec<C> {
             for l in s.map().layers.iter().filter(|l| !l.is_raster()) {
                 for r in &l.selection {
                     let Some(g) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()).filter(|g| within_square(g)) else { continue };
-                    let done = g.map_coords(&|c: Coord| shift(c, dx, dy));
+                    // A vertex missing a coordinate stays as it was, as on the ground.
+                    let done = g.map_coords(&|c: Coord| if c.is_finite() { shift(c, dx, dy) } else { c });
                     if within_square(&done) {
                         shifted.insert((l.id, *r), done);
                     }
@@ -536,12 +537,14 @@ fn ground_movable(g: &Geometry) -> Result<(), String> {
     if matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
         return Ok(());
     }
+    // A vertex missing a coordinate (or with an infinite one) is no place, and stays as it was:
+    // it reaches no pole and makes no edge wide.
     let (mut pole, mut wide) = (false, false);
-    g.for_each_coord(|c| pole |= c.y.abs() >= 90.0 - POLE_TOLERANCE);
+    g.for_each_coord(|c| pole |= c.is_finite() && c.y.abs() >= 90.0 - POLE_TOLERANCE);
     if pole {
         return Err("a line or polygon that reaches a pole can't be moved, rotated or scaled yet".into());
     }
-    g.for_each_edge(|_, a, b| wide |= (b.x - a.x).abs() >= 180.0);
+    g.for_each_edge(|_, a, b| wide |= a.is_finite() && b.is_finite() && (b.x - a.x).abs() >= 180.0);
     if wide {
         return Err("a line or polygon with an edge spanning 180° of longitude or more can't be moved, rotated or scaled on the ground \
                     yet (as features beyond 85.05° are)"
@@ -579,8 +582,12 @@ fn plane_at<'a>(geoms: impl IntoIterator<Item = &'a Geometry>, budget: &mut usiz
             continue;
         }
         g.for_each_edge(|_, a, b| {
+            // An edge to a vertex missing a coordinate, or with an infinite one, weighs nothing
+            // (an infinite latitude would otherwise reach a pole in the plane).
+            if !(a.is_finite() && b.is_finite()) {
+                return;
+            }
             let span = (b.x - a.x).abs().max((b.y - a.y).abs()) / CENTER_STEP_DEG;
-            // NaN (a coordinate missing) takes one stretch, which then weighs nothing.
             let n = if span > 1.0 { span.ceil().min(CENTER_STEPS_MAX) } else { 1.0 };
             let n = if n as usize <= *budget { n } else { 1.0 };
             *budget = budget.saturating_sub(n as usize);
@@ -610,8 +617,10 @@ fn about_center(
     budget: &mut usize,
 ) -> Result<Option<Geometry>, String> {
     if within_square(g) {
+        // About the extent of the vertices that have both coordinates; one missing a coordinate
+        // stays as it was, as on the ground.
         let c = lonlat_to_merc(g.extent().center());
-        let done = g.map_coords(&|p: Coord| merc_to_lonlat(merc(c, lonlat_to_merc(p))));
+        let done = g.map_coords(&|p: Coord| if p.is_finite() { merc_to_lonlat(merc(c, lonlat_to_merc(p))) } else { p });
         if within_square(&done) {
             return Ok(Some(done));
         }
@@ -752,7 +761,9 @@ fn polar_transform(
     let mut path = |pts: &[Coord], kind: PathKind, anchor: Option<f64>| -> Result<Vec<Coord>, String> {
         let mut out = Vec::with_capacity(pts.len());
         for c in pts {
-            let p = f(from.forward(*c));
+            // A vertex missing a coordinate, or with an infinite one, is no place: it isn't
+            // measured here, and stays as it was below.
+            let p = if c.is_finite() { f(from.forward(*c)) } else { Coord::new(f64::NAN, f64::NAN) };
             if p.x.hypot(p.y) > GROUND_REACH_M {
                 return Err("that would carry a feature more than 10,000 km from the center it's edited about on the ground (as features \
                             beyond 85.05° are)"
