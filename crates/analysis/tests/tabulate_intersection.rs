@@ -285,7 +285,7 @@ fn one_notice_per_field_for_missing_values() {
             "Tabulate Intersection: 1 row",
             "1 zone overlaps no class feature, so it has no rows",
             "class features with no value in a sum field are left out of its shares: 2 class features in 'pop', 1 class feature in 'income'",
-            "1 zone feature and 1 class feature have an edge beyond 85.05° running east or west: the map takes it straight in longitude and latitude, and their percentages and shares follow the map, while area_km2 takes the shortest way on the ground, which near a pole can differ widely",
+            "1 zone feature and 1 class feature have an edge beyond 85.05° running east or west: the analysis plane takes it straight in longitude and latitude beyond 85.05°, and their percentages and shares follow the plane, while area_km2 takes the shortest way on the ground, which near a pole can differ widely",
             "1 class feature lies partly or wholly outside the zones: its value outside isn't shared out",
         ]
     );
