@@ -1091,7 +1091,8 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
         // 85.05°, where the plane stretches east–west far more than north–south, each segment's
         // nearest point is found, and compared, on the ground.
         let m = lonlat_to_plane(at);
-        let ground = at.y.abs() > MAX_LAT || parts.iter().flatten().any(|c| c.y.abs() > MAX_LAT);
+        // A vertex missing a coordinate, or with an infinite one, is no place: it decides nothing.
+        let ground = at.y.abs() > MAX_LAT || parts.iter().flatten().any(|c| c.is_finite() && c.y.abs() > MAX_LAT);
         // On the ground, each vertex's distance, measured once (part after part, in one buffer),
         // where the plane has it (a latitude past ±90° at the pole). The line's nearest point is no
         // farther than the nearest end of a segment it can measure (both ends known), so a segment
@@ -1099,7 +1100,12 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
         let mut dists: Vec<f64> = Vec::new();
         if ground {
             dists.try_reserve(parts.iter().map(Vec::len).sum()).map_err(|_| "not enough memory to split the selected lines")?;
-            dists.extend(parts.iter().flatten().map(|c| haversine_m(at, Coord::new(c.x, c.y.clamp(-90.0, 90.0)))));
+            dists.extend(
+                parts
+                    .iter()
+                    .flatten()
+                    .map(|c| if c.is_finite() { haversine_m(at, Coord::new(c.x, c.y.clamp(-90.0, 90.0))) } else { f64::NAN }),
+            );
         }
         let (mut nearest_vertex, mut base) = (f64::INFINITY, 0);
         for p in parts {
@@ -1114,6 +1120,11 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
             base += part.len();
             for (si, w) in part.windows(2).enumerate() {
                 let (Some(a), Some(b2)) = (w.first(), w.get(1)) else { continue };
+                // A segment to a vertex that's no place (an infinite coordinate; a missing one
+                // measures as NaN below) is passed over, not run to a pole.
+                if !(a.is_finite() && b2.is_finite()) {
+                    continue;
+                }
                 let (d, q) = if ground {
                     let ends = part_dists.get(si).zip(part_dists.get(si + 1)).map(|(da, db)| (*da, *db));
                     let bound = best.map_or(nearest_vertex, |b| b.0.min(nearest_vertex));

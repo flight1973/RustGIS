@@ -245,6 +245,22 @@ fn a_split_passes_over_a_segment_missing_a_coordinate() {
 }
 
 #[test]
+fn a_split_passes_over_a_segment_to_an_infinite_latitude() {
+    // Along 88°N, then on to a vertex whose latitude is infinite (no place, not the pole): a
+    // click at 89.5°N above the corner cuts the line at its corner on 88°N, not the segment
+    // "to the pole" at 89.5°N.
+    let c = Coord::new;
+    let line = vec![c(0.0, 88.0), c(10.0, 88.0), c(10.0, f64::INFINITY)];
+    let (mut s, id) = layer(GeometryType::Polyline, vec![Geometry::Line(vec![line])]);
+    s.run("edit.split", &json!({"lon": 10.0, "lat": 89.5})).unwrap();
+    let added = match &s.map().layer(id).unwrap().dataset.features[1].geometry {
+        Some(Geometry::Line(p)) => p.clone(),
+        g => panic!("{g:?}"),
+    };
+    assert!(added.len() == 1 && (added[0][0].y - 88.0).abs() < 1e-6, "{added:?}");
+}
+
+#[test]
 fn points_around_a_pole_moved_keep_their_longitudes_as_written() {
     // Moved a kilometer, each point at 87°N stays written near where it was, not a turn away
     // (90° as −270°, say), wherever their center is.
