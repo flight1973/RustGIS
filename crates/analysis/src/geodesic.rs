@@ -328,8 +328,9 @@ impl Plane {
 
 /// Whether the edge from `a` to `b` in the plane (`la` and `lb` in lon/lat) can stray as far as
 /// `tolerance` from the same edge straight in the analysis plane, so that [`Plane::strays`] must
-/// look. An edge reaching beyond 85.05°, where the analysis plane's straight edges are straight in
-/// lon/lat (spirals about a pole, not rhumb lines), is always looked at. Within ±85.05° straight in
+/// look. Beyond 85.05° the analysis plane's straight edges are straight in lon/lat: spirals about a
+/// pole, not rhumb lines, bounded as such; an edge reaching across 85.05°, or with its ends beyond
+/// it about both poles, is always looked at. Within ±85.05° straight in
 /// the analysis plane is straight in Web Mercator, a rhumb line, which runs off the geodesic by about L² tan φ / 8R
 /// at latitude φ, the heading of a geodesic turning by L tan φ / R along it: 2.0e-8 per square
 /// metre at 46°, 1.9e-7 at 84°, as measured for [`STRAY_PER_M2`], plus [`FLAT_ALLOWANCE`] for the
@@ -341,19 +342,43 @@ impl Plane {
 /// the look that most of a buffer's time went to.
 fn may_stray(a: GC<f64>, b: GC<f64>, la: Coord, lb: Coord, tolerance: f64) -> bool {
     let length2 = (b.x - a.x).powi(2) + (b.y - a.y).powi(2);
+    let length = length2.sqrt();
+    let rho = a.x.hypot(a.y).max(b.x.hypot(b.y)) + length;
+    let (beyond_a, beyond_b) = (la.y.abs() > rustgis_geom::MAX_LAT, lb.y.abs() > rustgis_geom::MAX_LAT);
+    if beyond_a || beyond_b {
+        // [`STRAY_PER_M2`] holds for rhumb lines, not here, where even a short edge near a pole
+        // strays meters: an edge with an end within ±85.05° (where the plane bends) or ends about
+        // both poles is always looked at.
+        if !(beyond_a && beyond_b) || la.y * lb.y <= 0.0 {
+            return true;
+        }
+        // Straight in lon/lat is, about the pole, a spiral ([`spiral_stray`]). Its chord there,
+        // straight about the pole, turns from the geodesic as this plane's straight edges do, at
+        // its own distance from its center.
+        let from_pole = |c: Coord| (90.0 - c.y.abs()).to_radians() * rustgis_geom::WGS84_POLAR_RADIUS_M;
+        let (pa, pb) = (from_pole(la), from_pole(lb));
+        let spiral = spiral_stray(pa.max(pb), (pa - pb).abs(), wrap(lb.x - la.x).to_radians().abs());
+        let turn = (FLAT_ALLOWANCE + PLANE_TURN * (rho + pa.max(pb)) / EARTH_R_M) / (8.0 * EARTH_R_M) * length2;
+        let stray = STRAY_MARGIN * (spiral + turn);
+        return !stray.is_finite() || stray > tolerance;
+    }
     if STRAY_PER_M2 * length2 <= tolerance {
         return false;
     }
-    if la.y.abs().max(lb.y.abs()) > rustgis_geom::MAX_LAT {
-        return true;
-    }
-    let length = length2.sqrt();
     let lat = la.y.abs().max(lb.y.abs()).to_radians() + length / EARTH_R_M;
-    let rho = a.x.hypot(a.y).max(b.x.hypot(b.y)) + length;
     if !(lat.is_finite() && rho.is_finite()) || lat >= 89f64.to_radians() {
         return true;
     }
     STRAY_MARGIN * (lat.tan() + FLAT_ALLOWANCE + PLANE_TURN * rho / EARTH_R_M) / (8.0 * EARTH_R_M) * length2 > tolerance
+}
+
+/// How far, at most, an edge straight in longitude and latitude strays from its chord in a plane
+/// about its pole (meters): through `dl` radians of longitude, its distance from the pole changing
+/// by `drho` meters, `rho` being its end farther from the pole, it's a spiral, which strays by at
+/// most Δλ(ρΔλ + 2Δρ)/8 (the most its second derivative reaches, over 8). For the buffers' edges
+/// and the dangle check's pieces beyond 85.05°.
+pub(crate) fn spiral_stray(rho: f64, drho: f64, dl: f64) -> f64 {
+    dl * (rho * dl + 2.0 * drho) / 8.0
 }
 
 /// A longitude difference folded into −180..180.
@@ -546,18 +571,61 @@ mod tests {
             let (s, c) = (k as f64 * std::f64::consts::FRAC_PI_4).sin_cos();
             GC { x: 100_000.0 * c, y: 100_000.0 * s }
         };
-        let octagon: Vec<GC<f64>> = (0..=8).map(corner).collect();
+        let octagon = LineString::new((0..=8).map(corner).collect());
         let tolerance = 100_000.0 * OUTLINE_TOLERANCE;
-        let ring = plane.ring(&LineString::new(octagon.clone()), tolerance);
-        assert!(ring.0.len() > octagon.len(), "{}", ring.0.len());
+        let ring = plane.ring(&octagon, tolerance);
+        assert!(ring.0.len() > octagon.0.len(), "{}", ring.0.len());
+        let worst = farthest_drawn(&plane, &ring, &octagon);
+        assert!(worst <= 2.0 * tolerance, "{worst} m off the octagon, tolerance {tolerance} m");
+    }
+
+    #[test]
+    fn a_small_buffer_near_a_pole_follows_its_circle_as_the_tools_draw_it() {
+        // A point's buffer beyond 85.05° has short edges (49 m for 1 km), but near a pole an edge
+        // straight in lon/lat strays meters even so: each is looked at, not let pass for its length.
+        // Back in lon/lat, each edge of the outline, drawn as the tools draw it, stays within the
+        // tolerance of the circle drawn in the plane: across ±180° too, and round a pole (where the
+        // ring is closed by edges along ±180° and the pole, which aren't the circle's).
+        let cases = [
+            (10.0, 85.5, 1_000.0),
+            (10.0, 88.0, 1_000.0),
+            (10.0, 89.9, 100.0),
+            (10.0, 89.9, 10_000.0),
+            (10.0, 89.99, 1_000.0),
+            (10.0, -89.99, 1_000.0),
+            (180.0, 89.9, 10_000.0),
+            (10.0, 89.95, 10_000.0),
+        ];
+        for (lon, lat, meters) in cases {
+            let c = Coord::new(lon, lat);
+            let plane = Plane::new(c, c.x);
+            let circle = Point::new(0.0, 0.0).buffer_with_style(buffer_style(meters));
+            let Some(outline) = circle.0.first().map(Polygon::exterior) else { panic!("no circle at {lat}°") };
+            let tolerance = (meters * OUTLINE_TOLERANCE).max(MIN_TOLERANCE_M);
+            let ring = plane.ring(outline, tolerance);
+            // Only the last circle holds its pole.
+            assert_eq!(ring.0.iter().any(|p| p.y.abs() >= 90.0), (lon, lat) == (10.0, 89.95), "{lon}°, {lat}°");
+            let worst = farthest_drawn(&plane, &ring, outline);
+            assert!(worst <= 2.0 * tolerance, "{lon}°, {lat}°, {meters} m: {worst} m off the circle, tolerance {tolerance} m");
+        }
+    }
+
+    /// How far, at most, `ring` (in lon/lat, as [`Plane::ring`] gives it) drawn as the tools draw
+    /// its edges (straight in the analysis plane) comes from `outline` in `plane`, at each edge's
+    /// quarter points and midpoint; edges to a pole, which close a ring round it, aren't measured.
+    fn farthest_drawn(plane: &Plane, ring: &LineString<f64>, outline: &LineString<f64>) -> f64 {
         let mut worst = 0.0_f64;
         for w in ring.0.windows(2) {
             let [a, b] = w else { continue };
+            if a.y.abs().max(b.y.abs()) >= 90.0 {
+                continue;
+            }
             let (pa, pb) = (lonlat_to_plane(Coord::new(a.x, a.y)), lonlat_to_plane(Coord::new(b.x, b.y)));
             for t in [0.25, 0.5, 0.75] {
                 let drawn = plane_to_lonlat(Coord::new(pa.x + t * (pb.x - pa.x), pa.y + t * (pb.y - pa.y)));
                 let p = plane.0.forward(drawn);
-                let off = octagon
+                let off = outline
+                    .0
                     .windows(2)
                     .filter_map(|e| {
                         Some(rustgis_data::geometry::seg_dist2(
@@ -570,19 +638,21 @@ mod tests {
                 worst = worst.max(off);
             }
         }
-        assert!(worst <= 2.0 * tolerance, "{worst} m off the octagon, tolerance {tolerance} m");
+        worst
     }
 
     #[test]
     fn an_edge_let_pass_by_its_latitude_does_not_stray() {
-        // Wherever `may_stray` lets an edge pass without looking, looking agrees: planes from 88°S
-        // to 88°N (past Web Mercator's 85.05° too), edges of 100 m to 1,000 km in eight directions,
-        // up to 5,000 km from the centre to the side or at 45°, at the tolerances of buffers from
-        // 100 m to 5,000 km (the largest Buffer makes).
-        let mut passed = 0;
-        for lat in (-84..=84).step_by(12).chain([-88, -86, 86, 88]) {
-            let plane = Plane::new(Coord::new(10.0, f64::from(lat)), 10.0);
-            for len in [100.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0, 30_000.0, 100_000.0, 300_000.0, 1_000_000.0] {
+        // Wherever `may_stray` lets an edge pass without looking, looking agrees: planes from
+        // 89.99°S to 89.99°N (past Web Mercator's 85.05° too), edges of 10 m to 1,000 km in eight
+        // directions, up to 5,000 km from the center to the side or at 45°, at the tolerances of
+        // buffers from 100 m to 5,000 km (the largest Buffer makes). Beyond 85.05° every edge is
+        // tried, short ones too, as the spirals' bound lets them pass.
+        let (mut passed, mut polar) = (0, 0);
+        let lats = (-84..=84).step_by(12).map(f64::from).chain([-89.99, -89.9, -88.0, -86.0, 85.5, 86.0, 88.0, 89.0, 89.9, 89.99]);
+        for lat in lats {
+            let plane = Plane::new(Coord::new(10.0, lat), 10.0);
+            for len in [10.0, 50.0, 100.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0, 30_000.0, 100_000.0, 300_000.0, 1_000_000.0] {
                 for k in 0..8 {
                     let (sin, cos) = (f64::from(k) * std::f64::consts::PI / 8.0).sin_cos();
                     // The edge's centre off it to the side (where the plane turns it most) or obliquely.
@@ -595,10 +665,12 @@ mod tests {
                         let a = GC { x: cx - cos * len / 2.0, y: cy - sin * len / 2.0 };
                         let b = GC { x: cx + cos * len / 2.0, y: cy + sin * len / 2.0 };
                         let (la, lb) = (plane.to_lonlat(a), plane.to_lonlat(b));
+                        let beyond = la.y.abs().min(lb.y.abs()) > rustgis_geom::MAX_LAT;
                         for metres in [100.0, 1_000.0, 5_000.0, 50_000.0, 500_000.0, 2_000_000.0, 5_000_000.0] {
                             let tolerance = (metres * OUTLINE_TOLERANCE).max(MIN_TOLERANCE_M);
-                            if STRAY_PER_M2 * len * len > tolerance && !may_stray(a, b, la, lb, tolerance) {
+                            if (beyond || STRAY_PER_M2 * len * len > tolerance) && !may_stray(a, b, la, lb, tolerance) {
                                 passed += 1;
+                                polar += usize::from(beyond);
                                 assert!(!plane.strays(a, b, la, lb, tolerance), "{len} m at {lat}°, {off} m off, {metres} m");
                             }
                         }
@@ -606,8 +678,8 @@ mod tests {
                 }
             }
         }
-        // Most edges a buffer has at mid latitudes are let pass.
-        assert!(passed > 1_000, "{passed}");
+        // Most edges a buffer has at mid latitudes are let pass, and many beyond 85.05°.
+        assert!(passed > 1_000 && polar > 1_000, "{passed}, {polar} beyond 85.05°");
     }
 
     #[test]
