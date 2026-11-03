@@ -24,6 +24,7 @@
   <a href="https://web.rustgis.app"><img alt="Launch the RustGIS web app" src="https://img.shields.io/badge/Launch-web%20app-b84a2c?style=for-the-badge&logo=webassembly&logoColor=white" height="36"></a>
   <a href="https://github.com/opengeos/RustGIS/releases/latest"><img alt="Download the desktop app" src="https://img.shields.io/badge/Download-desktop%20app-2563eb?style=for-the-badge&logo=github&logoColor=white" height="36"></a>
   <a href="https://rustgis.app"><img alt="Read the documentation" src="https://img.shields.io/badge/Read-the%20docs-0e9384?style=for-the-badge&logo=materialformkdocs&logoColor=white" height="36"></a>
+  <a href="https://rustgis.app/videos/"><img alt="Watch the video tutorials" src="https://img.shields.io/badge/Watch-video%20tutorials-dc2626?style=for-the-badge&logo=youtube&logoColor=white" height="36"></a>
   <a href="https://apps.microsoft.com/detail/9ppjw8h561lq?mode=direct"><img alt="Get it from Microsoft" src="https://get.microsoft.com/images/en-us%20dark.svg" height="36"></a>
 </p>
 
@@ -50,6 +51,11 @@
   sandboxed WebAssembly [plugins](docs/plugins.md) that add commands, tools and ribbon tabs.
 
 ## A tour
+
+Prefer a video? [RustGIS: A Fast, Free GIS That Runs on Your Desktop and in Your
+Browser](https://youtu.be/XFhqlSiKn6U) walks through the main features, and the
+[Video Tutorials](https://rustgis.app/videos/) page collects the rest of the
+[playlist](https://www.youtube.com/playlist?list=PLBQuwPke8dNI).
 
 <table>
 <tr>
@@ -92,7 +98,7 @@ Every screenshot is RustGIS itself, rendered offscreen by `cargo run -p rustgis-
 
 | Area | Highlights |
 |---|---|
-| **Data** | GeoJSON, CSV/TSV with x/y columns in any coordinate system or WKT geometry, Excel and OpenDocument spreadsheets, GeoRSS, LandXML, encoded polylines, Shapefile (zipped too, in the browser as well), GeoPackage, GeoParquet, FlatGeobuf, KML/KMZ (with styles), GPX, GML, MapInfo MIF/MID, OpenStreetMap PBF, TopoJSON, AutoCAD DXF, LiDAR point clouds (LAS, LAZ, COPC) and geotagged photos (large files are read in place), files by their web address, every vector format GDAL reads when it is installed, Esri File Geodatabases without GDAL (desktop), PostGIS, MySQL, MariaDB and SQL Server tables read live (desktop), and SQL queries and DuckDB databases through DuckDB Spatial when DuckDB is installed; PMTiles archives (web or file) and MBTiles files; GeoJSON, CSV, GeoPackage, GeoParquet, Shapefile, FlatGeobuf, KML/KMZ, GPX and WKT out; standalone tables; reusable connections; supported QGIS projects and layer styles; layer and map files, styles, templates and packages |
+| **Data** | GeoJSON, CSV/TSV with x/y columns in any coordinate system or WKT geometry, Excel and OpenDocument spreadsheets, GeoRSS, LandXML, encoded polylines, Shapefile (zipped too, in the browser as well), GeoPackage, GeoParquet, FlatGeobuf, KML/KMZ (with styles), GPX, GML, MapInfo MIF/MID, OpenStreetMap PBF, TopoJSON, CityJSON, AutoCAD DXF, LiDAR point clouds (LAS, LAZ, COPC) and geotagged photos (large files are read in place), files by their web address, every vector format GDAL reads when it is installed, Esri File Geodatabases without GDAL (desktop), PostGIS, MySQL, MariaDB and SQL Server tables read live (desktop), and SQL queries and DuckDB databases through DuckDB Spatial when DuckDB is installed; PMTiles archives (web or file) and MBTiles files; GeoJSON, CSV, GeoPackage, GeoParquet, Shapefile, FlatGeobuf, KML/KMZ, GPX and WKT out; standalone tables; reusable connections; supported QGIS projects and layer styles; layer and map files, styles, templates and packages |
 | **Rasters** | GeoTIFF and cloud-optimised GeoTIFF (any pixel type, tiled or striped, compressed), ASCII grids, Zarr 2 and 3 stores (a variable at a time step, by folder or web address), and JPEG 2000, NetCDF, HDF, ERDAS Imagine and the other rasters GDAL reads when it is installed (desktop); reprojection from any EPSG code; Stretch, RGB, Classify, Unique Values, Colormap and Shaded Relief; DRA, band combinations, brightness/contrast/gamma; raster functions, indices, change detection, classification, georeferencing; cloud-optimised GeoTIFF export; data cubes, point time-series charts, temporal summaries and trends |
 | **Maps** | Multiple maps and layouts per project, renamed and duplicated from the Browser pane; tilt, rotation, terrain and a 3D globe; maps of the Moon, Mars and other celestial bodies; Web Mercator or any projection (Equal Earth, Robinson, Winkel Tripel, polar and regional presets, or an EPSG code); bookmarks, extent history, coordinate navigation; five offline basemaps, with borders in two worldviews |
 | **Web services** | WMS, WMTS, WFS, OGC API Features and ArcGIS REST (FeatureServer, MapServer, ImageServer, VectorTileServer) from their capabilities |
