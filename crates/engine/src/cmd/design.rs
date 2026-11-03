@@ -546,8 +546,8 @@ fn ground_movable(g: &Geometry) -> Result<(), String> {
     }
     g.for_each_edge(|_, a, b| wide |= a.is_finite() && b.is_finite() && (b.x - a.x).abs() >= 180.0);
     if wide {
-        return Err("a line or polygon with an edge spanning 180° of longitude or more can't be moved, rotated or scaled on the ground \
-                    yet (as features beyond 85.05° are)"
+        return Err("features beyond 85.05° are moved, rotated and scaled on the ground, which can't yet take a line or polygon \
+                    with an edge spanning 180° of longitude or more"
             .into());
     }
     Ok(())
@@ -765,8 +765,8 @@ fn polar_transform(
             // measured here, and stays as it was below.
             let p = if c.is_finite() { f(from.forward(*c)) } else { Coord::new(f64::NAN, f64::NAN) };
             if p.x.hypot(p.y) > GROUND_REACH_M {
-                return Err("that would carry a feature more than 10,000 km from the center it's edited about on the ground (as features \
-                            beyond 85.05° are)"
+                return Err("features beyond 85.05° are edited on the ground about their center, and that would carry one more \
+                            than 10,000 km from it"
                     .into());
             }
             out.push(p);
