@@ -707,7 +707,9 @@ percentage is taken from. Add vertices along such edges to bring them together.
 The tool says how many zone and class features have no polygon (no geometry, an empty one, a line or
 point, or a ring collapsed to no area; they are left out), how many cross the antimeridian without
 being split there (the map, and with it the percentages and shares, takes them the long way round,
-while area_km2 takes their ground shape), how many zones overlap no class feature and so have no
+while area_km2 takes their ground shape), how many have an edge beyond 85.05° running east or west
+(taken as the map draws it, so their percentages and area_km2 can differ widely, as above), how
+many zones overlap no class feature and so have no
 rows, how many class features have no value in a sum field (they add nothing to its shares) and,
 with sum fields, how many class features lie partly or wholly outside the zones. Only selected
 features are used when a layer has a selection, and the table is named `<zones>_Tabulate` unless
