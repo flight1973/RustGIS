@@ -347,6 +347,9 @@ const POLAR_PIECES_MAX: f64 = 65_536.0;
 /// The longest piece, in radians of longitude, that [`walk_edge`] measures an edge in: its chords
 /// fall short of the edge by under 0.006%.
 const POLAR_LENGTH_STEP: f64 = 0.0175;
+/// How many times [`walk_edge`] halves the piece it passes its distance in, to place it there: to
+/// within a 2⁻⁶⁰th of the piece, below an f64's precision.
+const PLACE_HALVINGS: usize = 60;
 /// How many cheap reads count as one unit of work: an edge's box found out of an end's reach, which
 /// at worst costs about a quarter of a piece measured in [`edge_from`]. Reads add up across ends.
 const READS_A_WORK: usize = 4;
@@ -545,9 +548,9 @@ enum Walked {
 /// Where the walk from `a` along the edge `a`–`b` (in the analysis plane), in the frame about a
 /// pole (the North Pole when `north`), passes `skip` meters: in pieces of at most
 /// [`POLAR_LENGTH_STEP`] of longitude, each counting against `work`, up to the one that passes it,
-/// within which the place is found by its length. An edge of a missing or infinite coordinate is
-/// one piece; one needing more than [`POLAR_PIECES_MAX`] is walked in that many, longer, and sets
-/// `coarse` (their chords fall shorter, so the walk passes later, never early).
+/// within which the place is found by halving the piece. An edge of a missing or infinite
+/// coordinate is one piece; one needing more than [`POLAR_PIECES_MAX`] is walked in that many,
+/// longer, and sets `coarse` (their chords fall shorter, so the walk passes later, never early).
 fn walk_edge((a, b): (Coord, Coord), north: bool, skip: f64, work: &mut usize, coarse: &mut bool) -> Result<Walked, WorkLimit> {
     let n = ((b.x - a.x) / rustgis_geom::MERCATOR_R).abs() / POLAR_LENGTH_STEP;
     let pieces = if !n.is_finite() {
@@ -566,10 +569,28 @@ fn walk_edge((a, b): (Coord, Coord), north: bool, skip: f64, work: &mut usize, c
         let next = at(k / pieces);
         let piece = (next.x - last.x).hypot(next.y - last.y);
         if length + piece > skip {
-            // In proportion to the piece's length (at its end when nothing is to be skipped, so a
-            // zero tolerance never measures the end itself).
-            let into = if skip > 0.0 { ((skip - length) / piece).clamp(0.0, 1.0) } else { 1.0 };
-            return Ok(Walked::Past((k - 1.0 + into) / pieces));
+            // Where in the piece it's `skip - length` from the piece's start, found by halving: its
+            // parameter isn't in proportion to its length (a piece reaching from beyond 85.05° far
+            // into the band stretches in the plane about 11.6 times more per meter beyond it). At
+            // the piece's end when nothing is to be skipped, so a zero tolerance never measures
+            // the end itself; at or just past the place, never before it.
+            let (mut lo, mut hi) = ((k - 1.0) / pieces, k / pieces);
+            if skip > 0.0 {
+                let rest = skip - length;
+                for _ in 0..PLACE_HALVINGS {
+                    let mid = 0.5 * (lo + hi);
+                    if mid <= lo || mid >= hi {
+                        break;
+                    }
+                    let p = at(mid);
+                    if (p.x - last.x).hypot(p.y - last.y) < rest {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+            }
+            return Ok(Walked::Past(hi));
         }
         length += piece;
         last = next;
@@ -889,10 +910,9 @@ mod tests {
         assert!(70_000f64.to_radians() / POLAR_LENGTH_STEP > POLAR_PIECES_MAX);
         let (mut work, mut coarse) = (0, false);
         let Ok(Walked::Past(t)) = walk_edge((a, b), true, 20.0, &mut work, &mut coarse) else { panic!("not past") };
-        let pieces = POLAR_PIECES_MAX;
-        let first = about_pole(plane_to_lonlat(Coord::new(a.x + (b.x - a.x) / pieces, a.y)), true);
+        let passed = about_pole(plane_to_lonlat(Coord::new(a.x + (b.x - a.x) * t, a.y)), true);
         let start = about_pole(Coord::new(0.0, 88.0), true);
-        assert!((t * pieces * (first.x - start.x).hypot(first.y - start.y) - 20.0).abs() < 1e-6, "{t}");
+        assert!(t < 1.0 / POLAR_PIECES_MAX && ((passed.x - start.x).hypot(passed.y - start.y) - 20.0).abs() < 1e-6, "{t}");
         assert!(coarse && work == 1, "{work}");
         let ends = (plane_to_lonlat(a), plane_to_lonlat(b));
         coarse = false;
@@ -946,6 +966,28 @@ mod tests {
         let checked = dangles(&ds, &[0], 10.0);
         let at: Vec<Coord> = checked.errors.iter().map(|e| e.at).collect();
         assert!(checked.complete && at.len() == 1 && at.iter().all(|c| (c.x + 3.0).abs() < 1e-9), "{at:?}");
+    }
+
+    #[test]
+    fn a_polar_end_on_a_line_reaching_far_into_the_band_dangles() {
+        // Lines down a meridian, or nearly, from beyond 85.05° far into the band: each is one
+        // piece, along which the plane stretches about 11.6 times more per meter beyond 85.05°
+        // than within it. Twice the tolerance is found on the ground, not in proportion to the
+        // plane, so the polar end doesn't meet its own line a few meters on, and both ends dangle.
+        let ends = [((0.0, 86.0), (0.0, 60.0)), ((0.0, -86.0), (0.0, -60.0)), ((0.0, 89.0), (0.0, 0.0)), ((0.0, 86.0), (0.5, 60.0))];
+        for ((x0, y0), (x1, y1)) in ends {
+            let mut ds = Dataset::new("l", GeometryType::Polyline, vec![]);
+            ds.push(Some(Geometry::Line(vec![vec![Coord::new(x0, y0), Coord::new(x1, y1)]])), vec![]);
+            let checked = dangles(&ds, &[0], 10.0);
+            assert!(checked.complete && checked.errors.len() == 2, "({x0}, {y0}) to ({x1}, {y1}): {:?}", checked.errors);
+        }
+        // The walk passes 20 m from the end on the ground, in the frame about the pole.
+        let (a, b) = (lonlat_to_plane(Coord::new(0.0, 86.0)), lonlat_to_plane(Coord::new(0.0, 60.0)));
+        let (mut work, mut coarse) = (0, false);
+        let Ok(Walked::Past(t)) = walk_edge((a, b), true, 20.0, &mut work, &mut coarse) else { panic!("not past") };
+        let at = about_pole(plane_to_lonlat(Coord::new(a.x, a.y + (b.y - a.y) * t)), true);
+        let start = about_pole(Coord::new(0.0, 86.0), true);
+        assert!(((at.x - start.x).hypot(at.y - start.y) - 20.0).abs() < 1e-6, "{t}");
     }
 
     #[test]
