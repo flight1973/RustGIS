@@ -1713,7 +1713,7 @@ fn meet_at_seam(part: &[Coord], next: &[Coord]) -> bool {
 fn for_each_line(g: &Geometry, mut f: impl FnMut(&[Vec<Coord>], bool)) {
     let closed = |run: &[Vec<Coord>]| {
         let mut v = run.iter().flatten().filter(|c| c.is_finite());
-        matches!((v.next(), v.next_back()), (Some(a), Some(b)) if rustgis_geom::wgs84_inverse(*a, *b).0 < MIN_SEGMENT)
+        matches!((v.next(), v.next_back()), (Some(a), Some(b)) if a == b || rustgis_geom::wgs84_inverse(*a, *b).0 < MIN_SEGMENT)
     };
     match g {
         Geometry::Line(parts) => {
@@ -1816,7 +1816,8 @@ fn bearing(azimuth: f64) -> f64 {
 /// solution, and one on a vertex none. A point on a vertex takes the mean of the directions either
 /// side, as QGIS's tool does; a ring's first vertex lies between its last segment and its first.
 /// Two points that would both take the same vertex (one just before it, one just after, within the
-/// tolerance) are one. The walk stops when `emit` breaks.
+/// tolerance) are one: the same vertex of the walk, not the same place, which a line can pass
+/// through twice. The walk stops when `emit` breaks.
 fn walk_line(segs: &[Segment], ring: bool, spacing: Spacing, mut emit: impl FnMut(Coord, f64, f64) -> ControlFlow<()>) {
     let (Some(head), Some(tail)) = (segs.first(), segs.last()) else { return };
     let len: f64 = segs.iter().map(|s| s.len).sum();
@@ -1826,10 +1827,10 @@ fn walk_line(segs: &[Segment], ring: bool, spacing: Spacing, mut emit: impl FnMu
     // The direction the walk arrives at its vertex in: none at a line's start; at a ring's, the one
     // its last segment comes back in.
     let mut arriving = ring.then_some(tail.azi_b);
-    // The vertex the last point was put on, if it was.
-    let mut on_vertex: Option<Coord> = None;
+    // The vertex the last point was put on, if it was: the start of that segment.
+    let mut on_vertex: Option<usize> = None;
     let (mut k, mut walked) = (0usize, 0.0);
-    for seg in segs {
+    for (i, seg) in segs.iter().enumerate() {
         // The points before this segment's end; one at its end is on the next one's start.
         while k < n && at(k) < walked + seg.len - tol {
             let along = at(k) - walked;
@@ -1838,7 +1839,7 @@ fn walk_line(segs: &[Segment], ring: bool, spacing: Spacing, mut emit: impl FnMu
             } else {
                 rustgis_geom::wgs84_direct(seg.a, seg.azi_a, along)
             };
-            let vertex = (along <= tol).then_some(seg.a);
+            let vertex = (along <= tol).then_some(i);
             if vertex.is_none() || vertex != on_vertex {
                 if emit(c, at(k), bearing(azimuth)).is_break() {
                     return;
@@ -1855,7 +1856,7 @@ fn walk_line(segs: &[Segment], ring: bool, spacing: Spacing, mut emit: impl FnMu
     }
     // The rest are at the part's end, which on a ring is its first vertex again: one point there.
     let azimuth = if ring { mean_azimuth(tail.azi_b, head.azi_a) } else { tail.azi_b };
-    if k < n && on_vertex != Some(tail.b) {
+    if k < n && !(ring && on_vertex == Some(0)) {
         let _ = emit(tail.b, at(k), bearing(azimuth));
     }
 }
@@ -1924,15 +1925,18 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     // Always estimated (`true` above), as the budget holds on every platform; a missing estimate
     // would count as over it, never as needing nothing.
     let total = |need: Option<u64>| need.unwrap_or(u64::MAX).saturating_add(segments_bytes);
-    let (mut need, mut exact) = (total(bound_need), false);
-    if (need > ALONG_BUDGET || !web_has_room(need)) && segments_bytes <= ALONG_BUDGET {
+    let mut need = total(bound_need);
+    let mut room = web_has_room(need);
+    if (need > ALONG_BUDGET || !room) && segments_bytes <= ALONG_BUDGET {
         // Before refusing for what the bound counts, count the points exactly: only a run that
-        // doesn't fit by its bound solves its segments twice, and the count stops once it's sure
-        // not to fit either, so one that can't costs no more.
+        // doesn't fit by its bound (in the browser, by the room it has too) solves its segments
+        // twice, and the count stops once it's sure not to fit the budget either, so one that
+        // can't costs no more.
         let (en, eneed) = count(true, ALONG_BUDGET - segments_bytes, &mut longest);
         let eneed = total(eneed);
         if eneed <= ALONG_BUDGET {
-            (n, need, exact) = (en, eneed, true);
+            (n, need) = (en, eneed);
+            room = web_has_room(need);
         }
     }
     // One line with tens of millions of vertices can be what doesn't fit.
@@ -1941,17 +1945,14 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     } else {
         "use a larger distance, or select fewer features"
     };
+    // Over the budget, the count is still the bound's: an exact one that fits replaced it.
     if need > ALONG_BUDGET {
-        let points = match (n, exact) {
-            (usize::MAX, _) => "more points than it can count".to_string(),
-            (n, true) => format!("{n} points"),
-            (n, false) => format!("up to {n} points"),
-        };
+        let points = if n == usize::MAX { "more points than it can count".to_string() } else { format!("up to {n} points") };
         let memory =
             if need == u64::MAX { "more memory than it can count".to_string() } else { format!("about {} MiB", need.div_ceil(1 << 20)) };
         return Err(format!("{TOOL}: {points} would need {memory}, more than the {} GiB it may use: {advice}", ALONG_BUDGET >> 30));
     }
-    check_room(TOOL, n, need, advice, web_has_room)?;
+    check_room(TOOL, n, need, advice, |_| room)?;
     let no_memory = |e: TryReserveError| Stopped::Memory(e).message(TOOL, n);
     let mut list = PointList::new(n).map_err(no_memory)?;
     let mut segs = Vec::new();
@@ -1980,6 +1981,8 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             });
         });
     }
+    // Freed first, so its room is there if the points move into a list of their own size.
+    drop(segs);
     out.features = list.finish().map_err(|e| e.message(TOOL, n))?.into();
     let written = out.features.len();
     result(out, format!("{TOOL}: {written} points"))
@@ -4151,17 +4154,83 @@ mod tests {
         let c = Coord::new;
         // Latitudes past the poles, longitudes at the ends of f64, a pole and antipodes: walked
         // without a panic, every point on the Earth (a vertex past a pole at the pole, where the
-        // walk measured it).
+        // walk measured it). The line ends at -95° (the South Pole), not where it starts (the
+        // North Pole), so it stays open and its end gets a point of its own; the same vertices
+        // as a polygon's ring are walked round to the start.
         let line = vec![c(0.0, 1e300), c(1e308, 0.0), c(-1e308, 90.0), c(0.0, -90.0), c(180.0, 0.0), c(0.0, -95.0)];
-        let m = along_inputs(vec![Geometry::Line(vec![line])]);
+        let ring = vec![c(0.0, 1e300), c(1e308, 0.0), c(-1e308, 90.0), c(0.0, -90.0), c(180.0, 0.0), c(f64::NAN, 0.0)];
+        let mut polys = Dataset::new("polys", GeometryType::Polygon, vec![]);
+        polys.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+        let mut m = along_inputs(vec![Geometry::Line(vec![line])]);
+        m.0.insert("polys".to_string(), polys);
+        let on_earth = |v: &Dataset| {
+            assert!(!v.features.is_empty());
+            for k in 0..v.features.len() {
+                let (p, d, angle) = place(v, k);
+                let on_earth = (-180.0..=180.0).contains(&p.x) && (-90.0..=90.0).contains(&p.y);
+                assert!(on_earth && d.is_finite() && (0.0..360.0).contains(&angle), "{k}: {p:?} {d} {angle}");
+            }
+        };
         let v = along(&m, serde_json::json!({"input": "lines", "distance": 1000, "includeEnd": true}));
-        assert!(!v.features.is_empty());
-        for k in 0..v.features.len() {
-            let (p, d, angle) = place(&v, k);
-            let on_earth = (-180.0..=180.0).contains(&p.x) && (-90.0..=90.0).contains(&p.y);
-            assert!(on_earth && d.is_finite() && (0.0..360.0).contains(&angle), "{k}: {p:?} {d} {angle}");
-        }
+        on_earth(&v);
         assert_eq!((place(&v, 0).0.y, place(&v, v.features.len() - 1).0.y), (90.0, -90.0));
+        let v = along(&m, serde_json::json!({"input": "polys", "distance": 1000, "includeEnd": true}));
+        on_earth(&v);
+        assert_eq!(place(&v, 0).0.y, 90.0);
+    }
+
+    #[test]
+    fn points_along_lines_makes_a_point_each_time_a_line_passes_a_place() {
+        // Out along the equator and back (A to B to A), then north (to C): a step of two legs
+        // lands on A going out and on A again coming back, both points. Out to B and on to D, then
+        // back to B (a lollipop's stick): from a leg in, every two legs lands on B both times.
+        let c = Coord::new;
+        let leg = 6_378_137.0 * 0.01f64.to_radians();
+        let (a, b, d) = (c(0.0, 0.0), c(0.01, 0.0), c(0.02, 0.0));
+        let m = along_inputs(vec![Geometry::Line(vec![vec![a, b, a, c(0.0, 0.01)]]), Geometry::Line(vec![vec![a, b, d, b]])]);
+        // Feature `fid`'s points: where, and how far along.
+        let of = |v: &Dataset, fid: i64| -> Vec<(Coord, f64)> {
+            let at = v.field_index("orig_fid").unwrap();
+            (0..v.features.len()).filter(|&k| *v.value(k, at) == Value::Int(fid)).map(|k| (place(v, k).0, place(v, k).1)).collect()
+        };
+        let first = of(&along(&m, serde_json::json!({"input": "lines", "distance": 2.0 * leg, "units": "Meters"})), 1);
+        assert!(first.len() == 2 && first[1].0 == a && (first[1].1 - 2.0 * leg).abs() < 1e-6, "{first:?}");
+        let second = of(&along(&m, serde_json::json!({"input": "lines", "distance": 2.0 * leg, "startOffset": leg, "units": "Meters"})), 2);
+        assert!(second.len() == 2 && second.iter().all(|(p, _)| *p == b) && (second[1].1 - 3.0 * leg).abs() < 1e-6, "{second:?}");
+    }
+
+    #[test]
+    fn points_along_lines_walks_a_parallel_round_the_world_as_a_ring() {
+        // Written from -180° to 180° at 60°N in four equal edges, it ends where it starts: a ring,
+        // so a step of one edge puts a point on each vertex, the last one once, end or no end.
+        let c = Coord::new;
+        let line = vec![c(-180.0, 60.0), c(-90.0, 60.0), c(0.0, 60.0), c(90.0, 60.0), c(180.0, 60.0)];
+        let edge = rustgis_geom::wgs84_inverse(c(-180.0, 60.0), c(-90.0, 60.0)).0;
+        let m = along_inputs(vec![Geometry::Line(vec![line])]);
+        let v = along(&m, serde_json::json!({"input": "lines", "distance": edge, "units": "Meters", "includeEnd": true}));
+        let xs: Vec<f64> = (0..v.features.len()).map(|k| place(&v, k).0.x).collect();
+        assert_eq!(xs, [-180.0, -90.0, 0.0, 90.0]);
+    }
+
+    #[test]
+    fn points_along_lines_walks_a_ring_offset_a_little_once_round() {
+        // A ring some 10,000 km round, a quarter of it a step: from its first vertex, or 5 mm on
+        // (within the walk's tolerance of it, a centimeter), four points, one of them there, never
+        // more than the list is sized for.
+        let c = Coord::new;
+        let ring = vec![vec![c(0.0, 0.0), c(30.0, 0.0), c(30.0, 30.0), c(0.0, 30.0)]];
+        let segs: Vec<Segment> = segments(&ring, true).collect();
+        let len: f64 = segs.iter().map(|s| s.len).sum();
+        for start in [0.0, 0.005] {
+            let spacing = Spacing { step: len / 4.0, start, end: 0.0, with_end: true };
+            let mut at = Vec::new();
+            walk_line(&segs, true, spacing, |p, _, _| {
+                at.push(p);
+                ControlFlow::Continue(())
+            });
+            let first = at.iter().filter(|p| rustgis_geom::wgs84_inverse(**p, c(0.0, 0.0)).0 < 0.01).count();
+            assert!(at.len() == 4 && at.len() <= spacing.most(len, true) && first == 1, "{start}: {at:?}");
+        }
     }
 
     #[test]

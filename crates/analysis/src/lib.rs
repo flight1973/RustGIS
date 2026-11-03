@@ -387,13 +387,13 @@ fn shown(v: &Value) -> String {
 /// `"Meters"`). Any other value is an error naming the choices: a tool never guesses what an
 /// unknown one meant (#406). A blank value is the declared default.
 fn choice(spec: &ToolSpec, ps: &ParamSpec, choices: &[&str], v: &Value) -> Result<Value, String> {
-    let given = match v {
+    let given: std::borrow::Cow<'_, str> = match v {
         Value::Null => return Ok(Value::Null),
         // Blank: the declared default, as when it's left out.
         Value::String(s) if s.trim().is_empty() => return Ok(serde_json::from_str(ps.default).unwrap_or_else(|_| v.clone())),
-        Value::String(s) => s.trim().to_string(),
-        Value::Number(_) | Value::Bool(_) => v.to_string(),
-        _ => String::new(),
+        Value::String(s) => s.trim().into(),
+        Value::Number(_) | Value::Bool(_) => v.to_string().into(),
+        _ => "".into(),
     };
     match choices.iter().find(|c| c.eq_ignore_ascii_case(&given)) {
         Some(c) => Ok(Value::String((*c).to_string())),
