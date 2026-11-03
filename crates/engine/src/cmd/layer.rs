@@ -4,7 +4,9 @@ use std::path::Path;
 
 use rustgis_data::{GeometryType, photo};
 use rustgis_map::symbology::{ClassRef, ClassStyle, LABEL_SIZE, MAX_STROKES};
-use rustgis_map::{ClassMethod, Glyph, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, Placements, Ramp, Renderer, Rgba};
+use rustgis_map::{
+    ClassMethod, Glyph, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, NoFill, Placements, Ramp, Renderer, Rgba,
+};
 use serde_json::{Value, json};
 
 use super::{b, f, need_feature_layer, need_layer, ps, uint};
@@ -41,7 +43,7 @@ pub fn commands() -> Vec<C> {
             r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true zooms to what was added; false keeps the view of a GeoParquet or FlatGeobuf read in place (zoomed to only when the map was empty)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place (an address without a file name is read in place when its first bytes are a cloud-optimised GeoTIFF)", "cog"?: "bool: the address is a cloud-optimised GeoTIFF whatever its name says (the app's probe found it so)", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on"}"#,
         ),
         C::new("layer.addDownload", "Add Downloaded Data", "Home › Add", add_download)
-            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes and paging are checked), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error), "geolibreProject"?: bool (internal: downloaded project JSON), "geolibreLayer"?: {"token", "record"} (internal: reserved imported layer and its saved style), "geolibreZarr"?: bool (internal: an imported Zarr slice as GeoTIFF)}"#),
+            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes and paging are checked), "bounds"?: [west, south, east, north] (with service: the layer's longitude/latitude bounds from its capabilities, which its axes are checked against; without bounds they are left as they come; ignored without service), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error), "geolibreProject"?: bool (internal: downloaded project JSON), "geolibreLayer"?: {"token", "record"} (internal: reserved imported layer and its saved style), "geolibreZarr"?: bool (internal: an imported Zarr slice as GeoTIFF)}"#),
         C::new("layer.addEncodedPolyline", "Add Encoded Polyline", "Home › Add", add_encoded_polyline).params(
             r#"{"polyline": "encoded polyline text" | [texts] (one line each), "precision"?: 5 (Google) | 6 (OSRM, Valhalla), "name"?: text}"#,
         ),
@@ -59,11 +61,38 @@ pub fn commands() -> Vec<C> {
             if n.is_empty() {
                 return Err("name is required".into());
             }
-            let old = s.map().layer(s.layer_id(p)?).map(|l| l.name.clone()).unwrap_or_default();
+            let id = s.layer_id(p)?;
+            let old = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
+            // The terrain keeps its DEM by name: did it name this layer, and was the name its own?
+            let on_old = terrain_dem(s).is_some_and(|d| d.eq_ignore_ascii_case(&old));
+            let old_was_shared = named_layers(s, &old) > 1;
             let r = with(s, p, |l| {
                 l.name = n.clone();
                 l.dataset.name = n.clone();
             })?;
+            // A rename to the same name (case aside) changes nothing the terrain reads.
+            if let Some(dem) = terrain_dem(s).filter(|_| !n.eq_ignore_ascii_case(&old)) {
+                if on_old && old_was_shared {
+                    // Two layers had the DEM's name: which one the terrain was on can't be told.
+                    s.map_mut().view.terrain = None;
+                    s.notify(format!("Terrain turned off: its name '{dem}' was shared by two layers, so which one gave the heights can't be told; turn Terrain on again from the layer you want"), false);
+                } else if on_old && named_layers(s, &n) == 1 {
+                    // The DEM itself, renamed to a name of its own: the terrain follows it.
+                    set_terrain_dem(s, n.clone());
+                } else if on_old || n.eq_ignore_ascii_case(&dem) {
+                    // The DEM renamed onto another layer's name, or another layer given the DEM's:
+                    // the first layer of that name would give the heights.
+                    let shared = if on_old { n.clone() } else { dem };
+                    let said = if named_layers(s, &shared) > 1 {
+                        format!("Terrain turned off: two layers are now called '{shared}'; rename one and turn Terrain on again")
+                    } else {
+                        // The DEM was gone (removed), and this layer took its name.
+                        format!("Terrain turned off: its DEM '{shared}' was missing, and a layer now has that name; turn Terrain on again to use it")
+                    };
+                    s.map_mut().view.terrain = None;
+                    s.notify(said, false);
+                }
+            }
             // Layers masked by this one follow the new name.
             for l in &mut s.map_mut().layers {
                 if l.mask.as_deref().is_some_and(|m| m.eq_ignore_ascii_case(&old)) {
@@ -109,14 +138,18 @@ pub fn commands() -> Vec<C> {
         .when(need_layer),
         C::new("layer.symbology", "Symbology", "Style › Drawing", symbology)
             .when(need_feature_layer)
-            .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile"|"geometricInterval"|"standardDeviation"|"arithmeticProgression"|"headTailBreaks"|"manual", "breaks"?: [numbers] (manual: the classes' upper bounds, closed by the field's largest value), "ramp"?: string}"#),
+            .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "expression"?: text|null (unique: class by this expression's values instead of a field; blank or null: by a field; with neither key, Unique Values keep the layer's expression), "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile"|"geometricInterval"|"standardDeviation"|"arithmeticProgression"|"headTailBreaks"|"manual", "breaks"?: [numbers] (manual: the classes' upper bounds, closed by the field's largest value), "ramp"?: string}"#),
         C::new("layer.ramp", "Color Scheme", "Style › Drawing", |s, p| {
             let r = s.ramp(s_req(p, "ramp")?)?;
             with(s, p, |l| match &mut l.raster {
                 Some(rl) => rl.style.set_ramp(r),
                 None => {
                     let g = l.geometry_type();
-                    l.renderer.apply_ramp(r, g)
+                    l.renderer.apply_ramp(r, g);
+                    // New colours after No Fill are drawn (#1301).
+                    if take_no_fill(l) == Some(NoFill::Symbols) {
+                        l.renderer.map_symbols(show_fill);
+                    }
                 }
             })
         }).params(r#"{"layer"?, "ramp": colour ramp name}"#)
@@ -149,15 +182,36 @@ pub fn commands() -> Vec<C> {
                     Renderer::Proportional { base, .. } => *base = fill(base),
                     other => *other = Renderer::Single(fill(&other.base_symbol())),
                 }
+                // A fill colour after No Fill is drawn, unless it is transparent itself (#1301).
+                take_no_fill(l);
             })
         })
         .when(need_feature_layer)
         .params(r##"{"layer"?, "color": "#RRGGBB"|"#RRGGBBAA" (the fill; a polygon's outline is left as it is, set it with layer.outline)}"##),
         C::new("layer.noFill", "No Fill", "Style › Drawing", |s, p| {
-            with(s, p, |l| l.renderer.map_symbols(|sym| sym.fill = sym.fill.with_alpha(0)))
+            with(s, p, |l| {
+                if l.source.is_some() || l.has_geometry(GeometryType::Point) || l.has_geometry(GeometryType::Polyline) {
+                    // Symbols are shared by geometry families. A polygon-only fill override
+                    // leaves point markers and line strokes (including their markers) intact.
+                    // A streamed layer may have other families outside the loaded window.
+                    l.no_fill = Some(NoFill::Override);
+                    l.fill_layers = vec![no_fill_override()];
+                    match &mut l.renderer {
+                        Renderer::Unique { class_fills, other_fills, .. } => {
+                            class_fills.clear();
+                            other_fills.clear();
+                        }
+                        Renderer::Graduated { class_fills, .. } => class_fills.clear(),
+                        _ => {}
+                    }
+                } else {
+                    l.renderer.map_symbols(|sym| sym.fill = sym.fill.with_alpha(0));
+                    l.no_fill = Some(NoFill::Symbols);
+                }
+            })
         })
-        .when(need_polygons)
-        .params(r#"{"layer"?: name|id (default: the active polygon layer; removes every symbol's fill, keeping its RGB and outline)}"#),
+        .when(need_polygon_features)
+        .params(r#"{"layer"?: name|id (default: the active layer containing polygons; hides polygon fills, keeping outlines and point/line symbols)}"#),
         C::new("layer.outline", "Outline", "Style › Drawing", |s, p| {
             let c = s.get_color(p, "color")?;
             let w = f(p, "width").map(|w| w.clamp(0.0, 20.0) as f32);
@@ -180,9 +234,9 @@ pub fn commands() -> Vec<C> {
                 r##"{"layer"?, "strokes": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the renderer's line colour), "width"?: points|null (null: the renderer's width), "offset"?: points (positive: right of the line's direction, negative: left), "cap"?: "round"|"flat"|"square", "join"?: "round"|"miter"|"bevel", "level"?: 0..255|null (with layer.strokeLevels: the level it draws at; null: its place in the stack), "dash"?: [points, …]|null (dash, gap, … in turn, at most 8; null: solid), "markers"?: {"mark"?: "circle"|"square"|"triangle"|"diamond"|"star"|"character"|"hash" (a mark across the line), "char"?: text (a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "size"?: points (a marker's size, a hash mark's length; default 4), "at"?: "interval"|"vertices"|"innerVertices"|"first"|"last"|"middle"|"segmentMiddles" or a list of them (default "interval"), "interval"?: points (default 12), "offsetAlong"?: points (from the start, back from the end, on from the middle), "rotate"?: bool (turned with the line; default true), "averageAngle"?: points (the stretch of line a marker at an interval turns with; 0: its segment), "angle"?: degrees clockwise (a hash mark at 0 crosses the line square), "outline"?: "#RRGGBB"|"#RRGGBBAA" (the markers' outline, as wide as the stroke)}|null (markers or hash marks along the line in the stroke's colour, instead of a line; cap, join and dash don't apply)}] (drawn bottom first; [] goes back to the single stroke, or for a class to the layer's strokes; on a point layer they are its marks: each stroke's markers drawn at the point in place of the symbol's, "offsetAlong" shifting a mark right and "offset" down, both turned with its "angle", and "rotate" turning it by layer.markerRotation's field), "value"?: text|number (a Unique Values class's own strokes), "index"?: number (a Graduated Colors class's, 0 = the lowest), "other"?: true (Unique Values' <all other values>)}"##,
             ),
         C::new("layer.fillLayers", "Fill Layers", "Style › Drawing", fill_layers)
-            .when(need_polygons)
+            .when(need_polygon_features)
             .params(
-                r##"{"layer"?, "value"?|"index"?|"other"?: a class of Unique Values (its value, or other: true) or Graduated Colors (its index) to set its own fills (none: the layer's), "fills": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the feature's fill colour, so the fills follow the classes), "pattern"?: "solid" (default)|"hatch" (parallel lines)|"dots" (markers on a grid), "angle"?: degrees anticlockwise from east (hatch), "spacing"?: points between lines (hatch, 1 to 500; default 8) or points across and down between markers, a number or [across, down] (dots), "width"?: a hatch line's width in points (0 to 50; default 1), "offset"?: points across the lines (hatch) or [across, down] (dots), "marker"?: "circle"|"square"|"triangle"|"diamond"|"star" (dots), "char"?: text (dots: a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "size"?: a marker's size in points (default 3), "outline"?: a marker's outline colour or null, "outlineWidth"?: points, "displacement"?: [across, down] points every other row and column are shifted by (dots)}] (bottom first, at most 8; [] for the symbol's single fill; the outline is drawn over them)}"##,
+                r##"{"layer"?, "value"?|"index"?|"other"?: a class of Unique Values (its value, or other: true) or Graduated Colors (its index) to set its own fills (none: the layer's), "fills": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the feature's fill colour, so the fills follow the classes), "pattern"?: "solid" (default)|"hatch" (parallel lines)|"dots" (markers on a grid)|"gradient" (from color to color2 across the feature)|"shapeburst" (from color at the edge to color2 inside), "angle"?: degrees anticlockwise from east (hatch), "spacing"?: points between lines (hatch, 1 to 500; default 8) or points across and down between markers, a number or [across, down] (dots), "width"?: a hatch line's width in points (0 to 50; default 1), "offset"?: points across the lines (hatch) or [across, down] (dots), "marker"?: "circle"|"square"|"triangle"|"diamond"|"star" (dots), "char"?: text (dots: a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "size"?: a marker's size in points (default 3), "outline"?: a marker's outline colour or null, "outlineWidth"?: points, "displacement"?: [across, down] points every other row and column are shifted by (dots), "color2"?: "#RRGGBB"|"#RRGGBBAA" (gradient, shapeburst: the second colour; default white), "stops"?: [[0..1, "#RRGGBB"|"#RRGGBBAA"], …] (gradient, shapeburst: colours between the two, at most 16), "discrete"?: bool (each colour held until the next stop), "shape"?: "linear" (default)|"radial"|"conical" (gradient), "from"?: [across, down]|"centroid" (gradient: where color is, 0..1 in the feature's box; default [0.5, 0], the top middle), "to"?: [across, down]|"centroid" (where color2 is; default [0.5, 1]), "spread"?: "pad" (default)|"reflect"|"repeat" (gradient: past its points), "angle"?: degrees anticlockwise (gradient: turned round its box's middle), "inView"?: bool (gradient: from and to in the map view's box, not the feature's), "distance"?: points|null (shapeburst: how deep it shades; null or none: to the point deepest inside), "blur"?: 0..17 (shapeburst: pixels), "ignoreRings"?: bool (shapeburst: holes' edges left out)}] (bottom first, at most 8; [] for the symbol's single fill; the outline is drawn over them)}"##,
             ),
         C::new("layer.markerRotation", "Marker Rotation", "Style › Drawing", |s, p| {
             let field = match p.get("field") {
@@ -212,6 +266,9 @@ pub fn commands() -> Vec<C> {
         })
         .when(need_points)
         .params(r#"{"layer"?, "field": numeric field name|null (each point's marker turned by the angle in it, in degrees; null: not turned), "counterclockwise"?: bool (the angles run counterclockwise, as in mathematics; default clockwise, as on a compass)}"#),
+        C::new("layer.symbolBy", "Symbol by Expression", "Style › Drawing", symbol_by)
+            .when(need_feature_layer)
+            .params(r#"{"layer"?, "size"?: expression|null (a point's marker size in points), "fill"?: expression|null (the fill colour: '#RRGGBB', a CSS colour name or 'r,g,b[,a]' as color_rgb gives it), "stroke"?: expression|null (the outline colour, a line's colour), "strokeWidth"?: expression|null (the outline's width in points, a line's width), "angle"?: expression|null (point layers: each marker turned by it, in degrees clockwise, in place of layer.markerRotation's field)} (each expression in the language of queries, per feature, @map_scale the map's scale; a key left out keeps its expression, null or "" removes it; where an expression gives null the symbol's own value is drawn)"#),
         C::new("layer.strokeLevels", "Stroke Levels", "Style › Drawing", |s, p| {
             let on = b(p, "on").ok_or("on is true or false")?;
             let id = s.layer_id(p)?;
@@ -488,12 +545,12 @@ impl Session {
     }
 }
 
-/// A polygon layer is active.
-fn need_polygons(s: &Session) -> Option<&'static str> {
+/// Polygon styling also applies to the polygon features of a mixed layer.
+fn need_polygon_features(s: &Session) -> Option<&'static str> {
     match s.active_layer.and_then(|id| s.map().layer(id)) {
-        Some(l) if !l.is_raster() && l.geometry_type() == GeometryType::Polygon && !l.graphics => None,
-        Some(_) => Some("this works on polygon layers"),
-        None => Some("select a polygon layer in the Layers pane first"),
+        Some(l) if !l.is_raster() && l.has_geometry(GeometryType::Polygon) && !l.graphics => None,
+        Some(_) => Some("this works on layers containing polygons"),
+        None => Some("select a layer containing polygons in the Layers pane first"),
     }
 }
 
@@ -520,6 +577,44 @@ fn need_lines(s: &Session) -> Option<&'static str> {
         Some(_) => Some("this works on line layers"),
         None => Some("select a layer in the Layers pane first"),
     }
+}
+
+/// `layer.symbolBy`: sets (or removes) the expressions a layer's symbol takes per feature, each
+/// checked against its fields first.
+fn symbol_by(s: &mut Session, p: &Value) -> CmdResult {
+    const KEYS: [&str; 5] = ["size", "fill", "stroke", "strokeWidth", "angle"];
+    let id = s.layer_id(p)?;
+    let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+    if l.is_raster() || l.graphics {
+        return Err("this works on feature layers".into());
+    }
+    let mut by = l.symbol_by.clone();
+    for key in KEYS {
+        let text = match p.get(key) {
+            None => continue,
+            Some(Value::Null) => None,
+            Some(Value::String(t)) if t.trim().is_empty() => None,
+            Some(Value::String(t)) => Some(t.clone()),
+            Some(_) => return Err(format!("{key} is an expression's text, or null for none")),
+        };
+        if let Some(t) = &text {
+            if matches!(key, "size" | "angle") && l.geometry_type() != GeometryType::Point {
+                return Err(format!("{key} works on point layers"));
+            }
+            rustgis_data::query::parse(t, &l.dataset).map_err(|e| format!("{key}: {e}"))?;
+        }
+        let slot = match key {
+            "size" => &mut by.size,
+            "fill" => &mut by.fill,
+            "stroke" => &mut by.stroke,
+            "strokeWidth" => &mut by.stroke_width,
+            _ => &mut by.angle,
+        };
+        *slot = text;
+    }
+    l.symbol_by = by;
+    let b = &l.symbol_by;
+    Ok(json!({"size": b.size, "fill": b.fill, "stroke": b.stroke, "strokeWidth": b.stroke_width, "angle": b.angle}))
 }
 
 /// `layer.lineStrokes`: sets a line layer's stacked strokes, or one class's own.
@@ -613,10 +708,53 @@ fn line_strokes(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"strokes": n}))
 }
 
+/// The alpha a polygon fill gets back when No Fill is turned off: a new polygon symbol's.
+fn shown_fill_alpha() -> u8 {
+    rustgis_map::Symbol::default_for(GeometryType::Polygon, 0).fill.a()
+}
+
+/// The one transparent fill No Fill lays over a layer's symbols.
+fn no_fill_override() -> rustgis_map::fills::FillLayer {
+    rustgis_map::fills::FillLayer { color: Some(Rgba::rgb(0, 0, 0).with_alpha(0)), ..Default::default() }
+}
+
+/// Turns No Fill off, dropping its override if it laid one, and says how it was on. The caller
+/// shows the symbols' fills on the other path, where only it knows which.
+fn take_no_fill(l: &mut rustgis_map::Layer) -> Option<NoFill> {
+    let hidden = l.no_fill.take();
+    if hidden == Some(NoFill::Override) && is_no_fill_override(&l.fill_layers) {
+        l.fill_layers.clear();
+    }
+    hidden
+}
+
+/// Whether the fills are No Fill's own, rather than a transparent fill chosen with `layer.fillLayers`.
+fn is_no_fill_override(fills: &[rustgis_map::fills::FillLayer]) -> bool {
+    let o = no_fill_override();
+    matches!(fills, [f] if matches!(f.pattern, rustgis_map::fills::FillPattern::Solid) && f.color == o.color)
+}
+
+/// The symbol of one class, for its own fills.
+fn class_symbol<'a>(r: &'a mut Renderer, class: &ClassRef) -> Option<&'a mut rustgis_map::Symbol> {
+    match (r, class) {
+        (Renderer::Unique { classes, .. }, ClassRef::Value(v)) => classes.iter_mut().find(|(k, _)| k == v).map(|(_, s)| s),
+        (Renderer::Unique { other, .. }, ClassRef::Other) => Some(other),
+        (Renderer::Graduated { symbols, .. }, ClassRef::Index(i)) => symbols.get_mut(*i),
+        _ => None,
+    }
+}
+
+/// A symbol's fill No Fill made transparent, shown again in its own colour.
+fn show_fill(sym: &mut rustgis_map::Symbol) {
+    if sym.fill.a() == 0 {
+        sym.fill = sym.fill.with_alpha(shown_fill_alpha());
+    }
+}
+
 /// `layer.fillLayers`: a polygon layer's stacked fills (or a class's own, with `value`, `index`
 /// or `other`), bottom first; `[]` goes back to the symbol's single fill.
 fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
-    use rustgis_map::fills::{FillLayer, FillPattern, MAX_FILLS};
+    use rustgis_map::fills::{FillLayer, FillPattern, GradientPoint, GradientShape, MAX_FILLS, Spread, Stop, Stops};
     let class = class_ref(p)?;
     let list = p.get("fills").and_then(Value::as_array).ok_or("fills is a list of fills ([] for the symbol's single fill)")?;
     if list.len() > MAX_FILLS {
@@ -690,19 +828,131 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
                     offset: pair("offset", [0.0, 0.0])?,
                 }
             }
-            Some(_) => return Err(format!("fill {n}: pattern is \"solid\", \"hatch\" or \"dots\"")),
+            Some(Some(kind @ ("gradient" | "shapeburst"))) => {
+                let color2 = hex("color2")?.unwrap_or(Rgba::rgb(255, 255, 255));
+                let stops = match o.get("stops") {
+                    None | Some(Value::Null) => Stops::default(),
+                    Some(Value::Array(a)) if a.len() <= rustgis_map::fills::MAX_STOPS => {
+                        let mut list = Vec::with_capacity(a.len());
+                        for st in a {
+                            let bad = || format!("fill {n}: each stop is [0..1, \"#RRGGBB\" or \"#RRGGBBAA\"]");
+                            let [at, c] = st.as_array().map(Vec::as_slice).unwrap_or_default() else { return Err(bad()) };
+                            let at = number(at).ok_or_else(bad)?;
+                            let color = c.as_str().and_then(Rgba::from_hex).ok_or_else(bad)?;
+                            list.push(Stop { at, color });
+                        }
+                        Stops::new(list)
+                    }
+                    Some(_) => {
+                        return Err(format!("fill {n}: stops is a list of at most {} [0..1, \"#RRGGBB\"]", rustgis_map::fills::MAX_STOPS));
+                    }
+                };
+                let flag = |k: &str| -> Result<bool, String> {
+                    match o.get(k) {
+                        None | Some(Value::Null) => Ok(false),
+                        Some(Value::Bool(b)) => Ok(*b),
+                        Some(_) => Err(format!("fill {n}: {k} is true or false")),
+                    }
+                };
+                let discrete = flag("discrete")?;
+                if kind == "shapeburst" {
+                    let blur = num("blur", 0.0)?;
+                    if !(0.0..=f32::from(rustgis_map::fills::MAX_BURST_BLUR)).contains(&blur) {
+                        return Err(format!("fill {n}: blur is 0 to {}", rustgis_map::fills::MAX_BURST_BLUR));
+                    }
+                    let distance = match o.get("distance") {
+                        None | Some(Value::Null) => None,
+                        Some(v) => Some(
+                            number(v).filter(|d| *d >= 0.0).ok_or_else(|| format!("fill {n}: distance is points (0 or more) or null"))?,
+                        ),
+                    };
+                    FillPattern::Shapeburst {
+                        color2,
+                        stops,
+                        discrete,
+                        distance,
+                        blur: blur.round() as u8,
+                        ignore_rings: flag("ignoreRings")?,
+                    }
+                } else {
+                    let point = |k: &str, default: [f32; 2]| -> Result<GradientPoint, String> {
+                        match o.get(k) {
+                            None | Some(Value::Null) => Ok(GradientPoint::At(default)),
+                            Some(Value::String(c)) if c.eq_ignore_ascii_case("centroid") => Ok(GradientPoint::CENTROID),
+                            Some(_) => pair(k, default)
+                                .map(GradientPoint::At)
+                                .map_err(|_| format!("fill {n}: {k} is [across, down] (0..1 in the box) or \"centroid\"")),
+                        }
+                    };
+                    let word = |k: &str, words: &[&str]| -> Result<usize, String> {
+                        match o.get(k) {
+                            None | Some(Value::Null) => Ok(0),
+                            Some(Value::String(w)) => words.iter().position(|x| x.eq_ignore_ascii_case(w.trim())).ok_or_else(|| {
+                                format!("fill {n}: {k} is {}", words.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(", "))
+                            }),
+                            Some(_) => {
+                                Err(format!("fill {n}: {k} is {}", words.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(", ")))
+                            }
+                        }
+                    };
+                    let shape = [GradientShape::Linear, GradientShape::Radial, GradientShape::Conical]
+                        .get(word("shape", &["linear", "radial", "conical"])?)
+                        .copied()
+                        .unwrap_or_default();
+                    let spread = [Spread::Pad, Spread::Reflect, Spread::Repeat]
+                        .get(word("spread", &["pad", "reflect", "repeat"])?)
+                        .copied()
+                        .unwrap_or_default();
+                    FillPattern::Gradient {
+                        shape,
+                        color2,
+                        stops,
+                        discrete,
+                        from: point("from", [0.5, 0.0])?,
+                        to: point("to", [0.5, 1.0])?,
+                        spread,
+                        angle: num("angle", 0.0)?,
+                        in_view: flag("inView")?,
+                    }
+                }
+            }
+            Some(_) => return Err(format!("fill {n}: pattern is \"solid\", \"hatch\", \"dots\", \"gradient\" or \"shapeburst\"")),
         };
         fills.push(FillLayer { color: hex("color")?, pattern }.clamped());
     }
     let id = s.layer_id(p)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-    if l.geometry_type() != GeometryType::Polygon || l.graphics || l.is_raster() {
-        return Err("this works on polygon layers".into());
+    if !l.has_geometry(GeometryType::Polygon) || l.graphics || l.is_raster() {
+        return Err("this works on layers containing polygons".into());
     }
+    // A fill in the symbol's colour, or the symbol's own fill ([]), asked for after No Fill: the
+    // symbols' fills are shown again, or they would draw nothing (#1301). A class's fills show
+    // that class's alone.
+    let in_symbol_colour = fills.is_empty() || fills.iter().any(|f| f.color.is_none());
+    let hidden = l.no_fill;
     let count = fills.len();
     match class {
-        Some(c) => l.renderer.set_class_fills(&c, fills)?,
-        None => l.fill_layers = fills,
+        Some(c) => {
+            // Without fills of its own the class takes the layer's, which No Fill's override
+            // hides: a solid fill in the symbol's colour instead.
+            let fills =
+                if fills.is_empty() && hidden == Some(NoFill::Override) { vec![rustgis_map::fills::FillLayer::default()] } else { fills };
+            l.renderer.set_class_fills(&c, fills)?;
+            if in_symbol_colour && hidden == Some(NoFill::Symbols) {
+                class_symbol(&mut l.renderer, &c).into_iter().for_each(show_fill);
+            }
+        }
+        None => {
+            if in_symbol_colour && hidden == Some(NoFill::Symbols) {
+                l.renderer.map_symbols(show_fill);
+                l.no_fill = None;
+            }
+            // Fills set here replace No Fill's own, even transparent ones.
+            if hidden == Some(NoFill::Override) {
+                l.no_fill = None;
+            }
+            l.fill_layers = fills;
+        }
     }
     Ok(json!({"fills": count}))
 }
@@ -1372,6 +1622,7 @@ fn apply_styles(s: &mut Session, id: u32, styles: &[(String, rustgis_data::kml::
         other_strokes: Vec::new(),
         class_fills: Default::default(),
         other_fills: Vec::new(),
+        expression: None,
     };
 }
 
@@ -1578,8 +1829,12 @@ fn add_source_with(
                 s.notify(format!("{unique}: {n}"), false);
             }
             let id = s.map_mut().add_streamed(unique.clone(), layer);
-            if let (Some(r), Some(l)) = (style.clone(), s.map_mut().layer_mut(id)) {
-                l.renderer = r;
+            if let Some(l) = s.map_mut().layer_mut(id) {
+                // Kept with the layer, as a materialized read keeps it (see Dataset::zm_dropped).
+                l.dataset.zm_dropped = info.zm_dropped;
+                if let Some(r) = style.clone() {
+                    l.renderer = r;
+                }
             }
             s.active_layer = Some(id);
             ids.push(id);
@@ -2448,12 +2703,15 @@ pub fn columns_of(name: &str, bytes: &[u8], p: &Value) -> CmdResult {
     } else if is_delimited_name(name) {
         let bytes = bytes.get(..COLUMNS_PREFIX).unwrap_or(bytes);
         let text = match std::str::from_utf8(bytes) {
-            Ok(text) => text,
+            Ok(text) => text.into(),
             // The part read may end inside a character.
-            Err(e) if e.error_len().is_none() => std::str::from_utf8(bytes.get(..e.valid_up_to()).unwrap_or_default()).unwrap_or_default(),
-            Err(_) => return Err(format!("{name} is not UTF-8 text")),
+            Err(e) if e.error_len().is_none() => {
+                std::str::from_utf8(bytes.get(..e.valid_up_to()).unwrap_or_default()).unwrap_or_default().into()
+            }
+            // Another encoding (Latin-1, UTF-16), as reading the file takes it.
+            Err(_) => rustgis_data::io::delimited_text(name, bytes).map_err(err)?.0,
         };
-        rustgis_data::io::csv_columns(text, parse_delimiter(ps(p, "delimiter"))?).map_err(err)?
+        rustgis_data::io::csv_columns(&text, parse_delimiter(ps(p, "delimiter"))?).map_err(err)?
     } else {
         return Err(format!("{name}: not delimited text (CSV, TSV, TXT) or a spreadsheet"));
     };
@@ -2484,9 +2742,11 @@ fn read_delimited(
     }
     let Some(opts) = csv_options(p)? else { return Ok(None) };
     let bytes = bytes()?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| format!("{name} is not UTF-8 text"))?;
+    let (text, note) = rustgis_data::io::delimited_text(name, &bytes).map_err(|e| e.to_string())?;
     let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
-    rustgis_data::io::read_csv_with(text, stem, &opts).map(Some).map_err(|e| format!("{name}: {e}"))
+    let (ds, mut report) = rustgis_data::io::read_csv_with(&text, stem, &opts).map_err(|e| format!("{name}: {e}"))?;
+    report.messages.extend(note);
+    Ok(Some((ds, report)))
 }
 
 /// The file name for data downloaded from `url`: its last path segment when that has an extension
@@ -2578,6 +2838,12 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
     if rustgis_data::source::is_remote_name(url) && scan {
         return Err(format!("{url}: \"as\": \"scan\" opens a TIFF, PNG or JPEG"));
     }
+    // A plugin's command run by the app (the desktop): what would wait (reading a header, a
+    // probe, a download) is left to the app, which does it off the frame, as in the browser.
+    #[cfg(not(target_arch = "wasm32"))]
+    if s.leave_downloads {
+        return s.request_url(p);
+    }
     // An address the app found to be a GeoTIFF (`"cog"`) is one whatever its name says.
     if rustgis_data::source::is_remote_name(url) && !super::b(p, "whole").unwrap_or(false) && !super::b(p, "cog").unwrap_or(false) {
         // In the browser nothing may wait: the app has fetched what opening needs already.
@@ -2641,6 +2907,9 @@ fn add_remote(s: &mut Session, p: &Value, url: &str, src: Box<dyn rustgis_data::
         s.notify(format!("{unique}: {n}"), false);
     }
     let id = s.map_mut().add_streamed(unique.clone(), layer);
+    if let Some(l) = s.map_mut().layer_mut(id) {
+        l.dataset.zm_dropped = info.zm_dropped;
+    }
     s.active_layer = Some(id);
     let count = info.count.map(|c| c.to_string()).unwrap_or_else(|| "many".into());
     s.notify(format!("{unique}: {count} features, read in place by range from its address, a view at a time"), false);
@@ -2650,6 +2919,26 @@ fn add_remote(s: &mut Session, p: &Value, url: &str, src: Box<dyn rustgis_data::
         s.zoom_to(&info.extent);
     }
     Ok(json!({"layer": id, "layers": [id], "features": info.count, "streamed": true, "inPlace": true}))
+}
+
+/// The name of the layer the map's terrain takes its heights from, when it has one.
+fn terrain_dem(s: &Session) -> Option<String> {
+    match &s.map().view.terrain {
+        Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer(n), .. }) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+/// Points the map's terrain at the layer called `name`.
+fn set_terrain_dem(s: &mut Session, name: String) {
+    if let Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer(n), .. }) = &mut s.map_mut().view.terrain {
+        *n = name;
+    }
+}
+
+/// How many layers are called `name` (as layers are looked up, ignoring case).
+fn named_layers(s: &Session, name: &str) -> usize {
+    s.map().layers.iter().filter(|l| l.name.eq_ignore_ascii_case(name)).count()
 }
 
 /// Whether a web address names a GeoTIFF (by its path's extension).
@@ -2733,6 +3022,9 @@ fn cog_name(url: &str) -> String {
 fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     let id = f(p, "id").filter(|v| *v >= 0.0 && v.fract() == 0.0).map(|v| v as u64).ok_or("id is required")?;
     let url = ps(p, "url").unwrap_or("data").to_string();
+    // Read before the download is taken, so a bad one leaves it to be added again.
+    let service = super::b(p, "service").unwrap_or(false);
+    let bounds = if service { super::service::bounds_of(p.get("bounds"))? } else { None };
     let i = s.downloaded.iter().position(|(d, _)| *d == id).ok_or("no such download (it was dropped when another project opened)")?;
     let (_, bytes) = s.downloaded.remove(i);
     if p.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
@@ -2746,10 +3038,11 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
         let name = if b(p, "geolibreZarr") == Some(true) { "zarr.tif".into() } else { url_file_name(&url, &bytes)? };
         return super::geolibre::finish_layer(s, p, name, bytes);
     }
-    // A service's features (Add From Service): its answer's axes and paging.
-    let bytes = if super::b(p, "service").unwrap_or(false) {
+    // A service's features (Add From Service): its answer's axes (against its layer's bounds) and
+    // paging.
+    let bytes = if service {
         let label = ps(p, "name").unwrap_or(&url).to_string();
-        super::service::features_answer(s, &label, bytes)
+        super::service::features_answer(s, &label, bytes, bounds)
     } else {
         bytes
     };
@@ -2799,10 +3092,14 @@ pub(crate) fn add_data_text(s: &mut Session, p: &Value) -> CmdResult {
     add_read(s, p, read)
 }
 
+/// Adds an imported dataset as a layer or table, forwarding reader notices for either result.
 pub(crate) fn add_read(s: &mut Session, p: &Value, read: (rustgis_data::Dataset, rustgis_data::ReadReport)) -> CmdResult {
     let (mut ds, report) = read;
     if let Some(n) = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
         ds.name = n.to_string();
+    }
+    for m in report.messages {
+        s.notify(m, false);
     }
     if ds.geometry_type == GeometryType::None {
         let name = ds.name.clone();
@@ -2812,9 +3109,6 @@ pub(crate) fn add_read(s: &mut Session, p: &Value, read: (rustgis_data::Dataset,
     let n = ds.features.len();
     let empty_before = s.map().layers.is_empty();
     let id = add_dataset(s, ds);
-    for m in report.messages {
-        s.notify(m, false);
-    }
     if empty_before && let Some(e) = s.map().layer(id).map(|l| l.extent()) {
         s.zoom_to(&e);
     }
@@ -2841,11 +3135,16 @@ fn add_sample(s: &mut Session, p: &Value) -> CmdResult {
 /// isn't left out unasked. Called once the layer is renamed or gone: while another layer still
 /// bears `old` (names may repeat), the legends keep it for that one. Renamed onto the name of
 /// another layer a legend lists, the layer is listed with it rather than taking that one out.
+/// A WMS or WMTS layer's name counts as a layer's: legends list those too.
 pub(crate) fn legends_follow_layer(s: &mut Session, old: &str, new: Option<&str>) {
-    if s.map().layers.iter().any(|l| l.name.eq_ignore_ascii_case(old)) {
+    let named = |s: &Session, n: &str| {
+        let m = s.map();
+        m.layers.iter().map(|l| &l.name).chain(m.tiles.iter().map(|t| &t.name)).filter(|x| x.eq_ignore_ascii_case(n)).count()
+    };
+    if named(s, old) > 0 {
         return;
     }
-    let shared = new.is_some_and(|n| s.map().layers.iter().filter(|l| l.name.eq_ignore_ascii_case(n)).count() > 1);
+    let shared = new.is_some_and(|n| named(s, n) > 1);
     let map = s.map().name.clone();
     for layout in &mut s.project.layouts {
         let frames: Vec<u32> = layout
@@ -2891,9 +3190,25 @@ pub(crate) fn drop_layers(s: &mut Session, ids: &[u32]) {
     // The tile layers drawn over them keep their place.
     m.release_tiles(ids);
     m.layers.retain(|l| !ids.contains(&l.id));
+    terrain_follows_removal(s, &names);
     for n in &names {
         legends_follow_layer(s, n, None);
     }
+}
+
+/// After layers called `names` are removed: a terrain drawn from one of them would lose its
+/// relief, or take another layer's heights by that name, so it is turned off, and said.
+fn terrain_follows_removal(s: &mut Session, names: &[String]) {
+    let Some(dem) = terrain_dem(s).filter(|d| names.iter().any(|n| n.eq_ignore_ascii_case(d))) else { return };
+    s.map_mut().view.terrain = None;
+    let said = if named_layers(s, &dem) > 0 {
+        format!(
+            "Terrain turned off: one of the layers called '{dem}' was removed, so which one gives the heights can't be told; turn Terrain on again"
+        )
+    } else {
+        format!("Terrain turned off: its DEM '{dem}' was removed")
+    };
+    s.notify(said, false);
 }
 
 fn remove(s: &mut Session, p: &Value) -> CmdResult {
@@ -2912,6 +3227,7 @@ fn remove(s: &mut Session, p: &Value) -> CmdResult {
     }
     let next = m.layers.get(at.min(m.layers.len().saturating_sub(1))).map(|l| l.id);
     s.set_layer_selection(next.into_iter().collect(), next);
+    terrain_follows_removal(s, &names);
     // A legend that left it out forgets it.
     for name in names {
         legends_follow_layer(s, &name, None);
@@ -3031,8 +3347,8 @@ fn move_to(s: &mut Session, p: &Value) -> CmdResult {
     let mut placed: Vec<(u32, usize)> = Vec::new();
     for id in grouped {
         let Some(g) = m.group_of(id).map(|g| g.id) else { continue };
-        let run: Vec<usize> =
-            m.layers.iter().enumerate().filter(|(_, l)| m.group_of(l.id).is_some_and(|x| x.id == g)).map(|(i, _)| i).collect();
+        let members = m.group_layers(g);
+        let run: Vec<usize> = m.layers.iter().enumerate().filter(|(_, l)| members.contains(&l.id)).map(|(i, _)| i).collect();
         let (Some(&lo), Some(&hi)) = (run.first(), run.last()) else { continue };
         let k = placed.iter().filter(|(x, _)| *x == g).count();
         placed.push((g, k));
@@ -3093,18 +3409,29 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
     let classes = f(p, "classes").map(|c| c.clamp(1.0, 12.0) as usize).unwrap_or(5);
     let l = s.map().layer(id).ok_or("no such layer")?;
     let g = l.geometry_type();
+    // A new symbology after No Fill draws fills again (#1301).
+    let hidden = l.no_fill;
     let base = l.renderer.base_symbol();
     let base = if matches!(l.renderer, Renderer::Graduated { .. } | Renderer::Unique { .. }) {
         rustgis_map::Symbol { ..rustgis_map::Symbol::default_for(g, id) }.with_fill(base.fill, g)
     } else {
         base
     };
+    let base = match hidden {
+        Some(NoFill::Symbols) if base.fill.a() == 0 => rustgis_map::Symbol { fill: base.fill.with_alpha(shown_fill_alpha()), ..base },
+        _ => base,
+    };
+    // The field it classes by, or classed by before an expression (kept to come back to).
+    let last_field = match &l.renderer {
+        Renderer::Unique { field, .. } => Some(field.as_str()),
+        r => r.field(),
+    }
+    .filter(|f| l.dataset.field_index(f).is_some());
     let field = |numeric_only: bool| -> Result<String, String> {
         if let Some(x) = ps(p, "field") {
             return Ok(x.to_string());
         }
-        l.renderer
-            .field()
+        last_field
             .filter(|name| {
                 !numeric_only || l.dataset.field_index(name).and_then(|i| l.dataset.fields.get(i)).is_some_and(|f| f.ty.is_numeric())
             })
@@ -3127,9 +3454,47 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
         }
         Ok(rows)
     };
+    // Unique Values by expression: the one given, or with no field given, the layer's own.
+    let expression = match p.get("expression") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) if t.trim().is_empty() => None,
+        Some(Value::String(t)) => Some(t.trim().to_string()),
+        Some(_) => return Err("expression is text".into()),
+    };
+    if expression.is_some() && ps(p, "field").is_some() {
+        return Err("give a field or an expression, not both".into());
+    }
+    if expression.is_some() && !matches!(kind.as_str(), "unique" | "uniquevalues") {
+        return Err("only Unique Values class by an expression".into());
+    }
+    // Applied again by the layer's own expression, as many classes as it has (an imported rule
+    // style's may pass the first MAX_UNIQUE values).
+    let mut keep = rustgis_map::symbology::MAX_UNIQUE;
+    let expression = match (p.get("expression"), p.get("field")) {
+        (None, None) => {
+            if let Renderer::Unique { classes, expression: Some(_), .. } = &l.renderer {
+                keep = keep.max(classes.len()).min(rustgis_map::symbology::MAX_EXPRESSION_CLASSES);
+            }
+            l.renderer.expression().map(str::to_string)
+        }
+        _ => expression,
+    };
+    // Features past the first values an expression's classes keep.
+    let mut rest = 0;
     let mut r = match kind.as_str() {
         "single" | "singlesymbol" => Renderer::Single(base),
-        "unique" | "uniquevalues" => Renderer::unique(&l.dataset, &rows()?, &field(false)?, ramp.unwrap_or(Ramp::Harbour), base)?,
+        "unique" | "uniquevalues" => match &expression {
+            Some(e) => {
+                let (mut r, n) = Renderer::unique_by_up_to(&l.dataset, &rows()?, e, ramp.unwrap_or(Ramp::Harbour), base, keep)?;
+                rest = n;
+                // (Clearing the expression goes back to the field it had.)
+                if let (Renderer::Unique { field, .. }, Some(last)) = (&mut r, last_field) {
+                    *field = last.to_string();
+                }
+                r
+            }
+            None => Renderer::unique(&l.dataset, &rows()?, &field(false)?, ramp.unwrap_or(Ramp::Harbour), base)?,
+        },
         "graduated" | "graduatedcolors" => {
             let (field, ramp) = (field(true)?, ramp.unwrap_or(Ramp::Ember));
             // Manual with no bounds keeps the layer's current ones on the same field, so switching
@@ -3154,7 +3519,34 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
     // Applied again on the same field, the classes keep the labels set by hand, and the colours
     // and outlines set by hand too while the colour scheme stays (#314).
     r.carry_edits_from(&l.renderer, g);
-    with(s, p, |l| l.renderer = r)
+    // The same field and scheme again carry the classes' alpha, which No Fill made 0.
+    if hidden == Some(NoFill::Symbols) {
+        r.map_symbols(show_fill);
+    }
+    let name = l.name.clone();
+    // Classes are the values given with no map scale: one given only at some scales never is.
+    let by_scale = r.expression().is_some_and(rustgis_map::qgis::reads_scale);
+    let out = with(s, p, |l| {
+        l.renderer = r;
+        take_no_fill(l);
+    })?;
+    if rest > 0 {
+        s.notify(
+            format!(
+                "{name}: {rest} features whose value is past the first {keep} values the expression gives (in text order) are drawn as <all other values>"
+            ),
+            false,
+        );
+    }
+    if by_scale {
+        s.notify(
+            format!(
+                "{name}: its classes are the values the expression gives without a map scale; values it gives only at some scales, if any, are drawn as <all other values>"
+            ),
+            false,
+        );
+    }
+    Ok(out)
 }
 
 /// The class `value`, `index` or `other: true` name in a command's parameters, or `None` when

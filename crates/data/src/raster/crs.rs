@@ -327,6 +327,27 @@ impl Crs {
         }
     }
 
+    /// Whether converting to WGS 84 leaves out a datum shift, so positions in longitude/latitude
+    /// may be off by up to a few hundred metres: a custom system with an ellipsoid (`+ellps`, `+a`
+    /// or `+R`) but no `+towgs84`, `+datum` or `+nadgrids`. That is what reading a WKT datum with
+    /// no known shift writes, as `+a`/`+rf` even on WGS 84's axes (SVY21's), and the reading says
+    /// so. `+ellps=WGS84` and `+ellps=GRS80` alone need no shift (GRS 80 datums the reader knows
+    /// get a null one), nor does a Mercator on Web Mercator's sphere of radius 6378137 m. Written
+    /// back in the same system, positions come back exact.
+    pub fn lacks_datum_shift(self) -> bool {
+        let Some(def) = self.custom_def() else { return false };
+        let keys: Vec<&str> = def.proj4.split_whitespace().collect();
+        let has = |prefix: &str| keys.iter().any(|k| k.starts_with(prefix));
+        let shifted = has("+towgs84=") || has("+datum=") || has("+nadgrids=");
+        // Web Mercator's sphere, of WGS 84's major axis, is a projection's, not a datum's: in a
+        // Mercator only, as a datum on that sphere elsewhere is unknown (and reading it says so).
+        let axis = |key: &str| keys.iter().find_map(|k| k.strip_prefix(key)?.parse::<f64>().ok()).is_some_and(|v| v == 6_378_137.0);
+        let sphere = keys.contains(&"+proj=merc") && (axis("+R=") || (axis("+a=") && axis("+b=")));
+        let wgs84 = keys.contains(&"+ellps=WGS84") || keys.contains(&"+ellps=GRS80") || sphere;
+        let ellipsoid = has("+ellps=") || has("+a=") || has("+R=");
+        ellipsoid && !wgs84 && !shifted
+    }
+
     /// A transformer between this system and WGS 84 longitude/latitude.
     pub fn transformer(self) -> Result<Transformer, String> {
         Ok(Transformer {
@@ -396,6 +417,17 @@ impl Transformer {
         out.is_finite().then_some(out)
     }
 
+    /// Extent samples keep a geographic grid's winding without losing its prime meridian or
+    /// datum shift. Only whole turns change; other consumers keep `to_lonlat`'s usual branch.
+    pub(super) fn to_lonlat_for_extent(&self, c: Coord) -> Option<Coord> {
+        let mut out = self.to_lonlat(c)?;
+        if let Kind::Proj { native, geographic: true, .. } = &self.kind {
+            let greenwich = c.x + native.from_greenwich().to_degrees();
+            out.x += 360.0 * ((greenwich - out.x) / 360.0).round();
+        }
+        out.is_finite().then_some(out)
+    }
+
     /// Longitude/latitude to native coordinates.
     pub fn from_lonlat(&self, c: Coord) -> Option<Coord> {
         let out = match &self.kind {
@@ -409,6 +441,11 @@ impl Transformer {
             Kind::Sinusoidal(s) => s.forward(c)?,
         };
         out.is_finite().then_some(out)
+    }
+
+    /// Whether the raster's own coordinates are longitude/latitude degrees.
+    pub fn is_geographic(&self) -> bool {
+        matches!(self.kind, Kind::LonLat | Kind::Proj { geographic: true, .. })
     }
 
     /// Web Mercator to native coordinates (the renderer's direction).
@@ -434,6 +471,23 @@ mod tests {
         assert!((ll.y - 42.0).abs() < 1e-4, "{ll:?}");
         let back = t.from_lonlat(ll).unwrap();
         assert!((back.x - 500_000.0).abs() < 0.01 && (back.y - 4_649_776.22).abs() < 0.01);
+    }
+
+    #[test]
+    fn extent_longitudes_keep_prime_meridian_and_datum_shift() {
+        let crs = Crs::parse("+proj=longlat +ellps=WGS84 +towgs84=0,1000,0 +pm=paris +no_defs").unwrap();
+        let t = crs.transformer().unwrap();
+        let native = Coord::new(190.0, 0.0);
+        let greenwich = 192.337_229_166_667_f64;
+        // At the equator, the specified geocentric translation adds 1000 m to WGS84's Y.
+        let angle = greenwich.to_radians();
+        let expected = (6_378_137.0 * angle.sin() + 1000.0).atan2(6_378_137.0 * angle.cos()).to_degrees();
+        let usual = t.to_lonlat(native).unwrap();
+        let extent = t.to_lonlat_for_extent(native).unwrap();
+        assert!((usual.x - expected).abs() < 1e-9, "{usual:?}: {expected}");
+        assert!((extent.x - (expected + 360.0)).abs() < 1e-9, "{extent:?}: {expected}");
+        assert!((extent.x - greenwich).abs() > 0.001, "the datum shift must not be replaced by native longitude");
+        assert_eq!(extent.y, usual.y, "only longitude winding changes");
     }
 
     #[test]

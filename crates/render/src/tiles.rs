@@ -125,7 +125,20 @@ pub fn spec(t: &TileLayer) -> Spec {
         attribution: t.attribution.clone(),
         layers: t.layers.clone(),
         style_layers: t.style_layers.clone(),
+        hidden_layers: t.hidden_layers.clone(),
     }
+}
+
+/// A vector PMTiles or MBTiles archive's source layers (`vector_layers`), each once in its
+/// order, as [`source_layers::of_metadata`](rustgis_data::source_layers::of_metadata) keeps
+/// them. `None` for other tile layers, and while the archive's header is on its way.
+pub fn source_layers(t: &TileLayer) -> Option<Vec<String>> {
+    let kind = match t.kind {
+        TileKind::PmTiles => Kind::PmTiles,
+        TileKind::MbTiles => Kind::MbTiles,
+        _ => return None,
+    };
+    rustgis_tiles::source::source_layers(kind, &t.url)
 }
 
 /// Where a MapLibre style layer's root properties place the map; `Ok(None)` while the style is
@@ -151,13 +164,13 @@ type LastTile = (std::sync::Weak<crate::tile_mesh::TileMesh>, [f64; 2], [f32; 4]
 type Last = std::collections::HashMap<usize, (std::sync::Weak<rustgis_tiles::source::Resolved>, Vec<LastTile>)>;
 static LAST: std::sync::OnceLock<std::sync::Mutex<Last>> = std::sync::OnceLock::new();
 
-/// The meshes of `v`'s tiles, and whether some were made while the sprite was on its way. A map
+/// The meshes of `v`'s tiles, and whether a sprite they use is on its way. A map
 /// drawn for the screen at a pace (see `rustgis_tiles::Pace`) makes those missing a frame's worth
 /// at a time, nearest `centre` first, the tiles drawn last standing in for the rest meanwhile,
 /// clipped to their squares.
 fn mesh_tiles(v: &rustgis_tiles::shapes::VectorTiles, centre: [f64; 2]) -> (Vec<MeshTile>, bool) {
     let pace = rustgis_tiles::pace();
-    let meshes = crate::tile_mesh::meshes(&v.style, &v.source, &v.tiles, v.level, pace.map(|(_, until)| (until, centre)));
+    let (meshes, mut waiting) = crate::tile_mesh::meshes(&v.style, &v.source, &v.tiles, v.level, pace.map(|(_, until)| (until, centre)));
     let lock = || LAST.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
     let key = std::sync::Arc::as_ptr(&v.style) as usize;
     let last: Vec<MeshTile> = lock()
@@ -170,7 +183,7 @@ fn mesh_tiles(v: &rustgis_tiles::shapes::VectorTiles, centre: [f64; 2]) -> (Vec<
                 .collect()
         })
         .unwrap_or_default();
-    let (mut stood_in, mut tiles, mut waiting) = (Vec::new(), Vec::new(), false);
+    let (mut stood_in, mut tiles) = (Vec::new(), Vec::new());
     for (d, m) in v.tiles.iter().zip(meshes) {
         let o = [d.at.min_x, d.at.max_y];
         match m {
@@ -290,18 +303,6 @@ pub(crate) fn draw(
         return out;
     }
     let ppp = view.pixels_per_point as f32;
-    let collect = |d: rustgis_tiles::Drawn, name: &str, out: &mut TileOutput| {
-        out.pending |= d.pending;
-        for a in d.attribution {
-            if !out.attribution.contains(&a) {
-                out.attribution.push(a);
-            }
-        }
-        if let Some(e) = d.error {
-            out.errors.push(format!("{name}: {e}"));
-        }
-        out.labels.extend(d.labels.into_iter().filter_map(tile_label));
-    };
     if let Place::Flat(Flat::Mercator, _) = place {
         let res = view.camera.res;
         let frame = Frame {
@@ -318,6 +319,18 @@ pub(crate) fn draw(
         let origin = [view.camera.center.x, view.camera.center.y];
         let north_up = view.camera.bearing == 0.0 && view.camera.pitch == 0.0;
         for t in layers {
+            // One picture of the view, where the layer is asked for so (#1162).
+            if view.camera.pitch == 0.0
+                && let Some(req) = crate::single_image::of(t, 3857)
+                && let Some((pending, error)) = crate::single_image::draw(pm, &req, t, view, &Flat::Mercator)
+            {
+                if let Some(g) = gpu.as_mut() {
+                    *g.dirty = true;
+                }
+                let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
+                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+                continue;
+            }
             // A vector tile style as meshes, made once a tile and level and drawn at any zoom
             // (see `tile_mesh`); a see-through or blended layer, as pictures.
             if let Some(g) = gpu.as_mut()
@@ -333,7 +346,8 @@ pub(crate) fn draw(
                 if !tiles.is_empty() {
                     g.cmds.push(DrawCmd::TileMeshes { tiles });
                 }
-                let d = rustgis_tiles::Drawn { labels: v.labels, attribution: v.attribution, pending: v.pending || waiting, error: None };
+                let d =
+                    rustgis_tiles::Drawn { labels: v.labels, attribution: v.attribution, pending: v.pending || waiting, error: v.error };
                 collect(d, &t.name, &mut out);
                 continue;
             }
@@ -381,7 +395,72 @@ pub(crate) fn draw(
     if let Some(g) = gpu {
         *g.dirty = true;
     }
-    // Elsewhere: a mosaic in Web Mercator, warped into place.
+    // Elsewhere: a layer offered in the map's own system drawn in it as its service gives it
+    // (#769); runs of the others, a mosaic in Web Mercator warped into place. (A tilted map's
+    // pictures aren't flat on screen: it warps them all, pixel by pixel.)
+    let native_to = match place {
+        Place::Flat(flat @ Flat::Custom(_), code) if view.camera.pitch == 0.0 => {
+            rustgis_data::ogc::warp::epsg_of(code).and_then(|c| u16::try_from(c).ok()).map(|e| (flat, e))
+        }
+        _ => None,
+    };
+    // A layer blended with what is beneath it (multiply…) is drawn in the mosaic with the tile
+    // layers beneath it: those are mosaicked too, not drawn natively.
+    let blended = layers.iter().rposition(|t| t.blend != Blend::Normal);
+    let mut run: Vec<&TileLayer> = Vec::new();
+    for (i, t) in layers.into_iter().enumerate() {
+        // One picture of the view, asked for in the map's system (#1162).
+        if let Some((flat, epsg)) = native_to.filter(|_| blended.is_none_or(|b| i > b))
+            && let Some(req) = crate::single_image::of(t, epsg)
+        {
+            // Those beneath first.
+            mosaic(pm, &run, view, place, &mut out);
+            run.clear();
+            if let Some((pending, error)) = crate::single_image::draw(pm, &req, t, view, flat) {
+                let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
+                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+                continue;
+            }
+        }
+        let native = native_to
+            .filter(|_| blended.is_none_or(|b| i > b))
+            .and_then(|(flat, epsg)| crate::native_tiles::of(t, epsg).map(|n| (flat, n)));
+        let Some((flat, n)) = native else {
+            run.push(t);
+            continue;
+        };
+        mosaic(pm, &run, view, place, &mut out);
+        run.clear();
+        let (pending, error) = crate::native_tiles::draw(pm, &n, t, view, flat);
+        let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
+        collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+    }
+    mosaic(pm, &run, view, place, &mut out);
+    out
+}
+
+/// What a tile layer drew, into what the map's tile layers drew: tiles on their way, credits,
+/// errors and labels.
+fn collect(d: rustgis_tiles::Drawn, name: &str, out: &mut TileOutput) {
+    out.pending |= d.pending;
+    for a in d.attribution {
+        if !out.attribution.contains(&a) {
+            out.attribution.push(a);
+        }
+    }
+    if let Some(e) = d.error {
+        out.errors.push(format!("{name}: {e}"));
+    }
+    out.labels.extend(d.labels.into_iter().filter_map(tile_label));
+}
+
+/// Tile layers (bottom first) on a map in another projection than Web Mercator, or the globe:
+/// drawn together into a mosaic in Web Mercator, warped into place over `pm`.
+fn mosaic(pm: &mut Pixmap, layers: &[&TileLayer], view: &View, place: Place, out: &mut TileOutput) {
+    if layers.is_empty() {
+        return;
+    }
+    let ppp = view.pixels_per_point as f32;
     let (w, h) = (pm.width(), pm.height());
     let k = view.pixels_per_point.max(0.01);
     let to_lonlat = |dx: f64, dy: f64| -> Option<Coord> {
@@ -429,7 +508,7 @@ pub(crate) fn draw(
         }
     }
     if e.is_empty() {
-        return out;
+        return;
     }
     let x0 = lonlat_to_merc(Coord::new(lon0, 0.0)).x;
     // A pole in sight brings the latitudes up to it into view, whether or not the grid reached
@@ -460,7 +539,7 @@ pub(crate) fn draw(
     };
     let m_per_px = detail.max(e.width() / MOSAIC).max(e.height() / MOSAIC).max(0.01);
     let (mw, mh) = ((e.width() / m_per_px).ceil().clamp(1.0, MOSAIC) as u32, (e.height() / m_per_px).ceil().clamp(1.0, MOSAIC) as u32);
-    let Some(mut mosaic) = Pixmap::new(mw, mh) else { return out };
+    let Some(mut mosaic) = Pixmap::new(mw, mh) else { return };
     // Pixels per point in the mosaic: line widths and the style's zoom then match the view's
     // centre once the mosaic is warped there.
     let mosaic_ppp = if detail > 0.0 { (detail * k / m_per_px) as f32 } else { ppp };
@@ -468,10 +547,9 @@ pub(crate) fn draw(
     let mut scratch = None;
     for t in layers {
         let d = draw_layer(&mut mosaic, t, &frame, false, &mut scratch);
-        collect(d, &t.name, &mut out);
+        collect(d, &t.name, out);
     }
     warp(pm, &mosaic, &frame, &to_lonlat, &to_merc);
-    out
 }
 
 /// A placed tile as the GPU draws it: its clipped square about `origin`, and the part of its
@@ -610,7 +688,7 @@ fn warp(pm: &mut Pixmap, mosaic: &Pixmap, frame: &Frame, to_lonlat: &dyn Fn(f64,
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use rustgis_geom::{Coord, lonlat_to_merc};
     use rustgis_map::{Camera, Map, Projection, TileKind, TileLayer};
 
@@ -667,12 +745,23 @@ mod tests {
         }
     }
 
+    /// What `wms.test` and `wmts.test` were asked for.
+    static ASKED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// What `one.test` was asked for (a test of its own: tests run at once).
+    static ASKED_ONE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    /// Held by the tests reading `ASKED_ONE`, one at a time.
+    static ONE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Requests that are never answered: their tiles stay on their way.
     static PARKED: std::sync::Mutex<Vec<rustgis_tiles::cache::Done>> = std::sync::Mutex::new(Vec::new());
+    /// Fetches under `stuck.test/`, left unanswered until a test lets them go: another's fetch
+    /// still under way.
+    static STUCK: std::sync::Mutex<Vec<rustgis_tiles::cache::Done>> = std::sync::Mutex::new(Vec::new());
 
     /// Serves tiles and documents for `https://tiles.test/…` without a network. Under `split/`,
     /// zoom 11 is red, zoom 13 blue, and zoom 12 never arrives.
-    fn serve() {
+    pub(crate) fn serve() {
         rustgis_tiles::cache::set_fetcher(|url, done| {
             let color = |r, g, b| {
                 let mut pm = tiny_skia::Pixmap::new(256, 256).unwrap();
@@ -685,6 +774,20 @@ mod tests {
                 done(Ok(color(20, 20, 220)));
             } else if url.starts_with("https://tiles.test/split/12/") {
                 PARKED.lock().unwrap().push(done);
+            } else if url.starts_with("https://stuck.test/") {
+                STUCK.lock().unwrap().push(done);
+            } else if url.starts_with("https://wms.test/") || url.starts_with("https://wmts.test/") {
+                // A service drawing in a system of its own (#769): green, and what it was asked.
+                ASKED.lock().unwrap().push(url.clone());
+                done(Ok(color(20, 200, 20)));
+            } else if url.starts_with("https://one.test/") {
+                ASKED_ONE.lock().unwrap().push(url.clone());
+                // Under `tiles-only/`, a service drawing no picture larger than a tile.
+                if url.starts_with("https://one.test/tiles-only/") && !url.contains("&WIDTH=256&HEIGHT=256") {
+                    done(Err("400 Bad Request".into()));
+                } else {
+                    done(Ok(color(20, 200, 20)));
+                }
             } else if url == "https://tiles.test/style.json" {
                 let style = r##"{"version": 8, "sources": {}, "layers": [{"id": "bg", "type": "background", "paint": {"background-color": "#2050e0"}}]}"##;
                 done(Ok(style.as_bytes().to_vec()));
@@ -701,6 +804,222 @@ mod tests {
         let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
         let p = pm.pixel(100, 50).unwrap();
         [p.red(), p.green(), p.blue(), p.alpha()]
+    }
+
+    /// A WMS layer offered only in Switzerland's LV95 (EPSG:2056) and a WMTS layer whose matrices
+    /// are in it (#769): on a Web Mercator map, asked for in LV95 and warped into the map's tiles;
+    /// on a map drawn in LV95, asked for in its own tiles (the WMS layer's 256 pixels a side, on a
+    /// grid of powers of two; the WMTS layer's of its matrix) and drawn as they come.
+    #[test]
+    fn layers_in_a_system_of_their_own() {
+        use rustgis_data::ogc::warp::{Grid, Matrix, System, Warp};
+        serve();
+        let area = Some([5.9, 45.8, 10.5, 47.8]);
+        let lv95 = System { epsg: 2056, name: "EPSG:2056".into(), lat_first: false };
+        let wms = Warp { epsg: 2056, grid: Grid::Map { lat_first: false }, area, systems: vec![lv95] }.address(
+            "https://wms.test/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=a&STYLES=&CRS={ncrs}&BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}",
+        );
+        let matrices: Vec<Matrix> = [20.0, 10.0, 5.0, 2.5]
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| Matrix {
+                id: format!("m{i}"),
+                left: 2_420_000.0,
+                top: 1_350_000.0,
+                cell: *cell,
+                tile_w: 256,
+                tile_h: 256,
+                cols: 5000,
+                rows: 5000,
+            })
+            .collect();
+        let wmts =
+            Warp { epsg: 2056, grid: Grid::Tiles(matrices), area, systems: Vec::new() }.address("https://wmts.test/{nm}/{ncol}/{nrow}.png");
+        let bern = Coord::new(7.4474, 46.948);
+        for (name, url) in [("WMS", &wms), ("WMTS", &wmts)] {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            m.tiles.push(TileLayer::new(name, TileKind::Raster, url));
+            let at = |m: &mut Map, res: f64| {
+                let center = m.to_map(bern).unwrap();
+                let view = View {
+                    width: 200.0,
+                    height: 100.0,
+                    pixels_per_point: 1.0,
+                    camera: Camera { center, res, bearing: 0.0, pitch: 0.0 },
+                    sky: false,
+                };
+                ASKED.lock().unwrap().clear();
+                let png = crate::render_png(m, &view).unwrap();
+                let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
+                let p = pm.pixel(100, 50).unwrap();
+                ([p.red(), p.green(), p.blue(), p.alpha()], std::mem::take(&mut *ASKED.lock().unwrap()))
+            };
+            // On Web Mercator: in LV95, warped.
+            let (p, asked) = at(&mut m, 8.0);
+            assert_eq!(p, [20, 200, 20, 255], "{name} on Web Mercator");
+            assert!(!asked.is_empty(), "{name}");
+            if name == "WMS" {
+                assert!(asked.iter().all(|u| u.contains("&CRS=EPSG:2056&BBOX=2")), "{asked:?}");
+            } else {
+                assert!(asked.iter().all(|u| u.starts_with("https://wmts.test/m")), "{asked:?}");
+            }
+            // On a map in LV95: its own tiles, drawn as they come. (From another path: those the
+            // warp asked for are in the cache.)
+            m.set_projection(Projection::Custom("EPSG:2056".into()));
+            m.tiles[0].url = m.tiles[0].url.replacen(".test/", ".test/lv95/", 1);
+            let (p, asked) = at(&mut m, 5.0);
+            assert_eq!(p, [20, 200, 20, 255], "{name} on LV95");
+            if name == "WMS" {
+                // 4 m pixels (the power of two below 5 m): tiles 1024 m a side on that grid.
+                for u in &asked {
+                    let bbox = u.split("&BBOX=").nth(1).unwrap().split('&').next().unwrap();
+                    let n: Vec<f64> = bbox.split(',').map(|v| v.parse().unwrap()).collect();
+                    assert!(u.ends_with("&WIDTH=256&HEIGHT=256") && n[2] - n[0] == 1024.0 && n[0] % 1024.0 == 0.0, "{u}");
+                }
+            } else {
+                // The 5 m matrix's.
+                assert!(!asked.is_empty() && asked.iter().all(|u| u.starts_with("https://wmts.test/lv95/m2/")), "{asked:?}");
+            }
+        }
+    }
+
+    /// A WMS layer asked for one picture of the view (#1162): one request for the view, of its
+    /// size and more, in Web Mercator and in a system of its own; a small pan asks nothing new;
+    /// in tiles, many.
+    #[test]
+    fn a_wms_layer_as_one_picture_of_the_view() {
+        let _one = ONE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        use rustgis_data::ogc::warp::{Grid, System, Warp};
+        serve();
+        let bern = Coord::new(7.4474, 46.948);
+        let at = |m: &mut Map, res: f64, dx: f64| {
+            let c = m.to_map(bern).unwrap();
+            let center = Coord::new(c.x + dx, c.y);
+            let view = View {
+                width: 200.0,
+                height: 100.0,
+                pixels_per_point: 2.0,
+                camera: Camera { center, res, bearing: 0.0, pitch: 0.0 },
+                sky: false,
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            let png = crate::render_png(m, &view).unwrap();
+            let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
+            let px = |x, y| pm.pixel(x, y).map(|p| [p.red(), p.green(), p.blue(), p.alpha()]).unwrap();
+            ([px(5, 5), px(200, 100), px(394, 194)], std::mem::take(&mut *ASKED_ONE.lock().unwrap()))
+        };
+        let green = [20, 200, 20, 255];
+        // In Web Mercator.
+        let mut m = Map::new("Map");
+        m.graticule = false;
+        let url = "https://one.test/merc/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=a&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng";
+        m.tiles.push(TileLayer::new("WMS", TileKind::Raster, url));
+        let (_, tiled) = at(&mut m, 30.0, 0.0);
+        assert!(tiled.len() > 1 && tiled.iter().all(|u| u.contains("&WIDTH=256&HEIGHT=256&")), "{tiled:?}");
+        m.tiles[0].single_image = true;
+        let (p, asked) = at(&mut m, 30.0, 0.0);
+        assert_eq!(p, [green; 3], "the whole view drawn");
+        // One picture, past the view (200 × 100 logical pixels: 512 × 256 with the margin).
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].contains("&CRS=EPSG:3857&BBOX=") && asked[0].contains("&WIDTH=512&HEIGHT=256&"), "{}", asked[0]);
+        // A small pan: the same picture, from the cache.
+        let (p, asked) = at(&mut m, 30.0, 300.0);
+        assert_eq!((p, asked.len()), ([green; 3], 0));
+        // Closer in than its finest zoom (10: 153 m a pixel), its picture there stretched, as its
+        // finest tiles are: fewer pixels for the same view.
+        m.tiles[0].max_zoom = 10;
+        let (p, asked) = at(&mut m, 30.0, 0.0);
+        assert_eq!((p, asked.len()), ([green; 3], 1));
+        assert!(asked[0].contains("&WIDTH=256&HEIGHT=256&"), "{}", asked[0]);
+        // Zoomed out past its coarsest zoom: nothing asked, nothing drawn.
+        m.tiles[0].max_zoom = 19;
+        m.tiles[0].min_zoom = 15;
+        let (p, asked) = at(&mut m, 30.0, 0.0);
+        assert!(p[1] != green && asked.is_empty(), "{p:?} {asked:?}");
+        // A service drawing no picture larger than a tile: its tiles, after its picture failed,
+        // and at once though a fetch of another's is still under way.
+        let _ = rustgis_tiles::cache::get("https://stuck.test/0.png", rustgis_tiles::cache::Want::Image);
+        let mut m = Map::new("Map");
+        m.graticule = false;
+        let mut t = TileLayer::new("WMS", TileKind::Raster, url.replace("one.test/merc/", "one.test/tiles-only/"));
+        t.single_image = true;
+        m.tiles.push(t);
+        let t0 = std::time::Instant::now();
+        let (p, asked) = at(&mut m, 30.0, 0.0);
+        let took = t0.elapsed();
+        for done in std::mem::take(&mut *STUCK.lock().unwrap()) {
+            done(Err("404".into()));
+        }
+        assert_eq!(p, [green; 3], "drawn in tiles");
+        assert!(took < std::time::Duration::from_secs(10), "waited {took:?} for another's fetch");
+        assert!(asked.iter().any(|u| u.contains("&WIDTH=512&HEIGHT=256&")), "its picture asked first: {asked:?}");
+        // In a system of its own, on a map in it.
+        let lv95 = System { epsg: 2056, name: "EPSG:2056".into(), lat_first: false };
+        let wms = Warp { epsg: 2056, grid: Grid::Map { lat_first: false }, area: Some([5.9, 45.8, 10.5, 47.8]), systems: vec![lv95] }.address(
+            "https://one.test/lv95/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=a&STYLES=&CRS={ncrs}&BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}",
+        );
+        let mut m = Map::new("Map");
+        m.graticule = false;
+        m.set_projection(Projection::Custom("EPSG:2056".into()));
+        let mut t = TileLayer::new("WMS", TileKind::Raster, wms);
+        t.single_image = true;
+        m.tiles.push(t);
+        let (p, asked) = at(&mut m, 5.0, 0.0);
+        assert_eq!(p, [green; 3]);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].contains("&CRS=EPSG:2056&BBOX=2") && asked[0].ends_with("&WIDTH=512&HEIGHT=256"), "{}", asked[0]);
+    }
+
+    /// Turning the map round asks a single picture layer for a picture or two, not one every few
+    /// degrees (the turned view's box widens and narrows as it turns): a picture holding the
+    /// view at its detail is drawn again.
+    #[test]
+    fn a_turning_map_asks_for_a_picture_or_two() {
+        let _one = ONE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        use rustgis_data::ogc::warp::{Grid, System, Warp};
+        serve();
+        let bern = Coord::new(7.4474, 46.948);
+        let turned = |m: &mut Map, res: f64, bearing: f64| {
+            let center = m.to_map(bern).unwrap();
+            let view = View {
+                width: 200.0,
+                height: 100.0,
+                pixels_per_point: 2.0,
+                camera: Camera { center, res, bearing, pitch: 0.0 },
+                sky: false,
+            };
+            ASKED_ONE.lock().unwrap().clear();
+            let png = crate::render_png(m, &view).unwrap();
+            let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
+            let px = |x, y| pm.pixel(x, y).map(|p| [p.red(), p.green(), p.blue(), p.alpha()]).unwrap();
+            ([px(1, 1), px(200, 100), px(398, 198)], std::mem::take(&mut *ASKED_ONE.lock().unwrap()))
+        };
+        let green = [20, 200, 20, 255];
+        let merc = "https://one.test/merc/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=turn&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng";
+        let lv95 = System { epsg: 2056, name: "EPSG:2056".into(), lat_first: false };
+        let own = Warp { epsg: 2056, grid: Grid::Map { lat_first: false }, area: Some([5.9, 45.8, 10.5, 47.8]), systems: vec![lv95] }.address(
+            "https://one.test/lv95/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=turn&STYLES=&CRS={ncrs}&BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}",
+        );
+        for (projection, url, res) in
+            [(Projection::WebMercator, merc.to_string(), 30.0), (Projection::Custom("EPSG:2056".into()), own, 5.0)]
+        {
+            let mut m = Map::new("Map");
+            m.graticule = false;
+            m.set_projection(projection);
+            let mut t = TileLayer::new("WMS", TileKind::Raster, url);
+            t.single_image = true;
+            m.tiles.push(t);
+            let (p, asked) = turned(&mut m, res, 0.0);
+            assert_eq!((p, asked.len()), ([green; 3], 1), "{asked:?}");
+            let mut all = Vec::new();
+            for step in 0..120 {
+                let (p, asked) = turned(&mut m, res, 0.5 + f64::from(step) * 3.0);
+                assert_eq!(p, [green; 3], "{step}");
+                all.extend(asked);
+            }
+            assert!(all.len() <= 2, "{all:?}");
+        }
     }
 
     /// A tile layer draws at its place in the drawing order (#808): under all the map's layers

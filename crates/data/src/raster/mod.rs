@@ -1,6 +1,8 @@
 //! Rasters: bands of numbers on a georeferenced grid (elevation, imagery, classified land cover).
 //!
-//! Pixels are held as `f32` per band. Readers never panic on malformed input and refuse rasters
+//! Pixels are held as `f32` per band: whole numbers are exact up to ±16,777,216 and decimals to
+//! about 7 significant digits. Readers count the values that change on the way in
+//! ([`Raster::rounded`]). Readers never panic on malformed input and refuse rasters
 //! larger than [`MAX_SAMPLES`]; cloud-optimised GeoTIFFs fall back to their largest overview that
 //! fits.
 
@@ -8,6 +10,7 @@ pub mod ascii;
 pub mod cog;
 pub mod cogwrite;
 pub mod crs;
+pub(crate) mod epsg_axes;
 mod epsg_gap;
 mod esri;
 #[cfg(not(target_arch = "wasm32"))]
@@ -25,6 +28,31 @@ use rustgis_geom::{Coord, Extent};
 use serde::{Deserialize, Serialize};
 
 use crate::{DataError, Result};
+
+/// Room for a band of `w × h` samples of `T`, empty: a band the machine can't hold is an error
+/// saying so, instead of ending the program (#1291). (In the browser and on Windows the check is
+/// reliable; Linux may promise memory it can't give later.)
+pub fn grid<T>(w: usize, h: usize) -> Result<Vec<T>> {
+    room(w.checked_mul(h).ok_or_else(|| no_memory(w, h))?, w, h)
+}
+
+/// A `w × h` band filled with `fill` ([`grid`]).
+pub fn filled<T: Clone>(w: usize, h: usize, fill: T) -> Result<Vec<T>> {
+    let mut v = grid(w, h)?;
+    v.resize(w * h, fill);
+    Ok(v)
+}
+
+/// Room for `n` samples of a `w × h` band (fewer than all of them, when fewer can come).
+pub(crate) fn room<T>(n: usize, w: usize, h: usize) -> Result<Vec<T>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| no_memory(w, h))?;
+    Ok(v)
+}
+
+fn no_memory(w: usize, h: usize) -> DataError {
+    DataError::Format(format!("not enough memory for a {w} × {h} raster"))
+}
 
 /// Most samples (pixels × bands) held in memory: 120 million (480 MB), or 32 million in the
 /// browser, whose memory is much tighter. Reading briefly needs about twice this.
@@ -205,6 +233,128 @@ impl BandStats {
     }
 }
 
+/// The no-data value the readers leave out of [`Raster::rounded`], by one rule for every reader:
+///
+/// - The value is the file's when it is finite, else the sidecar's (`.aux.xml`) when that is
+///   finite, else none: the value [`Raster::new`] and [`Raster::apply_pam`] go on to mask with.
+/// - A sample whose value in the file is exactly that value isn't counted, even when its `f32`
+///   overflows (a Float64 no-data of −1.8e308).
+/// - Any other sample `is_valid` masks is counted, as it went from a value to no-data: one that
+///   rounds onto the no-data value (an Int32 ID 16777217 with no-data 16777216), or one `f32`
+///   holds exactly that the no-data value rounds onto (−2^63 with no-data −2^63 + 1).
+/// - Any other sample is counted when it changed, an overflow to infinity included.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Uncounted {
+    exact: Option<Exact>,
+    masked: Option<f32>,
+}
+
+/// A value exactly as a file states it: a whole number as one (an `f64` rounds those past 2^53),
+/// anything else as an `f64`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Exact {
+    Whole(i128),
+    Float(f64),
+}
+
+impl Exact {
+    /// A number as text: whole when it is written as one.
+    pub(crate) fn parse(text: &str) -> Option<Exact> {
+        let text = text.trim();
+        text.parse::<i128>().map(Exact::Whole).ok().or_else(|| text.parse::<f64>().ok().map(Exact::Float))
+    }
+
+    /// The value as an `f64` (rounded, for a whole number past 2^53).
+    pub(crate) fn wide(self) -> f64 {
+        match self {
+            Exact::Whole(w) => w as f64,
+            Exact::Float(x) => x,
+        }
+    }
+
+    /// Whether two values are the same number.
+    pub(crate) fn same(self, other: Exact) -> bool {
+        match (self, other) {
+            (Exact::Whole(a), Exact::Whole(b)) => a == b,
+            (Exact::Float(a), Exact::Float(b)) => a == b,
+            // Only an integral float within i128's range (the cast saturates past it) can be one.
+            (Exact::Whole(w), Exact::Float(x)) | (Exact::Float(x), Exact::Whole(w)) => {
+                x.fract() == 0.0 && x.abs() < 2f64.powi(127) && x as i128 == w
+            }
+        }
+    }
+}
+
+impl Uncounted {
+    /// The value from the file's own no-data value and the sidecar's.
+    pub(crate) fn new(file: Option<Exact>, sidecar: Option<f64>) -> Uncounted {
+        let exact = file.filter(|v| v.wide().is_finite()).or(sidecar.filter(|v| v.is_finite()).map(Exact::Float));
+        Uncounted { exact, masked: exact.map(|d| d.wide() as f32).filter(|d| d.is_finite()) }
+    }
+
+    /// Whether a sample read as `f` is held, when the no-data value decides it: `Some(true)` for
+    /// the no-data value itself; `Some(false)` for any other sample [`Raster::is_valid`] masks as
+    /// no-data, exact in `f32` or not, as it went from a value to no-data; `None` otherwise (the
+    /// reader's own test decides). `value` gives the sample's value in the file; it is asked for
+    /// only when `f` matches the value's `f32` (or both are infinite, for a value past `f32`'s
+    /// range).
+    pub(crate) fn decides(self, f: f32, value: impl FnOnce() -> Option<Exact>) -> Option<bool> {
+        let is = |v: Option<Exact>| self.exact.zip(v).is_some_and(|(a, b)| a.same(b));
+        match self.masked {
+            Some(m) if f == m => Some(is(value())),
+            None if self.exact.is_some() && f.is_infinite() && is(value()) => Some(true),
+            _ => None,
+        }
+    }
+}
+
+/// Cases of [`Uncounted`]'s rule that every reader's tests read (a no-data value that isn't finite,
+/// one past `f32`'s range, a sidecar's, a sample rounding onto it), so the readers agree.
+#[cfg(test)]
+pub(crate) struct NodataCase {
+    /// The file's own no-data value, as it writes it (a GeoTIFF tag, an ASCII grid header, a
+    /// Zarr `_FillValue`).
+    pub file: Option<&'static str>,
+    /// The sidecar's (`.aux.xml`; Zarr stores have none).
+    pub sidecar: Option<f64>,
+    /// The samples of a 2 × 2 Float64 band.
+    pub samples: [f64; 4],
+    /// How many a GeoTIFF or ASCII grid counts as rounded.
+    pub counted: u64,
+    /// How many a Zarr store counts: it has no sidecar.
+    pub zarr: u64,
+}
+
+#[cfg(test)]
+pub(crate) const NODATA_CASES: &[NodataCase] = &[
+    // No no-data value: too many digits and an overflow to infinity are both counted.
+    NodataCase { file: None, sidecar: None, samples: [0.123_456_789_012_345, 1.0, -1e39, 2.0], counted: 2, zarr: 2 },
+    // A NaN or infinite file value is ignored and the sidecar's is used: 0.1 isn't counted, but
+    // 0.1000000001, a value that rounds onto it and so becomes no-data, is. Zarr, with no
+    // sidecar, counts all three.
+    NodataCase { file: Some("nan"), sidecar: Some(0.1), samples: [0.1, 0.100_000_000_1, 0.123_456_789_012_345, 2.0], counted: 2, zarr: 3 },
+    NodataCase { file: Some("inf"), sidecar: Some(0.1), samples: [0.1, 0.100_000_000_1, 0.123_456_789_012_345, 2.0], counted: 2, zarr: 3 },
+    // Past f32's range: the no-data value itself isn't counted, another overflow is.
+    NodataCase { file: Some("-1.7976931348623157e308"), sidecar: None, samples: [f64::MIN, -1e39, 0.5, 2.0], counted: 1, zarr: 1 },
+    NodataCase { file: Some("-1e39"), sidecar: None, samples: [-1e39, -2e39, 0.5, 2.0], counted: 1, zarr: 1 },
+    // A finite file value wins over the sidecar's; 1.00000001 and the ID 16777217 round onto it
+    // and become no-data, so they are counted, while the no-data value itself isn't.
+    NodataCase { file: Some("1"), sidecar: Some(0.1), samples: [1.000_000_01, 0.123_456_789_012_345, 0.5, 2.0], counted: 2, zarr: 2 },
+    NodataCase { file: Some("16777216"), sidecar: None, samples: [16_777_217.0, 16_777_216.0, 0.5, 2.0], counted: 1, zarr: 1 },
+];
+
+/// Cases of [`Uncounted`]'s rule for 64-bit whole numbers past 2^53, which an `f64` rounds: the
+/// file's no-data value as it writes it, four Int64 samples, how many a GeoTIFF or ASCII grid
+/// counts, and how many a Zarr store (which masks exact matches only) counts.
+#[cfg(test)]
+pub(crate) const NODATA_WHOLE_CASES: &[(&str, [i64; 4], u64, u64)] = &[
+    // −2^63 + 1 is the no-data value, written and stored exactly, so it isn't counted. −2^63, which
+    // f32 holds, shares its f32: a GeoTIFF or grid masks it as no-data and counts it; Zarr keeps it.
+    ("-9223372036854775807", [i64::MIN + 1, i64::MIN + 1, i64::MIN, 1], 1, 0),
+    // −2^63 is the no-data value; −2^63 + 1 rounds onto it and is counted everywhere.
+    ("-9223372036854775808", [i64::MIN, i64::MIN + 1, 0, 1], 1, 1),
+];
+
 /// One band of pixels, row by row.
 #[derive(Clone)]
 pub struct Band {
@@ -260,6 +410,10 @@ pub struct Raster {
     /// `false` for a scan (a TIFF with no GeoTIFF tags, a PNG, a JPEG): `transform` is then only
     /// a stand-in until the picture is placed or georeferenced, and says nothing about the ground.
     pub georeferenced: bool,
+    /// How many values of each band changed when read as `f32` (Int32 IDs past 16,777,216, Float64
+    /// values with more digits than `f32` holds), by band; empty when none did. NaN and no-data
+    /// values aren't counted.
+    pub rounded: Vec<u64>,
     transformer: Transformer,
     extent: Extent,
 }
@@ -320,6 +474,7 @@ impl Raster {
             source: None,
             overview: None,
             georeferenced: true,
+            rounded: Vec::new(),
             transformer,
             extent: Extent::EMPTY,
         };
@@ -364,8 +519,8 @@ impl Raster {
         let (w, h) = (self.width as f64, self.height as f64);
         let steps = 32;
         let mut add = |col: f64, row: f64| {
-            if let Some(c) = self.transformer.to_lonlat(self.transform.to_world(col, row)) {
-                e.expand(Coord::new(c.x.clamp(-180.0, 180.0), c.y.clamp(-90.0, 90.0)));
+            if let Some(c) = self.transformer.to_lonlat_for_extent(self.transform.to_world(col, row)) {
+                e.expand(Coord::new(c.x, c.y.clamp(-90.0, 90.0)));
             }
         };
         for i in 0..=steps {
@@ -381,6 +536,16 @@ impl Raster {
             for j in 1..n {
                 add(w * i as f64 / n as f64, h * j as f64 / n as f64);
             }
+        }
+        // Normalize the transformed range as a whole, retaining its winding: a range crossing
+        // the antimeridian needs world-wide bounds to include both strips in a single Extent.
+        // A native full turn remains world-wide even if a datum shift contracts its samples.
+        if !e.is_empty() && self.transformer.is_geographic() && w * self.transform.pixel_width.abs() >= 360.0 {
+            (e.min_x, e.max_x) = (-180.0, 180.0);
+        } else if !e.is_empty() && (e.min_x < -180.0 || e.max_x > 180.0) {
+            let shift = 360.0 * ((e.min_x + 180.0) / 360.0).floor();
+            let (lo, hi) = (e.min_x - shift, e.max_x - shift);
+            (e.min_x, e.max_x) = if lo >= -180.0 && hi <= 180.0 { (lo, hi) } else { (-180.0, 180.0) };
         }
         e
     }
@@ -468,8 +633,21 @@ impl Raster {
     /// The pixel under a longitude/latitude point.
     pub fn pixel_at(&self, lonlat: Coord) -> Option<(i64, i64)> {
         let (c, r) = self.transform.to_pixel(self.transformer.from_lonlat(lonlat)?);
-        let (c, r) = (c.floor(), r.floor());
+        let (c, r) = (self.wrap_col(c).floor(), r.floor());
         (c >= 0.0 && r >= 0.0 && c < self.width as f64 && r < self.height as f64).then_some((c as i64, r as i64))
+    }
+
+    /// A column off a geographic grid moved round by whole turns of 360° onto it, when that
+    /// lands on it: a grid stored from 0 to 360° has the place at -100° at its 260° column.
+    /// Any other column is returned as it is.
+    pub fn wrap_col(&self, c: f64) -> f64 {
+        let w = f64::from(self.width);
+        if (0.0..w).contains(&c) || !self.transformer.is_geographic() {
+            return c;
+        }
+        let turn = 360.0 / self.transform.pixel_width.abs();
+        let wrapped = c.rem_euclid(turn);
+        if wrapped < w { wrapped } else { c }
     }
 
     /// Cell size in the raster's units (x, y).
@@ -504,12 +682,16 @@ pub fn read_path(path: &Path) -> Result<Raster> {
     }
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("raster").to_string();
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    // The `.aux.xml` sidecar, read first: a no-data value it gives (for a file that has none) keeps
+    // those pixels out of the rounded count as they are read.
+    let pam = pam::read(path);
+    let sidecar_nodata = pam.as_ref().and_then(pam::Pam::nodata);
     let mut r = match ext.as_str() {
         "tif" | "tiff" => {
             #[cfg(not(target_arch = "wasm32"))]
-            let r = geotiff::read_file(path, &name)?;
+            let r = geotiff::read_file_with_nodata(path, &name, sidecar_nodata)?;
             #[cfg(target_arch = "wasm32")]
-            let r = geotiff::read(std::io::BufReader::new(std::fs::File::open(path)?), &name)?;
+            let r = geotiff::read_with_nodata(std::io::BufReader::new(std::fs::File::open(path)?), &name, sidecar_nodata)?;
             r
         }
         "png" | "jpg" | "jpeg" => read_scan(&name, std::io::BufReader::new(std::fs::File::open(path)?))?,
@@ -518,7 +700,7 @@ pub fn read_path(path: &Path) -> Result<Raster> {
                 return Err(DataError::Format("the ASCII grid is too large to open".into()));
             }
             let text = std::fs::read_to_string(path)?;
-            ascii::read(&text, &name, sidecar_crs(path))?
+            ascii::read_with_nodata(&text, &name, sidecar_crs(path), sidecar_nodata)?
         }
         #[cfg(not(target_arch = "wasm32"))]
         _ if gdal::is_gdal_raster_name(&path.to_string_lossy()) => {
@@ -527,8 +709,8 @@ pub fn read_path(path: &Path) -> Result<Raster> {
         }
         other => return Err(DataError::Unsupported(format!(".{other}"))),
     };
-    if let Some(p) = pam::read(path) {
-        r.apply_pam(&p);
+    if let Some(p) = &pam {
+        r.apply_pam(p);
     }
     r.source = Some(path.display().to_string());
     Ok(r)
@@ -576,9 +758,10 @@ pub(crate) fn unreferenced(w: u32, h: u32) -> GeoTransform {
 }
 
 /// Every `k`-th pixel of interleaved `ch`-sample pixels, one vector per band.
-fn deinterleave<T: Copy + Into<f32>>(raw: &[T], w: u32, h: u32, ch: usize, k: u32) -> Vec<Vec<f32>> {
+fn deinterleave<T: Copy + Into<f32>>(raw: &[T], w: u32, h: u32, ch: usize, k: u32) -> Result<Vec<Vec<f32>>> {
     let step = k.max(1) as usize;
-    let mut bands: Vec<Vec<f32>> = (0..ch).map(|_| Vec::with_capacity((w as usize).div_ceil(step) * (h as usize).div_ceil(step))).collect();
+    let (ow, oh) = ((w as usize).div_ceil(step), (h as usize).div_ceil(step));
+    let mut bands: Vec<Vec<f32>> = (0..ch).map(|_| grid(ow, oh)).collect::<Result<_>>()?;
     for row in (0..h as usize).step_by(step) {
         for col in (0..w as usize).step_by(step) {
             let at = (row * w as usize + col) * ch;
@@ -587,7 +770,7 @@ fn deinterleave<T: Copy + Into<f32>>(raw: &[T], w: u32, h: u32, ch: usize, k: u3
             }
         }
     }
-    bands
+    Ok(bands)
 }
 
 /// Reads a PNG or JPEG as a raster with no coordinates (`georeferenced` is false): its bands as
@@ -647,14 +830,14 @@ fn read_scan_limited<R: std::io::BufRead + std::io::Seek>(name: &str, mut source
         }
     }
     let (bands, color, data_type) = match &img {
-        D::ImageLuma8(i) => (deinterleave(i.as_raw(), w, h, ch, k), ColorHint::Gray, "UInt8"),
-        D::ImageLumaA8(i) => (deinterleave(i.as_raw(), w, h, ch, k), ColorHint::GrayAlpha, "UInt8"),
-        D::ImageRgb8(i) => (deinterleave(i.as_raw(), w, h, ch, k), ColorHint::Rgb { alpha: false }, "UInt8"),
-        D::ImageRgba8(i) => (deinterleave(i.as_raw(), w, h, ch, k), ColorHint::Rgb { alpha: true }, "UInt8"),
-        D::ImageLuma16(i) => (deinterleave(i.as_raw(), w, h, ch, k), ColorHint::Gray, "UInt16"),
-        D::ImageLumaA16(i) => (deinterleave(i.as_raw(), w, h, ch, k), ColorHint::GrayAlpha, "UInt16"),
-        D::ImageRgb16(i) => (deinterleave(i.as_raw(), w, h, ch, k), ColorHint::Rgb { alpha: false }, "UInt16"),
-        D::ImageRgba16(i) => (deinterleave(i.as_raw(), w, h, ch, k), ColorHint::Rgb { alpha: true }, "UInt16"),
+        D::ImageLuma8(i) => (deinterleave(i.as_raw(), w, h, ch, k)?, ColorHint::Gray, "UInt8"),
+        D::ImageLumaA8(i) => (deinterleave(i.as_raw(), w, h, ch, k)?, ColorHint::GrayAlpha, "UInt8"),
+        D::ImageRgb8(i) => (deinterleave(i.as_raw(), w, h, ch, k)?, ColorHint::Rgb { alpha: false }, "UInt8"),
+        D::ImageRgba8(i) => (deinterleave(i.as_raw(), w, h, ch, k)?, ColorHint::Rgb { alpha: true }, "UInt8"),
+        D::ImageLuma16(i) => (deinterleave(i.as_raw(), w, h, ch, k)?, ColorHint::Gray, "UInt16"),
+        D::ImageLumaA16(i) => (deinterleave(i.as_raw(), w, h, ch, k)?, ColorHint::GrayAlpha, "UInt16"),
+        D::ImageRgb16(i) => (deinterleave(i.as_raw(), w, h, ch, k)?, ColorHint::Rgb { alpha: false }, "UInt16"),
+        D::ImageRgba16(i) => (deinterleave(i.as_raw(), w, h, ch, k)?, ColorHint::Rgb { alpha: true }, "UInt16"),
         _ => return Err(fail(&"this pixel format isn't supported")),
     };
     drop(img);
@@ -844,6 +1027,20 @@ pub fn read_prj(path: &Path) -> Option<String> {
 pub(crate) mod tests {
     use super::*;
 
+    /// A band the machine can't hold is an error naming its size, not the end of the program
+    /// (#1291), on 64-bit (the reservation fails) and wasm32 (the size overflows) alike; one it can
+    /// is the size asked for.
+    #[test]
+    fn a_band_too_large_to_hold_is_an_error() {
+        let huge = 1usize << 31;
+        let err = grid::<f32>(huge, huge).unwrap_err().to_string();
+        assert_eq!(err, format!("not enough memory for a {huge} × {huge} raster"));
+        assert!(filled(usize::MAX, 2, 0u8).is_err());
+        assert!(room::<f64>(usize::MAX / 2, 1, 1).is_err(), "too many bytes to ask for");
+        assert_eq!(filled(3, 2, f32::NAN).map(|v| v.len()).ok(), Some(6));
+        assert!(grid::<u16>(4, 5).is_ok_and(|g| g.is_empty() && g.capacity() >= 20));
+    }
+
     /// A PNG of `w`×`h` pixels, red in its top half and blue below.
     pub(crate) fn png(w: u32, h: u32) -> Vec<u8> {
         let img =
@@ -964,6 +1161,62 @@ pub(crate) mod tests {
         assert_eq!(r.value(9, 0, 0), None);
         assert_eq!(r.pixel_at(Coord::new(10.6, 49.9)), Some((1, 0)));
         assert_eq!(r.pixel_at(Coord::new(0.0, 0.0)), None);
+    }
+
+    /// #1109: a lon/lat grid stored past 180° (0 to 360°) covers the places it holds within
+    /// ±180°, and the place at a western longitude is found in its columns past 180°.
+    #[test]
+    fn longitudes_past_180_go_round() {
+        let grid = |x0: f64, w: u32, px: f64, crs: Crs| {
+            let gt = GeoTransform { origin_x: x0, origin_y: 77.25, pixel_width: px, pixel_height: -0.5 };
+            Raster::new("g", w, 309, vec![vec![1.0; w as usize * 309]], gt, crs, None, ColorHint::Gray, "Float32").unwrap()
+        };
+        let lon = |r: &Raster| (r.extent().min_x, r.extent().max_x);
+        // The issue's grid: 720 × 0.5° from -0.25°, in EPSG:4326 and in another geographic system.
+        for crs in [Crs::LonLat, Crs::from_epsg(4269).unwrap()] {
+            let r = grid(-0.25, 720, 0.5, crs);
+            assert_eq!(lon(&r), (-180.0, 180.0), "{crs:?}");
+            assert!((r.extent().min_y + 77.25).abs() < 1e-6 && (r.extent().max_y - 77.25).abs() < 1e-6, "{crs:?}");
+            assert_eq!(r.pixel_at(Coord::new(-100.0, 0.0)), Some((520, 154)), "{crs:?}: 260°");
+            assert_eq!(r.pixel_at(Coord::new(100.0, 0.0)), Some((200, 154)), "{crs:?}");
+            assert_eq!(r.pixel_at(Coord::new(-0.1, 0.0)), Some((0, 154)), "{crs:?}");
+            assert_eq!(r.pixel_at(Coord::new(-0.3, 0.0)), Some((719, 154)), "{crs:?}: 359.7°");
+            // Do not clamp away the eastern strip of a regional grid straddling -180°.
+            let west = grid(-180.25, 41, 0.25, crs);
+            assert_eq!(lon(&west), (-180.0, 180.0), "{crs:?}");
+            assert!(west.extent().contains(Coord::new(179.9, 0.0)), "{crs:?}");
+        }
+        // A grid a turn east of its place is there; one across the antimeridian goes all round.
+        assert_eq!(lon(&grid(190.0, 20, 0.5, Crs::LonLat)), (-170.0, -160.0));
+        assert_eq!(lon(&grid(170.0, 40, 0.5, Crs::LonLat)), (-180.0, 180.0));
+        // Columns off a grid that doesn't reach round stay off it, and projected grids never wrap.
+        let part = grid(190.0, 20, 0.5, Crs::LonLat);
+        assert_eq!(part.pixel_at(Coord::new(0.0, 0.0)), None);
+        assert_eq!(part.pixel_at(Coord::new(-165.0, 0.0)), Some((10, 154)));
+        assert_eq!(grid(-0.25, 720, 0.5, Crs::WebMercator).wrap_col(-1.5), -1.5);
+        assert!(grid(-0.25, 720, 0.5, Crs::LonLat).wrap_col(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn geographic_extent_uses_greenwich_not_the_native_prime_meridian() {
+        let crs = Crs::parse("+proj=longlat +datum=WGS84 +pm=paris +no_defs").unwrap();
+        let grid = |x0: f64, width: u32| {
+            let gt = GeoTransform { origin_x: x0, origin_y: 1.0, pixel_width: 0.5, pixel_height: -1.0 };
+            Raster::new("Paris", width, 2, vec![vec![1.0; width as usize * 2]], gt, crs, None, ColorHint::Gray, "Float32").unwrap()
+        };
+        let e = grid(190.0, 20).extent();
+        let (west, east) = (-167.662_770_833_333, -157.662_770_833_333);
+        assert!((e.min_x - west).abs() < 1e-9 && (e.max_x - east).abs() < 1e-9, "{e:?}");
+        for x in [west + 1e-8, east - 1e-8] {
+            assert!(e.contains(Coord::new(x, 0.0)), "{x}: {e:?}");
+        }
+        for x in [west - 1e-8, east + 1e-8] {
+            assert!(!e.contains(Coord::new(x, 0.0)), "{x}: {e:?}");
+        }
+        // 177°..178° Paris is 179.337°..180.337° Greenwich, across the real antimeridian.
+        let e = grid(177.0, 2).extent();
+        assert_eq!((e.min_x, e.max_x), (-180.0, 180.0));
+        assert!(e.contains(Coord::new(179.9, 0.0)) && e.contains(Coord::new(-179.9, 0.0)));
     }
 
     #[test]

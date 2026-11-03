@@ -11,6 +11,7 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
 | [Cartography](cartography.md) | Symbology, labeling, layer effects and graphics |
 | [Editing](editing.md) | Creating and modifying features, data design, the clipboard and pop-ups |
 | [Analysis](analysis.md) | Selection and SQL queries, geoprocessing, the GeoLibre tools, guided workflows, imagery, data cubes and time series |
+| [Expressions](expressions.md) | The expression language of queries, filters and Calculate Field: grammar, operators, functions |
 | [Layouts and Reports](layouts.md) | Page layouts, map series, reports, presentations and notebooks |
 | [Sharing](sharing.md) | Exports, packages and open-format web maps, layers, styles and scenes |
 | [Workspace](workspace.md) | Linked views, the Browser view, animation, profiles, offline areas, customizing the ribbon |
@@ -54,23 +55,32 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
   group or zoom to a layer take a list in `layer`, or the picked layers when it is left out.
   **Group layers** to keep related ones together, such as one dataset drawn as several layers
   with their own visibility ranges: right-click a layer and pick **Group › New Group**, or move
-  it into a group that already exists. A group folds open and closed with its arrow; its box
-  shows or hides all its layers at once (each keeps its own box), and its menu renames it, sets a
-  transparency over its layers' own, ungroups it (its layers stay) or removes it with its layers.
-  Drag a layer onto a group's row, or between its layers, to put it in the group; drag it out
-  of the group's rows to take it out. Drag the group's row to move all its layers in the drawing
-  order. Scripts and the AI Assistant build groups with `group.add`, `group.set`,
-  `group.scaleRange` (a visibility range on top of each layer's own), `group.move`,
-  `group.expand`, `group.ungroup`, `group.remove` and `layer.group`.
-  **Copy Layer** (or **Copy Group**, with its layers) from its menu and **Paste Layer** (or
-  **Paste Group**) it on a layer (above it), a group or the map's name above the list
-  (at the top, also when the map has no layers yet), after switching to another map if you like,
-  or on a map in the Browser (at the top). The copy keeps its source, symbology, labels,
+  it into a group that already exists. Groups nest, up to eight levels (*Base map › Hydrography
+  › Rivers*): a new group made from layers that are all in one group goes inside it. A group
+  folds open and closed with its arrow; its box shows or hides all its layers at once, its
+  subgroups' too (each keeps its own box), and its menu renames it, sets a transparency over its
+  layers' own, ungroups it (its layers and subgroups go up one level) or removes it with its
+  layers and subgroups. The visibility, transparency and visibility range of every group above a
+  layer apply to it.
+  Drag a layer or group onto a group's row to put it in that group, or between rows to put it
+  in the group of the row below; drag it out of the group's rows to take it out. Drag a group's
+  row to move all its layers in the drawing order. Like a word processor's outline, a layer's or
+  group's menu has **Indent** (into the group just above it, as its last item) and **Outdent**
+  (out of its group, just below it); ++alt+shift+right++ and ++alt+shift+left++ indent and
+  outdent the active layer, ++alt+shift+up++ and ++alt+shift+down++ move it one step, past a
+  subgroup at once. Scripts and the AI Assistant build groups with `group.add` (`parent` puts it
+  in another), `group.set`, `group.scaleRange` (a visibility range on top of each layer's own),
+  `group.move`, `group.setParent`, `group.indent`, `group.outdent`, `group.expand`,
+  `group.ungroup`, `group.remove`, `layer.group`, `layer.indent` and `layer.outdent`.
+  **Copy Layer** (or **Copy Group**, with its layers and subgroups) from its menu and **Paste
+  Layer** (or **Paste Group**) it on a layer (above it), a group or the map's name above the
+  list (at the top, also when the map has no layers yet), after switching to another map if you
+  like, or on a map in the Browser (at the top). The copy keeps its source, symbology, labels,
   transparency, scale range, definition query, display filters and mask, but not its selection,
   and a name the map already has gets " copy". Pasting into the same map duplicates the layer. A
-  mask whose layer the map lacks is cleared, and said. Groups don't nest: pasted into a group (on
-  it, or on one of its layers), a copied group's layers join it at the top. Scripts use
-  `layer.copy` and `layer.paste`.
+  mask whose layer the map lacks is cleared, and said. Pasted into a group (on it, or on one of
+  its layers), the copies go in it at the top, copied groups too. Scripts use `layer.copy` and
+  `layer.paste`.
   The Style and Data tabs act on the layer selected here. The tabs at the top of the left pane
   switch it between **Layers**, **Browser** and **Data Sources** (also in **View › Windows**).
   The planet button above the list switches the map between the Earth and other celestial bodies.
@@ -87,9 +97,9 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
 - **Status bar**: the scale (type one, or pick from the list), the zoom level, bearing and pitch
   (click them to face north and look straight down again), the pointer's coordinates (click them
   to switch between decimal degrees and DMS), the coordinate system (click it to change the
-  projection), the selection count (with a button to clear it), the latest notice, the last draw
-  time, the frame rate and a **GPU**/**CPU** renderer switch. While agents control the desktop app,
-  it also shows the MCP relay or file bridge.
+  projection), the selection count (with a button to clear it), the latest notice (click to open
+  **Diagnostics**), a **Diagnostics** button, the last draw time, the frame rate and a **GPU**/**CPU**
+  renderer switch. While agents control the desktop app, it also shows the MCP relay or file bridge.
 
 **Command Search** (++ctrl+k++, or the box at the top right) finds commands and geoprocessing
 tools by name. Commands with an interactive entry point open their dialog, file picker or pane
@@ -104,6 +114,40 @@ To give the map more room, collapse the ribbon to its tab row with the chevron a
 end, by double-clicking a tab, or with ++ctrl+f1++ (++cmd+f1++ on macOS, where F1 may need the Fn
 key). Click a tab to peek at its commands while collapsed. When the window is narrower than the
 ribbon, arrows at its ends scroll it.
+
+### Diagnostics
+
+Open **View › Windows › Diagnostics**, click the status-bar notice or **Diagnostics** button,
+or search for **Diagnostics** in Command Search (`ui.pane.diagnosticLog`). This troubleshooting
+history is separate from **Help › Diagnostic Monitor**, which still shows performance metrics.
+
+Messages are collected even while the pane is closed. The newest entries appear first, with
+a UTC timestamp, severity, and source (such as the command id or Network). Expand **Technical
+details** for failed requests: their address, method, observed HTTP status and duration when
+available. Native connection failures and timeouts are identified when the transport knows
+them; an opaque browser failure does not claim a status or a specific DNS, CORS, or connection cause.
+
+Use **All**, **Errors**, **Warnings**, **Info**, or **Network failures** to filter the history
+(**Network failures** also lists the notes below about omitted absences). **Copy diagnostics**
+copies the filtered entries and their technical details, including folded details, as plain
+text: oldest entry first, with UTC Unix-millisecond timestamps, where the pane shows the newest
+first and a UTC date and time. **Clear** clears all entries, not just the selected filter. Closing
+or reopening the pane does not clear it.
+
+A map tile a server doesn't have (HTTP 404, or 410 where it is gone) is routine, as is a Zarr
+store's absent chunk, so each isn't listed. One **Network** note per server says that such
+absences are omitted, naming the first address. Past 64 servers one more note says that further
+servers aren't listed. A note that has left the 500 entries, or a **Clear**, lets its server be
+noted again.
+
+The last 500 entries are kept in memory for this session, including across project changes;
+older entries are discarded. Each message is limited to 2 KiB and technical details to 8 KiB.
+Nothing is saved in `.rgis` projects or sent automatically. Credentials are removed before
+retention: addresses omit user information, query strings and fragments; credential fields
+and structured payloads are omitted conservatively, which can also remove surrounding context.
+A credential field in the middle of a line is removed when its value is one word or quoted, but
+a value of several words reads as prose and is kept (`… password: correct horse battery`).
+Review copied diagnostics for private layer names or file paths before sharing them.
 
 ## The ribbon
 
@@ -194,6 +238,8 @@ with `{"index":0,"path":"/data/tiles.pmtiles"}`. Tile archives can also be selec
 | ++delete++ | Delete selected features; with Edit Vertices, the chosen vertex; in a layout, the selected element |
 | ++ctrl+d++ | Duplicate the selected layout element |
 | Arrow keys / ++shift++ + arrow keys | Nudge the selected layout element / nudge it further |
+| ++alt+shift+right++ / ++alt+shift+left++ | Indent the active layer into the group above it / outdent it out of its group |
+| ++alt+shift+up++ / ++alt+shift+down++ | Move the active layer up / down one step in the Layers pane |
 | ++ctrl+c++ / ++ctrl+x++ / ++ctrl+v++ | Copy / Cut / Paste features |
 
 On macOS, ++cmd++ takes the place of ++ctrl++. **Help › Shortcuts** lists them all in the app,

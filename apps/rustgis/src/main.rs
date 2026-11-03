@@ -11,9 +11,28 @@ use serde_json::json;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod menu;
 
 /// The app, and this run's marker (see [`running`]), cleared when eframe closes it.
-struct App(RustGisApp, running::Shared);
+struct App(RustGisApp, running::Shared, Menus);
+
+/// macOS: the menu bar (built once the app runs), the ids of the items chosen from it, and
+/// the commands chosen and not run yet.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct Menus {
+    bar: Option<menu::MenuBar>,
+    /// What the last build was for: a failed one is tried again only when that changes.
+    tried: Option<menu::Signature>,
+    /// The language and keymap the signature was last taken for: it's taken again only then.
+    seen: Option<(rustgis_ui_egui::i18n::Lang, u64)>,
+    chosen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    pending: Vec<menu::Action>,
+}
+#[cfg(not(target_os = "macos"))]
+#[derive(Default)]
+struct Menus {}
 
 /// Preferences in `prefs.json` beside the platform's other app settings.
 mod prefs {
@@ -248,6 +267,8 @@ impl eframe::App for App {
             self.0.ui.titlebar = titlebar;
         }
         self.0.logic(ctx);
+        #[cfg(target_os = "macos")]
+        self.menus(ctx);
         if self.0.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -255,11 +276,106 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.0.ui(ui);
     }
+    /// macOS: the Edit items arrive as clipboard events and keys (Undo and Redo in a focused text
+    /// field), so the app reads them as it reads typed ones; the others wait for `logic`. While
+    /// the shortcut editor is recording, the menu takes the keys it shows first: they go to it.
+    #[cfg(target_os = "macos")]
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let Some(bar) = &self.2.bar else { return };
+        let capturing = self.0.capturing_shortcut();
+        let press = |events: &mut Vec<egui::Event>, k: egui::KeyboardShortcut| {
+            for pressed in [true, false] {
+                events.push(egui::Event::Key { key: k.logical_key, physical_key: None, pressed, repeat: false, modifiers: k.modifiers });
+            }
+        };
+        for (action, shown) in bar.take_chosen() {
+            if capturing {
+                if let Some(k) = shown {
+                    press(&mut raw_input.events, k);
+                }
+                continue;
+            }
+            match action {
+                menu::Action::Cut => raw_input.events.push(egui::Event::Cut),
+                menu::Action::Copy => raw_input.events.push(egui::Event::Copy),
+                menu::Action::Paste => {
+                    if let Some(text) = menu::clipboard_text() {
+                        raw_input.events.push(egui::Event::Paste(text));
+                    }
+                }
+                menu::Action::SelectAll => {
+                    if let Some(k) = shown {
+                        press(&mut raw_input.events, k);
+                    }
+                }
+                // Undo and Redo as when typed: a focused text field or ModelBuilder's canvas takes
+                // the Mac's key, the keymap the key it gives them; with none, the command runs.
+                menu::Action::Keys { command, .. } => {
+                    let own = ctx.text_edit_focused() || (self.0.mb.shown() && !ctx.egui_wants_keyboard_input());
+                    let typed = shown.filter(|k| self.0.shortcut_command(*k).as_deref() == Some(command));
+                    match if own { menu::text_key(action) } else { typed } {
+                        Some(k) => press(&mut raw_input.events, k),
+                        None => self.2.pending.push(action),
+                    }
+                }
+                _ => self.2.pending.push(action),
+            }
+        }
+    }
     /// Every way eframe closes the app comes here, Cmd+Q on macOS included, which may not
     /// return from `run_native`: the run ended cleanly.
     fn on_exit(&mut self) {
         self.0.end_autosave();
         running::close(&self.1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl App {
+    /// The menu bar: built once the app runs, again for a new language or shortcut; its items
+    /// greyed out as their commands are; the commands chosen from it run, unless a dialog (Save
+    /// changes?) has the keys, as the keymap's do.
+    fn menus(&mut self, ctx: &egui::Context) {
+        // The shortcuts shown can only change with the language or the keymap.
+        let seen = (self.0.chosen_lang(), self.0.shortcuts_fingerprint());
+        if self.2.seen != Some(seen) {
+            self.2.seen = Some(seen);
+            let now = menu::signature(&self.0);
+            if self.2.bar.as_ref().is_none_or(|b| *b.built_for() != now) && self.2.tried.as_ref() != Some(&now) {
+                self.2.tried = Some(now);
+                match menu::MenuBar::new(&self.0, self.2.chosen.clone()) {
+                    Ok(bar) => self.2.bar = Some(bar),
+                    Err(e) => log::warn!("menu bar: {e}"),
+                }
+            }
+        }
+        // While the shortcut editor records, the items stay on: their keys go to it (raw_input_hook).
+        let blocked = ctx.memory(|m| m.top_modal_layer()).is_some();
+        if let Some(bar) = &mut self.2.bar {
+            bar.follow(&self.0, blocked);
+        }
+        if blocked {
+            self.2.pending.clear();
+            return;
+        }
+        // One a frame: one that opens a dialog (Save changes?) keeps the next from running.
+        if self.2.pending.is_empty() {
+            return;
+        }
+        let action = self.2.pending.remove(0);
+        if !self.2.pending.is_empty() {
+            ctx.request_repaint();
+        }
+        if action == menu::Action::CloseWindow {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if let Some((id, params)) = menu::command_of(action) {
+            match self.0.run_by_user(id, params) {
+                // Running out of undo isn't news, as with the keys.
+                Err(_) if matches!(action, menu::Action::Keys { .. }) => {}
+                Err(e) => self.0.session.notify(e, true),
+                Ok(_) => {}
+            }
+        }
     }
 }
 
@@ -353,6 +469,14 @@ fn main() -> eframe::Result {
         Ok(_) => Some("the settings folder can't lock files, so a second copy of RustGIS couldn't be told apart".into()),
         Err(why) => Some(why.clone()),
     };
+    // The keys the macOS menu bar keeps, before the stored shortcuts load: the keymap leaves them
+    // out and the shortcut editor refuses them.
+    #[cfg(target_os = "macos")]
+    let app = {
+        let mut app = app;
+        app.ui.reserved_shortcuts = menu::reserved();
+        app
+    };
     let mut app = app.with_services(services);
     // Settings › Start-up; `--sample` still opens the sample.
     let blank = if args.iter().any(|a| a == "--sample") { Some(false) } else { (!files.is_empty()).then_some(true) };
@@ -409,10 +533,29 @@ fn main() -> eframe::Result {
         let env = std::env::var("WGPU_BACKEND").ok();
         setup.instance_descriptor.backends = backends(backend, env.as_deref(), cfg!(windows));
     }
-    let options = eframe::NativeOptions { viewport, wgpu_options, ..Default::default() };
+    #[allow(unused_mut)]
+    let mut options = eframe::NativeOptions { viewport, wgpu_options, ..Default::default() };
+    // macOS: the app's own menu bar (menu.rs) in place of winit's minimal one.
+    #[cfg(target_os = "macos")]
+    {
+        options.event_loop_builder = Some(Box::new(|builder| {
+            use winit::platform::macos::EventLoopBuilderExtMacOS as _;
+            builder.with_default_menu(false);
+        }));
+    }
     let marker: running::Shared = std::sync::Arc::new(std::sync::Mutex::new(marker.ok()));
     let held = marker.clone();
-    let result = eframe::run_native("RustGIS", options, Box::new(move |_cc| Ok(Box::new(App(app, held)))));
+    let menus = Menus::default();
+    let result = eframe::run_native(
+        "RustGIS",
+        options,
+        Box::new(move |_cc| {
+            // The menu's choices wake the app: egui draws only on events.
+            #[cfg(target_os = "macos")]
+            menu::listen(menus.chosen.clone(), _cc.egui_ctx.clone());
+            Ok(Box::new(App(app, held, menus)))
+        }),
+    );
     running::close(&marker);
     result
 }

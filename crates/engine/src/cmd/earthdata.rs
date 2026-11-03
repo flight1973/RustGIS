@@ -1,7 +1,8 @@
 //! NASA Earthaccess: Earthdata's collections found by keyword, a collection's granules where the
 //! map is and between two dates (their footprints added as a layer), and the Earthdata Login
-//! token their files are read with (kept for the session only; see `rustgis_tiles::earthdata`).
-//! A granule's GeoTIFF is added by its address (`layer.addUrl`), read in place as a COG.
+//! token their files are read with (kept for the session, or remembered on this computer; see
+//! `rustgis_tiles::earthdata`). A granule's GeoTIFF is added by its address (`layer.addUrl`),
+//! read in place as a COG.
 
 use serde_json::{Value, json};
 
@@ -18,26 +19,56 @@ pub fn commands() -> Vec<C> {
             r#"{"collection"?: "a collection's concept id (C…-PROVIDER, as earthdata.collections lists it)", "shortName"?: "or a short name: its cloud-hosted, newest version", "bbox"?: [west, south, east, north] | "view" (the map's extent, the default), "view"?: bool (false: everywhere), "start"?: "YYYY-MM-DD", "end"?: "YYYY-MM-DD", "limit"?: 1–100 (25), "page"?: number (1), "footprints"?: bool (adds the granules' footprints as a layer, default true), "name"?: text (the footprints layer's), "answer"?: "CMR's JSON answer, when already fetched"} — each granule lists its data files; add a GeoTIFF with layer.addUrl (files need an Earthdata Login token: earthdata.login)"#,
         ),
         C::new("earthdata.login", "Earthdata Login Token", "Home › Add › Web Data › NASA Earthaccess", login).view().params(
-            r#"{"token": "an Earthdata Login token (Earthdata Login › Generate Token)"} — kept for the session only, never in the project; sent only to NASA's Earthdata data hosts (https://*.earthdatacloud.nasa.gov, *.earthdata.nasa.gov) when their files are read"#,
+            r#"{"token": "an Earthdata Login token (Earthdata Login › Generate Token)", "remember"?: bool (false: kept for the session only; true: also remembered on this computer, in the system's credential store, and read back when next needed; without it a token remembered before is deleted)} — never in the project; sent only to NASA's Earthdata data hosts (https://*.earthdatacloud.nasa.gov, *.earthdata.nasa.gov) when their files are read; an expired token is forgotten"#,
         ),
-        C::new("earthdata.logout", "Forget Earthdata Login Token", "Home › Add › Web Data › NASA Earthaccess", |_s, _p| {
-            earthdata::set_token(None)?;
-            Ok(json!({"token": false}))
+        C::new("earthdata.logout", "Forget Earthdata Login Token", "Home › Add › Web Data › NASA Earthaccess", logout)
+            .view()
+            .params("{} — forgets the token for the session and deletes the one remembered on this computer"),
+        C::new("earthdata.status", "Earthdata Login Status", "Home › Add › Web Data › NASA Earthaccess", |_s, _p| {
+            // Asked for: the token remembered on this computer is read, if it wasn't.
+            earthdata::restore();
+            earthdata::forget_if_expired();
+            Ok(status())
         })
-        .view(),
-        C::new("earthdata.status", "Earthdata Login Status", "Home › Add › Web Data › NASA Earthaccess", |_s, _p| Ok(status())).view(),
+        .view()
+        .params("{} — whether a token is kept, its expiry, whether it is remembered on this computer, and whether an expired one was forgotten (give a new one with earthdata.login)"),
     ]
 }
 
-/// Whether a token is kept, and when it expires.
+/// Whether a token is kept, when it expires, whether it is remembered on this computer, and
+/// whether an expired one was forgotten.
 fn status() -> Value {
-    json!({"token": earthdata::has_token(), "expires": earthdata::token_expiry().map(earthdata::date_of)})
+    json!({
+        "token": earthdata::has_token(),
+        "expires": earthdata::token_expiry().map(earthdata::date_of),
+        "remembered": earthdata::is_remembered(),
+        "expired": earthdata::expired_forgotten(),
+    })
 }
 
 fn login(_s: &mut Session, p: &Value) -> CmdResult {
+    // Judged before anything happens: a mistyped `remember` must not delete a remembered token.
+    let remember = match p.get("remember") {
+        None => false,
+        Some(Value::Bool(on)) => *on,
+        Some(_) => return Err("remember is true or false".into()),
+    };
     let token = ps(p, "token").map(str::trim).filter(|t| !t.is_empty()).ok_or("token is required (Earthdata Login › Generate Token)")?;
-    earthdata::set_token(Some(token))?;
-    Ok(status())
+    let warning = earthdata::login(token, remember)?;
+    let mut out = status();
+    if let Some(w) = warning {
+        out["warning"] = json!(w);
+    }
+    Ok(out)
+}
+
+fn logout(_s: &mut Session, _p: &Value) -> CmdResult {
+    let forgotten = earthdata::logout();
+    let mut out = status();
+    if let Err(w) = forgotten {
+        out["warning"] = json!(w);
+    }
+    Ok(out)
 }
 
 /// A page size and number a command names.

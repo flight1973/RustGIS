@@ -11,6 +11,7 @@ if os.environ.get("RUSTGIS_TEST_QT") != "1":
     pytest.importorskip("PySide6.QtWebEngineWidgets")
 
 from rustgis.qt import HOST_URL, MapWidget, _host_page  # noqa: E402  (before the QApplication)
+from PySide6.QtCore import QCoreApplication, QEvent  # noqa: E402
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -25,16 +26,43 @@ POINT = {
 NOWHERE = "http://127.0.0.1:9/"
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def app():
-    """The application the widgets need."""
-    return QApplication.instance() or QApplication([])
+    """The application the widgets need, kept alive until every test's widgets are destroyed.
+
+    WebEngine runs without the GPU. With it, WebEngine's GPU thread sets up EGL (Mesa reads the
+    environment with getenv there) while the tests go on, and a test or library that adds an
+    environment variable at that moment can crash the process: glibc's setenv may move and free
+    the environment array that getenv is reading (#1113). The tests never draw the page.
+    """
+    return QApplication.instance() or QApplication(["rustgis-tests", "--webEngineArgs", "--disable-gpu"])
 
 
 @pytest.fixture
-def widget(app):
+def make_widget(app):
+    """Destroy native widgets on the GUI thread, without relying on cyclic garbage collection."""
+    widgets = []
+
+    def make(*args, **kwargs):
+        w = MapWidget(*args, **kwargs)
+        widgets.append(w)
+        return w
+
+    try:
+        yield make
+    finally:
+        for w in widgets:
+            w.close()
+            # The bridge has no Qt parent, so deleting the widget does not delete it.
+            w._bridge.deleteLater()
+            w.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.fixture
+def widget(make_widget):
     """A widget whose scripts for the page are recorded rather than run."""
-    w = MapWidget(url=NOWHERE)
+    w = make_widget(url=NOWHERE)
     w.scripts = []
     w._js = w.scripts.append
     return w
@@ -94,11 +122,11 @@ def test_bad_messages_are_notices_not_crashes(widget):
     assert notices[-1] == ("unknown command", True) and all(error for _, error in notices)
 
 
-def test_options_and_the_session(app, tmp_path):
+def test_options_and_the_session(make_widget, tmp_path):
     path = tmp_path / "sites.geojson"
     path.write_text(json.dumps(POINT))
     s = rustgis.Session()
-    w = MapWidget(s, data=[path], lang="de", url=NOWHERE)
+    w = make_widget(s, data=[path], lang="de", url=NOWHERE)
     assert w._src == NOWHERE + "?embed&lang=de"
     assert w.session is s and w["sites"] in s
     # A small file travels with the project: the app can't read the path.

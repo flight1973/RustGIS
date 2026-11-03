@@ -51,7 +51,9 @@ which the app shows in its status bar, goes to standard error.
 Pass `--use-saved-secrets` to load the desktop app's saved connections and let
 `connection.login` and project sources use their remembered database passwords and S3 keys.
 It also lets `ask` use the API key the app remembers, only for the same provider and address
-when the environment supplies no key, and the ChatGPT sign-in kept in the system keychain.
+when the environment supplies no key, and the ChatGPT sign-in kept in the system keychain, and
+lets files on NASA's Earthdata data servers use the Earthdata Login token the app remembers
+(`earthdata.login` with `"remember": true` remembers one from here, too).
 Command parameters and environment variables take precedence over saved secrets. Connection
 changes aren't saved back to the desktop preferences. The flag applies to `run`, `ask`, `mcp`,
 `render` and `info`; for example, `rustgis-cli run --use-saved-secrets --cmd connection.list`.

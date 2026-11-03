@@ -1930,6 +1930,25 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
         });
     });
     group(ui, "Scene", |ui| {
+        let on = v.terrain.is_some();
+        // The active DEM by name, so a recorded step replays on it, not on whatever is active then.
+        let dem =
+            app.session.active_layer.and_then(|id| app.session.map().layer(id)).filter(|l| l.raster.is_some()).map(|l| l.name.clone());
+        big(
+            ui,
+            app,
+            "relief",
+            "Terrain",
+            "Drape the map over the heights of the active raster layer (a DEM, in metres), and tilt the map to see the relief. Click again to flatten it.",
+            "map.terrain",
+            match (on, dem) {
+                (true, _) => json!({"off": true}),
+                (false, Some(layer)) => json!({"layer": layer}),
+                (false, None) => json!({}),
+            },
+            on,
+            false,
+        );
         col(ui, |ui| {
             small(
                 ui,
@@ -2101,16 +2120,28 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 app.ui.right == Some(RightPane::Labeling),
             );
         });
-        small(
-            ui,
-            app,
-            "table",
-            "Attribute Table",
-            "Open the selected layer's table.",
-            "table.open",
-            Value::Null,
-            app.session.table_layer.is_some(),
-        );
+        col(ui, |ui| {
+            small(
+                ui,
+                app,
+                "table",
+                "Attribute Table",
+                "Open the selected layer's table.",
+                "table.open",
+                Value::Null,
+                app.session.table_layer.is_some(),
+            );
+            small(
+                ui,
+                app,
+                "identify",
+                "Diagnostics",
+                "Review errors, warnings, information and failed network requests from this session.",
+                "ui.pane.diagnosticLog",
+                Value::Null,
+                app.ui.right == Some(RightPane::DiagnosticLog),
+            );
+        });
     });
     group(ui, "Navigation", |ui| {
         big(ui, app, "zoom_world", "World", "Zoom to the whole world.", "map.zoomWorld", Value::Null, false, false);
@@ -3242,62 +3273,157 @@ fn panel_open(app: &RustGisApp, id: &str) -> bool {
     app.ui.right == Some(crate::RightPane::Plugin) && app.ui.plugin_panel.plugin.as_deref() == Some(id)
 }
 
-/// A plugin's own tab: its groups of commands, tools and menus.
+/// A plugin entry, shared by ribbon buttons and menu rows (`layout == None`).
+fn plugin_entry(
+    app: &mut RustGisApp,
+    ui: &mut Ui,
+    m: &rustgis_engine::plugins::Manifest,
+    lang: &str,
+    entry: &str,
+    layout: Option<rustgis_engine::plugins::Layout>,
+) {
+    use rustgis_engine::plugins::{Entry, Layout, command_id};
+    let open = panel_open(app, &m.id);
+    let mut show = |icon: &str, label: &str, help: &str, id: &str, params: Value| {
+        let label = if layout != Some(Layout::Large) && label.contains('\n') {
+            std::borrow::Cow::Owned(label.replace('\n', " "))
+        } else {
+            std::borrow::Cow::Borrowed(label)
+        };
+        let checked = open && id == "ui.pane.plugin";
+        match layout {
+            Some(Layout::Large) => {
+                big(ui, app, icon, &label, help, id, params, checked, false);
+            }
+            Some(Layout::Small) => {
+                small(ui, app, icon, &label, help, id, params, checked);
+            }
+            None => menu_item(ui, app, icon, &label, id, params),
+        }
+    };
+    match m.entry(entry) {
+        Some(Entry::Command(c)) => {
+            let icon = if crate::icons::ALL.contains(&c.icon.as_str()) { c.icon.as_str() } else { "plugin" };
+            show(icon, m.translate(lang, &c.label), m.translate(lang, &c.help), &command_id(&m.id, &c.id), Value::Null);
+        }
+        Some(Entry::Tool(t)) => {
+            let name = m.translate(lang, &t.name);
+            let label = if layout == Some(Layout::Large) {
+                std::borrow::Cow::Owned(name.replacen(' ', "\n", 1))
+            } else {
+                std::borrow::Cow::Borrowed(name)
+            };
+            show("toolbox", &label, m.translate(lang, &t.summary), "ui.gp.open", json!({"tool": command_id(&m.id, &t.id)}));
+        }
+        Some(Entry::Panel(d)) => {
+            let (icon, label, help) = panel_button(m, d, lang);
+            show(icon, &label, &help, "ui.pane.plugin", json!({"id": m.id}));
+        }
+        None => {}
+    }
+}
+
+/// Popup entries always use menu rows; nested menus cascade rather than opening another ribbon.
+fn plugin_menu_items(
+    app: &mut RustGisApp,
+    ui: &mut Ui,
+    m: &rustgis_engine::plugins::Manifest,
+    lang: &str,
+    items: &[rustgis_engine::plugins::ItemDecl],
+) {
+    use rustgis_engine::plugins::ItemDecl;
+    for (index, item) in items.iter().enumerate() {
+        ui.push_id(index, |ui| match item {
+            ItemDecl::Entry(e) => plugin_entry(app, ui, m, lang, e, None),
+            ItemDecl::Menu(menu) => {
+                let icon = if crate::icons::ALL.contains(&menu.icon.as_str()) { menu.icon.as_str() } else { "plugin" };
+                let label = m.translate(lang, &menu.menu);
+                let label = if label.contains('\n') {
+                    std::borrow::Cow::Owned(label.replace('\n', " "))
+                } else {
+                    std::borrow::Cow::Borrowed(label)
+                };
+                submenu_row(ui, icon, &label, |ui| plugin_menu_items(app, ui, m, lang, &menu.items));
+            }
+        });
+    }
+}
+
+fn plugin_item_layout(
+    item: &rustgis_engine::plugins::ItemDecl,
+    inherited: rustgis_engine::plugins::Layout,
+) -> rustgis_engine::plugins::Layout {
+    match item {
+        rustgis_engine::plugins::ItemDecl::Entry(_) => inherited,
+        rustgis_engine::plugins::ItemDecl::Menu(menu) => menu.layout.unwrap_or(inherited),
+    }
+}
+
+fn plugin_ribbon_item(
+    app: &mut RustGisApp,
+    ui: &mut Ui,
+    m: &rustgis_engine::plugins::Manifest,
+    lang: &str,
+    item: &rustgis_engine::plugins::ItemDecl,
+    layout: rustgis_engine::plugins::Layout,
+) {
+    use rustgis_engine::plugins::{ItemDecl, Layout};
+    match item {
+        ItemDecl::Entry(e) => plugin_entry(app, ui, m, lang, e, Some(layout)),
+        ItemDecl::Menu(menu) => {
+            let icon = if crate::icons::ALL.contains(&menu.icon.as_str()) { menu.icon.as_str() } else { "plugin" };
+            let label = m.translate(lang, &menu.menu);
+            let help = m.translate(lang, &menu.help);
+            let contents = |ui: &mut Ui, app: &mut RustGisApp| plugin_menu_items(app, ui, m, lang, &menu.items);
+            match layout {
+                Layout::Large => big_menu(ui, app, icon, label, help, contents),
+                Layout::Small => {
+                    let label = if label.contains('\n') {
+                        std::borrow::Cow::Owned(label.replace('\n', " "))
+                    } else {
+                        std::borrow::Cow::Borrowed(label)
+                    };
+                    small_menu(ui, app, icon, &label, help, contents);
+                }
+            }
+        }
+    }
+}
+
+/// A plugin's own tab: large controls and runs of three small controls per column.
 fn plugin_tab(app: &mut RustGisApp, ui: &mut Ui, plugin: &str) {
-    use rustgis_engine::plugins::{Entry, ItemDecl, command_id};
+    use rustgis_engine::plugins::Layout;
     let Some(p) = rustgis_engine::plugins::get(plugin).filter(|p| p.enabled) else { return };
     let Some(tab) = p.manifest.tab.as_ref() else { return };
     let m = &p.manifest;
     let lang = app.lang().code();
-    // What a button runs: a command, or the Tools pane open on a tool.
-    let target = |e: Entry<'_>| -> (String, String, String, String, Value) {
-        match e {
-            Entry::Command(c) => {
-                let icon = if crate::icons::ALL.contains(&c.icon.as_str()) { c.icon.clone() } else { "plugin".into() };
-                (
-                    icon,
-                    m.translate(lang, &c.label).to_string(),
-                    m.translate(lang, &c.help).to_string(),
-                    command_id(&m.id, &c.id),
-                    Value::Null,
-                )
-            }
-            Entry::Tool(t) => (
-                "toolbox".into(),
-                m.translate(lang, &t.name).replacen(' ', "\n", 1),
-                m.translate(lang, &t.summary).to_string(),
-                "ui.gp.open".into(),
-                json!({"tool": command_id(&m.id, &t.id)}),
-            ),
-            Entry::Panel(d) => {
-                let (icon, label, help) = panel_button(m, d, lang);
-                (icon.into(), label, help, "ui.pane.plugin".into(), json!({"id": m.id}))
-            }
-        }
-    };
-    let open = panel_open(app, &m.id);
-    for g in &tab.groups {
-        group(ui, m.translate(lang, &g.label), |ui| {
-            for item in &g.items {
-                match item {
-                    ItemDecl::Entry(e) => {
-                        if let Some((icon, label, help, id, params)) = m.entry(e).map(target) {
-                            let checked = open && id == "ui.pane.plugin";
-                            big(ui, app, &icon, &label, &help, &id, params, checked, false);
+    for (group_index, g) in tab.groups.iter().enumerate() {
+        ui.push_id(group_index, |ui| {
+            group(ui, m.translate(lang, &g.label), |ui| {
+                let mut remaining = g.items.as_slice();
+                let mut offset = 0;
+                while let Some(item) = remaining.first() {
+                    let layout = plugin_item_layout(item, g.layout);
+                    let count = if layout == Layout::Small {
+                        remaining.iter().take(3).take_while(|item| plugin_item_layout(item, g.layout) == Layout::Small).count()
+                    } else {
+                        1
+                    };
+                    let (column, rest) = remaining.split_at(count);
+                    let mut draw = |ui: &mut Ui| {
+                        for (index, item) in column.iter().enumerate() {
+                            ui.push_id(offset + index, |ui| plugin_ribbon_item(app, ui, m, lang, item, layout));
                         }
+                    };
+                    if layout == Layout::Small {
+                        col(ui, draw);
+                    } else {
+                        draw(ui);
                     }
-                    ItemDecl::Menu(menu) => {
-                        let icon = if crate::icons::ALL.contains(&menu.icon.as_str()) { menu.icon.as_str() } else { "plugin" };
-                        big_menu(ui, app, icon, m.translate(lang, &menu.menu), m.translate(lang, &menu.help), |ui, app| {
-                            for e in &menu.items {
-                                if let Some((icon, label, _, id, params)) = m.entry(e).map(target) {
-                                    menu_item(ui, app, &icon, &label.replace('\n', " "), &id, params);
-                                }
-                            }
-                        });
-                    }
+                    offset += count;
+                    remaining = rest;
                 }
-            }
+            });
         });
     }
 }
@@ -4014,14 +4140,18 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
         col(ui, |ui| {
             let mut c = crate::theme::c32(layer.renderer.base_symbol().fill);
             ui.horizontal(|ui| {
-                if crate::widgets::color_button(ui, &mut c).changed() {
+                let resp = crate::widgets::color_button(ui, &mut c);
+                if resp.changed() {
+                    crate::widgets::one_step_per_press(app, &resp);
                     let _ = app.run("layer.color", json!({"color": crate::theme::rgba(c).hex8()}));
                 }
                 ui.label(egui::RichText::new(tl!("Color")).size(11.5));
             });
             let mut w = layer.renderer.base_symbol().stroke_width;
             ui.horizontal(|ui| {
-                if ui.add(egui::DragValue::new(&mut w).range(0.0..=10.0).speed(0.05).suffix(" pt")).changed() {
+                let resp = ui.add(egui::DragValue::new(&mut w).range(0.0..=10.0).speed(0.05).suffix(" pt"));
+                if resp.changed() {
+                    crate::widgets::one_step_per_press(app, &resp);
                     let _ = app.run("layer.outline", json!({"width": w}));
                 }
                 ui.label(egui::RichText::new(tl!("Outline")).size(11.5));
@@ -4029,12 +4159,15 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
             if layer.geometry_type() == GeometryType::Point {
                 let mut s = layer.renderer.base_symbol().size;
                 ui.horizontal(|ui| {
-                    if ui.add(egui::DragValue::new(&mut s).range(1.0..=60.0).speed(0.1).suffix(" pt")).changed() {
+                    let resp = ui.add(egui::DragValue::new(&mut s).range(1.0..=60.0).speed(0.1).suffix(" pt"));
+                    if resp.changed() {
+                        crate::widgets::one_step_per_press(app, &resp);
                         let _ = app.run("layer.marker", json!({"size": s}));
                     }
                     ui.label(egui::RichText::new(tl!("Size")).size(11.5));
                 });
-            } else if layer.geometry_type() == GeometryType::Polygon && !layer.graphics {
+            }
+            if layer.has_geometry(GeometryType::Polygon) && !layer.graphics {
                 small(
                     ui,
                     app,
@@ -4102,7 +4235,9 @@ fn raster_style_groups(app: &mut RustGisApp, ui: &mut Ui) {
             let mut x = app.session.map().swipe.map_or(0.5, |(_, x)| x);
             ui.vertical(|ui| {
                 ui.add_space(14.0);
-                if ui.add(egui::Slider::new(&mut x, 0.0..=1.0).show_value(false)).on_hover_text(tl!("Swipe")).changed() {
+                let resp = ui.add(egui::Slider::new(&mut x, 0.0..=1.0).show_value(false)).on_hover_text(tl!("Swipe"));
+                if resp.changed() {
+                    crate::widgets::one_step_per_press(app, &resp);
                     let _ = app.run("layer.swipe", json!({"position": x}));
                 }
             });
@@ -4724,6 +4859,93 @@ mod tests {
         assert!(!has(&h, "Closest") && has(&h, "View Unplaced"), "the map's settings need no layer");
         assert!(!has(&tab_harness(cities(), style_tab), "Closest"), "Style keeps no label groups");
         assert!(!has(&tab_harness(cities(), view_tab), "View Unplaced"), "View keeps no label groups");
+    }
+
+    /// The Drawing group for the selected layer (Cities), as the Style tab draws it.
+    fn drawing_harness() -> egui_kittest::Harness<'static, RustGisApp> {
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 800.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                if let Some(layer) = app.session.active_layer.and_then(|id| app.session.map().layer(id)).cloned() {
+                    ui.horizontal(|ui| drawing_group(app, ui, &layer));
+                }
+            },
+            cities(),
+        );
+        h.run();
+        h
+    }
+
+    /// Drags a number of the harness from `at` by 16, 32 and 48 points, calling `each` between.
+    fn drag_by(h: &mut egui_kittest::Harness<'static, RustGisApp>, at: egui::Pos2, mut each: impl FnMut(&RustGisApp)) {
+        h.hover_at(at);
+        h.drag_at(at);
+        h.step();
+        for dx in [16.0, 32.0, 48.0] {
+            h.hover_at(at + vec2(dx, 0.0));
+            h.step();
+            each(h.state());
+        }
+        h.drop_at(at + vec2(48.0, 0.0));
+        h.run();
+    }
+
+    /// A drag of the point size runs `layer.marker` as it goes (the map follows it), and is one
+    /// undo step; the next drag is a step of its own (#1194).
+    #[test]
+    fn ribbon_marker_size_drag_is_one_undo_step() {
+        let mut h = drawing_harness();
+        let id = h.state().session.active_layer.unwrap();
+        let size = |app: &RustGisApp| app.session.map().layer(id).unwrap().renderer.base_symbol().size;
+        let before = size(h.state());
+        let undo = h.state().session.undo_depth();
+        // Outline, then Size.
+        let at = h.query_all_by_role(egui::accesskit::Role::SpinButton).nth(1).unwrap().rect().center();
+        let mut seen = Vec::new();
+        drag_by(&mut h, at, |app| {
+            seen.push(size(app));
+            assert_eq!(app.session.undo_depth(), undo + 1, "one step however many frames");
+        });
+        assert!(seen.windows(2).all(|w| w[1] > w[0]) && seen[0] > before, "the map follows the drag: {seen:?}");
+        let first = size(h.state());
+        drag_by(&mut h, at, |_| {});
+        let second = size(h.state());
+        assert!(second > first);
+        assert_eq!(h.state().session.undo_depth(), undo + 2, "a second drag is a step of its own");
+        h.state_mut().run("edit.undo", json!(null)).unwrap();
+        assert_eq!(size(h.state()), first);
+        h.state_mut().run("edit.undo", json!(null)).unwrap();
+        assert_eq!(size(h.state()), before);
+        h.state_mut().run("edit.redo", json!(null)).unwrap();
+        assert_eq!(size(h.state()), first);
+    }
+
+    /// A drag in the colour picker is one undo step back to the colour from before it (#1194).
+    #[test]
+    fn ribbon_colour_drag_is_one_undo_step() {
+        let mut h = drawing_harness();
+        let id = h.state().session.active_layer.unwrap();
+        let color = |app: &RustGisApp| app.session.map().layer(id).unwrap().renderer.base_symbol().fill;
+        let before = color(h.state());
+        let undo = h.state().session.undo_depth();
+        h.get_by_role(egui::accesskit::Role::ColorWell).click();
+        h.run();
+        // Outline and Size precede the picker's R/G/B/A numbers.
+        let at = h.query_all_by_role(egui::accesskit::Role::SpinButton).nth(2).unwrap().rect().center();
+        drag_by(&mut h, at, |app| {
+            assert_ne!(color(app), before, "the map follows the picker");
+            assert_eq!(app.session.undo_depth(), undo + 1, "one step however many frames");
+        });
+        let after = color(h.state());
+        h.state_mut().run("edit.undo", json!(null)).unwrap();
+        assert_eq!(color(h.state()), before);
+        h.state_mut().run("edit.redo", json!(null)).unwrap();
+        assert_eq!(color(h.state()), after);
     }
 
     /// Isolates the label controls; the interrupted-gesture test below checks full-frame wiring.

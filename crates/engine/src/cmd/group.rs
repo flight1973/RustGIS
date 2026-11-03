@@ -1,7 +1,8 @@
 //! Layer groups (#413): related layers under one name, shown, hidden, made see-through and
-//! limited to a scale range together.
+//! limited to a scale range together. Groups nest (#836): a group in another goes with it, and
+//! every group above a layer applies to it.
 
-use rustgis_map::{LayerGroup, MAX_GROUPS, Map};
+use rustgis_map::{LayerGroup, MAX_GROUP_DEPTH, MAX_GROUPS, Map, Outline};
 use serde_json::{Value, json};
 
 use super::{f, ps, uint};
@@ -10,7 +11,7 @@ use crate::{CmdResult, CommandSpec as C, Session};
 pub fn commands() -> Vec<C> {
     vec![
         C::new("group.add", "New Group", "Layers", add).params(
-            r#"{"name"?: text (default New Group), "layers"?: [name|id] (moved into it, out of any other group; together in the drawing order at the topmost)}"#,
+            r#"{"name"?: text (default New Group), "parent"?: name|id (the group it goes in), "layers"?: [name|id] (moved into it, out of any other group; together in the drawing order at the topmost)}"#,
         ),
         C::new("group.set", "Group Properties", "Layers", set).params(
             r#"{"group": name|id, "name"?: text, "visible"?: bool (toggles when no other property is given), "transparency"?: 0-100 (on top of each layer's own)}"#,
@@ -22,43 +23,73 @@ pub fn commands() -> Vec<C> {
             r#"{"group": name|id, "min"?: scale (out beyond), "max"?: scale (in beyond); both set on each call, one left out is cleared; its layers draw only within it and their own}"#,
         ),
         C::new("group.move", "Move Group", "Layers", move_group).params(
-            r#"{"group": name|id, "to": position among the other layers, counted in layers (0 = top; past the end, the bottom; never inside another group: above it)}"#,
+            r#"{"group": name|id, "to": position among the other layers, counted in layers (0 = top; past the end, the bottom; never inside another group: above it; a group in another stays in it, at most at its top or bottom)}"#,
         ),
-        C::new("group.ungroup", "Ungroup", "Layers", ungroup).params(r#"{"group": name|id} (its layers stay, out of any group)"#),
-        C::new("group.remove", "Remove Group", "Layers", remove).params(r#"{"group": name|id} (and its layers)"#),
+        C::new("group.setParent", "Move Group To Group", "Layers", set_parent).params(
+            r#"{"group": name|id, "parent": name|id|null (the group it goes in; null: the top level), "before"?: name|id|null (a layer or group: places the group just above it; null puts it at the end of the parent, or the bottom at the top level; omitted: next to the parent's layers, or where it is at the top level)}"#,
+        ),
+        C::new("group.indent", "Indent Group", "Layers", indent_group)
+            .params(r#"{"group": name|id} (into the group just above it in the Layers pane, as its last item)"#),
+        C::new("group.outdent", "Outdent Group", "Layers", outdent_group)
+            .params(r#"{"group": name|id} (out of the group it is in, up one level, just below that group)"#),
+        C::new("group.ungroup", "Ungroup", "Layers", ungroup)
+            .params(r#"{"group": name|id} (its layers and subgroups stay, one level up)"#),
+        C::new("group.remove", "Remove Group", "Layers", remove).params(r#"{"group": name|id} (and its layers and subgroups)"#),
         C::new("layer.group", "Move To Group", "Layers", move_to_group)
             .when(super::need_layer)
-            .params(r#"{"layer"?: name|id | [name|id] (default: the layer selection), "group": name|id|null (null takes it out of its group), "before"?: name|id|null (places a single layer just above this layer; null puts it at the group's end, or the bottom out of a group; omitted: next to the group's layers, or where it is when taken out)}"#),
+            .params(r#"{"layer"?: name|id | [name|id] (default: the layer selection), "group": name|id|null (null takes it out of its group), "before"?: name|id|null (places a single layer just above this layer, one of the group's or its subgroups'; null puts it at the group's end, or the bottom out of a group; omitted: next to the group's layers, or where it is when taken out)}"#),
+        C::new("layer.indent", "Indent Layer", "Layers", indent_layer)
+            .when(super::need_layer)
+            .params(r#"{"layer"?: name|id (default: the active layer)} (into the group just above it in the Layers pane, as its last item)"#),
+        C::new("layer.outdent", "Outdent Layer", "Layers", outdent_layer)
+            .when(super::need_layer)
+            .params(r#"{"layer"?: name|id (default: the active layer)} (out of its group, up one level, just below that group)"#),
     ]
 }
 
 /// A `group` parameter as the id of one of the map's groups: by id, or by name (ignoring case),
 /// else a name that is an id.
 pub(crate) fn group_id(m: &Map, p: &Value) -> Result<u32, String> {
-    match p.get("group") {
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .filter(|id| m.group(*id).is_some())
-            .ok_or_else(|| format!("no group with id {n}")),
-        Some(Value::String(name)) => m
+    group_ref(m, p.get("group")).ok_or_else(|| match p.get("group") {
+        Some(Value::Number(n)) => format!("no group with id {n}"),
+        Some(Value::String(name)) => format!("no group named '{name}'"),
+        _ => "give the group's name or id (\"group\")".into(),
+    })
+}
+
+/// A group named by id, or by name (ignoring case), else a name that is an id.
+fn group_ref(m: &Map, v: Option<&Value>) -> Option<u32> {
+    match v? {
+        Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|id| m.group(*id).is_some()),
+        Value::String(name) => m
             .groups
             .iter()
             .find(|g| g.name.eq_ignore_ascii_case(name.trim()))
             .map(|g| g.id)
-            .or_else(|| name.trim().parse::<u32>().ok().filter(|id| m.group(*id).is_some()))
-            .ok_or_else(|| format!("no group named '{name}'")),
-        _ => Err("give the group's name or id (\"group\")".into()),
+            .or_else(|| name.trim().parse::<u32>().ok().filter(|id| m.group(*id).is_some())),
+        _ => None,
+    }
+}
+
+/// A `parent` parameter: a group, or null for the top level.
+fn parent_of(m: &Map, p: &Value) -> Result<Option<u32>, String> {
+    match p.get("parent") {
+        None | Some(Value::Null) => Ok(None),
+        v => group_ref(m, v).map(Some).ok_or_else(|| "no such group to go in (\"parent\")".into()),
     }
 }
 
 /// A layer that can join a group: not one of a service's collections (its service group keeps it).
 fn groupable(s: &Session, id: u32) -> Result<u32, String> {
-    if s.map().service_groups.iter().any(|g| g.children.iter().any(|c| c.layer == id)) {
+    if in_service(s.map(), id) {
         let name = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
         return Err(format!("'{name}' belongs to a service group"));
     }
     Ok(id)
+}
+
+fn in_service(m: &Map, id: u32) -> bool {
+    m.service_groups.iter().any(|g| g.children.iter().any(|c| c.layer == id))
 }
 
 fn name_of(p: &Value) -> Result<Option<String>, String> {
@@ -79,6 +110,10 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
         return Err(format!("a map holds at most {MAX_GROUPS} groups"));
     }
     let name = name_of(p)?.unwrap_or_else(|| "New Group".into());
+    let parent = parent_of(s.map(), p)?;
+    if parent.is_some_and(|g| s.map().group_depth(g) >= MAX_GROUP_DEPTH) {
+        return Err(format!("groups nest at most {MAX_GROUP_DEPTH} levels deep"));
+    }
     let mut children = Vec::new();
     if let Some(layers) = p.get("layers") {
         let layers = layers.as_array().ok_or("layers must be a list of layer names or ids")?;
@@ -94,8 +129,8 @@ fn add(s: &mut Session, p: &Value) -> CmdResult {
     children.sort_by_key(|id| m.layer_index(*id));
     let mut group = LayerGroup::new(name);
     group.children = children;
+    group.parent = parent;
     let id = m.add_group(group);
-    m.gather_group(id);
     Ok(json!({"group": id}))
 }
 
@@ -165,20 +200,111 @@ fn move_group(s: &mut Session, p: &Value) -> CmdResult {
     Ok(Value::Null)
 }
 
+/// A `before` that names a layer or a group, as the layer at the top of it.
+fn before_of(s: &Session, v: &Value) -> Result<u32, String> {
+    let m = s.map();
+    if let Ok(id) = s.layer_id(&json!({"layer": v})) {
+        return Ok(id);
+    }
+    let g = group_ref(m, Some(v)).ok_or("no layer or group to go before")?;
+    m.group_layers(g).first().copied().ok_or_else(|| "the group to go before has no layers".into())
+}
+
+fn set_parent(s: &mut Session, p: &Value) -> CmdResult {
+    let id = group_id(s.map(), p)?;
+    if p.get("parent").is_none() {
+        return Err("give the group to go in (\"parent\"), or null for the top level".into());
+    }
+    let parent = parent_of(s.map(), p)?;
+    match p.get("before") {
+        None => s.map_mut().set_group_parent(id, parent)?,
+        Some(Value::Null) => s.map_mut().place_group(id, parent, None)?,
+        Some(v) => {
+            let before = before_of(s, v)?;
+            s.map_mut().place_group(id, parent, Some(before))?;
+        }
+    }
+    Ok(json!({"group": id, "parent": parent}))
+}
+
+/// The group just above an item at its level of the outline, which indenting puts it in.
+fn group_above(m: &Map, parent: Option<u32>, item: Outline) -> Result<u32, String> {
+    let level = m.outline(parent);
+    let at = level.iter().position(|x| *x == item).ok_or("it isn't listed in the Layers pane")?;
+    match at.checked_sub(1).and_then(|k| level.get(k)) {
+        None => Err("nothing above it to go into: it is first at its level".into()),
+        Some(Outline::Group(g)) => Ok(*g),
+        Some(Outline::Layer(l)) => {
+            let name = m.layer(*l).map(|l| l.name.clone()).unwrap_or_default();
+            if in_service(m, *l) {
+                Err(format!("'{name}' above it is in a service group, which keeps its own layers"))
+            } else {
+                Err(format!("'{name}' above it is a layer, not a group"))
+            }
+        }
+    }
+}
+
+/// The layer just below a group's layers (leaving `moving` out) if it is in `parent` (`None`:
+/// any): what goes just below the group goes before it. `None`: the end of `parent`, or the
+/// bottom.
+fn below(m: &Map, group: u32, parent: Option<u32>, moving: &[u32]) -> Option<u32> {
+    let members = m.group_layers(group);
+    let last = m.layers.iter().rposition(|l| members.contains(&l.id))?;
+    m.layers.iter().skip(last + 1).map(|l| l.id).find(|id| !moving.contains(id)).filter(|next| parent.is_none_or(|p| m.layer_in(*next, p)))
+}
+
+fn indent_layer(s: &mut Session, p: &Value) -> CmdResult {
+    let id = groupable(s, s.layer_id(p)?)?;
+    let m = s.map();
+    let into = group_above(m, m.group_of(id).map(|g| g.id), Outline::Layer(id))?;
+    s.map_mut().place_layer(id, Some(into), None)?;
+    Ok(json!({"layer": id, "group": into}))
+}
+
+fn outdent_layer(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    let m = s.map();
+    let g = m.group_of(id).ok_or("the layer isn't in a group")?;
+    let (group, parent) = (g.id, g.parent);
+    let before = below(m, group, parent, &[id]);
+    s.map_mut().place_layer(id, parent, before)?;
+    Ok(json!({"layer": id, "group": parent}))
+}
+
+fn indent_group(s: &mut Session, p: &Value) -> CmdResult {
+    let id = group_id(s.map(), p)?;
+    let m = s.map();
+    let parent = m.group(id).and_then(|g| g.parent);
+    let into = group_above(m, parent, Outline::Group(id))?;
+    s.map_mut().place_group(id, Some(into), None)?;
+    Ok(json!({"group": id, "parent": into}))
+}
+
+fn outdent_group(s: &mut Session, p: &Value) -> CmdResult {
+    let id = group_id(s.map(), p)?;
+    let m = s.map();
+    let parent = m.group(id).and_then(|g| g.parent).ok_or("the group isn't in another group")?;
+    let up = m.group(parent).and_then(|g| g.parent);
+    let before = below(m, parent, up, &m.group_layers(id));
+    s.map_mut().place_group(id, up, before)?;
+    Ok(json!({"group": id, "parent": up}))
+}
+
 fn ungroup(s: &mut Session, p: &Value) -> CmdResult {
     let id = group_id(s.map(), p)?;
-    // The tile layers over the group stay over its layers, where they were.
-    s.map_mut().settle_tiles();
-    s.map_mut().groups.retain(|g| g.id != id);
+    s.map_mut().ungroup(id)?;
     Ok(Value::Null)
 }
 
 fn remove(s: &mut Session, p: &Value) -> CmdResult {
     let id = group_id(s.map(), p)?;
-    let children = s.map().group(id).map(|g| g.children.clone()).unwrap_or_default();
-    crate::cmd::layer::drop_layers(s, &children);
-    s.map_mut().groups.retain(|g| g.id != id);
-    if s.active_layer.is_some_and(|a| children.contains(&a)) {
+    let layers = s.map().group_layers(id);
+    let mut gone = s.map().subgroups(id);
+    gone.push(id);
+    crate::cmd::layer::drop_layers(s, &layers);
+    s.map_mut().groups.retain(|g| !gone.contains(&g.id));
+    if s.active_layer.is_some_and(|a| layers.contains(&a)) {
         s.active_layer = s.map().layers.first().map(|l| l.id);
     }
     Ok(Value::Null)

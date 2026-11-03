@@ -87,7 +87,9 @@ pub(crate) fn add_layer_from(
             );
         }
         let items = asked.as_deref().unwrap_or(items);
-        return crate::connectiontree::run_add_url(app, json!({"url": items, "name": title, "service": true}), origin)
+        // The layer's bounds go along, for its features' axes (#1053).
+        let bounds = l.get("bbox").cloned().unwrap_or_default();
+        return crate::connectiontree::run_add_url(app, json!({"url": items, "name": title, "service": true, "bounds": bounds}), origin)
             .map(|_| tl!("Downloading…"));
     }
     let origin = origin.map(str::to_string);

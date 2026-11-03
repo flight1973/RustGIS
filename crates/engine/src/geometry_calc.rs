@@ -1,8 +1,8 @@
 //! The attribute table's geometry calculator: stores each feature's area, perimeter, length or
 //! X/Y coordinate, calculated from its WGS84 geometry, in a field.
 use crate::{CmdResult, Session};
-use rustgis_data::{FieldType, Geometry, GeometryType, Value, raster::Crs};
-use rustgis_geom::{geodesic_length_m, geodesic_ring_area_m2, spherical_centre};
+use rustgis_data::{FieldType, Geometry, GeometryType, Measure, Value, raster::Crs};
+use rustgis_geom::spherical_centre;
 use serde_json::{Value as Json, json};
 
 /// The properties a layer of `kind` can calculate, as `(key, label)` pairs.
@@ -29,29 +29,6 @@ pub fn units(property: &str) -> &'static [(&'static str, &'static str)] {
         "length" | "perimeter" => &[("m", "Metres"), ("km", "Kilometres"), ("ft", "Feet"), ("mi", "Miles")],
         "x" | "y" => &[("deg", "Degrees (WGS84)"), ("projected", "Projected CRS units")],
         _ => &[],
-    }
-}
-
-fn measure(g: &Geometry, property: &str) -> Option<f64> {
-    match (g, property) {
-        (Geometry::Polygon(polys), "area") => Some(
-            polys
-                .iter()
-                .map(|rings| rings.iter().enumerate().map(|(i, r)| geodesic_ring_area_m2(r) * if i == 0 { 1.0 } else { -1.0 }).sum::<f64>())
-                .sum(),
-        ),
-        (Geometry::Polygon(polys), "perimeter") => Some(
-            polys
-                .iter()
-                .flatten()
-                .map(|r| {
-                    let closing = r.first().zip(r.last()).filter(|(a, b)| a != b).map(|(a, b)| geodesic_length_m(&[*b, *a])).unwrap_or(0.0);
-                    geodesic_length_m(r) + closing
-                })
-                .sum(),
-        ),
-        (Geometry::Line(parts), "length") => Some(parts.iter().map(|r| geodesic_length_m(r)).sum()),
-        _ => None,
     }
 }
 
@@ -104,16 +81,10 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
     if rows.is_empty() {
         return Err("no features to calculate".into());
     }
-    let divisor = match unit {
-        "km" => 1e3,
-        "ft" => rustgis_geom::METRES_PER_FOOT,
-        "mi" => rustgis_geom::METRES_PER_MILE,
-        "km2" => 1e6,
-        "ft2" => rustgis_geom::SQUARE_METRES_PER_SQUARE_FOOT,
-        "mi2" => rustgis_geom::SQUARE_METRES_PER_SQUARE_MILE,
-        "ha" => 1e4,
-        "ac" => rustgis_geom::SQUARE_METRES_PER_ACRE,
-        _ => 1.0,
+    let measure = Measure::from_key(property);
+    let divisor = match measure {
+        Some(m) => m.unit(unit).ok_or("unit does not match the property")?,
+        None => 1.0,
     };
     let mut values = Vec::with_capacity(rows.len());
     let mut nulls = 0;
@@ -147,7 +118,7 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
                 };
                 c.map(|c| if property == "x" { c.x } else { c.y })
             } else {
-                measure(g, property).map(|v| v / divisor)
+                measure.and_then(|m| g.wgs84_measure(m)).map(|v| v / divisor)
             }
         } else {
             None

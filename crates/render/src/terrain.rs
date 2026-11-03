@@ -26,7 +26,10 @@ const STAND_IN_LEVELS: u8 = 8;
 const COARSE_LEVELS: u8 = 4;
 
 enum Heights {
-    Raster(Arc<Raster>),
+    Raster {
+        raster: Arc<Raster>,
+        wrap_width: Option<i64>,
+    },
     Tiles {
         url: String,
         encoding: TerrainEncoding,
@@ -58,7 +61,11 @@ impl Ground {
         }
         let exaggeration = if t.exaggeration.is_finite() { t.exaggeration.clamp(0.0, rustgis_map::view::MAX_EXAGGERATION) } else { 1.0 };
         let heights = match &t.source {
-            TerrainSource::Layer(name) => Heights::Raster(map.layer_by_name(name)?.raster.as_ref()?.data.clone()?),
+            TerrainSource::Layer(name) => {
+                let raster = map.layer_by_name(name)?.raster.as_ref()?.data.clone()?;
+                let wrap_width = crate::raster::full_turn_width(&raster);
+                Heights::Raster { raster, wrap_width }
+            }
             TerrainSource::Tiles { url, encoding } => {
                 // Tiles a few screen pixels a cell at the view's centre: relief, not detail.
                 let world = 2.0 * std::f64::consts::PI * MERCATOR_R;
@@ -81,7 +88,7 @@ impl Ground {
     /// is known (off the DEM, or no tile read yet).
     pub fn height(&self, m: Coord) -> Option<f64> {
         let h = match &self.heights {
-            Heights::Raster(r) => raster_height(r, m)?,
+            Heights::Raster { raster, wrap_width } => raster_height(raster, m, *wrap_width)?,
             Heights::Tiles { url, encoding, zoom, read, pending, waiting } => {
                 tile_height(url, *encoding, *zoom, read, pending, waiting, m)?
             }
@@ -107,7 +114,7 @@ impl Ground {
     /// Whether elevation tiles are still on their way (drawing again later shows more).
     pub fn pending(&self) -> bool {
         match &self.heights {
-            Heights::Raster(_) => false,
+            Heights::Raster { .. } => false,
             Heights::Tiles { pending, .. } => *pending.borrow(),
         }
     }
@@ -115,9 +122,10 @@ impl Ground {
 
 /// A DEM's height at a Web Mercator point, read bilinearly from its first band; nodata and
 /// points off it give `None`.
-fn raster_height(r: &Raster, m: Coord) -> Option<f64> {
+fn raster_height(r: &Raster, m: Coord, wrap_width: Option<i64>) -> Option<f64> {
     let n = r.transformer().from_merc(m)?;
     let (px, py) = r.transform.to_pixel(n);
+    let px = r.wrap_col(px);
     let (fx, fy) = (px - 0.5, py - 0.5);
     if !(fx.is_finite() && fy.is_finite()) {
         return None;
@@ -125,7 +133,9 @@ fn raster_height(r: &Raster, m: Coord) -> Option<f64> {
     let (x0, y0) = (fx.floor(), fy.floor());
     let (tx, ty) = (fx - x0, fy - y0);
     let at = |dx: i64, dy: i64| -> Option<f64> {
-        let (x, y) = ((x0 as i64 + dx).clamp(0, i64::from(r.width) - 1), (y0 as i64 + dy).clamp(0, i64::from(r.height) - 1));
+        let x = x0 as i64 + dx;
+        let x = wrap_width.map_or_else(|| x.clamp(0, i64::from(r.width) - 1), |w| if x < 0 || x >= w { x.rem_euclid(w) } else { x });
+        let y = (y0 as i64 + dy).clamp(0, i64::from(r.height) - 1);
         r.value(0, x, y).map(f64::from).filter(|v| v.is_finite())
     };
     // Off the grid by more than half a cell: nothing.
@@ -173,7 +183,7 @@ fn tile_height(
         }
         let u = template::expand(url, id, 256, false, &[]);
         let got = if fetch {
-            match cache::get(&u, Want::Image) {
+            match cache::get_tile(&u, Want::Image) {
                 State::Ready(p) => Some(p),
                 State::Pending => {
                     *pending.borrow_mut() = true;
@@ -231,7 +241,57 @@ fn per_unit(m: Coord, body: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform};
+    use rustgis_geom::lonlat_to_merc;
+
     use super::*;
+
+    fn raster_ground(pixel_width: f64, crs: Crs, nodata: Option<f64>) -> Ground {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 90.0, pixel_width, pixel_height: -60.0 };
+        let data = [0.0, 10.0, 20.0, 30.0].repeat(3);
+        let raster = Arc::new(Raster::new("heights", 4, 3, vec![data], gt, crs, nodata, ColorHint::Gray, "Float32").unwrap());
+        let wrap_width = crate::raster::full_turn_width(&raster);
+        Ground { heights: Heights::Raster { raster, wrap_width }, exaggeration: 1.0, body: 1.0 }
+    }
+
+    #[test]
+    fn raster_terrain_blends_across_both_ends_of_a_full_turn() {
+        for crs in [Crs::LonLat, Crs::from_epsg(4269).unwrap()] {
+            for pixel_width in [90.0, -90.0] {
+                let ground = raster_ground(pixel_width, crs, None);
+                for (col, expected) in [(0.0, 15.0), (0.25, 7.5), (3.75, 22.5)] {
+                    let m = lonlat_to_merc(Coord::new(col * pixel_width, 0.0));
+                    let h = ground.height(m).unwrap();
+                    assert!((h - expected).abs() < 1e-8, "{pixel_width}, column {col}: {h} != {expected}");
+                }
+                let west = ground.height(lonlat_to_merc(Coord::new(-1e-6, 0.0))).unwrap();
+                let east = ground.height(lonlat_to_merc(Coord::new(1e-6, 0.0))).unwrap();
+                assert!((west - east).abs() < 1e-5, "{west} vs {east}");
+            }
+        }
+    }
+
+    #[test]
+    fn raster_terrain_keeps_regional_projected_and_nodata_edges() {
+        for (pixel_width, crs) in [(10.0, Crs::LonLat), (89.9, Crs::LonLat), (90.1, Crs::LonLat), (90.0, Crs::WebMercator)] {
+            let ground = raster_ground(pixel_width, crs, None);
+            let point = |col| {
+                let c = Coord::new(col * pixel_width, 0.0);
+                if crs == Crs::WebMercator { c } else { lonlat_to_merc(c) }
+            };
+            for (col, expected) in [(0.25, 0.0), (3.75, 30.0)] {
+                let h = ground.height(point(col)).unwrap();
+                assert!((h - expected).abs() < 1e-8, "{pixel_width}, column {col}: {h} != {expected}");
+            }
+            // A gap just west of the grid remains outside a regional or projected DEM.
+            if pixel_width == 10.0 || crs == Crs::WebMercator {
+                assert!(ground.height(point(-0.25)).is_none());
+            }
+        }
+        let ground = raster_ground(90.0, Crs::LonLat, Some(30.0));
+        assert!(ground.height(lonlat_to_merc(Coord::new(22.5, 0.0))).is_none(), "the wrapped base neighbour is nodata");
+        assert!(ground.height(lonlat_to_merc(Coord::new(-22.5, 0.0))).is_none());
+    }
 
     #[test]
     fn heights_stand_in_the_metres_of_the_body() {

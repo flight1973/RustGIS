@@ -10,7 +10,10 @@
 //! [`tool`] and run by [`run`] like the rest.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod attribute_join;
+pub mod control;
 pub mod convert;
+pub mod density;
 pub mod dggs;
 pub mod geodesic;
 pub mod georef;
@@ -19,6 +22,8 @@ pub mod kriging;
 mod merge;
 pub mod network;
 pub mod neural;
+mod parallel;
+mod parameters;
 pub mod rasterops;
 pub mod selection;
 mod stats;
@@ -28,6 +33,12 @@ pub mod topology;
 pub mod trend;
 pub mod warp;
 
+pub use attribute_join::{DuplicateStrategy, JoinFieldOptions, JoinFieldReport, join_field};
+pub use density::{
+    KernelType, MAX_DENSITY_CELLS, MAX_DENSITY_WORK, auto_cell_size, kernel_density, points_extent, resolve_grid_extent,
+    silverman_bandwidth,
+};
+pub use parameters::StatisticList;
 pub use tools::{TOOLS, find_field_case_insensitive, holds_coordinates, param_applies, simplify_geometry, zonal_bands};
 
 use rustgis_data::Dataset;
@@ -42,13 +53,26 @@ pub enum ParamKind {
     PolygonLayer,
     /// A point layer.
     PointLayer,
-    /// A field of the layer given by the first `Layer` parameter.
+    /// A field of the associated input (the longest `<input>_` name prefix, else the first layer).
     Field,
-    /// A numeric field of the first layer.
+    /// Several field names entered as text, with suggestions from the associated input (tools
+    /// whose runner takes the list as one string). The runner defines the list syntax;
+    /// suggestions append comma-separated names.
+    FieldNames,
+    /// A numeric field of the associated input.
     NumericField,
-    /// A field of the first layer that can hold coordinates: a numeric field, or a text field
+    /// A field of the associated input that can hold coordinates: a numeric field, or a text field
     /// with numbers written in it (see [`holds_coordinates`]).
     CoordinateField,
+    /// Ordered field names from the named input; accepts the existing string or array values.
+    Fields {
+        input: &'static str,
+    },
+    /// Ordered field/statistic objects from the named input, using the existing JSON keys.
+    FieldStatistics {
+        input: &'static str,
+        statistics: StatisticList,
+    },
     Number,
     Text,
     /// One of a fixed list of choices.
@@ -167,6 +191,11 @@ pub trait Inputs {
         _source_layer: &str,
     ) -> Result<(Vec<u8>, Vec<String>), String> {
         Err("vector-to-PMTiles export is unavailable in this input provider".into())
+    }
+
+    /// Builds a raster tile archive with the layer's existing display style.
+    fn raster_to_pmtiles(&self, _layer: &str, _min_zoom: u8, _max_zoom: u8) -> Result<Vec<u8>, String> {
+        Err("raster-to-PMTiles export is unavailable in this input provider".into())
     }
 }
 
@@ -316,6 +345,9 @@ pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> 
     let mut p = params.as_object().cloned().unwrap_or_default();
     // Not an external suite's tool (a copy of a built-in spec counts as built-in).
     let built_in = source_of(spec).is_none();
+    if built_in {
+        tools::normalize_params(spec, &mut p);
+    }
     for ps in spec.params {
         if !p.contains_key(ps.name)
             && !ps.default.is_empty()
@@ -427,4 +459,34 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
         None => (spec.run)(inputs, &p),
     }))
     .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
+}
+
+/// [`run`] under `control`: setting its flag stops the tool at its next check, and its count
+/// follows the tool's progress (see [`control`]). A run cancelled before it returns is an error
+/// saying how far it came, whatever the tool gave back: a tool may stop early however suits it,
+/// and what it made by then is never taken for its result. One cancelled before it starts doesn't
+/// start.
+pub fn run_with(id: &str, inputs: &dyn Inputs, params: &Value, control: &std::sync::Arc<control::Control>) -> Result<ToolResult, String> {
+    if control.is_cancelled() {
+        return Err(format!("{} was cancelled before it started", tool(id).map_or(id, |t| t.name)));
+    }
+    let _current = control::install(Some(control.clone()));
+    // No count until the tool starts one: a control used before doesn't show that run's.
+    control::begin(0);
+    let res = run(id, inputs, params);
+    if !control.is_cancelled() {
+        // Finished: its last step is all done, however it counted. A failed one stays where it
+        // stopped.
+        if res.is_ok() {
+            control::finish();
+        }
+        return res;
+    }
+    let name = tool(id).map_or(id, |t| t.name);
+    Err(match control.progress() {
+        Some((done, total)) => {
+            format!("{name} was cancelled {}% of the way through its current step", done.saturating_mul(100) / total.max(1))
+        }
+        None => format!("{name} was cancelled"),
+    })
 }

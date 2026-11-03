@@ -27,12 +27,14 @@ mod connectionui;
 mod connectui;
 mod cswui;
 mod cubesui;
+mod diagnosticlog;
 mod dialogs;
 mod docpanes;
 mod earthaccessui;
 mod editpanes;
 mod embeddingsui;
 mod failureui;
+mod fieldlists;
 mod fieldmenu;
 mod fill_editor;
 mod geocodeui;
@@ -71,6 +73,7 @@ mod scriptcolor;
 mod scriptcomplete;
 mod searchbox;
 mod serviceui;
+mod shortcutfile;
 mod shortcutui;
 mod showme;
 mod sourcespane;
@@ -141,6 +144,12 @@ pub const SHAPEFILE_PICK: &str = "\u{1}shapefile:";
 /// The `open_async` purpose for a tool's file parameter, followed by the extensions it offers
 /// (`toolfile:nc,nc4`; none for any file).
 pub const TOOL_FILE_PURPOSE: &str = "toolfile:";
+
+/// Marks a returned shortcut picker file; cancellation leaves no pending routing state.
+pub const SHORTCUT_PICK: &str = "\u{1}shortcuts:";
+
+/// Maximum portable shortcut document size: saved overrides plus room for version metadata.
+pub const SHORTCUT_FILE_MAX_BYTES: usize = keymap::MAX_PREF_BYTES + 100;
 
 /// Starts the name of a file the web shell's tool file picker put in the inbox: it goes to the
 /// Tools pane's file parameter, not onto the map.
@@ -364,6 +373,9 @@ pub struct ServiceBrowse {
     pub filter: String,
     /// The date time-enabled layers are added at (their default when empty).
     pub time: String,
+    /// Time-enabled layers are added at a fixed date (`time`, or their default when empty) rather
+    /// than following the time slider, as they do by default.
+    pub fixed: bool,
     /// Feature layers are asked only for the features crossing the map's view (Only the map's
     /// area), not whole.
     pub area: bool,
@@ -475,6 +487,8 @@ pub enum RightPane {
     /// A Zarr variable's time series at points clicked on the map (#555).
     TimeSeries,
     Diagnostics,
+    /// Session-local troubleshooting messages, separate from the performance monitor.
+    DiagnosticLog,
     Infographics,
     Report,
     Presentation,
@@ -533,6 +547,9 @@ pub struct UiState {
     pub right: Option<RightPane>,
     /// The right panes open as tabs, in the order they were opened (#303).
     pub right_open: Vec<RightPane>,
+    /// The Diagnostics pane's filter (it also picks what **Copy diagnostics** copies).
+    pub diagnostic_filter: rustgis_engine::data::diagnostics::Filter,
+    diagnostic_snapshot: Option<(u64, Vec<rustgis_engine::data::diagnostics::Record>)>,
     /// The Web Data service the Web Data pane shows (a `ui.dialog` name, see
     /// `panes::web_data_name`).
     pub web_data: &'static str,
@@ -550,6 +567,9 @@ pub struct UiState {
     pub start_with: StartWith,
     /// Whether a file holding several layers asks which to add (#934), or adds them all.
     pub ask_layers: bool,
+    /// Key combinations the native menu bar keeps for itself (macOS: Quit, Close Window, Hide…):
+    /// a shortcut on one would never reach the app, so the shortcut editor refuses them.
+    pub reserved_shortcuts: Vec<egui::KeyboardShortcut>,
     /// Files whose layers are being listed or chosen, the first one shown.
     pub choosing: Vec<layerchooser::Chooser>,
     /// The project last opened or saved on this computer, for Start With › Last Project.
@@ -762,6 +782,8 @@ impl Default for UiState {
             left: Some(LeftPane::Contents),
             right: None,
             right_open: Vec::new(),
+            diagnostic_filter: rustgis_engine::data::diagnostics::Filter::All,
+            diagnostic_snapshot: None,
             web_data: "opendata",
             dark: false,
             measurement_imperial: false,
@@ -770,6 +792,7 @@ impl Default for UiState {
             worldview: i18n::AUTO.into(),
             start_with: StartWith::Sample,
             ask_layers: true,
+            reserved_shortcuts: Vec::new(),
             choosing: Vec::new(),
             last_project: None,
             start_projection: String::new(),
@@ -956,14 +979,58 @@ impl RustGisApp {
         keys
     }
 
-    /// A fingerprint of the keymap's key combinations: cheap to take every frame (no
-    /// allocation), it changes when a shortcut is added, removed or rebound, so a caller can
-    /// rebuild [`RustGisApp::command_keys`] only then.
+    /// The keyboard shortcuts of a command run without parameters, in the keymap's order, for a
+    /// native menu to show (the macOS menu bar).
+    pub fn shortcuts_of(&self, command: &str) -> Vec<egui::KeyboardShortcut> {
+        self.ui.keymap.keys_for(command, &Value::Null).map(|c| egui::KeyboardShortcut::new(c.modifiers(), c.key)).collect()
+    }
+
+    /// The command a keyboard shortcut runs, if the keymap gives it one.
+    pub fn shortcut_command(&self, shortcut: egui::KeyboardShortcut) -> Option<String> {
+        let m = shortcut.modifiers;
+        // A chord has no Ctrl apart from ⌘ (the Mac's Ctrl isn't one): ⌃T isn't the bare T.
+        if m.ctrl && !m.command {
+            return None;
+        }
+        let chord = keymap::Chord { command: m.command || m.mac_cmd, alt: m.alt, shift: m.shift, key: shortcut.logical_key };
+        self.ui.keymap.command_for(chord).map(|b| b.command.clone())
+    }
+
+    /// Whether the keyboard shortcut editor is waiting for a key combination to record.
+    pub fn capturing_shortcut(&self) -> bool {
+        self.ui.shortcut_editor.capturing()
+    }
+
+    /// Whether a command exists and can run now: what the ribbon greys out.
+    pub fn command_enabled(&self, command: &str) -> bool {
+        widgets::enabled(self, command)
+    }
+
+    /// A fingerprint of the keymap's key combinations and what they run: cheap to take every
+    /// frame (no allocation), it changes when a shortcut is added, removed or rebound (to
+    /// another key or another command), so a caller can rebuild [`RustGisApp::command_keys`]
+    /// only then.
     pub fn shortcuts_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         for b in &self.ui.keymap.bindings {
             b.chord.hash(&mut h);
+            // And what it runs: a key rebound to another command changes it too.
+            b.command.hash(&mut h);
+            if !b.params.is_null() {
+                // Written straight into the hash: no allocation.
+                struct Feed<'a>(&'a mut std::collections::hash_map::DefaultHasher);
+                impl std::io::Write for Feed<'_> {
+                    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                        self.0.write(buf);
+                        Ok(buf.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let _ = serde_json::to_writer(Feed(&mut h), &b.params);
+            }
         }
         self.ui.keymap.bindings.len().hash(&mut h);
         h.finish()
@@ -1048,8 +1115,10 @@ impl RustGisApp {
     /// Installs the shell's platform hooks and reads what they keep: preferences, saved
     /// connections and the recovery copy an earlier run left.
     pub fn with_services(mut self, services: Services) -> Self {
-        // Both saved database passwords and S3 keys use the same store, installed before prefs.
+        // Saved database passwords, S3 keys and the remembered Earthdata Login token use the same
+        // store, installed before prefs.
         self.session.database_logins.set_store(services.secrets.clone());
+        rustgis_engine::render::rustgis_tiles::earthdata::set_secret_store(services.secrets.clone());
         self.services = services;
         shortcutui::load(&mut self);
         sourcespane::load_connections(&mut self);
@@ -1114,7 +1183,12 @@ impl RustGisApp {
             panes::start_geolibre_load(&mut self);
         }
         // Plugins the web app installed in earlier visits (the desktop loads its plugins folder).
-        pluginsui::restore(&mut self);
+        // Their fetches (the blocklist, each plugin) are this session's: a failure is recorded
+        // in its Diagnostics.
+        {
+            let _diagnostics = self.session.diagnostics.enter();
+            pluginsui::restore(&mut self);
+        }
         // A GeoLibre runner located earlier (Locate… in the Tools pane).
         if let Some(path) = self.services.load_pref.as_ref().and_then(|load| load("geolibre_runner")).filter(|p| !p.is_empty())
             && let Err(e) = self.session.run("gp.setGeolibre", &json!({"path": path}))
@@ -1253,8 +1327,12 @@ impl RustGisApp {
 
     /// Opens a file from the inbox: one the `"text"` picker marked ([`DELIMITED_PICK`]) opens Add
     /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
-    /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`].
+    /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`];
+    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview.
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
+        if name.starts_with(SHORTCUT_PICK) {
+            return shortcutfile::picked(self, bytes);
+        }
         if let Some(name) = name.strip_prefix(TOOL_FILE_PICK) {
             panes::received_file(self, name, bytes);
             return Ok(Value::Null);
@@ -1302,6 +1380,7 @@ impl RustGisApp {
             (".rgistemplate", "project.fromTemplate"),
             (".rgistask", "task.import"),
             (".rgisbookmarks", "bookmark.import"),
+            (".rgisshortcuts", "ui.shortcuts.import"),
             (".rgisreport", "report.open"),
             (".rgisrpttemplate", "report.open"),
             (".rgispres", "presentation.import"),
@@ -1320,6 +1399,9 @@ impl RustGisApp {
             return self.run(cmd, json!({"image": base64::engine::general_purpose::STANDARD.encode(bytes)}));
         }
         if let Some(cmd) = self.ui.pending_open.take().or(item) {
+            if cmd == "ui.shortcuts.import" {
+                return shortcutfile::picked(self, bytes);
+            }
             use base64::Engine;
             let mut p = json!({"data": base64::engine::general_purpose::STANDARD.encode(bytes)});
             // A colour ramp file's name tells its format and names its ramp.
@@ -1657,6 +1739,7 @@ impl RustGisApp {
 
     /// Runs a command by id: `ui.*` here, everything else in the engine.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        let _diagnostics = self.session.diagnostics.enter();
         if !matches!(id, "ui.menu" | "ui.ribbon" | "ui.language" | "ui.worldview") {
             self.ui.ribbon_peek = false;
         }
@@ -1676,13 +1759,27 @@ impl RustGisApp {
         // of another, so it ends when the open layout changes (or layouts come and go).
         let open_layout = |app: &Self| (app.session.active_layout, app.session.project.layouts.len());
         let layout_before = open_layout(self);
-        let mut r = if id.starts_with("ui.") { self.run_ui(id, &params) } else { self.session.run(id, &params) };
+        let notice_mark = self.session.notice_mark();
+        // A plugin's command that adds data by address doesn't freeze the app: the download is
+        // left for the frame loop (`ui.addUrl`), as in the browser.
+        let mut r = if id.starts_with("ui.") {
+            self.run_ui(id, &params)
+        } else if id.starts_with(rustgis_engine::plugins::PREFIX) {
+            self.session.run_leaving_downloads(id, &params)
+        } else {
+            self.session.run(id, &params)
+        };
         r = self.deliver_gp_files(r);
         if r.is_ok() && id == "tool.set" {
             self.map.cancel_sketch();
         }
         if let Err(e) = &r {
             log::info!("{id}: {e}");
+            // UI-only failures can return before an engine command emits a notice.
+            let text = rustgis_engine::data::diagnostics::Redacted::new(e);
+            if !self.session.notices_since(notice_mark).iter().any(|notice| notice.error && notice.text == text.as_str()) {
+                self.session.notify_redacted(text, true);
+            }
         }
         // Commands can replace the project, switch maps or change the renderer while the pane
         // is closed. A field picked for the old context must not overwrite the new renderer.
@@ -1770,6 +1867,19 @@ impl RustGisApp {
     /// layer for Add Data, a service's), and a layer the command names is its own.
     /// Also whether another layer has that name, so the step would replay on the first of them.
     fn layer_acted_on(&mut self, id: &str, params: &Value) -> Option<(String, bool)> {
+        // Terrain with nothing named, while none is on, takes the active raster: named, so the
+        // step replays on that DEM (a change of exaggeration on a terrain already on names none).
+        if id == "map.terrain" {
+            let named = ["layer", "tiles"].iter().any(|k| params.get(*k).is_some_and(|v| !v.is_null()))
+                || params.get("off").and_then(serde_json::Value::as_bool) == Some(true);
+            let map = self.session.map();
+            if named || map.view.terrain.is_some() {
+                return None;
+            }
+            let name = self.session.active_layer.and_then(|l| map.layer(l)).filter(|l| l.raster.is_some()).map(|l| l.name.clone())?;
+            let shared = map.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(&name)).count() > 1;
+            return Some((name, shared));
+        }
         let spec = self.session.registry.get(id).filter(|c| c.mutates && params.get("layer").is_none_or(Value::is_null)).copied()?;
         if !spec.param_keys().is_some_and(|k| k.contains(&"layer")) {
             return None;
@@ -1793,6 +1903,20 @@ impl RustGisApp {
     /// made.
     /// `active` is the active layer's name from [`Self::layer_acted_on`], read before it ran.
     fn record_step(&mut self, id: &str, params: &Value, active: Option<(String, bool)>) {
+        if self.ws.recording.is_none() {
+            return;
+        }
+        // A tool run in the background is applied by `gp.finish`, whose run id means nothing to a
+        // replay: the step is the run itself, `gp.run` with its tool and parameters, from the
+        // history entry it has just added.
+        let finished;
+        let (id, params) = if id == "gp.finish" {
+            let Some(h) = self.session.project.gp_history.last().filter(|h| !h.id.is_empty()) else { return };
+            finished = json!({"tool": h.id, "params": h.params});
+            ("gp.run", &finished)
+        } else {
+            (id, params)
+        };
         let Some(steps) = self.ws.recording.as_mut() else { return };
         // Undo doesn't take back a recorded step (the undo history and the recording don't line
         // up step for step): say how to.
@@ -2257,6 +2381,9 @@ impl RustGisApp {
                     self.map.popup = None;
                 }
             }
+            "ui.shortcuts.set" | "ui.shortcuts.reset" | "ui.shortcuts.export" | "ui.shortcuts.import" => {
+                return shortcutfile::run(self, id, p);
+            }
             "ui.shortcuts" => self.ui.shortcuts = true,
             "ui.customizeShortcuts" => self.ui.shortcut_editor.open = true,
             // Copy, cut and copy path also put their text on the system clipboard.
@@ -2373,12 +2500,14 @@ impl RustGisApp {
                 // as before when it doesn't answer as one.
                 let remote = rustgis_engine::data::source::is_remote_name(url);
                 let tiff = rustgis_engine::cmd::layer::is_tiff_url(url);
+                // A scan (`"as"`, a plugin's or a script's) keeps only the pixels: downloaded
+                // whole.
+                let scan = p.get("as").and_then(Value::as_str) == Some("scan");
                 let unnamed = !remote
                     && !tiff
                     && rustgis_engine::cmd::layer::is_unnamed_url(url)
-                    && matches!(p.get("as"), None | Some(Value::Null))
                     && ["service", "coverage"].iter().all(|k| p.get(*k).and_then(Value::as_bool) != Some(true));
-                if (remote || tiff || unnamed) && p.get("whole").and_then(Value::as_bool) != Some(true) {
+                if (remote || tiff || unnamed) && !scan && p.get("whole").and_then(Value::as_bool) != Some(true) {
                     let slot: Slot<Result<bool, String>> = Slot::default();
                     let land = slot.clone();
                     if remote {
@@ -2433,6 +2562,13 @@ impl RustGisApp {
                         q[k] = v.clone();
                     }
                 }
+                // How the bytes are read, as `layer.addData` takes it (a command asking by
+                // address, such as a plugin's: the dialog gives none of these).
+                for k in ["x", "y", "wkt", "delimiter", "paperSpace", "stream", "as"] {
+                    if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
+                        q[k] = v.clone();
+                    }
+                }
                 if p.get("zoom").and_then(Value::as_bool) == Some(true) {
                     q["zoom"] = json!(true);
                 }
@@ -2445,6 +2581,10 @@ impl RustGisApp {
                     if let Some(value) = p.get(key) {
                         q[key] = value.clone();
                     }
+                }
+                // A service layer's bounds, which its features' axes are checked against.
+                if let Some(b) = p.get("bounds").filter(|b| b.is_array()) {
+                    q["bounds"] = b.clone();
                 }
                 if let Some(origin) = &origin {
                     q[connectiontree::ORIGIN] = json!(origin);
@@ -2894,6 +3034,7 @@ impl RustGisApp {
             "ui.pane.profile" => toggle_right(&mut self.ui, RightPane::Profile),
             "ui.pane.timeSeries" => toggle_right(&mut self.ui, RightPane::TimeSeries),
             "ui.pane.diagnostics" => toggle_right(&mut self.ui, RightPane::Diagnostics),
+            "ui.pane.diagnosticLog" => toggle_right(&mut self.ui, RightPane::DiagnosticLog),
             "ui.pane.infographics" => toggle_right(&mut self.ui, RightPane::Infographics),
             "ui.pane.report" => toggle_right(&mut self.ui, RightPane::Report),
             "ui.pane.presentation" => toggle_right(&mut self.ui, RightPane::Presentation),
@@ -3123,7 +3264,8 @@ impl RustGisApp {
                     .active_layer
                     .and_then(|id| self.session.map().layer(id))
                     .ok_or("select a layer in the Layers pane first")?;
-                // Any format but GeoPackage, which needs SQLite.
+                // Any format the dialog offers here (`dialogs::export_formats`): not GeoPackage or
+                // FlatGeobuf, which the data crate refuses in the browser.
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 // A streamed layer exports its whole source, not the features read for the view.
                 let whole = if l.is_streamed() { Some(l.load_all()?) } else { None };
@@ -3141,13 +3283,19 @@ impl RustGisApp {
                 };
                 let ext = if ext == "shp" { "zip".to_string() } else { ext };
                 let name = format!("{}.{ext}", l.name);
+                let notes = rustgis_engine::data::export_notes([(ds, l.extent())], &name, crs);
+                let names_note = if ext == "zip" { io::shapefile_names_note(&ds.fields, &name) } else { None };
                 if left_out > 0 {
                     self.session.notify(format!("{name}: {left_out} features without drawable geometry were left out"), false);
                 }
                 if ext == "zip" && rustgis_engine::data::raster::wkt::to_wkt(crs).is_none() {
                     self.session.notify(format!("{name}: no .prj written, as {} has no WKT form", crs.label()), false);
                 }
-                self.download(&name, bytes);
+                if self.download(&name, bytes) {
+                    for note in notes.into_iter().chain(names_note) {
+                        self.session.notify(note, false);
+                    }
+                }
             }
             "ui.exportRaster" if self.services.download.is_some() => {
                 // The web app: encode once and download.
@@ -3605,6 +3753,7 @@ impl RustGisApp {
 
     /// Per-frame work that doesn't draw (theme, fonts, files that arrived).
     pub fn logic(&mut self, ctx: &egui::Context) {
+        let _diagnostics = self.session.diagnostics.enter();
         // The MCP relay: what attached agents sent runs here, on this session, before the frame
         // draws (Session lives on this thread; the listener only queues messages).
         #[cfg(not(target_arch = "wasm32"))]
@@ -3651,6 +3800,8 @@ impl RustGisApp {
         rustgis_engine::plugins::set_language(self.lang().code());
         panes::poll_geolibre(self, ctx);
         panes::poll_plugin_run(self, ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        panes::poll_tool_run(self, ctx);
         self.poll_downloads();
         let _ = self.deliver_gp_files(Ok(Value::Null));
         // A value picked under Dynamic Text lasts while the text tool does, however the tool
@@ -3856,6 +4007,7 @@ impl RustGisApp {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let _diagnostics = self.session.diagnostics.enter();
         let ctx = ui.ctx().clone();
         // Fonts installed by `logic` take effect on the next frame.
         if self.fonts_frames < 2 {
@@ -3925,6 +4077,31 @@ fn project_file_name(url: &str) -> Option<&str> {
     let path = url.split(['?', '#']).next().unwrap_or("");
     let last = path.rsplit('/').next().unwrap_or("");
     (rustgis_engine::project::opens_as_project(last) || rustgis_engine::map::geolibre::is_project_file(last)).then_some(last)
+}
+
+/// Tests that fetch through the tile cache take turns: it has one fetcher for the whole process,
+/// and a test that replaces it (`set_fetcher`) would answer another's downloads.
+#[cfg(test)]
+pub(crate) mod fetching {
+    use std::sync::{Mutex, MutexGuard};
+
+    static TURN: Mutex<()> = Mutex::new(());
+
+    /// A test's turn: when it ends, even by failing, addresses are fetched natively again.
+    pub(crate) struct Turn {
+        _held: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            rustgis_engine::render::rustgis_tiles::cache::clear_fetcher();
+        }
+    }
+
+    /// Waits for the tests fetching before this one to end.
+    pub(crate) fn turn() -> Turn {
+        Turn { _held: TURN.lock().unwrap_or_else(|e| e.into_inner()) }
+    }
 }
 
 #[cfg(test)]
@@ -4028,6 +4205,24 @@ mod record_tests {
     use super::{DEFAULTS_TO_ACTIVE_LAYER, RustGisApp};
     use serde_json::json;
 
+    /// Terrain run with nothing named (from command search) records the DEM it took, so the
+    /// step replays on it; a change of exaggeration on a terrain already on records none.
+    #[test]
+    fn a_terrain_step_names_the_dem_it_took() {
+        let mut app = RustGisApp::with_sample();
+        let grid = "bmNvbHMgMgpucm93cyAyCnhsbGNvcm5lciAwCnlsbGNvcm5lciAwCmNlbGxzaXplIDEKTk9EQVRBX3ZhbHVlIC05OTk5CjEgMgozIDQK";
+        app.session.run("layer.addDataBytes", &json!({"fileName": "grid.asc", "data": grid})).unwrap();
+        let dem = app.session.map().layers.iter().find(|l| l.raster.is_some()).map(|l| (l.id, l.name.clone())).unwrap();
+        app.session.active_layer = Some(dem.0);
+        app.ws.recording = Some(Vec::new());
+        app.run("map.terrain", serde_json::Value::Null).unwrap();
+        app.run("map.terrain", json!({"exaggeration": 2})).unwrap();
+        let steps = app.ws.recording.clone().unwrap();
+        let layers: Vec<Option<&serde_json::Value>> =
+            steps.iter().filter(|s| s.command == "map.terrain").map(|s| s.params.get("layer")).collect();
+        assert_eq!(layers, [Some(&json!(dem.1)), None]);
+    }
+
     /// Every command with an optional `layer` either needs an active layer to be enabled, defaults
     /// to it (`DEFAULTS_TO_ACTIVE_LAYER`), or reads `layer` as something else: a recorded step
     /// names the active layer for the first two only.
@@ -4117,6 +4312,30 @@ mod record_tests {
         assert_eq!(app.ws.recording.as_ref().map(Vec::len), Some(1));
     }
 
+    /// A background run's `gp.finish` is recorded as the `gp.run` it finished.
+    #[test]
+    fn a_tool_finished_in_the_background_is_recorded_as_its_run() {
+        let mut app = RustGisApp::with_sample();
+        app.ws.recording = Some(Vec::new());
+        app.session.project.gp_history.push(rustgis_engine::GpRecord {
+            tool: "Buffer".into(),
+            id: "buffer".into(),
+            params: json!({"input": "Cities", "distance": 50}),
+            command: None,
+            at: 0,
+            ok: true,
+            messages: Vec::new(),
+            millis: 0,
+            outputs: Vec::new(),
+        });
+        app.record_step("gp.finish", &json!({"id": 7}), None);
+        let steps = app.ws.recording.as_deref().unwrap_or_default();
+        assert_eq!(
+            steps.iter().map(|s| (s.command.as_str(), s.params.clone())).collect::<Vec<_>>(),
+            [("gp.run", json!({"tool": "buffer", "params": {"input": "Cities", "distance": 50}}))]
+        );
+    }
+
     /// A step keeping a plain `key` is recorded, and that is said once a recording.
     #[test]
     fn a_kept_key_is_said_once() {
@@ -4203,6 +4422,42 @@ mod download_service_tests {
         assert!(!app.download("archive.pmtiles", vec![1, 2, 3]));
         assert!(app.session.notices.iter().any(|n| n.error && n.text.contains("browser rejected download")));
         assert!(!app.session.notices.iter().any(|n| n.text.contains("Downloaded")));
+    }
+
+    /// The web app's Shapefile download says which field names it changed, once the browser takes
+    /// the file; names that fit, other formats and a refused download say nothing of them.
+    #[test]
+    fn shapefile_download_says_which_field_names_it_changed() {
+        use rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+        use rustgis_engine::geom::Coord;
+        let changed = |app: &RustGisApp| app.session.notices.iter().filter(|n| n.text.contains("changed to fit a Shapefile")).count();
+        let with = |accept: bool| {
+            let download: Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>> =
+                if accept { Box::new(|_, _| Ok(())) } else { Box::new(|_, _| Err("browser rejected download".into())) };
+            let mut app = RustGisApp::with_sample().with_services(Services { download: Some(download), ..Default::default() });
+            let mut ds = Dataset::new("Sites", GeometryType::Point, vec![Field::new("population_2020", FieldType::Integer)]);
+            ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Int(1)]);
+            let id = app.session.map_mut().add_dataset(ds);
+            app.session.active_layer = Some(id);
+            app
+        };
+        let mut app = with(true);
+        app.run("ui.exportLayer", json!({"format": "shp"})).unwrap();
+        assert_eq!(changed(&app), 1);
+        assert!(app.session.notices.iter().any(|n| n.text
+            == "Sites.zip: 1 field name was changed to fit a Shapefile (10 bytes at most, unique ignoring case): \
+                'population_2020' → 'population'"));
+        app.run("ui.exportLayer", json!({"format": "geojson"})).unwrap();
+        assert_eq!(changed(&app), 1, "GeoJSON keeps the name");
+        let mut app = with(false);
+        let _ = app.run("ui.exportLayer", json!({"format": "shp"}));
+        assert!(app.session.notices.iter().any(|n| n.error && n.text.contains("browser rejected download")));
+        assert_eq!(changed(&app), 0, "nothing was downloaded");
+        let mut app = with(true);
+        let countries = app.session.map().layers.iter().find(|l| l.name == "Countries").map(|l| l.id);
+        app.session.active_layer = countries;
+        app.run("ui.exportLayer", json!({"format": "shp"})).unwrap();
+        assert_eq!(changed(&app), 0, "the sample's names fit");
     }
 
     #[test]

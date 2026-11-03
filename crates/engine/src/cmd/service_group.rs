@@ -167,7 +167,9 @@ fn read(s: &mut Session, p: &Value) -> Result<(Value, Vec<(ServiceChild, Dataset
         if bytes_read > MAX_GROUP_BYTES {
             return Err("service group data exceeds 64 MB".into());
         }
-        let bytes = super::features_answer(s, name, bytes);
+        // The collection's bounds, from the listing: none read leaves the axes as they come.
+        let bounds = super::bounds_of(layer.get("bbox")).ok().flatten();
+        let bytes = super::features_answer(s, name, bytes, bounds);
         let text = std::str::from_utf8(&bytes).map_err(|e| format!("{name}: {e}"))?;
         let (mut dataset, report) = rustgis_data::io::read_geojson(text, name).map_err(|e| format!("{name}: {e}"))?;
         if dataset.features.is_empty() && !feature_collection(text) {
@@ -262,6 +264,10 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
             .collect(),
     };
     let mut children = Vec::new();
+    // Label expressions a refresh left unreadable, said once each layer is read; and the layers
+    // whose classes no longer read, drawn with a single symbol.
+    let mut notes = Vec::new();
+    let mut singled = Vec::new();
     for ((mut child, mut dataset), existing) in reads.into_iter().zip(matches) {
         let existing = existing.and_then(|id| s.map_mut().layer_mut(id));
         if let Some(layer) = existing {
@@ -274,6 +280,7 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
             layer.selection.clear();
             let invalid_renderer = match &layer.renderer {
                 rustgis_map::Renderer::Single(_) => false,
+                rustgis_map::Renderer::Unique { expression: Some(e), .. } => rustgis_data::query::parse(e, &layer.dataset).is_err(),
                 rustgis_map::Renderer::Unique { field, .. } => layer.dataset.field_index(field).is_none(),
                 rustgis_map::Renderer::Graduated { field, .. } | rustgis_map::Renderer::Proportional { field, .. } => {
                     layer.dataset.field_index(field).and_then(|i| layer.dataset.fields.get(i)).is_none_or(|f| !f.ty.is_numeric())
@@ -281,10 +288,41 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
             };
             if changed_type || invalid_renderer {
                 layer.renderer = rustgis_map::Renderer::Single(rustgis_map::Symbol::default_for(layer.geometry_type(), layer.id));
+                if invalid_renderer {
+                    singled.push(layer.name.clone());
+                }
             }
+            // (Labels by a text expression that still reads need no field.)
+            let reads =
+                |t: &Option<String>, ds: &rustgis_data::Dataset| t.as_deref().is_some_and(|t| rustgis_data::query::parse(t, ds).is_ok());
+            let by_text = |c: &rustgis_map::LabelClass, ds: &rustgis_data::Dataset| reads(&c.by.text, ds);
             if layer.dataset.field_index(&layer.labels.default.field).is_none() {
-                layer.labels.enabled = false;
+                // A field the service dropped isn't kept, even under a text expression (a web style
+                // would label by it).
                 layer.labels.default.field.clear();
+                // Off, unless a shown class the map draws still labels as it stands: Default by its
+                // text, another on its own field or by its text. (Classes repointed below onto a
+                // fallback field don't count: with Default's field gone, labels go off as they
+                // always did.)
+                let ds = &layer.dataset;
+                if !layer.labels.in_order().any(|c| c.visible && (ds.field_index(&c.field).is_some() || by_text(c, ds))) {
+                    layer.labels.enabled = false;
+                }
+            }
+            // Expressions that no longer read against the service's fields are kept (a field may
+            // come back), but draw as if unset: said once for the refresh.
+            let lost: usize = layer
+                .labels
+                .in_order()
+                .map(|c| {
+                    [&c.by.text, &c.by.size, &c.by.color, &c.by.angle]
+                        .into_iter()
+                        .filter(|t| t.is_some() && !reads(t, &layer.dataset))
+                        .count()
+                })
+                .sum();
+            if lost > 0 {
+                notes.push((layer.name.clone(), lost));
             }
             layer.labels.repoint_missing_fields(&layer.dataset);
             if layer.definition_query.as_deref().is_some_and(|q| rustgis_data::query::parse(q, &layer.dataset).is_err()) {
@@ -293,9 +331,9 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
             layer.display_filters.retain(|f| rustgis_data::query::parse(&f.where_, &layer.dataset).is_ok());
             layer.touch_geometry();
             child.layer = layer.id;
-            // Locked labels name rows of the old features.
+            // Locked labels name the old features by id, and the new ones are numbered afresh.
             if let Some(lock) = &mut s.map_mut().label_lock {
-                lock.retain(|(id, _, _, _)| *id != child.layer);
+                lock.retain(|((id, _, _, _), _)| *id != child.layer);
             }
         } else {
             child.layer = crate::cmd::layer::add_dataset(s, dataset);
@@ -305,12 +343,33 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
         }
         children.push(child);
     }
+    if !notes.is_empty() {
+        let lost: usize = notes.iter().map(|(_, n)| n).sum();
+        let names: Vec<&str> = notes.iter().map(|(name, _)| name.as_str()).collect();
+        s.notify(
+            format!(
+                "label expressions that don't read against the refreshed fields are kept but left out when drawing ({lost}, in {})",
+                names.join(", ")
+            ),
+            false,
+        );
+    }
+    if !singled.is_empty() {
+        s.notify(
+            format!(
+                "layers whose classes read fields the refreshed service no longer has, or no longer read as numbers, or whose class expression no longer reads, are drawn with a single symbol ({}: {})",
+                singled.len(),
+                singled.join(", ")
+            ),
+            false,
+        );
+    }
     let ids: Vec<u32> = children.iter().map(|c| c.layer).collect();
     if child_id.is_none() {
         let gone: Vec<u32> = old.children.iter().map(|c| c.layer).filter(|id| !ids.contains(id)).collect();
         crate::cmd::layer::drop_layers(s, &gone);
         if let Some(lock) = &mut s.map_mut().label_lock {
-            lock.retain(|(id, _, _, _)| !gone.contains(id));
+            lock.retain(|((id, _, _, _), _)| !gone.contains(id));
         }
     }
     let map = s.map_mut();

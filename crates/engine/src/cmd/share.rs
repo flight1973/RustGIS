@@ -22,7 +22,16 @@ pub fn commands() -> Vec<C> {
         C::new("share.exportTable", "Export Table", "Publish › Output", |s, p| {
             let path = ps(p, "path").ok_or("path is required")?;
             let t = s.project.tables.get(s.table_index(p)?).ok_or("no such table")?;
+            // A table can hold geometry (a tool's or plugin's output, a project file), so what is
+            // written lacks the Z or M values dropped when it was read, and a Shapefile cuts field
+            // names to dBase's. Said once the file is written, as `share.exportLayer` says them.
+            let zm_note = rustgis_data::zm_export_note([&t.dataset], path);
+            let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            let names_note = if matches!(ext.as_str(), "shp" | "zip") { rustgis_data::io::shapefile_names_note(&t.dataset.fields, path) } else { None };
             rustgis_data::io::write_path(&t.dataset, Path::new(path)).map_err(|e| e.to_string())?;
+            for note in [zm_note, names_note].into_iter().flatten() {
+                s.notify(note, false);
+            }
             Ok(json!({"path": path}))
         })
         .params(
@@ -74,28 +83,57 @@ fn export_map(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"path": path, "bytes": png.len()}))
 }
 
+/// `share.exportLayer`: writes a layer to a file by its extension. A streamed layer exports its
+/// whole source, a chunk at a time where the source and format allow (see `data::export`). Says
+/// what the file couldn't hold: features without drawable geometry, a missing `.prj`, Z or M
+/// values dropped on import, positions that are approximate or aren't longitude/latitude, field
+/// names a Shapefile cuts.
 fn export_layer(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let path = ps(p, "path").ok_or("path is required")?.to_string();
     let l = s.map().layer(id).ok_or("no layer")?;
-    // A streamed layer exports its whole source, not the features read for the view.
-    let whole = if l.is_streamed() { Some(l.load_all()?) } else { None };
-    let ds = whole.as_ref().unwrap_or(&l.dataset);
+    let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    // A streamed layer exports its whole source, not the features read for the view: a chunk at
+    // a time where the source and format allow, so its size isn't limited by memory.
+    let chunks = if l.is_streamed() && rustgis_data::export::streams(&ext) { l.chunk_export()? } else { None };
+    let (whole, unread) = if l.is_streamed() && chunks.is_none() { l.load_all_counted().map(|(ds, n)| (Some(ds), n))? } else { (None, 0) };
+    let ds = chunks.as_ref().map(|(_, layer)| layer).or(whole.as_ref()).unwrap_or(&l.dataset);
     // GeoJSON, KML and GPX are longitude/latitude; the others keep the layer's own system unless
     // told another.
-    let ext = Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let crs = match ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()) {
         Some(text) => Crs::parse(text)?,
         None => rustgis_data::io::default_export_crs(ds, &ext),
     };
-    let left_out = rustgis_data::io::write_path_in(ds, Path::new(&path), crs).map_err(|e| e.to_string())?;
-    let written = ds.features.len().saturating_sub(left_out);
+    let (written, left_out, skipped) = match &chunks {
+        Some((src, layer)) => {
+            let e = rustgis_data::export::write_source_in(src.as_ref(), layer, Path::new(&path), crs).map_err(|e| e.to_string())?;
+            (e.written, e.left_out, e.skipped)
+        }
+        None => {
+            let left_out = rustgis_data::io::write_path_in(ds, Path::new(&path), crs).map_err(|e| e.to_string())?;
+            (ds.features.len().saturating_sub(left_out), left_out, unread)
+        }
+    };
+    // A streamed layer's extent is its whole source's.
+    let notes = rustgis_data::export_notes([(ds, l.extent())], &path, crs);
+    // A Shapefile (`.shp`, or zipped to `.zip`) cuts field names to dBase's.
+    let shapefile = matches!(ext.as_str(), "shp" | "zip");
+    let names_note = if shapefile { rustgis_data::io::shapefile_names_note(&ds.fields, &path) } else { None };
     // FlatGeobuf, KML, GPX and Shapefile hold features with geometry only (a Shapefile, only
     // geometry it can draw).
     if left_out > 0 {
         s.notify(format!("{path}: {left_out} features without drawable geometry were left out"), false);
     }
-    if matches!(ext.as_str(), "shp" | "zip") && rustgis_data::raster::wkt::to_wkt(crs).is_none() {
+    if skipped > 0 {
+        s.notify(format!("{path}: {skipped} rows couldn't be read and were left out"), false);
+    }
+    for note in notes {
+        s.notify(note, false);
+    }
+    if let Some(note) = names_note {
+        s.notify(note, false);
+    }
+    if shapefile && rustgis_data::raster::wkt::to_wkt(crs).is_none() {
         s.notify(format!("{path}: no .prj written, as {} has no WKT form", crs.label()), false);
     }
     s.notify(format!("Exported {path}"), false);

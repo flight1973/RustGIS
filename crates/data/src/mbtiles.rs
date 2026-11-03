@@ -75,16 +75,15 @@ pub struct Info {
     pub attribution: String,
     /// The `json` metadata entry (vector layers…), `Null` when there is none.
     pub json: Value,
+    /// Its vector layers' names, as [`source_layers::of_metadata`](crate::source_layers::of_metadata) keeps them.
+    vector_layers: Vec<String>,
 }
 
 impl Info {
-    /// The names of the vector layers the metadata lists.
-    pub fn vector_layers(&self) -> Vec<String> {
-        self.json
-            .get("vector_layers")
-            .and_then(Value::as_array)
-            .map(|v| v.iter().filter_map(|l| l.get("id").and_then(Value::as_str)).map(str::to_string).take(256).collect())
-            .unwrap_or_default()
+    /// The names of the vector layers the metadata lists, as
+    /// [`source_layers::of_metadata`](crate::source_layers::of_metadata) keeps them.
+    pub fn vector_layers(&self) -> &[String] {
+        &self.vector_layers
     }
 
     /// Reads the `metadata` table's (name, value) rows; `zooms` are the tiles' own zoom range and
@@ -115,6 +114,7 @@ impl Info {
             max_zoom,
             bounds,
             attribution: get("attribution").unwrap_or_default().chars().take(500).collect(),
+            vector_layers: crate::source_layers::of_metadata(&json),
             json,
         }
     }

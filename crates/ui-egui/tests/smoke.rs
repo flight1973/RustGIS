@@ -1056,6 +1056,125 @@ fn plugins_can_have_a_tab_of_their_own() {
 }
 
 #[test]
+fn plugin_small_ribbon_columns_and_nested_menus_preserve_actions() {
+    let _turn = PLUGINS.lock().unwrap_or_else(|e| e.into_inner());
+    use rustgis_ui_egui::rustgis_engine::plugins as rp;
+    let mut m: serde_json::Value = serde_json::from_str(&rp::testing::manifest("ui-small", &[])).unwrap();
+    m["commands"] = json!([
+        {"id": "e", "label": "Compact Error"},
+        {"id": "h", "label": "Width Probe"},
+        {"id": "h-large", "label": "Default Large"}
+    ]);
+    m["tools"][0]["name"] = json!("Compact Points");
+    m["tools"][1]["name"] = json!("Compact Select");
+    m["panel"] = json!({"title": "Compact Panel", "items": [
+        {"kind": "text", "id": "marker", "label": "Compact panel marker", "text": "Panel is open"}
+    ]});
+    m["i18n"] = json!({"de": {
+        "Width Probe": "Eine besonders lange\nübersetzte Beschriftung für diese Schaltfläche",
+        "Nested Tools": "Nested\nTools"
+    }});
+    m["tab"] = json!({"label": "Compact Tab", "groups": [
+        {"label": "Compact controls", "layout": "small", "items": [
+            "e", "h", "tool:m", "tool:x",
+            {"menu": "Inherited Menu", "items": [
+                {"menu": "Nested Tools", "layout": "large", "items": ["tool:x"]}
+            ]},
+            {"menu": "Large Override", "layout": "large", "items": ["h"]},
+            "panel"
+        ]},
+        {"label": "Mixed controls", "items": [
+            "h-large",
+            {"menu": "Small Override", "layout": "small", "items": [
+                {"menu": "Nested\nCommand", "items": ["e"]}
+            ]},
+            {"menu": "Small Neighbor", "layout": "small", "items": ["h"]}
+        ]}
+    ]});
+    let pkg = rp::testing::zip_of(&[("plugin.json", m.to_string().as_bytes()), ("plugin.wasm", &rp::testing::wasm())]);
+    rp::load(rp::Package::from_zip(&pkg).unwrap(), "test").unwrap();
+    let mut h = harness();
+    h.set_size(egui::vec2(2400.0, 860.0));
+    h.state_mut().run("ui.language", json!({"code": "en"})).unwrap();
+    h.state_mut().ui.tab = "plugin:ui-small".into();
+    h.run_steps(4);
+    let english_width = h.get_by_label("Width Probe").rect().width();
+    h.state_mut().run("ui.language", json!({"code": "de"})).unwrap();
+    h.run_steps(4);
+    let error = h.get_by_label("Compact Error").rect();
+    let wide = h.get_by_label("Eine besonders lange übersetzte Beschriftung für diese Schaltfläche").rect();
+    let points = h.get_by_label("Compact Points").rect();
+    let select = h.get_by_label("Compact Select").rect();
+    let inherited = h.get_by_label("Inherited Menu").rect();
+    let large = h.get_by_label("Large Override").rect();
+    let panel = h.get_by_label("Compact Panel").rect();
+    assert!(wide.width() > english_width + 80.0, "the translated label must determine the control's width");
+    // The widest control is deliberately in the middle of the first column.
+    assert!((error.left() - wide.left()).abs() < 1.0 && (wide.left() - points.left()).abs() < 1.0);
+    assert!(error.bottom() <= wide.top() && wide.bottom() <= points.top(), "small controls stack vertically");
+    assert!((select.top() - error.top()).abs() < 1.0, "the fourth entry starts a new column");
+    for first in [error, wide, points] {
+        assert!(first.right() <= select.left(), "the next column must clear every translated label: {first:?} / {select:?}");
+    }
+    assert!((inherited.left() - select.left()).abs() < 1.0 && select.bottom() <= inherited.top());
+    assert!((inherited.height() - error.height()).abs() < 1.0, "a menu inherits the small group layout");
+    assert!(select.right().max(inherited.right()) <= large.left(), "the large override follows the compact run");
+    assert!(large.height() > 2.0 * error.height(), "an explicitly large menu stays large in a small group");
+    assert!(large.right() <= panel.left() && (panel.top() - error.top()).abs() < 1.0, "a large control breaks the small run");
+    let default_large = h.get_by_label("Default Large").rect();
+    let small_override = h.get_by_label("Small Override").rect();
+    let small_neighbor = h.get_by_label("Small Neighbor").rect();
+    assert!(default_large.height() > 2.0 * small_override.height(), "an unspecified group layout remains large");
+    assert!(default_large.right() <= small_override.left());
+    assert!((small_override.left() - small_neighbor.left()).abs() < 1.0 && small_override.bottom() <= small_neighbor.top());
+    assert!((small_override.height() - error.height()).abs() < 1.0, "menu-level small overrides stack in a large group");
+
+    let mark = h.state().session.notice_mark();
+    h.get_by_label("Compact Error").click();
+    h.run_steps(2);
+    assert!(h.state().session.notices_since(mark).iter().any(|n| n.error && n.text.contains("nope")));
+    h.get_by_label("Compact Points").click();
+    h.run_steps(2);
+    assert_eq!(h.state().gp.tool, Some("plugin:ui-small/m"));
+    h.get_by_label("Compact Select").click();
+    h.run_steps(2);
+    assert_eq!(h.state().gp.tool, Some("plugin:ui-small/x"));
+    h.get_by_label("Compact Points").click();
+    h.run_steps(2);
+    assert_eq!(h.state().gp.tool, Some("plugin:ui-small/m"));
+    h.get_by_label("Inherited Menu").click();
+    h.run_steps(4);
+    let nested_tools = h.get_by_label("Nested Tools");
+    let submenu_height = nested_tools.rect().height();
+    nested_tools.click();
+    h.run_steps(4);
+    // Choose the popup row, not the identically named ribbon button.
+    let nested_select = h.query_all_by_label("Compact Select").find(|n| n.rect().top() > inherited.bottom()).unwrap();
+    assert!(nested_select.rect().height() < large.height(), "nested entries remain ordinary menu rows");
+    assert!((submenu_height - nested_select.rect().height()).abs() < 1.0, "translated submenu labels must stay on one standard-height row");
+    nested_select.click();
+    h.run_steps(2);
+    assert_eq!(h.state().gp.tool, Some("plugin:ui-small/x"), "the nested leaf must activate its tool");
+    h.get_by_label("Small Override").click();
+    h.run_steps(4);
+    h.get_by_label("Nested Command").click();
+    h.run_steps(4);
+    let mark = h.state().session.notice_mark();
+    h.query_all_by_label("Compact Error").find(|n| n.rect().top() > small_override.bottom()).unwrap().click();
+    h.run_steps(2);
+    assert!(h.state().session.notices_since(mark).iter().any(|n| n.error && n.text.contains("nope")), "the nested command must run");
+    h.get_by_label("Compact Panel").click();
+    h.run_steps(2);
+    assert_eq!(h.state().ui.right, Some(rustgis_ui_egui::RightPane::Plugin));
+    h.get_by_label("Panel is open");
+    h.query_all_by_label("Compact Panel").find(|n| n.rect().top() < panel.bottom()).unwrap().click();
+    h.run_steps(2);
+    assert_ne!(h.state().ui.right, Some(rustgis_ui_egui::RightPane::Plugin));
+    assert!(h.query_by_label("Panel is open").is_none(), "the compact panel button still toggles its pane");
+    rp::unload("ui-small");
+}
+
+#[test]
 fn browse_lists_thousands_of_plugins_quickly() {
     use rustgis_ui_egui::rustgis_engine::plugins::registry;
     let _turn = PLUGINS.lock().unwrap_or_else(|e| e.into_inner());
@@ -2946,7 +3065,7 @@ fn ogc_landing_connect_and_add_use_fixture_documents() {
     assert_eq!(conn.documents.len(), 1);
     assert_eq!(conn.listing.as_ref().unwrap()["count"], 1);
     h.step();
-    h.get_by_label("Places");
+    h.get_by_label_contains("Places");
     h.get_by_label("Import All").click();
     wait_for_ogc(&mut h, |app| app.session.map().layer_by_name("Places").is_some());
     let dataset = &h.state().session.map().layer_by_name("Places").unwrap().dataset;
@@ -2981,9 +3100,9 @@ fn ogc_landing_lists_both_offerings_and_keeps_maps_after_failure() {
         assert_eq!(conn.listing.as_ref().unwrap()["count"], count);
         assert_eq!(conn.failure.as_ref().and_then(|f| f.status()), fail.then_some(503));
         h.step();
-        h.get_by_label("Example GIS (map tiles)");
+        h.get_by_label_contains("Example GIS (map tiles)");
         if !fail {
-            h.get_by_label("Places");
+            h.get_by_label_contains("Places");
         }
         // The root map remains addable with its own document even after another fetch failed.
         h.query_all_by_label("Add").next().unwrap().click();
@@ -3492,6 +3611,14 @@ fn a_shortcut_that_cannot_run_says_why() {
     }
     let mark = h.state().session.notice_mark();
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.step();
+    assert!(h.state().session.notices_since(mark).is_empty());
+    // Exhausted redo is equally quiet; available redo still runs.
+    while h.state().session.can_redo() {
+        h.state_mut().run("edit.redo", json!(null)).unwrap();
+    }
+    let mark = h.state().session.notice_mark();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Y);
     h.step();
     assert!(h.state().session.notices_since(mark).is_empty());
 }

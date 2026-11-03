@@ -6,8 +6,10 @@
 The `rustgis` package runs the RustGIS engine inside Python, headless. It opens data and
 projects, runs engine commands and geoprocessing tools, styles layers, renders maps and saves
 projects that the desktop app opens as they are. There is no app to install and no server to run:
-the engine is a native module for Python 3.12 and later. Release wheels cover Windows x64,
-macOS Intel and Apple Silicon, and Linux x64 and arm64 (glibc 2.28 or later).
+the engine is a native module for Python 3.12 and later. Release wheels cover Windows x64 and
+arm64, macOS Intel and Apple Silicon, and Linux x64 and arm64 (glibc 2.28 or later). The
+`geopandas` extra doesn't install on Windows arm64 yet, because `pyogrio`, which geopandas needs,
+has no wheel for it.
 
 ```sh
 pip install rustgis               # pip install "rustgis[geopandas]" for GeoDataFrames
@@ -230,7 +232,9 @@ The GeoLibre and Whitebox tools run as they do in the app, through the `geolibre
 
 `rustgis.Session(use_saved_secrets=True)` loads the desktop app's saved connection definitions
 and lets `connection.login` and project sources use their remembered database passwords and S3
-keys. Secrets are read lazily from the system keychain, only when a command needs one, under
+keys, and files on NASA's Earthdata data servers the remembered Earthdata Login token (which,
+like a token given with `earthdata.login`, then serves every session of the process).
+Secrets are read lazily from the system keychain, only when a command needs one, under
 the desktop's rules: the same connection ID, kind and address or S3 endpoint. Parameters given
 to a command, and environment credentials selected by a connection, take precedence over saved
 secrets. Changes to the connection definitions aren't saved back to the desktop preferences.
@@ -315,5 +319,13 @@ python -m pytest tests/test_saved_secrets.py
 
 Rebuild without `--features test-stores` afterward to restore the OS backend. CI builds one test
 wheel with the injected store and runs the suite once; distributed wheels keep default features.
+
+To require the Qt tests, install the `qt` extra too and set `RUSTGIS_TEST_QT=1`. They run
+offscreen with one `QApplication` kept alive for the test session, and with WebEngine's GPU
+turned off (`--webEngineArgs --disable-gpu`): otherwise WebEngine sets up EGL on a thread of
+its own, where Mesa reads the environment, and a test or library adding an environment variable
+at that moment can crash the process (glibc's `setenv` may free the environment array that
+`getenv` is reading). Qt tests create widgets with the `make_widget` fixture, which destroys
+each widget and its message bridge at test teardown.
 
 Its version is the RustGIS version, and each release publishes wheels to PyPI.

@@ -372,3 +372,53 @@ fn waiting_for_live_tiles_paints_until_the_top_layer_is_uploaded() {
     h.step();
     assert!(!h.state().map.drawing(), "painting the settled frame must not reveal an upload backlog");
 }
+
+/// Zoomed in past where f32 holds the basemap's meshes, they are drawn on the CPU (#902): the
+/// scene is a picture, shifted and scaled until it is drawn again, and the live tiles over it
+/// must move with it, not be placed for the new camera and then moved again (a WMS layer
+/// flickered and stepped back on each wheel step out).
+#[test]
+fn live_tiles_move_with_a_scene_shown_as_a_picture() {
+    use rustgis_ui_egui::rustgis_engine::geom::Coord;
+    use rustgis_ui_egui::rustgis_engine::map::{TileKind, TileLayer};
+    use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles;
+    let _serial = one_at_a_time();
+    // A checkerboard: tiles out of place show at once.
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_fn(256, 256, |x, y| {
+        image::Rgba(if (x / 16 + y / 16) % 2 == 0 { [250, 250, 250, 255] } else { [10, 10, 10, 255] })
+    })
+    .write_to(&mut png, image::ImageFormat::Png)
+    .expect("tile");
+    rustgis_tiles::cache::set_fetcher(move |_, done| done(Ok(png.get_ref().clone())));
+    let Some(mut h) = harness() else { return };
+    let m = h.state_mut().session.map_mut();
+    m.layers.clear();
+    m.graticule = false;
+    m.tiles.push(TileLayer::new("WMS", TileKind::Raster, "https://wms.test/?BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256"));
+    // Bern, past the layer's max zoom (19).
+    m.camera.center = Coord::new(828_000.0, 5_933_000.0);
+    m.camera.res = 0.01;
+    h.state_mut().map.invalidate();
+    wait_for_frame(&mut h);
+    assert!(!h.state().map.moves_on_gpu(), "the basemap is drawn on the CPU this far in: the scene is a picture");
+    let start = h.state().map.full_frame_camera();
+    let mut shifted = 0;
+    for _ in 0..12 {
+        h.input_mut().events.push(egui::Event::PointerMoved(egui::pos2(450.0, 300.0)));
+        h.input_mut().events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -40.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Default::default(),
+            source: egui::MouseWheelSource::Wheel,
+        });
+        h.step();
+        if h.state().map.full_frame_camera() != h.state().session.map().camera {
+            shifted += 1;
+        }
+        assert_gpu_picture_matches_cpu(&mut h);
+    }
+    assert!(shifted > 0, "some steps show the picture shifted and scaled, not drawn again");
+    assert!(h.state().session.map().camera.res > start.res * 2.0, "zoomed out");
+}

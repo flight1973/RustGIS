@@ -100,11 +100,15 @@ impl<K: Copy + PartialEq> TiltSettle<K> {
         {
             let (tx, rx) = std::sync::mpsc::channel();
             let ctx = ctx.clone();
+            let diagnostics = rustgis_engine::data::diagnostics::Capture::current();
             let spawned = std::thread::Builder::new().name("rustgis-map-frame".into()).spawn(move || {
-                // Without an answer (a panic) `take` finds the channel closed.
+                let _diagnostics = diagnostics.enter();
+                // Without an answer (a panic) `take` finds the channel closed. It is closed before
+                // the frame is woken, so the woken frame finds the job over, not still running.
                 if let Ok(done) = std::panic::catch_unwind(work) {
                     let _ = tx.send(done);
                 }
+                drop(tx);
                 ctx.request_repaint();
             });
             match spawned {
@@ -196,5 +200,31 @@ mod tests {
         assert!(!s.busy(), "the same frame was tried again");
         s.start(&ctx, 2u8, map, view);
         assert!(s.busy());
+    }
+
+    /// The frame a worker's panic wakes finds the job over: the worker closes the channel before
+    /// it wakes the frame, so no wake-up is lost. (The callback holds the worker until the test has
+    /// looked.)
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_frame_a_panic_wakes_finds_the_job_over() {
+        let ctx = egui::Context::default();
+        let (woken, wake) = std::sync::mpsc::channel::<()>();
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let (woken, gate) = (std::sync::Mutex::new(woken), std::sync::Mutex::new(gate));
+        ctx.set_request_repaint_callback(move |_| {
+            if let Ok(w) = woken.lock() {
+                let _ = w.send(());
+            }
+            if let Ok(g) = gate.lock() {
+                let _ = g.recv_timeout(std::time::Duration::from_secs(30));
+            }
+        });
+        let mut s = TiltSettle::default();
+        s.start_with(&ctx, 1u8, || panic!("the renderer failed"));
+        assert!(wake.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "never woken");
+        assert!(s.take().is_none());
+        assert!(!s.busy(), "the woken frame found the job still running");
+        drop(open);
     }
 }

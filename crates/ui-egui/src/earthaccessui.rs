@@ -1,8 +1,9 @@
 //! Web Data › NASA Earthaccess: like GeoLibre's Earthaccess panel, a dataset (a popular one, or
 //! one found by keyword), then its granules where the map is and between two dates, drawn as
 //! footprints, each with its files (a GeoTIFF added as a COG, read in place), Zoom and Details.
-//! The Earthdata Login token the files are read with is kept for the session only
-//! (`earthdata.login`). Requests go off the frame through the tile cache's downloads.
+//! The Earthdata Login token the files are read with is kept for the session, or remembered on
+//! this computer (`earthdata.login` with `remember`). Requests go off the frame through the tile
+//! cache's downloads, and the remembered token is read off the frame too.
 
 use rustgis_engine::render::rustgis_tiles::cache;
 use rustgis_engine::render::rustgis_tiles::earthdata::{self, Collection, Granule};
@@ -57,6 +58,12 @@ pub struct State {
     added: Vec<String>,
     /// A token being typed.
     pub token: String,
+    /// Remember the token on this computer (off unless ticked, or one is remembered already).
+    pub remember: bool,
+    /// The remembered token was asked for (once, when the pane is first shown).
+    restoring: bool,
+    /// Whether a token was remembered at the last frame, so `remember` follows a change.
+    was_remembered: bool,
     /// Preview pictures, by address.
     thumbs: std::collections::HashMap<String, Thumb>,
     waiting: Option<(Asked, Answer)>,
@@ -83,6 +90,9 @@ impl Default for State {
             footprints: None,
             added: Vec::new(),
             token: String::new(),
+            remember: false,
+            restoring: false,
+            was_remembered: false,
             thumbs: Default::default(),
             waiting: None,
             error: None,
@@ -406,13 +416,15 @@ pub fn pane(app: &mut RustGisApp, ui: &mut egui::Ui) {
     granules(app, ui, &t, w);
 }
 
-/// The Earthdata Login section: the token kept for the session.
+/// The Earthdata Login section: the token kept for the session or remembered on this computer.
 fn auth(app: &mut RustGisApp, ui: &mut egui::Ui, w: f32) {
+    restore(app, ui.ctx());
     let expiry = earthdata::token_expiry();
     let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     let title = match (earthdata::has_token(), expiry) {
         (true, Some(e)) if e < now => tl!("Earthdata Login: token expired"),
         (true, _) => tl!("Earthdata Login: token set"),
+        (false, _) if earthdata::expired_forgotten() => tl!("Earthdata Login: token expired"),
         (false, _) => tl!("Earthdata Login: no token"),
     };
     egui::CollapsingHeader::new(title).id_salt("ea_auth").show(ui, |ui| {
@@ -420,28 +432,76 @@ fn auth(app: &mut RustGisApp, ui: &mut egui::Ui, w: f32) {
             ui.label(egui::RichText::new(tl!("Searching works here, but NASA's data servers don't let web pages read their files (no CORS), so GeoTIFFs and downloads of protected data need the desktop app. Download opens a file in a new tab, where Earthdata Login asks you to sign in.")).weak());
             return;
         }
+        let remembered = earthdata::is_remembered();
+        // The box follows whether a token is remembered (read back, saved or forgotten); a token
+        // replacing a remembered one stays remembered unless it is unticked.
+        if remembered != app.ui.earthaccess.was_remembered {
+            app.ui.earthaccess.was_remembered = remembered;
+            app.ui.earthaccess.remember = remembered;
+        }
         if earthdata::has_token() {
             let text = match expiry {
                 Some(e) => crate::i18n::fmt("The token expires on {date}.", &[("date", &earthdata::date_of(e))]),
                 None => tl!("A token is set.").to_string(),
             };
             ui.label(egui::RichText::new(text).small());
-            if ui.button(tl!("Remove token")).clicked() {
-                let _ = app.run("earthdata.logout", Value::Null);
+            if remembered {
+                ui.label(egui::RichText::new(tl!("It is remembered on this computer.")).small());
             }
+            if ui.button(tl!("Remove token")).clicked() {
+                let r = app.run("earthdata.logout", Value::Null);
+                logged_in(app, r);
+            }
+        } else if earthdata::expired_forgotten() {
+            ui.label(egui::RichText::new(tl!("The token expired and was forgotten. Paste a new one.")).small());
         }
-        ui.label(egui::RichText::new(tl!("Reading a granule's files needs an Earthdata Login token, which works for every NASA DAAC. It is kept until RustGIS closes, never in the project, and sent only to NASA's Earthdata data servers.")).small().weak());
+        ui.label(egui::RichText::new(tl!("Reading a granule's files needs an Earthdata Login token, which works for every NASA DAAC. It is kept until RustGIS closes unless you tick Remember, never in the project, and sent only to NASA's Earthdata data servers.")).small().weak());
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut app.ui.earthaccess.token).password(true).hint_text(tl!("Paste a token")).desired_width(w - 80.0));
             if ui.button(tl!("Save")).clicked() && !app.ui.earthaccess.token.trim().is_empty() {
                 let token = std::mem::take(&mut app.ui.earthaccess.token);
-                if let Err(e) = app.run("earthdata.login", json!({"token": token})) {
-                    app.ui.earthaccess.error = Some(e);
-                }
+                let remember = app.ui.earthaccess.remember && app.services.secrets.is_some();
+                let r = app.run("earthdata.login", json!({"token": token, "remember": remember}));
+                logged_in(app, r);
             }
         });
+        if app.services.secrets.is_some() {
+            ui.checkbox(&mut app.ui.earthaccess.remember, tl!("Remember on this computer")).on_hover_text(tl!(
+                "Keeps the token in the system's credential store, so it is there when RustGIS starts again. Unticked, a token remembered before is deleted when you save another."
+            ));
+        }
         ui.hyperlink_to(tl!("Generate a token"), earthdata::TOKEN_PAGE);
     });
+}
+
+/// Reads the token remembered on this computer, once, off the frame: the system may ask for its
+/// store to be unlocked.
+fn restore(app: &mut RustGisApp, ctx: &egui::Context) {
+    if app.ui.earthaccess.restoring || app.services.secrets.is_none() {
+        return;
+    }
+    app.ui.earthaccess.restoring = true;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let ctx = ctx.clone();
+        let read = std::thread::Builder::new().name("earthdata-token".into()).spawn(move || {
+            earthdata::restore();
+            ctx.request_repaint();
+        });
+        if read.is_err() {
+            app.ui.earthaccess.restoring = false;
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = ctx;
+}
+
+/// Shows what a login or logout said: its error, or the warning it gave.
+fn logged_in(app: &mut RustGisApp, r: Result<Value, String>) {
+    app.ui.earthaccess.error = match r {
+        Ok(v) => v.get("warning").and_then(Value::as_str).map(str::to_string),
+        Err(e) => Some(e),
+    };
 }
 
 fn status(app: &RustGisApp, ui: &mut egui::Ui, t: &crate::theme::Tokens) {

@@ -12,7 +12,12 @@ use std::rc::Rc;
 
 #[path = "ogc_info.rs"]
 mod info;
-pub use info::{FeatureInfo, InfoFeature, MAX_INFO_BYTES, answer_text, may_answer_in_another_format, read_feature_info, wms_layer_of};
+#[path = "ogc_warp.rs"]
+pub mod warp;
+pub use info::{
+    FeatureInfo, InfoFeature, MAX_INFO_BYTES, answer_text, at_map_time, map_time, may_answer_in_another_format, read_feature_info,
+    wms_layer_of,
+};
 
 /// What a layer of a service becomes.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,18 +39,193 @@ pub enum Offer {
     Service { url: String },
 }
 
-/// A layer's time dimension (a WMTS `Dimension` named `Time`): its tile template has `{Time}`,
-/// which takes the default unless a time is asked for.
+/// A layer's time dimension (a WMTS `Dimension` named `Time`, a WMS `Dimension` named `time`):
+/// its tile template has `{Time}`, which takes the default unless a time is asked for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayerTime {
     /// The time the service draws when none is given (`default` is GIBS's latest day).
     pub default: String,
     /// The times or ranges it lists (`2000-02-24/2026-10-19/P1D`), the first few.
     pub values: Vec<String>,
+    /// Whether several times may be asked for at once: a list or an interval (a WMS layer's
+    /// `multipleValues`, WMS 1.3.0 Annex C.2); otherwise one time.
+    pub multiple: bool,
 }
 
-/// Most time values kept for a layer.
-const MAX_TIME_VALUES: usize = 64;
+/// Most time values kept for a layer: enough for every year of a century and more (swisstopo's
+/// aerial photos list 92), as the time slider steps through them.
+const MAX_TIME_VALUES: usize = 1000;
+
+/// Most time values of a layer's dimension read for its default and latest, the last it lists
+/// (each a few bytes of the document, whose size is capped).
+const MAX_TIMES_READ: usize = 20_000;
+
+/// The last `n` of `values` (lists of times run from the earliest to the latest).
+fn last(mut values: Vec<String>, n: usize) -> Vec<String> {
+    values.drain(..values.len().saturating_sub(n));
+    values
+}
+
+/// Most time values kept for all of a WMS document's layers together (swisstopo's 56 list about
+/// 2,000).
+const MAX_DOCUMENT_TIME_VALUES: usize = 50_000;
+
+/// The most steps the time slider takes (`rustgis_map::time::MAX_STEPS`).
+const MAX_SLIDER_STEPS: usize = 20_000;
+
+/// The date formats a layer's times may be written in, as `{date:…}` takes them: years, compact
+/// dates (swisstopo's `19951231`), months, dates, date-times (with milliseconds, as GeoServer and
+/// ncWMS write them, always zero there).
+const DATE_FORMATS: [&str; 9] = [
+    "YYYY",
+    "YYYYMMDD",
+    "YYYY-MM",
+    "YYYY-MM-DD",
+    "YYYY-MM-DD[T]HH:mm:ss[Z]",
+    "YYYY-MM-DD[T]HH:mm:ss[.000Z]",
+    "YYYY-MM-DD[T]HH:mm[Z]",
+    "YYYY-MM-DD[T]HH:mm:ss",
+    "YYYY-MM-DD[T]HH:mm",
+];
+
+/// The start of the year 3000 (milliseconds since 1970): times past it stand for the latest
+/// (swisstopo's `9999`, `99991231`), no time the slider steps to.
+const LATEST_STAND_IN: f64 = 32_503_680_000_000.0;
+
+/// How a layer's times go on the time slider: the format they are written in (`{date:…}`'s), the
+/// slider's steps, and the time it starts at (the layer's default, else its latest).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SliderTime {
+    pub format: &'static str,
+    pub steps: SliderSteps,
+    pub at: Option<f64>,
+}
+
+/// The time slider's steps for a layer: the times it lists, or every so often between two (one
+/// period it lists, `1952/2026/P1Y`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SliderSteps {
+    Dates(Vec<f64>),
+    Every { start: f64, end: f64, unit: crate::time::Unit, interval: u32 },
+}
+
+/// A time written in `format` (and no stand-in for the latest), as milliseconds since 1970.
+fn written_as(v: &str, format: &str) -> Option<f64> {
+    let t = crate::time::parse_input(&serde_json::Value::String(v.to_string()))?;
+    (t < LATEST_STAND_IN && crate::time::format(t, format) == v).then_some(t)
+}
+
+/// An ISO 8601 period the slider steps by: years, months, weeks, days or hours (`P1Y`, `PT6H`).
+fn period_step(p: &str) -> Option<(crate::time::Unit, u32)> {
+    use crate::time::Unit;
+    let (body, hours) = match p.strip_prefix("PT") {
+        Some(b) => (b, true),
+        None => (p.strip_prefix('P')?, false),
+    };
+    let n: u32 = body.get(..body.len().checked_sub(1)?)?.parse().ok().filter(|n| *n > 0)?;
+    match (hours, body.chars().last()?) {
+        (true, 'H') => Some((Unit::Hour, n)),
+        (false, 'Y') => Some((Unit::Year, n)),
+        (false, 'M') => Some((Unit::Month, n)),
+        (false, 'W') => Some((Unit::Day, n.checked_mul(7)?)),
+        (false, 'D') => Some((Unit::Day, n)),
+        _ => None,
+    }
+}
+
+impl SliderTime {
+    /// Whether `t` is one of its steps (each counted from the start, as the slider counts them).
+    pub fn has(&self, t: f64) -> bool {
+        match &self.steps {
+            SliderSteps::Dates(dates) => dates.contains(&t),
+            SliderSteps::Every { start, end, unit, interval } => {
+                crate::time::steps(*start, *end, *unit, *interval, MAX_SLIDER_STEPS).contains(&t)
+            }
+        }
+    }
+}
+
+impl LayerTime {
+    /// Whether it lists more than one time (several, or a range): one that lists a single time
+    /// (swisstopo's maps, most of them `current` alone) has no other to show and is a plain map.
+    pub fn changes(&self) -> bool {
+        match self.values.as_slice() {
+            [] => false,
+            [one] => one.contains('/'),
+            _ => true,
+        }
+    }
+
+    /// Its times on the time slider; `None` when they aren't dates it can step to (one time, as
+    /// `current` alone, or written in no format of [`DATE_FORMATS`]).
+    pub fn slider(&self) -> Option<SliderTime> {
+        use crate::time::Unit;
+        if !self.changes() {
+            return None;
+        }
+        // The format: the first time listed (or a range's start) that reads as a date in one.
+        let first =
+            self.values.iter().flat_map(|v| v.split('/').take(2)).find(|v| DATE_FORMATS.iter().any(|f| written_as(v, f).is_some()))?;
+        let format = DATE_FORMATS.iter().copied().find(|f| written_as(first, f).is_some())?;
+        // A range without a period steps by the finest unit its times name.
+        let finest = match format {
+            "YYYY" => Unit::Year,
+            "YYYY-MM" => Unit::Month,
+            "YYYYMMDD" | "YYYY-MM-DD" => Unit::Day,
+            _ => Unit::Hour,
+        };
+        let range = |v: &str| -> Option<(f64, f64, Unit, u32)> {
+            let pieces: Vec<&str> = v.split('/').collect();
+            let (a, z) = (written_as(pieces.first()?, format)?, written_as(pieces.get(1)?, format)?);
+            let (unit, n) = match pieces.get(2) {
+                Some(p) => period_step(p)?,
+                None => (finest, 1),
+            };
+            (a <= z).then_some((a, z, unit, n))
+        };
+        let steps = match self.values.as_slice() {
+            [one] if one.contains('/') => {
+                let (start, end, unit, mut interval) = range(one)?;
+                // Within the slider's steps, every second, fourth… of the period's: still times the
+                // layer lists, from its start to (about) its end.
+                while crate::time::steps(start, end, unit, interval, MAX_SLIDER_STEPS + 1).len() > MAX_SLIDER_STEPS {
+                    interval = interval.checked_mul(2)?;
+                }
+                SliderSteps::Every { start, end, unit, interval }
+            }
+            values => {
+                let mut dates = Vec::new();
+                for v in values {
+                    if v.contains('/') {
+                        let Some((a, z, unit, n)) = range(v) else { continue };
+                        // Each step from the start, as the slider counts them: a month-end range keeps
+                        // to month ends (31 January, 29 February, 31 March), not one day earlier
+                        // after February.
+                        dates.extend(crate::time::steps(a, z, unit, n, (MAX_SLIDER_STEPS + 1).saturating_sub(dates.len())));
+                    } else if let Some(t) = written_as(v, format) {
+                        dates.push(t);
+                    }
+                    if dates.len() > MAX_SLIDER_STEPS {
+                        return None;
+                    }
+                }
+                dates.sort_by(f64::total_cmp);
+                dates.dedup();
+                if dates.is_empty() {
+                    return None;
+                }
+                SliderSteps::Dates(dates)
+            }
+        };
+        // At its default; one that isn't a date (`current`, swisstopo's `99991231`), its latest.
+        let latest = match &steps {
+            SliderSteps::Dates(dates) => dates.last().copied(),
+            SliderSteps::Every { end, .. } => Some(*end),
+        };
+        let at = written_as(&self.default, format).or(latest);
+        Some(SliderTime { format, steps, at })
+    }
+}
 
 /// A time given for a layer's `{Time}`: an ISO 8601 date or date-time (or `default`, or OGC's
 /// `current`), never anything else, since it goes into tile addresses.
@@ -61,6 +241,123 @@ pub fn checked_time(t: &str) -> Result<String, String> {
     } else {
         Err(format!("'{}': a time is a date like 2024-06-01", t.chars().take(60).collect::<String>()))
     }
+}
+
+/// Whether `p` is an ISO 8601 duration, as a WMS interval's resolution is: `P`, then numbers each
+/// with its designator in order (`Y`, `M`, `W`, `D`; after `T`, `H`, `M`, `S`, seconds with a
+/// fraction too), at least one (`P1Y`, `P1DT12H`, `PT30M`, `PT0.5S`).
+fn is_duration(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix('P').filter(|r| !r.is_empty() && p.len() <= 40) else { return false };
+    let (date, time) = match rest.split_once('T') {
+        Some((d, t)) if !t.is_empty() => (d, Some(t)),
+        Some(_) => return false,
+        None => (rest, None),
+    };
+    // Each part a number and a designator, in the order given; only seconds take a fraction.
+    let parts = |s: &str, order: &[u8]| -> Option<usize> {
+        let (mut at, mut next, mut count) = (0, 0, 0);
+        let b = s.as_bytes();
+        while at < b.len() {
+            let start = at;
+            while b.get(at).is_some_and(|c| c.is_ascii_digit() || *c == b'.') {
+                at += 1;
+            }
+            let number = s.get(start..at)?;
+            let designator = *b.get(at)?;
+            let place = order.iter().skip(next).position(|d| *d == designator)? + next;
+            let fraction = number.contains('.');
+            if number.matches('.').count() > 1
+                || number.is_empty()
+                || number.starts_with('.')
+                || number.ends_with('.')
+                || (fraction && designator != b'S')
+            {
+                return None;
+            }
+            (next, count, at) = (place + 1, count + 1, at + 1);
+        }
+        Some(count)
+    };
+    let dated = parts(date, b"YMWD");
+    let timed = time.map_or(Some(0), |t| parts(t, b"HMS"));
+    matches!((dated, timed), (Some(d), Some(t)) if d + t > 0)
+}
+
+/// Most characters of a WMS layer's time asked for (a list or interval of times).
+const MAX_WMS_TIME: usize = 1000;
+
+/// A time given for a WMS layer's `TIME` (WMS 1.3.0 Annex C, Table C.2): one time, a
+/// comma-separated list of times, or an interval `start/end`, with its resolution or not
+/// (`1952/2026/P1Y`); each time as [`checked_time`] takes it. It goes into a query, encoded.
+pub fn checked_wms_time(t: &str) -> Result<String, String> {
+    let t = t.trim();
+    let error = || {
+        format!(
+            "'{}': a time is a date like 2024-06-01, a list (1990,2000) or an interval (1990/2000/P1Y)",
+            t.chars().take(60).collect::<String>()
+        )
+    };
+    if t.is_empty() || t.len() > MAX_WMS_TIME {
+        return Err(error());
+    }
+    let one = |v: &str| checked_time(v).is_ok();
+    // Each item and each part of an interval as `checked_time` takes it, trimmed.
+    let parts: Vec<String> = t.split(',').map(|part| part.split('/').map(str::trim).collect::<Vec<_>>().join("/")).collect();
+    let valid = |part: &String| {
+        let pieces: Vec<&str> = part.split('/').collect();
+        match pieces.as_slice() {
+            [v] => one(v),
+            [start, end] => one(start) && one(end),
+            [start, end, p] => one(start) && one(end) && is_duration(p),
+            _ => false,
+        }
+    };
+    if parts.iter().all(valid) { Ok(parts.join(",")) } else { Err(error()) }
+}
+
+/// A tile template with its `{Time}` filled with `t` (a [`checked_time`], or for a WMS layer a
+/// [`checked_wms_time`]): percent-encoded where
+/// it is a query value (`TIME={Time}`, a WMS layer's or a WMTS one asked by key), as it is in a
+/// path (a checked time has no `/`).
+pub fn with_time(template: &str, t: &str) -> String {
+    template.replace("={Time}", &format!("={}", encode(t))).replace("{Time}", t)
+}
+
+/// A time dimension from its default (`None` when the service gives none) and the values it
+/// lists: the default when `check` takes it, else the latest time listed (a range's end); with
+/// neither, none. Every value read is looked through for the latest; the last few are kept.
+fn layer_time(default: Option<&str>, all: Vec<String>, check: fn(&str) -> Result<String, String>, multiple: bool) -> Option<LayerTime> {
+    let all: Vec<String> = all.into_iter().filter(|v| v.len() <= 100).collect();
+    let listed = all.iter().rev().find_map(|v| {
+        let mut parts = v.split('/');
+        let first = parts.next().unwrap_or("");
+        checked_time(parts.next().unwrap_or(first)).ok()
+    });
+    let default = default.and_then(|t| check(t).ok()).or(listed)?;
+    // The latest few: those the default and the latest are among.
+    let skip = all.len().saturating_sub(MAX_TIME_VALUES);
+    let values = all.into_iter().skip(skip).collect();
+    Some(LayerTime { default, values, multiple })
+}
+
+/// A WMS layer's own time dimension: its `Dimension` named `time` with its values (WMS 1.3.0
+/// Annex C), or its `Extent` of that name (WMS 1.1.1, whose `Dimension` only declares it): a
+/// comma-separated list of times and ranges (`1990,2000`, `1952/2026/P1Y`). Its default may be any
+/// time `TIME` takes, a range too (`2005/2025`, swisstopo's strips of aerial photos).
+/// `None` when the layer declares none of its own; `Some(None)` when it declares one that gives no
+/// time to draw it at (in WMS 1.3.0, `v13`, an empty one too; a WMS 1.1.1 `Dimension` without its
+/// `Extent` only declares the one it inherits).
+fn wms_time(layer: &Node, v13: bool) -> Option<Option<LayerTime>> {
+    let is_time = |n: &Node| n.attribute("name").is_some_and(|a| a.trim().eq_ignore_ascii_case("time"));
+    let d = children(layer, "Dimension")
+        .filter(is_time)
+        .find(|d| !text_of(d).is_empty())
+        .or_else(|| children(layer, "Extent").find(is_time))
+        .or_else(|| children(layer, "Dimension").filter(|_| v13).find(is_time))?;
+    let all: Vec<String> = text_of(&d).split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
+    let all = last(all, MAX_TIMES_READ);
+    let multiple = d.attribute("multipleValues").is_some_and(|m| m.trim() == "1" || m.trim().eq_ignore_ascii_case("true"));
+    Some(layer_time(d.attribute("default").map(str::trim), all, checked_wms_time, multiple))
 }
 
 /// A layer a service offers.
@@ -83,6 +380,9 @@ pub struct ServiceLayer {
     /// service's GetLegendGraphic, then its default style's picture; a WMTS layer's default
     /// style's, each for its scales. None when the service gives none.
     pub legends: Vec<Legend>,
+    /// The Web Mercator zooms its tiles are drawn at, least and greatest, when the service says:
+    /// a WMS layer's scale hints, a WMTS layer's tile matrices. `None`: the usual range.
+    pub zooms: Option<(u8, u8)>,
 }
 
 /// A map layer's legend picture as its service gives it: its address and, as a WMTS style's
@@ -317,6 +617,28 @@ fn resolve(from: &str, href: &str) -> Option<String> {
     Some(format!("{dir}{href}"))
 }
 
+/// The words in the notes on OGC API collections left out as 3D content, by which
+/// `service.add` finds why a layer isn't listed.
+pub const LEFT_OUT_3D: &str = "which RustGIS doesn't draw";
+
+/// What an OGC API collection's items link, in the document at `from`, offers when it is 3D
+/// content, not features: 3D Tiles (its type, or an address ending in `/3dtiles`) or quantized
+/// mesh terrain (an address ending in `/quantized-mesh`; its type is only `application/json`).
+/// A relative address is judged resolved, so a bare `3dtiles` counts.
+fn items_3d(from: &str, link: &serde_json::Value) -> Option<&'static str> {
+    let kind = link.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_ascii_lowercase();
+    let href = link.get("href").and_then(|h| h.as_str()).unwrap_or_default();
+    let href = resolve(from, href).unwrap_or_else(|| href.to_string());
+    let path = href.split(['?', '#']).next().unwrap_or_default().trim_end_matches('/').to_ascii_lowercase();
+    if kind.contains("3dtiles") || path.ends_with("/3dtiles") {
+        Some("3D Tiles")
+    } else if kind.contains("quantized-mesh") || path.ends_with("/quantized-mesh") {
+        Some("quantized mesh terrain")
+    } else {
+        None
+    }
+}
+
 fn with_query(url: &str, q: &str) -> String {
     let (base, frag) = url.split_once('#').map(|(b, f)| (b, Some(f))).unwrap_or((url, None));
     let sep = if base.contains('?') { if base.ends_with('?') || base.ends_with('&') { "" } else { "&" } } else { "?" };
@@ -438,6 +760,44 @@ fn is_web_mercator(code: &str) -> bool {
 // ---------------------------------------------------------------------------------------------
 // WMS
 
+/// The greatest zoom a WMS layer is drawn at when its service gives no scale hint: a GetMap is
+/// drawn at any scale, and this is about 4 cm a pixel at the equator (an aerial photo's 10 cm
+/// fills it).
+const WMS_MAX_ZOOM: u8 = 22;
+
+/// A WMS layer's scale hints: the scale denominators it is drawn between (WMS 1.3.0's
+/// `MinScaleDenominator` and `MaxScaleDenominator`; 1.1.1's `ScaleHint`, a pixel's diagonal on
+/// the ground in metres).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Scales {
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+impl Scales {
+    /// A layer's hints, each its own or else its parent's (`inherited`): WMS 1.3.0 replaces
+    /// each element on its own (Table 7).
+    fn of(layer: &Node, inherited: Scales) -> Scales {
+        let num = |t: Option<&str>| t.and_then(|t| t.trim().parse::<f64>().ok()).filter(|v| v.is_finite() && *v > 0.0);
+        let hint = child(layer, "ScaleHint");
+        let scale = |k: &str| num(hint.as_ref().and_then(|h| h.attribute(k))).map(|d| d / std::f64::consts::SQRT_2 / 0.000_28);
+        let min = num(child_text(layer, "MinScaleDenominator").as_deref()).or_else(|| scale("min"));
+        let max = num(child_text(layer, "MaxScaleDenominator").as_deref()).or_else(|| scale("max"));
+        Scales { min: min.or(inherited.min), max: max.or(inherited.max) }
+    }
+
+    /// The Web Mercator zooms the layer is drawn at: down to the last whose scale is at or above
+    /// its least (else [`WMS_MAX_ZOOM`]), out to the first at or below its greatest. A service
+    /// works out the scale of a request in Web Mercator in its metres, as the zooms' scales are
+    /// (a hair past a hint counts: hints are rounded).
+    fn zooms(self) -> (u8, u8) {
+        let at = |scale: f64| (Z0_SCALE / scale).log2();
+        let max = self.min.map_or(WMS_MAX_ZOOM, |s| (at(s) + 0.05).floor().clamp(0.0, 24.0) as u8);
+        let min = self.max.map_or(0, |s| (at(s) - 0.05).ceil().clamp(0.0, 24.0) as u8).min(max);
+        (min, max)
+    }
+}
+
 fn wms(url: &str, root: &Node) -> Service {
     let v13 = root.attribute("version").is_none_or(|v| v.starts_with("1.3"));
     let title = child(root, "Service").and_then(|s| child_text(&s, "Title")).unwrap_or_default();
@@ -448,6 +808,8 @@ fn wms(url: &str, root: &Node) -> Service {
         .and_then(|g| child(&g, "OnlineResource"))
         .and_then(|o| href(&o))
         .filter(|h| is_web(h))
+        // The request's own parameters replace any the advertised address carries (a `TIME`).
+        .map(|h| info::without_wms_keys(&h))
         .unwrap_or_else(|| endpoint(url));
     let formats: Vec<String> = root
         .descendants()
@@ -462,28 +824,36 @@ fn wms(url: &str, root: &Node) -> Service {
     let version = if v13 { "1.3.0" } else { "1.1.1" };
     let info_request = info::request_of(root, url, version, format);
     let mut service = Service { kind: "WMS".into(), title, ..Service::default() };
-    let mut skipped = 0;
-    // Layers inherit their parents' coordinate systems, nearest valid geographic bounds and
-    // queryable attribute.
+    let (mut skipped, mut too_long) = (0, 0);
+    let mut time_budget = MAX_DOCUMENT_TIME_VALUES;
+    // Layers inherit their parents' coordinate systems, nearest valid geographic bounds, queryable
+    // attribute and time dimension.
     // The SLD profile's GetLegendGraphic (WMS 1.3.0 with SLD 1.1, 1.1.1 with SLD 1.0), when the
     // service offers it in a format RustGIS shows: a layer's legend, drawn from its default style.
     let legend_graphic = wms_legend_graphic(root, url, &get_map, version);
     // (What a layer passes on is shared by its sublayers, not copied for each: a hostile document
     // may give one layer a great many.)
-    type Inherited<'a, 'i> = (Node<'a, 'i>, Rc<[String]>, Option<[f64; 4]>, bool, Rc<[Node<'a, 'i>]>);
+    type Inherited<'a, 'i> = (Node<'a, 'i>, Rc<Systems>, Option<[f64; 4]>, bool, Rc<[Node<'a, 'i>]>, Option<Rc<LayerTime>>, Scales);
     let mut stack: Vec<Inherited<'_, '_>> = root
         .descendants()
         .filter(|n| n.is_element() && local(n) == "Capability")
         .flat_map(|c| children(&c, "Layer").collect::<Vec<_>>())
-        .map(|l| (l, Rc::from([]), None, false, Rc::from([])))
+        .map(|l| (l, Rc::default(), None, false, Rc::from([]), None, Scales::default()))
         .collect();
-    while let Some((layer, inherited_crs, inherited_bbox, inherited_queryable, inherited_styles)) = stack.pop() {
+    while let Some((layer, inherited_crs, inherited_bbox, inherited_queryable, inherited_styles, inherited_time, inherited_scales)) =
+        stack.pop()
+    {
         if service.layers.len() >= MAX_LAYERS {
             break;
         }
-        let mut crs = inherited_crs.to_vec();
-        crs.extend(layer.children().filter(|c| c.is_element() && matches!(local(c), "CRS" | "SRS")).map(|c| text_of(&c)));
-        let crs: Rc<[String]> = crs.into();
+        // (A layer naming none of its own shares its parent's list, and what is worked out of it.)
+        let own: Vec<String> =
+            layer.children().filter(|c| c.is_element() && matches!(local(c), "CRS" | "SRS")).map(|c| text_of(&c)).collect();
+        let crs: Rc<Systems> = if own.is_empty() {
+            inherited_crs
+        } else {
+            Rc::new(Systems { names: inherited_crs.names.iter().cloned().chain(own).collect(), ..Systems::default() })
+        };
         let bbox = child(&layer, "EX_GeographicBoundingBox")
             .and_then(|b| {
                 let f = |k: &str| child_text(&b, k).and_then(|t| t.parse::<f64>().ok());
@@ -499,23 +869,60 @@ fn wms(url: &str, root: &Node) -> Service {
             layer.attribute("queryable").map_or(inherited_queryable, |q| q.trim() == "1" || q.trim().eq_ignore_ascii_case("true"));
         // Its own styles first, then those it inherits (a few: its parents' are each kept).
         let styles: Rc<[Node]> = children(&layer, "Style").chain(inherited_styles.iter().copied()).take(MAX_STYLES).collect();
+        // Its own time dimension replaces the one it inherits (WMS 1.3.0 §7.2.4.8), even one it
+        // can't be drawn at.
+        let time = match wms_time(&layer, v13) {
+            Some(own) => own.map(Rc::new),
+            None => inherited_time,
+        };
+        // Its own scale hints replace those it inherits (WMS 1.3.0 §7.2.4.8).
+        let scales = Scales::of(&layer, inherited_scales);
         for sub in children(&layer, "Layer") {
-            stack.push((sub, Rc::clone(&crs), bbox, queryable, Rc::clone(&styles)));
+            stack.push((sub, Rc::clone(&crs), bbox, queryable, Rc::clone(&styles), time.clone(), scales));
         }
         let Some(name) = child_text(&layer, "Name") else { continue };
-        if !crs.iter().any(|c| c.split_whitespace().any(is_web_mercator)) {
+        // In Web Mercator, as the service draws it, else in a system of its own, warped (#769);
+        // with the other systems it is offered in, for a map drawn in one of them.
+        let mercator = crs.names.iter().any(|c| c.split_whitespace().any(is_web_mercator));
+        let listed = crs.candidates.get_or_init(|| wms_candidates(&crs.names));
+        let mut native = wms_native(&layer, listed, v13, bbox, mercator);
+        if !mercator && native.is_none() {
             skipped += 1;
             continue;
         }
         let crs_key = if v13 { "CRS" } else { "SRS" };
+        let (code, area) = match &native {
+            Some((_, w)) if w.epsg != 3857 => ("{ncrs}".to_string(), "BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}"),
+            _ => ("EPSG:3857".to_string(), "BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256"),
+        };
         let template = with_query(
             &get_map,
             &format!(
-                "SERVICE=WMS&VERSION={version}&REQUEST=GetMap&LAYERS={}&STYLES=&{crs_key}=EPSG:3857&BBOX={{bbox-epsg-3857}}&WIDTH=256&HEIGHT=256&FORMAT={}&TRANSPARENT=TRUE",
+                "SERVICE=WMS&VERSION={version}&REQUEST=GetMap&LAYERS={}&STYLES=&{crs_key}={code}&{area}&FORMAT={}&TRANSPARENT=TRUE",
                 encode(&name),
                 encode(format)
             ),
         );
+        // At its time: the service's default, unless another is asked for when it is added.
+        let template = if time.is_some() { with_query(&template, "TIME={Time}") } else { template };
+        // An address the map can fetch (4096 bytes at most): the last of the other systems go
+        // first, then, for a layer offered in Web Mercator, all of them.
+        let mut address = native.as_ref().map(|(_, w)| w.address(&template));
+        while let (Some(a), Some((_, w))) = (&address, &mut native)
+            && a.len() > MAX_ADDRESS
+            && w.systems.len() > 1
+        {
+            w.systems.pop();
+            address = Some(w.address(&template));
+        }
+        if address.as_ref().is_some_and(|a| a.len() > MAX_ADDRESS) {
+            if !mercator {
+                too_long += 1;
+                continue;
+            }
+            (native, address) = (None, None);
+        }
+        let template = address.unwrap_or(template);
         let title = child_text(&layer, "Title").unwrap_or_else(|| name.clone());
         // A service without GetFeatureInfo still gives each layer one, never asked, so Identify
         // doesn't fetch the capabilities again to find out.
@@ -523,7 +930,14 @@ fn wms(url: &str, root: &Node) -> Service {
             info_request
                 .as_ref()
                 .map_or_else(|| FeatureInfo { layer: name.clone(), ..FeatureInfo::default() }, |r| r.for_layer(&name, queryable)),
-        );
+        )
+        .map(|f| match &native {
+            // Asked in the system the layer is drawn in.
+            Some((code, warp::Warp { epsg, grid: warp::Grid::Map { lat_first }, .. })) if *epsg != 3857 => {
+                FeatureInfo { crs: code.clone(), lat_first: *lat_first, ..f }
+            }
+            _ => f,
+        });
         // Its legend: the one the service draws from the layer's styling (the SLD profile's
         // GetLegendGraphic, symbols with their names, as ArcGIS Pro and QGIS show a WMS layer's),
         // then its default style's `LegendURL` picture (WMS 1.3.0 §7.2.4.6.4, 1.1.1 §7.1.4.5.14: of
@@ -534,22 +948,149 @@ fn wms(url: &str, root: &Node) -> Service {
             legends.push(l);
         }
         service.layers.push(ServiceLayer {
+            zooms: Some(scales.zooms()),
             name,
             title,
             offer: Offer::Tiles { template },
             bbox,
             tilesets: None,
-            time: None,
+            // (The values listed for the whole document are capped: a parent's many, inherited by
+            // a great many layers, aren't copied to each.)
+            time: time.as_deref().map(|t| {
+                let keep = t.values.len().min(time_budget);
+                let values: Vec<String> = t.values.iter().skip(t.values.len() - keep).cloned().collect();
+                time_budget -= values.len();
+                LayerTime { values, default: t.default.clone(), multiple: t.multiple }
+            }),
             feature_info,
             legends,
         });
     }
     service.layers.reverse();
     if skipped > 0 {
-        service.notes.push(format!("{skipped} layers aren't offered in Web Mercator (EPSG:3857) and are left out"));
+        service.notes.push(format!("{skipped} layers aren't offered in a coordinate system RustGIS can draw and are left out"));
+    }
+    if too_long > 0 {
+        service.notes.push(format!(
+            "{too_long} layers in another coordinate system are left out: their addresses are longer than {MAX_ADDRESS} bytes"
+        ));
     }
     service
 }
+
+/// The coordinate systems a WMS layer is offered in, its own and those it inherits, and those of
+/// them RustGIS knows (worked out once, for the layers sharing the list).
+#[derive(Default)]
+struct Systems {
+    names: Vec<String>,
+    candidates: std::cell::OnceCell<Vec<Candidate>>,
+}
+
+/// A system of a WMS layer's list that RustGIS knows: its name there, its EPSG code, it, and its
+/// place in the list.
+type Candidate = (String, u32, crate::raster::Crs, usize);
+
+/// The systems of a WMS layer's list that RustGIS knows, one name each, in order of preference:
+/// projected ones first (the service's own, as a rule), then CRS:84, then other
+/// longitude/latitude ones, each kind as listed. (A GeoServer lists some 5,000 systems by
+/// default, each layer inheriting them: only a system's definition is looked up here, once a
+/// list; [`wms_native`] builds transformers, in this order, until `MAX_SYSTEMS` are kept.)
+fn wms_candidates(crs: &[String]) -> Vec<Candidate> {
+    let mut seen = std::collections::HashSet::new();
+    let mut listed: Vec<Candidate> = crs
+        .iter()
+        .flat_map(|c| c.split_whitespace())
+        .filter(|c| c.len() <= warp::MAX_SYSTEM_NAME && !is_web_mercator(c) && seen.insert(c.to_ascii_uppercase()))
+        .enumerate()
+        .filter_map(|(i, c)| {
+            let code = warp::epsg_of(c)?;
+            let system = crate::raster::Crs::from_epsg(code).filter(|s| *s != crate::raster::Crs::WebMercator)?;
+            Some((c.to_string(), code, system, i))
+        })
+        .collect();
+    // One name for each system (EPSG:4326 and CRS:84 differ only in their axes: CRS:84 kept).
+    listed.sort_by_cached_key(|(name, code, _, _)| (*code, !warp::is_crs84(name)));
+    listed.dedup_by_key(|(_, code, _, _)| *code);
+    let rank = |(name, _, c, _): &Candidate| match (c.is_geographic(), warp::is_crs84(name)) {
+        (false, _) => 0,
+        (true, true) => 1,
+        (true, false) => 2,
+    };
+    // In the order the service lists them, the preferred first.
+    listed.sort_by_key(|l| (rank(l), l.3));
+    listed
+}
+
+/// The systems a WMS layer is offered in that RustGIS can draw (#769), of its `listed`
+/// candidates (see [`wms_candidates`]), and the one a Web Mercator map takes its pictures in: Web
+/// Mercator itself (`mercator`), else the first. `None` for a layer offered in Web Mercator
+/// alone (its address stays as it was) or in nothing usable. In WMS 1.3.0 a bounding box follows
+/// the system's axes as EPSG defines them ([`crate::raster::epsg_axes`]); for a system whose
+/// order RustGIS doesn't know, as the layer's own `BoundingBox` in it is written (else latitude
+/// first in a geographic system other than CRS:84).
+fn wms_native(layer: &Node, listed: &[Candidate], v13: bool, area: Option<[f64; 4]>, mercator: bool) -> Option<(String, warp::Warp)> {
+    // Its boxes by system (its own, else the nearest it inherits: WMS 1.3.0 §7.2.4.6.8), read
+    // once a layer.
+    let mut boxes: std::collections::HashMap<u32, Node> = std::collections::HashMap::new();
+    if v13 {
+        for b in layer
+            .ancestors()
+            .filter(|a| a.is_element() && local(a) == "Layer")
+            .flat_map(|a| children(&a, "BoundingBox").collect::<Vec<_>>())
+        {
+            // (By code: the box may name the system otherwise than the list, `EPSG:2056` for
+            // `urn:ogc:def:crs:EPSG::2056`; but a CRS:84 box, longitude first, isn't an
+            // EPSG:4326 one.)
+            if let Some(code) = b.attribute("CRS").or(b.attribute("SRS")).filter(|c| !warp::is_crs84(c)).and_then(warp::epsg_of) {
+                boxes.entry(code).or_insert(b);
+            }
+        }
+    }
+    let lat_first = |name: &str, system: crate::raster::Crs| {
+        v13 && !warp::is_crs84(name) && {
+            // In the order of the system's axes as EPSG defines them (WMS 1.3.0 §6.7.3.3); for a
+            // system newer than RustGIS's table, the layer's box in it, against its area there.
+            if let Some(north) = epsg_north_first(system) {
+                return north;
+            }
+            let own = warp::epsg_of(name).and_then(|code| boxes.get(&code));
+            let written = own.and_then(|b| {
+                let f = |k: &str| b.attribute(k).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite());
+                Some([f("minx")?, f("miny")?, f("maxx")?, f("maxy")?])
+            });
+            match written {
+                Some(b) => {
+                    let native = area.and_then(|a| warp::native_box(&*warp::transformer(u32::from(system.epsg()))?, a));
+                    warp::north_first(b, native, system.is_geographic())
+                }
+                None => system.is_geographic(),
+            }
+        }
+    };
+    let systems: Vec<warp::System> = listed
+        .iter()
+        .filter(|(_, code, _, _)| warp::usable(*code).is_some())
+        .take(warp::MAX_SYSTEMS)
+        .filter_map(|(name, code, system, _)| {
+            Some(warp::System { epsg: u16::try_from(*code).ok()?, name: name.clone(), lat_first: lat_first(name, *system) })
+        })
+        .collect();
+    let first = systems.first()?.clone();
+    let (epsg, lat_first) = if mercator { (3857, false) } else { (first.epsg, first.lat_first) };
+    Some((first.name, warp::Warp { epsg, grid: warp::Grid::Map { lat_first }, area, systems }))
+}
+
+/// Whether `system` is written north (or latitude) first as EPSG defines its axes, when
+/// RustGIS's table knows it ([`crate::raster::epsg_axes`]).
+fn epsg_north_first(system: crate::raster::Crs) -> Option<bool> {
+    match system {
+        crate::raster::Crs::Custom(_) => None,
+        s => crate::raster::epsg_axes::north_first(s.epsg()),
+    }
+}
+
+/// The longest address a layer in another system keeps (the map's own limit on an address).
+const MAX_ADDRESS: usize = 4096;
 
 /// The most styles a WMS layer's legend is looked for among, its own and those it inherits.
 const MAX_STYLES: usize = 64;
@@ -641,6 +1182,88 @@ fn mercator_matrices(tms: &Node) -> Option<Vec<(String, u8)>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// The zooms a WMTS layer's tiles are at in its Web Mercator tile matrix set `set` (of `sets`,
+/// each matrix's identifier and zoom): its matrices', or only those its link's
+/// `TileMatrixSetLimits` names when it gives them (WMTS 1.0.0 §7.2.4.6.3).
+fn wmts_zooms(layer: &Node, set: &str, sets: &[(String, Vec<(String, u8)>)]) -> Option<(u8, u8)> {
+    let matrices = &sets.iter().find(|(id, _)| id == set)?.1;
+    children(layer, "TileMatrixSetLink").find(|l| child_text(l, "TileMatrixSet").as_deref() == Some(set))?;
+    let limited = wmts_limits(layer, set);
+    let zooms = matrices.iter().filter(|(id, _)| limited.is_empty() || limited.contains(id)).map(|(_, z)| *z);
+    let (lo, hi) = zooms.fold((u8::MAX, 0), |(lo, hi), z| (lo.min(z), hi.max(z)));
+    (lo <= hi.min(24)).then_some((lo, hi.min(24)))
+}
+
+/// The tile matrices of `set` a WMTS layer's link limits it to (its `TileMatrixSetLimits`);
+/// none when it doesn't.
+fn wmts_limits(layer: &Node, set: &str) -> Vec<String> {
+    children(layer, "TileMatrixSetLink")
+        .find(|l| child_text(l, "TileMatrixSet").as_deref() == Some(set))
+        .and_then(|link| child(&link, "TileMatrixSetLimits"))
+        .map(|l| children(&l, "TileMatrixLimits").filter_map(|m| child_text(&m, "TileMatrix")).collect())
+        .unwrap_or_default()
+}
+
+/// A tile matrix as a WMTS document gives it, its corner in the order written.
+struct RawMatrix {
+    id: String,
+    scale: f64,
+    corner: (f64, f64),
+    tile: (u32, u32),
+    size: (u32, u32),
+}
+
+/// The most `TileMatrix` entries read of a tile matrix set in another system.
+const MAX_RAW_MATRICES: usize = 256;
+
+/// A tile matrix set in another system than Web Mercator that RustGIS can draw (#769): its EPSG
+/// code and its matrices RustGIS can draw, coarsest first.
+fn native_matrices(tms: &Node) -> Option<(u16, crate::raster::Crs, Vec<RawMatrix>)> {
+    let name = child_text(tms, "SupportedCRS")?;
+    let code = warp::epsg_of(&name)?;
+    let system = warp::usable(code)?;
+    let unit = warp::metres_per_unit(code);
+    let mut out = Vec::new();
+    // (In any order, up to `MAX_RAW_MATRICES` read: a real set has a few dozen.)
+    for m in children(tms, "TileMatrix").take(MAX_RAW_MATRICES) {
+        // One that can't be read or drawn is left out, not the set; only one RustGIS can draw
+        // counts towards `MAX_MATRICES`.
+        if let Some(raw) = raw_matrix(&m)
+            && warp::Matrix::from_scale(raw.id.clone(), raw.scale, unit, raw.corner, raw.tile, raw.size).is_some()
+        {
+            out.push(raw);
+        }
+    }
+    // Coarsest first. (Each layer keeps those its limits name, at most `MAX_MATRICES`; the
+    // corners' order is settled per layer, against its area.)
+    out.sort_by(|a, b| b.scale.total_cmp(&a.scale));
+    (!out.is_empty()).then_some((u16::try_from(code).ok()?, system, out))
+}
+
+/// A `TileMatrix` as the document gives it, if it gives all a matrix needs.
+fn raw_matrix(m: &Node) -> Option<RawMatrix> {
+    let n = |k: &str| child_text(m, k).and_then(|t| t.trim().parse::<f64>().ok()).filter(|v| v.is_finite());
+    let u = |k: &str| child_text(m, k).and_then(|t| t.trim().parse::<u32>().ok()).filter(|v| *v > 0);
+    let corner: Vec<f64> = child_text(m, "TopLeftCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+    let [a, b] = corner.as_slice() else { return None };
+    Some(RawMatrix {
+        id: child_text(m, "Identifier")?,
+        scale: n("ScaleDenominator").filter(|v| *v > 0.0)?,
+        corner: (*a, *b),
+        tile: (u("TileWidth")?, u("TileHeight")?),
+        size: (u("MatrixWidth")?, u("MatrixHeight")?),
+    })
+}
+
+/// Past `MAX_MATRICES` the middle of `ms` (coarsest first) goes, the coarsest half kept for a
+/// wide view and the finest half for a close one.
+fn keep_matrices<T>(ms: &mut Vec<T>) {
+    let (coarse, len) = (warp::MAX_MATRICES / 2, ms.len());
+    if len > warp::MAX_MATRICES {
+        ms.drain(coarse..len - (warp::MAX_MATRICES - coarse));
+    }
+}
+
 fn wmts(url: &str, root: &Node) -> Service {
     let title = child(root, "ServiceIdentification").and_then(|s| child_text(&s, "Title")).unwrap_or_default();
     let mut service = Service { kind: "WMTS".into(), title, ..Service::default() };
@@ -648,6 +1271,15 @@ fn wmts(url: &str, root: &Node) -> Service {
     // Tile matrix sets that are Web Mercator pyramids, with a zoom per matrix identifier.
     let sets: Vec<(String, Vec<(String, u8)>)> =
         children(&contents, "TileMatrixSet").filter_map(|t| Some((child_text(&t, "Identifier")?, mercator_matrices(&t)?))).collect();
+    // Others in a system RustGIS can transform, drawn warped into the map's tiles (#769).
+    let natives: Vec<(String, u16, crate::raster::Crs, bool, Vec<RawMatrix>)> = children(&contents, "TileMatrixSet")
+        .filter_map(|t| {
+            let id = child_text(&t, "Identifier")?;
+            let crs84 = child_text(&t, "SupportedCRS").is_some_and(|c| warp::is_crs84(&c));
+            let (code, system, ms) = native_matrices(&t)?;
+            Some((id, code, system, crs84, ms))
+        })
+        .collect();
     let kvp = root
         .descendants()
         .find(|n| n.is_element() && local(n) == "GetTile")
@@ -655,7 +1287,7 @@ fn wmts(url: &str, root: &Node) -> Service {
         .and_then(|g| href(&g))
         .filter(|h| is_web(h))
         .unwrap_or_else(|| endpoint(url));
-    let mut skipped = 0;
+    let (mut skipped, mut too_long) = (0, 0);
     for layer in children(&contents, "Layer").take(MAX_LAYERS) {
         let Some(name) = child_text(&layer, "Identifier") else { continue };
         let title = child_text(&layer, "Title").unwrap_or_else(|| name.clone());
@@ -673,18 +1305,72 @@ fn wmts(url: &str, root: &Node) -> Service {
             .take(MAX_LEGENDS)
             .collect();
         let linked: Vec<String> = children(&layer, "TileMatrixSetLink").filter_map(|l| child_text(&l, "TileMatrixSet")).collect();
-        let Some((set, matrices)) = sets.iter().find(|(id, _)| linked.contains(id)) else {
-            skipped += 1;
-            continue;
+        let bbox = child(&layer, "WGS84BoundingBox").and_then(|b| {
+            let lo: Vec<f64> = child_text(&b, "LowerCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            let hi: Vec<f64> = child_text(&b, "UpperCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            lonlat_box(*lo.first()?, *lo.get(1)?, *hi.first()?, *hi.get(1)?)
+        });
+        // A Web Mercator set whose matrix identifiers are a fixed prefix then the zoom, drawn as
+        // it is; else a set in another system, warped.
+        let mercator = sets.iter().filter(|(id, _)| linked.contains(id)).find_map(|(set, matrices)| {
+            let prefix = matrices.iter().find_map(|(id, z)| id.strip_suffix(&z.to_string()).map(str::to_string));
+            let consistent = prefix.as_ref().is_some_and(|p| matrices.iter().all(|(id, z)| *id == format!("{p}{z}")));
+            prefix.filter(|_| consistent).map(|p| (set.clone(), p))
+        });
+        let native = match mercator {
+            Some(_) => None,
+            None => natives.iter().filter(|n| linked.contains(&n.0)).find_map(|(set, code, system, crs84, raw)| {
+                let geographic = system.is_geographic();
+                let area = bbox.and_then(|b| warp::native_box(&*warp::transformer(u32::from(*code))?, b));
+                // Only the matrices the layer's link limits it to (WMTS 1.0.0 §7.2.4.6.3), when it does.
+                let limited = wmts_limits(&layer, set);
+                let mut raw: Vec<&RawMatrix> = raw.iter().filter(|m| limited.is_empty() || limited.contains(&m.id)).collect();
+                keep_matrices(&mut raw);
+                let unit = warp::metres_per_unit(u32::from(*code));
+                let first = raw.first()?;
+                let m = warp::Matrix::from_scale(first.id.clone(), first.scale, unit, first.corner, first.tile, first.size)?;
+                let span = (m.cell * f64::from(m.tile_w) * f64::from(m.cols), m.cell * f64::from(m.tile_h) * f64::from(m.rows));
+                // In the order of the system's axes as EPSG defines them (WMTS 1.0.0 §6.1). A
+                // geographic corner is often written longitude first anyway: one whose first number
+                // can't be a latitude is so; one whose numbers could be either is read longitude
+                // first only when its matrix, read in EPSG's order, misses the layer and read the
+                // other way doesn't. For a system newer than RustGIS's table, the order whose
+                // matrix covers more of the layer, else latitude first in a geographic system.
+                let swap = !*crs84
+                    && match epsg_north_first(*system) {
+                        Some(_) if geographic && first.corner.0.abs() > 90.0 => false,
+                        // Read the other way only when EPSG's reading misses the layer altogether
+                        // and that one doesn't: a correct corner is kept, however the other covers.
+                        Some(north) if geographic => match warp::corner_coverage(first.corner, span, area) {
+                            Some((east, north_cov)) => {
+                                let (kept, other) = if north { (north_cov, east) } else { (east, north_cov) };
+                                if kept <= 0.0 && other > 0.0 { !north } else { north }
+                            }
+                            None => north,
+                        },
+                        Some(north) => north,
+                        None => warp::corner_north_first(first.corner, span, area).unwrap_or(geographic),
+                    };
+                let matrices: Vec<warp::Matrix> = raw
+                    .iter()
+                    .filter_map(|m| {
+                        let corner = if swap { (m.corner.1, m.corner.0) } else { m.corner };
+                        warp::Matrix::from_scale(m.id.clone(), m.scale, unit, corner, m.tile, m.size)
+                    })
+                    .collect();
+                (!matrices.is_empty())
+                    .then(|| (set.clone(), warp::Warp { epsg: *code, grid: warp::Grid::Tiles(matrices), area: bbox, systems: Vec::new() }))
+            }),
         };
-        // A template needs the zoom in the matrix identifier: a fixed prefix then the zoom.
-        let prefix = matrices.iter().find_map(|(id, z)| id.strip_suffix(&z.to_string()).map(str::to_string));
-        let consistent = prefix.as_ref().is_some_and(|p| matrices.iter().all(|(id, z)| *id == format!("{p}{z}")));
-        let Some(prefix) = prefix.filter(|_| consistent) else {
-            skipped += 1;
-            continue;
+        let (set, matrix, row, col) = match (&mercator, &native) {
+            (Some((set, prefix)), _) => (set.clone(), format!("{prefix}{{z}}"), "{y}", "{x}"),
+            (None, Some((set, _))) => (set.clone(), "{nm}".to_string(), "{nrow}", "{ncol}"),
+            (None, None) => {
+                skipped += 1;
+                continue;
+            }
         };
-        let matrix = format!("{prefix}{{z}}");
+        let set = &set;
         // A time dimension: the template with `{Time}` is preferred, which takes the time asked
         // for (its default otherwise); without one, a template with no `{Time}` is.
         // Its default: the one given, else the last time its values list (a range's end); with
@@ -692,16 +1378,12 @@ fn wmts(url: &str, root: &Node) -> Service {
         let time = children(&layer, "Dimension")
             .find(|d| child_text(d, "Identifier").is_some_and(|i| i.eq_ignore_ascii_case("time")))
             .and_then(|d| {
-                // Every listed value is read for the latest; the first few are kept.
-                let all: Vec<String> = children(&d, "Value").take(MAX_LAYERS).map(|v| text_of(&v)).filter(|v| v.len() <= 100).collect();
-                let listed = all.iter().rev().find_map(|v| {
-                    let mut parts = v.split('/');
-                    let first = parts.next().unwrap_or("");
-                    checked_time(parts.next().unwrap_or(first)).ok()
-                });
-                let default = child_text(&d, "Default").and_then(|t| checked_time(&t).ok()).or(listed)?;
-                let values = all.into_iter().take(MAX_TIME_VALUES).collect();
-                Some(LayerTime { default, values })
+                layer_time(
+                    child_text(&d, "Default").as_deref(),
+                    last(children(&d, "Value").map(|v| text_of(&v)).collect(), MAX_TIMES_READ),
+                    checked_time,
+                    false,
+                )
             });
         let templates: Vec<String> = children(&layer, "ResourceURL")
             .filter(|r| r.attribute("resourceType") == Some("tile"))
@@ -722,15 +1404,15 @@ fn wmts(url: &str, root: &Node) -> Service {
                 .replace("{TileMatrixSet}", set)
                 .replace("{Style}", &style)
                 .replace("{TileMatrix}", &matrix)
-                .replace("{TileRow}", "{y}")
-                .replace("{TileCol}", "{x}"),
+                .replace("{TileRow}", row)
+                .replace("{TileCol}", col),
             None => {
                 let format =
                     children(&layer, "Format").map(|f| text_of(&f)).find(|f| f.starts_with("image/")).unwrap_or_else(|| "image/png".into());
                 let get = with_query(
                     &kvp,
                     &format!(
-                        "SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER={}&STYLE={}&TILEMATRIXSET={}&TILEMATRIX={matrix}&TILEROW={{y}}&TILECOL={{x}}&FORMAT={}",
+                        "SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER={}&STYLE={}&TILEMATRIXSET={}&TILEMATRIX={matrix}&TILEROW={row}&TILECOL={col}&FORMAT={}",
                         encode(&name),
                         encode(&style),
                         encode(set),
@@ -740,12 +1422,19 @@ fn wmts(url: &str, root: &Node) -> Service {
                 if time.is_some() { format!("{get}&TIME={{Time}}") } else { get }
             }
         };
-        let bbox = child(&layer, "WGS84BoundingBox").and_then(|b| {
-            let lo: Vec<f64> = child_text(&b, "LowerCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-            let hi: Vec<f64> = child_text(&b, "UpperCorner")?.split_whitespace().filter_map(|t| t.parse().ok()).collect();
-            lonlat_box(*lo.first()?, *lo.get(1)?, *hi.first()?, *hi.get(1)?)
-        });
+        let template = match &native {
+            Some((_, w)) => w.address(&template),
+            None => template,
+        };
+        // An address in another system no longer than a tile layer keeps (a set of a great many
+        // matrices, in its fragment).
+        if native.is_some() && template.len() > MAX_ADDRESS {
+            too_long += 1;
+            continue;
+        }
         service.layers.push(ServiceLayer {
+            // A Web Mercator set's own zooms, else those a warped set's matrices make (#769).
+            zooms: wmts_zooms(&layer, set, &sets).or_else(|| native.as_ref().and_then(|(_, w)| w.zooms())),
             name,
             title,
             offer: Offer::Tiles { template },
@@ -757,7 +1446,12 @@ fn wmts(url: &str, root: &Node) -> Service {
         });
     }
     if skipped > 0 {
-        service.notes.push(format!("{skipped} layers have no Web Mercator tile matrix set RustGIS can draw and are left out"));
+        service.notes.push(format!("{skipped} layers have no tile matrix set RustGIS can draw and are left out"));
+    }
+    if too_long > 0 {
+        service.notes.push(format!(
+            "{too_long} layers in another coordinate system are left out: their addresses are longer than {MAX_ADDRESS} bytes"
+        ));
     }
     service
 }
@@ -830,9 +1524,12 @@ fn wfs(url: &str, root: &Node) -> Service {
                 let f = |k: &str| b.attribute(k).and_then(|t| t.parse::<f64>().ok());
                 lonlat_box(f("minx")?, f("miny")?, f("maxx")?, f("maxy")?)
             });
-        // CRS84 when the type offers it: longitude first by definition. Otherwise EPSG:4326, which
-        // WFS 1.0 answers longitude first; a 1.1 or 2.0 server answering latitude first says so
-        // with a `urn:…EPSG::4326` crs in its GeoJSON, which is turned round (`fix_axes`).
+        // CRS84 when the type offers it: longitude first by definition. Otherwise EPSG:4326 (MapServer
+        // refuses a CRS84 the type doesn't list), which every server tried in #1053 answered
+        // longitude first; deegree answers latitude first when asked in the URN form instead. The
+        // `crs` an answer names doesn't tell the order (GeoServer names its longitude-first GeoJSON
+        // `urn:ogc:def:crs:EPSG::4326`), so an answer is turned round only when its positions miss
+        // the type's bounds and fit them turned (`fix_axes`).
         let crs84 = ft.children().any(|c| {
             c.is_element() && matches!(local(&c), "DefaultCRS" | "OtherCRS" | "DefaultSRS" | "OtherSRS" | "SRS") && is_crs84(&text_of(&c))
         });
@@ -854,6 +1551,7 @@ fn wfs(url: &str, root: &Node) -> Service {
         };
         let url = with_query(&get, &query);
         service.layers.push(ServiceLayer {
+            zooms: None,
             name,
             title,
             offer: Offer::Features { url },
@@ -987,6 +1685,7 @@ fn wcs(url: &str, root: &Node) -> Service {
     let mut add = |id: String, title: Option<String>, bbox: Option<[f64; 4]>| {
         let coverage = Coverage { endpoint: get.clone(), version: version.into(), id: id.clone(), formats: formats.clone() };
         service.layers.push(ServiceLayer {
+            zooms: None,
             title: title.filter(|t| !t.is_empty()).unwrap_or_else(|| id.clone()),
             name: id,
             offer: Offer::Coverage(coverage),
@@ -1403,6 +2102,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             }
             let url = format!("{b}/{id}/query?where=1%3D1&outFields=*&returnGeometry=true&outSR=4326&f=geojson");
             service.layers.push(ServiceLayer {
+                zooms: None,
                 name: id.to_string(),
                 title: name.to_string(),
                 offer: Offer::Features { url },
@@ -1426,6 +2126,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             format!("{b}/export?bbox={{bbox-epsg-3857}}&bboxSR=3857&imageSR=3857&size=256,256&format=png32&transparent=true&f=image")
         };
         service.layers.push(ServiceLayer {
+            zooms: None,
             name: "map".into(),
             title: format!("{title} (map)"),
             offer: Offer::Tiles { template },
@@ -1447,6 +2148,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
                     "{b}/export?bbox={{bbox-epsg-3857}}&bboxSR=3857&imageSR=3857&size=256,256&format=png32&transparent=true&f=image&layers=show:{id}"
                 );
                 service.layers.push(ServiceLayer {
+                    zooms: None,
                     name: format!("map:{id}"),
                     title: format!("{name} (map)"),
                     offer: Offer::Tiles { template },
@@ -1462,6 +2164,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         service.kind = "ArcGIS ImageServer".into();
         let template = format!("{b}/exportImage?bbox={{bbox-epsg-3857}}&bboxSR=3857&imageSR=3857&size=256,256&format=png&f=image");
         service.layers.push(ServiceLayer {
+            zooms: None,
             name: "image".into(),
             title: title.clone(),
             offer: Offer::Tiles { template },
@@ -1479,6 +2182,7 @@ fn arcgis(url: &str, v: &serde_json::Value) -> Result<Service, String> {
             .map(|s| format!("{b}/{}/root.json", s.trim_matches('/')))
             .unwrap_or_else(|| format!("{b}/resources/styles/root.json"));
         service.layers.push(ServiceLayer {
+            zooms: None,
             name: "style".into(),
             title: title.clone(),
             offer: Offer::Style { url: style },
@@ -1564,6 +2268,7 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
         }
         let path = if here.is_empty() { name.to_string() } else { format!("{here}/{name}") };
         service.layers.push(ServiceLayer {
+            zooms: None,
             name: format!("{path}/"),
             title: format!("{name}/"),
             offer: Offer::Service { url: format!("{root}/{path}") },
@@ -1589,6 +2294,7 @@ fn arcgis_directory(b: &str, v: &serde_json::Value) -> Service {
         };
         let short = name.rsplit('/').next().unwrap_or(name);
         service.layers.push(ServiceLayer {
+            zooms: None,
             name: format!("{name}/{kind}"),
             title: format!("{short} ({kind})"),
             offer: Offer::Service { url: format!("{root}/{}/{kind}", if rooted { name } else { short }) },
@@ -1623,6 +2329,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         // The dataset's layers aren't listed here, so its vector tiles can't be styled: map tiles only.
         if let Some((t, list)) = tileset(url, &links, TileRel::Map) {
             service.layers.push(ServiceLayer {
+                zooms: None,
                 name: "map".into(),
                 title: format!("{name} (map tiles)"),
                 offer: Offer::Tiles { template: t },
@@ -1650,13 +2357,25 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
     let root = base(url).trim_end_matches('/').to_string();
     let mut unreadable = 0;
     let mut tiled = 0;
+    // Collections whose items are 3D content, not features, by what it is and whether their tiles
+    // are listed.
+    let mut three_d: Vec<((&str, bool), Vec<&str>)> = Vec::new();
     for c in collections.iter().take(MAX_LAYERS) {
         let Some(id) = c.get("id").and_then(|i| i.as_str()) else { continue };
         let links = c.get("links").and_then(|l| l.as_array()).cloned().unwrap_or_default();
         let title = c.get("title").and_then(|t| t.as_str()).unwrap_or(id).to_string();
-        let bbox = c.pointer("/extent/spatial/bbox/0").and_then(|b| b.as_array()).and_then(|b| {
+        // Its extent in CRS84, the standard's default: a box in another system it names isn't
+        // read as longitude/latitude (its features' axes are judged against it, `fix_axes`). Four
+        // numbers, or six with heights.
+        let lonlat = c.pointer("/extent/spatial/crs").and_then(|v| v.as_str()).is_none_or(is_crs84);
+        let bbox = c.pointer("/extent/spatial/bbox/0").and_then(|b| b.as_array()).filter(|_| lonlat).and_then(|b| {
             let f = |i: usize| b.get(i).and_then(|v| v.as_f64());
-            lonlat_box(f(0)?, f(1)?, f(2)?, f(3)?)
+            let (e, n) = match b.len() {
+                4 => (2, 3),
+                6 => (3, 4),
+                _ => return None,
+            };
+            lonlat_box(f(0)?, f(1)?, f(e)?, f(n)?)
         });
         // OGC API Tiles: the collection's map and vector tiles in WebMercatorQuad. Its vector
         // tiles' layer is named after the collection, as the standard has it.
@@ -1664,6 +2383,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         let vector = tileset(url, &links, TileRel::Vector);
         if let Some((t, list)) = &map {
             service.layers.push(ServiceLayer {
+                zooms: None,
                 name: format!("{id} (map tiles)"),
                 title: format!("{title} (map tiles)"),
                 offer: Offer::Tiles { template: t.clone() },
@@ -1676,6 +2396,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         }
         if let Some((t, list)) = &vector {
             service.layers.push(ServiceLayer {
+                zooms: None,
                 name: format!("{id} (vector tiles)"),
                 title: format!("{title} (vector tiles)"),
                 offer: Offer::VectorTiles { template: t.clone(), layers: vec![id.chars().take(200).collect()] },
@@ -1689,15 +2410,31 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         if map.is_some() || vector.is_some() {
             tiled += 1;
         }
-        let link = links
+        let json_items: Vec<&serde_json::Value> = links
             .iter()
             .filter(|l| l.get("rel").and_then(|r| r.as_str()) == Some("items"))
-            .find(|l| l.get("type").and_then(|t| t.as_str()).is_none_or(|t| t.contains("json")));
-        // A collection with tiles and no items link has no features to offer.
-        if link.is_none() && (map.is_some() || vector.is_some()) {
+            .filter(|l| {
+                items_3d(url, l).is_some() || l.get("type").and_then(|t| t.as_str()).is_none_or(|t| t.to_ascii_lowercase().contains("json"))
+            })
+            .collect();
+        let link = json_items.iter().copied().find(|l| items_3d(url, l).is_none());
+        let tiles = map.is_some() || vector.is_some();
+        // Items that are only 3D content (PDOK links 3D Tiles and quantized meshes as items, for
+        // 3D viewers) aren't offered, and the notes say so: the collection is left out, or listed
+        // by its tiles alone.
+        if let (None, Some(what)) = (link, json_items.first().and_then(|l| items_3d(url, l))) {
+            match three_d.iter_mut().find(|(k, _)| *k == (what, tiles)) {
+                Some((_, ids)) => ids.push(id),
+                None => three_d.push(((what, tiles), vec![id])),
+            }
             continue;
         }
-        let declared_geojson = link.and_then(|l| l.get("type").and_then(|t| t.as_str())).is_some_and(|t| t.contains("geo+json"));
+        // A collection with tiles and no items link has no features to offer.
+        if link.is_none() && tiles {
+            continue;
+        }
+        let declared_geojson =
+            link.and_then(|l| l.get("type").and_then(|t| t.as_str())).is_some_and(|t| t.to_ascii_lowercase().contains("geo+json"));
         // Without an items link: the standard path under the collections address. A relative
         // link is resolved against the document's address.
         let items = match link.and_then(|l| l.get("href").and_then(|h| h.as_str())) {
@@ -1714,6 +2451,7 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
         // GeoJSON asked for unless the link says it is already.
         let items = if declared_geojson || query_value(&items, "f").is_some() { items } else { with_query(&items, "f=json") };
         service.layers.push(ServiceLayer {
+            zooms: None,
             name: id.to_string(),
             title,
             offer: Offer::Features { url: items },
@@ -1726,6 +2464,20 @@ fn ogc_api(url: &str, v: &serde_json::Value) -> Result<Service, String> {
     }
     if unreadable > 0 {
         service.notes.push(format!("{unreadable} collections link to their items with an address RustGIS doesn't fetch and are left out"));
+    }
+    for ((what, tiles), ids) in &three_d {
+        let mut named = ids.iter().take(20).map(|i| format!("'{i}'")).collect::<Vec<_>>().join(", ");
+        if ids.len() > 20 {
+            named.push_str(&format!(", and {} more", ids.len() - 20));
+        }
+        let one = ids.len() == 1;
+        let (noun, verb) = if one { ("collection", "offers") } else { ("collections", "offer") };
+        service.notes.push(match (tiles, one) {
+            (false, true) => format!("{noun} {named} {verb} {what}, {LEFT_OUT_3D}, so it is left out"),
+            (false, false) => format!("{noun} {named} {verb} {what}, {LEFT_OUT_3D}, so they are left out"),
+            (true, true) => format!("{noun} {named} also {verb} {what}, {LEFT_OUT_3D}; its tiles are listed"),
+            (true, false) => format!("{noun} {named} also {verb} {what}, {LEFT_OUT_3D}; their tiles are listed"),
+        });
     }
     if collections.len() > MAX_LAYERS {
         service.notes.push(format!("only the first {MAX_LAYERS} collections are listed"));
@@ -2013,6 +2765,88 @@ fn arcgis_page_url(query: &str, offset: usize, size: usize, order: Option<&str>)
     }
 }
 
+/// Whether a request can use WFS 2.0 offset paging (OGC 09-025r2 §7.6.3).
+/// Explicit windows and hits requests are left as the caller asked for them.
+fn is_wfs_query(url: &str) -> bool {
+    let is = |key, value: &str| query_value(url, key).is_some_and(|v| v.eq_ignore_ascii_case(value));
+    is("SERVICE", "WFS")
+        && is("REQUEST", "GetFeature")
+        && query_value(url, "VERSION").is_some_and(|v| v.starts_with("2.0"))
+        && query_value(url, "STARTINDEX").is_none()
+        && query_value(url, "COUNT").is_none_or(|c| c.trim().parse::<usize>().ok() == Some(FEATURE_LIMIT))
+        && !is("RESULTTYPE", "hits")
+}
+
+/// Whether a feature request uses legacy WFS, whose reported totals can expose a short read.
+fn is_legacy_wfs_query(url: &str) -> bool {
+    [("SERVICE", "WFS"), ("REQUEST", "GetFeature")].iter().all(|(k, v)| query_value(url, k).is_some_and(|s| s.eq_ignore_ascii_case(v)))
+        && query_value(url, "VERSION").is_some_and(|v| v.starts_with("1."))
+}
+
+/// Replaces WFS presentation parameters, retaining the query, filters and authentication.
+/// Hits use the default XML format; feature pages retain the requested GeoJSON format.
+fn wfs_page_url(url: &str, offset: Option<usize>, size: usize) -> String {
+    let kept = url
+        .split('#')
+        .next()
+        .and_then(|u| u.split_once('?'))
+        .map(|(_, q)| q)
+        .unwrap_or_default()
+        .split('&')
+        .filter(|kv| {
+            let key = kv.split_once('=').map(|(k, _)| k).unwrap_or(kv);
+            !["STARTINDEX", "COUNT", "RESULTTYPE"].iter().any(|k| key.eq_ignore_ascii_case(k))
+                && (offset.is_some() || !key.eq_ignore_ascii_case("OUTPUTFORMAT"))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = with_query(base(url), &kept);
+    match offset {
+        Some(offset) => with_query(&url, &format!("STARTINDEX={offset}&COUNT={size}")),
+        None => with_query(&url, "RESULTTYPE=hits"),
+    }
+}
+
+/// The total from a bounded WFS hits response; unknown counts and exception reports aren't totals.
+fn wfs_matched(bytes: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let doc = xml(text, 1024).ok()?;
+    let root = doc.root_element();
+    if local(&root) != "FeatureCollection" {
+        return None;
+    }
+    root.attribute("numberMatched").or_else(|| root.attribute("numberOfFeatures"))?.trim().parse().ok()
+}
+
+/// A feature's service id, retaining numeric text without rounding and normalizing strings.
+/// JSON quoting distinguishes string ids from numeric ids with the same characters.
+fn feature_id(feature: &RawValue) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Id<'a> {
+        #[serde(borrow)]
+        id: Option<&'a RawValue>,
+    }
+    let id = serde_json::from_str::<Id<'_>>(feature.get()).ok()?.id?.get();
+    match id.as_bytes().first()? {
+        b'"' => serde_json::from_str::<String>(id).ok().map(|s| serde_json::Value::String(s).to_string()),
+        b'-' | b'0'..=b'9' => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+/// A content fingerprint for an ID-less row, used only to warn about possible overlap.
+/// Rows remain distinct: equal content (or a hash collision) never causes one to be dropped.
+fn unidentified_hash(feature: &RawValue) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    if feature_id(feature).is_some() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(feature.get()).ok()?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hash);
+    Some(hash.finish())
+}
+
 /// A feature collection read page by page: `first` (from `url`), then each page `get` returns, up
 /// to `max` features, as [`read_pages`] leads (the blocking way to drive it). The pages' features
 /// in one collection, and a note when some features were left unread; a first page that leads
@@ -2071,8 +2905,20 @@ enum Phase {
     /// An ArcGIS layer's description, which says whether it can be read in pages; `first` is the
     /// first page as it came, kept for when it can't.
     Describe { first: Vec<u8> },
-    /// An OGC API or WFS page, which links to the next.
-    Linked,
+    /// A WFS hits response, used when its GeoJSON gives no next link.
+    WfsHits,
+    /// WFS offsets count returned rows, while ids prevent overlapping pages adding duplicates.
+    WfsOffsets {
+        matched: u64,
+        offset: usize,
+        size: usize,
+        ids: std::collections::HashSet<String>,
+        unidentified: std::collections::HashSet<u64>,
+        overlap: bool,
+        duplicates: usize,
+    },
+    /// An OGC API or WFS page, retaining the largest reported legacy total across the chain.
+    Linked { total: Option<u64> },
     /// An ArcGIS page, `size` long from an offset, in `order`. `start` is the first such page's
     /// first feature (a server that ignores the offset sends it again), once it is read; until
     /// then `first` keeps the first page as it came, to fall back on.
@@ -2138,13 +2984,15 @@ fn first_value(features: &[Box<RawValue>]) -> Option<serde_json::Value> {
 }
 
 /// Starts reading a feature collection page by page from its first page (`first`, from `url`), up
-/// to `max` features. An OGC API or WFS page leads to the next by its `next` link. An ArcGIS
+/// to `max` features. An OGC API or WFS page leads to the next by its `next` link. A WFS
+/// request without a next link uses a hits count and STARTINDEX pages (WFS 2.0). An ArcGIS
 /// query that stopped at the server's record limit (`exceededTransferLimit`) is read again in
 /// pages (`resultOffset`, `resultRecordCount`, in the order of its object ids) when the layer's
 /// description says it can be (fetched first: `advancedQueryCapabilities.supportsPagination`):
 /// from the start, since the first page, asked for in no order, may not be the paged order's. The pages' features end up in one collection,
 /// with the first page's other members and without its paging ones. A first page that leads
-/// nowhere is done at once, unchanged (and [`partial_note`] says what it holds).
+/// nowhere is done at once, unchanged (and [`partial_note`] says what it holds). Legacy WFS
+/// without links warns when its requested MAXFEATURES limit is reached.
 pub fn read_pages(url: &str, first: Vec<u8>, max: usize) -> Step {
     let (head, tail) = edges(&first);
     let linked = head.contains("\"next\"") || tail.contains("\"next\"");
@@ -2152,16 +3000,37 @@ pub fn read_pages(url: &str, first: Vec<u8>, max: usize) -> Step {
     let limited = is_arcgis_query(url)
         && ["resultOffset", "resultRecordCount"].iter().all(|k| query_value(url, k).is_none())
         && (is_true(&head, "exceededTransferLimit") || is_true(&tail, "exceededTransferLimit"));
-    if !(linked || limited) {
+    let wfs = is_wfs_query(url);
+    let legacy_wfs = is_legacy_wfs_query(url);
+    if !(linked || limited || wfs || legacy_wfs) {
         return Step::Done(first, None);
     }
     let Ok(Some((doc, features))) = split_page(&first) else { return Step::Done(first, None) };
     let (next, phase) = if linked && let Some(next) = next_page(url, &doc) {
-        (next, Phase::Linked)
+        (next, Phase::Linked { total: doc.get("totalFeatures").and_then(serde_json::Value::as_u64) })
     } else if limited && exceeded(&doc) {
         (arcgis_layer_url(url), Phase::Describe { first })
+    } else if wfs {
+        (wfs_page_url(url, None, 0), Phase::WfsHits)
     } else {
-        return Step::Done(first, None);
+        let read = features.len();
+        let note =
+            if legacy_wfs && let Some(total) = doc.get("totalFeatures").and_then(serde_json::Value::as_u64).filter(|n| *n > read as u64) {
+                Some(format!(
+                    "{read} of {total} WFS features read: the server reported more features than it returned; the read may be incomplete"
+                ))
+            } else if legacy_wfs
+                && doc.get("totalFeatures").and_then(serde_json::Value::as_u64).is_none()
+                && let Some(limit) = query_value(url, "MAXFEATURES").and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 0)
+                && read >= limit
+            {
+                Some(format!(
+                    "{read} WFS features read: the requested limit of {limit} was reached without a next link; the read may be incomplete"
+                ))
+            } else {
+                None
+            };
+        return Step::Done(first, note);
     };
     let pages = Pages {
         url: url.to_string(),
@@ -2174,7 +3043,7 @@ pub fn read_pages(url: &str, first: Vec<u8>, max: usize) -> Step {
         phase,
     };
     match pages.phase {
-        Phase::Linked => pages.advance(),
+        Phase::Linked { .. } | Phase::WfsHits => pages.advance(),
         _ => Step::Fetch(Box::new(pages)),
     }
 }
@@ -2199,6 +3068,39 @@ impl Pages {
     /// Takes the answer to [`next_url`](Self::next_url) (or why it couldn't be fetched): the next
     /// address to fetch, or the collection as read.
     pub fn land(mut self, answer: Result<Vec<u8>, String>) -> Step {
+        if matches!(self.phase, Phase::WfsHits) {
+            let matched = answer.ok().and_then(|b| wfs_matched(&b));
+            let Some(matched) = matched else {
+                return self.stop("the WFS total couldn't be read; the features received may be incomplete".into());
+            };
+            let offset = self.features.len();
+            if offset > self.max {
+                return self.finish_at_max();
+            }
+            if matched == offset as u64 {
+                return self.finish(None);
+            }
+            if matched < offset as u64 {
+                return self.stop("the WFS total changed; the features read may be incomplete".into());
+            }
+            if offset == 0 {
+                return self.stop(format!("the WFS sent no features of its {matched}; the rest aren't read"));
+            }
+            let mut ids = std::collections::HashSet::new();
+            self.features.retain(|f| feature_id(f).is_none_or(|id| ids.insert(id)));
+            let duplicates = offset.saturating_sub(self.features.len());
+            self.next = wfs_page_url(&self.url, Some(offset), offset.min(self.max));
+            self.phase = Phase::WfsOffsets {
+                matched,
+                offset,
+                size: offset.min(self.max),
+                ids,
+                unidentified: self.features.iter().filter_map(|f| unidentified_hash(f)).collect(),
+                overlap: false,
+                duplicates,
+            };
+            return self.advance();
+        }
         if let Phase::Describe { first } = &mut self.phase {
             let first = std::mem::take(first);
             let paging = answer.ok().and_then(|b| serde_json::from_slice(&b).ok()).and_then(|l| arcgis_paging(&l));
@@ -2216,12 +3118,51 @@ impl Pages {
             return self.advance();
         }
         let read = self.features.len();
-        let (page, more) = match answer.and_then(|b| split_page(&b)) {
+        let (page, mut more) = match answer.and_then(|b| split_page(&b)) {
             Ok(Some(page)) => page,
             Ok(None) => return self.stop(format!("the page after feature {read} isn't a feature collection; the rest aren't read")),
             Err(e) => return self.stop(format!("the page after feature {read} couldn't be read ({e}); the rest aren't read")),
         };
         let following = match &mut self.phase {
+            Phase::WfsOffsets { matched, offset, size, ids, unidentified, overlap, duplicates } => {
+                let returned = more.len();
+                if returned == 0 {
+                    return self.stop("the WFS sent an empty page before its reported total; the rest aren't read".into());
+                }
+                let hashes: Vec<_> = more.iter().filter_map(|f| unidentified_hash(f)).collect();
+                *overlap |= hashes.iter().any(|h| unidentified.contains(h));
+                unidentified.extend(hashes);
+                more.retain(|f| feature_id(f).is_none_or(|id| ids.insert(id)));
+                *duplicates = duplicates.saturating_add(returned.saturating_sub(more.len()));
+                if more.is_empty() {
+                    return self.stop("the WFS repeated an earlier page instead of advancing; the rest aren't read".into());
+                }
+                *offset = offset.saturating_add(returned);
+                // Bound fetched rows too: overlapping pages cannot keep the browser downloading forever.
+                if *offset >= self.max && (*offset as u64) < *matched {
+                    self.features.extend(more);
+                    self.features.truncate(self.max);
+                    return self.stop("the WFS paging row limit was reached; the rest aren't read".into());
+                }
+                if (*offset as u64) >= *matched {
+                    let matched = *matched;
+                    let overlap = *overlap;
+                    self.features.extend(more);
+                    if self.features.len() > self.max {
+                        return self.finish_at_max();
+                    }
+                    if self.features.len() as u64 != matched {
+                        return self.stop("the WFS pages overlap or its total changed; the features read may be incomplete".into());
+                    }
+                    if overlap {
+                        return self.stop(
+                            "possible overlap in rows without ids; all returned rows are kept and the read may be incomplete".into(),
+                        );
+                    }
+                    return self.finish(None);
+                }
+                Some(wfs_page_url(&self.url, Some(*offset), *size))
+            }
             Phase::Offsets { size, order, start, first } => {
                 // A server that doesn't honour `resultOffset` sends its first page again.
                 if start.is_some() && first_value(&more) == *start {
@@ -2232,6 +3173,10 @@ impl Pages {
                     *first = None;
                 }
                 exceeded(&page).then(|| arcgis_page_url(&self.url, read + more.len(), *size, order.as_deref()))
+            }
+            Phase::Linked { total } => {
+                *total = (*total).max(page.get("totalFeatures").and_then(serde_json::Value::as_u64));
+                next_page(&self.next, &page)
             }
             _ => next_page(&self.next, &page),
         };
@@ -2244,6 +3189,22 @@ impl Pages {
                 self.from = std::mem::replace(&mut self.next, n);
                 self.advance()
             }
+            None if matches!(self.phase, Phase::Linked { .. }) && is_wfs_query(&self.url) => {
+                // A next-link chain can end at a server cap too; verify the accumulated total.
+                self.from = self.url.clone();
+                self.next = wfs_page_url(&self.url, None, 0);
+                self.phase = Phase::WfsHits;
+                self.advance()
+            }
+            None if let Phase::Linked { total } = self.phase
+                && is_legacy_wfs_query(&self.url) =>
+            {
+                let read = self.features.len();
+                let note = total.filter(|n| *n > read as u64).map(|total| {
+                    format!("{read} of {total} WFS features read: the server reported more features than it returned; the read may be incomplete")
+                });
+                self.finish(note)
+            }
             None => self.finish(None),
         }
     }
@@ -2251,6 +3212,11 @@ impl Pages {
     /// Done early, with a note; or, when an ArcGIS layer's paged reading stops before any of its
     /// features are read, with the first page as it came (which says it was cut off).
     fn stop(mut self, note: String) -> Step {
+        let note = match self.phase {
+            Phase::WfsOffsets { matched, .. } => format!("{} of {matched} WFS features read: {note}", self.features.len()),
+            Phase::WfsHits => format!("{} WFS features read: {note}", self.features.len()),
+            _ => note,
+        };
         if let Phase::Offsets { first: Some(first), .. } = &mut self.phase {
             return Step::Done(std::mem::take(first), None);
         }
@@ -2260,7 +3226,7 @@ impl Pages {
     /// The next page fetched, unless the features are all read that may be or the pages lead
     /// back to one already read.
     fn advance(mut self) -> Step {
-        if self.features.len() >= self.max {
+        if self.features.len() > self.max || (self.features.len() == self.max && !matches!(self.phase, Phase::WfsHits)) {
             return self.finish_at_max();
         }
         if !self.seen.insert(self.next.clone()) {
@@ -2273,11 +3239,23 @@ impl Pages {
     fn finish_at_max(mut self) -> Step {
         let max = self.max;
         self.features.truncate(max);
-        self.finish(Some(format!("the first {max} features are read; the rest aren't")))
+        let note = format!("the first {max} features are read; the rest aren't");
+        if matches!(self.phase, Phase::WfsHits | Phase::WfsOffsets { .. }) { self.stop(note) } else { self.finish(Some(note)) }
     }
 
     /// The pages' features in the first page's collection, without its paging members.
     fn finish(mut self, note: Option<String>) -> Step {
+        let note = if let Phase::WfsOffsets { duplicates, .. } = &self.phase
+            && *duplicates > 0
+        {
+            let removed = format!("{duplicates} repeated service-id rows ignored");
+            Some(match note {
+                Some(note) => format!("{note}; {removed}"),
+                None => removed,
+            })
+        } else {
+            note
+        };
         if let Some(members) = self.doc.as_object_mut() {
             for paging in ["links", "numberMatched", "numberReturned", "exceededTransferLimit"] {
                 members.remove(paging);
@@ -2307,11 +3285,178 @@ impl Pages {
     }
 }
 
-/// Whether a GeoJSON answer names, as its `crs`, EPSG:4326 in the URN form that puts latitude
-/// first (as GeoServer does for WFS 1.1 and 2.0).
-fn lat_first(crs: &str) -> bool {
-    let c = crs.to_ascii_lowercase();
-    c.starts_with("urn:") && (c.ends_with("epsg::4326") || c.ends_with("epsg:6.6:4326") || c.ends_with("epsg:4326"))
+/// How far past a layer's bounds an answer's positions may reach and still fit them: a tenth of
+/// the bounds' size along that axis, or half a degree when that is more.
+fn margin(lo: f64, hi: f64) -> f64 {
+    ((hi - lo) / 10.0).max(0.5)
+}
+
+/// Whether the extent `[west, south, east, north]` lies within `bounds`, give or take [`margin`].
+fn fits(extent: [f64; 4], bounds: [f64; 4]) -> bool {
+    let [w, s, e, n] = bounds;
+    let (mx, my) = (margin(w, e), margin(s, n));
+    extent[0] >= w - mx && extent[2] <= e + mx && extent[1] >= s - my && extent[3] <= n + my
+}
+
+/// The extent of the positions in a GeoJSON answer (a collection, a feature or a geometry), read
+/// without keeping them: `[min x, min y, max x, max y]`, or `None` for an answer that isn't JSON
+/// or has no position.
+fn positions_extent(bytes: &[u8]) -> Option<[f64; 4]> {
+    use serde::de::DeserializeSeed;
+    let mut extent = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    Members { extent: &mut extent, depth: 0 }.deserialize(&mut de).ok()?;
+    (extent[0] <= extent[2] && extent[1] <= extent[3]).then_some(extent)
+}
+
+/// A GeoJSON object (or an array of them) whose `features`, `geometry`, `geometries` and
+/// `coordinates` are walked for [`positions_extent`]; its other members are skipped.
+struct Members<'a> {
+    extent: &'a mut [f64; 4],
+    depth: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Members<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Members<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a GeoJSON value")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "features" | "geometry" | "geometries" if self.depth < 16 => {
+                    map.next_value_seed(Members { extent: &mut *self.extent, depth: self.depth + 1 })?;
+                }
+                "coordinates" => {
+                    map.next_value_seed(Positions { extent: &mut *self.extent, depth: 0 })?;
+                }
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        if self.depth >= 16 {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            return Ok(());
+        }
+        while seq.next_element_seed(Members { extent: &mut *self.extent, depth: self.depth + 1 })?.is_some() {}
+        Ok(())
+    }
+
+    // A null geometry, or a member of an unexpected kind: nothing to read.
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+}
+
+/// A geometry's `coordinates`, nested arrays whose innermost hold positions: an array whose first
+/// two elements are numbers, as [`swap_positions`] takes one (and as deep as it goes). Gives the
+/// number it is, or `None` for an array or anything else.
+struct Positions<'a> {
+    extent: &'a mut [f64; 4],
+    depth: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Positions<'_> {
+    type Value = Option<f64>;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Option<f64>, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Positions<'_> {
+    type Value = Option<f64>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("GeoJSON coordinates")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Option<f64>, A::Error> {
+        if self.depth > 8 {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            return Ok(None);
+        }
+        let mut first = [None, None];
+        let mut i = 0;
+        while let Some(v) = seq.next_element_seed(Positions { extent: &mut *self.extent, depth: self.depth + 1 })? {
+            if let Some(slot) = first.get_mut(i) {
+                *slot = v;
+            }
+            i += 1;
+        }
+        if let [Some(x), Some(y)] = first
+            && x.is_finite()
+            && y.is_finite()
+        {
+            let e = &mut *self.extent;
+            *e = [e[0].min(x), e[1].min(y), e[2].max(x), e[3].max(y)];
+        }
+        Ok(None)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Option<f64>, E> {
+        Ok(Some(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Option<f64>, E> {
+        Ok(Some(v as f64))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Option<f64>, E> {
+        Ok(Some(v as f64))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Option<f64>, E> {
+        Ok(None)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Option<f64>, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Option<f64>, E> {
+        Ok(None)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Option<f64>, A::Error> {
+        while map.next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?.is_some() {}
+        Ok(None)
+    }
 }
 
 fn swap_positions(v: &mut serde_json::Value, depth: usize) {
@@ -2332,6 +3477,10 @@ fn swap_geometry(g: &mut serde_json::Value, depth: usize) {
     if depth > 8 {
         return;
     }
+    // A box written in the old order would be wrong after the turn; it is optional, so it goes.
+    if let Some(o) = g.as_object_mut() {
+        o.remove("bbox");
+    }
     if let Some(c) = g.get_mut("coordinates") {
         swap_positions(c, 0);
     }
@@ -2342,26 +3491,33 @@ fn swap_geometry(g: &mut serde_json::Value, depth: usize) {
     }
 }
 
-/// A service's GeoJSON answer with latitude-first coordinates (see [`lat_first`]) turned round to
-/// longitude first, and its `crs` dropped; `None` when it is longitude first already.
-pub fn fix_axes(bytes: &[u8]) -> Option<Vec<u8>> {
-    let (head, tail) = edges(bytes);
-    let mentions =
-        |t: &str| t.to_ascii_lowercase().contains("urn:ogc:def:crs:epsg:") || t.to_ascii_lowercase().contains("urn:x-ogc:def:crs:epsg:");
-    if !(mentions(&head) || mentions(&tail)) {
+/// A service's GeoJSON answer with latitude-first coordinates turned round to longitude first, and
+/// its `crs` and boxes (`bbox`, on the answer, its features and geometries) dropped; `None` when it
+/// is left as it came.
+///
+/// The data decide, not the `crs` name: GeoServer names longitude-first answers
+/// `urn:ogc:def:crs:EPSG::4326`, and deegree's one latitude-first answer has no `crs` at all
+/// (#1053). The positions are turned round only when their extent misses the layer's
+/// longitude/latitude `bounds` from the capabilities (west, south, east, north) and the turned
+/// extent fits them, give or take a tenth of their size or half a degree. With no bounds, or an
+/// answer that fits both ways (or neither), it can't tell, and nothing is turned.
+pub fn fix_axes(bytes: &[u8], bounds: Option<[f64; 4]>) -> Option<Vec<u8>> {
+    let bounds = bounds?;
+    let [x0, y0, x1, y1] = positions_extent(bytes)?;
+    if fits([x0, y0, x1, y1], bounds) || !fits([y0, x0, y1, x1], bounds) {
         return None;
     }
     let mut v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let crs = v.pointer("/crs/properties/name").and_then(|n| n.as_str())?;
-    if !lat_first(crs) {
-        return None;
-    }
-    if let Some(o) = v.as_object_mut() {
-        o.remove("crs");
-    }
+    // A GeoJSON answer is one object; anything else (a list of features) is left as it came.
+    let o = v.as_object_mut()?;
+    o.remove("crs");
+    o.remove("bbox");
     match v.get("type").and_then(|t| t.as_str()) {
         Some("FeatureCollection") => {
             for f in v.get_mut("features").and_then(|f| f.as_array_mut()).into_iter().flatten() {
+                if let Some(obj) = f.as_object_mut() {
+                    obj.remove("bbox");
+                }
                 if let Some(g) = f.get_mut("geometry") {
                     swap_geometry(g, 0);
                 }
@@ -2384,6 +3540,58 @@ mod fixtures;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A layer's box names its system otherwise than its list (`EPSG:3035` for the URN): found by
+    /// code, it still says the service writes LAEA Europe north first.
+    #[test]
+    fn a_box_is_found_by_its_systems_code() {
+        let xml = r#"<Layer><CRS>urn:ogc:def:crs:EPSG::3035</CRS><BoundingBox CRS="EPSG:3035" minx="2700000" miny="4000000" maxx="3600000" maxy="4700000"/></Layer>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let listed = wms_candidates(&["urn:ogc:def:crs:EPSG::3035".to_string()]);
+        let (_, w) = wms_native(&doc.root_element(), &listed, true, Some([6.0, 47.0, 15.0, 55.0]), false).unwrap();
+        assert_eq!((w.epsg, w.grid), (3035, warp::Grid::Map { lat_first: true }));
+    }
+
+    /// A WMS 1.3.0 layer is asked in the order EPSG gives its system's axes, with no box to read
+    /// it from (Gauss-Krüger zone 4, north first) and over a box written the other way (LV95,
+    /// east first); WMS 1.1.1 is always east first.
+    #[test]
+    fn a_wms_layer_follows_epsg_axis_order() {
+        let order = |xml: &str, crs: &str, v13: bool| {
+            let doc = roxmltree::Document::parse(xml).unwrap();
+            let listed = wms_candidates(&[crs.to_string()]);
+            let (_, w) = wms_native(&doc.root_element(), &listed, v13, Some([10.0, 47.5, 13.0, 50.5]), false).unwrap();
+            w.grid
+        };
+        let gk4 = "<Layer><CRS>EPSG:31468</CRS></Layer>";
+        assert_eq!(order(gk4, "EPSG:31468", true), warp::Grid::Map { lat_first: true });
+        assert_eq!(order(gk4, "EPSG:31468", false), warp::Grid::Map { lat_first: false });
+        let lv95 = r#"<Layer><CRS>EPSG:2056</CRS><BoundingBox CRS="EPSG:2056" minx="1070000" miny="2480000" maxx="1300000" maxy="2840000"/></Layer>"#;
+        assert_eq!(order(lv95, "EPSG:2056", true), warp::Grid::Map { lat_first: false });
+    }
+
+    /// A tile matrix set keeps the matrices it can read when one can't be (no identifier), and
+    /// past `MAX_MATRICES` its 20 coarsest and 20 finest.
+    #[test]
+    fn a_tile_matrix_set_keeps_what_it_can_read() {
+        let matrix = |id: &str, scale: f64| {
+            format!(
+                "<TileMatrix>{id}<ScaleDenominator>{scale}</ScaleDenominator><TopLeftCorner>2420000 1350000</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>4</MatrixWidth><MatrixHeight>3</MatrixHeight></TileMatrix>"
+            )
+        };
+        let set = |ms: &str| format!("<TileMatrixSet><SupportedCRS>EPSG:2056</SupportedCRS>{ms}</TileMatrixSet>");
+        let xml = set(&(matrix("<Identifier>a</Identifier>", 2_000_000.0) + &matrix("", 1_000_000.0)));
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let (code, _, ms) = native_matrices(&doc.root_element()).unwrap();
+        assert_eq!((code, ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>()), (2056, vec!["a"]));
+        let many: String = (0..50).map(|i| matrix(&format!("<Identifier>{i}</Identifier>"), 1e7 / f64::from(i + 1))).collect();
+        let xml = set(&many);
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        let mut ms = native_matrices(&doc.root_element()).unwrap().2;
+        keep_matrices(&mut ms);
+        let ids: Vec<&str> = ms.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!((ids.len(), ids[0], ids[19], ids[20], ids[39]), (40, "0", "19", "30", "49"));
+    }
 
     /// #167: World_Street_Map's map is named "Layers" and titled "Map", and its description is
     /// HTML: the service is named from its address, never from the description.
@@ -2565,6 +3773,63 @@ mod tests {
         assert!(s.notes.iter().any(|n| n.contains("1 collections")));
     }
 
+    /// OGC API collections whose items are 3D Tiles or quantized mesh terrain, for 3D viewers, as
+    /// PDOK's 3D Basisvoorziening links them (#1267): left out, by name in the notes, and a
+    /// collection that also links GeoJSON items is offered those.
+    #[test]
+    fn collections_of_3d_items_are_left_out() {
+        let json = r#"{"collections": [
+            {"id": "gebouwen", "itemType": "feature", "links": [{"rel": "items", "type": "application/json+3dtiles", "href": "https://x.org/collections/gebouwen/3dtiles?f=json"}]},
+            {"id": "terreinen", "itemType": "feature", "links": [{"rel": "items", "type": "application/json+3dtiles", "href": "https://x.org/collections/terreinen/3dtiles?f=json"}]},
+            {"id": "relative", "links": [{"rel": "items", "href": "3dtiles"}]},
+            {"id": "tiled", "links": [{"rel": "items", "type": "application/json+3dtiles", "href": "https://x.org/collections/tiled/3dtiles"}, {"rel": "http://www.opengis.net/def/rel/ogc/1.0/tilesets-map", "href": "https://x.org/collections/tiled/map/tiles"}]},
+            {"id": "bin", "links": [{"rel": "items", "type": "application/octet-stream", "href": "https://x.org/collections/bin/3dtiles"}]},
+            {"id": "dtm", "itemType": "feature", "links": [{"rel": "items", "type": "application/json", "href": "https://x.org/collections/dtm/quantized-mesh?f=json"}]},
+            {"id": "both", "links": [{"rel": "items", "href": "https://x.org/collections/both/3dtiles/"}, {"rel": "items", "type": "application/geo+JSON", "href": "https://x.org/collections/both/items?f=json"}]},
+            {"id": "plain", "links": [{"rel": "items", "type": "application/geo+json", "href": "https://x.org/collections/plain/items?f=json"}]}
+        ]}"#;
+        let s = parse("https://x.org/collections", json.as_bytes()).unwrap();
+        let offered: Vec<_> =
+            s.layers.iter().filter(|l| matches!(l.offer, Offer::Features { .. })).map(|l| (l.name.as_str(), &l.offer)).collect();
+        assert_eq!(offered.len(), 2, "{offered:?}");
+        assert!(
+            matches!(offered[0], ("both", Offer::Features { url }) if url == "https://x.org/collections/both/items?f=json&limit=10000"),
+            "{offered:?}"
+        );
+        assert_eq!(offered[1].0, "plain");
+        assert!(
+            s.notes.contains(
+                &"collections 'gebouwen', 'terreinen', 'relative', 'bin' offer 3D Tiles, which RustGIS doesn't draw, so they are left out"
+                    .to_string()
+            ),
+            "{:?}",
+            s.notes
+        );
+        assert!(
+            s.notes.contains(&"collection 'dtm' offers quantized mesh terrain, which RustGIS doesn't draw, so it is left out".to_string()),
+            "{:?}",
+            s.notes
+        );
+        // A collection with tiles too is listed by them, and the note says its 3D items aren't.
+        assert!(s.layers.iter().any(|l| l.name == "tiled (map tiles)"));
+        assert!(
+            s.notes.contains(&"collection 'tiled' also offers 3D Tiles, which RustGIS doesn't draw; its tiles are listed".to_string()),
+            "{:?}",
+            s.notes
+        );
+        assert!(!s.incomplete);
+        // Past 20 names, the note says how many more.
+        let many: Vec<String> =
+            (0..23).map(|i| format!(r#"{{"id": "c{i}", "links": [{{"rel": "items", "href": "https://x.org/c{i}/3dtiles"}}]}}"#)).collect();
+        let s = parse("https://x.org/collections", format!(r#"{{"collections": [{}]}}"#, many.join(",")).as_bytes()).unwrap();
+        assert!(s.notes.iter().any(|n| n.contains("'c19', and 3 more offer 3D Tiles")), "{:?}", s.notes);
+        // Without them, no note on 3D content.
+        let plain = r#"{"collections": [{"id": "plain", "links": [{"rel": "items", "type": "application/geo+json", "href": "https://x.org/collections/plain/items?f=json"}]}]}"#;
+        let s = parse("https://x.org/collections", plain.as_bytes()).unwrap();
+        assert_eq!(s.layers.len(), 1);
+        assert!(!s.notes.iter().any(|n| n.contains(LEFT_OUT_3D)), "{:?}", s.notes);
+    }
+
     #[test]
     fn features_asked_for_over_an_area() {
         let piaui = [-45.99, -10.93, -40.37, -2.74];
@@ -2639,17 +3904,95 @@ mod tests {
             "{:?}",
             s.layers[0].offer
         );
-        // An answer that says latitude comes first is turned round; others are left alone.
-        let lat_lon = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[46.5,7.1],[47.0,8.2]]}},{"type":"Feature","properties":{},"geometry":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[45,6]}]}}],"crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::4326"}}}"#;
-        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(lat_lon).unwrap()).unwrap();
-        assert_eq!(fixed.pointer("/features/0/geometry/coordinates/0").unwrap(), &serde_json::json!([7.1, 46.5]));
-        assert_eq!(fixed.pointer("/features/1/geometry/geometries/0/coordinates").unwrap(), &serde_json::json!([6, 45]));
+    }
+
+    /// #1053: an answer's axes are judged from its positions against the layer's bounds, never
+    /// from the `crs` it names.
+    #[test]
+    fn axes_judged_against_the_layer_bounds() {
+        // IBGE (GeoServer): longitude first, named urn:ogc:def:crs:EPSG::4326. Left alone.
+        let ibge = br#"{"type":"FeatureCollection","features":[{"type":"Feature","id":"v.1","geometry":{"type":"MultiPolygon","coordinates":[[[[-61.9307472,-11.9734947],[-62.8940789,-13.1189419],[-61.886511,-11.827457],[-61.9307472,-11.9734947]]]]},"properties":{"nome":"Rondonia"}},{"type":"Feature","id":"v.2","geometry":{"type":"Point","coordinates":[-35.2,-5.8]},"properties":{}}],"crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::4326"}},"bbox":[-62.8940789,-13.1189419,-35.2,-5.8]}"#;
+        let brazil = Some([-71.99, -30.51, -34.12, 1.10]);
+        assert!(fix_axes(ibge, brazil).is_none());
+
+        // Latitude first with no crs, as deegree answers when asked in the URN form (RustGIS asks
+        // EPSG:4326). Turned round, a GeometryCollection too; a null geometry and a property
+        // holding numbers are no positions.
+        let hamburg = Some([8.41, 53.40, 10.33, 53.96]);
+        let deegree = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"at":[0,0]},"geometry":{"type":"LineString","coordinates":[[53.55,9.99],[53.6,10.1]]}},{"type":"Feature","properties":{},"geometry":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[53.45,8.5]}]}},{"type":"Feature","properties":{},"geometry":null}]}"#;
+        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(deegree, hamburg).unwrap()).unwrap();
+        assert_eq!(fixed.pointer("/features/0/geometry/coordinates/0").unwrap(), &serde_json::json!([9.99, 53.55]));
+        assert_eq!(fixed.pointer("/features/1/geometry/geometries/0/coordinates").unwrap(), &serde_json::json!([8.5, 53.45]));
+        assert_eq!(fixed.pointer("/features/0/properties/at").unwrap(), &serde_json::json!([0, 0]));
+        // A crs naming the latitude-first order is dropped with the turn.
+        let named = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[53.55,9.99]}}],"crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::4326"}}}"#;
+        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(named, hamburg).unwrap()).unwrap();
         assert!(fixed.get("crs").is_none());
-        assert!(
-            fix_axes(br#"{"type":"FeatureCollection","features":[],"crs":{"type":"name","properties":{"name":"EPSG:4326"}}}"#).is_none()
+        // Boxes in the latitude-first order are dropped with it: the answer's, a feature's and a
+        // geometry's, within a collection too.
+        let boxed = br#"{"type":"FeatureCollection","bbox":[53.55,9.99,53.6,10.1],"features":[{"type":"Feature","bbox":[53.55,9.99,53.6,10.1],"properties":{"bbox":"kept"},"geometry":{"type":"GeometryCollection","bbox":[53.55,9.99,53.6,10.1],"geometries":[{"type":"LineString","bbox":[53.55,9.99,53.6,10.1],"coordinates":[[53.55,9.99],[53.6,10.1]]}]}}]}"#;
+        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(boxed, hamburg).unwrap()).unwrap();
+        for at in ["", "/features/0", "/features/0/geometry", "/features/0/geometry/geometries/0"] {
+            assert!(fixed.pointer(at).unwrap().get("bbox").is_none(), "{at}");
+        }
+        assert_eq!(fixed.pointer("/features/0/properties/bbox").unwrap(), "kept");
+        assert_eq!(
+            fixed.pointer("/features/0/geometry/geometries/0/coordinates").unwrap(),
+            &serde_json::json!([[9.99, 53.55], [10.1, 53.6]])
         );
-        assert!(fix_axes(br#"{"type":"FeatureCollection","features":[]}"#).is_none());
-        assert!(fix_axes(b"urn:ogc:def:crs:EPSG::4326 not json").is_none());
+        // A lone feature and a bare geometry.
+        let feature =
+            br#"{"type":"Feature","bbox":[53.55,9.99,53.55,9.99],"properties":{},"geometry":{"type":"Point","coordinates":[53.55,9.99]}}"#;
+        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(feature, hamburg).unwrap()).unwrap();
+        assert_eq!(fixed.pointer("/geometry/coordinates").unwrap(), &serde_json::json!([9.99, 53.55]));
+        assert!(fixed.get("bbox").is_none());
+        let geometry = br#"{"type":"Point","coordinates":[53.55,9.99,12.5]}"#;
+        let fixed: serde_json::Value = serde_json::from_slice(&fix_axes(geometry, hamburg).unwrap()).unwrap();
+        assert_eq!(fixed.pointer("/coordinates").unwrap(), &serde_json::json!([9.99, 53.55, 12.5]));
+
+        // No bounds: it can't tell, and nothing is turned.
+        assert!(fix_axes(deegree, None).is_none());
+
+        // Fits both ways (near 10°E 10°N, or a layer covering the world): left alone.
+        let both = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"LineString","coordinates":[[9.8,10.1],[10.2,9.9]]}}]}"#;
+        assert!(fix_axes(both, Some([9.5, 9.5, 10.5, 10.5])).is_none());
+        assert!(fix_axes(deegree, Some([-180.0, -90.0, 180.0, 90.0])).is_none());
+        // Fits neither way: left alone.
+        assert!(fix_axes(deegree, brazil).is_none());
+
+        // Slightly past the bounds, within the margin (a tenth of their size, or half a degree):
+        // it fits as it comes, though only the turned point lies strictly inside.
+        let past = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[12.3,11.0]}}]}"#;
+        assert!(fix_axes(past, Some([10.0, 10.0, 12.0, 14.0])).is_none());
+
+        // Nothing to judge from: no features, not JSON.
+        assert!(fix_axes(br#"{"type":"FeatureCollection","features":[]}"#, hamburg).is_none());
+        assert!(fix_axes(b"urn:ogc:def:crs:EPSG::4326 not json", hamburg).is_none());
+        // A list of features isn't a GeoJSON answer: judged, but left as it came.
+        let listed = br#"[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[53.55,9.99]}}]"#;
+        assert!(fix_axes(listed, hamburg).is_none());
+        // Positions under arrays nested deeper than a GeoJSON answer goes aren't read.
+        let deep = format!("{}{{\"type\":\"Point\",\"coordinates\":[53.55,9.99]}}{}", "[".repeat(20), "]".repeat(20));
+        assert!(fix_axes(deep.as_bytes(), hamburg).is_none());
+    }
+
+    /// An OGC API collection's extent is its longitude/latitude bounds only in CRS84 (named, or
+    /// by default), with or without heights: a box in EPSG:4326's latitude-first order would turn
+    /// longitude-first features round (#1053).
+    #[test]
+    fn ogc_api_extent_read_only_in_crs84() {
+        let doc = br#"{"collections": [
+            {"id": "a", "extent": {"spatial": {"bbox": [[8.41, 53.39, 10.34, 53.97]]}}, "links": [{"rel": "items", "href": "https://x.org/collections/a/items"}]},
+            {"id": "b", "extent": {"spatial": {"bbox": [[8.41, 53.39, 10.34, 53.97]], "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"}}, "links": [{"rel": "items", "href": "https://x.org/collections/b/items"}]},
+            {"id": "c", "extent": {"spatial": {"bbox": [[8.41, 53.39, -5, 10.34, 53.97, 120]], "crs": "http://www.opengis.net/def/crs/OGC/0/CRS84h"}}, "links": [{"rel": "items", "href": "https://x.org/collections/c/items"}]},
+            {"id": "d", "extent": {"spatial": {"bbox": [[53.39, 8.41, 53.97, 10.34]], "crs": "http://www.opengis.net/def/crs/EPSG/0/4326"}}, "links": [{"rel": "items", "href": "https://x.org/collections/d/items"}]},
+            {"id": "e", "extent": {"spatial": {"bbox": [[8.41, 9.0, 53.39, 10.34, 53.97]]}}, "links": [{"rel": "items", "href": "https://x.org/collections/e/items"}]}]}"#;
+        let s = parse("https://x.org/collections", doc).unwrap();
+        let bbox = |id: &str| s.layers.iter().find(|l| l.name == id).map(|l| l.bbox);
+        let hamburg = Some(Some([8.41, 53.39, 10.34, 53.97]));
+        assert_eq!((bbox("a"), bbox("b"), bbox("c")), (hamburg, hamburg, hamburg));
+        // A box in another system, or of neither four nor six numbers: no bounds.
+        assert_eq!((bbox("d"), bbox("e")), (Some(None), Some(None)));
     }
 
     #[test]
@@ -2670,6 +4013,311 @@ mod tests {
             .is_none()
         );
         assert!(partial_note(b"").is_none());
+    }
+
+    /// A WFS server can cap a page without linking to the next one (#1262).
+    #[test]
+    fn wfs_pages_without_next_links_are_read_completely() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=roads&COUNT=50000";
+        let first = br#"{"type":"FeatureCollection","features":[{"id":"roads.1"},{"id":"roads.2"}]}"#;
+        let (joined, note) = join_pages(url, first.to_vec(), 100, |next| {
+            if query_value(next, "RESULTTYPE").is_some_and(|v| v.eq_ignore_ascii_case("hits")) {
+                Ok(br#"<wfs:FeatureCollection xmlns:wfs="http://www.opengis.net/wfs/2.0" numberMatched="3" numberReturned="0"/>"#.to_vec())
+            } else {
+                assert_eq!(query_value(next, "STARTINDEX"), Some("2"));
+                Ok(br#"{"type":"FeatureCollection","features":[{"id":"roads.3"}]}"#.to_vec())
+            }
+        });
+        let doc: serde_json::Value = serde_json::from_slice(&joined).unwrap();
+        assert_eq!(doc["features"].as_array().unwrap().len(), 3);
+        assert_eq!(note, None);
+    }
+
+    /// Explicit count windows, below and above the generated request size, do not fetch more.
+    #[test]
+    fn wfs_explicit_count_windows_do_not_page() {
+        let first = br#"{"features":[{"id":1},{"id":2}]}"#;
+        let mut requests = Vec::new();
+        for count in [2, FEATURE_LIMIT + 1] {
+            let url = format!("https://wfs.example.org/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&COUNT={count}");
+            let mut calls = 0;
+            let _ = join_pages(&url, first.to_vec(), 100, |_| {
+                calls += 1;
+                Err("no extra request expected".into())
+            });
+            requests.push(calls);
+        }
+        assert_eq!(requests, [0, 0]);
+    }
+
+    /// A total reported only by an intermediate linked page remains evidence of a short read.
+    #[test]
+    fn wfs_legacy_intermediate_total_is_not_forgotten() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=1.1.0&REQUEST=GetFeature&MAXFEATURES=50000";
+        let first = br#"{"features":[{"id":1}],"links":[{"rel":"next","href":"?page=2"}]}"#;
+        let (bytes, note) = join_pages(url, first.to_vec(), 100, |u| {
+            if query_value(u, "page") == Some("2") {
+                Ok(br#"{"features":[{"id":2}],"totalFeatures":4,"links":[{"rel":"next","href":"?page=3"}]}"#.to_vec())
+            } else {
+                Ok(br#"{"features":[{"id":3}]}"#.to_vec())
+            }
+        });
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["features"].as_array().unwrap().len(), 3);
+        assert!(note.unwrap().contains("3 of 4 WFS features read"));
+    }
+
+    /// Exhausted legacy links report a known shortfall, while a matching total stays clean.
+    #[test]
+    fn wfs_legacy_linked_total_is_not_silent() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=1.1.0&REQUEST=GetFeature&MAXFEATURES=50000";
+        for total in [3, 2] {
+            let first = serde_json::to_vec(&serde_json::json!({
+                "features": [{"id": 1}], "totalFeatures": total,
+                "links": [{"rel": "next", "href": "?page=2"}]
+            }))
+            .unwrap();
+            let (bytes, note) = join_pages(url, first, 100, |_| Ok(br#"{"features":[{"id":2}]}"#.to_vec()));
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["features"].as_array().unwrap().len(), 2);
+            if total == 3 {
+                assert!(note.unwrap().contains("2 of 3 WFS features read"));
+            } else {
+                assert_eq!(note, None);
+            }
+        }
+    }
+
+    /// A matching legacy WFS total confirms completeness even at the requested cap.
+    #[test]
+    fn wfs_legacy_matching_total_at_cap_is_complete() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=1.1.0&REQUEST=GetFeature&MAXFEATURES=2";
+        let first = br#"{"features":[{"id":1},{"id":2}],"totalFeatures":2}"#;
+        let (bytes, note) = join_pages(url, first.to_vec(), 100, |_| panic!("legacy WFS has no offset paging"));
+        assert_eq!(bytes, first);
+        assert_eq!(note, None);
+    }
+
+    /// A reported legacy WFS total exposes truncation below the requested cap.
+    #[test]
+    fn wfs_legacy_reported_total_is_not_silent() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=1.1.0&REQUEST=GetFeature&MAXFEATURES=50000";
+        let first = br#"{"features":[{"id":1},{"id":2}],"totalFeatures":3}"#;
+        let (bytes, note) = join_pages(url, first.to_vec(), 100, |_| panic!("legacy WFS has no offset paging"));
+        assert_eq!(bytes, first);
+        let note = note.unwrap();
+        assert!(note.contains("2 of 3 WFS features read"));
+        assert!(note.contains("incomplete"));
+        let complete = br#"{"features":[{"id":1},{"id":2}],"totalFeatures":2}"#;
+        let (bytes, note) = join_pages(url, complete.to_vec(), 100, |_| panic!("legacy WFS has no offset paging"));
+        assert_eq!(bytes, complete);
+        assert_eq!(note, None);
+    }
+
+    /// Legacy WFS at its requested cap warns, while a shorter response stays clean.
+    #[test]
+    fn wfs_legacy_requested_cap_is_not_silent() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=1.1.0&REQUEST=GetFeature&MAXFEATURES=2";
+        let first = br#"{"features":[{"id":1,"properties":{"next":null}},{"id":2}]}"#;
+        let (bytes, note) = join_pages(url, first.to_vec(), 100, |_| panic!("legacy WFS has no offset paging"));
+        assert_eq!(bytes, first);
+        assert!(note.unwrap().contains("2"));
+        let short = br#"{"features":[{"id":1}]}"#;
+        let (bytes, note) = join_pages(url, short.to_vec(), 100, |_| panic!("legacy WFS has no offset paging"));
+        assert_eq!(bytes, short);
+        assert_eq!(note, None);
+    }
+
+    /// A WFS next-link chain still checks its total when the final link disappears.
+    #[test]
+    fn wfs_linked_pages_check_the_final_total() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature";
+        let first = br#"{"features":[{"id":1}],"numberMatched":3,"links":[{"rel":"next","href":"?page=2"}]}"#;
+        let (bytes, note) = join_pages(url, first.to_vec(), 100, |u| {
+            if query_value(u, "RESULTTYPE").is_some() {
+                Ok(br#"<FeatureCollection numberMatched="3"/>"#.to_vec())
+            } else if query_value(u, "STARTINDEX") == Some("2") {
+                Ok(br#"{"features":[{"id":3}]}"#.to_vec())
+            } else {
+                Ok(br#"{"features":[{"id":2}],"numberMatched":3}"#.to_vec())
+            }
+        });
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["features"].as_array().unwrap().len(), 3);
+        assert_eq!(note, None);
+    }
+
+    /// Numeric service IDs beyond u64 stay distinct across pages.
+    #[test]
+    fn wfs_large_numeric_ids_remain_distinct() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature";
+        let first = br#"{"features":[{"id":12345678901234567890123}]}"#;
+        let (bytes, note) = join_pages(url, first.to_vec(), 100, |u| {
+            if query_value(u, "RESULTTYPE").is_some() {
+                Ok(br#"<FeatureCollection numberMatched="2"/>"#.to_vec())
+            } else {
+                Ok(br#"{"features":[{"id":12345678901234567890124}]}"#.to_vec())
+            }
+        });
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["features"].as_array().unwrap().len(), 2);
+        assert_eq!(note, None);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("12345678901234567890123") && text.contains("12345678901234567890124"));
+    }
+
+    /// Identical ID-less page starts do not imply that the entire page was repeated.
+    #[test]
+    fn wfs_idless_pages_with_matching_starts_continue() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature";
+        let first = br#"{"features":[{"properties":{"n":0}},{"properties":{"n":1}}]}"#;
+        let (bytes, note) = join_pages(url, first.to_vec(), 100, |u| match query_value(u, "STARTINDEX") {
+            Some("2") => Ok(br#"{"features":[{"properties":{"n":0}},{"properties":{"n":2}}]}"#.to_vec()),
+            Some("4") => Ok(br#"{"features":[{"properties":{"n":0}},{"properties":{"n":3}}]}"#.to_vec()),
+            _ => Ok(br#"<FeatureCollection numberMatched="6"/>"#.to_vec()),
+        });
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["features"].as_array().unwrap().len(), 6);
+        let note = note.unwrap();
+        assert!(note.contains("possible overlap"));
+        assert!(!note.contains("rest aren't read"));
+    }
+
+    /// Removing a repeated service id remains visible even when the unique total matches.
+    #[test]
+    fn wfs_duplicate_ids_are_counted_when_the_total_matches() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature";
+        let first = br#"{"features":[{"id":1},{"id":2}]}"#;
+        let (bytes, note) = join_pages(url, first.to_vec(), 100, |u| {
+            if query_value(u, "RESULTTYPE").is_some() {
+                Ok(br#"<FeatureCollection numberMatched="4"/>"#.to_vec())
+            } else {
+                Ok(br#"{"features":[{"id":2},{"id":3},{"id":4}]}"#.to_vec())
+            }
+        });
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["features"].as_array().unwrap().len(), 4);
+        assert!(note.unwrap().contains("1 repeated service-id row"));
+    }
+
+    #[test]
+    fn wfs_review_exact_limit_can_be_complete() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature";
+        let page = |rows: serde_json::Value| serde_json::to_vec(&serde_json::json!({"features": rows})).unwrap();
+        let first = page(serde_json::json!([{"id": 1}, {"id": 2}]));
+        let (bytes, note) = join_pages(url, first.clone(), 2, |_| Ok(br#"<FeatureCollection numberMatched="2"/>"#.to_vec()));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["features"].as_array().unwrap().len(), 2);
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn wfs_review_padded_total_continues_paging() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature";
+        let page = |rows: serde_json::Value| serde_json::to_vec(&serde_json::json!({"features": rows})).unwrap();
+        let first = page(serde_json::json!([{"id": 1}, {"id": 2}]));
+        let (bytes, note) = join_pages(url, first, 100, |u| {
+            if query_value(u, "RESULTTYPE").is_some() {
+                Ok(br#"<FeatureCollection numberMatched=" 3 "/>"#.to_vec())
+            } else {
+                Ok(page(serde_json::json!([{"id": 3}])))
+            }
+        });
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["features"].as_array().unwrap().len(), 3);
+        assert_eq!(note, None);
+    }
+
+    #[test]
+    fn wfs_review_idless_overlap_reports_uncertainty() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature";
+        let page = |rows: serde_json::Value| serde_json::to_vec(&serde_json::json!({"features": rows})).unwrap();
+        let first = page(serde_json::json!([{"properties": {"n": 1}}, {"id": 2}]));
+        let (bytes, note) = join_pages(url, first, 100, |u| match query_value(u, "STARTINDEX") {
+            Some("2") => Ok(page(serde_json::json!([{"id": 3}, {"id": 4}]))),
+            Some("4") => Ok(page(serde_json::json!([{"id": 5}, {"properties": {"n": 1}}]))),
+            _ => Ok(br#"<FeatureCollection numberMatched="6"/>"#.to_vec()),
+        });
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["features"].as_array().unwrap().len(), 6);
+        assert!(note.unwrap().contains("possible overlap"));
+    }
+
+    #[test]
+    fn wfs_review_mixed_repeat_keeps_new_identified_rows() {
+        let url = "https://wfs.example.org/wfs?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature";
+        let page = |rows: serde_json::Value| serde_json::to_vec(&serde_json::json!({"features": rows})).unwrap();
+        let first = page(serde_json::json!([{"id": 1}, {"properties": {"n": 2}}]));
+        let (bytes, note) = join_pages(url, first, 100, |u| {
+            if query_value(u, "RESULTTYPE").is_some() {
+                Ok(br#"<FeatureCollection numberMatched="5"/>"#.to_vec())
+            } else {
+                Ok(page(serde_json::json!([{"id": 1}, {"properties": {"n": 2}}, {"id": 3}])))
+            }
+        });
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(doc["features"].as_array().unwrap().iter().any(|f| f["id"] == 3));
+        assert_eq!(doc["features"].as_array().unwrap().len(), 4);
+        assert!(note.is_some());
+    }
+
+    /// Paging preserves the selection query and reports each way a service can stop short.
+    #[test]
+    fn wfs_paging_keeps_filters_and_reports_incomplete_reads() {
+        let url = "https://wfs.example.org/wfs?service=wfs&version=2.0.0&request=GetFeature&typeNames=roads&outputFormat=json&count=50000&BBOX=1,2,3,4&token=t";
+        let first = br#"{"type":"FeatureCollection","features":[{"id":1},{"id":2}]}"#;
+        let hits = br#"<FeatureCollection numberMatched="4"/>"#;
+        let count = |bytes: &[u8]| serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["features"].as_array().unwrap().len();
+        let mut calls = 0;
+        let (bytes, note) = join_pages(url, first.to_vec(), 100, |next| {
+            calls += 1;
+            assert_eq!(query_value(next, "BBOX"), Some("1,2,3,4"));
+            assert_eq!(query_value(next, "token"), Some("t"));
+            if calls == 1 {
+                assert_eq!(query_value(next, "RESULTTYPE"), Some("hits"));
+                assert!(query_value(next, "OUTPUTFORMAT").is_none());
+                Ok(hits.to_vec())
+            } else {
+                assert_eq!(query_value(next, "STARTINDEX"), Some("2"));
+                assert_eq!(query_value(next, "COUNT"), Some("2"));
+                assert_eq!(query_value(next, "OUTPUTFORMAT"), Some("json"));
+                Ok(br#"{"features":[{"id":3},{"id":4}]}"#.to_vec())
+            }
+        });
+        assert_eq!((count(&bytes), note, calls), (4, None, 2));
+        for answer in
+            [Err("timeout".into()), Ok(b"<ExceptionReport/>".to_vec()), Ok(br#"<FeatureCollection numberMatched="unknown"/>"#.to_vec())]
+        {
+            let (bytes, note) = join_pages(url, first.to_vec(), 100, |_| answer.clone());
+            assert_eq!(count(&bytes), 2);
+            assert!(note.unwrap().contains("incomplete"));
+        }
+        for last in [
+            Err("timeout".into()),
+            Ok(br#"{"features":[]}"#.to_vec()),
+            Ok(first.to_vec()),
+            Ok(br#"{"features":[{"id":2},{"id":3}]}"#.to_vec()),
+        ] {
+            let mut calls = 0;
+            let (bytes, note) = join_pages(url, first.to_vec(), 100, |_| {
+                calls += 1;
+                if calls == 1 { Ok(hits.to_vec()) } else { last.clone() }
+            });
+            let n = count(&bytes);
+            assert!((2..=3).contains(&n));
+            assert!(note.unwrap().contains("of 4 WFS features read"));
+            assert_eq!(calls, 2);
+        }
+        let mut calls = 0;
+        let (bytes, note) = join_pages(url, first.to_vec(), 3, |_| {
+            calls += 1;
+            if calls == 1 { Ok(hits.to_vec()) } else { Ok(br#"{"features":[{"id":3},{"id":4}]}"#.to_vec()) }
+        });
+        assert_eq!(count(&bytes), 3);
+        assert!(note.unwrap().contains("3 of 4 WFS features read"));
+        let (bytes, note) = join_pages(url, first.to_vec(), 1, |_| panic!("limit checked before hits"));
+        assert_eq!(count(&bytes), 1);
+        assert!(note.unwrap().contains("first 1"));
+        for suffix in ["&STARTINDEX=0", "&RESULTTYPE=hits"] {
+            let (bytes, note) =
+                join_pages(&format!("{url}{suffix}"), first.to_vec(), 100, |_| panic!("explicit request must stay unchanged"));
+            assert_eq!((bytes, note), (first.to_vec(), None));
+        }
     }
 
     #[test]
@@ -2915,6 +4563,189 @@ mod tests {
         assert_eq!(paging(serde_json::json!({"maxRecordCount": 1000})), None);
     }
 
+    /// The zooms a layer's tiles are asked for at: a WMS layer down to its least scale (its own
+    /// hint or its parent's; WMS 1.1.1's `ScaleHint` too), else zoom 22, and out to its greatest;
+    /// a WMTS layer over its matrices, or those its `TileMatrixSetLimits` name.
+    #[test]
+    fn zooms_from_scale_hints_and_tile_matrices() {
+        let wms = |version: &str, layers: &str| {
+            format!(
+                r#"<WMS_Capabilities version="{version}" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://m.example.org/wms?"/></Get></HTTP></DCPType></GetMap></Request>
+<Layer><CRS>EPSG:3857</CRS><SRS>EPSG:3857</SRS>{layers}</Layer></Capability></WMS_Capabilities>"#
+            )
+        };
+        let zooms = |doc: &str, name: &str| {
+            parse("https://m.example.org/wms", doc.as_bytes()).unwrap().layers.into_iter().find(|l| l.name == name).unwrap().zooms
+        };
+        let equator = r#"<EX_GeographicBoundingBox><westBoundLongitude>-1</westBoundLongitude><eastBoundLongitude>1</eastBoundLongitude><southBoundLatitude>-1</southBoundLatitude><northBoundLatitude>1</northBoundLatitude></EX_GeographicBoundingBox>"#;
+        let doc = wms(
+            "1.3.0",
+            &format!(
+                r#"<Layer><Name>any</Name></Layer>
+<Layer><Name>hinted</Name>{equator}<MinScaleDenominator>2132</MinScaleDenominator><MaxScaleDenominator>4400000</MaxScaleDenominator>
+  <Layer><Name>child</Name>{equator}</Layer></Layer>"#
+            ),
+        );
+        // No hint: down to 22.
+        assert_eq!(zooms(&doc, "any"), Some((0, WMS_MAX_ZOOM)));
+        // 1:2132 is zoom 18; 1:4 400 000 is past zoom 6's scale, within zoom 7's.
+        assert_eq!(zooms(&doc, "hinted"), Some((7, 18)));
+        assert_eq!(zooms(&doc, "child"), Some((7, 18)), "inherited");
+        // Drawn down to 1:1000: zoom 19 (1:1066), not 20 (1:533, which it doesn't draw). A child
+        // giving only its least scale keeps its parent's greatest.
+        let deep = wms(
+            "1.3.0",
+            r#"<Layer><Name>deep</Name><MinScaleDenominator>1000</MinScaleDenominator><MaxScaleDenominator>4400000</MaxScaleDenominator>
+  <Layer><Name>own least</Name><MinScaleDenominator>500</MinScaleDenominator></Layer></Layer>"#,
+        );
+        assert_eq!(zooms(&deep, "deep"), Some((7, 19)));
+        assert_eq!(zooms(&deep, "own least"), Some((7, 20)));
+        // WMS 1.1.1: a pixel's diagonal on the ground, 0.85 m (0.6 m a side: 1:2142).
+        let old = wms("1.1.1", r#"<Layer><Name>old</Name><ScaleHint min="0.85" max="0"/></Layer>"#);
+        assert_eq!(zooms(&old, "old"), Some((0, 18)));
+        // A WMTS layer: its matrices' zooms, or those its limits name.
+        let wmts = |limits: &str| {
+            let matrix = |z: u32| {
+                format!(
+                    "<TileMatrix><ows:Identifier>{z}</ows:Identifier><ScaleDenominator>{}</ScaleDenominator><TopLeftCorner>-20037508.34278925 20037508.34278925</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>{}</MatrixWidth><MatrixHeight>{}</MatrixHeight></TileMatrix>",
+                    Z0_SCALE / f64::from(1u32 << z),
+                    1u32 << z,
+                    1u32 << z
+                )
+            };
+            let ms: String = (0..=20).map(matrix).collect();
+            format!(
+                r#"<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0"><Contents>
+<Layer><ows:Title>Photo</ows:Title><ows:Identifier>photo</ows:Identifier><TileMatrixSetLink><TileMatrixSet>gm</TileMatrixSet>{limits}</TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/jpeg" template="https://t.example.org/{{TileMatrix}}/{{TileRow}}/{{TileCol}}.jpeg"/></Layer>
+<TileMatrixSet><ows:Identifier>gm</ows:Identifier><ows:SupportedCRS>EPSG:3857</ows:SupportedCRS>{ms}</TileMatrixSet></Contents></Capabilities>"#
+            )
+        };
+        let photo = |doc: &str| parse("https://t.example.org/WMTSCapabilities.xml", doc.as_bytes()).unwrap().layers[0].zooms;
+        assert_eq!(photo(&wmts("")), Some((0, 20)), "past the usual 19");
+        let limits = "<TileMatrixSetLimits><TileMatrixLimits><TileMatrix>8</TileMatrix></TileMatrixLimits><TileMatrixLimits><TileMatrix>17</TileMatrix></TileMatrixLimits></TileMatrixSetLimits>";
+        assert_eq!(photo(&wmts(limits)), Some((8, 17)));
+    }
+
+    /// WMTS layers whose tile matrix sets are in another system (#769): swisstopo's LV95, its
+    /// corners east first, and one in longitude/latitude written latitude first (EPSG:4326): read
+    /// as matrices in the system, the layer's address asking for them by `{nm}`, `{ncol}`, `{nrow}`.
+    #[test]
+    fn wmts_layers_in_other_systems() {
+        let caps = r#"<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0"><Contents>
+<Layer><ows:Title>Map</ows:Title><ows:Identifier>map</ows:Identifier>
+ <ows:WGS84BoundingBox><ows:LowerCorner>5.1 45.4</ows:LowerCorner><ows:UpperCorner>11.5 48.2</ows:UpperCorner></ows:WGS84BoundingBox>
+ <Style isDefault="true"><ows:Identifier>default</ows:Identifier></Style>
+ <TileMatrixSetLink><TileMatrixSet>lv95</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/{Style}/{TileMatrixSet}/{TileMatrix}/{TileCol}/{TileRow}.png"/></Layer>
+<Layer><ows:Title>World</ows:Title><ows:Identifier>world</ows:Identifier>
+ <TileMatrixSetLink><TileMatrixSet>geo</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/w/{TileMatrix}/{TileRow}/{TileCol}.png"/></Layer>
+<Layer><ows:Title>Elsewhere</ows:Title><ows:Identifier>odd</ows:Identifier>
+ <TileMatrixSetLink><TileMatrixSet>odd</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/o/{TileMatrix}/{TileRow}/{TileCol}.png"/></Layer>
+<TileMatrixSet><ows:Identifier>lv95</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG:2056</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>21</ows:Identifier><ScaleDenominator>17857.142857142857</ScaleDenominator><TopLeftCorner>2420000.0 1350000.0</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>375</MatrixWidth><MatrixHeight>250</MatrixHeight></TileMatrix>
+ <TileMatrix><ows:Identifier>20</ows:Identifier><ScaleDenominator>35714.28571428571</ScaleDenominator><TopLeftCorner>2420000.0 1350000.0</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>188</MatrixWidth><MatrixHeight>125</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+<TileMatrixSet><ows:Identifier>geo</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG::4326</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>279541132.0143589</ScaleDenominator><TopLeftCorner>90 -180</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>2</MatrixWidth><MatrixHeight>1</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+<TileMatrixSet><ows:Identifier>odd</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:IAU::49900</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>1000</ScaleDenominator><TopLeftCorner>0 0</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>1</MatrixWidth><MatrixHeight>1</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+</Contents></Capabilities>"#;
+        let s = parse("https://t.example.org/WMTSCapabilities.xml", caps.as_bytes()).unwrap();
+        let names: Vec<&str> = s.layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["map", "world"], "{:?}", s.notes);
+        assert!(s.notes.iter().any(|n| n.starts_with("1 layers have no tile matrix set")));
+        let read = |i: usize| {
+            let Offer::Tiles { template } = &s.layers[i].offer else { panic!() };
+            let filled = template.replace("{z}/{x}/{y}", "0/0/0");
+            let (base, _, w) = warp::Warp::parse(&filled).unwrap();
+            (base.to_string(), w)
+        };
+        let (base, w) = read(0);
+        assert_eq!(base, "https://t.example.org/default/lv95/{nm}/{ncol}/{nrow}.png");
+        assert_eq!((w.epsg, w.area), (2056, Some([5.1, 45.4, 11.5, 48.2])));
+        let warp::Grid::Tiles(ms) = &w.grid else { panic!() };
+        // Coarsest first; 10 m and 5 m pixels; east first.
+        assert_eq!(ms.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["20", "21"]);
+        assert!((ms[0].cell - 10.0).abs() < 1e-9 && (ms[1].cell - 5.0).abs() < 1e-9);
+        assert_eq!((ms[1].left, ms[1].top, ms[1].cols, ms[1].rows), (2_420_000.0, 1_350_000.0, 375, 250));
+        // Latitude first in the document: read as west, north; its cells in degrees.
+        let (base, w) = read(1);
+        assert_eq!(base, "https://t.example.org/w/{nm}/{nrow}/{ncol}.png");
+        let warp::Grid::Tiles(ms) = &w.grid else { panic!() };
+        assert_eq!((w.epsg, ms[0].left, ms[0].top), (4326, -180.0, 90.0));
+        assert!((ms[0].cell - 0.703_125).abs() < 1e-6, "{}", ms[0].cell);
+    }
+
+    /// A WMTS corner is read in EPSG's order even where the layer's box tips the guess the other
+    /// way (swisstopo's LV03 set: its box reaches a little west of the corner), and a
+    /// longitude/latitude corner written longitude first is read so.
+    #[test]
+    fn a_wmts_corner_follows_epsg_axis_order() {
+        let caps = r#"<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0"><Contents>
+<Layer><ows:Title>Map</ows:Title><ows:Identifier>map</ows:Identifier>
+ <ows:WGS84BoundingBox><ows:LowerCorner>5.140242 45.398181</ows:LowerCorner><ows:UpperCorner>11.47757 48.230651</ows:UpperCorner></ows:WGS84BoundingBox>
+ <TileMatrixSetLink><TileMatrixSet>21781_27</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/{TileMatrix}/{TileCol}/{TileRow}.png"/></Layer>
+<Layer><ows:Title>World</ows:Title><ows:Identifier>world</ows:Identifier>
+ <TileMatrixSetLink><TileMatrixSet>geo</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/w/{TileMatrix}/{TileRow}/{TileCol}.png"/></Layer>
+<TileMatrixSet><ows:Identifier>21781_27</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG:21781</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>14285714.285714287</ScaleDenominator><TopLeftCorner>420000.0 350000.0</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>1</MatrixWidth><MatrixHeight>1</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+<TileMatrixSet><ows:Identifier>geo</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG::4326</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>279541132.0143589</ScaleDenominator><TopLeftCorner>-180 90</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>2</MatrixWidth><MatrixHeight>1</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+</Contents></Capabilities>"#;
+        let s = parse("https://t.example.org/WMTSCapabilities.xml", caps.as_bytes()).unwrap();
+        let corner = |i: usize| {
+            let Offer::Tiles { template } = &s.layers[i].offer else { panic!() };
+            let (_, _, w) = warp::Warp::parse(&template.replace("{z}/{x}/{y}", "0/0/0")).unwrap();
+            let warp::Grid::Tiles(ms) = &w.grid else { panic!() };
+            (w.epsg, ms[0].left, ms[0].top)
+        };
+        assert_eq!(corner(0), (21781, 420_000.0, 350_000.0));
+        assert_eq!(corner(1), (4326, -180.0, 90.0));
+    }
+
+    /// A regional longitude/latitude WMTS corner whose numbers could be either way round: written
+    /// longitude first (`5 50`) as some services do, it misses the layer read latitude first and
+    /// is read longitude first; written latitude first (`50 5`) as the standard has it, it is kept,
+    /// both at 5° E, 50° N. A correct corner is kept even where the other reading would cover
+    /// more of the layer (`50 40` over lon 50..150, lat -60..40: 40° E, 50° N).
+    #[test]
+    fn a_regional_geographic_corner_is_read_by_its_layer() {
+        let caps = |corner: &str, lower: &str, upper: &str, scale: f64| {
+            format!(
+                r#"<Capabilities xmlns="http://www.opengis.net/wmts/1.0" xmlns:ows="http://www.opengis.net/ows/1.1" version="1.0.0"><Contents>
+<Layer><ows:Title>Europe</ows:Title><ows:Identifier>europe</ows:Identifier>
+ <ows:WGS84BoundingBox><ows:LowerCorner>{lower}</ows:LowerCorner><ows:UpperCorner>{upper}</ows:UpperCorner></ows:WGS84BoundingBox>
+ <TileMatrixSetLink><TileMatrixSet>geo</TileMatrixSet></TileMatrixSetLink>
+ <ResourceURL resourceType="tile" format="image/png" template="https://t.example.org/{{TileMatrix}}/{{TileRow}}/{{TileCol}}.png"/></Layer>
+<TileMatrixSet><ows:Identifier>geo</ows:Identifier><ows:SupportedCRS>urn:ogc:def:crs:EPSG::4326</ows:SupportedCRS>
+ <TileMatrix><ows:Identifier>0</ows:Identifier><ScaleDenominator>{scale}</ScaleDenominator><TopLeftCorner>{corner}</TopLeftCorner><TileWidth>256</TileWidth><TileHeight>256</TileHeight><MatrixWidth>1</MatrixWidth><MatrixHeight>1</MatrixHeight></TileMatrix>
+</TileMatrixSet>
+</Contents></Capabilities>"#
+            )
+        };
+        let europe = ("5 40", "15 50", 15_902_784.0);
+        let wide = ("50 -60", "150 40", 155_300_628.896_866);
+        for (written, (lower, upper, scale), at) in
+            [("5 50", europe, (5.0, 50.0)), ("50 5", europe, (5.0, 50.0)), ("50 40", wide, (40.0, 50.0))]
+        {
+            let s = parse("https://t.example.org/WMTSCapabilities.xml", caps(written, lower, upper, scale).as_bytes()).unwrap();
+            let Offer::Tiles { template } = &s.layers[0].offer else { panic!() };
+            let (_, _, w) = warp::Warp::parse(&template.replace("{z}/{x}/{y}", "0/0/0")).unwrap();
+            let warp::Grid::Tiles(ms) = &w.grid else { panic!() };
+            assert_eq!((ms[0].left, ms[0].top), at, "{written}");
+        }
+    }
+
     #[test]
     fn wms_layers_in_web_mercator() {
         let xml = r#"<?xml version="1.0"?><WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
@@ -2924,20 +4755,41 @@ mod tests {
   <Layer><Name>roads</Name><Title>Roads</Title><EX_GeographicBoundingBox><westBoundLongitude>-10</westBoundLongitude><eastBoundLongitude>20</eastBoundLongitude><southBoundLatitude>35</southBoundLatitude><northBoundLatitude>60</northBoundLatitude></EX_GeographicBoundingBox></Layer>
   <Layer><Name>water bodies</Name></Layer>
 </Layer>
-<Layer><Name>utm only</Name><CRS>EPSG:32633</CRS></Layer></Capability></WMS_Capabilities>"#;
+<Layer><Name>utm only</Name><CRS>EPSG:32633</CRS><BoundingBox CRS="EPSG:32633" minx="500000" miny="5200000" maxx="700000" maxy="5400000"/></Layer>
+<Layer><Name>automatic</Name><CRS>AUTO:42001</CRS></Layer></Capability></WMS_Capabilities>"#;
         let s = parse("https://maps.example.org/wms", xml.as_bytes()).unwrap();
         assert_eq!((s.kind.as_str(), s.title.as_str()), ("WMS", "Demo WMS"));
         let names: Vec<&str> = s.layers.iter().map(|l| l.name.as_str()).collect();
-        assert!(names.contains(&"roads") && names.contains(&"water bodies") && !names.contains(&"utm only"), "{names:?}");
+        assert!(names.contains(&"roads") && names.contains(&"water bodies") && !names.contains(&"automatic"), "{names:?}");
         let roads = s.layers.iter().find(|l| l.name == "roads").unwrap();
         assert_eq!(roads.bbox, Some([-10.0, 35.0, 20.0, 60.0]));
         let Offer::Tiles { template } = &roads.offer else { panic!() };
         assert_eq!(
             template,
-            "https://maps.example.org/wms?map=demo&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=roads&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng&TRANSPARENT=TRUE"
+            "https://maps.example.org/wms?map=demo&SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=roads&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng&TRANSPARENT=TRUE\
+             #rustgis-warp={z}/{x}/{y};crs=3857;in=-10,35,20,60;sys=4326|n|EPSG:4326;map=east"
         );
+        // Drawn in Web Mercator as it comes; its other system (latitude first, WMS 1.3.0's
+        // EPSG:4326) kept for a map drawn in it.
+        let tile = |t: &str| t.replace("{z}/{x}/{y}", "0/0/0");
+        let roads_tile = tile(template);
+        let (base, _, w) = warp::Warp::parse(&roads_tile).unwrap();
+        let base = base.to_string();
+        assert!(w.epsg == 3857 && base.contains("CRS=EPSG:3857&BBOX={bbox-epsg-3857}&"));
+        assert_eq!(w.systems, [warp::System { epsg: 4326, name: "EPSG:4326".into(), lat_first: true }]);
+        assert!(warp::Warp::map_template(&base).contains("&CRS={ncrs}&BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}&"));
         let water = s.layers.iter().find(|l| l.name == "water bodies").unwrap();
         assert!(matches!(&water.offer, Offer::Tiles { template } if template.contains("LAYERS=water%20bodies")));
+        // A layer offered only in UTM: in UTM, warped (east first, as its own box says).
+        let utm = s.layers.iter().find(|l| l.name == "utm only").unwrap();
+        let Offer::Tiles { template } = &utm.offer else { panic!() };
+        let filled = tile(template);
+        let (base, _, w) = warp::Warp::parse(&filled).unwrap();
+        assert!(base.contains("&CRS={ncrs}&BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}&"), "{base}");
+        assert_eq!((w.epsg, &w.grid), (32633, &warp::Grid::Map { lat_first: false }));
+        // Its identify asks in UTM too.
+        assert_eq!(utm.feature_info.as_ref().map(|f| f.crs.as_str()), Some("EPSG:32633"));
+        // One in a system RustGIS can't draw is left out, and said so.
         assert!(s.notes.iter().any(|n| n.contains("1 layers")));
     }
 
@@ -3242,15 +5094,233 @@ mod tests {
         let s = parse("https://gibs.example.org/wmts/1.0.0/WMTSCapabilities.xml", listed.as_bytes()).unwrap();
         assert_eq!(s.layers[2].time.as_ref().map(|t| t.default.as_str()), Some("2020-02-01"));
         // The latest of many listed times, past the few kept.
-        let many: String = (0..100).map(|i| format!("<Value>{}-01-01</Value>", 1900 + i)).collect();
+        let many: String = (0..MAX_TIME_VALUES + 100).map(|i| format!("<Value>{}-01-01</Value>", 1000 + i)).collect();
         let late = GIBS.replace("<Default>../../x?y</Default>", &many);
         let s = parse("https://gibs.example.org/wmts/1.0.0/WMTSCapabilities.xml", late.as_bytes()).unwrap();
         let t = s.layers[2].time.as_ref().unwrap();
-        assert_eq!((t.default.as_str(), t.values.len()), ("1999-01-01", MAX_TIME_VALUES));
+        assert_eq!((t.default.as_str(), t.values.len()), ("2099-01-01", MAX_TIME_VALUES));
         assert!(checked_time("2024-06-01").is_ok() && checked_time("2024-06-01T10:00:00Z").is_ok());
         assert!(checked_time("default").is_ok() && checked_time("current").is_ok());
         for bad in ["", "..", ".", "../x", "2024-06-01/../..", "a b", "x?y=1", "latest", &"9".repeat(50)] {
             assert!(checked_time(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// WMS layers with a time dimension (WMS 1.3.0 Annex C, as swisstopo's: years listed, a range
+    /// by years, `99991231` for the latest): its GetMap template takes `{Time}`, at the default
+    /// given (any value `TIME` takes, a range too), else the latest listed; a sublayer inherits
+    /// its parent's.
+    #[test]
+    fn wms_time_dimensions() {
+        let layer = |name: &str, dim: &str| {
+            format!(r#"<Layer queryable="1"><Name>{name}</Name><Title>{name}</Title><CRS>EPSG:3857</CRS>{dim}</Layer>"#)
+        };
+        let dim = |attributes: &str, values: &str| format!(r#"<Dimension name="time" units="ISO8601" {attributes}>{values}</Dimension>"#);
+        let parent = format!(
+            "<Layer><Name>series</Name><Title>Series</Title><CRS>EPSG:3857</CRS>{}{}</Layer>",
+            dim(r#"default="2020""#, "2000,2010,2020"),
+            layer("part", "")
+        );
+        let layers = [
+            layer("population", &dim(r#"default="2025" nearestValue="0""#, "1990, 2000,2025")),
+            layer("strips", &dim(r#"default="2005/2025""#, "2005/2025")),
+            layer("oblique", &dim("", "1927,1950,2004")),
+            layer("photos", &dim(r#"default="99991231""#, "19291231,19341231,99991231")),
+            layer("several", &dim(r#"default="2010" multipleValues="1""#, "1990/2020/P10Y")),
+            layer("bad", &dim(r#"default="../x""#, "")),
+            layer("plain", ""),
+            parent,
+        ]
+        .concat();
+        let caps = format!(
+            r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms"><Service><Title>Maps</Title></Service><Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="https://maps.example.org/wms?"/></Get></HTTP></DCPType></GetMap></Request><Layer><Title>Root</Title>{layers}</Layer></Capability></WMS_Capabilities>"#
+        );
+        let url = "https://maps.example.org/wms?SERVICE=WMS&REQUEST=GetCapabilities";
+        let s = parse(url, caps.as_bytes()).unwrap();
+        let time = |name: &str| {
+            let l = s.layers.iter().find(|l| l.name == name).unwrap_or_else(|| panic!("{name}: {:?}", s.layers));
+            let Offer::Tiles { template } = &l.offer else { panic!("{name}") };
+            assert_eq!(template.ends_with("&TIME={Time}"), l.time.is_some(), "{name}: {template}");
+            l.time.clone()
+        };
+        let population = time("population").unwrap();
+        assert_eq!(
+            (population.default.as_str(), population.values.as_slice(), population.multiple),
+            ("2025", &["1990", "2000", "2025"].map(String::from)[..], false)
+        );
+        // The service's default as it gives it, a range too.
+        assert_eq!(time("strips").map(|t| t.default), Some("2005/2025".into()));
+        // No default: the latest listed.
+        assert_eq!(time("oblique").map(|t| t.default), Some("2004".into()));
+        assert_eq!(time("photos").map(|t| t.default), Some("99991231".into()));
+        assert!(time("several").unwrap().multiple);
+        // A default that isn't a time, and no time listed: no time, as for WMTS.
+        assert_eq!(time("bad"), None);
+        assert_eq!(time("plain"), None);
+        assert_eq!(time("series").map(|t| t.default), Some("2020".into()));
+        assert_eq!(time("part"), time("series"), "inherited");
+        // WMS 1.1.1: the parent declares the dimension, the layer gives its extent.
+        let old = caps.replace(r#"version="1.3.0""#, r#"version="1.1.1""#).replace("<CRS>", "<SRS>").replace("</CRS>", "</SRS>").replace(
+            r#"<Dimension name="time" units="ISO8601" default="2025" nearestValue="0">1990, 2000,2025</Dimension>"#,
+            r#"<Dimension name="time" units="ISO8601"/><Extent name="time" default="2000">1990,2000</Extent>"#,
+        );
+        let s = parse(url, old.as_bytes()).unwrap();
+        let population = s.layers.iter().find(|l| l.name == "population").unwrap();
+        assert_eq!(population.time.as_ref().map(|t| t.default.as_str()), Some("2000"));
+        // What TIME takes (WMS 1.3.0 Table C.2): a time, a list, an interval with its resolution or
+        // not; never a path or another parameter.
+        for good in ["2024-06-01", "1990, 2000", "1990/2020", "1952/2026/P1Y", "2017-08-31T23:59:59Z/current/P1M", "1990,2000/2010"] {
+            assert!(checked_wms_time(good).is_ok(), "{good}");
+        }
+        assert_eq!(checked_wms_time(" 1990, 2000 "), Ok("1990,2000".into()));
+        assert_eq!(checked_wms_time("1990/ 2000 / P1Y, 2010"), Ok("1990/2000/P1Y,2010".into()));
+        for good in ["P1DT12H", "PT30M", "PT0.5S", "P2W", "P1Y2M3D"] {
+            assert!(is_duration(good), "{good}");
+        }
+        for bad in ["Pfoo", "P", "PT", "P1YT", "P1D1Y", "P1.5Y", "P.5D", "PT1H1H", "P1Q", "PT1..2S", "PT1.2.3S"] {
+            assert!(!is_duration(bad), "{bad}");
+        }
+        for bad in [
+            "",
+            "1990,",
+            "/",
+            "1990/",
+            "1990/2000/2010",
+            "1990/2000/P",
+            "1990/2000/Pfoo",
+            "1990/2000/P1Y/x",
+            "../x",
+            "1990&LAYERS=x",
+            &"1990,".repeat(300),
+        ] {
+            assert!(checked_wms_time(bad).is_err(), "{bad}");
+        }
+        // A sublayer's own dimension replaces its parent's, even one that gives no time.
+        let broken = caps.replace(
+            "<Name>part</Name><Title>part</Title><CRS>EPSG:3857</CRS>",
+            r#"<Name>part</Name><Title>part</Title><CRS>EPSG:3857</CRS><Dimension name="time" units="ISO8601" default="../x">..</Dimension>"#,
+        );
+        let s = parse(url, broken.as_bytes()).unwrap();
+        assert_eq!(s.layers.iter().find(|l| l.name == "part").unwrap().time, None);
+        // An empty one too (WMS 1.3.0); in WMS 1.1.1 a `Dimension` alone declares the one inherited.
+        let empty = caps.replace(
+            "<Name>part</Name><Title>part</Title><CRS>EPSG:3857</CRS>",
+            r#"<Name>part</Name><Title>part</Title><CRS>EPSG:3857</CRS><Dimension name="time" units="ISO8601"/>"#,
+        );
+        assert_eq!(parse(url, empty.as_bytes()).unwrap().layers.iter().find(|l| l.name == "part").unwrap().time, None);
+        let declared = empty.replace(r#"version="1.3.0""#, r#"version="1.1.1""#).replace("<CRS>", "<SRS>").replace("</CRS>", "</SRS>");
+        let s = parse(url, declared.as_bytes()).unwrap();
+        assert_eq!(s.layers.iter().find(|l| l.name == "part").unwrap().time.as_ref().map(|t| t.default.as_str()), Some("2020"));
+        // A parent's many times, inherited by a great many layers, aren't kept for each.
+        let many: String = (0..1000).map(|i| format!("{},", 1000 + i)).collect();
+        let children: String = (0..1500).map(|i| layer(&format!("child{i}"), "")).collect();
+        let crowd = format!(
+            r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms"><Capability><Layer><Title>Root</Title><CRS>EPSG:3857</CRS>{}{children}</Layer></Capability></WMS_Capabilities>"#,
+            dim(r#"default="1999""#, many.trim_end_matches(','))
+        );
+        let s = parse(url, crowd.as_bytes()).unwrap();
+        let kept: usize = s.layers.iter().filter_map(|l| l.time.as_ref()).map(|t| t.values.len()).sum();
+        assert!(s.layers.len() == 1500 && kept == MAX_DOCUMENT_TIME_VALUES, "{} layers, {kept} values", s.layers.len());
+        assert!(s.layers.iter().all(|l| l.time.as_ref().is_some_and(|t| t.default == "1999")));
+        // A GetMap address that carries a TIME of its own (or other GetMap parameters) gives the
+        // template one TIME, the layer's.
+        let carried = caps.replace("https://maps.example.org/wms?", "https://maps.example.org/wms?map=m&amp;TIME=2000&amp;");
+        let s = parse(url, carried.as_bytes()).unwrap();
+        let Offer::Tiles { template } = &s.layers.iter().find(|l| l.name == "population").unwrap().offer else { panic!() };
+        assert!(template.starts_with("https://maps.example.org/wms?map=m&SERVICE=WMS&"), "{template}");
+        assert_eq!(template.matches("TIME=").count(), 1, "{template}");
+        // GetFeatureInfo at the template's time; none for a layer without one, and before a fragment.
+        let request = "https://maps.example.org/wms?REQUEST=GetFeatureInfo".to_string();
+        assert_eq!(
+            at_map_time(request.clone(), "https://maps.example.org/wms?LAYERS=x&TIME=1990%2F2000"),
+            format!("{request}&TIME=1990%2F2000")
+        );
+        assert_eq!(at_map_time(request.clone(), "https://maps.example.org/wms?LAYERS=x"), request);
+        assert_eq!(at_map_time(request.clone(), "https://maps.example.org/wms?LAYERS=x&TIME=../x"), request);
+        assert_eq!(at_map_time(format!("{request}#v"), "https://maps.example.org/wms?TIME=1990"), format!("{request}&TIME=1990#v"));
+        // Filled where `{Time}` is a query value, encoded; in a path, as it is.
+        assert_eq!(
+            with_time("https://a.example/wms?LAYERS=x&TIME={Time}", "2024-06-01T10:00:00+02:00/2024-06-02"),
+            "https://a.example/wms?LAYERS=x&TIME=2024-06-01T10:00:00%2B02:00%2F2024-06-02"
+        );
+        assert_eq!(with_time("https://a.example/{Time}/{z}/{x}/{y}.png", "2024-06-01"), "https://a.example/2024-06-01/{z}/{x}/{y}.png");
+    }
+
+    /// A layer's times on the time slider, in the forms swisstopo's WMS and NASA's WMTS list them:
+    /// the format they are written in (filled back to the very text listed), and steps: a period
+    /// regular ones, a list (ranges in it too) dated ones, the latest's stand-ins left out.
+    #[test]
+    fn layer_times_on_the_time_slider() {
+        use crate::time::{Unit, fill_template, parse_text};
+        let lt = |default: &str, values: &[&str]| LayerTime {
+            default: default.into(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+            multiple: false,
+        };
+        let ms = |t: &str| parse_text(t).unwrap();
+        let every = |start: &str, end: &str, unit, interval| SliderSteps::Every { start: ms(start), end: ms(end), unit, interval };
+        // swisstopo's national map, a year at a time.
+        let map = lt("2026", &["1952/2026/P1Y"]).slider().unwrap();
+        assert_eq!((map.format, &map.steps, map.at), ("YYYY", &every("1952-01-01", "2026-01-01", Unit::Year, 1), Some(ms("2026-01-01"))));
+        // A range without a period: by the unit its times name.
+        assert_eq!(lt("1915", &["1870/1949"]).slider().unwrap().steps, every("1870-01-01", "1949-01-01", Unit::Year, 1));
+        // NASA GIBS, day by day.
+        let gibs = lt("2024-06-02", &["2000-02-24/2024-06-02/P1D"]).slider().unwrap();
+        assert_eq!((gibs.format, gibs.steps), ("YYYY-MM-DD", every("2000-02-24", "2024-06-02", Unit::Day, 1)));
+        // Years listed, a range among them.
+        let settled = lt("2025", &["1919", "1950", "2019/2025"]).slider().unwrap();
+        let years = |ys: &[i32]| SliderSteps::Dates(ys.iter().map(|y| ms(&format!("{y}-01-01"))).collect());
+        assert_eq!(settled.steps, years(&[1919, 1950, 2019, 2020, 2021, 2022, 2023, 2024, 2025]));
+        // Aerial photos by compact dates, the latest's stand-in left out (and no default to start at).
+        let photos = lt("99991231", &["19291231", "19341231", "99991231"]).slider().unwrap();
+        assert_eq!(
+            (photos.format, &photos.steps, photos.at),
+            ("YYYYMMDD", &SliderSteps::Dates(vec![ms("1929-12-31"), ms("1934-12-31")]), Some(ms("1934-12-31")))
+        );
+        // Date-times, filled back to exactly the times listed (the service takes no other).
+        let ndvi = lt("2026-08-31T23:59:59Z", &["2025-08-31T23:59:59Z", "2026-08-31T23:59:59Z"]).slider().unwrap();
+        assert_eq!(ndvi.format, "YYYY-MM-DD[T]HH:mm:ss[Z]");
+        for (st, listed) in [(&ndvi, "2026-08-31T23:59:59Z"), (&photos, "19341231"), (&map, "2026")] {
+            let at = match &st.steps {
+                SliderSteps::Dates(d) => *d.last().unwrap(),
+                SliderSteps::Every { end, .. } => *end,
+            };
+            assert_eq!(
+                fill_template(&format!("https://wms.example.org/?TIME={{date:{}}}", st.format), at),
+                format!("https://wms.example.org/?TIME={listed}")
+            );
+        }
+        // Month ends in a list stay month ends; times with milliseconds (GeoServer's, ncWMS's).
+        let months = lt("2024-04-30", &["2023-12-31", "2024-01-31/2024-04-30/P1M"]).slider().unwrap();
+        let days = |ds: &[&str]| SliderSteps::Dates(ds.iter().map(|d| ms(d)).collect());
+        assert_eq!(months.steps, days(&["2023-12-31", "2024-01-31", "2024-02-29", "2024-03-31", "2024-04-30"]));
+        let geoserver = lt("2024-01-03T00:00:00.000Z", &["2024-01-01T00:00:00.000Z/2024-01-03T00:00:00.000Z/P1D"]).slider().unwrap();
+        assert_eq!(geoserver.format, "YYYY-MM-DD[T]HH:mm:ss[.000Z]");
+        assert_eq!(geoserver.steps, every("2024-01-01", "2024-01-03", Unit::Day, 1));
+        assert_eq!(fill_template("TIME={date:YYYY-MM-DD[T]HH:mm:ss[.000Z]}", ms("2024-01-02")), "TIME=2024-01-02T00:00:00.000Z");
+        // A range longer than the slider's steps: every second (fourth…) day of it, to its end.
+        let long = lt("2025-01-01", &["1950-01-01/2025-01-01/P1D"]).slider().unwrap();
+        assert_eq!(long.steps, every("1950-01-01", "2025-01-01", Unit::Day, 2));
+        // Of a list longer than is read, the latest (and the default) still.
+        let read: Vec<String> = (0..MAX_TIMES_READ + 500).map(|i| format!("{}", 1000 + i)).collect();
+        assert_eq!(last(read, MAX_TIMES_READ).last().map(String::as_str), Some("21499"));
+        // Of a long list, the latest are kept, those the default is among.
+        let all: Vec<String> = (0..1500).map(|i| format!("{}", 1000 + i)).collect();
+        let listed = layer_time(None, all, checked_wms_time, false).unwrap();
+        assert_eq!((listed.default.as_str(), listed.values.len(), listed.values[0].as_str()), ("2499", MAX_TIME_VALUES, "1500"));
+        // No dates to step to: one time (a name, a date), or none listed.
+        assert_eq!(lt("current", &["current"]).slider(), None);
+        assert_eq!(lt("1946", &["1946"]).slider(), None);
+        assert!(!lt("current", &["current"]).changes());
+        assert!(!lt("1946", &["1946"]).changes());
+        assert!(!lt("2024", &[]).changes());
+        assert!(lt("2026", &["1952/2026/P1Y"]).changes() && lt("current", &["current", "2025"]).changes());
+        assert_eq!(lt("2024", &[]).slider(), None);
+        assert_eq!(lt("2024", &["2024/2020"]).slider(), None);
+        assert_eq!(period_step("PT6H"), Some((Unit::Hour, 6)));
+        assert_eq!(period_step("P2W"), Some((Unit::Day, 14)));
+        for bad in ["P", "PT", "P0Y", "P1S", "PT1D", "1Y", "P1.5Y"] {
+            assert_eq!(period_step(bad), None, "{bad}");
         }
     }
 

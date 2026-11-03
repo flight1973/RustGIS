@@ -63,7 +63,8 @@ fn write_at(path: &Path, key: &str, value: &str) -> Result<(), String> {
         .map_err(|error| format!("could not save preferences: {error}"))
 }
 
-/// Opts a native caller into the desktop's saved connections and lazy credential store.
+/// Opts a native caller into the desktop's saved connections and lazy credential store, which
+/// also keeps the Earthdata Login token remembered on this computer.
 /// Constructing the store and loading connection definitions never reads a credential.
 /// Both preference failures and once-only store failures use the caller's diagnostic sink.
 /// Returns the same preference snapshot for assistant provider/key selection.
@@ -79,7 +80,9 @@ pub fn opt_in(
     let store = Reporting::new(store, move |error| {
         warn(format!("saved secrets can't be used ({error}); going on without them"));
     });
-    use_saved_secrets(s, &prefs, Arc::new(store));
+    let store: Arc<dyn SecretStore> = Arc::new(store);
+    crate::render::rustgis_tiles::earthdata::set_secret_store(Some(store.clone()));
+    use_saved_secrets(s, &prefs, store);
     prefs
 }
 

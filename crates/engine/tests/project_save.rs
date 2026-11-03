@@ -69,3 +69,30 @@ fn failed_save_as_preserves_project_state_and_a_later_save_succeeds() -> Result<
     }
     std::fs::remove_dir_all(root).map_err(|e| e.to_string())
 }
+
+#[test]
+fn project_from_newer_rustgis_reports_update_message() {
+    let json = serde_json::json!({
+        "format": 9999,
+        "name": "future project"
+    })
+    .to_string();
+    let err = Project::from_json(&json).unwrap_err();
+    assert!(err.contains("saved by a newer RustGIS"));
+    assert!(err.contains("Update RustGIS to open it"));
+}
+
+#[test]
+fn project_with_unknown_variant_suggests_newer_version() {
+    let json = serde_json::json!({
+        "format": 1,
+        "name": "project with unknown enum variant",
+        "maps": [{
+            "name": "Map",
+            "projection": "FutureProjectionVariant"
+        }]
+    })
+    .to_string();
+    let err = Project::from_json(&json).unwrap_err();
+    assert!(err.contains("may have been saved by a newer RustGIS") || err.contains("Update RustGIS to open it"));
+}

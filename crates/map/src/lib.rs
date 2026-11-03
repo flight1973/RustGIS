@@ -8,8 +8,10 @@ pub mod design;
 pub mod effects;
 pub mod fills;
 pub mod geolibre;
+mod geometry_kinds;
 pub mod globe;
 pub mod graphics;
+pub mod label_by;
 pub mod layout;
 pub mod lod;
 pub mod palette;
@@ -21,6 +23,7 @@ pub mod qgis;
 pub mod raster;
 pub mod report;
 pub mod source;
+pub mod symbol_by;
 pub mod symbology;
 pub mod tiles;
 pub mod time;
@@ -33,8 +36,8 @@ pub use color::{Ramp, RampGroup, Rgba};
 pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
-    ClassMethod, FontName, Glyph, LabelBackground, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap, LineJoin,
-    LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
+    ClassMethod, Classer, FontName, Glyph, LabelBackground, LabelClass, LabelKey, LabelMatcher, LabelPlacement, Labeling, LineCap,
+    LineJoin, LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
 
@@ -94,6 +97,16 @@ impl Basemap {
             Basemap::Blank => (Rgba::rgb(0xFF, 0xFF, 0xFF), Rgba::rgb(0xFF, 0xFF, 0xFF), Rgba::new(0, 0, 0, 0), Rgba::new(0, 0, 0, 0)),
         }
     }
+}
+
+/// How No Fill hid a layer's polygon fills ([`Layer::no_fill`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoFill {
+    /// One transparent fill over every symbol: on streamed layers and layers with points or lines,
+    /// whose symbols those share.
+    Override,
+    /// Every symbol's fill made transparent.
+    Symbols,
 }
 
 /// A layer: a dataset drawn with a renderer and labels.
@@ -156,6 +169,10 @@ pub struct Layer {
     /// [`fills::FillLayer`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "fills::de_fills")]
     pub fill_layers: Vec<fills::FillLayer>,
+    /// How No Fill hides the polygon fills, while it is on: a new symbology, a fill colour or a
+    /// fill in the symbol's colour shows them again. A fill colour chosen transparent isn't this.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_no_fill")]
+    pub no_fill: Option<NoFill>,
     /// Draws the stacked strokes in levels (symbol levels): every feature's strokes of one
     /// [`LineStroke::level`] before any of the next, so road casings join under the cores
     /// instead of cutting across them where lines meet.
@@ -165,6 +182,10 @@ pub struct Layer {
     /// field, as QGIS's data-defined symbol angle does.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "symbology::de_marker_rotation")]
     pub marker_rotation: Option<symbology::MarkerRotation>,
+    /// Its symbol's size, colours, outline width and marker angle per feature, each by an
+    /// expression (none set: the renderer's symbol alone); drawn through [`Layer::styler`].
+    #[serde(default, skip_serializing_if = "symbol_by::SymbolBy::is_empty", deserialize_with = "symbol_by::de_symbol_by")]
+    pub symbol_by: symbol_by::SymbolBy,
     /// The scale (1:N) its symbol and label sizes are set for: drawn at another scale they grow
     /// and shrink with the map, as on paper (QGIS's reference scale). `None`: they keep their
     /// size on screen.
@@ -196,6 +217,15 @@ pub struct Layer {
     /// Shared, like the features: an undo snapshot or other copy of the layer doesn't copy it.
     #[serde(skip)]
     projected: std::sync::Arc<Vec<Option<Geometry>>>,
+    /// The active Mercator display level; full projection stays lazy for interaction.
+    #[serde(skip)]
+    display: Option<std::sync::Arc<lod::Display>>,
+    /// Recent unsuccessful display attempts, keyed by their geometry, level and budget inputs.
+    #[serde(skip)]
+    display_rejected: Vec<lod::Rejected>,
+    /// Recent display levels, shared by snapshots and bounded together with `thinned`.
+    #[serde(skip)]
+    display_levels: Vec<std::sync::Arc<lod::Display>>,
     /// Each projected geometry's extent, for culling without walking its vertices.
     #[serde(skip)]
     projected_extents: std::sync::Arc<Vec<Extent>>,
@@ -214,6 +244,9 @@ pub struct Layer {
     /// Allocation identities and byte totals, shared with render snapshots without retaining rows.
     #[serde(skip)]
     view_memory: view_memory::Cache,
+    /// Geometry families in the current rows, invalidated by copy-on-write edits and window reads.
+    #[serde(skip)]
+    geometry_kinds: geometry_kinds::Cache,
     /// Bumped whenever geometry changes so caches rebuild.
     #[serde(default)]
     pub geometry_rev: u64,
@@ -317,6 +350,8 @@ impl Layer {
         if let Some(info) = src.info() {
             self.dataset.fields = info.fields.clone();
             self.dataset.crs = info.coordinate_system();
+            // The new source's Z and M, which reading it drops (see `Dataset::zm_dropped`).
+            self.dataset.zm_dropped = info.zm_dropped;
         }
         self.dataset.source = src.linked_file().map(String::from);
         self.source = Some(src);
@@ -357,8 +392,10 @@ impl Layer {
             extrusion: None,
             line_strokes: Vec::new(),
             fill_layers: Vec::new(),
+            no_fill: None,
             stroke_levels: false,
             marker_rotation: None,
+            symbol_by: Default::default(),
             reference_scale: None,
             priority: 0,
             design: design::Design::default(),
@@ -367,6 +404,9 @@ impl Layer {
             postgis: None,
             gpkg: None,
             projected: Default::default(),
+            display: None,
+            display_rejected: Vec::new(),
+            display_levels: Vec::new(),
             projected_extents: Default::default(),
             projected_vertices: 0,
             thinned: Default::default(),
@@ -374,6 +414,7 @@ impl Layer {
             projected_for: String::new(),
             geometry_rev: 0,
             view_memory: Default::default(),
+            geometry_kinds: Default::default(),
         }
     }
 
@@ -446,6 +487,12 @@ impl Layer {
         {
             self.dataset.fields = info.fields.clone();
         }
+        // An opened source's dropped Z or M values, for a project saved without the mark. Added to,
+        // not replaced: a source that couldn't tell (a check that timed out) mustn't clear a mark the
+        // project kept, and a stale one gives one notice too many rather than one too few.
+        if let Some(info) = self.source.as_ref().and_then(|s| s.info()) {
+            self.dataset.zm_dropped |= info.zm_dropped;
+        }
         let Some(src) = &mut self.source else { return false };
         src.window_fields = Some(self.dataset.fields.len());
         // A failed read leaves nothing drawn for it (its error shows in Layers), not the
@@ -510,15 +557,57 @@ impl Layer {
 
     /// Allocated row, projected-geometry, extent and optional display storage for this layer.
     /// Snapshots report the same shared allocations; totals are memoized until mutable access
-    /// changes an allocation identity, including edits through the public dataset API.
+    /// changes an allocation identity, including edits through the public dataset API. Stale
+    /// allocations still count until the next preparation or explicit cache clear releases them.
     pub fn view_cache_bytes(&self) -> usize {
-        self.view_memory.total(&self.dataset.features, &self.projected, &self.projected_extents, &self.thinned)
+        self.view_memory
+            .total(&self.dataset.features, &self.projected, &self.projected_extents, &self.thinned)
+            .saturating_add(self.display_levels.iter().map(|d| d.bytes).sum::<usize>())
     }
 
     /// Every feature of a streamed layer's source (up to the read limit), for tools and for
     /// loading the layer into memory.
     pub fn load_all(&self) -> Result<Dataset, String> {
-        let Some(src) = &self.source else { return Ok(self.dataset.clone()) };
+        self.load_all_counted().map(|(ds, _)| ds)
+    }
+
+    /// [`Layer::load_all`], with the number of rows of the source that couldn't be read.
+    pub fn load_all_counted(&self) -> Result<(Dataset, usize), String> {
+        let Some(copy) = self.open_source()? else { return Ok((self.dataset.clone(), 0)) };
+        let (mut ds, report) = copy.read_all()?;
+        ds.name = self.dataset.name.clone();
+        // (A project that lists no fields keeps the source's, as `sync_source` gives it.)
+        if !self.dataset.fields.is_empty() {
+            ds.fields = self.dataset.fields.clone();
+        }
+        ds.source = self.dataset.source.clone();
+        Ok((ds, report.skipped))
+    }
+
+    /// A streamed layer's source, to export whole a chunk at a time, with a dataset of no
+    /// features naming them as [`Layer::load_all`] would. `None` for a layer not
+    /// read in place, or whose source can't be read so (one by its web address).
+    pub fn chunk_export(&self) -> Result<Option<(std::sync::Arc<dyn rustgis_data::source::FeatureSource>, Dataset)>, String> {
+        let Some(copy) = self.open_source()? else { return Ok(None) };
+        let Some(src) = copy.visit_source() else { return Ok(None) };
+        let info = src.info();
+        let mut ds = Dataset::new(self.dataset.name.clone(), info.geometry_type, info.fields.clone());
+        ds.crs = info.coordinate_system();
+        // What reading the source drops, the export lacks (see `Dataset::zm_dropped`).
+        ds.zm_dropped = info.zm_dropped || self.dataset.zm_dropped;
+        if !self.dataset.fields.is_empty() {
+            ds.fields = self.dataset.fields.clone();
+        }
+        // (A source declaring no geometry type takes its first geometry's when exported, as a
+        // whole read does.)
+        ds.source = self.dataset.source.clone();
+        Ok(Some((src, ds)))
+    }
+
+    /// A copy of a streamed layer's source, opened (waiting for one still opening, as an export
+    /// does); `None` for a layer not read in place.
+    fn open_source(&self) -> Result<Option<source::SourceLayer>, String> {
+        let Some(src) = &self.source else { return Ok(None) };
         let mut copy = src.clone();
         if !copy.is_open() {
             copy.open()?;
@@ -532,23 +621,7 @@ impl Layer {
                     .unwrap_or_else(|| "the layer's source is still opening: try again once it has opened".into()));
             }
         }
-        let (mut ds, _) = copy.read_all()?;
-        // A sample isn't all of them: refuse rather than run a tool on part of the data.
-        let max = rustgis_data::source::MAX_LIMIT;
-        if let Some(n) = copy.info().and_then(|i| i.count).filter(|n| (ds.features.len() as u64) < *n && *n > max as u64) {
-            return Err(format!("the layer has {n} features, more than the {max} read at once"));
-        }
-        // A count the source doesn't know, and a read that hit the limit: maybe not all of them.
-        if copy.info().is_some_and(|i| i.count.is_none()) && ds.features.len() >= max {
-            return Err(format!("the layer has more features than the {max} read at once"));
-        }
-        ds.name = self.dataset.name.clone();
-        // (A project that lists no fields keeps the source's, as `sync_source` gives it.)
-        if !self.dataset.fields.is_empty() {
-            ds.fields = self.dataset.fields.clone();
-        }
-        ds.source = self.dataset.source.clone();
-        Ok(ds)
+        Ok(Some(copy))
     }
 
     /// The symbol a row draws with.
@@ -561,6 +634,13 @@ impl Layer {
     pub fn marker_turn(&self, row: usize) -> f32 {
         let Some(r) = self.marker_rotation.as_ref().filter(|_| !self.graphics) else { return 0.0 };
         r.turn(&self.dataset, row)
+    }
+
+    /// Its per-row style for one drawing at the map scale 1:`map_scale` (none: no map, as in an
+    /// export of the features): [`Layer::symbol`] and the rest with [`Layer::symbol_by`]'s
+    /// expressions applied, compiled once here.
+    pub fn styler(&self, map_scale: Option<f64>) -> symbol_by::Styler<'_> {
+        symbol_by::Styler::new(self, map_scale)
     }
 
     /// The stacked strokes a line feature row is drawn with: its class's own
@@ -627,6 +707,16 @@ impl Layer {
         (symbol, strokes.unwrap_or(&self.line_strokes), fills.unwrap_or(&self.fill_layers))
     }
 
+    /// [`Layer::style_and_fills`] with its renderer's class expression compiled (`c`, from
+    /// [`Renderer::classer`]), as a drawing of many features takes it.
+    pub fn style_and_fills_with(&self, row: usize, c: &Classer) -> (Symbol, &[LineStroke], &[fills::FillLayer]) {
+        if self.graphics || self.renderer.expression().is_none() {
+            return self.style_and_fills(row);
+        }
+        let (symbol, strokes, fills) = self.renderer.style_fills_with(&self.dataset, row, c);
+        (symbol, strokes.unwrap_or(&self.line_strokes), fills.unwrap_or(&self.fill_layers))
+    }
+
     /// Whether some feature may be drawn with stacked fills ([`Layer::fills`]).
     pub fn has_fills(&self) -> bool {
         !self.graphics && (!self.fill_layers.is_empty() || self.renderer.has_class_fills())
@@ -640,6 +730,13 @@ impl Layer {
         self.dataset.geometry_type
     }
 
+    /// The declared family or one present in the loaded features. A mixed layer's dominant
+    /// family does not describe every feature; streamed layers also expose their current window.
+    /// Derived from row allocation identity, so repeated UI checks do not rescan the layer.
+    pub fn has_geometry(&self, kind: GeometryType) -> bool {
+        kind != GeometryType::None && (self.geometry_type() == kind || self.geometry_kinds.contains(&self.dataset.features, kind))
+    }
+
     /// Copies of every geometry in a map projection's coordinates (`key` names the projection),
     /// rebuilt lazily when the geometry or the projection changes. Points a projection can't show
     /// become NaN, which the renderer skips; features across a world projection's edge are cut
@@ -649,6 +746,10 @@ impl Layer {
     /// vertex index, which only the source geometry has.
     pub fn projected_in(&mut self, flat: &projection::Flat, key: &str) -> &[Option<Geometry>] {
         if self.projected_rev != self.geometry_rev || self.projected.len() != self.dataset.features.len() || self.projected_for != key {
+            self.display = None;
+            if !matches!(flat, projection::Flat::Mercator) {
+                self.display_levels.clear();
+            }
             let projected: Vec<Option<Geometry>> =
                 self.dataset.features.iter().map(|ft| ft.geometry.as_ref().map(|g| flat.project(g))).collect();
             self.projected_extents =
@@ -658,6 +759,7 @@ impl Layer {
             self.thinned = Default::default();
             self.projected_rev = self.geometry_rev;
             self.projected_for = key.to_string();
+            self.trim_display_levels(self.lod_budget());
         }
         &self.projected
     }
@@ -667,15 +769,102 @@ impl Layer {
         self.projected_in(&projection::Flat::Mercator, "mercator")
     }
 
+    /// Prepares a bounded Mercator display copy without filling the exact projection cache.
+    /// Callers needing labels, selection or other exact positions must use `thinned_in` instead.
+    /// `whole_layer_eligible` applies the complete source's LOD decision to each streamed chunk.
+    /// Returns false for unsupported projections, small layers, weak savings or a full budget.
+    /// Every failure clears the active display; recent reusable levels may remain cached.
+    pub fn prepare_display(&mut self, flat: &projection::Flat, tol: f64, whole_layer_eligible: bool) -> bool {
+        self.display = None;
+        let Some(level) = lod::level(tol).filter(|_| matches!(flat, projection::Flat::Mercator)) else { return false };
+        self.trim_thinned_levels(self.lod_budget());
+        let used: usize = self.thinned.iter().filter_map(|(_, c)| c.as_ref()).map(|c| lod::cache_bytes(c)).sum();
+        let budget = self.lod_budget().saturating_sub(used);
+        self.trim_display_levels(budget);
+        if let Some(i) = self.display_levels.iter().position(|d| d.level == level && d.whole_layer_eligible == whole_layer_eligible) {
+            let hit = self.display_levels.remove(i);
+            self.display = Some(hit.clone());
+            self.display_levels.insert(0, hit);
+            return true;
+        }
+        let attempt = lod::Rejected { revision: self.geometry_rev, level, rows: self.dataset.features.len(), budget, whole_layer_eligible };
+        if let Some(i) = self.display_rejected.iter().position(|a| *a == attempt) {
+            let hit = self.display_rejected.remove(i);
+            self.display_rejected.insert(0, hit);
+            return false;
+        }
+        let Some(display) = lod::display(&self.dataset.features, self.geometry_rev, level, budget, whole_layer_eligible) else {
+            self.display_rejected.insert(0, attempt);
+            self.display_rejected.truncate(lod::LEVELS_KEPT);
+            return false;
+        };
+        let display = std::sync::Arc::new(display);
+        self.display_levels.insert(0, display.clone());
+        self.display_levels.truncate(lod::LEVELS_KEPT);
+        self.trim_display_levels(budget);
+        self.display = Some(display);
+        true
+    }
+
+    /// Shared optional LOD storage remaining after original rows and exact projection caches.
+    fn lod_budget(&self) -> usize {
+        self.source.as_ref().map_or(lod::CACHE_BYTES, |s| {
+            s.budget()
+                .saturating_sub(self.view_memory.base(&self.dataset.features, &self.projected, &self.projected_extents))
+                .min(lod::CACHE_BYTES)
+        })
+    }
+
+    /// Drops stale levels and evicts the least recently used copies to fit the supplied budget.
+    fn trim_display_levels(&mut self, budget: usize) {
+        let mut bytes = 0usize;
+        self.display_levels.retain(|d| {
+            if d.revision != self.geometry_rev
+                || d.geometries.len() != self.dataset.features.len()
+                || bytes.saturating_add(d.bytes) > budget
+            {
+                return false;
+            }
+            bytes += d.bytes;
+            true
+        });
+    }
+
+    /// Reclaims optional exact-consumer LOD copies when the shared remaining budget shrinks.
+    fn trim_thinned_levels(&mut self, budget: usize) {
+        let used = self.thinned.iter().filter_map(|(_, c)| c.as_ref()).fold(0usize, |n, c| n.saturating_add(lod::cache_bytes(c)));
+        if used <= budget {
+            return;
+        }
+        let mut bytes = 0usize;
+        std::sync::Arc::make_mut(&mut self.thinned).retain(|(_, copy)| {
+            let extra = copy.as_ref().map_or(0, |c| lod::cache_bytes(c));
+            if bytes.saturating_add(extra) > budget {
+                return false;
+            }
+            bytes += extra;
+            true
+        });
+    }
+
+    /// The copy and original extents from a successful `prepare_display`, row for row.
+    pub fn display_cache(&self) -> Option<(&[Option<Geometry>], &[Extent])> {
+        self.display
+            .as_ref()
+            .filter(|d| d.revision == self.geometry_rev && d.geometries.len() == self.dataset.features.len())
+            .map(|d| (d.geometries.as_slice(), d.extents.as_slice()))
+    }
+
     /// The projected geometry (see [`Layer::projected_in`]) as drawn at a tolerance in projection
     /// units: a thinned copy at the level just under it (see [`lod`]), made on first use, or the
     /// geometry itself for a small layer. Read it back with [`Layer::thinned_cache`].
     pub fn thinned_in(&mut self, flat: &projection::Flat, key: &str, tol: f64) -> &[Option<Geometry>] {
+        self.display = None;
         self.projected_in(flat, key);
-        let budget = self.source.as_ref().map_or(lod::CACHE_BYTES, |s| {
-            let base = self.view_memory.base(&self.dataset.features, &self.projected, &self.projected_extents);
-            s.budget().saturating_sub(base).min(lod::CACHE_BYTES)
-        });
+        self.trim_display_levels(self.lod_budget());
+        let display_bytes: usize = self.display_levels.iter().map(|d| d.bytes).sum();
+        let budget = self.lod_budget().saturating_sub(display_bytes);
+        self.trim_thinned_levels(budget);
         let Some(level) = lod::level(tol).filter(|_| self.projected_vertices > lod::THIN_ABOVE) else { return &self.projected };
         let levels = std::sync::Arc::make_mut(&mut self.thinned);
         match levels.iter().position(|(l, _)| *l == level) {
@@ -685,7 +874,11 @@ impl Layer {
             }
             None => {
                 let t = lod::tolerance(level);
-                let copy = lod::thin_budgeted(&self.projected, t, budget);
+                let copy = if matches!(flat, projection::Flat::Mercator) {
+                    lod::project_budgeted(&self.dataset.features, level, budget)
+                } else {
+                    lod::thin_budgeted(&self.projected, t, budget)
+                };
                 // The saving counts against every vertex the copy holds, points included.
                 let all: usize = self.projected.iter().flatten().map(lod::vertices).sum();
                 let copy = copy.filter(|c| {
@@ -694,17 +887,9 @@ impl Layer {
                 });
                 levels.insert(0, (level, copy.map(std::sync::Arc::new)));
                 levels.truncate(lod::LEVELS_KEPT);
-                let mut bytes = 0usize;
-                levels.retain(|(_, copy)| {
-                    let extra = copy.as_ref().map_or(0, |c| lod::cache_bytes(c));
-                    if bytes.saturating_add(extra) > budget {
-                        return false;
-                    }
-                    bytes += extra;
-                    true
-                });
             }
         }
+        self.trim_thinned_levels(budget);
         self.thinned_cache(tol)
     }
 
@@ -731,6 +916,9 @@ impl Layer {
 
     /// Drops the projected geometry cache (the feature cache).
     pub fn clear_cache(&mut self) {
+        self.display = None;
+        self.display_levels.clear();
+        self.display_rejected.clear();
         self.projected = Default::default();
         self.projected_extents = Default::default();
         self.projected_vertices = 0;
@@ -741,11 +929,12 @@ impl Layer {
 
     /// Takes the projected geometry cache `other` (a copy of this layer, such as one drawn off
     /// the UI thread) filled, when it was filled for the same rows and geometry: sharing it costs
-    /// a pointer. False when the cache doesn't fit.
+    /// a pointer. Display-only results preserve this layer's exact cache; optional copies are
+    /// trimmed to its remaining budget. False when the rows or source settings don't match.
     pub fn adopt_cache(&mut self, other: &Layer) -> bool {
         let fits = other.dataset.features.shares(&self.dataset.features)
             && other.geometry_rev == self.geometry_rev
-            && other.is_cached(&other.projected_for)
+            && (other.is_cached(&other.projected_for) || other.display_cache().is_some())
             && self.source.as_ref().is_none_or(|source| {
                 !source.is_pending()
                     && other.source.as_ref().is_some_and(|old| {
@@ -753,12 +942,22 @@ impl Layer {
                     })
             });
         if fits {
-            self.projected = other.projected.clone();
-            self.projected_extents = other.projected_extents.clone();
-            self.projected_vertices = other.projected_vertices;
-            self.thinned = other.thinned.clone();
-            self.projected_rev = other.projected_rev;
-            self.projected_for.clone_from(&other.projected_for);
+            self.display = other.display.clone();
+            self.display_rejected = other.display_rejected.clone();
+            self.display_levels = other.display_levels.clone();
+            if other.is_cached(&other.projected_for) {
+                self.projected = other.projected.clone();
+                self.projected_extents = other.projected_extents.clone();
+                self.projected_vertices = other.projected_vertices;
+                self.thinned = other.thinned.clone();
+                self.projected_rev = other.projected_rev;
+                self.projected_for.clone_from(&other.projected_for);
+            }
+            let budget = self.lod_budget();
+            self.trim_thinned_levels(budget);
+            let used: usize = self.thinned.iter().filter_map(|(_, c)| c.as_ref()).map(|c| lod::cache_bytes(c)).sum();
+            self.trim_display_levels(budget.saturating_sub(used));
+            self.display = self.display.take().filter(|d| self.display_levels.iter().any(|kept| std::sync::Arc::ptr_eq(d, kept)));
         }
         fits
     }
@@ -819,10 +1018,10 @@ impl Layer {
         let query = self.definition_query.as_deref().is_some_and(|q| !q.trim().is_empty());
         let timed = self.time.as_ref().is_some_and(|t| t.window.is_some());
         if !query && !timed && self.display_filters.is_empty() {
-            return (!self.dataset.features.is_empty()).then(|| self.renderer.legend_for(&self.dataset, &[]));
+            return (!self.dataset.features.is_empty()).then(|| self.renderer.legend_at(&self.dataset, &[], Some(scale)));
         }
         let rows = self.drawn_rows(scale);
-        rows.contains(&true).then(|| self.renderer.legend_for(&self.dataset, &rows))
+        rows.contains(&true).then(|| self.renderer.legend_at(&self.dataset, &rows, Some(scale)))
     }
 
     /// Rows passing the definition query (all rows when none or invalid).
@@ -921,9 +1120,14 @@ pub struct ServiceChild {
 /// Most layer groups a map keeps (files are hostile).
 pub const MAX_GROUPS: usize = 2000;
 
+/// Most levels layer groups nest (#836): a top-level group is level 1.
+pub const MAX_GROUP_DEPTH: usize = 8;
+
 /// Related layers under one name (#413): a collapsible folder in the Layers pane whose
 /// visibility, transparency and scale range apply on top of each child's own. Children stay
 /// ordinary layers, kept together in the drawing order; a layer belongs to one group at most.
+/// A group may sit in another (#836, `parent`): its layers, and its subgroups' at any depth,
+/// stay together in the drawing order, and every group above it applies too.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayerGroup {
     pub id: u32,
@@ -941,9 +1145,12 @@ pub struct LayerGroup {
     /// The children draw only when zoomed out beyond 1:`max_scale`, if set.
     #[serde(default)]
     pub max_scale: Option<f64>,
-    /// The children's layer ids.
+    /// The children's layer ids (the layers directly in it, not its subgroups').
     #[serde(default)]
     pub children: Vec<u32>,
+    /// The group this one is in (#836); `None` at the top level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u32>,
 }
 
 impl LayerGroup {
@@ -957,6 +1164,7 @@ impl LayerGroup {
             min_scale: None,
             max_scale: None,
             children: Vec::new(),
+            parent: None,
         }
     }
 
@@ -968,6 +1176,15 @@ impl LayerGroup {
     pub fn opacity(&self) -> f32 {
         (1.0 - self.transparency / 100.0).clamp(0.0, 1.0)
     }
+}
+
+/// An item at one level of the Layers pane's outline (#836, [`Map::outline`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Outline {
+    /// A map layer, by id.
+    Layer(u32),
+    /// A layer group, by id.
+    Group(u32),
 }
 
 /// An entry in the drawing order of all a map's layers ([`Map::stack`]), by index.
@@ -1008,10 +1225,11 @@ pub struct Map {
     /// Map-wide label display switches.
     #[serde(default)]
     pub label_display: LabelDisplay,
-    /// The labels placed when labels were locked: only they are drawn while the lock holds,
-    /// wherever the map moves. Filled by the renderer.
+    /// The labels placed when labels were locked, each with the place it took (0 its own, else
+    /// one of its alternatives, #1011): only they are drawn while the lock holds, there, wherever
+    /// the map moves. Filled by the renderer.
     #[serde(skip)]
-    pub label_lock: Option<Vec<LabelKey>>,
+    pub label_lock: Option<Vec<(LabelKey, u8)>>,
     /// Relationships, snapping, topology rules and edit settings.
     #[serde(default)]
     pub editing: design::MapEditing,
@@ -1036,6 +1254,9 @@ pub struct Map {
     pub body: String,
     #[serde(default)]
     next_layer_id: u32,
+    /// Process-local identity, kept by undo snapshots but never stored in a project.
+    #[serde(skip, default = "next_layer_instance")]
+    instance_id: u64,
 }
 
 fn earth() -> String {
@@ -1142,7 +1363,18 @@ impl Map {
             time: None,
             body: earth(),
             next_layer_id: 1,
+            instance_id: next_layer_instance(),
         }
+    }
+
+    /// Identifies this live map, whatever its name or place among the project's maps.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// Starts a distinct live map after copying one. Undo snapshots keep the original identity.
+    pub fn renew_instance_id(&mut self) {
+        self.instance_id = next_layer_instance();
     }
 
     /// Every address the map keeps to read its data again (service groups and their layers'
@@ -1241,37 +1473,47 @@ impl Map {
         id
     }
 
-    /// Adds a layer group (its children are taken from any other group); returns its id.
+    /// Adds a layer group (its children are taken from any other group and gathered together,
+    /// in its parent when it has one); returns its id. A parent that's missing, or with no room
+    /// for another level, is dropped.
     pub fn add_group(&mut self, mut group: LayerGroup) -> u32 {
         group.id = self.next_id();
         let id = group.id;
+        if group.parent.is_some_and(|p| self.group(p).is_none() || self.group_depth(p) >= MAX_GROUP_DEPTH) {
+            group.parent = None;
+        }
         self.settle_tiles();
         for g in &mut self.groups {
             g.children.retain(|c| !group.children.contains(c));
         }
+        let mut inside = vec![id];
+        inside.extend(self.chain_ids(group.parent));
         for c in &group.children {
-            self.lift_out(*c);
+            self.lift_out(&[*c], &inside);
         }
         self.groups.push(group);
+        self.gather_chain(id);
         self.settle_tiles();
         id
     }
 
-    /// Moves a layer that sits between two layers of a group it isn't in (it just left it) to
-    /// just above that group, so the group's layers stay together.
-    fn lift_out(&mut self, layer: u32) {
-        let Some(i) = self.layer_index(layer) else { return };
-        let l = self.layers.remove(i);
-        let mut at = i;
-        while at > 0 && self.splits_group(at) {
+    /// Moves layers that sit together inside a group they aren't in (`inside`: the groups they
+    /// are in, innermost first) to just above that group, so its layers stay together.
+    fn lift_out(&mut self, ids: &[u32], inside: &[u32]) {
+        let Some(first) = self.layers.iter().position(|l| ids.contains(&l.id)) else { return };
+        let order: Vec<u32> = self.layers.iter().map(|l| l.id).filter(|id| !ids.contains(id)).collect();
+        let mut at = first.min(order.len());
+        while at > 0 && self.splits_between(order.get(at - 1).copied(), order.get(at).copied(), inside) {
             at -= 1;
         }
-        self.layers.insert(i, l);
-        if at != i {
-            // Moving: the tile layers drawn over it keep their place.
-            self.release_tiles(&[layer]);
-            let l = self.layers.remove(i);
-            self.layers.insert(at.min(self.layers.len()), l);
+        if at != first {
+            // Moving: the tile layers drawn over them keep their place.
+            self.release_tiles(ids);
+            let (members, rest): (Vec<Layer>, Vec<Layer>) = std::mem::take(&mut self.layers).into_iter().partition(|l| ids.contains(&l.id));
+            self.layers = rest;
+            let tail = self.layers.split_off(at.min(self.layers.len()));
+            self.layers.extend(members);
+            self.layers.extend(tail);
         }
     }
 
@@ -1279,44 +1521,197 @@ impl Map {
         self.groups.iter().find(|g| g.id == id)
     }
 
-    /// The layer group a layer is in, if any.
+    /// The layer group a layer is directly in, if any.
     pub fn group_of(&self, layer: u32) -> Option<&LayerGroup> {
         self.groups.iter().find(|g| g.children.contains(&layer))
     }
 
-    /// Whether a layer is shown: its own box ticked, and its group's if it has one.
+    /// A group and the groups holding it, innermost first: at most [`MAX_GROUP_DEPTH`], ending at
+    /// a parent that's missing or already listed (a loop, as a project file may have).
+    pub fn group_chain(&self, group: u32) -> Vec<&LayerGroup> {
+        let mut out: Vec<&LayerGroup> = Vec::new();
+        let mut next = Some(group);
+        while let Some(id) = next {
+            if out.len() >= MAX_GROUP_DEPTH || out.iter().any(|g| g.id == id) {
+                break;
+            }
+            let Some(g) = self.group(id) else { break };
+            out.push(g);
+            next = g.parent;
+        }
+        out
+    }
+
+    /// The groups a layer is in, its own first (none outside a group).
+    pub fn groups_of(&self, layer: u32) -> Vec<&LayerGroup> {
+        self.group_of(layer).map_or_else(Vec::new, |g| self.group_chain(g.id))
+    }
+
+    /// The ids of a group's chain ([`Map::group_chain`]); none for `None`.
+    fn chain_ids(&self, group: Option<u32>) -> Vec<u32> {
+        group.map_or_else(Vec::new, |g| self.group_chain(g).iter().map(|g| g.id).collect())
+    }
+
+    /// How many levels deep a group is: 1 at the top level.
+    pub fn group_depth(&self, group: u32) -> usize {
+        self.group_chain(group).len()
+    }
+
+    /// Whether a layer is in a group, directly or in one of its subgroups.
+    pub fn layer_in(&self, layer: u32, group: u32) -> bool {
+        self.groups_of(layer).iter().any(|g| g.id == group)
+    }
+
+    /// Each group's chain of ids, itself first: for loops over many layers or groups.
+    fn chains(&self) -> std::collections::HashMap<u32, Vec<u32>> {
+        let parent: std::collections::HashMap<u32, Option<u32>> = self.groups.iter().map(|g| (g.id, g.parent)).collect();
+        self.groups
+            .iter()
+            .map(|g| {
+                let mut chain = vec![g.id];
+                let mut next = g.parent;
+                while let Some(p) = next {
+                    if chain.len() >= MAX_GROUP_DEPTH || chain.contains(&p) {
+                        break;
+                    }
+                    let Some(up) = parent.get(&p) else { break };
+                    chain.push(p);
+                    next = *up;
+                }
+                (g.id, chain)
+            })
+            .collect()
+    }
+
+    /// Each grouped layer's chain of groups, its own first (the first group listing it, as
+    /// [`Map::group_of`] finds it).
+    fn layer_chains(&self) -> std::collections::HashMap<u32, Vec<u32>> {
+        let chains = self.chains();
+        let mut out = std::collections::HashMap::new();
+        for g in &self.groups {
+            let Some(c) = chains.get(&g.id) else { continue };
+            for l in &g.children {
+                out.entry(*l).or_insert_with(|| c.clone());
+            }
+        }
+        out
+    }
+
+    /// The layers in a group and its subgroups at any depth, in drawing order.
+    pub fn group_layers(&self, group: u32) -> Vec<u32> {
+        let chains = self.layer_chains();
+        self.layers.iter().map(|l| l.id).filter(|id| chains.get(id).is_some_and(|c| c.contains(&group))).collect()
+    }
+
+    /// A group's subgroups at any depth (not itself).
+    pub fn subgroups(&self, group: u32) -> Vec<u32> {
+        let chains = self.chains();
+        self.groups.iter().map(|g| g.id).filter(|id| *id != group && chains.get(id).is_some_and(|c| c.contains(&group))).collect()
+    }
+
+    /// How many levels a group and its subgroups take: 1 without subgroups.
+    fn group_height(&self, group: u32) -> usize {
+        self.chains().values().filter_map(|c| c.iter().position(|g| *g == group)).max().map_or(1, |p| p + 1)
+    }
+
+    /// The layers and groups directly in `parent` (`None`: the top level), as the Layers pane
+    /// lists them: in drawing order, top first, then the groups with no layers.
+    pub fn outline(&self, parent: Option<u32>) -> Vec<Outline> {
+        let chains = self.layer_chains();
+        let mut out: Vec<Outline> = Vec::new();
+        let mut seen: std::collections::HashSet<Outline> = std::collections::HashSet::new();
+        for l in &self.layers {
+            let chain = chains.get(&l.id).map_or(&[][..], Vec::as_slice);
+            let item = match parent {
+                None => chain.last().map_or(Outline::Layer(l.id), |g| Outline::Group(*g)),
+                Some(p) => match chain.iter().position(|g| *g == p) {
+                    Some(0) => Outline::Layer(l.id),
+                    Some(k) => match chain.get(k - 1) {
+                        Some(g) => Outline::Group(*g),
+                        None => continue,
+                    },
+                    None => continue,
+                },
+            };
+            if seen.insert(item) {
+                out.push(item);
+            }
+        }
+        let tops = self.chains();
+        for g in &self.groups {
+            // At the top level, a group whose chain ends at it (a missing parent leaves it there).
+            let here = match parent {
+                None => tops.get(&g.id).and_then(|c| c.last()) == Some(&g.id),
+                Some(p) => g.parent == Some(p) && g.id != p,
+            };
+            if here && seen.insert(Outline::Group(g.id)) {
+                out.push(Outline::Group(g.id));
+            }
+        }
+        out
+    }
+
+    /// Whether a layer is shown: its own box ticked, and every group's it is in.
     pub fn shows(&self, l: &Layer) -> bool {
-        l.visible && self.group_of(l.id).is_none_or(|g| g.visible)
+        l.visible && self.groups_of(l.id).iter().all(|g| g.visible)
     }
 
     /// Whether a layer draws at a scale denominator: shown, and within its own scale range and
-    /// its group's.
+    /// its groups'.
     pub fn draws_at(&self, l: &Layer, scale: f64) -> bool {
-        l.visible && l.in_scale_range(scale) && self.group_of(l.id).is_none_or(|g| g.visible && g.in_scale_range(scale))
+        l.visible && l.in_scale_range(scale) && self.groups_of(l.id).iter().all(|g| g.visible && g.in_scale_range(scale))
     }
 
-    /// Whether a layer is within its own scale range and its group's.
+    /// Whether a layer is within its own scale range and its groups'.
     pub fn in_scale_range(&self, l: &Layer, scale: f64) -> bool {
-        l.in_scale_range(scale) && self.group_of(l.id).is_none_or(|g| g.in_scale_range(scale))
+        l.in_scale_range(scale) && self.groups_of(l.id).iter().all(|g| g.in_scale_range(scale))
     }
 
-    /// A layer's opacity with its group's applied.
+    /// A layer's opacity with its groups' applied.
     pub fn layer_opacity(&self, l: &Layer) -> f32 {
-        l.opacity() * self.group_of(l.id).map_or(1.0, LayerGroup::opacity)
+        l.opacity() * self.groups_of(l.id).iter().map(|g| g.opacity()).product::<f32>()
     }
 
-    /// Ids of the layers whose group keeps them from drawing at a scale denominator (hidden, or
-    /// out of its scale range): for loops that change the layers as they go.
+    /// The opacity the groups give each layer in a see-through one (all its groups' multiplied),
+    /// by layer id; a layer left out is opaque as far as its groups go.
+    pub fn group_opacities(&self) -> std::collections::HashMap<u32, f32> {
+        if !self.groups.iter().any(|g| g.transparency > 0.0) {
+            return std::collections::HashMap::new();
+        }
+        let opacity: std::collections::HashMap<u32, f32> = self.groups.iter().map(|g| (g.id, g.opacity())).collect();
+        self.layer_chains()
+            .into_iter()
+            .map(|(l, c)| (l, c.iter().map(|g| opacity.get(g).copied().unwrap_or(1.0)).product::<f32>()))
+            .filter(|(_, o)| *o < 1.0)
+            .collect()
+    }
+
+    /// Ids of the layers whose groups keep them from drawing at a scale denominator (one hidden,
+    /// or out of its scale range): for loops that change the layers as they go.
     pub fn held_by_group(&self, scale: f64) -> std::collections::HashSet<u32> {
-        self.groups.iter().filter(|g| !g.visible || !g.in_scale_range(scale)).flat_map(|g| g.children.iter().copied()).collect()
+        let held: std::collections::HashSet<u32> =
+            self.groups.iter().filter(|g| !g.visible || !g.in_scale_range(scale)).map(|g| g.id).collect();
+        if held.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        // Every group listing a layer counts (a hand-edited file may list it twice).
+        let chains = self.chains();
+        self.groups
+            .iter()
+            .filter(|g| chains.get(&g.id).is_some_and(|c| c.iter().any(|x| held.contains(x))))
+            .flat_map(|g| g.children.iter().copied())
+            .collect()
     }
 
-    /// Folds each group's visibility, transparency and scale range into its children and drops
-    /// the groups: for exports that know only layers.
+    /// Folds each group's visibility, transparency and scale range into its layers (its
+    /// subgroups' too) and drops the groups: for exports that know only layers.
     pub fn bake_groups(&mut self) {
         self.settle_tiles();
-        for g in std::mem::take(&mut self.groups) {
-            for l in self.layers.iter_mut().filter(|l| g.children.contains(&l.id)) {
+        let chains = self.layer_chains();
+        let groups = std::mem::take(&mut self.groups);
+        for l in &mut self.layers {
+            let Some(chain) = chains.get(&l.id) else { continue };
+            for g in chain.iter().filter_map(|id| groups.iter().find(|g| g.id == *id)) {
                 l.visible &= g.visible;
                 l.transparency = 100.0 * (1.0 - l.opacity() * g.opacity());
                 l.min_scale = match (l.min_scale, g.min_scale) {
@@ -1331,31 +1726,63 @@ impl Map {
         }
     }
 
-    /// Puts a layer in a group (out of any other), next to the group's other children in the
-    /// drawing order; `None` takes it out of its group (above the group when it was between two
-    /// of its layers).
+    /// Puts a layer in a group (out of any other), next to the group's other layers in the
+    /// drawing order (at its end nearer to the layer); `None` takes it out of its group (above
+    /// the outermost group when it was between two of its layers).
     pub fn set_group(&mut self, layer: u32, group: Option<u32>) {
         if group.is_some() && self.group_of(layer).map(|g| g.id) == group {
+            return;
+        }
+        if let Some(gid) = group
+            && let Some(before) = self.nearest_end(gid, &[layer])
+        {
+            // (Checked: the layer and the group exist, and `before` is one of its layers.)
+            let _ = self.place_layer(layer, group, before);
             return;
         }
         self.settle_tiles();
         for g in &mut self.groups {
             g.children.retain(|c| *c != layer);
         }
-        self.lift_out(layer);
+        let inside = self.chain_ids(group);
+        self.lift_out(&[layer], &inside);
         if let Some(gid) = group
             && let Some(g) = self.groups.iter_mut().find(|g| g.id == gid)
         {
             g.children.push(layer);
-            self.gather_group(gid);
+            self.gather_chain(gid);
         }
         self.settle_tiles();
     }
 
+    /// Where layers `moving` (together in the drawing order) join a group at its end nearer to
+    /// them: above its topmost other layer (`Some(Some(id))`) when they are above it, else at its
+    /// end (`Some(None)`). `None` when the group has no other layers, or they sit among them
+    /// already (in a subgroup): they stay there.
+    fn nearest_end(&self, group: u32, moving: &[u32]) -> Option<Option<u32>> {
+        let others: Vec<u32> = self.group_layers(group).into_iter().filter(|id| !moving.contains(id)).collect();
+        let (first, last) = (self.layer_index(*others.first()?)?, self.layer_index(*others.last()?)?);
+        let at = self.layers.iter().position(|l| moving.contains(&l.id))?;
+        match at {
+            a if a < first => Some(others.first().copied()),
+            a if a > last => Some(None),
+            _ => None,
+        }
+    }
+
+    /// Below the lowest layer of the first group of `chain` (innermost first) that has any: the
+    /// end of a group, or of the nearest group holding it when it has no layers.
+    fn end_of(&self, chain: &[u32]) -> Option<usize> {
+        chain.iter().find_map(|g| {
+            let members = self.group_layers(*g);
+            self.layers.iter().rposition(|l| members.contains(&l.id)).map(|i| i + 1)
+        })
+    }
+
     /// Puts a layer in a group, or out of any (`None`), and in the drawing order just above the
-    /// layer `before` (`None`: below the group's other layers, or at the bottom out of a group).
-    /// In a group, `before` must be one of its layers; out of one, a place between two layers of a
-    /// group moves up past that group.
+    /// layer `before` (`None`: below the group's other layers, its subgroups' too, or at the
+    /// bottom out of a group). In a group, `before` must be one of its layers or its subgroups';
+    /// a place inside a group the layer isn't going in moves up past that group.
     pub fn place_layer(&mut self, layer: u32, group: Option<u32>, before: Option<u32>) -> Result<(), String> {
         if self.layer_index(layer).is_none() {
             return Err("no such layer".into());
@@ -1364,7 +1791,10 @@ impl Map {
             return Err("the layer can't go before itself".into());
         }
         let others: Vec<u32> = match group {
-            Some(g) => self.group(g).ok_or("no such group")?.children.iter().copied().filter(|c| *c != layer).collect(),
+            Some(g) => {
+                self.group(g).ok_or("no such group")?;
+                self.group_layers(g).into_iter().filter(|c| *c != layer).collect()
+            }
             None => Vec::new(),
         };
         if let Some(b) = before {
@@ -1375,6 +1805,7 @@ impl Map {
                 return Err("the layer to go before isn't in the group".into());
             }
         }
+        let inside = self.chain_ids(group);
         let places = self.pin_tile_places();
         self.release_tiles(&[layer]);
         for g in &mut self.groups {
@@ -1384,14 +1815,13 @@ impl Map {
         let l = self.layers.remove(from);
         let mut at = match (before, group) {
             (Some(b), _) => self.layer_index(b).unwrap_or(self.layers.len()),
-            // Below the group's lowest layer; alone in it, where it was.
-            (None, Some(_)) => self.layers.iter().rposition(|x| others.contains(&x.id)).map_or(from.min(self.layers.len()), |i| i + 1),
+            // Below the group's lowest layer; in a group with none, at the end of the nearest one
+            // holding it that has some, or where it was.
+            (None, Some(_)) => self.end_of(&inside).unwrap_or(from.min(self.layers.len())),
             (None, None) => self.layers.len(),
         };
-        if group.is_none() {
-            while at > 0 && self.splits_group(at) {
-                at -= 1;
-            }
+        while at > 0 && self.splits(at, &inside) {
+            at -= 1;
         }
         let at = at.min(self.layers.len());
         self.layers.insert(at, l);
@@ -1404,10 +1834,13 @@ impl Map {
         Ok(())
     }
 
-    /// Moves a group's layers, together, to position `to` among the other layers (past the end,
-    /// the bottom); a position inside another group's run moves up above that group.
+    /// Moves a group's layers (its subgroups' too), together, to position `to` among the other
+    /// layers (past the end, the bottom); a position inside another group's run moves up above
+    /// that group. A subgroup stays in its group: at most to its top or its bottom.
     pub fn move_group(&mut self, group: u32, to: usize) -> Result<(), String> {
-        let children = self.group(group).ok_or("no such group")?.children.clone();
+        let parent = self.group(group).ok_or("no such group")?.parent;
+        let children = self.group_layers(group);
+        let inside = self.chain_ids(parent);
         let places = self.pin_tile_places();
         // Where the group's layers are now: put back at the start of their run, unbroken, they
         // haven't moved.
@@ -1420,7 +1853,17 @@ impl Map {
             return Err("the group has no layers to move".into());
         }
         let mut at = to.min(self.layers.len());
-        while at > 0 && self.splits_group(at) {
+        if let Some(p) = parent {
+            let siblings = self.group_layers(p);
+            let lo = self.layers.iter().position(|l| siblings.contains(&l.id));
+            let hi = self.layers.iter().rposition(|l| siblings.contains(&l.id));
+            at = match (lo, hi) {
+                (Some(lo), Some(hi)) => at.clamp(lo, hi + 1),
+                // Alone in its group: it moves with the group, not in it.
+                _ => run.first().copied().unwrap_or(at).min(self.layers.len()),
+            };
+        }
+        while at > 0 && self.splits(at, &inside) {
             at -= 1;
         }
         let tail = self.layers.split_off(at);
@@ -1431,25 +1874,183 @@ impl Map {
         Ok(())
     }
 
-    /// Moves a group's children together in the drawing order, at its topmost child, keeping
-    /// their order; children with no layer are dropped.
+    /// Whether `group` can go in `parent` (`None`: the top level): not in itself or one of its
+    /// subgroups, and no deeper than [`MAX_GROUP_DEPTH`] levels.
+    fn can_nest(&self, group: u32, parent: Option<u32>) -> Result<(), String> {
+        self.group(group).ok_or("no such group")?;
+        let Some(p) = parent else { return Ok(()) };
+        self.group(p).ok_or("no such group to go in")?;
+        if self.group_chain(p).iter().any(|g| g.id == group) {
+            return Err("a group can't go in itself or one of its subgroups".into());
+        }
+        if self.group_depth(p).saturating_add(self.group_height(group)) > MAX_GROUP_DEPTH {
+            return Err(format!("groups nest at most {MAX_GROUP_DEPTH} levels deep"));
+        }
+        Ok(())
+    }
+
+    fn set_parent_of(&mut self, group: u32, parent: Option<u32>) {
+        if let Some(g) = self.groups.iter_mut().find(|g| g.id == group) {
+            g.parent = parent;
+        }
+    }
+
+    /// Puts a group, with its layers and subgroups, in another group or at the top level
+    /// (`None`), in the drawing order just above the layer `before` (`None`: below the other
+    /// group's layers, or at the bottom at the top level). In a group, `before` must be one of
+    /// its layers or its subgroups'; a place inside a group it isn't going in moves up past that
+    /// group.
+    pub fn place_group(&mut self, group: u32, parent: Option<u32>, before: Option<u32>) -> Result<(), String> {
+        self.can_nest(group, parent)?;
+        let members = self.group_layers(group);
+        if let Some(b) = before {
+            if self.layer_index(b).is_none() {
+                return Err("no layer to go before".into());
+            }
+            if members.contains(&b) {
+                return Err("the group can't go before one of its own layers".into());
+            }
+            if parent.is_some_and(|p| !self.layer_in(b, p)) {
+                return Err("the layer to go before isn't in the group".into());
+            }
+        }
+        if members.is_empty() {
+            // Nothing to place: a group with no layers lists at the end of its level, in the
+            // order of the map's groups; at the end (`before` none), after the others there.
+            self.set_parent_of(group, parent);
+            if before.is_none()
+                && let Some(i) = self.groups.iter().position(|g| g.id == group)
+            {
+                let g = self.groups.remove(i);
+                self.groups.push(g);
+            }
+            return Ok(());
+        }
+        let places = self.pin_tile_places();
+        let run: Vec<usize> = self.layers.iter().enumerate().filter(|(_, l)| members.contains(&l.id)).map(|(i, _)| i).collect();
+        let start = run.first().copied().filter(|s| run.iter().enumerate().all(|(k, i)| *i == s + k));
+        self.release_tiles(&members);
+        self.set_parent_of(group, parent);
+        let inside = self.chain_ids(parent);
+        let (moving, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.layers).into_iter().partition(|l| members.contains(&l.id));
+        self.layers = rest;
+        let mut at = match (before, parent) {
+            (Some(b), _) => self.layer_index(b).unwrap_or(self.layers.len()),
+            (None, Some(_)) => self.end_of(&inside).unwrap_or_else(|| run.first().copied().unwrap_or(self.layers.len())),
+            (None, None) => self.layers.len(),
+        };
+        at = at.min(self.layers.len());
+        while at > 0 && self.splits(at, &inside) {
+            at -= 1;
+        }
+        let tail = self.layers.split_off(at);
+        self.layers.extend(moving);
+        self.layers.extend(tail);
+        self.keep_tiles_if_unmoved(start == Some(at), places);
+        self.settle_tiles();
+        Ok(())
+    }
+
+    /// Puts a group, with its layers and subgroups, in another group or at the top level
+    /// (`None`), next to that group's other layers (at the end nearer to where it is), or where
+    /// it is at the top level (above the group it was inside).
+    pub fn set_group_parent(&mut self, group: u32, parent: Option<u32>) -> Result<(), String> {
+        self.can_nest(group, parent)?;
+        if self.group(group).is_some_and(|g| g.parent == parent) {
+            return Ok(());
+        }
+        let members = self.group_layers(group);
+        if let Some(p) = parent
+            && let Some(before) = self.nearest_end(p, &members)
+        {
+            return self.place_group(group, parent, before);
+        }
+        self.settle_tiles();
+        self.set_parent_of(group, parent);
+        let inside = self.chain_ids(parent);
+        self.lift_out(&members, &inside);
+        if let Some(p) = parent {
+            self.gather_chain(p);
+        }
+        self.settle_tiles();
+        Ok(())
+    }
+
+    /// Dissolves a group: its layers and subgroups go up one level, where they are.
+    pub fn ungroup(&mut self, group: u32) -> Result<(), String> {
+        let g = self.group(group).ok_or("no such group")?;
+        let (parent, children) = (g.parent.filter(|p| *p != group), g.children.clone());
+        // The tile layers over the group stay over its layers, where they were.
+        self.settle_tiles();
+        for x in &mut self.groups {
+            if Some(x.id) == parent {
+                x.children.extend(children.iter().copied());
+            }
+            if x.parent == Some(group) {
+                x.parent = parent;
+            }
+        }
+        self.groups.retain(|x| x.id != group);
+        Ok(())
+    }
+
+    /// Gathers a group's layers, and those of every group holding it, the outermost first.
+    fn gather_chain(&mut self, group: u32) {
+        for id in self.chain_ids(Some(group)).into_iter().rev() {
+            self.gather_group(id);
+        }
+    }
+
+    /// Moves a group's layers, its subgroups' too, together in the drawing order at the topmost,
+    /// keeping their order; children with no layer are dropped.
     pub fn gather_group(&mut self, group: u32) {
         let ids: std::collections::HashSet<u32> = self.layers.iter().map(|l| l.id).collect();
         let Some(g) = self.groups.iter_mut().find(|g| g.id == group) else { return };
         g.children.retain(|c| ids.contains(c));
-        let children = g.children.clone();
-        let Some(top) = self.layers.iter().position(|l| children.contains(&l.id)) else { return };
-        let mut members = Vec::new();
+        let members: std::collections::HashSet<u32> = self.group_layers(group).into_iter().collect();
+        let Some(top) = self.layers.iter().position(|l| members.contains(&l.id)) else { return };
+        let mut inner = Vec::new();
         let mut rest = Vec::new();
         for l in std::mem::take(&mut self.layers) {
-            if children.contains(&l.id) { members.push(l) } else { rest.push(l) }
+            if members.contains(&l.id) { inner.push(l) } else { rest.push(l) }
         }
         // Layers above the topmost child stay above.
         let tail = rest.split_off(top.min(rest.len()));
-        rest.extend(members);
+        rest.extend(inner);
         rest.extend(tail);
         self.layers = rest;
         self.settle_tiles();
+    }
+
+    /// Makes a project file's groups whole (#836): a parent that is the group itself, missing,
+    /// in a loop or past [`MAX_GROUP_DEPTH`] levels is dropped (the group goes to the top
+    /// level), and each group's layers are gathered together, the outermost groups first.
+    pub fn tidy_groups(&mut self) {
+        let ids: std::collections::HashSet<u32> = self.groups.iter().map(|g| g.id).collect();
+        for g in &mut self.groups {
+            if g.parent.is_some_and(|p| p == g.id || !ids.contains(&p)) {
+                g.parent = None;
+            }
+        }
+        let mut parent: std::collections::HashMap<u32, Option<u32>> = self.groups.iter().map(|g| (g.id, g.parent)).collect();
+        for g in &mut self.groups {
+            let mut seen = vec![g.id];
+            let mut next = g.parent;
+            while let Some(p) = next {
+                if seen.contains(&p) || seen.len() >= MAX_GROUP_DEPTH {
+                    g.parent = None;
+                    parent.insert(g.id, None);
+                    break;
+                }
+                seen.push(p);
+                next = parent.get(&p).copied().flatten();
+            }
+        }
+        let mut order: Vec<(usize, u32)> = self.groups.iter().map(|g| (self.group_depth(g.id), g.id)).collect();
+        order.sort_by_key(|(depth, _)| *depth);
+        for (_, id) in order {
+            self.gather_group(id);
+        }
     }
 
     /// The map's layers as they stand (their ids in order, and the next id), cheap to take before
@@ -1472,11 +2073,12 @@ impl Map {
         self.layers.insert(0, layer);
     }
 
-    /// The map's layers as the Layers pane lists them, top first: each layer outside a group
-    /// alone, each group's layers together (in order), service groups aside.
+    /// The map's layers as the Layers pane lists them at the top level, top first: each layer
+    /// outside a group alone, each top-level group's layers together (its subgroups' too, in
+    /// order), service groups aside.
     fn units(&self) -> Vec<Vec<u32>> {
         let group: std::collections::HashMap<u32, u32> =
-            self.groups.iter().flat_map(|g| g.children.iter().map(move |c| (*c, g.id))).collect();
+            self.layer_chains().into_iter().filter_map(|(l, c)| c.last().map(|top| (l, *top))).collect();
         let mut units: Vec<Vec<u32>> = Vec::new();
         // A group's unit, by group.
         let mut at: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
@@ -1681,23 +2283,33 @@ impl Map {
         }
     }
 
-    /// Whether a layer put at `pos` in the drawing order would sit between two layers of one group.
-    fn splits_group(&self, pos: usize) -> bool {
-        let (Some(above), Some(below)) = (pos.checked_sub(1).and_then(|i| self.layers.get(i)), self.layers.get(pos)) else {
-            return false;
-        };
-        self.group_of(above.id).is_some_and(|g| g.children.contains(&below.id))
+    /// Whether a layer (or a group's layers) put at `pos` in the drawing order would sit inside a
+    /// group other than those of `inside` (the groups it is going in, innermost first): between
+    /// two of that group's layers.
+    fn splits(&self, pos: usize, inside: &[u32]) -> bool {
+        let above = pos.checked_sub(1).and_then(|i| self.layers.get(i)).map(|l| l.id);
+        self.splits_between(above, self.layers.get(pos).map(|l| l.id), inside)
+    }
+
+    /// Whether layers `above` and `below` share a group that isn't one of `inside`.
+    fn splits_between(&self, above: Option<u32>, below: Option<u32>, inside: &[u32]) -> bool {
+        let (Some(above), Some(below)) = (above, below) else { return false };
+        let below = self.groups_of(below);
+        self.groups_of(above).iter().any(|g| !inside.contains(&g.id) && below.iter().any(|b| b.id == g.id))
     }
 
     /// Moves the layer at index `from` to index `to` in the drawing order, keeping groups
-    /// together: a group's layer moves only among its group's, and another layer moving into a
-    /// group's run goes past it (above moving up, below moving down).
+    /// together: a group's layer moves only among its group's (its subgroups' included), and a
+    /// layer moving into the run of a group it isn't in goes past it (above moving up, below
+    /// moving down).
     pub fn move_layer(&mut self, from: usize, to: usize) -> Result<(), String> {
         let id = self.layers.get(from).map(|l| l.id).ok_or("no such layer")?;
         let to = to.min(self.layers.len().saturating_sub(1));
-        if let Some(g) = self.group_of(id) {
-            let run: Vec<usize> = self.layers.iter().enumerate().filter(|(_, l)| g.children.contains(&l.id)).map(|(i, _)| i).collect();
-            let (lo, hi) = (run.first().copied().unwrap_or(from), run.last().copied().unwrap_or(from));
+        let inside: Vec<u32> = self.groups_of(id).iter().map(|g| g.id).collect();
+        if let Some(g) = inside.first() {
+            let members = self.group_layers(*g);
+            let lo = self.layers.iter().position(|l| members.contains(&l.id)).unwrap_or(from);
+            let hi = self.layers.iter().rposition(|l| members.contains(&l.id)).unwrap_or(from);
             if to < lo || to > hi {
                 return Err("the layer can't move out of its group (take it out of the group first)".into());
             }
@@ -1708,11 +2320,9 @@ impl Map {
         self.release_tiles(&[id]);
         let l = self.layers.remove(from);
         let mut to = to;
-        if self.group_of(id).is_none() {
-            // `to` is now the index the layer goes in at, among the others.
-            while to > 0 && to < self.layers.len() && self.splits_group(to) {
-                if to < from { to -= 1 } else { to += 1 }
-            }
+        // `to` is now the index the layer goes in at, among the others.
+        while to > 0 && to < self.layers.len() && self.splits(to, &inside) {
+            if to < from { to -= 1 } else { to += 1 }
         }
         self.layers.insert(to.min(self.layers.len()), l);
         Ok(())
@@ -1775,7 +2385,7 @@ impl Map {
                 src.full_read = block;
                 if changed || mode_changed || budget_changed {
                     let selected = std::mem::take(&mut src.saved_selection);
-                    src.reset();
+                    src.reset_window();
                     src.saved_selection = selected;
                 }
                 if changed || (!block && layer.view_cache_bytes() > bytes) {
@@ -1785,7 +2395,7 @@ impl Map {
                         layer.selection.iter().filter_map(|r| layer.dataset.features.get(*r)).map(|f| f.id).collect();
                     if let Some(src) = &mut layer.source {
                         selected.append(&mut src.saved_selection);
-                        src.reset();
+                        src.reset_window();
                     }
                     layer.install(Vec::new());
                     if let Some(src) = &mut layer.source {
@@ -2057,6 +2667,21 @@ pub const REFERENCE_SCALES: (f64, f64) = (1.0, 1e9);
 /// far in, its lines would otherwise be drawn thousands of pixels wide.
 pub const SIZE_FACTORS: (f64, f64) = (0.01, 32.0);
 
+/// A [`Layer::no_fill`] this version doesn't know (a later variant, another type, or edited by
+/// hand) reads as off, rather than failing the whole project.
+fn de_no_fill<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<NoFill>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Read {
+        Known(NoFill),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Read>::deserialize(d)? {
+        Some(Read::Known(how)) => Some(how),
+        Some(Read::Other(_)) | None => None,
+    })
+}
+
 /// Reads a layer's reference scale as `layer.referenceScale` would leave it: one out of
 /// [`REFERENCE_SCALES`] (or not a number) is none. A project file is hostile input.
 fn de_reference_scale<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
@@ -2229,6 +2854,28 @@ mod tests {
     }
 
     #[test]
+    fn no_fill_is_saved_only_when_on_and_an_unknown_one_reads_as_off() {
+        let mut l = Layer::new(1, Dataset::new("parcels", GeometryType::Polygon, vec![]));
+        assert!(!serde_json::to_string(&l).unwrap().contains("no_fill"));
+        for how in [NoFill::Override, NoFill::Symbols] {
+            l.no_fill = Some(how);
+            let text = serde_json::to_string(&l).unwrap();
+            assert_eq!(serde_json::from_str::<Layer>(&text).unwrap().no_fill, Some(how));
+        }
+        let mut v = serde_json::to_value(&l).unwrap();
+        for unknown in [
+            serde_json::json!("Later"),
+            serde_json::json!(1),
+            serde_json::json!(true),
+            serde_json::json!({"Override": 1}),
+            serde_json::Value::Null,
+        ] {
+            v["no_fill"] = unknown.clone();
+            assert_eq!(serde_json::from_value::<Layer>(v.clone()).unwrap().no_fill, None, "{unknown}");
+        }
+    }
+
+    #[test]
     fn hostile_class_strokes_in_a_project_are_brought_into_range() {
         // The same for a class's own strokes, Unique Values' (and <all other values>') and
         // Graduated Colors'; a class listed with none is dropped.
@@ -2250,6 +2897,7 @@ mod tests {
             other_strokes: wild.clone(),
             class_fills: Default::default(),
             other_fills: Vec::new(),
+            expression: None,
         };
         let back: Layer = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
         let Renderer::Unique { class_strokes, other_strokes, .. } = &back.renderer else { panic!("unique renderer expected") };
@@ -2312,6 +2960,247 @@ mod tests {
         m.layer_mut(id).unwrap().touch_geometry();
         m.adopt_caches(&copy);
         assert!(!m.layer(id).unwrap().is_cached("mercator"));
+    }
+
+    #[test]
+    fn display_projection_is_lazy_shared_bounded_and_invalidated() {
+        let flat = projection::Flat::Mercator;
+        let mut l = long_line(lod::THIN_ABOVE + 1000);
+        let original = l.dataset.features.clone();
+        assert!(l.prepare_display(&flat, 12_000.0, false));
+        assert!(l.projected_cache().is_empty(), "display must not project discarded vertices");
+        let (g, extents) = l.display_cache().unwrap();
+        assert!(lod::vertices(g[0].as_ref().unwrap()) < (lod::THIN_ABOVE + 1000) / 40);
+        let expected_extent = flat.project(original[0].geometry.as_ref().unwrap()).extent();
+        assert_eq!(extents, &[expected_extent]);
+        let before = l.view_cache_bytes();
+        assert!(before > rustgis_data::source::memory::features_bytes(&original));
+        let mut copy = l.clone();
+        assert!(copy.prepare_display(&flat, 12_000.0, false));
+        assert_eq!(copy.display_cache().unwrap().0.as_ptr(), l.display_cache().unwrap().0.as_ptr());
+        let mut receiver = long_line(1);
+        receiver.dataset = l.dataset.clone();
+        receiver.geometry_rev = l.geometry_rev;
+        assert!(receiver.adopt_cache(&copy));
+        assert_eq!(receiver.display_cache().unwrap().0.as_ptr(), l.display_cache().unwrap().0.as_ptr());
+        // Requesting exact positions remains exact and drops the optional display copy.
+        assert_eq!(copy.projected().len(), 1);
+        assert!(copy.display_cache().is_none());
+        assert_eq!(lod::vertices(copy.projected_cache()[0].as_ref().unwrap()), lod::THIN_ABOVE + 1000);
+        l.touch_geometry();
+        assert!(l.display_cache().is_none());
+        assert!(l.prepare_display(&flat, 24_000.0, false));
+        l.clear_cache();
+        assert!(l.display_cache().is_none());
+        assert_eq!(l.view_cache_bytes(), rustgis_data::source::memory::features_bytes(&original));
+        assert!(lod::display(&original, 0, 12, 1, false).is_none());
+        assert!(!long_line(100).prepare_display(&flat, 12_000.0, false));
+        assert_eq!(l.dataset.features, original);
+    }
+
+    /// A worker's display-only snapshot must preserve exact positions filled later by the UI.
+    #[test]
+    fn adopting_display_preserves_newer_exact_cache_and_its_budget() {
+        let flat = projection::Flat::Mercator;
+        for tight in [false, true] {
+            let mut receiver = long_line(lod::THIN_ABOVE + 1000);
+            let mut worker = receiver.clone();
+            assert!(worker.prepare_display(&flat, 12_000.0, false));
+            receiver.thinned_in(&flat, "mercator", 24_000.0);
+            let exact = receiver.projected.clone();
+            let extents = receiver.projected_extents.clone();
+            let thinned = receiver.thinned.clone();
+            let base = receiver.view_memory.base(&receiver.dataset.features, &receiver.projected, &receiver.projected_extents);
+            if tight {
+                let mut source = source::SourceLayer::default();
+                source.byte_budget = base;
+                worker.source = Some(source.clone());
+                receiver.source = Some(source);
+            }
+            assert!(receiver.adopt_cache(&worker));
+            assert!(receiver.is_cached("mercator"), "display-only adoption must keep exact positions");
+            assert!(std::sync::Arc::ptr_eq(&exact, &receiver.projected));
+            assert!(std::sync::Arc::ptr_eq(&extents, &receiver.projected_extents));
+            if tight {
+                assert!(receiver.display_cache().is_none());
+                assert!(receiver.display_levels.is_empty());
+                assert!(receiver.thinned.iter().all(|(_, c)| c.is_none()));
+                assert!(receiver.view_cache_bytes() <= base);
+            } else {
+                assert!(std::sync::Arc::ptr_eq(&thinned, &receiver.thinned));
+                assert_eq!(receiver.display_cache().unwrap().0.as_ptr(), worker.display_cache().unwrap().0.as_ptr());
+            }
+            receiver.projected();
+            assert!(std::sync::Arc::ptr_eq(&exact, &receiver.projected), "the next exact request must reuse the allocation");
+        }
+    }
+
+    #[test]
+    fn streamed_display_uses_whole_layer_eligibility_and_respects_remaining_budget() {
+        let flat = projection::Flat::Mercator;
+        let mut chunk = long_line(100);
+        assert!(!chunk.prepare_display(&flat, 1e6, false));
+        // The complete source is detailed even though this chunk alone is small.
+        assert!(chunk.prepare_display(&flat, 1e6, true));
+        assert!(chunk.projected_cache().is_empty());
+        let (g, extents) = chunk.display_cache().unwrap();
+        assert!(lod::vertices(g[0].as_ref().unwrap()) < 100);
+        assert_eq!(extents[0], flat.project(chunk.dataset.features[0].geometry.as_ref().unwrap()).extent());
+        assert!(!chunk.prepare_display(&flat, 1e6, false), "chunk eligibility must not leak into ordinary drawing");
+        assert!(chunk.prepare_display(&flat, 1e6, true));
+        chunk.clear_cache();
+        let mut source = source::SourceLayer::default();
+        source.byte_budget = 1;
+        chunk.source = Some(source);
+        assert!(!chunk.prepare_display(&flat, 1e6, true));
+        assert!(chunk.display_cache().is_none());
+        // Budget exhaustion falls back to the original, fully projected geometry.
+        let full = flat.project(chunk.dataset.features[0].geometry.as_ref().unwrap());
+        assert_eq!(chunk.thinned_in(&flat, "mercator", 1e6), &[Some(full)]);
+    }
+
+    #[test]
+    fn geometry_only_lod_does_not_charge_for_unused_extents() {
+        let l = long_line(100);
+        let copy = lod::project_budgeted(&l.dataset.features, 20, usize::MAX).unwrap();
+        let budget = lod::cache_bytes(&copy);
+        assert_eq!(lod::project_budgeted(&l.dataset.features, 20, budget).unwrap(), copy);
+        assert!(lod::display(&l.dataset.features, 0, 20, budget, true).is_none());
+    }
+
+    /// Tilted bands and zoom reversals reuse bounded display levels shared by snapshots.
+    #[test]
+    fn display_levels_are_reused_across_bands_and_bounded_together() {
+        let flat = projection::Flat::Mercator;
+        let mut l = long_line(lod::THIN_ABOVE + 1000);
+        let tolerances = [12_000.0, 24_000.0, 48_000.0];
+        let before = lod::DISPLAY_BUILDS.get();
+        let mut pointers = Vec::new();
+        for tol in tolerances {
+            assert!(l.prepare_display(&flat, tol, false));
+            pointers.push(l.display_cache().unwrap().0.as_ptr());
+        }
+        let mut copy = l.clone();
+        for _ in 0..3 {
+            for (tol, pointer) in tolerances.into_iter().zip(&pointers) {
+                assert!(copy.prepare_display(&flat, tol, false));
+                assert_eq!(copy.display_cache().unwrap().0.as_ptr(), *pointer);
+            }
+        }
+        assert_eq!(lod::DISPLAY_BUILDS.get(), before + 3);
+        assert!(copy.projected_cache().is_empty());
+        let available = copy.display_levels.iter().map(|d| d.bytes).min().unwrap();
+        let base = copy.view_memory.base(&copy.dataset.features, &copy.projected, &copy.projected_extents);
+        let mut source = source::SourceLayer::default();
+        source.byte_budget = base + available;
+        copy.source = Some(source);
+        assert!(copy.prepare_display(&flat, 48_000.0, false));
+        assert!(copy.display_levels.iter().map(|d| d.bytes).sum::<usize>() <= available);
+        assert_eq!(copy.display_levels.len(), 1);
+        copy.touch_geometry();
+        assert!(copy.prepare_display(&flat, 48_000.0, false));
+        assert_eq!(lod::DISPLAY_BUILDS.get(), before + 4);
+        copy.clear_cache();
+        assert!(copy.display_levels.is_empty());
+    }
+
+    /// Unchanged budgets leave snapshot LOD arrays shared; only eviction needs a private array.
+    #[test]
+    fn trimming_lod_preserves_snapshot_sharing_when_nothing_is_evicted() {
+        let flat = projection::Flat::Mercator;
+        let mut l = long_line(lod::THIN_ABOVE + 1000);
+        l.thinned_in(&flat, "mercator", 12_000.0);
+        let mut copy = l.clone();
+        copy.trim_thinned_levels(lod::CACHE_BYTES);
+        assert!(std::sync::Arc::ptr_eq(&l.thinned, &copy.thinned));
+        copy.trim_thinned_levels(0);
+        assert!(!std::sync::Arc::ptr_eq(&l.thinned, &copy.thinned));
+        assert!(l.thinned.iter().any(|(_, c)| c.is_some()));
+        assert!(copy.thinned.iter().all(|(_, c)| c.is_none()));
+    }
+
+    /// Display and exact-consumer LOD levels coexist within one source budget, including shrinkage.
+    #[test]
+    fn display_and_exact_lod_share_one_budget() {
+        let flat = projection::Flat::Mercator;
+        let mut l = long_line(lod::THIN_ABOVE + 1000);
+        assert!(l.prepare_display(&flat, 12_000.0, false));
+        let display_bytes = l.display_levels[0].bytes;
+        l.projected();
+        assert_eq!(l.display_levels.len(), 1);
+        let base = l.view_memory.base(&l.dataset.features, &l.projected, &l.projected_extents);
+        let copy = lod::project_budgeted(&l.dataset.features, lod::level(24_000.0).unwrap(), usize::MAX).unwrap();
+        let extra = lod::cache_bytes(&copy);
+        let mut source = source::SourceLayer::default();
+        source.byte_budget = base + display_bytes + extra;
+        l.source = Some(source);
+        l.thinned_in(&flat, "mercator", 24_000.0);
+        assert_eq!(l.display_levels.len(), 1);
+        assert!(l.thinned.iter().any(|(_, c)| c.is_some()));
+        assert!(l.view_cache_bytes() <= base + display_bytes + extra);
+        l.source.as_mut().unwrap().byte_budget = base + display_bytes;
+        l.thinned_in(&flat, "mercator", 24_000.0);
+        assert_eq!(l.display_levels.len(), 1);
+        assert!(l.thinned.iter().all(|(_, c)| c.is_none()));
+        assert!(l.view_cache_bytes() <= base + display_bytes);
+        l.source.as_mut().unwrap().byte_budget = base;
+        l.thinned_in(&flat, "mercator", f64::NAN);
+        assert!(l.display_levels.is_empty());
+        assert!(l.thinned.iter().all(|(_, c)| c.is_none()));
+        assert!(l.view_cache_bytes() <= base);
+    }
+
+    /// Invalid requests hide the active display without discarding reusable Mercator levels.
+    #[test]
+    fn invalid_display_requests_clear_the_active_cache() {
+        let flat = projection::Flat::Mercator;
+        let mut l = long_line(lod::THIN_ABOVE + 1000);
+        for tol in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(l.prepare_display(&flat, 12_000.0, false));
+            assert!(l.display_cache().is_some());
+            assert!(!l.prepare_display(&flat, tol, false));
+            assert!(l.display_cache().is_none());
+            assert_eq!(l.display_levels.len(), 1, "invalid requests keep the reusable level");
+        }
+        assert!(l.prepare_display(&flat, 12_000.0, false));
+        let custom = projection::Flat::of(&Projection::Custom("EPSG:32637".into()));
+        assert!(!l.prepare_display(&custom, 12_000.0, false));
+        assert!(l.display_cache().is_none());
+    }
+
+    /// Alternating failed zoom levels must not repeatedly walk all source vertices.
+    #[test]
+    fn several_rejected_display_levels_are_memoized() {
+        let flat = projection::Flat::Mercator;
+        let mut l = long_line(lod::THIN_ABOVE + 1000);
+        let before = lod::DISPLAY_BUILDS.get();
+        for _ in 0..3 {
+            for tol in [0.001, 0.002, 0.004] {
+                assert!(!l.prepare_display(&flat, tol, false));
+            }
+        }
+        assert_eq!(lod::DISPLAY_BUILDS.get(), before + 3);
+        assert_eq!(l.display_rejected.len(), lod::LEVELS_KEPT);
+        l.touch_geometry();
+        assert!(!l.prepare_display(&flat, 0.001, false));
+        assert_eq!(lod::DISPLAY_BUILDS.get(), before + 4);
+    }
+
+    #[test]
+    fn rejected_display_levels_are_not_rebuilt_on_unchanged_frames() {
+        let flat = projection::Flat::Mercator;
+        let mut l = long_line(lod::THIN_ABOVE + 1000);
+        assert!(!l.prepare_display(&flat, 0.001, false));
+        let built = lod::DISPLAY_BUILDS.get();
+        l.thinned_in(&flat, "mercator", 0.001);
+        assert!(!l.prepare_display(&flat, 0.001, false));
+        assert_eq!(lod::DISPLAY_BUILDS.get(), built, "thinned_in builds geometry only");
+        l.thinned_in(&flat, "mercator", 0.001);
+        assert!(!l.prepare_display(&flat, 0.001, false));
+        assert_eq!(lod::DISPLAY_BUILDS.get(), built);
+        l.touch_geometry();
+        assert!(!l.prepare_display(&flat, 0.001, false));
+        assert_eq!(lod::DISPLAY_BUILDS.get(), built + 1, "a changed geometry must retry");
     }
 
     #[test]
@@ -2485,6 +3374,7 @@ mod tests {
             other_strokes: Vec::new(),
             class_fills: Default::default(),
             other_fills: Vec::new(),
+            expression: None,
         };
         let labels = |l: &Layer, scale| l.shown_legend(scale).map(|v| v.into_iter().map(|e| e.label).collect::<Vec<_>>());
         assert_eq!(labels(l, 1e6), Some(vec!["1".to_string(), "2".to_string()]), "no 9, no <all other values>");

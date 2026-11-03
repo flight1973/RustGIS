@@ -27,6 +27,13 @@ pub struct FeatureInfo {
     /// The answer formats (INFO_FORMAT) the service offers; none when the layer isn't queryable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub formats: Vec<String>,
+    /// The system it is asked in, as the service names it, for a layer drawn in a system of its
+    /// own (#769); empty, Web Mercator.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub crs: String,
+    /// Whether its bounding box is written north first (WMS 1.3.0, in such a system).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lat_first: bool,
 }
 
 /// Pixels across the map window a request describes, the point in its middle pixel.
@@ -90,12 +97,35 @@ impl FeatureInfo {
     /// `m_per_px` metres per pixel: a small window of the map around the point, which is its
     /// middle pixel. `None` when the layer can't be asked.
     pub fn request(&self, x: f64, y: f64, m_per_px: f64) -> Option<String> {
-        if !self.queryable() || !(x.is_finite() && y.is_finite() && m_per_px.is_finite() && m_per_px > 0.0) {
+        if !(self.queryable() && x.is_finite() && y.is_finite() && m_per_px.is_finite() && m_per_px > 0.0) {
             return None;
         }
         let format = self.info_format()?;
         let half = f64::from(WINDOW) / 2.0 * m_per_px;
-        let bbox = format!("{},{},{},{}", x - half, y - half, x + half, y + half);
+        let (code, bbox) = match self.crs.as_str() {
+            "" => (Cow::Borrowed("EPSG:3857"), format!("{},{},{},{}", x - half, y - half, x + half, y + half)),
+            name => {
+                // The window in the layer's system: about its centre, as wide as the window's
+                // corners reach there (the point stays in its middle pixel).
+                let code = super::warp::epsg_of(name)?;
+                super::warp::usable(code)?;
+                let t = super::warp::transformer(code)?;
+                let to = |dx: f64, dy: f64| t.from_merc(rustgis_geom::Coord::new(x + dx, y + dy));
+                let c = to(0.0, 0.0)?;
+                let corners = [to(-half, -half)?, to(half, -half)?, to(-half, half)?, to(half, half)?];
+                let rx = corners.iter().map(|p| (p.x - c.x).abs()).fold(0.0, f64::max);
+                let ry = corners.iter().map(|p| (p.y - c.y).abs()).fold(0.0, f64::max);
+                let r = rx.max(ry);
+                if !(r.is_finite() && r > 0.0) {
+                    return None;
+                }
+                let bbox = match self.lat_first {
+                    true => format!("{},{},{},{}", c.y - r, c.x - r, c.y + r, c.x + r),
+                    false => format!("{},{},{},{}", c.x - r, c.y - r, c.x + r, c.y + r),
+                };
+                (Cow::Owned(super::encode(name)), bbox)
+            }
+        };
         let mid = WINDOW / 2;
         let v13 = self.version.starts_with("1.3");
         let (crs, i, j, exceptions) = if v13 { ("CRS", "I", "J", "XML") } else { ("SRS", "X", "Y", "application/vnd.ogc.se_xml") };
@@ -104,7 +134,7 @@ impl FeatureInfo {
         Some(with_query(
             &self.url,
             &format!(
-                "SERVICE=WMS&VERSION={}&REQUEST=GetFeatureInfo&LAYERS={layer}&STYLES=&{crs}=EPSG:3857&BBOX={bbox}&WIDTH={WINDOW}&HEIGHT={WINDOW}&FORMAT={}&TRANSPARENT=TRUE&QUERY_LAYERS={layer}&INFO_FORMAT={}&FEATURE_COUNT={FEATURE_COUNT}&{i}={mid}&{j}={mid}&EXCEPTIONS={}",
+                "SERVICE=WMS&VERSION={}&REQUEST=GetFeatureInfo&LAYERS={layer}&STYLES=&{crs}={code}&BBOX={bbox}&WIDTH={WINDOW}&HEIGHT={WINDOW}&FORMAT={}&TRANSPARENT=TRUE&QUERY_LAYERS={layer}&INFO_FORMAT={}&FEATURE_COUNT={FEATURE_COUNT}&{i}={mid}&{j}={mid}&EXCEPTIONS={}",
                 super::encode(&self.version),
                 super::encode(map_format),
                 super::encode(format),
@@ -128,7 +158,14 @@ pub(super) fn request_of(root: &Node, url: &str, version: &str, map_format: &str
         .unwrap_or_else(|| super::endpoint(url));
     // The request's own parameters replace any the advertised address carries.
     let get = without_wms_keys(&get);
-    Some(FeatureInfo { url: get, version: version.to_string(), layer: String::new(), map_format: map_format.to_string(), formats })
+    Some(FeatureInfo {
+        url: get,
+        version: version.to_string(),
+        layer: String::new(),
+        map_format: map_format.to_string(),
+        formats,
+        ..FeatureInfo::default()
+    })
 }
 
 /// The GetMap parameters a WMS tile template carries, left out of its service's address.
@@ -156,7 +193,7 @@ const INFO_KEYS: [&str; 7] = ["query_layers", "info_format", "feature_count", "i
 
 /// An address without the WMS request parameters it carries (GetMap's and GetFeatureInfo's),
 /// keeping the others (MapServer's `map=`, a token); as it is when it carries none.
-fn without_wms_keys(url: &str) -> String {
+pub(super) fn without_wms_keys(url: &str) -> String {
     let pairs: Vec<&str> = url
         .split('#')
         .next()
@@ -175,6 +212,24 @@ fn without_wms_keys(url: &str) -> String {
     }
     let kept: Vec<&str> = pairs.into_iter().filter(|kv| !is_wms_key(kv)).collect();
     if kept.is_empty() { base(url).to_string() } else { format!("{}?{}", base(url), kept.join("&")) }
+}
+
+/// The time a WMS tile template (a GetMap request) draws at: its `TIME`, as it is in the address
+/// (encoded), when it is a time ([`super::checked_wms_time`]). A GetFeatureInfo request of the layer
+/// asks at the same time.
+pub fn map_time(template: &str) -> Option<&str> {
+    let v = query_value(template, "time")?;
+    let decoded = url::form_urlencoded::parse(format!("v={v}").as_bytes()).next().map(|(_, v)| v.into_owned())?;
+    super::checked_wms_time(&decoded).ok().map(|_| v)
+}
+
+/// A GetFeatureInfo request of the layer drawn by WMS tile `template`, at its time: with the
+/// template's `TIME`, when it has one ([`map_time`]).
+pub fn at_map_time(request: String, template: &str) -> String {
+    match map_time(template) {
+        Some(time) => super::with_query(&request, &format!("TIME={time}")),
+        None => request,
+    }
 }
 
 /// A WMS tile template's (a GetMap request's) service and layer: its GetCapabilities address and
@@ -727,6 +782,7 @@ mod tests {
             layer: "lines".into(),
             map_format: "image/png".into(),
             formats: formats.iter().map(|f| f.to_string()).collect(),
+            ..FeatureInfo::default()
         };
         let ask = |fi: &FeatureInfo| fi.request(971_712.0, 6_021_494.0, 2.0).unwrap();
         assert_eq!(fi.info_format(), Some("application/json"));
@@ -809,5 +865,34 @@ mod tests {
             let _ = read_feature_info(body);
         }
         let _ = wms_layer_of("http://x?service=wms&request=getmap&layers=%");
+    }
+
+    /// A layer drawn in a system of its own (#769) is asked in it: the window about the point
+    /// worked out there, its box east first, or north first where the layer's are.
+    #[test]
+    fn asks_in_the_layers_own_system() {
+        let fi = FeatureInfo {
+            url: "https://wms.example.org/".into(),
+            version: "1.3.0".into(),
+            layer: "a".into(),
+            formats: vec!["application/json".into()],
+            crs: "EPSG:2056".into(),
+            ..FeatureInfo::default()
+        };
+        // Bern (7.4474°E, 46.948°N): LV95 2 600 000 E, 1 200 000 N, about.
+        let m = rustgis_geom::lonlat_to_merc(rustgis_geom::Coord::new(7.4474, 46.948));
+        let r = fi.request(m.x, m.y, 2.0).unwrap();
+        assert!(r.contains("&CRS=EPSG:2056&BBOX="), "{r}");
+        let bbox = r.split("&BBOX=").nth(1).unwrap().split('&').next().unwrap();
+        let n: Vec<f64> = bbox.split(',').map(|v| v.parse().unwrap()).collect();
+        let (cx, cy) = ((n[0] + n[2]) / 2.0, (n[1] + n[3]) / 2.0);
+        assert!((cx - 2_600_000.0).abs() < 1_000.0 && (cy - 1_200_000.0).abs() < 1_000.0, "{bbox}");
+        // 101 pixels of 2 Web Mercator metres there: about 140 m of ground across.
+        assert!((120.0..160.0).contains(&(n[2] - n[0])) && (n[2] - n[0] - (n[3] - n[1])).abs() < 1e-6, "{bbox}");
+        let geo = FeatureInfo { crs: "EPSG:4326".into(), lat_first: true, ..fi };
+        let r = geo.request(m.x, m.y, 2.0).unwrap();
+        let bbox = r.split("&BBOX=").nth(1).unwrap().split('&').next().unwrap();
+        let n: Vec<f64> = bbox.split(',').map(|v| v.parse().unwrap()).collect();
+        assert!(n[0] > 46.0 && n[0] < 47.5 && n[1] > 7.0 && n[1] < 8.0, "latitude first: {bbox}");
     }
 }

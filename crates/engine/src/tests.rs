@@ -464,6 +464,80 @@ fn fill_layers_stack_and_survive_save_and_undo() {
     }
 }
 
+/// Gradient and shapeburst fills: their colours, stops and how they run, kept with the project;
+/// junk refused, numbers held within range.
+#[test]
+fn gradient_and_shapeburst_fills_are_set_and_kept() {
+    use rustgis_map::Rgba;
+    use rustgis_map::fills::{FillPattern, GradientPoint, GradientShape, MAX_GRADIENT_POINT, Spread, Stop};
+    let mut s = world();
+    let fills = json!([
+        {"color": "#FF0000", "pattern": "gradient", "color2": "#0000FF", "shape": "radial", "from": "centroid", "to": [1, 0.5], "spread": "reflect", "angle": 30, "stops": [[0.5, "#00FF00"]]},
+        {"color": "#2B6ADB", "pattern": "shapeburst", "color2": "#6A94DB", "distance": 14, "blur": 10, "ignoreRings": true, "discrete": true}
+    ]);
+    assert_eq!(s.run("layer.fillLayers", &json!({"layer": "Countries", "fills": fills})).unwrap(), json!({"fills": 2}));
+    let got = |s: &Session| s.map().layer_by_name("Countries").unwrap().fill_layers.clone();
+    let f = got(&s);
+    let FillPattern::Gradient { shape, color2, stops, from, to, spread, angle, in_view, discrete } = f[0].pattern else { panic!("{f:?}") };
+    assert_eq!(
+        (shape, color2, from, to, spread, angle, in_view, discrete),
+        (
+            GradientShape::Radial,
+            Rgba::rgb(0, 0, 255),
+            GradientPoint::CENTROID,
+            GradientPoint::At([1.0, 0.5]),
+            Spread::Reflect,
+            30.0,
+            false,
+            false
+        )
+    );
+    assert_eq!(stops.as_slice(), &[Stop { at: 0.5, color: Rgba::rgb(0, 255, 0) }]);
+    assert_eq!(
+        f[1].pattern,
+        FillPattern::Shapeburst {
+            color2: Rgba::rgb(0x6A, 0x94, 0xDB),
+            stops: Default::default(),
+            discrete: true,
+            distance: Some(14.0),
+            blur: 10,
+            ignore_rings: true
+        }
+    );
+    // Kept with the project.
+    let text = serde_json::to_string(&s.project).unwrap();
+    assert!(text.contains(r#""from":"centroid""#), "{text}");
+    assert_eq!(got(&Session::new(serde_json::from_str(&text).unwrap())), f);
+    // Defaults: QGIS's, top middle to bottom middle, to white; a shapeburst over the whole shape.
+    s.run("layer.fillLayers", &json!({"layer": "Countries", "fills": [{"pattern": "gradient"}, {"pattern": "shapeburst"}]})).unwrap();
+    let f = got(&s);
+    assert!(
+        matches!(f[0].pattern, FillPattern::Gradient { shape: GradientShape::Linear, from: GradientPoint::At([0.5, 0.0]), to: GradientPoint::At([0.5, 1.0]), color2, .. } if color2 == Rgba::rgb(255, 255, 255)),
+        "{f:?}"
+    );
+    assert!(matches!(f[1].pattern, FillPattern::Shapeburst { distance: None, blur: 0, .. }), "{f:?}");
+    // Held within range.
+    s.run("layer.fillLayers", &json!({"layer": "Countries", "fills": [{"pattern": "gradient", "from": [1e300, -1e300], "angle": -90, "stops": [[7, "#000000"], [-1, "#FFFFFF"]]}]})).unwrap();
+    let FillPattern::Gradient { from, angle, stops, .. } = got(&s)[0].pattern else { panic!() };
+    assert_eq!((from, angle), (GradientPoint::At([MAX_GRADIENT_POINT, -MAX_GRADIENT_POINT]), 270.0));
+    assert_eq!(stops.as_slice().iter().map(|s| s.at).collect::<Vec<_>>(), vec![0.0, 1.0], "in order, within 0 to 1");
+    for bad in [
+        json!({"pattern": "gradient", "shape": "spiral"}),
+        json!({"pattern": "gradient", "spread": 2}),
+        json!({"pattern": "gradient", "from": "middle"}),
+        json!({"pattern": "gradient", "from": [0.5]}),
+        json!({"pattern": "gradient", "stops": [[0.5]]}),
+        json!({"pattern": "gradient", "stops": [[0.5, "green"]]}),
+        json!({"pattern": "gradient", "stops": (0..20).map(|i| json!([i as f64 / 20.0, "#000000"])).collect::<Vec<_>>()}),
+        json!({"pattern": "gradient", "inView": "yes"}),
+        json!({"pattern": "shapeburst", "blur": 99}),
+        json!({"pattern": "shapeburst", "distance": -1}),
+        json!({"pattern": "shapeburst", "color2": "blue"}),
+    ] {
+        assert!(s.run("layer.fillLayers", &json!({"layer": "Countries", "fills": [bad]})).is_err(), "{bad}");
+    }
+}
+
 #[test]
 fn line_strokes_stack_and_survive_save_and_undo() {
     use rustgis_map::{LineCap, LineJoin, LineStroke, Rgba};
@@ -693,6 +767,521 @@ fn a_point_takes_stacked_marks_and_turns_by_a_field() {
     // None turns them back.
     s.run("layer.markerRotation", &json!({"layer": "Cities", "field": null})).unwrap();
     assert!(s.map().layer_by_name("Cities").unwrap().marker_rotation.is_none());
+}
+
+#[test]
+fn a_symbol_is_set_by_expressions() {
+    let mut s = world();
+    let r = s
+        .run("layer.symbolBy", &json!({"layer": "Cities", "size": "scale_linear(pop_max, 0, 2e7, 4, 20)", "fill": "if(pop_max > 1e7, '#ff0000', NULL)", "angle": "45"}))
+        .unwrap();
+    assert_eq!(r["angle"], "45");
+    let l = s.map().layer_by_name("Cities").unwrap();
+    let fi = l.dataset.field_index("pop_max").unwrap();
+    let big = (0..l.dataset.features.len()).find(|r| l.dataset.value(*r, fi).as_f64().is_some_and(|v| v > 1e7)).unwrap();
+    let st = l.styler(None);
+    assert_eq!(st.symbol(big).fill, rustgis_map::Rgba::new(255, 0, 0, 255));
+    assert!(st.symbol(big).size > 4.0);
+    assert_eq!(st.marker_turn(big), 45.0);
+    // Drawn in an export.
+    let dir = std::env::temp_dir().join(format!("rustgis-symbol-by-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    s.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 320, "height": 200})).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    let depth = s.undo_depth();
+    for (bad, says) in [
+        (json!({"layer": "Cities", "size": "nosuch + 1"}), "size: "),
+        (json!({"layer": "Cities", "fill": "'red' ||"}), "fill: "),
+        (json!({"layer": "Cities", "stroke": 3}), "stroke is an expression"),
+        (json!({"layer": "Rivers", "angle": "10"}), "angle works on point layers"),
+        (json!({"layer": "Rivers", "size": "4"}), "size works on point layers"),
+    ] {
+        let err = s.run("layer.symbolBy", &bad).unwrap_err();
+        assert!(err.contains(says), "{bad}: {err}");
+    }
+    assert_eq!(s.undo_depth(), depth);
+    // A line's width by expression; the Cities keep theirs.
+    s.run("layer.symbolBy", &json!({"layer": "Rivers", "strokeWidth": "2.5"})).unwrap();
+    assert_eq!(s.map().layer_by_name("Cities").unwrap().symbol_by.angle.as_deref(), Some("45"));
+    // A key left out is kept; null removes one, and undo brings it back.
+    s.run("layer.symbolBy", &json!({"layer": "Cities", "angle": null, "fill": ""})).unwrap();
+    let by = &s.map().layer_by_name("Cities").unwrap().symbol_by;
+    assert!(by.size.is_some() && by.fill.is_none() && by.angle.is_none());
+    s.undo();
+    assert_eq!(s.map().layer_by_name("Cities").unwrap().symbol_by.angle.as_deref(), Some("45"));
+}
+
+/// Applied again by its own expression, an imported rule style keeps as many classes as it has
+/// (past the first 64 values, up to the 200 an import makes); classes by an expression reading the map's scale are said to be
+/// the values given without one.
+#[test]
+fn unique_values_by_expression_keep_their_classes_and_say_scales() {
+    let mut s = world();
+    let mut ds = rustgis_data::Dataset::new(
+        "many",
+        rustgis_data::GeometryType::Point,
+        vec![rustgis_data::Field::new("v", rustgis_data::FieldType::Integer)],
+    );
+    let n = rustgis_map::symbology::MAX_EXPRESSION_CLASSES as i64;
+    for i in 0..n {
+        ds.push(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(i as f64 / 10.0, 1.0))), vec![rustgis_data::Value::Int(i)]);
+    }
+    let many = s.map_mut().add_dataset(ds);
+    let rules: String =
+        (0..n).map(|i| format!(r#"<rule filter="&quot;v&quot; = {i} AND &quot;v&quot; &gt;= 0" symbol="0" label="R{i:03}"/>"#)).collect();
+    let qml = format!(
+        r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">{rules}</rules><symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#
+    );
+    s.run("style.importQgis", &json!({"layer": many, "text": qml})).unwrap();
+    let classes = |s: &Session| match &s.map().layer(many).unwrap().renderer {
+        rustgis_map::Renderer::Unique { classes, expression: Some(_), .. } => classes.len(),
+        r => panic!("{r:?}"),
+    };
+    assert_eq!(classes(&s), n as usize);
+    let mark = s.notice_mark();
+    s.run("layer.symbology", &json!({"layer": many, "type": "unique", "ramp": "Ember"})).unwrap();
+    assert_eq!(classes(&s), n as usize, "every rule keeps its class, up to the limit");
+    let said = |s: &Session, what: &str| s.notices_since(mark).iter().any(|n| n.text.contains(what));
+    assert!(!said(&s, "past the first"), "{:?}", s.notices_since(mark));
+    assert!(!said(&s, "without a map scale"));
+    // An expression of its own keeps the first 64, and says so.
+    s.run("layer.symbology", &json!({"layer": many, "type": "unique", "expression": "'k' || (1000 + v)"})).unwrap();
+    assert_eq!(classes(&s), rustgis_map::symbology::MAX_UNIQUE);
+    assert!(said(&s, "past the first 64"));
+    // One reading the map's scale is classed without one, and says so.
+    let mark = s.notice_mark();
+    s.run(
+        "layer.symbology",
+        &json!({"layer": many, "type": "unique", "expression": "CASE WHEN @map_scale < 50000 THEN 'detail' ELSE 'overview' END"}),
+    )
+    .unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("without a map scale")), "{:?}", s.notices_since(mark));
+    // Its classes are what it gives with no scale: 'detail' only at some scales isn't one.
+    let rustgis_map::Renderer::Unique { classes: kept, .. } = &s.map().layer(many).unwrap().renderer else { panic!() };
+    assert_eq!(kept.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["overview"]);
+    // So too with the scale written right after a word, which the expression still reads.
+    let mark = s.notice_mark();
+    s.run(
+        "layer.symbology",
+        &json!({"layer": many, "type": "unique", "expression": "CASE WHEN@map_scale < 50000 THEN 'detail' ELSE 'overview' END"}),
+    )
+    .unwrap();
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("without a map scale")), "{:?}", s.notices_since(mark));
+    let rustgis_map::Renderer::Unique { classes: kept, .. } = &s.map().layer(many).unwrap().renderer else { panic!() };
+    assert_eq!(kept.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["overview"]);
+}
+
+#[test]
+fn unique_values_class_by_an_expression() {
+    let mut s = world();
+    let e = "CASE WHEN pop_max >= 10000000 THEN 'mega' ELSE 'city' END";
+    // Classed by a field that isn't the first, which clearing the expression comes back to.
+    let by = s.map().layer_by_name("Cities").unwrap().dataset.fields.last().unwrap().name.clone();
+    assert_ne!(Some(&by), s.map().layer_by_name("Cities").unwrap().dataset.fields.first().map(|f| &f.name));
+    s.run("layer.symbology", &json!({"layer": "Cities", "type": "unique", "field": by})).unwrap();
+    s.run("layer.symbology", &json!({"layer": "Cities", "type": "unique", "expression": e})).unwrap();
+    let keys = |s: &Session| match &s.map().layer_by_name("Cities").unwrap().renderer {
+        rustgis_map::Renderer::Unique { classes, .. } => classes.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+        r => panic!("{r:?}"),
+    };
+    let expression = |s: &Session| s.map().layer_by_name("Cities").unwrap().renderer.expression().map(str::to_string);
+    assert_eq!((keys(&s), expression(&s).as_deref()), (vec!["city".to_string(), "mega".to_string()], Some(e)));
+    let depth = s.undo_depth();
+    for (bad, says) in [
+        (json!({"layer": "Cities", "type": "unique", "expression": "nosuch + 1"}), "nosuch"),
+        (json!({"layer": "Cities", "type": "unique", "expression": e, "field": "name"}), "not both"),
+        (json!({"layer": "Cities", "type": "graduated", "expression": e}), "only Unique Values"),
+        (json!({"layer": "Cities", "type": "unique", "expression": 5}), "expression is text"),
+    ] {
+        let err = s.run("layer.symbology", &bad).unwrap_err();
+        assert!(err.contains(says), "{bad}: {err}");
+    }
+    assert_eq!(s.undo_depth(), depth);
+    // Applied again with neither a field nor an expression (another colour scheme): the same
+    // expression. Null or blank goes back to a field; undo brings the expression back.
+    s.run("layer.symbology", &json!({"layer": "Cities", "type": "unique", "ramp": "Ember"})).unwrap();
+    assert_eq!(expression(&s).as_deref(), Some(e));
+    s.run("layer.symbology", &json!({"layer": "Cities", "type": "unique", "expression": null})).unwrap();
+    assert!(expression(&s).is_none());
+    assert_eq!(s.map().layer_by_name("Cities").unwrap().renderer.field(), Some(by.as_str()), "back to the field it had");
+    s.undo();
+    assert_eq!(expression(&s).as_deref(), Some(e));
+    s.run("layer.symbology", &json!({"layer": "Cities", "type": "unique", "expression": "  "})).unwrap();
+    assert!(expression(&s).is_none(), "blank text goes back to the field too");
+    assert_eq!(s.map().layer_by_name("Cities").unwrap().renderer.field(), Some(by.as_str()));
+    s.undo();
+    assert_eq!(expression(&s).as_deref(), Some(e));
+    // A style shared to the web says it draws one symbol; a map draws the classes.
+    let dir = std::env::temp_dir().join(format!("rustgis-unique-by-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    s.run("share.webStyle", &json!({"layer": "Cities", "path": dir.join("cities.json").display().to_string()})).unwrap();
+    assert!(s.notices.iter().any(|n| n.text.contains("classes by expression aren't in it")), "{:?}", s.notices.last());
+    s.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 320, "height": 200})).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    // More values than classes: the features past them are said, with how many; a few values
+    // say nothing.
+    let past = |s: &Session| s.notices.iter().filter(|n| n.text.contains("past the first")).count();
+    assert_eq!(past(&s), 0);
+    s.run("layer.symbology", &json!({"layer": "Cities", "type": "unique", "expression": "name"})).unwrap();
+    let l = s.map().layer_by_name("Cities").unwrap();
+    let (_, rest) =
+        rustgis_map::Renderer::unique_by_counted(&l.dataset, &[], "name", rustgis_map::Ramp::Harbour, l.renderer.base_symbol()).unwrap();
+    assert!(rest > 0);
+    let said =
+        format!("Cities: {rest} features whose value is past the first {} values the expression gives", rustgis_map::symbology::MAX_UNIQUE);
+    assert!(s.notices.iter().any(|n| n.text.starts_with(&said)), "{:?}", s.notices.last());
+    s.undo();
+    // Shared to the web, the one symbol is one that draws: not a rest without a fill or an outline
+    // width.
+    let cities = s.map().layer_by_name("Cities").unwrap().id;
+    let l = s.map_mut().layer_mut(cities).unwrap();
+    let rustgis_map::Renderer::Unique { other, classes, .. } = &mut l.renderer else { panic!() };
+    (other.fill, other.stroke, other.stroke_width) = (rustgis_map::Rgba::new(0, 0, 0, 0), rustgis_map::Rgba::rgb(9, 9, 9), 0.0);
+    let first = classes[0].1.fill.hex();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("one.json");
+    s.run("share.webStyle", &json!({"layer": "Cities", "path": path.display().to_string()})).unwrap();
+    let style: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let circle = style["layers"].as_array().unwrap().iter().find(|l| l["type"] == "circle").unwrap();
+    assert_eq!(circle["paint"]["circle-color"], json!(first));
+    assert!(s.notices.iter().any(|n| n.text.contains("one symbol (its first class's)")), "{:?}", s.notices.last());
+    // A point's rest of no size draws nothing either, however it is filled.
+    let l = s.map_mut().layer_mut(cities).unwrap();
+    let rustgis_map::Renderer::Unique { other, .. } = &mut l.renderer else { panic!() };
+    (other.fill, other.size) = (rustgis_map::Rgba::rgb(9, 9, 9), 0.0);
+    s.run("share.webStyle", &json!({"layer": "Cities", "path": path.display().to_string()})).unwrap();
+    let style: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let circle = style["layers"].as_array().unwrap().iter().find(|l| l["type"] == "circle").unwrap();
+    assert_eq!(circle["paint"]["circle-color"], json!(first));
+    // A line's colour is its stroke's, as the map draws it.
+    let mut ds = rustgis_data::Dataset::new("ways", rustgis_data::GeometryType::Polyline, vec![]);
+    ds.push(Some(rustgis_data::Geometry::Line(vec![vec![rustgis_data::Coord::new(0.0, 0.0), rustgis_data::Coord::new(1.0, 1.0)]])), vec![]);
+    let ways = s.map_mut().add_dataset(ds);
+    let l = s.map_mut().layer_mut(ways).unwrap();
+    let mut sym = l.renderer.base_symbol();
+    (sym.fill, sym.stroke) = (rustgis_map::Rgba::rgb(1, 2, 3), rustgis_map::Rgba::rgb(200, 100, 50));
+    l.renderer = rustgis_map::Renderer::Single(sym);
+    s.run("share.webStyle", &json!({"layer": ways, "path": path.display().to_string()})).unwrap();
+    let style: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let line = style["layers"].as_array().unwrap().iter().find(|l| l["type"] == "line").unwrap();
+    assert_eq!(line["paint"]["line-color"], json!(sym.stroke.hex()));
+    // By expression, a line's rest with a fill but no stroke draws nothing: the first class's.
+    let mut ds = rustgis_data::Dataset::new(
+        "kinds",
+        rustgis_data::GeometryType::Polyline,
+        vec![rustgis_data::Field::new("k", rustgis_data::FieldType::Text)],
+    );
+    ds.push(
+        Some(rustgis_data::Geometry::Line(vec![vec![rustgis_data::Coord::new(0.0, 0.0), rustgis_data::Coord::new(1.0, 1.0)]])),
+        vec![rustgis_data::Value::Text("a".into())],
+    );
+    let kinds = s.map_mut().add_dataset(ds);
+    s.run("layer.symbology", &json!({"layer": kinds, "type": "unique", "expression": "k || 'x'"})).unwrap();
+    let l = s.map_mut().layer_mut(kinds).unwrap();
+    let rustgis_map::Renderer::Unique { other, classes, .. } = &mut l.renderer else { panic!() };
+    (other.fill, other.stroke) = (rustgis_map::Rgba::rgb(1, 2, 3), rustgis_map::Rgba::new(0, 0, 0, 0));
+    let first = classes[0].1.stroke.hex();
+    s.run("share.webStyle", &json!({"layer": kinds, "path": path.display().to_string()})).unwrap();
+    let style: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let line = style["layers"].as_array().unwrap().iter().find(|l| l["type"] == "line").unwrap();
+    assert_eq!(line["paint"]["line-color"], json!(first));
+    std::fs::remove_dir_all(&dir).ok();
+    // Deleting a field it reads: a single symbol, as for a renderer on that field, and said.
+    let mark = s.notice_mark();
+    let rustgis_map::Renderer::Unique { classes, .. } = &s.map().layer_by_name("Cities").unwrap().renderer else { panic!() };
+    let first_fill = classes[0].1.fill;
+    s.run("edit.deleteField", &json!({"layer": "Cities", "field": "pop_max"})).unwrap();
+    let rustgis_map::Renderer::Single(drawn) = &s.map().layer_by_name("Cities").unwrap().renderer else { panic!() };
+    assert_eq!(drawn.fill, first_fill, "drawn with the first class's symbol");
+    assert!(s.notices_since(mark).iter().any(|n| n.text.contains("drawn with a single symbol")), "{:?}", s.notices_since(mark));
+    // A field nothing draws by goes without a word about the symbols.
+    let mark = s.notice_mark();
+    s.run("edit.deleteField", &json!({"layer": "Cities", "field": "name"})).unwrap();
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("single symbol")), "{:?}", s.notices_since(mark));
+}
+
+#[test]
+fn qgis_measures_in_project_units_are_left_out() {
+    // QGIS's $area is in the project's units, which aren't read: left out, noted, not read as m².
+    let mut s = world();
+    let qml = |filter: &str| {
+        format!(
+            r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">
+            <rule filter="{filter}" symbol="0" label="Big"/><rule filter="&quot;pop_est&quot; &gt; 5" symbol="0" label="Kept"/></rules>
+            <symbols><symbol type="fill" name="0"><layer class="SimpleFill" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#
+        )
+    };
+    let r = s.run("style.importQgis", &json!({"layer": "Countries", "text": qml("$area &gt; 2")})).unwrap();
+    let said: Vec<&str> = r["notes"].as_array().unwrap().iter().filter_map(|n| n["text"].as_str()).collect();
+    assert!(said.iter().any(|n| n.contains("the rule \"Big\"") && n.contains("project's units")), "{said:?}");
+    // Named only in quotes, it is text: the rule reads.
+    let r = s.run("style.importQgis", &json!({"layer": "Countries", "text": qml("name &lt;&gt; '$area'")})).unwrap();
+    assert!(!r["notes"].to_string().contains("project's units"), "{r}");
+}
+
+#[test]
+fn qgis_rules_class_features_and_say_which_several_rules_pick() {
+    let mut s = world();
+    let qml = |rules: &str| {
+        format!(
+            r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">{rules}</rules><symbols>
+            <symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"><prop k="color" v="255,0,0,255"/></layer></symbol>
+            <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"><prop k="color" v="0,0,255,255"/></layer></symbol>
+            </symbols></renderer-v2></qgis>"#
+        )
+    };
+    let notes =
+        |r: &serde_json::Value| r["notes"].as_array().unwrap().iter().map(|n| n["text"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    // Every city of more than a million picks both rules, at the same scales.
+    let big = s.map().layer_by_name("Cities").unwrap();
+    let both = (0..big.dataset.features.len())
+        .filter(|r| big.dataset.field_index("pop_max").and_then(|f| big.dataset.value(*r, f).as_f64()).is_some_and(|v| v > 5_000_000.0))
+        .count();
+    assert!(both > 0);
+    let rules = r#"<rule filter="&quot;pop_max&quot; &gt; 1000000 AND length(name) &gt; 0" symbol="0" label="Million"/>
+        <rule filter="&quot;pop_max&quot; &gt; 5000000" symbol="1" label="Five"/>"#;
+    let r = s.run("style.importQgis", &json!({"layer": "Cities", "text": qml(rules)})).unwrap();
+    let said = notes(&r);
+    assert!(said.iter().any(|n| n.contains(&format!("{both} features that more than one of its rules picks"))), "{said:?}");
+    let l = s.map().layer_by_name("Cities").unwrap();
+    assert!(l.renderer.expression().is_some_and(|e| e.contains("THEN 'Million'")), "{:?}", l.renderer);
+    // At scales that never meet, nothing is said.
+    let apart = r#"<rule filter="&quot;pop_max&quot; &gt; 1000000 AND length(name) &gt; 0" symbol="0" scalemaxdenom="10000"/>
+        <rule filter="&quot;pop_max&quot; &gt; 5000000" symbol="1" scalemindenom="20000"/>"#;
+    let said = notes(&s.run("style.importQgis", &json!({"layer": "Cities", "text": qml(apart)})).unwrap());
+    assert!(!said.iter().any(|n| n.contains("more than one")), "{said:?}");
+    // Rules reading the map's scale can't be counted at no scale: said without a count.
+    let scaled = r#"<rule filter="$scale &gt; 0 AND &quot;pop_max&quot; &gt; 1000000" symbol="0"/>
+        <rule filter="&quot;pop_max&quot; &gt; 5000000" symbol="1"/>"#;
+    let said = notes(&s.run("style.importQgis", &json!({"layer": "Cities", "text": qml(scaled)})).unwrap());
+    assert!(said.iter().any(|n| n.contains("features that more than one of its rules picks (if any)")), "{said:?}");
+    // The scale named only in quotes is text: counted.
+    let quoted = r#"<rule filter="&quot;pop_max&quot; &gt; 1000000 AND name &lt;&gt; '@map_scale'" symbol="0"/>
+        <rule filter="&quot;pop_max&quot; &gt; 5000000" symbol="1"/>"#;
+    let said = notes(&s.run("style.importQgis", &json!({"layer": "Cities", "text": qml(quoted)})).unwrap());
+    assert!(said.iter().any(|n| n.contains(&format!("{both} features that more than one of its rules picks"))), "{said:?}");
+    // Only the features its definition query keeps are counted.
+    let cities = s.map().layer_by_name("Cities").unwrap();
+    let shown = (0..cities.dataset.features.len())
+        .filter(|r| {
+            cities.dataset.field_index("pop_max").and_then(|f| cities.dataset.value(*r, f).as_f64()).is_some_and(|v| v > 10_000_000.0)
+        })
+        .count();
+    assert!(shown > 0 && shown < both);
+    s.run("layer.definitionQuery", &json!({"layer": "Cities", "where": "pop_max > 10000000"})).unwrap();
+    let said = notes(&s.run("style.importQgis", &json!({"layer": "Cities", "text": qml(rules)})).unwrap());
+    assert!(said.iter().any(|n| n.contains(&format!("{shown} features that more than one of its rules picks"))), "{said:?}");
+    s.run("layer.definitionQuery", &json!({"layer": "Cities", "where": ""})).unwrap();
+    // An else rule picks what its siblings don't: nothing two rules pick.
+    let rest = r#"<rule filter="&quot;pop_max&quot; &gt; 0"><rule filter="&quot;pop_max&quot; &lt; 1000000" symbol="0"/><rule filter="ELSE" symbol="1"/></rule>"#;
+    let said = notes(&s.run("style.importQgis", &json!({"layer": "Cities", "text": qml(rest)})).unwrap());
+    assert!(!said.iter().any(|n| n.contains("more than one")), "{said:?}");
+    // A rule whose filter names a field the layer hasn't: left out by its label, the others kept.
+    let gone = r#"<rule filter="&quot;nosuch&quot; + 1 &gt; 2" symbol="0" label="Gone"/><rule filter="&quot;pop_max&quot; &gt; 5" symbol="1" label="Kept"/>"#;
+    let said = notes(&s.run("style.importQgis", &json!({"layer": "Cities", "text": qml(gone)})).unwrap());
+    assert!(said.iter().any(|n| n.contains("the rule \"Gone\"") && n.contains("nosuch")), "{said:?}");
+    // Several that don't fit: one note, with how many and the first.
+    let two = format!("{gone}<rule filter=\"&quot;nosuch2&quot; = 1\" symbol=\"0\" label=\"Gone too\"/>");
+    let said = notes(&s.run("style.importQgis", &json!({"layer": "Cities", "text": qml(&two)})).unwrap());
+    assert_eq!(said.iter().filter(|n| n.contains("fit the layer")).count(), 1, "{said:?}");
+    assert!(said.iter().any(|n| n.contains("2 rules whose filters don't fit the layer, the first \"Gone\"")), "{said:?}");
+    s.run("style.importQgis", &json!({"layer": "Cities", "text": qml(gone)})).unwrap();
+    let l = s.map().layer_by_name("Cities").unwrap();
+    let rustgis_map::Renderer::Unique { classes, expression: Some(e), .. } = &l.renderer else { panic!("{:?}", l.renderer) };
+    assert_eq!((classes.len(), classes[0].0.as_str()), (1, "Kept"));
+    assert!(!e.contains("nosuch"), "{e}");
+    let styler = l.styler(Some(1e6));
+    let drawn = (0..l.dataset.features.len()).filter(|r| styler.symbol(*r).fill == rustgis_map::Rgba::rgb(0, 0, 255)).count();
+    assert!(drawn > 0, "the kept rule draws");
+    // None that reads: the first rule's symbol for every feature, as before rules were classed.
+    let none = r#"<rule filter="&quot;nosuch&quot; = 1" symbol="1"/><rule filter="$area &gt; 2" symbol="0"/>"#;
+    let said = notes(&s.run("style.importQgis", &json!({"layer": "Cities", "text": qml(none)})).unwrap());
+    assert!(said.iter().any(|n| n.contains("none of whose filters fit the layer")), "{said:?}");
+    let l = s.map().layer_by_name("Cities").unwrap();
+    assert!(matches!(l.renderer, rustgis_map::Renderer::Single(sym) if sym.fill == rustgis_map::Rgba::rgb(0, 0, 255)), "{:?}", l.renderer);
+    // A layer's filter that is an expression now carries over.
+    let filtered = r#"<qgis version="3.40.0"><labeling type="rule-based"><rules key="r">
+        <rule filter="length(&quot;name&quot;) &lt;= 5"><settings><text-style fieldName="name"/></settings></rule></rules></labeling></qgis>"#;
+    let said = notes(&s.run("style.importQgis", &json!({"layer": "Cities", "text": filtered})).unwrap());
+    assert!(said.is_empty(), "{said:?}");
+    let l = s.map().layer_by_name("Cities").unwrap();
+    assert_eq!(l.labels.classes.first().and_then(|c| c.where_.as_deref()), Some("length(\"name\") <= 5"));
+}
+
+#[test]
+fn labels_are_set_by_expressions() {
+    let mut s = world();
+    let r = s
+        .run(
+            "labels.by",
+            &json!({"layer": "Cities", "text": "upper(name)", "size": "scale_linear(pop_max, 0, 2e7, 8, 20)", "color": "if(pop_max > 1e7, '#ff0000', NULL)", "angle": "30"}),
+        )
+        .unwrap();
+    assert_eq!((r["text"].as_str(), r["angle"].as_str()), (Some("upper(name)"), Some("30")));
+    let l = s.map().layer_by_name("Cities").unwrap();
+    assert!(l.labels.enabled, "a text expression turns the labels on");
+    assert_eq!(l.labels.default.by.color.as_deref(), Some("if(pop_max > 1e7, '#ff0000', NULL)"));
+    let depth = s.undo_depth();
+    for (bad, says) in [
+        (json!({"layer": "Cities", "text": "nosuch || 'x'"}), "text: "),
+        (json!({"layer": "Cities", "size": "("}), "size: "),
+        (json!({"layer": "Cities", "color": 3}), "color is an expression"),
+        (json!({"layer": "Cities", "class": "Nope", "angle": "4"}), "no label class named"),
+        (json!({"layer": "Cities"}), "give text, size, color or angle"),
+    ] {
+        let err = s.run("labels.by", &bad).unwrap_err();
+        assert!(err.contains(says), "{bad}: {err}");
+    }
+    assert_eq!(s.undo_depth(), depth);
+    // A class's own; a key left out is kept, null removes one, and undo brings it back.
+    s.run("labels.class.add", &json!({"layer": "Cities", "name": "Big", "where": "pop_max > 5000000"})).unwrap();
+    s.run("labels.by", &json!({"layer": "Cities", "class": "Big", "text": "name || '!'"})).unwrap();
+    s.run("labels.by", &json!({"layer": "Cities", "angle": null, "text": ""})).unwrap();
+    let l = s.map().layer_by_name("Cities").unwrap();
+    assert_eq!(l.labels.classes[0].by.text.as_deref(), Some("name || '!'"));
+    assert!(l.labels.default.by.text.is_none() && l.labels.default.by.angle.is_none() && l.labels.default.by.size.is_some());
+    s.undo();
+    assert_eq!(s.map().layer_by_name("Cities").unwrap().labels.default.by.angle.as_deref(), Some("30"));
+    // A style shared to the web says its label expressions are left out.
+    let dir = std::env::temp_dir().join(format!("rustgis-labels-by-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    s.run("share.webStyle", &json!({"layer": "Cities", "path": dir.join("cities.json").display().to_string()})).unwrap();
+    assert!(s.notices.iter().any(|n| n.text.contains("label expressions aren't in it")), "{:?}", s.notices.last());
+    s.run("share.exportMap", &json!({"path": dir.join("map.png").display().to_string(), "width": 320, "height": 200})).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    // Converted, each label keeps its text, size and colour: the annotation draws by its fields.
+    s.run("labels.class.clear", &json!({"layer": "Cities"})).unwrap();
+    s.run("labels.by", &json!({"layer": "Cities", "text": "upper(name)", "angle": null})).unwrap();
+    s.run("labels.convert", &json!({"layer": "Cities"})).unwrap();
+    let a = s.map().layer_by_name("Cities Annotation").unwrap();
+    let names: Vec<&str> = a.dataset.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["TEXT", "SIZE", "COLOR"]);
+    let by = &a.labels.default.by;
+    assert_eq!(
+        (by.text.as_deref(), by.size.as_deref(), by.color.as_deref(), by.angle.as_deref()),
+        (None, Some("\"SIZE\""), Some("\"COLOR\""), None)
+    );
+    let fi = |n: &str| a.dataset.field_index(n).unwrap();
+    let paris = (0..a.dataset.features.len()).find(|r| a.dataset.value(*r, fi("TEXT")).to_string() == "PARIS").expect("upper-case text");
+    assert!(a.dataset.value(paris, fi("SIZE")).as_f64().is_some_and(|v| v > 8.0));
+    let red = (0..a.dataset.features.len()).filter(|r| a.dataset.value(*r, fi("COLOR")).to_string() == "255,0,0,255").count();
+    assert!(red > 0 && red < a.dataset.features.len(), "only the big cities' red, the rest the class's");
+    assert!(!s.notices.iter().any(|n| n.text.contains("cut to")), "short texts aren't cut");
+}
+
+/// What label expressions lose is said, and what's reported or kept follows what the map draws:
+/// a text cut by Convert To Annotation, the Web Style's notices, Project Info's labels, and the
+/// angle a converted label keeps, decided for each feature.
+#[test]
+fn label_expressions_say_what_they_lose() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
+    let mut s = world();
+    let cities = s.map().layer_by_name("Cities").unwrap().id;
+    // A text past its most characters is cut, said once with a count.
+    let long = format!("name || '{}'", "x".repeat(rustgis_map::label_by::MAX_LABEL_TEXT));
+    s.run("labels.by", &json!({"layer": "Cities", "text": long})).unwrap();
+    let n = s.run("labels.convert", &json!({"layer": "Cities"})).unwrap()["annotations"].as_u64().unwrap();
+    let said = format!("Cities Annotation: {n} label texts cut to {} characters", rustgis_map::label_by::MAX_LABEL_TEXT);
+    assert!(s.notices.iter().any(|x| x.text == said), "{:?}", s.notices.last());
+    s.undo();
+    // Project Info names the text expression the labels draw by, and the field once it doesn't read.
+    s.map_mut().layer_mut(cities).unwrap().labels.default.field = "name".into();
+    s.run("labels.by", &json!({"layer": "Cities", "text": "upper(name)"})).unwrap();
+    let labels = |s: &mut Session| {
+        let info = s.run("info.project", &Value::Null).unwrap();
+        info["layers"].as_array().unwrap().iter().find(|l| l["name"] == "Cities").unwrap()["labels"].clone()
+    };
+    assert_eq!(labels(&mut s), json!("upper(name)"));
+    s.map_mut().layer_mut(cities).unwrap().labels.default.by.text = Some("upper(gone)".into());
+    assert_eq!(labels(&mut s), json!("name"));
+    // Deleting the field Default labels by keeps the labels while its text expression reads, and
+    // starts Default again (labels off) once it doesn't.
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "spare", "type": "text"})).unwrap();
+    for (text, on) in [("'#' || pop_max", true), ("upper(spare)", false)] {
+        let l = s.map_mut().layer_mut(cities).unwrap();
+        (l.labels.enabled, l.labels.default.field, l.labels.default.by.text) = (true, "spare".into(), Some(text.into()));
+        s.run("edit.deleteField", &json!({"layer": "Cities", "field": "spare"})).unwrap();
+        let l = s.map().layer(cities).unwrap();
+        assert_eq!(l.labels.enabled, on, "{text}");
+        assert_eq!(l.labels.default.by.text.is_some(), on, "{text}");
+        assert!(l.labels.default.field != "spare");
+        s.undo();
+    }
+    s.map_mut().layer_mut(cities).unwrap().labels.default.by.text = Some("upper(name)".into());
+    // Web Style: a Default class labelling by a text expression alone says only that its style has
+    // none, even with other classes; one with a size but no text or field says nothing of it.
+    let dir = std::env::temp_dir().join(format!("rustgis-labels-lose-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let share = |s: &mut Session| {
+        let before = s.notices.len();
+        s.run("share.webStyle", &json!({"layer": "Cities", "path": dir.join("c.json").display().to_string()})).unwrap();
+        s.notices[before..].iter().map(|n| n.text.clone()).collect::<Vec<_>>()
+    };
+    let l = s.map_mut().layer_mut(cities).unwrap();
+    l.labels.default.field.clear();
+    l.labels.default.by.text = Some("upper(name)".into());
+    s.run("labels.class.add", &json!({"layer": "Cities", "name": "Big", "where": "pop_max > 5000000"})).unwrap();
+    // Project Info lists each class's text expression with its field.
+    s.run("labels.by", &json!({"layer": "Cities", "class": "Big", "text": "name || '!'"})).unwrap();
+    let info = s.run("info.project", &Value::Null).unwrap();
+    let classes = &info["layers"].as_array().unwrap().iter().find(|l| l["name"] == "Cities").unwrap()["labelClasses"];
+    assert_eq!(classes[0]["text"], json!("name || '!'"), "{classes}");
+    let said = share(&mut s);
+    assert!(said.iter().any(|t| t.contains("has no labels: its Default class's text is an expression")), "{said:?}");
+    assert!(!said.iter().any(|t| t.contains("labels every feature")), "{said:?}");
+    let l = s.map_mut().layer_mut(cities).unwrap();
+    (l.labels.default.by.text, l.labels.default.by.size) = (None, Some("8".into()));
+    let said = share(&mut s);
+    assert!(said.iter().any(|t| t.contains("has no labels: its Default class has no label field")), "{said:?}");
+    assert!(!said.iter().any(|t| t.contains("expression") || t.contains("labels every feature")), "{said:?}");
+    std::fs::remove_dir_all(&dir).ok();
+    // A converted label keeps its angle on a point, and none on a line it is placed along, in a
+    // layer of both; a layer of lines alone gets no ANGLE field.
+    let line = Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(5.0, 0.0)]]);
+    let point = Geometry::Point(Coord::new(1.0, 1.0));
+    for (geoms, angles) in [(vec![line.clone(), point], Some(vec![Attr::Null, Attr::Float(30.0)])), (vec![line], None)] {
+        let mut ds = Dataset::new("ways", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        for g in geoms {
+            ds.push(Some(g), vec![Attr::Text("w".into())]);
+        }
+        let id = s.map_mut().add_dataset(ds);
+        let l = s.map_mut().layer_mut(id).unwrap();
+        (l.labels.enabled, l.labels.default.field, l.labels.default.placement) =
+            (true, "name".into(), rustgis_map::LabelPlacement::Parallel);
+        l.labels.default.by.angle = Some("30".into());
+        let a = s.run("labels.convert", &json!({"layer": id})).unwrap()["layer"].as_u64().unwrap() as u32;
+        let a = &s.map().layer(a).unwrap().dataset;
+        let got = a.field_index("ANGLE").map(|fi| (0..a.features.len()).map(|r| a.value(r, fi).clone()).collect::<Vec<_>>());
+        assert_eq!(got, angles);
+    }
+}
+
+#[test]
+fn a_qgis_styles_data_defined_settings_are_kept_where_they_read() {
+    let mut s = world();
+    // Size by a field Cities has; fill by a QGIS function RustGIS lacks; outline by a field it hasn't.
+    let dd = |name: &str, expr: &str| {
+        format!(
+            r#"<Option type="Map" name="{name}"><Option value="true" type="bool" name="active"/><Option value="{expr}" type="QString" name="expression"/><Option value="3" type="int" name="type"/></Option>"#
+        )
+    };
+    let qml = format!(
+        r#"<qgis version="3.40.0"><renderer-v2 type="singleSymbol"><symbols><symbol type="marker" name="0" alpha="1">
+        <layer class="SimpleMarker" enabled="1"><Option type="Map"><Option name="name" value="circle"/><Option name="size_unit" value="Pixel"/></Option>
+        <data_defined_properties><Option type="Map"><Option type="Map" name="properties">{}{}{}</Option></Option></data_defined_properties></layer>
+        </symbol></symbols></renderer-v2></qgis>"#,
+        dd("size", "&quot;pop_max&quot; / 1e6"),
+        dd("fillColor", "set_color_part(@symbol_color, 'value', 40)"),
+        dd("outlineColor", "&quot;nosuch&quot;"),
+    );
+    let out = s.run("style.importQgis", &json!({"layer": "Cities", "text": qml})).unwrap();
+    let by = &s.map().layer_by_name("Cities").unwrap().symbol_by;
+    assert_eq!((by.size.as_deref(), &by.fill, &by.stroke), (Some(r#""pop_max" / 1e6"#), &None, &None), "{by:?}");
+    let notes = serde_json::to_string(&out["notes"]).unwrap();
+    assert!(
+        notes.contains("data-defined symbol fill colour `set_color_part") && notes.contains("outline colour `\\\"nosuch\\\"`"),
+        "{notes}"
+    );
 }
 
 #[test]
@@ -1652,10 +2241,11 @@ fn custom_projections_switch_keep_scale_query_and_render() {
     assert!(crate::cmd::share::map_png(&mut s, Some(400.0), Some(300.0), None).unwrap().len() > 1000);
     assert!(s.run("map.projection", &json!({"type": "EPSG:4326"})).is_err(), "degrees are refused");
     assert!(s.run("map.projection", &json!({"type": "nope"})).is_err());
-    // A known code whose method isn't implemented (Brazil Polyconic) is refused, not drawn in
-    // Web Mercator under its own name; the map keeps its projection (#208).
-    let e = s.run("map.projection", &json!({"type": "EPSG:5880"})).unwrap_err();
-    assert!(e.contains("poly"), "{e}");
+    // A known code whose method isn't implemented (EPSG:8441, Laborde) is refused, not drawn in
+    // Web Mercator under its own name; the map keeps its projection (#208). proj4rs 0.3 grew
+    // Brazil Polyconic, so EPSG:5880 switches now.
+    let e = s.run("map.projection", &json!({"type": "EPSG:8441"})).unwrap_err();
+    assert!(e.contains("labrd"), "{e}");
     assert_eq!(s.map().projection.code(), "EPSG:32617");
     assert!(s.run("map.goToXY", &json!({"lon": 100.0, "lat": 0.0})).is_err(), "folded far side of the UTM zone");
     // Undo and save/reload keep the projection.
@@ -1854,9 +2444,55 @@ fn raster_masks_hide_values() {
     assert!(style(&s).mask.is_empty());
 }
 
-/// Every command with junk parameters returns Ok or Err, never panics, and leaves a usable session.
+/// Shards of `hostile_params_never_panic`: each takes every eighth command, so the parts run side by
+/// side (opengeos/RustGIS#1201).
+const HOSTILE_SHARDS: usize = 8;
+const _: () = assert!(HOSTILE_SHARDS == 8, "add a hostile_params_never_panic_N test for each shard");
+
 #[test]
-fn hostile_params_never_panic() {
+fn hostile_params_never_panic_0() {
+    hostile_params_never_panic(0);
+}
+
+#[test]
+fn hostile_params_never_panic_1() {
+    hostile_params_never_panic(1);
+}
+
+#[test]
+fn hostile_params_never_panic_2() {
+    hostile_params_never_panic(2);
+}
+
+#[test]
+fn hostile_params_never_panic_3() {
+    hostile_params_never_panic(3);
+}
+
+#[test]
+fn hostile_params_never_panic_4() {
+    hostile_params_never_panic(4);
+}
+
+#[test]
+fn hostile_params_never_panic_5() {
+    hostile_params_never_panic(5);
+}
+
+#[test]
+fn hostile_params_never_panic_6() {
+    hostile_params_never_panic(6);
+}
+
+#[test]
+fn hostile_params_never_panic_7() {
+    hostile_params_never_panic(7);
+}
+
+/// Every command with junk parameters returns Ok or Err, never panics, and leaves a usable session.
+/// Runs the commands of one shard: those whose place in the registry is `shard` modulo
+/// [`HOSTILE_SHARDS`].
+fn hostile_params_never_panic(shard: usize) {
     let junk = [
         Value::Null,
         json!({}),
@@ -1926,13 +2562,22 @@ fn hostile_params_never_panic() {
         json!({"source": "rustgis-s3::0::s3://bucket/key", "id": "c1", "remember": {"a": 1}}),
         json!({"source": 7, "id": ["c1"]}),
     ];
-    let ids: Vec<&str> = Session::new(Project::default()).registry.commands.iter().map(|c| c.id).collect();
-    let streamed = grid_fgb("hostile", 20);
+    let ids: Vec<&str> = Session::new(Project::default())
+        .registry
+        .commands
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % HOSTILE_SHARDS == shard)
+        .map(|(_, c)| c.id)
+        .collect();
+    // Shards share the process under `cargo test`: each streams its own file.
+    let streamed = grid_fgb(&format!("hostile-{shard}"), 20);
     for id in ids {
         if matches!(
             id,
             "project.save"
                 | "project.saveAs"
+                | "project.exportLog"
                 | "share.exportMap"
                 | "time.export"
                 | "share.exportLayer"
@@ -2235,11 +2880,20 @@ fn label_range_placement_lock_and_convert() {
     s.run("labels.lock", &json!({"on": false})).unwrap();
     count(&mut s);
     assert!(s.map().label_lock.is_none());
-    // Convert makes an annotation layer and turns the source's labels off.
+    // Convert makes an annotation layer and turns the source's labels off; its labels stay on
+    // their points, even when the source's classes had the other places on (#1011: refused for
+    // polygons by labels.placement, but a project file may have it).
+    s.run("labels.class.add", &json!({"layer": "Countries", "name": "Big", "where": "pop_est > 100000000"})).unwrap();
+    let countries = s.map().layer_by_name("Countries").unwrap().id;
+    let labels = &mut s.map_mut().layer_mut(countries).unwrap().labels;
+    labels.default.other_positions = true;
+    labels.classes.iter_mut().for_each(|c| c.other_positions = true);
     let r = s.run("labels.convert", &json!({"layer": "Countries"})).unwrap();
     assert!(r["annotations"].as_u64().unwrap() > 100);
     let a = s.map().layer_by_name("Countries Annotation").unwrap();
     assert!(a.labels.enabled && a.labels.default.field == "TEXT");
+    assert!(!a.labels.default.other_positions && !a.labels.classes.is_empty());
+    assert!(a.labels.classes.iter().all(|c| !c.other_positions), "every class's, not only Default's");
     assert!(!s.map().layer_by_name("Countries").unwrap().labels.enabled);
 }
 
@@ -2361,6 +3015,57 @@ fn labels_take_wrapping_and_a_repeat_along_lines() {
     assert_eq!(class(&reopened), class(&s));
 }
 
+/// A point label class tries the other places round its point when told to (#1011): alone it keeps
+/// the position, junk is refused (in it or in the position) and so is turning it on for lines and
+/// polygons, it undoes, the project keeps it, and turning it on or off while the labels are locked
+/// locks them again (the places they took no longer stand).
+#[test]
+fn labels_take_other_positions_round_points() {
+    use crate::render::View;
+    let mut s = world();
+    let class = |s: &Session| {
+        let c = &s.map().layer_by_name("Cities").unwrap().labels.default;
+        (c.other_positions, c.placement)
+    };
+    let placement = class(&s).1;
+    assert_eq!(class(&s), (false, placement));
+    s.run("labels.placement", &json!({"layer": "Cities", "otherPositions": true})).unwrap();
+    assert_eq!(class(&s), (true, placement), "alone it keeps the position");
+    s.run("edit.undo", &json!({})).unwrap();
+    assert!(!class(&s).0, "undoes");
+    for bad in [json!("yes"), json!(1), Value::Null] {
+        assert!(s.run("labels.placement", &json!({"layer": "Cities", "otherPositions": bad})).is_err(), "{bad}");
+    }
+    // A position that isn't a placement name is refused, not dropped for otherPositions; null is
+    // none.
+    for bad in [json!(123), json!(true), json!(["above"])] {
+        assert!(s.run("labels.placement", &json!({"layer": "Cities", "position": bad, "otherPositions": true})).is_err(), "{bad}");
+    }
+    assert!(!class(&s).0);
+    s.run("labels.placement", &json!({"layer": "Cities", "position": null, "otherPositions": false})).unwrap();
+    assert_eq!(class(&s), (false, placement), "null is no position");
+    // Only a point's label goes round it: on is refused for lines and polygons, off taken anywhere.
+    for layer in ["Rivers", "Countries"] {
+        assert!(s.run("labels.placement", &json!({"layer": layer, "otherPositions": true})).is_err(), "{layer}");
+        s.run("labels.placement", &json!({"layer": layer, "otherPositions": false})).unwrap();
+    }
+    s.run("labels.placement", &json!({"layer": "Cities", "otherPositions": true})).unwrap();
+    let text = serde_json::to_string(&s.project).unwrap();
+    assert!(Session::new(serde_json::from_str(&text).unwrap()).map().layer_by_name("Cities").unwrap().labels.default.other_positions);
+    s.run("labels.enable", &json!({"layer": "Cities", "on": true})).unwrap();
+    s.run("labels.lock", &json!({"on": true})).unwrap();
+    let v = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera: s.map().camera, sky: false };
+    crate::render::render(s.map_mut(), &v).unwrap();
+    assert!(s.map().label_lock.is_some());
+    s.run("labels.placement", &json!({"layer": "Cities", "otherPositions": false})).unwrap();
+    assert!(s.map().label_lock.is_none(), "turned off: locked again");
+    s.run("labels.lock", &json!({"on": true})).unwrap();
+    crate::render::render(s.map_mut(), &v).unwrap();
+    assert!(s.map().label_lock.is_some());
+    s.run("labels.placement", &json!({"layer": "Cities", "otherPositions": true})).unwrap();
+    assert!(s.map().label_lock.is_none(), "turned on: locked again");
+}
+
 /// A label class takes an offset with its placement and a background with its text symbol; junk
 /// is refused, numbers kept within their ranges, and each change undoes.
 #[test]
@@ -2434,6 +3139,139 @@ fn labels_take_an_offset_and_a_background() {
     let text = serde_json::to_string(&s.project).unwrap();
     let reopened = Session::new(serde_json::from_str(&text).unwrap());
     assert_eq!(class(&reopened), class(&s));
+}
+
+/// A lock names the place round its point a label took by its number among its class's (#1011): a
+/// class trying the others locks the labels again when its position changes, not when its offset
+/// does; one that doesn't keeps the lock, as before.
+#[test]
+fn a_change_to_where_point_labels_go_locks_them_again() {
+    use crate::render::View;
+    let mut s = world();
+    s.run("labels.enable", &json!({"layer": "Cities", "on": true})).unwrap();
+    s.run("labels.lock", &json!({"on": true})).unwrap();
+    let draw = |s: &mut Session| {
+        let v = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera: s.map().camera, sky: false };
+        crate::render::render(s.map_mut(), &v).unwrap();
+    };
+    draw(&mut s);
+    s.run("labels.placement", &json!({"layer": "Cities", "position": "below"})).unwrap();
+    assert!(s.map().label_lock.is_some(), "no class tries other places: the lock is kept");
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    s.map_mut().layer_mut(id).unwrap().labels.default.other_positions = true;
+    s.run("labels.placement", &json!({"layer": "Cities", "offset": [2, 2]})).unwrap();
+    assert!(s.map().label_lock.is_some(), "an offset moves every place alike: the lock is kept");
+    s.run("labels.placement", &json!({"layer": "Cities", "position": "above"})).unwrap();
+    assert!(s.map().label_lock.is_none(), "another position: locked again");
+    draw(&mut s);
+    assert!(s.map().label_lock.is_some(), "locked on the next frame");
+    // A style applied counts its classes' places too.
+    s.run("style.new", &json!({"layer": "Cities", "name": "Above"})).unwrap();
+    s.run("labels.placement", &json!({"layer": "Cities", "position": "below"})).unwrap();
+    draw(&mut s);
+    assert!(s.map().label_lock.is_some());
+    s.run("style.apply", &json!({"layer": "Cities", "name": "Above"})).unwrap();
+    assert!(s.map().label_lock.is_none(), "a style putting the labels elsewhere: locked again");
+}
+
+/// A lock names each label by its feature's id, not its row: deleting a feature (the rows after
+/// it move up) neither shows a label left out when the lock was taken nor hides one placed (#1046).
+#[test]
+fn locked_labels_stay_with_their_features_when_rows_move() {
+    use crate::render::View;
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let mut s = world();
+    // Three buoys on one spot of the South Atlantic: only the first one's label fits.
+    let mut d = Dataset::new("Buoys", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+    for name in ["Alpha", "Beta", "Gamma"] {
+        d.push(Some(Geometry::Point(rustgis_geom::Coord::new(-20.0, -30.0))), vec![V::Text(name.into())]);
+    }
+    let id = s.map_mut().add_dataset(d);
+    s.run("labels.enable", &json!({"layer": "Buoys", "on": true})).unwrap();
+    let draw = |s: &mut Session| -> Vec<String> {
+        let v = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera: s.map().camera, sky: false };
+        let labels = crate::render::render(s.map_mut(), &v).unwrap().labels;
+        labels.into_iter().map(|l| l.text).filter(|t| ["Alpha", "Beta", "Gamma"].contains(&t.as_str())).collect()
+    };
+    assert_eq!(draw(&mut s), ["Alpha"]);
+    s.run("labels.lock", &json!({"on": true})).unwrap();
+    assert_eq!(draw(&mut s), ["Alpha"]);
+    s.map_mut().layer_mut(id).unwrap().selection = vec![0];
+    s.run("edit.delete", &Value::Null).unwrap();
+    assert!(draw(&mut s).is_empty(), "Beta's label wasn't placed when the lock was taken");
+    s.run("labels.lock", &json!({"on": false})).unwrap();
+    assert_eq!(draw(&mut s), ["Beta"], "unlocked, Beta's fits");
+    s.run("labels.lock", &json!({"on": true})).unwrap();
+    assert_eq!(draw(&mut s), ["Beta"], "and is locked in turn");
+}
+
+/// A feature added after locking has no label, even when it takes the id of a feature deleted
+/// since: the lock's entry for that id goes with the feature, and undo brings it back (#1135).
+#[test]
+fn a_new_feature_doesnt_take_the_locked_label_of_a_deleted_one() {
+    use crate::render::View;
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let mut s = world();
+    let mut d = Dataset::new("Places", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+    for (name, lon) in [("Alpha", -30.0), ("Gamma", 30.0)] {
+        d.push(Some(Geometry::Point(rustgis_geom::Coord::new(lon, -40.0))), vec![V::Text(name.into())]);
+    }
+    // The full source id must survive lock placement, pruning and undo on wasm32 too.
+    d.features[0].id = 1_u64 << 32;
+    d.features[1].id = (1_u64 << 32) + 1;
+    let id = s.map_mut().add_dataset(d);
+    let gamma = s.map().layer(id).unwrap().dataset.features[1].id;
+    s.run("labels.enable", &json!({"layer": "Places", "on": true})).unwrap();
+    let draw = |s: &mut Session| -> Vec<String> {
+        let v = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera: s.map().camera, sky: false };
+        let labels = crate::render::render(s.map_mut(), &v).unwrap().labels;
+        let mut texts: Vec<String> =
+            labels.into_iter().map(|l| l.text).filter(|t| ["Alpha", "Alpha 2", "Gamma", "Delta"].contains(&t.as_str())).collect();
+        texts.sort();
+        texts
+    };
+    s.run("labels.lock", &json!({"on": true})).unwrap();
+    assert_eq!(draw(&mut s), ["Alpha", "Gamma"]);
+
+    // An edit keeps the feature's id, so its label stays locked.
+    s.run("edit.setValue", &json!({"layer": "Places", "row": 0, "field": "name", "value": "Alpha 2"})).unwrap();
+    assert_eq!(draw(&mut s), ["Alpha 2", "Gamma"]);
+
+    s.map_mut().layer_mut(id).unwrap().selection = vec![1];
+    s.run("edit.delete", &Value::Null).unwrap();
+    let locked = |s: &Session| s.map().label_lock.as_ref().is_some_and(|k| k.iter().any(|((l, f, ..), _)| *l == id && *f == gamma));
+    assert!(!locked(&s), "the lock's entry goes with the feature");
+    let delta = json!({"layer": "Places", "geometry": {"type": "Point", "coordinates": [0.0, -40.0]}, "attributes": {"name": "Delta"}});
+    s.run("edit.addFeature", &delta).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().dataset.features[1].id, gamma, "the new feature takes the deleted one's id");
+    assert_eq!(draw(&mut s), ["Alpha 2"], "and no label, as it wasn't placed when the lock was taken");
+
+    s.run("edit.undo", &Value::Null).unwrap();
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert!(locked(&s), "undoing the delete brings the entry back");
+    assert_eq!(draw(&mut s), ["Alpha 2", "Gamma"]);
+
+    s.run("edit.redo", &Value::Null).unwrap();
+    assert!(!locked(&s), "redoing the delete takes it away again");
+    assert_eq!(draw(&mut s), ["Alpha 2"]);
+}
+
+/// A streamed layer holds only the window in view: a lock's entry for a feature outside it stays
+/// when the window changes (#1135).
+#[test]
+fn a_lock_holds_for_a_streamed_layers_features_outside_its_window() {
+    let p = line_of_points_shp("locked-window", 20);
+    let mut s = world();
+    let r = s.run("layer.addData", &json!({"path": p.display().to_string(), "stream": true})).unwrap();
+    let id = r["layer"].as_u64().unwrap() as u32;
+    s.map_mut().label_lock = Some(vec![((id, 1, 0, 0), Default::default())]);
+    let before = s.project.clone();
+    // The window moves off the feature: no longer shared with the copy, and without its id.
+    s.map_mut().layer_mut(id).unwrap().dataset.features = Vec::new().into();
+    crate::forget_locks_of_removed_features(&before, &mut s.project);
+    assert_eq!(s.map().label_lock.as_ref().map(Vec::len), Some(1));
+    drop(s);
+    remove_shp(&p);
 }
 
 /// A lock names each label by its class's place in the list: a change to the list (a class added,
@@ -3339,6 +4177,107 @@ fn terrain_is_set_from_a_dem_or_tiles() {
     assert_eq!(back.terrain, s.map().view.terrain);
     s.run("map.terrain", &json!({"off": true})).unwrap();
     assert!(s.map().view.terrain.is_none());
+    // Nothing named: the active layer, when it is a raster, is the DEM; a vector one is refused,
+    // saying to make a DEM the active layer.
+    s.active_layer = s.map().layer_by_name("Countries").map(|l| l.id);
+    assert!(s.run("map.terrain", &json!({})).unwrap_err().contains("make a DEM raster layer the active layer"));
+    s.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": dem_b64()})).unwrap();
+    let dem = s.map().layers.iter().find(|l| l.is_raster()).unwrap();
+    let (id, name) = (dem.id, dem.name.clone());
+    s.active_layer = Some(id);
+    let v = s.run("map.terrain", &json!({"exaggeration": 3})).unwrap();
+    assert_eq!((v["source"]["layer"].as_str(), v["exaggeration"].as_f64()), (Some(name.as_str()), Some(3.0)));
+    // On a map looked at straight down, a notice names the layer picked and says to tilt it.
+    let said = s.notices.last().unwrap().text.clone();
+    assert!(said.contains(&format!("heights from '{name}'")) && said.contains("tilt the map"), "{said}");
+    // A change of exaggeration alone says nothing again.
+    let mark = s.notice_mark();
+    s.run("map.terrain", &json!({"exaggeration": 2})).unwrap();
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("Terrain is on")), "{:?}", s.notices_since(mark));
+    // Two layers of the DEM's name: refused, since the terrain keeps it by name.
+    s.run("map.terrain", &json!({"off": true})).unwrap();
+    s.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": dem_b64()})).unwrap();
+    let second = s.map().layers.iter().filter(|l| l.is_raster()).map(|l| l.id).max().unwrap();
+    s.active_layer = Some(second);
+    s.run("layer.rename", &json!({"name": name})).unwrap();
+    let e = s.run("map.terrain", &json!({})).unwrap_err();
+    assert!(e.contains("two layers are called"), "{e}");
+    s.run("layer.rename", &json!({"name": "dem 2"})).unwrap();
+    s.active_layer = Some(id);
+    s.run("map.terrain", &json!({})).unwrap();
+    // A project saved with a terrain on a shared DEM name says so as it opens.
+    {
+        let mut saved = s.project.clone();
+        let m = &mut saved.maps[0];
+        let first = m.layers.iter().find(|l| l.is_raster()).map(|l| l.name.clone()).unwrap();
+        if let Some(l) = m.layers.iter_mut().filter(|l| l.is_raster()).nth(1) {
+            l.name = first.clone();
+        }
+        m.view.terrain = Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer(first), exaggeration: 1.0 });
+        let mut opened = Session::new(Project::default());
+        crate::cmd::project::reset_to(&mut opened, saved);
+        assert!(opened.notices.iter().any(|n| n.text.contains("is shared by two layers")), "{:?}", opened.notices);
+    }
+    // Renaming another layer leaves the terrain as it is.
+    s.run("layer.rename", &json!({"layer": "Countries", "name": "Paises"})).unwrap();
+    assert!(s.map().view.terrain.is_some());
+    s.run("layer.rename", &json!({"layer": "Paises", "name": "Countries"})).unwrap();
+    // Renaming the DEM onto another layer's name turns the terrain off, said.
+    s.active_layer = Some(id);
+    s.run("layer.rename", &json!({"name": "dem 2"})).unwrap();
+    assert!(s.map().view.terrain.is_none());
+    assert!(s.notices.last().unwrap().text.contains("two layers are now called 'dem 2'"), "{:?}", s.notices.last());
+    s.run("layer.rename", &json!({"name": name})).unwrap();
+    s.run("map.terrain", &json!({"layer": name})).unwrap();
+    // Removing the DEM turns the terrain off, said.
+    {
+        let mut t = Session::new(Project::default());
+        t.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": dem_b64()})).unwrap();
+        t.run("map.terrain", &json!({})).unwrap();
+        t.run("layer.remove", &json!({})).unwrap();
+        assert!(t.map().view.terrain.is_none());
+        assert!(t.notices.last().unwrap().text.contains("was removed"), "{:?}", t.notices.last());
+        // A mobile map package keeps a hidden DEM, which still gives the heights.
+        t.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": dem_b64()})).unwrap();
+        t.run("map.terrain", &json!({})).unwrap();
+        t.run("layer.visibility", &json!({})).unwrap();
+        assert!(t.map().layers.iter().any(|l| l.is_raster() && !l.visible));
+        let pkg = std::env::temp_dir().join(format!("rustgis-terrain-{}.rgismpk", std::process::id()));
+        t.run("map.package", &json!({"path": pkg.display().to_string(), "mobile": true})).unwrap();
+        t.run("map.import", &json!({"path": pkg.display().to_string()})).unwrap();
+        let _ = std::fs::remove_file(&pkg);
+        let packaged = t.project.maps.last().unwrap();
+        assert!(packaged.layers.iter().any(|l| l.is_raster()), "the hidden DEM is in the package");
+        assert!(packaged.view.terrain.is_some());
+        t.run("layer.remove", &json!({"layer": t.map().layers.iter().find(|l| l.is_raster()).map(|l| l.id).unwrap()})).unwrap();
+        // So does removing a group that holds it.
+        t.run("layer.addDataBytes", &json!({"fileName": "dem.tif", "data": dem_b64()})).unwrap();
+        let dem = t.map().layers.iter().find(|l| l.is_raster()).map(|l| l.id).unwrap();
+        let group = t.run("group.add", &json!({"name": "Relevo", "layers": [dem]})).unwrap()["group"].clone();
+        t.active_layer = Some(dem);
+        t.run("map.terrain", &json!({})).unwrap();
+        t.run("group.remove", &json!({"group": group})).unwrap();
+        assert!(t.map().view.terrain.is_none());
+        assert!(t.notices.last().unwrap().text.contains("was removed"), "{:?}", t.notices.last());
+    }
+    // Renaming the DEM keeps the terrain on it.
+    s.run("layer.rename", &json!({"name": "Relevo"})).unwrap();
+    assert_eq!(s.run("map.terrain", &json!({"exaggeration": 1})).unwrap()["source"]["layer"], "Relevo");
+    // A second layer renamed to the DEM's name: the terrain, now ambiguous, is turned off, and
+    // said.
+    s.active_layer = Some(second);
+    s.run("layer.rename", &json!({"name": "relevo"})).unwrap();
+    assert!(s.map().view.terrain.is_none());
+    assert!(s.notices.last().unwrap().text.contains("Terrain turned off: two layers are now called"), "{:?}", s.notices.last());
+    s.run("layer.rename", &json!({"name": "dem 2"})).unwrap();
+    s.active_layer = Some(id);
+    s.run("map.terrain", &json!({"layer": "Relevo"})).unwrap();
+    let name = "Relevo".to_string();
+    // Once on, nothing named changes nothing but what is given: the active layer doesn't replace it.
+    s.active_layer = s.map().layer_by_name("Countries").map(|l| l.id);
+    let v = s.run("map.terrain", &json!({})).unwrap();
+    assert_eq!(v["source"]["layer"].as_str(), Some(name.as_str()));
+    s.run("map.terrain", &json!({"off": true})).unwrap();
 }
 
 #[test]
@@ -6223,6 +7162,152 @@ fn view_effects_scene_and_navigation() {
     assert!(s.run("map.navigator", &Value::Null).unwrap()["navigator"].as_bool().unwrap());
 }
 
+fn offline_field_session(layers: &[&str], empty: bool) -> Session {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
+    use rustgis_geom::Coord;
+
+    isolate_plugins();
+    let mut s = Session::new(Project::default());
+    for name in layers.iter().rev() {
+        let mut data = Dataset::new(
+            *name,
+            GeometryType::Point,
+            vec![Field::new("name", FieldType::Text), Field::new("region", FieldType::Text), Field::new("population", FieldType::Integer)],
+        );
+        if !empty {
+            data.push_next(
+                Some(Geometry::Point(Coord::new(1.0, 1.0))),
+                vec![Attr::Text("Original".into()), Attr::Text("North".into()), Attr::Int(10)],
+            );
+        }
+        s.active_layer = Some(s.map_mut().add_dataset(data));
+    }
+    s.run("offline.download", &json!({"name": "Fieldwork", "extent": [0.0, 0.0, 2.0, 2.0]})).unwrap();
+    s.run("offline.open", &json!({"name": "Fieldwork"})).unwrap();
+    s
+}
+
+#[test]
+fn offline_sync_rejects_incompatible_fields_and_preserves_safe_refreshes() {
+    use rustgis_data::{FieldType, Geometry, Value as Attr};
+    use rustgis_geom::Coord;
+
+    for mode in ["unchanged", "display_metadata", "source_refresh", "matching_schema_changes"] {
+        let mut s = offline_field_session(&["Assets"], false);
+        if mode != "source_refresh" {
+            s.run("edit.setValue", &json!({"layer": "Assets", "row": 0, "field": "population", "value": 20})).unwrap();
+        }
+        if mode == "matching_schema_changes" {
+            s.run("edit.deleteField", &json!({"layer": "Assets", "field": "region"})).unwrap();
+        }
+        s.run("map.activate", &json!({"name": "Map"})).unwrap();
+        if mode == "display_metadata" {
+            let fields = &mut s.map_mut().layers.iter_mut().find(|l| l.name == "Assets").unwrap().dataset.fields;
+            fields[0].name = "NAME".into();
+            fields[2].alias = Some("Population estimate".into());
+        } else if mode == "source_refresh" || mode == "matching_schema_changes" {
+            s.run("edit.deleteField", &json!({"layer": "Assets", "field": "region"})).unwrap();
+        }
+        s.run("offline.sync", &json!({"name": "Fieldwork"})).unwrap();
+        let source = &s.map().layer_by_name("Assets").unwrap().dataset;
+        let expected = if mode == "source_refresh" { 10 } else { 20 };
+        assert_eq!(source.value(0, source.field_index("population").unwrap()), &Attr::Int(expected), "{mode}");
+        let offline = &s.project.maps.iter().find(|m| m.name == "Fieldwork (offline)").unwrap().layer_by_name("Assets").unwrap().dataset;
+        assert_eq!(offline.fields, source.fields, "{mode}");
+        assert_eq!(offline.features, source.features, "{mode}");
+        // The synced copy is a map, with layers, of its own (a background run finds its map by it).
+        let ids: Vec<u64> = s.project.maps.iter().map(|m| m.instance_id()).collect();
+        assert!(ids.iter().enumerate().all(|(i, a)| ids[..i].iter().all(|b| a != b)), "{mode}: {ids:?}");
+        let offline_map = s.project.maps.iter().find(|m| m.name == "Fieldwork (offline)").unwrap();
+        assert_ne!(
+            offline_map.layer_by_name("Assets").unwrap().instance_id(),
+            s.map().layer_by_name("Assets").unwrap().instance_id(),
+            "{mode}"
+        );
+    }
+
+    for mode in ["source_deleted", "geometry_only", "offline_added", "source_reordered", "source_type_changed", "empty_offline_schema"] {
+        let mut s = offline_field_session(&["Assets"], mode == "empty_offline_schema");
+        if mode == "geometry_only" {
+            s.map_mut().layers[0].dataset.features[0].geometry = Some(Geometry::Point(Coord::new(1.1, 1.0)));
+        } else if mode != "empty_offline_schema" {
+            s.run("edit.setValue", &json!({"layer": "Assets", "row": 0, "field": "population", "value": 20})).unwrap();
+        }
+        if mode == "offline_added" || mode == "empty_offline_schema" {
+            s.run("edit.addField", &json!({"layer": "Assets", "name": "survey", "type": "long"})).unwrap();
+        }
+        s.run("map.activate", &json!({"name": "Map"})).unwrap();
+        match mode {
+            "source_deleted" | "geometry_only" => {
+                s.run("edit.deleteField", &json!({"layer": "Assets", "field": "region"})).unwrap();
+            }
+            "source_reordered" => {
+                let source = &mut s.map_mut().layers.iter_mut().find(|l| l.name == "Assets").unwrap().dataset;
+                source.fields.swap(0, 1);
+                source.features[0].attrs.swap(0, 1);
+            }
+            "source_type_changed" => {
+                let source = &mut s.map_mut().layers.iter_mut().find(|l| l.name == "Assets").unwrap().dataset;
+                source.fields[2].ty = FieldType::Text;
+                source.features[0].attrs[2] = Attr::Text("10".into());
+            }
+            _ => {}
+        }
+        s.mark_saved();
+        let before = serde_json::to_value(&s.project).unwrap();
+        let undo_depth = s.undo_depth();
+        for _ in 0..2 {
+            let error = s.run("offline.sync", &json!({"name": "Fieldwork"})).unwrap_err();
+            assert!(error.contains("Assets") && error.contains("fields"), "{mode}: {error}");
+            assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "{mode}");
+            assert_eq!(s.undo_depth(), undo_depth, "{mode}");
+            assert!(!s.dirty(), "{mode}");
+        }
+    }
+}
+
+#[test]
+fn offline_sync_schema_refusal_rolls_back_other_layers_and_can_retry() {
+    use rustgis_data::Value as Attr;
+
+    let mut s = offline_field_session(&["Other", "Assets"], false);
+    assert_eq!(s.map().layers[0].name, "Other", "sync the compatible layer before reaching the incompatible one");
+    for (name, population) in [("Other", 99), ("Assets", 20)] {
+        s.run("edit.setValue", &json!({"layer": name, "row": 0, "field": "population", "value": population})).unwrap();
+    }
+    s.run("map.activate", &json!({"name": "Map"})).unwrap();
+    s.run("edit.deleteField", &json!({"layer": "Assets", "field": "region"})).unwrap();
+    let before = serde_json::to_value(&s.project).unwrap();
+    let undo_depth = s.undo_depth();
+    assert!(s.run("offline.sync", &json!({"name": "Fieldwork"})).is_err());
+    assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
+    assert_eq!(s.undo_depth(), undo_depth);
+
+    // Undo and redo invalidate map geometry caches even while restoring the same project data.
+    let undo_snapshot = |s: &Session| {
+        let mut project = s.project.clone();
+        for map in &mut project.maps {
+            for layer in &mut map.layers {
+                layer.geometry_rev = 0;
+            }
+        }
+        serde_json::to_value(project).unwrap()
+    };
+    assert!(s.undo(), "restore the source field before retrying");
+    let before_retry = undo_snapshot(&s);
+    let synced = s.run("offline.sync", &json!({"name": "Fieldwork"})).unwrap();
+    assert_eq!(synced["updated"], 2);
+    for (name, population) in [("Other", 99), ("Assets", 20)] {
+        let data = &s.map().layer_by_name(name).unwrap().dataset;
+        assert_eq!(data.value(0, data.field_index("population").unwrap()), &Attr::Int(population));
+    }
+    let after_retry = undo_snapshot(&s);
+    assert!(s.undo());
+    assert_eq!(undo_snapshot(&s), before_retry);
+    assert!(s.redo());
+    assert_eq!(undo_snapshot(&s), after_retry);
+}
+
 #[test]
 fn workspace_links_thumbnails_animation_profiles_offline_and_cache() {
     let dir = std::env::temp_dir().join(format!("rustgis-ws-{}", std::process::id()));
@@ -6291,11 +7376,13 @@ fn workspace_links_thumbnails_animation_profiles_offline_and_cache() {
     s.run("select.byAttributes", &json!({"layer": "Cities", "where": "name = 'Paris'"})).unwrap();
     let row = s.map().layer_by_name("Cities").unwrap().selection[0];
     s.run("edit.setValue", &json!({"layer": "Cities", "row": row, "field": "pop_max", "value": 1})).unwrap();
-    s.run(
-        "edit.addFeature",
-        &json!({"layer": "Cities", "geometry": {"type": "Point", "coordinates": [2.0, 49.0]}, "attributes": {"name": "Field camp"}}),
-    )
-    .unwrap();
+    for (name, x) in [("Field camp", 2.0), ("Field hut", 2.2)] {
+        s.run(
+            "edit.addFeature",
+            &json!({"layer": "Cities", "geometry": {"type": "Point", "coordinates": [x, 49.0]}, "attributes": {"name": name}}),
+        )
+        .unwrap();
+    }
     // Meanwhile France is edited in the source map; the area's untouched copy mustn't undo that.
     let set_france = |s: &mut Session, v: i64| {
         let world = s.project.maps.iter_mut().find(|m| m.name == "World").unwrap();
@@ -6308,12 +7395,66 @@ fn workspace_links_thumbnails_animation_profiles_offline_and_cache() {
         f.attrs[pi].clone()
     };
     set_france(&mut s, 12_345);
+    let mark = s.notice_mark();
     let sync = s.run("offline.sync", &json!({"name": "Paris"})).unwrap();
-    assert_eq!((sync["updated"].as_u64(), sync["added"].as_u64()), (Some(1), Some(1)), "{sync}");
+    let clean = s.notices_since(mark);
+    assert!(clean.iter().all(|n| !n.text.starts_with("Offline area")), "{clean:?}");
+    assert_eq!((sync["updated"].as_u64(), sync["added"].as_u64()), (Some(1), Some(2)), "{sync}");
     assert_eq!(set_france(&mut s, -1), rustgis_data::Value::Int(12_345), "the source edit survives the sync");
     let world_map = s.project.maps.iter().find(|m| m.name == "World").unwrap();
     let cities = world_map.layer_by_name("Cities").unwrap();
     assert!(cities.dataset.features.iter().any(|f| f.attrs.iter().any(|v| v.to_string() == "Field camp")));
+    assert_eq!(sync["conflicts"], 0, "a change made only in the source is no conflict");
+    // Paris changed in both, and the field camp deleted offline but changed in the map: the area's
+    // version wins, a warning names both, and Undo restores the map's. The field hut, changed only
+    // in the map, is no conflict.
+    let paris = |s: &mut Session, map: &str, v: Option<i64>| {
+        let m = s.project.maps.iter_mut().find(|m| m.name == map).unwrap();
+        let cities = m.layers.iter_mut().find(|l| l.name == "Cities").unwrap();
+        let (ni, pi) = (cities.dataset.field_index("name").unwrap(), cities.dataset.field_index("pop_max").unwrap());
+        let f = cities.dataset.features.iter_mut().find(|f| f.attrs[ni].to_string() == "Paris").unwrap();
+        if let Some(v) = v {
+            f.attrs[pi] = rustgis_data::Value::Int(v);
+        }
+        (f.id, f.attrs[pi].clone())
+    };
+    paris(&mut s, "Paris (offline)", Some(2));
+    let (id, _) = paris(&mut s, "World", Some(3));
+    /// The features of `map`'s Cities layer, and the row of the one named `name` among them.
+    fn named<'a>(s: &'a mut Session, map: &str, name: &str) -> (&'a mut Vec<rustgis_data::Feature>, usize) {
+        let m = s.project.maps.iter_mut().find(|m| m.name == map).unwrap();
+        let features = &mut m.layers.iter_mut().find(|l| l.name == "Cities").unwrap().dataset.features;
+        let i = features.iter().position(|f| f.attrs.iter().any(|v| v.to_string() == name)).unwrap();
+        (features, i)
+    }
+    let (features, i) = named(&mut s, "Paris (offline)", "Field camp");
+    let camp_id = features.remove(i).id;
+    let (features, i) = named(&mut s, "World", "Field camp");
+    features[i].geometry = Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(2.5, 49.0)));
+    let (features, i) = named(&mut s, "World", "Field hut");
+    features[i].geometry = Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(2.2, 49.3)));
+    let mark = s.notice_mark();
+    let sync = s.run("offline.sync", &json!({"name": "Paris"})).unwrap();
+    assert_eq!((sync["updated"].as_u64(), sync["deleted"].as_u64(), sync["conflicts"].as_u64()), (Some(1), Some(1), Some(2)), "{sync}");
+    assert_eq!(paris(&mut s, "World", None).1, rustgis_data::Value::Int(2));
+    let warned = s.notices_since(mark);
+    assert!(
+        warned.iter().any(|n| n.text.contains(&format!("Cities #{id}")) && n.text.contains(&format!("Cities #{camp_id}"))),
+        "{warned:?}"
+    );
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(paris(&mut s, "World", None).1, rustgis_data::Value::Int(3), "Undo restores the map's version");
+    let (features, i) = named(&mut s, "World", "Field camp");
+    assert_eq!(features[i].id, camp_id, "Undo restores the deleted field camp");
+    // Paris edited offline but deleted from the map meanwhile: the edit is dropped, and said.
+    let world = s.project.maps.iter_mut().find(|m| m.name == "World").unwrap();
+    let cities = world.layers.iter_mut().find(|l| l.name == "Cities").unwrap();
+    cities.dataset.features.retain(|f| f.id != id);
+    let mark = s.notice_mark();
+    let sync = s.run("offline.sync", &json!({"name": "Paris"})).unwrap();
+    assert_eq!(sync["skipped"], 1, "{sync}");
+    let warned = s.notices_since(mark);
+    assert!(warned.iter().any(|n| n.text.contains("deleted from the map") && n.text.contains(&format!("Cities #{id}"))), "{warned:?}");
     s.run("offline.remove", &json!({"name": "Paris"})).unwrap();
     assert!(s.project.maps.iter().all(|m| m.name != "Paris (offline)"));
     // Feature cache.
@@ -6410,6 +7551,58 @@ fn plugin_edits_are_one_undo_step() {
     }
     assert!(forward(&mut s, "eng-edit", "layer.rename", json!({"layer": "Rivers", "name": "Streams"})).is_ok());
     rustgis_plugins::unload("eng-edit");
+}
+
+/// A built-in tool's output layer stays in the session, so a plugin with `edit` alone may name
+/// it, as a task from a file may. A name that could be a path, and tools that may write files
+/// (GeoLibre's, those that save one), still need `files`.
+#[test]
+fn plugin_tools_name_their_output_layer_with_edit_alone() {
+    use crate::cmd::plugins::reaches;
+    let mut s = world();
+    plugin("eng-out", &["edit"]);
+    let clip = json!({"tool": "clip", "params": {"input": "Cities", "clip": "Countries", "output": "Cities in countries"}});
+    let gp = s.registry.get("gp.run").copied().unwrap();
+    assert!(reaches(&gp, &clip).is_none(), "the assistant doesn't ask either");
+    forward(&mut s, "eng-out", "gp.run", clip).unwrap();
+    assert!(s.map().layer_by_name("Cities in countries").is_some());
+    for params in [
+        json!({"tool": "clip", "params": {"input": "Cities", "clip": "Countries", "output": "out/cities"}}),
+        json!({"tool": "clip", "params": {"input": "Cities", "clip": "Countries", "output": "cities.shp"}}),
+        json!({"tool": "clip", "params": {"input": "Cities", "clip": "Countries", "output": "C:\\cities"}}),
+        json!({"tool": "geolibre:slope", "params": {"input": "Cities", "output": "slope"}}),
+        json!({"tool": "vectorToPmtiles", "params": {"input": "Cities", "output": "cities"}}),
+    ] {
+        let e = forward(&mut s, "eng-out", "gp.run", params.clone()).unwrap_err();
+        assert!(e.contains("'files' permission"), "{params}: {e}");
+    }
+    rustgis_plugins::unload("eng-out");
+}
+
+/// A plugin's command the app runs leaves its downloads to the app, which fetches them off the
+/// frame (as the browser does): nothing waits, and nothing is an undo step until the data lands,
+/// with what the plugin asked (how a table's points are read) kept. Run another way (the command
+/// line, a script), the same command waits for the download and says how it went.
+#[test]
+fn plugin_downloads_are_left_to_the_app() {
+    let mut s = world();
+    plugin("eng-url", &["edit", "network"]);
+    let (undo, layers) = (s.undo.len(), s.map().layers.len());
+    // Nothing answers there: a download that waited fails.
+    let url = "http://127.0.0.1:9/places.csv";
+    let p = json!({"op": "layer.addUrl", "params": {"url": url, "name": "Places", "x": "lon", "y": "lat"}});
+    assert_eq!(s.run_leaving_downloads("plugin:eng-url/f", &p).unwrap(), json!({"pending": true, "url": url}));
+    assert_eq!((s.undo.len(), s.map().layers.len()), (undo, layers));
+    let asked = s.take_url_requests();
+    assert_eq!(asked.len(), 1);
+    assert_eq!((asked[0]["name"].as_str(), asked[0]["x"].as_str(), asked[0]["y"].as_str()), (Some("Places"), Some("lon"), Some("lat")));
+    assert!(s.run("plugin:eng-url/f", &p).is_err(), "run otherwise, it waits");
+    assert!(s.take_url_requests().is_empty());
+    // An edit run that way is an undo step still.
+    let p = json!({"op": "layer.rename", "params": {"layer": "Rivers", "name": "Streams"}});
+    s.run_leaving_downloads("plugin:eng-url/f", &p).unwrap();
+    assert_eq!(s.undo.len(), undo + 1);
+    rustgis_plugins::unload("eng-url");
 }
 
 #[test]
@@ -6512,6 +7705,61 @@ fn plugin_data_cubes_need_files_and_network() {
         assert!(e.contains("'files' and 'network' permissions"), "{id}: {e}");
     }
     rustgis_plugins::unload("eng-cube-files");
+}
+
+/// A mosaic of the project's raster layers, written to no file, stays in the project: a plugin
+/// with `edit` alone may make one, and none without it. Writing it to a `path`, or an input read
+/// from disk (a raster file name that isn't a layer), needs `files`; inputs the command reads no
+/// file for fail in the command instead.
+#[test]
+fn plugin_mosaics_of_project_layers_need_no_files() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let mut s = world();
+    // A layer named like a path is still taken for a place; one named like a bare file isn't.
+    for (name, x0) in [("west", 0.0), ("east", 1.0), ("../east.tif", 2.0), ("north.tif", 3.0)] {
+        let gt = GeoTransform { origin_x: x0, origin_y: 1.0, pixel_width: 0.1, pixel_height: -0.1 };
+        let r = Raster::new(name, 10, 10, vec![vec![1.0; 100]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let bytes = geotiff::write(&r, 0).unwrap();
+        crate::cmd::raster::add_raster(&mut s, name, rustgis_map::RasterLayer::from_bytes(r, format!("{name}.tif"), bytes)).unwrap();
+    }
+    plugin("eng-mosaic-view", &[]);
+    let e = forward(&mut s, "eng-mosaic-view", "raster.mosaic", json!({"inputs": ["west", "east"]})).unwrap_err();
+    assert!(e.contains("'edit' permission"), "{e}");
+    rustgis_plugins::unload("eng-mosaic-view");
+    plugin("eng-mosaic", &["edit"]);
+    forward(&mut s, "eng-mosaic", "raster.mosaic", json!({"inputs": ["west", " east "], "name": "Elevation"})).unwrap();
+    assert!(s.map().layer_by_name("Elevation").is_some_and(|l| l.is_raster()));
+    // The layer comes before a file of its name.
+    forward(&mut s, "eng-mosaic", "raster.mosaic", json!({"inputs": ["east", "north.tif"], "name": "East and north"})).unwrap();
+    assert!(s.map().layer_by_name("East and north").is_some());
+    // Writing a file, an input read from one (a raster file name that isn't a layer), and a name
+    // that looks like a place need `files`.
+    for params in [
+        json!({"inputs": ["west", "east"], "name": "Elevation", "path": "elevation.tif"}),
+        json!({"inputs": ["west", "east.tif"]}),
+        json!({"inputs": ["west", "../east.tif"]}),
+        json!({"inputs": ["west", "east"], "name": "../elevation"}),
+    ] {
+        let e = forward(&mut s, "eng-mosaic", "raster.mosaic", params.clone()).unwrap_err();
+        assert!(e.contains("'files' permission"), "{params}: {e}");
+    }
+    // Inputs the command would read no file for fail in the command, as they would with `files`:
+    // a typo, a vector layer, a non-text input, a call over the input limit.
+    for (params, why) in [
+        (json!({"inputs": ["west", "esat"]}), "no raster layer 'esat'"),
+        (json!({"inputs": ["west", "Countries"]}), "no raster layer 'Countries'"),
+        (json!({"inputs": ["west", 3]}), "each input is a raster layer's name or a file path"),
+        (json!({"inputs": vec!["west"; 10_001]}), "at most 10000 inputs"),
+    ] {
+        let e = forward(&mut s, "eng-mosaic", "raster.mosaic", params.clone()).unwrap_err();
+        assert!(e.contains(why) && !e.contains("permission"), "{params}: {e}");
+    }
+    // So does a raster layer whose cells aren't in memory yet (a tile still downloading).
+    let east = s.map().layer_by_name("east").unwrap().id;
+    s.map_mut().layer_mut(east).unwrap().raster.as_mut().unwrap().data = None;
+    let e = forward(&mut s, "eng-mosaic", "raster.mosaic", json!({"inputs": ["west", "east"]})).unwrap_err();
+    assert!(e.contains("no raster layer 'east'") && !e.contains("permission"), "{e}");
+    rustgis_plugins::unload("eng-mosaic");
 }
 
 #[test]
@@ -7189,19 +8437,20 @@ fn presentations_and_notebooks() {
     // Trust left by an undone notebook doesn't pass to a file's notebook of the same name.
     s.run("notebook.new", &json!({"name": "Notebook"})).unwrap();
     s.run("edit.undo", &Value::Null).unwrap();
-    let text = json!({"nbformat": 4, "cells": [{"cell_type": "code", "source": cell}]}).to_string();
+    let text = json!({"nbformat": 4, "metadata": {"language_info": {"name": "rustgis"}}, "cells": [{"cell_type": "code", "source": cell}]})
+        .to_string();
     s.run("notebook.open", &json!({"text": text})).unwrap();
     let r = s.run("notebook.run", &json!({"notebook": "Notebook"})).unwrap();
     assert_eq!(r["error"], 0, "{r}");
     // Nor can it make a trusted notebook to run its lines later.
-    let text = json!({"nbformat": 4, "cells": [{"cell_type": "code", "source": "notebook.new {\"name\": \"Laundered\"}"}]}).to_string();
+    let text = json!({"nbformat": 4, "metadata": {"language_info": {"name": "rustgis"}}, "cells": [{"cell_type": "code", "source": "notebook.new {\"name\": \"Laundered\"}"}]}).to_string();
     s.run("notebook.open", &json!({"text": text})).unwrap();
     let opened = s.project.notebooks.last().unwrap().name.clone();
     let r = s.run("notebook.run", &json!({"notebook": opened})).unwrap();
     assert_eq!(r["error"], 0, "{r}");
     assert!(!s.project.notebooks.iter().any(|nb| nb.name == "Laundered"));
     // Nor borrow trust from a notebook whose name differs only by non-ASCII case.
-    let text = json!({"nbformat": 4, "metadata": {"title": "éa"}, "cells": [{"cell_type": "code", "source": cell}]}).to_string();
+    let text = json!({"nbformat": 4, "metadata": {"title": "éa", "language_info": {"name": "rustgis"}}, "cells": [{"cell_type": "code", "source": cell}]}).to_string();
     s.run("notebook.open", &json!({"text": text})).unwrap();
     s.run("notebook.new", &json!({"name": "Éa"})).unwrap();
     let r = s.run("notebook.run", &json!({"notebook": "éa"})).unwrap();
@@ -7245,6 +8494,175 @@ fn presentations_and_notebooks() {
     assert_eq!(p.notebooks.last().unwrap().name, format!("A {}", crate::project::MAX_ITEMS));
     assert!(t0.elapsed().as_secs() < 5);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn jupyter_python_notebooks_survive_open_and_save() {
+    // A Python notebook as Jupyter writes it: kernelspec, cell ids, rich outputs, a raw cell.
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    let original = json!({
+        "nbformat": 4, "nbformat_minor": 5,
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+            "language_info": {"name": "python", "version": "3.12.4"},
+            "widgets": {"state": {}}
+        },
+        "cells": [
+            {"cell_type": "markdown", "id": "intro", "metadata": {"tags": ["title"]}, "source": ["# Rivers\n", "A study."]},
+            {"cell_type": "code", "id": "load", "metadata": {"scrolled": true}, "execution_count": 3, "source": "import geopandas\n1 + 1",
+             "outputs": [
+                {"output_type": "stream", "name": "stdout", "text": ["loading\n"]},
+                {"output_type": "execute_result", "execution_count": 3, "metadata": {}, "data": {"text/plain": ["2"], "text/html": ["<b>2</b>"]}},
+                {"output_type": "display_data", "metadata": {}, "data": {"text/plain": "<Figure>", "image/png": png}}
+             ]},
+            {"cell_type": "code", "id": "boom", "metadata": {}, "execution_count": 4, "source": "1 / 0",
+             "outputs": [{"output_type": "error", "ename": "ZeroDivisionError", "evalue": "division by zero",
+                          "traceback": ["\u{1b}[0;31mZeroDivisionError\u{1b}[0m: division by zero"]}]},
+            {"cell_type": "raw", "id": "raw", "metadata": {"format": "text/x-rst"}, "source": ".. note:: raw"}
+        ]
+    });
+    let mut s = world();
+    s.run("notebook.open", &json!({"text": original.to_string()})).unwrap();
+    let nb = s.project.notebooks.last().unwrap().clone();
+    assert_eq!(nb.language(), Some("python"));
+    // Rich outputs read as text, with the image kept for the pane.
+    let out = nb.cells[1].output.as_deref().unwrap_or_default();
+    assert!(out.contains("loading") && out.contains('2') && out.contains("<Figure>"), "{out:?}");
+    assert!(!nb.cells[1].error);
+    assert_eq!(nb.cells[1].images(), vec![png]);
+    let err = nb.cells[2].output.as_deref().unwrap_or_default();
+    assert!(nb.cells[2].error && err.contains("ZeroDivisionError: division by zero") && !err.contains('\u{1b}'), "{err:?}");
+    // A stream after a result starts its own line; consecutive streams join.
+    let outputs = json!([
+        {"output_type": "execute_result", "data": {"text/plain": "2"}},
+        {"output_type": "stream", "name": "stdout", "text": "a"},
+        {"output_type": "stream", "name": "stdout", "text": "b"}
+    ]);
+    // A kernel known only by its name, or with a blank language, is still Python.
+    for meta in [json!({"kernelspec": {"name": "python3"}}), json!({"kernelspec": {"language": " "}, "language_info": {"name": "python"}})]
+    {
+        let text = json!({"nbformat": 4, "metadata": meta, "cells": [{"cell_type": "code", "source": "x", "outputs": outputs}]});
+        s.run("notebook.open", &json!({"text": text.to_string()})).unwrap();
+        let opened = s.project.notebooks.last().unwrap();
+        assert_eq!(opened.language(), Some("python"), "{meta}");
+        assert_eq!(opened.cells[0].output.as_deref(), Some("2\nab"));
+        s.run("notebook.remove", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
+    }
+    // A notebook with more cells than RustGIS holds is refused rather than cut short.
+    let many = json!({"nbformat": 4, "cells": vec![json!({"cell_type": "markdown", "source": "x"}); 1001]});
+    let e = s.run("notebook.open", &json!({"text": many.to_string()})).unwrap_err();
+    assert!(e.contains("1001 cells"), "{e}");
+    // So is one too large in RustGIS's own format.
+    let many = json!({"name": "Big", "cells": vec![json!({"kind": "markdown", "source": "x"}); 1001]});
+    assert!(s.run("notebook.open", &json!({"text": many.to_string()})).unwrap_err().contains("1001 cells"));
+    // Nor one with a cell that isn't an object.
+    let odd = json!({"nbformat": 4, "cells": [{"cell_type": "markdown", "source": "a"}, 7]});
+    assert!(s.run("notebook.open", &json!({"text": odd.to_string()})).is_err());
+    // Nor is an nbformat 3 notebook, whose cells are in worksheets.
+    let v3 = json!({"nbformat": 3, "worksheets": [{"cells": [{"cell_type": "code", "input": "1"}]}]});
+    assert!(s.run("notebook.open", &json!({"text": v3.to_string()})).unwrap_err().contains("nbformat 3"));
+    // Nor is a cell longer than RustGIS keeps.
+    let long = json!({"nbformat": 4, "cells": [{"cell_type": "code", "source": "x".repeat(200_001)}]});
+    assert!(s.run("notebook.open", &json!({"text": long.to_string()})).unwrap_err().contains("cell 1"));
+    let long = json!({"name": "Long", "cells": [{"kind": "code", "source": "x".repeat(200_001)}]});
+    assert!(s.run("notebook.open", &json!({"text": long.to_string()})).unwrap_err().contains("cell 1"));
+    // A cell that removes an earlier one writes its result to itself, not to the cell that moved
+    // into its place.
+    s.run("notebook.new", &json!({"name": "Shift"})).unwrap();
+    s.run("notebook.editCell", &json!({"cell": 1, "source": "notebook.removeCell {\"notebook\": \"Shift\", \"cell\": 0}"})).unwrap();
+    s.run("notebook.addCell", &json!({"source": "map.goToXY {\"lon\": 1, \"lat\": 1}"})).unwrap();
+    s.run("notebook.run", &json!({"cell": 1})).unwrap();
+    let shift = s.project.notebooks.last().unwrap();
+    assert_eq!(shift.cells.len(), 2);
+    assert_eq!(shift.cells[1].output, None, "the cell that moved up keeps its own (empty) output");
+    assert!(shift.cells[0].output.as_deref().is_some_and(|o| o.starts_with("notebook.removeCell")), "{:?}", shift.cells[0].output);
+    s.run("notebook.remove", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
+    // Junk where a Jupyter notebook has its parts is skipped or refused, never a panic.
+    for junk in [
+        json!({"nbformat": 4, "cells": 5}),
+        json!({"nbformat": 4, "cells": [1, "x", null, {"cell_type": 7, "source": {"a": 1}, "outputs": "no"}]}),
+        json!({"nbformat": "4", "nbformat_minor": "5", "metadata": "x", "cells": [{"cell_type": "code", "outputs": [1, {"output_type": "error", "traceback": [1, null]}, {"output_type": "display_data", "data": 3}]}]}),
+        json!({"nbformat": 4, "metadata": {"kernelspec": 1, "language_info": [1]}, "cells": [{"cell_type": "code", "id": 9, "outputs": [{"data": {"image/png": [1, 2]}}]}]}),
+    ] {
+        if s.run("notebook.open", &json!({"text": junk.to_string()})).is_ok() {
+            let nb = s.project.notebooks.last().unwrap();
+            let _ = (nb.language_label(), nb.cells.iter().map(crate::cmd::notebook::Cell::images).count());
+            let i = s.project.notebooks.len() - 1;
+            assert!(crate::cmd::notebook::notebook_file(&s, i, true).is_ok(), "{junk}");
+            s.run("notebook.remove", &json!({"notebook": i})).unwrap();
+        }
+    }
+    // A command cell from Jupyter that runs here replaces its Jupyter outputs with the result.
+    let cmds = json!({"nbformat": 4, "nbformat_minor": 5, "metadata": {"language_info": {"name": "rustgis"}}, "cells": [
+        {"cell_type": "code", "id": "go", "metadata": {}, "execution_count": 7, "source": "map.goToXY {\"lon\": 3, \"lat\": 3}",
+         "outputs": [{"output_type": "stream", "name": "stdout", "text": "old\n"}]}]});
+    s.run("notebook.open", &json!({"text": cmds.to_string()})).unwrap();
+    s.run("notebook.run", &json!({"cell": 0})).unwrap();
+    let i = s.project.notebooks.len() - 1;
+    let saved: Value = serde_json::from_slice(&crate::cmd::notebook::notebook_file(&s, i, true).unwrap()).unwrap();
+    let cell = &saved["cells"][0];
+    assert_eq!(cell["id"], "go");
+    assert_eq!(cell["execution_count"], Value::Null);
+    let text = crate::cmd::notebook::jupyter_text(&cell["outputs"][0]["text"]);
+    assert!(text.starts_with("map.goToXY") && !text.contains("old"), "{text}");
+    s.run("notebook.remove", &json!({"notebook": i})).unwrap();
+    // A Jupyter notebook that names no language isn't run as commands either.
+    let bare = json!({"nbformat": 4, "cells": [{"cell_type": "code", "source": "map.goToXY {\"lon\": 9, \"lat\": 9}"}]});
+    s.run("notebook.open", &json!({"text": bare.to_string()})).unwrap();
+    assert_eq!(s.project.notebooks.last().unwrap().language(), Some("code"));
+    // A language from the file is kept short when shown.
+    let long = json!({"nbformat": 4, "metadata": {"kernelspec": {"language": "q".repeat(1000)}}, "cells": []});
+    s.run("notebook.open", &json!({"text": long.to_string()})).unwrap();
+    assert_eq!(s.project.notebooks.last().unwrap().language_label().map(|l| l.chars().count()), Some(32));
+    s.run("notebook.remove", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
+    s.run("notebook.activate", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
+    assert_eq!(s.run("notebook.run", &Value::Null).unwrap()["skipped"], 1);
+    s.run("notebook.remove", &json!({"notebook": s.project.notebooks.len() - 1})).unwrap();
+    s.run("notebook.activate", &json!({"notebook": nb.name.as_str()})).unwrap();
+    // Python cells aren't run as commands: running them all skips them, one alone says why.
+    let r = s.run("notebook.run", &Value::Null).unwrap();
+    assert_eq!(r["ran"], 0);
+    assert_eq!(r["skipped"], 2);
+    let e = s.run("notebook.run", &json!({"cell": 1})).unwrap_err();
+    assert!(e.contains("Python"), "{e}");
+    assert_eq!(s.project.notebooks.last().unwrap(), &nb, "skipped cells keep their outputs");
+    // Saving keeps the kernel, metadata, ids, raw cells and every output, so Jupyter can run it.
+    let dir = std::env::temp_dir().join(format!("rustgis-jupyter-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("rivers.ipynb");
+    s.run("notebook.save", &json!({"path": path.to_str().unwrap()})).unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["nbformat_minor"], 5);
+    for key in ["kernelspec", "language_info", "widgets"] {
+        assert_eq!(saved["metadata"][key], original["metadata"][key], "{key}");
+    }
+    let (sc, oc) = (saved["cells"].as_array().unwrap(), original["cells"].as_array().unwrap());
+    assert_eq!(sc.len(), oc.len());
+    for (a, b) in sc.iter().zip(oc) {
+        for key in ["cell_type", "id", "metadata", "outputs", "execution_count"] {
+            assert_eq!(a[key], b[key], "{key} of cell {}", b["id"]);
+        }
+        assert_eq!(crate::cmd::notebook::jupyter_text(&a["source"]), crate::cmd::notebook::jupyter_text(&b["source"]));
+    }
+    // An edited cell keeps its outputs; a new cell gets a fresh, unique id.
+    s.run("notebook.editCell", &json!({"cell": 1, "source": "1 + 2"})).unwrap();
+    s.run("notebook.addCell", &json!({"source": "print('hi')"})).unwrap();
+    s.run("notebook.save", &json!({"path": path.to_str().unwrap()})).unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved["cells"][1]["outputs"], original["cells"][1]["outputs"]);
+    let id = saved["cells"][4]["id"].as_str().unwrap();
+    assert!(!id.is_empty() && !["intro", "load", "boom", "raw"].contains(&id), "{id}");
+    assert_eq!(saved["cells"][4]["outputs"], json!([]));
+    // A RustGIS command notebook saved as Jupyter still opens as commands.
+    s.run("notebook.new", &json!({"name": "Commands"})).unwrap();
+    s.run("notebook.save", &json!({"path": path.to_str().unwrap()})).unwrap();
+    s.run("notebook.open", &json!({"path": path.to_str().unwrap()})).unwrap();
+    assert_eq!(s.project.notebooks.last().unwrap().language(), None);
+    // And a notebook kept in a project keeps its Jupyter details.
+    let i = s.project.notebooks.iter().position(|n| n.name == nb.name).unwrap();
+    let back: crate::cmd::notebook::Notebook = serde_json::from_value(serde_json::to_value(&s.project.notebooks[i]).unwrap()).unwrap();
+    assert_eq!(back.language(), Some("python"));
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A three-band raster: water-like pixels on the left half, field-like on the right.
@@ -8316,6 +9734,116 @@ fn identify_reports_vector_tile_features() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A vector archive's source layers are listed by `map.tiles`; one switched off with
+/// `map.setTiles {hiddenLayers}` isn't identified, the setting undoes and is kept with the project,
+/// and a bad list is refused without changing anything.
+#[test]
+fn tile_source_layers_can_be_hidden() {
+    use crate::render::rustgis_tiles::{mvt, pmtiles};
+    let feature = |kind, geometry: Vec<Vec<[f32; 2]>>, name: &str| mvt::Feature {
+        id: None,
+        kind,
+        geometry,
+        props: vec![("name".into(), mvt::Value::String(name.into()))],
+    };
+    let park = feature(
+        mvt::GeomKind::Polygon,
+        vec![vec![[1024.0, 1024.0], [3072.0, 1024.0], [3072.0, 3072.0], [1024.0, 3072.0], [1024.0, 1024.0]]],
+        "Central",
+    );
+    // Across the park, through the middle of the world.
+    let road = feature(mvt::GeomKind::LineString, vec![vec![[0.0, 2048.0], [4096.0, 2048.0]]], "Equator Road");
+    let layer = |name: &str, f| mvt::Layer { name: name.into(), extent: 4096, features: vec![f] };
+    let tile = mvt::encode(&mvt::Tile { layers: vec![layer("parks", park), layer("roads", road)] });
+    let new = pmtiles::NewArchive {
+        tile_type: pmtiles::TileType::Mvt,
+        gzipped_tiles: false,
+        bounds: [-180.0, -85.0, 180.0, 85.0],
+        // Names no tile layer keeps (empty, too long) and repeats don't use up the 256 listed, nor
+        // push `roads` out of the archive's look: it is listed, drawn, identified and hidden.
+        metadata: json!({"vector_layers": std::iter::repeat_n(json!({"id": "parks"}), 300)
+            .chain((0..300).map(|i| json!({"id": format!("{}{i}", "x".repeat(300))})))
+            .chain([json!({"id": ""}), json!({"id": "roads"})])
+            .collect::<Vec<_>>()}),
+    };
+    let dir = std::env::temp_dir().join(format!("rustgis-tile-source-layers-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("city.pmtiles");
+    std::fs::write(&path, pmtiles::write(vec![(0, 0, 0, tile)], &new).unwrap()).unwrap();
+
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path.display().to_string()})).unwrap();
+    s.map_mut().camera.center = rustgis_geom::Coord::new(0.0, 0.0);
+    s.map_mut().camera.res = 2.0 * 20_037_508.342_789_244 / 256.0;
+    // The archive's header arrives in the background.
+    let mut listed = Value::Null;
+    for _ in 0..500 {
+        listed = s.run("map.tiles", &json!({})).unwrap()[0].clone();
+        if listed.get("sourceLayers").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(listed["sourceLayers"], json!(["parks", "roads"]), "{listed}");
+    assert!(listed.get("hiddenLayers").is_none());
+    let found = |s: &mut Session| -> Vec<String> {
+        // The tile arrives in the background too.
+        for _ in 0..500 {
+            let r = s.run("identify", &json!({"lon": 1.0, "lat": 0.0, "mode": "visible"})).unwrap();
+            if !r.is_null() {
+                let mut names: Vec<String> =
+                    r["results"].as_array().unwrap().iter().map(|x| x["sourceLayer"].as_str().unwrap_or_default().to_string()).collect();
+                names.sort();
+                return names;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Vec::new()
+    };
+    assert_eq!(found(&mut s), ["parks", "roads"]);
+    s.run("map.setTiles", &json!({"index": 0, "hiddenLayers": ["parks"]})).unwrap();
+    assert_eq!(s.map().tiles[0].hidden_layers, ["parks"]);
+    assert_eq!(s.run("map.tiles", &json!({})).unwrap()[0]["hiddenLayers"], json!(["parks"]));
+    assert_eq!(found(&mut s), ["roads"]);
+    // Undone, the park is back; redone, it's hidden again.
+    s.run("edit.undo", &json!({})).unwrap();
+    assert!(s.map().tiles[0].hidden_layers.is_empty());
+    assert_eq!(found(&mut s), ["parks", "roads"]);
+    s.run("edit.redo", &json!({})).unwrap();
+    assert_eq!(found(&mut s), ["roads"]);
+    // Kept with the project.
+    let text = serde_json::to_string(&s.project).unwrap();
+    assert!(text.contains(r#""hiddenLayers":["parks"]"#), "{text}");
+    let mut reopened = Session::new(Project::default());
+    reopened.run("project.openText", &json!({"text": text})).unwrap();
+    assert_eq!(reopened.map().tiles[0].hidden_layers, ["parks"]);
+    // A damaged entry in a project is dropped, not fatal.
+    let damaged = text.replace(r#""hiddenLayers":["parks"]"#, r#""hiddenLayers":[3,"parks",""]"#);
+    let mut reopened = Session::new(Project::default());
+    reopened.run("project.openText", &json!({"text": damaged})).unwrap();
+    assert_eq!(reopened.map().tiles[0].hidden_layers, ["parks"]);
+    // Repeats don't use up the cap: each name counts once.
+    let repeated = format!(r#""hiddenLayers":[{}"roads"]"#, r#""parks","#.repeat(300));
+    let mut reopened = Session::new(Project::default());
+    reopened.run("project.openText", &json!({"text": text.replace(r#""hiddenLayers":["parks"]"#, &repeated)})).unwrap();
+    assert_eq!(reopened.map().tiles[0].hidden_layers, ["parks", "roads"]);
+    // Bad lists, and a raster layer's, are refused and change nothing.
+    let too_many: Vec<String> = (0..=rustgis_map::tiles::MAX_SOURCE_LAYERS).map(|i| format!("l{i}")).collect();
+    for bad in [json!("parks"), json!([1]), json!({"parks": true}), json!(too_many)] {
+        assert!(s.run("map.setTiles", &json!({"index": 0, "hiddenLayers": bad, "opacity": 0.5})).is_err(), "{bad}");
+    }
+    assert_eq!((s.map().tiles[0].hidden_layers.clone(), s.map().tiles[0].opacity), (vec!["parks".to_string()], 1.0));
+    s.run("map.addTiles", &json!({"url": "https://tiles.example.com/{z}/{x}/{y}.png", "name": "Imagery"})).unwrap();
+    assert!(s.run("map.setTiles", &json!({"name": "Imagery", "hiddenLayers": ["parks"]})).is_err());
+    // Each name once; null shows them all again.
+    s.run("map.setTiles", &json!({"name": "city", "hiddenLayers": ["roads", "parks", "roads"]})).unwrap();
+    let city = s.map().tiles.iter().position(|t| t.name == "city").unwrap();
+    assert_eq!(s.map().tiles[city].hidden_layers, ["parks", "roads"]);
+    s.run("map.setTiles", &json!({"name": "city", "hiddenLayers": null})).unwrap();
+    assert!(s.map().tiles[city].hidden_layers.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A tile-less PMTiles archive (an empty root directory) whose header gives these bounds
 /// (west, south, east, north).
 fn empty_pmtiles(bounds: [f64; 4]) -> Vec<u8> {
@@ -8703,7 +10231,7 @@ fn jpeg2000_from_a_web_address() {
 }
 
 /// Where a command may not download itself (the browser), `layer.addUrl` leaves its request for
-/// the front end: once per address, a few at a time (the next is refused, never one silently
+/// the front end: once per request, a few at a time (the next is refused, never one silently
 /// dropped after it was promised), and taken once.
 #[test]
 fn url_requests_wait_for_the_front_end() {
@@ -8712,10 +10240,13 @@ fn url_requests_wait_for_the_front_end() {
     assert_eq!(s.request_url(&p), Ok(json!({"pending": true, "url": "https://x.org/a.geojson"})));
     assert!(s.request_url(&p).is_ok());
     assert!(s.request_url(&json!({"url": "https://x.org/b.geojson"})).is_ok());
+    // The same address read another way is another layer.
+    assert!(s.request_url(&json!({"url": "https://x.org/a.geojson", "name": "A2"})).is_ok());
     let taken = s.take_url_requests();
-    assert_eq!(taken.len(), 2, "the same address once");
+    assert_eq!(taken.len(), 3, "the same request once");
     assert_eq!((taken[0]["name"].as_str(), taken[0]["zoom"].as_bool()), (Some("A"), Some(true)));
     assert_eq!(taken[1]["url"], "https://x.org/b.geojson");
+    assert_eq!((taken[2]["url"].as_str(), taken[2]["name"].as_str()), (Some("https://x.org/a.geojson"), Some("A2")));
     assert!(s.take_url_requests().is_empty());
     for i in 0..16 {
         assert!(s.request_url(&json!({"url": format!("https://x.org/{i}")})).is_ok(), "{i}");
@@ -8854,11 +10385,23 @@ fn spreadsheets_feeds_landxml_and_polylines() {
     assert_eq!(c["columns"], json!(["stop;Lon;Lat"]));
     assert!(s.run("info.fileColumns", &json!({"path": csv, "delimiter": ";;"})).is_err());
     assert!(s.run("info.fileColumns", &json!({"path": dir.join("missing.csv").display().to_string()})).is_err());
-    // Only the start of delimited text is read: a character cut at its end isn't an error, bytes
-    // that aren't UTF-8 are.
+    // Only the start of delimited text is read: a character cut at its end isn't an error, and
+    // bytes that aren't UTF-8 are read as Latin-1 (#1303), as the file is.
     let cut = crate::cmd::layer::columns_of("t.csv", b"lon,lat,name\n1,2,\xc3", &json!({})).unwrap();
     assert_eq!(cut["x"], "lon");
-    assert!(crate::cmd::layer::columns_of("t.csv", b"lon,lat\n\xff,2\n", &json!({})).is_err());
+    let latin1 = crate::cmd::layer::columns_of("t.csv", b"lon;lat;munic\xedpio\n\xff;2;x\n", &json!({})).unwrap();
+    assert_eq!(latin1["columns"], json!(["lon", "lat", "município"]));
+    // A Latin-1 file with its x/y columns named, as a public source's CSV is added: read, with
+    // a notice saying how.
+    let cnes = dir.join("cnes.csv");
+    std::fs::write(&cnes, b"NO_FANTASIA;NU_LATITUDE;NU_LONGITUDE\nPOSTO S\xc3O JOS\xc9;-5.09;-42.80\n").unwrap();
+    s.notices.clear();
+    let r = s
+        .run("layer.addData", &json!({"path": cnes.display().to_string(), "x": "NU_LONGITUDE", "y": "NU_LATITUDE", "delimiter": ";"}))
+        .unwrap();
+    let l = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap();
+    assert_eq!(l.dataset.value(0, 0), &rustgis_data::Value::Text("POSTO SÃO JOSÉ".into()));
+    assert!(s.notices.iter().any(|n| n.text.contains("Windows-1252")), "{:?}", s.notices);
     // A GeoRSS feed as plain .xml, by its contents.
     let feed = dir.join("quakes.xml");
     std::fs::write(&feed, r#"<rss xmlns:georss="http://www.georss.org/georss"><channel><item><title>Q</title><georss:point>45 -110</georss:point></item></channel></rss>"#).unwrap();
@@ -8994,6 +10537,9 @@ fn service_times_and_directories() {
         ]
     );
     assert!(s.run("service.add", &json!({"url": url, "layer": "TC", "text": WMTS, "time": "../../etc"})).is_err());
+    // Its matrices are zooms 0 and 1: past them its tiles are stretched, not asked for.
+    assert!(s.map().tiles.iter().all(|t| (t.min_zoom, t.max_zoom) == (0, 1)));
+    assert_eq!((v["layers"][0]["minZoom"].as_u64(), v["layers"][0]["maxZoom"].as_u64()), (Some(0), Some(1)));
     // A directory: its folders and services, each opened by its own address.
     let root = "https://x.example.org/arcgis/rest/services";
     let dir = r#"{"currentVersion": 11, "folders": ["Hydro"], "services": [{"name": "Topo", "type": "MapServer"}]}"#;
@@ -9002,6 +10548,19 @@ fn service_times_and_directories() {
     assert_eq!(v["layers"][1]["offer"], json!({"type": "service", "url": "https://x.example.org/arcgis/rest/services/Topo/MapServer"}));
     let e = s.run("service.add", &json!({"url": root, "text": dir, "layer": "Topo/MapServer"})).unwrap_err();
     assert!(e.contains("service.layers"), "{e}");
+}
+
+/// Adding an OGC API collection the listing left out, as 3D Tiles (#1267), says why, not that the
+/// document isn't GeoJSON.
+#[test]
+fn adding_a_collection_of_3d_tiles_says_why_it_is_left_out() {
+    let mut s = Session::new(Project::default());
+    let url = "https://x.example.org/ogc/v1/collections";
+    let doc = r#"{"collections": [{"id": "gebouwen", "title": "3D Tiles Gebouwen", "itemType": "feature", "links": [{"rel": "items", "type": "application/json+3dtiles", "href": "https://x.example.org/ogc/v1/collections/gebouwen/3dtiles?f=json"}]}]}"#;
+    let e = s.run("service.add", &json!({"url": url, "text": doc, "layer": "Gebouwen"})).unwrap_err();
+    assert!(e.contains("no layer 'Gebouwen': collection 'gebouwen' offers 3D Tiles, which RustGIS doesn't draw"), "{e}");
+    let e = s.run("service.add", &json!({"url": url, "text": doc, "layer": "gebouwen_x"})).unwrap_err();
+    assert!(e.ends_with("(service.layers lists them)"), "{e}");
 }
 
 /// A secured ArcGIS service given by an address with `?token=…` (#914): the token is kept for its
@@ -9049,6 +10608,84 @@ fn an_arcgis_token_in_a_service_address_reaches_its_layers() {
     let wms = "https://wms914.example.org/rest/services/wms?token=keep-it";
     let kept = crate::cmd::service::without_token(&json!({"url": wms, "type": "wms"})).unwrap();
     assert!(kept.is_none() && arcgis_auth::authorization(wms).is_none());
+}
+
+/// A layer its service draws on request (#1162): one picture of the view when added from its
+/// service, tiles of 256, 512 or 1024 pixels when asked; a project saved before keeps its tiles;
+/// tiles cut from a tile set refuse both.
+#[test]
+fn wms_layers_draw_as_one_picture_or_tiles_of_a_size() {
+    const WMS: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.com/wms?"/></Get></HTTP></DCPType></GetMap></Request>
+<Layer><CRS>EPSG:3857</CRS><CRS>EPSG:4326</CRS><Layer><Name>roads</Name><Title>Roads</Title></Layer></Layer></Capability></WMS_Capabilities>"#;
+    let mut s = Session::new(Project::default());
+    s.run("service.add", &json!({"url": "https://maps.example.com/wms", "layer": "roads", "text": WMS})).unwrap();
+    let roads = |s: &Session| s.map().tiles.iter().find(|t| t.name == "Roads").cloned().unwrap();
+    assert!(roads(&s).single_image, "one picture of the view, from its service");
+    // Offered in another system too: drawn in Web Mercator as it comes, its other systems kept
+    // for maps in them (as most services are).
+    assert!(roads(&s).url.contains("#rustgis-warp=") && roads(&s).sized_tiles(), "{}", roads(&s).url);
+    let listed = s.run("map.tiles", &json!({})).unwrap();
+    assert_eq!((listed[0]["singleImage"].clone(), listed[0]["tileSize"].clone()), (json!(true), json!(256)));
+    // Tiles of 1024 pixels: asked for that size.
+    s.run("map.setTiles", &json!({"name": "Roads", "singleImage": false, "tileSize": 1024.0})).unwrap();
+    let t = roads(&s);
+    assert!(!t.single_image && t.tile_size == 1024);
+    assert!(t.url.contains("&WIDTH=1024&HEIGHT=1024&") && t.url.contains("#rustgis-warp="), "{}", t.url);
+    // Its pictures in another system take any size still.
+    let base = t.url.split('#').next().unwrap();
+    assert!(rustgis_data::ogc::warp::Warp::map_template(base).contains("BBOX={nbbox}&WIDTH={nw}&HEIGHT={nh}"));
+    // Kept with the project, and undone.
+    let saved: rustgis_map::TileLayer = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
+    assert_eq!((saved.single_image, saved.tile_size), (false, 1024));
+    assert!(s.undo());
+    let t = roads(&s);
+    assert!(t.single_image && t.tile_size == 256 && t.url.contains("&WIDTH=256&HEIGHT=256&"));
+    // Junk refused, nothing changed.
+    for bad in
+        [json!({"name": "Roads", "tileSize": 300}), json!({"name": "Roads", "tileSize": "big"}), json!({"name": "Roads", "tileSize": 2048})]
+    {
+        assert!(s.run("map.setTiles", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(roads(&s).tile_size, 256);
+    // A project saved before: tiles, as then.
+    let mut old = serde_json::to_value(roads(&s)).unwrap();
+    old.as_object_mut().unwrap().remove("singleImage");
+    let old: rustgis_map::TileLayer = serde_json::from_value(old).unwrap();
+    assert!(!old.single_image);
+    // Tiles cut from a tile set are neither.
+    s.run("map.addTiles", &json!({"url": "https://tile.example.org/{z}/{x}/{y}.png", "name": "XYZ", "overlay": true})).unwrap();
+    let e = s.run("map.setTiles", &json!({"name": "XYZ", "singleImage": true})).unwrap_err();
+    assert!(e.contains("draws on request"), "{e}");
+    assert!(s.run("map.setTiles", &json!({"name": "XYZ", "tileSize": 1024})).is_err());
+    assert!(s.run("map.addTiles", &json!({"url": "https://tile.example.org/{z}/{x}/{y}.png", "singleImage": true})).is_err());
+    // Nor is an address by its box with no size to write (a generic template): asked for at its
+    // service's default size, it stays in its own tiles.
+    let bare = "https://maps.example.org/render?bbox={bbox-epsg-3857}&format=png";
+    assert!(!rustgis_map::tiles::drawn_on_request(bare));
+    assert!(s.run("map.addTiles", &json!({"url": bare, "name": "Bare", "overlay": true, "singleImage": true})).is_err());
+    s.run("map.addTiles", &json!({"url": bare, "name": "Bare", "overlay": true})).unwrap();
+    assert!(s.run("map.setTiles", &json!({"name": "Bare", "tileSize": 1024})).is_err());
+    assert!(rustgis_map::tiles::drawn_on_request("https://maps.example.org/wms?BBOX={nbbox}&width={nw}&HEIGHT={nh}&f=png"));
+    assert!(rustgis_map::tiles::drawn_on_request("https://maps.example.org/wms?BBOX={bbox-epsg-3857}&WIDTH={width}&HEIGHT={height}"));
+    assert!(!rustgis_map::tiles::drawn_on_request("https://maps.example.org/wms?BBOX={bbox-epsg-3857}&WIDTH={w}&HEIGHT=256"));
+    // Added by its address, a layer drawn on request is one picture too, unless tiles are asked
+    // for; a bare template, and tiles cut from a tile set, are tiles.
+    let wms = "https://m.example.org/wms?SERVICE=WMS&REQUEST=GetMap&LAYERS=a&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng";
+    let single = |s: &Session, name: &str| s.map().tiles.iter().find(|t| t.name == name).unwrap().single_image;
+    s.run("map.addTiles", &json!({"url": wms, "name": "ByAddress", "overlay": true})).unwrap();
+    assert!(single(&s, "ByAddress"));
+    s.run("map.addTiles", &json!({"url": wms, "name": "AsTiles", "overlay": true, "singleImage": false})).unwrap();
+    assert!(!single(&s, "AsTiles"));
+    s.run("map.addTiles", &json!({"url": wms.replace("LAYERS=a", "LAYERS=b"), "name": "Sized", "overlay": true, "tileSize": 512})).unwrap();
+    assert!(!single(&s, "Sized"));
+    assert!(!single(&s, "Bare") && !single(&s, "XYZ"));
+    // A map service's export added with a tile size: its size asked for.
+    let export = "https://s.example.org/arcgis/rest/services/x/MapServer/export?bbox={bbox-epsg-3857}&bboxSR=3857&imageSR=3857&size=256,256&format=png32&f=image";
+    s.run("map.addTiles", &json!({"url": export, "name": "Export", "overlay": true, "tileSize": 512})).unwrap();
+    let t = s.map().tiles.iter().find(|t| t.name == "Export").unwrap();
+    assert!(t.url.contains("&size=512,512&") && t.tile_size == 512 && !t.single_image, "{}", t.url);
 }
 
 /// A WMS layer added from its service takes its legends (the service's GetLegendGraphic, then
@@ -9130,6 +10767,145 @@ fn tile_layers_take_their_services_legends() {
         assert!(s.run("map.addTiles", &json!({"url": "https://other.example.com/{z}/{x}/{y}.png", "legend": bad})).is_err(), "{bad}");
     }
     assert_eq!(legends(&s, "Topo").0, Vec::<String>::new(), "a refusal changes nothing");
+}
+
+/// A WMS layer with a time dimension (WMS 1.3.0 Annex C) is added at its default or the time
+/// asked for, named with it: one time where the layer takes single values, a list or interval
+/// where it takes several; GetFeatureInfo asks at the same time, its project's layer too.
+#[test]
+fn wms_layers_with_time() {
+    const WMS: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.com/wms?"/></Get></HTTP></DCPType></GetMap>
+<GetFeatureInfo><Format>application/geo+json</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.com/wms?"/></Get></HTTP></DCPType></GetFeatureInfo></Request>
+<Layer queryable="1"><Title>Root</Title><CRS>EPSG:3857</CRS>
+<Layer><Name>population</Name><Title>Population</Title><Dimension name="time" units="ISO8601" default="2025" nearestValue="0">1990,2000,2025</Dimension></Layer>
+<Layer><Name>decades</Name><Title>Decades</Title><Dimension name="time" units="ISO8601" default="2020" multipleValues="1">1990/2020/P10Y</Dimension></Layer>
+<Layer><Name>roads</Name><Title>Roads</Title></Layer>
+<Layer><Name>now</Name><Title>Now</Title><Dimension name="time" units="ISO8601" default="current">current</Dimension></Layer>
+<Layer><Name>once</Name><Title>Once</Title><Dimension name="time" units="ISO8601" default="1946">1946</Dimension></Layer>
+</Layer></Capability></WMS_Capabilities>"#;
+    let mut s = Session::new(Project::default());
+    let url = "https://maps.example.com/wms";
+    let listed = s.run("service.layers", &json!({"url": url, "text": WMS})).unwrap();
+    let population = listed["layers"].as_array().unwrap().iter().find(|l| l["name"] == "population").unwrap();
+    assert_eq!(population["time"], json!({"default": "2025", "values": ["1990", "2000", "2025"], "count": 3, "multiple": false}));
+    s.run("service.add", &json!({"url": url, "layer": "population", "text": WMS})).unwrap();
+    s.run("service.add", &json!({"url": url, "layer": "population", "text": WMS, "time": "1990"})).unwrap();
+    let tile = |s: &Session, name: &str| s.map().tiles.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("{name}")).url.clone();
+    assert!(tile(&s, "Population").ends_with("&TIME=2025"), "{}", tile(&s, "Population"));
+    assert!(tile(&s, "Population 1990").ends_with("&TIME=1990"), "{}", tile(&s, "Population 1990"));
+    // One time for a layer that takes single values; a list or interval for one that takes several.
+    let e = s.run("service.add", &json!({"url": url, "layer": "population", "text": WMS, "time": "1990,2000"})).unwrap_err();
+    assert!(e.contains("a time is a date"), "{e}");
+    s.run("service.add", &json!({"url": url, "layer": "decades", "text": WMS, "time": "1990/2010"})).unwrap();
+    assert!(tile(&s, "Decades 1990/2010").ends_with("&TIME=1990%2F2010"), "{}", tile(&s, "Decades 1990/2010"));
+    // GetFeatureInfo asks at the layer's time, a project's layer (without its request) too.
+    s.run("map.goToXY", &json!({"lon": 8.5, "lat": 47.4, "scale": 10000})).unwrap();
+    let asked = |s: &mut Session| -> Vec<String> {
+        let v = s.run("identify", &json!({"lon": 8.5, "lat": 47.4, "mode": "visible"})).unwrap();
+        v["featureInfo"].as_array().unwrap().iter().filter_map(|a| a["url"].as_str().map(str::to_string)).collect()
+    };
+    let requests = asked(&mut s);
+    for (name, time) in [("Population", "2025"), ("Population 1990", "1990"), ("Decades 1990/2010", "1990%2F2010")] {
+        let layer = tile(&s, name);
+        assert!(
+            requests.iter().any(|r| r.contains("REQUEST=GetFeatureInfo")
+                && r.ends_with(&format!("&TIME={time}"))
+                && r.contains(if name.starts_with('D') { "LAYERS=decades" } else { "LAYERS=population" })),
+            "{name} ({layer}): {requests:?}"
+        );
+    }
+    let text = serde_json::to_string(&s.project).unwrap();
+    let mut reopened = Session::new(serde_json::from_str(&text).unwrap());
+    assert!(reopened.map().tiles.iter().all(|t| t.feature_info.is_none()));
+    let p = json!({"layer": "Population 1990", "lon": 8.5, "lat": 47.4, "capabilities": WMS, "request": true});
+    let r = reopened.run("identify.featureInfo", &p).unwrap();
+    let request = r["url"].as_str().unwrap();
+    assert!(request.contains("REQUEST=GetFeatureInfo") && request.ends_with("&TIME=1990"), "{request}");
+
+    // Following the time slider: it turns on with the layer's times, at its default, and each of
+    // its steps draws (and asks) the layer at that time.
+    let mut s = Session::new(Project::default());
+    let added = s.run("service.add", &json!({"url": url, "layer": "population", "text": WMS, "time": "slider"})).unwrap();
+    assert!(added["url"].as_str().is_some_and(|u| u.ends_with("&TIME=2025")), "{added}");
+    let year = |y: i32| rustgis_data::time::parse_text(&format!("{y}-01-01")).unwrap();
+    let slider = s.map().time.clone().unwrap();
+    assert_eq!((slider.steps(), slider.current), (vec![year(1990), year(2000), year(2025)], year(2025)));
+    let population = s.map().tiles.iter().find(|t| t.name == "Population").unwrap();
+    assert!(population.time_url.as_deref().is_some_and(|u| u.ends_with("&TIME={date:YYYY}")), "{:?}", population.time_url);
+    assert!(population.url.ends_with("&TIME=2025"), "{}", population.url);
+    s.run("time.goTo", &json!({"date": "1990"})).unwrap();
+    assert!(tile(&s, "Population").ends_with("&TIME=1990"), "{}", tile(&s, "Population"));
+    s.run("map.goToXY", &json!({"lon": 8.5, "lat": 47.4, "scale": 10000})).unwrap();
+    let requests = asked(&mut s);
+    assert!(requests.len() == 1 && requests[0].ends_with("&TIME=1990"), "{requests:?}");
+    // A second layer follows the slider that is on (`"time": true`, as for Zarr): its steps stay,
+    // and it says the service may have no map at some of them.
+    let mark = s.notice_mark();
+    s.run("service.add", &json!({"url": url, "layer": "decades", "text": WMS, "time": true})).unwrap();
+    assert_eq!(s.map().time.as_ref().unwrap().steps(), slider.steps());
+    assert!(s.notices_since(mark).is_empty(), "1990 is one of its times: {:?}", s.notices_since(mark));
+    assert!(tile(&s, "Decades").ends_with("&TIME=1990"), "{}", tile(&s, "Decades"));
+    // Kept with the project, still following.
+    let text = serde_json::to_string(&s.project).unwrap();
+    let mut reopened = Session::new(serde_json::from_str(&text).unwrap());
+    reopened.run("time.goTo", &json!({"date": "2000"})).unwrap();
+    assert!(tile(&reopened, "Population").ends_with("&TIME=2000"), "{}", tile(&reopened, "Population"));
+    // One period: a regular slider, by its period, at the layer's default.
+    let mut every = Session::new(Project::default());
+    every.run("service.add", &json!({"url": url, "layer": "decades", "text": WMS, "time": "slider"})).unwrap();
+    let t = every.map().time.clone().unwrap();
+    assert_eq!((t.start, t.end, t.unit.code(), t.interval, t.current), (year(1990), year(2020), "year", 10, year(2020)));
+    assert_eq!(t.steps().len(), 4);
+    assert!(tile(&every, "Decades").ends_with("&TIME=2020"), "{}", tile(&every, "Decades"));
+    // A slider on at a time the layer doesn't list: the layer says so.
+    let mut other = Session::new(Project::default());
+    other.run("time.set", &json!({"start": "2025", "end": "2026", "unit": "year"})).unwrap();
+    let mark = other.notice_mark();
+    other.run("service.add", &json!({"url": url, "layer": "decades", "text": WMS, "time": "slider"})).unwrap();
+    assert!(
+        other.notices_since(mark).iter().any(|n| n.text.contains("Decades: follows the time slider's steps")),
+        "{:?}",
+        other.notices_since(mark)
+    );
+    // Without a time asked for, a layer follows the slider; "default" (or false) adds it at its
+    // service's default instead, and a layer whose only time is a name (`current`) is added at it.
+    let mut plain = Session::new(Project::default());
+    plain.run("service.add", &json!({"url": url, "layer": "population", "text": WMS})).unwrap();
+    let t = plain.map().tiles.iter().find(|t| t.name == "Population").unwrap();
+    assert!(plain.map().time.is_some() && t.time_url.is_some() && t.url.ends_with("&TIME=2025"), "{}", t.url);
+    for pin in [json!("default"), json!(false)] {
+        let mut pinned = Session::new(Project::default());
+        pinned.run("service.add", &json!({"url": url, "layer": "population", "text": WMS, "time": pin})).unwrap();
+        let t = pinned.map().tiles.iter().find(|t| t.name == "Population").unwrap_or_else(|| panic!("{pin}"));
+        assert!(pinned.map().time.is_none() && t.time_url.is_none() && t.url.ends_with("&TIME=2025"), "{pin}: {}", t.url);
+    }
+    let mut named = Session::new(Project::default());
+    named.run("service.add", &json!({"url": url, "layer": "now", "text": WMS})).unwrap();
+    assert!(named.map().time.is_none() && tile(&named, "Now").ends_with("&TIME=current"), "{}", tile(&named, "Now"));
+    // Asked to follow the slider, such a layer can't: it says so.
+    let e = named.run("service.add", &json!({"url": url, "layer": "now", "text": WMS, "time": "slider"})).unwrap_err();
+    assert!(e.contains("lists only one time, current"), "{e}");
+    // A layer with one time, a name or a date, is listed and added as a plain map, at that time.
+    let v = named.run("service.layers", &json!({"url": url, "text": WMS})).unwrap();
+    let listed =
+        |name: &str| v["layers"].as_array().unwrap().iter().find(|l| l["name"] == name).unwrap_or_else(|| panic!("{name}")).clone();
+    assert!(listed("now").get("time").is_none() && listed("once").get("time").is_none(), "{v}");
+    assert_eq!(listed("population")["time"]["default"], "2025");
+    named.run("service.add", &json!({"url": url, "layer": "once", "text": WMS})).unwrap();
+    assert!(named.map().time.is_none() && tile(&named, "Once").ends_with("&TIME=1946"), "{}", tile(&named, "Once"));
+    // A year as a number is that time; an empty time, the service's default; anything else, refused.
+    let mut given = Session::new(Project::default());
+    given.run("service.add", &json!({"url": url, "layer": "population", "text": WMS, "time": 1990})).unwrap();
+    assert!(tile(&given, "Population 1990").ends_with("&TIME=1990") && given.map().time.is_none());
+    given.run("service.add", &json!({"url": url, "layer": "population", "text": WMS, "time": " "})).unwrap();
+    assert!(tile(&given, "Population").ends_with("&TIME=2025") && given.map().time.is_none());
+    let e = given.run("service.add", &json!({"url": url, "layer": "population", "text": WMS, "time": ["1990"]})).unwrap_err();
+    assert!(e.contains("time is a date"), "{e}");
+    // A layer without times has none to follow it with.
+    let e = s.run("service.add", &json!({"url": url, "layer": "roads", "text": WMS, "time": "slider"})).unwrap_err();
+    assert!(e.contains("no time to follow"), "{e}");
 }
 
 /// Identify asks a WMS layer what is at the point (GetFeatureInfo): the request from the
@@ -9436,12 +11212,12 @@ fn services_list_and_add_layers() {
     assert_eq!(v["count"], 0);
     assert!(v["notes"].as_array().unwrap().iter().any(|n| n.as_str().is_some_and(|n| n.contains("won't fetch"))), "{v}");
     assert!(s.run("service.add", &json!({"url": url, "layer": "roads", "text": inward})).is_err());
-    // A service's answer with latitude first (its crs says so) is turned round, and a page of a
-    // larger collection is pointed out.
+    // A service's answer with latitude first (it misses the collection's extent, and fits it
+    // turned round) is turned round, and a page of a larger collection is pointed out.
     const LAT_FIRST: &[u8] = br#"{"type": "FeatureCollection", "numberMatched": 9, "numberReturned": 1, "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [50, 10]}}], "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:EPSG::4326"}}}"#;
     let base = serve(LAT_FIRST, 1);
     let collections = format!(
-        r#"{{"collections": [{{"id": "wells", "title": "Wells", "links": [{{"rel": "items", "href": "{base}/collections/wells/items"}}]}}]}}"#
+        r#"{{"collections": [{{"id": "wells", "title": "Wells", "extent": {{"spatial": {{"bbox": [[9, 49, 11, 51]]}}}}, "links": [{{"rel": "items", "href": "{base}/collections/wells/items"}}]}}]}}"#
     );
     s.run("service.add", &json!({"url": format!("{base}/collections"), "layer": "wells", "text": collections})).unwrap();
     let e = s.map().layer_by_name("Wells").unwrap().extent();
@@ -9557,6 +11333,34 @@ fn arcgis_features_read_past_the_record_limit() {
     );
 }
 
+/// WFS 2.0 without next links reads every page through service.add, with no loss notice.
+#[test]
+fn wfs_service_reads_offset_pages_without_next_links() {
+    use ogc_server::{Route, Server};
+    let page = |ids: &[u32]| {
+        json!({"type": "FeatureCollection", "features": ids.iter().map(|id| {
+            json!({"type": "Feature", "id": id, "properties": {"n": id}, "geometry": {"type": "Point", "coordinates": [id, 1]}})
+        }).collect::<Vec<_>>()})
+        .to_string()
+    };
+    let query = "SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature&TYPENAMES=roads";
+    let format = "OUTPUTFORMAT=application%2Fjson&SRSNAME=EPSG:4326";
+    let server = Server::new(vec![
+        Route::new(&format!("/wfs?{query}&{format}&COUNT=50000"), &page(&[1, 2])),
+        Route::new(&format!("/wfs?{query}&SRSNAME=EPSG:4326&RESULTTYPE=hits"), r#"<FeatureCollection numberMatched="3"/>"#),
+        Route::new(&format!("/wfs?{query}&{format}&STARTINDEX=2&COUNT=2"), &page(&[3])),
+    ]);
+    let caps = format!(
+        r#"<WFS_Capabilities version="2.0.0"><OperationsMetadata><Operation name="GetFeature"><DCP><HTTP><Get href="{}/wfs?"/></HTTP></DCP></Operation></OperationsMetadata><FeatureTypeList><FeatureType><Name>roads</Name><Title>Roads</Title></FeatureType></FeatureTypeList></WFS_Capabilities>"#,
+        server.base
+    );
+    let mut s = Session::new(Project::default());
+    let result = s.run("service.add", &json!({"url": format!("{}/wfs", server.base), "layer": "roads", "text": caps})).unwrap();
+    assert_eq!(result["features"], 3);
+    assert!(s.notices.is_empty(), "{:?}", s.notices.iter().map(|n| &n.text).collect::<Vec<_>>());
+    assert_eq!(server.requests().len(), 3);
+}
+
 /// A feature layer comes whole unless an area is asked for (#819): then only the features that
 /// cross it, a WFS 1.1 or 2.0 asked with `BBOX` latitude first in urn:ogc:def:crs:EPSG::4326. A
 /// WFS 1.0, or an area across the antimeridian, is asked whole, and says so.
@@ -9592,8 +11396,13 @@ fn service_features_asked_for_over_an_area() {
     add(&mut s, "2.0.0", Some(json!("full")));
     add(&mut s, "2.0.0", Some(json!([170.0, -20.0, -170.0, -10.0])));
     add(&mut s, "1.0.0", Some(piaui.clone()));
-    let boxes: Vec<Option<String>> =
-        server.requests().iter().map(|r| r.query.iter().find(|(k, _)| k == "BBOX").map(|(_, v)| v.clone())).collect();
+    // WFS 2.0 also asks for hits; those requests must preserve the feature query's box.
+    let requests = server.requests();
+    let is_hits = |r: &&ogc_server::Request| r.query.iter().any(|(k, v)| k == "RESULTTYPE" && v == "hits");
+    let bbox = |r: &ogc_server::Request| r.query.iter().find(|(k, _)| k == "BBOX").map(|(_, v)| v.clone());
+    let boxes: Vec<Option<String>> = requests.iter().filter(|r| !is_hits(r)).map(bbox).collect();
+    let hit_boxes: Vec<Option<String>> = requests.iter().filter(is_hits).map(bbox).collect();
+    assert_eq!(hit_boxes, boxes[1..5]);
     assert_eq!(boxes.len(), 6);
     assert_eq!(boxes[0].as_deref(), Some("-10.93,-45.99,-2.74,-40.37,urn:ogc:def:crs:EPSG::4326"));
     assert!(boxes[1].as_deref().is_some_and(|b| b.ends_with(",urn:ogc:def:crs:EPSG::4326")), "{boxes:?}");
@@ -9611,6 +11420,58 @@ fn service_features_asked_for_over_an_area() {
 fn view_lonlat(s: &Session) -> [f64; 4] {
     let e = crate::cmd::workspace::view_extent(s);
     [e.min_x, e.min_y, e.max_x, e.max_y]
+}
+
+/// #1053: a WFS answering like GeoServer (longitude first, named urn:ogc:def:crs:EPSG::4326) is
+/// read as it comes; one answering latitude first (as deegree does when asked in the URN form) is
+/// turned round, judged against the type's `WGS84BoundingBox`. The app's download
+/// (`layer.addDownload` with `service` and `bounds`) is judged the same way, and left alone
+/// without bounds.
+#[test]
+fn wfs_axes_judged_against_the_type_bounds() {
+    use ogc_server::{Route, Server};
+    let geoserver = r#"{"type":"FeatureCollection","features":[{"type":"Feature","id":"uf.11","geometry":{"type":"Point","coordinates":[-63.3,-10.8]},"properties":{"uf":"RO"}},{"type":"Feature","id":"uf.43","geometry":{"type":"Point","coordinates":[-53.6,-29.7]},"properties":{"uf":"RS"}},{"type":"Feature","id":"uf.24","geometry":{"type":"Point","coordinates":[-36.5,-5.8]},"properties":{"uf":"RN"}}],"crs":{"type":"name","properties":{"name":"urn:ogc:def:crs:EPSG::4326"}},"bbox":[-63.3,-29.7,-36.5,-5.8]}"#;
+    let deegree = r#"{"type":"FeatureCollection","features":[{"type":"Feature","id":"b.1","geometry":{"type":"Point","coordinates":[53.55,9.99]},"properties":{"name":"Mitte"}},{"type":"Feature","id":"b.2","geometry":{"type":"Point","coordinates":[53.46,9.98]},"properties":{"name":"Harburg"}}]}"#;
+    let ibge = Server::new(vec![Route::new("/wfs", geoserver)]);
+    let hamburg = Server::new(vec![Route::new("/wfs", deegree)]);
+    let caps = |base: &str, name: &str, crs: &str, lower: &str, upper: &str| {
+        format!(
+            r#"<WFS_Capabilities version="2.0.0"><OperationsMetadata><Operation name="GetFeature"><DCP><HTTP><Get href="{base}/wfs?"/></HTTP></DCP></Operation></OperationsMetadata>
+<FeatureTypeList><FeatureType><Name>{name}</Name><Title>{name}</Title><DefaultCRS>{crs}</DefaultCRS><WGS84BoundingBox><LowerCorner>{lower}</LowerCorner><UpperCorner>{upper}</UpperCorner></WGS84BoundingBox></FeatureType></FeatureTypeList></WFS_Capabilities>"#
+        )
+    };
+    let mut s = Session::new(Project::default());
+    let text = caps(&ibge.base, "PNADC:uf", "urn:ogc:def:crs:EPSG::4674", "-71.99 -30.51", "-34.12 1.10");
+    s.run("service.add", &json!({"url": format!("{}/wfs", ibge.base), "layer": "PNADC:uf", "text": text, "name": "UF"})).unwrap();
+    let e = s.map().layer_by_name("UF").unwrap().extent();
+    assert_eq!([e.min_x, e.min_y, e.max_x, e.max_y], [-63.3, -29.7, -36.5, -5.8]);
+    // RustGIS asked for EPSG:4326, as the type doesn't list CRS84.
+    assert!(ibge.requests().iter().all(|r| r.query.iter().any(|(k, v)| k == "SRSNAME" && v == "EPSG:4326")));
+
+    let text = caps(&hamburg.base, "app:bezirke", "urn:ogc:def:crs:EPSG::25832", "8.41 53.39", "10.34 53.97");
+    s.run("service.add", &json!({"url": format!("{}/wfs", hamburg.base), "layer": "app:bezirke", "text": text, "name": "Bezirke"}))
+        .unwrap();
+    let e = s.map().layer_by_name("Bezirke").unwrap().extent();
+    assert_eq!([e.min_x, e.min_y, e.max_x, e.max_y], [9.98, 53.46, 9.99, 53.55]);
+
+    // The app's download of the same answers.
+    let download = |s: &mut Session, answer: &str, name: &str, bounds: Value| {
+        let id = s.download_started();
+        assert!(s.download_landed(id, answer.as_bytes().to_vec()));
+        let p = json!({"id": id, "url": format!("https://x.org/wfs?{name}"), "name": name, "service": true, "bounds": bounds});
+        s.run("layer.addDownload", &p).unwrap();
+        let e = s.map().layer_by_name(name).unwrap().extent();
+        [e.min_x, e.min_y, e.max_x, e.max_y]
+    };
+    assert_eq!(download(&mut s, geoserver, "UF2", json!([-71.99, -30.51, -34.12, 1.10])), [-63.3, -29.7, -36.5, -5.8]);
+    assert_eq!(download(&mut s, deegree, "B2", json!([8.41, 53.39, 10.34, 53.97])), [9.98, 53.46, 9.99, 53.55]);
+    assert_eq!(download(&mut s, deegree, "B3", Value::Null), [53.46, 9.98, 53.55, 9.99]);
+    // Bounds that aren't a box are refused, and the download is kept to be added again.
+    let id = s.download_started();
+    assert!(s.download_landed(id, deegree.as_bytes().to_vec()));
+    let bad = json!({"id": id, "url": "https://x.org/wfs", "name": "B4", "service": true, "bounds": [10.34, 53.39, 8.41, 53.97]});
+    assert!(s.run("layer.addDownload", &bad).unwrap_err().contains("bounds"));
+    s.run("layer.addDownload", &json!({"id": id, "url": "https://x.org/wfs", "name": "B4", "service": true})).unwrap();
 }
 
 /// A WCS coverage (from a local server) becomes a raster of the view, asked for in EPSG:4326 within
@@ -9819,6 +11680,156 @@ fn notices_since_survives_the_cap() {
     assert_eq!(s.notices_since(0).len(), 200);
 }
 
+#[test]
+fn diagnostics_capture_notices_without_an_open_pane_or_project_persistence() {
+    use rustgis_data::diagnostics::{Filter, MAX_DETAILS_BYTES, MAX_MESSAGE_BYTES, Severity};
+    let mut s = Session::new(Project::default());
+    let mark = s.notice_mark();
+    s.notify("diagnostics-session-only information", false);
+    s.warn("diagnostics-session-only warning");
+    s.notify("diagnostics-session-only error Authorization: Bearer never-retain-this", true);
+    let notices = s.notices_since(mark);
+    assert_eq!(notices.len(), 3);
+    assert!(!notices[0].error && !notices[1].error && notices[2].error);
+    assert!(!notices[2].text.contains("never-retain-this"));
+    let records: Vec<_> = s.diagnostics.records().into_iter().filter(|r| r.message.starts_with("diagnostics-session-only")).collect();
+    assert_eq!(records.iter().map(|r| r.severity).collect::<Vec<_>>(), [Severity::Info, Severity::Warning, Severity::Error]);
+    assert!(records.iter().all(|r| r.source == "Application" && r.timestamp_ms > 0));
+    assert!(!s.diagnostics.report(Filter::All).contains("never-retain-this"));
+    // A project's saved text holds none of the history (the docs promise it).
+    let saved = serde_json::to_string(&s.project).unwrap();
+    assert!(!saved.contains("diagnostics-session-only"));
+    s.notify("界".repeat(3000), false);
+    // The notice keeps its words to redaction's own bound (8 KiB, an ellipsis at the cut), not
+    // the record's 2 KiB; only the history's record copy takes the message bound.
+    let notice = &s.notices.last().unwrap().text;
+    assert!(notice.len() <= MAX_DETAILS_BYTES && notice.ends_with('…'), "{}", notice.len());
+    let last = s.diagnostics.records();
+    let record = last.last().unwrap();
+    assert!(record.message.len() <= MAX_MESSAGE_BYTES && record.message.ends_with('…'), "{}", record.message.len());
+    s.run("project.new", &json!({})).unwrap();
+    let records = s.diagnostics.records();
+    assert!(records.iter().any(|r| r.message == "diagnostics-session-only information"));
+    assert!(records.iter().any(|r| r.message == "diagnostics-session-only warning"));
+}
+
+#[test]
+fn diagnostics_keep_failed_command_context_without_changing_notice_rollback() {
+    use rustgis_data::diagnostics::Severity;
+    let mut s = Session::new(Project::default());
+    let before = s.project.name.clone();
+    let mark = s.notice_mark();
+    let result = s.guarded("Diagnostics rollback", true, |s| {
+        s.project.name = "not committed".to_string();
+        s.notify("diagnostics-rollback information", false);
+        s.warn("diagnostics-rollback warning");
+        s.notify("diagnostics-rollback error", true);
+        Err("diagnostics-rollback failed".to_string())
+    });
+    assert!(result.is_err());
+    assert_eq!(s.project.name, before);
+    assert!(s.notices_since(mark).iter().all(|n| n.error));
+    let records = s.diagnostics.records();
+    for text in
+        ["diagnostics-rollback information", "diagnostics-rollback warning", "diagnostics-rollback error", "diagnostics-rollback failed"]
+    {
+        assert!(records.iter().any(|r| r.message == text), "missing {text}");
+    }
+    // Registered command ids, not command parameters, identify the source.
+    assert!(s.run("layer.rename", &json!({"layer": "diagnostics-missing-layer", "name": "never-copy-parameters"})).is_err());
+    assert!(s.diagnostics.records().iter().any(|r| r.source == "layer.rename" && r.severity == Severity::Error));
+    s.notify("diagnostics-after-command", false);
+    assert!(s.diagnostics.records().iter().any(|r| r.message == "diagnostics-after-command" && r.source == "Application"));
+    assert!(!s.diagnostics.report(rustgis_data::diagnostics::Filter::All).contains("never-copy-parameters"));
+
+    // A panic caught inside the command must still restore Application attribution afterward.
+    fn panic_run(_: &mut Session, _: &Value) -> crate::CmdResult {
+        panic!("diagnostics source restore");
+    }
+    let command = crate::CommandSpec {
+        id: "diagnostics.testSourceRestore",
+        label: "Diagnostics source restore",
+        mutates: false,
+        run: panic_run,
+        ..*s.registry.get("map.zoomIn").unwrap()
+    };
+    s.registry.commands.push(command);
+    assert!(s.run(command.id, &Value::Null).is_err());
+    s.notify("diagnostics-after-panic", false);
+    assert!(s.diagnostics.records().iter().any(|r| r.message == "diagnostics-after-panic" && r.source == "Application"));
+}
+
+#[test]
+fn diagnostics_survive_project_replacement_rolled_back_within_a_command() {
+    let mut s = Session::new(Project::default());
+    let before = s.project.name.clone();
+    let result = s.guarded("Diagnostics replacement rollback", true, |s| {
+        s.run("project.new", &json!({"name": "temporary replacement"}))?;
+        s.notify("diagnostics-replacement context", false);
+        Err("diagnostics-replacement failed".to_string())
+    });
+    assert!(result.is_err());
+    assert_eq!(s.project.name, before);
+    assert!(s.diagnostics.records().iter().any(|r| r.message == "diagnostics-replacement context"));
+    assert!(s.diagnostics.records().iter().any(|r| r.message == "diagnostics-replacement failed"));
+}
+
+#[test]
+fn diagnostics_network_requests_belong_only_to_the_command_session() {
+    use rustgis_data::diagnostics::{Capture, Network, NetworkKind};
+
+    fn failure(message: &str) {
+        Capture::current().network_failure(
+            "Network",
+            message,
+            "",
+            Network {
+                url: "https://session-owned.example.org/request".to_string(),
+                method: "GET".to_string(),
+                status: Some(503),
+                duration_ms: Some(1),
+                kind: NetworkKind::Http,
+            },
+        );
+    }
+
+    fn request(_: &mut Session, params: &Value) -> crate::CmdResult {
+        let message = params.as_str().unwrap();
+        failure(message);
+        match message {
+            "b error" => Err("command refused".to_string()),
+            "b panic" => panic!("command panicked"),
+            _ => Ok(Value::Null),
+        }
+    }
+
+    let mut a = Session::new(Project::default());
+    let mut b = Session::new(Project::default());
+    let command = crate::CommandSpec {
+        id: "diagnostics.testRequest",
+        label: "Diagnostics request",
+        mutates: false,
+        run: request,
+        ..*a.registry.get("map.zoomIn").unwrap()
+    };
+    a.registry.commands.push(command);
+    b.registry.commands.push(command);
+    failure("unowned before command");
+    a.run(command.id, &json!("a command")).unwrap();
+    {
+        let _a = a.diagnostics.enter();
+        b.run(command.id, &json!("b command")).unwrap();
+        assert!(b.run(command.id, &json!("b error")).is_err());
+        assert!(b.run(command.id, &json!("b panic")).is_err());
+        // Every return path, including a caught command panic, restores A's enclosing scope.
+        failure("a restored");
+    }
+    failure("unowned after command");
+    let messages = |s: &Session| s.diagnostics.records().into_iter().filter(|r| r.network.is_some()).map(|r| r.message).collect::<Vec<_>>();
+    assert_eq!(messages(&a), ["a command", "a restored"]);
+    assert_eq!(messages(&b), ["b command", "b error", "b panic"]);
+}
+
 /// The web app's `?blank&projection=EPSG:3010` (discussion #81): an empty project starts in a
 /// national grid, and that start is neither an edit to undo nor unsaved work.
 #[test]
@@ -9865,6 +11876,214 @@ fn exporting_features_refuses_to_replace_an_existing_geopackage() {
     let error = s.run("share.exportLayer", &json!({"layer": "Countries", "path": path})).unwrap_err();
     assert!(error.to_string().contains("Choose a new filename"), "{error}");
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A layer whose Z values were dropped on import says so when added, read whole or in place, and
+/// again when exported or converted; a 2D layer's export says nothing of it.
+#[test]
+fn dropped_z_values_are_said_on_import_and_export() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-zm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("wells.geojson");
+    std::fs::write(
+        &src,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2,30]}}]}"#,
+    )
+    .unwrap();
+    isolate_plugins();
+    let mut s = Session::new(Project::default());
+    for stream in [false, true] {
+        let mark = s.notice_mark();
+        let id = s.run("layer.addData", &json!({"path": src, "stream": stream})).unwrap()["layer"].as_u64().unwrap();
+        assert!(s.notices_since(mark).iter().any(|n| n.text.contains("Z or M values")), "stream {stream}: {:?}", s.notices_since(mark));
+        let out = dir.join(format!("out-{stream}.geojson"));
+        let mark = s.notice_mark();
+        s.run("share.exportLayer", &json!({"layer": id, "path": out})).unwrap();
+        let said = |s: &Session, mark| s.notices_since(mark).iter().any(|n| n.text.contains("its geometry has no Z or M values"));
+        assert!(said(&s, mark), "stream {stream}: {:?}", s.notices_since(mark));
+        assert!(std::fs::read_to_string(&out).unwrap().contains("[1.0,2.0]"));
+        let mark = s.notice_mark();
+        s.run("data.convert", &json!({"layer": id, "format": "wkt"})).unwrap();
+        assert!(said(&s, mark), "stream {stream}");
+    }
+    let mut s = world();
+    let mark = s.notice_mark();
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": dir.join("cities.geojson")})).unwrap();
+    assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("Z or M")), "{:?}", s.notices_since(mark));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A standalone table can hold geometry whose Z values were dropped when it was read (a plugin's
+/// output, a project file): exporting it says so, to every format, once the file is written, as
+/// `share.exportLayer` does. A table read without Z, and a write that fails, say nothing of it.
+#[test]
+fn exporting_a_table_says_its_dropped_z_values() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-table-zm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("wells.geojson");
+    std::fs::write(
+        &src,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"depth":30},"geometry":{"type":"Point","coordinates":[1,2,30]}}]}"#,
+    )
+    .unwrap();
+    isolate_plugins();
+    let mut s = Session::new(Project::default());
+    let (wells, report) = rustgis_data::io::read_path(&src).unwrap();
+    assert!(wells.zm_dropped && report.messages.iter().any(|m| m.contains("Z or M")), "premise: the reader dropped Z");
+    s.project.add_table(wells);
+    let said = |s: &Session, mark| -> Vec<String> {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("Z or M")).map(|n| n.text.clone()).collect()
+    };
+    for ext in ["geojson", "csv", "shp", "zip"] {
+        let out = dir.join(format!("wells.{ext}")).display().to_string();
+        let mark = s.notice_mark();
+        s.run("share.exportTable", &json!({"table": "wells", "path": out})).unwrap();
+        assert_eq!(said(&s, mark), [format!("{out}: its geometry has no Z or M values, which were dropped when wells was read")], ".{ext}");
+    }
+    // The file holds x and y only.
+    assert!(std::fs::read_to_string(dir.join("wells.geojson")).unwrap().contains("[1.0,2.0]"));
+    // A project file keeps what the table's read lost, as it does a layer's (the Z or M values,
+    // the coordinate system, geometry lost to it), so a table opened from one says it too.
+    let crs = rustgis_data::raster::Crs::parse("EPSG:3857").unwrap();
+    {
+        let wells = s.project.tables.last_mut().unwrap();
+        wells.crs = Some(crs);
+        wells.crs_incomplete = true;
+    }
+    let project = dir.join("wells.rgis");
+    s.run("project.saveAs", &json!({"path": project.display().to_string()})).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.open", &json!({"path": project.display().to_string()})).unwrap();
+    let opened = &t.project.tables.get(t.table_index(&json!({"table": "wells"})).unwrap()).unwrap().dataset;
+    assert!(opened.zm_dropped && opened.crs_incomplete && opened.crs == Some(crs), "{opened:?}");
+    let out = dir.join("opened.geojson").display().to_string();
+    let mark = t.notice_mark();
+    t.run("share.exportTable", &json!({"table": "wells", "path": out})).unwrap();
+    assert_eq!(said(&t, mark), [format!("{out}: its geometry has no Z or M values, which were dropped when wells was read")]);
+    // A write that fails says nothing of what the file would have lacked.
+    let missing = dir.join("missing").join("wells.geojson").display().to_string();
+    let mark = s.notice_mark();
+    assert!(s.run("share.exportTable", &json!({"table": "wells", "path": missing})).is_err());
+    assert!(said(&s, mark).is_empty(), "{:?}", s.notices_since(mark));
+    // A table read without Z: no notice.
+    std::fs::write(
+        dir.join("flat.geojson"),
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"depth":30},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
+    )
+    .unwrap();
+    let (flat, _) = rustgis_data::io::read_path(&dir.join("flat.geojson")).unwrap();
+    assert!(!flat.zm_dropped, "premise");
+    s.project.add_table(flat);
+    for ext in ["geojson", "shp"] {
+        let mark = s.notice_mark();
+        s.run("share.exportTable", &json!({"table": "flat", "path": dir.join(format!("flat.{ext}"))})).unwrap();
+        assert!(said(&s, mark).is_empty(), ".{ext}: {:?}", s.notices_since(mark));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// What an import says about positions, an export says again: a NAD 27 Shapefile whose `.prj`
+/// has no shift to WGS 84 (read whole or in place, and after the project is saved and opened)
+/// exported to GeoJSON, but not written back to a Shapefile in NAD 27; and a Shapefile without a
+/// `.prj` or a CSV whose coordinates aren't longitude/latitude, exported, converted or shared.
+/// Sample layers say neither.
+#[test]
+fn exports_say_what_import_said_about_positions() {
+    const NAD27: &str = r#"PROJCS["NAD_1927_UTM_Zone_16N",GEOGCS["GCS_North_American_1927",DATUM["D_North_American_1927",SPHEROID["Clarke_1866",6378206.4,294.9786982]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-87.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]"#;
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-positions-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    isolate_plugins();
+    let pt = dir.join("pt.geojson");
+    std::fs::write(
+        &pt,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"id":1},"geometry":{"type":"Point","coordinates":[-89.9,35.1]}}]}"#,
+    )
+    .unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": pt, "name": "pt"})).unwrap();
+    let (nad27, bare) = (dir.join("nad27.shp"), dir.join("bare.shp"));
+    s.run("share.exportLayer", &json!({"layer": "pt", "path": nad27, "crs": "EPSG:32616"})).unwrap();
+    std::fs::write(nad27.with_extension("prj"), NAD27).unwrap();
+    s.run("share.exportLayer", &json!({"layer": "pt", "path": bare, "crs": "EPSG:32616"})).unwrap();
+    std::fs::remove_file(bare.with_extension("prj")).unwrap();
+    let csv = dir.join("utm.csv");
+    std::fs::write(&csv, "id,x,y\n1,500000,3800000\n").unwrap();
+
+    let said = |s: &Session, mark, what: &str| s.notices_since(mark).iter().any(|n| n.text.contains(what));
+    const APPROXIMATE: &str = "are approximate, possibly a few hundred metres off";
+    const NOT_LONLAT: &str = "aren't longitude/latitude, so they're out of place";
+    for stream in [false, true] {
+        let mut s = Session::new(Project::default());
+        let mark = s.notice_mark();
+        let id = s.run("layer.addData", &json!({"path": nad27, "stream": stream})).unwrap()["layer"].as_u64().unwrap();
+        assert!(said(&s, mark, "has no conversion to WGS 84"), "stream {stream}: {:?}", s.notices_since(mark));
+        let mark = s.notice_mark();
+        s.run("share.exportLayer", &json!({"layer": id, "path": dir.join(format!("nad27-{stream}.geojson"))})).unwrap();
+        assert!(said(&s, mark, APPROXIMATE), "stream {stream}: {:?}", s.notices_since(mark));
+        let mark = s.notice_mark();
+        s.run("share.exportLayer", &json!({"layer": id, "path": dir.join(format!("back-{stream}.shp"))})).unwrap();
+        assert!(!said(&s, mark, APPROXIMATE), "stream {stream}: {:?}", s.notices_since(mark));
+        let mark = s.notice_mark();
+        let id = s.run("layer.addData", &json!({"path": bare, "stream": stream})).unwrap()["layer"].as_u64().unwrap();
+        assert!(said(&s, mark, "not longitude/latitude"), "stream {stream}");
+        let mark = s.notice_mark();
+        s.run("share.exportLayer", &json!({"layer": id, "path": dir.join(format!("bare-{stream}.geojson"))})).unwrap();
+        assert!(said(&s, mark, NOT_LONLAT), "stream {stream}: {:?}", s.notices_since(mark));
+    }
+
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": nad27, "name": "nad27"})).unwrap();
+    s.run("layer.addData", &json!({"path": csv, "name": "utm"})).unwrap();
+    let saved = s.project.saved_text(None).unwrap().0;
+    let mut s = Session::new(Project::from_json(&saved).unwrap());
+    let mark = s.notice_mark();
+    s.run("share.exportLayer", &json!({"layer": "nad27", "path": dir.join("reopened.geojson")})).unwrap();
+    assert!(said(&s, mark, APPROXIMATE), "{:?}", s.notices_since(mark));
+    for (cmd, params) in [
+        ("share.exportLayer", json!({"layer": "utm", "path": dir.join("utm.geojson")})),
+        ("data.convert", json!({"layer": "utm", "format": "geojson"})),
+    ] {
+        let mark = s.notice_mark();
+        s.run(cmd, &params).unwrap();
+        assert!(said(&s, mark, NOT_LONLAT), "{cmd}: {:?}", s.notices_since(mark));
+    }
+    let mark = s.notice_mark();
+    s.run("share.webMap", &json!({"path": dir.join("map.html")})).unwrap();
+    let notes: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(notes.iter().filter(|n| n.contains(APPROXIMATE) || n.contains(NOT_LONLAT)).count(), 2, "{notes:?}");
+
+    let mut s = world();
+    let mark = s.notice_mark();
+    s.run("share.exportLayer", &json!({"layer": "Cities", "path": dir.join("cities.geojson")})).unwrap();
+    assert!(!said(&s, mark, APPROXIMATE) && !said(&s, mark, NOT_LONLAT), "{:?}", s.notices_since(mark));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn rounded_raster_values_are_said_on_import_and_export() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-rounded-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let grid = |name: &str, values: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("ncols 2\nnrows 2\nxllcorner 10\nyllcorner 40\ncellsize 1\n{values}")).unwrap();
+        path
+    };
+    let mut s = Session::new(Project::default());
+    for (path, rounded) in
+        [(grid("ids.asc", "16777217 100000001\n1234567.891 7"), true), (grid("clean.asc", "16777216 12.3\n123.4567 7"), false)]
+    {
+        let mark = s.notice_mark();
+        let id = s.run("layer.addData", &json!({"path": path})).unwrap()["layer"].as_u64().unwrap();
+        let said = |s: &Session, mark, text: &str| s.notices_since(mark).iter().any(|n| n.text.contains(text));
+        assert_eq!(said(&s, mark, "3 values were rounded as the file was read"), rounded, "{:?}", s.notices_since(mark));
+        let mark = s.notice_mark();
+        let out = dir.join(format!("out-{id}.tif"));
+        s.run("share.exportRaster", &json!({"layer": id, "path": out})).unwrap();
+        assert_eq!(said(&s, mark, "3 values in it were rounded to 32-bit floats"), rounded, "{:?}", s.notices_since(mark));
+        // The exported file holds the values as they were held: 16777217 is 16777216.
+        assert_eq!(rustgis_data::raster::read_path(&out).unwrap().value(0, 0, 0), Some(16_777_216.0));
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -11203,6 +13422,37 @@ fn lidar_point_clouds() {
     // Not a point cloud.
     assert!(s.run("layer.addDataBytes", &json!({"fileName": "junk.laz", "data": "AAAA"})).is_err());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A preview of an oversized cloud must never become a successful whole-data result.
+#[test]
+fn lidar_sample_refuses_exports_and_statistics() {
+    let dir = std::env::temp_dir().join(format!("rustgis-lidar-limit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("oversized.las");
+    let count = rustgis_data::lidar::MAX_POINTS as u32 + 1;
+    // Only a few records are needed: the header must retain its count even if the file ends early.
+    let mut bytes = las_bytes(&[(10.0, 50.0, 300.0, 2), (10.5, 50.5, 310.0, 2)]);
+    bytes[107..111].copy_from_slice(&count.to_le_bytes());
+    std::fs::write(&path, bytes).unwrap();
+    let mut s = Session::new(Project::default());
+    let added = s.run("layer.addData", &json!({"path": path})).unwrap();
+    assert_eq!(added["streamed"], true);
+    let id = added["layer"].as_u64().unwrap() as u32;
+    let output = dir.join("out.geojson");
+    for (command, params) in [
+        ("share.exportLayer", json!({"layer": id, "path": output})),
+        ("gp.run", json!({"tool": "summaryStatistics", "params": {"input": "oversized", "field": "z"}})),
+        ("layer.loadAll", json!({"layer": id})),
+        ("layer.addData", json!({"path": path, "stream": false})),
+    ] {
+        let error = s.run(command, &params).unwrap_err();
+        assert!(error.contains(&count.to_string()), "{command}: {error}");
+        assert!(error.contains(&rustgis_data::lidar::MAX_POINTS.to_string()), "{command}: {error}");
+    }
+    assert!(!output.exists());
+    assert_eq!(s.map().layers.len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// A Zarr store in a temporary folder: `t` over three monthly steps (days since 2001-01-01: 0,
@@ -13980,6 +16230,22 @@ fn unknown_params_are_said() {
 }
 
 #[test]
+fn geojson_collection_import_reports_loss_even_without_surviving_geometry() {
+    let collection = json!({"type":"GeometryCollection", "geometries":[
+        {"type":"Point", "coordinates":[1,2]},
+        {"type":"Polygon", "coordinates":[[[0,0],[4,0],[4,4],[0,0]]]}
+    ]});
+    let mut s = Session::new(Project::default());
+    s.run("layer.addDataText", &json!({"fileName":"collection.geojson", "text":collection.to_string()})).unwrap();
+    assert!(s.notices.iter().any(|n| n.text.contains("1 features had unreadable geometry")));
+    assert!(s.map().layers.is_empty(), "a partial geometry must never become a layer");
+
+    let mut clean = Session::new(Project::default());
+    clean.run("layer.addDataText", &json!({"fileName":"point.geojson", "text":r#"{"type":"Point","coordinates":[1,2]}"#})).unwrap();
+    assert!(!clean.notices.iter().any(|n| n.text.contains("unreadable geometry")));
+}
+
+#[test]
 fn geojson_read_in_place_when_asked_or_large() {
     use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
     let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("i", FieldType::Integer)]);
@@ -14041,6 +16307,45 @@ fn geojson_read_in_place_when_asked_or_large() {
     let _ = std::fs::remove_file(one);
 }
 
+/// Emptying the Shapefile index cache keeps the index of a layer that's open, says so, and the
+/// layer still reads (#1259).
+#[test]
+fn emptying_the_index_cache_keeps_indexes_in_use() {
+    let p = line_of_points_shp("index-cache", 20);
+    let mut s = Session::new(Project::default());
+    let r = s.run("layer.addData", &json!({"path": p.display().to_string(), "stream": true})).unwrap();
+    let mark = s.notice_mark();
+    let out = s.run("cache.emptyIndexes", &Value::Null).unwrap();
+    assert!(out["inUse"].as_u64().unwrap() >= 1, "{out}");
+    assert!(out["removed"].is_u64() && out["freedBytes"].is_u64(), "{out}");
+    let notices = s.notices_since(mark);
+    assert!(notices.iter().any(|n| n.text.contains("in use") && !n.error), "{notices:?}");
+    let layer = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap();
+    assert_eq!(layer.load_all().unwrap().features.len(), 20);
+    drop(s);
+    remove_shp(&p);
+}
+
+/// Emptying the index cache tells the user only what it couldn't do: nothing when all went (#1259).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn emptying_the_index_cache_notices_only_what_stayed() {
+    use crate::cmd::workspace::empty_notices;
+    let mut e = rustgis_data::source::shp::Emptied::default();
+    assert!(empty_notices(&e).is_empty());
+    e.removed = 3;
+    e.removed_bytes = 4096;
+    assert!(empty_notices(&e).is_empty(), "what it freed is in the result, not a notice");
+    e.in_use = 1;
+    e.in_use_bytes = 2048;
+    e.kept_bytes = 3 * 1024 * 1024;
+    e.failed.push("/somewhere: refused".to_string());
+    let notices = empty_notices(&e);
+    assert!(notices.iter().any(|(t, error)| *error && t.contains("/somewhere: refused")), "{notices:?}");
+    assert!(notices.iter().any(|(t, error)| !*error && t.contains("1 index in use") && t.contains("2.0 KB")), "{notices:?}");
+    assert!(notices.iter().any(|(t, error)| !*error && t.contains("not removed") && t.contains("3.0 MB")), "{notices:?}");
+}
+
 /// A Shapefile of `n` points along the equator, numbered.
 fn line_of_points_shp(name: &str, n: usize) -> std::path::PathBuf {
     use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
@@ -14051,6 +16356,13 @@ fn line_of_points_shp(name: &str, n: usize) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!("rustgis-engine-{}-{name}.shp", std::process::id()));
     rustgis_data::io::write_path(&ds, &p).unwrap();
     p
+}
+
+/// Removes a Shapefile written by [`line_of_points_shp`] with its sidecar files.
+fn remove_shp(p: &std::path::Path) {
+    for ext in ["shp", "shx", "dbf", "prj", "cpg"] {
+        let _ = std::fs::remove_file(p.with_extension(ext));
+    }
 }
 
 #[test]
@@ -14074,9 +16386,7 @@ fn shapefiles_too_large_to_load_whole_still_open() {
         let mut s = Session::new(Project::default());
         let e = s.run("layer.addData", &json!({"path": path, "stream": false})).unwrap_err();
         assert!(e.contains("too large"), "{grown}: {e}");
-        for ext in ["shp", "shx", "dbf", "prj", "cpg"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
+        remove_shp(&p);
     }
 }
 
@@ -14120,9 +16430,7 @@ fn large_shapefiles_are_read_in_place() {
     let r = u.run("layer.addData", &json!({"path": big.display().to_string(), "stream": false})).unwrap();
     assert!(!u.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().is_streamed());
     for p in [small, big] {
-        for ext in ["shp", "shx", "dbf", "prj", "cpg"] {
-            let _ = std::fs::remove_file(p.with_extension(ext));
-        }
+        remove_shp(&p);
     }
 }
 
@@ -16066,7 +18374,7 @@ fn ogc_group_refresh_keeps_children_across_rotated_keys_and_rejects_bad_answers(
     let group = added["group"].clone();
     let ids: Vec<u32> = s.map().service_groups[0].children.iter().map(|c| c.layer).collect();
     s.run("layer.rename", &json!({"layer":ids[0], "name":"Renamed"})).unwrap();
-    s.map_mut().label_lock = Some(vec![(ids[0], 0, 0, 0), (ids[1], 0, 0, 0)]);
+    s.map_mut().label_lock = Some(vec![((ids[0], 0, 0, 0), 0), ((ids[1], 0, 0, 0), 0)]);
 
     // A rotated key changes every source address but not the collections: the children stay.
     let mut q = doc("rotated-key");
@@ -16146,6 +18454,16 @@ fn ogc_refresh_reconciles_fields_and_preserves_compatible_settings() {
             // Reordered and additional fields do not invalidate references by name.
             server.set(ITEMS, &features(json!({"extra":true, "name":"Updated", "value":20, "keep":1})));
             s.run("service.refresh", &target).unwrap();
+            let singled = |s: &Session| s.notices.iter().filter(|n| n.text.contains("drawn with a single symbol (1: Places)")).count();
+            assert_eq!(singled(&s), 0);
+            // Classes by an expression that still reads are kept too.
+            s.run("layer.symbology", &json!({"layer":layer, "type":"unique", "expression":"value || ''"})).unwrap();
+            let by_expression = s.map().layer(layer).unwrap().renderer.clone();
+            s.run("service.refresh", &target).unwrap();
+            assert_eq!(s.map().layer(layer).unwrap().renderer, by_expression);
+            assert_eq!(singled(&s), 0);
+            s.run("edit.undo", &Value::Null).unwrap();
+            s.run("edit.undo", &Value::Null).unwrap();
             let l = s.map().layer(layer).unwrap();
             assert_eq!(l.renderer, style);
             assert_eq!(l.labels, labels);
@@ -16156,6 +18474,18 @@ fn ogc_refresh_reconciles_fields_and_preserves_compatible_settings() {
             s.run("service.refresh", &target).unwrap();
             let l = s.map().layer(layer).unwrap();
             assert!(matches!(l.renderer, rustgis_map::Renderer::Single(_)));
+            assert_eq!(singled(&s), 1, "the classes going is said");
+            // Classes by an expression on a field that goes too.
+            s.run("edit.undo", &Value::Null).unwrap();
+            s.run("layer.symbology", &json!({"layer":layer, "type":"unique", "expression":"value || ''"})).unwrap();
+            s.run("service.refresh", &target).unwrap();
+            let l = s.map().layer(layer).unwrap();
+            assert_eq!(l.renderer, rustgis_map::Renderer::Single(rustgis_map::Symbol::default_for(l.geometry_type(), l.id)));
+            assert_eq!(singled(&s), 2);
+            s.run("edit.undo", &Value::Null).unwrap();
+            s.run("edit.undo", &Value::Null).unwrap();
+            s.run("service.refresh", &target).unwrap();
+            let l = s.map().layer(layer).unwrap();
             assert!(!l.labels.enabled);
             assert!(l.labels.default.field.is_empty());
             assert_eq!(l.labels.default.size, 19.);
@@ -16166,6 +18496,41 @@ fn ogc_refresh_reconciles_fields_and_preserves_compatible_settings() {
             let l = s.map().layer(layer).unwrap();
             assert_eq!(l.renderer, style);
             assert_eq!(l.labels, labels);
+            // Labels by a text expression that still reads stay on without their field.
+            s.map_mut().layer_mut(layer).unwrap().labels.default.by.text = Some("'#' || keep".into());
+            server.set(ITEMS, &features(json!({"replacement":"New", "keep":1})));
+            s.run("service.refresh", &target).unwrap();
+            let l = s.map().layer(layer).unwrap();
+            assert!(l.labels.enabled && l.labels.default.by.text.is_some(), "{:?}", l.labels.default);
+            assert!(l.labels.default.field.is_empty(), "the field the service dropped isn't kept");
+            let lost = |s: &Session| s.notices.iter().filter(|n| n.text.contains("label expressions that don't read")).count();
+            assert_eq!(lost(&s), 0, "every expression still reads");
+            s.run("edit.undo", &Value::Null).unwrap();
+            // A size by a field that goes is kept, said.
+            s.map_mut().layer_mut(layer).unwrap().labels.default.by.size = Some("value / 2".into());
+            s.run("service.refresh", &target).unwrap();
+            assert!(s.notices.iter().any(|n| n.text.ends_with("left out when drawing (1, in Places)")), "{:?}", s.notices.last());
+            assert_eq!(s.map().layer(layer).unwrap().labels.default.by.size.as_deref(), Some("value / 2"));
+            s.run("edit.undo", &Value::Null).unwrap();
+            let l = s.map_mut().layer_mut(layer).unwrap();
+            (l.labels.default.by.text, l.labels.default.by.size) = (None, None);
+            // Another class labelling by a text expression that still reads keeps the labels on.
+            let mut other = rustgis_map::LabelClass::default_for(&l.dataset);
+            (other.name, other.field, other.by.text) = ("Other".into(), "name".into(), Some("'#' || keep".into()));
+            l.labels.classes.push(other);
+            s.run("service.refresh", &target).unwrap();
+            let l = s.map().layer(layer).unwrap();
+            assert!(l.labels.enabled && l.labels.default.field.is_empty(), "{:?}", l.labels);
+            s.run("edit.undo", &Value::Null).unwrap();
+            // Hidden, or on a field that goes without a text, it doesn't.
+            for (visible, text) in [(false, Some("'#' || keep")), (true, None)] {
+                let c = &mut s.map_mut().layer_mut(layer).unwrap().labels.classes[0];
+                (c.visible, c.by.text) = (visible, text.map(String::from));
+                s.run("service.refresh", &target).unwrap();
+                assert!(!s.map().layer(layer).unwrap().labels.enabled, "visible {visible}, text {text:?}");
+                s.run("edit.undo", &Value::Null).unwrap();
+            }
+            s.map_mut().layer_mut(layer).unwrap().labels.classes.clear();
             // Numeric renderers cannot use a field which has become text; unique values can.
             server.set(ITEMS, &features(json!({"name":"Place", "value":"text", "keep":1})));
             s.run("service.refresh", &target).unwrap();
@@ -16254,6 +18619,263 @@ fn polygon_no_fill_refuses_other_layers() {
         assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
     }
     assert!(Session::new(Project::default()).run("layer.noFill", &Value::Null).is_err());
+}
+
+/// Polygon styling follows the actual GeoJSON features, not just their dominant family.
+#[test]
+fn mixed_geometry_no_fill_preserves_other_symbols_classes_and_undo() {
+    use rustgis_data::GeometryType;
+
+    let state = |project: &Project| {
+        let mut value = serde_json::to_value(project).unwrap();
+        // Opening and undo/redo bump derived geometry revisions, independently of saved styles.
+        for map in value["maps"].as_array_mut().unwrap() {
+            for layer in map["layers"].as_array_mut().unwrap() {
+                layer.as_object_mut().unwrap().remove("geometry_rev");
+            }
+        }
+        value
+    };
+    let geometries = [
+        json!({"type": "Point", "coordinates": [-2, 0]}),
+        json!({"type": "LineString", "coordinates": [[1.5, -0.5], [2.5, 0.5]]}),
+        json!({"type": "Polygon", "coordinates": [[[-0.5,-0.5],[0.5,-0.5],[0.5,0.5],[-0.5,0.5],[-0.5,-0.5]]]}),
+    ];
+    for (dominant, kind) in [GeometryType::Point, GeometryType::Polyline, GeometryType::Polygon].into_iter().enumerate() {
+        for renderer in ["single", "unique", "graduated"] {
+            let features: Vec<Value> = [0, 1, 2, dominant, dominant]
+                .into_iter()
+                .enumerate()
+                .map(|(i, g)| json!({"type":"Feature", "geometry":geometries[g], "properties":{"class":i % 2, "value":i}}))
+                .collect();
+            let mut s = Session::new(Project::default());
+            s.run(
+                "layer.addDataText",
+                &json!({"fileName":"mixed.geojson", "text":json!({"type":"FeatureCollection", "features":features}).to_string()}),
+            )
+            .unwrap();
+            let id = s.active_layer.unwrap();
+            assert_eq!(s.map().layer(id).unwrap().geometry_type(), kind);
+            s.run("layer.symbology", &json!({"type":renderer, "field":if renderer == "unique" { "class" } else { "value" }, "classes":2}))
+                .unwrap();
+            // Both layer-wide and class-specific fills must stop drawing, while shared
+            // symbols (point interiors, line markers, outlines) keep their original colours.
+            s.run("layer.outline", &json!({"color":"#234567", "width":2.5})).unwrap();
+            s.run("layer.fillLayers", &json!({"fills":[{"color":"#FF0000"}]})).unwrap();
+            if renderer != "single" {
+                let mut p = json!({"fills":[{"color":"#00FF00"}]});
+                if renderer == "unique" {
+                    p["value"] = json!(0);
+                } else {
+                    p["index"] = json!(0);
+                }
+                s.run("layer.fillLayers", &p).unwrap();
+            }
+            let view = crate::render::View {
+                width: 400.0,
+                height: 150.0,
+                pixels_per_point: 1.0,
+                sky: false,
+                camera: rustgis_map::Camera { center: rustgis_geom::Coord::new(0.0, 0.0), res: 2000.0, bearing: 0.0, pitch: 0.0 },
+            };
+            s.map_mut().basemap = rustgis_map::Basemap::Blank;
+            let drawn_before =
+                (kind == GeometryType::Point && renderer == "single").then(|| crate::render::render(s.map_mut(), &view).unwrap().pixmap);
+            let before = state(&s.project);
+            let symbols: Vec<_> = (0..features.len()).map(|row| s.map().layer(id).unwrap().symbol(row)).collect();
+            s.run("layer.noFill", &json!({"layer":id})).unwrap();
+            let l = s.map().layer(id).unwrap();
+            for (row, symbol) in symbols.iter().enumerate() {
+                assert_eq!(&l.symbol(row), symbol, "{kind:?}/{renderer}: shared symbols stay intact");
+                assert!(l.fills(row).iter().all(|f| !f.draws(symbol.fill)), "{kind:?}/{renderer}: polygon fills are transparent");
+            }
+            if let Some(drawn_before) = drawn_before {
+                let drawn_after = crate::render::render(s.map_mut(), &view).unwrap().pixmap;
+                assert_ne!(drawn_before.pixel(200, 75), drawn_after.pixel(200, 75), "the polygon interior changes");
+                let middle = drawn_after.pixel(200, 75).unwrap();
+                assert_eq!((middle.red(), middle.green(), middle.blue()), (255, 255, 255), "the polygon interior reveals the basemap");
+                for y in 0..150 {
+                    for x in (0..165).chain(235..400) {
+                        assert_eq!(drawn_before.pixel(x, y), drawn_after.pixel(x, y), "points and lines stay unchanged at {x},{y}");
+                    }
+                }
+                let edge = drawn_after.pixel(172, 75).unwrap();
+                assert!(edge.red() < 250 || edge.green() < 250 || edge.blue() < 250, "the polygon outline remains visible");
+            }
+            let after = state(&s.project);
+            let reopened = Project::from_json(&serde_json::to_string(&s.project).unwrap()).unwrap();
+            assert_eq!(state(&reopened), after);
+            s.run("edit.undo", &Value::Null).unwrap();
+            assert_eq!(state(&s.project), before);
+            s.run("edit.redo", &Value::Null).unwrap();
+            assert_eq!(state(&s.project), after);
+            s.run("layer.noFill", &Value::Null).unwrap();
+            assert_eq!(state(&s.project), after, "No Fill is idempotent");
+            // Removing the polygon-only override restores fills without touching other symbols.
+            s.run("layer.fillLayers", &json!({"fills":[]})).unwrap();
+            assert!(s.map().layer(id).unwrap().fills(2).is_empty());
+            assert_eq!(s.map().layer(id).unwrap().symbol(0), symbols[0]);
+        }
+    }
+}
+
+/// After No Fill, a new symbology or a fill in the symbol's colour draws fills again (#1301), on
+/// a layer read into memory (its symbols' fills made transparent) and on a streamed or mixed one
+/// (a transparent fill over symbols that points and lines share) alike. Gradient fills, with
+/// colours of their own, always did.
+#[test]
+fn fills_come_back_after_no_fill() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
+    let square = |x: f64| {
+        Geometry::Polygon(vec![vec![vec![
+            Coord::new(x, 0.0),
+            Coord::new(x + 1.0, 0.0),
+            Coord::new(x + 1.0, 1.0),
+            Coord::new(x, 1.0),
+            Coord::new(x, 0.0),
+        ]]])
+    };
+    let dataset = |mixed: bool| {
+        let mut ds =
+            Dataset::new("parcels", GeometryType::Polygon, vec![Field::new("kind", FieldType::Text), Field::new("n", FieldType::Integer)]);
+        for (i, kind) in ["a", "b", "a"].into_iter().enumerate() {
+            ds.push(Some(square(i as f64 * 2.0)), vec![Attr::Text(kind.into()), Attr::Int(i as i64)]);
+        }
+        if mixed {
+            ds.push(Some(Geometry::Point(Coord::new(10.0, 0.5))), vec![Attr::Text("a".into()), Attr::Int(9)]);
+        }
+        ds
+    };
+    // Whether the polygons draw a fill: each of them, or, with none loaded (a streamed layer
+    // away from its features), the layer's own fills over its symbol.
+    let filled = |s: &Session| {
+        let l = s.map().layer(s.active_layer.unwrap()).unwrap();
+        let draws = |fills: &[rustgis_map::fills::FillLayer], fill: rustgis_map::Rgba| {
+            if fills.is_empty() { fill.a() > 0 } else { fills.iter().any(|f| f.draws(fill)) }
+        };
+        let polygons: Vec<usize> =
+            (0..l.dataset.features.len()).filter(|r| matches!(l.dataset.features[*r].geometry, Some(Geometry::Polygon(_)))).collect();
+        if polygons.is_empty() {
+            draws(&l.fill_layers, l.renderer.base_symbol().fill)
+        } else {
+            polygons.iter().all(|r| draws(l.fills(*r), l.symbol(*r).fill))
+        }
+    };
+    for case in ["memory", "mixed", "streamed"] {
+        let mut s = Session::new(Project::default());
+        if case == "streamed" {
+            let path = std::env::temp_dir().join(format!("rustgis-engine-{}-fill-after-no-fill.geojson", std::process::id()));
+            std::fs::write(&path, rustgis_data::io::to_geojson(&dataset(false)).to_string()).unwrap();
+            s.run("layer.addData", &json!({"path": path.to_string_lossy(), "stream": true})).unwrap();
+            let _ = std::fs::remove_file(path);
+            let id = s.active_layer.unwrap();
+            let l = s.map_mut().layer_mut(id).unwrap();
+            assert!(l.is_streamed());
+            l.dataset.features.clear();
+        } else {
+            let id = s.map_mut().add_dataset(dataset(case == "mixed"));
+            s.active_layer = Some(id);
+        }
+        let id = s.active_layer.unwrap();
+        assert!(filled(&s), "{case}: filled to begin with");
+        let steps = [
+            json!({"command": "layer.symbology", "params": {"type": "single"}}),
+            json!({"command": "layer.symbology", "params": {"type": "unique", "field": "kind"}}),
+            // Again on the same field and scheme, which carries the classes over.
+            json!({"command": "layer.symbology", "params": {"type": "unique", "field": "kind"}}),
+            json!({"command": "layer.symbology", "params": {"type": "graduated", "field": "n", "classes": 2}}),
+            json!({"command": "layer.symbology", "params": {"type": "graduated", "field": "n", "classes": 2}}),
+            json!({"command": "layer.ramp", "params": {"ramp": "Harbour"}}),
+            json!({"command": "layer.color", "params": {"color": "#336699"}}),
+            json!({"command": "layer.fillLayers", "params": {"fills": [{"pattern": "solid"}]}}),
+            json!({"command": "layer.fillLayers", "params": {"fills": [{"pattern": "hatch", "angle": 45}]}}),
+            json!({"command": "layer.fillLayers", "params": {"fills": []}}),
+            json!({"command": "layer.fillLayers", "params": {"fills": [{"pattern": "gradient", "color": "#336699"}]}}),
+        ];
+        // Graduated classes need values, which the streamed layer hasn't loaded.
+        for step in steps.into_iter().filter(|st| case != "streamed" || st["params"]["type"] != "graduated") {
+            s.run("layer.noFill", &Value::Null).unwrap();
+            assert!(!filled(&s), "{case}: No Fill hides the fills before {step}");
+            // The path each layer takes: a transparent fill over the symbols of a streamed or
+            // mixed layer, the symbols' own fills made transparent on the other.
+            let l = s.map().layer(id).unwrap();
+            let over = matches!(l.fill_layers.as_slice(), [f] if f.color.is_some_and(|c| c.a() == 0));
+            assert_eq!(over, case != "memory", "{case}: No Fill's path");
+            assert_eq!(l.no_fill, Some(if over { rustgis_map::NoFill::Override } else { rustgis_map::NoFill::Symbols }));
+            s.run(step["command"].as_str().unwrap(), &step["params"]).unwrap();
+            assert!(filled(&s), "{case}: {step} after No Fill draws fills");
+        }
+        // A fill given its own transparent colour leaves the polygons unfilled.
+        for colour in ["#11223300", "#00000000"] {
+            s.run("layer.symbology", &json!({"type": "single"})).unwrap();
+            s.run("layer.noFill", &Value::Null).unwrap();
+            s.run("layer.fillLayers", &json!({"fills": [{"pattern": "solid", "color": colour}]})).unwrap();
+            assert!(!filled(&s), "{case}: a transparent fill {colour} stays transparent");
+            // A new symbology then keeps that fill and turns No Fill off, showing the symbols'
+            // fills under it.
+            s.run("layer.symbology", &json!({"type": "single"})).unwrap();
+            let l = s.map().layer(id).unwrap();
+            assert!(
+                matches!(l.fill_layers.as_slice(), [f] if f.color.is_some_and(|c| c.a() == 0)),
+                "{case}: the chosen fill {colour} stays"
+            );
+            assert_eq!(l.no_fill, None, "{case}: No Fill is off");
+            assert!(l.renderer.base_symbol().fill.a() > 0, "{case}: the symbol's fill is shown");
+        }
+        // One class's fills after No Fill show that class alone: a hatch, or its symbol's own
+        // fill ([]). The streamed layer has no rows loaded to look at.
+        if case != "streamed" {
+            // Without the transparent layer fill chosen above, which a class without fills takes.
+            s.run("layer.fillLayers", &json!({"fills": []})).unwrap();
+            for fills in [json!([{"pattern": "hatch"}]), json!([])] {
+                s.run("layer.symbology", &json!({"type": "unique", "field": "kind"})).unwrap();
+                s.run("layer.noFill", &Value::Null).unwrap();
+                s.run("layer.fillLayers", &json!({"value": "a", "fills": fills})).unwrap();
+                let l = s.map().layer(id).unwrap();
+                let shows = |row: usize| {
+                    l.fills(row).iter().any(|f| f.draws(l.symbol(row).fill)) || (l.fills(row).is_empty() && l.symbol(row).fill.a() > 0)
+                };
+                assert!(shows(0) && shows(2), "{case}: class a shows with {fills}");
+                assert!(!shows(1), "{case}: class b keeps No Fill with {fills}");
+            }
+        }
+    }
+    // A fill colour chosen transparent isn't No Fill: a new symbology keeps it.
+    let mut s = Session::new(Project::default());
+    let id = s.map_mut().add_dataset(dataset(false));
+    s.active_layer = Some(id);
+    s.run("layer.color", &json!({"color": "#33669900"})).unwrap();
+    s.run("layer.symbology", &json!({"type": "unique", "field": "kind"})).unwrap();
+    assert!(!filled(&s), "a chosen transparent fill stays");
+}
+
+/// Other families can be outside a streamed polygon layer's current view when No Fill runs.
+#[test]
+fn mixed_geometry_no_fill_preserves_unloaded_point_symbols() {
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    let mut ds = Dataset::new("mixed", GeometryType::Polygon, vec![]);
+    let polygon =
+        Geometry::Polygon(vec![vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 0.0)]]]);
+    ds.push(Some(polygon.clone()), vec![]);
+    ds.push(Some(polygon), vec![]);
+    ds.push(Some(Geometry::Point(Coord::new(100.0, 30.0))), vec![]);
+    let path = std::env::temp_dir().join(format!("rustgis-engine-{}-mixed-no-fill.geojson", std::process::id()));
+    std::fs::write(&path, rustgis_data::io::to_geojson(&ds).to_string()).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path":path.to_string_lossy(), "stream":true})).unwrap();
+    let id = s.active_layer.unwrap();
+    let l = s.map_mut().layer_mut(id).unwrap();
+    assert!(l.is_streamed());
+    l.dataset.features.clear();
+    let renderer = l.renderer.clone();
+    s.run("layer.noFill", &Value::Null).unwrap();
+    s.run("layer.loadAll", &Value::Null).unwrap();
+    let l = s.map().layer(id).unwrap();
+    assert_eq!(l.renderer, renderer, "the later point keeps its filled symbol");
+    assert!(l.symbol(2).fill.a() > 0);
+    assert!(!l.fills(0).is_empty());
+    assert!(l.fills(0).iter().all(|f| !f.draws(l.symbol(0).fill)));
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -16992,24 +19614,230 @@ fn hostile_group_params_never_panic() {
         json!({"group": null, "layer": "Rivers", "before": "Lakes", "name": "", "to": 0}),
         json!({"group": [1], "layer": {"x": 1}, "layers": "Cities", "to": 2.5}),
         json!({"group": "A", "to": 1e9, "name": "x".repeat(10_000)}),
+        // Nesting (#836): into itself, its subgroup, nothing, junk, before its own layer.
+        json!({"group": "A", "parent": "A"}),
+        json!({"group": "A", "parent": "C", "before": "Rivers"}),
+        json!({"group": "C", "parent": "B", "before": "Countries"}),
+        json!({"group": "B", "parent": 99999, "before": [], "layer": "Lakes"}),
+        json!({"group": "C", "parent": {"x": 1}, "before": "A", "layers": ["Countries"]}),
+        json!({"group": "C", "parent": null, "before": null, "layer": "Countries"}),
     ];
-    let ids = ["group.add", "group.set", "group.expand", "group.scaleRange", "group.move", "group.ungroup", "group.remove", "layer.group"];
+    let ids = [
+        "group.add",
+        "group.set",
+        "group.expand",
+        "group.scaleRange",
+        "group.move",
+        "group.setParent",
+        "group.indent",
+        "group.outdent",
+        "group.ungroup",
+        "group.remove",
+        "layer.group",
+        "layer.indent",
+        "layer.outdent",
+        "layer.moveUp",
+        "layer.moveDown",
+    ];
     for id in ids {
         for p in &junk {
             let mut s = world();
             s.run("group.add", &json!({"name": "A", "layers": ["Rivers", "Lakes"]})).unwrap();
             s.run("group.add", &json!({"name": "B"})).unwrap();
+            s.run("group.add", &json!({"name": "C", "parent": "A", "layers": ["Lakes"]})).unwrap();
             let _ = s.run(id, p);
-            // The groups stay whole: each group's layers sit together in the drawing order.
+            // The groups stay whole: each group's layers, its subgroups' too, sit together in
+            // the drawing order, and no group is in itself.
             let m = s.map();
             for g in &m.groups {
-                let at: Vec<usize> = m.layers.iter().enumerate().filter(|(_, l)| g.children.contains(&l.id)).map(|(i, _)| i).collect();
+                let members = m.group_layers(g.id);
+                let at: Vec<usize> = m.layers.iter().enumerate().filter(|(_, l)| members.contains(&l.id)).map(|(i, _)| i).collect();
                 assert!(at.windows(2).all(|w| w[1] == w[0] + 1), "{id} {p}: {at:?}");
                 assert!(g.children.iter().all(|c| m.layer(*c).is_some()), "{id} {p}");
                 assert!(g.name.chars().count() <= 200 && (0.0..=100.0).contains(&g.transparency));
+                assert!(g.parent.is_none_or(|p| p != g.id && m.group(p).is_some()), "{id} {p}");
+                assert!(m.group_chain(g.id).last().is_some_and(|top| top.parent.is_none()), "{id} {p}: a loop");
             }
         }
     }
+}
+
+/// Names of the map's layers in drawing order.
+fn layer_names(s: &Session) -> Vec<String> {
+    s.map().layers.iter().map(|l| l.name.clone()).collect()
+}
+
+fn group_named(s: &Session, name: &str) -> u32 {
+    s.map().groups.iter().find(|g| g.name == name).map(|g| g.id).unwrap()
+}
+
+#[test]
+fn nested_groups_apply_down_the_chain_and_move_whole() {
+    use rustgis_map::Outline;
+    let mut s = world();
+    s.run("group.add", &json!({"name": "Base", "layers": ["Rivers", "Lakes", "Countries"]})).unwrap();
+    s.run("group.add", &json!({"name": "Water", "parent": "Base", "layers": ["Rivers", "Lakes"]})).unwrap();
+    let (base, water) = (group_named(&s, "Base"), group_named(&s, "Water"));
+    let id = |s: &Session, n: &str| s.map().layer_by_name(n).unwrap().id;
+    let (rivers, countries, cities) = (id(&s, "Rivers"), id(&s, "Countries"), id(&s, "Cities"));
+    assert_eq!(s.map().group(water).unwrap().parent, Some(base));
+    assert_eq!(layer_names(&s), ["Cities", "Rivers", "Lakes", "Countries"]);
+    assert_eq!(s.map().outline(None), [Outline::Layer(cities), Outline::Group(base)]);
+    assert_eq!(s.map().outline(Some(base)), [Outline::Group(water), Outline::Layer(countries)]);
+    // Hidden, the outer group hides the inner one's layers too; transparency multiplies.
+    s.run("group.set", &json!({"group": "Base", "visible": false})).unwrap();
+    let m = s.map();
+    assert!(!m.shows(m.layer(rivers).unwrap()) && m.shows(m.layer(cities).unwrap()));
+    assert_eq!(m.held_by_group(1e6).len(), 3);
+    s.run("group.set", &json!({"group": "Base", "visible": true, "transparency": 50})).unwrap();
+    s.run("group.set", &json!({"group": "Water", "transparency": 50})).unwrap();
+    s.run("group.scaleRange", &json!({"group": "Base", "min": 1e6})).unwrap();
+    let m = s.map();
+    let (r, c) = (m.layer(rivers).unwrap(), m.layer(countries).unwrap());
+    assert!((m.layer_opacity(r) - 0.25 * r.opacity()).abs() < 1e-6);
+    assert!((m.layer_opacity(c) - 0.5 * c.opacity()).abs() < 1e-6);
+    assert!(!m.draws_at(r, 2e6) && m.draws_at(r, 5e5));
+    // Exports fold every level into the layers.
+    let own = r.opacity();
+    let mut baked = s.map().clone();
+    baked.bake_groups();
+    let r = baked.layer(rivers).unwrap();
+    assert!((r.opacity() - 0.25 * own).abs() < 1e-4 && r.min_scale.is_some_and(|m| m <= 1e6));
+    // A subgroup moves within its group only, whole.
+    s.run("group.move", &json!({"group": "Water", "to": 0})).unwrap();
+    assert_eq!(layer_names(&s), ["Cities", "Rivers", "Lakes", "Countries"]);
+    s.run("group.move", &json!({"group": "Water", "to": 99})).unwrap();
+    assert_eq!(layer_names(&s), ["Cities", "Countries", "Rivers", "Lakes"]);
+    // A layer steps over a subgroup as one item, and stops at its group's edge.
+    s.run("layer.moveDown", &json!({"layer": "Countries"})).unwrap();
+    assert_eq!(layer_names(&s), ["Cities", "Rivers", "Lakes", "Countries"]);
+    assert!(s.run("layer.moveDown", &json!({"layer": "Countries"})).is_err());
+    // A layer outside steps over the whole outer group.
+    s.run("layer.moveDown", &json!({"layer": "Cities"})).unwrap();
+    assert_eq!(layer_names(&s), ["Rivers", "Lakes", "Countries", "Cities"]);
+    // Ungrouped, the outer group's layers and subgroups go up one level.
+    s.run("group.ungroup", &json!({"group": "Base"})).unwrap();
+    assert_eq!(s.map().group(water).unwrap().parent, None);
+    assert!(s.map().group_of(countries).is_none());
+    // Removing a group takes its subgroups and all their layers.
+    s.run("edit.undo", &Value::Null).unwrap();
+    s.run("group.remove", &json!({"group": "Base"})).unwrap();
+    assert_eq!(layer_names(&s), ["Cities"]);
+    assert!(s.map().groups.is_empty());
+}
+
+#[test]
+fn outline_commands_indent_and_outdent_one_level_in_one_step() {
+    let mut s = world();
+    s.run("group.add", &json!({"name": "G", "layers": ["Rivers"]})).unwrap();
+    let g = group_named(&s, "G");
+    let group_of = |s: &Session, n: &str| s.map().group_of(s.map().layer_by_name(n).unwrap().id).map(|g| g.id);
+    // Into the group above, as its last item; the drawing order stays.
+    let undo = s.undo_depth();
+    s.run("layer.indent", &json!({"layer": "Lakes"})).unwrap();
+    assert_eq!((group_of(&s, "Lakes"), s.undo_depth()), (Some(g), undo + 1));
+    s.run("layer.indent", &json!({"layer": "Countries"})).unwrap();
+    assert_eq!(layer_names(&s), ["Cities", "Rivers", "Lakes", "Countries"]);
+    assert_eq!(group_of(&s, "Countries"), Some(g));
+    // Nothing above, or a layer above: refused, with the reason.
+    assert!(s.run("layer.indent", &json!({"layer": "Cities"})).unwrap_err().contains("first"));
+    assert!(s.run("layer.indent", &json!({"layer": "Lakes"})).unwrap_err().contains("not a group"));
+    // Out, right below its group.
+    s.run("layer.outdent", &json!({"layer": "Lakes"})).unwrap();
+    assert_eq!(layer_names(&s), ["Cities", "Rivers", "Countries", "Lakes"]);
+    assert_eq!(group_of(&s, "Lakes"), None);
+    assert!(s.run("layer.outdent", &json!({"layer": "Lakes"})).is_err());
+    // A group goes in the group above, and out again just below it.
+    s.run("group.add", &json!({"name": "H", "layers": ["Lakes"]})).unwrap();
+    let h = group_named(&s, "H");
+    s.run("group.indent", &json!({"group": "H"})).unwrap();
+    assert_eq!(s.map().group(h).unwrap().parent, Some(g));
+    assert_eq!(layer_names(&s), ["Cities", "Rivers", "Countries", "Lakes"]);
+    // A layer in the inner group goes out one level only: into G, just below H.
+    s.run("layer.group", &json!({"layer": "Countries", "group": "H", "before": "Lakes"})).unwrap();
+    s.run("layer.outdent", &json!({"layer": "Countries"})).unwrap();
+    assert_eq!(layer_names(&s), ["Cities", "Rivers", "Lakes", "Countries"]);
+    assert_eq!(group_of(&s, "Countries"), Some(g));
+    s.run("group.outdent", &json!({"group": "H"})).unwrap();
+    assert_eq!(s.map().group(h).unwrap().parent, None);
+    assert_eq!(layer_names(&s), ["Cities", "Rivers", "Countries", "Lakes"]);
+    // Undone, a step at a time.
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.map().group(h).unwrap().parent, Some(g));
+    // No loops, and no deeper than eight levels.
+    assert!(s.run("group.setParent", &json!({"group": "G", "parent": "H"})).is_err());
+    let mut parent = Value::Null;
+    for level in 1..=rustgis_map::MAX_GROUP_DEPTH {
+        let made = s.run("group.add", &json!({"name": format!("L{level}"), "parent": parent})).unwrap();
+        parent = made["group"].clone();
+    }
+    assert!(s.run("group.add", &json!({"name": "Too deep", "parent": parent})).unwrap_err().contains("levels"));
+    assert!(s.run("group.setParent", &json!({"group": "G", "parent": "L7"})).unwrap_err().contains("levels"));
+    s.run("group.setParent", &json!({"group": "G", "parent": "L5", "before": null})).unwrap();
+    assert_eq!(s.map().group_depth(g), 6);
+    // A group with no layers put at the end of a level goes after the others there.
+    s.run("group.add", &json!({"name": "E1"})).unwrap();
+    s.run("group.add", &json!({"name": "E2"})).unwrap();
+    let (e1, e2) = (group_named(&s, "E1"), group_named(&s, "E2"));
+    s.run("group.setParent", &json!({"group": "E1", "parent": null, "before": null})).unwrap();
+    let top = s.map().outline(None);
+    assert_eq!(top.iter().rev().take(2).collect::<Vec<_>>(), [&rustgis_map::Outline::Group(e1), &rustgis_map::Outline::Group(e2)]);
+}
+
+#[test]
+fn hand_edited_group_parents_open_without_loops_or_too_many_levels() {
+    let mut s = world();
+    s.run("group.add", &json!({"name": "A", "layers": ["Cities"]})).unwrap();
+    let mut v: Value = serde_json::from_str(&serde_json::to_string(&s.project).unwrap()).unwrap();
+    let id = |n: &str| s.map().layer_by_name(n).unwrap().id;
+    // A loop, a parent of its own, a missing parent, a chain ten deep, and a subgroup whose layers
+    // are far from its group's.
+    let mut groups = vec![
+        json!({"id": 900, "name": "Loop1", "parent": 901, "children": []}),
+        json!({"id": 901, "name": "Loop2", "parent": 900, "children": []}),
+        json!({"id": 902, "name": "Self", "parent": 902, "children": []}),
+        json!({"id": 903, "name": "Orphan", "parent": 12345, "children": []}),
+        json!({"id": 910, "name": "Outer", "children": [id("Cities")]}),
+        json!({"id": 911, "name": "Inner", "parent": 910, "children": [id("Countries")]}),
+    ];
+    for k in 0..10u32 {
+        groups.push(json!({"id": 920 + k, "name": format!("D{k}"), "parent": if k == 0 { Value::Null } else { json!(919 + k) }}));
+    }
+    v["maps"][0]["groups"] = json!(groups);
+    let p = Project::from_json(&v.to_string()).unwrap();
+    let m = p.maps.first().unwrap();
+    for g in &m.groups {
+        assert!(m.group_depth(g.id) <= rustgis_map::MAX_GROUP_DEPTH, "{}", g.name);
+        assert!(m.group_chain(g.id).last().is_some_and(|top| top.parent.is_none()), "{}", g.name);
+    }
+    let parent = |n: &str| m.groups.iter().find(|g| g.name == n).and_then(|g| g.parent);
+    assert_eq!((parent("Self"), parent("Orphan"), parent("Inner")), (None, None, Some(910)));
+    assert!(parent("Loop1").is_none() || parent("Loop2").is_none());
+    assert_eq!(parent("D7"), Some(926));
+    assert_eq!(parent("D8"), None);
+    // The subgroup's layer gathered under its group's.
+    let order: Vec<&str> = m.layers.iter().map(|l| l.name.as_str()).collect();
+    assert_eq!(order, ["Cities", "Countries", "Rivers", "Lakes"]);
+    // Saved, a group at the top level writes no parent, so older versions read the same file.
+    let text = serde_json::to_string(m.groups.iter().find(|g| g.name == "Outer").unwrap()).unwrap();
+    assert!(!text.contains("parent"));
+}
+
+#[test]
+fn a_copied_group_pastes_with_its_subgroups() {
+    let mut s = world();
+    s.run("group.add", &json!({"name": "Base", "layers": ["Rivers", "Lakes", "Countries"]})).unwrap();
+    s.run("group.add", &json!({"name": "Water", "parent": "Base", "layers": ["Rivers", "Lakes"]})).unwrap();
+    s.run("group.add", &json!({"name": "Target", "layers": ["Cities"]})).unwrap();
+    s.run("layer.copy", &json!({"group": "Base"})).unwrap();
+    s.run("layer.paste", &json!({"group": "Target"})).unwrap();
+    let m = s.map();
+    let target = m.groups.iter().find(|g| g.name == "Target").unwrap().id;
+    let base = m.groups.iter().find(|g| g.name != "Base" && g.name.starts_with("Base")).unwrap();
+    let water = m.groups.iter().find(|g| g.name != "Water" && g.name.starts_with("Water")).unwrap();
+    assert_eq!((base.parent, water.parent), (Some(target), Some(base.id)));
+    assert_eq!(m.group_layers(water.id).len(), 2);
+    assert_eq!(m.group_layers(target).len(), 4);
 }
 
 /// Large elevation models come as tiles in a projected coordinate system (#155): mosaic them on
@@ -17865,6 +20693,15 @@ fn legends_leave_layers_out() {
     s.run("layer.rename", &json!({"layer": "Nations", "name": "Countries"})).unwrap();
     s.run("layer.rename", &json!({"layer": "Lakes", "name": "Countries"})).unwrap();
     assert!(left_out(&s, lakes).is_empty(), "the other Countries isn't taken out");
+    // A WMS or WMTS layer is left out by name too, and the name follows it: renamed, removed.
+    let wms = json!({"url": "https://maps.example.org/wms/{bbox-epsg-3857}", "name": "Soils", "overlay": true, "legend": "https://maps.example.org/legend.png"});
+    s.run("map.addTiles", &wms).unwrap();
+    s.run("layout.update", &json!({"element": lakes, "exclude": ["soils"]})).unwrap();
+    assert_eq!(left_out(&s, lakes), ["Soils"]);
+    s.run("map.setTiles", &json!({"name": "Soils", "rename": "Soil map", "move": "bottom"})).unwrap();
+    assert_eq!(left_out(&s, lakes), ["Soil map"]);
+    s.run("map.removeTiles", &json!({"name": "Soil map"})).unwrap();
+    assert!(left_out(&s, lakes).is_empty());
 }
 
 /// A point layer of events, one a month through 2015 (two in March), with their dates as text,
@@ -18875,6 +21712,87 @@ impl Drop for GpkgRegressionFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// A streamed layer's export says how many of its source's rows couldn't be read, written a
+/// chunk at a time (GeoJSON) or from a whole read (KML) alike.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_streamed_export_counts_the_rows_it_could_not_read() {
+    let fixture = GpkgRegressionFixture::new("unread-rows");
+    let path = fixture.path();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("INSERT INTO roads (fid, geom, name) VALUES (4, X'4750000300000000DEAD', 'bad');").unwrap();
+    drop(db);
+    let mut s = Session::new(Project::default());
+    let loaded = s.run("layer.addData", &json!({"path": path, "stream": true})).unwrap();
+    let id = loaded["layer"].as_u64().unwrap() as u32;
+    assert!(s.map().layer(id).unwrap().is_streamed());
+    for ext in ["geojson", "kml"] {
+        let mark = s.notice_mark();
+        let exported = s.run("share.exportLayer", &json!({"layer": id, "path": fixture.dir.join(format!("out.{ext}"))})).unwrap();
+        assert_eq!(exported["features"].as_u64(), Some(3), "{ext}");
+        let notices: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(notices.iter().any(|n| n.contains("1 rows couldn't be read")), "{ext}: {notices:?}");
+    }
+}
+
+/// A GeoPackage past the count limit is read whole within the memory budget, not refused or
+/// sampled (#1108, #1111), and exported a chunk at a time.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_past_the_count_limit_streams_exports_and_reads_whole() {
+    use rustgis_data::{Geometry, source::MAX_LIMIT};
+
+    let fixture = GpkgRegressionFixture::new("whole-read-limit");
+    let path = fixture.path();
+    let count = MAX_LIMIT + 1;
+    let db = rusqlite::Connection::open(&path).unwrap();
+    // A single SQLite statement generates the rows without keeping millions of features in Rust.
+    // The compact, valid point blob omits the optional envelope to keep this fixture small.
+    let mut blob = b"GP\x00\x01".to_vec();
+    blob.extend_from_slice(&4326i32.to_le_bytes());
+    blob.extend(rustgis_data::wkb::encode(&Geometry::Point(rustgis_geom::Coord::new(1.0, 20.0))));
+    db.execute_batch(
+        "DELETE FROM roads;
+         UPDATE gpkg_contents SET min_x=1, max_x=1, min_y=20, max_y=20 WHERE table_name='roads';",
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute(
+            "WITH RECURSIVE rows(fid) AS (SELECT 1 UNION ALL SELECT fid+1 FROM rows WHERE fid<?1)
+             INSERT INTO roads(fid, geom, name) SELECT fid, ?2, 'road ' || fid FROM rows",
+            rusqlite::params![count as i64, blob],
+        )
+        .unwrap(),
+        count
+    );
+    drop(db);
+    let mut s = Session::new(Project::default());
+    let loaded = s.run("layer.addData", &json!({"path": path, "stream": true})).unwrap();
+    assert_eq!(loaded["features"].as_u64(), Some(count as u64));
+    let id = loaded["layer"].as_u64().unwrap() as u32;
+    assert!(s.map().layer(id).unwrap().is_streamed());
+    let resident = s.map().layer(id).unwrap().dataset.features.len();
+    assert!(resident < count);
+    // Exported a chunk at a time, past the limit a whole read has.
+    let output = fixture.dir.join("whole.csv");
+    let exported = s.run("share.exportLayer", &json!({"layer": id, "path": output})).unwrap();
+    assert_eq!(exported["features"].as_u64(), Some(count as u64));
+    // A header, then every row once and in order (the first column is the road's name).
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(std::fs::File::open(&output).unwrap()));
+    assert!(lines.next().unwrap().unwrap().starts_with("name,"));
+    let mut rows = 0;
+    for (k, line) in lines.enumerate() {
+        let line = line.unwrap();
+        assert!(line.starts_with(&format!("road {},", k + 1)), "row {k}: {line}");
+        rows += 1;
+    }
+    assert_eq!(rows, count, "every row");
+    // A whole read is bounded by memory, not by the count.
+    s.run("layer.loadAll", &json!({"layer": id})).unwrap();
+    assert!(!s.map().layer(id).unwrap().is_streamed());
+    assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), count);
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -20324,6 +23242,250 @@ fn calculate_geometry_updates_ellipsoidal_lengths_in_one_undo_step() {
     assert!((out.value(0, length).as_f64().unwrap() - 111.31949079327356).abs() < 1e-6);
 }
 
+/// The session log (#797): a command run by itself that changes the project, or reaches a file
+/// or a service, is logged once (a script's lines inside it), with its outcome; reading isn't.
+/// Undo keeps the entries and is logged with the step it took back (not when there is none).
+/// Secrets are taken out and large values clipped; the log is capped and kept for the session
+/// only, across the projects opened in it; it can be read by filter, written out, cleared and
+/// turned off, none of which changes the project.
+#[test]
+fn the_session_log_records_each_command_run_in_the_session() {
+    use crate::project_log::{LOG_LIMIT, LOG_PARAMS_BYTES, LogEntry};
+    let mut s = world();
+    // The sample project's making is its first entry: counted from after it.
+    assert_eq!(s.log.clear(), 1);
+    let commands = |s: &Session| s.log.entries().map(|e| e.command.clone()).collect::<Vec<_>>();
+    let last = |s: &Session| s.log.entries().last().cloned().unwrap();
+    s.run("project.rename", &json!({"name": "Atlas"})).unwrap();
+    s.run("info.project", &Value::Null).unwrap();
+    s.run("map.zoomIn", &Value::Null).unwrap();
+    s.run("script.run", &json!({"script": "project.rename {\"name\": \"A\"}\nproject.rename {\"name\": \"B\"}"})).unwrap();
+    assert_eq!(commands(&s), ["project.rename", "script.run"], "reading and moving the view aren't logged, nor a script's lines");
+    let first = s.log.entries().next().cloned().unwrap();
+    assert!(first.ok && first.error.is_none() && first.at > 1_700_000_000_000, "{first:?}");
+    assert_eq!(first.params, json!({"name": "Atlas"}));
+    // Undone: the entries stay, and the undo says what it took back.
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.project.name, "Atlas");
+    assert_eq!(commands(&s), ["project.rename", "script.run", "edit.undo"]);
+    assert_eq!(s.log.entries().nth(2).unwrap().params, json!({"step": "Run Script"}));
+    // A failure is logged with its error; a service's address without its token.
+    assert!(s.run("project.rename", &json!({"name": " "})).is_err());
+    let failed = last(&s);
+    assert!(!failed.ok && failed.error.as_deref().is_some_and(|e| e.contains("name")), "{failed:?}");
+    let _ = s.run("service.layers", &json!({"url": "https://x.org/wms?token=S3CRET&layers=a", "text": "not a capabilities document"}));
+    let service = last(&s);
+    assert_eq!(service.command, "service.layers");
+    assert!(!service.params.to_string().contains("S3CRET"), "{service:?}");
+    // A document given as text is kept as its size only: it may hold secrets no redaction finds.
+    let qgs = format!("<qgis version=\"3.42.0\"><title>{}</title></qgis>", "rustgis-s3:TOKEN:s3://b/k ".repeat(20));
+    let _ = s.run("project.importQgis", &json!({"text": qgs}));
+    let doc = last(&s);
+    assert_eq!(doc.params["text"], json!(format!("(a document of {} characters)", qgs.chars().count())), "{doc:?}");
+    // So is one after a byte-order mark (a QGIS project read from a file that has one).
+    let marked = format!("\u{feff}{qgs}");
+    let _ = s.run("project.importQgis", &json!({"text": marked}));
+    let doc = last(&s);
+    assert!(doc.params["text"].as_str().is_some_and(|t| t.starts_with("(a document of")), "{doc:?}");
+    // A secret in the JSON a text holds (a script's command line) is taken out too.
+    let line = r#"s3.connect {"accessKeyId": "AKIA", "secretAccessKey": "S3CRETKEY", "region": "x"}"#;
+    let _ = s.run("script.run", &json!({"script": line}));
+    let script = last(&s);
+    assert!(!script.params.to_string().contains("S3CRETKEY") && script.params.to_string().contains("s3.connect"), "{script:?}");
+    // Nor where the clip cuts the object short: what follows its `{` goes.
+    // The secret comes first and a long field after it, past the cut.
+    let long = format!(r#"s3.connect {{"secretAccessKey": "S3CRETKEY", "notes": "{}"}}"#, "x".repeat(5000));
+    let _ = s.run("script.run", &json!({"script": long}));
+    let cut = last(&s);
+    assert!(!cut.params.to_string().contains("S3CRET"), "{}", cut.params);
+    // Nor in an object that doesn't parse (a trailing comma), while text such as `{name}` stays.
+    let broken = r#"s3.connect {"secretAccessKey": "S3CRETKEY", "region": "x",} # see {name}"#;
+    let _ = s.run("script.run", &json!({"script": broken}));
+    let kept = last(&s).params.to_string();
+    assert!(!kept.contains("S3CRET") && kept.contains("s3.connect"), "{kept}");
+    let _ = s.run("script.run", &json!({"script": "# keep {name} as it is"}));
+    assert!(last(&s).params.to_string().contains("{name}"));
+    // A long list is "…" once its texts are cut to fit, its count with it.
+    let long: Vec<String> = (0..5_000).map(|i| format!("{i}{}", "y".repeat(100))).collect();
+    let _ = s.run("project.rename", &json!({"name": "Long", "tags": long}));
+    let tags = last(&s).params.to_string();
+    assert_eq!(last(&s).params, json!({"name": "Long", "tags": "…"}), "{tags}");
+    // Large values clipped.
+    s.run("project.rename", &json!({"name": "x".repeat(20_000), "note": vec![1; 5_000]})).ok();
+    let big = last(&s);
+    assert!(serde_json::to_vec(&big.params).unwrap().len() <= LOG_PARAMS_BYTES, "{}", big.params.to_string().len());
+    // The project carries none of it: a saved project, or its recovery copy, holds no log.
+    assert!(!s.project.saved_text(None).unwrap().0.contains("\"log\""));
+    assert!(!s.project.clone().recovery_text().unwrap().contains("\"log\""));
+    // Read by filter, newest last.
+    let r = s.run("project.log", &json!({"command": "project.rename", "failed": true})).unwrap();
+    assert_eq!((r["count"].as_u64(), r["entries"][0]["command"].as_str()), (Some(1), Some("project.rename")));
+    assert_eq!(s.run("project.log", &json!({"limit": 2})).unwrap()["entries"].as_array().map(Vec::len), Some(2));
+    assert!(s.run("project.log", &json!({"limit": 0})).is_err());
+    assert!(s.run("project.log", &json!({"limit": 0.5})).unwrap_err().contains("whole number"));
+    // Steps merged into one undo step (a held arrow key) are one entry, with the last parameters.
+    let n = s.log.len();
+    for name in ["Nudged 1", "Nudged 2", "Nudged 3"] {
+        s.merge_undo("nudge");
+        s.run("project.rename", &json!({"name": name})).unwrap();
+    }
+    assert_eq!(s.log.len(), n + 1);
+    assert_eq!(last(&s).params["name"], json!("Nudged 3"));
+    // Times as decimals too; a negative time, or a filter that isn't true or false, is refused.
+    assert_eq!(s.run("project.log", &json!({"since": 1.7e12, "limit": 1})).unwrap()["entries"].as_array().map(Vec::len), Some(1));
+    assert!(s.run("project.log", &json!({"since": -1})).is_err());
+    assert!(s.run("project.log", &json!({"failed": "true"})).is_err());
+    assert!(s.run("project.log", &json!({"command": 7})).is_err());
+    // An error that starts as a spreadsheet formula is written as text in the CSV.
+    let formula = LogEntry { at: 2, command: "x".into(), params: Value::Null, ok: false, error: Some("=HYPERLINK(1)".into()), millis: 0 };
+    s.log.push(formula);
+    // Written out as CSV and JSON Lines.
+    let dir = std::env::temp_dir().join(format!("rustgis-session-log-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv = dir.join("log.csv");
+    s.run("project.exportLog", &json!({"path": csv.to_string_lossy()})).unwrap();
+    let csv_text = std::fs::read_to_string(&csv).unwrap();
+    assert!(csv_text.starts_with("time_utc,at,command,ok,millis,error,params\n") && csv_text.contains("\"edit.undo\""), "{csv_text}");
+    assert!(csv_text.contains("\"'=HYPERLINK(1)\"") && !csv_text.contains(",\"=HYPERLINK"), "{csv_text}");
+    let jsonl = dir.join("log.jsonl");
+    s.run("project.exportLog", &json!({"path": jsonl.to_string_lossy()})).unwrap();
+    let lines: Vec<LogEntry> = std::fs::read_to_string(&jsonl).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len() + 1, s.log.len(), "every entry but the export's own");
+    let _ = std::fs::remove_dir_all(&dir);
+    // Cleared, it says so; off, nothing goes in; on again, it does. Neither changes the project,
+    // which holds no log, nor takes an undo step.
+    for id in ["project.clearLog", "project.logCommands"] {
+        assert!(!s.registry.get(id).unwrap().mutates, "{id}");
+    }
+    let steps = s.undo.len();
+    s.mark_saved();
+    assert!(s.run("project.clearLog", &Value::Null).unwrap()["cleared"].as_u64().unwrap() > 5);
+    assert_eq!(commands(&s), ["project.clearLog"]);
+    assert!(!s.dirty() && s.undo.len() == steps, "the project doesn't change");
+    s.run("project.logCommands", &json!({"on": false})).unwrap();
+    s.run("project.rename", &json!({"name": "Quiet"})).unwrap();
+    assert_eq!(commands(&s), ["project.clearLog", "project.logCommands"], "turned off, and said so");
+    s.run("project.logCommands", &json!({"on": true})).unwrap();
+    assert_eq!(commands(&s), ["project.clearLog", "project.logCommands", "project.logCommands"]);
+    // A .json path is refused: JSON Lines isn't one JSON document. A format given doesn't let
+    // the log go over another kind of file, nor disagree with the path's extension.
+    assert!(s.run("project.exportLog", &json!({"path": "log.json"})).is_err());
+    for (path, format) in [("log.json", "jsonl"), ("map.rgis", "csv"), ("log.csv", "jsonl"), ("log", "xml")] {
+        let e = s.run("project.exportLog", &json!({"path": path, "format": format})).unwrap_err();
+        assert!(e.contains("not a .") || e.contains("doesn't match") || e.contains("format is"), "{path}: {e}");
+    }
+    assert!(s.run("project.exportLog", &json!({"path": "log"})).unwrap_err().contains("give a .csv"));
+    // The log lasts for the session: making a project adds to it and keeps what was there.
+    let mut made = world();
+    let before = made.log.len();
+    made.run("project.new", &json!({"name": "Fresh"})).unwrap();
+    assert_eq!(made.log.len(), before + 1);
+    assert_eq!(made.log.entries().last().unwrap().command, "project.new");
+    // Cleared while off, it still says so.
+    s.run("project.logCommands", &json!({"on": false})).unwrap();
+    s.run("project.clearLog", &Value::Null).unwrap();
+    assert_eq!(commands(&s), ["project.clearLog"]);
+    s.run("project.logCommands", &json!({"on": true})).unwrap();
+    // Capped: the oldest go first.
+    for i in 0..LOG_LIMIT + 5 {
+        s.log.push(LogEntry { at: i as u64, command: "x".into(), params: Value::Null, ok: true, error: None, millis: 0 });
+    }
+    assert_eq!(s.log.len(), LOG_LIMIT);
+    assert_eq!(s.log.entries().next().unwrap().at, 5);
+    // Undo or redo with nothing to take back changes nothing, and isn't logged.
+    s.clear_history();
+    let n = s.log.len();
+    assert!(s.run("edit.undo", &Value::Null).is_err() && s.run("edit.redo", &Value::Null).is_err());
+    assert_eq!(s.log.len(), n, "nothing to undo or redo: not logged");
+}
+
+/// What the session log keeps of a command's parameters: bounded in bytes, keys and time, and
+/// without secrets, those in JSON a text holds and in SQL `CREATE … SECRET` options included.
+#[test]
+fn the_session_log_keeps_parameters_bounded_and_without_secrets() {
+    // Many keys with short values still fit the bound.
+    let wide: serde_json::Map<String, Value> = (0..40).map(|i| (format!("{i:02}{}", "k".repeat(62)), json!("é".repeat(64)))).collect();
+    let kept = crate::project_log::kept_params(&Value::Object(wide));
+    assert!(serde_json::to_vec(&kept).unwrap().len() <= crate::project_log::LOG_PARAMS_BYTES, "{kept}");
+    assert!(kept.as_object().is_some_and(|o| o.len() > 1 && o.len() < 40));
+    assert_eq!(kept["…"], json!("40 keys in all"));
+    // Keys alike in their first 64 characters: the first stays, the other counted as left out.
+    let mut alike: serde_json::Map<String, Value> = (0..40).map(|i| (format!("{i:02}{}", "k".repeat(62)), json!("v".repeat(64)))).collect();
+    // Sorts right after the first key, and is the same once cut to 64 characters.
+    alike.insert(format!("00{}a", "k".repeat(62)), json!(2));
+    let kept = crate::project_log::kept_params(&Value::Object(alike));
+    assert_eq!(kept["…"], json!("41 keys in all"));
+    assert_eq!(kept[format!("00{}", "k".repeat(62))], json!("v".repeat(64)), "the first stays");
+    assert!(kept.as_object().is_some_and(|o| !o.values().any(|v| *v == json!(2))), "{kept}");
+    // A crafted text costs its length, not its braces times its length: 200,000 braces are
+    // milliseconds once, and would be hours if each `{` scanned the rest (a bound far from both).
+    let crafted = "{1".repeat(200_000);
+    let started = std::time::Instant::now();
+    assert_eq!(crate::project_log::json_in_text_redacted(&crafted).len(), crafted.len());
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "{:?}", started.elapsed());
+    // A key cut short keeps no value: a secret's name may be past the cut.
+    let long_key = format!("{}secretAccessKey", "x".repeat(195));
+    let kept = crate::project_log::kept_params(&json!({long_key: "S3CRET"}));
+    assert!(!kept.to_string().contains("S3CRET"), "{kept}");
+    // An SQL secret's options, written as plain words, go; the statement's shape stays.
+    let sql = "CREATE OR REPLACE SECRET s3 (TYPE s3, KEY_ID 'AKIA1', SECRET 'S3CRET'); SELECT 1 / 2";
+    let kept = crate::project_log::kept_params(&json!({"sql": sql}));
+    assert_eq!(kept["sql"], json!("CREATE OR REPLACE SECRET s3 (…); SELECT 1 / 2"));
+    assert_eq!(crate::project_log::sql_secrets_removed("create table t (a int)"), "create table t (a int)");
+    assert_eq!(crate::project_log::sql_secrets_removed("create table secret (a int)"), "create table secret (a int)");
+    // A file's contents in base64 (`layer.addDataBytes`) are kept as their size: a secret's name
+    // can't be seen in them. A long text that isn't base64 is clipped as before.
+    let encoded = "eyJ0b2tlbiI6ICJTM0NSRVQifQ==".repeat(20);
+    for data in [encoded.clone(), format!("data:application/json;base64,{encoded}")] {
+        let kept = crate::project_log::kept_params(&json!({"fileName": "a.geojson", "data": data}));
+        assert_eq!(kept["data"], json!(format!("(file contents of {} characters, base64)", data.len())), "{kept}");
+    }
+    let prose = crate::project_log::kept_params(&json!({"note": "word ".repeat(100)}));
+    assert!(prose["note"].as_str().is_some_and(|n| n.starts_with("word word")), "{prose}");
+    // `create` inside another word starts no statement.
+    for t in ["recreate secret s (key 'a')", "created secret (key 'a')"] {
+        assert_eq!(crate::project_log::sql_secrets_removed(t), t);
+    }
+    assert_eq!(crate::project_log::sql_secrets_removed("CREATE PERSISTENT SECRET (TYPE s3, SECRET 'x')"), "CREATE PERSISTENT SECRET (…)");
+    // An unquoted secret key in an object that doesn't parse goes, with the rest of the text;
+    // a format string's braces stay.
+    let line = crate::project_log::kept_params(&json!({"script": "s3.connect {secretAccessKey: \"S3CRET\"}\nprint(f\"{x:.2f}\")"}));
+    assert!(!line.to_string().contains("S3CRET"), "{line}");
+    let fmt = crate::project_log::kept_params(&json!({"script": "print(f\"{x:.2f}\")"}));
+    assert_eq!(fmt["script"], json!("print(f\"{x:.2f}\")"));
+    // A quoted secret key in such an object goes too, its value with it, double or single quotes.
+    for line in [r#"s3.connect {a: "x", "secretAccessKey": "S3CRET",}"#, "s3.connect {a: 'x', 'secretAccessKey': 'S3CRET',}"] {
+        let kept = crate::project_log::kept_params(&json!({"script": line}));
+        assert!(!kept.to_string().contains("S3CRET") && kept.to_string().contains("s3.connect"), "{kept}");
+    }
+}
+
+/// Plugins can neither empty the session log nor turn it off, nor push the user's entries out of
+/// it; writing the log out, or reading it, reaches a file.
+#[test]
+fn plugins_can_neither_clear_the_session_log_nor_crowd_out_the_users_entries() {
+    use crate::project_log::LogEntry;
+    // Plugins' commands keep at most their own share of the log: the user's entries stay.
+    let mut log = crate::project_log::SessionLog::default();
+    let entry = |command: &str| LogEntry { at: 1, command: command.into(), params: Value::Null, ok: true, error: None, millis: 0 };
+    log.push(entry("layer.rename"));
+    for _ in 0..crate::project_log::LOG_PLUGIN_LIMIT + 5 {
+        log.push(entry("plugin:p/flood"));
+    }
+    assert_eq!(log.len(), crate::project_log::LOG_PLUGIN_LIMIT + 1);
+    assert_eq!(log.entries().next().unwrap().command, "layer.rename");
+    // A plugin never empties the log or turns it off; writing it out is reaching a file.
+    assert!(crate::cmd::plugins::user_only("project.clearLog") && crate::cmd::plugins::user_only("project.logCommands"));
+    {
+        use crate::cmd::plugins::{Reach, reaches};
+        let export = crate::cmd::all().into_iter().find(|c| c.id == "project.exportLog").unwrap();
+        assert_eq!(reaches(&export, &json!({"path": "log.csv"})), Some(Reach::Files));
+        // Reading it too: it names the files and addresses the user's commands used.
+        let read = crate::cmd::all().into_iter().find(|c| c.id == "project.log").unwrap();
+        assert_eq!(reaches(&read, &json!({})), Some(Reach::Files));
+    }
+}
+
 /// `raster.project` puts a raster on a grid of another coordinate system, cell size, origin and
 /// extent, or on another raster's grid: grids of the same cell and origin line up, a polygon
 /// layer's selection gives the extent, and bad parameters are refused before anything is made.
@@ -21028,4 +24190,396 @@ fn merge_distinguishes_case_sensitive_file_paths() {
         .collect();
     assert_eq!(coordinates, [1.0, 2.0]);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Exporting to a Shapefile says which field names it changed to fit dBase's 10 bytes, as the
+/// file has them, from a layer read whole or in place; names that fit, and other formats, give no
+/// such notice.
+#[test]
+fn shapefile_exports_say_which_field_names_they_changed() {
+    let dir = std::env::temp_dir().join(format!("rustgis-engine-shp-names-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("sites.geojson");
+    std::fs::write(
+        &src,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"population_2020":1,"Population_2021":2,"id":3},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#,
+    )
+    .unwrap();
+    isolate_plugins();
+    let mut s = Session::new(Project::default());
+    let changed = |s: &Session, mark| -> Vec<String> {
+        s.notices_since(mark).iter().filter(|n| n.text.contains("changed to fit a Shapefile")).map(|n| n.text.clone()).collect()
+    };
+    for stream in [false, true] {
+        let id = s.run("layer.addData", &json!({"path": src, "stream": stream})).unwrap()["layer"].as_u64().unwrap();
+        for ext in ["shp", "zip"] {
+            let out = dir.join(format!("out-{stream}.{ext}")).display().to_string();
+            let mark = s.notice_mark();
+            s.run("share.exportLayer", &json!({"layer": id, "path": out})).unwrap();
+            assert_eq!(
+                changed(&s, mark),
+                [format!(
+                    "{out}: 2 field names were changed to fit a Shapefile (10 bytes at most, unique ignoring case): \
+                     'Population_2021' → 'Population', 'population_2020' → 'populati_1'"
+                )],
+                "stream {stream}, .{ext}"
+            );
+            // The names the notice gives are the file's.
+            let back = s.run("layer.addData", &json!({"path": out})).unwrap()["layer"].as_u64().unwrap() as u32;
+            let names: Vec<&str> = s.map().layer(back).unwrap().dataset.fields.iter().map(|f| f.name.as_str()).collect();
+            // The reader orders the fields by name, capitals first.
+            assert_eq!(names, ["Population", "id", "populati_1"], "stream {stream}, .{ext}");
+        }
+        // Other formats keep the names and say nothing of them.
+        let mark = s.notice_mark();
+        s.run("share.exportLayer", &json!({"layer": id, "path": dir.join(format!("out-{stream}.geojson"))})).unwrap();
+        assert!(changed(&s, mark).is_empty(), "{:?}", s.notices_since(mark));
+    }
+    // Names that fit: no notice.
+    let mut s = world();
+    let mark = s.notice_mark();
+    s.run("share.exportLayer", &json!({"layer": "Countries", "path": dir.join("countries.shp")})).unwrap();
+    assert!(changed(&s, mark).is_empty(), "{:?}", s.notices_since(mark));
+    // A standalone table can hold geometry (a plugin's output table is read from GeoJSON whole,
+    // and a project file keeps a table's geometry), so `share.exportTable` can write a Shapefile
+    // too, and says the same of its names.
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType};
+    use rustgis_geom::Coord;
+    let table = |name: &str, field: &str| {
+        let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new(field, FieldType::Integer)]);
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![rustgis_data::Value::Int(1)]);
+        ds
+    };
+    s.project.add_table(table("Sites", "population_2020"));
+    for ext in ["shp", "zip"] {
+        let out = dir.join(format!("sites.{ext}")).display().to_string();
+        let mark = s.notice_mark();
+        s.run("share.exportTable", &json!({"table": "Sites", "path": out})).unwrap();
+        assert_eq!(
+            changed(&s, mark),
+            [format!(
+                "{out}: 1 field name was changed to fit a Shapefile (10 bytes at most, unique ignoring case): \
+                 'population_2020' → 'population'"
+            )],
+            ".{ext}"
+        );
+        let back = s.run("layer.addData", &json!({"path": out})).unwrap()["layer"].as_u64().unwrap() as u32;
+        let names: Vec<&str> = s.map().layer(back).unwrap().dataset.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["population"], ".{ext}");
+    }
+    // To another format, or with names that fit: no notice.
+    s.project.add_table(table("Fits", "population"));
+    for (table, ext) in [("Sites", "geojson"), ("Fits", "shp")] {
+        let mark = s.notice_mark();
+        s.run("share.exportTable", &json!({"table": table, "path": dir.join(format!("{table}.{ext}"))})).unwrap();
+        assert!(changed(&s, mark).is_empty(), "{table}.{ext}: {:?}", s.notices_since(mark));
+    }
+    // A table without geometry is never a Shapefile: an error, and nothing said of its names.
+    s.run("gp.run", &json!({"tool": "summaryStatistics", "params": {"input": "Countries", "field": "pop_est"}})).unwrap();
+    let stats = s.project.tables.last().unwrap().name.clone();
+    let mark = s.notice_mark();
+    assert!(s.run("share.exportTable", &json!({"table": stats, "path": dir.join("stats.shp")})).is_err());
+    assert!(changed(&s, mark).is_empty(), "{:?}", s.notices_since(mark));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_cancelled_tool_leaves_the_map_as_it_was_and_says_so_in_the_history() {
+    let mut s = world();
+    let layers = s.map().layers.len();
+    let before = serde_json::to_value(&s.map().layers).unwrap();
+    let control = rustgis_analysis::control::Control::new();
+    control.cancel();
+    let params = json!({"input": "Cities", "field": "pop_max", "pixelSize": 5.0});
+    let e = crate::cmd::gp::run_tool_with(&mut s, "idwInterpolation", &params, &control).err().unwrap_or_default();
+    assert!(e.starts_with("IDW Interpolation was cancelled"), "{e}");
+    assert_eq!(s.map().layers.len(), layers, "nothing was added");
+    assert_eq!(serde_json::to_value(&s.map().layers).unwrap(), before, "no layer changed");
+    let last = s.project.gp_history.last().map(|r| (r.ok, r.messages.clone()));
+    assert_eq!(last, Some((false, vec![e])));
+    // Nothing is read for it either: a missing file among its inputs isn't reached.
+    let missing = std::env::temp_dir().join(format!("rustgis-no-such-{}.geojson", std::process::id()));
+    let merge = json!({"inputs": [missing.display().to_string(), "Cities"]});
+    let e = crate::cmd::gp::run_tool_with(&mut s, "merge", &merge, &control).err().unwrap_or_default();
+    assert_eq!(e, "Merge was cancelled before it started");
+    // Not cancelled, the missing file is read, and that is what fails.
+    let e = crate::cmd::gp::run_tool(&mut s, "merge", &merge).err().unwrap_or_default();
+    assert!(e.starts_with(&missing.display().to_string()), "{e}");
+    // The same run, not cancelled, adds its raster.
+    crate::cmd::gp::run_tool(&mut s, "idwInterpolation", &params).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(s.map().layers.len(), layers + 1);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn built_in_tools_run_off_the_session() {
+    use crate::cmd::gp::{tool_abandon, tool_complete, tool_start, tool_waiting};
+    use rustgis_analysis::control::Control;
+    fn sends<T: Send>(_: &T) {}
+    let mut s = world();
+    // Started: what it reads is taken now; it runs elsewhere while the project goes on.
+    let run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 50})).unwrap();
+    assert_eq!(run.tool, "buffer");
+    sends(&run);
+    let id = run.id;
+    assert!(tool_waiting(&s, id));
+    let made = std::thread::spawn(move || run.run(&Control::new()));
+    s.run("layer.remove", &json!({"layer": "Cities"})).unwrap();
+    let done = made.join().unwrap();
+    tool_complete(&mut s, id, done).unwrap();
+    // Applied as gp.run applies a run: its layer, its history, undo.
+    let before = s.map().layers.len();
+    s.run("gp.finish", &json!({"id": id})).unwrap();
+    assert_eq!(s.map().layers.len(), before + 1);
+    let h = s.project.gp_history.last().unwrap();
+    assert!(h.ok && h.tool == "Buffer" && h.params["input"] == "Cities", "{h:?}");
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.map().layers.len(), before);
+    // Cancelled before it starts (a cancel while it runs is the analysis crate's test): it fails,
+    // saying so, and adds nothing (a failed command leaves the project as it was, as a failed
+    // gp.run does).
+    let mut s = world();
+    let layers = s.map().layers.len();
+    let run = tool_start(&mut s, "idwInterpolation", &json!({"input": "Cities", "field": "pop_max", "pixelSize": 5.0})).unwrap();
+    let control = Control::new();
+    control.cancel();
+    let id = run.id;
+    let done = run.run(&control);
+    tool_complete(&mut s, id, done).unwrap();
+    let e = s.run("gp.finish", &json!({"id": id})).unwrap_err();
+    assert_eq!(e, "IDW Interpolation was cancelled before it started");
+    assert_eq!(s.map().layers.len(), layers);
+    // Inputs it can't read fail its run, in the history, rather than its start.
+    let missing = std::env::temp_dir().join(format!("rustgis-no-such-bg-{}.geojson", std::process::id()));
+    let run = tool_start(&mut s, "merge", &json!({"inputs": [missing.display().to_string(), "Cities"]})).unwrap();
+    let id = run.id;
+    let done = run.run(&Control::new());
+    tool_complete(&mut s, id, done).unwrap();
+    let e = s.run("gp.finish", &json!({"id": id})).unwrap_err();
+    assert!(e.starts_with(&missing.display().to_string()), "{e}");
+    // Parameters are checked when it starts; plugin tools start their own way; a run completes once.
+    assert!(tool_start(&mut s, "buffer", &json!({})).err().unwrap().contains("required"));
+    assert!(tool_start(&mut s, "plugin:none/x", &json!({})).err().unwrap().contains("no tool"));
+    let again = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 50})).unwrap();
+    let id = again.id;
+    tool_complete(&mut s, id, again.run(&Control::new())).unwrap();
+    let late = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 50})).unwrap();
+    let done = late.run(&Control::new());
+    assert!(tool_complete(&mut s, id, done).unwrap_err().contains("dropped"), "completed once");
+    s.run("gp.finish", &json!({"id": id})).unwrap();
+    // A run whose map is no longer the active one adds nothing to the one that is, and says so.
+    s.run("map.new", &json!({"name": "Second"})).unwrap();
+    s.project.active_map = 0;
+    let run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 50})).unwrap();
+    s.project.active_map = 1;
+    let layers = s.map().layers.len();
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    let e = s.run("gp.finish", &json!({"id": id})).unwrap_err();
+    assert!(e.contains("no longer the active one"), "{e}");
+    assert_eq!(s.map().layers.len(), layers);
+    // A tool that rewrites its layer applies when the layer is as it read it, and is refused when
+    // it was edited meanwhile, even only in its fields (the rows, however many, aren't compared).
+    let mut s = world();
+    let run = tool_start(&mut s, "calculateGeometry", &json!({"input": "Countries"})).unwrap();
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    s.run("gp.finish", &json!({"id": id})).unwrap();
+    // Renamed meanwhile, the layer it read is updated, under its new name.
+    let run = tool_start(&mut s, "calculateGeometry", &json!({"input": "Countries"})).unwrap();
+    s.run("layer.rename", &json!({"layer": "Countries", "name": "Nations"})).unwrap();
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    s.run("gp.finish", &json!({"id": id})).unwrap();
+    let nations = s.map().layer_by_name("Nations").unwrap();
+    assert_eq!(nations.dataset.name, "Nations");
+    s.run("layer.rename", &json!({"layer": "Nations", "name": "Countries"})).unwrap();
+    let run = tool_start(&mut s, "calculateGeometry", &json!({"input": "Countries"})).unwrap();
+    let countries = s.map_mut().layers.iter_mut().find(|l| l.name == "Countries").unwrap();
+    countries.dataset.fields[0].name = "renamed".into();
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    let e = s.run("gp.finish", &json!({"id": id})).unwrap_err();
+    assert!(e.contains("changed while"), "{e}");
+    // Opening another project drops its runs; one whose thread couldn't start is forgotten.
+    let run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 50})).unwrap();
+    s.run("project.new", &Value::Null).unwrap();
+    assert!(!tool_waiting(&s, run.id));
+    let mut s = world();
+    let run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 50})).unwrap();
+    tool_abandon(&mut s, run.id);
+    assert!(!tool_waiting(&s, run.id));
+}
+
+/// A background selection on a streamed layer renamed while it ran selects the features it chose
+/// where they are in the layer's window; a run whose map moved (one before it was deleted) still
+/// lands on it.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn background_runs_follow_renamed_streamed_layers_and_moved_maps() {
+    use crate::cmd::gp::{tool_complete, tool_start};
+    use rustgis_analysis::control::Control;
+    let path = grid_fgb("bgrenamed", 50);
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap();
+    // Only a corner is in view: the window holds part of the source, in its own order.
+    let v = view_of(&mut s, rustgis_geom::Extent::new(0.0, 0.0, 20.0, 20.0));
+    crate::render::render_png(s.map_mut(), &v).unwrap();
+    assert!(s.map().layers[0].dataset.features.len() < 2500, "only part of the source is in the window");
+    let run = tool_start(&mut s, "selectByAttributes", &json!({"input": "bgrenamed", "where": "x > 0 AND x < 20"})).unwrap();
+    s.run("layer.rename", &json!({"layer": "bgrenamed", "name": "Renamed"})).unwrap();
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    s.run("gp.finish", &json!({"id": id})).unwrap();
+    let l = s.map().layer_by_name("Renamed").unwrap();
+    let x = |f: &rustgis_data::Feature| f.attrs.get(1).and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
+    let mut selected: Vec<u64> = l.selection.iter().map(|&r| l.dataset.features[r].id).collect();
+    let mut expected: Vec<u64> = l.dataset.features.iter().filter(|f| x(f) > 0.0 && x(f) < 20.0).map(|f| f.id).collect();
+    selected.sort_unstable();
+    expected.sort_unstable();
+    assert!(!expected.is_empty() && selected == expected, "{selected:?} vs {expected:?}");
+    // What it selected outside the window isn't selected, and that is said.
+    let said = &s.project.gp_history.last().unwrap().messages;
+    assert!(said.iter().any(|m| m.contains("outside the part of it read for the view")), "{said:?}");
+    let _ = std::fs::remove_file(path);
+    // A map deleted before the run's own map moves it up: the result still lands there.
+    let mut s = world();
+    s.project.maps.insert(0, rustgis_map::Map::new("Before"));
+    s.project.active_map = 1;
+    let layers = s.map().layers.len();
+    let run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 50})).unwrap();
+    s.run("map.remove", &json!({"name": "Before"})).unwrap();
+    assert_eq!(s.project.active_map, 0);
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    s.run("gp.finish", &json!({"id": id})).unwrap();
+    assert_eq!(s.map().layers.len(), layers + 1);
+    // Its map deleted and another given its name, holding a layer of the same id from another
+    // source: that isn't the layer it read, and its selection doesn't land there.
+    let path = grid_fgb("bgother", 5);
+    let mut s = world();
+    s.run("map.new", &json!({"name": "Ran"})).unwrap();
+    s.project.active_map = s.project.maps.iter().position(|m| m.name == "Ran").unwrap();
+    s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true, "name": "Points"})).unwrap();
+    let read_id = s.map().layer_by_name("Points").unwrap().id;
+    let run = tool_start(&mut s, "selectByAttributes", &json!({"input": "Points", "where": "i >= 0"})).unwrap();
+    s.run("map.remove", &json!({"name": "Ran"})).unwrap();
+    s.run("map.new", &json!({"name": "Ran"})).unwrap();
+    s.project.active_map = s.project.maps.iter().position(|m| m.name == "Ran").unwrap();
+    let other = grid_fgb("bgother2", 5);
+    s.run("layer.addData", &json!({"path": other.display().to_string(), "stream": true, "name": "Points"})).unwrap();
+    assert_eq!(s.map().layer_by_name("Points").unwrap().id, read_id, "the same id, on a map of the same name");
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    let e = s.run("gp.finish", &json!({"id": id})).unwrap_err();
+    assert!(e.contains("was deleted or is no longer the active one"), "{e}");
+    assert!(s.map().layer_by_name("Points").unwrap().selection.is_empty());
+    let _ = (std::fs::remove_file(path), std::fs::remove_file(other));
+}
+
+/// A background run's result lands on its map renamed while it ran; its selection of a streamed
+/// layer whose window was read again meanwhile selects the same features, saying how many left
+/// it; and its update of a streamed layer loaded whole and edited meanwhile is refused.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn background_runs_follow_a_renamed_map_a_moved_window_and_a_loaded_layer() {
+    use crate::cmd::gp::{tool_complete, tool_start};
+    use rustgis_analysis::control::Control;
+    let mut s = world();
+    let layers = s.map().layers.len();
+    let run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 50})).unwrap();
+    s.run("map.rename", &json!({"name": "Renamed while it ran"})).unwrap();
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    s.run("gp.finish", &json!({"id": id})).unwrap();
+    assert_eq!(s.map().layers.len(), layers + 1);
+    // Renamed and the rename undone: the same map.
+    let layers = s.map().layers.len();
+    let run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 50})).unwrap();
+    s.run("map.rename", &json!({"name": "Renamed again"})).unwrap();
+    s.run("edit.undo", &Value::Null).unwrap();
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    s.run("gp.finish", &json!({"id": id})).unwrap();
+    assert_eq!(s.map().layers.len(), layers + 1);
+    // Deleted, and another map made with its name: the new layer doesn't land there.
+    s.run("map.new", &json!({"name": "Other"})).unwrap();
+    let ran = s.project.maps[0].name.clone();
+    s.project.active_map = 0;
+    let run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 50})).unwrap();
+    s.run("map.remove", &json!({"name": ran})).unwrap();
+    s.run("map.new", &json!({"name": ran})).unwrap();
+    s.project.active_map = s.project.maps.iter().position(|m| m.name == ran).unwrap();
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    let e = s.run("gp.finish", &json!({"id": id})).unwrap_err();
+    assert!(e.contains("was deleted or is no longer the active one"), "{e}");
+    assert!(s.map().layers.is_empty());
+    // A selection in the window (so the tool reads the window), then the view moves.
+    let path = grid_fgb("bgwindow", 50);
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap();
+    let v = view_of(&mut s, rustgis_geom::Extent::new(0.0, 0.0, 20.0, 20.0));
+    crate::render::render_png(s.map_mut(), &v).unwrap();
+    let ids = |s: &Session| -> Vec<u64> { s.map().layers[0].dataset.features.iter().map(|f| f.id).collect() };
+    let x = |f: &rustgis_data::Feature| f.attrs.get(1).and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
+    let picked: std::collections::HashSet<u64> =
+        s.map().layers[0].dataset.features.iter().filter(|f| x(f) > 0.0 && x(f) < 20.0).map(|f| f.id).collect();
+    let before = ids(&s);
+    let n = before.len();
+    s.map_mut().layers[0].selection = (0..n).collect();
+    let run = tool_start(&mut s, "selectByAttributes", &json!({"input": "bgwindow", "where": "x > 0 AND x < 20"})).unwrap();
+    // The view moved: the window, read again, holds part of what it did, in another order.
+    let l = &mut s.map_mut().layers[0];
+    l.dataset.features = l.dataset.features.iter().rev().filter(|f| f.id % 3 != 0).cloned().collect();
+    l.selection.clear();
+    let after = ids(&s);
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    s.run("gp.finish", &json!({"id": id})).unwrap();
+    let l = &s.map().layers[0];
+    let mut selected: Vec<u64> = l.selection.iter().map(|&r| l.dataset.features[r].id).collect();
+    let mut expected: Vec<u64> = after.iter().copied().filter(|i| picked.contains(i)).collect();
+    selected.sort_unstable();
+    expected.sort_unstable();
+    assert!(!expected.is_empty() && expected.len() < picked.len(), "{} of {}", expected.len(), picked.len());
+    assert_eq!(selected, expected);
+    let said = &s.project.gp_history.last().unwrap().messages;
+    assert!(said.iter().any(|m| m.contains("no longer there")), "{said:?}");
+    // Streamed and read whole, then loaded whole while the tool ran, and one of the features it
+    // selects deleted: its selection, rows of the whole source, lands on the others, and says so.
+    s.map_mut().layers[0].selection.clear();
+    let mut t = Session::new(Project::default());
+    t.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap();
+    let v = view_of(&mut t, rustgis_geom::Extent::new(0.0, 0.0, 20.0, 20.0));
+    crate::render::render_png(t.map_mut(), &v).unwrap();
+    let run = tool_start(&mut t, "selectByAttributes", &json!({"input": "bgwindow", "where": "i < 100"})).unwrap();
+    t.run("layer.loadAll", &json!({"layer": t.map().layers[0].id})).unwrap();
+    // One of the features it selects is deleted meanwhile.
+    let i = |f: &rustgis_data::Feature| f.attrs.first().and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
+    let first = t.map().layers[0].dataset.features.iter().position(|f| i(f) == 0.0).unwrap();
+    t.map_mut().layers[0].selection = vec![first];
+    t.run("edit.enable", &json!({"on": true})).unwrap();
+    t.run("edit.delete", &Value::Null).unwrap();
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut t, id, done).unwrap();
+    t.run("gp.finish", &json!({"id": id})).unwrap();
+    let l = &t.map().layers[0];
+    assert!(!l.is_streamed());
+    assert_eq!(l.selection.len(), 99);
+    assert!(l.selection.iter().all(|&r| i(&l.dataset.features[r]) < 100.0 && i(&l.dataset.features[r]) != 0.0));
+    let said = &t.project.gp_history.last().unwrap().messages;
+    assert!(said.iter().any(|m| m.contains("1 of the features selected in bgwindow were deleted while it ran")), "{said:?}");
+    // Streamed and read whole, then loaded whole and edited while the tool ran: its update
+    // would discard the edit.
+    let run = tool_start(&mut s, "calculateGeometry", &json!({"input": "bgwindow"})).unwrap();
+    s.run("layer.loadAll", &json!({"layer": s.map().layers[0].id})).unwrap();
+    s.run("edit.enable", &json!({"on": true})).unwrap();
+    s.run("edit.setValue", &json!({"layer": "bgwindow", "row": 0, "field": "i", "value": -1})).unwrap();
+    let (id, done) = (run.id, run.run(&Control::new()));
+    tool_complete(&mut s, id, done).unwrap();
+    let e = s.run("gp.finish", &json!({"id": id})).unwrap_err();
+    assert!(e.contains("loaded whole or replaced while"), "{e}");
+    assert!(s.map().layers[0].dataset.features.iter().any(|f| f.attrs.first().and_then(|v| v.as_f64()) == Some(-1.0)));
+    let _ = std::fs::remove_file(path);
 }

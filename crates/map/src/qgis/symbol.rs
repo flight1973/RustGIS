@@ -7,7 +7,8 @@ use roxmltree::Node;
 
 use super::{Report, color, data_defined_on, has_effect, points, prop, props, signed_points};
 use crate::Rgba;
-use crate::fills::{FillLayer, FillPattern};
+use crate::fills::{FillLayer, FillPattern, GradientPoint, GradientShape, Spread, Stop, Stops};
+use crate::symbol_by::SymbolBy;
 use crate::symbology::{
     Dash, Glyph, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_DASH_STEPS, MAX_STROKES, Marker, MarkerRotation, Placements,
     Symbol,
@@ -28,6 +29,8 @@ pub(super) struct Converted {
     pub strokes: Vec<LineStroke>,
     /// A marker symbol turned by a field (its data-defined angle).
     pub rotation: Option<MarkerRotation>,
+    /// Its data-defined size, colours, outline width and angle, as expressions.
+    pub by: SymbolBy,
     /// A fill symbol's stacked fills, bottom first: empty when its one fill is a colour (the
     /// symbol's own), as before patterns were read.
     pub fills: Vec<FillLayer>,
@@ -68,11 +71,19 @@ pub(super) fn read(sym: Node, reference: Option<f64>, turned: bool, layer: &str,
         .take(64)
         .map(|l| (l, settings(l, unit)))
         .collect();
-    // A marker symbol's angle from a field turns the layer's markers; other data-defined settings
-    // are noted.
+    // A marker symbol's angle from a field turns the layer's markers; its size, colours, outline
+    // width and other angles become expressions; other data-defined settings are noted.
     let is_marker = !matches!(sym.attribute("type"), Some("fill") | Some("line"));
     let mut rotation = None;
-    for node in std::iter::once(sym).chain(layers.iter().map(|(l, _)| *l)) {
+    let mut by = SymbolBy::default();
+    // The size (in points) of the layer whose size expression was taken.
+    let mut sized_layer: Option<f32> = None;
+    // How many of its layers are sized by expression.
+    let mut sized_layers = 0;
+    // A marker of several layers draws as marks scaled with its size: the top layer's is read first.
+    let marks = is_marker && layers.len() > 1;
+    let order: Vec<&(Node, Props)> = if marks { layers.iter().rev().collect() } else { layers.iter().collect() };
+    for (node, p) in std::iter::once((sym, None)).chain(order.into_iter().map(|(l, p)| (*l, Some(p.as_slice())))) {
         let active = active_properties(node);
         // A layout `active_properties` doesn't read (QGIS 2's `dd_properties`) is still noted.
         if active.is_empty() && data_defined_on(node) {
@@ -82,9 +93,26 @@ pub(super) fn read(sym: Node, reference: Option<f64>, turned: bool, layer: &str,
             match field_angle(property).filter(|_| is_marker && name == "angle") {
                 Some(r) if rotation.as_ref().is_none_or(|had| *had == r) => rotation = Some(r),
                 Some(_) => report.approximated(layer, "marker layers turned by different fields, all turned by the first"),
+                // A lower layer's size: the marks scale with the top one's.
+                None if marks && name == "size" && by.size.is_some() => sized_layers += usize::from(p.is_some()),
+                None if by_expression(sym.attribute("type"), name, property, p, reference, &mut by, layer, report) => {
+                    // (A size on the symbol itself scales the whole symbol: nothing to turn.)
+                    if name == "size" && p.is_some() {
+                        sized_layers += 1;
+                        sized_layer = p.and_then(|p| size(p, "size", reference, layer, report)).or(Some(2.0 * 96.0 / 25.4));
+                    }
+                    if !(marks && name == "size") && layers.len() > 1 {
+                        report.approximated(layer, "data-defined settings of one symbol layer, applied to the whole symbol");
+                    }
+                }
                 None => report.skipped(layer, "data-defined symbol settings (from fields or expressions)"),
             }
         }
+    }
+    // Each layer sized by expression scales as QGIS scales them together; a layer of a fixed size
+    // scales with the rest.
+    if marks && by.size.is_some() && sized_layers < layers.len() {
+        report.approximated(layer, "the layers of a marker sized by expression, all scaled with its size");
     }
     for (l, _) in &layers {
         if has_effect(*l) {
@@ -97,6 +125,38 @@ pub(super) fn read(sym: Node, reference: Option<f64>, turned: bool, layer: &str,
         _ => marker(&layers, reference, turned && rotation.is_none(), layer, report),
     };
     out.rotation = rotation;
+    let drawn_as_marks = is_marker && !out.strokes.is_empty();
+    // Marks keep their own colours and outlines.
+    if drawn_as_marks && (by.fill.is_some() || by.stroke.is_some() || by.stroke_width.is_some()) {
+        report.skipped(layer, "data-defined colours and outline widths of a marker drawn as marks");
+        (by.fill, by.stroke, by.stroke_width) = (None, None, None);
+    }
+    // A line of stacked strokes draws each with its own colour and width.
+    if sym.attribute("type") == Some("line") && out.stacked() && (by.stroke.is_some() || by.stroke_width.is_some()) {
+        report.skipped(layer, "data-defined colours and widths of a line of several strokes");
+        (by.stroke, by.stroke_width) = (None, None);
+    }
+    // Marks scale with the symbol's size, its largest layer's: the expression, taken from one
+    // layer, is turned into the size it gives that one, so every mark scales as that layer does.
+    if let (true, Some(text), Some(own)) = (drawn_as_marks, by.size.as_ref(), sized_layer.map(|s| s.clamp(0.0, 200.0)))
+        && own > 0.0
+        && out.symbol.size > 0.0
+        && (out.symbol.size / own - 1.0).abs() > 1e-6
+    {
+        let k = (f64::from(out.symbol.size / own)).clamp(1e-3, 1e3);
+        let scaled = format!("({text}) * {}", (k * 1e6).round() / 1e6);
+        if scaled.len() <= rustgis_data::query::MAX_LEN {
+            by.size = Some(scaled);
+        } else {
+            report.skipped(layer, "a data-defined marker size too long to read");
+            by.size = None;
+        }
+    }
+    // (An expression's colour is drawn as it is: the symbol's opacity doesn't fade it.)
+    if alpha < 1.0 && (by.fill.is_some() || by.stroke.is_some()) {
+        report.approximated(layer, "data-defined colours of a see-through symbol, drawn opaque");
+    }
+    out.by = by;
     out.symbol.fill = fade(out.symbol.fill);
     out.symbol.stroke = fade(out.symbol.stroke);
     for s in &mut out.strokes {
@@ -107,8 +167,13 @@ pub(super) fn read(sym: Node, reference: Option<f64>, turned: bool, layer: &str,
     }
     for f in &mut out.fills {
         f.color = f.color.map(fade);
-        if let FillPattern::Dots { outline, .. } = &mut f.pattern {
-            *outline = outline.map(fade);
+        match &mut f.pattern {
+            FillPattern::Dots { outline, .. } => *outline = outline.map(fade),
+            FillPattern::Gradient { color2, stops, .. } | FillPattern::Shapeburst { color2, stops, .. } => {
+                *color2 = fade(*color2);
+                *stops = Stops::new(stops.as_slice().iter().map(|s| Stop { at: s.at, color: fade(s.color) }));
+            }
+            _ => {}
         }
     }
     out
@@ -272,18 +337,16 @@ fn fill(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &
                     width = size(p, "line_width", reference, layer, report).unwrap_or(width);
                 }
             }
-            "GradientFill" | "ShapeburstFill" => {
-                report.approximated(layer, "gradient fills, drawn in their first colour");
-                let c = prop(p, "color").or(prop(p, "color1")).and_then(color);
-                if let Some(c) = c {
-                    stack.push(FillLayer { color: Some(c), pattern: FillPattern::Solid });
-                }
-                fill = c.or(fill);
+            class @ ("GradientFill" | "ShapeburstFill") => {
+                let (first, pattern) = gradient(class == "ShapeburstFill", *l, p, reference, layer, report);
+                stack.push(FillLayer { color: Some(first), pattern });
+                fill = Some(first);
             }
             // Hatch lines: its line's colour and width, its angle and spacing.
             "LinePatternFill" => {
                 let sub = l.children().find(|c| c.has_tag_name("symbol")).map(|s| read(s, reference, false, layer, report));
-                let angle = num(p, "lineangle").unwrap_or(45.0);
+                // QGIS 3 saves it as `angle`, QGIS 2 as `lineangle`.
+                let angle = num(p, "angle").or(num(p, "lineangle")).unwrap_or(45.0);
                 // QGIS's default: 5 mm apart.
                 let spacing = size(p, "distance", reference, layer, report).unwrap_or(5.0 * 96.0 / 25.4);
                 let shift = offset(p, "offset", reference, layer, report).unwrap_or(0.0);
@@ -368,7 +431,117 @@ fn fill(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &
     }
     let symbol =
         Symbol { fill: fill.unwrap_or(none), stroke: stroke.unwrap_or(none), stroke_width: width, size: 0.0, marker: Marker::Circle };
-    Converted { symbol, strokes: Vec::new(), rotation: None, fills: stack }
+    Converted { symbol, strokes: Vec::new(), rotation: None, by: SymbolBy::default(), fills: stack }
+}
+
+/// A gradient fill's (or a shapeburst fill's, `burst`) first colour and the rest of it: its two
+/// colours, or its colour ramp (a gradient's stops; another kind of ramp by its two ends), how
+/// it runs, and for a shapeburst how deep it shades.
+fn gradient(burst: bool, l: Node, p: &Props, reference: Option<f64>, layer: &str, report: &mut Report) -> (Rgba, FillPattern) {
+    let num = |k: &str| prop(p, k).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite());
+    let white = Rgba::rgb(255, 255, 255);
+    // QGIS's defaults: blue to white.
+    let two =
+        (prop(p, "color").and_then(color).unwrap_or(Rgba::rgb(0, 0, 255)), prop(p, "gradient_color2").and_then(color).unwrap_or(white));
+    let (first, color2, stops, discrete) = if prop(p, "color_type") == Some("1") {
+        // The ramp's settings: in a `colorramp` of the layer's own where it has one, else among
+        // the layer's.
+        let ramp = l.children().find(|c| c.has_tag_name("colorramp"));
+        let own = ramp.map(props);
+        let r = own.as_ref().map_or(p, |o| o);
+        let kind = ramp.and_then(|c| c.attribute("type"));
+        // Another kind of ramp is drawn by its two ends alone, its stops left out.
+        let gradient = matches!(prop(r, "rampType").or(kind), None | Some("gradient"));
+        if !gradient {
+            report.approximated(layer, "gradient fills' colour ramps other than gradients, drawn from their first colour to their last");
+        }
+        let stops = if gradient { ramp_stops(prop(r, "stops").unwrap_or_default()) } else { Stops::default() };
+        match (prop(r, "color1").and_then(color), prop(r, "color2").and_then(color)) {
+            (Some(a), Some(b)) => (a, b, stops, gradient && prop(r, "discrete") == Some("1")),
+            _ => (two.0, two.1, Stops::default(), false),
+        }
+    } else {
+        (two.0, two.1, Stops::default(), false)
+    };
+    if prop(p, "offset").is_some_and(|o| o.split(',').any(|v| v.trim().parse::<f64>().is_ok_and(|v| v != 0.0))) {
+        report.approximated(layer, "gradient and shapeburst fills' offsets, left out");
+    }
+    if burst {
+        // QGIS's default: over the whole shape.
+        let distance = (prop(p, "use_whole_shape") == Some("0")).then(|| {
+            let v = prop(p, "max_distance").and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(5.0);
+            points(v, prop(p, "distance_unit").or(prop(p, SYMBOL_UNIT)), reference, layer, report)
+        });
+        let blur = num("blur_radius").map_or(0, |b| b.clamp(0.0, f32::from(crate::fills::MAX_BURST_BLUR)).round() as u8);
+        let ignore_rings = prop(p, "ignore_rings") == Some("1");
+        let pattern = FillPattern::Shapeburst { color2, stops, discrete, distance, blur, ignore_rings };
+        return (first, FillLayer { color: None, pattern }.clamped().pattern);
+    }
+    let point = |k: &str, default: [f32; 2]| {
+        if prop(p, &format!("{k}_iscentroid")) == Some("1") {
+            return GradientPoint::CENTROID;
+        }
+        let xy: Option<Vec<f32>> = prop(p, k).map(|v| v.split(',').filter_map(|c| c.trim().parse::<f32>().ok()).collect());
+        match xy.as_deref() {
+            Some([x, y]) => GradientPoint::At([*x, *y]),
+            _ => GradientPoint::At(default),
+        }
+    };
+    let shape = match prop(p, "type") {
+        Some("1") => GradientShape::Radial,
+        Some("2") => GradientShape::Conical,
+        _ => GradientShape::Linear,
+    };
+    let spread = match prop(p, "spread") {
+        Some("1") => Spread::Reflect,
+        Some("2") => Spread::Repeat,
+        _ => Spread::Pad,
+    };
+    let pattern = FillPattern::Gradient {
+        shape,
+        color2,
+        stops,
+        discrete,
+        from: point("reference_point1", [0.5, 0.0]),
+        to: point("reference_point2", [0.5, 1.0]),
+        spread,
+        angle: num("angle").unwrap_or(0.0),
+        in_view: prop(p, "coordinate_mode") == Some("1"),
+    };
+    (first, FillLayer { color: None, pattern }.clamped().pattern)
+}
+
+/// A QGIS gradient ramp's `stops`: `position;colour` pairs split by colons (a colour may carry
+/// its own colon, in `…,rgb:0.2,0.4,…`, and a stop its colour spec and direction after it).
+fn ramp_stops(stops: &str) -> Stops {
+    // Each stop read as it ends, so only valid ones count towards what a fill keeps (and one
+    // more, to tell it has more), however many entries before them aren't.
+    let parse = |s: &str| {
+        let mut f = s.split(';');
+        let at = f.next()?.trim().parse::<f32>().ok().filter(|a| a.is_finite())?;
+        Some(Stop { at, color: color(f.next()?)? })
+    };
+    let mut valid: Vec<Stop> = Vec::new();
+    let mut current: Option<String> = None;
+    for part in stops.split(':') {
+        // A new stop starts with its position and a semicolon; anything else goes on the last.
+        let starts = part.split_once(';').is_some_and(|(at, _)| at.trim().parse::<f32>().is_ok());
+        match current.as_mut() {
+            Some(last) if !starts => {
+                last.push(':');
+                last.push_str(part);
+            }
+            _ => {
+                valid.extend(current.take().as_deref().and_then(parse));
+                if valid.len() > crate::fills::MAX_STOPS {
+                    break;
+                }
+                current = Some(part.to_string());
+            }
+        }
+    }
+    valid.extend(current.as_deref().and_then(parse));
+    Stops::new(valid)
 }
 
 fn line(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &mut Report) -> Converted {
@@ -424,7 +597,7 @@ fn line(layers: &[(Node, Props)], reference: Option<f64>, layer: &str, report: &
         }
         None => hidden(),
     };
-    Converted { symbol, strokes, rotation: None, fills: Vec::new() }
+    Converted { symbol, strokes, rotation: None, by: SymbolBy::default(), fills: Vec::new() }
 }
 
 /// A marker line (`hash` false) or hashed line as strokes of markers or hash marks along the line:
@@ -447,7 +620,12 @@ fn along(l: Node, p: &[(String, String)], hash: bool, reference: Option<f64>, la
         offset_along: offset(p, "offset_along_line", reference, layer, report).unwrap_or(0.0),
         rotate: prop(p, "rotate") != Some("0"),
         // QGIS's default stretch is 4 mm.
-        average_angle: size(p, "average_angle_length", reference, layer, report).unwrap_or(4.0 * 96.0 / 25.4),
+        // (Its unit is `average_angle_unit`, not the `_length_unit` `size` would look for.)
+        average_angle: prop(p, "average_angle_length")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| points(v, prop(p, "average_angle_unit").or(prop(p, SYMBOL_UNIT)), reference, layer, report))
+            .unwrap_or(4.0 * 96.0 / 25.4),
         ..LineMarkers::default()
     };
     let across = offset(p, "offset", reference, layer, report).unwrap_or(0.0);
@@ -675,7 +853,7 @@ fn marker(layers: &[(Node, Props)], reference: Option<f64>, still: bool, layer: 
         && marks.len() <= 1
         && marks.iter().all(|m| m.offset == 0.0 && m.markers.is_some_and(|k| k.offset_along == 0.0 && k.angle == 0.0));
     let strokes = if alone { Vec::new() } else { marks.into_iter().map(LineStroke::clamped).collect() };
-    Converted { symbol, strokes, rotation: None, fills: Vec::new() }
+    Converted { symbol, strokes, rotation: None, by: SymbolBy::default(), fills: Vec::new() }
 }
 
 /// A point marker layer's offset (`offset`, "x,y" in its unit: right and down) in points, its
@@ -708,7 +886,13 @@ fn point_offset(p: &[(String, String)], size: f32, reference: Option<f64>, layer
 
 /// The data-defined properties switched on in `node`'s own `data_defined_properties`, by name.
 fn active_properties<'a, 'i>(node: Node<'a, 'i>) -> Vec<(&'a str, Node<'a, 'i>)> {
-    let Some(dd) = node.children().find(|c| c.has_tag_name("data_defined_properties")) else { return Vec::new() };
+    active_properties_in(node, "data_defined_properties")
+}
+
+/// The data-defined properties switched on in `node`'s own `tag` (`data_defined_properties` of a
+/// symbol, `dd_properties` of label settings), by name.
+pub(super) fn active_properties_in<'a, 'i>(node: Node<'a, 'i>, tag: &str) -> Vec<(&'a str, Node<'a, 'i>)> {
+    let Some(dd) = node.children().find(|c| c.has_tag_name(tag)) else { return Vec::new() };
     let mut out = Vec::new();
     for props in dd.descendants().filter(|o| o.has_tag_name("Option") && o.attribute("name") == Some("properties")) {
         for p in props.children().filter(|c| c.has_tag_name("Option")).take(64) {
@@ -719,6 +903,61 @@ fn active_properties<'a, 'i>(node: Node<'a, 'i>) -> Vec<(&'a str, Node<'a, 'i>)>
         }
     }
     out
+}
+
+/// A data-defined property's expression: a field's (`type` 2) quoted, or the expression's own
+/// (`type` 3); `None` for a fixed value or text too long to read.
+pub(super) fn property_text(property: Node) -> Option<String> {
+    let named = |name: &str| {
+        property.children().find(|c| c.has_tag_name("Option") && c.attribute("name") == Some(name)).and_then(|o| o.attribute("value"))
+    };
+    let text = match named("type").map(str::trim) {
+        Some("2") => format!("\"{}\"", named("field")?.trim().replace('"', "\"\"")),
+        Some("3") => super::expr::rustgis_scales(named("expression")?.trim()),
+        _ => return None,
+    };
+    Some(text).filter(|t| !t.is_empty() && t != "\"\"" && t.chars().count() <= rustgis_data::query::MAX_LEN - 32)
+}
+
+/// Takes the data-defined property `name` of a symbol layer (its settings `p`) of a `kind`
+/// symbol into `by` when RustGIS draws it by expression: a marker's size and angle, the fill and
+/// outline colours and the outline's (a line's) width, sizes turned from the layer's unit into
+/// points. False for one it doesn't. A second symbol layer's for the same keeps the first's (noted).
+#[allow(clippy::too_many_arguments)]
+fn by_expression(
+    kind: Option<&str>,
+    name: &str,
+    property: Node,
+    p: Option<&[(String, String)]>,
+    reference: Option<f64>,
+    by: &mut SymbolBy,
+    layer: &str,
+    report: &mut Report,
+) -> bool {
+    let (marker, fill, line) = (!matches!(kind, Some("fill" | "line")), kind == Some("fill"), kind == Some("line"));
+    let sized = |key: &str, text: String, report: &mut Report| {
+        let unit = p.and_then(|p| prop(p, &format!("{key}_unit")).or(prop(p, SYMBOL_UNIT)));
+        let k = super::in_points(1.0, unit, reference, layer, report);
+        if (k - 1.0).abs() < 1e-9 || !k.is_finite() { text } else { format!("({text}) * {}", (k * 1e6).round() / 1e6) }
+    };
+    let Some(text) = property_text(property) else { return false };
+    let (slot, text) = match name {
+        "size" if marker => (&mut by.size, sized("size", text, report)),
+        "fillColor" if marker || fill => (&mut by.fill, text),
+        "outlineColor" => (&mut by.stroke, text),
+        "outlineWidth" if line => (&mut by.stroke_width, sized("line_width", text, report)),
+        "outlineWidth" => (&mut by.stroke_width, sized("outline_width", text, report)),
+        "angle" if marker => (&mut by.angle, text),
+        _ => return false,
+    };
+    match slot {
+        Some(had) if *had != text => {
+            report.approximated(layer, "symbol layers with different data-defined settings, drawn with the first's")
+        }
+        Some(_) => {}
+        None => *slot = Some(text),
+    }
+    true
 }
 
 /// A data-defined angle that is a field's value (a field property, or the expression `"field"`,

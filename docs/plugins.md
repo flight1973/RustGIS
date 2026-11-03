@@ -255,20 +255,50 @@ can hide it like any other. Declare it in `plugin.json`:
     {
       "label": "Go To",
       "items": [
-        { "menu": "Continent", "icon": "zoom_world", "help": "Go to a continent.", "items": ["go-africa", "go-europe"] },
+        {
+          "menu": "Continent",
+          "icon": "zoom_world",
+          "help": "Go to a continent.",
+          "layout": "small",
+          "items": [
+            "go-africa",
+            { "menu": "Europe", "items": ["go-europe", "go-france"] }
+          ]
+        },
         "random-place"
       ]
     },
-    { "label": "Inspect", "items": ["layer-report", "tool:field-summary"] }
+    {
+      "label": "Inspect",
+      "layout": "small",
+      "items": [
+        "layer-report",
+        "tool:field-summary",
+        { "menu": "More", "items": ["feature-report", "tool:statistics"] },
+        { "menu": "Overview", "layout": "large", "items": ["map-report"] }
+      ]
+    }
   ]
 }
 ```
 
 - `items` lists the buttons. An item is a command id, `tool:<id>` (which opens that tool in the
   Tools pane), `panel` (which opens the plugin's [panel](#a-panel)), or a dropdown `menu` whose
-  `items` are any of those.
-- A tab has 1 to 8 groups, a group has 1 to 16 items, and a menu has 1 to 32 entries. Every
-  entry must name one of the plugin's own commands or tools, or its panel.
+  `items` may also contain nested menus.
+- A group's `layout` is `"large"` by default: full-height ribbon buttons, as in existing
+  manifests. Use `"layout": "small"` for compact controls, stacked three per column.
+  A menu's optional `layout` overrides its ribbon trigger's size; when omitted (or `null`),
+  it inherits the group's layout. Consecutive small controls share three-row columns,
+  including small menu triggers in a large group. A large trigger starts a new column.
+  Column widths follow the translated labels; manifests neither need nor support pixel widths.
+  Layout affects ribbon triggers only: all entries and nested submenu triggers inside a
+  popup remain standard menu rows, regardless of any nested `layout`.
+  Popup labels stay on one line: line breaks in labels or their translations become spaces.
+- A tab has 1 to 8 groups. A large group has 1 to 16 direct items; a small group has 1 to 48.
+  Each menu has 1 to 32 direct items. Menus may nest up to 4 levels, counting the outer menu
+  as level 1. Across the entire tab there may be at most 16,384 items, counting every
+  command/tool/panel entry and every menu at every level. Every entry must name one of the
+  plugin's own commands or tools, or its panel.
 - The label is one line of 1 to 32 characters and can't be the name of one of RustGIS's tabs
   (Home, Data, Style, Analyze, Plugins…), including their older names. The `i18n` translations
   apply to the tab, group and menu labels too.
@@ -278,8 +308,8 @@ an example.
 
 ### A panel
 
-A plugin can have a panel: a pane on the right of the map with texts, checkboxes, sliders and
-buttons bound to its commands. Declare it in `plugin.json`:
+A plugin can have a panel: a pane on the right of the map with texts, checkboxes, sliders,
+buttons and trees bound to its commands. Declare it in `plugin.json`:
 
 ```json
 "panel": {
@@ -311,9 +341,14 @@ buttons bound to its commands. Declare it in `plugin.json`:
       to `0`; `default` is `min` unless given), with a caption, the value's label, and its two
       ends' labels. `steps: true` adds ‹ and › buttons that move it by one.
     - `button`: runs its `command`; its `label` is the command's unless given.
-- A checkbox runs its `command` when it changes, and a slider when it is let go, or stepped:
-  never while it is dragged, while the pane shows the label of the value it would take. Without
-  a `command`, a widget's value just goes with the plugin's next request.
+    - `tree`: nodes the plugin gives (themes, their datasets, say), each branch opened or closed
+      with its triangle or a double click. `search: true` adds a box above it that keeps the
+      nodes whose label holds every word typed (case and accents aside), with the branches
+      above them open; a branch found with nothing found below it opens to all its children.
+- A checkbox runs its `command` when it changes, a slider when it is let go, or stepped
+  (never while it is dragged, while the pane shows the label of the value it would take), and a
+  tree when a node is chosen. Without a `command`, a widget's value just goes with the plugin's
+  next request.
 - `state` (optional) is a command RustGIS runs each time the panel is opened, to answer its
   state.
 - Every `command` reference, including `state`, must name one of the plugin's own commands.
@@ -328,10 +363,11 @@ button, a script or the command line):
 "panel": { "values": { "local": false, "release": 196 }, "changed": ["release"] }
 ```
 
-`values` has each checkbox (`true` or `false`) and slider (a whole number), and `changed` the
-ones this call set: the widget the user just moved. A widget's command is run with
-`{"panel": {"release": 196}}` as its parameters, which sets the values before the call and is
-taken out of the request's `params`, so a script or `rustgis-cli` can do the same:
+`values` has each checkbox (`true` or `false`), slider (a whole number) and tree (the chosen
+node's id, or `null`), and `changed` the ones this call set: the widget the user just moved. A
+widget's command is run with `{"panel": {"release": 196}}` as its parameters, which sets the
+values before the call and is taken out of the request's `params`, so a script or `rustgis-cli`
+can do the same:
 
 ```sh
 rustgis-cli run --sample --cmd 'plugin:historical-imagery/go-to-release={"panel": {"release": 40}}'
@@ -355,10 +391,17 @@ Any command can answer the panel's new state, beside the rest of its answer:
 
 - An item can set `label` (`null` brings back the declared one), `enabled` and `visible`; a text
   its `text`; a slider its `min`, `max` and `labels`, one per value from `min` (the numbers when
-  there are none). What an answer leaves out stays as it was.
+  there are none); a tree its `nodes`. What an answer leaves out stays as it was.
+- A tree's `nodes` are `[{"id": "env", "label": "Environment", "count": 67, "children": [...]}]`:
+  `id` is the value the node gives when chosen, unique in the tree; `label` defaults to the id;
+  `count` (a whole number) shows at the right of the row. The nodes come before the values in an
+  answer, so one can give a tree and choose a node of it; a chosen node no longer among them
+  leaves nothing chosen.
 - RustGIS checks the answer like any other: unknown ids and fields and values of the wrong type
-  are ignored, a slider's value stays within its ends, texts are clipped to 4,000 characters,
-  labels to 200, and a slider has at most 2,000 labels of 80 characters.
+  are ignored, a slider's value stays within its ends and a tree's among its nodes, texts are
+  clipped to 4,000 characters, labels to 200, and a slider has at most 2,000 labels of 80
+  characters. A tree holds at most 5,000 nodes, 8 levels deep; a node without an id, or with one
+  longer than 200 characters or taken already, is left out with its children.
 - A plugin words what it sets in the request's `lang`; RustGIS translates only what the
   manifest declares.
 - A command that fails leaves the values as they were. The panel's state command is no undo
@@ -391,11 +434,16 @@ Inside a request, `host::call(op, params)` sends one of these to RustGIS:
 | `map.addTiles` `{url, kind?, name?, attribution?, maxZoom?, overlay?, replace?, blend?, …}` | adds a tile layer (`edit` and `network`); accepts the built-in command's parameters |
 | any command id (`layer.zoomTo`, `select.byAttributes`, `layer.symbology`…) | what the command returns, within the plugin's permissions |
 
-In the web app a command can't wait for a download, so where `layer.addUrl` has to download a
-file whole it answers `{"pending": true, "url": …}` there: RustGIS downloads the data off the
-frame and adds the layer when it lands, as **Home › Add › Add Data › From URL** does. A PMTiles
-archive, a cloud-optimised GeoTIFF or a FlatGeobuf or GeoParquet read in place is added at once,
-as elsewhere.
+In the apps a plugin's command (from the ribbon, command search or a panel's widget; not its
+panel's state command) doesn't wait for a download, so where `layer.addUrl` has to
+download a file whole it answers `{"pending": true, "url": …}`: RustGIS downloads the data off the
+frame, saying so in the status bar, and adds the layer when it lands (its own undo step), as
+**Home › Add › Add Data › From URL** does. On the desktop that goes for reading a GeoTIFF's,
+FlatGeobuf's or GeoParquet's header too; in the web app a PMTiles archive, a cloud-optimised
+GeoTIFF or a FlatGeobuf or GeoParquet whose header was fetched already is added at once. Up to 16
+downloads wait at a time: a request past 16 fails, and if the command then fails too, none of its
+downloads start. Run by
+`rustgis-cli`, a script or a task, the command waits and answers what was added.
 
 `rustgis-cli commands` lists every command id and its parameters.
 

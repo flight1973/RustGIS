@@ -32,7 +32,7 @@ pub fn commands() -> Vec<C> {
             .view()
             .params(r#"{"id": plugin id, "url"?: registry.json}"#),
         C::new("plugin.panel", "Plugin Panel State", "Plugins", panel).view().params(
-            r#"{"id": plugin id, "values"?: {widget id: true/false or a whole number}, "refresh"?: bool (run the panel's state command)}"#,
+            r#"{"id": plugin id, "values"?: {widget id: true/false, a whole number, or a tree node's id (null for none)}, "refresh"?: bool (run the panel's state command)}"#,
         ),
         C::new("plugin.prepare", "Prepare Plugin Environment", "Plugins › Manage", prepare)
             .view()
@@ -290,6 +290,9 @@ const NEVER: &[&str] = &[
     "s3.disconnect",
     "earthdata.login",
     "earthdata.logout",
+    // The session log records what was done (#797): a plugin never empties it or turns it off.
+    "project.clearLog",
+    "project.logCommands",
     "pg.connect",
     "pg.disconnect",
     // Writes to a database: the user's to do, asked each time.
@@ -297,15 +300,16 @@ const NEVER: &[&str] = &[
     "gpkg.saveEdits",
 ];
 
-/// Commands that write files without naming one in their parameters.
-const WRITES_FILES: &[&str] = &["project.save", "project.saveAs"];
+/// Commands that write files without naming one in their parameters, or read what the user's
+/// commands named (the session log's paths, addresses and SQL).
+const REACHES_FILES: &[&str] = &["project.save", "project.saveAs", "project.log"];
 
 /// Commands that read a file a layer names, not their parameters.
 const READS_FILES: &[&str] = &["gpkg.discardEdits"];
 
 /// Parameter keys that name a file, folder or address. (`data` and `text` carry content, which
 /// plugins may pass: `layer.addDataBytes`, `map.import` from text.)
-const PLACE_KEYS: &[&str] = &["path", "folder", "dir", "file", "url", "uri", "source", "output", "connection", "database"];
+pub(crate) const PLACE_KEYS: &[&str] = &["path", "folder", "dir", "file", "url", "uri", "source", "output", "connection", "database"];
 
 /// The command running an SQL query through DuckDB, which can read any file and web address.
 pub const SQL: &str = "layer.addSql";
@@ -346,7 +350,9 @@ pub fn user_only(id: &str) -> bool {
 }
 
 /// What running `spec` with `params` reaches beyond the project, if anything: by what the
-/// parameters name, what the command's parameters can name, and what it is.
+/// parameters name, what the command's parameters can name, and what it is. Without the session,
+/// it counts every `raster.mosaic` as reaching files; `refused` lets a plugin's mosaic of the
+/// project's layers through.
 pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     // External tools (the GeoLibre suite) run a native program that reads files a parameter
     // names, including bare file names.
@@ -381,16 +387,18 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     if spec.id == "raster.georeference" || spec.id == "raster.project" {
         return super::items::names_place(params, PLACE_KEYS, 0).then_some(Reach::Files);
     }
-    let files = super::items::names_place(params, PLACE_KEYS, 0)
+    // A built-in tool's output layer name stays in the session, as it does in a task.
+    let params = super::items::layer_name_left_out(spec.id, params);
+    let files = super::items::names_place(&params, PLACE_KEYS, 0)
         || PLACE_KEYS.iter().any(|k| spec.params.contains(&format!("\"{k}\"")))
-        || WRITES_FILES.contains(&spec.id)
+        || REACHES_FILES.contains(&spec.id)
         || READS_FILES.contains(&spec.id)
         || ["share.", "offline.", "cache.", "notebook."].iter().any(|p| spec.id.starts_with(p));
     files.then_some(Reach::Files)
 }
 
-/// Why a plugin may not run `id` with `params`, if it may not.
-fn refused(plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
+/// Why a plugin may not run `id` with `params` on the session `s`, if it may not.
+fn refused(s: &Session, plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
     let m = &plugin.manifest;
     if user_only(spec.id) {
         return Some(format!("plugins can't run '{}'", spec.id));
@@ -400,7 +408,11 @@ fn refused(plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
     if database && !(m.has(Permission::Files) && m.has(Permission::Network)) {
         return Some(format!("{} needs the 'files' and 'network' permissions to run '{}'", m.name, spec.id));
     }
-    match reaches(spec, params) {
+    // A mosaic writes a file only when given a `path`, and reads one for an input that is a raster
+    // file name and isn't a raster layer with its cells in memory; a mosaic of the project's layers
+    // stays in it, as `raster.project` does.
+    let reach = reaches(spec, params).filter(|_| !(spec.id == "raster.mosaic" && super::imagery::mosaic_stays_in_project(s, params)));
+    match reach {
         Some(Reach::Files)
             if spec.id == "gp.run"
                 && !m.has(Permission::Files)
@@ -431,6 +443,8 @@ struct Bridge<'a> {
     fetches: fetch::Calls,
     /// Whether a request could have changed the project (a command that mutates, a layer added).
     changed: bool,
+    /// Whether a command left a request for the front end instead ([`Session::request_url`]).
+    requested: bool,
 }
 
 impl Bridge<'_> {
@@ -479,6 +493,7 @@ impl Bridge<'_> {
             source: None,
             crs: None,
             crs_incomplete: false,
+            zm_dropped: false,
             windowed: false,
         };
         let mut gj = rustgis_data::io::to_geojson(&ds);
@@ -508,11 +523,10 @@ impl Bridge<'_> {
             return Err("plugins can't run other plugins' commands".into());
         }
         let spec = self.s.registry.get(id).ok_or_else(|| format!("unknown command '{id}'"))?;
-        if let Some(why) = refused(&self.plugin, spec, params) {
+        if let Some(why) = refused(self.s, &self.plugin, spec, params) {
             return Err(why);
         }
-        let (enabled, run, label) = (spec.enabled, spec.run, spec.label);
-        self.changed |= spec.mutates;
+        let (enabled, run, label, mutates) = (spec.enabled, spec.run, spec.label, spec.mutates);
         let named = params.get("layer").and_then(|_| self.s.layer_id(params).ok());
         let active = self.s.active_layer;
         if named.is_some() {
@@ -532,9 +546,15 @@ impl Bridge<'_> {
         let tile_sources =
             |s: &Session| -> std::collections::HashSet<_> { s.project.maps.iter().flat_map(|m| &m.tiles).map(fetched).collect() };
         let before = (!self.plugin.manifest.has(Permission::Network)).then(|| tile_sources(self.s));
-        // The plugin command took the undo snapshot: the commands it runs are part of it.
+        // The plugin command took the undo snapshot: the commands it runs are part of it. A
+        // command that only left a request for the front end ([`Session::request_url`]) changed
+        // nothing; a later one must not erase the undo step for an earlier edit.
+        self.s.request_only = false;
         let mut res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self.s, params)))
             .unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")));
+        let requested = std::mem::take(&mut self.s.request_only);
+        self.requested |= requested;
+        self.changed |= mutates && !requested;
         if let Some(before) = before {
             let mut dropped = false;
             for m in &mut self.s.project.maps {
@@ -628,7 +648,7 @@ impl Session {
         let mut pending = Vec::new();
         let res = self.guarded(label, mutates, |s| {
             let fetches = fetch::Calls::for_plugin(&plugin.manifest.id);
-            let mut bridge = Bridge { s, plugin, fetches, changed: false };
+            let mut bridge = Bridge { s, plugin, fetches, changed: false, requested: false };
             let res = rustgis_plugins::run_command_with_panel(&cmd, &mut bridge, params, request);
             if !bridge.fetches.pending.is_empty() {
                 // Waiting for a fetch (the browser): whatever the call did is undone, quietly,
@@ -637,9 +657,9 @@ impl Session {
                 bridge.s.quiet_failure = true;
                 return Err(String::new());
             }
-            if res.is_ok() && state_command && !bridge.changed {
-                bridge.s.request_only = true;
-            }
+            // Nor is a command that only left downloads for the front end: they add their
+            // layers, each its own undo step, when they land.
+            bridge.s.request_only = res.is_ok() && (state_command || bridge.requested) && !bridge.changed;
             res
         });
         if let Some(decl) = &panel {
@@ -687,5 +707,31 @@ impl Session {
             *state = rustgis_plugins::PanelState::new(decl);
         }
         state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A command that only left a download for the front end changed nothing, and a later one
+    /// doesn't hide an earlier edit: the plugin's command keeps its undo step.
+    #[test]
+    fn a_request_after_an_edit_keeps_the_edit() {
+        let pkg = rustgis_plugins::Package::from_zip(&rustgis_plugins::testing::package("eng-bridge", &["edit", "network"])).unwrap();
+        rustgis_plugins::load(pkg, "test").unwrap();
+        let plugin = rustgis_plugins::get("eng-bridge").unwrap();
+        let mut s = Session::new(crate::Project::default());
+        s.leave_downloads = true;
+        let fetches = fetch::Calls::for_plugin("eng-bridge");
+        let mut bridge = Bridge { s: &mut s, plugin, fetches, changed: false, requested: false };
+        bridge.call("layer.addUrl", &json!({"url": "https://x.org/a.geojson"})).unwrap();
+        assert!(bridge.requested && !bridge.changed, "a request alone changes nothing");
+        bridge.call("map.new", &json!({"name": "B"})).unwrap();
+        bridge.call("layer.addUrl", &json!({"url": "https://x.org/b.geojson"})).unwrap();
+        assert!(bridge.requested && bridge.changed, "the edit is still one");
+        assert!(!bridge.s.request_only, "the bridge took the flag");
+        assert_eq!(s.take_url_requests().len(), 2);
+        rustgis_plugins::unload("eng-bridge");
     }
 }

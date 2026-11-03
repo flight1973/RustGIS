@@ -524,6 +524,25 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.rect(3.0, 3.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
             p.rect(9.0, 9.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
         }
+        "symDiff" => {
+            // Both squares kept but their shared part, left empty.
+            p.rect(3.0, 3.0, 12.0, 12.0, Some(accent), None, 0.0);
+            p.rect(9.0, 9.0, 12.0, 12.0, Some(accent), None, 0.0);
+            p.rect(9.0, 9.0, 6.0, 6.0, Some(p.paper()), None, 0.0);
+            p.rect(3.0, 3.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
+            p.rect(9.0, 9.0, 12.0, 12.0, None, Some((1.3, ink)), 0.0);
+        }
+        "updatePolygons" => {
+            // The input's square, the update's square laid over it whole.
+            p.rect(3.0, 3.0, 12.0, 12.0, Some(p.tint(60)), Some((1.3, ink)), 0.0);
+            p.rect(9.0, 9.0, 12.0, 12.0, Some(accent), Some((1.3, ink)), 0.0);
+        }
+        "split" => {
+            // One shape cut in two along a line, its halves apart.
+            p.polygon_shape(&[(2.0, 5.0), (10.5, 3.0), (10.5, 20.0), (4.0, 18.0)], 110);
+            p.polygon_shape(&[(13.5, 3.0), (22.0, 6.0), (20.0, 19.0), (13.5, 20.0)], 60);
+            p.line(&[(12.0, 1.0), (12.0, 23.0)], 1.3, red);
+        }
         "near" => {
             // A point, and the shortest line from it to a polygon.
             p.polygon_shape(&[(12.0, 3.0), (21.0, 4.0), (20.0, 12.0), (13.0, 11.0)], 60);
@@ -1234,6 +1253,9 @@ pub const ALL: &[&str] = &[
     "intersect",
     "identity",
     "union",
+    "symDiff",
+    "updatePolygons",
+    "split",
     "near",
     "dissolve",
     "hull",

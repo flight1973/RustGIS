@@ -132,8 +132,11 @@ pub fn commands() -> Vec<C> {
         C::new("labels.placement", "Label Placement", "Labeling › Label Placement", |s, p| {
             let pos = match ps(p, "position") {
                 Some(code) => Some(LabelPlacement::from_code(code).ok_or_else(|| format!("unknown placement '{code}'"))?),
-                None if p.get("offset").is_some() || p.get("repeat").is_some() => None,
-                None => return Err("position is required (or an offset or a repeat)".into()),
+                // A position that isn't a placement name is refused, not dropped for the others (null:
+                // none, as for the other keys).
+                None if p.get("position").is_some_and(|v| !v.is_null()) => return Err("position must be a placement name".into()),
+                None if ["offset", "repeat", "otherPositions"].iter().any(|k| p.get(k).is_some()) => None,
+                None => return Err("position is required (or an offset, a repeat or otherPositions)".into()),
             };
             let offset = match p.get("offset") {
                 None => None,
@@ -149,9 +152,23 @@ pub fn commands() -> Vec<C> {
                     _ => return Err("repeat must be a number of points, or 0 or null for none".into()),
                 },
             };
+            // A point's label tries the other places round it when its own is taken (#1011).
+            let others = match p.get("otherPositions") {
+                None => None,
+                Some(Value::Bool(on)) => Some(*on),
+                Some(_) => return Err("otherPositions must be true or false".into()),
+            };
+            // Only a point's label goes round it: on elsewhere it would do nothing (off is taken
+            // anywhere). `layer_id` refuses a missing layer.
+            if others == Some(true) && s.map().layer(s.layer_id(p)?).is_some_and(|l| l.geometry_type() != GeometryType::Point) {
+                return Err("otherPositions is for point layers".into());
+            }
             with_class(s, p, |c| {
                 if let Some(pos) = pos {
                     c.placement = pos;
+                }
+                if let Some(on) = others {
+                    c.other_positions = on;
                 }
                 if let Some(o) = offset {
                     c.offset = o;
@@ -163,7 +180,7 @@ pub fn commands() -> Vec<C> {
         })
         .when(need_feature_layer)
         .params(
-            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset or repeat), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only)}"#,
+            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset, repeat or otherPositions), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only), "otherPositions"?: bool (a point's label whose place is taken tries the others round the point, corners first; point layers only: true is refused on lines and polygons)}"#,
         ),
         // Label classes: each labels every feature its clause takes, as in ArcGIS Pro; the classes
         // listed first, Default last, are placed first (`Labeling`, #732).
@@ -231,7 +248,55 @@ pub fn commands() -> Vec<C> {
         })
         .when(need_feature_layer)
         .params(r#"{"layer"?, "class": name (not Default), "to": number (its place among the classes listed before Default, 0 first: placed first when labels compete for room)}"#),
+        C::new("labels.by", "Labels by Expression", "View › Windows › Labeling", labels_by)
+            .when(need_feature_layer)
+            .params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "text"?: expression|null (each label's text, in place of the class's field; a feature it gives null or blanks for isn't labelled), "size"?: expression|null (the text's size in points, 4 to 72), "color"?: expression|null (the text's colour: '#RRGGBB', a CSS colour name or 'r,g,b[,a]' as color_rgb gives it), "angle"?: expression|null (a point's or polygon's label turned by it, in degrees clockwise; labels along lines keep the line's)} (each expression in the language of queries, per feature, @map_scale the map's scale; a key left out keeps its expression, null or "" removes it; where a size, color or angle expression gives null the class's own setting is used)"#),
     ]
+}
+
+/// `labels.by`: sets a label class's expressions, each checked against the layer's fields.
+fn labels_by(s: &mut Session, p: &Value) -> CmdResult {
+    const KEYS: [&str; 4] = ["text", "size", "color", "angle"];
+    let id = s.layer_id(p)?;
+    let l = s.map().layer(id).ok_or("no such layer")?;
+    let mut changes: Vec<(&str, Option<String>)> = Vec::new();
+    for key in KEYS {
+        let text = match p.get(key) {
+            None => continue,
+            Some(Value::Null) => None,
+            Some(Value::String(t)) if t.trim().is_empty() => None,
+            Some(Value::String(t)) => Some(t.clone()),
+            Some(_) => return Err(format!("{key} is an expression's text, or null for none")),
+        };
+        if let Some(t) = &text {
+            rustgis_data::query::parse(t, &l.dataset).map_err(|e| format!("{key}: {e}"))?;
+        }
+        changes.push((key, text));
+    }
+    if changes.is_empty() {
+        return Err("give text, size, color or angle: an expression, or null for none".into());
+    }
+    let mut by = None;
+    with_labels(s, p, |labels| {
+        let c = class_in(labels, p)?;
+        for (key, text) in changes {
+            let slot = match key {
+                "text" => &mut c.by.text,
+                "size" => &mut c.by.size,
+                "color" => &mut c.by.color,
+                _ => &mut c.by.angle,
+            };
+            *slot = text;
+        }
+        by = Some(c.by.clone());
+        // Labels by a text expression need no field, but labels must be on to show.
+        if c.by.text.is_some() {
+            labels.enabled = true;
+        }
+        Ok(())
+    })?;
+    let by = by.unwrap_or_default();
+    Ok(json!({"text": by.text, "size": by.size, "color": by.color, "angle": by.angle}))
 }
 
 /// Changes the label class `p` names (`"class"`; Default when none) of the layer it names.
@@ -267,7 +332,7 @@ pub(crate) fn with_labels(s: &mut Session, p: &Value, f: impl FnOnce(&mut Labeli
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     let mut labels = l.labels.clone();
     f(&mut labels)?;
-    let relock = !same_class_list(&l.labels, &labels);
+    let relock = !lock_holds(&l.labels, &labels);
     l.labels = labels;
     if relock {
         s.map_mut().label_lock = None;
@@ -280,6 +345,21 @@ pub(crate) fn with_labels(s: &mut Session, p: &Value, f: impl FnOnce(&mut Labeli
 /// where they are placed next (`Map::label_lock` emptied, #732).
 pub(crate) fn same_class_list(a: &Labeling, b: &Labeling) -> bool {
     a.classes.iter().map(|c| &c.name).eq(b.classes.iter().map(|c| &c.name))
+}
+
+/// Whether a lock taken with the labels `a` still names those of `b`: the same classes, listed
+/// alike and putting their point labels in the same places.
+pub(crate) fn lock_holds(a: &Labeling, b: &Labeling) -> bool {
+    same_class_list(a, b) && same_places(a, b)
+}
+
+/// Whether the classes of `a` and `b` (listed alike) put their point labels in the same places.
+/// A lock names the place round its point a label took by its number among its class's (#1011),
+/// so another position, or trying the others turned on or off, locks the labels again; with no
+/// class trying them a new position keeps the lock, as before.
+fn same_places(a: &Labeling, b: &Labeling) -> bool {
+    let classes = |l: &Labeling| l.classes.iter().chain([&l.default]).map(|c| (c.placement, c.other_positions)).collect::<Vec<_>>();
+    classes(a).into_iter().zip(classes(b)).all(|(x, y)| x == y || !(x.1 || y.1))
 }
 
 /// The place of the class named `name` among those checked before Default (of the
@@ -401,17 +481,40 @@ fn distance_range(s: &mut Session, p: &Value) -> CmdResult {
 /// own labels turn off.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
+    let scale = s.map().scale();
     let l = s.map().layer(id).ok_or("no such layer")?;
     let fields: Vec<Option<usize>> = l.labels.in_order().map(|c| l.dataset.field_index(&c.field)).collect();
-    if fields.iter().all(Option::is_none) {
+    // Its classes' expressions, as the map draws them now (at its scale).
+    let exprs: Vec<Option<rustgis_map::label_by::LabelExprs>> =
+        l.labels.in_order().map(|c| rustgis_map::label_by::LabelExprs::new(&c.by, &l.dataset, Some(scale))).collect();
+    // A line's labels along it keep the line's angle, not the expression's, as the map draws
+    // them: decided for each feature by its geometry.
+    let along = |c: &LabelClass, g: Option<&Geometry>| c.placement.along_line() && matches!(g, Some(Geometry::Line(_)));
+    let only_lines = !l.has_geometry(GeometryType::Point) && !l.has_geometry(GeometryType::Polygon);
+    let by_text = |i: usize| exprs.get(i).and_then(Option::as_ref).filter(|e| e.has_text());
+    if fields.iter().all(Option::is_none) && (0..fields.len()).all(|i| by_text(i).is_none()) {
         return Err("the layer has no label field".into());
     }
     let classes = !l.labels.classes.is_empty();
     let rows = l.visible_rows();
-    let matcher = LabelMatcher::new(&l.labels, &l.dataset);
+    let matcher = LabelMatcher::new(&l.labels, &l.dataset, Some(scale));
     let mut out_fields = vec![Field::new("TEXT", FieldType::Text)];
     if classes {
         out_fields.push(Field::new("CLASS", FieldType::Text));
+    }
+    // Each label's size, colour and angle by expression kept as fields the annotation's classes
+    // draw by, when a class has them.
+    let kept = |pick: fn(&rustgis_map::label_by::LabelBy) -> bool| l.labels.in_order().any(|c| c.visible && pick(&c.by));
+    let (by_size, by_color) = (kept(|b| b.size.is_some()), kept(|b| b.color.is_some()));
+    let by_angle = l.labels.in_order().any(|c| c.visible && c.by.angle.is_some() && !(only_lines && c.placement.along_line()));
+    // Texts cut to their most characters, said once.
+    let mut cut = 0usize;
+    for (on, name, kind) in
+        [(by_size, "SIZE", FieldType::Double), (by_color, "COLOR", FieldType::Text), (by_angle, "ANGLE", FieldType::Double)]
+    {
+        if on {
+            out_fields.push(Field::new(name, kind));
+        }
     }
     let mut ds = Dataset::new(
         ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| format!("{} Annotation", l.name)),
@@ -424,14 +527,37 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         }
         let Some(at) = ft.geometry.as_ref().and_then(Geometry::label_point) else { continue };
         for (i, class) in matcher.classes_of(&l.dataset, row).filter(|(_, c)| c.visible) {
-            let Some(fi) = fields.get(i).copied().flatten() else { continue };
-            let v = l.dataset.value(row, fi);
-            if v.is_null() {
-                continue;
-            }
-            let mut attrs = vec![Attr::Text(v.to_string())];
+            let text = match by_text(i).and_then(|e| e.text_cut(&l.dataset, row)) {
+                Some(Some((t, was_cut))) => {
+                    cut += usize::from(was_cut);
+                    t
+                }
+                Some(None) => continue,
+                None => {
+                    let Some(fi) = fields.get(i).copied().flatten() else { continue };
+                    let v = l.dataset.value(row, fi);
+                    if v.is_null() {
+                        continue;
+                    }
+                    v.to_string()
+                }
+            };
+            let mut attrs = vec![Attr::Text(text)];
             if classes {
                 attrs.push(Attr::Text(class.name.clone()));
+            }
+            let e = exprs.get(i).and_then(Option::as_ref);
+            let number = |v: Option<f32>| v.map_or(Attr::Null, |v| Attr::Float(f64::from(v)));
+            if by_size {
+                attrs.push(number(e.and_then(|e| e.size(&l.dataset, row))));
+            }
+            if by_color {
+                let c = e.and_then(|e| e.color(&l.dataset, row));
+                attrs.push(c.map_or(Attr::Null, |c| Attr::Text(format!("{},{},{},{}", c.r(), c.g(), c.b(), c.a()))));
+            }
+            if by_angle {
+                let turns = class.by.angle.is_some() && !along(class, ft.geometry.as_ref());
+                attrs.push(number(e.filter(|_| turns).and_then(|e| e.angle(&l.dataset, row))));
             }
             ds.push(Some(Geometry::Point(at)), attrs);
         }
@@ -440,16 +566,34 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         return Err("the layer has no labels to convert".into());
     }
     let n = ds.features.len();
+    let cut_note = (cut > 0).then(|| {
+        format!(
+            "{}: {cut} label text{} cut to {} characters",
+            ds.name,
+            if cut == 1 { "" } else { "s" },
+            rustgis_map::label_by::MAX_LABEL_TEXT
+        )
+    });
     let mut labels = l.labels.clone();
     labels.enabled = true;
     // The classes that count, as for the layer's own labels.
     labels.classes.truncate(MAX_LABEL_CLASSES);
     for c in std::iter::once(&mut labels.default).chain(labels.classes.iter_mut()) {
         c.field = "TEXT".into();
+        // On its point, never round it: an annotation stays where it is (#1011).
         c.placement = LabelPlacement::Center;
+        c.other_positions = false;
         // Each class picks the points it labelled, Default too once there are others (#732):
         // with no clause it would label theirs as well.
         c.where_ = classes.then(|| format!("\"CLASS\" = '{}'", c.name.replace('\'', "''")));
+        // Its text is in TEXT; its size, colour and angle by expression in their fields.
+        let field = |on: bool, had: &Option<String>, name: &str| (on && had.is_some()).then(|| format!("\"{name}\""));
+        c.by = rustgis_map::label_by::LabelBy {
+            text: None,
+            size: field(by_size, &c.by.size, "SIZE"),
+            color: field(by_color, &c.by.color, "COLOR"),
+            angle: field(by_angle, &c.by.angle, "ANGLE"),
+        };
     }
     let (min_scale, max_scale) = (l.min_scale, l.max_scale);
     if let Some(src) = s.map_mut().layer_mut(id) {
@@ -463,6 +607,9 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         a.labels = labels;
         a.min_scale = min_scale;
         a.max_scale = max_scale;
+    }
+    if let Some(note) = cut_note {
+        s.notify(note, false);
     }
     Ok(json!({"layer": new_id, "annotations": n}))
 }

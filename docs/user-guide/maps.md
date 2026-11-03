@@ -72,8 +72,10 @@ ground's heights, labels and point markers stand on it, and nearer slopes hide w
 them. The heights come from a DEM raster layer of the project (heights in metres; the layer can
 stay hidden) or from elevation tiles: Terrarium (`terrarium`, as the free
 `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png`) or Mapbox
-Terrain-RGB (`mapbox`, also MapTiler's). `map.terrain` sets it: `{"layer": "DEM"}` or
-`{"tiles": "https://…/{z}/{x}/{y}.png", "encoding": "terrarium"}`, with `"exaggeration"`
+Terrain-RGB (`mapbox`, also MapTiler's). **View › Scene › Terrain** turns it on from the active
+layer (make the DEM the active layer first) and off again; a notice names the layer and says to
+tilt the map. `map.terrain` sets it: `{"layer": "DEM"}`, or `{}` for the active raster layer when
+no terrain is on, or `{"tiles": "https://…/{z}/{x}/{y}.png", "encoding": "terrarium"}`, with `"exaggeration"`
 (0 to 20, default 1) to stretch the heights; `{"exaggeration": 2}` alone changes only that, and
 `{"off": true}` flattens the map again. Terrain is saved with the project and shows in exported
 maps; a flat (untilted) view, the globe and other projections stay flat, extruded layers are
@@ -192,16 +194,29 @@ Ocean, Atlas, Blank), which need no network, and web tile layers over them:
   the desktop read in place a tile at a time (**Tile Archive File…**, Add Data, or drop it on the
   window); in the web app added with Add Data and held in memory for the session (a project keeps
   the layer, and asks for the file again).
-- **Map styles**: a MapLibre style document (`style.json`), with its vector and raster sources.
+- **Map styles**: a MapLibre style document (`style.json`), with its vector, raster and
+  elevation (`raster-dem`: Terrarium, Mapbox or custom encoding) sources.
   RustGIS draws background, fill, line, circle and raster layers, labels with their icons from
-  the style's sprite (SDF icons in their `icon-color`), and fill patterns; it evaluates the
-  style's expressions and zoom functions. Labels are placed as MapLibre places them: at points,
+  the style's sprites (SDF icons in their `icon-color`; the icons of a sprite in the style's
+  list are named `<sprite id>:<name>`, those of a sprite with the id `default` just `<name>`), and
+  fill patterns; it evaluates the style's expressions and zoom functions, `image` among them (an
+  icon's name when a sprite has it, so `coalesce` falls back to the next). When the style draws
+  images, a notice says why any are missing: a sprite at an address RustGIS won't fetch, an entry
+  of the list that can't be read, or a sprite whose download failed, which loses only its own
+  icons and patterns and is tried again. From elevation it draws `color-relief` layers (a
+  `color-relief-color` that is an `interpolate` or `step` on `["elevation"]`) and `hillshade`
+  layers (each `hillshade-method`, lit as the map is drawn, north up; slopes are steepened at
+  small scales so relief stays visible). Its shading follows the style's colours, exaggeration
+  and light rather than matching MapLibre's pixel for pixel. Other `color-relief-color`
+  expressions aren't drawn. If a style's elevation source can't be read, its relief and
+  hillshade layers are left out with a notice saying why, and the rest is drawn. Labels are placed
+  as MapLibre places them: at points,
   in the middle of areas, and along lines (street names every `symbol-spacing`, turned to the
   street, where it bends less than `text-max-angle`; shields and one-way arrows), wrapped to
   `text-max-width`, the style's later layers first and then by `symbol-sort-key`, kept apart by
   `text-padding` and the `*-optional`, `*-allow-overlap` and `*-ignore-placement` rules. Text
-  along a line is drawn straight rather than curved round its bends. Line patterns, hillshade
-  and 3D extrusion are not drawn (extrusions draw flat). A label shows the lines of its text
+  along a line is drawn straight rather than curved round its bends. Line patterns and 3D
+  extrusion are not drawn (extrusions draw flat). A label shows the lines of its text
   that the map's font can draw: a style's "Syria / سوريا" shows as "Syria".
   A style's root `center`, `zoom`, `bearing` and `pitch` say where it opens: `map.addTiles` with
   `"view": true` takes the map there once the style has loaded.
@@ -222,7 +237,9 @@ tile service, **Overlay** ticked in Add Tile Layer) on top of the map's layers w
 every new layer goes. Drag one, or right-click it and choose **Move up** or **Move down**, to put it
 between the map's layers (above a layer group, never inside one). Tick
 one to show or hide it, and right-click it for **Zoom To Layer** (when its bounds are known), opacity,
-**Blend** mode, order and **Remove**.
+**Blend** mode, order and **Remove**; a WMS or map service layer also has **Draw as**: one picture
+of the view or tiles of a size (see
+[One picture of the view, or tiles](data-formats.md#one-picture-of-the-view-or-tiles)).
 A blend mode (Multiply, Screen, Overlay, Darken, Lighten, Difference) combines a tile layer with
 what is drawn beneath it (tile layers, the basemap, and map layers when it's placed over them): stack imagery over a hillshade and set it to Multiply to
 let the terrain show through. Overlays stay over the basemaps; choosing a built-in basemap
@@ -237,6 +254,15 @@ alone, whichever it is (a WMS layer too). Tiles are not
 selectable or editable; a tile not yet loaded may need another click once it arrives.
 **Reload** in the Basemap gallery (`map.reloadWebLayers`) clears cached tiles and styles and
 fetches them again.
+
+**Source layers.** A vector PMTiles or MBTiles archive lists its source layers (the
+`vector_layers` its metadata names: `water`, `roads`, `pois`…) under its row in the Layers pane:
+the arrow beside it opens them, each with its own checkbox. Untick one to hide what it draws
+(fills, lines, points and labels, in the default look and in a style given with `styleLayers`
+alike); Explore's pop-ups then skip its features too. From scripts, `map.tiles` lists a vector
+archive's `sourceLayers` once its header is read, and `map.setTiles` takes `"hiddenLayers":
+["roads", …]`, the source layers switched off (`[]` or `null` shows them all again). Switching one
+off is an edit to undo, and a project keeps which are off.
 
 Tiles load in the background and the map fills in as they arrive, with coarser tiles standing in
 meanwhile; exports and `rustgis-cli` wait for them. On the globe and in other projections the
@@ -315,9 +341,9 @@ projection, and clicking the coordinate system in the status bar opens the **Coo
 System** dialog, which also takes a projected EPSG code (such as `3035`, `32633` for UTM zone
 33N or `2056` for Switzerland) or an ESRI code, the one `.prj` files and ArcGIS name (such as
 `ESRI:102033` for South America Albers Equal Area Conic, or `ESRI:54030` for World Robinson). A
-code whose projection method or datum grid RustGIS can't use (Polyconic such as `5880`, Cassini,
-oblique Mercator, or a NAD27 code that needs a grid) is refused with the reason, rather than drawn
-in another projection. RustGIS supports a subset of Esri's projected systems, checked against
+code whose projection method or datum grid RustGIS can't use (Laborde such as `8441`, or a NAD27
+code that needs a grid) is refused with the reason, rather than drawn in another projection.
+RustGIS supports a subset of Esri's projected systems, checked against
 PROJ at representative points; unsupported codes such as World Miller (`ESRI:54003`) are refused
 as unknown codes. The presets:
 

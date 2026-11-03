@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use rustgis_data::GeometryType;
-use rustgis_map::{Layer, LayerGroup, MAX_GROUPS, Map};
+use rustgis_map::{Layer, LayerGroup, MAX_GROUP_DEPTH, MAX_GROUPS, Map};
 use serde_json::{Value, json};
 
 use super::{copy_name, uint};
@@ -18,7 +18,8 @@ use crate::{CmdResult, CommandSpec as C, Session};
 const MAX_COPIED: usize = 10_000;
 
 /// Layers on the clipboard: copies in drawing order (top first), with the groups that were copied
-/// whole (their children are ids of `layers`).
+/// whole, their subgroups included (their children are ids of `layers`; a subgroup's `parent` is
+/// one of `groups`, a copied group's own is left as it was).
 #[derive(Clone, Debug)]
 pub struct LayerClip {
     pub layers: Vec<Layer>,
@@ -28,10 +29,10 @@ pub struct LayerClip {
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.copy", "Copy Layers", "Layers", copy).view().params(
-            r#"{"layer"?: name|id | [name|id, …] (default: the active layer, unless a group is given), "group"?: name|id | [name|id, …] (the group and all its layers)}"#,
+            r#"{"layer"?: name|id | [name|id, …] (default: the active layer, unless a group is given), "group"?: name|id | [name|id, …] (the group with all its layers and subgroups)}"#,
         ),
         C::new("layer.paste", "Paste Layers", "Layers", paste).when(need_copied).params(
-            r#"{"map"?: name (default: the map in view), "group"?: name|id (into that group, at its top; copied groups aren't kept, as groups don't nest), "to"?: position (0 = top, the default; never inside a group: above it)}"#,
+            r#"{"map"?: name (default: the map in view), "group"?: name|id (into that group, at its top; copied groups go in it too), "to"?: position (0 = top, the default; never inside a group: above it)}"#,
         ),
     ]
 }
@@ -55,10 +56,17 @@ fn copy(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(v) = p.get("group").filter(|v| !v.is_null()) {
         for g in list(v)? {
             let id = super::group::group_id(s.map(), &json!({"group": g}))?;
-            let Some(group) = s.map().group(id) else { continue };
-            if groups.iter().all(|x| x.id != id) {
-                ids.extend(&group.children);
-                groups.push(group.clone());
+            let m = s.map();
+            // The group and its subgroups, outermost first, each once.
+            let mut tree = vec![id];
+            tree.extend(m.subgroups(id));
+            tree.sort_by_key(|g| m.group_depth(*g));
+            for gid in tree {
+                let Some(group) = m.group(gid) else { continue };
+                if groups.iter().all(|x| x.id != gid) {
+                    ids.extend(&group.children);
+                    groups.push(group.clone());
+                }
             }
         }
     }
@@ -133,17 +141,34 @@ fn paste(s: &mut Session, p: &Value) -> CmdResult {
     if into.is_some() && to.is_some() {
         return Err("give a group or a position, not both".into());
     }
-    if into.is_some() && clip.layers.is_empty() {
-        return Err("the copied groups have no layers to paste into a group".into());
+    if into.is_some() && clip.layers.is_empty() && clip.groups.is_empty() {
+        return Err("nothing copied to paste into a group".into());
     }
-    // Groups don't nest: pasted into a group, the copied groups' layers just join it.
-    let groups = if into.is_some() { Vec::new() } else { clip.groups };
+    let groups = clip.groups;
     if m.groups.len().saturating_add(groups.len()) > MAX_GROUPS {
         return Err(format!("a map holds at most {MAX_GROUPS} groups"));
     }
+    // Each copied group's level among the copied ones (1: copied without the group holding it).
+    let copied = |id: u32| groups.iter().any(|g| g.id == id);
+    let depths: HashMap<u32, usize> = groups
+        .iter()
+        .map(|g| {
+            let mut depth = 1;
+            let mut up = g.parent.filter(|p| copied(*p));
+            while let Some(p) = up.filter(|_| depth <= MAX_GROUP_DEPTH) {
+                depth += 1;
+                up = groups.iter().find(|x| x.id == p).and_then(|x| x.parent).filter(|p| copied(*p));
+            }
+            (g.id, depth)
+        })
+        .collect();
+    let deepest = depths.values().copied().max().unwrap_or(0);
+    if into.is_some_and(|g| m.group_depth(g).saturating_add(deepest) > MAX_GROUP_DEPTH) {
+        return Err(format!("groups nest at most {MAX_GROUP_DEPTH} levels deep"));
+    }
     // Where the copies go: above this layer (`None`: the bottom, as on an empty map).
     let before = match into {
-        Some(g) => m.layers.iter().find(|l| m.group(g).is_some_and(|g| g.children.contains(&l.id))).map(|l| l.id),
+        Some(g) => m.group_layers(g).first().copied(),
         None => m.layers.get(usize::try_from(to.unwrap_or(0)).unwrap_or(usize::MAX)).map(|l| l.id),
     };
     let m = s.project.maps.get_mut(mi).ok_or("no such map")?;
@@ -181,11 +206,20 @@ fn paste(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     let mut group_ids = Vec::new();
+    // Outermost first, so each subgroup's parent is pasted before it.
+    let mut groups = groups;
+    groups.sort_by_key(|g| depths.get(&g.id).copied().unwrap_or(0));
+    let mut new_groups: HashMap<u32, u32> = HashMap::new();
     for mut g in groups {
+        let old = g.id;
         g.children = g.children.iter().filter_map(|c| new_ids.get(c).copied()).collect();
         g.name = unique_group_name(m, &g.name);
+        g.parent = match g.parent.and_then(|p| new_groups.get(&p)) {
+            Some(p) => Some(*p),
+            None => into,
+        };
         let gid = m.add_group(g);
-        m.gather_group(gid);
+        new_groups.insert(old, gid);
         group_ids.push(gid);
     }
     let map = m.name.clone();

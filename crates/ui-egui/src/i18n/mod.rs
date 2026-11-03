@@ -306,7 +306,7 @@ pub fn tr(lang: Lang, s: &str) -> &str {
 /// placeholders are filled — and whose separators are joined — before it is shown. A
 /// plugin's translation is used when the catalog has none, so [`fmt`] and [`location`]
 /// translate plugin strings as well.
-fn tr_raw(lang: Lang, s: &str) -> &str {
+pub fn tr_raw(lang: Lang, s: &str) -> &str {
     if let Some(t) = lang.0.catalog().get(s) {
         return t;
     }

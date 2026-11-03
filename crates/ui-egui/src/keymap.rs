@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::RustGisApp;
 
-const MAX_PREF_BYTES: usize = 100_000;
+pub(crate) const MAX_PREF_BYTES: usize = 100_000;
 const MAX_PREF_CHANGES: usize = 1_000;
 const MAX_COMMAND_LEN: usize = 200;
 
@@ -36,6 +36,11 @@ const DEFAULTS: &[(&str, &str, &str)] = &[
     ("Escape", "tool.set", r#"{"tool":"explore"}"#),
     ("Delete", "edit.delete", ""),
     ("Mod+D", "layout.duplicateElement", ""),
+    // The active layer in the Layers pane's outline, as a word processor's outline keys (#836).
+    ("Alt+Shift+ArrowRight", "layer.indent", ""),
+    ("Alt+Shift+ArrowLeft", "layer.outdent", ""),
+    ("Alt+Shift+ArrowUp", "layer.moveUp", ""),
+    ("Alt+Shift+ArrowDown", "layer.moveDown", ""),
 ];
 
 /// The clipboard keys: (keys, command). They arrive as copy, cut and paste events rather than key
@@ -148,6 +153,17 @@ impl Chord {
             s + key
         }
     }
+
+    /// [`Chord::text`] for `ctx`'s keys, Option spelled out (`Opt+⇧Right`) where the interface
+    /// faces have no "⌥" (egui's own have none, so a browser without the system's faces).
+    pub fn shown(self, ctx: &egui::Context) -> String {
+        let text = self.text(ctx.os().is_mac());
+        if !text.contains('⌥') {
+            return text;
+        }
+        let ids = [egui::FontId::monospace(12.0), egui::FontId::proportional(12.0)];
+        if ctx.fonts_mut(|f| ids.iter().all(|id| f.has_glyphs(id, "⌥"))) { text } else { text.replacen('⌥', "Opt+", 1) }
+    }
 }
 
 impl std::fmt::Display for Chord {
@@ -181,13 +197,13 @@ impl Binding {
 
 /// One user change to the defaults, stored in preferences.
 #[derive(Serialize, Deserialize)]
-struct Change {
-    keys: String,
-    command: String,
+pub(crate) struct Change {
+    pub(crate) keys: String,
+    pub(crate) command: String,
     #[serde(default)]
-    params: Value,
+    pub(crate) params: Value,
     #[serde(default)]
-    remove: bool,
+    pub(crate) remove: bool,
 }
 
 /// Every shortcut.
@@ -351,7 +367,7 @@ pub fn is_clipboard(chord: Chord) -> bool {
 /// fixed key included), or empty for none.
 pub fn shortcut_text(ctx: &egui::Context, app: &RustGisApp, command: &str, params: &Value) -> String {
     let clipboard = || CLIPBOARD.iter().find(|(_, c)| *c == command).and_then(|(keys, _)| Chord::parse(keys));
-    app.ui.keymap.keys_for(command, params).next().or_else(clipboard).map(|c| c.text(ctx.os().is_mac())).unwrap_or_default()
+    app.ui.keymap.keys_for(command, params).next().or_else(clipboard).map(|c| c.shown(ctx)).unwrap_or_default()
 }
 
 /// What a binding runs, translated: the command's label, or the map tool it picks.
@@ -506,6 +522,20 @@ mod tests {
         b.chord = Chord { command: true, alt: false, shift: false, key: Key::J };
         assert_ne!(before, app.shortcuts_fingerprint());
         assert!(crate::RustGisApp::takes_browser_key(&app.command_keys(), "j", "KeyJ", true, false, false));
+        // The same key given another command, or other parameters, changes it too.
+        let moved = app.shortcuts_fingerprint();
+        let j = Chord { command: true, alt: false, shift: false, key: Key::J };
+        app.ui.keymap.assign(j, "select.clear", Value::Null);
+        let other_command = app.shortcuts_fingerprint();
+        assert_ne!(moved, other_command);
+        // Assigning moves the binding to the end, so a second command for the same key, in the
+        // same place, isolates the command.
+        app.ui.keymap.assign(j, "select.all", Value::Null);
+        assert_ne!(other_command, app.shortcuts_fingerprint());
+        app.ui.keymap.assign(j, "tool.set", serde_json::json!({"tool": "select"}));
+        let with_params = app.shortcuts_fingerprint();
+        app.ui.keymap.assign(j, "tool.set", serde_json::json!({"tool": "measure"}));
+        assert_ne!(with_params, app.shortcuts_fingerprint());
     }
 
     #[test]

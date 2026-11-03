@@ -275,9 +275,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         _ => "Rename Layer",
     };
 
-    // list of dialogs which should allow collapse feature
-    let collapsible_windows = ["addService"];
-    let should_be_collapsible = collapsible_windows.contains(&which);
+    let is_add_service = which == "addService";
 
     let t = Tokens::get(ctx);
     let mut open = true;
@@ -293,14 +291,15 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     }
 
     // Opens centred and can be moved; each dialog remembers where it was put.
-    egui::Window::new(tl!(title))
+    let window = egui::Window::new(tl!(title))
         .id(window_id)
         .open(&mut open)
-        .collapsible(should_be_collapsible)
+        .collapsible(is_add_service)
         .resizable(false)
         .pivot(Align2::CENTER_CENTER)
-        .default_pos(ctx.content_rect().center() + vec2(0.0, -40.0))
-        .show(ctx, |ui| {
+        .default_pos(ctx.content_rect().center() + vec2(0.0, -40.0));
+    let window = if is_add_service { window.auto_sized() } else { window };
+    window.show(ctx, |ui| {
         ui.set_width(match which {
             "coordinateSystem" | "zarr" => 660.0,
             "addTiles" | "addUrl" | "addService" | "s3" => 560.0,
@@ -473,8 +472,19 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     }).response.labelled_by(input_label.id);
                 });
                 let input_label = ui.label(format!("{} =", app.dialogs.a));
-                ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text(tl!("e.g.  pop_est / 1000000   or   'Africa'   or   name")).desired_width(f32::INFINITY)).labelled_by(input_label.id);
-                ui.label(egui::RichText::new(tl!("A value, a field, or two of them joined by + − × ÷. Applies to the selected rows, or every row when none is selected.")).small().weak());
+                let edit = egui::TextEdit::singleline(&mut app.dialogs.text)
+                    .hint_text(tl!("e.g.  pop_est / 1000000   or   upper(name) || ' ' || round(area, 1)"))
+                    .char_limit(rustgis_engine::data::query::MAX_LEN)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY);
+                ui.add(edit).labelled_by(input_label.id);
+                let text = app.dialogs.text.trim();
+                let reads = app.session.active_layer.and_then(|id| app.session.map().layer(id)).filter(|_| !text.is_empty()).map(|l| rustgis_engine::cmd::edit::check_calculation(text, &l.dataset));
+                if let Some(Err(e)) = reads {
+                    let t = Tokens::get(ui.ctx());
+                    ui.label(egui::RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", &e)])).small().color(t.red));
+                }
+                ui.label(egui::RichText::new(tl!("Fields, numbers, 'text', + - * / % ^, || to join text, comparisons, CASE and functions such as round(), upper(), if() or scale_linear(). Applies to the selected rows, or every row when none is selected.")).small().weak());
                 close = buttons(app, ui, "Calculate", |app| app.run("edit.calculateField", json!({"field": app.dialogs.a, "expression": app.dialogs.text})).map(|_| ()));
             }
             "definitionQuery" => {
@@ -570,6 +580,13 @@ pub const EXPORT_FORMATS: &[(&str, &str)] = &[
     ("GPX", "gpx"),
 ];
 
+/// The formats Export Features offers: all of [`EXPORT_FORMATS`] on the desktop. The web app
+/// leaves out GeoPackage, written with SQLite, and FlatGeobuf, whose writer needs a temporary
+/// file; the browser has neither.
+pub(crate) fn export_formats(web: bool) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    EXPORT_FORMATS.iter().filter(move |(_, e)| !(web && matches!(*e, "gpkg" | "fgb")))
+}
+
 /// Export Features: the active layer, in a format picked here (a file's type isn't changed by
 /// the filter chosen in a save dialog, and the web app has no save dialog).
 fn export_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
@@ -584,8 +601,7 @@ fn export_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             .selected_text(shown)
             .width(220.0)
             .show_ui(ui, |ui| {
-                // GeoPackages are written with SQLite, which the web app doesn't have.
-                for (label, ext) in EXPORT_FORMATS.iter().filter(|(_, e)| !(web && *e == "gpkg")) {
+                for (label, ext) in export_formats(web) {
                     ui.selectable_value(&mut app.dialogs.mode, *ext, *label);
                 }
             })
@@ -917,14 +933,33 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                     }
                 });
             }
-            // Layers that change with time (NASA GIBS's) are added at a date.
+            // Layers that change with time (NASA GIBS's, swisstopo's maps by year) are added at a
+            // date; empty, at the service's default.
             if layers.iter().any(|l| l.get("time").is_some()) {
-                ui.horizontal(|ui| {
-                    let input_label = ui.label(tl!("Date"));
-                    ui.add(egui::TextEdit::singleline(&mut browse.time).hint_text(tl!("latest")).desired_width(120.0))
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        let mut follow = !browse.fixed;
+                        let input_label = ui.label(tl!("Date"));
+                        ui.add_enabled(
+                            browse.fixed,
+                            egui::TextEdit::singleline(&mut browse.time).hint_text(tl!("its default")).desired_width(120.0),
+                        )
                         .labelled_by(input_label.id);
-                    ui.label(egui::RichText::new(tl!("YYYY-MM-DD, for the layers that change with time")).small().weak());
+                        if ui
+                            .checkbox(&mut follow, tl!("Follow the time slider"))
+                            .on_hover_text(tl!("Step through the layer's times with the time slider (View › Time), which starts with them"))
+                            .changed()
+                        {
+                            browse.fixed = !follow;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(tl!("for the layers that change with time, as they list their times (2024-06-01, 1995)"))
+                            .small()
+                            .weak(),
+                    );
                 });
+                ui.separator();
             }
             // Feature layers come whole, or only the features crossing the map's view.
             if !grouped && layers.iter().any(|l| l["offer"]["type"] == "features") {
@@ -963,12 +998,14 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 .min_height(100.0)
                 .max_height(350.0)
                 .resizable(true)
-                .max_width(ui_width)
-                .min_width(ui_width)
+                .min_width(ui_width.min(560.0))
+                .max_width(750.0)
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("add_service_layers_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        let style = ui.style().clone();
                         for l in matching.into_iter().take(SHOWN_LAYERS) {
                             ui.horizontal(|ui| {
+                                ui.add_space(2.0);
                                 let kind = l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str);
 
                                 if kind == Some("service") {
@@ -980,8 +1017,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                 }
 
                                 let name = l.get("name").and_then(Value::as_str).unwrap_or("");
-                                ui.label(l.get("title").and_then(Value::as_str).unwrap_or(name)).on_hover_text(name);
-
+                                let title = l.get("title").and_then(Value::as_str).unwrap_or(name);
                                 let what = match kind {
                                     Some("features") => tl!("features"),
                                     Some("style") => tl!("style"),
@@ -992,7 +1028,44 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                                     _ => tl!("map"),
                                 };
 
-                                ui.label(egui::RichText::new(what).small().weak());
+                                let mut job = egui::text::LayoutJob::default();
+                                egui::RichText::new(format!("{title}  ")).append_to(
+                                    &mut job,
+                                    &style,
+                                    egui::FontSelection::Default,
+                                    egui::Align::Center,
+                                );
+                                egui::RichText::new(what).small().weak().append_to(
+                                    &mut job,
+                                    &style,
+                                    egui::FontSelection::Default,
+                                    egui::Align::Center,
+                                );
+                                ui.add(egui::Label::new(job).wrap()).on_hover_ui(|ui| {
+                                    ui.label(name);
+                                    if let Some(t) = l.get("time") {
+                                        let values: Vec<&str> =
+                                            t["values"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+                                        let default = t["default"].as_str().unwrap_or("");
+                                        // The first and last few of a long list (`service.layers` lists
+                                        // those, with how many there are).
+                                        let count = t["count"].as_u64().and_then(|c| usize::try_from(c).ok()).unwrap_or(values.len());
+                                        let half = values.len() / 2;
+                                        let times = if count > values.len() {
+                                            format!(
+                                                "{}, …, {}",
+                                                values.get(..half).unwrap_or(&[]).join(", "),
+                                                values.get(half..).unwrap_or(&[]).join(", ")
+                                            )
+                                        } else {
+                                            values.join(", ")
+                                        };
+                                        ui.label(crate::i18n::fmt(
+                                            "Its default: {default}. Its times: {times}",
+                                            &[("default", default), ("times", &times)],
+                                        ));
+                                    }
+                                });
                             });
                         }
                     });
@@ -1046,7 +1119,7 @@ fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         let name = l.get("name").and_then(Value::as_str).unwrap_or("");
         let title = l.get("title").and_then(Value::as_str).unwrap_or(name).to_string();
         // Features are downloaded in the background, as From URL… does; map layers are added now.
-        let time = app.ui.service_browse.time.trim().to_string();
+        let time = crate::webdataui::fixed_or_slider(app.ui.service_browse.fixed, &app.ui.service_browse.time);
         // The view's area, for a feature layer only: a map layer never asks for one, so an
         // unknown view can't stop it.
         let features = l["offer"]["type"] == "features";
@@ -2027,6 +2100,39 @@ fn crs_details(ui: &mut egui::Ui, chosen: &str, current: &str, t: &Tokens) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The web app's Export Features offers only formats it can write: no GeoPackage (SQLite) or
+    /// FlatGeobuf (whose writer needs a temporary file; choosing it aborted the app). The
+    /// dialog's own Format list is opened and read, as a user would.
+    #[test]
+    fn the_web_export_dialog_offers_no_geopackage_or_flatgeobuf() {
+        use egui_kittest::kittest::Queryable;
+        for web in [true, false] {
+            let mut app = RustGisApp::with_sample();
+            if web {
+                app = app.with_services(crate::Services { download: Some(Box::new(|_, _| Ok(()))), ..Default::default() });
+            }
+            app.session.active_layer = app.session.map().layers.first().map(|l| l.id);
+            app.run("ui.dialog", json!({"name": "exportLayer"})).unwrap();
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 900.0)).with_max_steps(64).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+            h.run_steps(4);
+            h.get_by_label("Format").click();
+            h.run_steps(4);
+            let offered = |label: &str| h.query_all_by_label(label).count() > 0;
+            assert!(offered("GeoParquet") && offered("KML"), "web {web}: the Format list is open");
+            assert_eq!(offered("FlatGeobuf"), !web, "web {web}");
+            assert_eq!(offered("GeoPackage"), !web, "web {web}");
+        }
+        let web: Vec<&str> = export_formats(true).map(|(_, e)| *e).collect();
+        assert_eq!(web, ["geojson", "parquet", "shp", "csv", "kml", "kmz", "gpx"]);
+    }
 
     /// The Coordinate System dialog re-centres a preset (opengeos/RustGIS#517): the central
     /// meridian, set as assistive technology does, goes into the code that Apply uses.

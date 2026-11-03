@@ -59,6 +59,8 @@ pub struct Info {
     pub bounds: [f64; 4],
     /// The JSON metadata (vector layers, attribution…), `Null` when there is none.
     pub metadata: Value,
+    /// Its vector layers' names, as [`source_layers::of_metadata`](rustgis_data::source_layers::of_metadata) keeps them.
+    vector_layers: Vec<String>,
     root: Arc<Vec<Entry>>,
     leaf_offset: u64,
     leaf_length: u64,
@@ -69,13 +71,16 @@ pub struct Info {
 }
 
 impl Info {
-    /// The names of the metadata's vector layers.
-    pub fn vector_layers(&self) -> Vec<String> {
-        self.metadata
-            .get("vector_layers")
-            .and_then(Value::as_array)
-            .map(|v| v.iter().filter_map(|l| l.get("id").and_then(Value::as_str)).map(str::to_string).collect())
-            .unwrap_or_default()
+    /// The names of the metadata's vector layers, as
+    /// [`source_layers::of_metadata`](rustgis_data::source_layers::of_metadata) keeps them.
+    pub fn vector_layers(&self) -> &[String] {
+        &self.vector_layers
+    }
+
+    /// Takes the archive's metadata, and the vector layers' names from it.
+    fn set_metadata(&mut self, metadata: Value) {
+        self.vector_layers = rustgis_data::source_layers::of_metadata(&metadata);
+        self.metadata = metadata;
     }
 
     /// The metadata's attribution, if any.
@@ -475,7 +480,7 @@ fn load(archive: String) {
                             // Unreadable metadata only loses the layer names and credits.
                             if let Ok(m) = m {
                                 let m = info.internal.decode(m).unwrap_or_default();
-                                info.metadata = serde_json::from_slice(&m).unwrap_or(Value::Null);
+                                info.set_metadata(serde_json::from_slice(&m).unwrap_or(Value::Null));
                             }
                             finish(&a2, Ok(info));
                         }),
@@ -729,6 +734,7 @@ fn parse_head(b: &[u8]) -> Result<(Info, u64, u64), String> {
         max_zoom,
         bounds,
         metadata: Value::Null,
+        vector_layers: Vec::new(),
         root: Arc::new(root),
         leaf_offset,
         leaf_length,
@@ -1042,6 +1048,7 @@ pub(crate) mod tests {
             attribution: String::new(),
             layers: Vec::new(),
             style_layers: String::new(),
+            hidden_layers: Vec::new(),
         };
         let mut resolved = crate::source::resolve(&spec);
         for _ in 0..200 {

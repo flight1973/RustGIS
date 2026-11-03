@@ -99,7 +99,7 @@ pub fn commands() -> Vec<C> {
             }
             l.renderer = st.renderer;
             let field = l.labels.default.field.clone();
-            let relock = !super::labels::same_class_list(&l.labels, &st.labels);
+            let relock = !super::labels::lock_holds(&l.labels, &st.labels);
             l.labels = st.labels;
             // The label field stays if the style's isn't in this layer.
             if l.dataset.field_index(&l.labels.default.field).is_none() {
@@ -460,6 +460,7 @@ fn import_maps(s: &mut Session, p: &Value) -> CmdResult {
             m.name = format!("{base} ({i})");
         }
         names.push(m.name.clone());
+        m.renew_instance_id();
         s.project.maps.push(m);
     }
     // Repair what was read (rasters reopen, cameras clamp); the sources that read S3 wait for
@@ -577,9 +578,15 @@ fn package_map(s: &Session, mobile: bool, tol: f64) -> Result<Vec<u8>, String> {
     if mobile {
         // Groups folded into their layers: a hidden group's layers are dropped with the others.
         m.bake_groups();
-        let hidden: Vec<u32> = m.layers.iter().filter(|l| !l.visible).map(|l| l.id).collect();
+        // A hidden DEM still gives the terrain its heights (it can stay hidden): it is kept.
+        let dem = match &m.view.terrain {
+            Some(rustgis_map::view::Terrain { source: rustgis_map::view::TerrainSource::Layer(n), .. }) => Some(n.clone()),
+            _ => None,
+        };
+        let kept = |l: &rustgis_map::Layer| l.visible || (l.is_raster() && dem.as_deref().is_some_and(|d| l.name.eq_ignore_ascii_case(d)));
+        let hidden: Vec<u32> = m.layers.iter().filter(|l| !kept(l)).map(|l| l.id).collect();
         m.release_tiles(&hidden);
-        m.layers.retain(|l| l.visible);
+        m.layers.retain(|l| kept(l));
         for l in &mut m.layers {
             if l.is_raster() || tol <= 0.0 {
                 continue;
@@ -764,12 +771,12 @@ pub(crate) fn touches_files(command: &str, params: &Value) -> bool {
 }
 
 /// Parameters without a built-in tool's output layer name, which stays in the session, so a task
-/// (or a model, or a notebook) from a file may set it: only `gp.run`'s `{"tool", "params"}` shape,
-/// only `params.output`, only for the tools in `rustgis_analysis::TOOLS`, which name their output
-/// layer and never a file through it (see `out_name` there), not GeoLibre or plugin tools, which may
-/// write theirs as files, and only a plain name, with no `/`, `\`, `.` or `:`. Anything else stays
-/// a place.
-fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::borrow::Cow<'a, Value> {
+/// (or a model, or a notebook) from a file, or a plugin without `files`, may set it: only
+/// `gp.run`'s `{"tool", "params"}` shape, only `params.output`, only for the tools in
+/// `rustgis_analysis::TOOLS`, which name their output layer and never a file through it (see
+/// `out_name` there), not GeoLibre or plugin tools, which may write theirs as files, and only a
+/// plain name, with no `/`, `\`, `.` or `:`. Anything else stays a place.
+pub(crate) fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::borrow::Cow<'a, Value> {
     use std::borrow::Cow;
     // Resolved as gp.run resolves it (by id or name, a built-in tool first), then held to the
     // built-in list, so the two can't drift: an external tool of a built-in's name isn't let in.
@@ -1091,6 +1098,7 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
         k if super::sharing::KINDS.iter().any(|x| x.0 == k) => {
             let (name, bytes, _) = super::sharing::share_bytes(s, k, p)?;
             super::sharing::note_label_classes(s, k, p);
+            super::sharing::note_export(s, k, p, &name);
             (name, bytes)
         }
         k => return Err(format!("unknown item '{k}'")),

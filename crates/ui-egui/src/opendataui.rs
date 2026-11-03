@@ -636,10 +636,8 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
         st.thumbs.insert(u, Thumb::Loading(slot));
     }
     match act {
-        Some(Act::Details(i)) => {
-            if !st.open.remove(&i) {
-                st.open.insert(i);
-            }
+        Some(Act::Details(i)) if !st.open.remove(&i) => {
+            st.open.insert(i);
         }
         Some(Act::Zoom(b)) => {
             if let Err(e) = app.run("map.zoomToExtent", json!({"extent": b})) {
@@ -671,7 +669,7 @@ pub fn dialog(app: &mut RustGisApp, ui: &mut egui::Ui) {
                 app.ui.opendata.error = Some(e);
             }
         }
-        None => {}
+        None | Some(Act::Details(_)) => {}
     }
 }
 

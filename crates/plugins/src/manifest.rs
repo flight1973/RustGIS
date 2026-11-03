@@ -17,8 +17,11 @@ const MAX_TEXT: usize = 2_000;
 const MAX_LANGS: usize = 64;
 const MAX_STRINGS: usize = 20_000;
 const MAX_GROUPS: usize = 8;
-const MAX_GROUP_ITEMS: usize = 16;
+const MAX_LARGE_GROUP_ITEMS: usize = 16;
+const MAX_SMALL_GROUP_ITEMS: usize = 48;
 const MAX_MENU_ITEMS: usize = 32;
+const MAX_MENU_DEPTH: usize = 4;
+const MAX_TAB_ITEMS: usize = 16_384;
 const MAX_TAB_LABEL: usize = 32;
 const MAX_RUN_ARGS: usize = 64;
 const MAX_SKILLS: usize = 32;
@@ -207,10 +210,24 @@ pub struct TabDecl {
     pub groups: Vec<GroupDecl>,
 }
 
+/// The size of ribbon controls; popup menu rows always use the standard menu layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Layout {
+    /// Full-height ribbon controls (the default).
+    #[default]
+    Large,
+    /// Compact ribbon controls, stacked three per column.
+    Small,
+}
+
 /// A group of buttons on a plugin's tab.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GroupDecl {
     pub label: String,
+    /// The size of the group's ribbon controls.
+    #[serde(default)]
+    pub layout: Layout,
     pub items: Vec<ItemDecl>,
 }
 
@@ -231,7 +248,10 @@ pub struct MenuDecl {
     pub icon: String,
     #[serde(default)]
     pub help: String,
-    pub items: Vec<String>,
+    /// The ribbon trigger's size, inheriting the group when unset. Ignored inside popups.
+    #[serde(default)]
+    pub layout: Option<Layout>,
+    pub items: Vec<ItemDecl>,
 }
 
 /// What a tab entry (`command-id`, `tool:tool-id` or `panel`) refers to.
@@ -620,32 +640,48 @@ impl Manifest {
         if tab.groups.is_empty() || tab.groups.len() > MAX_GROUPS {
             return Err(format!("plugin.json: the tab needs 1 to {MAX_GROUPS} groups"));
         }
-        let entry = |e: &str| -> Result<(), String> {
-            self.entry(e).map(|_| ()).ok_or_else(|| {
-                format!(
-                    "plugin.json: the tab names '{e}', which isn't one of the plugin's commands, tools (tool:<id>) or its panel (panel)"
-                )
-            })
-        };
+        let mut total = 0;
         for g in &tab.groups {
             check_text("group label", &g.label, true)?;
-            if g.items.is_empty() || g.items.len() > MAX_GROUP_ITEMS {
-                return Err(format!("plugin.json: tab group '{}' needs 1 to {MAX_GROUP_ITEMS} items", g.label));
+            let max_items = match g.layout {
+                Layout::Large => MAX_LARGE_GROUP_ITEMS,
+                Layout::Small => MAX_SMALL_GROUP_ITEMS,
+            };
+            if g.items.is_empty() || g.items.len() > max_items {
+                return Err(format!("plugin.json: tab group '{}' needs 1 to {max_items} items", g.label));
             }
             for item in &g.items {
-                match item {
-                    ItemDecl::Entry(e) => entry(e)?,
-                    ItemDecl::Menu(m) => {
-                        check_text("menu label", &m.menu, true)?;
-                        check_text("menu help", &m.help, false)?;
-                        check_text("menu icon", &m.icon, false)?;
-                        if m.items.is_empty() || m.items.len() > MAX_MENU_ITEMS {
-                            return Err(format!("plugin.json: menu '{}' needs 1 to {MAX_MENU_ITEMS} items", m.menu));
-                        }
-                        for e in &m.items {
-                            entry(e)?;
-                        }
-                    }
+                self.validate_tab_item(item, 0, &mut total)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_tab_item(&self, item: &ItemDecl, menu_depth: usize, total: &mut usize) -> Result<(), String> {
+        if *total >= MAX_TAB_ITEMS {
+            return Err(format!("plugin.json: the tab has more than {MAX_TAB_ITEMS} total items"));
+        }
+        *total += 1;
+        match item {
+            ItemDecl::Entry(e) => {
+                if self.entry(e).is_none() {
+                    return Err(format!(
+                        "plugin.json: the tab names '{e}', which isn't one of the plugin's commands, tools (tool:<id>) or its panel (panel)"
+                    ));
+                }
+            }
+            ItemDecl::Menu(m) => {
+                if menu_depth >= MAX_MENU_DEPTH {
+                    return Err(format!("plugin.json: menus may nest at most {MAX_MENU_DEPTH} levels"));
+                }
+                check_text("menu label", &m.menu, true)?;
+                check_text("menu help", &m.help, false)?;
+                check_text("menu icon", &m.icon, false)?;
+                if m.items.is_empty() || m.items.len() > MAX_MENU_ITEMS {
+                    return Err(format!("plugin.json: menu '{}' needs 1 to {MAX_MENU_ITEMS} items", m.menu));
+                }
+                for item in &m.items {
+                    self.validate_tab_item(item, menu_depth + 1, total)?;
                 }
             }
         }

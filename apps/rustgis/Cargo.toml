@@ -29,8 +29,12 @@ embed-resource = "3"
 # macOS: reads the native title bar's geometry (window buttons, height) so the header can sit in it.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSButton", "NSControl", "NSView", "NSResponder"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSWindow", "NSButton", "NSControl", "NSView", "NSResponder", "NSPasteboard"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSUserDefaults"] }
+# The native menu bar (#1077). Its own unsafe code stays in the crate.
+muda = { version = "0.21", default-features = false }
+# Turns winit's default menu off: keep the version in step with eframe's, as for Linux below.
+winit = { version = "0.30", default-features = false }
 
 # Linux: GNOME on Wayland leaves the title bar to the app. winit draws an Adwaita one (title,
 # minimise, maximise, close, following the light/dark theme) instead of its plain grey fallback.

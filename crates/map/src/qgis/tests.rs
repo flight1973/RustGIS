@@ -167,10 +167,13 @@ fn a_project_reads_into_layers_in_tree_order_with_their_styles() {
     let by = |n: &str| l.classes.iter().find(|c| c.name == n).unwrap();
     assert_eq!((by("Motorways").where_.as_deref(), by("Motorways").placement), (Some("\"class\" = 'motorway'"), LabelPlacement::Curved));
     let rest = by("Rest");
-    assert_eq!(rest.where_.as_deref(), Some("(\"lanes\" > 1) AND (NOT ((\"kind\" = 'x')))"));
+    assert_eq!(rest.where_.as_deref(), Some("(\"lanes\" > 1) AND (NOT coalesce(((\"kind\" = 'x')), FALSE))"));
     assert_eq!(rest.placement, LabelPlacement::Parallel);
     assert!((rest.min_scale.unwrap() - 50_000.0 * QGIS_SCALE).abs() < 1e-6);
-    assert_eq!(l.classes.len(), 3, "the function filter's rule is left out");
+    // A filter with a function is kept for the expression language (checked against the layer's
+    // fields where the layer is added).
+    assert_eq!(l.classes.len(), 4);
+    assert_eq!(l.classes[3].where_.as_deref(), Some("length(\"name\") > 3"));
 
     // Towns: XYZ tiles as the source; rules on one field read as categories.
     let towns = &p.layers[0];
@@ -202,7 +205,7 @@ fn a_project_reads_into_layers_in_tree_order_with_their_styles() {
     assert!(said("Roads", NoteKind::Approximated, "dashed"));
     // A marker line without the symbol it places draws nothing, in QGIS too: nothing to say.
     assert!(!said("Roads", NoteKind::Skipped, "markers"));
-    assert!(said("Roads", NoteKind::Skipped, "length("));
+    assert!(!said("Roads", NoteKind::Skipped, "length("));
     assert!(!report.notes.iter().any(|n| n.layer == "Towns" && n.text.contains("font markers")), "drawn as characters: {:?}", report.notes);
     // A switched-off label rule is never drawn, so its filter isn't noted.
     assert!(!report.notes.iter().any(|n| n.text.contains("Switched off")), "{:?}", report.notes);
@@ -389,6 +392,9 @@ fn pattern_fills_carry_over_as_stacked_fills() {
         angle == 30.0 && (spacing - mm(1.0)).abs() < 1e-3 && (width - mm(0.3)).abs() < 1e-3 && (offset - mm(0.5)).abs() < 1e-3,
         "{fills:?}"
     );
+    // QGIS 3 saves the angle as `angle` (QGIS 2 as `lineangle`).
+    let (fills, ..) = read(&lines.replace("lineangle", "angle").replace("\"30\"", "\"90\""));
+    assert!(matches!(fills[0].pattern, FillPattern::Hatch { angle: 90.0, .. }), "{fills:?}");
     // Two colours stacked: both, the top one over the bottom.
     let half = r#"<layer class="SimpleFill" enabled="1"><Option type="Map"><Option name="color" value="0,0,0,64"/><Option name="style" value="solid"/></Option></layer>"#;
     let (fills, ..) = read(&format!("{}{half}", simple("solid")));
@@ -929,6 +935,13 @@ fn marker_and_hashed_lines_carry_over_as_strokes_of_marks() {
     assert_eq!(pic.color, Some(Rgba::new(242, 242, 242, 128)));
     assert!(near(m.offset_along, 0.12 * mm) && near(pic.offset, (0.5 - 0.35) * mm), "{pic:?}");
     assert!(near(m.size, mm) && near(m.average_angle, 4.0 * mm) && m.rotate && m.outline.is_none());
+    // The average angle's length in its own unit, `average_angle_unit` (4 pixels, not 4 mm).
+    let px = qml.replace(
+        r#"<Option name="average_angle_length" value="4"/>"#,
+        r#"<Option name="average_angle_length" value="4"/><Option name="average_angle_unit" value="Pixel"/>"#,
+    );
+    let m = read_style(&px, "Rail", &mut Report::default()).unwrap().line_strokes.unwrap()[1].markers.unwrap();
+    assert!(m.average_angle > 0.0 && m.average_angle < 2.0 * mm, "4 pixels: {}", m.average_angle);
     assert_eq!(pic.level, Some(2));
 
     // The triangle: its outline, its angle, offset only by the line's.
@@ -1050,12 +1063,13 @@ fn marker_symbols_of_several_layers_carry_over_as_marks_turned_by_their_field() 
     let Some(Renderer::Single(sym)) = &s.renderer else { panic!() };
     assert_eq!(sym.marker, Marker::Star);
 
-    // An angle from any other expression is noted, and turns nothing.
+    // An angle from any other expression turns the markers by that expression.
     let other = qml.replace("</layer>", &format!("{}</layer>", dd("&quot;A&quot; * 2")));
     let mut report = Report::default();
     let s = read_style(&other, "Signs", &mut report).unwrap();
     assert_eq!(s.marker_rotation, Some(None));
-    assert!(report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+    assert_eq!(s.symbol_by.and_then(|b| b.angle).as_deref(), Some(r#""A" * 2"#));
+    assert!(!report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
 
     // Classes of one layer: an antenna that keeps still where a cliff turns by the field. The
     // antenna's single plain character becomes a mark that doesn't turn; the cliff's turns.
@@ -1104,4 +1118,653 @@ fn marker_symbols_of_several_layers_carry_over_as_marks_turned_by_their_field() 
     let mut report = Report::default();
     read_style(old, "Signs", &mut report).unwrap();
     assert!(report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+}
+
+/// Gradient and shapeburst fills carry over: their two colours (or their ramp's, with its stops,
+/// a colour of which carries its own colon), how a gradient runs, and how deep a shapeburst shades
+/// in its unit; neither is noted as approximated any more.
+#[test]
+fn gradient_and_shapeburst_fills_carry_over() {
+    use crate::fills::{FillPattern, GradientPoint, GradientShape, Spread, Stop};
+    let read = |layer: &str| {
+        let qml = format!(
+            r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="fill" name="0" alpha="0.5">{layer}</symbol></symbols></renderer-v2></qgis>"#
+        );
+        let mut report = Report::default();
+        let s = read_style(&qml, "Countries", &mut report).unwrap();
+        (s.fill_layers.unwrap_or_default(), report)
+    };
+    let opts =
+        |o: &[(&str, &str)]| o.iter().map(|(k, v)| format!(r#"<Option name="{k}" type="QString" value="{v}"/>"#)).collect::<String>();
+    // A radial gradient from the centroid, reflected, turned; as QGIS 4 writes it.
+    let gradient = format!(
+        r#"<layer class="GradientFill" enabled="1"><Option type="Map">{}</Option></layer>"#,
+        opts(&[
+            ("color", "255,0,0,255,rgb:1,0,0,1"),
+            ("gradient_color2", "0,0,255,255,rgb:0,0,1,1"),
+            ("color1", "69,116,40,255"),
+            ("color2", "188,220,60,255"),
+            ("color_type", "0"),
+            ("type", "1"),
+            ("spread", "1"),
+            ("angle", "30"),
+            ("coordinate_mode", "0"),
+            ("reference_point1", "0.5,0"),
+            ("reference_point1_iscentroid", "1"),
+            ("reference_point2", "1,0.25"),
+            ("reference_point2_iscentroid", "0"),
+            ("offset", "0,0"),
+        ])
+    );
+    let (fills, report) = read(&gradient);
+    assert_eq!(fills.len(), 1, "{fills:?}");
+    let half = |c: Rgba| c.with_alpha(128);
+    assert_eq!(fills[0].color, Some(half(Rgba::rgb(255, 0, 0))), "its first colour, the symbol's opacity on it");
+    let FillPattern::Gradient { shape, color2, from, to, spread, angle, in_view, stops, .. } = fills[0].pattern else {
+        panic!("{fills:?}")
+    };
+    assert_eq!(
+        (shape, from, to, spread, angle, in_view),
+        (GradientShape::Radial, GradientPoint::CENTROID, GradientPoint::At([1.0, 0.25]), Spread::Reflect, 30.0, false)
+    );
+    assert_eq!(color2, half(Rgba::rgb(0, 0, 255)), "faded with the symbol");
+    assert!(stops.is_empty());
+    assert!(!report.notes.iter().any(|n| n.text.contains("gradient")), "{:?}", report.notes);
+    // world.qgs's shapeburst: a colour ramp with stops (QGIS 2 props), 5 mm deep, blurred.
+    let burst = r#"<layer class="ShapeburstFill" enabled="1"><prop k="blur_radius" v="10"/><prop k="color" v="51,160,44,255"/><prop k="color1" v="0,104,55,255"/>
+        <prop k="color2" v="255,255,204,255"/><prop k="color_type" v="1"/><prop k="discrete" v="0"/><prop k="distance_unit" v="MM"/><prop k="gradient_color2" v="178,223,138,255"/>
+        <prop k="ignore_rings" v="0"/><prop k="max_distance" v="5"/><prop k="offset" v="0,0"/><prop k="stops" v="0.05;49,163,84,255:0.1;120,198,121,255,rgb:0.47,0.78,0.47,1;rgb;ccw:0.75;194,230,153,255"/>
+        <prop k="use_whole_shape" v="0"/></layer>"#;
+    let (fills, report) = read(burst);
+    let FillPattern::Shapeburst { color2, stops, distance, blur, ignore_rings, discrete } = fills[0].pattern else { panic!("{fills:?}") };
+    assert_eq!(fills[0].color, Some(half(Rgba::rgb(0, 104, 55))), "the ramp's first colour");
+    assert_eq!(color2, half(Rgba::rgb(255, 255, 204)));
+    assert_eq!(
+        stops.as_slice(),
+        &[(0.05, Rgba::rgb(49, 163, 84)), (0.1, Rgba::rgb(120, 198, 121)), (0.75, Rgba::rgb(194, 230, 153))]
+            .map(|(at, c)| Stop { at, color: half(c) })
+    );
+    assert!((distance.unwrap() - 5.0 * 96.0 / 25.4).abs() < 1e-3, "{distance:?}");
+    assert_eq!((blur, ignore_rings, discrete), (10, false, false));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    // A ramp that isn't a gradient: drawn by its two ends, its stops left out, and noted.
+    let random = burst.replace(r#"<prop k="color_type" v="1"/>"#, r#"<prop k="color_type" v="1"/><prop k="rampType" v="random"/>"#);
+    let (fills, report) = read(&random);
+    let FillPattern::Shapeburst { stops, .. } = fills[0].pattern else { panic!("{fills:?}") };
+    assert!(stops.as_slice().is_empty(), "{stops:?}");
+    assert!(report.notes.iter().any(|n| n.text.contains("other than gradients")), "{:?}", report.notes);
+    // Invalid stops before a valid one don't use up what a fill keeps.
+    let junk: String = (0..20).map(|_| "0.1;not a colour:").collect();
+    let late = burst.replace(r#"<prop k="stops" v=""#, &format!(r#"<prop k="stops" v="{junk}0.5;255,0,0,255:"#));
+    let (fills, _) = read(&late);
+    let FillPattern::Shapeburst { stops, .. } = fills[0].pattern else { panic!("{fills:?}") };
+    assert!(stops.as_slice().iter().any(|s| s.at == 0.5 && s.color.0[..3] == [255, 0, 0]), "{stops:?}");
+    // Over the whole shape; an offset, which is left out, noted.
+    let whole =
+        burst.replace(r#"<prop k="use_whole_shape" v="0"/>"#, r#"<prop k="use_whole_shape" v="1"/>"#).replace(r#"v="0,0""#, r#"v="1,2""#);
+    let (fills, report) = read(&whole);
+    assert!(matches!(fills[0].pattern, FillPattern::Shapeburst { distance: None, .. }), "{fills:?}");
+    assert!(report.notes.iter().any(|n| n.text.contains("offsets")), "{:?}", report.notes);
+    // Without the setting, QGIS's default: over the whole shape.
+    let (fills, _) = read(&burst.replace(r#"<prop k="use_whole_shape" v="0"/>"#, ""));
+    assert!(matches!(fills[0].pattern, FillPattern::Shapeburst { distance: None, .. }), "{fills:?}");
+}
+
+/// A label text that is an expression, and data-defined label size, colour and rotation, carry
+/// over as the label class's expressions; sizes in another unit are turned into points, and
+/// what isn't drawn by expression is noted by name.
+#[test]
+fn label_expressions_and_data_defined_label_settings_carry_over() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qml");
+    let read = |text: &str| {
+        let mut report = Report::default();
+        let s = read_style(text, "points", &mut report).unwrap();
+        (s.labels.unwrap().default, report)
+    };
+    let (c, report) = read(&std::fs::read_to_string(dir.join("label-expression-text.qml")).unwrap());
+    assert_eq!(c.by.text.as_deref(), Some(r#""name" || ' (' || to_string("value") || ')'"#));
+    assert!(c.field.is_empty());
+    assert!(!report.notes.iter().any(|n| n.text.contains("expression")), "{:?}", report.notes);
+    let (c, report) = read(&std::fs::read_to_string(dir.join("label-data-defined.qml")).unwrap());
+    assert_eq!(c.field, "name");
+    assert_eq!(
+        (c.by.size.as_deref(), c.by.color.as_deref(), c.by.angle.as_deref()),
+        (Some(r#""value" / 5 + 6"#), Some(r#""kind""#), Some(r#""angle""#))
+    );
+    assert!(!report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+    // A size in millimetres, QGIS 2's counterclockwise rotation, and one RustGIS has no place for.
+    let qml = |unit: &str, props: &str| {
+        format!(
+            r#"<qgis version="3.40.0"><labeling type="simple"><settings><text-style fieldName="name" fontSize="3" fontSizeUnit="{unit}"/>
+            <dd_properties><Option type="Map"><Option name="properties" type="Map">{props}</Option></Option></dd_properties></settings></labeling></qgis>"#
+        )
+    };
+    let dd = |name: &str, expr: &str| {
+        format!(
+            r#"<Option name="{name}" type="Map"><Option name="active" type="bool" value="true"/><Option name="expression" value="{expr}"/><Option name="type" type="int" value="3"/></Option>"#
+        )
+    };
+    let (c, report) =
+        read(&qml("MM", &[dd("Size", "2 + 1"), dd("Rotation", "&quot;deg&quot;"), dd("Show", "1"), dd("Family", "'Arial'")].concat()));
+    assert_eq!((c.by.size.as_deref(), c.by.angle.as_deref()), (Some("(2 + 1) * 2.834646"), Some(r#"-("deg")"#)));
+    assert!(report.notes.iter().any(|n| n.text.contains("data-defined label settings (Family, Show)")), "{:?}", report.notes);
+    // Past twelve names, how many more.
+    let many: String = (1..=14).map(|i| dd(&format!("Unknown{i:02}"), "1")).collect();
+    let (_, report) = read(&qml("Point", &many));
+    assert!(report.notes.iter().any(|n| n.text.contains("Unknown12, and 2 more)")), "{:?}", report.notes);
+    // Both rotations: the first is kept, the other noted.
+    let (c, report) = read(&qml("Point", &[dd("LabelRotation", "10"), dd("Rotation", "20")].concat()));
+    assert_eq!(c.by.angle.as_deref(), Some("10"));
+    assert!(report.notes.iter().any(|n| n.text.contains("data-defined label settings (Rotation)")), "{:?}", report.notes);
+    // An empty expression labels nothing: the class is left out, said.
+    for empty in ["", "&quot;&quot;", "&quot; &quot;", "  "] {
+        let qml = format!(
+            r#"<qgis version="3.40.0"><labeling type="simple"><settings><text-style isExpression="1" fieldName="{empty}"/></settings></labeling></qgis>"#
+        );
+        let mut report = Report::default();
+        let s = read_style(&qml, "points", &mut report);
+        assert!(!s.is_ok_and(|s| s.labels.is_some()), "{empty:?}");
+        assert!(report.notes.iter().any(|n| n.text.contains("an empty expression")), "{empty:?}: {:?}", report.notes);
+    }
+    // An expression too long to read: the class is left out, said.
+    let long = format!(
+        r#"<qgis version="3.40.0"><labeling type="simple"><settings><text-style isExpression="1" fieldName="'{}'"/></settings></labeling></qgis>"#,
+        "x".repeat(20_000)
+    );
+    let mut report = Report::default();
+    let s = read_style(&long, "points", &mut report);
+    assert!(!s.is_ok_and(|s| s.labels.is_some()));
+    assert!(report.notes.iter().any(|n| n.text.contains("too long")), "{:?}", report.notes);
+}
+
+/// Data-defined size, colours, outline width and angle carry over as the layer's expressions:
+/// a field's quoted, sizes in millimetres turned into points; an angle that is a field still
+/// turns the markers by it, as before.
+#[test]
+fn data_defined_symbol_settings_carry_over_as_expressions() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qml/datadefined-size-angle-color.qml");
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut report = Report::default();
+    let s = read_style(&text, "points", &mut report).unwrap();
+    let by = s.symbol_by.clone().unwrap();
+    assert_eq!(by.size.as_deref(), Some(r#"("value") * 3.779528"#));
+    assert_eq!(by.fill.as_deref(), Some(r#"CASE WHEN "kind" = 'a' THEN '#ff0000' ELSE '#0000ff' END"#));
+    assert_eq!(by.angle, None, "a field's angle turns by the field");
+    assert_eq!(s.marker_rotation.clone().flatten().map(|r| r.field), Some("angle".into()));
+    assert!(!report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+    // Applied to a point layer with those fields, each reads and draws per feature.
+    let fields = ["value", "angle"].map(|f| rustgis_data::Field::new(f, rustgis_data::FieldType::Double));
+    let mut ds = rustgis_data::Dataset::new("points", rustgis_data::GeometryType::Point, fields.to_vec());
+    ds.fields.push(rustgis_data::Field::new("kind", rustgis_data::FieldType::Text));
+    ds.push(
+        Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))),
+        vec![rustgis_data::Value::Float(2.0), rustgis_data::Value::Float(0.0), rustgis_data::Value::Text("a".into())],
+    );
+    let mut layer = crate::Layer::new(1, ds);
+    s.apply(&mut layer);
+    let sym = layer.styler(None).symbol(0);
+    assert!((sym.size - 2.0 * 96.0 / 25.4).abs() < 1e-3 && sym.fill == Rgba::rgb(255, 0, 0), "{sym:?}");
+
+    // A line's colour and width; an outline width in points; what isn't drawn by expression is noted.
+    let dd = |props: &[(&str, &str)]| {
+        let one = |(name, expr): &(&str, &str)| {
+            format!(
+                r#"<Option type="Map" name="{name}"><Option value="true" type="bool" name="active"/><Option value="{expr}" type="QString" name="expression"/>
+                <Option value="3" type="int" name="type"/></Option>"#
+            )
+        };
+        format!(
+            r#"<data_defined_properties><Option type="Map"><Option value="" type="QString" name="name"/><Option type="Map" name="properties">{}</Option>
+            <Option value="collection" type="QString" name="type"/></Option></data_defined_properties>"#,
+            props.iter().map(one).collect::<String>()
+        )
+    };
+    let line = format!(
+        r#"<qgis version="3.40.0"><renderer-v2 type="singleSymbol"><symbols><symbol type="line" name="0" alpha="1">
+        <layer class="SimpleLine" enabled="1"><Option type="Map"><Option name="line_width" value="0.5"/><Option name="line_width_unit" value="Point"/></Option>{}</layer>
+        </symbol></symbols></renderer-v2></qgis>"#,
+        dd(&[("outlineWidth", "if(@map_scale &lt; 4656581, 1.0, 0)"), ("outlineColor", "color_rgb(255, 0, 0)")])
+    );
+    let mut report = Report::default();
+    let s = read_style(&line, "roads", &mut report).unwrap();
+    let by = s.symbol_by.unwrap();
+    // QGIS's map scale read as RustGIS's.
+    let k = QGIS_SCALE;
+    assert_eq!(by.stroke_width.as_deref(), Some(format!("(if((@map_scale / {k}) < 4656581, 1.0, 0)) * 1.333333").as_str()), "{by:?}");
+    assert_eq!(by.stroke.as_deref(), Some("color_rgb(255, 0, 0)"));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    // A line of two strokes draws each with its own: left out, said.
+    let stroke =
+        r#"<layer class="SimpleLine" enabled="1"><Option type="Map"><Option name="line_color" value="0,0,0,255"/></Option></layer>"#;
+    let doubled = line.replace("</symbol>", &format!("{stroke}{stroke}</symbol>"));
+    let mut report = Report::default();
+    let s = read_style(&doubled, "roads", &mut report).unwrap();
+    assert!(s.symbol_by.is_none_or(|b| b.stroke.is_none() && b.stroke_width.is_none()));
+    assert!(report.notes.iter().any(|n| n.text.contains("line of several strokes")), "{:?}", report.notes);
+    // Classes: one sized by expression, one not; left out (applied to every feature, they would
+    // change the other's), said. A see-through symbol's expression colour is drawn opaque, said.
+    let marker = |name: &str, props: &str| {
+        format!(
+            r#"<symbol type="marker" name="{name}" alpha="0.5"><layer class="SimpleMarker" enabled="1"><Option type="Map"/>{props}</layer></symbol>"#
+        )
+    };
+    let classes = format!(
+        r#"<qgis version="3.40.0"><renderer-v2 type="categorizedSymbol" attr="kind"><categories>
+          <category value="a" symbol="0" label="a" render="true"/><category value="b" symbol="1" label="b" render="true"/></categories>
+          <symbols>{}{}</symbols></renderer-v2></qgis>"#,
+        marker("0", &dd(&[("size", "&quot;v&quot;"), ("fillColor", "'red'")])),
+        marker("1", "")
+    );
+    let mut report = Report::default();
+    let s = read_style(&classes, "points", &mut report).unwrap();
+    assert!(s.symbol_by.is_none_or(|b| b.is_empty()));
+    let said = |t: &str| report.notes.iter().any(|n| n.text.contains(t));
+    assert!(said("differ between its classes") && said("see-through symbol"), "{:?}", report.notes);
+    // Both classes alike: theirs. With a class switched off besides, which they would paint: left
+    // out, said.
+    let same = dd(&[("size", "&quot;v&quot;")]);
+    let alike =
+        classes.replace(&marker("1", ""), &marker("1", &same)).replace(&dd(&[("size", "&quot;v&quot;"), ("fillColor", "'red'")]), &same);
+    let mut report = Report::default();
+    let s = read_style(&alike, "points", &mut report).unwrap();
+    assert_eq!(s.symbol_by.unwrap().size.as_deref(), Some(r#"("v") * 3.779528"#));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    let off = alike.replace("</categories>", r#"<category value="c" symbol="1" label="c" render="false"/></categories>"#);
+    let mut report = Report::default();
+    let s = read_style(&off, "points", &mut report).unwrap();
+    assert!(s.symbol_by.is_none_or(|b| b.is_empty()));
+    assert!(report.notes.iter().any(|n| n.text.contains("a class switched off")), "{:?}", report.notes);
+    // A marker of two layers (the Training Manual's world places): a white disc sized by
+    // expression, a black dot sized in proportion on top. The marks scale with the top layer's
+    // size; their colours stay their own, the outline colour by expression is left out.
+    let layer_of = |color: &str, size: &str, props: &[(&str, &str)]| {
+        format!(
+            r#"<layer class="SimpleMarker" enabled="1"><Option type="Map"><Option name="color" value="{color}"/><Option name="size" value="{size}"/></Option>{}</layer>"#,
+            dd(props)
+        )
+    };
+    let places = format!(
+        r#"<qgis version="3.10.4"><renderer-v2 type="singleSymbol"><symbols><symbol type="marker" name="0" alpha="1">{}{}</symbol></symbols></renderer-v2></qgis>"#,
+        layer_of(
+            "255,255,255,255",
+            "2.4",
+            &[
+                ("outlineColor", "IF(pop_max &gt; 5000000, color_rgb(255,0,0), color_rgb(0,0,0))"),
+                ("size", "scale_linear(pop_max, 7026, 35676000, 8, 18)")
+            ]
+        ),
+        layer_of("0,0,0,255", "0.5", &[("size", "0.208333*(scale_linear(pop_max, 7026, 35676000, 8, 18))")])
+    );
+    let mut report = Report::default();
+    let s = read_style(&places, "places", &mut report).unwrap();
+    let by = s.symbol_by.unwrap();
+    // Turned into the largest layer's (the symbol's) size: 2.4 / 0.5 times the dot's.
+    assert_eq!(by.size.as_deref(), Some("((0.208333*(scale_linear(pop_max, 7026, 35676000, 8, 18))) * 3.779528) * 4.8"));
+    assert!(by.stroke.is_none(), "{by:?}");
+    assert_eq!(s.line_strokes.map(|m| m.len()), Some(2));
+    let said = |t: &str| report.notes.iter().any(|n| n.text.contains(t));
+    // Both layers sized by expression scale together as QGIS scales them: nothing to say of that.
+    assert!(!said("scaled with its size") && said("colours and outline widths of a marker drawn as marks"), "{:?}", report.notes);
+    // A layer of a fixed size scales with the rest: said.
+    let fixed = places.replace(&dd(&[("size", "0.208333*(scale_linear(pop_max, 7026, 35676000, 8, 18))")]), "");
+    let mut report = Report::default();
+    read_style(&fixed, "places", &mut report).unwrap();
+    assert!(report.notes.iter().any(|n| n.text.contains("scaled with its size")), "{:?}", report.notes);
+    assert!(!report.notes.iter().any(|n| n.text.contains("drawn with the first's")), "{:?}", report.notes);
+
+    let dashed = line.replace("outlineColor", "customDash");
+    let mut report = Report::default();
+    let s = read_style(&dashed, "roads", &mut report).unwrap();
+    assert!(s.symbol_by.unwrap().stroke.is_none());
+    assert!(report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+}
+
+/// A layer of points with the fields QGIS's generated rule-based style filters by.
+fn rule_points(rows: &[(&str, i64, &str)]) -> crate::Layer {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+    let fields = vec![Field::new("kind", FieldType::Text), Field::new("value", FieldType::Integer), Field::new("name", FieldType::Text)];
+    let mut ds = Dataset::new("points", GeometryType::Point, fields);
+    for (kind, value, name) in rows {
+        let g = Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0));
+        ds.push(Some(g), vec![Value::Text((*kind).into()), Value::Int(*value), Value::Text((*name).into())]);
+    }
+    crate::Layer::new(1, ds)
+}
+
+/// The class each row of `l` draws with at 1:`scale`: its key, or `None` for the rest.
+fn rule_classes(l: &crate::Layer, scale: Option<f64>) -> Vec<Option<String>> {
+    let c = l.renderer.classer(&l.dataset, scale);
+    let Renderer::Unique { classes, .. } = &l.renderer else { panic!("{:?}", l.renderer) };
+    (0..l.dataset.features.len()).map(|r| l.renderer.unique_class(&l.dataset, r, &c).map(|i| classes[i].0.clone())).collect()
+}
+
+#[test]
+fn a_rule_based_renderer_classes_each_feature_by_the_first_rule_it_meets() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qml/renderer-RuleRenderer.qml");
+    let mut report = Report::default();
+    let s = read_style(&std::fs::read_to_string(path).unwrap(), "points", &mut report).unwrap();
+    let Some(Renderer::Unique { field, classes, expression: Some(e), .. }) = &s.renderer else { panic!("{:?}", s.renderer) };
+    assert!(field.is_empty(), "by expression, not a field");
+    let keys: Vec<&str> = classes.iter().map(|c| c.0.as_str()).collect();
+    assert_eq!(keys, ["a", "big", "fn", "inner"], "each rule a class, the else rule the rest");
+    assert!(e.starts_with("CASE WHEN (\"kind\" = 'a') THEN 'a' WHEN "), "{e}");
+    assert!(e.contains("(length(\"name\") > 3) THEN 'fn'"), "kept as QGIS wrote it: {e}");
+    assert!(e.contains("(\"value\" < 50) AND (\"kind\" = 'c') THEN 'inner'"), "the parent's filter too: {e}");
+    assert!(!report.notes.iter().any(|n| n.text.contains("rules")), "{:?}", report.notes);
+    assert_eq!(s.rules.len(), 4);
+
+    let mut l = rule_points(&[("a", 10, "ab"), ("b", 60, "xy"), ("c", 20, "abcd"), ("c", 20, "ab"), ("z", 99, "ab")]);
+    s.apply(&mut l);
+    // "big" is drawn between 1:50,000 and 1:1,000 the wrong way round: at no scale in QGIS, at
+    // every one without a map (an export).
+    let at = |scale| rule_classes(&l, scale);
+    let named = |v: &[Option<&str>]| v.iter().map(|k| k.map(str::to_string)).collect::<Vec<_>>();
+    assert_eq!(at(Some(5000.0)), named(&[Some("a"), None, Some("fn"), Some("inner"), None]));
+    assert_eq!(at(None), named(&[Some("a"), Some("big"), Some("fn"), Some("inner"), None]));
+}
+
+/// A renderer whose only rule is an else rule draws every feature with its symbol: one symbol,
+/// nothing approximated.
+#[test]
+fn a_lone_else_rule_is_one_symbol() {
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r"><rule filter="ELSE" symbol="0" label="All"/></rules>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#;
+    let mut report = Report::default();
+    let s = read_style(qml, "points", &mut report).unwrap();
+    assert!(matches!(s.renderer, Some(Renderer::Single(_))), "{:?}", s.renderer);
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    // Of two top-level else rules, the first draws the rest; the second adds no class.
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">
+        <rule filter="&quot;value&quot; &gt;= 20 AND &quot;kind&quot; = 'a'" symbol="0" label="A"/>
+        <rule filter="ELSE" symbol="1" label="First rest"/><rule filter="ELSE" symbol="0" label="Second rest"/></rules>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"><prop k="color" v="0,0,255,255"/></layer></symbol></symbols></renderer-v2></qgis>"#;
+    let s = read_style(qml, "points", &mut Report::default()).unwrap();
+    let mut l = rule_points(&[("a", 30, "q"), ("b", 30, "q")]);
+    s.apply(&mut l);
+    assert_eq!(rule_classes(&l, None), [Some("A".to_string()), None]);
+    assert!(
+        matches!(&l.renderer, Renderer::Unique { other, other_label: Some(o), .. } if o == "First rest" && other.fill == crate::Rgba::rgb(0, 0, 255)),
+        "{:?}",
+        l.renderer
+    );
+    // So too beside rules on one field's values (Unique Values on it).
+    let simple = qml.replace(r#"&quot;value&quot; &gt;= 20 AND &quot;kind&quot; = 'a'"#, r#"&quot;kind&quot; = 'a'"#);
+    let mut l = rule_points(&[("a", 30, "q"), ("b", 30, "q")]);
+    read_style(&simple, "points", &mut Report::default()).unwrap().apply(&mut l);
+    assert!(
+        matches!(&l.renderer, Renderer::Unique { field, other, other_label: Some(o), .. } if field == "kind" && o == "First rest" && other.fill == crate::Rgba::rgb(0, 0, 255)),
+        "{:?}",
+        l.renderer
+    );
+}
+
+#[test]
+fn rules_keep_their_scales_else_rules_and_switched_off_groups() {
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">
+        <rule filter="&quot;value&quot; &gt;= 50" label="Big" symbol="0" scalemaxdenom="100000"/>
+        <rule filter="&quot;kind&quot; = 'c'" label="C">
+          <rule filter="&quot;value&quot; &lt; 15" symbol="1" label="Small c"/>
+          <rule filter="ELSE" symbol="2" label="Other c" scalemindenom="10000"/>
+        </rule>
+        <rule filter="&quot;kind&quot; = 'a'" active="0"><rule filter="TRUE" symbol="3" label="Never"/></rule>
+        <rule filter="&quot;name&quot; || 'x' = 'abx'" symbol="3" label="Big"/>
+      </rules><symbols>
+        <symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"><prop k="color" v="255,0,0,255"/></layer></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"><prop k="color" v="0,255,0,255"/></layer></symbol>
+        <symbol type="marker" name="2"><layer class="SimpleMarker" enabled="1"><prop k="color" v="0,0,255,255"/></layer></symbol>
+        <symbol type="marker" name="3"><layer class="SimpleMarker" enabled="1"><prop k="color" v="9,9,9,255"/></layer></symbol>
+      </symbols></renderer-v2></qgis>"#;
+    let mut report = Report::default();
+    let s = read_style(qml, "points", &mut report).unwrap();
+    let Some(Renderer::Unique { classes, other, .. }) = &s.renderer else { panic!("{:?}", s.renderer) };
+    let keys: Vec<&str> = classes.iter().map(|c| c.0.as_str()).collect();
+    // A switched-off rule takes the rules under it; a label used twice is told apart.
+    assert_eq!(keys, ["Big", "Small c", "Other c", "Big (2)"]);
+    assert_eq!(classes[1].1.fill, Rgba::rgb(0, 255, 0));
+    assert_eq!(other.fill.a(), 0, "no else rule at the top: the rest isn't drawn");
+    assert!(!report.notes.iter().any(|n| n.text.contains("scales")), "scales are kept: {:?}", report.notes);
+
+    let mut l = rule_points(&[("z", 80, "q"), ("c", 10, "q"), ("c", 30, "q"), ("a", 1, "ab"), ("a", 1, "q")]);
+    s.apply(&mut l);
+    let named = |v: &[Option<&str>]| v.iter().map(|k| k.map(str::to_string)).collect::<Vec<_>>();
+    // Zoomed in past 1:10,000 (QGIS's), "Other c" is gone; out past 1:100,000, "Big" is.
+    assert_eq!(rule_classes(&l, Some(50_000.0)), named(&[Some("Big"), Some("Small c"), Some("Other c"), Some("Big (2)"), None]));
+    assert_eq!(rule_classes(&l, Some(5_000.0)), named(&[Some("Big"), Some("Small c"), None, Some("Big (2)"), None]));
+    assert_eq!(rule_classes(&l, Some(500_000.0)), named(&[None, Some("Small c"), Some("Other c"), Some("Big (2)"), None]));
+    // A sibling's filter that is unknown for a feature (a null value) isn't met: the else rule
+    // takes it.
+    let mut l = rule_points(&[("c", 0, "q")]);
+    l.dataset.features[0].attrs[1] = rustgis_data::Value::Null;
+    s.apply(&mut l);
+    assert_eq!(rule_classes(&l, None), named(&[Some("Other c")]));
+}
+
+#[test]
+fn rules_past_what_one_expression_holds_are_drawn_with_the_first_and_noted() {
+    let rules: String =
+        (0..300).map(|i| format!(r#"<rule filter="&quot;value&quot; = {i} AND upper(&quot;kind&quot;) = 'A'" symbol="0"/>"#)).collect();
+    let qml = format!(
+        r#"<qgis><renderer-v2 type="RuleRenderer"><rules key="r">{rules}</rules><symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#
+    );
+    let mut report = Report::default();
+    let s = read_style(&qml, "points", &mut report).unwrap();
+    assert!(matches!(s.renderer, Some(Renderer::Single(_))), "{:?}", s.renderer);
+    assert!(report.notes.iter().any(|n| n.text.contains("300 rules")), "{:?}", report.notes);
+    // Rules on one field's values are still Unique Values on that field, as before.
+    let qml = r#"<qgis><renderer-v2 type="RuleRenderer"><rules key="r"><rule filter="&quot;kind&quot; = 'a'" symbol="0"/><rule filter="ELSE" symbol="0"/></rules>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2></qgis>"#;
+    let s = read_style(qml, "points", &mut Report::default()).unwrap();
+    assert!(matches!(&s.renderer, Some(Renderer::Unique { field, expression: None, .. }) if field == "kind"), "{:?}", s.renderer);
+    assert!(s.rules.is_empty());
+}
+
+#[test]
+fn an_else_rule_takes_what_its_siblings_dont_draw_at_the_scale() {
+    // Under "Big": kind a only zoomed in past 1:10,000 (QGIS's), and the rest.
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">
+        <rule filter="&quot;value&quot; &gt;= 20" label="Big">
+          <rule filter="&quot;kind&quot; = 'a'" symbol="0" label="A" scalemaxdenom="10000"/>
+          <rule filter="ELSE" symbol="1" label="Rest of big"/>
+        </rule>
+        <rule label="Group without a filter"><rule filter="ELSE" symbol="1" label="Never"/><rule symbol="0" label="All"/></rule>
+      </rules><symbols>
+        <symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"/></symbol>
+      </symbols></renderer-v2></qgis>"#;
+    let s = read_style(qml, "points", &mut Report::default()).unwrap();
+    let mut l = rule_points(&[("a", 30, "q"), ("b", 30, "q"), ("a", 5, "q")]);
+    s.apply(&mut l);
+    let named = |v: &[Option<&str>]| v.iter().map(|k| k.map(str::to_string)).collect::<Vec<_>>();
+    // Zoomed in, kind a is "A"; zoomed out, the else rule takes it. Beside a rule with no filter
+    // (every feature), an else rule draws nothing.
+    assert_eq!(rule_classes(&l, Some(5_000.0)), named(&[Some("A"), Some("Rest of big"), Some("All")]));
+    assert_eq!(rule_classes(&l, Some(50_000.0)), named(&[Some("Rest of big"), Some("Rest of big"), Some("All")]));
+    // The legend lists what is drawn at the map's scale.
+    let legend = |scale| l.shown_legend(scale).unwrap().into_iter().map(|e| e.label).collect::<Vec<_>>();
+    assert_eq!(legend(5_000.0), ["A", "All", "Rest of big"]);
+    assert_eq!(legend(50_000.0), ["All", "Rest of big"]);
+}
+
+/// A rule under an else rule takes only what the else rule does: what none of its siblings
+/// draws, even before them; a label rule too.
+#[test]
+fn rules_under_an_else_rule_take_only_the_rest() {
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r">
+        <rule filter="ELSE" label="Rest group"><rule symbol="1" label="Rest"/></rule>
+        <rule filter="&quot;kind&quot; = 'a'" symbol="0" label="A"/>
+      </rules><symbols>
+        <symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"/></symbol>
+      </symbols></renderer-v2>
+      <labeling type="rule-based"><rules key="r">
+        <rule filter="ELSE"><rule description="Rest"><settings><text-style fieldName="name"/></settings></rule></rule>
+        <rule filter="&quot;kind&quot; = 'a'" description="A"><settings><text-style fieldName="name"/></settings></rule>
+        <rule active="0"><rule description="Off"><settings><text-style fieldName="name"/></settings></rule></rule>
+      </rules></labeling></qgis>"#;
+    let mut report = Report::default();
+    let s = read_style(qml, "points", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("past the")), "{:?}", report.notes);
+    let mut l = rule_points(&[("a", 1, "x"), ("b", 1, "y")]);
+    s.apply(&mut l);
+    // Kind a is A's, not the rest's (the rules are Unique Values on kind, the rest the others,
+    // under the else rule's label).
+    assert_eq!(rule_classes(&l, Some(5_000.0)), [Some("a".to_string()), None]);
+    assert!(matches!(&l.renderer, Renderer::Unique { other_label: Some(o), .. } if o == "Rest"), "{:?}", l.renderer);
+    assert!(l.labels.class("Off").is_none(), "a label rule under a switched-off one isn't read");
+    let rest = l.labels.class("Rest").expect("the label rule under the else rule");
+    assert!(rest.where_.as_deref().is_some_and(|w| w.contains("NOT")), "{:?}", rest.where_);
+}
+
+/// A sibling counts against an else rule only where it, or a rule under it, draws (as QGIS has
+/// it): a rule without a symbol or label settings and nothing under it takes nothing, and a group
+/// takes only what the rules under it draw.
+#[test]
+fn else_rules_take_what_siblings_that_draw_nothing_leave() {
+    let qml = r#"<qgis version="3.40.0"><renderer-v2 type="RuleRenderer"><rules key="r"><rule filter="&quot;value&quot; &gt;= 1" label="Outer">
+        <rule filter="&quot;kind&quot; = 'b'" label="Hidden"/>
+        <rule label="Group"><rule filter="&quot;kind&quot; = 'a'" symbol="0" label="A"/></rule>
+        <rule filter="ELSE" symbol="1" label="Rest"/>
+      </rule></rules><symbols>
+        <symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol>
+        <symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"/></symbol>
+      </symbols></renderer-v2>
+      <labeling type="rule-based"><rules key="r">
+        <rule filter="&quot;kind&quot; = 'b'" description="No settings"/>
+        <rule description="Label group"><rule filter="&quot;kind&quot; = 'a'" description="A"><settings><text-style fieldName="name"/></settings></rule></rule>
+        <rule filter="ELSE" description="Rest"><settings><text-style fieldName="name"/></settings></rule>
+      </rules></labeling></qgis>"#;
+    let s = read_style(qml, "points", &mut Report::default()).unwrap();
+    let mut l = rule_points(&[("a", 1, "x"), ("b", 1, "y"), ("c", 1, "z")]);
+    s.apply(&mut l);
+    // (Kind b, which the hidden rule doesn't draw, is the rest's.)
+    let named = |v: &[&str]| v.iter().map(|k| Some(k.to_string())).collect::<Vec<_>>();
+    assert_eq!(rule_classes(&l, Some(5_000.0)), named(&["A", "Rest", "Rest"]));
+    let names = |row: usize| {
+        crate::LabelMatcher::new(&l.labels, &l.dataset, Some(5_000.0))
+            .classes_of(&l.dataset, row)
+            .filter(|(_, c)| c.visible)
+            .map(|(_, c)| c.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(0), ["A"]);
+    assert_eq!(names(1), ["Rest"]);
+    assert_eq!(names(2), ["Rest"]);
+}
+
+/// A label else rule beside more siblings than one clause holds is left out, and said so.
+#[test]
+fn a_label_else_rule_too_long_to_read_is_noted() {
+    let long = "x".repeat(200);
+    let rules: String = (0..60)
+        .map(|i| format!(r#"<rule filter="&quot;name&quot; = '{long}{i}'" description="R{i}"><settings><text-style fieldName="name"/></settings></rule>"#))
+        .collect();
+    let qml = format!(
+        r#"<qgis version="3.40.0"><labeling type="rule-based"><rules key="r">{rules}<rule filter="ELSE" description="Rest"><settings><text-style fieldName="name"/></settings></rule></rules></labeling></qgis>"#
+    );
+    let mut report = Report::default();
+    let s = read_style(&qml, "points", &mut report).unwrap();
+    let mut l = rule_points(&[("a", 1, "x")]);
+    s.apply(&mut l);
+    assert!(l.labels.class("Rest").is_none());
+    assert!(l.labels.class("R0").is_some() && l.labels.class("R59").is_some(), "its siblings are kept");
+    assert!(report.notes.iter().any(|n| n.text.contains("\"Rest\"")), "{:?}", report.notes);
+}
+
+/// A label else rule takes what its siblings don't label, as the renderer's else rules do: at
+/// their scales, a feature a sibling's filter is unknown for, and nothing beside a sibling with
+/// no filter.
+#[test]
+fn label_else_rules_take_what_their_siblings_dont_at_their_scales() {
+    let settings = r#"<settings><text-style fieldName="name"/></settings>"#;
+    let read = |rules: &str| {
+        let qml = format!(r#"<qgis version="3.40.0"><labeling type="rule-based"><rules key="r">{rules}</rules></labeling></qgis>"#);
+        let s = read_style(&qml, "points", &mut Report::default()).unwrap();
+        let mut l = rule_points(&[("a", 1, "x"), ("b", 1, "y"), ("c", 1, "z")]);
+        // A feature whose kind is unknown: A's filter is null for it.
+        if let Some(f) = l.dataset.features.get_mut(2).and_then(|f| f.attrs.get_mut(0)) {
+            *f = rustgis_data::Value::Null;
+        }
+        s.apply(&mut l);
+        l
+    };
+    let names = |l: &crate::Layer, scale: f64, row: usize| {
+        crate::LabelMatcher::new(&l.labels, &l.dataset, Some(scale))
+            .classes_of(&l.dataset, row)
+            .filter(|(_, c)| c.visible)
+            .map(|(_, c)| c.name.clone())
+            .collect::<Vec<_>>()
+    };
+    let l = read(&format!(
+        r#"<rule filter="&quot;kind&quot; = 'a'" description="A" scalemaxdenom="10000">{settings}</rule><rule filter="ELSE" description="Rest">{settings}</rule>"#
+    ));
+    // Zoomed in, A labels kind a; zoomed out past its range (kept on its class, which isn't drawn
+    // there), the rest does too. Kind b and the unknown one are the rest's at every scale.
+    assert_eq!(names(&l, 5_000.0, 0), ["A"]);
+    assert_eq!(names(&l, 50_000.0, 0), ["A", "Rest"]);
+    assert!(l.labels.class("A").and_then(|a| a.min_scale).is_some_and(|out| out < 50_000.0));
+    for scale in [5_000.0, 50_000.0] {
+        assert_eq!(names(&l, scale, 1), ["Rest"], "{scale}");
+        assert_eq!(names(&l, scale, 2), ["Rest"], "{scale}");
+    }
+    // Beside a rule with no filter (every feature), an else rule labels nothing.
+    let l = read(&format!(r#"<rule description="All">{settings}</rule><rule filter="ELSE" description="Never">{settings}</rule>"#));
+    for row in 0..3 {
+        assert_eq!(names(&l, 5_000.0, row), ["All"], "{row}");
+    }
+    // A rule inside a group is labelled only within both ranges, as the renderer draws it.
+    let l = read(&format!(
+        r#"<rule description="Group" scalemaxdenom="10000"><rule filter="&quot;kind&quot; = 'a'" description="Inner" scalemaxdenom="50000">{settings}</rule></rule>"#
+    ));
+    assert_eq!(names(&l, 5_000.0, 0), ["Inner"]);
+    assert!(l.labels.class("Inner").and_then(|c| c.min_scale).is_some_and(|out| (out - 10_000.0 * QGIS_SCALE).abs() < 1e-6));
+    // Its settings' own range too keeps within the group's.
+    let l = read(
+        r#"<rule description="Group" scalemaxdenom="10000"><rule description="Own"><settings><text-style fieldName="name"/><rendering scaleVisibility="1" scaleMin="50000"/></settings></rule></rule>"#,
+    );
+    assert!(l.labels.class("Own").and_then(|c| c.min_scale).is_some_and(|out| (out - 10_000.0 * QGIS_SCALE).abs() < 1e-6));
+}
+
+#[test]
+fn many_rules_read_quickly() {
+    // Thousands of rules beside thousands of else rules: bounded, not one sibling list each.
+    // (A switched-off rule past them draws nothing, so it isn't among those said left out.)
+    let rules: String = (0..20_000)
+        .map(|i| format!(r#"<rule filter="a = {i}" symbol="0"/><rule filter="ELSE" symbol="0"/>"#))
+        .chain(std::iter::once(r#"<rule filter="a = 1" symbol="0" active="0"/>"#.to_string()))
+        .collect();
+    let qml = format!(
+        r#"<qgis><renderer-v2 type="RuleRenderer"><rules key="r">{rules}</rules><symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2>
+        <labeling type="rule-based"><rules key="r">{}</rules></labeling></qgis>"#,
+        (0..20_000).map(|i| format!(r#"<rule filter="a = {i}"><settings><text-style fieldName="a"/></settings></rule><rule filter="ELSE"><settings><text-style fieldName="a"/></settings></rule>"#)).collect::<String>()
+    );
+    let t = std::time::Instant::now();
+    let mut report = Report::default();
+    let s = read_style(&qml, "points", &mut report).unwrap();
+    assert!(t.elapsed().as_secs_f64() < 10.0, "{:?}", t.elapsed());
+    // Each picks a value of one field: Unique Values on it, its classes bounded.
+    assert!(
+        matches!(&s.renderer, Some(Renderer::Unique { field, classes, .. }) if field == "a" && classes.len() <= 4096),
+        "{:?}",
+        s.renderer.as_ref().map(|r| r.kind_label())
+    );
+    // The rules past those read are said, with how many: 40,000 drawing rules, 4,096 read; 40,000
+    // label rules, 256 read.
+    assert!(report.notes.iter().any(|n| n.text.contains("35904 of its rules, past the")), "{:?}", report.notes);
+    assert!(report.notes.iter().any(|n| n.text.contains("39744 of its label rules, past the")), "{:?}", report.notes);
+}
+
+/// A layer filter (subset string) reading the map's scale can't be a definition query, which has
+/// no scale: it is left out, said, rather than kept to take no feature.
+#[test]
+fn a_subset_string_reading_the_scale_is_left_out() {
+    for (subset, kept) in [("$scale &lt; 5000", false), ("@map_scale &lt; 5000", false), ("&quot;kind&quot; = '$scale'", true)] {
+        let project = format!(
+            r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>./a.gpkg|layername=a|subset={subset}</datasource><layername>A</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+        );
+        let mut report = Report::default();
+        let p = read_project(&project, "/maps", &mut report).unwrap();
+        assert_eq!(p.layers[0].definition_query.is_some(), kept, "{subset}");
+        assert_eq!(report.notes.iter().any(|n| n.text.contains("reads the map's scale")), !kept, "{subset}: {:?}", report.notes);
+    }
 }

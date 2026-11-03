@@ -1,5 +1,5 @@
-//! A plugin's panel: a pane of simple widgets (text, checkboxes, sliders, buttons) bound to its
-//! commands, declared in `plugin.json` (`panel`).
+//! A plugin's panel: a pane of simple widgets (text, checkboxes, sliders, buttons, trees) bound
+//! to its commands, declared in `plugin.json` (`panel`).
 //!
 //! A plugin keeps no state between calls (each gets a fresh instance), so the host keeps the
 //! panel's state: the widgets' values and what the plugin last said about them. Every command
@@ -8,7 +8,7 @@
 //! other hostile input before it is kept. Nothing here knows about the user interface: the
 //! engine keeps a [`PanelState`] per plugin in its session, and the front end draws it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -28,8 +28,12 @@ pub const MAX_STATE_TEXT: usize = 4_000;
 pub const MAX_STATE_LABEL: usize = 200;
 /// The longest declared label, text or help, in characters.
 pub const MAX_DECLARED: usize = 2_000;
+/// The most nodes a tree holds, how deep they go, and the longest node id, in characters.
+pub const MAX_TREE_NODES: usize = 5_000;
+pub const MAX_TREE_DEPTH: usize = 8;
+pub const MAX_TREE_ID: usize = 200;
 /// The widget kinds.
-pub const KINDS: &[&str] = &["text", "checkbox", "slider", "button"];
+pub const KINDS: &[&str] = &["text", "checkbox", "slider", "button", "tree"];
 
 /// The panel as `plugin.json` declares it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,7 +54,8 @@ pub struct PanelDecl {
     pub items: Vec<PanelItemDecl>,
 }
 
-/// A widget. `kind` is `text`, `checkbox`, `slider` or `button`; the other fields apply to some.
+/// A widget. `kind` is `text`, `checkbox`, `slider`, `button` or `tree`; the other fields apply
+/// to some.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PanelItemDecl {
@@ -69,8 +74,8 @@ pub struct PanelItemDecl {
     #[serde(default)]
     pub text: String,
     /// The command it runs: a button's when clicked; a checkbox's when ticked or cleared; a
-    /// slider's when let go (or stepped). Optional for checkboxes and sliders, whose values
-    /// then just go with the plugin's next request.
+    /// slider's when let go (or stepped); a tree's when a node is chosen. Optional for
+    /// checkboxes, sliders and trees, whose values then just go with the plugin's next request.
     #[serde(default)]
     pub command: String,
     /// A checkbox's first value (a bool), or a slider's (a whole number; its `min` if unset).
@@ -84,6 +89,9 @@ pub struct PanelItemDecl {
     /// A slider with ‹ and › buttons that step it by one.
     #[serde(default)]
     pub steps: bool,
+    /// A tree with a search box above it, which keeps the nodes whose label holds what's typed.
+    #[serde(default)]
+    pub search: bool,
 }
 
 impl PanelItemDecl {
@@ -92,9 +100,9 @@ impl PanelItemDecl {
         if self.id.is_empty() && self.kind == "button" { &self.command } else { &self.id }
     }
 
-    /// Whether it has a value (a checkbox or a slider).
+    /// Whether it has a value (a checkbox, a slider or a tree).
     pub fn has_value(&self) -> bool {
-        matches!(self.kind.as_str(), "checkbox" | "slider")
+        matches!(self.kind.as_str(), "checkbox" | "slider" | "tree")
     }
 }
 
@@ -118,11 +126,11 @@ impl PanelDecl {
         if self.items.is_empty() || self.items.len() > MAX_ITEMS {
             return Err(format!("plugin.json: the panel needs 1 to {MAX_ITEMS} items"));
         }
-        let mut ids = std::collections::HashSet::new();
+        let mut ids = HashSet::new();
         for item in &self.items {
             let kind = item.kind.as_str();
             if !KINDS.contains(&kind) {
-                return Err(format!("plugin.json: panel item kind '{}' isn't text, checkbox, slider or button", clip(kind, 40)));
+                return Err(format!("plugin.json: panel item kind '{}' isn't text, checkbox, slider, button or tree", clip(kind, 40)));
             }
             let id = item.key();
             if !crate::manifest::valid_id(id, false) || !ids.insert(id) {
@@ -149,6 +157,9 @@ impl PanelDecl {
             }
             if kind != "text" && !item.text.is_empty() {
                 return Err(what("text is for texts"));
+            }
+            if kind != "tree" && item.search {
+                return Err(what("search is for trees"));
             }
             match (kind, &item.default) {
                 (_, None) | ("checkbox", Some(Value::Bool(_))) => {}
@@ -194,6 +205,69 @@ pub struct ItemState {
     pub max: i64,
     /// A slider's label for each position from `min` (empty: the numbers).
     pub labels: Vec<String>,
+    /// A tree's nodes (shared: the panel's front end copies the state every frame it shows).
+    #[serde(skip_serializing_if = "no_nodes", serialize_with = "shared_nodes")]
+    pub nodes: Arc<Vec<TreeNode>>,
+}
+
+fn no_nodes(n: &Arc<Vec<TreeNode>>) -> bool {
+    n.is_empty()
+}
+
+fn shared_nodes<S: serde::Serializer>(n: &Arc<Vec<TreeNode>>, s: S) -> Result<S::Ok, S::Error> {
+    n.as_slice().serialize(s)
+}
+
+/// A node of a tree, as the plugin gave it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TreeNode {
+    /// How the plugin names it: the tree's value when it is chosen. Unique in the tree.
+    pub id: String,
+    pub label: String,
+    /// A number shown beside it (how many datasets a theme holds, say).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<TreeNode>,
+}
+
+/// The nodes in `v` (`[{"id", "label"?, "count"?, "children"?}]`), at most `left` of them
+/// (counted down) and [`MAX_TREE_DEPTH`] deep below `depth`. A node without an id, or with one
+/// taken already or too long, is left out with its children; a label defaults to the id (when
+/// missing or blank), and is kept to one line (a row of the tree), control characters as spaces.
+fn tree_nodes(v: &[Value], depth: usize, left: &mut usize, seen: &mut HashSet<String>) -> Vec<TreeNode> {
+    let mut nodes = Vec::new();
+    for n in v {
+        if *left == 0 {
+            break;
+        }
+        let Some(id) = n.get("id").and_then(Value::as_str).filter(|i| !i.is_empty() && i.chars().count() <= MAX_TREE_ID) else {
+            continue;
+        };
+        if !seen.insert(id.to_string()) {
+            continue;
+        }
+        *left -= 1;
+        let label: String = n
+            .get("label")
+            .and_then(Value::as_str)
+            .filter(|l| !l.trim().is_empty())
+            .map_or_else(|| id.to_string(), |l| clip(l, MAX_STATE_LABEL))
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let children = match n.get("children").and_then(Value::as_array) {
+            Some(c) if depth + 1 < MAX_TREE_DEPTH => tree_nodes(c, depth + 1, left, seen),
+            _ => Vec::new(),
+        };
+        nodes.push(TreeNode { id: id.to_string(), label, count: n.get("count").and_then(Value::as_u64), children });
+    }
+    nodes
+}
+
+/// Whether `nodes` hold one with id `id`, at any depth.
+fn holds(nodes: &[TreeNode], id: &str) -> bool {
+    nodes.iter().any(|n| n.id == id || holds(&n.children, id))
 }
 
 /// A panel's state, kept by the host between the plugin's calls.
@@ -231,6 +305,9 @@ impl PanelState {
                     let v = d.default.as_ref().and_then(whole).unwrap_or(d.min).clamp(d.min, d.max.max(d.min));
                     values.insert(id.clone(), json!(v));
                 }
+                "tree" => {
+                    values.insert(id.clone(), Value::Null);
+                }
                 _ => {}
             }
             items.insert(
@@ -243,6 +320,7 @@ impl PanelState {
                     min: d.min,
                     max: d.max.max(d.min),
                     labels: Vec::new(),
+                    nodes: Arc::default(),
                 },
             );
         }
@@ -259,6 +337,11 @@ impl PanelState {
         self.values.get(id).and_then(Value::as_i64).unwrap_or(0)
     }
 
+    /// A tree's chosen node, if any.
+    pub fn chosen(&self, id: &str) -> Option<&str> {
+        self.values.get(id).and_then(Value::as_str)
+    }
+
     /// A slider's label for value `v`: its own label there, or the number.
     pub fn slider_label(&self, id: &str, v: i64) -> String {
         let Some(st) = self.items.get(id) else { return v.to_string() };
@@ -271,7 +354,8 @@ impl PanelState {
     }
 
     /// Sets widget values from `values` (`{"id": value}`): a checkbox takes a bool, a slider a
-    /// whole number (kept within its ends). Anything else is ignored. Returns the ids set.
+    /// whole number (kept within its ends), a tree one of its nodes' ids or `null` for none.
+    /// Anything else is ignored. Returns the ids set.
     pub fn set_values(&mut self, decl: &PanelDecl, values: &Value) -> Vec<String> {
         let Some(given) = values.as_object() else { return Vec::new() };
         let mut set = Vec::new();
@@ -280,6 +364,11 @@ impl PanelState {
             let Some(v) = given.get(id) else { continue };
             let new = match d.kind.as_str() {
                 "checkbox" => v.as_bool().map(Value::Bool),
+                "tree" => match v {
+                    Value::Null => Some(Value::Null),
+                    Value::String(n) if self.items.get(id).is_some_and(|s| holds(&s.nodes, n)) => Some(v.clone()),
+                    _ => None,
+                },
                 _ => whole(v).map(|n| {
                     let (min, max) = self.items.get(id).map_or((d.min, d.max), |s| (s.min, s.max));
                     json!(n.clamp(min, max.max(min)))
@@ -294,9 +383,10 @@ impl PanelState {
     }
 
     /// Takes in a plugin's answer about its panel: `{"values": {...}, "items": {"id": {...}}}`.
-    /// An item may set `label` (`null` for the declared one), `text`, `enabled`, `visible` and,
-    /// for a slider, `min`, `max` and `labels`. Unknown ids and fields, and values of the wrong
-    /// type, are ignored; texts are clipped and sliders' values kept within their ends.
+    /// An item may set `label` (`null` for the declared one), `text`, `enabled`, `visible`, for a
+    /// slider `min`, `max` and `labels`, and for a tree `nodes`. Unknown ids and fields, and values
+    /// of the wrong type, are ignored; texts are clipped, sliders' values kept within their ends
+    /// and a tree's chosen node among its nodes.
     pub fn apply(&mut self, decl: &PanelDecl, update: &Value) {
         let empty = Map::new();
         let items = update.get("items").and_then(Value::as_object).unwrap_or(&empty);
@@ -333,15 +423,24 @@ impl PanelState {
                         .collect();
                 }
             }
+            if d.kind == "tree"
+                && let Some(nodes) = u.get("nodes").and_then(Value::as_array)
+            {
+                let mut left = MAX_TREE_NODES;
+                st.nodes = Arc::new(tree_nodes(nodes, 0, &mut left, &mut Default::default()));
+            }
         }
         if let Some(values) = update.get("values") {
             self.set_values(decl, values);
         }
-        // New ends keep the values within them.
-        for d in decl.items.iter().filter(|d| d.kind == "slider") {
+        // New ends keep the values within them, and new nodes the chosen one among them.
+        for d in &decl.items {
             let id = d.key();
-            if let (Some(st), Some(v)) = (self.items.get(id), self.values.get_mut(id)) {
-                *v = json!(v.as_i64().unwrap_or(st.min).clamp(st.min, st.max));
+            let (Some(st), Some(v)) = (self.items.get(id), self.values.get_mut(id)) else { continue };
+            match d.kind.as_str() {
+                "slider" => *v = json!(v.as_i64().unwrap_or(st.min).clamp(st.min, st.max)),
+                "tree" if v.as_str().is_some_and(|n| !holds(&st.nodes, n)) => *v = Value::Null,
+                _ => {}
             }
         }
     }

@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use crate::Canvas;
 use rustgis_geom::Coord;
 use rustgis_map::fills::{FillLayer, FillPattern};
 use rustgis_map::{Marker, Rgba, Symbol};
@@ -48,7 +49,7 @@ thread_local! {
 impl Ctx<'_> {
     /// Draws `polys` with its stacked `fills`, bottom first (a fill without a colour of its own
     /// takes the symbol's), then the symbol's outline over them.
-    pub(crate) fn filled(&self, pm: &mut Pixmap, polys: &[Vec<Vec<Coord>>], s: &Symbol, fills: &[FillLayer]) {
+    pub(crate) fn filled(&self, pm: &mut Canvas, polys: &[Vec<Vec<Coord>>], s: &Symbol, fills: &[FillLayer]) {
         let Some(path) = self.polygon_path(polys) else { return };
         // The map's origin in device pixels, in f64: the patterns' lattice point.
         let origin = match self.globe {
@@ -65,6 +66,35 @@ impl Ctx<'_> {
             let color = f.color.unwrap_or(s.fill);
             match f.pattern {
                 FillPattern::Solid => pm.fill_path(&path, &paint(color, 1.0), FillRule::EvenOdd, Transform::identity(), None),
+                FillPattern::Gradient { .. } | FillPattern::Shapeburst { .. } => {
+                    // Each part shaded on its own, in its own box, as QGIS shades a multi-part
+                    // feature (France's gradient in France, not across to French Guiana).
+                    let clip = self.clip_box();
+                    let clip = (self.globe.is_none())
+                        .then(|| tiny_skia::Rect::from_ltrb(clip.min_x as f32, clip.min_y as f32, clip.max_x as f32, clip.max_y as f32))
+                        .flatten();
+                    for part in polys {
+                        let Some(path) = self.polygon_path(std::slice::from_ref(part)) else { continue };
+                        // Its outer ring alone, for a shapeburst that leaves its holes' edges out.
+                        let exterior = || part.first().and_then(|r| self.polygon_path(&[vec![r.clone()]]));
+                        let whole = part.first().and_then(|r| self.device_box(r));
+                        let centroid = part.first().and_then(|r| self.device_centroid(r));
+                        let whole_depth = |outer_only: bool| {
+                            let rings: Vec<Vec<(f64, f64)>> =
+                                part.iter().take(if outer_only { 1 } else { usize::MAX }).filter_map(|r| self.device_ring(r)).collect();
+                            crate::gradient_fill::whole_depth(&rings)
+                        };
+                        let part = crate::gradient_fill::Part {
+                            path: &path,
+                            whole,
+                            centroid,
+                            clip,
+                            whole_depth: &whole_depth,
+                            budget: &self.bursts,
+                        };
+                        crate::gradient_fill::draw(pm, &part, exterior, &f.pattern, color, self.ppp);
+                    }
+                }
                 pattern => {
                     let Some((tile, t)) = pattern_tile(pattern, color, self.ppp, origin) else { continue };
                     let shader = tiny_skia::Pattern::new(
@@ -85,6 +115,68 @@ impl Ctx<'_> {
     }
 }
 
+impl Ctx<'_> {
+    /// `ring`'s box in device pixels before any clipping, held within ±10⁷ (a gradient's box when
+    /// zoomed far into its polygon); `None` on the globe (its rings are drawn as seen) or for a
+    /// ring of no finite point.
+    fn device_box(&self, ring: &[Coord]) -> Option<tiny_skia::Rect> {
+        if self.globe.is_some() {
+            return None;
+        }
+        let ppp = self.view.pixels_per_point;
+        let mut b = rustgis_geom::Extent::EMPTY;
+        for c in ring {
+            let (x, y) = self.view.to_screen(*c);
+            let (x, y) = (x * ppp, y * ppp);
+            if x.is_finite() && y.is_finite() {
+                b.expand(Coord::new(x.clamp(-1e7, 1e7), y.clamp(-1e7, 1e7)));
+            }
+        }
+        if b.is_empty() {
+            return None;
+        }
+        tiny_skia::Rect::from_ltrb(b.min_x as f32, b.min_y as f32, b.max_x as f32, b.max_y as f32)
+    }
+
+    /// `ring` in device pixels before any clipping, in f64 (its points of no finite place left
+    /// out); `None` on the globe or for a ring of under three points.
+    fn device_ring(&self, ring: &[Coord]) -> Option<Vec<(f64, f64)>> {
+        if self.globe.is_some() {
+            return None;
+        }
+        let ppp = self.view.pixels_per_point;
+        let pts: Vec<(f64, f64)> = ring
+            .iter()
+            .map(|c| self.view.to_screen(*c))
+            .map(|(x, y)| (x * ppp, y * ppp))
+            .filter(|(x, y)| x.is_finite() && y.is_finite())
+            .collect();
+        (pts.len() >= 3).then_some(pts)
+    }
+
+    /// The centroid of the area `ring` (an outer ring) encloses, in device pixels before any
+    /// clipping, held within ±10⁷; `None` on the globe or for no area.
+    fn device_centroid(&self, ring: &[Coord]) -> Option<tiny_skia::Point> {
+        let pts = self.device_ring(ring)?;
+        // Taken about its first point, so far-off rings keep their precision.
+        let (ox, oy) = *pts.first()?;
+        let (mut a, mut cx, mut cy) = (0.0f64, 0.0f64, 0.0f64);
+        for (p, q) in pts.iter().zip(pts.iter().cycle().skip(1)) {
+            let (px, py, qx, qy) = (p.0 - ox, p.1 - oy, q.0 - ox, q.1 - oy);
+            let cross = px * qy - qx * py;
+            a += cross;
+            cx += (px + qx) * cross;
+            cy += (py + qy) * cross;
+        }
+        // (Each sum is three times the area times the centroid, the area twice over.)
+        if a.abs() <= 1e-9 {
+            return None;
+        }
+        let (x, y) = (ox + cx / (3.0 * a), oy + cy / (3.0 * a));
+        (x.is_finite() && y.is_finite()).then(|| tiny_skia::Point::from_xy(x.clamp(-1e7, 1e7) as f32, y.clamp(-1e7, 1e7) as f32))
+    }
+}
+
 /// `v` modulo `m` (positive), as f32: a lattice offset reduced to within one period.
 fn reduce(v: f64, m: f64) -> f32 {
     if m > 0.0 && v.is_finite() { v.rem_euclid(m) as f32 } else { 0.0 }
@@ -94,7 +186,7 @@ fn reduce(v: f64, m: f64) -> f32 {
 /// its lattice through `origin` (device pixels); `None` for a pattern of no size.
 fn pattern_tile(pattern: FillPattern, color: Rgba, ppp: f32, origin: (f64, f64)) -> Option<(Arc<Pixmap>, Transform)> {
     match pattern {
-        FillPattern::Solid => None,
+        FillPattern::Solid | FillPattern::Gradient { .. } | FillPattern::Shapeburst { .. } => None,
         FillPattern::Hatch { angle, spacing, width, offset } => {
             // A tile a few pixels across and a period high, its line along the middle, turned to
             // the angle (anticlockwise from east; the screen's y runs down).
@@ -177,6 +269,9 @@ pub(crate) fn tint(fills: &[FillLayer], feature: Rgba) -> Rgba {
         let c = f.color.unwrap_or(feature);
         match f.pattern {
             FillPattern::Solid => over(c, 1.0),
+            FillPattern::Gradient { color2, ref stops, discrete, .. } | FillPattern::Shapeburst { color2, ref stops, discrete, .. } => {
+                over(crate::gradient_fill::average(c, color2, stops, discrete), 1.0)
+            }
             FillPattern::Hatch { spacing, width, .. } => over(c, per(width, spacing)),
             FillPattern::Dots { marker, size, outline, outline_width, spacing, .. } => {
                 // As drawn: at least a point across; a square covers its whole box, the other
@@ -215,7 +310,7 @@ fn key(pattern: &FillPattern, color: Rgba, ppp: f32) -> Key {
     let mut bits = [0; 11];
     bits[..3].copy_from_slice(&[u32::from_le_bytes(color.0), ppp.to_bits(), u32::from(crate::antialiased())]);
     let marker = match *pattern {
-        FillPattern::Solid => None,
+        FillPattern::Solid | FillPattern::Gradient { .. } | FillPattern::Shapeburst { .. } => None,
         FillPattern::Hatch { spacing, width, .. } => {
             bits[3..6].copy_from_slice(&[1, spacing.to_bits(), width.to_bits()]);
             None
@@ -240,7 +335,7 @@ fn key(pattern: &FillPattern, color: Rgba, ppp: f32) -> Key {
 /// for now) is kept among the provisional ones instead, which all go once one of a named family
 /// is settled (the index is done, for every family; the label font's, unnamed, is settled from
 /// the start and says nothing about it).
-fn tile(key: &Key, settled: impl FnOnce() -> bool, w: f32, h: f32, draw: impl FnOnce(&mut Pixmap)) -> Option<Arc<Pixmap>> {
+fn tile(key: &Key, settled: impl FnOnce() -> bool, w: f32, h: f32, draw: impl FnOnce(&mut Canvas)) -> Option<Arc<Pixmap>> {
     if let Some(t) = TILES.with(|t| t.borrow().by_key.get(key).cloned()) {
         return t;
     }
@@ -253,11 +348,11 @@ fn tile(key: &Key, settled: impl FnOnce() -> bool, w: f32, h: f32, draw: impl Fn
         return t;
     }
     let made = (w.is_finite() && h.is_finite() && w <= MAX_TILE_PX + 1.0 && h <= MAX_TILE_PX + 1.0)
-        .then(|| Pixmap::new(w.max(1.0) as u32, h.max(1.0) as u32))
+        .then(|| Canvas::new(w.max(1.0) as u32, h.max(1.0) as u32))
         .flatten()
         .map(|mut pm| {
             draw(&mut pm);
-            Arc::new(pm)
+            Arc::new(pm.into_pixmap())
         });
     if !keep {
         PROVISIONAL.with(|p| {
