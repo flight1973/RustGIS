@@ -426,8 +426,9 @@ pub fn within(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> Vec<(us
 
 /// [`within`], and how many of its rows have a distance that's a bound rather than measured: a
 /// point or edge as near as its box ([`least_distance_to_box`]), past the search's
-/// `REACH_STEPS_TOTAL` steps or along an edge longer than [`REACH_STEPS_MAX`] steps. They may lie
-/// farther, even beyond the radius.
+/// `REACH_STEPS_TOTAL` steps or along an edge longer than [`REACH_STEPS_MAX`] steps, or a polygon
+/// counted as holding the center (at 0) when its turns around the pole outrun the steps or are too
+/// many to count. They may lie farther, even beyond the radius.
 pub fn within_counted(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> (Vec<(usize, f64)>, usize) {
     use rustgis_geom::MAX_LAT;
     // A center that's no place (a latitude past ±90°, a coordinate missing) reaches nothing.

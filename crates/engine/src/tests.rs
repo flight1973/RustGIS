@@ -25482,6 +25482,29 @@ fn background_runs_follow_a_renamed_map_a_moved_window_and_a_loaded_layer() {
 }
 
 #[test]
+fn validate_topology_says_which_checks_are_incomplete() {
+    // A line 11 m from the North Pole winding round it some 19,000 times is measured coarsely, so
+    // Must Not Have Dangles is incomplete and the validation says so; a plain line, nothing (#1033).
+    use rustgis_data::{Coord, Dataset, Geometry, GeometryType};
+    let c = Coord::new;
+    for (to, warned) in [(7_000_000.0, true), (1.0, false)] {
+        let mut s = Session::new(Project::default());
+        let mut paths = Dataset::new("Paths", GeometryType::Polyline, vec![]);
+        paths.push(Some(Geometry::Line(vec![vec![c(0.0, 89.9999), c(to, 89.9999)]])), vec![]);
+        s.map_mut().add_dataset(paths);
+        s.run("topology.rules", &json!({"add": {"rule": "mustNotHaveDangles", "layer": "Paths"}})).unwrap();
+        let mark = s.notice_mark();
+        let v = s.run("topology.validate", &Value::Null).unwrap();
+        assert_eq!(v["incomplete"].as_array().map(Vec::len), Some(usize::from(warned)), "{v}");
+        let said = s
+            .notices_since(mark)
+            .iter()
+            .any(|n| n.text.starts_with("Checks that stopped early") && n.text.ends_with("Must Not Have Dangles"));
+        assert_eq!(said, warned, "{:?}", s.notices_since(mark));
+    }
+}
+
+#[test]
 fn must_be_covered_by_says_which_polygons_it_left_out_at_a_pole() {
     // Around the South Pole, a cap from 20°E round to 10°E and the 10° between written a
     // billion degrees on: the check at the pole can't use that one, reports the point there and

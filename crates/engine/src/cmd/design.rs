@@ -1326,6 +1326,12 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
             lat: e.at.y,
         }));
     }
+    if !incomplete.is_empty() {
+        s.warn(format!(
+            "Checks that stopped early (an error or work limit) or measured a line round a pole coarsely, so their counts may be off: {}",
+            incomplete.join(", ")
+        ));
+    }
     if !skipped.is_empty() {
         s.warn(format!(
             "Polygons left out of the check at a pole (a coordinate missing or infinite, or a million turns around), so its result there may be wrong: {}",
