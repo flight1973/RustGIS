@@ -2806,6 +2806,7 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let mut missing = 0usize;
     // Vertices with a latitude past a pole (bad data), taken as that pole.
     let mut past_pole = 0usize;
+    let (mut without_geometry, mut point_features) = (0usize, 0usize);
     // The progress counts features; a cancel stops the walk at the next point, line or feature.
     crate::control::begin(feats().count());
     for (i, f) in feats().enumerate() {
@@ -2814,7 +2815,14 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         if list.stopped() {
             break;
         }
-        let Some(g) = &f.geometry else { continue };
+        let Some(g) = &f.geometry else {
+            without_geometry = without_geometry.saturating_add(1);
+            continue;
+        };
+        if matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+            point_features = point_features.saturating_add(1);
+            continue;
+        }
         let own = f.attrs.get(..kept).unwrap_or(&f.attrs);
         // An id a reader wrapped from a negative key (a GeoPackage's) is that key again.
         let fid = Value::Int(f.id.cast_signed());
@@ -2852,7 +2860,15 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         r.messages.push(format!("{TOOL}: {missing} vertex(es) with a coordinate missing or infinite passed over"));
     }
     if past_pole > 0 {
-        r.messages.push(format!("{TOOL}: {past_pole} vertex(es) with a latitude past a pole taken as that pole"));
+        r.messages.push(format!(
+            "{TOOL}: {past_pole} vertex(es) with a latitude past a pole found (latitudes limited to the poles when measuring segments)"
+        ));
+    }
+    if without_geometry > 0 {
+        r.messages.push(format!("{TOOL}: {without_geometry} feature(s) without geometry skipped"));
+    }
+    if point_features > 0 {
+        r.messages.push(format!("{TOOL}: {point_features} point feature(s) skipped; only lines and polygon rings produce points"));
     }
     Ok(r)
 }
@@ -6310,7 +6326,7 @@ mod tests {
         // are taken as it, and the tool says so.
         assert_eq!(
             r.messages[1..],
-            ["Points Along Lines: 2 vertex(es) with a latitude past a pole taken as that pole"],
+            ["Points Along Lines: 2 vertex(es) with a latitude past a pole found (latitudes limited to the poles when measuring segments)"],
             "{:?}",
             r.messages
         );
@@ -6324,7 +6340,7 @@ mod tests {
             r.messages[1..],
             [
                 "Points Along Lines: 1 vertex(es) with a coordinate missing or infinite passed over",
-                "Points Along Lines: 1 vertex(es) with a latitude past a pole taken as that pole"
+                "Points Along Lines: 1 vertex(es) with a latitude past a pole found (latitudes limited to the poles when measuring segments)"
             ],
         );
         let v = layer(r);
@@ -6343,6 +6359,38 @@ mod tests {
         let wild = vec![c(1e308, 1e300), c(0.0, -95.0), c(-1e308, 0.0), c(1e308, 1e300)];
         let m = along_inputs(vec![Geometry::Line(vec![wild])]);
         on_earth(&along(&m, serde_json::json!({"input": "lines", "distance": 1000, "includeEnd": true})));
+    }
+
+    /// Mixed line input reports skipped point and absent geometries; clean lines have no loss notice.
+    #[test]
+    fn points_along_lines_reports_skipped_features() {
+        let line = Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(0.1, 0.0)]]);
+        let mut inputs = along_inputs(vec![line, Geometry::Point(Coord::new(0.0, 0.0)), Geometry::MultiPoint(vec![Coord::new(1.0, 0.0)])]);
+        inputs.0.get_mut("lines").unwrap().push(None, vec![Value::Text("missing".into())]);
+        let params = serde_json::json!({"input": "lines", "distance": 1});
+        let result = crate::run("pointsAlongLines", &inputs, &params).unwrap();
+        assert_eq!(
+            result.messages[1..],
+            [
+                "Points Along Lines: 1 feature(s) without geometry skipped",
+                "Points Along Lines: 2 point feature(s) skipped; only lines and polygon rings produce points",
+            ]
+        );
+        assert!(!layer(result).features.is_empty());
+        inputs.0.get_mut("lines").unwrap().features.truncate(1);
+        assert_eq!(crate::run("pointsAlongLines", &inputs, &params).unwrap().messages.len(), 1);
+    }
+
+    /// Invalid vertices are counted as encountered even when their degenerate part emits no points.
+    #[test]
+    fn points_along_lines_reports_past_pole_vertices_without_claiming_placement() {
+        let inputs = along_inputs(vec![Geometry::Line(vec![vec![Coord::new(0.0, 95.0)]])]);
+        let result = crate::run("pointsAlongLines", &inputs, &serde_json::json!({"input":"lines", "distance":1})).unwrap();
+        assert_eq!(
+            result.messages[1..],
+            ["Points Along Lines: 1 vertex(es) with a latitude past a pole found (latitudes limited to the poles when measuring segments)"]
+        );
+        assert!(layer(result).features.is_empty());
     }
 
     #[test]
