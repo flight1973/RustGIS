@@ -2806,7 +2806,7 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let mut missing = 0usize;
     // Vertices with a latitude past a pole (bad data), taken as that pole.
     let mut past_pole = 0usize;
-    let (mut without_geometry, mut point_features) = (0usize, 0usize);
+    let (mut without_geometry, mut point_features, mut without_segments) = (0usize, 0usize, 0usize);
     // The progress counts features; a cancel stops the walk at the next point, line or feature.
     crate::control::begin(feats().count());
     for (i, f) in feats().enumerate() {
@@ -2826,6 +2826,7 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         let own = f.attrs.get(..kept).unwrap_or(&f.attrs);
         // An id a reader wrapped from a negative key (a GeoPackage's) is that key again.
         let fid = Value::Int(f.id.cast_signed());
+        let mut has_segments = false;
         for_each_line(g, |line, ring| {
             if list.stopped() || crate::control::cancelled() {
                 return;
@@ -2837,6 +2838,7 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             segs.clear();
             // A cancel stops the solving within a line too; the walk below then stops at once.
             segs.extend(segments(line, ring).take_while(|_| !crate::control::cancelled()));
+            has_segments |= !segs.is_empty();
             walk_line(&segs, ring, spacing, |c, along, angle| {
                 if crate::control::cancelled() {
                     return ControlFlow::Break(());
@@ -2847,6 +2849,9 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                 list.push(c, own, kept, [fid.clone(), Value::Float(along / unit), Value::Float(angle)])
             });
         });
+        if !has_segments {
+            without_segments = without_segments.saturating_add(1);
+        }
     }
     // A walk a cancel stopped partway made only some of the points.
     crate::control::check()?;
@@ -2869,6 +2874,9 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     }
     if point_features > 0 {
         r.messages.push(format!("{TOOL}: {point_features} point feature(s) skipped; only lines and polygon rings produce points"));
+    }
+    if without_segments > 0 {
+        r.messages.push(format!("{TOOL}: {without_segments} line or polygon feature(s) without measurable segments skipped"));
     }
     Ok(r)
 }
@@ -6381,6 +6389,28 @@ mod tests {
         assert_eq!(crate::run("pointsAlongLines", &inputs, &params).unwrap().messages.len(), 1);
     }
 
+    /// Degenerate features are reported once; usable parts and offset-only empty output are clean.
+    #[test]
+    fn points_along_lines_reports_features_without_segments() {
+        let c = Coord::new;
+        let inputs = along_inputs(vec![
+            Geometry::Line(vec![]),
+            Geometry::Polygon(vec![]),
+            Geometry::Line(vec![vec![c(0.0, 0.0)]]),
+            Geometry::Line(vec![vec![c(1.0, 0.0), c(1.0, 0.0)]]),
+            Geometry::Line(vec![vec![c(2.0, 0.0), c(2.0 + equator_degrees(0.0005), 0.0)]]),
+            Geometry::Line(vec![vec![c(3.0, 0.0)], vec![c(4.0, 0.0), c(4.1, 0.0)]]),
+        ]);
+        let result = crate::run("pointsAlongLines", &inputs, &serde_json::json!({"input":"lines", "distance":1})).unwrap();
+        assert_eq!(result.messages[1..], ["Points Along Lines: 5 line or polygon feature(s) without measurable segments skipped"]);
+        assert!(!layer(result).features.is_empty());
+        let clean = along_inputs(vec![Geometry::Line(vec![vec![c(0.0, 0.0), c(0.1, 0.0)]])]);
+        let result =
+            crate::run("pointsAlongLines", &clean, &serde_json::json!({"input":"lines", "distance":1, "startOffset":100})).unwrap();
+        assert_eq!(result.messages.len(), 1, "offsets do not make a feature geometrically unusable");
+        assert!(layer(result).features.is_empty());
+    }
+
     /// Invalid vertices are counted as encountered even when their degenerate part emits no points.
     #[test]
     fn points_along_lines_reports_past_pole_vertices_without_claiming_placement() {
@@ -6388,7 +6418,10 @@ mod tests {
         let result = crate::run("pointsAlongLines", &inputs, &serde_json::json!({"input":"lines", "distance":1})).unwrap();
         assert_eq!(
             result.messages[1..],
-            ["Points Along Lines: 1 vertex(es) with a latitude past a pole found (latitudes limited to the poles when measuring segments)"]
+            [
+                "Points Along Lines: 1 vertex(es) with a latitude past a pole found (latitudes limited to the poles when measuring segments)",
+                "Points Along Lines: 1 line or polygon feature(s) without measurable segments skipped",
+            ]
         );
         assert!(layer(result).features.is_empty());
     }

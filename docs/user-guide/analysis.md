@@ -331,7 +331,10 @@ name the input already has gets a suffix (`distance_2`). QGIS's tool works diffe
 measures `distance` along the whole feature (a polygon's rings as one, its end offset left out) in
 the layer's units, and walks a closed line as an open one, which gets a point at its end, on its
 start again, when the distance lands there. Here each part and ring starts again from 0, and the
-distance is on the ground in any coordinate system.
+distance is on the ground in any coordinate system. Missing geometry, point features, and line
+or polygon features with no measurable segments (including empty geometries) are skipped with
+separate counted notices. A valid part that produces no points because of the offsets is not
+reported as unusable geometry.
 
 Each edge is the shortest path between its vertices on the ellipsoid, as Calculate Geometry
 Attributes measures it and the globe draws it. A flat map draws an edge straight in its own
