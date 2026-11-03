@@ -418,6 +418,8 @@ pub fn radius_boundary_point(at: Coord, radius_m: f64, angle_rad: f64) -> Option
 /// Mercator or on the ground doesn't depend on the radius, and a larger radius never loses a row,
 /// to within that sag (though past the search's `REACH_STEPS_TOTAL` steps, which a larger radius
 /// may spend sooner, a shape counts at its box's distance; [`within_counted`] says how many did).
+/// A center that's no place (a latitude past ±90°, a coordinate missing or infinite), or a radius
+/// missing or negative, reaches no row: callers check them first, to say why.
 pub fn within(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> Vec<(usize, f64)> {
     within_counted(ds, rows, at, radius_m).0
 }
