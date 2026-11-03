@@ -2751,7 +2751,12 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             }
             for_each_line(g, |line, ring| {
                 *longest = (*longest).max(line.iter().map(Vec::len).fold(0, usize::saturating_add));
-                let len = if exact { segments(line, ring).map(|s| s.len).sum::<f64>() } else { length_bound(line, ring) };
+                // A cancel stops the solving within a line too (one can have millions of vertices).
+                let len = if exact {
+                    segments(line, ring).take_while(|_| !crate::control::cancelled()).map(|s| s.len).sum::<f64>()
+                } else {
+                    length_bound(line, ring)
+                };
                 k = k.saturating_add(spacing.most(len, ring));
             });
             k
@@ -2819,7 +2824,8 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             // Each segment solved once. A line has no more segments than vertices, so the list
             // stays within the room reserved for the longest.
             segs.clear();
-            segs.extend(segments(line, ring));
+            // A cancel stops the solving within a line too; the walk below then stops at once.
+            segs.extend(segments(line, ring).take_while(|_| !crate::control::cancelled()));
             walk_line(&segs, ring, spacing, |c, along, angle| {
                 if crate::control::cancelled() {
                     return ControlFlow::Break(());
@@ -2840,8 +2846,7 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let written = out.features.len();
     let mut r = result(out, format!("{TOOL}: {written} points"))?;
     if missing > 0 {
-        r.messages
-            .push(format!("{TOOL}: {missing} vertex(es) with a coordinate missing or infinite passed over, the lines joined across them"));
+        r.messages.push(format!("{TOOL}: {missing} vertex(es) with a coordinate missing or infinite passed over"));
     }
     Ok(r)
 }
@@ -6304,11 +6309,20 @@ mod tests {
         let r = run("polys");
         assert_eq!(
             r.messages.get(1).map(String::as_str),
-            Some("Points Along Lines: 1 vertex(es) with a coordinate missing or infinite passed over, the lines joined across them")
+            Some("Points Along Lines: 1 vertex(es) with a coordinate missing or infinite passed over")
         );
         let v = layer(r);
         on_earth(&v);
         assert_eq!(place(&v, 0).0.y, 90.0);
+        // Lines too: one left with a single vertex (no points), one trimmed at its end; both
+        // counted, in one message.
+        let lossy = along_inputs(vec![
+            Geometry::Line(vec![vec![c(0.0, 0.0), c(f64::NAN, 0.0)]]),
+            Geometry::Line(vec![vec![c(0.0, 0.0), c(1.0, 0.0), c(f64::INFINITY, 5.0)]]),
+        ]);
+        let r = crate::run("pointsAlongLines", &lossy, &serde_json::json!({"input": "lines", "distance": 10})).unwrap();
+        assert_eq!(r.messages[1], "Points Along Lines: 2 vertex(es) with a coordinate missing or infinite passed over");
+        assert!(!layer(r).features.is_empty());
         // A line whose ends are the same wild coordinate is a ring, closed without a geodesic.
         let wild = vec![c(1e308, 1e300), c(0.0, -95.0), c(-1e308, 0.0), c(1e308, 1e300)];
         let m = along_inputs(vec![Geometry::Line(vec![wild])]);
@@ -6349,7 +6363,8 @@ mod tests {
             crate::run_with("pointsAlongLines", &m, &params, &control).err().as_deref(),
             Some("Points Along Lines was cancelled before it started")
         );
-        // Asked once it has walked some lines: it stops well before the end.
+        // Asked once it has walked some lines: it stops within a line of where it was asked (not
+        // at the end, where a run that only checked once it was done would stop).
         let control = crate::control::Control::new();
         let watcher = {
             let control = control.clone();
@@ -6358,15 +6373,17 @@ mod tests {
                 while control.progress().is_none_or(|(done, _)| done == 0) && std::time::Instant::now() < end {
                     std::thread::yield_now();
                 }
+                let asked = control.progress().map_or(0, |(done, _)| done);
                 control.cancel();
+                asked
             })
         };
         let r = crate::run_with("pointsAlongLines", &m, &params, &control);
-        let _ = watcher.join();
+        let asked = watcher.join().unwrap_or(0);
         let e = r.err().unwrap_or_default();
         assert!(e.starts_with("Points Along Lines was cancelled "), "{e}");
         let (done, total) = control.progress().unwrap_or_default();
-        assert!(total == 400 && done < total, "{done} of {total} lines");
+        assert!(total == 400 && done <= asked + 1 && done < total, "{done} of {total} lines, asked at {asked}");
     }
 
     #[test]
