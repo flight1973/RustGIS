@@ -352,9 +352,12 @@ with. On a map in another projection than Web Mercator, north isn't straight up 
 there the angle differs from the line's direction on the map. In Web Mercator it differs from a long
 edge's drawn direction by about half the edge's span of longitude times the sine of the latitude:
 at the ends of an east–west edge 100 km long, 0.45° at 45° and 2.5° at 80°; and, as Web Mercator
-isn't conformal on the ellipsoid, from any diagonal edge's by up to about 0.19°, on the equator
-too. A vertex less than a millimeter from the one before is passed over, so a near-duplicate
-doesn't turn a point's angle, and a vertex past a pole (bad data) is taken as the pole. The points
+isn't conformal on the ellipsoid, from a diagonal edge's by up to about 0.19° at the equator (0.1°
+at 45°, less toward the poles). A vertex less than a millimeter from the one before is passed over,
+so a near-duplicate doesn't turn a point's angle; a vertex past a pole (bad data) is taken as the
+pole; and a vertex with a coordinate missing or infinite is passed over, the line joined across it,
+and the tool says how many it passed over. The output keeps what the input lost on reading, if
+anything (features, or Z and M values), as its layer's notes say. The points
 keep the input's coordinate system, with longitudes between -180 and 180, so a point past the
 antimeridian is on the far side of the map. The points are counted first and may take up to about
 4 GiB (some 20 million points with a few fields): a distance that would make more, or more than

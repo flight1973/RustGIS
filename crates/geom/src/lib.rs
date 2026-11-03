@@ -304,15 +304,23 @@ pub fn wgs84_distance_m(a: Coord, b: Coord) -> f64 {
 
 /// The geodesic from `a` to `b` on the WGS 84 ellipsoid: its length in meters, as
 /// [`wgs84_distance_m`] gives it, and its azimuths at `a` and at `b` (degrees clockwise from north).
+/// A coordinate that isn't finite is no place: all three are NaN, as that distance is.
 pub fn wgs84_inverse(a: Coord, b: Coord) -> (f64, f64, f64) {
+    if !a.is_finite() || !b.is_finite() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
     let (s12, azi1, azi2, _): (f64, f64, f64, f64) = WGS84.inverse(a.y.clamp(-90.0, 90.0), a.x, b.y.clamp(-90.0, 90.0), b.x);
     (s12, azi1, azi2)
 }
 
 /// The point `dist_m` meters from `c` along the geodesic leaving it at `azimuth_deg` (clockwise
 /// from north) on the WGS 84 ellipsoid, and the geodesic's azimuth there. The longitude is in
-/// −180..180 exactly as GeographicLib gives it, not moved next to `c`'s, which would round it.
+/// −180..180 exactly as GeographicLib gives it, not moved next to `c`'s, which would round it. A
+/// start, azimuth or distance that isn't finite leads nowhere: NaN.
 pub fn wgs84_direct(c: Coord, azimuth_deg: f64, dist_m: f64) -> (Coord, f64) {
+    if !c.is_finite() || !azimuth_deg.is_finite() || !dist_m.is_finite() {
+        return (Coord::new(f64::NAN, f64::NAN), f64::NAN);
+    }
     let (lat, lon, azi2): (f64, f64, f64) = WGS84.direct(c.y.clamp(-90.0, 90.0), c.x, azimuth_deg, dist_m);
     (Coord::new(lon, lat), azi2)
 }
@@ -794,6 +802,14 @@ mod tests {
         // GeographicLib's, in -180..180 (one degree is 111,319.49 m there).
         let (p, azi2) = wgs84_direct(Coord::new(179.5, 0.0), 90.0, 111_319.490_793);
         assert!((p.x + 179.5).abs() < 1e-9 && p.y.abs() < 1e-12 && (azi2 - 90.0).abs() < 1e-12, "{p:?} {azi2}");
+        // A coordinate that isn't finite is no place, not a pole the clamp would make of it.
+        let (o, inf) = (Coord::new(0.0, 0.0), Coord::new(0.0, f64::INFINITY));
+        let (s, a1, a2) = wgs84_inverse(o, inf);
+        assert!(s.is_nan() && a1.is_nan() && a2.is_nan() && wgs84_distance_m(o, inf).is_nan());
+        for (c, azimuth, dist) in [(inf, 0.0, 1.0), (o, f64::NAN, 1.0), (o, 0.0, f64::INFINITY)] {
+            let (p, azi2) = wgs84_direct(c, azimuth, dist);
+            assert!(!p.is_finite() && azi2.is_nan(), "{c:?} {azimuth} {dist}");
+        }
     }
 
     #[test]

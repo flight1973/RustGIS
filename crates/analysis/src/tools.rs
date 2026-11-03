@@ -2376,7 +2376,8 @@ fn feature_vertices_to_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, 
         return Err("Feature Vertices To Points needs a layer with geometry".into());
     }
     let mut out = copy_schema(ds, out_name(p, format!("{}_Vertices", ds.name)), GeometryType::Point);
-    out.crs = ds.crs;
+    // What the input lost on reading (features, Z and M values), its points have lost too.
+    (out.crs, out.crs_incomplete, out.zm_dropped) = (ds.crs, ds.crs_incomplete, ds.zm_dropped);
     // A name the input already has keeps its field, and the new one gets a suffix, as Intersect's
     // and Spatial Join's do.
     for name in VERTEX_FIELDS {
@@ -2538,8 +2539,8 @@ fn meet_at_seam(part: &[Coord], next: &[Coord]) -> bool {
 /// Calls `f` with each line Points Along Lines walks, as the run of parts that make it, and whether
 /// it is a ring: each ring of a polygon on its own, and each part of a line together with the parts
 /// after it that carry it on across the antimeridian ([`meet_at_seam`]), a ring when it ends where it
-/// starts, within [`MIN_SEGMENT`] (a closed line, such as a contour, or one round a parallel from
-/// −180° to 180°). A point has none.
+/// starts, within [`MIN_SEGMENT`] (a closed line, such as a contour, or one written along a parallel
+/// from −180° to 180°, walked along its edges' geodesics). A point has none.
 fn for_each_line(g: &Geometry, mut f: impl FnMut(&[Vec<Coord>], bool)) {
     let closed = |run: &[Vec<Coord>]| {
         let mut v = run.iter().flatten().filter(|c| c.is_finite());
@@ -2637,8 +2638,8 @@ fn mean_azimuth(a: f64, b: f64) -> f64 {
 /// An azimuth (degrees) from 0 up to 360: north 0, east 90.
 fn bearing(azimuth: f64) -> f64 {
     let b = azimuth.rem_euclid(360.0);
-    // Rounding takes a tiny negative angle to 360.
-    if b >= 360.0 { 0.0 } else { b }
+    // Rounding takes a tiny negative angle to 360, and due north can come as -0 (written "-0").
+    if b >= 360.0 || b == 0.0 { 0.0 } else { b }
 }
 
 /// Calls `emit` with each point `spacing` puts on a line, given its [`segments`], already solved:
@@ -2685,6 +2686,8 @@ fn walk_line(segs: &[Segment], ring: bool, spacing: Spacing, mut emit: impl FnMu
         arriving = Some(seg.azi_b);
     }
     // The rest are at the part's end, which on a ring is its first vertex again: one point there.
+    // (`Spacing::places` already leaves out a ring's end that merges into its start; the check
+    // keeps the walk from making that point twice should the two ever disagree.)
     let azimuth = if ring { mean_azimuth(tail.azi_b, head.azi_a) } else { tail.azi_b };
     if k < n && !(ring && on_vertex == Some(0)) {
         let _ = emit(tail.b, at(k), bearing(azimuth));
@@ -2723,7 +2726,8 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         with_end: p.get("includeEnd").and_then(Json::as_bool).unwrap_or(false),
     };
     let mut out = copy_schema(ds, out_name(p, format!("{}_PointsAlong", ds.name)), GeometryType::Point);
-    out.crs = ds.crs;
+    // What the input lost on reading (features, Z and M values), its points have lost too.
+    (out.crs, out.crs_incomplete, out.zm_dropped) = (ds.crs, ds.crs_incomplete, ds.zm_dropped);
     // A name the input already has keeps its field, and the new one gets a suffix.
     for (name, ty) in ALONG_FIELDS {
         let field = Field::new(unique_field(&out, name), ty);
@@ -2740,6 +2744,11 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let count = |exact: bool, limit: u64, longest: &mut usize| {
         size_output_points(feats(), kept, width, true, limit, |g| {
             let mut k = 0usize;
+            // An exact count, solving every segment, can take a while: a cancel stops it (it's
+            // then reported below, before the count is used).
+            if exact && crate::control::cancelled() {
+                return k;
+            }
             for_each_line(g, |line, ring| {
                 *longest = (*longest).max(line.iter().map(Vec::len).fold(0, usize::saturating_add));
                 let len = if exact { segments(line, ring).map(|s| s.len).sum::<f64>() } else { length_bound(line, ring) };
@@ -2763,6 +2772,7 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         // twice, and the count stops once it's sure not to fit the budget either, so one that
         // can't costs no more.
         let (en, eneed) = count(true, ALONG_BUDGET - segments_bytes, &mut longest);
+        crate::control::check()?;
         let eneed = total(eneed);
         if eneed <= ALONG_BUDGET {
             (n, need) = (en, eneed);
@@ -2787,7 +2797,13 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let mut list = PointList::new(n).map_err(no_memory)?;
     let mut segs = Vec::new();
     segs.try_reserve_exact(longest).map_err(no_memory)?;
-    for f in feats() {
+    // Vertices passed over for a coordinate missing or infinite, their neighbors joined.
+    let mut missing = 0usize;
+    // The progress counts features; a cancel stops the walk at the next point, line or feature.
+    crate::control::begin(feats().count());
+    for (i, f) in feats().enumerate() {
+        crate::control::check()?;
+        crate::control::reached(i);
         if list.stopped() {
             break;
         }
@@ -2796,14 +2812,18 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         // An id a reader wrapped from a negative key (a GeoPackage's) is that key again.
         let fid = Value::Int(f.id.cast_signed());
         for_each_line(g, |line, ring| {
-            if list.stopped() {
+            if list.stopped() || crate::control::cancelled() {
                 return;
             }
+            missing = missing.saturating_add(line.iter().flatten().filter(|c| !c.is_finite()).count());
             // Each segment solved once. A line has no more segments than vertices, so the list
             // stays within the room reserved for the longest.
             segs.clear();
             segs.extend(segments(line, ring));
             walk_line(&segs, ring, spacing, |c, along, angle| {
+                if crate::control::cancelled() {
+                    return ControlFlow::Break(());
+                }
                 // Folded into −180..180: a point past the antimeridian is on the far side of the map.
                 // A vertex's latitude past a pole (bad data) is the pole, where the walk measured it.
                 let c = Coord::new(rustgis_geom::fold_lon(c.x), c.y.clamp(-90.0, 90.0));
@@ -2811,11 +2831,19 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             });
         });
     }
+    // A walk a cancel stopped partway made only some of the points.
+    crate::control::check()?;
+    crate::control::finish();
     // Freed first, so its room is there if the points move into a list of their own size.
     drop(segs);
     out.features = list.finish().map_err(|e| e.message(TOOL, n))?.into();
     let written = out.features.len();
-    result(out, format!("{TOOL}: {written} points"))
+    let mut r = result(out, format!("{TOOL}: {written} points"))?;
+    if missing > 0 {
+        r.messages
+            .push(format!("{TOOL}: {missing} vertex(es) with a coordinate missing or infinite passed over, the lines joined across them"));
+    }
+    Ok(r)
 }
 
 /// A coordinate from a table cell: a number, or text holding one, written with a decimal point
@@ -6263,12 +6291,82 @@ mod tests {
                 assert!(on_earth && d.is_finite() && (0.0..360.0).contains(&angle), "{k}: {p:?} {d} {angle}");
             }
         };
-        let v = along(&m, serde_json::json!({"input": "lines", "distance": 1000, "includeEnd": true}));
+        let run = |input: &str| {
+            crate::run("pointsAlongLines", &m, &serde_json::json!({"input": input, "distance": 1000, "includeEnd": true})).unwrap()
+        };
+        let r = run("lines");
+        // Every vertex finite (if wild): none passed over, and nothing said of it.
+        assert_eq!(r.messages.len(), 1, "{:?}", r.messages);
+        let v = layer(r);
         on_earth(&v);
         assert_eq!((place(&v, 0).0.y, place(&v, v.features.len() - 1).0.y), (90.0, -90.0));
-        let v = along(&m, serde_json::json!({"input": "polys", "distance": 1000, "includeEnd": true}));
+        // The ring's vertex missing its longitude is passed over, and the tool says so.
+        let r = run("polys");
+        assert_eq!(
+            r.messages.get(1).map(String::as_str),
+            Some("Points Along Lines: 1 vertex(es) with a coordinate missing or infinite passed over, the lines joined across them")
+        );
+        let v = layer(r);
         on_earth(&v);
         assert_eq!(place(&v, 0).0.y, 90.0);
+        // A line whose ends are the same wild coordinate is a ring, closed without a geodesic.
+        let wild = vec![c(1e308, 1e300), c(0.0, -95.0), c(-1e308, 0.0), c(1e308, 1e300)];
+        let m = along_inputs(vec![Geometry::Line(vec![wild])]);
+        on_earth(&along(&m, serde_json::json!({"input": "lines", "distance": 1000, "includeEnd": true})));
+    }
+
+    #[test]
+    fn point_tools_keep_what_the_input_lost_on_reading() {
+        // An input that lost features or Z and M values on reading marks its points so too; one
+        // that lost nothing doesn't.
+        let c = Coord::new;
+        let line = Geometry::Line(vec![vec![c(0.0, 0.0), c(0.1, 0.0)]]);
+        for lost in [false, true] {
+            let mut m = along_inputs(vec![line.clone()]);
+            let ds = m.0.get_mut("lines").unwrap();
+            (ds.crs_incomplete, ds.zm_dropped) = (lost, lost);
+            for (tool, p) in [
+                ("pointsAlongLines", serde_json::json!({"input": "lines"})),
+                ("featureVerticesToPoints", serde_json::json!({"input": "lines"})),
+            ] {
+                let out = layer(crate::run(tool, &m, &p).unwrap());
+                assert_eq!((out.crs_incomplete, out.zm_dropped), (lost, lost), "{tool}");
+            }
+        }
+    }
+
+    #[test]
+    fn points_along_lines_stops_when_canceled() {
+        // 400 lines of a degree along the equator, a point every 100 m: some 445,000 geodesics.
+        let c = Coord::new;
+        let lines: Vec<Geometry> =
+            (0..400).map(|i| Geometry::Line(vec![vec![c(0.0, f64::from(i) * 0.1), c(1.0, f64::from(i) * 0.1)]])).collect();
+        let m = along_inputs(lines);
+        let params = serde_json::json!({"input": "lines", "distance": 100, "units": "Meters"});
+        let control = crate::control::Control::new();
+        control.cancel();
+        assert_eq!(
+            crate::run_with("pointsAlongLines", &m, &params, &control).err().as_deref(),
+            Some("Points Along Lines was cancelled before it started")
+        );
+        // Asked once it has walked some lines: it stops well before the end.
+        let control = crate::control::Control::new();
+        let watcher = {
+            let control = control.clone();
+            std::thread::spawn(move || {
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                while control.progress().is_none_or(|(done, _)| done == 0) && std::time::Instant::now() < end {
+                    std::thread::yield_now();
+                }
+                control.cancel();
+            })
+        };
+        let r = crate::run_with("pointsAlongLines", &m, &params, &control);
+        let _ = watcher.join();
+        let e = r.err().unwrap_or_default();
+        assert!(e.starts_with("Points Along Lines was cancelled "), "{e}");
+        let (done, total) = control.progress().unwrap_or_default();
+        assert!(total == 400 && done < total, "{done} of {total} lines");
     }
 
     #[test]
@@ -6726,6 +6824,8 @@ mod tests {
         let tiny = Spacing { step: 1e-300, start: 0.0, end: 0.0, with_end: true };
         assert_eq!(tiny.places(1e10, false).regular, usize::MAX);
         assert_eq!((mean_azimuth(170.0, -170.0), bearing(-1e-17), bearing(-90.0)), (180.0, 0.0, 270.0));
+        // Due north as -0 is 0, not "-0".
+        assert!(bearing(-0.0).is_sign_positive());
     }
 
     #[test]
