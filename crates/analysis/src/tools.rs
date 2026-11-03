@@ -3042,10 +3042,13 @@ fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         let Some(f) = ds.features.get(r) else { continue };
         let Some(g) = &f.geometry else { continue };
         before += g.coord_count();
-        // Beyond 85.05° the tolerance is taken at 85°'s scale east–west (`merc_scale`), where the
-        // ground is far narrower: less is taken out there than asked (#1033).
+        // A line or polygon reaching beyond 85.05° has its tolerance taken east–west at the scale
+        // of its label point's latitude, at most 85° (`merc_scale`), where the ground beyond is far
+        // narrower: less is taken out there than asked (#1033). Points aren't simplified.
         let mut beyond = false;
-        g.for_each_coord(|c| beyond |= c.y.is_finite() && c.y.abs() > rustgis_geom::MAX_LAT);
+        if !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+            g.for_each_coord(|c| beyond |= c.y.is_finite() && c.y.abs() > rustgis_geom::MAX_LAT);
+        }
         polar += usize::from(beyond && tol > 0.0);
         let sg = simplify_geometry(g, tol);
         after += sg.coord_count();
@@ -3054,7 +3057,7 @@ fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let mut messages = vec![format!("Simplify: {before} → {after} vertices")];
     if polar > 0 {
         messages.push(format!(
-            "{polar} feature(s) reach beyond 85.05°, where the tolerance is taken east–west at 85°'s scale: less is simplified away there than asked"
+            "{polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at the scale of the feature's middle, at most 85°'s: less is simplified away there than asked"
         ));
     }
     Ok(ToolResult { output: Output::Layer(out), messages })
@@ -6104,6 +6107,12 @@ mod tests {
         };
         assert!(said(86.0, 87.0, 1.0));
         assert!(!said(80.0, 84.0, 1.0) && !said(86.0, 87.0, 0.0));
+        // A point beyond 85.05° isn't simplified, so isn't counted.
+        let mut ds = Dataset::new("d", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(Coord::new(0.0, 88.0))), vec![]);
+        let m = Map(HashMap::from([("d".to_string(), ds)]));
+        let res = crate::run("simplify", &m, &serde_json::json!({"input": "d", "tolerance": 1.0})).unwrap();
+        assert!(res.messages.iter().all(|m| !m.contains("beyond 85.05°")), "{:?}", res.messages);
     }
 
     #[test]
