@@ -2804,6 +2804,8 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     segs.try_reserve_exact(longest).map_err(no_memory)?;
     // Vertices passed over for a coordinate missing or infinite, their neighbors joined.
     let mut missing = 0usize;
+    // Vertices with a latitude past a pole (bad data), taken as that pole.
+    let mut past_pole = 0usize;
     // The progress counts features; a cancel stops the walk at the next point, line or feature.
     crate::control::begin(feats().count());
     for (i, f) in feats().enumerate() {
@@ -2821,6 +2823,7 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                 return;
             }
             missing = missing.saturating_add(line.iter().flatten().filter(|c| !c.is_finite()).count());
+            past_pole = past_pole.saturating_add(line.iter().flatten().filter(|c| c.is_finite() && c.y.abs() > 90.0).count());
             // Each segment solved once. A line has no more segments than vertices, so the list
             // stays within the room reserved for the longest.
             segs.clear();
@@ -2847,6 +2850,9 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let mut r = result(out, format!("{TOOL}: {written} points"))?;
     if missing > 0 {
         r.messages.push(format!("{TOOL}: {missing} vertex(es) with a coordinate missing or infinite passed over"));
+    }
+    if past_pole > 0 {
+        r.messages.push(format!("{TOOL}: {past_pole} vertex(es) with a latitude past a pole taken as that pole"));
     }
     Ok(r)
 }
@@ -6300,16 +6306,26 @@ mod tests {
             crate::run("pointsAlongLines", &m, &serde_json::json!({"input": input, "distance": 1000, "includeEnd": true})).unwrap()
         };
         let r = run("lines");
-        // Every vertex finite (if wild): none passed over, and nothing said of it.
-        assert_eq!(r.messages.len(), 1, "{:?}", r.messages);
+        // Every vertex finite (if wild): none passed over; the two past a pole (1e300 and -95)
+        // are taken as it, and the tool says so.
+        assert_eq!(
+            r.messages[1..],
+            ["Points Along Lines: 2 vertex(es) with a latitude past a pole taken as that pole"],
+            "{:?}",
+            r.messages
+        );
         let v = layer(r);
         on_earth(&v);
         assert_eq!((place(&v, 0).0.y, place(&v, v.features.len() - 1).0.y), (90.0, -90.0));
-        // The ring's vertex missing its longitude is passed over, and the tool says so.
+        // The ring's vertex missing its longitude is passed over, the one past a pole taken as
+        // it, and the tool says both, each once.
         let r = run("polys");
         assert_eq!(
-            r.messages.get(1).map(String::as_str),
-            Some("Points Along Lines: 1 vertex(es) with a coordinate missing or infinite passed over")
+            r.messages[1..],
+            [
+                "Points Along Lines: 1 vertex(es) with a coordinate missing or infinite passed over",
+                "Points Along Lines: 1 vertex(es) with a latitude past a pole taken as that pole"
+            ],
         );
         let v = layer(r);
         on_earth(&v);

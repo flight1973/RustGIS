@@ -355,7 +355,7 @@ at the ends of an east–west edge 100 km long, 0.45° at 45° and 2.5° at 80°
 isn't conformal on the ellipsoid, from a diagonal edge's by up to about 0.19° at the equator (0.1°
 at 45°, less toward the poles). A vertex less than a millimeter from the one before is passed over,
 so a near-duplicate doesn't turn a point's angle; a vertex past a pole (bad data) is taken as the
-pole; and a vertex with a coordinate missing or infinite is passed over (its neighbors joined, or a
+pole, and the tool says how many it took so; and a vertex with a coordinate missing or infinite is passed over (its neighbors joined, or a
 line's end trimmed back to the last vertex it has), and the tool says how many it passed over. The output keeps what the input lost on reading, if
 anything (features, or Z and M values), as its layer's notes say. The points
 keep the input's coordinate system, with longitudes between -180 and 180, so a point past the
