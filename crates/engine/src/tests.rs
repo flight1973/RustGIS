@@ -24627,7 +24627,9 @@ fn must_be_covered_by_says_which_polygons_it_left_out_at_a_pole() {
         let mark = s.notice_mark();
         let v = s.run("topology.validate", &Value::Null).unwrap();
         assert_eq!(v["errors"], u64::from(warned));
-        let said = s.notices_since(mark).iter().any(|n| n.text.contains("left out of the check at a pole") && n.text.contains(": 1"));
+        let said = s.notices_since(mark).iter().any(|n| {
+            n.text.contains("left out of the check at a pole") && n.text.contains("Must Be Covered By on 'Pole': 1 feature(s) of 'Caps'")
+        });
         assert_eq!(said, warned, "{:?}", s.notices_since(mark));
     }
 }

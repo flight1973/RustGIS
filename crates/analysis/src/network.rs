@@ -574,31 +574,40 @@ fn polar_reach(g: &Geometry, e: &rustgis_geom::Extent, at: Coord, ground: &rustg
         // written across ±180°, or from 0° to 360°, holds a center written a turn or more away; one
         // whose box holds none of them holds no center. Every turn the box spans is tried: the
         // first four (all an ordinary polygon has) freely, each further one taking as many steps as
-        // the polygon has vertices; once they run out, the polygon counts as holding the center, a
-        // bound.
+        // the polygon has vertices. When, past the first four, the steps left can't pay for the
+        // rest, or the turns are too many to count one by one (past 2⁵³), the polygon counts as
+        // holding the center, a bound, at once, taking none (as an edge too long to step along
+        // does), so one polygon written a billion degrees long doesn't spend the search's steps.
         if e.min_y <= at.y && at.y <= e.max_y {
             let (first, last) = (((e.min_x - at.x) / 360.0).ceil(), ((e.max_x - at.x) / 360.0).floor());
             let mut plane = None;
-            let mut vertices = None;
             let mut tried = 0_u32;
             let mut turn = first;
+            // The steps each turn past the first four takes.
+            let mut cost = 1;
             while turn <= last {
-                if tried >= 4 {
-                    let cost = *vertices.get_or_insert_with(|| {
-                        let mut n = 0_usize;
-                        g.for_each_coord(|_| n += 1);
-                        n.max(1)
-                    });
-                    if !steps.take(cost) {
+                if tried == 4 {
+                    let mut n = 0_usize;
+                    g.for_each_coord(|_| n += 1);
+                    cost = n.max(1);
+                    // (Finite, or infinite for a box billions of turns wide: never missing.)
+                    if (last - turn + 1.0) * cost as f64 > steps.left as f64 {
                         return steps.bound(0.0);
                     }
+                }
+                if tried >= 4 && !steps.take(cost) {
+                    return steps.bound(0.0);
                 }
                 let c = Coord::new(at.x + 360.0 * turn, at.y);
                 if plane.get_or_insert_with(|| g.map_coords(&lonlat_to_plane)).hit(lonlat_to_plane(c), 0.0) {
                     return 0.0;
                 }
                 tried = tried.saturating_add(1);
-                turn = first + f64::from(tried);
+                let next = first + f64::from(tried);
+                if next <= turn {
+                    return steps.bound(0.0);
+                }
+                turn = next;
             }
         }
     }
@@ -834,6 +843,27 @@ mod tests {
         ds.push(Some(Geometry::Polygon(vec![vec![long]])), vec![]);
         assert_eq!(within_counted(&ds, &[0], c(0.0, 86.5), 1_000.0), (vec![(0, 0.0)], 0));
         assert_eq!(within_counted(&ds, &[1], c(0.0, 86.5), 50_000.0), (vec![(1, 0.0)], 1));
+        // Past its first four turns, the sliver counts at its bound at once, taking no steps: a
+        // line after it, about 160 km off, is still measured, and left out of 50 km.
+        ds.push(Some(Geometry::Line(vec![vec![c(-170.0, 86.0), c(170.0, 89.9)]])), vec![]);
+        assert_eq!(within_counted(&ds, &[1, 2], c(0.0, 86.5), 50_000.0), (vec![(1, 0.0)], 1));
+        // A center on the sliver's corner is found there, at its first turn, exactly.
+        assert_eq!(within_counted(&ds, &[1], c(0.0, 86.0), 50_000.0), (vec![(1, 0.0)], 0));
+        // A wedge written 1e19° on, its turns some 2.8e16, past 2⁵³, where a turn and the next
+        // round to one number: the center isn't in it at the first, which can't be counted on from,
+        // so it's a bound, at once, taking no steps.
+        let wedge = Geometry::Polygon(vec![vec![vec![c(1e19, 86.0), c(1e19 + 1e6, 86.0), c(1e19 + 1e6, 86.6), c(1e19, 86.0)]]]);
+        let mut steps = Steps::new(REACH_STEPS_TOTAL);
+        let at = c(0.0, 86.5);
+        assert!((1e19 / 360.0f64).ceil() + 1.0 == (1e19 / 360.0f64).ceil());
+        let d = polar_reach(&wedge, &wedge.extent(), at, &rustgis_geom::Aeqd::new(at), 50_000.0, &mut steps);
+        assert!(d == 0.0 && steps.bound == 0.0 && steps.left == REACH_STEPS_TOTAL, "{d} {} {}", steps.bound, steps.left);
+        // A center in the polygon at its first turn is found there, exactly, however many turns
+        // its box spans after.
+        let mut wide = Dataset::new("wide", GeometryType::Polygon, vec![]);
+        let ring = vec![c(-10.0, 86.0), c(1e9, 86.0), c(1e9, 87.0), c(-10.0, 87.0), c(-10.0, 86.0)];
+        wide.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+        assert_eq!(within_counted(&wide, &[0], c(0.0, 86.5), 1_000.0), (vec![(0, 0.0)], 0));
     }
 
     #[test]

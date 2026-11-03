@@ -1260,7 +1260,12 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
             incomplete.push(rule.label().to_string());
         }
         if found.skipped > 0 {
-            skipped.push(format!("{} on '{}': {}", rule.label(), l.name, found.skipped));
+            // The features left out are the covering layer's.
+            let of = match &rule {
+                TopologyRule::MustBeCoveredBy { by, .. } => by.as_str(),
+                _ => l.name.as_str(),
+            };
+            skipped.push(format!("{} on '{}': {} feature(s) of '{}'", rule.label(), l.name, found.skipped, of));
         }
         errors.extend(found.errors.into_iter().map(|e| crate::TopologyIssue {
             rule: rule.label().to_string(),
@@ -1272,7 +1277,7 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
     }
     if !skipped.is_empty() {
         s.warn(format!(
-            "Polygons left out of the check at a pole (a coordinate missing or infinite, or a million turns around), so points there they'd cover are reported: {}",
+            "Polygons left out of the check at a pole (a coordinate missing or infinite, or a million turns around), so its result there may be wrong: {}",
             skipped.join("; ")
         ));
     }
