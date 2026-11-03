@@ -285,6 +285,7 @@ fn one_notice_per_field_for_missing_values() {
             "Tabulate Intersection: 1 row",
             "1 zone overlaps no class feature, so it has no rows",
             "class features with no value in a sum field are left out of its shares: 2 class features in 'pop', 1 class feature in 'income'",
+            "1 zone feature and 1 class feature have an edge beyond 85.05° running east or west: the map takes it straight in longitude and latitude, and their percentages and shares follow the map, while area_km2 takes the shortest way on the ground, which near a pole can differ widely",
             "1 class feature lies partly or wholly outside the zones: its value outside isn't shared out",
         ]
     );
@@ -309,7 +310,12 @@ fn polygons_past_85_degrees_are_measured_to_the_pole() {
     c.push_next(polar(20.0, 30.0, 86.0, 90.0), vec![Value::Float(500.0)]);
     let l = layers(z, c);
     let params = json!({"zones": "zones", "zoneFields": "zone", "classes": "classes", "sumFields": ["pop"]});
-    let got = rows(&table(rustgis_analysis::run("tabulateIntersection", &l, &params).unwrap()));
+    let res = rustgis_analysis::run("tabulateIntersection", &l, &params).unwrap();
+    // Each has an edge beyond 85.05° running east or west, which the map and the ground take
+    // differently: the tool says so.
+    let said = "2 zone features and 2 class features have an edge beyond 85.05° running east or west";
+    assert!(res.messages.iter().any(|m| m.starts_with(said)), "{:?}", res.messages);
+    let got = rows(&table(res));
     // zone, then area_km2, percentage, pop.
     assert_eq!(got.len(), 2, "{got:?}");
     let (a, b) = (&got[0], &got[1]);
@@ -319,6 +325,13 @@ fn polygons_past_85_degrees_are_measured_to_the_pole() {
     assert!((a.1[0] - 34_625.271).abs() < 0.01 && (b.1[0] - 17_323.559).abs() < 0.01, "{a:?} {b:?}");
     assert!((a.1[1] - 33.388).abs() < 0.01 && (a.1[2] - 914.216).abs() < 0.1, "{a:?}");
     assert!((b.1[1] - 16.034).abs() < 0.01 && (b.1[2] - 500.0).abs() < 1e-6, "{b:?}");
+    // Within ±85.05°, or beyond it only along meridians, nothing of the kind.
+    let mut z = Dataset::new("zones", GeometryType::Polygon, vec![Field::new("zone", FieldType::Text)]);
+    z.push_next(polar(0.0, 10.0, 70.0, 85.0), vec![Value::Text("A".into())]);
+    let mut c = Dataset::new("classes", GeometryType::Polygon, vec![Field::new("pop", FieldType::Double)]);
+    c.push_next(polar(0.0, 10.0, 75.0, 85.0), vec![Value::Float(1000.0)]);
+    let res = rustgis_analysis::run("tabulateIntersection", &layers(z, c), &params).unwrap();
+    assert!(res.messages.iter().all(|m| !m.contains("beyond 85.05°")), "{:?}", res.messages);
 }
 
 /// Features of about 10 m in zones of half a degree: the overlay rounds their parts to a grid
