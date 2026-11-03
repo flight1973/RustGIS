@@ -238,8 +238,11 @@ gp.run={"tool":"vectorToPmtiles","params":{"input":"Roads","minZoom":0,"maxZoom"
 least three different, non-collinear corners (plus the closing vertex), so a tolerance larger
 than a polygon produces a small ring instead of restoring its original vertices. Holes and
 multipart rings are retained. This is not a topology-preserving simplifier: check the result
-where holes or neighbouring polygons must stay aligned. The default tolerance remains 25 km;
-use a smaller value for local boundaries.
+where holes or neighboring polygons must stay aligned. The default tolerance remains 25 km;
+use a smaller value for local boundaries. Beyond 85.05° the tolerance is taken east–west at
+85°'s scale, where the ground is far narrower, so less is simplified away there than asked (a
+3 km tolerance at 89.9°N takes out only what lies within about 60 m east–west), and the tool says
+how many features reach that far.
 
 **Kernel Density** (`kernelDensity`) calculates a continuous magnitude-per-unit-area raster
 surface from point features using a Quartic (biweight, default) or Gaussian kernel (truncated at 3σ and

@@ -2452,16 +2452,27 @@ fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let tol = num(p, "tolerance").ok_or("Tolerance must be a number")?.abs() * 1000.0;
     let mut out = copy_schema(ds, out_name(p, format!("{}_Simplified", ds.name)), ds.geometry_type);
-    let (mut before, mut after) = (0usize, 0usize);
+    let (mut before, mut after, mut polar) = (0usize, 0usize, 0usize);
     for r in rows(inp, p, "input", ds) {
         let Some(f) = ds.features.get(r) else { continue };
         let Some(g) = &f.geometry else { continue };
         before += g.coord_count();
+        // Beyond 85.05° the tolerance is taken at 85°'s scale east–west (`merc_scale`), where the
+        // ground is far narrower: less is taken out there than asked (#1033).
+        let mut beyond = false;
+        g.for_each_coord(|c| beyond |= c.y.is_finite() && c.y.abs() > rustgis_geom::MAX_LAT);
+        polar += usize::from(beyond && tol > 0.0);
         let sg = simplify_geometry(g, tol);
         after += sg.coord_count();
         out.push(Some(sg), f.attrs.clone());
     }
-    result(out, format!("Simplify: {before} → {after} vertices"))
+    let mut messages = vec![format!("Simplify: {before} → {after} vertices")];
+    if polar > 0 {
+        messages.push(format!(
+            "{polar} feature(s) reach beyond 85.05°, where the tolerance is taken east–west at 85°'s scale: less is simplified away there than asked"
+        ));
+    }
+    Ok(ToolResult { output: Output::Layer(out), messages })
 }
 
 /// A Select by Location selector: its shape and extent in the analysis plane, and the poles it
@@ -4154,7 +4165,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     if !polar.is_empty() {
         let verb = if zones_polar + classes_polar == 1 { "has" } else { "have" };
         messages.push(format!(
-            "{} {verb} an edge beyond 85.05° running east or west: the map takes it straight in longitude and latitude, and their percentages and shares follow the map, while area_km2 takes the shortest way on the ground, which near a pole can differ widely",
+            "{} {verb} an edge beyond 85.05° running east or west: the analysis plane takes it straight in longitude and latitude beyond 85.05°, and their percentages and shares follow the plane, while area_km2 takes the shortest way on the ground, which near a pole can differ widely",
             polar.join(" and ")
         ));
     }
@@ -5554,6 +5565,22 @@ mod tests {
             assert_eq!(out.features[0].geometry.as_ref(), Some(&simple));
         }
         assert_eq!(previous, 12, "three closed triangle rings at a very large tolerance");
+    }
+
+    #[test]
+    fn simplify_says_how_many_features_reach_beyond_85_degrees() {
+        // A box from 86°N to 87°N reaches beyond 85.05°, where less is taken out east–west than
+        // asked: the tool says so. One from 80°N to 84°N, or a tolerance of 0, says nothing.
+        let said = |y0: f64, y1: f64, tolerance: f64| {
+            let ring = [(0.0, y0), (1.0, y0), (1.0, y1), (0.0, y1), (0.0, y0)].map(|(x, y)| Coord::new(x, y)).to_vec();
+            let mut ds = Dataset::new("d", GeometryType::Polygon, vec![]);
+            ds.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+            let m = Map(HashMap::from([("d".to_string(), ds)]));
+            let res = crate::run("simplify", &m, &serde_json::json!({"input": "d", "tolerance": tolerance})).unwrap();
+            res.messages.iter().any(|m| m.contains("beyond 85.05°"))
+        };
+        assert!(said(86.0, 87.0, 1.0));
+        assert!(!said(80.0, 84.0, 1.0) && !said(86.0, 87.0, 0.0));
     }
 
     #[test]
