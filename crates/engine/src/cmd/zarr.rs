@@ -104,10 +104,10 @@ fn fetch(root: &str, keys: &[String]) -> Result<(HashMap<String, Vec<u8>>, usize
                         break;
                     }
                     // A missing file is an expected answer here (see `is_absent`), not a failure: its 404
-                    // or 403 makes no network record of its own (one note per server says the
+                    // or 403 isn't recorded one by one (one note per server says the
                     // omission, and a store refusing everything still says "access denied"), while
                     // a real one (a 500, a timeout) does, with its address, status and duration.
-                    let got = crate::render::rustgis_tiles::cache::download_blocking_expecting(&format!("{root}/{k}"), &[404, 403]);
+                    let got = crate::render::rustgis_tiles::cache::download_blocking_omitting(&format!("{root}/{k}"), &[404, 403]);
                     match got {
                         Ok(b) => {
                             let len = b.len() as u64;
@@ -935,7 +935,7 @@ impl ReduceRun {
         use std::sync::atomic::Ordering;
         // The first slice's grid (its size, place and coordinate system), all the run keeps of it.
         let mut first: Option<(u32, u32, raster::GeoTransform, Crs)> = None;
-        let mut totals = super::cube::Totals::new(self.stat, 0);
+        let mut totals = super::cube::Totals::new(self.stat, 0)?;
         // Steps never written (no chunk at all), read as having no value.
         let mut unwritten = 0usize;
         for &i in &self.steps {
@@ -965,7 +965,7 @@ impl ReduceRun {
                     if len > MAX_REDUCE_CELLS {
                         return Err(format!("{len} cells, more than a summary takes ({MAX_REDUCE_CELLS})"));
                     }
-                    totals = super::cube::Totals::new(self.stat, len);
+                    totals = super::cube::Totals::new(self.stat, len)?;
                     first = Some((r.width, r.height, r.transform, r.crs));
                 }
                 // One grid for every step: the same size and coordinate system, its place within a
