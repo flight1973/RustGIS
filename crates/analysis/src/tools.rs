@@ -1378,16 +1378,18 @@ impl BufferStorage {
 }
 
 /// Ordinary per-feature Buffer: bounded result batches, a per-feature complexity limit and
-/// one byte budget for row capacity, geometry allocations and copied attributes together.
+/// one byte budget for row capacity, geometry allocations and copied attributes together. With
+/// the buffers, how many left an edge straying more than its tolerance.
 fn buffer_rows(
     geoms: &[(&Feature, &Geometry)],
     metres: f64,
     vertices: usize,
     bytes: usize,
     fields: usize,
-) -> Result<Vec<Feature>, &'static str> {
+) -> Result<(Vec<Feature>, usize), &'static str> {
     let storage = BufferStorage::new(bytes);
     let mut output = Vec::new();
+    let coarse = std::sync::atomic::AtomicUsize::new(0);
     crate::control::begin(geoms.len());
     for batch in geoms.chunks(BUFFER_BATCH) {
         let made = crate::parallel::try_map(
@@ -1395,7 +1397,9 @@ fn buffer_rows(
             PARALLEL_FEATURES,
             || (),
             |_, _, (f, g)| -> Result<Option<Feature>, &'static str> {
-                let Some(geometry) = geodesic_buffer_with_limit(g, metres, vertices)?.geometry else { return Ok(None) };
+                let buffered = geodesic_buffer_with_limit(g, metres, vertices)?;
+                coarse.fetch_add(usize::from(buffered.coarse), std::sync::atomic::Ordering::Relaxed);
+                let Some(geometry) = buffered.geometry else { return Ok(None) };
                 // Charge the requested attribute storage before copying potentially large text.
                 // Fallible allocation also makes an exhausted allocator an ordinary tool error.
                 let requested = f.attrs.iter().take(fields).fold(
@@ -1422,7 +1426,7 @@ fn buffer_rows(
             output.push(feature);
         }
     }
-    Ok(output)
+    Ok((output, coarse.into_inner()))
 }
 
 /// Buffer with the output budget shared by all selected input features.
@@ -1444,15 +1448,15 @@ fn buffer_with_limits(inp: &dyn Inputs, p: &Json, limit: usize, bytes: usize) ->
     let picked: Vec<&Feature> = rows(inp, p, "input", ds).into_iter().filter_map(|r| ds.features.get(r)).collect();
     let geoms: Vec<(&Feature, &Geometry)> = picked.iter().filter_map(|f| Some((*f, f.geometry.as_ref()?))).collect();
     let without = picked.len() - geoms.len();
-    let empty = if s(p, "dissolve") != "All" {
-        let features = buffer_rows(&geoms, metres, limit, bytes, out.fields.len())?;
+    let (empty, coarse) = if s(p, "dissolve") != "All" {
+        let (features, coarse) = buffer_rows(&geoms, metres, limit, bytes, out.fields.len())?;
         let empty = geoms.len() - features.len();
         out.features = features.into();
-        empty
+        (empty, coarse)
     } else {
         // Dissolve still accumulates outlines for one overlay, so retain its shared complexity
         // limit, including multipoint discs before union and the final union's coordinates.
-        let buffers = geodesic_buffers_with_limit(&geoms.iter().map(|(_, g)| *g).collect::<Vec<_>>(), metres, limit)?;
+        let (buffers, coarse) = geodesic_buffers_with_limit(&geoms.iter().map(|(_, g)| *g).collect::<Vec<_>>(), metres, limit)?;
         let empty = buffers.iter().filter(|g| g.is_none()).count();
         for geom in buffers.into_iter().flatten() {
             all.extend(to_multipolygon(&geom));
@@ -1470,7 +1474,7 @@ fn buffer_with_limits(inp: &dyn Inputs, p: &Json, limit: usize, bytes: usize) ->
                 out.push(Some(geom), vec![]);
             }
         }
-        empty
+        (empty, coarse)
     };
     let n = out.features.len();
     let units = if s(p, "units").is_empty() { "Kilometers" } else { s(p, "units") };
@@ -1481,6 +1485,12 @@ fn buffer_with_limits(inp: &dyn Inputs, p: &Json, limit: usize, bytes: usize) ->
     if empty > 0 {
         r.messages
             .push(format!("{empty} of {} features made no buffer at {d} {units} (nothing left, or no finite coordinates)", picked.len()));
+    }
+    if coarse > 0 {
+        r.messages.push(format!(
+            "{coarse} of {} features' buffers have edges left longer than their outline allows (a ring of thousands of long edges uses up the points added to it): their sides there can stray more than 0.012% from the distance",
+            picked.len()
+        ));
     }
     Ok(r)
 }
@@ -3116,13 +3126,21 @@ fn select_by_location_with_work_limit(inp: &dyn Inputs, p: &Json, limit: usize, 
     let storage = BufferStorage::new(if dist > 0.0 { bytes } else { usize::MAX });
     let mut selectors = Vec::new();
     crate::control::begin(picked.len());
+    // Selecting features whose buffers kept edges coarser than their outline allows.
+    let coarse = std::sync::atomic::AtomicUsize::new(0);
     for batch in picked.chunks(BUFFER_BATCH) {
         let made = crate::parallel::try_map(
             batch,
             PARALLEL_FEATURES,
             || (),
             |_, _, g| {
-                let b = if dist > 0.0 { geodesic_buffer_with_limit(g, dist, limit)?.geometry } else { None };
+                let b = if dist > 0.0 {
+                    let buffered = geodesic_buffer_with_limit(g, dist, limit)?;
+                    coarse.fetch_add(usize::from(buffered.coarse), std::sync::atomic::Ordering::Relaxed);
+                    buffered.geometry
+                } else {
+                    None
+                };
                 let gg = to_geo(b.as_ref().unwrap_or(g));
                 if dist > 0.0 {
                     storage.charge(selector_heap_bytes(&gg))?;
@@ -3184,6 +3202,12 @@ fn select_by_location_with_work_limit(inp: &dyn Inputs, p: &Json, limit: usize, 
             "{} of {} selecting features lack geometry, so they select nothing",
             chosen.len() - picked.len(),
             chosen.len()
+        ));
+    }
+    let coarse = coarse.into_inner();
+    if coarse > 0 {
+        messages.push(format!(
+            "{coarse} selecting features' buffers have edges left longer than their outline allows (a ring of thousands of long edges uses up the points added to it): features near their edges there may be selected or not by more than 0.012% of the distance"
         ));
     }
     Ok(ToolResult { output: Output::Selection { layer: ds.name.clone(), rows: hits }, messages })

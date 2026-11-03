@@ -267,7 +267,9 @@ projection. Each feature is buffered in an azimuthal equidistant projection on t
 centred on it, so distances from a point are true; long lines and large polygon outlines are
 buffered in stretches of a few hundred kilometres to limit projection error. Up to 85° of
 latitude, a buffer's sides are within 0.012 % of the distance (or 1 cm), and within 0.05 % along
-a winding line or outline buffered in stretches. Its curves are drawn with straight edges (128
+a winding line or outline buffered in stretches. An outline's edges are split to keep to that,
+by at most 16,000 points a ring; a ring of thousands of long edges can use them up and keep some
+edges coarser, and the tool says how many features' buffers did. Its curves are drawn with straight edges (128
 to a point's circle, 64 to a semicircular line end). Between vertices, those edges cut up
 to 0.031 % of the distance inside the true curve in the projection plane, and up to 0.125 % at
 polygon corners and line joins, in addition to the projection error. Negative Buffer
