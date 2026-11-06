@@ -112,8 +112,8 @@ that crosses 85.05° is straight in the tools, but the Web Mercator map clamps i
 85.05° and draws it straight to there, so a cut along such an edge can fall well east or west of
 where that map shows it: about 48 km at 84.5°N for an edge from (0°, 80°N) to (10°E, 89°N). A
 pole is a line in these coordinates, not a point, so Minimum Bounding Geometry of points spread
-around a pole spans their longitudes (a sliver, for points on one parallel), not the cap they
-enclose on the ground. The globe draws a long edge along the great circle between its ends, so near
+around a pole spans their longitudes (a flat polygon with no area, for points on one parallel),
+not the cap they enclose on the ground. The globe draws a long edge along the great circle between its ends, so near
 a pole it shows a little poleward of where the tools take it: about 850 m at the middle of a 10°
 edge along 88°N (as everywhere, the tools take an edge as straight on the map, not on the globe).
 Beyond 85.05°, the dangle check measures line ends about their pole (on WGS 84's curvature there,
@@ -759,9 +759,9 @@ The tool says how many zone and class features have no polygon (no geometry, an 
 point, or a ring collapsed to no area; they are left out), how many cross the antimeridian without
 being split there (the map, and with it the percentages and shares, takes them the long way round,
 while area_km2 takes their ground shape), how many have an edge beyond 85.05° running east or west
-(taken as the map draws it, so their percentages and area_km2 can differ widely, as above), how
-many zones overlap no class feature and so have no
-rows, how many class features have no value in a sum field (they add nothing to its shares) and,
+(their percentages and shares follow the analysis plane, which takes such an edge straight in
+longitude and latitude, not clamped as the Web Mercator map draws it, so they and area_km2 can
+differ widely, as above), how many zones overlap no class feature and so have no rows, how many class features have no value in a sum field (they add nothing to its shares) and,
 with sum fields, how many class features lie partly or wholly outside the zones. Only selected
 features are used when a layer has a selection, and the table is named `<zones>_Tabulate` unless
 `output` names it.

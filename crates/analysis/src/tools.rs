@@ -3803,9 +3803,40 @@ fn map_area_m2(g: &Geometry) -> f64 {
 /// linearly with λ, so it is Δλ × (cos φ₁ − cos φ₂)/Δφ. For a short Δψ or Δφ, where those
 /// differences cancel, each takes its Taylor series about the middle. Longitudes are not folded,
 /// as on the map, so the ring's Δλ add up to 0 and no ring winds around a pole: a ring stored
-/// around one with a jump across the antimeridian is the flat shape the map draws.
+/// around one with a jump across the antimeridian is the flat shape the map draws. Since they add
+/// up to 0, a ring wholly beyond 85.05° on one side is measured as ∮ (sin φ ∓ 1) dλ instead, the
+/// same area, with 1 ∓ sin φ taken as 1 − cos θ from the colatitude θ: it keeps its precision
+/// where sin φ rounds to ±1, within about 7 cm of the pole, so a small ring there doesn't cancel
+/// to nothing.
 fn rhumb_ring_area(ring: &[Coord]) -> f64 {
     let max_lat = rustgis_geom::MAX_LAT;
+    // +1 for a ring wholly beyond 85.05° north, −1 south, 0 otherwise (or with a missing latitude).
+    let side = if ring.iter().all(|c| c.y > max_lat) {
+        1.0
+    } else if ring.iter().all(|c| c.y < -max_lat) {
+        -1.0
+    } else {
+        0.0
+    };
+    // θ − sin θ by its Taylor series, for a colatitude within 4.95° (0.087 rad) of the pole, where
+    // the subtraction would cancel: the first term left out is under 5e-16 of the first.
+    let g = |t: f64| {
+        let t2 = t * t;
+        t * t2 / 6.0 * (1.0 - t2 / 20.0 * (1.0 - t2 / 42.0 * (1.0 - t2 / 72.0)))
+    };
+    // The mean of 1 − cos θ along a piece from `p` to `q` on `side`'s pole, θ changing linearly
+    // with λ: (g(θ₂) − g(θ₁))/Δθ, or for a short Δθ, 2 sin²(m/2) + cos m × Δθ²/24 about the middle
+    // m. The colatitude 90° ∓ φ is exact in degrees.
+    let mean_versine = |p: Coord, q: Coord| {
+        let (t1, t2) = ((90.0 - side * p.y).max(0.0).to_radians(), (90.0 - side * q.y).max(0.0).to_radians());
+        let dt = t2 - t1;
+        if dt.abs() < 1e-4 {
+            let m = (t1 + t2) / 2.0;
+            2.0 * (m / 2.0).sin().powi(2) + m.cos() * dt * dt / 24.0
+        } else {
+            (g(t2) - g(t1)) / dt
+        }
+    };
     let iso = |lat: f64| lat.clamp(-max_lat, max_lat).to_radians().tan().asinh();
     let ln_cosh = |x: f64| x.abs() + (-2.0 * x.abs()).exp().ln_1p() - std::f64::consts::LN_2;
     // The mean of sin φ along a piece from `p` to `q`, straight in the plane on one side of ±85.05°.
@@ -3846,7 +3877,9 @@ fn rhumb_ring_area(ring: &[Coord]) -> f64 {
         cuts.sort_by(|p, q| p.0.total_cmp(&q.0));
         let mut from = a;
         for to in cuts.into_iter().map(|(t, lat)| Coord::new(a.x + t * (b.x - a.x), lat)).chain(std::iter::once(b)) {
-            total += (to.x - from.x).to_radians() * mean_sin(from, to);
+            // sin φ ∓ 1 is −(1 − cos θ) by the North Pole and 1 − cos θ by the South Pole.
+            let mean = if side == 0.0 { mean_sin(from, to) } else { -side * mean_versine(from, to) };
+            total += (to.x - from.x).to_radians() * mean;
             from = to;
         }
     }
@@ -4468,8 +4501,8 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         rs.iter().filter(|&&r| ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(jumps)).count()
     };
     let (zones_unsplit, classes_unsplit) = (unsplit(zones, &zone_rows), unsplit(classes, &class_rows));
-    // Features with an edge beyond 85.05° that runs east or west: the overlay, like the map, takes
-    // it straight in longitude and latitude there, while `area_km2` takes the shortest way between
+    // Features with an edge beyond 85.05° that runs east or west: the overlay, in the analysis plane,
+    // takes it straight in longitude and latitude there (the Web Mercator map clamps it), while `area_km2` takes the shortest way between
     // its ends, which near a pole runs far poleward of it (#1033).
     let polar = |ds: &Dataset, rs: &[usize]| {
         let max = rustgis_geom::MAX_LAT;
@@ -8721,14 +8754,9 @@ mod tests {
         assert!(around_pole.abs() < 1.0, "{around_pole} m²");
     }
 
-    /// An edge crossing 85.05° and running east or west is cut where it crosses: a rhumb line on one
-    /// side, straight in longitude and latitude on the other. The map measure of a triangle with two
-    /// such edges agrees with ∮ sin φ dλ summed in a million steps along each edge as the plane draws
-    /// it, independently of the cut.
-    #[test]
-    fn map_area_cuts_edges_across_85_degrees() {
-        let ring: Vec<Coord> = [(0.0, 80.0), (20.0, 88.0), (-15.0, 87.0), (0.0, 80.0)].iter().map(|&(x, y)| Coord::new(x, y)).collect();
-        let measured = map_area_m2(&Geometry::Polygon(vec![vec![ring.clone()]]));
+    /// |∮ sin φ dλ| around `ring` on a sphere of the Earth's radius, summed in a million steps along
+    /// each edge as the analysis plane draws it: the map measure worked out the slow way.
+    fn stepped_area_m2(ring: &[Coord]) -> f64 {
         let steps = 1_000_000;
         let mut sum = 0.0;
         for w in ring.windows(2) {
@@ -8741,7 +8769,47 @@ mod tests {
                 last = next;
             }
         }
-        let expected = sum.abs() * rustgis_geom::EARTH_RADIUS_M * rustgis_geom::EARTH_RADIUS_M;
+        sum.abs() * rustgis_geom::EARTH_RADIUS_M * rustgis_geom::EARTH_RADIUS_M
+    }
+
+    /// An edge crossing 85.05° and running east or west is cut where it crosses: a rhumb line on one
+    /// side, straight in longitude and latitude on the other. The map measure of a triangle with two
+    /// such edges agrees with ∮ sin φ dλ summed in a million steps along each edge as the plane draws
+    /// it, independently of the cut.
+    #[test]
+    fn map_area_cuts_edges_across_85_degrees() {
+        let ring: Vec<Coord> = [(0.0, 80.0), (20.0, 88.0), (-15.0, 87.0), (0.0, 80.0)].iter().map(|&(x, y)| Coord::new(x, y)).collect();
+        let measured = map_area_m2(&Geometry::Polygon(vec![vec![ring.clone()]]));
+        let expected = stepped_area_m2(&ring);
+        assert!((measured / expected - 1.0).abs() < 1e-9, "{measured} m², not {expected}");
+    }
+
+    /// A ring right by a pole keeps its area: where sin φ rounds to 1, within about 7 cm of the pole,
+    /// a strip between two parallels there doesn't cancel to nothing. Its area, Δλ × (sin φ₁ − sin φ₂)
+    /// on the sphere, is 2 sin((θ₁ + θ₂)/2) sin((θ₂ − θ₁)/2) × Δλ in the colatitudes θ. So near the
+    /// pole 1 − cos θ is θ²/2, whose mean along an edge slanting from θ₁ to θ₂ is
+    /// (θ₁² + θ₁θ₂ + θ₂²)/6: a triangle with an edge slanting from θ to 3θ, closed along the parallel
+    /// at θ, has an area of Δλ × (13θ²/6 − θ²/2) = 5/3 Δλ θ². A triangle wholly beyond 85.05° agrees
+    /// with ∮ sin φ dλ summed in a million steps along each edge.
+    #[test]
+    fn map_area_keeps_rings_by_a_pole() {
+        let r2 = rustgis_geom::EARTH_RADIUS_M * rustgis_geom::EARTH_RADIUS_M;
+        let poly = |pts: &[(f64, f64)]| Geometry::Polygon(vec![vec![pts.iter().map(|&(x, y)| Coord::new(x, y)).collect()]]);
+        // Colatitudes of 1e-7° and 2e-7°: 1.1 cm and 2.2 cm from the pole, 10° wide.
+        let (t1, t2, dl) = (1e-7f64.to_radians(), 2e-7f64.to_radians(), 10f64.to_radians());
+        let expected = r2 * dl * 2.0 * ((t1 + t2) / 2.0).sin() * ((t2 - t1) / 2.0).sin();
+        let slanted = r2 * dl * 5.0 / 3.0 * t1 * t1;
+        for side in [1.0, -1.0] {
+            let lat = |colat: f64| side * (90.0 - colat);
+            let (a, b) = (lat(1e-7), lat(2e-7));
+            let strip = map_area_m2(&poly(&[(0.0, a), (10.0, a), (10.0, b), (0.0, b), (0.0, a)]));
+            assert!((strip / expected - 1.0).abs() < 1e-6, "{strip} m², not {expected} (pole {side})");
+            let tri = map_area_m2(&poly(&[(0.0, a), (10.0, lat(3e-7)), (10.0, a), (0.0, a)]));
+            assert!((tri / slanted - 1.0).abs() < 1e-6, "{tri} m², not {slanted} (pole {side})");
+        }
+        let ring: Vec<Coord> = [(0.0, 86.0), (20.0, 89.0), (-15.0, 87.5), (0.0, 86.0)].iter().map(|&(x, y)| Coord::new(x, y)).collect();
+        let measured = map_area_m2(&Geometry::Polygon(vec![vec![ring.clone()]]));
+        let expected = stepped_area_m2(&ring);
         assert!((measured / expected - 1.0).abs() < 1e-9, "{measured} m², not {expected}");
     }
 
