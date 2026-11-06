@@ -3804,16 +3804,19 @@ fn map_area_m2(g: &Geometry) -> f64 {
 /// differences cancel, each takes its Taylor series about the middle. Longitudes are not folded,
 /// as on the map, so the ring's Δλ add up to 0 and no ring winds around a pole: a ring stored
 /// around one with a jump across the antimeridian is the flat shape the map draws. Since they add
-/// up to 0, a ring wholly beyond 85.05° on one side is measured as ∮ (sin φ ∓ 1) dλ instead, the
-/// same area, with 1 ∓ sin φ taken as 1 − cos θ from the colatitude θ: it keeps its precision
-/// where sin φ rounds to ±1, within about 7 cm of the pole, so a small ring there doesn't cancel
-/// to nothing.
+/// up to 0, a ring wholly poleward of 45° on one side is measured as ∮ (sin φ ∓ 1) dλ instead, the
+/// same area: beyond 85.05° with 1 ∓ sin φ taken as 1 − cos θ from the colatitude θ, which keeps
+/// its precision where sin φ rounds to ±1, within about 7 cm of the pole, so a small ring there
+/// doesn't cancel to nothing; within ±85.05° as the mean of sin φ less ±1, which with |sin φ| ≥ ½
+/// is exact (Sterbenz's lemma), so a piece there keeps the rounding it had. A ring reaching nearer
+/// the equator than 45° is measured as ∮ sin φ dλ, rounded on its own scale, which a ring that
+/// size dwarfs.
 fn rhumb_ring_area(ring: &[Coord]) -> f64 {
     let max_lat = rustgis_geom::MAX_LAT;
-    // +1 for a ring wholly beyond 85.05° north, −1 south, 0 otherwise (or with a missing latitude).
-    let side = if ring.iter().all(|c| c.y > max_lat) {
+    // +1 for a ring wholly poleward of 45° north, −1 south, 0 otherwise (or with a missing latitude).
+    let side = if ring.iter().all(|c| c.y >= 45.0) {
         1.0
-    } else if ring.iter().all(|c| c.y < -max_lat) {
+    } else if ring.iter().all(|c| c.y <= -45.0) {
         -1.0
     } else {
         0.0
@@ -3877,8 +3880,10 @@ fn rhumb_ring_area(ring: &[Coord]) -> f64 {
         cuts.sort_by(|p, q| p.0.total_cmp(&q.0));
         let mut from = a;
         for to in cuts.into_iter().map(|(t, lat)| Coord::new(a.x + t * (b.x - a.x), lat)).chain(std::iter::once(b)) {
-            // sin φ ∓ 1 is −(1 − cos θ) by the North Pole and 1 − cos θ by the South Pole.
-            let mean = if side == 0.0 { mean_sin(from, to) } else { -side * mean_versine(from, to) };
+            // Beyond 85.05°, sin φ ∓ 1 is −(1 − cos θ) by the North Pole and 1 − cos θ by the South
+            // Pole; a piece there lies on the ring's side, as the whole ring does.
+            let beyond = from.y.abs().max(to.y.abs()) > max_lat;
+            let mean = if side != 0.0 && beyond { -side * mean_versine(from, to) } else { mean_sin(from, to) - side };
             total += (to.x - from.x).to_radians() * mean;
             from = to;
         }
@@ -8789,8 +8794,9 @@ mod tests {
     /// on the sphere, is 2 sin((θ₁ + θ₂)/2) sin((θ₂ − θ₁)/2) × Δλ in the colatitudes θ. So near the
     /// pole 1 − cos θ is θ²/2, whose mean along an edge slanting from θ₁ to θ₂ is
     /// (θ₁² + θ₁θ₂ + θ₂²)/6: a triangle with an edge slanting from θ to 3θ, closed along the parallel
-    /// at θ, has an area of Δλ × (13θ²/6 − θ²/2) = 5/3 Δλ θ². A triangle wholly beyond 85.05° agrees
-    /// with ∮ sin φ dλ summed in a million steps along each edge.
+    /// at θ, has an area of Δλ × (13θ²/6 − θ²/2) = 5/3 Δλ θ². The strip keeps its area with a spike
+    /// with no area reaching out to 85.05° or into Web Mercator's square. A triangle wholly beyond 85.05°
+    /// agrees with ∮ sin φ dλ summed in a million steps along each edge.
     #[test]
     fn map_area_keeps_rings_by_a_pole() {
         let r2 = rustgis_geom::EARTH_RADIUS_M * rustgis_geom::EARTH_RADIUS_M;
@@ -8806,6 +8812,12 @@ mod tests {
             assert!((strip / expected - 1.0).abs() < 1e-6, "{strip} m², not {expected} (pole {side})");
             let tri = map_area_m2(&poly(&[(0.0, a), (10.0, lat(3e-7)), (10.0, a), (0.0, a)]));
             assert!((tri / slanted - 1.0).abs() < 1e-6, "{tri} m², not {slanted} (pole {side})");
+            // The strip with a spike out to 85.05°, or on into Web Mercator's square, and back along
+            // the same meridian: the spike has no area, so the ring's is still the strip's.
+            for reach in [rustgis_geom::MAX_LAT, 80.0] {
+                let spiked = map_area_m2(&poly(&[(0.0, a), (10.0, a), (10.0, b), (0.0, b), (0.0, side * reach), (0.0, b), (0.0, a)]));
+                assert!((spiked / expected - 1.0).abs() < 1e-6, "{spiked} m², not {expected} (pole {side}, to {reach}°)");
+            }
         }
         let ring: Vec<Coord> = [(0.0, 86.0), (20.0, 89.0), (-15.0, 87.5), (0.0, 86.0)].iter().map(|&(x, y)| Coord::new(x, y)).collect();
         let measured = map_area_m2(&Geometry::Polygon(vec![vec![ring.clone()]]));
