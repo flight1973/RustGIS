@@ -31,6 +31,12 @@ deletes the selection, adds or calculates a field, and calculates geometry attri
 The first column, **Feature ID**, shows each feature's identifier, not its current row position
 after sorting or filtering. It is not a dataset field: do not use it as a geoprocessing field name.
 
+Right-click a column header for **Hide Column**, **Move Left**, **Move Right** and **Show All
+Columns**. A hidden column is only left out of the table: export, selection, expressions and the
+map are unchanged. The toolbar says how many columns are hidden, and clicking it shows them all.
+Hiding the column the rows are sorted by clears the sort. The order and hidden columns are kept
+per table until another project is opened, and are not saved in the project.
+
 <figure markdown="span">
   ![The attribute table docked under the map: the 14 African countries of more than 30 million people, selected by attributes, highlighted on the map and in the table](https://assets.rustgis.app/images/attribute-table.webp)
   <figcaption>The attribute table, with a selection highlighted on the map and in the table.</figcaption>
@@ -829,7 +835,8 @@ being split there (the map, and with it the percentages and shares, takes them t
 while area_km2 takes their ground shape), how many have an edge beyond 85.05° running east or west
 (their percentages and shares follow the analysis plane, which takes such an edge straight in
 longitude and latitude, not clamped as the Web Mercator map draws it, so they and area_km2 can
-differ widely, as above), how many zones overlap no class feature and so have no rows, how many class features have no value in a sum field (they add nothing to its shares) and,
+differ widely, as above), how many zones overlap no class feature and so have no rows, how many
+class features have no value in a sum field (they add nothing to its shares) and,
 with sum fields, how many class features lie partly or wholly outside the zones. Only selected
 features are used when a layer has a selection, and the table is named `<zones>_Tabulate` unless
 `output` names it.
@@ -1264,7 +1271,7 @@ their name.
   where the command runs.
 - **Save** keeps the model in the project; **Export** writes it as a `*.model.json` file, which
   **Import** (or dropping the file on the window) opens again. A model from a file may not read
-  or write files. **Copy Command** copies a `model.run` command that runs the model from the
+  or write files, use the network or run other software, including plugin and GeoLibre tools. **Copy Command** copies a `model.run` command that runs the model from the
   Script pane, the command line or Python.
 
 Import checks declared model and web-tool versions before interpreting their contents. Unsupported

@@ -189,6 +189,13 @@ tile), without a STAC catalogue:
   may take two minutes more): past that the window is given up, saying how many bands were read.
   A window reads 256 bands at most. A window near the limit takes several hundred MB of memory
   while it is read and kept.
+- The Add Data From URL dialog has no box to fill in, so a window is asked for by a command. On
+  the command line and in a script, `layer.addUrl` waits for it and answers what was added. In the
+  desktop app, `ui.addUrl` with `"bbox"` reads it off the frame: the map stays in use, and the
+  layer is added when the read lands. These are read one at a time, with 16 under way at most,
+  and the next starts once the app has taken the last. If another project is opened meanwhile, one
+  still waiting isn't read, and one being read can't be cancelled yet: it runs to its end and
+  isn't added. Each is said in a notice.
 - The file's no-data, colour table (a palette file draws in its colours) and band names come
   with it, and class names given as `CLASS_<value>` items in GDAL's metadata tag, as the MapBiomas
   files on Source Cooperative give theirs. These come from the file's own tags: an `.aux.xml`
@@ -199,7 +206,9 @@ tile), without a STAC catalogue:
   keeps only its first band once the project is reopened, with a notice. Files stored bottom up
   aren't read this way yet. In the web app, `"bbox"` is refused for now: the file is drawn in
   place without it. An address that names another kind of file (`.geojson`, `.fgb`) is refused
-  with `"bbox"` before anything is read; `"cog": true` takes a GeoTIFF by another name.
+  with `"bbox"` before anything is read; `"cog": true` takes a GeoTIFF by another name. A
+  window is a raster layer that the time slider doesn't step through, so `"cube": true` is
+  refused with it.
 
 A GeoParquet or FlatGeobuf file by its address is read in place too, a view at a time, however
 large: the layer is streamed like a large local file, and the view's features are fetched in the
@@ -548,7 +557,7 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 | Vector tiles | Mapbox Vector Tiles (`.pbf`, `.mvt`) template, or TileJSON | Add Tile Layer | Drawn in a built-in style that knows the OpenMapTiles, Protomaps and Shortbread schemas. |
 | MapLibre styles | `style.json` | Add Tile Layer | A supported subset of vector and raster sources, sprites, expressions and zoom functions; see [Maps and Basemaps](maps.md#basemaps) for styling limits. |
 | PMTiles | `.pmtiles`: a web address, or a desktop file | Add Tile Layer (or **Tile Archive File…**), Add Data, or drop a local file on desktop | Version 3 archives only: PNG, JPEG or WebP rasters, or MVT vectors; uncompressed, gzip, Brotli or Zstandard. Read a tile at a time by byte ranges (CORS on the web). Browser local-file uploads aren't supported; use an archive's web address. The map moves to the archive's bounds, except a world archive. Vector archives use the built-in basemap style, or a colour per layer when added as an overlay. |
-| MBTiles | `.mbtiles`: a file | Add Data, drop the file, Add Tile Layer's **Tile Archive File…** button, or upload in the web app | Raster (PNG, JPEG, WebP) or vector tiles, as its metadata says, drawn as PMTiles archives are. The desktop reads the file in place, a tile at a time. The web app reads an upload into memory (the plain `tiles` table and the deduplicated layouts of mbutil, TileMill and Planetiler) and keeps it for the session: a project saved there asks for the file again. |
+| MBTiles | `.mbtiles`: a file | Add Data, drop the file, Add Tile Layer's **Tile Archive File…** button, or upload in the web app | Raster (PNG, JPEG, WebP) or vector tiles, as its metadata says, drawn as PMTiles archives are. The desktop reads the file in place, a tile at a time; on Windows the file can't be moved or deleted while a map draws it, until its layer is removed. The web app reads an upload into memory (the plain `tiles` table and the deduplicated layouts of mbutil, TileMill and Planetiler) and keeps it for the session: a project saved there asks for the file again. |
 
 ## Writing
 
@@ -594,6 +603,32 @@ another system says so; written back in that same system they are exact, and not
 Coordinates beyond ±180.5° longitude or ±90.5° latitude (a CSV of eastings and northings without its
 `"crs"`, a Shapefile without its `.prj`) aren't longitude/latitude: an export says they're out of
 place, and Define Projection, below, places them.
+
+Coordinate systems of other bodies than the Earth (Mars, the Moon and the rest of the IAU's
+`IAU_2015` codes, or any datum whose ellipsoid isn't the Earth's) aren't read as such yet: every
+layer is placed on the Earth.
+
+- **Read, with a notice.** A layer whose coordinates are the body's longitude/latitude, counted
+  east, is read as it is: a geographic `.prj` or WKT, a GeoTIFF's own keys, an IAU code ending in
+  `00` or `02`, or a projection RustGIS unprojects. Adding it says that the map, its scale bar and
+  measurements take it for the Earth.
+- **Refused.** A layer whose coordinates would land in the wrong place as longitude/latitude is
+  refused, and the error says why:
+  - projected metres the reader can't convert: a FlatGeobuf, GeoParquet or GeoJSON whose system
+    is another body's projection, a GeoPackage one known only by its IAU code, or a projection
+    RustGIS doesn't read;
+  - geocentric X/Y/Z (a GeoParquet system);
+  - longitude/latitude in another unit than degrees (a GeoParquet or GeoTIFF one);
+  - longitudes counted west: planetographic systems, and projections of them, unless their axes
+    say they count east. An Esri `.prj` has no axes, so a planetographic one is refused.
+- **Exported.** Exporting such a layer as WGS 84 longitude/latitude says so. Exported in its own
+  system, a vector file (a Shapefile's `.prj`, say) gives its datum only by the ellipsoid's axes,
+  and that is said too. A GeoTIFF read with its own GeoKeys is written back with them and their
+  citation. Projecting such a layer onto another ellipsoid (the Earth's) is refused. A layer known
+  to be another body's only by an IAU code, or by an ellipsoid its reader doesn't keep
+  (GeoParquet), keeps no system, so its export can't tell. Adding it says so instead: an export
+  takes its coordinates for WGS 84 longitude/latitude, and one in a projection projects them as
+  the Earth's.
 
 ## Define Projection
 

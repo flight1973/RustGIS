@@ -805,6 +805,9 @@ fn pole_tools_refuse_latitudes_outside_the_earth() {
             ]));
             let error = rustgis_analysis::run(id, &map, &params).unwrap_err();
             assert!(error.contains("latitude past ±90°"), "{id} {bad}: {error}");
+            let resolved = rustgis_analysis::resolve_published(id).unwrap();
+            let error = rustgis_analysis::run_resolved(&resolved, &map, &params, &rustgis_analysis::control::Control::new()).unwrap_err();
+            assert!(error.contains("latitude past ±90°"), "resolved {id} {bad}: {error}");
         }
     }
 }
