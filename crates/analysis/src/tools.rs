@@ -2172,22 +2172,28 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     } else {
         Dataset::new(out_name(p, format!("{}_Hull", ds.name)), GeometryType::Polygon, vec![Field::new("count", FieldType::Integer)])
     };
+    // A feature's points in the analysis plane, and how many of its vertices have a coordinate
+    // missing or infinite: those are passed over, since the hull can't order them.
     let points = |g: &Geometry| {
-        let mut these = Vec::new();
+        let (mut these, mut gaps) = (Vec::new(), 0usize);
         g.for_each_coord(|c| {
-            let m = rustgis_geom::lonlat_to_plane(c);
-            these.push(geo::Point::new(m.x, m.y));
+            if c.is_finite() {
+                let m = rustgis_geom::lonlat_to_plane(c);
+                these.push(geo::Point::new(m.x, m.y));
+            } else {
+                gaps += 1;
+            }
         });
-        these
+        (these, gaps)
     };
-    // The features with a geometry, each with it.
+    let picked = rows(inp, p, "input", ds);
+    // The features with a geometry, each with it; the rest are left out, and counted.
     let features: Vec<(&Feature, &Geometry)> =
-        rows(inp, p, "input", ds).into_iter().filter_map(|r| ds.features.get(r)).filter_map(|f| Some((f, f.geometry.as_ref()?))).collect();
-    let mut pts: Vec<geo::Point<f64>> = Vec::new();
-    // Hulls of points in more than one place that came out with no area: one point's hull has none
-    // as a matter of course, so it isn't counted.
-    let mut flat = 0usize;
-    let spread = |these: &[geo::Point<f64>]| these.first().is_some_and(|first| these.iter().any(|q| q != first));
+        picked.iter().filter_map(|r| ds.features.get(*r)).filter_map(|f| Some((f, f.geometry.as_ref()?))).collect();
+    let without = picked.len().saturating_sub(features.len());
+    // A hull of two points or more with no area: one point's hull has none as a matter of course.
+    let is_flat = |points: usize, hull: &geo::Polygon<f64>| points >= 2 && geo::Area::unsigned_area(hull) == 0.0;
+    let (mut flat, mut gaps) = (0usize, 0usize);
     if each {
         // Each feature's hull made on several cores for many (#1252), placed in their order.
         crate::control::begin(features.len());
@@ -2196,38 +2202,45 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             PARALLEL_FEATURES,
             || (),
             |_, _, (_, g)| {
-                let these = points(g);
-                let spread = spread(&these);
+                let (these, passed) = points(g);
+                let n = these.len();
                 let hull = geo::MultiPoint::new(these).convex_hull();
-                Ok::<_, String>((spread && geo::Area::unsigned_area(&hull) == 0.0, hull))
+                Ok::<_, String>((is_flat(n, &hull), passed, hull))
             },
         )?;
-        for ((f, _), (is_flat, hull)) in features.iter().zip(hulls) {
-            flat += usize::from(is_flat);
+        for ((f, _), (flat_one, passed, hull)) in features.iter().zip(hulls) {
+            flat += usize::from(flat_one);
+            gaps += passed;
             out.push(from_multipolygon(&MultiPolygon::new(vec![hull])), f.attrs.clone());
         }
-    }
-    // The features hulled together: those picked (the selection, or all) with a point to give.
-    let mut hulled = 0usize;
-    if !each {
+    } else {
+        // All together; `count` is the features hulled, those with a point to give.
+        let (mut pts, mut hulled) = (Vec::new(), 0usize);
         for (_, g) in &features {
-            let these = points(g);
+            let (these, passed) = points(g);
             hulled += usize::from(!these.is_empty());
+            gaps += passed;
             pts.extend(these);
         }
-    }
-    if !each {
-        let n = i64::try_from(hulled).unwrap_or(i64::MAX);
-        let spread = spread(&pts);
+        if hulled == 0 {
+            return Err("no feature has a point to enclose (no geometry, or only coordinates missing or infinite)".into());
+        }
+        let n = pts.len();
         let hull = geo::MultiPoint::new(pts).convex_hull();
-        flat += usize::from(spread && geo::Area::unsigned_area(&hull) == 0.0);
-        out.push(from_multipolygon(&MultiPolygon::new(vec![hull])), vec![Value::Int(n)]);
+        flat += usize::from(is_flat(n, &hull));
+        out.push(from_multipolygon(&MultiPolygon::new(vec![hull])), vec![Value::Int(i64::try_from(hulled).unwrap_or(i64::MAX))]);
     }
     let n = out.features.len();
     let mut r = result(out, format!("Minimum Bounding Geometry: {n} hulls"))?;
+    if without > 0 {
+        r.messages.push(format!("Minimum Bounding Geometry: {without} feature(s) without geometry skipped"));
+    }
+    if gaps > 0 {
+        r.messages.push(format!("Minimum Bounding Geometry: {gaps} vertex(es) with a coordinate missing or infinite passed over"));
+    }
     if flat > 0 {
         r.messages.push(format!(
-            "Minimum Bounding Geometry: {flat} of {n} hulls have no area: their points lie on one straight line on the map (points on one meridian or parallel, say; beyond 85.05° that includes points around a pole, which enclose a cap on the ground)"
+            "Minimum Bounding Geometry: {flat} of {n} hulls have no area: their points lie in one place or on one straight line on the map (on one meridian or parallel, say; beyond 85.05° that includes points around a pole, which enclose a cap on the ground)"
         ));
     }
     Ok(r)
@@ -3658,7 +3671,9 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         (missing_members > 0).then(|| format!("{missing_members} multipoint member(s) were left out: a coordinate missing or infinite"));
     if pts.is_empty() {
         let none = "input layer has no valid points with positive weights to analyze";
-        let notes: Vec<&str> = beyond_note.iter().chain(missing_note.iter()).map(String::as_str).collect();
+        let skipped_note = (skipped > 0)
+            .then(|| format!("{skipped} feature(s) skipped (no point geometry, a weight that isn't positive, or no finite coordinate)"));
+        let notes: Vec<&str> = skipped_note.iter().chain(beyond_note.iter()).chain(missing_note.iter()).map(String::as_str).collect();
         return Err(if notes.is_empty() { none.to_string() } else { format!("{none}: {}", notes.join("; ")) });
     }
 
@@ -8339,6 +8354,41 @@ mod tests {
         assert_eq!(note(&layer(&spread, false), "All"), None);
         assert_eq!(note(&layer(&spread, true), "None"), None);
         assert_eq!(note(&layer(&spread, false), "None"), None, "single points");
+        // Features stacked in one place, together, have a hull with no area, and say so.
+        let stacked = [(10.0, 20.0), (10.0, 20.0), (10.0, 20.0)];
+        let note_stacked = note(&layer(&stacked, false), "All").unwrap_or_default();
+        assert!(note_stacked.contains(": 1 of 1 hulls have no area"), "{note_stacked}");
+    }
+
+    /// Minimum Bounding Geometry passes over a vertex with a coordinate missing or infinite, which
+    /// the hull can't order (it failed on one before), and skips a feature without geometry, saying
+    /// how many of each, all together or one feature each; with nothing left to enclose, all
+    /// together, it's an error. Clean points say nothing of the kind.
+    #[test]
+    fn convex_hull_passes_over_missing_coordinates() {
+        let run = |geoms: Vec<Option<Geometry>>, group: &str| {
+            let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+            for g in geoms {
+                pts.push(g, vec![]);
+            }
+            let m = Map(HashMap::from([("pts".to_string(), pts)]));
+            crate::run("convexHull", &m, &serde_json::json!({"input": "pts", "group": group}))
+        };
+        let gap = Coord::new(f64::NAN, 40.0);
+        let stations = Geometry::MultiPoint(vec![Coord::new(-75.0, 40.0), Coord::new(-74.99, 40.0), Coord::new(-75.0, 40.01), gap]);
+        for group in ["All", "None"] {
+            let res = run(vec![Some(stations.clone()), Some(Geometry::Point(gap)), None], group).unwrap_or_else(|e| panic!("{group}: {e}"));
+            let all = res.messages.join(" | ");
+            assert!(all.contains("2 vertex(es) with a coordinate missing or infinite passed over"), "{group}: {all}");
+            assert!(all.contains("1 feature(s) without geometry skipped"), "{group}: {all}");
+            let clean = run(vec![Some(Geometry::Point(Coord::new(0.0, 0.0))), Some(Geometry::Point(Coord::new(1.0, 1.0)))], group)
+                .unwrap_or_else(|e| panic!("{group}: {e}"))
+                .messages
+                .join(" | ");
+            assert!(!clean.contains("passed over") && !clean.contains("skipped"), "{group}: {clean}");
+        }
+        let err = run(vec![Some(Geometry::Point(gap)), None], "All").err().unwrap_or_default();
+        assert!(err.contains("no feature has a point to enclose"), "{err}");
     }
 
     /// Minimum Bounding Geometry's `count`, all features together, is the features it hulled: with a
