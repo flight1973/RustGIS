@@ -2184,8 +2184,10 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let features: Vec<(&Feature, &Geometry)> =
         rows(inp, p, "input", ds).into_iter().filter_map(|r| ds.features.get(r)).filter_map(|f| Some((f, f.geometry.as_ref()?))).collect();
     let mut pts: Vec<geo::Point<f64>> = Vec::new();
-    // Hulls of at least one point that came out with no area.
+    // Hulls of points in more than one place that came out with no area: one point's hull has none
+    // as a matter of course, so it isn't counted.
     let mut flat = 0usize;
+    let spread = |these: &[geo::Point<f64>]| these.first().is_some_and(|first| these.iter().any(|q| q != first));
     if each {
         // Each feature's hull made on several cores for many (#1252), placed in their order.
         crate::control::begin(features.len());
@@ -2195,32 +2197,37 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             || (),
             |_, _, (_, g)| {
                 let these = points(g);
-                let had = !these.is_empty();
+                let spread = spread(&these);
                 let hull = geo::MultiPoint::new(these).convex_hull();
-                Ok::<_, String>((had && geo::Area::unsigned_area(&hull) == 0.0, hull))
+                Ok::<_, String>((spread && geo::Area::unsigned_area(&hull) == 0.0, hull))
             },
         )?;
         for ((f, _), (is_flat, hull)) in features.iter().zip(hulls) {
             flat += usize::from(is_flat);
             out.push(from_multipolygon(&MultiPolygon::new(vec![hull])), f.attrs.clone());
         }
-    } else {
+    }
+    // The features hulled together: those picked (the selection, or all) with a point to give.
+    let mut hulled = 0usize;
+    if !each {
         for (_, g) in &features {
-            pts.extend(points(g));
+            let these = points(g);
+            hulled += usize::from(!these.is_empty());
+            pts.extend(these);
         }
     }
     if !each {
-        let n = ds.features.len() as i64;
-        let had = !pts.is_empty();
+        let n = i64::try_from(hulled).unwrap_or(i64::MAX);
+        let spread = spread(&pts);
         let hull = geo::MultiPoint::new(pts).convex_hull();
-        flat += usize::from(had && geo::Area::unsigned_area(&hull) == 0.0);
+        flat += usize::from(spread && geo::Area::unsigned_area(&hull) == 0.0);
         out.push(from_multipolygon(&MultiPolygon::new(vec![hull])), vec![Value::Int(n)]);
     }
     let n = out.features.len();
     let mut r = result(out, format!("Minimum Bounding Geometry: {n} hulls"))?;
     if flat > 0 {
         r.messages.push(format!(
-            "Minimum Bounding Geometry: {flat} of {n} hulls have no area: their points lie on one straight line on the map (a single point, or points on one meridian or parallel; beyond 85.05° that includes points around a pole, which enclose a cap on the ground)"
+            "Minimum Bounding Geometry: {flat} of {n} hulls have no area: their points lie on one straight line on the map (points on one meridian or parallel, say; beyond 85.05° that includes points around a pole, which enclose a cap on the ground)"
         ));
     }
     Ok(r)
@@ -3581,6 +3588,8 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
 
     let mut pts: Vec<(Coord, f64)> = Vec::new();
     let mut skipped: usize = 0;
+    // Members of multipoints with another finite member, missing a coordinate or with an infinite one.
+    let mut missing_members: usize = 0;
     // A point the system can't hold is left out, and counted, as one past 85.05° in Web Mercator,
     // which would land on the map's edge rather than where it is (#1033): its latitude doesn't
     // come back.
@@ -3621,17 +3630,19 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
                 }
             }
             Geometry::MultiPoint(cs) => {
-                let mut any = false;
-                for c in cs {
-                    if c.is_finite()
-                        && let Some(p_proj) = project(*c, &mut beyond)
-                    {
-                        pts.push((p_proj, w));
-                        any = true;
-                    }
-                }
-                if !any {
+                // As for a point: a feature with no finite member is skipped, and a member the
+                // system can't hold counts as beyond; a member missing a coordinate in a feature
+                // with a finite one is left out and counted on its own.
+                let finite = cs.iter().filter(|c| c.is_finite()).count();
+                if finite == 0 {
                     skipped += 1;
+                    continue;
+                }
+                missing_members += cs.len() - finite;
+                for c in cs.iter().filter(|c| c.is_finite()) {
+                    if let Some(p_proj) = project(*c, &mut beyond) {
+                        pts.push((p_proj, w));
+                    }
                 }
             }
             _ => {
@@ -3643,9 +3654,12 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
     // Only Web Mercator's limit is known to be a latitude.
     let why = if crs == Crs::WebMercator { " (past 85.05° of latitude)" } else { "" };
     let beyond_note = (beyond > 0).then(|| format!("{beyond} point(s) beyond what {} can hold{why} were left out", crs.label()));
+    let missing_note =
+        (missing_members > 0).then(|| format!("{missing_members} multipoint member(s) were left out: a coordinate missing or infinite"));
     if pts.is_empty() {
         let none = "input layer has no valid points with positive weights to analyze";
-        return Err(beyond_note.map_or_else(|| none.to_string(), |note| format!("{none}: {note}")));
+        let notes: Vec<&str> = beyond_note.iter().chain(missing_note.iter()).map(String::as_str).collect();
+        return Err(if notes.is_empty() { none.to_string() } else { format!("{none}: {}", notes.join("; ")) });
     }
 
     let pt_extent = crate::density::points_extent(&pts).ok_or("input layer has no valid points with positive weights to analyze")?;
@@ -3708,7 +3722,7 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
     };
     Ok(ToolResult {
         output: Output::Layers(vec![OutputLayer::Raster { file_name: format!("{name}.tif"), name, bytes }]),
-        messages: std::iter::once(msg).chain(beyond_note).collect(),
+        messages: std::iter::once(msg).chain(beyond_note).chain(missing_note).collect(),
     })
 }
 
@@ -8294,7 +8308,8 @@ mod tests {
 
     /// Minimum Bounding Geometry says how many hulls have no area: points around a pole on one
     /// parallel (one line in the analysis plane), all together or one feature each, and points
-    /// spread over an area say nothing of the kind.
+    /// spread over an area say nothing of the kind; nor do single points, one feature each, whose
+    /// hulls have no area as a matter of course.
     #[test]
     fn convex_hull_counts_hulls_with_no_area() {
         let layer = |coords: &[(f64, f64)], multi: bool| {
@@ -8323,6 +8338,26 @@ mod tests {
         let spread = [(0.0, 60.0), (10.0, 60.0), (5.0, 65.0), (0.0, 89.0), (90.0, 88.0)];
         assert_eq!(note(&layer(&spread, false), "All"), None);
         assert_eq!(note(&layer(&spread, true), "None"), None);
+        assert_eq!(note(&layer(&spread, false), "None"), None, "single points");
+    }
+
+    /// Minimum Bounding Geometry's `count`, all features together, is the features it hulled: with a
+    /// selection, the selected ones, and never a feature without geometry.
+    #[test]
+    fn convex_hull_counts_the_features_it_hulls() {
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+        for c in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (5.0, 5.0)] {
+            pts.push(Some(Geometry::Point(Coord::new(c.0, c.1))), vec![]);
+        }
+        pts.push(None, vec![]);
+        let count = |sel: Vec<usize>| {
+            let m = Selected(Map(HashMap::from([("pts".to_string(), pts.clone())])), HashMap::from([("pts".to_string(), sel)]));
+            let out = layer(crate::run("convexHull", &m, &serde_json::json!({"input": "pts"})).unwrap_or_else(|e| panic!("{e}")));
+            out.value(0, 0).as_f64()
+        };
+        // No selection: every feature with a geometry (the one without isn't counted).
+        assert_eq!(count(vec![]), Some(4.0));
+        assert_eq!(count(vec![0, 1, 2]), Some(3.0));
     }
 
     /// Buffer says how many features' buffers kept edges coarser than their outline allows: a line
@@ -8592,6 +8627,39 @@ mod tests {
         let res = crate::run("kernelDensity", &m, &params).unwrap();
         let note = res.messages.iter().find(|m| m.contains("beyond what")).cloned().unwrap_or_default();
         assert!(note.starts_with("1 point(s) beyond what") && !note.contains("85.05°"), "{:?}", res.messages);
+    }
+
+    /// Kernel Density counts the multipoint members it leaves out for a missing or infinite
+    /// coordinate, in a feature with others it places; a feature with none it can place is
+    /// skipped, and one wholly past 85.05° counts its points as beyond, not as skipped too, as a
+    /// point does. Whole multipoints say nothing of the kind.
+    #[test]
+    fn kernel_density_counts_multipoint_members_left_out() {
+        let run = |members: Vec<Vec<Coord>>| {
+            let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+            pts.push(Some(Geometry::MultiPoint(vec![Coord::new(0.0, 60.0), Coord::new(0.01, 60.0)])), vec![]);
+            for m in members {
+                pts.push(Some(Geometry::MultiPoint(m)), vec![]);
+            }
+            let m = Map(HashMap::from([("pts".to_string(), pts)]));
+            let params = serde_json::json!({"input": "pts", "crs": "EPSG:3857", "radius": 5000.0, "pixelSize": 1000.0});
+            crate::run("kernelDensity", &m, &params).unwrap_or_else(|e| panic!("{e}")).messages
+        };
+        let (gap, inf) = (Coord::new(f64::NAN, 60.0), Coord::new(0.0, f64::INFINITY));
+        let messages = run(vec![vec![Coord::new(0.02, 60.0), gap, inf], vec![gap], vec![Coord::new(0.0, 87.0), Coord::new(1.0, 88.0)]]);
+        let all = messages.join(" | ");
+        assert!(all.contains("2 multipoint member(s) were left out: a coordinate missing or infinite"), "{all}");
+        assert!(all.contains("from 3 points (1 skipped"), "{all}");
+        assert!(all.contains("2 point(s) beyond what"), "{all}");
+        let clean = run(vec![vec![Coord::new(0.02, 60.0), Coord::new(0.03, 60.0)]]).join(" | ");
+        assert!(!clean.contains("left out") && !clean.contains("skipped"), "{clean}");
+        // With nothing left to place, the error says both why.
+        let mut only = Dataset::new("only", GeometryType::Point, vec![]);
+        only.push(Some(Geometry::MultiPoint(vec![gap, Coord::new(0.0, 87.0)])), vec![]);
+        let m = Map(HashMap::from([("only".to_string(), only)]));
+        let params = serde_json::json!({"input": "only", "crs": "EPSG:3857", "radius": 5000.0, "pixelSize": 1000.0});
+        let err = crate::run("kernelDensity", &m, &params).err().unwrap_or_default();
+        assert!(err.contains("1 point(s) beyond what") && err.contains("1 multipoint member(s) were left out"), "{err}");
     }
 
     #[test]
