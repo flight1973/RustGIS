@@ -686,6 +686,13 @@ notice. A Double field's values are decimals already, rounded as decimal arithme
 get no notice. Without `statistics`, `field` gives that field's `COUNT`, `SUM`, `MEAN`, `MIN`,
 `MAX` and `STD`, reading its values as numbers.
 
+**Minimum Bounding Geometry** (`convexHull`) encloses each feature in its convex hull (Group
+Option `None`), or all of them in one (`All`, with `count`, the features it enclosed). It passes
+over a vertex with a coordinate missing or infinite, or a longitude far out of range, and skips a
+feature without geometry or with no point left to enclose, writing no hull for it; it says how
+many of each, and how many hulls have no area (a single point, or points in one place or on one
+line on the map).
+
 **Dissolve** (`dissolve`) merges the polygons sharing a value of `field` into one feature for
 each value, or all of them into one without a field. Each feature has the value and `count`, the
 polygons merged; records with no value form a feature of their own. **Summarize Within**
