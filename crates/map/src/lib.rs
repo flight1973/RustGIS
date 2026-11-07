@@ -5,6 +5,7 @@ pub mod antimeridian;
 pub mod camera;
 pub mod color;
 pub mod design;
+pub mod diagram;
 pub mod effects;
 pub mod fills;
 pub mod geolibre;
@@ -33,6 +34,7 @@ pub mod world;
 
 pub use camera::Camera;
 pub use color::{Ramp, RampGroup, Rgba};
+pub use diagram::{DiagramCategory, DiagramKind, DiagramLabel, DiagramSettings, DiagramSize};
 pub use globe::{Globe, Projection};
 pub use raster::{RasterDefaults, RasterLayer, RasterRenderer, RasterStyle, Resampling, Stretch};
 pub use symbology::{
@@ -40,6 +42,15 @@ pub use symbology::{
     LineJoin, LineMark, LineMarkers, LineStroke, Marker, MarkerRotation, Placements, Renderer, Symbol,
 };
 pub use tiles::{TileKind, TileLayer};
+
+/// Where a locked label stays.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LockedPlace {
+    /// The place it took: 0 its own, else one of its alternatives (#1011), numbered from 1.
+    pub place: u8,
+    /// How far a callout moved it from there (points, right and down), if one did.
+    pub callout: Option<[f32; 2]>,
+}
 
 use rustgis_data::{Dataset, Geometry, GeometryType};
 use rustgis_geom::{Coord, Extent};
@@ -182,6 +193,10 @@ pub struct Layer {
     /// field, as QGIS's data-defined symbol angle does.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "symbology::de_marker_rotation")]
     pub marker_rotation: Option<symbology::MarkerRotation>,
+    /// A small chart drawn on each feature from several numeric fields (pie or bars), as ArcGIS
+    /// Pro's Chart symbology and QGIS's Diagrams draw, over the renderer's own symbol.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "diagram::de_diagram")]
+    pub diagram: Option<diagram::DiagramSettings>,
     /// Its symbol's size, colours, outline width and marker angle per feature, each by an
     /// expression (none set: the renderer's symbol alone); drawn through [`Layer::styler`].
     #[serde(default, skip_serializing_if = "symbol_by::SymbolBy::is_empty", deserialize_with = "symbol_by::de_symbol_by")]
@@ -211,6 +226,16 @@ pub struct Layer {
     /// The GeoPackage table this layer's edits save to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpkg: Option<source::GpkgEdit>,
+    /// The saved connection it was added from (its id, in the app's preferences): a layer whose
+    /// source is read again logs in with that connection's login, and a project opened where
+    /// the connection or its login is missing asks for one. Empty for a layer that came from no
+    /// connection. Never a secret.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub connection: String,
+    /// Added by an anonymous plugin command: never adopt a saved web-service login, including
+    /// after saving and reopening the project.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anonymous: bool,
     /// Process-local identity, preserved by snapshots but never stored in a project.
     #[serde(skip, default = "next_layer_instance")]
     instance_id: u64,
@@ -344,9 +369,13 @@ impl Layer {
         })
     }
 
-    /// Installs a fresh source without changing the layer's identity or configuration.
-    pub fn replace_source(&mut self, src: source::SourceLayer) {
+    /// Installs a fresh source, retaining styling but clearing feature-specific state whose ids
+    /// may identify different features. Returns the number of saved label moves reset for a notice.
+    pub fn replace_source(&mut self, src: source::SourceLayer) -> usize {
         self.selection.clear();
+        let moved = self.labels.in_order().map(|class| class.moved.len()).sum();
+        self.labels.default.moved.clear();
+        self.labels.classes.iter_mut().for_each(|class| class.moved.clear());
         if let Some(info) = src.info() {
             self.dataset.fields = info.fields.clone();
             self.dataset.crs = info.coordinate_system();
@@ -356,6 +385,7 @@ impl Layer {
         self.dataset.source = src.linked_file().map(String::from);
         self.source = Some(src);
         self.install(Vec::new());
+        moved
     }
 
     /// The dataset, streamed, raster and time-following Zarr addresses used to read this layer
@@ -395,6 +425,7 @@ impl Layer {
             no_fill: None,
             stroke_levels: false,
             marker_rotation: None,
+            diagram: None,
             symbol_by: Default::default(),
             reference_scale: None,
             priority: 0,
@@ -403,6 +434,8 @@ impl Layer {
             source: None,
             postgis: None,
             gpkg: None,
+            connection: String::new(),
+            anonymous: false,
             projected: Default::default(),
             display: None,
             display_rejected: Vec::new(),
@@ -495,6 +528,8 @@ impl Layer {
         }
         let Some(src) = &mut self.source else { return false };
         src.window_fields = Some(self.dataset.fields.len());
+        // The view keeps up to its limit of the features the query keeps (#1456).
+        src.set_query(self.definition_query.as_deref(), &self.dataset.fields);
         // A failed read leaves nothing drawn for it (its error shows in Layers), not the
         // previous view's features.
         match src.poll(block) {
@@ -1104,6 +1139,9 @@ pub struct ServiceGroup {
     pub name: String,
     pub url: String,
     pub kind: String,
+    /// Plugin-selected service: never adopt a saved login, even without children or after reopen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anonymous: bool,
     #[serde(default = "yes")]
     pub expanded: bool,
     pub children: Vec<ServiceChild>,
@@ -1225,11 +1263,10 @@ pub struct Map {
     /// Map-wide label display switches.
     #[serde(default)]
     pub label_display: LabelDisplay,
-    /// The labels placed when labels were locked, each with the place it took (0 its own, else
-    /// one of its alternatives, #1011): only they are drawn while the lock holds, there, wherever
-    /// the map moves. Filled by the renderer.
+    /// The labels placed when labels were locked, each with the place it took: only they are
+    /// drawn while the lock holds, there, wherever the map moves. Filled by the renderer.
     #[serde(skip)]
-    pub label_lock: Option<Vec<(LabelKey, u8)>>,
+    pub label_lock: Option<Vec<(LabelKey, LockedPlace)>>,
     /// Geographic anchors of locked non-repeated line labels. Render cache only, never saved.
     #[serde(skip)]
     pub label_lock_line_anchors: std::collections::HashMap<LabelKey, Coord>,
@@ -1371,6 +1408,22 @@ impl Map {
         }
     }
 
+    /// A copy to draw elsewhere (an export on a thread of its own): its layers keep this map's
+    /// identities, and its streamed layers read for themselves (see [`source::SourceLayer::detach_read`]).
+    pub fn detached(&self) -> Map {
+        let mut copy = self.clone();
+        copy.detach_reads();
+        copy
+    }
+
+    /// [`Map::detached`] for a map that is already a copy: its streamed layers leave a read under
+    /// way to the map it was copied from.
+    pub fn detach_reads(&mut self) {
+        for source in self.layers.iter_mut().filter_map(|l| l.source.as_mut()) {
+            source.detach_read();
+        }
+    }
+
     /// Identifies this live map, whatever its name or place among the project's maps.
     pub fn instance_id(&self) -> u64 {
         self.instance_id
@@ -1382,8 +1435,8 @@ impl Map {
     }
 
     /// Every address the map keeps to read its data again (service groups and their layers'
-    /// sources, tile layers and their dated addresses, terrain tiles, layers' dataset, streamed and
-    /// raster sources, time-following Zarr stores). Local paths come too: callers judge each one.
+    /// sources, tile layers and their dated, feature-info and legend addresses, terrain tiles,
+    /// layers' dataset, streamed and raster sources, time-following Zarr stores). Local paths come too.
     pub fn addresses_mut(&mut self) -> Vec<&mut String> {
         let mut addresses = Vec::new();
         for group in &mut self.service_groups {
@@ -1399,6 +1452,9 @@ impl Map {
             }
             for (_, url) in &mut tile.time_urls {
                 addresses.push(url);
+            }
+            if let Some(info) = &mut tile.feature_info {
+                addresses.push(&mut info.url);
             }
             // (A legend's address is built from the service's, its key or password included.)
             for legend in &mut tile.legends {
@@ -2388,9 +2444,7 @@ impl Map {
                 src.byte_budget = bytes;
                 src.full_read = block;
                 if changed || mode_changed || budget_changed {
-                    let selected = std::mem::take(&mut src.saved_selection);
-                    src.reset_window();
-                    src.saved_selection = selected;
+                    src.reread();
                 }
                 if changed || (!block && layer.view_cache_bytes() > bytes) {
                     // Preserve ids while discarding a window that no longer fits. The next
@@ -2502,6 +2556,13 @@ impl Map {
         let l = ((u16::from(land.r()) * 3 + u16::from(land.g()) * 6 + u16::from(land.b())) / 10) as u8;
         let grey = Rgba::rgb(l, l, l);
         (grey, grey, Rgba::new(0, 0, 0, 0), grat)
+    }
+
+    /// Whether the built-in world outline is drawn: where the palette's land and water differ, so
+    /// not on the blank basemap or another body.
+    pub fn draws_world_outline(&self) -> bool {
+        let (water, land, ..) = self.palette();
+        land != water
     }
 
     /// Ground metres on the map's body per map unit at a point in map coordinates.
@@ -2735,6 +2796,62 @@ mod tests {
     }
 
     #[test]
+    fn a_diagram_is_kept_and_a_crafted_one_reads_as_none() {
+        let mut l = Layer::new(
+            1,
+            Dataset::new(
+                "p",
+                GeometryType::Polygon,
+                vec![Field::new("male", FieldType::Integer), Field::new("female", FieldType::Integer)],
+            ),
+        );
+        l.dataset.push(
+            Some(Geometry::Polygon(vec![vec![vec![
+                Coord::new(0.0, 0.0),
+                Coord::new(1.0, 0.0),
+                Coord::new(1.0, 1.0),
+                Coord::new(0.0, 1.0),
+                Coord::new(0.0, 0.0),
+            ]]])),
+            vec![Value::Int(52_000), Value::Int(48_000)],
+        );
+        // None isn't written: an older RustGIS reads the layer as before.
+        assert!(serde_json::to_value(&l).unwrap().get("diagram").is_none());
+        l.diagram = Some(diagram::DiagramSettings {
+            kind: diagram::DiagramKind::Pie,
+            categories: vec![
+                diagram::DiagramCategory { field: "male".into(), colour: diagram::CATEGORY_COLORS[0] },
+                diagram::DiagramCategory { field: "female".into(), colour: diagram::CATEGORY_COLORS[1] },
+            ],
+            size: diagram::DiagramSize::Scaled { min_size: 6.0, max_size: 40.0, min: 45_000.0, max: 100_000.0 },
+            start_angle: 0.0,
+            background: None,
+            stroke: diagram::DiagramSettings::default_stroke(),
+            stroke_width: 0.75,
+            labels: diagram::DiagramLabel::Percent,
+        });
+        let v = serde_json::to_value(&l).unwrap();
+        let back: Layer = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(back.diagram, l.diagram);
+        // Its values read from the row it draws on.
+        let d = l.diagram.as_ref().unwrap();
+        let (values, total) = d.values(&l.dataset, 0).unwrap();
+        assert_eq!(total, 100_000.0);
+        assert_eq!(values.len(), 2);
+        for junk in [
+            serde_json::json!("nonsense"),
+            serde_json::json!({"kind": "hexagon"}),
+            serde_json::json!({"categories": []}),
+            serde_json::json!(17),
+        ] {
+            let mut v = v.clone();
+            v["diagram"] = junk.clone();
+            let read: Layer = serde_json::from_value(v).unwrap();
+            assert!(read.diagram.is_none(), "{junk}");
+        }
+    }
+
+    #[test]
     fn hostile_line_strokes_in_a_project_are_brought_into_range() {
         // A crafted project file: too many strokes, and widths and offsets far out of range.
         let mut l = Layer::new(1, Dataset::new("lines", GeometryType::Polyline, vec![]));
@@ -2939,7 +3056,15 @@ mod tests {
     fn ids_stay_unique_when_a_project_reaches_the_largest_id() {
         let mut m = Map::new("m");
         m.layers.push(Layer::new(u32::MAX, points()));
-        let group = ServiceGroup { id: 0, name: "g".into(), url: String::new(), kind: String::new(), expanded: true, children: vec![] };
+        let group = ServiceGroup {
+            id: 0,
+            name: "g".into(),
+            url: String::new(),
+            kind: String::new(),
+            anonymous: false,
+            expanded: true,
+            children: vec![],
+        };
         let a = m.add_dataset(points());
         let b = m.add_service_group(group);
         let c = m.add_dataset(points());
@@ -3061,6 +3186,61 @@ mod tests {
         // Budget exhaustion falls back to the original, fully projected geometry.
         let full = flat.project(chunk.dataset.features[0].geometry.as_ref().unwrap());
         assert_eq!(chunk.thinned_in(&flat, "mercator", 1e6), &[Some(full)]);
+    }
+
+    /// #1456: a view holding more features than it reads keeps its limit of the definition
+    /// query's matches, so a match the unfiltered sample leaves out still draws.
+    #[test]
+    fn a_streamed_view_reads_its_definition_querys_matches() {
+        let mut ds = Dataset::new("sites", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+        for i in 0..5 {
+            ds.push(Some(Geometry::Point(Coord::new(f64::from(i), 0.0))), vec![Value::Int(i64::from(i))]);
+        }
+        let bytes = std::sync::Arc::new(rustgis_data::source::fgb::write(&ds).unwrap());
+        let handle = rustgis_data::source::open_shared("sites.fgb", bytes.clone(), None).unwrap();
+        let mut src = source::SourceLayer::from_bytes("sites.fgb", bytes, None, handle);
+        src.limit = 2;
+        let mut l = Layer::new_streamed(1, src);
+        let view = Extent::new(-1.0, -1.0, 5.0, 1.0);
+        let shown = |l: &Layer| -> Vec<Value> {
+            l.visible_rows()
+                .iter()
+                .zip(l.dataset.features.iter())
+                .filter(|(v, _)| **v)
+                .filter_map(|(_, f)| f.attrs.first().cloned())
+                .collect()
+        };
+        l.sync_source(&view, true);
+        let sampled = shown(&l);
+        assert_eq!(sampled.len(), 2, "the view reads a sample of two");
+        let left_out = (0..5).find(|n| !sampled.contains(&Value::Int(*n))).unwrap();
+        l.definition_query = Some(format!("n = {left_out}"));
+        assert!(shown(&l).is_empty(), "filtering the sample loses the match");
+        l.sync_source(&view, true);
+        assert_eq!(shown(&l), [Value::Int(left_out)]);
+        // More matches than the view reads: a sample of them, up to its limit, counted as matches.
+        l.definition_query = Some(format!("n <> {left_out}"));
+        l.sync_source(&view, true);
+        assert_eq!((shown(&l).len(), l.dataset.features.len()), (2, 2));
+        let src = l.source.as_ref().unwrap();
+        assert_eq!((src.sampled(), src.sampled_matches()), (Some((2, 4)), true));
+        // A row number is a row's place in the view: the view is read as without a query. The
+        // words in a text are only text.
+        l.definition_query = Some("@row_number = 1".into());
+        l.sync_source(&view, true);
+        let src = l.source.as_ref().unwrap();
+        assert_eq!((src.sampled(), src.sampled_matches()), (Some((2, 5)), false));
+        l.definition_query = Some(format!("n = {left_out} or 'x' = '@row_number'"));
+        l.sync_source(&view, true);
+        assert_eq!(shown(&l), [Value::Int(left_out)]);
+        // However it's quoted or nested, a row number is found in the parsed query.
+        l.definition_query = Some(format!("!n! = {left_out} and (@row_number >= 1 or 'it''s' = '')"));
+        l.sync_source(&view, true);
+        assert!(!l.source.as_ref().unwrap().sampled_matches());
+        // A query that doesn't parse leaves the view as read without one, as for loaded layers.
+        l.definition_query = Some("n = = 1".into());
+        l.sync_source(&view, true);
+        assert_eq!(shown(&l), sampled);
     }
 
     #[test]

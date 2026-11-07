@@ -104,8 +104,9 @@ down, or delete it. Bookmark edits run `bookmark.*` commands and undo with ++ctr
 
 **Home › Navigate › Locate › By Place or Address…** (`map.findPlace`) looks up a place or an
 address by name with OpenStreetMap's [Nominatim](https://nominatim.org) (or a
-[Photon](https://photon.komoot.io) server, or a geocoder of your own given by its address) and
-zooms to the one picked. The search goes to that server over the network; see
+[Photon](https://photon.komoot.io) server, PDOK's
+[Locatieserver](data.md#geocoding-addresses) for Dutch addresses and places, or a geocoder of your
+own given by its address) and zooms to the one picked. The search goes to that server over the network; see
 [Geocoding addresses](data.md#geocoding-addresses) for whole tables.
 
 The **search box** at the foot of the left pane searches the map as you type: a latitude and
@@ -220,6 +221,9 @@ Ocean, Atlas, Blank), which need no network, and web tile layers over them:
   that the map's font can draw: a style's "Syria / سوريا" shows as "Syria".
   A style's root `center`, `zoom`, `bearing` and `pitch` say where it opens: `map.addTiles` with
   `"view": true` takes the map there once the style has loaded.
+
+HTTPS tiles use [platform certificate trust](data.md#https-certificates) on desktop and the
+command line, including private CAs trusted by the operating system. The web app uses the browser.
 
 The gallery's **Web Basemaps** need no API key: the OpenFreeMap vector maps (Liberty, Bright,
 Positron, Dark, Fiord) and USGS Imagery. Choosing one replaces the other web basemaps; tick

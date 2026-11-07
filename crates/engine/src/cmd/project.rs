@@ -155,6 +155,9 @@ fn reset(s: &mut Session, p: Project) {
     // Kept until the command ends: a failure gives the project back with its history.
     s.put_aside();
     s.project = p;
+    for text in std::mem::take(&mut s.project.label_read_notices) {
+        s.notify(text, false);
+    }
     s.opened_package = None;
     s.opened = s.opened.wrapping_add(1);
     s.active_layer = s.map().layers.first().map(|l| l.id);
@@ -171,16 +174,17 @@ fn reset(s: &mut Session, p: Project) {
     // nothing of the new project is fetched before.
     s.s3_pending.clear();
     crate::s3_connections::resolve_project_s3(s);
+    // Its rasters read in place, begun together as it was read: waited for where the session
+    // waits (the command line, Python), landing as the map draws on the desktop.
+    s.wait_in_place_reads();
     // What reading a raster left out (a colour table, names, a sidecar's scale) is said again as
     // the project opens, as when it was added. One still read in the background isn't here yet.
-    let lost: Vec<(String, String)> = s
-        .project
-        .maps
-        .iter()
-        .flat_map(|m| &m.layers)
-        .filter_map(|l| Some((&l.name, l.raster.as_ref()?.data.as_ref()?)))
-        .flat_map(|(name, d)| d.lost.iter().map(move |l| (name.clone(), l.clone())))
-        .collect();
+    let mut lost: Vec<(String, String)> = Vec::new();
+    for l in s.project.maps.iter_mut().flat_map(|m| &mut m.layers) {
+        if let Some(rl) = &mut l.raster {
+            lost.extend(rl.lost_unsaid().into_iter().map(|what| (l.name.clone(), what)));
+        }
+    }
     super::raster::say_losses(s, lost);
     // A terrain saved on a DEM name two layers share draws the first of them: said, as the
     // project opens (its layers keep their names).
@@ -234,6 +238,8 @@ fn sample(s: &mut Session, _: &Value) -> CmdResult {
 /// Largest project package opened (1 GiB).
 const MAX_PACKAGE: u64 = 1 << 30;
 
+/// `project.open`: a project file, or a package (`.rgispkg`) opened unsaved; either must be a
+/// regular file within its limit.
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let path = PathBuf::from(super::ps(p, "path").ok_or("path is required")?);
     let is_package = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rgispkg"));
@@ -242,15 +248,7 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
     super::connections::clear_active();
     let proj = (|| {
         if is_package {
-            // Read at most a byte past the limit, so a huge file is refused rather than loaded.
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            std::fs::File::open(&path)
-                .and_then(|f| f.take(MAX_PACKAGE + 1).read_to_end(&mut bytes))
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-            if bytes.len() as u64 > MAX_PACKAGE {
-                return Err("the package is too large".into());
-            }
+            let bytes = crate::project::read_file(&path, MAX_PACKAGE)?;
             Project::from_import_json(&super::items::package_text(&bytes)?, None)
         } else {
             Project::load(&path)

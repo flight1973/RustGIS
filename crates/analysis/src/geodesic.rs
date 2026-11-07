@@ -15,7 +15,8 @@
 //! projection's centre: the projection's own error, under 0.0093% there, and the edges' 0.002%.
 //! A winding line or outline buffered in stretches can have vertices up to [`STRETCH_M`] from a
 //! stretch's centre, where the sides are within 0.05%. A ring gains at most [`MAX_ADDED`] points,
-//! which only a ring of thousands of long edges uses up; past that, its edges are left whole.
+//! which only a ring of thousands of long edges uses up; past that, its edges are left whole,
+//! and the buffer says so ([`BudgetedBuffer::coarse`]), as Buffer then does.
 //!
 //! Arcs use a 2.8125° step: 128 edges to a point's circle and 64 to a semicircular cap.
 //! Between vertices, those edges cut at most 0.031% of the distance inside the circle in the
@@ -88,10 +89,18 @@ pub fn geodesic_buffer(g: &Geometry, metres: f64) -> Option<Geometry> {
 }
 
 /// A buffered outline and its budget charge: at least the retained coordinate count, or the
-/// pre-union disc total for a multipoint, whichever is larger.
+/// pre-union disc total for a multipoint, whichever is larger; and whether an edge of it was left
+/// straying more than its tolerance, for want of [`MAX_ADDED`] points or [`MAX_SPLITS`] halvings.
 pub(crate) struct BudgetedBuffer {
     pub geometry: Option<Geometry>,
     pub charged_vertices: usize,
+    pub coarse: bool,
+}
+
+std::thread_local! {
+    /// Whether the buffer being made on this thread left an edge straying more than its tolerance
+    /// ([`Plane::split`]); each buffer is made whole on one thread, which resets it first.
+    static COARSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A buffer that must fit the caller's remaining vertex budget. Multipoint discs are counted
@@ -100,8 +109,9 @@ pub(crate) struct BudgetedBuffer {
 /// outlines, not all temporary allocations inside the polygon overlay backend.
 pub(crate) fn geodesic_buffer_with_limit(g: &Geometry, metres: f64, max_vertices: usize) -> Result<BudgetedBuffer, &'static str> {
     if !metres.is_finite() {
-        return Ok(BudgetedBuffer { geometry: None, charged_vertices: 0 });
+        return Ok(BudgetedBuffer { geometry: None, charged_vertices: 0, coarse: false });
     }
+    COARSE.set(false);
     let mut pre_union_vertices = 0;
     let mp = match g {
         Geometry::Point(c) => point(*c, metres),
@@ -126,7 +136,7 @@ pub(crate) fn geodesic_buffer_with_limit(g: &Geometry, metres: f64, max_vertices
         return Err(VERTEX_BUDGET_ERROR);
     }
     let charged_vertices = pre_union_vertices.max(mp.coords_count());
-    Ok(BudgetedBuffer { geometry: to_geometry(&mp), charged_vertices })
+    Ok(BudgetedBuffer { geometry: to_geometry(&mp), charged_vertices, coarse: COARSE.get() })
 }
 
 /// Buffers of this many features or more are made on several threads.
@@ -135,32 +145,40 @@ pub(crate) const PARALLEL_FEATURES: usize = 256;
 /// The buffers of `geoms` at `metres`, in their order, as [`geodesic_buffer`] makes them: on
 /// several threads when there are many (one in the browser), since each is made alone.
 pub fn geodesic_buffers(geoms: &[&Geometry], metres: f64) -> Vec<Option<Geometry>> {
-    geodesic_buffers_with_limit(geoms, metres, usize::MAX).unwrap_or_default()
+    geodesic_buffers_with_limit(geoms, metres, usize::MAX).map(|(b, _)| b).unwrap_or_default()
 }
 
-/// Ordered parallel buffers sharing an outline budget, including pre-union multipoint discs.
+/// Ordered parallel buffers sharing an outline budget, including pre-union multipoint discs, and
+/// how many of them left an edge straying more than its tolerance ([`BudgetedBuffer::coarse`]).
 /// `usize::MAX` disables cumulative charging for the public unlimited API. Each buffer checks the
 /// allowance left before it is made, then is charged to it before it is kept. In-flight
 /// operations may allocate temporary geometry on each thread (one in the browser).
-pub(crate) fn geodesic_buffers_with_limit(geoms: &[&Geometry], metres: f64, limit: usize) -> Result<Vec<Option<Geometry>>, &'static str> {
+pub(crate) fn geodesic_buffers_with_limit(
+    geoms: &[&Geometry],
+    metres: f64,
+    limit: usize,
+) -> Result<(Vec<Option<Geometry>>, usize), &'static str> {
     buffers_on(geoms, metres, crate::parallel::threads_for(geoms.len(), PARALLEL_FEATURES), limit)
 }
 
 /// [`geodesic_buffers_with_limit`] on `threads` threads, through [`crate::parallel::try_map_on`]:
 /// a buffer past the budget stops the others.
-fn buffers_on(geoms: &[&Geometry], metres: f64, threads: usize, limit: usize) -> Result<Vec<Option<Geometry>>, &'static str> {
-    let remaining = std::sync::atomic::AtomicUsize::new(limit);
+fn buffers_on(geoms: &[&Geometry], metres: f64, threads: usize, limit: usize) -> Result<(Vec<Option<Geometry>>, usize), &'static str> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (remaining, coarse) = (AtomicUsize::new(limit), AtomicUsize::new(0));
     crate::control::begin(geoms.len());
-    crate::parallel::try_map_on(
+    let buffers = crate::parallel::try_map_on(
         geoms,
         threads,
         || (),
-        |_, _, g| {
-            let buffered = geodesic_buffer_with_limit(g, metres, remaining.load(std::sync::atomic::Ordering::Relaxed))?;
+        |_, _, g| -> Result<Option<Geometry>, &'static str> {
+            let buffered = geodesic_buffer_with_limit(g, metres, remaining.load(Ordering::Relaxed))?;
             charge(&remaining, limit, buffered.charged_vertices)?;
+            coarse.fetch_add(usize::from(buffered.coarse), Ordering::Relaxed);
             Ok(buffered.geometry)
         },
-    )
+    )?;
+    Ok((buffers, coarse.load(Ordering::Relaxed)))
 }
 
 /// Takes `vertices` from the `remaining` budget that threads share, or says it is spent; nothing
@@ -257,7 +275,14 @@ impl Plane {
         budget: &mut usize,
         out: &mut Vec<(GC<f64>, Coord)>,
     ) {
-        if *budget == 0 || depth >= MAX_SPLITS || !may_stray(a, b, la, lb, tolerance) {
+        if !may_stray(a, b, la, lb, tolerance) {
+            return;
+        }
+        // Out of points or halvings: an edge that still strays is left so, and the buffer says so.
+        if *budget == 0 || depth >= MAX_SPLITS {
+            if self.strays(a, b, la, lb, tolerance) {
+                COARSE.set(true);
+            }
             return;
         }
         if !self.strays(a, b, la, lb, tolerance) {
@@ -267,6 +292,13 @@ impl Plane {
         let mid = (mid, self.to_lonlat(mid));
         self.split((a, la), mid, tolerance, depth + 1, budget, out);
         if *budget == 0 {
+            // Out of points in the first half: `mid` isn't added, so the edge left runs from the
+            // last point added to `b`, checked by no call below.
+            if let Some(&(p, lp)) = out.last()
+                && self.strays(p, b, lp, lb, tolerance)
+            {
+                COARSE.set(true);
+            }
             return;
         }
         *budget -= 1;
@@ -692,12 +724,37 @@ mod tests {
         let vertices: usize = alone.iter().flatten().map(Geometry::coord_count).sum();
         // The exact shared limit succeeds; one vertex less fails on every thread count.
         for threads in [1, 3, 16] {
-            assert_eq!(buffers_on(&refs, 5_000.0, threads, vertices).unwrap(), alone);
+            assert_eq!(buffers_on(&refs, 5_000.0, threads, vertices).unwrap(), (alone.clone(), 0));
             assert_eq!(buffers_on(&refs, 5_000.0, threads, vertices - 1).unwrap_err(), VERTEX_BUDGET_ERROR);
-            assert_eq!(buffers_on(&refs, 5_000.0, threads, usize::MAX).unwrap(), alone, "{threads} threads");
-            assert_eq!(buffers_on(&refs[..3], 5_000.0, threads, usize::MAX).unwrap(), alone[..3], "{threads} threads, 3 features");
+            assert_eq!(buffers_on(&refs, 5_000.0, threads, usize::MAX).unwrap(), (alone.clone(), 0), "{threads} threads");
+            assert_eq!(buffers_on(&refs[..3], 5_000.0, threads, usize::MAX).unwrap().0, alone[..3], "{threads} threads, 3 features");
         }
-        assert!(buffers_on(&[], 5_000.0, 3, 0).unwrap().is_empty());
+        assert!(buffers_on(&[], 5_000.0, 3, 0).unwrap().0.is_empty());
+        // A ring 5,000 km out from its plane's center, where straight edges stray most, of 2,000
+        // edges, needs far more than MAX_ADDED points: its edges are left so, and the buffer says
+        // so. A ring of 10 km round the center needs none.
+        let plane = Plane::new(Coord::new(0.0, 0.0), 0.0);
+        let circle = |r: f64, n: usize| {
+            LineString::new(
+                (0..=n).map(|i| std::f64::consts::TAU * i as f64 / n as f64).map(|t| GC { x: r * t.cos(), y: r * t.sin() }).collect(),
+            )
+        };
+        COARSE.set(false);
+        let _ = plane.ring(&circle(5_000_000.0, 2_000), 0.02);
+        assert!(COARSE.get(), "the far ring kept its tolerance");
+        COARSE.set(false);
+        let _ = plane.ring(&circle(10_000.0, 64), 0.02);
+        assert!(!COARSE.get(), "the near ring was coarse");
+        // A budget running out within an edge's first half leaves the edge from the last point added
+        // to its end, which no deeper call checks: one point for a long straying edge is too few.
+        let far = circle(5_000_000.0, 8);
+        let ends: Vec<(GC<f64>, Coord)> = far.0.iter().take(2).map(|p| (*p, plane.to_lonlat(*p))).collect();
+        let [a, b] = ends.as_slice() else { panic!("two ends") };
+        assert!(plane.strays(a.0, b.0, a.1, b.1, 0.02), "the edge doesn't stray");
+        let (mut budget, mut out) = (1, vec![*a]);
+        COARSE.set(false);
+        plane.split(*a, *b, 0.02, 0, &mut budget, &mut out);
+        assert!(budget == 0 && COARSE.get(), "budget {budget}, {} points: not marked", out.len());
         // Overlapping multipoint unions stay small, but every disc is charged across workers.
         let multipoint = Geometry::MultiPoint(vec![Coord::new(0.0, 0.0); 2]);
         let refs = vec![&multipoint; 2 * BATCH];

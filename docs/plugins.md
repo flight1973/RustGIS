@@ -36,7 +36,10 @@ The desktop app keeps installed packages in `plugins/` in its data folder (overr
 `$RUSTGIS_PLUGINS_DIR`) and loads them at startup. The web app remembers the
 plugins you installed from the registry and downloads them again on your next visit. Packages
 installed from files are remembered when they are at most 1.5 MiB; larger ones last for the
-current session only.
+current session only. When one of them can't be loaded on a visit (you're offline, the download
+is gone or has changed), the web app says so once and lists it on the **Installed** tab as *Not
+loaded*, with why. **Retry** downloads a plugin from the registry again; **Remove** forgets it, so
+the web app stops trying at start. A plugin that fails to load is never forgotten on its own.
 
 On the command line:
 
@@ -445,6 +448,33 @@ downloads wait at a time: a request past 16 fails, and if the command then fails
 downloads start. Run by
 `rustgis-cli`, a script or a task, the command waits and answers what was added.
 
+The command then runs again, as for a [fetch](#fetching-a-document): RustGIS undoes what the call
+did to the project and, once every download it left has been added (or failed), runs it again with
+the same parameters. In that run the same `layer.addUrl` call answers what adding the download
+answered (`{"layer", …}`, or its error) and adds nothing, so the command goes on with the layer:
+clips it, renames it or styles it. Everything the command did before the call runs again as well,
+and only what it did to the project is undone: keep side effects outside the project (files
+written, services called) after the call, or make them safe to repeat. The added layer stays its
+own undo step, and what the command
+does with it is another. So a command can be written as if `layer.addUrl` waited:
+
+```rust
+let added = host::call("layer.addUrl", json!({"url": url, "name": "Rivers"}))?;
+if added.get("pending").is_some() {
+    return Ok(json!({}));           // runs again once the layer is in
+}
+host::call("gp.run", json!({"tool": "clip", "params": {"input": "Rivers", "clip": "Area"}}))?;
+```
+
+A call asked again while its download is under way (the button clicked twice) waits for that
+download, not another. A command runs again at most 64 times, and a download not added within 10
+minutes runs it again with an error.
+
+Other commands that wait for a server (`service.add`, say) still wait with the window held. A
+command the user starts from the ribbon, command search or a panel first shows "Running …" in the
+status bar with a busy cursor, and clicks made during a long run are dropped, so they don't run it
+again.
+
 `rustgis-cli commands` lists every command id and its parameters.
 
 #### Fetching a document
@@ -473,8 +503,8 @@ document parsed when it is a JSON object or array.
 - In the web app nothing may wait. A fetch that isn't kept yet answers
   `{"pending": true, "url"}` and starts in the background. The command should then return
   straight away, before doing anything outside the project (writing a file): RustGIS undoes
-  what the call did to the project (its notices stay, and so does anything done outside it),
-  and runs the command
+  what the call did to the project (its error notices stay, and the next run doesn't repeat them;
+  anything done outside the project stays too), and runs the command
   again with the same parameters once every pending answer has landed (up to 8 per call), when
   `host.fetch` answers from what was kept. A command that walks a chain of documents, each
   address taken from the one before, runs once per step, up to 64 times. The browser follows

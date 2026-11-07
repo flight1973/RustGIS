@@ -10,7 +10,7 @@
 //! map stopped asking for is dropped unfetched ([`crate::schedule`]). Natively they are fetched on
 //! worker threads; the browser app installs its own fetcher with [`set_fetcher`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -63,7 +63,7 @@ type ImageDecoder = Box<dyn Fn(Vec<u8>, Decoded) + Send + Sync>;
 /// Bytes the cache keeps before dropping the least recently used entries.
 const BUDGET: usize = if cfg!(target_arch = "wasm32") { 160 << 20 } else { 384 << 20 };
 /// A failed address is tried again after this long.
-pub(crate) const RETRY: Duration = Duration::from_secs(60);
+pub const RETRY: Duration = Duration::from_secs(60);
 /// The largest tile or document fetched.
 pub const MAX_BYTES: usize = 16 << 20;
 /// The error a fetcher gives a request it dropped unfetched (the view moved on): the address is
@@ -140,6 +140,31 @@ pub fn clear_fetcher() {
     *fetcher().lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// Tests that fetch through the cache take turns. It has one fetcher for the whole process, so a
+/// test that replaces it ([`set_fetcher`]) would answer another's fetches. It also starts fetches
+/// on whichever thread is starting them already, so one test's fetch may run on another's thread,
+/// later. Tests that end a login take turns too, as that empties the cache ([`clear`]), and so do
+/// tests that wait for or plant what the cache holds (an archive read, a style resolved), which
+/// that would drop. The turn puts the native fetcher back when it ends.
+#[cfg(test)]
+pub(crate) fn turn() -> Turn {
+    static TURN: Mutex<()> = Mutex::new(());
+    Turn { _held: TURN.lock().unwrap_or_else(|e| e.into_inner()) }
+}
+
+/// A test's turn at the cache ([`turn`]).
+#[cfg(test)]
+pub(crate) struct Turn {
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for Turn {
+    fn drop(&mut self) {
+        clear_fetcher();
+    }
+}
+
 /// Replaces how tile pictures (PNG, JPEG, WebP) are decoded: the browser's own decoder works
 /// off the page's thread, where decoding them here held up every frame tiles arrived in. `done`
 /// must be called once, with the picture as [`RAW`] pixels, or with the bytes given back.
@@ -166,9 +191,148 @@ pub fn set_waker(f: impl Fn() + Send + Sync + 'static) {
     *waker().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
 }
 
-/// Goes up each time a fetch finishes: a map drawn at an older generation may now draw more.
+/// When the map is next to draw again by itself (a failed read may be tried again then): each
+/// wait asked for ([`notify_at`]), in milliseconds after [`alarm_base`] plus one, the earliest
+/// first. Every wait is kept (the earliest [`MAX_ALARMS`]), not the earliest alone: the draw when
+/// it is over may not ask again for a later one (a style kept whole while its elevation source
+/// waits).
+fn alarms() -> &'static Mutex<BTreeSet<u64>> {
+    static A: OnceLock<Mutex<BTreeSet<u64>>> = OnceLock::new();
+    A.get_or_init(Mutex::default)
+}
+
+/// The most waits kept at once: a later one past them all is left to its read, which asks again
+/// on each draw while it waits.
+const MAX_ALARMS: usize = 1024;
+
+fn alarm_base() -> Instant {
+    static B: OnceLock<Instant> = OnceLock::new();
+    *B.get_or_init(Instant::now)
+}
+
+/// `when` as the alarms keep it.
+fn alarm_at(when: Instant) -> u64 {
+    (when.saturating_duration_since(alarm_base()).as_millis() as u64).saturating_add(1)
+}
+
+fn alarm_hook() -> &'static Mutex<Option<Arc<dyn Fn(Duration) + Send + Sync>>> {
+    static A: OnceLock<Mutex<Option<Arc<dyn Fn(Duration) + Send + Sync>>>> = OnceLock::new();
+    A.get_or_init(Mutex::default)
+}
+
+/// Sets how the app is asked to draw again after a while (a repaint after it): a read that failed
+/// is tried again once its wait is over, though nothing else draws the map. The request lasts
+/// one frame (egui's `request_repaint_after`): it is made again on each draw while the wait
+/// lasts (see [`generation`]).
+pub fn set_alarm(f: impl Fn(Duration) + Send + Sync + 'static) {
+    *alarm_hook().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+}
+
+/// Asks the app to draw again after `after` (see [`set_alarm`]).
+fn ring(after: Duration) {
+    let hook = alarm_hook().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(hook) = hook {
+        hook(after);
+    }
+}
+
+/// Draws the map again at `when`: [`generation`] goes up then, so a map waiting on a failed read
+/// asks for it again. The app is asked for the earliest wait pending; each draw asks it again
+/// for the earliest left (see [`generation`]).
+pub fn notify_at(when: Instant) {
+    let at = alarm_at(when);
+    let earliest = {
+        let mut a = alarms().lock().unwrap_or_else(|e| e.into_inner());
+        if a.len() >= MAX_ALARMS {
+            // Full: a wait past every one kept is left to its read; an earlier one takes the
+            // latest's place.
+            if a.last().is_some_and(|last| at >= *last) {
+                return;
+            }
+            a.pop_last();
+        }
+        a.insert(at);
+        a.first() == Some(&at)
+    };
+    if earliest {
+        ring(when.saturating_duration_since(Instant::now()));
+    }
+}
+
+/// Goes up each time a fetch finishes, and once a wait asked for ([`notify_at`]) is over: a map
+/// drawn at an older generation may now draw more. Read as the map draws, it asks the app to draw
+/// again at the earliest wait still pending: the app's request lasts one frame (egui's
+/// `request_repaint_after`), and a draw before the wait was over (the pointer moved) used it up.
 pub fn generation() -> u64 {
+    let now = alarm_at(Instant::now());
+    let next = {
+        let mut a = alarms().lock().unwrap_or_else(|e| e.into_inner());
+        if a.first().is_some_and(|at| *at <= now) {
+            // Every wait over is one draw: the generation goes up once for them all.
+            let later = a.split_off(&now.saturating_add(1));
+            *a = later;
+            GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
+        a.first().copied()
+    };
+    if let Some(at) = next {
+        ring(Duration::from_millis(at.saturating_sub(now)));
+    }
     GENERATION.load(Ordering::Relaxed)
+}
+
+/// How long until the earliest wait pending; none when there is none.
+#[cfg(test)]
+pub(crate) fn next_alarm() -> Option<Duration> {
+    let at = alarms().lock().unwrap_or_else(|e| e.into_inner()).first().copied()?;
+    Some(Duration::from_millis(at.saturating_sub(alarm_at(Instant::now()))))
+}
+
+/// Forgets every wait pending.
+#[cfg(test)]
+pub(crate) fn clear_alarms() {
+    alarms().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// Undoes [`set_alarm`]: a test done with its own.
+#[cfg(test)]
+pub(crate) fn clear_alarm() {
+    *alarm_hook().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// A test's turn at the process-wide alarms, held by the tests that arm, read or clear them, or
+/// set what rings: they run in parallel threads of one process, and one's clearing would erase
+/// another's.
+#[cfg(test)]
+pub(crate) fn alarm_turn() -> std::sync::MutexGuard<'static, ()> {
+    static L: Mutex<()> = Mutex::new(());
+    L.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How long a server that refused with 429 or 503 asked to be left before it is asked again, as
+/// the error's text says it (`http status: 503 (retry after 30 s)`; see
+/// [`crate::failure::with_retry_after`]).
+pub fn retry_after(error: &str) -> Option<Duration> {
+    let (_, rest) = error.rsplit_once("(retry after ")?;
+    let secs: u64 = rest.strip_suffix(" s)")?.parse().ok()?;
+    // Bounded as when written: a text from elsewhere (an address echoed) can't ask for years.
+    Some(Duration::from_secs(secs.clamp(1, crate::failure::MAX_RETRY_AFTER)))
+}
+
+/// How long a failed read waits before it is tried again: what its server asked for (see
+/// [`retry_after`]), else `default`.
+pub fn retry_wait(error: &str, default: Duration) -> Duration {
+    retry_after(error).unwrap_or(default)
+}
+
+/// How long a read that has failed `failures` times in a row waits before the next try: `wait`,
+/// doubled for each failure past the first, within the hour (see [`retry_after`]'s bound), so a
+/// file that never reads isn't asked for every minute all session.
+pub fn backoff(wait: Duration, failures: u32) -> Duration {
+    let most = Duration::from_secs(crate::failure::MAX_RETRY_AFTER);
+    // Past twelve doublings the wait is over the hour whatever it was (it is a second at least).
+    let doublings = failures.saturating_sub(1).min(12);
+    wait.saturating_mul(1u32 << doublings).min(most)
 }
 
 /// How many fetches are under way. Once a fetch no longer counts, its [`generation`] shows.
@@ -198,6 +362,9 @@ const TILE_OMIT: &[u16] = &[404, 410];
 
 /// [`get`] with the statuses that are expected answers for this fetch.
 fn request(url: &str, want: Want, omit: &'static [u16]) -> State {
+    if let Err(e) = crate::logins::check(resource_of(url)) {
+        return State::Failed(e.to_string());
+    }
     // A map tile of a layer in another system: its service's picture as it comes, or made from
     // its pictures (#769).
     if let Some(base) = crate::warp::direct(url) {
@@ -214,7 +381,15 @@ fn request(url: &str, want: Want, omit: &'static [u16]) -> State {
         match &slot.entry {
             Entry::Ready(p, _) => return State::Ready(p.clone()),
             Entry::Pending => return State::Pending,
-            Entry::Failed(e, at) if at.elapsed() < RETRY => return State::Failed(e.clone()),
+            Entry::Failed(e, at) if at.elapsed() < retry_wait(e, RETRY) => {
+                // A server that said when to come back (429 or 503 with `Retry-After`) is asked
+                // again then: the map draws again at that time, though nothing else draws it.
+                // One that didn't is asked again by the next draw after a minute, as before.
+                if let Some(wait) = retry_after(e) {
+                    notify_at(*at + wait);
+                }
+                return State::Failed(e.clone());
+            }
             Entry::Failed(..) => {}
         }
     }
@@ -244,6 +419,7 @@ fn request(url: &str, want: Want, omit: &'static [u16]) -> State {
 
 /// What the cache holds for `url`, without fetching it.
 pub fn peek(url: &str) -> Option<Arc<Payload>> {
+    crate::logins::check(resource_of(url)).ok()?;
     if let Some(base) = crate::warp::direct(url) {
         return peek(base);
     }
@@ -345,11 +521,16 @@ const SETTLE: Duration = Duration::from_secs(1);
 /// a moment, or for a second at most: one drawing again with what came needn't wait for every
 /// fetch in the process (another map's, a slow server's, one never answered). Native only.
 pub fn wait_for_news(since: u64, timeout: Duration) {
+    wait_for_news_unless(since, timeout, || false);
+}
+
+/// [`wait_for_news`], given up as soon as `stop` says so (an export cancelled meanwhile).
+pub fn wait_for_news_unless(since: u64, timeout: Duration, stop: impl Fn() -> bool) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let start = Instant::now();
         let (mut seen, mut changed, mut news) = (since, Instant::now(), None);
-        while in_flight() > 0 && start.elapsed() < timeout {
+        while in_flight() > 0 && start.elapsed() < timeout && !stop() {
             let now = generation();
             if now != seen {
                 (seen, changed) = (now, Instant::now());
@@ -362,7 +543,7 @@ pub fn wait_for_news(since: u64, timeout: Duration) {
         }
     }
     #[cfg(target_arch = "wasm32")]
-    let _ = (since, timeout);
+    let _ = (since, timeout, stop);
 }
 
 /// A waiting fetch: what to decode it as, whose diagnostics it goes to, and its expected statuses.
@@ -502,7 +683,11 @@ fn fetch_tile(url: String, host: String, want: Want, omit: &'static [u16]) {
                     Entry::Ready(Arc::new(p), size)
                 }
                 Err(e) => {
-                    log::debug!("{}: {e}", answer.key);
+                    log::debug!("{}", crate::logins::scrub(&format!("{}: {e}", answer.key)));
+                    // Refused until a time its server gave: the map draws again then.
+                    if let Some(wait) = retry_after(&e) {
+                        notify_at(Instant::now() + wait);
+                    }
                     Entry::Failed(e, Instant::now())
                 }
             });
@@ -676,6 +861,14 @@ impl<'a> RequestDiagnostics<'a> {
         let (url, _) = split_download_limit(self.url);
         let (url, tail) = split_tail(url);
         let (url, range) = split_range(url);
+        // A request carrying a login is recorded by its plain address and scrubbed text: neither
+        // the binding that names the login nor a credential belongs in the history.
+        let carried = rustgis_data::login_address::is_wrapper(url);
+        let url = crate::logins::inner(url);
+        let url = if rustgis_data::login_address::is_wrapper(url) { "[address omitted]" } else { url };
+        let clean = |text: &str| {
+            if carried || text.contains(rustgis_data::login_address::PREFIX) { crate::logins::scrub(text) } else { text.to_string() }
+        };
         // A status the caller expects is an answer, not a failure for the history; a caller
         // that treats the refusal as an error says so itself. One bounded record per server says
         // the omission, so a misconfigured tile source isn't silent.
@@ -696,7 +889,7 @@ impl<'a> RequestDiagnostics<'a> {
         if let Some(answer) = &failure.answer {
             for (name, value) in &answer.headers {
                 if crate::failure::KEPT_HEADERS.contains(&name.as_str()) {
-                    details.push_str(&rustgis_data::diagnostics::redact(&format!("{name}: {value}")));
+                    details.push_str(&rustgis_data::diagnostics::redact(&clean(&format!("{name}: {value}"))));
                     details.push('\n');
                 }
             }
@@ -713,8 +906,8 @@ impl<'a> RequestDiagnostics<'a> {
         };
         self.capture.network_failure(
             "Network",
-            &failure.message,
-            &details,
+            &clean(&failure.message),
+            &clean(&details),
             Network {
                 url: url.to_string(),
                 method: self.method.to_string(),
@@ -731,8 +924,11 @@ impl<'a> RequestDiagnostics<'a> {
 /// another message (an address can hold "404").
 pub fn http_status(error: &str) -> Option<u16> {
     let e = error.trim();
-    let code = e.strip_prefix("http status: ").or_else(|| e.strip_prefix("HTTP "))?;
-    (code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit())).then(|| code.parse().ok()).flatten()
+    let rest = e.strip_prefix("http status: ").or_else(|| e.strip_prefix("HTTP "))?;
+    // The status, and nothing after it but how long to wait (see [`retry_after`]).
+    let (code, after) = rest.split_at_checked(3)?;
+    let known = after.is_empty() || (after.starts_with(" (retry after ") && retry_after(after).is_some());
+    (known && code.bytes().all(|b| b.is_ascii_digit())).then(|| code.parse().ok()).flatten()
 }
 
 /// Downloads a file the user named (data added by its web address): up to [`MAX_DOWNLOAD`]
@@ -744,13 +940,34 @@ pub fn download(url: &str, done: Done) {
 
 /// Like [`download`], with a smaller budget enforced by the native and browser fetchers.
 pub fn download_limited(url: &str, max: usize, done: Done) {
-    download_detailed(url, max, Box::new(move |r| done(r.map_err(|f| f.message))));
+    download_limited_omitting(url, max, &[], done);
 }
+
+/// Like [`download_limited`], but a status in `omit` is an expected answer: its failure isn't
+/// recorded, only noted once per server (a file that may not be there, which the caller handles).
+pub fn download_limited_omitting(url: &str, max: usize, omit: &'static [u16], done: Done) {
+    download_detailed_within(url, max, DOWNLOAD_TIMEOUT, omit, Box::new(move |r| done(r.map_err(|f| f.message))));
+}
+
+/// Like [`download_limited`], giving up after `timeout` natively (the browser's fetch keeps its
+/// own): a small answer that mustn't hold a thread for long (an ArcGIS layer's description).
+pub fn download_within(url: &str, max: usize, timeout: std::time::Duration, done: Done) {
+    download_detailed_within(url, max, timeout, &[], Box::new(move |r| done(r.map_err(|f| f.message))));
+}
+
+/// How long a download off the frame may take natively.
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// Like [`download_limited`], telling what is known of a failure (#509): the status, the headers
 /// that say who answered and an excerpt of the answer. The browser's fetch tells only the
 /// status, read back from its error.
 pub fn download_detailed(url: &str, max: usize, done: DoneDetailed) {
+    download_detailed_within(url, max, DOWNLOAD_TIMEOUT, &[], done);
+}
+
+/// Like [`download_detailed`], giving up after `timeout` natively; a status in `omit` isn't
+/// recorded as a failure.
+fn download_detailed_within(url: &str, max: usize, timeout: std::time::Duration, omit: &'static [u16], done: DoneDetailed) {
     if let Err(e) = crate::address::check(url, None) {
         done(Err(Failure::new(url, e)));
         return;
@@ -760,13 +977,14 @@ pub fn download_detailed(url: &str, max: usize, done: DoneDetailed) {
     // The failure names the address asked for, not the marked one fetched.
     let asked = url.to_string();
     let done: DoneDetailed = Box::new(move |r| {
-        done(r.map_err(|f| Failure { url: asked, ..f }));
+        let r = crate::logins::check(&asked).map_err(|e| Failure::new(&asked, e)).and(r);
+        done(r.map_err(|f| Failure { url: crate::logins::inner(&asked).to_string(), ..f }));
         finished();
     });
     let f = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone();
     match f {
-        Some(f) => f(marked.clone(), Box::new(move |r| done(r.map_err(|e| Failure::new(&marked, e)))), &[]),
-        None => native::download(marked, done),
+        Some(f) => f(marked.clone(), Box::new(move |r| done(r.map_err(|e| Failure::new(&marked, e)))), omit),
+        None => native::download_within(marked, timeout, omit, done),
     }
 }
 
@@ -795,9 +1013,9 @@ pub fn download_blocking_omitting(url: &str, omit: &'static [u16]) -> Result<Vec
     download_blocking_omitting_within(url, MAX_DOWNLOAD, BLOCKING_TIMEOUT, omit).map_err(large_file_hint)
 }
 
-/// A blocking download that ran out of time says how to add a large file instead.
+/// A waited-for download's error, with where a large file goes instead when it timed out.
 #[cfg(not(target_arch = "wasm32"))]
-fn large_file_hint(e: String) -> String {
+pub fn large_file_hint(e: String) -> String {
     if e.contains("timeout") || e.contains("timed out") {
         format!("{e} (a large file: add it with Home › Add › Add Data › From URL, which downloads in the background)")
     } else {
@@ -815,7 +1033,12 @@ pub fn download_blocking_within(url: &str, max: usize, timeout: std::time::Durat
 /// isn't recorded, only noted once per server (a store's absent chunk, which the caller counts
 /// itself).
 #[cfg(not(target_arch = "wasm32"))]
-fn download_blocking_omitting_within(url: &str, max: usize, timeout: std::time::Duration, omit: &'static [u16]) -> Result<Vec<u8>, String> {
+pub fn download_blocking_omitting_within(
+    url: &str,
+    max: usize,
+    timeout: std::time::Duration,
+    omit: &'static [u16],
+) -> Result<Vec<u8>, String> {
     crate::address::check(url, None)?;
     native::get(&native::download_agent(timeout), &download_address(url, max), omit)
 }
@@ -862,8 +1085,9 @@ pub fn post_json(url: &str, body: String, done: Done) {
         return;
     }
     IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    let key = url.to_string();
     let done: Done = Box::new(move |r| {
-        done(r);
+        done(crate::logins::check(&key).map_err(str::to_string).and(r));
         finished();
     });
     let p = poster().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -927,8 +1151,9 @@ pub fn head(url: &str, done: HeadDone) {
         return;
     }
     IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    let key = url.to_string();
     let done: HeadDone = Box::new(move |r| {
-        done(r);
+        done(crate::logins::check(&key).map_err(str::to_string).and(r));
         finished();
     });
     let h = header().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -942,6 +1167,12 @@ pub fn head(url: &str, done: HeadDone) {
 /// A status in `omit` is an expected answer: its failure isn't recorded, only noted once per
 /// server (a tile past a map's edge).
 pub(crate) fn fetch_bytes(url: String, done: Done, omit: &'static [u16]) {
+    if let Err(e) = crate::logins::check(resource_of(&url)) {
+        done(Err(e.to_string()));
+        return;
+    }
+    let key = url.clone();
+    let done: Done = Box::new(move |r| done(crate::logins::check(resource_of(&key)).map_err(str::to_string).and(r)));
     let f = fetcher().lock().unwrap_or_else(|e| e.into_inner()).clone();
     match f {
         Some(f) => f(url, done, omit),
@@ -1003,6 +1234,13 @@ fn finished() {
 }
 
 fn store(url: &str, entry: Entry) {
+    if crate::logins::check(resource_of(url)).is_err() {
+        let mut c = lock();
+        if let Some(Slot { entry: Entry::Ready(_, n), .. }) = c.slots.remove(url) {
+            c.bytes = c.bytes.saturating_sub(n);
+        }
+        return;
+    }
     let mut c = lock();
     let added = if let Entry::Ready(_, n) = &entry { *n } else { 0 };
     // Dropped while it was fetched (cleared, or evicted): kept anyway, it was asked for.
@@ -1169,7 +1407,9 @@ mod native {
         if crate::mbtiles::is_tile(url) || url.starts_with(LOCAL) {
             return String::new();
         }
-        let Some((_, rest)) = rustgis_data::s3_address::reached(url).split_once("://") else { return String::new() };
+        let Some((_, rest)) = rustgis_data::login_address::reached(rustgis_data::s3_address::reached(url)).split_once("://") else {
+            return String::new();
+        };
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = rest.get(..end).unwrap_or(rest);
         // Credentials in the address aren't part of the server.
@@ -1218,12 +1458,21 @@ mod native {
         }
     }
 
-    pub(super) fn agent() -> ureq::Agent {
+    /// The settings every agent here starts from. An error status is answered, not failed (its
+    /// headers and body say who refused), set here rather than on each request: a request's own
+    /// settings would make the agent set up TLS again, reading the system's certificates.
+    fn config_builder(timeout: std::time::Duration) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
         ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .tls_config(rustgis_data::http::tls_config())
+            .http_status_as_error(false)
+            .timeout_global(Some(timeout))
             .user_agent(USER_AGENT)
             // Redirects are followed by `get`, which checks where each one leads.
             .max_redirects(0)
+    }
+
+    pub(super) fn agent() -> ureq::Agent {
+        config_builder(std::time::Duration::from_secs(30))
             // The workers share the agent: keep a connection open for each fetch a server
             // may have under way, so the next tile doesn't connect again.
             .max_idle_connections_per_host(PER_HOST)
@@ -1240,7 +1489,7 @@ mod native {
 
     /// An agent for downloads, which may take minutes.
     pub(super) fn download_agent(timeout: std::time::Duration) -> ureq::Agent {
-        ureq::Agent::config_builder().timeout_global(Some(timeout)).user_agent(USER_AGENT).max_redirects(0).build().into()
+        config_builder(timeout).build().into()
     }
 
     /// Resolves names as ureq does, keeping only the internet addresses (checked where the
@@ -1271,10 +1520,7 @@ mod native {
 
     /// A download agent that connects only to internet addresses.
     pub(super) fn public_agent(timeout: std::time::Duration) -> ureq::Agent {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .user_agent(USER_AGENT)
-            .max_redirects(0)
+        let config = config_builder(timeout)
             // A proxy would resolve the address itself, past `PublicOnly`.
             .proxy(None)
             .build();
@@ -1307,21 +1553,32 @@ mod native {
     /// them.
     pub(super) fn head_with(agent: &ureq::Agent, url: &str) -> Result<super::Head, String> {
         let mut diagnostics = super::RequestDiagnostics::new(url, "HEAD");
+        let mut carried_login = false;
         let answer = (|| -> Result<super::Head, Failure> {
-            let prepared = crate::s3::prepare(url)?;
+            crate::logins::check(url).map_err(str::to_string)?;
+            let prepared = crate::s3::prepare(crate::logins::inner(url))?;
             if prepared.signed {
                 return Ok(super::Head::default());
             }
             let mut at = prepared.url.clone();
+            let first_origin = crate::logins::origin(&at);
+            let mut same_origin = true;
             for redirects in 0..=5 {
-                let mut req = agent.head(&at);
+                // The login goes to its own origin only: once a redirect leaves it, never again.
+                let bound = crate::logins::inherit(url, &at);
+                let login = if same_origin { crate::logins::apply(&bound)? } else { None };
+                carried_login |= login.is_some();
+                let mut req = agent.head(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
+                if let Some((name, value)) = login.as_ref().and_then(|a| a.header.as_ref()) {
+                    req = req.header(name.as_str(), value.as_str());
+                }
                 if redirects == 0 {
                     for (k, v) in &prepared.headers {
                         req = req.header(k.as_str(), v.as_str());
                     }
                 }
                 diagnostics.sending();
-                let resp = req.config().http_status_as_error(false).build().call().map_err(unanswered)?;
+                let resp = req.call().map_err(unanswered)?;
                 diagnostics.answered(resp.status().as_u16());
                 let header = |k: &str| resp.headers().get(k).and_then(|v| v.to_str().ok());
                 if resp.status().is_redirection() {
@@ -1330,12 +1587,19 @@ mod native {
                     if at.starts_with("https://") && !next.starts_with("https://") {
                         return Err(format!("{next}: a redirect from https to http").into());
                     }
+                    same_origin &= crate::logins::origin(&next) == first_origin;
                     at = next;
                     continue;
                 }
                 if resp.status().as_u16() >= 400 {
-                    // The selected headers say who refused and what it wants: kept, as a GET's
-                    // refusal keeps them, so the history's details aren't only a status.
+                    // A server can echo credentials in retained headers, even after logout has
+                    // removed their redaction patterns. Remember every hop, including before a
+                    // cross-origin redirect: HEAD refusals keep only the status after any login hop.
+                    if carried_login {
+                        let status = resp.status().as_u16();
+                        return Err(Failure::without_answer("", format!("http status: {status}"), Reason::Status(status)));
+                    }
+                    // Anonymous refusals retain the selected diagnostic headers.
                     let headers: Vec<(String, String)> = resp
                         .headers()
                         .iter()
@@ -1344,6 +1608,7 @@ mod native {
                         .collect();
                     return Err(Failure::answered("", resp.status().as_u16(), &headers, &[]));
                 }
+                crate::logins::check(url).map_err(str::to_string)?;
                 return Ok(super::Head {
                     tiff_header_length: header("x-tiff-header-length").and_then(super::tiff_header_length),
                     content_type: header("content-type").map(str::to_string),
@@ -1352,7 +1617,7 @@ mod native {
             }
             Err("too many redirects".into())
         })();
-        diagnostics.record(answer).map_err(|failure| failure.message)
+        diagnostics.record(answer).map_err(|failure| if carried_login { crate::logins::scrub(&failure.message) } else { failure.message })
     }
 
     /// POSTs a JSON document on a thread of its own.
@@ -1370,20 +1635,29 @@ mod native {
     pub(super) fn post_with(agent: &ureq::Agent, url: &str, body: &str) -> Result<Vec<u8>, String> {
         use std::io::Read;
         let mut diagnostics = super::RequestDiagnostics::new(url, "POST");
+        let mut carried_login = false;
         let answer = (|| -> Result<Vec<u8>, Failure> {
-            let mut resp = agent
-                .post(url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .config()
-                .http_status_as_error(false)
-                .build()
-                .send(body)
-                .map_err(unanswered)?;
+            crate::logins::check(url).map_err(str::to_string)?;
+            let prepared = crate::s3::prepare(crate::logins::inner(url))?;
+            if prepared.signed {
+                return Err("S3 signed JSON POST requests are not supported.".into());
+            }
+            let bound = crate::logins::inherit(url, &prepared.url);
+            let login = crate::logins::apply(&bound)?;
+            carried_login = login.is_some();
+            let mut req = agent.post(prepared.url.as_str()).header("Content-Type", "application/json").header("Accept", "application/json");
+            if let Some((name, value)) = login.as_ref().and_then(|a| a.header.as_ref()) {
+                req = req.header(name.as_str(), value.as_str());
+            }
+            let mut resp = req.send(body).map_err(unanswered)?;
             let status = resp.status().as_u16();
             diagnostics.answered(status);
             if !(200..300).contains(&status) {
-                return Err(Failure::without_answer("", format!("http status: {status}"), Reason::Status(status)));
+                return Err(Failure::without_answer(
+                    "",
+                    crate::failure::with_retry_after(format!("http status: {status}"), status, retry_after_header(&resp)),
+                    Reason::Status(status),
+                ));
             }
             let mut buf = Vec::new();
             resp.body_mut()
@@ -1396,17 +1670,23 @@ mod native {
             if buf.len() > MAX_BYTES {
                 return Err(format!("larger than {MAX_BYTES} bytes").into());
             }
+            crate::logins::check(url).map_err(str::to_string)?;
             Ok(buf)
         })();
-        diagnostics.record(answer).map_err(|failure| failure.message)
+        diagnostics.record(answer).map_err(|failure| if carried_login { crate::logins::scrub(&failure.message) } else { failure.message })
     }
 
     /// Downloads on a thread of its own, so a large file doesn't hold up the tiles.
+    #[cfg(test)]
     pub(super) fn download(url: String, done: DoneDetailed) {
+        download_within(url, super::DOWNLOAD_TIMEOUT, &[], done);
+    }
+
+    pub(super) fn download_within(url: String, timeout: std::time::Duration, omit: &'static [u16], done: DoneDetailed) {
         let capture = Capture::current();
         std::thread::spawn(move || {
             let _scope = capture.enter();
-            done(get_detailed(&download_agent(std::time::Duration::from_secs(900)), &url));
+            done(get_detailed_omitting(&download_agent(timeout), &url, omit));
         });
     }
 
@@ -1469,6 +1749,11 @@ mod native {
         Failure::without_answer("", e.to_string(), reason)
     }
 
+    /// An answer's `Retry-After` header, as sent.
+    fn retry_after_header(resp: &ureq::http::Response<ureq::Body>) -> Option<&str> {
+        resp.headers().get("retry-after").and_then(|v| v.to_str().ok())
+    }
+
     /// An answer with an error status (#509): its kept headers and the start of its body.
     fn refused(resp: &mut ureq::http::Response<ureq::Body>) -> Failure {
         use std::io::Read;
@@ -1485,7 +1770,15 @@ mod native {
 
     /// [`get`], telling what is known of a failure.
     pub(super) fn get_detailed(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, Failure> {
-        fetch_answer(agent, url, true, &[]).map_err(|f| Failure { url: url.to_string(), ..f })
+        get_detailed_omitting(agent, url, &[])
+    }
+
+    /// [`get_detailed`], a status in `omit` not recorded as a failure.
+    pub(super) fn get_detailed_omitting(agent: &ureq::Agent, url: &str, omit: &'static [u16]) -> Result<Vec<u8>, Failure> {
+        fetch_answer(agent, url, true, omit).map_err(|f| Failure {
+            url: if url.contains(rustgis_data::login_address::PREFIX) { crate::logins::scrub(url) } else { url.to_string() },
+            ..f
+        })
     }
 
     /// A file's length from a `Content-Range` header (`bytes 0-0/1234`); none when the server
@@ -1497,9 +1790,12 @@ mod native {
 
     /// The answer to `url`; a refusal keeps the server's answer only when `detail` asks for it,
     /// as tiles a server doesn't have are routine and only their status is read. A status in
-    /// `omit` is an expected answer: its failure isn't recorded, only noted once per server.
+    /// `omit` is an expected answer: its failure isn't recorded, only noted once per server. A
+    /// request carrying a login is recorded by its plain address and scrubbed text only
+    /// ([`RequestDiagnostics::failed`]).
     fn fetch_answer(agent: &ureq::Agent, url: &str, detail: bool, omit: &'static [u16]) -> Result<Vec<u8>, Failure> {
         use std::io::Read;
+        let mut carried_login = false;
         // Local file failures are not network traffic.
         let local = crate::mbtiles::is_tile(url) || url.starts_with(LOCAL);
         let mut diagnostics = super::RequestDiagnostics::new(url, "GET");
@@ -1521,11 +1817,21 @@ mod native {
             let mut measuring: Option<u64> = None;
             // An `s3://` address becomes its web address, and a request to an S3 connection's
             // endpoint is signed.
-            let prepared = crate::s3::prepare(url)?;
+            crate::logins::check(url)?;
+            let prepared = crate::s3::prepare(crate::logins::inner(url))?;
             let mut at = prepared.url.clone();
+            let first_origin = crate::logins::origin(&at);
+            let mut same_origin = true;
             let mut redirects = 0;
             let mut resp = loop {
-                let mut req = agent.get(&at);
+                // The login goes to its own origin only: once a redirect leaves it, never again.
+                let bound = crate::logins::inherit(url, &at);
+                let login = if !prepared.signed && same_origin { crate::logins::apply(&bound)? } else { None };
+                carried_login |= login.is_some();
+                let mut req = agent.get(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
+                if let Some((name, value)) = login.as_ref().and_then(|a| a.header.as_ref()) {
+                    req = req.header(name.as_str(), value.as_str());
+                }
                 if let Some((a, b)) = range {
                     req = req.header("Range", &format!("bytes={a}-{b}"));
                 } else if let Some(n) = tail {
@@ -1555,9 +1861,8 @@ mod native {
                 {
                     req = req.header("X-Esri-Authorization", &auth);
                 }
-                // An error status is answered, not failed: its headers and body say who refused.
                 diagnostics.sending();
-                let mut resp = req.config().http_status_as_error(false).build().call().map_err(unanswered)?;
+                let mut resp = req.call().map_err(unanswered)?;
                 let status = resp.status().as_u16();
                 diagnostics.answered(status);
                 // A data host refusing the request (or the token): say what to do.
@@ -1588,13 +1893,16 @@ mod native {
                     }
                 }
                 if status >= 400 {
-                    // A signed request's refusal is told by its status alone: an answer's headers and
-                    // body are the server's text, and a server may echo the request's Authorization
-                    // header (the access key's id) back in it.
-                    return Err(if detail && !prepared.signed {
+                    // A signed or logged-in request's refusal is told by its status alone: a server
+                    // may echo its credentials in the answer's headers or body.
+                    return Err(if detail && !prepared.signed && login.is_none() {
                         refused(&mut resp)
                     } else {
-                        Failure::without_answer("", format!("http status: {status}"), Reason::Status(status))
+                        Failure::without_answer(
+                            "",
+                            crate::failure::with_retry_after(format!("http status: {status}"), status, retry_after_header(&resp)),
+                            Reason::Status(status),
+                        )
                     });
                 }
                 if !resp.status().is_redirection() {
@@ -1625,6 +1933,7 @@ mod native {
                 if redirects > 5 {
                     return Err("too many redirects".into());
                 }
+                same_origin &= crate::logins::origin(&next) == first_origin;
                 at = next;
             };
             if resp.status().as_u16() == 204 {
@@ -1682,7 +1991,15 @@ mod native {
             }
             Ok(buf)
         })();
-        if local { answer } else { diagnostics.record(answer) }
+        let result = if local { answer } else { diagnostics.record(answer) };
+        let result = crate::logins::check(super::resource_of(url)).map_err(Failure::from).and(result);
+        result.map_err(|mut f| {
+            if carried_login {
+                f.message = crate::logins::scrub(&f.message);
+                f.url = crate::logins::scrub(&f.url);
+            }
+            f
+        })
     }
 }
 
@@ -1694,7 +2011,7 @@ mod native {
         done(Err(format!("{url}: this build has no way to fetch tiles")));
     }
 
-    pub(super) fn download(url: String, done: DoneDetailed) {
+    pub(super) fn download_within(url: String, _timeout: std::time::Duration, _omit: &'static [u16], done: DoneDetailed) {
         let message = format!("{url}: this build has no way to fetch tiles");
         done(Err(crate::failure::Failure::new(&url, message)));
     }
@@ -1964,6 +2281,12 @@ mod tests {
         let records = network_records(&history, &url);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].network.as_ref().unwrap().status, Some(503));
+        // One that says when to ask again: its wait goes with the status, read back as the wait.
+        let wait = "HTTP/1.1 503 Unavailable\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let base = serve(vec![wait.into()]);
+        let e = native::get(&native::agent(), &format!("{base}/tiles/0/0/0.png"), &[404]).unwrap_err();
+        assert_eq!(e, "http status: 503 (retry after 30 s)");
+        assert_eq!((http_status(&e), retry_wait(&e, RETRY)), (Some(503), Duration::from_secs(30)));
         // A download's absence names the address asked for, not the module's markers.
         let base = serve(vec![not_found.into()]);
         let url = format!("{base}/data.zarr/zarr.json");
@@ -2139,6 +2462,110 @@ mod tests {
         assert_eq!(http_status("https://x.org/404/a.zarr: timed out"), None);
         assert_eq!(http_status("HTTP 4040"), None);
         assert_eq!(http_status("io: connection reset (read 404 bytes)"), None);
+        // With how long the server asked to be left: the status, and the wait.
+        assert_eq!(http_status("http status: 503 (retry after 30 s)"), Some(503));
+        assert_eq!(http_status("HTTP 429 (retry after 2 s)"), Some(429));
+        assert_eq!(http_status("HTTP 429 (something else)"), None);
+        assert_eq!(retry_after("http status: 503 (retry after 30 s)"), Some(Duration::from_secs(30)));
+        assert_eq!(retry_after("http status: 503"), None);
+        assert_eq!(retry_after("x (retry after 18446744073709551615 s)"), Some(Duration::from_secs(3600)), "bounded, never overflowing");
+        assert_eq!(retry_after("x (retry after 0 s)"), Some(Duration::from_secs(1)));
+        assert_eq!(retry_wait("HTTP 429 (retry after 2 s)", RETRY), Duration::from_secs(2));
+        assert_eq!(retry_wait("http status: 500", RETRY), RETRY);
+    }
+
+    /// A read that fails again waits twice as long each time, within the hour: a file that never
+    /// reads isn't asked for every minute all session.
+    #[test]
+    fn a_read_that_fails_again_waits_longer_each_time() {
+        let minute = Duration::from_secs(60);
+        assert_eq!(backoff(minute, 0), minute);
+        assert_eq!(backoff(minute, 1), minute);
+        assert_eq!(backoff(minute, 2), Duration::from_secs(120));
+        assert_eq!(backoff(minute, 3), Duration::from_secs(240));
+        assert_eq!(backoff(minute, 7), Duration::from_secs(3600), "within the hour");
+        assert_eq!(backoff(minute, u32::MAX), Duration::from_secs(3600), "bounded, never overflowing");
+        // A server's own wait is doubled the same way, within the hour.
+        assert_eq!(backoff(Duration::from_secs(1), 2), Duration::from_secs(2));
+        assert_eq!(backoff(Duration::from_secs(3600), 2), Duration::from_secs(3600));
+    }
+
+    /// A tile its server refused saying when to come back (429 or 503 with `Retry-After`) has the
+    /// map asked to draw again then, from the gate, on each draw while it waits (the alarm is
+    /// one-shot, and another may have fired since; the failure arms it first). The alarm is the
+    /// earliest pending one, read here as the map reads it. The entry is stored as a failed fetch
+    /// stores it: the fetcher is one for the process, and another test's may be in.
+    #[test]
+    fn a_tile_refused_with_retry_after_has_the_map_drawn_again_then() {
+        // Its turn at the cache (the entry is planted in it, and another test's clearing would
+        // drop it) and at the alarms.
+        let _turn = super::turn();
+        let _alarm = super::alarm_turn();
+        let within = |secs: u64| super::next_alarm().is_some_and(|d| d <= Duration::from_secs(secs));
+        let url = "test://cache/busy.json";
+        store(url, Entry::Failed("http status: 503 (retry after 2 s)".into(), Instant::now()));
+        super::clear_alarms();
+        let State::Failed(e) = get(url, Want::Json) else { panic!("not failed") };
+        assert!(e.contains("retry after 2 s"), "{e}");
+        assert!(within(2), "no alarm on a draw while waiting: {:?}", super::next_alarm());
+        // Again on the next draw: the alarm fired (or was consumed) before the wait was over.
+        super::clear_alarms();
+        assert!(matches!(get(url, Want::Json), State::Failed(_)));
+        assert!(within(2), "not armed again: {:?}", super::next_alarm());
+    }
+
+    /// A read that failed asks the map to draw again when it may be tried: the generation goes up
+    /// once that time has come.
+    #[test]
+    fn the_map_draws_again_when_a_wait_is_over() {
+        let _alarm = super::alarm_turn();
+        let before = generation();
+        notify_at(Instant::now() + Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert!(generation() > before);
+    }
+
+    /// Every wait asked for has the map drawn again when it is over, not the earliest alone: the
+    /// draw when the earlier is over may not ask for the later again (a style kept whole while
+    /// its elevation source waits), so the later is kept, and the app asked for it then.
+    #[test]
+    fn a_later_wait_isnt_lost_behind_an_earlier_one() {
+        let _alarm = super::alarm_turn();
+        let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let noted = asked.clone();
+        super::set_alarm(move |after| noted.lock().unwrap_or_else(|e| e.into_inner()).push(after));
+        super::clear_alarms();
+        let before = generation();
+        notify_at(Instant::now() + Duration::from_millis(20));
+        notify_at(Instant::now() + Duration::from_millis(150));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let earlier = generation();
+        assert!(earlier > before, "the earlier wait over");
+        // The later is still pending, and asked of the app as the earlier was over.
+        assert!(super::next_alarm().is_some_and(|d| d <= Duration::from_millis(150)), "{:?}", super::next_alarm());
+        let later = |asked: &Vec<Duration>| asked.iter().any(|d| (Duration::from_millis(30)..=Duration::from_millis(150)).contains(d));
+        assert!(later(&asked.lock().unwrap_or_else(|e| e.into_inner())), "{:?}", asked.lock().unwrap_or_else(|e| e.into_inner()));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(generation() > earlier, "the later wait over");
+        super::clear_alarm();
+    }
+
+    /// A draw before a wait is over asks the app for it again: the app's request lasts one frame,
+    /// and a draw since (the pointer moved) used it up.
+    #[test]
+    fn a_draw_before_a_wait_is_over_asks_for_it_again() {
+        let _alarm = super::alarm_turn();
+        let asked = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let noted = asked.clone();
+        super::set_alarm(move |after| noted.lock().unwrap_or_else(|e| e.into_inner()).push(after));
+        super::clear_alarms();
+        notify_at(Instant::now() + Duration::from_millis(300));
+        asked.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let _ = generation();
+        let again = asked.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|d| *d <= Duration::from_millis(300));
+        assert!(again, "{:?}", asked.lock().unwrap_or_else(|e| e.into_inner()));
+        super::clear_alarms();
+        super::clear_alarm();
     }
 
     #[test]
@@ -2201,38 +2628,410 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn serve_bytes(answers: Vec<Vec<u8>>) -> String {
-        use std::io::{Read, Write};
+        serve_recorded(answers).0
+    }
+
+    /// Reads a whole request from `stream`, body too: answering and closing while a POST's body
+    /// is still arriving resets the connection, and the client sees that instead of the answer.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut request = Vec::new();
+        let mut buf = [0u8; 2048];
+        while let Ok(n) = stream.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+            let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+            let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if request.len() >= head_end + 4 + length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn serve_recorded(answers: Vec<Vec<u8>>) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for answer in answers {
                 let Ok((mut stream, _)) = listener.accept() else { return };
-                // The whole request, body too, before answering: answering and closing while a
-                // POST's body is still arriving resets the connection, and the client sees that
-                // instead of the answer.
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-                let mut request = Vec::new();
-                let mut buf = [0u8; 2048];
-                while let Ok(n) = stream.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buf[..n]);
-                    let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
-                    let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
-                    let length = head
-                        .lines()
-                        .find_map(|line| line.strip_prefix("content-length:"))
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    if request.len() >= head_end + 4 + length {
-                        break;
-                    }
-                }
+                let _ = sent.send(read_request(&mut stream));
                 let _ = stream.write_all(&answer);
             }
         });
-        format!("http://{addr}")
+        (format!("http://{addr}"), received)
+    }
+
+    /// Serves every connection to the returned address with what `answer` gives for its request
+    /// path, sending each request to the receiver. It answers until the test binary exits, so its
+    /// thread and listener live that long.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn serve_by_path(answer: impl Fn(&str) -> Vec<u8> + Send + 'static) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let request = read_request(&mut stream);
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                let _ = sent.send(request);
+                let _ = stream.write_all(&answer(&path));
+            }
+        });
+        (format!("http://{addr}"), received)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn logins_headers_follow_same_origin_redirects() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        let (base, asked) = serve_recorded(
+            [
+                "HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile",
+            ]
+            .into_iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect(),
+        );
+        let binding = logins::activate(&base, "same-origin", Method::Header("X-Service-Key".into()), "same-origin-secret", true).unwrap();
+        let url = logins::bind(&binding, &format!("{base}/start")).unwrap();
+        assert_eq!(native::get(&native::agent(), &url, &[]).unwrap(), b"tile");
+        for request in asked.iter().take(2) {
+            assert!(request.to_ascii_lowercase().contains("x-service-key: same-origin-secret\r\n"));
+        }
+        assert!(logins::deactivate(&binding));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn logins_redirects_never_pick_up_another_origins_login() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        let (other, asked) = serve_recorded(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile".to_vec()]);
+        let base = serve(vec![format!("HTTP/1.1 302 Found\r\nLocation: {other}/tile\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")]);
+        let first = logins::activate(&base, "first", Method::Header("X-Service-Key".into()), "first-secret", true).unwrap();
+        let second = logins::activate(&other, "second", Method::Header("X-Service-Key".into()), "second-secret", true).unwrap();
+        let url = logins::bind(&first, &format!("{base}/start")).unwrap();
+        assert_eq!(native::get(&native::agent(), &url, &[]).unwrap(), b"tile");
+        let request = asked.recv_timeout(std::time::Duration::from_secs(5)).unwrap().to_ascii_lowercase();
+        assert!(!request.contains("x-service-key"));
+        assert!(!request.contains("first-secret") && !request.contains("second-secret"));
+        assert!(logins::deactivate(&first));
+        assert!(logins::deactivate(&second));
+    }
+
+    /// A failed request that carried a login is recorded by its plain address and scrubbed text:
+    /// neither the binding that names the login nor its secret reaches the history or its report.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn logins_diagnostics_never_record_the_binding_or_the_secret() {
+        let _turn = crate::cache::turn();
+        use crate::failure::Reason;
+        use crate::logins::{self, Method};
+        use rustgis_data::diagnostics::{Filter, History};
+        let refused = b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (base, asked) = serve_recorded(vec![refused; 5]);
+        let secret = "diagnostics-login-secret";
+        let binding = logins::activate(&base, "diagnostics", Method::Header("X-Service-Key".into()), secret, true).unwrap();
+        let history = History::default();
+        let _scope = history.enter();
+        let plain = format!("{base}/data.parquet");
+        let url = logins::bind(&binding, &plain).unwrap();
+        let prefix = rustgis_data::login_address::PREFIX;
+        assert!(url.contains(&binding) && url.contains(prefix));
+        let agent = native::agent();
+        // A whole read, a range read, an expected status (omitted: said once per server), a HEAD
+        // and a POST: every request goes with the login, and each failure is recorded.
+        native::get(&agent, &url, &[]).unwrap_err();
+        native::get(&agent, &format!("{url}{RANGE}0-9"), &[]).unwrap_err();
+        native::get(&agent, &url, &[503]).unwrap_err();
+        native::head_with(&agent, &url).unwrap_err();
+        native::post_with(&agent, &url, "{}").unwrap_err();
+        for request in asked.iter().take(5) {
+            assert!(request.to_ascii_lowercase().contains(&format!("x-service-key: {secret}\r\n")), "{request}");
+        }
+        // A server that echoes the credential, and a transport error that names the address.
+        let diagnostics = RequestDiagnostics::new(&url, "GET");
+        diagnostics.failed(&Failure::without_answer("", format!("the server repeated {secret}"), Reason::Other));
+        let echoed = vec![("www-authenticate".to_string(), format!("Bearer realm={secret}"))];
+        diagnostics.failed(&Failure::answered("", 401, &echoed, &[]));
+        diagnostics.failed(&Failure::new(&url, format!("{url}: connection reset")));
+        let records = history.records();
+        // Five requests (the omitted status as a single absence note) and three synthetic failures.
+        assert_eq!(records.len(), 8, "{records:?}");
+        assert_eq!(network_records(&history, &plain).len(), 8, "every record names the plain address: {records:?}");
+        let everything = format!("{records:?}\n{}", history.report(Filter::All));
+        for private in [binding.as_str(), secret, prefix] {
+            assert!(!everything.contains(private), "{private} reached the diagnostics: {everything}");
+        }
+        assert!(everything.contains(&plain));
+        assert!(logins::deactivate(&binding));
+    }
+
+    /// Once any hop carried a login, a later anonymous hop must not regain response details.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn delayed_head_refusal_after_cross_origin_redirect_is_status_only() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        use rustgis_data::diagnostics::{Capture, Filter, History};
+        use std::io::{Read, Write};
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = format!("http://{}", listener.local_addr().unwrap());
+        let secret = "redirect-head-sentinel-757";
+        let (received_tx, received_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 2048];
+            while request.len() < 32768 && !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            assert!(request.ends_with(b"\r\n\r\n"));
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("HEAD /refused HTTP/1.1\r\n"));
+            assert!(!request.to_ascii_lowercase().contains("x-key:") && !request.contains(secret));
+            received_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            write!(stream, "HTTP/1.1 403 Forbidden\r\nx-request-id: {secret}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let (base, asked) = serve_recorded(vec![
+            format!("HTTP/1.1 302 Found\r\nLocation: {other}/refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes(),
+        ]);
+        let binding = logins::activate(&base, "redirect-head", Method::Header("X-Key".into()), secret, true).unwrap();
+        let foreign = logins::activate(&other, "foreign-head", Method::Header("X-Key".into()), "foreign-head-secret", true).unwrap();
+        let url = logins::bind(&binding, &format!("{base}/start")).unwrap();
+        let history = History::default();
+        let _scope = history.enter();
+        let capture = Capture::current();
+        let worker = std::thread::spawn(move || {
+            let _scope = capture.enter();
+            native::head_with(&native::agent(), &url)
+        });
+        let request = asked.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(request.to_ascii_lowercase().contains(&format!("x-key: {secret}\r\n")));
+        received_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(logins::deactivate(&binding));
+        release_tx.send(()).unwrap();
+        // Other parallel tests can register short credentials that scrub ordinary message
+        // words. Check the failure status here and its structured diagnostic status below.
+        assert!(worker.join().unwrap().unwrap_err().contains("403"));
+        server.join().unwrap();
+        let records = history.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].network.as_ref().unwrap().status, Some(403));
+        let text = format!("{records:?}\n{}", history.report(Filter::All));
+        assert!(text.contains("403"));
+        assert!(!text.contains(secret) && !text.contains("x-request-id") && !text.contains("foreign-head-secret"));
+        assert!(logins::deactivate(&foreign));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn logins_head_and_post_carry_the_login() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (base, asked) = serve_recorded(vec![answer.clone(), answer]);
+        let binding = logins::activate(&base, "head-post", Method::Header("X-Service-Key".into()), "head/post secret", true).unwrap();
+        let url = logins::bind(&binding, &format!("{base}/data?key=a%2Fb")).unwrap();
+        let agent = native::agent();
+        native::head_with(&agent, &url).unwrap();
+        assert!(native::post_with(&agent, &url, "{}").unwrap().is_empty());
+        for (method, request) in ["HEAD", "POST"].into_iter().zip(asked.iter().take(2)) {
+            assert!(request.starts_with(&format!("{method} /data?key=a%2Fb HTTP/1.1\r\n")), "{request}");
+            assert!(request.to_ascii_lowercase().contains("x-service-key: head/post secret\r\n"));
+        }
+        assert!(logins::deactivate(&binding));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn live_connection_bindings_separate_requests_and_cache_entries() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec();
+        let (base, asked) = serve_recorded(vec![answer.clone(), answer.clone(), answer]);
+        let raw = format!("{base}/same");
+        let a = logins::activate(&base, "session-a/connection-a", Method::Header("X-Key".into()), "a", true).unwrap();
+        let b = logins::activate(&base, "session-b/connection-b", Method::Header("X-Key".into()), "b", true).unwrap();
+        let ua = logins::bind(&a, &raw).unwrap();
+        let ub = logins::bind(&b, &raw).unwrap();
+        for url in [&ua, &ub, &raw] {
+            native::get(&native::agent(), url, &[]).unwrap();
+        }
+        let requests: Vec<_> = asked.iter().take(3).map(|r| r.to_ascii_lowercase()).collect();
+        assert!(requests[0].contains("x-key: a\r\n"));
+        assert!(requests[1].contains("x-key: b\r\n"));
+        assert!(!requests[2].contains("x-key:"));
+        store(&ua, Entry::Ready(Arc::new(Payload::Json(serde_json::json!({"a": 1}))), 64));
+        assert!(peek(&ua).is_some());
+        assert!(peek(&ub).is_none() && peek(&raw).is_none());
+        assert!(logins::deactivate(&a));
+        assert!(peek(&ua).is_none());
+        assert!(matches!(get(&ua, Want::Json), State::Failed(_)));
+        let replacement = logins::activate(&base, "session-a/connection-a", Method::Header("X-Key".into()), "new", true).unwrap();
+        assert!(logins::apply(&ua).is_err());
+        assert!(logins::apply(&ub).unwrap().is_some());
+        assert!(logins::deactivate(&replacement));
+        assert!(logins::deactivate(&b));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn logout_during_pending_download_discards_old_authenticated_body() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let binding =
+            logins::activate(&base, "pending-session/connection", Method::Header("X-Key".into()), "pending-secret", true).unwrap();
+        let url = logins::bind(&binding, &format!("{base}/pending")).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap();
+            assert!(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase().contains("x-key: pending-secret"));
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nold-body").unwrap();
+        });
+        let worker_url = url.clone();
+        let worker = std::thread::spawn(move || native::get(&native::agent(), &worker_url, &[]));
+        started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(logins::deactivate(&binding));
+        let replacement =
+            logins::activate(&base, "pending-session/connection", Method::Header("X-Key".into()), "replacement-secret", true).unwrap();
+        let replacement_url = logins::bind(&replacement, &format!("{base}/pending")).unwrap();
+        assert_ne!(url, replacement_url);
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err());
+        store(&url, Entry::Ready(Arc::new(Payload::Json(serde_json::json!({"old": true}))), 64));
+        assert!(peek(&url).is_none());
+        assert!(matches!(get(&url, Want::Json), State::Failed(_)));
+        assert!(peek(&replacement_url).is_none());
+        assert!(logins::apply(&replacement_url).unwrap().is_some());
+        assert!(logins::deactivate(&replacement));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn derived_style_tilejson_sprite_and_feature_requests_carry_the_binding() {
+        let _turn = crate::cache::turn();
+        use crate::{
+            logins::{self, Method},
+            source,
+            style::Source,
+            template,
+        };
+        let style = serde_json::json!({
+            "version": 8, "sprite": "./sprite",
+            "sources": {"roads": {"type": "vector", "url": "./tiles.json"}}, "layers": []
+        });
+        let tilejson = serde_json::json!({"tiles": ["./tile/{z}/{x}/{y}.pbf"]});
+        let answer =
+            |body: String| format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes();
+        // Answered by path, for as many connections as come: a test running at once may clear the
+        // shared cache, and resolving then fetches the style again in the background, so the
+        // requests are neither five nor in a fixed order.
+        let (base, asked) = serve_by_path(move |path| {
+            if path.starts_with("/style.json") {
+                answer(style.to_string())
+            } else if path.starts_with("/tiles.json") {
+                answer(tilejson.to_string())
+            } else {
+                answer("{}".into())
+            }
+        });
+        let binding =
+            logins::activate(&base, "derived-style", Method::Header("X-Service-Key".into()), "derived-style-secret", true).unwrap();
+        let url = logins::bind(&binding, &format!("{base}/style.json")).unwrap();
+        let tilejson_url = template::join(&url, "./tiles.json");
+        // The cache is shared with tests running at once, and any of them may clear it: store the
+        // fetched documents again on each try until the style resolves from them.
+        let mut documents = Vec::new();
+        for address in [&url, &tilejson_url] {
+            let bytes = native::get(&native::agent(), address, &[]).unwrap();
+            documents.push((address.clone(), serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(), bytes.len()));
+        }
+        let spec = source::Spec {
+            kind: source::Kind::Style,
+            url: url.clone(),
+            subdomains: vec![],
+            min_zoom: 0,
+            max_zoom: 22,
+            tile_size: 256,
+            tms: false,
+            attribution: String::new(),
+            layers: vec![],
+            style_layers: String::new(),
+            hidden_layers: vec![],
+        };
+        let mut resolved = None;
+        for _ in 0..200 {
+            for (address, json, len) in &documents {
+                store(address, Entry::Ready(Arc::new(Payload::Json(json.clone())), *len));
+            }
+            if let source::Resolve::Ready(r) = source::resolve(&spec) {
+                resolved = Some(r);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let resolved = resolved.expect("style must resolve from fetched documents");
+        let Source::Vector { tiles, .. } = &resolved.style.sources[0].1 else { panic!("vector source") };
+        let tile = template::expand(&tiles[0], template::TileId { z: 0, x: 0, y: 0 }, 256, false, &[]);
+        native::get(&native::agent(), &tile, &[]).unwrap();
+        assert_eq!(resolved.sprites.len(), 1);
+        let sprite = &resolved.sprites[0].1;
+        native::get(&native::agent(), &format!("{sprite}.json"), &[]).unwrap();
+        let info = rustgis_data::ogc::FeatureInfo {
+            url: template::join(&url, "./info"),
+            layer: "roads".into(),
+            version: "1.3.0".into(),
+            formats: vec!["application/json".into()],
+            ..Default::default()
+        };
+        native::get(&native::agent(), &info.request(0.0, 0.0, 10.0).unwrap(), &[]).unwrap();
+        // Every request sent so far, background fetches included. Each of the test's own requests
+        // was sent on before its answer came back, so all of them are among these.
+        let requests: Vec<String> = asked.try_iter().collect();
+        assert!(requests.len() >= 5);
+        for request in &requests {
+            assert!(request.to_ascii_lowercase().contains("x-service-key: derived-style-secret\r\n"));
+            assert!(!request.contains("rustgis-login:"));
+        }
+        assert!(logins::deactivate(&binding));
+        assert!(matches!(source::resolve(&spec), source::Resolve::Failed(_)));
+        assert!(matches!(crate::sprite::load(&resolved.sprites, false), crate::sprite::Load::Failed));
+        assert!(crate::pmtiles::info(&url).is_err());
+        assert!(crate::cog::info(&url).is_err());
     }
 
     /// The last bytes from a store that serves ranges but answers `bytes=-n` with 501 (GitHub's
@@ -2414,6 +3213,7 @@ mod tests {
 
     #[test]
     fn fetches_through_the_fetcher_once() {
+        let _turn = crate::cache::turn();
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         set_fetcher(|url, done| {
             CALLS.fetch_add(1, Ordering::Relaxed);

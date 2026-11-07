@@ -38,20 +38,20 @@ pollster, polycool, postgres, postgres-protocol, postgres-types, presser, proc-m
 proj4rs, proj4rs-geodesic, pyo3, pyo3-build-config, pyo3-ffi, pyo3-macros, pyo3-macros-backend,
 quote, rand, range-alloc, raw-window-handle, raw-window-metal, rayon, rayon-core, regex,
 regex-automata, regex-syntax, renderdoc-sys, ring, robust, roxmltree, rstar, rustc-hash,
-rustc_version, rustix, rustls, rustls-native-certs, rustls-pemfile, rustversion, ryu, scoped-tls,
-scopeguard, secrecy, secret-service, security-framework, security-framework-sys, self_cell, semver,
-send_wrapper, seq-macro, serde, serde_core, serde_derive, serde_json, serde_repr, sha1, sha2, shlex,
-sif-itree, signal-hook-registry, simdutf8, siphasher, smallvec, smol_str, socket2, spade, spirv,
-spki, stable_deref_trait, static_assertions, syn, sys-locale, tar, tempfile, thiserror,
-thiserror-impl, tiberius-macros, time, time-core, tinyvec, tokio-postgres, ttf-parser, type-map,
-typed-path, unicode-bidi, unicode-ident, unicode-normalization, unicode-properties,
-unicode-segmentation, unicode-width, ureq, ureq-proto, url, utf8-zero, utf8_iter, uuid, vcpkg,
-vello_common, vello_cpu, version_check, wasm-bindgen, wasm-bindgen-futures, wasm-bindgen-macro,
-wasm-bindgen-macro-support, wasm-bindgen-shared, wasm-encoder, wasmi, wasmi_collections, wasmi_core,
-wasmi_ir, wasmparser, wast, wat, web-sys, weezl, wgpu, wgpu-core, wgpu-core-deps-apple,
-wgpu-core-deps-wasm, wgpu-core-deps-windows-linux-android, wgpu-hal, wgpu-naga-bridge, wgpu-types,
-whoami, winauth, wkt, wl-clipboard-rs, x11rb, x11rb-protocol, x509-cert, xattr, zeroize, zune-core,
-zune-jpeg
+rustc_version, rustix, rustls, rustls-native-certs, rustls-pemfile, rustls-platform-verifier,
+rustversion, ryu, scoped-tls, scopeguard, secrecy, secret-service, security-framework,
+security-framework-sys, self_cell, semver, send_wrapper, seq-macro, serde, serde_core, serde_derive,
+serde_json, serde_repr, sha1, sha2, shlex, sif-itree, signal-hook-registry, simdutf8, siphasher,
+smallvec, smol_str, socket2, spade, spirv, spki, stable_deref_trait, static_assertions, syn,
+sys-locale, tar, tempfile, thiserror, thiserror-impl, tiberius-macros, time, time-core, tinyvec,
+tokio-postgres, ttf-parser, type-map, typed-path, unicode-bidi, unicode-ident,
+unicode-normalization, unicode-properties, unicode-segmentation, unicode-width, ureq, ureq-proto,
+url, utf8-zero, utf8_iter, uuid, vcpkg, vello_common, vello_cpu, version_check, wasm-bindgen,
+wasm-bindgen-futures, wasm-bindgen-macro, wasm-bindgen-macro-support, wasm-bindgen-shared,
+wasm-encoder, wasmi, wasmi_collections, wasmi_core, wasmi_ir, wasmparser, wast, wat, web-sys, weezl,
+wgpu, wgpu-core, wgpu-core-deps-apple, wgpu-core-deps-wasm, wgpu-core-deps-windows-linux-android,
+wgpu-hal, wgpu-naga-bridge, wgpu-types, whoami, winauth, wkt, wl-clipboard-rs, x11rb,
+x11rb-protocol, x509-cert, xattr, zeroize, zune-core, zune-jpeg
 ====================================================================================================
 
                                  Apache License
@@ -8117,7 +8117,7 @@ DEALINGS IN THE SOFTWARE.
 
 ====================================================================================================
 Community Data License Agreement Permissive 2.0
-Used by: webpki-roots
+Used by: webpki-root-certs, webpki-roots
 ====================================================================================================
 
 # Community Data License Agreement - Permissive - Version 2.0
@@ -10724,20 +10724,6 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
-
-====================================================================================================
-MIT License
-Used by: zstd
-====================================================================================================
-
-The MIT License (MIT)
-Copyright (c) 2016 Alexandre Bury
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ====================================================================================================
 SIL Open Font License 1.1
