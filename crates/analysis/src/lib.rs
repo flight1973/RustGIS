@@ -603,14 +603,14 @@ fn validate_pole_inputs(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Resu
     Ok(())
 }
 
-/// Refuses features with finite latitudes outside the Earth instead of clamping them to a pole.
+/// Refuses latitudes outside the Earth, including infinities, instead of clamping them to a pole.
 pub fn validate_latitudes(ds: &rustgis_data::Dataset, rows: impl IntoIterator<Item = usize>) -> Result<(), String> {
     let invalid = rows
         .into_iter()
         .filter(|&row| {
             let mut invalid = false;
             if let Some(g) = ds.features.get(row).and_then(|f| f.geometry.as_ref()) {
-                g.for_each_coord(|c| invalid |= c.y.is_finite() && c.y.abs() > 90.0);
+                g.for_each_coord(|c| invalid |= c.y.abs() > 90.0);
             }
             invalid
         })
