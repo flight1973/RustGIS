@@ -41,6 +41,12 @@ struct Geo {
     referenced: bool,
 }
 
+/// Whether the first sample past the colour ones is declared alpha (extra sample 1, associated, or
+/// 2, unassociated).
+pub(super) fn extra_alpha<R: Read + Seek>(dec: &mut Decoder<R>) -> bool {
+    dec.find_tag_unsigned_vec::<u16>(Tag::ExtraSamples).ok().flatten().is_some_and(|v| matches!(v.first(), Some(1 | 2)))
+}
+
 /// How `n` samples of a grey image the decoder calls multiband are shown: grey with alpha when
 /// there are two and the second is declared alpha (extra sample 1, associated, or 2, unassociated),
 /// else grey. GDAL marks the second band of an ordinary two-band file as 0, unspecified data.
@@ -576,6 +582,9 @@ pub(crate) struct Unpaletted<R> {
     patches: Vec<(u64, [u8; 2])>,
     /// Whether the first image (the full one) is a palette image.
     first_palette: bool,
+    /// Whether the first image is an RGB image with samples past the colour ones (shown to the
+    /// decoder as grey): its first three samples are red, green and blue, every sample read.
+    first_wide_rgb: bool,
     pos: u64,
 }
 
@@ -583,13 +592,16 @@ pub(crate) struct Unpaletted<R> {
 const MAX_IFDS: usize = 64;
 const MAX_ENTRIES: u64 = 4096;
 
-/// Where the palette images' PhotometricInterpretation values are, walking the IFD chain
-/// (classic and BigTIFF). A file it can't walk has none: the decoder reports what's wrong.
-fn palette_patches<R: Read + Seek>(r: &mut R) -> (Vec<(u64, [u8; 2])>, bool) {
+/// Where the palette images' PhotometricInterpretation values are, and those of RGB images with
+/// samples past the colour ones (which the decoder would leave out, or refuse), walking the IFD
+/// chain (classic and BigTIFF). A file it can't walk has none: the decoder reports what's wrong.
+/// Returns the patches, whether the first image is a palette image, and whether it is such an RGB
+/// image.
+fn palette_patches<R: Read + Seek>(r: &mut R) -> (Vec<(u64, [u8; 2])>, bool, bool) {
     use std::io::SeekFrom;
     let mut patches = Vec::new();
-    // Whether the first image is one of them.
-    let mut first = false;
+    // Whether the first image is one of them, and whether it is an RGB image with more samples.
+    let (mut first, mut first_wide) = (false, false);
     let mut walk = || -> Option<()> {
         let mut head = [0u8; 16];
         r.seek(SeekFrom::Start(0)).ok()?;
@@ -636,16 +648,35 @@ fn palette_patches<R: Read + Seek>(r: &mut R) -> (Vec<(u64, [u8; 2])>, bool) {
             }
             let mut entries = vec![0u8; usize::try_from(n * entry_len).ok()?];
             r.read_exact(&mut entries).ok()?;
+            let value_at = if big { 12 } else { 8 };
+            let grey = if little { [1, 0] } else { [0, 1] };
+            // PhotometricInterpretation (262): where its value is, and the value; SamplesPerPixel
+            // (277); the first ExtraSamples (338) value, when it is inline. Each a SHORT, as the
+            // decoder itself requires of them.
+            let (mut photometric, mut samples, mut extra) = (None, 1u16, None);
             for (i, e) in entries.chunks(entry_len as usize).enumerate() {
-                // PhotometricInterpretation (262), a SHORT, its value inline.
-                if u16_(e)? == 262 && u16_(e.get(2..)?)? == 3 {
-                    let value_at = if big { 12 } else { 8 };
-                    if u16_(e.get(value_at..)?)? == 3 {
-                        let at = ifd + count_len + i as u64 * entry_len + value_at as u64;
-                        patches.push((at, if little { [1, 0] } else { [0, 1] }));
-                        first |= k == 0;
+                let short = u16_(e.get(2..)?)? == 3;
+                match u16_(e)? {
+                    262 if short => {
+                        photometric = Some((ifd + count_len + i as u64 * entry_len + value_at as u64, u16_(e.get(value_at..)?)?))
                     }
+                    277 if short => samples = u16_(e.get(value_at..)?)?,
+                    338 if short => extra = u16_(e.get(value_at..)?),
+                    _ => {}
                 }
+            }
+            match photometric {
+                Some((at, 3)) => {
+                    patches.push((at, grey));
+                    first |= k == 0;
+                }
+                // An RGB image whose fourth sample isn't alpha, or with five or more: RGBI
+                // orthophotos, multispectral images.
+                Some((at, 2)) if samples > 4 || (samples == 4 && !matches!(extra, Some(1 | 2))) => {
+                    patches.push((at, grey));
+                    first_wide |= k == 0;
+                }
+                _ => {}
             }
             let mut next = [0u8; 8];
             r.read_exact(&mut next[..next_len]).ok()?;
@@ -654,7 +685,7 @@ fn palette_patches<R: Read + Seek>(r: &mut R) -> (Vec<(u64, [u8; 2])>, bool) {
         Some(())
     };
     let _ = walk();
-    (patches, first)
+    (patches, first, first_wide)
 }
 
 /// Any reader, boxed: the decoder is compiled once for every kind of source (a file, bytes in
@@ -676,13 +707,18 @@ impl<R> Unpaletted<R> {
     pub(crate) fn first_is_palette(&self) -> bool {
         self.first_palette
     }
+
+    /// Whether the first image is an RGB image with more samples than its colours.
+    pub(crate) fn first_is_wide_rgb(&self) -> bool {
+        self.first_wide_rgb
+    }
 }
 
 impl<R: Read + Seek> Unpaletted<R> {
     fn new(mut inner: R) -> std::io::Result<Self> {
-        let (patches, first_palette) = palette_patches(&mut inner);
+        let (patches, first_palette, first_wide_rgb) = palette_patches(&mut inner);
         inner.seek(std::io::SeekFrom::Start(0))?;
-        Ok(Unpaletted { inner, patches, first_palette, pos: 0 })
+        Ok(Unpaletted { inner, patches, first_palette, first_wide_rgb, pos: 0 })
     }
 }
 
@@ -1026,6 +1062,7 @@ pub(super) fn read_limited_with_nodata(
     // COG window has it: a grey full image's stray colour table colours nothing, nor do palette
     // overviews of it.
     let palette = r.first_is_palette();
+    let wide_rgb = r.first_is_wide_rgb();
     let limits = {
         let mut l = Limits::default();
         l.decoding_buffer_size = max_samples().saturating_mul(4);
@@ -1161,6 +1198,11 @@ pub(super) fn read_limited_with_nodata(
                 None => None,
             };
             (1, table.map_or(ColorHint::Gray, ColorHint::Palette))
+        }
+        // An RGB image with more bands (shown to the decoder as grey, see `Unpaletted`): every
+        // band, the first three red, green and blue.
+        ColorType::Multiband { num_samples, .. } if wide_rgb && num_samples >= 3 => {
+            (num_samples as usize, ColorHint::Rgb { alpha: extra_alpha(&mut dec) })
         }
         ColorType::Multiband { num_samples, .. } => (num_samples.max(1) as usize, multiband_color(&mut dec, num_samples)),
         other => return Err(err(format!("{other:?} images aren't supported"))),
@@ -1391,12 +1433,43 @@ pub fn written_bands(r: &Raster, band: usize) -> Vec<usize> {
 /// Writes a raster as a Deflate-compressed GeoTIFF: a colour raster's colour bands (RGB(A) bytes
 /// when they are 8-bit, else 32-bit floats, alpha kept), so it reads back in colour; otherwise
 /// `band` (0-based) as 32-bit floats. `band` is for rasters that aren't colour ones: a colour
-/// raster always writes its colour bands, as its 8-bit form did before.
+/// raster always writes its colour bands, as its 8-bit form did before. A cancelled run stops
+/// it (with [`DataError::Cancelled`]) within a strip.
 pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
+    match encode(r, band) {
+        Ok(bytes) => Ok(bytes),
+        // The encoder's error for a cancel only says the write stopped.
+        Err(e) => crate::progress::check().and(Err(e)),
+    }
+}
+
+/// The file's bytes, written by the encoder a strip's compressed output at a time: each write
+/// fails once the run was cancelled. It counts no progress: the encoder doesn't say where a
+/// strip ends.
+struct Probed<W>(W);
+
+impl<W: std::io::Write> std::io::Write for Probed<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        crate::progress::check().map_err(std::io::Error::other)?;
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<W: Seek> Seek for Probed<W> {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(pos)
+    }
+}
+
+/// [`write`], a cancel failing as any write error does.
+fn encode(r: &Raster, band: usize) -> Result<Vec<u8>> {
     use tiff::encoder::{Compression, DeflateLevel, TiffEncoder, colortype};
     // A scan's place is only where it was laid on the view: not coordinates to write into a file.
     r.require_coordinates().map_err(err)?;
-    let mut out = std::io::Cursor::new(Vec::new());
+    let mut out = Probed(std::io::Cursor::new(Vec::new()));
     let mut enc = TiffEncoder::new(&mut out).map_err(err)?.with_compression(Compression::Deflate(DeflateLevel::Balanced));
     let gt = r.transform;
     if gt.pixel_height > 0.0 || gt.pixel_width < 0.0 {
@@ -1491,7 +1564,7 @@ pub fn write(r: &Raster, band: usize) -> Result<Vec<u8>> {
         tags!(img, &[band]);
         img.write_data(&b.data).map_err(err)?;
     }
-    Ok(out.into_inner())
+    Ok(out.0.into_inner())
 }
 
 #[cfg(test)]
@@ -2040,11 +2113,12 @@ mod tests {
         // columns down its west edge, the padding of each row's last tile spilt into the next row.
         let pixel = |b: u32, x: u32, y: u32| ((x + 3 * y + 60 * b) % 250 + 1) as u8;
         let bytes = rgbi_tiled(&[(40, 16), (20, 16)], pixel);
+        // Its near-infrared band is read too, the fourth, after red, green and blue.
         let check = |r: &Raster, k: u32| {
-            assert_eq!((r.band_count(), r.color.clone()), (3, ColorHint::Rgb { alpha: false }));
+            assert_eq!((r.band_count(), r.color.clone()), (4, ColorHint::Rgb { alpha: false }));
             for y in 0..r.height {
                 for x in 0..r.width {
-                    for b in 0..3 {
+                    for b in 0..4 {
                         let want = f32::from(pixel(b, x * k, y * k));
                         assert_eq!(r.value(b as usize, i64::from(x), i64::from(y)), Some(want), "band {b} at {x},{y} (k {k})");
                     }

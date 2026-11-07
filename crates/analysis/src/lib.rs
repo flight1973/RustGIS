@@ -28,6 +28,7 @@ pub mod neural;
 mod parallel;
 mod parameters;
 pub mod rasterops;
+mod repair;
 pub mod selection;
 pub mod sketch_edit;
 mod stats;
@@ -35,6 +36,7 @@ pub mod tissot;
 mod tools;
 pub mod topology;
 pub mod trend;
+mod validity;
 pub mod warp;
 
 pub use attribute_join::{DuplicateStrategy, JoinFieldOptions, JoinFieldReport, join_field};
@@ -472,13 +474,23 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
 /// and what it made by then is never taken for its result. One cancelled before it starts doesn't
 /// start.
 pub fn run_with(id: &str, inputs: &dyn Inputs, params: &Value, control: &std::sync::Arc<control::Control>) -> Result<ToolResult, String> {
+    run_under(tool(id).map_or(id, |t| t.name), control, || run(id, inputs, params))
+}
+
+/// `work` on this thread under `control`, as [`run_with`] runs a tool, for work that isn't one (an
+/// engine command's raster): setting `control`'s flag from another thread stops it at its next
+/// check, its count follows the work's progress, and a cancelled run's error says how far `name`
+/// came.
+pub fn run_under<T>(name: &str, control: &std::sync::Arc<control::Control>, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     if control.is_cancelled() {
-        return Err(format!("{} was cancelled before it started", tool(id).map_or(id, |t| t.name)));
+        return Err(format!("{name} was cancelled before it started"));
     }
     let _current = control::install(Some(control.clone()));
-    // No count until the tool starts one: a control used before doesn't show that run's.
+    // A file the work writes or reads counts and stops with it too.
+    let _data = rustgis_data::progress::install(Some(control.clone()));
+    // No count until the work starts one: a control used before doesn't show that run's.
     control::begin(0);
-    let res = run(id, inputs, params);
+    let res = work();
     if !control.is_cancelled() {
         // Finished: its last step is all done, however it counted. A failed one stays where it
         // stopped.
@@ -487,7 +499,6 @@ pub fn run_with(id: &str, inputs: &dyn Inputs, params: &Value, control: &std::sy
         }
         return res;
     }
-    let name = tool(id).map_or(id, |t| t.name);
     Err(match control.progress() {
         Some((done, total)) => {
             format!("{name} was cancelled {}% of the way through its current step", done.saturating_mul(100) / total.max(1))

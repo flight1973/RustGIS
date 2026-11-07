@@ -11,9 +11,9 @@ fn parse_and_escape() {
 #[test]
 fn every_catalog_parses_cleanly_and_keeps_placeholders() {
     for l in &LANGUAGES[1..] {
-        let (m, errors) = parse(l.source);
+        let (catalog, errors) = parse_catalog(l.source);
         assert!(errors.is_empty(), "{}: {errors:?}", l.code);
-        for (en, tr) in &m {
+        for (en, tr) in catalog.values().flat_map(|entries| entries.iter()) {
             let names = |s: &str| -> Vec<String> {
                 let mut v: Vec<String> = s.split('{').skip(1).filter_map(|p| p.split_once('}').map(|x| x.0.to_string())).collect();
                 v.sort();
@@ -32,6 +32,8 @@ fn lookup_fallback_and_tags() {
     assert_eq!(lang_from_tag("pt-BR").map(Lang::code), Some("pt"));
     assert_eq!(lang_from_tag("bn-BD").map(Lang::code), Some("bn"));
     assert_eq!(lang_from_tag("pl_PL.UTF-8").map(Lang::code), Some("pl"));
+    assert_eq!(lang_from_tag("el_GR.UTF-8").map(Lang::code), Some("el"));
+    assert_eq!(lang_from_tag("el-CY").map(Lang::code), Some("el"));
     assert_eq!(lang_from_tag("zh-Hans-CN").map(Lang::code), Some("zh"));
     assert_eq!(lang_from_tag("zh_CN.UTF-8").map(Lang::code), Some("zh"));
     assert_eq!(lang_from_tag("zh-TW"), None);
@@ -63,6 +65,16 @@ fn polish_registration_and_fallback() {
 }
 
 #[test]
+fn greek_registration_and_fallback() {
+    let el = Lang::from_code("el").unwrap_or(Lang::EN);
+    assert_eq!(el.name(), "Ελληνικά");
+    assert_eq!(el.english(), "Greek");
+    assert_eq!(el.script(), Script::Alphabetic);
+    assert_eq!(tr(el, "Open"), "Άνοιγμα");
+    assert_eq!(tr(el, "A string not in the Greek catalog"), "A string not in the Greek catalog");
+}
+
+#[test]
 fn plugin_strings_use_the_plugins_translations() {
     use rustgis_engine::plugins;
     let pkg = plugins::Package::from_zip(&plugins::testing::package("i18n-fallback", &[])).unwrap();
@@ -73,7 +85,7 @@ fn plugin_strings_use_the_plugins_translations() {
     assert_eq!(tr(Lang::EN, "Hello"), "Hello");
     assert_eq!(tr(Lang::from_code("fr").unwrap(), "Hello"), "Hello");
     // RustGIS's own catalog comes first.
-    assert_eq!(tr(de, "Open"), de.0.catalog().get("Open").copied().unwrap_or("Open"));
+    assert_eq!(tr(de, "Open"), de.0.lookup("", "Open", false).unwrap_or("Open"));
     plugins::unload("i18n-fallback");
 }
 
@@ -268,4 +280,48 @@ fn vn2000_translations_in_vietnamese_catalog() {
         tr(vi, "Vietnam national coordinate system (VN-2000) UTM zone 49N (108°E–114°E, central meridian 111°E)."),
         "Hệ tọa độ quốc gia Việt Nam (VN-2000) múi chiếu UTM 49N (108°Đ–114°Đ, kinh tuyến trục 111°Đ)."
     );
+}
+
+#[test]
+fn contexts_keep_homographs_separate_and_report_duplicate_lines() {
+    let (catalog, errors) = parse_catalog(
+        "Open\tDefault\nverb\tOpen\tÖffnen\nstate\tOpen\tOffen\n\tOpen\tDuplicate\nverb\tOpen\tDuplicate\nx\tKey\tValue\textra\n",
+    );
+    assert_eq!(catalog[""]["Open"], "Default");
+    assert_eq!(catalog["verb"]["Open"], "Öffnen");
+    assert_eq!(catalog["state"]["Open"], "Offen");
+    assert_eq!(errors.len(), 3);
+    assert!(errors[0].starts_with("line 4: duplicate"));
+    assert!(errors[1].starts_with("line 5: duplicate"));
+    assert!(errors[2].starts_with("line 6: expected"));
+}
+
+#[test]
+fn context_lookup_fallback_macros_and_formatted_values() {
+    static INFO: LangInfo = LangInfo {
+        code: "test",
+        name: "Test",
+        english: "Test",
+        script: Script::Alphabetic,
+        source: "Open\tDefault\nverb\tOpen\tÖffnen\nstate\tOpen\tOffen\ncount\t{n} open\t{n} offen\nrtl\tOpen\tباز RustGIS\n",
+        catalog: OnceLock::new(),
+        visual: OnceLock::new(),
+    };
+    let lang = Lang(&INFO);
+    assert_eq!(tr_context(lang, "verb", "Open"), "Öffnen");
+    assert_eq!(tr_context(lang, "state", "Open"), "Offen");
+    assert_eq!(tr_context(lang, "unknown", "Open"), "Default");
+    assert_eq!(tr_context(lang, "verb", "Missing"), "Missing");
+    assert_eq!(tr_context(Lang::EN, "verb", "Open"), "Open");
+    let previous = current();
+    set_current(lang);
+    // Restore the thread-local language even if an assertion panics.
+    let result = std::panic::catch_unwind(|| {
+        assert_eq!(tl!("Open", context = "verb"), "Öffnen");
+        assert_eq!(tl_raw!("Open", context = "rtl"), "باز RustGIS");
+        assert_eq!(tl!("Open", context = "rtl"), rtl::visual("باز RustGIS"));
+        assert_eq!(fmt_context("count", "{n} open", &[("n", "{literal}")]), "{literal} offen");
+    });
+    set_current(previous);
+    result.unwrap();
 }

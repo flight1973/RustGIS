@@ -171,6 +171,9 @@ pub fn is_tile(url: &str) -> bool {
 /// (As `rustgis_map::tiles::is_local_archive` decides it, which a layer's address went through.)
 /// An address read through a saved S3 connection is never a file, well formed or not.
 pub fn is_local(archive: &str) -> bool {
+    if rustgis_data::login_address::is_wrapper(archive) {
+        return false;
+    }
     if rustgis_data::s3_address::is_wrapper(archive) {
         return false;
     }
@@ -410,11 +413,19 @@ pub(crate) fn forget_archive(archive: &str) {
 /// An archive's header and metadata: `Ok(None)` while they are read (the map draws again once
 /// they arrive).
 pub fn info(archive: &str) -> Result<Option<Arc<Info>>, String> {
+    crate::logins::check(archive).map_err(str::to_string)?;
     let mut all = archives().lock().unwrap_or_else(|e| e.into_inner());
     match all.get(archive) {
         Some(State::Ready(i)) => return Ok(Some(i.clone())),
         Some(State::Loading(_)) => return Ok(None),
-        Some(State::Failed(e, at)) if at.elapsed() < RETRY => return Err(e.clone()),
+        Some(State::Failed(e, at)) => {
+            // Not read again until its wait is over: the map draws again then.
+            let wait = crate::cache::retry_wait(e, RETRY);
+            if at.elapsed() < wait {
+                crate::cache::notify_at(*at + wait);
+                return Err(e.clone());
+            }
+        }
         _ => {}
     }
     all.insert(archive.to_string(), State::Loading(Vec::new()));
@@ -434,6 +445,10 @@ pub fn info_blocking(archive: &str, timeout: std::time::Duration) -> Result<Arc<
 
 /// Calls `f` with the archive's info, once it is read.
 fn with_info(archive: &str, f: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
+    if let Err(e) = crate::logins::check(archive) {
+        f(Err(e.to_string()));
+        return;
+    }
     let mut all = archives().lock().unwrap_or_else(|e| e.into_inner());
     match all.get_mut(archive) {
         Some(State::Ready(i)) => {
@@ -442,7 +457,8 @@ fn with_info(archive: &str, f: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>
             f(Ok(i));
         }
         Some(State::Loading(waiting)) => waiting.push(f),
-        Some(State::Failed(e, at)) if at.elapsed() < RETRY => {
+        Some(State::Failed(e, at)) if at.elapsed() < crate::cache::retry_wait(e, RETRY) => {
+            crate::cache::notify_at(*at + crate::cache::retry_wait(e, RETRY));
             let e = e.clone();
             drop(all);
             f(Err(e));
@@ -492,7 +508,11 @@ fn load(archive: String) {
 }
 
 fn finish(archive: &str, r: Result<Info, String>) {
-    let r = r.map(Arc::new);
+    let r = crate::logins::check(archive)
+        .map_err(str::to_string)
+        .and(r)
+        .map(Arc::new)
+        .map_err(|e| if rustgis_data::login_address::is_wrapper(archive) { crate::logins::scrub(&e) } else { e });
     let waiting = {
         let mut all = archives().lock().unwrap_or_else(|e| e.into_inner());
         let old = match &r {
@@ -500,7 +520,12 @@ fn finish(archive: &str, r: Result<Info, String>) {
             // A read the busy queue dropped isn't the archive's fault: forgotten, so the next
             // draw reads it again, rather than kept as a failure.
             Err(e) if e == crate::cache::DROPPED => all.remove(archive),
-            Err(e) => all.insert(archive.to_string(), State::Failed(e.clone(), Instant::now())),
+            Err(e) => {
+                // Read again once its wait is over: the map draws again then (a 429 or 503 says
+                // when).
+                crate::cache::notify_at(Instant::now() + crate::cache::retry_wait(e, RETRY));
+                all.insert(archive.to_string(), State::Failed(e.clone(), Instant::now()))
+            }
         };
         match old {
             Some(State::Loading(w)) => w,
@@ -1027,6 +1052,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_raster_archive_resolves_and_decodes_and_truncations_fail_cleanly() {
+        let _turn = crate::cache::turn();
         let dir = std::env::temp_dir().join(format!("rustgis-pmtiles-raster-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut png = Vec::new();

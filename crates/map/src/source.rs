@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 mod render_lod;
 mod window;
+pub(crate) use window::Query;
 
 /// Retained streamed rows and geometry caches per map; excludes scratch and render/export copies.
 pub const VIEW_BYTES: usize = if cfg!(target_arch = "wasm32") { 48 * 1024 * 1024 } else { 128 * 1024 * 1024 };
@@ -80,6 +81,9 @@ pub struct SourceLayer {
     pub(crate) saved_selection: Vec<u64>,
     #[serde(skip)]
     pub(crate) window_fields: Option<usize>,
+    /// The layer's definition query, applied while a view is read rather than to the rows read.
+    #[serde(skip)]
+    pub(crate) query: Option<Query>,
     /// A source by its web address being opened (its header or footer being fetched).
     #[serde(skip)]
     opening: Option<Opening>,
@@ -514,6 +518,8 @@ pub struct Window {
     pub matched: u64,
     /// How many were read.
     pub kept: usize,
+    /// The read kept the definition query's matches: `matched` counts them.
+    pub filtered: bool,
 }
 
 /// A read in flight.
@@ -525,9 +531,9 @@ struct Pending {
 /// A source being opened off the frame.
 type Opening = Arc<Mutex<Option<Result<Arc<dyn FeatureSource>, String>>>>;
 
-/// Tells the app something landed (a read, or a source opened by its address).
-pub(crate) fn landed() {
-    GENERATION.fetch_add(1, Ordering::Relaxed);
+/// Asks the app for a frame (the waker) with nothing new to draw: what landed while the map drew
+/// is said a frame after (see [`wake`] for something new to draw).
+pub(crate) fn another_frame() {
     if let Some(w) = waker().lock().ok().and_then(|w| w.clone()) {
         w();
     }
@@ -800,7 +806,7 @@ impl SourceLayer {
                         if let Ok(mut s) = land.lock() {
                             *s = Some(r.map(Arc::from).map_err(|e| e.to_string()));
                         }
-                        landed();
+                        wake();
                     }),
                 );
                 Ok(())
@@ -833,7 +839,7 @@ impl SourceLayer {
                 if let Ok(mut s) = land.lock() {
                     *s = Some(r);
                 }
-                landed();
+                wake();
             }),
         );
         Ok(())
@@ -871,6 +877,25 @@ impl SourceLayer {
 
     pub fn is_open(&self) -> bool {
         self.handle.is_some()
+    }
+
+    /// When `query` (on a layer of `fields`) can filter only a sample of a view, the source's
+    /// feature count (`None` when it doesn't say) and the most a view reads. That is when the view
+    /// isn't walked with it (a database, GeoJSON or LiDAR read in place, a file by its web address,
+    /// or a query using a row number), and the source holds more features than a view reads,
+    /// doesn't say how many, or the view read now is already a sample (of more bytes than a view
+    /// holds). `None` until open.
+    pub fn query_sample(&self, query: &str, fields: &[rustgis_data::Field]) -> Option<(Option<u64>, usize)> {
+        let h = self.handle.as_ref()?;
+        let most = match self.limit {
+            0 if h.remote().is_some() => REMOTE_VIEW_LIMIT,
+            0 => VIEW_LIMIT,
+            n => n,
+        };
+        let count = h.info().count;
+        let query = Query { text: query.to_string(), fields: fields.to_vec() };
+        let crowded = count.is_none_or(|c| c > most as u64) || self.sampled().is_some();
+        (window::walked(h.as_ref(), &query).is_none() && crowded).then_some((count, most))
     }
 
     pub fn info(&self) -> Option<&SourceInfo> {
@@ -915,10 +940,58 @@ impl SourceLayer {
         self.open()
     }
 
+    /// Leaves a read under way to the layer this one was copied from, which takes it when it
+    /// lands: a copy drawn elsewhere (an export on a thread of its own) reads what it needs for
+    /// itself. The two would otherwise share the read, and the one that didn't take it would wait
+    /// for it forever. The copy decides its thinning by itself too, so the map's redraws never
+    /// wait for the export's.
+    pub fn detach_read(&mut self) {
+        self.pending = None;
+        self.render_lod = Default::default();
+    }
+
+    /// Whether `other` (a copy of this one) reads the same source the same way: the same file and
+    /// table, opened by the same open. One opened afresh since (`reopen`, a table replaced) is
+    /// another, whatever its path.
+    pub fn same_opening(&self, other: &SourceLayer) -> bool {
+        let handles = match (&self.handle, &other.handle) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        // A source by its web address still opening: the same open shares its slot.
+        let openings = match (&self.opening, &other.opening) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        handles && openings && self.path == other.path && self.table == other.table
+    }
+
     /// Forgets the window, so the next view reads again (after the source changes).
     pub fn reset(&mut self) {
         self.render_lod = Default::default();
         self.reset_window();
+    }
+
+    /// Reads the view again, keeping the selection parked for the next read.
+    pub(crate) fn reread(&mut self) {
+        let selected = std::mem::take(&mut self.saved_selection);
+        self.reset_window();
+        self.saved_selection = selected;
+    }
+
+    /// Applies the layer's definition query (`fields` are the layer's) as views are read; a
+    /// different one reads the view again.
+    pub(crate) fn set_query(&mut self, text: Option<&str>, fields: &[rustgis_data::Field]) {
+        let text = text.map(str::trim).filter(|t| !t.is_empty());
+        if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice())) != text.map(|t| (t, fields)) {
+            self.query = text.map(|t| Query { text: t.to_string(), fields: fields.to_vec() });
+            // A source that can't be walked reads the same rows whatever the query.
+            if self.handle.as_ref().is_some_and(|h| h.visits_chunks()) {
+                self.reread();
+            }
+        }
     }
 
     /// Drops disposable view rows while retaining decisions about the unchanged full source.
@@ -968,6 +1041,7 @@ impl SourceLayer {
         let estimate = self.estimated_row_bytes;
         let full_read = self.full_read;
         let fields = self.window_fields;
+        let query = self.query.clone();
         let pending = Arc::new(Pending { extent, result: Mutex::new(None) });
         let p = pending.clone();
         // A source by its web address: the read runs as its bytes land (on the desktop and in
@@ -976,7 +1050,7 @@ impl SourceLayer {
             let (h2, p2) = (h.clone(), p.clone());
             let work = Arc::new(move || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    window::read_mode(h2.as_ref(), &req, budget, &projection, estimate, full_read, fields)
+                    window::read_mode(h2.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
                 }))
                 .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
             });
@@ -987,7 +1061,7 @@ impl SourceLayer {
                     if let Ok(mut slot) = p2.result.lock() {
                         *slot = Some(r.map_err(|e| e.to_string()));
                     }
-                    landed();
+                    wake();
                 }),
             );
             self.pending = Some(pending);
@@ -996,7 +1070,7 @@ impl SourceLayer {
         }
         let job = move || {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields)
+                window::read_mode(h.as_ref(), &req, budget, &projection, estimate, full_read, fields, query.as_ref())
             }))
             .unwrap_or_else(|_| Err(rustgis_data::DataError::Format("the read failed unexpectedly".into())))
             .map_err(|e| e.to_string());
@@ -1023,7 +1097,7 @@ impl SourceLayer {
                 Err(e) => {
                     self.saved_selection.clear();
                     self.error = Some(format!("couldn't start reading the layer: {e}"));
-                    self.window = Some(Window { extent, complete: true, matched: 0, kept: 0 });
+                    self.window = Some(Window { extent, complete: true, matched: 0, kept: 0, filtered: false });
                 }
             }
             return;
@@ -1043,8 +1117,9 @@ impl SourceLayer {
                 Some(Ok((b, cache))) => {
                     self.pending = None;
                     self.estimated_row_bytes = cache.mean_bytes;
+                    let filtered = cache.filtered;
                     self.ready_cache = Some(cache);
-                    let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len() };
+                    let w = Window { extent: p.extent, complete: b.complete, matched: b.matched, kept: b.features.len(), filtered };
                     self.window = Some(w);
                     self.error = None;
                     return Polled::Done(w, b);
@@ -1055,7 +1130,7 @@ impl SourceLayer {
                     self.saved_selection.clear();
                     self.error = Some(e.clone());
                     // Not read again until the view moves past it.
-                    self.window = Some(Window { extent: p.extent, complete: true, matched: 0, kept: 0 });
+                    self.window = Some(Window { extent: p.extent, complete: true, matched: 0, kept: 0, filtered: false });
                     return Polled::Failed(e);
                 }
                 None if block && cfg!(not(target_arch = "wasm32")) && start.elapsed() < web_time::Duration::from_secs(60) => {
@@ -1077,6 +1152,12 @@ impl SourceLayer {
     /// (features read, features matching) when the window is a sample of the view.
     pub fn sampled(&self) -> Option<(usize, u64)> {
         self.window.as_ref().filter(|w| !w.complete).map(|w| (w.kept, w.matched))
+    }
+
+    /// Whether the view read kept the definition query's matches, so [`SourceLayer::sampled`]
+    /// counts matches rather than every feature in view.
+    pub fn sampled_matches(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.filtered)
     }
 }
 
@@ -1106,6 +1187,16 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 fn waker() -> &'static Mutex<Option<Arc<dyn Fn() + Send + Sync>>> {
     static W: OnceLock<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>> = OnceLock::new();
     W.get_or_init(|| Mutex::new(None))
+}
+
+/// Something read in the background (a feature read, a source opened by its address, a raster's
+/// pixels read in place; outside this module, a Zarr step) has landed: the map redraws
+/// ([`generation`]) and the UI is woken.
+pub fn wake() {
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    if let Some(w) = waker().lock().ok().and_then(|w| w.clone()) {
+        w();
+    }
 }
 
 /// Called whenever a background read finishes (the UI asks for a repaint).
