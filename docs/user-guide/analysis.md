@@ -120,7 +120,8 @@ Beyond 85.05°, the dangle check measures line ends about their pole (on WGS 84'
 within 0.13% out to 85°), right up to the pole and across ±180°; an edge winding round a pole so
 many times that it can't be measured closely is measured coarsely, and the check says it's
 incomplete.
-Radius selections and the Neighborhood Explorer still measure in local Web Mercator.
+Radius selections and the Neighborhood Explorer still measure in local Web Mercator, and the Cut
+Polygon, Reshape and Trace edits still work in it.
 
 These are the built-in tools; GeoLibre and plugin tools join them when available.
 Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available tools and their parameters):
