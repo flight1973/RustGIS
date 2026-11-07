@@ -2193,10 +2193,9 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         });
         (these, gaps)
     };
-    // Each row once, however often a selection lists it.
-    let mut picked = rows(inp, p, "input", ds);
-    picked.sort_unstable();
-    picked.dedup();
+    // Each row once, however often a selection lists it, in the selection's order.
+    let mut seen = std::collections::HashSet::new();
+    let picked: Vec<usize> = rows(inp, p, "input", ds).into_iter().filter(|r| seen.insert(*r)).collect();
     // The features with a geometry, each with it; the rest are left out, and counted.
     let features: Vec<(&Feature, &Geometry)> =
         picked.iter().filter_map(|&r| ds.features.get(r).and_then(|f| Some((f, f.geometry.as_ref()?)))).collect();
@@ -8452,6 +8451,16 @@ mod tests {
         assert_eq!(count(vec![0, 1, 2]), Some(3.0));
         // A row a selection lists twice is one feature.
         assert_eq!(count(vec![0, 0, 1]), Some(2.0));
+        // One feature each, the hulls follow the selection's order, each row once.
+        let mut named = Dataset::new("pts", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        for (name, x) in [("a", 0.0), ("b", 1.0), ("c", 2.0)] {
+            named.push(Some(Geometry::Point(Coord::new(x, 0.0))), vec![Value::Text(name.into())]);
+        }
+        let m = Selected(Map(HashMap::from([("pts".to_string(), named)])), HashMap::from([("pts".to_string(), vec![2, 0, 2])]));
+        let out =
+            layer(crate::run("convexHull", &m, &serde_json::json!({"input": "pts", "group": "None"})).unwrap_or_else(|e| panic!("{e}")));
+        let names: Vec<String> = (0..out.features.len()).map(|r| out.value(r, 0).to_string()).collect();
+        assert_eq!(names, ["c", "a"]);
     }
 
     /// Buffer says how many features' buffers kept edges coarser than their outline allows: a line
