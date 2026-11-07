@@ -781,6 +781,30 @@ fn radius_search_reports_invalid_input_without_clamping() {
 }
 
 #[test]
+fn radius_search_measures_incomplete_polygons_only_along_finite_edges() {
+    let c = Coord::new;
+    for (latitude, radius) in [(45.0, 100_000.0), (89.0, 10_000.0)] {
+        let (a, b, d) = (c(-1.0, latitude - 1.0), c(1.0, latitude - 1.0), c(-1.0, latitude + 1.0));
+        let at = c(0.0, latitude);
+        let mut edges = Dataset::new("edges", GeometryType::Polyline, vec![]);
+        edges.push(Some(Geometry::Line(vec![vec![a, b], vec![d, a]])), vec![]);
+        let expected = rustgis_analysis::network::within_report(&edges, &[0], at, radius);
+        assert_eq!(expected.rows.len(), 1);
+        assert!(expected.rows[0].1 > 1_000.0);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let (_, ds) = layer("broken", vec![Geometry::Polygon(vec![vec![vec![a, b, c(1.0, bad), d, a]]])]);
+            let report = rustgis_analysis::network::within_report(&ds, &[0], at, radius);
+            assert_eq!((report.invalid_latitudes, report.missing_coordinates, report.bounded), (0, 1, 0));
+            assert_eq!(report.rows.len(), 1, "{latitude} {bad}");
+            assert!((report.rows[0].1 - expected.rows[0].1).abs() < 1e-6, "{latitude} {bad}: {:?}", report.rows);
+        }
+        let (_, clean) = layer("clean", vec![Geometry::Polygon(vec![vec![vec![a, b, c(1.0, latitude + 1.0), d, a]]])]);
+        let report = rustgis_analysis::network::within_report(&clean, &[0], at, radius);
+        assert_eq!((report.rows, report.missing_coordinates), (vec![(0, 0.0)], 0));
+    }
+}
+
+#[test]
 fn pole_tools_refuse_latitudes_outside_the_earth() {
     let cases = [
         ("clip", serde_json::json!({"input":"a", "clip":"b"})),

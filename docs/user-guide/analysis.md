@@ -170,9 +170,10 @@ the far side of the pole can be left out while one just beyond it, nearer on the
 A search measures at most 250,000 points and steps along edges in each layer, in steps of at most
 half a degree; past them, or along an edge over 512° long (as only a hostile file has), a feature is
 counted at the least distance it could be, so it may lie beyond the radius, and the tool warns how
-many were, layer by layer. Shapes with a latitude past ±90° are left out of radius searches,
+many were, layer by layer. Shapes with a finite latitude past ±90° are left out of radius searches,
 with a count; missing or infinite coordinates and their incident edges are omitted from the
-measurement, also with a count. The overlay tools, Select By Location, Spatial Join, Summarize
+measurement, also with a count. An incomplete polygon is measured along its remaining finite
+edges, without assuming it contains the center. The overlay tools, Select By Location, Spatial Join, Summarize
 Within and topology validation refuse latitudes past ±90° before doing their work.
 
 These are the built-in tools; GeoLibre and plugin tools join them when available.

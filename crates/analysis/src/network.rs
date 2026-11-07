@@ -496,9 +496,11 @@ pub fn within_report(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> 
             if at.x < e.min_x - dlon || at.x > e.max_x + dlon || at.y < e.min_y - dlat || at.y > e.max_y + dlat {
                 return None;
             }
-            let pg = g.map_coords(&rustgis_geom::lonlat_to_merc);
-            let d = if pg.hit(m, 0.0) { 0.0 } else { pg_dist(&pg, m) / k };
-            (d <= radius_m).then_some((*r, d))
+            // Keep missing vertices unmeasurable instead of projecting infinite latitudes onto
+            // the Mercator edge. A broken ring cannot establish containment.
+            let pg = g.map_coords(&|c| if c.is_finite() { rustgis_geom::lonlat_to_merc(c) } else { Coord::new(f64::NAN, f64::NAN) });
+            let d = if !missing && pg.hit(m, 0.0) { 0.0 } else { pg_dist(&pg, m) / k };
+            (d.is_finite() && d <= radius_m).then_some((*r, d))
         })
         .collect();
     out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -598,6 +600,10 @@ fn polar_reach(g: &Geometry, e: &rustgis_geom::Extent, at: Coord, ground: &rustg
         (p, p.x.hypot(p.y))
     };
     if let Geometry::Polygon(_) = g {
+        // Incomplete rings are measured only along their finite edges, without inferring
+        // containment from a missing vertex or clamping an infinite latitude onto a pole.
+        let mut finite = true;
+        g.for_each_coord(|c| finite &= c.is_finite());
         // The center at its longitude moved by whole turns into the polygon's box: a polygon
         // written across ±180°, or from 0° to 360°, holds a center written a turn or more away; one
         // whose box holds none of them holds no center. Every turn the box spans is tried: the
@@ -606,7 +612,7 @@ fn polar_reach(g: &Geometry, e: &rustgis_geom::Extent, at: Coord, ground: &rustg
         // rest, or the turns are too many to count one by one (past 2⁵³), the polygon counts as
         // holding the center, a bound, at once, taking none (as an edge too long to step along
         // does), so one polygon written a billion degrees long doesn't spend the search's steps.
-        if e.min_y <= at.y && at.y <= e.max_y {
+        if finite && e.min_y <= at.y && at.y <= e.max_y {
             let (first, last) = (((e.min_x - at.x) / 360.0).ceil(), ((e.max_x - at.x) / 360.0).floor());
             let mut plane = None;
             let mut tried = 0_u32;
