@@ -292,6 +292,13 @@ impl Plane {
         let mid = (mid, self.to_lonlat(mid));
         self.split((a, la), mid, tolerance, depth + 1, budget, out);
         if *budget == 0 {
+            // Out of points in the first half: `mid` isn't added, so the edge left runs from the
+            // last point added to `b`, checked by no call below.
+            if let Some(&(p, lp)) = out.last()
+                && self.strays(p, b, lp, lb, tolerance)
+            {
+                COARSE.set(true);
+            }
             return;
         }
         *budget -= 1;
@@ -738,6 +745,16 @@ mod tests {
         COARSE.set(false);
         let _ = plane.ring(&circle(10_000.0, 64), 0.02);
         assert!(!COARSE.get(), "the near ring was coarse");
+        // A budget running out within an edge's first half leaves the edge from the last point added
+        // to its end, which no deeper call checks: one point for a long straying edge is too few.
+        let far = circle(5_000_000.0, 8);
+        let ends: Vec<(GC<f64>, Coord)> = far.0.iter().take(2).map(|p| (*p, plane.to_lonlat(*p))).collect();
+        let [a, b] = ends.as_slice() else { panic!("two ends") };
+        assert!(plane.strays(a.0, b.0, a.1, b.1, 0.02), "the edge doesn't stray");
+        let (mut budget, mut out) = (1, vec![*a]);
+        COARSE.set(false);
+        plane.split(*a, *b, 0.02, 0, &mut budget, &mut out);
+        assert!(budget == 0 && COARSE.get(), "budget {budget}, {} points: not marked", out.len());
         // Overlapping multipoint unions stay small, but every disc is charged across workers.
         let multipoint = Geometry::MultiPoint(vec![Coord::new(0.0, 0.0); 2]);
         let refs = vec![&multipoint; 2 * BATCH];

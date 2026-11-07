@@ -1488,7 +1488,7 @@ fn buffer_with_limits(inp: &dyn Inputs, p: &Json, limit: usize, bytes: usize) ->
     }
     if coarse > 0 {
         r.messages.push(format!(
-            "{coarse} of {} features' buffers have edges left longer than their outline allows (a ring of thousands of long edges uses up the points added to it): their sides there can stray more than 0.012% from the distance",
+            "{coarse} of {} features' buffers have edges left longer than their outline allows (a ring of thousands of long edges uses up the points added to it): their sides there can stray from the distance by more than a buffer otherwise keeps to (0.012%, 0.05% along a line or outline buffered in stretches, or 1 cm)",
             picked.len()
         ));
     }
@@ -2141,6 +2141,8 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         Dataset::new(out_name(p, format!("{}_Hull", ds.name)), GeometryType::Polygon, vec![Field::new("count", FieldType::Integer)])
     };
     let mut pts: Vec<geo::Point<f64>> = Vec::new();
+    // Hulls of at least one point that came out with no area.
+    let mut flat = 0usize;
     for r in rows(inp, p, "input", ds) {
         let Some(f) = ds.features.get(r) else { continue };
         let Some(g) = &f.geometry else { continue };
@@ -2150,7 +2152,9 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             these.push(geo::Point::new(m.x, m.y));
         });
         if each {
+            let had = !these.is_empty();
             let hull = geo::MultiPoint::new(these).convex_hull();
+            flat += usize::from(had && geo::Area::unsigned_area(&hull) == 0.0);
             out.push(from_multipolygon(&MultiPolygon::new(vec![hull])), f.attrs.clone());
         } else {
             pts.extend(these);
@@ -2158,11 +2162,19 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     }
     if !each {
         let n = ds.features.len() as i64;
+        let had = !pts.is_empty();
         let hull = geo::MultiPoint::new(pts).convex_hull();
+        flat += usize::from(had && geo::Area::unsigned_area(&hull) == 0.0);
         out.push(from_multipolygon(&MultiPolygon::new(vec![hull])), vec![Value::Int(n)]);
     }
     let n = out.features.len();
-    result(out, format!("Minimum Bounding Geometry: {n} hulls"))
+    let mut r = result(out, format!("Minimum Bounding Geometry: {n} hulls"))?;
+    if flat > 0 {
+        r.messages.push(format!(
+            "Minimum Bounding Geometry: {flat} of {n} hulls have no area: their points lie on one straight line on the map (a single point, or points on one meridian or parallel; beyond 85.05° that includes points around a pole, which enclose a cap on the ground)"
+        ));
+    }
+    Ok(r)
 }
 
 /// The point Feature To Point gives for a geometry: inside a polygon, else its label point.
@@ -3207,7 +3219,7 @@ fn select_by_location_with_work_limit(inp: &dyn Inputs, p: &Json, limit: usize, 
     let coarse = coarse.into_inner();
     if coarse > 0 {
         messages.push(format!(
-            "{coarse} selecting features' buffers have edges left longer than their outline allows (a ring of thousands of long edges uses up the points added to it): features near their edges there may be selected or not by more than 0.012% of the distance"
+            "{coarse} selecting features' buffers have edges left longer than their outline allows (a ring of thousands of long edges uses up the points added to it): features near their edges there may be selected or not by more than a buffer otherwise keeps to (0.012% of the distance, 0.05% along a line or outline buffered in stretches, or 1 cm)"
         ));
     }
     Ok(ToolResult { output: Output::Selection { layer: ds.name.clone(), rows: hits }, messages })
@@ -7999,6 +8011,61 @@ mod tests {
             crate::run("idwInterpolation", &m, &serde_json::json!({"input": "pts", "field": "v", "extent": "0,0,10,10", "pixelSize": 1.0}))
                 .is_ok()
         );
+    }
+
+    /// Minimum Bounding Geometry says how many hulls have no area: points around a pole on one
+    /// parallel (one line in the analysis plane), all together or one feature each, and points
+    /// spread over an area say nothing of the kind.
+    #[test]
+    fn convex_hull_counts_hulls_with_no_area() {
+        let layer = |coords: &[(f64, f64)], multi: bool| {
+            let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+            let cs: Vec<Coord> = coords.iter().map(|&(x, y)| Coord::new(x, y)).collect();
+            if multi {
+                pts.push(Some(Geometry::MultiPoint(cs)), vec![]);
+                pts.push(Some(Geometry::MultiPoint(vec![Coord::new(0.0, 10.0), Coord::new(5.0, 10.0), Coord::new(0.0, 15.0)])), vec![]);
+            } else {
+                for c in cs {
+                    pts.push(Some(Geometry::Point(c)), vec![]);
+                }
+            }
+            Map(HashMap::from([("pts".to_string(), pts)]))
+        };
+        let note = |m: &Map, group: &str| {
+            let res = crate::run("convexHull", m, &serde_json::json!({"input": "pts", "group": group})).unwrap_or_else(|e| panic!("{e}"));
+            res.messages.iter().find(|m| m.contains("have no area")).cloned()
+        };
+        let polar = [(0.0, 89.0), (90.0, 89.0), (180.0, 89.0), (-90.0, 89.0)];
+        let note_all = note(&layer(&polar, false), "All").unwrap_or_default();
+        assert!(note_all.contains(": 1 of 1 hulls have no area"), "{note_all}");
+        // One feature each: the polar multipoint's hull is flat, the other's isn't.
+        let note_each = note(&layer(&polar, true), "None").unwrap_or_default();
+        assert!(note_each.contains(": 1 of 2 hulls have no area"), "{note_each}");
+        let spread = [(0.0, 60.0), (10.0, 60.0), (5.0, 65.0), (0.0, 89.0), (90.0, 88.0)];
+        assert_eq!(note(&layer(&spread, false), "All"), None);
+        assert_eq!(note(&layer(&spread, true), "None"), None);
+    }
+
+    /// Buffer says how many features' buffers kept edges coarser than their outline allows: a line
+    /// zigzagging 2,000 times across 100 km near 46°N, buffered by a meter (an outline tolerance of a
+    /// centimeter), uses up the points its outline may gain, alone or dissolved; a short line
+    /// doesn't.
+    #[test]
+    fn buffer_says_when_an_outline_ran_out_of_points() {
+        let zigzag: Vec<Coord> =
+            (0..=2000).map(|i| Coord::new(10.0 + f64::from(i) * 0.0013 - 1.3, if i % 2 == 0 { 45.55 } else { 46.45 })).collect();
+        let short = vec![Coord::new(10.0, 46.0), Coord::new(10.01, 46.0)];
+        for (line, coarse) in [(zigzag, true), (short, false)] {
+            let mut lines = Dataset::new("l", GeometryType::Polyline, vec![]);
+            lines.push(Some(Geometry::Line(vec![line])), vec![]);
+            let m = Map(HashMap::from([("l".to_string(), lines)]));
+            for dissolve in ["None", "All"] {
+                let params = serde_json::json!({"input": "l", "distance": 1, "units": "Meters", "dissolve": dissolve});
+                let res = crate::run("buffer", &m, &params).unwrap_or_else(|e| panic!("{e}"));
+                let said = res.messages.iter().any(|m| m.starts_with("1 of 1 features' buffers have edges left longer"));
+                assert_eq!(said, coarse, "dissolve {dissolve}: {:?}", res.messages);
+            }
+        }
     }
 
     #[test]

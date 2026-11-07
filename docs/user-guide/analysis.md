@@ -112,10 +112,11 @@ that crosses 85.05° is straight in the tools, but the Web Mercator map clamps i
 85.05° and draws it straight to there, so a cut along such an edge can fall well east or west of
 where that map shows it: about 48 km at 84.5°N for an edge from (0°, 80°N) to (10°E, 89°N). A
 pole is a line in these coordinates, not a point, so Minimum Bounding Geometry of points spread
-around a pole spans their longitudes (a flat polygon with no area, for points on one parallel),
-not the cap they enclose on the ground. The globe draws a long edge along the great circle between its ends, so near
-a pole it shows a little poleward of where the tools take it: about 850 m at the middle of a 10°
-edge along 88°N (as everywhere, the tools take an edge as straight on the map, not on the globe).
+around a pole spans their longitudes (a flat polygon with no area, for points on one parallel,
+and the tool says how many hulls have no area), not the cap they enclose on the ground. The globe
+draws a long edge along the great circle between its ends, so near a pole it shows a little
+poleward of where the tools take it: about 850 m at the middle of a 10° edge along 88°N (as
+everywhere, the tools take an edge as straight on the map, not on the globe).
 Beyond 85.05°, the dangle check measures line ends about their pole (on WGS 84's curvature there,
 within 0.13% out to 85°), right up to the pole and across ±180°; an edge winding round a pole so
 many times that it can't be measured closely is measured coarsely, and the check says it's
@@ -269,8 +270,9 @@ buffered in stretches of a few hundred kilometres to limit projection error. Up 
 latitude, a buffer's sides are within 0.012 % of the distance (or 1 cm), and within 0.05 % along
 a winding line or outline buffered in stretches. An outline's edges are split to keep to that,
 by at most 16,000 points a ring; a ring of thousands of long edges can use them up and keep some
-edges coarser, and the tool says how many features' buffers did. Its curves are drawn with straight edges (128
-to a point's circle, 64 to a semicircular line end). Between vertices, those edges cut up
+edges coarser, and the tool says how many features' buffers did. Its curves are drawn with
+straight edges (128 to a point's circle, 64 to a semicircular line end). Between vertices, those
+edges cut up
 to 0.031 % of the distance inside the true curve in the projection plane, and up to 0.125 % at
 polygon corners and line joins, in addition to the projection error. Negative Buffer
 distances shrink polygons. Buffer and Select Layer By Location limit distances to 5,000 km.
