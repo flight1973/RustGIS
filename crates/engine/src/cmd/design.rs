@@ -1152,6 +1152,7 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     // Lines the search, past its steps, couldn't search in full where a nearer point might lie:
     // split at the nearest point it found, or left whole when that was an end.
     let (mut rough, mut whole) = (0, 0);
+    let mut unmeasured = 0usize;
     for r in l.selection.clone() {
         let Some(f) = l.dataset.features.get(r).cloned() else { continue };
         let Some(Geometry::Line(parts)) = &f.geometry else { continue };
@@ -1193,6 +1194,7 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
                 // A segment to a vertex that's no place (an infinite coordinate; a missing one
                 // measures as NaN below) is passed over, not run to a pole.
                 if !(a.is_finite() && b2.is_finite()) {
+                    unmeasured += 1;
                     continue;
                 }
                 let (d, q) = if ground {
@@ -1209,7 +1211,9 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
                     ((q.x - m.x).powi(2) + (q.y - m.y).powi(2), plane_to_lonlat(q))
                 };
                 // A segment missing a coordinate (its distance NaN) is passed over.
-                if d.is_finite() && best.is_none_or(|b| d < b.0) {
+                if !d.is_finite() {
+                    unmeasured += 1;
+                } else if best.is_none_or(|b| d < b.0) {
                     best = Some((d, pi, si, q));
                 }
             }
@@ -1249,6 +1253,11 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     let unsearched =
         |n: usize| format!("{n} line(s) near a pole couldn't be searched in full within one split's limit of a million distances");
     if changes.is_empty() {
+        if unmeasured > 0 {
+            return Err(format!(
+                "no line could be split away from its ends; {unmeasured} segment(s) could not be measured because of invalid coordinates"
+            ));
+        }
         if whole > 0 {
             return Err(format!("{}: the nearest point found was at an end; select fewer lines, or simplify them", unsearched(whole)));
         }
@@ -1256,6 +1265,9 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     }
     l.touch_geometry();
     apply(s, id, changes)?;
+    if unmeasured > 0 {
+        s.warn(format!("{unmeasured} segment(s) of the selected lines could not be measured because of invalid coordinates; the split search skipped them, so the point found may not be the nearest"));
+    }
     if rough > 0 {
         s.warn(format!("{}: each was split at the nearest point found, which may not be the nearest", unsearched(rough)));
     }

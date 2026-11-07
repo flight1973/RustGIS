@@ -184,6 +184,29 @@ fn a_line_beyond_85_degrees_splits_where_it_is_asked() {
 }
 
 #[test]
+fn split_reports_segments_it_cannot_measure() {
+    let c = Coord::new;
+    for lat in [45.0, -88.0] {
+        for bad in [false, true] {
+            let mut parts = vec![vec![c(0.0, lat - 0.1), c(0.0, lat + 0.1)]];
+            if bad {
+                parts.push(vec![c(f64::NAN, lat), c(1.0, lat), c(f64::INFINITY, lat)]);
+            }
+            let (mut s, _) = layer(GeometryType::Polyline, vec![Geometry::Line(parts)]);
+            let mark = s.notice_mark();
+            s.run("edit.split", &json!({"lon": 0.0, "lat": lat})).unwrap();
+            let notices: Vec<&str> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+            if bad {
+                assert_eq!(notices.len(), 1, "{notices:?}");
+                assert!(notices[0].contains("2 segment(s)"), "{notices:?}");
+            } else {
+                assert!(notices.is_empty(), "{notices:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn a_polygon_with_an_edge_across_half_the_world_is_refused() {
     // Along 87°N and 88°N from 0° to 180°: which way around such an edge goes would be unclear once
     // moved, so the edit is refused, and the polygon stays as it was.
