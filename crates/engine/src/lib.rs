@@ -7,17 +7,26 @@
 
 pub mod cmd;
 pub mod connections;
+pub mod durable;
 pub mod geometry_calc;
 pub mod model;
+pub mod peer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod prefs;
 pub mod project;
+mod roles;
+pub use peer::Peer;
+pub(crate) use roles::{Document, ParamRole, Role};
+mod parameters;
 pub mod project_log;
+pub use parameters::{params_envelope, script_line};
+pub use project_log::{LogCopy, log_identifier, log_params};
 pub mod s3_connections;
 pub mod s3_keys;
 #[cfg(test)]
 mod s3_saved_tests;
 pub mod sample;
+pub mod service_logins;
 pub mod sources;
 #[cfg(test)]
 mod tests;
@@ -37,6 +46,9 @@ use serde_json::Value;
 
 pub type CmdResult = Result<Value, String>;
 
+/// A download that landed read already: its layer, and what reading it skipped or noticed.
+pub(crate) type LandedRead = Box<(rustgis_data::Dataset, rustgis_data::ReadReport)>;
+
 /// A command.
 #[derive(Clone, Copy)]
 pub struct CommandSpec {
@@ -54,6 +66,8 @@ pub struct CommandSpec {
     /// `None` = enabled; `Some(reason)` = disabled.
     pub enabled: fn(&Session) -> Option<&'static str>,
     pub run: fn(&mut Session, &Value) -> CmdResult,
+    /// Reviewed builtin durable-output roles. Extension parameters remain opaque.
+    pub(crate) roles: Option<&'static [ParamRole]>,
 }
 
 fn always(_: &Session) -> Option<&'static str> {
@@ -73,7 +87,12 @@ impl CommandSpec {
     }
 
     pub const fn new(id: &'static str, label: &'static str, location: &'static str, run: fn(&mut Session, &Value) -> CmdResult) -> Self {
-        CommandSpec { id, label, location, shortcut: "", params: "{}", mutates: true, enabled: always, run }
+        CommandSpec { id, label, location, shortcut: "", params: "{}", mutates: true, enabled: always, run, roles: None }
+    }
+    /// Declares builtin durable-output roles; an empty list uses reviewed common parameter rules.
+    pub(crate) const fn roles(mut self, roles: &'static [ParamRole]) -> Self {
+        self.roles = Some(roles);
+        self
     }
     pub const fn key(mut self, s: &'static str) -> Self {
         self.shortcut = s;
@@ -264,6 +283,29 @@ fn clip(s: &str, n: usize) -> String {
     if s.chars().count() > n { s.chars().take(n).chain(['…']).collect() } else { s.to_string() }
 }
 
+/// The most layer names a notice lists (the rest counted), each cut to 80 characters: the notice
+/// stays well within what a notice keeps.
+const NAMES_SAID: usize = 5;
+
+/// Layer names for a notice: the first [`NAMES_SAID`], each clipped, and how many more.
+fn names_said(names: &[String]) -> String {
+    let shown: Vec<String> = names.iter().take(NAMES_SAID).map(|n| clip(n, 80)).collect();
+    match names.len().saturating_sub(NAMES_SAID) {
+        0 => shown.join(", "),
+        more => format!("{} and {more} more", shown.join(", ")),
+    }
+}
+
+/// What a raster layer read in place holds for its statistics and tools, when it holds an
+/// overview of the image the map draws.
+pub(crate) fn in_place_overview(d: &rustgis_data::raster::Raster) -> Option<String> {
+    let (fw, fh) = d.overview?;
+    Some(format!(
+        "read in place: the map draws its {fw} × {fh} pixels as it needs them, while statistics, histograms and raster tools read a {} × {} overview",
+        d.width, d.height
+    ))
+}
+
 pub struct Registry {
     pub commands: Vec<CommandSpec>,
 }
@@ -291,6 +333,9 @@ pub enum Tool {
     CreatePolygon,
     /// Moves, inserts and deletes the vertices of the selected features.
     EditVertices,
+    /// Drags a layer's label to where it should be (`labels.move`), as QGIS's Move Label tool;
+    /// dragging anything else pans the map.
+    MoveLabel,
     /// Draws a line across the selected polygons to cut them (`edit.cutPolygon`).
     CutPolygon,
     /// Draws a line across the selected feature's boundary to reshape it (`edit.reshape`).
@@ -329,6 +374,7 @@ impl Tool {
             Tool::CreateLine => "createLine",
             Tool::CreatePolygon => "createPolygon",
             Tool::EditVertices => "editVertices",
+            Tool::MoveLabel => "moveLabel",
             Tool::CutPolygon => "cutPolygon",
             Tool::Reshape => "reshape",
             Tool::Graphic(shape) => GRAPHIC_TOOLS.iter().find(|g| g.0 == shape).map_or("graphicPoint", |g| g.1),
@@ -351,6 +397,7 @@ impl Tool {
             Tool::CreateLine,
             Tool::CreatePolygon,
             Tool::EditVertices,
+            Tool::MoveLabel,
             Tool::CutPolygon,
             Tool::Reshape,
         ]
@@ -371,6 +418,7 @@ impl Tool {
             Tool::CreateLine => "Create Line",
             Tool::CreatePolygon => "Create Polygon",
             Tool::EditVertices => "Edit Vertices",
+            Tool::MoveLabel => "Move Label",
             Tool::CutPolygon => "Cut Polygon",
             Tool::Reshape => "Reshape",
             Tool::Graphic(shape) => GRAPHIC_TOOLS.iter().find(|g| g.0 == shape).map_or("Point", |g| g.2),
@@ -430,7 +478,21 @@ pub struct TopologyIssue {
 pub struct Notice {
     pub text: String,
     pub error: bool,
+    /// How the troubleshooting history files it (an error, a warning or information).
+    pub(crate) severity: rustgis_data::diagnostics::Severity,
 }
+
+/// One counted, already-redacted loss, independent of the changes a command can roll back.
+struct LossNotice {
+    template: &'static str,
+    count: u32,
+    text: rustgis_data::diagnostics::Redacted,
+    source: Option<&'static str>,
+}
+
+/// At most 256 KiB of redacted text per outer command (32 kinds, redaction's 8 KiB bound).
+/// Further losses are counted in one overflow notice rather than silently discarded.
+const MAX_LOSS_NOTICE_KINDS: usize = 32;
 
 const UNDO_LIMIT: usize = 40;
 
@@ -492,13 +554,17 @@ struct PutAside {
     plugin_runs: Vec<cmd::gp::StartedRun>,
     downloading: Vec<u64>,
     downloaded: Vec<(u64, Vec<u8>)>,
+    landed_reads: Vec<(u64, LandedRead)>,
     url_requests: Vec<serde_json::Value>,
     plugin_retries: Vec<cmd::plugins::fetch::Retry>,
+    url_waits: cmd::plugins::fetch::UrlWaits,
     /// A style of the project still loading, which mustn't move the next one's view.
-    style_view: Option<(String, Camera)>,
+    style_view: Option<(rustgis_map::TileLayer, Camera, u64)>,
     #[cfg(not(target_arch = "wasm32"))]
     sql_results: Vec<(u64, String, Option<String>, rustgis_data::source::duckdb::Output)>,
     trend_results: Vec<(u64, Vec<rustgis_data::raster::Raster>, usize)>,
+    raster_results: Vec<(u64, cmd::workflows::Made)>,
+    raster_runs: Vec<u64>,
     edit_counts: std::collections::HashMap<u32, cmd::design::EditCounts>,
 }
 
@@ -536,9 +602,15 @@ pub struct Session {
     /// and login requests. S3 uses the same store through `DatabaseLogins::secret_store`.
     /// Never saved; see [`connections::DatabaseLogins`].
     pub database_logins: connections::DatabaseLogins,
+    /// The web-service logins this session made the ones sent to an origin, which the process's
+    /// fetches share: they end with it (see [`service_logins`]).
+    pub(crate) web_logins: service_logins::SessionLogins,
     /// How rasters added from now on are drawn (`raster.setDefaultStyle`; kept with the app's
     /// preferences, not the project).
     pub raster_defaults: rustgis_map::RasterDefaults,
+    /// The favourite arrangement of publication layouts (`layout.arrangement`, #1379): a name or a
+    /// corner for each surround, kept with the app's preferences, not the project.
+    pub layout_favourite: serde_json::Value,
     pub registry: Registry,
     /// Bumped on every change so views can cache.
     pub revision: u64,
@@ -546,6 +618,8 @@ pub struct Session {
     /// the command came (the app, an agent, a script): the interface drops what it kept for the
     /// old one.
     pub opened: u64,
+    /// Session-local last bridge exchange; absent from project files and undo snapshots.
+    pub(crate) exchange: Option<peer::Exchange>,
     pub tool: Tool,
     /// The layer selected in the Layers pane (the one the Style and Data tabs act on).
     pub active_layer: Option<u32>,
@@ -557,11 +631,21 @@ pub struct Session {
     layer_selection_of: Option<u32>,
     /// Map view size in logical points (set by the UI each frame).
     pub view_size: (f64, f64),
-    /// A MapLibre style tile layer (by its address) whose own view the map goes to once it loads
-    /// (`map.addTiles` with `"view": true`), or a PMTiles archive whose bounds it goes to, and the
-    /// camera then: moved since, the map stays.
-    pub style_view: Option<(String, Camera)>,
+    /// A MapLibre style tile layer (the added layer snapshot) whose own view the map goes to once it loads
+    /// (`map.addTiles` with `"view": true`), or a PMTiles/MBTiles archive whose bounds it goes to, and the
+    /// camera and owning map instance then: moved or switched since, the map stays.
+    pub style_view: Option<(rustgis_map::TileLayer, Camera, u64)>,
+    /// Whether a command waits for the overview of a raster read in place (natively, at most two
+    /// minutes; the browser never waits): the command line, Python and tests do, so a result is
+    /// complete; the desktop app doesn't, as its commands run on the window's own thread, and the
+    /// layer lands as the map draws (failing is said then, and read again: see
+    /// [`Session::read_in_place_again`]).
+    pub in_place_wait: bool,
     pub notices: Vec<Notice>,
+    /// Counted losses await the outermost guard's cleanup, including failed nested commands.
+    /// Runtime-only: never in Project, undo or PutAside, so replacement cannot erase them.
+    loss_notices: Vec<LossNotice>,
+    loss_notice_overflow: u32,
     /// Troubleshooting history, independent of the active pane, project files and undo.
     pub diagnostics: rustgis_data::diagnostics::History,
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]),
@@ -609,6 +693,10 @@ pub struct Session {
     /// A notebook is running: it may not start another, even through a task or model (no
     /// unbounded recursion).
     pub(crate) notebook_running: bool,
+    /// How many commands are running other commands as their steps by calling them directly
+    /// (a script's lines, a plugin's host calls): what those steps do is the script's, not the
+    /// user's own move, so a Zarr step they move to is read before the next line runs.
+    pub(crate) steps_running: u32,
     /// How many geoprocessing history records came with the opened project (from its file).
     pub history_from_file: usize,
     /// The report open in the Report pane, if any.
@@ -633,9 +721,9 @@ pub struct Session {
     /// What the project replaced during the command running held beside itself, to give back if
     /// the command fails ([`PutAside`]); and how deep commands run within commands now.
     put_aside: Option<Box<PutAside>>,
-    depth: u32,
+    pub(crate) depth: u32,
     /// Only the command's registered id, never its parameters. Nested commands restore this.
-    diagnostic_source: Option<&'static str>,
+    pub(crate) diagnostic_source: Option<&'static str>,
     /// How many of the commands running now restore the project if they fail: a replacement is
     /// put aside only under one of them, as only then can it be rolled back.
     restorable: u32,
@@ -669,6 +757,9 @@ pub struct Session {
     downloading: Vec<u64>,
     /// Downloads that landed, waiting for `layer.addDownload`.
     pub(crate) downloaded: Vec<(u64, Vec<u8>)>,
+    /// Downloads that landed already read (an ArcGIS layer's protocol buffer pages, joined),
+    /// waiting for `layer.addDownload` too.
+    pub(crate) landed_reads: Vec<(u64, LandedRead)>,
     /// Downloads a command asked for where nothing may wait (the browser): the parameters of
     /// `layer.addUrl` calls, for the front end to fetch and add (see [`Session::take_url_requests`]).
     pub(crate) url_requests: Vec<serde_json::Value>,
@@ -678,8 +769,24 @@ pub struct Session {
     /// Set by [`Session::run_leaving_downloads`]: `layer.addUrl` leaves what it would wait for
     /// to the front end ([`Session::request_url`]), as in the browser.
     leave_downloads: bool,
-    /// Plugin commands waiting for their `host.fetch` answers to run again (the browser).
+    /// Plugin commands waiting for their `host.fetch` answers, or the downloads their
+    /// `layer.addUrl` left to the app, to run again.
     pub(crate) plugin_retries: Vec<cmd::plugins::fetch::Retry>,
+    /// The downloads plugin commands wait for: being made by the app, or landed (#1202).
+    pub(crate) url_waits: cmd::plugins::fetch::UrlWaits,
+    /// The number of the last download request ([`Session::request_url`]).
+    next_request: u64,
+    /// The download requests of the plugin call running now (none outside one): each one's
+    /// number, and what was asked.
+    pub(crate) call_requests: Option<Vec<(u64, serde_json::Value)>>,
+    /// While a plugin command runs again for its downloads: what each one asked for, and what
+    /// adding it answered, for its `layer.addUrl` to answer once.
+    pub(crate) rerun_landed: Vec<(serde_json::Value, CmdResult, cmd::plugins::fetch::Added)>,
+    /// While a plugin command runs again: the errors its earlier runs said, not said again.
+    pub(crate) rerun_said: Vec<String>,
+    /// While plugin commands whose downloads are in run again: the downloads they wait for, still
+    /// theirs though the commands are out of `plugin_retries` until each has run.
+    pub(crate) rerun_requests: Vec<u64>,
     /// How many times the plugin command running now has been run again for its fetches.
     pub(crate) retry_tries: u32,
     /// Set for [`Session::guarded`] by a command whose failure is no news (a plugin command
@@ -692,12 +799,45 @@ pub struct Session {
     /// Trends the app worked out on a thread, waiting for `cube.trend {"ran"}`: the id, the
     /// layers and how many dates (see [`cmd::cube::land`]).
     pub(crate) trend_results: Vec<(u64, Vec<rustgis_data::raster::Raster>, usize)>,
+    /// Rasters the app made on a thread for an Analysis workflow, waiting for its command with
+    /// `{"ran"}` (see [`cmd::workflows::raster_land`]).
+    pub(crate) raster_results: Vec<(u64, cmd::workflows::Made)>,
+    /// The ids of the Analysis workflows running on a thread (see
+    /// [`cmd::workflows::raster_start`]), apart from the downloads'.
+    pub(crate) raster_runs: Vec<u64>,
     /// Set where nothing waits on a command but a shell (`rustgis-cli run`): long runs a command
     /// works out where it's called (a trend over a state from a data cube) take the app's larger
     /// bounds, as its panes do on a thread, and tell their progress (a share, 0 to 1, and 1 when
     /// one succeeds) through this. Python leaves it unset: a run there holds the interpreter's
     /// lock and can't be interrupted, so it keeps the Script pane's bounds.
     pub long_runs: Option<fn(&str, f64)>,
+    /// Zarr layers that follow the time slider read a step not read yet on a thread of their
+    /// own, showing the step before until it lands (the desktop app; see
+    /// [`Session::follow_time_landed`]). Off, as for scripts and the command line, a slider move
+    /// waits for the step.
+    pub zarr_off_frame: bool,
+    /// The Zarr steps landed that [`Session::follow_time_landed`] has seen.
+    zarr_seen: u64,
+    /// A read the app made on a thread of its own for the command it runs next, which takes it
+    /// instead of reading again ([`cmd::reads`]).
+    pub(crate) read_ahead: Option<cmd::reads::Read>,
+    /// A model's tools run ahead on a copy of the session, which a model's run here takes
+    /// ([`cmd::gp::Ahead::Taking`]), or which that copy records ([`cmd::gp::Ahead::Recording`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) tools_ahead: Option<cmd::gp::Ahead>,
+    /// Where the requests a copy of the session makes for a model's run ahead go
+    /// ([`cmd::workflows::ahead_on_copy`]): the session's own Diagnostics, as when they're made
+    /// there. Its notices stay its own: the run there says them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) requests_into: Option<rustgis_data::diagnostics::Capture>,
+    /// The tools run ahead that a model's run took, for the tests.
+    #[cfg(test)]
+    pub(crate) tools_taken: usize,
+    /// Set where a person at a terminal waits on a command (`rustgis-cli run` with stdin and
+    /// stderr a terminal), who can stop it with Ctrl-C: tools and rasters take no work cap
+    /// ([`rustgis_analysis::control::Control::stoppable`]). A program that calls it (an agent, a
+    /// CI job) may wait with a timeout, so there they keep their caps.
+    pub stoppable: bool,
 }
 
 /// The most `layer.addUrl` requests kept for the front end at a time.
@@ -790,21 +930,26 @@ fn fresh_source_ids(before: &Project, after: &mut Project) {
 
 /// A lock names each label by its feature's id, and [`rustgis_data::Dataset::push`] hands the
 /// largest id out again once its feature is deleted: the new feature would take the lock's place
-/// without having been placed (#1135). So a command that removes features removes their entries,
+/// without having been placed (#1135). Saved moved-label positions have the same identity rule.
+/// So a command that removes features removes their locks, line anchors and saved moves,
 /// whichever way it removes them. Undo brings them back with the rest of the project. A streamed
 /// layer holds only the window in view, so its other features aren't gone. It compares ids, so an
 /// id a single command both removes and hands out stays locked: only restoring from an archive can.
-fn forget_locks_of_removed_features(before: &Project, after: &mut Project) {
+/// A command that removes a layer removes its locks and line anchors too, or each frame would read
+/// them for nothing. It compares layer ids too: a layer id the map hands out again (after `u32::MAX`,
+/// or once a failed add rewinds the counter) keeps the old layer's entries.
+fn forget_label_state_of_removed_features(before: &Project, after: &mut Project) {
     for (i, m) in after.maps.iter_mut().enumerate() {
         let was = before.maps.get(i).filter(|o| o.name == m.name);
-        let Some(lock) = m.label_lock.as_mut() else { continue };
-        for l in m.layers.iter().filter(|l| !l.is_streamed()) {
+        for l in m.layers.iter_mut().filter(|l| !l.is_streamed()) {
             if was.and_then(|o| o.layers.iter().find(|o| o.id == l.id)).is_some_and(|o| o.dataset.features.shares(&l.dataset.features)) {
                 continue;
             }
-            // The lock's ids for this layer, less those it still has: sized by the lock, not the layer.
-            let mut gone: std::collections::HashSet<u64> =
-                lock.iter().filter(|((layer, ..), _)| *layer == l.id).map(|((_, id, ..), _)| *id).collect();
+            // Bound the lookup by saved label state, not the feature count. Off-window ids stay put.
+            let mut gone: std::collections::HashSet<u64> = l.labels.in_order().flat_map(|c| c.moved.iter().map(|m| m.id)).collect();
+            if let Some(lock) = &m.label_lock {
+                gone.extend(lock.iter().filter(|((layer, ..), _)| *layer == l.id).map(|((_, id, ..), _)| *id));
+            }
             if gone.is_empty() {
                 continue;
             }
@@ -814,8 +959,19 @@ fn forget_locks_of_removed_features(before: &Project, after: &mut Project) {
                     break;
                 }
             }
-            lock.retain(|((layer, id, ..), _)| *layer != l.id || !gone.contains(id));
+            for c in std::iter::once(&mut l.labels.default).chain(l.labels.classes.iter_mut()) {
+                c.moved.retain(|entry| !gone.contains(&entry.id));
+            }
+            if let Some(lock) = &mut m.label_lock {
+                lock.retain(|((layer, id, ..), _)| *layer != l.id || !gone.contains(id));
+            }
+            m.label_lock_line_anchors.retain(|(layer, id, ..), _| *layer != l.id || !gone.contains(id));
         }
+        let kept: std::collections::HashSet<u32> = m.layers.iter().map(|l| l.id).collect();
+        if let Some(lock) = &mut m.label_lock {
+            lock.retain(|((layer, ..), _)| kept.contains(layer));
+        }
+        m.label_lock_line_anchors.retain(|(layer, ..), _| kept.contains(layer));
     }
 }
 
@@ -833,7 +989,7 @@ fn edits_features(id: &str) -> bool {
 }
 
 impl Session {
-    pub fn new(project: Project) -> Self {
+    pub fn new(mut project: Project) -> Self {
         // The engine's tests never add Shapefile indexes to the user's cache (#1230).
         #[cfg(all(test, not(target_arch = "wasm32")))]
         rustgis_data::source::shp::use_temporary_index_dir();
@@ -841,12 +997,15 @@ impl Session {
         #[cfg(feature = "geolibre")]
         rustgis_geolibre::register();
         rustgis_plugins::tools::register();
-        // FlatGeobuf and GeoParquet by their web address are read through the tile fetchers.
+        // FlatGeobuf and GeoParquet by their web address are read through the tile fetchers, and
+        // cloud-optimised GeoTIFFs' overviews for raster layers read in place.
         render::rustgis_tiles::remote::install();
+        map::raster::set_in_place_reader(render::rustgis_tiles::cog::raster::overview);
         rustgis_data::diagnostics::set_clock(|| {
             web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
         });
-        Session {
+        let label_notices = std::mem::take(&mut project.label_read_notices);
+        let mut session = Session {
             project,
             path: None,
             log: project_log::SessionLog::default(),
@@ -860,17 +1019,23 @@ impl Session {
             s3_bindings: std::collections::BTreeMap::new(),
             s3_pending: Vec::new(),
             database_logins: connections::DatabaseLogins::default(),
+            web_logins: service_logins::SessionLogins::new(),
             raster_defaults: rustgis_map::RasterDefaults::default(),
+            layout_favourite: serde_json::Value::String("classic".into()),
             registry: Registry { commands: cmd::all() },
             revision: 1,
             opened: 0,
+            exchange: None,
             tool: Tool::Explore,
             active_layer: None,
             layer_selection: Vec::new(),
             layer_selection_of: None,
             view_size: (1200.0, 720.0),
             style_view: None,
+            in_place_wait: true,
             notices: Vec::new(),
+            loss_notices: Vec::new(),
+            loss_notice_overflow: 0,
             diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
             table_layer: None,
@@ -886,6 +1051,7 @@ impl Session {
             project_starts: 0,
             trusted_notebooks: Default::default(),
             notebook_running: false,
+            steps_running: 0,
             history_from_file: 0,
             active_report: None,
             active_presentation: None,
@@ -917,6 +1083,7 @@ impl Session {
             plugin_panels: std::collections::BTreeMap::new(),
             downloading: Vec::new(),
             downloaded: Vec::new(),
+            landed_reads: Vec::new(),
             url_requests: Vec::new(),
             file_outputs: Vec::new(),
             #[cfg(test)]
@@ -924,13 +1091,35 @@ impl Session {
             request_only: false,
             leave_downloads: false,
             plugin_retries: Vec::new(),
+            url_waits: cmd::plugins::fetch::UrlWaits::default(),
+            next_request: 0,
+            call_requests: None,
+            rerun_landed: Vec::new(),
+            rerun_said: Vec::new(),
+            rerun_requests: Vec::new(),
             retry_tries: 0,
             quiet_failure: false,
             #[cfg(not(target_arch = "wasm32"))]
             sql_results: Vec::new(),
             trend_results: Vec::new(),
+            raster_results: Vec::new(),
+            raster_runs: Vec::new(),
             long_runs: None,
+            zarr_off_frame: false,
+            zarr_seen: 0,
+            read_ahead: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            tools_ahead: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            requests_into: None,
+            #[cfg(test)]
+            tools_taken: 0,
+            stoppable: false,
+        };
+        for text in label_notices {
+            session.notify(text, false);
         }
+        session
     }
 
     /// Keeps a query's result the app ran off the frame, for `layer.addSql {"ran": id}`, with the
@@ -963,9 +1152,29 @@ impl Session {
     /// Hands over a download's bytes, for `layer.addDownload {"id"}`; `false` when it was dropped
     /// (another project was opened meanwhile).
     pub fn download_landed(&mut self, id: u64, bytes: Vec<u8>) -> bool {
+        let landed = self.landed(id);
+        if landed {
+            self.downloaded.push((id, bytes));
+        }
+        landed
+    }
+
+    /// Hands over a download read already (an ArcGIS layer's protocol buffer pages, joined, see
+    /// [`ogc::Step::Decoded`](rustgis_data::ogc::Step::Decoded)), for `layer.addDownload {"id"}`
+    /// as [`Session::download_landed`] does.
+    pub fn download_landed_read(&mut self, id: u64, dataset: rustgis_data::Dataset, report: rustgis_data::ReadReport) -> bool {
+        let landed = self.landed(id);
+        if landed {
+            self.landed_reads.push((id, Box::new((dataset, report))));
+        }
+        landed
+    }
+
+    /// Takes a download off those under way: `false` when it isn't one of them (another project
+    /// was opened meanwhile).
+    fn landed(&mut self, id: u64) -> bool {
         let Some(i) = self.downloading.iter().position(|d| *d == id) else { return false };
         self.downloading.remove(i);
-        self.downloaded.push((id, bytes));
         true
     }
 
@@ -987,16 +1196,80 @@ impl Session {
     /// so. A request made again while it waits is made once (the same address read another way,
     /// as another layer or with other columns, is another request), and past a few waiting
     /// requests the next is refused rather than silently dropping one already promised.
+    ///
+    /// Each request has a number (`"request"` in what the front end takes), which it hands on to
+    /// the command that adds the download; a plugin command waiting for it runs again with what
+    /// that command answered (#1202). A plugin command's call asking again for a download a
+    /// command waits for (clicked twice) is that one, not a second download, while what it added
+    /// is still there; from anywhere else, a request made again once taken is another download, as
+    /// Add Data From URL's is.
     pub fn request_url(&mut self, p: &serde_json::Value) -> Result<serde_json::Value, String> {
+        if !p.is_object() {
+            return Err("a download is asked for by an object: its \"url\" and how to read it".into());
+        }
         let url = p.get("url").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-        if !self.url_requests.iter().any(|q| q == p) {
+        let asked = self.asked_for(p);
+        let waiting = self.url_requests.iter().find(|q| cmd::plugins::fetch::same_request(q, &asked)).and_then(|q| q["request"].as_u64());
+        // A number is taken only as what it was made for here: this request, waited for. Any other
+        // is set aside, so the request gets a download of its own, under a number no other request
+        // can get. (One given up comes here only from inside another command: a front end's is
+        // refused in `run`.)
+        let given = p.get("request").and_then(serde_json::Value::as_u64).filter(|n| self.url_waits.holds(*n, &asked));
+        let made = self
+            .call_requests
+            .as_ref()
+            .and_then(|_| self.url_waits.in_flight(&asked))
+            .filter(|n| !self.url_waits.taken_away(*n, &self.project));
+        let number = match given.or(waiting).or(made) {
+            Some(n) => n,
+            None => {
+                self.next_request += 1;
+                self.next_request
+            }
+        };
+        // A number the front end took and hands back (in the browser, a file it found must be
+        // downloaded whole after all) isn't being downloaded: queued again, whole, so it isn't
+        // probed again.
+        let handed_back = given.is_some_and(|n| self.url_waits.holds(n, &asked));
+        // (Even with the same request queued under another number: nothing else lands this one.)
+        if (handed_back && waiting != Some(number)) || (waiting.is_none() && !self.url_waits.has(number)) {
             if self.url_requests.len() >= MAX_URL_REQUESTS {
                 return Err(format!("{url}: {MAX_URL_REQUESTS} downloads are already waiting; try again when they have landed"));
             }
-            self.url_requests.push(p.clone());
+            let mut q = asked.clone();
+            q["request"] = serde_json::json!(number);
+            if handed_back {
+                q["whole"] = serde_json::json!(true);
+            }
+            self.url_requests.push(q);
+        }
+        // Once per download, however many times a command asks for it in one call.
+        if let Some(asked_now) = self.call_requests.as_mut()
+            && !asked_now.iter().any(|(n, _)| *n == number)
+        {
+            asked_now.push((number, asked));
         }
         self.request_only = true;
         Ok(serde_json::json!({"pending": true, "url": url}))
+    }
+
+    /// Says a download the front end was asked for ([`Session::request_url`]) failed before
+    /// anything could add it (it didn't download, or its project was closed): a plugin command
+    /// waiting for it runs again, and its `layer.addUrl` answers this error. `p` is the request
+    /// the front end took.
+    pub fn request_failed(&mut self, p: &serde_json::Value, error: &str) {
+        // Only the download its number names (the same address and import): a number given with
+        // another changes no wait or refusal.
+        if let Some(n) = p.get("request").and_then(serde_json::Value::as_u64) {
+            if self.url_waits.holds(n, p) {
+                // Its command gets this as its answer: without the address's keys.
+                self.url_waits.land(n, Err(sources::redact_text(error)), cmd::plugins::fetch::Added::default());
+            }
+            // One given up won't land now: nothing left to refuse.
+            if self.url_waits.given_up(n, p) {
+                self.url_waits.refused(n);
+            }
+        }
     }
 
     /// Runs a command as [`Session::run`] does, except that the downloads `layer.addUrl` would
@@ -1033,6 +1306,28 @@ impl Session {
         self.project.map_mut()
     }
 
+    /// Whether a Zarr layer on the active map that follows the time slider is waiting for its
+    /// step to be read off the frame ([`Session::zarr_off_frame`]): playing holds its next step.
+    pub fn zarr_waiting(&self) -> bool {
+        self.zarr_off_frame && cmd::zarr::waiting(self)
+    }
+
+    /// Drops a read placed for a command ([`cmd::reads::Read::placed`]) that the command didn't
+    /// take: one refused before it read, or that read another way.
+    pub fn drop_read(&mut self) {
+        self.read_ahead = None;
+    }
+
+    /// Shows the Zarr steps read off the frame ([`Session::zarr_off_frame`]) once they land: the
+    /// app asks each frame. True when one landed, so the map draws again.
+    pub fn follow_time_landed(&mut self) -> bool {
+        if !cmd::zarr::landed_since(&mut self.zarr_seen) {
+            return false;
+        }
+        cmd::zarr::follow_time(self);
+        true
+    }
+
     /// Moves the map to the view of a style added with `"view": true` once the style has loaded,
     /// or to an archive's bounds once its header is read (the UI asks each frame). True when the
     /// map moved.
@@ -1056,6 +1351,9 @@ impl Session {
     /// panic restores it. A command run by itself (not as a part of another) that changes the
     /// project, or reaches a file or a service, goes into the session's log (#797).
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _diagnostic_scope = self.requests_into.as_ref().map_or_else(|| self.diagnostics.enter(), |c| c.enter());
+        #[cfg(target_arch = "wasm32")]
         let _diagnostic_scope = self.diagnostics.enter();
         let source = self.registry.get(id).map(|spec| spec.id).or_else(|| id.starts_with(rustgis_plugins::PREFIX).then_some("Plugin"));
         // Restored on every path, including panics outside `guarded`, so a later notice is not
@@ -1076,7 +1374,54 @@ impl Session {
             // one entry too, as it is one step to undo.
             let joins = self.merge.is_some() && self.merge == self.merged && !self.undo.is_empty();
             let (at, start) = (project_log::now_ms(), web_time::Instant::now());
-            let res = self.run_command(id, params);
+            // A download that lands after its plugin command gave up waiting (it ran again with
+            // that error) isn't added: no command is left to go on with it. Nor is one landing
+            // again, added already (a caller gave its number itself, then the app's own download
+            // came) (#1202).
+            let refused = if matches!(id, "layer.addUrl" | "layer.addDownload")
+                && let Some(n) = params.get("request").and_then(Value::as_u64)
+                && (self.url_waits.given_up(n, params) || self.url_waits.added_already(n, params))
+            {
+                // Its bytes or its read go too; the refusal is said as any refused command is,
+                // once, with its address.
+                if let Some(d) = params.get("id").and_then(Value::as_u64) {
+                    self.downloaded.retain(|(k, _)| *k != d);
+                    self.landed_reads.retain(|(k, _)| *k != d);
+                }
+                // Redacted here too: the assistant and MCP get the error as it is.
+                let url = sources::redact_text(params.get("url").and_then(Value::as_str).unwrap_or("download"));
+                Some(if self.url_waits.added_already(n, params) {
+                    Err(format!("{url}: it was added already for its plugin command, so it wasn't added again"))
+                } else {
+                    self.url_waits.refused(n);
+                    Err(format!("{url}: it came after its plugin command stopped waiting, so it wasn't added"))
+                })
+            } else {
+                None
+            };
+            let res = match refused {
+                Some(refused) => refused,
+                None => self.run_command(id, params),
+            };
+            // A download a plugin command left to the app, added: what it answered is kept for the
+            // command to run again with (#1202).
+            if matches!(id, "layer.addUrl" | "layer.addDownload")
+                && let Some(n) = params.get("request").and_then(Value::as_u64)
+                && self.url_waits.holds(n, params)
+                && !res.as_ref().is_ok_and(|v| v.get("pending").and_then(Value::as_bool) == Some(true))
+            {
+                // What it added, to tell on the command's next run whether it is still there.
+                let added = cmd::plugins::fetch::Added::of(self.map(), &res);
+                self.url_waits.land(n, res.clone(), added);
+            }
+            // A failed overview whose wait is over is read again (the app does this each frame;
+            // a session that doesn't draw, the command line or Python, as its next command runs),
+            // waited for where the session waits for reads in place.
+            if self.read_in_place_again() {
+                self.wait_in_place_reads();
+            }
+            // Pixels the command read in place (a project, an import) say what they lost.
+            self.notice_landed_rasters();
             // A plugin's command waiting for its fetches answers `pending` and runs again when they
             // land: logged then, once. (Another command's `pending`, a download the web app makes, is
             // logged as it is asked for: nothing runs it again.)
@@ -1107,7 +1452,7 @@ impl Session {
             }
             // A refused command is said once, without secrets, as the front ends show it.
             if let Err(error) = &res {
-                let text = rustgis_data::diagnostics::Redacted::new(error);
+                let text = Session::redacted(error);
                 if !self.notices_since(notice_mark).iter().any(|notice| notice.error && notice.text == text.as_str()) {
                     self.notify_redacted(text, true);
                 }
@@ -1121,7 +1466,12 @@ impl Session {
         }
     }
 
+    /// Cleans every returned error, including early refusal and plugin paths.
     fn run_command(&mut self, id: &str, params: &Value) -> CmdResult {
+        self.run_command_inner(id, params).map_err(|e| durable::generated_text(&e))
+    }
+
+    fn run_command_inner(&mut self, id: &str, params: &Value) -> CmdResult {
         // The merge key asked for ([`Session::merge_undo`]) goes to this command if it runs, and is
         // gone if it's refused first, so it can't merge a later command into the last step.
         let merge = if self.depth == 0 { self.merge.take() } else { None };
@@ -1133,7 +1483,7 @@ impl Session {
             self.merge = merge;
             return self.run_plugin(id, params);
         }
-        let Some(&spec) = self.registry.get(id) else { return Err(format!("unknown command '{id}'")) };
+        let Some(&spec) = self.registry.get(id) else { return Err(format!("unknown command '{}'", project_log::log_identifier(id))) };
         // Keys the command does not read: said, so a script or an agent can correct itself.
         if let (Value::Object(given), Some(known)) = (params, spec.param_keys()) {
             // Bounded: the keys come from the caller (the first few, each clipped).
@@ -1172,7 +1522,22 @@ impl Session {
             return Err(e);
         }
         self.merge = merge;
-        let res = self.guarded(label, mutates, |s| run(s, params));
+        // A layer added from a saved web-service connection records it, inside the command's step.
+        let res = self.guarded(label, mutates, |s| {
+            let add = |s: &mut Session| {
+                let before = service_logins::before(s, id, params)?;
+                let out = run(s, params)?;
+                if let Some(before) = before {
+                    service_logins::tag(s, params, before, &out)?;
+                }
+                Ok(out)
+            };
+            if matches!(id, "layer.addUrl" | "layer.addDownload") && params.get("anonymous").and_then(Value::as_bool) == Some(true) {
+                service_logins::anonymously(s, true, add).unwrap_or_else(|_| Err(format!("{label} failed unexpectedly")))
+            } else {
+                add(s)
+            }
+        });
         if id == "layer.addDownload"
             && res.is_ok()
             && let Some(token) = params.get("geolibreLayer").and_then(|v| v.get("token")).and_then(serde_json::Value::as_str)
@@ -1255,7 +1620,7 @@ impl Session {
             (Ok(_), Some(_)) if std::mem::take(&mut self.request_only) => {}
             (Ok(_), Some(mut snap)) => {
                 fresh_source_ids(&snap, &mut self.project);
-                forget_locks_of_removed_features(&snap, &mut self.project);
+                forget_label_state_of_removed_features(&snap, &mut self.project);
                 // An edit may change the dates the time slider's window filters on: bound layers
                 // whose features or fields the command changed (features are shared with the
                 // snapshot until written) take the window again.
@@ -1337,7 +1702,7 @@ impl Session {
                     .skip(history_from)
                     .filter(|record| !record.ok && rustgis_analysis::tool(&record.id).is_some_and(cmd::gp::writes_files))
                 {
-                    self.project.gp_history.push(record);
+                    self.push_gp_record(record);
                     recorded_failure = true;
                 }
                 if recorded_failure {
@@ -1366,6 +1731,11 @@ impl Session {
         }
         self.fix_active_layer();
         self.revision = self.revision.wrapping_add(1);
+        // Nested guards leave their losses pending: only after the outermost rollback has
+        // withdrawn completion notices may these go to ordinary notice consumers.
+        if self.depth == 0 {
+            self.flush_loss_notices();
+        }
         res
     }
 
@@ -1421,12 +1791,16 @@ impl Session {
             plugin_runs: take(&mut self.plugin_runs),
             downloading: take(&mut self.downloading),
             downloaded: take(&mut self.downloaded),
+            landed_reads: take(&mut self.landed_reads),
             url_requests: take(&mut self.url_requests),
             plugin_retries: take(&mut self.plugin_retries),
+            url_waits: take(&mut self.url_waits),
             style_view: self.style_view.take(),
             #[cfg(not(target_arch = "wasm32"))]
             sql_results: take(&mut self.sql_results),
             trend_results: take(&mut self.trend_results),
+            raster_results: take(&mut self.raster_results),
+            raster_runs: take(&mut self.raster_runs),
             edit_counts: take(&mut self.edit_counts),
         }
     }
@@ -1469,12 +1843,16 @@ impl Session {
             plugin_runs,
             downloading,
             downloaded,
+            landed_reads,
             url_requests,
             plugin_retries,
+            url_waits,
             style_view,
             #[cfg(not(target_arch = "wasm32"))]
             sql_results,
             trend_results,
+            raster_results,
+            raster_runs,
             edit_counts,
         } = *a;
         (self.undo, self.redo, self.back, self.forward, self.last_camera) = (undo, redo, back, forward, last_camera);
@@ -1488,10 +1866,11 @@ impl Session {
         (self.path, self.model_run, self.style_view) = (path, model_run, style_view);
         self.opened_package = opened_package;
         self.file_identity = file_identity;
-        (self.pending, self.plugin_runs, self.plugin_retries) = (pending, plugin_runs, plugin_retries);
+        (self.pending, self.plugin_runs, self.plugin_retries, self.url_waits) = (pending, plugin_runs, plugin_retries, url_waits);
         self.file_outputs = file_outputs;
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
-        self.trend_results = trend_results;
+        self.landed_reads = landed_reads;
+        (self.trend_results, self.raster_results, self.raster_runs) = (trend_results, raster_results, raster_runs);
         #[cfg(feature = "geolibre")]
         {
             self.started = started;
@@ -1500,6 +1879,131 @@ impl Session {
         {
             self.sql_results = sql_results;
         }
+    }
+
+    /// Says what reading raster layers' pixels lost when it wasn't said as each was added (pixels
+    /// read in place land later: in the browser, a project, an import): what the file's header
+    /// left out (`Raster::lost`: a colour table missing or short, GDAL metadata that doesn't
+    /// decode), an overview statistics and tools read, a layer read in place that couldn't be
+    /// read, and why. Once for each layer's pixels or failure, one notice of each kind; the app
+    /// calls it each frame.
+    pub fn notice_landed_rasters(&mut self) {
+        let (mut lost, mut held, mut failed, mut dropped) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for m in &mut self.project.maps {
+            for l in &mut m.layers {
+                let Some(rl) = &mut l.raster else { continue };
+                if let Some(e) = rl.error_unsaid() {
+                    failed.push((l.name.clone(), e));
+                }
+                let dropped_here = rl.dropped_unsaid();
+                if !dropped_here.is_empty() {
+                    dropped.push((l.name.clone(), dropped_here));
+                }
+                let in_place = rl.in_place;
+                lost.extend(rl.lost_unsaid().into_iter().map(|what| (l.name.clone(), what)));
+                let Some(d) = rl.pixels_unsaid() else { continue };
+                if let Some(what) = in_place.then(|| in_place_overview(&d)).flatten() {
+                    held.push((l.name.clone(), what));
+                }
+            }
+        }
+        // What a header left out, as adding the layer says it (one notice a kind, with counts).
+        cmd::raster::say_losses(self, lost);
+        if !dropped.is_empty() {
+            let mut kinds: Vec<&str> = dropped.iter().flat_map(|(_, k)| k.iter().copied()).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            let names: Vec<String> = dropped.iter().map(|(n, _)| n.clone()).collect();
+            self.notify(
+                format!(
+                    "{} COG tile layer(s) opened as raster layers read in place, which have no {}: not kept for {}",
+                    dropped.len(),
+                    kinds.join(", "),
+                    names_said(&names)
+                ),
+                false,
+            );
+        }
+        match &failed[..] {
+            [] => {}
+            [(one, e)] => self.notify(format!("{}: couldn't be read in place: {e}", clip(one, 80)), true),
+            many => {
+                let names: Vec<String> = many.iter().map(|(n, _)| n.clone()).collect();
+                self.notify(format!("{} raster layers couldn't be read in place: {}", many.len(), names_said(&names)), true);
+            }
+        }
+        match &held[..] {
+            [] => {}
+            [(one, what)] => self.notify(format!("{}: {what}", clip(one, 80)), false),
+            many => {
+                let names: Vec<String> = many.iter().map(|(n, _)| n.clone()).collect();
+                self.notify(
+                    format!(
+                        "{} rasters are read in place: the map draws them at full resolution as it needs it, while statistics, histograms and raster tools read an overview of each: {}",
+                        many.len(),
+                        names_said(&names)
+                    ),
+                    false,
+                )
+            }
+        }
+    }
+
+    /// Waits for the overviews of the rasters read in place that a project, an import or a layer
+    /// file began reading together (see [`crate::project::read_in_place`]), where the session
+    /// waits for them ([`Session::in_place_wait`]: natively, two minutes at most for all); where
+    /// it doesn't, they land as the map draws. Failing is the layer's to say (see
+    /// [`Session::notice_landed_rasters`]).
+    pub(crate) fn wait_in_place_reads(&mut self) {
+        if !self.in_place_wait {
+            return;
+        }
+        // Every map's at once: one wait bounds them all, not each map's in turn.
+        let mut named: Vec<(String, &mut rustgis_map::raster::RasterLayer)> = self
+            .project
+            .maps
+            .iter_mut()
+            .flat_map(|m| m.layers.iter_mut())
+            .filter_map(|l| {
+                let name = l.name.clone();
+                let rl = l.raster.as_mut()?;
+                rl.in_place.then_some((name, rl))
+            })
+            .collect();
+        let mut layers: Vec<&mut rustgis_map::raster::RasterLayer> = named.iter_mut().map(|(_, rl)| &mut **rl).collect();
+        for (i, e) in rustgis_map::raster::wait_for_reads(&mut layers) {
+            if let Some((name, _)) = named.get(i) {
+                log::warn!("{name}: {e}");
+            }
+        }
+    }
+
+    /// Reads again the overview of a raster layer read in place whose read failed, once its wait
+    /// is over: a minute, or what its server's `Retry-After` said, as a tile or a file's header is
+    /// read again (see `rustgis_tiles::cache::retry_wait`), doubled each time it fails again,
+    /// within the hour (`cache::backoff`: a file that never reads isn't asked for every minute all
+    /// session); until then the map is asked to draw again when the wait is over. The app calls it
+    /// each frame, with [`Session::notice_landed_rasters`], and [`Session::run`] after each command
+    /// (a session that doesn't draw, the command line or Python, asks again that way); the pixels
+    /// land as the map draws, or are waited for where the session waits for reads in place
+    /// ([`Session::in_place_wait`]). Whether a read was started.
+    pub fn read_in_place_again(&mut self) -> bool {
+        use render::rustgis_tiles::cache;
+        let mut started = false;
+        for m in &mut self.project.maps {
+            for l in &mut m.layers {
+                let Some(rl) = &mut l.raster else { continue };
+                let Some((e, at, failures)) = rl.read_failure() else { continue };
+                let wait = cache::backoff(cache::retry_wait(e, cache::RETRY), failures);
+                if at.elapsed() < wait {
+                    cache::notify_at(at + wait);
+                } else {
+                    rl.read_again();
+                    started = true;
+                }
+            }
+        }
+        started
     }
 
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {
@@ -1514,26 +2018,97 @@ impl Session {
     }
 
     fn notice(&mut self, text: String, severity: rustgis_data::diagnostics::Severity) {
-        // Redacted for the status bar and the history alike. `redact` bounds the notice to 8 KiB
-        // (an ellipsis marks the cut) and omits one over 16 KiB whole, so a clipped credential
-        // can't survive; the history's copy is bounded further, to a record's 2 KiB.
-        self.notice_redacted(rustgis_data::diagnostics::Redacted::new(&text), severity);
+        // A web-service connection's password or key never shows, whatever quoted it: scrubbed
+        // first, as its login values are known only here, then redacted for the status bar and
+        // the history alike. `redact` bounds the notice to 8 KiB (an ellipsis marks the cut) and
+        // omits one over 16 KiB whole, so a clipped credential can't survive; the history's copy
+        // is bounded further, to a record's 2 KiB.
+        self.notice_redacted(Self::redacted(&text), severity);
     }
 
-    /// [`Session::notify`] for text already redacted (a failure the caller redacted to compare it
-    /// with the notices): the type says so, so it isn't redacted again.
+    /// `text` scrubbed of every active web-service login (and any login capability), then
+    /// redacted: what a notice or history record may show. Login values are known only here, so
+    /// a failure redacted by [`Session::notify_redacted`]'s callers goes through this first.
+    pub fn redacted(text: &str) -> rustgis_data::diagnostics::Redacted {
+        rustgis_data::diagnostics::Redacted::new(&durable::generated_text(text))
+    }
+
+    /// [`Session::notify`] for text already scrubbed and redacted by [`Session::redacted`] (a
+    /// failure the caller redacted to compare it with the notices): the type says so, so it isn't
+    /// redacted again.
     pub fn notify_redacted(&mut self, text: rustgis_data::diagnostics::Redacted, error: bool) {
         use rustgis_data::diagnostics::Severity;
         self.notice_redacted(text, if error { Severity::Error } else { Severity::Info });
     }
 
+    /// A counted loss that remains true after rollback, unlike a completion such as "Deleted
+    /// 3 features". Only static engine templates with `{n}` and a count enter this channel.
+    /// Counts saturate and repeated templates aggregate once per outer command. Text is redacted
+    /// before retention; at most 32 kinds are held, with excess counts reported as one overflow.
+    /// Outside a guard it is published immediately. A native panic caught by `guarded` follows
+    /// the same outermost drain as an error; nothing is saved in project or undo state.
+    pub(crate) fn notify_loss(&mut self, template: &'static str, count: u32) {
+        use rustgis_data::diagnostics::{Redacted, Severity};
+        if count == 0 {
+            return;
+        }
+        if self.depth == 0 {
+            self.notice_redacted(Redacted::new(&template.replace("{n}", &count.to_string())), Severity::Info);
+        } else if let Some(loss) = self.loss_notices.iter_mut().find(|loss| loss.template == template) {
+            loss.count = loss.count.saturating_add(count);
+            loss.text = Redacted::new(&template.replace("{n}", &loss.count.to_string()));
+        } else if self.loss_notices.len() < MAX_LOSS_NOTICE_KINDS {
+            self.loss_notices.push(LossNotice {
+                template,
+                count,
+                text: Redacted::new(&template.replace("{n}", &count.to_string())),
+                source: self.diagnostic_source,
+            });
+        } else {
+            self.loss_notice_overflow = self.loss_notice_overflow.saturating_add(count);
+        }
+    }
+
+    /// Publishes and empties runtime losses only after outermost success/error/panic cleanup.
+    /// Stored attribution keeps nested command losses assigned to their original command.
+    fn flush_loss_notices(&mut self) {
+        use rustgis_data::diagnostics::Severity;
+        for loss in std::mem::take(&mut self.loss_notices) {
+            self.notice_redacted_from(loss.text, Severity::Info, loss.source);
+        }
+        let overflow = std::mem::take(&mut self.loss_notice_overflow);
+        if overflow > 0 {
+            self.notice(format!("{overflow} further loss(es) could not be described"), Severity::Info);
+        }
+    }
+
+    /// Uses current attribution for ordinary notices; delayed losses retain their own source.
     fn notice_redacted(&mut self, text: rustgis_data::diagnostics::Redacted, severity: rustgis_data::diagnostics::Severity) {
-        self.diagnostics.push_redacted(severity, self.diagnostic_source.unwrap_or("Application"), &text);
-        self.notices.push(Notice { text: text.into_string(), error: severity == rustgis_data::diagnostics::Severity::Error });
+        self.notice_redacted_from(text, severity, self.diagnostic_source);
+    }
+
+    /// The one publication path for the ordinary notice queue and diagnostics; called once per
+    /// loss at drain, so neither sink sees a duplicate from queuing and publication.
+    fn notice_redacted_from(
+        &mut self,
+        text: rustgis_data::diagnostics::Redacted,
+        severity: rustgis_data::diagnostics::Severity,
+        source: Option<&'static str>,
+    ) {
+        if severity == rustgis_data::diagnostics::Severity::Error && self.rerun_said.iter().any(|said| said == text.as_str()) {
+            return;
+        }
+        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text);
+        self.notices.push(Notice { text: text.into_string(), error: severity == rustgis_data::diagnostics::Severity::Error, severity });
         self.notices_given += 1;
         if self.notices.len() > 200 {
             self.notices.remove(0);
         }
+    }
+
+    /// How many notices were given in this session, including ones no longer kept.
+    pub(crate) fn notices_given(&self) -> u64 {
+        self.notices_given
     }
 
     /// A mark to pass to [`Session::notices_since`].
@@ -1942,5 +2517,44 @@ impl Session {
 
     pub fn title(&self) -> String {
         self.project.name.clone()
+    }
+}
+
+impl durable::Durable for GpRecord {
+    fn prepare(&self, p: &mut durable::Prepare<'_>) {
+        use durable::Leaf;
+        let Self { tool, id, params, command, at: _, ok: _, messages, millis: _, outputs: _ } = self;
+        let tool = if id.is_empty() { cmd::gp::tool_id(tool).unwrap_or("") } else { id };
+        p.tool(Leaf::HistoryParams, Leaf::HistoryId, tool, params);
+        if let Some((id, params)) = command {
+            p.command(Leaf::HistoryCommand, Leaf::HistoryCommandId, id, params);
+        }
+        for (i, message) in messages.iter().enumerate() {
+            p.generated(Leaf::Message(i), message);
+        }
+    }
+    fn field_mut(&mut self, owners: &[durable::Owner], leaf: &durable::Leaf) -> Option<durable::FieldMut<'_>> {
+        use durable::{FieldMut, Leaf};
+        if !owners.is_empty() {
+            return None;
+        }
+        match leaf {
+            Leaf::HistoryParams => Some(FieldMut::Json(&mut self.params)),
+            Leaf::HistoryId => Some(FieldMut::Text(&mut self.id)),
+            Leaf::HistoryCommand => Some(FieldMut::Json(&mut self.command.as_mut()?.1)),
+            Leaf::HistoryCommandId => Some(FieldMut::Text(&mut self.command.as_mut()?.0)),
+            Leaf::Message(i) => self.messages.get_mut(*i).map(FieldMut::Text),
+            _ => None,
+        }
+    }
+}
+
+impl Session {
+    /// The single history production seam: retained generated messages never keep address keys.
+    pub(crate) fn push_gp_record(&mut self, mut record: GpRecord) {
+        for message in &mut record.messages {
+            *message = durable::generated_text(message);
+        }
+        self.project.gp_history.push(record);
     }
 }

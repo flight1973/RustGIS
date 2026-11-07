@@ -903,6 +903,7 @@ pub(crate) fn family_picker(ui: &mut Ui, salt: impl std::hash::Hash + std::fmt::
     Picked { response, chosen }
 }
 
+/// Edits this label class's placement, including overlap and callout options, through commands.
 fn position(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
     let cur = c.it.placement;
     let pick = |app: &mut RustGisApp, ui: &mut Ui, pl: LabelPlacement| {
@@ -939,10 +940,87 @@ fn position(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
         });
         if cur.along_line() {
             repeat(app, ui, l, c);
+            // One label a line: other places along it, tried when its own won't do (#1187). Each
+            // repeat is already a place of its own.
+            if c.it.repeat.is_none() {
+                ui.add_space(4.0);
+                let mut on = c.it.other_positions;
+                let help = tl!("If its place is taken or (curved) the line bends too much, the label tries other places along the line.");
+                if ui.checkbox(&mut on, tl!("Try other places along the line")).on_hover_text(help).changed() {
+                    run(app, "labels.placement", c.params(json!({"otherPositions": on})));
+                }
+            }
         }
     }
     ui.add_space(6.0);
     offset(app, ui, l, c);
+    ui.add_space(6.0);
+    crowding(app, ui, l, c);
+}
+
+/// Where labels crowd: every one shown, over the others, rather than some left out; and
+/// callouts, which move a crowded label to a free spot nearby with a line back to its feature,
+/// no longer than so far.
+fn crowding(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, c: &Class) {
+    use rustgis_engine::map::symbology::{CALLOUT_REACH, callout_reach};
+    let id = l.id;
+    grid(ui, "crowding", |ui| {
+        let input_label = ui.label(tl!("Show all labels"));
+        let mut all = c.it.show_all;
+        if ui
+            .checkbox(&mut all, "")
+            .labelled_by(input_label.id)
+            .on_hover_text(tl!("Draw every label, over the others where they crowd, rather than leaving some out."))
+            .changed()
+        {
+            run(app, "labels.placement", c.params(json!({"showAll": all})));
+        }
+        ui.end_row();
+        let input_label = ui.label(tl!("Callouts"));
+        ui.horizontal(|ui| {
+            let mut on = c.it.callout.is_some();
+            if ui
+                .checkbox(&mut on, "")
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!(
+                    "Move a label crowded off its spot to a free one nearby, with a line back to its feature. Labels along lines stay."
+                ))
+                .changed()
+            {
+                run(app, "labels.placement", c.params(json!({"callout": on})));
+            }
+            let Some(reach) = c.it.callout else { return };
+            let mut v = f64::from(reach);
+            let r = ui
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .update_while_editing(false)
+                        .range(CALLOUT_REACH)
+                        .speed(1.0)
+                        .max_decimals(0)
+                        .prefix(tl!("at most "))
+                        .suffix(" pt"),
+                )
+                .labelled_by(input_label.id)
+                .on_hover_text(tl!("The longest a callout's line may be."));
+            crate::ribbon::live_drag(
+                app,
+                ui,
+                &r,
+                f64::from(reach),
+                v,
+                |app, x| {
+                    if let Some(k) = app.session.map_mut().layer_mut(id).and_then(|l| class_mut(&mut l.labels, c.name)) {
+                        k.callout = callout_reach(x);
+                    }
+                },
+                |app, x| {
+                    run(app, "labels.placement", c.params(json!({"callout": x})));
+                },
+            );
+        });
+        ui.end_row();
+    });
 }
 
 /// Along a line, a label every so many points, spaced out from the one at its middle; off, the one
@@ -1381,6 +1459,64 @@ mod tests {
         h.state_mut().session.run("layer.select", &json!({"layer": countries})).unwrap();
         h.run();
         assert!(h.query_by_role_and_label(Role::CheckBox, BOX).is_none(), "not for polygons");
+    }
+
+    /// A line layer's labels can try other places along the line (#1187): the box is there for a
+    /// placement along the line without a repeat, and hiding it leaves what it was set to.
+    #[test]
+    fn other_positions_are_set_in_the_pane_along_lines() {
+        use egui::accesskit::Role;
+        const BOX: &str = "Try other places along the line";
+        let mut h = harness(with_cities());
+        h.run();
+        let rivers = layer_id(h.state(), "Rivers");
+        h.state_mut().session.run("layer.select", &json!({"layer": rivers})).unwrap();
+        h.run();
+        open_tab(&mut h, "Position");
+        let on = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+            h.state().session.map().layer_by_name("Rivers").unwrap().labels.default.other_positions
+        };
+        assert!(h.query_by_role_and_label(Role::CheckBox, BOX).is_none(), "not off the line");
+        for position in ["parallel", "curved"] {
+            h.state_mut().session.run("labels.placement", &json!({"layer": rivers, "position": position})).unwrap();
+            h.run();
+            assert!(h.query_by_role_and_label(Role::CheckBox, BOX).is_some(), "{position}");
+        }
+        h.get_by_role_and_label(Role::CheckBox, BOX).click();
+        h.run();
+        assert!(on(&h));
+        h.state_mut().session.run("labels.placement", &json!({"layer": rivers, "repeat": 144})).unwrap();
+        h.run();
+        assert!(h.query_by_role_and_label(Role::CheckBox, BOX).is_none(), "not with a repeat");
+        assert!(on(&h), "hidden, it's kept");
+        h.state_mut().session.run("labels.placement", &json!({"layer": rivers, "repeat": null})).unwrap();
+        h.run();
+        h.get_by_role_and_label(Role::CheckBox, BOX).click();
+        h.run();
+        assert!(!on(&h));
+        let countries = layer_id(h.state(), "Countries");
+        h.state_mut().session.run("layer.select", &json!({"layer": countries})).unwrap();
+        h.run();
+        assert!(h.query_by_role_and_label(Role::CheckBox, BOX).is_none(), "not for polygons");
+    }
+
+    /// The box along the line sets the class chosen, not Default (#1187).
+    #[test]
+    fn other_positions_along_lines_set_the_chosen_class() {
+        let mut app = with_cities();
+        let rivers = layer_id(&app, "Rivers");
+        app.session.run("layer.select", &json!({"layer": rivers})).unwrap();
+        app.run("labels.class.add", json!({"name": "Named"})).unwrap();
+        app.run("labels.placement", json!({"class": "Named", "position": "curved"})).unwrap();
+        let mut h = harness(app);
+        h.run();
+        pick_class(&mut h, "Default", "Named");
+        open_tab(&mut h, "Position");
+        h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Try other places along the line").click();
+        h.run();
+        let l = labels(h.state());
+        assert!(l.class("Named").unwrap().other_positions);
+        assert!(!l.default.other_positions);
     }
 
     #[test]

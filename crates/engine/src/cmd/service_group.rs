@@ -9,16 +9,16 @@ use super::{C, CmdResult, MAX_GROUP_BYTES, Session, capabilities, ps, service_js
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("service.import", "Import Service", "Home › Add", import).params(
-            r#"{"url": "an OGC API landing page or collections address", "type"?, "name"?: "group name (default My OGC Layer)", "text"?, "documents"?: "as service.layers", "responses"?: [{"url": "features URL", "text": "downloaded GeoJSON"}]} ("group" and "layer" are rejected: use service.refresh)"#,
+        C::new("service.import", "Import Service", "Home › Add", import).roles(&[]).params(
+            r#"{"url": "an OGC API landing page or collections address", "type"?, "name"?: "group name (default My OGC Layer)", "text"?, "documents"?: "as service.layers", "responses"?: [{"url": "features URL", "text": "downloaded GeoJSON"}], "connection"?: "as service.add", "anonymous"?: bool (internal: preserve plugin-selected service provenance)} ("group" and "layer" are rejected: use service.refresh)"#,
         ),
-        C::new("service.refresh", "Refresh", "Layers", refresh).params(
-            r#"{"group"?: id, "layer"?: "one child layer id or name", "text"?, "documents"?, "responses"?: "as service.import"}"#,
+        C::new("service.refresh", "Refresh", "Layers", refresh).roles(&[]).params(
+            r#"{"group"?: id, "layer"?: "one child layer id or name", "text"?, "documents"?, "responses"?: "as service.import", "connection"?: "as service.add (default: the one its layers record)", "anonymous"?: bool (internal: do not borrow a saved login)}"#,
         ),
-        C::new("service.groupPlan", "Service Import Requests", "Layers", plan).view().params(
-            r#"{"url"?, "type"?, "name"?, "group"?: id, "layer"?: "one child layer", "sourceOnly"?: "return the connection without fetching", "text"?, "documents"?} → request, layers, and next while discovery is incomplete"#,
+        C::new("service.groupPlan", "Service Import Requests", "Layers", plan).roles(&[]).view().params(
+            r#"{"url"?, "type"?, "name"?, "group"?: id, "layer"?: "one child layer", "sourceOnly"?: "return the connection without fetching", "text"?, "documents"?, "connection"?: "as service.add", "anonymous"?: bool (internal: preserve plugin-selected service provenance)} → request, layers, and next while discovery is incomplete"#,
         ),
-        C::new("service.group", "Service Group", "Layers", set_group).params(
+        C::new("service.group", "Service Group", "Layers", set_group).roles(&[]).params(
             r#"{"group"?: id, "layer"?: "a child identifying its group", "name"?: text, "expanded"?: bool, "visible"?: "set all children", "remove"?: "remove the group and its children"}"#,
         ),
     ]
@@ -39,15 +39,63 @@ fn target(s: &Session, p: &Value) -> Result<Option<(ServiceGroup, Option<u32>)>,
     Ok(Some((group.clone(), layer)))
 }
 
-fn request(s: &Session, p: &Value) -> CmdResult {
+fn request(s: &mut Session, p: &Value) -> CmdResult {
     let mut q = p.clone();
-    if let Some((group, _)) = target(s, p)? {
-        q["url"] = json!(group.url);
+    let mut anonymous = s.web_logins.is_anonymous() || p.get("anonymous").and_then(Value::as_bool) == Some(true);
+    if let Some((group, child)) = target(s, p)? {
+        anonymous |= group.anonymous || child.and_then(|id| s.map().layer(id)).is_some_and(|l| l.anonymous);
+        // A plugin-selected source never borrows a login, including a later user refresh.
+        if !anonymous && q.get("connection").is_none_or(Value::is_null) {
+            let mut ids = group
+                .children
+                .iter()
+                .filter(|c| child.is_none_or(|id| c.layer == id))
+                .filter_map(|c| s.map().layer(c.layer))
+                .map(|l| l.connection.as_str());
+            if let Some(id) = ids.next().filter(|id| !id.is_empty())
+                && ids.all(|other| other == id)
+                && valid_connection(s, id, &group.url)
+            {
+                q["connection"] = json!(id);
+            }
+        }
+        q["url"] = json!(crate::render::rustgis_tiles::logins::inner(&group.url));
         q["type"] = json!(group.kind);
         q["name"] = json!(group.name);
     }
+    if anonymous {
+        q["anonymous"] = json!(true);
+        if let Some(q) = q.as_object_mut() {
+            q.remove("connection");
+        }
+    }
     super::url_of(&q)?;
-    Ok(q)
+    Ok(crate::service_logins::request_params(s, &q)?.into_owned())
+}
+
+fn valid_connection(s: &Session, id: &str, url: &str) -> bool {
+    let origin = crate::render::rustgis_tiles::logins::origin(url);
+    origin.is_some()
+        && s.connections.connections.iter().any(|c| {
+            c.id == id && crate::service_logins::is_service(c) && crate::render::rustgis_tiles::logins::origin(&c.address) == origin
+        })
+}
+
+fn record_connection(s: &mut Session, layer: u32, request: &Value, anonymous: bool) {
+    if anonymous || request.get("anonymous").and_then(Value::as_bool) == Some(true) {
+        if let Some(layer) = s.map_mut().layer_mut(layer) {
+            layer.anonymous = true;
+            layer.connection.clear();
+        }
+        return;
+    }
+    let Some(id) = ps(request, "connection") else { return };
+    let Some(url) = s.map().layer(layer).and_then(|l| l.dataset.source.as_deref()) else { return };
+    if valid_connection(s, id, url)
+        && let Some(layer) = s.map_mut().layer_mut(layer)
+    {
+        layer.connection = id.to_string();
+    }
 }
 
 fn plan(s: &mut Session, p: &Value) -> CmdResult {
@@ -59,7 +107,8 @@ fn plan(s: &mut Session, p: &Value) -> CmdResult {
 
 fn listing(s: &mut Session, p: &Value) -> CmdResult {
     let q = request(s, p)?;
-    let mut found = capabilities(&q)?;
+    let mut found = capabilities(s, &q)?;
+    super::notify_withheld(s, found.service.withheld_addresses);
     if let Some(error) = found.error {
         return Err(error);
     }
@@ -74,14 +123,24 @@ fn listing(s: &mut Session, p: &Value) -> CmdResult {
             "the service lists collections RustGIS cannot read (more than 2000, or unreadable addresses); the group was not changed".into(),
         );
     }
-    let child = target(s, p)?.and_then(|(g, id)| id.and_then(|id| g.children.into_iter().find(|c| c.layer == id)));
+    let previous = target(s, p)?;
+    let child = previous.as_ref().and_then(|(g, id)| id.and_then(|id| g.children.iter().find(|c| c.layer == id).cloned()));
+    let anonymous: std::collections::HashSet<&str> = previous
+        .as_ref()
+        .into_iter()
+        .flat_map(|(g, _)| &g.children)
+        .filter(|c| s.map().layer(c.layer).is_some_and(|l| l.anonymous))
+        .map(|c| c.collection.as_str())
+        .collect();
     let mut identities = std::collections::HashSet::new();
     let mut offered = Vec::new();
     for (layer, source) in found.service.layers.into_iter().zip(found.sources) {
+        let mut source = source;
         if !matches!(layer.offer, Offer::Features { .. }) {
             continue;
         }
-        if !identities.insert((source.clone(), layer.name.clone())) {
+        source.crossed_origin |= anonymous.contains(layer.name.as_str());
+        if !identities.insert((source.address.clone(), layer.name.clone())) {
             return Err("the service advertises duplicate collection identifiers".into());
         }
         offered.push((layer, source));
@@ -92,7 +151,7 @@ fn listing(s: &mut Session, p: &Value) -> CmdResult {
     // One child: its collection at its saved source, or else the one collection with its id (a
     // rotated query or a moved collections document keeps the child's identity).
     if let Some(c) = &child {
-        let exact = offered.iter().position(|(l, src)| l.name == c.collection && *src == c.source_url);
+        let exact = offered.iter().position(|(l, src)| l.name == c.collection && super::same_address(&src.address, &c.source_url));
         let pos = match exact {
             Some(i) => Some(i),
             None => {
@@ -114,13 +173,18 @@ fn listing(s: &mut Session, p: &Value) -> CmdResult {
     let mut out = service_json(&found.service);
     if let Some(layers) = out.get_mut("layers").and_then(Value::as_array_mut) {
         for (layer, source) in layers.iter_mut().zip(sources) {
-            layer["source_url"] = json!(source);
+            super::layer_source(layer, source);
         }
     }
     if let Some(next) = found.next {
         out["next"] = json!(next);
     }
     out["request"] = json!({"url": q.get("url"), "type": ps(&q, "type").unwrap_or("ogcapi")});
+    if q.get("anonymous").and_then(Value::as_bool) == Some(true) {
+        out["request"]["anonymous"] = json!(true);
+    } else if let Some(connection) = q.get("connection").filter(|v| !v.is_null()) {
+        out["request"]["connection"] = connection.clone();
+    }
     Ok(out)
 }
 
@@ -134,7 +198,7 @@ fn download(_: &mut Session, _: &str, _: &str, _: usize) -> Result<Vec<u8>, Stri
     Err("the browser must supply downloaded feature responses".into())
 }
 
-fn read(s: &mut Session, p: &Value) -> Result<(Value, Vec<(ServiceChild, Dataset)>), String> {
+fn read(s: &mut Session, p: &Value) -> Result<(Value, Vec<(ServiceChild, Dataset, bool)>), String> {
     let listing = listing(s, p)?;
     if listing.get("next").is_some() {
         return Err("complete service discovery before importing or refreshing".into());
@@ -153,7 +217,7 @@ fn read(s: &mut Session, p: &Value) -> Result<(Value, Vec<(ServiceChild, Dataset
             Some(responses) => {
                 let text = responses
                     .iter()
-                    .find(|r| ps(r, "url") == Some(url))
+                    .find(|r| ps(r, "url").is_some_and(|u| super::same_address(u, url)))
                     .and_then(|r| ps(r, "text"))
                     .ok_or_else(|| format!("{name}: missing downloaded response"))?;
                 if text.len() > MAX_GROUP_BYTES.saturating_sub(bytes_read) {
@@ -187,6 +251,7 @@ fn read(s: &mut Session, p: &Value) -> Result<(Value, Vec<(ServiceChild, Dataset
                 source_url: ps(layer, "source_url").unwrap_or_default().to_string(),
             },
             dataset,
+            layer.get("anonymous").and_then(Value::as_bool) == Some(true),
         ));
     }
     Ok((listing, reads))
@@ -199,18 +264,25 @@ fn feature_collection(text: &str) -> bool {
         .is_ok_and(|v| v.get("type").and_then(Value::as_str) == Some("FeatureCollection") && v.get("features").is_some_and(Value::is_array))
 }
 
+/// Imports every feature collection a service advertises as a group of layers, framed on a map
+/// that shows nothing yet.
 fn import(s: &mut Session, p: &Value) -> CmdResult {
     if p.get("group").is_some() || p.get("layer").is_some() {
         return Err("use service.refresh for an existing group or child".into());
     }
+    // `super` is `service`, which lacks the helper, so the path starts at the crate root.
+    let empty_before = crate::cmd::map_is_empty(s);
     let (listing, reads) = read(s, p)?;
     if reads.is_empty() {
         return Err("the service has no feature collections".into());
     }
     let mut children = Vec::new();
     let mut extent = rustgis_geom::Extent::EMPTY;
-    for (mut child, dataset) in reads {
+    for (mut child, dataset, anonymous) in reads {
         child.layer = crate::cmd::layer::add_dataset(s, dataset);
+        if let Some(request) = listing.get("request") {
+            record_connection(s, child.layer, request, anonymous);
+        }
         if let Some(layer) = s.map().layer(child.layer) {
             extent = extent.union(&layer.extent());
         }
@@ -223,12 +295,15 @@ fn import(s: &mut Session, p: &Value) -> CmdResult {
         name,
         url: ps(req, "url").unwrap_or_default().into(),
         kind: ps(req, "type").unwrap_or("ogcapi").into(),
+        anonymous: req.get("anonymous").and_then(Value::as_bool) == Some(true),
         expanded: true,
         children,
     };
     let ids: Vec<u32> = group.children.iter().map(|c| c.layer).collect();
     let id = s.map_mut().add_service_group(group);
-    if !extent.is_empty() {
+    // As adding a service layer: the first group on an empty map is framed, a later one leaves
+    // the view where it is.
+    if empty_before && !extent.is_empty() {
         s.zoom_to(&extent);
     }
     Ok(json!({"group":id,"layers":ids}))
@@ -238,11 +313,11 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
     let (old, child_id) = target(s, p)?.ok_or("group or layer is required")?;
     let hidden = old.children.iter().any(|c| s.map().layer(c.layer).is_some())
         && old.children.iter().filter_map(|c| s.map().layer(c.layer)).all(|l| !l.visible);
-    let (_, reads) = read(s, p)?;
+    let (listing, reads) = read(s, p)?;
     if !s.map().service_groups.iter().any(|g| g.id == old.id) {
         return Err("the group was removed".into());
     }
-    let read_count = |name: &str| reads.iter().filter(|(c, _)| c.collection == name).count();
+    let read_count = |name: &str| reads.iter().filter(|(c, _, _)| c.collection == name).count();
     let old_count = |name: &str| old.children.iter().filter(|c| c.collection == name).count();
     // A child refresh updates that child. A group refresh keeps a child whose collection is at the
     // same source, or else whose collection id is unique on both sides (the source address may
@@ -251,10 +326,10 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
         Some(id) => reads.iter().map(|_| Some(id)).collect(),
         None => reads
             .iter()
-            .map(|(child, _)| {
+            .map(|(child, _, _)| {
                 old.children
                     .iter()
-                    .find(|c| c.collection == child.collection && c.source_url == child.source_url)
+                    .find(|c| c.collection == child.collection && super::same_address(&c.source_url, &child.source_url))
                     .or_else(|| {
                         let unique = read_count(&child.collection) == 1 && old_count(&child.collection) == 1;
                         old.children.iter().find(|c| unique && c.collection == child.collection)
@@ -268,7 +343,8 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
     // whose classes no longer read, drawn with a single symbol.
     let mut notes = Vec::new();
     let mut singled = Vec::new();
-    for ((mut child, mut dataset), existing) in reads.into_iter().zip(matches) {
+    let mut moved = 0;
+    for ((mut child, mut dataset, anonymous), existing) in reads.into_iter().zip(matches) {
         let existing = existing.and_then(|id| s.map_mut().layer_mut(id));
         if let Some(layer) = existing {
             if dataset.geometry_type == rustgis_data::GeometryType::None {
@@ -278,6 +354,9 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
             dataset.name = layer.name.clone();
             layer.dataset = dataset;
             layer.selection.clear();
+            moved += layer.labels.in_order().map(|class| class.moved.len()).sum::<usize>();
+            layer.labels.default.moved.clear();
+            layer.labels.classes.iter_mut().for_each(|class| class.moved.clear());
             let invalid_renderer = match &layer.renderer {
                 rustgis_map::Renderer::Single(_) => false,
                 rustgis_map::Renderer::Unique { expression: Some(e), .. } => rustgis_data::query::parse(e, &layer.dataset).is_err(),
@@ -335,13 +414,22 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
             if let Some(lock) = &mut s.map_mut().label_lock {
                 lock.retain(|((id, _, _, _), _)| *id != child.layer);
             }
+            if let Some(request) = listing.get("request") {
+                record_connection(s, child.layer, request, anonymous);
+            }
         } else {
             child.layer = crate::cmd::layer::add_dataset(s, dataset);
+            if let Some(request) = listing.get("request") {
+                record_connection(s, child.layer, request, anonymous);
+            }
             if hidden && let Some(layer) = s.map_mut().layer_mut(child.layer) {
                 layer.visible = false;
             }
         }
         children.push(child);
+    }
+    if moved > 0 {
+        s.notify(format!("{moved} saved label move(s) reset in refreshed service layers"), false);
     }
     if !notes.is_empty() {
         let lost: usize = notes.iter().map(|(_, n)| n).sum();
@@ -367,7 +455,14 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
     let ids: Vec<u32> = children.iter().map(|c| c.layer).collect();
     if child_id.is_none() {
         let gone: Vec<u32> = old.children.iter().map(|c| c.layer).filter(|id| !ids.contains(id)).collect();
+        let mut gone_moved = 0;
+        for l in s.map().layers.iter().filter(|l| gone.contains(&l.id)) {
+            gone_moved += l.labels.in_order().map(|class| class.moved.len()).sum::<usize>();
+        }
         crate::cmd::layer::drop_layers(s, &gone);
+        if gone_moved > 0 {
+            s.notify(format!("{gone_moved} saved label move(s) dropped with layers the refreshed service no longer offers"), false);
+        }
         if let Some(lock) = &mut s.map_mut().label_lock {
             lock.retain(|((id, _, _, _), _)| !gone.contains(id));
         }
@@ -375,6 +470,7 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
     let map = s.map_mut();
     let group = map.service_groups.iter_mut().find(|g| g.id == old.id).ok_or("the group was removed")?;
     if child_id.is_none() {
+        group.anonymous |= listing["request"].get("anonymous").and_then(Value::as_bool) == Some(true);
         group.children = children;
     } else {
         // The child's provenance follows the service (a new source address or token).
@@ -414,4 +510,112 @@ fn set_group(s: &mut Session, p: &Value) -> CmdResult {
         g.expanded = expanded;
     }
     Ok(json!({"group":group.id}))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn document(ids: &[&str]) -> Value {
+        json!({"collections": ids.iter().map(|id| json!({
+            "id": id, "title": id,
+            "links": [{"rel": "items", "type": "application/geo+json",
+                "href": format!("https://group-none757.example.org/collections/{id}/items")}]
+        })).collect::<Vec<_>>()})
+    }
+
+    fn features() -> String {
+        json!({"type": "FeatureCollection", "features": [{
+            "type": "Feature", "geometry": {"type": "Point", "coordinates": [1, 2]},
+            "properties": {"collection": "any"}
+        }]})
+        .to_string()
+    }
+
+    /// Answers keyed by the offer addresses `service.layers` reports (a service may spell them
+    /// its own way), exactly as `service.import` and `service.refresh` look them up.
+    fn answers(s: &mut Session, p: &Value, text: &str) -> Value {
+        let plan = s.run("service.layers", p).unwrap();
+        json!(plan["layers"].as_array().unwrap().iter().map(|l| json!({"url": l["offer"]["url"], "text": text})).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn refresh_new_children_keep_the_unambiguous_auth_none_connection() {
+        let mut s = Session::new(crate::Project::default());
+        let connection = s
+            .run(
+                "connection.new",
+                &json!({
+                    "kind": "ogcapi", "name": "Public", "auth": "none",
+                    "address": "https://group-none757.example.org/collections"
+                }),
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut p = json!({
+            "url": "https://group-none757.example.org/collections", "type": "ogcapi",
+            "connection": connection, "text": document(&["old"]).to_string()
+        });
+        p["responses"] = answers(&mut s, &p, &features());
+        let imported = s.run("service.import", &p).unwrap();
+        let old = imported["layers"][0].as_u64().unwrap() as u32;
+        let mut q = json!({
+            "url": "https://group-none757.example.org/collections",
+            "group": imported["group"], "text": document(&["old", "new"]).to_string()
+        });
+        q["responses"] = answers(&mut s, &q, &features());
+        s.run("service.refresh", &q).unwrap();
+        assert_eq!(s.map().layers.len(), 2);
+        assert!(s.map().layer(old).is_some());
+        for layer in &s.map().layers {
+            assert_eq!(layer.connection, connection);
+            assert_eq!(layer.dataset.features.len(), 1);
+        }
+    }
+
+    #[test]
+    fn refresh_with_an_explicit_connection_records_it_on_existing_children() {
+        let mut s = Session::new(crate::Project::default());
+        let url = "https://group-none757.example.org/collections";
+        let mut p = json!({"url": url, "type": "ogcapi", "text": document(&["old"]).to_string()});
+        p["responses"] = answers(&mut s, &p, &features());
+        let imported = s.run("service.import", &p).unwrap();
+        let old = imported["layers"][0].as_u64().unwrap() as u32;
+        assert_eq!(s.map().layer(old).unwrap().connection, "");
+        let definition = json!({"kind": "ogcapi", "name": "Public", "auth": "none", "address": url});
+        let connection = s.run("connection.new", &definition).unwrap()["id"].as_str().unwrap().to_string();
+        let mut q = json!({"url": url, "group": imported["group"], "connection": connection, "text": document(&["old"]).to_string()});
+        q["responses"] = answers(&mut s, &q, &features());
+        s.run("service.refresh", &q).unwrap();
+        assert_eq!(s.map().layer(old).unwrap().connection, connection);
+    }
+
+    #[test]
+    fn an_unrelated_explicit_connection_is_not_attributed_to_imported_children() {
+        let mut s = Session::new(crate::Project::default());
+        let connection = s
+            .run(
+                "connection.new",
+                &json!({
+                    "kind": "ogcapi", "name": "Elsewhere", "auth": "none",
+                    "address": "https://elsewhere757.example.org/collections"
+                }),
+            )
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let mut p = json!({
+            "url": "https://group-none757.example.org/collections", "type": "ogcapi",
+            "connection": connection, "text": document(&["new"]).to_string()
+        });
+        p["responses"] = answers(&mut s, &p, &features());
+        s.run("service.import", &p).unwrap();
+        assert_eq!(s.map().layers.len(), 1);
+        assert_eq!(s.map().layers[0].dataset.features.len(), 1);
+        assert!(s.map().layers[0].connection.is_empty());
+    }
 }

@@ -153,10 +153,14 @@ With Unique Values or Graduated Colors, each class in the Symbology pane's list 
 and a legend label. Pick a colour and opacity to give that class its own. Type a label to show in the Layers
 pane and in layout legends instead of the value or range (for example `High income` for
 `1. High income: OECD`); clear it to show the value again. `<all other values>` can be edited the
-same way. Applying the symbology again on the same field keeps the colours, outlines and labels
-you set by hand on the classes that are still there (the others take the scheme's colours again);
-picking another colour scheme recolours every class but keeps the labels. A Graduated Colors
-class keeps its colour and label while its range stays the same. By command:
+same way. The list shows up to 200 classes. A style imported with more says below the list how many
+it leaves out: the list's limit doesn't change how they're drawn, and `layer.classStyle` edits them,
+a Unique Values class by its `value` (a value listed twice is drawn, and edited, as its first class)
+and a Graduated Colors class by its `index`. Applying the symbology again on the same field keeps
+the colours, outlines and labels you set by hand on the classes that are still there (the others
+take the scheme's colours again); picking another colour scheme recolours every class but keeps the
+labels. A Graduated Colors class keeps its colour and label while its range stays the same. By
+command:
 
 ```text
 layer.classStyle={"layer":"Countries","value":"1. High income: OECD","color":"#2E6B4F","label":"High income"}
@@ -378,6 +382,34 @@ its own copy of the ramp it uses, so layer files, map files and packages keep th
 projects that don't have the ramp, and deleting a ramp from the project leaves layers that use
 it unchanged.
 
+## Diagrams
+
+A diagram draws a small chart on each feature from **several numeric fields**, over the renderer's
+own symbol, as ArcGIS Pro's Chart symbology and QGIS's Diagrams draw: a polygon layer of
+administrative units can keep a Graduated Colors fill underneath while a pie on each feature shows
+its split of, say, male and female population. The categories take colours in turn from the palette
+new layers take; a feature where every category is null or zero draws nothing. A pie's slice
+angles are each category's share of the total; a bar chart's bars rise from a baseline, one per
+category. The size is a fixed radius or height in points, the same for every feature, or one grown
+with the categories' sum: from the smallest size to the largest, by the square root of the total's
+share of the range, as Proportional Symbols grow. By command:
+
+```text
+layer.diagram={"layer":"Regions","kind":"pie","fields":["pop_male","pop_female"]}
+layer.diagram={"kind":"bar","fields":[{"field":"under18","color":"#4A90D9"},{"field":"over65","color":"#E07B39"}],"size":{"from":6,"to":40},"labels":"both","background":"#FFFFFFCC","outline":{"color":"#4D4D4D","width":0.75}}
+layer.diagramInfo={"layer":"Regions"}
+layer.clearDiagram={"layer":"Regions"}
+```
+
+Each slice or bar can say something beside it (`"labels"`): `"none"` (the default), `"value"` (the
+feature's number, in the legend's number format — 52K, 1.2M), `"percent"` (its share of the
+feature's total, a whole percent or one decimal below ten), or `"both"` (`52K (52%)`). The label
+draws just past a pie's crust on the slice's mid-angle, or above a bar's top, in a small haloed
+dark text; culling makes room for it, so labelled charts stay visible to their last letter.
+
+The categories list under the layer's classes in layout legends — the printed map's legend lists
+them the same way. Clearing the diagram leaves the renderer as it is.
+
 ## Labeling
 
 The **Labeling pane** brings together the label classes and the chosen class's field, SQL
@@ -453,6 +485,31 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   Lock keeps the ones placed. The distance grows with the labels at a reference scale
   (`labels.placement={"layer": "Rivers", "position": "curved", "repeat": 144}`; `null` or `0` is
   the one at the middle).
+- **Show all labels** (Labeling pane › Position): labels among the view's 20,000 highest-priority
+  candidates are drawn, over the others where
+  they crowd, rather than some left out (`labels.placement={"layer": "Cities", "showAll": true}`).
+- **Callouts** (Labeling pane › Position): a label crowded off its spot moves to the nearest free
+  spot nearby, and a line is drawn from its feature to the text, as QGIS's callouts. **at most**
+  sets how long the line may be (5 to 500 points, 40 to start with): a label with no free spot
+  that close is left out, or drawn over the others with Show all labels. The line takes the
+  label's colour, over its halo. Labels along lines and labels with an icon aren't moved
+  (`labels.placement={"layer": "Cities", "callout": 60}`; `true` keeps the length, `false` turns
+  them off).
+- **Move Label** (Labeling tab › Label Placement): drag a label to where it should be, as with
+  QGIS's Move Label tool. It stays there as the map moves (kept by its feature, in longitude and
+  latitude, and saved with the project), is drawn whatever is under it, and the other labels keep
+  off it; with Callouts on, its line follows it back to its feature, however far it went.
+  Shift-click a moved label to put it back, or **Reset Moved** for all of the layer's. Dragging
+  anything else pans the map; Esc leaves the tool
+  (`labels.move={"layer": "Cities", "feature": 12, "to": [2.5, 49.1]}`; `"to": null` puts it back;
+  `labels.resetMoved={"layer": "Cities", "all": true}`).
+  Deleting a feature removes its saved move; Undo restores it. Service refresh and Repair Data Source reset saved
+  moves and old label locks because replacement data can reuse feature ids, with a counted notice
+  and undo restoration. Opening a project, importing a map or styles, or adding a layer file
+  reports invalid, duplicate or excess moved-label entries that were ignored, callout lengths that
+  were adjusted, and Show all labels settings that were not true or false. A callout length given
+  to `labels.placement` outside 5 to 500 points is brought within range with a notice. Clean
+  settings give no such notice.
 - **Font**: the labels' font family, any installed on the computer (Labeling pane › Symbol
   › **Font**; type part of a name to find it), or the label font the interface uses. Bold and
   italic take the family's own bold and italic faces where it has them. The family is saved by
@@ -482,11 +539,20 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
 - **Other places round points**: a point's label whose place another label takes tries the
   other places round the point, corners first (above right, above left, below right, below left,
   right, left, above, below, leaving out its own), and goes to the first where
-  all of it shows; where none is free it is left out, as before (Labeling pane › Position ›
+  all of it shows; where none does, it stays at its own place and shows what fits there (an icon
+  without its text, say), or is left out if nothing fits (Labeling pane › Position ›
   **Try other places round the point**, for point layers). Off by default: a label that moves can
   take the place a less important one had. The class's offset applies to every place, and Lock
   keeps the place each label took
   (`labels.placement={"layer": "Cities", "otherPositions": true}`).
+- **Other places along lines**: a Parallel or Curved label whose place at the middle is taken, or
+  (curved) where the line bends too sharply, tries up to seven others along the same stretch,
+  nearest the middle first, and goes to the first that will do (Labeling pane › Position › Along
+  lines › **Try other places along the line**). If none will, it is left out, as with this off. A
+  line with a repeat keeps its repeats where they are, so the box is hidden while Repeat is on, and
+  the setting does nothing there or at a position off the line. Off by default, for the same reason
+  as round points, and Lock keeps the place each label took
+  (`labels.placement={"layer": "Rivers", "position": "curved", "otherPositions": true}`).
 - **Lock** keeps the labelled features fixed while you pan and zoom; **Pause** stops drawing
   labels for faster navigation; **View Unplaced** draws the labels that didn't fit in red. They
   apply to the whole map, so they are on the ribbon (Labeling › Map Labeling), not in the pane.

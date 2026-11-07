@@ -25,7 +25,7 @@ fn need_slider(s: &Session) -> Option<&'static str> {
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("time.bind", "Bind to Time Slider", "View › Time", bind)
+        C::new("time.bind", "Bind to Time Slider", "View › Time", bind).roles(&[])
             .when(need_feature_layer)
             .params(r#"{"layer"?, "field"?: date field (default: the one most of whose values read as dates), "start"?, "end"?: dates (default: the field's span, when the slider is new), "unit"?: "hour"|"day"|"month"|"year", "interval"?: number, "show"?: "step"|"wide"|"wider"|"cumulative"}"#),
         C::new("time.unbind", "Unbind from Time Slider", "View › Time", |s, p| {
@@ -34,7 +34,7 @@ pub fn commands() -> Vec<C> {
             let was = l.time.take().map(|t| t.field);
             super::zarr::follow_time(s);
             Ok(json!({"unbound": was}))
-        })
+        }).roles(&[])
         .when(need_feature_layer)
         .params(r#"{"layer"?}"#),
         C::new("time.fields", "Time Fields", "View › Time", |s, p| {
@@ -42,11 +42,11 @@ pub fn commands() -> Vec<C> {
             let l = s.map().layer(id).ok_or("no such layer")?;
             let fields: Vec<Value> = time_fields(&l.dataset).into_iter().map(|(n, share)| json!({"field": n, "share": share})).collect();
             Ok(json!({"fields": fields, "bound": l.time.as_ref().map(|t| t.field.clone())}))
-        })
+        }).roles(&[])
         .view()
         .when(need_feature_layer)
         .params(r#"{"layer"?}"#),
-        C::new("time.set", "Time Slider Settings", "View › Time", set).params(
+        C::new("time.set", "Time Slider Settings", "View › Time", set).roles(&[]).params(
             r#"{"start"?, "end"?: dates (text, a year or milliseconds since 1970), "date"?: the current step, "unit"?: "hour"|"day"|"month"|"year", "interval"?: steps of that many units, "dates"?: [dates] (irregular steps; [] for regular ones), "show"?: "step"|"wide"|"wider"|"cumulative", "before"?: steps before the current one the window takes in, "after"?: steps from the current one (at least 1), "cumulative"?: bool, "speed"?: milliseconds a step shows for, "loop"?: bool, "format"?: date format (YYYY, MM, MMM, DD, HH, mm), "off"?: bool (turns the slider off, every feature showing)}"#,
         ),
         C::new("time.goTo", "Go to Date", "View › Time", |s, p| {
@@ -64,7 +64,7 @@ pub fn commands() -> Vec<C> {
             m.apply_time();
             super::zarr::follow_time(s);
             Ok(info(s))
-        })
+        }).roles(&[])
         .view()
         .when(need_slider)
         .params(r#"{"date": date | "step": number (0 = the first)}"#),
@@ -76,12 +76,12 @@ pub fn commands() -> Vec<C> {
             m.apply_time();
             super::zarr::follow_time(s);
             Ok(info(s))
-        })
+        }).roles(&[])
         .view()
         .when(need_slider)
         .params(r#"{"by"?: steps (default 1; negative goes back), "wrap"?: bool (past the end starts over)}"#),
-        C::new("time.info", "Time Slider", "View › Time", |s, _| Ok(info(s))).view(),
-        C::new("time.export", "Export Time Animation", "View › Time", export)
+        C::new("time.info", "Time Slider", "View › Time", |s, _| Ok(info(s))).roles(&[]).view(),
+        C::new("time.export", "Export Time Animation", "View › Time", export).roles(&[])
             .view()
             .when(need_slider)
             .params(r#"{"path": "*.gif" | "*.zip" (PNG frames), "width"?, "height"?: px, "speed"?: milliseconds a frame shows for (default: the slider's), "from"?, "to"?: dates (default: the whole span)}"#),
@@ -282,7 +282,8 @@ fn export(s: &mut Session, p: &Value) -> CmdResult {
     let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| frames(s, &steps, w, h, gif.then_some(speed))));
     s.map_mut().time = Some(saved);
     s.map_mut().apply_time();
-    super::zarr::follow_time(s);
+    // The step it is back at, read here: a command after the export may read the layer.
+    super::zarr::follow_time_now(s);
     let bytes = made.map_err(|_| "exporting the time steps failed unexpectedly".to_string())??;
     rustgis_data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
     Ok(json!({"path": path, "frames": steps.len(), "bytes": bytes.len()}))
@@ -316,8 +317,9 @@ fn frames(s: &mut Session, steps: &[f64], w: f64, h: f64, gif: Option<u32>) -> R
                 sl.current = *t;
             }
             s.map_mut().apply_time();
-            // Zarr layers that follow the slider read this step's slice.
-            super::zarr::follow_time(s);
+            // Zarr layers that follow the slider read this step's slice, here: each frame draws
+            // its own step.
+            super::zarr::follow_time_now(s);
             // Dated tile layers have this step's address now: natively, map_png (through
             // rustgis_render::render_complete) fetches the tiles it lacks and waits for them
             // before it draws, so each frame shows its own date's imagery.

@@ -430,10 +430,26 @@ pub fn within(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> Vec<(us
 /// counted as holding the center (at 0) when its turns around the pole outrun the steps or are too
 /// many to count. They may lie farther, even beyond the radius.
 pub fn within_counted(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> (Vec<(usize, f64)>, usize) {
+    let report = within_report(ds, rows, at, radius_m);
+    (report.rows, report.bounded)
+}
+
+/// Radius results and counts of approximations or invalid input, for callers to report.
+#[derive(Default)]
+pub struct WithinReport {
+    pub rows: Vec<(usize, f64)>,
+    pub bounded: usize,
+    pub invalid_latitudes: usize,
+    pub missing_coordinates: usize,
+}
+
+/// Searches like [`within_counted`], also counting shapes refused for invalid latitudes and
+/// shapes measured without vertices whose coordinates are missing or infinite.
+pub fn within_report(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) -> WithinReport {
     use rustgis_geom::MAX_LAT;
     // A center that's no place (a latitude past ±90°, a coordinate missing) reaches nothing.
     if !(at.x.is_finite() && at.y.abs() <= 90.0 && radius_m >= 0.0) {
-        return (Vec::new(), 0);
+        return WithinReport::default();
     }
     let m = rustgis_geom::lonlat_to_merc(at);
     let k = radius_scale(at);
@@ -446,10 +462,21 @@ pub fn within_counted(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) ->
     // The steps along polar shapes' edges this search may take, shared by them all.
     let mut steps = Steps::new(REACH_STEPS_TOTAL);
     let mut bounded = 0;
+    let (mut invalid_latitudes, mut missing_coordinates) = (0, 0);
     let mut out: Vec<(usize, f64)> = rows
         .iter()
         .filter_map(|r| {
             let g = ds.features.get(*r)?.geometry.as_ref()?;
+            let (mut invalid, mut missing) = (false, false);
+            g.for_each_coord(|c| {
+                invalid |= c.y.is_finite() && c.y.abs() > 90.0;
+                missing |= !c.is_finite();
+            });
+            if invalid {
+                invalid_latitudes += 1;
+                return None;
+            }
+            missing_coordinates += usize::from(missing);
             // Skip shapes whose box is farther than the radius before projecting them.
             let e = g.extent();
             if polar_point || e.min_y < -MAX_LAT || e.max_y > MAX_LAT {
@@ -475,7 +502,7 @@ pub fn within_counted(ds: &Dataset, rows: &[usize], at: Coord, radius_m: f64) ->
         })
         .collect();
     out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    (out, bounded)
+    WithinReport { rows: out, bounded, invalid_latitudes, missing_coordinates }
 }
 
 /// The steps a search ([`within`]) has left to take along its shapes; and, for the shape being

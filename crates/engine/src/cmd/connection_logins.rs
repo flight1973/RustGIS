@@ -23,7 +23,7 @@ pub(crate) fn restore_active(s: &mut Session) {
 fn groups(s: &Session) -> std::collections::BTreeMap<(&'static str, String), Vec<u32>> {
     let mut groups = std::collections::BTreeMap::<_, Vec<_>>::new();
     for l in s.project.maps.iter().flat_map(|m| &m.layers) {
-        let Some(src) = l.source.as_ref().filter(|src| !src.is_open()) else { continue };
+        let Some(src) = l.source.as_ref().filter(|src| !src.is_open() && !src.reconnect_required()) else { continue };
         let Some((_, db)) = layer_database(src) else { continue };
         let Some(key) = database_key(&crate::sources::redact(db)) else { continue };
         groups.entry(key).or_default().push(l.id);
@@ -41,18 +41,19 @@ pub(super) fn request_password(s: &mut Session, c: &Connection) {
             key,
             connections: vec![c.id.clone()],
             layers,
+            tiles: 0,
             opened: s.opened,
             prompted: false,
         });
     }
 }
 
-/// Resolves every unopened database of the project: a project was opened or imported.
+/// Resolves every unopened database of the project, and the web-service logins its layers read
+/// with: a project was opened or imported.
 pub(crate) fn resolve_project(s: &mut Session) {
-    #[cfg(target_arch = "wasm32")]
-    let _ = s;
     #[cfg(not(target_arch = "wasm32"))]
     resolve(s, None);
+    crate::service_logins::resolve(s, None);
 }
 
 /// Resolves only the databases `keys` names: a saved definition or a single layer change can only
@@ -100,6 +101,7 @@ fn resolve(s: &mut Session, only: Option<&[(&'static str, String)]>) {
                     key: key.clone(),
                     connections: ids,
                     layers: layers.clone(),
+                    tiles: 0,
                     opened: s.opened,
                     prompted: false,
                 });
@@ -112,7 +114,7 @@ fn resolve(s: &mut Session, only: Option<&[(&'static str, String)]>) {
         match super::credential(s, &c) {
             Ok(Some((pw, saved))) => {
                 super::activate(s, &c, pw.expose());
-                super::reopen(s, &c, saved, !saved, true);
+                super::reopen(s, &c, saved, !saved, super::ReopenMode::Automatic);
             }
             Ok(None) => {
                 duckdb::set_connection_password(&key, &c.id, None);

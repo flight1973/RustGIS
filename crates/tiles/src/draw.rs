@@ -1285,6 +1285,7 @@ pub(crate) mod tests {
 
     #[test]
     fn picks_the_vector_tile_features_under_a_point() {
+        let _turn = crate::cache::turn();
         let tile = crate::mvt::encode(&crate::mvt::Tile {
             layers: vec![
                 mvt_layer("parks", GeomKind::Polygon, &[[1024.0, 1024.0], [3072.0, 1024.0], [3072.0, 3072.0], [1024.0, 3072.0]], "Central"),
@@ -1376,11 +1377,28 @@ pub(crate) mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
-        // A hidden source layer is left out of the style: not picked, the others still are.
-        assert_eq!(crate::source::source_layers(spec.kind, &spec.url).unwrap(), ["parks", "roads", "pois", "plots"]);
+        // A hidden source layer is left out of the style: not picked, the others still are. Other
+        // tests running at once may clear the cache, so wait for the archive to be read again.
+        let mut layers = None;
+        for _ in 0..500 {
+            layers = crate::source::source_layers(spec.kind, &spec.url);
+            if layers.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(layers.unwrap(), ["parks", "roads", "pois", "plots"]);
         let without_roads = Spec { hidden_layers: vec!["roads".into()], ..spec.clone() };
         let (x, y) = at(2048.0, 2048.0);
-        assert_eq!(pick(&without_roads, x, y, m_per_px, 3.0, 10).len(), 1, "the park is still there");
+        let mut park = Vec::new();
+        for _ in 0..500 {
+            park = pick(&without_roads, x, y, m_per_px, 3.0, 10);
+            if !park.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(park.len(), 1, "the park is still there");
         let (x, y) = at(200.0, 505.0);
         assert!(pick(&without_roads, x, y, m_per_px, 3.0, 10).is_empty(), "the road isn't");
         // An own style's layers too.
@@ -1396,6 +1414,7 @@ pub(crate) mod tests {
 
     #[test]
     fn picks_a_feature_across_a_tile_edge() {
+        let _turn = crate::cache::turn();
         // Zoom 1: a point at the right edge of the western tile (1/0/0); the click is just over
         // the edge, in the eastern one (1/1/0).
         let tile = crate::mvt::encode(&crate::mvt::Tile { layers: vec![mvt_layer("pois", GeomKind::Point, &[[4094.0, 2048.0]], "Edge")] });

@@ -29,6 +29,7 @@ pub mod neural;
 mod parallel;
 mod parameters;
 pub mod rasterops;
+mod repair;
 pub mod selection;
 pub mod sketch_edit;
 mod stats;
@@ -36,6 +37,7 @@ pub mod tissot;
 mod tools;
 pub mod topology;
 pub mod trend;
+mod validity;
 pub mod warp;
 
 pub use attribute_join::{DuplicateStrategy, JoinFieldOptions, JoinFieldReport, join_field};
@@ -460,11 +462,66 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
     let spec = tool(id).ok_or_else(|| format!("no tool '{id}'"))?;
     let p = resolve_params(spec, params)?;
     // A bug in a tool must not take the app down.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match source_of(spec) {
-        Some((_, runner)) => runner(spec, inputs, &p),
-        None => (spec.run)(inputs, &p),
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if matches!(
+            spec.id,
+            "clip"
+                | "erase"
+                | "intersect"
+                | "identity"
+                | "union"
+                | "symmetricalDifference"
+                | "update"
+                | "split"
+                | "countPoints"
+                | "spatialJoin"
+                | "selectByLocation"
+        ) {
+            for param in spec
+                .params
+                .iter()
+                .filter(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::PointLayer | ParamKind::VectorLayer))
+            {
+                if let Some(name) = p.get(param.name).and_then(Value::as_str)
+                    && let Some(ds) = inputs.dataset(name)
+                {
+                    let selected = inputs.selection(name);
+                    if selected.is_empty() || (spec.id == "selectByLocation" && param.name == "input") {
+                        validate_latitudes(ds, 0..ds.features.len())?;
+                    } else {
+                        validate_latitudes(ds, selected.iter().copied())?;
+                    }
+                }
+            }
+        }
+        match source_of(spec) {
+            Some((_, runner)) => runner(spec, inputs, &p),
+            None => (spec.run)(inputs, &p),
+        }
     }))
     .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
+}
+
+/// Refuses features with finite latitudes outside the Earth instead of clamping them to a pole.
+pub fn validate_latitudes(ds: &rustgis_data::Dataset, rows: impl IntoIterator<Item = usize>) -> Result<(), String> {
+    let invalid = rows
+        .into_iter()
+        .filter(|&row| {
+            let mut invalid = false;
+            if let Some(g) = ds.features.get(row).and_then(|f| f.geometry.as_ref()) {
+                g.for_each_coord(|c| invalid |= c.y.is_finite() && c.y.abs() > 90.0);
+            }
+            invalid
+        })
+        .count();
+    if invalid > 0 {
+        Err(format!(
+            "'{name}' has {invalid} feature(s) with a latitude past ±90°; repair their coordinates before analysis",
+            name = ds.name
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// [`run`] under `control`: setting its flag stops the tool at its next check, and its count
@@ -473,13 +530,23 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
 /// and what it made by then is never taken for its result. One cancelled before it starts doesn't
 /// start.
 pub fn run_with(id: &str, inputs: &dyn Inputs, params: &Value, control: &std::sync::Arc<control::Control>) -> Result<ToolResult, String> {
+    run_under(tool(id).map_or(id, |t| t.name), control, || run(id, inputs, params))
+}
+
+/// `work` on this thread under `control`, as [`run_with`] runs a tool, for work that isn't one (an
+/// engine command's raster): setting `control`'s flag from another thread stops it at its next
+/// check, its count follows the work's progress, and a cancelled run's error says how far `name`
+/// came.
+pub fn run_under<T>(name: &str, control: &std::sync::Arc<control::Control>, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     if control.is_cancelled() {
-        return Err(format!("{} was cancelled before it started", tool(id).map_or(id, |t| t.name)));
+        return Err(format!("{name} was cancelled before it started"));
     }
     let _current = control::install(Some(control.clone()));
-    // No count until the tool starts one: a control used before doesn't show that run's.
+    // A file the work writes or reads counts and stops with it too.
+    let _data = rustgis_data::progress::install(Some(control.clone()));
+    // No count until the work starts one: a control used before doesn't show that run's.
     control::begin(0);
-    let res = run(id, inputs, params);
+    let res = work();
     if !control.is_cancelled() {
         // Finished: its last step is all done, however it counted. A failed one stays where it
         // stopped.
@@ -488,7 +555,6 @@ pub fn run_with(id: &str, inputs: &dyn Inputs, params: &Value, control: &std::sy
         }
         return res;
     }
-    let name = tool(id).map_or(id, |t| t.name);
     Err(match control.progress() {
         Some((done, total)) => {
             format!("{name} was cancelled {}% of the way through its current step", done.saturating_mul(100) / total.max(1))

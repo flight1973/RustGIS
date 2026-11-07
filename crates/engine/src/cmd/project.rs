@@ -11,36 +11,36 @@ pub fn commands() -> Vec<C> {
     vec![
         // Replacing or saving the project isn't an undoable edit: these are `.view()` commands
         // that manage `dirty` and the history themselves.
-        C::new("project.new", "New Project", "Project", new).key("Mod+N").view().params(r#"{"name"?: string}"#),
-        C::new("project.sample", "World Atlas Sample", "Project", sample).view(),
-        C::new("project.open", "Open Project", "Project", open).key("Mod+O").view().params(r#"{"path": string}"#),
-        C::new("project.openText", "Open Project (from text)", "Project", open_text).view().params(r#"{"text": project JSON, "fileName"?: string, "package"?: "true for package contents: never restore saved layer secrets"}"#),
-        C::new("project.save", "Save Project", "Project", save).key("Mod+S").view().params(r#"{"path"?: string}"#),
-        C::new("project.saveAs", "Save Project As", "Project", save_as).key("Mod+Shift+S").view().params(r#"{"path": string}"#),
-        C::new("project.rename", "Rename Project", "Project", rename).params(r#"{"name": string}"#),
-        C::new("edit.undo", "Undo", "Quick Access Toolbar", |s, _| if s.undo() { Ok(Value::Null) } else { Err("nothing to undo".into()) })
+        C::new("project.new", "New Project", "Project", new).roles(&[]).key("Mod+N").view().params(r#"{"name"?: string}"#),
+        C::new("project.sample", "World Atlas Sample", "Project", sample).roles(&[]).view(),
+        C::new("project.open", "Open Project", "Project", open).roles(&[]).key("Mod+O").view().params(r#"{"path": string}"#),
+        C::new("project.openText", "Open Project (from text)", "Project", open_text).roles(&[crate::ParamRole { key: "text", role: crate::Role::Document(crate::Document::Project) }]).view().params(r#"{"text": project JSON, "fileName"?: string, "package"?: "true for package contents: never restore saved layer secrets"}"#),
+        C::new("project.save", "Save Project", "Project", save).roles(&[]).key("Mod+S").view().params(r#"{"path"?: string}"#),
+        C::new("project.saveAs", "Save Project As", "Project", save_as).roles(&[]).key("Mod+Shift+S").view().params(r#"{"path": string}"#),
+        C::new("project.rename", "Rename Project", "Project", rename).roles(&[]).params(r#"{"name": string}"#),
+        C::new("edit.undo", "Undo", "Quick Access Toolbar", |s, _| if s.undo() { Ok(Value::Null) } else { Err("nothing to undo".into()) }).roles(&[])
             .key("Mod+Z")
             .view()
             .when(|s| if s.can_undo() { None } else { Some("nothing to undo") }),
-        C::new("edit.redo", "Redo", "Quick Access Toolbar", |s, _| if s.redo() { Ok(Value::Null) } else { Err("nothing to redo".into()) })
+        C::new("edit.redo", "Redo", "Quick Access Toolbar", |s, _| if s.redo() { Ok(Value::Null) } else { Err("nothing to redo".into()) }).roles(&[])
             .key("Mod+Y")
             .view()
             .when(|s| if s.can_redo() { None } else { Some("nothing to redo") }),
-        C::new("tool.set", "Set Map Tool", "Home › Navigate", set_tool)
+        C::new("tool.set", "Set Map Tool", "Home › Navigate", set_tool).roles(&[])
             .view()
             .params(r#"{"tool": "explore"|"select"|"selectPolygon"|"selectLasso"|"selectRadius"|"zoomIn"|"measure"|"measureArea"|"createPoint"|"createLine"|"createPolygon"|"editVertices"|"cutPolygon"|"reshape"|"graphicPoint"|"graphicText"|"graphicLine"|"graphicCurve"|"graphicFreehand"|"graphicPolygon"|"graphicLasso"|"graphicRectangle"|"graphicCircle"|"graphicEllipse"|"graphicPicture"}"#),
-        C::new("info.project", "Project Info", "Project", info).view().params(r#"{"nameFilter"?: string, "includeFields"?: bool}"#),
-        C::new("info.commands", "List Commands", "Help", list).view(),
+        C::new("info.project", "Project Info", "Project", info).roles(&[]).view().params(r#"{"nameFilter"?: string, "includeFields"?: bool}"#),
+        C::new("info.commands", "List Commands", "Help", list).roles(&[]).view(),
         // The session log (#797): read, written out, emptied, turned on or off. It sits outside
         // the project, so none of these changes the project or takes an undo step.
-        C::new("project.log", "Session Log", "Project", log).view().params(
+        C::new("project.log", "Session Log", "Project", log).roles(&[]).view().params(
             r#"{"since"?: milliseconds since 1970 (UTC), "until"?: milliseconds, "command"?: "a command id, or the start of one (layer.)", "failed"?: bool (true: only those that failed; false: only those that succeeded), "limit"?: entries, a whole number (default 100, the newest; 1 to 1000)} → {"entries": [{"at", "command", "params", "ok", "error"?, "millis"}], "count": matching, "total": in the log, "on": bool}"#,
         ),
-        C::new("project.exportLog", "Export Session Log", "Project", export_log)
+        C::new("project.exportLog", "Export Session Log", "Project", export_log).roles(&[])
             .view()
             .params(r#"{"path": ".csv, .jsonl or .ndjson file", "format"?: "csv"|"jsonl" (for a path with no extension; one given must match the extension)}"#),
-        C::new("project.clearLog", "Clear Session Log", "Project", clear_log).view(),
-        C::new("project.logCommands", "Log Commands", "Project", log_commands).view().params(r#"{"on"?: bool (default: turn it the other way)}"#),
+        C::new("project.clearLog", "Clear Session Log", "Project", clear_log).roles(&[]).view(),
+        C::new("project.logCommands", "Log Commands", "Project", log_commands).roles(&[]).view().params(r#"{"on"?: bool (default: turn it the other way)}"#),
     ]
 }
 
@@ -148,13 +148,18 @@ pub(crate) fn reset_to(s: &mut Session, p: Project) {
     reset(s, p);
 }
 
+/// Replaces project authority, clearing the exchange record, item trust and active connections.
 fn reset(s: &mut Session, p: Project) {
+    s.exchange = None;
     super::connections::clear_active();
     s.database_logins.clear_activations();
     s.database_logins.clear_requests();
     // Kept until the command ends: a failure gives the project back with its history.
     s.put_aside();
     s.project = p;
+    for text in std::mem::take(&mut s.project.label_read_notices) {
+        s.notify(text, false);
+    }
     s.opened_package = None;
     s.opened = s.opened.wrapping_add(1);
     s.active_layer = s.map().layers.first().map(|l| l.id);
@@ -171,16 +176,17 @@ fn reset(s: &mut Session, p: Project) {
     // nothing of the new project is fetched before.
     s.s3_pending.clear();
     crate::s3_connections::resolve_project_s3(s);
+    // Its rasters read in place, begun together as it was read: waited for where the session
+    // waits (the command line, Python), landing as the map draws on the desktop.
+    s.wait_in_place_reads();
     // What reading a raster left out (a colour table, names, a sidecar's scale) is said again as
     // the project opens, as when it was added. One still read in the background isn't here yet.
-    let lost: Vec<(String, String)> = s
-        .project
-        .maps
-        .iter()
-        .flat_map(|m| &m.layers)
-        .filter_map(|l| Some((&l.name, l.raster.as_ref()?.data.as_ref()?)))
-        .flat_map(|(name, d)| d.lost.iter().map(move |l| (name.clone(), l.clone())))
-        .collect();
+    let mut lost: Vec<(String, String)> = Vec::new();
+    for l in s.project.maps.iter_mut().flat_map(|m| &mut m.layers) {
+        if let Some(rl) = &mut l.raster {
+            lost.extend(rl.lost_unsaid().into_iter().map(|what| (l.name.clone(), what)));
+        }
+    }
     super::raster::say_losses(s, lost);
     // A terrain saved on a DEM name two layers share draws the first of them: said, as the
     // project opens (its layers keep their names).
@@ -234,6 +240,8 @@ fn sample(s: &mut Session, _: &Value) -> CmdResult {
 /// Largest project package opened (1 GiB).
 const MAX_PACKAGE: u64 = 1 << 30;
 
+/// `project.open`: a project file, or a package (`.rgispkg`) opened unsaved; either must be a
+/// regular file within its limit.
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let path = PathBuf::from(super::ps(p, "path").ok_or("path is required")?);
     let is_package = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("rgispkg"));
@@ -242,15 +250,7 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
     super::connections::clear_active();
     let proj = (|| {
         if is_package {
-            // Read at most a byte past the limit, so a huge file is refused rather than loaded.
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            std::fs::File::open(&path)
-                .and_then(|f| f.take(MAX_PACKAGE + 1).read_to_end(&mut bytes))
-                .map_err(|e| format!("{}: {e}", path.display()))?;
-            if bytes.len() as u64 > MAX_PACKAGE {
-                return Err("the package is too large".into());
-            }
+            let bytes = crate::project::read_file(&path, MAX_PACKAGE)?;
             Project::from_import_json(&super::items::package_text(&bytes)?, None)
         } else {
             Project::load(&path)
@@ -308,13 +308,12 @@ fn open_text(s: &mut Session, p: &Value) -> CmdResult {
 fn write(s: &mut Session, path: PathBuf) -> CmdResult {
     let path = if path.extension().is_none() { path.with_extension(crate::project::EXTENSION) } else { path };
     let destination = std::path::absolute(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let stripped = s.project.save(&destination)?;
+    let report = s.project.save(&destination)?;
+    let stripped = report.layer_addresses();
     s.mark_saved();
     s.edit_counts.clear();
     s.notify(format!("Saved {}", path.display()), false);
-    if stripped > 0 {
-        s.notify(format!("{stripped} layer address(es) were saved without their keys, tokens or passwords: after RustGIS closes, add those layers again to give them"), false);
-    }
+    crate::durable::notify(s, &report);
     s.path = Some(destination);
     Ok(json!({"path": path.display().to_string(), "stripped": stripped}))
 }

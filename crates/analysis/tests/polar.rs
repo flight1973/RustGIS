@@ -763,3 +763,61 @@ fn a_point_at_a_pole_meets_what_reaches_it_and_lies_in_what_surrounds_it() {
         assert_eq!(uncovered(&layer("cap", features).1), want, "{name}");
     }
 }
+
+#[test]
+fn radius_search_reports_invalid_input_without_clamping() {
+    let c = Coord::new;
+    let mut ds = Dataset::new("bad", GeometryType::Point, vec![]);
+    ds.push(Some(Geometry::Point(c(0.0, 100.0))), vec![]);
+    ds.push(Some(Geometry::Line(vec![vec![c(0.0, 89.0), c(0.5, 89.0), c(f64::NAN, 89.0), c(1.0, 89.0)]])), vec![]);
+    ds.push(Some(Geometry::Point(c(0.0, 89.0))), vec![]);
+    let report = rustgis_analysis::network::within_report(&ds, &[0, 1, 2], c(0.0, 90.0), 200_000.0);
+    assert_eq!(report.invalid_latitudes, 1);
+    assert_eq!(report.missing_coordinates, 1);
+    assert_eq!(report.rows.len(), 2);
+    assert!(!report.rows.iter().any(|(r, _)| *r == 0));
+    let clean = rustgis_analysis::network::within_report(&ds, &[2], c(0.0, 90.0), 200_000.0);
+    assert_eq!((clean.invalid_latitudes, clean.missing_coordinates), (0, 0));
+}
+
+#[test]
+fn pole_tools_refuse_latitudes_outside_the_earth() {
+    let cases = [
+        ("clip", serde_json::json!({"input":"a", "clip":"b"})),
+        ("CLIP", serde_json::json!({"input":"a", "clip":"b"})),
+        ("erase", serde_json::json!({"input":"a", "erase":"b"})),
+        ("intersect", serde_json::json!({"input":"a", "overlay":"b"})),
+        ("identity", serde_json::json!({"input":"a", "overlay":"b"})),
+        ("union", serde_json::json!({"input":"a", "overlay":"b"})),
+        ("symmetricalDifference", serde_json::json!({"input":"a", "overlay":"b"})),
+        ("update", serde_json::json!({"input":"a", "update":"b"})),
+        ("split", serde_json::json!({"input":"a", "split":"b"})),
+        ("countPoints", serde_json::json!({"points":"a", "polygons":"b"})),
+        ("spatialJoin", serde_json::json!({"target":"a", "join":"b"})),
+        ("selectByLocation", serde_json::json!({"input":"a", "select":"b"})),
+        ("Select Layer By Location", serde_json::json!({"input":"a", "select":"b"})),
+    ];
+    for (id, params) in cases {
+        for bad in ["a", "b"] {
+            let map = Map(HashMap::from([
+                layer("a", vec![square(0.0, 88.0, 1.0, if bad == "a" { 95.0 } else { 89.0 })]),
+                layer("b", vec![square(0.0, 88.0, 1.0, if bad == "b" { 95.0 } else { 89.0 })]),
+            ]));
+            let error = rustgis_analysis::run(id, &map, &params).unwrap_err();
+            assert!(error.contains("latitude past ±90°"), "{id} {bad}: {error}");
+        }
+    }
+}
+
+#[test]
+fn polar_dangles_match_parts_stored_many_turns_apart() {
+    let c = Coord::new;
+    for turn in [720.0, -1080.0] {
+        let mut ds = Dataset::new("turns", GeometryType::Polyline, vec![]);
+        ds.push(Some(Geometry::Line(vec![vec![c(0.0, 88.0), c(0.0, 89.0)]])), vec![]);
+        ds.push(Some(Geometry::Line(vec![vec![c(turn, 89.0), c(turn, 89.5)]])), vec![]);
+        let checked = rustgis_analysis::topology::dangles(&ds, &[0, 1], 1.0);
+        assert!(checked.complete);
+        assert_eq!(checked.errors.len(), 2, "turn {turn}");
+    }
+}

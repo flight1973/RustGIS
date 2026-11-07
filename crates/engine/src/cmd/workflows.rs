@@ -14,25 +14,25 @@ use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("gp.env", "Environments", "Analyze › Geoprocessing", environments).params(
+        C::new("gp.env", "Environments", "Analyze › Geoprocessing", environments).roles(&[]).params(
             r#"{"extent"?: "view"|"full"|layer name|[minLon, minLat, maxLon, maxLat]|null, "cellSize"?: degrees|null}"#,
         ),
-        C::new("gp.gallery", "Tool Gallery", "Analyze › Portal", gallery).view().params(r#"{"kind": "ready"|"feature"|"raster"}"#),
-        C::new("model.new", "ModelBuilder", "Analyze › Geoprocessing", new_model).params(
+        C::new("gp.gallery", "Tool Gallery", "Analyze › Portal", gallery).roles(&[]).view().params(r#"{"kind": "ready"|"feature"|"raster"}"#),
+        C::new("model.new", "ModelBuilder", "Analyze › Geoprocessing", new_model).roles(&[crate::ParamRole { key: "steps", role: crate::Role::ModelSteps }, crate::ParamRole { key: "graph", role: crate::Role::ModelGraph }]).params(
             r#"{"name"?: string, "graph"?: {"nodes": [{"id", "kind": "input"|"tool"|"output", "x", "y" (optional), an input's "layer", a tool's "tool" and "params", an output's "name"}], "edges": [{"from", "fromPort": "out", "to", "toPort": a tool's layer parameter | "in" (output)}]}, "steps"?: [{"tool": id, "params": {…, "%1" for step 1's output}}], "fromHistory"?: bool, "imported"?: bool (from a file: its tools may not touch files)}"#,
         ),
-        C::new("model.save", "Save Model", "Analyze › Geoprocessing", save_model)
+        C::new("model.save", "Save Model", "Analyze › Geoprocessing", save_model).roles(&[crate::ParamRole { key: "graph", role: crate::Role::ModelGraph }])
             .params(r#"{"name": model (made if new), "graph": graph (as model.new), "rename"?: new name, "imported"?: bool (from a file: its tools may not touch files; a model from a file stays one)}"#),
-        C::new("model.run", "Run Model", "Analyze › Geoprocessing", run_model)
+        C::new("model.run", "Run Model", "Analyze › Geoprocessing", run_model).roles(&[crate::ParamRole { key: "graph", role: crate::Role::ModelGraph }])
             .params(r#"{"name"?: model (default: the last), "graph"?: run this graph instead (as model.new)}"#),
         C::new("model.validate", "Validate Model", "Analyze › Geoprocessing", |s, p| {
             let (_, g, _) = model_graph(s, p)?;
             let problems = crate::model::validate(s, &g);
             Ok(json!({"ok": problems.is_empty(), "problems": problems}))
-        })
+        }).roles(&[crate::ParamRole { key: "graph", role: crate::Role::ModelGraph }])
         .view()
         .params(r#"{"name"?: model (default: the last), "graph"?: graph}"#),
-        C::new("model.export", "Export Model", "Analyze › Geoprocessing", export_model)
+        C::new("model.export", "Export Model", "Analyze › Geoprocessing", export_model).roles(&[crate::ParamRole { key: "graph", role: crate::Role::ModelGraph }])
             .view()
             .params(r#"{"name"?: model (default: the last), "graph"?: export this graph instead, "path"?: "*.model.json" (else the file's text is returned)}"#),
         C::new("model.remove", "Delete Model", "Browser", |s, p| {
@@ -41,33 +41,33 @@ pub fn commands() -> Vec<C> {
             s.project.models.retain(|m| !m.name.eq_ignore_ascii_case(n));
             s.trusted_models.remove(&n.to_ascii_lowercase());
             if s.project.models.len() == before { Err(format!("no model '{n}'")) } else { Ok(Value::Null) }
-        })
+        }).roles(&[])
         .params(r#"{"name": model}"#),
-        C::new("script.run", "Run Script", "Analyze › Geoprocessing", run_script)
+        C::new("script.run", "Run Script", "Analyze › Geoprocessing", run_script).roles(&[crate::ParamRole { key: "script", role: crate::Role::Script }])
             .params(r#"{"script": "one command per line: id {json}; # comments"}"#),
-        C::new("raster.function", "Raster Functions", "Analyze › Raster", raster_function).params(
-            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample", "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]], "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output}"#,
+        C::new("raster.function", "Raster Functions", "Analyze › Raster", raster_function).roles(&[]).params(
+            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample", "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]], "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
-        C::new("raster.functionChain", "Function Editor", "Analyze › Raster", function_chain)
-            .params(r#"{"layer": raster, "steps": [{"function", …}], "name"?: output}"#),
-        C::new("analysis.suitability", "Suitability Modeler", "Analyze › Workflows", suitability).params(
-            r#"{"criteria": [{"layer": raster, "band"?: 1-based, "ranges": [[lo, hi, score]], "weight": number}], "name"?: output}"#,
+        C::new("raster.functionChain", "Function Editor", "Analyze › Raster", function_chain).roles(&[])
+            .params(r#"{"layer": raster, "steps": [{"function", …}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
+        C::new("analysis.suitability", "Suitability Modeler", "Analyze › Workflows", suitability).roles(&[]).params(
+            r#"{"criteria": [{"layer": raster, "band"?: 1-based, "ranges": [[lo, hi, score]], "weight": number}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
-        C::new("analysis.viewshed", "Visibility Analysis", "Analyze › Workflows", viewshed)
-            .params(r#"{"layer": elevation raster, "lon", "lat", "band"?: 1-based, "height"?: observer metres, "radius"?: metres, "name"?: output}"#),
-        C::new("analysis.lineOfSight", "Line Of Sight", "Analyze › Workflows", line_of_sight).params(
+        C::new("analysis.viewshed", "Visibility Analysis", "Analyze › Workflows", viewshed).roles(&[])
+            .params(r#"{"layer": elevation raster, "lon", "lat", "band"?: 1-based, "height"?: observer metres, "radius"?: metres, "name"?: output, "ran"?: (internal: a viewshed the app has worked out)}"#),
+        C::new("analysis.lineOfSight", "Line Of Sight", "Analyze › Workflows", line_of_sight).roles(&[]).params(
             r#"{"layer": elevation raster, "from": [lon, lat], "to": [lon, lat], "band"?: 1-based, "observerHeight"?: m, "targetHeight"?: m, "name"?: output}"#,
         ),
-        C::new("analysis.interpolate", "Geostatistical Wizard", "Analyze › Workflows", interpolate).params(
-            r#"{"layer": points, "field": numeric field, "cellSize"?: degrees, "power"?: 2, "neighbors"?: 12, "name"?: output}"#,
+        C::new("analysis.interpolate", "Geostatistical Wizard", "Analyze › Workflows", interpolate).roles(&[]).params(
+            r#"{"layer": points, "field": numeric field, "cellSize"?: degrees, "power"?: 2, "neighbors"?: 12, "name"?: output, "ran"?: (internal: a surface the app has worked out)}"#,
         ),
-        C::new("analysis.route", "Network Analysis", "Analyze › Workflows", route).params(
+        C::new("analysis.route", "Network Analysis", "Analyze › Workflows", route).roles(&[]).params(
             r#"{"layer": line network, "from": [lon, lat], "to": [lon, lat], "costField"?: field, "snapDistance"?: metres, "name"?: output}"#,
         ),
-        C::new("analysis.neighborhood", "Neighborhood Explorer", "Analyze › Workflows", neighborhood)
+        C::new("analysis.neighborhood", "Neighborhood Explorer", "Analyze › Workflows", neighborhood).roles(&[])
             .view()
             .params(r#"{"lon", "lat", "radius": metres, "layers"?: [names], "select"?: bool}"#),
-        C::new("analysis.simulate", "Simulation", "Analyze › Workflows", simulate).params(
+        C::new("analysis.simulate", "Simulation", "Analyze › Workflows", simulate).roles(&[]).params(
             r#"{"layer": polygons, "count"?: points per polygon, "seed"?: number, "field"?: numeric field (count per polygon from it, scaled by "rate"), "rate"?: number, "name"?: output}"#,
         ),
         C::new("data.profile", "Data Engineering", "Analyze › Workflows", |s, p| {
@@ -77,15 +77,15 @@ pub fn commands() -> Vec<C> {
                 .map(|f| json!({"field": f.name, "type": f.ty, "count": f.count, "nulls": f.nulls, "distinct": f.distinct, "truncated": f.truncated, "min": f.min, "max": f.max, "mean": f.mean, "top": f.top}))
                 .collect();
             Ok(json!({"layer": ds.name, "features": ds.features.len(), "fields": rows}))
-        })
+        }).roles(&[])
         .view()
         .params(r#"{"layer"?}"#),
-        C::new("data.explore", "Exploratory Analysis", "Analyze › Workflows", explore)
+        C::new("data.explore", "Exploratory Analysis", "Analyze › Workflows", explore).roles(&[])
             .view()
             .params(r#"{"layer"?, "fields"?: [numeric fields], "bins"?: number}"#),
-        C::new("data.similar", "Embeddings", "Analyze › Workflows", similar)
+        C::new("data.similar", "Embeddings", "Analyze › Workflows", similar).roles(&[])
             .params(r#"{"layer"?, "row"?: number (the selected feature when omitted), "fields"?: [numeric fields], "count"?: number, "select"?: bool}"#),
-        C::new("data.convert", "Data Interop", "Analyze › Workflows", convert)
+        C::new("data.convert", "Data Interop", "Analyze › Workflows", convert).roles(&[])
             .view()
             .params(r#"{"layer"?, "format": "geojson"|"csv"|"kml"|"gpx"|"wkt", "path"?: file (the text is returned without one), "nameField"?: field}"#),
     ]
@@ -119,12 +119,182 @@ fn point(p: &Value, k: &str) -> Result<Coord, String> {
     if c.is_finite() && c.y.abs() <= 90.0 { Ok(c) } else { Err(format!("{k} is [lon, lat]")) }
 }
 
-/// Adds a computed raster as a layer (embedded as a GeoTIFF, so it saves with the project).
-fn add_raster(s: &mut Session, r: Raster) -> CmdResult {
-    let name = r.name.clone();
-    let bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
-    let layer = rustgis_map::RasterLayer::from_bytes(r, format!("{name}.tif"), bytes);
-    super::raster::add_raster(s, &name, layer)
+/// A raster a command made, as the layer it adds (its GeoTIFF embedded, so it saves with the
+/// project), what the command says of it besides its layer, and what else the command does once
+/// it is added: made on any thread, added by [`add_made`].
+pub struct Made {
+    name: String,
+    layer: rustgis_map::RasterLayer,
+    extra: Option<Value>,
+    then: Option<Then>,
+    /// Made on another thread: the command's name and the map it was started on.
+    ran: Option<(&'static str, u64)>,
+}
+
+/// A workflow's work once its inputs are read: it reads nothing more of the session, so it runs on
+/// any thread.
+pub(crate) type Work = Box<dyn FnOnce() -> Result<Made, String> + Send>;
+
+/// What a command does to the session once its raster is added (a trained model kept), and what it
+/// adds to its answer.
+pub(crate) type Then = Box<dyn FnOnce(&mut Session, &mut Value) + Send>;
+
+/// A raster embedded as a GeoTIFF, as a layer of its own.
+pub(crate) fn made(raster: Raster, extra: Option<Value>) -> Result<Made, String> {
+    let bytes = rustgis_data::raster::geotiff::write(&raster, 0).map_err(|e| e.to_string())?;
+    let name = raster.name.clone();
+    let layer = rustgis_map::RasterLayer::from_bytes(raster, format!("{name}.tif"), bytes);
+    Ok(made_layer(name, layer, extra, None))
+}
+
+/// A layer made (styled, say), to be added as `name`.
+pub(crate) fn made_layer(name: String, layer: rustgis_map::RasterLayer, extra: Option<Value>, then: Option<Then>) -> Made {
+    Made { name, layer, extra, then, ran: None }
+}
+
+/// Adds a made raster as a layer: the command's answer is the layer's (its id, size and bands) and
+/// what the command says besides (`extra`), and what it does then.
+fn add_made(s: &mut Session, m: Made) -> CmdResult {
+    let Made { name, layer, extra, then, .. } = m;
+    let mut v = super::raster::add_raster(s, &name, layer)?;
+    if let (Some(Value::Object(more)), Some(o)) = (extra, v.as_object_mut()) {
+        o.extend(more);
+    }
+    if let Some(then) = then {
+        then(s, &mut v);
+    }
+    Ok(v)
+}
+
+/// What a command that makes its raster on another thread reads of the session, and the work
+/// that makes it.
+type Start = fn(&Session, &Value) -> Result<Work, String>;
+
+/// The commands that make a raster on another thread from the app ([`raster_start`]), each with
+/// what it is called (in its progress, and a cancelled run's error) and what it reads of the
+/// session: their work grows with the raster, and most of their passes spread it over the cores
+/// from that thread. Run again with `{"ran": id}`, each adds the raster made (#1291 step 3).
+const IN_BACKGROUND: &[(&str, &str, Start)] = &[
+    ("analysis.viewshed", "Viewshed", viewshed_work),
+    ("analysis.interpolate", "Interpolate (IDW)", interpolate_work),
+    ("analysis.suitability", "Suitability Modeler", suitability_work),
+    ("raster.function", "Raster Functions", function_work),
+    ("raster.functionChain", "Function Editor", function_chain_work),
+    ("raster.classify", "Classification Wizard", super::imagery::classify_work),
+    ("raster.classifySupervised", "Classification Tools", super::imagery::supervised_work),
+    ("raster.change", "Change Detection", super::imagery::change_work),
+    ("raster.index", "Indices", super::imagery::index_work),
+    ("raster.process", "Process", super::imagery::process_work),
+    ("imagery.mosaic", "Build Mosaic", super::imagery::mosaic_work),
+    ("dl.classify", "Deep Learning", super::deeplearning::classify_work),
+];
+
+/// `command` and what it is called, when it makes its raster on another thread from the app (see
+/// [`raster_start`]).
+pub fn runs_in_background(command: &str) -> Option<(&'static str, &'static str)> {
+    IN_BACKGROUND.iter().find(|(c, ..)| *c == command).map(|(c, name, _)| (*c, *name))
+}
+
+/// `command`'s raster ([`IN_BACKGROUND`]) made here, or the one the app made on a thread
+/// ([`raster_start`]) and handed over as `ran`: a raster another command made isn't taken.
+pub(crate) fn made_or_ran(s: &mut Session, p: &Value, command: &str) -> CmdResult {
+    let &(_, name, work) = IN_BACKGROUND.iter().find(|(c, ..)| *c == command).ok_or_else(|| format!("{command} makes no raster"))?;
+    if let Some(ran) = p.get("ran").filter(|v| !v.is_null()) {
+        let id = ran.as_u64().ok_or("ran is the number of a run the app worked out")?;
+        let at = s.raster_results.iter().position(|(k, _)| *k == id).ok_or("that run is no longer kept: run it again")?;
+        if s.raster_results[at].1.ran.is_some_and(|(made_by, _)| made_by != name) {
+            return Err(format!("that run made another command's raster, not {name}'s"));
+        }
+        let (_, m) = s.raster_results.remove(at);
+        return add_made(s, m);
+    }
+    let made = work(s, p)?;
+    // Where a person at a terminal can stop it with Ctrl-C: no work cap, as on the app's thread.
+    let made =
+        if s.stoppable { rustgis_analysis::run_under(name, &rustgis_analysis::control::Control::stoppable(), made)? } else { made()? };
+    add_made(s, made)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A command that makes a raster ([`IN_BACKGROUND`]), started to make it on another thread
+/// ([`RasterRun::run`]) while the session goes on: its inputs are read now (cheaply: the pixels
+/// are shared), and [`raster_land`] hands the raster to the command, which adds it with undo and
+/// history when run again with `ran` (#1291 step 3).
+pub struct RasterRun {
+    pub id: u64,
+    /// What the command is called, for a cancelled run's error.
+    pub name: &'static str,
+    work: Work,
+    /// The map it started on, the one its raster is added to.
+    map: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RasterRun {
+    /// Makes the raster, blocking until it's made; `control` stops it and counts its progress (see
+    /// [`rustgis_analysis::control`]).
+    pub fn run(self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> Result<Made, String> {
+        let RasterRun { name, work, map, .. } = self;
+        // A bug in the work, as one in a tool, must not take the app down.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_analysis::run_under(name, control, work)))
+            .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")))
+            .map(|m| Made { ran: Some((name, map)), ..m })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Starts `command` (one of [`RasterRun`]'s) with `p` on the active map, as
+/// it would run, to make its raster on another thread: its parameters checked and its inputs read
+/// now. The run belongs to this project: [`raster_land`] refuses it once another project is open.
+pub fn raster_start(s: &mut Session, command: &str, p: &Value) -> Result<RasterRun, String> {
+    let &(_, name, start) =
+        IN_BACKGROUND.iter().find(|(c, ..)| *c == command).ok_or_else(|| format!("{command} doesn't run in the background"))?;
+    let work = start(s, p)?;
+    s.next_pending = s.next_pending.wrapping_add(1);
+    let id = s.next_pending;
+    // One runs at a time from the app; a few are kept, apart from the downloads' list, so no
+    // number of downloads meanwhile pushes a run out.
+    if s.raster_runs.len() >= 8 {
+        s.raster_runs.remove(0);
+    }
+    s.raster_runs.push(id);
+    Ok(RasterRun { id, name, work, map: s.map().instance_id() })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Whether a run from [`raster_start`] still waits for its raster: opening or creating a project
+/// drops the runs of the previous one.
+pub fn raster_waiting(s: &Session, id: u64) -> bool {
+    s.raster_runs.contains(&id)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Forgets a run from [`raster_start`] that won't land (it failed, or its thread couldn't start).
+pub fn raster_abandon(s: &mut Session, id: u64) {
+    s.raster_runs.retain(|r| *r != id);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Hands over a raster [`RasterRun::run`] made, for its command run again with `{"ran": id}`:
+/// `Ok(false)` when the run was dropped (another project is open), and an error when another map
+/// is active than the one it started on, as for a tool run in the background. A run that failed
+/// is forgotten with [`raster_abandon`].
+pub fn raster_land(s: &mut Session, id: u64, m: Made) -> Result<bool, String> {
+    if !raster_waiting(s, id) {
+        return Ok(false);
+    }
+    raster_abandon(s, id);
+    if let Some((name, map)) = m.ran
+        && map != s.map().instance_id()
+    {
+        return Err(format!("{name} wasn't added: another map was opened while it ran"));
+    }
+    // The last two are kept (each a full raster and its GeoTIFF).
+    if s.raster_results.len() >= 2 {
+        s.raster_results.remove(0);
+    }
+    s.raster_results.push((id, m));
+    Ok(true)
 }
 
 fn out_name(p: &Value, default: String) -> String {
@@ -323,12 +493,106 @@ fn model_graph(s: &Session, p: &Value) -> Result<(String, crate::project::ModelG
         Some(n) => s.project.models.iter().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no model '{n}'"))?,
         None => s.project.models.last().ok_or("the project has no models")?,
     };
-    let g = model.graph.clone().unwrap_or_else(|| crate::model::steps_to_graph(&model.steps));
+    let g = match &model.graph {
+        Some(graph) => graph.clone(),
+        None => crate::model::checked_steps_to_graph(&model.steps)?,
+    };
     Ok((model.name.clone(), g, s.trusted_models.contains(&model.name.to_ascii_lowercase())))
 }
 
-/// Runs a model's graph, or the graph passed.
+/// Runs a model's graph, or the graph passed: taking the tools the app ran ahead
+/// ([`ahead_on_copy`]) whose inputs are still the same.
 fn run_model(s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(ran) = super::reads::take::<Vec<super::gp::RanAhead>>(s, MODEL_AHEAD) {
+        return super::gp::taking(s, ran, |s| run_model_here(s, p));
+    }
+    run_model_here(s, p)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The key of a model's tools run ahead ([`ahead_on_copy`]).
+const MODEL_AHEAD: &str = "model.run";
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The key of a script's tools run ahead ([`ahead_on_copy`]).
+const SCRIPT_AHEAD: &str = "script.run";
+
+#[cfg(not(target_arch = "wasm32"))]
+/// `command` (`model.run` or `script.run`) run on a copy of the session, made on a thread of its
+/// own: it records what each tool it runs read and made, for the command to take instead of
+/// running them again, so what the run adds, says, logs and puts in Undo is the same as when it
+/// runs here. It stops at a tool that writes files, a plugin's or GeoLibre's, and at a script's
+/// line that may reach outside the session ([`runs_on_a_copy`]): from there the run here runs
+/// them as it always has. What it says and how it ends are the run here's to say.
+pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> super::reads::ReadAhead {
+    let name = if command == SCRIPT_AHEAD { "Run Script" } else { "Run Model" };
+    let (project, trusted) = (s.project.clone(), s.trusted_models.clone());
+    let (view_size, active_layer, p) = (s.view_size, s.active_layer, p.clone());
+    // What its tools ask of servers and files goes in this session's Diagnostics, as when they
+    // run here: the run here takes their results and asks nothing.
+    let requests = s.diagnostics.capture();
+    super::reads::ahead(name, command.into(), move || {
+        let mut copy = Session::new(project);
+        copy.requests_into = Some(requests);
+        copy.trusted_models = trusted;
+        copy.view_size = view_size;
+        copy.active_layer = active_layer;
+        copy.tools_ahead = Some(super::gp::Ahead::Recording(Vec::new()));
+        let _ = copy.run(command, &p);
+        super::gp::ran_ahead(&mut copy)
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A script's run on a copy of the session ([`ahead_on_copy`]), unless its first line would stop
+/// the copy at once, or the script has no lines or doesn't parse: then it runs here, with no copy
+/// made.
+pub(crate) fn script_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadAhead> {
+    let lines = script_commands(ps(p, "script")?).ok()?;
+    let (_, id, params) = lines.first()?;
+    runs_on_a_copy(id, params).then(|| ahead_on_copy(s, SCRIPT_AHEAD, p))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The commands a script's line may run on a copy of the session ([`runs_on_a_copy`]): those
+/// whose results are taken (a tool, a model) and those that change only what the taking compares
+/// by value (a selection, a layer's name or query, the environment, the projection). A line that
+/// makes rows of its own (an edit, a layer from a selection) isn't one: the rows it made on the
+/// copy are never the run here's, so every tool after it would run again.
+pub(crate) const ON_A_COPY: &[&str] = &[
+    "model.run",
+    "gp.run",
+    "gp.spatialJoin",
+    "gp.zonalStats",
+    "gp.env",
+    "select.all",
+    "select.atPoint",
+    "select.byAttributes",
+    "select.byPolygon",
+    "select.byRadius",
+    "select.byRect",
+    "select.clear",
+    "select.rows",
+    "select.switch",
+    "layer.remove",
+    "layer.rename",
+    "layer.definitionQuery",
+    "layer.select",
+    "map.projection",
+];
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Whether a script's line runs on a copy of the session ([`ahead_on_copy`]): one of
+/// [`ON_A_COPY`], naming no file: run twice, none changes anything outside the session. Any
+/// other line stops the copy there, Add Data and Load All among them (they would read their
+/// files and servers twice).
+fn runs_on_a_copy(id: &str, params: &Value) -> bool {
+    // A model's own tools are checked as they run; any other line by what its parameters name.
+    ON_A_COPY.contains(&id) && (id == "model.run" || !super::items::touches_files(id, params))
+}
+
+fn run_model_here(s: &mut Session, p: &Value) -> CmdResult {
     // A model saved as steps runs as steps: `%n` may stand anywhere in them, and inputs may be files.
     if p.get("graph").is_none_or(Value::is_null) {
         let model = match ps(p, "name") {
@@ -370,7 +634,9 @@ fn save_model(s: &mut Session, p: &Value) -> CmdResult {
 /// A model as a `*.model.json` file: written to `path`, or its text returned.
 fn export_model(s: &mut Session, p: &Value) -> CmdResult {
     let (name, g, _) = model_graph(s, p)?;
-    let text = serde_json::to_string_pretty(&crate::model::to_file(&name, &g)).map_err(|e| e.to_string())?;
+    let (text, report) =
+        crate::durable::output_owned(g, |g| serde_json::to_string_pretty(&crate::model::to_file(&name, g)).map_err(|e| e.to_string()))?;
+    crate::durable::notify(s, &report);
     let file: String = name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     match ps(p, "path") {
         Some(path) => {
@@ -439,11 +705,26 @@ fn wire(v: &mut Value, outputs: &[String], step: usize, depth: usize) -> Result<
 /// any command, files included; notebooks vet cells that came from files before running them.
 /// The whole script is one undo step.
 pub(crate) fn run_script(s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(ran) = super::reads::take::<Vec<super::gp::RanAhead>>(s, SCRIPT_AHEAD) {
+        return super::gp::taking(s, ran, |s| run_script_here(s, p));
+    }
+    run_script_here(s, p)
+}
+
+/// Runs a script's lines in order ([`run_script`]).
+fn run_script_here(s: &mut Session, p: &Value) -> CmdResult {
     let script = ps(p, "script").ok_or("script is required")?;
     let mut out = Vec::new();
     for (n, id, params) in script_commands(script)? {
         let spec = s.registry.get(&id).ok_or_else(|| format!("line {n}: unknown command '{id}'"))?;
         let (run, enabled, mutates, label) = (spec.run, spec.enabled, spec.mutates, spec.label);
+        // On a copy of the session ([`ahead_on_copy`]): from a line that may reach outside it,
+        // the run here runs the rest.
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(s.tools_ahead, Some(super::gp::Ahead::Recording(_))) && !runs_on_a_copy(&id, &params) {
+            return Err(super::gp::NOT_AHEAD.into());
+        }
         // As when typed directly, a line naming a layer is checked against that layer.
         if params.get("layer").is_some()
             && let Ok(lid) = s.layer_id(&params)
@@ -457,10 +738,19 @@ pub(crate) fn run_script(s: &mut Session, p: &Value) -> CmdResult {
         if let Some(e) = s.streamed_edit(&id, mutates, label, s.active_layer) {
             return Err(format!("line {n}: {e}"));
         }
-        let r = run(s, &params).map_err(|e| format!("line {n}: {id}: {e}"))?;
+        let r = steps_of(s, |s| run(s, &params)).map_err(|e| format!("line {n}: {id}: {e}"))?;
         out.push(json!({"line": n, "command": id, "result": r}));
     }
     Ok(json!({"ran": out}))
+}
+
+/// `run` as a step of the command running now ([`Session::steps_running`] counts it, on every
+/// path, a panic included, which is raised again).
+pub(crate) fn steps_of<T>(s: &mut Session, run: impl FnOnce(&mut Session) -> T) -> T {
+    s.steps_running += 1;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(s)));
+    s.steps_running = s.steps_running.saturating_sub(1);
+    r.unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
 /// The most lines a script is read to: Run reads no further, and the Script pane colours no further.
@@ -478,27 +768,17 @@ pub fn refused_in_script(id: &str) -> bool {
 pub fn script_commands(script: &str) -> Result<Vec<(usize, String, Value)>, String> {
     let mut out = Vec::new();
     for (n, line) in script.lines().enumerate().take(MAX_SCRIPT_LINES) {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+        if let Some(parsed) = crate::script_line(line) {
+            let (id, params) = parsed.map_err(|e| format!("line {}: {e}", n + 1))?;
+            out.push((n + 1, id, params));
         }
-        let (id, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-        let id = id.trim_end_matches('=');
-        let params: Value = if rest.trim().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(rest.trim()).map_err(|e| format!("line {}: {e}", n + 1))?
-        };
-        if refused_in_script(id) {
-            return Err(format!("line {}: '{id}' can't run in a script", n + 1));
-        }
-        out.push((n + 1, id.to_string(), params));
     }
     Ok(out)
 }
 
-/// One raster function's output pixels on `r`'s grid.
-fn apply_function(s: &Session, r: &Raster, p: &Value) -> Result<Vec<f32>, String> {
+/// One raster function's output pixels on `r`'s grid, or a resample's on `target`'s (from
+/// [`resample_target`]).
+fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>) -> Result<Vec<f32>, String> {
     let band = band_of(p, r)?;
     let zf = f(p, "zFactor").unwrap_or(1.0).clamp(0.0001, 100_000.0);
     match ps(p, "function").ok_or("function is required")? {
@@ -533,63 +813,92 @@ fn apply_function(s: &Session, r: &Raster, p: &Value) -> Result<Vec<f32>, String
             };
             rasterops::remap(r, band, &ranges, b(p, "keep").unwrap_or(false))
         }
-        "resample" => {
-            let t = raster_of(s, ps(p, "target").ok_or("target (a raster to match) is required")?)?;
-            if t.width as usize * t.height as usize > rasterops::max_pixels() {
-                return Err(format!("the target grid is larger than this computer's {} cells", rasterops::max_pixels()));
-            }
-            rasterops::resample_to(r, band, &t)
-        }
+        "resample" => rasterops::resample_to(r, band, target.ok_or("target (a raster to match) is required")?),
         other => Err(format!("unknown raster function '{other}'")),
     }
 }
 
+/// The raster a resample step (`p`) takes the grid of: none for another function.
+fn resample_target(s: &Session, p: &Value) -> Result<Option<std::sync::Arc<Raster>>, String> {
+    if ps(p, "function") != Some("resample") {
+        return Ok(None);
+    }
+    let t = raster_of(s, ps(p, "target").ok_or("target (a raster to match) is required")?)?;
+    if t.width as usize * t.height as usize > rasterops::max_pixels() {
+        return Err(format!("the target grid is larger than this computer's {} cells", rasterops::max_pixels()));
+    }
+    Ok(Some(t))
+}
+
 fn raster_function(s: &mut Session, p: &Value) -> CmdResult {
+    made_or_ran(s, p, "raster.function")
+}
+
+/// What a raster function reads of the session, and the work that applies it.
+fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
     let src = raster_of(s, ps(p, "layer").ok_or("layer is required")?)?;
-    let func = ps(p, "function").unwrap_or("");
-    let pixels = apply_function(s, &src, p)?;
-    let grid = if func == "resample" { raster_of(s, ps(p, "target").unwrap_or(""))? } else { src.clone() };
-    let r = rasterops::derive(&grid, &out_name(p, format!("{}_{func}", src.name)), vec![pixels])?;
-    add_raster(s, r)
+    let target = resample_target(s, p)?;
+    let name = out_name(p, format!("{}_{}", src.name, ps(p, "function").unwrap_or("")));
+    let p = p.clone();
+    Ok(Box::new(move || {
+        let pixels = apply_function(&src, &p, target.as_deref())?;
+        // Only a resample takes another raster's grid.
+        made(rasterops::derive(target.as_deref().unwrap_or(&src), &name, vec![pixels])?, None)
+    }))
 }
 
 /// Runs raster functions one after another, each on the previous one's output.
 fn function_chain(s: &mut Session, p: &Value) -> CmdResult {
-    let mut cur: Raster = (*raster_of(s, ps(p, "layer").ok_or("layer is required")?)?).clone();
-    let steps = p.get("steps").and_then(Value::as_array).ok_or("steps is required")?;
+    made_or_ran(s, p, "raster.functionChain")
+}
+
+/// What a chain of raster functions reads of the session (its raster, and each resample's
+/// target), and the work that applies them.
+fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
+    let src = raster_of(s, ps(p, "layer").ok_or("layer is required")?)?;
+    let steps = p.get("steps").and_then(Value::as_array).ok_or("steps is required")?.clone();
     if steps.is_empty() || steps.len() > 20 {
         return Err("give 1 to 20 steps".into());
     }
-    let mut names = Vec::new();
-    for (i, st) in steps.iter().enumerate() {
-        let func = st.get("function").and_then(Value::as_str).unwrap_or("?").to_string();
-        let pixels = apply_function(s, &cur, st).map_err(|e| format!("step {} ({func}): {e}", i + 1))?;
-        // Only a resample takes another raster's grid; otherwise the grid is the current one.
-        cur = if func == "resample" {
-            let target = raster_of(s, st.get("target").and_then(Value::as_str).unwrap_or(""))?;
-            rasterops::derive(&target, &cur.name, vec![pixels])?
-        } else {
-            rasterops::derive(&cur, &cur.name, vec![pixels])?
-        };
-        names.push(func);
-    }
-    cur.name = out_name(p, format!("{}_{}", cur.name, names.join("_")));
-    add_raster(s, cur)
+    let func = |st: &Value| st.get("function").and_then(Value::as_str).unwrap_or("?").to_string();
+    let targets: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, st)| resample_target(s, st).map_err(|e| format!("step {} ({}): {e}", i + 1, func(st))))
+        .collect::<Result<_, _>>()?;
+    let named = Some(out_name(p, String::new())).filter(|n| !n.is_empty());
+    Ok(Box::new(move || {
+        let mut cur: Raster = (*src).clone();
+        let mut names = Vec::new();
+        for (i, (st, target)) in steps.iter().zip(&targets).enumerate() {
+            let f = func(st);
+            let pixels = apply_function(&cur, st, target.as_deref()).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
+            // Only a resample takes another raster's grid; otherwise the grid is the current one.
+            cur = rasterops::derive(target.as_deref().unwrap_or(&cur), &cur.name, vec![pixels])?;
+            names.push(f);
+        }
+        cur.name = named.unwrap_or_else(|| format!("{}_{}", cur.name, names.join("_")));
+        made(cur, None)
+    }))
 }
 
 fn suitability(s: &mut Session, p: &Value) -> CmdResult {
+    made_or_ran(s, p, "analysis.suitability")
+}
+
+/// What a weighted overlay reads of the session (each criterion's raster, band, ranges and
+/// weight), and the work that scores and weighs them.
+fn suitability_work(s: &Session, p: &Value) -> Result<Work, String> {
     let crit = p.get("criteria").and_then(Value::as_array).ok_or("criteria is required")?;
     if crit.is_empty() || crit.len() > 20 {
         return Err("give 1 to 20 criteria".into());
     }
     let first =
         raster_of(s, crit.first().and_then(|c| c.get("layer")).and_then(Value::as_str).ok_or("each criterion names a raster layer")?)?;
-    let mut scored = Vec::new();
+    let mut criteria = Vec::new();
     for c in crit {
         let r = raster_of(s, c.get("layer").and_then(Value::as_str).ok_or("each criterion names a raster layer")?)?;
         let band = band_of(c, &r)?;
-        let on_grid = rasterops::resample_to(&r, band, &first)?;
-        let grid = rasterops::derive(&first, "c", vec![on_grid])?;
         let ranges: Vec<(f64, f64, f64)> = c
             .get("ranges")
             .and_then(Value::as_array)
@@ -603,26 +912,40 @@ fn suitability(s: &mut Session, p: &Value) -> CmdResult {
         if ranges.is_empty() {
             return Err("each criterion has ranges [[lo, hi, score], …]".into());
         }
-        let scores = rasterops::remap(&grid, 0, &ranges, false)?;
-        scored.push((scores, c.get("weight").and_then(Value::as_f64).unwrap_or(1.0)));
+        criteria.push((r, band, ranges, c.get("weight").and_then(Value::as_f64).unwrap_or(1.0)));
     }
-    let out = rasterops::weighted_overlay(&scored)?;
-    let r = rasterops::derive(&first, &out_name(p, "Suitability".into()), vec![out])?;
-    add_raster(s, r)
+    let name = out_name(p, "Suitability".into());
+    Ok(Box::new(move || {
+        let mut scored = Vec::new();
+        for (r, band, ranges, weight) in &criteria {
+            let on_grid = rasterops::resample_to(r, *band, &first)?;
+            let grid = rasterops::derive(&first, "c", vec![on_grid])?;
+            scored.push((rasterops::remap(&grid, 0, ranges, false)?, *weight));
+        }
+        let out = rasterops::weighted_overlay(&scored)?;
+        made(rasterops::derive(&first, &name, vec![out])?, None)
+    }))
 }
 
 fn viewshed(s: &mut Session, p: &Value) -> CmdResult {
+    made_or_ran(s, p, "analysis.viewshed")
+}
+
+/// What a viewshed reads of the session, and the work that makes it.
+fn viewshed_work(s: &Session, p: &Value) -> Result<Work, String> {
     let dem = raster_of(s, ps(p, "layer").ok_or("layer is required")?)?;
     let at = Coord::new(f(p, "lon").ok_or("lon is required")?, f(p, "lat").ok_or("lat is required")?);
     let band = band_of(p, &dem)?;
     let (cx, cy) = dem.cell_size_m();
     // The whole raster by default: its diagonal reaches every cell from any observer.
     let radius = f(p, "radius").unwrap_or((cx * dem.width as f64).hypot(cy * dem.height as f64)).clamp(1.0, 500_000.0);
-    let vs = rasterops::viewshed(&dem, band, at, f(p, "height").unwrap_or(1.7).clamp(0.0, 10_000.0), radius)?;
-    let seen = vs.iter().filter(|v| **v == 1.0).count();
-    let r = rasterops::derive(&dem, &out_name(p, format!("{}_viewshed", dem.name)), vec![vs])?;
-    let v = add_raster(s, r)?;
-    Ok(json!({"layer": v["layer"], "visibleCells": seen}))
+    let height = f(p, "height").unwrap_or(1.7).clamp(0.0, 10_000.0);
+    let name = out_name(p, format!("{}_viewshed", dem.name));
+    Ok(Box::new(move || {
+        let vs = rasterops::viewshed(&dem, band, at, height, radius)?;
+        let seen = vs.iter().filter(|v| **v == 1.0).count();
+        made(rasterops::derive(&dem, &name, vec![vs])?, Some(json!({"visibleCells": seen})))
+    }))
 }
 
 fn line_of_sight(s: &mut Session, p: &Value) -> CmdResult {
@@ -662,6 +985,11 @@ fn line_of_sight(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn interpolate(s: &mut Session, p: &Value) -> CmdResult {
+    made_or_ran(s, p, "analysis.interpolate")
+}
+
+/// What an IDW surface reads of the session, and the work that makes it.
+fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let ds = feature_ds(s, p)?;
     let field = ps(p, "field").ok_or("field is required")?;
     let fi = ds.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
@@ -678,15 +1006,9 @@ fn interpolate(s: &mut Session, p: &Value) -> CmdResult {
     });
     let cell = f(p, "cellSize").or(s.project.gp_env.cell_size).unwrap_or((e.width().max(e.height()) / 300.0).max(1e-5));
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
-    let r = rasterops::idw(
-        &pts,
-        &e,
-        cell,
-        f(p, "power").unwrap_or(2.0).clamp(0.5, 10.0),
-        p.get("neighbors").and_then(Value::as_u64).unwrap_or(12).max(1) as usize,
-        &name,
-    )?;
-    add_raster(s, r)
+    let power = f(p, "power").unwrap_or(2.0).clamp(0.5, 10.0);
+    let neighbors = p.get("neighbors").and_then(Value::as_u64).unwrap_or(12).max(1) as usize;
+    Ok(Box::new(move || made(rasterops::idw(&pts, &e, cell, power, neighbors, &name)?, None)))
 }
 
 /// Creates a route layer and reports invalid source segments omitted from its network.
@@ -732,12 +1054,15 @@ fn neighborhood(s: &mut Session, p: &Value) -> CmdResult {
     let mut out = Vec::new();
     let mut found: Vec<(u32, Vec<usize>)> = Vec::new();
     let mut bounded = Vec::new();
+    let mut invalid = Vec::new();
     for l in s.map().layers.iter().filter(|l| s.map().shows(l) && !l.is_raster() && !l.graphics) {
         if only.as_ref().is_some_and(|o| !o.contains(&l.name.to_ascii_lowercase())) {
             continue;
         }
         let rows: Vec<usize> = l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect();
-        let (near, n) = network::within_counted(&l.dataset, &rows, at, radius);
+        let report = network::within_report(&l.dataset, &rows, at, radius);
+        let (near, n) = (report.rows, report.bounded);
+        invalid.push((l.name.clone(), report.invalid_latitudes, report.missing_coordinates));
         if n > 0 {
             bounded.push((l.name.clone(), n));
         }
@@ -757,6 +1082,7 @@ fn neighborhood(s: &mut Session, p: &Value) -> CmdResult {
         found.push((l.id, near.into_iter().map(|x| x.0).collect()));
     }
     super::select::warn_bounded(s, &bounded);
+    super::select::warn_radius_input(s, &invalid);
     if b(p, "select").unwrap_or(false) {
         s.map_mut().clear_selection();
         for (id, rows) in found {
@@ -905,8 +1231,8 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
     let text = match ps(p, "format").ok_or("format is required")? {
         "geojson" => rustgis_data::io::to_geojson(ds).to_string(),
         "csv" => rustgis_data::io::to_csv(ds).map_err(|e| e.to_string())?,
-        "kml" => rustgis_data::interop::to_kml(ds, name_field),
-        "gpx" => rustgis_data::interop::to_gpx(ds, name_field),
+        "kml" => rustgis_data::interop::to_kml(ds, name_field).map_err(|e| e.to_string())?,
+        "gpx" => rustgis_data::interop::to_gpx(ds, name_field).map_err(|e| e.to_string())?,
         "wkt" => rustgis_data::interop::to_wkt_csv(ds),
         f => return Err(format!("unknown format '{f}'")),
     };

@@ -75,7 +75,9 @@ Then ask, for example:
 ## Managing the open desktop app
 
 By default each agent gets its own project in memory. To drive the project that is open in the
-desktop app instead, tick **Let your Agents Control RustGIS** in the AI Assistant's settings. It
+desktop app instead, open **Analyze › AI Assistant**, click the **Assistant settings** (gear)
+icon in the pane's header, and tick **Let your Agents Control RustGIS** below **Skills**.
+These are the AI Assistant's settings, separate from the main **Settings** ribbon tab. Ticking it
 starts the relay and shows what an agent needs to connect: the MCP server configuration, and the
 `claude mcp add` / `codex mcp add` commands. While it's ticked, attached agents may also read and
 write files and use the network, without `--yes`. RustGIS remembers the choice and starts the
@@ -156,7 +158,11 @@ Passwords, keys and tokens in the arguments, a `run` script's lines included, ar
 they are written. On Linux and macOS the folder and files are readable by you only; on Windows they're protected by
 your user profile's permissions. A batch's calls share the batch's
 `duration_s` and are marked `"batch": true`. An error whose text mentions a credential (a token, a
-password, a bearer…) is logged as withheld rather than risk keeping the credential. Days older than 30 are removed.
+password, a bearer…) is logged as withheld rather than risk keeping the credential. Log days older
+than 30 days are pruned when a logged call creates a new day's file, not by a timer; older files
+can remain while logging is idle. You can remove unwanted day files from this folder yourself.
+Updating does not rewrite old logs. If an older log exposed a credential, rotate it with its
+service before sharing the log.
 
 ### MCP over HTTP
 

@@ -4,7 +4,9 @@
 //! bad features are skipped and counted in [`ReadReport`].
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod address;
 pub mod cityjson;
+mod citymodel;
 pub mod color;
 mod dbf;
 pub mod diagnostics;
@@ -18,17 +20,21 @@ pub mod geometry;
 pub mod georss;
 pub mod gml;
 pub mod gpx;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod http;
 pub mod interop;
 pub mod io;
 pub mod kml;
 pub mod landxml;
 pub mod lidar;
+pub mod login_address;
 pub mod mapinfo;
 pub mod mbtiles;
 pub mod memory;
 pub mod ogc;
 pub mod osm;
 pub mod photo;
+pub mod progress;
 pub mod query;
 pub mod raster;
 pub mod s3_address;
@@ -53,7 +59,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, thiserror::Error)]
 pub enum DataError {
     #[error("i/o: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
     #[error("{0}")]
     Format(String),
     /// The server refused the login: no password, or a wrong one.
@@ -65,9 +71,23 @@ pub enum DataError {
     /// which Zarr reads as its fill value, told apart from a slice that can't be read.
     #[error("{0}: none of the slice's chunks could be read")]
     NoChunks(String),
+    /// Stopped because its run was cancelled ([`progress`]).
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, DataError>;
+
+/// An I/O error, or [`DataError::Cancelled`] when it carries one: a write that only returns I/O
+/// errors stops with it for a cancelled run ([`progress`]).
+impl From<std::io::Error> for DataError {
+    fn from(e: std::io::Error) -> Self {
+        if e.get_ref().and_then(|inner| inner.downcast_ref::<DataError>()).is_some_and(|d| matches!(d, DataError::Cancelled)) {
+            return DataError::Cancelled;
+        }
+        DataError::Io(e)
+    }
+}
 
 /// Replaces `secret` in `message` with asterisks; the text itself when it holds none.
 fn without_secret(message: String, secret: &str) -> String {
@@ -100,6 +120,7 @@ impl DataError {
                 DataError::Io(std::io::Error::new(e.kind(), without_secret(e.to_string(), secret)))
             }
             DataError::Io(e) => DataError::Io(e),
+            DataError::Cancelled => DataError::Cancelled,
         }
     }
 }

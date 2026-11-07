@@ -11,7 +11,7 @@ use crate::render::rustgis_tiles::routing::{self, Avoid, Mode, Route, Router};
 use crate::{CmdResult, CommandSpec as C, Session};
 
 pub fn commands() -> Vec<C> {
-    vec![C::new("map.route", "Directions", "Home › Navigate", route).params(
+    vec![C::new("map.route", "Directions", "Home › Navigate", route).roles(&[]).params(
         r#"{"from": [lon, lat] | "a place, an address or 'lat, lon'", "to": the same, "via"?: [places] (stops on the way), "mode"?: "drive" (default) | "bike" | "walk", "avoid"?: ["tolls", "highways", "ferries"] (driving), "imperial"?: bool (miles in the instructions), "language"?: "en-US" | "de" | …, "url"?: "a Valhalla server of your own", "addLayer"?: bool (adds the route and its steps as layers, default true), "zoom"?: bool (default true), "answer"?: "a routing answer already fetched (the app's; nothing is fetched)", "route"?: index of the route in answer}"#,
     )]
 }
@@ -57,7 +57,7 @@ fn look_up(_s: &Session, name: &str, wait: bool) -> Result<Coord, String> {
             std::thread::sleep(std::time::Duration::from_millis(g.spacing_ms()));
         }
         let found = crate::render::rustgis_tiles::geocode::search_blocking(&g, name, 1)?;
-        found.first().map(|p| Coord::new(p.lon, p.lat)).ok_or_else(|| format!("no place found for '{name}'"))
+        found.places.first().map(|p| Coord::new(p.lon, p.lat)).ok_or_else(|| format!("no place found for '{name}'"))
     }
 }
 

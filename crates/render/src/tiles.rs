@@ -27,6 +27,11 @@ pub(crate) struct TileOutput {
     pub attribution: Vec<String>,
     pub pending: bool,
     pub errors: Vec<String>,
+    /// Raster layers read in place drawn from less than the view needs (a coarser level, tiles
+    /// they couldn't read), by id: shown, with the error among `errors`; an export refuses them.
+    pub partial: Vec<u32>,
+    /// Raster layers read in place whose tiles are still on their way, by id.
+    pub pending_in_place: Vec<u32>,
 }
 
 impl TileOutput {
@@ -73,7 +78,8 @@ pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> 
     let (th, em) = (crate::text::block_height(&text, size), l.size);
     let x = l.x + l.offset[0] * em;
     let y = l.y + l.anchor[1] * th + l.offset[1] * em;
-    let icon = l.icon.map(|i| PlacedIcon { image: i.image, x: l.x + i.dx, y: l.y + i.dy, w: i.width, h: i.height, angle: i.angle });
+    let icon =
+        l.icon.map(|i| PlacedIcon { image: i.image, x: l.x + i.dx, y: l.y + i.dy, w: i.width, h: i.height, angle: i.angle, alpha: 1.0 });
     let line_align = match l.justify {
         j if j < -0.25 => TextAlign::Left,
         j if j > 0.25 => TextAlign::Right,
@@ -103,6 +109,25 @@ pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> 
         },
         l.priority,
     ))
+}
+
+/// A colour with its alpha times `k`.
+fn faded(c: Rgba, k: f32) -> Rgba {
+    Rgba([c.0[0], c.0[1], c.0[2], (f32::from(c.0[3]) * k).round() as u8])
+}
+
+/// A tile layer's label at the layer's opacity: its text, halo and icon fainter by it.
+fn fade(mut l: PlacedLabel, opacity: f32) -> PlacedLabel {
+    if !opacity.is_finite() || opacity >= 1.0 {
+        return l;
+    }
+    let k = opacity.max(0.0);
+    l.color = faded(l.color, k);
+    l.halo = l.halo.map(|c| faded(c, k));
+    if let Some(i) = &mut l.icon {
+        i.alpha *= k;
+    }
+    l
 }
 
 /// How the tiles crate sees a tile layer.
@@ -328,7 +353,7 @@ pub(crate) fn draw(
                     *g.dirty = true;
                 }
                 let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
-                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, t, &mut out);
                 continue;
             }
             // A vector tile style as meshes, made once a tile and level and drawn at any zoom
@@ -348,7 +373,7 @@ pub(crate) fn draw(
                 }
                 let d =
                     rustgis_tiles::Drawn { labels: v.labels, attribution: v.attribution, pending: v.pending || waiting, error: v.error };
-                collect(d, &t.name, &mut out);
+                collect(d, t, &mut out);
                 continue;
             }
             // A raster tile layer placed for every frame by the GPU map: the scene holds the layer.
@@ -364,7 +389,7 @@ pub(crate) fn draw(
             {
                 g.cmds.push(DrawCmd::LiveTiles { spec: s, opacity: t.opacity });
                 let d = rustgis_tiles::Drawn { labels: Vec::new(), attribution: p.attribution, pending: p.pending, error: p.error };
-                collect(d, &t.name, &mut out);
+                collect(d, t, &mut out);
                 continue;
             }
             if let Some(g) = gpu.as_mut()
@@ -380,7 +405,7 @@ pub(crate) fn draw(
                         g.cmds.push(DrawCmd::Tiles { origin, tiles: p.tiles.iter().map(|q| quad(q, origin)).collect() });
                     }
                     let d = rustgis_tiles::Drawn { labels: p.labels, attribution: p.attribution, pending: p.pending, error: p.error };
-                    collect(d, &t.name, &mut out);
+                    collect(d, t, &mut out);
                     continue;
                 }
             }
@@ -388,7 +413,7 @@ pub(crate) fn draw(
             if let Some(g) = gpu.as_mut() {
                 *g.dirty = true;
             }
-            collect(d, &t.name, &mut out);
+            collect(d, t, &mut out);
         }
         return out;
     }
@@ -418,7 +443,7 @@ pub(crate) fn draw(
             run.clear();
             if let Some((pending, error)) = crate::single_image::draw(pm, &req, t, view, flat) {
                 let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
-                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+                collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, t, &mut out);
                 continue;
             }
         }
@@ -433,7 +458,7 @@ pub(crate) fn draw(
         run.clear();
         let (pending, error) = crate::native_tiles::draw(pm, &n, t, view, flat);
         let attribution = if t.attribution.trim().is_empty() { Vec::new() } else { vec![t.attribution.clone()] };
-        collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, &t.name, &mut out);
+        collect(rustgis_tiles::Drawn { labels: Vec::new(), attribution, pending, error }, t, &mut out);
     }
     mosaic(pm, &run, view, place, &mut out);
     out
@@ -441,7 +466,8 @@ pub(crate) fn draw(
 
 /// What a tile layer drew, into what the map's tile layers drew: tiles on their way, credits,
 /// errors and labels.
-fn collect(d: rustgis_tiles::Drawn, name: &str, out: &mut TileOutput) {
+fn collect(d: rustgis_tiles::Drawn, t: &TileLayer, out: &mut TileOutput) {
+    let name = &t.name;
     out.pending |= d.pending;
     for a in d.attribution {
         if !out.attribution.contains(&a) {
@@ -451,7 +477,8 @@ fn collect(d: rustgis_tiles::Drawn, name: &str, out: &mut TileOutput) {
     if let Some(e) = d.error {
         out.errors.push(format!("{name}: {e}"));
     }
-    out.labels.extend(d.labels.into_iter().filter_map(tile_label));
+    // The layer's opacity fades its text and icons as it fades the rest of what it draws (#1358).
+    out.labels.extend(d.labels.into_iter().filter_map(tile_label).map(|(l, p)| (fade(l, t.opacity), p)));
 }
 
 /// Tile layers (bottom first) on a map in another projection than Web Mercator, or the globe:
@@ -547,7 +574,7 @@ fn mosaic(pm: &mut Pixmap, layers: &[&TileLayer], view: &View, place: Place, out
     let mut scratch = None;
     for t in layers {
         let d = draw_layer(&mut mosaic, t, &frame, false, &mut scratch);
-        collect(d, &t.name, out);
+        collect(d, t, out);
     }
     warp(pm, &mosaic, &frame, &to_lonlat, &to_merc);
 }
@@ -694,6 +721,84 @@ pub(crate) mod tests {
 
     use crate::View;
 
+    /// A tile layer's opacity fades its labels' text, halo and icon with the rest of the layer
+    /// (#1358), and leaves them as they are at full opacity.
+    #[test]
+    fn a_tile_layers_opacity_fades_its_labels_and_icons() {
+        use super::{PlacedIcon, PlacedLabel, Rgba, fade};
+        let icon = PlacedIcon {
+            image: std::sync::Arc::new(tiny_skia::Pixmap::new(2, 2).unwrap()),
+            x: 5.0,
+            y: 5.0,
+            w: 2.0,
+            h: 2.0,
+            angle: None,
+            alpha: 1.0,
+        };
+        let label = PlacedLabel {
+            color: Rgba([10, 20, 30, 255]),
+            halo: Some(Rgba([255, 255, 255, 200])),
+            icon: Some(icon),
+            ..crate::tests::label("Hoek", 5.0, None, 0.0)
+        };
+        assert_eq!(fade(label.clone(), 1.0), label);
+        let half = fade(label.clone(), 0.5);
+        assert_eq!(half.color, Rgba([10, 20, 30, 128]));
+        assert_eq!(half.halo, Some(Rgba([255, 255, 255, 100])));
+        assert_eq!(half.icon.as_ref().map(|i| i.alpha), Some(0.5));
+        // Only the opacity changes: where it sits and what it says.
+        assert_eq!((half.x, half.y, &half.text), (label.x, label.y, &label.text));
+        // A fade of a fade multiplies; junk opacity never panics.
+        assert_eq!(fade(half, 0.5).icon.as_ref().map(|i| i.alpha), Some(0.25));
+        assert_eq!(fade(label.clone(), -3.0).color.0[3], 0);
+        assert_eq!(fade(label.clone(), f32::NAN), label);
+    }
+
+    /// `collect` applies the layer's opacity to what the layer drew (the one place every way of
+    /// drawing a tile layer passes through), not only `fade` on its own.
+    #[test]
+    fn collecting_a_tile_layers_labels_applies_its_opacity() {
+        let label = || rustgis_tiles::Label {
+            text: "Hoek".into(),
+            x: 20.0,
+            y: 20.0,
+            size: 12.0,
+            color: [10, 20, 30, 255],
+            halo: Some([255, 255, 255, 200]),
+            bold: false,
+            italic: false,
+            letter_spacing: 0.0,
+            max_width: 0.0,
+            justify: 0.0,
+            priority: 0.0,
+            anchor: [0.0, 0.0],
+            offset: [0.0, 0.0],
+            angle: None,
+            icon: Some(rustgis_tiles::LabelIcon {
+                image: std::sync::Arc::new(tiny_skia::Pixmap::new(2, 2).unwrap()),
+                width: 8.0,
+                height: 8.0,
+                dx: 0.0,
+                dy: 0.0,
+                angle: None,
+            }),
+            collide: Default::default(),
+        };
+        let collected = |opacity: f32| {
+            let mut t = TileLayer::new("Seamap", TileKind::Style, "https://tiles.test/style.json");
+            t.opacity = opacity;
+            let mut out = super::TileOutput::default();
+            let drawn = rustgis_tiles::Drawn { labels: vec![label()], ..Default::default() };
+            super::collect(drawn, &t, &mut out);
+            assert_eq!(out.labels.len(), 1);
+            out.labels.remove(0).0
+        };
+        let full = collected(1.0);
+        assert_eq!((full.color.0[3], full.halo.map(|h| h.0[3]), full.icon.as_ref().map(|i| i.alpha)), (255, Some(200), Some(1.0)));
+        let faint = collected(0.5);
+        assert_eq!((faint.color.0[3], faint.halo.map(|h| h.0[3]), faint.icon.as_ref().map(|i| i.alpha)), (128, Some(100), Some(0.5)));
+    }
+
     /// The warp interpolating across cells puts every pixel where working it out pixel by pixel
     /// does: on a globe zoomed in, on a whole one with its edge in view, across the antimeridian
     /// (where the mosaic's longitudes jump from one side to the other), and with a pole in sight
@@ -758,6 +863,10 @@ pub(crate) mod tests {
     /// Fetches under `stuck.test/`, left unanswered until a test lets them go: another's fetch
     /// still under way.
     static STUCK: std::sync::Mutex<Vec<rustgis_tiles::cache::Done>> = std::sync::Mutex::new(Vec::new());
+    /// Fetches under `tiles.test/held/`, kept in [`HELD`] while `HOLD` is set (a layout page drawn
+    /// short of its frame's tiles), answered at once after.
+    static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static HELD: std::sync::Mutex<Vec<rustgis_tiles::cache::Done>> = std::sync::Mutex::new(Vec::new());
 
     /// Serves tiles and documents for `https://tiles.test/…` without a network. Under `split/`,
     /// zoom 11 is red, zoom 13 blue, and zoom 12 never arrives.
@@ -776,6 +885,12 @@ pub(crate) mod tests {
                 PARKED.lock().unwrap().push(done);
             } else if url.starts_with("https://stuck.test/") {
                 STUCK.lock().unwrap().push(done);
+            } else if url.starts_with("https://tiles.test/held/") {
+                if HOLD.load(std::sync::atomic::Ordering::SeqCst) {
+                    HELD.lock().unwrap().push(done);
+                } else {
+                    done(Ok(color(220, 20, 20)));
+                }
             } else if url.starts_with("https://wms.test/") || url.starts_with("https://wmts.test/") {
                 // A service drawing in a system of its own (#769): green, and what it was asked.
                 ASKED.lock().unwrap().push(url.clone());
@@ -1284,5 +1399,63 @@ pub(crate) mod tests {
         m.projection = Projection::Globe;
         let p = pixel(&mut m);
         assert!(p[0] < 60 && p[1] < 40 && p[2] < 60, "{p:?}");
+    }
+
+    /// A layout page drawn while a map frame's tiles are still on their way says so, for the
+    /// browser's layout view to draw it again as they land (#1534); drawn once they have, it
+    /// doesn't. The browser doesn't wait for tiles: here the wait is cancelled, which skips it too.
+    #[test]
+    fn a_layout_page_drawn_short_of_its_frames_tiles_says_so() {
+        use rustgis_map::layout::{ElementKind, FrameShape, INDICATOR_COLOR, INDICATOR_WIDTH, Layout};
+        use std::sync::atomic::Ordering;
+        struct Cancelled;
+        impl rustgis_data::progress::Probe for Cancelled {
+            fn cancelled(&self) -> bool {
+                true
+            }
+            fn begin(&self, _: u64) {}
+            fn advance(&self, _: u64) {}
+        }
+        serve();
+        let mut m = Map::new("Map");
+        m.graticule = false;
+        m.basemap = rustgis_map::Basemap::Blank;
+        m.tiles.push(TileLayer::new("Held", TileKind::Raster, "https://tiles.test/held/{z}/{x}/{y}.png"));
+        let mut page = Layout::new("page", 100.0, 80.0);
+        page.add(
+            "map",
+            (5.0, 5.0, 90.0, 70.0),
+            ElementKind::MapFrame {
+                map: "Map".into(),
+                center: Coord::new(4.6, 4.7),
+                scale: 500_000.0,
+                shape: FrameShape::Rectangle,
+                grid: None,
+                extent_of: None,
+                extent_color: INDICATOR_COLOR,
+                extent_width: INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+            },
+        );
+        let info = crate::layout::PageInfo::default();
+        let mut maps = [m];
+        HOLD.store(true, Ordering::SeqCst);
+        let short = {
+            let _wait = rustgis_data::progress::install(Some(std::sync::Arc::new(Cancelled)));
+            crate::layout::render_pending(&page, &mut maps, 72.0, &info).map(|(_, pending)| pending)
+        };
+        // Answered now, and those asked for later at once: the next drawing waits for them.
+        HOLD.store(false, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        while HELD.lock().unwrap().is_empty() && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for done in std::mem::take(&mut *HELD.lock().unwrap()) {
+            done(Ok(tiny_skia::Pixmap::new(256, 256).unwrap().encode_png().unwrap()));
+        }
+        assert_eq!(short, Some(true), "drawn before its tiles landed");
+        let whole = crate::layout::render_pending(&page, &mut maps, 72.0, &info).map(|(_, pending)| pending);
+        assert_eq!(whole, Some(false), "drawn once they have");
     }
 }

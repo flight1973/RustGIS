@@ -32,8 +32,12 @@ base64 = { workspace = true }
 
 # Fetching tiles on worker threads. The browser fetches them itself (see `set_fetcher`).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip", "platform-verifier"] }
 getrandom = "0.4"
+
+# Browser and worker login bindings use Web Crypto, never a uniqueness-only fallback.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 # Tests write Brotli-compressed PMTiles archives.

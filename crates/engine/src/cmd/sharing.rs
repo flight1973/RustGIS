@@ -126,9 +126,10 @@ fn web_link_chart(s: &mut Session, p: &Value) -> CmdResult {
 }
 const MANAGE: &str = r#"{"item"?: id|name (default: the last of its kind), "map"?: re-share from another map}"#;
 
+/// Publish shared items and import models, checking file compatibility before creating a model.
 pub fn commands() -> Vec<C> {
     let share_as = |id: &'static str, label: &'static str, run: fn(&mut Session, &Value) -> CmdResult, params: &'static str| {
-        C::new(id, label, "Publish › Share As", run).params(params)
+        C::new(id, label, "Publish › Share As", run).roles(&[]).params(params)
     };
     vec![
         share_as("share.webMap", "Web Map", web_map, r#"{"map"?: name (default: the active map), "path"?: "*.html" (default: the first data store)}"#),
@@ -142,30 +143,36 @@ pub fn commands() -> Vec<C> {
         C::new("share.jobs", "Jobs", "Publish › Share As", |s, _| {
             let items: Vec<Value> = s.project.shared.iter().rev().map(|i| serde_json::to_value(i).unwrap_or(Value::Null)).collect();
             Ok(json!({"items": items, "stores": s.project.data_stores}))
-        })
+        }).roles(&[])
         .view(),
-        C::new("share.saveWebMap", "Save Web Map", "Publish › Manage", |s, p| update_item(s, p, "webMap", ps(p, "map"))).when(need_items).params(MANAGE),
-        C::new("share.replaceWebLayer", "Replace Web Layer", "Publish › Manage", |s, p| update_item(s, p, "webLayer", ps(p, "layer")))
+        C::new("share.saveWebMap", "Save Web Map", "Publish › Manage", |s, p| update_item(s, p, "webMap", ps(p, "map"))).roles(&[]).when(need_items).params(MANAGE),
+        C::new("share.replaceWebLayer", "Replace Web Layer", "Publish › Manage", |s, p| update_item(s, p, "webLayer", ps(p, "layer"))).roles(&[])
             .when(need_items)
             .params(r#"{"item"?: id|name (default: the last web layer), "layer"?: the layer replacing it (default: the one it was made from)}"#),
-        C::new("share.dataStore", "Data Stores", "Publish › Manage", data_store).params(r#"{"name"?, "path"?: folder, "remove"?: name (no parameters: list them)}"#),
-        C::new("share.upload", "Upload File", "Publish › Manage", upload).params(r#"{"path": file, "store"?: name (default: the first data store)}"#),
-        C::new("share.saveWebScene", "Save Web Scene", "Publish › Manage", |s, p| update_item(s, p, "webScene", ps(p, "map"))).when(need_items).params(MANAGE),
-        C::new("share.saveWebLinkChart", "Save Web Link Chart", "Publish › Manage", |s, p| update_item(s, p, "linkChart", ps(p, "relationship")))
+        C::new("share.dataStore", "Data Stores", "Publish › Manage", data_store).roles(&[]).params(r#"{"name"?, "path"?: folder, "remove"?: name (no parameters: list them)}"#),
+        C::new("share.upload", "Upload File", "Publish › Manage", upload).roles(&[]).params(r#"{"path": file, "store"?: name (default: the first data store)}"#),
+        C::new("share.saveWebScene", "Save Web Scene", "Publish › Manage", |s, p| update_item(s, p, "webScene", ps(p, "map"))).roles(&[]).when(need_items).params(MANAGE),
+        C::new("share.saveWebLinkChart", "Save Web Link Chart", "Publish › Manage", |s, p| update_item(s, p, "linkChart", ps(p, "relationship"))).roles(&[])
             .when(need_items)
             .params(r#"{"item"?: id|name (default: the last link chart), "relationship"?: re-share another relationship}"#),
-        C::new("locator.find", "Find Place", "Home › Inspect", find).params(r#"{"locator"?: shared item name or *.rgisloc path (default: the last locator), "text": search text, "limit"?: 1..100, "zoom"?: bool (go to the best match)}"#),
+        C::new("locator.find", "Find Place", "Home › Inspect", find).roles(&[]).params(r#"{"locator"?: shared item name or *.rgisloc path (default: the last locator), "text": search text, "limit"?: 1..100, "zoom"?: bool (go to the best match)}"#),
         C::new("model.import", "Import Model", "Analyze › Geoprocessing", |s, p| {
             let text = super::items::read_text(p)?;
             let v: Value = serde_json::from_str(&text).map_err(|e| format!("not a RustGIS web tool: {e}"))?;
+            crate::model::check_file(&v)?;
             let name = v["name"].as_str().unwrap_or("Tool").chars().take(200).collect::<String>();
             // A model file (`*.model.json`) holds a graph; a web tool its steps.
-            if let Some(graph) = v.get("graph") {
-                return s.run("model.new", &json!({"name": name, "graph": graph, "imported": true}));
+            let imported = if let Some(graph) = v.get("graph") {
+                s.run("model.new", &json!({"name": name, "graph": graph, "imported": true}))?
+            } else {
+                let steps = v.get("steps").cloned().ok_or("not a RustGIS model or web tool (no graph or steps)")?;
+                s.run("model.new", &json!({"name": name, "steps": steps, "imported": true}))?
+            };
+            if v.get("name").map_or(Some("Tool"), Value::as_str) != imported.get("model").and_then(Value::as_str) {
+                s.notify("1 model name was trimmed, shortened, replaced or made unique during import.", false);
             }
-            let steps = v.get("steps").cloned().ok_or("not a RustGIS model or web tool (no graph or steps)")?;
-            s.run("model.new", &json!({"name": name, "steps": steps, "imported": true}))
-        })
+            Ok(imported)
+        }).roles(&[crate::ParamRole { key: "text", role: crate::Role::Document(crate::Document::Model) }])
         .params(r#"{"path"?: "*.model.json" | "*.rgistool", "text"?: file JSON, "data"?: base64 file}"#),
     ]
 }
@@ -204,25 +211,30 @@ pub fn share_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Ve
             Ok((m.name.clone(), ogc_zip(&m.name, &layers, &[])?, m.name.clone()))
         }
         "webTool" => {
-            let ms = &s.project.models;
+            let ms = &mut s.project.models;
             let m = match ps(p, "model") {
-                Some(n) => ms.iter().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no model '{n}'"))?,
-                None => ms.last().ok_or("make a model first (ModelBuilder)")?,
+                Some(n) => ms.iter_mut().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no model '{n}'"))?,
+                None => ms.last_mut().ok_or("make a model first (ModelBuilder)")?,
             };
-            let params: Vec<Value> = m
-                .steps
-                .iter()
-                .enumerate()
-                .flat_map(|(i, st)| {
-                    st.params
-                        .as_object()
-                        .into_iter()
-                        .flatten()
-                        .map(move |(k, v)| json!({"step": i + 1, "tool": st.tool, "name": k, "default": v}))
-                })
-                .collect();
-            let tool = json!({"format": "RustGIS web tool", "version": 1, "name": m.name, "steps": m.steps, "parameters": params});
-            Ok((m.name.clone(), serde_json::to_vec_pretty(&tool).map_err(|e| e.to_string())?, m.name.clone()))
+            let name = m.name.clone();
+            let (bytes, report) = crate::durable::output(m, None, |m| {
+                let params: Vec<Value> = m
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, st)| {
+                        st.params
+                            .as_object()
+                            .into_iter()
+                            .flatten()
+                            .map(move |(k, v)| json!({"step": i + 1, "tool": st.tool, "name": k, "default": v}))
+                    })
+                    .collect();
+                let tool = json!({"format": "RustGIS web tool", "version": crate::model::WEB_TOOL_VERSION, "name": m.name, "steps": m.steps, "parameters": params});
+                serde_json::to_vec_pretty(&tool).map_err(|e| e.to_string())
+            })?;
+            crate::durable::notify(s, &report);
+            Ok((name.clone(), bytes, name))
         }
         "webScene" => {
             let mut m = map_of(s, p)?;

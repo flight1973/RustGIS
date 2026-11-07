@@ -139,6 +139,15 @@ The project, with the data that travels with it, goes to that app through the br
 (`postMessage`); nothing goes to a server. The app runs in your browser, so with the default
 address your data stays on your machine. Point `url=` only at a copy of the app you trust.
 
+The widget receives public addresses and cleaned executable parameters. Recognized credentials
+in supported fields are removed, so protected layers can remain empty there; a warning counts
+affected layer addresses. User data, foreign notebook source and opaque parameters are kept
+unchanged and may contain credentials: review them before sharing the project with a widget.
+When the widget sends a project back, Python can retain credentials only for
+unchanged, uniquely matched sources from its last exchange that still match its current project.
+Changing or replacing a source can require signing in again in Python. Exchange notices are
+available through `m.notices()` on the `Map` or `MapWidget`.
+
 ## The app in a Qt application
 
 `rustgis.qt.MapWidget` is the same app in a Qt widget, for a desktop tool or a script that opens a
@@ -271,8 +280,14 @@ s["Cities"].to_geojson()                            # a FeatureCollection dict
 big.to_file("big-cities.gpkg", crs="EPSG:3857")     # GeoJSON, CSV, FlatGeobuf, GeoParquet, …
 ```
 
-GeoPackage exports through `Layer.to_file` or `share.exportLayer` require a new filename.
-An existing `.gpkg` is refused to preserve its tables; export does not append or replace tables.
+A GeoPackage export through `Layer.to_file` or `share.exportLayer` writes a new file and refuses
+an existing `.gpkg`, unless told to add a table to it or replace one of its tables; its other
+tables are kept:
+
+```python
+roads.to_file("big-cities.gpkg", mode="addTable", table_name="roads_2026")
+big.to_file("big-cities.gpkg", mode="replaceTable")   # its table named for the layer, "Big cities"
+```
 
 `add_geojson` also takes any object with `__geo_interface__` (a Shapely geometry, a GeoSeries).
 `add_data`, `add_geojson` and `add_geopandas` return a `Layer` for a single layer, a list for
@@ -287,9 +302,13 @@ last view in memory; run `layer.loadAll` on it before `to_geojson` or `to_geopan
 of them.
 
 Open an existing project with `Session(project="atlas.rgis")` or `s.open("atlas.rgis")`.
-`s.project_json()` returns its JSON text; `s.run("project.openText", text=...)` opens project
-JSON without an intermediate file. `to_png()` returns PNG bytes even when it also writes a
-file; omit the path to keep the image in memory.
+`s.project_json()` returns JSON with the same credential removal as Save, with notices available
+through `s.notices()`. Like Save, this explicit serialization retains a bounded, process-local
+credential-restoration snapshot for reopening its exact text; repeated identical text replaces
+the same snapshot. It refuses unfinished imports instead of writing runtime reservations.
+The widget's private peer exchange uses a separate path that never fills this save cache.
+`s.run("project.openText", text=...)` opens project JSON without an intermediate file. `to_png()`
+returns PNG bytes even when it also writes a file; omit the path to keep the image in memory.
 
 ## From source
 
