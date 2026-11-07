@@ -3136,7 +3136,7 @@ fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let mut messages = vec![format!("Simplify: {before} → {after} vertices")];
     if polar > 0 {
         messages.push(format!(
-            "{polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at the scale of the feature's middle, at most 85°'s: less is simplified away there than asked"
+            "{polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at the scale of the feature's label point, at most 85°'s: less is simplified away there than asked, and parts farther equatorward than the label point can be simplified more than asked"
         ));
     }
     Ok(ToolResult { output: Output::Layer(out), messages })

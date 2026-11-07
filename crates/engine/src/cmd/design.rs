@@ -1329,6 +1329,13 @@ fn topology_validate(s: &mut Session, p: &Json) -> CmdResult {
             lat: e.at.y,
         }));
     }
+    if !incomplete.is_empty() {
+        s.warn(format!(
+            "{} topology rule(s) weren't checked completely ({}): a check stopped early, or measured a line winding round a pole coarsely, so their counts may be off",
+            incomplete.len(),
+            incomplete.join(", ")
+        ));
+    }
     let n = errors.len();
     let out: Vec<Json> =
         errors.iter().take(1000).map(|e| json!({"rule": e.rule, "layer": e.layer, "rows": e.rows, "lon": e.lon, "lat": e.lat})).collect();

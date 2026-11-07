@@ -257,7 +257,10 @@ where holes or neighboring polygons must stay aligned. The default tolerance rem
 use a smaller value for local boundaries. A line or polygon has its tolerance taken east–west at
 the scale of its middle (its label point's latitude), at most 85°'s, so beyond 85.05°, where the
 ground is far narrower, less is simplified away than asked (a 3 km tolerance at 89.9°N takes out
-only what lies within about 60 m east–west), and the tool says how many reach that far.
+only what lies within about 60 m east–west). Parts farther equatorward than the label point can be
+simplified more than asked: the tolerance is applied at that one scale, so a polar cap from 60°N to
+the pole, at 3 km, can move its 60°N vertices about 17 km on the ground. The tool says how many
+features reach beyond 85.05° and so are affected.
 
 **Kernel Density** (`kernelDensity`) calculates a continuous magnitude-per-unit-area raster
 surface from point features using a Quartic (biweight, default) or Gaussian kernel (truncated at 3σ and
