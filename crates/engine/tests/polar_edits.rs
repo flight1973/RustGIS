@@ -834,3 +834,28 @@ fn polar_neighbors_share_a_corner_written_as_zero_or_minus_zero() {
     let (a, b) = (ring_of(&s, id, 0), ring_of(&s, id, 1));
     assert!(a[1] == b[0] && a[2] == b[3], "{a:?} {b:?}");
 }
+
+#[test]
+fn edits_refuse_points_past_the_poles() {
+    for (cmd, params) in
+        [("edit.move", json!({"dx": 100, "dy": 0})), ("edit.rotate", json!({"angle": 20})), ("edit.scale", json!({"factor": 2}))]
+    {
+        let g = Geometry::MultiPoint(vec![Coord::new(0.0, 95.0), Coord::new(1.0, 89.0)]);
+        let (mut s, id) = layer(GeometryType::Point, vec![g.clone()]);
+        let err = s.run(cmd, &params).unwrap_err();
+        assert!(err.contains("latitude past ±90°"), "{cmd}: {err}");
+        assert_eq!(s.map().layer(id).unwrap().dataset.features[0].geometry, Some(g));
+        let (mut clean, _) = layer(GeometryType::Point, vec![Geometry::MultiPoint(vec![Coord::new(0.0, 88.0), Coord::new(1.0, 89.0)])]);
+        clean.run(cmd, &params).unwrap();
+    }
+}
+
+#[test]
+fn split_searches_every_turn_of_a_long_polar_line() {
+    let (mut s, id) = layer(GeometryType::Polyline, vec![Geometry::Line(vec![vec![Coord::new(0.0, 89.0), Coord::new(368_640.0, 89.0)]])]);
+    s.run("edit.split", &json!({"lon": 0.014, "lat": 89.0})).unwrap();
+    assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 2);
+    let Some(Geometry::Line(parts)) = &s.map().layer(id).unwrap().dataset.features[0].geometry else { panic!("expected a line") };
+    let cut = *parts[0].last().unwrap();
+    assert!(wgs84_distance_m(cut, Coord::new(0.014, 89.0)) < 0.01, "{cut:?}");
+}

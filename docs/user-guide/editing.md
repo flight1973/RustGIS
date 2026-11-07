@@ -51,11 +51,12 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   passes it can land far apart. Only the vertices move rigidly: edges stay straight in longitude
   and latitude between them, so long edges bend, the more so the nearer the pole one end is than
   the other, and far less for moves north–south than east–west: an edge from 87° to 89° bends
-  333 m for each kilometer moved east; one from 89.5° to 89.99°, about 12 m for each meter, and
-  nearly 10 km for a 1 km move. Add vertices along them first to keep their shape. A moved
+  333 m for each kilometer moved east; one from 89.5° to 89.99° bends much more. Add vertices along them first to keep their shape. A moved
   feature's longitudes run on from where they were written, past ±180° if it crosses there (to
   188°, say, rather than −172°), as within ±85.05°; one carried more than halfway around a pole
   is written within half a turn of where it was.
+  Rotate and Scale use each feature's own center, so selected neighbors sharing a corner can
+  separate at that corner.
   Right by a pole a move's directions turn quickly with its center's place: a center at
   the pole takes "east" from the prime meridian (toward 90°E), one a meter away from its own
   longitude. The whole edit is refused, and nothing changes, when a selected line or polygon
