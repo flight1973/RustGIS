@@ -356,12 +356,16 @@ pub fn commands() -> Vec<C> {
             if still && shifted.is_empty() {
                 return Err("a move of no distance changes nothing".into());
             }
-            let (planes, ground) = if still { (HashMap::new(), 0) } else { move_planes(s, |key| shifted.contains_key(&key), dx.hypot(dy))? };
+            let (planes, ground, coarse) = if still {
+                (HashMap::new(), 0, 0)
+            } else {
+                move_planes(s, |key| shifted.contains_key(&key), dx.hypot(dy))?
+            };
             let mut placed = HashMap::new();
             placed.try_reserve(ground).map_err(|_| "not enough memory to move the selection on the ground")?;
             // Each group's move, worked out once: its planes and its turn's sine and cosine.
             let mut moves: HashMap<(i64, i64), (Aeqd, Aeqd, f64, f64)> = HashMap::new();
-            move_features(s, |key, g| match planes.get(&key) {
+            let done = move_features(s, |key, g| match planes.get(&key) {
                 Some(center) => {
                     let (from, to, sin, cos) = *moves.entry(vertex_key(*center)).or_insert_with(|| {
                         let (from, to, turn) = ground_move(*center, dx, dy);
@@ -372,14 +376,16 @@ pub fn commands() -> Vec<C> {
                         .map(Some)
                 }
                 None => Ok(shifted.remove(&key)),
-            })
+            })?;
+            center_notice(s, coarse);
+            Ok(done)
         })
         .when(need_editable_selection)
         .params(r#"{"dx": distance east, "dy": distance north, "units"?: "Meters" (default)|"Feet"|"Kilometers"|"Miles"}"#),
         C::new("edit.rotate", "Rotate", "Edit › Features › Modify", |s, p| {
             let deg = f(p, "angle").ok_or("angle is required")?;
-            let mut budget = CENTER_STEPS_TOTAL;
-            move_features(s, |_, g| {
+            let mut steps = CenterSteps::new();
+            let done = move_features(s, |_, g| {
                 // Any point, a feature's or a text graphic's, turns on itself: left out, so a
                 // selection of points alone fails rather than recording an edit that changes
                 // nothing (and an undo step).
@@ -394,23 +400,27 @@ pub fn commands() -> Vec<C> {
                         Coord::new(c.x + x * cos - y * sin, c.y + x * sin + y * cos)
                     },
                     |p| Coord::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos),
-                    &mut budget,
+                    &mut steps,
                 )
-            })
+            })?;
+            center_notice(s, steps.coarse);
+            Ok(done)
         })
         .when(need_editable_selection)
         .params(r#"{"angle": degrees clockwise}"#),
         C::new("edit.scale", "Scale", "Edit › Features › Modify", |s, p| {
             let k = f(p, "factor").filter(|k| *k > 0.0 && *k < 1e6).ok_or("factor must be a positive number")?;
-            let mut budget = CENTER_STEPS_TOTAL;
-            move_features(s, |_, g| {
+            let mut steps = CenterSteps::new();
+            let done = move_features(s, |_, g| {
                 // Any point, a feature's or a text graphic's, scales on itself: left out, as above.
                 if matches!(g, Geometry::Point(_)) {
                     return Ok(None);
                 }
                 let merc = |c: Coord, m: Coord| Coord::new(c.x + (m.x - c.x) * k, c.y + (m.y - c.y) * k);
-                about_center(g, merc, |p| Coord::new(p.x * k, p.y * k), &mut budget)
-            })
+                about_center(g, merc, |p| Coord::new(p.x * k, p.y * k), &mut steps)
+            })?;
+            center_notice(s, steps.coarse);
+            Ok(done)
         })
         .when(need_editable_selection)
         .params(r#"{"factor": number}"#),
@@ -594,6 +604,28 @@ const CENTER_STEPS_MAX: f64 = 1024.0;
 /// The most stretches it cuts all the edges of one command's features into; past them, an edge is
 /// weighed in one.
 const CENTER_STEPS_TOTAL: usize = 1_000_000;
+
+/// What a command's ground centers may still spend: the stretches left of [`CENTER_STEPS_TOTAL`],
+/// and how many edges were weighed in one for want of them (said by [`center_notice`]).
+struct CenterSteps {
+    left: usize,
+    coarse: usize,
+}
+
+impl CenterSteps {
+    fn new() -> Self {
+        Self { left: CENTER_STEPS_TOTAL, coarse: 0 }
+    }
+}
+
+/// Says how many edges a command's ground centers weighed in one, past its limit of stretches.
+fn center_notice(s: &mut Session, coarse: usize) {
+    if coarse > 0 {
+        s.warn(format!(
+            "{coarse} edge(s) of features beyond 85.05° were weighed in one to find their center, past one command's limit of a million stretches: those centers are worked out more coarsely"
+        ));
+    }
+}
 /// The farthest (meters) a polar edit may carry a vertex from the center it's moved, turned or
 /// scaled about: a quarter of the way around the world, well short of the center's antipode, where
 /// the azimuthal equidistant plane tears.
@@ -603,11 +635,11 @@ const GROUND_REACH_M: f64 = 10_000_000.0;
 /// scale about. It's the center of their lines and rings, each edge (as the analysis plane draws
 /// it) weighed by length on the sphere in stretches of at most half a degree, so a vertex added
 /// along an edge hardly moves it; with no edges of any length, of their vertices (their points).
-/// The stretches come out of the command's `budget` ([`CENTER_STEPS_TOTAL`]); once it runs out, an
-/// edge is weighed in one. A center at a pole takes its directions from the prime meridian, however
-/// the features' longitudes are written. `None` when they balance out (or have no finite
-/// coordinate).
-fn plane_at<'a>(geoms: impl IntoIterator<Item = &'a Geometry>, budget: &mut usize) -> Option<Coord> {
+/// The stretches come out of the command's `steps` ([`CENTER_STEPS_TOTAL`]); once they run out, an
+/// edge is weighed in one, and counted in `steps.coarse`. A center at a pole takes its directions
+/// from the prime meridian, however the features' longitudes are written. `None` when they balance
+/// out (or have no finite coordinate).
+fn plane_at<'a>(geoms: impl IntoIterator<Item = &'a Geometry>, steps: &mut CenterSteps) -> Option<Coord> {
     let (mut edges, mut vertices) = (SphericalMean::default(), SphericalMean::default());
     for g in geoms {
         g.for_each_coord(|c| vertices.add(c));
@@ -622,8 +654,13 @@ fn plane_at<'a>(geoms: impl IntoIterator<Item = &'a Geometry>, budget: &mut usiz
             }
             let span = (b.x - a.x).abs().max((b.y - a.y).abs()) / CENTER_STEP_DEG;
             let n = if span > 1.0 { span.ceil().min(CENTER_STEPS_MAX) } else { 1.0 };
-            let n = if n as usize <= *budget { n } else { 1.0 };
-            *budget = budget.saturating_sub(n as usize);
+            let n = if n as usize <= steps.left {
+                n
+            } else {
+                steps.coarse += usize::from(n > 1.0);
+                1.0
+            };
+            steps.left = steps.left.saturating_sub(n as usize);
             let (pa, pb) = (lonlat_to_plane(a), lonlat_to_plane(b));
             let at = |t: f64| plane_to_lonlat(Coord::new(pa.x + (pb.x - pa.x) * t, pa.y + (pb.y - pa.y) * t));
             let mut last = a;
@@ -642,12 +679,12 @@ fn plane_at<'a>(geoms: impl IntoIterator<Item = &'a Geometry>, budget: &mut usiz
 /// `g` turned or scaled about its center: in Web Mercator, as always, by `merc` (taking the
 /// center of `g`'s extent and a point, both in Web Mercator) while `g` and its result stay within
 /// the square; otherwise on the ground (#1033), by `ground` (taking a point's meters east and north
-/// of the feature's center, [`plane_at`], found within the command's `budget`).
+/// of the feature's center, [`plane_at`], found within the command's `steps`).
 fn about_center(
     g: &Geometry,
     merc: impl Fn(Coord, Coord) -> Coord,
     ground: impl Fn(Coord) -> Coord,
-    budget: &mut usize,
+    steps: &mut CenterSteps,
 ) -> Result<Option<Geometry>, String> {
     if within_square(g) {
         // About the extent of the vertices that have both coordinates; one missing a coordinate
@@ -659,7 +696,7 @@ fn about_center(
         }
     }
     ground_movable(g)?;
-    let plane = Aeqd::new(plane_at(std::iter::once(g), budget).ok_or("the feature has no center to turn or scale it about")?);
+    let plane = Aeqd::new(plane_at(std::iter::once(g), steps).ok_or("the feature has no center to turn or scale it about")?);
     polar_transform(g, (&plane, &plane), None, ground).map(Some)
 }
 
@@ -671,7 +708,7 @@ fn about_center(
 /// it, and features near both poles each have a center). A move on the ground goes at most
 /// [`GROUND_REACH_M`] (`reach_m` is how far this one goes), and only features it can carry
 /// ([`ground_movable`]). With the map, how many vertices move on the ground.
-fn move_planes(s: &Session, stays: impl Fn((u32, usize)) -> bool, reach_m: f64) -> Result<(HashMap<(u32, usize), Coord>, usize), String> {
+fn move_planes(s: &Session, stays: impl Fn((u32, usize)) -> bool, reach_m: f64) -> Result<(HashMap<(u32, usize), Coord>, usize, usize), String> {
     let selected: Vec<((u32, usize), &Geometry)> = s
         .map()
         .layers
@@ -682,7 +719,7 @@ fn move_planes(s: &Session, stays: impl Fn((u32, usize)) -> bool, reach_m: f64) 
     // Most moves stay within the square: then no feature needs grouping.
     let stay: Vec<bool> = selected.iter().map(|(key, _)| stays(*key)).collect();
     if stay.iter().all(|s| *s) {
-        return Ok((HashMap::new(), 0));
+        return Ok((HashMap::new(), 0, 0));
     }
     if reach_m > GROUND_REACH_M {
         return Err("a move on the ground (beyond or across 85.05°) can go at most 10,000 km at once".into());
@@ -737,7 +774,7 @@ fn move_planes(s: &Session, stays: impl Fn((u32, usize)) -> bool, reach_m: f64) 
     for i in 0..selected.len() {
         members.entry(find(&mut group, i)).or_default().push(i);
     }
-    let (mut planes, mut ground, mut budget) = (HashMap::new(), 0usize, CENTER_STEPS_TOTAL);
+    let (mut planes, mut ground, mut steps) = (HashMap::new(), 0usize, CenterSteps::new());
     for ids in members.values() {
         let geoms = || ids.iter().filter_map(|i| selected.get(*i).map(|(_, g)| *g));
         if ids.iter().all(|i| stay.get(*i).copied().unwrap_or(true)) {
@@ -751,10 +788,10 @@ fn move_planes(s: &Session, stays: impl Fn((u32, usize)) -> bool, reach_m: f64) 
             }
             ground += g.coord_count();
         }
-        let plane = plane_at(geoms(), &mut budget).ok_or("the selected features have no center to move them about")?;
+        let plane = plane_at(geoms(), &mut steps).ok_or("the selected features have no center to move them about")?;
         planes.extend(ids.iter().filter_map(|i| selected.get(*i).map(|(key, _)| (*key, plane))));
     }
-    Ok((planes, ground))
+    Ok((planes, ground, steps.coarse))
 }
 
 /// How near a pole (meters) a moved line or ring may come: nearer, it's taken to reach it.
@@ -1971,11 +2008,28 @@ mod tests {
         // each, out of the budget; with none left, each edge is weighed in one, and a center is
         // still found.
         let line = Geometry::Line(vec![(0..=10).map(|i| Coord::new(if i % 2 == 0 { 0.0 } else { 170.0 }, 89.9)).collect()]);
-        let mut budget = CENTER_STEPS_TOTAL;
-        assert!(plane_at([&line], &mut budget).is_some());
-        assert_eq!(CENTER_STEPS_TOTAL - budget, 10 * 340);
-        let mut budget = 0;
-        assert!(plane_at([&line], &mut budget).is_some() && budget == 0);
+        let mut steps = CenterSteps::new();
+        assert!(plane_at([&line], &mut steps).is_some());
+        assert_eq!(CENTER_STEPS_TOTAL - steps.left, 10 * 340);
+        assert_eq!(steps.coarse, 0);
+        let mut steps = CenterSteps { left: 0, coarse: 0 };
+        assert!(plane_at([&line], &mut steps).is_some() && steps.left == 0);
+        assert_eq!(steps.coarse, 10);
+    }
+
+    #[test]
+    fn a_center_says_when_its_steps_run_out() {
+        // A line at 89.9°N of 3,000 edges, each 340 half-degree stretches: the million run out in
+        // the 2,942nd, and the 59 after it are weighed in one, which is counted; ten edges are not.
+        let zigzag = |edges: usize| {
+            Geometry::Line(vec![(0..=edges).map(|i| Coord::new(if i % 2 == 0 { 0.0 } else { 170.0 }, 89.9)).collect()])
+        };
+        let mut steps = CenterSteps::new();
+        assert!(plane_at([&zigzag(3_000)], &mut steps).is_some());
+        assert_eq!(steps.coarse, 59);
+        let mut steps = CenterSteps::new();
+        assert!(plane_at([&zigzag(10)], &mut steps).is_some());
+        assert_eq!(steps.coarse, 0);
     }
 
     #[test]
@@ -2048,7 +2102,7 @@ mod tests {
         let c = Coord::new;
         let line = Geometry::Line(vec![vec![c(0.0, 86.0), c(10.0, 86.0)]]);
         let points = Geometry::MultiPoint(vec![c(90.0, 88.0), c(100.0, 88.0)]);
-        let (mut a, mut b) = (CENTER_STEPS_TOTAL, CENTER_STEPS_TOTAL);
+        let (mut a, mut b) = (CenterSteps::new(), CenterSteps::new());
         assert_eq!(plane_at([&line, &points], &mut a), plane_at([&line], &mut b));
     }
 }
