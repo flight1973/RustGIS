@@ -1127,6 +1127,17 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     }
     let id = selection_layer(s)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+    // A vertex past ±90° is no place: the search would take it for the pole, so the lines are
+    // refused up front, before any is split.
+    let mut beyond_pole = false;
+    for feat in l.selection.iter().filter_map(|r| l.dataset.features.get(*r)) {
+        if let Some(Geometry::Line(parts)) = &feat.geometry {
+            beyond_pole |= parts.iter().flatten().any(|c| c.is_finite() && c.y.abs() > 90.0);
+        }
+    }
+    if beyond_pole {
+        return Err("a selected line has a latitude past ±90°, which is no place".into());
+    }
     let mut changes = Vec::new();
     let mut steps = SplitSteps { left: SPLIT_STEPS_TOTAL, floor: f64::INFINITY };
     // Lines the search, past its steps, couldn't search in full where a nearer point might lie:
