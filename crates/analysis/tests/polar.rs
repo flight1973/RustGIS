@@ -821,3 +821,31 @@ fn polar_dangles_match_parts_stored_many_turns_apart() {
         assert_eq!(checked.errors.len(), 2, "turn {turn}");
     }
 }
+
+#[test]
+fn summarize_within_validates_unselected_polygons_it_also_reads() {
+    struct Selected<'a>(&'a Map);
+    impl Inputs for Selected<'_> {
+        fn dataset(&self, name: &str) -> Option<&Dataset> {
+            self.0.dataset(name)
+        }
+        fn selection(&self, name: &str) -> &[usize] {
+            if name == "zones" { &[0] } else { &[] }
+        }
+    }
+    for invalid in [false, true] {
+        let mut points = Dataset::new("points", GeometryType::Point, vec![]);
+        points.push(Some(Geometry::Point(Coord::new(0.5, 89.0))), vec![]);
+        let map = Map(HashMap::from([
+            ("points".into(), points),
+            layer("zones", vec![square(0.0, 88.0, 1.0, 89.0), square(0.0, 89.0, 1.0, if invalid { 95.0 } else { 90.0 })]),
+        ]));
+        let result = rustgis_analysis::run("countPoints", &Selected(&map), &serde_json::json!({"points":"points", "polygons":"zones"}));
+        if invalid {
+            let error = result.unwrap_err();
+            assert!(error.contains("zones") && error.contains("1 feature(s)") && error.contains("latitude past ±90°"), "{error}");
+        } else {
+            assert!(result.is_ok(), "{result:?}");
+        }
+    }
+}

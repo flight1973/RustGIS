@@ -486,7 +486,8 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
                     && let Some(ds) = inputs.dataset(name)
                 {
                     let selected = inputs.selection(name);
-                    if selected.is_empty() || (spec.id == "selectByLocation" && param.name == "input") {
+                    let reads_all = matches!((spec.id, param.name), ("selectByLocation", "input") | ("countPoints", "polygons"));
+                    if selected.is_empty() || reads_all {
                         validate_latitudes(ds, 0..ds.features.len())?;
                     } else {
                         validate_latitudes(ds, selected.iter().copied())?;
