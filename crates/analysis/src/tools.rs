@@ -2181,17 +2181,21 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     // A feature's points in the analysis plane, and how many of its vertices (a closed ring's
     // repeated last point left out) are passed over: a coordinate missing or infinite, which the
     // hull can't order, or a longitude so far out (millions of degrees) that the hull's arithmetic
-    // would overflow. A latitude past ±90° is taken as the pole, as the analysis plane takes it.
+    // would overflow. A latitude past ±90° is taken as the pole, as the analysis plane takes it, and
+    // counted too.
     let points = |g: &Geometry| {
-        let (mut these, mut gaps) = (Vec::new(), 0usize);
+        let (mut these, mut gaps, mut poles) = (Vec::new(), 0usize, 0usize);
         g.for_each_vertex(|_, c| {
             let m = if c.is_finite() { Some(rustgis_geom::lonlat_to_plane(c)) } else { None };
             match m {
-                Some(m) if m.x.abs() <= HULL_LIMIT_M && m.y.abs() <= HULL_LIMIT_M => these.push(geo::Point::new(m.x, m.y)),
+                Some(m) if m.x.abs() <= HULL_LIMIT_M && m.y.abs() <= HULL_LIMIT_M => {
+                    poles += usize::from(c.y.abs() > 90.0);
+                    these.push(geo::Point::new(m.x, m.y));
+                }
                 _ => gaps += 1,
             }
         });
-        (these, gaps)
+        (these, gaps, poles)
     };
     // Each row once, however often a selection lists it, in the selection's order.
     let mut seen = std::collections::HashSet::new();
@@ -2203,7 +2207,7 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let mut skipped = picked.len().saturating_sub(features.len());
     // A hull with no area: a single point's, or points in one place or along one line.
     let is_flat = |hull: &geo::Polygon<f64>| geo::Area::unsigned_area(hull) == 0.0;
-    let (mut flat, mut gaps) = (0usize, 0usize);
+    let (mut flat, mut gaps, mut poles) = (0usize, 0usize, 0usize);
     if each {
         // Each feature's hull made on several cores for many (#1252), placed in their order.
         crate::control::begin(features.len());
@@ -2212,14 +2216,15 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             PARALLEL_FEATURES,
             || (),
             |_, _, (_, g)| {
-                let (these, passed) = points(g);
+                let (these, passed, past) = points(g);
                 // A feature with no point to give has no hull: none is written for it.
                 let hull = (!these.is_empty()).then(|| geo::MultiPoint::new(these).convex_hull());
-                Ok::<_, String>((passed, hull))
+                Ok::<_, String>((passed, past, hull))
             },
         )?;
-        for ((f, _), (passed, hull)) in features.iter().zip(hulls) {
+        for ((f, _), (passed, past, hull)) in features.iter().zip(hulls) {
             gaps += passed;
+            poles += past;
             let Some(hull) = hull else {
                 skipped += 1;
                 continue;
@@ -2232,8 +2237,9 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         // no hull is written, as one feature each.
         let (mut pts, mut hulled) = (Vec::new(), 0usize);
         for (_, g) in &features {
-            let (these, passed) = points(g);
+            let (these, passed, past) = points(g);
             gaps += passed;
+            poles += past;
             if these.is_empty() {
                 skipped += 1;
             } else {
@@ -2247,6 +2253,10 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             out.push(from_multipolygon(&MultiPolygon::new(vec![hull])), vec![Value::Int(i64::try_from(hulled).unwrap_or(i64::MAX))]);
         }
     }
+    // Nothing hulled, every feature skipped: an unusable result, so an error saying why.
+    if out.features.is_empty() && skipped > 0 {
+        return Err(format!("Minimum Bounding Geometry: none of the {} feature(s) has a point it can hull", picked.len()));
+    }
     let n = out.features.len();
     let mut r = result(out, format!("Minimum Bounding Geometry: {n} hulls"))?;
     if skipped > 0 {
@@ -2254,8 +2264,11 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     }
     if gaps > 0 {
         r.messages.push(format!(
-            "Minimum Bounding Geometry: {gaps} vertex(es) passed over: a coordinate missing or infinite, or a longitude far out of range"
+            "Minimum Bounding Geometry: {gaps} vertex(es) passed over: a coordinate missing or infinite, or so far out that the hull can't take it (past about 9 million degrees)"
         ));
+    }
+    if poles > 0 {
+        r.messages.push(format!("Minimum Bounding Geometry: {poles} vertex(es) with a latitude past a pole found (taken as that pole)"));
     }
     if flat > 0 {
         r.messages.push(format!(
@@ -8384,8 +8397,9 @@ mod tests {
     /// the hull can't order (it failed on one before), or so far out that its arithmetic would
     /// overflow, and skips a feature without geometry or with no point it can use (writing no hull
     /// for it), saying how many of each, all together or one feature each; with nothing left to
-    /// enclose, it writes no hull either way and says why. A bad vertex in a closed ring counts
-    /// once. Clean points say nothing of the kind.
+    /// enclose, it is an error saying why. A latitude past a pole is taken as that pole, and says
+    /// so. A bad vertex in a closed ring counts once, a repeated NaN point included. Clean points
+    /// say nothing of the kind.
     #[test]
     fn convex_hull_passes_over_missing_coordinates() {
         let run = |geoms: Vec<Option<Geometry>>, group: &str| {
@@ -8402,7 +8416,9 @@ mod tests {
             let res = run(vec![Some(stations.clone()), Some(Geometry::Point(gap)), None], group).unwrap_or_else(|e| panic!("{group}: {e}"));
             let all = res.messages.join(" | ");
             assert!(
-                all.contains("3 vertex(es) passed over: a coordinate missing or infinite, or a longitude far out of range"),
+                all.contains(
+                    "3 vertex(es) passed over: a coordinate missing or infinite, or so far out that the hull can't take it (past about 9 million degrees)"
+                ),
                 "{group}: {all}"
             );
             assert!(all.contains("2 feature(s) skipped: no geometry, or no point it can use"), "{group}: {all}");
@@ -8415,10 +8431,8 @@ mod tests {
             assert!(!clean.contains("passed over") && !clean.contains("skipped"), "{group}: {clean}");
         }
         for group in ["All", "None"] {
-            let res = run(vec![Some(Geometry::Point(gap)), None], group).unwrap_or_else(|e| panic!("{group}: {e}"));
-            let Output::Layer(out) = &res.output else { panic!("{group}: not a layer") };
-            assert!(out.features.is_empty(), "{group}: no hull with nothing to enclose");
-            assert!(res.messages.iter().any(|m| m.contains("2 feature(s) skipped")), "{group}: {:?}", res.messages);
+            let err = run(vec![Some(Geometry::Point(gap)), None], group).err().unwrap_or_default();
+            assert!(err.contains("none of the 2 feature(s) has a point it can hull"), "{group}: {err}");
         }
         // A ring with one vertex too far out, its closing point the same: one vertex passed over.
         let far_ring = Geometry::Polygon(vec![vec![vec![
@@ -8430,6 +8444,24 @@ mod tests {
         ]]]);
         let all = run(vec![Some(far_ring)], "All").unwrap_or_else(|e| panic!("{e}")).messages.join(" | ");
         assert!(all.contains(": 1 vertex(es) passed over"), "{all}");
+        // A ring that repeats its NaN start point as its end: that vertex is passed over once.
+        let nan_ring = Geometry::Polygon(vec![vec![vec![
+            gap,
+            Coord::new(1.0, 0.0),
+            Coord::new(1.0, 1.0),
+            Coord::new(0.0, 1.0),
+            gap,
+        ]]]);
+        let all = run(vec![Some(nan_ring)], "All").unwrap_or_else(|e| panic!("{e}")).messages.join(" | ");
+        assert!(all.contains(": 1 vertex(es) passed over"), "{all}");
+        // A latitude past a pole is taken as that pole, and says so; a pole's own latitude says nothing.
+        let past = run(vec![Some(Geometry::Point(Coord::new(10.0, 95.0)))], "All")
+            .unwrap_or_else(|e| panic!("{e}"))
+            .messages
+            .join(" | ");
+        assert!(past.contains("1 vertex(es) with a latitude past a pole found (taken as that pole)"), "{past}");
+        let at_pole = run(vec![Some(Geometry::Point(Coord::new(10.0, 90.0)))], "All").unwrap_or_else(|e| panic!("{e}"));
+        assert!(!at_pole.messages.join(" | ").contains("past a pole"), "{:?}", at_pole.messages);
     }
 
     /// Minimum Bounding Geometry's `count`, all features together, is the features it hulled: with a

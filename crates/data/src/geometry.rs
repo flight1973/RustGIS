@@ -332,9 +332,15 @@ impl VertexId {
 /// How many vertices a path has: a closed ring's repeated last point doesn't count.
 fn open_len(path: &[Coord], ring: bool) -> usize {
     match (path.first(), path.last()) {
-        (Some(a), Some(b)) if ring && path.len() > 1 && a == b => path.len() - 1,
+        (Some(a), Some(b)) if ring && path.len() > 1 && same_point(a, b) => path.len() - 1,
         _ => path.len(),
     }
+}
+
+/// Whether two points are the same place. A NaN coordinate equals nothing as a number, so NaN is
+/// matched by its bits: a ring that repeats a NaN point closes on it.
+fn same_point(a: &Coord, b: &Coord) -> bool {
+    a == b || (a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits())
 }
 
 impl Geometry {
