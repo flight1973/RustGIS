@@ -116,8 +116,19 @@ fn write_chunks_to(
     let left_out = match ext.as_str() {
         #[cfg(not(target_arch = "wasm32"))]
         "gpkg" => {
-            table = Some(crate::source::gpkg::write_features_in(&layer.name, geometry_type, &layer.fields, path, crs, gpkg, &mut feed)?);
-            0
+            // A GeoPackage table holds one kind of geometry: each chunk's features of another
+            // kind are left out, and counted, as the rest is handed over.
+            let mut left_out = 0usize;
+            let mut kinded = |add: &mut dyn FnMut(&[Feature]) -> Result<()>| -> Result<()> {
+                // An export that starts again feeds the features again, and counts them again.
+                left_out = 0;
+                feed(&mut |chunk: &[Feature]| {
+                    left_out = left_out.saturating_add(crate::io::feed_of_kind(chunk, geometry_type, add)?);
+                    Ok(())
+                })
+            };
+            table = Some(crate::source::gpkg::write_features_in(&layer.name, geometry_type, &layer.fields, path, crs, gpkg, &mut kinded)?);
+            left_out
         }
         #[cfg(target_arch = "wasm32")]
         "gpkg" => {

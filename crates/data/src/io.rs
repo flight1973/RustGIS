@@ -533,8 +533,15 @@ pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
 /// also returns the table written.
 pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> Result<(usize, Option<GpkgWritten>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let reprojects = crs != Crs::LonLat && PROJECTED_FORMATS.contains(&ext.as_str());
+    // A GeoPackage export to be projected leaves out what its table can't hold first, so a
+    // feature left out can't fail the projection (which copies the layer anyway).
+    #[cfg(not(target_arch = "wasm32"))]
+    let (kept, mut left_out) = if ext == "gpkg" && reprojects { of_its_kind(ds) } else { (None, 0) };
+    #[cfg(not(target_arch = "wasm32"))]
+    let ds = kept.as_ref().unwrap_or(ds);
     let projected;
-    let ds = if crs == Crs::LonLat || !PROJECTED_FORMATS.contains(&ext.as_str()) {
+    let ds = if !reprojects {
         ds
     } else {
         check_projected(&ext, crs)?;
@@ -545,10 +552,19 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
         "gpkg" => {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let (kept, left_out) = of_its_kind(ds);
-                let ds = kept.as_ref().unwrap_or(ds);
                 crate::progress::begin(ds.features.len());
-                let table = crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?;
+                let table = if ds.features.iter().any(|f| off_kind(f, ds.geometry_type)) {
+                    // What the table can't hold is left out as the rest is handed over, in runs
+                    // borrowed from the layer, so a large one isn't copied.
+                    let mut feed = |add: &mut dyn FnMut(&[crate::Feature]) -> Result<()>| -> Result<()> {
+                        // An export that starts again hands the features over again.
+                        left_out = feed_of_kind(&ds.features, ds.geometry_type, add)?;
+                        Ok(())
+                    };
+                    crate::source::gpkg::write_features_in(&ds.name, ds.geometry_type, &ds.fields, path, crs, gpkg, &mut feed)?
+                } else {
+                    crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?
+                };
                 Ok((left_out, Some(table)))
             }
             #[cfg(target_arch = "wasm32")]
@@ -2518,22 +2534,50 @@ fn dbf_boolean(value: &Value) -> Option<bool> {
     }
 }
 
-/// A dataset as a GeoPackage table holds it: geometry of one kind, the layer's (its column's
-/// declared type). A feature of another kind, as a mixed layer can hold (a GeoJSON of points and
-/// polygons, say), is left out and counted, as a Shapefile leaves it out; one without geometry
-/// stays, as a table holds it. `None` when every feature already fits, so nothing is copied.
+/// Whether a GeoPackage table of geometry type `kind` can't hold `f`'s geometry: a column holds
+/// one kind of geometry, the layer's. A feature of another kind, as a mixed layer can hold (a
+/// GeoJSON of points and polygons, say), is left out and counted, as a Shapefile leaves it out;
+/// one without geometry fits, as a table holds it.
+#[cfg(not(target_arch = "wasm32"))]
+fn off_kind(f: &crate::Feature, kind: GeometryType) -> bool {
+    kind != GeometryType::None && f.geometry.as_ref().is_some_and(|g| g.kind() != kind)
+}
+
+/// Hands `add` the runs of `features` a GeoPackage table of `kind` can hold, borrowed (nothing is
+/// copied), and returns how many it left out ([`off_kind`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn feed_of_kind(
+    features: &[crate::Feature],
+    kind: GeometryType,
+    add: &mut dyn FnMut(&[crate::Feature]) -> Result<()>,
+) -> Result<usize> {
+    let (mut start, mut left_out) = (0usize, 0usize);
+    for (i, f) in features.iter().enumerate() {
+        if off_kind(f, kind) {
+            if start < i {
+                add(features.get(start..i).unwrap_or_default())?;
+            }
+            left_out += 1;
+            start = i + 1;
+        }
+    }
+    if start < features.len() {
+        add(features.get(start..).unwrap_or_default())?;
+    }
+    Ok(left_out)
+}
+
+/// `ds` with the features a GeoPackage table of its type can't hold left out, and how many: for
+/// an export about to be projected, which copies the layer anyway, so a feature left out can't
+/// fail the projection. `None` when every feature fits.
 #[cfg(not(target_arch = "wasm32"))]
 fn of_its_kind(ds: &Dataset) -> (Option<Dataset>, usize) {
-    if ds.geometry_type == GeometryType::None {
-        return (None, 0);
-    }
-    let off = |f: &crate::Feature| f.geometry.as_ref().is_some_and(|g| g.kind() != ds.geometry_type);
-    let n = ds.features.iter().filter(|f| off(f)).count();
+    let n = ds.features.iter().filter(|f| off_kind(f, ds.geometry_type)).count();
     if n == 0 {
         return (None, 0);
     }
     let mut kept = ds.clone();
-    kept.features.retain(|f| !off(f));
+    kept.features.retain(|f| !off_kind(f, ds.geometry_type));
     (Some(kept), n)
 }
 
@@ -2726,6 +2770,15 @@ mod tests {
         assert_eq!(written, [("area".to_string(), false), ("none".to_string(), true)]);
         let (back, _) = read_path(&path)?;
         assert!(back.features.iter().all(|f| f.geometry.as_ref().is_none_or(|g| g.kind() == GeometryType::Polygon)));
+        // Projected, the point is left out before the projection: one UTM zone 18N can't hold (a
+        // quarter of the way round the equator from its central meridian, 75°W) doesn't fail the
+        // export of the polygon.
+        let mut far = mixed.clone();
+        if let Some(f) = far.features.get_mut(1) {
+            f.geometry = Some(Geometry::Point(Coord::new(15.0, 0.0)));
+        }
+        let utm = Crs::from_epsg(32618).ok_or("no UTM zone 18N")?;
+        assert_eq!(write_path_in(&far, &dir.path().join("far.gpkg"), utm)?, 1);
         // One kind: nothing left out.
         let mut areas = mixed.clone();
         areas.features.retain(|f| !matches!(f.geometry, Some(Geometry::Point(_))));

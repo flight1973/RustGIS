@@ -370,3 +370,32 @@ fn geoparquet_counts_values_written_as_null() {
     assert_eq!(note, format!("{want}, '{}…'", "x".repeat(40)));
     let _ = std::fs::remove_dir_all(d);
 }
+
+/// A streamed GeoPackage export leaves out geometry of another kind than the layer's, chunk by
+/// chunk, and counts it, as the export of the whole layer does: squares with points among them,
+/// a few features a chunk, give the same table and the same count.
+#[test]
+fn a_streamed_geopackage_leaves_out_geometry_of_another_kind() {
+    let d = folder("mixed-kinds");
+    let mut mixed = squares();
+    mixed.name = "mixed".into();
+    for i in [0usize, 5, 6, 299] {
+        if let Some(f) = mixed.features.get_mut(i) {
+            f.geometry = Some(Geometry::Point(Coord::new(i as f64, 1.0)));
+        }
+    }
+    let layer = Dataset::new(mixed.name.clone(), mixed.geometry_type, mixed.fields.clone());
+    let (a, b) = (d.join("streamed.gpkg"), d.join("whole.gpkg"));
+    let streamed = write_chunks_in(&Runs::new(&mixed, 4), &layer, &a, Crs::LonLat, 1).unwrap();
+    assert_eq!(streamed.left_out, 4);
+    assert_eq!(crate::io::write_path(&mixed, &b).unwrap(), 4);
+    let blobs = |p: &Path| {
+        let c = rusqlite::Connection::open(p).unwrap();
+        c.query_row("SELECT count(*) FROM mixed WHERE geom IS NOT NULL AND substr(hex(geom), 1, 4) = '4750'", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    // Every geometry row is a GeoPackage blob of the table's kind: 296 squares, none of the points.
+    assert_eq!((blobs(&a), blobs(&b)), (296, 296));
+    assert_eq!(read_back(&a).features, read_back(&b).features);
+    assert!(read_back(&a).features.iter().all(|f| f.geometry.as_ref().is_none_or(|g| g.kind() == GeometryType::Polygon)));
+}

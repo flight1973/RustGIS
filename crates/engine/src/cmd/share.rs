@@ -54,7 +54,7 @@ pub fn commands() -> Vec<C> {
                 rustgis_data::io::write_path_to(&t.dataset, Path::new(path), Crs::LonLat, &gpkg).map_err(|e| e.to_string())?;
             s.check_continuation(&owner).map_err(|why| super::exports::completion_refused(Some(path), why))?;
             if left_out > 0 {
-                s.notify(format!("{path}: {left_out} features without drawable geometry were left out"), false);
+                s.notify(format!("{path}: {left_out} features were left out: no drawable geometry, or a geometry of another kind than the layer's"), false);
             }
             for note in notes.into_iter().chain(dbf_notes) {
                 s.notify(note, false);
@@ -638,7 +638,9 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     // geometry it can draw).
     let mut said = Vec::new();
     if left_out > 0 {
-        said.push(format!("{path}: {left_out} features without drawable geometry were left out"));
+        said.push(format!(
+            "{path}: {left_out} features were left out: no drawable geometry, or a geometry of another kind than the layer's"
+        ));
     }
     if skipped > 0 {
         said.push(format!("{path}: {skipped} rows couldn't be read and were left out"));
