@@ -8,7 +8,9 @@ use rustgis_engine::analysis::{
     network::{radius_boundary_point, radius_distance_m},
     selection::MAX_POINTS,
 };
-use rustgis_engine::geom::{Coord, Extent, geodesic_length_m, geodesic_ring_area_m2, wgs84_length_m, wgs84_ring_perimeter_area_m2};
+use rustgis_engine::geom::{
+    Coord, Extent, geodesic_length_m, geodesic_ring_area_m2, geodesic_ring_perimeter_m, wgs84_length_m, wgs84_ring_perimeter_area_m2,
+};
 use rustgis_engine::map::layout::TextAlign;
 use rustgis_engine::map::projection::Flat;
 use rustgis_engine::map::{Camera, Globe, Projection};
@@ -227,6 +229,8 @@ struct SelectionGesture {
 }
 
 pub struct MapView {
+    /// The project whose frames and reported tile errors are kept here.
+    project: Option<u64>,
     texture: Option<egui::TextureHandle>,
     key: Option<Key>,
     /// A preview is attempted once for each frame key, including when drawing fails.
@@ -282,6 +286,8 @@ pub struct MapView {
     pub split_mode: bool,
     /// The vertex chosen with the Edit Vertices tool (layer, row, vertex): Delete removes it.
     pub vertex: Option<(u32, usize, rustgis_engine::data::VertexId)>,
+    /// Source replacement identity captured when the vertex was chosen.
+    pub(crate) vertex_owner: Option<crate::vertexedit::VertexOwner>,
     /// The vertex being dragged with the Edit Vertices tool.
     pub vertex_drag: Option<crate::vertexedit::VertexDrag>,
     /// Non-owning source identity for the held vertex gesture; never persisted with the project.
@@ -396,6 +402,7 @@ impl Default for MapView {
             sketch_done: false,
             split_mode: false,
             vertex: None,
+            vertex_owner: None,
             vertex_drag: None,
             vertex_drag_owner: None,
             move_shared_vertices: false,
@@ -420,6 +427,7 @@ impl Default for MapView {
             picture: None,
             attribution: Vec::new(),
             tile_errors: std::collections::HashSet::new(),
+            project: None,
             last_render: -10.0,
             drape: Default::default(),
             tilt_drape: Default::default(),
@@ -441,6 +449,29 @@ impl Default for MapView {
 }
 
 impl MapView {
+    /// Retire old drawings before any of them can report errors for a replacement project.
+    fn follow_project(&mut self, opened: u64) {
+        if self.project.is_some_and(|p| p != opened) {
+            self.invalidate();
+            self.texture = None;
+            self.split = None;
+            self.split_gpu = None;
+            self.live_rev = None;
+            self.gpu_turn_declined = None;
+            self.labels.clear();
+            self.label_lonlat.clear();
+            self.label_map.clear();
+            self.callout_lonlat.clear();
+            self.callout_map.clear();
+            self.attribution.clear();
+            self.tile_errors.clear();
+            self.drape = Default::default();
+            self.tilt_drape = Default::default();
+            self.filling = false;
+        }
+        self.project = Some(opened);
+    }
+
     /// The position the status bar shows: the last one over this map, kept while the pointer is
     /// elsewhere. A position from another map or project no longer applies, so it is dropped.
     pub fn kept_pointer_lonlat(&mut self, map_instance: u64, opened: u64) -> Option<Coord> {
@@ -540,6 +571,7 @@ impl MapView {
     /// alone. The chosen node is cleared because its row/address may now belong to another shape.
     pub(crate) fn cancel_vertex_drag(&mut self) {
         self.vertex = None;
+        self.vertex_owner = None;
         self.vertex_drag = None;
         self.vertex_drag_owner = None;
         if self.drag.is_some_and(|(_, kind)| kind == DragKind::Vertex) {
@@ -558,6 +590,7 @@ fn now(ui: &Ui) -> f64 {
 /// Shows the active map workspace, discarding stale node gestures after map-tab changes and
 /// before rendering their overlays or consuming pointer releases.
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
+    app.map.follow_project(app.session.opened);
     let t = Tokens::get(ui.ctx());
     crate::modelbuilder::follow_view(app);
     view_tabs(app, ui, &t);
@@ -1186,7 +1219,12 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         // In a picture, for the camera it was drawn for: the picture moves them with the rest (a
         // basemap zoomed in past what f32 holds is such a picture, under the tiles).
         let (live_frame, live_pending) = match gf.live_frame(if picture { app.map.tex_camera } else { cam }) {
-            Some((f, pending, declined)) => {
+            Some((mut f, pending, declined)) => {
+                for error in f.tile_errors.drain(..) {
+                    if app.map.tile_errors.insert(error.clone()) {
+                        app.session.notify(error, true);
+                    }
+                }
                 // A layer no longer drawn live (its style turned out to draw more than raster
                 // tiles): the map is drawn again, as tiles arriving would draw it.
                 if declined && app.map.live_rev.take().is_some() {
@@ -3168,7 +3206,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
                 if body.is_earth() {
                     wgs84_ring_perimeter_area_m2(ring)
                 } else {
-                    (body.length(geodesic_length_m(ring)), body.area(geodesic_ring_area_m2(ring)))
+                    (body.length(geodesic_ring_perimeter_m(ring)), body.area(geodesic_ring_area_m2(ring)))
                 }
             };
             let text = if tool == Tool::Measure {
@@ -4166,6 +4204,36 @@ mod tile_redraw_tests {
 
     fn key(tiles: u64) -> Key {
         Key { rev: 4, cam: (1, 2, 3, 0, 0), size: [800, 600], draft: false, tiles, sources: 0, shown: 0 }
+    }
+
+    #[test]
+    fn replacing_a_project_retires_frames_and_allows_its_tile_notices_again() {
+        let mut app = crate::RustGisApp::with_sample();
+        let ctx = egui::Context::default();
+        // Showing another workspace still retires old map frames before the map is opened.
+        app.ws.catalog_view = true;
+        let draw = |app: &mut crate::RustGisApp| {
+            let mut pass = ctx.run_ui(Default::default(), |ui| super::show(app, ui));
+            pass.textures_delta.clear();
+        };
+        draw(&mut app);
+        let (saved, _) = app.session.project.saved_text(None).unwrap();
+        for params in [serde_json::json!({"text":saved}), serde_json::json!({})] {
+            let error = "Tiles: missing source".to_owned();
+            assert!(app.map.tile_errors.insert(error.clone()));
+            app.map.key = Some(key(0));
+            app.map.texture = Some(ctx.load_texture("old map", egui::ColorImage::filled([1, 1], egui::Color32::RED), Default::default()));
+            draw(&mut app);
+            assert!(!app.map.tile_errors.insert(error.clone()), "reported once within the same project");
+            assert!(app.map.texture.is_some() && app.map.key.is_some());
+            // Direct engine ingress also covers an assistant, script or peer opening a project.
+            let cmd = if params.get("text").is_some() { "project.openText" } else { "project.new" };
+            app.session.run(cmd, &params).unwrap();
+            draw(&mut app);
+            assert!(app.map.key.is_none() && app.map.texture.is_none() && app.map.gpu_frame.is_none());
+            assert!(app.map.tile_errors.insert(error), "reopening the same or another project reports the notice again");
+            app.map.tile_errors.clear();
+        }
     }
 
     #[test]

@@ -102,16 +102,16 @@ impl Session {
             })
         })
     }
-    /// Admits a file read before its picker, freezes Load All's selector, and seals its owner.
+    /// Admits a file read before its picker, freezes a layer selector, and seals its owner.
     pub(crate) fn start_read(&mut self, command: &str, params: &Value) -> Result<crate::cmd::reads::ReadAhead, String> {
         if self.depth > 0 || !self.policy.nodes.is_empty() || self.policy.cursor.is_some() {
             return Err("background reads can only start before handler dispatch".into());
         }
-        if !matches!(command, "layer.addData" | "layer.loadAll" | "model.run" | "script.run") {
-            return Err("only Add Data, Load All, models and scripts can prepare background work".into());
+        if !matches!(command, "layer.addData" | "layer.loadAll" | "layer.reloadData" | "model.run" | "script.run") {
+            return Err("only Add Data, Load All, Reload Data, models and scripts can prepare background work".into());
         }
         let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
-        if command == "layer.loadAll" {
+        if matches!(command, "layer.loadAll" | "layer.reloadData") {
             let id = self.layer_id(&Value::Object(params.clone()))?;
             params.insert("layer".into(), json!(id));
         }
@@ -196,7 +196,9 @@ impl Session {
         }
         let op = self.authorize(command, params)?;
         let node = op.node.clone();
-        self.with_node(node, |s| crate::cmd::exports::export_start_raw(s, op))
+        // Prepared outside a command: what it couldn't read as true or false is said here (#1600).
+        let source = self.registry.get(command).map(|spec| spec.id);
+        self.with_unread_bools(source, |s| s.with_node(node, |s| crate::cmd::exports::export_start_raw(s, op)))
     }
     /// Exports own their input snapshot. Native delivery may report it after a layer/map switch;
     /// restricted delivery still binds the original live map and source identities.
@@ -274,6 +276,20 @@ impl Session {
             Ok(r) => Ok(r),
             Err(p) => std::panic::resume_unwind(p),
         }
+    }
+    /// Runs what a session plugin's program asks between its commands with the plugin's own
+    /// authority, as its commands run: the exact load, still current, narrowing the scope the app
+    /// is in (none at the frame's root, the trusted native convention).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn as_session_plugin<T>(
+        &mut self,
+        plugin: Arc<rustgis_plugins::Plugin>,
+        f: impl FnOnce(&mut Session) -> T,
+    ) -> Result<T, String> {
+        if !rustgis_plugins::is_current(&plugin) {
+            return Err("the plugin was disabled, updated or removed".into());
+        }
+        self.narrowed(Narrow::Plugin(super::plan::PluginPin(plugin)), f)
     }
     /// Intersects nested plugin/item authority with its initiating scope.
     pub(crate) fn narrowed<T>(&mut self, to: Narrow, f: impl FnOnce(&mut Session) -> T) -> Result<T, String> {
@@ -408,7 +424,12 @@ impl Session {
                     return Err("this operation needs your approval".into());
                 }
                 let node = self.admit(node)?;
-                self.with_node(node, |s| s.guarded("Run Script", true, |s| crate::cmd::workflows::run_script(s, &json!({"script":script}))))
+                // Its lines run nested: what they couldn't read as true or false is said here (#1600).
+                self.with_unread_bools(Some("script.run"), |s| {
+                    s.with_node(node, |s| {
+                        s.guarded("Run Script", true, |s| crate::cmd::workflows::run_script(s, &json!({"script":script})))
+                    })
+                })
             }
             CallKind::Adapter { .. } => {
                 let node = self.call_node(&self.scope(), call)?;
@@ -746,8 +767,10 @@ impl Session {
             return Err(error);
         }
         let node = op.node;
+        let source = Some(spec.id);
         let op = Authorized { op: RasterOp { spec, params }, node: node.clone() };
-        self.with_node(node, |s| crate::cmd::workflows::raster_start_raw(s, op))
+        // Prepared outside a command: what it couldn't read as true or false is said here (#1600).
+        self.with_unread_bools(source, |s| s.with_node(node, |s| crate::cmd::workflows::raster_start_raw(s, op)))
     }
     /// A UI completion resumes the stored owner; scoped callers must already be that owner.
     pub fn finish_raster(&mut self, command: &str, id: u64, params: &Value) -> CmdResult {

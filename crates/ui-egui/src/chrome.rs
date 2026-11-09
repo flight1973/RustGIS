@@ -432,7 +432,7 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                             sep(ui, &t);
                         }
                     }
-                    if ui.small_button(tl!("Diagnostics")).on_hover_text(tl!("Review messages and failed network requests")).clicked() {
+                    if ui.small_button(tl!("Messages")).on_hover_text(tl!("Review messages and failed network requests")).clicked() {
                         app.ui.open_right(crate::RightPane::DiagnosticLog);
                     }
                     // Cut to the room left (the whole notice on hover), so it doesn't run
@@ -446,7 +446,7 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                                 .small()
                                 .truncate(),
                         )
-                        .on_hover_text(crate::i18n::fmt("{message}\n{open}", &[("message", &n.text), ("open", tl_raw!("Open Diagnostics"))]))
+                        .on_hover_text(crate::i18n::fmt("{message}\n{open}", &[("message", &n.text), ("open", tl_raw!("Open Messages"))]))
                         .clicked() {
                         app.ui.open_right(crate::RightPane::DiagnosticLog);
                     }
@@ -679,7 +679,7 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
 
 /// Whether a UI command is available on the current platform.
 pub(crate) fn command_available(id: &str, web: bool) -> bool {
-    !web || !matches!(id, "ui.checkUpdate" | "ui.mcpRelay" | "ui.themeLoad" | "ui.themeReload")
+    !web || !matches!(id, "ui.checkUpdate" | "ui.mcpRelay" | "ui.themeLoad" | "ui.themeReload" | "ui.reloadData" | "layer.reloadData")
 }
 
 /// The `ui.*` commands Command Search lists: (id, label, ribbon location).
@@ -704,7 +704,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.pane.geoprocessing", "Tools Pane", "View › Windows"),
     ("ui.pane.symbology", "Symbology Pane", "Style › Drawing"),
     ("ui.pane.labeling", "Labeling Pane", "View › Windows"),
-    ("ui.pane.diagnosticLog", "Diagnostics", "View › Windows"),
+    ("ui.pane.diagnosticLog", "Messages", "View › Windows"),
     ("ui.pane.assistant", "AI Assistant", "Analyze › AI"),
     ("ui.pane.sql", "SQL Pane", "Analyze › Workflows"),
     ("ui.pane.directions", "Directions", "Home › Navigate"),
@@ -785,6 +785,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "layer.rename" => Dialog("renameLayer"),
         "layer.defineProjection" => Dialog("defineProjection"),
         "layer.repairSource" => Dialog("repairSource"),
+        "layer.reloadData" => Command("ui.reloadData"),
         "ui.importShapefile" => Dialog("addShapefile"),
         "layer.definitionQuery" => Dialog("definitionQuery"),
         "layer.symbology" | "raster.symbology" | "layer.color" | "layer.outline" | "layer.lineStrokes" | "layer.fillLayers"
@@ -979,7 +980,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             }
         }
         for c in &app.session.registry.commands {
-            if command_matches(c, &ql) {
+            if command_available(c.id, cfg!(target_arch = "wasm32")) && command_matches(c, &ql) {
                 hits.push((c.id.to_string(), tl!(c.label).to_string(), crate::i18n::location(c.location)));
             }
         }

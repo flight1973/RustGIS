@@ -2132,8 +2132,8 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
             small(
                 ui,
                 app,
-                "identify",
-                "Diagnostics",
+                "message_log",
+                "Messages",
                 "Review errors, warnings, information and failed network requests from this session.",
                 "ui.pane.diagnosticLog",
                 Value::Null,
@@ -2334,6 +2334,10 @@ fn data_source_group(app: &mut RustGisApp, ui: &mut Ui) {
             false,
             false,
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        if active_layer(app).is_some_and(crate::reloaddata::supported) {
+            big(ui, app, "redo", "Reload\nData", crate::reloaddata::HELP, "ui.reloadData", Value::Null, false, false);
+        }
     });
 }
 
@@ -3488,10 +3492,53 @@ fn settings_tab(app: &mut RustGisApp, ui: &mut Ui) {
         worldview_menu(app, ui);
     });
     group(ui, "Start-up", |ui| start_project_menu(app, ui));
+    // The browser has no threads to set.
+    if !cfg!(target_arch = "wasm32") {
+        group(ui, "Performance", |ui| threads_menu(app, ui));
+    }
     // Only a shell that keeps recovery copies (the desktop app) has autosave.
     if app.services.recovery.is_some() {
         group(ui, "Autosave", |ui| autosave_menu(app, ui));
     }
+}
+
+/// A thread setting's name: "Automatic (8)", with the threads it gives, or the number.
+fn threads_label(setting: Option<usize>) -> String {
+    use rustgis_engine::data::threads;
+    match setting {
+        None => crate::i18n::fmt("Automatic ({n})", &[("n", &threads::default_max().to_string())]),
+        Some(n) => n.min(threads::cores()).to_string(),
+    }
+}
+
+/// Settings › Threads: the most threads one piece of work uses (#1562), the computer's cores up
+/// to 16 by default.
+fn threads_menu(app: &mut RustGisApp, ui: &mut Ui) {
+    use rustgis_engine::data::threads;
+    let setting = threads::setting();
+    let label = format!("{}\n{}", tl!("Threads"), threads_label(setting));
+    let tip = "The most threads a tool, a raster read or a map drawing uses: fewer keep cores free for other work.";
+    big_menu(ui, app, "settings", &label, tip, move |ui, app| {
+        if ui.add(egui::Button::selectable(setting.is_none(), threads_label(None))).clicked() {
+            let _ = app.run("ui.threads", json!({"threads": null}));
+            ui.close();
+        }
+        let mut choices = crate::threadsui::choices(threads::cores());
+        // A setting made elsewhere (`gp.threads`, a script) is listed too, so it shows as chosen.
+        if let Some(s) = setting.map(|s| s.min(threads::cores()))
+            && !choices.contains(&s)
+        {
+            choices.push(s);
+            choices.sort_unstable();
+        }
+        for n in choices {
+            let on = setting.is_some_and(|s| s.min(threads::cores()) == n);
+            if ui.add(egui::Button::selectable(on, n.to_string())).clicked() {
+                let _ = app.run("ui.threads", json!({"threads": n}));
+                ui.close();
+            }
+        }
+    });
 }
 
 /// An interval's name: "Off" or "Every 5 min".
@@ -4902,10 +4949,29 @@ fn feature_data_groups(app: &mut RustGisApp, ui: &mut Ui) {
     });
 }
 
-/// A language's own name, or its English name when no installed font can draw it (CJK names on the
-/// web before a CJK font has been downloaded).
+/// Whether an installed font can draw `text` (CJK names on the web before a CJK font has been
+/// downloaded can't be).
+fn drawable(ui: &Ui, text: &str) -> bool {
+    ui.ctx().fonts_mut(|f| f.has_glyphs(&regular(12.5), text))
+}
+
+/// How the language picker names `l`: in English while the interface is English, otherwise in the
+/// language itself, or in English when no installed font can draw that.
 fn shown_name(ui: &Ui, l: crate::i18n::Lang) -> &'static str {
-    if ui.ctx().fonts_mut(|f| f.has_glyphs(&regular(12.5), l.name())) { l.name() } else { l.english() }
+    if crate::i18n::current() == crate::i18n::Lang::EN || !drawable(ui, l.name()) { l.english() } else { l.name() }
+}
+
+/// The languages in the picker's order: alphabetical by the name the list shows.
+fn sorted_langs(ui: &Ui) -> Vec<crate::i18n::Lang> {
+    let mut langs: Vec<_> = crate::i18n::Lang::all().collect();
+    langs.sort_by_cached_key(|&l| shown_name(ui, l).to_lowercase());
+    langs
+}
+
+/// The picker's tooltip for `l`: whichever of its two names the list doesn't show, if it can be drawn.
+fn other_name(ui: &Ui, l: crate::i18n::Lang) -> &'static str {
+    let shown = shown_name(ui, l);
+    if shown == l.english() && drawable(ui, l.name()) { l.name() } else { l.english() }
 }
 
 /// Whose view of disputed borders the built-in countries and world outline show (Settings › Language).
@@ -4945,9 +5011,9 @@ fn language_menu(app: &mut RustGisApp, ui: &mut Ui) {
             ui.close();
         }
         ui.separator();
-        for l in crate::i18n::Lang::all() {
+        for l in sorted_langs(ui) {
             let sel = !auto && l == current;
-            if ui.selectable_label(sel, shown_name(ui, l)).on_hover_text(l.english()).clicked() {
+            if ui.selectable_label(sel, shown_name(ui, l)).on_hover_text(other_name(ui, l)).clicked() {
                 let _ = app.run("ui.language", json!({"code": l.code()}));
                 ui.close();
             }
@@ -4985,6 +5051,70 @@ mod tests {
         );
         h.run();
         h
+    }
+
+    /// The language list names every language in English while the interface is English, with the
+    /// language's own name as the tooltip; in another language each keeps its own name, or its
+    /// English one where no font can draw it.
+    #[test]
+    fn the_language_list_follows_the_interface_language() {
+        use crate::i18n::{self, Lang};
+        let names = |lang: Lang, install: bool| {
+            let mut fonts = !install;
+            let mut h = egui_kittest::Harness::builder().build_ui_state(
+                move |ui, out: &mut Vec<(&'static str, &'static str)>| {
+                    if !fonts {
+                        crate::theme::install_fonts(ui.ctx(), &[], None);
+                        fonts = true;
+                        return;
+                    }
+                    i18n::set_current(lang);
+                    *out = Lang::all().map(|l| (shown_name(ui, l), other_name(ui, l))).collect();
+                    i18n::set_current(Lang::EN);
+                },
+                Vec::new(),
+            );
+            h.run();
+            h.state().clone()
+        };
+        let en = names(Lang::EN, true);
+        let english: Vec<_> = Lang::all().map(Lang::english).collect();
+        assert_eq!(en.iter().map(|n| n.0).collect::<Vec<_>>(), english);
+        let fr = Lang::from_code("fr").unwrap();
+        let tip = |names: &[(&'static str, &'static str)], l: Lang| -> &'static str {
+            names.iter().find(|n| n.0 == l.english() || n.0 == l.name()).unwrap().1
+        };
+        assert_eq!(tip(&en, fr), "Français", "the tooltip gives the language's own name");
+        let order = |lang: Lang| {
+            let mut fonts = false;
+            let mut h = egui_kittest::Harness::builder().build_ui_state(
+                move |ui, out: &mut Vec<&'static str>| {
+                    if !fonts {
+                        crate::theme::install_fonts(ui.ctx(), &[], None);
+                        fonts = true;
+                        return;
+                    }
+                    i18n::set_current(lang);
+                    *out = sorted_langs(ui).into_iter().map(|l| shown_name(ui, l)).collect();
+                    i18n::set_current(Lang::EN);
+                },
+                Vec::new(),
+            );
+            h.run();
+            h.state().clone()
+        };
+        let listed = order(Lang::EN);
+        assert_eq!(listed.first(), Some(&"Azerbaijani"), "{listed:?}");
+        assert!(listed.windows(2).all(|w| w[0].to_lowercase() <= w[1].to_lowercase()), "alphabetical: {listed:?}");
+        let de = Lang::from_code("de").unwrap();
+        let names_de = names(de, true);
+        assert!(names_de.contains(&("Français", "French")), "in German, French keeps its own name: {names_de:?}");
+        // egui's own fonts have no Bengali letters, so without the interface fonts Bengali falls back.
+        let bn = Lang::from_code("bn").unwrap();
+        let bare = names(de, false);
+        assert!(bare.contains(&("Bengali", "Bengali")), "an undrawable name falls back to English: {bare:?}");
+        assert!(bare.contains(&("Français", "French")), "a drawable one doesn't: {bare:?}");
+        assert!(!bare.iter().any(|n| n.0 == bn.name()));
     }
 
     /// The Labeling tab holds every label group (#897): a feature layer's, then the map's, which

@@ -137,7 +137,7 @@ fn right_title(pane: RightPane) -> (&'static str, &'static str) {
         RightPane::Profile => ("Profile", "ui.pane.profile"),
         RightPane::TimeSeries => ("Time Series", "ui.pane.timeSeries"),
         RightPane::Diagnostics => ("Diagnostic Monitor", "ui.pane.diagnostics"),
-        RightPane::DiagnosticLog => ("Diagnostics", "ui.pane.diagnosticLog"),
+        RightPane::DiagnosticLog => ("Messages", "ui.pane.diagnosticLog"),
         RightPane::Infographics => ("Infographics", "ui.pane.infographics"),
         RightPane::Report => ("Report", "ui.pane.report"),
         RightPane::Presentation => ("Presentation", "ui.pane.presentation"),
@@ -2260,6 +2260,11 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
     }
     if l.linked_file().is_some() && ui.button(tl!("Repair Data Source…")).clicked() {
         let _ = app.run("ui.dialog", json!({"name": "repairSource", "layer": l.id}));
+        ui.close();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::reloaddata::supported(l) && ui.button(tl!("Reload Data")).on_hover_text(tl!(crate::reloaddata::HELP)).clicked() {
+        let _ = app.run("ui.reloadData", json!({"layer": l.id}));
         ui.close();
     }
     ui.separator();

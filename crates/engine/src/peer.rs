@@ -436,7 +436,8 @@ impl Session {
             }
         }
         crate::cmd::connections::clear_active();
-        p.normalize_opened();
+        let layout_notices = p.normalize_opened();
+        p.read_notices.extend(layout_notices.into_iter().map(|n| (crate::project::ReadPart::Layouts, n)));
         let mut report = Report::default();
 
         if let (Some(exchange), Some(raw)) = (exchange, raw) {
@@ -477,13 +478,13 @@ impl Session {
     }
 }
 
-/// The same opening bound applies to peers; no destination is written on a formatting failure.
+/// A peer may be the web app, which opens at most [`BYTES_FLOOR`](crate::project::BYTES_FLOOR)
+/// whatever this computer saves: the text is never built past that. No destination is written on
+/// a formatting failure.
 fn text(p: &Project) -> Result<String, String> {
-    let text = serde_json::to_string(p).map_err(|e| e.to_string())?;
-    if text.len() as u64 > crate::project::MAX_BYTES {
-        return Err("the project is too large to exchange".into());
-    }
-    Ok(text)
+    let max = crate::project::BYTES_FLOOR;
+    crate::project::json_within(p, max)?
+        .ok_or_else(|| format!("the project is too large to exchange (maximum {} MiB, what the web app opens)", max >> 20))
 }
 
 #[cfg(test)]

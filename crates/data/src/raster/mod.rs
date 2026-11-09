@@ -303,14 +303,10 @@ fn higher(max: f64, x: f64) -> f64 {
     if x > max { x } else { max }
 }
 
-/// The threads to count a band of `len` values on: at most 16, one per 256 Ki values, and one
-/// below [`PARALLEL_VALUES`] or in the browser.
+/// The threads to count a band of `len` values on: at most [`crate::threads::max`], one per
+/// 256 Ki values, and one below [`PARALLEL_VALUES`] or in the browser.
 fn threads_for(len: usize) -> usize {
-    if cfg!(target_arch = "wasm32") || len < PARALLEL_VALUES {
-        1
-    } else {
-        std::thread::available_parallelism().map_or(1, |n| n.get()).min(16).min(len / (PARALLEL_VALUES / 4))
-    }
+    if cfg!(target_arch = "wasm32") || len < PARALLEL_VALUES { 1 } else { crate::threads::max().min(len / (PARALLEL_VALUES / 4)) }
 }
 
 /// `f` over `threads` runs of `data` that cover it in order, its results in that order, the
@@ -582,6 +578,11 @@ pub struct Raster {
     /// compared once read as `f32`: a long decimal whose `f32` reading differs from the no-data
     /// value's (rounded through `f64`) is counted, as it isn't masked as no-data either.
     pub rounded: Vec<u64>,
+    /// By band, whether the band holds some values rounded when its source was read, how many
+    /// not known: a raster made from part of one with `rounded` values (a clip, a pixel edit)
+    /// keeps an unknown share of them, so it carries this mark instead of a count. Empty when
+    /// none does.
+    pub rounded_some: Vec<bool>,
     /// Who holds the rights to the picture (the TIFF Copyright tag): the credits a map's tile
     /// layers ask for, on a GeoTIFF of the view. Read from a GeoTIFF that has it, and written
     /// when this raster is exported; a raster made from it (clipped, reprojected) starts
@@ -756,6 +757,7 @@ impl Raster {
             georeferenced: true,
             lost: Vec::new(),
             rounded: Vec::new(),
+            rounded_some: Vec::new(),
             copyright: None,
             transformer,
             extent: Extent::EMPTY,
@@ -940,6 +942,30 @@ impl Raster {
 
     pub fn band_count(&self) -> usize {
         self.bands.len()
+    }
+
+    /// Whether band `b` holds values rounded when its source was read: counted in `rounded`, or
+    /// marked in `rounded_some` with no count.
+    pub fn band_rounded(&self, b: usize) -> bool {
+        self.rounded.get(b).is_some_and(|n| *n > 0) || self.rounded_some.get(b).copied().unwrap_or(false)
+    }
+
+    /// Marks this raster, made from part of `src` band for band (a clip, a pixel edit, a
+    /// resample), as holding some of `src`'s rounded values, how many unknown: the bands of `src`
+    /// that held any are marked, and the count, which was `src`'s whole, isn't kept.
+    pub fn keep_rounded_mark(&mut self, src: &Raster) {
+        self.keep_rounded_marks(std::iter::once(src));
+    }
+
+    /// As [`Raster::keep_rounded_mark`], for a raster made from parts of several (a mosaic): a
+    /// band is marked when any source's band of that number held rounded values.
+    pub fn keep_rounded_marks<'a>(&mut self, srcs: impl IntoIterator<Item = &'a Raster>) {
+        let mut marks = vec![false; self.band_count()];
+        for src in srcs {
+            marks.iter_mut().enumerate().for_each(|(b, m)| *m |= src.band_rounded(b));
+        }
+        self.rounded = Vec::new();
+        self.rounded_some = if marks.contains(&true) { marks } else { Vec::new() };
     }
 
     /// Whether a value is a real measurement (not no-data or NaN).
@@ -1362,15 +1388,19 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
 
 /// An ASCII grid at `path` (its `text`), in the coordinate system of the `.prj` next to it.
 fn read_ascii(path: &Path, text: &str, name: &str, nodata: Option<f64>) -> Result<Raster> {
-    let (crs, unread) = sidecar_crs(path)?;
+    let (crs, note) = sidecar_crs(path)?;
     let mut r = ascii::read_with_nodata(text, name, crs, nodata)?;
-    // A .prj that couldn't be read leaves the grid in longitude/latitude, as a Shapefile's does.
-    r.lost.extend(unread.map(|e| format!("the .prj file: {e}; coordinates are read as longitude/latitude")));
+    // Planetary body notices have their own path. Preserve the method warning without duplicating
+    // those, and only assume lon/lat for an unreadable definition.
+    r.lost.extend(note.map(|message| match crs {
+        Some(_) => format!("the .prj file: {message}"),
+        None => format!("the .prj file: {message}; coordinates are read as longitude/latitude"),
+    }));
     Ok(r)
 }
 
-/// The coordinate system in the `.prj` next to an ASCII grid, when RustGIS understands it. Else
-/// why it doesn't, so the grid is read without it and says so. Another body's system RustGIS
+/// The coordinate system and WKT notice in the `.prj` next to an ASCII grid. An unreadable
+/// definition returns no system and explains why, so the grid says it assumes longitude/latitude. Another body's system RustGIS
 /// doesn't understand is an error instead, because the grid would land in the wrong place as
 /// longitude/latitude.
 fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
@@ -1379,8 +1409,13 @@ fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
         let there = std::fs::metadata(path.with_extension("prj")).is_ok_and(|m| m.is_file());
         return Ok((None, there.then(|| "it can't be read as text".to_string())));
     };
-    match wkt::crs_from_wkt(&prj) {
-        Ok(crs) => Ok((Some(crs), None)),
+    match wkt::read_wkt(&prj) {
+        Ok((crs, note)) => {
+            // The raster's body channel reports planetary interpretation once; datum and
+            // projection notices from this sidecar must otherwise be preserved.
+            let note = if crs.is_planetary() { wkt::projection_compatibility_note(&prj, crs).map(str::to_owned) } else { note };
+            Ok((Some(crs), note))
+        }
         Err(e) => match planetary::refused_wkt(&prj, &e) {
             Some(refused) => Err(DataError::Format(format!("the .prj file: {refused}"))),
             None => Ok((None, Some(e))),

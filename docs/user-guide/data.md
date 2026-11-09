@@ -50,6 +50,10 @@ first and its points last, so its points are drawn on top, and a KML's ground ov
 them. A name given goes to the first map layer added, the bottom one (a standalone table only gets
 it when the file has no map layer). A GeoPackage adds its tables in name order, and a file read
 through GDAL keeps its layers in the file's order and orders only the types within each layer.
+GeoPackage attribute-only tables are not supported. Adding a whole file reports their count in
+one notice. Tile and other unsupported GeoPackage contents are also counted by type. The omission counts cover catalog entries without a registered geometry column; unknown content types are combined into one counted "other" group. Only contents registered in `gpkg_contents` are considered; arbitrary unregistered SQLite tables are ignored. Desktop uploads add their first feature table, with the existing note naming how many feature tables the file contains. Browser uploads with virtual generated `table_name` or `data_type` catalog columns cannot be evaluated and are refused with an explanation; materialize these columns or select a feature table explicitly. A file
+containing only attribute tables is refused with the count. Selecting a
+feature table explicitly adds only that table.
 On the desktop, **Home › Add › Add Data › Add Folder…** connects a folder to the Browser; the web
 app does not offer folder connections.
 On the desktop, a file Add Data reads whole (a GeoTIFF or another raster, one GDAL converts, a
@@ -76,6 +80,13 @@ the table's name beside it (`input_name`). The **XY Table To Point** tool
 ([Geoprocessing](analysis.md), and a table's right-click menu) makes points of a table already in
 the project, from two fields of coordinates and their coordinate system. In a text field a single comma is the decimal separator
 (`1,234` is 1.234); thousands separators are not read.
+Excel `.xls` records, formula operands and sheet bounds are checked before opening, including
+sheets that were not selected. The workbook shares a memory budget across its sheets and retained
+metadata. Value and formula grids are counted separately, with conservative estimates for
+formula strings, defined names and sheet state. Formula-heavy workbooks can reach this budget
+before their value-grid limit. A file with damaged records or excessive allocations is refused with the reason. Normal
+cached formula values are read. A formula's direct cell reference to row 65,536 is currently
+refused because the XLS reader cannot handle that reference safely.
 **Home › Add › Add Data › Graphics Layer** adds a layer for [drawn graphics](cartography.md#graphics),
 and **Data › Layer Templates** adds empty layers with ready-made schemas to draw into.
 
@@ -96,10 +107,23 @@ Mercator in its azimuth forms (the two-point form, with no azimuth, is refused),
 Cassini-Soldner, polyconic and Equal Earth methods are supported from their parameters, as are sinusoidal (MODIS), Robinson, orthographic and Mercator (variant A), in `.prj`
 files and in GeoTIFF keys. Esri's orthographic is a spherical projection: on an ellipsoid it is
 refused, with a notice, rather than computed as EPSG's ellipsoidal one. The equidistant
-cylindrical projection (EPSG:4087, World Equidistant Cylindrical) is computed on its ellipsoid,
-as EPSG defines it, not on a sphere, both for data and for a map drawn in it (as is the
-Equirectangular preset). An ellipsoid flatter than about 1/100, such as Jupiter's or Saturn's, is
-refused in it rather than approximated.
+cylindrical projection (EPSG:4087, World Equidistant Cylindrical) uses a sphere of its datum's
+semi-major axis, matching legacy PROJ/GDAL coordinates (verified with PROJ 9.7.1), both for data
+and for a map drawn in it (including the
+Equirectangular preset). This also applies to planetary Equirectangular systems and definitions
+that name EPSG method 1028. Shapefile and ASCII-grid `.prj` files and GeoPackage WKT definitions
+whose method is interpreted as EPSG 1028 on an ellipsoid report the formula difference,
+without assuming how the producer computed its coordinates. Effectively spherical definitions
+need no warning. Code-only CRS identifiers use the same compatibility formula without a method
+warning, since no explicit WKT method is being read. Typed WKT inputs also report the method
+difference: Add Data overrides, Define Projection, CSV imports, measured layout grids, Zarr
+inputs, vector exports, XY Table To Point and Kernel Density. ASCII-grid sidecars retain
+datum warnings as well as the projection warning. RustGIS applies the same compatibility formula to GeoTIFF CT 17;
+this key identifies a GeoTIFF transformation, rather than explicitly declaring EPSG method 1028.
+[PROJ 9.9](https://proj.org/en/stable/operations/projections/eqc.html) supports the ellipsoidal
+formula instead. RustGIS preserves coordinates for files created with the legacy spherical formula. Files created with an ellipsoidal EQC formula, including PROJ 9.9 output, can be misplaced by kilometres; check which formula the producer used.
+The datum's ellipsoid is retained for datum transformations and
+exported coordinate system definitions.
 
 Shapefile text uses a supported `.cpg` encoding, otherwise the `.dbf` code page, with UTF-8 as
 the fallback. Keep the sidecar files together.
@@ -117,7 +141,8 @@ fields, calculates field [expressions](expressions.md) and opens **Calculate Geo
 The geometry calculator fills a new double field or an existing numeric field with area,
 perimeter, length or point X/Y, for all or selected features. Point coordinates can be WGS 84
 degrees or a supported projected EPSG system's units. Areas, perimeters and lengths measure on
-the WGS 84 ellipsoid, with the exceptions for full-turn and polar rings listed under
+the WGS 84 ellipsoid; how full-turn rings (globe-wide bands) and rings split at the antimeridian
+are measured, and the exception for polar rings, are under
 [Geoprocessing](analysis.md#geoprocessing-tools).
 See [Editing](editing.md) for field
 calculations and data-design rules. Streamed layers must first be loaded with **Load All
@@ -625,6 +650,21 @@ password and any key, token or signature in its query (`token=`, `sig=`, `X-Amz-
 database is kept without its password. The commands `sources.list`, `sources.save`,
 `sources.favourite` and `sources.remove` read and change the lists, for the command line and the
 [AI Assistant](assistant.md). On the command line they last for the run.
+
+### Network downloads
+
+On desktop and the command line, web tiles, service documents and file downloads through
+**From URL…** connect directly, including `layer.addUrl`. These requests do not use
+`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`: a proxy could resolve a destination beyond the
+app's IP checks. There is no proxy override for these requests. If your network requires a
+proxy, download a file with a trusted external tool and open the local copy in RustGIS.
+Live tile and service access requires direct connectivity. The web app uses the browser's
+network settings. Browser GET and HEAD requests refuse redirects, including HTTP-to-HTTPS upgrades
+and CDN hops, because the app cannot inspect their destinations. This includes **From URL…**
+file downloads, fonts, service documents, tiles and sprites, and PMTiles/COG archive range
+reads. Supply the final address; for a redirecting file download, download it with a trusted
+external tool and open the local copy. The browser also controls DNS and local-network access;
+see [tile request limits](maps.md#basemaps).
 
 ### HTTPS certificates
 

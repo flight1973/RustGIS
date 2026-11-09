@@ -50,7 +50,7 @@ files, and exported maps are drawn turned and tilted. A tilted map keeps the sca
 of the view: nearer ground is larger, farther ground smaller and drawn coarser, fading into fog
 and, past about 72 degrees, a sky above the horizon. Labels stay upright, and those too far away
 to read are left out. Point markers stand upright, facing you, as MapLibre's circles do, smaller
-with distance (aggregated, masked or blended point layers, and layers of more than 50,000 points,
+with distance (aggregated, masked, blended or diagrammed point layers, and layers of more than 50,000 points,
 keep their markers on the ground). Extruded layers (Style › Extrusion) stand up in perspective on a tilted
 map, as in MapLibre: walls lit by the way they face and darker toward their foot, roofs at their
 height, with the labels of extruded features on their roofs. While a tilted map moves, the
@@ -263,7 +263,7 @@ Ocean, Atlas, Blank), which need no network, and web tile layers over them:
   layers (each `hillshade-method`, lit as the map is drawn, north up; slopes are steepened at
   small scales so relief stays visible). Its shading follows the style's colours, exaggeration
   and light rather than matching MapLibre's pixel for pixel. Other `color-relief-color`
-  expressions aren't drawn. If a style's elevation source can't be read, its relief and
+  expressions aren't drawn, and a notice names the layers skipped. If a style's elevation source can't be read, its relief and
   hillshade layers are left out with a notice saying why, and the rest is drawn. Labels are placed
   as MapLibre places them: at points,
   in the middle of areas, and along lines (street names every `symbol-spacing`, turned to the
@@ -278,6 +278,33 @@ Ocean, Atlas, Blank), which need no network, and web tile layers over them:
 
 HTTPS tiles use [platform certificate trust](data.md#https-certificates) on desktop and the
 command line, including private CAs trusted by the operating system. The web app uses the browser.
+
+Tile addresses are checked after filling their placeholders, before cached bytes or network
+requests are used. In the native app, a document on the internet cannot select a local
+destination IP. Explicitly selected self-hosted servers remain supported, including ordinary
+hostnames resolved by local DNS, with local fallback when the same hostname also returns
+public addresses. Native fetchers filter the resolved IPs before connecting,
+using the supplying document's actual connection reach. Native requests refuse
+link-local and unspecified addresses, including those represented by IPv4-mapped IPv6
+addresses or the well-known NAT64 prefix. Public IPv4 destinations under that prefix can pass.
+Document redirects also change the base for relative references.
+IPv4 decoding covers mapped addresses and the well-known `64:ff9b::/96` prefix. It does not
+inspect destinations behind 6to4 tunnels or custom translation gateways, including the
+[RFC 8215](https://www.rfc-editor.org/rfc/rfc8215#section-5) `64:ff9b:1::/48` prefix, whose
+translation is network-specific. Such routes can hide a private or link-local IPv4 destination
+behind a public-looking IPv6 address; restrictions on those routes require network firewall policy.
+Native redirects are checked at each hop. In the web app, use the final service address:
+tile, style, TileJSON and sprite redirects, including HTTP-to-HTTPS upgrades and CDN hops,
+are refused because the browser hides their destinations from the app. The same browser
+transport refuses redirects for downloads, fonts, archive range reads and HEAD requests for
+file metadata; see
+[network downloads](data.md#network-downloads).
+The web app checks the URL's spelling and normalized address, but cannot inspect resolved IPs.
+A public-looking hostname can reach a private or link-local server if the browser permits it;
+DNS resolution, local-network permissions and certificate trust are controlled by the browser.
+Native tile and document requests, and file downloads through **From URL…**,
+connect directly without an environment HTTP proxy, so a proxy cannot resolve destinations
+beyond these checks. See [network downloads](data.md#network-downloads) if your network requires a proxy.
 
 The gallery's **Web Basemaps** need no API key: the OpenFreeMap vector maps (Liberty, Bright,
 Positron, Dark, Fiord) and USGS Imagery. Choosing one replaces the other web basemaps; tick

@@ -370,33 +370,10 @@ pub(crate) fn add_raster_after(s: &mut Session, name: &str, mut layer: RasterLay
         unique = format!("{name} ({i})");
     }
     let (w, h, n, overview) = layer.data.as_ref().map(|d| (d.width, d.height, d.band_count(), d.overview)).unwrap_or_default();
-    // What reading it left out (a colour table, names), said once the layer has its name.
-    let rounded = layer.data.as_deref().and_then(rounded_count);
-    // Said here for pixels added with the layer; for those landing later, by `notice_landed_rasters`.
-    let lost = layer.lost_unsaid();
-    let unsaid = layer.pixels_unsaid();
-    // Read in place, the map shows the full image as it draws, but statistics and tools read the
-    // overview held: said so.
-    let held = unsaid.filter(|_| layer.in_place).and_then(|d| crate::in_place_overview(&d));
-    let in_place = layer.in_place;
+    read_notices(s, &unique, &mut layer);
     let empty_before = super::map_is_empty(s);
     let id = s.map_mut().add_raster(unique.clone(), layer);
     s.active_layer = Some(id);
-    // Read in place, its own notice says the overview it holds (`held`); the result names the full
-    // size all the same.
-    if let Some((fw, fh)) = overview.filter(|_| !in_place) {
-        s.notify(format!("{unique}: showing a {w} × {h} overview of the {fw} × {fh} raster"), false);
-    }
-    for l in lost {
-        s.notify(format!("{unique}: {l}"), false);
-    }
-    if let Some(held) = held {
-        s.notify(format!("{unique}: {held}"), false);
-    }
-    if let Some(count) = rounded {
-        let held = "pixels are held as 32-bit floats, exact for whole numbers up to 16,777,216 and to about 7 significant digits";
-        s.notify(format!("{unique}: {count} rounded as the file was read: {held}, so an export writes the rounded values"), false);
-    }
     if zoom.unwrap_or(empty_before)
         && let Some(e) = s.map().layer(id).map(|l| l.extent())
     {
@@ -415,6 +392,29 @@ pub(crate) fn add_raster_after(s: &mut Session, name: &str, mut layer: RasterLay
         o.insert("overviewOf".into(), json!([fw, fh]));
     }
     Ok(v)
+}
+
+/// Discloses a newly read layer's losses once, whether added, reloaded or repaired.
+pub(super) fn read_notices(s: &mut Session, name: &str, layer: &mut RasterLayer) {
+    let lost = layer.lost_unsaid();
+    let pixels = layer.pixels_unsaid();
+    if let Some(r) = pixels.as_deref()
+        && let Some((fw, fh)) = r.overview.filter(|_| !layer.in_place)
+    {
+        s.notify(format!("{name}: showing a {} × {} overview of the {fw} × {fh} raster", r.width, r.height), false);
+    }
+    for loss in lost {
+        s.notify(format!("{name}: {loss}"), false);
+    }
+    if let Some(r) = pixels.as_deref() {
+        if let Some(held) = layer.in_place.then(|| crate::in_place_overview(r)).flatten() {
+            s.notify(format!("{name}: {held}"), false);
+        }
+        if let Some(count) = rounded_count(r) {
+            let held = "pixels are held as 32-bit floats, exact for whole numbers up to 16,777,216 and to about 7 significant digits";
+            s.notify(format!("{name}: {count} rounded as the file was read: {held}, so an export writes the rounded values"), false);
+        }
+    }
 }
 
 /// How many of a raster's values changed when read as 32-bit floats, as notices say it: "3 values
@@ -954,11 +954,16 @@ fn info(s: &mut Session, p: &Value) -> CmdResult {
 
 /// GeoTIFF bytes of a raster layer (band is 1-based; RGB rasters keep their colour bands; `cog`
 /// makes it a cloud-optimised one).
-pub fn geotiff_bytes(s: &Session, p: &Value) -> Result<(String, Vec<u8>), String> {
+pub fn geotiff_bytes(s: &mut Session, p: &Value) -> Result<(String, Vec<u8>), String> {
     let (_, r) = get(s, p)?;
     let bi = band(p, "band", &r)?.unwrap_or(0);
-    let bytes = if b(p, "cog") == Some(true) { raster::cogwrite::write(&r, bi) } else { raster::geotiff::write(&r, bi) };
-    Ok((r.name.clone(), bytes.map_err(|e| e.to_string())?))
+    let cog = b(p, "cog") == Some(true);
+    let bytes = if cog { raster::cogwrite::write(&r, bi) } else { raster::geotiff::write(&r, bi) }.map_err(|e| e.to_string())?;
+    let note = geotiff_note(&r, bi, cog, "give \"band\" for another")?;
+    if !note.is_empty() {
+        s.notify(format!("Exported {}.tif{note}", r.name), false);
+    }
+    Ok((r.name.clone(), bytes))
 }
 
 /// `share.exportRaster`'s inputs, and the work that writes the raster as a GeoTIFF (a
@@ -986,6 +991,11 @@ pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work
 
 /// Writes raster `r` (band `bi`, or its colour bands) to `path`, and says what the file holds.
 pub(super) fn write_geotiff(r: &Raster, bi: usize, cog: bool, path: &str) -> Result<super::exports::Wrote, String> {
+    write_geotiff_with_guidance(r, bi, cog, path, "give \"band\" for another")
+}
+
+/// Builds the band instruction before combining the note with any caller-supplied path or name.
+fn write_geotiff_with_guidance(r: &Raster, bi: usize, cog: bool, path: &str, band_hint: &str) -> Result<super::exports::Wrote, String> {
     let cog = if cog {
         // Tiles go to the file as they are made: the whole file is never held in memory.
         Some(raster::cogwrite::write_file(r, bi, Path::new(path)).map_err(|e| format!("{path}: {e}"))?)
@@ -994,26 +1004,58 @@ pub(super) fn write_geotiff(r: &Raster, bi: usize, cog: bool, path: &str) -> Res
         rustgis_data::io::write_atomic(Path::new(path), &bytes).map_err(|e| format!("{path}: {e}"))?;
         None
     };
+    let note = geotiff_note(r, bi, cog.is_some(), band_hint)?;
+    let mut v = match r.overview {
+        Some((fw, fh)) => json!({"path": path, "width": r.width, "height": r.height, "overviewOf": [fw, fh]}),
+        None => json!({"path": path}),
+    };
+    if let (Some(o), Some(c)) = (v.as_object_mut(), cog) {
+        o.insert("cog".into(), json!({"overviews": c.levels.len().saturating_sub(1), "bigTiff": c.big, "bytes": c.bytes}));
+    }
+    Ok(super::exports::Wrote {
+        answer: v,
+        notes: vec![format!("Exported {path}{note}")],
+        written_path: Some(path.to_string()),
+        then: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        owner: None,
+    })
+}
+
+/// Writes a tool's raster file and reports the same export notes as `share.exportRaster`.
+pub(super) fn write_and_report(s: &mut Session, r: &Raster, bi: usize, cog: bool, path: &str) -> Result<Value, String> {
+    let wrote =
+        write_geotiff_with_guidance(r, bi, cog, path, "export the resulting layer with share.exportRaster and give \"band\" for another")?;
+    for note in wrote.notes {
+        s.notify(note, false);
+    }
+    Ok(wrote.answer)
+}
+
+/// What the selected GeoTIFF writer keeps, changes or leaves out, shared by files and downloads.
+fn geotiff_note(r: &Raster, bi: usize, cog: bool, band_hint: &str) -> Result<String, String> {
     let mut note = match r.overview {
         Some((fw, fh)) => format!(" (the {} × {} overview of the {fw} × {fh} raster)", r.width, r.height),
         None => String::new(),
     };
     // Values changed when the file was read are written as they are held: those of the bands the
     // writer writes, as it chooses them.
-    let bands = if cog.is_some() {
-        raster::cogwrite::written_bands(r, bi).map_err(|e| e.to_string())?
-    } else {
-        raster::geotiff::written_bands(r, bi)
-    };
+    let bands =
+        if cog { raster::cogwrite::written_bands(r, bi).map_err(|e| e.to_string())? } else { raster::geotiff::written_bands(r, bi) };
     let written: u64 = bands.iter().filter_map(|b| r.rounded.get(*b)).sum();
     if written > 0 {
         let (values, verb) = values_were(written);
         note.push_str(&format!("; {values} in it {verb} rounded to 32-bit floats when {} was read", r.name));
     }
+    if bands.iter().any(|b| r.rounded_some.get(*b).copied().unwrap_or(false)) {
+        // Made from part of a raster with rounded values (a clip, an edit): how many it kept isn't
+        // known, so no count is given.
+        note.push_str("; some values in it may have been rounded to 32-bit floats when the raster it was made from was read");
+    }
     // The bands the writer leaves out (it writes `band`, or a colour raster's colour bands, which
     // `band` doesn't change) are said, names and all.
     if bands.len() < r.bands.len() {
-        let which = if bands == [bi] { "give \"band\" for another" } else { "its colour bands" };
+        let which = if bands == [bi] { band_hint } else { "its colour bands" };
         note.push_str(&format!("; {} of its {} bands written ({which})", bands.len(), r.bands.len()));
     }
     // The file keeps the first written band's class names only (as dataset `CLASS_` items).
@@ -1030,21 +1072,7 @@ pub(super) fn write_geotiff(r: &Raster, bi: usize, cog: bool, path: &str) -> Res
     if spaced > 0 {
         note.push_str(&format!("; {spaced} band or class name(s) held control characters, written as spaces"));
     }
-    let mut v = match r.overview {
-        Some((fw, fh)) => json!({"path": path, "width": r.width, "height": r.height, "overviewOf": [fw, fh]}),
-        None => json!({"path": path}),
-    };
-    if let (Some(o), Some(c)) = (v.as_object_mut(), cog) {
-        o.insert("cog".into(), json!({"overviews": c.levels.len().saturating_sub(1), "bigTiff": c.big, "bytes": c.bytes}));
-    }
-    Ok(super::exports::Wrote {
-        answer: v,
-        notes: vec![format!("Exported {path}{note}")],
-        written_path: Some(path.to_string()),
-        then: None,
-        #[cfg(not(target_arch = "wasm32"))]
-        owner: None,
-    })
+    Ok(note)
 }
 
 /// Pixel values of the topmost visible raster under a longitude/latitude point.

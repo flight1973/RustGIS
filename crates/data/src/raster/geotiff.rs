@@ -450,7 +450,7 @@ fn proj4_of_keys(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<(String, 
 }
 
 /// Whether two PROJ definitions place the same points: points around the projection's origin,
-/// unprojected by both (as RustGIS computes them, sinusoidal and ellipsoidal equidistant
+/// unprojected by both (as RustGIS computes them, sinusoidal and PROJ-compatible equidistant
 /// cylindrical included), land within a centimetre.
 fn same_projection(a: &str, b: &str) -> bool {
     let offsets = [(0.0, 0.0), (100_000.0, 50_000.0), (-250_000.0, 150_000.0), (300_000.0, -200_000.0), (-50_000.0, -400_000.0)];
@@ -936,6 +936,13 @@ impl Chunks {
         }
     }
 
+    /// The most one chunk holds while it is decoded: its samples as read (up to 8 bytes each),
+    /// as 32-bit floats, and which of them were rounded (a byte each).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn bytes(&self) -> usize {
+        (self.cw as usize).saturating_mul(self.ch as usize).saturating_mul(self.samples).saturating_mul(13)
+    }
+
     fn count(&self) -> u64 {
         u64::from(self.per_plane) * self.planes as u64
     }
@@ -1038,7 +1045,12 @@ fn decimate<R: Read + Seek>(
     if let Some((open, image, limits)) = open
         && chunks.count() >= PARALLEL_CHUNKS
     {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+        // Each thread decodes a chunk of its own. Up to the default count as before; past it (a
+        // high setting) no more than the threads' scratch budget holds, so the peak doesn't
+        // multiply with the setting.
+        let affordable = 1 + crate::memory::thread_scratch() / chunks.bytes().max(1);
+        let chunk_count = usize::try_from(chunks.count()).unwrap_or(usize::MAX);
+        let threads = crate::threads::max().min(affordable.max(crate::threads::default_max())).min(chunk_count);
         if threads > 1 {
             return decimate_parallel(chunks, bands, k, (ow, oh), nodata, threads, open, image, limits);
         }
@@ -1114,7 +1126,11 @@ fn decimate_parallel(
         }
     };
     std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads).map(|_| scope.spawn(work)).collect();
+        // A thread the OS refuses costs speed, not the read: this one decodes chunks too.
+        let handles: Vec<_> = (1..threads).filter_map(|_| std::thread::Builder::new().spawn_scoped(scope, work).ok()).collect();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+            fail(err("a chunk couldn't be decoded"));
+        }
         for h in handles {
             if h.join().is_err() {
                 fail(err("a chunk couldn't be decoded"));
@@ -2036,7 +2052,7 @@ mod tests {
 
     /// Orthographic and Robinson systems from WKT are written as keys (CT_Orthographic 21 and
     /// CT_Robinson 23, by the projection centre's keys) and read back as the same; an ellipsoidal
-    /// equidistant cylindrical one (EPSG:4087's, CT 17) is compared as computed on the ellipsoid.
+    /// equidistant cylindrical one (EPSG:4087's, CT 17) uses PROJ-compatible coordinates.
     #[test]
     fn orthographic_robinson_and_ellipsoidal_eqc_are_written_as_keys() {
         for (def, ct) in [
@@ -2051,8 +2067,8 @@ mod tests {
             let back = custom_crs(&k, &d, &a).unwrap().custom_def().unwrap().proj4.clone();
             assert!(same_projection(def, &back), "{def}: {back}");
         }
-        // The same projection on a sphere of the semi-major axis is another one.
-        assert!(!same_projection(
+        // PROJ uses the same coordinates on a sphere of the semi-major axis.
+        assert!(same_projection(
             "+proj=eqc +lat_ts=0 +lon_0=0 +datum=WGS84 +units=m +no_defs",
             "+proj=eqc +lat_ts=0 +lon_0=0 +R=6378137 +units=m +no_defs"
         ));

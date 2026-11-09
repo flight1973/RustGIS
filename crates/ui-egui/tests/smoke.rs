@@ -939,6 +939,8 @@ static PLUGINS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn a_ribbon_wider_than_the_window_scrolls_with_arrow_buttons() {
+    // A plugin's tab, added or removed by a test running alongside, would change the tab strip.
+    let _turn = PLUGINS.lock().unwrap_or_else(|e| e.into_inner());
     let mut h = harness();
     h.set_size(egui::vec2(900.0, 600.0));
     h.state_mut().ui.tab = "View".into();
@@ -963,6 +965,9 @@ fn a_ribbon_wider_than_the_window_scrolls_with_arrow_buttons() {
 
 #[test]
 fn a_tab_strip_wider_than_the_window_scrolls_with_arrow_buttons() {
+    // Plugins' tabs follow Help, so one removed by a test running alongside while the strip is
+    // scrolled to its end shifts the tabs right, and a click on Help lands on Settings.
+    let _turn = PLUGINS.lock().unwrap_or_else(|e| e.into_inner());
     let mut h = harness();
     // Narrower than the tabs' text alone, whatever the system font: at 560 points the tabs just
     // fit on macOS once its semibold is drawn heavier (#591), so they didn't need to scroll.
@@ -3569,6 +3574,28 @@ fn plugin_panels_run_their_commands_when_a_slider_is_let_go() {
     h.get_by_label("Only versions with local changes").click();
     h.run_steps(3);
     assert!(h.state().session.plugin_panels["ui-panel"].checked("local"));
+    // A range runs nothing while a handle is dragged, and takes the values it shows when let go.
+    let span = |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.plugin_panels["ui-panel"].range("span");
+    assert_eq!(span(&h), (2, 8));
+    let rect = h.query_all_by_label("Year span").map(|n| n.rect()).max_by(|a, b| a.width().total_cmp(&b.width())).unwrap();
+    let (from, to) = (egui::pos2(rect.max.x - 2.0, rect.center().y), egui::pos2(rect.center().x, rect.center().y));
+    h.event(egui::Event::PointerMoved(from));
+    h.event(egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+    for i in 1..=6 {
+        h.event(egui::Event::PointerMoved(from + (to - from) * (i as f32 / 6.0)));
+        h.step();
+    }
+    assert_eq!(span(&h), (2, 8), "nothing sent while dragging");
+    h.event(egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(3);
+    let (lo, hi) = span(&h);
+    assert!(lo == 2 && (3..8).contains(&hi), "the high handle, sent when let go: {lo}–{hi}");
     // Its button closes it again; a disabled plugin's panel closes.
     h.state_mut().run("ui.pane.plugin", json!({"id": "ui-panel"})).unwrap();
     h.step();
