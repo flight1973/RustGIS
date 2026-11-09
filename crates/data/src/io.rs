@@ -533,28 +533,12 @@ pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
 /// also returns the table written.
 pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> Result<(usize, Option<GpkgWritten>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let reprojects = crs != Crs::LonLat && PROJECTED_FORMATS.contains(&ext.as_str());
-    // Features a GeoPackage table can't hold, left out before projecting.
-    #[cfg(not(target_arch = "wasm32"))]
-    let mut left_out = 0usize;
     let projected;
-    let ds = if !reprojects {
+    let ds = if crs == Crs::LonLat || !PROJECTED_FORMATS.contains(&ext.as_str()) {
         ds
     } else {
         check_projected(&ext, crs)?;
-        // Projected into one copy of the layer. A GeoPackage export leaves out what its table
-        // can't hold first, so a feature left out can't fail the projection.
-        let mut out = ds.clone();
-        #[cfg(not(target_arch = "wasm32"))]
-        if ext == "gpkg" {
-            let kind = gpkg_kind(ds);
-            let before = out.features.len();
-            out.features.retain(|f| !off_kind(f, kind));
-            left_out = before - out.features.len();
-        }
-        let t = crs.transformer().map_err(DataError::Format)?;
-        project_features(&mut out.features, &t, crs)?;
-        projected = out;
+        projected = project(ds, crs)?;
         &projected
     };
     match ext.as_str() {
@@ -562,22 +546,10 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
             #[cfg(not(target_arch = "wasm32"))]
             {
                 crate::progress::begin(ds.features.len());
-                let kind = gpkg_kind(ds);
-                let table = if kind != ds.geometry_type || ds.features.iter().any(|f| off_kind(f, kind)) {
-                    // What the table can't hold is left out as the rest is handed over, in runs
-                    // borrowed from the layer, so a large one isn't copied.
-                    // Added to any left out before a projection.
-                    let before = left_out;
-                    let mut feed = |add: &mut dyn FnMut(&[crate::Feature]) -> Result<()>| -> Result<()> {
-                        // An export that starts again hands the features over again.
-                        left_out = before + feed_of_kind(&ds.features, kind, add)?;
-                        Ok(())
-                    };
-                    crate::source::gpkg::write_features_in(&ds.name, kind, &ds.fields, path, crs, gpkg, &mut feed)?
-                } else {
-                    crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?
-                };
-                Ok((left_out, Some(table)))
+                // Every feature is written: a layer of several kinds of geometry gets a GEOMETRY
+                // column, and one that declares no type takes its geometry's.
+                let table = crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?;
+                Ok((0, Some(table)))
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -2546,52 +2518,17 @@ fn dbf_boolean(value: &Value) -> Option<bool> {
     }
 }
 
-/// Whether a GeoPackage table of geometry type `kind` can't hold `f`'s geometry: a column holds
-/// one kind of geometry, the layer's. A feature of another kind, as a mixed layer can hold (a
-/// GeoJSON of points and polygons, say), is left out and counted, as a Shapefile leaves it out;
-/// one without geometry fits, as a table holds it.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn off_kind(f: &crate::Feature, kind: GeometryType) -> bool {
-    kind != GeometryType::None && f.geometry.as_ref().is_some_and(|g| g.kind() != kind)
-}
-
-/// Hands `add` the runs of `features` a GeoPackage table of `kind` can hold, borrowed (nothing is
-/// copied), and returns how many it left out ([`off_kind`]).
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn feed_of_kind(
-    features: &[crate::Feature],
-    kind: GeometryType,
-    add: &mut dyn FnMut(&[crate::Feature]) -> Result<()>,
-) -> Result<usize> {
-    let (mut start, mut left_out) = (0usize, 0usize);
-    for (i, f) in features.iter().enumerate() {
-        // A large layer's scan stops on a cancel.
-        if i % 65_536 == 0 {
-            crate::progress::check()?;
-        }
-        if off_kind(f, kind) {
-            if start < i {
-                add(features.get(start..i).unwrap_or_default())?;
-            }
-            left_out += 1;
-            start = i + 1;
-        }
-    }
-    if start < features.len() {
-        add(features.get(start..).unwrap_or_default())?;
-    }
-    Ok(left_out)
-}
-
-/// The kind of geometry a GeoPackage table of `ds` holds: its type, or, for a layer that
-/// declares none but carries geometry, its first geometry's (as a streamed export takes it), so
-/// that geometry isn't dropped for want of a column.
-#[cfg(not(target_arch = "wasm32"))]
-fn gpkg_kind(ds: &Dataset) -> GeometryType {
-    match ds.geometry_type {
-        GeometryType::None => ds.features.iter().find_map(|f| f.geometry.as_ref()).map_or(GeometryType::None, Geometry::kind),
-        t => t,
-    }
+/// The notice for the `left_out` features an export to `name` (a file of extension `ext`) left
+/// out, as [`write_path_in`] and [`write_bytes_in`] count them; `None` when none were. A
+/// Shapefile (`.shp`, or zipped) holds only drawable geometry of the layer's one kind; FlatGeobuf,
+/// KML and GPX hold only features with geometry; the other formats leave nothing out.
+pub fn left_out_note(name: &str, ext: &str, left_out: usize) -> Option<String> {
+    (left_out > 0).then(|| match ext {
+        "shp" | "zip" => format!(
+            "{name}: {left_out} features a Shapefile can't hold were left out: without drawable geometry, or with geometry of another kind than the layer's"
+        ),
+        _ => format!("{name}: {left_out} features without drawable geometry were left out"),
+    })
 }
 
 /// Whether [`shapefile_parts_in`] writes a feature with geometry `g` to a layer of type `gt`: one
@@ -2760,13 +2697,33 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// A GeoPackage column holds the layer's one kind of geometry: a layer read from a GeoJSON of
-    /// a polygon and a point (declared a polygon layer) writes the polygon and leaves the point out,
-    /// counted, as a Shapefile does; a feature without geometry stays, as a table holds it. A layer
-    /// of one kind loses nothing.
+    /// The left-out notice names what each format can't hold: a Shapefile, features without
+    /// drawable geometry or of another kind; the others, features without drawable geometry.
+    /// Nothing left out, no notice.
+    #[test]
+    fn left_out_notes_say_what_the_format_cant_hold() {
+        for ext in ["shp", "zip"] {
+            assert_eq!(
+                left_out_note("out", ext, 2).as_deref(),
+                Some(
+                    "out: 2 features a Shapefile can't hold were left out: without drawable geometry, or with geometry of another kind than the layer's"
+                )
+            );
+        }
+        for ext in ["fgb", "kml", "gpx"] {
+            assert_eq!(left_out_note("out", ext, 1).as_deref(), Some("out: 1 features without drawable geometry were left out"));
+        }
+        assert_eq!(left_out_note("out", "shp", 0), None);
+        assert_eq!(left_out_note("out", "gpkg", 0), None);
+    }
+
+    /// A GeoPackage export loses no geometry: a layer read from a GeoJSON of a polygon and a point
+    /// (declared a polygon layer, by its most common kind) gets a GEOMETRY column holding both, and
+    /// a feature without geometry stays, as a table holds it. A layer of one kind keeps its kind's
+    /// column, whether it declares its type or not.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn a_geopackage_leaves_out_geometry_of_another_kind() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn a_geopackage_of_a_mixed_layer_keeps_every_kind() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let geojson = r#"{"type":"FeatureCollection","features":[
             {"type":"Feature","properties":{"name":"area"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}},
             {"type":"Feature","properties":{"name":"spot"},"geometry":{"type":"Point","coordinates":[5,5]}},
@@ -2774,42 +2731,45 @@ mod tests {
         let (mixed, _) = read_geojson(geojson, "mixed")?;
         assert_eq!(mixed.geometry_type, GeometryType::Polygon);
         let dir = tempfile::tempdir()?;
+        // The column's type, and the rows written with whether each has geometry, read with SQL.
+        let table = |path: &Path| -> std::result::Result<(String, Vec<(String, bool)>), Box<dyn std::error::Error>> {
+            let conn = rusqlite::Connection::open(path)?;
+            let kind: String = conn.query_row("SELECT geometry_type_name FROM gpkg_geometry_columns", [], |r| r.get(0))?;
+            let mut rows = conn.prepare(r#"SELECT "name", "geom" IS NOT NULL FROM "mixed" ORDER BY "fid""#)?;
+            let written = rows.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+            Ok((kind, written))
+        };
+        let all = vec![("area".to_string(), true), ("spot".to_string(), true), ("none".to_string(), false)];
         let path = dir.path().join("mixed.gpkg");
-        assert_eq!(write_path(&mixed, &path)?, 1);
-        // The rows written, read with SQL: the polygon, and the feature without geometry.
-        let conn = rusqlite::Connection::open(&path)?;
-        let mut rows = conn.prepare(r#"SELECT "name", "geom" IS NULL FROM "mixed" ORDER BY "fid""#)?;
-        let written: Vec<(String, bool)> = rows.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
-        assert_eq!(written, [("area".to_string(), false), ("none".to_string(), true)]);
+        assert_eq!(write_path(&mixed, &path)?, 0);
+        assert_eq!(table(&path)?, ("GEOMETRY".to_string(), all.clone()));
+        // Read back, the point and the polygon are both there.
         let (back, _) = read_path(&path)?;
-        assert!(back.features.iter().all(|f| f.geometry.as_ref().is_none_or(|g| g.kind() == GeometryType::Polygon)));
-        // Projected, the point is left out before the projection: one UTM zone 18N can't hold (a
-        // quarter of the way round the equator from its central meridian, 75°W) doesn't fail the
-        // export of the polygon.
-        let mut far = mixed.clone();
-        if let Some(f) = far.features.get_mut(1) {
-            f.geometry = Some(Geometry::Point(Coord::new(15.0, 0.0)));
-        }
-        let utm = Crs::from_epsg(32618).ok_or("no UTM zone 18N")?;
-        assert_eq!(write_path_in(&far, &dir.path().join("far.gpkg"), utm)?, 1);
-        // A layer that declares no geometry type but carries geometry takes its first geometry's
-        // (as a streamed export does): a polygon table, the point left out, nothing dropped silently.
+        let mut kinds: Vec<GeometryType> = back.features.iter().filter_map(|f| f.geometry.as_ref().map(Geometry::kind)).collect();
+        kinds.sort_by_key(|k| format!("{k:?}"));
+        assert_eq!(kinds, [GeometryType::Point, GeometryType::Polygon]);
+        // A layer that declares no geometry type does the same.
         let mut typeless = mixed.clone();
         typeless.geometry_type = GeometryType::None;
         let at = dir.path().join("typeless.gpkg");
-        assert_eq!(write_path(&typeless, &at)?, 1);
-        let conn = rusqlite::Connection::open(&at)?;
-        let kind: String = conn.query_row("SELECT geometry_type_name FROM gpkg_geometry_columns", [], |r| r.get(0))?;
-        let rows: i64 = conn.query_row(r#"SELECT count(*) FROM "mixed" WHERE "geom" IS NOT NULL"#, [], |r| r.get(0))?;
-        assert_eq!((kind.as_str(), rows), ("MULTIPOLYGON", 1));
-        // Projected too, the count of what was left out before the projection holds.
-        let mut typeless_far = far.clone();
-        typeless_far.geometry_type = GeometryType::None;
-        assert_eq!(write_path_in(&typeless_far, &dir.path().join("typeless-far.gpkg"), utm)?, 1);
-        // One kind: nothing left out.
+        assert_eq!(write_path(&typeless, &at)?, 0);
+        assert_eq!(table(&at)?, ("GEOMETRY".to_string(), all));
+        // Projected, every feature is written too.
+        let utm = Crs::from_epsg(32631).ok_or("no UTM zone 31N")?;
+        let projected = dir.path().join("projected.gpkg");
+        assert_eq!(write_path_in(&mixed, &projected, utm)?, 0);
+        assert_eq!(table(&projected)?.0, "GEOMETRY");
+        // One kind, declared or not: that kind's column, nothing left out.
         let mut areas = mixed.clone();
         areas.features.retain(|f| !matches!(f.geometry, Some(Geometry::Point(_))));
-        assert_eq!(write_path(&areas, &dir.path().join("areas.gpkg"))?, 0);
+        let one = vec![("area".to_string(), true), ("none".to_string(), false)];
+        let at = dir.path().join("areas.gpkg");
+        assert_eq!(write_path(&areas, &at)?, 0);
+        assert_eq!(table(&at)?, ("MULTIPOLYGON".to_string(), one.clone()));
+        areas.geometry_type = GeometryType::None;
+        let at = dir.path().join("typeless-areas.gpkg");
+        assert_eq!(write_path(&areas, &at)?, 0);
+        assert_eq!(table(&at)?, ("MULTIPOLYGON".to_string(), one));
         Ok(())
     }
 

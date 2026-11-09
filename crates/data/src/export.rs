@@ -95,25 +95,12 @@ fn write_chunks_to(
     let t = if crs == Crs::LonLat { None } else { Some(crs.transformer().map_err(DataError::Format)?) };
     let mut total = 0usize;
     let mut skipped = 0usize;
-    // A GeoPackage table holds one kind of geometry: each chunk's features of another kind are
-    // left out, and counted, before it's projected, so one left out can't fail the projection.
-    #[cfg(not(target_arch = "wasm32"))]
-    let gpkg_kinds = ext == "gpkg";
-    let mut off_kind = 0usize;
     let mut feed = |add: &mut dyn FnMut(&[Feature]) -> Result<()>| -> Result<()> {
         // A GeoPackage export that starts again feeds the features again, and counts them again.
         total = 0;
-        off_kind = 0;
         // The writers count the features; a source that doesn't know how many leaves the total at 0.
         crate::progress::begin(src.info().count.map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)));
         let batch = src.visit_chunks(None, bytes, &mut |mut chunk| {
-            #[cfg(not(target_arch = "wasm32"))]
-            if gpkg_kinds {
-                let before = chunk.len();
-                chunk.retain(|f| !crate::io::off_kind(f, geometry_type));
-                off_kind = off_kind.saturating_add(before - chunk.len());
-                total = total.saturating_add(before - chunk.len());
-            }
             if let Some(t) = &t {
                 // Counted as the writer writes them, so only stopped on a cancel here.
                 project_each(&mut chunk, t, crs, false)?;
@@ -129,8 +116,9 @@ fn write_chunks_to(
     let left_out = match ext.as_str() {
         #[cfg(not(target_arch = "wasm32"))]
         "gpkg" => {
+            // Every feature is written: one of another kind makes the column GEOMETRY.
             table = Some(crate::source::gpkg::write_features_in(&layer.name, geometry_type, &layer.fields, path, crs, gpkg, &mut feed)?);
-            off_kind
+            0
         }
         #[cfg(target_arch = "wasm32")]
         "gpkg" => {

@@ -762,13 +762,17 @@ about 9 million degrees), and skips a feature without geometry or with no point 
 writing no hull for it; if every feature is skipped, it is an error. A latitude past a pole is
 taken as that pole. A hull with no area is written as what it is: a point for points in one place,
 or the line between the two farthest apart for points on one straight line on the map. The layer is
-a point or line layer when every hull is one; otherwise it's a polygon layer holding any points and
-lines among its polygons, which a Shapefile or GeoPackage export leaves out, saying how many. It
-says how many of each.
+a point or line layer when every hull is one, and the tool says so; otherwise it's a polygon layer
+holding any points and lines among its polygons. Dissolve leaves those out, saying how many; as
+Clip masks they cover nothing; a Shapefile export leaves them out, saying how many; and a
+GeoPackage export keeps them in a column that holds any kind of geometry. It says how many of
+each.
 
 **Dissolve** (`dissolve`) merges the polygons sharing a value of `field` into one feature for
 each value, or all of them into one without a field. Each feature has the value and `count`, the
-polygons merged; records with no value form a feature of their own. **Summarize Within**
+polygons merged; records with no value form a feature of their own. A feature with no polygon (no
+geometry, or a point or line in the polygon layer) is left out, with its values, and the tool says
+how many; if none has a polygon, it is an error. **Summarize Within**
 (`countPoints`) copies the polygons and adds `point_count`, the points inside each polygon or on
 its edge; a point where polygons overlap counts in each of them.
 

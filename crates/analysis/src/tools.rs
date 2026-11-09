@@ -2156,8 +2156,14 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     // Each group's key, polygons and records, in the order first met; found by its key's hash.
     let mut groups: Vec<(Value, Vec<MultiPolygon<f64>>, Vec<usize>)> = Vec::new();
     let mut index: HashMap<crate::stats::KeyPart<'_>, usize> = HashMap::new();
+    // Features with no polygon to dissolve (no geometry, or a point or line in the polygon layer,
+    // as Minimum Bounding Geometry's flat hulls are): left out of the groups, and counted.
+    let mut not_polygons = 0usize;
     for r in each_once(rows(inp, p, "input", ds)) {
-        let Some(mp) = ds.features.get(r).and_then(|f| f.geometry.as_ref()).and_then(to_multipolygon) else { continue };
+        let Some(mp) = ds.features.get(r).and_then(|f| f.geometry.as_ref()).and_then(to_multipolygon) else {
+            not_polygons += 1;
+            continue;
+        };
         let value = fi.map_or(&Value::Null, |fi| ds.value(r, fi));
         // A NaN equals no value, so each one stays a group of its own; −0 is 0, as it compares.
         let part = crate::stats::equal_key(value);
@@ -2196,7 +2202,16 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         out.push(from_multipolygon(&u), attrs);
     }
     let n = out.features.len();
+    // Features read, none with a polygon: an unusable result, so an error saying why.
+    if n == 0 && not_polygons > 0 {
+        return Err(format!("Dissolve: none of the {not_polygons} feature(s) has a polygon: no geometry, or a point or line"));
+    }
     let mut messages = vec![format!("Dissolve: {n} features")];
+    if not_polygons > 0 {
+        messages.push(format!(
+            "Dissolve: {not_polygons} feature(s) left out, with their values: no geometry, or a point or line rather than a polygon"
+        ));
+    }
     messages.extend(rounded_notice(&rounded, out.fields.get(first_added..).unwrap_or_default()));
     Ok(ToolResult { output: Output::Layer(out), messages })
 }
@@ -2321,6 +2336,7 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     {
         out.geometry_type = first;
     }
+    let out_kind = out.geometry_type;
     let gaps_note = (gaps > 0).then(|| {
         format!("{gaps} vertex(es) passed over: a coordinate missing or infinite, or so far out that the hull can't take it (past about 9 million degrees)")
     });
@@ -2338,8 +2354,20 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     }
     r.messages.extend(gaps_note.into_iter().chain(poles_note).map(|n| format!("Minimum Bounding Geometry: {n}")));
     if flat > 0 {
+        // Where they go: a layer of their kind when every hull is flat, else the polygon layer,
+        // where tools taking polygons pass them over.
+        let layer = match out_kind {
+            GeometryType::Point => "the output is a point layer".to_string(),
+            GeometryType::Polyline => "the output is a line layer".to_string(),
+            // Points and lines, every hull flat: a polygon layer, there being no one kind.
+            _ if flat >= n => "they are kept in the output's polygon layer, points and lines together, where Dissolve leaves them out and as Clip masks they cover nothing".to_string(),
+            _ => format!(
+                "they are kept in the output's polygon layer, among its {} polygon(s), where Dissolve leaves them out and as Clip masks they cover nothing",
+                n.saturating_sub(flat)
+            ),
+        };
         r.messages.push(format!(
-            "Minimum Bounding Geometry: {flat} of {n} hulls have no area, so they are written as a point or a line: a single point, or points in one place or on one straight line on the map (on one meridian or parallel, say; beyond 85.05° that includes points around a pole, which enclose a cap on the ground)"
+            "Minimum Bounding Geometry: {flat} of {n} hulls have no area, so they are written as a point or a line: a single point, or points in one place or on one straight line on the map (on one meridian or parallel, say; beyond 85.05° that includes points around a pole, which enclose a cap on the ground); {layer}"
         ));
     }
     Ok(r)
@@ -6677,6 +6705,41 @@ mod tests {
         }
     }
 
+    /// Dissolve says how many features it left out for having no polygon: a point and a line in a
+    /// polygon layer (as Minimum Bounding Geometry's flat hulls are) and a feature without
+    /// geometry. A layer of polygons says nothing of the kind.
+    #[test]
+    fn dissolve_counts_features_with_no_polygon() {
+        let notice = |extra: bool| {
+            let mut polys = Dataset::new("polys", GeometryType::Polygon, vec![Field::new("k", FieldType::Integer)]);
+            polys.push(Some(sq(0.0, 0.0, 1.0)), vec![Value::Int(1)]);
+            polys.push(Some(sq(3.0, 0.0, 1.0)), vec![Value::Int(1)]);
+            if extra {
+                polys.push(Some(Geometry::Point(Coord::new(5.0, 5.0))), vec![Value::Int(1)]);
+                polys.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 5.0), Coord::new(1.0, 5.0)]])), vec![Value::Int(2)]);
+                polys.push(None, vec![Value::Int(3)]);
+            }
+            let m = Map(HashMap::from([("polys".to_string(), polys)]));
+            let res = crate::run("dissolve", &m, &serde_json::json!({"input": "polys", "field": "k"})).unwrap();
+            let note = res.messages.iter().find(|m| m.contains("left out")).cloned();
+            (layer(res).features.len(), note)
+        };
+        let (groups, note) = notice(true);
+        assert_eq!(groups, 1);
+        assert_eq!(
+            note.as_deref(),
+            Some("Dissolve: 3 feature(s) left out, with their values: no geometry, or a point or line rather than a polygon")
+        );
+        assert_eq!(notice(false), (1, None));
+        // None with a polygon: an error saying why, not an empty layer.
+        let mut flat = Dataset::new("flat", GeometryType::Polygon, vec![]);
+        flat.push(Some(Geometry::Point(Coord::new(5.0, 5.0))), vec![]);
+        flat.push(None, vec![]);
+        let m = Map(HashMap::from([("flat".to_string(), flat)]));
+        let e = crate::run("dissolve", &m, &serde_json::json!({"input": "flat"})).err().unwrap_or_default();
+        assert!(e.contains("none of the 2 feature(s) has a polygon"), "{e}");
+    }
+
     /// Dissolve's groups, found by their keys' hash: in the order first met, −0 with 0, each NaN
     /// on its own (it equals no value), and a number apart from the same text and a whole number
     /// apart from the same fraction.
@@ -8565,9 +8628,20 @@ mod tests {
         let polar = [(0.0, 89.0), (90.0, 89.0), (180.0, 89.0), (-90.0, 89.0)];
         let note_all = note(&layer(&polar, false), "All").unwrap_or_default();
         assert!(note_all.contains(": 1 of 1 hulls have no area"), "{note_all}");
-        // One feature each: the polar multipoint's hull is flat, the other's isn't.
+        // Every hull flat, and a line: the notice says the output is a line layer.
+        assert!(note_all.ends_with("; the output is a line layer"), "{note_all}");
+        // One feature each: the polar multipoint's hull is flat, the other's isn't, so the flat one
+        // stays in the polygon layer, and the notice says where and what polygon tools do with it.
         let note_each = note(&layer(&polar, true), "None").unwrap_or_default();
         assert!(note_each.contains(": 1 of 2 hulls have no area"), "{note_each}");
+        assert!(note_each.contains("kept in the output's polygon layer, among its 1 polygon(s)"), "{note_each}");
+        // Every hull flat, a point and a line: no one kind, so a polygon layer, said as such.
+        let mut both = Dataset::new("pts", GeometryType::Point, vec![]);
+        both.push(Some(Geometry::Point(Coord::new(10.0, 20.0))), vec![]);
+        both.push(Some(Geometry::MultiPoint(vec![Coord::new(0.0, 0.0), Coord::new(5.0, 0.0)])), vec![]);
+        let note_both = note(&Map(HashMap::from([("pts".to_string(), both)])), "None").unwrap_or_default();
+        assert!(note_both.contains(": 2 of 2 hulls have no area"), "{note_both}");
+        assert!(note_both.contains("polygon layer, points and lines together"), "{note_both}");
         let spread = [(0.0, 60.0), (10.0, 60.0), (5.0, 65.0), (0.0, 89.0), (90.0, 88.0)];
         assert_eq!(note(&layer(&spread, false), "All"), None);
         assert_eq!(note(&layer(&spread, true), "None"), None);
@@ -8576,6 +8650,7 @@ mod tests {
             note_single.contains(": 5 of 5 hulls have no area, so they are written as a point or a line: a single point"),
             "{note_single}"
         );
+        assert!(note_single.ends_with("; the output is a point layer"), "{note_single}");
         // Features stacked in one place, together, have a hull with no area, and say so.
         let stacked = [(10.0, 20.0), (10.0, 20.0), (10.0, 20.0)];
         let note_stacked = note(&layer(&stacked, false), "All").unwrap_or_default();
