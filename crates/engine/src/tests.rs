@@ -37112,7 +37112,8 @@ fn long_commands_stop_when_cancelled_while_they_run() {
         let done = run.run(&control);
         // The result is kept, then `gp.finish` applies it (or says why it can't), as in the app.
         let finished = crate::cmd::gp::tool_complete(&mut s, id, done).and_then(|()| s.run("gp.finish", &json!({"id": id})).map(|_| ()));
-        note(tool, finished, &control);
+        // With its parameters: a tool listed twice (convexHull) is told apart.
+        note(&format!("{tool} {params}"), finished, &control);
     }
     assert!(kept_going.is_empty(), "these ran on after Cancel:\n{}", kept_going.join("\n"));
 }
