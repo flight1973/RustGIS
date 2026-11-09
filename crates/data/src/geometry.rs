@@ -342,7 +342,9 @@ fn open_len(path: &[Coord], ring: bool) -> usize {
 /// Whether two points are the same place. A NaN coordinate equals nothing as a number, so NaN is
 /// matched by its bits: a ring that repeats a NaN point closes on it.
 fn same_point(a: &Coord, b: &Coord) -> bool {
-    a == b || (a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits())
+    // Each coordinate on its own: equal as numbers (so 0 and −0 match), or a NaN by its bits.
+    let same = |p: f64, q: f64| p == q || p.to_bits() == q.to_bits();
+    same(a.x, b.x) && same(a.y, b.y)
 }
 
 impl Geometry {
@@ -784,6 +786,9 @@ mod tests {
         assert_eq!((ring.first(), ring.last()), (Some(&Coord::new(1.0, 0.0)), Some(&Coord::new(1.0, 0.0))));
         let line = Geometry::Line(vec![vec![gap, Coord::new(1.0, 0.0), gap]]);
         assert_eq!(line.vertices().len(), 3);
+        // The same NaN point written once with 0 and once with −0 still closes the ring.
+        let signed = vec![Coord::new(f64::NAN, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(f64::NAN, -0.0)];
+        assert_eq!(Geometry::Polygon(vec![vec![signed]]).vertices().len(), 3);
     }
 
     #[test]

@@ -2217,9 +2217,9 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     };
     // A feature's points in the analysis plane, and how many of its vertices (a closed ring's
     // repeated last point left out) are passed over: a coordinate missing or infinite, which the
-    // hull can't order, or a longitude so far out (millions of degrees) that the hull's arithmetic
-    // would overflow. A latitude past ±90° is taken as the pole, as the analysis plane takes it, and
-    // counted too.
+    // hull can't order, or a longitude past [`HULL_LIMIT_M`] (about 9 million degrees), which no
+    // real data reaches, well before the hull's arithmetic could overflow (near 1e154 m). A
+    // latitude past ±90° is taken as the pole, as the analysis plane takes it, and counted too.
     let points = |g: &Geometry| {
         let (mut these, mut gaps, mut poles) = (Vec::new(), 0usize, 0usize);
         g.for_each_vertex(|_, c| {
@@ -2251,8 +2251,10 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         if !is_flat(&hull) {
             return from_multipolygon(&MultiPolygon::new(vec![hull]));
         }
-        *flat += 1;
         let ring = &hull.exterior().0;
+        // (A hull of a point or more always has one; if not, the caller counts the feature skipped.)
+        ring.first()?;
+        *flat += 1;
         let farthest = |from: geo::Coord<f64>| {
             ring.iter().copied().fold((from, 0.0), |(best, d), c| {
                 let dc = (c.x - from.x).hypot(c.y - from.y);
@@ -2283,11 +2285,10 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         for ((f, _), (passed, past, hull)) in features.iter().zip(hulls) {
             gaps += passed;
             poles += past;
-            let Some(hull) = hull else {
-                skipped += 1;
-                continue;
-            };
-            out.push(shape(hull, &mut flat), f.attrs.clone());
+            match hull.and_then(|hull| shape(hull, &mut flat)) {
+                Some(g) => out.push(Some(g), f.attrs.clone()),
+                None => skipped += 1,
+            }
         }
     } else {
         // All together; `count` is the features hulled, those with a point to give. With none,
@@ -2305,9 +2306,20 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             pts.extend(these);
         }
         if hulled > 0 {
-            let hull = geo::MultiPoint::new(pts).convex_hull();
-            out.push(shape(hull, &mut flat), vec![Value::Int(i64::try_from(hulled).unwrap_or(i64::MAX))]);
+            match shape(geo::MultiPoint::new(pts).convex_hull(), &mut flat) {
+                Some(g) => out.push(Some(g), vec![Value::Int(i64::try_from(hulled).unwrap_or(i64::MAX))]),
+                None => skipped += hulled,
+            }
         }
+    }
+    // The layer's type follows its hulls: points or lines when every hull is one (so a tool
+    // taking points takes them), polygons otherwise, holding any points and lines among them.
+    let kinds: Vec<GeometryType> = out.features.iter().filter_map(|f| f.geometry.as_ref().map(Geometry::kind)).collect();
+    if let Some(&first) = kinds.first()
+        && first != GeometryType::Polygon
+        && kinds.iter().all(|k| *k == first)
+    {
+        out.geometry_type = first;
     }
     let gaps_note = (gaps > 0).then(|| {
         format!("{gaps} vertex(es) passed over: a coordinate missing or infinite, or so far out that the hull can't take it (past about 9 million degrees)")
@@ -8578,6 +8590,17 @@ mod tests {
         };
         let singles = geoms(&layer(&spread, false), "None");
         assert!(singles.len() == 5 && singles.iter().all(|g| matches!(g, Some(Geometry::Point(_)))), "{singles:?}");
+        // The layer's type follows its hulls: all points, a point layer; all lines, a line layer;
+        // a mix, a polygon layer.
+        let kind = |m: &Map, group: &str| {
+            let res = crate::run("convexHull", m, &serde_json::json!({"input": "pts", "group": group})).unwrap_or_else(|e| panic!("{e}"));
+            let Output::Layer(out) = res.output else { panic!("not a layer") };
+            out.geometry_type
+        };
+        assert_eq!(kind(&layer(&spread, false), "None"), GeometryType::Point);
+        assert_eq!(kind(&layer(&polar, false), "All"), GeometryType::Polyline);
+        assert_eq!(kind(&layer(&polar, true), "None"), GeometryType::Polygon);
+        assert_eq!(kind(&layer(&spread, false), "All"), GeometryType::Polygon);
         let near = |a: Coord, b: (f64, f64)| (a.x - b.0).abs() < 1e-9 && (a.y - b.1).abs() < 1e-9;
         assert!(matches!(geoms(&layer(&stacked, false), "All").first(), Some(Some(Geometry::Point(c))) if near(*c, (10.0, 20.0))));
         // The polar points on 89°N, as the analysis plane draws them: from 90°W to 180°.
@@ -8667,13 +8690,17 @@ mod tests {
             pts.push(Some(Geometry::Point(Coord::new(c.0, c.1))), vec![]);
         }
         pts.push(None, vec![]);
+        // A feature whose only point is missing a coordinate gives the hull nothing either.
+        pts.push(Some(Geometry::Point(Coord::new(f64::NAN, 0.0))), vec![]);
         let count = |sel: Vec<usize>| {
             let m = Selected(Map(HashMap::from([("pts".to_string(), pts.clone())])), HashMap::from([("pts".to_string(), sel)]));
             let out = layer(crate::run("convexHull", &m, &serde_json::json!({"input": "pts"})).unwrap_or_else(|e| panic!("{e}")));
             out.value(0, 0).as_f64()
         };
-        // No selection: every feature with a geometry (the one without isn't counted).
+        // No selection: every feature with a usable point (not the one without geometry, nor the
+        // one whose point is missing a coordinate).
         assert_eq!(count(vec![]), Some(4.0));
+        assert_eq!(count(vec![0, 5]), Some(1.0));
         assert_eq!(count(vec![0, 1, 2]), Some(3.0));
         // A row a selection lists twice is one feature.
         assert_eq!(count(vec![0, 0, 1]), Some(2.0));
