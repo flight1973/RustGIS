@@ -2200,15 +2200,17 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     // Each group's key, polygons and records, in the order first met; found by its key's hash.
     let mut groups: Vec<(Value, Vec<MultiPolygon<f64>>, Vec<usize>)> = Vec::new();
     let mut index: HashMap<crate::stats::KeyPart<'_>, usize> = HashMap::new();
-    // Features with no polygon to dissolve (no geometry, or a point or line in the polygon layer,
-    // as Minimum Bounding Geometry's flat hulls are): left out of the groups, and counted.
+    // Features with no polygon to dissolve (no geometry, an empty polygon, or a point or line in
+    // the polygon layer, as Minimum Bounding Geometry's flat hulls are): left out of the groups,
+    // their counts and statistics, and counted.
     let mut not_polygons = 0usize;
     let input_rows = each_once(rows(inp, p, "input", ds));
     crate::control::begin(input_rows.len());
     for (done, r) in input_rows.into_iter().enumerate() {
         crate::control::check()?;
         crate::control::reached(done);
-        let Some(mp) = ds.features.get(r).and_then(|f| f.geometry.as_ref()).and_then(to_multipolygon) else {
+        let polygon = ds.features.get(r).and_then(|f| f.geometry.as_ref()).and_then(to_multipolygon);
+        let Some(mp) = polygon.filter(|mp| mp.0.iter().any(|p| !p.exterior().0.is_empty())) else {
             not_polygons += 1;
             continue;
         };
@@ -2256,12 +2258,14 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let n = out.features.len();
     // Features read, none with a polygon: an unusable result, so an error saying why.
     if n == 0 && not_polygons > 0 {
-        return Err(format!("Dissolve: none of the {not_polygons} feature(s) has a polygon: no geometry, or a point or line"));
+        return Err(format!(
+            "Dissolve: none of the {not_polygons} feature(s) has a polygon: no geometry, an empty polygon, or a point or line"
+        ));
     }
     let mut messages = vec![format!("Dissolve: {n} features")];
     if not_polygons > 0 {
         messages.push(format!(
-            "Dissolve: {not_polygons} feature(s) left out, with their values: no geometry, or a point or line rather than a polygon"
+            "Dissolve: {not_polygons} feature(s) left out, with their values: no geometry, an empty polygon, or a point or line rather than a polygon"
         ));
     }
     messages.extend(rounded_notice(&rounded, out.fields.get(first_added..).unwrap_or_default()));
@@ -6782,31 +6786,39 @@ mod tests {
     }
 
     /// Dissolve says how many features it left out for having no polygon: a point and a line in a
-    /// polygon layer (as Minimum Bounding Geometry's flat hulls are) and a feature without
-    /// geometry. A layer of polygons says nothing of the kind.
+    /// polygon layer (as Minimum Bounding Geometry's flat hulls are), an empty polygon and a
+    /// feature without geometry. Those in a group add nothing to its count or statistics. A layer
+    /// of polygons says nothing of the kind.
     #[test]
     fn dissolve_counts_features_with_no_polygon() {
+        let fields = vec![Field::new("k", FieldType::Integer), Field::new("v", FieldType::Double)];
         let notice = |extra: bool| {
-            let mut polys = Dataset::new("polys", GeometryType::Polygon, vec![Field::new("k", FieldType::Integer)]);
-            polys.push(Some(sq(0.0, 0.0, 1.0)), vec![Value::Int(1)]);
-            polys.push(Some(sq(3.0, 0.0, 1.0)), vec![Value::Int(1)]);
+            let mut polys = Dataset::new("polys", GeometryType::Polygon, fields.clone());
+            polys.push(Some(sq(0.0, 0.0, 1.0)), vec![Value::Int(1), Value::Float(1.0)]);
+            polys.push(Some(sq(3.0, 0.0, 1.0)), vec![Value::Int(1), Value::Float(2.0)]);
             if extra {
-                polys.push(Some(Geometry::Point(Coord::new(5.0, 5.0))), vec![Value::Int(1)]);
-                polys.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 5.0), Coord::new(1.0, 5.0)]])), vec![Value::Int(2)]);
-                polys.push(None, vec![Value::Int(3)]);
+                // In group 1 with the polygons, with values that would show in its sum.
+                polys.push(Some(Geometry::Point(Coord::new(5.0, 5.0))), vec![Value::Int(1), Value::Float(100.0)]);
+                polys.push(Some(Geometry::Polygon(vec![])), vec![Value::Int(1), Value::Float(1000.0)]);
+                polys.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 5.0), Coord::new(1.0, 5.0)]])), vec![Value::Int(2), Value::Null]);
+                polys.push(None, vec![Value::Int(3), Value::Null]);
             }
             let m = Map(HashMap::from([("polys".to_string(), polys)]));
-            let res = crate::run("dissolve", &m, &serde_json::json!({"input": "polys", "field": "k"})).unwrap();
+            let params = serde_json::json!({"input": "polys", "field": "k", "statistics": [{"field": "v", "statistic": "SUM"}]});
+            let res = crate::run("dissolve", &m, &params).unwrap();
             let note = res.messages.iter().find(|m| m.contains("left out")).cloned();
-            (layer(res).features.len(), note)
+            let out = layer(res);
+            (out.features.len(), out.value(0, 1).as_f64(), out.value(0, 2).as_f64(), note)
         };
-        let (groups, note) = notice(true);
-        assert_eq!(groups, 1);
+        let (groups, count, sum, note) = notice(true);
+        assert_eq!((groups, count, sum), (1, Some(2.0), Some(3.0)));
         assert_eq!(
             note.as_deref(),
-            Some("Dissolve: 3 feature(s) left out, with their values: no geometry, or a point or line rather than a polygon")
+            Some(
+                "Dissolve: 4 feature(s) left out, with their values: no geometry, an empty polygon, or a point or line rather than a polygon"
+            )
         );
-        assert_eq!(notice(false), (1, None));
+        assert_eq!(notice(false), (1, Some(2.0), Some(3.0), None));
         // None with a polygon: an error saying why, not an empty layer.
         let mut flat = Dataset::new("flat", GeometryType::Polygon, vec![]);
         flat.push(Some(Geometry::Point(Coord::new(5.0, 5.0))), vec![]);

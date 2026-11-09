@@ -404,6 +404,20 @@ fn a_streamed_geopackage_of_a_mixed_layer_keeps_every_kind() {
     assert_eq!(read_back(&a).features, read_back(&b).features);
     let points = read_back(&a).features.iter().filter(|f| matches!(f.geometry, Some(Geometry::Point(_)))).count();
     assert_eq!(points, 4);
+    // A multipoint among them comes back a multipoint, with its members, streamed and whole.
+    let pair = Geometry::MultiPoint(vec![Coord::new(1.5, 2.5), Coord::new(3.5, 4.5)]);
+    if let Some(f) = mixed.features.get_mut(10) {
+        f.geometry = Some(pair.clone());
+    }
+    let (c, e) = (d.join("streamed-multi.gpkg"), d.join("whole-multi.gpkg"));
+    write_chunks_in(&Runs::new(&mixed, 4), &layer, &c, Crs::LonLat, 1).unwrap();
+    crate::io::write_path(&mixed, &e).unwrap();
+    for p in [&c, &e] {
+        let back = read_back(p);
+        let multis: Vec<_> =
+            back.features.iter().filter_map(|f| f.geometry.as_ref()).filter(|g| matches!(g, Geometry::MultiPoint(_))).collect();
+        assert_eq!(multis, [&pair], "{}", p.display());
+    }
 }
 
 /// A layer that declares no geometry type but carries geometry exports to the same GeoPackage

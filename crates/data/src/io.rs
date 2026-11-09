@@ -2520,12 +2520,13 @@ fn dbf_boolean(value: &Value) -> Option<bool> {
 
 /// The notice for the `left_out` features an export to `name` (a file of extension `ext`) left
 /// out, as [`write_path_in`] and [`write_bytes_in`] count them; `None` when none were. A
-/// Shapefile (`.shp`, or zipped) holds only drawable geometry of the layer's one kind; FlatGeobuf,
-/// KML and GPX hold only features with geometry; the other formats leave nothing out.
+/// Shapefile export (`.shp`, or zipped) writes only drawable geometry of the layer's one kind (it
+/// writes no null shapes, though the format has them); FlatGeobuf, KML and GPX exports write only
+/// features with geometry; the other formats leave nothing out.
 pub fn left_out_note(name: &str, ext: &str, left_out: usize) -> Option<String> {
     (left_out > 0).then(|| match ext {
         "shp" | "zip" => format!(
-            "{name}: {left_out} features a Shapefile can't hold were left out: without drawable geometry, or with geometry of another kind than the layer's"
+            "{name}: {left_out} features left out of the Shapefile: without drawable geometry, or with geometry of another kind than the layer's"
         ),
         _ => format!("{name}: {left_out} features without drawable geometry were left out"),
     })
@@ -2697,6 +2698,26 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// A Shapefile export of a polygon layer holding a point and a feature without geometry writes
+    /// the polygon and counts both left out, the point for its kind; a layer of polygons loses none.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_shapefile_counts_geometry_of_another_kind_left_out() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let geojson = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","properties":{"name":"area"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}},
+            {"type":"Feature","properties":{"name":"spot"},"geometry":{"type":"Point","coordinates":[5,5]}},
+            {"type":"Feature","properties":{"name":"none"},"geometry":null}]}"#;
+        let (mixed, _) = read_geojson(geojson, "mixed")?;
+        let dir = tempfile::tempdir()?;
+        assert_eq!(write_path(&mixed, &dir.path().join("mixed.shp"))?, 2);
+        let (back, _) = read_path(&dir.path().join("mixed.shp"))?;
+        assert_eq!(back.features.len(), 1);
+        let mut areas = mixed.clone();
+        areas.features.truncate(1);
+        assert_eq!(write_path(&areas, &dir.path().join("areas.shp"))?, 0);
+        Ok(())
+    }
+
     /// The left-out notice names what each format can't hold: a Shapefile, features without
     /// drawable geometry or of another kind; the others, features without drawable geometry.
     /// Nothing left out, no notice.
@@ -2706,7 +2727,7 @@ mod tests {
             assert_eq!(
                 left_out_note("out", ext, 2).as_deref(),
                 Some(
-                    "out: 2 features a Shapefile can't hold were left out: without drawable geometry, or with geometry of another kind than the layer's"
+                    "out: 2 features left out of the Shapefile: without drawable geometry, or with geometry of another kind than the layer's"
                 )
             );
         }

@@ -32296,7 +32296,7 @@ fn shapefile_value_losses_reach_export_notices() {
                 notices.iter().any(|n| n.contains("3 values") && n.contains("id") && n.contains("number") && n.contains("left empty")),
                 "{command}: {notices:?}"
             );
-            assert!(notices.iter().any(|n| n.contains("1 features a Shapefile can't hold were left out")), "{command}: {notices:?}");
+            assert!(notices.iter().any(|n| n.contains("1 features left out of the Shapefile")), "{command}: {notices:?}");
         }
     }
     // A clean table gives neither loss notice; other formats keep the lossy attributes.
