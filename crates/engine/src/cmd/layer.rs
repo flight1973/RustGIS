@@ -16,13 +16,13 @@ use crate::{CmdResult, CommandSpec as C, Session};
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addData", "Add Data", "Home › Add", add_data).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
-            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a CityJSON model, or a GDAL or DuckDB file that doesn't say", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
+            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a CityJSON model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
         C::new("layer.addPhotos", "Add Photos", "Home › Add", add_photos).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"paths"?: [JPEG photo files], "folder"?: "a folder of photos (every JPEG in it)", "name"?: "the layer (default Photos; photos join it when it exists)"}"#,
         ),
         C::new("info.fileLayers", "List Layers in File", "Home › Add › Add Data", file_layers).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
-            .params(r#"{"path": string, "crs"?: "EPSG:… for a .city.json that doesn't say (as layer.addData)"}"#),
+            .params(r#"{"path": string, "crs"?: "EPSG:… for a CityJSON model (.city.json, a .json, or in a zip): it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows (as layer.addData)"}"#),
         C::new("info.fileColumns", "List Columns in File", "Home › Add › Add Data › Delimited Text", file_columns).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
             r#"{"path": "a delimited text file (CSV, TSV, TXT) or a spreadsheet", "delimiter"?: ","|";"|"\\t"|"|", "layer"?: "a spreadsheet's sheet (the first by default)"}"#,
         ),
@@ -43,11 +43,11 @@ pub fn commands() -> Vec<C> {
             r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.shp (its .dbf fetched beside it, and its .shx, .prj and .cpg when there)|.kml|.kmz|.gpx|.tif|.jp2 (JPEG 2000: desktop, through GDAL) (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX", "zoom"?: "bool: true frames everything added; false keeps the view, even on an empty map; omitted, the first content on an empty map is framed (a GeoParquet, FlatGeobuf or cloud-optimised GeoTIFF read in place likewise; a PMTiles or MBTiles archive ignores zoom and is framed on its bounds unless it covers the whole world)", "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "whole"?: "bool: download a cloud-optimised GeoTIFF whole (as a raster layer) instead of reading it in place (an address without a file name is read in place when its first bytes are a cloud-optimised GeoTIFF)", "cog"?: "bool: the address is a cloud-optimised GeoTIFF whatever its name says (the app's probe found it so)", "bbox"?: "[west, south, east, north] in degrees | "view": a cloud-optimised GeoTIFF's window as a raster layer (desktop and command line), read by range at full resolution, in the file's coordinate system, with its colour table and class names; at most 64 million values (all bands)", "cellSize"?: "with bbox: the coarsest overview whose cells are at most this size is read (the file's units; metres for longitude/latitude, a degree taken as 111.32 km)", "cube"?: "bool: a data cube's file: a tile layer that follows the time slider (stac.addCube adds them), kept one when the project opens again", "start"?, "end"?, "unit"?, "interval"?, "dates"?: "a GeoTIFF address with date placeholders ({date:YYYY}, {YYYY}{MM}{DD}), one file per date: the dates it spans and steps through (as time.set), turning the time slider on", "connection"?: "the id of the saved web-service connection it comes from (as service.add)", "anonymous"?: bool (internal: a plugin-origin download must never adopt a saved login), "request"?: "number (internal: the download a plugin command left to the app, #1202)"}"#,
         ),
         C::new("layer.addDownload", "Add Downloaded Data", "Home › Add", add_download).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files))
-            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes (when they came as GeoJSON) and paging are checked, and the address is kept as the layer's source), "bounds"?: [west, south, east, north] (with service: the layer's longitude/latitude bounds from its capabilities, which its axes are checked against; without bounds they are left as they come; ignored without service), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error, and its request kept as the layer's source), "geolibreProject"?: bool (internal: downloaded project JSON), "geolibreLayer"?: {"token", "record"} (internal: reserved imported layer and its saved style), "geolibreZarr"?: bool (internal: an imported Zarr slice as GeoTIFF), "connection"?: "as layer.addUrl", "anonymous"?: bool (internal: preserves a plugin-origin download's anonymous reads), "request"?: number (internal: the download a plugin command left to the app, #1202)}"#),
+            .params(r#"{"id": a download the app finished (Home › Add › Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "stream"?, "as"? (as layer.addData), "service"?: bool (a service's features: their axes (when they came as GeoJSON) and paging are checked, and the address is kept as the layer's source), "bounds"?: [west, south, east, north] (with service: the layer's longitude/latitude bounds from its capabilities, which its axes are checked against; without bounds they are left as they come; ignored without service), "coverage"?: bool (a WCS coverage: a GeoTIFF, else the service's error, and its request kept as the layer's source), "geolibreProject"?: bool (internal: downloaded project JSON), "geolibreLayer"?: {"token", "record"} (internal: reserved imported layer and its saved style), "geolibreZarr"?: bool (internal: an imported Zarr slice as GeoTIFF), "connection"?: "as layer.addUrl", "anonymous"?: bool (internal: preserves a plugin-origin download's anonymous reads), "request"?: number (internal: the download a plugin command left to the app, #1202), "window"?: {"bbox", "cellSize"?, "cog"?} (internal: what a cloud-optimised GeoTIFF's window the app read off the frame asked for, for a task to read it again, #1330)}"#),
         C::new("layer.addEncodedPolyline", "Add Encoded Polyline", "Home › Add", add_encoded_polyline).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"polyline": "encoded polyline text" | [texts] (one line each), "precision"?: 5 (Google) | 6 (OSRM, Valhalla), "name"?: text}"#,
         ),
-        C::new("layer.addDataText", "Add Data (from text)", "Home › Add", add_data_text).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"fileName": "name.geojson|.csv|.tsv", "text": string, "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"? (as layer.addData, for delimited text), "layer"?, "paperSpace"? (as layer.addData, for a file of several layers)}"#),
+        C::new("layer.addDataText", "Add Data (from text)", "Home › Add", add_data_text).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"fileName": "name.geojson|.csv|.tsv|.city.json (CityJSON: all its layers)", "text": string, "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"? (as layer.addData, for delimited text; crs also for a CityJSON model that doesn't say), "layer"?, "paperSpace"? (as layer.addData, for a file of several layers)}"#),
         C::new("layer.addSample", "Add Sample Data", "Home › Add › Add Data", add_sample).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"name": "countries"|"cities"|"rivers"|"lakes"}"#),
         C::new("layer.remove", "Remove", "Layers", remove).roles(&[]).effects(crate::policy::Effects::NONE)
             .key("Delete")
@@ -153,6 +153,62 @@ pub fn commands() -> Vec<C> {
                 }
             })
         }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?, "ramp": colour ramp name}"#)
+        .when(need_layer),
+        C::new("layer.invertRamp", "Invert Color Ramp", "Style › Drawing", |s, p| {
+            use rustgis_map::symbology::RampReversal;
+            let id = s.layer_id(p)?;
+            let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+            if l.graphics && l.raster.is_none() {
+                return Err("a graphics layer draws each feature in its own style, so it has no color scheme to invert".into());
+            }
+            let raster = l.raster.is_some();
+            let by_expression = !raster && (l.symbol_by.fill.is_some() || l.symbol_by.stroke.is_some());
+            let (done, layer_stack) = match &mut l.raster {
+                Some(rl) => (rl.style.invert_ramp().then_some(RampReversal { reversed: 0, kept: 0, on_layer_stack: 0 }), None),
+                None => {
+                    let g = l.geometry_type();
+                    let stack = layer_stack_hiding_symbol(l, g);
+                    (l.renderer.reverse_ramp(g), stack)
+                }
+            };
+            let Some(done) = done else {
+                return Err("the layer has no color scheme to invert: use Graduated or Unique Values (or a Stretch raster)".into());
+            };
+            // A raster's Invert is a switch, so it has no classes to count. Classes with fewer than two
+            // to change places, and none left for their own stacks (which say so below), change nothing.
+            if !raster && done.reversed == 0 && done.kept == 0 {
+                return Err("the layer has fewer than two classes showing the color scheme, so there is nothing to invert".into());
+            }
+            if done.kept > 0 {
+                // Their own stacks are drawn instead of the symbol, so the reversal can't reach them.
+                let kept = done.kept;
+                s.notify(
+                    format!(
+                        "{kept} class(es) drawn with fills or strokes of their own were left as they are: \
+                         edit those with their fill and stroke editors"
+                    ),
+                    false,
+                );
+            }
+            if let Some(what) = layer_stack.filter(|_| done.on_layer_stack > 0) {
+                // The classes without a stack of their own are drawn from the layer's, in colors of its own.
+                s.notify(
+                    format!(
+                        "The layer's stacked {what} set their own colors, so the classes show those and little of the color \
+                         scheme: the colors were reversed, but change the {what} to see them"
+                    ),
+                    false,
+                );
+            }
+            if by_expression && done.reversed > 0 {
+                // Drawn over the class colors, wherever the expression gives a color.
+                s.notify(
+                    "The layer's Symbol by Expression sets some features' colors, so the reversed colors show only where it gives none",
+                    false,
+                );
+            }
+            Ok(Value::Null)
+        }).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layer"?}"#)
         .when(need_layer),
         C::new("layer.classStyle", "Class Style", "Style › Drawing", class_style).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
@@ -768,6 +824,17 @@ fn show_fill(sym: &mut rustgis_map::Symbol) {
     if sym.fill.a() == 0 {
         sym.fill = sym.fill.with_alpha(shown_fill_alpha());
     }
+}
+
+/// "fills" or "strokes" when the layer's own stack (`fill_layers` of a polygon layer, `line_strokes` of a
+/// line or point layer), which the classes without a stack of their own are drawn from, hides the
+/// symbol's colors, which a color scheme sets ([`rustgis_map::symbology::stack_hides_symbol`]).
+fn layer_stack_hiding_symbol(l: &rustgis_map::Layer, g: GeometryType) -> Option<&'static str> {
+    rustgis_map::symbology::stack_hides_symbol(g, &l.fill_layers, &l.line_strokes).then_some(if g == GeometryType::Polygon {
+        "fills"
+    } else {
+        "strokes"
+    })
 }
 
 /// `layer.fillLayers`: a polygon layer's stacked fills (or a class's own, with `value`, `index`
@@ -1527,7 +1594,7 @@ pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u
                 .map(|(dataset, report)| rustgis_data::io::LayerRead { dataset, report, styles: Vec::new() })
                 .collect()
         }
-        // A CityJSON model that names no coordinate system, or names one it doesn't have.
+        // A CityJSON model with a coordinate system given, which takes the place of any it names.
         _ if crs.is_some() && rustgis_data::io::is_cityjson(file_name, bytes) => {
             let crs = crs.map(rustgis_data::raster::Crs::parse).transpose()?;
             rustgis_data::cityjson::read(file_name, bytes, crs)
@@ -1696,7 +1763,8 @@ fn ground_overlays(s: &mut Session, file_name: &str, bytes: &[u8]) -> Vec<(Strin
     let dir = Path::new(file_name).parent().filter(|d| d.is_absolute());
     for (g, picture) in found {
         let href = g.href.trim();
-        let picture = picture.or_else(|| {
+        // `Err(None)`: not in the file or beside it; `Err(Some(why))`: beside it but unreadable.
+        let picture = picture.ok_or(None::<String>).or_else(|_| {
             // Beside the document: no web addresses, absolute paths or climbing out of its folder.
             let rel = Path::new(href);
             let safe = !href.contains("://")
@@ -1705,14 +1773,29 @@ fn ground_overlays(s: &mut Session, file_name: &str, bytes: &[u8]) -> Vec<(Strin
                     // Windows too (`C:x`, `\\x`).
                     && rel.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir));
             if !safe {
-                return None;
+                return Err(None);
             }
-            let p = dir?.join(rel);
-            crate::project::read_file(&p, (256 << 20) - 1).ok()
+            let p = dir.ok_or(None)?.join(rel);
+            // Only a missing picture isn't beside it; one that can't be looked at says why.
+            // (Followed as the read follows it: a link to nothing is missing too.)
+            match std::fs::metadata(&p) {
+                Ok(_) => {}
+                // (A file named as a folder on its way, `a.png/b.png`, isn't beside it either.)
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => return Err(None),
+                Err(e) => return Err(Some(e.to_string())),
+            }
+            crate::project::read_file(&p, (256 << 20) - 1).map_err(Some)
         });
-        let Some(picture) = picture else {
-            notes.push(format!("{} (its picture {href} isn't in the file or beside it)", g.name));
-            continue;
+        let picture = match picture {
+            Ok(p) => p,
+            Err(None) => {
+                notes.push(format!("{} (its picture {href} isn't in the file or beside it)", g.name));
+                continue;
+            }
+            Err(Some(why)) => {
+                notes.push(format!("{} (its picture {href} can't be read: {why})", g.name));
+                continue;
+            }
         };
         match rustgis_data::raster::from_image(&g.name, &picture, g.bbox, g.rotation) {
             Ok(r) => out.push((g.name.clone(), r)),
@@ -3123,8 +3206,12 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
 fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
     let bound = crate::service_logins::request_params(s, p)?;
     let p = bound.as_ref();
-    if ["geolibreProject", "geolibreLayer", "geolibreZarr"].iter().any(|key| p.get(key).is_some()) && !s.import_completion(p) {
-        return Err("GeoLibre download state is internal; use project.importGeolibre".into());
+    if !s.import_completion(p) {
+        no_geolibre_state(p)?;
+    }
+    // Marks a service's document, read and kept for `service.add`: as a download, no layer would come.
+    if super::plugins::fetch::is_document(p) {
+        return Err("\"document\" is internal to service.add: leave it out".into());
     }
     let url = ps(p, "url").map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
     // A plugin command run again once the download it left to the app was added (#1202): what
@@ -3132,7 +3219,7 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
     // Answering it changes nothing (the layer is its own undo step).
     let wanted = s.asked_for(p);
     if s.leave_downloads
-        && let Some((_, answer, added)) = s.rerun_landed.iter().find(|(asked, ..)| super::plugins::fetch::same_request(asked, &wanted))
+        && let Some((answer, added)) = s.rerun_answer(&wanted)
     {
         s.request_only = true;
         // Added to another map than the one shown now: the command's next steps would act on this
@@ -3155,19 +3242,16 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
             .and_then(Value::as_u64)
             .is_some_and(|id| u32::try_from(id).ok().and_then(|id| s.map().layer(id)).is_none());
         if missing || added.gone(s.map()) {
-            return Err(format!("{url}: the layer its download added was taken away (undone) before the command ran again"));
+            return Err(format!("{url}: the layer its download added was removed or undone before the command ran again"));
         }
-        if super::plugins::fetch::table_gone(answer, &s.project) {
-            return Err(format!("{url}: the table its download added was taken away (undone) before the command ran again"));
+        if super::plugins::fetch::table_gone(&answer, &s.project) {
+            return Err(format!("{url}: the table its download added was removed or undone before the command ran again"));
         }
-        return added.answer_now(s.map(), answer);
+        return added.answer_now(s.map(), &answer);
     }
     // An address read through a saved S3 connection is judged by the address it wraps; the whole
     // address stays what is fetched and kept.
-    let lower = rustgis_data::s3_address::inner(crate::render::rustgis_tiles::logins::inner(url)).to_ascii_lowercase();
-    if !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("s3://")) {
-        return Err(format!("{url}: give an http://, https:// or s3:// address (Add Data opens files)"));
-    }
+    let lower = web_address(url)?;
     // A scan (`"as"`) keeps the pixels and none of the coordinates: the file is downloaded whole and
     // read as one (`add_named_bytes` checks it is an image), never read in place.
     let scan = super::raster::as_scan(p)?;
@@ -3177,26 +3261,7 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
         return Err(format!("{url}: \"cellSize\" goes with \"bbox\": give a box, or leave it out"));
     }
     if window {
-        if scan || b(p, "whole") == Some(true) || rustgis_data::time::is_template(url) {
-            return Err(format!(
-                "{url}: \"bbox\" reads a window of one cloud-optimised GeoTIFF with its coordinates: leave out \"as\" and \"whole\", and give a single file's address"
-            ));
-        }
-        // An address naming another kind of file is refused before anything is fetched (one
-        // with no extension, or a GeoTIFF's, is read; `"cog": true` says it is one).
-        if b(p, "cog") != Some(true)
-            && let Some(ext) =
-                address_extension(rustgis_data::s3_address::inner(url)).filter(|e| !matches!(e.as_str(), "tif" | "tiff" | "geotiff"))
-        {
-            return Err(format!(
-                "{url}: \"bbox\" reads a window of a cloud-optimised GeoTIFF, and this address names a .{ext} file: leave out \"bbox\" (or give \"cog\": true for a GeoTIFF by another name)"
-            ));
-        }
-        // What a window doesn't read is refused, not dropped: it keeps the file's coordinate system.
-        let unread: Vec<&str> = WINDOW_UNREAD.iter().copied().filter(|k| p.get(*k).is_some_and(|v| !v.is_null())).collect();
-        if !unread.is_empty() {
-            return Err(format!("{url}: a window (\"bbox\") doesn't read {}: leave it out", unread.join(", ")));
-        }
+        window_checks(p, url, scan)?;
         // A plugin's command run by the app leaves what would wait to the app, off the frame; a
         // window waits for its header and tiles, which the app doesn't take over yet.
         #[cfg(not(target_arch = "wasm32"))]
@@ -3852,12 +3917,131 @@ pub(crate) fn address_extension(url: &str) -> Option<String> {
 }
 
 /// `layer.addUrl` keys for other kinds of address, which a window (`"bbox"`) doesn't read.
-const WINDOW_UNREAD: [&str; 13] =
-    ["layer", "x", "y", "wkt", "crs", "delimiter", "paperSpace", "stream", "start", "end", "unit", "interval", "dates"];
+const WINDOW_UNREAD: [&str; 16] = [
+    "layer",
+    "x",
+    "y",
+    "wkt",
+    "crs",
+    "delimiter",
+    "paperSpace",
+    "stream",
+    "start",
+    "end",
+    "unit",
+    "interval",
+    "dates",
+    "service",
+    "coverage",
+    "bounds",
+];
 
 /// Metres in a degree, to compare a cell size in metres with a longitude/latitude file's pixels.
 #[cfg(not(target_arch = "wasm32"))]
 const METRES_PER_DEGREE: f64 = 111_320.0;
+
+/// A web address's lowercase form (the address it wraps when read through a saved connection), or
+/// why it isn't one.
+fn web_address(url: &str) -> Result<String, String> {
+    let lower = rustgis_data::s3_address::inner(crate::render::rustgis_tiles::logins::inner(url)).to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("s3://")) {
+        return Err(format!("{url}: give an http://, https:// or s3:// address (Add Data opens files)"));
+    }
+    Ok(lower)
+}
+
+/// Refuses a GeoLibre project's download state, which only the app's import sets.
+fn no_geolibre_state(p: &Value) -> Result<(), String> {
+    if ["geolibreProject", "geolibreLayer", "geolibreZarr"].iter().any(|key| p.get(key).is_some()) {
+        return Err("GeoLibre download state is internal; use project.importGeolibre".into());
+    }
+    Ok(())
+}
+
+/// Refuses what can't be a window of `url`, before anything is fetched.
+fn window_checks(p: &Value, url: &str, scan: bool) -> Result<(), String> {
+    no_geolibre_state(p)?;
+    if scan || b(p, "whole") == Some(true) || rustgis_data::time::is_template(url) {
+        return Err(format!(
+            "{url}: \"bbox\" reads a window of one cloud-optimised GeoTIFF with its coordinates: leave out \"as\" and \"whole\", and give a single file's address"
+        ));
+    }
+    // An address naming another kind of file is refused before anything is fetched (one
+    // with no extension, or a GeoTIFF's, is read; `"cog": true` says it is one).
+    if b(p, "cog") != Some(true)
+        && let Some(ext) =
+            address_extension(rustgis_data::s3_address::inner(url)).filter(|e| !matches!(e.as_str(), "tif" | "tiff" | "geotiff"))
+    {
+        return Err(format!(
+            "{url}: \"bbox\" reads a window of a cloud-optimised GeoTIFF, and this address names a .{ext} file: leave out \"bbox\" (or give \"cog\": true for a GeoTIFF by another name)"
+        ));
+    }
+    // What a window doesn't read is refused, not dropped: it keeps the file's coordinate system.
+    // A data cube's file is a tile layer that follows the time slider, and a window is a raster:
+    // `"cube": false` asks for nothing.
+    let cube = (b(p, "cube") == Some(true)).then_some("cube");
+    let unread: Vec<&str> = WINDOW_UNREAD.iter().copied().filter(|k| p.get(*k).is_some_and(|v| !v.is_null())).chain(cube).collect();
+    if !unread.is_empty() {
+        return Err(format!("{url}: a window (\"bbox\") doesn't read {}: leave it out", unread.join(", ")));
+    }
+    Ok(())
+}
+
+/// A window asked for, with its box settled (`"view"` is the view when it was asked for): what
+/// [`read_cog_window`] needs, on any thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct WindowAsked {
+    url: String,
+    bbox: [f64; 4],
+    cell: Option<f64>,
+    name: Option<String>,
+}
+
+/// A window read by [`read_cog_window`], waiting to be added to the project: its raster made and
+/// its GeoTIFF written, so that adding it holds no frame for long.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct CogWindow {
+    name: String,
+    layer: rustgis_map::RasterLayer,
+    /// What to say of it, once the layer has its name.
+    notes: Vec<String>,
+    columns: [u32; 2],
+    rows: [u32; 2],
+    level: usize,
+    cell_size: f64,
+}
+
+/// `p`'s box and cell size, read on the frame, which holds the view.
+#[cfg(not(target_arch = "wasm32"))]
+fn window_settled(s: &Session, p: &Value, url: &str) -> Result<WindowAsked, String> {
+    let named = |e: String| if e.starts_with(url) { e } else { format!("{url}: {e}") };
+    let bbox = window_box(s, p).map_err(named)?;
+    let cell = match p.get("cellSize").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => Some(v.as_f64().filter(|c| c.is_finite() && *c > 0.0).ok_or_else(|| named("cellSize is a size above 0".into()))?),
+    };
+    let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(String::from);
+    Ok(WindowAsked { url: url.to_string(), bbox, cell, name })
+}
+
+/// A window the app reads off the frame: `p`, a `layer.addUrl` with `"bbox"` and its address bound
+/// to its login, checked as the command checks it. Errors quote the address without its keys.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn window_asked(s: &Session, p: &Value) -> Result<WindowAsked, String> {
+    let url = ps(p, "url").map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
+    let checked = web_address(url)
+        .and_then(|_| super::raster::as_scan(p))
+        .and_then(|scan| window_checks(p, url, scan))
+        .and_then(|()| window_settled(s, p, url));
+    checked.map_err(|e| crate::sources::redact_text(&e))
+}
+
+/// `layer.addUrl` with `"bbox"`, for those that wait: read here and added.
+#[cfg(not(target_arch = "wasm32"))]
+fn add_cog_window(s: &mut Session, p: &Value, url: &str) -> CmdResult {
+    let read = read_cog_window(&window_settled(s, p, url)?)?;
+    add_window(s, p, read)
+}
 
 /// `layer.addUrl` with `"bbox"` (opengeos/RustGIS#1204): a window of a cloud-optimised GeoTIFF,
 /// read by range as a raster layer. The box (longitude/latitude, or the view) is turned into the
@@ -3866,16 +4050,18 @@ const METRES_PER_DEGREE: f64 = 111_320.0;
 /// takes are read, with the reader the data cubes use. The raster keeps the file's coordinate
 /// system, no-data, colour table and band and class names, and is kept in the project (as a
 /// GeoTIFF of the window), not read again from the address.
+///
+/// This waits for the file, and needs no [`Session`]: the app runs it on a thread and adds what it
+/// reads when it lands (`layer.addDownload`, [`Session::download_landed_window`]; #1330). Errors
+/// quote the address without its keys.
 #[cfg(not(target_arch = "wasm32"))]
-fn add_cog_window(s: &mut Session, p: &Value, url: &str) -> CmdResult {
+pub fn read_cog_window(asked: &WindowAsked) -> Result<CogWindow, String> {
     use crate::render::rustgis_tiles::cog;
     use rustgis_data::raster::cog::Level;
-    let named = |e: String| if e.starts_with(url) { e } else { format!("{url}: {e}") };
-    let [west, south, east, north] = window_box(s, p).map_err(named)?;
-    let cell = match p.get("cellSize").filter(|v| !v.is_null()) {
-        None => None,
-        Some(v) => Some(v.as_f64().filter(|c| c.is_finite() && *c > 0.0).ok_or_else(|| named("cellSize is a size above 0".into()))?),
-    };
+    let url = asked.url.as_str();
+    let named = |e: String| crate::sources::redact_text(&if e.starts_with(url) { e } else { format!("{url}: {e}") });
+    let [west, south, east, north] = asked.bbox;
+    let cell = asked.cell;
     // The five minutes count from the header's read.
     let started = std::time::Instant::now();
     let info = cog::info_blocking(url).map_err(named)?;
@@ -4049,8 +4235,7 @@ fn add_cog_window(s: &mut Session, p: &Value, url: &str) -> CmdResult {
     // A colour table is one band's: a window of more bands comes in without it, and says so.
     let palette_lost = (layout.palette.is_some() && bands.len() != 1)
         .then(|| format!("its colour table is left out: the window has {} bands, a palette has one", bands.len()));
-    let stem = cog_name(url);
-    let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&stem).to_string();
+    let name = asked.name.clone().unwrap_or_else(|| cog_name(url));
     let mut r =
         rustgis_data::raster::Raster::new(&name, c1 - c0, r1 - r0, bands, transform, layout.crs, layout.nodata, color, layout.data_type)
             .map_err(|e| named(e.to_string()))?;
@@ -4088,39 +4273,43 @@ fn add_cog_window(s: &mut Session, p: &Value, url: &str) -> CmdResult {
     };
     let (width, height, size) = (r.width, r.height, size_of(lv));
     let layer = rustgis_map::RasterLayer::from_bytes(r, format!("{name}.tif"), bytes);
-    let mut out = super::raster::add_raster_after(s, &name, layer, b(p, "zoom"))?;
     let of = if level == 0 { "the full image".to_string() } else { format!("overview {level} of {}", layout.levels.len() - 1) };
-    let added = s.active_layer.and_then(|id| s.map().layer(id)).map(|l| l.name.clone()).unwrap_or(name);
-    s.notify(format!("{added}: a {width} × {height} window of {of}, cells of {size:.1}{unit}, read by range from its address"), false);
-    if let Some(plain) = plain {
-        s.notify(format!("{added}: {plain}"), false);
-    }
+    let mut notes = vec![format!("a {width} × {height} window of {of}, cells of {size:.1}{unit}, read by range from its address")];
+    notes.extend(plain);
     if let Some(c) = finer {
-        s.notify(format!("{added}: cellSize {c} is finer than the file's finest cells ({size:.1}{unit}): the full image is read"), false);
+        notes.push(format!("cellSize {c} is finer than the file's finest cells ({size:.1}{unit}): the full image is read"));
     }
     if left_out > 0 {
         let kept = band_count - left_out;
-        s.notify(
-            format!("{added}: the project keeps {kept} of its {band_count} bands: {left_out} band(s) are left out once it is reopened"),
-            false,
-        );
+        notes.push(format!("the project keeps {kept} of its {band_count} bands: {left_out} band(s) are left out once it is reopened"));
     }
     if !cut.is_empty() {
-        s.notify(format!("{added}: the box reaches past the file's {} edge(s): the window is cut to the file", cut.join(", ")), false);
+        notes.push(format!("the box reaches past the file's {} edge(s): the window is cut to the file", cut.join(", ")));
     }
     if unrefined > 0 {
-        s.notify(
-            format!("{added}: {unrefined} piece(s) of the box's edges not followed to a quarter of a pixel: the window may fall short of a bent edge"),
-            false,
-        );
+        notes.push(format!(
+            "{unrefined} piece(s) of the box's edges not followed to a quarter of a pixel: the window may fall short of a bent edge"
+        ));
     }
     if unplaced > 0 {
-        s.notify(
-            format!("{added}: {unplaced} of the {points} points tested along the box's edges have no place in the file's coordinate system: the window is placed from the others"),
-            false,
-        );
+        notes.push(format!(
+            "{unplaced} of the {points} points tested along the box's edges have no place in the file's coordinate system: the window is placed from the others"
+        ));
     }
-    out["window"] = json!({"columns": [c0, c1], "rows": [r0, r1], "level": level, "cellSize": size});
+    Ok(CogWindow { name, layer, notes, columns: [c0, c1], rows: [r0, r1], level, cell_size: size })
+}
+
+/// Adds a window read by [`read_cog_window`] and says what it read. `p` is the command adding it
+/// (`layer.addUrl`, or `layer.addDownload` when the app read it off the frame).
+#[cfg(not(target_arch = "wasm32"))]
+fn add_window(s: &mut Session, p: &Value, read: CogWindow) -> CmdResult {
+    let CogWindow { name, layer, notes, columns, rows, level, cell_size } = read;
+    let mut out = super::raster::add_raster_after(s, &name, layer, b(p, "zoom"))?;
+    let added = s.active_layer.and_then(|id| s.map().layer(id)).map(|l| l.name.clone()).unwrap_or(name);
+    for note in notes {
+        s.notify(format!("{added}: {note}"), false);
+    }
+    out["window"] = json!({"columns": columns, "rows": rows, "level": level, "cellSize": cell_size});
     // `"zoom": true` zooms to the window whatever the map held, as for any other address.
     if b(p, "zoom") == Some(true) {
         out["zoomed"] = json!(zoom_to_added(s, &out));
@@ -4253,6 +4442,18 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     let coverage = super::b(p, "coverage").unwrap_or(false);
     if (service || coverage) && ps(p, "url").is_none_or(|url| url.trim().is_empty()) {
         return Err("url is required for a service or coverage download".into());
+    }
+    // A window the app read off the frame (#1330).
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(i) = s.landed_windows.iter().position(|(d, _)| *d == id) {
+        let (_, read) = s.landed_windows.remove(i);
+        let r = add_window(s, p, read)?;
+        return added_download(s, p, r, false, &url);
+    }
+    // No window landed for it: a whole file isn't added in a window's place.
+    if p.get("window").is_some_and(Value::is_object) {
+        let shown = crate::sources::redact(&url);
+        return Err(format!("{shown}: \"window\" is for a window the app read off the frame: use layer.addUrl with \"bbox\""));
     }
     // A download read already (an ArcGIS layer's protocol buffer pages, joined): added as read,
     // with no axes to check against bounds.

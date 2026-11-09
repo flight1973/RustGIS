@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, TryReserveError};
 use std::ops::ControlFlow;
 
-use crate::convert::{from_line, from_multipolygon, from_point, to_geo, to_multiline, to_multipolygon};
+use crate::convert::{from_line, from_multipolygon, from_point, reaches_poles, to_geo, to_multiline, to_multipolygon};
 use crate::geodesic::{PARALLEL_FEATURES, VERTEX_BUDGET_ERROR, geodesic_buffer_with_limit, geodesic_buffers_with_limit};
 use crate::{Inputs, Output, OutputLayer, ParamKind as K, ParamSpec as P, ToolResult, ToolSpec};
 
@@ -98,7 +98,7 @@ pub static TOOLS: &[ToolSpec] = &[
         id: "repairGeometry",
         name: "Repair Geometry",
         toolbox: "Data Management › Features",
-        summary: "Writes every feature with its geometry made valid: rings closed, repeated vertices and degenerate parts dropped, self-intersections, overlapping parts and holes outside their shell resolved. Says what was repaired in each.",
+        summary: "Writes every feature with its geometry made valid where it can be: rings closed, repeated vertices and degenerate parts dropped, self-intersections, overlapping parts and holes outside their shell resolved. Features with a missing or non-finite coordinate anywhere, even in a hole, or left with no usable points or, for polygons, no area once repaired, are written without geometry. Other features too complex to check, or whose repair fails, are written unchanged. Says what was repaired in each.",
         params: &[
             P { name: "input", label: "Input Features", kind: K::VectorLayer, required: true, default: "", help: "" },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
@@ -1512,7 +1512,7 @@ fn buffer_with_limits(inp: &dyn Inputs, p: &Json, limit: usize, bytes: usize) ->
     }
     if coarse > 0 {
         r.messages.push(format!(
-            "{coarse} of {} features' buffers have edges left longer than their outline allows (a ring of thousands of long edges uses up the points added to it): their sides there can stray from the distance by more than a buffer otherwise keeps to (0.012%, 0.05% along a line or outline buffered in stretches, or 1 cm)",
+            "{coarse} of {} features' buffers have outline edges left with fewer points along them than they need (the points a ring may add ran out, as on a ring of thousands of long edges, or a very long edge was halved as many times as it may be): their sides there can stray from the distance by more than a buffer otherwise keeps to (0.012%, 0.05% along a line or outline buffered in stretches, or 1 cm)",
             picked.len()
         ));
     }
@@ -1550,12 +1550,19 @@ fn part(g: &Geometry, mask: &MultiPolygon<f64>, inside: bool) -> Option<Geometry
                 Geometry::MultiPoint(v) => v,
                 _ => &[],
             };
+            // The poles the mask reaches, found at the first point at one.
+            let mut reached = None;
             let kept: Vec<Coord> = pts
                 .iter()
                 .copied()
                 .filter(|c| {
                     let m = rustgis_geom::lonlat_to_plane(*c);
-                    mask.intersects(&geo::Point::new(m.x, m.y)) == inside
+                    // A point at a pole touches a mask that reaches the pole, whatever its
+                    // longitude.
+                    let at = reaches_poles(c.y, c.y);
+                    let touches = mask.intersects(&geo::Point::new(m.x, m.y))
+                        || ((at.0 || at.1) && meet_at_a_pole(at, *reached.get_or_insert_with(|| plane_poles(mask))));
+                    touches == inside
                 })
                 .collect();
             match kept.len() {
@@ -1589,6 +1596,8 @@ fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         .filter(|(m, _)| !m.0.is_empty())
         .collect();
     let index = ExtentIndex::new(masks.iter().map(|(_, ext)| *ext));
+    // The masks reaching each pole: a point at one is in them at any longitude (#1033).
+    let at_poles = AtPoles::new(masks.iter().map(|(m, _)| plane_poles(m)));
     // Single candidates reuse their normalized mask. Retain eight recent multi-mask unions
     // so alternating neighbourhoods can reuse work too; evict the least recently used.
     const MAX_CACHED_MASKS: usize = 8;
@@ -1604,7 +1613,11 @@ fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         let domain = index.total.union(&ext);
         let margin = domain.width().max(domain.height()) / f64::from(1_u32 << 27);
         let ext = ext.padded(0.0, margin);
-        let near: Vec<_> = index.candidates(&ext).into_iter().filter(|i| masks.get(*i).is_some_and(|(_, e)| e.intersects(&ext))).collect();
+        let mut near: Vec<_> =
+            index.candidates(&ext).into_iter().filter(|i| masks.get(*i).is_some_and(|(_, e)| e.intersects(&ext))).collect();
+        if matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+            at_poles.add_to(poles(&g.extent()), &mut near);
+        }
         if near.is_empty() {
             continue;
         }
@@ -1645,11 +1658,12 @@ fn erase(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     }
     let (er, zones) = overlay_zones(inp, p, "erase")?;
     let index = ExtentIndex::new(zones.iter().map(|z| z.ext));
+    let at_poles = AtPoles::new(zones.iter().map(|z| poles(&z.ext)));
     let mut out = copy_schema(ds, out_name(p, format!("{}_Erase", ds.name)), ds.geometry_type);
     keep_source_crs(&mut out, ds, er);
     for r in rows(inp, p, "input", ds) {
         let Some(f) = ds.features.get(r) else { continue };
-        if let Some(rest) = f.geometry.as_ref().and_then(|g| outside(g, &zones, &index)) {
+        if let Some(rest) = f.geometry.as_ref().and_then(|g| outside(g, &zones, (&index, &at_poles))) {
             out.push_next(Some(rest), f.attrs.clone());
         }
     }
@@ -1766,10 +1780,9 @@ impl Overlay {
 /// zone order; and, when `outside` is set, its part outside them all. Parts that only touch are
 /// left out. A feature no zone overlaps is its own part outside, coordinates untouched; one that
 /// is cut comes out rebuilt, its overlapping parts unioned (see [`dissolved`]).
-fn cut(g: &Geometry, zones: &[Zone], index: &ExtentIndex, outside: bool) -> (Vec<(usize, Geometry)>, Option<Geometry>) {
+fn cut(g: &Geometry, zones: &[Zone], index: (&ExtentIndex, &AtPoles), outside: bool) -> (Vec<(usize, Geometry)>, Option<Geometry>) {
     let ext = g.extent();
-    let meets: Vec<usize> =
-        index.candidates(&ext).into_iter().filter(|zi| zones.get(*zi).is_some_and(|z| ext.intersects(&z.ext))).collect();
+    let meets = meeting(g, &ext, zones, index);
     // A feature of overlapping parts is unioned once, for all the zones it may meet, and only
     // when it may meet one.
     let whole = if meets.is_empty() { std::borrow::Cow::Borrowed(g) } else { dissolved(g) };
@@ -1780,6 +1793,18 @@ fn cut(g: &Geometry, zones: &[Zone], index: &ExtentIndex, outside: bool) -> (Vec
     let hit: Vec<&Zone> = inside.iter().filter_map(|(zi, _)| zones.get(*zi)).collect();
     let rest = rest_outside(g, &whole, &hit);
     (inside, rest)
+}
+
+/// The zones that may meet a feature (`ext` its extent), in zone order: those whose extent meets
+/// its, and, for points, those reaching a pole a point is at, where they meet at any longitude
+/// (#1033; a line or polygon meeting a zone only at a pole has no part in it).
+fn meeting(g: &Geometry, ext: &Extent, zones: &[Zone], (index, at_poles): (&ExtentIndex, &AtPoles)) -> Vec<usize> {
+    let mut found: Vec<usize> =
+        index.candidates(ext).into_iter().filter(|zi| zones.get(*zi).is_some_and(|z| ext.intersects(&z.ext))).collect();
+    if matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+        at_poles.add_to(poles(ext), &mut found);
+    }
+    found
 }
 
 /// A feature's part outside the zones that cut it, for [`cut`] and [`outside`], which find those
@@ -1801,9 +1826,9 @@ fn rest_outside(g: &Geometry, whole: &Geometry, hit: &[&Zone]) -> Option<Geometr
 /// exactly where they are, or their union), without [`cut`]'s part in each zone. Only zones whose
 /// extent meets the feature's are tested. A feature no zone cuts is kept as it is, coordinates
 /// untouched: a polygon that at most touches them, a line or point that doesn't meet them.
-fn outside(g: &Geometry, zones: &[Zone], index: &ExtentIndex) -> Option<Geometry> {
+fn outside(g: &Geometry, zones: &[Zone], index: (&ExtentIndex, &AtPoles)) -> Option<Geometry> {
     let ext = g.extent();
-    let near: Vec<&Zone> = index.candidates(&ext).into_iter().filter_map(|zi| zones.get(zi)).filter(|z| ext.intersects(&z.ext)).collect();
+    let near: Vec<&Zone> = meeting(g, &ext, zones, index).into_iter().filter_map(|zi| zones.get(zi)).collect();
     if near.is_empty() {
         return Some(g.clone());
     }
@@ -1811,13 +1836,15 @@ fn outside(g: &Geometry, zones: &[Zone], index: &ExtentIndex) -> Option<Geometry
     let whole = dissolved(g);
     let geo_g = to_geo(&whole);
     // The zones that cut it: a polygon is cut by those it overlaps, a line or point by those it
-    // meets (an edge counts as inside). Each is tested on its own, before any union.
+    // meets (an edge counts as inside, and a point at a pole meets a zone reaching it). Each is
+    // tested on its own, before any union.
     let cuts = |z: &&Zone| match g {
         Geometry::Polygon(_) => {
             let m = z.poly.relate(&geo_g);
             m.is_intersects() && !m.is_touches()
         }
-        _ => z.poly.intersects(&geo_g),
+        Geometry::Point(_) | Geometry::MultiPoint(_) => meet_at_a_pole(poles(&ext), poles(&z.ext)) || z.poly.intersects(&geo_g),
+        Geometry::Line(_) => z.poly.intersects(&geo_g),
     };
     let hit: Vec<&Zone> = near.into_iter().filter(cuts).collect();
     rest_outside(g, &whole, &hit)
@@ -1842,6 +1869,7 @@ fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String
     }
     let (ov, zones) = overlay_zones(inp, p, "overlay")?;
     let index = ExtentIndex::new(zones.iter().map(|z| z.ext));
+    let at_poles = AtPoles::new(zones.iter().map(|z| poles(&z.ext)));
     let mut out = overlay_schema(ds, ov, out_name(p, format!("{}_{}", ds.name, op.suffix())), ds.geometry_type);
     let zone_attrs = |z: &Zone| ov.features.get(z.row).map(|o| o.attrs.as_slice());
     // For Union and Symmetrical Difference, the rows of the input polygons that overlap each zone.
@@ -1855,7 +1883,7 @@ fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String
             }
             continue;
         };
-        let (inside, rest) = cut(g, &zones, &index, op.keeps_outside());
+        let (inside, rest) = cut(g, &zones, (&index, &at_poles), op.keeps_outside());
         for (zi, piece) in inside {
             if op.keeps_inside() {
                 out.push_next(Some(piece), overlay_row(ds, Some(&f.attrs), ov, zones.get(zi).and_then(zone_attrs)));
@@ -1969,6 +1997,7 @@ fn update(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         })
         .collect::<Result<Vec<Option<usize>>, String>>()?;
     let index = ExtentIndex::new(zones.iter().map(|z| z.ext));
+    let at_poles = AtPoles::new(zones.iter().map(|z| poles(&z.ext)));
     let mut out = copy_schema(ds, out_name(p, format!("{}_Update", ds.name)), GeometryType::Polygon);
     keep_source_crs(&mut out, ds, up);
     for r in rows(inp, p, "input", ds) {
@@ -1978,7 +2007,7 @@ fn update(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
                 out.push_next(None, f.attrs.clone());
                 continue;
             }
-            Some(g) => outside(g, &zones, &index),
+            Some(g) => outside(g, &zones, (&index, &at_poles)),
         };
         if let Some(rest) = rest {
             out.push_next(Some(rest), f.attrs.clone());
@@ -2067,6 +2096,11 @@ fn split(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let located: Vec<(usize, Extent)> =
         rows(inp, p, "input", ds).into_iter().filter_map(|r| Some((r, ds.features.get(r)?.geometry.as_ref()?.extent()))).collect();
     let index = ExtentIndex::new(located.iter().map(|(_, e)| *e));
+    // The input points at each pole: in a split polygon reaching it, at any longitude (#1033).
+    let point = |r: usize| {
+        ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)))
+    };
+    let points_at_poles = AtPoles::new(located.iter().map(|(r, e)| if point(*r) { poles(e) } else { (false, false) }));
     // Each input feature as the overlay takes it, made once, when a split polygon first meets it.
     let mut whole: Vec<Option<std::borrow::Cow<'_, Geometry>>> = vec![None; located.len()];
     let mut layers = Vec::new();
@@ -2079,13 +2113,16 @@ fn split(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             _ => std::borrow::Cow::Owned(union_all(polys.iter().flat_map(|z| z.poly.0.iter()))),
         };
         let ext = polys.iter().fold(Extent::EMPTY, |e, z| e.union(&z.ext));
+        let reached = polys.iter().map(|z| poles(&z.ext)).fold((false, false), |(n, s), (zn, zs)| (n || zn, s || zs));
         let mut out = copy_schema(ds, format!("{prefix}_{name}"), ds.geometry_type);
         keep_source_crs(&mut out, ds, sp);
         index.candidates_into(&ext, &mut cand_buf);
+        points_at_poles.add_to(reached, &mut cand_buf);
         for &li in &cand_buf {
             let Some((r, e)) = located.get(li) else { continue };
             let Some(f) = ds.features.get(*r) else { continue };
-            let (Some(g), Some(slot)) = (f.geometry.as_ref().filter(|_| e.intersects(&ext)), whole.get_mut(li)) else { continue };
+            let meets = e.intersects(&ext) || (point(*r) && meet_at_a_pole(poles(e), reached));
+            let (Some(g), Some(slot)) = (f.geometry.as_ref().filter(|_| meets), whole.get_mut(li)) else { continue };
             if let Some(c) = part(slot.get_or_insert_with(|| dissolved(g)), &mask, true) {
                 out.push_next(Some(c), f.attrs.clone());
             }
@@ -2357,8 +2394,9 @@ fn size_output_points<'a>(
     for f in feats {
         let Some(g) = &f.geometry else { continue };
         let k = count(g);
-        // Saturating, as sizes from input are. A row repeated in the selection (a project can
-        // restore one) is counted again, and its points are written twice.
+        // Saturating, as sizes from input are. A row repeated in the selection (only a custom
+        // `Inputs` can give one: a project's selection is normalized on load) is counted again,
+        // and its points are written twice.
         n = n.saturating_add(k);
         if estimate {
             let own = f.attrs.get(..kept).unwrap_or(&f.attrs);
@@ -3194,6 +3232,10 @@ fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     Ok(ToolResult { output: Output::Layer(out), messages })
 }
 
+/// A Select by Location selector: its shape and extent in the analysis plane, and the poles it
+/// reaches (north, south).
+type Selector = (geo::Geometry<f64>, Extent, (bool, bool));
+
 /// Conservative heap accounting for the geometry variants produced by `to_geo`. Coordinate
 /// capacities are exact; private polygon-interior arrays use an upper allocation allowance.
 fn selector_heap_bytes(g: &geo::Geometry<f64>) -> usize {
@@ -3245,7 +3287,7 @@ fn select_by_location_with_work_limit(inp: &dyn Inputs, p: &Json, limit: usize, 
     // Each selector has its own complexity limit. Retained selectors share a separate byte
     // budget; zero-distance selection keeps its existing unbuffered behavior.
     let storage = BufferStorage::new(if dist > 0.0 { bytes } else { usize::MAX });
-    let mut selectors = Vec::new();
+    let mut selectors: Vec<Selector> = Vec::new();
     crate::control::begin(picked.len());
     // Selecting features whose buffers kept edges coarser than their outline allows.
     let coarse = std::sync::atomic::AtomicUsize::new(0);
@@ -3262,12 +3304,13 @@ fn select_by_location_with_work_limit(inp: &dyn Inputs, p: &Json, limit: usize, 
                 } else {
                     None
                 };
-                let gg = to_geo(b.as_ref().unwrap_or(g));
+                let g = b.as_ref().unwrap_or(g);
+                let gg = to_geo(g);
                 if dist > 0.0 {
                     storage.charge(selector_heap_bytes(&gg))?;
                 }
                 let ext = merc_extent(&gg);
-                Ok::<_, &'static str>((gg, ext))
+                Ok::<_, &'static str>((gg, ext, poles(&g.extent())))
             },
         )?;
         storage.reserve(&mut selectors, made.len())?;
@@ -3278,9 +3321,11 @@ fn select_by_location_with_work_limit(inp: &dyn Inputs, p: &Json, limit: usize, 
     if dist > 0.0 {
         storage.charge(selectors.len().saturating_mul(std::mem::size_of::<Extent>()))?;
     }
-    let index = ExtentIndex::new(selectors.iter().map(|(_, ext)| *ext));
+    let index = ExtentIndex::new(selectors.iter().map(|(_, ext, _)| *ext));
+    // The selectors reaching each pole, where they meet whatever else reaches it (#1033).
+    let at_poles = AtPoles::new(selectors.iter().map(|(_, _, at)| *at));
     if dist > 0.0 {
-        storage.charge(index.storage_bytes())?;
+        storage.charge(index.storage_bytes().saturating_add(at_poles.storage_bytes()))?;
     }
     let invert = s(p, "invert") == "Yes";
     let bounded_checks = dist > 0.0 && selectors.len() > ExtentIndex::MAX_LINEAR_FEATURES;
@@ -3294,17 +3339,18 @@ fn select_by_location_with_work_limit(inp: &dyn Inputs, p: &Json, limit: usize, 
         let gg = to_geo(g);
         let ext = merc_extent(&gg);
         let mut exhausted = false;
-        let hit = index.any_candidate(&ext, |i| {
-            if bounded_checks {
-                if remaining_checks == 0 {
-                    exhausted = true;
-                    // Stop the candidate traversal; this sentinel is never used as a match.
-                    return true;
+        let hit = at_poles.any(poles(&g.extent()))
+            || index.any_candidate(&ext, |i| {
+                if bounded_checks {
+                    if remaining_checks == 0 {
+                        exhausted = true;
+                        // Stop the candidate traversal; this sentinel is never used as a match.
+                        return true;
+                    }
+                    remaining_checks -= 1;
                 }
-                remaining_checks -= 1;
-            }
-            selectors.get(i).is_some_and(|(s, e)| e.intersects(&ext) && s.intersects(&gg))
-        });
+                selectors.get(i).is_some_and(|(s, e, _)| e.intersects(&ext) && s.intersects(&gg))
+            });
         if exhausted {
             return Err(format!("Distance selection exceeds its limit of {checks} selector checks; select fewer features or selectors"));
         }
@@ -3328,7 +3374,7 @@ fn select_by_location_with_work_limit(inp: &dyn Inputs, p: &Json, limit: usize, 
     let coarse = coarse.into_inner();
     if coarse > 0 {
         messages.push(format!(
-            "{coarse} selecting features' buffers have edges left longer than their outline allows (a ring of thousands of long edges uses up the points added to it): features near their edges there may be selected or not by more than a buffer otherwise keeps to (0.012% of the distance, 0.05% along a line or outline buffered in stretches, or 1 cm)"
+            "{coarse} selecting features' buffers have outline edges left with fewer points along them than they need (the points a ring may add ran out, as on a ring of thousands of long edges, or a very long edge was halved as many times as it may be): features near their edges there may be selected or not by more than a buffer otherwise keeps to (0.012% of the distance, 0.05% along a line or outline buffered in stretches, or 1 cm)"
         ));
     }
     Ok(ToolResult { output: Output::Selection { layer: ds.name.clone(), rows: hits }, messages })
@@ -3633,12 +3679,13 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
 
     let mut pts: Vec<(Coord, f64)> = Vec::new();
     let mut skipped: usize = 0;
-    // Members of multipoints with another finite member, missing a coordinate or with an infinite one.
-    let mut missing_members: usize = 0;
     // A point the system can't hold is left out, and counted, as one past 85.05° in Web Mercator,
     // which would land on the map's edge rather than where it is (#1033): its latitude doesn't
     // come back.
     let mut beyond: usize = 0;
+    // A multipoint's members with non-finite coordinates, in the features with finite ones (a
+    // feature with none is counted in `skipped`).
+    let (mut non_finite, mut non_finite_features) = (0usize, 0usize);
     let project = |c: Coord, beyond: &mut usize| {
         // Web Mercator's limit is known exactly: the round trip alone would let a latitude a hair
         // past it through, onto the edge.
@@ -3676,18 +3723,21 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
             }
             Geometry::MultiPoint(cs) => {
                 // As for a point: a feature with no finite member is skipped, and a member the
-                // system can't hold counts as beyond; a member missing a coordinate in a feature
-                // with a finite one is left out and counted on its own.
-                let finite = cs.iter().filter(|c| c.is_finite()).count();
-                if finite == 0 {
+                // system can't hold counts as beyond (not as skipped too); a non-finite member of a
+                // feature with finite ones is left out and counted on its own.
+                let bad = cs.iter().filter(|c| !c.is_finite()).count();
+                if bad == cs.len() {
                     skipped += 1;
                     continue;
                 }
-                missing_members += cs.len() - finite;
                 for c in cs.iter().filter(|c| c.is_finite()) {
                     if let Some(p_proj) = project(*c, &mut beyond) {
                         pts.push((p_proj, w));
                     }
+                }
+                if bad > 0 {
+                    non_finite = non_finite.saturating_add(bad);
+                    non_finite_features += 1;
                 }
             }
             _ => {
@@ -3699,13 +3749,14 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
     // Only Web Mercator's limit is known to be a latitude.
     let why = if crs == Crs::WebMercator { " (past 85.05° of latitude)" } else { "" };
     let beyond_note = (beyond > 0).then(|| format!("{beyond} point(s) beyond what {} can hold{why} were left out", crs.label()));
-    let missing_note =
-        (missing_members > 0).then(|| format!("{missing_members} multipoint member(s) were left out: a coordinate missing or infinite"));
+    let non_finite_note = (non_finite > 0).then(|| {
+        format!("{non_finite} point(s) with non-finite coordinates were left out of {non_finite_features} multipoint feature(s) that have other points")
+    });
     if pts.is_empty() {
         let none = "input layer has no valid points with positive weights to analyze";
         let skipped_note = (skipped > 0)
             .then(|| format!("{skipped} feature(s) skipped (no point geometry, a weight that isn't positive, or no finite coordinate)"));
-        let notes: Vec<&str> = skipped_note.iter().chain(beyond_note.iter()).chain(missing_note.iter()).map(String::as_str).collect();
+        let notes: Vec<&str> = skipped_note.iter().chain(beyond_note.iter()).chain(non_finite_note.iter()).map(String::as_str).collect();
         return Err(if notes.is_empty() { none.to_string() } else { format!("{none}: {}", notes.join("; ")) });
     }
 
@@ -3769,7 +3820,7 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
     };
     Ok(ToolResult {
         output: Output::Layers(vec![OutputLayer::Raster { file_name: format!("{name}.tif"), name, bytes }]),
-        messages: std::iter::once(msg).chain(beyond_note).chain(missing_note).collect(),
+        messages: std::iter::once(msg).chain(beyond_note).chain(non_finite_note).collect(),
     })
 }
 
@@ -3792,10 +3843,11 @@ fn merc_extent(g: &impl geo::CoordsIter<Scalar = f64>) -> Extent {
 
 /// Summarize Within: each polygon's count of the (selected) point features that meet it, inside it
 /// or on its edge; a feature of several points counts once in each polygon it meets. Each point is
-/// tested only against the polygons whose extents hold it, through an [`ExtentIndex`]. The extents
-/// are in the analysis plane, where the test runs, which goes on past 85.05° to the poles (#1033).
-/// The statistics asked for, of the point layer's fields, are over the same points, as
-/// `<STAT>_<field>` after `point_count`.
+/// tested only against the polygons whose extents hold it, through an [`ExtentIndex`], and, at a
+/// pole, those reaching it, which it touches at any longitude. The extents are in the analysis
+/// plane, where the test runs, which goes on past 85.05° to the poles (#1033). The statistics
+/// asked for, of the point layer's fields, are over the same points, as `<STAT>_<field>` after
+/// `point_count`.
 fn count_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let polys = input(inp, p, "polygons")?;
     let pts = input(inp, p, "points")?;
@@ -3805,18 +3857,21 @@ fn count_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     out.source = None;
     let fi = out.ensure_field("point_count", FieldType::Integer);
     let added = statistic_fields(pts, &requests, false, &out.fields)?;
-    // Each polygon's row, shape and extent; a feature without polygons meets no point.
-    let zones: Vec<(usize, MultiPolygon<f64>, Extent)> = out
+    // Each polygon's row, shape, extent and the poles it reaches; a feature without polygons meets
+    // no point.
+    let zones: Vec<(usize, MultiPolygon<f64>, Extent, (bool, bool))> = out
         .features
         .iter()
         .enumerate()
         .filter_map(|(row, f)| {
-            let mp = f.geometry.as_ref().and_then(to_multipolygon)?;
+            let g = f.geometry.as_ref()?;
+            let mp = to_multipolygon(g)?;
             let ext = merc_extent(&mp);
-            Some((row, mp, ext))
+            Some((row, mp, ext, poles(&g.extent())))
         })
         .collect();
-    let index = ExtentIndex::new(zones.iter().map(|(_, _, ext)| *ext));
+    let index = ExtentIndex::new(zones.iter().map(|(_, _, ext, _)| *ext));
+    let at_poles = AtPoles::new(zones.iter().map(|(.., at)| *at));
     let mut counts = vec![0i64; out.features.len()];
     // Each polygon's points, kept only for statistics.
     let mut members: Vec<Vec<usize>> = if requests.is_empty() { Vec::new() } else { vec![Vec::new(); out.features.len()] };
@@ -3829,10 +3884,13 @@ fn count_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         let ext = merc_extent(&pg);
         let mut met = false;
         index.candidates_into(&ext, &mut cand_buf);
+        // A point at a pole touches a polygon reaching it, at whatever longitude (a line or
+        // polygon passed as points, meeting one only there, has no part in it).
+        let at = if matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) { poles(&g.extent()) } else { (false, false) };
+        at_poles.add_to(at, &mut cand_buf);
         for &zi in &cand_buf {
-            let Some((row, mp, z_ext)) = zones.get(zi) else { continue };
-            if z_ext.intersects(&ext)
-                && mp.intersects(&pg)
+            let Some((row, mp, z_ext, z_at)) = zones.get(zi) else { continue };
+            if (meet_at_a_pole(at, *z_at) || (z_ext.intersects(&ext) && mp.intersects(&pg)))
                 && let Some(c) = counts.get_mut(*row)
             {
                 *c += 1;
@@ -4708,9 +4766,10 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         rs.iter().filter(|&&r| ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(jumps)).count()
     };
     let (zones_unsplit, classes_unsplit) = (unsplit(zones, &zone_rows), unsplit(classes, &class_rows));
-    // Features with an edge beyond 85.05° that runs east or west: the overlay, in the analysis plane,
-    // takes it straight in longitude and latitude there (the Web Mercator map clamps it), while `area_km2` takes the shortest way between
-    // its ends, which near a pole runs far poleward of it (#1033).
+    // Features with an edge beyond 85.05° that runs east or west: the overlay, in the analysis
+    // plane, takes it straight in longitude and latitude there (the Web Mercator map clamps it),
+    // while `area_km2` takes the shortest way between its ends, which near a pole runs far
+    // poleward of it (#1033).
     let polar = |ds: &Dataset, rs: &[usize]| {
         let max = rustgis_geom::MAX_LAT;
         let across = |g: &Geometry| {
@@ -5086,6 +5145,77 @@ impl JoinMatch {
 
 /// The least distance Closest's first search reaches, in metres.
 const MIN_REACH_M: f64 = 10.0;
+
+/// The poles a feature with this extent reaches: north, then south.
+fn poles(e: &Extent) -> (bool, bool) {
+    reaches_poles(e.min_y, e.max_y)
+}
+
+/// The features of a list reaching the North Pole and the South Pole, by their place in it: a
+/// feature reaching a pole meets them there, however far apart their extents' longitudes are, so
+/// they're candidates for it beside those an index finds by extent (#1033).
+#[derive(Default)]
+struct AtPoles {
+    north: Vec<usize>,
+    south: Vec<usize>,
+}
+
+impl AtPoles {
+    /// From the poles each feature reaches (north, south), in list order.
+    fn new(reached: impl IntoIterator<Item = (bool, bool)>) -> Self {
+        let mut at = Self::default();
+        for (i, (north, south)) in reached.into_iter().enumerate() {
+            if north {
+                at.north.push(i);
+            }
+            if south {
+                at.south.push(i);
+            }
+        }
+        at
+    }
+
+    /// Adds to `found` those reaching the poles `at` (north, south) reaches, then sorts it, each
+    /// once; leaves it as it is when there are none to add.
+    fn add_to(&self, (north, south): (bool, bool), found: &mut Vec<usize>) {
+        let before = found.len();
+        if north {
+            found.extend_from_slice(&self.north);
+        }
+        if south {
+            found.extend_from_slice(&self.south);
+        }
+        if found.len() != before {
+            found.sort_unstable();
+            found.dedup();
+        }
+    }
+
+    /// The bytes its lists hold.
+    fn storage_bytes(&self) -> usize {
+        self.north.capacity().saturating_add(self.south.capacity()).saturating_mul(std::mem::size_of::<usize>())
+    }
+
+    /// Whether any feature reaches a pole `at` (north, south) reaches.
+    fn any(&self, (north, south): (bool, bool)) -> bool {
+        (north && !self.north.is_empty()) || (south && !self.south.is_empty())
+    }
+}
+
+/// The poles polygons in the analysis plane reach, from their box there: north, then south.
+fn plane_poles(mp: &MultiPolygon<f64>) -> (bool, bool) {
+    use geo::BoundingRect;
+    let lat = |y: f64| rustgis_geom::plane_to_lonlat(Coord::new(0.0, y)).y;
+    mp.bounding_rect().map_or((false, false), |r| reaches_poles(lat(r.min().y), lat(r.max().y)))
+}
+
+/// Whether two features meet at a pole, given the poles each reaches. The analysis plane, like
+/// longitude and latitude, draws a pole as a line, so (0°, −90°) and (90°, −90°) are apart there
+/// though they are one place on the ground (#1033). (Distances already meet there: they're
+/// measured on the ground.)
+fn meet_at_a_pole((a_north, a_south): (bool, bool), (b_north, b_south): (bool, bool)) -> bool {
+    (a_north && b_north) || (a_south && b_south)
+}
 
 /// The ground distance between two features in metres: zero when they intersect.
 fn ground_distance(t: &Geometry, t_geo: &geo::Geometry<f64>, j: &Geometry, j_geo: &geo::Geometry<f64>) -> Option<f64> {
@@ -5620,6 +5750,12 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 
     let index = ExtentIndex::new(join_geoms.iter().map(|j| j.ext));
     let nearby = Nearby { feats: &join_geoms, index: &index };
+    // For Intersects and Center In, the join features reaching each pole.
+    let joins_at_poles = if matches!(mode, JoinMatch::Intersects | JoinMatch::CentreIn) {
+        AtPoles::new(join_geoms.iter().map(|j| poles(&j.ext)))
+    } else {
+        AtPoles::default()
+    };
 
     let mut total_matches = 0usize;
     let mut written_features = 0usize;
@@ -5638,11 +5774,13 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             match mode {
                 JoinMatch::Intersects | JoinMatch::Contains | JoinMatch::Within => {
                     index.candidates_into(&t_ext, &mut cand_buf);
+                    let t_poles = poles(&t_ext);
+                    joins_at_poles.add_to(t_poles, &mut cand_buf);
                     for j in cand_buf.iter().copied().filter_map(at) {
                         let hit = match mode {
                             JoinMatch::Contains => extent_contains(&t_ext, &j.ext) && Contains::contains(&t_geo, &j.geo),
                             JoinMatch::Within => extent_contains(&j.ext, &t_ext) && Contains::contains(&j.geo, &t_geo),
-                            _ => t_ext.intersects(&j.ext) && t_geo.intersects(&j.geo),
+                            _ => meet_at_a_pole(t_poles, poles(&j.ext)) || (t_ext.intersects(&j.ext) && t_geo.intersects(&j.geo)),
                         };
                         if hit {
                             matches.push((j.row, None));
@@ -5653,8 +5791,10 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
                     if let Some(pt) = interior_point(tg) {
                         let (p_ext, p_geo) = (pt.extent(), to_geo(&pt));
                         index.candidates_into(&p_ext, &mut cand_buf);
+                        let p_poles = poles(&p_ext);
+                        joins_at_poles.add_to(p_poles, &mut cand_buf);
                         for j in cand_buf.iter().copied().filter_map(at) {
-                            if j.ext.intersects(&p_ext) && j.geo.intersects(&p_geo) {
+                            if meet_at_a_pole(p_poles, poles(&j.ext)) || (j.ext.intersects(&p_ext) && j.geo.intersects(&p_geo)) {
                                 matches.push((j.row, None));
                             }
                         }
@@ -6094,6 +6234,22 @@ pub(crate) fn normalize_params(spec: &ToolSpec, p: &mut serde_json::Map<String, 
         normalize_join_field_params(p);
     }
 }
+
+/// Parameter aliases recognized by `normalize_join_field_params`.
+pub static JOIN_FIELD_ALIASES: &[&str] = &[
+    "input",
+    "target_layer",
+    "join",
+    "source",
+    "join_table",
+    "target_field",
+    "key",
+    "target_key",
+    "join_field",
+    "join_key",
+    "duplicateStrategy",
+    "duplicate_strategy",
+];
 
 pub(crate) fn normalize_join_field_params(p: &mut serde_json::Map<String, Json>) {
     let is_blank = |val: Option<&Json>| val.is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()));
@@ -8445,20 +8601,11 @@ mod tests {
         let all = run(vec![Some(far_ring)], "All").unwrap_or_else(|e| panic!("{e}")).messages.join(" | ");
         assert!(all.contains(": 1 vertex(es) passed over"), "{all}");
         // A ring that repeats its NaN start point as its end: that vertex is passed over once.
-        let nan_ring = Geometry::Polygon(vec![vec![vec![
-            gap,
-            Coord::new(1.0, 0.0),
-            Coord::new(1.0, 1.0),
-            Coord::new(0.0, 1.0),
-            gap,
-        ]]]);
+        let nan_ring = Geometry::Polygon(vec![vec![vec![gap, Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 1.0), gap]]]);
         let all = run(vec![Some(nan_ring)], "All").unwrap_or_else(|e| panic!("{e}")).messages.join(" | ");
         assert!(all.contains(": 1 vertex(es) passed over"), "{all}");
         // A latitude past a pole is taken as that pole, and says so; a pole's own latitude says nothing.
-        let past = run(vec![Some(Geometry::Point(Coord::new(10.0, 95.0)))], "All")
-            .unwrap_or_else(|e| panic!("{e}"))
-            .messages
-            .join(" | ");
+        let past = run(vec![Some(Geometry::Point(Coord::new(10.0, 95.0)))], "All").unwrap_or_else(|e| panic!("{e}")).messages.join(" | ");
         assert!(past.contains("1 vertex(es) with a latitude past a pole found (taken as that pole)"), "{past}");
         let at_pole = run(vec![Some(Geometry::Point(Coord::new(10.0, 90.0)))], "All").unwrap_or_else(|e| panic!("{e}"));
         assert!(!at_pole.messages.join(" | ").contains("past a pole"), "{:?}", at_pole.messages);
@@ -8511,8 +8658,14 @@ mod tests {
             for dissolve in ["None", "All"] {
                 let params = serde_json::json!({"input": "l", "distance": 1, "units": "Meters", "dissolve": dissolve});
                 let res = crate::run("buffer", &m, &params).unwrap_or_else(|e| panic!("{e}"));
-                let said = res.messages.iter().any(|m| m.starts_with("1 of 1 features' buffers have edges left longer"));
-                assert_eq!(said, coarse, "dissolve {dissolve}: {:?}", res.messages);
+                let note =
+                    res.messages.iter().find(|m| m.starts_with("1 of 1 features' buffers have outline edges left with fewer points"));
+                assert_eq!(note.is_some(), coarse, "dissolve {dissolve}: {:?}", res.messages);
+                // The note names both reasons an edge can be left coarse.
+                assert!(
+                    note.is_none_or(|m| m.contains("the points a ring may add ran out") && m.contains("halved as many times as it may be")),
+                    "{note:?}"
+                );
             }
         }
     }
@@ -8764,12 +8917,11 @@ mod tests {
         assert!(note.starts_with("1 point(s) beyond what") && !note.contains("85.05°"), "{:?}", res.messages);
     }
 
-    /// Kernel Density counts the multipoint members it leaves out for a missing or infinite
-    /// coordinate, in a feature with others it places; a feature with none it can place is
-    /// skipped, and one wholly past 85.05° counts its points as beyond, not as skipped too, as a
-    /// point does. Whole multipoints say nothing of the kind.
+    /// Kernel Density skips a multipoint with no finite member; one wholly past 85.05° counts its
+    /// points as beyond, not as skipped too, as a point does. With nothing left to place, the
+    /// error names every cause. Whole multipoints say nothing of the kind.
     #[test]
-    fn kernel_density_counts_multipoint_members_left_out() {
+    fn kernel_density_counts_a_multipoint_beyond_once() {
         let run = |members: Vec<Vec<Coord>>| {
             let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
             pts.push(Some(Geometry::MultiPoint(vec![Coord::new(0.0, 60.0), Coord::new(0.01, 60.0)])), vec![]);
@@ -8783,7 +8935,7 @@ mod tests {
         let (gap, inf) = (Coord::new(f64::NAN, 60.0), Coord::new(0.0, f64::INFINITY));
         let messages = run(vec![vec![Coord::new(0.02, 60.0), gap, inf], vec![gap], vec![Coord::new(0.0, 87.0), Coord::new(1.0, 88.0)]]);
         let all = messages.join(" | ");
-        assert!(all.contains("2 multipoint member(s) were left out: a coordinate missing or infinite"), "{all}");
+        assert!(all.contains("2 point(s) with non-finite coordinates were left out of 1 multipoint feature(s)"), "{all}");
         assert!(all.contains("from 3 points (1 skipped"), "{all}");
         assert!(all.contains("2 point(s) beyond what"), "{all}");
         let clean = run(vec![vec![Coord::new(0.02, 60.0), Coord::new(0.03, 60.0)]]).join(" | ");
@@ -8794,7 +8946,38 @@ mod tests {
         let m = Map(HashMap::from([("only".to_string(), only)]));
         let params = serde_json::json!({"input": "only", "crs": "EPSG:3857", "radius": 5000.0, "pixelSize": 1000.0});
         let err = crate::run("kernelDensity", &m, &params).err().unwrap_or_default();
-        assert!(err.contains("1 point(s) beyond what") && err.contains("1 multipoint member(s) were left out"), "{err}");
+        assert!(err.contains("1 point(s) beyond what") && err.contains("1 point(s) with non-finite coordinates were left out"), "{err}");
+    }
+
+    /// A multipoint's non-finite members are left out and counted when its other members are
+    /// used; a clean multipoint says nothing of the kind.
+    #[test]
+    fn kernel_density_counts_a_multipoints_non_finite_members() {
+        let run = |members: Vec<Coord>| {
+            let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+            pts.push(Some(Geometry::Point(Coord::new(0.0, 60.0))), vec![]);
+            pts.push(Some(Geometry::MultiPoint(members)), vec![]);
+            let m = Map(HashMap::from([("pts".to_string(), pts)]));
+            let params = serde_json::json!({"input": "pts", "crs": "EPSG:3857", "radius": 5000.0, "pixelSize": 1000.0});
+            crate::run("kernelDensity", &m, &params).map(|r| r.messages).unwrap_or_else(|e| vec![e])
+        };
+        let lossy = run(vec![Coord::new(0.01, 60.0), Coord::new(f64::NAN, 60.0), Coord::new(0.0, f64::INFINITY)]);
+        assert!(lossy.iter().any(|m| m.contains("from 2 points (bandwidth")), "{lossy:?}");
+        assert!(lossy.iter().all(|m| !m.contains("beyond what")), "{lossy:?}");
+        let notes: Vec<_> = lossy.iter().filter(|m| m.contains("non-finite")).collect();
+        assert!(
+            notes.len() == 1
+                && notes.iter().all(|m| m.starts_with("2 point(s) with non-finite coordinates were left out of 1 multipoint feature(s)")),
+            "{lossy:?}"
+        );
+        let unusable = run(vec![Coord::new(f64::NAN, 60.0), Coord::new(0.0, f64::INFINITY)]);
+        assert!(unusable.iter().any(|m| m.contains("from 1 points (1 skipped, bandwidth")), "{unusable:?}");
+        assert!(unusable.iter().all(|m| !m.contains("were left out of")), "{unusable:?}");
+        let clean = run(vec![Coord::new(0.01, 60.0), Coord::new(0.02, 60.0)]);
+        assert!(
+            clean.iter().any(|m| m.contains("from 3 points (bandwidth")) && clean.iter().all(|m| !m.contains("non-finite")),
+            "{clean:?}"
+        );
     }
 
     #[test]
@@ -9851,8 +10034,7 @@ mod tests {
         let gg = to_geo(&buffered);
         let ext = merc_extent(&gg);
         let n = 32;
-        let before_index =
-            n * (selector_heap_bytes(&gg) + std::mem::size_of::<(geo::Geometry<f64>, Extent)>() + std::mem::size_of::<Extent>());
+        let before_index = n * (selector_heap_bytes(&gg) + std::mem::size_of::<Selector>() + std::mem::size_of::<Extent>());
         let index_bytes = ExtentIndex::new((0..n).map(|_| ext)).storage_bytes();
         assert!(index_bytes > 0);
         let mut selectors = Dataset::new("selectors", GeometryType::Point, vec![]);
@@ -10968,7 +11150,8 @@ mod tests {
         let mut test_pts = Dataset::new("test_pts", GeometryType::Point, vec![Field::new("tag", FieldType::Text)]);
         test_pts.push(Some(Geometry::Point(Coord::new(0.5, 0.5))), vec![Value::Text("in_0".into())]);
         test_pts.push(Some(Geometry::Point(Coord::new(4.5, 4.5))), vec![Value::Text("in_24".into())]);
-        test_pts.push(Some(Geometry::Point(Coord::new(100.0, 100.0))), vec![Value::Text("far".into())]);
+        // Far outside the grid, but still a valid longitude/latitude coordinate.
+        test_pts.push(Some(Geometry::Point(Coord::new(100.0, 50.0))), vec![Value::Text("far".into())]);
 
         let m2 = Map(HashMap::from([("grid_polys".to_string(), grid_polys), ("test_pts".to_string(), test_pts)]));
 

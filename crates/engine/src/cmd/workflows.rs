@@ -27,6 +27,7 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"name"?: model (default: the last), "graph"?: run this graph instead (as model.new)}"#),
         C::new("model.validate", "Validate Model", "Analyze › Geoprocessing", |s, p| {
             let (_, g, _) = model_graph(s, p)?;
+            note_passed_graph(s, p);
             let problems = crate::model::validate(s, &g);
             Ok(json!({"ok": problems.is_empty(), "problems": problems}))
         }).roles(&[crate::ParamRole { key: "graph", role: crate::Role::ModelGraph }]).effects(crate::policy::Effects::NONE)
@@ -443,9 +444,60 @@ pub fn gallery_list(kind: &str) -> CmdResult {
     Ok(Value::Array(out))
 }
 
+/// Tells the user what a graph passed to a command lost or changed when it was read: one notice
+/// per kind, each with a count.
+fn notify_graph_dropped(s: &mut Session, dropped: crate::model::GraphDropped) {
+    if dropped.nodes > 0 {
+        s.notify(format!("model graph: {} node(s) left out: unreadable, without an id, or with the id of another", dropped.nodes), false);
+    }
+    if dropped.edges > 0 {
+        s.notify(
+            format!(
+                "model graph: {} connection(s) left out: unreadable, to a missing node or itself, without an input port, or repeating another",
+                dropped.edges
+            ),
+            false,
+        );
+    }
+    if dropped.ids > 0 {
+        s.notify(
+            format!(
+                "model graph: {} node id(s) changed: trimmed of spaces or cut to {} characters (connections naming the old id follow it)",
+                dropped.ids,
+                crate::model::MAX_NODE_ID
+            ),
+            false,
+        );
+    }
+    if dropped.positions > 0 {
+        s.notify(
+            format!("model graph: {} node position(s) changed: not a number (moved to 0, 0) or out of range (clamped)", dropped.positions),
+            false,
+        );
+    }
+    if dropped.params > 0 {
+        s.notify(format!("model graph: {} node(s) had parameters that were not an object; they were left out", dropped.params), false);
+    }
+}
+
+/// Reads the `graph` a command was passed, if any, with what reading it left out or changed. The
+/// command reports that once it succeeds, so a command that fails says nothing about it.
+fn read_graph(p: &Value) -> Result<(Option<crate::project::ModelGraph>, crate::model::GraphDropped), String> {
+    let Some(g) = p.get("graph").filter(|g| !g.is_null()) else { return Ok((None, Default::default())) };
+    let (graph, dropped) = crate::model::graph_from_json_counted(g)?;
+    Ok((Some(graph), dropped))
+}
+
+/// Says what the graph a command was passed (rather than a saved model's) lost when read.
+fn note_passed_graph(s: &mut Session, p: &Value) {
+    if let Some(Ok((_, dropped))) = p.get("graph").filter(|g| !g.is_null()).map(crate::model::graph_from_json_counted) {
+        notify_graph_dropped(s, dropped);
+    }
+}
+
 fn new_model(s: &mut Session, p: &Value) -> CmdResult {
     let base = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Model").chars().take(200).collect::<String>();
-    let graph = p.get("graph").filter(|g| !g.is_null()).map(crate::model::graph_from_json).transpose()?;
+    let (graph, dropped) = read_graph(p)?;
     let steps: Vec<ModelStep> = match p.get("steps") {
         _ if graph.is_some() => graph.as_ref().map(crate::model::graph_to_steps).unwrap_or_default(),
         Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("steps: {e}"))?,
@@ -506,6 +558,7 @@ fn new_model(s: &mut Session, p: &Value) -> CmdResult {
     }
     let n = steps.len();
     s.project.models.push(Model { name: name.clone(), steps, graph });
+    notify_graph_dropped(s, dropped);
     Ok(json!({"model": name, "steps": n}))
 }
 
@@ -637,11 +690,14 @@ fn run_model_here(s: &mut Session, p: &Value) -> CmdResult {
     }
     let (name, _, trusted) = model_graph(s, p)?;
     let op = s.authorize_model(p)?;
-    if trusted || p.get("graph").is_some_and(|g| !g.is_null()) {
-        crate::model::run(s, op)
+    let out = if trusted || p.get("graph").is_some_and(|g| !g.is_null()) {
+        crate::model::run(s, op)?
     } else {
-        s.narrowed(crate::policy::Narrow::Item { kind: "model", name }, |s| crate::model::run(s, op))?
-    }
+        s.narrowed(crate::policy::Narrow::Item { kind: "model", name }, |s| crate::model::run(s, op))??
+    };
+    // Said once the run went ahead, not for one that was refused.
+    note_passed_graph(s, p);
+    Ok(out)
 }
 
 /// The stored source and destination names used by graph saving and its provenance check.
@@ -654,7 +710,8 @@ pub(crate) fn model_save_names(p: &Value) -> Result<(String, String), String> {
 /// Saves a graph as a model, replacing the one of that name (or adding it).
 fn save_model(s: &mut Session, p: &Value) -> CmdResult {
     let (name, new_name) = model_save_names(p)?;
-    let g = crate::model::graph_from_json(p.get("graph").ok_or("graph is required")?)?;
+    let (g, dropped) = read_graph(p)?;
+    let g = g.ok_or("graph is required")?;
     let i = s.project.models.iter().position(|m| m.name.eq_ignore_ascii_case(&name));
     if !new_name.eq_ignore_ascii_case(&name) && s.project.models.iter().any(|m| m.name.eq_ignore_ascii_case(&new_name)) {
         return Err(format!("a model named '{new_name}' already exists"));
@@ -667,6 +724,7 @@ fn save_model(s: &mut Session, p: &Value) -> CmdResult {
         None => s.project.models.push(model),
     }
     s.trusted_models.remove(&name.to_ascii_lowercase());
+    notify_graph_dropped(s, dropped);
     Ok(json!({"model": new_name}))
 }
 
@@ -680,9 +738,13 @@ fn export_model(s: &mut Session, p: &Value) -> CmdResult {
     match ps(p, "path") {
         Some(path) => {
             rustgis_data::io::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
+            note_passed_graph(s, p);
             Ok(json!({"model": name, "path": path}))
         }
-        None => Ok(json!({"model": name, "fileName": format!("{file}.model.json"), "text": text})),
+        None => {
+            note_passed_graph(s, p);
+            Ok(json!({"model": name, "fileName": format!("{file}.model.json"), "text": text}))
+        }
     }
 }
 
@@ -1036,12 +1098,21 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let ds = feature_ds(s, p)?;
     let field = ps(p, "field").ok_or("field is required")?;
     let fi = ds.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
-    let pts: Vec<(Coord, f64)> = ds
-        .features
-        .iter()
-        .enumerate()
-        .filter_map(|(r, ft)| Some((ft.geometry.as_ref()?.label_point()?, ds.value(r, fi).as_f64().filter(|v| v.is_finite())?)))
-        .collect();
+    // Features without a place or a number are left out, and said (by kind, with a count).
+    let (mut no_point, mut no_value) = (0usize, 0usize);
+    let mut pts: Vec<(Coord, f64)> = Vec::with_capacity(ds.features.len());
+    for (r, ft) in ds.features.iter().enumerate() {
+        let Some(c) = ft.geometry.as_ref().and_then(|g| g.label_point()).filter(|c| c.is_finite()) else {
+            no_point += 1;
+            continue;
+        };
+        let Some(v) = ds.value(r, fi).as_f64().filter(|v| v.is_finite()) else {
+            no_value += 1;
+            continue;
+        };
+        pts.push((c, v));
+    }
+    let (layer_name, field_name) = (ds.name.clone(), field.to_string());
     let e = s.project.gp_env.extent.unwrap_or_else(|| {
         let mut e = Extent::EMPTY;
         pts.iter().for_each(|(c, _)| e.expand(*c));
@@ -1051,7 +1122,37 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
     let power = f(p, "power").unwrap_or(2.0).clamp(0.5, 10.0);
     let neighbors = p.get("neighbors").and_then(Value::as_u64).unwrap_or(12).max(1) as usize;
-    Ok(Box::new(move || made(rasterops::idw(&pts, &e, cell, power, neighbors, &name)?, None)))
+    Ok(Box::new(move || {
+        // A surface that can't be made says what was left out of it, so the input can be fixed.
+        let left_out = |e: String| {
+            let mut why = Vec::new();
+            if no_point > 0 {
+                why.push(format!("{no_point} features with no geometry or no usable point"));
+            }
+            if no_value > 0 {
+                why.push(format!("{no_value} whose value isn't a number"));
+            }
+            if why.is_empty() { e } else { format!("{e} ({} left out)", why.join(", ")) }
+        };
+        let m = made(rasterops::idw(&pts, &e, cell, power, neighbors, &name).map_err(left_out)?, None)?;
+        if no_point == 0 && no_value == 0 {
+            return Ok(m);
+        }
+        let then: Then = Box::new(move |s: &mut Session, v: &mut Value| {
+            let mut why = Vec::new();
+            if no_point > 0 {
+                why.push(format!("{no_point} with no geometry or no usable point"));
+            }
+            if no_value > 0 {
+                why.push(format!("{no_value} whose {field_name} isn't a number"));
+            }
+            s.notify(format!("{layer_name}: features left out of the surface: {}", why.join(", ")), false);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("skipped".into(), json!({"noPoint": no_point, "noValue": no_value}));
+            }
+        });
+        Ok(Made { then: Some(then), ..m })
+    }))
 }
 
 /// Creates a route layer and reports invalid source segments omitted from its network.
@@ -1088,17 +1189,27 @@ fn route(s: &mut Session, p: &Value) -> CmdResult {
 
 fn neighborhood(s: &mut Session, p: &Value) -> CmdResult {
     let at = Coord::new(f(p, "lon").ok_or("lon is required")?, f(p, "lat").ok_or("lat is required")?);
+    if !(at.x.is_finite() && at.y.abs() <= 90.0) {
+        return Err("lon must be a finite number and lat within -90 to 90".into());
+    }
     let radius = f(p, "radius").filter(|r| *r > 0.0).ok_or("radius is required (metres)")?.min(5e6);
     let only: Option<Vec<String>> =
         p.get("layers").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_ascii_lowercase)).collect());
     let mut out = Vec::new();
     let mut found: Vec<(u32, Vec<usize>)> = Vec::new();
+    let mut bounded = Vec::new();
+    let mut invalid = Vec::new();
     for l in s.map().layers.iter().filter(|l| s.map().shows(l) && !l.is_raster() && !l.graphics) {
         if only.as_ref().is_some_and(|o| !o.contains(&l.name.to_ascii_lowercase())) {
             continue;
         }
         let rows: Vec<usize> = l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect();
-        let near = network::within(&l.dataset, &rows, at, radius);
+        let report = network::within_report(&l.dataset, &rows, at, radius);
+        let (near, n) = (report.rows, report.bounded);
+        invalid.push((l.name.clone(), report.invalid_latitudes, report.missing_coordinates));
+        if n > 0 {
+            bounded.push((l.name.clone(), n));
+        }
         if near.is_empty() {
             continue;
         }
@@ -1114,6 +1225,8 @@ fn neighborhood(s: &mut Session, p: &Value) -> CmdResult {
         out.push(json!({"layer": l.name, "count": near.len(), "nearestKm": near.first().map(|x| x.1 / 1000.0), "sums": sums}));
         found.push((l.id, near.into_iter().map(|x| x.0).collect()));
     }
+    super::select::warn_bounded(s, &bounded);
+    super::select::warn_radius_input(s, &invalid);
     if b(p, "select").unwrap_or(false) {
         s.map_mut().clear_selection();
         for (id, rows) in found {

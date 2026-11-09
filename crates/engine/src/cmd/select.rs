@@ -239,15 +239,42 @@ fn by_radius(s: &mut Session, p: &Value) -> CmdResult {
     flat.validate_selection_path(&boundary)?;
     let scale = s.scale();
     let mut hits = Vec::new();
+    let mut bounded = Vec::new();
+    let mut invalid = Vec::new();
     for layer in s.map_mut().selectable_layers(scale) {
         let drawn = layer.drawn_rows(scale);
         let rows: Vec<usize> = drawn.iter().enumerate().filter_map(|(row, shown)| shown.then_some(row)).collect();
-        let rows: Vec<usize> = network::within(&layer.dataset, &rows, center, radius).into_iter().map(|(row, _)| row).collect();
+        let report = network::within_report(&layer.dataset, &rows, center, radius);
+        let (near, n) = (report.rows, report.bounded);
+        invalid.push((layer.name.clone(), report.invalid_latitudes, report.missing_coordinates));
+        if n > 0 {
+            bounded.push((layer.name.clone(), n));
+        }
+        let rows: Vec<usize> = near.into_iter().map(|(row, _)| row).collect();
         if !rows.is_empty() {
             hits.push((layer.id, rows));
         }
     }
+    warn_bounded(s, &bounded);
+    warn_radius_input(s, &invalid);
     apply_hits(s, hits, m)
+}
+
+/// One warning for the features of each layer a radius search ([`network::within_counted`])
+/// counted at a bound on their distance near a pole, with their counts (#1033); none when there are
+/// none.
+pub(crate) fn warn_bounded(s: &mut Session, bounded: &[(String, usize)]) {
+    if bounded.is_empty() {
+        return;
+    }
+    let total: usize = bounded.iter().map(|(_, n)| n).sum();
+    let layers: Vec<String> = bounded.iter().map(|(layer, n)| format!("{layer} {n}")).collect();
+    let steps = rustgis_map::graphics::thousands(network::REACH_STEPS_TOTAL as f64);
+    let longest = network::REACH_STEPS_MAX * network::REACH_STEP_DEG;
+    s.warn(format!(
+        "{total} feature(s) near a pole ({}) couldn't be measured in full (past a search's {steps} steps a layer, or along an edge over {longest}° long) and were counted at the least distance they could be: they may lie farther, even beyond the radius",
+        layers.join(", ")
+    ));
 }
 
 /// The hit count describes the query, regardless of whether its rows are added or removed.
@@ -458,12 +485,52 @@ fn feature_json(map: &rustgis_map::Map, id: u32, row: usize) -> Option<Value> {
     Some(json!({"layer": l.name, "layerId": id, "row": row, "fid": fid, "attributes": attrs}))
 }
 
+/// Reports invalid radius-search input once per kind, with counts for each layer.
+pub(crate) fn warn_radius_input(s: &mut Session, invalid: &[(String, usize, usize)]) {
+    for latitude in [true, false] {
+        let layers: Vec<String> = invalid
+            .iter()
+            .filter_map(|(name, bad, missing)| {
+                let n = if latitude { *bad } else { *missing };
+                (n > 0).then(|| format!("{name} {n}"))
+            })
+            .collect();
+        let total: usize = invalid.iter().map(|(_, bad, missing)| if latitude { *bad } else { *missing }).sum();
+        if total > 0 {
+            let why = if latitude {
+                "have a latitude past ±90° and were left out of the radius search"
+            } else {
+                "have missing or infinite coordinates; those vertices and their incident edges were left out of the radius measurement"
+            };
+            s.warn(format!("{total} feature(s) ({}) {why}", layers.join(", ")));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Project, Tool};
     use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as DataValue};
     use rustgis_geom::{lonlat_to_merc, merc_to_lonlat};
+
+    /// The pole warning states the search's limits from the constants that set them.
+    #[test]
+    fn bounded_warning_states_the_search_limits() {
+        let mut s = Session::new(Project::default());
+        let mark = s.notices_given();
+        warn_bounded(&mut s, &[("Cities".into(), 2)]);
+        let text = s.notices_since(mark).first().map(|n| n.text.as_str()).unwrap_or_default();
+        assert!(
+            text.contains("2 feature(s) near a pole (Cities 2)")
+                && text.contains(&format!(
+                    "past a search's {} steps a layer",
+                    rustgis_map::graphics::thousands(network::REACH_STEPS_TOTAL as f64)
+                ))
+                && text.contains(&format!("along an edge over {}° long", network::REACH_STEPS_MAX * network::REACH_STEP_DEG)),
+            "{text}"
+        );
+    }
 
     fn fixture() -> (Session, u32, u32) {
         let mut s = Session::new(Project::default());

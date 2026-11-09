@@ -607,6 +607,8 @@ struct PutAside {
     url_requests: Vec<UrlRequest>,
     policy_work: policy::downloads::Work,
     landed_reads: Vec<(u64, LandedRead)>,
+    #[cfg(not(target_arch = "wasm32"))]
+    landed_windows: Vec<(u64, cmd::layer::CogWindow)>,
     plugin_retries: Vec<cmd::plugins::fetch::Retry>,
     url_waits: cmd::plugins::fetch::UrlWaits,
     /// A style of the project still loading, which mustn't move the next one's view.
@@ -698,6 +700,8 @@ pub struct Session {
     /// Runtime-only: never in Project, undo or PutAside, so replacement cannot erase them.
     loss_notices: Vec<LossNotice>,
     loss_notice_overflow: u32,
+    /// Whether this session has said that native HTTPS trusts the bundled CA roots (#1591).
+    bundled_roots_said: bool,
     /// Troubleshooting history, independent of the active pane, project files and undo.
     pub diagnostics: rustgis_data::diagnostics::History,
     /// Notices given in this session, including ones no longer kept (see [`Session::notices_since`]),
@@ -812,6 +816,10 @@ pub struct Session {
     /// Downloads that landed already read (an ArcGIS layer's protocol buffer pages, joined),
     /// waiting for `layer.addDownload` too.
     pub(crate) landed_reads: Vec<(u64, LandedRead)>,
+    /// Windows of cloud-optimised GeoTIFFs the app read off the frame, waiting for
+    /// `layer.addDownload` too.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) landed_windows: Vec<(u64, cmd::layer::CogWindow)>,
     /// Downloads a command asked for where nothing may wait (the browser): the parameters of
     /// `layer.addUrl` calls, for the front end to fetch and add (see [`Session::take_url_requests`]).
     pub(crate) url_requests: Vec<UrlRequest>,
@@ -834,6 +842,8 @@ pub struct Session {
     /// While a plugin command runs again for its downloads: what each one asked for, and what
     /// adding it answered, for its `layer.addUrl` to answer once.
     pub(crate) rerun_landed: Vec<(serde_json::Value, CmdResult, cmd::plugins::fetch::Added)>,
+    /// Which of those are failures already told in this run (see [`Session::rerun_answer`]).
+    pub(crate) rerun_told: Vec<usize>,
     /// While a plugin command runs again: the errors its earlier runs said, not said again.
     pub(crate) rerun_said: Vec<String>,
     /// While plugin commands whose downloads are in run again: the downloads they wait for, still
@@ -1093,6 +1103,7 @@ impl Session {
             notices: Vec::new(),
             loss_notices: Vec::new(),
             loss_notice_overflow: 0,
+            bundled_roots_said: false,
             diagnostics: rustgis_data::diagnostics::History::default(),
             notices_given: 0,
             table_layer: None,
@@ -1142,6 +1153,8 @@ impl Session {
             downloading: Vec::new(),
             downloaded: Vec::new(),
             landed_reads: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            landed_windows: Vec::new(),
             url_requests: Vec::new(),
             file_outputs: Vec::new(),
             #[cfg(test)]
@@ -1153,6 +1166,7 @@ impl Session {
             next_request: 0,
             call_requests: None,
             rerun_landed: Vec::new(),
+            rerun_told: Vec::new(),
             rerun_said: Vec::new(),
             rerun_requests: Vec::new(),
             retry_tries: 0,
@@ -1232,6 +1246,18 @@ impl Session {
         landed
     }
 
+    /// Hands over a window of a cloud-optimised GeoTIFF read off the frame
+    /// ([`cmd::layer::read_cog_window`]), for `layer.addDownload {"id"}` as
+    /// [`Session::download_landed`] does.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn download_landed_window(&mut self, id: u64, window: cmd::layer::CogWindow) -> bool {
+        let landed = self.landed(id);
+        if landed {
+            self.landed_windows.push((id, window));
+        }
+        landed
+    }
+
     /// Takes a download off those under way: `false` when it isn't one of them (another project
     /// was opened meanwhile).
     fn landed(&mut self, id: u64) -> bool {
@@ -1248,6 +1274,12 @@ impl Session {
         let Some(i) = self.downloading.iter().position(|d| *d == id) else { return false };
         self.downloading.remove(i);
         true
+    }
+
+    /// Whether a download is still under way for this project: `false` once another project was
+    /// opened.
+    pub fn download_under_way(&self, id: u64) -> bool {
+        self.downloading.contains(&id)
     }
 
     /// Forgets a download that failed.
@@ -1269,6 +1301,17 @@ impl Session {
         self.forget_download_claim(id);
         self.downloading.retain(|d| *d != id);
         current
+    }
+
+    /// The MBTiles files the project's layers read.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn mbtiles_files(&self) -> impl Iterator<Item = &str> {
+        self.project
+            .maps
+            .iter()
+            .flat_map(|m| &m.tiles)
+            .filter(|t| t.kind == rustgis_map::TileKind::MbTiles)
+            .filter_map(|t| t.archive_file())
     }
 
     /// Runs a command as [`Session::run`] does, except that the downloads `layer.addUrl` would
@@ -1425,7 +1468,19 @@ impl Session {
             // one entry too, as it is one step to undo.
             let joins = self.merge.is_some() && self.merge == self.merged && !self.undo.is_empty();
             let (at, start) = (project_log::now_ms(), web_time::Instant::now());
+            #[cfg(not(target_arch = "wasm32"))]
+            let files_before: Vec<String> = self.mbtiles_files().map(str::to_string).collect();
             let res = run(self);
+            // Whichever command took its last layer away (removed, undone, the project closed):
+            // the file can now be moved or replaced, so what was read of it is forgotten too.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let files: Vec<&str> = self.mbtiles_files().collect();
+                for gone in files_before.iter().filter(|f| !files.contains(&f.as_str())) {
+                    render::rustgis_tiles::cache::forget(gone);
+                }
+                render::rustgis_tiles::mbtiles::close_unused(files.into_iter());
+            }
             // Pixels the command read in place (a project, an import) say what they lost.
             self.notice_landed_rasters();
             // A plugin's command waiting for its fetches answers `pending` and runs again when they
@@ -1793,6 +1848,8 @@ impl Session {
             downloading: take(&mut self.downloading),
             downloaded: take(&mut self.downloaded),
             landed_reads: take(&mut self.landed_reads),
+            #[cfg(not(target_arch = "wasm32"))]
+            landed_windows: take(&mut self.landed_windows),
             url_requests: take(&mut self.url_requests),
             policy_work: self.take_policy_work(),
             plugin_retries: take(&mut self.plugin_retries),
@@ -1846,6 +1903,8 @@ impl Session {
             downloading,
             downloaded,
             landed_reads,
+            #[cfg(not(target_arch = "wasm32"))]
+            landed_windows,
             url_requests,
             policy_work,
             plugin_retries,
@@ -1874,6 +1933,10 @@ impl Session {
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
         self.restore_policy_work(policy_work);
         self.landed_reads = landed_reads;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.landed_windows = landed_windows;
+        }
         (self.trend_results, self.raster_results, self.raster_runs) = (trend_results, raster_results, raster_runs);
         #[cfg(feature = "geolibre")]
         {
@@ -1913,6 +1976,9 @@ impl Session {
         }
         // What a header left out, as adding the layer says it (one notice a kind, with counts).
         cmd::raster::say_losses(self, lost);
+        // The browser uses its own trust; only native clients can fall back.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.notice_trust();
         if !dropped.is_empty() {
             let mut kinds: Vec<&str> = dropped.iter().flat_map(|(_, k)| k.iter().copied()).collect();
             kinds.sort_unstable();
@@ -1950,6 +2016,28 @@ impl Session {
                     false,
                 )
             }
+        }
+    }
+
+    /// Says once a session that native HTTPS trusts the bundled Mozilla roots, as a Linux or BSD
+    /// system with no CA certificates and no `SSL_CERT_FILE` or `SSL_CERT_DIR` makes it
+    /// ([`rustgis_data::http::bundled_roots`]): the trust source was assumed, not the system's.
+    /// Checked after each command and each frame, as the clients are first made when a request is.
+    /// Says, once a session, that native HTTPS fell back to the bundled CA roots, if it did. Run
+    /// with [`Session::notice_landed_rasters`]; a reader of the notices that runs no command (the
+    /// Python package) calls it first, as a client made on a background thread chooses the trust.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn notice_trust(&mut self) {
+        self.say_bundled_roots(rustgis_data::http::bundled_roots());
+    }
+
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn say_bundled_roots(&mut self, bundled: bool) {
+        if bundled && !self.bundled_roots_said {
+            self.bundled_roots_said = true;
+            self.warn(
+                "This system has no CA certificates, so HTTPS servers are checked against the Mozilla roots bundled with RustGIS: install the system's CA certificates (or set SSL_CERT_FILE or SSL_CERT_DIR) to use its trust instead",
+            );
         }
     }
 

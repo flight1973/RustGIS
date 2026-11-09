@@ -1747,6 +1747,15 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
             action = Some(("map.setTiles", json!({"index": i, "move": "down"})));
             ui.close();
         }
+        // Its raster tiles over the view, as a GeoTIFF placed on the ground.
+        // Not a vector archive (one whose source layers its header names).
+        if matches!(tile.kind, TileKind::Raster | TileKind::PmTiles | TileKind::MbTiles)
+            && sources.is_none()
+            && ui.button(tl!("Export Raster…")).clicked()
+        {
+            action = Some(("ui.exportRaster", json!({"tiles": i})));
+            ui.close();
+        }
         if tile.archive_file().is_some() && ui.button(tl!("Repair Data Source…")).clicked() {
             action = Some(("ui.dialog", json!({"name": "repairTiles", "index": i})));
             ui.close();
@@ -1960,6 +1969,7 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
                     ("renderer", tl_raw!(rl.style.renderer.label())),
                 ],
             ),
+            None if rl.error.is_none() && rl.in_place => tl!("Reading in place…").to_string(),
             None => crate::i18n::fmt(
                 "The raster's data couldn't be read: {error}",
                 &[("error", rl.error.as_deref().or(rl.path.as_deref()).unwrap_or(""))],
@@ -2877,8 +2887,9 @@ pub fn start_geolibre_load(app: &mut RustGisApp) {
     app.gp.web_load = Some(slot);
 }
 
+/// What a slot holds, taken out; a poisoned slot is still read, as its writer fills it anyway.
 fn take<T>(slot: &crate::Slot<T>) -> Option<T> {
-    slot.lock().ok().and_then(|mut s| s.take())
+    slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
 /// Picks up what the browser's GeoLibre runner finished: the tool list, or a tool run.
@@ -4254,7 +4265,7 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 let e = if text.is_empty() { Value::Null } else { json!(text) };
                 let _ = app.run("layer.symbology", json!({"type": "unique", "expression": e, "ramp": ramp.name()}));
             }
-            ramp_picker(app, ui, ramp, t);
+            ramp_picker_with(app, ui, ramp, t, !l.graphics);
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(crate::i18n::fmt("{n} classes", &[("n", &classes.len().to_string())])).size(11.5).color(t.text_dim),
@@ -4291,7 +4302,7 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                 });
             }
-            ramp_picker(app, ui, ramp, t);
+            ramp_picker_with(app, ui, ramp, t, !l.graphics);
             ui.add_space(6.0);
             legend_list(app, ui, &l, t);
         }
@@ -4709,8 +4720,26 @@ fn field_combo(app: &mut RustGisApp, ui: &mut Ui, label: &str, cur: &str, fields
 }
 
 fn ramp_picker(app: &mut RustGisApp, ui: &mut Ui, cur: &Ramp, t: &Tokens) {
+    ramp_picker_with(app, ui, cur, t, false);
+}
+
+/// The color scheme picker; `invert` adds an Invert Color Ramp button to its heading row, for a
+/// layer whose classes take their colors from the scheme (#1355).
+fn ramp_picker_with(app: &mut RustGisApp, ui: &mut Ui, cur: &Ramp, t: &Tokens, invert: bool) {
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(tl!("Color scheme")).size(11.5).color(t.text_dim));
+    let heading = egui::RichText::new(tl!("Color scheme")).size(11.5).color(t.text_dim);
+    if invert {
+        ui.horizontal(|ui| {
+            ui.label(heading);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(tl!("Invert Color Ramp")).on_hover_text(tl!("Reverse the order of the classes' colors.")).clicked() {
+                    let _ = app.run("layer.invertRamp", json!({}));
+                }
+            });
+        });
+    } else {
+        ui.label(heading);
+    }
     let grid = |app: &mut RustGisApp, ui: &mut Ui, id: &str, ramps: Vec<Ramp>| {
         // Two to a row, in the width left inside the group's indent.
         let w = (ui.available_width() - 8.0) / 2.0;
@@ -6417,7 +6446,12 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
     ui.label(egui::RichText::new(&l.name).font(semibold(14.0)));
     let Some(rl) = l.raster.clone() else { return };
     let Some(d) = rl.data.clone() else {
-        ui.label(egui::RichText::new(tl!("The raster's data couldn't be read.")).color(t.red));
+        // Read in place, its overview is on its way until it lands, or fails (as Details says).
+        if rl.error.is_none() && rl.in_place {
+            ui.label(egui::RichText::new(tl!("Reading in place…")).color(t.text_dim));
+        } else {
+            ui.label(egui::RichText::new(tl!("The raster's data couldn't be read.")).color(t.red));
+        }
         return;
     };
     let style = rl.style.clone();
@@ -6909,6 +6943,24 @@ pub(crate) fn layout_menu(app: &mut RustGisApp, ui: &mut Ui, n: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slot poisoned by a panicking writer that filled it anyway is still read, or the pane
+    /// waiting on it would wait forever.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_poisoned_slot_is_still_taken() {
+        let slot: crate::Slot<u32> = crate::Slot::default();
+        let writer = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let mut held = writer.lock().unwrap();
+            *held = Some(7);
+            panic!("the writer fails after filling the slot");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+        assert_eq!(take(&slot), Some(7));
+        assert_eq!(take(&slot), None, "taken once");
+    }
 
     /// Run starts a built-in tool on a thread of its own: the pane shows it running, with Cancel,
     /// and its result lands as gp.run's would, with its layer and history.
