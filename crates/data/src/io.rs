@@ -553,15 +553,16 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
             #[cfg(not(target_arch = "wasm32"))]
             {
                 crate::progress::begin(ds.features.len());
-                let table = if ds.features.iter().any(|f| off_kind(f, ds.geometry_type)) {
+                let kind = gpkg_kind(ds);
+                let table = if kind != ds.geometry_type || ds.features.iter().any(|f| off_kind(f, kind)) {
                     // What the table can't hold is left out as the rest is handed over, in runs
                     // borrowed from the layer, so a large one isn't copied.
                     let mut feed = |add: &mut dyn FnMut(&[crate::Feature]) -> Result<()>| -> Result<()> {
                         // An export that starts again hands the features over again.
-                        left_out = feed_of_kind(&ds.features, ds.geometry_type, add)?;
+                        left_out = feed_of_kind(&ds.features, kind, add)?;
                         Ok(())
                     };
-                    crate::source::gpkg::write_features_in(&ds.name, ds.geometry_type, &ds.fields, path, crs, gpkg, &mut feed)?
+                    crate::source::gpkg::write_features_in(&ds.name, kind, &ds.fields, path, crs, gpkg, &mut feed)?
                 } else {
                     crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?
                 };
@@ -2572,13 +2573,25 @@ pub(crate) fn feed_of_kind(
 /// fail the projection. `None` when every feature fits.
 #[cfg(not(target_arch = "wasm32"))]
 fn of_its_kind(ds: &Dataset) -> (Option<Dataset>, usize) {
-    let n = ds.features.iter().filter(|f| off_kind(f, ds.geometry_type)).count();
+    let kind = gpkg_kind(ds);
+    let n = ds.features.iter().filter(|f| off_kind(f, kind)).count();
     if n == 0 {
         return (None, 0);
     }
     let mut kept = ds.clone();
-    kept.features.retain(|f| !off_kind(f, ds.geometry_type));
+    kept.features.retain(|f| !off_kind(f, kind));
     (Some(kept), n)
+}
+
+/// The kind of geometry a GeoPackage table of `ds` holds: its type, or, for a layer that
+/// declares none but carries geometry, its first geometry's (as a streamed export takes it), so
+/// that geometry isn't dropped for want of a column.
+#[cfg(not(target_arch = "wasm32"))]
+fn gpkg_kind(ds: &Dataset) -> GeometryType {
+    match ds.geometry_type {
+        GeometryType::None => ds.features.iter().find_map(|f| f.geometry.as_ref()).map_or(GeometryType::None, Geometry::kind),
+        t => t,
+    }
 }
 
 /// Whether [`shapefile_parts_in`] writes a feature with geometry `g` to a layer of type `gt`: one
@@ -2779,6 +2792,16 @@ mod tests {
         }
         let utm = Crs::from_epsg(32618).ok_or("no UTM zone 18N")?;
         assert_eq!(write_path_in(&far, &dir.path().join("far.gpkg"), utm)?, 1);
+        // A layer that declares no geometry type but carries geometry takes its first geometry's
+        // (as a streamed export does): a polygon table, the point left out, nothing dropped silently.
+        let mut typeless = mixed.clone();
+        typeless.geometry_type = GeometryType::None;
+        let at = dir.path().join("typeless.gpkg");
+        assert_eq!(write_path(&typeless, &at)?, 1);
+        let conn = rusqlite::Connection::open(&at)?;
+        let kind: String = conn.query_row("SELECT geometry_type_name FROM gpkg_geometry_columns", [], |r| r.get(0))?;
+        let rows: i64 = conn.query_row(r#"SELECT count(*) FROM "mixed" WHERE "geom" IS NOT NULL"#, [], |r| r.get(0))?;
+        assert_eq!((kind.as_str(), rows), ("MULTIPOLYGON", 1));
         // One kind: nothing left out.
         let mut areas = mixed.clone();
         areas.features.retain(|f| !matches!(f.geometry, Some(Geometry::Point(_))));

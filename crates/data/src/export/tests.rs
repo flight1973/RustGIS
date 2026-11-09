@@ -399,3 +399,26 @@ fn a_streamed_geopackage_leaves_out_geometry_of_another_kind() {
     assert_eq!(read_back(&a).features, read_back(&b).features);
     assert!(read_back(&a).features.iter().all(|f| f.geometry.as_ref().is_none_or(|g| g.kind() == GeometryType::Polygon)));
 }
+
+/// A layer that declares no geometry type but carries geometry exports to the same GeoPackage
+/// streamed as whole: a table of its first geometry's kind, with the others left out and counted.
+#[test]
+fn a_typeless_layer_exports_the_same_geopackage_streamed_or_whole() {
+    let d = folder("typeless");
+    let mut ds = squares();
+    ds.name = "typeless".into();
+    ds.geometry_type = GeometryType::None;
+    if let Some(f) = ds.features.get_mut(3) {
+        f.geometry = Some(Geometry::Point(Coord::new(3.0, 1.0)));
+    }
+    let layer = Dataset::new(ds.name.clone(), ds.geometry_type, ds.fields.clone());
+    let (a, b) = (d.join("streamed.gpkg"), d.join("whole.gpkg"));
+    assert_eq!(write_chunks_in(&Runs::new(&ds, 4), &layer, &a, Crs::LonLat, 1).unwrap().left_out, 1);
+    assert_eq!(crate::io::write_path(&ds, &b).unwrap(), 1);
+    let kind = |p: &Path| {
+        let c = rusqlite::Connection::open(p).unwrap();
+        c.query_row("SELECT geometry_type_name FROM gpkg_geometry_columns", [], |r| r.get::<_, String>(0)).unwrap()
+    };
+    assert_eq!((kind(&a), kind(&b)), ("MULTIPOLYGON".to_string(), "MULTIPOLYGON".to_string()));
+    assert_eq!(read_back(&a).features, read_back(&b).features);
+}
