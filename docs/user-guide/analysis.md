@@ -611,6 +611,12 @@ field), empty ones included. Selections in both layers are honoured.
 gp.run={"tool":"split","params":{"input":"roads","split":"districts","field":"name"}}
 ```
 
+Clip, Erase, Intersect, Identity, Union, Symmetrical Difference, Update and Split leave out a
+feature of the clip, erase, overlay, update or split layer that covers nothing, and say how many:
+one without geometry, a point or line in the polygon layer (as Minimum Bounding Geometry's flat
+hulls are), an empty polygon, or a polygon with no area. Clip leaves out any polygon with no area;
+the others leave out one whose parts, two or more, all have no area, and keep a single such part.
+
 **Near** (`near`) copies `input` and adds, for each feature, the nearest feature of `near`: its OID
 as the attribute table shows it (`near_fid`), the distance to it (`near_dist`, in `units`,
 Kilometers by default) and the point on it nearest the input feature (`near_x` and `near_y`, in
@@ -782,8 +788,9 @@ writing no hull for it; if every feature is skipped, it is an error. A latitude 
 taken as that pole. A hull with no area is written as what it is: a point for points in one place,
 or the line between the two farthest apart for points on one straight line on the map. The layer is
 a point or line layer when every hull is one, and the tool says so; otherwise it's a polygon layer
-holding any points and lines among its polygons. Dissolve leaves those out, saying how many; as
-Clip masks they cover nothing; a Shapefile export leaves them out, saying how many; and a
+holding any points and lines among its polygons. Dissolve leaves those out, saying how many; so
+do Clip and the overlay tools when the layer is their mask or overlay; a Shapefile export leaves
+them out, saying how many; and a
 GeoPackage export keeps them in a column that holds any kind of geometry. It says how many of
 each.
 
