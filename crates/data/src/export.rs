@@ -99,8 +99,6 @@ fn write_chunks_to(
     // left out, and counted, before it's projected, so one left out can't fail the projection.
     #[cfg(not(target_arch = "wasm32"))]
     let gpkg_kinds = ext == "gpkg";
-    #[cfg(target_arch = "wasm32")]
-    let gpkg_kinds = false;
     let mut off_kind = 0usize;
     let mut feed = |add: &mut dyn FnMut(&[Feature]) -> Result<()>| -> Result<()> {
         // A GeoPackage export that starts again feeds the features again, and counts them again.
