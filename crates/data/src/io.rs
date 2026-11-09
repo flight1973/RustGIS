@@ -545,9 +545,11 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
         "gpkg" => {
             #[cfg(not(target_arch = "wasm32"))]
             {
+                let (kept, left_out) = of_its_kind(ds);
+                let ds = kept.as_ref().unwrap_or(ds);
                 crate::progress::begin(ds.features.len());
                 let table = crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?;
-                Ok((0, Some(table)))
+                Ok((left_out, Some(table)))
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -2516,6 +2518,25 @@ fn dbf_boolean(value: &Value) -> Option<bool> {
     }
 }
 
+/// A dataset as a GeoPackage table holds it: geometry of one kind, the layer's (its column's
+/// declared type). A feature of another kind, as a mixed layer can hold (a GeoJSON of points and
+/// polygons, say), is left out and counted, as a Shapefile leaves it out; one without geometry
+/// stays, as a table holds it. `None` when every feature already fits, so nothing is copied.
+#[cfg(not(target_arch = "wasm32"))]
+fn of_its_kind(ds: &Dataset) -> (Option<Dataset>, usize) {
+    if ds.geometry_type == GeometryType::None {
+        return (None, 0);
+    }
+    let off = |f: &crate::Feature| f.geometry.as_ref().is_some_and(|g| g.kind() != ds.geometry_type);
+    let n = ds.features.iter().filter(|f| off(f)).count();
+    if n == 0 {
+        return (None, 0);
+    }
+    let mut kept = ds.clone();
+    kept.features.retain(|f| !off(f));
+    (Some(kept), n)
+}
+
 /// Whether [`shapefile_parts_in`] writes a feature with geometry `g` to a layer of type `gt`: one
 /// of the layer's kind with something drawable (a finite point, a line part of two finite points,
 /// a polygon whose outer ring has three).
@@ -2681,6 +2702,36 @@ pub(crate) fn group_rings(rings: Vec<(Vec<Coord>, bool)>) -> Geometry {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A GeoPackage column holds the layer's one kind of geometry: a layer read from a GeoJSON of
+    /// a polygon and a point (declared a polygon layer) writes the polygon and leaves the point out,
+    /// counted, as a Shapefile does; a feature without geometry stays, as a table holds it. A layer
+    /// of one kind loses nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_geopackage_leaves_out_geometry_of_another_kind() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let geojson = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","properties":{"name":"area"},"geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}},
+            {"type":"Feature","properties":{"name":"spot"},"geometry":{"type":"Point","coordinates":[5,5]}},
+            {"type":"Feature","properties":{"name":"none"},"geometry":null}]}"#;
+        let (mixed, _) = read_geojson(geojson, "mixed")?;
+        assert_eq!(mixed.geometry_type, GeometryType::Polygon);
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("mixed.gpkg");
+        assert_eq!(write_path(&mixed, &path)?, 1);
+        // The rows written, read with SQL: the polygon, and the feature without geometry.
+        let conn = rusqlite::Connection::open(&path)?;
+        let mut rows = conn.prepare(r#"SELECT "name", "geom" IS NULL FROM "mixed" ORDER BY "fid""#)?;
+        let written: Vec<(String, bool)> = rows.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+        assert_eq!(written, [("area".to_string(), false), ("none".to_string(), true)]);
+        let (back, _) = read_path(&path)?;
+        assert!(back.features.iter().all(|f| f.geometry.as_ref().is_none_or(|g| g.kind() == GeometryType::Polygon)));
+        // One kind: nothing left out.
+        let mut areas = mixed.clone();
+        areas.features.retain(|f| !matches!(f.geometry, Some(Geometry::Point(_))));
+        assert_eq!(write_path(&areas, &dir.path().join("areas.gpkg"))?, 0);
+        Ok(())
+    }
 
     /// Exercises caller cleanup through the public Shapefile writer, one fresh process per collision.
     #[cfg(not(target_arch = "wasm32"))]

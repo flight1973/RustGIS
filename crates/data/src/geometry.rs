@@ -789,6 +789,9 @@ mod tests {
         // The same NaN point written once with 0 and once with −0 still closes the ring.
         let signed = vec![Coord::new(f64::NAN, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(f64::NAN, -0.0)];
         assert_eq!(Geometry::Polygon(vec![vec![signed]]).vertices().len(), 3);
+        // And the other way round: a signed zero in x, the NaN in y.
+        let mirrored = vec![Coord::new(0.0, f64::NAN), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(-0.0, f64::NAN)];
+        assert_eq!(Geometry::Polygon(vec![vec![mirrored]]).vertices().len(), 3);
     }
 
     #[test]

@@ -761,8 +761,10 @@ over a vertex with a coordinate missing or infinite, or so far out the hull can'
 about 9 million degrees), and skips a feature without geometry or with no point left to enclose,
 writing no hull for it; if every feature is skipped, it is an error. A latitude past a pole is
 taken as that pole. A hull with no area is written as what it is: a point for points in one place,
-or the line between the two farthest apart for points on one straight line on the map. It says how
-many of each.
+or the line between the two farthest apart for points on one straight line on the map. The layer is
+a point or line layer when every hull is one; otherwise it's a polygon layer holding any points and
+lines among its polygons, which a Shapefile or GeoPackage export leaves out, saying how many. It
+says how many of each.
 
 **Dissolve** (`dissolve`) merges the polygons sharing a value of `field` into one feature for
 each value, or all of them into one without a field. Each feature has the value and `count`, the
