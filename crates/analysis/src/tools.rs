@@ -2242,8 +2242,29 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         picked.iter().filter_map(|&r| ds.features.get(r).and_then(|f| Some((f, f.geometry.as_ref()?)))).collect();
     // Features skipped: no geometry, or no point the hull can use.
     let mut skipped = picked.len().saturating_sub(features.len());
-    // A hull with no area: a single point's, or points in one place or along one line.
+    // A hull with no area isn't a polygon (its ring would have fewer than the four positions one
+    // needs): points in one place have a point for their hull, and points on one line the segment
+    // between the two farthest apart, so it's written as that point or line. Those two are found by
+    // taking the point farthest from any one of them, then the point farthest from that.
     let is_flat = |hull: &geo::Polygon<f64>| geo::Area::unsigned_area(hull) == 0.0;
+    let shape = |hull: geo::Polygon<f64>, flat: &mut usize| {
+        if !is_flat(&hull) {
+            return from_multipolygon(&MultiPolygon::new(vec![hull]));
+        }
+        *flat += 1;
+        let ring = &hull.exterior().0;
+        let farthest = |from: geo::Coord<f64>| {
+            ring.iter().copied().fold((from, 0.0), |(best, d), c| {
+                let dc = (c.x - from.x).hypot(c.y - from.y);
+                if dc > d { (c, dc) } else { (best, d) }
+            })
+        };
+        let first = *ring.first()?;
+        let (a, _) = farthest(first);
+        let (b, span) = farthest(a);
+        let back = |c: geo::Coord<f64>| rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y));
+        Some(if span > 0.0 { Geometry::Line(vec![vec![back(a), back(b)]]) } else { Geometry::Point(back(a)) })
+    };
     let (mut flat, mut gaps, mut poles) = (0usize, 0usize, 0usize);
     if each {
         // Each feature's hull made on several cores for many (#1252), placed in their order.
@@ -2266,8 +2287,7 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
                 skipped += 1;
                 continue;
             };
-            flat += usize::from(is_flat(&hull));
-            out.push(from_multipolygon(&MultiPolygon::new(vec![hull])), f.attrs.clone());
+            out.push(shape(hull, &mut flat), f.attrs.clone());
         }
     } else {
         // All together; `count` is the features hulled, those with a point to give. With none,
@@ -2286,30 +2306,28 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         }
         if hulled > 0 {
             let hull = geo::MultiPoint::new(pts).convex_hull();
-            flat += usize::from(is_flat(&hull));
-            out.push(from_multipolygon(&MultiPolygon::new(vec![hull])), vec![Value::Int(i64::try_from(hulled).unwrap_or(i64::MAX))]);
+            out.push(shape(hull, &mut flat), vec![Value::Int(i64::try_from(hulled).unwrap_or(i64::MAX))]);
         }
     }
-    // Nothing hulled, every feature skipped: an unusable result, so an error saying why.
+    let gaps_note = (gaps > 0).then(|| {
+        format!("{gaps} vertex(es) passed over: a coordinate missing or infinite, or so far out that the hull can't take it (past about 9 million degrees)")
+    });
+    let poles_note = (poles > 0).then(|| format!("{poles} vertex(es) with a latitude past a pole found (taken as that pole)"));
+    // Nothing hulled, every feature skipped: an unusable result, so an error saying why, with the
+    // vertices it passed over.
     if out.features.is_empty() && skipped > 0 {
-        return Err(format!("Minimum Bounding Geometry: none of the {} feature(s) has a point it can hull", picked.len()));
+        let why = gaps_note.iter().chain(poles_note.iter()).map(|n| format!("; {n}")).collect::<String>();
+        return Err(format!("Minimum Bounding Geometry: none of the {} feature(s) has a point it can hull{why}", picked.len()));
     }
     let n = out.features.len();
     let mut r = result(out, format!("Minimum Bounding Geometry: {n} hulls"))?;
     if skipped > 0 {
         r.messages.push(format!("Minimum Bounding Geometry: {skipped} feature(s) skipped: no geometry, or no point it can use"));
     }
-    if gaps > 0 {
-        r.messages.push(format!(
-            "Minimum Bounding Geometry: {gaps} vertex(es) passed over: a coordinate missing or infinite, or so far out that the hull can't take it (past about 9 million degrees)"
-        ));
-    }
-    if poles > 0 {
-        r.messages.push(format!("Minimum Bounding Geometry: {poles} vertex(es) with a latitude past a pole found (taken as that pole)"));
-    }
+    r.messages.extend(gaps_note.into_iter().chain(poles_note).map(|n| format!("Minimum Bounding Geometry: {n}")));
     if flat > 0 {
         r.messages.push(format!(
-            "Minimum Bounding Geometry: {flat} of {n} hulls have no area: a single point, or points in one place or on one straight line on the map (on one meridian or parallel, say; beyond 85.05° that includes points around a pole, which enclose a cap on the ground)"
+            "Minimum Bounding Geometry: {flat} of {n} hulls have no area, so they are written as a point or a line: a single point, or points in one place or on one straight line on the map (on one meridian or parallel, say; beyond 85.05° that includes points around a pole, which enclose a cap on the ground)"
         ));
     }
     Ok(r)
@@ -8542,11 +8560,40 @@ mod tests {
         assert_eq!(note(&layer(&spread, false), "All"), None);
         assert_eq!(note(&layer(&spread, true), "None"), None);
         let note_single = note(&layer(&spread, false), "None").unwrap_or_default();
-        assert!(note_single.contains(": 5 of 5 hulls have no area: a single point"), "{note_single}");
+        assert!(
+            note_single.contains(": 5 of 5 hulls have no area, so they are written as a point or a line: a single point"),
+            "{note_single}"
+        );
         // Features stacked in one place, together, have a hull with no area, and say so.
         let stacked = [(10.0, 20.0), (10.0, 20.0), (10.0, 20.0)];
         let note_stacked = note(&layer(&stacked, false), "All").unwrap_or_default();
         assert!(note_stacked.contains(": 1 of 1 hulls have no area"), "{note_stacked}");
+        // A hull with no area is written as what it is (its ring would have fewer than the four
+        // positions a polygon needs): a point for points in one place, the segment between the
+        // farthest two for points on one line. A hull with area keeps a closed ring.
+        let geoms = |m: &Map, group: &str| {
+            let res = crate::run("convexHull", m, &serde_json::json!({"input": "pts", "group": group})).unwrap_or_else(|e| panic!("{e}"));
+            let Output::Layer(out) = res.output else { panic!("not a layer") };
+            out.features.into_iter().map(|f| f.geometry).collect::<Vec<_>>()
+        };
+        let singles = geoms(&layer(&spread, false), "None");
+        assert!(singles.len() == 5 && singles.iter().all(|g| matches!(g, Some(Geometry::Point(_)))), "{singles:?}");
+        let near = |a: Coord, b: (f64, f64)| (a.x - b.0).abs() < 1e-9 && (a.y - b.1).abs() < 1e-9;
+        assert!(matches!(geoms(&layer(&stacked, false), "All").first(), Some(Some(Geometry::Point(c))) if near(*c, (10.0, 20.0))));
+        // The polar points on 89°N, as the analysis plane draws them: from 90°W to 180°.
+        let each = geoms(&layer(&polar, true), "None");
+        let ends = match each.first() {
+            Some(Some(Geometry::Line(parts))) => parts.first().cloned().unwrap_or_default(),
+            _ => vec![],
+        };
+        let mut lons: Vec<f64> = ends.iter().map(|c| c.x).collect();
+        lons.sort_by(f64::total_cmp);
+        assert!(ends.len() == 2 && near(Coord::new(lons[0], ends[0].y), (-90.0, 89.0)) && (lons[1] - 180.0).abs() < 1e-9, "{each:?}");
+        let ring_len = |g: &Option<Geometry>| match g {
+            Some(Geometry::Polygon(p)) => p.first().and_then(|rings| rings.first()).map_or(0, Vec::len),
+            _ => 0,
+        };
+        assert!(each.get(1).map_or(0, ring_len) >= 4, "{each:?}");
     }
 
     /// Minimum Bounding Geometry passes over a vertex with a coordinate missing or infinite, which
@@ -8588,7 +8635,7 @@ mod tests {
         }
         for group in ["All", "None"] {
             let err = run(vec![Some(Geometry::Point(gap)), None], group).err().unwrap_or_default();
-            assert!(err.contains("none of the 2 feature(s) has a point it can hull"), "{group}: {err}");
+            assert!(err.contains("none of the 2 feature(s) has a point it can hull; 1 vertex(es) passed over"), "{group}: {err}");
         }
         // A ring with one vertex too far out, its closing point the same: one vertex passed over.
         let far_ring = Geometry::Polygon(vec![vec![vec![

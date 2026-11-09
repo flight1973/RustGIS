@@ -768,6 +768,24 @@ mod tests {
         assert!(polygon_contains(&[square(0.0, 0.0, 10.0), square(4.0, 4.0, 2.0)], lp));
     }
 
+    /// A polygon ring that starts and ends on the same NaN point is closed on it (NaN equals
+    /// nothing as a number, so it's matched by its bits): its last point isn't a vertex of its own,
+    /// so every ring reader sees four vertices and four edges, and deleting the first vertex keeps
+    /// the ring closed on the next one. A line with the same ends isn't a ring: all three count.
+    #[test]
+    fn a_ring_closed_on_a_nan_point_counts_it_once() {
+        let gap = Coord::new(f64::NAN, 0.0);
+        let ring = vec![gap, Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 1.0), gap];
+        let g = Geometry::Polygon(vec![vec![ring]]);
+        assert_eq!((g.vertices().len(), g.edges().len()), (4, 4));
+        let Ok(Geometry::Polygon(after)) = g.delete_vertex(VertexId { part: 0, ring: 0, index: 0 }) else { panic!("not deleted") };
+        let ring = after.first().and_then(|rings| rings.first()).cloned().unwrap_or_default();
+        assert_eq!(ring.len(), 4);
+        assert_eq!((ring.first(), ring.last()), (Some(&Coord::new(1.0, 0.0)), Some(&Coord::new(1.0, 0.0))));
+        let line = Geometry::Line(vec![vec![gap, Coord::new(1.0, 0.0), gap]]);
+        assert_eq!(line.vertices().len(), 3);
+    }
+
     #[test]
     fn line_hit_and_box() {
         let g = Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(10.0, 0.0)]]);

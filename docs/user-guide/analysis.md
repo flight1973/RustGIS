@@ -760,8 +760,9 @@ Option `None`), or all of them in one (`All`, with `count`, the features it encl
 over a vertex with a coordinate missing or infinite, or so far out the hull can't take it (past
 about 9 million degrees), and skips a feature without geometry or with no point left to enclose,
 writing no hull for it; if every feature is skipped, it is an error. A latitude past a pole is
-taken as that pole. It says how many of each, and how many hulls have no area (a single point, or
-points in one place or on one line on the map).
+taken as that pole. A hull with no area is written as what it is: a point for points in one place,
+or the line between the two farthest apart for points on one straight line on the map. It says how
+many of each.
 
 **Dissolve** (`dissolve`) merges the polygons sharing a value of `field` into one feature for
 each value, or all of them into one without a field. Each feature has the value and `count`, the
