@@ -1281,11 +1281,10 @@ fn result(ds: Dataset, msg: String) -> Result<ToolResult, String> {
     Ok(ToolResult { output: Output::Layer(ds), messages: vec![msg] })
 }
 
-/// A feature's polygons, or none when it has no polygon to give: no geometry, an empty polygon,
-/// or a point or line, which a polygon layer can hold (Minimum Bounding Geometry writes its flat
-/// hulls so).
-fn polygon_of(f: Option<&Feature>) -> Option<MultiPolygon<f64>> {
-    f.and_then(|f| f.geometry.as_ref()).and_then(to_multipolygon).filter(|mp| mp.0.iter().any(|p| !p.exterior().0.is_empty()))
+/// A geometry's polygons, or none when it has no polygon to give: an empty polygon, or a point
+/// or line, which a polygon layer can hold (Minimum Bounding Geometry writes its flat hulls so).
+fn polygon_of(g: &Geometry) -> Option<MultiPolygon<f64>> {
+    to_multipolygon(g).filter(|mp| mp.0.iter().any(|p| !p.exterior().0.is_empty()))
 }
 
 /// The notice for the `n` features of `layer` that `tool` left out of its masks or overlay
@@ -1294,9 +1293,22 @@ fn no_polygon_note(tool: &str, layer: &str, n: usize, what: &str) -> Option<Stri
     (n > 0).then(|| format!("{tool}: {n} feature(s) of '{layer}' left out, covering nothing: {what}"))
 }
 
-/// What a feature [`overlay_zones`] leaves out holds: [`polygon_of`] gives nothing for it, or
-/// its parts, unioned, have no area.
-const NO_POLYGON: &str = "no geometry, a point or line, an empty polygon, or several parts with no area";
+/// The error when `tool` would leave out every one of the `n` features of `layer` it was given
+/// (`what` lists what they hold): its output would be empty, or its input unchanged.
+fn nothing_covered(tool: &str, layer: &str, n: usize, what: &str) -> String {
+    format!("{tool}: none of the {n} feature(s) of '{layer}' covers anything: {what}")
+}
+
+/// What a feature [`overlay_zones`] leaves out holds: no geometry, or a geometry [`polygon_of`]
+/// gives nothing for.
+const NO_POLYGON: &str = "no geometry, a point or line, or an empty polygon";
+
+/// What a mask Clip leaves out holds: [`NO_POLYGON`], or polygons whose union has no area.
+const NO_MASK: &str = "no geometry, a point or line, or a polygon with no area";
+
+/// What an overlay feature Union and Symmetrical Difference leave out of their output holds,
+/// though it is a zone: parts whose union (see [`mask_of`]) has no area.
+const NO_AREA: &str = "two or more polygon parts, all with no area";
 
 /// A copy of a feature's attributes for an output with the same schema.
 fn copy_schema(ds: &Dataset, name: String, g: GeometryType) -> Dataset {
@@ -1604,13 +1616,13 @@ fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let mut masks = Vec::new();
     // Mask features that clip nothing, left out and counted: no polygon, or one with no area.
     let mut no_mask = 0usize;
-    let mask_rows = rows(inp, p, "clip", clip_ds);
+    let mask_rows = each_once(rows(inp, p, "clip", clip_ds));
     crate::control::begin(mask_rows.len());
     for (done, r) in mask_rows.into_iter().enumerate() {
         // Each mask is a union: Cancel is looked at, and progress counted, before each.
         crate::control::check()?;
         crate::control::reached(done);
-        let Some(m) = polygon_of(clip_ds.features.get(r)) else {
+        let Some(m) = clip_ds.features.get(r).and_then(|f| f.geometry.as_ref()).and_then(polygon_of) else {
             no_mask += 1;
             continue;
         };
@@ -1624,6 +1636,9 @@ fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         } else {
             masks.push((mask, ext));
         }
+    }
+    if masks.is_empty() && no_mask > 0 {
+        return Err(nothing_covered("Clip", &clip_ds.name, no_mask, NO_MASK));
     }
     let index = ExtentIndex::new(masks.iter().map(|(_, ext)| *ext));
     // The masks reaching each pole: a point at one is in them at any longitude (#1033).
@@ -1679,7 +1694,7 @@ fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     }
     let n = out.features.len();
     let mut r = result(out, format!("Clip: {n} features kept"))?;
-    r.messages.extend(no_polygon_note("Clip", &clip_ds.name, no_mask, "no geometry, a point or line, or a polygon with no area"));
+    r.messages.extend(no_polygon_note("Clip", &clip_ds.name, no_mask, NO_MASK));
     Ok(r)
 }
 
@@ -1692,9 +1707,7 @@ fn erase(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     if ds.geometry_type == GeometryType::None {
         return Err(format!("'{}' has no geometry", ds.name));
     }
-    let zs = overlay_zones(inp, p, "erase")?;
-    let left_out = zs.note("Erase");
-    let OverlayZones { layer: er, zones, .. } = zs;
+    let (er, zones, left_out) = overlay_zones(inp, p, "erase", "Erase")?;
     let index = ExtentIndex::new(zones.iter().map(|z| z.ext));
     let at_poles = AtPoles::new(zones.iter().map(|z| poles(&z.ext)));
     let mut out = copy_schema(ds, out_name(p, format!("{}_Erase", ds.name)), ds.geometry_type);
@@ -1711,7 +1724,7 @@ fn erase(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     }
     let n = out.features.len();
     let mut r = result(out, format!("Erase: {n} features remain"))?;
-    r.messages.extend(left_out);
+    r.messages.extend(no_polygon_note("Erase", &er.name, left_out, NO_POLYGON));
     Ok(r)
 }
 
@@ -1730,45 +1743,36 @@ fn mask_of(poly: MultiPolygon<f64>) -> MultiPolygon<f64> {
     if poly.0.len() > 1 { union_all(poly.0.iter()) } else { poly.orient(Direction::Default) }
 }
 
-/// The polygon layer of an overlay tool's parameter `k` (`overlay`, `erase`, `update`, `split`),
-/// which must be polygons, and its (selected) features with a polygon as [`Zone`]s, in order; the
-/// others ([`NO_POLYGON`]) are counted for the tool's notice.
-fn overlay_zones<'a>(inp: &'a dyn Inputs, p: &Json, k: &str) -> Result<OverlayZones<'a>, String> {
+/// The polygon layer of `tool`'s parameter `k` (`overlay`, `erase`, `update`, `split`), which
+/// must be polygons, its (selected) features with a polygon as [`Zone`]s, in order, each once, and
+/// how many it left out ([`NO_POLYGON`]), for the tool's notice. Leaving out every one is an error.
+fn overlay_zones<'a>(inp: &'a dyn Inputs, p: &Json, k: &str, tool: &str) -> Result<(&'a Dataset, Vec<Zone>, usize), String> {
     let ov = input(inp, p, k)?;
     if ov.geometry_type != GeometryType::Polygon {
         return Err(format!("'{}' is not a polygon layer", ov.name));
     }
     // A zone of several parts is a union: Cancel is looked at, and progress counted, before each.
-    let zone_rows = rows(inp, p, k, ov);
+    let zone_rows = each_once(rows(inp, p, k, ov));
     crate::control::begin(zone_rows.len());
     let mut zones = Vec::with_capacity(zone_rows.len());
     let mut no_polygon = 0usize;
     for (done, row) in zone_rows.into_iter().enumerate() {
         crate::control::check()?;
         crate::control::reached(done);
-        let f = ov.features.get(row);
-        // Parts are unioned (see [`mask_of`]): several with no area between them come out empty.
-        match (polygon_of(f).map(mask_of), f.and_then(|f| f.geometry.as_ref())) {
-            (Some(poly), Some(g)) if !poly.0.is_empty() => zones.push(Zone { row, ext: g.extent(), poly }),
-            _ => no_polygon += 1,
-        }
+        let Some(g) = ov.features.get(row).and_then(|f| f.geometry.as_ref()) else {
+            no_polygon += 1;
+            continue;
+        };
+        let Some(poly) = polygon_of(g) else {
+            no_polygon += 1;
+            continue;
+        };
+        zones.push(Zone { row, ext: g.extent(), poly: mask_of(poly) });
     }
-    Ok(OverlayZones { layer: ov, zones, no_polygon })
-}
-
-/// The overlay polygons [`overlay_zones`] gives, from `layer`, and how many of its features it
-/// left out for having no polygon ([`polygon_of`]).
-struct OverlayZones<'a> {
-    layer: &'a Dataset,
-    zones: Vec<Zone>,
-    no_polygon: usize,
-}
-
-impl OverlayZones<'_> {
-    /// The notice for the features left out, for `tool`'s result.
-    fn note(&self, tool: &str) -> Option<String> {
-        no_polygon_note(tool, &self.layer.name, self.no_polygon, NO_POLYGON)
+    if zones.is_empty() && no_polygon > 0 {
+        return Err(nothing_covered(tool, &ov.name, no_polygon, NO_POLYGON));
     }
+    Ok((ov, zones, no_polygon))
 }
 
 /// An overlay tool's output layer: the input's fields, then the overlay's, an overlay field whose
@@ -1937,9 +1941,7 @@ fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String
     if op.keeps_overlay_rest() && ds.geometry_type != GeometryType::Polygon {
         return Err(format!("'{}' is not a polygon layer", ds.name));
     }
-    let zs = overlay_zones(inp, p, "overlay")?;
-    let left_out = zs.note(op.name());
-    let OverlayZones { layer: ov, zones, .. } = zs;
+    let (ov, zones, left_out) = overlay_zones(inp, p, "overlay", op.name())?;
     let index = ExtentIndex::new(zones.iter().map(|z| z.ext));
     let at_poles = AtPoles::new(zones.iter().map(|z| poles(&z.ext)));
     let mut out = overlay_schema(ds, ov, out_name(p, format!("{}_{}", ds.name, op.suffix())), ds.geometry_type);
@@ -1974,11 +1976,17 @@ fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String
             out.push_next(Some(rest), overlay_row(ds, Some(&f.attrs), ov, None));
         }
     }
+    // Zones whose parts union to nothing: no part of them, nor their values, reaches the output.
+    let mut no_area = 0usize;
     if op.keeps_overlay_rest() {
         crate::control::begin(zones.len());
         for (done, (z, inputs)) in zones.iter().zip(&covering).enumerate() {
             crate::control::check()?;
             crate::control::reached(done);
+            if z.poly.0.is_empty() {
+                no_area += 1;
+                continue;
+            }
             let rest = if inputs.is_empty() {
                 from_multipolygon(&z.poly)
             } else {
@@ -1993,7 +2001,8 @@ fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String
     }
     let n = out.features.len();
     let mut r = result(out, format!("{}: {n} features", op.name()))?;
-    r.messages.extend(left_out);
+    r.messages.extend(no_polygon_note(op.name(), &ov.name, left_out, NO_POLYGON));
+    r.messages.extend(no_polygon_note(op.name(), &ov.name, no_area, NO_AREA));
     Ok(r)
 }
 
@@ -2063,9 +2072,7 @@ fn update(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     if ds.geometry_type != GeometryType::Polygon {
         return Err(format!("'{}' is not a polygon layer", ds.name));
     }
-    let zs = overlay_zones(inp, p, "update")?;
-    let left_out = zs.note("Update");
-    let OverlayZones { layer: up, zones, .. } = zs;
+    let (up, zones, left_out) = overlay_zones(inp, p, "update", "Update")?;
     // Each input field's field in the update layer, if it has one: an ambiguous one fails here,
     // before any geometry work.
     let from = ds
@@ -2112,7 +2119,7 @@ fn update(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     }
     let added = out.features.len() - kept;
     let mut r = result(out, format!("Update: {kept} input features kept, {added} update features added"))?;
-    r.messages.extend(left_out);
+    r.messages.extend(no_polygon_note("Update", &up.name, left_out, NO_POLYGON));
     Ok(r)
 }
 
@@ -2151,9 +2158,7 @@ fn split(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     if ds.geometry_type == GeometryType::None {
         return Err(format!("'{}' has no geometry", ds.name));
     }
-    let zs = overlay_zones(inp, p, "split")?;
-    let left_out = zs.note("Split");
-    let OverlayZones { layer: sp, zones, .. } = zs;
+    let (sp, zones, left_out) = overlay_zones(inp, p, "split", "Split")?;
     // A field name, or none; anything else is an error, not one layer per polygon.
     let field = match p.get("field") {
         None | Some(Json::Null) => None,
@@ -2238,7 +2243,10 @@ fn split(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         let areas = if empty == 1 { "split area" } else { "split areas" };
         msg = format!("{msg} ({empty} {areas} held no features)");
     }
-    Ok(ToolResult { output: Output::Layers(layers), messages: std::iter::once(msg).chain(left_out).collect() })
+    Ok(ToolResult {
+        output: Output::Layers(layers),
+        messages: std::iter::once(msg).chain(no_polygon_note("Split", &sp.name, left_out, NO_POLYGON)).collect(),
+    })
 }
 
 /// Dissolve: one feature for each value of the dissolve field (one for all without it), the union
@@ -2268,7 +2276,7 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     for (done, r) in input_rows.into_iter().enumerate() {
         crate::control::check()?;
         crate::control::reached(done);
-        let Some(mp) = polygon_of(ds.features.get(r)) else {
+        let Some(mp) = ds.features.get(r).and_then(|f| f.geometry.as_ref()).and_then(polygon_of) else {
             not_polygons += 1;
             continue;
         };
@@ -2482,9 +2490,9 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             GeometryType::Point => "the output is a point layer".to_string(),
             GeometryType::Polyline => "the output is a line layer".to_string(),
             // Points and lines, every hull flat: a polygon layer, there being no one kind.
-            _ if flat >= n => "they are kept in the output's polygon layer, points and lines together, where Dissolve, Clip and the overlay tools leave them out, saying how many".to_string(),
+            _ if flat >= n => "they are kept in the output's polygon layer, points and lines together, where Dissolve leaves them out, as do Clip and the overlay tools from a mask or overlay layer, saying how many".to_string(),
             _ => format!(
-                "they are kept in the output's polygon layer, among its {} polygon(s), where Dissolve, Clip and the overlay tools leave them out, saying how many",
+                "they are kept in the output's polygon layer, among its {} polygon(s), where Dissolve leaves them out, as do Clip and the overlay tools from a mask or overlay layer, saying how many",
                 n.saturating_sub(flat)
             ),
         };
@@ -6938,9 +6946,10 @@ mod tests {
 
     /// Clip and the overlay tools say how many mask or overlay features they left out as covering
     /// nothing: a point and a line in a polygon layer (as Minimum Bounding Geometry's flat hulls
-    /// are), empty polygons, a feature without geometry and one of two parts with no area, and for
-    /// Clip a single polygon with no area too. Those change nothing in the output; a layer of
-    /// polygons says nothing of the kind, and only the selected features are counted.
+    /// are), empty polygons and a feature without geometry; Clip also a polygon with no area, and
+    /// Union and Symmetrical Difference one of two parts with no area. Those change nothing in the
+    /// output; a layer of polygons says nothing of the kind; only the selected features are
+    /// counted, each once; and leaving out every one is an error.
     #[test]
     fn overlay_tools_count_mask_features_that_cover_nothing() {
         struct Sel(Map, Option<Vec<usize>>);
@@ -6970,7 +6979,10 @@ mod tests {
                 masks.push(Some(Geometry::Polygon(vec![])), vec![Value::Int(13)]);
                 masks.push(Some(Geometry::Polygon(vec![vec![]])), vec![Value::Int(14)]);
                 masks.push(None, vec![Value::Int(15)]);
-                masks.push(Some(Geometry::Polygon(vec![vec![flat(1.0)], vec![flat(1.5)]])), vec![Value::Int(16)]);
+                // Update writes an update polygon as it is, so one with no area changes its output.
+                if tool != "update" {
+                    masks.push(Some(Geometry::Polygon(vec![vec![flat(1.0)], vec![flat(1.5)]])), vec![Value::Int(16)]);
+                }
                 if tool == "clip" {
                     masks.push(Some(Geometry::Polygon(vec![vec![flat(1.0)]])), vec![Value::Int(17)]);
                 }
@@ -7001,24 +7013,32 @@ mod tests {
             ("update", "update", "Update"),
             ("split", "split", "Split"),
         ];
-        let note = |name: &str, n: usize| {
-            let what = if name == "Clip" {
-                "no geometry, a point or line, or a polygon with no area"
-            } else {
-                "no geometry, a point or line, an empty polygon, or several parts with no area"
-            };
-            format!("{name}: {n} feature(s) of 'masks' left out, covering nothing: {what}")
-        };
+        let note = |name: &str, n: usize, what: &str| format!("{name}: {n} feature(s) of 'masks' left out, covering nothing: {what}");
         for (tool, key, name) in tools {
             let (clean, none) = run(tool, key, false, None);
             assert!(none.is_empty(), "{tool}: {none:?}");
             let (shapes, notes) = run(tool, key, true, None);
             assert_eq!(shapes, clean, "{tool}: the features covering nothing change nothing");
-            assert_eq!(notes, [note(name, if tool == "clip" { 7 } else { 6 })], "{tool}");
-            // The square and the point and line selected: only those two are counted.
-            let (shapes, notes) = run(tool, key, true, Some(vec![0, 1, 2]));
+            let expected = match tool {
+                "clip" => vec![note(name, 7, NO_MASK)],
+                "union" | "symmetricalDifference" => vec![note(name, 5, NO_POLYGON), note(name, 1, NO_AREA)],
+                _ => vec![note(name, 5, NO_POLYGON)],
+            };
+            assert_eq!(notes, expected, "{tool}");
+            // The square, and the point and line twice over, selected: those two are counted once.
+            let (shapes, notes) = run(tool, key, true, Some(vec![0, 1, 2, 2, 1]));
             assert_eq!(shapes, clean, "{tool}: selected");
-            assert_eq!(notes, [note(name, 2)], "{tool}: selected");
+            let what = if tool == "clip" { NO_MASK } else { NO_POLYGON };
+            assert_eq!(notes, [note(name, 2, what)], "{tool}: selected");
+            // The point and line alone: nothing would be clipped or cut by, an error saying why.
+            let mut points = Dataset::new("masks", GeometryType::Polygon, vec![]);
+            points.push(Some(Geometry::Point(Coord::new(6.0, 1.0))), vec![]);
+            points.push(None, vec![]);
+            let mut polys = Dataset::new("polys", GeometryType::Polygon, vec![]);
+            polys.push(Some(sq(0.0, 0.0, 2.0)), vec![]);
+            let m = Map(HashMap::from([("polys".to_string(), polys), ("masks".to_string(), points)]));
+            let e = crate::run(tool, &m, &serde_json::json!({"input": "polys", key: "masks"})).err().unwrap_or_default();
+            assert_eq!(e, format!("{name}: none of the 2 feature(s) of 'masks' covers anything: {what}"), "{tool}");
         }
     }
 
@@ -10333,6 +10353,8 @@ mod tests {
                 .is_some()
         );
         for selection in [None, Some((0..80).filter(|i| i % 3 != 0).collect()), Some(vec![82]), Some(vec![83])] {
+            // Mask 83 has no geometry.
+            let without_geometry = selection == Some(vec![83]);
             let mut selected = HashMap::new();
             if let Some(s) = selection {
                 selected.insert("masks".into(), s);
@@ -10340,6 +10362,12 @@ mod tests {
             }
             let inp = Selected(indexed_overlay_inputs(), selected);
             let p = serde_json::json!({"input":"features", "clip":"masks"});
+            if without_geometry {
+                // Nothing to clip by: an error saying why, not an empty layer.
+                let e = crate::run("clip", &inp, &p).err().unwrap_or_default();
+                assert!(e.contains("none of the 1 feature(s) of 'masks' covers anything"), "{e}");
+                continue;
+            }
             let masks = &inp.0.0["masks"];
             let polys: Vec<_> = rows(&inp, &p, "clip", masks)
                 .iter()
