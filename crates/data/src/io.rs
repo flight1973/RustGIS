@@ -534,18 +534,27 @@ pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
 pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> Result<(usize, Option<GpkgWritten>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let reprojects = crs != Crs::LonLat && PROJECTED_FORMATS.contains(&ext.as_str());
-    // A GeoPackage export to be projected leaves out what its table can't hold first, so a
-    // feature left out can't fail the projection (which copies the layer anyway).
+    // Features a GeoPackage table can't hold, left out before projecting.
     #[cfg(not(target_arch = "wasm32"))]
-    let (kept, mut left_out) = if ext == "gpkg" && reprojects { of_its_kind(ds) } else { (None, 0) };
-    #[cfg(not(target_arch = "wasm32"))]
-    let ds = kept.as_ref().unwrap_or(ds);
+    let mut left_out = 0usize;
     let projected;
     let ds = if !reprojects {
         ds
     } else {
         check_projected(&ext, crs)?;
-        projected = project(ds, crs)?;
+        // Projected into one copy of the layer. A GeoPackage export leaves out what its table
+        // can't hold first, so a feature left out can't fail the projection.
+        let mut out = ds.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        if ext == "gpkg" {
+            let kind = gpkg_kind(ds);
+            let before = out.features.len();
+            out.features.retain(|f| !off_kind(f, kind));
+            left_out = before - out.features.len();
+        }
+        let t = crs.transformer().map_err(DataError::Format)?;
+        project_features(&mut out.features, &t, crs)?;
+        projected = out;
         &projected
     };
     match ext.as_str() {
@@ -557,9 +566,11 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
                 let table = if kind != ds.geometry_type || ds.features.iter().any(|f| off_kind(f, kind)) {
                     // What the table can't hold is left out as the rest is handed over, in runs
                     // borrowed from the layer, so a large one isn't copied.
+                    // Added to any left out before a projection.
+                    let before = left_out;
                     let mut feed = |add: &mut dyn FnMut(&[crate::Feature]) -> Result<()>| -> Result<()> {
                         // An export that starts again hands the features over again.
-                        left_out = feed_of_kind(&ds.features, kind, add)?;
+                        left_out = before + feed_of_kind(&ds.features, kind, add)?;
                         Ok(())
                     };
                     crate::source::gpkg::write_features_in(&ds.name, kind, &ds.fields, path, crs, gpkg, &mut feed)?
@@ -2540,7 +2551,7 @@ fn dbf_boolean(value: &Value) -> Option<bool> {
 /// GeoJSON of points and polygons, say), is left out and counted, as a Shapefile leaves it out;
 /// one without geometry fits, as a table holds it.
 #[cfg(not(target_arch = "wasm32"))]
-fn off_kind(f: &crate::Feature, kind: GeometryType) -> bool {
+pub(crate) fn off_kind(f: &crate::Feature, kind: GeometryType) -> bool {
     kind != GeometryType::None && f.geometry.as_ref().is_some_and(|g| g.kind() != kind)
 }
 
@@ -2554,6 +2565,10 @@ pub(crate) fn feed_of_kind(
 ) -> Result<usize> {
     let (mut start, mut left_out) = (0usize, 0usize);
     for (i, f) in features.iter().enumerate() {
+        // A large layer's scan stops on a cancel.
+        if i % 65_536 == 0 {
+            crate::progress::check()?;
+        }
         if off_kind(f, kind) {
             if start < i {
                 add(features.get(start..i).unwrap_or_default())?;
@@ -2566,21 +2581,6 @@ pub(crate) fn feed_of_kind(
         add(features.get(start..).unwrap_or_default())?;
     }
     Ok(left_out)
-}
-
-/// `ds` with the features a GeoPackage table of its type can't hold left out, and how many: for
-/// an export about to be projected, which copies the layer anyway, so a feature left out can't
-/// fail the projection. `None` when every feature fits.
-#[cfg(not(target_arch = "wasm32"))]
-fn of_its_kind(ds: &Dataset) -> (Option<Dataset>, usize) {
-    let kind = gpkg_kind(ds);
-    let n = ds.features.iter().filter(|f| off_kind(f, kind)).count();
-    if n == 0 {
-        return (None, 0);
-    }
-    let mut kept = ds.clone();
-    kept.features.retain(|f| !off_kind(f, kind));
-    (Some(kept), n)
 }
 
 /// The kind of geometry a GeoPackage table of `ds` holds: its type, or, for a layer that
@@ -2802,6 +2802,10 @@ mod tests {
         let kind: String = conn.query_row("SELECT geometry_type_name FROM gpkg_geometry_columns", [], |r| r.get(0))?;
         let rows: i64 = conn.query_row(r#"SELECT count(*) FROM "mixed" WHERE "geom" IS NOT NULL"#, [], |r| r.get(0))?;
         assert_eq!((kind.as_str(), rows), ("MULTIPOLYGON", 1));
+        // Projected too, the count of what was left out before the projection holds.
+        let mut typeless_far = far.clone();
+        typeless_far.geometry_type = GeometryType::None;
+        assert_eq!(write_path_in(&typeless_far, &dir.path().join("typeless-far.gpkg"), utm)?, 1);
         // One kind: nothing left out.
         let mut areas = mixed.clone();
         areas.features.retain(|f| !matches!(f.geometry, Some(Geometry::Point(_))));

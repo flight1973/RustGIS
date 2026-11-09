@@ -422,3 +422,25 @@ fn a_typeless_layer_exports_the_same_geopackage_streamed_or_whole() {
     assert_eq!((kind(&a), kind(&b)), ("MULTIPOLYGON".to_string(), "MULTIPOLYGON".to_string()));
     assert_eq!(read_back(&a).features, read_back(&b).features);
 }
+
+/// A projected streamed GeoPackage export leaves out geometry of another kind before projecting
+/// each chunk, as the whole export does: points UTM zone 31N can't place (on the other side of
+/// the world from its central meridian, 3°E) don't fail the export of the squares.
+#[test]
+fn a_projected_streamed_geopackage_leaves_out_before_projecting() {
+    let d = folder("mixed-projected");
+    let mut mixed = squares();
+    mixed.name = "mixed".into();
+    for i in [2usize, 7] {
+        if let Some(f) = mixed.features.get_mut(i) {
+            f.geometry = Some(Geometry::Point(Coord::new(-177.0, 0.0)));
+        }
+    }
+    let utm = Crs::from_epsg(32631).unwrap();
+    let layer = Dataset::new(mixed.name.clone(), mixed.geometry_type, mixed.fields.clone());
+    let (a, b) = (d.join("streamed.gpkg"), d.join("whole.gpkg"));
+    let streamed = write_chunks_in(&Runs::new(&mixed, 4), &layer, &a, utm, 1).unwrap();
+    assert_eq!((streamed.left_out, streamed.written), (2, 299));
+    assert_eq!(crate::io::write_path_in(&mixed, &b, utm).unwrap(), 2);
+    assert_eq!(read_back(&a).features.len(), read_back(&b).features.len());
+}
