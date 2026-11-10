@@ -2278,9 +2278,20 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 /// latitude past ±90° is taken as the pole.)
 const HULL_LIMIT_M: f64 = 1e12;
 
-/// Minimum Bounding Geometry. Cancel is looked at per feature, before its points are gathered (and
-/// its hull made, one hull each); gathering one feature's points, and making its hull, are steps
-/// without a look, as is the one hull of all features' points with `group` All.
+/// Minimum Bounding Geometry. Cancel is looked at per feature, before its points are gathered and
+/// its hull made; gathering one feature's points, and making its hull, are steps without a look,
+/// as is, with `group` All, the one hull of the features' hull points.
+/// The points of the convex hull of `pts`: its ring's, none for none. The hull of several sets'
+/// hull points is the hull of all their points, as a point that is a corner of the whole hull is
+/// one of its own set's hull too; Minimum Bounding Geometry with `group` All hulls each feature
+/// apart and keeps only these.
+fn hull_points(pts: Vec<geo::Point<f64>>) -> Vec<geo::Point<f64>> {
+    if pts.is_empty() {
+        return pts;
+    }
+    geo::MultiPoint::new(pts).convex_hull().exterior().points().collect()
+}
+
 fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let each = s(p, "group") == "None";
@@ -2365,12 +2376,26 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         }
     } else {
         // All together; `count` is the features hulled, those with a point to give. With none,
-        // no hull is written, as one feature each. Each feature's points gathered on several
-        // cores for many, Cancel looked at and progress counted per feature, placed in order.
+        // no hull is written, as one feature each. Each feature hulled apart on several cores for
+        // many, Cancel looked at and progress counted per feature, keeping only its hull's points
+        // ([`hull_points`]): the hull of those is the hull of all, from far fewer points.
         crate::control::begin(features.len());
-        let gathered = crate::parallel::try_map(&features, PARALLEL_FEATURES, || (), |_, _, (_, g)| Ok::<_, String>(points(g)))?;
+        let gathered = crate::parallel::try_map(
+            &features,
+            PARALLEL_FEATURES,
+            || (),
+            |_, _, (_, g)| {
+                let (these, passed, past) = points(g);
+                Ok::<_, String>((hull_points(these), passed, past))
+            },
+        )?;
+        // The rest isn't counted: the count ends, so a Cancel in it isn't said to come near the
+        // end. Cancel is looked at per feature as their points are put together, then before the
+        // one hull, which is a step without a look.
+        crate::control::begin(0);
         let (mut pts, mut hulled) = (Vec::new(), 0usize);
         for (these, passed, past) in gathered {
+            crate::control::check()?;
             gaps += passed;
             poles += past;
             if these.is_empty() {
@@ -2380,10 +2405,7 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             }
             pts.extend(these);
         }
-        // The one hull of all the points isn't counted, nor looked at inside: Cancel is looked at
-        // before it, and the count ends, so a Cancel during it isn't said to come near the end.
         crate::control::check()?;
-        crate::control::begin(0);
         if hulled > 0 {
             match shape(geo::MultiPoint::new(pts).convex_hull(), &mut flat) {
                 Some(g) => out.push(Some(g), vec![Value::Int(i64::try_from(hulled).unwrap_or(i64::MAX))]),
@@ -10176,6 +10198,55 @@ mod tests {
             for (a, b) in a.iter().zip(&b) {
                 assert!((a.x - b.x).abs() < 0.1 && (a.y - b.y).abs() < 0.1, "{got:?} vs {want:?}");
             }
+        }
+    }
+
+    /// The hull of each set's hull points is the hull of all the points, exactly: the same corners,
+    /// in the same direction (its ring may start at another corner), for random clouds, points on a
+    /// line, repeated points and single points, in sets of every size.
+    #[test]
+    fn the_hull_of_hull_points_is_the_hull_of_all() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            // A value in [-1e7, 1e7), on a coarse grid so points repeat and fall on lines.
+            f64::from(u32::try_from(seed >> 44).unwrap_or(0) % 2001) * 1e4 - 1e7
+        };
+        for round in 0..200 {
+            let sets: Vec<Vec<geo::Point<f64>>> = (0..1 + round % 7)
+                .map(|k| {
+                    let n = (round * 3 + k) % 12;
+                    (0..n)
+                        .map(|i| match (round + k) % 4 {
+                            // On one line, or one point over and over.
+                            0 => geo::Point::new(f64::from(u32::try_from(i).unwrap_or(0)) * 5.0, 7.0),
+                            1 => geo::Point::new(3.0, -2.0),
+                            _ => geo::Point::new(next(), next()),
+                        })
+                        .collect()
+                })
+                .collect();
+            let all: Vec<geo::Point<f64>> = sets.iter().flatten().copied().collect();
+            if all.is_empty() {
+                continue;
+            }
+            let hulls: Vec<geo::Point<f64>> = sets.into_iter().flat_map(hull_points).collect();
+            // A ring's corners from its least one, the closing repeat left off.
+            let corners = |hull: geo::Polygon<f64>| {
+                let mut ring: Vec<(f64, f64)> = hull.exterior().0.iter().map(|c| (c.x, c.y)).collect();
+                ring.pop();
+                let start =
+                    ring.iter().enumerate().min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal)).map_or(0, |(i, _)| i);
+                ring.rotate_left(start);
+                ring
+            };
+            assert_eq!(
+                corners(geo::MultiPoint::new(hulls).convex_hull()),
+                corners(geo::MultiPoint::new(all).convex_hull()),
+                "round {round}"
+            );
         }
     }
 
