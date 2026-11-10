@@ -1621,7 +1621,9 @@ fn part(g: &Geometry, mask: &MultiPolygon<f64>, inside: bool) -> Option<Geometry
 /// Clip each input feature to the union of only the selected clip polygons whose projected
 /// extents meet it. Union candidates together so overlapping masks never duplicate output.
 /// Cancel is looked at, and progress counted, mask by mask and feature by feature; one mask's
-/// union, and one feature's overlay, can't be stopped once started (#1562).
+/// union, and one feature's overlay, can't be stopped once started (#1562). Masks with no polygon,
+/// or whose union has no area, are left out and counted (a mask selected twice is used once);
+/// with none left, it's an error.
 fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let clip_ds = input(inp, p, "clip")?;
@@ -1810,7 +1812,13 @@ enum ZoneMade {
 /// unless `use_` is [`ZoneUse::AsIs`], those of several parts whose union is empty ([`NO_AREA`]),
 /// as they cover nothing. A polygon of one part is only oriented, its edges kept exactly, so one
 /// with no area stays a zone, as it always has.
-fn overlay_zones<'a>(inp: &'a dyn Inputs, p: &Json, k: &str, tool: &str, use_: ZoneUse) -> Result<(&'a Dataset, Vec<Zone>, LeftOut), String> {
+fn overlay_zones<'a>(
+    inp: &'a dyn Inputs,
+    p: &Json,
+    k: &str,
+    tool: &str,
+    use_: ZoneUse,
+) -> Result<(&'a Dataset, Vec<Zone>, LeftOut), String> {
     overlay_zones_on(inp, p, k, tool, use_, None)
 }
 
@@ -2263,7 +2271,8 @@ fn split_key(v: &Value) -> String {
 /// [`MAX_SPLIT_NAME`] characters, control characters dropped); one with no value is named by its
 /// id, as is one whose value is blank once its control characters are dropped. A name the map
 /// already has gets a number when the layer is added. Layers left with no features are left out;
-/// selections in both layers count.
+/// selections in both layers count. Split features left out by [`overlay_zones`] are counted; with
+/// none left, it's an error.
 fn split(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     if ds.geometry_type == GeometryType::None {

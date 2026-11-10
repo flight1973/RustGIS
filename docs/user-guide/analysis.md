@@ -792,9 +792,8 @@ or the line between the two farthest apart for points on one straight line on th
 a point or line layer when every hull is one, and the tool says so; otherwise it's a polygon layer
 holding any points and lines among its polygons. Dissolve leaves those out, saying how many; so
 do Clip and the overlay tools when the layer is their mask or overlay; a Shapefile export leaves
-them out, saying how many; and a
-GeoPackage export keeps them in a column that holds any kind of geometry. It says how many of
-each.
+them out, saying how many; and a GeoPackage export keeps them in a column that holds any kind of
+geometry. It says how many of each.
 
 **Dissolve** (`dissolve`) merges the polygons sharing a value of `field` into one feature for
 each value, or all of them into one without a field. Each feature has the value and `count`, the
