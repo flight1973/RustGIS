@@ -560,8 +560,8 @@ overlay must be polygons. An overlay field whose name the input already has gets
 Overlapping features within one layer are not split against each other. Like Clip and Erase, the
 overlay works on the map's Web Mercator coordinates, so the parts' edges are straight on the map
 within ±85.05° (beyond it, see **Near the poles** above).
-Selections in both layers are honoured. To measure each part, run Calculate Geometry Attributes on
-the result:
+Selections in both layers are honoured, and a row selected twice is used once, so its parts come out
+once. To measure each part, run Calculate Geometry Attributes on the result:
 
 ```text
 gp.run={"tool":"intersect","params":{"input":"parcels","overlay":"floodplain","output":"parcels_in_floodplain"}}
