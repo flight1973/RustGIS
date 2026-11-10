@@ -2278,9 +2278,6 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 /// latitude past ±90° is taken as the pole.)
 const HULL_LIMIT_M: f64 = 1e12;
 
-/// Minimum Bounding Geometry. Cancel is looked at per feature, before its points are gathered and
-/// its hull made; gathering one feature's points, and making its hull, are steps without a look,
-/// as is, with `group` All, the one hull of the features' hull points.
 /// The points of the convex hull of `pts`: its ring's, none for none. The hull of several sets'
 /// hull points is the hull of all their points, as a point that is a corner of the whole hull is
 /// one of its own set's hull too; Minimum Bounding Geometry with `group` All hulls each feature
@@ -2292,6 +2289,9 @@ fn hull_points(pts: Vec<geo::Point<f64>>) -> Vec<geo::Point<f64>> {
     geo::MultiPoint::new(pts).convex_hull().exterior().points().collect()
 }
 
+/// Minimum Bounding Geometry. Cancel is looked at per feature, before its points are gathered and
+/// its hull made; gathering one feature's points, and making its hull, are steps without a look,
+/// as is, with `group` All, the one hull of the features' hull points.
 fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let each = s(p, "group") == "None";
@@ -8874,6 +8874,26 @@ mod tests {
             _ => 0,
         };
         assert!(each.get(1).map_or(0, ring_len) >= 4, "{each:?}");
+    }
+
+    /// With Group: All, points of several features on one parallel make one line, between the two
+    /// farthest apart, whichever feature each comes from and in either direction.
+    #[test]
+    fn grouped_hull_of_points_on_a_line_is_the_line_between_the_ends() {
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+        for lon in [20.0, 10.0, 30.0, 25.0, 15.0] {
+            pts.push(Some(Geometry::Point(Coord::new(lon, 0.0))), vec![]);
+        }
+        let m = Map(HashMap::from([("pts".to_string(), pts)]));
+        let res = crate::run("convexHull", &m, &serde_json::json!({"input": "pts", "group": "All"})).unwrap_or_else(|e| panic!("{e}"));
+        let out = layer(res);
+        let Some(Some(Geometry::Line(parts))) = out.features.first().map(|f| f.geometry.clone()) else { panic!("{:?}", out.features) };
+        let mut ends: Vec<(f64, f64)> = parts.iter().flatten().map(|c| (c.x, c.y)).collect();
+        ends.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(ends.len(), 2, "{parts:?}");
+        let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+        assert!(near(ends[0], (10.0, 0.0)) && near(ends[1], (30.0, 0.0)), "{ends:?}");
+        assert_eq!(out.value(0, 0), &Value::Int(5));
     }
 
     /// Minimum Bounding Geometry passes over a vertex with a coordinate missing or infinite, which
