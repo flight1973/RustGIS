@@ -1293,7 +1293,7 @@ fn nothing_covered(tool: &str, layer: &str, left: LeftOut) -> String {
     let what = match (left.no_polygon, left.no_area) {
         (_, 0) => NO_POLYGON.to_string(),
         (0, _) => NO_AREA.to_string(),
-        (a, b) => format!("{a} with no polygon ({NO_POLYGON}), {b} {NO_AREA}"),
+        (a, b) => format!("{a} with no polygon ({NO_POLYGON}), {b} with no area"),
     };
     format!("{tool}: none of the {} feature(s) of '{layer}' covers anything: {what}", left.no_polygon + left.no_area)
 }
@@ -7115,8 +7115,8 @@ mod tests {
                 masks.push(Some(Geometry::Polygon(vec![])), vec![Value::Int(13)]);
                 masks.push(Some(Geometry::Polygon(vec![vec![]])), vec![Value::Int(14)]);
                 masks.push(None, vec![Value::Int(15)]);
-                // Update writes an update polygon as it is, so one with no area changes its output;
-                // the other overlay tools keep one part with no area as a polygon, as it is.
+                // Update writes an update polygon as it is, so this one would change its output;
+                // the others leave it out, counted.
                 if tool != "update" {
                     // Two polygons, each a ring on a line.
                     masks.push(Some(Geometry::Polygon(vec![vec![flat(1.0)], vec![flat(1.5)]])), vec![Value::Int(16)]);
@@ -7208,7 +7208,7 @@ mod tests {
         both.push(Some(Geometry::Polygon(vec![vec![flat(1.0)]])), vec![]);
         assert_eq!(
             run("clip", "clip", both, None).err().unwrap_or_default(),
-            format!("Clip: none of the 2 feature(s) of 'masks' covers anything: 1 with no polygon ({NO_POLYGON}), 1 {NO_AREA}")
+            format!("Clip: none of the 2 feature(s) of 'masks' covers anything: 1 with no polygon ({NO_POLYGON}), 1 with no area")
         );
     }
 

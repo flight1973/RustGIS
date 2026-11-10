@@ -617,7 +617,8 @@ without geometry, a point or line in the polygon layer (as Minimum Bounding Geom
 are), or an empty polygon. Clip also leaves out a mask whose polygons, unioned, have no area, and
 the others a feature of several parts that, unioned, come to nothing (Update writes it as it is),
 saying how many. When none of the features of that layer is left, Clip, Intersect and Split, whose
-result would be empty, stop with an error.
+result would be empty, stop with an error. In all of them, a feature selected twice in that layer is
+used once.
 
 **Near** (`near`) copies `input` and adds, for each feature, the nearest feature of `near`: its OID
 as the attribute table shows it (`near_fid`), the distance to it (`near_dist`, in `units`,
@@ -793,7 +794,7 @@ a point or line layer when every hull is one, and the tool says so; otherwise it
 holding any points and lines among its polygons. Dissolve leaves those out, saying how many; so
 do Clip and the overlay tools when the layer is their mask or overlay; a Shapefile export leaves
 them out, saying how many; and a GeoPackage export keeps them in a column that holds any kind of
-geometry. It says how many of each.
+geometry. The tool says how many hulls have no area.
 
 **Dissolve** (`dissolve`) merges the polygons sharing a value of `field` into one feature for
 each value, or all of them into one without a field. Each feature has the value and `count`, the
