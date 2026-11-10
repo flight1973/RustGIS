@@ -2278,6 +2278,9 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 /// latitude past ±90° is taken as the pole.)
 const HULL_LIMIT_M: f64 = 1e12;
 
+/// Minimum Bounding Geometry. Cancel is looked at per feature, as each one's points are gathered
+/// (and its hull made, one hull each); the one hull of all features' points, with `group` All, is
+/// a single step without a look.
 fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let each = s(p, "group") == "None";
@@ -2306,8 +2309,7 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         (these, gaps, poles)
     };
     // Each row once, however often a selection lists it, in the selection's order.
-    let mut seen = std::collections::HashSet::new();
-    let picked: Vec<usize> = rows(inp, p, "input", ds).into_iter().filter(|r| seen.insert(*r)).collect();
+    let picked = each_once(rows(inp, p, "input", ds));
     // The features with a geometry, each with it; the rest are left out, and counted.
     let features: Vec<(&Feature, &Geometry)> =
         picked.iter().filter_map(|&r| ds.features.get(r).and_then(|f| Some((f, f.geometry.as_ref()?)))).collect();
@@ -2364,8 +2366,13 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     } else {
         // All together; `count` is the features hulled, those with a point to give. With none,
         // no hull is written, as one feature each.
+        // Cancel is looked at, and progress counted, per feature; the one hull of all their
+        // points is a single step without a look.
         let (mut pts, mut hulled) = (Vec::new(), 0usize);
-        for (_, g) in &features {
+        crate::control::begin(features.len());
+        for (done, (_, g)) in features.iter().enumerate() {
+            crate::control::check()?;
+            crate::control::reached(done);
             let (these, passed, past) = points(g);
             gaps += passed;
             poles += past;
@@ -8982,7 +8989,7 @@ mod tests {
         crate::run_with("buffer", &m, &serde_json::json!({"input": "pts", "distance": 100.0}), &control).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(control.progress(), Some((40, 40)));
         // The same control for a tool that doesn't count shows no count, not the buffers'.
-        crate::run_with("convexHull", &m, &serde_json::json!({"input": "pts"}), &control).unwrap_or_else(|e| panic!("{e}"));
+        crate::run_with("featureVerticesToPoints", &m, &serde_json::json!({"input": "pts"}), &control).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(control.progress(), None);
         // Dissolved, the union after the buffers isn't counted: the buffers' count ends before it.
         let dissolve = serde_json::json!({"input": "pts", "distance": 100.0, "dissolve": "All"});
