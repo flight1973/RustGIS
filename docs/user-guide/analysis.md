@@ -612,11 +612,11 @@ gp.run={"tool":"split","params":{"input":"roads","split":"districts","field":"na
 ```
 
 Clip, Erase, Intersect, Identity, Union, Symmetrical Difference, Update and Split leave out a
-feature of the clip, erase, overlay, update or split layer that covers nothing, and say how many:
-one without geometry, a point or line in the polygon layer (as Minimum Bounding Geometry's flat
-hulls are), an empty polygon, or a polygon with no area, such as rings on a line (one that crosses
-itself covers its loops). Update keeps a polygon with no area, as it writes its update polygons as
-they are. When Clip, Intersect or Split has none left, so that its result would be empty, it stops
+feature of the clip, erase, overlay, update or split layer with no polygon, and say how many: one
+without geometry, a point or line in the polygon layer (as Minimum Bounding Geometry's flat hulls
+are), or an empty polygon. Clip also leaves out a mask whose polygons, unioned, have no area, and
+Union and Symmetrical Difference an overlay feature whose parts, unioned, come to nothing, saying
+how many. When Clip, Intersect or Split has none left, so that its result would be empty, it stops
 with an error.
 
 **Near** (`near`) copies `input` and adds, for each feature, the nearest feature of `near`: its OID
