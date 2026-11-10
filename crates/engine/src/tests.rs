@@ -37098,8 +37098,8 @@ fn long_commands_stop_when_cancelled_while_they_run() {
         ("symmetricalDifference", json!({"input": "Lakes", "overlay": "Countries"})),
         ("update", json!({"input": "Countries", "update": "Lakes"})),
         ("split", json!({"input": "Rivers", "split": "Countries"})),
-        ("convexHull", json!({"input": "Countries", "group": "None"})),
-        ("convexHull", json!({"input": "Countries", "group": "All"})),
+        ("convexHull", json!({"input": "Countries", "group": "None", "output": "Hulls_each"})),
+        ("convexHull", json!({"input": "Countries", "group": "All", "output": "Hulls_all"})),
         ("kernelDensity", json!({"input": "Cities", "crs": "EPSG:3857"})),
         ("kriging", json!({"input": "Cities", "field": "pop_max"})),
     ];

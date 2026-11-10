@@ -2278,9 +2278,9 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 /// latitude past ±90° is taken as the pole.)
 const HULL_LIMIT_M: f64 = 1e12;
 
-/// Minimum Bounding Geometry. Cancel is looked at per feature, as each one's points are gathered
-/// (and its hull made, one hull each); the one hull of all features' points, with `group` All, is
-/// a single step without a look.
+/// Minimum Bounding Geometry. Cancel is looked at per feature, before its points are gathered (and
+/// its hull made, one hull each); gathering one feature's points, and making its hull, are steps
+/// without a look, as is the one hull of all features' points with `group` All.
 fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let each = s(p, "group") == "None";
@@ -2365,15 +2365,12 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         }
     } else {
         // All together; `count` is the features hulled, those with a point to give. With none,
-        // no hull is written, as one feature each.
-        // Cancel is looked at, and progress counted, per feature; the one hull of all their
-        // points is a single step without a look.
-        let (mut pts, mut hulled) = (Vec::new(), 0usize);
+        // no hull is written, as one feature each. Each feature's points gathered on several
+        // cores for many, Cancel looked at and progress counted per feature, placed in order.
         crate::control::begin(features.len());
-        for (done, (_, g)) in features.iter().enumerate() {
-            crate::control::check()?;
-            crate::control::reached(done);
-            let (these, passed, past) = points(g);
+        let gathered = crate::parallel::try_map(&features, PARALLEL_FEATURES, || (), |_, _, (_, g)| Ok::<_, String>(points(g)))?;
+        let (mut pts, mut hulled) = (Vec::new(), 0usize);
+        for (these, passed, past) in gathered {
             gaps += passed;
             poles += past;
             if these.is_empty() {
@@ -2383,6 +2380,10 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             }
             pts.extend(these);
         }
+        // The one hull of all the points isn't counted, nor looked at inside: Cancel is looked at
+        // before it, and the count ends, so a Cancel during it isn't said to come near the end.
+        crate::control::check()?;
+        crate::control::begin(0);
         if hulled > 0 {
             match shape(geo::MultiPoint::new(pts).convex_hull(), &mut flat) {
                 Some(g) => out.push(Some(g), vec![Value::Int(i64::try_from(hulled).unwrap_or(i64::MAX))]),
