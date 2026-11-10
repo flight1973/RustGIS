@@ -208,19 +208,7 @@ pub fn commands() -> Vec<C> {
         .when(need_report)
         .params(r#"{"report"?, "category": field|null (no chart), "value"?: field to sum (default: count records)}"#),
         // Output.
-        C::new("report.export", "Export Report", "Publish › Output", |s, p| {
-            let path = ps(p, "path").ok_or("path is required")?.to_string();
-            let i = index(s, p)?;
-            let dpi = f(p, "dpi").unwrap_or(150.0).clamp(72.0, 600.0);
-            let lower = path.to_ascii_lowercase();
-            let pdf = lower.ends_with(".pdf");
-            if !pdf && !lower.ends_with(".png") {
-                return Err("export to a .pdf or .png file".into());
-            }
-            let (bytes, pages) = report_bytes(s, i, dpi, pdf)?;
-            rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
-            Ok(json!({"path": path, "pages": pages, "bytes": bytes.len()}))
-        }).inputs(export_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        C::new("report.export", "Export Report", "Publish › Output", |s, p| super::exports::write_here(s, p, "report.export")).inputs(export_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .view()
         .when(need_report)
         .params(r#"{"report"?, "path": "*.pdf|*.png" (PNG: the first page), "dpi"?: 72..600}"#),
@@ -312,23 +300,87 @@ fn add_section(s: &mut Session, p: &Value, sec: Section) -> CmdResult {
     Ok(json!({"report": i, "sections": r.sections.len()}))
 }
 
-/// Drops what a layer lacks from a report (fields, groups, statistics, sort, picture,
-/// attachments, chart, and a where clause it can't read), so the report draws on that layer.
-fn fit_to_layer(r: &mut Report, ds: &rustgis_data::Dataset) {
+/// Counted changes needed to fit a report to a different layer's schema.
+#[derive(Default)]
+struct Fitted {
+    fields: usize,
+    groups: usize,
+    statistics: usize,
+    settings: usize,
+    filter_cleared: bool,
+    columns_replaced: bool,
+    subreports: usize,
+    subreport_fields: usize,
+}
+
+impl Fitted {
+    /// Publishes only completed changes, with literal report names and translated operation text.
+    fn notify(self, s: &mut Session, name: &str, when: &'static str) {
+        use crate::notice_text::NoticeText;
+        for (n, key) in [
+            (self.fields, "{name}: {n} report column(s) missing from the layer removed {when}"),
+            (self.groups, "{name}: {n} report grouping field(s) missing from the layer removed {when}"),
+            (self.statistics, "{name}: {n} report statistic(s) whose fields are missing removed {when}"),
+            (self.settings, "{name}: {n} report sort, picture, attachment or chart setting(s) whose fields are missing removed {when}"),
+            (
+                usize::from(self.columns_replaced),
+                "{name}: {n} report column set(s) replaced with the layer's default columns because none of the requested columns exist {when}",
+            ),
+            (self.subreports, "{name}: {n} subreport(s) whose relationship no longer involves the layer removed {when}"),
+            (self.subreport_fields, "{name}: {n} subreport field(s) missing from the related layer removed {when}"),
+        ] {
+            if n > 0 {
+                s.notify_text(
+                    NoticeText::format(
+                        key,
+                        [("name", name.to_string().into()), ("n", n.to_string().into()), ("when", NoticeText::term(when))],
+                    ),
+                    false,
+                );
+            }
+        }
+        if self.filter_cleared {
+            s.notify_text(NoticeText::format(
+                "{name}: 1 report filter that could not be read for its layer removed {when}; that filter no longer limits included records",
+                [("name", name.to_string().into()), ("when", NoticeText::term(when))],
+            ), false);
+        }
+    }
+}
+
+/// Drops what a layer lacks so the report draws on that layer, returning every removed binding
+/// and whether missing columns were replaced with the default field list.
+fn fit_to_layer(r: &mut Report, ds: &rustgis_data::Dataset) -> Fitted {
     let has = |n: &str| ds.field_index(n).is_some();
+    let mut fitted = Fitted { fields: r.fields.len(), groups: r.groups.len(), statistics: r.stats.len(), ..Fitted::default() };
+    let settings = usize::from(r.sort.is_some())
+        + usize::from(r.picture_field.is_some())
+        + usize::from(r.attachments_field.is_some())
+        + usize::from(r.chart.is_some());
     r.fields.retain(|f| has(f));
     r.groups.retain(|f| has(f));
     r.stats.retain(|x| has(&x.field));
+    fitted.fields -= r.fields.len();
+    fitted.groups -= r.groups.len();
+    fitted.statistics -= r.stats.len();
     r.sort = r.sort.take().filter(|f| has(f));
     r.picture_field = r.picture_field.take().filter(|f| has(f));
     r.attachments_field = r.attachments_field.take().filter(|f| has(f));
     r.chart = r.chart.take().filter(|c| has(&c.category) && c.value.as_deref().is_none_or(has));
+    fitted.settings = settings
+        - usize::from(r.sort.is_some())
+        - usize::from(r.picture_field.is_some())
+        - usize::from(r.attachments_field.is_some())
+        - usize::from(r.chart.is_some());
     if r.fields.is_empty() {
+        fitted.columns_replaced = fitted.fields > 0;
         r.fields = ds.fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect();
     }
-    if !r.where_clause.is_empty() && rustgis_data::query::parse_fields(&r.where_clause, ds).is_err() {
+    fitted.filter_cleared = !r.where_clause.is_empty() && rustgis_data::query::parse_fields(&r.where_clause, ds).is_err();
+    if fitted.filter_cleared {
         r.where_clause.clear();
     }
+    fitted
 }
 
 /// A join key: numbers by value (so 1 and 1.0 match), anything else as text; empty for none.
@@ -420,6 +472,7 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     let mut r = s.project.reports.get(i).cloned().ok_or("no report")?;
     let old_name = r.name.clone();
     let mut renamed = None;
+    let mut fitted = Fitted::default();
     if let Some(n) = ps(p, "layer") {
         let l = find_layer(s, n).ok_or_else(|| format!("no layer named '{n}'"))?;
         if l.is_raster() {
@@ -429,16 +482,21 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         // What the new layer lacks is dropped, so the report doesn't show blank columns, and so
         // are subreports through relationships that don't involve it. A kept subreport may now
         // list the other end of its relationship, so its fields are fitted to that layer.
-        fit_to_layer(&mut r, &l.dataset);
+        fitted = fit_to_layer(&mut r, &l.dataset);
         let name = l.name.clone();
         r.sections.retain_mut(|x| match x {
             Section::Subreport { relationship, fields } => {
                 let other = update_other(s, relationship, &name);
-                let Some(other) = other else { return false };
+                let Some(other) = other else {
+                    fitted.subreports += 1;
+                    return false;
+                };
+                let before = fields.len();
                 match find_layer(s, &other) {
                     Some(o) => fields.retain(|f| o.dataset.field_index(f).is_some()),
                     None => fields.clear(),
                 }
+                fitted.subreport_fields += before - fields.len();
                 true
             }
             _ => true,
@@ -493,6 +551,10 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
     }
+    if ps(p, "where").is_some() {
+        fitted.filter_cleared = false;
+    }
+    fitted.notify(s, &name, "while changing the report layer");
     Ok(json!({"report": i, "name": name}))
 }
 
@@ -538,12 +600,10 @@ pub fn report_file(s: &Session, i: usize, template: bool) -> Result<Vec<u8>, Str
 fn open(s: &mut Session, p: &Value) -> CmdResult {
     let text = super::items::read_text(p)?;
     let mut r: Report = serde_json::from_str(&text).map_err(|e| format!("not a RustGIS report: {e}"))?;
-    r.clamp();
+    let repairs = r.clamp();
     import_layer(s, p, &mut r)?;
     // Drop what the layer lacks, so the report still draws.
-    if let Some(l) = find_layer(s, &r.layer) {
-        fit_to_layer(&mut r, &l.dataset);
-    }
+    let fitted = find_layer(s, &r.layer).map(|l| fit_to_layer(&mut r, &l.dataset)).unwrap_or_default();
     r.name = unique_name(s, &r.name, None);
     let name = r.name.clone();
     if s.project.reports.len() >= crate::project::MAX_ITEMS {
@@ -552,6 +612,10 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
     s.project.reports.push(r);
     let i = s.project.reports.len() - 1;
     s.active_report = Some(i);
+    for notice in crate::project::content_notices(repairs, &name) {
+        s.notify_text(notice, false);
+    }
+    fitted.notify(s, &name, "while importing the report");
     Ok(json!({"report": i, "name": name}))
 }
 
@@ -697,6 +761,19 @@ fn blocks(s: &Session, i: usize, out: &mut Vec<Block>, seen: &mut Vec<usize>, de
     }
     if truncated {
         about.push_str(&format!(" — the first {MAX_RECORDS} are listed"));
+    }
+    // Only a preview draws a layer read in place (an export reads it whole first), here or
+    // under a record through a relationship.
+    let related_in_view = r.sections.iter().any(|sec| {
+        let Section::Subreport { relationship, .. } = sec else { return false };
+        relationships(s)
+            .find(|x| x.name.eq_ignore_ascii_case(relationship))
+            .and_then(|rel| opposite(rel, &layer.name))
+            .and_then(|other| find_layer(s, other))
+            .is_some_and(Layer::is_streamed)
+    });
+    if layer.is_streamed() || related_in_view {
+        about.push_str(" — in this preview, only the records in the map's view; the export lists them all");
     }
     out.push(Block::Text(about));
     let fi: Vec<Option<usize>> = r.fields.iter().map(|n| ds.field_index(n)).collect();
@@ -871,33 +948,180 @@ fn blocks(s: &Session, i: usize, out: &mut Vec<Block>, seen: &mut Vec<usize>, de
     Ok(())
 }
 
-/// The report's pages, laid out.
+/// The report's pages, laid out: for the preview, from the features the layers hold now (a layer
+/// read in place holds those of the view, and the report says so); an export reads them whole
+/// ([`report_bytes`]).
 pub fn pages(s: &Session, i: usize) -> Result<(Doc, Vec<rustgis_render::report::Page>), String> {
     let doc = build(s, i)?;
     let pages = rustgis_render::report::paginate(&doc);
     Ok((doc, pages))
 }
 
-/// The report as a PDF (every page) or a PNG (the first page), and its page count.
+/// The report as a PDF (every page) or a PNG (the first page), and its page count: every record of
+/// a layer read in place, read whole on a copy of the project ([`whole_copy`]); what reading and
+/// drawing it said is said in `s`. The browser's export, where the whole read runs here; the
+/// app's runs on a thread of its own ([`export_work`]).
 pub fn report_bytes(s: &mut Session, i: usize, dpi: f64, pdf: bool) -> Result<(Vec<u8>, usize), String> {
+    let name = s.project.reports.get(i).map(|r| r.name.clone()).unwrap_or_default();
+    let (bytes, mut copy) = whole_bytes(detached(&s.project), s.path.clone(), i, dpi, pdf);
+    super::exports::say(s, super::exports::copy_notices(&mut copy, &name));
+    bytes
+}
+
+/// What Export Report reads of the session (a copy of the project, its layers' reads left with
+/// the live ones), and the work that reads the report's layers whole, draws it and writes it.
+pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
+    let path = ps(p, "path").ok_or("path is required")?.to_string();
+    let i = index(s, p)?;
+    let dpi = f(p, "dpi").unwrap_or(150.0).clamp(72.0, 600.0);
+    let lower = path.to_ascii_lowercase();
+    let pdf = lower.ends_with(".pdf");
+    if !pdf && !lower.ends_with(".png") {
+        return Err("export to a .pdf or .png file".into());
+    }
+    let (project, folder) = (detached(&s.project), s.path.clone());
+    Ok(Box::new(move || {
+        let (bytes, mut copy) = whole_bytes(project, folder, i, dpi, pdf);
+        let written = bytes.and_then(|(bytes, pages)| {
+            rustgis_data::progress::check().map_err(|e| e.to_string())?;
+            rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+            Ok(json!({"path": path, "pages": pages, "bytes": bytes.len()}))
+        });
+        // The layers it lists are read whole; a layout drawn in it draws the others' views, and
+        // one whose source fails there is said, as Export Layout says it.
+        let said = super::exports::copy_notices(&mut copy, &path);
+        super::exports::drawn(&copy.project.maps, said, written, path)
+    }))
+}
+
+/// `project`, its streamed layers' reads under way left with the live layers.
+fn detached(project: &crate::project::Project) -> crate::project::Project {
+    let mut project = project.clone();
+    for m in &mut project.maps {
+        m.detach_reads();
+    }
+    project
+}
+
+/// Report `i` drawn ([`drawn_bytes`]) from a copy of `project` saved at `path` (pictures are found
+/// beside it), its layers read whole ([`whole_copy`]), with the copy, which holds what reading and
+/// drawing it said.
+fn whole_bytes(
+    project: crate::project::Project,
+    path: Option<std::path::PathBuf>,
+    i: usize,
+    dpi: f64,
+    pdf: bool,
+) -> (Result<(Vec<u8>, usize), String>, Session) {
+    let mut copy = Session::new(project);
+    copy.path = path;
+    let bytes = whole_copy(&mut copy, i).and_then(|()| drawn_bytes(&mut copy, i, dpi, pdf));
+    (bytes, copy)
+}
+
+/// Reads whole, in `copy` (a copy of the project to draw report `i` from), the layers read in
+/// place that the report lists records of ([`reported_layers`]), so the report lists every
+/// record of their sources and not only those of the view, their selections kept; the rows a
+/// source couldn't read are said on the copy. Each read looks at Cancel as Load All Features'
+/// does: between the chunks of a source read so, not during one read at once.
+pub(crate) fn whole_copy(copy: &mut Session, i: usize) -> Result<(), String> {
+    for (m, id) in reported_layers(copy, i) {
+        // Cancelled after one layer's read: the next isn't started.
+        rustgis_data::progress::check().map_err(|e| e.to_string())?;
+        let Some(l) = copy.project.maps.get_mut(m).and_then(|map| map.layer_mut(id)) else { continue };
+        let unread = super::whole::load_into(l)?;
+        unread.say(copy);
+    }
+    rustgis_data::progress::check().map_err(|e| e.to_string())
+}
+
+/// The layers report `i` lists records of, by map and id: its own, its subreports' related
+/// layers, and those of the reports it appends, as far as [`blocks`] draws them (the same
+/// reports, in the same order, to the same depth), so an export reads no layer it doesn't list.
+pub(crate) fn reported_layers(input: &impl super::InputSource, i: usize) -> Vec<(usize, u32)> {
+    /// Report `i`'s layers at `depth`, then those of the reports it appends, as `blocks` walks
+    /// them (sharing its `seen`).
+    fn walk(input: &impl super::InputSource, i: usize, depth: usize, seen: &mut Vec<usize>, out: &mut Vec<(usize, u32)>) {
+        let context = input.input_context();
+        let s = &context;
+        let place = |name: &str| {
+            let (map, l) = find_layer_map(input, name)?;
+            Some((s.project.maps.iter().position(|m| std::ptr::eq(m, map))?, l.id, l.name.clone()))
+        };
+        let Some(r) = s.project.reports.get(i) else { return };
+        // A report whose layer is gone draws nothing (`blocks` fails), nor the reports it appends.
+        let Some((m, id, name)) = place(&r.layer) else { return };
+        out.push((m, id));
+        for sec in &r.sections {
+            if let Section::Subreport { relationship, .. } = sec {
+                let other = relationships(input)
+                    .find(|x| x.name.eq_ignore_ascii_case(relationship))
+                    .and_then(|rel| opposite(rel, &name).map(str::to_string));
+                out.extend(other.and_then(|other| place(&other)).map(|(m, id, _)| (m, id)));
+            }
+        }
+        for sec in &r.sections {
+            if let Section::Related { report } = sec
+                && depth < MAX_DEPTH
+                && let Some(j) = s.project.reports.iter().position(|x| x.name.eq_ignore_ascii_case(report))
+                && !seen.contains(&j)
+            {
+                seen.push(j);
+                walk(input, j, depth + 1, seen, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(input, i, 0, &mut vec![i], &mut out);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The report as a PDF (every page) or a PNG (the first page), and its page count, drawn from
+/// the features `s`'s layers hold.
+fn drawn_bytes(s: &mut Session, i: usize, dpi: f64, pdf: bool) -> Result<(Vec<u8>, usize), String> {
     let (doc, pages) = pages(s, i)?;
+    let revision = |s: &Session| {
+        pages
+            .iter()
+            .take(if pdf { usize::MAX } else { 1 })
+            .filter_map(|page| {
+                let rustgis_render::report::Page::Layout(li) = page else { return None };
+                s.project.layouts.get(*li).map(|layout| rustgis_render::layout::archive_revisions(layout, &s.project.maps))
+            })
+            .max()
+            .unwrap_or_default()
+    };
+    let before = revision(s);
+    let result = report_pages_bytes(s, &doc, &pages, dpi, pdf);
+    before.finish_revision(revision(s), Some(result), "could not draw the report")?
+}
+
+fn report_pages_bytes(
+    s: &mut Session,
+    doc: &Doc,
+    pages: &[rustgis_render::report::Page],
+    dpi: f64,
+    pdf: bool,
+) -> Result<(Vec<u8>, usize), String> {
     let n = if pdf { pages.len() } else { 1 };
     let mut out = Vec::new();
     let mut held = 0usize;
     let (mut frames_pictured, mut pages_pictured) = (Vec::new(), Vec::new());
+    // Counted, and stopped on Cancel, a page at a time.
+    rustgis_data::progress::begin(n);
     for k in 0..n {
+        rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
         if !pdf {
-            let (img, ..) = rustgis_render::report::draw_page(&doc, &pages, k, dpi, &s.project.layouts, &mut s.project.maps)
-                .ok_or("the page is too large to draw")?;
+            let (img, ..) = rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)?;
             return Ok((img.encode_png().map_err(|e| e.to_string())?, pages.len()));
         }
-        let (page, pictured) = rustgis_render::report::pdf_page(&doc, &pages, k, dpi, &s.project.layouts, &mut s.project.maps)
-            .ok_or("the page is too large to draw")?;
+        let (page, pictured) = rustgis_render::report::pdf_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)?;
         if page.overflowed() {
             // Too large for vectors all the same: the page as one picture.
             pages_pictured.push(k + 1);
-            let (img, w, h) = rustgis_render::report::draw_page(&doc, &pages, k, dpi, &s.project.layouts, &mut s.project.maps)
-                .ok_or("the page is too large to draw")?;
+            let (img, w, h) = rustgis_render::report::draw_page(doc, pages, k, dpi, &s.project.layouts, &mut s.project.maps)?;
             out.push(rustgis_render::pdf::Page::new(&img, w, h));
         } else {
             frames_pictured.extend(pictured);

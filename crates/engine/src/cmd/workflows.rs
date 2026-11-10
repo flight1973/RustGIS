@@ -148,7 +148,7 @@ pub(crate) type Then = Box<dyn FnOnce(&mut Session, &mut Value) + Send>;
 
 /// A raster embedded as a GeoTIFF, as a layer of its own.
 pub(crate) fn made(raster: Raster, extra: Option<Value>) -> Result<Made, String> {
-    let bytes = rustgis_data::raster::geotiff::write(&raster, 0).map_err(|e| e.to_string())?;
+    let bytes = rustgis_data::raster::geotiff::write_all(&raster).map_err(|e| e.to_string())?;
     let name = raster.name.clone();
     let layer = rustgis_map::RasterLayer::from_bytes(raster, format!("{name}.tif"), bytes);
     Ok(made_layer(name, layer, extra, None))
@@ -643,6 +643,7 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
         copy.active_layer = active_layer;
         copy.tools_ahead = Some(super::gp::Ahead::Recording(Vec::new()));
         copy.files_ahead = Some(super::gp::FilesAhead::Recording(Vec::new()));
+        copy.zones_ahead = Some(super::imagery::ZonesAhead::Recording(Vec::new()));
         let _ = copy.run(command, &p);
         super::gp::ran_ahead(&mut copy)
     })
@@ -685,6 +686,7 @@ pub(crate) const ON_A_COPY: &[&str] = &[
     "layer.definitionQuery",
     "layer.select",
     "map.projection",
+    "raster.spectral",
 ];
 
 #[cfg(not(target_arch = "wasm32"))]

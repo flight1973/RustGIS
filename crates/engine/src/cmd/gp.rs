@@ -623,8 +623,13 @@ pub(crate) enum Ahead {
 
 #[cfg(not(target_arch = "wasm32"))]
 /// What a model's or script's run on a copy of the session stops at, as its run here does them: a
-/// tool that writes files (which would be written twice), plugin and GeoLibre tools, which run as
-/// they always have, and a script's line that may reach outside the session.
+/// tool that writes files (which would be written twice), a plugin tool (a plugin's program may do
+/// more than hand back its layers, so it runs once, where the user ran it), and a script's line that may reach outside the session. A
+/// GeoLibre tool runs ahead like a built-in one (#1562): the outputs it declares are written to a
+/// scratch folder of its own and handed back, so the run here takes the result instead of running
+/// it again, and Cancel stops its program. (The runner is trusted like any program the user
+/// installs: a tool asked to write elsewhere through its parameters would, and would again if its
+/// result isn't taken.)
 pub(crate) const NOT_AHEAD: &str = "runs where the model or script runs";
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -658,6 +663,7 @@ pub(crate) enum FilesAhead {
 pub(crate) struct RanAheads {
     tools: Vec<RanAhead>,
     files: Vec<FileAhead>,
+    zones: Vec<super::imagery::ZoneMeans>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -668,9 +674,11 @@ pub(crate) struct RanAheads {
 pub(crate) fn taking<T>(s: &mut Session, ran: RanAheads, run: impl FnOnce(&mut Session) -> T) -> T {
     s.tools_ahead = Some(Ahead::Taking(ran.tools.into()));
     s.files_ahead = Some(FilesAhead::Taking(ran.files.into()));
+    s.zones_ahead = Some(super::imagery::ZonesAhead::Taking(ran.zones.into()));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(s)));
     s.tools_ahead = None;
     s.files_ahead = None;
+    s.zones_ahead = None;
     r.unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
@@ -685,7 +693,11 @@ pub(crate) fn ran_ahead(s: &mut Session) -> RanAheads {
         Some(FilesAhead::Recording(read)) => read,
         _ => Vec::new(),
     };
-    RanAheads { tools, files }
+    let zones = match s.zones_ahead.take() {
+        Some(super::imagery::ZonesAhead::Recording(read)) => read,
+        _ => Vec::new(),
+    };
+    RanAheads { tools, files, zones }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2224,7 +2236,7 @@ pub(crate) fn execute(
         Some(ran) => ran,
         None => {
             #[cfg(not(target_arch = "wasm32"))]
-            if recording && (pin.resolved().source().is_some() || writes_files(spec)) {
+            if recording && (pin.plugin().is_some() || writes_files(spec)) {
                 return Err(NOT_AHEAD.into());
             }
             #[cfg(not(target_arch = "wasm32"))]

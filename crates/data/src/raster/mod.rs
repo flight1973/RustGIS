@@ -502,6 +502,9 @@ pub struct Band {
     /// The names of the band's classes, by value, from GDAL's `.aux.xml` sidecar (see
     /// [`Band::class_name`]). Empty when the band names no class.
     pub classes: Vec<String>,
+    /// The band's central wavelength in nanometres, from GDAL's metadata (the file's tag or its
+    /// sidecar, [`pam::wavelength_nm`]); `None` when the file gives none.
+    pub wavelength: Option<f64>,
 }
 
 impl Band {
@@ -609,11 +612,13 @@ pub(crate) fn band_name_of(r: &Raster, band: usize) -> Option<&str> {
 }
 
 /// GDAL's metadata tag (42112) for the bands `bands` of `r`, written as samples in that order:
-/// their names, and the first one's class names. Both GeoTIFF writers take it from here.
+/// their names and wavelengths, and the first one's class names. Both GeoTIFF writers take it
+/// from here.
 pub(crate) fn gdal_metadata_of(r: &Raster, bands: &[usize]) -> Option<String> {
     let names: Vec<Option<&str>> = bands.iter().map(|b| band_name_of(r, *b)).collect();
+    let wavelengths: Vec<Option<f64>> = bands.iter().map(|b| r.bands.get(*b).and_then(|b| b.wavelength)).collect();
     let first = bands.first().and_then(|b| r.bands.get(*b)).map_or(&[][..], |b| &b.classes[..]);
-    pam::gdal_metadata(&names, first)
+    pam::gdal_metadata(&names, first, &wavelengths)
 }
 
 /// Text for a TIFF ASCII tag, which holds 7-bit ASCII only: control characters (a NUL would end
@@ -740,6 +745,7 @@ impl Raster {
                 stats: if measure { BandStats::compute(&data, valid) } else { BandStats::default() },
                 data,
                 classes: Vec::new(),
+                wavelength: None,
             })
             .collect();
         let mut r = Raster {
@@ -776,14 +782,18 @@ impl Raster {
     /// metadata", "its .aux.xml sidecar").
     pub fn apply_pam(&mut self, pam: &pam::Pam, from: &str) {
         self.lost.extend(pam.lost.iter().map(|l| format!("{from}: {l}")));
-        // Names for bands the raster doesn't have have nowhere to go.
+        // Names and wavelengths for bands the raster doesn't have have nowhere to go.
         let beyond = pam
             .bands
             .iter()
-            .filter(|b| (b.band == 0 || b.band > self.bands.len()) && (b.description.is_some() || !b.categories.is_empty()))
+            .filter(|b| {
+                (b.band == 0 || b.band > self.bands.len())
+                    && (b.description.is_some() || !b.categories.is_empty() || b.wavelength.is_some())
+            })
             .count();
         if beyond > 0 {
-            self.lost.push(format!("{from}: names for {beyond} band(s) it doesn't have (it has {}) left out", self.bands.len()));
+            self.lost
+                .push(format!("{from}: names or wavelengths for {beyond} band(s) it doesn't have (it has {}) left out", self.bands.len()));
         }
         // So is a no-data value: it isn't the raster's.
         let outside = pam.bands.iter().filter(|b| (b.band == 0 || b.band > self.bands.len()) && b.nodata.is_some()).count();
@@ -835,6 +845,9 @@ impl Raster {
             }
             if let Some(p) = p.filter(|p| !p.categories.is_empty()) {
                 band.classes = p.categories.clone();
+            }
+            if let Some(w) = p.and_then(|p| p.wavelength) {
+                band.wavelength = Some(w);
             }
             let stored = p.and_then(|p| p.stats).filter(|_| overview);
             if recompute || stored.is_some() {
@@ -1621,7 +1634,7 @@ pub(crate) mod tests {
             pam::SIDECAR,
         );
         assert!(
-            one.lost.iter().any(|l| l == "its .aux.xml sidecar: names for 1 band(s) it doesn't have (it has 1) left out"),
+            one.lost.iter().any(|l| l == "its .aux.xml sidecar: names or wavelengths for 1 band(s) it doesn't have (it has 1) left out"),
             "{:?}",
             one.lost
         );
@@ -1780,6 +1793,28 @@ pub(crate) mod tests {
         assert!(read_bytes("x.tif", b"not a tiff").is_err());
         assert!(read_bytes("x.asc", &[0xff, 0xfe]).is_err());
         assert!(read_bytes("x.png", b"").is_err());
+    }
+
+    /// #1486: the placement cases, as an ASCII grid's `.prj`: its lower left corner, at the case's
+    /// point, is where the case says.
+    #[test]
+    fn placement_cases_are_placed_from_a_grids_prj() {
+        let dir = std::env::temp_dir().join(format!("rustgis-placement-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for wkt::tests::PlacementCase { what, wkt, xy, lonlat } in wkt::tests::placement_cases() {
+            let asc = dir.join("grid.asc");
+            std::fs::write(&asc, format!("ncols 1\nnrows 1\nxllcorner {}\nyllcorner {}\ncellsize 1\n7\n", xy.x, xy.y)).unwrap();
+            std::fs::write(dir.join("grid.prj"), &wkt).unwrap();
+            let r = read_path(&asc).unwrap();
+            assert!(r.lost.is_empty(), "{what}: {:?}", r.lost);
+            // The origin is the upper left corner; `pixel_height` is negative, so this is the lower
+            // left.
+            let corner = Coord::new(r.transform.origin_x, r.transform.origin_y + r.transform.pixel_height);
+            let ll = r.crs.transformer().unwrap().to_lonlat(corner).unwrap();
+            let off = wkt::tests::metres_apart(ll, lonlat);
+            assert!(off < 0.01, "{what}: {off} m off");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

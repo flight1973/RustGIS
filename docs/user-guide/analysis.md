@@ -94,8 +94,8 @@ run` called from another program, such as an agent or a CI job, which may wait w
 Viewshed, IDW Interpolation and Kriging refuse a run that would take more than a second or two of
 work on one thread (a ray step, a cell-point pair), Kernel Density one whose points' search windows
 (the square around each point's radius) cover more than 50 million cells, and Deep Learning a model
-too large for its raster; its training fits a share of the sampled pixels, or fewer epochs, instead
-(`dl.train` reports the epochs it ran). A task or model recorded from a pane run keeps these limits
+too large for its raster; its training fits a share of the sampled pixels, or fewer epochs, instead,
+and says how many of each it trained on (`"limited"` in `dl.train`'s and `dl.classify`'s answer). A task or model recorded from a pane run keeps these limits
 when it runs again in the app, so a step the pane took on can be refused there, and a model trained
 again can differ. On the desktop these limits grow with the threads the run takes (the cores, up to 16 unless
 [`threads`](#analysis-workflows) says otherwise), as many
@@ -1201,7 +1201,7 @@ same trust as installing that package. Tools that read files by path (LiDAR file
 since a web page has no file system.
 
 In the desktop app the Tools pane runs a GeoLibre tool in the background like any other; its
-**Cancel** takes effect when the GeoLibre program ends, and the result is then dropped. On the
+**Cancel** stops the GeoLibre program at once, and nothing is added. On the
 command line RustGIS waits while a tool runs. In the web app the run
 is started in the background and the result is added when it ends, but the tool itself runs
 in the page, so the page is busy while it computes.
@@ -1293,11 +1293,11 @@ project (New, Open, the sample, a template, or the same one again), from the app
 assistant or an agent, starts the pane blank: the script, its results, the count and the Details
 window go with the old project. A script that opens a project itself stays, with its results, as
 the new project's Run #1. On the desktop, a script's tools, models and batches, with selections, layer
-renames and definition queries, the environment and the projection between them, are worked out
+renames and definition queries, the environment, the projection and spectral zones between them, are worked out
 in the background first, so the map and the rest of the window stay in use: the status bar shows
 **Run Script** and **Cancel**, and the results say **Running…** until the run is added. From the
 first line of any other kind (an edit, Add Data, a save, an export, a style or a zoom, a plugin
-or GeoLibre tool, a tool that writes a file) the rest runs as a script always has, holding the
+tool, a tool that writes a file) the rest runs as a script always has, holding the
 window until it finishes. A tool whose inputs change meanwhile runs again as the
 results are added, as in a model's run. It colours the commands as you type, in both
 themes: `#` comments in green italics, the command id, and the JSON's strings, numbers and
@@ -1374,8 +1374,11 @@ their name.
   **Running…** until the results are added, as one step to undo. What a tool reads that changes
   meanwhile (an edit, a selection, a layer added or reordered, the environment, the projection)
   has that tool and those after it run again as the results are added, and so does a tool that
-  writes a file, a plugin tool or a GeoLibre tool, with those after it. Those run as a model
-  always has, holding the window until they finish, with the work limits of a run that can't
+  writes a file or a plugin tool, with those after it. GeoLibre tools are worked out in the
+  background like the built-in ones: their outputs go to a folder of their own until they are
+  added. A GeoLibre option that names a file for the program to write isn't an output, so a
+  tool given one writes it in the background, and again if the tool runs again. Those that run again run as a model always has, holding the
+  window until they finish, with the work limits of a run that can't
   be cancelled. The tools worked out in the background take no work limit, as a run that can
   be stopped takes none. Tools that run holding the window or from the command line keep it, so
   the same model can finish in the background and stop at the limit there. A file a tool reads
@@ -1456,10 +1459,27 @@ The Analyze tab's imagery groups open their tools in the Workflows pane:
   it holds: each point's residual in pixels and map units, the RMSE, and each point's error when
   it is left out of the fit. With `compare` it fits them all and recommends the simplest whose
   leave-one-out error is close to the best.
-- **Change Detection** (difference, ratio, percent), **Spectral Analysis** (every band at a
-  pixel), **Indices** (NDVI, NDWI, SAVI, NBR, NDBI, EVI), **Process** (clip to the view, to a
-  box, or to a polygon layer's selected or all polygons, with the cells outside them no-data;
-  resample) and the **Pixel Editor** (set the pixels inside a polygon).
+- **Spectral Analysis** (`raster.spectral`) charts a multiband raster's spectral profile: every
+  band's value at points on the map, to compare the signatures of water, vegetation, soil or roofs
+  before drawing training samples for a classification. Pick the raster, turn on **Pick Points** and
+  click: each click adds a point until you turn it off. Identify's pop-up on a pixel of two bands or
+  more has a **Spectral Profile** button that adds that pixel. Up to six points are compared, a line
+  each, in the colour of a numbered marker on the map. The x axis is the bands' wavelengths in
+  nanometres when the file gives one for every band (see [Rasters](data.md#rasters)), drawn in
+  wavelength order, and their numbers otherwise. Hovering the chart shows a band's name, wavelength
+  and each point's value; **×** takes a point off, **Clear** all of them, and **Export CSV…**
+  (desktop) writes a row per band (its number, name and wavelength) and a column per point. From
+  scripts, `{"layer": "scene", "points": [[-43.95, -19.92], [-43.96, -19.93]]}` gives one profile
+  per point (up to 1,000; a point off the raster keeps its place with null values, and is said),
+  `{"lon", "lat"}` one pixel and `{"zone": "polygons"}` the mean in the selected or first polygon
+  (on the desktop, a script's zone is worked out in the background with the script, up to the
+  first line that stops it, as said under **Script**; one after it holds the window);
+  every answer has the band names and, when the file gives any, `"wavelengths"` in nanometres.
+  After GeoLibre's spectral profile.
+- **Change Detection** (difference, ratio, percent), **Indices** (NDVI, NDWI, SAVI, NBR, NDBI,
+  EVI), **Process** (clip to the view, to a box, or to a polygon layer's selected or all polygons,
+  with the cells outside them no-data; resample) and the **Pixel Editor** (set the pixels inside a
+  polygon).
 - **Mosaic Rasters** (`raster.mosaic`) merges tiles of one grid, such as the 1 km tiles of a state
   elevation model, into one raster in their own coordinate system and cell size, optionally
   written to a GeoTIFF: `{"inputs": ["dgm_1.tif", "dgm_2.tif", …], "path": "dem.tif"}`. Inputs

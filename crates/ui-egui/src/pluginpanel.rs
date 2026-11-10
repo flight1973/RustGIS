@@ -1,18 +1,23 @@
 //! A plugin's panel (`panel` in its `plugin.json`): a right pane of texts, checkboxes, sliders,
-//! buttons, trees, dropdowns, date pickers and range sliders bound to the plugin's commands.
+//! buttons, trees, forms, dropdowns, date pickers, range sliders and picks bound to the plugin's
+//! commands.
 //!
 //! The session keeps the panel's state ([`rustgis_engine::plugins::PanelState`]); this draws it
 //! and turns the user's changes into commands: a widget with a command runs
 //! `plugin:<plugin>/<command>` with `{"panel": {"<widget>": value}}`, one without sets the value
 //! with `plugin.panel`. A slider or a range runs its command when it is let go (or stepped, or
 //! moved with the keys), never while it is dragged: until then the pane shows the value it would
-//! take. A date runs its command when a day is picked in its calendar, or a date typed is
-//! confirmed (Enter, or leaving the box).
+//! take. A form's text and number fields send when they lose focus, its other fields at once. A
+//! date runs its command when a day is picked in its calendar, or a date typed is confirmed
+//! (Enter, or leaving the box). A pick waits for the map: the next click there (or a box dragged)
+//! is its value, and Esc, another tool, or the panel closing stops it waiting.
 
 use egui::{Align2, CornerRadius, RichText, Sense, Stroke, Ui, pos2, vec2};
 use std::collections::{HashMap, HashSet};
 
-use rustgis_engine::plugins::{Manifest, PanelItemDecl, PanelState, TreeNode, command_id};
+use rustgis_engine::Tool;
+use rustgis_engine::geom::{Coord, Extent};
+use rustgis_engine::plugins::{FormField, Manifest, PanelItemDecl, PanelState, TreeNode, command_id};
 use serde_json::{Value, json};
 
 use crate::theme::{Tokens, regular, semibold};
@@ -42,6 +47,19 @@ pub struct State {
     /// since, or moved (by the plugin or a script), opens the branches above it, once, so it
     /// shows and they can still be closed.
     revealed: HashMap<String, Vec<String>>,
+    /// A form's text and number fields being typed in, by widget and field, and the value they
+    /// showed when typing began (so a value the plugin sets since wins).
+    typing: HashMap<(String, String), Typing>,
+    /// A change sent this frame was refused: the frame's button clicks wait, since they would
+    /// act on the values the refused change tried to replace.
+    refused: bool,
+    /// A pick waiting for the map: plugin and widget.
+    picking: Option<(String, String)>,
+}
+
+struct Typing {
+    text: String,
+    was: String,
 }
 
 /// The panel's title (its tab), in the interface language.
@@ -88,6 +106,7 @@ pub fn open(app: &mut RustGisApp, p: &Value) -> Result<Value, String> {
 
 fn run(app: &mut RustGisApp, id: &str, p: Value) {
     if let Err(e) = app.run_by_user(id, p) {
+        app.ui.plugin_panel.refused = true;
         app.session.notify(e, true);
     }
 }
@@ -116,6 +135,9 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     };
     let m = &plugin.manifest;
     let Some(decl) = m.panel.as_ref() else { return };
+    // A draft belongs to a form field the plugin still gives: one it removed takes its draft
+    // with it, so a field given back later starts from its stored value.
+    app.ui.plugin_panel.typing.retain(|(w, f), _| state.items.get(w.as_str()).is_some_and(|s| s.fields.iter().any(|x| x.id == *f)));
     let lang = app.lang().code();
     let tr = |s: &str| m.translate(lang, s).to_string();
     ui.horizontal(|ui| {
@@ -131,25 +153,28 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     ui.separator();
     ui.add_space(4.0);
     let items: Vec<&PanelItemDecl> = decl.items.iter().filter(|d| state.items.get(d.key()).is_none_or(|s| s.visible)).collect();
+    app.ui.plugin_panel.refused = false;
     // What was being typed or dragged in a pane, or a widget, out of sight since is let go: the
     // box would otherwise show the old text over what the plugin set meanwhile.
     let frame = ui.ctx().cumulative_frame_nr();
     let pane = &mut app.ui.plugin_panel;
     if pane.drawn.saturating_add(1) < frame {
         pane.date_text.clear();
+        pane.typing.clear();
         pane.dragging = None;
         pane.range_drag = None;
     }
     pane.drawn = frame;
     pane.date_text.retain(|k, _| items.iter().any(|d| d.kind == "date" && d.key() == k && enabled(d, &state)));
     let mut i = 0;
+    let mut clicks: Vec<String> = Vec::new();
     while let Some(item) = items.get(i).copied() {
         // Buttons side by side, wrapping, as many as follow each other.
         if item.kind == "button" {
             let n = items.iter().skip(i).take_while(|d| d.kind == "button").count();
             ui.horizontal_wrapped(|ui| {
                 for b in items.iter().skip(i).take(n) {
-                    button(app, ui, &pid, m, b, &state, &tr);
+                    clicks.extend(button(ui, &pid, m, b, &state, &tr));
                 }
             });
             ui.add_space(8.0);
@@ -157,10 +182,12 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             continue;
         }
         match item.kind.as_str() {
+            "pick" => pick_item(app, ui, &pid, m, item, &state, &tr, t),
             "text" => text(ui, item, &state, &tr, t),
             "checkbox" => checkbox(app, ui, &pid, item, &state, &tr),
             "slider" => slider(app, ui, &pid, item, &state, &tr, t),
             "tree" => tree(app, ui, &pid, item, &state, &tr, t),
+            "form" => form(app, ui, &pid, item, &state, &tr, t),
             "choice" => choice(app, ui, &pid, item, &state, &tr, t),
             "date" => date(app, ui, &pid, item, &state, &tr, t),
             "range" => range(app, ui, &pid, item, &state, &tr, t),
@@ -168,6 +195,14 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         ui.add_space(8.0);
         i += 1;
+    }
+    // A button runs after the widgets' changes of this frame are sent: a form field left by
+    // the click (the focus moves to the button) goes first, so the command sees it. If one of
+    // those changes was refused, the click waits: its command would act on the old values.
+    if !app.ui.plugin_panel.refused {
+        for id in clicks {
+            run(app, &id, Value::Null);
+        }
     }
 }
 
@@ -202,15 +237,9 @@ fn checkbox(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, 
     }
 }
 
-fn button(
-    app: &mut RustGisApp,
-    ui: &mut Ui,
-    pid: &str,
-    m: &Manifest,
-    item: &PanelItemDecl,
-    state: &PanelState,
-    tr: &dyn Fn(&str) -> String,
-) {
+/// A button's or a pick's label, on one line: what the plugin set, the declared one, or its
+/// command's; and its help: the declared one or its command's.
+fn button_label(m: &Manifest, item: &PanelItemDecl, state: &PanelState, tr: &dyn Fn(&str) -> String) -> (String, String) {
     let cmd = m.commands.iter().find(|c| c.id == item.command);
     let label = state
         .items
@@ -221,10 +250,417 @@ fn button(
         .unwrap_or_default()
         .replace('\n', " ");
     let help = if item.help.is_empty() { cmd.as_ref().map(|c| tr(&c.help)).unwrap_or_default() } else { tr(&item.help) };
+    (label, help)
+}
+
+/// A button's command when it was clicked. The caller runs it once the frame's other changes
+/// are sent (see [`show`]).
+fn button(ui: &mut Ui, pid: &str, m: &Manifest, item: &PanelItemDecl, state: &PanelState, tr: &dyn Fn(&str) -> String) -> Option<String> {
+    let (label, help) = button_label(m, item, state, tr);
     let resp = ui.add_enabled(enabled(item, state), egui::Button::new(label).min_size(vec2(64.0, 26.0)));
     let resp = if help.is_empty() { resp } else { resp.on_hover_text(help) };
+    resp.clicked().then(|| command_id(pid, &item.command))
+}
+
+/// A form: a label per field and its widget, the fields the plugin gave. A text or number
+/// sends when it loses focus, so the plugin is not run on every keystroke; a checkbox, a choice
+/// or a set of them at once. Every change carries the whole form, as the plugin set it.
+fn form(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, state: &PanelState, tr: &dyn Fn(&str) -> String, t: &Tokens) {
+    let id = item.key();
+    let Some(st) = state.items.get(id) else { return };
+    let label = label_of(item, state, tr);
+    if !label.is_empty() {
+        let r = ui.label(RichText::new(label).size(11.0).color(t.text_dim));
+        if !item.help.is_empty() {
+            r.on_hover_text(tr(&item.help));
+        }
+    }
+    if st.fields.is_empty() {
+        ui.label(RichText::new("—").size(12.5).color(t.text_dim));
+        return;
+    }
+    let on = enabled(item, state);
+    let mut changes: Vec<(String, Value)> = Vec::new();
+    ui.add_enabled_ui(on, |ui| {
+        egui::Grid::new(("plugin-form", pid, id)).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+            for f in st.fields.iter() {
+                let text = RichText::new(if f.required { format!("{} *", f.label) } else { f.label.clone() }).size(11.0).color(t.text_dim);
+                // A form label wraps in a narrow column instead of widening it: a long
+                // description would otherwise push the field's value box out of the pane.
+                // The label names its widget for screen readers.
+                let named = ui
+                    .scope(|ui| {
+                        ui.set_max_width(96.0);
+                        ui.add(egui::Label::new(text).wrap())
+                    })
+                    .inner
+                    .id;
+                match f.kind.as_str() {
+                    "checkbox" => {
+                        let mut v = state.form_value(id, &f.id).and_then(Value::as_bool).unwrap_or(false);
+                        let r = ui.checkbox(&mut v, "").labelled_by(named);
+                        let r = if f.help.is_empty() { r } else { r.on_hover_text(tr(&f.help)) };
+                        if r.changed() {
+                            changes.push((f.id.clone(), json!(v)));
+                        }
+                    }
+                    "select" => {
+                        let now = state.form_value(id, &f.id).and_then(Value::as_str).unwrap_or_default();
+                        let r = egui::ComboBox::from_id_salt(("plugin-form-select", pid, id, &f.id))
+                            .selected_text(if now.is_empty() { "—" } else { now })
+                            .show_ui(ui, |ui| {
+                                for c in &f.choices {
+                                    if ui.selectable_label(now == c, c).clicked() {
+                                        changes.push((f.id.clone(), json!(c)));
+                                    }
+                                }
+                            });
+                        let r = r.response.labelled_by(named);
+                        if !f.help.is_empty() {
+                            r.on_hover_text(tr(&f.help));
+                        }
+                    }
+                    "multi" => {
+                        let mut now: Vec<String> = state
+                            .form_value(id, &f.id)
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+                            .unwrap_or_default();
+                        let shown = if now.is_empty() { "—".to_string() } else { now.join(", ") };
+                        // Stays open across ticks so several choices can be picked in one go.
+                        let r = egui::ComboBox::from_id_salt(("plugin-form-multi", pid, id, &f.id))
+                            .selected_text(shown)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show_ui(ui, |ui| {
+                                for c in &f.choices {
+                                    let mut on = now.iter().any(|x| x == c);
+                                    if ui.checkbox(&mut on, c).changed() {
+                                        if on {
+                                            now.push(c.clone());
+                                        } else {
+                                            now.retain(|x| x != c);
+                                        }
+                                        changes.push((f.id.clone(), json!(now)));
+                                    }
+                                }
+                            });
+                        let r = r.response.labelled_by(named);
+                        if !f.help.is_empty() {
+                            r.on_hover_text(tr(&f.help));
+                        }
+                    }
+                    kind => {
+                        let stored = state.form_value(id, &f.id).map_or_else(String::new, shown_value);
+                        let key = (id.to_string(), f.id.clone());
+                        let mut text = match app.ui.plugin_panel.typing.get(&key) {
+                            Some(w) if w.was == stored => w.text.clone(),
+                            Some(_) => {
+                                app.ui.plugin_panel.typing.remove(&key);
+                                stored.clone()
+                            }
+                            None => stored.clone(),
+                        };
+                        let r = ui.add(egui::TextEdit::singleline(&mut text).desired_width(160.0)).labelled_by(named);
+                        let bad = kind == "number" && typed_value(f, &text).is_none();
+                        if bad {
+                            ui.painter().rect_stroke(r.rect, CornerRadius::same(3), Stroke::new(1.0, t.red), egui::StrokeKind::Inside);
+                        }
+                        let r = if f.help.is_empty() { r } else { r.on_hover_text(tr(&f.help)) };
+                        if r.changed() {
+                            app.ui.plugin_panel.typing.insert(key.clone(), Typing { text: text.clone(), was: stored.clone() });
+                        }
+                        if r.lost_focus() {
+                            // The draft ends with the focus; the value is sent only if it changed.
+                            // Escape ends the edit without a send: the draft is discarded.
+                            app.ui.plugin_panel.typing.remove(&key);
+                            let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if let Some(v) = typed_value(f, &text)
+                                && !escaped
+                                && !same_value(state.form_value(id, &f.id), &v)
+                            {
+                                changes.push((f.id.clone(), v));
+                            }
+                        }
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    });
+    if !changes.is_empty() {
+        let mut values = state.form(id).cloned().unwrap_or_default();
+        for (field, v) in changes {
+            values.insert(field, v);
+        }
+        send(app, pid, item, Value::Object(values));
+    }
+}
+
+/// How a form field's value shows in its text box.
+fn shown_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Whether `stored` already holds `v`: numbers compare by value, so `0` is `0.0`.
+fn same_value(stored: Option<&Value>, v: &Value) -> bool {
+    match (stored, v) {
+        (Some(Value::Number(a)), Value::Number(b)) => a.as_f64() == b.as_f64(),
+        (Some(a), b) => a == b,
+        (None, _) => false,
+    }
+}
+
+/// A text or number field's value from what the user typed: a whole number for an integer
+/// field, a finite number for the other, and the text itself otherwise.
+fn typed_value(f: &FormField, text: &str) -> Option<Value> {
+    if f.kind != "number" {
+        return Some(json!(text));
+    }
+    // A whole number is read as it is typed, so one past the range the backend keeps (2^53) is
+    // refused rather than rounded to it.
+    if f.integer
+        && let Ok(i) = text.trim().parse::<i64>()
+    {
+        return (i.unsigned_abs() <= 9_007_199_254_740_992).then(|| json!(i));
+    }
+    let n: f64 = text.trim().parse().ok().filter(|n: &f64| n.is_finite())?;
+    if f.integer && (n.fract() != 0.0 || n.abs() > 9_007_199_254_740_992.0) {
+        return None;
+    }
+    Some(if f.integer { json!(n as i64) } else { json!(n) })
+}
+
+/// Where a pick's value is, in words: a point's degrees, or a box's south-west and north-east
+/// corners.
+fn place_text(v: &serde_json::Map<String, Value>) -> Option<String> {
+    let n = |v: Option<&Value>| v.and_then(Value::as_f64);
+    if let Some(b) = v.get("bbox").and_then(Value::as_array) {
+        let (w, s, e, north) = (n(b.first())?, n(b.get(1))?, n(b.get(2))?, n(b.get(3))?);
+        let (sw, ne) = (rustgis_engine::geom::format_lonlat(Coord::new(w, s)), rustgis_engine::geom::format_lonlat(Coord::new(e, north)));
+        return Some(crate::i18n::fmt("{southwest} to {northeast}", &[("southwest", &sw), ("northeast", &ne)]));
+    }
+    Some(rustgis_engine::geom::format_lonlat(Coord::new(n(v.get("lon"))?, n(v.get("lat"))?)))
+}
+
+/// A pick: a button that waits for a place on the map (a click, or a box dragged for a box), then
+/// runs the widget's command with it. Clicked again while it waits, it stops waiting. Under it,
+/// what it waits for, or the place picked last.
+#[allow(clippy::too_many_arguments)]
+fn pick_item(
+    app: &mut RustGisApp,
+    ui: &mut Ui,
+    pid: &str,
+    m: &Manifest,
+    item: &PanelItemDecl,
+    state: &PanelState,
+    tr: &dyn Fn(&str) -> String,
+    t: &crate::theme::Tokens,
+) {
+    let id = item.key();
+    let waiting = app.ui.plugin_panel.picking.as_ref().is_some_and(|(p, i)| p == pid && i == id);
+    let (label, help) = button_label(m, item, state, tr);
+    let on = enabled(item, state);
+    let resp = ui.add_enabled(on, egui::Button::new(format!("⌖ {label}")).selected(waiting).min_size(vec2(64.0, 26.0)));
+    let resp = if help.is_empty() { resp } else { resp.on_hover_text(help) };
     if resp.clicked() {
-        run(app, &command_id(pid, &item.command), Value::Null);
+        if waiting {
+            app.ui.plugin_panel.picking = None;
+        } else {
+            // Clicks and drags on the map are the pick's, not another tool's: Explore, whose
+            // drags still pan the map to find the place (for a point).
+            if app.session.tool != Tool::Explore
+                && let Err(e) = app.run("tool.set", json!({"tool": "explore"}))
+            {
+                app.session.notify(e, true);
+                return;
+            }
+            app.map.popup = None;
+            app.ui.plugin_panel.picking = Some((pid.to_string(), id.to_string()));
+        }
+    }
+    let (line, color) = if waiting {
+        let asks = if item.picks_box() { tl!("Drag a box on the map · Esc cancels") } else { tl!("Click the map · Esc cancels") };
+        (Some(asks.to_string()), t.accent_text)
+    } else {
+        (state.picked(id).and_then(place_text), t.text_dim)
+    };
+    if let Some(line) = line {
+        ui.add(egui::Label::new(RichText::new(line).size(11.0).color(color)).wrap());
+    }
+}
+
+/// The pick waiting for the map, while it still can: its plugin's panel is open and the plugin
+/// on, the widget is a pick that shows and is enabled, and the Explore tool is on (any other
+/// tool, Esc among the ways to choose one, ends it). Anything else ends it.
+fn waiting_pick(app: &mut RustGisApp) -> Option<(String, PanelItemDecl)> {
+    let (pid, id) = app.ui.plugin_panel.picking.clone()?;
+    let open = app.ui.right == Some(RightPane::Plugin) && app.ui.plugin_panel.plugin.as_deref() == Some(pid.as_str());
+    let item = (open && app.session.tool == Tool::Explore)
+        .then(|| rustgis_engine::plugins::get(&pid))
+        .flatten()
+        .filter(|p| p.enabled)
+        .and_then(|p| p.manifest.panel.as_ref().and_then(|d| d.item(&id)).filter(|d| d.kind == "pick").cloned())
+        .filter(|_| app.session.plugin_panels.get(&pid).and_then(|s| s.items.get(&id)).is_none_or(|s| s.enabled && s.visible));
+    if item.is_none() {
+        app.ui.plugin_panel.picking = None;
+    }
+    item.map(|i| (pid, i))
+}
+
+/// Ends a pick waiting for the map (another tool was chosen: Esc chooses Explore), dropping a box
+/// being dragged for it.
+pub(crate) fn cancel_pick(app: &mut RustGisApp) {
+    if app.ui.plugin_panel.picking.take().is_some() {
+        app.map.cancel_box_drag();
+    }
+}
+
+/// What a pick waiting for the map asks for, for the map's hint and the status bar.
+pub(crate) fn pick_hint(app: &mut RustGisApp) -> Option<String> {
+    let (pid, item) = waiting_pick(app)?;
+    let plugin = rustgis_engine::plugins::get(&pid)?;
+    let state = app.session.plugin_panels.get(&pid)?;
+    let lang = app.lang().code();
+    let tr = |s: &str| plugin.manifest.translate(lang, s).to_string();
+    let (label, _) = button_label(&plugin.manifest, &item, state, &tr);
+    Some(if item.picks_box() {
+        crate::i18n::fmt("{pick}: drag a box on the map · Esc cancels", &[("pick", &label)])
+    } else {
+        crate::i18n::fmt("{pick}: click the map · Esc cancels", &[("pick", &label)])
+    })
+}
+
+/// Whether a pick waits for a box: a drag on the map draws one.
+pub(crate) fn picks_box(app: &mut RustGisApp) -> bool {
+    waiting_pick(app).is_some_and(|(_, i)| i.picks_box())
+}
+
+/// A longitude in -180..180.
+fn wrap(lon: f64) -> f64 {
+    let l = (lon + 180.0).rem_euclid(360.0) - 180.0;
+    if l == -180.0 && lon > 0.0 { 180.0 } else { l }
+}
+
+/// The place picked: the pick stops waiting and runs its command with it (or keeps it for the
+/// plugin's next one).
+fn picked(app: &mut RustGisApp, pid: &str, item: &PanelItemDecl, value: Value) {
+    app.ui.plugin_panel.picking = None;
+    send(app, pid, item, value);
+}
+
+/// A click on the map at `c`, for a pick waiting for a point. A pick waiting for a box takes the
+/// click too, and goes on waiting for a drag. False when no pick waits.
+pub(crate) fn map_click(app: &mut RustGisApp, c: Coord) -> bool {
+    let Some((pid, item)) = waiting_pick(app) else { return false };
+    if !item.picks_box() {
+        picked(app, &pid, &item, json!({"lon": wrap(c.x), "lat": c.y.clamp(-90.0, 90.0)}));
+    }
+    true
+}
+
+/// A box dragged on the map, `grid` the places on a `side` by `side` grid over it in degrees
+/// (column by column, `None` off the globe) and `pole` the latitude of a pole inside it (the
+/// globe's), for a pick waiting for one; false when none waits.
+pub(crate) fn box_picked(app: &mut RustGisApp, grid: &[Option<Coord>], side: usize, pole: Option<f64>) -> bool {
+    let Some((pid, item)) = waiting_pick(app).filter(|(_, i)| i.picks_box()) else { return false };
+    let globe = app.session.map().projection == rustgis_engine::map::Projection::Globe;
+    let Some(bbox) = box_of(grid, side, globe, pole) else { return false };
+    picked(app, &pid, &item, json!({"bbox": bbox}));
+    true
+}
+
+/// The box `[west, south, east, north]` around the places on `grid` (degrees, `side` by `side`,
+/// column by column, `None` off the globe): a box wider than the world is the world, and one
+/// across the antimeridian has a west longitude greater than its east. A flat map gives
+/// longitudes past ±180 across it (its copies of the world); the globe wraps them, so there each
+/// place's is read from a neighbour's already read, and a box over more than 180° of longitude
+/// keeps its side. A box around a pole (`pole`, its latitude) reaches it, all the way round.
+fn box_of(grid: &[Option<Coord>], side: usize, globe: bool, pole: Option<f64>) -> Option<[f64; 4]> {
+    if grid.len() != side * side {
+        return None;
+    }
+    let start = grid.iter().position(Option::is_some)?;
+    let first = grid[start]?.x;
+    let mut read: Vec<Option<f64>> = vec![None; grid.len()];
+    if globe {
+        read[start] = Some(first);
+        let mut todo = vec![start];
+        while let Some(k) = todo.pop() {
+            let Some(at) = read[k] else { continue };
+            let (i, j) = (k / side, k % side);
+            let near = [(i > 0).then(|| k - side), (i + 1 < side).then(|| k + side), (j > 0).then(|| k - 1), (j + 1 < side).then(|| k + 1)];
+            for m in near.into_iter().flatten() {
+                if let (Some(c), None) = (grid[m], read[m]) {
+                    read[m] = Some(at + wrap(c.x - at));
+                    todo.push(m);
+                }
+            }
+        }
+    }
+    let mut e = Extent::EMPTY;
+    for (k, c) in grid.iter().enumerate() {
+        let Some(c) = c else { continue };
+        let x = if globe { read[k].unwrap_or_else(|| first + wrap(c.x - first)) } else { c.x };
+        e.expand(Coord::new(x, c.y));
+    }
+    if let Some(lat) = pole {
+        e.expand(Coord::new(first, lat));
+        e.min_x = first - 180.0;
+        e.max_x = first + 180.0;
+    }
+    let (west, east) = if e.width() >= 360.0 { (-180.0, 180.0) } else { (wrap(e.min_x), wrap(e.max_x)) };
+    Some([west, e.min_y.clamp(-90.0, 90.0), east, e.max_y.clamp(-90.0, 90.0)])
+}
+
+/// The places the open panel's picks hold, on the map: a point's marker, a box's outline.
+pub(crate) fn paint(app: &RustGisApp, p: &egui::Painter, t: &crate::theme::Tokens, to_screen: impl Fn(Coord) -> Option<egui::Pos2>) {
+    if app.ui.right != Some(RightPane::Plugin) {
+        return;
+    }
+    let Some(pid) = app.ui.plugin_panel.plugin.as_deref() else { return };
+    let (Some(plugin), Some(state)) = (rustgis_engine::plugins::get(pid).filter(|p| p.enabled), app.session.plugin_panels.get(pid)) else {
+        return;
+    };
+    let Some(decl) = plugin.manifest.panel.as_ref() else { return };
+    let n = |v: Option<&Value>| v.and_then(Value::as_f64);
+    let ring = Stroke::new(1.5, egui::Color32::WHITE);
+    for d in decl.items.iter().filter(|d| d.kind == "pick" && state.items.get(d.key()).is_none_or(|s| s.visible)) {
+        let Some(v) = state.picked(d.key()) else { continue };
+        if let Some(b) = v.get("bbox").and_then(Value::as_array) {
+            let (Some(w), Some(s), Some(e), Some(north)) = (n(b.first()), n(b.get(1)), n(b.get(2)), n(b.get(3))) else { continue };
+            let e = if e < w { e + 360.0 } else { e };
+            // Its edges followed, so a curved projection draws them curved.
+            let steps = 24;
+            let mut edge = Vec::new();
+            for (a, z) in [((w, s), (e, s)), ((e, s), (e, north)), ((e, north), (w, north)), ((w, north), (w, s))] {
+                for i in 0..steps {
+                    let f = i as f64 / steps as f64;
+                    edge.push(Coord::new(a.0 + (z.0 - a.0) * f, a.1 + (z.1 - a.1) * f));
+                }
+            }
+            // The parts on show: a box partly on the globe's far side keeps the rest.
+            let pts: Vec<Option<egui::Pos2>> = edge.into_iter().map(&to_screen).collect();
+            if pts.iter().all(Option::is_some) {
+                p.add(egui::Shape::closed_line(pts.into_iter().flatten().collect(), Stroke::new(2.0, t.accent)));
+            } else {
+                let closed = pts.iter().chain(pts.first());
+                for run in closed.copied().collect::<Vec<_>>().split(Option::is_none) {
+                    if run.len() > 1 {
+                        p.add(egui::Shape::line(run.iter().flatten().copied().collect(), Stroke::new(2.0, t.accent)));
+                    }
+                }
+            }
+        } else if let (Some(lon), Some(lat)) = (n(v.get("lon")), n(v.get("lat")))
+            && let Some(sp) = to_screen(Coord::new(lon, lat))
+        {
+            p.circle_filled(sp, 6.0, t.accent);
+            p.circle_stroke(sp, 6.0, ring);
+        }
     }
 }
 
@@ -751,6 +1187,50 @@ fn range(app: &mut RustGisApp, ui: &mut Ui, pid: &str, item: &PanelItemDecl, sta
 mod tests {
     use super::*;
 
+    /// A box dragged across the antimeridian is the narrow box there, on the globe (longitudes
+    /// wrapped) and on a flat map (past 180); a wide one stays wide, on a flat map and on the
+    /// globe (a band under the pole over more than 180° of longitude), and one around a pole is
+    /// the world's width.
+    #[test]
+    fn a_box_across_the_antimeridian_is_the_narrow_one() {
+        const SIDE: usize = 13;
+        // The places on a grid over the box, `at(u, v)` for u, v from 0 to 1, column by column.
+        let grid = |at: &dyn Fn(f64, f64) -> Option<Coord>| -> Vec<Option<Coord>> {
+            let t = |k: usize| k as f64 / (SIDE - 1) as f64;
+            (0..SIDE).flat_map(|i| (0..SIDE).map(move |j| (t(i), t(j)))).map(|(u, v)| at(u, v)).collect()
+        };
+        let c = |x: f64, y: f64| Some(Coord::new(x, y));
+        let globe = grid(&|u, v| c(wrap(179.0 + 2.0 * u), -1.0 + 2.0 * v));
+        assert_eq!(box_of(&globe, SIDE, true, None), Some([179.0, -1.0, -179.0, 1.0]));
+        let flat = grid(&|u, v| c(179.0 + 2.0 * u, -1.0 + 2.0 * v));
+        assert_eq!(box_of(&flat, SIDE, false, None), Some([179.0, -1.0, -179.0, 1.0]));
+        let wide = grid(&|u, v| c(-170.0 + 340.0 * u, 5.0 * v));
+        assert_eq!(box_of(&wide, SIDE, false, None), Some([-170.0, 0.0, 170.0, 5.0]));
+        assert_eq!(box_of(&wide, SIDE, true, None), Some([-170.0, 0.0, 170.0, 5.0]), "wide on the globe");
+        // An orthographic globe centred on 30°N 0° (unit radius, y up), and a band across it
+        // just under the north pole: its longitudes run from about -111 to 111 by way of 0.
+        let (lat0, r) = (30f64.to_radians(), |x: f64, y: f64| (x * x + y * y).sqrt());
+        let ortho = |x: f64, y: f64| {
+            let rho = r(x, y);
+            let s = rho.asin();
+            let lat = (s.cos() * lat0.sin() + y * s.sin() * lat0.cos() / rho).asin();
+            let lon = (x * s.sin()).atan2(rho * s.cos() * lat0.cos() - y * s.sin() * lat0.sin());
+            (rho <= 1.0).then(|| Coord::new(wrap(lon.to_degrees()), lat.to_degrees()))
+        };
+        let band = grid(&|u, v| ortho(-1.0 + 2.0 * u, 0.6 + 0.2 * v));
+        let b = box_of(&band, SIDE, true, None).unwrap_or_default();
+        assert!(b[0] < -100.0 && b[2] > 100.0, "the band's own side, not the far one: {b:?}");
+        // Off the globe on its left: the rest still reads.
+        let part = grid(&|u, v| (u > 0.4).then(|| Coord::new(wrap(170.0 + 20.0 * u), v)));
+        assert_eq!(box_of(&part, SIDE, true, None).map(|b| b[2]), Some(-170.0));
+        let pole = grid(&|u, v| c(wrap(360.0 * u), 80.0 + 5.0 * v));
+        assert_eq!(box_of(&pole, SIDE, true, Some(90.0)), Some([-180.0, 80.0, 180.0, 90.0]), "around a pole");
+        let world = grid(&|u, _| c(-200.0 + 400.0 * u, 0.0));
+        assert_eq!(box_of(&world, SIDE, false, None), Some([-180.0, 0.0, 180.0, 0.0]), "wider than the world");
+        assert_eq!(box_of(&grid(&|_, _| None), SIDE, true, None), None, "nothing on the globe");
+        assert_eq!(box_of(&globe, SIDE - 1, true, None), None, "a grid of another size");
+    }
+
     fn node(id: &str, label: &str, children: Vec<TreeNode>) -> TreeNode {
         TreeNode { id: id.into(), label: label.into(), count: None, children }
     }
@@ -816,6 +1296,32 @@ mod tests {
         let decomposed = vec![node("601", "A\u{301}rboles urbanos", vec![])];
         assert_eq!(shown(&decomposed, "arbol", &[]), ["601"]);
         assert_eq!(shown(&decomposed, "árbol arbol", &[]), ["601"], "a word given twice");
+    }
+
+    #[test]
+    fn a_form_field_reads_the_number_it_shows() {
+        let field = |integer| FormField {
+            id: "n".into(),
+            kind: "number".into(),
+            label: "N".into(),
+            help: String::new(),
+            choices: Vec::new(),
+            default: None,
+            required: false,
+            integer,
+        };
+        assert_eq!(typed_value(&field(true), "3"), Some(json!(3)));
+        assert_eq!(typed_value(&field(true), " 3.0 "), Some(json!(3)), "a whole number written as a float");
+        assert_eq!(typed_value(&field(true), "3.5"), None);
+        assert_eq!(typed_value(&field(false), "3.5"), Some(json!(3.5)));
+        assert_eq!(typed_value(&field(false), "x"), None);
+        assert_eq!(typed_value(&field(false), "inf"), None);
+        assert_eq!(typed_value(&field(false), ""), None);
+        assert!(same_value(Some(&json!(0)), &json!(0.0)), "a number left as it was isn't sent");
+        assert!(!same_value(Some(&json!(0)), &json!(0.5)));
+        assert!(!same_value(None, &json!(0)));
+        assert_eq!(shown_value(&json!(2)), "2");
+        assert_eq!(shown_value(&json!("two")), "two");
     }
 
     /// A plugin's command adding data by address doesn't wait for it: the app downloads it off
@@ -983,6 +1489,57 @@ mod tests {
         assert!(h.state().ui.cog_probes.is_empty());
         assert_eq!(asked.load(Ordering::Relaxed), 1, "one download, no probe first");
         plugins::unload("ui-scan");
+    }
+
+    /// A plugin's command asking for a window of a cloud-optimised GeoTIFF doesn't wait for it:
+    /// the app reads it off the frame, adds it when it lands, and runs the command again, whose
+    /// `layer.addUrl` answers what was added (#1330).
+    #[test]
+    fn a_plugin_reads_a_window_off_the_frame() {
+        let _turn = crate::fetching::turn();
+        use rustgis_engine::plugins;
+        use std::sync::atomic::Ordering;
+        let slow = crate::fetching::slow_ranges(rustgis_engine::data::raster::cog::example(1024, 256));
+        let pkg = plugins::Package::from_zip(&plugins::testing::package("ui-window", &["edit", "network"])).unwrap();
+        plugins::load(pkg, "test").unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 860.0)).with_step_dt(0.05).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            RustGisApp::with_sample(),
+        );
+        let url = format!("{}/scene.tif", slow.origin);
+        // The header in hand, so only the window's tiles wait.
+        rustgis_engine::render::rustgis_tiles::cog::info_blocking(&url).unwrap();
+        slow.open.store(false, Ordering::Relaxed);
+        let params = json!({"url": url, "bbox": [10.25, 45.5, 10.5, 45.75], "name": "Window"});
+        let r = h.state_mut().run("plugin:ui-window/f", json!({"op": "layer.addUrl", "params": params})).unwrap();
+        assert_eq!(r["pending"], true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while slow.held.load(Ordering::Relaxed) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no request held");
+            let frame = std::time::Instant::now();
+            h.step();
+            assert!(frame.elapsed() < std::time::Duration::from_secs(5), "the read held the frame");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(h.state().session.map().layer_by_name("Window").is_none(), "nothing waited");
+        assert!(h.state().session.plugin_retries_waiting());
+        slow.open.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let landed = |app: &RustGisApp| app.session.map().layer_by_name("Window").is_some() && !app.session.plugin_retries_waiting();
+        while !landed(h.state()) {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting: {:?}", h.state().session.notices);
+            h.step();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let app = h.state();
+        assert!(app.session.map().layer_by_name("Window").is_some_and(|l| l.is_raster()));
+        assert!(app.session.map().layer_by_name("Window (2)").is_none(), "added once");
+        assert!(app.session.notices.iter().all(|n| !n.error), "{:?}", app.session.notices);
+        plugins::unload("ui-window");
     }
 
     /// A download that lands after its plugin command stopped waiting for it isn't added, and

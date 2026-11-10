@@ -10,6 +10,7 @@ pub mod connections;
 pub mod durable;
 pub mod geometry_calc;
 pub mod model;
+mod notice_text;
 pub mod peer;
 pub mod policy;
 #[cfg(not(target_arch = "wasm32"))]
@@ -50,10 +51,17 @@ pub struct UrlRequest {
     key: u64,
     params: Value,
     authority: std::sync::Arc<policy::Continuation>,
+    /// For a window asked with `"bbox": "view"`: the box the view was then, kept apart from its
+    /// parameters, which a caller gives and a command run again is matched by.
+    view: Option<[f64; 4]>,
 }
 impl UrlRequest {
     pub fn params(&self) -> &Value {
         &self.params
+    }
+    /// The box `"bbox": "view"` was when the command asked (`cmd::layer::window_asked_in`).
+    pub fn view_asked(&self) -> Option<[f64; 4]> {
+        self.view
     }
 }
 
@@ -527,8 +535,19 @@ pub struct TopologyIssue {
 pub struct Notice {
     pub text: String,
     pub error: bool,
+    /// Trusted templates with already-redacted arguments; ordinary notices have no payload.
+    localized: Option<notice_text::NoticeText>,
     /// How the troubleshooting history files it (an error, a warning or information).
     pub(crate) severity: rustgis_data::diagnostics::Severity,
+}
+
+impl Notice {
+    /// Deferred interface text, or `None` for an ordinary notice whose text is already final.
+    /// The formatter returns logical-order text; the front end shapes the complete result once.
+    /// Arguments are redacted before retention, and the result has the ordinary notice limits.
+    pub fn translated(&self, format: impl Fn(&str, &[(&str, &str)]) -> String) -> Option<String> {
+        self.localized.as_ref().map(|text| Session::redacted(&text.render(&format)).into_string())
+    }
 }
 
 /// One counted, already-redacted loss, independent of the changes a command can roll back.
@@ -695,6 +714,10 @@ pub struct Session {
     /// layer lands as the map draws (failing is said then, and read again: see
     /// [`Session::read_in_place_again`]).
     pub in_place_wait: bool,
+    /// Whether commands run on the desktop window's own thread, which draws nothing until each
+    /// answers: a plugin command there is held to the usual two minutes, whatever longer
+    /// `timeout` it declares. The command line, Python, scripts and tests run off any window.
+    pub on_window_thread: bool,
     pub notices: Vec<Notice>,
     /// Counted losses await the outermost guard's cleanup, including failed nested commands.
     /// Runtime-only: never in Project, undo or PutAside, so replacement cannot erase them.
@@ -826,12 +849,17 @@ pub struct Session {
     /// Downloads a command asked for where nothing may wait (the browser): the parameters of
     /// `layer.addUrl` calls, for the front end to fetch and add (see [`Session::take_url_requests`]).
     pub(crate) url_requests: Vec<UrlRequest>,
+    /// The view's box a window request being queued keeps ([`UrlRequest::view_asked`]).
+    pub(crate) window_view: Option<[f64; 4]>,
     /// Set by [`Session::request_url`] for [`Session::guarded`]: the command running changed
     /// nothing, it only left a request (a plugin's own answer can't claim that).
     request_only: bool,
     /// Set by [`Session::run_leaving_downloads`]: `layer.addUrl` leaves what it would wait for
     /// to the front end ([`Session::request_url`]), as in the browser.
     leave_downloads: bool,
+    /// Set by [`prefs::opt_in`]: the command line and Python read the remembered Earthdata token
+    /// for a command that names a data host, before it binds its accounts.
+    saved_secrets_opted_in: bool,
     /// Plugin commands waiting for their `host.fetch` answers, or the downloads their
     /// `layer.addUrl` left to the app, to run again.
     pub(crate) plugin_retries: Vec<cmd::plugins::fetch::Retry>,
@@ -897,6 +925,10 @@ pub struct Session {
     /// ([`cmd::gp::FilesAhead`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) files_ahead: Option<cmd::gp::FilesAhead>,
+    /// The zones' spectral means a script read on that copy, which its run here takes
+    /// ([`cmd::imagery::ZonesAhead`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) zones_ahead: Option<cmd::imagery::ZonesAhead>,
     /// Where the requests a copy of the session makes for a model's run ahead go
     /// ([`cmd::workflows::ahead_on_copy`]): the session's own Diagnostics, as when they're made
     /// there. Its notices stay its own: the run there says them.
@@ -905,6 +937,9 @@ pub struct Session {
     /// The tools run ahead that a model's run took, for the tests.
     #[cfg(test)]
     pub(crate) tools_taken: usize,
+    /// The zones' means read ahead that a command took, for the tests.
+    #[cfg(test)]
+    pub(crate) zones_taken: usize,
     /// Set where a person at a terminal waits on a command (`rustgis-cli run` with stdin and
     /// stderr a terminal), who can stop it with Ctrl-C: tools and rasters take no work cap
     /// ([`rustgis_analysis::control::Control::stoppable`]). A program that calls it (an agent, a
@@ -1107,6 +1142,7 @@ impl Session {
             view_size: (1200.0, 720.0),
             style_view: None,
             in_place_wait: true,
+            on_window_thread: false,
             notices: Vec::new(),
             loss_notices: Vec::new(),
             loss_notice_overflow: 0,
@@ -1164,11 +1200,13 @@ impl Session {
             #[cfg(not(target_arch = "wasm32"))]
             landed_windows: Vec::new(),
             url_requests: Vec::new(),
+            window_view: None,
             file_outputs: Vec::new(),
             #[cfg(test)]
             queue_gp_files: false,
             request_only: false,
             leave_downloads: false,
+            saved_secrets_opted_in: false,
             plugin_retries: Vec::new(),
             url_waits: cmd::plugins::fetch::UrlWaits::default(),
             next_request: 0,
@@ -1195,13 +1233,17 @@ impl Session {
             #[cfg(not(target_arch = "wasm32"))]
             files_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
+            zones_ahead: None,
+            #[cfg(not(target_arch = "wasm32"))]
             requests_into: None,
             #[cfg(test)]
             tools_taken: 0,
+            #[cfg(test)]
+            zones_taken: 0,
             stoppable: false,
         };
         for text in label_notices {
-            session.notify(text, false);
+            session.notify_text(text, false);
         }
         session
     }
@@ -2131,6 +2173,18 @@ impl Session {
         self.notice(text.into(), if error { Severity::Error } else { Severity::Info });
     }
 
+    /// Publishes English diagnostics and retains redacted templates for translated interfaces.
+    pub(crate) fn notify_text(&mut self, text: notice_text::NoticeText, error: bool) {
+        let text = text.redacted();
+        let mark = self.notices_given;
+        self.notify(text.english(), error);
+        if self.notices_given != mark
+            && let Some(notice) = self.notices.last_mut()
+        {
+            notice.localized = Some(text);
+        }
+    }
+
     /// Runs `f`, then says the true/false parameters it could not read: text taken as false,
     /// other values ignored (#1600), as `source`'s notice. Inside another such run (a command's
     /// script, a command run by a command) they are left for the outer one to say.
@@ -2234,7 +2288,12 @@ impl Session {
             return;
         }
         self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text);
-        self.notices.push(Notice { text: text.into_string(), error: severity == rustgis_data::diagnostics::Severity::Error, severity });
+        self.notices.push(Notice {
+            text: text.into_string(),
+            error: severity == rustgis_data::diagnostics::Severity::Error,
+            localized: None,
+            severity,
+        });
         self.notices_given += 1;
         if self.notices.len() > 200 {
             self.notices.remove(0);
@@ -2311,7 +2370,8 @@ impl Session {
         self.state
     }
 
-    /// The project as it is now is saved (written to its file, or downloaded in the browser).
+    /// The project as it is now is saved: written to its file. A browser download doesn't
+    /// count, as the page can't tell whether the browser saved it.
     pub fn mark_saved(&mut self) {
         self.saved = Some(self.state);
     }

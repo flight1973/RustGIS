@@ -155,14 +155,16 @@ pub fn checked(url: &str) -> Result<String, String> {
     }
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("https://") || lower.starts_with("http://")) {
-        let shown: String = url.chars().take(80).collect();
-        return Err(format!("{shown}: plugins fetch only http:// and https:// addresses"));
+        return Err(crate::sources::shortened_message_with_address(url, 80, "plugins fetch only http:// and https:// addresses"));
     }
     // A fragment never reaches the server (and RustGIS marks byte ranges with one).
     let url = url.split('#').next().unwrap_or(url);
     address::check(url, None)?;
     if address::reach(url) != address::Reach::Public && !allow_local() {
-        return Err(format!("{url}: plugins fetch only from the internet, not this computer or the local network"));
+        return Err(crate::sources::message_with_address(
+            url,
+            "plugins fetch only from the internet, not this computer or the local network",
+        ));
     }
     Ok(url.to_string())
 }
@@ -171,10 +173,10 @@ pub fn checked(url: &str) -> Result<String, String> {
 /// or array.
 pub fn answer(url: &str, bytes: &[u8]) -> Result<Value, String> {
     if bytes.len() > MAX_BYTES {
-        return Err(format!("{url}: larger than {MAX_BYTES} bytes"));
+        return Err(crate::sources::message_with_address(url, &format!("larger than {MAX_BYTES} bytes")));
     }
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let text = std::str::from_utf8(bytes).map_err(|_| format!("{url}: the answer isn't UTF-8 text"))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| crate::sources::message_with_address(url, "the answer isn't UTF-8 text"))?;
     let trimmed = text.trim_start();
     let parsed = if trimmed.starts_with('{') || trimmed.starts_with('[') { serde_json::from_str::<Value>(text).ok() } else { None };
     Ok(match parsed {
@@ -205,7 +207,7 @@ fn start(key: &str, url: &str) {
         &s3::anonymous(&url),
         MAX_BYTES,
         Box::new(move |r| {
-            let answer = r.map_err(|e| format!("{url}: {e}")).and_then(|bytes| answer(&url, &bytes));
+            let answer = r.map_err(|e| crate::sources::message_with_address(&url, &e)).and_then(|bytes| answer(&url, &bytes));
             cache().keep(&key, answer);
         }),
     );
@@ -257,7 +259,10 @@ impl Calls {
         let started = *self.started.get_or_insert_with(Instant::now);
         let left = CALL_BUDGET.saturating_sub(started.elapsed());
         if left.is_zero() {
-            return Err(format!("{url}: this plugin call's fetches took longer than {} s in all", CALL_BUDGET.as_secs()));
+            return Err(crate::sources::message_with_address(
+                url,
+                &format!("this plugin call's fetches took longer than {} s in all", CALL_BUDGET.as_secs()),
+            ));
         }
         // Names are checked again where they resolve: a public-looking name for a local address
         // (or a redirect to one) is refused there. Tests fetch from a server on this computer.
@@ -269,7 +274,7 @@ impl Calls {
         };
         // Errors are kept too (for `ERROR_TTL`), so a plugin run again and again on an address
         // that doesn't answer doesn't wait for it each time.
-        let answer = bytes.map_err(|e| format!("{url}: {e}")).and_then(|bytes| answer(url, &bytes));
+        let answer = bytes.map_err(|e| crate::sources::message_with_address(url, &e)).and_then(|bytes| answer(url, &bytes));
         cache().keep(key, answer.clone());
         answer
     }
@@ -277,7 +282,7 @@ impl Calls {
     #[cfg(target_arch = "wasm32")]
     fn blocking(&mut self, _key: &str, url: &str) -> CmdResult {
         let _ = self.started;
-        Err(format!("{url}: the web app can't wait for a fetch"))
+        Err(crate::sources::message_with_address(url, "the web app can't wait for a fetch"))
     }
 }
 
@@ -316,11 +321,19 @@ pub(crate) struct Retry {
     tries: u32,
 }
 
+/// The key a window of the view is told apart by when a command run again is answered
+/// ([`Session::with_view`]): matched only, never read as a parameter.
+const VIEW_ASKED: &str = "viewAsked";
+
 /// The downloads plugin commands wait for (#1202): those the app is making, with what was
 /// asked and since when, and those added, with what adding them answered, until the command
 /// waiting for them runs again.
 #[derive(Clone, Default)]
 pub(crate) struct UrlWaits {
+    /// The view's boxes of the window requests asked with `"bbox": "view"`, by their numbers: a
+    /// request for the view joins one being made only when it was asked in the same view. Kept
+    /// here, they go aside with a project and back on a rollback as the waits do.
+    pub(crate) views: std::collections::BTreeMap<u64, [f64; 4]>,
     owners: std::collections::BTreeMap<u64, crate::policy::Continuation>,
     in_flight: Vec<(u64, Value, Instant)>,
     landed: Vec<(u64, Value, CmdResult, Added)>,
@@ -333,7 +346,7 @@ pub(crate) struct UrlWaits {
     /// added twice.
     added: VecDeque<(u64, Value)>,
     /// A service's documents being read off the frame, by request number.
-    reading: Vec<(u64, Arc<Mutex<Option<Result<Vec<u8>, String>>>>)>,
+    reading: Vec<(u64, String, Arc<Mutex<Option<Result<Vec<u8>, String>>>>)>,
 }
 
 /// What adding a landed download added, to tell when its command runs again whether it is still
@@ -566,27 +579,28 @@ impl UrlWaits {
     pub(crate) fn read_document(&mut self, n: u64, asked: &Value) {
         let slot: Arc<Mutex<Option<Result<Vec<u8>, String>>>> = Arc::default();
         let land = slot.clone();
+        let url = asked["url"].as_str().unwrap_or("").to_string();
         crate::render::rustgis_tiles::cache::download_within(
-            asked["url"].as_str().unwrap_or(""),
+            &url,
             MAX_DOCUMENT,
             DOCUMENT_TIMEOUT,
             Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
         );
-        self.reading.push((n, slot));
+        self.reading.push((n, url, slot));
     }
 
     /// Lands the documents read by now. One whose command gave up is dropped, and forgotten.
     fn documents_in(&mut self) {
-        for (n, slot) in std::mem::take(&mut self.reading) {
+        for (n, url, slot) in std::mem::take(&mut self.reading) {
             let answer = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
             let Some(answer) = answer else {
-                self.reading.push((n, slot));
+                self.reading.push((n, url, slot));
                 continue;
             };
             match answer {
                 Ok(bytes) => self.land(n, Ok(json!({})), Added { document: Some(bytes.into()), ..Added::default() }),
                 // Its command gets this as its answer: without the address's keys.
-                Err(e) => self.land(n, Err(crate::sources::redact_text(&e)), Added::default()),
+                Err(e) => self.land(n, Err(crate::sources::message_with_address(&url, &e)), Added::default()),
             }
             self.refused(n);
         }
@@ -610,11 +624,18 @@ impl UrlWaits {
         }
     }
 
+    /// Keeps the views of the requests still being made or landed only.
+    fn prune_views(&mut self) {
+        let live: Vec<u64> = self.in_flight.iter().map(|(n, ..)| *n).chain(self.landed.iter().map(|(n, ..)| *n)).collect();
+        self.views.retain(|n, _| live.contains(n));
+    }
+
     /// Only what `waiting` still waits for is kept.
     fn keep_only(&mut self, waiting: &[Retry]) {
         let wanted = |n: &u64| waiting.iter().any(|r| r.requests.contains(n));
         self.in_flight.retain(|(n, ..)| wanted(n));
         self.landed.retain(|(n, ..)| wanted(n));
+        self.views.retain(|n, _| wanted(n));
         let retained: Vec<u64> = self
             .in_flight
             .iter()
@@ -661,10 +682,13 @@ impl Session {
     /// eventual `layer.addDownload`; a command run again asks for the same.
     pub(crate) fn asked_for(&self, p: &Value) -> Value {
         let mut asked = without_request(p);
-        if self.web_logins.is_anonymous()
-            && let Some(o) = asked.as_object_mut()
-        {
-            o.insert("anonymous".into(), json!(true));
+        if let Some(o) = asked.as_object_mut() {
+            // Only the session tells windows of the view apart ([`Session::with_view`]): a caller's
+            // own `viewAsked` is left out.
+            o.remove(VIEW_ASKED);
+            if self.web_logins.is_anonymous() {
+                o.insert("anonymous".into(), json!(true));
+            }
         }
         asked
     }
@@ -725,6 +749,17 @@ impl Session {
             asked_now.push((number, asked));
         }
         Ok(None)
+    }
+
+    /// What a window of the view was asked as, for a command run again to be answered by: `asked`
+    /// with the box the view was then (`UrlWaits::views`), so two windows of the view asked in
+    /// two views are told apart. Others are `asked` as it is.
+    pub(crate) fn with_view(asked: &Value, view: Option<[f64; 4]>) -> Value {
+        let mut asked = asked.clone();
+        if let (Some(v), Some(o)) = (view, asked.as_object_mut()) {
+            o.insert(VIEW_ASKED.into(), json!(v));
+        }
+        asked
     }
 
     /// Whether a command run again has an answer for `wanted`.
@@ -880,6 +915,7 @@ impl Session {
     fn poll_plugin_retries_at(&mut self, now: Instant) -> Vec<(String, CmdResult)> {
         self.url_waits.documents_in();
         if self.plugin_retries.is_empty() {
+            self.url_waits.prune_views();
             return Vec::new();
         }
         // Said here too: the command may go on without it, and what it answers goes nowhere.
@@ -911,12 +947,9 @@ impl Session {
                 // runs, and the ones it waited for. These stay in `landed` until no command waits
                 // for them (`keep_only`, below), so another command waiting for the same download
                 // gets the answer too.
-                let mine = self
-                    .url_waits
-                    .landed
-                    .iter()
-                    .filter(|(n, ..)| r.requests.contains(n))
-                    .map(|(_, asked, answer, added)| (asked.clone(), answer.clone(), added.clone()));
+                let mine = self.url_waits.landed.iter().filter(|(n, ..)| r.requests.contains(n)).map(|(n, asked, answer, added)| {
+                    (Self::with_view(asked, self.url_waits.views.get(n).copied()), answer.clone(), added.clone())
+                });
                 self.rerun_landed = r.answered.iter().cloned().chain(mine).collect();
                 self.rerun_said = r.said;
                 self.retry_tries = r.tries;
@@ -952,6 +985,17 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long refused address is shortened without cutting an omission marker in half: the
+    /// address before it is cut instead, and its query stays out.
+    #[test]
+    fn a_shortened_refused_address_keeps_whole_markers() {
+        let url = format!("ftp://h.example/{}?page=1&token=hidden", "a".repeat(52));
+        let error = checked(&url).unwrap_err();
+        assert!(!error.contains("hidden") && !error.contains("page=1"), "{error}");
+        assert!(error.ends_with("a…[query omitted]: plugins fetch only http:// and https:// addresses"), "{error}");
+        assert_eq!(error.split(": plugins").next().map(|a| a.chars().count()), Some(80), "{error}");
+    }
 
     /// A failure answers once a run, in the order it came, and a call made again after it is a new
     /// download: a command trying again gets its next try, not the same failure for ever. What was
@@ -1054,11 +1098,12 @@ mod tests {
         waits.wait(2, doc(2));
         waits.wait(3, doc(3));
         waits.remember_given_up(4, doc(4));
+        // Each read carries the address it fetched, which the error names.
         waits.reading = vec![
-            (1, reading(Some(Ok(b"caps".to_vec())))),
-            (2, reading(Some(Err("https://x.org/2?token=hunter2: 404 Not Found".into())))),
-            (3, reading(None)),
-            (4, reading(Some(Ok(b"late".to_vec())))),
+            (1, "https://x.org/1".into(), reading(Some(Ok(b"caps".to_vec())))),
+            (2, "https://x.org/2?token=hunter2".into(), reading(Some(Err("https://x.org/2?token=hunter2: 404 Not Found".into())))),
+            (3, "https://x.org/3".into(), reading(None)),
+            (4, "https://x.org/4".into(), reading(Some(Ok(b"late".to_vec())))),
         ];
         waits.documents_in();
         let landed = |n: u64| waits.landed.iter().find(|(m, ..)| *m == n);

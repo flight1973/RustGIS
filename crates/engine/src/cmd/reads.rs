@@ -1,6 +1,8 @@
 //! Reads the desktop app makes on a thread of its own before a command adds what they read
 //! (#1291 step 3): Add Data's whole-file reads (a raster, a raster GDAL converts, a GeoJSON,
-//! delimited text or spreadsheet read whole), Reload Data, Load All Features and native models or scripts. [`read_ahead`]
+//! delimited text or spreadsheet read whole, a CityJSON or CityGML model's layers), Reload Data, Load All
+//! Features, Convert To Annotation's read of a layer read in place, native models or scripts and the
+//! Error Inspector's topology check (#1291). [`read_ahead`]
 //! takes what the read needs of the session, [`ReadAhead::run`] reads on the thread, and [`read_land`]
 //! runs the admitted command under its initiating owner: the command takes
 //! it instead of reading again, so what it adds, says, logs and puts in Undo is the same as when
@@ -45,6 +47,13 @@ pub struct ReadAhead {
 }
 
 impl ReadAhead {
+    /// The immutable registered invocation retained by this read, for queue presentation only.
+    pub fn command(&self) -> Option<(&'static str, &Value)> {
+        match self.op.op() {
+            CommandOp::Registered { spec, params } => Some((spec.id, params)),
+            _ => None,
+        }
+    }
     /// Whether this command has a read to make before it lands; otherwise landing runs it inline.
     pub fn reads(&self) -> bool {
         self.work.is_some()
@@ -90,6 +99,14 @@ pub(crate) fn prepare(s: &Session, op: Authorized<CommandOp>, owner: Continuatio
             let layer = s.map().layer(s.layer_id(params)?).ok_or("no such layer")?;
             ("Load All Features", super::layer::load_all_ahead(s, params), layer.source.clone())
         }
+        "labels.convert" => {
+            let layer = s.map().layer(s.layer_id(params)?).ok_or("no such layer")?;
+            // Nothing to convert: the command says so at once, with no read.
+            let work = super::labels::has_label_text(layer, s.map().scale())
+                .then(|| super::whole::ahead(s, params, "Convert To Annotation"))
+                .flatten();
+            ("Convert To Annotation", work, layer.source.clone())
+        }
         "layer.reloadData" => {
             #[cfg(not(target_arch = "wasm32"))]
             let work = super::repair::reload_ahead(s, params);
@@ -113,7 +130,16 @@ pub(crate) fn prepare(s: &Session, op: Authorized<CommandOp>, owner: Continuatio
             let work = None;
             ("Run Script", work, None)
         }
-        _ => return Err("only Add Data, Reload Data, Load All, models and scripts can prepare background work".into()),
+        "map.reloadTiles" | "map.repairTiles" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let work = Some(super::repair::archive_ahead(s, spec.id, params));
+            #[cfg(target_arch = "wasm32")]
+            let work = None;
+            let name = if spec.id == "map.repairTiles" { "Repair Data Source" } else { "Reload Data" };
+            (name, work, None)
+        }
+        "topology.validate" => ("Error Inspector", super::design::topology_ahead(s, params), None),
+        _ => return Err("only Add Data, Load All, Reload Data, Convert To Annotation, models, scripts, tile archives and topology prepare background work".into()),
     };
     let name = work.as_ref().map_or(name, |work| work.name);
     Ok(ReadAhead { name, op, owner, source, work })
@@ -122,6 +148,15 @@ pub(crate) fn prepare(s: &Session, op: Authorized<CommandOp>, owner: Continuatio
 /// Consumes a completed read under its initiating owner, with ordinary command history and undo.
 pub fn read_land(s: &mut Session, read: Read) -> CmdResult {
     s.finish_read(read)
+}
+
+/// Captures the archive selected now, so a queued UI read cannot retarget an index or name.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn archive_target(s: &Session, p: &Value) -> Option<(usize, rustgis_map::TileLayer)> {
+    let i = super::tiles::find(s, p).ok()??;
+    let tile = s.map().tiles.get(i)?;
+    tile.archive_file()?;
+    Some((i, tile.clone()))
 }
 
 /// `work` as a read for the command to take under `key`.

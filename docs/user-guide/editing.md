@@ -129,6 +129,15 @@ you edit the value or choose units; click **Apply elevation** to apply the new i
   (Move, and `edit.traverse`, which draws a line or polygon from distances and bearings).
 - **Topology**: rules (must not overlap, must not have gaps, must not self-intersect, must not
   have dangles, must be covered by); Validate lists the errors, and clicking one zooms to it.
+  On the desktop the check runs in the background, so the map stays in use: the status bar
+  shows **Error Inspector** with its progress and **Cancel**, and a check that can be cancelled
+  takes any amount of work (a gaps rule first joins all its polygons in one step, which
+  **Cancel** stops only once it is done). A layer edited while it is checked makes the check say
+  so: run Validate again. Checked from a script, the assistant or the command line, it holds
+  the window and stops after a fixed amount of work, saying which rules weren't checked
+  completely (a gaps rule's join of its polygons has no such limit). A line or ring too complex
+  to check for self-intersections within the limit is listed at its first point, to be looked
+  at, and its rule is said to be incomplete.
   Beyond 85.05° they follow the geometry tools (see
   [Geoprocessing tools](analysis.md#geoprocessing-tools), **Near the poles**).
 - **Status**: features added, changed and deleted per layer since the last save.
@@ -226,8 +235,9 @@ such as `image_page_url` or `image_credit` stay links or text in the list.
 A picture from RustGIS's own asset server (`https://assets.rustgis.app/…`) is fetched as the pop-up
 opens. A picture from any other server isn't: the pop-up shows **Show Picture** and the server's
 name, and fetches nothing until you click it, because the request tells that server that someone
-opened the data (see [Privacy](../privacy.md)). A spinner shows while a picture is fetched. Pictures
-of up to 4 MB and 2048 × 2048 pixels are shown; the last 16 addresses' pictures are kept for the
+opened the data (see [Privacy](../privacy.md)). A spinner shows while a picture is fetched. PNG, JPEG,
+WebP and GIF pictures of up to 4 MB and 2048 × 2048 pixels are shown (on every platform; any other
+format, such as BMP or TIFF, is "not supported"); the last 16 addresses' pictures are kept for the
 session, so opening the pop-up again shows the picture without asking again; they are forgotten with
 the web layers' cached tiles (signing out of ArcGIS, a login that ends, **Reload Web Layers**). When
 one can't be shown, the pop-up says why ("Picture unavailable: …": the server's answer, a network

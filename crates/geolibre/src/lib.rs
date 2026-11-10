@@ -221,6 +221,7 @@ fn field_kind(name: &str) -> Option<ParamKind> {
     }
 }
 
+/// Builds the form and staging metadata together, including legacy Composite Bands inputs.
 fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
     let id = m.get("id")?.as_str()?;
     let name = m.get("display_name").and_then(Value::as_str).filter(|n| !n.is_empty()).unwrap_or(id);
@@ -232,13 +233,21 @@ fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
     for p in m.get("params").and_then(Value::as_array).into_iter().flatten() {
         let Some(pname) = p.get("name").and_then(Value::as_str) else { continue };
         let schema = p.get("schema");
-        let data = Data::of(p.get("data_kind").and_then(Value::as_str).unwrap_or(""));
+        // GeoLibre 1.8.0/1.8.1 describe this raster list as a string option (#1684).
+        // Correct both the form and staging; leave explicit metadata from newer runners alone.
+        let composite_inputs = id == "composite_bands"
+            && pname == "inputs"
+            && p.get("io_role").is_none()
+            && p.get("data_kind").and_then(Value::as_str) == Some("string")
+            && schema.and_then(|s| s.get("kind")).and_then(Value::as_str) == Some("string");
+        let data = if composite_inputs { Data::Raster } else { Data::of(p.get("data_kind").and_then(Value::as_str).unwrap_or("")) };
         let role = match p.get("io_role").and_then(Value::as_str) {
+            None if composite_inputs => Role::Input,
             Some("input") => Role::Input,
             Some("output") => Role::Output,
             _ => Role::Option,
         };
-        let many = schema.and_then(|s| s.get("cardinality")).and_then(Value::as_str).is_some_and(|c| c != "single");
+        let many = composite_inputs || schema.and_then(|s| s.get("cardinality")).and_then(Value::as_str).is_some_and(|c| c != "single");
         let optional = !p.get("required").and_then(Value::as_bool).unwrap_or(false);
         let default = defaults.and_then(|d| d.get(pname)).filter(|v| optional && !v.is_null()).cloned();
         meta.push(MetaParam { name: pname.to_string(), role, data, default });
@@ -531,6 +540,17 @@ fn option_value(v: &Value, data: Data) -> Value {
     }
 }
 
+/// Whether option value `v` is the manifest's default `d`. The form sends text, so a default that
+/// isn't text on a field shown as text comes back as its JSON (`[255,255,255,255]`, `false`).
+fn is_default(v: &Value, d: &Value, data: Data) -> bool {
+    option_value(d, data) == *v || (!d.is_string() && json_text(v).as_ref() == Some(d))
+}
+
+/// The JSON a text value spells (`"[255,255,255,255]"` gives the list), if it is text and reads.
+fn json_text(v: &Value) -> Option<Value> {
+    v.as_str().and_then(|t| serde_json::from_str(t).ok())
+}
+
 /// Immutable manifest metadata paired with one published analysis schema.
 #[derive(Clone)]
 pub struct ResolvedTool {
@@ -574,21 +594,20 @@ pub fn prepare(spec: &ToolSpec, inputs: &dyn Inputs, params: &Value) -> Result<J
     prepare_with(spec, &meta, inputs, params)
 }
 
+/// Validates input name lists before choosing a CRS or staging files, preserving their order.
 fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Value) -> Result<Job, String> {
     let id = spec.id.strip_prefix(PREFIX).ok_or("not a GeoLibre tool")?;
     let value_of = |name: &str| params.get(name).filter(|v| !v.is_null() && v.as_str() != Some(""));
-    let names = |v: &Value| -> Vec<String> {
-        v.as_str().map(|s| s.split(';').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()).unwrap_or_default()
-    };
+    let names = rustgis_analysis::layer_list;
 
     // Rasters set the coordinate system; otherwise the vector data's UTM zone.
     let mut raster_crs = Vec::new();
     let mut vector_extents = Vec::new();
     for p in meta.params.iter().filter(|p| p.role == Role::Input) {
-        for n in value_of(&p.name).map(names).unwrap_or_default() {
-            if let Some(r) = inputs.raster(&n) {
+        for n in value_of(&p.name).map(names).transpose()?.unwrap_or_default() {
+            if let Some(r) = inputs.raster(n) {
                 raster_crs.push(r.raster.crs);
-            } else if let Some(ds) = inputs.dataset(&n) {
+            } else if let Some(ds) = inputs.dataset(n) {
                 vector_extents.push(ds.extent());
             }
         }
@@ -610,7 +629,7 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
         match p.role {
             Role::Input => {
                 let Some(v) = value_of(&p.name) else { continue };
-                let files = names(v).iter().map(|n| stage(inputs, n, p.data, &tf, &mut job)).collect::<Result<Vec<_>, _>>()?;
+                let files = names(v)?.into_iter().map(|n| stage(inputs, n, p.data, &tf, &mut job)).collect::<Result<Vec<_>, _>>()?;
                 if !files.is_empty() {
                     job.args.push((p.name.clone(), Arg::Files(files)));
                 }
@@ -628,7 +647,7 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
                 // own default, as when it runs alone. They can differ: `fill_depressions` lists
                 // a `flat_increment` of 0.0001 but, without one, picks a far smaller step that
                 // keeps flats draining (#237).
-                if p.default.as_ref().is_some_and(|d| option_value(d, p.data) == v) {
+                if p.default.as_ref().is_some_and(|d| is_default(&v, d, p.data)) {
                     continue;
                 }
                 job.args.push((p.name.clone(), Arg::Value(v)));

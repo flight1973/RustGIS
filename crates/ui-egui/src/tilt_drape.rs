@@ -63,6 +63,7 @@ struct Drawn {
     relief: Option<(usize, Vec<Vec<f64>>)>,
     shapes: Vec<ExtrudedShape>,
     markers: Vec<UprightMarker>,
+    archives: render::ArchiveRevision,
 }
 
 /// The drape of the moving tilted map, kept between frames while the map doesn't change.
@@ -188,7 +189,10 @@ impl TiltDrape {
     }
 
     /// Makes `drawn` the drape, its pictures textures (reusing the last drape's).
-    fn show(&mut self, ctx: &egui::Context, drawn: Drawn) {
+    fn show(&mut self, ctx: &egui::Context, drawn: Drawn, map: &Map) {
+        if !drawn.archives.current([map]) {
+            return;
+        }
         // Something to drape: `warm` keeps it up to date again.
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -225,6 +229,7 @@ impl TiltDrape {
         if let Some(drawn) = self.take(map)
             && drawn.key == key
             && drawn.ppp == drape_ppp
+            && drawn.archives.current([&*map])
             && self.drape.as_ref().is_none_or(|d| d.built <= drawn.built)
         {
             if drawn.patches.is_empty() {
@@ -233,7 +238,7 @@ impl TiltDrape {
                 self.drape = None;
                 self.empty = Some((key, drawn.camera));
             } else {
-                self.show(ctx, drawn);
+                self.show(ctx, drawn, map);
             }
         }
         if self.job.as_ref().is_some_and(|(k, _)| *k != key) {
@@ -339,7 +344,7 @@ impl TiltDrape {
             self.drape = None;
             return false;
         }
-        self.show(ctx, drawn);
+        self.show(ctx, drawn, map);
         true
     }
 
@@ -439,8 +444,8 @@ impl TiltDrape {
             .collect();
         let mut mesh = Mesh::default();
         // Shadows on the ground first, under every feature.
-        let shade = Color32::from_black_alpha(60);
         for (s, _, up, rings, _) in shapes.iter().filter(|x| x.0.shadows) {
+            let shade = Color32::from_black_alpha((60 * u16::from(s.fill.a()) / 255) as u8);
             for q in render::tilted_shadow_quads(cam, w, h, rings, *up) {
                 fan(&mut mesh, q.into_iter().map(|p| Some(pos(p))), shade);
             }
@@ -456,7 +461,8 @@ impl TiltDrape {
         }
         for (s, depth, up, rings, holes) in &shapes {
             let t = ((depth - FAR * 0.5) / (FAR * 0.5)).clamp(0.0, 1.0);
-            let base = s.fill.lerp(fog, t * t * (3.0 - 2.0 * t));
+            // Fog fades the colour, not the layer's transparency (the alpha stays).
+            let base = s.fill.lerp(fog, t * t * (3.0 - 2.0 * t)).with_alpha(s.fill.a());
             for wall in render::tilted_walls(cam, w, h, rings, holes, *up, s.face_culling, s.lighting) {
                 let (top, foot) = (c32(base.shade(wall.top)), c32(base.shade(wall.foot)));
                 let [fa, fb, tb, ta] = wall.quad;
@@ -556,9 +562,21 @@ impl TiltDrape {
 fn draw(map: &mut Map, view: &View, max_side: u32, key: DrapeKey, tiles: u64, time: f64) -> Drawn {
     let cam = view.camera;
     let ppp = view.pixels_per_point as f32;
+    let archives = render::archive_revisions([&*map]);
     let patches = render::render_tilt_drape(map, view, MARGIN, max_side);
     if patches.is_empty() {
-        return Drawn { key, ppp, camera: cam, tiles, built: time, patches, relief: None, shapes: Vec::new(), markers: Vec::new() };
+        return Drawn {
+            key,
+            ppp,
+            camera: cam,
+            tiles,
+            built: time,
+            patches,
+            relief: None,
+            shapes: Vec::new(),
+            markers: Vec::new(),
+            archives,
+        };
     }
     // A turned flat map's band is a square over the circle round the view: what stands on it is
     // taken over all of it, as the view turns there.
@@ -586,7 +604,7 @@ fn draw(map: &mut Map, view: &View, max_side: u32, key: DrapeKey, tiles: u64, ti
             .collect();
         (n, heights)
     });
-    Drawn { key, ppp, camera: cam, tiles, built: time, patches, relief, shapes, markers }
+    Drawn { key, ppp, camera: cam, tiles, built: time, patches, relief, shapes, markers, archives }
 }
 
 /// Adds a convex polygon (screen points, `None` where one couldn't be placed) to `mesh` as a fan
@@ -1067,7 +1085,18 @@ mod tests {
 
     /// A drape with nothing in it, as a worker hands back for a view over no ground.
     fn nothing(key: DrapeKey, camera: Camera) -> Drawn {
-        Drawn { key, ppp: 1.0, camera, tiles: 0, built: 0.0, patches: Vec::new(), relief: None, shapes: Vec::new(), markers: Vec::new() }
+        Drawn {
+            key,
+            ppp: 1.0,
+            camera,
+            tiles: 0,
+            built: 0.0,
+            patches: Vec::new(),
+            relief: None,
+            shapes: Vec::new(),
+            markers: Vec::new(),
+            archives: Default::default(),
+        }
     }
 
     /// Prepares `d` until the drape being drawn is shown.

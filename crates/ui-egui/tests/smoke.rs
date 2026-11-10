@@ -2011,6 +2011,75 @@ fn data_from_a_web_address_lands_later() {
     assert!(h.state().ui.downloads.is_empty());
 }
 
+/// A failed header probe, ordinary download and project download retain their HTTP reason after
+/// notices and diagnostic history redact the message again (#1475).
+#[test]
+fn address_failures_keep_status_without_credentials() {
+    use ogc_server::{Route, Server};
+    let server = Server::new(
+        ["probe.tif", "remote.fgb", "download.geojson", "project.rgis"]
+            .into_iter()
+            .map(|name| Route { status: 503, ..Route::new(&format!("/{name}"), "") })
+            .collect(),
+    );
+    let mut h = harness();
+    h.step();
+    for (command, file, query) in [
+        ("ui.addUrl", "probe.tif", "sig=hidden-probe"),
+        ("ui.addUrl", "remote.fgb", "token=hidden-remote"),
+        ("ui.addUrl", "download.geojson", "key=hidden-download"),
+        ("ui.openUrl", "project.rgis", "%74oken=hidden-project"),
+    ] {
+        let url = format!("{}/{file}?{query}#hidden-fragment", server.base);
+        h.state_mut().session.notices.clear();
+        h.state_mut().run(command, json!({"url": url})).unwrap();
+        for _ in 0..200 {
+            h.step();
+            if h.state().session.notices.iter().any(|n| n.error) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let notices = &h.state().session.notices;
+        let failure = notices.iter().find(|n| n.error).unwrap_or_else(|| panic!("{file}: no failure notice"));
+        assert!(failure.text.contains(file) && failure.text.contains("503"), "{failure:?}");
+        assert!(notices.iter().all(|n| !n.text.contains("hidden")), "{notices:?}");
+        let report = h.state().session.diagnostics.report(rustgis_engine::data::diagnostics::Filter::All);
+        assert!(!report.contains("hidden"), "{report}");
+        assert!(report.lines().any(|line| line.contains(file) && line.contains("503")), "{report}");
+    }
+}
+
+/// A required Shapefile part is the failed resource, not a second name for its parent.
+#[test]
+fn shapefile_part_failures_keep_one_address_and_the_http_reason() {
+    use ogc_server::{Route, Server};
+    let server = Server::new(vec![Route::new("/secret.shp", "shape-fixture"), Route::new("/versioned.shp", "shape-fixture")]);
+    let mut h = harness();
+    h.step();
+    for (name, query) in [("secret", "token=hidden-part"), ("versioned", "page=2")] {
+        h.state_mut().session.notices.clear();
+        h.state_mut().run("ui.addUrl", json!({"url":format!("{}/{name}.shp?{query}",server.base)})).unwrap();
+        for _ in 0..200 {
+            h.step();
+            if h.state().session.notices.iter().any(|notice| notice.error) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let failure = h.state().session.notices.iter().find(|notice| notice.error).unwrap();
+        assert!(failure.text.contains(&format!("/{name}.dbf")) && failure.text.contains("404"), "{failure:?}");
+        assert!(!failure.text.contains(".shp") && !failure.text.contains("hidden"), "{failure:?}");
+        assert_eq!(failure.text.matches("://").count(), 1, "{failure:?}");
+        let redacted = rustgis_engine::Session::redacted(&failure.text);
+        assert_eq!(redacted.as_str(), failure.text);
+    }
+    assert_eq!(
+        server.requests().iter().map(|request| request.path.as_str()).collect::<Vec<_>>(),
+        ["/secret.shp", "/secret.dbf", "/versioned.shp", "/versioned.dbf"]
+    );
+}
+
 /// A local server answering with a small cloud-optimised GeoTIFF by range, its HEAD answers
 /// announcing the TIFF header's length as Vantor's Transform API does: its address, the bytes it
 /// has sent and the file's length.
@@ -2987,6 +3056,8 @@ fn connections_tree_browses_and_adds() {
 
 /// Save in the web app (issue #197): the browser has no save dialog, so the first Save and every
 /// Save As ask for the file name, and Save then downloads under it; an opened file keeps its name.
+/// A download offered isn't a file saved (the user can cancel the browser's prompt), so the
+/// project keeps its unsaved changes and leaving the page still warns.
 #[test]
 fn web_save_asks_for_the_file_name() {
     let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Vec<u8>)>::new()));
@@ -3008,8 +3079,10 @@ fn web_save_asks_for_the_file_name() {
         app,
     );
     let names = |got: &std::sync::Mutex<Vec<(String, Vec<u8>)>>| got.lock().unwrap().iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
-    // A project never saved: Save asks first, with the project's name.
-    h.state_mut().run("layer.color", json!({"layer": "Countries", "color": "#336699"})).unwrap();
+    // A clean document's Save As rename is itself unsaved; no unrelated dirty edit is needed
+    // to keep the browser's close warning active after a download is merely offered.
+    h.state_mut().session.mark_saved();
+    assert!(!h.state().session.dirty());
     h.state_mut().run("ui.save", json!(null)).unwrap();
     assert_eq!(h.state().dialogs.open, Some("saveProject"));
     assert_eq!(h.state().dialogs.text, "World Atlas.rgis");
@@ -3029,7 +3102,8 @@ fn web_save_asks_for_the_file_name() {
     assert_eq!(h.state().dialogs.open, None);
     assert_eq!(names(&got), ["Trip plan.rgis"]);
     assert_eq!(h.state().session.project.name, "Trip plan");
-    assert!(!h.state().session.dirty());
+    assert!(h.state().session.dirty(), "a download offered doesn't mark the project saved");
+    assert!(h.state().session.notices.iter().any(|n| n.text.starts_with("Download offered: Trip plan.rgis")));
     // Saved once: Save downloads under that name again without asking; Save As asks.
     h.state_mut().run("ui.save", json!(null)).unwrap();
     assert_eq!(h.state().dialogs.open, None);
@@ -3042,9 +3116,13 @@ fn web_save_asks_for_the_file_name() {
     let bytes = got.lock().unwrap()[0].1.clone();
     h.state_mut().open_picked("test.rgis", &bytes).unwrap();
     assert_eq!(h.state().session.project.name, "test");
+    assert!(!h.state().session.dirty());
     h.state_mut().run("ui.save", json!(null)).unwrap();
     assert_eq!(h.state().dialogs.open, None);
     assert_eq!(names(&got).last().map(String::as_str), Some("test.rgis"));
+    assert!(!h.state().session.dirty(), "an unchanged opened project stays clean after a download offer");
+    let notice = h.state().session.notices.iter().rev().find(|n| n.text.starts_with("Download offered: test.rgis")).unwrap();
+    assert!(!notice.text.contains("unsaved changes"), "{}", notice.text);
     // Another project in its place hasn't been saved: Save asks again, even under the same name.
     let n = names(&got).len();
     h.state_mut().run("project.new", json!({"name": "test"})).unwrap();
@@ -3608,6 +3686,175 @@ fn plugin_panels_run_their_commands_when_a_slider_is_let_go() {
     assert!(h.state_mut().run("ui.pane.plugin", json!({"id": "ui-panel"})).is_err());
     assert!(h.state_mut().run("ui.pane.plugin", json!({"id": 7})).is_err());
     rp::unload("ui-panel");
+}
+
+/// The session log's last run of plugin command `id`: its parameters, if it ran and succeeded
+/// (the pick test plugin has `edit`, so its commands are logged).
+fn last_run(h: &egui_kittest::Harness<'_, RustGisApp>, id: &str) -> Option<serde_json::Value> {
+    h.state().session.log.entries().filter(|e| e.command == id).last().filter(|e| e.ok).map(|e| e.params.clone())
+}
+
+/// The parameters of the run of plugin command `id` after the log's first `seen` entries: frames
+/// until it is there (a plugin command asked for in the interface starts a frame or two later).
+fn run_after(h: &mut egui_kittest::Harness<'_, RustGisApp>, id: &str, seen: usize) -> serde_json::Value {
+    for _ in 0..40 {
+        if let Some(e) = h.state().session.log.entries().skip(seen).find(|e| e.command == id) {
+            assert!(e.ok, "{id} failed: {:?}", e.error);
+            return e.params.clone();
+        }
+        h.step();
+    }
+    let log: Vec<String> = h.state().session.log.entries().map(|e| format!("{} {:?}", e.command, e.error)).collect();
+    panic!("{id} didn't run: {log:?}");
+}
+
+/// Runs test `name` again in a process of its own, as the app's own tests that own process-wide
+/// accounts do: a plugin command asked for in the interface starts a frame later and checks first
+/// that the storage accounts haven't changed, and another test here connects and disconnects one.
+/// True in the parent, which then has nothing more to do.
+fn in_own_process(name: &str) -> bool {
+    if std::env::var("RUSTGIS_SMOKE_ALONE").as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).args(["--exact", name]).env("RUSTGIS_SMOKE_ALONE", name).output())
+        .expect("start the test in a process of its own");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "{name} failed in a process of its own:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
+/// Unloads a test plugin when dropped, so a failed test doesn't leave it for the next one.
+struct Unload(&'static str);
+
+impl Drop for Unload {
+    fn drop(&mut self) {
+        rustgis_ui_egui::rustgis_engine::plugins::unload(self.0);
+    }
+}
+
+/// Whether a pick waits for the map: the status bar says so.
+fn waits_for_the_map(h: &egui_kittest::Harness<'_, RustGisApp>) -> bool {
+    h.query_all_by_label_contains("the map · Esc cancels").next().is_some()
+}
+
+/// A plugin's pick waits for the map: a click there runs its command with the place, a box dragged
+/// for a box; Esc, or another tool, stops it waiting with nothing run.
+#[test]
+fn plugin_picks_take_a_place_on_the_map() {
+    if in_own_process("plugin_picks_take_a_place_on_the_map") {
+        return;
+    }
+    let _turn = PLUGINS.lock().unwrap_or_else(|e| e.into_inner());
+    use rustgis_ui_egui::rustgis_engine::plugins as rp;
+    rp::load(rp::Package::from_zip(&rp::testing::pick_package("ui-pick")).unwrap(), "test").unwrap();
+    let _unload = Unload("ui-pick");
+    let mut h = harness();
+    h.state_mut().run("ui.pane.plugin", json!({"id": "ui-pick"})).unwrap();
+    h.run_steps(3);
+    let place = |h: &egui_kittest::Harness<'_, RustGisApp>, id: &str| h.state().session.plugin_panels["ui-pick"].values[id].clone();
+    // A point, labelled by its command: a click on the map runs it with the place.
+    h.get_by_label("⌖ Grow a Sample").click();
+    h.run_steps(2);
+    assert!(waits_for_the_map(&h));
+    assert!(last_run(&h, "plugin:ui-pick/q-grow").is_none());
+    let seen = h.state().session.log.len();
+    click_map(&mut h);
+    let ran = run_after(&mut h, "plugin:ui-pick/q-grow", seen);
+    assert!(!waits_for_the_map(&h), "one click");
+    let given = &ran["panel"]["seed"];
+    let (lon, lat) = (given["lon"].as_f64().unwrap(), given["lat"].as_f64().unwrap());
+    assert!((-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat), "{ran}");
+    let seed = place(&h, "seed");
+    assert_eq!((seed["lon"].as_f64(), seed["lat"].as_f64()), (Some(lon), Some(lat)), "{seed}");
+    assert!(seed["x"].is_f64() && seed["y"].is_f64() && seed["crs"] == "EPSG:3857", "in the map's coordinates too: {seed}");
+    // The pane shows where (and so does the status bar's readout, the pointer being there).
+    let shown = rustgis_ui_egui::rustgis_engine::geom::format_lonlat(rustgis_ui_egui::rustgis_engine::geom::Coord::new(lon, lat));
+    assert!(h.query_all_by_label(&shown).count() >= 2, "the pane shows where: {shown}");
+    // Esc stops it waiting: the next click runs nothing, and identifies as ever.
+    h.get_by_label("⌖ Grow a Sample").click();
+    h.run_steps(2);
+    assert!(waits_for_the_map(&h));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!waits_for_the_map(&h), "Esc");
+    let runs = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+        h.state().session.log.entries().filter(|e| e.command.starts_with("plugin:ui-pick/")).count()
+    };
+    let before = runs(&h);
+    click_map(&mut h);
+    h.run_steps(3);
+    assert_eq!(runs(&h), before, "nothing ran");
+    assert_eq!(place(&h, "seed"), seed, "the place stays");
+    // Clicked again while it waits, the pick stops; another tool stops it too.
+    h.get_by_label("⌖ Grow a Sample").click();
+    h.run_steps(2);
+    h.get_by_label("⌖ Grow a Sample").click();
+    h.run_steps(2);
+    assert!(!waits_for_the_map(&h), "clicked again");
+    h.get_by_label("⌖ Grow a Sample").click();
+    h.run_steps(2);
+    h.state_mut().run("tool.set", json!({"tool": "measure"})).unwrap();
+    h.run_steps(2);
+    assert!(!waits_for_the_map(&h), "another tool");
+    // Started under another tool, a pick brings back Explore, so the map's drags pan.
+    h.get_by_label("⌖ Classify Inside a Box").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.tool, rustgis_ui_egui::rustgis_engine::Tool::Explore);
+    assert!(h.query_all_by_label_contains("drag a box on the map").next().is_some());
+    // A box: a click doesn't do, a drag does.
+    click_map(&mut h);
+    assert!(waits_for_the_map(&h), "a click is no box");
+    let (from, to) = (egui::pos2(640.0, 440.0), egui::pos2(780.0, 560.0));
+    h.event(egui::Event::PointerMoved(from));
+    h.event(egui::Event::PointerButton {
+        pos: from,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+    for i in 1..=6 {
+        h.event(egui::Event::PointerMoved(from + (to - from) * (i as f32 / 6.0)));
+        h.step();
+    }
+    let camera = h.state().session.map().camera.center;
+    let seen = h.state().session.log.len();
+    h.event(egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE });
+    let ran = run_after(&mut h, "plugin:ui-pick/q", seen);
+    h.run_steps(2);
+    assert_eq!(h.state().session.map().camera.center, camera, "the drag didn't pan");
+    assert!(!waits_for_the_map(&h));
+    let b = ran["panel"]["area"]["bbox"].as_array().cloned().unwrap_or_default();
+    assert!(b.len() == 4 && b[0].as_f64() < b[2].as_f64() && b[1].as_f64() < b[3].as_f64(), "{ran}");
+    let area = place(&h, "area");
+    let corner = |x: usize, y: usize| {
+        rustgis_ui_egui::rustgis_engine::geom::format_lonlat(rustgis_ui_egui::rustgis_engine::geom::Coord::new(
+            b[x].as_f64().unwrap_or_default(),
+            b[y].as_f64().unwrap_or_default(),
+        ))
+    };
+    let shown = format!("{} to {}", corner(0, 1), corner(2, 3));
+    assert!(h.query_by_label(&shown).is_some(), "the pane shows the box: {shown}");
+    assert!(area["extent"].as_array().is_some_and(|e| e.len() == 4) && area["crs"] == "EPSG:3857", "{area}");
+    // A pick with no command keeps the place for the plugin's next request.
+    h.get_by_label("⌖ Mark a Spot").click();
+    h.run_steps(2);
+    let before = runs(&h);
+    click_map(&mut h);
+    h.run_steps(3);
+    assert_eq!(runs(&h), before, "it runs nothing");
+    assert!(place(&h, "spot")["lon"].is_f64() && place(&h, "spot")["x"].is_f64());
+    // The panel closing stops a pick waiting.
+    h.get_by_label("⌖ Grow a Sample").click();
+    h.run_steps(2);
+    h.state_mut().run("ui.pane.plugin", json!({"id": "ui-pick"})).unwrap();
+    h.run_steps(2);
+    assert!(!waits_for_the_map(&h), "the panel closed");
 }
 
 /// A run in the History pane opens again in its tool with the values it ran with (#539), from

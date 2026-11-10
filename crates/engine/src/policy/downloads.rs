@@ -10,6 +10,15 @@ use std::{
     },
 };
 
+/// What a window the app read off the frame says it read (`"window"`, #1330) is what its request
+/// asked for: a box, and its cell size and `"cog"` if the request gave them, nothing else.
+fn asked_window(asked: &Value, window: &Value) -> bool {
+    const KEYS: [&str; 3] = ["bbox", "cellSize", "cog"];
+    let given = |k: &str| asked.get(k).filter(|v| !v.is_null());
+    given("bbox").is_some()
+        && window.as_object().is_some_and(|w| w.keys().all(|k| KEYS.contains(&k.as_str())) && KEYS.iter().all(|k| given(k) == w.get(*k)))
+}
+
 pub(super) struct Claim {
     pub c: Continuation,
     pub params: Value,
@@ -53,7 +62,7 @@ impl Session {
             requests: self
                 .url_requests
                 .iter()
-                .map(|q| UrlRequest { key: q.key, params: q.params.clone(), authority: q.authority.clone() })
+                .map(|q| UrlRequest { key: q.key, params: q.params.clone(), authority: q.authority.clone(), view: q.view })
                 .collect(),
             queued: self.policy.work.queued.clone(),
         }
@@ -121,7 +130,11 @@ impl Session {
             return;
         }
         if self.url_waits.holds(n, p) {
-            self.url_waits.land(n, Err(crate::sources::redact_text(error)), crate::cmd::plugins::fetch::Added::default());
+            let error = p
+                .get("url")
+                .and_then(Value::as_str)
+                .map_or_else(|| Self::redacted(error).into_string(), |url| crate::sources::message_with_address(url, error));
+            self.url_waits.land(n, Err(error), crate::cmd::plugins::fetch::Added::default());
         }
         if self.url_waits.given_up(n, p) {
             self.url_waits.refused(n);
@@ -145,7 +158,7 @@ impl Session {
         self.landed_reads.retain(|(k, _)| *k != id);
         #[cfg(not(target_arch = "wasm32"))]
         self.landed_windows.retain(|(k, _)| *k != id);
-        let url = crate::sources::redact_text(p.get("url").and_then(Value::as_str).unwrap_or("download"));
+        let url = crate::sources::address_in_message(p.get("url").and_then(Value::as_str).unwrap_or("download"));
         if added {
             Ok(Some(format!("{url}: it was added already for its plugin command, so it wasn't added again")))
         } else {
@@ -230,6 +243,7 @@ impl Session {
             .iter()
             .find(|q| {
                 crate::cmd::plugins::fetch::same_request(&q.params, &asked)
+                    && q.view == self.window_view
                     && self.same_url_caller(&q.authority, &c)
                     && self.check_continuation(&q.authority).is_ok()
             })
@@ -247,8 +261,13 @@ impl Session {
             .call_requests
             .as_ref()
             .and_then(|_| {
+                // A window of the view is the one asked in the same view: another is read again.
                 self.url_waits.in_flight(&asked, |n| {
-                    self.url_waits.owner(n).is_some_and(|owner| self.same_url_caller(owner, &c) && self.check_continuation(owner).is_ok())
+                    self.url_waits.views.get(&n).copied() == self.window_view
+                        && self
+                            .url_waits
+                            .owner(n)
+                            .is_some_and(|owner| self.same_url_caller(owner, &c) && self.check_continuation(owner).is_ok())
                 })
             })
             .filter(|n| !self.url_waits.taken_away(*n, &self.project));
@@ -261,7 +280,11 @@ impl Session {
         };
         if (given.is_some() && waiting != Some(number)) || (waiting.is_none() && !self.url_waits.has(number)) {
             if self.policy.work.queued.len() >= crate::MAX_URL_REQUESTS {
-                return Err(format!("{} downloads are already waiting; try again when they have landed", crate::MAX_URL_REQUESTS));
+                let reason = format!("{} downloads are already waiting; try again when they have landed", crate::MAX_URL_REQUESTS);
+                return Err(p
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| Self::redacted(&reason).into_string(), |url| crate::sources::message_with_address(url, &reason)));
             }
             let mut params = asked.clone();
             params.as_object_mut().ok_or("download parameters must be an object")?.insert("request".into(), json!(number));
@@ -271,7 +294,11 @@ impl Session {
             self.next_pending = self.next_pending.wrapping_add(1);
             let key = self.next_pending;
             self.policy.work.queued.insert(key, Queued { c: Arc::downgrade(&c), import, consumed: Arc::new(AtomicBool::new(false)) });
-            self.url_requests.push(UrlRequest { key, params, authority: c });
+            let view = self.window_view.take();
+            if let Some(v) = view {
+                self.url_waits.views.insert(number, v);
+            }
+            self.url_requests.push(UrlRequest { key, params, authority: c, view });
         }
         if !import
             && let Some(asked_now) = self.call_requests.as_mut()
@@ -350,6 +377,11 @@ impl Session {
         }
         let c = (*c).clone();
         let id = self.download_started();
+        // The view a window of the view was asked in, by its number, now that the request is made
+        // (the command's own waits may have been restored since it was queued).
+        if let (Some(v), Some(n)) = (request.view, request.params.get("request").and_then(Value::as_u64)) {
+            self.url_waits.views.insert(n, v);
+        }
         self.policy.work.claims.insert(id, Claim { c, params: request.params.clone(), live: Arc::new(AtomicBool::new(true)), import });
         Ok(id)
     }
@@ -438,7 +470,8 @@ impl Session {
                 || (key == "whole" && value.as_bool() == Some(true))
                 || (key == "zoom"
                     && crate::cmd::bool_value(value) == Some(false)
-                    && claim.params.get(key).and_then(crate::cmd::bool_value) == Some(true));
+                    && claim.params.get(key).and_then(crate::cmd::bool_value) == Some(true))
+                || (key == "window" && asked_window(&claim.params, value));
             if !refinement && claim.params.get(key) != Some(value) {
                 return Err("the download's address or parameters changed since it was requested".into());
             }
@@ -481,7 +514,12 @@ impl Session {
         if let Some(number) = claim.params.get("request").and_then(Value::as_u64)
             && self.url_waits.holds(number, &claim.params)
         {
-            self.url_waits.land(number, Err(crate::sources::redact_text(error)), crate::cmd::plugins::fetch::Added::default());
+            let error = claim
+                .params
+                .get("url")
+                .and_then(Value::as_str)
+                .map_or_else(|| Self::redacted(error).into_string(), |url| crate::sources::message_with_address(url, error));
+            self.url_waits.land(number, Err(error), crate::cmd::plugins::fetch::Added::default());
         }
         if claim.import {
             crate::cmd::geolibre::discard_pending(self, &claim.params);
@@ -490,5 +528,27 @@ impl Session {
     /// Consumes a completed claim and invalidates every captured predicate.
     pub(crate) fn forget_download_claim(&mut self, id: u64) {
         self.policy.work.claims.remove(&id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::asked_window;
+    use serde_json::json;
+
+    /// A window the app read completes its request only as what was asked (#1330): the same box,
+    /// cell size and `"cog"`, and nothing more; a request with no box takes no window.
+    #[test]
+    fn a_landed_window_completes_only_what_was_asked() {
+        let asked = json!({"url": "https://x.org/a.tif", "bbox": [10.25, 45.5, 10.5, 45.75], "cellSize": 30, "name": "W"});
+        assert!(asked_window(&asked, &json!({"bbox": [10.25, 45.5, 10.5, 45.75], "cellSize": 30})));
+        assert!(!asked_window(&asked, &json!({"bbox": [0, 0, 1, 1], "cellSize": 30})), "another box");
+        assert!(!asked_window(&asked, &json!({"bbox": [10.25, 45.5, 10.5, 45.75]})), "its cell size left out");
+        assert!(!asked_window(&asked, &json!({"bbox": [10.25, 45.5, 10.5, 45.75], "cellSize": 30, "cog": true})), "cog not asked");
+        assert!(!asked_window(&asked, &json!({"bbox": [10.25, 45.5, 10.5, 45.75], "cellSize": 30, "url": "https://y.org"})), "another key");
+        assert!(!asked_window(&asked, &json!("view")), "not an object");
+        let view = json!({"url": "https://x.org/a.tif", "bbox": "view", "cellSize": null});
+        assert!(asked_window(&view, &json!({"bbox": "view"})), "a null cell size is none given");
+        assert!(!asked_window(&json!({"url": "https://x.org/a.tif"}), &json!({})), "no box asked");
     }
 }

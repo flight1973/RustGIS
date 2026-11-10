@@ -107,11 +107,55 @@ impl Session {
         if self.depth > 0 || !self.policy.nodes.is_empty() || self.policy.cursor.is_some() {
             return Err("background reads can only start before handler dispatch".into());
         }
-        if !matches!(command, "layer.addData" | "layer.loadAll" | "layer.reloadData" | "model.run" | "script.run") {
-            return Err("only Add Data, Load All, Reload Data, models and scripts can prepare background work".into());
+        self.capture_read(command, params)
+    }
+    /// Admits exactly one standalone archive command before dispatch, retaining its original
+    /// scope and one-use approval through the worker and landing. Composite/handler capture
+    /// remains forbidden, including when an approval cursor is already active.
+    pub fn start_scoped_archive_read(
+        &mut self,
+        scope: Scope,
+        call: &Call,
+        permit: Option<Permit>,
+    ) -> Result<crate::cmd::reads::ReadAhead, String> {
+        if self.depth > 0 || !self.policy.nodes.is_empty() || self.policy.cursor.is_some() || !self.policy.scopes.is_empty() {
+            return Err("background reads can only start before handler dispatch".into());
+        }
+        let CallKind::Command { id, params } = &call.kind else {
+            return Err("only a standalone archive command can prepare a scoped read".into());
+        };
+        if !matches!(id.as_str(), "map.reloadTiles" | "map.repairTiles") {
+            return Err("only a standalone archive command can prepare a scoped read".into());
+        }
+        let capture = |s: &mut Session| s.capture_read(id, params);
+        match permit {
+            Some(p) => {
+                if p.request != call.request {
+                    return Err("this approval belongs to another request".into());
+                }
+                self.run_plan_with(scope, p.plan, call, capture)
+            }
+            None => self.with_scope(scope, capture)?,
+        }
+    }
+    /// Private pre-handler capture shared by native reads and the exact scoped archive entry.
+    fn capture_read(&mut self, command: &str, params: &Value) -> Result<crate::cmd::reads::ReadAhead, String> {
+        if !matches!(
+            command,
+            "layer.addData"
+                | "layer.loadAll"
+                | "layer.reloadData"
+                | "labels.convert"
+                | "model.run"
+                | "script.run"
+                | "map.reloadTiles"
+                | "map.repairTiles"
+                | "topology.validate"
+        ) {
+            return Err("only Add Data, Load All, Reload Data, Convert To Annotation, models, scripts, tile archives and topology prepare background work".into());
         }
         let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
-        if matches!(command, "layer.loadAll" | "layer.reloadData") {
+        if matches!(command, "layer.loadAll" | "layer.reloadData" | "labels.convert") {
             let id = self.layer_id(&Value::Object(params.clone()))?;
             params.insert("layer".into(), json!(id));
         }

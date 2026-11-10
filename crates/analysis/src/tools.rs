@@ -1718,22 +1718,26 @@ fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 /// meets is kept as it is. Features left with nothing, or without geometry, are left out; the
 /// input must have geometry.
 fn erase(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    erase_on(inp, p, None)
+}
+
+/// [`erase`] on `threads` threads (by the number of items in each step when `None`): each input
+/// feature is cut on its own (#1252), and the rows come back in input order, as on one thread.
+fn erase_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     if ds.geometry_type == GeometryType::None {
         return Err(format!("'{}' has no geometry", ds.name));
     }
-    let (er, zones, left_out) = overlay_zones(inp, p, "erase", "Erase", ZoneUse::Cuts)?;
+    let (er, zones, left_out) = overlay_zones_on(inp, p, "erase", "Erase", ZoneUse::Cuts, threads)?;
     let index = ExtentIndex::new(zones.iter().map(|z| z.ext));
     let at_poles = AtPoles::new(zones.iter().map(|z| poles(&z.ext)));
     let mut out = copy_schema(ds, out_name(p, format!("{}_Erase", ds.name)), ds.geometry_type);
     keep_source_crs(&mut out, ds, er);
     let input_rows = rows(inp, p, "input", ds);
-    crate::control::begin(input_rows.len());
-    for (done, r) in input_rows.into_iter().enumerate() {
-        crate::control::check()?;
-        crate::control::reached(done);
+    let rests = outside_each(ds, &input_rows, &zones, (&index, &at_poles), threads)?;
+    for (r, rest) in input_rows.into_iter().zip(rests) {
         let Some(f) = ds.features.get(r) else { continue };
-        if let Some(rest) = f.geometry.as_ref().and_then(|g| outside(g, &zones, (&index, &at_poles))) {
+        if let Some(Some(rest)) = rest {
             out.push_next(Some(rest), f.attrs.clone());
         }
     }
@@ -1741,6 +1745,27 @@ fn erase(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let mut r = result(out, format!("Erase: {n} features remain"))?;
     r.messages.extend(left_out.notes("Erase", &er.name));
     Ok(r)
+}
+
+/// Each of `input_rows`' parts outside every zone, as [`outside`] gives it, in their order: `None`
+/// for a row with no feature or no geometry, `Some(None)` for one left with nothing. Made on
+/// `threads` threads (by the number of rows when `None`), each feature on its own (#1252); Cancel
+/// is looked at, and progress counted, between features.
+fn outside_each(
+    ds: &Dataset,
+    input_rows: &[usize],
+    zones: &[Zone],
+    near: (&ExtentIndex, &AtPoles),
+    threads: Option<usize>,
+) -> Result<Vec<Option<Option<Geometry>>>, String> {
+    crate::control::begin(input_rows.len());
+    let threads = threads.unwrap_or_else(|| crate::parallel::threads_for(input_rows.len(), PARALLEL_FEATURES));
+    crate::parallel::try_map_on(
+        input_rows,
+        threads,
+        || (),
+        |_, _, &r| Ok::<_, String>(ds.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| outside(g, zones, near))),
+    )
 }
 
 /// An overlay polygon: its row in the overlay layer, its extent and its polygons in the analysis
@@ -1771,41 +1796,66 @@ enum ZoneUse {
     AsIs,
 }
 
+/// What one overlay polygon's feature makes of its layer in [`overlay_zones_on`]: a zone, or the
+/// reason it is left out.
+enum ZoneMade {
+    Zone(Zone),
+    NoPolygon,
+    NoArea,
+}
+
 /// The polygon layer of `tool`'s parameter `k` (`overlay`, `erase`, `update`, `split`), which
 /// must be polygons, its (selected) features with a polygon as [`Zone`]s, in order, each once, and
 /// how many it left out, for the tool's notices: those with no polygon ([`NO_POLYGON`]), and,
 /// unless `use_` is [`ZoneUse::AsIs`], those of several parts whose union is empty ([`NO_AREA`]),
 /// as they cover nothing. A polygon of one part is only oriented, its edges kept exactly, so one
 /// with no area stays a zone, as it always has.
-fn overlay_zones<'a>(
+fn overlay_zones<'a>(inp: &'a dyn Inputs, p: &Json, k: &str, tool: &str, use_: ZoneUse) -> Result<(&'a Dataset, Vec<Zone>, LeftOut), String> {
+    overlay_zones_on(inp, p, k, tool, use_, None)
+}
+
+/// [`overlay_zones`] on `threads` threads (by the number of zones when `None`). A zone of several
+/// parts is a union: each zone is made on its own, on several threads when there are many
+/// (#1252), and they come back in order, as on one thread; Cancel is looked at, and progress
+/// counted, between zones.
+fn overlay_zones_on<'a>(
     inp: &'a dyn Inputs,
     p: &Json,
     k: &str,
     tool: &str,
     use_: ZoneUse,
+    threads: Option<usize>,
 ) -> Result<(&'a Dataset, Vec<Zone>, LeftOut), String> {
     let ov = input(inp, p, k)?;
     if ov.geometry_type != GeometryType::Polygon {
         return Err(format!("'{}' is not a polygon layer", ov.name));
     }
-    // A zone of several parts is a union: Cancel is looked at, and progress counted, before each.
     let zone_rows = each_once(rows(inp, p, k, ov));
     crate::control::begin(zone_rows.len());
-    let mut zones = Vec::with_capacity(zone_rows.len());
+    let threads = threads.unwrap_or_else(|| crate::parallel::threads_for(zone_rows.len(), PARALLEL_FEATURES));
+    let made = crate::parallel::try_map_on(
+        &zone_rows,
+        threads,
+        || (),
+        |_, _, &row| {
+            let Some((g, poly)) = ov.features.get(row).and_then(|f| f.geometry.as_ref()).and_then(|g| Some((g, polygon_of(g)?))) else {
+                return Ok::<_, String>(ZoneMade::NoPolygon);
+            };
+            let poly = mask_of(poly);
+            if poly.0.is_empty() && use_ != ZoneUse::AsIs {
+                return Ok(ZoneMade::NoArea);
+            }
+            Ok(ZoneMade::Zone(Zone { row, ext: g.extent(), poly }))
+        },
+    )?;
+    let mut zones = Vec::with_capacity(made.len());
     let mut left = LeftOut::default();
-    for (done, row) in zone_rows.into_iter().enumerate() {
-        crate::control::check()?;
-        crate::control::reached(done);
-        let Some((g, poly)) = ov.features.get(row).and_then(|f| f.geometry.as_ref()).and_then(|g| Some((g, polygon_of(g)?))) else {
-            left.no_polygon += 1;
-            continue;
-        };
-        let poly = mask_of(poly);
-        if poly.0.is_empty() && use_ != ZoneUse::AsIs {
-            left.no_area += 1;
-            continue;
+    for m in made {
+        match m {
+            ZoneMade::Zone(z) => zones.push(z),
+            ZoneMade::NoPolygon => left.no_polygon += 1,
+            ZoneMade::NoArea => left.no_area += 1,
         }
-        zones.push(Zone { row, ext: g.extent(), poly });
     }
     if use_ == ZoneUse::Inside && zones.is_empty() && left.no_polygon + left.no_area > 0 {
         return Err(nothing_covered(tool, &ov.name, left));
@@ -1970,8 +2020,16 @@ fn outside(g: &Geometry, zones: &[Zone], index: (&ExtentIndex, &AtPoles)) -> Opt
 /// polygon meets too, coordinates untouched (a feature that is cut comes out rebuilt, its
 /// overlapping parts unioned). Cancel is looked at per overlay polygon, input feature and
 /// remaining zone; the rest of an overlay polygon is one difference against the union of the
-/// input polygons covering it, and Cancel isn't looked at inside that step (#1562).
+/// input polygons covering it, and Cancel isn't looked at inside that step (#1562). Each overlay
+/// polygon, input feature and remaining zone is worked out on its own, on several threads when
+/// there are many (#1252); the rows are then made in order, so the output is the same as on one
+/// thread.
 fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String> {
+    overlay_on(inp, p, op, None)
+}
+
+/// [`overlay`] on `threads` threads (by the number of items in each step when `None`).
+fn overlay_on(inp: &dyn Inputs, p: &Json, op: Overlay, threads: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     if ds.geometry_type == GeometryType::None {
         return Err(format!("'{}' has no geometry", ds.name));
@@ -1980,29 +2038,43 @@ fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String
         return Err(format!("'{}' is not a polygon layer", ds.name));
     }
     let use_ = if matches!(op, Overlay::Intersect) { ZoneUse::Inside } else { ZoneUse::Cuts };
-    let (ov, zones, left_out) = overlay_zones(inp, p, "overlay", op.name(), use_)?;
+    let (ov, zones, left_out) = overlay_zones_on(inp, p, "overlay", op.name(), use_, threads)?;
     let index = ExtentIndex::new(zones.iter().map(|z| z.ext));
     let at_poles = AtPoles::new(zones.iter().map(|z| poles(&z.ext)));
     let mut out = overlay_schema(ds, ov, out_name(p, format!("{}_{}", ds.name, op.suffix())), ds.geometry_type);
     let zone_attrs = |z: &Zone| ov.features.get(z.row).map(|o| o.attrs.as_slice());
-    // For Union and Symmetrical Difference, the rows of the input polygons that overlap each zone.
-    let mut covering: Vec<Vec<usize>> = vec![Vec::new(); zones.len()];
+    let threads_for = |n: usize| threads.unwrap_or_else(|| crate::parallel::threads_for(n, PARALLEL_FEATURES));
+    // Each input feature is cut on its own: its parts in the zones it overlaps (the part only for
+    // the tools that keep it, the zone's index for all) and its part outside them.
     let input_rows = rows(inp, p, "input", ds);
     crate::control::begin(input_rows.len());
-    for (done, r) in input_rows.into_iter().enumerate() {
-        crate::control::check()?;
-        crate::control::reached(done);
+    let cuts = crate::parallel::try_map_on(
+        &input_rows,
+        threads_for(input_rows.len()),
+        || (),
+        |_, _, &r| {
+            let cut = ds.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| {
+                let (inside, rest) = cut(g, &zones, (&index, &at_poles), op.keeps_outside());
+                let inside: Vec<(usize, Option<Geometry>)> =
+                    inside.into_iter().map(|(zi, piece)| (zi, op.keeps_inside().then_some(piece))).collect();
+                (inside, rest)
+            });
+            Ok::<_, String>(cut)
+        },
+    )?;
+    // For Union and Symmetrical Difference, the rows of the input polygons that overlap each zone.
+    let mut covering: Vec<Vec<usize>> = vec![Vec::new(); zones.len()];
+    for (&r, cut) in input_rows.iter().zip(cuts) {
         let Some(f) = ds.features.get(r) else { continue };
-        let Some(g) = &f.geometry else {
+        let Some((inside, rest)) = cut else {
             // All but Intersect keep every input feature: one without geometry, as it is.
             if op.keeps_outside() {
                 out.push_next(None, overlay_row(ds, Some(&f.attrs), ov, None));
             }
             continue;
         };
-        let (inside, rest) = cut(g, &zones, (&index, &at_poles), op.keeps_outside());
         for (zi, piece) in inside {
-            if op.keeps_inside() {
+            if let Some(piece) = piece {
                 out.push_next(Some(piece), overlay_row(ds, Some(&f.attrs), ov, zones.get(zi).and_then(zone_attrs)));
             }
             if op.keeps_overlay_rest()
@@ -2017,16 +2089,23 @@ fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String
     }
     if op.keeps_overlay_rest() {
         crate::control::begin(zones.len());
-        for (done, (z, inputs)) in zones.iter().zip(&covering).enumerate() {
-            crate::control::check()?;
-            crate::control::reached(done);
-            let rest = if inputs.is_empty() {
-                from_multipolygon(&z.poly)
-            } else {
-                let polys: Vec<MultiPolygon<f64>> =
-                    inputs.iter().filter_map(|r| ds.features.get(*r)?.geometry.as_ref()).filter_map(to_multipolygon).collect();
-                from_multipolygon(&z.poly.difference(&union_all(polys.iter().flat_map(|m| m.0.iter()))))
-            };
+        let pairs: Vec<(&Zone, &Vec<usize>)> = zones.iter().zip(&covering).collect();
+        let rests = crate::parallel::try_map_on(
+            &pairs,
+            threads_for(pairs.len()),
+            || (),
+            |_, _, &(z, inputs)| {
+                let rest = if inputs.is_empty() {
+                    from_multipolygon(&z.poly)
+                } else {
+                    let polys: Vec<MultiPolygon<f64>> =
+                        inputs.iter().filter_map(|r| ds.features.get(*r)?.geometry.as_ref()).filter_map(to_multipolygon).collect();
+                    from_multipolygon(&z.poly.difference(&union_all(polys.iter().flat_map(|m| m.0.iter()))))
+                };
+                Ok::<_, String>(rest)
+            },
+        )?;
+        for (z, rest) in zones.iter().zip(rests) {
             if let Some(rest) = rest {
                 out.push_next(Some(rest), overlay_row(ds, None, ov, zone_attrs(z)));
             }
@@ -2101,11 +2180,17 @@ fn converted(v: &Value, ty: FieldType) -> Value {
 /// input field that no update field matches exactly, but two match ignoring case, is an error
 /// rather than a guess.
 fn update(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
+    update_on(inp, p, None)
+}
+
+/// [`update`] on `threads` threads (by the number of items in each step when `None`): each input
+/// polygon is cut on its own (#1252), and the rows come back in input order, as on one thread.
+fn update_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     if ds.geometry_type != GeometryType::Polygon {
         return Err(format!("'{}' is not a polygon layer", ds.name));
     }
-    let (up, zones, left_out) = overlay_zones(inp, p, "update", "Update", ZoneUse::AsIs)?;
+    let (up, zones, left_out) = overlay_zones_on(inp, p, "update", "Update", ZoneUse::AsIs, threads)?;
     // Each input field's field in the update layer, if it has one: an ambiguous one fails here,
     // before any geometry work.
     let from = ds
@@ -2124,20 +2209,13 @@ fn update(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let mut out = copy_schema(ds, out_name(p, format!("{}_Update", ds.name)), GeometryType::Polygon);
     keep_source_crs(&mut out, ds, up);
     let input_rows = rows(inp, p, "input", ds);
-    crate::control::begin(input_rows.len());
-    for (done, r) in input_rows.into_iter().enumerate() {
-        crate::control::check()?;
-        crate::control::reached(done);
+    let rests = outside_each(ds, &input_rows, &zones, (&index, &at_poles), threads)?;
+    for (r, rest) in input_rows.into_iter().zip(rests) {
         let Some(f) = ds.features.get(r) else { continue };
-        let rest = match &f.geometry {
-            None => {
-                out.push_next(None, f.attrs.clone());
-                continue;
-            }
-            Some(g) => outside(g, &zones, (&index, &at_poles)),
-        };
-        if let Some(rest) = rest {
-            out.push_next(Some(rest), f.attrs.clone());
+        match rest {
+            None => out.push_next(None, f.attrs.clone()),
+            Some(Some(rest)) => out.push_next(Some(rest), f.attrs.clone()),
+            Some(None) => {}
         }
     }
     let kept = out.features.len();
@@ -11410,6 +11488,101 @@ mod tests {
         let want = rustgis_geom::wgs84_distance_m(Coord::new(50.0, 50.0), Coord::new(11.0, 11.0));
         assert!((d.unwrap() - want).abs() < 1e-4 * want, "{d:?} vs {want}");
         assert!((x.unwrap() - 11.0).abs() < 1e-7 && (y.unwrap() - 11.0).abs() < 1e-7, "{x:?} {y:?}");
+    }
+
+    /// Intersect, Identity, Union and Symmetrical Difference give the same rows, bit for bit, on
+    /// several threads as on one (#1252): overlapping squares of two layers, overlay features of
+    /// two parts, and input features without geometry.
+    #[test]
+    fn overlay_on_several_threads_is_overlay_on_one() {
+        let mut input = Dataset::new("input", GeometryType::Polygon, vec![Field::new("v", FieldType::Integer)]);
+        let mut over = Dataset::new("over", GeometryType::Polygon, vec![Field::new("k", FieldType::Integer)]);
+        for i in 0..600i64 {
+            let (x, y) = ((i * 37 % 300) as f64 * 0.1, (i * 53 % 120) as f64 * 0.1);
+            input.push(if i % 97 == 0 { None } else { Some(sq(x, y, 0.35)) }, vec![Value::Int(i)]);
+        }
+        for i in 0..200i64 {
+            let (x, y) = ((i * 71 % 290) as f64 * 0.1, (i * 29 % 110) as f64 * 0.1);
+            // Every fifth of two overlapping parts, so its zone is a union.
+            let ring = |x: f64| {
+                vec![Coord::new(x, y), Coord::new(x + 0.5, y), Coord::new(x + 0.5, y + 0.5), Coord::new(x, y + 0.5), Coord::new(x, y)]
+            };
+            let g = if i % 5 == 0 { Geometry::Polygon(vec![vec![ring(x)], vec![ring(x + 0.3)]]) } else { sq(x, y, 0.5) };
+            over.push(Some(g), vec![Value::Int(i)]);
+        }
+        let m = Map(HashMap::from([("input".to_string(), input), ("over".to_string(), over)]));
+        let p = serde_json::json!({"input": "input", "overlay": "over"});
+        for op in [Overlay::Intersect, Overlay::Identity, Overlay::Union, Overlay::SymmetricalDifference] {
+            let one = layer(overlay_on(&m, &p, op, Some(1)).unwrap());
+            assert!(one.features.len() > 100, "{op:?}: {}", one.features.len());
+            for threads in [2, 7, 16] {
+                let many = layer(overlay_on(&m, &p, op, Some(threads)).unwrap());
+                assert_eq!(many.features.len(), one.features.len(), "{op:?}, {threads} threads");
+                for (a, b) in one.features.iter().zip(&many.features) {
+                    assert_eq!(
+                        format!("{:?}", (&a.geometry, &a.attrs)),
+                        format!("{:?}", (&b.geometry, &b.attrs)),
+                        "{op:?}, {threads} threads"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Erase and Update give the same rows, bit for bit, on several threads as on one (#1252):
+    /// overlapping squares of two layers, erase and update features of two parts, input features
+    /// without geometry, and (for Erase) points and lines.
+    #[test]
+    fn erase_and_update_on_several_threads_are_on_one() {
+        let mut input = Dataset::new("input", GeometryType::Polygon, vec![Field::new("v", FieldType::Integer)]);
+        let mut lines = Dataset::new("lines", GeometryType::Polyline, vec![Field::new("v", FieldType::Integer)]);
+        let mut points = Dataset::new("points", GeometryType::Point, vec![Field::new("v", FieldType::Integer)]);
+        let mut over = Dataset::new("over", GeometryType::Polygon, vec![Field::new("v", FieldType::Integer)]);
+        for i in 0..600i64 {
+            let (x, y) = ((i * 37 % 300) as f64 * 0.1, (i * 53 % 120) as f64 * 0.1);
+            let none = i % 97 == 0;
+            input.push(if none { None } else { Some(sq(x, y, 0.35)) }, vec![Value::Int(i)]);
+            let line = Geometry::Line(vec![vec![Coord::new(x, y), Coord::new(x + 0.7, y + 0.2)]]);
+            lines.push(if none { None } else { Some(line) }, vec![Value::Int(i)]);
+            points.push(if none { None } else { Some(Geometry::Point(Coord::new(x, y))) }, vec![Value::Int(i)]);
+        }
+        for i in 0..200i64 {
+            let (x, y) = ((i * 71 % 290) as f64 * 0.1, (i * 29 % 110) as f64 * 0.1);
+            // Every fifth of two overlapping parts, so its zone is a union.
+            let ring = |x: f64| {
+                vec![Coord::new(x, y), Coord::new(x + 0.5, y), Coord::new(x + 0.5, y + 0.5), Coord::new(x, y + 0.5), Coord::new(x, y)]
+            };
+            let g = if i % 5 == 0 { Geometry::Polygon(vec![vec![ring(x)], vec![ring(x + 0.3)]]) } else { sq(x, y, 0.5) };
+            over.push(Some(g), vec![Value::Int(1000 + i)]);
+        }
+        let m = Map(HashMap::from([
+            ("input".to_string(), input),
+            ("lines".to_string(), lines),
+            ("points".to_string(), points),
+            ("over".to_string(), over),
+        ]));
+        type On = fn(&dyn Inputs, &Json, Option<usize>) -> Result<ToolResult, String>;
+        let runs: [(&str, On, Json); 4] = [
+            ("erase", erase_on, serde_json::json!({"input": "input", "erase": "over"})),
+            ("erase lines", erase_on, serde_json::json!({"input": "lines", "erase": "over"})),
+            ("erase points", erase_on, serde_json::json!({"input": "points", "erase": "over"})),
+            ("update", update_on, serde_json::json!({"input": "input", "update": "over"})),
+        ];
+        for (name, run, p) in runs {
+            let one = layer(run(&m, &p, Some(1)).unwrap());
+            assert!(one.features.len() > 100, "{name}: {}", one.features.len());
+            for threads in [2, 7, 16] {
+                let many = layer(run(&m, &p, Some(threads)).unwrap());
+                assert_eq!(many.features.len(), one.features.len(), "{name}, {threads} threads");
+                for (a, b) in one.features.iter().zip(&many.features) {
+                    assert_eq!(
+                        format!("{:?}", (&a.geometry, &a.attrs)),
+                        format!("{:?}", (&b.geometry, &b.attrs)),
+                        "{name}, {threads} threads"
+                    );
+                }
+            }
+        }
     }
 
     /// Features searched on several threads find the same nearest features, distances and points

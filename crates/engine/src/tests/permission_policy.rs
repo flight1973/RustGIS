@@ -920,6 +920,114 @@ fn permission_policy_exact_runtime_account_rotation() {
     arcgis_auth::sign_out(Some(root.trim_end_matches('/')));
 }
 
+/// A remembered Earthdata token read before a node binds keeps it current; read after, it cancels
+/// with a message that says why; a login or replacement keeps the ordinary message. The command
+/// line and Python read it for a command that names a data host, so that command is not cancelled.
+#[test]
+fn permission_policy_remembered_earthdata_token_read_mid_run() {
+    // The token and its store are process-wide: isolate them from every parallel plan reader.
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var_os("RUSTGIS_POLICY_REMEMBERED_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::permission_policy::permission_policy_remembered_earthdata_token_read_mid_run", "--nocapture"])
+            .env("RUSTGIS_POLICY_REMEMBERED_CHILD", "1")
+            // `opt_in` reads saved preferences: none, from a folder that doesn't exist.
+            .env("RUSTGIS_CONFIG_DIR", std::env::temp_dir().join(format!("rustgis-policy-remembered-{}", std::process::id())))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
+    use crate::render::rustgis_tiles::earthdata;
+    use rustgis_data::secrets::{MemorySecrets, Secret, SecretStore};
+    // A new run of the app with a token remembered, not yet read.
+    let relaunch = || {
+        let store = Arc::new(MemorySecrets::new());
+        store.save(earthdata::ACCOUNT, &Secret::new("synthetic-remembered")).unwrap();
+        earthdata::set_token(None).unwrap();
+        earthdata::set_secret_store(Some(store));
+    };
+    // Starts a command that sends (a download), as the app does after the plan binds its accounts.
+    let start = |s: &mut Session, n: u64| {
+        let (scope, _) = assistant(n);
+        let call = Call::command("layer.addUrl", json!({"url":"https://example.invalid/remembered.geojson"}));
+        let p = pending(s, &scope, &call);
+        s.run_permitted(scope, p.allow(), &call).unwrap();
+        let request = s.take_url_requests().pop().unwrap();
+        let id = s.download_started_for(&request).unwrap();
+        (id, s.download_still(id).unwrap())
+    };
+    let mut s = world();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        s.leave_downloads = true;
+    }
+
+    // Read at startup, before the node binds: nothing changes mid-run.
+    relaunch();
+    assert_eq!(earthdata::restore(), earthdata::Restored::Token);
+    let (id, still) = start(&mut s, 1601);
+    assert_eq!(earthdata::restore(), earthdata::Restored::Nothing);
+    assert!(still() && s.download_continues(id).is_ok());
+
+    // Read while the command runs: cancelled, and told why.
+    relaunch();
+    let (id, still) = start(&mut s, 1602);
+    assert_eq!(earthdata::restore(), earthdata::Restored::Token);
+    assert!(!still());
+    let said = s.download_continues(id).unwrap_err();
+    assert!(said.contains("remembered on this computer was read while this command ran") && !said.contains("synthetic"), "{said}");
+
+    // A login or replacement instead of that read, or after it, is the ordinary change.
+    let changes: [&dyn Fn(); 2] =
+        [&|| drop(earthdata::login("synthetic-typed", false)), &|| earthdata::set_token(Some("synthetic-typed")).unwrap()];
+    for (n, change) in changes.into_iter().enumerate() {
+        relaunch();
+        let (id, still) = start(&mut s, 1610 + n as u64);
+        change();
+        assert!(!still());
+        let said = s.download_continues(id).unwrap_err();
+        assert!(said.contains("account changed") && !said.contains("remembered"), "{said}");
+    }
+    relaunch();
+    let (id, _) = start(&mut s, 1620);
+    earthdata::restore();
+    earthdata::set_token(Some("synthetic-typed")).unwrap();
+    let said = s.download_continues(id).unwrap_err();
+    assert!(said.contains("account changed") && !said.contains("remembered"), "{said}");
+
+    // Run as the command line and Python run a command.
+    let run = |s: &mut Session, url: &str| {
+        s.run("layer.addUrl", &json!({ "url": url })).unwrap();
+        let request = s.take_url_requests().pop().unwrap();
+        let id = s.download_started_for(&request).unwrap();
+        (id, s.download_still(id).unwrap())
+    };
+    let data_host = "https://data.ornldaac.earthdata.nasa.gov/remembered.geojson";
+    // Without the opt-in (the app, which reads it off the frame) a command doesn't read the token.
+    relaunch();
+    run(&mut s, data_host);
+    assert!(!earthdata::has_token());
+
+    // Opting in to saved secrets reads nothing, and neither does a command naming no data host.
+    // One that names a data host reads the token first, binds it and is not cancelled.
+    let store = MemorySecrets::new();
+    store.save(earthdata::ACCOUNT, &Secret::new("synthetic-remembered")).unwrap();
+    earthdata::set_token(None).unwrap();
+    crate::prefs::opt_in(&mut s, store, |_| {});
+    assert!(!earthdata::has_token());
+    run(&mut s, "https://example.invalid/remembered.geojson");
+    assert!(!earthdata::has_token());
+    let (id, still) = run(&mut s, data_host);
+    assert!(earthdata::has_token());
+    assert_eq!(earthdata::restore(), earthdata::Restored::Nothing);
+    assert!(still() && s.download_continues(id).is_ok());
+    earthdata::set_secret_store(None);
+    earthdata::set_token(None).unwrap();
+}
+
 /// Foreign in-place completions cannot borrow/consume ownership; omitted options retain defaults.
 #[test]
 fn permission_policy_download_refinements_rollback_and_abandonment() {
@@ -1686,6 +1794,73 @@ fn permission_policy_renamed_streamed_inputs_keep_their_reach() {
         assert_eq!(serde_json::to_value(&s.project).unwrap(), before);
     }
     assert!(outcomes.iter().all(|(_, asks, shown)| *asks && *shown), "{outcomes:?}");
+}
+
+/// Training read whole from a layer read in place reaches its source, as Load All does; the
+/// same layer in memory reaches nothing.
+#[test]
+fn permission_policy_training_read_whole_reaches_its_source() {
+    let mut s = world();
+    s.run("layer.addDataBytes", &json!({"fileName":"scene.tif","data":two_class_b64()})).unwrap();
+    let (scope, _) = assistant(3602);
+    let calls = [
+        Call::command("dl.train", json!({"layer":"scene","training":"Countries","classField":"name"})),
+        Call::command("dl.classify", json!({"layer":"scene","training":"Countries","classField":"name"})),
+        Call::command("raster.classifySupervised", json!({"layer":"scene","training":"Countries","classField":"name"})),
+    ];
+    let reaches = |s: &Session, call: &Call| matches!(s.review(&scope, call), Outcome::NeedsApproval(_));
+    assert!(calls.iter().all(|call| !reaches(&s, call)), "in memory: nothing to approve");
+    let id = s.map().layer_by_name("Countries").unwrap().id;
+    let mut source = rustgis_map::source::SourceLayer::default();
+    source.path = Some("https://example.invalid/countries.fgb".into());
+    s.map_mut().layer_mut(id).unwrap().source = Some(source);
+    for call in &calls {
+        let approved = pending(&s, &scope, call);
+        assert!(approved.review().why.contains("internet"), "{:?}", approved.review().why);
+    }
+}
+
+/// Converting the labels of, or exporting a report of, a layer read in place reads it whole, so
+/// the call reaches its source; the same layer in memory reaches no network.
+#[test]
+fn permission_policy_labels_and_reports_read_whole_reach_their_source() {
+    let mut s = world();
+    s.run("report.new", &json!({"layer":"Cities"})).unwrap();
+    let (scope, _) = assistant(3603);
+    let convert = Call::command("labels.convert", json!({"layer":"Cities"}));
+    let export = Call::command("report.export", json!({"path":"/tmp/report.pdf"}));
+    let internet = |s: &Session, call: &Call| match s.review(&scope, call) {
+        Outcome::NeedsApproval(p) => p.review().why.contains("internet"),
+        _ => false,
+    };
+    assert!(!internet(&s, &convert) && !internet(&s, &export), "in memory: no network");
+    let id = s.map().layer_by_name("Cities").unwrap().id;
+    let mut source = rustgis_map::source::SourceLayer::default();
+    source.path = Some("https://example.invalid/cities.fgb".into());
+    s.map_mut().layer_mut(id).unwrap().source = Some(source);
+    assert!(internet(&s, &convert), "labels.convert");
+    assert!(internet(&s, &export), "report.export");
+
+    // The report's own layer in memory, the web source only under its records (a subreport) or
+    // in a report it appends: the export reads those whole too.
+    for under in ["subreport", "appended"] {
+        let mut s = world();
+        s.run("report.new", &json!({"layer":"Countries","name":"Main"})).unwrap();
+        if under == "subreport" {
+            s.run("data.relate", &json!({"name":"Country of city","origin":"Countries","originKey":"name","destination":"Cities","destinationKey":"adm0name"})).unwrap();
+            s.run("report.subreport", &json!({"report":"Main","relationship":"Country of city"})).unwrap();
+        } else {
+            s.run("report.new", &json!({"layer":"Cities","name":"Appended"})).unwrap();
+            s.run("report.relatedReport", &json!({"report":"Main","related":"Appended"})).unwrap();
+        }
+        let export = Call::command("report.export", json!({"report":"Main","path":"/tmp/report.pdf"}));
+        assert!(!internet(&s, &export), "{under}: in memory");
+        let id = s.map().layer_by_name("Cities").unwrap().id;
+        let mut source = rustgis_map::source::SourceLayer::default();
+        source.path = Some("https://example.invalid/cities.fgb".into());
+        s.map_mut().layer_mut(id).unwrap().source = Some(source);
+        assert!(internet(&s, &export), "{under}: its layer read whole from the web");
+    }
 }
 
 /// In-memory range reads need Network, while local paths and external drivers retain Files.

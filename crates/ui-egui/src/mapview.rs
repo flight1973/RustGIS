@@ -562,12 +562,31 @@ impl MapView {
         self.cancel_label_drag();
     }
 
+    /// Drops a box being dragged: letting go of it does nothing (a plugin's pick it was drawn
+    /// for has ended).
+    pub(crate) fn cancel_box_drag(&mut self) {
+        if self.drag.is_some_and(|(_, kind)| kind == DragKind::Box) {
+            self.drag = None;
+        }
+    }
+
     /// Drops a label being moved with the Move Label tool, leaving it where it was.
     pub(crate) fn cancel_label_drag(&mut self) {
         self.moving_label = None;
         if self.drag.is_some_and(|(_, kind)| matches!(kind, DragKind::Label { .. })) {
             self.drag = None;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn label_dragging_for_tests(&self) -> bool {
+        self.moving_label.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn label_position_for_tests(&self, text: &str) -> Option<Pos2> {
+        let label = self.labels.iter().find(|label| label.text == text)?;
+        Some(self.view_rect?.0.min + vec2(label.x, label.y))
     }
 
     /// Cancels a vertex preview and its pending release together, leaving other map gestures
@@ -957,12 +976,13 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         if let Some((k, done)) = app.map.tilt_settle.take() {
             app.session.map_mut().adopt_caches(&done.map);
             // A frame of this view that couldn't be drawn isn't tried again: nothing is to fill.
-            if same_view(k, key) && done.rendered.is_none() {
+            if same_view(k, key) && done.rendered.is_none() && done.archives.current([&done.map]) {
                 app.map.filling = false;
             }
             // One drawn before tiles or data arrived still shows; the next follows. So does one
             // of a change made since, for a view whose frame on screen is older still.
             if (same_view(k, key) || (tiled_flat && shows_finished(k, key, app.map.key)))
+                && done.archives.current([&done.map])
                 && let Some(r) = done.rendered
             {
                 // With tile pictures still to draw, a draft: the next frame draws more.
@@ -2495,6 +2515,8 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             DragKind::Vertex
         } else {
             match tool {
+                // A plugin's pick waiting for a box draws it.
+                Tool::Explore if crate::pluginpanel::picks_box(app) => DragKind::Box,
                 Tool::Explore if shift => DragKind::Box,
                 // Ctrl+drag turns and tilts the map, as the right button does.
                 Tool::Explore if ctrl => DragKind::Turn,
@@ -2662,17 +2684,28 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             // one whose corners all miss it) uses the part that is on it.
             let r = Rect::from_two_pos(start, end);
             let mut e = Extent::EMPTY;
+            let mut grid = Vec::new();
             let n = 12;
             for i in 0..=n {
                 for j in 0..=n {
                     let q = pos2(r.min.x + r.width() * i as f32 / n as f32, r.min.y + r.height() * j as f32 / n as f32);
-                    if let Some(c) = screen_to_lonlat(app, rect, q) {
+                    let c = screen_to_lonlat(app, rect, q);
+                    if let Some(c) = c {
                         e.expand(c);
                     }
+                    grid.push(c);
                 }
             }
+            // A pole inside a box on the globe: the box goes all the way round it.
+            let pole = (app.session.map().projection == Projection::Globe)
+                .then(|| {
+                    [90.0, -90.0].into_iter().find(|&lat| lonlat_to_screen(app, rect, Coord::new(0.0, lat)).is_some_and(|p| r.contains(p)))
+                })
+                .flatten();
             if e.is_empty() {
                 // Nothing on the globe.
+            } else if (start - end).length() > 6.0 && crate::pluginpanel::box_picked(app, &grid, n + 1, pole) {
+                // A plugin's pick took it.
             } else if tool == Tool::Select {
                 let mode = ui.input(|i| {
                     if i.modifiers.shift {
@@ -2726,6 +2759,10 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
             app.map.popup = None;
             return;
         };
+        // A plugin's pick waiting for the map takes the click.
+        if crate::pluginpanel::map_click(app, c) {
+            return;
+        }
         // Directions waiting for a place, or a click on another route, takes the click.
         let nav = &app.ui.nav;
         let other = (nav.routes.len() > 1 && app.ui.right == Some(crate::RightPane::Directions))
@@ -3093,6 +3130,10 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     }
     // The NLDI's point, while its pane is open.
     crate::nldiui::paint(app, p, rect, t, |c| lonlat_to_screen(app, rect, c));
+    // The places a plugin's panel holds.
+    crate::pluginpanel::paint(app, p, t, |c| lonlat_to_screen(app, rect, c));
+    // The spectral profile's points, while its section shows.
+    crate::spectralui::paint(app, p, t, |c| lonlat_to_screen(app, rect, c));
     // Points picked for a workflow.
     if let Some(pick) = &app.workflow.pick {
         let pts = pick.points.clone();
@@ -3283,10 +3324,11 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         Tool::Graphic(_) => Some("Drag a box"),
         Tool::Explore => None,
     };
-    if let Some(h) = hint
-        && (app.map.sketch.is_empty() || !matches!(app.session.tool, Tool::Measure | Tool::MeasureArea))
-    {
-        let g = p.layout_no_wrap(tl!(h).to_string(), regular(12.0), Color32::WHITE);
+    let measuring = !app.map.sketch.is_empty() && matches!(app.session.tool, Tool::Measure | Tool::MeasureArea);
+    // A plugin's pick waiting for the map says what it waits for instead.
+    let hint = crate::pluginpanel::pick_hint(app).or_else(|| hint.filter(|_| !measuring).map(|h| tl!(h).to_string()));
+    if let Some(h) = hint {
+        let g = p.layout_no_wrap(h, regular(12.0), Color32::WHITE);
         let bg = Rect::from_center_size(pos2(rect.center().x, rect.max.y - 26.0), g.size() + vec2(22.0, 10.0));
         p.rect_filled(bg, CornerRadius::same(12), Color32::from_black_alpha(160));
         p.galley(bg.center() - g.size() / 2.0, g, Color32::WHITE);
@@ -3564,6 +3606,7 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     follow_popup(app);
     let Some(pp) = &app.map.popup else { return };
     let t = Tokens::get(ui.ctx());
+    let at = pp.at;
     let Some(anchor) = lonlat_to_screen(app, rect, pp.at) else { return };
     if !rect.contains(anchor) {
         return;
@@ -3581,7 +3624,10 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     };
     let mut step: Option<usize> = None;
     let mut zoom = false;
-    // The feature shown, as its layer id and feature id (a raster pixel has neither).
+    // A pixel of a raster of two bands or more: its layer, for the spectral profile.
+    let spectral = crate::spectralui::offered(app, &info);
+    let mut profile = false;
+    // The feature shown, as its layer id and feature id (a raster pixel has no feature id).
     let shown = info["layerId"].as_u64().and_then(|id| u32::try_from(id).ok()).zip(info["fid"].as_u64());
     // Only WMS layers being asked so far, or still waited for: their names.
     let waiting = !is_found(&info);
@@ -3659,6 +3705,16 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                             if ui.add(egui::Button::new(tl!("×")).frame(false)).clicked() {
                                 close = true;
+                            }
+                            // A pixel of several bands: add it to the spectral profile.
+                            if spectral.is_some() {
+                                let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                                let ink = if resp.hovered() { t.text } else { t.icon };
+                                crate::icons::paint(ui.painter(), r, "chart", ink, t.accent);
+                                resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!("Spectral Profile")));
+                                if resp.on_hover_text(tl!("Spectral Profile: chart every band here, and compare points")).clicked() {
+                                    profile = true;
+                                }
                             }
                             // A feature (not a raster pixel): zoom to it.
                             if shown.is_some() {
@@ -3838,6 +3894,9 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
         if let Some(e) = extent.filter(|e| !e.is_empty()) {
             app.session.zoom_to(&e);
         }
+    }
+    if let (true, Some(id)) = (profile, spectral) {
+        crate::spectralui::from_identify(app, id, at);
     }
     if close {
         app.map.popup = None;
@@ -4403,6 +4462,25 @@ mod tile_redraw_tests {
         assert!(!keeps_frame(None, changed, 40));
         // Nothing changed: nothing to keep.
         assert!(!keeps_frame(Some(key(3)), key(3), 40));
+    }
+
+    #[test]
+    fn an_eligible_finished_frame_cannot_cross_its_archive_reload() {
+        use rustgis_engine::{
+            map::{Map, TileKind, TileLayer},
+            render,
+        };
+        let mut map = Map::new("Archive publication");
+        map.tiles.push(TileLayer::new("Target", TileKind::PmTiles, "/finished-frame-revision.pmtiles"));
+        let archives = render::archive_revisions([&map]);
+        let (shown, done, now) = (Key { rev: 4, ..key(0) }, Key { rev: 6, ..key(0) }, Key { rev: 9, ..key(0) });
+        let eligible = || shows_finished(done, now, Some(shown)) && archives.current([&map]);
+        assert!(eligible(), "ordinary progressive finished frames still show");
+        render::rustgis_tiles::cache::reload_archive("/finished-frame-unrelated.mbtiles");
+        assert!(eligible(), "another source does not revoke this worker's frame");
+        render::rustgis_tiles::cache::reload_archive(&map.tiles[0].url);
+        assert!(shows_finished(done, now, Some(shown)), "the permissive revision fallback alone still accepts it");
+        assert!(!eligible(), "archive coherence is also required at adoption");
     }
 
     #[test]

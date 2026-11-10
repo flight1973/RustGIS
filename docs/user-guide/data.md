@@ -98,16 +98,43 @@ coordinate system and are reprojected as they draw. The map uses Web Mercator by
 
 ESRI `.prj` files without an EPSG code use their projection parameters and, for ED50,
 Monte Mario (from Greenwich or from Rome), OSGB36, DHDN, Amersfoort, GGRS87, CH1903/CH1903+
-and S-JTSK, the same built-in Helmert datum transformation as the EPSG definition. A `TOWGS84`
-transformation in the file takes precedence. RDN2008 and IGM95 are treated as WGS 84-like
-datums. These transformations do not replace regional grid corrections for survey accuracy. An
-unrecognized datum keeps its ellipsoid and produces a notice when no transformation is
-available. Swiss oblique Mercator, the standard Krovak East/North variant, the oblique
-Mercator in its azimuth forms (the two-point form, with no azimuth, is refused), and the
-Cassini-Soldner, polyconic and Equal Earth methods are supported from their parameters, as are sinusoidal (MODIS), Robinson, orthographic and Mercator (variant A), in `.prj`
-files and in GeoTIFF keys. Esri's orthographic is a spherical projection: on an ellipsoid it is
-refused, with a notice, rather than computed as EPSG's ellipsoidal one. The equidistant
-cylindrical projection (EPSG:4087, World Equidistant Cylindrical) uses a sphere of its datum's
+and S-JTSK, the same built-in Helmert datum transformation as the EPSG definition. In a `.prj`
+or other WKT:
+
+- A transformation in the file (a `TOWGS84`, or a WKT2 `BOUNDCRS`'s) takes precedence, also over
+  the built-in one of an EPSG code in the WKT, as in PROJ and GDAL. A system RustGIS can read
+  only by that code keeps the code's transformation, with a notice. Web Mercator is on WGS 84, so
+  a transformation its file gives is set aside, with a notice.
+- A `BOUNDCRS` whose transformation goes to another datum than WGS 84 continues with that
+  datum's own transformation to WGS 84: the one the file gives it, else none for a datum treated
+  as WGS 84 (such as RDN2008, IGM95 or NAD 83), else the built-in one. It is refused when there is
+  none of these, when the target gives a zero transformation where its datum has another (a
+  writer's placeholder, as for ED50 or NAD 27), or when combining the two transformations'
+  rotations could be off by a centimetre.
+- A UTM name (`WGS_1984_UTM_Zone_31N`) gives its EPSG code only when the parameters are that
+  zone's.
+- Transverse Mercator (South Orientated), the method GDAL and Esri write South Africa's Lo grids
+  with, counts westings and southings, and is read so, its false easting and northing as a false
+  westing and southing. Read from its parameters, a system declaring other axes is refused; one
+  with an EPSG code (EPSG:2048, say) is read by the code, as the code defines it, whatever axes
+  its WKT declares.
+- Projected axes pointing west or south, as in South Africa's Lo grids, are read as such, or
+  refused where they can't be (Web Mercator, Krovak, sinusoidal, or such axes declared northing
+  first, as in Austria's Ferro grids).
+- A WKT1 or Esri projection's angles (its latitude of origin, central meridian, standard
+  parallels, azimuth) and its prime meridian are in its geographic system's unit, such as grads
+  for NTF (Paris)'s Lambert zones, as PROJ reads them. The Paris meridian written as 2.33722917,
+  in degrees as GDAL and Esri write it whatever the unit, is read in degrees.
+
+RDN2008 and IGM95 are treated as WGS 84-like datums. These transformations do not replace
+regional grid corrections for survey accuracy. An unrecognized datum keeps its ellipsoid and
+produces a notice when no transformation is available. Swiss oblique Mercator, the standard
+Krovak East/North variant, the oblique Mercator in its azimuth forms (the two-point form, with
+no azimuth, is refused), and the Cassini-Soldner, polyconic and Equal Earth methods are
+supported from their parameters, as are sinusoidal (MODIS), Robinson, orthographic and Mercator
+(variant A), in `.prj` files and in GeoTIFF keys. Esri's orthographic is a spherical projection:
+on an ellipsoid it is refused, with a notice, rather than computed as EPSG's ellipsoidal one.
+The equidistant cylindrical projection (EPSG:4087, World Equidistant Cylindrical) uses a sphere of its datum's
 semi-major axis, matching legacy PROJ/GDAL coordinates (verified with PROJ 9.7.1), both for data
 and for a map drawn in it (including the
 Equirectangular preset). This also applies to planetary Equirectangular systems and definitions
@@ -716,6 +743,16 @@ database tests run synchronously on desktop. The web app doesn't offer database 
 connections; saved database rows remain visible but cannot be opened or tested there. Earth
 Search and Planetary Computer remain available under **Library**.
 
+For a new web-service connection, enter its Basic password or header API key to test it before
+saving. The test uses only the entered login, not a saved service login or an S3 session login
+at the same address.
+For an `http://` address, tick the confirmation before sending the login unencrypted. After a test
+starts, RustGIS clears the password or key and the confirmation from the form; enter them again
+if you want to save a session login. The test does not save the connection or retain its login.
+Test status masks echoed login credentials, and the command log keeps response sizes rather than
+response bodies.
+For an existing service connection, save changes to its address or login definition before testing.
+
 **From Service…** (including **Catalogue search (CSW)**), **Database…**, **STAC Search…** and
 **S3…** can use saved connections directly. Service, database and S3 dialogs offer a **Saved
 connection** picker; STAC includes saved connections in its existing API/catalog list.
@@ -1159,7 +1196,16 @@ steps where they meet. `raster.stretch` with `{"like": "<layer>"}` gives a layer
 of another layer's stretch as fixed bounds, so the tiles match; `{"type": "custom", "min": …,
 "max": …}` sets the bounds yourself.
 
-Clicking a raster with the Explore tool shows its pixel values. Projects remember a raster's file
+Clicking a raster with the Explore tool shows its pixel values. On a raster of two bands or more,
+the pop-up's **Spectral Profile** button charts every band at that pixel and opens the profile, where
+more points are compared (see [Spectral Analysis](analysis.md)). A band's wavelength is read from the
+GeoTIFF's GDAL metadata or its `.aux.xml` sidecar: GDAL's `CENTRAL_WAVELENGTH_UM` (its `IMAGERY`
+domain), or a `wavelength` or `central_wavelength` item (as rasterio, STAC exports and ENVI files
+through GDAL write them) in the unit a `wavelength_units` item gives. With no unit, a value under 100
+is read as micrometres and any other as nanometres: imaging sensors see from about 0.3 to 15 µm, so
+the two never meet. One that isn't a length from 1 nm to 1 m, or another length for a band that has
+one, is said and left out. A GeoTIFF export writes the wavelengths of the bands it writes (one
+band, or a raster's RGB) back as `CENTRAL_WAVELENGTH_UM`. Projects remember a raster's file
 path relative to the project and reopen it; rasters added in the browser are stored inside the project.
 
 ### Zarr stores
