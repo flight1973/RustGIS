@@ -616,8 +616,8 @@ feature of the clip, erase, overlay, update or split layer with no polygon, and 
 without geometry, a point or line in the polygon layer (as Minimum Bounding Geometry's flat hulls
 are), or an empty polygon. Clip also leaves out a mask whose polygons, unioned, have no area, and
 Union and Symmetrical Difference an overlay feature whose parts, unioned, come to nothing, saying
-how many. When Clip, Intersect or Split has none left, so that its result would be empty, it stops
-with an error.
+how many. When none of the features of that layer has a polygon (for Clip, none covers any area),
+Clip, Intersect and Split, whose result would be empty, stop with an error.
 
 **Near** (`near`) copies `input` and adds, for each feature, the nearest feature of `near`: its OID
 as the attribute table shows it (`near_fid`), the distance to it (`near_dist`, in `units`,

@@ -2176,14 +2176,15 @@ fn split(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     if ds.geometry_type == GeometryType::None {
         return Err(format!("'{}' has no geometry", ds.name));
     }
-    let (sp, zones, left_out) = overlay_zones(inp, p, "split", "Split", true)?;
-    // A field name, or none; anything else is an error, not one layer per polygon.
+    // A field name, or none; anything else is an error, not one layer per polygon. Checked before
+    // the split polygons are read, so a wrong field isn't hidden behind them.
     let field = match p.get("field") {
         None | Some(Json::Null) => None,
         Some(Json::String(name)) if name.trim().is_empty() => None,
-        Some(Json::String(name)) => Some(find_field_case_insensitive(sp, name.trim())?),
+        Some(Json::String(name)) => Some(find_field_case_insensitive(input(inp, p, "split")?, name.trim())?),
         Some(other) => return Err(format!("Split Field must be a field name, not {other}")),
     };
+    let (sp, zones, left_out) = overlay_zones(inp, p, "split", "Split", true)?;
     // The split polygons of each layer, in the order their first polygon comes, keyed by the exact
     // value, so values that would be named alike stay apart. A layer named by a value and one named
     // by an id are kept apart even when the two read the same.
@@ -7080,6 +7081,12 @@ mod tests {
                 (_, res) => assert_eq!(res.map(|(_, notes)| notes), Ok(vec![]), "{tool}"),
             }
         }
+        // A wrong Split field is said before the split polygons are looked at.
+        let mut points = Dataset::new("masks", GeometryType::Polygon, vec![]);
+        points.push(Some(Geometry::Point(Coord::new(6.0, 1.0))), vec![]);
+        let m = Map(HashMap::from([("polys".to_string(), polys()), ("masks".to_string(), points)]));
+        let e = crate::run("split", &m, &serde_json::json!({"input": "polys", "split": "masks", "field": 42})).err().unwrap_or_default();
+        assert_eq!(e, "Split Field must be a field name, not 42");
         // Clip's error says how many of each kind.
         let mut both = Dataset::new("masks", GeometryType::Polygon, vec![]);
         both.push(None, vec![]);
