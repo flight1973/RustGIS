@@ -154,12 +154,15 @@ fn search_map(map: &rustgis_map::Map, query: &str, limit: usize) -> Results {
     // zone and band) isn't looked for in the tables; two whole numbers (an id, years, a range)
     // may be either, and so may a bare 100 km MGRS square, which names Sentinel-2's tiles (33UVP);
     // an MGRS reference with digits is plainly a coordinate. UTM and MGRS are the Earth's grids,
-    // so on another body's map they name no place.
+    // so on another body's map they name no place. A polar (UPS) reference starts with a letter
+    // and has no zone number, so without digits it is three letters (BAN, ZAP), as often a word
+    // as a place: text with no digit isn't read as a grid reference (every other one has digits).
     let mut plainly_coordinate = false;
+    let grid_text = q.chars().any(|c| c.is_ascii_digit());
     if let Some(c) = parse_lat_lon(&q) {
         out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
         plainly_coordinate = q.chars().any(|c| matches!(c, '.' | '°' | 'º' | '\'' | '′' | '"' | '″') || c.is_alphabetic());
-    } else if map.body().is_earth() {
+    } else if map.body().is_earth() && grid_text {
         match read_grid_reference(&q) {
             Ok(c) => {
                 out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
@@ -698,7 +701,7 @@ mod tests {
             "38SAB4414084706",
             "38SMB441408470",
             "38TMB4414084706",
-            // Polar (UPS) references aren't read.
+            // A polar (UPS) letter after a zone number: UPS has no zone number.
             "38Z 444141 3684706",
             "38ZMB4414084706",
             "99X 1 2",
@@ -793,6 +796,33 @@ mod tests {
         assert!(matches!(search(&s, "33.3, 44.4", 50).hits.first(), Some(Hit::Coordinate { .. })));
         s.run("map.body", &json!({"name": "earth", "basemap": false})).unwrap();
         assert!(matches!(search(&s, "38SMB4414084706", 50).hits.first(), Some(Hit::Coordinate { .. })));
+    }
+
+    /// In the polar areas the grid is UPS: its MGRS references (no zone number) and positions are
+    /// found, while three letters alone (a 100 km square, or a word) aren't read as a reference.
+    #[test]
+    fn polar_grid_references_are_found() {
+        let s = Session::new(crate::sample::world_project());
+        for q in ["ZFD9276707232", "Z FD 92767 07232", "zfd9276707232", "north 2392768 1607232", "Z 2392768 1607232"] {
+            match search(&s, q, 50).hits.first() {
+                Some(Hit::Coordinate { lon, lat }) => {
+                    assert!((lon - 45.0).abs() < 1e-3 && (lat - 85.0).abs() < 1e-3, "{q}: {lon} {lat}")
+                }
+                other => panic!("{q}: {other:?}"),
+            }
+        }
+        match search(&s, "Y, 1735147, 2243078", 50).hits.first() {
+            Some(Hit::Coordinate { lon, lat }) => assert!(*lon < 0.0 && *lat > 86.0, "{lon} {lat}"),
+            other => panic!("{other:?}"),
+        }
+        for q in ["BAN", "ZAP", "Box", "Berlin", "Bay", "Zanzibar", "Y", "ZAH"] {
+            let r = search(&s, q, 50);
+            assert!(!r.hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}: {r:?}");
+            assert_eq!(r.grid_error, None, "{q}");
+        }
+        // A polar reference that names no place says why.
+        assert_eq!(search(&s, "ZDA1234512345", 50).grid_error, Some(GridError::Square));
+        assert_eq!(search(&s, "YRA1234512345", 50).grid_error, Some(GridError::OutsideZone));
     }
 
     #[test]

@@ -18,9 +18,10 @@
 //! writes the zone with two digits (`04QFJ`), so references line up and sort; one digit is read
 //! as well.
 //!
-//! Only the UTM latitudes, 80° S to 84° N, are covered: the polar areas use the Universal Polar
-//! Stereographic (UPS) grid, which isn't implemented. There the functions return `None`, and a
-//! typed polar reference is refused with [`GridError::Polar`].
+//! The UTM functions cover the UTM latitudes, 80° S up to 84° N. North of 84° N and south of
+//! 80° S, the polar areas use the Universal Polar Stereographic grid ([`crate::ups`]): there
+//! [`format_utm`] writes UPS (`north 2392768 1607232`), [`to_mgrs`] gives the polar MGRS reference
+//! (`Z FD 92767 07232`, no zone number), and [`parse_utm`] and [`parse_mgrs`] read both grids.
 
 use std::fmt;
 use std::sync::LazyLock;
@@ -100,8 +101,18 @@ static SERIES: LazyLock<Series> = LazyLock::new(|| {
     }
 });
 
+/// The WGS 84 semi-major axis (meters), for [`crate::ups`].
+pub(crate) fn wgs84_a() -> f64 {
+    WGS84_A
+}
+
+/// The WGS 84 first eccentricity, for [`crate::ups`].
+pub(crate) fn eccentricity() -> f64 {
+    SERIES.e
+}
+
 /// tan of the conformal latitude from tan of the latitude, τ′(τ) (Karney 2011, eqs. 7–9).
-fn conformal_tan(tau: f64) -> f64 {
+pub(crate) fn conformal_tan(tau: f64) -> f64 {
     let e = SERIES.e;
     let sigma = (e * (e * tau / tau.hypot(1.0)).atanh()).sinh();
     tau * sigma.hypot(1.0) - sigma * tau.hypot(1.0)
@@ -109,7 +120,7 @@ fn conformal_tan(tau: f64) -> f64 {
 
 /// tan of the latitude from tan of the conformal latitude, by Newton's method (Karney 2011,
 /// eqs. 19–21).
-fn geographic_tan(taup: f64) -> Option<f64> {
+pub(crate) fn geographic_tan(taup: f64) -> Option<f64> {
     let e2m = 1.0 - SERIES.e * SERIES.e;
     let mut tau = taup / e2m;
     for _ in 0..10 {
@@ -158,7 +169,7 @@ fn tm_inverse(x: f64, y: f64) -> Option<(f64, f64)> {
 }
 
 /// A longitude within [-180, 180).
-fn wrap(lon: f64) -> f64 {
+pub(crate) fn wrap(lon: f64) -> f64 {
     let l = (lon + 180.0).rem_euclid(360.0) - 180.0;
     if l >= 180.0 { l - 360.0 } else { l }
 }
@@ -301,14 +312,17 @@ pub fn from_utm(zone: u8, north: bool, easting: f64, northing: f64) -> Option<Co
     Some(Coord::new(wrap(central_meridian(zone) + dlon), lat))
 }
 
-/// A place as `33north 412345 5523456` (zone and hemisphere; see [`Utm`]'s `Display`); `None`
-/// outside 80° S to 84° N.
+/// A place as `33north 412345 5523456` (zone and hemisphere; see [`Utm`]'s `Display`), or in the
+/// polar areas as UPS, `north 2392768 1607232` (see [`crate::ups::Ups`]); `None` for a
+/// non-finite place or a latitude past ±90°.
 pub fn format_utm(c: Coord) -> Option<String> {
-    to_utm(c).map(|u| u.to_string())
+    to_utm(c).map(|u| u.to_string()).or_else(|| crate::ups::format_ups(c))
 }
 
 /// An MGRS reference: zone, band, the 100 km square's column and row letters, and the easting
-/// and northing within the square truncated to `digits` digits each (0–5: 100 km to 1 m).
+/// and northing within the square truncated to `digits` digits each (0–5: 100 km to 1 m). In the
+/// polar areas (UPS) the zone is 0, as MGRS writes no zone number there, and the band is the
+/// half's letter: Y or Z north of 84° N, A or B south of 80° S.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mgrs {
     pub zone: u8,
@@ -326,9 +340,19 @@ impl Mgrs {
         10f64.powi(5 - i32::from(self.digits.min(5)))
     }
 
-    /// Without spaces: `33UVP1234523456`, `04QFJ12345678`.
+    /// Whether the reference is in a polar area (UPS), which MGRS writes without a zone number.
+    pub fn polar(&self) -> bool {
+        self.zone == 0
+    }
+
+    /// The zone and band as MGRS writes them: `33U`, `04Q`, or the polar half's letter alone (`Z`).
+    fn designator(&self) -> String {
+        if self.polar() { self.band.to_string() } else { format!("{:02}{}", self.zone, self.band) }
+    }
+
+    /// Without spaces: `33UVP1234523456`, `04QFJ12345678`, `ZFD9276707232`.
     pub fn compact(&self) -> String {
-        format!("{:02}{}{}{}{}", self.zone, self.band, self.column, self.row, self.digit_groups().concat())
+        format!("{}{}{}{}", self.designator(), self.column, self.row, self.digit_groups().concat())
     }
 
     /// The easting and northing digits, zero-padded to the precision (empty for 100 km).
@@ -347,9 +371,10 @@ impl Mgrs {
 }
 
 impl fmt::Display for Mgrs {
-    /// `33U VP 12345 23456` (the readout's form; `33U VP` at 100 km; `04Q FJ …` in zones 1–9).
+    /// `33U VP 12345 23456` (the readout's form; `33U VP` at 100 km; `04Q FJ …` in zones 1–9;
+    /// `Z FD 92767 07232` in the polar areas).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:02}{} {}{}", self.zone, self.band, self.column, self.row)?;
+        write!(f, "{} {}{}", self.designator(), self.column, self.row)?;
         let [e, n] = self.digit_groups();
         if !e.is_empty() {
             write!(f, " {e} {n}")?;
@@ -359,10 +384,11 @@ impl fmt::Display for Mgrs {
 }
 
 /// A place's MGRS reference to `digits` digits per axis (clamped to 0–5: 100 km to 1 m),
-/// truncated as MGRS requires; `None` outside 80° S to 84° N (the UPS areas).
+/// truncated as MGRS requires (NGA.SIG.0012 §12.3); in the polar areas the UPS reference
+/// (`Z FD 92767 07232`). `None` for a non-finite place or a latitude past ±90°.
 pub fn to_mgrs(c: Coord, digits: u8) -> Option<Mgrs> {
     let digits = digits.min(5);
-    let u = to_utm(c)?;
+    let Some(u) = to_utm(c) else { return polar_mgrs(c, digits) };
     // Whole metres first, truncated, so the square letters and the digits agree at an edge. Just
     // south of the equator the northing can round up to the full 10,000 km false northing, which
     // is the equator itself and row A of band N: it is kept a metre short, in row V of band M.
@@ -390,7 +416,26 @@ pub fn to_mgrs(c: Coord, digits: u8) -> Option<Mgrs> {
     })
 }
 
-/// A place as `33U VP 12345 23456` (1 m); `None` outside 80° S to 84° N.
+/// A polar place's MGRS reference (NGA.SIG.0012 §§11.9–11.12): the UPS easting and northing in
+/// whole meters, truncated, so the square letters and the digits agree at an edge.
+fn polar_mgrs(c: Coord, digits: u8) -> Option<Mgrs> {
+    let p = crate::ups::to_ups(c)?;
+    let (e, n) = (p.easting.floor() as i64, p.northing.floor() as i64);
+    let (band, column, row) = crate::ups::square_letters(p.north, e, n)?;
+    let scale = 10i64.pow(5 - u32::from(digits));
+    Some(Mgrs {
+        zone: 0,
+        band,
+        column,
+        row,
+        easting: u32::try_from(e.rem_euclid(100_000) / scale).ok()?,
+        northing: u32::try_from(n.rem_euclid(100_000) / scale).ok()?,
+        digits,
+    })
+}
+
+/// A place as `33U VP 12345 23456` (1 m), or `Z FD 92767 07232` in the polar areas; `None` for
+/// a non-finite place or a latitude past ±90°.
 pub fn format_mgrs(c: Coord) -> Option<String> {
     to_mgrs(c, 5).map(|m| m.to_string())
 }
@@ -404,7 +449,8 @@ pub enum GridError {
     Zone,
     /// A letter that isn't a latitude band.
     Band,
-    /// A polar (UPS) reference: bands A, B, Y and Z.
+    /// A polar letter (A, B, Y or Z) after a zone number, or a UTM position north of 84° N or
+    /// south of 80° S: the polar areas are UPS, which has no zone number.
     Polar,
     /// 100 km square letters that the zone doesn't use.
     Square,
@@ -424,7 +470,9 @@ impl fmt::Display for GridError {
             GridError::Syntax => "not a UTM or MGRS grid reference",
             GridError::Zone => "the UTM zone must be 1 to 60",
             GridError::Band => "the latitude band must be a letter from C to X (not I or O)",
-            GridError::Polar => "polar (UPS) grid references, north of 84° N or south of 80° S, aren't supported",
+            GridError::Polar => {
+                "north of 84° N and south of 80° S the grid is UPS, which has no zone number: write north 2000000 2444268 or Z AM 00775 44267"
+            }
             GridError::Square => "the 100 km square letters aren't used in this zone",
             GridError::Digits => "the grid digits must be an even count of 0 to 10, half for the easting and half for the northing",
             GridError::BandMismatch => "the northing doesn't fall in the latitude band given",
@@ -477,6 +525,9 @@ fn cell_latitudes(zone: u8, north: bool, e0: f64, n0: f64, cell: f64) -> Option<
 /// The centre of the cell an MGRS reference names: the 2,000 km row cycle is settled by the band,
 /// which the cell must reach into.
 fn locate(m: &Mgrs) -> Result<Coord, GridError> {
+    if m.polar() {
+        return locate_polar(m);
+    }
     if !(1..=60).contains(&m.zone) {
         return Err(GridError::Zone);
     }
@@ -517,8 +568,77 @@ fn locate(m: &Mgrs) -> Result<Coord, GridError> {
     found.ok_or(GridError::BandMismatch)
 }
 
+/// The center of the cell a polar MGRS reference names (NGA.SIG.0012 §11.13): the square's
+/// south-west corner from its letters, plus the digits. The cell must reach into its UPS zone:
+/// the squares at the corners of the lettering lie wholly in the UTM latitudes.
+fn locate_polar(m: &Mgrs) -> Result<Coord, GridError> {
+    if m.digits > 5 {
+        return Err(GridError::Digits);
+    }
+    let (north, e0, n0) = crate::ups::square_origin(m.band, m.column, m.row)?;
+    let cell = m.precision_m();
+    if f64::from(m.easting) * cell >= SQUARE || f64::from(m.northing) * cell >= SQUARE {
+        return Err(GridError::Digits);
+    }
+    let e0 = e0 + f64::from(m.easting) * cell;
+    let n0 = n0 + f64::from(m.northing) * cell;
+    if !crate::ups::cell_reaches_zone(north, e0, n0, cell, ROUNDING_DEG) {
+        return Err(GridError::OutsideZone);
+    }
+    crate::ups::from_ups(north, e0 + cell / 2.0, n0 + cell / 2.0).ok_or(GridError::OutsideZone)
+}
+
 /// Most characters a typed grid reference may have.
 const MAX_REF_CHARS: usize = 64;
+
+/// An easting and a northing in meters, separated by spaces or commas: plain decimals only (no
+/// signs, exponents or `inf`).
+fn easting_and_northing(text: &str) -> Result<(f64, f64), GridError> {
+    let nums: Vec<&str> = text.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).collect();
+    let [es, ns] = nums.as_slice() else { return Err(GridError::Syntax) };
+    let number = |s: &str| {
+        if !s.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return Err(GridError::Syntax);
+        }
+        s.parse::<f64>().ok().filter(|v| v.is_finite()).ok_or(GridError::Syntax)
+    };
+    Ok((number(es)?, number(ns)?))
+}
+
+/// Reads a UPS position, which has no zone number: the zone spelled out, `north 2392768 1607232`
+/// or `south 2096454 1452981` (any case), as the readout writes it, or the polar half's letter
+/// before the easting and northing, `Y, 1735147, 2243078` (NGA.STND.0037 App. A-4), where Y and
+/// A lie west of the 2,000,000 m easting and Z and B on or east of it. The place must lie in the
+/// zone, at 84° N or more or south of 80° S, give or take the meter it was rounded to.
+pub fn parse_ups(text: &str) -> Result<Coord, GridError> {
+    let text = text.trim();
+    if text.chars().count() > MAX_REF_CHARS {
+        return Err(GridError::Syntax);
+    }
+    let mut chars = text.chars().peekable();
+    let mut word = String::new();
+    while let Some(c) = chars.next_if(char::is_ascii_alphabetic) {
+        word.push(c.to_ascii_uppercase());
+    }
+    let (north, half) = match word.as_str() {
+        "NORTH" => (true, None),
+        "SOUTH" => (false, None),
+        "Y" | "Z" => (true, word.chars().next()),
+        "A" | "B" => (false, word.chars().next()),
+        _ => return Err(GridError::Syntax),
+    };
+    let rest: String = chars.collect();
+    let (easting, northing) = easting_and_northing(&rest)?;
+    if half.is_some_and(|h| !crate::ups::easting_in_half(h, easting)) {
+        return Err(GridError::OutsideZone);
+    }
+    let p = crate::ups::from_ups(north, easting, northing).ok_or(GridError::OutsideZone)?;
+    let in_zone = if north { p.y >= crate::ups::UPS_NORTH_FROM - ROUNDING_DEG } else { p.y < crate::ups::UPS_SOUTH_OF + ROUNDING_DEG };
+    if !in_zone {
+        return Err(GridError::OutsideZone);
+    }
+    Ok(p)
+}
 
 /// Reads a zone number (one or two digits) and the letter after it, skipping spaces. The zone
 /// isn't checked to be 1–60 here (the caller does, once the rest reads as a reference): until
@@ -550,15 +670,21 @@ fn band_letter(letter: char) -> Result<char, GridError> {
 /// `33U VP 12345 23456`, `33UVP 1234 2345`, `4QFJ` (100 km). The digits are an even count of 0
 /// to 10, as one run or as two groups of the same length. The square letters are checked against
 /// the zone, and the northing against the band, so a reference that doesn't exist is refused
-/// rather than placed somewhere else. Polar (UPS) references are refused with
-/// [`GridError::Polar`].
+/// rather than placed somewhere else.
+///
+/// In the polar areas MGRS writes no zone number (NGA.SIG.0012 §§11.9 and 11.13): the half's
+/// letter (Y or Z north, A or B south), the square's letters, then the digits, as
+/// `ZFD9276707232` or `Z FD 92767 07232`. A polar letter after a zone number (`38ZMB`) is refused
+/// with [`GridError::Polar`]; text that starts with any other letter isn't a reference.
 pub fn parse_mgrs(text: &str) -> Result<Mgrs, GridError> {
     let text = text.trim();
     if text.chars().count() > MAX_REF_CHARS {
         return Err(GridError::Syntax);
     }
     let mut chars = text.chars().peekable();
-    let (zone, band) = zone_and_letter(&mut chars)?;
+    let polar = chars.peek().is_some_and(char::is_ascii_alphabetic);
+    let (zone, band) =
+        if polar { (0, chars.next().map(|c| c.to_ascii_uppercase()).ok_or(GridError::Syntax)?) } else { zone_and_letter(&mut chars)? };
     let mut letters = [' '; 2];
     for l in letters.iter_mut() {
         while chars.next_if(|c| c.is_whitespace()).is_some() {}
@@ -585,11 +711,19 @@ pub fn parse_mgrs(text: &str) -> Result<Mgrs, GridError> {
         }
         _ => return Err(GridError::Digits),
     };
-    // The zone first, as `parse_utm` does: `0AAA` names a bad zone, not a polar reference.
-    if !(1..=60).contains(&zone) {
-        return Err(GridError::Zone);
-    }
-    let band = band_letter(band)?;
+    let band = if polar {
+        // Only the polar halves' letters start a reference: `CAT` or `Main` is text.
+        if !crate::ups::is_polar_half(band) {
+            return Err(GridError::Syntax);
+        }
+        band
+    } else {
+        // The zone first, as `parse_utm` does: `0AAA` names a bad zone, not a polar reference.
+        if !(1..=60).contains(&zone) {
+            return Err(GridError::Zone);
+        }
+        band_letter(band)?
+    };
     let [column, row] = letters;
     let digit = |s: &str| if s.is_empty() { Ok(0) } else { s.parse::<u32>().map_err(|_| GridError::Digits) };
     let m = Mgrs {
@@ -617,11 +751,16 @@ pub fn parse_mgrs(text: &str) -> Result<Mgrs, GridError> {
 ///
 /// `S` after the zone is band S (32° N to 40° N). A northing outside band S may mean the
 /// southern hemisphere, so it is refused as [`GridError::Ambiguous`] rather than guessed.
-/// Polar (UPS) references are refused.
+///
+/// North of 84° N and south of 80° S the grid is UPS, read by [`parse_ups`]'s forms
+/// (`north 2392768 1607232`); a UTM zone's position there is refused as [`GridError::Polar`].
 pub fn parse_utm(text: &str) -> Result<Coord, GridError> {
     let text = text.trim();
     if text.chars().count() > MAX_REF_CHARS {
         return Err(GridError::Syntax);
+    }
+    if text.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return parse_ups(text);
     }
     let mut chars = text.chars().peekable();
     let (zone, letter) = zone_and_letter(&mut chars)?;
@@ -633,16 +772,7 @@ pub fn parse_utm(text: &str) -> Result<Coord, GridError> {
         return Err(GridError::Syntax);
     }
     let rest: String = chars.collect();
-    let nums: Vec<&str> = rest.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).collect();
-    let [es, ns] = nums.as_slice() else { return Err(GridError::Syntax) };
-    let number = |s: &str| {
-        // Plain decimals only: no signs, exponents or "inf".
-        if s.is_empty() || !s.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            return Err(GridError::Syntax);
-        }
-        s.parse::<f64>().ok().filter(|v| v.is_finite()).ok_or(GridError::Syntax)
-    };
-    let (easting, northing) = (number(es)?, number(ns)?);
+    let (easting, northing) = easting_and_northing(&rest)?;
     if !(1..=60).contains(&zone) {
         return Err(GridError::Zone);
     }
@@ -910,8 +1040,11 @@ mod tests {
         assert_eq!(to_mgrs(p, 9).unwrap().digits, 5);
         // The UTM readout rounds instead.
         assert_eq!(from_utm(38, true, 444_140.6, 3_684_706.4).map(format_utm), Some(Some("38north 444141 3684706".into())));
-        assert!(to_mgrs(c(0.0, 84.0), 5).is_none());
-        assert!(format_mgrs(c(0.0, -85.0)).is_none());
+        // In the polar areas, UPS's MGRS (GeographicLib's `GeoConvert -m -p 0`), truncated too.
+        assert_eq!(to_mgrs(c(0.0, 84.0), 5).map(|m| m.compact()).as_deref(), Some("ZAA0000033272"));
+        assert_eq!(format_mgrs(c(170.0, -85.0)).as_deref(), Some("B AG 96454 52981"));
+        assert_eq!(to_mgrs(c(-0.0001, -88.0), 5).map(|m| m.compact()).as_deref(), Some("AZQ9999922069"));
+        assert_eq!(to_mgrs(c(170.0, -85.0), 2).map(|m| m.compact()).as_deref(), Some("BAG9652"));
     }
 
     #[test]
@@ -1138,10 +1271,17 @@ mod tests {
             let zone_end = text.find(|ch: char| !ch.is_ascii_digit()).unwrap();
             assert!(text[zone_end..].starts_with("north ") || text[zone_end..].starts_with("south "), "{text}");
         }
-        // Where UTM has no zone the readout still writes nothing, and the hemisphere form of a
-        // polar position is refused.
-        for p in [c(0.0, 84.0), c(0.0, -80.000_1), c(0.0, 90.0)] {
-            assert!(format_utm(p).is_none(), "{p:?}");
+        // Where UTM has no zone the readout writes UPS (GeographicLib's `GeoConvert -u -l`), which
+        // reads back; a UTM zone's position there is refused.
+        for (p, want) in [
+            (c(0.0, 84.0), "north 2000000 1333272"),
+            (c(0.0001, -80.000_1), "south 2000002 3112940"),
+            (c(0.0, 90.0), "north 2000000 2000000"),
+        ] {
+            let text = format_utm(p).unwrap();
+            assert_eq!(text, want, "{p:?}");
+            let back = parse_utm(&text).unwrap();
+            assert!((back.y - p.y).abs() < 1e-5, "{p:?} {back:?}");
         }
         let (e, n) = to_utm_in_zone(c(15.0, 84.05), 33, true).unwrap();
         assert_eq!(parse_utm(&format!("33north {} {}", e.round(), n.round())), Err(GridError::Polar));
@@ -1341,7 +1481,15 @@ mod tests {
 
     #[test]
     fn outside_utm_is_said_not_guessed() {
-        for p in [c(0.0, 84.0), c(10.0, 89.9), c(0.0, 90.0), c(-60.0, -80.5), c(0.0, -90.0), c(f64::NAN, 1.0)] {
+        // UTM has no zone in the polar areas; the readouts give UPS there instead.
+        for p in [c(0.0, 84.0), c(10.0, 89.9), c(0.0, 90.0), c(-60.0, -80.5), c(0.0, -90.0)] {
+            assert!(to_utm(p).is_none(), "{p:?}");
+            let utm = format_utm(p).unwrap();
+            assert!(utm.starts_with(if p.y > 0.0 { "north " } else { "south " }), "{p:?} {utm}");
+            let mgrs = to_mgrs(p, 5).unwrap();
+            assert!(mgrs.polar() && "ABYZ".contains(mgrs.band), "{p:?} {mgrs}");
+        }
+        for p in [c(f64::NAN, 1.0), c(0.0, 90.5), c(0.0, -91.0), c(f64::INFINITY, 85.0)] {
             assert!(to_utm(p).is_none(), "{p:?}");
             assert!(format_utm(p).is_none(), "{p:?}");
             assert!(format_mgrs(p).is_none(), "{p:?}");
@@ -1353,5 +1501,93 @@ mod tests {
         assert!(from_utm(31, true, 500_000.0, 1e7).is_none());
         assert!(to_utm_in_zone(c(100.0, 0.0), 31, true).is_none());
         assert!(to_utm_in_zone(c(3.0, 91.0), 31, true).is_none());
+    }
+
+    /// Polar MGRS against GeographicLib's `GeoConvert -m -p 0`: written, then read back in both
+    /// forms to the same cell.
+    #[test]
+    fn polar_mgrs_matches_geoconvert_and_reads_back() {
+        let cases = [
+            (0.0, 84.0, "ZAA0000033272"),
+            (-0.5, 84.5, "YZA9466788941"),
+            (45.0, 85.0, "ZFD9276707232"),
+            (-135.0, 87.5, "YYJ0370596294"),
+            (10.0, 89.999, "ZAG0001999890"),
+            (0.0, 90.0, "ZAH0000000000"),
+            (179.9, 86.0, "ZAM0077544267"),
+            (-179.9, 86.0, "YZM9922444267"),
+            (180.0, 84.0, "ZAP0000066727"),
+            (-180.0, 84.0, "ZAP0000066727"),
+            (-60.0, -80.5, "ALT8456628525"),
+            (170.0, -85.0, "BAG9645452981"),
+            (30.0, -89.9, "BAN0555109614"),
+            (0.0, -90.0, "BAN0000000000"),
+            (0.0001, -80.0001, "BAZ0000112939"),
+            (-0.0001, -88.0, "AZQ9999922069"),
+        ];
+        for (lon, lat, want) in cases {
+            let m = to_mgrs(c(lon, lat), 5).unwrap();
+            assert_eq!(m.compact(), want, "{lon} {lat}");
+            assert_eq!(parse_mgrs(want), Ok(m), "{want}");
+            assert_eq!(parse_mgrs(&m.to_string()), Ok(m), "{m}");
+            assert_eq!(parse_mgrs(&want.to_lowercase()), Ok(m), "{want}");
+            let p = m.centre().unwrap();
+            assert!((p.y - lat).abs() < 1e-4, "{want}: {p:?}");
+        }
+        // UTM still owns 80° S itself.
+        assert_eq!(to_mgrs(c(0.0, -80.0), 5).map(|m| m.compact()).as_deref(), Some("31CDM4186716915"));
+        // NGA.STND.0037 App. B-5f's worked example, 86°46′ N 132°30′ W: zone Y, square XK.
+        let m = to_mgrs(c(-132.5, 86.0 + 46.0 / 60.0), 2).unwrap();
+        assert_eq!((m.band, m.column, m.row), ('Y', 'X', 'K'));
+    }
+
+    #[test]
+    fn polar_references_that_name_no_place_are_refused() {
+        for (text, why) in [
+            ("ZDA", GridError::Square),      // Z skips D and E
+            ("YAA", GridError::Square),      // Y starts at R
+            ("BAI", GridError::Square),      // no I
+            ("YRA", GridError::OutsideZone), // the north lettering's corner lies south of 84° N
+            ("AJA", GridError::OutsideZone), // the south lettering's corner lies north of 80° S
+            ("ZAH123", GridError::Digits),
+            ("ZAH 123 45", GridError::Digits),
+            ("38ZMB", GridError::Polar), // a polar letter after a zone number
+        ] {
+            assert_eq!(parse_mgrs(text), Err(why), "{text}");
+        }
+        // Text starting with any other letter, or words, aren't references.
+        for text in ["CAT", "Main", "Berlin 12", "Z", "ZA", "BOX", "zap road"] {
+            assert!(matches!(parse_mgrs(text), Err(GridError::Syntax | GridError::Square)), "{text}");
+        }
+        for text in ["CAT", "Main", "Berlin 12", "Z", "zap road"] {
+            assert_eq!(parse_mgrs(text), Err(GridError::Syntax), "{text}");
+        }
+    }
+
+    /// UPS positions: the readout's `north …`/`south …` and NGA.STND.0037 App. A-4's
+    /// `Y, 1735147, 2243078`, whose letter must match the side of the 2,000,000 m easting.
+    #[test]
+    fn ups_positions_read_both_forms() {
+        let p = parse_utm("north 2392768 1607232").unwrap();
+        assert!((p.x - 45.0).abs() < 1e-4 && (p.y - 85.0).abs() < 1e-4, "{p:?}");
+        assert_eq!(parse_utm("NORTH 2392768 1607232"), Ok(p));
+        assert_eq!(parse_utm("Z 2392768 1607232"), Ok(p));
+        let q = parse_utm("Y, 1735147, 2243078").unwrap();
+        assert!(q.x < 0.0 && q.y > 84.0, "{q:?}");
+        let s = parse_utm("south 2096454 1452981").unwrap();
+        assert!((s.x - 170.0).abs() < 1e-4 && (s.y + 85.0).abs() < 1e-4, "{s:?}");
+        assert_eq!(parse_utm("B 2096454 1452981"), Ok(s));
+        for (text, why) in [
+            ("Y 2392768 1607232", GridError::OutsideZone),     // east of 2,000,000 m is Z
+            ("A 2096454 1452981", GridError::OutsideZone),     // east of 2,000,000 m is B
+            ("north 2000000 100000", GridError::OutsideZone),  // south of 84° N
+            ("south 2000000 3500000", GridError::OutsideZone), // north of 80° S
+            ("north 2000000", GridError::Syntax),
+            ("north -1 2000000", GridError::Syntax),
+            ("Q 2000000 2000000", GridError::Syntax),
+            ("north 1e300 2000000", GridError::Syntax),
+        ] {
+            assert_eq!(parse_utm(text), Err(why), "{text}");
+        }
     }
 }

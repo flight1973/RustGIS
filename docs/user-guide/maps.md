@@ -129,9 +129,9 @@ rustgis-cli run --sample --cmd 'map.search={"query":"Tokyo","go":true}'
 
 **Right-click the map** for a menu about that place. Its first row shows the place in the status
 bar's coordinate format (latitude and longitude as `40.712800, -74.006000` for decimal degrees);
-click it to copy it. North of 84° N and south of 80° S, where UTM and MGRS have no zone, and on
-the map of another body than the Earth, it shows and copies the latitude and longitude, and its
-hover text says why. Below it, **Copy As GeoJSON**
+click it to copy it. North of 84° N and south of 80° S it gives the polar grid, UPS (see
+[Coordinate readouts](#coordinate-readouts)). On the map of another body than the Earth it shows
+and copies the latitude and longitude, and its hover text says why. Below it, **Copy As GeoJSON**
 copies the place as a point feature, **Center Map Here** and **Zoom In Here** move the view, and **Directions To Here** and
 **Directions From Here** open the [Directions](#directions) pane. **Quick Analysis** runs a tool
 at the place: a buffer of 500 m, 1 km or 5 km (¼, 1 or 5 miles when the Directions pane is set
@@ -158,10 +158,15 @@ UTM states the hemisphere, as GeographicLib's `GeoConvert -u -l` writes it, not 
 in plain UTM a letter after the zone is commonly read as the hemisphere, so `38S` (band S, 32° N
 to 40° N) would be taken for the southern hemisphere, 10,000 km away. Latitude bands are MGRS's.
 UTM and MGRS are on WGS 84, with the zone exceptions for southern Norway (32V) and Svalbard (31X,
-33X, 35X and 37X), and cover 80° S to 84° N. Nearer the poles they would need the Universal Polar
-Stereographic grid, which RustGIS doesn't have: there the readout shows *No UTM here* (or
-*No MGRS here*) rather than a wrong reference, and so it does on the map of another body than
-the Earth, where degrees still read. Scripts set the format with
+33X, 35X and 37X), and cover 80° S up to 84° N. North of 84° N and south of 80° S the readouts
+use the Universal Polar Stereographic grid (UPS), as NGA defines it (NGA.SIG.0012): the UTM
+readout gives the zone spelled out and the easting and northing, `north 2077146 1562481`, as
+GeographicLib writes it, and the MGRS readout gives the polar reference, which has no zone
+number: a letter for the half (Y west and Z east of the 0° and 180° meridians in the north, A
+and B in the south), the 100 km square and the digits, `Z AC 77146 62481`. 84° N itself is
+UPS, 80° S itself is UTM. Search reads both, along with `ZAC7714662481` and the form
+`Z 2077146 1562481`. On the map of another body than the Earth the readout shows *No UTM here*
+(or *No MGRS here*) rather than a wrong reference, and degrees still read. Scripts set the format with
 `ui.coordinateFormat={"format":"utm"}` (`decimal`, `dms`, `utm` or `mgrs`); without `format`
 it steps to the next one. A saved format this version doesn't know, say from a newer RustGIS,
 reads as decimal degrees with a notice, and stays saved until you pick a format.

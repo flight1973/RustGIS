@@ -131,7 +131,7 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, c: Coord) {
         )
     } else if fell_back {
         i18n::fmt(
-            "Copy coordinates to the clipboard. No {format} here: outside the UTM zones (80° S to 84° N), so latitude and longitude are copied",
+            "Copy coordinates to the clipboard. No {format} here, so latitude and longitude are copied",
             &[("format", format.label())],
         )
     } else {
@@ -286,11 +286,15 @@ mod tests {
                 assert!((at.x - q.x).abs() < 1e-4 && (at.y - q.y).abs() < 1e-4, "{text} {at:?}");
             }
         }
-        // Where UTM has no zone, the row falls back to latitude and longitude (and says so).
+        // Where UTM has no zone, the row gives UPS (`north …`, `Z …`), which reads back too.
         let pole = Coord::new(10.0, 86.0);
         for f in [CoordReadout::Utm, CoordReadout::Mgrs] {
-            assert_eq!(coordinate_row(pole, f, true), ("86.000000, 10.000000".into(), true), "{f:?}");
-            // On another body's map as well: UTM and MGRS are the Earth's grids.
+            let (text, fell_back) = coordinate_row(pole, f, true);
+            assert!(!fell_back && (text.starts_with("north ") || text.starts_with("Z ")), "{f:?}: {text}");
+            let at = rustgis_engine::cmd::search::read_grid_reference(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert!((at.x - pole.x).abs() < 1e-3 && (at.y - pole.y).abs() < 1e-4, "{text} {at:?}");
+            // On another body's map the row falls back to latitude and longitude (and says so):
+            // UTM, MGRS and UPS are the Earth's grids.
             assert_eq!(coordinate_row(p, f, false), ("33.300000, 44.400000".into(), true), "{f:?}");
         }
         assert!(!coordinate_row(pole, CoordReadout::Dms, true).1);

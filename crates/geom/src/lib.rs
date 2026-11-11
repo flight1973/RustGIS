@@ -10,12 +10,14 @@ pub mod body;
 pub mod eqc;
 pub mod sinusoidal;
 pub mod triangulate;
+pub mod ups;
 pub mod utm;
 
 pub use body::{BODIES, Body};
 pub use eqc::EquidistantCylindrical;
 pub use sinusoidal::Sinusoidal;
-pub use utm::{GridError, Mgrs, Utm, format_mgrs, format_utm, parse_mgrs, parse_utm, to_mgrs, to_utm};
+pub use ups::{Ups, format_ups, from_ups, to_ups};
+pub use utm::{GridError, Mgrs, Utm, format_mgrs, format_utm, parse_mgrs, parse_ups, parse_utm, to_mgrs, to_utm};
 
 use std::sync::LazyLock;
 
