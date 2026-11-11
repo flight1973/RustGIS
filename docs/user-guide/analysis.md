@@ -331,16 +331,16 @@ multipart rings are retained. This is not a topology-preserving simplifier: chec
 where holes or neighboring polygons must stay aligned. The default tolerance remains 25 km;
 use a smaller value for local boundaries. The tolerance is taken at each vertex's latitude (or,
 where the line runs nearer the equator, there), so a feature spanning many latitudes is never
-simplified more than asked: no vertex moves farther on the ground than the tolerance. Near a long
-stretch reaching toward the equator it can be simplified a little less than asked. The scale
-stops at 85°'s, so beyond 85.05°, where the ground is far narrower, less is simplified away than
-asked (a 3 km tolerance at 89.9°N takes out only what lies within about 60 m east–west), and the
-tool says how many features reach that far. A tolerance of 0 leaves every feature as it is.
+simplified more than asked: no vertex moves farther on the ground (on the WGS 84 ellipsoid) than
+the tolerance. Near a long stretch reaching toward the equator it can be simplified a little less
+than asked. The scale stops at 85°'s, so beyond 85.05°, where the ground is far narrower, less is
+simplified away than asked (a 3 km tolerance at 89.9°N takes out only what lies within about 60 m
+east–west), and the tool says how many features reach that far. A feature without geometry is
+left out, and the tool says how many. A tolerance of 0 leaves every line and polygon as it is.
 Otherwise a line or polygon with a coordinate missing, or a longitude too far out to place, is
 left as it was; a latitude past ±90° is taken as the pole; a line part of fewer than 2 vertices
-beside a longer one, and a feature without geometry, are left out; and a feature too intricate to
-simplify whole within the work allowed keeps more vertices than asked in part of it. The tool
-says how many of each.
+beside a longer one is left out; and a feature too intricate to simplify whole within the work
+allowed keeps more vertices than asked in part of it. The tool says how many of each.
 
 **Kernel Density** (`kernelDensity`) calculates a continuous magnitude-per-unit-area raster
 surface from point features using a Quartic (biweight, default) or Gaussian kernel (truncated at 3σ and

@@ -3778,6 +3778,12 @@ fn xy_table_to_point(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 /// whose farthest vertex is always beside a chord's end), as `lod.rs`'s `DP_WORK` bounds the map's.
 const SIMPLIFY_WORK: usize = 256;
 
+/// The analysis plane's scale ([`merc_scale`]) is the sphere's; on the WGS 84 ellipsoid a ground
+/// distance is at most the polar radius of curvature over the sphere's radius longer (about 0.34%:
+/// a meter east–west at the pole, or north–south there). A tolerance taken this much smaller holds
+/// on the ellipsoid too, so no vertex moves farther than asked there either.
+const SPHERE_TO_WGS84: f64 = 6_378_137.0 / 6_399_593.625_8;
+
 /// Douglas–Peucker on a run of vertices in the analysis plane, each vertex's tolerance converted at
 /// its latitude ([`merc_scale`], at most 85°'s), so a feature spanning many latitudes isn't
 /// simplified farther than asked toward the equator (#1033). A vertex's tolerance is taken at the
@@ -3798,6 +3804,8 @@ fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cel
     if n <= 2 || tol_m.is_nan() || tol_m <= 0.0 || pts.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
         return pts.to_vec();
     }
+    // On the ellipsoid, not the sphere ([`SPHERE_TO_WGS84`]).
+    let tol_m = tol_m * SPHERE_TO_WGS84;
     // Each vertex's latitude and scale (plane meters per ground meter, [`merc_scale`]), worked out
     // once.
     let lat: Vec<f64> = pts.iter().map(|c| rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y)).y).collect();
@@ -3810,12 +3818,21 @@ fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cel
         *k = true;
     }
     let mut budget = n.saturating_mul(work);
+    // Distances measured since Cancel was last looked at.
+    let mut since_check = 0usize;
     let mut stack = vec![(0, n - 1)];
     while let Some((i, j)) = stack.pop() {
-        // Out of work: this span, and those still open, keep their vertices.
         let span = j - i - 1;
-        if span > budget {
-            capped.set(true);
+        // Cancel is looked at every 65,536 distances, so one large feature doesn't hold the run.
+        since_check = since_check.saturating_add(span);
+        let canceled = since_check >= 1 << 16 && {
+            since_check = 0;
+            crate::control::cancelled()
+        };
+        // Out of work, or canceled (the run then stops as an error): this span, and those still
+        // open, keep their vertices.
+        if span > budget || canceled {
+            capped.set(capped.get() || !canceled);
             for k in std::iter::once((i, j)).chain(stack.drain(..)).flat_map(|(i, j)| i + 1..j) {
                 if let Some(kept) = keep.get_mut(k) {
                     *kept = true;
@@ -3987,11 +4004,22 @@ fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<Too
                 // than 2 vertices has no line to keep (`from_line`), and is counted.
                 let s = simplify_checked(g, tol);
                 let (mut beyond, mut past_pole, mut short) = (false, 0usize, 0usize);
+                // A geometry given back as it was (nothing to keep in the plane) moved nothing.
+                let changed = s.geometry != *g;
                 if tol > 0.0 && !s.broken && !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
-                    g.for_each_coord(|c| {
-                        beyond |= !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT;
-                        past_pole += usize::from(!c.y.is_nan() && c.y.abs() > 90.0);
-                    });
+                    let past = |c: &Coord| !c.y.is_nan() && c.y.abs() > 90.0;
+                    g.for_each_coord(|c| beyond |= !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT);
+                    // The vertices taken to a pole are those in what's kept: a line's parts of 2
+                    // vertices or more, a polygon's rings.
+                    past_pole = match g {
+                        _ if !changed => 0,
+                        Geometry::Line(parts) => parts.iter().filter(|p| p.len() >= 2).flatten().filter(|c| past(c)).count(),
+                        _ => {
+                            let mut n = 0;
+                            g.for_each_coord(|c| n += usize::from(past(&c)));
+                            n
+                        }
+                    };
                     // A line whose parts are all that short is kept as it was (`from_line` has none
                     // to give), so only the short parts beside a longer one go.
                     if let Geometry::Line(parts) = g
@@ -7654,6 +7682,16 @@ mod tests {
         let m = Map(HashMap::from([("lines".to_string(), lines)]));
         let res = crate::run("simplify", &m, &serde_json::json!({"input": "lines", "tolerance": 1.0})).unwrap();
         assert!(res.messages.iter().any(|m| m == "Simplify: 2 line part(s) of fewer than 2 vertices left out"), "{:?}", res.messages);
+        // A line of nothing but a one-vertex part past the pole is kept as it was: nothing is taken
+        // to the pole, nothing left out, and neither is said.
+        let mut lone = Dataset::new("lone", GeometryType::Polyline, vec![]);
+        lone.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 95.0)]])), vec![]);
+        let m = Map(HashMap::from([("lone".to_string(), lone)]));
+        let res = crate::run("simplify", &m, &serde_json::json!({"input": "lone", "tolerance": 1.0})).unwrap();
+        let messages = res.messages.clone();
+        let out = layer(res);
+        assert_eq!(out.features[0].geometry, Some(Geometry::Line(vec![vec![Coord::new(0.0, 95.0)]])));
+        assert!(!messages.iter().any(|m| m.contains("past a pole") || m.contains("left out")), "{messages:?}");
     }
 
     /// Where every vertex has the same scale (all beyond 85°, where it stops at 85°'s), the
@@ -7664,7 +7702,8 @@ mod tests {
     #[test]
     fn simplify_coords_matches_douglas_peucker_at_one_scale() {
         use geo::Simplify;
-        let geo_dp = |pts: &[geo::Coord<f64>], tol: f64| geo::LineString::new(pts.to_vec()).simplify(tol * merc_scale(86.0)).0;
+        let geo_dp =
+            |pts: &[geo::Coord<f64>], tol: f64| geo::LineString::new(pts.to_vec()).simplify(tol * SPHERE_TO_WGS84 * merc_scale(86.0)).0;
         let zigzag: Vec<geo::Coord<f64>> = (0..40)
             .map(|i| {
                 let y = 86.0 + (i % 5) as f64 * 0.2 + if i % 2 == 0 { 0.01 } else { 0.0 };
