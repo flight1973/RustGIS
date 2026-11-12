@@ -155,7 +155,7 @@ fn search_map(map: &rustgis_map::Map, query: &str, limit: usize) -> Results {
     // may be either, and so may a bare 100 km MGRS square, which names Sentinel-2's tiles (33UVP);
     // an MGRS reference with digits is plainly a coordinate. UTM and MGRS are the Earth's grids,
     // so on another body's map they name no place. Polar (UPS) references have no zone number;
-    // the parser tells them from words (`ZAH` and `Z AH` are references, `Bay 12` and `zap` text).
+    // the parser tells them from words (`Z AH` and `ZAH1234512345` are references; `ZAH`, `ATL`, `BAW1234` and `Bay 12` are text).
     let mut plainly_coordinate = false;
     if let Some(c) = parse_lat_lon(&q) {
         out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
@@ -833,6 +833,14 @@ mod tests {
             "Zanzibar",
             "Y",
             "north 10 20",
+            "BAW1234",
+            "YUL1234",
+            "BAN12",
+            "Bay 12 34",
+            "Apt 12 14",
+            "Z Ah",
+            "B Ag",
+            "z ah",
             // Codes and acronyms in capitals: airports, not polar squares.
             "ATL",
             "AUS",
@@ -849,7 +857,7 @@ mod tests {
         }
         // A 100 km polar square written as the readout writes it, spaced, reads back; like
         // `33UVP` it may also be a name, so the tables are still searched.
-        for q in ["Z AH", "z ah", "B AN"] {
+        for q in ["Z AH", "B AN"] {
             let r = search(&s, q, 50);
             assert!(matches!(r.hits.first(), Some(Hit::Coordinate { .. })), "{q}: {r:?}");
         }

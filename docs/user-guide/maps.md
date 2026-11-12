@@ -189,9 +189,11 @@ The [search box](#navigating) takes the same grid references, in any case:
 - **UPS and polar MGRS**, north of 84° N and south of 80° S, which have no zone number: UPS as
   the readout writes it, `north 2077146 1562481` or `south 2096454 1452981`, or with the half's
   letter, `Z 2077146 1562481` or `Y, 1735147, 2243078`; polar MGRS as `ZAC7714662481`,
-  `Z AC 77146 62481` or `ZAC 77146 62481`. Three letters alone, or before a single number, are
-  read as a word (`ATL`, `Bay 12`), so a 100 km polar square alone is written spaced, `Z AC`,
-  as the readout writes it. A UTM zone's position past 84° N or 80° S, or a polar letter after a
+  `ZAC 77146 62481` or `Z AC 77146 62481`. Three letters written together are as often a word
+  or a code (`ATL`, `Bay 12`, `BAW1234`), so they're read only with at least six digits (100 m
+  or finer); with a space after the half's letter (`Z AC 77 62`) any precision reads, and a
+  100 km square alone is written as the readout writes it, `Z AC`, in capitals. A UTM zone's
+  position past 84° N or 80° S, or a polar letter after a
   zone number (`38ZMB`), finds nothing and the list says how UPS is written.
 
 A reference that doesn't exist (square letters the zone doesn't use, a northing or a square

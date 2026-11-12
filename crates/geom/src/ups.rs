@@ -26,10 +26,9 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use crate::Coord;
-/// Reads a UPS position (`north 2392768 1607232`, `Y, 1735147, 2243078`); it lives with the UTM
-/// parser, which hands polar text to it.
-pub use crate::utm::parse_ups;
-use crate::utm::{GridError, conformal_tan, eccentricity, geographic_tan, wgs84_a, wrap};
+use crate::utm::{
+    GridError, MAX_REF_CHARS, ROUNDING_DEG, conformal_tan, easting_and_northing, eccentricity, geographic_tan, wgs84_a, wrap,
+};
 
 /// The northern limit of the UTM zones, where north UPS begins (degrees); 84° N itself is UPS.
 pub const UPS_NORTH_FROM: f64 = 84.0;
@@ -204,13 +203,18 @@ pub fn format_ups(c: Coord) -> Option<String> {
     to_ups(c).map(|u| u.to_string())
 }
 
+/// A zone's lettering: its column letter pairs, its row letters, and the index of its first
+/// 100 km square along either axis (NGA.SIG.0012 §§11.10 and 11.11).
+fn lettering(north: bool) -> (&'static [&'static [u8; 2]], &'static [u8], i64) {
+    if north { (&NORTH_COLUMNS, NORTH_ROWS, NORTH_FIRST) } else { (&SOUTH_COLUMNS, SOUTH_ROWS, SOUTH_FIRST) }
+}
+
 /// The MGRS letters of the 100 km square holding a UPS easting and northing (whole meters): the
 /// half's letter (Y, Z, A or B), then the square's column and row letters. `None` outside the
 /// lettered area of the zone (NGA.SIG.0012 §§11.10 and 11.11).
 pub(crate) fn square_letters(north: bool, easting: i64, northing: i64) -> Option<(char, char, char)> {
     let (col, row) = (easting.div_euclid(100_000), northing.div_euclid(100_000));
-    let (columns, rows, first): (&[&[u8; 2]], &[u8], i64) =
-        if north { (&NORTH_COLUMNS, NORTH_ROWS, NORTH_FIRST) } else { (&SOUTH_COLUMNS, SOUTH_ROWS, SOUTH_FIRST) };
+    let (columns, rows, first) = lettering(north);
     let pair = columns.get(usize::try_from(col - first).ok()?)?;
     let row = rows.get(usize::try_from(row - first).ok()?)?;
     Some((char::from(pair[0]), char::from(pair[1]), char::from(*row)))
@@ -225,8 +229,7 @@ pub(crate) fn square_origin(half: char, column: char, row: char) -> Result<(bool
         'A' | 'B' => false,
         _ => return Err(GridError::Band),
     };
-    let (columns, rows, first): (&[&[u8; 2]], &[u8], i64) =
-        if north { (&NORTH_COLUMNS, NORTH_ROWS, NORTH_FIRST) } else { (&SOUTH_COLUMNS, SOUTH_ROWS, SOUTH_FIRST) };
+    let (columns, rows, first) = lettering(north);
     let col = columns.iter().position(|p| char::from(p[0]) == half && char::from(p[1]) == column).ok_or(GridError::Square)?;
     let row = rows.iter().position(|r| char::from(*r) == row).ok_or(GridError::Square)?;
     let at = |i: usize| (first + i as i64) as f64 * SQUARE;
@@ -250,10 +253,10 @@ pub(crate) fn cell_reaches_zone(north: bool, e0: f64, n0: f64, cell: f64, slop_d
 /// 2,000,000 m easting, Z and B on it and east of it (NGA.STND.0037 App. B-5b; the line itself
 /// is Z and B by NGA.SIG.0012 §§11.10 and 11.11, where square 20 is ZA and BA). Full
 /// coordinates are written rounded to the meter (NGA.STND.0037 App. A-2), so a place in Y or A
-/// just west of the line may read 2,000,000: Y and A accept it, within half a meter.
+/// just west of the line may read 2,000,000: Y and A accept exactly that whole number too.
 pub(crate) fn easting_in_half(half: char, easting: f64) -> bool {
     match half {
-        'Y' | 'A' => easting < FALSE_ORIGIN + 0.5,
+        'Y' | 'A' => easting <= FALSE_ORIGIN,
         'Z' | 'B' => easting >= FALSE_ORIGIN,
         _ => false,
     }
@@ -264,7 +267,7 @@ pub(crate) fn easting_in_half(half: char, easting: f64) -> bool {
 /// the south, along both axes (NGA.SIG.0012 §§11.10 and 11.11). Numbers outside it aren't a UPS
 /// position at all.
 pub(crate) fn in_lettered_area(north: bool, easting: f64, northing: f64) -> bool {
-    let first = (if north { NORTH_FIRST } else { SOUTH_FIRST }) as f64 * SQUARE;
+    let first = lettering(north).2 as f64 * SQUARE;
     let span = first..(2.0 * FALSE_ORIGIN - first);
     span.contains(&easting) && span.contains(&northing)
 }
@@ -272,6 +275,49 @@ pub(crate) fn in_lettered_area(north: bool, easting: f64, northing: f64) -> bool
 /// Whether a letter names a polar half of MGRS.
 pub(crate) fn is_polar_half(letter: char) -> bool {
     matches!(letter, 'A' | 'B' | 'Y' | 'Z')
+}
+
+/// Reads a UPS position, which has no zone number: the zone spelled out, `north 2392768 1607232`
+/// or `south 2096454 1452981` (any case), as the readout writes it, or the polar half's letter
+/// before the easting and northing, `Y, 1735147, 2243078` (NGA.STND.0037 App. A-4), where Y and
+/// A lie west of the 2,000,000 m easting and Z and B on or east of it. Numbers outside the zone's
+/// lettered area (north 1,300,000 up to 2,700,000 m, south 800,000 up to 3,200,000 m) aren't a UPS
+/// position and read as text ([`GridError::Syntax`]); a place inside it must lie in the zone, at
+/// 84° N or more or south of 80° S, give or take the meter it was rounded to.
+pub fn parse_ups(text: &str) -> Result<Coord, GridError> {
+    let text = text.trim();
+    if text.chars().count() > MAX_REF_CHARS {
+        return Err(GridError::Syntax);
+    }
+    let mut chars = text.chars().peekable();
+    let mut word = String::new();
+    while let Some(c) = chars.next_if(char::is_ascii_alphabetic) {
+        word.push(c.to_ascii_uppercase());
+    }
+    let (north, half) = match word.as_str() {
+        "NORTH" => (true, None),
+        "SOUTH" => (false, None),
+        "Y" | "Z" => (true, word.chars().next()),
+        "A" | "B" => (false, word.chars().next()),
+        _ => return Err(GridError::Syntax),
+    };
+    // A space or comma after the word or letter: `north2000000 …` isn't written that way.
+    if !chars.peek().is_some_and(|c| c.is_whitespace() || *c == ',') {
+        return Err(GridError::Syntax);
+    }
+    let rest: String = chars.collect();
+    let (easting, northing) = easting_and_northing(&rest)?;
+    // Numbers outside the zone's lettered area aren't a UPS position (`A 10 20`, a road): text.
+    if !in_lettered_area(north, easting, northing) {
+        return Err(GridError::Syntax);
+    }
+    if half.is_some_and(|h| !easting_in_half(h, easting)) {
+        return Err(GridError::OutsideZone);
+    }
+    if !cell_reaches_zone(north, easting, northing, 0.0, ROUNDING_DEG) {
+        return Err(GridError::OutsideZone);
+    }
+    from_ups(north, easting, northing).ok_or(GridError::OutsideZone)
 }
 
 #[cfg(test)]
@@ -380,8 +426,8 @@ mod tests {
         }
         assert!(easting_in_half('Z', FALSE_ORIGIN) && !easting_in_half('Z', FALSE_ORIGIN - 0.1));
         assert!(easting_in_half('B', FALSE_ORIGIN) && !easting_in_half('B', FALSE_ORIGIN - 0.1));
-        // A typed full coordinate is rounded: Y and A take the line within half a meter.
-        assert!(easting_in_half('Y', FALSE_ORIGIN) && !easting_in_half('Y', FALSE_ORIGIN + 0.5));
+        // A typed full coordinate is rounded: Y and A take the line itself, not past it.
+        assert!(easting_in_half('Y', FALSE_ORIGIN) && !easting_in_half('Y', FALSE_ORIGIN + 0.4));
         assert!(easting_in_half('A', FALSE_ORIGIN) && !easting_in_half('A', FALSE_ORIGIN + 1.0));
     }
 

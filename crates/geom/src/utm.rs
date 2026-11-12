@@ -50,7 +50,7 @@ const ROW_CYCLE: f64 = 2_000_000.0;
 const EDGE_SLOP_DEG: f64 = 0.5;
 /// How far (degrees) a place, or the nearest part of a cell, may lie outside its band, or past the
 /// UTM limits, for rounding: about a metre, the precision a UTM position is written to.
-const ROUNDING_DEG: f64 = 1.0 / M_PER_DEG;
+pub(crate) const ROUNDING_DEG: f64 = 1.0 / M_PER_DEG;
 /// Metres per degree of latitude, roughly, for turning a cell's size into degrees.
 const M_PER_DEG: f64 = 111_000.0;
 
@@ -545,7 +545,7 @@ fn locate(m: &Mgrs) -> Result<Coord, GridError> {
     if !(1..=60).contains(&m.zone) {
         return Err(GridError::Zone);
     }
-    if matches!(m.band, 'A' | 'B' | 'Y' | 'Z') {
+    if crate::ups::is_polar_half(m.band) {
         return Err(GridError::Polar);
     }
     if m.digits > 5 {
@@ -603,11 +603,11 @@ fn locate_polar(m: &Mgrs) -> Result<Coord, GridError> {
 }
 
 /// Most characters a typed grid reference may have.
-const MAX_REF_CHARS: usize = 64;
+pub(crate) const MAX_REF_CHARS: usize = 64;
 
 /// An easting and a northing in meters, separated by spaces or commas: plain decimals only (no
 /// signs, exponents or `inf`).
-fn easting_and_northing(text: &str) -> Result<(f64, f64), GridError> {
+pub(crate) fn easting_and_northing(text: &str) -> Result<(f64, f64), GridError> {
     let nums: Vec<&str> = text.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty()).collect();
     let [es, ns] = nums.as_slice() else { return Err(GridError::Syntax) };
     let number = |s: &str| {
@@ -617,51 +617,6 @@ fn easting_and_northing(text: &str) -> Result<(f64, f64), GridError> {
         s.parse::<f64>().ok().filter(|v| v.is_finite()).ok_or(GridError::Syntax)
     };
     Ok((number(es)?, number(ns)?))
-}
-
-/// Reads a UPS position, which has no zone number: the zone spelled out, `north 2392768 1607232`
-/// or `south 2096454 1452981` (any case), as the readout writes it, or the polar half's letter
-/// before the easting and northing, `Y, 1735147, 2243078` (NGA.STND.0037 App. A-4), where Y and
-/// A lie west of the 2,000,000 m easting and Z and B on or east of it. Numbers outside the zone's
-/// lettered area (north 1,300,000 up to 2,700,000 m, south 800,000 up to 3,200,000 m) aren't a UPS
-/// position and read as text ([`GridError::Syntax`]); a place inside it must lie in the zone, at
-/// 84° N or more or south of 80° S, give or take the meter it was rounded to.
-pub fn parse_ups(text: &str) -> Result<Coord, GridError> {
-    let text = text.trim();
-    if text.chars().count() > MAX_REF_CHARS {
-        return Err(GridError::Syntax);
-    }
-    let mut chars = text.chars().peekable();
-    let mut word = String::new();
-    while let Some(c) = chars.next_if(char::is_ascii_alphabetic) {
-        word.push(c.to_ascii_uppercase());
-    }
-    let (north, half) = match word.as_str() {
-        "NORTH" => (true, None),
-        "SOUTH" => (false, None),
-        "Y" | "Z" => (true, word.chars().next()),
-        "A" | "B" => (false, word.chars().next()),
-        _ => return Err(GridError::Syntax),
-    };
-    // A space or comma after the word or letter: `north2000000 …` isn't written that way.
-    if !chars.peek().is_some_and(|c| c.is_whitespace() || *c == ',') {
-        return Err(GridError::Syntax);
-    }
-    let rest: String = chars.collect();
-    let (easting, northing) = easting_and_northing(&rest)?;
-    // Numbers outside the zone's lettered area aren't a UPS position (`A 10 20`, a road): text.
-    if !crate::ups::in_lettered_area(north, easting, northing) {
-        return Err(GridError::Syntax);
-    }
-    if half.is_some_and(|h| !crate::ups::easting_in_half(h, easting)) {
-        return Err(GridError::OutsideZone);
-    }
-    let p = crate::ups::from_ups(north, easting, northing).ok_or(GridError::OutsideZone)?;
-    let in_zone = if north { p.y >= crate::ups::UPS_NORTH_FROM - ROUNDING_DEG } else { p.y < crate::ups::UPS_SOUTH_OF + ROUNDING_DEG };
-    if !in_zone {
-        return Err(GridError::OutsideZone);
-    }
-    Ok(p)
 }
 
 /// Reads a zone number (one or two digits) and the letter after it, skipping spaces. The zone
@@ -684,7 +639,7 @@ fn zone_and_letter(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Resu
 
 /// Checks a band letter, telling the polar letters apart.
 fn band_letter(letter: char) -> Result<char, GridError> {
-    if matches!(letter, 'A' | 'B' | 'Y' | 'Z') {
+    if crate::ups::is_polar_half(letter) {
         return Err(GridError::Polar);
     }
     band_latitudes(letter).map(|_| letter).ok_or(GridError::Band)
@@ -698,9 +653,11 @@ fn band_letter(letter: char) -> Result<char, GridError> {
 ///
 /// In the polar areas MGRS writes no zone number (NGA.SIG.0012 §§11.9 and 11.13): the half's
 /// letter (Y or Z north, A or B south), the square's letters, then the digits, as
-/// `ZFD9276707232` or `Z FD 92767 07232`. It must have a space after the half's letter or its
-/// digits attached to the letters: three letters alone (`ATL`, `Bay 12`) are a word, so a 100 km
-/// polar square is read spaced, `Z AH`, as the readout writes it. A polar letter after a zone
+/// `ZFD9276707232` or `Z FD 92767 07232`. Three letters written as one word are as often a word
+/// or a code, so they are read only with at least six digits after them (`ZFD9276707232`,
+/// `ZFD 927 072`, `ZAC 7714662481`): `ATL`, `Bay 12` and `BAW1234` are text. Spaced after the
+/// half's letter it is read at any precision, and a 100 km square alone in capitals (`Z AH`, as
+/// the readout writes it; `Z Ah` is a phrase). A polar letter after a zone
 /// number (`38ZMB`) is refused with [`GridError::Polar`]; text that starts with any other letter
 /// isn't a reference.
 pub fn parse_mgrs(text: &str) -> Result<Mgrs, GridError> {
@@ -723,23 +680,26 @@ pub fn parse_mgrs(text: &str) -> Result<Mgrs, GridError> {
     // Whether a space follows the zone and band (or the polar half's letter).
     let spaced = chars.peek().is_some_and(|c| c.is_whitespace());
     let mut letters = [' '; 2];
+    let mut capitals = true;
     for l in letters.iter_mut() {
         while chars.next_if(|c| c.is_whitespace()).is_some() {}
-        *l = chars.next().filter(char::is_ascii_alphabetic).ok_or(GridError::Syntax)?.to_ascii_uppercase();
+        let c = chars.next().filter(char::is_ascii_alphabetic).ok_or(GridError::Syntax)?;
+        capitals &= c.is_ascii_uppercase();
+        *l = c.to_ascii_uppercase();
     }
-    let digits_attached = chars.peek().is_some_and(char::is_ascii_digit);
     let rest: String = chars.collect();
     if rest.chars().any(|c| !c.is_ascii_digit() && !c.is_whitespace()) {
         return Err(GridError::Syntax);
     }
     let groups: Vec<&str> = rest.split_whitespace().collect();
     // A polar reference written as one word of three letters is as often a word or a code
-    // (`Bay 12`, `ATL`, `YUL`): it is text, unless its digits are attached (`ZAH1234512345`,
-    // MGRS's compact form) or follow as two equal groups of 2 to 5 (`ZFD 92767 07232`). Spaced
-    // after the half's letter (`Z AH`, `Z AH 12345 12345`, as the readout writes it) it is a
-    // reference in any form. Case doesn't matter.
-    let two_groups = matches!(groups.as_slice(), [e, n] if e.len() == n.len() && (2..=5).contains(&e.len()));
-    if polar && !spaced && !digits_attached && !two_groups {
+    // (`ATL`, `Bay 12`, the flight `BAW1234`): it is read only with at least six digits, 100 m or
+    // finer, as references are written (`ZAH1234512345`, `ZFD 92767 07232`, `ZAC 7714662481`).
+    // Spaced after the half's letter (`Z AH 12 34`, as the readout writes it) it is a reference at
+    // any precision; a 100 km square alone, with no digits, only with its square letters in
+    // capitals (`Z AH`), as `Z Ah` or `b ag` is a phrase.
+    let digit_count = groups.iter().map(|g| g.len()).sum::<usize>();
+    if polar && ((!spaced && digit_count < 6) || (digit_count == 0 && !capitals)) {
         return Err(GridError::Syntax);
     }
     let (e, n) = match groups.as_slice() {
@@ -795,7 +755,7 @@ pub fn parse_mgrs(text: &str) -> Result<Mgrs, GridError> {
 /// `S` after the zone is band S (32° N to 40° N). A northing outside band S may mean the
 /// southern hemisphere, so it is refused as [`GridError::Ambiguous`] rather than guessed.
 ///
-/// North of 84° N and south of 80° S the grid is UPS, read by [`parse_ups`]'s forms
+/// North of 84° N and south of 80° S the grid is UPS, read by [`crate::ups::parse_ups`]'s forms
 /// (`north 2392768 1607232`); a UTM zone's position there is refused as [`GridError::Polar`].
 pub fn parse_utm(text: &str) -> Result<Coord, GridError> {
     let text = text.trim();
@@ -803,7 +763,7 @@ pub fn parse_utm(text: &str) -> Result<Coord, GridError> {
         return Err(GridError::Syntax);
     }
     if text.starts_with(|c: char| c.is_ascii_alphabetic()) {
-        return parse_ups(text);
+        return crate::ups::parse_ups(text);
     }
     let mut chars = text.chars().peekable();
     let (zone, letter) = zone_and_letter(&mut chars)?;
@@ -1590,10 +1550,10 @@ mod tests {
             ("Z DA", GridError::Square),      // Z skips D and E
             ("Y AA", GridError::Square),      // Y starts at R
             ("B AI", GridError::Square),      // no I
-            ("ZDA12", GridError::Square),     // attached digits read as a reference too
+            ("ZDA123456", GridError::Square), // six digits or more read as a reference too
             ("Y RA", GridError::OutsideZone), // the north lettering's corner lies south of 84° N
             ("A JA", GridError::OutsideZone), // the south lettering's corner lies north of 80° S
-            ("ZAH123", GridError::Digits),
+            ("ZAH1234567", GridError::Digits),
             ("Z AH 123 45", GridError::Digits),
             ("38ZMB", GridError::Polar), // a polar letter after a zone number
         ] {
@@ -1636,12 +1596,36 @@ mod tests {
             "Elm",
             "BA Y 12",
             "ZAH 1 2",
+            // Codes with a few digits: flights, apartments, short numbers.
+            "BAW1234",
+            "YUL1234",
+            "BAN12",
+            "bay12",
+            "Bay 12 34",
+            "Apt 12 14",
+            "Yuk 12 34",
+            "zfd 92 07",
+            "ZAH123",
+            // A one-letter word and a two-letter word is a phrase unless in capitals.
+            "Z Ah",
+            "B Ag",
+            "z ah",
         ] {
             assert_eq!(parse_mgrs(text), Err(GridError::Syntax), "{text}");
         }
-        // Spaced after the half's letter, with the digits attached, or with two equal groups of
-        // digits, it is a reference.
-        for text in ["B AY 12", "bay12", "Z AH", "z ah", "Z AH 12345 12345", "ZAH1234512345", "ZFD 92767 07232", "zfd 92 07"] {
+        // Spaced after the half's letter, or written as one word with at least six digits (100 m
+        // or finer), it is a reference.
+        for text in [
+            "B AY 12",
+            "b ay 12",
+            "Z AH",
+            "Z AH 12345 12345",
+            "ZAH1234512345",
+            "ZFD 92767 07232",
+            "zfd 927 072",
+            "ZAC 7714662481",
+            "zac7714662481",
+        ] {
             assert!(parse_mgrs(text).is_ok(), "{text}");
         }
     }
