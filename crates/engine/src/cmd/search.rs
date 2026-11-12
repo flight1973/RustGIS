@@ -136,6 +136,10 @@ pub struct Results {
     /// that doesn't hold its northing, square letters the zone doesn't use, `S` that may mean
     /// south); `None` when it isn't written as one, or reads.
     pub grid_error: Option<GridError>,
+    /// Whether the coordinate among the hits was read from text that may as well be a name or a
+    /// code: a polar (UPS) reference, which starts with a letter (`BAG123456`). The search box
+    /// still offers to look the text up as a place.
+    pub coordinate_may_be_text: bool,
 }
 
 /// Searches the active map for `query`: a coordinate first, then layers, bookmarks and features.
@@ -154,14 +158,18 @@ fn search_map(map: &rustgis_map::Map, query: &str, limit: usize) -> Results {
     // zone and band) isn't looked for in the tables; two whole numbers (an id, years, a range)
     // may be either, and so may a bare 100 km MGRS square, which names Sentinel-2's tiles (33UVP);
     // an MGRS reference with digits is plainly a coordinate. UTM and MGRS are the Earth's grids,
-    // so on another body's map they name no place. Polar (UPS) references have no zone number;
-    // the parser tells them from words (`Z AH` and `ZAH1234512345` are references; `ZAH`, `ATL`, `BAW1234` and `Bay 12` are text).
+    // so on another body's map they name no place. Polar (UPS) references and positions start
+    // with a letter, as names and codes do (`BAG123456`, `A ST 12`): read_grid_reference reads
+    // them only as references are written ([`polar_form`]), and even then the tables are still
+    // searched and the place comes after their hits, so a feature named so is found first.
     let mut plainly_coordinate = false;
+    let mut polar_place = None;
     if let Some(c) = parse_lat_lon(&q) {
         out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
         plainly_coordinate = q.chars().any(|c| matches!(c, '.' | '°' | 'º' | '\'' | '′' | '"' | '″') || c.is_alphabetic());
     } else if map.body().is_earth() {
         match read_grid_reference(&q) {
+            Ok(c) if letter_led(&q) => polar_place = Some(c),
             Ok(c) => {
                 out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
                 plainly_coordinate = rustgis_geom::parse_mgrs(&q).map_or(true, |m| m.digits > 0);
@@ -238,7 +246,13 @@ fn search_map(map: &rustgis_map::Map, query: &str, limit: usize) -> Results {
             }
         }
     }
-    out.hits.truncate(limit.max(1));
+    let limit = limit.max(1);
+    if let Some(c) = polar_place {
+        // After the other hits, but within the limit.
+        out.hits.insert(out.hits.len().min(limit - 1), Hit::Coordinate { lon: c.x, lat: c.y });
+        out.coordinate_may_be_text = true;
+    }
+    out.hits.truncate(limit);
     out
 }
 
@@ -414,8 +428,18 @@ pub fn parse_grid_reference(text: &str) -> Option<Coord> {
 /// references are ([`written_as_polar_reference`]); UPS positions (`north 2077146 1562481`) are
 /// read as [`rustgis_geom::parse_utm`] reads them.
 pub fn read_grid_reference(text: &str) -> Result<Coord, GridError> {
-    let letter_led = text.trim_start().starts_with(|c: char| c.is_ascii_alphabetic());
-    let mgrs = if letter_led && !written_as_polar_reference(text) { Err(GridError::Syntax) } else { rustgis_geom::parse_mgrs(text) };
+    let mgrs = if !letter_led(text) {
+        rustgis_geom::parse_mgrs(text)
+    } else {
+        match polar_form(text) {
+            // As the readout writes it: plainly meant as a reference, so it says why it names no
+            // place.
+            Some(PolarForm::Readout) => rustgis_geom::parse_mgrs(text),
+            // Compact forms look like codes too (`BAG123456`): read if they name a place, text if not.
+            Some(PolarForm::Compact) => rustgis_geom::parse_mgrs(text).map_err(|_| GridError::Syntax),
+            None => Err(GridError::Syntax),
+        }
+    };
     match mgrs {
         Ok(m) => m.centre(),
         Err(mgrs) => match rustgis_geom::parse_utm(text) {
@@ -426,36 +450,51 @@ pub fn read_grid_reference(text: &str) -> Result<Coord, GridError> {
     }
 }
 
-/// Whether letter-led text is written as a polar (UPS) MGRS reference is, rather than as a word
-/// or code that happens to read as one (`ATL`, `Bay 12`, the flight `BAW1234`, `A St 12`,
-/// `Apt 123456`):
-/// - as the readout writes it: the half's letter, a space and the square's letters, in capitals
-///   (`Z AH`, `Z AH 12 34`);
-/// - as one word with at least six digits attached, 100 m or finer (`ZAC7714662481`, any case);
-/// - or with the three letters in capitals before two equal groups of at least three digits
-///   (`ZFD 927 072`, `ZFD 92767 07232`).
-fn written_as_polar_reference(text: &str) -> bool {
+/// Whether text starts with a letter, as a polar (UPS) MGRS reference or position does; no
+/// other grid reference does.
+fn letter_led(text: &str) -> bool {
+    text.trim_start().starts_with(|c: char| c.is_ascii_alphabetic())
+}
+
+/// How letter-led text is written as a polar MGRS reference, if it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolarForm {
+    /// As the readout writes it: the half's letter, a space and the square's letters, in
+    /// capitals (`Z AH`, `Z AH 12 34`).
+    Readout,
+    /// As one word with at least six digits attached, 100 m or finer (`ZAC7714662481`, any
+    /// case), or the three letters in capitals before two equal groups of at least three digits
+    /// (`ZFD 927 072`).
+    Compact,
+}
+
+/// How letter-led text is written as a polar MGRS reference ([`PolarForm`]), rather than
+/// as a word or code that happens to read as one (`ATL`, `Bay 12`, the flight `BAW1234`,
+/// `A St 12`, `Apt 123456`); `None` for those.
+fn polar_form(text: &str) -> Option<PolarForm> {
     let mut chars = text.trim().chars();
-    let Some(half) = chars.next() else { return false };
+    let half = chars.next()?;
     let rest = chars.as_str();
     let spaced = rest.starts_with(char::is_whitespace);
     let rest = rest.trim_start();
     let letters: Vec<char> = rest.chars().take(2).collect();
     if letters.len() != 2 || !letters.iter().all(char::is_ascii_alphabetic) {
-        return false;
+        return None;
     }
     let capitals = half.is_ascii_uppercase() && letters.iter().all(char::is_ascii_uppercase);
     if spaced {
-        return capitals;
+        return capitals.then_some(PolarForm::Readout);
     }
     // The two letters are ASCII, so the digits start two bytes on.
     let after = rest.get(2..).unwrap_or("");
     let attached = after.starts_with(|c: char| c.is_ascii_digit());
-    match after.split_whitespace().collect::<Vec<_>>().as_slice() {
-        [run] if attached => run.len() >= 6,
-        [e, n] => capitals && e.len() == n.len() && e.len() >= 3,
+    let digits = |s: &str| s.chars().filter(char::is_ascii_digit).count() == s.len();
+    let compact = match after.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [run] if attached => digits(run) && run.len() >= 6,
+        [e, n] => capitals && digits(e) && digits(n) && e.len() == n.len() && e.len() >= 3,
         _ => false,
-    }
+    };
+    compact.then_some(PolarForm::Compact)
 }
 
 /// Whether `text` has spaces and no digits after its leading number: written so, an MGRS
@@ -911,9 +950,32 @@ mod tests {
         // A reference written as one, but with fewer than six digits as one word, is text: the
         // flight BAW1234 looks the same as ZAH1234.
         assert!(!search(&s, "ZAH1234", 50).hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })));
-        // A polar reference that names no place says why.
-        assert_eq!(search(&s, "ZDA1234512345", 50).grid_error, Some(GridError::Square));
-        assert_eq!(search(&s, "YRA1234512345", 50).grid_error, Some(GridError::OutsideZone));
+        // A polar reference written as the readout writes it that names no place says why; a
+        // compact one may be a code (`ABC123456`), so it says nothing.
+        assert_eq!(search(&s, "Z DA 12345 12345", 50).grid_error, Some(GridError::Square));
+        assert_eq!(search(&s, "Y RA 12345 12345", 50).grid_error, Some(GridError::OutsideZone));
+        for q in ["ZDA1234512345", "YRA1234512345", "ABC123456", "YAA123456"] {
+            assert_eq!(search(&s, q, 50).grid_error, None, "{q}");
+        }
+    }
+
+    /// A code that also reads as a polar reference (`BAG123456` is B AG 123 456, a place in
+    /// Antarctica) is still looked for in the tables, and a feature named so comes first, so
+    /// Enter or `go` goes to it rather than to the pole.
+    #[test]
+    fn features_named_like_polar_references_come_first() {
+        let mut s = Session::new(crate::sample::world_project());
+        s.run("layer.addDataText", &json!({"fileName": "parts.csv", "text": "part,lon,lat\nBAG123456,10.0,50.0\n"})).unwrap();
+        for q in ["BAG123456", "bag123456"] {
+            let r = search(&s, q, 50);
+            assert!(matches!(r.hits.first(), Some(Hit::Feature { value, .. }) if value == "BAG123456"), "{q}: {r:?}");
+            assert!(r.hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}: {r:?}");
+        }
+        // With no feature named so, the place is the first hit, and within the limit; it may still
+        // be text, so the search box offers places too. A UTM reference is plainly a coordinate.
+        let r = search(&s, "ZAC7714662481", 1);
+        assert!(matches!(r.hits.as_slice(), [Hit::Coordinate { .. }]) && r.coordinate_may_be_text);
+        assert!(!search(&s, "38SMB4414084706", 50).coordinate_may_be_text);
     }
 
     #[test]

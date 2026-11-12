@@ -534,7 +534,8 @@ fn cell_latitudes(zone: u8, north: bool, e0: f64, n0: f64, cell: f64) -> Option<
 /// The centre of the cell an MGRS reference names: the 2,000 km row cycle is settled by the band,
 /// which the cell must reach into.
 fn locate(m: &Mgrs) -> Result<Coord, GridError> {
-    if m.polar() {
+    // Zone 0 with a polar half's letter is UPS; with any other letter it is a bad UTM zone.
+    if m.polar() && crate::ups::is_polar_half(m.band) {
         return locate_polar(m);
     }
     if !(1..=60).contains(&m.zone) {
@@ -1530,6 +1531,9 @@ mod tests {
 
     #[test]
     fn polar_references_that_name_no_place_are_refused() {
+        // Built by hand, zone 0 with a UTM band is a bad zone, not a bad band.
+        let m = Mgrs { zone: 0, band: 'U', column: 'V', row: 'P', easting: 0, northing: 0, digits: 0 };
+        assert_eq!(m.centre(), Err(GridError::Zone));
         for (text, why) in [
             ("ZDA", GridError::Square),      // Z skips D and E
             ("Z DA", GridError::Square),     // spaced, the same

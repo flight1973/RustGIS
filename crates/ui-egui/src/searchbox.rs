@@ -106,8 +106,10 @@ pub fn had_focus(st: &State, pass: u64) -> bool {
     st.focus_pass.is_some_and(|p| p + 1 == pass)
 }
 
+/// Whether the query reads as a coordinate and nothing else, so looking it up as a place is no
+/// use. A polar reference may as well be a name or a code (`BAG123456`), so it isn't.
 fn is_coordinate(st: &State) -> bool {
-    matches!(st.results.hits.first(), Some(Hit::Coordinate { .. }))
+    matches!(st.results.hits.first(), Some(Hit::Coordinate { .. })) && !st.results.coordinate_may_be_text
 }
 
 /// The box, at the bottom of the left pane (`ui` is the pane).
