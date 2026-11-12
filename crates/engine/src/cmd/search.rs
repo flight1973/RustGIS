@@ -409,15 +409,52 @@ pub fn parse_grid_reference(text: &str) -> Option<Coord> {
 /// refused: [`GridError::Syntax`] for text written as neither form, otherwise the reason of the
 /// form it was written in. A 100 km square alone written with spaces (`5 Ave`, `4K TV`) is a
 /// number and a word as often as a reference, so one that names no square is
-/// [`GridError::Syntax`] too; written as one word (`38TMJ`), it says why.
+/// [`GridError::Syntax`] too; written as one word (`38TMJ`), it says why. A polar reference has
+/// no zone number, so text that starts with a letter is read as one only when written as
+/// references are ([`written_as_polar_reference`]); UPS positions (`north 2077146 1562481`) are
+/// read as [`rustgis_geom::parse_utm`] reads them.
 pub fn read_grid_reference(text: &str) -> Result<Coord, GridError> {
-    match rustgis_geom::parse_mgrs(text) {
+    let letter_led = text.trim_start().starts_with(|c: char| c.is_ascii_alphabetic());
+    let mgrs = if letter_led && !written_as_polar_reference(text) { Err(GridError::Syntax) } else { rustgis_geom::parse_mgrs(text) };
+    match mgrs {
         Ok(m) => m.centre(),
         Err(mgrs) => match rustgis_geom::parse_utm(text) {
             Err(GridError::Syntax) if spaced_square(text) => Err(GridError::Syntax),
             Err(GridError::Syntax) => Err(mgrs),
             utm => utm,
         },
+    }
+}
+
+/// Whether letter-led text is written as a polar (UPS) MGRS reference is, rather than as a word
+/// or code that happens to read as one (`ATL`, `Bay 12`, the flight `BAW1234`, `A St 12`,
+/// `Apt 123456`):
+/// - as the readout writes it: the half's letter, a space and the square's letters, in capitals
+///   (`Z AH`, `Z AH 12 34`);
+/// - as one word with at least six digits attached, 100 m or finer (`ZAC7714662481`, any case);
+/// - or with the three letters in capitals before two equal groups of at least three digits
+///   (`ZFD 927 072`, `ZFD 92767 07232`).
+fn written_as_polar_reference(text: &str) -> bool {
+    let mut chars = text.trim().chars();
+    let Some(half) = chars.next() else { return false };
+    let rest = chars.as_str();
+    let spaced = rest.starts_with(char::is_whitespace);
+    let rest = rest.trim_start();
+    let letters: Vec<char> = rest.chars().take(2).collect();
+    if letters.len() != 2 || !letters.iter().all(char::is_ascii_alphabetic) {
+        return false;
+    }
+    let capitals = half.is_ascii_uppercase() && letters.iter().all(char::is_ascii_uppercase);
+    if spaced {
+        return capitals;
+    }
+    // The two letters are ASCII, so the digits start two bytes on.
+    let after = rest.get(2..).unwrap_or("");
+    let attached = after.starts_with(|c: char| c.is_ascii_digit());
+    match after.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [run] if attached => run.len() >= 6,
+        [e, n] => capitals && e.len() == n.len() && e.len() >= 3,
+        _ => false,
     }
 }
 
@@ -850,17 +887,30 @@ mod tests {
             "BRU",
             "ZAH",
             "BAN",
+            // A word and a long number, and phrases with digits.
+            "Apt 123456",
+            "Bay 123456",
+            "Bay 123 456",
+            "Box 123456",
+            "A St 12",
+            "a st 12",
+            "B St 12",
+            "ZAC 7714662481",
         ] {
             let r = search(&s, q, 50);
             assert!(!r.hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}: {r:?}");
             assert_eq!(r.grid_error, None, "{q}");
         }
         // A 100 km polar square written as the readout writes it, spaced, reads back; like
-        // `33UVP` it may also be a name, so the tables are still searched.
-        for q in ["Z AH", "B AN"] {
+        // `33UVP` it may also be a name, so the tables are still searched. So do the other
+        // written forms of a reference.
+        for q in ["Z AH", "B AN", "Z AH 12 34", "ZAH1234512345", "zac7714662481", "ZFD 927 072"] {
             let r = search(&s, q, 50);
             assert!(matches!(r.hits.first(), Some(Hit::Coordinate { .. })), "{q}: {r:?}");
         }
+        // A reference written as one, but with fewer than six digits as one word, is text: the
+        // flight BAW1234 looks the same as ZAH1234.
+        assert!(!search(&s, "ZAH1234", 50).hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })));
         // A polar reference that names no place says why.
         assert_eq!(search(&s, "ZDA1234512345", 50).grid_error, Some(GridError::Square));
         assert_eq!(search(&s, "YRA1234512345", 50).grid_error, Some(GridError::OutsideZone));

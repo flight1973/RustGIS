@@ -171,7 +171,8 @@ itself is UTM. On the map of another body than the Earth the readout shows *No U
 it steps to the next one. A saved format this version doesn't know, say from a newer RustGIS,
 reads as decimal degrees with a notice, and stays saved until you pick a format.
 
-The [search box](#navigating) takes the same grid references, in any case:
+The [search box](#navigating) takes the same grid references, in any case (polar references have
+their own rules, below):
 
 - **MGRS** with or without spaces: `33UWR2156621996`, `33U WR 21566 21996`, `33UWR 2156 2199`,
   or a 100 km square alone, `33UWR`; a zone below 10 with or without its leading zero (`04QFJ`,
@@ -188,13 +189,14 @@ The [search box](#navigating) takes the same grid references, in any case:
   nothing: write `south` instead.
 - **UPS and polar MGRS**, north of 84° N and south of 80° S, which have no zone number: UPS as
   the readout writes it, `north 2077146 1562481` or `south 2096454 1452981`, or with the half's
-  letter, `Z 2077146 1562481` or `Y, 1735147, 2243078`; polar MGRS as `ZAC7714662481`,
-  `ZAC 77146 62481` or `Z AC 77146 62481`. Three letters written together are as often a word
-  or a code (`ATL`, `Bay 12`, `BAW1234`), so they're read only with at least six digits (100 m
-  or finer); with a space after the half's letter (`Z AC 77 62`) any precision reads, and a
-  100 km square alone is written as the readout writes it, `Z AC`, in capitals. A UTM zone's
-  position past 84° N or 80° S, or a polar letter after a
-  zone number (`38ZMB`), finds nothing and the list says how UPS is written.
+  letter, `Z 2077146 1562481` or `Y, 1735147, 2243078`. Polar MGRS has no zone number, so three
+  letters and a few digits look like a word or a code (`ATL`, `Bay 12`, the flight `BAW1234`);
+  search reads one only as a reference is written: as the readout writes it, with a space after
+  the half's letter and the square in capitals (`Z AC`, `Z AC 77 62`, `Z AC 77146 62481`), as
+  one word with at least six digits (`ZAC7714662481`, 100 m or finer), or in capitals before
+  two equal groups of digits (`ZAC 771 624`, `ZAC 77146 62481`). A UTM zone's position past
+  84° N or 80° S, or a polar letter after a zone number (`38ZMB`), finds nothing and the list
+  says how UPS is written.
 
 A reference that doesn't exist (square letters the zone doesn't use, a northing or a square
 outside the band, an odd number of digits, a place outside the zone) finds nothing rather than a

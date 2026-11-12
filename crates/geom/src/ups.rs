@@ -16,8 +16,7 @@
 //!   the half (Y for western longitudes and Z for eastern ones in the north, A and B in the
 //!   south; the 0° and 180° meridians, at an easting of 2,000,000 m, are Z and B, by §§11.10 and
 //!   11.11, where square 20 is ZA and BA), then the 100 km square's column and row letters, and
-//!   the digits truncated to the precision. A 100 km square alone is written spaced, `Z AH`
-//!   ([`crate::utm::parse_mgrs`] reads three letters alone as a word).
+//!   the digits truncated to the precision.
 //!
 //! The conformal latitude is the one in [`crate::utm`] (Karney 2011, eqs. 7–9 and 19–21), which
 //! gives the same values as §2.8 and §2.9's PhiToChi and ChiToPhi.
@@ -27,7 +26,7 @@ use std::sync::LazyLock;
 
 use crate::Coord;
 use crate::utm::{
-    GridError, MAX_REF_CHARS, ROUNDING_DEG, conformal_tan, easting_and_northing, eccentricity, geographic_tan, wgs84_a, wrap,
+    GridError, MAX_REF_CHARS, ROUNDING_DEG, WGS84_A, conformal_tan, easting_and_northing, eccentricity, geographic_tan, wrap,
 };
 
 /// The northern limit of the UTM zones, where north UPS begins (degrees); 84° N itself is UPS.
@@ -41,8 +40,9 @@ const K0: f64 = 0.994;
 const FALSE_ORIGIN: f64 = 2_000_000.0;
 /// MGRS 100 km square side (meters).
 const SQUARE: f64 = 100_000.0;
-/// The farthest from the pole (meters) an easting and northing may lie and still name a place;
-/// past it they are typing errors, and the latitude series has nothing to gain.
+/// The farthest from the pole (meters) an easting and northing are converted. Every distance maps
+/// to some latitude (about 2° on the zone's side of the equator at 12,000 km, 25° beyond it at
+/// 20,000 km); past this the numbers can only be typing errors, so they are refused.
 const MAX_RADIUS: f64 = 20_000_000.0;
 
 /// k90 of NGA.SIG.0012 eq. (19): √(1 − e²) · exp(e · artanh e).
@@ -96,7 +96,7 @@ fn polar_radius(lat: f64) -> Option<f64> {
     let taup = conformal_tan(lat.to_radians().tan());
     let h = taup.hypot(1.0);
     let t = if taup >= 0.0 { 1.0 / (h + taup) } else { h - taup };
-    let rho = 2.0 * wgs84_a() * K0 / *K90 * t;
+    let rho = 2.0 * WGS84_A * K0 / *K90 * t;
     rho.is_finite().then_some(rho)
 }
 
@@ -107,7 +107,7 @@ fn latitude_at(rho: f64) -> Option<f64> {
     if rho == 0.0 {
         return Some(90.0);
     }
-    let r = rho * *K90 / (2.0 * wgs84_a() * K0);
+    let r = rho * *K90 / (2.0 * WGS84_A * K0);
     let lat = geographic_tan((1.0 - r * r) / (2.0 * r))?.atan().to_degrees();
     lat.is_finite().then_some(lat)
 }
@@ -153,9 +153,7 @@ impl fmt::Display for Ups {
 /// A place's UPS coordinates; `None` in the UTM latitudes (80° S up to 84° N) and for a non-finite
 /// place.
 pub fn to_ups(c: Coord) -> Option<Ups> {
-    if !c.is_finite() {
-        return None;
-    }
+    // ups_zone refuses a non-finite latitude, and to_ups_in_zone a non-finite longitude.
     let north = ups_zone(c.y)?;
     let (easting, northing) = to_ups_in_zone(c, north)?;
     Some(Ups { north, easting, northing })
@@ -242,11 +240,13 @@ pub(crate) fn square_origin(half: char, column: char, row: char) -> Result<(bool
 /// wholly in the UTM latitudes, and a reference there names no UPS place.
 pub(crate) fn cell_reaches_zone(north: bool, e0: f64, n0: f64, cell: f64, slop_deg: f64) -> bool {
     let near_pole = |lo: f64| FALSE_ORIGIN.clamp(lo, lo + cell);
-    match from_ups(north, near_pole(e0), near_pole(n0)) {
-        Some(p) if north => p.y >= UPS_NORTH_FROM - slop_deg,
-        Some(p) => p.y < UPS_SOUTH_OF + slop_deg,
-        None => false,
-    }
+    from_ups(north, near_pole(e0), near_pole(n0)).is_some_and(|p| in_zone(north, p.y, slop_deg))
+}
+
+/// Whether a latitude lies in a UPS zone (84° N or more, or south of 80° S), give or take
+/// `slop_deg`.
+fn in_zone(north: bool, lat: f64, slop_deg: f64) -> bool {
+    if north { lat >= UPS_NORTH_FROM - slop_deg } else { lat < UPS_SOUTH_OF + slop_deg }
 }
 
 /// Whether a typed easting lies in a polar half's side of its zone: Y and A west of the
@@ -280,7 +280,8 @@ pub(crate) fn is_polar_half(letter: char) -> bool {
 /// Reads a UPS position, which has no zone number: the zone spelled out, `north 2392768 1607232`
 /// or `south 2096454 1452981` (any case), as the readout writes it, or the polar half's letter
 /// before the easting and northing, `Y, 1735147, 2243078` (NGA.STND.0037 App. A-4), where Y and
-/// A lie west of the 2,000,000 m easting and Z and B on or east of it. Numbers outside the zone's
+/// A lie west of the 2,000,000 m easting (or on it, for a rounded coordinate) and Z and B on or
+/// east of it. Numbers outside the zone's
 /// lettered area (north 1,300,000 up to 2,700,000 m, south 800,000 up to 3,200,000 m) aren't a UPS
 /// position and read as text ([`GridError::Syntax`]); a place inside it must lie in the zone, at
 /// 84° N or more or south of 80° S, give or take the meter it was rounded to.
@@ -314,10 +315,11 @@ pub fn parse_ups(text: &str) -> Result<Coord, GridError> {
     if half.is_some_and(|h| !easting_in_half(h, easting)) {
         return Err(GridError::OutsideZone);
     }
-    if !cell_reaches_zone(north, easting, northing, 0.0, ROUNDING_DEG) {
+    let p = from_ups(north, easting, northing).ok_or(GridError::OutsideZone)?;
+    if !in_zone(north, p.y, ROUNDING_DEG) {
         return Err(GridError::OutsideZone);
     }
-    from_ups(north, easting, northing).ok_or(GridError::OutsideZone)
+    Ok(p)
 }
 
 #[cfg(test)]
