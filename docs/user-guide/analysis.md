@@ -339,8 +339,9 @@ east–west), and the tool says how many features reach that far. A feature with
 left out, and the tool says how many. A tolerance of 0 leaves every line and polygon as it is.
 Otherwise a line or polygon with a coordinate missing, or a longitude too far out to place, is
 left as it was; a latitude past ±90° is taken as the pole; a line part of fewer than 2 vertices
-beside a longer one is left out; and a feature too intricate to simplify whole within the work
-allowed keeps more vertices than asked in part of it. The tool says how many of each.
+beside a longer one is left out; and, in a run that can't be canceled, a feature too intricate to
+simplify whole within the work allowed keeps more vertices than asked in part of it (a run you can
+cancel takes no limit, looking at Cancel within each feature). The tool says how many of each.
 
 **Kernel Density** (`kernelDensity`) calculates a continuous magnitude-per-unit-area raster
 surface from point features using a Quartic (biweight, default) or Gaussian kernel (truncated at 3σ and

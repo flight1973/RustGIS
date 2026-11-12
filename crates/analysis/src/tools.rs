@@ -3817,27 +3817,26 @@ fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cel
     if let Some(k) = keep.last_mut() {
         *k = true;
     }
-    let mut budget = n.saturating_mul(work);
-    // Distances measured since Cancel was last looked at.
+    // A run someone can stop while it goes takes no cap (`control::uncapped`), as other tools'.
+    let mut budget = if crate::control::uncapped() { usize::MAX } else { n.saturating_mul(work) };
+    // Distances measured since Cancel was last looked at: it's looked at every 65,536, inside a
+    // span's scan too, so one large feature doesn't hold the run.
     let mut since_check = 0usize;
-    let mut stack = vec![(0, n - 1)];
-    while let Some((i, j)) = stack.pop() {
-        let span = j - i - 1;
-        // Cancel is looked at every 65,536 distances, so one large feature doesn't hold the run.
-        since_check = since_check.saturating_add(span);
-        let canceled = since_check >= 1 << 16 && {
-            since_check = 0;
-            crate::control::cancelled()
-        };
-        // Out of work, or canceled (the run then stops as an error): this span, and those still
-        // open, keep their vertices.
-        if span > budget || canceled {
-            capped.set(capped.get() || !canceled);
-            for k in std::iter::once((i, j)).chain(stack.drain(..)).flat_map(|(i, j)| i + 1..j) {
-                if let Some(kept) = keep.get_mut(k) {
-                    *kept = true;
-                }
+    // Out of work, or canceled (the run then stops as an error): the spans still open keep their
+    // vertices.
+    let keep_open = |keep: &mut Vec<bool>, spans: &mut dyn Iterator<Item = (usize, usize)>| {
+        for k in spans.flat_map(|(i, j)| i + 1..j) {
+            if let Some(kept) = keep.get_mut(k) {
+                *kept = true;
             }
+        }
+    };
+    let mut stack = vec![(0, n - 1)];
+    'spans: while let Some((i, j)) = stack.pop() {
+        let span = j - i - 1;
+        if span > budget {
+            capped.set(true);
+            keep_open(&mut keep, &mut std::iter::once((i, j)).chain(stack.drain(..)));
             break;
         }
         budget -= span;
@@ -3854,6 +3853,14 @@ fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cel
         // The farthest vertex on the ground of those beyond their tolerance.
         let mut far: Option<(usize, f64)> = None;
         for k in i + 1..j {
+            since_check += 1;
+            if since_check >= 1 << 16 {
+                since_check = 0;
+                if crate::control::cancelled() {
+                    keep_open(&mut keep, &mut std::iter::once((i, j)).chain(stack.drain(..)));
+                    break 'spans;
+                }
+            }
             let (Some(c), Some(&lk), Some(&sk)) = (pts.get(k), lat.get(k), scale.get(k)) else { continue };
             // The smallest scale between the vertex and the chord: the equator's (1) where their
             // latitudes straddle it, otherwise the least of theirs. There a plane meter is the most
@@ -3944,9 +3951,12 @@ fn simplify_checked(g: &Geometry, tol_m: f64) -> Simplified {
     }
     if matches!(g, Geometry::Line(_) | Geometry::Polygon(_)) {
         let mut broken = false;
+        // Beyond 1e150 plane meters (a longitude past about 1e143°), the squares in a distance
+        // overflow; no place on Earth is within a hair of it.
+        const PLANE_LIMIT: f64 = 1e150;
         g.for_each_coord(|c| {
             let p = rustgis_geom::lonlat_to_plane(c);
-            broken |= !p.x.is_finite() || !p.y.is_finite();
+            broken |= p.x.is_nan() || p.y.is_nan() || p.x.abs() > PLANE_LIMIT || p.y.abs() > PLANE_LIMIT;
         });
         if broken {
             return unchanged(true);
@@ -7672,6 +7682,49 @@ mod tests {
         assert!(short.iter().all(|c| zigzag.contains(c)));
     }
 
+    /// A run looks at Cancel inside one feature: canceled, a 200,000-vertex line that would be
+    /// simplified to a few vertices stops in its first span's scan and keeps them all (the run then
+    /// ends as canceled), without calling it a work cap. A run someone can stop takes no cap.
+    #[test]
+    fn simplify_coords_looks_at_cancel_inside_a_feature() {
+        let zigzag: Vec<geo::Coord<f64>> = (0..200_000)
+            .map(|i| {
+                let c = rustgis_geom::lonlat_to_plane(Coord::new(i as f64 * 1e-5, if i % 2 == 0 { 0.0 } else { 1e-7 }));
+                geo::coord! { x: c.x, y: c.y }
+            })
+            .collect();
+        assert_eq!(dp(&zigzag, 100.0).len(), 2);
+        let control = crate::control::Control::new();
+        control.cancel();
+        let canceled = {
+            let _installed = crate::control::install(Some(control));
+            let capped = std::cell::Cell::new(false);
+            let out = simplify_coords(&zigzag, 100.0, &capped);
+            assert!(!capped.get(), "a cancel isn't a work cap");
+            out
+        };
+        assert_eq!(canceled.len(), zigzag.len());
+        // Stoppable: no cap, however little work is allowed, and the whole run simplified.
+        let _installed = crate::control::install(Some(crate::control::Control::stoppable()));
+        let capped = std::cell::Cell::new(false);
+        assert_eq!(simplify_coords_within(&zigzag, 100.0, &capped, 1).len(), 2);
+        assert!(!capped.get());
+    }
+
+    /// The bound holds on WGS 84, not only on the sphere: at 60°N, a vertex 0.01795° east of a
+    /// chord along the meridian is 999.1 m off on the sphere but about 1,001.6 m on the ellipsoid,
+    /// beyond a 1 km tolerance, and stays.
+    #[test]
+    fn simplify_holds_its_bound_on_wgs84() {
+        let line: Vec<geo::Coord<f64>> = [(0.0, 59.99999), (0.01795, 60.0), (0.0, 60.00001)]
+            .map(|(x, y)| {
+                let c = rustgis_geom::lonlat_to_plane(Coord::new(x, y));
+                geo::coord! { x: c.x, y: c.y }
+            })
+            .to_vec();
+        assert_eq!(dp(&line, 1_000.0).len(), 3);
+    }
+
     /// Simplify says how many line parts of fewer than 2 vertices it left out beside longer ones.
     #[test]
     fn simplify_says_how_many_short_line_parts_it_left_out() {
@@ -7752,6 +7805,12 @@ mod tests {
                     c.x = 1e308;
                 }
                 lines.push(Some(Geometry::Line(vec![far])), vec![]);
+                // One finite on the plane, but whose squares there would overflow.
+                let mut huge = zig.clone();
+                if let Some(c) = huge.get_mut(4) {
+                    c.x = 1e200;
+                }
+                lines.push(Some(Geometry::Line(vec![huge])), vec![]);
                 // A latitude past the pole, taken as the pole.
                 lines.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)]])), vec![]);
                 lines.push(None, vec![]);
@@ -7763,17 +7822,17 @@ mod tests {
             (layer(res), messages, input)
         };
         let (out, messages, input) = run(true, 1.0);
-        assert_eq!(out.features.len(), 4);
+        assert_eq!(out.features.len(), 5);
         // The clean line is simplified to its ends; the broken ones are exactly as they were, the
         // NaN and the 1e308 included (compared as text, as NaN equals nothing).
         assert_eq!(out.features[0].geometry.as_ref().map(Geometry::coord_count), Some(2));
-        for k in [1, 2] {
+        for k in [1, 2, 3] {
             assert_eq!(format!("{:?}", out.features[k].geometry), input[k], "feature {k}");
         }
         assert!(
             messages
                 .iter()
-                .any(|m| m == "Simplify: 2 line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"),
+                .any(|m| m == "Simplify: 3 line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"),
             "{messages:?}"
         );
         assert!(
@@ -7783,7 +7842,7 @@ mod tests {
         // With a tolerance of 0 nothing is simplified, so the broken lines aren't blamed for it.
         // At 0 every feature is as it was, the 1e308 and the 95° included, and nothing is said of them.
         let (out0, at_zero, input0) = run(true, 0.0);
-        assert_eq!(out0.features.len(), 4);
+        assert_eq!(out0.features.len(), 5);
         for (k, (f, before)) in out0.features.iter().zip(&input0).enumerate() {
             assert_eq!(&format!("{:?}", f.geometry), before, "feature {k} at 0");
         }
