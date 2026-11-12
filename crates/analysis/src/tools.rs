@@ -3851,7 +3851,7 @@ impl SimplifyRun {
         if self.canceled.get() {
             return true;
         }
-        let mut pace = self.pace.get();
+        let mut pace = self.pace.take();
         let stop = pace.stop(work);
         self.pace.set(pace);
         self.canceled.set(stop);

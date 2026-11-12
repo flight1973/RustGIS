@@ -196,7 +196,7 @@ pub(crate) const PACE_WORK: usize = 1 << 22;
 
 /// Looks at the cancel flag about every [`PACE_WORK`] units of work, within an item that may
 /// take long on its own (a row of a wide grid without a work cap), so Cancel stops the run soon.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Default)]
 pub(crate) struct Pace(usize);
 
 impl Pace {
