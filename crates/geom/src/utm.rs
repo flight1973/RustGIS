@@ -321,8 +321,11 @@ pub fn format_utm(c: Coord) -> Option<String> {
 
 /// An MGRS reference: zone, band, the 100 km square's column and row letters, and the easting
 /// and northing within the square truncated to `digits` digits each (0–5: 100 km to 1 m). In the
-/// polar areas (UPS) the zone is 0, as MGRS writes no zone number there, and the band is the
-/// half's letter: Y or Z north of 84° N, A or B south of 80° S.
+/// polar areas (UPS) the zone is 0, as MGRS writes no zone number there (and as GeographicLib's
+/// UTMUPS numbers UPS), and the band is the half's letter: Y or Z north of 84° N, A or B south of
+/// 80° S; [`Mgrs::polar`] tells them apart. Zone 0 is never a UTM zone, so code that turns a zone
+/// into an EPSG code (326zz, 327zz) must check [`Mgrs::polar`] first; [`Mgrs::centre`] refuses a
+/// polar letter with a UTM zone and a UTM band with zone 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mgrs {
     pub zone: u8,
@@ -608,8 +611,10 @@ fn easting_and_northing(text: &str) -> Result<(f64, f64), GridError> {
 /// Reads a UPS position, which has no zone number: the zone spelled out, `north 2392768 1607232`
 /// or `south 2096454 1452981` (any case), as the readout writes it, or the polar half's letter
 /// before the easting and northing, `Y, 1735147, 2243078` (NGA.STND.0037 App. A-4), where Y and
-/// A lie west of the 2,000,000 m easting and Z and B on or east of it. The place must lie in the
-/// zone, at 84° N or more or south of 80° S, give or take the meter it was rounded to.
+/// A lie west of the 2,000,000 m easting and Z and B on or east of it. Numbers outside the zone's
+/// lettered area (north 1,300,000 up to 2,700,000 m, south 800,000 up to 3,200,000 m) aren't a UPS
+/// position and read as text ([`GridError::Syntax`]); a place inside it must lie in the zone, at
+/// 84° N or more or south of 80° S, give or take the meter it was rounded to.
 pub fn parse_ups(text: &str) -> Result<Coord, GridError> {
     let text = text.trim();
     if text.chars().count() > MAX_REF_CHARS {
@@ -629,6 +634,10 @@ pub fn parse_ups(text: &str) -> Result<Coord, GridError> {
     };
     let rest: String = chars.collect();
     let (easting, northing) = easting_and_northing(&rest)?;
+    // Numbers outside the zone's lettered area aren't a UPS position (`A 10 20`, a road): text.
+    if !crate::ups::in_lettered_area(north, easting, northing) {
+        return Err(GridError::Syntax);
+    }
     if half.is_some_and(|h| !crate::ups::easting_in_half(h, easting)) {
         return Err(GridError::OutsideZone);
     }
@@ -683,16 +692,39 @@ pub fn parse_mgrs(text: &str) -> Result<Mgrs, GridError> {
     }
     let mut chars = text.chars().peekable();
     let polar = chars.peek().is_some_and(char::is_ascii_alphabetic);
-    let (zone, band) =
-        if polar { (0, chars.next().map(|c| c.to_ascii_uppercase()).ok_or(GridError::Syntax)?) } else { zone_and_letter(&mut chars)? };
-    let mut letters = [' '; 2];
-    for l in letters.iter_mut() {
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
-        *l = chars.next().filter(char::is_ascii_alphabetic).ok_or(GridError::Syntax)?.to_ascii_uppercase();
+    let (zone, band) = if polar {
+        // Only the polar halves' letters start a reference: `Elm 123` or `Main` is text.
+        let half = chars.next().map(|c| c.to_ascii_uppercase()).ok_or(GridError::Syntax)?;
+        if !crate::ups::is_polar_half(half) {
+            return Err(GridError::Syntax);
+        }
+        (0, half)
+    } else {
+        zone_and_letter(&mut chars)?
+    };
+    let mut spaced = false;
+    let mut typed = [' '; 2];
+    for l in typed.iter_mut() {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {
+            spaced = true;
+        }
+        *l = chars.next().filter(char::is_ascii_alphabetic).ok_or(GridError::Syntax)?;
     }
+    let letters = typed.map(|c| c.to_ascii_uppercase());
+    let digits_attached = chars.peek().is_some_and(char::is_ascii_digit);
     let rest: String = chars.collect();
     if rest.chars().any(|c| !c.is_ascii_digit() && !c.is_whitespace()) {
         return Err(GridError::Syntax);
+    }
+    // A polar reference written as one word of three letters, with no digits right after it, is
+    // as often a word (`Bay 12`, `zap`): it is read only in capitals, as MGRS writes it (`ZAH`,
+    // `ZAH 12345 12345`). Spaced (`Z AH`) or with its digits attached (`zah1234512345`), it is
+    // plainly a reference in any case.
+    if polar && !spaced && !digits_attached {
+        let first = text.chars().next().unwrap_or(' ');
+        if !(first.is_ascii_uppercase() && typed.iter().all(char::is_ascii_uppercase)) {
+            return Err(GridError::Syntax);
+        }
     }
     let groups: Vec<&str> = rest.split_whitespace().collect();
     let (e, n) = match groups.as_slice() {
@@ -712,10 +744,6 @@ pub fn parse_mgrs(text: &str) -> Result<Mgrs, GridError> {
         _ => return Err(GridError::Digits),
     };
     let band = if polar {
-        // Only the polar halves' letters start a reference: `CAT` or `Main` is text.
-        if !crate::ups::is_polar_half(band) {
-            return Err(GridError::Syntax);
-        }
         band
     } else {
         // The zone first, as `parse_utm` does: `0AAA` names a bad zone, not a polar reference.
@@ -1562,6 +1590,15 @@ mod tests {
         for text in ["CAT", "Main", "Berlin 12", "Z", "zap road"] {
             assert_eq!(parse_mgrs(text), Err(GridError::Syntax), "{text}");
         }
+        // A three-letter word before a number is text, not a polar square (`Bay 12` would be B AY
+        // in the south), and so is any word whose first letter isn't a polar half (`Elm 123`).
+        for text in ["Bay 12", "Ban 12", "Bad 34", "Zag 56", "Ave 12", "Zoo 12", "bay 12", "zap", "Elm 123", "Elm"] {
+            assert_eq!(parse_mgrs(text), Err(GridError::Syntax), "{text}");
+        }
+        // In capitals, spaced, or with the digits attached, it is a reference.
+        for text in ["BAY 12", "B AY 12", "bay12", "Z AH", "z ah", "ZAH", "ZAH 12345 12345"] {
+            assert!(parse_mgrs(text).is_ok(), "{text}");
+        }
     }
 
     /// UPS positions: the readout's `north …`/`south …` and NGA.STND.0037 App. A-4's
@@ -1580,8 +1617,12 @@ mod tests {
         for (text, why) in [
             ("Y 2392768 1607232", GridError::OutsideZone),     // east of 2,000,000 m is Z
             ("A 2096454 1452981", GridError::OutsideZone),     // east of 2,000,000 m is B
-            ("north 2000000 100000", GridError::OutsideZone),  // south of 84° N
-            ("south 2000000 3500000", GridError::OutsideZone), // north of 80° S
+            ("north 2000000 1300000", GridError::OutsideZone), // lettered, but south of 84° N
+            ("south 2000000 3150000", GridError::OutsideZone), // lettered, but north of 80° S
+            ("north 2000000 100000", GridError::Syntax),       // outside the lettered area
+            ("A 10 20", GridError::Syntax),
+            ("A1 12", GridError::Syntax),
+            ("B 12, 34", GridError::Syntax),
             ("north 2000000", GridError::Syntax),
             ("north -1 2000000", GridError::Syntax),
             ("Q 2000000 2000000", GridError::Syntax),

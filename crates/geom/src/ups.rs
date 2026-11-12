@@ -251,6 +251,16 @@ pub(crate) fn easting_in_half(half: char, easting: f64) -> bool {
     }
 }
 
+/// Whether an easting and northing lie in their zone's lettered area, where every UPS position
+/// in the zone falls: 1,300,000 m up to 2,700,000 m in the north, 800,000 m up to 3,200,000 m in
+/// the south, along both axes (NGA.SIG.0012 §§11.10 and 11.11). Numbers outside it aren't a UPS
+/// position at all.
+pub(crate) fn in_lettered_area(north: bool, easting: f64, northing: f64) -> bool {
+    let first = (if north { NORTH_FIRST } else { SOUTH_FIRST }) as f64 * SQUARE;
+    let span = first..(2.0 * FALSE_ORIGIN - first);
+    span.contains(&easting) && span.contains(&northing)
+}
+
 /// Whether a letter names a polar half of MGRS.
 pub(crate) fn is_polar_half(letter: char) -> bool {
     matches!(letter, 'A' | 'B' | 'Y' | 'Z')

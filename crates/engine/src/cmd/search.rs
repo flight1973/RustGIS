@@ -154,15 +154,13 @@ fn search_map(map: &rustgis_map::Map, query: &str, limit: usize) -> Results {
     // zone and band) isn't looked for in the tables; two whole numbers (an id, years, a range)
     // may be either, and so may a bare 100 km MGRS square, which names Sentinel-2's tiles (33UVP);
     // an MGRS reference with digits is plainly a coordinate. UTM and MGRS are the Earth's grids,
-    // so on another body's map they name no place. A polar (UPS) reference starts with a letter
-    // and has no zone number, so without digits it is three letters (BAN, ZAP), as often a word
-    // as a place: text with no digit isn't read as a grid reference (every other one has digits).
+    // so on another body's map they name no place. Polar (UPS) references have no zone number;
+    // the parser tells them from words (`ZAH` and `Z AH` are references, `Bay 12` and `zap` text).
     let mut plainly_coordinate = false;
-    let grid_text = q.chars().any(|c| c.is_ascii_digit());
     if let Some(c) = parse_lat_lon(&q) {
         out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
         plainly_coordinate = q.chars().any(|c| matches!(c, '.' | '°' | 'º' | '\'' | '′' | '"' | '″') || c.is_alphabetic());
-    } else if map.body().is_earth() && grid_text {
+    } else if map.body().is_earth() {
         match read_grid_reference(&q) {
             Ok(c) => {
                 out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
@@ -815,10 +813,36 @@ mod tests {
             Some(Hit::Coordinate { lon, lat }) => assert!(*lon < 0.0 && *lat > 86.0, "{lon} {lat}"),
             other => panic!("{other:?}"),
         }
-        for q in ["BAN", "ZAP", "Box", "Berlin", "Bay", "Zanzibar", "Y", "ZAH"] {
+        // Words and street names, with or without numbers, are text: no coordinate, no grid error.
+        for q in [
+            "Bay 12",
+            "Ban 12",
+            "Bad 34",
+            "Zag 56",
+            "Ave 12",
+            "Zoo 12",
+            "Elm 123",
+            "A 10 20",
+            "A1 12",
+            "B 12, 34",
+            "zap",
+            "ban",
+            "Box",
+            "Berlin",
+            "Bay",
+            "Zanzibar",
+            "Y",
+            "north 10 20",
+        ] {
             let r = search(&s, q, 50);
             assert!(!r.hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}: {r:?}");
             assert_eq!(r.grid_error, None, "{q}");
+        }
+        // A 100 km polar square in capitals, as MGRS writes it, or spaced, reads back; like
+        // `33UVP` it may also be a name, so the tables are still searched.
+        for q in ["ZAH", "Z AH", "z ah", "BAN"] {
+            let r = search(&s, q, 50);
+            assert!(matches!(r.hits.first(), Some(Hit::Coordinate { .. })), "{q}: {r:?}");
         }
         // A polar reference that names no place says why.
         assert_eq!(search(&s, "ZDA1234512345", 50).grid_error, Some(GridError::Square));

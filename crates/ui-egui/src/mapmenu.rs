@@ -52,9 +52,9 @@ fn lat_lon(c: Coord) -> String {
 }
 
 /// The coordinate row: the text it shows and copies, in the readout's format, and whether it fell
-/// back from it. Decimal degrees are `lat, lon` ([`lat_lon`]); north of 84° N or south of 80° S,
-/// and on another body's map (`earth` false), UTM and MGRS fall back to them (and the row's hover
-/// text says why).
+/// back from it. Decimal degrees are `lat, lon` ([`lat_lon`]); north of 84° N and south of 80° S
+/// UTM and MGRS give UPS (`north …`, `Z …`); on another body's map (`earth` false) they fall back
+/// to latitude and longitude (and the row's hover text says why).
 fn coordinate_row(c: Coord, f: CoordReadout, earth: bool) -> (String, bool) {
     match f {
         CoordReadout::Decimal => (lat_lon(c), false),
