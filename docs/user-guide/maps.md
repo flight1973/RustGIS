@@ -192,7 +192,8 @@ their own rules, below):
   letter, `Z 2077146 1562481` or `Y, 1735147, 2243078`. Polar MGRS has no zone number, so three
   letters and a few digits look like a word or a code (`ATL`, `Bay 12`, the flight `BAW1234`);
   search reads one only as a reference is written: as the readout writes it, with a space after
-  the half's letter and the square in capitals (`Z AC`, `Z AC 77 62`, `Z AC 77146 62481`), as
+  the half's letter and the square in capitals, then no digits or two equal groups (`Z AC`,
+  `Z AC 77 62`, `Z AC 77146 62481`; `A ST 12` is an address), as
   one word with at least six digits (`ZAC7714662481`, 100 m or finer), or in capitals before
   two equal groups of at least three digits (`ZAC 771 624`, `ZAC 77146 62481`). A UPS position
   (`north 2077146 1562481`, `Z 2077146 1562481`) and a reference written exactly as the readout
@@ -209,7 +210,9 @@ place somewhere else, and the list says why; `map.search` returns the reason as 
 adds `"coordinateMayBeText": true` when a polar place among its hits may as well be a name or a
 code. A
 100 km square written with spaces, such as `5 Ave` or `4K TV`, is as likely ordinary text, so one
-that names no square gives no reason; written as one word, `38TMJ`, it does. On the map of
+that names no square gives no reason; written as one word, `38TMJ`, it does. Polar MGRS written
+compactly (`ZDA1234512345`) may be a code too, so one that names no place gives no reason either;
+written as the readout writes it (`Z DA 12345 12345`), it does. On the map of
 another body, grid references find nothing.
 
 ### Directions

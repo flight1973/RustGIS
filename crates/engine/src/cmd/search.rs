@@ -250,10 +250,10 @@ fn search_map(map: &rustgis_map::Map, query: &str, limit: usize) -> Results {
         }
     }
     let limit = limit.max(1);
-    // After the other hits, within the limit; with room for one hit only, the place is listed only
-    // when nothing else matched, so a feature named like the reference stays the one to go to.
-    if let Some(c) = polar_place.filter(|_| out.hits.is_empty() || limit > 1) {
-        out.hits.insert(out.hits.len().min(limit - 1), Hit::Coordinate { lon: c.x, lat: c.y });
+    // After every other hit, and only when they leave room, so no feature named like the
+    // reference is pushed out and `go` with any index still reaches the same feature.
+    if let Some(c) = polar_place.filter(|_| out.hits.len() < limit) {
+        out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
         out.coordinate_may_be_text = true;
     }
     out.hits.truncate(limit);
@@ -501,7 +501,7 @@ fn led_by_zone_word(text: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PolarForm {
     /// As the readout writes it: the half's letter, a space and the square's letters, in
-    /// capitals (`Z AH`, `Z AH 12 34`).
+    /// capitals, then no digits or two equal groups (`Z AH`, `Z AH 12 34`).
     Readout,
     /// As one word with at least six digits attached, 100 m or finer (`ZAC7714662481`, any
     /// case), or the three letters in capitals before two equal groups of at least three digits
@@ -523,14 +523,22 @@ fn polar_form(text: &str) -> Option<PolarForm> {
         return None;
     }
     let capitals = half.is_ascii_uppercase() && letters.iter().all(char::is_ascii_uppercase);
-    if spaced {
-        return capitals.then_some(PolarForm::Readout);
-    }
     // The two letters are ASCII, so the digits start two bytes on.
     let after = rest.get(2..).unwrap_or("");
-    let attached = after.starts_with(|c: char| c.is_ascii_digit());
     let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-    let compact = match after.split_whitespace().collect::<Vec<_>>().as_slice() {
+    let groups: Vec<&str> = after.split_whitespace().collect();
+    if spaced {
+        // The readout writes no digits (100 km) or two equal groups; a single number after a
+        // spaced, capitalized word is a house number (`A ST 12`, `Z ST 12`).
+        let as_written = match groups.as_slice() {
+            [] => true,
+            [e, n] => digits(e) && digits(n) && e.len() == n.len(),
+            _ => false,
+        };
+        return (capitals && as_written).then_some(PolarForm::Readout);
+    }
+    let attached = after.starts_with(|c: char| c.is_ascii_digit());
+    let compact = match groups.as_slice() {
         [run] if attached => digits(run) && run.len() >= 6,
         [e, n] => capitals && digits(e) && digits(n) && e.len() == n.len() && e.len() >= 3,
         _ => false,
@@ -976,6 +984,11 @@ mod tests {
             "a st 12",
             "B St 12",
             "ZAC 7714662481",
+            // All-caps addresses: a house number after a spaced word, not the readout's two groups.
+            "A ST 12",
+            "Z ST 12",
+            "B ST 5",
+            "A ST 123",
         ] {
             let r = search(&s, q, 50);
             assert!(!r.hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}: {r:?}");
@@ -1015,6 +1028,10 @@ mod tests {
             let one = search(&s, q, 1);
             assert!(matches!(one.hits.as_slice(), [Hit::Feature { .. }]), "{q}: {one:?}");
         }
+        // Two features named so fill a limit of two: both are kept, ahead of any place.
+        s.run("layer.addDataText", &json!({"fileName": "more.csv", "text": "part,lon,lat\nBAG123456,11.0,51.0\n"})).unwrap();
+        let two = search(&s, "BAG123456", 2);
+        assert!(matches!(two.hits.as_slice(), [Hit::Feature { .. }, Hit::Feature { .. }]), "{two:?}");
         // `go` goes to the feature, and the answer says the place may be text.
         let v = s.run("map.search", &json!({"query": "BAG123456", "limit": 1, "go": true})).unwrap();
         assert!(v["hits"][0]["kind"] == "feature", "{v}");
