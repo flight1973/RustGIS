@@ -168,7 +168,10 @@ mod tests {
         let p = Coord::new(44.4, 33.3);
         for f in [CoordReadout::Utm, CoordReadout::Mgrs] {
             assert_eq!(f.format(p, false), None);
-            assert_eq!(f.readout(Some(p), false), format!("No {} here", f.label()));
+            let r = f.readout(Some(p), false);
+            assert_eq!(r, format!("No {} here", f.label()));
+            // No wider than the reference it stands for, in the status bar.
+            assert!(r.chars().count() <= f.readout(Some(p), true).chars().count(), "{r}");
             assert!(f.earth_only());
         }
         for f in [CoordReadout::Decimal, CoordReadout::Dms] {

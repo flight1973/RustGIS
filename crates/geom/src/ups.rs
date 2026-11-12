@@ -30,9 +30,9 @@ use crate::utm::{
 };
 
 /// The northern limit of the UTM zones, where north UPS begins (degrees); 84° N itself is UPS.
-pub const UPS_NORTH_FROM: f64 = 84.0;
+pub const UPS_NORTH_FROM: f64 = crate::utm::UTM_MAX_LAT;
 /// The southern limit of the UTM zones (degrees); south UPS is south of it, 80° S itself is UTM.
-pub const UPS_SOUTH_OF: f64 = -80.0;
+pub const UPS_SOUTH_OF: f64 = crate::utm::UTM_MIN_LAT;
 
 /// UPS's scale at the pole, exactly (NGA.SIG.0012 §10.1).
 const K0: f64 = 0.994;
@@ -310,7 +310,6 @@ pub fn parse_ups(text: &str) -> Result<Coord, GridError> {
     }
     let rest: String = chars.collect();
     let (easting, northing) = easting_and_northing(&rest)?;
-    // Numbers outside the zone's lettered area aren't a UPS position (`A 10 20`, a road): text.
     if !in_lettered_area(north, easting, northing) {
         // Not a UPS position: a road or a code (`A 10 20`), or a UTM position without its zone
         // (`north 412345 5523456`), which "outside the zone" would mislead about. Text.

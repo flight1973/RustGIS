@@ -1583,7 +1583,7 @@ mod tests {
             ("north 2000000 100000", GridError::Syntax),       // outside the lettered area
             ("north 412345 5523456", GridError::Syntax),       // a UTM position without its zone
             ("n 2000000 100000", GridError::Syntax),
-            ("A 2000000 100000", GridError::Syntax), // after a single letter it may be text
+            ("A 2000000 100000", GridError::Syntax), // outside the lettered area too
             ("A 10 20", GridError::Syntax),
             ("A1 12", GridError::Syntax),
             ("B 12, 34", GridError::Syntax),
