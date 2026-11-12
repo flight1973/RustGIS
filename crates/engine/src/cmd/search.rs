@@ -137,8 +137,8 @@ pub struct Results {
     /// south); `None` when it isn't written as one, or reads.
     pub grid_error: Option<GridError>,
     /// Whether the coordinate among the hits was read from text that may as well be a name or a
-    /// code: a polar (UPS) reference, which starts with a letter (`BAG123456`), unless written
-    /// exactly as the readout writes it ([`plainly_polar_place`]). The search box still
+    /// code: a polar (UPS) reference, which starts with a letter (`BAG123456`), unless it is
+    /// plainly a place ([`plainly_polar_place`]). The search box still
     /// offers to look the text up as a place.
     pub coordinate_may_be_text: bool,
 }
@@ -162,8 +162,8 @@ fn search_map(map: &rustgis_map::Map, query: &str, limit: usize) -> Results {
     // an MGRS reference with digits is plainly a coordinate. UTM and MGRS are the Earth's grids,
     // so on another body's map they name no place. Polar (UPS) references and positions start
     // with a letter, as names and codes do (`BAG123456`, `A ST 12`): read_grid_reference reads
-    // them only as references are written ([`polar_form`]). Unless written exactly as the
-    // readout writes it ([`plainly_polar_place`]), the tables are still searched and the
+    // them only as references are written ([`polar_form`]). Unless plainly a
+    // place ([`plainly_polar_place`]), the tables are still searched and the
     // place comes after their hits, so a feature named so is found first.
     let mut plainly_coordinate = false;
     let mut polar_place = None;
@@ -465,8 +465,9 @@ fn letter_led(text: &str) -> bool {
 }
 
 /// Whether polar text is plainly a place rather than a name or a code: any UPS position
-/// [`rustgis_geom::parse_ups`] reads, led by the zone (`north 2077146 1562481`, `n …`) or the
-/// half's letter (`Z 2077146 1562481`, `Y, 1735147, 2243078`), or polar MGRS written as the
+/// [`rustgis_geom::parse_ups`] reads, led by the zone spelled out (`north 2077146 1562481`;
+/// GeographicLib's `n …` may be text, as `N 1400000 2000000` is a State Plane pair) or the half's
+/// letter (`Z 2077146 1562481`, `Y, 1735147, 2243078`), or polar MGRS written as the
 /// readout writes it, spaced, in capitals, to the meter (`Z AC 77146 62481`).
 fn plainly_polar_place(text: &str) -> bool {
     let text = text.trim();
@@ -474,7 +475,7 @@ fn plainly_polar_place(text: &str) -> bool {
     // UPS with the zone or the half's letter before two numbers in the lettered area
     // (`Y, 1735147, 2243078`) is plainly a position: no name or code is written that way.
     let word = text.split(|c: char| c.is_whitespace() || c == ',').next().unwrap_or("").to_ascii_lowercase();
-    if matches!(word.as_str(), "north" | "south" | "n" | "s") {
+    if matches!(word.as_str(), "north" | "south") {
         return true;
     }
     if matches!(word.as_str(), "y" | "z" | "a" | "b") && rustgis_geom::parse_ups(text).is_ok() {
@@ -1030,7 +1031,7 @@ mod tests {
             assert!(matches!(r.hits.as_slice(), [Hit::Coordinate { .. }]) && !r.coordinate_may_be_text, "{q}: {r:?}");
         }
         // Shorter than the readout writes it, it may still be text.
-        for q in ["Z AC 7714 6248", "Z AC", "ZAC7714662481"] {
+        for q in ["Z AC 7714 6248", "Z AC", "ZAC7714662481", "n 2077146 1562481", "N 2000000 1500000"] {
             assert!(search(&s, q, 50).coordinate_may_be_text, "{q}");
         }
     }

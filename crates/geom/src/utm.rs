@@ -1569,6 +1569,7 @@ mod tests {
         assert_eq!(parse_utm("Z 2392768 1607232"), Ok(p));
         // GeographicLib's short form (`GeoConvert -u`).
         assert_eq!(parse_utm("n 2392768 1607232"), Ok(p));
+        assert!(parse_utm("s 2096454 1452981").is_ok_and(|q| q.y < -80.0));
         let q = parse_utm("Y, 1735147, 2243078").unwrap();
         assert!(q.x < 0.0 && q.y > 84.0, "{q:?}");
         let s = parse_utm("south 2096454 1452981").unwrap();
@@ -1579,8 +1580,10 @@ mod tests {
             ("A 2096454 1452981", GridError::OutsideZone),     // east of 2,000,000 m is B
             ("north 2000000 1300000", GridError::OutsideZone), // lettered, but south of 84° N
             ("south 2000000 3150000", GridError::OutsideZone), // lettered, but north of 80° S
-            ("north 2000000 100000", GridError::OutsideZone),  // outside the lettered area, after the zone
-            ("A 2000000 100000", GridError::Syntax),           // after a single letter it may be text
+            ("north 2000000 100000", GridError::Syntax),       // outside the lettered area
+            ("north 412345 5523456", GridError::Syntax),       // a UTM position without its zone
+            ("n 2000000 100000", GridError::Syntax),
+            ("A 2000000 100000", GridError::Syntax), // after a single letter it may be text
             ("A 10 20", GridError::Syntax),
             ("A1 12", GridError::Syntax),
             ("B 12, 34", GridError::Syntax),
