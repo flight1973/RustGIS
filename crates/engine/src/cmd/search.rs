@@ -833,14 +833,23 @@ mod tests {
             "Zanzibar",
             "Y",
             "north 10 20",
+            // Codes and acronyms in capitals: airports, not polar squares.
+            "ATL",
+            "AUS",
+            "YUL",
+            "BBC",
+            "ABC",
+            "BRU",
+            "ZAH",
+            "BAN",
         ] {
             let r = search(&s, q, 50);
             assert!(!r.hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}: {r:?}");
             assert_eq!(r.grid_error, None, "{q}");
         }
-        // A 100 km polar square in capitals, as MGRS writes it, or spaced, reads back; like
+        // A 100 km polar square written as the readout writes it, spaced, reads back; like
         // `33UVP` it may also be a name, so the tables are still searched.
-        for q in ["ZAH", "Z AH", "z ah", "BAN"] {
+        for q in ["Z AH", "z ah", "B AN"] {
             let r = search(&s, q, 50);
             assert!(matches!(r.hits.first(), Some(Hit::Coordinate { .. })), "{q}: {r:?}");
         }

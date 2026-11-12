@@ -387,7 +387,7 @@ fn grid_error_text(e: rustgis_engine::geom::GridError) -> String {
         G::Zone => tl_raw!("the UTM zone must be 1 to 60"),
         G::Band => tl_raw!("the latitude band must be a letter from C to X (not I or O)"),
         G::Polar => tl_raw!(
-            "north of 84° N and south of 80° S the grid is UPS, which has no zone number: write north 2000000 2444268 or Z AM 00775 44267"
+            "north of 84° N and south of 80° S the grid is UPS, which has no zone number: write north 2000000 2444268 or Z AM 00000 44268"
         ),
         G::Square => tl_raw!("the 100 km square letters aren't used in this zone"),
         G::Digits => tl_raw!("the grid digits must be an even count of 0 to 10, half for the easting and half for the northing"),

@@ -1,5 +1,5 @@
 //! L0: coordinates, extents, the Web Mercator projection, geodesic measurement, map scale, and
-//! UTM and MGRS coordinates ([`utm`]).
+//! UTM and MGRS coordinates ([`utm`]), and UPS for the polar areas ([`ups`]).
 //!
 //! Everything here is plain math with no I/O. Longitude/latitude are WGS 84 degrees; projected
 //! coordinates are Web Mercator meters (EPSG:3857), which [`lonlat_to_plane`] continues beyond

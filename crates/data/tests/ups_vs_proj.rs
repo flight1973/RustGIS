@@ -45,7 +45,7 @@ fn random_polar_places_agree_with_proj4rs() {
     for _ in 0..5_000 {
         let lon = -180.0 + r.next() * 360.0;
         worst = worst.max(compare(&north_t, Coord::new(lon, 84.0 + r.next() * 6.0), true));
-        worst = worst.max(compare(&south_t, Coord::new(lon, -80.0 - 1e-9 - r.next() * 10.0), false));
+        worst = worst.max(compare(&south_t, Coord::new(lon, -80.0 - 1e-9 - r.next() * (10.0 - 2e-9)), false));
     }
     for (p, north) in [(Coord::new(0.0, 90.0), true), (Coord::new(0.0, -90.0), false), (Coord::new(180.0, 84.0), true)] {
         worst = worst.max(compare(if north { &north_t } else { &south_t }, p, north));

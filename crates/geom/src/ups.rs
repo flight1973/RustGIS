@@ -13,9 +13,11 @@
 //! - north UPS for latitudes of 84° N and more, south UPS for latitudes south of 80° S (§10.4):
 //!   84° N itself is UPS, 80° S itself is UTM;
 //! - MGRS in the polar areas (§§11.9–11.13, and NGA.STND.0037 §3-2c): no zone number, a letter for
-//!   the half (Y west and Z east in the north, A west and B east in the south; the 0° and 180°
-//!   meridians, at an easting of 2,000,000 m, are Z and B), then the 100 km square's column and
-//!   row letters, and the digits truncated to the precision.
+//!   the half (Y for western longitudes and Z for eastern ones in the north, A and B in the
+//!   south; the 0° and 180° meridians, at an easting of 2,000,000 m, are Z and B, by §§11.10 and
+//!   11.11, where square 20 is ZA and BA), then the 100 km square's column and row letters, and
+//!   the digits truncated to the precision. A 100 km square alone is written spaced, `Z AH`
+//!   ([`crate::utm::parse_mgrs`] reads three letters alone as a word).
 //!
 //! The conformal latitude is the one in [`crate::utm`] (Karney 2011, eqs. 7–9 and 19–21), which
 //! gives the same values as §2.8 and §2.9's PhiToChi and ChiToPhi.
@@ -24,6 +26,9 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use crate::Coord;
+/// Reads a UPS position (`north 2392768 1607232`, `Y, 1735147, 2243078`); it lives with the UTM
+/// parser, which hands polar text to it.
+pub use crate::utm::parse_ups;
 use crate::utm::{GridError, conformal_tan, eccentricity, geographic_tan, wgs84_a, wrap};
 
 /// The northern limit of the UTM zones, where north UPS begins (degrees); 84° N itself is UPS.
@@ -241,11 +246,14 @@ pub(crate) fn cell_reaches_zone(north: bool, e0: f64, n0: f64, cell: f64, slop_d
     }
 }
 
-/// Whether an easting lies in a polar half's side of its zone: Y and A west of the 2,000,000 m
-/// easting, Z and B on it and east of it (NGA.STND.0037 App. B-5b).
+/// Whether a typed easting lies in a polar half's side of its zone: Y and A west of the
+/// 2,000,000 m easting, Z and B on it and east of it (NGA.STND.0037 App. B-5b; the line itself
+/// is Z and B by NGA.SIG.0012 §§11.10 and 11.11, where square 20 is ZA and BA). Full
+/// coordinates are written rounded to the meter (NGA.STND.0037 App. A-2), so a place in Y or A
+/// just west of the line may read 2,000,000: Y and A accept it, within half a meter.
 pub(crate) fn easting_in_half(half: char, easting: f64) -> bool {
     match half {
-        'Y' | 'A' => easting < FALSE_ORIGIN,
+        'Y' | 'A' => easting < FALSE_ORIGIN + 0.5,
         'Z' | 'B' => easting >= FALSE_ORIGIN,
         _ => false,
     }
@@ -370,8 +378,11 @@ mod tests {
                 assert_eq!(x, FALSE_ORIGIN, "{lon} {lat}");
             }
         }
-        assert!(easting_in_half('Z', FALSE_ORIGIN) && !easting_in_half('Y', FALSE_ORIGIN));
-        assert!(easting_in_half('B', FALSE_ORIGIN) && !easting_in_half('A', FALSE_ORIGIN));
+        assert!(easting_in_half('Z', FALSE_ORIGIN) && !easting_in_half('Z', FALSE_ORIGIN - 0.1));
+        assert!(easting_in_half('B', FALSE_ORIGIN) && !easting_in_half('B', FALSE_ORIGIN - 0.1));
+        // A typed full coordinate is rounded: Y and A take the line within half a meter.
+        assert!(easting_in_half('Y', FALSE_ORIGIN) && !easting_in_half('Y', FALSE_ORIGIN + 0.5));
+        assert!(easting_in_half('A', FALSE_ORIGIN) && !easting_in_half('A', FALSE_ORIGIN + 1.0));
     }
 
     #[test]

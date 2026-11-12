@@ -160,12 +160,12 @@ to 40° N) would be taken for the southern hemisphere, 10,000 km away. Latitude 
 UTM and MGRS are on WGS 84, with the zone exceptions for southern Norway (32V) and Svalbard (31X,
 33X, 35X and 37X), and cover 80° S up to 84° N. North of 84° N and south of 80° S the readouts
 use the Universal Polar Stereographic grid (UPS), as NGA defines it (NGA.SIG.0012): the UTM
-readout gives the zone spelled out and the easting and northing, `north 2077146 1562481`, as
-GeographicLib writes it, and the MGRS readout gives the polar reference, which has no zone
-number: a letter for the half (Y west and Z east of the 0° and 180° meridians in the north, A
-and B in the south), the 100 km square and the digits, `Z AC 77146 62481`. 84° N itself is
-UPS, 80° S itself is UTM. Search reads both, along with `ZAC7714662481` and the form
-`Z 2077146 1562481`. On the map of another body than the Earth the readout shows *No UTM here*
+readout gives the zone spelled out and the easting and northing rounded to the meter,
+`north 2077146 1562481`, as GeographicLib writes it, and the MGRS readout gives the polar
+reference, which has no zone number: a letter for the half (Y for western longitudes and Z for
+eastern ones in the north, A and B in the south, with the 0° and 180° meridians in Z and B),
+the 100 km square and the digits, truncated, `Z AC 77146 62481`. 84° N itself is UPS, 80° S
+itself is UTM. On the map of another body than the Earth the readout shows *No UTM here*
 (or *No MGRS here*) rather than a wrong reference, and degrees still read. Scripts set the format with
 `ui.coordinateFormat={"format":"utm"}` (`decimal`, `dms`, `utm` or `mgrs`); without `format`
 it steps to the next one. A saved format this version doesn't know, say from a newer RustGIS,
@@ -186,6 +186,13 @@ The [search box](#navigating) takes the same grid references, in any case:
   `S` after the zone is always band S (32° N to 40° N), as in `11S 384629 3768405` (Los
   Angeles); with a northing outside band S it could mean the southern hemisphere, so it finds
   nothing: write `south` instead.
+- **UPS and polar MGRS**, north of 84° N and south of 80° S, which have no zone number: UPS as
+  the readout writes it, `north 2077146 1562481` or `south 2096454 1452981`, or with the half's
+  letter, `Z 2077146 1562481` or `Y, 1735147, 2243078`; polar MGRS as `ZAC7714662481`,
+  `Z AC 77146 62481` or `ZAC 77146 62481`. Three letters alone, or before a single number, are
+  read as a word (`ATL`, `Bay 12`), so a 100 km polar square alone is written spaced, `Z AC`,
+  as the readout writes it. A UTM zone's position past 84° N or 80° S, or a polar letter after a
+  zone number (`38ZMB`), finds nothing and the list says how UPS is written.
 
 A reference that doesn't exist (square letters the zone doesn't use, a northing or a square
 outside the band, an odd number of digits, a place outside the zone) finds nothing rather than a
