@@ -137,8 +137,9 @@ pub struct Results {
     /// south); `None` when it isn't written as one, or reads.
     pub grid_error: Option<GridError>,
     /// Whether the coordinate among the hits was read from text that may as well be a name or a
-    /// code: a polar (UPS) reference, which starts with a letter (`BAG123456`). The search box
-    /// still offers to look the text up as a place.
+    /// code: a polar (UPS) reference, which starts with a letter (`BAG123456`), unless written
+    /// exactly as the readout writes it ([`as_the_readout_writes_it`]). The search box still
+    /// offers to look the text up as a place.
     pub coordinate_may_be_text: bool,
 }
 
@@ -161,8 +162,9 @@ fn search_map(map: &rustgis_map::Map, query: &str, limit: usize) -> Results {
     // an MGRS reference with digits is plainly a coordinate. UTM and MGRS are the Earth's grids,
     // so on another body's map they name no place. Polar (UPS) references and positions start
     // with a letter, as names and codes do (`BAG123456`, `A ST 12`): read_grid_reference reads
-    // them only as references are written ([`polar_form`]), and even then the tables are still
-    // searched and the place comes after their hits, so a feature named so is found first.
+    // them only as references are written ([`polar_form`]). Unless written exactly as the
+    // readout writes it ([`as_the_readout_writes_it`]), the tables are still searched and the
+    // place comes after their hits, so a feature named so is found first.
     let mut plainly_coordinate = false;
     let mut polar_place = None;
     if let Some(c) = parse_lat_lon(&q) {
@@ -468,8 +470,14 @@ fn letter_led(text: &str) -> bool {
 /// (`Z AC 77146 62481`).
 fn as_the_readout_writes_it(text: &str) -> bool {
     let text = text.trim();
-    let word = text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-    if word == "north" || word == "south" {
+    // The word may be followed by a comma, as parse_ups reads it (`north, 2077146, 1562481`).
+    // UPS with the zone or the half's letter before two numbers in the lettered area
+    // (`Y, 1735147, 2243078`) is plainly a position: no name or code is written that way.
+    let word = text.split(|c: char| c.is_whitespace() || c == ',').next().unwrap_or("").to_ascii_lowercase();
+    if matches!(word.as_str(), "north" | "south") {
+        return true;
+    }
+    if matches!(word.as_str(), "y" | "z" | "a" | "b") && rustgis_geom::parse_ups(text).is_ok() {
         return true;
     }
     polar_form(text) == Some(PolarForm::Readout)
@@ -1004,10 +1012,26 @@ mod tests {
         let r = search(&s, "ZAC7714662481", 1);
         assert!(matches!(r.hits.as_slice(), [Hit::Coordinate { .. }]) && r.coordinate_may_be_text);
         assert!(!search(&s, "38SMB4414084706", 50).coordinate_may_be_text);
-        // Pasted from the readout, a polar place is plainly a coordinate: first, and no place search.
-        for q in ["north 2077146 1562481", "South 2096454 1452981", "Z AC 77146 62481"] {
+        // At limit 1 with a feature, the answer doesn't claim a place it left out.
+        let v = s.run("map.search", &json!({"query": "BAG123456", "limit": 1})).unwrap();
+        assert!(v.get("coordinateMayBeText").is_none(), "{v}");
+        // Pasted from the readout, a polar place is plainly a coordinate: first, no place search,
+        // and the tables aren't searched (a value written the same is not a hit).
+        s.run("layer.addDataText", &json!({"fileName": "odd.csv", "text": "v,lon,lat\nZ AC 77146 62481,1.0,1.0\n"})).unwrap();
+        for q in [
+            "north 2077146 1562481",
+            "South 2096454 1452981",
+            "north, 2077146, 1562481",
+            "Z AC 77146 62481",
+            "Z 2077146 1562481",
+            "Y, 1735147, 2243078",
+        ] {
             let r = search(&s, q, 50);
-            assert!(matches!(r.hits.first(), Some(Hit::Coordinate { .. })) && !r.coordinate_may_be_text, "{q}: {r:?}");
+            assert!(matches!(r.hits.as_slice(), [Hit::Coordinate { .. }]) && !r.coordinate_may_be_text, "{q}: {r:?}");
+        }
+        // Shorter than the readout writes it, it may still be text.
+        for q in ["Z AC 7714 6248", "Z AC", "ZAC7714662481"] {
+            assert!(search(&s, q, 50).coordinate_may_be_text, "{q}");
         }
     }
 

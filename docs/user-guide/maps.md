@@ -194,9 +194,12 @@ their own rules, below):
   search reads one only as a reference is written: as the readout writes it, with a space after
   the half's letter and the square in capitals (`Z AC`, `Z AC 77 62`, `Z AC 77146 62481`), as
   one word with at least six digits (`ZAC7714662481`, 100 m or finer), or in capitals before
-  two equal groups of at least three digits (`ZAC 771 624`, `ZAC 77146 62481`). Since such text
-  may also be a name or a code, the attribute tables are still searched, their hits come before
-  the polar place, and **Search places** is still offered. A UTM zone's position past 84° N or
+  two equal groups of at least three digits (`ZAC 771 624`, `ZAC 77146 62481`). A UPS position
+  (`north 2077146 1562481`, `Z 2077146 1562481`) and a reference written exactly as the readout
+  writes it (`Z AC 77146 62481`) are plainly places. Any
+  other polar text may also be a name or a code, so the attribute tables are still searched,
+  their hits come before the polar place, and **Search places** is still offered; with room
+  for one hit (`limit: 1`), a matching feature is the hit. A UTM zone's position past 84° N or
   80° S, or a polar letter after a zone number (`38ZMB`), finds nothing and the list says how UPS
   is written.
 

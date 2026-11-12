@@ -129,11 +129,6 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui, c: Coord) {
             "Copy coordinates to the clipboard. {format} is a grid of the Earth, so latitude and longitude are copied",
             &[("format", format.label())],
         )
-    } else if fell_back {
-        i18n::fmt(
-            "Copy coordinates to the clipboard. No {format} here, so latitude and longitude are copied",
-            &[("format", format.label())],
-        )
     } else {
         tl!("Copy coordinates to the clipboard").to_string()
     };

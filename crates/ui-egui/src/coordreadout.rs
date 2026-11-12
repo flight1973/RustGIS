@@ -99,7 +99,7 @@ impl CoordReadout {
     /// and MGRS read near the poles.
     pub fn hover(self) -> String {
         i18n::fmt(
-            "Coordinates in {format}. Click to switch: decimal degrees, DMS, UTM, MGRS. North of 84° N and south of 80° S, UTM and MGRS read in UPS.",
+            "Coordinates in {format}. Click to switch: decimal degrees, DMS, UTM, MGRS. UTM and MGRS are grids of the Earth, read in UPS north of 84° N and south of 80° S.",
             &[("format", self.label())],
         )
     }
