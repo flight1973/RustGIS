@@ -3823,17 +3823,47 @@ const SPHERE_TO_WGS84: f64 = 6_378_137.0 / 6_399_593.625_8;
 /// ground than asked; of the vertices beyond theirs, the one farthest from the chord on the ground
 /// (its plane distance over that scale) is kept and splits the run. The ends are kept. Worked with
 /// a stack, not recursion, within [`SIMPLIFY_WORK`]: past it, the spans still open keep their
-/// vertices, and `capped` is set. At one scale it gives what `geo`'s Douglas–Peucker gives, which
-/// Simplify used before: a tolerance of 0 or less leaves the run as it is, and of equally far
-/// vertices the last is kept. A run with a coordinate missing or infinite is left as it is.
-fn simplify_coords(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cell::Cell<bool>) -> Vec<geo::Coord<f64>> {
-    simplify_coords_within(pts, tol_m, capped, SIMPLIFY_WORK)
+/// vertices, and `run.capped` is set. Its work counts toward Cancel across the feature (`run`):
+/// once canceled, the spans still open, and every later run, are left as they are. At one scale it
+/// gives what `geo`'s Douglas–Peucker gives, which Simplify used before: a tolerance of 0 or less
+/// leaves the run as it is, and of equally far vertices the last is kept. A run with a coordinate
+/// missing or infinite is left as it is.
+fn simplify_coords(pts: &[geo::Coord<f64>], tol_m: f64, run: &SimplifyRun) -> Vec<geo::Coord<f64>> {
+    simplify_coords_within(pts, tol_m, run, SIMPLIFY_WORK)
+}
+
+/// What the runs of one feature share as Simplify works through its parts and rings: the work done
+/// since Cancel was last looked at ([`crate::control::Pace`]), counted across them all (each
+/// vertex set up, each distance, each ring's anchor scans), so a feature of a million short parts
+/// is looked at as often as one long run; whether it was canceled; and whether a run's work ran out
+/// ([`SIMPLIFY_WORK`]).
+#[derive(Default)]
+struct SimplifyRun {
+    pace: std::cell::Cell<crate::control::Pace>,
+    canceled: std::cell::Cell<bool>,
+    capped: std::cell::Cell<bool>,
+}
+
+impl SimplifyRun {
+    /// Counts `work` more units; whether the feature was canceled, now or before (then nothing more
+    /// of it is simplified).
+    fn stop(&self, work: usize) -> bool {
+        if self.canceled.get() {
+            return true;
+        }
+        let mut pace = self.pace.get();
+        let stop = pace.stop(work);
+        self.pace.set(pace);
+        self.canceled.set(stop);
+        stop
+    }
 }
 
 /// [`simplify_coords`] with `work` distances a vertex allowed rather than [`SIMPLIFY_WORK`].
-fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cell::Cell<bool>, work: usize) -> Vec<geo::Coord<f64>> {
+fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, run: &SimplifyRun, work: usize) -> Vec<geo::Coord<f64>> {
     let n = pts.len();
-    if n <= 2 || tol_m.is_nan() || tol_m <= 0.0 || pts.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
+    // Each vertex set up (its latitude and scale) counts toward Cancel, short runs too.
+    if run.stop(n) || n <= 2 || tol_m.is_nan() || tol_m <= 0.0 || pts.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
         return pts.to_vec();
     }
     // On the ellipsoid, not the sphere ([`SPHERE_TO_WGS84`]).
@@ -3851,9 +3881,8 @@ fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cel
     }
     // A run someone can stop while it goes takes no cap (`control::uncapped`), as other tools'.
     let mut budget = if crate::control::uncapped() { usize::MAX } else { n.saturating_mul(work) };
-    // Distances measured since Cancel was last looked at: it's looked at every 65,536, inside a
-    // span's scan too, so one large feature doesn't hold the run.
-    let mut since_check = 0usize;
+    // Each distance counts toward Cancel (`run.stop`), inside a span's scan too, so one large
+    // feature doesn't hold the run.
     // Out of work, or canceled (the run then stops as an error): the spans still open keep their
     // vertices.
     let keep_open = |keep: &mut Vec<bool>, spans: &mut dyn Iterator<Item = (usize, usize)>| {
@@ -3867,7 +3896,7 @@ fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cel
     'spans: while let Some((i, j)) = stack.pop() {
         let span = j - i - 1;
         if span > budget {
-            capped.set(true);
+            run.capped.set(true);
             keep_open(&mut keep, &mut std::iter::once((i, j)).chain(stack.drain(..)));
             break;
         }
@@ -3885,13 +3914,9 @@ fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cel
         // The farthest vertex on the ground of those beyond their tolerance.
         let mut far: Option<(usize, f64)> = None;
         for k in i + 1..j {
-            since_check += 1;
-            if since_check >= 1 << 16 {
-                since_check = 0;
-                if crate::control::cancelled() {
-                    keep_open(&mut keep, &mut std::iter::once((i, j)).chain(stack.drain(..)));
-                    break 'spans;
-                }
+            if run.stop(1) {
+                keep_open(&mut keep, &mut std::iter::once((i, j)).chain(stack.drain(..)));
+                break 'spans;
             }
             let (Some(c), Some(&lk), Some(&sk)) = (pts.get(k), lat.get(k), scale.get(k)) else { continue };
             // The smallest scale between the vertex and the chord: the equator's (1) where their
@@ -3923,9 +3948,10 @@ fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, capped: &std::cel
 }
 
 // Three fixed non-collinear anchors prevent ring collapse and keep vertex counts monotonic.
-fn simplify_ring(ring: &geo::LineString<f64>, tol_m: f64, capped: &std::cell::Cell<bool>) -> geo::LineString<f64> {
+fn simplify_ring(ring: &geo::LineString<f64>, tol_m: f64, run: &SimplifyRun) -> geo::LineString<f64> {
     use geo::{Distance, Euclidean};
-    if ring.0.len() <= 4 || ring.0.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
+    // Its two anchor scans count toward Cancel; once canceled, the ring is left as it is.
+    if run.stop(ring.0.len().saturating_mul(2)) || ring.0.len() <= 4 || ring.0.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
         return ring.clone();
     }
     let Some(&first) = ring.0.first() else { return ring.clone() };
@@ -3949,7 +3975,7 @@ fn simplify_ring(ring: &geo::LineString<f64>, tol_m: f64, capped: &std::cell::Ce
     for bounds in stops.windows(2) {
         let [start, end] = bounds else { return ring.clone() };
         let Some(arc) = ring.0.get(*start..=*end) else { return ring.clone() };
-        let simple = simplify_coords(arc, tol_m, capped);
+        let simple = simplify_coords(arc, tol_m, run);
         corners.extend(simple.into_iter().skip(usize::from(!corners.is_empty())));
     }
     geo::LineString::new(corners)
@@ -3974,7 +4000,7 @@ struct Simplified {
 /// [`simplify_geometry`], saying what it left alone ([`Simplified`]). A line or polygon with a
 /// coordinate the plane can't hold isn't moved through the plane and back at all.
 fn simplify_checked(g: &Geometry, tol_m: f64) -> Simplified {
-    let capped = std::cell::Cell::new(false);
+    let run = SimplifyRun::default();
     let unchanged = |broken| Simplified { geometry: g.clone(), broken, capped: false };
     // A tolerance of 0 (or one that isn't a number) simplifies nothing: the geometry as it is, not
     // moved through the plane and back.
@@ -3997,21 +4023,26 @@ fn simplify_checked(g: &Geometry, tol_m: f64) -> Simplified {
     let sg = match g {
         Geometry::Polygon(_) => to_multipolygon(g).and_then(|mut m| {
             for p in &mut m.0 {
-                p.exterior_mut(|r| *r = simplify_ring(r, tol_m, &capped));
+                p.exterior_mut(|r| *r = simplify_ring(r, tol_m, &run));
                 p.interiors_mut(|rings| {
                     for r in rings {
-                        *r = simplify_ring(r, tol_m, &capped);
+                        *r = simplify_ring(r, tol_m, &run);
                     }
                 });
             }
             from_multipolygon(&m)
         }),
         Geometry::Line(_) => to_multiline(g).and_then(|m| {
-            from_line(&geo::MultiLineString::new(m.0.iter().map(|l| geo::LineString::new(simplify_coords(&l.0, tol_m, &capped))).collect()))
+            from_line(&geo::MultiLineString::new(m.0.iter().map(|l| geo::LineString::new(simplify_coords(&l.0, tol_m, &run))).collect()))
         }),
         _ => None,
     };
-    Simplified { geometry: sg.unwrap_or_else(|| g.clone()), broken: false, capped: capped.get() }
+    // Canceled partway: the feature as it was, not part-simplified, for callers outside a tool run
+    // (a tool run stops as canceled).
+    if run.canceled.get() {
+        return unchanged(false);
+    }
+    Simplified { geometry: sg.unwrap_or_else(|| g.clone()), broken: false, capped: run.capped.get() }
 }
 
 fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -4112,7 +4143,7 @@ fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<Too
         messages.push(format!("Simplify: {short} line part(s) of fewer than 2 vertices left out"));
     }
     if past_pole > 0 {
-        messages.push(format!("Simplify: {past_pole} vertex(es) with a latitude past a pole found (taken as that pole)"));
+        messages.push(format!("Simplify: {past_pole} vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"));
     }
     if without > 0 {
         messages.push(format!("Simplify: {without} feature(s) left out: they have no geometry to simplify"));
@@ -7598,9 +7629,9 @@ mod tests {
 
     /// [`simplify_coords`] on its own, its work allowance asserted not to have run out.
     fn dp(pts: &[geo::Coord<f64>], tol_m: f64) -> Vec<geo::Coord<f64>> {
-        let capped = std::cell::Cell::new(false);
-        let out = simplify_coords(pts, tol_m, &capped);
-        assert!(!capped.get(), "work allowance ran out");
+        let run = SimplifyRun::default();
+        let out = simplify_coords(pts, tol_m, &run);
+        assert!(!run.capped.get(), "work allowance ran out");
         out
     }
 
@@ -7779,9 +7810,9 @@ mod tests {
         let big: Vec<geo::Coord<f64>> = zigzag.iter().enumerate().filter(|(i, _)| i % 10 == 5).map(|(_, c)| *c).collect();
         assert!(big.iter().all(|c| whole.contains(c)));
         assert!(whole.len() < 1_000, "{}", whole.len());
-        let capped = std::cell::Cell::new(false);
-        let short = simplify_coords_within(&zigzag, 20.0, &capped, 1);
-        assert!(capped.get());
+        let run = SimplifyRun::default();
+        let short = simplify_coords_within(&zigzag, 20.0, &run, 1);
+        assert!(run.capped.get());
         assert!(short.len() > whole.len(), "{} {}", short.len(), whole.len());
         // The ends and every big tooth (beyond its tolerance) are among those kept, all original.
         assert_eq!(short.first(), zigzag.first());
@@ -7790,33 +7821,97 @@ mod tests {
         assert!(short.iter().all(|c| zigzag.contains(c)));
     }
 
-    /// A run looks at Cancel inside one feature: canceled, a 200,000-vertex line that would be
-    /// simplified to a few vertices stops in its first span's scan and keeps them all (the run then
-    /// ends as canceled), without calling it a work cap. A run someone can stop takes no cap.
-    #[test]
-    fn simplify_coords_looks_at_cancel_inside_a_feature() {
-        let zigzag: Vec<geo::Coord<f64>> = (0..200_000)
+    /// A zigzag line of `n` vertices in the analysis plane, 1 cm teeth: at 100 m, simplified to its
+    /// two ends.
+    fn cancel_zigzag(n: usize) -> Vec<geo::Coord<f64>> {
+        (0..n)
             .map(|i| {
                 let c = rustgis_geom::lonlat_to_plane(Coord::new(i as f64 * 1e-5, if i % 2 == 0 { 0.0 } else { 1e-7 }));
                 geo::coord! { x: c.x, y: c.y }
             })
-            .collect();
+            .collect()
+    }
+
+    /// A run looks at Cancel inside one span's scan: with the run's work counted to just short of a
+    /// look ([`crate::control::PACE_WORK`]), a canceled 200,000-vertex line gets past its set-up,
+    /// stops some 1,000 distances into its first scan, and keeps all its vertices, without calling it
+    /// a work cap. A run someone can stop takes no cap.
+    #[test]
+    fn simplify_coords_looks_at_cancel_inside_a_feature() {
+        let zigzag = cancel_zigzag(200_000);
         assert_eq!(dp(&zigzag, 100.0).len(), 2);
         let control = crate::control::Control::new();
         control.cancel();
         let canceled = {
             let _installed = crate::control::install(Some(control));
-            let capped = std::cell::Cell::new(false);
-            let out = simplify_coords(&zigzag, 100.0, &capped);
-            assert!(!capped.get(), "a cancel isn't a work cap");
+            let run = SimplifyRun::default();
+            assert!(!run.stop(crate::control::PACE_WORK - zigzag.len() - 1_000));
+            let out = simplify_coords(&zigzag, 100.0, &run);
+            assert!(run.canceled.get());
+            assert!(!run.capped.get(), "a cancel isn't a work cap");
             out
         };
         assert_eq!(canceled.len(), zigzag.len());
         // Stoppable: no cap, however little work is allowed, and the whole run simplified.
         let _installed = crate::control::install(Some(crate::control::Control::stoppable()));
-        let capped = std::cell::Cell::new(false);
-        assert_eq!(simplify_coords_within(&zigzag, 100.0, &capped, 1).len(), 2);
-        assert!(!capped.get());
+        let run = SimplifyRun::default();
+        assert_eq!(simplify_coords_within(&zigzag, 100.0, &run, 1).len(), 2);
+        assert!(!run.capped.get());
+    }
+
+    /// Cancel is counted across a feature's parts and rings, not per part: with the work just short
+    /// of a look, a three-vertex part is simplified, and the next part's set-up crosses it, so it and
+    /// every part after are left as they are; the same across a polygon's rings. Before, each part
+    /// started its own count, so a feature of many short parts never looked at all.
+    #[test]
+    fn simplify_looks_at_cancel_across_a_features_parts() {
+        let control = crate::control::Control::new();
+        control.cancel();
+        let _installed = crate::control::install(Some(control));
+        // Lines: 3 for the first part's set-up and 1 for its distance stay short of the look.
+        let parts: Vec<Vec<geo::Coord<f64>>> =
+            (0..10).map(|k| cancel_zigzag(3).into_iter().map(|c| geo::coord! { x: c.x + k as f64 * 1e4, y: c.y }).collect()).collect();
+        let run = SimplifyRun::default();
+        assert!(!run.stop(crate::control::PACE_WORK - 5));
+        let lens: Vec<usize> = parts.iter().map(|p| simplify_coords(p, 100.0, &run).len()).collect();
+        assert_eq!(lens, [2, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
+        assert!(run.canceled.get());
+        // Rings: each ring's anchor scans count too; once canceled, a ring is left as it is.
+        let ring = |dx: f64| -> geo::LineString<f64> {
+            let mut r: Vec<geo::Coord<f64>> = (0..12)
+                .map(|i| {
+                    let a = i as f64 * std::f64::consts::TAU / 12.0;
+                    let c = rustgis_geom::lonlat_to_plane(Coord::new(dx + 0.01 * a.cos(), 0.01 * a.sin()));
+                    geo::coord! { x: c.x, y: c.y }
+                })
+                .collect();
+            r.push(r[0]);
+            geo::LineString::new(r)
+        };
+        let run = SimplifyRun::default();
+        assert!(!run.stop(crate::control::PACE_WORK - 70));
+        let first = simplify_ring(&ring(0.0), 1e6, &run);
+        let second = simplify_ring(&ring(1.0), 1e6, &run);
+        assert!(first.0.len() < 13, "the first ring is simplified: {}", first.0.len());
+        assert_eq!(second, ring(1.0), "the second ring is left as it is");
+    }
+
+    /// Canceled partway, a feature is given back as it was rather than part-simplified, for callers
+    /// outside a tool run: a 2.2-million-vertex ring's anchor scans alone cross a look at Cancel.
+    #[test]
+    fn simplify_gives_back_a_canceled_feature_as_it_was() {
+        let ring: Vec<Coord> = (0..2_200_000)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::TAU / 2_200_000.0;
+                Coord::new(10.0 * a.cos(), 10.0 * a.sin())
+            })
+            .chain(std::iter::once(Coord::new(10.0, 0.0)))
+            .collect();
+        let polygon = Geometry::Polygon(vec![vec![ring]]);
+        let control = crate::control::Control::new();
+        control.cancel();
+        let _installed = crate::control::install(Some(control));
+        assert_eq!(simplify_geometry(&polygon, 1_000.0), polygon);
     }
 
     /// The bound holds on WGS 84, not only on the sphere: at 60°N, a vertex 0.01795° east of a
@@ -7944,7 +8039,8 @@ mod tests {
             "{messages:?}"
         );
         assert!(
-            messages.iter().any(|m| m == "Simplify: 1 vertex(es) with a latitude past a pole found (taken as that pole)"),
+            messages.iter().any(|m| m
+                == "Simplify: 1 vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"),
             "{messages:?}"
         );
         // With a tolerance of 0 nothing is simplified, so the broken lines aren't blamed for it.
@@ -7990,16 +8086,16 @@ mod tests {
         let line = Geometry::Line(vec![vec![Coord::new(10.0, 46.0), Coord::new(10.1, 46.0), Coord::new(10.2, 46.0)]]);
         assert_eq!(simplify_geometry(&line, 1e6).coord_count(), 2);
         let repeated = geo::LineString::new(vec![geo::Coord { x: 1.0, y: 1.0 }; 6]);
-        assert_eq!(simplify_ring(&repeated, 1e6, &std::cell::Cell::new(false)), repeated);
+        assert_eq!(simplify_ring(&repeated, 1e6, &SimplifyRun::default()), repeated);
         let collinear = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&collinear, 1e6, &std::cell::Cell::new(false)), collinear);
+        assert_eq!(simplify_ring(&collinear, 1e6, &SimplifyRun::default()), collinear);
         let both_sides = geo::LineString::from(vec![(0.0, 0.0), (3.0, 0.0), (-3.0, 0.0), (0.0, 0.0), (1.0, 0.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&both_sides, 1e6, &std::cell::Cell::new(false)), both_sides);
+        assert_eq!(simplify_ring(&both_sides, 1e6, &SimplifyRun::default()), both_sides);
         let concave = geo::LineString::from(vec![(0.0, 0.0), (3.0, 0.0), (2.0, 1.0), (-2.0, 1.0), (-3.0, 0.0), (-2.0, -1.0), (0.0, 0.0)]);
         let mut previous = concave.0.len();
         for tolerance in [0.1, 1.1, 2.5, 1e6] {
             use geo::{Distance, Euclidean};
-            let reduced = simplify_ring(&concave, tolerance, &std::cell::Cell::new(false));
+            let reduced = simplify_ring(&concave, tolerance, &SimplifyRun::default());
             assert!((4..=previous).contains(&reduced.0.len()));
             previous = reduced.0.len();
             let deviation = concave.0.iter().map(|c| Euclidean.distance(&geo::Point::from(*c), &reduced)).fold(0.0_f64, f64::max);
@@ -8008,9 +8104,9 @@ mod tests {
         }
         assert_eq!(previous, 4);
         let triangle = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&triangle, 1e6, &std::cell::Cell::new(false)), triangle);
+        assert_eq!(simplify_ring(&triangle, 1e6, &SimplifyRun::default()), triangle);
         let nonfinite = geo::LineString::from(vec![(0.0, 0.0), (f64::INFINITY, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&nonfinite, 1e6, &std::cell::Cell::new(false)), nonfinite);
+        assert_eq!(simplify_ring(&nonfinite, 1e6, &SimplifyRun::default()), nonfinite);
     }
 
     /// Feature To Point, Minimum Bounding Geometry without grouping and Calculate Geometry make

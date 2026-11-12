@@ -192,11 +192,11 @@ pub(crate) fn uncapped() -> bool {
 
 /// The work units (a distance, a ray step, a multiply-add) between two looks at the cancel flag
 /// inside an item of a loop ([`Pace`]): a few milliseconds.
-const PACE_WORK: usize = 1 << 22;
+pub(crate) const PACE_WORK: usize = 1 << 22;
 
 /// Looks at the cancel flag about every [`PACE_WORK`] units of work, within an item that may
 /// take long on its own (a row of a wide grid without a work cap), so Cancel stops the run soon.
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Pace(usize);
 
 impl Pace {
