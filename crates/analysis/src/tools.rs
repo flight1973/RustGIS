@@ -3985,6 +3985,10 @@ fn simplify_ring(ring: &geo::LineString<f64>, tol_m: f64, run: &SimplifyRun) -> 
         let [start, end] = bounds else { return ring.clone() };
         let Some(arc) = ring.0.get(*start..=*end) else { return ring.clone() };
         let simple = simplify_coords(arc, tol_m, run);
+        // Canceled: the ring as it is, its arcs left not copied.
+        if run.canceled.get() {
+            return ring.clone();
+        }
         corners.extend(simple.into_iter().skip(usize::from(!corners.is_empty())));
     }
     geo::LineString::new(corners)
@@ -4073,7 +4077,10 @@ fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 /// [`simplify`] on `threads` threads (by the number of features when `None`): each feature is
 /// simplified on its own (#1252), and the rows and vertex counts are made in input order, as on
 /// one thread. Cancel is looked at, and progress counted, between features, and within a feature
-/// as its work adds up across its parts ([`SimplifyRun`]).
+/// as its work adds up across its parts ([`SimplifyRun`]). A feature's passes over all its
+/// vertices without a look (checking it and moving it into the plane and back, setting up a run's
+/// latitudes and scales, comparing and counting the result) each take about as long as one
+/// distance per vertex, so only a feature of tens of millions of vertices holds the run for long.
 fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let tol = num(p, "tolerance").ok_or("Tolerance must be a number")?.abs() * 1000.0;
@@ -7910,13 +7917,26 @@ mod tests {
             r.push(r[0]);
             geo::LineString::new(r)
         };
-        // The first ring's work (59) stays short of the look; the second's anchor scans cross it.
+        // The first ring's work (26 for its anchor scans, 60 for its arcs' 15 vertices set up, 9
+        // distances: 95) stays short of the look, and the last unit of the second's anchor scans
+        // reaches it.
+        let full = simplify_ring(&ring(0.0), 1e6, &SimplifyRun::default());
+        assert_eq!(full.0.len(), 4);
         let run = SimplifyRun::default();
-        assert!(!run.stop(crate::control::PACE_WORK - 70));
+        assert!(!run.stop(crate::control::PACE_WORK - 121));
         let first = simplify_ring(&ring(0.0), 1e6, &run);
+        assert!(!run.canceled.get(), "the first ring's work stays short of the look");
+        assert_eq!(first, full, "the first ring is simplified");
         let second = simplify_ring(&ring(1.0), 1e6, &run);
-        assert!(first.0.len() < 13, "the first ring is simplified: {}", first.0.len());
+        assert!(run.canceled.get());
         assert_eq!(second, ring(1.0), "the second ring is left as it is");
+        // A ring too small to simplify counts too (8 for a closed triangle), so a polygon of a
+        // million small holes is looked at.
+        let triangle = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]);
+        let run = SimplifyRun::default();
+        assert!(!run.stop(crate::control::PACE_WORK - 8));
+        assert_eq!(simplify_ring(&triangle, 1e6, &run), triangle);
+        assert!(run.canceled.get(), "a small ring's work counts toward Cancel");
     }
 
     /// Canceled partway, a feature is given back as it was rather than part-simplified, for callers
