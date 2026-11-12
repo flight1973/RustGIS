@@ -344,7 +344,7 @@ impl Mgrs {
     }
 
     /// Writes the zone and band as MGRS writes them: `33U`, `04Q`, or the polar half's letter alone
-    /// (`Z`), without building a string (the readout writes a reference every frame).
+    /// (`Z`), without building a string of its own.
     fn write_designator(&self, f: &mut impl fmt::Write) -> fmt::Result {
         if self.polar() { write!(f, "{}", self.band) } else { write!(f, "{:02}{}", self.zone, self.band) }
     }
@@ -480,7 +480,7 @@ impl fmt::Display for GridError {
             GridError::Zone => "the UTM zone must be 1 to 60",
             GridError::Band => "the latitude band must be a letter from C to X (not I or O)",
             GridError::Polar => {
-                "north of 84° N and south of 80° S the grid is UPS, which has no zone number: write north 2000000 2444268 or Z AM 00000 44268"
+                "north of 84° N and south of 80° S the grid is UPS, which has no zone number: write north 2000000 2444268, south 2000000 1555732, or polar MGRS such as Z AM 00000 44268"
             }
             GridError::Square => "the 100 km square letters aren't used in this zone",
             GridError::Digits => "the grid digits must be an even count of 0 to 10, half for the easting and half for the northing",
@@ -1567,6 +1567,8 @@ mod tests {
         assert!((p.x - 45.0).abs() < 1e-4 && (p.y - 85.0).abs() < 1e-4, "{p:?}");
         assert_eq!(parse_utm("NORTH 2392768 1607232"), Ok(p));
         assert_eq!(parse_utm("Z 2392768 1607232"), Ok(p));
+        // GeographicLib's short form (`GeoConvert -u`).
+        assert_eq!(parse_utm("n 2392768 1607232"), Ok(p));
         let q = parse_utm("Y, 1735147, 2243078").unwrap();
         assert!(q.x < 0.0 && q.y > 84.0, "{q:?}");
         let s = parse_utm("south 2096454 1452981").unwrap();
@@ -1577,7 +1579,8 @@ mod tests {
             ("A 2096454 1452981", GridError::OutsideZone),     // east of 2,000,000 m is B
             ("north 2000000 1300000", GridError::OutsideZone), // lettered, but south of 84° N
             ("south 2000000 3150000", GridError::OutsideZone), // lettered, but north of 80° S
-            ("north 2000000 100000", GridError::Syntax),       // outside the lettered area
+            ("north 2000000 100000", GridError::OutsideZone),  // outside the lettered area, after the zone
+            ("A 2000000 100000", GridError::Syntax),           // after a single letter it may be text
             ("A 10 20", GridError::Syntax),
             ("A1 12", GridError::Syntax),
             ("B 12, 34", GridError::Syntax),

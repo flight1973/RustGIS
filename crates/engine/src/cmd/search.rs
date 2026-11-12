@@ -138,7 +138,7 @@ pub struct Results {
     pub grid_error: Option<GridError>,
     /// Whether the coordinate among the hits was read from text that may as well be a name or a
     /// code: a polar (UPS) reference, which starts with a letter (`BAG123456`), unless written
-    /// exactly as the readout writes it ([`as_the_readout_writes_it`]). The search box still
+    /// exactly as the readout writes it ([`plainly_polar_place`]). The search box still
     /// offers to look the text up as a place.
     pub coordinate_may_be_text: bool,
 }
@@ -163,7 +163,7 @@ fn search_map(map: &rustgis_map::Map, query: &str, limit: usize) -> Results {
     // so on another body's map they name no place. Polar (UPS) references and positions start
     // with a letter, as names and codes do (`BAG123456`, `A ST 12`): read_grid_reference reads
     // them only as references are written ([`polar_form`]). Unless written exactly as the
-    // readout writes it ([`as_the_readout_writes_it`]), the tables are still searched and the
+    // readout writes it ([`plainly_polar_place`]), the tables are still searched and the
     // place comes after their hits, so a feature named so is found first.
     let mut plainly_coordinate = false;
     let mut polar_place = None;
@@ -172,7 +172,7 @@ fn search_map(map: &rustgis_map::Map, query: &str, limit: usize) -> Results {
         plainly_coordinate = q.chars().any(|c| matches!(c, '.' | '°' | 'º' | '\'' | '′' | '"' | '″') || c.is_alphabetic());
     } else if map.body().is_earth() {
         match read_grid_reference(&q) {
-            Ok(c) if letter_led(&q) && !as_the_readout_writes_it(&q) => polar_place = Some(c),
+            Ok(c) if letter_led(&q) && !plainly_polar_place(&q) => polar_place = Some(c),
             Ok(c) => {
                 out.hits.push(Hit::Coordinate { lon: c.x, lat: c.y });
                 plainly_coordinate = rustgis_geom::parse_mgrs(&q).map_or(true, |m| m.digits > 0);
@@ -464,17 +464,17 @@ fn letter_led(text: &str) -> bool {
     text.trim_start().starts_with(|c: char| c.is_ascii_alphabetic())
 }
 
-/// Whether polar text is written exactly as the readout and its copy write a place, so it is
-/// plainly a coordinate rather than a name or a code: UPS with the zone spelled out
-/// (`north 2077146 1562481`), or polar MGRS spaced, in capitals, to the meter
-/// (`Z AC 77146 62481`).
-fn as_the_readout_writes_it(text: &str) -> bool {
+/// Whether polar text is plainly a place rather than a name or a code: any UPS position
+/// [`rustgis_geom::parse_ups`] reads, led by the zone (`north 2077146 1562481`, `n …`) or the
+/// half's letter (`Z 2077146 1562481`, `Y, 1735147, 2243078`), or polar MGRS written as the
+/// readout writes it, spaced, in capitals, to the meter (`Z AC 77146 62481`).
+fn plainly_polar_place(text: &str) -> bool {
     let text = text.trim();
     // The word may be followed by a comma, as parse_ups reads it (`north, 2077146, 1562481`).
     // UPS with the zone or the half's letter before two numbers in the lettered area
     // (`Y, 1735147, 2243078`) is plainly a position: no name or code is written that way.
     let word = text.split(|c: char| c.is_whitespace() || c == ',').next().unwrap_or("").to_ascii_lowercase();
-    if matches!(word.as_str(), "north" | "south") {
+    if matches!(word.as_str(), "north" | "south" | "n" | "s") {
         return true;
     }
     if matches!(word.as_str(), "y" | "z" | "a" | "b") && rustgis_geom::parse_ups(text).is_ok() {

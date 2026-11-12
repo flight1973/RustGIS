@@ -278,13 +278,16 @@ pub(crate) fn is_polar_half(letter: char) -> bool {
 }
 
 /// Reads a UPS position, which has no zone number: the zone spelled out, `north 2392768 1607232`
-/// or `south 2096454 1452981` (any case), as the readout writes it, or the polar half's letter
-/// before the easting and northing, `Y, 1735147, 2243078` (NGA.STND.0037 App. A-4), where Y and
-/// A lie west of the 2,000,000 m easting (or on it, for a rounded coordinate) and Z and B on or
-/// east of it. Numbers outside the zone's
-/// lettered area (north 1,300,000 up to 2,700,000 m, south 800,000 up to 3,200,000 m) aren't a UPS
-/// position and read as text ([`GridError::Syntax`]); a place inside it must lie in the zone, at
-/// 84° N or more or south of 80° S, give or take the meter it was rounded to.
+/// or `south 2096454 1452981` (any case), as the readout writes it, or as GeographicLib's short
+/// form, `n 2392768 1607232`; or the polar half's letter before the easting and northing,
+/// `Y, 1735147, 2243078` (NGA.STND.0037 App. A-4), where Y and A lie west of the 2,000,000 m
+/// easting (or on it, for a rounded coordinate) and Z and B on or east of it. Numbers outside the
+/// zone's lettered area (north 1,300,000 up to 2,700,000 m, south 800,000 up to 3,200,000 m)
+/// aren't a UPS position: after `north` or `south` and with both numbers at least 100,000 m they
+/// are a mistyped one ([`GridError::OutsideZone`]); otherwise text ([`GridError::Syntax`], as
+/// `A 10 20` is a road). A place inside it
+/// must lie in the zone, at 84° N or more or south of 80° S, give or take the meter it was rounded
+/// to.
 pub fn parse_ups(text: &str) -> Result<Coord, GridError> {
     let text = text.trim();
     if text.chars().count() > MAX_REF_CHARS {
@@ -296,8 +299,8 @@ pub fn parse_ups(text: &str) -> Result<Coord, GridError> {
         word.push(c.to_ascii_uppercase());
     }
     let (north, half) = match word.as_str() {
-        "NORTH" => (true, None),
-        "SOUTH" => (false, None),
+        "NORTH" | "N" => (true, None),
+        "SOUTH" | "S" => (false, None),
         "Y" | "Z" => (true, word.chars().next()),
         "A" | "B" => (false, word.chars().next()),
         _ => return Err(GridError::Syntax),
@@ -310,7 +313,11 @@ pub fn parse_ups(text: &str) -> Result<Coord, GridError> {
     let (easting, northing) = easting_and_northing(&rest)?;
     // Numbers outside the zone's lettered area aren't a UPS position (`A 10 20`, a road): text.
     if !in_lettered_area(north, easting, northing) {
-        return Err(GridError::Syntax);
+        // After the zone spelled out, with numbers the size of UPS coordinates (a typo such as
+        // `north 20771461 1562481`), it is a position, so it says why; after a single letter, or
+        // with small numbers (`A 10 20`, `North 10 20`), it may be a road or a code: text.
+        let position = half.is_none() && word.len() > 1 && easting >= SQUARE && northing >= SQUARE;
+        return Err(if position { GridError::OutsideZone } else { GridError::Syntax });
     }
     if half.is_some_and(|h| !easting_in_half(h, easting)) {
         return Err(GridError::OutsideZone);
