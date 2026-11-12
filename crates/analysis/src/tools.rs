@@ -3859,11 +3859,20 @@ impl SimplifyRun {
     }
 }
 
+/// The work units toward Cancel of setting up one vertex (its latitude and scale, a few
+/// transcendentals): it takes some 3 to 8 times one distance.
+const SETUP_WORK: usize = 4;
+
 /// [`simplify_coords`] with `work` distances a vertex allowed rather than [`SIMPLIFY_WORK`].
 fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, run: &SimplifyRun, work: usize) -> Vec<geo::Coord<f64>> {
     let n = pts.len();
     // Each vertex set up (its latitude and scale) counts toward Cancel, short runs too.
-    if run.stop(n) || n <= 2 || tol_m.is_nan() || tol_m <= 0.0 || pts.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
+    if run.stop(n.saturating_mul(SETUP_WORK))
+        || n <= 2
+        || tol_m.is_nan()
+        || tol_m <= 0.0
+        || pts.iter().any(|c| !c.x.is_finite() || !c.y.is_finite())
+    {
         return pts.to_vec();
     }
     // On the ellipsoid, not the sphere ([`SPHERE_TO_WGS84`]).
@@ -3883,7 +3892,7 @@ fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, run: &SimplifyRun
     let mut budget = if crate::control::uncapped() { usize::MAX } else { n.saturating_mul(work) };
     // Each distance counts toward Cancel (`run.stop`), inside a span's scan too, so one large
     // feature doesn't hold the run.
-    // Out of work, or canceled (the run then stops as an error): the spans still open keep their
+    // Out of work, or canceled (the feature is then given back as it was): the spans still open keep their
     // vertices.
     let keep_open = |keep: &mut Vec<bool>, spans: &mut dyn Iterator<Item = (usize, usize)>| {
         for k in spans.flat_map(|(i, j)| i + 1..j) {
@@ -4021,24 +4030,36 @@ fn simplify_checked(g: &Geometry, tol_m: f64) -> Simplified {
         }
     }
     let sg = match g {
+        // Once canceled, the parts left aren't walked nor the feature put back together.
         Geometry::Polygon(_) => to_multipolygon(g).and_then(|mut m| {
             for p in &mut m.0 {
+                if run.canceled.get() {
+                    return None;
+                }
                 p.exterior_mut(|r| *r = simplify_ring(r, tol_m, &run));
                 p.interiors_mut(|rings| {
-                    for r in rings {
+                    for r in rings.iter_mut().take_while(|_| !run.canceled.get()) {
                         *r = simplify_ring(r, tol_m, &run);
                     }
                 });
             }
-            from_multipolygon(&m)
+            if run.canceled.get() { None } else { from_multipolygon(&m) }
         }),
         Geometry::Line(_) => to_multiline(g).and_then(|m| {
-            from_line(&geo::MultiLineString::new(m.0.iter().map(|l| geo::LineString::new(simplify_coords(&l.0, tol_m, &run))).collect()))
+            let mut parts = Vec::with_capacity(m.0.len());
+            for l in &m.0 {
+                let simple = simplify_coords(&l.0, tol_m, &run);
+                if run.canceled.get() {
+                    return None;
+                }
+                parts.push(geo::LineString::new(simple));
+            }
+            from_line(&geo::MultiLineString::new(parts))
         }),
         _ => None,
     };
-    // Canceled partway: the feature as it was, not part-simplified, for callers outside a tool run
-    // (a tool run stops as canceled).
+    // Canceled partway: the feature as it was, never part-simplified (a tool run then stops as
+    // canceled, and its features aren't used).
     if run.canceled.get() {
         return unchanged(false);
     }
@@ -4051,7 +4072,8 @@ fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 
 /// [`simplify`] on `threads` threads (by the number of features when `None`): each feature is
 /// simplified on its own (#1252), and the rows and vertex counts are made in input order, as on
-/// one thread. Cancel is looked at, and progress counted, between features.
+/// one thread. Cancel is looked at, and progress counted, between features, and within a feature
+/// as its work adds up across its parts ([`SimplifyRun`]).
 fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let tol = num(p, "tolerance").ok_or("Tolerance must be a number")?.abs() * 1000.0;
@@ -7845,7 +7867,7 @@ mod tests {
         let canceled = {
             let _installed = crate::control::install(Some(control));
             let run = SimplifyRun::default();
-            assert!(!run.stop(crate::control::PACE_WORK - zigzag.len() - 1_000));
+            assert!(!run.stop(crate::control::PACE_WORK - SETUP_WORK * zigzag.len() - 1_000));
             let out = simplify_coords(&zigzag, 100.0, &run);
             assert!(run.canceled.get());
             assert!(!run.capped.get(), "a cancel isn't a work cap");
@@ -7868,11 +7890,11 @@ mod tests {
         let control = crate::control::Control::new();
         control.cancel();
         let _installed = crate::control::install(Some(control));
-        // Lines: 3 for the first part's set-up and 1 for its distance stay short of the look.
+        // Lines: 12 for the first part's set-up (3 vertices) and 1 for its distance stay short of the look.
         let parts: Vec<Vec<geo::Coord<f64>>> =
             (0..10).map(|k| cancel_zigzag(3).into_iter().map(|c| geo::coord! { x: c.x + k as f64 * 1e4, y: c.y }).collect()).collect();
         let run = SimplifyRun::default();
-        assert!(!run.stop(crate::control::PACE_WORK - 5));
+        assert!(!run.stop(crate::control::PACE_WORK - 14));
         let lens: Vec<usize> = parts.iter().map(|p| simplify_coords(p, 100.0, &run).len()).collect();
         assert_eq!(lens, [2, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
         assert!(run.canceled.get());
@@ -7888,6 +7910,7 @@ mod tests {
             r.push(r[0]);
             geo::LineString::new(r)
         };
+        // The first ring's work (59) stays short of the look; the second's anchor scans cross it.
         let run = SimplifyRun::default();
         assert!(!run.stop(crate::control::PACE_WORK - 70));
         let first = simplify_ring(&ring(0.0), 1e6, &run);
