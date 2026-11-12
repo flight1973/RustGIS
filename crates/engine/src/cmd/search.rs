@@ -453,9 +453,10 @@ pub fn read_grid_reference(text: &str) -> Result<Coord, GridError> {
         Err(mgrs) => match rustgis_geom::parse_utm(text) {
             Err(GridError::Syntax) if spaced_square(text) => Err(GridError::Syntax),
             Err(GridError::Syntax) => Err(mgrs),
-            // A UPS position that names no place after a lone letter (`N 1350000 1350000`, a State
-            // Plane pair, or `A …`) may be a code: text. After `north` or `south` it says why.
-            Err(_) if letter_led(text) && !led_by_zone_word(text) => Err(GridError::Syntax),
+            // A UPS position that names no place after GeographicLib's `n` or `s` may be a State
+            // Plane pair (`N 1350000 1350000`): text. After `north`, `south` or a half's letter
+            // (`Y 2392768 1607232`, two numbers in the lettered area) it says why.
+            Err(_) if letter_led(text) && !led_by_zone_word(text) && !led_by_half_letter(text) => Err(GridError::Syntax),
             utm => utm,
         },
     }
@@ -479,7 +480,7 @@ fn plainly_polar_place(text: &str) -> bool {
     if led_by_zone_word(text) {
         return true;
     }
-    if matches!(first_word(text).as_str(), "y" | "z" | "a" | "b") && rustgis_geom::parse_ups(text).is_ok() {
+    if led_by_half_letter(text) && rustgis_geom::parse_ups(text).is_ok() {
         return true;
     }
     polar_form(text) == Some(PolarForm::Readout)
@@ -495,6 +496,12 @@ fn first_word(text: &str) -> String {
 /// Whether text starts with the UPS zone spelled out, `north` or `south`.
 fn led_by_zone_word(text: &str) -> bool {
     matches!(first_word(text).as_str(), "north" | "south")
+}
+
+/// Whether text starts with a polar half's letter alone, `Y`, `Z`, `A` or `B`, as NGA writes a
+/// UPS position (`Y, 1735147, 2243078`).
+fn led_by_half_letter(text: &str) -> bool {
+    matches!(first_word(text).as_str(), "y" | "z" | "a" | "b")
 }
 
 /// How letter-led text is written as a polar MGRS reference, if it is.
@@ -1064,10 +1071,14 @@ mod tests {
         for q in ["Z AC 7714 6248", "Z AC", "ZAC7714662481", "n 2077146 1562481", "N 2000000 1500000"] {
             assert!(search(&s, q, 50).coordinate_may_be_text, "{q}");
         }
-        // One that names no UPS place after a lone letter (a State Plane pair near 81.8° N) says
-        // nothing; after `north` it says why.
+        // One that names no UPS place after `n` (a State Plane pair near 81.8° N) says nothing;
+        // after `north` or a half's letter (Y east of 2,000,000 m is Z's) it says why.
         assert_eq!(search(&s, "N 1350000 1350000", 50).grid_error, None);
-        assert_eq!(search(&s, "north 1350000 1350000", 50).grid_error, Some(GridError::OutsideZone));
+        for q in ["north 1350000 1350000", "Y 2392768 1607232", "a 2100000 1500000"] {
+            let r = search(&s, q, 50);
+            assert_eq!(r.grid_error, Some(GridError::OutsideZone), "{q}");
+            assert!(!r.hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}");
+        }
     }
 
     #[test]
