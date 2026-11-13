@@ -4062,12 +4062,11 @@ impl SimplifyNotes {
         self.past_pole += other.past_pole;
     }
 
-    /// Only what changed the data beyond simplifying it: vertices past a pole taken as the pole, and
-    /// one-vertex line parts left out. What was simplified less than asked (beyond 85.05°, left as
-    /// it was, too intricate) keeps the data as it was, for a caller with nothing to tell about that
-    /// (a package, a locator's sketch).
-    pub fn changes(&self) -> SimplifyNotes {
-        SimplifyNotes { short: self.short, past_pole: self.past_pole, ..SimplifyNotes::default() }
+    /// All but [`SimplifyNotes::polar`], for a caller that simplifies to its own tolerance (a
+    /// package, a locator's sketch): reaching beyond 85.05° only simplifies a little less there, and
+    /// any world map reaches it (Antarctica, to -90°), so saying it would be said every time.
+    pub fn without_polar(&self) -> SimplifyNotes {
+        SimplifyNotes { polar: 0, ..*self }
     }
 
     /// One notice per kind counted, each starting with `lead` (who simplified: "Simplify"); none
@@ -8176,8 +8175,8 @@ mod tests {
             Geometry::Line(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)], vec![Coord::new(5.0, 5.0)]]);
         let (_, notes) = simplify_geometry(&bad, 100.0);
         assert_eq!(notes, SimplifyNotes { polar: 1, short: 1, past_pole: 1, ..SimplifyNotes::default() });
-        // What changed the data beyond simplifying it, for callers that only tell that.
-        assert_eq!(notes.changes(), SimplifyNotes { short: 1, past_pole: 1, ..SimplifyNotes::default() });
+        // All but reaching beyond 85.05°, for callers simplifying to their own tolerance.
+        assert_eq!(notes.without_polar(), SimplifyNotes { short: 1, past_pole: 1, ..SimplifyNotes::default() });
         // Canceled (a part whose set-up alone reaches a look at Cancel), the line is given back as
         // it was: its short part didn't go, so it isn't said to.
         let long: Vec<Coord> = (0..(crate::control::PACE_WORK / SETUP_WORK + 1)).map(|i| Coord::new(i as f64 * 1e-6, 0.0)).collect();

@@ -728,9 +728,9 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
         m.release_tiles(&hidden);
         m.layers.retain(|l| kept(l));
     }
-    // What Simplify changed beyond simplifying (a latitude past a pole taken as the pole, a
-    // one-vertex line part left out), over all the layers: said once the package is made, one
-    // notice per kind (#1811). Simplified less than asked keeps the data, with nothing to tell.
+    // What Simplify left alone or changed beyond simplifying (a latitude past a pole taken as the
+    // pole, a one-vertex line part left out, a feature left as it was or too intricate), over all
+    // the layers: said once the package is made, one notice per kind (#1811).
     let mut notes = rustgis_analysis::SimplifyNotes::default();
     if mobile {
         for l in &mut m.layers {
@@ -751,12 +751,14 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
     let name = m.name.clone();
     let (text, report) = crate::durable::output_owned(m, |m| serde_json::to_string(m).map_err(|e| e.to_string()))?;
     crate::durable::notify(s, &report);
-    for said in notes.changes().messages("Mobile map package, simplifying") {
-        s.notify(said, false);
-    }
     let kind = if mobile { "mobile map package" } else { "map package" };
     let readme = format!("{} — a RustGIS {kind}.\nAdd it to a project with Data › Import.\n", name);
-    rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&name)), text.into_bytes()), ("README.txt".into(), readme.into_bytes())])
+    let archive =
+        rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&name)), text.into_bytes()), ("README.txt".into(), readme.into_bytes())])?;
+    for said in notes.without_polar().messages("Mobile map package, simplifying") {
+        s.notify(said, false);
+    }
+    Ok(archive)
 }
 
 /// The geoprocessing history with the layers its runs made, as GeoJSON.

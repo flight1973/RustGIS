@@ -1882,8 +1882,9 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             // Each polygon simplified to a tenth of a millimetre on the disc (its scale in metres),
             // so the project keeps a sketch of the layers for it, not a second full copy of them.
             let tolerance_m = globe * 1e-4;
-            // What Simplify changed beyond simplifying in what the sketch keeps (a latitude past a
-            // pole taken as the pole): said in the warnings, one per kind (#1811).
+            // What Simplify left alone or changed beyond simplifying in what the sketch keeps (a
+            // latitude past a pole taken as the pole, a polygon left as it was): said in the
+            // warnings, one per kind (#1811).
             let notes = std::cell::Cell::new(rustgis_analysis::SimplifyNotes::default());
             // On the locator, sub-tolerance rings keep their outline rather than becoming triangles.
             let sketch = |g: &rustgis_data::Geometry| {
@@ -1948,8 +1949,8 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                     layer
                 })
                 .collect();
-            // Only what changed the polygons: a sketch simplified less than asked loses nothing.
-            warnings.extend(notes.get().changes().messages("the globe locator, simplifying its polygons"));
+            // All but reaching beyond 85.05°, which any world map does (`without_polar`).
+            warnings.extend(notes.get().without_polar().messages("the globe locator, simplifying its polygons"));
             let name = m.name.clone();
             match orphan.and_then(|i| s.project.maps.get_mut(i)) {
                 Some(old) => {

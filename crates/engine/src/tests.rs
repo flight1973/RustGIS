@@ -45385,15 +45385,18 @@ fn a_mobile_package_says_what_simplifying_did() {
     std::fs::create_dir_all(&dir.0).unwrap();
     let said =
         |s: &Session| s.notices.iter().filter(|n| n.text.starts_with("Mobile map package")).map(|n| n.text.clone()).collect::<Vec<_>>();
-    let package = |line: Vec<Vec<Coord>>, name: &str| {
+    let package_all = |lines: Vec<Vec<Vec<Coord>>>, name: &str| {
         let mut s = Session::new(Project::default());
         let mut ds = Dataset::new("ways", GeometryType::Polyline, vec![]);
-        ds.push(Some(Geometry::Line(line)), vec![]);
+        for line in lines {
+            ds.push(Some(Geometry::Line(line)), vec![]);
+        }
         s.map_mut().add_dataset(ds);
         let path = dir.0.join(name);
         s.run("map.package", &json!({"path": path.display().to_string(), "mobile": true})).unwrap();
         s
     };
+    let package = |line: Vec<Vec<Coord>>, name: &str| package_all(vec![line], name);
     let bad =
         package(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)], vec![Coord::new(5.0, 5.0)]], "bad.rgismpk");
     let notes = said(&bad);
@@ -45405,6 +45408,21 @@ fn a_mobile_package_says_what_simplifying_did() {
                 .to_string()
         ),
         "{notes:?}"
+    );
+    // A line with a coordinate missing, and one with a longitude too far out for the analysis
+    // plane, are left as they were, and said.
+    let unplaced = package_all(
+        vec![
+            vec![vec![Coord::new(0.0, 10.0), Coord::new(f64::NAN, 10.5), Coord::new(2.0, 10.0)]],
+            vec![vec![Coord::new(0.0, 20.0), Coord::new(1e300, 20.0), Coord::new(2.0, 20.0)]],
+        ],
+        "unplaced.rgismpk",
+    );
+    assert_eq!(
+        said(&unplaced),
+        [
+            "Mobile map package, simplifying: 2 line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
+        ]
     );
     // Clean, or only simplified less than asked (reaching 88°, as Antarctica does): nothing to say.
     for (line, name) in [
@@ -45445,6 +45463,18 @@ fn a_globe_locator_says_what_simplifying_did() {
         ),
         "{bad:?}"
     );
+    // A ring with a coordinate missing is left as it was, and said.
+    let unplaced = warned(vec![c(0.0, 70.0), c(20.0, 70.0), c(f64::NAN, 80.0), c(10.0, 82.0), c(0.0, 80.0), c(0.0, 70.0)]);
+    assert_eq!(
+        unplaced,
+        [
+            "the globe locator, simplifying its polygons: 1 line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
+        ]
+    );
+    // A ring smaller than the tolerance keeps its vertices as they were, the one past the pole
+    // too, so nothing was taken to the pole: nothing said.
+    let tiny = warned(vec![c(10.0, 89.99999), c(10.00001, 89.99999), c(10.000005, 95.0), c(10.0, 89.99999)]);
+    assert!(tiny.is_empty(), "{tiny:?}");
     // Clean, or only simplified less than asked (reaching 89°, as Antarctica's -90° does): nothing.
     for ring in [
         vec![c(0.0, 70.0), c(20.0, 70.0), c(20.0, 80.0), c(10.0, 82.0), c(0.0, 80.0), c(0.0, 70.0)],
