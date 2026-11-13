@@ -4444,7 +4444,15 @@ fn by_coordinates_reads_one_position_box() {
     h.step();
     assert_eq!(h.state().dialogs.open, Some("goToXY"));
     assert!(h.state().dialogs.error.as_deref().is_some_and(|e| e.contains("100 km square")), "{:?}", h.state().dialogs.error);
+    // A scale it can't read is said, not dropped.
     h.state_mut().dialogs.a = "18TWL8395907350".into();
+    h.state_mut().dialogs.c = "50k".into();
+    h.step();
+    h.get_by_label("Go").click();
+    h.step();
+    assert_eq!(h.state().dialogs.open, Some("goToXY"));
+    assert!(h.state().dialogs.error.as_deref().is_some_and(|e| e.contains("scale")), "{:?}", h.state().dialogs.error);
+    h.state_mut().dialogs.c = "50,000".into();
     h.step();
     h.get_by_label("Go").click();
     h.step();

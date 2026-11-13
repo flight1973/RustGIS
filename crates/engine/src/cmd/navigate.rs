@@ -334,8 +334,8 @@ fn zoom(s: &mut Session, factor: f64) -> CmdResult {
 /// `40°42'46"N 74°0'22"W`), or on the Earth's map a UTM position or an MGRS reference
 /// (`18north 583959 4507351`, `18TWL8395907350`). A reference that names no place says why, as
 /// the search box does. An MGRS reference coarser than a meter names a square, not a point: the
-/// place is its center, and the second value says so, for a notice.
-pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, Option<String>), String> {
+/// place is its center, and the second value is the square's side in meters, for a notice.
+pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, Option<f64>), String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("the position is empty".into());
@@ -346,24 +346,26 @@ pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, Option<Stri
     if let Some(c) = super::search::parse_lat_lon(text) {
         return Ok((c, None));
     }
-    // Two plain numbers that aren't a latitude and a longitude: out of range, not misspelled.
+    // Two plain decimal numbers (`40.7, 200`) that aren't a latitude and a longitude: out of
+    // range, not misspelled.
+    let plain = |w: &&str| {
+        let digits = w.strip_prefix(['-', '+']).unwrap_or(w);
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit() || c == '.') && digits.chars().filter(|&c| c == '.').count() <= 1
+    };
     let words: Vec<&str> = text.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()).collect();
-    if words.len() == 2 && words.iter().all(|w| w.parse::<f64>().is_ok_and(f64::is_finite)) {
+    if words.len() == 2 && words.iter().all(plain) {
         return Err("latitude must be within ±90 and longitude within ±180".into());
     }
     let degrees = "write a position as latitude, then longitude (40.7128, -74.006 or 40°42'46\"N 74°0'22\"W)";
     if !map.body().is_earth() {
-        return Err(format!("{degrees}; UTM and MGRS are the Earth's grids"));
+        // A grid reference is told why; anything else how a place is written here.
+        return Err(match super::search::read_grid_reference(text) {
+            Err(rustgis_geom::GridError::Syntax) => degrees.into(),
+            _ => "UTM and MGRS are the Earth's grids and name no place on this map; write a position as latitude, then longitude".into(),
+        });
     }
     match super::search::read_grid_reference(text) {
-        Ok(c) => {
-            let square = rustgis_geom::parse_mgrs(text).ok().filter(|m| m.digits < 5).map(|m| {
-                let side = 10u32.pow(5 - u32::from(m.digits));
-                let side = if side >= 1000 { format!("{} km", side / 1000) } else { format!("{side} m") };
-                format!("{} names a {side} square, not a point: went to its center", text)
-            });
-            Ok((c, square))
-        }
+        Ok(c) => Ok((c, rustgis_geom::parse_mgrs(text).ok().filter(|m| m.digits < 5).map(|m| m.precision_m()))),
         Err(rustgis_geom::GridError::Syntax) => Err(format!("{degrees}, UTM (18north 583959 4507351) or MGRS (18TWL8395907350)")),
         Err(e) => Err(format!("no place at this grid reference: {e}")),
     }
@@ -381,7 +383,14 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
         if ["lon", "lat", "x", "y"].iter().any(|k| given(k)) {
             return Err("give a position or lon and lat, not both".into());
         }
-        let (c, square) = read_position(s.map(), text)?;
+        let (c, side) = read_position(s.map(), text)?;
+        let square = side.map(|side| {
+            let side = if side >= 1000.0 { format!("{} km", side / 1000.0) } else { format!("{side} m") };
+            crate::notice_text::NoticeText::format(
+                "{reference} names a {side} square, not a point: went to its center",
+                [("reference", text.trim().to_string().into()), ("side", side.into())],
+            )
+        });
         (c.x, c.y, square)
     } else {
         (
@@ -415,7 +424,7 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
     m.camera.clamp();
     s.record_extent();
     if let Some(said) = square {
-        s.notify(said, false);
+        s.notify_text(said, false);
     }
     Ok(Value::Null)
 }

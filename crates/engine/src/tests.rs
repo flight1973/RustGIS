@@ -45419,6 +45419,9 @@ fn go_to_xy_reads_a_position_as_the_search_box_does() {
     for q in ["40.7, 200", "95, 100", "-91, 200"] {
         assert!(refused(&mut s, json!({"position": q})).contains("within ±90"), "{q}");
     }
+    // Not plain decimals, so not a range: `1e1` isn't how a latitude is written.
+    let e = refused(&mut s, json!({"position": "1e1, 2"}));
+    assert!(!e.contains("within ±90"), "{e}");
     assert!(refused(&mut s, json!({"position": "  "})).contains("empty"));
     assert!(refused(&mut s, json!({"position": "4".repeat(10_000)})).contains("longer than"));
     assert!(refused(&mut s, json!({"position": 40.7})).contains("must be text"));
@@ -45430,4 +45433,6 @@ fn go_to_xy_reads_a_position_as_the_search_box_does() {
     s.run("map.goToXY", &json!({"position": "18.4, 77.5"})).unwrap();
     assert_eq!(at(&s), (18.4, 77.5));
     assert!(refused(&mut s, json!({"position": "18TWL8395907350"})).contains("Earth's grids"));
+    let e = refused(&mut s, json!({"position": "Olympus"}));
+    assert!(e.contains("write a position as") && !e.contains("UTM"), "{e}");
 }

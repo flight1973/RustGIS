@@ -157,7 +157,7 @@ impl Dialogs {
                 // The map's center as the search box writes a place: `lat, lon`, the longitude
                 // within ±180 even when the view has been panned past the antimeridian.
                 let c = s.map().center_lonlat();
-                let lon = (c.x + 180.0).rem_euclid(360.0) - 180.0;
+                let lon = crate::mapmenu::wrap_lon(c.x);
                 self.a = rustgis_engine::cmd::search::format_lat_lon((c.y * 1e4).round() / 1e4, (lon * 1e4).round() / 1e4);
             }
             "bookmark" => self.text = rustgis_engine::cmd::navigate::new_bookmark_name(s.map()),
@@ -336,14 +336,19 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("keep current")).desired_width(300.0)).labelled_by(input_label.id);
                     ui.end_row();
                 });
-                // Below the boxes, wrapped to the dialog's width rather than widening it.
-                ui.label(
-                    egui::RichText::new(tl!("Latitude, then longitude, or a UTM or MGRS reference: 40.7128, -74.006 · 40°42′46″N 74°0′22″W · 18north 583959 4507351 · 18TWL8395907350"))
-                        .weak(),
-                );
+                // Below the boxes, wrapped to the dialog's width rather than widening it. UTM and
+                // MGRS are the Earth's grids, so another body's map offers degrees alone.
+                let hint = if app.session.map().body().is_earth() {
+                    tl!("Latitude, then longitude, or a UTM or MGRS reference: 40.7128, -74.006 · 40°42′46″N 74°0′22″W · 18north 583959 4507351 · 18TWL8395907350")
+                } else {
+                    tl!("Latitude, then longitude: 18.4, 77.5 · 18°24′N 77°30′E")
+                };
+                ui.label(egui::RichText::new(hint).weak());
                 close = buttons(app, ui, "Go", |app| {
                     let mut p = json!({"position": app.dialogs.a.trim()});
-                    if let Ok(s) = app.dialogs.c.trim().replace(',', "").parse::<f64>() {
+                    let scale = app.dialogs.c.trim().replace(',', "");
+                    if !scale.is_empty() {
+                        let s = scale.parse::<f64>().ok().filter(|s| s.is_finite() && *s > 0.0).ok_or_else(|| tl!("The scale must be a number, such as 50000").to_string())?;
                         p["scale"] = json!(s);
                     }
                     app.run("map.goToXY", p).map(|_| ())
