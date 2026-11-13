@@ -45366,3 +45366,52 @@ fn native_date_source_repair_and_reload_use_finished_candidates() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// `map.goToXY` takes a `position` written as the search box reads one (#1042, discussion
+/// #1157): decimal degrees, degrees, minutes and seconds, UTM and MGRS; one that names no place
+/// says why, and the Earth's grids name no place on another body.
+#[test]
+fn go_to_xy_reads_a_position_as_the_search_box_does() {
+    let mut s = world();
+    let at = |s: &Session| {
+        let c = s.map().center_lonlat();
+        ((c.y * 1e3).round() / 1e3, (c.x * 1e3).round() / 1e3)
+    };
+    // The forms the dialog's hint shows, all New York (GeographicLib's `GeoConvert` for the grids).
+    assert_eq!(rustgis_geom::format_utm(rustgis_geom::Coord::new(-74.006, 40.7128)).as_deref(), Some("18north 583959 4507351"));
+    assert_eq!(
+        rustgis_geom::to_mgrs(rustgis_geom::Coord::new(-74.006, 40.7128), 5).map(|m| m.compact()).as_deref(),
+        Some("18TWL8395907350")
+    );
+    for q in [
+        "40.7128, -74.006",
+        "40°42'46\"N 74°0'21\"W",
+        "40°42′46″N 74°0′21″W",
+        "18north 583959 4507351",
+        "18T WL 83959 07350",
+        "18TWL8395907350",
+    ] {
+        s.run("map.goToXY", &json!({"lon": 0, "lat": 0})).unwrap();
+        s.run("map.goToXY", &json!({"position": q, "scale": 50_000})).unwrap();
+        assert_eq!(at(&s), (40.713, -74.006), "{q}");
+    }
+    assert!((s.map().scale() - 50_000.0).abs() < 1.0);
+    // Numbers still go as before.
+    s.run("map.goToXY", &json!({"lon": 10, "lat": 50})).unwrap();
+    assert_eq!(at(&s), (50.0, 10.0));
+    // Refused, with the reason the search box gives, and the map stays where it was.
+    let refused = |s: &mut Session, p: Value| s.run("map.goToXY", &p).unwrap_err();
+    assert!(refused(&mut s, json!({"position": "33UZZ1234512345"})).contains("100 km square"));
+    assert!(refused(&mut s, json!({"position": "Paris"})).contains("write a position as"));
+    assert!(refused(&mut s, json!({"position": "  "})).contains("empty"));
+    assert!(refused(&mut s, json!({"position": "4".repeat(10_000)})).contains("longer than"));
+    assert!(refused(&mut s, json!({"position": 40.7})).contains("must be text"));
+    assert!(refused(&mut s, json!({"position": "40.7, -74", "lon": 1})).contains("not both"));
+    assert!(refused(&mut s, json!({})).contains("lon is required"));
+    assert_eq!(at(&s), (50.0, 10.0));
+    // On another body degrees still name a place; the Earth's grids don't.
+    s.run("map.body", &json!({"name": "Mars"})).unwrap();
+    s.run("map.goToXY", &json!({"position": "18.4, 77.5"})).unwrap();
+    assert_eq!(at(&s), (18.4, 77.5));
+    assert!(refused(&mut s, json!({"position": "18TWL8395907350"})).contains("Earth's grids"));
+}

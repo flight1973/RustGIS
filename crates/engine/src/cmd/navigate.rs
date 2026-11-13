@@ -42,7 +42,7 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"extent": [minLon, minLat, maxLon, maxLat]}"#),
         C::new("map.goToXY", "By Coordinates…", "Home › Navigate › Locate", go_to_xy).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
-            .params(r#"{"lon" | "x": number, "lat" | "y": number, "scale"?: number, "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85)}"#),
+            .params(r#"{"lon" | "x": number, "lat" | "y": number | "position": text as the search box reads it (40.7128, -74.006; 40°42'46"N 74°0'21"W; 18north 583959 4507351; 18TWL8395907350), "scale"?: number, "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85)}"#),
         C::new("map.goToLink", "Go To Map Link", "Home › Navigate", go_to_link).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"url": a map link ending in #zoom/lat/lon[/bearing[/pitch]] (as MapLibre writes them; also #map=…), or just zoom/lat/lon[/bearing[/pitch]]}"#),
@@ -329,9 +329,58 @@ fn zoom(s: &mut Session, factor: f64) -> CmdResult {
     Ok(Value::Null)
 }
 
+/// The most characters of a typed position read; no form the search box reads is longer.
+const MAX_POSITION: usize = 200;
+
+/// A place typed as the search box reads one: latitude and longitude in decimal degrees, degrees
+/// and minutes or degrees, minutes and seconds (`40.7128, -74.006`, `40°42'46"N 74°0'21"W`), or
+/// on the Earth's map a UTM position or an MGRS reference (`18north 583959 4507351`,
+/// `18TWL8395907350`, the center of the square it names). A reference that names no place says
+/// why, as the search box does.
+pub(crate) fn read_position(map: &Map, text: &str) -> Result<Coord, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("the position is empty".into());
+    }
+    if text.chars().count() > MAX_POSITION {
+        return Err(format!("the position is longer than {MAX_POSITION} characters"));
+    }
+    if let Some(c) = super::search::parse_lat_lon(text) {
+        return Ok(c);
+    }
+    let usage = "write a position as latitude and longitude (40.7128, -74.006 or 40°42'46\"N 74°0'21\"W), UTM (18north 583959 4507351) or MGRS (18TWL8395907350)";
+    if !map.body().is_earth() {
+        return Err(
+            "write a position as latitude and longitude (40.7128, -74.006 or 40°42'46\"N 74°0'21\"W); UTM and MGRS are the Earth's grids"
+                .into(),
+        );
+    }
+    match super::search::read_grid_reference(text) {
+        Ok(c) => Ok(c),
+        Err(rustgis_geom::GridError::Syntax) => Err(usage.into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
-    let lon = f(p, "lon").or_else(|| f(p, "x")).ok_or("lon is required")?;
-    let lat = f(p, "lat").or_else(|| f(p, "y")).ok_or("lat is required")?;
+    let position = match p.get("position") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(_) => return Err("position must be text, such as \"40.7128, -74.006\" or \"18TWL8395907350\"".into()),
+    };
+    let given = |k: &str| !matches!(p.get(k), None | Some(Value::Null));
+    let (lon, lat) = if let Some(text) = position {
+        if ["lon", "lat", "x", "y"].iter().any(|k| given(k)) {
+            return Err("give a position or lon and lat, not both".into());
+        }
+        let c = read_position(s.map(), text)?;
+        (c.x, c.y)
+    } else {
+        (
+            f(p, "lon").or_else(|| f(p, "x")).ok_or("lon is required (or a position)")?,
+            f(p, "lat").or_else(|| f(p, "y")).ok_or("lat is required (or a position)")?,
+        )
+    };
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
         return Err("longitude must be within ±180 and latitude within ±90".into());
     }

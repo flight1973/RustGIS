@@ -154,9 +154,9 @@ impl Dialogs {
                 self.a = if is_code { self.text.trim_start_matches(|c: char| !c.is_ascii_digit()).to_string() } else { String::new() };
             }
             "goToXY" => {
+                // The map's center as the search box writes a place: `lat, lon`.
                 let c = s.map().center_lonlat();
-                self.a = format!("{:.4}", c.x);
-                self.b = format!("{:.4}", c.y);
+                self.a = rustgis_engine::cmd::search::format_lat_lon((c.y * 1e4).round() / 1e4, (c.x * 1e4).round() / 1e4);
             }
             "bookmark" => self.text = rustgis_engine::cmd::navigate::new_bookmark_name(s.map()),
             "camera" => {
@@ -327,18 +327,20 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "selectByAttributes" => close = select_by_attributes(app, ui, &t),
             "goToXY" => {
                 egui::Grid::new("xy").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-                    let input_label = ui.label(tl!("Longitude (X)"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).desired_width(200.0)).labelled_by(input_label.id);
-                    ui.end_row();
-                    let input_label = ui.label(tl!("Latitude (Y)"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.b).desired_width(200.0)).labelled_by(input_label.id);
+                    let input_label = ui.label(tl!("Position"));
+                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).desired_width(300.0)).labelled_by(input_label.id);
                     ui.end_row();
                     let input_label = ui.label(tl!("Scale 1:"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("keep current")).desired_width(200.0)).labelled_by(input_label.id);
+                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("keep current")).desired_width(300.0)).labelled_by(input_label.id);
                     ui.end_row();
                 });
+                // Below the boxes, wrapped to the dialog's width rather than widening it.
+                ui.label(
+                    egui::RichText::new(tl!("Latitude and longitude, or a UTM or MGRS reference: 40.7128, -74.006 · 40°42′46″N 74°0′21″W · 18north 583959 4507351 · 18TWL8395907350"))
+                        .weak(),
+                );
                 close = buttons(app, ui, "Go", |app| {
-                    let mut p = json!({"lon": app.dialogs.a.trim(), "lat": app.dialogs.b.trim()});
+                    let mut p = json!({"position": app.dialogs.a.trim()});
                     if let Ok(s) = app.dialogs.c.trim().replace(',', "").parse::<f64>() {
                         p["scale"] = json!(s);
                     }

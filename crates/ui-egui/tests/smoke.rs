@@ -4426,3 +4426,29 @@ fn zonal_statistics_shows_available_band_range() {
     assert!(h.query_by_label("Band must be a positive integer, list of bands, or 'all'.").is_some());
     assert!(h.get_by_label("Calculate Statistics").accesskit_node().is_disabled());
 }
+
+/// By Coordinates… opens on the map's center as `lat, lon`, and Go reads its one box as the
+/// search box does: MGRS here; a reference that names no place keeps the dialog open with the
+/// reason.
+#[test]
+fn by_coordinates_reads_one_position_box() {
+    let mut h = harness();
+    h.state_mut().run("map.goToXY", json!({"lon": 10, "lat": 50})).unwrap();
+    h.state_mut().run("ui.dialog", json!({"name": "goToXY"})).unwrap();
+    h.step();
+    assert_eq!(h.state().dialogs.open, Some("goToXY"));
+    assert_eq!(h.state().dialogs.a, "50, 10");
+    h.state_mut().dialogs.a = "33UZZ1234512345".into();
+    h.step();
+    h.get_by_label("Go").click();
+    h.step();
+    assert_eq!(h.state().dialogs.open, Some("goToXY"));
+    assert!(h.state().dialogs.error.as_deref().is_some_and(|e| e.contains("100 km square")), "{:?}", h.state().dialogs.error);
+    h.state_mut().dialogs.a = "18TWL8395907350".into();
+    h.step();
+    h.get_by_label("Go").click();
+    h.step();
+    assert_eq!(h.state().dialogs.open, None);
+    let c = h.state().session.map().center_lonlat();
+    assert!((c.y - 40.7128).abs() < 1e-3 && (c.x + 74.006).abs() < 1e-3, "{c:?}");
+}
