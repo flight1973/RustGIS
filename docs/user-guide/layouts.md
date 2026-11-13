@@ -113,8 +113,8 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   - **The locator** (at the frame's top left unless the data is there): `"locator": "globe"` (a
     sheet's default) adds a separate globe map with simplified copies of the map's visible polygon
     layers held in the project. Streamed layers, rasters, points, lines and labels are left out.
-    A vertex past a pole (bad data) that simplifying takes to the pole, or a polygon left
-    unsimplified (a missing coordinate), is said in the layout's warnings.
+    What simplifying changes or leaves alone there (a vertex past a pole taken to the pole, a
+    polygon left as it was or too intricate to simplify whole) is said in the layout's warnings.
     It uses the map's basemap, not its web tiles, in a round frame, the globe
     nearly filling it and the area outlined in red; `"inset"` shows the surrounding region (about
     four times the area across) on the map itself, outlined the same way; `"none"` (a figure's

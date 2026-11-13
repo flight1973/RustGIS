@@ -1915,8 +1915,14 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                         notes.set(all);
                         simple
                     }
-                    // The polygon as it was: nothing Simplify did is kept.
-                    _ => g.clone(),
+                    // The polygon as it was: nothing Simplify did is kept, but one it left as it was
+                    // (a missing coordinate) is still said.
+                    _ => {
+                        let mut all = notes.get();
+                        all.add(&rustgis_analysis::SimplifyNotes { broken: said.broken, ..Default::default() });
+                        notes.set(all);
+                        g.clone()
+                    }
                 }
             };
             m.layers = src
