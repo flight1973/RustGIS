@@ -13,6 +13,7 @@ pub mod geolibre;
 mod geometry_kinds;
 pub mod globe;
 pub mod graphics;
+pub mod graticule;
 pub mod label_by;
 pub mod layout;
 pub mod lod;
@@ -24,6 +25,7 @@ pub mod projection;
 pub mod qgis;
 pub mod raster;
 pub mod report;
+pub mod shadow;
 pub mod slots;
 pub mod source;
 pub use slots::{LayerRole, Slot, SlotAt, SlotPos, TileRole};
@@ -139,6 +141,16 @@ pub struct HiddenFills {
     /// earlier RustGIS): it holds only what was hidden since, not what the first No Fill hid.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub partial: bool,
+}
+
+/// What a whole read of a layer's source ([`Layer::load_all_counted`]) couldn't read.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Unreadable {
+    /// Rows left out.
+    pub rows: usize,
+    /// What it says of values in date fields that weren't dates, read as null
+    /// ([`rustgis_data::source::unread_dates_note`]).
+    pub dates: Option<String>,
 }
 
 /// A layer: a dataset drawn with a renderer and labels.
@@ -576,6 +588,16 @@ impl Layer {
         {
             self.dataset.fields = info.fields.clone();
         }
+        if let Some(info) = self.source.as_ref().and_then(|s| s.info()) {
+            let mut fields = self.dataset.fields.clone();
+            if let Err(error) = self.date_fields_from_source(&mut fields, &info.fields, info.format) {
+                if let Some(source) = &mut self.source {
+                    source.error = Some(error);
+                }
+                return false;
+            }
+            self.dataset.fields = fields;
+        }
         // An opened source's dropped Z or M values, for a project saved without the mark. Added to,
         // not replaced: a source that couldn't tell (a check that timed out) mustn't clear a mark the
         // project kept, and a stale one gives one notice too many rather than one too few.
@@ -589,7 +611,10 @@ impl Layer {
         // A failed read leaves nothing drawn for it (its error shows in Layers), not the
         // previous view's features.
         match src.poll(block) {
-            source::Polled::Done(_, batch) => self.install(batch.features),
+            source::Polled::Done(_, batch) => {
+                src.saw_unread_dates(&batch.unread_dates);
+                self.install(batch.features)
+            }
             source::Polled::Failed(_) => self.install(Vec::new()),
             source::Polled::Idle | source::Polled::Waiting => {}
         }
@@ -597,7 +622,10 @@ impl Layer {
         if let Some(e) = src.wanted(view) {
             src.start(e, block);
             match src.poll(block) {
-                source::Polled::Done(_, batch) => self.install(batch.features),
+                source::Polled::Done(_, batch) => {
+                    src.saw_unread_dates(&batch.unread_dates);
+                    self.install(batch.features)
+                }
                 source::Polled::Failed(_) => self.install(Vec::new()),
                 // A thread that couldn't start leaves an error and no read.
                 source::Polled::Idle if src.error.is_some() => self.install(Vec::new()),
@@ -676,9 +704,85 @@ impl Layer {
         self.load_all_counted().map(|(ds, _)| ds)
     }
 
-    /// [`Layer::load_all`], with the number of rows of the source that couldn't be read.
-    pub fn load_all_counted(&self) -> Result<(Dataset, usize), String> {
-        let Some(copy) = self.open_source()? else { return Ok((self.dataset.clone(), 0)) };
+    /// Reconciles source dates with a saved schema before installing any source values.
+    /// Old GeoParquet epoch-integer schemas require re-adding the source: changing the type
+    /// alone cannot preserve saved queries, class keys and calculation rules. Newly exposed
+    /// Parquet columns also require matching positions. Other providers retain name matching.
+    /// Text date fields upgrade only when their saved filters and expressions still read.
+    fn date_fields_from_source(
+        &self,
+        fields: &mut [rustgis_data::Field],
+        source: &[rustgis_data::Field],
+        format: &str,
+    ) -> Result<(), String> {
+        // Old Parquet readers exposed epoch integers. Their stored queries, class keys and
+        // calculation rules cannot be migrated by changing a field type alone.
+        if format == "GeoParquet"
+            && fields.iter().zip(source).any(|(saved, fresh)| {
+                saved.ty == rustgis_data::FieldType::Integer && (fresh.ty.is_temporal() || fresh.ty == rustgis_data::FieldType::Text)
+            })
+        {
+            return Err("This saved GeoParquet layer lists dates or times as epoch integers. Add the data source again to use its native date schema; saved fields and settings were kept unchanged.".into());
+        }
+        if format == "GeoParquet"
+            && source.iter().any(|f| f.ty.is_temporal())
+            && (fields.len() != source.len() || fields.iter().zip(source).any(|(saved, fresh)| saved.name != fresh.name))
+        {
+            return Err(
+                "The source's columns don't match this saved layer's fields. Add the data source again to use its current schema.".into()
+            );
+        }
+        let filters: Vec<&str> = self
+            .definition_query
+            .iter()
+            .map(String::as_str)
+            .chain(self.display_filters.iter().map(|f| f.where_.as_str()))
+            .chain(self.design.rules.iter().map(|r| r.expression.as_str()))
+            .chain(
+                std::iter::once(&self.labels.default)
+                    .chain(&self.labels.classes)
+                    .flat_map(|c| c.where_.as_deref().into_iter().chain(c.by.text.as_deref())),
+            )
+            .collect();
+        for k in 0..fields.len() {
+            let Some(f) = fields.get(k) else { continue };
+            let source_field = if format == "GeoParquet" {
+                source.get(k)
+            } else {
+                // Other formats keep their existing name-based date upgrade behavior.
+                source.iter().find(|s| s.name == f.name)
+            };
+            let Some(ty) = source_field.filter(|s| s.ty.is_temporal()).map(|s| s.ty) else { continue };
+            if f.ty != rustgis_data::FieldType::Text {
+                continue;
+            }
+            let before = rustgis_data::Dataset::new("", self.dataset.geometry_type, fields.to_vec());
+            // A calculation rule the expression language doesn't read is the earlier calculator's
+            // (`issued + 1`), which only the engine parses: one that names the field keeps it text.
+            let name = f.name.to_lowercase();
+            let calculates = self.design.rules.iter().any(|r| {
+                r.kind == design::RuleKind::Calculation
+                    && rustgis_data::query::parse_fields(&r.expression, &before).is_err()
+                    // Anywhere in the text: the earlier calculator reads names with spaces
+                    // (`Date issued + 1`), and matching too much only keeps the field text.
+                    && r.expression.to_lowercase().contains(&name)
+            });
+            let mut after = before.clone();
+            if let Some(f) = after.fields.get_mut(k) {
+                f.ty = ty;
+            }
+            let reads =
+                |q: &str| rustgis_data::query::parse_fields(q, &before).is_err() || rustgis_data::query::parse_fields(q, &after).is_ok();
+            if !calculates && filters.iter().all(|q| reads(q)) {
+                fields.clone_from_slice(&after.fields);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Layer::load_all`], with what of the source couldn't be read.
+    pub fn load_all_counted(&self) -> Result<(Dataset, Unreadable), String> {
+        let Some(copy) = self.open_source()? else { return Ok((self.dataset.clone(), Unreadable::default())) };
         let (mut ds, report) = copy.read_all()?;
         ds.name = self.dataset.name.clone();
         ds.zm_dropped |= self.dataset.zm_dropped;
@@ -692,9 +796,12 @@ impl Layer {
         // (A project that lists no fields keeps the source's, as `sync_source` gives it.)
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
+            if let Some(info) = copy.info() {
+                self.date_fields_from_source(&mut ds.fields, &info.fields, info.format)?;
+            }
         }
         ds.source = self.dataset.source.clone();
-        Ok((ds, report.skipped))
+        Ok((ds, Unreadable { rows: report.skipped, dates: report.unread_dates }))
     }
 
     /// A streamed layer's source, to export whole a chunk at a time, with a dataset of no
@@ -718,6 +825,7 @@ impl Layer {
         ds.zm_dropped = info.zm_dropped || self.dataset.zm_dropped;
         if !self.dataset.fields.is_empty() {
             ds.fields = self.dataset.fields.clone();
+            self.date_fields_from_source(&mut ds.fields, &info.fields, info.format)?;
         }
         // (A source declaring no geometry type takes its first geometry's when exported, as a
         // whole read does.)
@@ -1340,6 +1448,13 @@ pub struct Map {
     pub bookmarks: Vec<Bookmark>,
     #[serde(default = "yes")]
     pub graticule: bool,
+    /// What the graticule draws: latitudes and longitudes, a measured grid or the UTM zones.
+    #[serde(default, skip_serializing_if = "graticule::GraticuleType::is_degrees")]
+    pub graticule_type: graticule::GraticuleType,
+    /// A measured graticule's coordinate system (`EPSG:2056`, WKT or a PROJ string): none is the
+    /// map's own when it is projected, else the UTM zone (WGS 84) at the view's centre.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graticule_crs: Option<String>,
     /// Flat map or 3D globe.
     #[serde(default)]
     pub projection: Projection,
@@ -1477,6 +1592,8 @@ impl Map {
             camera: Camera::world(),
             bookmarks: Vec::new(),
             graticule: true,
+            graticule_type: graticule::GraticuleType::Degrees,
+            graticule_crs: None,
             projection: Projection::WebMercator,
             popup_mode: PopupMode::Topmost,
             label_display: LabelDisplay::default(),
@@ -2655,22 +2772,29 @@ impl Map {
         self.camera.clamp();
     }
 
-    /// Points the flat map at a longitude/latitude extent with a margin.
-    pub fn fit_lonlat(&mut self, e: &Extent, w: f64, h: f64) {
+    /// Points the flat map at a longitude/latitude extent with a margin. Whether it did: not for
+    /// an empty extent or view, nor one the map's projection doesn't reach (the view unmoved).
+    pub fn fit_lonlat(&mut self, e: &Extent, w: f64, h: f64) -> bool {
+        if e.is_empty() || w <= 1.0 || h <= 1.0 {
+            return false;
+        }
         let flat = self.flat();
         if let projection::Flat::Mercator = flat {
+            // Web Mercator fits any extent clamped to its 85°: one wholly past them would be a
+            // strip along the edge, so isn't fitted.
+            if e.min_y >= rustgis_geom::MAX_LAT || e.max_y <= -rustgis_geom::MAX_LAT {
+                return false;
+            }
             self.camera.fit_lonlat(e, w, h);
-            return;
-        }
-        if e.is_empty() || w <= 1.0 || h <= 1.0 {
-            return;
+            return true;
         }
         let min_pad = if e.width() > 0.0 || e.height() > 0.0 { 1e-6 } else { 0.02 };
         let m = flat.extent(&e.padded(0.06, min_pad));
         if m.is_empty() {
-            return;
+            return false;
         }
         self.camera.fit_extent(&m, w, h);
+        true
     }
 
     /// Switches projection, keeping the centre and the ground scale.
@@ -2851,6 +2975,8 @@ impl Map {
             camera: _,
             bookmarks: _,
             graticule: _,
+            graticule_type: _,
+            graticule_crs: _,
             projection: _,
             popup_mode: _,
             label_display: _,
@@ -3062,6 +3188,134 @@ mod tests {
     use super::*;
     use rustgis_data::{Field, FieldType, Value};
     use rustgis_geom::lonlat_to_merc;
+
+    /// A text field an old project lists for a source's date column becomes a date field, unless
+    /// a filter reads it as text and wouldn't as dates: then it stays text and the filter works.
+    #[test]
+    fn source_dates_upgrade_text_fields_a_filter_still_reads() {
+        let fields = vec![Field::new("issued", FieldType::Text)];
+        let source = [Field::new("issued", FieldType::Date)];
+        let mut layer = Layer::new(1, Dataset::new("permits", rustgis_data::GeometryType::Point, fields.clone()));
+        for (query, ty) in
+            [(None, FieldType::Date), (Some("issued >= '2026-01-01'"), FieldType::Date), (Some("issued >= 2026"), FieldType::Text)]
+        {
+            layer.definition_query = query.map(String::from);
+            let mut got = fields.clone();
+            layer.date_fields_from_source(&mut got, &source, "GeoParquet").unwrap();
+            assert_eq!(got[0].ty, ty, "{query:?}");
+        }
+        // Kept as text, the field holds the dates the source reads, and the filter keeps the rows
+        // it kept when they were text.
+        let rows = |values: [Value; 2]| {
+            let mut ds = Dataset::new("permits", GeometryType::None, fields.clone());
+            for v in values {
+                ds.push(None, vec![v]);
+            }
+            let q = rustgis_data::query::parse("issued >= 2026", &ds).unwrap();
+            (0..2).map(|r| rustgis_data::query::eval(&q, &ds, r)).collect::<Vec<bool>>()
+        };
+        let day = |d: &str| Value::parse(d, FieldType::Date);
+        let text = |d: &str| Value::Text(d.into());
+        assert_eq!(rows([day("2026-03-05"), day("2025-12-31")]), rows([text("2026-03-05"), text("2025-12-31")]));
+        // An attribute rule is kept reading too.
+        layer.definition_query = None;
+        for (kind, expression) in [(design::RuleKind::Constraint, "issued >= 2026"), (design::RuleKind::Calculation, "Issued + 1 days")] {
+            layer.design.rules =
+                vec![design::AttributeRule { name: "Recent".into(), kind, field: String::new(), expression: expression.into() }];
+            let mut got = fields.clone();
+            layer.date_fields_from_source(&mut got, &source, "GeoParquet").unwrap();
+            assert_eq!(got[0].ty, FieldType::Text, "{expression}");
+        }
+        // And a label class's clause.
+        layer.design.rules.clear();
+        let mut class = layer.labels.default.clone();
+        class.where_ = Some("issued >= 2026".into());
+        layer.labels.classes.push(class);
+        let mut got = fields.clone();
+        layer.date_fields_from_source(&mut got, &source, "GeoParquet").unwrap();
+        assert_eq!(got[0].ty, FieldType::Text);
+        // Old epoch schemas need explicit reconciliation: even a filter valid for two
+        // proposed dates cannot account for saved class keys or legacy calculation rules.
+        let old = vec![Field::new("starts_on", FieldType::Integer), Field::new("ends_on", FieldType::Integer)];
+        let source = [Field::new("starts_on", FieldType::Date), Field::new("ends_on", FieldType::Date)];
+        let mut legacy = Layer::new(2, Dataset::new("old epochs", GeometryType::Point, old.clone()));
+        legacy.definition_query = Some("starts_on <= ends_on".into());
+        legacy.dataset.push(None, vec![Value::Int(20000), Value::Int(20001)]);
+        legacy.renderer =
+            Renderer::unique(&legacy.dataset, &[], "starts_on", Ramp::Ember, Symbol::default_for(GeometryType::Point, 0)).unwrap();
+        for query in [None, Some("starts_on <= ends_on")] {
+            legacy.definition_query = query.map(String::from);
+            let mut kept = old.clone();
+            let error = legacy.date_fields_from_source(&mut kept, &source, "GeoParquet").unwrap_err();
+            assert!(error.contains("Add the data source again"));
+            assert_eq!(kept, old);
+            assert_eq!(legacy.renderer.field(), Some("starts_on"));
+        }
+        // Current native-date schemas need no migration, including date-to-date comparisons.
+        let mut current = source.to_vec();
+        legacy.date_fields_from_source(&mut current, &source, "GeoParquet").unwrap();
+        assert!(rustgis_data::query::parse_fields("starts_on <= ends_on", &Dataset::new("", GeometryType::Point, current)).is_ok());
+    }
+
+    /// Previously omitted INT96 fields can now be present between saved columns, or after them.
+    /// Refusal keeps the saved schema intact and prevents shifted or silently omitted values.
+    #[test]
+    fn newly_read_date_columns_refuse_stale_saved_field_positions() {
+        let fields = vec![Field::new("name", FieldType::Text), Field::new("population", FieldType::Integer)];
+        let layer = Layer::new(1, Dataset::new("old", GeometryType::Point, fields.clone()));
+        for source in [
+            vec![fields[0].clone(), Field::new("legacy_time", FieldType::DateTime), fields[1].clone()],
+            vec![fields[0].clone(), fields[1].clone(), Field::new("legacy_time", FieldType::DateTime)],
+            vec![Field::new("name", FieldType::DateTime), fields[0].clone(), fields[1].clone()],
+        ] {
+            let mut saved = fields.clone();
+            let error = layer.date_fields_from_source(&mut saved, &source, "GeoParquet").unwrap_err();
+            assert!(error.contains("Add the data source again"));
+            assert_eq!(saved, fields);
+            let mut fresh = source.clone();
+            layer.date_fields_from_source(&mut fresh, &source, "GeoParquet").unwrap();
+            assert_eq!(fresh, source);
+        }
+    }
+
+    #[test]
+    fn time_only_text_refuses_a_saved_epoch_integer_schema() {
+        let old = vec![Field::new("clock", FieldType::Integer)];
+        let source = vec![Field::new("clock", FieldType::Text)];
+        let layer = Layer::new(1, Dataset::new("old times", GeometryType::Point, old.clone()));
+        let mut fields = old.clone();
+        assert!(layer.date_fields_from_source(&mut fields, &source, "GeoParquet").unwrap_err().contains("Add the data source again"));
+        assert_eq!(fields, old);
+        // Inferred text in other formats can come from empty or mixed columns; this change
+        // does not reinterpret those saved schemas as a Parquet clock migration.
+        for format in ["CSV", "GeoJSON"] {
+            let mut inferred = old.clone();
+            layer.date_fields_from_source(&mut inferred, &source, format).unwrap();
+            assert_eq!(inferred, old);
+        }
+        let mut fresh = source.clone();
+        layer.date_fields_from_source(&mut fresh, &source, "GeoParquet").unwrap();
+        assert_eq!(fresh, source);
+    }
+
+    /// Parquet's newly exposed columns need positional validation; other providers retain
+    /// their name-based date upgrades when an unrelated source column is added or removed.
+    #[test]
+    fn non_parquet_date_upgrades_keep_name_matching_for_changed_schemas() {
+        let old = vec![Field::new("issued", FieldType::Text), Field::new("name", FieldType::Text)];
+        let layer = Layer::new(1, Dataset::new("permits", GeometryType::Point, old.clone()));
+        for source in [
+            vec![Field::new("extra", FieldType::Integer), Field::new("issued", FieldType::Date), old[1].clone()],
+            vec![Field::new("issued", FieldType::Date)],
+        ] {
+            for format in ["GeoPackage", "Shapefile", "CSV"] {
+                let mut fields = old.clone();
+                layer.date_fields_from_source(&mut fields, &source, format).unwrap();
+                assert_eq!(fields[0].ty, FieldType::Date);
+                assert_eq!(fields[1], old[1]);
+            }
+        }
+    }
 
     fn points() -> Dataset {
         let mut d = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
@@ -3914,5 +4168,19 @@ mod tests {
         l.min_scale = None;
         l.dataset.features.clear();
         assert_eq!(labels(l, 1e6), None);
+    }
+
+    /// A Web Mercator map fits an extent reaching past its 85°, clamped, but not one wholly past
+    /// them (the view unmoved).
+    #[test]
+    fn web_mercator_doesnt_fit_an_extent_wholly_past_its_latitudes() {
+        let mut m = Map::new("m");
+        let view = m.camera;
+        assert!(!m.fit_lonlat(&Extent::new(-10.0, 86.0, 10.0, 89.0), 800.0, 600.0));
+        assert!(!m.fit_lonlat(&Extent::new(-10.0, -89.0, 10.0, -86.0), 800.0, 600.0));
+        assert_eq!(m.camera.center, view.center);
+        assert_eq!(m.camera.res, view.res);
+        assert!(m.fit_lonlat(&Extent::new(-10.0, 80.0, 10.0, 89.0), 800.0, 600.0));
+        assert_ne!(m.camera.center, view.center);
     }
 }

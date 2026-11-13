@@ -90,6 +90,33 @@ refused because the XLS reader cannot handle that reference safely.
 **Home › Add › Add Data › Graphics Layer** adds a layer for [drawn graphics](cartography.md#graphics),
 and **Data › Layer Templates** adds empty layers with ready-made schemas to draw into.
 
+Dates and date-times remain typed when reading Shapefile, GeoPackage, GeoParquet, local
+FlatGeobuf, FileGDB, workbook date cells and GPX timestamps. Ordinary spreadsheet text that
+looks like a date stays text. A workbook column mixing date cells with ordinary text is read
+entirely as text; clean that column in the workbook before using date operations.
+Invalid dates become empty values with a notice naming the fields
+and counting the values; dates cover years 1–9999. Fractional seconds are kept to microseconds.
+Floating-point serial dates in workbooks and FileGDB are rounded to the nearest microsecond,
+with a notice when rounding is needed. Parquet timestamps with finer nonzero precision are
+read as empty with a notice. Times without a day stay text; Parquet clocks retain `Z` when declared UTC.
+
+GeoParquet exports use native dates and microsecond timestamps. Zoned date-times are written
+as UTC instants, with a notice when their displayed offsets change; unzoned times stay unzoned.
+A column mixing zoned and unzoned times is written as ISO text, with a notice, to preserve both.
+The writer makes a cancellable pass over timestamp columns before writing to choose that policy;
+a streamed export reads its source twice.
+If newly available date columns no longer match a saved layer's field positions (for example,
+a formerly unsupported INT96 column), reading or exporting that layer is refused. Add the file
+again to use its current schema; the saved fields are kept unchanged. Saved GeoParquet layers that still list dates as epoch integers are also refused: add the source
+again. Their saved fields, filters and styles are kept unchanged rather than partially migrated. An old integer field that
+now reads as time-only text is refused in the same way.
+FlatGeobuf exports use its native DateTime column type for both dates and date-times. Local
+files are scanned to distinguish date-only columns, date-times and time-only text. Reopening
+a saved desktop layer runs that scan off the window thread, with progress and Cancel in the
+status bar. Remote
+FlatGeobuf date/time columns stay ISO text with a notice so opening them can keep reading by
+range without downloading every feature.
+
 Vector geometry is stored as WGS 84 longitude/latitude. Data in another supported coordinate
 system is converted as it is read; Shapefiles use their `.prj`, and formats such as GeoPackage,
 GeoParquet and FlatGeobuf carry their coordinate system in the file. Rasters keep their own
@@ -102,15 +129,35 @@ and S-JTSK, the same built-in Helmert datum transformation as the EPSG definitio
 or other WKT:
 
 - A transformation in the file (a `TOWGS84`, or a WKT2 `BOUNDCRS`'s) takes precedence, also over
-  the built-in one of an EPSG code in the WKT, as in PROJ and GDAL. A system RustGIS can read
-  only by that code keeps the code's transformation, with a notice. Web Mercator is on WGS 84, so
-  a transformation its file gives is set aside, with a notice.
+  the built-in one of an EPSG code in the WKT, as in PROJ and GDAL. It also takes precedence over
+  the EPSG code given beside the WKT in a GeoPackage system, a FlatGeobuf header or a File
+  Geodatabase. A system
+  RustGIS can read only by that code keeps the code's transformation, with a notice. Web Mercator
+  is on WGS 84, so a transformation its file gives is set aside, with a notice.
 - A `BOUNDCRS` whose transformation goes to another datum than WGS 84 continues with that
   datum's own transformation to WGS 84: the one the file gives it, else none for a datum treated
   as WGS 84 (such as RDN2008, IGM95 or NAD 83), else the built-in one. It is refused when there is
   none of these, when the target gives a zero transformation where its datum has another (a
   writer's placeholder, as for ED50 or NAD 27), or when combining the two transformations'
-  rotations could be off by a centimetre.
+  rotations could be off by a centimetre. When it is refused beside the EPSG code of a GeoPackage
+  system, a FlatGeobuf header or a File Geodatabase, the code is used instead, with a notice.
+- A grid transformation (NTv2 or NADCON, a `BOUNDCRS`'s, or GDAL's WKT1 `PROJ4_GRIDS` or
+  `+nadgrids` in its `PROJ4` extension), or another without Helmert translations, isn't applied:
+  the system is read without it, with a notice naming it and its grid file, as positions may be
+  off by as much as that shift. A system read by an EPSG or Esri code that has its own shift to
+  WGS 84 uses that shift instead, and the notice says so. A `BOUNDCRS` without a transformation, which
+  PROJ refuses, is read as its source system, with a notice unless the source is on WGS 84. A
+  ballpark offset is no known shift (the datum's own notice says so), and a null offset is none.
+- The notices come with WKT read from a Shapefile's or ASCII grid's `.prj`, a GeoPackage's,
+  FlatGeobuf's or FileGDB's system, a LAS file or a Zarr store. WKT given as a command's `crs`,
+  and a GeoPackage or FlatGeobuf system read by its EPSG code, say of these only the two above: a transformation that isn't
+  applied, and a `BOUNDCRS` without one (typed WKT also says its projection method's formula, as
+  below). A Zarr store's `crs` says them only when the slice uses it: a store that gives its own
+  system, or a longitude/latitude grid, doesn't. A PostGIS, MySQL or SQL Server layer's `crs` is
+  read only for a geometry with no SRID of its own, by its EPSG code, with the same two notices; a
+  geometry that has an SRID ignores it, so nothing is said of it. A DuckDB query's `crs` isn't
+  read by RustGIS: it goes to DuckDB, which transforms the geometry from it even when the
+  geometry's type gives a system, so none of these notices come with it.
 - A UTM name (`WGS_1984_UTM_Zone_31N`) gives its EPSG code only when the parameters are that
   zone's.
 - Transverse Mercator (South Orientated), the method GDAL and Esri write South Africa's Lo grids
@@ -132,7 +179,15 @@ produces a notice when no transformation is available. Swiss oblique Mercator, t
 Krovak East/North variant, the oblique Mercator in its azimuth forms (the two-point form, with
 no azimuth, is refused), and the Cassini-Soldner, polyconic and Equal Earth methods are
 supported from their parameters, as are sinusoidal (MODIS), Robinson, orthographic and Mercator
-(variant A), in `.prj` files and in GeoTIFF keys. Esri's orthographic is a spherical projection:
+(variant A), in `.prj` files and in GeoTIFF keys. Natural Earth, Winkel Tripel and Eckert IV are
+read from WKT as GDAL, Esri and PROJ write it, and by their ESRI codes (Natural Earth and Eckert
+IV, on WGS 84 and on a sphere: `ESRI:54077`, `53077`, `54012`, `53012`). They're computed on a
+sphere of the datum's semi-major axis, as PROJ computes them. Winkel Tripel's standard parallel
+is the file's; a definition or WKT without one is at 0, as PROJ and GDAL take a coordinate
+system without one (PROJ's `proj` program, which runs the bare projection, takes Winkel's own
+instead). The map's Winkel Tripel is at Winkel's own, acos(2/π) (about 50.46°), and its
+definition and WKT say so. A parameter that isn't a finite number, or a scale factor other than
+1, is refused rather than left out. Esri's orthographic is a spherical projection:
 on an ellipsoid it is refused, with a notice, rather than computed as EPSG's ellipsoidal one.
 The equidistant cylindrical projection (EPSG:4087, World Equidistant Cylindrical) uses a sphere of its datum's
 semi-major axis, matching legacy PROJ/GDAL coordinates (verified with PROJ 9.7.1), both for data
@@ -365,7 +420,10 @@ changed or disappeared in the file since it was loaded, nothing is saved. A cons
 trigger failure also rolls everything back; pending edits remain in the layer. New features
 get source-assigned keys that cannot alias loaded rows, and unrelated columns and tables remain
 intact. The saved rows are read back within the transaction, so the layer keeps values assigned
-by defaults and triggers before it starts tracking its next edits. If a DELETE trigger recreates
+by defaults and triggers before it starts tracking its next edits. Dates are saved as a
+GeoPackage export writes them: a date-time with another offset than UTC's is saved in UTC, and a
+notice says so. A stored date that isn't one loads as empty, with a notice, and is left as it is
+unless that value is edited. If a DELETE trigger recreates
 a target row, that stored row reappears in the layer and is not counted as deleted. If triggers
 change or remove other rows already loaded in the layer, those rows are refreshed or removed
 before the next edits; rows outside the load are not added.
@@ -542,11 +600,31 @@ addresses a run. An address is matched to the house before its street (`Damrak 1
 the building, not the middle of Damrak). Its places have a point but no extent, so Find Place
 zooms in close around them.
 
+For U.S. street addresses, `"provider": "census"` (**U.S. Census (addresses)**) uses the
+[Census Bureau geocoder](https://geocoding.geo.census.gov/geocoder/Geocoding_Services_API.html),
+with the `Public_AR_Current` benchmark. Give a house number and street plus city/state or ZIP;
+it does not search general place names. Coordinates are calculated along address ranges, rather
+than surveyed building positions. RustGIS sends one single-record request at a time, at most one
+a second, including through a proxy, with up to 10,000 distinct addresses a run; this pacing is a
+RustGIS precaution, not a published Census rate limit. This uses the single-line endpoint, not
+Census's file-upload service. Puerto Rico addresses requiring Urbanization or Municipio are not
+supported by that endpoint. No Census geography attributes are added. Find Place credits the
+U.S. Census Bureau and zooms around the returned point. Direct access works in the desktop app
+and CLI; Census does not support CORS, so the web app requires a CORS-enabled proxy in **Server**
+(`"url"`), exposing the same `/locations/onelineaddress` endpoint.
+
+Find Place shows up to eight candidates; `map.findPlace` honours its `limit` (1–20). When
+the server returns additional candidates, a notice counts those not shown, including candidates
+not inspected past the parser's 20-result safety cap. Supplied `places` answers need no network
+access and can be applied without a proxy in the browser.
+
 An answer's places without a usable position (no coordinate, or one that can't be read) are left
 out, and a notice says how many; an answer with places but none usable counts as a failed
 request, not as "not found". An address longer than the geocoder takes (400 characters for the
 Locatieserver, 500 for the others) isn't sent cut short: its request fails. In the app the requests go out in the background, one at a time, and the layer is added when the
-last answer lands; `layer.geocode` on the command line waits for them.
+last answer lands. The status bar shows progress and **Cancel**; cancelling discards the run
+without adding a layer, even if its current request later finishes. `layer.geocode` on the command
+line waits for the answers.
 
 ```sh
 rustgis-cli run --cmd 'layer.addData={"path":"stores.csv"}' --cmd 'layer.geocode={"table":"stores","address":["street","city","country"]}'
@@ -1132,15 +1210,20 @@ exporting it (`layer.addData`, `share.exportRaster`) give the full size as `over
 and the MCP server see it too. A GeoTIFF read in place that is added before its overview is in
 (the desktop app, the browser) answers `"reading": true`, sized by its header when that is in, and
 with `null` for its size and bands until then.
-`share.exportRaster` writes an untiled GeoTIFF; with `"cog": true` it writes a cloud-optimised one:
-512-pixel tiles compressed with Deflate, overviews (each half the size of the last, down to one
-tile), and every directory ahead of the tiles, so a reader fetches the header once and then only the
-tiles it needs. Overviews are averaged, except for a palette raster or one with a few whole-number
-classes, whose overviews take a pixel so that no class is invented; a palette keeps its colour
-table, though not the table's transparency, which a TIFF colour table can't hold (GDAL drops it
-too). The file is classic TIFF when it would fit in 4 GiB even uncompressed and BigTIFF when it
-might not. Exported to a file it is written tile by tile, never held whole in memory (the browser
-builds it in memory to download it).
+`share.exportRaster` writes an untiled GeoTIFF, in strips of rows, with an 8-bit grey band (a
+hillshade, say) as bytes and another single band as 32-bit floats; with `"cog": true` it writes a
+cloud-optimised one: 512-pixel tiles, overviews (each half the size of the last, down to one tile),
+and every directory ahead of the tiles, so a reader fetches the header once and then only the tiles
+it needs. Both compress with Deflate after a predictor: the floating-point one for decimal values,
+differences along the row for whole numbers, none for classes. Overviews are averaged, except for a
+single band of classes (a palette raster's, a band with class names, or a band written as 8- or
+16-bit whole numbers with a few distinct values), whose overviews take a pixel so that no class is
+invented; colour and grey-with-alpha files are always averaged. A palette keeps its colour table,
+though not the table's transparency, which a TIFF colour table can't hold (GDAL drops it too).
+Either file is classic TIFF when it would fit in 4 GiB even uncompressed and BigTIFF when it might
+not.
+Exported to a file, a cloud-optimised one is written tile by tile, never held whole in memory (the
+browser builds it in memory to download it).
 GeoTIFFs may be regular or cloud-optimised: grey, RGB(A), palette (coloured by the file's colour
 table, as land cover such as the NLCD is) or multiband, of any pixel type, tiled or striped, and
 compressed with Deflate, LZW, PackBits, JPEG or Zstandard. JPEG-compressed YCbCr images are shown
@@ -1172,6 +1255,48 @@ With a raster layer selected in Layers, the **Style** and **Data** tabs show its
 | Style › Rendering | **Symbology**: Stretch, RGB, Classify, Unique Values, Colormap, Shaded Relief; **Stretch Type**: None, Minimum Maximum, Custom Min/Max (your own bounds, one pair per colour channel on an RGB layer), Percent Clip, Standard Deviation, Histogram Equalize; **DRA** (stretch the pixels in view); **Resampling** (nearest or bilinear); **Band Combination** (natural colour, colour infrared, or any bands) |
 | Style › Enhancement | Brightness, contrast, gamma |
 | Data | Raster information (size, bands, statistics, coordinate system) and Export Raster (GeoTIFF) |
+
+**See-through cells** of an image with an alpha band (RGBA, or grey and alpha) are left out of
+its colour bands' statistics. These are the cells the map draws fully see-through: an alpha of no
+value, or one under half a 256th of opaque. That is alpha 0 in an 8-bit image, 128 or less of
+65535 in a 16-bit one, and under about 0.002 of 1 in a Float32 one. Leaving them out changes
+Raster information's counts and ranges, and the stretches taken from them: Minimum Maximum,
+Percent Clip, Standard Deviation, Histogram Equalize, a style mask's, and a cloud-optimised
+GeoTIFF's own. So a value those cells hold, such as −3.4e38 in a Float32 image, doesn't set the
+stretch, and an opaque black cell still counts. The alpha band's own statistics count every
+alpha with a value, see-through ones included.
+**Change Detection** gives no-data where either image is see-through.
+
+**Cast shadows**, on a Shaded Relief layer (`raster.symbology` `"shadow"`, 0 to 1), darkens the
+slopes the terrain hides from the sun as well as those facing away from it: a valley behind a ridge
+is in shadow, with a soft edge. Only the direct light is darkened: a slope in full shadow keeps the
+relief's ambient light. 0, the default, draws the relief as before. The shadows are worked out once
+for the layer's sun, band and Z factor, off the map's frame on the desktop: the map and the Layout
+view draw without them for the moment that takes (under a second for a few million cells on a
+multi-core computer, several seconds on one thread; a sun under about 5° traces much farther, some
+seconds on a multi-core computer and twenty or so on one thread), then with them. An export
+waits for them; what the window draws at once (Copy Map or Copy Layout to the clipboard, printing,
+the presentation and report previews, an agent's snapshot) doesn't, and says the layers it drew
+without them.
+The strength is drawn, not worked out, so changing it is immediate. The browser works them out for
+rasters of at most 500,000 cells, and a cloud-optimised GeoTIFF read in place has none unless its
+whole image is held: either way the layer is drawn without them, and a notice says so. Terrain
+outside the raster casts nothing on it, and a grid spanning 0 to 360° casts nothing across its
+seam.
+
+**Sky visibility**, on a Shaded Relief layer (`raster.symbology` `"sky"`, 0 to 1), dims the
+relief's ambient light where the terrain around a cell hides part of the sky: valley floors, pits
+and the foot of a cliff get less of it than a plain or a ridge, whatever the sun. Each cell's sky is
+the share of the half sphere above its horizon, looked for in 16 directions up to 100 cells away
+(past 32 cells, in steps of a sixteenth of the distance, so a peak narrower than that far away can
+be missed); 1 scales the ambient light by it, 0, the default, draws the relief as before, and the
+direct light (and its cast shadows) is left as it is. It is worked out once for the layer's band,
+Z factor and mask, not for the sun, so moving the sun doesn't work it out again: off the map's
+frame on the desktop, about a second for two million cells on a multi-core computer, nine or so on
+one thread. It is drawn, waited for by
+exports, and said when it can't be drawn (in the browser over 500,000 cells, or a cloud-optimised
+GeoTIFF read in place) as cast shadows are. Terrain outside the raster, or farther than 100 cells,
+hides none of its sky.
 
 **Masking**, at the foot of the Symbology pane (`raster.mask`), hides pixel values from view without
 changing the data: values to draw as no data (a background of 0 or −9999 the file doesn't flag, QA

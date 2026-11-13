@@ -9,6 +9,7 @@ pub mod citygml;
 pub mod cityjson;
 mod citymodel;
 pub mod color;
+pub mod date;
 mod dbf;
 pub mod diagnostics;
 pub mod dirs;
@@ -53,6 +54,7 @@ pub mod wkb;
 pub mod xml;
 pub mod zip;
 
+pub use date::{Date, DateTime};
 pub use geometry::{Geometry, GeometryType, Measure, VertexId, ambiguous_area_message};
 pub use rustgis_geom::{Coord, Extent};
 pub use value::{Field, FieldType, Value};
@@ -382,6 +384,9 @@ pub struct ReadReport {
     /// ([`sync::FileSync::around`]): what a layer kept in the project compares with its source
     /// before writing edits back.
     pub synced: Option<sync::Synced>,
+    /// What a read of a source says of values in date fields that weren't dates
+    /// ([`source::unread_dates_note`]), also in `messages`: for a caller that says only this.
+    pub unread_dates: Option<String>,
 }
 
 /// What a read says when it drops Z or M values (see [`Dataset::zm_dropped`]): from `features` of

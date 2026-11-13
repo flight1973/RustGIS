@@ -4,9 +4,7 @@ mod check_geometry;
 mod geometry;
 mod repair_geometry;
 
-use geo::{
-    BooleanOps, Contains, ConvexHull, CoordsIter, InteriorPoint, Intersects, MultiPolygon, Orient, Relate, Simplify, orient::Direction,
-};
+use geo::{BooleanOps, Contains, ConvexHull, CoordsIter, InteriorPoint, Intersects, MultiPolygon, Orient, Relate, orient::Direction};
 use rustgis_data::raster::{Crs, Transformer};
 use rustgis_data::{Coord, Dataset, Feature, Field, FieldType, Geometry, GeometryType, Value};
 use rustgis_geom::Extent;
@@ -722,7 +720,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "xmin,ymin,xmax,ymax in the coordinate system's units (degrees when it is empty); the input's extent when empty.",
+                help: "xmin,ymin,xmax,ymax in the units of the system the raster is made in (see Coordinate System); the input's extent when empty.",
             },
             P {
                 name: "pixelSize",
@@ -730,7 +728,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Number,
                 required: false,
                 default: "",
-                help: "The output cell size in the coordinate system's units (degrees when it is empty); 300 cells across the extent when empty.",
+                help: "The output cell size in the units of the system the raster is made in (see Coordinate System); 300 cells across the extent when empty.",
             },
             P {
                 name: "crs",
@@ -738,7 +736,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent and pixel size; longitude/latitude in degrees when empty.",
+                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent and pixel size; when empty, the one the layer was read in if projected, else degrees; EPSG:4326 for degrees.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -880,7 +878,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Number,
                 required: false,
                 default: "",
-                help: "Spatial correlation distance in the coordinate system's units, degrees when it is empty (defaults to 1/3 extent diagonal).",
+                help: "Spatial correlation distance in the units of the system the raster is made in (see Coordinate System; defaults to 1/3 extent diagonal).",
             },
             P {
                 name: "extent",
@@ -888,7 +886,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "xmin,ymin,xmax,ymax in the coordinate system's units (degrees when it is empty); the input's extent when empty.",
+                help: "xmin,ymin,xmax,ymax in the units of the system the raster is made in (see Coordinate System); the input's extent when empty.",
             },
             P {
                 name: "pixelSize",
@@ -896,7 +894,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Number,
                 required: false,
                 default: "",
-                help: "The output cell size in the coordinate system's units (degrees when it is empty); up to 250 cells across the extent when empty.",
+                help: "The output cell size in the units of the system the raster is made in (see Coordinate System); up to 250 cells across the extent when empty.",
             },
             P {
                 name: "crs",
@@ -904,7 +902,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent, pixel size and range; longitude/latitude in degrees when empty.",
+                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent, pixel size and range; when empty, the one the layer was read in if projected, else degrees; EPSG:4326 for degrees.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -1278,10 +1276,6 @@ fn out_name(p: &Json, default: String) -> String {
 /// tolerance converted with it reaches no farther on the ground than asked there (#1033).
 fn merc_scale(lat: f64) -> f64 {
     1.0 / lat.clamp(-85.0, 85.0).to_radians().cos().max(0.01)
-}
-
-fn feature_lat(g: &Geometry) -> f64 {
-    g.label_point().map(|c| c.y).unwrap_or(0.0)
 }
 
 /// A distance in `units` (one of [`UNITS`], as `resolve_params` spells it; empty for the default,
@@ -2324,8 +2318,14 @@ fn converted(v: &Value, ty: FieldType) -> Value {
         (Value::Int(_), FieldType::Integer)
         | (Value::Float(_), FieldType::Double)
         | (Value::Text(_), FieldType::Text)
-        | (Value::Bool(_), FieldType::Boolean) => v.clone(),
+        | (Value::Bool(_), FieldType::Boolean)
+        | (Value::Date(_), FieldType::Date)
+        | (Value::DateTime(_), FieldType::DateTime) => v.clone(),
         (Value::Null, _) => Value::Null,
+        // A date-time into a date field is the day it shows, as Calculate Field puts it.
+        (Value::DateTime(t), FieldType::Date) => Value::Date(t.date()),
+        // A date is no number or yes/no: null, and counted, rather than read as one.
+        (Value::Date(_) | Value::DateTime(_), FieldType::Integer | FieldType::Double | FieldType::Boolean) => Value::Null,
         (Value::Int(i), FieldType::Double) => Value::Float(*i as f64),
         // In range, truncated; out of range (or not a number), empty rather than clamped. i64's
         // bounds as f64 are exactly -2⁶³ and 2⁶³.
@@ -2396,19 +2396,44 @@ fn update_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolR
         }
     }
     let kept = out.features.len();
+    // For each input field, how many update values its type couldn't hold, written as null, and
+    // how many date-times a date field kept only the day of.
+    let mut unfit = vec![(0usize, 0usize); ds.fields.len()];
     crate::control::begin(zones.len());
     for (done, z) in zones.iter().enumerate() {
         crate::control::check()?;
         crate::control::reached(done);
         let Some(u) = up.features.get(z.row) else { continue };
-        let attrs =
-            ds.fields.iter().zip(&from).map(|(f, i)| i.and_then(|i| u.attrs.get(i)).map_or(Value::Null, |v| converted(v, f.ty))).collect();
+        let attrs = ds
+            .fields
+            .iter()
+            .zip(&from)
+            .zip(&mut unfit)
+            .map(|((f, i), (n, days))| {
+                let Some(v) = i.and_then(|i| u.attrs.get(i)) else { return Value::Null };
+                let c = converted(v, f.ty);
+                // Empty or `<null>` text asks for null: no loss.
+                *n += usize::from(c.is_null() && !v.asks_null());
+                *days += usize::from(matches!(v, Value::DateTime(t) if f.ty == FieldType::Date && !t.is_date()));
+                c
+            })
+            .collect();
         out.push_next(u.geometry.clone(), attrs);
     }
     let added = out.features.len() - kept;
-    let mut r = result(out, format!("Update: {kept} input features kept, {added} update features added"))?;
-    r.messages.extend(left_out.notes("Update", &up.name));
-    Ok(r)
+    let mut messages = vec![format!("Update: {kept} input features kept, {added} update features added")];
+    messages.extend(left_out.notes("Update", &up.name));
+    let features = |n: usize| if n == 1 { "1 update feature".to_string() } else { format!("{n} update features") };
+    for (f, (n, days)) in ds.fields.iter().zip(unfit) {
+        if n > 0 {
+            messages.push(format!("Update: '{}' is null in {}, whose value isn't a {} value", f.name, features(n), f.ty.label()));
+        }
+        if days > 0 {
+            let their = if days == 1 { "its" } else { "their" };
+            messages.push(format!("Update: '{}' holds dates, so {} kept only {their} day", f.name, features(days)));
+        }
+    }
+    Ok(ToolResult { output: Output::Layer(out), messages })
 }
 
 /// The most split areas (split polygons, or values of the split field) Split takes: more is an
@@ -3076,7 +3101,7 @@ pub(crate) fn try_clone_value(v: &Value) -> Result<Value, TryReserveError> {
             s.push_str(t);
             Value::Text(s)
         }
-        Value::Null | Value::Int(_) | Value::Float(_) | Value::Bool(_) => v.clone(),
+        Value::Null | Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Date(_) | Value::DateTime(_) => v.clone(),
     })
 }
 
@@ -3710,7 +3735,7 @@ fn coordinate(v: &Value) -> Option<f64> {
                 Err(_) => return None,
             }
         }
-        Value::Null | Value::Bool(_) => return None,
+        Value::Null | Value::Bool(_) | Value::Date(_) | Value::DateTime(_) => return None,
     };
     n.is_finite().then_some(n)
 }
@@ -3729,10 +3754,11 @@ pub fn holds_coordinates(ds: &Dataset, field: usize) -> bool {
     }
 }
 
-/// Typed WKT retains its explicit method warning; a code alone follows the compatibility policy.
-fn crs_with_compatibility_note(text: &str) -> Result<(Crs, Option<&'static str>), String> {
+/// Typed WKT retains its explicit method warning, and says a shift it gives that isn't applied; a
+/// code alone follows the compatibility policy.
+fn crs_with_compatibility_note(text: &str) -> Result<(Crs, Option<String>), String> {
     let crs = Crs::parse(text)?;
-    Ok((crs, rustgis_data::raster::wkt::projection_compatibility_note(text, crs)))
+    Ok((crs, rustgis_data::raster::wkt::typed_crs_note(text, crs)))
 }
 
 fn xy_table_to_point(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -3779,10 +3805,162 @@ fn xy_table_to_point(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     Ok(ToolResult { output: Output::Layer(out), messages })
 }
 
+/// The distances a Douglas–Peucker run of `n` vertices may measure, `n` times this: far more than
+/// ordinary lines take (about `n log n`), a bound on a hostile one that would take `n²` (a spiral
+/// whose farthest vertex is always beside a chord's end), as `lod.rs`'s `DP_WORK` bounds the map's.
+const SIMPLIFY_WORK: usize = 256;
+
+/// The analysis plane's scale ([`merc_scale`]) is the sphere's; on the WGS 84 ellipsoid a ground
+/// distance is at most the polar radius of curvature over the sphere's radius longer (about 0.34%:
+/// a meter east–west at the pole, or north–south there). A tolerance taken this much smaller holds
+/// on the ellipsoid too, so no vertex moves farther than asked there either.
+const SPHERE_TO_WGS84: f64 = 6_378_137.0 / 6_399_593.625_8;
+
+/// Douglas–Peucker on a run of vertices in the analysis plane, each vertex's tolerance converted at
+/// its latitude ([`merc_scale`], at most 85°'s), so a feature spanning many latitudes isn't
+/// simplified farther than asked toward the equator (#1033). A vertex's tolerance is taken at the
+/// smallest scale of it and the chord's ends (nearest the equator), so none moves farther on the
+/// ground than asked; of the vertices beyond theirs, the one farthest from the chord on the ground
+/// (its plane distance over that scale) is kept and splits the run. The ends are kept. Worked with
+/// a stack, not recursion, within [`SIMPLIFY_WORK`]: past it, the spans still open keep their
+/// vertices, and `run.capped` is set. Its work counts toward Cancel across the feature (`run`):
+/// once canceled, the spans still open, and every later run, are left as they are. At one scale it
+/// gives what `geo`'s Douglas–Peucker gives, which Simplify used before: a tolerance of 0 or less
+/// leaves the run as it is, and of equally far vertices the last is kept. A run with a coordinate
+/// missing or infinite is left as it is.
+fn simplify_coords(pts: &[geo::Coord<f64>], tol_m: f64, run: &SimplifyRun) -> Vec<geo::Coord<f64>> {
+    simplify_coords_within(pts, tol_m, run, SIMPLIFY_WORK)
+}
+
+/// What the runs of one feature share as Simplify works through its parts and rings: the work done
+/// since Cancel was last looked at ([`crate::control::Pace`]), counted across them all (each
+/// vertex set up, each distance, each ring's anchor scans), so a feature of a million short parts
+/// is looked at as often as one long run; whether it was canceled; and whether a run's work ran out
+/// ([`SIMPLIFY_WORK`]).
+#[derive(Default)]
+struct SimplifyRun {
+    pace: std::cell::Cell<crate::control::Pace>,
+    canceled: std::cell::Cell<bool>,
+    capped: std::cell::Cell<bool>,
+}
+
+impl SimplifyRun {
+    /// Counts `work` more units; whether the feature was canceled, now or before (then nothing more
+    /// of it is simplified).
+    fn stop(&self, work: usize) -> bool {
+        if self.canceled.get() {
+            return true;
+        }
+        let mut pace = self.pace.take();
+        let stop = pace.stop(work);
+        self.pace.set(pace);
+        self.canceled.set(stop);
+        stop
+    }
+}
+
+/// The work units toward Cancel of setting up one vertex (its latitude and scale, a few
+/// transcendentals): it takes some 3 to 8 times one distance.
+const SETUP_WORK: usize = 4;
+
+/// [`simplify_coords`] with `work` distances a vertex allowed rather than [`SIMPLIFY_WORK`].
+fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, run: &SimplifyRun, work: usize) -> Vec<geo::Coord<f64>> {
+    let n = pts.len();
+    // Each vertex set up (its latitude and scale) counts toward Cancel, short runs too.
+    if run.stop(n.saturating_mul(SETUP_WORK))
+        || n <= 2
+        || tol_m.is_nan()
+        || tol_m <= 0.0
+        || pts.iter().any(|c| !c.x.is_finite() || !c.y.is_finite())
+    {
+        return pts.to_vec();
+    }
+    // On the ellipsoid, not the sphere ([`SPHERE_TO_WGS84`]).
+    let tol_m = tol_m * SPHERE_TO_WGS84;
+    // Each vertex's latitude and scale (plane meters per ground meter, [`merc_scale`]), worked out
+    // once.
+    let lat: Vec<f64> = pts.iter().map(|c| rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y)).y).collect();
+    let scale: Vec<f64> = lat.iter().map(|&y| merc_scale(y)).collect();
+    let mut keep = vec![false; n];
+    if let Some(k) = keep.first_mut() {
+        *k = true;
+    }
+    if let Some(k) = keep.last_mut() {
+        *k = true;
+    }
+    // A run someone can stop while it goes takes no cap (`control::uncapped`), as other tools'.
+    let mut budget = if crate::control::uncapped() { usize::MAX } else { n.saturating_mul(work) };
+    // Each distance counts toward Cancel (`run.stop`), inside a span's scan too, so one large
+    // feature doesn't hold the run.
+    // Out of work, or canceled (the feature is then given back as it was): the spans still open keep their
+    // vertices.
+    let keep_open = |keep: &mut Vec<bool>, spans: &mut dyn Iterator<Item = (usize, usize)>| {
+        for k in spans.flat_map(|(i, j)| i + 1..j) {
+            if let Some(kept) = keep.get_mut(k) {
+                *kept = true;
+            }
+        }
+    };
+    let mut stack = vec![(0, n - 1)];
+    'spans: while let Some((i, j)) = stack.pop() {
+        let span = j - i - 1;
+        if span > budget {
+            run.capped.set(true);
+            keep_open(&mut keep, &mut std::iter::once((i, j)).chain(stack.drain(..)));
+            break;
+        }
+        budget -= span;
+        let (Some(a), Some(b), Some(&la), Some(&lb), Some(&sa), Some(&sb)) =
+            (pts.get(i), pts.get(j), lat.get(i), lat.get(j), scale.get(i), scale.get(j))
+        else {
+            continue;
+        };
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let len2 = dx * dx + dy * dy;
+        // The chord's latitudes and least scale; a vertex's distance runs from it to a point on the
+        // chord, between the chord's ends.
+        let (chord_lo, chord_hi, chord_scale) = (la.min(lb), la.max(lb), sa.min(sb));
+        // The farthest vertex on the ground of those beyond their tolerance.
+        let mut far: Option<(usize, f64)> = None;
+        for k in i + 1..j {
+            if run.stop(1) {
+                keep_open(&mut keep, &mut std::iter::once((i, j)).chain(stack.drain(..)));
+                break 'spans;
+            }
+            let (Some(c), Some(&lk), Some(&sk)) = (pts.get(k), lat.get(k), scale.get(k)) else { continue };
+            // The smallest scale between the vertex and the chord: the equator's (1) where their
+            // latitudes straddle it, otherwise the least of theirs. There a plane meter is the most
+            // ground, so no vertex moves farther on the ground than asked, even poleward of its chord.
+            let s = if chord_lo.min(lk) <= 0.0 && chord_hi.max(lk) >= 0.0 { merc_scale(0.0) } else { sk.min(chord_scale) };
+            let t = if len2 > 0.0 { (((c.x - a.x) * dx + (c.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            let d = (c.x - (a.x + t * dx)).hypot(c.y - (a.y + t * dy));
+            // Within its tolerance, it may go. A distance that overflowed to NaN (coordinates near
+            // f64's limits) counts as beyond, so the vertex is kept rather than lost.
+            if d <= tol_m * s {
+                continue;
+            }
+            let ground = if d.is_nan() { f64::INFINITY } else { d / s };
+            // The last of equally far vertices, as `geo`'s Douglas–Peucker takes it.
+            if far.is_none_or(|(_, g)| ground >= g) {
+                far = Some((k, ground));
+            }
+        }
+        if let Some((k, _)) = far {
+            if let Some(kept) = keep.get_mut(k) {
+                *kept = true;
+            }
+            stack.push((i, k));
+            stack.push((k, j));
+        }
+    }
+    pts.iter().zip(keep).filter(|(_, k)| *k).map(|(c, _)| *c).collect()
+}
+
 // Three fixed non-collinear anchors prevent ring collapse and keep vertex counts monotonic.
-fn simplify_ring(ring: &geo::LineString<f64>, eps: f64) -> geo::LineString<f64> {
+fn simplify_ring(ring: &geo::LineString<f64>, tol_m: f64, run: &SimplifyRun) -> geo::LineString<f64> {
     use geo::{Distance, Euclidean};
-    if ring.0.len() <= 4 || ring.0.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
+    // Its two anchor scans count toward Cancel; once canceled, the ring is left as it is.
+    if run.stop(ring.0.len().saturating_mul(2)) || ring.0.len() <= 4 || ring.0.iter().any(|c| !c.x.is_finite() || !c.y.is_finite()) {
         return ring.clone();
     }
     let Some(&first) = ring.0.first() else { return ring.clone() };
@@ -3806,31 +3984,90 @@ fn simplify_ring(ring: &geo::LineString<f64>, eps: f64) -> geo::LineString<f64> 
     for bounds in stops.windows(2) {
         let [start, end] = bounds else { return ring.clone() };
         let Some(arc) = ring.0.get(*start..=*end) else { return ring.clone() };
-        let simple = geo::LineString::new(arc.to_vec()).simplify(eps);
-        corners.extend(simple.0.into_iter().skip(usize::from(!corners.is_empty())));
+        let simple = simplify_coords(arc, tol_m, run);
+        // Canceled: the ring as it is, its arcs left not copied.
+        if run.canceled.get() {
+            return ring.clone();
+        }
+        corners.extend(simple.into_iter().skip(usize::from(!corners.is_empty())));
     }
     geo::LineString::new(corners)
 }
 
-/// A geometry simplified (Douglas–Peucker) to a tolerance in metres.
+/// A geometry simplified (Douglas–Peucker) to a tolerance in meters, converted at each vertex's
+/// latitude ([`simplify_coords`]).
 pub fn simplify_geometry(g: &Geometry, tol_m: f64) -> Geometry {
-    let eps = tol_m * merc_scale(feature_lat(g));
+    simplify_checked(g, tol_m).geometry
+}
+
+/// What [`simplify_checked`] made of a geometry, and what it said no to.
+struct Simplified {
+    geometry: Geometry,
+    /// A line or polygon left exactly as it was, a coordinate being missing or out of the analysis
+    /// plane's reach (a NaN, or a longitude so large the plane can't hold it).
+    broken: bool,
+    /// A run that would have taken more than [`SIMPLIFY_WORK`]: part of it kept its vertices.
+    capped: bool,
+}
+
+/// [`simplify_geometry`], saying what it left alone ([`Simplified`]). A line or polygon with a
+/// coordinate the plane can't hold isn't moved through the plane and back at all.
+fn simplify_checked(g: &Geometry, tol_m: f64) -> Simplified {
+    let run = SimplifyRun::default();
+    let unchanged = |broken| Simplified { geometry: g.clone(), broken, capped: false };
+    // A tolerance of 0 (or one that isn't a number) simplifies nothing: the geometry as it is, not
+    // moved through the plane and back.
+    if tol_m.is_nan() || tol_m <= 0.0 {
+        return unchanged(false);
+    }
+    if matches!(g, Geometry::Line(_) | Geometry::Polygon(_)) {
+        let mut broken = false;
+        // Beyond 1e150 plane meters (a longitude past about 1e143°), the squares in a distance
+        // overflow; no place on Earth is within a hair of it.
+        const PLANE_LIMIT: f64 = 1e150;
+        g.for_each_coord(|c| {
+            let p = rustgis_geom::lonlat_to_plane(c);
+            broken |= p.x.is_nan() || p.y.is_nan() || p.x.abs() > PLANE_LIMIT || p.y.abs() > PLANE_LIMIT;
+        });
+        if broken {
+            return unchanged(true);
+        }
+    }
     let sg = match g {
+        // Once canceled, the parts left aren't walked nor the feature put back together.
         Geometry::Polygon(_) => to_multipolygon(g).and_then(|mut m| {
             for p in &mut m.0 {
-                p.exterior_mut(|r| *r = simplify_ring(r, eps));
+                if run.canceled.get() {
+                    return None;
+                }
+                p.exterior_mut(|r| *r = simplify_ring(r, tol_m, &run));
                 p.interiors_mut(|rings| {
-                    for r in rings {
-                        *r = simplify_ring(r, eps);
+                    for r in rings.iter_mut().take_while(|_| !run.canceled.get()) {
+                        *r = simplify_ring(r, tol_m, &run);
                     }
                 });
             }
-            from_multipolygon(&m)
+            if run.canceled.get() { None } else { from_multipolygon(&m) }
         }),
-        Geometry::Line(_) => to_multiline(g).and_then(|m| from_line(&m.simplify(eps))),
+        Geometry::Line(_) => to_multiline(g).and_then(|m| {
+            let mut parts = Vec::with_capacity(m.0.len());
+            for l in &m.0 {
+                let simple = simplify_coords(&l.0, tol_m, &run);
+                if run.canceled.get() {
+                    return None;
+                }
+                parts.push(geo::LineString::new(simple));
+            }
+            from_line(&geo::MultiLineString::new(parts))
+        }),
         _ => None,
     };
-    sg.unwrap_or_else(|| g.clone())
+    // Canceled partway: the feature as it was, never part-simplified (a tool run then stops as
+    // canceled, and its features aren't used).
+    if run.canceled.get() {
+        return unchanged(false);
+    }
+    Simplified { geometry: sg.unwrap_or_else(|| g.clone()), broken: false, capped: run.capped.get() }
 }
 
 fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -3839,7 +4076,11 @@ fn simplify(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 
 /// [`simplify`] on `threads` threads (by the number of features when `None`): each feature is
 /// simplified on its own (#1252), and the rows and vertex counts are made in input order, as on
-/// one thread. Cancel is looked at, and progress counted, between features.
+/// one thread. Cancel is looked at, and progress counted, between features, and within a feature
+/// as its work adds up across its parts ([`SimplifyRun`]). A feature's passes over all its
+/// vertices without a look (checking it and moving it into the plane and back, setting up a run's
+/// latitudes and scales, comparing and counting the result) each take about as long as one
+/// distance per vertex, so only a feature of tens of millions of vertices holds the run for long.
 fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let tol = num(p, "tolerance").ok_or("Tolerance must be a number")?.abs() * 1000.0;
@@ -3854,32 +4095,87 @@ fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<Too
         || (),
         |_, _, &r| {
             let made = ds.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| {
-                // A line or polygon reaching beyond 85.05° has its tolerance taken east–west at the
-                // scale of its label point's latitude, at most 85° (`merc_scale`), where the ground
-                // beyond is far narrower: less is taken out there than asked (#1033). Points aren't
-                // simplified.
-                let mut beyond = false;
-                if !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
-                    g.for_each_coord(|c| beyond |= c.y.is_finite() && c.y.abs() > rustgis_geom::MAX_LAT);
+                // Each vertex's tolerance is taken at its own latitude, at most 85°'s (`merc_scale`):
+                // a line or polygon reaching beyond 85.05° has it east–west there at 85°'s, where the
+                // ground is far narrower, so less is taken out there than asked (#1033). Points
+                // aren't simplified.
+                // A line or polygon with a coordinate missing, or a longitude too far out for the
+                // analysis plane, is left exactly as it was (`simplify_checked`), and the feature is
+                // counted. Otherwise a latitude past ±90° (bad data), infinite ones included, is
+                // taken as that pole by the plane, and the vertices are counted; a line part of fewer
+                // than 2 vertices has no line to keep (`from_line`), and is counted.
+                let s = simplify_checked(g, tol);
+                let (mut beyond, mut past_pole, mut short) = (false, 0usize, 0usize);
+                // A geometry given back as it was (nothing to keep in the plane) moved nothing.
+                let changed = s.geometry != *g;
+                if tol > 0.0 && !s.broken && !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+                    let past = |c: &Coord| !c.y.is_nan() && c.y.abs() > 90.0;
+                    g.for_each_coord(|c| beyond |= !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT);
+                    // The vertices taken to a pole are those in what's kept: a line's parts of 2
+                    // vertices or more, a polygon's rings.
+                    past_pole = match g {
+                        _ if !changed => 0,
+                        Geometry::Line(parts) => parts.iter().filter(|p| p.len() >= 2).flatten().filter(|c| past(c)).count(),
+                        _ => {
+                            let mut n = 0;
+                            g.for_each_coord(|c| n += usize::from(past(&c)));
+                            n
+                        }
+                    };
+                    // A line whose parts are all that short is kept as it was (`from_line` has none
+                    // to give), so only the short parts beside a longer one go.
+                    if let Geometry::Line(parts) = g
+                        && parts.iter().any(|p| p.len() >= 2)
+                    {
+                        short = parts.iter().filter(|p| p.len() < 2).count();
+                    }
                 }
-                (g.coord_count(), beyond, simplify_geometry(g, tol))
+                (g.coord_count(), beyond, past_pole, short, s)
             });
             Ok::<_, String>(made)
         },
     )?;
+    let (mut broken, mut without, mut past_pole, mut short, mut capped) = (0usize, 0usize, 0usize, 0usize, 0usize);
     for (r, made) in input_rows.into_iter().zip(simplified) {
         let Some(f) = ds.features.get(r) else { continue };
-        let Some((count, beyond, sg)) = made else { continue };
+        // A feature without geometry has nothing to simplify: left out, and counted.
+        let Some((count, beyond, past, parts, s)) = made else {
+            without += 1;
+            continue;
+        };
         before += count;
-        polar += usize::from(beyond && tol > 0.0);
-        after += sg.coord_count();
-        out.push(Some(sg), f.attrs.clone());
+        polar += usize::from(beyond);
+        broken += usize::from(s.broken);
+        capped += usize::from(s.capped);
+        past_pole += past;
+        short += parts;
+        after += s.geometry.coord_count();
+        out.push(Some(s.geometry), f.attrs.clone());
     }
     let mut messages = vec![format!("Simplify: {before} → {after} vertices")];
     if polar > 0 {
         messages.push(format!(
-            "{polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at the scale of the feature's label point, at most 85°'s: less is simplified away there than asked, and parts farther equatorward than the label point can be simplified more than asked"
+            "Simplify: {polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at 85°'s scale: less is simplified away there than asked"
         ));
+    }
+    if broken > 0 {
+        messages.push(format!(
+            "Simplify: {broken} line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
+        ));
+    }
+    if capped > 0 {
+        messages.push(format!(
+            "Simplify: {capped} feature(s) were too intricate to simplify whole within the work allowed: parts of them keep more vertices than asked"
+        ));
+    }
+    if short > 0 {
+        messages.push(format!("Simplify: {short} line part(s) of fewer than 2 vertices left out"));
+    }
+    if past_pole > 0 {
+        messages.push(format!("Simplify: {past_pole} vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"));
+    }
+    if without > 0 {
+        messages.push(format!("Simplify: {without} feature(s) left out: they have no geometry to simplify"));
     }
     Ok(ToolResult { output: Output::Layer(out), messages })
 }
@@ -4057,7 +4353,7 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             }
         });
     }
-    let (crs, crs_note) = interpolation_crs(ds, p, "IDW Interpolation")?;
+    let (crs, crs_note) = raster_crs(ds, p, "IDW Interpolation")?;
     let (pts, beyond_note) = points_in(crs, pts)?;
     let extent = match s(p, "extent").trim() {
         "" => {
@@ -4077,6 +4373,7 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     };
     // Defaults only when a value is not given: a bad one is refused, not replaced.
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
+    let crs_note = in_its_units(p, crs, crs_note, &extent, &pts, &["extent", "pixelSize"]);
     let cell = match num(p, "pixelSize") {
         Some(c) if c > 0.0 => c,
         _ if given("pixelSize") => return Err("the pixel size must be more than zero".into()),
@@ -4088,7 +4385,8 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         None => 2.0,
     };
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
-    let r = crate::rasterops::idw(&pts, &extent, cell, power, 0, &name, crs).map_err(|e| with_note(e, &beyond_note))?;
+    let r =
+        crate::rasterops::idw(&pts, &extent, cell, power, 0, &name, crs).map_err(|e| with_note(with_note(e, &beyond_note), &crs_note))?;
     let bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
     let msg = format!("IDW Interpolation: {} × {} cells from {} points", r.width, r.height, pts.len());
     Ok(ToolResult {
@@ -4144,7 +4442,7 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
             }
         }
     }
-    let (crs, crs_note) = interpolation_crs(ds, p, "Ordinary Kriging")?;
+    let (crs, crs_note) = raster_crs(ds, p, "Ordinary Kriging")?;
     let (mut raw_pts, beyond_note) = points_in(crs, raw_pts)?;
     // Deduplicate sample points by coordinate to prevent singular kriging matrix
     raw_pts.sort_by(|a, b| a.0.x.total_cmp(&b.0.x).then_with(|| a.0.y.total_cmp(&b.0.y)));
@@ -4189,6 +4487,7 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         }
     };
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
+    let crs_note = in_its_units(p, crs, crs_note, &extent, &pts, &["extent", "pixelSize", "range"]);
     let neighbours = match num(p, "neighbours") {
         Some(n) if n >= 2.0 => (n as usize).min(32),
         Some(_) => return Err("neighbours must be at least 2".into()),
@@ -4225,7 +4524,8 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     }
 
     let name = out_name(p, format!("{}_{field}_kriging", ds.name));
-    let r = crate::kriging::kriging(&pts, &extent, cell, &params, neighbours, &name, crs).map_err(|e| with_note(e, &beyond_note))?;
+    let r = crate::kriging::kriging(&pts, &extent, cell, &params, neighbours, &name, crs)
+        .map_err(|e| with_note(with_note(e, &beyond_note), &crs_note))?;
     let pred_bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
     let var_bytes = rustgis_data::raster::geotiff::write(&r, 1).map_err(|e| e.to_string())?;
     let var_name = format!("{name}_variance");
@@ -4239,38 +4539,77 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     })
 }
 
-/// The coordinate system IDW Interpolation and Ordinary Kriging make their grid in: the projected
-/// system given as `crs`, or longitude/latitude in degrees when it is empty, as before `crs` was
-/// there. The note says what the run used where that could surprise: the compatibility note on
-/// the system given, or degrees for a layer read from a projected file.
-fn interpolation_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<String>), String> {
+/// The projected system an interpolation takes from a layer read in `crs` when it is given none
+/// (#1743): `None` for none or a geographic one (degrees, with nothing to say), else the system, or
+/// why it can't be used. The Geostatistical Wizard's hint shows the same choice.
+pub fn layer_raster_crs(crs: Option<Crs>) -> Option<Result<Crs, String>> {
+    let c = crs.filter(|c| !c.is_geographic())?;
+    Some(if c.is_geocentric() {
+        Err(format!("{}, which can't hold its cells", c.label()))
+    } else {
+        c.transformer().map(|_| c).map_err(|e| format!("{}, which this version can't project to ({e})", c.label()))
+    })
+}
+
+/// The coordinate system an interpolation (`tool`) makes its grid in: the projected system given as
+/// `p`'s `crs`; degrees for `EPSG:4326`; else [`layer_raster_crs`], the projected system `ds` was
+/// read in, as Kernel Density uses, and degrees for a layer read in degrees. The note says what the
+/// run used where that could surprise: the system it took from the layer, or the compatibility note
+/// on the one given.
+pub fn raster_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<String>), String> {
     if p.get("crs").is_some_and(|v| !v.is_null() && !v.is_string()) {
         return Err("crs must be text".into());
     }
     match s(p, "crs").trim() {
-        "" => Ok((
-            Crs::LonLat,
-            ds.crs.filter(|c| !c.is_geographic()).map(|c| {
-                format!(
-                    "{tool}: made in degrees of longitude and latitude, though {} was read in {}; set its coordinate system (crs) to make it in that system's units",
-                    ds.name,
-                    c.label()
-                )
-            }),
-        )),
+        "" => Ok(match layer_raster_crs(ds.crs) {
+            // A system that can't hold a raster's cells (geocentric), or one this version can't
+            // project to: degrees, as before, and said why.
+            Some(Err(why)) => (
+                Crs::LonLat,
+                Some(format!(
+                    "{tool}: made in degrees of longitude and latitude, though {} was read in {why}; give a projected crs to make it in metres or feet",
+                    ds.name
+                )),
+            ),
+            Some(Ok(c)) => (
+                c,
+                Some(format!(
+                    "{tool}: made in {}, the coordinate system {} was read in, with its units for the extent and sizes; set crs to EPSG:4326 to make it in degrees",
+                    c.label(),
+                    ds.name
+                )),
+            ),
+            None => (Crs::LonLat, None),
+        }),
+        // Asked for by name: degrees, with nothing to say.
+        text if Crs::parse(text).is_ok_and(|c| c == Crs::LonLat) => Ok((Crs::LonLat, None)),
         text => {
-            let (crs, note) = crs_with_compatibility_note(text)?;
-            if crs.is_geographic() {
-                return Err("crs must be a projected coordinate system with linear units (such as UTM or State Plane, e.g. EPSG:32618); leave it empty to work in degrees".into());
-            }
+            let (crs, note) = projected_crs(text).map_err(|e| match Crs::parse(text) {
+                Ok(c) if c.is_geographic() => format!("{e}; EPSG:4326 makes it in degrees"),
+                _ => e,
+            })?;
             Ok((crs, note.map(|note| format!("{tool}: its coordinate system: {note}"))))
         }
     }
 }
 
+/// The projected coordinate system `text` names, and its compatibility note, or an error for one
+/// in degrees: a raster's cells are measured in a projected system's units.
+pub fn projected_crs(text: &str) -> Result<(Crs, Option<String>), String> {
+    let (crs, note) = crs_with_compatibility_note(text)?;
+    if crs.is_geocentric() {
+        return Err("crs must be a projected coordinate system, not a geocentric one (X, Y and Z from the Earth's centre)".into());
+    }
+    if crs.is_geographic() {
+        return Err("crs must be a projected coordinate system with linear units (such as UTM or State Plane, e.g. EPSG:32618)".into());
+    }
+    Ok((crs, note))
+}
+
 /// `pts` (longitude/latitude) in `crs`, and a note counting those left out because the system
-/// can't hold them (see [`in_projected`]).
-fn points_in(crs: Crs, pts: Vec<(Coord, f64)>) -> Result<(Vec<(Coord, f64)>, Option<String>), String> {
+/// can't hold them (see [`in_projected`]). One short step without a Cancel check: a point costs a
+/// projection and its round trip, far less than the interpolation that follows.
+pub fn points_in(crs: Crs, pts: Vec<(Coord, f64)>) -> Result<(Vec<(Coord, f64)>, Option<String>), String> {
     if crs == Crs::LonLat {
         return Ok((pts, None));
     }
@@ -4289,8 +4628,8 @@ fn beyond_note(crs: Crs, beyond: usize) -> Option<String> {
 }
 
 /// The least an interpolation grid reaches past points in a row, which span no area: 0.01° in
-/// degrees, or about as far (1 km) in a projected system's units.
-fn min_pad(crs: Crs) -> f64 {
+/// degrees, or 1000 of a projected system's units (1 km in metres).
+pub fn min_pad(crs: Crs) -> f64 {
     if crs.is_geographic() { 0.01 } else { 1000.0 }
 }
 
@@ -4302,6 +4641,30 @@ fn in_projected(crs: Crs, to: &Transformer, c: Coord) -> Option<Coord> {
     // past it through, onto the edge.
     let held = crs != Crs::WebMercator || c.y.abs() <= rustgis_geom::MAX_LAT;
     held.then(|| to.from_lonlat(c)).flatten().filter(|p| p.is_finite() && to.to_lonlat(*p).is_some_and(|back| (back.y - c.y).abs() < 1e-4))
+}
+
+/// The note on a system an interpolation took from the layer (`p`'s `crs` empty), naming the values
+/// among `keys` that `p` gives, read in its units: a script written when these tools worked in
+/// degrees is told, not answered in metres without a word (#1743). An `extent` that holds none of
+/// `pts` is said too, with how to ask for degrees; it isn't refused, as one in the system's units
+/// may lie away from the points and still be interpolated.
+pub fn in_its_units(p: &Json, crs: Crs, note: Option<String>, extent: &Extent, pts: &[(Coord, f64)], keys: &[&str]) -> Option<String> {
+    let note = note?;
+    if crs == Crs::LonLat || !s(p, "crs").trim().is_empty() {
+        return Some(note);
+    }
+    let given: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|k| p.get(*k).is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty())))
+        .collect();
+    if given.is_empty() {
+        return Some(note);
+    }
+    // With no points left (the system holds none), the run's own error says why.
+    let outside = given.contains(&"extent") && !pts.is_empty() && !pts.iter().any(|(c, _)| extent.contains(*c));
+    let outside = if outside { "; the extent holds none of the points: if it is in degrees, set crs to EPSG:4326" } else { "" };
+    Some(format!("{note} ({} as given, in its units{outside})", given.join(", ")))
 }
 
 /// `e` with `note` after it, when there is one: what was left out can be why a run failed.
@@ -5026,19 +5389,28 @@ fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let ds = input(inp, p, "input")?;
     let mut requests = stats::parse_requests(ds, p.get("statistics"))?;
     let field_only = requests.is_empty();
+    // A Statistics Field is read as numbers, except a date field: its values are dates, which give
+    // a count and the earliest and latest, not sums.
+    let mut as_numbers = field_only;
     if field_only {
         let field = s(p, "field").trim();
         if field.is_empty() {
             return Err("give the statistics to compute, or a Statistics Field".into());
         }
         let fi = find_field_case_insensitive(ds, field)?;
-        requests = [Stat::Count, Stat::Sum, Stat::Mean, Stat::Min, Stat::Max, Stat::Std].map(|stat| Request { field: fi, stat }).to_vec();
+        let stats: &[Stat] = if ds.fields.get(fi).is_some_and(|f| f.ty.is_temporal()) {
+            as_numbers = false;
+            &[Stat::Count, Stat::Min, Stat::Max]
+        } else {
+            &[Stat::Count, Stat::Sum, Stat::Mean, Stat::Min, Stat::Max, Stat::Std]
+        };
+        requests = stats.iter().map(|&stat| Request { field: fi, stat }).collect();
     }
     let cases = key_fields(ds, p.get("case"), "Case Field")?;
     let separator = concatenate_separator(p)?;
     let mut fields: Vec<Field> = cases.iter().filter_map(|&c| ds.fields.get(c).cloned()).collect();
     fields.push(Field::new("FREQUENCY", FieldType::Integer));
-    let added = statistic_fields(ds, &requests, field_only, &fields)?;
+    let added = statistic_fields(ds, &requests, as_numbers, &fields)?;
     let first_added = fields.len();
     fields.extend(added);
     if let Some(c) = cases.iter().filter_map(|&c| ds.fields.get(c)).find(|f| f.name.eq_ignore_ascii_case("FREQUENCY")) {
@@ -5051,11 +5423,11 @@ fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     rs.sort_unstable();
     rs.dedup();
     let mut rounded = Rounded::new(requests.len());
-    rounded.count_texts(ds, &rs, &requests, field_only);
+    rounded.count_texts(ds, &rs, &requests, as_numbers);
     for group in stats::group_rows(ds, &rs, &cases) {
         let mut row = group.key;
         row.push(stats::count(group.rows.len()));
-        row.extend(statistic_values(ds, &group.rows, &requests, field_only, separator, &mut rounded));
+        row.extend(statistic_values(ds, &group.rows, &requests, as_numbers, separator, &mut rounded));
         // One past the last id: `push` would search them all for each group.
         out.push_next(None, row);
     }
@@ -5072,8 +5444,8 @@ fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
 fn statistic_fields(ds: &Dataset, requests: &[crate::stats::Request], as_numbers: bool, taken: &[Field]) -> Result<Vec<Field>, String> {
     let mut out: Vec<Field> = Vec::with_capacity(requests.len());
     for r in requests {
-        let (name, numeric) = ds.fields.get(r.field).map(|f| (f.name.as_str(), f.ty.is_numeric())).unwrap_or_default();
-        let field = Field::new(format!("{}_{name}", r.stat.name()), r.stat.output_type(numeric || as_numbers));
+        let (name, ty) = ds.fields.get(r.field).map(|f| (f.name.as_str(), f.ty)).unwrap_or(("", FieldType::Text));
+        let field = Field::new(format!("{}_{name}", r.stat.name()), r.stat.output_type(ty, as_numbers));
         if taken.iter().chain(&out).any(|f| f.name.eq_ignore_ascii_case(&field.name)) {
             return Err(format!("the output would have two fields named '{}'", field.name));
         }
@@ -5339,7 +5711,7 @@ fn pivot_table(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         return Err(format!("{} rows by {width} fields would make more than {MAX_PIVOT_CELLS} values; select fewer records", groups.len()));
     }
     let mut fields: Vec<Field> = keys.iter().filter_map(|&k| ds.fields.get(k).cloned()).collect();
-    let ty = stat.map_or(value_type, |st| st.output_type(value_type.is_numeric()));
+    let ty = stat.map_or(value_type, |st| st.output_type(value_type, false));
     let values = columns.iter().map(|c| c.key.first().unwrap_or(&Value::Null));
     let names = pivot_field_names(field_name(pivot), values, &fields);
     let first_pivot_field = fields.len();
@@ -6050,7 +6422,7 @@ pub(crate) fn unique_field(out: &Dataset, base: &str) -> String {
 /// Features' extents on a grid, to find those whose extents may meet another extent without
 /// testing every one. Up to 16 features, or when the grid would hold more than a million
 /// references (large features on a fine grid), there is no grid and every feature is a candidate.
-struct ExtentIndex {
+pub(crate) struct ExtentIndex {
     /// The union of the extents.
     total: Extent,
     cell_w: f64,
@@ -6071,7 +6443,7 @@ impl ExtentIndex {
     const MAX_REFERENCES: usize = 1_000_000;
 
     /// An index of these extents, numbered in order from 0.
-    fn new(extents: impl Iterator<Item = Extent>) -> Self {
+    pub(crate) fn new(extents: impl Iterator<Item = Extent>) -> Self {
         let extents: Vec<Extent> = extents.collect();
         let total = extents.iter().fold(Extent::EMPTY, |t, e| t.union(e));
         let n_cells = (extents.len() as f64).sqrt().clamp(4.0, 256.0);
@@ -6143,7 +6515,7 @@ impl ExtentIndex {
 
     /// Whether any candidate passes `test`, stopping immediately at the first match. Test each
     /// candidate at most once even when it spans several cells; candidate order is unspecified.
-    fn any_candidate(&self, ext: &Extent, mut test: impl FnMut(usize) -> bool) -> bool {
+    pub(crate) fn any_candidate(&self, ext: &Extent, mut test: impl FnMut(usize) -> bool) -> bool {
         let Some(grid) = &self.grid else { return (0..self.len).any(test) };
         let Some(((x0, y0), (x1, y1))) = self.query_cells(ext) else { return false };
         let mut seen = std::collections::HashSet::new();
@@ -7278,6 +7650,20 @@ mod tests {
     use rustgis_data::Feature;
     use std::collections::HashMap;
 
+    /// A feature's label point's latitude: the one scale Simplify took for a whole feature before
+    /// it took each vertex's own.
+    fn feature_lat(g: &Geometry) -> f64 {
+        g.label_point().map(|c| c.y).unwrap_or(0.0)
+    }
+
+    /// [`simplify_coords`] on its own, its work allowance asserted not to have run out.
+    fn dp(pts: &[geo::Coord<f64>], tol_m: f64) -> Vec<geo::Coord<f64>> {
+        let run = SimplifyRun::default();
+        let out = simplify_coords(pts, tol_m, &run);
+        assert!(!run.capped.get(), "work allowance ran out");
+        out
+    }
+
     struct Map(HashMap<String, Dataset>);
     impl Inputs for Map {
         fn dataset(&self, layer: &str) -> Option<&Dataset> {
@@ -7369,8 +7755,12 @@ mod tests {
             let target = to_multipolygon(&simple).unwrap();
             for (a, b) in source.0.iter().zip(&target.0) {
                 for (a, b) in std::iter::once(a.exterior()).chain(a.interiors()).zip(std::iter::once(b.exterior()).chain(b.interiors())) {
-                    let deviation = a.0.iter().map(|c| Euclidean.distance(&geo::Point::from(*c), b)).fold(0.0_f64, f64::max);
-                    assert!(deviation <= tolerance * merc_scale(feature_lat(&original)) + 1e-6, "{tolerance} m: {deviation}");
+                    // Each vertex lies within its own tolerance, at its own latitude, of the result.
+                    for c in &a.0 {
+                        let deviation = Euclidean.distance(&geo::Point::from(*c), b);
+                        let own = tolerance * merc_scale(rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y)).y);
+                        assert!(deviation <= own + 1e-6, "{tolerance} m: {deviation} > {own}");
+                    }
                 }
             }
             let out =
@@ -7378,6 +7768,335 @@ mod tests {
             assert_eq!(out.features[0].geometry.as_ref(), Some(&simple));
         }
         assert_eq!(previous, 12, "three closed triangle rings at a very large tolerance");
+    }
+
+    #[test]
+    fn simplify_takes_each_vertex_tolerance_at_its_own_latitude() {
+        // A polygon from 60°N to 89°N with a bump north along 60°N: at 3 km, a 5 km bump lies
+        // farther than the tolerance on the ground and stays, as it would in a polygon at 60°N
+        // alone; a 1 km bump goes. Taken at the feature's middle (about 75°N), the 3 km would have
+        // reached some 6 km on the ground at 60°N and taken the 5 km bump too.
+        let kept = |bump_km: f64| {
+            let dy = bump_km / 111.32;
+            let ring = [(-30.0, 60.0), (0.0, 60.0 + dy), (30.0, 60.0), (30.0, 89.0), (0.0, 89.0), (-30.0, 89.0), (-30.0, 60.0)]
+                .map(|(x, y)| Coord::new(x, y))
+                .to_vec();
+            let g = simplify_geometry(&Geometry::Polygon(vec![vec![ring]]), 3_000.0);
+            let Geometry::Polygon(p) = g else { return false };
+            p.iter().flatten().flatten().any(|c| c.x.abs() < 1e-9 && c.y < 61.0)
+        };
+        assert!(kept(5.0), "the 5 km bump went");
+        assert!(!kept(1.0), "the 1 km bump stayed");
+        // One tolerance for the feature, at its label point, would hold the 5 km bump (its offset
+        // in the plane) within it: the bump would have gone.
+        let ring = [(-30.0, 60.0), (30.0, 60.0), (30.0, 89.0), (-30.0, 89.0), (-30.0, 60.0)].map(|(x, y)| Coord::new(x, y)).to_vec();
+        let whole = 3_000.0 * merc_scale(feature_lat(&Geometry::Polygon(vec![vec![ring]])));
+        let offset =
+            rustgis_geom::lonlat_to_plane(Coord::new(0.0, 60.0 + 5.0 / 111.32)).y - rustgis_geom::lonlat_to_plane(Coord::new(0.0, 60.0)).y;
+        assert!(whole > offset, "{whole} {offset}");
+    }
+
+    /// No vertex moves farther on the ground than asked, even poleward of its chord: along the 80th
+    /// parallel at 25 km, a vertex 25.15 km north stays. Taken at its own latitude alone, its
+    /// tolerance (about 1% wider in the plane there) would have let it go. One 24.5 km north goes.
+    #[test]
+    fn simplify_moves_no_vertex_farther_than_asked_poleward_of_its_chord() {
+        let km_north = |km: f64| (km * 1000.0 / 6_378_137.0).to_degrees();
+        let kept = |km: f64| {
+            let line = [(-10.0, 80.0), (0.0, 80.0 + km_north(km)), (10.0, 80.0)]
+                .map(|(x, y)| {
+                    let c = rustgis_geom::lonlat_to_plane(Coord::new(x, y));
+                    geo::coord! { x: c.x, y: c.y }
+                })
+                .to_vec();
+            dp(&line, 25_000.0).len() == 3
+        };
+        assert!(kept(25.15), "25.15 km north went");
+        assert!(!kept(24.5), "24.5 km north stayed");
+    }
+
+    /// A run whose work runs out keeps the vertices of the spans still open and says so: never a
+    /// vertex beyond its tolerance lost, only more kept than asked. With the work allowed, the same
+    /// run is simplified whole.
+    #[test]
+    fn simplify_coords_keeps_vertices_when_its_work_runs_out() {
+        // Teeth of 55 m every tenth vertex, of 5.5 m between: at 20 m the big ones stay, the small
+        // ones go, which takes many splits.
+        let zigzag: Vec<geo::Coord<f64>> = (0..2_000)
+            .map(|i| {
+                let y = if i % 10 == 5 {
+                    0.0005
+                } else if i % 2 == 1 {
+                    0.00005
+                } else {
+                    0.0
+                };
+                let c = rustgis_geom::lonlat_to_plane(Coord::new(i as f64 * 0.001, y));
+                geo::coord! { x: c.x, y: c.y }
+            })
+            .collect();
+        let whole = dp(&zigzag, 20.0);
+        let big: Vec<geo::Coord<f64>> = zigzag.iter().enumerate().filter(|(i, _)| i % 10 == 5).map(|(_, c)| *c).collect();
+        assert!(big.iter().all(|c| whole.contains(c)));
+        assert!(whole.len() < 1_000, "{}", whole.len());
+        let run = SimplifyRun::default();
+        let short = simplify_coords_within(&zigzag, 20.0, &run, 1);
+        assert!(run.capped.get());
+        assert!(short.len() > whole.len(), "{} {}", short.len(), whole.len());
+        // The ends and every big tooth (beyond its tolerance) are among those kept, all original.
+        assert_eq!(short.first(), zigzag.first());
+        assert_eq!(short.last(), zigzag.last());
+        assert!(big.iter().all(|c| short.contains(c)));
+        assert!(short.iter().all(|c| zigzag.contains(c)));
+    }
+
+    /// A zigzag line of `n` vertices in the analysis plane, 1 cm teeth: at 100 m, simplified to its
+    /// two ends.
+    fn cancel_zigzag(n: usize) -> Vec<geo::Coord<f64>> {
+        (0..n)
+            .map(|i| {
+                let c = rustgis_geom::lonlat_to_plane(Coord::new(i as f64 * 1e-5, if i % 2 == 0 { 0.0 } else { 1e-7 }));
+                geo::coord! { x: c.x, y: c.y }
+            })
+            .collect()
+    }
+
+    /// A run looks at Cancel inside one span's scan: with the run's work counted to just short of a
+    /// look ([`crate::control::PACE_WORK`]), a canceled 200,000-vertex line gets past its set-up,
+    /// stops some 1,000 distances into its first scan, and keeps all its vertices, without calling it
+    /// a work cap. A run someone can stop takes no cap.
+    #[test]
+    fn simplify_coords_looks_at_cancel_inside_a_feature() {
+        let zigzag = cancel_zigzag(200_000);
+        assert_eq!(dp(&zigzag, 100.0).len(), 2);
+        let control = crate::control::Control::new();
+        control.cancel();
+        let canceled = {
+            let _installed = crate::control::install(Some(control));
+            let run = SimplifyRun::default();
+            assert!(!run.stop(crate::control::PACE_WORK - SETUP_WORK * zigzag.len() - 1_000));
+            let out = simplify_coords(&zigzag, 100.0, &run);
+            assert!(run.canceled.get());
+            assert!(!run.capped.get(), "a cancel isn't a work cap");
+            out
+        };
+        assert_eq!(canceled.len(), zigzag.len());
+        // Stoppable: no cap, however little work is allowed, and the whole run simplified.
+        let _installed = crate::control::install(Some(crate::control::Control::stoppable()));
+        let run = SimplifyRun::default();
+        assert_eq!(simplify_coords_within(&zigzag, 100.0, &run, 1).len(), 2);
+        assert!(!run.capped.get());
+    }
+
+    /// Cancel is counted across a feature's parts and rings, not per part: with the work just short
+    /// of a look, a three-vertex part is simplified, and the next part's set-up crosses it, so it and
+    /// every part after are left as they are; the same across a polygon's rings. Before, each part
+    /// started its own count, so a feature of many short parts never looked at all.
+    #[test]
+    fn simplify_looks_at_cancel_across_a_features_parts() {
+        let control = crate::control::Control::new();
+        control.cancel();
+        let _installed = crate::control::install(Some(control));
+        // Lines: 12 for the first part's set-up (3 vertices) and 1 for its distance stay short of the look.
+        let parts: Vec<Vec<geo::Coord<f64>>> =
+            (0..10).map(|k| cancel_zigzag(3).into_iter().map(|c| geo::coord! { x: c.x + k as f64 * 1e4, y: c.y }).collect()).collect();
+        let run = SimplifyRun::default();
+        assert!(!run.stop(crate::control::PACE_WORK - 14));
+        let lens: Vec<usize> = parts.iter().map(|p| simplify_coords(p, 100.0, &run).len()).collect();
+        assert_eq!(lens, [2, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
+        assert!(run.canceled.get());
+        // Rings: each ring's anchor scans count too; once canceled, a ring is left as it is.
+        let ring = |dx: f64| -> geo::LineString<f64> {
+            let mut r: Vec<geo::Coord<f64>> = (0..12)
+                .map(|i| {
+                    let a = i as f64 * std::f64::consts::TAU / 12.0;
+                    let c = rustgis_geom::lonlat_to_plane(Coord::new(dx + 0.01 * a.cos(), 0.01 * a.sin()));
+                    geo::coord! { x: c.x, y: c.y }
+                })
+                .collect();
+            r.push(r[0]);
+            geo::LineString::new(r)
+        };
+        // The first ring's work (26 for its anchor scans, 60 for its arcs' 15 vertices set up, 9
+        // distances: 95) stays short of the look, and the last unit of the second's anchor scans
+        // reaches it.
+        let full = simplify_ring(&ring(0.0), 1e6, &SimplifyRun::default());
+        assert_eq!(full.0.len(), 4);
+        let run = SimplifyRun::default();
+        assert!(!run.stop(crate::control::PACE_WORK - 121));
+        let first = simplify_ring(&ring(0.0), 1e6, &run);
+        assert!(!run.canceled.get(), "the first ring's work stays short of the look");
+        assert_eq!(first, full, "the first ring is simplified");
+        let second = simplify_ring(&ring(1.0), 1e6, &run);
+        assert!(run.canceled.get());
+        assert_eq!(second, ring(1.0), "the second ring is left as it is");
+        // A ring too small to simplify counts too (8 for a closed triangle), so a polygon of a
+        // million small holes is looked at.
+        let triangle = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]);
+        let run = SimplifyRun::default();
+        assert!(!run.stop(crate::control::PACE_WORK - 8));
+        assert_eq!(simplify_ring(&triangle, 1e6, &run), triangle);
+        assert!(run.canceled.get(), "a small ring's work counts toward Cancel");
+    }
+
+    /// Canceled partway, a feature is given back as it was rather than part-simplified, for callers
+    /// outside a tool run: a 2.2-million-vertex ring's anchor scans alone cross a look at Cancel.
+    #[test]
+    fn simplify_gives_back_a_canceled_feature_as_it_was() {
+        let ring: Vec<Coord> = (0..2_200_000)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::TAU / 2_200_000.0;
+                Coord::new(10.0 * a.cos(), 10.0 * a.sin())
+            })
+            .chain(std::iter::once(Coord::new(10.0, 0.0)))
+            .collect();
+        let polygon = Geometry::Polygon(vec![vec![ring]]);
+        let control = crate::control::Control::new();
+        control.cancel();
+        let _installed = crate::control::install(Some(control));
+        assert_eq!(simplify_geometry(&polygon, 1_000.0), polygon);
+    }
+
+    /// The bound holds on WGS 84, not only on the sphere: at 60°N, a vertex 0.01795° east of a
+    /// chord along the meridian is 999.1 m off on the sphere but about 1,001.6 m on the ellipsoid,
+    /// beyond a 1 km tolerance, and stays.
+    #[test]
+    fn simplify_holds_its_bound_on_wgs84() {
+        let line: Vec<geo::Coord<f64>> = [(0.0, 59.99999), (0.01795, 60.0), (0.0, 60.00001)]
+            .map(|(x, y)| {
+                let c = rustgis_geom::lonlat_to_plane(Coord::new(x, y));
+                geo::coord! { x: c.x, y: c.y }
+            })
+            .to_vec();
+        assert_eq!(dp(&line, 1_000.0).len(), 3);
+    }
+
+    /// Simplify says how many line parts of fewer than 2 vertices it left out beside longer ones.
+    #[test]
+    fn simplify_says_how_many_short_line_parts_it_left_out() {
+        let mut lines = Dataset::new("lines", GeometryType::Polyline, vec![]);
+        let long: Vec<Coord> = (0..5).map(|i| Coord::new(i as f64, 0.0)).collect();
+        lines.push(Some(Geometry::Line(vec![long.clone(), vec![Coord::new(9.0, 9.0)], vec![]])), vec![]);
+        lines.push(Some(Geometry::Line(vec![long])), vec![]);
+        let m = Map(HashMap::from([("lines".to_string(), lines)]));
+        let res = crate::run("simplify", &m, &serde_json::json!({"input": "lines", "tolerance": 1.0})).unwrap();
+        assert!(res.messages.iter().any(|m| m == "Simplify: 2 line part(s) of fewer than 2 vertices left out"), "{:?}", res.messages);
+        // A line of nothing but a one-vertex part past the pole is kept as it was: nothing is taken
+        // to the pole, nothing left out, and neither is said.
+        let mut lone = Dataset::new("lone", GeometryType::Polyline, vec![]);
+        lone.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 95.0)]])), vec![]);
+        let m = Map(HashMap::from([("lone".to_string(), lone)]));
+        let res = crate::run("simplify", &m, &serde_json::json!({"input": "lone", "tolerance": 1.0})).unwrap();
+        let messages = res.messages.clone();
+        let out = layer(res);
+        assert_eq!(out.features[0].geometry, Some(Geometry::Line(vec![vec![Coord::new(0.0, 95.0)]])));
+        assert!(!messages.iter().any(|m| m.contains("past a pole") || m.contains("left out")), "{messages:?}");
+    }
+
+    /// Where every vertex has the same scale (all beyond 85°, where it stops at 85°'s), the
+    /// per-vertex Douglas–Peucker gives exactly `geo`'s, the one Simplify used before: on a
+    /// zigzag at several tolerances; on two peaks exactly as far from the chord, where which one
+    /// stays depends on the tie; and at a tolerance of 0, which leaves the run as it is, collinear
+    /// and repeated vertices included.
+    #[test]
+    fn simplify_coords_matches_douglas_peucker_at_one_scale() {
+        use geo::Simplify;
+        let geo_dp =
+            |pts: &[geo::Coord<f64>], tol: f64| geo::LineString::new(pts.to_vec()).simplify(tol * SPHERE_TO_WGS84 * merc_scale(86.0)).0;
+        let zigzag: Vec<geo::Coord<f64>> = (0..40)
+            .map(|i| {
+                let y = 86.0 + (i % 5) as f64 * 0.2 + if i % 2 == 0 { 0.01 } else { 0.0 };
+                let c = rustgis_geom::lonlat_to_plane(Coord::new(i as f64 * 0.5, y));
+                geo::coord! { x: c.x, y: c.y }
+            })
+            .collect();
+        for tol in [0.0, 50.0, 500.0, 3_000.0, 20_000.0] {
+            assert_eq!(dp(&zigzag, tol), geo_dp(&zigzag, tol), "{tol} m");
+        }
+        // Two peaks 1,000 plane meters off the chord, beyond 85°: at 50 m (about 573 plane meters
+        // there) both are out, the one taken first splits the run, and the other, 447 m from the
+        // new chord, goes. Which stays is the tie-break's: the same as geo's.
+        let y0 = rustgis_geom::lonlat_to_plane(Coord::new(0.0, 87.0)).y;
+        let peaks = [(0.0, 0.0), (1000.0, 1000.0), (2000.0, 1000.0), (3000.0, 0.0)].map(|(x, y)| geo::coord! { x: x, y: y0 + y }).to_vec();
+        let ours = dp(&peaks, 50.0);
+        assert_eq!(ours.len(), 3, "{ours:?}");
+        // The second peak stays: of equally far vertices, the last is taken.
+        assert_eq!(ours.get(1), peaks.get(2));
+        assert_eq!(ours, geo_dp(&peaks, 50.0));
+        // A tolerance of 0 leaves a run as it is, as geo does: a vertex on the line between its
+        // neighbors, and a repeated one, stay.
+        let line = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (2.0, 0.0), (2.0, 1.0)].map(|(x, y)| geo::coord! { x: x, y: y }).to_vec();
+        assert_eq!(dp(&line, 0.0), line);
+        assert_eq!(dp(&line, 0.0), geo_dp(&line, 0.0));
+    }
+
+    /// Simplify leaves a line with a coordinate missing or infinite as it was, and says how many
+    /// such features there were; a feature without geometry is left out and counted. A clean layer
+    /// says neither.
+    #[test]
+    fn simplify_says_what_it_leaves_alone_and_out() {
+        let run = |with_bad: bool, tolerance: f64| {
+            let mut lines = Dataset::new("lines", GeometryType::Polyline, vec![]);
+            let zig: Vec<Coord> = (0..10).map(|i| Coord::new(i as f64 * 0.1, if i % 2 == 0 { 0.0 } else { 0.001 })).collect();
+            lines.push(Some(Geometry::Line(vec![zig.clone()])), vec![]);
+            if with_bad {
+                let mut bad = zig.clone();
+                if let Some(c) = bad.get_mut(4) {
+                    c.x = f64::NAN;
+                }
+                lines.push(Some(Geometry::Line(vec![bad])), vec![]);
+                // A longitude that is a number, but infinite on the analysis plane.
+                let mut far = zig.clone();
+                if let Some(c) = far.get_mut(4) {
+                    c.x = 1e308;
+                }
+                lines.push(Some(Geometry::Line(vec![far])), vec![]);
+                // One finite on the plane, but whose squares there would overflow.
+                let mut huge = zig.clone();
+                if let Some(c) = huge.get_mut(4) {
+                    c.x = 1e200;
+                }
+                lines.push(Some(Geometry::Line(vec![huge])), vec![]);
+                // A latitude past the pole, taken as the pole.
+                lines.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)]])), vec![]);
+                lines.push(None, vec![]);
+            }
+            let input: Vec<String> = lines.features.iter().map(|f| format!("{:?}", f.geometry)).collect();
+            let m = Map(HashMap::from([("lines".to_string(), lines)]));
+            let res = crate::run("simplify", &m, &serde_json::json!({"input": "lines", "tolerance": tolerance})).unwrap();
+            let messages = res.messages.clone();
+            (layer(res), messages, input)
+        };
+        let (out, messages, input) = run(true, 1.0);
+        assert_eq!(out.features.len(), 5);
+        // The clean line is simplified to its ends; the broken ones are exactly as they were, the
+        // NaN and the 1e308 included (compared as text, as NaN equals nothing).
+        assert_eq!(out.features[0].geometry.as_ref().map(Geometry::coord_count), Some(2));
+        for k in [1, 2, 3] {
+            assert_eq!(format!("{:?}", out.features[k].geometry), input[k], "feature {k}");
+        }
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "Simplify: 3 line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m
+                == "Simplify: 1 vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"),
+            "{messages:?}"
+        );
+        // With a tolerance of 0 nothing is simplified, so the broken lines aren't blamed for it.
+        // At 0 every feature is as it was, the 1e308 and the 95° included, and nothing is said of them.
+        let (out0, at_zero, input0) = run(true, 0.0);
+        assert_eq!(out0.features.len(), 5);
+        for (k, (f, before)) in out0.features.iter().zip(&input0).enumerate() {
+            assert_eq!(&format!("{:?}", f.geometry), before, "feature {k} at 0");
+        }
+        assert!(!at_zero.iter().any(|m| m.contains("missing or infinite") || m.contains("past a pole")), "{at_zero:?}");
+        assert!(messages.iter().any(|m| m == "Simplify: 1 feature(s) left out: they have no geometry to simplify"), "{messages:?}");
+        let (_, clean, _) = run(false, 1.0);
+        assert_eq!(clean.len(), 1, "{clean:?}");
     }
 
     #[test]
@@ -7410,16 +8129,16 @@ mod tests {
         let line = Geometry::Line(vec![vec![Coord::new(10.0, 46.0), Coord::new(10.1, 46.0), Coord::new(10.2, 46.0)]]);
         assert_eq!(simplify_geometry(&line, 1e6).coord_count(), 2);
         let repeated = geo::LineString::new(vec![geo::Coord { x: 1.0, y: 1.0 }; 6]);
-        assert_eq!(simplify_ring(&repeated, 1e6), repeated);
+        assert_eq!(simplify_ring(&repeated, 1e6, &SimplifyRun::default()), repeated);
         let collinear = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&collinear, 1e6), collinear);
+        assert_eq!(simplify_ring(&collinear, 1e6, &SimplifyRun::default()), collinear);
         let both_sides = geo::LineString::from(vec![(0.0, 0.0), (3.0, 0.0), (-3.0, 0.0), (0.0, 0.0), (1.0, 0.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&both_sides, 1e6), both_sides);
+        assert_eq!(simplify_ring(&both_sides, 1e6, &SimplifyRun::default()), both_sides);
         let concave = geo::LineString::from(vec![(0.0, 0.0), (3.0, 0.0), (2.0, 1.0), (-2.0, 1.0), (-3.0, 0.0), (-2.0, -1.0), (0.0, 0.0)]);
         let mut previous = concave.0.len();
         for tolerance in [0.1, 1.1, 2.5, 1e6] {
             use geo::{Distance, Euclidean};
-            let reduced = simplify_ring(&concave, tolerance);
+            let reduced = simplify_ring(&concave, tolerance, &SimplifyRun::default());
             assert!((4..=previous).contains(&reduced.0.len()));
             previous = reduced.0.len();
             let deviation = concave.0.iter().map(|c| Euclidean.distance(&geo::Point::from(*c), &reduced)).fold(0.0_f64, f64::max);
@@ -7428,9 +8147,9 @@ mod tests {
         }
         assert_eq!(previous, 4);
         let triangle = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&triangle, 1e6), triangle);
+        assert_eq!(simplify_ring(&triangle, 1e6, &SimplifyRun::default()), triangle);
         let nonfinite = geo::LineString::from(vec![(0.0, 0.0), (f64::INFINITY, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]);
-        assert_eq!(simplify_ring(&nonfinite, 1e6), nonfinite);
+        assert_eq!(simplify_ring(&nonfinite, 1e6, &SimplifyRun::default()), nonfinite);
     }
 
     /// Feature To Point, Minimum Bounding Geometry without grouping and Calculate Geometry make
@@ -9902,7 +10621,7 @@ mod tests {
         for tool in ["idwInterpolation", "kriging"] {
             let p = serde_json::json!({"input": "wells", "field": "v", "pixelSize": 500, "crs": "EPSG:32616"});
             let r = crate::run(tool, &m, &p).unwrap_or_else(|e| panic!("{tool}: {e}"));
-            assert!(!r.messages.iter().any(|m| m.contains("made in degrees") || m.contains("beyond what")), "{tool}: {:?}", r.messages);
+            assert!(!r.messages.iter().any(|m| m.contains("was read in") || m.contains("beyond what")), "{tool}: {:?}", r.messages);
             let Output::Layers(out) = r.output else { panic!("{tool}: expected layers") };
             let Some(OutputLayer::Raster { file_name, bytes, .. }) = out.first() else { panic!("{tool}: expected a raster") };
             let g = rustgis_data::raster::read_bytes(file_name, bytes).unwrap_or_else(|e| panic!("{tool}: {e}"));
@@ -9915,14 +10634,73 @@ mod tests {
             assert!(d.iter().all(|v| (1.0..=4.0).contains(v)), "{tool}: {d:?}");
             assert!(d[d.len() - g.width as usize] < d[g.width as usize - 1], "{tool}: south-west below north-east");
 
-            for (crs, why) in [(serde_json::json!("EPSG:4326"), "geographic"), (serde_json::json!(32616), "not text")] {
+            for (crs, why) in [(serde_json::json!("EPSG:4269"), "geographic, not WGS 84"), (serde_json::json!(32616), "not text")] {
                 let p = serde_json::json!({"input": "wells", "field": "v", "crs": crs});
                 assert!(crate::run(tool, &m, &p).is_err(), "{tool}: {why}");
             }
-            // Without `crs`, a layer read in UTM is made in degrees, and the run names its system.
-            let r = crate::run(tool, &m, &serde_json::json!({"input": "wells", "field": "v"})).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            // Without `crs`, a layer read in UTM is made in UTM, and the run says it took that.
+            let made_in = |p: serde_json::Value| {
+                let r = crate::run(tool, &m, &p).unwrap_or_else(|e| panic!("{tool}: {e}"));
+                let Output::Layers(out) = r.output else { panic!("{tool}: expected layers") };
+                let Some(OutputLayer::Raster { file_name, bytes, .. }) = out.first() else { panic!("{tool}: expected a raster") };
+                let g = rustgis_data::raster::read_bytes(file_name, bytes).unwrap_or_else(|e| panic!("{tool}: {e}"));
+                (g.crs, r.messages)
+            };
+            let (crs, messages) = made_in(serde_json::json!({"input": "wells", "field": "v"}));
+            assert_eq!(crs, Crs::Epsg(32616), "{tool}");
             let label = Crs::Epsg(32616).label();
-            assert!(r.messages.iter().any(|m| m.contains("made in degrees") && m.contains(&label)), "{tool}: {:?}", r.messages);
+            assert!(
+                messages.iter().any(|m| m.contains(&format!("made in {label}, the coordinate system wells was read in"))),
+                "{tool}: {messages:?}"
+            );
+            // A layer read in a system that can't hold the cells (geocentric) is made in degrees,
+            // and said.
+            let mut geocentric = m.0.get("wells").cloned().unwrap_or_else(|| panic!("wells"));
+            geocentric.crs = Some(Crs::Epsg(4978));
+            let m_geo = Map(HashMap::from([("wells".to_string(), geocentric)]));
+            let r =
+                crate::run(tool, &m_geo, &serde_json::json!({"input": "wells", "field": "v"})).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(
+                r.messages.iter().any(|m| m.contains("made in degrees") && m.contains("can't hold its cells")),
+                "{tool}: {:?}",
+                r.messages
+            );
+            // So is one this version can't project to, saying so.
+            let mut unknown = m.0.get("wells").cloned().unwrap_or_else(|| panic!("wells"));
+            unknown.crs = Some(Crs::Custom(u32::MAX));
+            let m_unknown = Map(HashMap::from([("wells".to_string(), unknown)]));
+            let r = crate::run(tool, &m_unknown, &serde_json::json!({"input": "wells", "field": "v"}))
+                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(r.messages.iter().any(|m| m.contains("made in degrees") && m.contains("can't project to")), "{tool}: {:?}", r.messages);
+            // Values a script gave in degrees, read in the layer's metres, are said, not taken quietly:
+            // an extent holding no points is refused, and too many cells say the units.
+            let run = |p: serde_json::Value| crate::run(tool, &m, &p);
+            let r = run(serde_json::json!({"input": "wells", "field": "v", "extent": "-90.1,35.05,-89.9,35.25"}))
+                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(
+                r.messages.iter().any(|m| m.contains("the extent holds none of the points: if it is in degrees, set crs to EPSG:4326")),
+                "{tool}: {:?}",
+                r.messages
+            );
+            // An extent in metres away from the wells is made too, with the same word: its numbers
+            // can't say which units they were meant in.
+            let r = run(serde_json::json!({"input": "wells", "field": "v", "extent": "0,0,10000,10000"}))
+                .unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(
+                r.messages.iter().any(|m| m.contains("(extent as given, in its units; the extent holds none of the points")),
+                "{tool}: {:?}",
+                r.messages
+            );
+            let e = run(serde_json::json!({"input": "wells", "field": "v", "pixelSize": 0.01})).err().unwrap_or_default();
+            assert!(e.contains(&format!("made in {label}")), "{tool}: {e}");
+            let r = run(serde_json::json!({"input": "wells", "field": "v", "pixelSize": 500})).unwrap_or_else(|e| panic!("{tool}: {e}"));
+            assert!(r.messages.iter().any(|m| m.contains("(pixelSize as given, in its units)")), "{tool}: {:?}", r.messages);
+            let e = run(serde_json::json!({"input": "wells", "field": "v", "crs": "EPSG:4269"})).err().unwrap_or_default();
+            assert!(e.contains("EPSG:4326 makes it in degrees"), "{tool}: {e}");
+            // EPSG:4326 asks for degrees, with nothing to say.
+            let (crs, messages) = made_in(serde_json::json!({"input": "wells", "field": "v", "crs": "EPSG:4326"}));
+            assert_eq!(crs, Crs::LonLat, "{tool}");
+            assert!(!messages.iter().any(|m| m.contains("was read in")), "{tool}: {messages:?}");
         }
 
         // A point Web Mercator can't hold is left out and counted; the others make the raster.
@@ -9935,7 +10713,7 @@ mod tests {
             let p = serde_json::json!({"input": "polar", "field": "v", "crs": "EPSG:3857"});
             let r = crate::run(tool, &m, &p).unwrap_or_else(|e| panic!("{tool}: {e}"));
             assert!(r.messages.iter().any(|m| m.starts_with("1 point(s) beyond what")), "{tool}: {:?}", r.messages);
-            assert!(!r.messages.iter().any(|m| m.contains("made in degrees")), "{tool}: {:?}", r.messages);
+            assert!(!r.messages.iter().any(|m| m.contains("was read in")), "{tool}: {:?}", r.messages);
         }
     }
 
@@ -9989,18 +10767,23 @@ mod tests {
         assert!(crate::run("kriging", &m, &serde_json::json!({"input": "pts", "field": "v", "range": -5})).is_err());
         assert!(crate::run("kriging", &m, &serde_json::json!({"input": "pts", "field": "v", "range": "none"})).is_err());
 
-        // Source CRS metadata does not change the normalized longitude/latitude geometry.
+        // A layer read in a projected system is made in degrees when EPSG:4326 asks, as before
+        // `crs` was there: the same rasters. Left empty it takes the layer's system, and says so.
         let Some(pts_layer) = m.0.get("pts") else { panic!("missing pts") };
         let mut proj_pts = pts_layer.clone();
         proj_pts.crs = Some(rustgis_data::raster::Crs::WebMercator);
         let m_proj = Map(HashMap::from([("proj_pts".to_string(), proj_pts)]));
-        let projected =
-            crate::run("kriging", &m_proj, &serde_json::json!({"input": "proj_pts", "field": "v", "extent": "0,0,2,2", "pixelSize": 0.5}))
-                .unwrap();
-        // Without `crs` it is still made in degrees, and says so for a layer read in metres.
-        let degrees_note = |messages: &[String]| messages.iter().any(|m| m.contains("made in degrees"));
-        assert!(degrees_note(&projected.messages), "{:?}", projected.messages);
-        assert!(!degrees_note(&r.messages), "{:?}", r.messages);
+        let in_degrees = serde_json::json!({"input": "proj_pts", "field": "v", "extent": "0,0,2,2", "pixelSize": 0.5, "crs": "EPSG:4326"});
+        let projected = crate::run("kriging", &m_proj, &in_degrees).unwrap();
+        let assumed = |messages: &[String]| messages.iter().any(|m| m.contains("the coordinate system pts was read in"));
+        assert!(!assumed(&projected.messages), "{:?}", projected.messages);
+        assert!(!r.messages.iter().any(|m| m.contains("was read in")), "{:?}", r.messages);
+        let in_its_own = crate::run("kriging", &m_proj, &serde_json::json!({"input": "proj_pts", "field": "v"})).unwrap();
+        assert!(assumed(&in_its_own.messages), "{:?}", in_its_own.messages);
+        let Output::Layers(own) = in_its_own.output else { panic!("expected layers") };
+        let Some(OutputLayer::Raster { file_name, bytes, .. }) = own.first() else { panic!("expected a raster") };
+        let g = rustgis_data::raster::read_bytes(file_name, bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(g.crs, rustgis_data::raster::Crs::WebMercator);
         let Output::Layers(projected_layers) = projected.output else { panic!("expected layers") };
         assert_eq!(projected_layers.len(), out.len());
         for (actual, expected) in projected_layers.iter().zip(&out) {
@@ -11729,7 +12512,9 @@ mod tests {
         m.0.get_mut("parcels").unwrap().push(None, vec![Value::Text("p3".into()), Value::Text("lot".into())]);
         // An update feature without geometry adds nothing.
         m.0.get_mut("zones").unwrap().push(None, vec![Value::Text("z0".into()), Value::Null]);
-        let out = layer(crate::run("update", &m, &serde_json::json!({"input": "parcels", "update": "zones"})).unwrap());
+        let res = crate::run("update", &m, &serde_json::json!({"input": "parcels", "update": "zones"})).unwrap();
+        assert!(!res.messages.iter().any(|m| m.contains("is null in")), "values that fit say nothing: {:?}", res.messages);
+        let out = layer(res);
         assert_eq!(out.name, "parcels_Update");
         let names: Vec<&str> = out.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["id", "use"], "the input's fields only");
@@ -11756,6 +12541,25 @@ mod tests {
         assert_eq!(out.features[4].geometry, zones.features[1].geometry);
         let e = crate::run("update", &inputs(), &serde_json::json!({"input": "pts", "update": "polys"})).unwrap_err();
         assert!(e.contains("not a polygon layer"), "{e}");
+    }
+
+    #[test]
+    fn update_says_what_a_date_field_keeps_of_a_date_time() {
+        let fields = vec![Field::new("d", FieldType::Date), Field::new("n", FieldType::Integer)];
+        let mut parcels = Dataset::new("parcels", GeometryType::Polygon, fields);
+        parcels.push(Some(sq(0.0, 0.0, 1.0)), vec![Value::Null, Value::Null]);
+        let fields = vec![Field::new("d", FieldType::DateTime), Field::new("n", FieldType::Text)];
+        let mut zones = Dataset::new("zones", GeometryType::Polygon, fields);
+        let at = |t: &str| Value::DateTime(rustgis_data::DateTime::parse(t).unwrap());
+        // A midnight without a zone is all there is to its day; `<null>` asks for null.
+        zones.push(Some(sq(5.0, 0.0, 1.0)), vec![at("2026-03-05T00:00:00"), Value::Text("<null>".into())]);
+        let m = |zones: Dataset| Map(HashMap::from([("parcels".to_string(), parcels.clone()), ("zones".to_string(), zones)]));
+        let res = crate::run("update", &m(zones.clone()), &serde_json::json!({"input": "parcels", "update": "zones"})).unwrap();
+        assert_eq!(res.messages.len(), 1, "{:?}", res.messages);
+        zones.push(Some(sq(7.0, 0.0, 1.0)), vec![at("2026-03-05T14:30:00+02:00"), Value::Null]);
+        let res = crate::run("update", &m(zones), &serde_json::json!({"input": "parcels", "update": "zones"})).unwrap();
+        assert_eq!(res.messages.get(1).map(String::as_str), Some("Update: 'd' holds dates, so 1 update feature kept only its day"));
+        assert_eq!(res.messages.len(), 2);
     }
 
     #[test]
@@ -11786,7 +12590,14 @@ mod tests {
         zones.push(Some(sq(5.0, 0.0, 1.0)), row(0.1, " 7 ", 3, 1));
         zones.push(Some(sq(7.0, 0.0, 1.0)), row(2.5, "seven", -2, 0));
         let m = Map(HashMap::from([("parcels".to_string(), parcels), ("zones".to_string(), zones)]));
-        let out = layer(crate::run("update", &m, &serde_json::json!({"input": "parcels", "update": "zones"})).unwrap());
+        let res = crate::run("update", &m, &serde_json::json!({"input": "parcels", "update": "zones"})).unwrap();
+        // "seven" isn't a whole number: null, and said.
+        assert_eq!(
+            res.messages.get(1).map(String::as_str),
+            Some("Update: 'n' is null in 1 update feature, whose value isn't a Long value")
+        );
+        assert_eq!(res.messages.len(), 2);
+        let out = layer(res);
         let attrs: Vec<&[Value]> = out.features.iter().skip(1).map(|f| f.attrs.as_slice()).collect();
         assert_eq!(
             attrs,
@@ -11826,6 +12637,16 @@ mod tests {
         assert_eq!(converted(&Value::Int(5), FieldType::Text), Value::Text("5".into()));
         assert_eq!(converted(&Value::Text("x".into()), FieldType::Double), Value::Null);
         assert_eq!(converted(&Value::Null, FieldType::Text), Value::Null);
+        // A date-time into a date field is its day; a date into a date-time field, its midnight.
+        let t = Value::parse("2026-03-05T23:30:00+02:00", FieldType::DateTime);
+        assert_eq!(converted(&t, FieldType::Date), Value::parse("2026-03-05", FieldType::Date));
+        let d = Value::parse("2026-03-05", FieldType::Date);
+        assert_eq!(converted(&d, FieldType::DateTime), Value::parse("2026-03-05T00:00:00", FieldType::DateTime));
+        // A date into a number or yes/no field is null (and counted), not read as false.
+        for ty in [FieldType::Boolean, FieldType::Integer, FieldType::Double] {
+            assert_eq!(converted(&d, ty), Value::Null, "{ty:?}");
+            assert_eq!(converted(&t, ty), Value::Null, "{ty:?}");
+        }
     }
 
     /// The layers of a tool's output with several.
@@ -13194,6 +14015,26 @@ mod tests {
         let text = layer(crate::run("summaryStatistics", &m, &serde_json::json!({"input": "parcels", "field": "owner"})).unwrap());
         assert_eq!((column(&text, "COUNT_owner"), column(&text, "MEAN_owner")), (vec![Value::Int(0)], vec![Value::Null]));
         assert_eq!(text.fields.get(3).map(|f| f.ty), Some(FieldType::Double));
+        // A date field gives its count and its earliest and latest dates, as dates.
+        let mut permits = Dataset::new("permits", GeometryType::Polygon, vec![Field::new("issued", FieldType::Date)]);
+        for day in ["2026-03-05", "1999-12-31", "", "2026-01-01"] {
+            permits.push(Some(sq(0.0, 0.0, 1.0)), vec![Value::parse(day, FieldType::Date)]);
+        }
+        let m = Map(HashMap::from([("permits".to_string(), permits)]));
+        let dates = layer(crate::run("summaryStatistics", &m, &serde_json::json!({"input": "permits", "field": "issued"})).unwrap());
+        let names: Vec<(&str, FieldType)> = dates.fields.iter().map(|f| (f.name.as_str(), f.ty)).collect();
+        assert_eq!(
+            names,
+            [
+                ("FREQUENCY", FieldType::Integer),
+                ("COUNT_issued", FieldType::Integer),
+                ("MIN_issued", FieldType::Date),
+                ("MAX_issued", FieldType::Date)
+            ]
+        );
+        assert_eq!(column(&dates, "COUNT_issued"), [Value::Int(3)]);
+        assert_eq!(column(&dates, "MIN_issued"), [Value::parse("1999-12-31", FieldType::Date)]);
+        assert_eq!(column(&dates, "MAX_issued"), [Value::parse("2026-03-05", FieldType::Date)]);
     }
 
     /// A statistics list over several case fields: groups for each (zone, district), the pairs'

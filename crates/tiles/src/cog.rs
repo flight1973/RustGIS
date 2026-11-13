@@ -14,6 +14,7 @@
 //! reads, tile counts and sizes are bounded (see [`rustgis_data::raster::cog`]).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rustgis_data::diagnostics::message_with_address;
@@ -369,6 +370,33 @@ pub fn info(url: &str) -> Result<Option<Arc<Info>>, String> {
     Ok(None)
 }
 
+/// A file's info if its header is already in, without asking for it (a layer the map doesn't
+/// draw starts no read): what has landed, for what is said once it has. `None` while it is being
+/// read, after a failed read, or where the address may not be read now (a login that ended).
+pub fn info_landed(url: &str) -> Option<Arc<Info>> {
+    crate::cache::check_still(&crate::cache::current_still()).ok()?;
+    crate::logins::check(url).ok()?;
+    let url = split(url).0;
+    match infos().lock().unwrap_or_else(|e| e.into_inner()).get(url) {
+        Some(State::Ready(info)) => Some(info.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a file's header is being read now (asked for, not in yet), without asking for it.
+pub fn info_loading(url: &str) -> bool {
+    matches!(infos().lock().unwrap_or_else(|e| e.into_inner()).get(split(url).0), Some(State::Loading(_)))
+}
+
+/// How many headers have landed in this run: what looks for headers landed since it last looked
+/// (the files a dated series showed before the slider moved on) looks again only when it changes.
+static LANDED: AtomicU64 = AtomicU64::new(0);
+
+/// The count of headers landed so far ([`LANDED`]).
+pub fn landed_count() -> u64 {
+    LANDED.load(Ordering::Relaxed)
+}
+
 /// Shares parsed headers and loading waiters, retaining retry delays only for resource failures.
 fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>) {
     let then = caller_callback(then);
@@ -418,7 +446,10 @@ fn with_info(url: &str, then: Box<dyn FnOnce(Result<Arc<Info>, String>) + Send>)
             let waiting = {
                 let mut i = infos().lock().unwrap_or_else(|e| e.into_inner());
                 let old = match &r {
-                    Ok(info) => i.insert(key, State::Ready(info.clone())),
+                    Ok(info) => {
+                        LANDED.fetch_add(1, Ordering::Relaxed);
+                        i.insert(key, State::Ready(info.clone()))
+                    }
                     Err(_) if transient => i.remove(&key),
                     Err(e) => {
                         // Read again once its wait is over: the map draws again then (a 429
@@ -784,22 +815,41 @@ fn with_stretch(info: Arc<Info>, file: String, look: Look, then: StretchThen) {
             w(s.clone());
         }
     };
+    // The colour bands, and the alpha band where the file has one: a cell it hides is left out,
+    // as the map leaves it unpainted (#1810), so a value a see-through cell holds (−3.4e38 in a
+    // Float32 image) doesn't set the stretch.
+    let read = info.shown_from(colour.clone());
+    let alpha = info.alpha.and_then(|a| read.iter().rposition(|b| *b == a));
+    let opaque = rustgis_data::raster::alpha_max(info.layout.data_type);
     fetch_bands(
         info,
         file,
         coarsest,
         tiles,
-        colour.clone(),
+        read,
         Box::new(move |r| match r {
             Ok(picked) => {
                 let s: Vec<(f32, f32)> = (0..colour.len())
                     .map(|j| {
+                        // The alpha band shown as a colour isn't hidden by itself.
+                        let alpha = alpha.filter(|a| *a != j);
                         percentiles(
                             picked
                                 .iter()
-                                .filter_map(|t| t.get(j))
-                                .filter_map(|(chunk, b)| chunk.get(*b))
-                                .flat_map(|v| v.iter().map(|x| shown_value(*x, look.aef)))
+                                .filter_map(|t| {
+                                    let band = t.get(j).and_then(|(chunk, b)| chunk.get(*b))?;
+                                    Some((band, alpha.and_then(|a| t.get(a)).and_then(|(chunk, b)| chunk.get(*b))))
+                                })
+                                .flat_map(|(band, hides)| {
+                                    band.iter()
+                                        .enumerate()
+                                        .filter(move |(i, _)| {
+                                            hides.is_none_or(|al| {
+                                                al.get(*i).is_some_and(|&a| !rustgis_data::raster::see_through(a, !a.is_nan(), opaque))
+                                            })
+                                        })
+                                        .map(|(_, x)| shown_value(*x, look.aef))
+                                })
                                 .collect(),
                         )
                     })
@@ -1512,9 +1562,29 @@ pub fn read_values_counted_blocking(
     rows: (u32, u32),
     stop: &std::sync::atomic::AtomicBool,
 ) -> Result<(Vec<f32>, u64, u64), String> {
+    let mut read = read_bands_counted_blocking(info, url, level, &[band], cols, rows, Duration::from_secs(120), stop)?;
+    read.pop().ok_or_else(|| "no band was read".to_string())
+}
+
+/// [`read_values_counted_blocking`] for several bands of the window at once (in their order): their
+/// tiles are asked for together, so the reads of a file whose bands are stored apart (a chunk a
+/// band, as AlphaEarth's 64) overlap instead of following one another. It waits up to `wait` for
+/// them all.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+pub fn read_bands_counted_blocking(
+    info: &Arc<Info>,
+    url: &str,
+    level: usize,
+    bands: &[usize],
+    cols: (u32, u32),
+    rows: (u32, u32),
+    wait: Duration,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<(Vec<f32>, u64, u64)>, String> {
     let url = split(url).0.to_string();
     let l = info.layout.levels.get(level).ok_or("no such overview")?;
-    if band >= info.layout.bands.max(1) {
+    if bands.iter().any(|b| *b >= info.layout.bands.max(1)) {
         return Err(format!("the file has {} band(s)", info.layout.bands));
     }
     // The window's size checked before its values are allocated: a caller's window, not the file.
@@ -1526,8 +1596,13 @@ pub fn read_values_counted_blocking(
     // The part of the window inside the file.
     let (x0, x1) = (cols.0.min(l.width), cols.1.min(l.width));
     let (y0, y1) = (rows.0.min(l.height), rows.1.min(l.height));
+    // Reserved first: a window the machine can't hold is an error, not a crash (#1291).
+    let mut outs = bands
+        .iter()
+        .map(|_| rustgis_data::raster::filled(w, h, f32::NAN).map(|v| (v, 0u64, 0u64)).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, String>>()?;
     if x1 <= x0 || y1 <= y0 {
-        return Ok((rustgis_data::raster::filled(w, h, f32::NAN).map_err(|e| e.to_string())?, 0, 0));
+        return Ok(outs);
     }
     let (tw, th, across) = (l.tile_width.max(1), l.tile_height.max(1), l.across().max(1));
     // The tiles the window takes, counted before they are listed, in checked arithmetic: a
@@ -1539,39 +1614,42 @@ pub fn read_values_counted_blocking(
     }
     let tiles: Vec<u32> =
         (r0..=r1).flat_map(|ty| (c0..=c1).filter_map(move |tx| ty.checked_mul(across).and_then(|t| t.checked_add(tx)))).collect();
-    // Reserved first: a window the machine can't hold is an error, not a crash (#1291).
-    let (mut out, mut rounded, mut overflowed) = (rustgis_data::raster::filled(w, h, f32::NAN).map_err(|e| e.to_string())?, 0u64, 0u64);
     if stop.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(message_with_address(&url, STOPPED));
     }
     let (tx, rx) = std::sync::mpsc::channel();
-    fetch_bands(info.clone(), url.clone(), level, tiles.clone(), vec![band], Box::new(move |r| tx.send(r).unwrap_or_default()));
-    let picked =
-        wait_until(&rx, Duration::from_secs(120), stop).map_err(|stopped| stopped_or(stopped, &url, "tiles not read in two minutes"))??;
+    fetch_bands(info.clone(), url.clone(), level, tiles.clone(), bands.to_vec(), Box::new(move |r| tx.send(r).unwrap_or_default()));
+    let late = if wait == Duration::from_secs(120) {
+        "tiles not read in two minutes".to_string()
+    } else {
+        format!("tiles not read in {} s", wait.as_secs())
+    };
+    let picked = wait_until(&rx, wait, stop).map_err(|stopped| stopped_or(stopped, &url, &late))??;
     let nodata = info.layout.nodata.map(|v| v as f32);
     for (&t, p) in tiles.iter().zip(&picked) {
-        let Some((chunk, b)) = p.first() else { continue };
-        let Some(values) = chunk.get(*b) else { continue };
         let (tx0, ty0) = ((t % across).saturating_mul(tw), (t / across).saturating_mul(th));
-        for py in ty0.max(y0)..ty0.saturating_add(th).min(y1) {
-            for px in tx0.max(x0)..tx0.saturating_add(tw).min(x1) {
-                let i = (py - ty0) as usize * tw as usize + (px - tx0) as usize;
-                let Some(&v) = values.get(i) else { continue };
-                // A marked value past `f32`'s range is infinite: left out as no value, and
-                // counted apart from those rounded. No-data isn't marked.
-                if chunk.rounded_at(*b, i) {
-                    if v.is_infinite() { overflowed += 1 } else { rounded += 1 }
-                }
-                if v.is_finite()
-                    && Some(v) != nodata
-                    && let Some(slot) = out.get_mut((py - rows.0) as usize * w + (px - cols.0) as usize)
-                {
-                    *slot = v;
+        for ((chunk, b), (out, rounded, overflowed)) in p.iter().zip(outs.iter_mut()) {
+            let Some(values) = chunk.get(*b) else { continue };
+            for py in ty0.max(y0)..ty0.saturating_add(th).min(y1) {
+                for px in tx0.max(x0)..tx0.saturating_add(tw).min(x1) {
+                    let i = (py - ty0) as usize * tw as usize + (px - tx0) as usize;
+                    let Some(&v) = values.get(i) else { continue };
+                    // A marked value past `f32`'s range is infinite: left out as no value, and
+                    // counted apart from those rounded. No-data isn't marked.
+                    if chunk.rounded_at(*b, i) {
+                        if v.is_infinite() { *overflowed += 1 } else { *rounded += 1 }
+                    }
+                    if v.is_finite()
+                        && Some(v) != nodata
+                        && let Some(slot) = out.get_mut((py - rows.0) as usize * w + (px - cols.0) as usize)
+                    {
+                        *slot = v;
+                    }
                 }
             }
         }
     }
-    Ok((out, rounded, overflowed))
+    Ok(outs)
 }
 
 #[cfg(test)]
@@ -1750,6 +1828,65 @@ mod tests {
         assert!(info.stretch_for(&own).is_none(), "kept, which a look of its bands would take for its own");
     }
 
+    /// A colour image's stretch leaves out the cells its alpha band hides (#1810): an RGBA
+    /// Float32 COG whose see-through half holds −3.4e38, as an export from before #1759 wrote it,
+    /// is stretched over its opaque half, black cells and all.
+    #[test]
+    fn a_stretch_leaves_out_what_the_alpha_band_hides() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let _turn = crate::cache::turn();
+        let _alarm = crate::cache::alarm_turn();
+        let (w, h) = (512usize, 512usize);
+        let n = w * h;
+        // The top half opaque, 10 to 209 and black in its first column; the bottom see-through.
+        let colour: Vec<f32> = (0..n)
+            .map(|i| {
+                if i >= n / 2 {
+                    -3.4e38
+                } else if i % w == 0 {
+                    0.0
+                } else {
+                    (10 + i % 200) as f32
+                }
+            })
+            .collect();
+        let alpha: Vec<f32> = (0..n).map(|i| if i >= n / 2 { 0.0 } else { 1.0 }).collect();
+        let gt = GeoTransform { origin_x: 500_000.0, origin_y: 4_800_000.0, pixel_width: 10.0, pixel_height: -10.0 };
+        let utm = Crs::from_epsg(32611).unwrap();
+        let bands = vec![colour.clone(), colour.clone(), colour, alpha];
+        let r = Raster::new("rgba", w as u32, h as u32, bands, gt, utm, None, ColorHint::Rgb { alpha: true }, "Float32").unwrap();
+        let file = Arc::new(rustgis_data::raster::cogwrite::write(&r, 0).unwrap());
+        let held = Arc::new(Mutex::new(Vec::<(String, Done)>::new()));
+        let hold = held.clone();
+        crate::cache::set_fetcher(move |url, done| hold.lock().unwrap().push((url, done)));
+        let drain = || {
+            for _ in 0..100 {
+                let pending = std::mem::take(&mut *held.lock().unwrap());
+                if pending.is_empty() {
+                    return;
+                }
+                for (url, done) in pending {
+                    let (a, b) = crate::cache::split_range(&url).1.unwrap();
+                    done(Ok(file[a as usize..((b + 1) as usize).min(file.len())].to_vec()));
+                }
+            }
+            panic!("bounded reads");
+        };
+        let url = "https://see-through.invalid/rgba.tif".to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        with_info(&url, Box::new(move |r| tx.send(r).unwrap()));
+        drain();
+        let info = rx.recv().unwrap().unwrap();
+        assert_eq!(info.alpha, Some(3));
+        let (tx, rx) = std::sync::mpsc::channel();
+        with_stretch(info, url.clone(), Look::default(), Box::new(move |r| tx.send(r).unwrap()));
+        drain();
+        let stretch = rx.recv().unwrap().unwrap();
+        assert_eq!(stretch.len(), 3);
+        assert!(stretch.iter().all(|(lo, hi)| (0.0..=209.0).contains(lo) && (0.0..=209.0).contains(hi) && lo < hi), "{stretch:?}");
+        forget_file(&url);
+    }
+
     /// A joint read whose tiles the fetch queue keeps dropping ends, saying so, rather than
     /// asking without end: within eight drops a tile (64 at least).
     #[test]
@@ -1925,7 +2062,7 @@ mod tests {
         out.extend((0..n).flat_map(|_| 1u32.to_le_bytes()));
         out.extend((0..n).flat_map(|i| (data_at + i).to_le_bytes()));
         let px = 1.0 / 3600.0;
-        out.extend([px, px, 0.0, 0.0, 0.0, 0.0, 0.0, -74.0, 6.0, 0.0].iter().flat_map(|v: &f64| v.to_le_bytes()));
+        out.extend([px, px, 0.0, 0.0, 0.0, 0.0, -74.0, 6.0, 0.0].iter().flat_map(|v: &f64| v.to_le_bytes()));
         out.extend([1u16, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326].iter().flat_map(|v| v.to_le_bytes()));
         out
     }
@@ -1939,6 +2076,7 @@ mod tests {
         assert_eq!(layout.levels.len(), 1);
         assert_eq!(layout.levels[0].offsets.len(), 490_000);
         assert_eq!(layout.levels[0].width, 179_200);
+        assert_eq!((layout.transform.origin_x, layout.transform.origin_y), (-74., 6.));
         assert!(rounds <= 6, "{rounds} reads");
         // No byte is read twice: a read stops where a part already read starts.
         assert!(held <= file.len() as u64, "{held} bytes held of a {}-byte header", file.len());

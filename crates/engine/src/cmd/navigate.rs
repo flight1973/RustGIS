@@ -75,12 +75,8 @@ pub fn commands() -> Vec<C> {
         .params(r#"{"scale": number}"#),
         C::new("map.basemap", "Basemap", "Home › Add", basemap).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"name": "paper"|"midnight"|"ocean"|"atlas"|"blank", "keepTiles"?: bool (keeps the web tile basemaps over it)}"#),
-        C::new("map.graticule", "Graticule", "View › Display", |s, p| {
-            let m = s.map_mut();
-            m.graticule = super::b(p, "on").unwrap_or(!m.graticule);
-            Ok(Value::Null)
-        }).roles(&[]).effects(crate::policy::Effects::NONE)
-        .params(r#"{"on"?: bool (toggles when omitted)}"#),
+        C::new("map.graticule", "Graticule", "View › Display", graticule).roles(&[]).effects(crate::policy::Effects::NONE)
+        .params(r#"{"on"?: bool (toggles when omitted, on when a type or crs is given), "type"?: "degrees"|"measured"|"utm", "crs"?: a projected system for the measured grid (EPSG:2056, WKT or a PROJ string; "" or null: the map's own when projected, else the UTM zone at the view's centre)}"#),
         C::new("map.reloadWebLayers", "Reload Web Layers", "View › Display", |_, _| {
             // The map view draws again when the tile cache's generation moves.
             crate::render::rustgis_tiles::cache::clear();
@@ -533,6 +529,62 @@ fn set_bearing(s: &mut Session, p: &Value) -> CmdResult {
     Ok(out)
 }
 
+/// Shows or hides the map's graticule, and sets what it draws: a type or a coordinate system
+/// given shows it too. A coordinate system is for the measured grid, and refused (naming it) when
+/// it can't be read or isn't projected.
+fn graticule(s: &mut Session, p: &Value) -> CmdResult {
+    use rustgis_map::graticule::GraticuleType;
+    let kind = match p.get("type") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) => Some(GraticuleType::from_name(t).ok_or_else(|| {
+            let names: Vec<&str> = GraticuleType::ALL.iter().map(|t| t.code()).collect();
+            format!("type must be one of {}, not \"{t}\"", names.join(", "))
+        })?),
+        Some(other) => {
+            let names: Vec<String> = GraticuleType::ALL.iter().map(|t| format!("\"{}\"", t.code())).collect();
+            return Err(format!("type must be one of {}, not {other}", names.join(", ")));
+        }
+    };
+    let crs = match p.get("crs") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(c)) if c.trim().is_empty() => Some(None),
+        Some(Value::String(c)) if c.trim().chars().count() > rustgis_map::layout::MAX_GRID_CRS => {
+            return Err(format!("crs: at most {} characters", rustgis_map::layout::MAX_GRID_CRS));
+        }
+        Some(Value::String(c)) => {
+            let read = rustgis_data::raster::Crs::parse(c.trim()).map_err(|e| format!("crs: {e}"))?;
+            if read.is_geographic() {
+                return Err(format!(
+                    "crs: {} is geographic; a measured grid needs a projected system (\"degrees\" draws latitudes and longitudes)",
+                    c.trim()
+                ));
+            }
+            if read.is_geocentric() {
+                return Err(format!("crs: {} is geocentric; a measured grid needs a projected system", c.trim()));
+            }
+            // (As the project checks it when it opens: one this version can't project to draws no grid.)
+            if let Err(e) = read.transformer() {
+                return Err(format!("crs: {} can't be used here: {e}", c.trim()));
+            }
+            Some(Some(c.trim().to_string()))
+        }
+        Some(other) => return Err(format!("crs must be a coordinate system (EPSG:2056, WKT or a PROJ string), or \"\", not {other}")),
+    };
+    let m = s.map_mut();
+    let kind_after = kind.unwrap_or(m.graticule_type);
+    if matches!(crs, Some(Some(_))) && kind_after != GraticuleType::Measured {
+        return Err(format!("crs is the measured grid's; the graticule is \"{}\" (give \"type\": \"measured\")", kind_after.code()));
+    }
+    let set = kind.is_some() || crs.is_some();
+    m.graticule = super::b(p, "on").unwrap_or(if set { true } else { !m.graticule });
+    m.graticule_type = kind_after;
+    if let Some(c) = crs {
+        m.graticule_crs = c;
+    }
+    Ok(json!({"on": m.graticule, "type": m.graticule_type.code(), "crs": m.graticule_crs}))
+}
+
 fn basemap(s: &mut Session, p: &Value) -> CmdResult {
     let n = s_name(p)?;
     let m = s.map_mut();
@@ -649,11 +701,11 @@ pub fn new_bookmark_name(map: &Map) -> String {
 }
 
 /// The longest bookmark name and description kept.
-const MAX_BOOKMARK_NAME: usize = 120;
+pub(crate) const MAX_BOOKMARK_NAME: usize = 120;
 const MAX_DESCRIPTION: usize = 2_000;
 
 /// Most bookmarks a map keeps.
-const MAX_BOOKMARKS: usize = 10_000;
+pub(crate) const MAX_BOOKMARKS: usize = 10_000;
 
 /// The map's bookmarks as a bookmarks file. Places are lon/lat and metres per pixel, so they
 /// open in the same place on a map in any projection.
@@ -693,42 +745,90 @@ fn import_bookmarks(s: &mut Session, p: &Value) -> CmdResult {
     let list = v.get("bookmarks").and_then(Value::as_array).ok_or("not a RustGIS bookmarks file: no bookmarks")?;
     let m = s.map_mut();
     let mut names = Vec::new();
-    for b in list.iter().take(MAX_BOOKMARKS) {
-        if m.bookmarks.len() >= MAX_BOOKMARKS {
-            break;
-        }
-        let name: String = match super::ps(b, "name").map(str::trim).filter(|n| !n.is_empty()) {
-            Some(n) => n.chars().take(MAX_BOOKMARK_NAME).collect(),
-            None => continue,
+    // The map's bookmarks by name (the first of any that differ only in case, as found before),
+    // and the names this file added or replaced: a file of many entries is read in one pass.
+    let mut at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, b) in m.bookmarks.iter().enumerate() {
+        at.entry(b.name.to_ascii_lowercase()).or_insert(i);
+    }
+    let mut taken = std::collections::HashSet::new();
+    // What the file has that isn't taken, counted to be said (#1896).
+    let (mut no_name, mut no_place, mut past, mut cut_names, mut cut_descriptions) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    for b in list {
+        // A cut name is counted once the bookmark is kept, below.
+        let (name, name_cut): (String, bool) = match super::ps(b, "name").map(str::trim).filter(|n| !n.is_empty()) {
+            Some(n) => (n.chars().take(MAX_BOOKMARK_NAME).collect(), n.chars().nth(MAX_BOOKMARK_NAME).is_some()),
+            None => {
+                no_name += 1;
+                continue;
+            }
         };
-        let (Some(lon), Some(lat), Some(ground)) = (f(b, "lon"), f(b, "lat"), f(b, "metresPerPixel")) else { continue };
+        let (Some(lon), Some(lat), Some(ground)) = (f(b, "lon"), f(b, "lat"), f(b, "metresPerPixel")) else {
+            no_place += 1;
+            continue;
+        };
         if !(lon.is_finite() && lat.is_finite() && (-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat)) {
+            no_place += 1;
             continue;
         }
-        let Some(mut camera) = place_at(m, Coord::new(lon, lat), ground) else { continue };
+        let Some(mut camera) = place_at(m, Coord::new(lon, lat), ground) else {
+            no_place += 1;
+            continue;
+        };
+        // A new bookmark past the map's limit is left out; one replacing a bookmark by its name
+        // is taken, as it adds none.
+        let key = name.to_ascii_lowercase();
+        let existing = at.get(&key).copied();
+        if existing.is_none() && m.bookmarks.len() >= MAX_BOOKMARKS {
+            past += 1;
+            continue;
+        }
+        cut_names += usize::from(name_cut);
         // A file from before bearings faces north.
         camera.set_bearing(f(b, "bearing").unwrap_or(0.0));
         camera.set_pitch(f(b, "pitch").unwrap_or(0.0));
         // Absent (a file from before descriptions, or written by hand) isn't empty: a bookmark
         // it replaces keeps its own.
-        let description: Option<String> = super::ps(b, "description").map(|d| d.trim().chars().take(MAX_DESCRIPTION).collect());
+        let description: Option<String> = super::ps(b, "description").map(|d| {
+            cut_descriptions += usize::from(d.trim().chars().nth(MAX_DESCRIPTION).is_some());
+            d.trim().chars().take(MAX_DESCRIPTION).collect()
+        });
         // A bookmark by the same name is replaced where it is in the list (importing a file
         // again updates its bookmarks).
-        match m.bookmarks.iter_mut().find(|b| b.name.eq_ignore_ascii_case(&name)) {
+        match existing.and_then(|i| m.bookmarks.get_mut(i)) {
             Some(b) => {
                 b.camera = camera;
                 if let Some(d) = description {
                     b.description = d;
                 }
             }
-            None => m.bookmarks.push(Bookmark { description: description.unwrap_or_default(), ..Bookmark::new(name.clone(), camera) }),
+            None => {
+                at.insert(key.clone(), m.bookmarks.len());
+                m.bookmarks.push(Bookmark { description: description.unwrap_or_default(), ..Bookmark::new(name.clone(), camera) });
+            }
         }
-        if !names.iter().any(|n: &String| n.eq_ignore_ascii_case(&name)) {
+        if taken.insert(key) {
             names.push(name);
         }
     }
+    let left: Vec<String> = [
+        (no_name, "without a name left out".to_string()),
+        (no_place, "without a place this map can show left out".to_string()),
+        (past, format!("past the map's {MAX_BOOKMARKS} left out")),
+        (cut_names, format!("with a name cut to {MAX_BOOKMARK_NAME} characters")),
+        (cut_descriptions, format!("with a description cut to {MAX_DESCRIPTION} characters")),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} bookmark(s) {what}"))
+    .collect();
+    // Nothing taken is an error, which gives what was left out and why.
     if names.is_empty() {
-        return Err("the file has no bookmarks this map can show".into());
+        let none = "the file has no bookmarks this map can show";
+        return Err(if left.is_empty() { none.to_string() } else { format!("{none}: {}", left.join(", ")) });
+    }
+    for what in left {
+        s.notify(format!("Import Bookmarks: {what}"), false);
     }
     Ok(json!({"added": names}))
 }

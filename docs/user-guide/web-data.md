@@ -59,13 +59,66 @@ at a time; other assets download whole (see [Files on the web](data-formats.md#f
 The commands do the same: `stac.collections` (`"url"`), `stac.search` (`"collections"`,
 `"bbox"` as `[west, south, east, north]` or `"view"`, `"datetime"` such as
 `2024-06-01/2024-06-30`, `"limit"` from 1 to 200, default 10, `"maxCloud"`, `"footprints"`, and
-`"properties": true` for the scalar item properties rather than just date and cloud cover),
+`"properties": true` for the scalar item properties rather than just date and cloud cover; see
+[Searching by shape](#searching-by-shape) for `"intersects"` and `"buffer"`),
 and `stac.addAsset` with an item returned by `stac.search` (`"item"`) or an item's address
 (`"url"`) and `"asset"`. API searches return one page and a `"next"` address when there is another:
 
 ```sh
 rustgis-cli run --cmd 'stac.search={"collections":"sentinel-2-c1-l2a","bbox":[7.4,46.9,7.5,47],"datetime":"2024-07-01/2024-07-31","maxCloud":20}' --cmd 'stac.addAsset={"url":"https://earth-search.aws.element84.com/v1/collections/sentinel-2-c1-l2a/items/S2B_T32TLS_20240727T103439_L2A","asset":"scl"}'
 ```
+
+### Searching by shape
+
+A bounding box isn't always the area you mean. In STAC Search (desktop) build a **Search area**
+from any of these, and the search looks there rather than where the map is:
+
+- **Draw point**, **Draw line**, **Draw polygon** and **Draw extent** (a box dragged on the map)
+  draw on the map with the usual click-to-add, double-click-to-finish tools; Esc stops.
+- **Selected features** adds the selected features of the active layer.
+- **Load file…** adds the features of a file in any format RustGIS reads. A file that holds
+  several layers (KML, GPX, a zip) is read by its first layer, and a notice names the others: add
+  the file with Add Data, pick the layer you mean, and use **Selected features**.
+- **Current extent** adds the map's extent as a polygon.
+- **Clear** empties the area.
+
+Each choice adds a part, so the area can hold several; the pane says how many of each kind, and
+the area is drawn on the map while the pane is open. Reading a file or merging a large selection
+runs in the background, with Cancel. The command is `"intersects"`: GeoJSON (a geometry, a feature
+or a collection of features), or `"selection"` for the selected features of `"layer"` (default the
+active layer). It is sent as the STAC `intersects` parameter and replaces `"bbox"` (Item Search
+takes one or the other); a static catalog, which has no search, keeps the items whose footprint
+meets the shape, and also the items that have no usable footprint, which are not known to match:
+check those yourself. A box dragged across the 180° meridian is searched as two boxes, one each
+side of it.
+
+Several features are merged into one shape. Only the highest dimension present is kept
+(polygons, then lines, then points); polygons are dissolved, and positions are rounded to eight
+decimals. RustGIS says how many parts of a lower dimension it left out, and how many lines or
+polygons had too few positions to search with. A shape of more than 20,000 positions, or one
+off the globe, is refused.
+
+`"buffer"` (up to 1,000,000 metres, given in `"unit"`: `Meters`, `Feet`, `Kilometers` or `Miles`,
+default `Meters`; **Widen points and lines by** in the dialog, in your Distance units setting) widens a point
+or line into a polygon along the Earth's surface before searching, so scenes near it are found and
+not only those that cover it. A polygon is not widened, and RustGIS says so.
+
+`stac.area` makes the shape without searching: from `"path"` (a file in any format RustGIS reads)
+or from a layer's selected features, with the same rules and `"buffer"`. It returns the GeoJSON
+to give `stac.search` as `"intersects"`. Run it first, then copy the `intersects` geometry it
+returns into the search (already widened, so the search needs no `"buffer"`):
+
+```sh
+rustgis-cli run --cmd 'stac.area={"path":"parcel.shp","buffer":500}'
+rustgis-cli run --cmd 'stac.search={"collections":"sentinel-2-c1-l2a","intersects":<the geometry returned above>,"datetime":"2024-07-01/2024-07-31"}'
+```
+
+A shape is sent in the body of a `POST /search`; if the server refuses that, the search is asked
+again in the query when the shape is short enough for one (the pane and `stac.search` both do).
+A POST search returns no usable
+`"next"` address: raise `"limit"` or narrow the search to see more. RustGIS says when the answer
+shows that more items match than were loaded, but a server that gives neither a count nor a next
+link can't be told from one with no more.
 
 Assets can use HTTP(S) or `s3://` addresses. S3 assets use the saved connection serving their
 bucket, or anonymous AWS access when none matches; see [S3 buckets](data.md#s3-buckets).
@@ -89,7 +142,12 @@ and band, such as INPE's [Brazil Data Cube](https://data.inpe.br/bdc/) or Sentin
   path and row, the Brazil Data Cube's `bdc:tiles`, else their bounding box), and by day.
 - **Layers:** each tile becomes a tile layer read in place, a file per date. The time slider shows
   the last date in its window, and a tile with no date in it draws nothing. The slider turns on
-  over the dates when it is off.
+  over the dates when it is off. When it is on with regular steps, its span widens to the cube's,
+  and the cube is refused in two cases. If the widened span would be more steps than the slider
+  lists (20,000), a longer step (`time.set`) or a shorter period takes the cube. If its step is
+  longer than the cube's dates are apart, so some of them would never show (a yearly slider over a
+  monthly cube), the refusal names those dates, and a shorter step or the slider turned off takes
+  the cube.
 - **Range:** a fixed `"range"` (`[0, 0.9]` for NDVI) is the same for every date and tile, so a grey
   means one value throughout. It is in the band's own units: its `raster:bands` (or `eo:bands`)
   scale and offset turn it into the files' stored values. Without one, each file is stretched on
@@ -677,7 +735,7 @@ their footprints drawn as a layer.
 
 | Dataset | What RustGIS does with it |
 |---|---|
-| **AlphaEarth Foundations** (Google's Satellite Embedding; 64 values a 10 m pixel, 2017–2025) | Finds the year's UTM tiles where the map is in the dataset's GeoParquet index on [Source Cooperative](https://source.coop/tge-labs/aef), read in place (its bounding boxes, then the rows that meet the map). **Add** shows a tile as a cloud-optimised GeoTIFF read in place: three bands (**Bands**, from 1; A01, A16 and A09 by default) as red, green and blue, dequantised (`sign(v)·(v/127.5)²`) and stretched over ±**Stretch** (0.3). Only the three bands shown are read, a band at a time. **Apply to layers** shows other bands or another stretch on the tiles already added. |
+| **AlphaEarth Foundations** (Google's Satellite Embedding; 64 values a 10 m pixel, 2017–2025) | Finds the year's UTM tiles where the map is in the dataset's GeoParquet index on [Source Cooperative](https://source.coop/tge-labs/aef), read in place (its bounding boxes, then the rows that meet the map). **Add** shows a tile as a cloud-optimised GeoTIFF read in place: three bands (**Bands**, from 1; A01, A16 and A09 by default) as red, green and blue, dequantised (`sign(v)·(v/127.5)²`) and stretched over ±**Stretch** (0.3). Only the three bands shown are read, a band at a time. **Apply to layers** shows other bands or another stretch on the tiles already added. With **All years, on the time slider**, the search finds each tile's file of every year (2017–2025, matched by place, since each year's files have names of their own) and **Add years** shows them as one tile layer that follows the time slider, a year a step (turned on over the years when it is off); a year a tile has no file for shows nothing, and is said. |
 | **Earth Index** (Earth Genome; 384 values every ~320 m, 2024) | Names the Sentinel-2 (MGRS) tiles where the map is and keeps those with a file. **Add points** reads the file's points in the view in place (every point's position, then the vectors of those in view: zoom to a few kilometres) and colours them by their vectors' first three principal components (64 colours); **Keep value** keeps one of each vector's values as the points' `value` field. |
 | **Tessera** (Cambridge; 128 values a 10 m pixel, 2017–2025) | **Add view** reads three bands (1, 2 and 3 by default) of the view from Tessera's [Zarr store](https://data.source.coop/tessera/tessera/zarr/v1.1-dclimate) in place (the shard's index, then the chunks the view needs: at most about 6 km a side, its centre when the view is larger), as a 32-bit raster in UTM. |
 | **Clay**, **Major TOM**, **Copernicus-Embed** | Listed with links to their data and papers; RustGIS doesn't read them. |
@@ -688,11 +746,39 @@ AlphaEarth's tiles are tile layers that keep their look in their address
 in the Symbology pane. GeoTIFFs with their bands stored apart (planar), signed bytes and bottom-up
 images are read in place too. The commands: `embeddings.datasets`, `embeddings.search` (`"dataset"`,
 `"year"`, `"bbox"` or the view, `"footprints"`) and `embeddings.add` (`"dataset"`, `"url"`,
-`"bands"`, `"stretch"`, `"dimension"`, `"bbox"`, `"year"`):
+`"bands"`, `"stretch"`, `"dimension"`, `"bbox"`, `"year"`) and `embeddings.addCube` (AlphaEarth's tiles
+where the map is over the years `"start"` to `"end"`, with `"bbox"`, `"bands"`, `"stretch"`, `"name"`; at
+most 32 tile layers on a map):
 
 ```sh
 rustgis-cli run --cmd 'map.zoomToExtent={"extent":[-122.55,37.7,-122.3,37.85]}' --cmd 'embeddings.search={"dataset":"alphaearth","year":2024}' --cmd 'embeddings.add={"dataset":"alphaearth","url":"https://data.source.coop/tge-labs/aef/v1/annual/2024/10N/xcyo46pot2fg6a61t-0000008192-0000000000.tiff"}' --cmd 'share.exportMap={"path":"aef.png"}'
+rustgis-cli run --cmd 'map.zoomToExtent={"extent":[-42.91,-20.78,-42.85,-20.735]}' --cmd 'embeddings.addCube={"dataset":"alphaearth"}' --cmd 'time.goTo={"date":"2017"}' --cmd 'share.exportMap={"path":"aef_2017.png"}' --cmd 'time.goTo={"date":"2025"}' --cmd 'share.exportMap={"path":"aef_2025.png"}'
 rustgis-cli run --cmd 'map.zoomToExtent={"extent":[-83.96,35.94,-83.9,35.98]}' --cmd 'embeddings.add={"dataset":"tessera","year":2024}' --cmd 'share.exportMap={"path":"tessera.png"}'
+```
+
+AlphaEarth's 64 values have no meaning one by one, so a picture of three of them only shows where
+places differ. What they are for is comparing places and years, which two commands do over the map's
+extent (or `"bbox"`), reading one AlphaEarth tile's window by range, all 64 bands (at most about
+1000 × 1000 cells, 10 × 10 km; `"cellSize"` reads an overview for a larger area). Each makes a
+32-bit raster in the tile's UTM coordinate system; a cell with no embedding (AlphaEarth's −128) has
+no value.
+
+- `embeddings.similarity` (`"point"`: [longitude, latitude], or `"points"`: up to 1000 of them,
+  averaged; `"year"`, 2024 by default): each cell's cosine similarity to the reference's embedding,
+  from −1 to 1. 1 is a place like the reference. Reference points outside the area read, or on no
+  data, are left out and said.
+- `embeddings.change` (`"from"`, 2017 by default, and `"to"`, 2025): how far each cell's embedding
+  moved between the two years, 1 − their cosine, from 0 (unchanged) to 2.
+
+The vectors are dequantised (`sign(v)·(v/127.5)²`) and scaled to unit length first. When the area
+meets several tiles, the one nearest its centre with the years asked for is read, and the others
+are said: keep the area within one tile. They run on the desktop and the command line (in the web
+app, not yet), and there is no button for them yet. Each adds its raster as a layer: `share.exportRaster`
+saves its values as a GeoTIFF, and `share.exportMap` a PNG preview of the map:
+
+```sh
+rustgis-cli run --cmd 'embeddings.similarity={"dataset":"alphaearth","year":2024,"point":[-42.88,-20.75],"bbox":[-42.91,-20.78,-42.85,-20.735]}' --cmd 'share.exportRaster={"layer":"AlphaEarth 2024 similarity","path":"aef_similarity.tif"}' --cmd 'share.exportMap={"path":"aef_similarity.png"}'
+rustgis-cli run --cmd 'embeddings.change={"dataset":"alphaearth","from":2017,"to":2025,"bbox":[-42.91,-20.78,-42.85,-20.735]}' --cmd 'share.exportRaster={"layer":"AlphaEarth change 2017–2025","path":"aef_change.tif"}' --cmd 'share.exportMap={"path":"aef_change.png"}'
 ```
 
 These reach the network: the AI Assistant asks first and plugins need the network permission.

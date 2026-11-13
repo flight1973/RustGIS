@@ -42,7 +42,7 @@ const PROJECT: &str = r#"<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTE
         </symbols>
       </renderer-v2>
       <layerOpacity>0.75</layerOpacity>
-      <blendMode>13</blendMode>
+      <blendMode>6</blendMode>
       <labeling type="simple">
         <settings><text-style fieldName="name" fontSize="12" fontSizeUnit="Point" textColor="20,40,60,255" namedStyle="Bold Italic" fontFamily="Liberation Sans Narrow">
           <text-buffer bufferDraw="1"/></text-style><placement placement="1" quadOffset="2"/></settings>
@@ -664,6 +664,17 @@ fn files_of_qgis_1_and_2_read_by_their_old_names() {
     assert_eq!(p.crs.as_deref(), Some("EPSG:21781"), "the canvas's");
     let names: Vec<(&str, bool)> = p.layers.iter().map(|l| (l.name.as_str(), l.visible)).collect();
     assert_eq!(names, [("roads", true), ("land", false)], "the legend's order; land's group is unchecked");
+    assert!(!report.notes.iter().any(|n| n.text.contains("layer order")), "the legend's own order: {:?}", report.notes);
+    // A legend keeping a drawing order of its own: noted, as it isn't read.
+    let own = qgs
+        .replace(r#"<legend updateDrawingOrder="true">"#, r#"<legend updateDrawingOrder="false">"#)
+        .replace(r#"name="land">"#, r#"name="land" drawingOrder="0">"#);
+    let mut own_report = Report::default();
+    read_project(&own, "", &mut own_report).unwrap();
+    assert!(own_report.notes.iter().any(|n| n.text.contains("set apart from the legend")), "{:?}", own_report.notes);
+    let base = p.groups.iter().map(|g| (g.name.as_str(), g.checked, g.expanded)).collect::<Vec<_>>();
+    assert_eq!(base, [("base", false, true)], "the legend's group");
+    assert_eq!((p.layers[1].group, p.layers[1].checked), (Some(0), true));
     let (roads, land) = (&p.layers[0].style, &p.layers[1].style);
     // maximumScale was the out-beyond limit, minimumScale the in-beyond.
     let (min, max) = (land.min_scale.flatten().unwrap(), land.max_scale.flatten().unwrap());
@@ -709,6 +720,7 @@ fn what_rustgis_has_no_place_for_is_noted() {
         </maplayer>
       </projectlayers>
       <main-annotation-layer><items><item type="pointtext"/><item type="linetext"/></items></main-annotation-layer>
+      <Annotations><TextAnnotationItem/></Annotations>
       <Layouts><Layout name="One"/></Layouts>
       <Bookmarks><Bookmark name="Here"/></Bookmarks>
       <visibility-presets><visibility-preset name="Only points"/></visibility-presets>
@@ -716,13 +728,20 @@ fn what_rustgis_has_no_place_for_is_noted() {
     </qgis>"#
     );
     let mut report = Report::default();
-    read_project(&qgs, "", &mut report).unwrap();
+    let p = read_project(&qgs, "", &mut report).unwrap();
     let said = |layer: &str, part: &str| report.notes.iter().any(|n| n.layer == layer && n.text.contains(part));
-    for part in ["print layouts (1)", "annotations (2", "bookmarks (1)", "map themes (1)", "relations between layers (1)"] {
+    for part in [
+        "print layouts (1)",
+        "annotations of QGIS's older kind (1",
+        "bookmarks whose place doesn't read (1: Here)",
+        "map themes (1)",
+        "relations that name no layers or fields (1: r)",
+    ] {
         assert!(said("", part), "{part}: {:?}", report.notes);
     }
+    // The main annotation layer's items, placed nowhere, are noted on it.
+    assert!(said("Annotations", "2 annotations whose geometry doesn't read"), "{:?}", report.notes);
     for part in [
-        "time settings",
         "other styles (night)",
         "joins",
         "virtual fields",
@@ -740,6 +759,9 @@ fn what_rustgis_has_no_place_for_is_noted() {
     assert_eq!(report.notes.iter().find(|n| n.text.contains("draw effects")).map(|n| n.count), Some(1));
     // Wrapping and repeats along lines are read now, not noted.
     assert!(!said("A", "wrapped") && !said("A", "repeated"), "{:?}", report.notes);
+    // Its time by a date field is read now, not noted.
+    assert!(!said("A", "time settings"), "{:?}", report.notes);
+    assert_eq!(p.layers.iter().find(|l| l.name == "A").and_then(|l| l.style.time.as_deref()), Some("day"));
 }
 
 /// A raster style file with `renderer` as its renderer and `pipe` after it in the pipe.
@@ -845,7 +867,7 @@ fn raster_renderers_read_as_rustgis_raster_styles() {
     );
     assert_eq!(
         s.raster.unwrap().renderer,
-        RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 300.0, altitude: 35.0, z_factor: 2.0 }
+        RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 300.0, altitude: 35.0, z_factor: 2.0, shadow: 0.0, sky: 0.0 }
     );
     assert!(report.notes.iter().any(|n| n.text.contains("saturation")));
     let (s, report) = read(r#"<rasterrenderer type="contour" band="1"/>"#, "");
@@ -854,6 +876,180 @@ fn raster_renderers_read_as_rustgis_raster_styles() {
     for bad in [r#"<rasterrenderer type="singlebandgray" grayBand="0"/>"#, r#"<rasterrenderer type="paletted" band="99999999999"/>"#] {
         let (s, report) = read(bad, "");
         assert!(s.raster.is_none() && report.notes.iter().any(|n| n.text.contains("couldn't read")), "{bad}: {report:?}");
+    }
+}
+
+/// QGIS's annotation items come in as graphics, in z order, with their look; what RustGIS draws
+/// differently or not at all is noted.
+#[test]
+fn annotations_carry_over_as_graphics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("annotations-styled.qgs")).unwrap();
+    let mut report = Report::default();
+    let project = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let layer = project.layers.iter().find(|l| l.kind == "annotation").unwrap();
+    assert_eq!((layer.name.as_str(), layer.crs.as_deref()), ("styled annotations", Some("EPSG:2056")));
+    let kinds: Vec<&str> = layer.annotations.iter().map(|a| a.graphic.kind).collect();
+    // The polygon (z -1) first, the bold text (z 5) last; the box of the centred text under it.
+    assert_eq!(kinds.first(), Some(&"polygon"), "{kinds:?}");
+    assert_eq!(layer.annotations.last().and_then(|a| a.graphic.text.as_deref()), Some("right, bold, red"));
+    // Switched off and SVG: left out.
+    let texts: Vec<&str> = layer.annotations.iter().filter_map(|a| a.graphic.text.as_deref()).collect();
+    assert!(!texts.contains(&"switched off"), "{texts:?}");
+    assert!(texts.contains(&"html text"), "HTML read as plain text: {texts:?}");
+    assert_eq!(kinds.iter().filter(|k| **k == "picture").count(), 1, "{kinds:?}");
+
+    let bold = layer.annotations.last().unwrap().graphic.clone();
+    assert!(bold.bold && !bold.italic, "{bold:?}");
+    assert_eq!((bold.fill, bold.align, bold.font_size), (Some(Rgba::rgb(200, 0, 0)), Some(TextAlign::Right), Some(14.0)));
+    assert_eq!(bold.geometry, rustgis_data::Geometry::Point(rustgis_geom::Coord::new(2697000.0, 1261800.0)));
+    let italic = layer.annotations.iter().find(|a| a.graphic.text.as_deref() == Some("turned, italic")).unwrap();
+    // 4 mm in typographic points.
+    assert!(italic.graphic.italic && !italic.graphic.bold && (italic.graphic.font_size.unwrap() - 4.0 * 72.0 / 25.4).abs() < 1e-3);
+    let square = layer.annotations.iter().find(|a| a.graphic.kind == "point" && a.graphic.fill == Some(Rgba::rgb(255, 0, 0))).unwrap();
+    assert!((square.graphic.size.unwrap() - 4.0 * 96.0 / 25.4).abs() < 1e-3, "{square:?}");
+    let line = layer.annotations.iter().find(|a| a.graphic.outline == Some(Rgba::rgb(0, 0, 255))).unwrap();
+    assert_eq!(line.graphic.kind, "line");
+    let Some(rustgis_data::Geometry::Polygon(rings)) = layer.annotations.first().map(|a| &a.graphic.geometry) else { panic!() };
+    assert_eq!(rings[0].len(), 2, "the hole is kept");
+    // The centred text's box: its background with its frame's outline, under the text.
+    let at = layer.annotations.iter().position(|a| a.graphic.text.as_deref() == Some("centred in a box")).unwrap();
+    let boxed = &layer.annotations[at - 1].graphic;
+    assert_eq!((boxed.kind, boxed.fill, boxed.outline), ("rectangle", Some(Rgba::rgb(255, 255, 180)), Some(Rgba::rgb(200, 0, 0))));
+    // The picture: its file from the project's folder, fitted keeping its aspect; its frame over it.
+    let pic = layer.annotations.iter().position(|a| a.picture.is_some()).unwrap();
+    assert_eq!(layer.annotations[pic].picture.as_deref(), Some("/p/qgs/../data/picture.png"));
+    assert!(layer.annotations[pic].keep_aspect);
+    assert_eq!(layer.annotations[pic + 1].graphic.kind, "rectangle");
+    // The main annotation layer, over the others.
+    let main = project.main_annotations.as_ref().unwrap();
+    assert_eq!((main.name.as_str(), main.annotations.len()), ("Annotations", 1));
+
+    let said = |part: &str| report.notes.iter().any(|n| n.layer == "styled annotations" && n.text.contains(part));
+    for part in [
+        "a switched-off annotation",
+        "an SVG picture annotation",
+        "4 text annotations, centred on their points",
+        "a turned text annotation, drawn level",
+        "a text annotation in HTML",
+        "sized at a reference scale",
+        "a text along a line, drawn level",
+        "a rectangle text aligned to a side of its box",
+        "a rectangle text of a fixed size",
+        "marker annotation of another shape, drawn as a circle",
+        "symbol of dashes",
+        "text annotations in DejaVu Sans",
+        "rectangle texts, drawn on their own lines rather than wrapped",
+    ] {
+        assert!(said(part), "{part}: {:#?}", report.notes);
+    }
+}
+
+/// A point text without an alignment (a file from before QGIS wrote one) is left aligned, as
+/// QGIS reads it; a picture naming no file and a huge font are noted.
+#[test]
+fn annotation_defaults_and_limits() {
+    let qgs = r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs><projectlayers>
+      <maplayer type="annotation"><id>a</id><layername>N</layername><items>
+        <item type="pointtext" text="old" x="1" y="2"/>
+        <item type="pointtext" text="huge" x="1" y="2"><pointTextFormat><text-style fontSize="900" fontSizeUnit="Point"/></pointTextFormat></item>
+        <item type="picture" path="" xMin="0" yMin="0" xMax="1" yMax="1"/>
+      </items></maplayer></projectlayers></qgis>"#;
+    let mut report = Report::default();
+    let p = read_project(qgs, "", &mut report).unwrap();
+    let a = &p.layers[0].annotations;
+    assert_eq!(a[0].graphic.align, Some(TextAlign::Left));
+    let said = |part: &str| report.notes.iter().any(|n| n.text.contains(part));
+    assert!(said("a picture annotation that names no picture"), "{:?}", report.notes);
+    assert!(said("an annotation with a text longer, a font"), "{:?}", report.notes);
+}
+
+/// An HTML text's tags are dropped (and its head, as QGIS's editor writes it), but a `<` that
+/// opens no tag (`a < b`, or one never closed) is kept as text, with what follows it; white
+/// space and entities are read as HTML reads them.
+#[test]
+fn html_annotation_texts_keep_a_lone_less_than() {
+    for (html, plain) in [
+        ("<b>a</b> &lt; b", "a < b"),
+        ("x < 3 and y > 2", "x < 3 and y > 2"),
+        ("1 <2 <b>bold</b>", "1 <2 bold"),
+        ("left<br>right", "left\nright"),
+        ("never closed <b", "never closed <b"),
+        // As QGIS's text editor writes it (Qt's `toHtml`): the head and its style aren't text,
+        // the source's line breaks and indents are white space, paragraphs are lines.
+        (
+            "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0//EN\" \"http://www.w3.org/TR/REC-html40/strict.dtd\">\n<html><head><meta name=\"qrichtext\" content=\"1\" /><style type=\"text/css\">\np, li { white-space: pre-wrap; }\n</style></head><body style=\" font-family:'Sans'; font-size:10pt;\">\n<p style=\" margin-top:0px;\">Hello   <b>bold</b></p>\n<p style=\" margin-top:0px;\">World &#233;&#xE9;&nbsp;!</p></body></html>",
+            "Hello bold\nWorld éé !",
+        ),
+        ("&unknown; &amp;lt;", "&unknown; &lt;"),
+        // Qt's empty paragraph is one blank line; blocks left open still break lines; table cells
+        // stay apart; a comment holding a `>` is dropped; a control character isn't text.
+        ("<p>a</p>\n<p style=\"-qt-paragraph-type:empty;\"><br /></p>\n<p>b</p>", "a\n\nb"),
+        ("<p>one<p>two<ul><li>x<li>y</ul>", "one\ntwo\nx\ny"),
+        ("<table><tr><td>a</td><td>b</td></tr></table>", "a b"),
+        ("a<!-- x > y -->b", "ab"),
+        ("bell&#7;&#+65;&#0;", "bell&#7;&#+65;&#0;"),
+    ] {
+        let qgs = format!(
+            r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs><projectlayers>
+      <maplayer type="annotation"><id>a</id><layername>N</layername><items>
+        <item type="pointtext" text="{}" x="1" y="2"><pointTextFormat><text-style allowHtml="1"/></pointTextFormat></item>
+      </items></maplayer></projectlayers></qgis>"#,
+            html.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\n', "&#10;")
+        );
+        let mut report = Report::default();
+        let p = read_project(&qgs, "", &mut report).unwrap();
+        assert_eq!(p.layers[0].annotations[0].graphic.text.as_deref(), Some(plain), "{html}");
+    }
+    // Many a `<` with no `>` after it: read in linear time (a quadratic scan of 200,000 would
+    // take minutes), each kept.
+    // As many an `&` with no `;`.
+    for lone in ["<".repeat(200_000), "&".repeat(200_000)] {
+        let qgs = format!(
+            r#"<qgis><projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs><projectlayers>
+      <maplayer type="annotation"><id>a</id><layername>N</layername><items>
+        <item type="pointtext" text="{}" x="1" y="2"><pointTextFormat><text-style allowHtml="1"/></pointTextFormat></item>
+      </items></maplayer></projectlayers></qgis>"#,
+            lone.replace('&', "&amp;").replace('<', "&lt;")
+        );
+        let started = std::time::Instant::now();
+        let p = read_project(&qgs, "", &mut Report::default()).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(p.layers[0].annotations[0].graphic.text.as_ref().map(String::len), Some(200_000));
+    }
+}
+
+/// What `push` clamps, `cut` says it cuts (and so the import notes it): a negative width or size,
+/// and letter spacing outside its range, as well as the limits above.
+#[test]
+fn graphics_cut_counts_every_clamp() {
+    let point = rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0));
+    let with = |f: &dyn Fn(&mut crate::graphics::Graphic)| {
+        let mut g = crate::graphics::Graphic::new("point", point.clone());
+        f(&mut g);
+        crate::graphics::cut(&g)
+    };
+    assert!(!with(&|g| g.width = Some(2.0)));
+    assert!(with(&|g| g.width = Some(-1.0)));
+    assert!(with(&|g| g.size = Some(-0.5)));
+    assert!(with(&|g| g.letter_spacing = 60.0));
+    assert!(with(&|g| g.letter_spacing = -60.0));
+    assert!(!with(&|g| g.letter_spacing = 2.0));
+    assert!(with(&|g| g.letter_spacing = f32::INFINITY));
+    assert!(with(&|g| g.letter_spacing = f32::NAN));
+}
+
+/// QGIS 4 (on Qt 6) weighs fonts from 100 to 1000, QGIS 3 from 0 to 99: a normal weight in
+/// either isn't bold.
+#[test]
+fn font_weights_read_on_both_scales() {
+    for (weight, bold) in [("50", false), ("75", true), ("400", false), ("600", true), ("700", true)] {
+        let qml = format!(
+            r#"<qgis><labeling type="simple"><settings><text-style fieldName="name" fontWeight="{weight}"/></settings></labeling></qgis>"#
+        );
+        let mut report = Report::default();
+        let s = read_style(&qml, "layer", &mut report).unwrap();
+        assert_eq!(s.labels.unwrap().default.bold, bold, "weight {weight}");
     }
 }
 
@@ -877,7 +1073,7 @@ fn every_corpus_file_reads() {
         read_style(&text, "layer", &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
     let projects = files("generated/qgs", &["qgs", "qgz"]);
-    assert_eq!(projects.len(), 21, "project corpus changed: {projects:?}");
+    assert_eq!(projects.len(), 24, "project corpus changed: {projects:?}");
     for path in &projects {
         let bytes = std::fs::read(path).unwrap();
         let text = if path.extension().is_some_and(|e| e == "qgz") {
@@ -2079,4 +2275,501 @@ fn diagrams_carry_over_as_pie_diagrams() {
         report.notes
     );
     assert!(pie("").2.notes.is_empty());
+}
+
+/// A project's layer tree, as QGIS 4.2 writes it (measured): groups nested, a hidden one, a
+/// collapsed one, one showing a layer at a time, one drawn as one (a group layer, with its
+/// opacity and blending in a `<maplayer type="group">`), and an empty one.
+const GROUPS: &str = r#"<qgis version="4.2.3-Firenze">
+  <layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" name="Outer">
+      <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" name="Inner">
+        <layer-tree-layer checked="Qt::Checked" expanded="1" id="p1" name="pts1"/>
+      </layer-tree-group>
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="p2" name="pts2"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Unchecked" expanded="1" groupLayer="" name="Hidden">
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="p3" name="pts3"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="0" groupLayer="" name="Collapsed">
+      <layer-tree-layer checked="Qt::Unchecked" expanded="1" id="p4" name="pts4"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" mutually-exclusive="1" mutually-exclusive-child="0" name="Exclusive">
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="e1" name="ex1"/>
+      <layer-tree-layer checked="Qt::Unchecked" expanded="1" id="e2" name="ex2"/>
+    </layer-tree-group>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="AsGroup_1" name="AsGroup">
+      <layer-tree-layer checked="Qt::Checked" expanded="1" id="g1" name="gl1"/>
+    </layer-tree-group>
+    <layer-tree-layer checked="Qt::Checked" expanded="1" id="top" name="top"/>
+    <layer-tree-group checked="Qt::Checked" expanded="1" groupLayer="" name="Empty"/>
+  </layer-tree-group>
+  <projectlayers>
+    <maplayer type="group"><id>AsGroup_1</id><datasource></datasource><layername>AsGroup</layername>
+      <childLayers><child layerid="g1"/></childLayers><layerOpacity>0.5</layerOpacity><blendMode>6</blendMode></maplayer>
+    {LAYERS}
+  </projectlayers>
+</qgis>"#;
+
+fn groups_project() -> String {
+    let layers: String = ["p1", "p2", "p3", "p4", "e1", "e2", "g1", "top"]
+        .iter()
+        .map(|id| format!(r#"<maplayer type="vector"><id>{id}</id><datasource>/d/{id}.shp</datasource><layername>{id}</layername><provider>ogr</provider></maplayer>"#))
+        .collect();
+    GROUPS.replace("{LAYERS}", &layers)
+}
+
+#[test]
+fn layer_tree_groups_carry_over() {
+    let mut report = Report::default();
+    let p = read_project(&groups_project(), "", &mut report).unwrap();
+    let groups: Vec<(&str, bool, bool, Option<usize>, Option<f32>)> =
+        p.groups.iter().map(|g| (g.name.as_str(), g.checked, g.expanded, g.parent, g.transparency)).collect();
+    assert_eq!(
+        groups,
+        [
+            ("Outer", true, true, None, None),
+            ("Inner", true, true, Some(0), None),
+            ("Hidden", false, true, None, None),
+            ("Collapsed", true, false, None, None),
+            ("Exclusive", true, true, None, None),
+            ("AsGroup", true, true, None, Some(50.0)),
+            ("Empty", true, true, None, None),
+        ]
+    );
+    // The group layer is its group's opacity, not a layer.
+    let layers: Vec<(&str, Option<usize>, bool, bool)> =
+        p.layers.iter().map(|l| (l.name.as_str(), l.group, l.checked, l.visible)).collect();
+    assert_eq!(
+        layers,
+        [
+            ("p1", Some(1), true, true),
+            ("p2", Some(0), true, true),
+            ("p3", Some(2), true, false),
+            ("p4", Some(3), false, false),
+            ("e1", Some(4), true, true),
+            ("e2", Some(4), false, false),
+            ("g1", Some(5), true, true),
+            ("top", None, true, true),
+        ],
+        "each in its group, its own box apart from what the groups above add"
+    );
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    for part in [
+        "one layer at a time (1: Exclusive)",
+        "opacity of groups drawn as one (1: AsGroup)",
+        "blending mode of groups drawn as one (1: AsGroup)",
+    ] {
+        assert!(texts.iter().any(|t| t.contains(part)), "{part}: {texts:?}");
+    }
+    assert!(!texts.iter().any(|t| t.contains("group layers")), "{texts:?}");
+
+    // A group layer's draw effect is noted; a layer order of its own, when it differs from the
+    // tree's, is noted (the tree's is drawn).
+    let effect = r#"<paintEffect><effect enabled="1" type="effectStack"><effect type="dropShadow"><Option type="Map"><Option name="enabled" type="QString" value="1"/></Option></effect><effect type="drawSource"/></effect></paintEffect>"#;
+    let order = r#"<custom-order enabled="1"><item>top</item><item>p1</item></custom-order></layer-tree-group>
+  <projectlayers>"#;
+    let qgs = groups_project().replace("<blendMode>6</blendMode>", effect).replacen("</layer-tree-group>\n  <projectlayers>", order, 1);
+    let mut report = Report::default();
+    read_project(&qgs, "", &mut report).unwrap();
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    for part in ["draw effects of groups drawn as one (1: AsGroup)", "its layer order (set apart from the layer tree)"] {
+        assert!(texts.iter().any(|t| t.contains(part)), "{part}: {texts:?}");
+    }
+    // The same order as the tree's: nothing to note.
+    let same = groups_project().replacen(
+        "</layer-tree-group>\n  <projectlayers>",
+        &order.replace("<item>top</item><item>p1</item>", "<item>p1</item><item>top</item>"),
+        1,
+    );
+    let mut report = Report::default();
+    read_project(&same, "", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("layer order")), "{:?}", report.notes);
+
+    // A tree of plain groups, all shown, carries over without a note.
+    let mut report = Report::default();
+    let plain = r#"<qgis><layer-tree-group><layer-tree-group checked="Qt::Checked" expanded="1" name="A"><layer-tree-layer checked="Qt::Checked" id="a"/></layer-tree-group></layer-tree-group>
+      <projectlayers><maplayer type="vector"><id>a</id><datasource>/d/a.shp</datasource><layername>a</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#;
+    let p = read_project(plain, "", &mut report).unwrap();
+    assert_eq!((p.groups.len(), p.layers[0].group), (1, Some(0)));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+}
+
+#[test]
+fn groups_past_the_limits_put_their_layers_in_the_group_holding_them() {
+    // Ten levels: the ninth and tenth aren't kept. The tenth is unchecked, so its layer comes in
+    // unchecked in the eighth.
+    let mut tree = String::new();
+    for level in 1..=10 {
+        let checked = if level == 10 { "Qt::Unchecked" } else { "Qt::Checked" };
+        tree.push_str(&format!(r#"<layer-tree-group checked="{checked}" name="L{level}">"#));
+    }
+    tree.push_str(r#"<layer-tree-layer checked="Qt::Checked" id="a"/>"#);
+    tree.push_str(&"</layer-tree-group>".repeat(10));
+    let qgs = format!(
+        r#"<qgis><layer-tree-group>{tree}</layer-tree-group><projectlayers><maplayer type="vector"><id>a</id><datasource>/d/a.shp</datasource><layername>a</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "", &mut report).unwrap();
+    assert_eq!(p.groups.len(), crate::MAX_GROUP_DEPTH);
+    assert_eq!((p.layers[0].group, p.layers[0].checked, p.layers[0].visible), (Some(crate::MAX_GROUP_DEPTH - 1), false, false));
+    assert!(report.notes.iter().any(|n| n.text.contains("groups past RustGIS's 8 levels") && n.text.contains("(2)")), "{:?}", report.notes);
+
+    // The ninth group drawn as one: its group layer isn't a layer, and its opacity is noted as
+    // left out (its layer went in the eighth group).
+    let drawn = qgs.replace(r#"name="L9">"#, r#"name="L9" groupLayer="gl9">"#).replace(
+        "</projectlayers>",
+        r#"<maplayer type="group"><id>gl9</id><layername>L9</layername><layerOpacity>0.5</layerOpacity></maplayer></projectlayers>"#,
+    );
+    let mut report = Report::default();
+    let p = read_project(&drawn, "", &mut report).unwrap();
+    assert_eq!(p.layers.iter().map(|l| l.name.as_str()).collect::<Vec<_>>(), ["a"]);
+    assert!(
+        report.notes.iter().any(|n| n.text.contains("drawn as one past RustGIS's group limits give their layers (1: L9 (opacity))")),
+        "{:?}",
+        report.notes
+    );
+    // One that gives its layers nothing: no note.
+    let mut report = Report::default();
+    read_project(&drawn.replace("<layerOpacity>0.5</layerOpacity>", "<layerOpacity>1</layerOpacity>"), "", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("drawn as one")), "{:?}", report.notes);
+
+    // A tree deeper than it is walked (64 levels): the layers further in are still read, in the
+    // eighth group, with the boxes of the groups between; noted. The 70th group is unchecked.
+    let mut tree = String::new();
+    for level in 1..=70 {
+        let checked = if level == 70 { "Qt::Unchecked" } else { "Qt::Checked" };
+        tree.push_str(&format!(r#"<layer-tree-group checked="{checked}" name="L{level}">"#));
+    }
+    // An empty group beside it, below 64 levels, counted with the groups not kept.
+    tree.push_str(r#"<layer-tree-layer checked="Qt::Checked" id="a"/><layer-tree-group checked="Qt::Checked" name="E"/>"#);
+    tree.push_str(&"</layer-tree-group>".repeat(70));
+    let qgs = format!(
+        r#"<qgis><layer-tree-group>{tree}<layer-tree-layer checked="Qt::Checked" id="b"/></layer-tree-group><projectlayers><maplayer type="vector"><id>a</id><datasource>/d/a.shp</datasource><layername>a</layername><provider>ogr</provider></maplayer><maplayer type="vector"><id>b</id><datasource>/d/b.shp</datasource><layername>b</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "", &mut report).unwrap();
+    let layers: Vec<(&str, Option<usize>, bool, bool)> =
+        p.layers.iter().map(|l| (l.name.as_str(), l.group, l.checked, l.visible)).collect();
+    assert_eq!(layers, [("a", Some(crate::MAX_GROUP_DEPTH - 1), false, false), ("b", None, true, true)], "a hidden by its 70th group");
+    assert!(report.notes.iter().any(|n| n.text.contains("layers below 64 levels of groups (1)")), "{:?}", report.notes);
+    // Levels 9 to 70 and the empty group: 63 groups not kept.
+    assert!(report.notes.iter().any(|n| n.text.contains("2000 groups (63)")), "{:?}", report.notes);
+
+    // Layer entries past those read (4000) are noted.
+    let entries: String = (0..TREE_LAYERS + 2).map(|i| format!(r#"<layer-tree-layer checked="Qt::Checked" id="x{i}"/>"#)).collect();
+    let mut report = Report::default();
+    read_project(&format!("<qgis><layer-tree-group>{entries}</layer-tree-group></qgis>"), "", &mut report).unwrap();
+    let cut = report.notes.iter().find(|n| n.text.contains("entries past the first 4000 (2)"));
+    assert_eq!(cut.map(|n| n.kind), Some(NoteKind::Approximated), "their layers come in: {:?}", report.notes);
+
+    // Past the most groups a map keeps: the rest aren't kept.
+    let many = r#"<layer-tree-group checked="Qt::Checked" name="G"/>"#.repeat(crate::MAX_GROUPS + 3);
+    let p = read_project(&format!("<qgis><layer-tree-group>{many}</layer-tree-group></qgis>"), "", &mut Report::default()).unwrap();
+    assert_eq!(p.groups.len(), crate::MAX_GROUPS);
+}
+
+#[test]
+fn blending_modes_read_by_the_numbers_qgis_saves() {
+    // QGIS saves its own numbers (measured, QGIS 4.2): 6 is Multiply; Qt's 13 is not one of
+    // RustGIS's modes in them (it is QGIS's "Source"), so it is drawn as Normal with a note.
+    for (number, blend, noted) in [
+        (0, Blend::Normal, false),
+        (1, Blend::Lighten, false),
+        (2, Blend::Screen, false),
+        (5, Blend::Darken, false),
+        (6, Blend::Multiply, false),
+        (8, Blend::Overlay, false),
+        (11, Blend::Difference, false),
+        (13, Blend::Normal, true),
+        (10, Blend::Normal, true),
+    ] {
+        let mut report = Report::default();
+        let s = read_style(&format!("<qgis><blendMode>{number}</blendMode></qgis>"), "L", &mut report).unwrap();
+        assert_eq!(s.blend, Some(blend), "{number}");
+        assert_eq!(report.notes.iter().any(|n| n.text.contains("blending mode")), noted, "{number}");
+    }
+}
+
+/// The corpus's groups, as QGIS wrote them: the tree as groups, the group layer's opacity on its
+/// group (Multiply noted), each layer in its group with its own box.
+#[test]
+fn the_corpus_groups_read_as_qgis_wrote_them() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("groups-nested-hidden-collapsed-drawn-as-one.qgs")).unwrap();
+    let mut report = Report::default();
+    let p = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let groups: Vec<(&str, bool, bool, Option<usize>, Option<f32>)> =
+        p.groups.iter().map(|g| (g.name.as_str(), g.checked, g.expanded, g.parent, g.transparency)).collect();
+    assert_eq!(
+        groups,
+        [
+            ("Outer", true, true, None, None),
+            ("Inner", true, true, Some(0), None),
+            ("Hidden", false, true, None, None),
+            ("Drawn as one", true, false, None, Some(40.0)),
+            ("Empty", true, true, None, None),
+        ]
+    );
+    let layers: Vec<(&str, Option<usize>, bool)> = p.layers.iter().map(|l| (l.name.as_str(), l.group, l.checked)).collect();
+    assert_eq!(layers, [("points", Some(1), true), ("lines", Some(0), false), ("dem", Some(2), true), ("polygons", Some(3), true)]);
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    assert!(texts.iter().any(|t| t.contains("blending mode of groups drawn as one (1: Drawn as one)")), "{texts:?}");
+    assert!(!texts.iter().any(|t| t.contains("group layers")), "{texts:?}");
+}
+
+/// A temporal element as QGIS 4.2 saves a vector layer's time settings (measured), `set`
+/// taking the place of its defaults.
+fn temporal(mode: &str, set: &[(&str, &str)]) -> String {
+    let defaults = [
+        ("accumulate", "0"),
+        ("durationField", ""),
+        ("durationUnit", "min"),
+        ("endExpression", ""),
+        ("endField", ""),
+        ("fixedDuration", "0"),
+        ("limitMode", "0"),
+        ("startExpression", ""),
+        ("startField", ""),
+    ];
+    let attrs: String =
+        defaults.iter().map(|(k, v)| format!(r#" {k}="{}""#, set.iter().find(|(s, _)| s == k).map_or(*v, |(_, v)| *v))).collect();
+    format!(r#"<temporal enabled="1" mode="{mode}"{attrs}><fixedRange><start></start><end></end></fixedRange></temporal>"#)
+}
+
+/// Bookmarks, relations, the map's rotation and time settings, in the shapes QGIS 4.2 saves
+/// them (measured): each read, and what RustGIS has no place for noted.
+#[test]
+fn bookmarks_relations_and_time_read_as_qgis_saves_them() {
+    let layer = |id: &str, t: &str| {
+        format!(
+            r#"<maplayer type="vector" geometry="Point"><id>{id}</id><datasource>./{id}.gpkg</datasource><layername>{id}</layername><provider>ogr</provider>{t}</maplayer>"#
+        )
+    };
+    let layers = [
+        layer("instant", &temporal("1", &[("startField", "when"), ("accumulate", "1")])),
+        layer("span", &temporal("2", &[("startField", "t0"), ("endField", "t1")])),
+        layer("lasting", &temporal("3", &[("startField", "t0"), ("durationField", "d")])),
+        layer("by_field", &temporal("4", &[("startExpression", "&quot;t0&quot;"), ("endExpression", "&quot;t1&quot;")])),
+        layer("by_expr", &temporal("4", &[("startExpression", "&quot;t&quot; + make_interval(days:=1)")])),
+        layer("fixed", &temporal("0", &[])),
+        layer("redraw", &temporal("5", &[])),
+        layer("closed", &temporal("1", &[("startField", "when"), ("limitMode", "1")])),
+        layer("lasting_events", &temporal("1", &[("startField", "when"), ("fixedDuration", "3"), ("durationUnit", "h")])),
+        layer("piling", &temporal("1", &[("startField", "when"), ("fixedDuration", "3"), ("accumulate", "1")])),
+        layer("unnamed", &temporal("1", &[])),
+        r#"<maplayer type="raster"><id>dem</id><datasource>./dem.tif</datasource><layername>dem</layername><provider>gdal</provider><temporal enabled="1" mode="0"/></maplayer>"#.to_string(),
+    ]
+    .concat();
+    // A ring of 10,001 points: not read in part.
+    let long = vec!["1 2"; 10_001].join(", ");
+    let wgs84 =
+        "<spatialrefsys nativeFormat=\"Wkt\"><proj4>+proj=longlat +datum=WGS84 +no_defs</proj4><authid>EPSG:4326</authid></spatialrefsys>";
+    let qgs = format!(
+        r#"<qgis version="4.2.3-Belém do Pará">
+      <projectCrs><spatialrefsys><authid>EPSG:3857</authid></spatialrefsys></projectCrs>
+      <mapcanvas annotationsVisible="1" name="theMapCanvas"><units>meters</units><extent><xmin>0</xmin><ymin>0</ymin><xmax>10</xmax><ymax>10</ymax></extent><rotation>15</rotation></mapcanvas>
+      <mapcanvas name="mapCanvas2"><rotation>x</rotation></mapcanvas>
+      <projectlayers>{layers}</projectlayers>
+      <relations>
+        <relation id="own" name="Owners of parcel" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Composition"><fieldRef referencedField="id" referencingField="pid"/></relation>
+        <relation id="two" name="two keys" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/><fieldRef referencedField="k2" referencingField="pk2"/></relation>
+        <relation id="none" name="" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"/>
+        <relation id="nameless" name="" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/></relation>
+        <relation id="half" name="half pair" referencedLayer="parcels_1" referencingLayer="owners_1" strength="Association"><fieldRef referencedField="id" referencingField="pid"/><fieldRef referencedField="k2"/></relation>
+      </relations>
+      <polymorphicRelations><relation id="poly" name="poly" referencedLayerExpression="@layer_name" referencedLayerField="y" referencedLayerIds="a,b" referencingLayer="events" relationStrength="Association"><fieldRef referencedField="id" referencingField="y"/></relation></polymorphicRelations>
+      <Bookmarks>
+        <Bookmark extent="Polygon ((8.40000000000000036 47.29999999999999716, 8.59999999999999964 47.29999999999999716, 8.59999999999999964 47.45000000000000284, 8.40000000000000036 47.45000000000000284, 8.40000000000000036 47.29999999999999716))" group="Swiss" id="{{0ac0}}" name="Zurich" rotation="0">{wgs84}</Bookmark>
+        <Bookmark extent="Polygon ((900000 5900000, 1000000 5900000, 1000000 6000000, 900000 6000000, 900000 5900000))" group="" id="{{0072}}" name="Web" rotation="30"/>
+        <Bookmark extent="Point (1 2)" group="" id="x" name="Nowhere" rotation="0"/>
+        <Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="" id="y" name="Askew" rotation="abc"/>
+        <Bookmark extent="Polygon (({long}))" group="" id="z" name="Long" rotation="0"/>
+        <Bookmark extent="Polygon ((1 2 9, 3 2 9, 3 4 9, 1 4 9, 1 2 9))" group="" id="h" name="High" rotation="0"/>
+        <Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="" id="n" name=" " rotation="0"/>
+        <Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="Lost" id="u" name="Blank" rotation="x"><spatialrefsys><authid></authid></spatialrefsys></Bookmark>
+      </Bookmarks>
+      <ProjectTimeSettings cumulativeTemporalRange="1" frameRate="5" timeStep="2" timeStepUnit="wk" totalMovieFrames="100">
+        <TemporalRange><start>2020-01-01T00:00:00Z</start><end>2020-12-31T00:00:00Z</end></TemporalRange>
+      </ProjectTimeSettings>
+    </qgis>"#
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "/p", &mut report).unwrap();
+    // The main canvas's (another canvas's unreadable one isn't read).
+    assert_eq!(p.rotation, 15.0);
+    let marks: Vec<(&str, [f64; 4], Option<&str>, f64)> =
+        p.bookmarks.iter().map(|b| (b.name.as_str(), b.extent, b.crs.as_deref(), b.rotation)).collect();
+    assert_eq!(
+        marks,
+        [
+            ("Zurich", [8.4, 47.3, 8.6, 47.45], Some("EPSG:4326"), 0.0),
+            ("Web", [900000.0, 5900000.0, 1000000.0, 6000000.0], None, 30.0),
+            ("Askew", [1.0, 2.0, 3.0, 4.0], None, 0.0),
+            ("Bookmark", [1.0, 2.0, 3.0, 4.0], None, 0.0)
+        ]
+    );
+    let rels: Vec<(&str, &str, &str, &str, &str)> = p
+        .relations
+        .iter()
+        .map(|r| {
+            (r.name.as_str(), r.referenced.as_str(), r.referenced_field.as_str(), r.referencing.as_str(), r.referencing_field.as_str())
+        })
+        .collect();
+    assert_eq!(
+        rels,
+        [
+            ("Owners of parcel", "parcels_1", "id", "owners_1", "pid"),
+            ("two keys", "parcels_1", "id", "owners_1", "pid"),
+            ("nameless", "parcels_1", "id", "owners_1", "pid"),
+            ("half pair", "parcels_1", "id", "owners_1", "pid")
+        ]
+    );
+    let time = |name: &str| p.layers.iter().find(|l| l.name == name).and_then(|l| l.style.time.as_deref());
+    for (name, field) in [
+        ("instant", Some("when")),
+        ("span", Some("t0")),
+        ("lasting", Some("t0")),
+        ("by_field", Some("t0")),
+        ("by_expr", None),
+        ("fixed", None),
+        ("redraw", None),
+        ("closed", Some("when")),
+        ("unnamed", None),
+        ("dem", None),
+    ] {
+        assert_eq!(time(name), field, "{name}");
+    }
+    let said =
+        |layer: &str, kind: NoteKind, part: &str| report.notes.iter().any(|n| n.layer == layer && n.kind == kind && n.text.contains(part));
+    use NoteKind::{Approximated as A, Skipped as S};
+    for (layer, kind, part) in [
+        ("", S, "the groups of its bookmarks (1: Swiss)"),
+        ("", S, "its bookmarks whose place doesn't read (3: Nowhere, Long, High)"),
+        ("", S, "its relation half pair's pairs of fields that don't name both (1)"),
+        ("", A, "its bookmarks with no name, named Bookmark (1)"),
+        ("", S, "its bookmarks whose coordinate system doesn't read (1: Blank)"),
+        ("", A, "its relations with no name, named by their id, else Relation (1: nameless)"),
+        ("", A, "its bookmarks whose rotation doesn't read, facing north (1: Askew)"),
+        ("lasting_events", A, "its features lasting 3 hours each: each shown at its date alone"),
+        ("", S, "its relation Owners of parcel's composition"),
+        ("", A, "its relation two keys on 2 pairs of fields: related by the first (pid = id) alone"),
+        ("", S, "its relations that name no layers or fields (1: none)"),
+        ("", S, "its polymorphic relations (1"),
+        ("", S, "its time span and steps (2020-01-01 to 2020-12-31, steps of 2 weeks, cumulative): the time slider is left off"),
+        ("instant", A, "its features accumulating over time"),
+        ("span", A, "its features' end dates (the field t1): each shown at its start date alone"),
+        ("lasting", A, "its features' durations (the field d)"),
+        ("by_field", A, "its features' end dates (`\"t1\"`)"),
+        ("by_expr", S, "its time, from the expression `\"t\" + make_interval(days:=1)`"),
+        ("fixed", S, "its fixed time range"),
+        ("redraw", S, "its redrawing as the map's time changes"),
+        ("closed", A, "a feature at the very end of a time step"),
+        ("unnamed", S, "its time settings, which name no field"),
+        ("dem", S, "its time settings"),
+    ] {
+        assert!(said(layer, kind, part), "{layer}: {part}: {:#?}", report.notes);
+    }
+    // Accumulating, an event has no duration of its own.
+    assert!(!said("piling", A, "lasting"), "{:#?}", report.notes);
+    assert!(!report.notes.iter().any(|n| n.text.contains("the map's rotation")), "{:#?}", report.notes);
+    // Each layer's time noted once.
+    assert_eq!(report.notes.iter().filter(|n| n.layer == "by_expr").count(), 1, "{:#?}", report.notes);
+}
+
+/// A project whose bookmarks, relation and time settings carry over whole gives no note on them:
+/// QGIS's default time settings (no span) included.
+#[test]
+fn bookmarks_relations_and_time_that_carry_over_whole_are_not_noted() {
+    let qgs = format!(
+        r#"<qgis version="4.2.3">
+      <projectlayers><maplayer type="vector" geometry="Point"><id>a</id><datasource>./a.gpkg</datasource><layername>a</layername><provider>ogr</provider>{}</maplayer></projectlayers>
+      <relations><relation id="r" name="r" referencedLayer="a" referencingLayer="b" strength="Association"><fieldRef referencedField="id" referencingField="aid"/></relation></relations>
+      <Bookmarks><Bookmark extent="Polygon ((1 2, 3 2, 3 4, 1 4, 1 2))" group="" id="b" name="Here" rotation="0"/></Bookmarks>
+      <ProjectTimeSettings cumulativeTemporalRange="0" frameRate="1" timeStep="1" timeStepUnit="h" totalMovieFrames="100"/>
+    </qgis>"#,
+        temporal("1", &[("startField", "day")])
+    );
+    let mut report = Report::default();
+    let p = read_project(&qgs, "/p", &mut report).unwrap();
+    assert_eq!((p.bookmarks.len(), p.relations.len(), p.rotation), (1, 1, 0.0));
+    assert_eq!(p.layers.first().and_then(|l| l.style.time.as_deref()), Some("day"));
+    assert!(report.notes.is_empty(), "{:#?}", report.notes);
+}
+
+/// The corpus's project structure, as QGIS wrote it: its bookmark, relation and a layer's time
+/// by a date field.
+#[test]
+fn the_corpus_bookmarks_relations_and_time_read_as_qgis_wrote_them() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("structure-groups-themes-bookmarks-variables-relations-joins-time.qgs")).unwrap();
+    let mut report = Report::default();
+    let p = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let marks: Vec<(&str, [f64; 4], Option<&str>)> = p.bookmarks.iter().map(|b| (b.name.as_str(), b.extent, b.crs.as_deref())).collect();
+    assert_eq!(marks, [("Old town", [2696400.0, 1261250.0, 2698200.0, 1262350.0], Some("EPSG:2056"))]);
+    let rels: Vec<(&str, &str, &str)> =
+        p.relations.iter().map(|r| (r.name.as_str(), r.referenced_field.as_str(), r.referencing_field.as_str())).collect();
+    assert_eq!(rels, [("lines to points", "id", "id")]);
+    let points = p.layers.iter().find(|l| l.name == "points").unwrap();
+    assert_eq!(points.style.time.as_deref(), Some("day"));
+    let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+    assert!(!texts.iter().any(|t| t.contains("bookmark") || t.contains("relation") || t.contains("time settings")), "{texts:?}");
+}
+
+/// The corpus's bookmarks, relations and time settings as QGIS 4.2 wrote them: a bookmark turned
+/// and in a group, one in degrees; relations on one pair of fields, on two, a composition and a
+/// polymorphic one; a span of months, and each layer's time read or noted.
+#[test]
+fn the_corpus_bookmarks_relations_and_time_settings_read_as_qgis_wrote_them() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/qgis/generated/qgs");
+    let text = std::fs::read_to_string(root.join("bookmarks-relations-time.qgs")).unwrap();
+    let mut report = Report::default();
+    let p = read_project(&text, "/p/qgs", &mut report).unwrap();
+    let marks: Vec<(&str, Option<&str>, f64)> = p.bookmarks.iter().map(|b| (b.name.as_str(), b.crs.as_deref(), b.rotation)).collect();
+    assert_eq!(marks, [("Old town", Some("EPSG:2056"), 30.0), ("Region", Some("EPSG:4326"), 0.0)]);
+    assert_eq!(p.bookmarks[0].extent, [2696400.0, 1261250.0, 2698200.0, 1262350.0]);
+    let rels: Vec<&str> = p.relations.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(rels, ["lines to points", "lines to points by kind", "polygons of points"]);
+    let time = |name: &str| p.layers.iter().find(|l| l.name == name).and_then(|l| l.style.time.as_deref());
+    assert_eq!((time("points"), time("lines"), time("polygons")), (Some("day"), Some("day"), None));
+    let said = |layer: &str, part: &str| report.notes.iter().any(|n| n.layer == layer && n.text.contains(part));
+    for (layer, part) in [
+        ("", "the groups of its bookmarks (1: Places)"),
+        ("", "its relation lines to points by kind on 2 pairs of fields"),
+        ("", "its relation polygons of points's composition"),
+        ("", "its polymorphic relations (1"),
+        ("", "its time span and steps (2024-01-01 to 2024-12-31, steps of 1 month, cumulative)"),
+        ("points", "accumulating over time"),
+        ("lines", "its features' durations (the field value)"),
+        ("polygons", "its fixed time range"),
+    ] {
+        assert!(said(layer, part), "{layer}: {part}: {:#?}", report.notes);
+    }
+}
+
+/// The map's rotation that doesn't read faces north, noted.
+#[test]
+fn a_map_rotation_that_does_not_read_is_noted() {
+    let qgs = r#"<qgis version="4.2.3"><mapcanvas name="theMapCanvas"><rotation>sideways</rotation></mapcanvas></qgis>"#;
+    let mut report = Report::default();
+    let p = read_project(qgs, "/p", &mut report).unwrap();
+    assert_eq!(p.rotation, 0.0);
+    assert!(
+        report.notes.iter().any(|n| n.text == "the map's rotation `sideways`, which doesn't read: facing north"),
+        "{:#?}",
+        report.notes
+    );
+}
+
+/// A project nested past the limit, or whose namespaces would take too long to resolve, is refused
+/// before it is parsed, never a crash or a hang.
+#[test]
+fn a_hostile_project_is_refused_before_parsing() {
+    let deep = format!("<!DOCTYPE qgis><qgis>{}{}</qgis>", "<a>".repeat(10_000), "</a>".repeat(10_000));
+    let refused = parse(&deep, "a QGIS project").unwrap_err();
+    assert!(refused.contains("deep"), "{refused}");
+    let declarations: String = (0..20_000).map(|k| format!(r#" xmlns:n{k}="urn:{k}""#)).collect();
+    let flood = format!("<qgis{declarations}/>");
+    let refused = parse(&flood, "a QGIS project").unwrap_err();
+    assert!(refused.contains("namespace declarations"), "{refused}");
 }

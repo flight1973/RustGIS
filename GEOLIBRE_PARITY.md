@@ -54,7 +54,7 @@ _GeoLibre: docs/data-formats.md, docs/features.md › Adding data, SQL and datab
   the service address is sent with its requests (saved sources drop it); sign-in with OAuth to
   ArcGIS Online and Enterprise. Missing: a Portal browser (_Roadmap: add data_).
 - [ ] **STAC browser and cloud catalogs**: STAC, Planetary Computer, Earth Engine, Overture,
-  Source Cooperative, NASA Earthdata, Planet and Hugging Face. Partial: STAC Search ([#128](https://github.com/opengeos/RustGIS/issues/128)),
+  Source Cooperative, NASA Earthdata, Planet and Hugging Face. Partial: STAC Search ([#128](https://github.com/opengeos/RustGIS/issues/128)) by box, point, line, polygon, selected features or file, with a buffer in your Distance units that widens points and lines (a box or polygon is searched as drawn, with a notice),
   Planetary Computer with signed assets ([#144](https://github.com/opengeos/RustGIS/issues/144)), Overture Maps and Source Cooperative ([#158](https://github.com/opengeos/RustGIS/issues/158)), NASA
   Earthdata (desktop) and Hugging Face. Missing: Earth Engine and Planet.
 - [ ] **Open-data portal browsers**: partial. Overpass and geoBoundaries ([#139](https://github.com/opengeos/RustGIS/issues/139)), CKAN, Socrata and
@@ -290,8 +290,10 @@ deployment-capabilities.md, ui-profiles.md_
 - [ ] **Auto-update**. Partial: Check for Updates, with Download and Install for Windows `setup.exe`
   installs (_Roadmap: platform, docs and security_ for the macOS app).
 - [ ] **Desktop network features**: OS trust store, mTLS client certificates, network log,
-  reloading files changed on disk. Partial: Reload Data for linked files and tile archives
-  (_Roadmap: add data_ for noticing changes).
+  reloading files changed on disk. Partial: reloading files changed on disk is done (Reload Data,
+  and a notice when a linked file or tile archive changes,
+  [#1477](https://github.com/opengeos/RustGIS/issues/1477)); the trust store, mTLS certificates
+  and network log remain.
 
 ## AI
 _GeoLibre: docs/user-guide/ai-assistant.md, docs/features.md › AI, Python, and automation_

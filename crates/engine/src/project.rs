@@ -506,6 +506,37 @@ pub struct GpEnvironment {
     /// The cell size (degrees) of rasters tools create, when they don't say.
     #[serde(default)]
     pub cell_size: Option<f64>,
+    /// The projected coordinate system the Geostatistical Wizard makes its surface in, and the cell
+    /// size in its units, when the run doesn't say; `None`: the projected system the layer was read in,
+    /// else degrees with `cell_size`. Kept apart
+    /// from `cell_size` so an older RustGIS, which reads only that, still makes it in degrees rather
+    /// than reading this system's units as degrees: losing it costs that version the setting, not
+    /// the raster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected: Option<ProjectedCells>,
+}
+
+impl GpEnvironment {
+    /// The cell size set for rasters made in `crs`: the projected one's in its own system, the
+    /// degree one in longitude/latitude (whether or not a system is set), none in another system.
+    pub fn cell_in(&self, crs: rustgis_data::raster::Crs) -> Option<f64> {
+        match self.projected {
+            Some(g) if g.crs == crs => g.cell_size,
+            _ if crs == rustgis_data::raster::Crs::LonLat => self.cell_size,
+            _ => None,
+        }
+    }
+}
+
+/// A projected coordinate system for the rasters the environment sets ([`GpEnvironment::projected`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedCells {
+    /// The system, never one in degrees: `gp.env` refuses those, and opening a project leaves one
+    /// out.
+    pub crs: rustgis_data::raster::Crs,
+    /// The cell size in the system's units; `None`: the tool's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_size: Option<f64>,
 }
 
 /// A model: geoprocessing steps run in order. A parameter value `%n` stands for the output layer
@@ -1302,6 +1333,61 @@ impl Project {
         p.read_notices =
             label_losses::notices_for_maps(text, &p, map_limit.is_some())?.into_iter().map(|(part, text)| (part, text.into())).collect();
         p.read_notices.extend(repair_notices);
+        // What `gp.env` refuses, which only a hand-edited file holds, is left out, and said: a system
+        // in degrees or geocentric (its cell size would be read in the wrong units) or one this
+        // version can't project to, and a cell size that isn't above 0.
+        if let Some(g) = p.gp_env.projected.filter(|g| g.crs.is_geographic() || g.crs.is_geocentric() || g.crs.transformer().is_err()) {
+            p.gp_env.projected = None;
+            p.read_notices.push((
+                ReadPart::Items,
+                NoticeText::format(
+                    "the environment's coordinate system {crs} isn't a projected one this version can use, so it was left out",
+                    [("crs", g.crs.label().into())],
+                ),
+            ));
+        }
+        // A measured graticule's system `map.graticule` would refuse (too long, unreadable here, or
+        // in degrees), from a hand-edited file or one saved where it reads (a PROJ string the web
+        // app can't): left out, said, and the graticule falls back to the map's own system.
+        // One notice for all of them, with how many and which.
+        let mut left_out = Vec::new();
+        for m in &mut p.maps {
+            let Some(c) = m.graticule_crs.take() else { continue };
+            let usable = c.trim().chars().nth(rustgis_map::layout::MAX_GRID_CRS).is_none()
+                && rustgis_data::raster::Crs::parse(c.trim())
+                    .is_ok_and(|r| !r.is_geographic() && !r.is_geocentric() && r.transformer().is_ok());
+            if usable {
+                m.graticule_crs = Some(c);
+            } else {
+                left_out.push(format!("{} ({})", m.name, rustgis_map::graticule::short_crs(&c)));
+            }
+        }
+        if !left_out.is_empty() {
+            let n = left_out.len();
+            let mut which = left_out.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            if n > 3 {
+                which = format!("{which} and {} more", n - 3);
+            }
+            p.read_notices.push((
+                ReadPart::Maps,
+                NoticeText::format(
+                    "{n} map(s): the measured graticule's coordinate system isn't a projected one this version can use, so it was left out (the map's own, else the UTM zone at the centre, is used): {which}",
+                    [("n", n.to_string().into()), ("which", which.into())],
+                ),
+            ));
+        }
+        if let Some(g) = p.gp_env.projected.as_mut()
+            && let Some(c) = g.cell_size.filter(|c| !(c.is_finite() && *c > 0.0))
+        {
+            g.cell_size = None;
+            p.read_notices.push((
+                ReadPart::Items,
+                NoticeText::format(
+                    "the environment's cell size {size} isn't above 0, so it was left out",
+                    [("size", c.to_string().into())],
+                ),
+            ));
+        }
         if excluded_maps > 0 {
             p.read_notices.push((
                 ReadPart::Maps,
@@ -1754,6 +1840,13 @@ pub(crate) fn layout_notices(
         notices.push(format!(
             "{name}: the page size, guides or map series margin of {pages} layout(s) adjusted {when} (in {})",
             layout_names(repairs, |r| r.page_adjusted)
+        ));
+    }
+    let mgrs = total(|r| r.mgrs_off);
+    if mgrs > 0 {
+        notices.push(format!(
+            "{name}: MGRS labels turned off on {mgrs} map frame grid(s) that weren't measured grids in a WGS 84 UTM zone (named by its EPSG code) {when} (in {})",
+            layout_names(repairs, |r| r.mgrs_off)
         ));
     }
     let series = total(|r| r.series_removed);

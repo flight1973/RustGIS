@@ -11,6 +11,7 @@ use rustgis_map::layout::{
     MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries, Orientation, PAGES, ScaleBarStyle, ScaleUnits, TextAlign, TickSide,
     fit_scale, line_angle, line_at_angle, line_length,
 };
+use rustgis_map::symbology::{Dash, MAX_DASH_STEP, MAX_DASH_STEPS};
 use rustgis_map::{Map, Rgba};
 use serde_json::{Value, json};
 
@@ -31,10 +32,10 @@ pub fn commands() -> Vec<C> {
             r#"{"name"?: string, "page"?: "letter"|"legal"|"tabloid"|"a5"|"a4"|"a3"|"a2"|"a1"|"a0", "orientation"?: "landscape"|"portrait", "width"?: mm, "height"?: mm, "template"?: "map" (frame, title, legend, north arrow, scale bar; the default)|"blank"}"#,
         ),
         C::new("layout.publication", "New Publication Layout", "Publish › Layout", publication).inputs(publication_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"profile"?: "a4" (the default) | "a3" | "a2" (a sheet turned to portrait or landscape, whichever the area's map comes out larger on: its extent east to west against north to south, on the map's projection) | "a4-portrait"|"a4-landscape"|"a3-portrait"|"a3-landscape"|"a2-portrait"|"a2-landscape" (a sheet: frame, title, subtitle, the map, a boxed footer)|"figure-1col" (90 mm)|"figure-1.5col" (140 mm)|"figure-2col" (190 mm)|"thesis-full" (160 × 225 mm)|"thesis-half" (160 × 110 mm) (a figure: the map edge to edge, its title and sources left to the caption), "extent"?: [west, south, east, north] in degrees that must fit (default: the map view), "name"?: string, "title"?: text, "subtitle"?: text, "sources"?: text | [texts], "reference"?: text | [texts] (default: the projection, datum and graticule), "note"?: text, "author"?: text (default: "Made with RustGIS · {date}"; "" or [] for none), "headings"?: [the sources' heading, the reference's heading, an editorial column's heading], "locator"?: "globe" (a globe with the area outlined; the default on sheets) | "inset" (the surrounding region, the area outlined) | "none" (the default on figures), "decimal"?: "." (the default) | "," (graticule, scale bar and colorbar numbers and {scale} with a decimal comma: 0,05 and 1:6.300.000), "colorbar"?: "auto" (the default: the top visible raster with a colour scale gets one, under the legend in its box) | "none" (no colorbar, and the legend's box has no room for one), "veil"?: true (the default: when no shape of the legend fits, a map that runs on past the extent, with a long legend, has what is outside the extent veiled and its surrounds grouped there, at up to half the scale on a sheet) | false (never veiled, and drawn at its scale; the map may still move aside), "style"?: "classic" (the default: the title over the map, the footer under it) | "banner" (the title and subtitle in a band of the accent colour across the top) | "panel" (the map at the left, a panel at the right with the title, locator, legend, sources and reference) | "editorial" (the title large in serif, a column at the right with the note, the locator and the legend) | "modular" (cards on a light page: the map, the locator and the legend each in one, the sources and reference in tinted ones) | "poster" (the page in the accent colour, the title in light text, the map in a light card, the footer in darker blocks) (a sheet's arrangement; figures leave it to the caption), "accent"?: a colour as #RRGGBB (the style's colour: its band, panel tint, headings and rules, a poster's page), "arrangement"?: "best" (the default: the favourite and each arrangement by name laid out, the one moving the least area off its corners kept, then the one leaving the least over the data, the favourite on a tie) | "favourite" (layout.arrangement's) | an arrangement by name or corner by corner, as layout.arrangement takes (the corners the locator, north arrow, legend and scale bar are at home in; one covering what the map draws there still moves)} → a new layout of the active map at a round scale, its texts wrapped to their boxes; {projection}, {datum} and {grid} in the texts are filled from the map"#,
+            r#"{"profile"?: "a4" (the default) | "a3" | "a2" (a sheet turned to portrait or landscape, whichever the area's map comes out larger on: its extent east to west against north to south, on the map's projection) | "a4-portrait"|"a4-landscape"|"a3-portrait"|"a3-landscape"|"a2-portrait"|"a2-landscape" (a sheet: frame, title, subtitle, the map, a boxed footer)|"figure-1col" (90 mm)|"figure-1.5col" (140 mm)|"figure-2col" (190 mm)|"thesis-full" (160 × 225 mm)|"thesis-half" (160 × 110 mm) (a figure: the map edge to edge, its title and sources left to the caption), "extent"?: [west, south, east, north] in degrees that must fit (default: the map view), "name"?: string, "title"?: text, "subtitle"?: text, "sources"?: text | [texts], "reference"?: text | [texts] (default: the projection, datum and graticule), "note"?: text, "author"?: text (default: "Made with RustGIS · {date}"; "" or [] for none), "headings"?: [the sources' heading, the reference's heading, an editorial column's heading], "locator"?: "globe" (a globe with the area outlined; the default on sheets) | "inset" (the surrounding region, the area outlined) | "none" (the default on figures), "decimal"?: "." (the default) | "," (graticule, scale bar and colorbar numbers and {scale} with a decimal comma: 0,05 and 1:6.300.000), "colorbar"?: "auto" (the default: the top visible raster with a colour scale, not drawn by classes, gets one, under the legend in its box; a raster drawn by classes has them in the legend's rows instead) | "none" (no colorbar, and the legend's box has no room for one), "veil"?: true (the default: when no shape of the legend fits, a map that runs on past the extent, with a long legend, has what is outside the extent veiled and its surrounds grouped there, at up to half the scale on a sheet) | false (never veiled, and drawn at its scale; the map may still move aside), "style"?: "classic" (the default: the title over the map, the footer under it) | "banner" (the title and subtitle in a band of the accent colour across the top) | "panel" (the map at the left, a panel at the right with the title, locator, legend, sources and reference) | "editorial" (the title large in serif, a column at the right with the note, the locator and the legend) | "modular" (cards on a light page: the map, the locator and the legend each in one, the sources and reference in tinted ones) | "poster" (the page in the accent colour, the title in light text, the map in a light card, the footer in darker blocks) (a sheet's arrangement; figures leave it to the caption), "accent"?: a colour as #RRGGBB (the style's colour: its band, panel tint, headings and rules, a poster's page), "arrangement"?: "best" (the default: the favourite, each arrangement by name and each saved with layout.arrangement laid out, the one moving the least area off its corners kept, then the one leaving the least over the data, the favourite on a tie) | "favourite" (layout.arrangement's) | an arrangement by name (built in or saved) or corner by corner, as layout.arrangement takes (the corners the locator, north arrow, legend and scale bar are at home in; one covering what the map draws there still moves), "coverage"?: "*.png" (writes the coverage grid the placement searched, as it settled on it, three pixels a cell: what the map draws dark, the free cells white, both tinted blue in the strips the graticule's labels keep, the surrounds placed over the map outlined in red; the answer gives its path)} → a new layout of the active map at a round scale, its texts wrapped to their boxes; {projection}, {datum} and {grid} in the texts are filled from the map"#,
         ),
         C::new("layout.arrangement", "Favourite Arrangement", "Publish › Layout", arrangement).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
-            r#"{"favourite"?: "classic" (the locator top left, the north arrow top right, the legend bottom left, the scale bar bottom right) | "mirrored" | "legendRight" | "legendTop" | {"locator", "northArrow", "legend", "scaleBar": "top-left"|"top-right"|"bottom-left"|"bottom-right", each a corner of its own}} → the favourite arrangement of publication layouts (kept with the app's preferences), its corners and the arrangements by name; with no favourite given, it is only shown"#,
+            r#"{"favourite"?: "classic" (the locator top left, the north arrow top right, the legend bottom left, the scale bar bottom right) | "mirrored" | "legendRight" | "legendTop" | {"locator", "northArrow", "legend", "scaleBar": "top-left"|"top-right"|"bottom-left"|"bottom-right", each a corner of its own} | a saved arrangement's name, "save"?: a name (1 to 40 characters, not a built-in one nor "best", "favourite", "custom" or "veil"; one saved under it already, case aside, is replaced) to save "arrangement" under (at most 20 saved), "arrangement"?: what "save" saves: an arrangement by name, or a corner for each surround as "favourite" takes them (refused without "save"), "remove"?: a saved arrangement's name (a favourite named after it keeps its corners, unless "favourite" gives another)} → the favourite arrangement of publication layouts and those saved by name (kept with the app's preferences), the favourite's corners, the arrangements by name and the saved ones' corners; a removal, then a save, then the favourite; with none of them given, they are only shown"#,
         ),
         C::new("layout.activate", "Open Layout", "Browser", |s, p| {
             let i = index(s, &by_name(p))?;
@@ -93,10 +94,10 @@ pub fn commands() -> Vec<C> {
             r#"{"layout"?, "shape"?: "rectangle"|"circle"|"ellipse"|"polygon"|"lasso", "points"?: [[u, v], …] (polygon/lasso, 0..1 across the frame), "map"?: name, "x"?, "y"?, "w"?, "h"?: mm}"#,
         ),
         C::new("layout.addElement", "Add Element", "Publish › Map Surrounds", add_element).inputs(element_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
-            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA" (text, dynamicText, line, arrow, rectangle, ellipse, circle: its outline; extentIndicator; grid; scaleBar; refused for other kinds), "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "font"?: "sans"|"serif"|an installed font family's name, as labels.fonts lists them (text, dynamicText; a family not installed here is drawn in its fallback, and a serif where none is installed in the sans, with a warning; refused for other kinds), "fallback"?: "sans"|"serif" (a named font's, where it isn't installed; default its own class, else sans), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "columns"?: 1..3 (legend: the columns its rows are laid in; default 1), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow; scaleBar: the alternating bar's light divisions, default white; refused for other kinds), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "radius"?: mm, 0 to 50 (rectangle: rounded corners), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page unless x or y is given (line, arrow; it sets the box and the direction, so w, h and dir are not used with it), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees, or a measured grid's units (metres) (0 picks one), "type"?: "graticule" (latitudes and longitudes, default) | "measured" (eastings and northings in a projected system, as ArcGIS Pro's measured grid), "crs"?: a measured grid's coordinate system: EPSG:25832, WKT or a PROJ string ("" or none: the map's when projected, else the UTM zone at the frame's centre), "short"?: bool (a measured grid's labels as their kilometres' last two digits, 43 for 543000), "labels"?: bool (grid) | {"<layer>": "<label>"} (legend: what it shows instead of a layer's name, as in layout.update; a layer the map hasn't is refused), "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow, or a rectangle's, ellipse's or circle's outline instead of color; refused for other kinds), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar, whose "color" is its lines, dark divisions and labels, default #222222), "x"?, "y"?, "w"?, "h"?: mm}"##,
+            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA" (text, dynamicText, line, arrow, rectangle, ellipse, circle: its outline; extentIndicator; grid; scaleBar; refused for other kinds), "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "rotation"?: degrees clockwise about the box's centre, 90 reading top to bottom and -90 bottom to top, kept within -180 to 180 (text, dynamicText; refused for other kinds), "font"?: "sans"|"serif"|an installed font family's name, as labels.fonts lists them (text, dynamicText; a family not installed here is drawn in its fallback, and a serif where none is installed in the sans, with a warning; refused for other kinds), "fallback"?: "sans"|"serif" (a named font's, where it isn't installed; default its own class, else sans), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "columns"?: 1..3 (legend: the columns its rows are laid in; default 1), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow; scaleBar: the alternating bar's light divisions, default white; refused for other kinds), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "radius"?: mm, 0 to 50 (rectangle: rounded corners), "dash"?: [points, …] (line, arrow, and a rectangle's, ellipse's or circle's outline: dash, gap, … in turn, as layer.lineStrokes takes it, at most 8, each 0 to 500; an arrow's heads stay solid; [] or null for solid; refused, null too, for other kinds), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page unless x or y is given (line, arrow; it sets the box and the direction, so w, h and dir are not used with it), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible raster with a colour scale, not drawn by classes, which a legend lists), "field"?, "label"?, "rows"?, "step"?: degrees, or a measured grid's units (metres) (0 picks one), "type"?: "graticule" (latitudes and longitudes, default) | "measured" (eastings and northings in a projected system, as ArcGIS Pro's measured grid), "crs"?: a measured grid's coordinate system: EPSG:25832, WKT or a PROJ string ("" or none: the map's when projected, else the UTM zone at the frame's centre), "short"?: bool (a measured grid's labels as their kilometres' last two digits, 43 for 543000), "mgrs"?: bool (a measured grid labelled as MGRS: each 100 km square named with its grid zone designation, 32T MT, and the lines by their kilometres' last two digits; its crs a WGS 84 UTM zone by EPSG code, EPSG:32601–32660 or 32701–32760, or none: the map's when it is one, else the zone at the frame's centre), "labels"?: bool (grid) | {"<layer>": "<label>"} (legend: what it shows instead of a layer's name, as in layout.update; a layer the map hasn't is refused), "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow, or a rectangle's, ellipse's or circle's outline instead of color; refused for other kinds), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar, whose "color" is its lines, dark divisions and labels, default #222222), "x"?, "y"?, "w"?, "h"?: mm}"##,
         ),
         C::new("layout.update", "Element Properties", "Publish › Element", update).inputs(update_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
-            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line, rectangle, ellipse: its outline; scaleBar: its lines, dark divisions and labels; refused for other elements), "bold"?, "italic"?, "align"?, "letterSpacing"?, "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "labels"?: {"<layer>": "<label>"|null} (legend: what it shows instead of a layer's name, up to 200 characters, a longer one is refused; each entry replaces that layer's label, null or "" shows its name again, {} every layer's; a layer the map hasn't is refused), "columns"?: 1..3 (legend), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse, and a scaleBar's fill; refused for other elements; for a rectangle or ellipse, color sets it when outline is not given; a scaleBar's fill is the alternating bar's light divisions), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?}"##,
+            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line, rectangle, ellipse: its outline; scaleBar: its lines, dark divisions and labels; refused for other elements), "bold"?, "italic"?, "align"?, "letterSpacing"?, "rotation"?: degrees clockwise (text, as in layout.addElement; refused for other elements), "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "labels"?: {"<layer>": "<label>"|null} (legend: what it shows instead of a layer's name, up to 200 characters, a longer one is refused; each entry replaces that layer's label, null or "" shows its name again, {} every layer's; a layer the map hasn't is refused), "columns"?: 1..3 (legend), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse, and a scaleBar's fill; refused for other elements; for a rectangle or ellipse, color sets it when outline is not given; a scaleBar's fill is the alternating bar's light divisions), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dash"?: [points, …]|[]|null (line, rectangle, ellipse, as in layout.addElement; [] or null makes it solid; refused, null too, for other elements), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster with a colour scale, not drawn by classes), "field"?, "rows"?}"##,
         ),
         C::new("layout.guides", "Guides", "Publish › Page Setup", guides).inputs(object_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layout"?, "x"?: [mm] (vertical guides, from the page's left edge), "y"?: [mm] (horizontal guides, from its top edge), "clear"?: bool (remove every guide first)}"#,
@@ -128,7 +129,7 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"layout"?}"#),
         C::new("layout.export", "Export Layout", "Publish › Output", |s, p| super::exports::write_here(s, p, "layout.export")).inputs(layout_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
-            .params(r#"{"layout"?, "path": "*.png|*.pdf|*.svg" (PNG/SVG: current page; SVG: each element a group of its own; text and shapes as SVG, map frames and surrounds as vectors, rasters and tiles in them as pictures at dpi), "dpi"?: 72..600, "allPages"?: bool (PDF only; default true: every map series page, up to 500; false: the current page), "georeference"?: bool (PDF only; default true: map frames carry their coordinates, a GeoPDF; false: none)}"#),
+            .params(r#"{"layout"?, "path": "*.png|*.pdf|*.svg" (PNG/SVG: current page; SVG: each element a group of its own; text and shapes as SVG, map frames and surrounds as vectors, rasters and tiles in them as pictures at dpi), "dpi"?: 72..600, "allPages"?: bool (PDF only; default true: every map series page, up to 500; false: the current page), "georeference"?: bool (PDF only; default true: map frames carry their coordinates, a GeoPDF; false: none), "pdf"?: {"layers"?: bool (default true: each element, and in a map frame each layer and its labels, a PDF layer that vector editors open as a layer; false: none), "text"?: "fonts" (default: text in its faces, embedded as subsets, editable in a vector editor; a face that can't be is set in outlines, and said)|"outlines" (glyphs as outlines, as print shops ask)}}"#),
         C::new("layout.save", "Save Layout File", "Publish › Save As", |s, p| {
             let path = ps(p, "path").ok_or("path is required")?;
             let l = active(s, p)?.clone();
@@ -519,7 +520,7 @@ fn pub_text(text: String, size: f64, color: Rgba, bold: bool, align: TextAlign) 
 
 /// [`pub_text`] in `font`.
 fn pub_text_in(text: String, size: f64, color: Rgba, bold: bool, align: TextAlign, font: FontFamily) -> ElementKind {
-    ElementKind::Text { text, size, color, bold, italic: false, align, letter_spacing: 0.0, font, font_name: None }
+    ElementKind::Text { text, size, color, bold, italic: false, align, letter_spacing: 0.0, font, font_name: None, rotation: 0.0 }
 }
 
 /// How a publication sheet is arranged around its map.
@@ -602,7 +603,7 @@ fn pub_box(fill: Rgba, outline: Rgba, width: f64) -> ElementKind {
 
 /// [`pub_box`] with its corners rounded by `radius` millimetres.
 fn pub_card(fill: Rgba, outline: Rgba, width: f64, radius: f64) -> ElementKind {
-    ElementKind::Rectangle { fill, outline, width, radius }
+    ElementKind::Rectangle { fill, outline, width, radius, dash: None }
 }
 
 /// The surrounds a publication layout places in the map frame's corners.
@@ -830,17 +831,42 @@ fn home_slot(kind: Surround) -> usize {
     }
 }
 
-/// An arrangement: one of [`ARRANGEMENTS`] by name, or a corner for each surround
-/// (`{"locator": "top-left", "northArrow": "top-right", "legend": "bottom-left", "scaleBar":
-/// "bottom-right"}`, every corner once). `Value::Null` (none given) is `classic`.
-pub fn parse_arrangement(v: &Value) -> Result<Homes, String> {
-    let names = || ARRANGEMENTS.iter().map(|(n, _)| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
+/// At most this many arrangements are saved by name, each name at most this many characters
+/// (#1379).
+pub const MAX_SAVED_ARRANGEMENTS: usize = 20;
+pub const MAX_ARRANGEMENT_NAME: usize = 40;
+
+/// Names an arrangement can't be saved under: those `"arrangement"` reads otherwise, and those
+/// the answer gives.
+const RESERVED_ARRANGEMENT_NAMES: [&str; 4] = ["best", "favourite", "custom", "veil"];
+
+/// Two arrangement names the same but for case (beyond ASCII too).
+fn same_name(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// The arrangements saved by name (`layout.arrangement {"save": …}`), each its name and corners;
+/// an entry that isn't an arrangement is passed over.
+fn saved_arrangements(saved: &serde_json::Map<String, Value>) -> impl Iterator<Item = (&String, Homes)> {
+    let none = serde_json::Map::new();
+    saved
+        .iter()
+        .filter(|(_, corners)| corners.is_object())
+        .filter_map(move |(name, corners)| parse_arrangement(corners, &none).ok().map(|h| (name, h)))
+}
+
+/// An arrangement: one of [`ARRANGEMENTS`] or of the `saved` ones by name, or a corner for each
+/// surround (`{"locator": "top-left", "northArrow": "top-right", "legend": "bottom-left",
+/// "scaleBar": "bottom-right"}`, every corner once). `Value::Null` (none given) is `classic`.
+pub fn parse_arrangement(v: &Value, saved: &serde_json::Map<String, Value>) -> Result<Homes, String> {
+    let names = || {
+        let saved = saved_arrangements(saved).map(|(n, _)| n.as_str());
+        ARRANGEMENTS.iter().map(|(n, _)| *n).chain(saved).map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")
+    };
     match v {
         Value::Null => Ok(ARRANGEMENTS[0].1),
-        Value::String(name) => ARRANGEMENTS
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name.trim()))
-            .map(|(_, h)| *h)
+        Value::String(name) => arrangement_named(name, saved)
+            .map(|(_, h)| h)
             .ok_or_else(|| format!("arrangement is {}, or a corner for each surround, not \"{name}\"", names())),
         Value::Object(o) => {
             if let Some(k) = o.keys().find(|k| !ARRANGEMENT_KEYS.contains(&k.as_str())) {
@@ -894,19 +920,156 @@ fn arrangement_name(homes: Homes) -> &'static str {
     ARRANGEMENTS.iter().find(|(_, h)| *h == homes).map_or("custom", |(n, _)| n)
 }
 
-/// Sets or shows the favourite arrangement of publication layouts (#1379): the one
-/// `"arrangement": "favourite"` asks for, and the first `"best"` tries (it wins a tie). Kept with
-/// the app's preferences, not the project.
-fn arrangement(s: &mut Session, p: &Value) -> CmdResult {
-    if let Some(v) = p.get("favourite").filter(|v| !v.is_null()) {
-        parse_arrangement(v)?;
-        s.layout_favourite = v.clone();
+/// A built-in or saved arrangement by `name` (case aside): its name as it is kept, and its corners.
+fn arrangement_named(name: &str, saved: &serde_json::Map<String, Value>) -> Option<(String, Homes)> {
+    let name = name.trim();
+    let built_in = ARRANGEMENTS.iter().find(|(n, _)| same_name(n, name)).map(|(n, h)| ((*n).to_string(), *h));
+    built_in.or_else(|| saved_arrangements(saved).find(|(n, _)| same_name(n, name)).map(|(n, h)| (n.clone(), h)))
+}
+
+/// What an arrangement given as `v` is called in the answer: its name; given corner by corner,
+/// the name of the built-in or saved one with those corners, else `"custom"`.
+fn arrangement_label(v: &Value, homes: Homes, saved: &serde_json::Map<String, Value>) -> String {
+    let by_corners = || {
+        ARRANGEMENTS
+            .iter()
+            .find(|(_, h)| *h == homes)
+            .map(|(n, _)| (*n).to_string())
+            .or_else(|| saved_arrangements(saved).find(|(_, h)| *h == homes).map(|(n, _)| n.clone()))
+            .unwrap_or_else(|| "custom".into())
+    };
+    match v {
+        Value::String(name) => arrangement_named(name, saved).map_or_else(by_corners, |(n, _)| n),
+        _ => by_corners(),
     }
-    let homes = parse_arrangement(&s.layout_favourite)?;
-    let corners: serde_json::Map<String, Value> =
-        ARRANGEMENT_KEYS.iter().zip(homes).map(|(k, h)| ((*k).to_string(), json!(CORNER_NAMES[h]))).collect();
+}
+
+/// The corners of an arrangement, by surround.
+fn corners_of(homes: Homes) -> Value {
+    Value::Object(ARRANGEMENT_KEYS.iter().zip(homes).map(|(k, h)| ((*k).to_string(), json!(CORNER_NAMES[h]))).collect())
+}
+
+/// Refuses a name an arrangement can't be saved under: blank, longer than
+/// [`MAX_ARRANGEMENT_NAME`], with control characters, or one `"arrangement"` already reads.
+fn check_arrangement_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() || name.trim() != name || name.chars().count() > MAX_ARRANGEMENT_NAME || name.chars().any(char::is_control) {
+        return Err(format!("an arrangement's name is 1 to {MAX_ARRANGEMENT_NAME} characters, without control characters"));
+    }
+    if ARRANGEMENTS.iter().map(|(n, _)| *n).chain(RESERVED_ARRANGEMENT_NAMES).any(|n| same_name(n, name)) {
+        return Err(format!("\"{name}\" names an arrangement already: choose another name"));
+    }
+    Ok(())
+}
+
+/// Whether this version would use a saved arrangement `name` with `corners`: a name
+/// `layout.arrangement` saves, and a corner for each surround.
+pub fn usable_saved_arrangement(name: &str, corners: &Value) -> bool {
+    check_arrangement_name(name).is_ok() && corners.is_object() && parse_arrangement(corners, &serde_json::Map::new()).is_ok()
+}
+
+/// The arrangements saved by name as the preferences keep them (a JSON object of names and
+/// corners), and the entries passed over, as they were: not an arrangement this version reads, a
+/// name `layout.arrangement` wouldn't save, a name twice (case aside), or past
+/// [`MAX_SAVED_ARRANGEMENTS`]. `None` for text that isn't such an object.
+pub fn read_saved_arrangements(text: &str) -> Option<(serde_json::Map<String, Value>, serde_json::Map<String, Value>)> {
+    let Ok(Value::Object(entries)) = serde_json::from_str::<Value>(text) else { return None };
+    let (mut kept, mut passed) = (serde_json::Map::new(), serde_json::Map::new());
+    for (name, corners) in entries {
+        let usable =
+            usable_saved_arrangement(&name, &corners) && !kept.keys().any(|k| same_name(k, &name)) && kept.len() < MAX_SAVED_ARRANGEMENTS;
+        if usable {
+            kept.insert(name, corners);
+        } else {
+            passed.insert(name, corners);
+        }
+    }
+    Some((kept, passed))
+}
+
+/// The arrangements `layout.publication` tries for `"arrangement": asked` (#1379), each by the name
+/// its answer gives it: for `"best"` (or none) the favourite first, so it wins a tie, then the
+/// built-in ones and those saved by name, one of each set of corners.
+pub(crate) fn arrangements_to_try(s: &Session, asked: &Value) -> Result<Vec<(String, Homes)>, String> {
+    let saved = &s.layout_arrangements;
+    let favourite = parse_arrangement(&s.layout_favourite, saved).unwrap_or(ARRANGEMENTS[0].1);
+    let favourite = (arrangement_label(&s.layout_favourite, favourite, saved), favourite);
+    Ok(match asked {
+        Value::String(a) if a.trim().eq_ignore_ascii_case("favourite") => vec![favourite],
+        Value::Null => arrangements_to_try(s, &json!("best"))?,
+        Value::String(a) if a.trim().eq_ignore_ascii_case("best") => {
+            let built_in = ARRANGEMENTS.iter().map(|(n, h)| ((*n).to_string(), *h));
+            let mut all = vec![favourite];
+            for (name, homes) in built_in.chain(saved_arrangements(saved).map(|(n, h)| (n.clone(), h))) {
+                if !all.iter().any(|(_, h)| *h == homes) {
+                    all.push((name, homes));
+                }
+            }
+            all
+        }
+        v => {
+            let homes = parse_arrangement(v, saved)?;
+            vec![(arrangement_label(v, homes, saved), homes)]
+        }
+    })
+}
+
+/// Sets or shows the favourite arrangement of publication layouts (#1379): the one
+/// `"arrangement": "favourite"` asks for, and the first `"best"` tries (it wins a tie). Saves
+/// arrangements by name, which `"arrangement"` then takes as it takes the built-in ones and
+/// `"best"` tries too, and removes them. All kept with the app's preferences, not the project.
+/// A removal, then a save, then the favourite; checked before anything changes.
+fn arrangement(s: &mut Session, p: &Value) -> CmdResult {
+    let text = |key: &str, what: &str| match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(v)) => Ok(Some(v.trim().to_string())),
+        Some(_) => Err(format!("{key} is {what}")),
+    };
+    let (remove, save) = (text("remove", "the name of a saved arrangement")?, text("save", "a name for \"arrangement\"")?);
+    // An arrangement given with nothing to save it under would do nothing.
+    if save.is_none() && p.get("arrangement").is_some_and(|v| !v.is_null()) {
+        return Err("\"arrangement\" is saved under a name given as \"save\"; the favourite is set with \"favourite\"".into());
+    }
+    let mut saved = s.layout_arrangements.clone();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut favourite = s.layout_favourite.clone();
+    if let Some(name) = remove {
+        let key = saved.keys().find(|k| same_name(k, &name)).cloned().ok_or_else(|| format!("no arrangement is saved as \"{name}\""))?;
+        let corners = saved.remove(&key).unwrap_or(Value::Null);
+        // A favourite named after it keeps its corners, unless this call gives another.
+        let replaced = p.get("favourite").is_some_and(|v| !v.is_null());
+        if !replaced && favourite.as_str().is_some_and(|f| same_name(f.trim(), &key)) {
+            favourite = corners;
+            warnings.push(format!("the favourite was the arrangement \"{key}\": it keeps its corners"));
+        }
+    }
+    if let Some(name) = save {
+        let homes = match p.get("arrangement") {
+            None | Some(Value::Null) => return Err("save takes \"arrangement\": a name, or a corner for each surround".into()),
+            Some(v) => parse_arrangement(v, &saved)?,
+        };
+        check_arrangement_name(&name)?;
+        match saved.keys().find(|k| same_name(k, &name)).cloned() {
+            Some(old) => {
+                saved.remove(&old);
+                warnings.push(format!("the arrangement saved as \"{old}\" is replaced"));
+            }
+            None if saved.len() >= MAX_SAVED_ARRANGEMENTS => {
+                return Err(format!("at most {MAX_SAVED_ARRANGEMENTS} arrangements are saved: remove one first"));
+            }
+            None => {}
+        }
+        saved.insert(name, corners_of(homes));
+    }
+    if let Some(v) = p.get("favourite").filter(|v| !v.is_null()) {
+        parse_arrangement(v, &saved)?;
+        favourite = v.clone();
+    }
+    let homes = parse_arrangement(&favourite, &saved)?;
+    (s.layout_arrangements, s.layout_favourite) = (saved, favourite);
+    let names: Vec<&str> =
+        ARRANGEMENTS.iter().map(|(n, _)| *n).chain(saved_arrangements(&s.layout_arrangements).map(|(n, _)| n.as_str())).collect();
     Ok(
-        json!({"favourite": s.layout_favourite, "corners": corners, "arrangements": ARRANGEMENTS.iter().map(|(n, _)| *n).collect::<Vec<_>>()}),
+        json!({"favourite": s.layout_favourite, "corners": corners_of(homes), "arrangements": names, "saved": s.layout_arrangements, "warnings": warnings}),
     )
 }
 
@@ -1035,20 +1198,17 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         }
     };
     let accent = color(p, "accent", style.accent())?;
-    // The arrangements to try (#1379): the favourite first, so it wins a tie.
-    let favourite = parse_arrangement(&s.layout_favourite).unwrap_or(ARRANGEMENTS[0].1);
-    let tries: Vec<Homes> = match p.get("arrangement").filter(|v| !v.is_null()) {
-        None => std::iter::once(favourite).chain(ARRANGEMENTS.iter().map(|(_, h)| *h).filter(|h| *h != favourite)).collect(),
-        Some(Value::String(a)) if a.trim().eq_ignore_ascii_case("best") => {
-            std::iter::once(favourite).chain(ARRANGEMENTS.iter().map(|(_, h)| *h).filter(|h| *h != favourite)).collect()
-        }
-        Some(Value::String(a)) if a.trim().eq_ignore_ascii_case("favourite") => vec![favourite],
-        Some(v) => vec![parse_arrangement(v)?],
-    };
+    let tries = arrangements_to_try(s, p.get("arrangement").unwrap_or(&Value::Null))?;
     // A translucent accent would leave a band, a poster's page or the headings faint or unseen.
     if accent.a() != 255 {
         return Err("accent is an opaque colour as #RRGGBB".into());
     }
+    // Where the coverage grid the placement searches is written as an image (#1379).
+    let coverage_path = match p.get("coverage") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(path)) if path.trim().to_ascii_lowercase().ends_with(".png") => Some(path.trim().to_string()),
+        Some(_) => return Err("coverage is the path of a .png file to write the coverage grid to".into()),
+    };
     // No orientation asked: the one the area's map comes out larger on, from its extents east to
     // west and north to south on the map's projection and the room the style leaves the map.
     let profile = match &auto {
@@ -1105,6 +1265,21 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     // A sheet's sizes follow its short side (A4's 210 mm is 1); a figure keeps its texts at their
     // printed size, whatever its width.
     let k = if sheet { page_w.min(page_h) / 210.0 } else { 1.0 };
+    // The sources and the reference that have something in them, each its heading in `head_pt` and
+    // lines in `body_pt`, `tw` wide. Each one's elements keep their names (`Sources`, `Reference`)
+    // whatever its heading reads, the heading filled and wrapped like the rest.
+    let sections = |tw: f64, head_pt: f64, body_pt: f64| -> Vec<(&'static str, Vec<String>, Vec<String>)> {
+        [("Sources", heading(0, "Sources"), &sources), ("Reference", heading(1, "Cartographic reference"), &reference)]
+            .into_iter()
+            .filter(|(.., texts)| !texts.is_empty())
+            .map(|(name, head, texts)| {
+                // Filled first, so `{projection}` reads in capitals too; the live tokens left keep
+                // their case (wrap_as fills again, which then finds nothing).
+                let head = wrap_as(&capitals(&fill(&head)), tw, head_pt, true);
+                (name, head, texts.iter().flat_map(|t| wrap(t, tw, body_pt)).collect::<Vec<_>>())
+            })
+            .collect()
+    };
     // A panel's or an editorial page's map is as wide as its column: where the area is less tall
     // than the frame the sheet leaves it, the sheet is laid out again with the frame the area's
     // height (and a little room), and the whole put in the middle of the page, rather than the map
@@ -1131,21 +1306,6 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                 if !style.cards() {
                     page_wide.push(("Frame".into(), (m, m, page_w - 2.0 * m, page_full - 2.0 * m), pub_box(clear, ink, 0.8), true));
                 }
-                // The sources and the reference that have something in them, each its heading and lines
-                // `tw` wide. Each one's elements keep their names (`Sources`, `Reference`) whatever its
-                // heading reads, the heading filled and wrapped like the rest.
-                let sections = |tw: f64| -> Vec<(&'static str, Vec<String>, Vec<String>)> {
-                    [("Sources", heading(0, "Sources"), &sources), ("Reference", heading(1, "Cartographic reference"), &reference)]
-                        .into_iter()
-                        .filter(|(.., texts)| !texts.is_empty())
-                        .map(|(name, head, texts)| {
-                            // Filled first, so `{projection}` reads in capitals too; the live tokens left
-                            // keep their case (wrap_as fills again, which then finds nothing).
-                            let head = wrap_as(&capitals(&fill(&head)), tw, head_pt, true);
-                            (name, head, texts.iter().flat_map(|t| wrap(t, tw, body_pt)).collect::<Vec<_>>())
-                        })
-                        .collect()
-                };
                 // The footer, from the bottom up across the sheet: authorship, the note (unless the style
                 // sets it beside the map), then the sources and reference boxed side by side (unless it
                 // stacks them in its panel), as tall as the longer column. Its top.
@@ -1181,7 +1341,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                     let n = [!sources.is_empty(), !reference.is_empty()].iter().filter(|x| **x).count().max(1) as f64;
                     let cw = (iw - gap * (n - 1.0)) / n;
                     let tw = cw - 2.0 * inner;
-                    let columns = sections(tw);
+                    let columns = sections(tw, head_pt, body_pt);
                     let heads = columns.iter().map(|(_, h, _)| h.len()).max().unwrap_or(1);
                     let rows = columns.iter().map(|(.., l)| l.len()).max().unwrap_or(0);
                     if rows > 0 {
@@ -1305,6 +1465,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                                         width: 0.75,
                                         dir: LineDir::Vertical,
                                         head: LineHead::None,
+                                        dash: None,
                                     },
                                 ));
                             }
@@ -1432,13 +1593,13 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                             around.push((
                                 "Panel Rule".into(),
                                 (ix, y + 1.5 * k, tw, 1.0),
-                                ElementKind::Line { color: accent, width: 1.0, dir: LineDir::Horizontal, head: LineHead::None },
+                                ElementKind::Line { color: accent, width: 1.0, dir: LineDir::Horizontal, head: LineHead::None, dash: None },
                             ));
                             y += 4.0 * k;
                         }
                         // The sources and the reference, stacked up from the panel's foot.
                         let mut yb = panel_bottom - ip;
-                        for (name, head, lines) in sections(tw).into_iter().rev().filter(|_| !under) {
+                        for (name, head, lines) in sections(tw, head_pt, body_pt).into_iter().rev().filter(|_| !under) {
                             let (hh, bh) = (head.len() as f64 * pitch(head_pt), lines.len() as f64 * pitch(body_pt));
                             yb -= hh + bh;
                             around.push((
@@ -1510,7 +1671,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                         around.push((
                             "Column Rule".into(),
                             (cx, cy, cw, 1.0),
-                            ElementKind::Line { color: accent, width: 1.5, dir: LineDir::Horizontal, head: LineHead::None },
+                            ElementKind::Line { color: accent, width: 1.5, dir: LineDir::Horizontal, head: LineHead::None, dash: None },
                         ));
                         cy += 3.0 * k;
                         if let Some(hd) = headings.get(2).filter(|h| !h.trim().is_empty()) {
@@ -1812,7 +1973,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             (fw * 0.3, fh * 0.25)
         }
     };
-    let listed = s.map().layers.iter().any(|l| s.map().shows(l) && !l.graphics && !l.is_raster());
+    let listed = s.map().layers.iter().any(|l| s.map().shows(l) && crate::render::layout::legend_lists(l));
     if reading && listed {
         (cw, ch) = (cw.max(fw * 0.3), ch.max(fh * 0.25));
         sizes = None;
@@ -1823,7 +1984,24 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         sizes = None;
         warnings.push("a WMS or WMTS layer's legend picture is still loading: the legend has a fixed size to fit by hand".into());
     }
-    let (sw, sh, nh) = ((fw * 0.3).max(25.0), if sheet { 8.0 * k } else { 6.0 }, pitch(small_pt) + 0.5);
+    let (sh, nh) = (if sheet { 8.0 * k } else { 6.0 }, pitch(small_pt) + 0.5);
+    // The scale bar's box at a scale: the size of its bar and labels and of the scale under them,
+    // with the padding (#1379). The bar is the one a box 30 % of the frame's width (25 mm at least)
+    // would draw, which sets its length and divisions. The box is the narrowest that draws that same
+    // bar: the renderer gives a bar at most 85 % of its box, so the box is at least the bar's length
+    // over 0.85.
+    let bar_kind = match ElementKind::scale_bar(frame) {
+        ElementKind::ScaleBar { units, divisions, .. } => Some((units, divisions)),
+        _ => None,
+    };
+    let scale_box = |ground_per_pt: f64, scale: f64| {
+        let text = ("{scale}", small_pt, false);
+        let w = bar_kind.map_or((fw * 0.3).max(25.0), |bar| scale_box_width(ground_per_pt, scale, fw, bar, comma, text));
+        (w, sh + nh)
+    };
+    let ground_per_pt = |s: &Session, center: Coord, scale: f64| {
+        s.map().ground_res_at(&rustgis_map::layout::frame_camera(s.map(), center, scale, 0.0, 0.0))
+    };
     let pad = 2.0;
     // The surrounds to place: what each is and its size (the arrangement gives its corner).
     let mut surrounds: Vec<(Surround, f64, f64)> = Vec::new();
@@ -1831,12 +2009,26 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         surrounds.push((Surround::Locator, side, side));
     }
     surrounds.push((Surround::Arrow, aw, ah));
-    // The topmost visible raster drawn on a ramp gets a colorbar, under the legend in its box (a
-    // map whose theme is a raster has its key there, which the legend's rows don't give).
-    // `"colorbar": "none"` leaves it out, and its room in the box with it (#1680).
-    let bar = rustgis_map::layout::colorbar_layer(s.map(), None)
-        .filter(|l| colorbar && l.raster.as_ref().and_then(rustgis_map::layout::color_scale).is_some())
-        .map(|l| l.name.clone());
+    // The topmost visible raster with a colour scale that the legend doesn't list by its classes
+    // gets a colorbar, under the legend in its box (a map whose theme is a raster on a ramp has its
+    // key there, which the legend's rows don't give): an RGB composite over a DEM leaves it to the
+    // DEM. A raster drawn by classes has them in the legend's rows instead (#1679). `"colorbar":
+    // "none"` leaves it out, and its room in the box with it (#1680).
+    // One on top whose pixels aren't read yet has no scale to show: no colorbar, rather than the
+    // scale of a raster under it under its name.
+    let top_raster = colorbar.then(|| rustgis_map::layout::colorbar_layer(s.map(), None)).flatten();
+    let scaled = |l: &&rustgis_map::Layer| l.raster.as_ref().is_some_and(|r| rustgis_map::layout::color_scale(r).is_some());
+    let bar = top_raster.filter(scaled).map(|l| l.name.clone());
+    if let Some(l) = top_raster.filter(|l| !scaled(l)) {
+        let why = if l.raster.as_ref().is_some_and(|r| r.error.is_some()) { "couldn't be read" } else { "is still reading" };
+        warnings.push(format!(
+            "{} {why}, so its colour scale isn't known and the layout has no colorbar for it; add one with layout.addElement once it has read",
+            l.name
+        ));
+    }
+    // A colour table whose values can't be known (too many to list) gives the legend no class, and
+    // the sheet no key for it; classes from an overview may miss a rare one: said, not left out.
+    warnings.extend(raster_key_notices(s.map(), &[], false));
     let (bar_w, bar_h) = (if sheet { 50.0 * k } else { 40.0 }, COLORBAR_MM);
     let bar_part = if bar.is_some() { bar_h + if ch > 0.0 { 2.0 } else { 0.0 } } else { 0.0 };
     let (content_w, content_h) = (if bar.is_some() { cw.max(bar_w) } else { cw }, ch + bar_part);
@@ -1844,7 +2036,8 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     if content_h > 0.0 && !legend_in_column {
         surrounds.push((Surround::Legend, (content_w + 2.0 * pad).min(fw * 0.45), (content_h + 2.0 * pad).min(fh * 0.6)));
     }
-    surrounds.push((Surround::Scale, sw, sh + nh));
+    // Its width is set once the frame's centre and scale are settled, below; nothing reads it before.
+    surrounds.push((Surround::Scale, 0.0, sh + nh));
     // A corner's rectangle for a surround `w` × `h`.
     let at = |corner: usize, w: f64, h: f64| {
         let x = if corner.is_multiple_of(2) { fx + left } else { fx + fw - right - w };
@@ -1897,12 +2090,11 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         bands
     };
     let size_of = |kind: Surround| surrounds.iter().find(|x| x.0 == kind).map(|x| (x.1, x.2));
-    let (locator_side, arrow_size, scale_size) =
-        (size_of(Surround::Locator).map(|x| x.0), size_of(Surround::Arrow), size_of(Surround::Scale));
+    let (locator_side, arrow_size) = (size_of(Surround::Locator).map(|x| x.0), size_of(Surround::Arrow));
     // The fewest columns from `from` up in which the surrounds group in a band around `clip`, with
-    // their places.
-    let grouped = |clip: Rect, from: usize, known: &[(f64, f64); MAX_LEGEND_COLUMNS]| {
-        let (arrow, scale_bar) = (arrow_size?, scale_size?);
+    // their places; the scale bar's box `scale_bar` is the one at the scale tried.
+    let grouped = |clip: Rect, from: usize, known: &[(f64, f64); MAX_LEGEND_COLUMNS], scale_bar: (f64, f64)| {
+        let arrow = arrow_size?;
         (from..known.len()).find_map(|i| {
             bands_around(clip)
                 .iter()
@@ -2059,8 +2251,10 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                     }
                     let room = free_room(&moved);
                     let Some(n) = need(room) else { continue };
-                    // Under a veil the whole group has to fit, not the legend alone.
-                    let Some(n) = (if veil { grouped(clip, n, here).map(|(i, _)| i) } else { Some(n) }) else { continue };
+                    // Under a veil the whole group has to fit, not the legend alone, the scale bar's box
+                    // as drawn there.
+                    let in_group = |s: &Session| grouped(clip, n, here, scale_box(ground_per_pt(s, there, tried), tried));
+                    let Some(n) = (if veil { in_group(s).map(|(i, _)| i) } else { Some(n) }) else { continue };
                     if found.is_none_or(|(fewest, most)| n < fewest || (n == fewest && room.0 * room.1 > most)) {
                         found = Some((n, room.0 * room.1));
                         (center, scale, coverage, map_shift) = (there, tried, Some(moved), (dx, dy));
@@ -2098,6 +2292,11 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
         }
+    }
+    // The scale bar's box as the frame is drawn, moved or at another scale or not.
+    let bar_box = scale_box(ground_per_pt(s, center, scale), scale);
+    if let Some(entry) = surrounds.iter_mut().find(|x| x.0 == Surround::Scale) {
+        (entry.1, entry.2) = bar_box;
     }
     // Its cells summed from the top left (a summed-area table), so a rectangle's count is four
     // lookups, however large: the search off the corners tries thousands.
@@ -2198,7 +2397,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     // corners, so it is what goes where that differs. A single arrangement asked for is the one
     // laid out.
     let arranged = |legend: (f64, f64)| -> (Homes, Laid) {
-        let mut laid: Vec<(Homes, Laid)> = tries.iter().map(|h| (*h, lay_out(*h, legend))).collect();
+        let mut laid: Vec<(Homes, Laid)> = tries.iter().map(|(_, h)| (*h, lay_out(*h, legend))).collect();
         let chosen = pick_arrangement(&laid.iter().map(|(_, l)| l.3).collect::<Vec<_>>()).map(|i| laid.swap_remove(i));
         chosen.unwrap_or_else(|| (ARRANGEMENTS[0].1, lay_out(ARRANGEMENTS[0].1, legend)))
     };
@@ -2243,9 +2442,11 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     // fewest columns that do, rather than each in a corner of its own. The search found that group
     // with these very sizes, so it is found again; the legend goes there too when the corners left
     // it no room.
-    let mut arrangement_used = arrangement_name(homes);
+    let mut arrangement_used =
+        tries.iter().find(|(_, h)| *h == homes).map_or_else(|| arrangement_name(homes).to_string(), |(n, _)| n.clone());
     if let (Some(clip), Some(known)) = (veiled, sizes)
-        && let Some((i, (legend_place, locator_place, arrow_place, scale_place))) = grouped(clip, 0, &known)
+        && let Some((i, (legend_place, locator_place, arrow_place, scale_place))) =
+            grouped(clip, 0, &known, scale_box(ground_per_pt(s, center, scale), scale))
     {
         legend_cols = i + 1;
         (cw, ch) = known[i];
@@ -2270,7 +2471,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             })
             .map(|(kind, _)| named(*kind))
             .collect();
-        arrangement_used = "veil";
+        arrangement_used = "veil".into();
     }
     if let Some(ElementKind::MapFrame { center: at, scale: drawn_at, .. }) = l.element_mut(frame).map(|e| &mut e.kind) {
         (*at, *drawn_at) = (center, scale);
@@ -2413,9 +2614,9 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Some((sx, sy, w, h)) = spot_of(Surround::Scale) {
         placed.push(("scale bar", (sx, sy, w, h)));
-        l.add("Scale Box", (sx, sy, sw, sh + nh), surround_box(paper));
-        l.add("Scale Bar", (sx, sy, sw, sh), ElementKind::scale_bar(frame));
-        l.add("Scale", (sx, sy + sh, sw, nh), pub_text("{scale}".into(), small_pt, ink, false, TextAlign::Center));
+        l.add("Scale Box", (sx, sy, w, sh + nh), surround_box(paper));
+        l.add("Scale Bar", (sx, sy, w, sh), ElementKind::scale_bar(frame));
+        l.add("Scale", (sx, sy + sh, w, nh), pub_text("{scale}".into(), small_pt, ink, false, TextAlign::Center));
     }
     // What placing couldn't avoid: a surround over the map's drawing while a clearly freer corner
     // went to another (more surrounds than free corners), or two overlapping (a frame too small
@@ -2445,24 +2646,88 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             }
         }
     }
+    if let (None, Some(legend)) = (column, spot_of(Surround::Legend)) {
+        align_footer(&mut around, legend, (fx, fw), &sections);
+    }
     for (n, r, kind, _) in over {
         l.add(&n, r, kind);
     }
     for (n, r, kind) in around {
         l.add(&n, r, kind);
     }
-    // Every element by name and id, for `layout.update`.
-    let elements: Vec<Value> = l.elements.iter().map(|e| json!({"element": e.id, "name": e.name, "kind": e.kind.code()})).collect();
     if s.project.layouts.len() >= crate::project::MAX_LAYOUTS {
         return Err(format!("a project holds at most {} layouts; remove one first", crate::project::MAX_LAYOUTS));
     }
+    // The coverage grid as the placement searched it, with what was placed on it, for a look at
+    // why a surround moved (#1379). The layout is made by then (nothing below refuses it): a file
+    // that can't be written is said, and the layout kept.
+    let mut coverage_written = Value::Null;
+    if let Some(path) = &coverage_path {
+        let rects: Vec<Rect> = placed.iter().map(|(_, r)| *r).collect();
+        let png = coverage
+            .as_ref()
+            .ok_or_else(|| "the map couldn't be drawn for it".to_string())
+            .and_then(|grid| coverage_png(grid, (fx, fy, fw, fh), area, &rects));
+        match png.and_then(|bytes| rustgis_data::io::write_atomic(Path::new(path), &bytes).map_err(|e| format!("{path}: {e}"))) {
+            Ok(()) => coverage_written = json!(path),
+            Err(why) => warnings.push(format!("the coverage image isn't written: {why}")),
+        }
+    }
+    // Every element by name and id, for `layout.update`.
+    let elements: Vec<Value> = l.elements.iter().map(|e| json!({"element": e.id, "name": e.name, "kind": e.kind.code()})).collect();
     s.project.layouts.push(l);
     let i = s.project.layouts.len() - 1;
     s.active_layout = Some(i);
     let locator = locator_map.map(|(map, ..)| map);
     Ok(
-        json!({"layout": i, "name": name, "profile": profile.id, "page": [w, h], "scale": scale, "grid": step, "locator": locator, "style": style.code(), "arrangement": arrangement_used, "legendColumns": legend_cols, "mapShift": [map_shift.0, map_shift.1], "veiled": veiled.is_some(), "elements": elements, "moved": moved, "warnings": warnings}),
+        json!({"layout": i, "name": name, "profile": profile.id, "page": [w, h], "scale": scale, "grid": step, "locator": locator, "style": style.code(), "arrangement": arrangement_used, "legendColumns": legend_cols, "mapShift": [map_shift.0, map_shift.1], "veiled": veiled.is_some(), "elements": elements, "moved": moved, "coverage": coverage_written, "warnings": warnings}),
     )
+}
+
+/// The coverage grid of a publication's frame (`frame`, page mm) as a PNG, three pixels a cell
+/// (#1379): a cell the map draws dark, a free one white, both tinted blue outside `area` (the
+/// strips the grid's labels keep, which the search leaves out), and each surround placed over the
+/// map (`placed`, page mm) outlined in red.
+fn coverage_png(
+    (gw, gh, cells): &(u32, u32, Vec<bool>),
+    frame: Rect,
+    area: (f64, f64, f64, f64),
+    placed: &[Rect],
+) -> Result<Vec<u8>, String> {
+    const CELL_PX: u32 = 3;
+    let (fx, fy, fw, fh) = frame;
+    let mut pm = tiny_skia::Pixmap::new(gw * CELL_PX, gh * CELL_PX).ok_or("the coverage grid is empty")?;
+    let paint = |r: u8, g: u8, b: u8| {
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color_rgba8(r, g, b, 255);
+        paint
+    };
+    let (dark, free, dark_band, free_band) =
+        (paint(0x33, 0x33, 0x33), paint(0xFF, 0xFF, 0xFF), paint(0x2E, 0x4A, 0x7A), paint(0xC9, 0xDD, 0xF2));
+    for (i, drawn) in cells.iter().enumerate() {
+        let (col, row) = ((i % *gw as usize) as f64, (i / *gw as usize) as f64);
+        let (x, y) = (fx + (col + 0.5) / f64::from(*gw) * fw, fy + (row + 0.5) / f64::from(*gh) * fh);
+        let band = x < area.0 || x > area.2 || y < area.1 || y > area.3;
+        let colour = match (*drawn, band) {
+            (true, false) => &dark,
+            (false, false) => &free,
+            (true, true) => &dark_band,
+            (false, true) => &free_band,
+        };
+        let px = CELL_PX as f32;
+        if let Some(cell) = tiny_skia::Rect::from_xywh(col as f32 * px, row as f32 * px, px, px) {
+            pm.fill_rect(cell, colour, tiny_skia::Transform::identity(), None);
+        }
+    }
+    let (sx, sy) = (f64::from(pm.width()) / fw, f64::from(pm.height()) / fh);
+    let line = tiny_skia::Stroke { width: 2.0, ..tiny_skia::Stroke::default() };
+    for (x, y, w, h) in placed {
+        let r = tiny_skia::Rect::from_xywh(((x - fx) * sx) as f32, ((y - fy) * sy) as f32, (w * sx) as f32, (h * sy) as f32);
+        if let Some(r) = r {
+            pm.stroke_path(&tiny_skia::PathBuilder::from_rect(r), &paint(0xD6, 0x27, 0x28), &line, tiny_skia::Transform::identity(), None);
+        }
+    }
+    pm.encode_png().map_err(|e| e.to_string())
 }
 
 fn page(s: &mut Session, p: &Value) -> CmdResult {
@@ -2477,6 +2742,65 @@ fn page(s: &mut Session, p: &Value) -> CmdResult {
         l.decimal_comma = comma;
     }
     Ok(json!({"width": w, "height": h, "decimal": if l.decimal_comma { "," } else { "." }}))
+}
+
+/// A sheet's footer of two columns, its right one moved to start where a legend at the right of the
+/// frame (`frame` its left edge and width, page mm) does, when that is between 45 % and 70 % of the
+/// frame's width, so the two line up (#1379). Each column's heading and lines are wrapped again to
+/// its new width (`sections`, as the footer wraps them); when they'd need a taller box, the
+/// footer stays as it is.
+pub(crate) fn align_footer(
+    around: &mut [(String, Rect, ElementKind)],
+    legend: Rect,
+    (fx, fw): (f64, f64),
+    sections: &dyn Fn(f64, f64, f64) -> Vec<(&'static str, Vec<String>, Vec<String>)>,
+) {
+    let at = (legend.0 - fx) / fw;
+    if !(0.45..=0.70).contains(&at) || legend.0 + legend.2 < fx + 0.9 * fw {
+        return;
+    }
+    let find = |name: &str| around.iter().position(|(n, ..)| n == name);
+    let size = |i: Option<usize>| match i.and_then(|i| around.get(i)).map(|e| &e.2) {
+        Some(ElementKind::Text { size, .. }) => Some(*size),
+        _ => None,
+    };
+    let (Some(a), Some(b), Some(head_at)) = (find("Sources Box"), find("Reference Box"), find("Sources Heading")) else { return };
+    let (Some(head_pt), Some(body_pt)) = (size(Some(head_at)), size(find("Sources")).or_else(|| size(find("Reference")))) else { return };
+    let (Some(left), Some(right), Some(head)) = (around.get(a), around.get(b), around.get(head_at)) else { return };
+    let (left, right, inner) = (left.1, right.1, head.1.0 - left.1.0);
+    let gap = right.0 - (left.0 + left.2);
+    let (lw, rw) = (legend.0 - gap - left.0, right.0 + right.2 - legend.0);
+    // Side by side, and the move a real one.
+    if (left.1 - right.1).abs() > 1e-6 || lw <= 2.0 * inner || rw <= 2.0 * inner || (legend.0 - right.0).abs() < 0.5 {
+        return;
+    }
+    let pitch = crate::render::layout::line_pitch_mm;
+    let column = |w: f64, name: &str| sections(w - 2.0 * inner, head_pt, body_pt).into_iter().find(|(n, ..)| *n == name);
+    let (Some((_, l_head, l_lines)), Some((_, r_head, r_lines))) = (column(lw, "Sources"), column(rw, "Reference")) else { return };
+    let head_h = l_head.len().max(r_head.len()) as f64 * pitch(head_pt);
+    let rows = l_lines.len().max(r_lines.len());
+    if 2.0 * inner + head_h + rows as f64 * pitch(body_pt) > left.3 + 1e-6 {
+        return;
+    }
+    for (name, x, w, head, lines) in [("Sources", left.0, lw, l_head, l_lines), ("Reference", legend.0, rw, r_head, r_lines)] {
+        let y = left.1;
+        for (part, r, text) in [
+            (format!("{name} Box"), (x, y, w, left.3), None),
+            (format!("{name} Heading"), (x + inner, y + inner, w - 2.0 * inner, head.len() as f64 * pitch(head_pt)), Some(head.join("\n"))),
+            (
+                name.to_string(),
+                (x + inner, y + inner + head_h, w - 2.0 * inner, lines.len() as f64 * pitch(body_pt)),
+                Some(lines.join("\n")),
+            ),
+        ] {
+            if let Some(e) = around.iter_mut().find(|(n, ..)| *n == part) {
+                e.1 = r;
+                if let (Some(new), ElementKind::Text { text, .. }) = (text, &mut e.2) {
+                    *text = new;
+                }
+            }
+        }
+    }
 }
 
 /// Sets a layout's ruler guides: the lists given replace those there.
@@ -2669,6 +2993,63 @@ fn legend_fit_warnings(columns: usize, (w, h): (f64, f64), (room_w, room_h): (f6
     said
 }
 
+/// What a legend of `map` can't key, or keys only in part, for the rasters it shows by classes
+/// (#1679), those `exclude` leaves out aside: one warning a kind, with how many and their names.
+/// A colour table over more values than a legend can list (over 256, or not whole numbers) gives
+/// no class and no key; classes taken from an overview's statistics (a COG read in place), or from
+/// a sample of a large raster under a mask, can miss a rare one the map draws, unless
+/// `all_classes` lists every class of the renderer.
+fn raster_key_notices(map: &Map, exclude: &[String], all_classes: bool) -> Vec<String> {
+    let shown: Vec<(&str, &rustgis_map::RasterLayer)> = map
+        .layers
+        .iter()
+        .filter(|l| map.shows(l) && !exclude.iter().any(|n| n.eq_ignore_ascii_case(&l.name)))
+        .filter_map(|l| Some((l.name.as_str(), l.raster.as_ref()?)))
+        .collect();
+    let names = |kind: &dyn Fn(&rustgis_map::RasterLayer) -> bool| -> Vec<&str> {
+        shown.iter().filter(|(_, r)| kind(r)).map(|(n, _)| *n).collect()
+    };
+    let unlisted = names(&rustgis_map::RasterLayer::classes_unknown);
+    let reduced = names(&|r| r.classes_from_overview(all_classes));
+    let sampled = names(&|r| r.classes_from_sample(all_classes));
+    let mut said = Vec::new();
+    if !unlisted.is_empty() {
+        said.push(format!(
+            "{} raster(s) drawn by a colour table over more values than a legend can list (over 256, or not whole numbers) have no key in the legend: {}",
+            unlisted.len(),
+            unlisted.join(", ")
+        ));
+    }
+    if !reduced.is_empty() {
+        said.push(format!(
+            "{} raster(s) drawn by classes were read through an overview, so the legend lists the classes found there and may miss a rare one the map draws: {}",
+            reduced.len(),
+            reduced.join(", ")
+        ));
+    }
+    if !sampled.is_empty() {
+        said.push(format!(
+            "{} raster(s) drawn by classes under a mask have more cells than their masked statistics read, so the legend lists the classes of a sample and may miss a rare one the map draws: {}",
+            sampled.len(),
+            sampled.join(", ")
+        ));
+    }
+    said
+}
+
+/// Says, a kind once, what the legend `id` of the layout `li` can't key ([`raster_key_notices`]),
+/// as `layout.publication` does for its own: for a legend added, or told what it leaves out or
+/// whether it lists every class.
+fn say_raster_keys(s: &mut Session, li: usize, id: u32) {
+    let Some(l) = s.project.layouts.get(li) else { return };
+    let Some(ElementKind::Legend { frame, exclude, all_classes, .. }) = l.element(id).map(|e| &e.kind) else { return };
+    let Some(ElementKind::MapFrame { map, .. }) = l.element(*frame).map(|f| &f.kind) else { return };
+    let said = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)).map(|m| raster_key_notices(m, exclude, *all_classes));
+    for said in said.unwrap_or_default() {
+        s.warn(said);
+    }
+}
+
 /// Says what a legend loses in its box, as `layout.publication` does for its own, or that it can't
 /// tell.
 fn say_legend_fit(s: &mut Session, li: usize, id: u32) {
@@ -2731,6 +3112,13 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
     if kind != "rectangle" && p.get("radius").is_some_and(|v| !v.is_null()) {
         return Err(ONLY_RECTANGLE_RADIUS.into());
     }
+    // `null` too: on a line it means solid, so elsewhere it is refused rather than ignored.
+    if !matches!(kind, "line" | "arrow" | "rectangle" | "ellipse" | "circle") && p.get("dash").is_some() {
+        return Err(ONLY_DASH.into());
+    }
+    if !matches!(kind, "text" | "dynamicText") && gives(p, "rotation") {
+        return Err(ONLY_TEXT_ROTATION.into());
+    }
     if !matches!(
         kind,
         "text" | "dynamicText" | "rectangle" | "ellipse" | "circle" | "line" | "arrow" | "extentIndicator" | "grid" | "scaleBar"
@@ -2788,7 +3176,8 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
             };
             let k = ElementKind::Colorbar {
                 frame,
-                // Kept only when named: otherwise (none, or "") it follows the map's top visible raster.
+                // Kept only when named: otherwise (none, or "") it follows the map's top shown raster with a
+                // colour scale, not drawn by classes.
                 layer: ps(p, "layer").filter(|n| !n.trim().is_empty()).and(layer),
                 title,
                 orientation,
@@ -2805,6 +3194,7 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
             let size = f(p, "size").unwrap_or(12.0).clamp(*fonts.start(), *fonts.end());
             let (italic, align, letter_spacing) = text_style(p, false, TextAlign::Left, 0.0)?;
             let (font, font_name) = text_font(p, (FontFamily::Sans, None))?;
+            let rotation = text_rotation(p)?.unwrap_or(0.0);
             let k = ElementKind::Text {
                 text,
                 size,
@@ -2815,6 +3205,7 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
                 letter_spacing,
                 font,
                 font_name,
+                rotation,
             };
             (if kind == "text" { "Text" } else { "Dynamic Text" }, place(p, l, (15.0, 12.0, 120.0, (size * 0.5).max(8.0)))?, k)
         }
@@ -2851,6 +3242,7 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
                 outline: color(p, "outline", color(p, "color", Rgba::rgb(0x22, 0x22, 0x22))?)?,
                 width: shape_width(p, 1.0)?.clamp(0.0, 50.0),
                 radius: corner_radius(p, 0.0)?,
+                dash: element_dash(p)?.flatten(),
             };
             // Without a box it frames the page, as a neatline does; with any part of one it's a shape.
             if ["x", "y", "w", "h"].iter().any(|k| p.get(k).is_some_and(|v| !v.is_null())) {
@@ -2864,6 +3256,7 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
                 fill: color(p, "fill", Rgba::new(0, 0, 0, 0))?,
                 outline: color(p, "outline", color(p, "color", Rgba::rgb(0x22, 0x22, 0x22))?)?,
                 width: shape_width(p, 1.0)?.clamp(0.0, 50.0),
+                dash: element_dash(p)?.flatten(),
             };
             // A circle is an ellipse in a square box.
             let d = (pw.min(ph) * 0.25).max(5.0);
@@ -2876,6 +3269,7 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
             let head = line_head(p, if arrow { LineHead::End } else { LineHead::None })?;
             let color = color(p, "color", Rgba::rgb(0x22, 0x22, 0x22))?;
             let width = shape_width(p, if arrow { 1.5 } else { 1.0 })?.clamp(0.1, 50.0);
+            let dash = element_dash(p)?.flatten();
             let len = (pw.min(ph) * 0.4).max(10.0);
             let name = if head == LineHead::None { "Line" } else { "Arrow" };
             // At an angle, centred on the page unless x or y moves it; else the box is the
@@ -2908,7 +3302,7 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
                     (place(p, l, ((pw - w) / 2.0, (ph - h) / 2.0, w, h))?, dir, head)
                 }
             };
-            (name, rect, ElementKind::Line { color, width, dir, head })
+            (name, rect, ElementKind::Line { color, width, dir, head, dash })
         }
         "extentIndicator" => {
             let frame = frame_of(l, p)?;
@@ -2955,6 +3349,11 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
         }
         _ => None,
     };
+    // A colorbar with nothing to show says why, as a notice the app shows.
+    let empty_colorbar = match &k {
+        ElementKind::Colorbar { frame, layer: None, .. } => colorbar_without_raster(s, i, *frame),
+        _ => None,
+    };
     let l = s.project.layouts.get_mut(i).ok_or("no layout")?;
     let id = l.add(name, rect, k);
     // In columns, or with labels of its own (which may be wider than its box), it says what it
@@ -2963,6 +3362,12 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
     if p.get("columns").is_some_and(|v| !v.is_null()) || labelled {
         say_legend_fit(s, i, id);
     }
+    if kind == "legend" {
+        say_raster_keys(s, i, id);
+    }
+    if let Some(said) = empty_colorbar {
+        s.warn(said);
+    }
     let mut out = json!({"element": id});
     if let Some(w) = warning {
         out["warning"] = json!(w);
@@ -2970,8 +3375,46 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
     Ok(out)
 }
 
+/// What a colorbar with no layer of its own on `frame` says when the frame's map shows no raster
+/// with a colour scale for it but one drawn by classes (#1679): it draws an empty placeholder; the
+/// legend lists those classes, unless a colour table has more values than it can list. `None`
+/// otherwise. Said when the colorbar is added, or set back to no layer.
+fn colorbar_without_raster(s: &Session, li: usize, frame: u32) -> Option<String> {
+    let l = s.project.layouts.get(li)?;
+    let Some(ElementKind::MapFrame { map, .. }) = l.element(frame).map(|f| &f.kind) else { return None };
+    let m = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
+    if rustgis_map::layout::colorbar_layer(m, None).is_some() {
+        return None;
+    }
+    // Those the legend lists, and colour tables over more values than it can list, which nothing keys.
+    let (mut listed, mut unlisted) = (Vec::new(), Vec::new());
+    for l in m.layers.iter().filter(|l| m.shows(l)) {
+        match l.raster.as_ref().filter(|r| r.style.renderer.draws_classes()) {
+            Some(r) if r.classes_unknown() => unlisted.push(l.name.as_str()),
+            Some(_) => listed.push(l.name.as_str()),
+            None => {}
+        }
+    }
+    let mut why = Vec::new();
+    if !listed.is_empty() {
+        why.push(format!(
+            "{} is drawn by classes, which a legend lists rather than a colorbar (give \"layer\" to show its colours on one anyway)",
+            listed.join(", ")
+        ));
+    }
+    if !unlisted.is_empty() {
+        why.push(format!(
+            "{} draws a colour table over more values than a legend or a colorbar can list (over 256, or not whole numbers), so nothing keys it",
+            unlisted.join(", ")
+        ));
+    }
+    (!why.is_empty())
+        .then(|| format!("the colorbar has no raster with a colour scale to show, so it draws an empty placeholder: {}", why.join("; ")))
+}
+
 /// The raster layer a colorbar on `frame` shows: `name` checked against the frame's map, or the
-/// map's top visible raster (`None` when the map has none yet).
+/// map's top visible raster with a colour scale, not drawn by classes
+/// ([`rustgis_map::layout::colorbar_layer`]; `None` when the map has none yet).
 fn colorbar_layer(input: &impl super::InputSource, l: &Layout, frame: u32, name: Option<&str>) -> Result<Option<String>, String> {
     let context = input.input_context();
     let s = &context;
@@ -3043,6 +3486,10 @@ fn grid_params(p: &Value, base: Grid) -> Result<Grid, String> {
         if kind != g.kind {
             g.kind = kind;
             g.step = 0.0;
+            // (MGRS labels are a measured grid's; a graticule doesn't keep them.)
+            if kind == GridKind::Graticule {
+                g.mgrs = false;
+            }
         }
     }
     // A measured grid's coordinate system, projected ("" or null: the map's, else the UTM zone).
@@ -3067,6 +3514,21 @@ fn grid_params(p: &Value, base: Grid) -> Result<Grid, String> {
     }
     if let Some(v) = b(p, "short") {
         g.short = v;
+    }
+    if let Some(v) = b(p, "mgrs") {
+        if v && g.kind != GridKind::Measured {
+            return Err("mgrs labels a measured grid: give \"type\": \"measured\" with it".into());
+        }
+        g.mgrs = v;
+    }
+    // MGRS names a WGS 84 UTM zone's squares, so a measured grid with them is in one.
+    if g.mgrs
+        && let Some(c) = g.crs.as_deref().filter(|c| !c.trim().is_empty() && rustgis_map::layout::utm_zone_of(c).is_none())
+    {
+        return Err(format!(
+            "crs: MGRS labels need a WGS 84 UTM zone by its EPSG code (EPSG:32601–32660 north, 32701–32760 south), not {}; give none for the map's own zone, else the one at the frame's centre",
+            rustgis_map::graticule::short_crs(c)
+        ));
     }
     if let Some(v) = f(p, "step") {
         g.step = match g.kind {
@@ -3149,8 +3611,41 @@ pub(crate) fn text_style(p: &Value, italic: bool, align: TextAlign, spacing: f64
     Ok((italic, align, spacing))
 }
 
+/// What a `rotation` given for an element that isn't a text is told.
+const ONLY_TEXT_ROTATION: &str = "only text elements take a rotation";
+
+/// A text's `rotation` when given: degrees clockwise, kept within -180..=180 (450 is 90); refused
+/// when not a number, as the other numbers of a layout are.
+fn text_rotation(p: &Value) -> Result<Option<f64>, String> {
+    Ok(given_num(p, "rotation", "a number of degrees, clockwise")?.map(rustgis_map::layout::rotation))
+}
+
 /// What a `font` given for an element that isn't a text is told.
 const ONLY_TEXT_FONT: &str = "only text elements take a font or a fallback";
+
+/// What a `dash` given for an element that draws no line or outline is told.
+const ONLY_DASH: &str = "only lines, arrows, rectangles, ellipses and circles take a dash";
+
+/// A line's or an outline's `dash` when given, read as a line layer's stroke reads it
+/// (`layer.lineStrokes`): `Some(None)` for solid (`null` or `[]`), `Some(Some(_))` for a pattern,
+/// `None` when not given; refused when it isn't one.
+fn element_dash(p: &Value) -> Result<Option<Option<Dash>>, String> {
+    let bad = || {
+        format!(
+            "dash is a list of 1 to {MAX_DASH_STEPS} lengths in points (dash, gap, …), each 0 to {MAX_DASH_STEP}, not all 0; [] or null for solid"
+        )
+    };
+    match p.get("dash") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::Array(a)) if a.is_empty() => Ok(Some(None)),
+        Some(Value::Array(a)) => {
+            let steps: Vec<f32> = a.iter().map(|v| v.as_f64().map(|x| x.clamp(-1e6, 1e6) as f32)).collect::<Option<_>>().ok_or_else(bad)?;
+            Dash::new(&steps).map(|d| Some(Some(d))).ok_or_else(bad)
+        }
+        Some(_) => Err(bad()),
+    }
+}
 
 /// Rounded corners are a rectangle's: refused elsewhere, as a family is, so a script doesn't take
 /// them as applied.
@@ -3413,28 +3908,30 @@ fn restyle(kind: &ElementKind, p: &Value) -> Result<Option<ElementKind>, String>
             let (color, fill) = (color(p, "color", *c)?, color(p, "fill", *fill)?);
             Ok(Some(ElementKind::ScaleBar { frame: *frame, units, divisions, style, color, fill }))
         }
-        ElementKind::Rectangle { fill, outline, width, .. } | ElementKind::Ellipse { fill, outline, width } => {
-            if ["fill", "outline", "color", "width", "radius"].iter().all(|k| p.get(k).is_none()) {
+        ElementKind::Rectangle { fill, outline, width, dash, .. } | ElementKind::Ellipse { fill, outline, width, dash } => {
+            if ["fill", "outline", "color", "width", "radius", "dash"].iter().all(|k| p.get(k).is_none()) {
                 return Ok(None);
             }
+            let dash = element_dash(p)?.unwrap_or(*dash);
             // The outline's colour is "outline", or "color" as when adding one.
             let (fill, outline) = (color(p, "fill", *fill)?, color(p, "outline", color(p, "color", *outline)?)?);
             let width = shape_width(p, *width)?.clamp(0.0, 50.0);
             Ok(Some(match kind {
                 ElementKind::Rectangle { radius, .. } => {
-                    ElementKind::Rectangle { fill, outline, width, radius: corner_radius(p, *radius)? }
+                    ElementKind::Rectangle { fill, outline, width, radius: corner_radius(p, *radius)?, dash }
                 }
-                _ => ElementKind::Ellipse { fill, outline, width },
+                _ => ElementKind::Ellipse { fill, outline, width, dash },
             }))
         }
-        ElementKind::Line { color: c, width, dir, head } => {
-            if ["color", "width", "dir", "head"].iter().all(|k| p.get(k).is_none()) {
+        ElementKind::Line { color: c, width, dir, head, dash } => {
+            if ["color", "width", "dir", "head", "dash"].iter().all(|k| p.get(k).is_none()) {
                 return Ok(None);
             }
+            let dash = element_dash(p)?.unwrap_or(*dash);
             let dir = line_dir(p, *dir)?;
             let head = line_head(p, *head)?;
             let width = shape_width(p, *width)?.clamp(0.1, 50.0);
-            Ok(Some(ElementKind::Line { color: color(p, "color", *c)?, width, dir, head }))
+            Ok(Some(ElementKind::Line { color: color(p, "color", *c)?, width, dir, head, dash }))
         }
         _ => Ok(None),
     }
@@ -3459,15 +3956,20 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     let li = index(s, p)?;
+    // What a publication's scale bar box was measured from, before this change.
+    let basis = scale_box_basis(s, li);
     // Locked, it takes no change but being unlocked, which may come with other changes.
-    let changes =
-        p.as_object().is_some_and(|o| o.iter().any(|(k, v)| !v.is_null() && !matches!(k.as_str(), "layout" | "element" | "locked")));
+    // "dash": null makes a line solid, so it is a change too.
+    let changes = p
+        .as_object()
+        .is_some_and(|o| o.iter().any(|(k, v)| (!v.is_null() || k == "dash") && !matches!(k.as_str(), "layout" | "element" | "locked")));
     if changes && b(p, "locked") != Some(false) {
         unlocked(s.project.layouts.get(li).ok_or("no layout")?, id)?;
     }
     // A new layer (tables and charts) or field (charts) must exist in the frame's map.
     let checked = checked_update(s, p, li, id)?;
-    // A colorbar's new layer must be a raster in its frame's map; empty follows the top raster.
+    // A colorbar's new layer must be a raster in its frame's map; empty follows the top visible
+    // raster with a colour scale, not drawn by classes.
     let colorbar = {
         let l = s.project.layouts.get(li).ok_or("no layout")?;
         match l.element(id).map(|e| &e.kind) {
@@ -3482,6 +3984,8 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
             _ => None,
         }
     };
+    // Set back to no layer: it follows the map's default, which may have nothing to show (#1679).
+    let emptied_colorbar = matches!(&colorbar, Some((Some(None), _, _)));
     // A north arrow's or scale bar's new look, and a map frame's grid: `"grid": false` removes it,
     // `true` adds the default one, an object changes the options it names, and null (not set)
     // leaves it as it is.
@@ -3585,6 +4089,10 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         _ if gives_font(p) => return Err(ONLY_TEXT_FONT.into()),
         _ => None,
     };
+    let new_rotation = match text_rotation(p)? {
+        Some(_) if !matches!(kind_now, Some(ElementKind::Text { .. })) => return Err(ONLY_TEXT_ROTATION.into()),
+        r => r,
+    };
     // A family asked for that isn't drawn as asked: said whenever the call asks for one (again
     // too, as `layout.addElement` says it), so a script is told what it gets; a call that changes
     // something else on such a text isn't told again.
@@ -3602,6 +4110,15 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         && !matches!(s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind), Some(ElementKind::Rectangle { .. }))
     {
         return Err(ONLY_RECTANGLE_RADIUS.into());
+    }
+    // `null` too: it makes a line solid, so elsewhere it is refused rather than ignored.
+    if p.get("dash").is_some()
+        && !matches!(
+            s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind),
+            Some(ElementKind::Line { .. } | ElementKind::Rectangle { .. } | ElementKind::Ellipse { .. })
+        )
+    {
+        return Err(ONLY_DASH.into());
     }
     // A legend's left-out layers, checked against its frame's map before anything changes.
     let new_exclude = {
@@ -3677,9 +4194,12 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     match &mut e.kind {
-        ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name } => {
+        ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name, rotation } => {
             if let Some(((i, a, l), (f, n))) = new_text_style {
                 (*italic, *align, *letter_spacing, *font, *font_name) = (i, a, l, f, n);
+            }
+            if let Some(r) = new_rotation {
+                *rotation = r;
             }
             if let Some(t) = ps(p, "text") {
                 *text = t.chars().take(5000).collect();
@@ -3790,16 +4310,211 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         || p.get("labels").is_some_and(|v| !v.is_null());
     // Labels given are told in one column too: a label is text chosen for the box.
     let labelled = matches!(&e.kind, ElementKind::Legend { .. }) && p.get("labels").is_some_and(|v| !v.is_null());
+    // Told what it leaves out, or whether it lists every class, it says again which rasters it
+    // can't key.
+    let excluding =
+        matches!(&e.kind, ElementKind::Legend { .. }) && (p.get("exclude").is_some_and(|v| !v.is_null()) || b(p, "allClasses").is_some());
     if new_columns.is_some() || (in_columns && refitted) || labelled {
         say_legend_fit(s, li, id);
     }
+    if excluding {
+        say_raster_keys(s, li, id);
+    }
+    if emptied_colorbar {
+        let frame = s.project.layouts.get(li).and_then(|l| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Colorbar { frame, layer: None, .. }) => Some(*frame),
+            _ => None,
+        });
+        if let Some(said) = frame.and_then(|frame| colorbar_without_raster(s, li, frame)) {
+            s.warn(said);
+        }
+    }
     if let Some(text) = p.get("grid").and_then(|grid| grid.get("crs")).and_then(Value::as_str) {
         super::say_crs_note(s, text);
+    }
+    // Its frame drawn at another scale or width, or the text under its bar changed: a
+    // publication's scale bar box measured again.
+    if let Some(basis) = basis {
+        let given = |keys: &[&str]| keys.iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null()));
+        let restyled = id == basis.bar_id && given(&["units", "divisions"]);
+        if (id == basis.frame && given(&["scale", "w"])) || (id == basis.text_id && given(&["text", "size", "bold"])) || restyled {
+            refit_scale_box(s, li, &basis);
+        }
     }
     if let Some(w) = font_told {
         return Ok(json!({"warning": w}));
     }
     Ok(Value::Null)
+}
+
+/// The width (mm) of a publication's scale bar box (#1379), for a frame `frame_w` mm wide at
+/// `scale` and `ground_per_pt` ground metres a point: the bar a box 30 % of the frame's width (25
+/// mm at least) would draw sets its length and divisions, and the box is the narrowest that draws
+/// that same bar (at least its length over the 85 % of a box the renderer gives a bar), its last
+/// label included, and holds the text written under it: `text` (its `{scale}` filled), in
+/// `text_pt` points, bold or not.
+fn scale_box_width(ground_per_pt: f64, scale: f64, frame_w_mm: f64, bar: (ScaleUnits, usize), comma: bool, text: (&str, f64, bool)) -> f64 {
+    let (text, text_pt, bold) = text;
+    let (widest, pt_per_mm) = ((frame_w_mm * 0.3).max(25.0), rustgis_map::layout::PT_PER_MM);
+    let bar_w = crate::render::layout::scale_bar_width_pt(ground_per_pt, widest * pt_per_mm, bar, comma, 1.5 * pt_per_mm)
+        .map_or(widest, |w| w / pt_per_mm);
+    let written = text.replace("{scale}", &crate::render::layout::scale_ratio_text(scale, comma));
+    bar_w.max(scale_text_mm(&written, text_pt, bold)).min(widest)
+}
+
+/// The width (mm) a scale bar box gives the text under its bar, its tokens filled: its longest
+/// line in `text_pt` points, bold or not, and a millimetre each side.
+fn scale_text_mm(text: &str, text_pt: f64, bold: bool) -> f64 {
+    text.lines().map(|line| crate::render::report::width_mm(line, text_pt as f32, bold)).fold(0.0, f64::max) + 2.0
+}
+
+/// What a publication places over its map, which a scale bar box measured again must stay off.
+const PLACED_OVER_MAP: [&str; 3] = ["Legend Box", "Locator", "North Arrow"];
+
+/// What a publication's scale bar box is measured from: its frame (id, centre, scale, width), its
+/// bar (id, units, divisions) and the text under the bar (id, text, size, boldness).
+#[derive(Clone)]
+struct BoxBasis {
+    frame: u32,
+    center: Coord,
+    scale: f64,
+    frame_w: f64,
+    bar_id: u32,
+    units: ScaleUnits,
+    divisions: usize,
+    text_id: u32,
+    text: String,
+    size: f64,
+    bold: bool,
+}
+
+/// The text under a publication's scale bar as the page draws it from `b`: `{scale}` filled as
+/// `layout.publication` fills it, the other tokens from the frame's map.
+fn basis_text(l: &Layout, m: &rustgis_map::Map, b: &BoxBasis) -> String {
+    let info = crate::render::layout::PageInfo { page: 1, pages: 1, page_name: String::new() };
+    let cam = rustgis_map::layout::frame_camera(m, b.center, b.scale, 0.0, 0.0);
+    let text = b.text.replace("{scale}", &crate::render::layout::scale_ratio_text(b.scale, l.decimal_comma));
+    crate::render::layout::expand(&text, l, &info, Some((m, cam)))
+}
+
+/// The automatic width (mm) of a publication's scale bar box measured from `b`: the one
+/// `layout.publication` gives it for that frame, bar and text.
+fn basis_width(l: &Layout, m: &rustgis_map::Map, b: &BoxBasis) -> f64 {
+    let ground_per_pt = m.ground_res_at(&rustgis_map::layout::frame_camera(m, b.center, b.scale, 0.0, 0.0));
+    let filled = basis_text(l, m, b);
+    scale_box_width(ground_per_pt, b.scale, b.frame_w, (b.units, b.divisions), l.decimal_comma, (&filled, b.size, b.bold))
+}
+
+/// The automatic width (mm) of layout `li`'s publication scale bar box as things are now.
+#[cfg(test)]
+pub(crate) fn scale_box_auto(s: &Session, li: usize) -> Option<f64> {
+    let b = scale_box_basis(s, li)?;
+    let l = s.project.layouts.get(li)?;
+    let ElementKind::MapFrame { map, .. } = &l.element(b.frame)?.kind else { return None };
+    let m = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
+    Some(basis_width(l, m, &b))
+}
+
+/// The basis of a layout's publication scale bar box as it is now (#1379); `None` without one.
+fn scale_box_basis(s: &Session, li: usize) -> Option<BoxBasis> {
+    let l = s.project.layouts.get(li)?;
+    let named = |name: &str| l.elements.iter().find(|e| e.name == name);
+    let (bar, written) = (named("Scale Bar")?, named("Scale")?);
+    let (ElementKind::ScaleBar { frame, units, divisions, .. }, ElementKind::Text { text, size, bold, .. }) = (&bar.kind, &written.kind)
+    else {
+        return None;
+    };
+    let fr = l.element(*frame)?;
+    let ElementKind::MapFrame { center, scale, .. } = &fr.kind else { return None };
+    Some(BoxBasis {
+        frame: *frame,
+        center: *center,
+        scale: *scale,
+        frame_w: fr.w,
+        bar_id: bar.id,
+        units: *units,
+        divisions: *divisions,
+        text_id: written.id,
+        text: text.clone(),
+        size: *size,
+        bold: *bold,
+    })
+}
+
+/// A publication's scale bar box measured again after its frame's scale or width changed (#1379):
+/// the "Scale Box", the "Scale Bar" of `frame` and the "Scale" under it, as a publication lays them
+/// out (one place, one width, none locked), take the width that bar and the text under it (its
+/// tokens filled as the page draws them, measured as drawn) now need, kept on the side of the
+/// frame they are nearer. A layout without them, with them moved apart, with that text spaced out
+/// or in another font, naming a map series page (which differs from page to page), or of a frame
+/// other than the first (whose map the page fills the text from) is left as it is; so is a text
+/// longer than the widest box a publication gives. Only a box as wide as `before` (what it was
+/// measured from before the change: its frame, bar and text) makes it is measured again: one set
+/// by hand keeps its width. A change to the text under the bar or to the bar's units or divisions
+/// measures it again too. A box that would then cover the legend, locator or north arrow, which
+/// it didn't, stays as it was, which is said.
+fn refit_scale_box(s: &mut Session, li: usize, before: &BoxBasis) {
+    let frame = before.frame;
+    let Some(now) = scale_box_basis(s, li).filter(|b| b.frame == frame) else { return };
+    let Some(l) = s.project.layouts.get(li) else { return };
+    let Some(fr) = l.element(frame) else { return };
+    let ElementKind::MapFrame { map, .. } = &fr.kind else { return };
+    let Some(m) = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)) else { return };
+    let named = |name: &str| l.elements.iter().find(|e| e.name == name);
+    let (Some(boxed), Some(bar), Some(text)) = (named("Scale Box"), named("Scale Bar"), named("Scale")) else { return };
+    let (ElementKind::ScaleBar { frame: of, .. }, ElementKind::Text { text: written, letter_spacing, font, font_name, .. }) =
+        (&bar.kind, &text.kind)
+    else {
+        return;
+    };
+    if *letter_spacing != 0.0
+        || *font != FontFamily::Sans
+        || font_name.is_some()
+        || (l.series.is_some() && written.contains("{page"))
+        || l.first_frame() != Some(frame)
+    {
+        return;
+    }
+    // Its tokens filled as the page draws them.
+    let filled = basis_text(l, m, &now);
+    let together = [bar, text].iter().all(|e| (e.x - boxed.x).abs() < 1e-6 && (e.w - boxed.w).abs() < 1e-6 && !e.locked);
+    if *of != frame || !together || boxed.locked {
+        return;
+    }
+    // A text longer than the widest box a publication gives: a width set by hand for it is kept.
+    if scale_text_mm(&filled, now.size, now.bold) > (fr.w * 0.3).max(25.0) {
+        return;
+    }
+    // The width the box had from its basis before the change: another one was set by hand.
+    if (boxed.w - basis_width(l, m, before)).abs() > 0.01 {
+        return;
+    }
+    let w = basis_width(l, m, &now);
+    let x = if boxed.x + boxed.w / 2.0 > fr.x + fr.w / 2.0 { boxed.x + boxed.w - w } else { boxed.x };
+    let covers = |(x, w): (f64, f64), e: &rustgis_map::layout::Element| {
+        x < e.x + e.w && e.x < x + w && boxed.y < e.y + e.h && e.y < boxed.y + boxed.h
+    };
+    let newly = l
+        .elements
+        .iter()
+        .filter(|e| PLACED_OVER_MAP.contains(&e.name.as_str()) && e.visible)
+        .find(|e| covers((x, w), e) && !covers((boxed.x, boxed.w), e))
+        .map(|e| e.name.to_lowercase().replace(" box", ""));
+    if let Some(what) = newly {
+        s.notify(
+            format!("the scale bar's box would now cover the {what}, so it is left as it was: move or widen it by hand, or make the layout again with layout.publication"),
+            false,
+        );
+        return;
+    }
+    let ids = [boxed.id, bar.id, text.id];
+    if let Some(l) = s.project.layouts.get_mut(li) {
+        for id in ids {
+            if let Some(e) = l.element_mut(id) {
+                (e.x, e.w) = (x, w);
+            }
+        }
+    }
 }
 
 /// Points a frame at an extent.
@@ -3821,6 +4536,7 @@ fn set_frame(s: &mut Session, li: usize, frame: u32, e: &Extent) -> Result<(), S
 
 fn frame_zoom(s: &mut Session, p: &Value) -> CmdResult {
     let li = index(s, p)?;
+    let basis = scale_box_basis(s, li);
     let l = s.project.layouts.get(li).ok_or("no layout")?;
     let frame = zoom_frame(l, p)?;
     unlocked(l, frame)?;
@@ -3856,6 +4572,9 @@ fn frame_zoom(s: &mut Session, p: &Value) -> CmdResult {
             set_frame(s, li, frame, &e)?;
         }
         o => return Err(format!("unknown zoom '{o}'")),
+    }
+    if let Some(basis) = basis.filter(|b| b.frame == frame) {
+        refit_scale_box(s, li, &basis);
     }
     Ok(json!({"element": frame}))
 }
@@ -3981,15 +4700,24 @@ fn named_fonts_unread(layout: &Layout) -> Option<&'static str> {
 /// Layout `li` as a PDF (kept as vectors; every map series page when `all`; its map frames
 /// georeferenced) or a PNG of the current page, at `dpi`.
 pub fn layout_bytes(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool) -> Result<Vec<u8>, String> {
-    layout_bytes_with(s, li, pdf, dpi, all, true)
+    layout_bytes_with(s, li, pdf, dpi, all, true, rustgis_render::pdf::Options::default())
 }
 
-/// [`layout_bytes`], a PDF's map frames georeferenced only when `georeference` (#1191).
-/// Returns an actionable error if a linked archive changes while the pages are drawn.
-pub fn layout_bytes_with(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool, georeference: bool) -> Result<Vec<u8>, String> {
+/// [`layout_bytes`], a PDF's map frames georeferenced only when `georeference` (#1191), written
+/// as `options` say (its layers and text, #1815). Returns an actionable error if a linked archive changes
+/// while the pages are drawn.
+pub fn layout_bytes_with(
+    s: &mut Session,
+    li: usize,
+    pdf: bool,
+    dpi: f64,
+    all: bool,
+    georeference: bool,
+    options: rustgis_render::pdf::Options,
+) -> Result<Vec<u8>, String> {
     let layout = s.project.layouts.get(li).ok_or("no layout")?;
     let revisions = rustgis_render::layout::archive_revisions(layout, &s.project.maps);
-    let result = layout_bytes_inner(s, li, pdf, dpi, all, georeference);
+    let result = layout_bytes_inner(s, li, pdf, dpi, all, georeference, options);
     let layout = s.project.layouts.get(li).ok_or("no layout")?;
     revisions.finish_revision(
         rustgis_render::layout::archive_revisions(layout, &s.project.maps),
@@ -3998,7 +4726,15 @@ pub fn layout_bytes_with(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: b
     )?
 }
 
-fn layout_bytes_inner(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool, georeference: bool) -> Result<Vec<u8>, String> {
+fn layout_bytes_inner(
+    s: &mut Session,
+    li: usize,
+    pdf: bool,
+    dpi: f64,
+    all: bool,
+    georeference: bool,
+    options: rustgis_render::pdf::Options,
+) -> Result<Vec<u8>, String> {
     let saved = s.project.layouts.get(li).ok_or("no layout")?.clone();
     if let Some(note) = named_fonts_unread(&saved) {
         s.warn(note);
@@ -4026,7 +4762,7 @@ fn layout_bytes_inner(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool
     // The map frames a PDF can't georeference, and those it georeferences by their corners only,
     // each with the page (from 1) it is on.
     let (mut left_out, mut by_corners): (Vec<(usize, u32, String, &'static str)>, Vec<(usize, u32, String)>) = (Vec::new(), Vec::new());
-    let mut render_pages = || -> Result<(Vec<rustgis_render::pdf::Page>, Option<Vec<u8>>), String> {
+    let render_pages = || -> Result<(Vec<rustgis_render::pdf::Page>, Option<Vec<u8>>), String> {
         let mut out = Vec::new();
         let mut png = None;
         let mut held = 0usize;
@@ -4086,7 +4822,15 @@ fn layout_bytes_inner(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool
         }
         Ok((out, png))
     };
-    let result = render_pages();
+    // Layers its frames drew without their cast shadows (read in place, too large for the
+    // browser, no memory, still being worked out on the interface's thread): said, as the map's
+    // export says them.
+    let (result, said) = rustgis_render::shadows_said(render_pages);
+    if result.is_ok() {
+        for w in super::share::shadow_warnings("The layout", &said) {
+            s.warn(w);
+        }
+    }
     // Stepping through the series moved the frame; put the layout back however that went.
     if stepping && let Some(cur) = s.project.layouts.get_mut(li) {
         *cur = saved.clone();
@@ -4094,7 +4838,30 @@ fn layout_bytes_inner(s: &mut Session, li: usize, pdf: bool, dpi: f64, all: bool
     let (pages, png) = result?;
     pictured_notices(s, &frames_pictured, &pages_pictured);
     georeference_notices(s, &left_out, &by_corners, pages.len());
-    if pdf { Ok(rustgis_render::pdf::write(&pages, &saved.name)) } else { png.ok_or_else(|| "nothing to draw".to_string()) }
+    if !pdf {
+        return png.ok_or_else(|| "nothing to draw".to_string());
+    }
+    let (bytes, outlined) = rustgis_render::pdf::write_with(&pages, &saved.name, options);
+    outlined_notice(s, &outlined);
+    Ok(bytes)
+}
+
+/// Says which faces a PDF set in outlines though its text was to be in fonts (#1815), with why:
+/// their text is drawings, not text, in a vector editor. One notice, the faces counted.
+pub(crate) fn outlined_notice(s: &mut Session, outlined: &[rustgis_render::pdf::Outlined]) {
+    let n = outlined.len();
+    if n == 0 {
+        return;
+    }
+    let mut each: Vec<String> = outlined.iter().take(10).map(|o| format!("{} ({})", o.face, o.why)).collect();
+    if n > 10 {
+        each.push(format!("and {} more", n - 10));
+    }
+    s.warn(format!(
+        "The PDF sets the text of {n} face{} as outlines, not as text a vector editor can edit: {}",
+        if n == 1 { "" } else { "s" },
+        each.join(", ")
+    ));
 }
 
 /// Says which map frames a PDF doesn't georeference, with why, and which it georeferences by their
@@ -4210,6 +4977,35 @@ pub(crate) fn pictured_notices(s: &mut Session, frames: &[(u32, String)], pages:
     }
 }
 
+/// The keys `layout.export`'s `"pdf"` takes.
+const PDF_KEYS: &[&str] = &["layers", "text"];
+
+/// How `layout.export`'s `"pdf": {…}` asks a PDF to be written (#1815): with its layers unless
+/// `"layers": false`, its text in its fonts unless `"text": "outlines"`. It is checked whatever
+/// the export writes, a PNG or SVG too, so a script's mistake shows on its first run; a key it
+/// doesn't know is refused, with the keys it takes.
+fn pdf_options(p: &Value) -> Result<rustgis_render::pdf::Options, String> {
+    use rustgis_render::pdf::Text;
+    let mut options = rustgis_render::pdf::Options::default();
+    let Some(pdf) = p.get("pdf").filter(|v| !v.is_null()) else { return Ok(options) };
+    let Some(pdf) = pdf.as_object() else { return Err(r#"pdf is an object: {"layers": true|false, "text": "fonts"|"outlines"}"#.into()) };
+    if let Some(key) = pdf.keys().find(|k| !PDF_KEYS.contains(&k.as_str())) {
+        return Err(format!("pdf has no key \"{key}\": its keys are {}", PDF_KEYS.join(", ")));
+    }
+    match pdf.get("layers") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(on)) => options.layers = *on,
+        Some(_) => return Err("pdf.layers is true or false".into()),
+    }
+    options.text = match pdf.get("text") {
+        None | Some(Value::Null) => Text::Fonts,
+        Some(v) if v == "fonts" => Text::Fonts,
+        Some(v) if v == "outlines" => Text::Outlines,
+        Some(_) => return Err(r#"pdf.text is "fonts" or "outlines""#.into()),
+    };
+    Ok(options)
+}
+
 /// `layout.export`: a layout to a PNG, PDF or SVG. It draws a copy of the project, so the project
 /// can change meanwhile (a map series steps through its pages on the copy); a cancelled export
 /// stops at the next page, or its map's wait for tiles, and writes nothing.
@@ -4222,6 +5018,7 @@ pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work
         return Err("export to a .png, .pdf or .svg file".into());
     }
     let (dpi, all, georeference) = (f(p, "dpi").unwrap_or(150.0), b(p, "allPages").unwrap_or(true), b(p, "georeference").unwrap_or(true));
+    let options = pdf_options(p)?;
     let mut project = s.project.clone();
     for m in &mut project.maps {
         m.detach_reads();
@@ -4232,7 +5029,7 @@ pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work
             let bytes = if svg {
                 layout_svg(&mut copy, li, dpi)?.into_bytes()
             } else {
-                layout_bytes_with(&mut copy, li, pdf, dpi, all, georeference)?
+                layout_bytes_with(&mut copy, li, pdf, dpi, all, georeference, options)?
             };
             rustgis_data::progress::check().map_err(|e| e.to_string())?;
             rustgis_data::io::write_atomic(Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
@@ -4470,8 +5267,8 @@ fn locator_orphan(input: &impl super::InputSource) -> Option<usize> {
     s.project.maps.iter().position(|x| x.projection.is_globe() && ours(&x.name) && !shown(&x.name) && x.name != src.name && made_here(x))
 }
 
-/// Whether the publication gives the top visible raster a colorbar: `"auto"` (the default) or
-/// `"none"`.
+/// Whether the publication gives the top shown raster with a colour scale a colorbar: `"auto"` (the
+/// default) or `"none"`.
 fn publication_colorbar(p: &Value) -> Result<bool, String> {
     match p.get("colorbar").filter(|v| !v.is_null()) {
         None => Ok(true),

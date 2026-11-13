@@ -210,11 +210,23 @@ on the desktop, or **Project › New › QGIS Project…** (`project.importQgis=
 The QGIS Project picker filters for `.qgs` and `.qgz` files on both desktop and web.
 Its layers come in the layer tree's order, each from its file (GeoPackage, Shapefile, GeoJSON,
 GeoTIFF and the other formats RustGIS reads), a CSV of
-points, XYZ tiles or a WMS layer, unchecked layers and groups hidden. The map takes the project's
+points, XYZ tiles or a WMS layer, unchecked layers and groups hidden. The layer tree's groups come in
+as [layer groups](index.md), nested as in QGIS (to eight levels and 2,000 groups; the layers of
+groups past that go in the group holding them), open or closed, each layer in its group with its
+own box; a group drawn as one (a QGIS group layer) takes its visibility range and its
+opacity, the opacity applied to each of its layers. Web tile layers (XYZ, and WMS layers drawn as tiles) can't be in a group and come in
+outside it. The layers draw in the layer tree's order, also when the project sets an order of
+its own (noted). The map takes the project's
 coordinate system and its saved view (or its layers' extent, when that view shows none of them),
 with no basemap and no graticule, as QGIS draws it. A project in degrees (EPSG:4326 and other supported
 longitude/latitude systems) opens in the Equirectangular projection, the plate carrée QGIS draws
-it in. The import is one undo step.
+it in; a map QGIS turned keeps its rotation. The project's bookmarks come in at their places (from
+the coordinate system each was saved in), turned as QGIS turns them; their groups are noted. Its
+relations come in as [relationships](editing.md#data-design) between the layers that came in (one on several
+pairs of fields relates by the first, noted). A layer whose time QGIS reads from a date field
+(or starts at one) is bound to the [time slider](#views-and-tools) on that field, the slider left off, as
+QGIS opens a project with its time navigation off: every feature draws until it is turned on; the
+project's own span and steps, when it sets one, are noted. The import is one undo step.
 Relative layer paths resolve from the project's folder on desktop. In the browser, relative
 file sources cannot be resolved and are listed in the import notes.
 
@@ -264,6 +276,19 @@ Each layer keeps its look:
   field the layer hasn't, is left out, noted. Histograms, stacked bars and text diagrams are
   left out (RustGIS's bar diagrams draw each category's share, QGIS's histograms its value), and
   scale ranges, distances from the feature and data-defined diagram settings noted.
+- **Annotations**: each annotation layer, and the project's main one (on top, as "Annotations"),
+  as a [graphics layer](cartography.md#graphics): markers, lines and polygons in their symbol's colours, sizes and widths;
+  point text, rectangle text and text along a line as text graphics, with their font size,
+  colour, weight, slant, letter spacing and alignment; pictures (PNG and JPEG) fitted in their box;
+  a rectangle text's or picture's background and frame as a rectangle. They are taken from the
+  layer's coordinate system to the map's and drawn in their z order. RustGIS centres a text
+  graphic on its point, draws it level and with its own halo, and draws text along a line level
+  at the line's middle, all noted. RustGIS draws a graphics layer's texts after all layers, so a
+  text QGIS draws under a shape, or under a layer above, comes out over it (noted). A picture
+  whose aspect is locked keeps it on the map, as QGIS does; an import keeps at most 64 MiB of
+  pictures as stored (base64, about 48 MiB of PNG or JPEG files), and those past it are left out
+  (noted). SVG pictures, callouts and annotations QGIS
+  keeps switched off are left out, noted.
 - **Rasters**: singleband grey as a stretch from black to white, singleband pseudocolour as a
   stretch along its colour map (interpolated), as Classify (discrete) or as Unique Values (exact),
   paletted as Unique Values, multiband colour as RGB and hillshade as Shaded Relief; with the
@@ -312,11 +337,15 @@ dashed polygon outlines solid, label halos with sharp corners drawn round and bl
 over the map, label backgrounds of other shapes drawn as rectangles, label distances from lines
 and polygons, a distance around points moved straight up, labels wrapped at a shortest line
 length or justified, values outside a graduated renderer's ranges in its first or last class, file options
-such as `layerid` that RustGIS doesn't read) and what was skipped (arrow lines, other data-defined
+such as `layerid` that RustGIS doesn't read, groups showing one layer at a time as ordinary groups,
+a group layer's opacity applied to each of its layers and its blending mode drawn as Normal, a
+relation on several pairs of fields related by the first, features shown over time from a start date
+alone, events lasting a fixed time shown at their date, a layer accumulating its features over time, features at the very end of a time step) and what was skipped (arrow lines, group layers' draw effects, other data-defined
 settings, draw effects, label callouts, contours and other raster
 renderers RustGIS has no match for, PostGIS, WFS
 and other sources RustGIS doesn't read, histogram, stacked bar and text diagrams, joins, virtual fields, a layer's other styles,
-and the project's print layouts, annotations, bookmarks, map themes and relations). A database
+time from an expression, a fixed range or redrawn as the time changes, a raster's or a service's time, and the project's print layouts, QGIS 3's older annotation balloons, map themes,
+bookmark groups and bookmarks the map's projection doesn't reach, polymorphic relations and its time span and steps). A database
 password in a project never reaches the notes.
 
 A QGIS layer style (`.qml`) styles the selected layer the same way, a feature layer or a raster:
@@ -463,8 +492,10 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
       <figcaption>The Time Slider in cumulative mode: every event up to 2018 is drawn.</figcaption>
     </figure>
 
-    - **Bind To Time Slider** (a layer's context menu, or the bar's **Layers** menu) picks the
-      layer's date field: the one most of whose values read as dates. Text dates (`2015-03-01`,
+    - **Bound to the time slider** (the Time tab of a layer's [Layer Properties](cartography.md#layer-properties),
+      or the bar's **Layers** menu) picks the layer's date field: the one it is bound to already (by
+      a QGIS project's import, say), else the one most of whose values read as dates, or the one
+      chosen in its list. Text dates (`2015-03-01`,
       `2015-03-01T12:00:00Z`, `2015/3/1`), epoch milliseconds or seconds, and years (`1958`) all
       read; times are UTC. Only the features whose date falls in the slider's window draw (and
       show in the legend). The bar's bars count each step's features.

@@ -337,8 +337,9 @@ pub struct MapView {
     pictures: crate::popupmedia::Pictures,
     /// The tile layers' credits, from the last render.
     attribution: Vec<String>,
-    /// Tile layer errors already reported.
-    tile_errors: std::collections::HashSet<String>,
+    /// Tile layer errors, and why layers were drawn without their cast shadows (in the map or
+    /// the Layout view), already reported.
+    pub(crate) tile_errors: std::collections::HashSet<String>,
     /// When the map last rendered (seconds).
     last_render: f64,
     /// The map drawn flat and laid over the globe while it moves.
@@ -347,6 +348,14 @@ pub struct MapView {
     tilt_drape: crate::tilt_drape::TiltDrape,
     /// Exact globe, tilted and tiled flat frames, composed off the UI thread.
     tilt_settle: crate::tilt_settle::TiltSettle<Key>,
+    /// The frame a flat map draws while it moves (a gap to fill, a stretched frame to sharpen, a
+    /// GPU scene the view has outgrown), off the UI thread too (#1750): see `main_view`.
+    motion_frame: crate::tilt_settle::TiltSettle<Key>,
+    /// The frame `motion_frame` is drawing is no longer wanted (the map came to rest, or changed):
+    /// it is dropped when it lands, even if it finished before it saw the stop.
+    motion_dropped: bool,
+    /// Draws a flat map's frames on the UI thread, as the browser does (diagnostics and tests).
+    pub inline_frames: bool,
     /// The frame shown has tile pictures still to draw: drawn again.
     filling: bool,
     /// The last frame painted showed the tilted map's drape.
@@ -375,6 +384,12 @@ pub struct MapView {
     pub(crate) render_state: Option<egui_wgpu::RenderState>,
     /// The GPU map backend, for now gated on the RUSTGIS_GPU environment variable.
     pub gpu_enabled: bool,
+    /// What the device's error handler found since the map last looked ([`handle_gpu_errors`]).
+    pub(crate) gpu_errors: std::sync::Arc<GpuErrors>,
+    /// Whether a graphics card error other than running out of memory was said this session.
+    gpu_error_said: bool,
+    /// Whether that handler is on the device yet.
+    gpu_handler_on: bool,
     /// Rolling map-frame timestamps (for the status-bar FPS readout).
     frame_times: std::collections::VecDeque<f64>,
 }
@@ -441,6 +456,9 @@ impl Default for MapView {
             drape: Default::default(),
             tilt_drape: Default::default(),
             tilt_settle: Default::default(),
+            motion_frame: Default::default(),
+            motion_dropped: false,
+            inline_frames: false,
             filling: false,
             drape_painted: false,
             tilt_fade: None,
@@ -454,6 +472,9 @@ impl Default for MapView {
             gpu_target_split: std::sync::Arc::new(std::sync::Mutex::new(None)),
             render_state: None,
             gpu_enabled: std::env::var_os("RUSTGIS_GPU").is_some(),
+            gpu_errors: std::sync::Arc::new(GpuErrors::default()),
+            gpu_error_said: false,
+            gpu_handler_on: false,
             frame_times: std::collections::VecDeque::new(),
         }
     }
@@ -498,7 +519,7 @@ impl MapView {
     /// Whether an exact frame is being composed off the UI thread, or the frame shown waits for
     /// tile pictures still to be drawn.
     pub fn drawing(&self) -> bool {
-        self.tilt_settle.busy() || self.filling
+        self.tilt_settle.busy() || self.motion_frame.busy() || self.filling
     }
 
     /// egui's wgpu render state from the host (`frame.wgpu_render_state()`), for the GPU map
@@ -531,7 +552,12 @@ impl MapView {
         self.preview_attempt = None;
         self.kept = None;
         self.gpu_frame = None;
+        // The frame being drawn is out of date: stopped, so it uploads no scene nobody will show.
+        self.tilt_settle.cancel();
         self.tilt_settle = Default::default();
+        // One still being drawn is stopped, and dropped when it lands.
+        self.motion_frame.cancel();
+        self.motion_dropped = self.motion_frame.busy();
     }
     /// The camera the last full render was drawn with (diagnostics and tests).
     pub fn full_frame_camera(&self) -> Camera {
@@ -617,9 +643,111 @@ fn now(ui: &Ui) -> f64 {
     ui.input(|i| i.time)
 }
 
+/// Puts a handler on the desktop device for the errors nothing else catches (#1777). wgpu's own
+/// closes the app on any of them, a graphics card running out of memory (2 GB at 2560 × 1440)
+/// too; this one logs them, and notes running out in `out_of_memory`, after which the map
+/// leaves the graphics card ([`leave_gpu_if_out_of_memory`]). In the browser none is put on:
+/// WebGPU already only logs what nothing catches, and wgpu would turn its rare internal errors
+/// into a crash once a handler is there.
+/// Puts [`handle_gpu_errors`] on the device once there is one, from the app's frame (the start
+/// page and backstage included, so egui's own uploads are covered from the first frame).
+pub(crate) fn handle_gpu_errors_once(app: &mut RustGisApp, ctx: &egui::Context) {
+    if app.map.gpu_handler_on {
+        return;
+    }
+    if let Some(rs) = &app.map.render_state {
+        handle_gpu_errors(&rs.device, app.map.gpu_errors.clone(), ctx.clone());
+        app.map.gpu_handler_on = true;
+    }
+}
+
+/// A frame is asked of `ctx` for each error, so the map leaves the card even when nothing else
+/// would draw again (an error in the last frame before the window goes idle).
+#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+pub(crate) fn handle_gpu_errors(device: &egui_wgpu::wgpu::Device, errors: std::sync::Arc<GpuErrors>, ctx: egui::Context) {
+    #[cfg(not(target_arch = "wasm32"))]
+    device.on_uncaptured_error(std::sync::Arc::new(move |e: egui_wgpu::wgpu::Error| {
+        errors.note(&e);
+        ctx.request_repaint();
+    }));
+}
+
+/// What the graphics card's error handler found since the map last looked.
+#[derive(Default)]
+pub(crate) struct GpuErrors {
+    /// It ran out of memory.
+    pub(crate) out_of_memory: std::sync::atomic::AtomicBool,
+    /// It reported another error (a bug: the map may be drawn wrong).
+    pub(crate) other: std::sync::atomic::AtomicBool,
+    /// Errors logged so far: after [`MAX_GPU_ERRORS_LOGGED`], no more, as one repeated each frame
+    /// would fill the log.
+    logged: std::sync::atomic::AtomicU32,
+}
+
+/// The most graphics card errors logged in a session.
+const MAX_GPU_ERRORS_LOGGED: u32 = 20;
+
+impl GpuErrors {
+    /// Notes `e`, and logs it while few have been: whether it was logged.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn note(&self, e: &egui_wgpu::wgpu::Error) -> bool {
+        use std::sync::atomic::Ordering;
+        let oom = matches!(e, egui_wgpu::wgpu::Error::OutOfMemory { .. });
+        if oom { &self.out_of_memory } else { &self.other }.store(true, Ordering::SeqCst);
+        let n = self.logged.fetch_add(1, Ordering::SeqCst);
+        if n < MAX_GPU_ERRORS_LOGGED {
+            log::error!("graphics card error: {e}");
+        }
+        if n + 1 == MAX_GPU_ERRORS_LOGGED {
+            log::error!("further graphics card errors are not logged");
+        }
+        n < MAX_GPU_ERRORS_LOGGED
+    }
+}
+
+/// Once the graphics card has run out of memory, the map is drawn on the CPU: the GPU map's
+/// pictures, tiles and targets are let go, and a notice says so and how to go back. Turning the
+/// GPU on again from the status bar is up to the user; running out again comes back here.
+/// Another error the card reports is said once a session, as it may leave the map drawn wrong.
+pub(crate) fn leave_gpu_if_out_of_memory(app: &mut RustGisApp) {
+    use std::sync::atomic::Ordering;
+    if app.map.gpu_errors.other.swap(false, Ordering::SeqCst) && !app.map.gpu_error_said {
+        app.map.gpu_error_said = true;
+        // (Clicking GPU helps only with the map on the GPU; otherwise it's egui's own drawing.)
+        let text = if app.map.gpu_enabled {
+            tl!(
+                "The graphics card reported an error, so the map may be drawn wrongly. Clicking GPU in the status bar draws it on the CPU instead."
+            )
+        } else {
+            tl!("The graphics card reported an error, so the window may be drawn wrongly.")
+        };
+        app.session.notify(text, true);
+    }
+    if !app.map.gpu_errors.out_of_memory.swap(false, Ordering::SeqCst) || !app.map.gpu_enabled {
+        return;
+    }
+    app.map.gpu_enabled = false;
+    app.map.gpu_renderer = None;
+    app.map.gpu_frame = None;
+    // (No live GPU scene is left to keep the tile key for.)
+    app.map.live_rev = None;
+    app.map.split_gpu = None;
+    for target in [&app.map.gpu_target, &app.map.gpu_target_split] {
+        *target.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    app.map.invalidate();
+    app.session.notify(
+        tl!(
+            "The graphics card ran out of memory, so the map is now drawn without it (CPU), which is slower. Click CPU in the status bar to try the graphics card again, with a smaller window or fewer layers."
+        ),
+        true,
+    );
+}
+
 /// Shows the active map workspace, discarding stale node gestures after map-tab changes and
 /// before rendering their overlays or consuming pointer releases.
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
+    leave_gpu_if_out_of_memory(app);
     // Read before the cache was cleared (a sign-out), a picture goes with it: checked on every
     // frame, whatever is shown (a view with no map frame, a catalog or a layout included).
     app.map.pictures.forget_if_cleared(rustgis_engine::render::rustgis_tiles::cache::clears());
@@ -891,6 +1019,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         && cam.pitch == 0.0
         && app.map.live_rev == Some(app.session.revision)
         && !reads_in_place(app.session.map())
+        && !casts_shadows(app.session.map())
     {
         key.tiles = 0;
     } else if fetches_tiles(app.session.map()) {
@@ -956,6 +1085,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // resize) is still drawn at once, so it shows without waiting. The browser has one thread: there
     // the worker draws it at once, as before.
     let flat_settle = cfg!(not(target_arch = "wasm32"))
+        && !app.map.inline_frames
         && !globe_view
         && cam.bearing == 0.0
         && cam.pitch == 0.0
@@ -1030,7 +1160,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         }
                     }
                     rustgis_engine::render::RenderOutput::Gpu(scene) => {
-                        if !show_gpu_frame(app, scene, &done.view, k, time) {
+                        if !show_gpu_frame(app, scene, uploaded(done.prepared), &done.view, k, time) {
                             // Device limits can decline a scene: compose the CPU fallback on
                             // the worker too, keeping oversized images off the UI thread.
                             app.map.tilt_settle.start(ui.ctx(), k, done.map, done.view);
@@ -1049,7 +1179,8 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 rustgis_engine::render::sync_tilted_view(app.session.map_mut(), &view);
             }
             let backend = if gpu_ok { rustgis_engine::render::Backend::GpuLive } else { rustgis_engine::render::Backend::Cpu };
-            app.map.tilt_settle.start_backend(ui.ctx(), key, app.session.map().clone(), view, backend);
+            let upload = gpu_upload(app, gpu_ok);
+            app.map.tilt_settle.start_prepared(ui.ctx(), key, app.session.map().clone(), view, backend, upload);
             // A worker the system refused wakes no frame: the next draws it here.
             if flat_settle && app.map.tilt_settle.failed(key) {
                 ui.ctx().request_repaint();
@@ -1097,6 +1228,50 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     }
     if globe_view && !moving && app.map.key.is_some_and(|k| k.draft) {
         ui.ctx().request_repaint();
+    }
+    // A frame drawn off the UI thread while the flat map moves (see `motion_off` below) is shown
+    // as it lands, while the map still moves: the camera has moved on since, so it is shifted and
+    // scaled like the frame it replaces. Once the map rests or changes it is stopped and dropped:
+    // the exact frame follows.
+    if flat_settle && interacting && !app.map.motion_dropped {
+        if let Some((k, done)) = app.map.motion_frame.take() {
+            app.session.map_mut().adopt_caches(&done.map);
+            if k.rev == key.rev
+                && k.size == key.size
+                && k.sources == key.sources
+                && done.archives.current([&done.map])
+                && let Some(r) = done.rendered
+            {
+                app.map.render_ms = done.ms;
+                app.map.motion_cost = full_cost(done.ms as f64, &done.view, (w, h), ppp);
+                match r {
+                    rustgis_engine::render::RenderOutput::Cpu(r) => {
+                        app.map.gpu_frame = None;
+                        show_frame(app, ui.ctx(), r, &done.view, (w, h), k, time, false);
+                    }
+                    rustgis_engine::render::RenderOutput::Gpu(scene) => {
+                        // The map came back (panned away and back) inside the scene on screen
+                        // while this one was drawn for where it had gone: the one that still
+                        // holds the view stays, rather than one with features left out of it.
+                        let keep = app.map.gpu_frame.as_ref().is_some_and(|f| !f.has_images && f.fits(&cam))
+                            && scene_covers(app.map.tex_camera, cam, w, h)
+                            && !scene_covers(done.view.camera, cam, w, h);
+                        // A scene over the device's limits: drawn on the CPU, on the worker too.
+                        if !keep && !show_gpu_frame(app, scene, uploaded(done.prepared), &done.view, k, time) {
+                            app.map.motion_frame.start(ui.ctx(), Key { draft: true, ..k }, done.map, done.view);
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some((_, done)) = app.map.motion_frame.take() {
+        app.session.map_mut().adopt_caches(&done.map);
+        app.map.motion_dropped = false;
+    } else if app.map.motion_frame.busy() {
+        app.map.motion_frame.cancel();
+        app.map.motion_dropped = true;
+    } else {
+        app.map.motion_dropped = false;
     }
     // GPU fast path: during pan/zoom (or a camera animation) with an all-GPU scene (no CPU
     // image runs — rasters and tiles don't re-project), only the camera changes, so rewrite
@@ -1151,13 +1326,25 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let r = tex_rect(app, cam, rect, false);
             let stretch = r.width() as f64 / app.map.tex_size.0.max(1.0);
             let full = app.map.motion_cost;
+            let since = time - app.map.last_render;
+            // Drawn on this thread (the browser, a tiled map, a worker refused), a frame stops the
+            // window for as long as it takes: see `inline_frame_due`.
+            let inline = !flat_settle;
             let (vw, vh, k) = if !r.expand(0.5).contains_rect(rect) {
-                // A gap is filled at once.
-                (w * GAP_SPAN, h * GAP_SPAN, motion_resolution(full, GAP_SPAN * GAP_SPAN))
+                // A gap is filled at once: off the UI thread, or by a quick frame on it.
+                let area = GAP_SPAN * GAP_SPAN;
+                let k = motion_resolution(full, area);
+                if inline && !inline_frame_due(full * area * k * k, since) {
+                    return None;
+                }
+                (w * GAP_SPAN, h * GAP_SPAN, k)
             } else {
                 let k = motion_resolution(full, 1.0);
                 // Tile pictures still to draw are drawn as a stretched frame is sharpened.
-                if (stretch <= MOTION_STRETCH && !app.map.filling) || time - app.map.last_render < motion_gap(full * k * k) {
+                if (stretch <= MOTION_STRETCH && !app.map.filling)
+                    || since < motion_gap(full * k * k)
+                    || (inline && full * k * k > MOTION_HOLD_MS)
+                {
                     return None;
                 }
                 (w, h, k)
@@ -1166,8 +1353,47 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         })
         .flatten();
     let (vw, vh, vppp) = motion.unwrap_or((w, h, render_ppp));
+    // A frame a flat, north-up map needs while it moves is drawn off the UI thread too (#1750),
+    // like its exact frame once it rests (`flat_settle`): a gap to fill (zooming out, panning past
+    // the frame's edge), a stretched frame to sharpen (zooming in), or a GPU scene the view has
+    // outgrown (zooming out past the margin its meshes were collected for). Drawn here, each one
+    // stopped the window for as long as it took: zooming out of a detailed layer, which needs one
+    // every few steps, stalled again and again while zooming in and panning stayed smooth.
+    // Meanwhile the frame on screen keeps moving with the camera (the map's background shows in
+    // a gap), and the new one is swapped in when it lands. One frame is drawn at a time; a frame
+    // the worker can't draw (the system refused its thread, the renderer panicked) and a GPU
+    // scene that can't follow the camera are drawn here, as before. The browser has one thread.
+    let gpu_vector = gpu_ok && !texture_motion;
+    let mut motion_off = false;
     if stale
         && !fast_engaged
+        && flat_settle
+        && interacting
+        && !turning
+        && !hold
+        && !app.map.motion_dropped
+        && (motion.is_some() || gpu_vector)
+        // The scene on screen follows the camera while its successor is drawn.
+        && (!gpu_vector || (cam_only && app.map.gpu_frame.as_ref().is_some_and(|f| !f.has_images && f.fits(&cam))))
+    {
+        let job = Key { draft: motion.is_some(), ..key };
+        if !app.map.motion_frame.busy() {
+            let view = View { width: vw, height: vh, pixels_per_point: vppp as f64, camera: cam, sky: true };
+            let backend = if gpu_ok { rustgis_engine::render::Backend::GpuLive } else { rustgis_engine::render::Backend::Cpu };
+            let upload = gpu_upload(app, gpu_ok);
+            app.map.motion_frame.start_prepared(ui.ctx(), job, app.session.map().clone(), view, backend, upload);
+        }
+        motion_off = !app.map.motion_frame.failed(job);
+        if motion_off
+            && gpu_vector
+            && let (Some(gf), Some(rs)) = (&app.map.gpu_frame, &app.map.render_state)
+        {
+            gf.set_camera(&rs.queue, &cam);
+        }
+    }
+    if stale
+        && !fast_engaged
+        && !motion_off
         && !settling
         && !hold
         && !draped
@@ -1217,7 +1443,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             };
             if let Some(rustgis_engine::render::RenderOutput::Gpu(scene)) = out {
                 let key = Key { draft: key.draft || motion.is_some() || lacks.is_some(), ..key };
-                rendered_gpu = show_gpu_frame(app, scene, &view, key, time);
+                rendered_gpu = show_gpu_frame(app, scene, None, &view, key, time);
             }
         }
         // The CPU path, unchanged — also the fallback when the GPU backend declines a frame
@@ -1413,12 +1639,20 @@ fn drape_state(app: &RustGisApp) -> (crate::globe_drape::DrapeKey, u64) {
     (key, tiles)
 }
 
-/// Whether the map draws from web tiles (its tile layers, or elevation tiles for its terrain):
-/// tiles arriving draw it again.
+/// Whether the map draws from web tiles (its tile layers, or elevation tiles for its terrain), or
+/// draws cast shadows worked out off the frame: tiles or shadows arriving (both move the tile
+/// cache's generation) draw it again.
 fn fetches_tiles(m: &rustgis_engine::map::Map) -> bool {
     !m.tiles.is_empty()
         || m.view.terrain.as_ref().is_some_and(|t| matches!(t.source, rustgis_engine::map::view::TerrainSource::Tiles { .. }))
         || reads_in_place(m)
+        || casts_shadows(m)
+}
+
+/// Whether a visible raster layer of the map is drawn with cast shadows, which land after the
+/// frame that asks for them (see `RasterLayer::cast_shadows`).
+fn casts_shadows(m: &rustgis_engine::map::Map) -> bool {
+    m.layers.iter().any(|l| l.visible && l.raster.as_ref().is_some_and(|r| r.casts_shadows()))
 }
 
 /// Whether the map has raster layers read in place: the part in view arrives a tile at a time,
@@ -1427,21 +1661,69 @@ fn reads_in_place(m: &rustgis_engine::map::Map) -> bool {
     m.layers.iter().any(|l| l.raster.as_ref().is_some_and(|r| r.in_place))
 }
 
-/// Uploads a composed GPU scene, whether built in place or by the frame worker.
-fn show_gpu_frame(app: &mut RustGisApp, scene: rustgis_engine::render::gpu_scene::GpuScene, view: &View, key: Key, time: f64) -> bool {
+/// The GPU scene buffers a worker uploaded for its frame (see [`gpu_upload`]), if it did.
+fn uploaded(prepared: Option<crate::tilt_settle::Prepared>) -> Option<crate::mapgpu::SceneBuffers> {
+    prepared.and_then(|p| p.downcast::<crate::mapgpu::SceneBuffers>().ok()).map(|b| *b)
+}
+
+/// What uploads a finished frame's GPU scene on the worker that drew it (`None` for a CPU frame,
+/// a scene over the device's limits, or a map not drawn on the GPU: `gpu`). Uploading a detailed
+/// scene's meshes takes tens of milliseconds: on the UI thread that stopped the window each time
+/// a frame landed (#1750).
+fn gpu_upload(
+    app: &mut RustGisApp,
+    gpu: bool,
+) -> impl FnOnce(&crate::tilt_settle::Done) -> Option<crate::tilt_settle::Prepared> + Send + 'static {
+    let gpu = app.map.render_state.as_ref().filter(|_| gpu).map(|rs| {
+        let r = app.map.gpu_renderer.get_or_insert_with(|| std::sync::Arc::new(crate::mapgpu::GpuMapRenderer::new(rs)));
+        (rs.device.clone(), rs.queue.clone(), r.clone())
+    });
+    move |done| {
+        let (device, queue, r) = gpu?;
+        let Some(rustgis_engine::render::RenderOutput::Gpu(scene)) = &done.rendered else { return None };
+        let v = &done.view;
+        let bufs =
+            crate::mapgpu::SceneBuffers::from_scene(&device, &queue, &r, scene, v.camera, [v.width, v.height], v.pixels_per_point as f32)?;
+        Some(Box::new(bufs) as crate::tilt_settle::Prepared)
+    }
+}
+
+/// Shows a GPU scene drawn for `view` as the map, with its labels, credits and tile errors:
+/// from `prepared`, its buffers already uploaded (see [`gpu_upload`]), else uploading them here.
+/// False when the scene is over the device's limits, or the map has left the GPU: the caller
+/// draws the frame on the CPU.
+fn show_gpu_frame(
+    app: &mut RustGisApp,
+    scene: rustgis_engine::render::gpu_scene::GpuScene,
+    prepared: Option<crate::mapgpu::SceneBuffers>,
+    view: &View,
+    key: Key,
+    time: f64,
+) -> bool {
+    // A scene a worker finished after the map left the graphics card (it ran out of memory,
+    // #1777) isn't shown: the caller draws it on the CPU, and no GPU renderer comes back.
+    if !app.map.gpu_enabled {
+        return false;
+    }
     let Some(rs) = &app.map.render_state else { return false };
     let r = app.map.gpu_renderer.get_or_insert_with(|| std::sync::Arc::new(crate::mapgpu::GpuMapRenderer::new(rs)));
     let cam = view.camera;
-    let Some(bufs) = crate::mapgpu::SceneBuffers::from_scene(
-        &rs.device,
-        &rs.queue,
-        r,
-        &scene,
-        cam,
-        [view.width, view.height],
-        view.pixels_per_point as f32,
-    ) else {
-        return false;
+    let bufs = match prepared {
+        Some(bufs) => bufs,
+        None => {
+            let Some(bufs) = crate::mapgpu::SceneBuffers::from_scene(
+                &rs.device,
+                &rs.queue,
+                r,
+                &scene,
+                cam,
+                [view.width, view.height],
+                view.pixels_per_point as f32,
+            ) else {
+                return false;
+            };
+            bufs
+        }
     };
     app.map.live_rev = bufs.tiles_live.then_some(key.rev);
     app.map.gpu_frame = Some(std::sync::Arc::new(bufs));
@@ -1575,6 +1857,23 @@ fn full_cost(ms: f64, view: &View, (w, h): (f64, f64), ppp: f32) -> f64 {
 fn motion_gap(ms: f64) -> f64 {
     let s = ms.min(300.0) / 1000.0;
     (if ms <= 60.0 { s * 1.5 } else { s * 3.0 }).max(1.0 / 30.0)
+}
+
+/// How long (ms) a frame may take to be drawn on the UI thread while the map moves: a longer one
+/// waits until the map rests, as a freeze of a quarter of a second mid-gesture is worse than the
+/// map's background showing round the last frame meanwhile.
+const MOTION_HOLD_MS: f64 = 250.0;
+
+/// Whether a frame that fills a gap (zooming out, panning past the last frame's edge) is drawn
+/// now on the UI thread, `since` seconds after the last frame, when it would take `ms`: a quick
+/// one at once; a slower one spaced out by how long it takes (see `motion_gap`), as frames that
+/// sharpen a stretched picture are; one over `MOTION_HOLD_MS` not until the map rests. Filled at
+/// once whatever it took, a detailed layer's gaps stopped the window every few steps of zooming
+/// out where frames aren't drawn off the UI thread (the browser, #1750), while zooming in, whose
+/// frames were spaced, stayed smooth.
+fn inline_frame_due(ms: f64, since: f64) -> bool {
+    // An unmeasured cost (not a number) is drawn, as `motion_resolution` draws it sharp.
+    ms.is_nan() || ms <= MOTION_BUDGET_MS || (ms <= MOTION_HOLD_MS && since >= motion_gap(ms))
 }
 
 /// Draws with `f`, the tile pictures the map lacks drawn at the pace of a map `moving` or not
@@ -2893,12 +3192,12 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
                         } else if !is_found(&v) {
                             // Only WMS layers being asked: the click found nothing yet, so it clears
                             // the selection as an empty click does.
-                            let _ = app.session.run("select.clear", &Value::Null);
+                            clear_selection_quietly(app);
                         }
                         Some(Popup::new(v, c, app.session.project.active_map, app.session.opened))
                     }
                     _ => {
-                        let _ = app.session.run("select.clear", &Value::Null);
+                        clear_selection_quietly(app);
                         None
                     }
                 };
@@ -3077,6 +3376,14 @@ fn with_template(app: &RustGisApp, mut p: Value) -> Value {
 
 /// Adds a graphic drawn with a tool, then returns to Explore unless the tool is kept.
 pub fn finish_graphic(app: &mut RustGisApp, shape: &str, pts: Vec<Coord>) {
+    // While the STAC search area is being drawn, the shape goes to it, not to a graphics layer.
+    if let Some(taken) = crate::stacui::take_drawn(app, shape, &pts) {
+        app.map.cancel_sketch();
+        if taken && !app.session.keep_tool {
+            app.session.tool = Tool::Explore;
+        }
+        return;
+    }
     let coords: Vec<[f64; 2]> = pts.iter().map(|c| [c.x, c.y]).collect();
     let ok = app.run("graphics.add", json!({"shape": shape, "points": coords})).is_ok();
     app.map.cancel_sketch();
@@ -3106,6 +3413,8 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         p.rect_filled(r, 0.0, accent.gamma_multiply(0.12));
         p.rect_stroke(r, 0.0, Stroke::new(1.5, accent), egui::StrokeKind::Middle);
     }
+    // The STAC search area, while that pane is open.
+    crate::stacui::paint_area(app, p, rect, accent);
     // Vertices of the selected features while editing.
     let editing = &app.session.map().editing;
     if editing.settings.enabled
@@ -4370,7 +4679,8 @@ fn shown_layers(session: &rustgis_engine::Session) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     let project = &session.project;
     let map = project.map();
-    (&session.path, &project.name, project.active_map, &map.name, map.basemap, map.graticule).hash(&mut h);
+    (&session.path, &project.name, project.active_map, &map.name, map.basemap, map.graticule, map.graticule_type, &map.graticule_crs)
+        .hash(&mut h);
     for l in &map.layers {
         (l.id, l.visible).hash(&mut h);
     }
@@ -4693,9 +5003,104 @@ mod picture_tests {
     }
 }
 
+/// An empty click clears the selection when there is one. With nothing selected it does nothing:
+/// `select.clear` refuses then ("nothing is selected"), and a click is not a request to be told so.
+fn clear_selection_quietly(app: &mut RustGisApp) {
+    if app.session.map().selection_count() > 0 {
+        let _ = app.session.run("select.clear", &Value::Null);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The graphics card running out of memory doesn't close the app (#1777): it's noted, and
+    /// the map then leaves the GPU for the CPU with a notice, its GPU resources let go. Once:
+    /// turned on again, running out again falls back again. A map on the CPU only forgets it.
+    #[test]
+    fn running_out_of_gpu_memory_draws_the_map_on_the_cpu() {
+        use egui_wgpu::wgpu::Error;
+        use std::sync::atomic::Ordering;
+        let source = || -> egui_wgpu::wgpu::ErrorSource { "no room".into() };
+        let invalid = || Error::Validation { source: source(), description: "texture is invalid".into() };
+        let errors = GpuErrors::default();
+        assert!(errors.note(&invalid()));
+        assert!(errors.other.load(Ordering::SeqCst) && !errors.out_of_memory.load(Ordering::SeqCst));
+        assert!(errors.note(&Error::OutOfMemory { source: source() }));
+        assert!(errors.out_of_memory.load(Ordering::SeqCst));
+        // A flood is logged only so far: noting goes on.
+        let logged = (0..100).filter(|_| errors.note(&invalid())).count();
+        assert_eq!(logged, MAX_GPU_ERRORS_LOGGED as usize - 2, "the first two above were logged");
+        assert_eq!(errors.logged.load(Ordering::SeqCst), 102);
+        let mut app = RustGisApp::with_sample();
+        app.map.gpu_enabled = true;
+        let before = app.session.notices.len();
+        leave_gpu_if_out_of_memory(&mut app);
+        assert!(app.map.gpu_enabled, "nothing noted yet");
+        let ran_out = |app: &RustGisApp| app.map.gpu_errors.note(&Error::OutOfMemory { source: source() });
+        ran_out(&app);
+        leave_gpu_if_out_of_memory(&mut app);
+        assert!(!app.map.gpu_enabled && app.map.gpu_renderer.is_none() && app.map.gpu_frame.is_none() && app.map.split_gpu.is_none());
+        assert_eq!(app.session.notices.len(), before + 1);
+        assert!(format!("{:?}", app.session.notices.last().unwrap()).contains("ran out of memory"));
+        // Said once; on the CPU already, running out (egui's own textures) is only forgotten.
+        leave_gpu_if_out_of_memory(&mut app);
+        ran_out(&app);
+        leave_gpu_if_out_of_memory(&mut app);
+        assert_eq!(app.session.notices.len(), before + 1);
+        assert!(!app.map.gpu_errors.out_of_memory.load(Ordering::SeqCst));
+        // Turned on again, running out again falls back again.
+        app.run("ui.map.gpu", serde_json::json!({"on": true, "remember": false})).unwrap();
+        assert!(app.map.gpu_enabled);
+        ran_out(&app);
+        leave_gpu_if_out_of_memory(&mut app);
+        assert!(!app.map.gpu_enabled);
+        assert_eq!(app.session.notices.len(), before + 2);
+        // Another error is said once a session, the map left as it is.
+        app.map.gpu_enabled = true;
+        for _ in 0..2 {
+            app.map.gpu_errors.note(&invalid());
+            leave_gpu_if_out_of_memory(&mut app);
+        }
+        assert!(app.map.gpu_enabled);
+        assert_eq!(app.session.notices.len(), before + 3);
+        assert!(format!("{:?}", app.session.notices.last().unwrap()).contains("Clicking GPU"));
+        // With the map on the CPU, the notice doesn't point at the GPU switch.
+        let mut cpu = RustGisApp::with_sample();
+        let before = cpu.session.notices.len();
+        cpu.map.gpu_errors.note(&invalid());
+        leave_gpu_if_out_of_memory(&mut cpu);
+        assert_eq!(cpu.session.notices.len(), before + 1);
+        let said = format!("{:?}", cpu.session.notices.last().unwrap());
+        assert!(said.contains("window may be drawn wrongly") && !said.contains("Clicking GPU"), "{said}");
+    }
+
+    /// A map whose relief casts shadows is drawn again as the tile cache's generation moves, which
+    /// the shadows' landing moves, though it fetches no tiles: a map of a DEM alone gets its
+    /// shadows without being moved. Without shadows (or hidden) it isn't.
+    #[test]
+    fn a_relief_casting_shadows_is_drawn_again_as_they_land() {
+        use rustgis_engine::data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        use rustgis_engine::map::{Map, RasterLayer, RasterRenderer};
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 0.0, pixel_width: 30.0, pixel_height: -30.0 };
+        let r = Raster::new("dem", 4, 4, vec![vec![0.0; 16]], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
+        let mut map = Map::new("Relief");
+        let id = map.add_raster("dem", RasterLayer::from_path(r, "dem.tif"));
+        let relief =
+            |shadow| RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 315.0, altitude: 30.0, z_factor: 1.0, shadow, sky: 0.0 };
+        let set = |map: &mut Map, shadow: f64, visible: bool| {
+            let l = map.layer_mut(id).unwrap();
+            l.visible = visible;
+            l.raster.as_mut().unwrap().style.renderer = relief(shadow);
+        };
+        set(&mut map, 0.0, true);
+        assert!(!fetches_tiles(&map));
+        set(&mut map, 0.8, true);
+        assert!(fetches_tiles(&map));
+        set(&mut map, 0.8, false);
+        assert!(!fetches_tiles(&map));
+    }
 
     /// Natural Earth is credited only where its world outline is drawn: not on a blank basemap or
     /// another body, whose sources are still credited.
@@ -5034,6 +5439,44 @@ mod tests {
         assert_eq!(selection_rows(&h), vec![1]);
     }
 
+    /// An Explore click on empty map clears a selection, and with nothing selected gives no
+    /// "nothing is selected" error notice.
+    #[test]
+    fn explore_click_on_empty_map_clears_without_a_notice() {
+        let mut h = selection_harness();
+        h.state_mut().run("tool.set", json!({"tool": "explore"})).unwrap();
+        let mark = h.state().session.notice_mark();
+        selection_click(&mut h, [3.5, 1.5]);
+        assert!(selection_rows(&h).is_empty());
+        h.state_mut().run("select.rows", json!({"layer": "Points", "rows": [1]})).unwrap();
+        // A second empty click, elsewhere, with a row selected: it clears the selection.
+        selection_click(&mut h, [1.0, 3.5]);
+        assert!(selection_rows(&h).is_empty(), "an empty click clears the selection");
+        let errors: Vec<_> = h.state().session.notices_since(mark).iter().filter(|n| n.error).map(|n| n.text.clone()).collect();
+        assert!(errors.is_empty(), "no error notice: {errors:?}");
+    }
+
+    /// An Explore click on empty map that only asks a WMS layer clears a selection too, and with
+    /// nothing selected gives no "nothing is selected" error notice.
+    #[test]
+    fn explore_click_asking_only_wms_clears_without_a_notice() {
+        let mut h = selection_harness();
+        let url = "https://wms.example.org/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=over&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng";
+        h.state_mut().run("map.addTiles", json!({"url": url, "name": "Over", "overlay": true})).unwrap();
+        h.state_mut().run("map.popupMode", json!({"mode": "visible"})).unwrap();
+        h.state_mut().run("tool.set", json!({"tool": "explore"})).unwrap();
+        let mark = h.state().session.notice_mark();
+        selection_click(&mut h, [3.5, 1.5]);
+        assert!(h.state().map.popup.is_some(), "the click asks the WMS layer");
+        assert!(selection_rows(&h).is_empty());
+        h.state_mut().run("select.rows", json!({"layer": "Points", "rows": [1]})).unwrap();
+        selection_click(&mut h, [1.0, 3.5]);
+        assert!(selection_rows(&h).is_empty(), "the click clears the selection");
+        // The made-up WMS server's own failure may land too: only the refusal is checked.
+        let refused = h.state().session.notices_since(mark).iter().any(|n| n.error && n.text.contains("nothing is selected"));
+        assert!(!refused, "no \"nothing is selected\" notice");
+    }
+
     #[test]
     fn selection_tools_polygon_survives_camera_and_viewport_changes() {
         let mut h = selection_harness();
@@ -5272,6 +5715,112 @@ mod tests {
         assert_eq!(h.state().map.key.map(|k| k.rev), Some(before.rev));
     }
 
+    /// #1750: zooming a flat map out uncovers the edges of its last frame, and the frame that
+    /// fills them was drawn on the UI thread, stopping the window every few steps of the zoom
+    /// (a detailed layer takes tens of milliseconds a frame). It is drawn on a worker: the last
+    /// frame stays, shrunk, and the new one is swapped in mid-motion when it lands.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_moving_flat_maps_gap_frame_is_drawn_off_the_ui_thread() {
+        let _turn = crate::fetching::turn();
+        let app = RustGisApp::with_sample();
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(900.0, 550.0)).with_step_dt(0.000_05).with_max_steps(10_000).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+        let exact = |h: &mut egui_kittest::Harness<'_, RustGisApp>, what: &str| {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                h.step();
+                let st = h.state();
+                let res = (st.session.map().camera.res * 1000.0) as i64;
+                if st.map.key.is_some_and(|k| k.rev == st.session.revision && !k.draft && k.cam.2 == res) && !st.map.drawing() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < end, "{what}");
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        exact(&mut h, "the first frame did not arrive");
+        let before = h.state().map.key.expect("a frame");
+        // The wheel zooming out, mid-gesture (the camera moved as the wheel moves it, not by a
+        // command, which changes the map's revision): the frame no longer covers the view.
+        h.state_mut().map.last_interaction = f64::MAX;
+        h.state_mut().session.map_mut().camera.res *= 2.0;
+        let res = h.state().session.map().camera.res;
+        h.step();
+        assert!(h.state().map.motion_frame.busy(), "the gap's frame is drawn on the worker");
+        assert_eq!(h.state().map.key, Some(before), "the last frame stays on screen meanwhile");
+        // It lands while the map still moves, drawn for the zoomed-out camera.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while h.state().map.key == Some(before) {
+            assert!(std::time::Instant::now() < end, "the gap's frame never landed");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            h.step();
+        }
+        let st = h.state();
+        assert!(st.map.key.is_some_and(|k| k.draft && k.rev == before.rev), "a frame drawn mid-motion stands in for the exact one");
+        assert_eq!(st.map.tex_camera.res, res, "it was drawn for the camera the map had zoomed out to");
+        assert!(st.map.tex_size.0 > st.session.view_size.0 * 1.2, "and over more than the view, for the next steps");
+        // One still being drawn when the map comes to rest is stopped and dropped; the exact frame
+        // follows.
+        h.state_mut().session.map_mut().camera.res *= 2.0;
+        h.step();
+        assert!(h.state().map.motion_frame.busy(), "the next gap's frame is drawn on the worker");
+        h.state_mut().map.last_interaction = -10.0;
+        exact(&mut h, "the frame of the resting map did not arrive");
+        assert!(!h.state().map.motion_frame.busy() && !h.state().map.motion_dropped);
+    }
+
+    /// #1750: where frames are drawn on the UI thread (the browser), a slow map's gap frame
+    /// isn't drawn mid-motion at all: zooming out of a detailed layer froze the window for each
+    /// one, every few steps. The last frame stays, shrunk, until the map rests; a quick map's gap
+    /// is still filled at once.
+    #[test]
+    fn a_slow_maps_gap_frame_waits_for_the_map_to_rest_on_the_ui_thread() {
+        let _turn = crate::fetching::turn();
+        let mut app = RustGisApp::with_sample();
+        app.map.inline_frames = true;
+        let mut h =
+            egui_kittest::Harness::builder().with_size(vec2(900.0, 550.0)).with_step_dt(0.000_05).with_max_steps(10_000).build_ui_state(
+                |ui, app: &mut RustGisApp| {
+                    let ctx = ui.ctx().clone();
+                    app.logic(&ctx);
+                    app.ui(ui);
+                },
+                app,
+            );
+        for _ in 0..5 {
+            h.step();
+        }
+        let before = h.state().map.key.expect("a frame");
+        assert!(!before.draft && !h.state().map.drawing(), "the first frame is drawn at once");
+        // The wheel zooming out, mid-gesture, on a map whose frames take long.
+        h.state_mut().map.last_interaction = f64::MAX;
+        h.state_mut().map.motion_cost = 400.0;
+        h.state_mut().session.map_mut().camera.res *= 2.0;
+        for _ in 0..5 {
+            h.step();
+            assert_eq!(h.state().map.key, Some(before), "a slow gap frame froze the window mid-motion");
+        }
+        assert!(!h.state().map.drawing(), "nothing is drawn off the UI thread here");
+        // A quick map's gap is filled at once, over more than the view.
+        h.state_mut().map.motion_cost = 5.0;
+        h.step();
+        let st = h.state();
+        assert!(st.map.key.is_some_and(|k| k.draft && k != before), "a quick gap frame is drawn at once");
+        assert!(st.map.tex_size.0 > st.session.view_size.0 * 1.2);
+        // At rest the exact frame is drawn.
+        h.state_mut().map.last_interaction = -10.0;
+        h.step();
+        assert!(h.state().map.key.is_some_and(|k| !k.draft), "the exact frame of the resting map");
+    }
+
     /// #1051: changing a layer's transparency over a tiled basemap kept the exact frame on
     /// screen until the next one arrived; it showed a coarse preview of the whole map, basemap
     /// included, so every step of a slider drag made the map flicker.
@@ -5462,6 +6011,11 @@ mod tests {
         assert_eq!(motion_resolution(10_000.0, 4.0), 0.5, "never below half");
         assert_eq!(motion_resolution(f64::NAN, 1.0), 1.0);
         assert_eq!(motion_resolution(f64::INFINITY, 1.0), 0.5);
+        // On the UI thread a quick gap frame is drawn at once, a slower one spaced out by how
+        // long it takes, and one that would freeze the window not until the map rests.
+        assert!(inline_frame_due(0.0, 0.0) && inline_frame_due(20.0, 0.0) && inline_frame_due(f64::NAN, 0.0));
+        assert!(!inline_frame_due(100.0, 0.1) && inline_frame_due(100.0, 0.31));
+        assert!(!inline_frame_due(400.0, 60.0) && !inline_frame_due(f64::INFINITY, 60.0));
         // A gap frame over 1.5 times the view at full resolution costs 2.25 views.
         let gap = View { width: 1200.0, height: 900.0, pixels_per_point: 2.0, camera: Camera::world(), sky: true };
         assert!((full_cost(45.0, &gap, (800.0, 600.0), 2.0) - 20.0).abs() < 1e-9);

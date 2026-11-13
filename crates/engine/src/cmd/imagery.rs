@@ -24,9 +24,17 @@ pub struct Workspace {
     /// "ortho" (an orthomosaic of images) or "reality" (a surface model from elevation rasters).
     pub kind: String,
     pub images: Vec<String>,
-    /// Output cell size in degrees (the finest image's when unset).
+    /// Output cell size in degrees (the finest image's when unset), for a mosaic made in degrees.
     #[serde(default)]
     pub cell_size: Option<f64>,
+    /// The coordinate system the mosaic is made in: a projected one, or longitude/latitude for
+    /// degrees. `None`: the projected system all its images are in, else degrees. An older
+    /// version reads only `cell_size` and makes the mosaic in degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crs: Option<Crs>,
+    /// The output cell size in `crs`'s units when it is projected (the finest image's when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_cell_size: Option<f64>,
     /// Where images overlap: "first" (the first image wins) or "mean".
     #[serde(default = "first")]
     pub method: String,
@@ -66,7 +74,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer": raster, "index": "ndvi"|"ndwi"|"savi"|"nbr"|"ndbi"|"evi", "red"?, "green"?, "blue"?, "nir"?, "swir"?: band numbers, "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
         C::new("raster.process", "Process", "Imagery › Imagery Tools", process).inputs(process_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"layer": raster, "operation": "clip"|"resample", "extent"?: [minLon, minLat, maxLon, maxLat] (clip; the view when omitted), "polygon"?: polygon layer (clip to its selected or all polygons; cells outside become no-data), "selectedOnly"?: bool (clip to selected polygons when true, all when false), "factor"?: n (resample: n×n pixels become one), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
+            .params(r#"{"layer": raster, "operation": "clip"|"resample", "extent"?: [minLon, minLat, maxLon, maxLat] (clip; the view when omitted), "polygon"?: polygon layer (clip to its selected or all polygons; cells outside become no-data, or see-through in a raster with alpha or a three-band colour one without no-data), "selectedOnly"?: bool (clip to selected polygons when true, all when false), "factor"?: n (resample: n×n pixels become one), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
         C::new("raster.mosaic", "Mosaic Rasters", "Imagery › Imagery Tools", raster_mosaic).inputs(mosaic_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"inputs": [raster layer or file path, …] (two or more, in one coordinate system and cell size; where they overlap the first wins), "name"?: output, "path"?: GeoTIFF to write the mosaic to}"#,
         ),
@@ -85,20 +93,32 @@ pub fn commands() -> Vec<C> {
         .view()
         .params(r#"{"clear"?: bool}"#),
         C::new("imagery.workspace", "New Workspace", "Imagery › Ortho Mapping", new_workspace).inputs(workspace_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"kind": "ortho"|"reality", "name"?: string, "images": [raster layers], "cellSize"?: degrees, "method"?: "first"|"mean"}"#,
+            r#"{"kind": "ortho"|"reality", "name"?: string, "images": [raster layers], "crs"?: projected coordinate system ("EPSG:32616") to make the mosaic in or "EPSG:4326" for degrees (default the projected system all the images are in, else degrees), "cellSize"?: in the crs's units or degrees without a crs (default the finest image's), "method"?: "first"|"mean"}"#,
         ),
         C::new("imagery.workspaceOptions", "Workspace Options", "Imagery › Ortho Mapping", |s, p| {
             let n = ps(p, "name").ok_or("name is required")?;
-            let w = s.project.workspaces.iter_mut().find(|w| w.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no workspace '{n}'"))?;
-            if p.get("cellSize").is_some() {
-                w.cell_size = cell_size(p)?;
-            }
+            let (at, mut w) = s
+                .project
+                .workspaces
+                .iter()
+                .enumerate()
+                .find(|(_, w)| w.name.eq_ignore_ascii_case(n))
+                .map(|(at, w)| (at, w.clone()))
+                .ok_or_else(|| format!("no workspace '{n}'"))?;
             if ps(p, "method").is_some() {
                 w.method = method(p, "first")?;
             }
-            serde_json::to_value(&*w).map_err(|e| e.to_string())
+            let note = set_grid(p, &mut w)?;
+            let v = serde_json::to_value(&w).map_err(|e| e.to_string())?;
+            if let Some(note) = note {
+                s.notify(format!("{}: its coordinate system: {note}", w.name), false);
+            }
+            if let Some(slot) = s.project.workspaces.get_mut(at) {
+                *slot = w;
+            }
+            Ok(v)
         }).roles(&[]).effects(crate::policy::Effects::NONE)
-        .params(r#"{"name": workspace, "cellSize"?: degrees|null, "method"?: "first"|"mean"}"#),
+        .params(r#"{"name": workspace, "crs"?: projected coordinate system ("EPSG:32616") or "EPSG:4326" for degrees|null (none: the images' projected system, else degrees), "cellSize"?: in the crs's units or degrees without a crs|null, "method"?: "first"|"mean"}"#),
         C::new("imagery.mosaic", "Build Mosaic", "Imagery › Ortho Mapping", mosaic).inputs(workspace_mosaic_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"name": workspace, "ran"?: (internal: a raster the app has worked out)}"#),
         C::new("imagery.mesh", "Export Mesh", "Imagery › Reality Mapping", mesh).inputs(raster_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
@@ -482,21 +502,33 @@ fn rasterize(s: &mut Session, p: &Value) -> CmdResult {
         };
         burns.push((parts, v));
     }
-    // A text field's values become codes 1 to n, in sorted order.
-    let text = field.is_some_and(|(_, ty)| ty == FieldType::Text);
-    let classes: Vec<String> = if text {
-        let set: std::collections::BTreeSet<String> = burns.iter().filter_map(|(_, v)| text_of(v)).collect();
-        set.into_iter().collect()
-    } else {
-        Vec::new()
-    };
+    // A text or date field's values become codes 1 to n, in sorted order: text by its text, dates
+    // and date-times by instant (one moment at two offsets is one class, labelled as first seen).
+    let text = field.is_some_and(|(_, ty)| ty == FieldType::Text || ty.is_temporal());
+    let temporal = field.is_some_and(|(_, ty)| ty.is_temporal());
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    enum ClassKey {
+        Instant(i64),
+        Text(String),
+    }
+    let key = |v: &rustgis_data::Value| if temporal { v.temporal_key().map(ClassKey::Instant) } else { text_of(v).map(ClassKey::Text) };
+    let mut labels = std::collections::BTreeMap::new();
+    if text {
+        for (_, v) in &burns {
+            if let (Some(k), Some(label)) = (key(v), text_of(v)) {
+                labels.entry(k).or_insert(label);
+            }
+        }
+    }
+    let keys: Vec<ClassKey> = labels.keys().cloned().collect();
+    let classes: Vec<String> = labels.into_values().collect();
     // Whole numbers: codes, one value, or a field that isn't a floating-point one.
     let whole_field = field.is_none_or(|(_, ty)| ty != FieldType::Double);
     let what = field.and_then(|(i, _)| ds.fields.get(i)).map_or("value", |f| f.name.as_str()).to_string();
     let mut shapes = Vec::with_capacity(burns.len());
     let mut rounded = 0;
     for (parts, v) in burns {
-        let x = if text { text_of(&v).and_then(|t| classes.binary_search(&t).ok()).map(|i| i as f64 + 1.0) } else { v.as_f64() };
+        let x = if text { key(&v).and_then(|k| keys.binary_search(&k).ok()).map(|i| i as f64 + 1.0) } else { v.as_f64() };
         let Some(x) = x else {
             no_value += 1;
             continue;
@@ -611,6 +643,7 @@ fn text_of(v: &rustgis_data::Value) -> Option<String> {
         rustgis_data::Value::Int(i) => i.to_string(),
         rustgis_data::Value::Float(f) => f.to_string(),
         rustgis_data::Value::Bool(b) => b.to_string(),
+        rustgis_data::Value::Date(_) | rustgis_data::Value::DateTime(_) => v.to_string(),
     };
     (!t.trim().is_empty()).then_some(t)
 }
@@ -851,6 +884,19 @@ pub(crate) fn change_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
     Ok(Box::new(move || {
         let av = &a.bands.get(band).ok_or("no such band")?.data;
         let bv = rasterops::resample_to(&bfr, band, &a)?;
+        // A cell either raster draws see-through has no colour to compare (#1810): the first's by
+        // its alpha band, the second's by its alpha band resampled onto the first's grid as its
+        // band is (a cell outside it, or of no alpha value, is see-through).
+        let a_hidden = a.see_through_cells(band);
+        let b_alpha = match bfr.color.alpha(bfr.band_count()) {
+            Some((alpha, colour)) if colour.contains(&band) => Some(rasterops::resample_to(&bfr, alpha, &a)?),
+            _ => None,
+        };
+        let b_opaque = raster::alpha_max(&bfr.data_type);
+        let hidden = |i: usize| {
+            a_hidden.as_ref().is_some_and(|h| h(i))
+                || b_alpha.as_ref().is_some_and(|al| al.get(i).is_none_or(|&v| raster::see_through(v, bfr.is_valid(v), b_opaque)))
+        };
         let n = a.width as usize * a.height as usize;
         let out = rasterops::per_index(
             n,
@@ -859,7 +905,7 @@ pub(crate) fn change_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
             || (),
             |_, i| {
                 let (Some(x), Some(y)) = (av.get(i).copied(), bv.get(i).copied()) else { return NODATA };
-                if !a.is_valid(x) || y == NODATA {
+                if !a.is_valid(x) || y == NODATA || hidden(i) {
                     return NODATA;
                 }
                 let v = match method.as_str() {
@@ -1129,7 +1175,8 @@ pub(crate) fn index_work(s: &Session, p: &Value) -> Result<super::workflows::Wor
 ///     even-odd rule within each polygon. Where multiple polygons overlap, their coverage is combined
 ///     (union: any cell falling inside at least one polygon is retained).
 ///   - The raster is cropped to the tight bounding box of valid selected polygons, and cells outside the
-///     polygons receive NoData.
+///     polygons receive NoData; in a raster with alpha, or a three-band colour one without NoData (which
+///     gains an alpha band), they are see-through, 0 in every band, so its pixel type is kept.
 /// - **Partial Failure Reporting**:
 ///   - Features with invalid geometry are skipped and reported in the result messages.
 ///   - Polygon parts that cannot be projected onto the raster grid are reported separately.
@@ -1548,7 +1595,11 @@ fn mosaic_matches(first: &Raster, r: &Raster) -> Result<(), String> {
 }
 
 /// The cells of `r` in a column and row window, as a new raster on the same grid. With a mask
-/// (row-major over the window), the cells it leaves out become no-data.
+/// (row-major over the window), the cells it leaves out have no value, as Project Raster leaves
+/// the cells outside its source (`rustgis_analysis::warp`): in a raster with alpha they are
+/// see-through, 0 in every band, and a three-band colour raster with neither alpha nor no-data gains an alpha
+/// band for them, so an 8-bit image stays 8-bit (#1731). Otherwise they are its no-data, or
+/// -3.4e38 when it has none.
 fn clip_window(
     r: &Raster,
     cols: std::ops::Range<u32>,
@@ -1558,11 +1609,17 @@ fn clip_window(
 ) -> Result<Raster, String> {
     r.require_coordinates()?;
     let (w, h) = (cols.end.saturating_sub(cols.start), rows.end.saturating_sub(rows.start));
-    let nodata = if mask.is_some() { r.nodata.or(Some(NODATA as f64)) } else { r.nodata };
-    let fill = nodata.map(|v| v as f32).unwrap_or(NODATA);
+    let n = r.bands.len();
+    let has_alpha = matches!(r.color, ColorHint::Rgb { alpha: true } if n >= 4) || matches!(r.color, ColorHint::GrayAlpha if n >= 2);
+    let add_alpha = mask.is_some() && !has_alpha && matches!(r.color, ColorHint::Rgb { .. }) && n == 3 && r.nodata.is_none();
+    let clear = mask.is_some() && (has_alpha || add_alpha);
+    let nodata = if mask.is_some() && !clear { r.nodata.or(Some(NODATA as f64)) } else { r.nodata };
+    let fill = if clear { 0.0 } else { nodata.map(|v| v as f32).unwrap_or(NODATA) };
     // Each band's cells counted and cancellable, as in a run on another thread.
     let (wu, width) = (w as usize, r.width as usize);
-    let bands = r
+    let kept = |i: usize| mask.is_none_or(|m| m.get(i).copied().unwrap_or(false));
+    let at = |i: usize| (rows.start as usize + i / wu.max(1)) * width + cols.start as usize + i % wu.max(1);
+    let mut bands = r
         .bands
         .iter()
         .map(|b| {
@@ -1571,23 +1628,23 @@ fn clip_window(
                 wu,
                 1,
                 || (),
-                |_, i| match mask.map(|m| m.get(i).copied().unwrap_or(false)) {
-                    Some(false) => fill,
-                    _ => {
-                        let (row, col) = (rows.start as usize + i / wu.max(1), cols.start as usize + i % wu.max(1));
-                        b.data.get(row * width + col).copied().unwrap_or(fill)
-                    }
-                },
+                |_, i| if kept(i) { b.data.get(at(i)).copied().unwrap_or(fill) } else { fill },
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if add_alpha {
+        // Opaque where the cell is kept and has a value in some band, as Project Raster's alpha.
+        let valued = |i: usize| r.bands.iter().any(|b| b.data.get(at(i)).is_some_and(|v| !v.is_nan()));
+        bands.push(rasterops::per_index(wu * h as usize, wu, n, || (), |_, i| if kept(i) && valued(i) { 255.0 } else { 0.0 })?);
+    }
     let o = r.transform.to_world(f64::from(cols.start), f64::from(rows.start));
     let gt = GeoTransform { origin_x: o.x, origin_y: o.y, ..r.transform };
-    let mut out = Raster::new(name, w, h, bands, gt, r.crs, nodata, r.color.clone(), r.data_type.clone()).map_err(|e| e.to_string())?;
-    out.bands.iter_mut().zip(&r.bands).for_each(|(o, i)| {
-        o.name = i.name.clone();
-        o.wavelength = i.wavelength;
-    });
+    let color = if add_alpha { ColorHint::Rgb { alpha: true } } else { r.color.clone() };
+    let mut out = Raster::new(name, w, h, bands, gt, r.crs, nodata, color, r.data_type.clone()).map_err(|e| e.to_string())?;
+    for (i, band) in out.bands.iter_mut().enumerate() {
+        band.name = r.bands.get(i).map_or_else(|| "Alpha".to_string(), |b| b.name.clone());
+        band.wavelength = r.bands.get(i).and_then(|b| b.wavelength);
+    }
     // Some of the values rounded when the file was read may be in the window: how many isn't known.
     out.keep_rounded_mark(r);
     Ok(out)
@@ -1689,9 +1746,17 @@ fn edit_pixels(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"pixels": n}))
 }
 
+/// The most points `raster.measure` takes.
+const MAX_MEASURE_POINTS: usize = 10_000;
+
 fn measure(s: &mut Session, p: &Value) -> CmdResult {
-    let pts: Vec<Coord> =
-        p.get("points").and_then(Value::as_array).ok_or("points is required")?.iter().take(10_000).map(point).collect::<Result<_, _>>()?;
+    let given = p.get("points").and_then(Value::as_array).ok_or("points is required")?;
+    // Refused over the limit: a measurement of the first points would read as the whole
+    // geometry's (#1896).
+    if given.len() > MAX_MEASURE_POINTS {
+        return Err(format!("points has {} entries: a measurement takes at most {MAX_MEASURE_POINTS}", given.len()));
+    }
+    let pts: Vec<Coord> = given.iter().map(point).collect::<Result<_, _>>()?;
     let kind = ps(p, "kind").ok_or("kind is required")?;
     let dem = ps(p, "layer").map(|n| raster_named(s, n)).transpose()?;
     // A scan's heights would be read at the made-up place it is laid.
@@ -1800,16 +1865,63 @@ fn measure(s: &mut Session, p: &Value) -> CmdResult {
     Ok(out)
 }
 
-/// A workspace's cell size (degrees, or null for the finest image's), checked the same way when
-/// a workspace is made and when its options change.
-fn cell_size(p: &Value) -> Result<Option<f64>, String> {
-    match p.get("cellSize") {
-        None | Some(Value::Null) => Ok(None),
-        Some(_) => f(p, "cellSize")
-            .filter(|c| *c > 0.0 && *c < 10.0)
-            .map(Some)
-            .ok_or_else(|| "cellSize is degrees, above 0 and below 10".to_string()),
+/// Sets what `p` gives of a workspace's coordinate system (`crs`) and cell size, checked the same
+/// way when a workspace is made and when its options change. Both are read before either is set,
+/// so a bad one changes nothing. A cell size is in the units of the system the workspace then
+/// has: a projected one's, else degrees. Another system starts without a projected cell size.
+/// Returns the note on a coordinate system read with a compatibility caveat.
+fn set_grid(p: &Value, w: &mut Workspace) -> Result<Option<String>, String> {
+    let mut note = None;
+    let crs = match p.get("crs") {
+        None => w.crs,
+        Some(Value::Null) => None,
+        Some(Value::String(t)) if t.trim().is_empty() => None,
+        Some(v @ (Value::String(_) | Value::Number(_))) => {
+            let text = match v {
+                // A form's number comes as a float: 32616.0 is EPSG:32616.
+                Value::Number(n) => match n.as_f64().filter(|c| c.fract() == 0.0) {
+                    Some(c) => format!("EPSG:{c}"),
+                    None => format!("EPSG:{n}"),
+                },
+                _ => v.as_str().unwrap_or_default().trim().to_string(),
+            };
+            if Crs::parse(&text).is_ok_and(|c| c == Crs::LonLat) {
+                Some(Crs::LonLat)
+            } else {
+                let (crs, compatibility) = rustgis_analysis::projected_crs(&text).map_err(|e| match Crs::parse(&text) {
+                    // Degrees are asked for with EPSG:4326; that can't help any other refusal.
+                    Ok(c) if c.is_geographic() => format!("{e}; EPSG:4326 makes it in degrees"),
+                    _ => e,
+                })?;
+                note = compatibility;
+                Some(crs)
+            }
+        }
+        Some(_) => return Err("crs is a projected coordinate system (such as \"EPSG:32616\"), \"EPSG:4326\" for degrees, or null".into()),
+    };
+    let projected = crs.filter(|c| *c != Crs::LonLat);
+    let size = match p.get("cellSize") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(_) => Some(Some(match projected {
+            Some(c) => {
+                f(p, "cellSize").filter(|v| *v > 0.0).ok_or_else(|| format!("cellSize is a size above 0, in {}'s units", c.label()))?
+            }
+            None => f(p, "cellSize")
+                .filter(|v| *v > 0.0 && *v < 10.0)
+                .ok_or("cellSize is degrees, above 0 and below 10; give a projected crs to set it in metres or feet")?,
+        })),
+    };
+    if crs != w.crs {
+        w.projected_cell_size = None;
     }
+    w.crs = crs;
+    match size {
+        Some(size) if projected.is_some() => w.projected_cell_size = size,
+        Some(size) => w.cell_size = size,
+        None => {}
+    }
+    Ok(note)
 }
 
 /// A workspace's mosaic method: first or mean.
@@ -1820,6 +1932,8 @@ fn method(p: &Value, default: &str) -> Result<String, String> {
     }
 }
 
+/// `imagery.workspace`: a new workspace of `images`, under a name no other workspace has (a
+/// number added when it is taken), with its method, coordinate system and cell size.
 fn new_workspace(s: &mut Session, p: &Value) -> CmdResult {
     let kind = ps(p, "kind").ok_or("kind is required")?;
     if !matches!(kind, "ortho" | "reality") {
@@ -1841,12 +1955,15 @@ fn new_workspace(s: &mut Session, p: &Value) -> CmdResult {
         nm = format!("{base} {i}");
     }
     let method = method(p, if kind == "reality" { "mean" } else { "first" })?;
-    let cell_size = cell_size(p)?;
-    s.project.workspaces.push(Workspace { name: nm.clone(), kind: kind.into(), images, cell_size, method });
+    let mut w = Workspace { name: nm.clone(), kind: kind.into(), images, cell_size: None, crs: None, projected_cell_size: None, method };
+    if let Some(note) = set_grid(p, &mut w)? {
+        s.notify(format!("{nm}: its coordinate system: {note}"), false);
+    }
+    s.project.workspaces.push(w);
     Ok(json!({"workspace": nm}))
 }
 
-/// Mosaics a workspace's images onto one longitude/latitude grid.
+/// Mosaics a workspace's images onto one grid, in the coordinate system [`mosaic_crs`] gives.
 fn mosaic(s: &mut Session, p: &Value) -> CmdResult {
     super::workflows::made_or_ran(s, p, "imagery.mosaic")
 }
@@ -1856,37 +1973,78 @@ fn mosaic(s: &mut Session, p: &Value) -> CmdResult {
 pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Work, String> {
     let w = workspace_of(s, p)?.clone();
     let imgs: Vec<Arc<Raster>> = w.images.iter().map(|i| raster_named(s, i)).collect::<Result<_, _>>()?;
-    let mut e = Extent::EMPTY;
     for r in &imgs {
         r.require_coordinates()?;
-        e = e.union(&r.extent());
     }
-    let finest = imgs
+    let (crs, crs_note) = mosaic_crs(&w, &imgs)?;
+    // The images' footprints and the finest image's pixel, in the system.
+    let (e, finest, cell) = if crs == Crs::LonLat {
+        let e = imgs.iter().fold(Extent::EMPTY, |e, r| e.union(&r.extent()));
+        let finest = imgs
+            .iter()
+            .map(|r| {
+                let (cx, _) = r.cell_size_m();
+                cx / (111_320.0 * r.extent().center().y.to_radians().cos().abs().max(0.01))
+            })
+            .fold(f64::INFINITY, f64::min);
+        (e, finest, w.cell_size)
+    } else {
+        let mut e = Extent::EMPTY;
+        let mut finest = f64::INFINITY;
+        for r in &imgs {
+            let ([x0, y0, x1, y1], pixel) = warp::footprint_in(r, crs)?;
+            e = e.union(&Extent::new(x0, y0, x1, y1));
+            finest = finest.min(pixel);
+        }
+        (e, finest, w.projected_cell_size)
+    };
+    // A size from a project file is checked here: the options refuse others.
+    let cell = match cell {
+        Some(c) if c.is_finite() && c > 0.0 => c,
+        Some(c) => return Err(format!("the workspace's cell size, {c}, isn't a size above 0: set it in the workspace options")),
+        None => finest,
+    }
+    .max(1e-7);
+    // A projected grid's cell corners fall on those of the finest image already in its system, so
+    // that image's pixels line up with the cells it is copied to.
+    let anchor = imgs
         .iter()
-        .map(|r| {
-            let (cx, _) = r.cell_size_m();
-            cx / (111_320.0 * r.extent().center().y.to_radians().cos().abs().max(0.01))
-        })
-        .fold(f64::INFINITY, f64::min);
-    let cell = w.cell_size.unwrap_or(finest).max(1e-7);
+        .filter(|r| crs != Crs::LonLat && r.crs == crs)
+        .min_by(|a, b| a.transform.pixel_width.abs().total_cmp(&b.transform.pixel_width.abs()));
+    let e = match anchor {
+        Some(r) => {
+            let (ox, oy) = (r.transform.origin_x, r.transform.origin_y);
+            let west = ox + ((e.min_x - ox) / cell).floor() * cell;
+            let north = oy + ((e.max_y - oy) / cell).ceil() * cell;
+            Extent::new(west, e.min_y, e.max_x, north)
+        }
+        None => e,
+    };
     let (cols, rows) = ((e.width() / cell).ceil().max(1.0) as usize, (e.height() / cell).ceil().max(1.0) as usize);
     if cols.saturating_mul(rows) > rasterops::max_pixels() / 2 {
-        return Err(format!("the mosaic would be {cols} × {rows} cells; set a larger cell size in the workspace options"));
+        let made_in = crs_note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default();
+        return Err(format!("the mosaic would be {cols} × {rows} cells; set a larger cell size in the workspace options{made_in}"));
     }
     let nb = imgs.iter().map(|r| r.band_count()).min().unwrap_or(1).min(if w.kind == "reality" { 1 } else { 4 });
+    // The images with bands left out, the first five named.
+    let omitted_count = imgs.iter().filter(|r| r.band_count() > nb).count();
     let omitted: Vec<String> = w
         .images
         .iter()
         .zip(&imgs)
         .filter(|(_, r)| r.band_count() > nb)
+        .take(5)
         .map(|(name, r)| {
-            let bands = ((nb + 1)..=r.band_count()).map(|b| b.to_string()).collect::<Vec<_>>().join(", ");
+            // A range, however many bands: a one-band reality mosaic can leave out thousands.
+            let bands = if r.band_count() == nb + 1 { (nb + 1).to_string() } else { format!("{}–{}", nb + 1, r.band_count()) };
             format!("'{name}': band(s) {bands}")
         })
         .collect();
-    let mut messages: Vec<String> = Vec::new();
+    let mut messages: Vec<String> = crs_note.into_iter().collect();
     if !omitted.is_empty() {
-        messages.push(format!("{} image(s) have bands omitted from the {nb}-band mosaic: {}", omitted.len(), omitted.join("; ")));
+        // The count is of every image left out; only the first five are named.
+        let more = if omitted_count > omitted.len() { "; …" } else { "" };
+        messages.push(format!("{omitted_count} image(s) have bands omitted from the {nb}-band mosaic: {}{more}", omitted.join("; ")));
     }
     // A band's wavelength is the images' when they all give it the same one; else it has none,
     // and that is said.
@@ -1907,10 +2065,13 @@ pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
         messages
             .push(format!("{differ} band(s) have no wavelength in the mosaic: the images don't all give the same one (or some give none)"));
     }
-    let extra = (!messages.is_empty()).then(|| json!({ "messages": messages }));
+    let mut extra = json!({ "crs": crs.label() });
+    if !messages.is_empty() {
+        extra["messages"] = json!(messages);
+    }
     Ok(Box::new(move || {
         let refs: Vec<&Raster> = imgs.iter().map(|r| &**r).collect();
-        let mut bands = rasterops::mosaic(&refs, &e, cell, (cols, rows), nb, w.method == "mean")?;
+        let mut bands = rasterops::mosaic(&refs, &e, cell, (cols, rows), nb, w.method == "mean", crs)?;
         // Colour only when every image is colour. A mosaic of 8-bit images stays 8-bit (means
         // rounded), so it displays as they do; anything else is Float32.
         let all_rgb = imgs.iter().all(|r| matches!(r.color, ColorHint::Rgb { .. }));
@@ -1928,12 +2089,102 @@ pub(crate) fn mosaic_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
         }
         let gt = GeoTransform { origin_x: e.min_x, origin_y: e.max_y, pixel_width: cell, pixel_height: -cell };
         let suffix = if w.kind == "reality" { "DSM" } else { "Orthomosaic" };
-        let mut out =
-            Raster::new(format!("{} {suffix}", w.name), cols as u32, rows as u32, bands, gt, Crs::LonLat, Some(NODATA as f64), color, dt)
-                .map_err(|e| e.to_string())?;
+        let mut out = Raster::new(format!("{} {suffix}", w.name), cols as u32, rows as u32, bands, gt, crs, Some(NODATA as f64), color, dt)
+            .map_err(|e| e.to_string())?;
         out.bands.iter_mut().zip(&wavelengths).for_each(|(band, w)| band.wavelength = *w);
-        super::workflows::made(out, extra)
+        // What the result says is said in the app too.
+        let name = w.name.clone();
+        let then: Option<super::workflows::Then> = (!messages.is_empty()).then(|| {
+            Box::new(move |s: &mut Session, _: &mut Value| {
+                for message in messages {
+                    s.notify(format!("{name}: {message}"), false);
+                }
+            }) as super::workflows::Then
+        });
+        super::workflows::made_then(out, Some(extra), then)
     }))
+}
+
+/// The coordinate system a workspace's mosaic is made in, and a note when the workspace didn't
+/// set it: the one set, else the projected system all its images are in, else degrees. A
+/// workspace with a cell size in degrees and no system stays in degrees, as that size was asked
+/// for in degrees.
+fn mosaic_crs(w: &Workspace, imgs: &[Arc<Raster>]) -> Result<(Crs, Option<String>), String> {
+    match w.crs {
+        Some(Crs::LonLat) => return Ok((Crs::LonLat, None)),
+        // Set through the options, which refuse others; a project file can hold anything.
+        Some(c) => {
+            return match rustgis_analysis::layer_raster_crs(Some(c)) {
+                // A size kept from degrees isn't one in this system's units.
+                Some(Ok(c)) => Ok((
+                    c,
+                    w.cell_size.filter(|_| w.projected_cell_size.is_none()).map(|d| {
+                        format!(
+                            "its cell size ({d}) is in degrees, so the finest image's pixel was taken for a mosaic in {0}; set cellSize in {0}'s units",
+                            c.label()
+                        )
+                    }),
+                )),
+                Some(Err(why)) => Err(format!("the workspace's coordinate system is {why}: set another crs in the workspace options")),
+                None => Err(format!(
+                    "the workspace's coordinate system, {}, is in degrees: set crs to EPSG:4326 for degrees, or to a projected system",
+                    c.label()
+                )),
+            };
+        }
+        None => {}
+    }
+    let shared = imgs.first().map(|r| r.crs).filter(|c| imgs.iter().all(|r| r.crs == *c));
+    let note = match shared.map(|c| rustgis_analysis::layer_raster_crs(Some(c))) {
+        Some(Some(Ok(c))) => match w.cell_size {
+            None => {
+                let made =
+                    format!("made in {}, the coordinate system its images are in; set crs to EPSG:4326 to make it in degrees", c.label());
+                return Ok((c, Some(made)));
+            }
+            Some(d) => format!(
+                "made in degrees, as its cell size ({d}) is in degrees, though its images are in {0}; set crs to {0}, with a cell size in its units, to make it there",
+                c.label()
+            ),
+        },
+        Some(Some(Err(why))) => {
+            format!("made in degrees, though its images are in {why}; set a projected crs to make it in metres or feet")
+        }
+        // Images in WGS 84 degrees: degrees, nothing assumed.
+        Some(None) if shared == Some(Crs::LonLat) => return Ok((Crs::LonLat, None)),
+        // In another geographic system (NAD83, say): WGS 84 degrees, said.
+        Some(None) => format!(
+            "made in WGS 84 degrees (EPSG:4326), though its images are in {}; set a projected crs to make it in metres or feet",
+            shared.map(Crs::label).unwrap_or_default()
+        ),
+        None => {
+            // Named: the projected systems, else the geographic ones other than WGS 84.
+            let distinct = |keep: &dyn Fn(Crs) -> bool| {
+                let mut systems: Vec<String> = Vec::new();
+                for c in imgs.iter().map(|r| r.crs).filter(|c| keep(*c)) {
+                    if !systems.contains(&c.label()) {
+                        systems.push(c.label());
+                    }
+                }
+                let more = if systems.len() > 5 { ", …" } else { "" };
+                systems.truncate(5);
+                (!systems.is_empty()).then(|| format!("{}{more}", systems.join(", ")))
+            };
+            match (distinct(&|c| !c.is_geographic()), distinct(&|c| c.is_geographic() && c != Crs::LonLat)) {
+                (Some(projected), geographic) => {
+                    let all = geographic.map_or(projected.clone(), |g| format!("{projected}, {g}"));
+                    format!(
+                        "made in WGS 84 degrees (EPSG:4326), as its images are in different coordinate systems (some in {all}); set crs to make it in a projected one"
+                    )
+                }
+                (None, Some(geographic)) => format!(
+                    "made in WGS 84 degrees (EPSG:4326), though its images are in different geographic systems (some in {geographic}); set a projected crs to make it in metres or feet"
+                ),
+                (None, None) => return Ok((Crs::LonLat, None)),
+            }
+        }
+    };
+    Ok((Crs::LonLat, Some(note)))
 }
 
 /// A surface model as a triangle mesh (Wavefront OBJ), in metres from its south-west corner.

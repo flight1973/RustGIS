@@ -31,6 +31,8 @@ mod cswui;
 mod cubesui;
 mod diagnosticlog;
 mod dialogs;
+#[cfg(not(target_arch = "wasm32"))]
+mod diskwatch;
 mod docpanes;
 mod earthaccessui;
 mod editpanes;
@@ -41,6 +43,8 @@ mod extensionsui;
 mod failureui;
 mod fieldlists;
 mod fieldmenu;
+#[cfg(not(target_arch = "wasm32"))]
+mod filedialog;
 mod fill_editor;
 mod geocodeui;
 mod geolibreui;
@@ -52,6 +56,7 @@ mod keymap;
 mod labelfonts;
 mod labelpane;
 mod layerchooser;
+mod layerprops;
 mod layoutview;
 #[cfg(not(target_arch = "wasm32"))]
 mod localagents;
@@ -185,6 +190,8 @@ pub const TOOL_FILE_PICK: &str = "\u{1}toolfile:";
 const RASTER_DEFAULTS_PREF: &str = "raster_default_style";
 /// The preference holding the favourite arrangement of publication layouts (`layout.arrangement`).
 const LAYOUT_FAVOURITE_PREF: &str = "layout_favourite_arrangement";
+/// The preference holding the arrangements of publication layouts saved by name.
+const LAYOUT_ARRANGEMENTS_PREF: &str = "layout_saved_arrangements";
 
 /// A result an asynchronous service fills in when it's done (the app polls it each frame).
 pub type Slot<T> = std::sync::Arc<std::sync::Mutex<Option<T>>>;
@@ -444,6 +451,8 @@ pub struct ServiceConn {
     /// `wms`, `wmts`, `wfs`, `ogcapi`, `arcgis`, or `auto`.
     pub kind: &'static str,
     pub slot: Slot<Result<Vec<u8>, Failure>>,
+    /// Supplied-document parsing on a desktop worker, owned by this connection alone.
+    pub reading: Option<serviceui::ListingRead>,
     /// The capabilities document, once it has arrived.
     pub text: Option<String>,
     /// Additional capabilities documents, keyed by their requested address.
@@ -624,7 +633,6 @@ pub enum RightPane {
     Geoprocessing,
     Symbology,
     History,
-    Details,
     Editing,
     Design,
     Workflows,
@@ -650,6 +658,8 @@ pub enum RightPane {
     Format,
     /// The selected feature layer's labels (#617).
     Labeling,
+    /// The selected layer's settings in one place, a tab per topic (#1803).
+    LayerProperties,
     /// A Home › Add › Web Data service: the one `UiState::web_data` names.
     WebData,
     /// A plugin's panel: the one `UiState::plugin_panel` names.
@@ -701,6 +711,9 @@ pub struct UiState {
     /// The Web Data service the Web Data pane shows (a `ui.dialog` name, see
     /// `panes::web_data_name`).
     pub web_data: &'static str,
+    /// The Layer Properties pane's tab: the one last chosen, or asked for with
+    /// `ui.pane.layerProperties {"tab"}`.
+    pub layer_properties_tab: layerprops::Topic,
     pub dark: bool,
     /// The theme file in use, by name. Empty follows `dark` and the system.
     pub theme_name: String,
@@ -738,6 +751,8 @@ pub struct UiState {
     pub start_projection: String,
     /// The EPSG or ESRI code typed in Settings › Start-up › Projection.
     pub start_projection_input: String,
+    /// The coordinate system typed in View › Graticule's menu for the measured grid.
+    pub graticule_crs_input: String,
     /// Start-up preference: the extent the map opens on, `[minLon, minLat, maxLon, maxLat]`;
     /// `None` for the full extent.
     pub start_extent: Option<[f64; 4]>,
@@ -890,6 +905,13 @@ pub struct UiState {
     pub raster_defaults_saved: rustgis_engine::map::RasterDefaults,
     /// The favourite arrangement last saved, to save it again only when it changes.
     pub layout_favourite_saved: Value,
+    /// The arrangements saved by name last kept in the preferences, likewise.
+    pub layout_arrangements_saved: serde_json::Map<String, Value>,
+    /// Entries of that preference this version can't use (a newer one's), saved again with it as
+    /// they were.
+    pub layout_arrangements_unread: serde_json::Map<String, Value>,
+    /// That preference couldn't be read at all: it is left as it is, never saved over.
+    pub layout_arrangements_unreadable: bool,
     /// Home › Add › Add Data › Zarr…: its store, choices and fetches.
     pub zarr: zarrui::State,
     /// Independent Zarr reads for imported GeoLibre layers; does not share the picker state.
@@ -957,6 +979,7 @@ impl Default for UiState {
             diagnostic_filter: rustgis_engine::data::diagnostics::Filter::All,
             diagnostic_snapshot: None,
             web_data: "opendata",
+            layer_properties_tab: layerprops::Topic::General,
             dark: false,
             theme_name: String::new(),
             interface_scale: 1.0,
@@ -973,6 +996,7 @@ impl Default for UiState {
             last_project: None,
             start_projection: String::new(),
             start_projection_input: String::new(),
+            graticule_crs_input: String::new(),
             start_extent: None,
             start_view: None,
             ribbon_minimized: false,
@@ -1039,6 +1063,9 @@ impl Default for UiState {
             connections_saved: 0,
             raster_defaults_saved: Default::default(),
             layout_favourite_saved: Value::Null,
+            layout_arrangements_saved: Default::default(),
+            layout_arrangements_unread: Default::default(),
+            layout_arrangements_unreadable: false,
             zarr: Default::default(),
             geolibre_zarr: Vec::new(),
             hidden_tabs: Vec::new(),
@@ -1103,6 +1130,13 @@ pub struct RustGisApp {
     /// Add Data and Load All Features read on a thread of their own (the desktop app; see
     /// [`readjob`]). Off, as for tests and the examples, they read as the command runs.
     pub reads_off_frame: bool,
+    /// Watches linked local files for changes made outside RustGIS and offers Reload Data
+    /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
+    /// `watchFiles` does).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub watch_files: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    diskwatch: diskwatch::Watch,
     /// ModelBuilder's view: the model on its canvas.
     pub mb: modelbuilder::ModelBuilder,
     pub ws: workspacepanes::WorkspaceState,
@@ -1340,8 +1374,12 @@ impl RustGisApp {
         }
         // The favourite arrangement counts as saved until a command changes it, so one never set
         // isn't written to the preferences.
-        let ui =
-            UiState { keymap: keymap::Keymap::new(&s.registry), layout_favourite_saved: s.layout_favourite.clone(), ..UiState::default() };
+        let ui = UiState {
+            keymap: keymap::Keymap::new(&s.registry),
+            layout_favourite_saved: s.layout_favourite.clone(),
+            layout_arrangements_saved: s.layout_arrangements.clone(),
+            ..UiState::default()
+        };
         RustGisApp {
             session: s,
             ui,
@@ -1358,6 +1396,10 @@ impl RustGisApp {
             #[cfg(not(target_arch = "wasm32"))]
             reads: readjob::Reads::default(),
             reads_off_frame: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            watch_files: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            diskwatch: diskwatch::Watch::default(),
             mb: modelbuilder::ModelBuilder::default(),
             ws: workspacepanes::WorkspaceState::default(),
             time: timebar::TimeBarState::default(),
@@ -1481,12 +1523,40 @@ impl RustGisApp {
             self.session.raster_defaults = d.sanitized();
         }
         self.ui.raster_defaults_saved = self.session.raster_defaults.clone();
+        // The arrangements saved by name, before the favourite, which may name one; those this
+        // version can't use are said, and kept as they are with the preference. Text that isn't a
+        // list of them is said and never saved over: arrangements saved then last the session.
+        if let Some(text) = self.services.load_pref.as_ref().and_then(|load| load(LAYOUT_ARRANGEMENTS_PREF)) {
+            match rustgis_engine::cmd::layout::read_saved_arrangements(&text) {
+                Some((kept, unread)) => {
+                    if !unread.is_empty() {
+                        self.session.notify(
+                            crate::i18n::fmt(
+                                "Saved arrangements of publication layouts left out: {count} (not usable by this version, a second name for one kept, or past the limit of 20). They are kept with the preferences.",
+                                &[("count", &unread.len().to_string())],
+                            ),
+                            false,
+                        );
+                    }
+                    (self.session.layout_arrangements, self.ui.layout_arrangements_unread) = (kept, unread);
+                }
+                None => {
+                    self.ui.layout_arrangements_unreadable = true;
+                    self.session.notify(
+                        tl!("The saved arrangements of publication layouts can't be read: they are left as they are, and arrangements saved now last only until the app closes.").to_string(),
+                        false,
+                    );
+                }
+            }
+        }
+        self.ui.layout_arrangements_saved = self.session.layout_arrangements.clone();
         // The favourite arrangement of publication layouts; one no longer valid is passed over,
         // said, and classic used.
         if let Some(text) = self.services.load_pref.as_ref().and_then(|load| load(LAYOUT_FAVOURITE_PREF)) {
+            let saved = &self.session.layout_arrangements;
             let read = serde_json::from_str::<Value>(&text)
                 .map_err(|e| e.to_string())
-                .and_then(|v| rustgis_engine::cmd::layout::parse_arrangement(&v).map(|_| v));
+                .and_then(|v| rustgis_engine::cmd::layout::parse_arrangement(&v, saved).map(|_| v));
             match read {
                 // A saved null is the default, named.
                 Ok(v) if v.is_null() => self.session.layout_favourite = Value::String("classic".into()),
@@ -1679,7 +1749,15 @@ impl RustGisApp {
         let georeference = self.ui.pdf_georeference;
         let session = &mut self.session;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rustgis_engine::cmd::layout::layout_bytes_with(session, li, pdf, dpi, true, georeference)
+            rustgis_engine::cmd::layout::layout_bytes_with(
+                session,
+                li,
+                pdf,
+                dpi,
+                true,
+                georeference,
+                rustgis_engine::render::pdf::Options::default(),
+            )
         }))
         .unwrap_or_else(|_| Err("the layout export failed unexpectedly".into()));
         if let Err(e) = &r {
@@ -2359,6 +2437,15 @@ impl RustGisApp {
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         #[cfg(not(target_arch = "wasm32"))]
         if self.reads_off_frame {
+            if id == "service.layers" {
+                return readjob::run(self, "service.layers", params);
+            }
+            if id == "service.add" && params.get("text").and_then(Value::as_str).is_some() {
+                return readjob::run(self, "service.add", params);
+            }
+            if id == "layer.repairSource" {
+                return readjob::run(self, "layer.repairSource", params);
+            }
             let archive = match id {
                 "map.reloadTiles" => Some("map.reloadTiles"),
                 "map.repairTiles" => Some("map.repairTiles"),
@@ -2438,6 +2525,14 @@ impl RustGisApp {
             AppDispatch::ResolvedTiles { crossed_origin, .. } => Some(*crossed_origin),
             _ => None,
         };
+        // What a watched file a save or export writes holds just before it does.
+        #[cfg(not(target_arch = "wasm32"))]
+        let before_write = diskwatch::before_write(self, id, &params);
+        // Discard Edits reads its table as it runs: what the file holds now is what it reads.
+        #[cfg(not(target_arch = "wasm32"))]
+        if id == "gpkg.discardEdits" {
+            diskwatch::reading(self, id, &params);
+        }
         let mut r = match dispatch {
             AppDispatch::Prepared(prepared) => self.session.run_prepared(*prepared),
             AppDispatch::InPlace(id) => self.session.add_in_place_for(id, &params),
@@ -2452,6 +2547,13 @@ impl RustGisApp {
             AppDispatch::Direct => self.session.run(id, &params),
         };
         r = self.deliver_gp_files(r);
+        // A reload acknowledges what it read; a save into a watched file is RustGIS's own write.
+        #[cfg(not(target_arch = "wasm32"))]
+        match &r {
+            Ok(answer) => diskwatch::ran(self, id, &params, answer, before_write),
+            Err(_) if matches!(id, "layer.reloadData" | "map.reloadTiles" | "gpkg.discardEdits") => diskwatch::not_read(self, id, &params),
+            Err(_) => {}
+        }
         if r.is_ok() && id == "tool.set" {
             self.map.cancel_sketch();
             // Esc chooses Explore: a plugin's pick stops waiting for the map, as for any tool.
@@ -2597,6 +2699,14 @@ impl RustGisApp {
             let name = self.session.active_layer.and_then(|l| map.layer(l)).filter(|l| l.raster.is_some()).map(|l| l.name.clone())?;
             let shared = map.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(&name)).count() > 1;
             return Some((name, shared));
+        }
+        // A STAC search reads the active layer only to take its selection as the search area
+        // (`intersects: "selection"`, compared as the engine does), so a bbox or GeoJSON search
+        // names none.
+        if id == "stac.search"
+            && !params.get("intersects").and_then(Value::as_str).is_some_and(|v| v.trim().eq_ignore_ascii_case("selection"))
+        {
+            return None;
         }
         let spec = self.session.registry.get(id).filter(|c| c.mutates && params.get("layer").is_none_or(Value::is_null)).copied()?;
         if !spec.param_keys().is_some_and(|k| k.contains(&"layer")) {
@@ -2799,8 +2909,40 @@ impl RustGisApp {
         });
     }
 
-    /// Saves the favourite arrangement of publication layouts when `layout.arrangement` changed it.
+    /// Saves the favourite arrangement of publication layouts, and those saved by name, when
+    /// `layout.arrangement` changed them.
     fn save_layout_favourite(&mut self) {
+        if self.session.layout_arrangements != self.ui.layout_arrangements_saved && !self.ui.layout_arrangements_unreadable {
+            // An arrangement removed, saved or replaced here takes with it the entries passed over
+            // beside it under the same name but for case: one removed doesn't come back at the next
+            // start, and one saved isn't passed over then for the older entry.
+            let (kept, before) = (&self.session.layout_arrangements, &self.ui.layout_arrangements_saved);
+            let removed: Vec<String> =
+                before.keys().chain(kept.keys()).filter(|k| before.get(*k) != kept.get(*k)).map(|k| k.to_lowercase()).collect();
+            // Only those this version would use: one it can't read stays as it was.
+            let passed = self.ui.layout_arrangements_unread.len();
+            self.ui.layout_arrangements_unread.retain(|name, corners| {
+                !removed.contains(&name.to_lowercase()) || !rustgis_engine::cmd::layout::usable_saved_arrangement(name, corners)
+            });
+            let dropped = passed - self.ui.layout_arrangements_unread.len();
+            if dropped > 0 {
+                self.session.notify(
+                    crate::i18n::fmt(
+                        "Saved arrangements of publication layouts passed over under a name saved or removed now are dropped: {count}.",
+                        &[("count", &dropped.to_string())],
+                    ),
+                    false,
+                );
+            }
+            self.ui.layout_arrangements_saved = self.session.layout_arrangements.clone();
+            // Those this version couldn't use go back as they were, but where one saved here took
+            // their very name.
+            let mut all = self.ui.layout_arrangements_unread.clone();
+            all.extend(self.session.layout_arrangements.clone());
+            if let Some(save) = &self.services.save_pref {
+                save(LAYOUT_ARRANGEMENTS_PREF, &Value::Object(all).to_string());
+            }
+        }
         if self.session.layout_favourite == self.ui.layout_favourite_saved {
             return;
         }
@@ -2848,7 +2990,16 @@ impl RustGisApp {
                 toggle_right(&mut self.ui, RightPane::Symbology)
             }
             "ui.pane.history" => toggle_right(&mut self.ui, RightPane::History),
-            "ui.pane.details" => toggle_right(&mut self.ui, RightPane::Details),
+            // The Layer Properties pane on its Source tab (#1803), for the layer given (`{"layer"}`)
+            // or the selected one; with neither, it hides the pane when it is in view on Source.
+            "ui.pane.details" => {
+                let layer = p.get("layer").filter(|l| !l.is_null());
+                if layer.is_none() && layerprops::source_in_view(&self.ui) {
+                    self.ui.close_right(RightPane::LayerProperties);
+                } else {
+                    return self.run_ui("ui.pane.layerProperties", &json!({"tab": "source", "layer": layer}));
+                }
+            }
             "ui.pane.editing" => toggle_right(&mut self.ui, RightPane::Editing),
             "ui.pane.design" => toggle_right(&mut self.ui, RightPane::Design),
             "ui.pane.script" => toggle_right(&mut self.ui, RightPane::Script),
@@ -2879,6 +3030,44 @@ impl RustGisApp {
                 }
                 // A layer's menu asks for that layer's labels: shown, even when already in view.
                 if given.is_some() { self.ui.open_right(RightPane::Labeling) } else { toggle_right(&mut self.ui, RightPane::Labeling) }
+            }
+            // The Layer Properties pane (#1803), on `{"layer": id}` when given (a layer's
+            // right-click menu), as the Labeling pane is; feature and raster layers alike. With
+            // `{"tab": "general"|"source"|"display"|"query"|"time"}` it shows that tab (Data ›
+            // Definition Query asks for "query"; "query" and "time" are a feature layer's only).
+            "ui.pane.layerProperties" => {
+                let given = match p.get("layer").filter(|l| !l.is_null()) {
+                    Some(_) => Some(self.session.layer_id(p)?),
+                    None => None,
+                };
+                let tab = match p.get("tab").filter(|t| !t.is_null()) {
+                    Some(t) => Some(
+                        t.as_str().and_then(layerprops::Topic::parse).ok_or("unknown tab: give general, source, display, query or time")?,
+                    ),
+                    None => None,
+                };
+                let layer = given.or(self.session.active_layer).and_then(|id| self.session.map().layer(id));
+                // Showing its tab already open needs no layer.
+                if (given.is_some() || tab.is_some() || !self.ui.right_open.contains(&RightPane::LayerProperties)) && layer.is_none() {
+                    return Err("select a layer in the Layers pane first".into());
+                }
+                if tab.is_some_and(layerprops::Topic::feature_only) && layer.is_some_and(|l| l.is_raster()) {
+                    return Err(
+                        "a raster layer has no definition query or time binding: the Query and Time tabs are a feature layer's".into()
+                    );
+                }
+                if let Some(id) = given {
+                    self.session.run("layer.select", &json!({"layer": id}))?;
+                }
+                if let Some(tab) = tab {
+                    self.ui.layer_properties_tab = tab;
+                }
+                // Asked for a layer or a tab, it is shown, even when already in view.
+                if given.is_some() || tab.is_some() {
+                    self.ui.open_right(RightPane::LayerProperties)
+                } else {
+                    toggle_right(&mut self.ui, RightPane::LayerProperties)
+                }
             }
             // A plugin's panel: `{"id": plugin}`.
             "ui.pane.plugin" => return pluginpanel::open(self, p),
@@ -3465,6 +3654,7 @@ impl RustGisApp {
                     connection: resolved_connection,
                     kind,
                     slot,
+                    reading: None,
                     text: None,
                     documents: Vec::new(),
                     pending: Some(caps),
@@ -3772,7 +3962,7 @@ impl RustGisApp {
             }
             "ui.addFolder" => {
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                if let Some(dir) = crate::filedialog::FileDialog::new().pick_folder() {
                     return self.run("project.addFolder", json!({"path": dir.display().to_string()}));
                 }
                 #[cfg(target_arch = "wasm32")]
@@ -4138,7 +4328,12 @@ impl RustGisApp {
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
-                let whole = if l.is_streamed() { Some(l.load_all()?) } else { None };
+                let (whole, lost) = if l.is_streamed() {
+                    let (ds, lost) = l.load_all_counted()?;
+                    (Some(ds), lost)
+                } else {
+                    (None, Default::default())
+                };
                 // In the layer's own coordinate system, as share.exportLayer writes a file.
                 let ds = whole.as_ref().unwrap_or(&l.dataset);
                 use rustgis_engine::data::io;
@@ -4165,6 +4360,14 @@ impl RustGisApp {
                 if matches!(ext.as_str(), "parquet" | "geoparquet") {
                     dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(ds, &name));
                 }
+                dbf_notes.extend(io::dates_as_text_note(&ds.fields, &name));
+                dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(ds, &ext, &name));
+                if lost.rows > 0 {
+                    dbf_notes.push(format!("{name}: {} rows couldn't be read and were left out", lost.rows));
+                }
+                dbf_notes.extend(lost.dates.iter().map(|n| format!("{name}: {}: {n}, so they're empty in the export", l.name)));
+                // CSV holds a point a row, GPX a name for each feature and no areas.
+                dbf_notes.extend(io::export_losses_notes(ds, &ext, io::name_field(ds), &name));
                 if let Some(note) = io::left_out_note(&name, &ext, left_out) {
                     self.session.notify(note, false);
                 }
@@ -5221,6 +5424,20 @@ impl RustGisApp {
     fn poll_service(&mut self) {
         self.poll_service_steps();
         let Some(conn) = &mut self.ui.service else { return };
+        if let Some(reading) = &conn.reading {
+            let done = reading.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            let Some(done) = done else { return };
+            let cancelled = reading.control.is_cancelled();
+            let filter = reading.filter.clone();
+            conn.reading = None;
+            let result = if cancelled {
+                Err(tl!("Service discovery was cancelled").to_string())
+            } else {
+                done.and_then(|read| rustgis_engine::cmd::reads::read_land(&mut self.session, read))
+            };
+            serviceui::listed(conn, result, filter);
+            return;
+        }
         let Some(r) = conn.slot.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
         let document = conn.pending.take().unwrap_or_else(|| conn.url.clone());
         match r {
@@ -5244,19 +5461,20 @@ impl RustGisApp {
                 if let Some(connection) = &conn.connection {
                     p["connection"] = json!(connection);
                 }
-                // Not `self.run`: an error belongs in the dialog, not the notices.
-                match self.session.run("service.layers", &p) {
-                    Ok(v) => {
-                        conn.pending = v.get("next").and_then(Value::as_str).map(str::to_string);
-                        if let Some(next) = &conn.pending {
-                            conn.slot = fetch_detailed_into(next);
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.reads_off_frame {
+                    match serviceui::ListingRead::start(&mut self.session, &p) {
+                        Ok(reading) => {
+                            conn.reading = Some(reading);
+                            conn.pending = Some(document);
                         }
-                        conn.listing = Some(v);
-                        conn.added = None;
-                        conn.search = None;
+                        Err(error) => conn.error = Some(error),
                     }
-                    Err(e) => conn.error = Some(e),
+                    return;
                 }
+                // Not `self.run`: an error belongs in the dialog, not the notices.
+                let result = self.session.run("service.layers", &p);
+                serviceui::listed(conn, result, None);
             }
             Err(f) => conn.failure = Some(f),
         }
@@ -5265,6 +5483,10 @@ impl RustGisApp {
     /// Per-frame work that doesn't draw (theme, fonts, files that arrived).
     pub fn logic(&mut self, ctx: &egui::Context) {
         let _diagnostics = self.session.diagnostics.enter();
+        // What this thread draws (an image, a print, a page, a preview, an agent's snapshot)
+        // never waits for cast shadows still being worked out: it says they were (Never hold the
+        // window). Exports drawn off it wait for them.
+        rustgis_engine::render::on_the_interface_thread();
         // A pass egui asks to repeat is the same frame: `ui` sets the delay once, from the first pass.
         if ctx.current_pass_index() == 0 {
             self.frame_start = Some(web_time::Instant::now());
@@ -5430,6 +5652,10 @@ impl RustGisApp {
         self.note_last_project();
         saveprompt::close_requested(self, ctx);
         autosave::tick(self, ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.watch_files {
+            diskwatch::tick(self, ctx);
+        }
         self.ensure_script_font();
         // Fonts downloaded by the web app.
         let fonts: Vec<(String, Vec<u8>)> = match &self.services.font_inbox {
@@ -5606,7 +5832,11 @@ impl RustGisApp {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let _diagnostics = self.session.diagnostics.enter();
+        // See `logic`.
+        rustgis_engine::render::on_the_interface_thread();
         let ctx = ui.ctx().clone();
+        // The graphics card's error handler, on the first frame with a device, whatever it shows.
+        mapview::handle_gpu_errors_once(self, &ctx);
         // Fonts installed by `logic` take effect on the next frame.
         if self.fonts_frames < 2 {
             self.fonts_frames += 1;
@@ -5655,6 +5885,10 @@ impl RustGisApp {
         mapview::confirm_delete(self, &ctx);
         autosave::offer(self, &ctx);
         saveprompt::show(self, &ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.watch_files {
+            diskwatch::show(self, &ctx);
+        }
         pluginsui::show(self, &ctx);
         extensionsui::show(self, &ctx);
         plugindialog::show(self, &ctx);
@@ -5923,6 +6157,7 @@ const MAX_STEP_BYTES: usize = 4 << 20;
 /// `record_tests::every_optional_layer_is_classified` fails until it is placed here or there.
 const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
     "select.byAttributes",
+    "stac.search",
     "select.rows",
     "select.layerFromSelection",
     "data.similar",
@@ -5967,6 +6202,23 @@ mod record_tests {
         let layers: Vec<Option<&serde_json::Value>> =
             steps.iter().filter(|s| s.command == "map.terrain").map(|s| s.params.get("layer")).collect();
         assert_eq!(layers, [Some(&json!(dem.1)), None]);
+    }
+
+    /// A STAC search records the active layer only when its search area is that layer's selection.
+    #[test]
+    fn a_stac_search_names_the_active_layer_only_for_its_selection() {
+        let mut app = RustGisApp::with_sample();
+        let layer = app.session.map().layers.first().map(|l| l.id);
+        app.session.active_layer = layer;
+        for (params, names) in [
+            (json!({"intersects": "selection"}), true),
+            (json!({"intersects": " Selection "}), true),
+            (json!({"bbox": [0, 0, 1, 1]}), false),
+            (json!({"intersects": {"type": "Point", "coordinates": [0, 0]}}), false),
+            (json!({}), false),
+        ] {
+            assert_eq!(app.layer_acted_on("stac.search", &params).is_some(), names, "{params}");
+        }
     }
 
     /// Every command with an optional `layer` either needs an active layer to be enabled, defaults
@@ -6811,6 +7063,7 @@ mod download_service_tests {
 
     /// Real UI discovery never restores a login after a foreign hop, while a public saved
     /// connection on a same-origin chain can still gain its legitimate login later.
+    /// Empty supplied collections retain the legacy map offer and its UI tile-resolver path.
     #[test]
     fn tile_discovery_keeps_foreign_lineage_and_same_origin_connections() {
         use rustgis_engine::render::rustgis_tiles::{cache, logins};
@@ -6856,9 +7109,18 @@ mod download_service_tests {
                     connection = c["id"].as_str().unwrap().to_string();
                 }
             }
-            let text = json!({"title":"Lineage","links":[{"rel":"tilesets-map","href":format!("{a}/list")}]}).to_string();
-            let source = crate::serviceui::ServiceSource { url: a.into(), kind: "ogcapi", text: text.clone(), documents: Vec::new() };
-            let listing = app.session.run("service.layers", &json!({"url":a,"type":"ogcapi","text":text,"connection":connection})).unwrap();
+            let text = json!({"title":"Lineage","links":[
+                {"rel":"tilesets-map","href":format!("{a}/list")},
+                {"rel":"data","type":"application/json","href":format!("{a}/collections")}
+            ]})
+            .to_string();
+            let documents = vec![json!({"url":format!("{a}/collections"),"text":"{\"collections\":[]}"})];
+            let source =
+                crate::serviceui::ServiceSource { url: a.into(), kind: "ogcapi", text: text.clone(), documents: documents.clone() };
+            let listing = app
+                .session
+                .run("service.layers", &json!({"url":a,"type":"ogcapi","text":text,"documents":documents,"connection":connection}))
+                .unwrap();
             crate::serviceui::add_layer_from(&mut app, &source, &listing["layers"][0], "", None, false, None, Some(&connection)).unwrap();
             app.ws.recording = Some(Vec::new());
             for _ in 0..3 {
@@ -6905,6 +7167,81 @@ mod download_service_tests {
                 Some(&(logins::inner(&url).to_string(), !foreign)),
                 "render fetch preserves lineage after reload"
             );
+        }
+    }
+
+    /// The dialog schedules supplied-document parsing and polls its result on a later frame.
+    /// Cancel also wins over a completed result that has not yet been installed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ogc_dataset_dialog_listing_runs_off_frame_and_cancels() {
+        let wait = |app: &mut RustGisApp| {
+            let started = std::time::Instant::now();
+            while app.ui.service.as_ref().unwrap().reading.is_some() && started.elapsed() < std::time::Duration::from_secs(5) {
+                app.poll_service();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(app.ui.service.as_ref().unwrap().reading.is_none());
+        };
+        let text = br#"{"collections":[{"id":"roads"},{"id":"water"}]}"#;
+        for cancel in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.reads_off_frame = true;
+            app.ui.service = Some(super::ServiceConn {
+                url: "https://maps.example.org/dataset".into(),
+                connection: None,
+                kind: "ogcapi",
+                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(text.to_vec())))),
+                reading: None,
+                text: None,
+                documents: Vec::new(),
+                pending: None,
+                listing: None,
+                added: None,
+                typed: None,
+                search: None,
+                error: None,
+                failure: None,
+            });
+            app.poll_service();
+            let conn = app.ui.service.as_ref().unwrap();
+            assert!(conn.reading.is_some(), "parsing is scheduled, not run on this frame");
+            assert!(conn.listing.is_none());
+            if cancel {
+                let started = std::time::Instant::now();
+                let reading = conn.reading.as_ref().unwrap();
+                while reading.slot.lock().unwrap().is_none() && started.elapsed() < std::time::Duration::from_secs(5) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                assert!(reading.slot.lock().unwrap().is_some(), "the result is ready but has not landed");
+                conn.reading.as_ref().unwrap().control.cancel();
+            }
+            wait(&mut app);
+            let conn = app.ui.service.as_ref().unwrap();
+            assert!(conn.reading.is_none());
+            assert!(conn.pending.is_none());
+            if cancel {
+                assert!(conn.error.as_ref().is_some_and(|e| e.contains("cancelled")));
+                assert!(conn.listing.is_none());
+                let conn = app.ui.service.as_mut().unwrap();
+                super::serviceui::listed(conn, Ok(json!({"count":0,"layers":[]})), None);
+                assert!(conn.error.is_none(), "a successful retry clears the cancellation error");
+            } else {
+                assert!(conn.error.is_none(), "{:?}", conn.error);
+                assert_eq!(conn.listing.as_ref().unwrap()["count"], 2);
+                let params = json!({"url":conn.url,"type":"ogcapi","text":String::from_utf8_lossy(text),"filter":"roads"});
+                let reading = super::serviceui::ListingRead::start(&mut app.session, &params).unwrap();
+                let conn = app.ui.service.as_mut().unwrap();
+                conn.reading = Some(reading);
+                conn.pending = Some(conn.url.clone());
+                app.ui.service_browse.filter = "water".into();
+                wait(&mut app);
+                let conn = app.ui.service.as_ref().unwrap();
+                let search = conn.search.as_ref().unwrap();
+                assert_eq!(search.filter, "roads", "an earlier search retains its own key");
+                assert_eq!(search.listing.as_ref().unwrap()["count"], 1);
+                assert_eq!(conn.listing.as_ref().unwrap()["count"], 2, "a search never replaces the root listing");
+            }
         }
     }
 

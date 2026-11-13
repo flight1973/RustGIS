@@ -15,7 +15,7 @@ use crate::{CmdResult, CommandSpec as C, Session};
 pub fn commands() -> Vec<C> {
     vec![
         C::new("gp.env", "Environments", "Analyze › Geoprocessing", environments).inputs(environment_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"extent"?: "view"|"full"|layer name|[minLon, minLat, maxLon, maxLat]|null, "cellSize"?: degrees|null}"#,
+            r#"{"extent"?: "view"|"full"|layer name|[minLon, minLat, maxLon, maxLat]|null, "crs"?: projected coordinate system ("EPSG:32616") rasters are made in|null (none: the layer's projected system, else degrees), "cellSize"?: in degrees, or in the units of the crs when one is set|null}"#,
         ),
         // A setting of the whole process, not of the project: no undo step, and `Reserved`, so the
         // assistant asks first and agents, plugins and imported items can't change it.
@@ -60,12 +60,12 @@ pub fn commands() -> Vec<C> {
             r#"{"criteria": [{"layer": raster, "band"?: 1-based, "ranges": [[lo, hi, score]], "weight": number}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
         C::new("analysis.viewshed", "Visibility Analysis", "Analyze › Workflows", viewshed).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"layer": elevation raster, "lon", "lat", "band"?: 1-based, "height"?: observer metres, "radius"?: metres, "name"?: output, "ran"?: (internal: a viewshed the app has worked out)}"#),
+            .params(r#"{"layer": elevation raster, "lon", "lat", "band"?: 1-based, "height"?: observer metres, 0 to 10,000 (default 1.7), "radius"?: metres (default: the whole raster), "heights"?: "nearest" (default) | "bilinear" (the ground along each ray), "name"?: output, "ran"?: (internal: a viewshed the app has worked out)}"#),
         C::new("analysis.lineOfSight", "Line Of Sight", "Analyze › Workflows", line_of_sight).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layer": elevation raster, "from": [lon, lat], "to": [lon, lat], "band"?: 1-based, "observerHeight"?: m, "targetHeight"?: m, "name"?: output}"#,
         ),
         C::new("analysis.interpolate", "Geostatistical Wizard", "Analyze › Workflows", interpolate).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer": points, "field": numeric field, "cellSize"?: degrees, "power"?: 2, "neighbors"?: 12, "name"?: output, "ran"?: (internal: a surface the app has worked out)}"#,
+            r#"{"layer": points, "field": numeric field, "crs"?: projected coordinate system ("EPSG:32616") to make it in (default the environment's, else the layer's projected system, else degrees; "EPSG:4326" for degrees), "cellSize"?: in degrees, or in the units of the crs, "power"?: 2, "neighbors"?: 12, "name"?: output, "ran"?: (internal: a surface the app has worked out)}"#,
         ),
         C::new("analysis.route", "Network Analysis", "Analyze › Workflows", route).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layer": line network, "from": [lon, lat], "to": [lon, lat], "costField"?: field, "snapDistance"?: metres, "name"?: output}"#,
@@ -154,6 +154,13 @@ pub(crate) fn made(raster: Raster, extra: Option<Value>) -> Result<Made, String>
     Ok(made_layer(name, layer, extra, None))
 }
 
+/// [`made`], with what is done once the layer is added (`then`).
+pub(crate) fn made_then(raster: Raster, extra: Option<Value>, then: Option<Then>) -> Result<Made, String> {
+    let mut m = made(raster, extra)?;
+    m.then = then;
+    Ok(m)
+}
+
 /// A layer made (styled, say), to be added as `name`.
 pub(crate) fn made_layer(name: String, layer: rustgis_map::RasterLayer, extra: Option<Value>, then: Option<Then>) -> Made {
     Made { name, layer, extra, then, ran: None, continuation: None }
@@ -161,7 +168,7 @@ pub(crate) fn made_layer(name: String, layer: rustgis_map::RasterLayer, extra: O
 
 /// Adds a made raster as a layer: the command's answer is the layer's (its id, size and bands) and
 /// what the command says besides (`extra`), and what it does then.
-fn add_made(s: &mut Session, m: Made) -> CmdResult {
+pub(crate) fn add_made(s: &mut Session, m: Made) -> CmdResult {
     let Made { name, layer, extra, then, .. } = m;
     let mut v = super::raster::add_raster(s, &name, layer)?;
     if let (Some(Value::Object(more)), Some(o)) = (extra, v.as_object_mut()) {
@@ -194,6 +201,8 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str, Start)] = &[
     ("raster.process", "Process", super::imagery::process_work),
     ("imagery.mosaic", "Build Mosaic", super::imagery::mosaic_work),
     ("dl.classify", "Deep Learning", super::deeplearning::classify_work),
+    ("embeddings.similarity", "Satellite Embedding Similarity", super::embeddings::similarity_work),
+    ("embeddings.change", "Satellite Embedding Change", super::embeddings::change_work),
 ];
 
 /// `command` and what it is called, when it makes its raster on another thread from the app (see
@@ -339,6 +348,10 @@ fn out_name(p: &Value, default: String) -> String {
     ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(200).collect()).unwrap_or(default)
 }
 
+/// `gp.env`: sets what it's given of the geoprocessing environment (the extent, the projected
+/// system rasters are made in, the cell size in that system's units or in degrees), and answers
+/// the whole environment with this computer's memory limits. A system and cell size given together
+/// are both checked before either is set.
 fn environments(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(v) = p.get("extent") {
         let e = match v {
@@ -374,11 +387,39 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
         }
         s.project.gp_env.extent = e;
     }
-    if let Some(v) = p.get("cellSize") {
-        s.project.gp_env.cell_size = match v {
-            Value::Null => None,
-            _ => Some(f(p, "cellSize").filter(|c| *c > 0.0 && *c < 10.0).ok_or("cellSize is degrees, above 0")?),
-        };
+    // Both read before either is set, so a bad one changes nothing and says nothing; a cell size
+    // given with a system is in its units.
+    let mut note = None;
+    let projected = match p.get("crs") {
+        None => s.project.gp_env.projected,
+        Some(Value::Null) => None,
+        Some(Value::String(t)) if t.trim().is_empty() => None,
+        Some(Value::String(t)) => {
+            let (crs, compatibility) = rustgis_analysis::projected_crs(t.trim())?;
+            note = compatibility;
+            // The same system again keeps its cell size; another one starts without one.
+            let cell_size = s.project.gp_env.projected.filter(|g| g.crs == crs).and_then(|g| g.cell_size);
+            Some(crate::project::ProjectedCells { crs, cell_size })
+        }
+        Some(_) => return Err("crs is a projected coordinate system (such as \"EPSG:32616\"), or null".into()),
+    };
+    let size = match p.get("cellSize") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(_) => Some(Some(f(p, "cellSize").filter(|c| c.is_finite() && *c > 0.0).ok_or("cellSize is a size above 0")?)),
+    };
+    if projected.is_none() && size.flatten().is_some_and(|c| c >= 10.0) {
+        return Err("cellSize is degrees, above 0 and below 10, without a crs".into());
+    }
+    if let Some(note) = note {
+        s.notify(format!("Environments: its coordinate system: {note}"), false);
+    }
+    s.project.gp_env.projected = projected;
+    if let Some(size) = size {
+        match s.project.gp_env.projected.as_mut() {
+            Some(g) => g.cell_size = size,
+            None => s.project.gp_env.cell_size = size,
+        }
     }
     let env = &s.project.gp_env;
     // The memory limits on this computer (#1291 step 2), so a script or model can see why a run
@@ -396,7 +437,10 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
         "threads": rustgis_data::threads::max(),
         "cores": rustgis_data::threads::cores(),
     });
-    Ok(json!({"extent": env.extent.map(|e| [e.min_x, e.min_y, e.max_x, e.max_y]), "cellSize": env.cell_size, "limits": limits}))
+    let projected = env.projected.map(|g| json!({"crs": g.crs.code(), "label": g.crs.label(), "cellSize": g.cell_size}));
+    Ok(
+        json!({"extent": env.extent.map(|e| [e.min_x, e.min_y, e.max_x, e.max_y]), "cellSize": env.cell_size, "projected": projected, "limits": limits}),
+    )
 }
 
 /// `gp.threads`: sets the most threads one piece of work uses (#1562), for the whole process
@@ -977,6 +1021,7 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
     let src = raster_of(s, ps(p, "layer").ok_or("layer is required")?)?;
     let target = resample_target(s, p)?;
     let name = out_name(p, format!("{}_{}", src.name, ps(p, "function").unwrap_or("")));
+    let defaults = s.raster_defaults.clone();
     let mut p = p.clone();
     // Read here, on the command's thread, where an unreadable value is said (#1600); only a remap
     // or threshold reads it.
@@ -985,9 +1030,30 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
     }
     Ok(Box::new(move || {
         let pixels = apply_function(&src, &p, target.as_deref())?;
+        if is_hillshade(&p) {
+            return made_hillshade(rasterops::derive_hillshade(&src, &name, pixels)?, &defaults);
+        }
         // Only a resample takes another raster's grid.
         made(rasterops::derive(target.as_deref().unwrap_or(&src), &name, vec![pixels])?, None)
     }))
+}
+
+/// Whether raster function step `p` is a hillshade, whose pixels are bytes
+/// ([`rasterops::derive_hillshade`]).
+fn is_hillshade(p: &Value) -> bool {
+    ps(p, "function") == Some("hillshade")
+}
+
+/// [`made`] for a hillshade, drawn as a stretch on the session's raster `defaults` however few
+/// shades it holds: as whole numbers, 16 or fewer (a gentle slope) would otherwise be drawn as
+/// classes (Unique Values).
+fn made_hillshade(raster: Raster, defaults: &rustgis_map::RasterDefaults) -> Result<Made, String> {
+    let mut m = made(raster, None)?;
+    let style = &mut m.layer.style;
+    style.renderer = rustgis_map::RasterRenderer::Stretch { band: 0, ramp: defaults.ramp.clone(), invert: defaults.invert };
+    style.stretch = defaults.stretch;
+    style.resampling = defaults.resampling;
+    Ok(m)
 }
 
 /// Runs raster functions one after another, each on the previous one's output.
@@ -1014,6 +1080,7 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
         .map(|(i, st)| resample_target(s, st).map_err(|e| format!("step {} ({}): {e}", i + 1, func(st))))
         .collect::<Result<_, _>>()?;
     let named = Some(out_name(p, String::new())).filter(|n| !n.is_empty());
+    let defaults = s.raster_defaults.clone();
     Ok(Box::new(move || {
         let mut cur: Raster = (*src).clone();
         let mut names = Vec::new();
@@ -1021,11 +1088,19 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
             let f = func(st);
             let pixels = apply_function(&cur, st, target.as_deref()).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
             // Only a resample takes another raster's grid; otherwise the grid is the current one.
-            cur = rasterops::derive(target.as_deref().unwrap_or(&cur), &cur.name, vec![pixels])?;
+            cur = if is_hillshade(st) {
+                rasterops::derive_hillshade(&cur, &cur.name, pixels)?
+            } else {
+                rasterops::derive(target.as_deref().unwrap_or(&cur), &cur.name, vec![pixels])?
+            };
             names.push(f);
         }
         cur.name = named.unwrap_or_else(|| format!("{}_{}", cur.name, names.join("_")));
-        made(cur, None)
+        // A chain that ends in a hillshade is drawn as one.
+        match steps.last() {
+            Some(last) if is_hillshade(last) => made_hillshade(cur, &defaults),
+            _ => made(cur, None),
+        }
     }))
 }
 
@@ -1083,14 +1158,99 @@ fn viewshed_work(s: &Session, p: &Value) -> Result<Work, String> {
     let at = Coord::new(f(p, "lon").ok_or("lon is required")?, f(p, "lat").ok_or("lat is required")?);
     let band = band_of(p, &dem)?;
     let (cx, cy) = dem.cell_size_m();
-    // The whole raster by default: its diagonal reaches every cell from any observer.
-    let radius = f(p, "radius").unwrap_or((cx * dem.width as f64).hypot(cy * dem.height as f64)).clamp(1.0, 500_000.0);
-    let height = f(p, "height").unwrap_or(1.7).clamp(0.0, 10_000.0);
+    // The whole raster by default, however large: its diagonal reaches every cell from any
+    // observer, and only the raster's cells are worked out. A radius given past the diagonal
+    // covers the same cells, so it is taken as the diagonal: nothing is left out.
+    let diagonal = (cx * dem.width as f64).hypot(cy * dem.height as f64).max(1.0);
+    let radius = match p.get("radius") {
+        None | Some(Value::Null) => diagonal,
+        Some(v) => {
+            f(p, "radius").filter(|r| *r > 0.0).ok_or_else(|| format!("radius must be a number of metres above 0, not {v}"))?.min(diagonal)
+        }
+    };
+    // A raster around the whole Earth (in longitude/latitude) has its east and west edges side
+    // by side, but rays don't cross from one to the other: said when the radius reaches an edge.
+    // (Within half a cell of 360°: a cell size stored rounded falls a little short.)
+    let pw = dem.transform.pixel_width.abs();
+    let round_the_earth = dem.crs.is_geographic() && pw * f64::from(dem.width) >= 360.0 - pw / 2.0;
+    let (oc, or) = dem.pixel_at(at).unwrap_or((0, 0));
+    let (w, h) = (i64::from(dem.width), i64::from(dem.height));
+    let (near, far) = (oc.min(w - 1 - oc), oc.max(w - 1 - oc));
+    // Only when the way across the edge is shorter than the way through the raster: the cell
+    // just across the near edge is `near + 1` cells away across it and `far` through the raster,
+    // and with no shorter way (the observer within a cell of the middle column) every cell is
+    // worked out as near as it is.
+    let seam = round_the_earth && near + 1 < far && (near as f64 + 1.0) * cx <= radius;
+    // The ground just across the edge is the far edge's column, reached only through the raster:
+    // worked out the long way round in the rows where the radius reaches it (cell centres, as the
+    // viewshed measures them). The rows with ground across the edge within the radius are those
+    // where it reaches a cell one past the near edge. All of them are worked out when the radius
+    // reaches the far column in the farthest of those rows, none when it doesn't reach the far
+    // column even on the observer's row.
+    let reaches = |dc: i64, dr: i64| (dc as f64 * cx).hypot(dr as f64 * cy) <= radius;
+    // The rows are walked only on a raster round the Earth, at most its height.
+    let last_row = if seam { (0..=or.max(h - 1 - or)).take_while(|dr| reaches(near + 1, *dr)).last().unwrap_or(0) } else { 0 };
+    let across = if !reaches(far, 0) {
+        "left out of the viewshed"
+    } else if reaches(far, last_row) {
+        "worked out the long way round"
+    } else {
+        "worked out the long way round near the observer's row and left out farther from it"
+    };
+    // Refused, naming it, when it isn't a height a viewshed takes: never another one used.
+    let height = match p.get("height") {
+        None | Some(Value::Null) => 1.7,
+        Some(v) => f(p, "height")
+            .filter(|h| (0.0..=10_000.0).contains(h))
+            .ok_or_else(|| format!("height must be a number of metres from 0 to 10,000, not {v}"))?,
+    };
+    // How the ground along each ray is read: the cell a point falls in, or between cells.
+    let heights = match p.get("heights") {
+        None | Some(Value::Null) => rasterops::Heights::Nearest,
+        Some(Value::String(h)) => {
+            rasterops::Heights::named(h).ok_or_else(|| format!("heights must be \"nearest\" or \"bilinear\", not \"{h}\""))?
+        }
+        Some(other) => return Err(format!("heights must be \"nearest\" or \"bilinear\", not {other}")),
+    };
     let name = out_name(p, format!("{}_viewshed", dem.name));
+    let dem_name = dem.name.clone();
     Ok(Box::new(move || {
-        let vs = rasterops::viewshed(&dem, band, at, height, radius)?;
-        let seen = vs.iter().filter(|v| **v == 1.0).count();
-        made(rasterops::derive(&dem, &name, vec![vs])?, Some(json!({"visibleCells": seen})))
+        let vs = rasterops::viewshed(&dem, band, at, height, radius, heights)?;
+        let seen = vs.cells.iter().filter(|v| **v == 1.0).count();
+        let (through_gaps, read_nearest) = (vs.through_gaps, vs.read_nearest);
+        let answer = json!({"visibleCells": seen, "acrossNoData": through_gaps, "readNearest": read_nearest});
+        let m = made(rasterops::derive(&dem, &name, vec![vs.cells])?, Some(answer))?;
+        if through_gaps == 0 && read_nearest == 0 && !seam {
+            return Ok(m);
+        }
+        // Ground with no data hides nothing, and bilinear heights read the nearest cell beside
+        // it: said, with how many cells it touched. Rays that don't cross the raster's east–west
+        // edge, said too.
+        let then: Then = Box::new(move |s: &mut Session, _: &mut Value| {
+            if seam {
+                s.notify(
+                    format!(
+                        "{dem_name}: the raster goes round the Earth, but the viewshed's rays don't cross its east–west edge: ground just across it is {across}"
+                    ),
+                    false,
+                );
+            }
+            if through_gaps > 0 {
+                s.notify(
+                    format!(
+                        "{dem_name}: {through_gaps} cell(s) of the viewshed were seen across ground with no data, taken as hiding nothing"
+                    ),
+                    false,
+                );
+            }
+            if read_nearest > 0 {
+                s.notify(
+                    format!("{dem_name}: {read_nearest} cell(s) were worked out with the nearest cell's height next to ground with no data, not between cells"),
+                    false,
+                );
+            }
+        });
+        Ok(Made { then: Some(then), ..m })
     }))
 }
 
@@ -1154,16 +1314,58 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
         pts.push((c, v));
     }
     let (layer_name, field_name) = (ds.name.clone(), field.to_string());
-    let e = s.project.gp_env.extent.unwrap_or_else(|| {
-        let mut e = Extent::EMPTY;
-        pts.iter().for_each(|(c, _)| e.expand(*c));
-        e.padded(0.05, 0.01)
+    // The system: the one given, else the environment's, else the projected one the layer was read
+    // in, else degrees.
+    let env = &s.project.gp_env;
+    // An empty `crs` is none given, as `null` is: the environment's system still applies.
+    let given = p.get("crs").is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
+    let (crs, crs_note) = match env.projected {
+        Some(g) if !given => (g.crs, None),
+        _ => rustgis_analysis::raster_crs(ds, p, "Geostatistical Wizard")?,
+    };
+    let crs_note = rustgis_analysis::in_its_units(p, crs, crs_note, &Extent::EMPTY, &[], &["cellSize"]);
+    let env_extent = env.extent;
+    let given_cell = f(p, "cellSize").or(env.cell_in(crs));
+    // The environment's cell sizes this run doesn't use are said: the projected one when the run is
+    // in another system, the degree one when it isn't in degrees. Run in the environment's own
+    // system with its size, the degree size kept beside it (for older versions) goes unsaid.
+    let own = env.projected.is_some_and(|g| g.crs == crs && g.cell_size.is_some());
+    let unused: Vec<String> = [
+        env.projected.filter(|g| g.crs != crs).and_then(|g| g.cell_size.map(|c| format!("{c}, in {}'s units", g.crs.label()))),
+        env.cell_size.filter(|_| crs != Crs::LonLat && !own).map(|c| format!("{c}, in degrees")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let cell_note = (f(p, "cellSize").is_none() && !unused.is_empty()).then(|| {
+        let (what, verb) = if unused.len() > 1 { ("sizes", "weren't") } else { ("size", "wasn't") };
+        let from_extent = if given_cell.is_none() { "; the cell size was set from the extent" } else { "" };
+        format!(
+            "Geostatistical Wizard: the environment's cell {what} ({}) {verb} used for a surface made in {}{from_extent}. Give cellSize, or set the environment's cell size in {}",
+            unused.join("; "),
+            crs.label(),
+            if crs == Crs::LonLat { "degrees".to_string() } else { format!("{}'s units", crs.label()) }
+        )
     });
-    let cell = f(p, "cellSize").or(s.project.gp_env.cell_size).unwrap_or((e.width().max(e.height()) / 300.0).max(1e-5));
     let name = out_name(p, format!("{}_{field}_idw", ds.name));
     let power = f(p, "power").unwrap_or(2.0).clamp(0.5, 10.0);
     let neighbors = p.get("neighbors").and_then(Value::as_u64).unwrap_or(12).max(1) as usize;
     Ok(Box::new(move || {
+        // Off the window's thread: the points, and the grid they set, in the system.
+        let (pts, beyond_note) = rustgis_analysis::points_in(crs, pts)?;
+        let e = match env_extent {
+            Some(e) if crs == Crs::LonLat => e,
+            Some(e) => {
+                let [x0, y0, x1, y1] = rustgis_analysis::warp::bounds_in([e.min_x, e.min_y, e.max_x, e.max_y], crs)?;
+                Extent::new(x0, y0, x1, y1)
+            }
+            None => {
+                let mut e = Extent::EMPTY;
+                pts.iter().for_each(|(c, _)| e.expand(*c));
+                e.padded(0.05, rustgis_analysis::min_pad(crs))
+            }
+        };
+        let cell = given_cell.unwrap_or((e.width().max(e.height()) / 300.0).max(1e-5));
         // A surface that can't be made says what was left out of it, so the input can be fixed.
         let left_out = |e: String| {
             let mut why = Vec::new();
@@ -1173,10 +1375,19 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
             if no_value > 0 {
                 why.push(format!("{no_value} whose value isn't a number"));
             }
-            if why.is_empty() { e } else { format!("{e} ({} left out)", why.join(", ")) }
+            let e = if why.is_empty() { e } else { format!("{e} ({} left out)", why.join(", ")) };
+            // A size read in the layer's system's units, or one the environment holds that wasn't
+            // used, can be why it failed.
+            let notes: Vec<&str> = [crs_note.as_deref(), cell_note.as_deref()].into_iter().flatten().collect();
+            let e = if notes.is_empty() { e } else { format!("{e} ({})", notes.join("; ")) };
+            // Points the system can't hold can be why there are too few.
+            match &beyond_note {
+                Some(note) => format!("{e}; {note}"),
+                None => e,
+            }
         };
-        let m = made(rasterops::idw(&pts, &e, cell, power, neighbors, &name, Crs::LonLat).map_err(left_out)?, None)?;
-        if no_point == 0 && no_value == 0 {
+        let m = made(rasterops::idw(&pts, &e, cell, power, neighbors, &name, crs).map_err(left_out)?, None)?;
+        if no_point == 0 && no_value == 0 && beyond_note.is_none() && crs_note.is_none() && cell_note.is_none() {
             return Ok(m);
         }
         let then: Then = Box::new(move |s: &mut Session, v: &mut Value| {
@@ -1187,9 +1398,21 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
             if no_value > 0 {
                 why.push(format!("{no_value} whose {field_name} isn't a number"));
             }
-            s.notify(format!("{layer_name}: features left out of the surface: {}", why.join(", ")), false);
-            if let Some(o) = v.as_object_mut() {
-                o.insert("skipped".into(), json!({"noPoint": no_point, "noValue": no_value}));
+            if !why.is_empty() {
+                s.notify(format!("{layer_name}: features left out of the surface: {}", why.join(", ")), false);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("skipped".into(), json!({"noPoint": no_point, "noValue": no_value}));
+                }
+            }
+            if let Some(note) = beyond_note {
+                s.notify(format!("{layer_name}: {note}"), false);
+            }
+            // It names the layer itself.
+            if let Some(note) = crs_note {
+                s.notify(note, false);
+            }
+            if let Some(note) = cell_note {
+                s.notify(note, false);
             }
         });
         Ok(Made { then: Some(then), ..m })
@@ -1406,34 +1629,130 @@ fn similar(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({"similar": rows}))
 }
 
-/// Converts a layer to GeoJSON, CSV, KML, GPX or WKT text, written to `path` or returned; says when
-/// the layer's Z or M values were dropped on import, or its positions are approximate or aren't
-/// longitude/latitude.
+/// Converts text on the caller's thread for scripts and browser downloads. A streamed layer
+/// needs a file path so its full source can be read off the desktop frame, rather than returning
+/// only its loaded view. File conversions use the shared export lifecycle.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
+    if ps(p, "path").is_some() {
+        return super::exports::write_here(s, p, "data.convert");
+    }
+    let id = s.layer_id(p)?;
+    if s.map().layer(id).is_some_and(|l| l.is_streamed()) {
+        return Err("a streamed layer needs a path to convert its whole source; text conversion would contain only the loaded view".into());
+    }
     let ds = feature_ds(s, p)?;
-    let name_field =
-        ps(p, "nameField").and_then(|n| ds.field_index(n)).or_else(|| ds.fields.iter().position(|f| f.name.eq_ignore_ascii_case("name")));
-    let text = match ps(p, "format").ok_or("format is required")? {
-        "geojson" => rustgis_data::io::to_geojson(ds).to_string(),
-        "csv" => rustgis_data::io::to_csv(ds).map_err(|e| e.to_string())?,
-        "kml" => rustgis_data::interop::to_kml(ds, name_field).map_err(|e| e.to_string())?,
-        "gpx" => rustgis_data::interop::to_gpx(ds, name_field).map_err(|e| e.to_string())?,
-        "wkt" => rustgis_data::interop::to_wkt_csv(ds),
-        f => return Err(format!("unknown format '{f}'")),
-    };
-    // Every format here is longitude/latitude.
-    let notes = rustgis_data::export_notes([(ds, ds.extent())], ps(p, "path").unwrap_or(&ds.name), rustgis_data::raster::Crs::LonLat);
-    let out = match ps(p, "path") {
-        Some(path) => {
-            rustgis_data::io::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
-            json!({"path": path, "bytes": text.len()})
-        }
-        None => json!({"text": text}),
-    };
+    let (text, notes) = converted(ds, p)?;
+    let null_numbers = rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, conversion_format(p)?);
+    let target = ds.name.clone();
     for note in notes {
         s.notify(note, false);
     }
-    Ok(out)
+    super::share::notify_null_numbers(s, &target, null_numbers);
+    Ok(json!({"text": text}))
+}
+
+/// Captures a conversion's layer and parameters without reading its source on the UI thread.
+/// GeoJSON and CSV use the chunk writer; KML, GPX and WKT read whole within the existing memory
+/// limits, then check Cancel between features (one geometry's serialization is indivisible).
+pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
+    feature_ds(s, p)?;
+    let id = s.layer_id(p)?;
+    let layer = s.map().layer(id).ok_or("no such layer")?.clone();
+    let path = ps(p, "path").ok_or("path is required")?.to_string();
+    conversion_format(p)?;
+    let params = p.clone();
+    Ok(Box::new(move || {
+        let format = conversion_format(&params)?;
+        let chunks = if layer.is_streamed() && matches!(format, "geojson" | "csv") { layer.chunk_export()? } else { None };
+        let (mut notes, null_numbers) = if let Some((source, ds)) = chunks {
+            let result = rustgis_data::export::write_source_as_in(
+                source.as_ref(),
+                &ds,
+                std::path::Path::new(&path),
+                rustgis_data::raster::Crs::LonLat,
+                format,
+            )
+            .map_err(|e| e.to_string())?;
+            let mut notes = rustgis_data::export_notes([(&ds, layer.extent())], &path, rustgis_data::raster::Crs::LonLat);
+            if format == "csv" {
+                notes.extend(result.csv.notes(&path));
+            }
+            if result.skipped > 0 {
+                notes.push(format!("{path}: {} rows couldn't be read and were left out", result.skipped));
+            }
+            notes.extend(
+                rustgis_data::source::unread_dates_note(&ds.fields, &result.unread_dates)
+                    .map(|n| format!("{path}: {}: {n}, so they're empty in the export", ds.name)),
+            );
+            (notes, result.null_numbers)
+        } else {
+            let (whole, unreadable) = if layer.is_streamed() {
+                layer.load_all_counted().map(|(ds, n)| (Some(ds), n))?
+            } else {
+                (None, rustgis_map::Unreadable::default())
+            };
+            let ds = whole.as_ref().unwrap_or(&layer.dataset);
+            rustgis_data::progress::begin(ds.features.len());
+            let (text, mut notes) = converted(ds, &params)?;
+            rustgis_data::io::write_atomic(std::path::Path::new(&path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
+            if unreadable.rows > 0 {
+                notes.push(format!("{path}: {} rows couldn't be read and were left out", unreadable.rows));
+            }
+            notes.extend(unreadable.dates.iter().map(|n| format!("{path}: {}: {n}, so they're empty in the export", ds.name)));
+            (notes, rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, format))
+        };
+        let bytes = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len();
+        notes.push(format!("Exported {path}"));
+        let target = path.clone();
+        let then = (null_numbers > 0).then(|| {
+            Box::new(move |s: &mut Session, _: &mut Value| {
+                super::share::notify_null_numbers(s, &target, null_numbers);
+                Ok(())
+            }) as super::exports::Then
+        });
+        Ok(super::exports::Wrote {
+            answer: json!({"path": path, "bytes": bytes}),
+            notes,
+            written_path: Some(path),
+            then,
+            #[cfg(not(target_arch = "wasm32"))]
+            owner: None,
+        })
+    }))
+}
+
+/// Validates the existing case-sensitive format parameter before starting background work.
+fn conversion_format(p: &Value) -> Result<&str, String> {
+    match ps(p, "format").ok_or("format is required")? {
+        f @ ("geojson" | "csv" | "kml" | "gpx" | "wkt") => Ok(f),
+        f => Err(format!("unknown format '{f}'")),
+    }
+}
+
+/// Serializes a complete dataset and collects its loss notices for delivery after success.
+fn converted(ds: &Dataset, p: &Value) -> Result<(String, Vec<String>), String> {
+    let name_field =
+        ps(p, "nameField").and_then(|n| ds.field_index(n)).or_else(|| ds.fields.iter().position(|f| f.name.eq_ignore_ascii_case("name")));
+    let format = conversion_format(p)?;
+    let text = match format {
+        "geojson" => rustgis_data::io::to_geojson_text(ds).map_err(|e| e.to_string())?,
+        "csv" => rustgis_data::io::to_csv(ds).map_err(|e| e.to_string())?,
+        "kml" => rustgis_data::interop::to_kml(ds, name_field).map_err(|e| e.to_string())?,
+        "gpx" => rustgis_data::interop::to_gpx(ds, name_field).map_err(|e| e.to_string())?,
+        _ => rustgis_data::interop::to_wkt_csv(ds).map_err(|e| e.to_string())?,
+    };
+    // Every format here is longitude/latitude.
+    let target = ps(p, "path").unwrap_or(&ds.name);
+    let mut notes = rustgis_data::export_notes([(ds, ds.extent())], target, rustgis_data::raster::Crs::LonLat);
+    // CSV holds a point a row, GPX a name for each feature and no areas.
+    notes.extend(rustgis_data::io::export_losses_notes(ds, format, name_field, target));
+    // KML and GPX hold features with geometry only.
+    if let ext @ ("kml" | "gpx") = format {
+        let without =
+            if ext == "gpx" { rustgis_data::io::gpx_left_out(ds) } else { ds.features.iter().filter(|f| f.geometry.is_none()).count() };
+        notes.extend(rustgis_data::io::left_out_note(target, ext, without));
+    }
+    Ok((text, notes))
 }
 
 /// Binds the extent layer, or all full-extent layers, without computing a view or loading pixels.

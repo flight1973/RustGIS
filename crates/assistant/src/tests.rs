@@ -112,6 +112,12 @@ fn first_keyed_provider_is_the_first_key_provider_and_never_a_sign_in() {
     // TrustedRouter comes after it, for the same reason.
     assert_eq!(first_keyed(keyed(&["trustedrouter", "requesty"])), Some("requesty"));
     assert_eq!(first_keyed(keyed(&["trustedrouter"])), Some("trustedrouter"));
+    // Opper comes after Requesty, so its key never takes the place of another provider's either.
+    assert_eq!(first_keyed(keyed(&["opper", "requesty"])), Some("requesty"));
+    assert_eq!(first_keyed(keyed(&["opper"])), Some("opper"));
+    // UberLLM comes last, for the same reason.
+    assert_eq!(first_keyed(keyed(&["uberllm", "opper"])), Some("opper"));
+    assert_eq!(first_keyed(keyed(&["uberllm"])), Some("uberllm"));
     assert_eq!(first_keyed(keyed(&[])), None);
 }
 
@@ -739,6 +745,15 @@ fn geoprocessing_and_reading_data() {
     let r = v["rows"].as_array().cloned().unwrap_or_default();
     assert_eq!(r.len(), 3);
     assert!(r[0]["pop_max"].as_i64() >= r[1]["pop_max"].as_i64());
+    // Date-times order by instant, not by their text: 00:30+02:00 is before 23:00Z the day before.
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "seen", "type": "datetime"})).unwrap();
+    for (row, when) in [(0, "2026-03-05T00:30:00+02:00"), (1, "2026-03-04T23:00:00Z")] {
+        s.run("edit.setValue", &json!({"layer": "Cities", "row": row, "field": "seen", "value": when})).unwrap();
+    }
+    let latest =
+        run_tool_call(&mut s, &t("read_features", json!({"layer": "Cities", "order_by": "seen DESC", "limit": 1}))).unwrap_or_default();
+    let v: Value = serde_json::from_str(&latest).unwrap_or(Value::Null);
+    assert_eq!(v["rows"][0]["_row"], json!(1), "{latest}");
     assert!(run_tool_call(&mut s, &t("read_features", json!({"layer": "Cities", "fields": ["nope"]}))).is_err());
     assert!(run_tool_call(&mut s, &t("read_features", json!({"layer": "Cities", "fields": [1, null]}))).is_err());
     let cmds = run_tool_call(&mut s, &t("search_commands", json!({"query": "basemap"}))).unwrap_or_default();
@@ -1000,6 +1015,27 @@ fn trustedrouter_lists_its_models_with_a_bearer_key() {
     assert_eq!(p.model, "trustedrouter/auto");
     let req = models_request(&cfg("trustedrouter"));
     assert_eq!(req.url, "https://api.trustedrouter.com/v1/models");
+    assert!(req.headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer k"));
+}
+
+#[test]
+fn opper_lists_its_models_with_a_bearer_key() {
+    let p = preset("opper").expect("Opper preset");
+    assert_eq!((p.api, p.keyless, p.login), (Api::OpenAi, false, false));
+    assert_eq!(p.key_env, &["OPPER_API_KEY"]);
+    let req = models_request(&cfg("opper"));
+    assert_eq!(req.url, "https://api.opper.ai/v3/compat/models");
+    assert!(req.headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer k"));
+}
+
+#[test]
+fn uberllm_lists_its_models_with_a_bearer_key() {
+    let p = preset("uberllm").expect("UberLLM preset");
+    assert_eq!((p.api, p.keyless, p.login), (Api::OpenAi, false, false));
+    assert_eq!(p.key_env, &["UBERLLM_API_KEY"]);
+    assert_eq!(p.model, "anthropic/claude-sonnet-5.5");
+    let req = models_request(&cfg("uberllm"));
+    assert_eq!(req.url, "https://api.uberllm.dev/v1/models");
     assert!(req.headers.iter().any(|(k, v)| k == "Authorization" && v == "Bearer k"));
 }
 

@@ -103,6 +103,62 @@ pub struct GlyphRun {
     pub color: Color,
     pub transform: Transform,
     pub glyphs: Vec<Glyph>,
+    /// A halo's copy of the text, drawn under it (#1815): its glyphs filled and stroked this wide
+    /// (in the run's pixels), rounded, in `color`. `None` for the text itself.
+    pub halo: Option<f32>,
+}
+
+impl GlyphRun {
+    /// The run's glyph outlines as one path, in the run's space (before `transform`); `None`
+    /// for a run with no outline (spaces).
+    pub(crate) fn outline(&self) -> Option<Path> {
+        let upm = self.font.units_per_em().filter(|u| u.is_finite() && *u > 0.0).unwrap_or(1000.0);
+        let k = self.size / upm;
+        let mut pb = tiny_skia::PathBuilder::new();
+        for g in &self.glyphs {
+            let Some(o) = self.font.outline(g.id) else { continue };
+            let at = |p: ab_glyph::Point| (g.x + p.x * k, -p.y * k);
+            let mut last = None;
+            for c in &o.curves {
+                let (a, e) = match c {
+                    ab_glyph::OutlineCurve::Line(a, b)
+                    | ab_glyph::OutlineCurve::Quad(a, _, b)
+                    | ab_glyph::OutlineCurve::Cubic(a, _, _, b) => (*a, *b),
+                };
+                if last != Some(a) {
+                    if last.is_some() {
+                        pb.close();
+                    }
+                    let (x, y) = at(a);
+                    pb.move_to(x, y);
+                }
+                match c {
+                    ab_glyph::OutlineCurve::Line(_, b) => {
+                        let (x, y) = at(*b);
+                        pb.line_to(x, y);
+                    }
+                    ab_glyph::OutlineCurve::Quad(_, q, b) => {
+                        let ((qx, qy), (x, y)) = (at(*q), at(*b));
+                        pb.quad_to(qx, qy, x, y);
+                    }
+                    ab_glyph::OutlineCurve::Cubic(_, q1, q2, b) => {
+                        let ((ax, ay), (bx, by), (x, y)) = (at(*q1), at(*q2), at(*b));
+                        pb.cubic_to(ax, ay, bx, by, x, y);
+                    }
+                }
+                last = Some(e);
+            }
+            if last.is_some() {
+                pb.close();
+            }
+        }
+        pb.finish()
+    }
+
+    /// The stroke a halo run's glyphs are drawn with: `width` wide, rounded.
+    pub(crate) fn halo_stroke(width: f32) -> Stroke {
+        Stroke { width, cap: LineCap::Round, join: LineJoin::Round, ..Stroke::default() }
+    }
 }
 
 /// A glyph at its pen position along the run, and the character it stands for (what copying
@@ -135,6 +191,13 @@ pub struct Group {
     pub blend: Blend,
     pub clip: Option<Clip>,
     pub transform: Transform,
+    /// The layer its items make, named: a layout element, a map layer or its labels, which a PDF
+    /// writes as an optional content group so a vector editor opens it as a layer (#1815).
+    pub layer: Option<String>,
+    /// Which layer it is, where its name doesn't say (a map layer's id): groups with the same
+    /// name and id are runs of one layer (a map layer's labels, drawn among others'). Without
+    /// one, each group is a layer of its own, however named.
+    pub layer_id: Option<u64>,
 }
 
 /// A clip path: what is outside it isn't drawn.
@@ -226,7 +289,16 @@ impl Drawing {
         let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
         let clip = clip.filter(|c| c.transform.is_finite());
         self.cost += clip.as_ref().map_or(0, |c| path_cost(&c.path)) + 120;
-        self.open.push(Group { items: Vec::new(), opacity, blend, clip, transform: Transform::identity() });
+        self.open.push(Group { items: Vec::new(), opacity, blend, clip, transform: Transform::identity(), layer: None, layer_id: None });
+    }
+
+    /// Starts a layer named `name` (and identified by `id`, see [`Group::layer_id`]): what is drawn
+    /// until [`Drawing::end_group`] is one, drawn as it would be without it (see [`Group::layer`]).
+    pub fn begin_layer(&mut self, name: &str, id: Option<u64>) {
+        self.cost += 120 + name.len();
+        let layer = Some(name.chars().filter(|c| !c.is_control()).take(200).collect());
+        let (opacity, blend, transform) = (1.0, Blend::Normal, Transform::identity());
+        self.open.push(Group { items: Vec::new(), opacity, blend, clip: None, transform, layer, layer_id: id });
     }
 
     /// Places `child` as a group: its items moved by `transform` (from its space to this
@@ -253,7 +325,7 @@ impl Drawing {
         self.count += count;
         self.cost += cost;
         let opacity = if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 };
-        self.add(Item::Group(Group { items, opacity, blend, clip, transform }));
+        self.add(Item::Group(Group { items, opacity, blend, clip, transform, layer: None, layer_id: None }));
     }
 
     /// Ends the innermost group begun; nothing when none is open. An empty group is left out.
@@ -384,12 +456,25 @@ pub(crate) fn deflate_rows<'a, T: 'a>(rows: impl Iterator<Item = &'a [T]>, mut f
     (status == TDEFLStatus::Done).then_some(out)
 }
 
+/// `items` with every layer's group replaced by its items, at any depth: for tests that look at
+/// what is drawn, not at the layers it is in.
+#[cfg(test)]
+pub(crate) fn without_layers(items: Vec<Item>) -> Vec<Item> {
+    items
+        .into_iter()
+        .flat_map(|i| match i {
+            Item::Group(g) if g.layer.is_some() => without_layers(g.items),
+            Item::Group(g) => vec![Item::Group(Group { items: without_layers(g.items), ..g })],
+            other => vec![other],
+        })
+        .collect()
+}
+
 /// Draws `items` (moved by `base`) back onto pixels with tiny-skia: for tests comparing a
 /// recording with what the renderer draws.
 #[cfg(test)]
 pub(crate) fn replay(items: &[Item], pm: &mut Pixmap, base: Transform) {
-    use ab_glyph::Font;
-    use tiny_skia::{GradientStop, Paint, PathBuilder, PixmapPaint, Point, SpreadMode};
+    use tiny_skia::{GradientStop, Paint, PixmapPaint, Point, SpreadMode};
     let paint = |c: Color| {
         let mut p = Paint::default();
         p.set_color(c);
@@ -433,48 +518,14 @@ pub(crate) fn replay(items: &[Item], pm: &mut Pixmap, base: Transform) {
                 pm.stroke_path(path, &paint(*color), &st, base.pre_concat(*transform), None);
             }
             Item::Glyphs(run) => {
-                let upm = run.font.units_per_em().unwrap_or(1000.0);
-                let k = run.size / upm;
-                let mut pb = PathBuilder::new();
-                for g in &run.glyphs {
-                    let Some(o) = run.font.outline(g.id) else { continue };
-                    let at = |p: ab_glyph::Point| (g.x + p.x * k, -p.y * k);
-                    let mut last = None;
-                    for c in &o.curves {
-                        let (a, e) = match c {
-                            ab_glyph::OutlineCurve::Line(a, b)
-                            | ab_glyph::OutlineCurve::Quad(a, _, b)
-                            | ab_glyph::OutlineCurve::Cubic(a, _, _, b) => (*a, *b),
-                        };
-                        if last != Some(a) {
-                            if last.is_some() {
-                                pb.close();
-                            }
-                            let (x, y) = at(a);
-                            pb.move_to(x, y);
-                        }
-                        match c {
-                            ab_glyph::OutlineCurve::Line(_, b) => {
-                                let (x, y) = at(*b);
-                                pb.line_to(x, y);
-                            }
-                            ab_glyph::OutlineCurve::Quad(_, q, b) => {
-                                let ((qx, qy), (x, y)) = (at(*q), at(*b));
-                                pb.quad_to(qx, qy, x, y);
-                            }
-                            ab_glyph::OutlineCurve::Cubic(_, q1, q2, b) => {
-                                let ((ax, ay), (bx, by), (x, y)) = (at(*q1), at(*q2), at(*b));
-                                pb.cubic_to(ax, ay, bx, by, x, y);
-                            }
-                        }
-                        last = Some(e);
+                if let Some(path) = run.outline() {
+                    let at = base.pre_concat(run.transform);
+                    pm.fill_path(&path, &paint(run.color), tiny_skia::FillRule::Winding, at, None);
+                    if let Some(w) = run.halo {
+                        let s = GlyphRun::halo_stroke(w);
+                        let st = tiny_skia::Stroke { width: s.width, line_cap: s.cap, line_join: s.join, ..tiny_skia::Stroke::default() };
+                        pm.stroke_path(&path, &paint(run.color), &st, at, None);
                     }
-                    if last.is_some() {
-                        pb.close();
-                    }
-                }
-                if let Some(path) = pb.finish() {
-                    pm.fill_path(&path, &paint(run.color), tiny_skia::FillRule::Winding, base.pre_concat(run.transform), None);
                 }
             }
             Item::Image(image) => {
@@ -568,6 +619,7 @@ mod tests {
             color: Color::BLACK,
             transform: Transform::identity(),
             glyphs: vec![Glyph { id: ab_glyph::Font::glyph_id(font, 'W'), x: 0.0, ch: 'W' }],
+            halo: None,
         };
         let mut page = Drawing::new(10.0, 10.0);
         page.glyphs(run());

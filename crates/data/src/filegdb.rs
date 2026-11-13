@@ -210,22 +210,49 @@ fn wkids(t: &[u8], x: &[u8]) -> Vec<(String, u32)> {
 }
 
 /// The coordinate system Esri data names: by its EPSG or Esri `code` (a WKID), else from its `wkt`,
-/// with the transformer to longitude/latitude. `(None, None)` for longitude/latitude, and for a
-/// system that can't be read, which `report` says; coordinates are then read as longitude/latitude.
-/// Another body's system that can't be read is an error instead, because its coordinates would
-/// land in the wrong place as longitude/latitude. The File Geodatabase and ArcGIS protocol buffer
-/// readers share it.
+/// with the transformer to longitude/latitude. The WKT comes before the code when it gives another
+/// shift to WGS 84 than an EPSG code's, or is another body's system ([`esri_wkt_over_code`]).
+/// A system read by its code says a grid shift its WKT gives, which the code doesn't apply, and for
+/// an Esri code another Helmert shift its WKT gives, which is set aside.
+/// `(None, None)` for longitude/latitude, and for a system that can't be read, which `report`
+/// says; coordinates are then read as longitude/latitude. Another body's system that can't be read
+/// is an error instead, because its coordinates would land in the wrong place as
+/// longitude/latitude. The File Geodatabase and ArcGIS protocol buffer readers share it.
 pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadReport) -> Result<(Option<Crs>, Option<Transformer>)> {
     use crate::raster::planetary;
-    // By its code, else from the WKT.
-    let by_code = code.and_then(crs_of_code).and_then(|c| match c.transformer() {
-        Ok(t) if c != Crs::LonLat => Some((Some(c), Some(t))),
-        Ok(_) => Some((None, None)),
-        Err(_) => None,
-    });
+    // By its code, unless the WKT is read in its place ([`esri_wkt_over_code`]); else from the WKT.
+    let over_code = esri_wkt_over_code(code, wkt);
+    let by_code = if over_code.is_some() {
+        None
+    } else {
+        code.and_then(crs_of_code).and_then(|c| match c.transformer() {
+            Ok(t) if c != Crs::LonLat => Some((Some(c), Some(t))),
+            Ok(_) => Some((None, None)),
+            Err(_) => None,
+        })
+    };
     Ok(match (by_code, wkt) {
-        (Some(by_code), _) => by_code,
-        (None, Some(wkt)) => match crate::raster::wkt::read_wkt(wkt) {
+        (Some(by_code), _) => {
+            // A grid the WKT gives isn't applied by the code, which is said for any code (as for a
+            // GeoPackage's, #1678), longitude/latitude's too; the code's own shift, an Esri
+            // code's as an EPSG code's, is used in its place. An Esri code is read without its
+            // WKT's own Helmert shift, which is said too.
+            let esri =
+                code.filter(|c| Crs::from_epsg(*c).is_none()).and_then(|c| Some((format!("ESRI:{c}"), crate::raster::crs::esri_proj4(c)?)));
+            let note = wkt.and_then(|wkt| match &esri {
+                Some((name, def)) => crate::raster::wkt::unapplied_note_beside(wkt, name, def).or_else(|| {
+                    let why = "ArcGIS keeps transformations apart from the system";
+                    crate::raster::wkt::set_aside_shift_note(wkt, name, def, why)
+                }),
+                // `None` is longitude/latitude.
+                None => crate::raster::wkt::unapplied_note(wkt, by_code.0.unwrap_or(Crs::LonLat)),
+            });
+            if let Some(note) = note {
+                report.messages.push(format!("coordinate system: {note}"));
+            }
+            by_code
+        }
+        (None, Some(wkt)) => match over_code.unwrap_or_else(|| crate::raster::wkt::read_wkt(wkt)) {
             Ok((c, note)) => {
                 if let Some(n) = note {
                     report.messages.push(format!("coordinate system: {n}"));
@@ -251,6 +278,21 @@ pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadRe
     })
 }
 
+/// Esri data's `wkt` read in place of its `code`, as a `.prj` is read in place of its own
+/// `AUTHORITY` ([`read_wkt_over_code`](crate::raster::wkt::read_wkt_over_code), which gives the
+/// three cases): when it gives another shift to WGS 84 than an EPSG code's, or is another body's
+/// system. For an Esri (non-EPSG) code the WKT's shift is set aside, as ArcGIS keeps
+/// transformations apart from the system, and [`esri_crs`] says so. Only another body's WKT
+/// replaces an Esri code, as Esri's codes are the Earth's too.
+pub(crate) fn esri_wkt_over_code(code: Option<u32>, wkt: Option<&str>) -> Option<std::result::Result<(Crs, Option<String>), String>> {
+    let (code, wkt) = (code?, wkt?);
+    if Crs::from_epsg(code).is_some() {
+        crate::raster::wkt::read_wkt_over_code(wkt, code)
+    } else {
+        crate::raster::wkt::planetary_datum(wkt).map(|_| crate::raster::wkt::read_wkt(wkt))
+    }
+}
+
 /// A coordinate system by its EPSG or Esri code.
 pub(crate) fn crs_of_code(code: u32) -> Option<Crs> {
     Crs::from_epsg(code).or_else(|| {
@@ -268,6 +310,7 @@ pub(crate) fn crs_of_code(code: u32) -> Option<Crs> {
 
 /// One table as a dataset: `None` for a table with no rows and no fields worth showing. `wkid` is
 /// its coordinate system's code, when the item definitions give one.
+/// Reads a table and its row index, keeping typed attributes and reporting invalid or rounded dates.
 fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Option<(Dataset, ReadReport)>> {
     let table = Table::parse(t)?;
     let rows = row_offsets(x)?;
@@ -290,9 +333,9 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
             Kind::Geometry | Kind::Binary | Kind::Raster => continue,
             Kind::Int16 | Kind::Int32 | Kind::Int64 | Kind::ObjectId => FieldType::Integer,
             Kind::Float32 | Kind::Float64 => FieldType::Double,
-            Kind::Text | Kind::Xml | Kind::Guid | Kind::GlobalId | Kind::Date | Kind::DateOnly | Kind::TimeOnly | Kind::DateTimeOffset => {
-                FieldType::Text
-            }
+            Kind::Date | Kind::DateTimeOffset => FieldType::DateTime,
+            Kind::DateOnly => FieldType::Date,
+            Kind::Text | Kind::Xml | Kind::Guid | Kind::GlobalId | Kind::TimeOnly => FieldType::Text,
         };
         let alias = (!f.alias.is_empty() && f.alias != f.name).then(|| f.alias.clone());
         fields.push(Field { name: f.name.clone(), ty, alias });
@@ -327,14 +370,23 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
     let mut no_footprint = 0usize;
     // Shapes decoded, a multipatch's too (its M values go even when it has no footprint).
     let mut decoded = 0usize;
+    let mut unread_dates = Vec::new();
+    let mut rounded_dates = Vec::new();
     let mut budget = MAX_TABLE_FACES;
     for (row, offset) in rows {
+        crate::progress::step(1)?;
         let Some(mut values) = table.row(t, offset) else {
             report.skipped += 1;
             continue;
         };
         let mut attrs: Vec<Value> = Vec::with_capacity(ds.fields.len());
-        for &c in &columns {
+        for (k, &c) in columns.iter().enumerate() {
+            if values.get(c).is_some_and(|v| v.invalid_date) {
+                crate::source::unread_date(&mut unread_dates, k);
+            }
+            if values.get(c).is_some_and(|v| v.rounded_date) {
+                crate::source::unread_date(&mut rounded_dates, k);
+            }
             attrs.push(match table.fields.get(c).map(|f| f.kind) {
                 Some(Kind::ObjectId) => Value::Int(i64::try_from(row).unwrap_or(i64::MAX)),
                 // Taken, not cloned: each column is read once, and the geometry's blob stays.
@@ -374,6 +426,15 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
         };
         ds.push_next(geometry, attrs);
     }
+    let rounded: usize = rounded_dates.iter().sum();
+    if rounded > 0 {
+        report.messages.push(format!(
+            "{rounded} serial date values were rounded to the nearest microsecond, in {}",
+            crate::io::named_fields(&ds.fields, &rounded_dates)
+        ));
+    }
+    report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
+    report.messages.extend(report.unread_dates.clone());
     if curves > 0 {
         report.messages.push(format!("{curves} curved segments are drawn as straight lines"));
     }
@@ -608,6 +669,9 @@ struct Table {
 
 /// One field's value in a row: a value, or a geometry's bytes.
 struct Cell<'a> {
+    /// A stored, non-null date was invalid; the table read counts it by field.
+    invalid_date: bool,
+    rounded_date: bool,
     value: Value,
     blob: Option<&'a [u8]>,
 }
@@ -744,11 +808,20 @@ impl Table {
         for f in &self.fields {
             let null = f.null_bit.is_some_and(|bit| nulls.get(bit / 8).is_some_and(|b| b >> (bit % 8) & 1 == 1));
             if null || f.kind == Kind::ObjectId {
-                out.push(Cell { value: Value::Null, blob: None });
+                out.push(Cell { value: Value::Null, blob: None, invalid_date: false, rounded_date: false });
                 continue;
             }
             let text = |b: &[u8]| if self.utf8 { String::from_utf8_lossy(b).into_owned() } else { utf16(b) };
-            let cell = |value: Value| Cell { value, blob: None };
+            let cell = |value: Value| Cell { value, blob: None, invalid_date: false, rounded_date: false };
+            let date_cell = |days: f64, offset: Option<i16>, only: bool| {
+                let value = match gdb_datetime(days, offset) {
+                    Value::DateTime(t) if only && t.is_date() => Value::Date(t.date()),
+                    Value::DateTime(_) if only => Value::Null,
+                    v => v,
+                };
+                let rounded_date = !value.is_null() && serial_rounds(days);
+                Cell { invalid_date: value.is_null(), rounded_date, value, blob: None }
+            };
             out.push(match f.kind {
                 Kind::Int16 => cell(Value::Int(i64::from(c.i16()?))),
                 Kind::Int32 => cell(Value::Int(i64::from(c.i32()?))),
@@ -759,26 +832,18 @@ impl Table {
                     let n = usize::try_from(c.varuint()?).ok()?;
                     cell(Value::Text(text(c.bytes(n)?)))
                 }
-                Kind::Date => cell(date(c.f64()?, "YYYY-MM-DDTHH:mm:ss")),
-                Kind::DateOnly => cell(date(c.f64()?, "YYYY-MM-DD")),
+                Kind::Date => date_cell(c.f64()?, None, false),
+                Kind::DateOnly => date_cell(c.f64()?, None, true),
                 Kind::TimeOnly => cell(date(c.f64()?, "HH:mm:ss")),
                 Kind::DateTimeOffset => {
                     let days = c.f64()?;
                     let minutes = c.i16()?;
-                    cell(match date(days, "YYYY-MM-DDTHH:mm:ss") {
-                        Value::Text(s) => Value::Text(format!(
-                            "{s}{}{:02}:{:02}",
-                            if minutes < 0 { '-' } else { '+' },
-                            minutes.unsigned_abs() / 60,
-                            minutes.unsigned_abs() % 60
-                        )),
-                        v => v,
-                    })
+                    date_cell(days, Some(minutes), false)
                 }
                 Kind::Guid | Kind::GlobalId => cell(Value::Text(guid(c.bytes(16)?))),
                 Kind::Geometry => {
                     let n = usize::try_from(c.varuint()?).ok()?;
-                    Cell { value: Value::Null, blob: Some(c.bytes(n)?) }
+                    Cell { value: Value::Null, blob: Some(c.bytes(n)?), invalid_date: false, rounded_date: false }
                 }
                 Kind::Binary => {
                     let n = usize::try_from(c.varuint()?).ok()?;
@@ -794,6 +859,22 @@ impl Table {
 
 fn float(v: f64) -> Value {
     if v.is_finite() { Value::Float(v) } else { Value::Null }
+}
+
+/// Whether the floating-point serial has precision below the microsecond RustGIS stores.
+fn serial_rounds(days: f64) -> bool {
+    crate::date::serial_datetime(days, -25_569).is_some_and(|(_, rounded)| rounded)
+}
+
+/// FileGDB days count from 1899-12-30. Offset fields store local clock days and minutes east
+/// of UTC. Round the binary floating-point serial to microseconds, retaining its precision.
+fn gdb_datetime(days: f64, offset: Option<i16>) -> Value {
+    let Some((wall, _)) = crate::date::serial_datetime(days, -25_569) else { return Value::Null };
+    let t = match offset {
+        None => Some(wall),
+        Some(off) => wall.micros().checked_sub(i64::from(off) * 60_000_000).and_then(|v| crate::DateTime::with_offset(v, off)),
+    };
+    t.map(Value::DateTime).unwrap_or_default()
 }
 
 /// Days since 1899-12-30 as text in `fmt`.

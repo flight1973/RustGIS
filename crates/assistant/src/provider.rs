@@ -154,6 +154,30 @@ pub const PRESETS: &[Preset] = &[
         key_url: "https://trustedrouter.com",
         login: false,
     },
+    Preset {
+        id: "opper",
+        label: "Opper",
+        api: Api::OpenAi,
+        base_url: "https://api.opper.ai/v3/compat",
+        model: "claude-sonnet-5-5",
+        key_env: &["OPPER_API_KEY"],
+        url_env: "",
+        keyless: false,
+        key_url: "https://platform.opper.ai",
+        login: false,
+    },
+    Preset {
+        id: "uberllm",
+        label: "UberLLM",
+        api: Api::OpenAi,
+        base_url: "https://api.uberllm.dev/v1",
+        model: "anthropic/claude-sonnet-5.5",
+        key_env: &["UBERLLM_API_KEY"],
+        url_env: "",
+        keyless: false,
+        key_url: "https://uberllm.dev/signup",
+        login: false,
+    },
 ];
 
 /// The preset with this id.

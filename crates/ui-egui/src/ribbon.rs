@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 
 use crate::theme::{Tokens, regular, semibold};
 use crate::widgets::{
-    CONTENT_H, Dragged, LABEL_H, big, big_form_menu, big_menu, big_split_menu, col, group, menu_item, small, small_form_menu, small_menu,
-    submenu_row, text_w,
+    CONTENT_H, Dragged, LABEL_H, big, big_form_menu, big_menu, big_split_form_menu, big_split_menu, col, group, menu_item, small,
+    small_form_menu, small_menu, submenu_row, text_w,
 };
 use crate::{RightPane, RustGisApp, icons};
 
@@ -1802,10 +1802,64 @@ fn analysis_groups(app: &mut RustGisApp, ui: &mut Ui) {
     });
 }
 
+/// View › Display › Graticule's menu: the graticule's type (choosing one shows it), and the
+/// measured grid's coordinate system.
+fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
+    use rustgis_engine::map::graticule::GraticuleType;
+    let (on, kind) = (app.session.map().graticule, app.session.map().graticule_type);
+    for t in GraticuleType::ALL {
+        if ui.add(egui::Button::selectable(on && kind == t, tl!(t.label()))).clicked() {
+            if let Err(e) = app.run("map.graticule", json!({"type": t.code()})) {
+                app.session.notify(e, true);
+            }
+            ui.close();
+        }
+    }
+    ui.separator();
+    let name = ui.label(tl!("Measured grid's coordinate system"));
+    ui.horizontal(|ui| {
+        let edit = ui.add(egui::TextEdit::singleline(&mut app.ui.graticule_crs_input).hint_text("2056").desired_width(90.0)).on_hover_text(
+            tl!("An EPSG code, WKT or a PROJ string; empty: the map's own when it is projected, else the UTM zone at the view's centre"),
+        );
+        // Named by the label above it, for a screen reader (the hint is only a placeholder).
+        let edit = edit.labelled_by(name.id);
+        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if ui.button(tl!("Use System")).clicked() || enter {
+            let typed = app.ui.graticule_crs_input.trim();
+            let crs = if typed.is_empty() { String::new() } else { crate::dialogs::typed_crs(typed) };
+            match app.run("map.graticule", json!({"type": "measured", "crs": crs})) {
+                Ok(_) => {
+                    app.ui.graticule_crs_input.clear();
+                    ui.close();
+                }
+                Err(e) => app.session.notify(e, true),
+            }
+        }
+    });
+    let shown = app.session.map().graticule_crs.as_deref().map(rustgis_engine::map::graticule::short_crs);
+    ui.label(match shown {
+        Some(c) => crate::i18n::fmt("Now: {crs}", &[("crs", &c)]),
+        None => tl!("Now: the map's own, else the UTM zone at the centre").to_string(),
+    });
+}
+
 fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
     group(ui, "Display", |ui| {
         let g = app.session.map().graticule;
-        big(ui, app, "graticule", "Graticule", "Show latitude/longitude lines on the basemap.", "map.graticule", Value::Null, g, false);
+        big_split_form_menu(
+            ui,
+            app,
+            "graticule",
+            "Graticule",
+            "Show or hide the graticule over the basemap: latitudes and longitudes, a measured grid or the UTM zones.",
+            "map.graticule",
+            Value::Null,
+            g,
+            "Graticule options",
+            "What the graticule draws: latitudes and longitudes, a measured grid or the UTM zones.",
+            true,
+            graticule_menu,
+        );
         let gpu = app.map.gpu_enabled;
         big(
             ui,
@@ -2121,10 +2175,10 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 app,
                 "identify",
                 "Details",
-                "Details of the selected layer.",
+                "Details of the selected layer, on the Source tab of its properties.",
                 "ui.pane.details",
                 Value::Null,
-                app.ui.right == Some(RightPane::Details),
+                crate::layerprops::source_in_view(&app.ui),
             );
         });
         col(ui, |ui| {
@@ -2179,6 +2233,16 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 "ui.pane.diagnosticLog",
                 Value::Null,
                 app.ui.right == Some(RightPane::DiagnosticLog),
+            );
+            small(
+                ui,
+                app,
+                "settings",
+                "Layer Properties",
+                "Show the selected layer's settings in one place.",
+                "ui.pane.layerProperties",
+                Value::Null,
+                app.ui.right == Some(RightPane::LayerProperties),
             );
         });
     });
@@ -3926,16 +3990,21 @@ fn feature_style_groups(app: &mut RustGisApp, ui: &mut Ui) {
     layer_group(app, ui, &layer);
 }
 
-/// The polygon layers that could mask `layer`.
-fn mask_menu(ui: &mut Ui, app: &mut RustGisApp, layer: &rustgis_engine::map::Layer) {
-    let polys: Vec<String> = app
-        .session
+/// The names of the polygon layers that could mask `layer`: the ribbon's Masking menu and the
+/// Layer Properties pane's Display tab (#1803) offer the same ones.
+pub(crate) fn mask_choices(app: &RustGisApp, layer: &rustgis_engine::map::Layer) -> Vec<String> {
+    app.session
         .map()
         .layers
         .iter()
         .filter(|l| l.id != layer.id && l.geometry_type() == GeometryType::Polygon)
         .map(|l| l.name.clone())
-        .collect();
+        .collect()
+}
+
+/// The polygon layers that could mask `layer`.
+fn mask_menu(ui: &mut Ui, app: &mut RustGisApp, layer: &rustgis_engine::map::Layer) {
+    let polys = mask_choices(app, layer);
     let cur = layer.mask.clone();
     small_menu(ui, app, "polygon_layer", "Masking", "Show the layer only inside another layer's polygons.", move |ui, app| {
         if ui.radio(cur.is_none(), tl!("No mask")).clicked() {
@@ -4252,36 +4321,43 @@ fn imagery_groups(app: &mut RustGisApp, ui: &mut Ui) {
     });
 }
 
+/// The layer's Out Beyond and In Beyond pickers (`layer.scaleRange`), a row each: the ribbon's
+/// Visibility Range group and the Layer Properties pane's Display tab (#1803) share them. `salt`
+/// keeps the two places' pickers apart; `size` is the labels' text size.
+pub(crate) fn scale_range_rows(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map::Layer, salt: &str, size: f32) {
+    for (label, cur, key) in [("Out Beyond", layer.min_scale, "min"), ("In Beyond", layer.max_scale, "max")] {
+        ui.horizontal(|ui| {
+            let input_label = ui.label(egui::RichText::new(tl!(label)).size(size));
+            egui::ComboBox::from_id_salt(format!("{salt}_{key}"))
+                .selected_text(scale_label(cur))
+                .width(118.0)
+                .show_ui(ui, |ui| {
+                    let mut choices: Vec<Option<f64>> = vec![None];
+                    choices.extend(SCALES.iter().map(|s| Some(*s)));
+                    for c in choices {
+                        if ui.selectable_label(c == cur, scale_label(c)).clicked() {
+                            let (mut min, mut max) = (layer.min_scale, layer.max_scale);
+                            if key == "min" {
+                                min = c;
+                            } else {
+                                max = c;
+                            }
+                            let _ = app.run("layer.scaleRange", json!({"min": min, "max": max}));
+                        }
+                    }
+                })
+                .response
+                .labelled_by(input_label.id);
+        });
+    }
+}
+
 /// The Visibility Range and Effects groups shared by feature and raster layers.
 fn visibility_and_effects(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map::Layer) {
     group(ui, "Visibility Range", |ui| {
         ui.vertical(|ui| {
             ui.add_space(6.0);
-            for (label, cur, key) in [("Out Beyond", layer.min_scale, "min"), ("In Beyond", layer.max_scale, "max")] {
-                ui.horizontal(|ui| {
-                    let input_label = ui.label(egui::RichText::new(tl!(label)).size(11.5));
-                    egui::ComboBox::from_id_salt(format!("scale_{key}"))
-                        .selected_text(scale_label(cur))
-                        .width(118.0)
-                        .show_ui(ui, |ui| {
-                            let mut choices: Vec<Option<f64>> = vec![None];
-                            choices.extend(SCALES.iter().map(|s| Some(*s)));
-                            for c in choices {
-                                if ui.selectable_label(c == cur, scale_label(c)).clicked() {
-                                    let (mut min, mut max) = (layer.min_scale, layer.max_scale);
-                                    if key == "min" {
-                                        min = c;
-                                    } else {
-                                        max = c;
-                                    }
-                                    let _ = app.run("layer.scaleRange", json!({"min": min, "max": max}));
-                                }
-                            }
-                        })
-                        .response
-                        .labelled_by(input_label.id);
-                });
-            }
+            scale_range_rows(app, ui, layer, "scale", 11.5);
         });
         big(ui, app, "scale_range", "Clear\nLimits", "Draw the layer at every scale.", "layer.scaleRange", json!({}), false, false);
     });
@@ -4402,7 +4478,9 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                     crate::widgets::one_step_per_press(app, &resp);
                     let _ = app.run("layer.color", json!({"color": crate::theme::rgba(c).hex8()}));
                 }
-                ui.label(egui::RichText::new(tl!("Color")).size(11.5));
+                // A line has no inside: its colour is the line's (the outline is the "Outline" width below).
+                let name = if layer.geometry_type() == GeometryType::Polyline { tl!("Color") } else { tl!("Fill") };
+                ui.label(egui::RichText::new(name).size(11.5));
             });
             let mut w = layer.renderer.base_symbol().stroke_width;
             ui.horizontal(|ui| {
@@ -4696,10 +4774,10 @@ fn raster_data_groups(app: &mut RustGisApp, ui: &mut Ui) {
             app,
             "identify",
             "Raster\nInformation",
-            "Size, bands, statistics and coordinate system.",
+            "Size, bands, statistics and coordinate system, on the Source tab of the raster's properties.",
             "ui.pane.details",
             Value::Null,
-            app.ui.right == Some(RightPane::Details),
+            crate::layerprops::source_in_view(&app.ui),
             false,
         );
     });
@@ -4940,8 +5018,8 @@ fn feature_data_groups(app: &mut RustGisApp, ui: &mut Ui) {
             "def_query",
             "Definition\nQuery",
             "Limit which features draw with a SQL expression.",
-            "ui.dialog",
-            json!({"name": "definitionQuery"}),
+            "ui.pane.layerProperties",
+            json!({"tab": "query"}),
             has,
             false,
         );
@@ -5169,6 +5247,50 @@ mod tests {
         h
     }
 
+    /// View › Display › Graticule: the button shows or hides it, its menu picks the type (and shows
+    /// it), and the measured grid's coordinate system typed there is used, or refused with a
+    /// notice and nothing changed.
+    #[test]
+    fn the_graticule_menu_picks_its_type_and_the_measured_grids_system() {
+        use rustgis_engine::map::graticule::GraticuleType;
+        let mut h = tab_harness(RustGisApp::with_sample(), view_tab);
+        let on = h.state().session.map().graticule;
+        h.get_by_label("Graticule").click();
+        h.run();
+        assert_eq!(h.state().session.map().graticule, !on);
+        h.get_by_label("Graticule options").click();
+        h.run();
+        h.get_by_label("UTM Zones").click();
+        h.run();
+        assert!(h.state().session.map().graticule && h.state().session.map().graticule_type == GraticuleType::Utm);
+        // A system typed as an EPSG code: clicking into the field keeps the menu open.
+        h.get_by_label("Graticule options").click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Measured grid's coordinate system").click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::TextInput, "Measured grid's coordinate system").type_text("2056");
+        h.run();
+        assert_eq!(h.state().ui.graticule_crs_input, "2056", "typed into the open menu");
+        h.get_by_label("Use System").click();
+        h.run();
+        let m = h.state().session.map();
+        assert_eq!((m.graticule_type, m.graticule_crs.as_deref()), (GraticuleType::Measured, Some("EPSG:2056")));
+        assert!(h.state().ui.graticule_crs_input.is_empty());
+        // A geographic one: refused, said, and nothing changed.
+        let said = h.state().session.notices.len();
+        h.state_mut().ui.graticule_crs_input = "4326".into();
+        h.get_by_label("Graticule options").click();
+        h.run();
+        h.get_by_label("Use System").click();
+        h.run();
+        assert_eq!(h.state().session.map().graticule_crs.as_deref(), Some("EPSG:2056"));
+        assert!(
+            h.state().session.notices[said..].iter().any(|n| n.text.contains("is geographic")),
+            "{:?}",
+            h.state().session.notices.last()
+        );
+    }
+
     /// The language list names every language in English while the interface is English, with the
     /// language's own name as the tooltip; in another language each keeps its own name, or its
     /// English one where no font can draw it.
@@ -5233,6 +5355,19 @@ mod tests {
         assert!(!bare.iter().any(|n| n.0 == bn.name()));
     }
 
+    /// Data › Definition Query shows the Layer Properties pane on its Query tab (#1803), even when
+    /// the pane is already in view on another tab.
+    #[test]
+    fn definition_query_opens_the_query_tab() {
+        let mut app = cities();
+        app.run("ui.pane.layerProperties", json!({"tab": "general"})).unwrap();
+        let mut h = tab_harness(app, feature_data_groups);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Definition Query").click();
+        h.run();
+        assert_eq!(h.state().ui.right, Some(crate::RightPane::LayerProperties));
+        assert_eq!(h.state().ui.layer_properties_tab, crate::layerprops::Topic::Query);
+    }
+
     /// The Labeling tab holds every label group (#897): a feature layer's, then the map's, which
     /// show with no layer too; Style and View have none left.
     #[test]
@@ -5289,6 +5424,17 @@ mod tests {
         assert!(layer.no_fill.is_none());
         assert_eq!(layer.renderer, renderer);
         assert!(h.query_by_label("No Fill").is_some());
+    }
+
+    #[test]
+    fn drawing_names_the_colour_by_what_it_changes() {
+        let mut h = drawing_harness();
+        for (layer, fill) in [("Countries", true), ("Cities", true), ("Rivers", false)] {
+            h.state_mut().run("layer.select", json!({"layer": layer})).unwrap();
+            h.run();
+            // The colour well itself is also labelled "Color", so only "Fill" tells the two apart.
+            assert_eq!(h.query_by_label("Fill").is_some(), fill, "{layer}");
+        }
     }
 
     /// Drags a number of the harness from `at` by 16, 32 and 48 points, calling `each` between.

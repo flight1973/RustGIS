@@ -1,4 +1,4 @@
-//! Add Data's whole-file reads, layer reload, Load All Features, Convert To Annotation's read of a
+//! Add Data's whole-file reads, layer repair/reload, Load All Features, Convert To Annotation's read of a
 //! layer read in place, local archive validation and model/script tools on the desktop run on a
 //! thread of their own (#1291 step 3), so large reads
 //! and tools don't hold the window: the status bar shows the run under way,
@@ -41,6 +41,8 @@ struct Asked {
     /// The exact archive and its presentation when asked, not a reusable list index.
     archive: Option<(usize, rustgis_engine::map::TileLayer)>,
     reload: Option<crate::reloaddata::Form>,
+    /// A service add keeps the connection's display name until its actual landing.
+    origin: Option<String>,
     /// Given what the command answered when it runs, or why it didn't (cancelled, or left).
     then: Option<Then>,
     /// A direct relay archive call owns its real completion, rather than a Native callback.
@@ -61,9 +63,11 @@ struct ReadJob {
     name: &'static str,
     control: Arc<Control>,
     slot: crate::Slot<Result<reads::Read, String>>,
+    /// A reload's target and what its file held, looked at on its thread as the read started.
+    seen: Option<(crate::diskwatch::Target, crate::Slot<crate::diskwatch::Seen>)>,
 }
 
-/// Runs Add Data, Load All, Reload Data, Convert To Annotation, archive reload/repair, model/script
+/// Runs Add Data, Load All, Repair/Reload Data, Convert To Annotation, archive reload/repair, model/script
 /// tools or the topology check with `p`: its read on a thread of its own when the desktop app makes it
 /// so ([`reads::read_ahead`]), after any under way; here and now otherwise. While one is under way or
 /// waiting it answers that, not what the command installs, which comes as it lands.
@@ -73,12 +77,34 @@ pub fn run(app: &mut RustGisApp, command: &'static str, p: Value) -> Result<Valu
 
 /// [`run`], then `then` with what the command answered once it ran, here or as it lands, or why
 /// it never ran.
-pub fn run_then(app: &mut RustGisApp, command: &'static str, mut p: Value, then: Option<Then>) -> Result<Value, String> {
+pub fn run_then(app: &mut RustGisApp, command: &'static str, p: Value, then: Option<Then>) -> Result<Value, String> {
+    run_presented(app, command, p, then, None)
+}
+
+/// Keeps a service layer's title and connection display name outside recorded parameters
+/// until its admitted discovery lands. The ordinary read queue owns progress and Cancel.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn run_service(app: &mut RustGisApp, p: Value, name: &str, origin: Option<&str>) -> Result<Value, String> {
+    run_presented(app, "service.add", p, None, Some((name.to_string(), origin.map(str::to_string))))
+}
+
+/// Queues the admitted read with optional presentation supplied by the service dialog/tree.
+fn run_presented(
+    app: &mut RustGisApp,
+    command: &'static str,
+    mut p: Value,
+    then: Option<Then>,
+    presentation: Option<(String, Option<String>)>,
+) -> Result<Value, String> {
     if !app.reads_off_frame {
+        // Read here and now: what its file holds now is what it reads.
+        if matches!(command, "layer.reloadData" | "map.reloadTiles") {
+            crate::diskwatch::reading(app, command, &p);
+        }
         let r = app.run(command, p);
         return answered(app, then, r);
     }
-    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "labels.convert" | "source.syncState")
+    let layer = matches!(command, "layer.loadAll" | "layer.reloadData" | "layer.repairSource" | "labels.convert" | "source.syncState")
         .then(|| app.session.layer_id(&p).ok().and_then(|id| app.session.map().layer(id)).map(|l| (l.instance_id(), l.name.clone())))
         .flatten();
     let notice_mark = app.session.notice_mark();
@@ -124,8 +150,12 @@ pub fn run_then(app: &mut RustGisApp, command: &'static str, mut p: Value, then:
         None if archive.is_some() => archive.as_ref().map(|(_, tile)| tile.name.clone()).unwrap_or_default(),
         // A model by its name (one drawn but not yet named has none: see `called`).
         None if command == "model.run" => p.get("name").and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string(),
+        None if command == "service.add" => {
+            p.get("name").or_else(|| p.get("layer")).and_then(Value::as_str).unwrap_or_default().to_string()
+        }
         None => p.get("path").and_then(Value::as_str).map(|path| file_name(path).to_string()).unwrap_or_default(),
     };
+    let (what, origin) = presentation.unwrap_or((what, None));
     let reload = if command == "layer.reloadData" {
         match app.session.layer_id(&p).and_then(|id| crate::reloaddata::Form::for_read(&app.session, id)) {
             Ok(form) => Some(form),
@@ -147,6 +177,7 @@ pub fn run_then(app: &mut RustGisApp, command: &'static str, mut p: Value, then:
         layer: layer.map(|(instance, _)| instance),
         archive,
         reload,
+        origin,
         then,
         relay: None,
     };
@@ -183,6 +214,7 @@ pub fn admitted(app: &mut RustGisApp, ahead: reads::ReadAhead, relay: rustgis_as
         layer: None,
         archive,
         reload: None,
+        origin: None,
         then: None,
         relay: Some(relay),
     };
@@ -199,10 +231,27 @@ pub fn admitted(app: &mut RustGisApp, ahead: reads::ReadAhead, relay: rustgis_as
 }
 
 fn not_run_asked(app: &mut RustGisApp, asked: &Asked, why: String) {
+    service_result(app, asked, Err(why.clone()));
+    if matches!(asked.command, "layer.reloadData" | "map.reloadTiles") {
+        crate::diskwatch::not_read(app, asked.command, &asked.params);
+    }
     not_run(app, asked.then, why.clone());
     if let Some(relay) = &asked.relay {
         relay.begin_archive_landing(&app.session);
         finish_relay(app, relay, Err(why));
+    }
+}
+
+/// Updates only this service add's pending dialog line; generic failures already have notices.
+fn service_result(app: &mut RustGisApp, asked: &Asked, result: Result<(), String>) {
+    let pending = crate::serviceui::adding(&asked.what);
+    if asked.command == "service.add"
+        && asked.opened == app.session.opened
+        && asked.map == app.session.map().instance_id()
+        && app.dialogs.open == Some("addService")
+        && app.dialogs.info.as_deref() == Some(pending.as_str())
+    {
+        app.report_step(true, Some(&pending), result.map(|()| crate::serviceui::added(&asked.what)));
     }
 }
 
@@ -244,6 +293,7 @@ fn called<'a>(command: &str, what: &'a str) -> &'a str {
         (false, _) => what,
         (true, "script.run") => tl_raw!("Run Script"),
         (true, "topology.validate") => tl_raw!("Error Inspector"),
+        (true, "service.add") => tl_raw!("Add Service Layer"),
         (true, _) => tl_raw!("Run Model"),
     }
 }
@@ -317,11 +367,22 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
         return complete_here(app, asked, p, Err(tl!("This read was already started").to_string()));
     };
     let name = ahead.name;
+    let reload = matches!(asked.command, "layer.reloadData" | "map.reloadTiles");
     let control = Control::stoppable();
     if !ahead.reads() {
+        // Read here and now: what its file holds now is what it reads.
+        if reload {
+            crate::diskwatch::reading(app, asked.command, &p);
+        }
         let read = ahead.run(&control);
         return complete_here(app, asked, p, read);
     }
+    // A reload's file is looked at on its thread, just before it reads it: a stalled drive holds
+    // the read, not the window.
+    let watched = if reload { crate::diskwatch::read_target(app, asked.command, &p) } else { None };
+    let looked = crate::Slot::default();
+    let look_out = looked.clone();
+    let look_path = watched.as_ref().map(|(_, path)| path.clone());
     let (ctl, slot) = (control.clone(), crate::Slot::default());
     let out = slot.clone();
     // Retain the admitted operation if the OS cannot start its worker: the synchronous
@@ -332,21 +393,24 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
     let diagnostics = app.session.diagnostics.capture();
     let spawned = std::thread::Builder::new().name(name.into()).spawn(move || {
         let _diagnostics = diagnostics.enter();
+        if let Some(path) = look_path {
+            *look_out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(crate::diskwatch::observe(&path));
+        }
         let ahead = work.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         let read = ahead.ok_or_else(|| tl!("This read was already started").to_string()).and_then(|ahead| ahead.run(&ctl));
         *out.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(read);
     });
     if let Err(e) = spawned {
-        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles") {
-            let why = crate::i18n::fmt(
-                "The archive validation worker could not start ({error}). Retry the command.",
-                &[("error", &e.to_string())],
-            );
+        if matches!(asked.command, "map.reloadTiles" | "map.repairTiles" | "service.add" | "service.layers") {
+            let why = crate::i18n::fmt("The background worker could not start ({error}). Retry the command.", &[("error", &e.to_string())]);
             app.session.notify(why.clone(), true);
             not_run_asked(app, &asked, why.clone());
             return Err(why);
         }
         log::warn!("{name} reads here: its thread didn't start: {e}");
+        if reload {
+            crate::diskwatch::reading(app, asked.command, &p);
+        }
         // Here, where its Cancel can't be clicked, the topology check takes the work limit of a
         // run that can't be cancelled; it has none on its thread.
         let control = if asked.command == "topology.validate" { Control::new() } else { control };
@@ -358,7 +422,8 @@ fn start(app: &mut RustGisApp, mut asked: Asked, p: Value) -> Result<Value, Stri
             .and_then(|ahead| ahead.run(&control));
         return complete_here(app, asked, p, read);
     }
-    app.reads.job = Some(ReadJob { asked, gone: None, name, control, slot });
+    let seen = watched.map(|(target, _)| (target, looked));
+    app.reads.job = Some(ReadJob { asked, gone: None, name, control, slot, seen });
     Ok(json!({"started": name}))
 }
 
@@ -377,7 +442,12 @@ fn complete_here(app: &mut RustGisApp, asked: Asked, p: Value, done: Result<read
     if let Some(relay) = &asked.relay {
         relay.begin_archive_landing(&app.session);
     }
+    let before = app.session.sources.generation;
     let r = app.run_read(asked.command, p, read);
+    service_result(app, &asked, r.as_ref().map(|_| ()).map_err(Clone::clone));
+    if r.is_ok() {
+        crate::connectiontree::name_recent(app, before, asked.origin.as_deref());
+    }
     if asked.command == "map.repairTiles"
         && let Ok(answer) = &r
         && let Some(index) = answer.get("index").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok())
@@ -436,6 +506,13 @@ pub fn land(app: &mut RustGisApp) -> bool {
                         not_run_asked(app, &asked, left_too.clone());
                     }
                 } else {
+                    // What its file held as its read started is what this reload acknowledges.
+                    if let Some((target, looked)) = job.seen {
+                        let seen = looked.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+                        if let Some(seen) = seen {
+                            crate::diskwatch::read_started(app, target, seen);
+                        }
+                    }
                     // The engine consumes the original owner before the callback sees its result.
                     let _ = complete_here(app, job.asked, p, done);
                     app.map.invalidate();
@@ -733,6 +810,67 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ogc_dataset_add_reads_on_a_thread_and_keeps_its_origin() {
+        let base = "https://maps.example.org";
+        let docs = [
+            ("/dataset", json!({"links":[{"rel":"tilesets-vector","href":"/tiles?f=json"},{"rel":"styles","href":"/styles?f=json"}]})),
+            (
+                "/tiles?f=json",
+                json!({"tilesets":[{"tileMatrixSetId":"WebMercatorQuad","dataType":"vector","links":[{"rel":"item","type":"application/vnd.mapbox-vector-tile","href":"/wm/{tileMatrix}/{tileRow}/{tileCol}"}]}]}),
+            ),
+            (
+                "/styles?f=json",
+                json!({"styles":[{"id":"good","links":[{"rel":"stylesheet","type":"application/vnd.mapbox.style+json","href":"/good?f=mapbox"}]}]}),
+            ),
+            (
+                "/good?f=mapbox",
+                json!({"version":8,"sources":{"base":{"type":"vector","tiles":["/wm/{z}/{y}/{x}"]}},"layers":[{"id":"roads","type":"line","source":"base","source-layer":"roads"}]}),
+            ),
+        ];
+        let p = json!({"url":format!("{base}/dataset"),"type":"ogcapi","layer":"good","text":docs[0].1.to_string(),"documents":docs.iter().skip(1).map(|(path,body)|json!({"url":format!("{base}{path}"),"text":body.to_string()})).collect::<Vec<_>>()});
+        for cancel in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.reads_off_frame = true;
+            let result = crate::connectiontree::run_named(&mut app, "service.add", p.clone(), Some("Fixture connection")).unwrap();
+            assert_eq!(result["started"], "Add Service Layer");
+            app.dialogs.open = Some("addService");
+            app.dialogs.info = Some(crate::serviceui::adding("good"));
+            assert!(showing(&app));
+            assert!(app.session.map().tiles.is_empty());
+            if cancel {
+                let end = std::time::Instant::now() + Duration::from_secs(5);
+                while app.reads.job.as_ref().unwrap().slot.lock().unwrap().is_none() {
+                    assert!(std::time::Instant::now() < end);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                app.reads.cancel_for_tests();
+            }
+            landed(&mut app, 5);
+            assert_eq!(app.session.map().tiles.len(), usize::from(!cancel));
+            if cancel {
+                assert!(app.dialogs.info.is_none());
+                assert!(app.dialogs.error.as_ref().is_some_and(|e| e.contains("cancelled")));
+            } else {
+                assert_eq!(app.dialogs.info, Some(crate::serviceui::added("good")));
+                assert_eq!(app.session.map().tiles[0].url, format!("{base}/good?f=mapbox"));
+                assert_eq!(app.session.sources.recent[0].name, "Fixture connection");
+                app.run("edit.undo", Value::Null).unwrap();
+                assert!(app.session.map().tiles.is_empty());
+            }
+        }
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        app.reads_off_frame = true;
+        crate::connectiontree::run_named(&mut app, "service.add", p.clone(), None).unwrap();
+        app.run("project.new", json!({})).unwrap();
+        crate::connectiontree::run_named(&mut app, "service.add", p, None).unwrap();
+        app.dialogs.open = Some("addService");
+        app.dialogs.info = Some(crate::serviceui::adding("good"));
+        landed(&mut app, 30);
+        assert_eq!(app.session.map().tiles.len(), 1);
+        assert_eq!(app.dialogs.info, Some(crate::serviceui::added("good")), "an old project must not replace the new add's progress line");
     }
 
     #[test]
@@ -1506,7 +1644,9 @@ mod tests {
         assert_eq!(app.run("ui.reloadData", json!({"layer": id})).unwrap()["waiting"], 1);
         let replacement = dir.path().join("replacement.geojson");
         publish_point(&replacement, 5.0);
-        app.run("layer.repairSource", json!({"layer": id, "path": replacement})).unwrap();
+        // A direct command can repair while the UI has old reads queued; UI repairs now
+        // join that queue themselves, so use the command API to exercise stale landing.
+        app.session.run("layer.repairSource", &json!({"layer": id, "path": replacement})).unwrap();
         let before = app.session.undo_label().map(str::to_string);
         landed(&mut app, 60);
         assert_eq!(source_x(&app, id), 5.0);

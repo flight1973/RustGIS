@@ -118,7 +118,8 @@ project's `jet`, say) is renamed with ` (custom)` when the project opens; layers
 keep their colours, as each holds its own copy. Click a group's name to show or hide it. The Style tab sets the fill **Color**, the
 **Outline** width, **Transparency** and a **Visibility Range** (the scales between which the layer
 draws; a large file read in place is not read at all outside them); points can be circles, squares,
-triangles, diamonds or stars. **Data › Definition Query** draws only the features matching a SQL
+triangles, diamonds or stars. **Data › Definition Query** (the Query tab of the
+[Layer Properties pane](#layer-properties)) draws only the features matching a SQL
 clause; Unique Values, Graduated Colors and Proportional Symbols take their values, classes and
 sizes from those features when you apply them (apply the symbology again after changing the query),
 and **Full Extent** zooms to them. A layer with [subtypes](editing.md#data-design) can be symbolized
@@ -658,6 +659,44 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   ![Europe with the Countries and Cities labelled; the city names sit above and to the right of their points](https://assets.rustgis.app/images/labels.webp)
   <figcaption>City labels placed above and to the right of their points, beside the country labels.</figcaption>
 </figure>
+
+## Layer properties
+
+The **Layer Properties pane** brings together a layer's settings that are otherwise spread over the
+ribbon and the layer's right-click menu. A tab per topic shows one part at a time:
+
+- **General**: the layer's name (renamed when you leave the box or press Enter; Escape keeps the
+  old one; up to 200 characters: a longer paste is cut to fit, and a note under the full box says
+  so),
+  **Visible**, for a feature layer **Selectable** (whether the Select tool picks its
+  features on the map), and **Show legend in Layers**. Symbology and labels keep their own panes.
+- **Source**: what the layer is read from (geometry, feature and field counts, source, coordinate
+  system, extent and fields; for a raster, its size, bands, statistics and coordinate system), with
+  the actions on the source that the layer's menu has, where they apply: **Load All Features**,
+  **Repair Data Source…**, **Reload Data** (desktop) and **Define Projection…**.
+- **Display**: the visibility range (**Out Beyond**, **In Beyond**, **Clear Limits**),
+  **Transparency**, **Masking**, a raster's **Layer Blend** or a feature layer's **Reference
+  scale**, and the **Depth priority** that View › Scene › Raise and Lower Priority change (a
+  higher one draws on top, whatever the layer order).
+- **Query**, for a feature layer: its definition query, the SQL clause the features must match to
+  draw (the grammar is in [Expressions](expressions.md)). Buttons add a field or an operator, a red
+  line says what is wrong with a clause as you type it, **Apply** (or Ctrl+Enter) sets it and
+  **Clear** draws every feature again. A clause being typed is kept while you look at another tab;
+  choosing another layer or Escape in the box drops it.
+- **Time**, for a feature layer: **Bound to the time slider**, and the **Date field** it is bound
+  by (the list shows the fields whose values read as dates, with the share that does). Only the
+  features whose date falls in the slider's window draw; the slider's span, step and playback are
+  on [View › Time](workspace.md). Each change undoes on its own.
+
+Open it with Layers › right-click › **Properties…** or **View › Windows › Layer Properties**;
+**Data › Definition Query** opens it on the Query tab, and **View › Windows › Details** (for a
+raster also **Data › Raster Information**) on the Source tab, which they show and hide as they did
+the Details pane it replaces. It follows the selected layer, as the Symbology and Labeling panes do:
+its header shows the layer's type and name, and lights up for a moment when another layer is
+selected, and the pane's tab names the layer too. A name being typed is kept when you click away,
+even on another layer, as Enter keeps it; Escape drops it. It runs the same commands as the ribbon,
+so each change undoes on its own, except **Show legend in Layers**: like the arrow beside a layer in
+the Layers pane, it changes what that pane shows, not the layer, so it isn't a step to undo.
 
 ## Layer effects
 

@@ -1,6 +1,6 @@
 //! Reads the desktop app makes on a thread of its own before a command adds what they read
 //! (#1291 step 3): Add Data's whole-file reads (a raster, a raster GDAL converts, a GeoJSON,
-//! delimited text or spreadsheet read whole, a CityJSON or CityGML model's layers), Reload Data, Load All
+//! delimited text or spreadsheet read whole, a CityJSON or CityGML model's layers), Repair/Reload Data, Load All
 //! Features, Convert To Annotation's read of a layer read in place, native models or scripts, the
 //! Error Inspector's topology check (#1291) and Source File State's hashing of a layer's file. [`read_ahead`]
 //! takes what the read needs of the session, [`ReadAhead::run`] reads on the thread, and [`read_land`]
@@ -91,9 +91,23 @@ pub fn read_ahead(s: &mut Session, command: &str, p: &Value) -> Result<ReadAhead
 }
 
 /// Picks work only for an already admitted command, retaining its exact streamed-source opening.
-pub(crate) fn prepare(s: &Session, op: Authorized<CommandOp>, owner: Continuation) -> Result<ReadAhead, String> {
+pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continuation) -> Result<ReadAhead, String> {
     let CommandOp::Registered { spec, params } = op.op() else { return Err("not a registered read command".into()) };
     let (name, work, source) = match spec.id {
+        "service.layers" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let work = super::service::listing_ahead(s, params)?;
+            #[cfg(target_arch = "wasm32")]
+            let work = None;
+            ("List Service Layers", work, None)
+        }
+        "service.add" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let work = super::service::adding_ahead(s, params)?;
+            #[cfg(target_arch = "wasm32")]
+            let work = None;
+            ("Add Service Layer", work, None)
+        }
         "layer.addData" => ("Add Data", super::layer::add_data_ahead(params), None),
         "layer.loadAll" => {
             let layer = s.map().layer(s.layer_id(params)?).ok_or("no such layer")?;
@@ -106,6 +120,13 @@ pub(crate) fn prepare(s: &Session, op: Authorized<CommandOp>, owner: Continuatio
                 .then(|| super::whole::ahead(s, params, "Convert To Annotation"))
                 .flatten();
             ("Convert To Annotation", work, layer.source.clone())
+        }
+        "layer.repairSource" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let work = super::repair::repair_ahead(s, params);
+            #[cfg(target_arch = "wasm32")]
+            let work = None;
+            ("Repair Data Source", work, None)
         }
         "layer.reloadData" => {
             #[cfg(not(target_arch = "wasm32"))]
@@ -140,7 +161,7 @@ pub(crate) fn prepare(s: &Session, op: Authorized<CommandOp>, owner: Continuatio
         }
         "topology.validate" => ("Error Inspector", super::design::topology_ahead(s, params), None),
         "source.syncState" => ("Source File State", super::publish::sync_ahead(s, params), None),
-        _ => return Err("only Add Data, Load All, Reload Data, Convert To Annotation, models, scripts, tile archives, topology and Source File State prepare background work".into()),
+        _ => return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service listings, topology and Source File State prepare background work".into()),
     };
     let name = work.as_ref().map_or(name, |work| work.name);
     Ok(ReadAhead { name, op, owner, source, work })

@@ -118,12 +118,10 @@ features build on.
 - What a project holds by default, its own data or links to it
   ([poll #1660](https://github.com/opengeos/RustGIS/discussions/1660)), and storage that opens a
   large project without reading it whole. _Decide first._
-- Date and date-time field types ([#853](https://github.com/opengeos/RustGIS/issues/853); part 1 is
-  a draft, [#1325](https://github.com/opengeos/RustGIS/pull/1325)), then read and written as dates
-  by Shapefile and GeoPackage, the other files, and the databases, in that order; afterwards time
-  zones (a time without a zone stays as written; where an instant is needed, an assumed zone is
-  saved in the project, never written into the data) and recovering a project with an invalid date.
-  _Decide first_ (field types).
+- Dates read and written as dates by database providers (the field types and file readers are in;
+  [#853](https://github.com/opengeos/RustGIS/issues/853) has the plan); afterwards time zones (a
+  time without a zone stays as written; where an instant is needed, an assumed zone is saved in
+  the project, never written into the data) and recovering a project with an invalid date.
 - Z coordinates kept from the data and written back, Phase 1 of
   [#726](https://github.com/opengeos/RustGIS/issues/726). _Decide first_ (it changes `Coord`).
 - Persistent attribute joins and virtual fields. _Decide first_ (they change `Feature`; needs an
@@ -198,11 +196,6 @@ In the order of the work: add data, style it, edit it, analyse it, lay it out an
 ### Add data
 - Georeferencer: side-by-side window, transform picker, more formats
   ([#609](https://github.com/opengeos/RustGIS/issues/609)).
-- Noticing when a linked file or tile archive changes on disk, and offering to reload it (Reload
-  Data does it by hand; [#1477](https://github.com/opengeos/RustGIS/issues/1477)).
-- OGC API services that offer tilesets but no collections list them
-  ([#1266](https://github.com/opengeos/RustGIS/issues/1266); waits on a maintainer's answer
-  there).
 - GeoTIFF transparency masks ([#1564](https://github.com/opengeos/RustGIS/issues/1564)).
 - ArcGIS: browsing a signed-in portal's own content (Hub search, sign-in and adding by address
   work today); Esri JSON for layers that offer neither protocol buffers nor GeoJSON (older
@@ -278,7 +271,7 @@ attributes kept.
   estimated from the points and extent today, not fitted; `kriging.rs`).
 - Charts linked to the selection: histogram, scatter, bar and box plots of a layer's fields.
 - H3 grids built in, next to the A5 grids _(open)_.
-- Reverse geocoding, and the US Census geocoder beside Nominatim and Photon; a DEM downloader so
+- Reverse geocoding; a DEM downloader so
   viewshed works without a loaded elevation raster _(open)_.
 - Reference results for zonal statistics and the terrain tools, beside the existing analysis
   reference cases _(open)_.

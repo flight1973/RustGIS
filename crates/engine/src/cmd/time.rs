@@ -27,7 +27,7 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("time.bind", "Bind to Time Slider", "View › Time", bind).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
-            .params(r#"{"layer"?, "field"?: date field (default: the one most of whose values read as dates), "start"?, "end"?: dates (default: the field's span, when the slider is new), "unit"?: "hour"|"day"|"month"|"year", "interval"?: number, "show"?: "step"|"wide"|"wider"|"cumulative"}"#),
+            .params(r#"{"layer"?, "field"?: date field (default: the one it is bound to, else the one most of whose values read as dates), "start"?, "end"?: dates (default: the field's span, when the slider is new), "unit"?: "hour"|"day"|"month"|"year", "interval"?: number, "show"?: "step"|"wide"|"wider"|"cumulative"}"#),
         C::new("time.unbind", "Unbind from Time Slider", "View › Time", |s, p| {
             let id = s.layer_id(p)?;
             let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
@@ -142,7 +142,12 @@ fn bind(s: &mut Session, p: &Value) -> CmdResult {
             l.dataset.field_index(fname).ok_or_else(|| format!("no field '{fname}'"))?;
             fname.to_string()
         }
-        None => time_fields(&l.dataset).into_iter().next().map(|(n, _)| n).ok_or("no field of this layer holds dates")?,
+        // A layer already bound keeps its field (one an import bound, say), while its values read as
+        // dates.
+        None => match l.time.as_ref().map(|t| t.field.as_str()).filter(|f| field_span(&l.dataset, f).is_some()) {
+            Some(bound) => bound.to_string(),
+            None => time_fields(&l.dataset).into_iter().next().map(|(n, _)| n).ok_or("no field of this layer holds dates")?,
+        },
     };
     let span = field_span(&l.dataset, &field).ok_or_else(|| format!("no value of '{field}' reads as a date"))?;
     let name = l.name.clone();
@@ -380,6 +385,10 @@ fn frames(s: &mut Session, steps: &[f64], w: f64, h: f64, gif: Option<u32>) -> R
             // rustgis_render::render_complete) fetches the tiles it lacks and waits for them
             // before it draws, so each frame shows its own date's imagery.
             let png = super::share::map_png(s, Some(w), Some(h), Some(96.0))?;
+            // What this date's file left out, said while its header is surely in (a cleared tile
+            // cache could drop it before the export ends): the slider moves on before the
+            // command's own landing check.
+            s.notice_landed_rasters();
             match (&mut enc, gif) {
                 (Some(e), Some(ms)) => {
                     let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).map_err(|e| e.to_string())?.to_rgba8();

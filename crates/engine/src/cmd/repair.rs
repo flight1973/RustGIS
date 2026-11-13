@@ -47,6 +47,7 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let prepared = super::reads::take::<Result<Prepared, String>>(s, "layer.repairSource");
         let id = s.layer_id(p)?;
         let full = replacement(p)?;
         let table = super::ps(p, "table").map(str::trim).filter(|t| !t.is_empty());
@@ -57,7 +58,7 @@ fn repair_source(s: &mut Session, p: &Value) -> CmdResult {
                 l.name
             ));
         }
-        replace_linked(s, id, &full, table)?;
+        replace_linked(s, id, &full, table, prepared)?;
         Ok(json!({"layer": id, "path": full, "table": s.map().layer(id).and_then(|l| l.linked_table())}))
     }
 }
@@ -207,6 +208,25 @@ pub(crate) fn reload_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadW
     Some(super::reads::ahead("Reload Data", "layer.reloadData".into(), move || input.and_then(prepare)))
 }
 
+/// Repair validates the replacement on the same cancellable worker path as Reload Data.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn repair_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
+    let input = (|| {
+        let id = s.layer_id(p)?;
+        let layer = s.map().layer(id).ok_or("the layer no longer exists")?;
+        if layer.linked_file().is_none() {
+            return Err(format!(
+                "{}'s data is kept in the project or read from a database or web address: there's no file to repair",
+                layer.name
+            ));
+        }
+        let path = replacement(p)?;
+        let table = super::ps(p, "table").map(str::trim).filter(|t| !t.is_empty()).map(String::from);
+        capture(s, id, path, table, false)
+    })();
+    Some(super::reads::ahead("Repair Data Source", "layer.repairSource".into(), move || input.and_then(prepare)))
+}
+
 /// Layer repair and layer reload (inline and ahead) share candidate construction and installation policy.
 #[cfg(not(target_arch = "wasm32"))]
 fn prepare(input: Input) -> Result<Prepared, String> {
@@ -227,10 +247,22 @@ fn prepare(input: Input) -> Result<Prepared, String> {
     Ok(Prepared { input, candidate })
 }
 
+/// Installs a matching prepared repair once; rejected or stale candidates never trigger a reread.
 #[cfg(not(target_arch = "wasm32"))]
-fn replace_linked(s: &mut Session, id: u32, path: &str, table: Option<&str>) -> Result<(), String> {
-    let input = capture(s, id, path.into(), table.map(String::from), false)?;
-    let prepared = prepare(input)?;
+fn replace_linked(
+    s: &mut Session,
+    id: u32,
+    path: &str,
+    table: Option<&str>,
+    prepared: Option<Result<Prepared, String>>,
+) -> Result<(), String> {
+    let prepared = match prepared {
+        Some(result) => result?,
+        None => prepare(capture(s, id, path.into(), table.map(String::from), false)?)?,
+    };
+    if prepared.input.id != id || prepared.input.path != path || prepared.input.table.as_deref() != table {
+        return Err("the repair target changed while reading; retry Repair Data Source".into());
+    }
     // Reload keeps a selected branch that has become empty. Repair instead chooses a new
     // source: rows exclusively of another family are not a compatible replacement.
     if let Candidate::Vector(new) = &prepared.candidate
@@ -535,113 +567,19 @@ fn archive_candidate(t: &rustgis_map::TileLayer, path: &str) -> Result<rustgis_m
     Ok(new)
 }
 
-/// An operation-local observation, not a file snapshot or a monitor baseline.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(PartialEq, Eq)]
-struct FileRevision {
-    len: u64,
-    modified: web_time::SystemTime,
-    #[cfg(unix)]
-    identity_change: (u64, u64, i64, i64),
-    #[cfg(windows)]
-    created: u64,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl FileRevision {
-    fn read(path: &std::path::Path, optional: bool) -> Result<Option<Self>, String> {
-        let shown = path.display();
-        let metadata = match std::fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(e) if optional && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(format!("{shown}: could not observe archive metadata ({e}); finish writing or restore the file and retry"));
-            }
-        };
-        // SQLite creates an empty -wal even for a read-only open of a clean WAL-mode archive,
-        // and cannot remove it again. An empty sidecar holds no commits: same as no sidecar.
-        if optional && metadata.len() == 0 {
-            return Ok(None);
-        }
-        if !metadata.is_file() {
-            return Err(format!("{shown}: expected an archive file; restore the file and retry"));
-        }
-        let modified = metadata
-            .modified()
-            .map_err(|e| format!("{shown}: could not observe the archive modification time ({e}); check file access and retry"))?;
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-        #[cfg(windows)]
-        use std::os::windows::fs::MetadataExt;
-        Ok(Some(Self {
-            len: metadata.len(),
-            modified,
-            #[cfg(unix)]
-            identity_change: (metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec()),
-            #[cfg(windows)]
-            created: metadata.creation_time(),
-        }))
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(PartialEq, Eq)]
-struct ArchiveObservation {
-    primary: Option<FileRevision>,
-    // SQLite commits can change these without changing the main database. The -shm file
-    // is reader coordination, not content, and is deliberately not observed.
-    sqlite: Option<Vec<Option<FileRevision>>>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl ArchiveObservation {
-    fn read(path: &str) -> Result<Self, String> {
-        let path = path.strip_prefix("file://").unwrap_or(path);
-        let primary = FileRevision::read(std::path::Path::new(path), false)?;
-        let sqlite = std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("mbtiles"));
-        let sqlite = if sqlite {
-            // Unix SQLite names its sidecars from the resolved database path, so commits through
-            // a link land beside the target; Windows names them from the path as given. Observe
-            // beside both when they differ, so neither VFS's commits escape.
-            let given = std::path::Path::new(path);
-            let resolved = std::fs::canonicalize(given).ok().filter(|resolved| resolved != given);
-            let mut sidecars = Vec::new();
-            for base in std::iter::once(given).chain(resolved.as_deref()) {
-                for suffix in ["-wal", "-journal"] {
-                    let mut sidecar = base.as_os_str().to_owned();
-                    sidecar.push(suffix);
-                    sidecars.push(FileRevision::read(std::path::Path::new(&sidecar), true)?);
-                }
-            }
-            Some(sidecars)
-        } else {
-            None
-        };
-        Ok(Self { primary, sqlite })
-    }
-
-    /// Metadata only: safe for final landing, with no archive scan or decompression.
-    fn unchanged(&self, path: &str) -> Result<(), String> {
-        if *self != Self::read(path)? {
-            return Err(format!("{path}: the archive changed while it was read; finish writing and retry the command"));
-        }
-        Ok(())
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 struct ValidatedArchive {
     layer: rustgis_map::TileLayer,
-    observation: ArchiveObservation,
+    observation: crate::observe::Observation,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn observed_candidate(t: &rustgis_map::TileLayer, path: &str) -> Result<ValidatedArchive, String> {
     // Keep the archive reader's path boundary ahead of the new metadata I/O too.
     rustgis_map::tiles::check_path(path, if t.kind == rustgis_map::TileKind::MbTiles { "mbtiles" } else { "pmtiles" })?;
-    let observation = ArchiveObservation::read(path)?;
+    let observation = crate::observe::Observation::archive(path)?;
     let layer = archive_candidate(t, path)?;
-    observation.unchanged(path)?;
+    observation.unchanged_archive(path)?;
     Ok(ValidatedArchive { layer, observation })
 }
 
@@ -688,7 +626,7 @@ fn archive_candidate_after_read(
     } else {
         observed_candidate(t, path)?
     };
-    candidate.observation.unchanged(path)?;
+    candidate.observation.unchanged_archive(path)?;
     Ok(candidate.layer)
 }
 
@@ -733,56 +671,5 @@ fn reload_tiles(s: &mut Session, p: &Value) -> CmdResult {
         }
         s.notify(message, false);
         Ok(json!({"index": i, "path": path}))
-    }
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_sqlite_sidecars_match_absent_ones_but_commits_do_not() {
-        let dir = std::env::temp_dir().join(format!("rustgis-repair-observation-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("clean.mbtiles");
-        std::fs::write(&path, b"main database").unwrap();
-        let path = path.display().to_string();
-        let observed = ArchiveObservation::read(&path).unwrap();
-        for sidecar in ["-wal", "-journal"] {
-            let sidecar = format!("{path}{sidecar}");
-            std::fs::write(&sidecar, b"").unwrap();
-            observed.unchanged(&path).expect("an empty sidecar created by a reader is not a commit");
-            std::fs::write(&sidecar, b"committed frame").unwrap();
-            assert!(observed.unchanged(&path).is_err(), "{sidecar}");
-            std::fs::remove_file(&sidecar).unwrap();
-            observed.unchanged(&path).unwrap();
-        }
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn linked_mbtiles_observes_the_sidecars_beside_its_target_and_beside_the_link() {
-        let dir = std::env::temp_dir().join(format!("rustgis-repair-linked-observation-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("target.mbtiles");
-        std::fs::write(&target, b"main database").unwrap();
-        let link = dir.join("link.mbtiles");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let link = link.display().to_string();
-        let observed = ArchiveObservation::read(&link).unwrap();
-        observed.unchanged(&link).expect("nothing was committed");
-        // SQLite on unix commits beside the target; on Windows beside the path as given.
-        for beside in [target.display().to_string(), link.clone()] {
-            for sidecar in ["-wal", "-journal"] {
-                let sidecar = format!("{beside}{sidecar}");
-                std::fs::write(&sidecar, b"committed frame").unwrap();
-                assert!(observed.unchanged(&link).is_err(), "a commit to {sidecar} escaped the freshness check");
-                std::fs::remove_file(&sidecar).unwrap();
-                observed.unchanged(&link).unwrap();
-            }
-        }
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

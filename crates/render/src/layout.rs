@@ -67,15 +67,27 @@ pub fn archive_revisions(layout: &Layout, maps: &[Map]) -> crate::ArchiveRevisio
 /// Renders a layout at `dpi` (dots per inch). `maps` are the project's maps, found by name.
 /// Refuses a linked archive changed while composing the page, including its different map frames.
 pub fn render(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Result<Pixmap, String> {
-    render_pending(layout, maps, dpi, info).map(|(pm, _)| pm)
+    render_page(layout, maps, dpi, info, true).map(|(pm, _)| pm)
 }
 
 /// [`render`], and whether a map frame on the page drew while some of its tiles, or a read of its
 /// streamed layers or rasters, were still on their way: in the browser, which doesn't wait for
 /// them, the page is drawn again once they land.
+/// Drawn for the Layout view on the interface's thread, its frames don't wait for cast shadows
+/// still being worked out: [`crate::shadows_said`] says so, and the page is drawn again as they
+/// land (natively too, where its tiles were waited for).
 pub fn render_pending(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Result<(Pixmap, bool), String> {
+    render_page(layout, maps, dpi, info, false)
+}
+
+/// [`render_pending`], its frames waiting for cast shadows when `wait_shadows` (an export).
+fn render_page(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo, wait_shadows: bool) -> Result<(Pixmap, bool), String> {
     let revisions = archive_revisions(layout, maps);
-    let result = render_pending_inner(layout, maps, dpi, info);
+    let result = if wait_shadows {
+        render_pending_inner(layout, maps, dpi, info)
+    } else {
+        crate::without_shadow_wait(|| render_pending_inner(layout, maps, dpi, info))
+    };
     revisions.finish_revision(archive_revisions(layout, maps), result, "the page is too large to draw")
 }
 
@@ -216,6 +228,9 @@ fn draw_page(
         }
     }
     for e in layout.elements.iter().filter(visible) {
+        // Each element is a layer of the recording, named after it (#1815) and identified by its
+        // id: the same layer on every page of a series, whatever other elements draw there.
+        pm.layer_with_id(if e.name.trim().is_empty() { e.kind.code() } else { &e.name }, u64::from(e.id));
         let (x, y, ew, eh) =
             ((e.x * k - f64::from(bounds.x())) as f32, (e.y * k - f64::from(bounds.y())) as f32, (e.w * k) as f32, (e.h * k) as f32);
         let Some(r) = Rect::from_xywh(x, y, ew.max(1.0), eh.max(1.0)) else { continue };
@@ -229,7 +244,10 @@ fn draw_page(
                 // A frame larger than the page budget is drawn at a lower resolution and scaled up.
                 let fppp = ppp.min((MAX_PIXELS / (fw * fh).max(1.0)).sqrt()).max(0.01);
                 let view = View { width: fw, height: fh, pixels_per_point: fppp, camera: cam, sky: false };
-                let Some(mut frame_pm) = frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), pending) else {
+                // The grid is drawn with the frame's map, before its attribution, which keeps
+                // clear of the grid's labels.
+                let grid = grid.as_ref().map(|g| (g, layout.decimal_comma));
+                let Some(mut frame_pm) = frame_canvas(map, cam, fw, fh, fppp, pm.is_recording(), pending, grid) else {
                     if frame_requires_complete(map, &view) {
                         return None;
                     }
@@ -242,15 +260,12 @@ fn draw_page(
                     frame_pm.overflowed() || pm.recorded_cost().saturating_add(frame_pm.recorded_cost()) > crate::vector::max_cost();
                 if frame_pm.is_recording()
                     && too_large
-                    && let Some(pixels) = frame_canvas(map, cam, fw, fh, fppp, false, pending)
+                    && let Some(pixels) = frame_canvas(map, cam, fw, fh, fppp, false, pending, grid)
                 {
                     frame_pm = pixels;
                     if let Some(list) = record.as_deref_mut() {
                         list.push((e.id, e.name.clone()));
                     }
-                }
-                if let Some(g) = grid {
-                    draw_grid(&mut frame_pm, map, &view, g, layout.decimal_comma);
                 }
                 if let Some(other) = extent_of.and_then(frame)
                     && let Some(om) = maps.get(other.1)
@@ -349,7 +364,7 @@ fn draw_page(
                     None => placeholder(&mut pm, r, "Colorbar", ppp),
                 }
             }
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name } => {
+            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation } => {
                 let first = layout.first_frame().and_then(frame);
                 let s = expand(t, layout, info, first.and_then(|f| maps.get(f.1).map(|m| (m, f.2))));
                 // An installed family by name (#762), else its generic one. The app doesn't wait
@@ -358,7 +373,13 @@ fn draw_page(
                 let family = font_name.as_deref().and_then(crate::families::find_ready);
                 let face = text::Face { bold: *bold, italic: *italic, serif: *font == rustgis_map::layout::FontFamily::Serif, family };
                 let style = TextStyle { face, align: *align, spacing: *letter_spacing as f32 };
-                text_block(&mut pm, r, &s, *size as f32, *color, style, ppp);
+                if *rotation == 0.0 {
+                    text_block(&mut pm, r, &s, *size as f32, *color, style, ppp);
+                } else if let Some(area) = text_area(r, &s, *size as f32, style, ppp) {
+                    draw_turned_box(&mut pm, r, *rotation as f32, area, |c, r, k| {
+                        text_block(c, r, &s, *size as f32, *color, style, ppp * k)
+                    });
+                }
             }
             ElementKind::Picture { image } => {
                 if let Some(img) = crate::picture::decode(image) {
@@ -392,7 +413,7 @@ fn draw_page(
                     None => placeholder(&mut pm, r, "Chart", ppp),
                 }
             }
-            ElementKind::Rectangle { fill, outline, width, radius } => {
+            ElementKind::Rectangle { fill, outline, width, radius, dash } => {
                 // Square corners filled as before, so an existing layout draws to the same pixels.
                 let rounded = rounded_rect(r, (*radius * PT_PER_MM * ppp) as f32);
                 match &rounded {
@@ -401,25 +422,20 @@ fn draw_page(
                 }
                 let p = rounded.unwrap_or_else(|| PathBuilder::from_rect(r));
                 if *width > 0.0 {
-                    pm.stroke_path(
-                        &p,
-                        &paint(*outline, 1.0),
-                        &Stroke { width: (*width as f32) * ppp as f32, ..Stroke::default() },
-                        Transform::identity(),
-                        None,
-                    );
+                    let stroke = dashed(Stroke { width: (*width as f32) * ppp as f32, ..Stroke::default() }, dash.as_ref(), ppp, &p);
+                    pm.stroke_path(&p, &paint(*outline, 1.0), &stroke, Transform::identity(), None);
                 }
             }
-            ElementKind::Ellipse { fill, outline, width } => {
+            ElementKind::Ellipse { fill, outline, width, dash } => {
                 if let Some(p) = PathBuilder::from_oval(r) {
                     pm.fill_path(&p, &paint(*fill, 1.0), FillRule::Winding, Transform::identity(), None);
                     if *width > 0.0 {
-                        let stroke = Stroke { width: (*width as f32) * ppp as f32, ..Stroke::default() };
+                        let stroke = dashed(Stroke { width: (*width as f32) * ppp as f32, ..Stroke::default() }, dash.as_ref(), ppp, &p);
                         pm.stroke_path(&p, &paint(*outline, 1.0), &stroke, Transform::identity(), None);
                     }
                 }
             }
-            ElementKind::Line { color, width, dir, head } => {
+            ElementKind::Line { color, width, dir, head, dash } => {
                 let [(x0, y0), (x1, y1)] = dir.ends((r.x().into(), r.y().into(), r.width().into(), r.height().into()));
                 let (a, b) = ((x0 as f32, y0 as f32), (x1 as f32, y1 as f32));
                 let stroke_w = ((*width as f32) * ppp as f32).max(0.5);
@@ -443,7 +459,8 @@ fn draw_page(
                 pb.move_to(s0.0, s0.1);
                 pb.line_to(s1.0, s1.1);
                 if let Some(p) = pb.finish() {
-                    let stroke = Stroke { width: stroke_w, ..Stroke::default() };
+                    // Only the shaft is dashed: the heads below are filled.
+                    let stroke = dashed(Stroke { width: stroke_w, ..Stroke::default() }, dash.as_ref(), ppp, &p);
                     pm.stroke_path(&p, &paint(*color, 1.0), &stroke, Transform::identity(), None);
                 }
                 // Each head: a filled triangle, its tip on the line's end.
@@ -462,6 +479,7 @@ fn draw_page(
             }
         }
     }
+    pm.layer(None);
     Some(pm)
 }
 
@@ -470,19 +488,34 @@ fn draw_page(
 /// page needs them all. Refuses a linked archive changed during the complete frame.
 pub fn frame_map(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Result<Pixmap, String> {
     let revisions = crate::archive_revisions([&*map]);
-    let result = frame_canvas(map, camera, w, h, ppp, false, &mut false).map(Canvas::into_pixmap);
+    let result = frame_canvas(map, camera, w, h, ppp, false, &mut false, None).map(Canvas::into_pixmap);
     revisions.finish([&*map], result, "could not draw the map frame")
 }
 
 /// [`frame_map`] on a canvas: one that records (see [`crate::canvas`]) when `record` and the
-/// frame can be kept as vectors (flat, north up, without view effects), else its pixels.
+/// frame can be kept as vectors (flat, north up, without view effects), else its pixels; with
+/// `grid` (and whether the layout writes a decimal comma) drawn on it under the attribution.
 /// `pending` is set when some of its tiles, or a read of its streamed layers or rasters, were
 /// still on their way (in the browser, which doesn't wait for them).
-fn frame_canvas(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64, record: bool, pending: &mut bool) -> Option<Canvas> {
+fn frame_canvas(
+    map: &mut Map,
+    camera: rustgis_map::Camera,
+    w: f64,
+    h: f64,
+    ppp: f64,
+    record: bool,
+    pending: &mut bool,
+    grid: Option<(&Grid, bool)>,
+) -> Option<Canvas> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    let img = if record { crate::render_complete_recorded(map, &view) } else { crate::render_complete(map, &view) }?;
-    *pending |= img.tiles_pending || img.data_pending;
-    Some(finish_frame(img, ppp))
+    // Why its layers were drawn without their cast shadows is kept for the page's caller (see
+    // `crate::shadows_said`).
+    let (img, shadows) = crate::frame_with_shadows_to_come(|| {
+        if record { crate::render_complete_recorded(map, &view) } else { crate::render_complete(map, &view) }
+    });
+    let img = img?;
+    *pending |= img.tiles_pending || img.data_pending || shadows;
+    Some(finish_frame(img, ppp, grid.map(|(g, comma)| (&*map, &view, g, comma))))
 }
 
 /// [`frame_map`] without waiting for tiles still on their way, for a preview drawn while the
@@ -490,18 +523,70 @@ fn frame_canvas(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp:
 /// under the pointer.
 pub fn frame_map_preview(map: &mut Map, camera: rustgis_map::Camera, w: f64, h: f64, ppp: f64) -> Option<Pixmap> {
     let view = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
-    crate::render(map, &view).map(|img| finish_frame(img, ppp).into_pixmap())
+    crate::render(map, &view).map(|img| finish_frame(img, ppp, None).into_pixmap())
 }
 
-/// A rendered frame map with its labels and attribution drawn on it: on its recording when it
-/// was recorded, else on its pixels.
-fn finish_frame(img: crate::Rendered, ppp: f64) -> Canvas {
-    let mut pm = img.recorded.unwrap_or_else(|| Canvas::from_pixmap(img.pixmap));
-    for l in img.unplaced.iter().chain(&img.labels) {
-        text::draw(&mut pm, l, ppp as f32);
-    }
-    crate::draw_attribution(&mut pm, &img.attribution, ppp as f32);
+/// A rendered frame map with its labels, its `grid` (drawn on `map` in `view`, with a decimal
+/// comma or not) and its attribution drawn on it: on its recording when it was recorded, else on
+/// its pixels. The attribution keeps clear of the grid's labels.
+fn finish_frame(img: crate::Rendered, ppp: f64, grid: Option<(&Map, &View, &Grid, bool)>) -> Canvas {
+    let crate::Rendered { pixmap, recorded, labels, unplaced, label_layers, attribution, .. } = img;
+    let mut pm = recorded.unwrap_or_else(|| Canvas::from_pixmap(pixmap));
+    crate::draw_labels(&mut pm, (&unplaced, &labels, &label_layers), ppp as f32);
+    // The grid is a layer of its own (#1815).
+    pm.layer(grid.is_some().then_some("Grid"));
+    let grid_labels = grid.map(|(map, view, g, comma)| draw_grid(&mut pm, map, view, g, comma)).unwrap_or_default();
+    pm.layer(None);
+    let (w, h) = (pm.width() as f32 / ppp as f32, pm.height() as f32 / ppp as f32);
+    let inset = crate::attribution_text(&attribution).map_or((0.0, 0.0), |(_, tw)| attribution_inset((w, h), tw, &grid_labels));
+    crate::draw_attribution(&mut pm, &attribution, ppp as f32, inset);
     pm
+}
+
+/// How far further in (up from the bottom, in from the right, in points) the attribution `tw`
+/// points wide goes on a frame `w` × `h` points, so it covers none of the grid's bottom and right
+/// `labels` (each one's edge, and its box in points: left, top, right, bottom). It goes above a
+/// bottom label under it. Beside a right label, it goes left of it when it still fits in the frame
+/// there, else above it; when neither fits, as far left as the frame holds it. Where none is in
+/// the way, it stays in the corner.
+fn attribution_inset((w, h): (f32, f32), tw: f32, labels: &[(Edge, [f32; 4])]) -> (f32, f32) {
+    let size = crate::ATTRIBUTION_SIZE;
+    // Half the credit's height, its halo included, and the gap it keeps from a label.
+    let (half, gap) = (size * 0.8, 2.0);
+    let (mut bottom, mut right) = (0.0f32, 0.0f32);
+    // The credit's foot set `gap` above a label's top `y`: how far up from the bottom that is.
+    let above = |y: f32| h - size * 0.9 + half - y + gap;
+    // Each move clears the label for good (the credit only goes up and left), so each label is
+    // met once at most; the last resort ends the search.
+    for _ in 0..=labels.len() {
+        // Its whole width, where it is drawn: a credit wider than the frame runs past both edges.
+        let (cx, cy) = (crate::attribution_center(w, tw, right), h - bottom - size * 0.9);
+        let (x0, x1, y0, y1) = (cx - tw / 2.0, cx + tw / 2.0, cy - half, cy + half);
+        let hit = labels
+            .iter()
+            .filter(|(e, _)| matches!(e, Edge::Bottom | Edge::Right))
+            .find(|(_, b)| x0 < b[2] && b[0] < x1 && y0 < b[3] && b[1] < y1);
+        match hit {
+            // Left of the label, its right end `gap` short of it, when all of it stays in.
+            Some((Edge::Right, b)) if b[0] - gap - tw >= 0.0 => right += x1 - (b[0] - gap),
+            // Above the label, when all of it stays in.
+            Some((Edge::Right, b)) if b[1] - gap - 2.0 * half >= 0.0 => bottom = above(b[1]),
+            // Neither: as far left as the frame holds it (a credit wider than the frame stays put).
+            Some((Edge::Right, _)) => {
+                right += x0.max(0.0);
+                break;
+            }
+            Some((_, b)) => bottom = above(b[1]),
+            None => break,
+        }
+    }
+    (bottom, right)
+}
+
+/// A scale as `{scale}` prints it: `1:6,300,000`, or `1:6.300.000` with a decimal comma.
+pub fn scale_ratio_text(scale: f64, comma: bool) -> String {
+    let ratio = rustgis_map::graphics::scale_ratio(scale);
+    if comma { decimal(ratio, true) } else { ratio }
 }
 
 /// Expands layout text tokens: the page ones here, the map ones from the first frame.
@@ -511,7 +596,7 @@ pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, ru
     // A layout with a decimal comma prints its scale with points between thousands: put in first,
     // so a page or layout name holding "{scale}" isn't read as the token.
     let t = match scale {
-        Some(scale) if layout.decimal_comma => t.replace("{scale}", &decimal(rustgis_map::graphics::scale_ratio(scale), true)),
+        Some(scale) if layout.decimal_comma => t.replace("{scale}", &scale_ratio_text(scale, true)),
         _ => t.to_string(),
     };
     let t = t
@@ -539,6 +624,14 @@ pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, ru
         },
     };
     rustgis_map::graphics::expand(&t, &v)
+}
+
+/// `stroke` dashed along `path` by an element's pattern (points, at `ppp` pixels a point), as a
+/// line layer's stroke is ([`crate::dash_steps`]): solid when it has none, or when the pattern is
+/// under a pixel a round or would cut the path into too many dashes.
+fn dashed(stroke: Stroke, dash: Option<&rustgis_map::symbology::Dash>, ppp: f64, path: &tiny_skia::Path) -> Stroke {
+    let dash = dash.and_then(|d| crate::dash_steps(d, ppp as f32, path)).and_then(|steps| tiny_skia::StrokeDash::new(steps, 0.0));
+    Stroke { dash, ..stroke }
 }
 
 /// A rectangle with its corners rounded by `rad` pixels (at most half its shorter side), each a
@@ -951,7 +1044,7 @@ const WIDENED_LINES: f64 = 50.0;
 
 /// A measured grid's lines over the frame whose edges are `lonlats`, in the coordinate system of
 /// `tr`: eastings (north–south) and northings, each back in longitude/latitude, with its label.
-fn measured_lines(
+pub(crate) fn measured_lines(
     g: &Grid,
     tr: &rustgis_data::raster::Transformer,
     lonlats: &[Coord],
@@ -969,6 +1062,9 @@ fn measured_lines(
     let given = g.step.clamp(0.0, rustgis_map::layout::MAX_MEASURED_STEP);
     let step = if given > 0.0 {
         given.max(rustgis_map::layout::MIN_MEASURED_STEP)
+    } else if g.mgrs {
+        // (At most 100 km apart, so MGRS's squares are drawn whole.)
+        nice_step(span, rustgis_map::layout::MIN_MEASURED_STEP).min(100_000.0)
     } else {
         nice_step(span, rustgis_map::layout::MIN_MEASURED_STEP)
     };
@@ -1035,17 +1131,22 @@ enum Edge {
 }
 
 /// The coordinate system of a measured grid on `map`: the grid's own, else the map's when it is
-/// projected, else the WGS 84 UTM zone at `center` (longitude/latitude). `None` for one that
-/// can't be read or isn't projected.
+/// projected, else the WGS 84 UTM zone at `center` (longitude/latitude). With MGRS labels, only a
+/// WGS 84 UTM zone: the one named, else the map's when it is one, else MGRS's zone at `center`.
+/// `None` for one that can't be read or isn't projected.
 pub fn measured_crs(g: &Grid, map: &Map, center: Coord) -> Option<rustgis_data::raster::Crs> {
     use rustgis_data::raster::Crs;
+    use rustgis_map::layout::utm_zone_of;
+    let utm = |(zone, north): (u8, bool)| Crs::from_epsg(if north { 32_600 } else { 32_700 } + u32::from(zone));
     let named = g.crs.as_deref().map(str::trim).filter(|c| !c.is_empty());
     let crs = match named {
         // (One longer than a command keeps, from a crafted project, isn't read each frame.)
         Some(c) if c.chars().count() > rustgis_map::layout::MAX_GRID_CRS => return None,
+        Some(c) if g.mgrs => utm(utm_zone_of(c)?)?,
         Some(c) => Crs::parse(c).ok()?,
         // The map's own: its code (a preset, EPSG:, ESRI: or local:) as its PROJ definition.
         None => match &map.projection {
+            rustgis_map::Projection::Custom(code) if g.mgrs => utm_zone_of(code).and_then(utm),
             rustgis_map::Projection::Custom(code) => rustgis_map::projection::lookup(code)
                 .ok()
                 .and_then(|(def, _)| Crs::parse(&def).ok())
@@ -1053,13 +1154,23 @@ pub fn measured_crs(g: &Grid, map: &Map, center: Coord) -> Option<rustgis_data::
                 .filter(|c| !c.is_geographic()),
             _ => None,
         }
-        .map_or_else(|| Crs::from_epsg(rustgis_map::layout::utm_epsg(center.x, center.y)), Some)?,
+        .map_or_else(
+            || {
+                // MGRS's zone at the centre keeps southern Norway's and Svalbard's wider zones.
+                let c = Coord::new((center.x + 180.0).rem_euclid(360.0) - 180.0, center.y);
+                match rustgis_geom::utm::utm_zone(c).filter(|_| g.mgrs) {
+                    Some(zone) => utm((zone, center.y >= 0.0)),
+                    None => Crs::from_epsg(rustgis_map::layout::utm_epsg(center.x, center.y)),
+                }
+            },
+            Some,
+        )?,
     };
     (!crs.is_geographic()).then_some(crs)
 }
 
 /// A step that draws about eight lines across `span`: 1, 2 or 5 times a power of ten.
-fn nice_step(span: f64, smallest: f64) -> f64 {
+pub(crate) fn nice_step(span: f64, smallest: f64) -> f64 {
     let rough = (span / 8.0).max(smallest);
     let p = 10f64.powf(rough.log10().floor());
     [1.0, 2.0, 5.0, 10.0].iter().map(|k| k * p).find(|s| *s >= rough).unwrap_or(10.0 * p)
@@ -1067,8 +1178,9 @@ fn nice_step(span: f64, smallest: f64) -> f64 {
 
 /// A grid over a frame: lines across it, ticks along its edges or both, labelled at the edges the
 /// grid names. A graticule's lines are latitudes and longitudes; a measured grid's are eastings and
-/// northings in its coordinate system, bent through it onto the map.
-fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) {
+/// northings in its coordinate system, bent through it onto the map. Gives the labels drawn: each
+/// one's edge and its box in points (left, top, right, bottom).
+fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) -> Vec<(Edge, [f32; 4])> {
     let ppp = view.pixels_per_point as f32;
     let (w, h) = (view.width, view.height);
     // The frame's edges in longitude/latitude: its corners and points along each side.
@@ -1083,11 +1195,13 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) {
         ext.expand(*c);
     }
     if ext.is_empty() {
-        return;
+        return Vec::new();
     }
     // Each line: its points in longitude/latitude, its label, and whether it runs north–south
     // (labelled along the top and bottom first).
     let mut lines: Vec<(Vec<Coord>, String, bool)> = Vec::new();
+    // A measured grid's MGRS squares: each one's name and middle, in the frame's points.
+    let mut squares = Vec::new();
     match g.kind {
         GridKind::Graticule => {
             // Over the extent of the frame's corners and midpoints, as it always was (its step and
@@ -1102,8 +1216,16 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) {
         }
         GridKind::Measured => {
             let center = map.to_lonlat(view.camera.to_map(w / 2.0, h / 2.0, w, h)).unwrap_or_else(|| ext.center());
-            let Some(tr) = measured_crs(g, map, center).and_then(|c| c.transformer().ok()) else { return };
+            let Some(crs) = measured_crs(g, map, center) else { return Vec::new() };
+            let Ok(tr) = crs.transformer() else { return Vec::new() };
             measured_lines(g, &tr, &lonlats, comma, &mut lines);
+            if g.mgrs
+                && g.labels
+                && let Some((zone, _)) = rustgis_map::layout::utm_zone_of(&crs.epsg().to_string())
+            {
+                let size = |s: &str| (text::measure(s, MGRS_LABEL_PT, true), MGRS_LABEL_PT * 1.33 * 1.2);
+                squares = mgrs_squares(map, view, zone, &tr, size);
+            }
         }
     }
     // A tilted frame's lines break where they pass behind the eye.
@@ -1162,23 +1284,108 @@ fn draw_grid(pm: &mut Canvas, map: &Map, view: &View, g: &Grid, comma: bool) {
     if let Some(p) = pb.finish() {
         pm.stroke_path(&p, &paint_line, &stroke, Transform::identity(), None);
     }
+    for (s, x, y) in squares {
+        text::text_at(pm, &s, x * ppp, y * ppp, MGRS_LABEL_PT * 1.33 * ppp, label_color, true, text::Align::Center, true);
+    }
     // Labels sit just inside the frame, past the ticks.
     let inset = tick + 3.0 * ppp;
     let along = |edge: Edge, s: &str| match edge {
         Edge::Left | Edge::Right if !vertical => label_px,
         _ => text::measure(s, label_px / 1.33, false),
     };
+    let mut drawn = Vec::new();
     for (edge, at, s) in kept_labels(labels, (pw, ph), along, label_px, ppp) {
         let tw = text::measure(&s, label_px / 1.33, false);
-        match edge {
-            Edge::Top => text::text_at(pm, &s, at, inset + label_px * 0.4, label_px, label_color, false, text::Align::Center, true),
-            Edge::Bottom => text::text_at(pm, &s, at, ph - inset - label_px * 0.4, label_px, label_color, false, text::Align::Center, true),
-            Edge::Left if vertical => rotated_text(pm, &s, inset + label_px * 0.4, at, label_px, label_color),
-            Edge::Right if vertical => rotated_text(pm, &s, pw - inset - label_px * 0.4, at, label_px, label_color),
-            Edge::Left => text::text_at(pm, &s, inset, at, label_px, label_color, false, text::Align::Left, true),
-            Edge::Right => text::text_at(pm, &s, pw - inset - tw, at, label_px, label_color, false, text::Align::Left, true),
+        // Its centre, and half its size across and down (its halo and descenders included).
+        let (flat, upright) = ((tw / 2.0, label_px * 0.6), (label_px * 0.6, tw / 2.0));
+        let (cx, cy, (hw, hh)) = match edge {
+            Edge::Top => (at, inset + label_px * 0.4, flat),
+            Edge::Bottom => (at, ph - inset - label_px * 0.4, flat),
+            Edge::Left if vertical => (inset + label_px * 0.4, at, upright),
+            Edge::Right if vertical => (pw - inset - label_px * 0.4, at, upright),
+            Edge::Left => (inset + tw / 2.0, at, flat),
+            Edge::Right => (pw - inset - tw / 2.0, at, flat),
+        };
+        if matches!(edge, Edge::Left | Edge::Right) && vertical {
+            rotated_text(pm, &s, cx, cy, label_px, label_color);
+        } else {
+            text::text_at(pm, &s, cx, cy, label_px, label_color, false, text::Align::Center, true);
+        }
+        drawn.push((edge, [(cx - hw) / ppp, (cy - hh) / ppp, (cx + hw) / ppp, (cy + hh) / ppp]));
+    }
+    drawn
+}
+
+/// The size of a measured grid's MGRS square labels, in points.
+const MGRS_LABEL_PT: f32 = 10.0;
+/// The places across and down a frame where [`mgrs_squares`] looks which square shows.
+const MGRS_SAMPLES: u32 = 32;
+
+/// Where a measured grid in UTM zone `zone` (`tr` its transformer) names its MGRS 100 km squares on
+/// a frame showing `map` in `view`: each square of the zone, and of each latitude band, that shows,
+/// by its grid zone designation and letters (`32T MT`), at the middle of what shows of it, in the
+/// frame's points. Only where all of the label, `size(text)` points across and down, stays in its
+/// square and well inside the frame, clear of the edge labels. Squares the zone's eastings reach
+/// past its edges (a frame across two zones) are named in the other zone, so not here.
+fn mgrs_squares(
+    map: &Map,
+    view: &View,
+    zone: u8,
+    tr: &rustgis_data::raster::Transformer,
+    size: impl Fn(&str) -> (f32, f32),
+) -> Vec<(String, f32, f32)> {
+    use rustgis_geom::utm;
+    let (w, h) = (view.width, view.height);
+    // The square, and band, a place on the frame is in: none outside the zone.
+    let square = |sx: f64, sy: f64| -> Option<(i64, i64, char)> {
+        let c = map.to_lonlat(view.camera.to_map(sx, sy, w, h))?;
+        // (A copy of the world past ±180° is the same place.)
+        let c = Coord::new((c.x + 180.0).rem_euclid(360.0) - 180.0, c.y);
+        if utm::utm_zone(c)? != zone {
+            return None;
+        }
+        let band = utm::latitude_band(c.y)?;
+        let p = tr.from_lonlat(c)?;
+        // Across the Equator from the grid's hemisphere, the northing MGRS gives there: the other
+        // hemisphere's, 10,000 km apart.
+        let y = match (c.y < 0.0, p.y) {
+            (true, y) if y < 0.0 => y + 10_000_000.0,
+            (false, y) if y >= 10_000_000.0 => y - 10_000_000.0,
+            (_, y) => y,
+        };
+        let (e, n) = ((p.x / 100_000.0).floor(), (y / 100_000.0).floor());
+        (e.is_finite() && n.is_finite()).then_some((e as i64, n as i64, band))
+    };
+    // Each square's samples: their sum across and down, and how many.
+    let mut seen: std::collections::BTreeMap<(i64, i64, char), (f64, f64, u32)> = std::collections::BTreeMap::new();
+    for i in 0..MGRS_SAMPLES {
+        for j in 0..MGRS_SAMPLES {
+            let (sx, sy) = (w * (f64::from(i) + 0.5) / f64::from(MGRS_SAMPLES), h * (f64::from(j) + 0.5) / f64::from(MGRS_SAMPLES));
+            if let Some(k) = square(sx, sy) {
+                let e = seen.entry(k).or_default();
+                *e = (e.0 + sx, e.1 + sy, e.2 + 1);
+            }
         }
     }
+    let mut out = Vec::new();
+    for ((e, n, band), (sx, sy, count)) in seen {
+        let mid = |k: i64| (k as f64 + 0.5) * 100_000.0;
+        let Some((column, row)) = utm::square_letters(zone, mid(e), mid(n)) else { continue };
+        let text = format!("{zone:02}{band} {column}{row}");
+        let (tw, th) = size(&text);
+        let (cx, cy) = (sx / f64::from(count), sy / f64::from(count));
+        let (hw, hh) = (f64::from(tw) / 2.0 + 2.0, f64::from(th) / 2.0 + 2.0);
+        // Clear of the edges' labels: three label heights in from each edge.
+        let margin = 3.0 * f64::from(th);
+        if cx - hw < margin || cx + hw > w - margin || cy - hh < margin || cy + hh > h - margin {
+            continue;
+        }
+        let corners = [(cx - hw, cy - hh), (cx + hw, cy - hh), (cx - hw, cy + hh), (cx + hw, cy + hh)];
+        if corners.iter().all(|&(x, y)| square(x, y) == Some((e, n, band))) {
+            out.push((text, cx as f32, cy as f32));
+        }
+    }
+    out
 }
 
 /// The graticule labels drawn, of those at each edge crossing (`labels`: edge, place along it,
@@ -1356,6 +1563,57 @@ fn scale_number(v: f64, step: f64) -> String {
     if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
 }
 
+/// The share of its element's width a scale bar's length may take.
+const BAR_SHARE: f64 = 0.85;
+/// A scale bar's labels' size, and how far its bar starts in from the element's left edge, in
+/// pixels: at most as many points at a pixel a point or more, which [`scale_bar_width_pt`] counts.
+const BAR_LABEL_PT: f32 = 8.0;
+const BAR_INSET: f32 = 2.0;
+
+/// What a scale bar counts: its whole length in its unit, that unit in metres and its abbreviation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarPlan {
+    total: f64,
+    unit_m: f64,
+    abbr: &'static str,
+}
+
+/// The bar a scale bar draws in an element `width_pt` points wide at `ground_per_pt` ground metres
+/// a point: the roundest length within [`BAR_SHARE`] of the width. `None` when it draws none.
+fn bar_plan(ground_per_pt: f64, width_pt: f64, units: ScaleUnits) -> Option<BarPlan> {
+    if !(ground_per_pt.is_finite() && ground_per_pt > 0.0 && width_pt.is_finite()) {
+        return None;
+    }
+    let room_m = ground_per_pt * width_pt * BAR_SHARE;
+    let (unit_m, abbr) = units.resolve(rustgis_geom::nice_distance(room_m));
+    let total = rustgis_geom::nice_distance(room_m / unit_m);
+    (total > 0.0).then_some(BarPlan { total, unit_m, abbr })
+}
+
+/// A scale bar's label at division `i` of `divisions`, the last with the unit.
+fn bar_label(total: f64, divisions: usize, i: usize, abbr: &str, comma: bool) -> String {
+    let v = decimal(scale_number(total * i as f64 / divisions as f64, total / divisions as f64), comma);
+    if i == divisions { format!("{v} {abbr}") } else { v }
+}
+
+/// The narrowest element, in points, in which a scale bar draws the same bar as in one `width_pt`
+/// wide (its length, unit and divisions), its last label and `pad_pt` after it included, so a box
+/// can be the size of its bar (#1379). `width_pt` when no narrower one draws that bar; `None` when
+/// it draws none.
+pub fn scale_bar_width_pt(ground_per_pt: f64, width_pt: f64, bar: (ScaleUnits, usize), comma: bool, pad_pt: f64) -> Option<f64> {
+    let (units, divisions) = bar;
+    let plan = bar_plan(ground_per_pt, width_pt, units)?;
+    let divisions = divisions.clamp(1, rustgis_map::layout::MAX_SCALE_DIVISIONS);
+    let len = plan.total * plan.unit_m / ground_per_pt;
+    let last = bar_label(plan.total, divisions, divisions, plan.abbr, comma);
+    let half = f64::from(text::measure(&last, BAR_LABEL_PT, false)) / 2.0;
+    // A little over the share the bar takes, so the f32 rectangle an export rebuilds the width
+    // from (its error growing with the element's place on the page) doesn't pick the next shorter
+    // length: a ten-thousandth, 0.003 mm on a 30 mm box.
+    let w = (len / BAR_SHARE * (1.0 + 1e-4)).max(f64::from(BAR_INSET) + len + half + pad_pt);
+    Some(if w < width_pt && bar_plan(ground_per_pt, w, units) == Some(plan) { w } else { width_pt })
+}
+
 /// A scale bar filling most of the element's width, in `units`, with `divisions` labelled steps.
 /// `ground_per_pt` is ground metres per logical point of paper; `colors` are its lines, dark
 /// divisions and labels, then the alternating bar's light divisions.
@@ -1370,19 +1628,11 @@ fn scale_bar(
 ) {
     let (units, divisions, style) = bar;
     let (dark, light) = colors;
-    if !(ground_per_pt.is_finite() && ground_per_pt > 0.0) {
-        return;
-    }
     let divisions = divisions.clamp(1, rustgis_map::layout::MAX_SCALE_DIVISIONS);
-    let room_m = ground_per_pt * r.width() as f64 / ppp * 0.85;
-    let (unit_m, abbr) = units.resolve(rustgis_geom::nice_distance(room_m));
-    let total = rustgis_geom::nice_distance(room_m / unit_m);
-    if total <= 0.0 {
-        return;
-    }
+    let Some(BarPlan { total, unit_m, abbr }) = bar_plan(ground_per_pt, f64::from(r.width()) / ppp, units) else { return };
     let len = (total * unit_m / ground_per_pt * ppp) as f32;
     let bar_h = (r.height() * 0.28).min(6.0 * ppp as f32);
-    let (x0, y0) = (r.x() + 2.0, r.y() + r.height() * 0.62 - bar_h / 2.0);
+    let (x0, y0) = (r.x() + BAR_INSET, r.y() + r.height() * 0.62 - bar_h / 2.0);
     let seg = len / divisions as f32;
     let line = Stroke { width: 0.6 * ppp as f32, ..Stroke::default() };
     let stroke = |pm: &mut Canvas, pts: &[(f32, f32)], w: &Stroke| {
@@ -1428,15 +1678,10 @@ fn scale_bar(
     }
     // Labels at the divisions, the last with the unit; one that would touch its neighbour is left
     // out (never the ends).
-    let px = 8.0 * 1.33 * ppp as f32;
+    let px = BAR_LABEL_PT * 1.33 * ppp as f32;
     let ty = y0 - px * 0.7;
     let gap = 3.0 * ppp as f32;
-    let labels: Vec<(f32, String)> = (0..=divisions)
-        .map(|i| {
-            let v = decimal(scale_number(total * i as f64 / divisions as f64, total / divisions as f64), comma);
-            (x0 + seg * i as f32, if i == divisions { format!("{v} {abbr}") } else { v })
-        })
-        .collect();
+    let labels: Vec<(f32, String)> = (0..=divisions).map(|i| (x0 + seg * i as f32, bar_label(total, divisions, i, abbr, comma))).collect();
     let half = |s: &str| text::measure(s, px / 1.33, false) / 2.0;
     let last = labels.last().map(|(x, s)| x - half(s)).unwrap_or(f32::MAX);
     let mut right = f32::MIN;
@@ -1457,9 +1702,40 @@ fn scale_bar(
 fn shown_legends(map: &Map, scale: f64) -> Vec<(u32, Vec<LegendEntry>)> {
     map.layers
         .iter()
-        .filter(|l| map.draws_at(l, scale) && !l.graphics && !l.is_raster())
-        .filter_map(|l| l.shown_legend(scale).map(|entries| (l.id, entries)))
+        .filter(|l| map.draws_at(l, scale) && legend_lists(l))
+        .filter_map(|l| layer_shown(l, scale).map(|entries| (l.id, entries)))
         .collect()
+}
+
+/// Whether a legend can list a layer: a vector layer, by its symbols, or a raster drawn by classes
+/// (a colour table, unique values, class breaks), by its classes (#1679). Not a graphics layer,
+/// nor a raster on a ramp or in RGB bands, which a colorbar keys or nothing does.
+pub fn legend_lists(l: &rustgis_map::Layer) -> bool {
+    !l.graphics && l.raster.as_ref().is_none_or(|r| r.style.renderer.draws_classes())
+}
+
+/// What a layer a legend lists draws at 1:`scale` ([`rustgis_map::Layer::shown_legend`]); for a
+/// classified raster, the classes it holds ([`raster_classes`]). `None` when it draws nothing
+/// there.
+fn layer_shown(l: &rustgis_map::Layer, scale: f64) -> Option<Vec<LegendEntry>> {
+    if l.is_raster() {
+        return raster_classes(l, false).filter(|classes| l.in_scale_range(scale) && !classes.is_empty());
+    }
+    l.shown_legend(scale)
+}
+
+/// A classified raster's classes as legend rows (#1679), as the Layers pane draws them
+/// ([`rustgis_map::RasterLayer::legend_classes`]): a filled swatch with a thin outline, and its
+/// label. `None` for a raster on a ramp or in RGB bands, and for a vector layer.
+fn raster_classes(l: &rustgis_map::Layer, all_classes: bool) -> Option<Vec<LegendEntry>> {
+    let classes = l.raster.as_ref()?.legend_classes(all_classes)?;
+    let symbol = |fill| rustgis_map::Symbol { fill, stroke: RASTER_SWATCH_EDGE, stroke_width: 0.5, size: 0.0, marker: Default::default() };
+    Some(
+        classes
+            .into_iter()
+            .map(|(fill, label)| LegendEntry { label, symbol: symbol(fill), strokes: Vec::new(), fallback: false })
+            .collect(),
+    )
 }
 
 /// Complete-source legends retain one minimal value per used class, never its geometry.
@@ -1468,12 +1744,12 @@ fn complete_shown_legends(map: &mut Map, scale: f64) -> Option<Vec<(u32, Vec<Leg
         return Some(shown_legends(map, scale));
     }
     let wanted: Vec<usize> =
-        map.layers.iter().enumerate().filter(|(_, l)| map.draws_at(l, scale) && !l.graphics && !l.is_raster()).map(|(i, _)| i).collect();
+        map.layers.iter().enumerate().filter(|(_, l)| map.draws_at(l, scale) && legend_lists(l)).map(|(i, _)| i).collect();
     let mut out = Vec::new();
     for index in wanted {
         let layer = map.layers.get_mut(index)?;
         let Some(source) = layer.source.as_ref().and_then(|s| s.chunk_source()) else {
-            if let Some(entries) = layer.shown_legend(scale) {
+            if let Some(entries) = layer_shown(layer, scale) {
                 out.push((layer.id, entries));
             }
             continue;
@@ -1748,6 +2024,8 @@ const MAX_LEGEND_SIDE: u32 = 2048;
 
 /// A legend's text colour.
 const LEGEND_TEXT: Rgba = Rgba::rgb(0x22, 0x22, 0x22);
+/// The outline of a raster class's swatch in a legend, as the Layers pane draws one around it.
+const RASTER_SWATCH_EDGE: Rgba = Rgba::rgb(0x80, 0x80, 0x80);
 /// A legend row's height, in points.
 const LEGEND_ROW: f32 = 15.0;
 /// A legend swatch's width, in points.
@@ -1779,7 +2057,7 @@ fn legend_rows<'a>(map: &'a Map, drawn: Option<&[(u32, Vec<LegendEntry>)]>, opts
                 continue;
             }
         };
-        if !(map.shows(l) && !l.graphics && !l.is_raster() && !excluded(&l.name)) {
+        if !(map.shows(l) && legend_lists(l) && !excluded(&l.name)) {
             continue;
         }
         let mut entries = match drawn {
@@ -1787,6 +2065,8 @@ fn legend_rows<'a>(map: &'a Map, drawn: Option<&[(u32, Vec<LegendEntry>)]>, opts
                 Some((_, entries)) => entries.clone(),
                 None => continue,
             },
+            // A classified raster's every class (#1679).
+            None if l.is_raster() => raster_classes(l, true).unwrap_or_default(),
             None => l.renderer.legend(),
         };
         // The fallback row only (a class that happens to bear its name stays).
@@ -1803,8 +2083,9 @@ fn legend_rows<'a>(map: &'a Map, drawn: Option<&[(u32, Vec<LegendEntry>)]>, opts
             entries.extend(d.legend(l.geometry_type() == GeometryType::Polyline));
         }
         if entries.is_empty() {
-            // A Unique Values layer that lists nothing draws nothing visible (#207).
-            if !matches!(l.renderer, rustgis_map::Renderer::Unique { .. }) {
+            // A Unique Values layer that lists nothing draws nothing visible (#207); a raster has
+            // no symbol of its own to show.
+            if !l.is_raster() && !matches!(l.renderer, rustgis_map::Renderer::Unique { .. }) {
                 rows.push(LegendRow::Plain(l, opts.shown(&l.name)));
             }
             continue;
@@ -2383,6 +2664,71 @@ pub fn line_pitch_mm(size: f64) -> f64 {
     size.clamp(2.0, 400.0) * 1.33 * 1.25 * 25.4 / 96.0
 }
 
+/// The part of a text element's box (pixels, from its top-left corner) [`text_block`] inks, a line's
+/// height more each way: across, its lines as each is aligned (past the box where one overruns
+/// it); down, its lines, or the box and the line [`text_block`] still draws past it. `None` when
+/// it has no line.
+fn text_area(r: Rect, s: &str, size: f32, style: TextStyle, ppp: f64) -> Option<Rect> {
+    let px = size.clamp(2.0, 400.0) * 1.33 * ppp as f32;
+    let spacing = style.spacing * 1.33 * ppp as f32;
+    let w = r.width();
+    let (mut x0, mut x1, mut lines) = (f32::INFINITY, f32::NEG_INFINITY, 0u16);
+    for line in s.lines().take(200) {
+        let (lo, hi) = text::styled_extent(line, px, style.face, spacing);
+        // Where `text_block` puts the ink: from the edge (left), or by the ink (centre, right).
+        let (a, b) = match style.align {
+            TextAlign::Left => (lo, hi),
+            TextAlign::Center => ((w - (hi - lo)) / 2.0, (w + (hi - lo)) / 2.0),
+            TextAlign::Right => (w - (hi - lo), w),
+        };
+        (x0, x1, lines) = (x0.min(a), x1.max(b), lines + 1);
+    }
+    let down = (r.height() + px).min(f32::from(lines) * px * 1.25);
+    (lines > 0).then(|| Rect::from_ltrb(x0 - px, -px, x1 + px, down + px)).flatten()
+}
+
+/// Draws with `draw` (given the box to draw in and how many of the page's pixels one of its own
+/// is) turned `degrees` clockwise about the centre of `r`: kept turned on a recording canvas (a
+/// vector PDF), else drawn upright in a picture of `area` (pixels from the box's top-left corner:
+/// what it inks), which is placed turned. A picture past the page's budget is drawn at a lower
+/// resolution and scaled up, as a frame that large is. Its size is at least a pixel and at most
+/// the budget, and `r` and `area` have a size, so the picture is always made.
+///
+/// A quarter turn at full resolution maps the picture's pixels one for one onto the page's: it is
+/// placed on whole pixels and not filtered, the part of a pixel that moved it drawn into the
+/// picture instead, so its text is sampled once, as upright text is, and keeps as sharp. Another
+/// turn is sampled once more, by the turn.
+fn draw_turned_box(pm: &mut Canvas, r: Rect, degrees: f32, area: Rect, draw: impl FnOnce(&mut Canvas, Rect, f64)) {
+    let (cx, cy) = (r.x() + r.width() / 2.0, r.y() + r.height() / 2.0);
+    if pm.is_recording() {
+        pm.with_transform(Transform::from_rotate_at(degrees, cx, cy), |c| draw(c, r, 1.0));
+        return;
+    }
+    let (w, h) = (f64::from(area.width()), f64::from(area.height()));
+    let k = (MAX_PIXELS / (w * h)).sqrt().min(MAX_SIDE / w.max(h)).min(1.0) as f32;
+    let (pw, ph) = ((w as f32 * k).ceil().max(1.0), (h as f32 * k).ceil().max(1.0));
+    let mut place =
+        Transform::from_scale(1.0 / k, 1.0 / k).post_translate(r.x() + area.x(), r.y() + area.y()).post_rotate_at(degrees, cx, cy);
+    let quarter = k == 1.0 && degrees.rem_euclid(90.0) == 0.0;
+    let (mut dx, mut dy) = (0.0, 0.0);
+    if quarter {
+        // Its turn exactly (0 or ±1 each way), and its corner on a whole pixel: the picture's
+        // content moves back by as much, turned back (the turn's inverse is its transpose).
+        let [sx, ky, kx, sy] = [place.sx, place.ky, place.kx, place.sy].map(f32::round);
+        let (ex, ey) = (place.tx.round() - place.tx, place.ty.round() - place.ty);
+        (dx, dy) = (-(sx * ex + ky * ey), -(kx * ex + sy * ey));
+        place = Transform::from_row(sx, ky, kx, sy, place.tx.round(), place.ty.round());
+    }
+    // The box in the picture: its corner `area`'s offset away from the picture's (and less than a
+    // pixel more, within the room `area` leaves round the ink).
+    let inner = Rect::from_xywh(-area.x() * k + dx, -area.y() * k + dy, r.width() * k, r.height() * k);
+    let (Some(mut pic), Some(inner)) = (Canvas::new(pw as u32, ph as u32), inner) else { return };
+    draw(&mut pic, inner, f64::from(k));
+    let quality = if quarter { tiny_skia::FilterQuality::Nearest } else { tiny_skia::FilterQuality::Bilinear };
+    let paint = PixmapPaint { quality, ..PixmapPaint::default() };
+    pm.draw_pixmap(0, 0, pic.pixmap().as_ref(), &paint, place, None);
+}
+
 /// Text in an element: lines split at `\n` from the top, each placed by the style's alignment. A
 /// centred or right-aligned line wider than the element runs out past its left edge, as a
 /// left-aligned one runs past its right.
@@ -2541,6 +2887,29 @@ mod tests {
         assert!(uncovered(r, [-1.0, -1.0, 102.0, 52.0]).is_empty());
     }
 
+    /// Each element is a layer of the page's recording, named after it and identified by its id
+    /// (#1815): two elements named alike are told apart by id, not by which comes first, so an
+    /// element that draws nothing on one page of a series doesn't hand its layer to the other.
+    #[test]
+    fn each_element_is_a_layer_with_its_id() {
+        use crate::vector::Item;
+        let mut layout = Layout::new("Layers", 120.0, 90.0);
+        let text = |t: &str| ElementKind::text(t, 12.0, Rgba::rgb(0, 0, 0), false);
+        let (a, b) =
+            (layout.add("Texto", (10.0, 10.0, 60.0, 10.0), text("Um")), layout.add("Texto", (10.0, 30.0, 60.0, 10.0), text("Dois")));
+        let layers = |layout: &Layout| {
+            let (drawing, _) = render_drawing(layout, &mut [], 96.0, &PageInfo::default()).unwrap();
+            let (_, _, items) = drawing.finish();
+            items.into_iter().filter_map(|i| if let Item::Group(g) = i { Some((g.layer?, g.layer_id?)) } else { None }).collect::<Vec<_>>()
+        };
+        assert_eq!(layers(&layout), [("Texto".to_string(), u64::from(a)), ("Texto".to_string(), u64::from(b))]);
+        // The first draws nothing: the second keeps its own layer.
+        if let Some(ElementKind::Text { text, .. }) = layout.elements.iter_mut().find(|e| e.id == a).map(|e| &mut e.kind) {
+            text.clear();
+        }
+        assert_eq!(layers(&layout), [("Texto".to_string(), u64::from(b))]);
+    }
+
     /// A page with a frame of the built-in world and a title.
     fn vector_page() -> (Layout, Vec<Map>) {
         let mut layout = Layout::new("Vectors", 120.0, 90.0);
@@ -2561,6 +2930,7 @@ mod tests {
         let (drawing, pictured) = render_drawing(&layout, &mut maps, 150.0, &PageInfo::default()).unwrap();
         assert!(pictured.is_empty() && !drawing.overflowed());
         let (_, _, items) = drawing.finish();
+        let items = crate::vector::without_layers(items);
         let text: String = items
             .iter()
             .filter_map(|i| if let Item::Glyphs(r) = i { Some(r) } else { None })
@@ -2612,6 +2982,7 @@ mod tests {
         }
         let (drawing, _) = render_drawing(&layout, &mut maps, 96.0, &PageInfo::default()).unwrap();
         let (_, _, items) = drawing.finish();
+        let items = crate::vector::without_layers(items);
         let frame = items.iter().find_map(|i| if let Item::Group(g) = i { Some(g) } else { None }).expect("the frame's group");
         // The turned view holds the north-up frame, turned.
         let Some(Item::Group(north)) = frame.items.first() else { panic!("the north-up frame inside") };
@@ -2629,6 +3000,7 @@ mod tests {
         let (drawing, pictured) = result.unwrap();
         assert_eq!(pictured.iter().map(|p| p.1.as_str()).collect::<Vec<_>>(), ["World"]);
         let (_, _, items) = drawing.finish();
+        let items = crate::vector::without_layers(items);
         assert!(items.iter().any(|i| matches!(i, Item::Image(_))), "the frame as a picture");
     }
 
@@ -3269,8 +3641,9 @@ mod tests {
         assert!(depth(&map, None, false) > 0, "the empty Graduated layer is listed");
     }
 
-    /// A layout with one map frame on `map` and a colorbar of its raster at 10–90 × 10–30 mm
-    /// (a vertical one at 10–30 × 10–90 mm), drawn at 96 dpi.
+    /// A layout with one map frame on `map` and a colorbar of its first raster, by name (one drawn by
+    /// classes isn't a colorbar's by default, #1679), at 10–90 × 10–30 mm (a vertical one at 10–30 ×
+    /// 10–90 mm), drawn at 96 dpi.
     fn colorbar_page(map: &Map, orientation: Orientation, reverse: bool, title: &str) -> Pixmap {
         let mut l = Layout::new("Layout", 100.0, 100.0);
         let frame = l.add(
@@ -3290,10 +3663,114 @@ mod tests {
             },
         );
         let rect = if orientation == Orientation::Vertical { (10.0, 10.0, 20.0, 80.0) } else { (10.0, 10.0, 80.0, 20.0) };
-        let kind =
-            ElementKind::Colorbar { frame, layer: None, title: title.into(), orientation, ticks: 5, tick_side: TickSide::End, reverse };
+        let layer = map.layers.iter().find(|l| l.is_raster()).map(|l| l.name.clone());
+        let kind = ElementKind::Colorbar { frame, layer, title: title.into(), orientation, ticks: 5, tick_side: TickSide::End, reverse };
         l.add("Colorbar", rect, kind);
         render(&l, &mut [map.clone()], 96.0, &PageInfo::default()).unwrap()
+    }
+
+    /// A page whose frame draws a layer without its cast shadows says why, named by the layer; one
+    /// with them, or without any asked for, says nothing.
+    #[test]
+    fn a_page_says_why_a_frame_drew_no_cast_shadows() {
+        let relief = |shadow| rustgis_map::raster::RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 315.0,
+            altitude: 30.0,
+            z_factor: 1.0,
+            shadow,
+            sky: 0.0,
+        };
+        for shadow in [0.0, 1.0] {
+            let map = ramp_map(relief(shadow), rustgis_map::raster::Stretch::MinMax);
+            let (_, said) = crate::shadows_said(|| colorbar_page(&map, Orientation::Horizontal, false, ""));
+            assert!(said.notices.is_empty() && !said.to_come, "shadow {shadow}: {said:?}");
+        }
+        // Read in place with only its overview held: no whole grid to trace.
+        let mut map = ramp_map(relief(1.0), rustgis_map::raster::Stretch::MinMax);
+        let rl = map.layers.iter_mut().find_map(|l| l.raster.as_mut()).unwrap();
+        rl.in_place = true;
+        let mut r = (**rl.data.as_ref().unwrap()).clone();
+        r.overview = Some((1000, 10));
+        rl.data = Some(std::sync::Arc::new(r));
+        let (_, said) = crate::shadows_said(|| colorbar_page(&map, Orientation::Horizontal, false, ""));
+        let said = said.notices;
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("dem: ") && said[0].contains("read in place"), "{said:?}");
+        // What the map view's frame said is not a page's: a clean page drawn after it says nothing.
+        let camera =
+            rustgis_map::Camera { center: rustgis_geom::lonlat_to_merc(Coord::new(0.5, 0.5)), res: 2000.0, bearing: 0.0, pitch: 0.0 };
+        crate::render(&mut map, &crate::View { width: 64.0, height: 64.0, pixels_per_point: 1.0, camera, sky: false });
+        let clean = ramp_map(relief(0.0), rustgis_map::raster::Stretch::MinMax);
+        let (_, said) = crate::shadows_said(|| colorbar_page(&clean, Orientation::Horizontal, false, ""));
+        assert!(said.notices.is_empty(), "{said:?}");
+    }
+
+    /// A page with maps showing copies of one relief (each layer the first of its map, so with the
+    /// same id), each under its own sun, drawn again until it has no shadows to come, as the
+    /// Layout view draws it while they land. Panics if it never settles.
+    fn page_settles_with_suns(suns: &[f64]) {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let n = 300usize;
+        let heights: Vec<f32> = (0..n * n).map(|i| (((i % n) as f32 / 9.0).sin() + ((i / n) as f32 / 7.0).cos()) * 400.0).collect();
+        let gt = GeoTransform { origin_x: -1.0, origin_y: 1.0, pixel_width: 2.0 / n as f64, pixel_height: -2.0 / n as f64 };
+        let dem = Raster::new("dem", n as u32, n as u32, vec![heights], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let rl = rustgis_map::raster::RasterLayer::from_path(dem, "dem.tif");
+        let mut maps = Vec::new();
+        let mut l = Layout::new("Layout", 100.0, 100.0);
+        for (i, azimuth) in suns.iter().enumerate() {
+            let name = format!("m{i}");
+            let mut copy = rl.clone();
+            copy.style.renderer = rustgis_map::raster::RasterRenderer::ShadedRelief {
+                band: 0,
+                ramp: None,
+                azimuth: *azimuth,
+                altitude: 10.0,
+                z_factor: 1.0,
+                shadow: 1.0,
+                sky: 0.0,
+            };
+            let mut m = Map::new(name.clone());
+            assert_eq!(m.add_raster("dem", copy), 1);
+            maps.push(m);
+            let frame = ElementKind::MapFrame {
+                map: name.clone(),
+                center: Coord::new(0.0, 0.0),
+                scale: 1e7,
+                shape: FrameShape::Rectangle,
+                grid: None,
+                extent_of: None,
+                extent_color: rustgis_map::layout::INDICATOR_COLOR,
+                extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                bearing: 0.0,
+                pitch: 0.0,
+            };
+            l.add(&name, (5.0 + 20.0 * i as f64, 5.0, 18.0, 18.0), frame);
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let (drawn, said) = crate::shadows_said(|| render_pending(&l, &mut maps, 48.0, &PageInfo::default()));
+            drawn.unwrap();
+            assert!(said.notices.is_empty(), "{said:?}");
+            if !said.to_come {
+                break;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(60), "the page never got its shadows");
+            std::thread::yield_now();
+        }
+    }
+
+    /// Two maps lit otherwise on a page: neither map's grid stops the other's.
+    #[test]
+    fn two_maps_lit_otherwise_on_a_page_keep_their_own_shadows() {
+        page_settles_with_suns(&[315.0, 135.0]);
+    }
+
+    /// More maps lit otherwise than the grids kept for going back: none is let go while it is drawn.
+    #[test]
+    fn many_maps_lit_otherwise_on_a_page_all_get_their_shadows() {
+        page_settles_with_suns(&[315.0, 135.0, 45.0, 225.0, 0.0]);
     }
 
     /// A map with one 100 × 1 raster valued 0–99 by column, styled by `renderer`.
@@ -3308,6 +3785,96 @@ mod tests {
         let mut map = Map::new("m");
         map.add_raster("dem", rl);
         map
+    }
+
+    /// A map with a land cover raster of `n` classes (values 1 to `n`, one cell each) drawn by its
+    /// colour table, the first named "Forest".
+    fn classes_map(n: u8) -> Map {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 0.01, pixel_height: -0.01 };
+        let mut palette = vec![[0, 0, 0, 0]; 256];
+        for v in 1..=n {
+            palette[usize::from(v)] = [v, 255 - v, 128, 255];
+        }
+        let data: Vec<f32> = (1..=n).map(f32::from).collect();
+        let mut r = Raster::new("lc", u32::from(n), 1, vec![data], gt, Crs::LonLat, None, ColorHint::Palette(palette), "UInt8").unwrap();
+        r.bands[0].classes = vec![String::new(), "Forest".into()];
+        let mut rl = rustgis_map::raster::RasterLayer::from_path(r, "lc.tif");
+        rl.style.renderer = rustgis_map::raster::RasterRenderer::Colormap;
+        let mut map = Map::new("m");
+        map.add_raster("Land cover", rl);
+        map
+    }
+
+    /// A classified raster's legend: its name over its classes, as the Layers pane lists them, by
+    /// what the frame shows and with every class alike (a colour table lists the values it holds);
+    /// left out by name; a raster on a ramp isn't listed (#1679).
+    #[test]
+    fn a_legend_lists_a_classified_rasters_classes() {
+        let mut map = classes_map(5);
+        let opts = LegendOptions { hide_other: true, exclude: &[], labels: &NO_LABELS, scale: 1e6 };
+        let labels = |rows: &[LegendRow]| -> Vec<String> {
+            rows.iter()
+                .map(|r| match r {
+                    LegendRow::Head(name) => format!("[{name}]"),
+                    LegendRow::Class(_, en) => en.label.clone(),
+                    LegendRow::Plain(_, name) => format!("plain {name}"),
+                    LegendRow::Picture(_) => "picture".into(),
+                })
+                .collect()
+        };
+        let want = ["[Land cover]", "Forest", "2", "3", "4", "5"];
+        assert_eq!(labels(&legend_rows(&map, None, &opts)), want);
+        let drawn = shown_legends(&map, 1e6);
+        assert_eq!(labels(&legend_rows(&map, Some(&drawn), &opts)), want);
+        // Its swatches are the pane's colours.
+        let pane: Vec<Rgba> = map.layers[0]
+            .raster
+            .as_ref()
+            .unwrap()
+            .legend()
+            .into_iter()
+            .filter_map(|e| match e {
+                rustgis_map::raster::RasterLegend::Class { color, .. } => Some(color),
+                _ => None,
+            })
+            .collect();
+        let swatches: Vec<Rgba> = legend_rows(&map, None, &opts)
+            .iter()
+            .filter_map(|r| if let LegendRow::Class(_, en) = r { Some(en.symbol.fill) } else { None })
+            .collect();
+        assert_eq!(swatches, pane);
+        // Sized by its rows: its name and five classes.
+        let mm = 25.4 / 96.0;
+        let [(_, h), ..] = legend_sizes_mm(&mut map, 1e6, false, false, (&[], &NO_LABELS)).unwrap();
+        assert!((h - 6.0 * f64::from(LEGEND_ROW) * mm).abs() < 1e-6, "{h} mm");
+        let labelled = BTreeMap::from([("Land cover".to_string(), "Classes do MapBiomas".to_string())]);
+        let opts_labelled = LegendOptions { labels: &labelled, ..opts };
+        assert_eq!(labels(&legend_rows(&map, None, &opts_labelled))[0], "[Classes do MapBiomas]");
+        // Left out by name, or when hidden.
+        let exclude = ["land cover".to_string()];
+        assert!(legend_rows(&map, None, &LegendOptions { exclude: &exclude, ..opts }).is_empty());
+        map.layers[0].visible = false;
+        assert!(shown_legends(&map, 1e6).is_empty());
+        assert!(legend_rows(&map, None, &opts).is_empty());
+        // A raster on a ramp: a colorbar keys it, the legend doesn't list it.
+        let ramp = ramp_map(
+            rustgis_map::raster::RasterRenderer::Stretch { band: 0, ramp: rustgis_map::Ramp::Harbour, invert: false },
+            rustgis_map::raster::Stretch::MinMax,
+        );
+        assert!(legend_rows(&ramp, None, &opts).is_empty() && shown_legends(&ramp, 1e6).is_empty());
+    }
+
+    /// A drawn legend fills each class's swatch with its colour, under the raster's name.
+    #[test]
+    fn a_drawn_legend_fills_a_raster_class_with_its_colour() {
+        let map = classes_map(5);
+        let pm = point_legend(&map);
+        for v in 1..=5u8 {
+            let c = (v, 255 - v, 128);
+            let found = pm.pixels().iter().any(|p| (p.red(), p.green(), p.blue()) == c);
+            assert!(found, "class {v}'s colour {c:?}");
+        }
     }
 
     /// A page with a main frame and an inset (5–55 mm) that outlines it in `color` at `width`.
@@ -3365,6 +3932,277 @@ mod tests {
     fn text_height(pm: &Pixmap) -> u32 {
         let rows: Vec<u32> = (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| rgb(pm, x, y).0 < 128)).collect();
         rows[rows.len() - 1] - rows[0]
+    }
+
+    /// A page with `kind` in (10, 10, 80, 30) mm on white.
+    fn shape_page(kind: ElementKind) -> Layout {
+        let mut l = Layout::new("L", 100.0, 50.0);
+        l.add("Shape", (10.0, 10.0, 80.0, 30.0), kind);
+        l
+    }
+
+    /// The runs of inked and blank pixels along a row (or a column) from `from` to `to`: how many
+    /// times it goes from ink to blank.
+    fn gaps(pm: &Pixmap, along: impl Iterator<Item = (u32, u32)>) -> usize {
+        let ink: Vec<bool> = along.map(|(x, y)| rgb(pm, x, y).0 < 128).collect();
+        ink.windows(2).filter(|w| w[0] && !w[1]).count()
+    }
+
+    /// A dashed line has gaps where its pattern says, its arrowhead solid; a dashed rectangle's
+    /// outline has gaps on all four sides; solid, both draw as before (#1763).
+    #[test]
+    fn dashed_lines_and_outlines_have_gaps() {
+        use rustgis_map::layout::LineDir;
+        let black = Rgba::rgb(0, 0, 0);
+        let dash = rustgis_map::symbology::Dash::new(&[6.0, 6.0]);
+        let png = |kind: ElementKind| render(&shape_page(kind), &mut [], 96.0, &PageInfo::default()).unwrap();
+        // 96 dpi: 1 mm is 3.78 px. The line runs along y = 25 mm from x = 10 to 90 mm.
+        let px = |mm: f64| (mm * 96.0 / 25.4).round() as u32;
+        let line = |dash, head| ElementKind::Line { color: black, width: 2.0, dir: LineDir::Horizontal, head, dash };
+        let along = |pm: &Pixmap| gaps(pm, (px(11.0)..px(80.0)).map(|x| (x, px(25.0))));
+        assert_eq!(along(&png(line(None, LineHead::None))), 0, "solid");
+        // 69 mm is about 261 points (PT_PER_MM): a 12-point round each, so some 22 gaps.
+        let dashed = png(line(dash, LineHead::End));
+        assert!((20..=24).contains(&along(&dashed)), "{} gaps", along(&dashed));
+        // The head (the last 6 + 2.5 × 2 = 11 points, 2.9 mm) is filled: no gap across it.
+        assert_eq!(gaps(&dashed, (px(87.5)..px(89.8)).map(|x| (x, px(25.0)))), 0, "the arrowhead stays solid");
+        let rect = |dash| ElementKind::Rectangle { fill: Rgba::new(0, 0, 0, 0), outline: black, width: 2.0, radius: 0.0, dash };
+        let sides = |pm: &Pixmap| {
+            let (x0, x1, y0, y1) = (px(10.0), px(90.0), px(10.0), px(40.0));
+            [
+                gaps(pm, (x0 + 4..x1 - 4).map(|x| (x, y0))),
+                gaps(pm, (x0 + 4..x1 - 4).map(|x| (x, y1))),
+                gaps(pm, (y0 + 4..y1 - 4).map(|y| (x0, y))),
+                gaps(pm, (y0 + 4..y1 - 4).map(|y| (x1, y))),
+            ]
+        };
+        assert_eq!(sides(&png(rect(None))), [0; 4], "solid");
+        let dashed = sides(&png(rect(dash)));
+        assert!(dashed.iter().all(|g| *g >= 3), "gaps on every side: {dashed:?}");
+        let oval = |dash| ElementKind::Ellipse { fill: Rgba::new(0, 0, 0, 0), outline: black, width: 2.0, dash };
+        // Round its outline: the ellipse fills (10, 10, 80, 30) mm.
+        let round = |pm: &Pixmap| {
+            let px = |mm: f64| mm * 96.0 / 25.4;
+            // Inked where any pixel within one of the curve's point is: the 2-point stroke is about
+            // 2 pixels wide.
+            let near = |(x, y): (f64, f64)| {
+                (-1..=1).any(|dx| (-1..=1).any(|dy| rgb(pm, (x.round() as i32 + dx) as u32, (y.round() as i32 + dy) as u32).0 < 128))
+            };
+            let ink: Vec<bool> = (0..2000)
+                .map(|i| f64::from(i) / 2000.0 * std::f64::consts::TAU)
+                .map(|t| near((px(50.0 + 40.0 * t.cos()), px(25.0 + 15.0 * t.sin()))))
+                .collect();
+            ink.windows(2).filter(|w| w[0] && !w[1]).count()
+        };
+        assert_eq!(round(&png(oval(None))), 0, "solid");
+        assert!(round(&png(oval(dash))) >= 20, "{}", round(&png(oval(dash))));
+    }
+
+    /// A dashed box round a turned text, on one page (#1763): the picture has the box's gaps and
+    /// the text running down the page inside it; the recorded page (the PDF's) keeps the dashes as
+    /// pieces and the text as glyphs; the SVG writes the dash array and the turn.
+    #[test]
+    fn a_dashed_box_and_a_turned_text_share_a_page() {
+        use crate::vector::Item;
+        // The text's box (10, 45, 80, 10) mm turned 90° about (50, 50): 45..55 across, 10..90 down.
+        let mut layout = turned_text_page(90.0);
+        let dash = rustgis_map::symbology::Dash::new(&[6.0, 6.0]);
+        let outline = Rgba::rgb(0, 0, 0);
+        layout.add(
+            "Box",
+            (5.0, 5.0, 90.0, 90.0),
+            ElementKind::Rectangle { fill: Rgba::new(0, 0, 0, 0), outline, width: 2.0, radius: 0.0, dash },
+        );
+        let info = PageInfo::default();
+        let png = render(&layout, &mut [], 96.0, &info).unwrap();
+        let px = |mm: f64| (mm * 96.0 / 25.4).round() as u32;
+        assert!(gaps(&png, (px(10.0)..px(90.0)).map(|x| (x, px(5.0)))) >= 3, "the box's top is dashed");
+        // Inside the box: the text, tall and narrow about x = 50 mm.
+        let inside: Vec<(u32, u32)> =
+            (px(8.0)..px(92.0)).flat_map(|y| (px(8.0)..px(92.0)).map(move |x| (x, y))).filter(|&(x, y)| rgb(&png, x, y).0 < 128).collect();
+        let (l, r) = (inside.iter().map(|p| p.0).min().unwrap(), inside.iter().map(|p| p.0).max().unwrap());
+        let (t, b) = (inside.iter().map(|p| p.1).min().unwrap(), inside.iter().map(|p| p.1).max().unwrap());
+        assert!(b - t > 4 * (r - l) && l > px(44.0) && r < px(56.0), "the text runs down the page: {l},{t} to {r},{b}");
+        let (drawing, _) = render_drawing(&layout, &mut [], 96.0, &info).unwrap();
+        let (_, _, items) = drawing.finish();
+        let items = crate::vector::without_layers(items);
+        let pieces: usize = items
+            .iter()
+            .filter_map(|i| if let Item::Stroke { path, .. } = i { Some(path) } else { None })
+            .map(|p| p.segments().filter(|s| matches!(s, tiny_skia::PathSegment::MoveTo(_))).count())
+            .sum();
+        let text: String = items
+            .iter()
+            .filter_map(|i| if let Item::Glyphs(r) = i { Some(r) } else { None })
+            .flat_map(|r| r.glyphs.iter().map(|g| g.ch))
+            .collect();
+        assert!(pieces > 20 && text == "Fonte: IBGE, 2022", "{pieces} dashes, text {text:?}");
+        let svg = crate::svg::layout_svg(&layout, &mut [], 96.0, &info).unwrap().0;
+        assert!(svg.contains("stroke-dasharray") && svg.contains(r#"transform="rotate(90 50 50)""#), "{svg}");
+    }
+
+    /// A dashed outline is kept as vectors, its dashes as the pieces of the path (as a dashed line
+    /// layer's are), which draw what its picture shows (#1763).
+    #[test]
+    fn a_dashed_outline_is_kept_as_its_dashes() {
+        use crate::vector::Item;
+        let dash = rustgis_map::symbology::Dash::new(&[6.0, 6.0]);
+        let kind = ElementKind::Rectangle { fill: Rgba::new(0, 0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 2.0, radius: 0.0, dash };
+        let layout = shape_page(kind);
+        let info = PageInfo::default();
+        let png = render(&layout, &mut [], 96.0, &info).unwrap();
+        let (drawing, _) = render_drawing(&layout, &mut [], 96.0, &info).unwrap();
+        let (_, _, items) = drawing.finish();
+        let items = crate::vector::without_layers(items);
+        let pieces: usize = items
+            .iter()
+            .filter_map(|i| if let Item::Stroke { path, .. } = i { Some(path) } else { None })
+            .map(|p| p.segments().filter(|s| matches!(s, tiny_skia::PathSegment::MoveTo(_))).count())
+            .sum();
+        assert!(pieces > 20, "{pieces} dashes kept");
+        let mut replayed = Pixmap::new(png.width(), png.height()).unwrap();
+        replayed.fill(tiny_skia::Color::WHITE);
+        crate::vector::replay(&items, &mut replayed, Transform::identity());
+        let differ = png.pixels().iter().zip(replayed.pixels()).filter(|(a, b)| a.red().abs_diff(b.red()) > 48).count();
+        assert!(differ < 50, "{differ} pixels differ");
+    }
+
+    /// A page with one text element in (10, 45, 80, 10) mm, turned `turn` degrees.
+    fn turned_text_page(turn: f64) -> Layout {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let mut kind = ElementKind::text("Fonte: IBGE, 2022", 14.0, Rgba::rgb(0, 0, 0), false);
+        if let ElementKind::Text { rotation, .. } = &mut kind {
+            *rotation = turn;
+        }
+        l.add("Source", (10.0, 45.0, 80.0, 10.0), kind);
+        l
+    }
+
+    /// The dark pixels' bounds: left, top, right, bottom.
+    fn ink_bounds(pm: &Pixmap) -> (u32, u32, u32, u32) {
+        let dark: Vec<(u32, u32)> =
+            (0..pm.height()).flat_map(|y| (0..pm.width()).map(move |x| (x, y))).filter(|&(x, y)| rgb(pm, x, y).0 < 128).collect();
+        let xs = dark.iter().map(|p| p.0);
+        let ys = dark.iter().map(|p| p.1);
+        (xs.clone().min().unwrap(), ys.clone().min().unwrap(), xs.max().unwrap(), ys.max().unwrap())
+    }
+
+    /// A text turned 90° runs down the page from the top of its turned box, -90° up it from the
+    /// bottom, about the centre of its box (#1763); upright, it runs across as before.
+    #[test]
+    fn a_turned_text_runs_down_or_up_the_page() {
+        // 100 mm at 96 dpi; the box's centre at 50 mm.
+        let centre = 50.0 * 96.0 / 25.4;
+        let ink = |turn: f64| ink_bounds(&render(&turned_text_page(turn), &mut [], 96.0, &PageInfo::default()).unwrap());
+        let (l, t, r, b) = ink(0.0);
+        assert!(r - l > 4 * (b - t), "upright runs across: {l},{t} to {r},{b}");
+        for turn in [90.0, -90.0] {
+            let (l, t, r, b) = ink(turn);
+            assert!(b - t > 4 * (r - l), "{turn}° runs along the page: {l},{t} to {r},{b}");
+            // Across: within the turned box, 10 mm wide about the centre.
+            assert!((f64::from(l + r) / 2.0 - centre).abs() < 10.0 * 96.0 / 25.4 / 2.0, "{turn}°: {l}..{r}");
+            // Along: a left-aligned line starts at the box's left edge, which a turn of 90° takes to
+            // the top and one of -90° to the bottom.
+            let middle = f64::from(t + b) / 2.0;
+            assert!(if turn > 0.0 { middle < centre } else { middle > centre }, "{turn}°: {t}..{b} about {centre}");
+        }
+    }
+
+    /// A quarter-turned text keeps as sharp as an upright one: its picture is put on whole pixels,
+    /// not filtered between them, so its edges have no more part-covered pixels (#1763). At 300 dpi
+    /// the box's corner falls between pixels (10 mm is 118.1 of them).
+    #[test]
+    fn a_quarter_turned_text_is_as_sharp_as_upright() {
+        // Solid pixels (darker than 80 %) and part-covered ones (20 to 80 %).
+        let edges = |turn: f64| {
+            let pm = render(&turned_text_page(turn), &mut [], 300.0, &PageInfo::default()).unwrap();
+            let dark = (0..pm.height()).flat_map(|y| (0..pm.width()).map(move |x| (x, y))).map(|(x, y)| 255 - u32::from(rgb(&pm, x, y).0));
+            dark.fold((0u32, 0u32), |(solid, part), d| (solid + u32::from(d > 204), part + u32::from(d > 51 && d <= 204)))
+        };
+        let (solid, part) = edges(0.0);
+        let upright = f64::from(part) / f64::from(solid);
+        for turn in [90.0, -90.0, 180.0] {
+            let (s, p) = edges(turn);
+            let turned = f64::from(p) / f64::from(s);
+            assert!(turned < upright * 1.2, "{turn}°: {p} part-covered to {s} solid, upright {part} to {solid}");
+            assert!(s.abs_diff(solid) * 10 < solid, "{turn}°: as much ink, {s} solid to {solid}");
+        }
+    }
+
+    /// A turned text's picture covers the lines it draws, not its whole box: a short line in a
+    /// large box takes a small picture, where its alignment puts the line (#1763).
+    #[test]
+    fn a_turned_texts_picture_covers_its_lines() {
+        let r = Rect::from_xywh(0.0, 0.0, 2000.0, 1000.0).unwrap();
+        let plain = TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0 };
+        let px = 14.0 * 1.33;
+        let area = |align| text_area(r, "Fonte: IBGE", 14.0, TextStyle { align, ..plain }, 1.0).unwrap();
+        let left = area(TextAlign::Left);
+        assert!(left.width() < 200.0 && left.height() < 4.0 * px, "{left:?}");
+        assert!(left.left() < 0.0 && left.top() < 0.0, "a line's height of room: {left:?}");
+        let right = area(TextAlign::Right);
+        assert!((right.right() - (2000.0 + px)).abs() < 1.0 && (right.width() - left.width()).abs() < 1.0, "{right:?}");
+        let centre = area(TextAlign::Center);
+        assert!(((centre.left() + centre.right()) / 2.0 - 1000.0).abs() < 1.0, "{centre:?}");
+        // Two lines, twice the pitch; nothing when there is no line.
+        let two = text_area(
+            r,
+            "Fonte: IBGE
+Elaboração: RustGIS",
+            14.0,
+            plain,
+            1.0,
+        )
+        .unwrap();
+        assert!((two.height() - left.height() - px * 1.25).abs() < 0.01);
+        assert!(text_area(r, "", 14.0, plain, 1.0).is_none());
+    }
+
+    /// A turned box past the page's budget is still drawn turned, at a lower resolution, not
+    /// left out or left upright (#1763).
+    #[test]
+    fn a_huge_turned_box_is_drawn_at_a_lower_resolution() {
+        let mut pm = Canvas::new(200, 200).unwrap();
+        // 20,000 px long (past MAX_SIDE), 20 high, about the canvas's centre.
+        let r = Rect::from_xywh(-9_900.0, 90.0, 20_000.0, 20.0).unwrap();
+        let mut scale = 0.0;
+        let area = Rect::from_xywh(0.0, 0.0, r.width(), r.height()).unwrap();
+        draw_turned_box(&mut pm, r, 90.0, area, |c, inner, k| {
+            scale = k;
+            c.fill_rect(inner, &paint(Rgba::rgb(0, 0, 0), 1.0), Transform::identity(), None);
+        });
+        assert!(scale < 1.0 && scale > 0.0, "{scale}");
+        // Turned upright: a bar down the middle, top to bottom; nothing beside it.
+        let dark = |x: u32, y: u32| pm.pixmap().pixel(x, y).is_some_and(|p| p.alpha() > 128);
+        assert!(dark(100, 2) && dark(100, 197) && dark(95, 100), "the bar runs down the page");
+        assert!(!dark(70, 100) && !dark(130, 100));
+    }
+
+    /// A turned text is kept as turned glyphs, which draw what its picture shows (#1763).
+    #[test]
+    fn a_turned_text_is_kept_turned_as_vectors() {
+        use crate::vector::Item;
+        let layout = turned_text_page(90.0);
+        let info = PageInfo::default();
+        let png = render(&layout, &mut [], 96.0, &info).unwrap();
+        let (drawing, _) = render_drawing(&layout, &mut [], 96.0, &info).unwrap();
+        let (_, _, items) = drawing.finish();
+        let items = crate::vector::without_layers(items);
+        let text: String = items
+            .iter()
+            .filter_map(|i| if let Item::Glyphs(r) = i { Some(r) } else { None })
+            .flat_map(|r| r.glyphs.iter().map(|g| g.ch))
+            .collect();
+        assert_eq!(text, "Fonte: IBGE, 2022", "kept as text, not a picture");
+        let mut replayed = Pixmap::new(png.width(), png.height()).unwrap();
+        replayed.fill(tiny_skia::Color::WHITE);
+        crate::vector::replay(&items, &mut replayed, Transform::identity());
+        let (pl, pt, pr, pb) = ink_bounds(&png);
+        let (vl, vt, vr, vb) = ink_bounds(&replayed);
+        assert!(
+            pl.abs_diff(vl) <= 2 && pt.abs_diff(vt) <= 2 && pr.abs_diff(vr) <= 2 && pb.abs_diff(vb) <= 2,
+            "{pl},{pt},{pr},{pb} vs {vl},{vt},{vr},{vb}"
+        );
     }
 
     /// Text elements take italic, alignment and letter spacing (#213, point c); plain, they draw
@@ -3484,7 +4322,20 @@ mod tests {
         let breaks = vec![24.0, 49.0, 74.0, 99.0];
         let classify =
             RasterRenderer::Classify { band: 0, method: rustgis_map::ClassMethod::EqualInterval, ramp: ramp.clone(), breaks, classes: 4 };
-        let pm = colorbar_page(&ramp_map(classify, Stretch::MinMax), Orientation::Horizontal, false, "");
+        let classes = ramp_map(classify, Stretch::MinMax);
+        // Named: a colorbar with no layer leaves a raster drawn by classes to the legend (#1679).
+        assert!(rustgis_map::layout::colorbar_layer(&classes, None).is_none());
+        assert!(rustgis_map::layout::colorbar_layer(&map, None).is_some(), "a stretch is the default's");
+        // A stretched raster in a hidden group isn't the default's: the one the map shows is.
+        let mut hidden = map.clone();
+        let top = hidden.layers[0].clone();
+        let id = hidden.add_raster("hidden", top.raster.clone().unwrap());
+        let mut group = rustgis_map::LayerGroup::new("off");
+        group.visible = false;
+        group.children.push(id);
+        hidden.add_group(group);
+        assert_eq!(rustgis_map::layout::colorbar_layer(&hidden, None).map(|l| l.name.as_str()), Some("dem"));
+        let pm = colorbar_page(&classes, Orientation::Horizontal, false, "");
         let mut colours: Vec<(u8, u8, u8)> = ((16.0 * k) as u32..(84.0 * k) as u32).map(|x| rgb(&pm, x, y)).collect();
         colours.dedup();
         assert!((4..=7).contains(&colours.len()), "four steps (and their seams): {colours:?}");
@@ -3556,7 +4407,7 @@ mod tests {
         l.add(
             "Rule",
             (5.0, 10.0, 40.0, 0.15),
-            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0 },
+            ElementKind::Rectangle { fill: Rgba::rgb(0, 0, 0), outline: Rgba::rgb(0, 0, 0), width: 0.0, radius: 0.0, dash: None },
         );
         let pm = render(&l, &mut [], 300.0, &PageInfo::default()).unwrap();
         let x = pm.width() / 2;
@@ -3573,7 +4424,7 @@ mod tests {
         l.add(
             "Arrow",
             (10.0, 7.0, 80.0, 6.0),
-            ElementKind::Line { color: blue, width: 1.0, dir: LineDir::Horizontal, head: LineHead::End },
+            ElementKind::Line { color: blue, width: 1.0, dir: LineDir::Horizontal, head: LineHead::End, dash: None },
         );
         let pm = render(&l, &mut [], 254.0, &PageInfo::default()).unwrap();
         let inked = |x: u32, y: u32| pm.pixel(x, y).is_some_and(|p| p.red() < 128 && p.blue() > 128);
@@ -3592,11 +4443,11 @@ mod tests {
         // 100 × 50 mm at 254 dpi: ten pixels a millimetre.
         let mut l = Layout::new("Layout", 100.0, 50.0);
         let red = Rgba::rgb(255, 0, 0);
-        l.add("Circle", (10.0, 10.0, 30.0, 30.0), ElementKind::Ellipse { fill: red, outline: red, width: 0.0 });
+        l.add("Circle", (10.0, 10.0, 30.0, 30.0), ElementKind::Ellipse { fill: red, outline: red, width: 0.0, dash: None });
         l.add(
             "Line",
             (50.0, 10.0, 40.0, 30.0),
-            ElementKind::Line { color: Rgba::rgb(0, 0, 255), width: 2.0, dir: LineDir::Rising, head: LineHead::None },
+            ElementKind::Line { color: Rgba::rgb(0, 0, 255), width: 2.0, dir: LineDir::Rising, head: LineHead::None, dash: None },
         );
         let pm = render(&l, &mut [], 254.0, &PageInfo::default()).unwrap();
         let is = |x: u32, y: u32, want: (u8, u8, u8)| pm.pixel(x, y).is_some_and(|p| (p.red(), p.green(), p.blue()) == want);
@@ -3755,11 +4606,93 @@ mod tests {
         let mut short = Vec::new();
         measured_lines(&Grid { short: true, ..utm.clone() }, &tr, &frame, false, &mut short);
         assert!(short.iter().any(|l| l.2 && l.1 == "79") && short.iter().any(|l| !l.2 && l.1 == "61"));
+        // MGRS labels: an interval picked for the frame is at most 100 km, a square's side.
+        let country: Vec<Coord> = [(3.0, 43.0), (15.0, 43.0), (15.0, 52.0), (3.0, 52.0)].iter().map(|&(x, y)| Coord::new(x, y)).collect();
+        let tr32 = rustgis_data::raster::Crs::from_epsg(32632).unwrap().transformer().unwrap();
+        let step_of = |g: &Grid| {
+            let mut l = Vec::new();
+            measured_lines(g, &tr32, &country, false, &mut l);
+            let mut xs: Vec<f64> = l.iter().filter(|l| l.2).filter_map(|l| l.1.parse::<f64>().ok()).collect();
+            xs.sort_by(f64::total_cmp);
+            xs.windows(2).map(|w| w[1] - w[0]).fold(f64::INFINITY, f64::min)
+        };
+        let plain = Grid { step: 0.0, ..utm.clone() };
+        assert_eq!(step_of(&plain), 200_000.0);
+        assert_eq!(step_of(&Grid { mgrs: true, ..plain }), 100_000.0);
         // A frame of no extent draws none.
         let mut none = Vec::new();
         measured_lines(&utm, &tr, &[], false, &mut none);
         assert!(none.is_empty());
         assert_eq!((nice_step(2000.0, 1.0), nice_step(7000.0, 1.0), nice_step(1.0, 1.0)), (500.0, 1000.0, 1.0));
+    }
+
+    /// A measured grid labelled as MGRS names each 100 km square that shows, by its grid zone
+    /// designation and letters, where the label fits in it: one square over Winterthur at
+    /// 1:25,000, several at 1:2,000,000, each label in the square it names; in zone 32 only on a
+    /// frame across its edge with zone 33; both bands across the Equator; none on a frame too small
+    /// for a label. The grid is in UTM 32N for MGRS on a map in it, and in the frame's MGRS zone
+    /// (Norway's and Svalbard's exceptions kept) over LV95 or Web Mercator.
+    #[test]
+    fn mgrs_labels_name_the_100_km_squares() {
+        use rustgis_map::layout::{Grid, GridKind};
+        let map = Map::new("m");
+        let tr = rustgis_data::raster::Crs::from_epsg(32632).unwrap().transformer().unwrap();
+        // (A label's size fixed, not measured: the fonts installed differ between machines.)
+        let size = |_: &str| (40.0_f32, 16.0_f32);
+        let view = |center: Coord, scale: f64, mm: f64| View {
+            width: mm * PT_PER_MM,
+            height: mm * PT_PER_MM,
+            pixels_per_point: 1.0,
+            camera: frame_camera(&map, center, scale, 0.0, 0.0),
+            sky: false,
+        };
+        let at = |v: &View, x: f32, y: f32| map.to_lonlat(v.camera.to_map(f64::from(x), f64::from(y), v.width, v.height)).unwrap();
+        let near = view(Coord::new(8.73, 47.5), 25_000.0, 80.0);
+        let one = mgrs_squares(&map, &near, 32, &tr, size);
+        assert_eq!(one.len(), 1, "{one:?}");
+        assert_eq!(one[0].0, "32T MT");
+        assert!((f64::from(one[0].1) - near.width / 2.0).abs() < 2.0 && (f64::from(one[0].2) - near.height / 2.0).abs() < 2.0);
+        let wide = view(Coord::new(8.73, 47.5), 2_000_000.0, 80.0);
+        let many = mgrs_squares(&map, &wide, 32, &tr, size);
+        assert!(many.len() >= 2, "{many:?}");
+        for (text, x, y) in &many {
+            let named = rustgis_geom::to_mgrs(at(&wide, *x, *y), 0).unwrap().to_string();
+            assert_eq!(&named, text);
+        }
+        // Across the edge with zone 33 at 12° E: only zone 32's squares, west of it.
+        let edge = view(Coord::new(11.0, 47.5), 2_000_000.0, 80.0);
+        let west = mgrs_squares(&map, &edge, 32, &tr, size);
+        assert!(!west.is_empty() && west.iter().all(|(t, x, y)| t.starts_with("32") && at(&edge, *x, *y).x < 12.0), "{west:?}");
+        assert!(mgrs_squares(&map, &view(Coord::new(8.73, 47.5), 25_000.0, 15.0), 32, &tr, size).is_empty());
+        // Across the Equator, a northern zone's grid names the southern squares too, as MGRS does.
+        let equator = view(Coord::new(9.0, 0.0), 2_000_000.0, 80.0);
+        let both = mgrs_squares(&map, &equator, 32, &tr, size);
+        for band in ["32N ", "32M "] {
+            assert!(both.iter().any(|(t, ..)| t.starts_with(band)), "{band}: {both:?}");
+        }
+        for (text, x, y) in &both {
+            assert_eq!(&rustgis_geom::to_mgrs(at(&equator, *x, *y), 0).unwrap().to_string(), text);
+        }
+        // Its system: UTM 32N on a map in it or over LV95 (the frame's zone), the one named.
+        let g = Grid { kind: GridKind::Measured, mgrs: true, ..Grid::default() };
+        let c = Coord::new(8.73, 47.5);
+        let on = |code: &str| {
+            let mut m = Map::new("m");
+            m.projection = rustgis_map::Projection::Custom(code.into());
+            m
+        };
+        assert_eq!(measured_crs(&g, &on("EPSG:32632"), Coord::new(14.0, 47.5)).map(|c| c.epsg()), Some(32632));
+        assert_eq!(measured_crs(&g, &on("EPSG:2056"), c).map(|c| c.epsg()), Some(32632));
+        assert_eq!(measured_crs(&g, &map, c).map(|c| c.epsg()), Some(32632));
+        // MGRS's zone at the centre: Bergen's 32V, Svalbard's 33X; a plain measured grid's 6° one.
+        assert_eq!(measured_crs(&g, &map, Coord::new(5.3, 60.4)).map(|c| c.epsg()), Some(32632));
+        assert_eq!(measured_crs(&g, &map, Coord::new(10.0, 78.0)).map(|c| c.epsg()), Some(32633));
+        assert_eq!(measured_crs(&g, &map, Coord::new(9.0, -1.0)).map(|c| c.epsg()), Some(32732));
+        let plain = Grid { mgrs: false, ..g.clone() };
+        assert_eq!(measured_crs(&plain, &map, Coord::new(5.3, 60.4)).map(|c| c.epsg()), Some(32631));
+        let named = Grid { crs: Some("EPSG:32733".into()), ..g.clone() };
+        assert_eq!(measured_crs(&named, &map, c).map(|c| c.epsg()), Some(32733));
+        assert_eq!(measured_crs(&Grid { crs: Some("EPSG:2056".into()), ..g }, &map, c), None);
     }
 
     #[test]
@@ -3815,6 +4748,136 @@ mod tests {
         let vertical = grid_page(g(GridEdges { top: false, bottom: false, left: true, right: false }, Orientation::Vertical));
         assert!(count(&vertical, left, ink) > 0);
         assert!(across(&vertical) < across(&horizontal), "{} columns, against {}", across(&vertical), across(&horizontal));
+    }
+
+    /// A tile layer's credit on a frame with a labelled grid (#1767): in the bottom-right corner,
+    /// where it was drawn, it runs over the bottom labels; the frame moves it clear of every label,
+    /// whichever edges carry them and however the side ones run, and leaves the labels as the grid
+    /// drew them.
+    #[test]
+    fn a_frames_attribution_keeps_clear_of_its_grid_labels() {
+        use rustgis_map::layout::{Grid, GridEdges};
+        let (fw, fh, ppp) = (80.0 * PT_PER_MM, 80.0 * PT_PER_MM, 2.0);
+        let map = Map::new("m");
+        let view = View {
+            width: fw,
+            height: fh,
+            pixels_per_point: ppp,
+            camera: frame_camera(&map, Coord::new(0.0, 0.0), 2e8, 0.0, 0.0),
+            sky: false,
+        };
+        let credit = vec!["© OpenStreetMap contributors".to_string()];
+        let white = || {
+            let mut pm = Pixmap::new((fw * ppp) as u32, (fh * ppp) as u32).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            pm
+        };
+        // Whether each pixel is darkened by text, antialiased edges included.
+        let shaded = |pm: &Pixmap| pm.pixels().iter().map(|p| p.red() < 200 && p.green() < 200 && p.blue() < 200).collect::<Vec<_>>();
+        let grid =
+            |edges, label_orientation| Grid { step: 30.0, color: Rgba::new(0, 0, 0, 0), edges, label_orientation, ..Grid::default() };
+        // The grid's labels and the credit, each on its own frame (the credit `inset` from the
+        // corner, else where the frame puts it); the pixels both darken.
+        let overlap = |g: &Grid, credit: &[String], inset: Option<(f32, f32)>| {
+            let mut labels_pm = Canvas::from_pixmap(white());
+            let labels = draw_grid(&mut labels_pm, &map, &view, g, false);
+            assert!(!labels.is_empty());
+            let (w, h) = (fw as f32, fh as f32);
+            let tw = crate::attribution_text(credit).unwrap().1;
+            let inset = inset.unwrap_or_else(|| attribution_inset((w, h), tw, &labels));
+            let mut credit_pm = Canvas::from_pixmap(white());
+            crate::draw_attribution(&mut credit_pm, credit, ppp as f32, inset);
+            shaded(labels_pm.pixmap()).iter().zip(shaded(credit_pm.pixmap())).filter(|(a, b)| **a && *b).count()
+        };
+        let default = grid(GridEdges::default(), Orientation::Horizontal);
+        assert!(overlap(&default, &credit, Some((0.0, 0.0))) > 20, "in the corner, the credit runs over the bottom labels");
+        for (bottom, right) in [(true, false), (true, true), (false, true)] {
+            for orientation in [Orientation::Horizontal, Orientation::Vertical] {
+                let g = grid(GridEdges { top: true, bottom, left: true, right }, orientation);
+                assert_eq!(overlap(&g, &credit, None), 0, "bottom {bottom}, right {right}, {orientation:?}");
+            }
+        }
+        // A credit wider than the frame (several layers' credits, a narrow frame) runs past both
+        // edges; it keeps clear of the bottom and right labels all the same.
+        let long = vec![
+            "© OpenStreetMap contributors".to_string(),
+            "MapBiomas, sistemas de irrigação (CC BY 4.0)".to_string(),
+            "Instituto Brasileiro de Geografia e Estatística".to_string(),
+        ];
+        assert!(crate::attribution_text(&long).unwrap().1 > fw as f32);
+        for (bottom, right) in [(true, true), (false, true)] {
+            for orientation in [Orientation::Horizontal, Orientation::Vertical] {
+                let g = grid(GridEdges { top: false, bottom, left: false, right }, orientation);
+                assert_eq!(overlap(&g, &long, None), 0, "long credit: bottom {bottom}, right {right}, {orientation:?}");
+            }
+        }
+        // Drawn with the frame's map: the labels' pixels are the grid's alone.
+        let mut labels_pm = Canvas::from_pixmap(white());
+        let all = grid(GridEdges { top: false, bottom: true, left: false, right: true }, Orientation::Horizontal);
+        let labels = draw_grid(&mut labels_pm, &map, &view, &all, false);
+        let img = crate::Rendered {
+            pixmap: white(),
+            labels: Vec::new(),
+            unplaced: Vec::new(),
+            attribution: credit.clone(),
+            tiles_pending: false,
+            data_pending: false,
+            tile_errors: Vec::new(),
+            partial: Vec::new(),
+            pending_in_place: Vec::new(),
+            recorded: None,
+            label_layers: Vec::new(),
+        };
+        let framed = finish_frame(img, ppp, Some((&map, &view, &all, false)));
+        let (a, b) = (labels_pm.pixmap(), framed.pixmap());
+        assert_ne!(a.data(), b.data(), "the credit is drawn");
+        for (_, [x0, y0, x1, y1]) in &labels {
+            let px = |v: f32| (v * ppp as f32) as u32;
+            for (x, y) in (px(*y0)..px(*y1)).flat_map(|y| (px(*x0)..px(*x1)).map(move |x| (x, y))) {
+                assert_eq!(a.pixel(x, y), b.pixel(x, y), "({x}, {y})");
+            }
+        }
+    }
+
+    /// The credit stays in the corner with nothing under it, goes up above a bottom label and left
+    /// of a right one (above it, when going left would take it out of the frame), and pays no heed
+    /// to the top and left labels.
+    #[test]
+    fn attribution_inset_steps_round_the_labels_in_its_way() {
+        let (size, tw) = ((200.0, 100.0), 60.0);
+        assert_eq!(attribution_inset(size, tw, &[]), (0.0, 0.0));
+        // A bottom label under the credit, another left of it.
+        let under = [(Edge::Bottom, [150.0, 88.0, 170.0, 98.0]), (Edge::Bottom, [40.0, 88.0, 60.0, 98.0])];
+        let (bottom, right) = attribution_inset(size, tw, &under);
+        assert_eq!(right, 0.0);
+        // The credit's foot (its centre plus half its height) sits 2 points over the label's top.
+        assert!((100.0 - bottom - crate::ATTRIBUTION_SIZE * 0.9 + crate::ATTRIBUTION_SIZE * 0.8 - 86.0).abs() < 1e-3, "{bottom}");
+        // A right label beside it once it is up: it moves left of it too.
+        let both = [under[0], (Edge::Right, [180.0, 70.0, 197.0, 82.0])];
+        let (b2, r2) = attribution_inset(size, tw, &both);
+        assert_eq!(b2, bottom);
+        assert!((200.0 - r2 - 4.0 - 178.0).abs() < 1e-3, "{r2}");
+        // Labels on the other edges are not in its way.
+        let others = [(Edge::Left, [130.0, 88.0, 196.0, 98.0]), (Edge::Top, [130.0, 88.0, 196.0, 98.0])];
+        assert_eq!(attribution_inset(size, tw, &others), (0.0, 0.0));
+        // Left of a right label it would leave the frame (180 points from x = 16, a label at
+        // x = 163, it would start at x = -19): it goes above the label instead, still in the
+        // corner's column.
+        let side = [(Edge::Right, [163.0, 85.0, 197.0, 97.0])];
+        let (b3, r3) = attribution_inset(size, 180.0, &side);
+        assert_eq!(r3, 0.0);
+        assert!((100.0 - b3 - crate::ATTRIBUTION_SIZE * 0.9 + crate::ATTRIBUTION_SIZE * 0.8 - 83.0).abs() < 1e-3, "{b3}");
+        // No room above it either (a frame 20 points tall): as far left as the frame holds it,
+        // starting at its left edge.
+        let low = [(Edge::Right, [163.0, 3.0, 197.0, 15.0])];
+        let (b4, r4) = attribution_inset((200.0, 20.0), 180.0, &low);
+        assert_eq!(b4, 0.0);
+        assert!((crate::attribution_center(200.0, 180.0, r4) - 90.0).abs() < 1e-3, "{r4}");
+        // Wider than the frame: never left (it can't fit), above the label when there is room.
+        let (b5, r5) = attribution_inset(size, 300.0, &side);
+        assert_eq!((b5, r5), (b3, 0.0));
+        let (b6, r6) = attribution_inset((200.0, 20.0), 300.0, &low);
+        assert_eq!((b6, r6), (0.0, 0.0), "it stays where it was drawn");
     }
 
     #[test]
@@ -3897,6 +4960,58 @@ mod tests {
             assert!(dark < 20, "{style:?}: {dark} dark pixels across the bar");
             assert_ne!(pm.data(), four.data());
         }
+    }
+
+    /// The narrowest element keeps its bar where an export rebuilds it from an f32 rectangle: near
+    /// an A2 sheet's right edge, at 300 and 600 dpi (#1379).
+    #[test]
+    fn a_scale_bar_keeps_its_bar_near_the_right_edge_at_print_density() {
+        // As an export places an element: page mm at `k` pixels a mm, `ppp` pixels a point.
+        let pt_per_mm = rustgis_map::layout::PT_PER_MM;
+        for i in 0..400 {
+            let ground = 10f64.powf(-1.0 + 4.0 * f64::from(i) / 400.0);
+            for widest_mm in [25.0, 63.0, 126.0] {
+                let w_pt = scale_bar_width_pt(ground, widest_mm * pt_per_mm, (ScaleUnits::Auto, 4), false, 4.0).unwrap();
+                let plan = bar_plan(ground, w_pt, ScaleUnits::Auto);
+                for (x_mm, dpi) in [(380.0, 300.0), (560.0, 300.0), (380.0, 600.0), (560.0, 600.0)] {
+                    let k = dpi / 25.4;
+                    let ppp = k / pt_per_mm;
+                    let r = Rect::from_xywh((x_mm * k) as f32, 0.0, (w_pt / pt_per_mm * k) as f32, 10.0).unwrap();
+                    let drawn = bar_plan(ground, f64::from(r.width()) / ppp, ScaleUnits::Auto);
+                    assert_eq!(drawn, plan, "{ground} m a point, {widest_mm} mm at most, x {x_mm} mm, {dpi} dpi");
+                }
+            }
+        }
+    }
+
+    /// The narrowest element for a scale bar draws the very bar a wider one does, labels and all,
+    /// within itself (#1379).
+    #[test]
+    fn a_scale_bar_draws_the_same_in_its_narrowest_element() {
+        let draw = |ground: f64, width: f32| {
+            let mut pm = Pixmap::new(320, 60).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            let r = Rect::from_xywh(0.0, 0.0, width, 60.0).unwrap();
+            let colors = (Rgba::rgb(0x22, 0x22, 0x22), Rgba::rgb(0xFF, 0xFF, 0xFF));
+            crate::canvas::with_canvas(&mut pm, |c| {
+                scale_bar(c, r, ground, (ScaleUnits::Auto, 4, ScaleBarStyle::Alternating), colors, 1.0, true)
+            });
+            pm
+        };
+        // 20 km on a bar of 300 points takes two thirds of it; 10 km at 37.2 m a point, a third.
+        for (ground, narrower_than) in [(100.0, 260.0), (37.2, 190.0), (78.4, 300.0)] {
+            let w = scale_bar_width_pt(ground, 300.0, (ScaleUnits::Auto, 4), true, 4.0).unwrap();
+            assert!(w < narrower_than, "{ground} m a point: {w} points");
+            let (wide, narrow) = (draw(ground, 300.0), draw(ground, w as f32));
+            assert_eq!(wide.data(), narrow.data(), "{ground} m a point: the same bar in {w} points");
+            let past =
+                (w.ceil() as u32..320).flat_map(|x| (0..60).map(move |y| (x, y))).filter(|&(x, y)| narrow.pixel(x, y).is_some_and(ink));
+            assert_eq!(past.count(), 0, "{ground} m a point: nothing drawn past {w} points");
+        }
+        assert_eq!(scale_bar_width_pt(0.0, 300.0, (ScaleUnits::Auto, 4), false, 4.0), None);
+        // Miles count in other lengths: the box still draws the same bar.
+        let w = scale_bar_width_pt(100.0, 300.0, (ScaleUnits::Miles, 4), false, 4.0).unwrap();
+        assert!(w <= 300.0 && bar_plan(100.0, w, ScaleUnits::Miles) == bar_plan(100.0, 300.0, ScaleUnits::Miles));
     }
 
     #[test]
