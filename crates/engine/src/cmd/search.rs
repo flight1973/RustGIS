@@ -442,6 +442,11 @@ pub fn read_grid_reference(text: &str) -> Result<Coord, GridError> {
         match polar_form(text) {
             // As the readout writes it: plainly meant as a reference, so it says why it names no
             // place.
+            // The square alone (`Z AC`) is a letter and a word as often (`A TO`), as `5 Ave` is:
+            // read if it names a square, text if not.
+            Some(PolarForm::Readout) if !text.bytes().any(|b| b.is_ascii_digit()) => {
+                rustgis_geom::parse_mgrs(text).map_err(|_| GridError::Syntax)
+            }
             Some(PolarForm::Readout) => rustgis_geom::parse_mgrs(text),
             // Compact forms look like codes too (`BAG123456`): read if they name a place, text if not.
             Some(PolarForm::Compact) => rustgis_geom::parse_mgrs(text).map_err(|_| GridError::Syntax),
@@ -1018,6 +1023,15 @@ mod tests {
         for q in ["ZDA1234512345", "YRA1234512345", "ABC123456", "YAA123456"] {
             assert_eq!(search(&s, q, 50).grid_error, None, "{q}");
         }
+        // The square alone is a letter and a word as often, as `5 Ave` is: one that names no
+        // square (`A TO`, row O isn't used) is text and says nothing; one that names a square
+        // (`A ST`) is found but may be text.
+        for q in ["A TO", "Z DA", "Y RA"] {
+            let r = search(&s, q, 50);
+            assert!(!r.hits.iter().any(|h| matches!(h, Hit::Coordinate { .. })), "{q}: {r:?}");
+            assert_eq!(r.grid_error, None, "{q}");
+        }
+        assert!(search(&s, "A ST", 50).coordinate_may_be_text);
     }
 
     /// A code that also reads as a polar reference (`BAG123456` is B AG 123 456, a place in

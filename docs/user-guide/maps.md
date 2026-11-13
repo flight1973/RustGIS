@@ -209,8 +209,8 @@ A reference that doesn't exist (square letters the zone doesn't use, a northing 
 outside the band, an odd number of digits, a place outside the zone) finds nothing rather than a
 place somewhere else, and the list says why; `map.search` returns the reason as `gridError`, and
 adds `"coordinateMayBeText": true` when a polar place among its hits may as well be a name or a
-code. A 100 km square written with spaces, such as `5 Ave` or `4K TV`, is as likely ordinary
-text, so one that names no square gives no reason; written as one word, `38TMJ`, it does. Polar
+code. A 100 km square written with spaces, such as `5 Ave`, `4K TV` or `A TO`, is as likely
+ordinary text, so one that names no square gives no reason; written as one word, `38TMJ`, it does. Polar
 MGRS written compactly (`ZDA1234512345`) may be a code too, so one that names no place gives no
 reason either; written as the readout writes it (`Z DA 12345 12345`), it does. A UPS position
 after `n` or `s` may be a State Plane pair (`N 1350000 1350000`), so it gives no reason; after
