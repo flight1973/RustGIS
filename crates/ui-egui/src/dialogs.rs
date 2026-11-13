@@ -154,9 +154,11 @@ impl Dialogs {
                 self.a = if is_code { self.text.trim_start_matches(|c: char| !c.is_ascii_digit()).to_string() } else { String::new() };
             }
             "goToXY" => {
-                // The map's center as the search box writes a place: `lat, lon`.
+                // The map's center as the search box writes a place: `lat, lon`, the longitude
+                // within ±180 even when the view has been panned past the antimeridian.
                 let c = s.map().center_lonlat();
-                self.a = rustgis_engine::cmd::search::format_lat_lon((c.y * 1e4).round() / 1e4, (c.x * 1e4).round() / 1e4);
+                let lon = (c.x + 180.0).rem_euclid(360.0) - 180.0;
+                self.a = rustgis_engine::cmd::search::format_lat_lon((c.y * 1e4).round() / 1e4, (lon * 1e4).round() / 1e4);
             }
             "bookmark" => self.text = rustgis_engine::cmd::navigate::new_bookmark_name(s.map()),
             "camera" => {
@@ -336,7 +338,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 });
                 // Below the boxes, wrapped to the dialog's width rather than widening it.
                 ui.label(
-                    egui::RichText::new(tl!("Latitude and longitude, or a UTM or MGRS reference: 40.7128, -74.006 · 40°42′46″N 74°0′21″W · 18north 583959 4507351 · 18TWL8395907350"))
+                    egui::RichText::new(tl!("Latitude, then longitude, or a UTM or MGRS reference: 40.7128, -74.006 · 40°42′46″N 74°0′22″W · 18north 583959 4507351 · 18TWL8395907350"))
                         .weak(),
                 );
                 close = buttons(app, ui, "Go", |app| {

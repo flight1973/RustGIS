@@ -42,7 +42,7 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"extent": [minLon, minLat, maxLon, maxLat]}"#),
         C::new("map.goToXY", "By Coordinates…", "Home › Navigate › Locate", go_to_xy).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
-            .params(r#"{"lon" | "x": number, "lat" | "y": number | "position": text as the search box reads it (40.7128, -74.006; 40°42'46"N 74°0'21"W; 18north 583959 4507351; 18TWL8395907350), "scale"?: number, "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85)}"#),
+            .params(r#"{"lon" | "x": number, "lat" | "y": number, "position"?: text in place of lon and lat, as the search box reads it (40.7128, -74.006; 40°42′46″N 74°0′22″W; 18north 583959 4507351; 18TWL8395907350), "scale"?: number, "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85)}"#),
         C::new("map.goToLink", "Go To Map Link", "Home › Navigate", go_to_link).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"url": a map link ending in #zoom/lat/lon[/bearing[/pitch]] (as MapLibre writes them; also #map=…), or just zoom/lat/lon[/bearing[/pitch]]}"#),
@@ -329,36 +329,43 @@ fn zoom(s: &mut Session, factor: f64) -> CmdResult {
     Ok(Value::Null)
 }
 
-/// The most characters of a typed position read; no form the search box reads is longer.
-const MAX_POSITION: usize = 200;
-
-/// A place typed as the search box reads one: latitude and longitude in decimal degrees, degrees
-/// and minutes or degrees, minutes and seconds (`40.7128, -74.006`, `40°42'46"N 74°0'21"W`), or
-/// on the Earth's map a UTM position or an MGRS reference (`18north 583959 4507351`,
-/// `18TWL8395907350`, the center of the square it names). A reference that names no place says
-/// why, as the search box does.
-pub(crate) fn read_position(map: &Map, text: &str) -> Result<Coord, String> {
+/// A place typed as the search box reads one: latitude, then longitude, in decimal degrees,
+/// degrees and minutes or degrees, minutes and seconds (`40.7128, -74.006`,
+/// `40°42'46"N 74°0'22"W`), or on the Earth's map a UTM position or an MGRS reference
+/// (`18north 583959 4507351`, `18TWL8395907350`). A reference that names no place says why, as
+/// the search box does. An MGRS reference coarser than a meter names a square, not a point: the
+/// place is its center, and the second value says so, for a notice.
+pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, Option<String>), String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("the position is empty".into());
     }
-    if text.chars().count() > MAX_POSITION {
-        return Err(format!("the position is longer than {MAX_POSITION} characters"));
+    if text.chars().nth(super::search::MAX_CHARS).is_some() {
+        return Err(format!("the position is longer than {} characters", super::search::MAX_CHARS));
     }
     if let Some(c) = super::search::parse_lat_lon(text) {
-        return Ok(c);
+        return Ok((c, None));
     }
-    let usage = "write a position as latitude and longitude (40.7128, -74.006 or 40°42'46\"N 74°0'21\"W), UTM (18north 583959 4507351) or MGRS (18TWL8395907350)";
+    // Two plain numbers that aren't a latitude and a longitude: out of range, not misspelled.
+    let words: Vec<&str> = text.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()).collect();
+    if words.len() == 2 && words.iter().all(|w| w.parse::<f64>().is_ok_and(f64::is_finite)) {
+        return Err("latitude must be within ±90 and longitude within ±180".into());
+    }
+    let degrees = "write a position as latitude, then longitude (40.7128, -74.006 or 40°42'46\"N 74°0'22\"W)";
     if !map.body().is_earth() {
-        return Err(
-            "write a position as latitude and longitude (40.7128, -74.006 or 40°42'46\"N 74°0'21\"W); UTM and MGRS are the Earth's grids"
-                .into(),
-        );
+        return Err(format!("{degrees}; UTM and MGRS are the Earth's grids"));
     }
     match super::search::read_grid_reference(text) {
-        Ok(c) => Ok(c),
-        Err(rustgis_geom::GridError::Syntax) => Err(usage.into()),
-        Err(e) => Err(e.to_string()),
+        Ok(c) => {
+            let square = rustgis_geom::parse_mgrs(text).ok().filter(|m| m.digits < 5).map(|m| {
+                let side = 10u32.pow(5 - u32::from(m.digits));
+                let side = if side >= 1000 { format!("{} km", side / 1000) } else { format!("{side} m") };
+                format!("{} names a {side} square, not a point: went to its center", text)
+            });
+            Ok((c, square))
+        }
+        Err(rustgis_geom::GridError::Syntax) => Err(format!("{degrees}, UTM (18north 583959 4507351) or MGRS (18TWL8395907350)")),
+        Err(e) => Err(format!("no place at this grid reference: {e}")),
     }
 }
 
@@ -369,16 +376,18 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
         Some(_) => return Err("position must be text, such as \"40.7128, -74.006\" or \"18TWL8395907350\"".into()),
     };
     let given = |k: &str| !matches!(p.get(k), None | Some(Value::Null));
-    let (lon, lat) = if let Some(text) = position {
+    // An MGRS square's center is said once the map has moved there, not before a refusal.
+    let (lon, lat, square) = if let Some(text) = position {
         if ["lon", "lat", "x", "y"].iter().any(|k| given(k)) {
             return Err("give a position or lon and lat, not both".into());
         }
-        let c = read_position(s.map(), text)?;
-        (c.x, c.y)
+        let (c, square) = read_position(s.map(), text)?;
+        (c.x, c.y, square)
     } else {
         (
             f(p, "lon").or_else(|| f(p, "x")).ok_or("lon is required (or a position)")?,
             f(p, "lat").or_else(|| f(p, "y")).ok_or("lat is required (or a position)")?,
+            None,
         )
     };
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
@@ -405,6 +414,9 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
     }
     m.camera.clamp();
     s.record_extent();
+    if let Some(said) = square {
+        s.notify(said, false);
+    }
     Ok(Value::Null)
 }
 

@@ -4452,3 +4452,22 @@ fn by_coordinates_reads_one_position_box() {
     let c = h.state().session.map().center_lonlat();
     assert!((c.y - 40.7128).abs() < 1e-3 && (c.x + 74.006).abs() < 1e-3, "{c:?}");
 }
+
+/// Panned past the antimeridian, By Coordinates still opens on a longitude within ±180, so Go on
+/// the text it wrote goes there.
+#[test]
+fn by_coordinates_wraps_the_longitude_past_the_antimeridian() {
+    let mut h = harness();
+    h.state_mut().run("map.goToXY", json!({"lon": 170, "lat": 10, "scale": 5_000_000})).unwrap();
+    // 20° further east in Web Mercator meters: 190° E.
+    h.state_mut().session.map_mut().camera.center.x += 20.0_f64.to_radians() * 6_378_137.0;
+    let lon = h.state().session.map().center_lonlat().x;
+    assert!(lon > 180.0, "the camera is past the antimeridian: {lon}");
+    h.state_mut().run("ui.dialog", json!({"name": "goToXY"})).unwrap();
+    h.step();
+    assert_eq!(h.state().dialogs.a, "10, -170");
+    h.step();
+    h.get_by_label("Go").click();
+    h.step();
+    assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+}

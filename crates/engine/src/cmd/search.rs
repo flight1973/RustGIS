@@ -33,7 +33,7 @@ const MAX_ROWS: usize = 50_000;
 /// index it picks is one the command finds.
 pub const LIMIT: usize = 30;
 /// Most characters of a query, and of a value shown.
-const MAX_CHARS: usize = 200;
+pub(crate) const MAX_CHARS: usize = 200;
 
 /// Identifies a tile layer across stack reordering without relying on catalog metadata. It uses
 /// temporal source metadata rather than the current URL, which changes with the time slider.

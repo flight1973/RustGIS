@@ -45385,8 +45385,8 @@ fn go_to_xy_reads_a_position_as_the_search_box_does() {
     );
     for q in [
         "40.7128, -74.006",
-        "40°42'46\"N 74°0'21\"W",
-        "40°42′46″N 74°0′21″W",
+        "40°42'46\"N 74°0'22\"W",
+        "40°42′46″N 74°0′22″W",
         "18north 583959 4507351",
         "18T WL 83959 07350",
         "18TWL8395907350",
@@ -45396,13 +45396,29 @@ fn go_to_xy_reads_a_position_as_the_search_box_does() {
         assert_eq!(at(&s), (40.713, -74.006), "{q}");
     }
     assert!((s.map().scale() - 50_000.0).abs() < 1.0);
+    // An MGRS reference coarser than a meter goes to its square's center and says so; one to the
+    // meter, or degrees, say nothing.
+    for (q, said) in [("18TWL", Some("100 km square")), ("18TWL8307", Some("1 km square")), ("18TWL8395907350", None), ("40.7, -74", None)]
+    {
+        let mark = s.notice_mark();
+        s.run("map.goToXY", &json!({"position": q})).unwrap();
+        let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        match said {
+            Some(t) => assert!(notices.len() == 1 && notices[0].contains(t) && notices[0].contains("center"), "{q}: {notices:?}"),
+            None => assert!(notices.is_empty(), "{q}: {notices:?}"),
+        }
+    }
     // Numbers still go as before.
     s.run("map.goToXY", &json!({"lon": 10, "lat": 50})).unwrap();
     assert_eq!(at(&s), (50.0, 10.0));
     // Refused, with the reason the search box gives, and the map stays where it was.
     let refused = |s: &mut Session, p: Value| s.run("map.goToXY", &p).unwrap_err();
-    assert!(refused(&mut s, json!({"position": "33UZZ1234512345"})).contains("100 km square"));
+    let e = refused(&mut s, json!({"position": "33UZZ1234512345"}));
+    assert!(e.starts_with("no place at this grid reference") && e.contains("100 km square"), "{e}");
     assert!(refused(&mut s, json!({"position": "Paris"})).contains("write a position as"));
+    for q in ["40.7, 200", "95, 100", "-91, 200"] {
+        assert!(refused(&mut s, json!({"position": q})).contains("within ±90"), "{q}");
+    }
     assert!(refused(&mut s, json!({"position": "  "})).contains("empty"));
     assert!(refused(&mut s, json!({"position": "4".repeat(10_000)})).contains("longer than"));
     assert!(refused(&mut s, json!({"position": 40.7})).contains("must be text"));

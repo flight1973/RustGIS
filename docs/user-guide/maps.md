@@ -11,10 +11,12 @@ For selecting, grouping, reordering and copying layers between maps, see
 Drag to pan and scroll to zoom; ++home++ (or **Full Extent**) shows all the data. **Home › Navigate**
 has fixed zoom steps, **Previous** and **Next** extents, **Bookmarks** (the World Atlas has World,
 Europe, Africa, Americas and East Asia), and **Locate**: **By Coordinates…** pans to a position
-written as the search box reads one: latitude and longitude in decimal degrees or degrees, minutes
-and seconds (`40.7128, -74.006`, `40°42'46"N 74°0'21"W`), or a UTM or MGRS reference
-(`18north 583959 4507351`, `18TWL8395907350`; `map.goToXY {"position": "18TWL8395907350"}`), and
-one that names no place says why; **By Place or Address…** finds a place or address with a geocoder. **New Bookmark…**
+written as the search box reads one: latitude, then longitude, in decimal degrees or degrees,
+minutes and seconds (`40.7128, -74.006`, `40°42'46"N 74°0'22"W`), or a UTM or MGRS reference
+(`18north 583959 4507351`, `18TWL8395907350`; `map.goToXY {"position": "18TWL8395907350"}`). One
+that names no place says why; an MGRS reference coarser than a meter (`18TWL`) goes to the center
+of its square and says so. **By Place or Address…** finds a place or address with a geocoder.
+**New Bookmark…**
 saves the current view under a name, with an optional description of the place. The Bookmarks menu
 removes a bookmark with the button beside it, and exports or imports them as a `.rgisbookmarks`
 file. Imported bookmarks show the same place on a map in another projection; places that projection
