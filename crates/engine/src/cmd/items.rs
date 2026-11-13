@@ -727,10 +727,12 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
         let hidden: Vec<u32> = m.layers.iter().filter(|l| !kept(l)).map(|l| l.id).collect();
         m.release_tiles(&hidden);
         m.layers.retain(|l| kept(l));
-        // What Simplify left alone or changed beyond simplifying (a latitude past a pole taken as
-        // the pole, a one-vertex line part left out), over all the layers: said, one notice per
-        // kind (#1811).
-        let mut notes = rustgis_analysis::SimplifyNotes::default();
+    }
+    // What Simplify changed beyond simplifying (a latitude past a pole taken as the pole, a
+    // one-vertex line part left out), over all the layers: said once the package is made, one
+    // notice per kind (#1811). Simplified less than asked keeps the data, with nothing to tell.
+    let mut notes = rustgis_analysis::SimplifyNotes::default();
+    if mobile {
         for l in &mut m.layers {
             if l.is_raster() || tol <= 0.0 {
                 continue;
@@ -744,14 +746,14 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
             }
             l.touch_geometry();
         }
-        for said in notes.messages("Mobile map package, simplifying") {
-            s.notify(said, false);
-        }
     }
     crate::project::ensure_map_imports_complete(&m)?;
     let name = m.name.clone();
     let (text, report) = crate::durable::output_owned(m, |m| serde_json::to_string(m).map_err(|e| e.to_string()))?;
     crate::durable::notify(s, &report);
+    for said in notes.changes().messages("Mobile map package, simplifying") {
+        s.notify(said, false);
+    }
     let kind = if mobile { "mobile map package" } else { "map package" };
     let readme = format!("{} — a RustGIS {kind}.\nAdd it to a project with Data › Import.\n", name);
     rustgis_data::zip::write(&[(format!("{}.rgismap", safe(&name)), text.into_bytes()), ("README.txt".into(), readme.into_bytes())])

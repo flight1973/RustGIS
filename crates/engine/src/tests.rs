@@ -45397,7 +45397,7 @@ fn a_mobile_package_says_what_simplifying_did() {
     let bad =
         package(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)], vec![Coord::new(5.0, 5.0)]], "bad.rgismpk");
     let notes = said(&bad);
-    assert_eq!(notes.len(), 3, "{notes:?}");
+    assert_eq!(notes.len(), 2, "{notes:?}");
     assert!(notes.contains(&"Mobile map package, simplifying: 1 line part(s) of fewer than 2 vertices left out".to_string()), "{notes:?}");
     assert!(
         notes.contains(
@@ -45406,9 +45406,14 @@ fn a_mobile_package_says_what_simplifying_did() {
         ),
         "{notes:?}"
     );
-    assert!(notes.iter().any(|n| n.contains("reach beyond 85.05°")), "{notes:?}");
-    let clean = package(vec![vec![Coord::new(0.0, 40.0), Coord::new(1.0, 40.0001), Coord::new(2.0, 40.0)]], "clean.rgismpk");
-    assert!(said(&clean).is_empty(), "{:?}", said(&clean));
+    // Clean, or only simplified less than asked (reaching 88°, as Antarctica does): nothing to say.
+    for (line, name) in [
+        (vec![vec![Coord::new(0.0, 40.0), Coord::new(1.0, 40.0001), Coord::new(2.0, 40.0)]], "clean.rgismpk"),
+        (vec![vec![Coord::new(0.0, -80.0), Coord::new(1.0, -88.0), Coord::new(2.0, -80.0)]], "south.rgismpk"),
+    ] {
+        let clean = package(line, name);
+        assert!(said(&clean).is_empty(), "{name}: {:?}", said(&clean));
+    }
 }
 
 /// A globe locator says what simplifying its polygons did beyond simplifying (#1811): a ring's
@@ -45440,6 +45445,12 @@ fn a_globe_locator_says_what_simplifying_did() {
         ),
         "{bad:?}"
     );
-    let clean = warned(vec![c(0.0, 70.0), c(20.0, 70.0), c(20.0, 80.0), c(10.0, 82.0), c(0.0, 80.0), c(0.0, 70.0)]);
-    assert!(clean.is_empty(), "{clean:?}");
+    // Clean, or only simplified less than asked (reaching 89°, as Antarctica's -90° does): nothing.
+    for ring in [
+        vec![c(0.0, 70.0), c(20.0, 70.0), c(20.0, 80.0), c(10.0, 82.0), c(0.0, 80.0), c(0.0, 70.0)],
+        vec![c(0.0, 70.0), c(20.0, 70.0), c(20.0, 80.0), c(10.0, 89.0), c(0.0, 80.0), c(0.0, 70.0)],
+    ] {
+        let clean = warned(ring);
+        assert!(clean.is_empty(), "{clean:?}");
+    }
 }

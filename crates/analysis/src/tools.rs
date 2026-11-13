@@ -4006,32 +4006,33 @@ pub fn simplify_geometry(g: &Geometry, tol_m: f64) -> (Geometry, SimplifyNotes) 
     // and the vertices are counted; a line part of fewer than 2 vertices has no line to keep
     // (`from_line`), and is counted. Points aren't simplified.
     if tol_m > 0.0 && !s.broken && !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
-        // A geometry given back as it was (nothing to keep in the plane) moved nothing.
-        let changed = s.geometry != *g;
-        let past = |c: &Coord| !c.y.is_nan() && c.y.abs() > 90.0;
         let mut beyond = false;
         g.for_each_coord(|c| beyond |= !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT);
         notes.polar = usize::from(beyond);
         // The vertices taken to a pole are those in what's kept: a line's parts of 2 vertices or
-        // more, a polygon's rings.
-        notes.past_pole = match g {
-            _ if !changed => 0,
-            Geometry::Line(parts) => parts.iter().filter(|p| p.len() >= 2).flatten().filter(|c| past(c)).count(),
-            _ => {
-                let mut n = 0;
-                g.for_each_coord(|c| n += usize::from(past(&c)));
-                n
+        // more, a polygon's rings. A line whose parts are all that short is kept as it was
+        // (`from_line` has none to give), so only the short parts beside a longer one go.
+        (notes.past_pole, notes.short) = match g {
+            Geometry::Line(parts) if parts.iter().any(|p| p.len() >= 2) => {
+                (past_pole(parts.iter().filter(|p| p.len() >= 2).flatten()), parts.iter().filter(|p| p.len() < 2).count())
             }
+            Geometry::Line(_) => (0, 0),
+            Geometry::Polygon(polygons) => (past_pole(polygons.iter().flatten().flatten()), 0),
+            _ => (0, 0),
         };
-        // A line whose parts are all that short is kept as it was (`from_line` has none to give),
-        // so only the short parts beside a longer one go.
-        if let Geometry::Line(parts) = g
-            && parts.iter().any(|p| p.len() >= 2)
-        {
-            notes.short = parts.iter().filter(|p| p.len() < 2).count();
+        // A geometry given back as it was (nothing to keep in the plane, or canceled) moved nothing
+        // and left nothing out: looked at only when there's something to say.
+        if (notes.past_pole > 0 || notes.short > 0) && s.geometry == *g {
+            (notes.past_pole, notes.short) = (0, 0);
         }
     }
     (s.geometry, notes)
+}
+
+/// The vertices with a latitude past a pole (bad data), infinite ones included: Simplify takes
+/// them as that pole ([`SimplifyNotes::past_pole`]).
+pub fn past_pole<'a>(coords: impl IntoIterator<Item = &'a Coord>) -> usize {
+    coords.into_iter().filter(|c| !c.y.is_nan() && c.y.abs() > 90.0).count()
 }
 
 /// What Simplify left alone or changed beyond simplifying, counted over the geometries it was
@@ -4059,6 +4060,14 @@ impl SimplifyNotes {
         self.capped += other.capped;
         self.short += other.short;
         self.past_pole += other.past_pole;
+    }
+
+    /// Only what changed the data beyond simplifying it: vertices past a pole taken as the pole, and
+    /// one-vertex line parts left out. What was simplified less than asked (beyond 85.05°, left as
+    /// it was, too intricate) keeps the data as it was, for a caller with nothing to tell about that
+    /// (a package, a locator's sketch).
+    pub fn changes(&self) -> SimplifyNotes {
+        SimplifyNotes { short: self.short, past_pole: self.past_pole, ..SimplifyNotes::default() }
     }
 
     /// One notice per kind counted, each starting with `lead` (who simplified: "Simplify"); none
@@ -8167,6 +8176,20 @@ mod tests {
             Geometry::Line(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)], vec![Coord::new(5.0, 5.0)]]);
         let (_, notes) = simplify_geometry(&bad, 100.0);
         assert_eq!(notes, SimplifyNotes { polar: 1, short: 1, past_pole: 1, ..SimplifyNotes::default() });
+        // What changed the data beyond simplifying it, for callers that only tell that.
+        assert_eq!(notes.changes(), SimplifyNotes { short: 1, past_pole: 1, ..SimplifyNotes::default() });
+        // Canceled (a part whose set-up alone reaches a look at Cancel), the line is given back as
+        // it was: its short part didn't go, so it isn't said to.
+        let long: Vec<Coord> = (0..(crate::control::PACE_WORK / SETUP_WORK + 1)).map(|i| Coord::new(i as f64 * 1e-6, 0.0)).collect();
+        let canceled_line = Geometry::Line(vec![long, vec![Coord::new(5.0, 5.0)]]);
+        let control = crate::control::Control::new();
+        control.cancel();
+        {
+            let _installed = crate::control::install(Some(control));
+            let (back, notes) = simplify_geometry(&canceled_line, 100.0);
+            assert_eq!(back, canceled_line);
+            assert_eq!(notes, SimplifyNotes::default());
+        }
         let mut all = SimplifyNotes::default();
         all.add(&notes);
         all.add(&notes);
