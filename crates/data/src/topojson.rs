@@ -72,19 +72,53 @@ fn rings_json(r: &[Vec<Pos>]) -> Json {
     Json::Array(r.iter().map(|l| line_json(l)).collect())
 }
 
+/// Why a geometry wasn't rebuilt.
+enum Lost {
+    /// It, or an arc it uses, can't be read (or it is nested too deep).
+    Unreadable,
+    /// Rebuilding it would pass the limit of coordinates rebuilt from arcs.
+    Cut,
+}
+
+/// Whether a geometry object is empty on purpose: a JSON null type, with no arcs or coordinates.
+/// The specification's types (§2) have no null type; this reads such an object as a feature
+/// without geometry, as GeoJSON's null geometry. Any other type that isn't one of them, the text
+/// "null" included, can't be read.
+fn empty_on_purpose(g: &Json) -> bool {
+    let none = |k: &str| g.get(k).is_none_or(Json::is_null);
+    matches!(g.get("type"), Some(Json::Null)) && none("arcs") && none("coordinates")
+}
+
 struct Topology {
     /// The arcs, decoded to coordinates; `None` for one with a position that can't be read.
     arcs: Vec<Option<Vec<Pos>>>,
     transform: Option<([f64; 2], [f64; 2])>,
-    /// Coordinates still allowed to be rebuilt from arcs, across all objects.
+    /// The most coordinates rebuilt from arcs, across all objects.
+    limit: usize,
+    /// Coordinates still allowed to be rebuilt.
     budget: usize,
     /// Whether rebuilding the geometry being read ran past `budget`.
     over_budget: bool,
-    /// Members of geometry collections left out, since the last object was read.
+    /// Members of geometry collections left out, since the last object was read: unreadable, and
+    /// at the coordinate limit.
     members_lost: usize,
+    members_cut: usize,
 }
 
 impl Topology {
+    /// A geometry object rebuilt as GeoJSON, or why it wasn't. The coordinates counted for one
+    /// that isn't rebuilt are given back, so it doesn't use up the limit.
+    fn read_member(&mut self, g: &Json, depth: usize) -> std::result::Result<Json, Lost> {
+        let (budget, outer) = (self.budget, self.over_budget);
+        self.over_budget = false;
+        let read = self.geometry(g, depth);
+        let cut = std::mem::replace(&mut self.over_budget, outer);
+        read.ok_or_else(|| {
+            self.budget = budget;
+            if cut { Lost::Cut } else { Lost::Unreadable }
+        })
+    }
+
     /// A point's position, quantized (not delta-encoded) with a transform.
     fn point(&self, p: &Json) -> Option<Pos> {
         let [x, y, e] = position(p)?;
@@ -153,9 +187,17 @@ impl Topology {
                 json!({"type": ty, "coordinates": polys?.iter().map(|p| rings_json(p)).collect::<Vec<_>>()})
             }
             "GeometryCollection" if depth < 4 => {
-                let members = g.get("geometries")?.as_array()?;
-                let gs: Vec<Json> = members.iter().filter_map(|x| self.geometry(x, depth + 1)).collect();
-                self.members_lost += members.len().saturating_sub(gs.len());
+                let mut gs = Vec::new();
+                for member in g.get("geometries")?.as_array()? {
+                    if empty_on_purpose(member) {
+                        continue;
+                    }
+                    match self.read_member(member, depth + 1) {
+                        Ok(m) => gs.push(m),
+                        Err(Lost::Unreadable) => self.members_lost += 1,
+                        Err(Lost::Cut) => self.members_cut += 1,
+                    }
+                }
                 json!({"type": ty, "geometries": gs})
             }
             _ => return None,
@@ -212,7 +254,7 @@ fn read_with(file_name: &str, text: &str, budget: usize) -> Result<Vec<(Dataset,
             .collect();
         arcs.push(pts);
     }
-    let mut topo = Topology { arcs, transform, budget, over_budget: false, members_lost: 0 };
+    let mut topo = Topology { arcs, transform, limit: budget, budget, over_budget: false, members_lost: 0, members_cut: 0 };
     let objects = v.get("objects").and_then(Json::as_object).ok_or_else(|| DataError::Format(format!("{file_name}: no objects")))?;
     let mut out = Vec::new();
     for (name, obj) in objects.iter().take(MAX_OBJECTS) {
@@ -230,29 +272,24 @@ fn read_with(file_name: &str, text: &str, budget: usize) -> Result<Vec<(Dataset,
         };
         // Geometries that couldn't be read, and those left out at the coordinate limit.
         let (mut bad, mut cut) = (0usize, 0usize);
-        topo.members_lost = 0;
+        (topo.members_lost, topo.members_cut) = (0, 0);
         let features: Vec<Json> = members
             .into_iter()
             .map(|g| {
-                // Only a null type is a geometry left empty on purpose (TopoJSON specification
-                // §2.2); a member without a type, or with one that isn't a string, can't be read.
-                let empty = match g.get("type") {
-                    Some(Json::Null) => true,
-                    Some(t) => t.as_str() == Some("null"),
-                    None => false,
-                };
-                topo.over_budget = false;
-                let geometry = if empty {
+                let geometry = if empty_on_purpose(g) {
                     Json::Null
                 } else {
-                    topo.geometry(g, 0).unwrap_or_else(|| {
-                        if topo.over_budget {
-                            cut += 1;
-                        } else {
+                    match topo.read_member(g, 0) {
+                        Ok(geometry) => geometry,
+                        Err(Lost::Unreadable) => {
                             bad += 1;
+                            Json::Null
                         }
-                        Json::Null
-                    })
+                        Err(Lost::Cut) => {
+                            cut += 1;
+                            Json::Null
+                        }
+                    }
                 };
                 let mut props = g.get("properties").and_then(Json::as_object).cloned().unwrap_or_else(Map::new);
                 if let Some(id) = g.get("id")
@@ -273,19 +310,22 @@ fn read_with(file_name: &str, text: &str, budget: usize) -> Result<Vec<(Dataset,
             let were = if bad == 1 { "its feature was" } else { "their features were" };
             rep.messages.push(format!("{} couldn't be read ({WHY}): {were} kept without one", counted(bad, "geometry", "geometries")));
         }
+        // The coordinate limit, said where it was reached.
+        let limit = format!("at the limit of {} coordinates rebuilt from the file's arcs", topo.limit);
         if cut > 0 {
             rep.skipped += cut;
             let were = if cut == 1 { "its feature was" } else { "their features were" };
-            rep.messages.push(format!(
-                "{} left out at the limit of {MAX_COORDS} coordinates rebuilt from the file's arcs: {were} kept without one",
-                counted(cut, "geometry", "geometries")
-            ));
+            rep.messages.push(format!("{} left out {limit}: {were} kept without one", counted(cut, "geometry", "geometries")));
         }
+        let members = |n| counted(n, "member of a geometry collection", "members of geometry collections");
         if topo.members_lost > 0 {
-            let what = counted(topo.members_lost, "member of a geometry collection", "members of geometry collections");
-            rep.messages.push(format!("{what} couldn't be read ({WHY}, nested too deep, or past the coordinate limit) and left out"));
+            rep.messages.push(format!("{} couldn't be read ({WHY}, or nested too deep) and left out", members(topo.members_lost)));
+        }
+        if topo.members_cut > 0 {
+            rep.messages.push(format!("{} left out {limit}", members(topo.members_cut)));
         }
         if no_list {
+            rep.skipped += 1;
             rep.messages.push(format!("object {name} is a geometry collection without a list of geometries: nothing in it was read"));
         }
         out.push((ds, rep));
@@ -449,23 +489,53 @@ mod tests {
 "arcs":[[[0,0],[1,1]]]}"#;
         let (ds, rep) = read_with("l.topojson", text, 4).unwrap().remove(0);
         assert_eq!((ds.features.len(), rep.skipped), (3, 1));
-        assert!(rep.messages.iter().any(|m| m.starts_with("1 geometry left out at the limit")), "{:?}", rep.messages);
+        // The limit said is the one used.
+        assert!(rep.messages.iter().any(|m| m.starts_with("1 geometry left out at the limit of 4 coordinates")), "{:?}", rep.messages);
         assert!(rep.messages.iter().all(|m| !m.contains("couldn't be read")), "{:?}", rep.messages);
+
+        // Members of a nested collection at the limit are said as such too.
+        let nested = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[
+{"type":"GeometryCollection","geometries":[{"type":"LineString","arcs":[0]},{"type":"LineString","arcs":[0]}]}]}},
+"arcs":[[[0,0],[1,1]]]}"#;
+        let (_, rep) = read_with("n.topojson", nested, 2).unwrap().remove(0);
+        assert!(
+            rep.messages.iter().any(|m| m.starts_with("1 member of a geometry collection left out at the limit of 2")),
+            "{:?}",
+            rep.messages
+        );
+    }
+
+    #[test]
+    fn a_geometry_not_read_gives_back_its_coordinates() {
+        // The first line uses arc 0 (2 coordinates), then an arc the file doesn't hold: it isn't
+        // read, and its 2 coordinates don't count against the limit of 2, so the second is read.
+        let text = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[
+{"type":"MultiLineString","arcs":[[0],[9]]},{"type":"LineString","arcs":[0]}]}},"arcs":[[[0,0],[1,1]]]}"#;
+        let (ds, rep) = read_with("b.topojson", text, 2).unwrap().remove(0);
+        assert!(ds.features[1].geometry.is_some(), "{:?}", rep.messages);
+        assert!(rep.messages.iter().all(|m| !m.contains("limit")), "{:?}", rep.messages);
     }
 
     #[test]
     fn a_collection_without_geometries_and_members_without_a_type_are_said() {
         let no_list = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":5}},"arcs":[]}"#;
         let (_, rep) = read("n.topojson", no_list).unwrap().remove(0);
+        assert_eq!(rep.skipped, 1);
         assert!(rep.messages.iter().any(|m| m.contains("without a list of geometries")), "{:?}", rep.messages);
 
-        // No type and a number for a type can't be read; a null type, as JSON or text, is empty
-        // on purpose.
+        // No type, a number, the text "null", and a null type with arcs can't be read; a null
+        // type alone is empty on purpose.
         let types = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[
-{"arcs":[0]},{"type":7,"arcs":[0]},{"type":null},{"type":"null"}]}},"arcs":[[[0,0],[1,1]]]}"#;
+{"arcs":[0]},{"type":7,"arcs":[0]},{"type":"null"},{"type":null,"arcs":[0]},{"type":null}]}},"arcs":[[[0,0],[1,1]]]}"#;
         let (ds, rep) = read("t.topojson", types).unwrap().remove(0);
-        assert_eq!((ds.features.len(), rep.skipped), (4, 2));
-        assert!(rep.messages.iter().any(|m| m.starts_with("2 geometries couldn't be read")), "{:?}", rep.messages);
+        assert_eq!((ds.features.len(), rep.skipped), (5, 4));
+        assert!(rep.messages.iter().any(|m| m.starts_with("4 geometries couldn't be read")), "{:?}", rep.messages);
+
+        // Inside a collection, a null member is left out without a notice.
+        let nested = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[
+{"type":"GeometryCollection","geometries":[{"type":null},{"type":"Point","coordinates":[1,2]}]}]}},"arcs":[]}"#;
+        let (_, rep) = read("n.topojson", nested).unwrap().remove(0);
+        assert!(rep.messages.is_empty(), "{:?}", rep.messages);
     }
 
     #[test]
