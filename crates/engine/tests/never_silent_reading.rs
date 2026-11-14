@@ -141,21 +141,21 @@ fn cases() -> Vec<Case> {
             "a.topojson",
             topo_line("[[0,0],[1,1]]"),
             r#"{"type":"Topology","objects":{"o":{"type":"LineString","arcs":[7]}},"arcs":[[[0,0],[1,1]]]}"#,
-            Said("arcs that couldn't be read"),
+            Said("geometry couldn't be read"),
         ),
         case(
             "TopoJSON: an unreadable position in a quantized arc",
             "a.topojson",
             topo_quantized("[[0,0],[1,1],[1,1]]"),
             topo_quantized(r#"[[0,0],["x",1],[1,1]]"#),
-            Said("arcs that couldn't be read"),
+            Said("geometry couldn't be read"),
         ),
         case(
             "TopoJSON: an unreadable member of a nested collection",
             "a.topojson",
             topo_nested(""),
             topo_nested(r#",{"type":"LineString","arcs":[9]}"#),
-            Said("members of geometry collections"),
+            Said("member of a geometry collection"),
         ),
         // CSV.
         case(
@@ -410,12 +410,17 @@ fn a_reading_that_loses_something_says_so() {
             Ok(Ok((said, added))) => (said.into_iter().filter(|n| !clean.contains(n)).collect(), added),
         };
         match c.expect {
+            // Both ways (AGENTS.md, Never silent): the clean file doesn't say the loss.
+            Said(words) if clean.iter().any(|n| n.contains(words)) => {
+                failures.push(format!("{}: the clean file says the loss it doesn't have ({words:?}): {clean:?}", c.name))
+            }
             Said(words) if !new.iter().any(|n| n.contains(words)) => {
                 failures.push(format!("{}: not said: nothing new holds {words:?}; new: {new:?}; the clean file said {clean:?}", c.name))
             }
-            Silent(lost) if !new.is_empty() => {
-                failures.push(format!("{}: now said ({new:?}): {lost} no longer goes unsaid, so make the case Said", c.name))
-            }
+            Silent(lost) if !new.is_empty() => failures.push(format!(
+                "{}: a new notice ({new:?}): if it says that {lost}, make the case Said; if not, change the lossy file so it gives only that loss",
+                c.name
+            )),
             Silent(lost) if !added => {
                 failures.push(format!("{}: the lossy file added no layer and said nothing, more than this case's loss ({lost})", c.name))
             }
