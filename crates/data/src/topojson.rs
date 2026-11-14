@@ -43,9 +43,17 @@ pub fn looks_like_topojson(text: &str) -> bool {
 /// holds no NaN, so it can't be one read).
 type Pos = [f64; 3];
 
-/// The first number after a position's x and y, or NaN.
-fn extra(a: &[Json]) -> f64 {
-    a.iter().skip(2).find_map(Json::as_f64).unwrap_or(f64::NAN)
+/// A position as written (before any transform): x, y and the first number after them, or NaN.
+/// `None` when it isn't an array starting with two numbers.
+fn position(p: &Json) -> Option<Pos> {
+    let a = p.as_array()?;
+    let extra = a.iter().skip(2).find_map(Json::as_f64).unwrap_or(f64::NAN);
+    Some([a.first()?.as_f64()?, a.get(1)?.as_f64()?, extra])
+}
+
+/// "1 geometry" or "2 geometries": `n` and the word for one or for several.
+fn counted(n: usize, one: &str, several: &str) -> String {
+    if n == 1 { format!("1 {one}") } else { format!("{n} {several}") }
 }
 
 /// A position as GeoJSON: `[x, y]`, or `[x, y, extra]` when it had a further number.
@@ -74,12 +82,12 @@ struct Topology {
 }
 
 impl Topology {
+    /// A point's position, quantized (not delta-encoded) with a transform.
     fn point(&self, p: &Json) -> Option<Pos> {
-        let a = p.as_array()?;
-        let (x, y) = (a.first()?.as_f64()?, a.get(1)?.as_f64()?);
+        let [x, y, e] = position(p)?;
         Some(match self.transform {
-            Some(([sx, sy], [tx, ty])) => [x * sx + tx, y * sy + ty, extra(a)],
-            None => [x, y, extra(a)],
+            Some(([sx, sy], [tx, ty])) => [x * sx + tx, y * sy + ty, e],
+            None => [x, y, e],
         })
     }
 
@@ -91,8 +99,8 @@ impl Topology {
             let (k, rev) = if i < 0 { (!i, true) } else { (i, false) };
             let arc = self.arcs.get(usize::try_from(k).ok()?)?.as_ref()?;
             self.budget = self.budget.checked_sub(arc.len())?;
-            let pts: Vec<Pos> = if rev { arc.iter().rev().copied().collect() } else { arc.clone() };
-            let mut pts = pts.into_iter();
+            let forward = arc.iter().copied();
+            let mut pts: Box<dyn Iterator<Item = Pos>> = if rev { Box::new(forward.rev()) } else { Box::new(forward) };
             // The joint, written once, keeps a further number either arc gives it.
             if let Some(last) = out.last_mut()
                 && let Some(first) = pts.next()
@@ -155,7 +163,11 @@ pub fn read(file_name: &str, text: &str) -> Result<Vec<(Dataset, ReadReport)>> {
     let mut total = 0usize;
     let mut arcs = Vec::new();
     for a in v.get("arcs").and_then(Json::as_array).map(Vec::as_slice).unwrap_or_default() {
-        let positions = a.as_array().map(Vec::as_slice).unwrap_or_default();
+        // An arc that isn't an array of positions can't be read either.
+        let Some(positions) = a.as_array() else {
+            arcs.push(None);
+            continue;
+        };
         total += positions.len();
         if total > MAX_COORDS {
             return Err(DataError::Format(format!("{file_name}: too many arc coordinates")));
@@ -164,20 +176,18 @@ pub fn read(file_name: &str, text: &str) -> Result<Vec<(Dataset, ReadReport)>> {
         let pts: Option<Vec<Pos>> = positions
             .iter()
             .map(|p| {
-                let a = p.as_array()?;
-                let (px, py) = (a.first()?.as_f64()?, a.get(1)?.as_f64()?);
+                let [px, py, e] = position(p)?;
                 Some(match transform {
                     Some(([sx, sy], [tx, ty])) => {
                         x += px;
                         y += py;
-                        [x * sx + tx, y * sy + ty, extra(a)]
+                        [x * sx + tx, y * sy + ty, e]
                     }
-                    None => [px, py, extra(a)],
+                    None => [px, py, e],
                 })
             })
             .collect();
-        // An arc that isn't an array of positions can't be read either.
-        arcs.push(pts.filter(|_| a.is_array()));
+        arcs.push(pts);
     }
     let mut topo = Topology { arcs, transform, budget: MAX_COORDS, members_lost: 0 };
     let objects = v.get("objects").and_then(Json::as_object).ok_or_else(|| DataError::Format(format!("{file_name}: no objects")))?;
@@ -212,15 +222,16 @@ pub fn read(file_name: &str, text: &str) -> Result<Vec<(Dataset, ReadReport)>> {
         let fc = json!({"type": "FeatureCollection", "features": features});
         let title = if objects.len() == 1 { stem.to_string() } else { format!("{stem} {name}") };
         let (ds, mut rep) = crate::io::read_geojson(&fc.to_string(), &title)?;
+        // Why a geometry or member can't be read, said with each count.
+        const WHY: &str = "unreadable coordinates or arcs, or a kind of geometry not read";
         if bad > 0 {
             rep.skipped += bad;
-            rep.messages.push(format!("{bad} geometries had arcs that couldn't be read"));
+            let were = if bad == 1 { "its feature was" } else { "their features were" };
+            rep.messages.push(format!("{} couldn't be read ({WHY}): {were} kept without one", counted(bad, "geometry", "geometries")));
         }
         if topo.members_lost > 0 {
-            rep.messages.push(format!(
-                "{} members of geometry collections couldn't be read (an arc that couldn't be read, or nested too deep) and were left out",
-                topo.members_lost
-            ));
+            let what = counted(topo.members_lost, "member of a geometry collection", "members of geometry collections");
+            rep.messages.push(format!("{what} couldn't be read ({WHY}, or nested too deep) and left out"));
         }
         out.push((ds, rep));
     }
@@ -347,7 +358,7 @@ mod tests {
 "arcs":[[[0,0],["x",5],[1,1]],[[0,0],[1,1]]]}"#;
         let (ds, rep) = read("q.topojson", quantized).unwrap().remove(0);
         assert_eq!(rep.skipped, 1);
-        assert!(rep.messages.iter().any(|m| m.contains("arcs that couldn't be read")), "{:?}", rep.messages);
+        assert!(rep.messages.iter().any(|m| m.starts_with("1 geometry couldn't be read")), "{:?}", rep.messages);
         assert!(ds.features[0].geometry.is_none());
         let Some(Geometry::Line(l)) = &ds.features[1].geometry else { panic!() };
         assert_eq!((l[0][1].x, l[0][1].y), (1.0, 1.0));
@@ -360,11 +371,27 @@ mod tests {
     }
 
     #[test]
+    fn geometries_not_read_are_said_whatever_the_cause() {
+        // A point has no arcs: the notice doesn't blame them. Two: the plural.
+        let text = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[
+{"type":"Point","coordinates":["x",1]},{"type":"Sphere"},{"type":"Point","coordinates":[1,2]}]}},"arcs":[]}"#;
+        let (ds, rep) = read("g.topojson", text).unwrap().remove(0);
+        assert_eq!((ds.features.len(), rep.skipped), (3, 2));
+        assert!(
+            rep.messages
+                .iter()
+                .any(|m| m.starts_with("2 geometries couldn't be read") && m.ends_with("their features were kept without one")),
+            "{:?}",
+            rep.messages
+        );
+    }
+
+    #[test]
     fn collection_members_left_out_are_said() {
         let text = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[
 {"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,2]},{"type":"LineString","arcs":[9]}]}]}},"arcs":[]}"#;
         let (_, rep) = read("c.topojson", text).unwrap().remove(0);
-        assert!(rep.messages.iter().any(|m| m.starts_with("1 members of geometry collections")), "{:?}", rep.messages);
+        assert!(rep.messages.iter().any(|m| m.starts_with("1 member of a geometry collection couldn't be read")), "{:?}", rep.messages);
         // Counted for each object: a second object without losses says nothing of them.
         let two = r#"{"type":"Topology","objects":{
 "a":{"type":"GeometryCollection","geometries":[{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,2]},{"type":"LineString","arcs":[9]}]}]},
