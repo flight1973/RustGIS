@@ -463,7 +463,7 @@ pub fn ring_area_is_ambiguous(ring: &[Coord]) -> bool {
 }
 
 /// How many times a lon/lat ring that never reaches a pole winds around one: each step of
-/// longitude taken the short way round (into (-180°, 180°]; a 360° edge as [`ring_lon_steps`]
+/// longitude taken the short way round (within ±180°; an edge of exactly a whole turn as [`ring_lon_steps`]
 /// reads it), summed, in whole turns. A ring cut at ±180° and closed along the pole, the form
 /// RustGIS takes for a polygon around a pole, reaches the pole and gives 0; so does any ring whose
 /// steps cancel. A loop such as a parallel written all the way round (`[0, 80]`, `[30, 80]`, …,

@@ -597,40 +597,91 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
     .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
 }
 
-/// A tool's result with [`pole_loop_notes`] added: to its messages, or to its error, which a
-/// loop may be the reason for (Clip refuses a mask with no area).
+/// A tool's result with [`pole_loop_notes`] added: to its messages, or to an error about a
+/// missing area, which a loop may be the reason for (Clip refuses a mask with no area). Other
+/// errors (`distance must be positive`) are left as they are.
 fn with_pole_loop_notes(result: Result<ToolResult, String>, spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Result<ToolResult, String> {
-    let notes = pole_loop_notes(spec, inputs, p);
     match result {
         Ok(mut r) => {
-            r.messages.extend(notes);
+            r.messages.extend(pole_loop_notes(spec, inputs, p));
             Ok(r)
         }
-        Err(e) if notes.is_empty() => Err(e),
-        Err(e) => Err(format!("{e}. {}", notes.join(". "))),
+        Err(e) if !e.contains("area") => Err(e),
+        Err(e) => {
+            let notes = pole_loop_notes(spec, inputs, p);
+            if notes.is_empty() { Err(e) } else { Err(format!("{}. {}", e.trim_end_matches(['.', ' ']), notes.join(". "))) }
+        }
     }
 }
 
+/// Tools that read polygons as areas in the analysis plane, where longitude and latitude are x
+/// and y: overlays, joins and containment. Others copy a geometry, read only its attributes, or
+/// measure it on the ground (Calculate Geometry), so a loop around a pole is nothing to them.
+const READ_AREAS_IN_THE_PLANE: &[&str] = &[
+    "clip",
+    "erase",
+    "intersect",
+    "identity",
+    "union",
+    "symmetricalDifference",
+    "update",
+    "split",
+    "countPoints",
+    "spatialJoin",
+    "selectByLocation",
+    "featureToPoint",
+    "dissolve",
+    "tabulateIntersection",
+];
+
+/// Whether a tool reads every row of an input whatever is selected in it.
+fn reads_all_rows(tool: &str, param: &str) -> bool {
+    matches!((tool, param), ("selectByLocation", "input") | ("countPoints", "polygons"))
+}
+
 /// What a tool's vector inputs hold that it can't read as areas: rings that loop around a pole
-/// without being cut at ±180° (#1354), one notice per layer with a count. Every tool reads
-/// longitude and latitude as x and y, so for each such a ring is a line with no area. The rows
-/// counted are those the tool reads: the layer's selection, or every row without one.
+/// without being cut at ±180° (#1354), one notice per layer with a count, for the tools that read
+/// areas in the analysis plane ([`READ_AREAS_IN_THE_PLANE`]), which takes longitude and latitude
+/// as x and y and so doesn't see the area such a ring goes around. The rows counted are those the
+/// tool reads: the layer's selection, or every row without one or where the tool reads them all
+/// ([`reads_all_rows`]). The walk over their vertices looks at Cancel between features, and stops
+/// there; a run canceled meanwhile is refused by [`run_under`] all the same.
 fn pole_loop_notes(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Vec<String> {
+    if !READ_AREAS_IN_THE_PLANE.contains(&spec.id) {
+        return Vec::new();
+    }
     let mut seen: Vec<&str> = Vec::new();
     let mut notes = Vec::new();
-    for param in spec.params.iter().filter(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::VectorLayer)) {
-        let Some(name) = p.get(param.name).and_then(Value::as_str) else { continue };
-        if seen.contains(&name) {
-            continue;
-        }
-        seen.push(name);
-        let Some(ds) = inputs.dataset(name) else { continue };
-        let selected = inputs.selection(name);
-        let geometries = |rows: &mut dyn Iterator<Item = usize>| -> Option<String> {
-            rustgis_data::pole_loop_message(name, rows.filter_map(|r| ds.features.get(r).and_then(|f| f.geometry.as_ref())))
+    let params = spec
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::VectorLayer | ParamKind::VectorLayers));
+    for param in params {
+        // One layer, or several (Merge's inputs).
+        let names: Vec<&str> = match p.get(param.name) {
+            Some(Value::String(name)) => vec![name.as_str()],
+            Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).collect(),
+            _ => continue,
         };
-        let note = if selected.is_empty() { geometries(&mut (0..ds.features.len())) } else { geometries(&mut selected.iter().copied()) };
-        notes.extend(note);
+        for name in names {
+            // Layers are found by name whatever its case, so a layer named twice is said once.
+            if seen.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            seen.push(name);
+            let Some(ds) = inputs.dataset(name) else { continue };
+            let selected = inputs.selection(name);
+            let geometries = |rows: &mut dyn Iterator<Item = usize>| -> Option<String> {
+                let read = rows.take_while(|_| control::check().is_ok());
+                rustgis_data::pole_loop_message(name, read.filter_map(|r| ds.features.get(r).and_then(|f| f.geometry.as_ref())))
+            };
+            let note = if selected.is_empty() || reads_all_rows(spec.id, param.name) {
+                geometries(&mut (0..ds.features.len()))
+            } else {
+                geometries(&mut selected.iter().copied())
+            };
+            notes.extend(note);
+        }
     }
     notes
 }
@@ -660,8 +711,7 @@ fn validate_pole_inputs(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Resu
                 && let Some(ds) = inputs.dataset(name)
             {
                 let selected = inputs.selection(name);
-                let reads_all = matches!((spec.id, param.name), ("selectByLocation", "input") | ("countPoints", "polygons"));
-                if selected.is_empty() || reads_all {
+                if selected.is_empty() || reads_all_rows(spec.id, param.name) {
                     validate_latitudes(ds, 0..ds.features.len())?;
                 } else {
                     validate_latitudes(ds, selected.iter().copied())?;

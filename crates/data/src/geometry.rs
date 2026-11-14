@@ -24,8 +24,9 @@ pub fn ambiguous_area_message<'a>(geometries: impl Iterator<Item = &'a Geometry>
 }
 
 /// A counted explanation when these features (of the layer `layer`) have rings that loop around
-/// a pole without being cut at ±180° ([`rustgis_geom::ring_pole_turns`]): longitude and latitude
-/// read as x and y, as the analysis plane reads them, take such a ring for a line with no area.
+/// a pole without being cut at ±180° ([`rustgis_geom::ring_pole_turns`]): taken the short way
+/// round in longitude, such a ring goes around the pole, but longitude and latitude read as x and
+/// y, as the analysis plane reads them, give another shape (a ring along one parallel, a line).
 pub fn pole_loop_message<'a>(layer: &str, geometries: impl Iterator<Item = &'a Geometry>) -> Option<String> {
     let (mut features, mut rings) = (0usize, 0usize);
     for geometry in geometries {
@@ -38,11 +39,11 @@ pub fn pole_loop_message<'a>(layer: &str, geometries: impl Iterator<Item = &'a G
     if rings == 0 {
         return None;
     }
-    let (rings_text, verb, it) =
-        if rings == 1 { ("1 ring".to_string(), "loops", "it") } else { (format!("{rings} rings"), "loop", "them") };
+    let (rings_text, verb, it, encloses) =
+        if rings == 1 { ("1 ring".to_string(), "goes", "it", "encloses") } else { (format!("{rings} rings"), "go", "them", "enclose") };
     let features_text = if features == 1 { "1 feature".to_string() } else { format!("{features} features") };
     Some(format!(
-        "'{layer}': {rings_text} in {features_text} {verb} around a pole without being cut at ±180°, so the analysis reads {it} as having no area; cut {it} at ±180° and close {it} along the pole to include {it}"
+        "'{layer}': {rings_text} in {features_text} {verb} around a pole, each step in longitude taken the short way, without being cut at ±180°; the analysis reads longitude and latitude as x and y, so it doesn't see the area {it} {encloses} (along one parallel, none at all); if {it} {verb} around the pole on purpose, cut {it} at ±180° and close {it} along the pole"
     ))
 }
 
