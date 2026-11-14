@@ -1919,7 +1919,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                     // (a missing coordinate) is still said.
                     _ => {
                         let mut all = notes.get();
-                        all.add(&rustgis_analysis::SimplifyNotes { broken: said.broken, ..Default::default() });
+                        all.add(&rustgis_analysis::SimplifyNotes { broken: said.broken, capped: said.capped, ..Default::default() });
                         notes.set(all);
                         g.clone()
                     }
