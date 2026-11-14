@@ -1108,6 +1108,9 @@ impl Raster {
         }
         let mut r = if wf.is_north_up() {
             self.transform = GeoTransform { origin_x: affine[0], origin_y: affine[3], pixel_width: affine[1], pixel_height: affine[5] };
+            self.crs = crs;
+            self.transformer = transformer;
+            self.extent = self.compute_extent();
             self
         } else {
             // The bands are only read, so a picture that can't be turned comes back as it was.
@@ -1127,16 +1130,13 @@ impl Raster {
                 old.stats = new.stats.clone();
                 *new = old;
             }
-            // Resampled to a grid of its own: its pixels are neither the file's nor an overview's.
-            (r.source, r.lost, r.copyright) = (self.source, self.lost, self.copyright);
+            // A picture read at a reduced size still says so, as a turned GeoTIFF does.
+            (r.source, r.lost, r.overview, r.copyright) = (self.source, self.lost, self.overview, self.copyright);
             (r.rounded, r.rounded_some) = (self.rounded, self.rounded_some);
             r
         };
-        r.crs = crs;
-        r.transformer = transformer;
         r.georeferenced = true;
         r.step = 1;
-        r.extent = r.compute_extent();
         Ok(r)
     }
 
@@ -1363,7 +1363,7 @@ pub fn apply_world_file(path: &Path, mut r: Raster) -> Raster {
     let Some(crs) = crs else {
         let why = note.map_or_else(String::new, |n| format!(" (the .prj file: {n})"));
         r.lost.push(format!(
-            "the world file {name} places it, but no .prj beside it says the coordinate system{why}: {unplaced}; put a .prj next to it"
+            "the world file {name} places it, but no .prj beside it says the coordinate system{why}: {unplaced}; put a .prj next to it and add it again"
         ));
         return r;
     };
@@ -1400,6 +1400,16 @@ fn world_file_agrees(r: &Raster, wf: &world::WorldFile) -> bool {
 /// subdataset (a NetCDF variable) and the coordinate system it doesn't say. Other files ignore
 /// them.
 pub fn read_path_with(path: &Path, subdataset: Option<&str>, crs: Option<&str>) -> Result<Raster> {
+    read_path_with_placing(path, subdataset, crs, true)
+}
+
+/// [`read_path_with`] without the world file beside a picture ([`read_path_unplaced`]): a layer
+/// laid over a placement, read again as it was added.
+pub fn read_path_with_unplaced(path: &Path, subdataset: Option<&str>, crs: Option<&str>) -> Result<Raster> {
+    read_path_with_placing(path, subdataset, crs, false)
+}
+
+fn read_path_with_placing(path: &Path, subdataset: Option<&str>, crs: Option<&str>, world: bool) -> Result<Raster> {
     // A Zarr store's variable and slice (`t2m[time=3]`).
     #[cfg(not(target_arch = "wasm32"))]
     if zarr::is_store(path) {
@@ -1410,7 +1420,7 @@ pub fn read_path_with(path: &Path, subdataset: Option<&str>, crs: Option<&str>) 
         return read_converted(path, &gdal::convert(path, subdataset, crs)?);
     }
     let _ = (subdataset, crs);
-    read_path(path)
+    read_path_placing(path, world)
 }
 
 /// Reads the GeoTIFF GDAL converted `path` to, named and sourced as `path` (and its subdataset).
@@ -1708,7 +1718,7 @@ fn read_ascii(path: &Path, text: &str, name: &str, nodata: Option<f64>) -> Resul
 fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
     let Some(prj) = read_prj(path) else {
         // One that is there but can't be read as text (not UTF-8, too large to be one) is said too.
-        let there = std::fs::metadata(path.with_extension("prj")).is_ok_and(|m| m.is_file());
+        let there = prj_path(path).is_some();
         return Ok((None, there.then(|| "it can't be read as text".to_string())));
     };
     match wkt::read_wkt(&prj) {
@@ -1726,9 +1736,30 @@ fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
     }
 }
 
+/// Whether a world file lays a `w` × `h` picture somewhere on Earth in `crs`: its corners convert,
+/// and in a geographic system lie within the poles and at longitudes wrapping explains (the
+/// check [`Raster::placed_by_world_file`] makes, on the corners alone, without the pixels).
+pub(crate) fn lands_on_earth(wf: &world::WorldFile, crs: Crs, w: u32, h: u32) -> bool {
+    let Ok(transformer) = crs.transformer() else { return false };
+    let [x0, xc, xr, y0, yc, yr] = wf.affine();
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    let corners = [(0.0, 0.0), (fw, 0.0), (0.0, fh), (fw, fh)].map(|(c, r)| Coord::new(x0 + c * xc + r * xr, y0 + c * yc + r * yr));
+    if transformer.is_geographic() {
+        corners.iter().all(|p| (-90.5..=90.5).contains(&p.y) && (-540.0..=540.0).contains(&p.x))
+    } else {
+        corners.iter().all(|p| transformer.to_lonlat_for_extent(*p).is_some_and(|q| q.x.is_finite() && q.y.is_finite()))
+    }
+}
+
+/// The `.prj` next to a file, in lower or upper case (`.PRJ`, beside an `IMAGE.TFW`), for file
+/// systems that tell them apart.
+fn prj_path(path: &Path) -> Option<std::path::PathBuf> {
+    ["prj", "PRJ"].into_iter().map(|e| path.with_extension(e)).find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+}
+
 /// The text of the `.prj` next to a file (`None` when there's none, or it's too large to be one).
 pub fn read_prj(path: &Path) -> Option<String> {
-    let prj = path.with_extension("prj");
+    let prj = prj_path(path)?;
     let meta = std::fs::metadata(&prj).ok()?;
     if !meta.is_file() || meta.len() > 1 << 20 {
         return None;

@@ -1094,31 +1094,33 @@ fn start_light(r: Arc<Raster>, key: LightKey, work: Arc<LightWork>) {
 }
 
 impl RasterLayer {
-    /// The layer's file read again (a project reopened, a source repaired), and laid where it was.
+    /// The layer's file read again (a project reopened, a source repaired), as it was added.
     ///
-    /// - A scan asked for (`"as": "scan"`) is read as the file holds it, without the world file
-    ///   beside it (#2075) or a GeoTIFF's own coordinates, and laid over its placement.
-    /// - A layer with no placement is read as [`rustgis_data::raster::read_path_with`] reads it,
-    ///   its subdataset and coordinate system with it.
-    /// - A picture laid over a placement without being asked to be a scan opened with no
-    ///   coordinates (for want of a `.prj`, say): a world file that places it now does, else it is
-    ///   laid where it was. A GeoTIFF with its own coordinates there (an older project's scan) is
-    ///   a scan again.
+    /// - A scan asked for (`"as": "scan"`), or a layer laid over a placement (every raster that
+    ///   opened without coordinates is laid over the view, an older project's scans too), is read
+    ///   without the world file beside it (#2075), its subdataset and coordinate system kept, and
+    ///   laid where it was: a world file that turns up later doesn't move it (add it again).
+    /// - Any other layer had coordinates when it was added: it is read as
+    ///   [`rustgis_data::raster::read_path_with`] reads it, and one that no longer has them (the
+    ///   `.prj` or world file that placed it gone) is an error that says so, not a picture drawn at
+    ///   a stand-in near 0°, 0°.
     fn read_placed(&self, path: &str, subdataset: Option<&str>) -> rustgis_data::Result<Raster> {
-        use rustgis_data::raster::{apply_world_file, read_path_unplaced, read_path_with};
+        use rustgis_data::raster::{read_path_with, read_path_with_unplaced};
         let p = std::path::Path::new(path);
-        match self.placement {
-            _ if self.scan => placed(read_path_unplaced(p)?.into_scan()?, self.placement),
-            None => read_path_with(p, subdataset, self.crs.as_deref()),
-            Some(_) => {
-                let r = read_path_unplaced(p)?;
-                if r.georeferenced {
-                    return placed(r, self.placement);
-                }
-                let r = apply_world_file(p, r);
-                if r.georeferenced { Ok(r) } else { placed(r, self.placement) }
-            }
+        let crs = self.crs.as_deref();
+        if self.scan || self.placement.is_some() {
+            let r = read_path_with_unplaced(p, subdataset, crs)?;
+            let r = if self.scan { r.into_scan()? } else { r };
+            return placed(r, self.placement);
         }
+        let r = read_path_with(p, subdataset, crs)?;
+        if !r.georeferenced {
+            let why = if r.lost.is_empty() { String::new() } else { format!(" ({})", r.lost.join("; ")) };
+            return Err(rustgis_data::DataError::Format(format!(
+                "the file has no coordinates now{why}, though the layer had them when added"
+            )));
+        }
+        Ok(r)
     }
 }
 

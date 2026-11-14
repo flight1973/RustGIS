@@ -98,11 +98,15 @@ pub fn beside(path: &Path) -> Option<(PathBuf, Result<WorldFile, String>)> {
     Some((found, read))
 }
 
-/// Whether the picture at `path` is placed by a world file: one beside it can be read, and a
-/// `.prj` beside it says a coordinate system RustGIS uses. (A JPEG so placed opens as a raster,
-/// not as a photo; a stray world file, or one without a usable `.prj`, leaves it a photo.)
+/// Whether the picture at `path` is placed by a world file: one beside it can be read, a `.prj`
+/// beside it says a coordinate system RustGIS uses, and together they lay the picture (its size
+/// read from its header, not its pixels) somewhere on Earth. A JPEG so placed opens as a raster,
+/// not as a photo; a stray world file, one without a usable `.prj`, or one whose numbers belong
+/// to another system leaves it a photo.
 pub fn places(path: &Path) -> bool {
-    matches!(beside(path), Some((_, Ok(_)))) && matches!(super::sidecar_crs(path), Ok((Some(_), _)))
+    let Some((_, Ok(wf))) = beside(path) else { return false };
+    let Ok((Some(crs), _)) = super::sidecar_crs(path) else { return false };
+    image::image_dimensions(path).is_ok_and(|(w, h)| super::lands_on_earth(&wf, crs, w, h))
 }
 
 #[cfg(test)]
@@ -229,6 +233,8 @@ mod tests {
         std::fs::write(dir.join("p.prj"), PRJ).unwrap();
         let r = crate::raster::read_path(&dir.join("p.png")).unwrap();
         assert!(!r.georeferenced && (r.width, r.height) == (4, 2));
+        // Nor does it count as placing the picture (a camera JPEG with it stays a photo).
+        assert!(!places(&dir.join("p.png")));
         assert!(
             r.lost.iter().any(|m| m.contains("p.pgw") && m.contains("isn't used") && m.contains("without coordinates")),
             "{:?}",
@@ -246,6 +252,18 @@ mod tests {
         assert!(r.lost.iter().any(|m| m.contains("p.pgw")), "{:?}", r.lost);
         // Nor does that .prj make the picture one a world file places (a JPEG stays a photo).
         assert!(!places(&dir.join("p.png")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_all_caps_set_is_placed() {
+        let dir = picture("caps");
+        std::fs::rename(dir.join("p.png"), dir.join("P.PNG")).unwrap();
+        std::fs::write(dir.join("P.PGW"), "0.5\n0\n0\n-0.5\n10.25\n49.75\n").unwrap();
+        std::fs::write(dir.join("P.PRJ"), PRJ).unwrap();
+        let r = crate::raster::read_path(&dir.join("P.PNG")).unwrap();
+        assert!(r.georeferenced, "{:?}", r.lost);
+        assert!(places(&dir.join("P.PNG")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

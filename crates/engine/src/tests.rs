@@ -29104,8 +29104,8 @@ fn a_jpeg_with_a_world_file_opens_placed_not_as_a_photo() {
     u.run("project.openText", &json!({"text": text})).unwrap();
     assert_eq!(scan(&u), Some((true, Some(false))));
 
-    // A picture that opened without coordinates for want of a .prj isn't a scan asked for: once
-    // its .prj is there, the project reopens it placed.
+    // A picture that opened without coordinates for want of a .prj reopens as it was added, laid
+    // over the view: a .prj that turns up later doesn't move it (the notice says to add it again).
     image::GrayImage::from_pixel(4, 2, image::Luma([7])).save(dir.join("plan.png")).unwrap();
     std::fs::write(dir.join("plan.pgw"), "0.5\n0\n0\n-0.5\n10.25\n49.75\n").unwrap();
     let mut v = Session::new(Project::default());
@@ -29114,11 +29114,24 @@ fn a_jpeg_with_a_world_file_opens_placed_not_as_a_photo() {
         v.map().layer_by_name("plan").and_then(|l| l.raster.as_ref()).map(|r| (r.scan, r.data.as_ref().map(|d| d.georeferenced)))
     };
     assert_eq!(plan(&v), Some((false, Some(false))));
+    assert!(v.notices.iter().any(|n| n.text.contains("add it again")), "the missing .prj is said");
     let text = serde_json::to_string(&v.project).unwrap();
     std::fs::copy(dir.join("aerial.prj"), dir.join("plan.prj")).unwrap();
     let mut w = Session::new(Project::default());
     w.run("project.openText", &json!({"text": text})).unwrap();
-    assert_eq!(plan(&w), Some((false, Some(true))));
+    assert_eq!(plan(&w), Some((false, Some(false))));
+    // Added now, it is placed; a project that kept it placed says so when the .prj is gone,
+    // rather than drawing it at a stand-in near 0°, 0°.
+    let mut z = Session::new(Project::default());
+    z.run("layer.addData", &json!({"path": path("plan.png")})).unwrap();
+    assert_eq!(plan(&z), Some((false, Some(true))));
+    let text = serde_json::to_string(&z.project).unwrap();
+    std::fs::remove_file(dir.join("plan.prj")).unwrap();
+    let mut gone = Session::new(Project::default());
+    let _ = gone.run("project.openText", &json!({"text": text}));
+    let error = gone.map().layer_by_name("plan").and_then(|l| l.raster.as_ref()).and_then(|r| r.error.clone());
+    assert!(error.as_deref().is_some_and(|e| e.contains("no coordinates now")), "{error:?}");
+    std::fs::copy(dir.join("aerial.prj"), dir.join("plan.prj")).unwrap();
 
     // A GeoTIFF added as a scan reopens as one, without its own coordinates.
     let placed = rustgis_data::raster::read_path(&dir.join("plan.png")).unwrap();
