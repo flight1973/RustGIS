@@ -132,19 +132,21 @@ fn flat_geojson_says_nothing_new() {
 #[test]
 fn an_edit_that_changes_vertices_exports_that_feature_flat_and_says_so() {
     let f = Fixture::new("z-edit");
-    let src = f.file("heights.geojson");
-    std::fs::write(&src, HEIGHTS).unwrap();
+    let src = f.file("tracks.geojson");
+    let track = |y: f64| json!({"type": "Feature", "properties": {}, "geometry": {"type": "LineString", "coordinates": [[0, y, 1], [1, y, 2], [2, y, 3]]}});
+    std::fs::write(&src, json!({"type": "FeatureCollection", "features": [track(0.0), track(1.0), track(2.0)]}).to_string()).unwrap();
     let mut s = Session::new(Project::default());
     add(&mut s, &src);
     s.map_mut().editing.settings.enabled = true;
-    // A vertex added to the track: its three heights no longer fit four vertices.
-    s.run("edit.vertex", &json!({"layer": "heights", "row": 1, "action": "insert", "index": 0, "lon": 8.55, "lat": 47.35})).unwrap();
-    // A vertex of the roof moved: the same vertices in the same order keep their heights.
-    s.run("edit.vertex", &json!({"layer": "heights", "row": 2, "action": "move", "index": 1, "lon": 1.1, "lat": 0.0})).unwrap();
-    // The well replaced by another point: its height isn't the new point's.
-    s.run("edit.setGeometry", &json!({"layer": "heights", "row": 0, "geometry": {"type": "Point", "coordinates": [9, 48]}})).unwrap();
+    // Replaced by a line of as many vertices: the heights would fit, but aren't its own.
+    let other = json!({"type": "LineString", "coordinates": [[9, 48], [9, 49], [9, 50]]});
+    s.run("edit.setGeometry", &json!({"layer": "tracks", "row": 0, "geometry": other})).unwrap();
+    // A vertex added: three heights no longer fit four vertices.
+    s.run("edit.vertex", &json!({"layer": "tracks", "row": 1, "action": "insert", "index": 0, "lon": 0.5, "lat": 1.0})).unwrap();
+    // A vertex moved: the same vertices in the same order keep their heights.
+    s.run("edit.vertex", &json!({"layer": "tracks", "row": 2, "action": "move", "index": 1, "lon": 1.1, "lat": 2.0})).unwrap();
     let out = f.file("out.geojson");
-    let said = export(&mut s, "heights", &out);
+    let said = export(&mut s, "tracks", &out);
     assert_eq!(
         of_heights(&said),
         [&format!(
@@ -154,14 +156,14 @@ fn an_edit_that_changes_vertices_exports_that_feature_flat_and_says_so() {
         "{said:?}"
     );
     let text: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-    assert_eq!(text["features"][0]["geometry"]["coordinates"], json!([9.0, 48.0]));
-    assert_eq!(text["features"][1]["geometry"]["coordinates"][1], json!([8.55, 47.35]));
-    assert_eq!(text["features"][2]["geometry"]["coordinates"][0][1], json!([1.1, 0.0, 11.0]));
-    // Undone, the track's heights fit again.
-    s.run("edit.undo", &Value::Null).unwrap();
-    s.run("edit.undo", &Value::Null).unwrap();
-    s.run("edit.undo", &Value::Null).unwrap();
-    let said = export(&mut s, "heights", &f.file("again.geojson"));
+    assert_eq!(text["features"][0]["geometry"]["coordinates"], json!([[9.0, 48.0], [9.0, 49.0], [9.0, 50.0]]));
+    assert_eq!(text["features"][1]["geometry"]["coordinates"][1], json!([0.5, 1.0]));
+    assert_eq!(text["features"][2]["geometry"]["coordinates"], json!([[0.0, 2.0, 1.0], [1.1, 2.0, 2.0], [2.0, 2.0, 3.0]]));
+    // Undone, every track's heights fit again.
+    for _ in 0..3 {
+        s.run("edit.undo", &Value::Null).unwrap();
+    }
+    let said = export(&mut s, "tracks", &f.file("again.geojson"));
     assert!(of_heights(&said).is_empty(), "{said:?}");
 }
 

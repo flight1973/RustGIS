@@ -32,10 +32,10 @@ merge as is. Nothing pushed.
 3. GeoJSON read: done.
 4. GeoJSON write + export notice: done.
 5. `zm_dropped` honest: done for GeoJSON read.
-6. Projects: serde round trip — test written (z_arrays.rs `a_saved_project_keeps_the_heights`),
-   being run. Older release finding below.
-7. Tests: written (`crates/engine/tests/z_arrays.rs`, data lib tests); data lib tests pass; engine
-   tests being run.
+6. Projects: done; save/reopen keeps Z (z_arrays.rs `a_saved_project_keeps_the_heights`).
+   Older release finding below.
+7. Tests: z_arrays.rs (6) and data lib tests pass.
+
 8. `cargo xtask ci` + wasm build: not started.
 
 ## Where Z is dropped (tools/edits that change geometry)
@@ -83,5 +83,5 @@ reprojection via `map_coords` (io.rs project, geolibre convert).
 
 ## Next step
 
-Run `cargo test -p rustgis-engine --test z_arrays`, fix failures, then the analysis/engine test
+Run the analysis and engine test
 suites, `cargo xtask ci`, and `cargo build --target wasm32-unknown-unknown -p rustgis-web`.
