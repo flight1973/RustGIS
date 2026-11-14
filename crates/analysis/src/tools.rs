@@ -5972,7 +5972,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         let jumps = |g: &Geometry| {
             has_shape(g)
                 && matches!(g, Geometry::Polygon(polys) if polys.iter().flatten().any(|r| {
-                    rustgis_geom::ring_pole_turns(r) == 0 && r.iter().zip(r.iter().cycle().skip(1)).any(|(a, b)| (b.x - a.x).abs() > 180.0)
+                    r.iter().zip(r.iter().cycle().skip(1)).any(|(a, b)| (b.x - a.x).abs() > 180.0) && rustgis_geom::ring_pole_turns(r) == 0
                 }))
         };
         rs.iter().filter(|&&r| ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(jumps)).count()
@@ -7782,7 +7782,7 @@ mod tests {
         let ring = |pts: &[(f64, f64)]| Geometry::Polygon(vec![vec![pts.iter().map(|&(x, y)| Coord::new(x, y)).collect()]]);
         let lp: Vec<(f64, f64)> = (0..=12).map(|i| (f64::from(i % 12) * 30.0, 80.0)).collect();
         let cut = [(-180.0, 80.0), (0.0, 80.0), (180.0, 80.0), (180.0, 90.0), (-180.0, 90.0), (-180.0, 80.0)];
-        let about = |t: &str| t.contains("around a pole, each step in longitude");
+        let about = |t: &str| t.contains("around a pole without reaching it");
         let run_with_cap = |cap: Geometry| {
             let mut caps = Dataset::new("loop", GeometryType::Polygon, vec![Field::new("v", FieldType::Double)]);
             caps.push(Some(cap), vec![Value::Float(1.0)]);
@@ -7804,9 +7804,10 @@ mod tests {
             // Statistics read attributes only: nothing to say.
             let stats = crate::run("summaryStatistics", &m, &serde_json::json!({"input": "loop", "field": "v"})).unwrap();
             assert!(said(&stats).is_empty(), "{:?}", stats.messages);
-            [said(&sj), clip, said(&ftp), said(&dissolve)]
+            let buffer = crate::run("buffer", &m, &serde_json::json!({"input": "loop", "distance": 10})).unwrap();
+            [said(&sj), clip, said(&ftp), said(&dissolve), said(&buffer)]
         };
-        let note = "'loop': 1 ring in 1 feature goes around a pole, each step in longitude taken the short way, without being cut at ±180°; the analysis reads longitude and latitude as x and y, so it doesn't see the area it encloses (along one parallel, none at all); if it goes around the pole on purpose, cut it at ±180° and close it along the pole";
+        let note = "'loop': 1 ring in 1 feature goes around a pole without reaching it, each step in longitude taken the short way; the analysis reads longitude and latitude as x and y, so it doesn't see the area it encloses (along one parallel, none at all); if it goes around the pole on purpose, cut it at ±180° and close it along the pole";
         for said in run_with_cap(ring(&lp)) {
             assert_eq!(said, [note]);
         }
@@ -7841,8 +7842,10 @@ mod tests {
         assert!(!r.messages.iter().any(|t| about(t)), "{:?}", r.messages);
         let r = crate::run("countPoints", &third, &serde_json::json!({"polygons": "loop", "points": "pts"})).unwrap();
         assert!(r.messages.iter().any(|t| about(t) && t.contains("2 rings")), "{:?}", r.messages);
-        // An error that isn't about an area is left as it was.
+        // An error that doesn't name the layer with loops is left as it was, even one about an area.
         let e = crate::run("spatialJoin", &all, &serde_json::json!({"target": "pts", "join": "loop", "match": "Nowhere"})).unwrap_err();
+        assert!(!about(&e), "{e}");
+        let e = crate::run("spatialJoin", &all, &serde_json::json!({"target": "study_area", "join": "loop"})).unwrap_err();
         assert!(!about(&e), "{e}");
     }
 

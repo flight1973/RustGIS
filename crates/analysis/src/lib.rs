@@ -597,27 +597,34 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
     .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
 }
 
-/// A tool's result with [`pole_loop_notes`] added: to its messages, or to an error about a
-/// missing area, which a loop may be the reason for (Clip refuses a mask with no area). Other
-/// errors (`distance must be positive`) are left as they are.
+/// A tool's result with [`pole_loop_notes`] added: to its messages, or to an error that names a
+/// layer with such rings (`'loop'`), which they may be the reason for (Clip refuses a mask with no
+/// area). An error about something else (`no layer named 'study_area'`) is left as it is.
 fn with_pole_loop_notes(result: Result<ToolResult, String>, spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Result<ToolResult, String> {
     match result {
         Ok(mut r) => {
-            r.messages.extend(pole_loop_notes(spec, inputs, p));
+            r.messages.extend(pole_loop_notes(spec, inputs, p).into_iter().map(|(_, note)| note));
             Ok(r)
         }
-        Err(e) if !e.contains("area") => Err(e),
         Err(e) => {
-            let notes = pole_loop_notes(spec, inputs, p);
+            let notes: Vec<String> = pole_loop_notes(spec, inputs, p)
+                .into_iter()
+                .filter(|(layer, _)| e.contains(&format!("'{layer}'")))
+                .map(|(_, note)| note)
+                .collect();
             if notes.is_empty() { Err(e) } else { Err(format!("{}. {}", e.trim_end_matches(['.', ' ']), notes.join(". "))) }
         }
     }
 }
 
 /// Tools that read polygons as areas in the analysis plane, where longitude and latitude are x
-/// and y: overlays, joins and containment. Others copy a geometry, read only its attributes, or
-/// measure it on the ground (Calculate Geometry), so a loop around a pole is nothing to them.
+/// and y: overlays, joins, containment, zones, buffers and distances from inside. Others copy a
+/// geometry, read only its attributes, or measure it on the ground (Calculate Geometry), so a loop
+/// around a pole is nothing to them.
 const READ_AREAS_IN_THE_PLANE: &[&str] = &[
+    "buffer",
+    "near",
+    "zonalStats",
     "clip",
     "erase",
     "intersect",
@@ -645,31 +652,32 @@ fn reads_all_rows(tool: &str, param: &str) -> bool {
 /// as x and y and so doesn't see the area such a ring goes around. The rows counted are those the
 /// tool reads: the layer's selection, or every row without one or where the tool reads them all
 /// ([`reads_all_rows`]). The walk over their vertices looks at Cancel between features, and stops
-/// there; a run canceled meanwhile is refused by [`run_under`] all the same.
-fn pole_loop_notes(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Vec<String> {
+/// there; a run canceled meanwhile is refused by [`run_under`] all the same. Each note comes with
+/// the name its layer was given by.
+fn pole_loop_notes(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Vec<(String, String)> {
     if !READ_AREAS_IN_THE_PLANE.contains(&spec.id) {
         return Vec::new();
     }
-    let mut seen: Vec<&str> = Vec::new();
+    let mut seen: Vec<&rustgis_data::Dataset> = Vec::new();
     let mut notes = Vec::new();
     let params = spec
         .params
         .iter()
         .filter(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::VectorLayer | ParamKind::VectorLayers));
     for param in params {
-        // One layer, or several (Merge's inputs).
-        let names: Vec<&str> = match p.get(param.name) {
-            Some(Value::String(name)) => vec![name.as_str()],
-            Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).collect(),
+        // One layer, or several as a list or names separated by `;`.
+        let names: Vec<&str> = match (&param.kind, p.get(param.name)) {
+            (ParamKind::VectorLayers, Some(v)) => layer_list(v).unwrap_or_default(),
+            (_, Some(Value::String(name))) => vec![name.as_str()],
             _ => continue,
         };
         for name in names {
-            // Layers are found by name whatever its case, so a layer named twice is said once.
-            if seen.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            let Some(ds) = inputs.dataset(name) else { continue };
+            // A layer given twice, by one name or two, is said once.
+            if seen.iter().any(|s| std::ptr::eq(*s, ds)) {
                 continue;
             }
-            seen.push(name);
-            let Some(ds) = inputs.dataset(name) else { continue };
+            seen.push(ds);
             let selected = inputs.selection(name);
             let geometries = |rows: &mut dyn Iterator<Item = usize>| -> Option<String> {
                 let read = rows.take_while(|_| control::check().is_ok());
@@ -680,7 +688,7 @@ fn pole_loop_notes(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Vec<Strin
             } else {
                 geometries(&mut selected.iter().copied())
             };
-            notes.extend(note);
+            notes.extend(note.map(|n| (name.to_string(), n)));
         }
     }
     notes

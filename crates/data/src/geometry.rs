@@ -43,7 +43,7 @@ pub fn pole_loop_message<'a>(layer: &str, geometries: impl Iterator<Item = &'a G
         if rings == 1 { ("1 ring".to_string(), "goes", "it", "encloses") } else { (format!("{rings} rings"), "go", "them", "enclose") };
     let features_text = if features == 1 { "1 feature".to_string() } else { format!("{features} features") };
     Some(format!(
-        "'{layer}': {rings_text} in {features_text} {verb} around a pole, each step in longitude taken the short way, without being cut at ±180°; the analysis reads longitude and latitude as x and y, so it doesn't see the area {it} {encloses} (along one parallel, none at all); if {it} {verb} around the pole on purpose, cut {it} at ±180° and close {it} along the pole"
+        "'{layer}': {rings_text} in {features_text} {verb} around a pole without reaching it, each step in longitude taken the short way; the analysis reads longitude and latitude as x and y, so it doesn't see the area {it} {encloses} (along one parallel, none at all); if {it} {verb} around the pole on purpose, cut {it} at ±180° and close {it} along the pole"
     ))
 }
 
