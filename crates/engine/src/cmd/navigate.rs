@@ -444,22 +444,17 @@ pub(crate) fn read_axis(text: &str, latitude: bool) -> Result<f64, String> {
         }
         nums.push(v);
     }
-    let (d, ms) = nums.split_first().ok_or_else(usage)?;
     // Minutes follow whole degrees and seconds whole minutes (`48.85 2.35` is two values, not
     // degrees and minutes).
     if nums.iter().rev().skip(1).any(|v| v.fract() != 0.0) {
         return Err(usage());
     }
-    if ms.iter().any(|v| !(0.0..60.0).contains(v)) {
-        return Err(format!("the {name}'s minutes and seconds must be from 0 to under 60"));
-    }
-    if hemisphere.is_some() && d.is_sign_negative() {
+    if hemisphere.is_some() && nums.first().is_some_and(|d| d.is_sign_negative()) {
         return Err(format!("the {name} has both a minus sign and a hemisphere letter"));
     }
-    let m = ms.first().copied().unwrap_or(0.0);
-    let sec = ms.get(1).copied().unwrap_or(0.0);
-    let mut v = d.abs() + m / 60.0 + sec / 3600.0;
-    if d.is_sign_negative() || matches!(hemisphere, Some('S' | 'W')) {
+    // The degrees, minutes and seconds as the search box sums them.
+    let mut v = super::search::axis(&nums).ok_or_else(|| format!("the {name}'s minutes and seconds must be from 0 to under 60"))?;
+    if matches!(hemisphere, Some('S' | 'W')) {
         v = -v;
     }
     let limit = if latitude { 90.0 } else { 180.0 };

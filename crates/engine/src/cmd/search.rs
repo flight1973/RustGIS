@@ -644,7 +644,7 @@ fn tokens(text: &str) -> Option<Vec<Tok>> {
 }
 
 /// One axis: degrees, and maybe minutes and seconds; `None` for anything else.
-fn axis(nums: &[f64]) -> Option<f64> {
+pub(crate) fn axis(nums: &[f64]) -> Option<f64> {
     let (d, rest) = nums.split_first()?;
     if rest.len() > 2 || rest.iter().any(|v| !(0.0..60.0).contains(v)) {
         return None;

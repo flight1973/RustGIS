@@ -45865,6 +45865,8 @@ fn go_to_xy_reads_a_position_as_the_search_box_does() {
     // them; a letter of the other axis is refused, not swapped; numbers say nothing.
     for (lon, lat) in [("74°0′22″W", "40°42′46″N"), ("W 74 0 22", "N 40 42 46"), ("-74 0 22", "40 42 46"), ("-74.006", "40.7128")]
     {
+        // From elsewhere each time, so the text is what moves the map.
+        s.run("map.goToXY", &json!({"lon": 0, "lat": 0})).unwrap();
         let mark = s.notice_mark();
         s.run("map.goToXY", &json!({"lon": lon, "lat": lat})).unwrap();
         assert_eq!(at(&s), (40.713, -74.006), "{lon} {lat}");
@@ -45881,6 +45883,7 @@ fn go_to_xy_reads_a_position_as_the_search_box_does() {
     assert!(axis_refused(&mut s, "48.85, 2.35", "48").contains("one value"));
     assert!(axis_refused(&mut s, "48.85 2.35", "48").contains("write the longitude"));
     // Typographic quotes, as pasted from a document, are marks like any other.
+    s.run("map.goToXY", &json!({"lon": 0, "lat": 0})).unwrap();
     s.run("map.goToXY", &json!({"lon": "74°0’22”W", "lat": "40°42’46”N"})).unwrap();
     assert_eq!(at(&s), (40.713, -74.006));
     assert!(axis_refused(&mut s, &"9".repeat(500), "40").contains("longer than"));
