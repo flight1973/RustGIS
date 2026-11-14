@@ -95,9 +95,12 @@ struct Topology {
     transform: Option<([f64; 2], [f64; 2])>,
     /// The most coordinates rebuilt from arcs, across all objects.
     limit: usize,
-    /// Coordinates still allowed to be rebuilt.
+    /// Coordinates still allowed to be rebuilt into geometries kept.
     budget: usize,
-    /// Whether rebuilding the geometry being read ran past `budget`.
+    /// Coordinates still allowed to be copied at all, kept or not: never given back, so a file
+    /// can't make the reader copy without end by failing each geometry after its arcs.
+    work: usize,
+    /// Whether rebuilding the geometry being read ran past `budget` or `work`.
     over_budget: bool,
     /// Members of geometry collections left out, since the last object was read: unreadable, and
     /// at the coordinate limit.
@@ -107,7 +110,8 @@ struct Topology {
 
 impl Topology {
     /// A geometry object rebuilt as GeoJSON, or why it wasn't. The coordinates counted for one
-    /// that isn't rebuilt are given back, so it doesn't use up the limit.
+    /// that isn't rebuilt are given back to `budget`, so it doesn't use up the limit, but not to
+    /// `work`.
     fn read_member(&mut self, g: &Json, depth: usize) -> std::result::Result<Json, Lost> {
         let (budget, outer) = (self.budget, self.over_budget);
         self.over_budget = false;
@@ -135,11 +139,11 @@ impl Topology {
             let i = id.as_i64()?;
             let (k, rev) = if i < 0 { (!i, true) } else { (i, false) };
             let arc = self.arcs.get(usize::try_from(k).ok()?)?.as_ref()?;
-            let Some(left) = self.budget.checked_sub(arc.len()) else {
+            let (Some(left), Some(work)) = (self.budget.checked_sub(arc.len()), self.work.checked_sub(arc.len())) else {
                 self.over_budget = true;
                 return None;
             };
-            self.budget = left;
+            (self.budget, self.work) = (left, work);
             // The joint (this arc's first position as read), written once, keeps a further number
             // either arc gives it.
             let joint = if out.is_empty() {
@@ -254,7 +258,10 @@ fn read_with(file_name: &str, text: &str, budget: usize) -> Result<Vec<(Dataset,
             .collect();
         arcs.push(pts);
     }
-    let mut topo = Topology { arcs, transform, limit: budget, budget, over_budget: false, members_lost: 0, members_cut: 0 };
+    // Copying is bounded at twice the limit: room for the geometries kept, and as much again for
+    // those that fail after their arcs are copied.
+    let work = budget.saturating_mul(2);
+    let mut topo = Topology { arcs, transform, limit: budget, budget, work, over_budget: false, members_lost: 0, members_cut: 0 };
     let objects = v.get("objects").and_then(Json::as_object).ok_or_else(|| DataError::Format(format!("{file_name}: no objects")))?;
     let mut out = Vec::new();
     for (name, obj) in objects.iter().take(MAX_OBJECTS) {
@@ -503,6 +510,22 @@ mod tests {
             "{:?}",
             rep.messages
         );
+    }
+
+    #[test]
+    fn geometries_failing_after_their_arcs_cant_copy_without_end() {
+        // Each multi-line copies arc 0 (2 coordinates), then fails on an arc the file doesn't
+        // hold. The limit (2) is given back each time, but the work (twice the limit, 4) isn't: the
+        // first two fail as unreadable, and from then on everything stops at the limit, said.
+        let bad = r#"{"type":"MultiLineString","arcs":[[0],[9]]}"#;
+        let text = format!(
+            r#"{{"type":"Topology","objects":{{"o":{{"type":"GeometryCollection","geometries":[{bad},{bad},{bad},{{"type":"LineString","arcs":[0]}}]}}}},"arcs":[[[0,0],[1,1]]]}}"#
+        );
+        let (ds, rep) = read_with("w.topojson", &text, 2).unwrap().remove(0);
+        assert_eq!(rep.skipped, 4);
+        assert!(ds.features[3].geometry.is_none());
+        assert!(rep.messages.iter().any(|m| m.starts_with("2 geometries couldn't be read")), "{:?}", rep.messages);
+        assert!(rep.messages.iter().any(|m| m.starts_with("2 geometries left out at the limit of 2")), "{:?}", rep.messages);
     }
 
     #[test]
