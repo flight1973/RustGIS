@@ -35,7 +35,15 @@ merge as is. Nothing pushed.
 6. Projects: done; save/reopen keeps Z (z_arrays.rs `a_saved_project_keeps_the_heights`).
    Older release finding below.
 7. Tests: z_arrays.rs (6) and data lib tests pass.
-8. `cargo xtask ci`: in progress (clippy fixed once); wasm build: not started.
+8. Done. `cargo xtask ci`: fmt, clippy pass; tests pass except
+   `ui-egui mapview::tests::explore_click_asking_only_wms_clears_without_a_notice`, which failed
+   once under the full parallel run and passes alone (a WMS popup test with no features; looks
+   flaky, not from this change). The workspace tests with it skipped pass, and `xtask layers` is ok.
+   `cargo build --target wasm32-unknown-unknown -p rustgis-web` passes.
+   Older tests that used a 3D GeoJSON point to get a "dropped Z" notice now use a fourth number
+   (`gp.rs` batch tests) or `[1,2,null,30]` (`tests.rs` dropped-Z tests), since Z is now kept.
+
+Status: prototype complete. Next step: none on the code; the report goes to the coordinator.
 
 ## Where Z is dropped (tools/edits that change geometry)
 
@@ -80,7 +88,3 @@ reprojection via `map_coords` (io.rs project, geolibre convert).
 - A legacy GeoJSON `crs` converts x/y but leaves Z as given (no vertical datum on the layer yet).
 - Web map notices count features but don't name the layer.
 
-## Next step
-
-Run the analysis and engine test
-suites, `cargo xtask ci`, and `cargo build --target wasm32-unknown-unknown -p rustgis-web`.
