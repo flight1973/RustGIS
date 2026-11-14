@@ -588,12 +588,51 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
     // A bug in a tool must not take the app down.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         validate_pole_inputs(spec, inputs, &p)?;
-        match source_of(spec) {
+        let result = match source_of(spec) {
             Some((_, runner)) => runner(spec, inputs, &p),
             None => (spec.run)(inputs, &p),
-        }
+        };
+        with_pole_loop_notes(result, spec, inputs, &p)
     }))
     .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
+}
+
+/// A tool's result with [`pole_loop_notes`] added: to its messages, or to its error, which a
+/// loop may be the reason for (Clip refuses a mask with no area).
+fn with_pole_loop_notes(result: Result<ToolResult, String>, spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Result<ToolResult, String> {
+    let notes = pole_loop_notes(spec, inputs, p);
+    match result {
+        Ok(mut r) => {
+            r.messages.extend(notes);
+            Ok(r)
+        }
+        Err(e) if notes.is_empty() => Err(e),
+        Err(e) => Err(format!("{e}. {}", notes.join(". "))),
+    }
+}
+
+/// What a tool's vector inputs hold that it can't read as areas: rings that loop around a pole
+/// without being cut at ±180° (#1354), one notice per layer with a count. Every tool reads
+/// longitude and latitude as x and y, so for each such a ring is a line with no area. The rows
+/// counted are those the tool reads: the layer's selection, or every row without one.
+fn pole_loop_notes(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut notes = Vec::new();
+    for param in spec.params.iter().filter(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::VectorLayer)) {
+        let Some(name) = p.get(param.name).and_then(Value::as_str) else { continue };
+        if seen.contains(&name) {
+            continue;
+        }
+        seen.push(name);
+        let Some(ds) = inputs.dataset(name) else { continue };
+        let selected = inputs.selection(name);
+        let geometries = |rows: &mut dyn Iterator<Item = usize>| -> Option<String> {
+            rustgis_data::pole_loop_message(name, rows.filter_map(|r| ds.features.get(r).and_then(|f| f.geometry.as_ref())))
+        };
+        let note = if selected.is_empty() { geometries(&mut (0..ds.features.len())) } else { geometries(&mut selected.iter().copied()) };
+        notes.extend(note);
+    }
+    notes
 }
 
 /// Validates the rows a pole-aware tool reads, on either execution path.
@@ -676,10 +715,11 @@ pub fn run_resolved(
         let params = tool.resolve_params(params)?;
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             validate_pole_inputs(tool.spec, inputs, &params)?;
-            match tool.runner {
+            let result = match tool.runner {
                 Some(runner) => runner(tool.spec, inputs, &params),
                 None => (tool.spec.run)(inputs, &params),
-            }
+            };
+            with_pole_loop_notes(result, tool.spec, inputs, &params)
         }))
         .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", tool.spec.name)))
     })

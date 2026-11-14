@@ -23,6 +23,29 @@ pub fn ambiguous_area_message<'a>(geometries: impl Iterator<Item = &'a Geometry>
     })
 }
 
+/// A counted explanation when these features (of the layer `layer`) have rings that loop around
+/// a pole without being cut at ±180° ([`rustgis_geom::ring_pole_turns`]): longitude and latitude
+/// read as x and y, as the analysis plane reads them, take such a ring for a line with no area.
+pub fn pole_loop_message<'a>(layer: &str, geometries: impl Iterator<Item = &'a Geometry>) -> Option<String> {
+    let (mut features, mut rings) = (0usize, 0usize);
+    for geometry in geometries {
+        let count = geometry.pole_loop_rings();
+        if count > 0 {
+            features += 1;
+            rings += count;
+        }
+    }
+    if rings == 0 {
+        return None;
+    }
+    let (rings_text, verb, it) =
+        if rings == 1 { ("1 ring".to_string(), "loops", "it") } else { (format!("{rings} rings"), "loop", "them") };
+    let features_text = if features == 1 { "1 feature".to_string() } else { format!("{features} features") };
+    Some(format!(
+        "'{layer}': {rings_text} in {features_text} {verb} around a pole without being cut at ±180°, so the analysis reads {it} as having no area; cut {it} at ±180° and close {it} along the pole to include {it}"
+    ))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GeometryType {
     Point,
@@ -126,6 +149,15 @@ impl Geometry {
     pub fn ambiguous_area_rings(&self) -> usize {
         match self {
             Geometry::Polygon(polys) => polys.iter().flatten().filter(|r| rustgis_geom::ring_area_is_ambiguous(r)).count(),
+            _ => 0,
+        }
+    }
+
+    /// Rings, holes included, that loop around a pole without being cut at ±180°
+    /// ([`rustgis_geom::ring_pole_turns`]).
+    pub fn pole_loop_rings(&self) -> usize {
+        match self {
+            Geometry::Polygon(polys) => polys.iter().flatten().filter(|r| rustgis_geom::ring_pole_turns(r) != 0).count(),
             _ => 0,
         }
     }
