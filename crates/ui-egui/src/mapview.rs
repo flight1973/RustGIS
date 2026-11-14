@@ -5174,6 +5174,7 @@ mod tests {
             shadow,
             sky: 0.0,
             fill: 0.0,
+            rock: None,
         };
         let set = |map: &mut Map, shadow: f64, visible: bool| {
             let l = map.layer_mut(id).unwrap();

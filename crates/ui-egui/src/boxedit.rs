@@ -356,7 +356,6 @@ pub(crate) fn context_menu(app: &mut RustGisApp, ui: &mut egui::Ui) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use rustgis_engine::{

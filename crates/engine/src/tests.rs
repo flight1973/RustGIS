@@ -4456,6 +4456,67 @@ fn shaded_relief_keeps_its_fill_light() {
     assert_eq!(fill(&t), 0.45, "back when opened");
 }
 
+/// Shaded Relief's rock on steep slopes (#1913): an object turns it on, its missing keys from the
+/// current rock or the defaults; kept when left out; `false` removes it; a `from` not below `to`
+/// or a bad colour is refused; saved with the project only when set.
+#[test]
+fn shaded_relief_keeps_its_rock_on_steep_slopes() {
+    use rustgis_map::raster::Rock;
+    let mut s = with_raster();
+    let rock = |s: &Session| match s.map().layers.first().and_then(|l| l.raster.as_ref()).map(|r| &r.style.renderer) {
+        Some(rustgis_map::RasterRenderer::ShadedRelief { rock, .. }) => *rock,
+        other => panic!("{other:?}"),
+    };
+    let rocks_saved = |s: &mut Session| s.project.saved_text(None).unwrap().0.matches("\"rock\"").count();
+    s.run("raster.symbology", &json!({"type": "shadedRelief"})).unwrap();
+    assert_eq!(rock(&s), None, "off by default");
+    let before = rocks_saved(&mut s);
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "rock": {}})).unwrap();
+    assert_eq!(rock(&s), Some(Rock::DEFAULT));
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "rock": {"to": 50, "color": "#806040"}})).unwrap();
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "azimuth": 200})).unwrap();
+    let want = Rock { from: 25.0, to: 50.0, color: rustgis_map::Rgba::rgb(0x80, 0x60, 0x40) };
+    assert_eq!(rock(&s), Some(want), "left out, kept; its missing keys too");
+    assert_eq!(rocks_saved(&mut s), before + 1, "saved when set");
+    for bad in
+        [json!({"from": 40, "to": 30}), json!({"from": 30, "to": 30}), json!({"color": "rock"}), json!({"color": "#B2ACA480"}), json!(3)]
+    {
+        assert!(s.run("raster.symbology", &json!({"type": "shadedRelief", "rock": bad})).is_err(), "{bad}");
+        assert_eq!(rock(&s), Some(want), "{bad}: refused, the rock kept");
+    }
+    s.run("raster.symbology", &json!({"type": "shadedRelief", "rock": false})).unwrap();
+    assert_eq!(rock(&s), None);
+    assert_eq!(rocks_saved(&mut s), before, "not saved once removed");
+}
+
+/// An export draws the rock on steep slopes: a grey relief whose east half is a 63° wall turns
+/// red there with a red rock, and keeps the same pixels on the flat west half.
+#[test]
+fn an_export_draws_the_rock_on_steep_slopes() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let mut s = world();
+    // 41 cells of 30 m a side: flat to column 20, then rising 60 m a cell eastward.
+    let wall: Vec<f32> = (0..41 * 41).map(|i| ((i % 41 - 20).max(0) * 60) as f32).collect();
+    let gt = GeoTransform { origin_x: 500_000.0, origin_y: 7_000_000.0, pixel_width: 30.0, pixel_height: -30.0 };
+    let r = Raster::new("wall", 41, 41, vec![wall], gt, Crs::from_epsg(31983).unwrap(), None, ColorHint::Gray, "Float32").unwrap();
+    let bytes = geotiff::write(&r, 0).unwrap();
+    crate::cmd::raster::add_raster(&mut s, "wall", rustgis_map::RasterLayer::from_bytes(r, "wall.tif".to_string(), bytes)).unwrap();
+    s.run("layer.zoomTo", &json!({"layer": "wall"})).unwrap();
+    let drawn = |s: &mut Session, rock: Value| {
+        s.run("raster.symbology", &json!({"layer": "wall", "type": "shadedRelief", "grey": true, "azimuth": 270, "rock": rock})).unwrap();
+        let png = crate::cmd::share::map_png(s, Some(200.0), Some(200.0), None).unwrap();
+        crate::render::decode_png(&png).unwrap()
+    };
+    let plain = drawn(&mut s, json!(false));
+    let rocky = drawn(&mut s, json!({"from": 10, "to": 20, "color": "#FF0000"}));
+    let px = |p: &tiny_skia::Pixmap, x: u32| p.pixel(x, 100).map(|c| [c.red(), c.green(), c.blue()]).unwrap();
+    // The flat west half: the same grey. The wall: grey without the rock, red with it.
+    assert_eq!(px(&rocky, 70), px(&plain, 70));
+    let ([r0, g0, b0], [r1, g1, b1]) = (px(&plain, 130), px(&rocky, 130));
+    assert!(r0 == g0 && g0 == b0 && r0 > 0, "a grey wall: {:?}", [r0, g0, b0]);
+    assert!(r1 > 0 && g1 == 0 && b1 == 0, "a red wall: {:?}", [r1, g1, b1]);
+}
+
 /// An export draws the sky a pit hides: its floor darker with `sky` 1 than with 0, the ground
 /// around it (which sees the whole sky) the same. The first export with the sky, from a cold
 /// cache, waits for the grid: it is the same image as one drawn once the grid is kept.
@@ -12338,6 +12399,53 @@ fn a_scan_warped_onto_its_points_is_placed_for_real() {
     let again = t.map().layer_by_name("plate").unwrap().raster.as_ref().unwrap().data.clone().unwrap();
     assert!(again.georeferenced && again.transform == out.transform, "{:?} vs {:?}", again.transform, out.transform);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A one-in-one plane returns 45 degrees, with its unit in the band description through both
+/// function paths, GeoTIFF export and project reopening. A following function clears that label.
+/// The geographic case uses the documented centre-latitude approximation; zFactor scales rise.
+#[test]
+fn slope_results_describe_degrees() {
+    use base64::Engine;
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    for (crs, cell, top, rise) in [(Crs::WebMercator, 10.0, 30.0, 10.0), (Crs::LonLat, 0.001, 60.0015, 55.66)] {
+        for chain in [false, true] {
+            let mut s = world();
+            let gt = GeoTransform { origin_x: 0.0, origin_y: top, pixel_width: cell, pixel_height: -cell };
+            let pixels = (0..9).map(|i| (i % 3) as f32 * rise).collect();
+            let dem = Raster::new("plane", 3, 3, vec![pixels], gt, crs, None, ColorHint::Gray, "Float32").unwrap();
+            let data = base64::engine::general_purpose::STANDARD.encode(geotiff::write(&dem, 0).unwrap());
+            s.run("layer.addDataBytes", &json!({"fileName": "plane.tif", "data": data})).unwrap();
+            let (cmd, params, expected) = if chain {
+                ("raster.functionChain", json!({"layer": "plane", "steps": [{"function": "slope"}], "name": "S"}), 45.0)
+            } else {
+                (
+                    "raster.function",
+                    json!({"layer": "plane", "function": "slope", "zFactor": 0.5, "name": "S"}),
+                    0.5_f64.atan().to_degrees(),
+                )
+            };
+            s.run(cmd, &params).unwrap();
+            let info = s.run("raster.info", &json!({"layer": "S"})).unwrap();
+            assert_eq!(info["bands"][0]["name"], "Slope (degrees)");
+            let out = s.map().layer_by_name("S").unwrap().raster.as_ref().unwrap().data.as_ref().unwrap();
+            assert!((f64::from(out.bands[0].data[4]) - expected).abs() < 1e-4, "{crs:?} {cmd}");
+            let back = geotiff::read(std::io::Cursor::new(geotiff::write(out, 0).unwrap()), "S").unwrap();
+            assert_eq!(back.bands[0].name, "Slope (degrees)");
+            let text = serde_json::to_string(&s.project).unwrap();
+            let mut reopened = Session::new(Project::default());
+            reopened.run("project.openText", &json!({"text": text})).unwrap();
+            assert_eq!(reopened.run("raster.info", &json!({"layer": "S"})).unwrap()["bands"][0]["name"], "Slope (degrees)");
+            s.run(
+                "raster.functionChain",
+                &json!({"layer": "plane", "steps": [
+                {"function": "slope"}, {"function": "threshold", "value": 30}
+            ], "name": "mask"}),
+            )
+            .unwrap();
+            assert_ne!(s.run("raster.info", &json!({"layer": "mask"})).unwrap()["bands"][0]["name"], "Slope (degrees)");
+        }
+    }
 }
 
 /// A hillshade is made as bytes, 1–255 with 0 for no data, so it is exported as 8-bit samples (a

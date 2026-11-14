@@ -54,10 +54,10 @@ pub fn commands() -> Vec<C> {
         C::new("script.run", "Run Script", "Analyze › Geoprocessing", run_script).roles(&[crate::ParamRole { key: "script", role: crate::Role::Script }]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Automation))
             .params(r#"{"script": "one command per line: id {json}; # comments"}"#),
         C::new("raster.function", "Raster Functions", "Analyze › Raster", raster_function).inputs(function_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample", "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]], "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
+            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample" (slope returns degrees, not percent), "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]], "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
         C::new("raster.functionChain", "Function Editor", "Analyze › Raster", function_chain).inputs(chain_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"layer": raster, "steps": [{"function", …}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
+            .params(r#"{"layer": raster, "steps": [{"function", … (as raster.function; slope returns degrees, not percent)}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
         C::new("analysis.suitability", "Suitability Modeler", "Analyze › Workflows", suitability).inputs(suitability_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"criteria": [{"layer": raster, "band"?: 1-based, "ranges": [[lo, hi, score]], "weight": number}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
@@ -496,7 +496,11 @@ pub fn gallery_list(kind: &str) -> CmdResult {
         .collect();
     if kind == "raster" {
         for (id, name, summary) in [
-            ("raster.function", "Raster Functions", "Slope, aspect, hillshade, NDVI, band math, remap, threshold and resampling."),
+            (
+                "raster.function",
+                "Raster Functions",
+                "Slope (degrees), aspect, hillshade, NDVI, band math, remap, threshold and resampling.",
+            ),
             ("analysis.suitability", "Suitability Modeler", "Weighted overlay of scored rasters."),
             ("analysis.viewshed", "Viewshed", "The cells visible from an observer on a DEM."),
             ("analysis.interpolate", "Interpolate (IDW)", "A raster surface from point values."),
@@ -1196,12 +1200,25 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
     }
     Ok(Box::new(move || {
         let pixels = apply_function(&src, &p, target.as_deref())?;
-        if is_hillshade(&p) {
-            return made_hillshade(rasterops::derive_hillshade(&src, &name, pixels)?, &defaults);
-        }
         // Only a resample takes another raster's grid.
-        made(rasterops::derive(target.as_deref().unwrap_or(&src), &name, vec![pixels])?, None)
+        let raster = derive_function(target.as_deref().unwrap_or(&src), &name, &p, pixels)?;
+        if is_hillshade(&p) { made_hillshade(raster, &defaults) } else { made(raster, None) }
     }))
+}
+
+/// Wraps a function's pixels on its output grid, keeping a slope's unit in its band description
+/// and a hillshade's byte storage. A later function starts with its own description.
+fn derive_function(r: &Raster, name: &str, p: &Value, pixels: Vec<f32>) -> Result<Raster, String> {
+    if is_hillshade(p) {
+        return rasterops::derive_hillshade(r, name, pixels);
+    }
+    let mut out = rasterops::derive(r, name, vec![pixels])?;
+    if ps(p, "function") == Some("slope")
+        && let Some(band) = out.bands.first_mut()
+    {
+        band.name = "Slope (degrees)".into();
+    }
+    Ok(out)
 }
 
 /// Whether raster function step `p` is a hillshade, whose pixels are bytes
@@ -1254,11 +1271,7 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
             let f = func(st);
             let pixels = apply_function(&cur, st, target.as_deref()).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
             // Only a resample takes another raster's grid; otherwise the grid is the current one.
-            cur = if is_hillshade(st) {
-                rasterops::derive_hillshade(&cur, &cur.name, pixels)?
-            } else {
-                rasterops::derive(target.as_deref().unwrap_or(&cur), &cur.name, vec![pixels])?
-            };
+            cur = derive_function(target.as_deref().unwrap_or(&cur), &cur.name, st, pixels)?;
             names.push(f);
         }
         cur.name = named.unwrap_or_else(|| format!("{}_{}", cur.name, names.join("_")));

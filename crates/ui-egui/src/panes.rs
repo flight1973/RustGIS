@@ -7,7 +7,7 @@ use egui::{Align2, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::Session;
 use rustgis_engine::analysis::{ParamKind, tools};
 use rustgis_engine::data::GeometryType;
-use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle};
+use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle, Rock};
 use rustgis_engine::map::symbology::{
     ClassRef, ClassStyle, Dash, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_EXPRESSION_CLASSES, MAX_LABEL,
     MAX_LINE_MARKER_SIZE, MAX_MARKER_INTERVAL, MAX_STROKE_OFFSET, MAX_STROKE_WIDTH, MAX_STROKES, MIN_MARKER_INTERVAL, OTHER_VALUES,
@@ -6755,7 +6755,7 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
         RasterRenderer::Colormap => {
             ui.label(egui::RichText::new(tl!("Colors from the raster's own color table.")).size(11.5).color(t.text_dim));
         }
-        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky, fill } => {
+        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky, fill, rock } => {
             let (az, alt, zf, sh, sk, fl) = (*azimuth, *altitude, *z_factor, *shadow, *sky, *fill);
             let rp = ramp.as_ref().map(|r| r.name().to_string());
             let relief = move |band: usize, az: f64, alt: f64, zf: f64, sh: f64| {
@@ -6814,6 +6814,7 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     ui.end_row();
                 }
             });
+            rock_on_slopes(app, ui, l.id, *rock, relief(*band, az, alt, zf, sh));
             let mut tint = ramp.is_some();
             if ui.checkbox(&mut tint, tl!("Tint by elevation")).changed() {
                 let mut p = relief(*band, az, alt, zf, sh);
@@ -6967,6 +6968,50 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
     ui.separator();
     ui.label(egui::RichText::new(tl!("Layer")).size(11.5).color(t.text_dim));
     transparency_row(app, ui, l);
+}
+
+/// Shaded Relief's Rock on steep slopes (#1913): a check box and, when it is on, the slopes in
+/// degrees the rock colour starts and ends at and the colour. `relief` is the layer's Shaded
+/// Relief as `raster.symbology` takes it, to which the rock is added.
+fn rock_on_slopes(app: &mut RustGisApp, ui: &mut Ui, layer: u32, rock: Option<Rock>, relief: Value) {
+    let send = |app: &mut RustGisApp, rock: Value| {
+        let mut p = relief.clone();
+        p["rock"] = rock;
+        let _ = app.run("raster.symbology", p);
+    };
+    let mut on = rock.is_some();
+    if ui
+        .checkbox(&mut on, tl!("Rock on steep slopes"))
+        .on_hover_text(tl!("Tints steep ground toward a rock colour before the light shades it, by the ground's own slope"))
+        .changed()
+    {
+        send(app, if on { json!({}) } else { json!(false) });
+    }
+    let Some(rock) = rock else { return };
+    egui::Grid::new(("relief_rock", layer)).num_columns(2).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
+        for (label, v, which) in [("From", rock.from, 0), ("To", rock.to, 1)] {
+            let input_label = ui.label(tl!(label));
+            let mut x = v;
+            // Kept across a drag until it is let go (#607).
+            let drag = Dragged::lend(ui, egui::Id::unique(("relief_rock_drag", layer, which)), &mut x);
+            let r = ui
+                .add(egui::DragValue::new(&mut x).update_while_editing(false).range(0.0..=90.0).speed(0.5).max_decimals(1).suffix("°"))
+                .labelled_by(input_label.id);
+            if drag.settled(ui, &r, &mut x) && x != v {
+                // The other end moves along rather than cross it.
+                let (from, to) =
+                    if which == 0 { (x.min(89.0), rock.to.max(x.min(89.0) + 1.0)) } else { (rock.from.min(x.max(1.0) - 1.0), x.max(1.0)) };
+                send(app, json!({"from": from, "to": to}));
+            }
+            ui.end_row();
+        }
+        let input_label = ui.label(tl!("Color"));
+        let mut c = egui::Color32::from_rgb(rock.color.r(), rock.color.g(), rock.color.b());
+        if crate::widgets::color_button(ui, &mut c).labelled_by(input_label.id).changed() {
+            send(app, json!({"color": rustgis_engine::map::Rgba::rgb(c.r(), c.g(), c.b()).hex()}));
+        }
+        ui.end_row();
+    });
 }
 
 /// The Masking section of a raster's symbology (#348): values drawn as no data, and a range of
