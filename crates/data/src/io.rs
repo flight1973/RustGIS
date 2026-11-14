@@ -1274,11 +1274,14 @@ pub(crate) fn geojson_zm_notes(partial: usize, m: usize) -> Vec<String> {
     let count = |n: usize| if n == 1 { "1 feature".to_string() } else { format!("{n} features") };
     let mut notes = Vec::new();
     if partial > 0 {
-        notes.push(format!("{} had heights (Z) on only some of their points, which were dropped: exports won't have them", count(partial)));
+        notes.push(format!(
+            "{} had Z or M values (heights) on only some of their points, which were dropped: exports won't have them",
+            count(partial)
+        ));
     }
     if m > 0 {
         notes.push(format!(
-            "{} had a fourth number in their positions (a measure, which GeoJSON doesn't define), which was dropped: exports won't have it",
+            "{} had Z or M values past a height (a fourth number: a measure, which GeoJSON doesn't define), which were dropped: exports won't have them",
             count(m)
         ));
     }
@@ -4119,7 +4122,7 @@ mod tests {
             )
         };
         // Read whole, heights on every position are kept (the member's), on only some dropped.
-        let some = |r: &ReadReport| r.messages.iter().any(|m| m.contains("heights (Z) on only some of their points"));
+        let some = |r: &ReadReport| r.messages.iter().any(|m| m.contains("(heights) on only some of their points"));
         let (ds, rep) = read_geojson(&doc("[1,2,9]"), "track").unwrap();
         assert!(ds.zm_dropped && some(&rep) && ds.features[0].zm.is_none());
         let all = r#"{"type":"Feature","properties":{},"geometry":{"type":"GeometryCollection","geometries":[{"type":"LineString","coordinates":[[1,2,9],[3,4,-1]]}]}}"#;

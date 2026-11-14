@@ -35,8 +35,7 @@ merge as is. Nothing pushed.
 6. Projects: done; save/reopen keeps Z (z_arrays.rs `a_saved_project_keeps_the_heights`).
    Older release finding below.
 7. Tests: z_arrays.rs (6) and data lib tests pass.
-
-8. `cargo xtask ci` + wasm build: not started.
+8. `cargo xtask ci`: in progress (clippy fixed once); wasm build: not started.
 
 ## Where Z is dropped (tools/edits that change geometry)
 

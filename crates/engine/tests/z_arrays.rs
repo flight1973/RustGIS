@@ -101,8 +101,8 @@ fn heights_on_only_some_points_or_a_fourth_number_are_said() {
     let (ds, said) = add(&mut s, &src);
     assert!(ds.zm_dropped);
     let notes = of_heights(&said);
-    assert!(notes.iter().any(|t| t.contains("1 feature had heights (Z) on only some of their points")), "{said:?}");
-    assert!(notes.iter().any(|t| t.contains("1 feature had a fourth number")), "{said:?}");
+    assert!(notes.iter().any(|t| t.contains("1 feature had Z or M values (heights) on only some of their points")), "{said:?}");
+    assert!(notes.iter().any(|t| t.contains("1 feature had Z or M values past a height")), "{said:?}");
     // The mixed feature keeps no heights; the one with a measure keeps its heights; null isn't one.
     let kept: Vec<bool> = ds.features.iter().map(|f| f.zm.is_some()).collect();
     assert_eq!(kept, [false, true, false]);

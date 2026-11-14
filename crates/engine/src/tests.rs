@@ -20578,7 +20578,7 @@ fn dropped_z_values_are_said_on_import_and_export() {
     let src = dir.join("wells.geojson");
     std::fs::write(
         &src,
-        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2,30]}}]}"#,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2,null,30]}}]}"#,
     )
     .unwrap();
     isolate_plugins();
@@ -20614,7 +20614,7 @@ fn exporting_a_table_says_its_dropped_z_values() {
     let src = dir.join("wells.geojson");
     std::fs::write(
         &src,
-        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"depth":30},"geometry":{"type":"Point","coordinates":[1,2,30]}}]}"#,
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"depth":30},"geometry":{"type":"Point","coordinates":[1,2,null,30]}}]}"#,
     )
     .unwrap();
     isolate_plugins();
