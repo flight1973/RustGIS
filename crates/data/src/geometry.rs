@@ -23,12 +23,36 @@ pub fn ambiguous_area_message<'a>(geometries: impl Iterator<Item = &'a Geometry>
     })
 }
 
-/// A counted explanation when these features (of the layer `layer`) have rings that loop around
+/// A counted explanation when features of `layers` have `rings` rings, in `features` features, that loop around
 /// a pole without being cut at ±180° ([`rustgis_geom::ring_pole_turns`]): taken the short way
 /// round in longitude, such a ring goes around the pole, but longitude and latitude read as x and
 /// y, as the analysis plane reads them, give another shape (a ring along one parallel, a line).
-pub fn pole_loop_message<'a>(layer: &str, geometries: impl Iterator<Item = &'a Geometry>) -> Option<String> {
-    let (mut features, mut rings) = (0usize, 0usize);
+pub fn pole_loop_message(layers: &[&str], rings: usize, features: usize) -> Option<String> {
+    if rings == 0 {
+        return None;
+    }
+    let names: Vec<String> = layers.iter().map(|l| format!("'{l}'")).collect();
+    let names = match names.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => String::new(),
+    };
+    // Subject and object forms: "it goes … cut it", "they go … cut them".
+    let (rings_text, verb, they, them, encloses) = if rings == 1 {
+        ("1 ring".to_string(), "goes", "it", "it", "encloses")
+    } else {
+        (format!("{rings} rings"), "go", "they", "them", "enclose")
+    };
+    let features_text = if features == 1 { "1 feature".to_string() } else { format!("{features} features") };
+    Some(format!(
+        "{names}: {rings_text} in {features_text} {verb} around a pole without reaching it, each step in longitude taken the short way; the analysis reads longitude and latitude as x and y, so it doesn't see the area {they} {encloses} (along one parallel, none at all); if {they} {verb} around the pole on purpose, cut {them} at ±180° and close {them} along the pole"
+    ))
+}
+
+/// The rings that loop around a pole ([`Geometry::pole_loop_rings`]) in these features, and the
+/// features that have any: what [`pole_loop_message`] says.
+pub fn pole_loop_count<'a>(geometries: impl Iterator<Item = &'a Geometry>) -> (usize, usize) {
+    let (mut rings, mut features) = (0usize, 0usize);
     for geometry in geometries {
         let count = geometry.pole_loop_rings();
         if count > 0 {
@@ -36,15 +60,7 @@ pub fn pole_loop_message<'a>(layer: &str, geometries: impl Iterator<Item = &'a G
             rings += count;
         }
     }
-    if rings == 0 {
-        return None;
-    }
-    let (rings_text, verb, it, encloses) =
-        if rings == 1 { ("1 ring".to_string(), "goes", "it", "encloses") } else { (format!("{rings} rings"), "go", "them", "enclose") };
-    let features_text = if features == 1 { "1 feature".to_string() } else { format!("{features} features") };
-    Some(format!(
-        "'{layer}': {rings_text} in {features_text} {verb} around a pole without reaching it, each step in longitude taken the short way; the analysis reads longitude and latitude as x and y, so it doesn't see the area {it} {encloses} (along one parallel, none at all); if {it} {verb} around the pole on purpose, cut {it} at ±180° and close {it} along the pole"
-    ))
+    (rings, features)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

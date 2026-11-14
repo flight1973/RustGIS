@@ -597,22 +597,24 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
     .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
 }
 
-/// A tool's result with [`pole_loop_notes`] added: to its messages, or to an error that names a
-/// layer with such rings (`'loop'`), which they may be the reason for (Clip refuses a mask with no
-/// area). An error about something else (`no layer named 'study_area'`) is left as it is.
+/// A tool's result with [`pole_loop_note`] added: to its messages, or to an error about an area
+/// that names a layer with such rings (Clip's `none of the 1 feature(s) of 'loop' covers anything:
+/// a polygon with no area`), which they may be the reason for; then only those layers are read.
+/// Another error (`no layer named 'study_area'`, a field missing from 'loop') is left as it is.
 fn with_pole_loop_notes(result: Result<ToolResult, String>, spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Result<ToolResult, String> {
     match result {
         Ok(mut r) => {
-            r.messages.extend(pole_loop_notes(spec, inputs, p).into_iter().map(|(_, note)| note));
+            r.messages.extend(pole_loop_note(spec, inputs, p, |_| true));
             Ok(r)
         }
+        Err(e) if !e.contains("area") => Err(e),
         Err(e) => {
-            let notes: Vec<String> = pole_loop_notes(spec, inputs, p)
-                .into_iter()
-                .filter(|(layer, _)| e.contains(&format!("'{layer}'")))
-                .map(|(_, note)| note)
-                .collect();
-            if notes.is_empty() { Err(e) } else { Err(format!("{}. {}", e.trim_end_matches(['.', ' ']), notes.join(". "))) }
+            // Tools name a layer as it is stored, which may differ in case from how it was given.
+            let lower = e.to_lowercase();
+            match pole_loop_note(spec, inputs, p, |stored| lower.contains(&format!("'{}'", stored.to_lowercase()))) {
+                Some(note) => Err(format!("{}. {note}", e.trim_end_matches(['.', ' ']))),
+                None => Err(e),
+            }
         }
     }
 }
@@ -647,51 +649,46 @@ fn reads_all_rows(tool: &str, param: &str) -> bool {
 }
 
 /// What a tool's vector inputs hold that it can't read as areas: rings that loop around a pole
-/// without being cut at ±180° (#1354), one notice per layer with a count, for the tools that read
-/// areas in the analysis plane ([`READ_AREAS_IN_THE_PLANE`]), which takes longitude and latitude
-/// as x and y and so doesn't see the area such a ring goes around. The rows counted are those the
-/// tool reads: the layer's selection, or every row without one or where the tool reads them all
-/// ([`reads_all_rows`]). The walk over their vertices looks at Cancel between features, and stops
-/// there; a run canceled meanwhile is refused by [`run_under`] all the same. Each note comes with
-/// the name its layer was given by.
-fn pole_loop_notes(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Vec<(String, String)> {
+/// without being cut at ±180° (#1354), in one notice with a count naming each layer that has
+/// them, for the tools that read areas in the analysis plane ([`READ_AREAS_IN_THE_PLANE`]), which
+/// takes longitude and latitude as x and y and so doesn't see the area such a ring goes around.
+/// Only the layers whose stored name `read` accepts are read. The rows counted are those the tool
+/// reads, each once: the layer's selection, or every row without one or where the tool reads them
+/// all ([`reads_all_rows`]). The walk over their vertices looks at Cancel between features, and
+/// stops there; a run canceled meanwhile is refused by [`run_under`] all the same.
+fn pole_loop_note(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value, read: impl Fn(&str) -> bool) -> Option<String> {
     if !READ_AREAS_IN_THE_PLANE.contains(&spec.id) {
-        return Vec::new();
+        return None;
     }
     let mut seen: Vec<&rustgis_data::Dataset> = Vec::new();
-    let mut notes = Vec::new();
-    let params = spec
-        .params
-        .iter()
-        .filter(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::VectorLayer | ParamKind::VectorLayers));
+    let (mut layers, mut rings, mut features) = (Vec::new(), 0usize, 0usize);
+    let params = spec.params.iter().filter(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::VectorLayer));
     for param in params {
-        // One layer, or several as a list or names separated by `;`.
-        let names: Vec<&str> = match (&param.kind, p.get(param.name)) {
-            (ParamKind::VectorLayers, Some(v)) => layer_list(v).unwrap_or_default(),
-            (_, Some(Value::String(name))) => vec![name.as_str()],
-            _ => continue,
+        let Some(name) = p.get(param.name).and_then(Value::as_str) else { continue };
+        let Some(ds) = inputs.dataset(name) else { continue };
+        // A layer given twice, by one name or two, is read once.
+        if seen.iter().any(|s| std::ptr::eq(*s, ds)) || !read(&ds.name) {
+            continue;
+        }
+        seen.push(ds);
+        let selected = inputs.selection(name);
+        let rows: Box<dyn Iterator<Item = usize>> = if selected.is_empty() || reads_all_rows(spec.id, param.name) {
+            Box::new(0..ds.features.len())
+        } else {
+            let mut rows = selected.to_vec();
+            rows.sort_unstable();
+            rows.dedup();
+            Box::new(rows.into_iter())
         };
-        for name in names {
-            let Some(ds) = inputs.dataset(name) else { continue };
-            // A layer given twice, by one name or two, is said once.
-            if seen.iter().any(|s| std::ptr::eq(*s, ds)) {
-                continue;
-            }
-            seen.push(ds);
-            let selected = inputs.selection(name);
-            let geometries = |rows: &mut dyn Iterator<Item = usize>| -> Option<String> {
-                let read = rows.take_while(|_| control::check().is_ok());
-                rustgis_data::pole_loop_message(name, read.filter_map(|r| ds.features.get(r).and_then(|f| f.geometry.as_ref())))
-            };
-            let note = if selected.is_empty() || reads_all_rows(spec.id, param.name) {
-                geometries(&mut (0..ds.features.len()))
-            } else {
-                geometries(&mut selected.iter().copied())
-            };
-            notes.extend(note.map(|n| (name.to_string(), n)));
+        let geometries = rows.take_while(|_| control::check().is_ok()).filter_map(|r| ds.features.get(r).and_then(|f| f.geometry.as_ref()));
+        let (r, f) = rustgis_data::pole_loop_count(geometries);
+        if r > 0 {
+            layers.push(ds.name.as_str());
+            rings += r;
+            features += f;
         }
     }
-    notes
+    rustgis_data::pole_loop_message(&layers, rings, features)
 }
 
 /// Validates the rows a pole-aware tool reads, on either execution path.

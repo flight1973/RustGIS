@@ -7833,8 +7833,33 @@ mod tests {
         let all = Ci(HashMap::from([("loop".to_string(), caps.clone()), ("pts".to_string(), pts.clone())]), vec![]);
         let r = crate::run("spatialJoin", &all, &serde_json::json!({"target": "Loop", "join": "loop"})).unwrap();
         let said: Vec<&String> = r.messages.iter().filter(|t| about(t)).collect();
+        assert_eq!(
+            said,
+            [
+                "'loop': 2 rings in 2 features go around a pole without reaching it, each step in longitude taken the short way; the analysis reads longitude and latitude as x and y, so it doesn't see the area they enclose (along one parallel, none at all); if they go around the pole on purpose, cut them at ±180° and close them along the pole"
+            ]
+        );
+        // Two layers with loops: one notice naming both, with their counts together.
+        let mut more = caps.clone();
+        more.name = "more".into();
+        let two = Ci(HashMap::from([("loop".to_string(), caps.clone()), ("more".to_string(), more)]), vec![]);
+        let r = crate::run("union", &two, &serde_json::json!({"input": "loop", "overlay": "more"})).unwrap();
+        let said: Vec<&String> = r.messages.iter().filter(|t| about(t)).collect();
         assert_eq!(said.len(), 1, "{:?}", r.messages);
-        assert!(said[0].starts_with("'Loop': 2 rings in 2 features go around a pole"), "{said:?}");
+        assert!(said[0].starts_with("'loop' and 'more': 4 rings in 4 features go around"), "{said:?}");
+        // A row selected twice is read, and counted, once.
+        let twice = Ci(HashMap::from([("loop".to_string(), caps.clone())]), vec![0, 0]);
+        let r = crate::run("featureToPoint", &twice, &serde_json::json!({"input": "loop"})).unwrap();
+        assert!(r.messages.iter().any(|t| about(t) && t.contains("1 ring in 1 feature")), "{:?}", r.messages);
+        // Clip's refusal names the layer as stored: the note joins it however the name was typed.
+        let only_loops = {
+            let mut d = Dataset::new("Loop", GeometryType::Polygon, vec![]);
+            d.push(Some(ring(&lp)), vec![]);
+            d
+        };
+        let typed = Ci(HashMap::from([("Loop".to_string(), only_loops), ("pts".to_string(), pts.clone())]), vec![]);
+        let e = crate::run("clip", &typed, &serde_json::json!({"input": "pts", "clip": "LOOP"})).unwrap_err();
+        assert!(e.contains("'Loop': 1 ring in 1 feature goes around a pole"), "{e}");
         // Only the selected square: a tool reading the selection says nothing; Count Points, which
         // reads every polygon whatever is selected, says what it read.
         let third = Ci(HashMap::from([("loop".to_string(), caps), ("pts".to_string(), pts)]), vec![2]);
