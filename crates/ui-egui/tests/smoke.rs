@@ -4427,9 +4427,9 @@ fn zonal_statistics_shows_available_band_range() {
     assert!(h.get_by_label("Calculate Statistics").accesskit_node().is_disabled());
 }
 
-/// By Coordinates… opens on the map's center as `lat, lon`, and Go reads its one box as the
-/// search box does: MGRS here; a reference that names no place keeps the dialog open with the
-/// reason.
+/// By Coordinates… opens on the map's center in its Longitude (X) and Latitude (Y) boxes, each of
+/// which takes degrees, minutes and seconds; a grid reference goes in place of both, and one that
+/// names no place, or a scale it can't use, keeps the dialog open with the reason.
 #[test]
 fn by_coordinates_reads_x_y_and_a_grid_reference() {
     let mut h = harness();

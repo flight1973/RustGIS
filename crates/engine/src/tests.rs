@@ -45430,6 +45430,13 @@ fn go_to_xy_reads_a_position_as_the_search_box_does() {
     assert!(axis_refused(&mut s, "-74W", "40").contains("both a minus sign"));
     assert!(axis_refused(&mut s, "74", "91 N").contains("within ±90"));
     assert!(axis_refused(&mut s, "Paris", "40").contains("write the longitude"));
+    // A decimal comma or a pasted pair in one box is refused, not read as degrees and minutes.
+    assert!(axis_refused(&mut s, "2,35", "48").contains("one value"));
+    assert!(axis_refused(&mut s, "48.85, 2.35", "48").contains("one value"));
+    assert!(axis_refused(&mut s, "48.85 2.35", "48").contains("write the longitude"));
+    // Typographic quotes, as pasted from a document, are marks like any other.
+    s.run("map.goToXY", &json!({"lon": "74°0’22”W", "lat": "40°42’46”N"})).unwrap();
+    assert_eq!(at(&s), (40.713, -74.006));
     assert!(axis_refused(&mut s, &"9".repeat(500), "40").contains("longer than"));
     // Numbers still go as before.
     s.run("map.goToXY", &json!({"lon": 10, "lat": 50})).unwrap();

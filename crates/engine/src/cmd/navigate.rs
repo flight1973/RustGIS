@@ -345,7 +345,7 @@ pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, PositionRea
     }
     if let Some(c) = super::search::parse_lat_lon(text) {
         // Without N, S, E or W the order is the reader's assumption, so it is said.
-        let lettered = text.chars().any(char::is_alphabetic);
+        let lettered = text.chars().any(|c| matches!(c.to_ascii_uppercase(), 'N' | 'S' | 'E' | 'W'));
         return Ok((c, if lettered { PositionRead::AsWritten } else { PositionRead::Ordered }));
     }
     // Two plain decimal numbers (`40.7, 200`) that aren't a latitude and a longitude: out of
@@ -426,7 +426,11 @@ pub(crate) fn read_axis(text: &str, latitude: bool) -> Result<f64, String> {
             rest = if at_end { rest.get(..rest.len().saturating_sub(1)) } else { rest.get(1..) }.unwrap_or("").trim();
         }
     }
-    let marks = |c: char| c.is_whitespace() || matches!(c, '°' | 'º' | '\'' | '′' | '"' | '″' | ',');
+    // One value a box: a comma is a decimal comma or a second value, neither of which is read here.
+    if rest.contains(',') {
+        return Err(format!("the {name} box takes one value, with a point for decimals (-74.006, not -74,006 or two numbers)"));
+    }
+    let marks = |c: char| c.is_whitespace() || matches!(c, '°' | 'º' | '\'' | '′' | '’' | '"' | '″' | '”');
     let parts: Vec<&str> = rest.split(marks).filter(|w| !w.is_empty()).collect();
     let usage = || format!("write the {name} in degrees (-74.006) or degrees, minutes and seconds (74°0′22″W)");
     if parts.is_empty() || parts.len() > 3 {
@@ -441,6 +445,11 @@ pub(crate) fn read_axis(text: &str, latitude: bool) -> Result<f64, String> {
         nums.push(v);
     }
     let (d, ms) = nums.split_first().ok_or_else(usage)?;
+    // Minutes follow whole degrees and seconds whole minutes (`48.85 2.35` is two values, not
+    // degrees and minutes).
+    if nums.iter().rev().skip(1).any(|v| v.fract() != 0.0) {
+        return Err(usage());
+    }
     if ms.iter().any(|v| !(0.0..60.0).contains(v)) {
         return Err(format!("the {name}'s minutes and seconds must be from 0 to under 60"));
     }
@@ -474,7 +483,7 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
     };
     let given = |k: &str| !matches!(p.get(k), None | Some(Value::Null));
     // What the reading assumed is said once the map has moved there, not before a refusal.
-    let (lon, lat, square) = if let Some(text) = position {
+    let (lon, lat, notice) = if let Some(text) = position {
         if ["lon", "lat", "x", "y"].iter().any(|k| given(k)) {
             return Err("give a position or lon and lat, not both".into());
         }
@@ -535,7 +544,7 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
     }
     m.camera.clamp();
     s.record_extent();
-    if let Some(said) = square {
+    if let Some(said) = notice {
         s.notify_text(said, false);
     }
     Ok(Value::Null)
