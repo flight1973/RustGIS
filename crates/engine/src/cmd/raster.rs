@@ -565,7 +565,7 @@ pub(crate) fn say_losses(s: &mut Session, losses: Vec<(String, String)>) {
 pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, scan: bool) -> CmdResult {
     let mut r = match super::reads::take(s, &read_key(path)) {
         Some(r) => r,
-        None => read_raster(path),
+        None => read_raster_as(path, scan),
     }?;
     if scan {
         r = r.into_scan().map_err(|e| format!("{path}: {e}"))?;
@@ -577,9 +577,11 @@ pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, scan: bool) -> 
     add_raster(s, &name, RasterLayer::from_path(r, full))
 }
 
-/// The raster at `path`, read whole.
-pub(crate) fn read_raster(path: &str) -> Result<Raster, String> {
-    raster::read_path(Path::new(path)).map_err(|e| format!("{path}: {e}"))
+/// The raster at `path`, read whole; for a `scan`, as the file holds it, without the world file
+/// beside it (#2075).
+pub(crate) fn read_raster_as(path: &str, scan: bool) -> Result<Raster, String> {
+    let read = if scan { raster::read_path_unplaced(Path::new(path)) } else { raster::read_path(Path::new(path)) };
+    read.map_err(|e| format!("{path}: {e}"))
 }
 
 /// The key [`add_path`]'s read of `path` is taken by (see [`super::reads`]).

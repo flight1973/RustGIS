@@ -48,6 +48,11 @@ pub struct RasterLayer {
     /// was laid over when added, so it is laid there again when the project opens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<[f64; 4]>,
+    /// Added as a scan (with no coordinates, or `"as": "scan"`): reopened as one, as the file
+    /// holds it, so a world file beside it, there now or later, doesn't place or resample it
+    /// (#2075).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scan: bool,
     pub style: RasterStyle,
     /// The pixels; `None` when the source couldn't be read.
     #[serde(skip)]
@@ -222,7 +227,7 @@ impl RasterLayer {
             return Err("give a raster file or Zarr store on this computer: web addresses aren't repaired here".into());
         }
         let sub = subdataset.or(self.subdataset.as_deref());
-        let r = rustgis_data::raster::read_path_with(std::path::Path::new(path), sub, self.crs.as_deref())
+        let r = read_source(path, sub, self.crs.as_deref(), self.scan)
             .and_then(|r| placed(r, self.placement))
             .map_err(|e| format!("{path}: {e}"))?;
         self.validate_replacement(&r, path)?;
@@ -237,6 +242,7 @@ impl RasterLayer {
             crs: self.crs.clone(),
             time_zarr: None,
             placement: self.placement,
+            scan: self.scan,
             style,
             data: Some(Arc::new(r)),
             error: None,
@@ -286,6 +292,7 @@ impl RasterLayer {
             crs: None,
             time_zarr: None,
             placement: None,
+            scan: !raster.georeferenced,
             style,
             data: Some(Arc::new(raster)),
             error: None,
@@ -318,6 +325,7 @@ impl RasterLayer {
             crs: None,
             time_zarr: None,
             placement: None,
+            scan: !raster.georeferenced,
             style,
             data: Some(Arc::new(raster)),
             error: None,
@@ -355,6 +363,7 @@ impl RasterLayer {
             crs: None,
             time_zarr: None,
             placement: None,
+            scan: false,
             style: RasterStyle::placeholder(),
             data: None,
             error: None,
@@ -554,7 +563,7 @@ impl RasterLayer {
         let r = if let Some(bytes) = &self.embedded {
             rustgis_data::raster::read_bytes(self.file_name.as_deref().unwrap_or("raster.tif"), bytes)
         } else if let Some(p) = &self.path {
-            rustgis_data::raster::read_path_with(std::path::Path::new(p), self.subdataset.as_deref(), self.crs.as_deref())
+            read_source(p, self.subdataset.as_deref(), self.crs.as_deref(), self.scan)
         } else {
             return Err("the raster has no source".into());
         };
@@ -1086,6 +1095,13 @@ fn start_light(r: Arc<Raster>, key: LightKey, work: Arc<LightWork>) {
 }
 
 /// Reapplies a scan's placement to pixels read again, without copying their bands.
+/// A raster layer's file read again: a scan as the file holds it, without the world file beside it
+/// (#2075), anything else as [`rustgis_data::raster::read_path_with`] reads it.
+fn read_source(path: &str, subdataset: Option<&str>, crs: Option<&str>, scan: bool) -> rustgis_data::Result<Raster> {
+    let p = std::path::Path::new(path);
+    if scan { rustgis_data::raster::read_path_unplaced(p) } else { rustgis_data::raster::read_path_with(p, subdataset, crs) }
+}
+
 fn placed(mut raster: Raster, placement: Option<[f64; 4]>) -> rustgis_data::Result<Raster> {
     if let Some(bbox) = placement {
         if raster.georeferenced {
@@ -2276,6 +2292,7 @@ impl RasterLayer {
             crs: _,
             time_zarr,
             placement: _,
+            scan: _,
             style: _,
             data: _,
             error: _,

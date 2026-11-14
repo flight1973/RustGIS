@@ -1660,6 +1660,7 @@ pub(super) fn read_limited_with_nodata(
         let mut r = Raster::new(name, w, h, bands, super::unreferenced(w, h), Crs::LonLat, geo.nodata, color, data_type)?;
         r.georeferenced = false;
         r.overview = overview;
+        r.step = decimate_by.max(1);
         r.rounded = rounded;
         r.copyright = copyright.filter(|c| !c.is_empty());
         r.lost.extend(copyright_lost);
@@ -1714,6 +1715,8 @@ pub(super) fn read_limited_with_nodata(
     };
     let mut r = Raster::new(name, w, h, bands, transform, crs, geo.nodata, color, data_type)?;
     r.overview = overview;
+    // A turned image is resampled to a grid of its own: its pixels are no longer the file's.
+    r.step = if geo.affine.is_none() { decimate_by.max(1) } else { 1 };
     r.rounded = rounded;
     r.copyright = copyright.filter(|c| !c.is_empty());
     r.lost.extend(copyright_lost);

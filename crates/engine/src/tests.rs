@@ -29060,16 +29060,16 @@ fn a_failed_multi_file_add_leaves_the_map_as_it_was() {
     assert!(crate::cmd::catalogs::area(&s, &json!({"bbox": [200.0, 0.0, 10.0, 1.0]})).unwrap_err().contains("antimeridian"));
 }
 
-/// Geotagged photos: a folder of them becomes a point layer with each photo's time, camera and
-/// thumbnail; photos without a position are named, not added; an upload joins the Photos layer;
-/// a project keeps the thumbnails.
+/// World files (#2075): a JPEG a `.jgw` and a `.prj` place opens as a placed raster, not a photo;
+/// a camera JPEG with a stray world file and no `.prj` stays a photo; `"as": "scan"` ignores the
+/// world file, and a scan reopened from a project stays one.
 #[test]
 fn a_jpeg_with_a_world_file_opens_placed_not_as_a_photo() {
-    // #2075: a JPEG with a `.jgw` (and a `.prj`) beside it is a raster placed by them; without
-    // them it would join the photo layer.
+    use rustgis_data::photo;
     let dir = std::env::temp_dir().join(format!("rustgis-jgw-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let path = |f: &str| dir.join(f).display().to_string();
     image::RgbImage::from_pixel(8, 4, image::Rgb([200, 100, 50])).save(dir.join("aerial.jpg")).unwrap();
     std::fs::write(dir.join("aerial.jgw"), "0.25\n0\n0\n-0.25\n-96.875\n33.125\n").unwrap();
     std::fs::write(
@@ -29078,16 +29078,37 @@ fn a_jpeg_with_a_world_file_opens_placed_not_as_a_photo() {
     )
     .unwrap();
     let mut s = Session::new(Project::default());
-    s.run("layer.addData", &json!({"path": dir.join("aerial.jpg").display().to_string()})).unwrap();
+    s.run("layer.addData", &json!({"path": path("aerial.jpg")})).unwrap();
     assert!(s.map().layer_by_name("Photos").is_none());
     let l = s.map().layer_by_name("aerial").unwrap();
     let r = l.raster.as_ref().and_then(|r| r.data.as_ref()).unwrap();
     assert!(r.georeferenced);
     let e = r.extent();
     assert!((e.min_x + 97.0).abs() < 1e-9 && (e.max_y - 33.25).abs() < 1e-9, "{e:?}");
+
+    // A camera's photo with a stray world file and no `.prj` stays a photo, at its GPS position.
+    std::fs::write(dir.join("camera.jpg"), photo::example(true, (43.4674, "N"), (11.8851, "E"))).unwrap();
+    std::fs::write(dir.join("camera.wld"), "1\n0\n0\n-1\n0\n0\n").unwrap();
+    s.run("layer.addData", &json!({"path": path("camera.jpg")})).unwrap();
+    assert_eq!(s.map().layer_by_name("Photos").map(|l| l.dataset.features.len()), Some(1));
+
+    // As a scan, the world file is passed over; the project reopens it as one.
+    let mut t = Session::new(Project::default());
+    t.run("layer.addData", &json!({"path": path("aerial.jpg"), "as": "scan", "name": "scan"})).unwrap();
+    let scan = |t: &Session| {
+        t.map().layer_by_name("scan").and_then(|l| l.raster.as_ref()).map(|r| (r.scan, r.data.as_ref().map(|d| d.georeferenced)))
+    };
+    assert_eq!(scan(&t), Some((true, Some(false))));
+    let text = serde_json::to_string(&t.project).unwrap();
+    let mut u = Session::new(Project::default());
+    u.run("project.openText", &json!({"text": text})).unwrap();
+    assert_eq!(scan(&u), Some((true, Some(false))));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Geotagged photos: a folder of them becomes a point layer with each photo's time, camera and
+/// thumbnail; photos without a position are named, not added; an upload joins the Photos layer;
+/// a project keeps the thumbnails.
 #[test]
 fn geotagged_photos_become_a_photo_layer() {
     use base64::Engine;

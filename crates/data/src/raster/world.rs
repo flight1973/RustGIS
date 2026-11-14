@@ -86,17 +86,23 @@ pub fn names(path: &Path) -> Vec<PathBuf> {
 
 /// The world file beside `path`, if there is one: its path and what reading it gave.
 pub fn beside(path: &Path) -> Option<(PathBuf, Result<WorldFile, String>)> {
-    let found = names(path).into_iter().find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))?;
-    let read = match std::fs::metadata(&found) {
-        Ok(m) if m.len() > MAX_BYTES => Err("it is too large to be a world file".to_string()),
-        _ => std::fs::read_to_string(&found).map_err(|e| e.to_string()).and_then(|t| WorldFile::parse(&t)),
+    let (found, len) = names(path).into_iter().find_map(|p| match std::fs::metadata(&p) {
+        Ok(m) if m.is_file() => Some((p, m.len())),
+        _ => None,
+    })?;
+    let read = if len > MAX_BYTES {
+        Err("it is too large to be a world file".to_string())
+    } else {
+        std::fs::read_to_string(&found).map_err(|e| e.to_string()).and_then(|t| WorldFile::parse(&t))
     };
     Some((found, read))
 }
 
-/// Whether a world file is beside `path`, whether or not it can be read.
-pub fn is_beside(path: &Path) -> bool {
-    names(path).iter().any(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+/// Whether the picture at `path` is placed by a world file: one beside it can be read, and a
+/// `.prj` beside it says the coordinate system. (A JPEG so placed opens as a raster, not as a
+/// photo; a stray world file, or one without a `.prj`, leaves it a photo.)
+pub fn places(path: &Path) -> bool {
+    matches!(beside(path), Some((_, Ok(_)))) && std::fs::metadata(path.with_extension("prj")).is_ok_and(|m| m.is_file())
 }
 
 #[cfg(test)]
@@ -142,7 +148,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rustgis-world-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let pic = dir.join("p.png");
-        assert!(beside(&pic).is_none() && !is_beside(&pic));
+        assert!(beside(&pic).is_none() && !places(&pic));
         std::fs::write(dir.join("p.wld"), "1\n0\n0\n-1\n0.5\n9.5\n").unwrap();
         let (found, read) = beside(&pic).unwrap();
         assert_eq!(found.extension().unwrap(), "wld");
@@ -212,6 +218,91 @@ mod tests {
         let e = r.extent();
         assert!((e.min_x - 10.0).abs() < 1e-9 && (e.max_x - 12.0).abs() < 1e-9, "{e:?}");
         assert!((e.min_y - 46.0).abs() < 1e-9 && (e.max_y - 50.0).abs() < 1e-9, "{e:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_world_file_that_cant_place_it_leaves_a_scan_never_an_error() {
+        let dir = picture("fallback");
+        // UTM numbers in a file whose .prj says longitude/latitude: nowhere to draw it.
+        std::fs::write(dir.join("p.pgw"), "1\n0\n0\n-1\n500000\n7000000\n").unwrap();
+        std::fs::write(dir.join("p.prj"), PRJ).unwrap();
+        let r = crate::raster::read_path(&dir.join("p.png")).unwrap();
+        assert!(!r.georeferenced && (r.width, r.height) == (4, 2));
+        assert!(
+            r.lost.iter().any(|m| m.contains("p.pgw") && m.contains("isn't used") && m.contains("without coordinates")),
+            "{:?}",
+            r.lost
+        );
+        // A .prj RustGIS refuses (another body's system it can't read): still a scan, said.
+        std::fs::write(dir.join("p.pgw"), "0.5\n0\n0\n-0.5\n10.25\n49.75\n").unwrap();
+        std::fs::write(
+            dir.join("p.prj"),
+            r#"PROJCS["Mars_X",GEOGCS["Mars 2000",DATUM["D_Mars_2000",SPHEROID["Mars_2000_IAU_IAG",3396190.0,169.8944472]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Hotine_Oblique_Mercator"],UNIT["Meter",1.0]]"#,
+        )
+        .unwrap();
+        let r = crate::raster::read_path(&dir.join("p.png")).unwrap();
+        assert!(!r.georeferenced, "{:?}", r.lost);
+        assert!(r.lost.iter().any(|m| m.contains("p.pgw")), "{:?}", r.lost);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_projected_world_file_is_placed_in_its_prj_system() {
+        let dir = picture("utm");
+        // UTM zone 33N meters: 10 m pixels, the top-left pixel's center at (500005, 5299995).
+        std::fs::write(dir.join("p.pgw"), "10\n0\n0\n-10\n500005\n5299995\n").unwrap();
+        std::fs::write(
+            dir.join("p.prj"),
+            r#"PROJCS["WGS_1984_UTM_Zone_33N",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",15.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]"#,
+        )
+        .unwrap();
+        let r = crate::raster::read_path(&dir.join("p.png")).unwrap();
+        assert!(r.georeferenced, "{:?}", r.lost);
+        assert_eq!((r.transform.origin_x, r.transform.origin_y), (500000.0, 5300000.0));
+        // On the central meridian, about 47.8° N.
+        let e = r.extent();
+        assert!((e.min_x - 15.0).abs() < 0.01 && (e.max_y - 47.84).abs() < 0.05, "{e:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_unplaced_the_world_file_is_passed_over() {
+        let dir = picture("unplaced");
+        std::fs::write(dir.join("p.wld"), "0\n-1\n-1\n0\n11.5\n49.5\n").unwrap();
+        std::fs::write(dir.join("p.prj"), PRJ).unwrap();
+        let r = crate::raster::read_path_unplaced(&dir.join("p.png")).unwrap();
+        // The file's pixels, not turned, and nothing said of a world file it wasn't asked to use.
+        assert!(!r.georeferenced && (r.width, r.height) == (4, 2) && r.lost.is_empty(), "{:?}", r.lost);
+        assert!(places(&dir.join("p.png")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_picture_read_at_every_second_pixel_keeps_exact_pixel_sizes() {
+        // 101 × 3 read at every second pixel: 51 × 2 pixels, each exactly two of the file's (not
+        // 101/51 of them).
+        let mut png = Vec::new();
+        image::GrayImage::from_pixel(101, 3, image::Luma([9]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let r = super::super::read_scan_limited("p", std::io::Cursor::new(png), 300).unwrap();
+        assert_eq!((r.width, r.height, r.step, r.overview), (51, 2, 2, Some((101, 3))));
+        let wf = WorldFile::parse("1\n0\n0\n-1\n0.5\n9.5\n").unwrap();
+        let r = r.placed_by_world_file(&wf, crate::raster::Crs::LonLat).map_err(|(_, e)| e).unwrap();
+        assert_eq!((r.transform.origin_x, r.transform.origin_y, r.transform.pixel_width, r.transform.pixel_height), (0.0, 10.0, 2.0, -2.0));
+    }
+
+    #[test]
+    fn a_turned_scan_keeps_its_bands_classes_and_names() {
+        let dir = picture("classes");
+        let mut r = crate::raster::read_path_unplaced(&dir.join("p.png")).unwrap();
+        r.bands[0].name = "landcover".into();
+        r.bands[0].classes = vec!["water".into(), "forest".into()];
+        let wf = WorldFile::parse("0\n-1\n-1\n0\n11.5\n49.5\n").unwrap();
+        let r = r.placed_by_world_file(&wf, crate::raster::Crs::LonLat).map_err(|(_, e)| e).unwrap();
+        assert_eq!((r.width, r.height), (2, 4));
+        assert_eq!((r.bands[0].name.as_str(), r.bands[0].classes.len()), ("landcover", 2));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

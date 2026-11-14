@@ -622,6 +622,10 @@ pub struct Raster {
     pub source: Option<String>,
     /// Whether the pixels come from a reduced-resolution overview.
     pub overview: Option<(u32, u32)>,
+    /// With `overview`, whether the pixels are every `step`-th of the file's, from its top-left
+    /// corner (a picture too large to read whole): each then spans exactly `step` of its pixels,
+    /// where an overview's span its size over the file's. 1 otherwise.
+    pub step: u32,
     /// `false` for a scan (a TIFF with no GeoTIFF tags, a PNG, a JPEG): `transform` is then only
     /// a stand-in until the picture is placed or georeferenced, and says nothing about the ground.
     pub georeferenced: bool,
@@ -816,6 +820,7 @@ impl Raster {
             data_type,
             source: None,
             overview: None,
+            step: 1,
             georeferenced: true,
             lost: Vec::new(),
             rounded: Vec::new(),
@@ -1052,42 +1057,84 @@ impl Raster {
         Ok(())
     }
 
-    /// A scan placed by its world file, in `crs`: georeferenced. The world file speaks of the
-    /// file's pixels, so a scan read at a reduced size (`overview`) keeps its place with pixels
-    /// as much larger. A rotated, skewed or mirrored one is resampled north up, as a rotated
-    /// GeoTIFF is.
-    pub fn placed_by_world_file(self, wf: &world::WorldFile, crs: Crs) -> Result<Raster> {
-        if self.georeferenced {
-            return Err(DataError::Format("only a raster with no coordinates can be placed".into()));
+    /// How many of the file's pixels one pixel read spans, across and down: exactly `step` for
+    /// every `step`-th pixel, an overview's size over the file's, else 1.
+    fn file_pixels(&self) -> (f64, f64) {
+        if self.step > 1 {
+            return (f64::from(self.step), f64::from(self.step));
         }
         let (full_w, full_h) = self.overview.unwrap_or((self.width, self.height));
-        let (sx, sy) = (f64::from(full_w) / f64::from(self.width.max(1)), f64::from(full_h) / f64::from(self.height.max(1)));
+        (f64::from(full_w) / f64::from(self.width.max(1)), f64::from(full_h) / f64::from(self.height.max(1)))
+    }
+
+    /// A scan placed by its world file, in `crs`: georeferenced. The world file speaks of the
+    /// file's pixels, so a scan read at a reduced size keeps its place with pixels as much
+    /// larger. A rotated, skewed or mirrored one is resampled north up, as a rotated GeoTIFF is,
+    /// keeping its bands' names, classes and wavelengths. When it can't be placed (it would lie
+    /// nowhere it can be drawn, or be too large turned), the scan comes back unchanged with why.
+    pub fn placed_by_world_file(mut self, wf: &world::WorldFile, crs: Crs) -> std::result::Result<Raster, (Box<Raster>, String)> {
+        if self.georeferenced {
+            return Err((Box::new(self), "only a raster with no coordinates can be placed".into()));
+        }
+        let transformer = match crs.transformer() {
+            Ok(t) => t,
+            Err(e) => return Err((Box::new(self), e)),
+        };
+        let (sx, sy) = self.file_pixels();
         let [x0, xc, xr, y0, yc, yr] = wf.affine();
-        let transformer = crs.transformer().map_err(DataError::Format)?;
+        let affine = [x0, xc * sx, xr * sy, y0, yc * sx, yr * sy];
+        // Where it would lie, checked on the box of its corners before anything changes.
+        let (fw, fh) = (f64::from(self.width), f64::from(self.height));
+        let corners = [(0.0, 0.0), (fw, 0.0), (0.0, fh), (fw, fh)]
+            .map(|(c, r)| (affine[0] + c * affine[1] + r * affine[2], affine[3] + c * affine[4] + r * affine[5]));
+        let (min_x, max_x) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), (x, _)| (a.min(*x), b.max(*x)));
+        let (min_y, max_y) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), (_, y)| (a.min(*y), b.max(*y)));
+        let boxed = GeoTransform {
+            origin_x: min_x,
+            origin_y: max_y,
+            pixel_width: (max_x - min_x) / fw.max(1.0),
+            pixel_height: -(max_y - min_y) / fh.max(1.0),
+        };
+        let before = (self.transform, std::mem::replace(&mut self.transformer, transformer.clone()));
+        self.transform = boxed;
+        let extent = self.compute_extent();
+        (self.transform, self.transformer) = before;
+        // In a geographic system, corners past the poles or at longitudes no wrapping explains are
+        // numbers in another system than the .prj says (UTM meters with a longitude/latitude
+        // .prj). The extent can't show it: it clamps latitudes and wraps longitudes.
+        let on_earth = !transformer.is_geographic() || (min_y >= -90.5 && max_y <= 90.5 && min_x >= -540.0 && max_x <= 540.0);
+        if !boxed.is_valid() || extent.is_empty() || !on_earth {
+            return Err((Box::new(self), format!("it places the picture nowhere it can be drawn in {}", crs.label())));
+        }
         let mut r = if wf.is_north_up() {
-            let mut r = self;
-            r.transform = GeoTransform { origin_x: x0, origin_y: y0, pixel_width: xc * sx, pixel_height: yr * sy };
-            r
+            self.transform = GeoTransform { origin_x: affine[0], origin_y: affine[3], pixel_width: affine[1], pixel_height: affine[5] };
+            self
         } else {
-            let keep = (self.source.clone(), self.lost.clone(), self.overview, self.copyright.clone());
-            let names: Vec<String> = self.bands.iter().map(|b| b.name.clone()).collect();
-            let data: Vec<Vec<f32>> = self.bands.into_iter().map(|b| b.data).collect();
-            let affine = [x0, xc * sx, xr * sy, y0, yc * sx, yr * sy];
-            let (data, ow, oh, t) = north_up(data, self.width, self.height, affine, max_samples())?;
-            let mut r = Raster::new(self.name, ow, oh, data, t, crs, self.nodata, self.color, self.data_type)?;
-            for (band, name) in r.bands.iter_mut().zip(names) {
-                band.name = name;
+            let data: Vec<Vec<f32>> = self.bands.iter().map(|b| b.data.clone()).collect();
+            let (data, ow, oh, t) = match north_up(data, self.width, self.height, affine, max_samples()) {
+                Ok(turned) => turned,
+                Err(e) => return Err((Box::new(self), e.to_string())),
+            };
+            let mut r = match Raster::new(self.name.clone(), ow, oh, data, t, crs, self.nodata, self.color.clone(), self.data_type.clone())
+            {
+                Ok(r) => r,
+                Err(e) => return Err((Box::new(self), e.to_string())),
+            };
+            // Each band keeps all it was but its pixels and their statistics.
+            for (new, mut old) in r.bands.iter_mut().zip(std::mem::take(&mut self.bands)) {
+                old.data = std::mem::take(&mut new.data);
+                old.stats = new.stats.clone();
+                *new = old;
             }
-            (r.source, r.lost, r.overview, r.copyright) = keep;
+            (r.source, r.lost, r.overview, r.copyright) = (self.source, self.lost, self.overview, self.copyright);
+            (r.rounded, r.rounded_some) = (self.rounded, self.rounded_some);
             r
         };
         r.crs = crs;
         r.transformer = transformer;
         r.georeferenced = true;
+        r.step = 1;
         r.extent = r.compute_extent();
-        if !r.transform.is_valid() || r.extent.is_empty() {
-            return Err(DataError::Format("the world file places the picture nowhere it can be drawn".into()));
-        }
         Ok(r)
     }
 
@@ -1192,8 +1239,20 @@ impl Raster {
     }
 }
 
-/// Reads a raster file by path.
+/// Reads a raster file by path: a picture with a world file beside it placed by it (#2075).
 pub fn read_path(path: &Path) -> Result<Raster> {
+    read_path_placing(path, true)
+}
+
+/// [`read_path`] without the world file beside a picture: the picture as the file holds it, for
+/// one opened as a scan (`"as": "scan"`, or a project's scan reopened), so a world file that is
+/// there, or turns up later, doesn't place or resample it.
+pub fn read_path_unplaced(path: &Path) -> Result<Raster> {
+    read_path_placing(path, false)
+}
+
+/// [`read_path`], applying a picture's world file when `world` is true.
+fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
     // A Zarr store is a folder: its first variable.
     #[cfg(not(target_arch = "wasm32"))]
     if zarr::is_store(path) {
@@ -1262,57 +1321,77 @@ pub fn read_path(path: &Path) -> Result<Raster> {
     if let Some(p) = &pam {
         r.apply_pam(p, pam::SIDECAR);
     }
-    if matches!(ext.as_str(), "tif" | "tiff" | "png" | "jpg" | "jpeg") {
-        r = with_world_file(path, r)?;
+    if world && matches!(ext.as_str(), "tif" | "tiff" | "png" | "jpg" | "jpeg") {
+        r = with_world_file(path, r);
     }
     r.source = Some(path.display().to_string());
     Ok(r)
 }
 
 /// A picture at `path` with the world file beside it applied (#2075). A scan is placed by it, in
-/// the coordinate system of the `.prj` beside it; without one, or with a world file that can't be
-/// read, it stays a scan and says why. A GeoTIFF keeps its own tags, and says so when the world
-/// file places it differently.
-fn with_world_file(path: &Path, mut r: Raster) -> Result<Raster> {
-    let Some((found, read)) = world::beside(path) else { return Ok(r) };
+/// the coordinate system of the `.prj` beside it. Whatever goes wrong (no `.prj`, one that can't
+/// be used, a world file that can't be read, or one that places it nowhere it can be drawn), the
+/// picture still opens as the scan it was, and a notice says why. A GeoTIFF keeps its own tags,
+/// and says so when the world file places it differently.
+fn with_world_file(path: &Path, mut r: Raster) -> Raster {
+    let Some((found, read)) = world::beside(path) else { return r };
     let name = found.file_name().map_or_else(|| found.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let unplaced = "it opens without coordinates";
     let wf = match read {
         Ok(wf) => wf,
         Err(e) => {
-            let then = if r.georeferenced { "the GeoTIFF's own coordinates are used" } else { "it opens without coordinates" };
+            let then = if r.georeferenced { "the GeoTIFF's own coordinates are used" } else { unplaced };
             r.lost.push(format!("the world file {name} can't be read ({e}): {then}"));
-            return Ok(r);
+            return r;
         }
     };
     if r.georeferenced {
         if !world_file_agrees(&r, &wf) {
             r.lost.push(format!("the world file {name} places it differently from the GeoTIFF's own tags, which are used"));
         }
-        return Ok(r);
+        return r;
     }
-    let (crs, note) = sidecar_crs(path)?;
+    let (crs, note) = match sidecar_crs(path) {
+        Ok(found) => found,
+        Err(e) => {
+            r.lost.push(format!("the world file {name} isn't used ({e}): {unplaced}"));
+            return r;
+        }
+    };
     let Some(crs) = crs else {
         let why = note.map_or_else(String::new, |n| format!(" (the .prj file: {n})"));
         r.lost.push(format!(
-            "the world file {name} places it, but no .prj beside it says the coordinate system{why}: it opens without coordinates; put a .prj next to it"
+            "the world file {name} places it, but no .prj beside it says the coordinate system{why}: {unplaced}; put a .prj next to it"
         ));
-        return Ok(r);
+        return r;
     };
-    let mut r = r.placed_by_world_file(&wf, crs).map_err(|e| DataError::Format(format!("the world file {name}: {e}")))?;
-    r.lost.extend(note.map(|n| format!("the .prj file: {n}")));
-    Ok(r)
+    match r.placed_by_world_file(&wf, crs) {
+        Ok(mut r) => {
+            r.lost.extend(note.map(|n| format!("the .prj file: {n}")));
+            r
+        }
+        Err((r, why)) => {
+            let mut r = *r;
+            r.lost.push(format!("the world file {name} isn't used ({why}): {unplaced}"));
+            r
+        }
+    }
 }
 
-/// Whether a world file places a GeoTIFF where its tags do: north up, with the same corner and
-/// pixel size, to a thousandth of a pixel (at the file's resolution).
+/// Whether a world file places a GeoTIFF where its tags do: the same corner and pixel size, to a
+/// thousandth of a pixel (at the file's resolution). A turned world file isn't compared: a turned
+/// GeoTIFF is resampled north up as it is read, so its tags can't be compared with one, and
+/// nothing is claimed.
 fn world_file_agrees(r: &Raster, wf: &world::WorldFile) -> bool {
-    let (full_w, full_h) = r.overview.unwrap_or((r.width, r.height));
-    let (sx, sy) = (f64::from(full_w) / f64::from(r.width.max(1)), f64::from(full_h) / f64::from(r.height.max(1)));
+    if !wf.is_north_up() {
+        return true;
+    }
+    let (sx, sy) = r.file_pixels();
     let t = r.transform;
     let (pw, ph) = (t.pixel_width / sx, t.pixel_height / sy);
     let [x0, xc, _, y0, _, yr] = wf.affine();
     let close = |a: f64, b: f64, unit: f64| (a - b).abs() <= unit.abs() * 1e-3;
-    wf.is_north_up() && close(xc, pw, pw) && close(yr, ph, ph) && close(x0, t.origin_x, pw) && close(y0, t.origin_y, ph)
+    close(xc, pw, pw) && close(yr, ph, ph) && close(x0, t.origin_x, pw) && close(y0, t.origin_y, ph)
 }
 
 /// Reads a raster file, with the GDAL choices a raster GDAL reads may have been added with: its
@@ -1444,6 +1523,7 @@ fn read_scan_limited<R: std::io::BufRead + std::io::Seek>(name: &str, mut source
     let mut r = Raster::new(name, ow, oh, bands, unreferenced(ow, oh), Crs::LonLat, None, color, data_type)?;
     r.georeferenced = false;
     r.overview = (k > 1).then_some((w, h));
+    r.step = k;
     Ok(r)
 }
 
