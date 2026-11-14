@@ -350,7 +350,9 @@ pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, Option<f64>
     // range, not misspelled.
     let plain = |w: &&str| {
         let digits = w.strip_prefix(['-', '+']).unwrap_or(w);
-        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit() || c == '.') && digits.chars().filter(|&c| c == '.').count() <= 1
+        digits.chars().any(|c| c.is_ascii_digit())
+            && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && digits.chars().filter(|&c| c == '.').count() <= 1
     };
     let words: Vec<&str> = text.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()).collect();
     if words.len() == 2 && words.iter().all(plain) {
@@ -402,6 +404,11 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
         return Err("longitude must be within ±180 and latitude within ±90".into());
     }
+    // A scale that can't be used is refused, not dropped.
+    let scale = match p.get("scale") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(f(p, "scale").filter(|s| *s > 0.0).ok_or("scale must be a positive number, such as 50000 for 1:50,000")?),
+    };
     let bearing = match p.get("bearing") {
         None | Some(Value::Null) => None,
         Some(_) => Some(f(p, "bearing").ok_or("bearing must be a number of degrees")?),
@@ -412,7 +419,7 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
     };
     let m = s.map_mut();
     m.camera.center = m.to_map(Coord::new(lon, lat)).ok_or("that point is outside the map's projection")?;
-    if let Some(sc) = f(p, "scale") {
+    if let Some(sc) = scale {
         m.set_scale(sc);
     }
     if let Some(b) = bearing {

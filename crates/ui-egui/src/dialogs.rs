@@ -346,10 +346,10 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 ui.label(egui::RichText::new(hint).weak());
                 close = buttons(app, ui, "Go", |app| {
                     let mut p = json!({"position": app.dialogs.a.trim()});
+                    // The command refuses a scale it can't use.
                     let scale = app.dialogs.c.trim().replace(',', "");
                     if !scale.is_empty() {
-                        let s = scale.parse::<f64>().ok().filter(|s| s.is_finite() && *s > 0.0).ok_or_else(|| tl!("The scale must be a number, such as 50000").to_string())?;
-                        p["scale"] = json!(s);
+                        p["scale"] = json!(scale);
                     }
                     app.run("map.goToXY", p).map(|_| ())
                 });

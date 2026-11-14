@@ -45427,6 +45427,12 @@ fn go_to_xy_reads_a_position_as_the_search_box_does() {
     assert!(refused(&mut s, json!({"position": 40.7})).contains("must be text"));
     assert!(refused(&mut s, json!({"position": "40.7, -74", "lon": 1})).contains("not both"));
     assert!(refused(&mut s, json!({})).contains("lon is required"));
+    // A scale that can't be used is refused, not dropped, whether a position or numbers are given.
+    for scale in [json!("50k"), json!(0), json!(-5), json!(true)] {
+        assert!(refused(&mut s, json!({"position": "40.7, -74", "scale": scale})).contains("scale must be"), "{scale}");
+        assert!(refused(&mut s, json!({"lon": 1, "lat": 1, "scale": scale})).contains("scale must be"), "{scale}");
+    }
+    assert!(refused(&mut s, json!({"position": "., 5"})).contains("write a position as"));
     assert_eq!(at(&s), (50.0, 10.0));
     // On another body degrees still name a place; the Earth's grids don't.
     s.run("map.body", &json!({"name": "Mars"})).unwrap();
