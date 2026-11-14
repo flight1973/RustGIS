@@ -8,7 +8,12 @@
 //! A position may hold more than x and y (TopoJSON specification §2.1.1, which leaves their meaning
 //! open). The first further number (a height or measure) is carried into the rebuilt GeoJSON as is,
 //! neither scaled nor delta-decoded (§2.1.2: the reference implementation copies it), so the
-//! GeoJSON reading counts the features that had one and says it dropped them.
+//! GeoJSON reading counts the features that had one and says it dropped them. (Positions take 24
+//! bytes rather than 16 for it, within the `MAX_COORDS` bound.)
+//!
+//! An arc with a position that can't be read is not read: in a quantized topology every later
+//! position of the arc is a delta from it, so leaving it out would move the rest of the line.
+//! Geometries using it are counted and said, as are collection members left out.
 
 use serde_json::{Map, Value as Json, json};
 
@@ -60,10 +65,12 @@ fn rings_json(r: &[Vec<Pos>]) -> Json {
 }
 
 struct Topology {
-    /// The arcs, decoded to coordinates.
-    arcs: Vec<Vec<Pos>>,
+    /// The arcs, decoded to coordinates; `None` for one with a position that can't be read.
+    arcs: Vec<Option<Vec<Pos>>>,
     transform: Option<([f64; 2], [f64; 2])>,
     budget: usize,
+    /// Members of geometry collections left out, since the last object was read.
+    members_lost: usize,
 }
 
 impl Topology {
@@ -82,11 +89,18 @@ impl Topology {
         for id in ids.as_array()? {
             let i = id.as_i64()?;
             let (k, rev) = if i < 0 { (!i, true) } else { (i, false) };
-            let arc = self.arcs.get(usize::try_from(k).ok()?)?;
+            let arc = self.arcs.get(usize::try_from(k).ok()?)?.as_ref()?;
             self.budget = self.budget.checked_sub(arc.len())?;
             let pts: Vec<Pos> = if rev { arc.iter().rev().copied().collect() } else { arc.clone() };
-            let skip = usize::from(!out.is_empty());
-            out.extend(pts.into_iter().skip(skip));
+            let mut pts = pts.into_iter();
+            // The joint, written once, keeps a further number either arc gives it.
+            if let Some(last) = out.last_mut()
+                && let Some(first) = pts.next()
+                && last[2].is_nan()
+            {
+                last[2] = first[2];
+            }
+            out.extend(pts);
         }
         Some(out)
     }
@@ -113,7 +127,9 @@ impl Topology {
                 json!({"type": ty, "coordinates": polys?.iter().map(|p| rings_json(p)).collect::<Vec<_>>()})
             }
             "GeometryCollection" if depth < 4 => {
-                let gs: Vec<Json> = g.get("geometries")?.as_array()?.iter().filter_map(|x| self.geometry(x, depth + 1)).collect();
+                let members = g.get("geometries")?.as_array()?;
+                let gs: Vec<Json> = members.iter().filter_map(|x| self.geometry(x, depth + 1)).collect();
+                self.members_lost += members.len().saturating_sub(gs.len());
                 json!({"type": ty, "geometries": gs})
             }
             _ => return None,
@@ -139,28 +155,31 @@ pub fn read(file_name: &str, text: &str) -> Result<Vec<(Dataset, ReadReport)>> {
     let mut total = 0usize;
     let mut arcs = Vec::new();
     for a in v.get("arcs").and_then(Json::as_array).map(Vec::as_slice).unwrap_or_default() {
-        let mut pts = Vec::new();
-        let (mut x, mut y) = (0.0f64, 0.0f64);
-        for p in a.as_array().map(Vec::as_slice).unwrap_or_default() {
-            let Some(a) = p.as_array() else { continue };
-            let (Some(px), Some(py)) = (a.first().and_then(Json::as_f64), a.get(1).and_then(Json::as_f64)) else { continue };
-            let pt = match transform {
-                Some(([sx, sy], [tx, ty])) => {
-                    x += px;
-                    y += py;
-                    [x * sx + tx, y * sy + ty, extra(a)]
-                }
-                None => [px, py, extra(a)],
-            };
-            pts.push(pt);
-        }
-        total += pts.len();
+        let positions = a.as_array().map(Vec::as_slice).unwrap_or_default();
+        total += positions.len();
         if total > MAX_COORDS {
             return Err(DataError::Format(format!("{file_name}: too many arc coordinates")));
         }
-        arcs.push(pts);
+        let (mut x, mut y) = (0.0f64, 0.0f64);
+        let pts: Option<Vec<Pos>> = positions
+            .iter()
+            .map(|p| {
+                let a = p.as_array()?;
+                let (px, py) = (a.first()?.as_f64()?, a.get(1)?.as_f64()?);
+                Some(match transform {
+                    Some(([sx, sy], [tx, ty])) => {
+                        x += px;
+                        y += py;
+                        [x * sx + tx, y * sy + ty, extra(a)]
+                    }
+                    None => [px, py, extra(a)],
+                })
+            })
+            .collect();
+        // An arc that isn't an array of positions can't be read either.
+        arcs.push(pts.filter(|_| a.is_array()));
     }
-    let mut topo = Topology { arcs, transform, budget: MAX_COORDS };
+    let mut topo = Topology { arcs, transform, budget: MAX_COORDS, members_lost: 0 };
     let objects = v.get("objects").and_then(Json::as_object).ok_or_else(|| DataError::Format(format!("{file_name}: no objects")))?;
     let mut out = Vec::new();
     for (name, obj) in objects.iter().take(MAX_OBJECTS) {
@@ -169,6 +188,7 @@ pub fn read(file_name: &str, text: &str) -> Result<Vec<(Dataset, ReadReport)>> {
             _ => vec![obj],
         };
         let mut bad = 0usize;
+        topo.members_lost = 0;
         let features: Vec<Json> = members
             .into_iter()
             .map(|g| {
@@ -195,6 +215,12 @@ pub fn read(file_name: &str, text: &str) -> Result<Vec<(Dataset, ReadReport)>> {
         if bad > 0 {
             rep.skipped += bad;
             rep.messages.push(format!("{bad} geometries had arcs that couldn't be read"));
+        }
+        if topo.members_lost > 0 {
+            rep.messages.push(format!(
+                "{} members of geometry collections couldn't be read (an arc that couldn't be read, or nested too deep) and were left out",
+                topo.members_lost
+            ));
         }
         out.push((ds, rep));
     }
@@ -302,6 +328,49 @@ mod tests {
         let null = r#"{"type":"Topology","objects":{"o":{"type":"Point","coordinates":[1,2,null]}},"arcs":[]}"#;
         let (lost, said) = zm_said(null);
         assert!(!lost && said.is_empty(), "{said:?}");
+    }
+
+    #[test]
+    fn a_height_on_a_shared_joint_is_kept() {
+        // Only the second arc's first position, the joint written once, has a height.
+        let text = r#"{"type":"Topology","objects":{"o":{"type":"LineString","arcs":[0,1]}},
+"arcs":[[[0,0],[1,1]],[[1,1,5],[2,2]]]}"#;
+        let (lost, said) = zm_said(text);
+        assert!(lost && said == [crate::zm_note(Some(1))], "{said:?}");
+    }
+
+    #[test]
+    fn an_arc_with_an_unreadable_position_is_not_read() {
+        // Quantized: leaving out the bad delta would move (1,1) to where (x+1, 6) should be.
+        let quantized = r#"{"type":"Topology","transform":{"scale":[1,1],"translate":[0,0]},
+"objects":{"o":{"type":"GeometryCollection","geometries":[{"type":"LineString","arcs":[0]},{"type":"LineString","arcs":[1]}]}},
+"arcs":[[[0,0],["x",5],[1,1]],[[0,0],[1,1]]]}"#;
+        let (ds, rep) = read("q.topojson", quantized).unwrap().remove(0);
+        assert_eq!(rep.skipped, 1);
+        assert!(rep.messages.iter().any(|m| m.contains("arcs that couldn't be read")), "{:?}", rep.messages);
+        assert!(ds.features[0].geometry.is_none());
+        let Some(Geometry::Line(l)) = &ds.features[1].geometry else { panic!() };
+        assert_eq!((l[0][1].x, l[0][1].y), (1.0, 1.0));
+        // Plain coordinates, and an arc that isn't an array: the same.
+        for arcs in [r#"[[[0,0],[null,1],[2,2]]]"#, r#"[5]"#] {
+            let text = format!(r#"{{"type":"Topology","objects":{{"o":{{"type":"LineString","arcs":[0]}}}},"arcs":{arcs}}}"#);
+            let (_, rep) = read("p.topojson", &text).unwrap().remove(0);
+            assert_eq!(rep.skipped, 1, "{arcs}");
+        }
+    }
+
+    #[test]
+    fn collection_members_left_out_are_said() {
+        let text = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[
+{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,2]},{"type":"LineString","arcs":[9]}]}]}},"arcs":[]}"#;
+        let (_, rep) = read("c.topojson", text).unwrap().remove(0);
+        assert!(rep.messages.iter().any(|m| m.starts_with("1 members of geometry collections")), "{:?}", rep.messages);
+        // Counted for each object: a second object without losses says nothing of them.
+        let two = r#"{"type":"Topology","objects":{
+"a":{"type":"GeometryCollection","geometries":[{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,2]},{"type":"LineString","arcs":[9]}]}]},
+"b":{"type":"Point","coordinates":[3,4]}},"arcs":[]}"#;
+        let layers = read("c.topojson", two).unwrap();
+        assert!(layers[1].1.messages.iter().all(|m| !m.contains("members")), "{:?}", layers[1].1.messages);
     }
 
     #[test]
