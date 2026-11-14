@@ -51,7 +51,7 @@ pub fn commands() -> Vec<C> {
         C::new("map.terrain", "Terrain", "View › Scene", terrain).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network)).params(
             r#"{"layer"?: a DEM raster layer (heights in metres; without layer or tiles, and no terrain yet, the active layer when it is a raster) | "tiles"?: elevation tile URL with {z}/{x}/{y}, "encoding"?: "terrarium"|"mapbox" (tiles; default terrarium), "exaggeration"?: 0 to 20 (default 1, or the terrain's), "off"?: true}"#,
         ),
-        C::new("map.exportOrbit", "Export Orbit", "View › Scene", export_orbit).inputs(orbit_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+        C::new("map.exportOrbit", "Export Orbit", "View › Scene", |s, p| super::exports::write_here(s, p, "map.exportOrbit")).inputs(orbit_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"path": "*.gif" | "*.zip" (PNG frames), "frames"?: 1 to 2000 (default 60), "turn"?: degrees the bearing turns by over the frames (default 360, once round; negative turns the other way), "width"?, "height"?: points, 64 to 4096 (default 640 × 400), "dpi"?: 48 to 600 (default 96), "speed"?: milliseconds a GIF frame shows for (default 50; a GIF keeps it to the hundredth of a second)}"#),
         C::new("map.displayType", "Display Type", "View › Options", |s, p| {
@@ -187,27 +187,25 @@ fn orbit_inputs(input: &super::InputContext<'_>, _: &Value) -> Result<super::Inp
     Ok(super::tiles::render_inputs(input.map()))
 }
 
-/// Turns the view about its centre, keeping its scale and pitch, and writes a frame a step as an
-/// animated GIF or a zip of PNGs (the writer `time.export` uses). The view comes back to where
-/// it was however the frames end.
-///
-/// It runs to its end where it is called, the interface's thread in the app, as `time.export`
-/// and `animation.export` do: each frame is drawn from the session's own map, which the camera
-/// turns, while a background export (`exports::IN_BACKGROUND`) reads the session once and draws
-/// without it. Drawing the frames from a copy of the map, with progress and Cancel, is part 2 of
-/// #1916.
-fn export_orbit(s: &mut Session, p: &Value) -> CmdResult {
+/// What an orbit export draws, its parameters checked: [`check_orbit_params`].
+struct Orbit {
+    frames: f64,
+    turn: f64,
+    w: f64,
+    h: f64,
+    dpi: f64,
+    speed: u32,
+}
+
+/// Checks an orbit export's parameters other than its path (each number in its range, and the
+/// pixels within the bound), with nothing drawn or written: the app calls it before its file
+/// picker opens, and [`orbit_work`] before it draws.
+pub fn check_orbit_params(p: &Value) -> Result<(), String> {
+    orbit_params(p).map(|_| ())
+}
+
+fn orbit_params(p: &Value) -> Result<Orbit, String> {
     use super::time::{MAX_FRAMES, MAX_PIXELS};
-    // Files are written by the desktop app; the browser's go through its services.
-    if cfg!(target_arch = "wasm32") {
-        return Err("exporting an orbit needs the desktop app".into());
-    }
-    let path = ps(p, "path").ok_or("path is required (a .gif, or a .zip of PNG frames)")?.to_string();
-    let lower = path.to_ascii_lowercase();
-    let gif = lower.ends_with(".gif");
-    if !gif && !lower.ends_with(".zip") {
-        return Err("path must end in .gif (an animation) or .zip (PNG frames)".into());
-    }
     // A number outside its range is refused, never drawn at the nearest one unsaid.
     let within = |k: &str, default: f64, (least, most): (f64, f64)| match p.get(k) {
         None | Some(Value::Null) => Ok(default),
@@ -234,17 +232,50 @@ fn export_orbit(s: &mut Session, p: &Value) -> CmdResult {
             MAX_PIXELS / 1e6
         ));
     }
+    Ok(Orbit { frames, turn, w, h, dpi, speed })
+}
+
+/// Turns the view about its centre, keeping its scale and pitch, and draws a frame a step as an
+/// animated GIF or a zip of PNGs (the writer `time.export` uses). The frames are drawn from a
+/// copy of the map, so the view never moves: the app draws them on a thread of its own, with a
+/// frame a step of progress and Cancel between frames (`exports::IN_BACKGROUND`), and a script
+/// where it is called (`exports::write_here`). As with Export Map's copy, what a raster read on
+/// the copy left out is said by the session's own landing check (`notice_landed_rasters`, after
+/// each command and on each frame of the app), not frame by frame here.
+pub(crate) fn orbit_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
+    // Files are written by the desktop app; the browser's go through its services.
+    if cfg!(target_arch = "wasm32") {
+        return Err("exporting an orbit needs the desktop app".into());
+    }
+    let path = ps(p, "path").ok_or("path is required (a .gif, or a .zip of PNG frames)")?.to_string();
+    let lower = path.to_ascii_lowercase();
+    let gif = lower.ends_with(".gif");
+    if !gif && !lower.ends_with(".zip") {
+        return Err("path must end in .gif (an animation) or .zip (PNG frames)".into());
+    }
+    let Orbit { frames, turn, w, h, dpi, speed } = orbit_params(p)?;
     let n = frames as usize;
-    let saved = s.map().camera;
-    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::time::frames(s, "The orbit", n, (w, h, dpi), gif.then_some(speed), |s, i| {
-            s.map_mut().camera.set_bearing(orbit_bearing(saved.bearing, turn, i, n));
-        })
-    }));
-    s.map_mut().camera = saved;
-    let bytes = made.map_err(|_| "exporting the orbit failed unexpectedly".to_string())??;
-    rustgis_data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
-    Ok(json!({"path": path, "frames": n, "turn": turn, "bytes": bytes.len()}))
+    let (mut map, view_size) = (s.map().detached(), s.view_size);
+    let start = map.camera.bearing;
+    Ok(Box::new(move || {
+        let mut shadows = Vec::new();
+        let written = (|| {
+            let (made, said) = rustgis_render::shadows_said(|| {
+                super::time::animate(n, gif.then_some(speed), |i| {
+                    map.camera.set_bearing(orbit_bearing(start, turn, i, n));
+                    super::share::png_of(&mut map, view_size, Some(w), Some(h), Some(dpi))
+                })
+            });
+            let bytes = made?;
+            // What the frames said of their cast shadows, once for the export.
+            shadows = super::share::shadow_warnings("The orbit", &said);
+            rustgis_data::io::write_atomic(std::path::Path::new(&path), &bytes).map_err(|e| format!("{path}: {e}"))?;
+            Ok(json!({"path": path, "frames": n, "turn": turn, "bytes": bytes.len()}))
+        })();
+        let warn = rustgis_data::diagnostics::Severity::Warning;
+        let notes = if written.is_ok() { shadows.into_iter().map(|e| (warn, e)).collect() } else { Vec::new() };
+        super::exports::drawn(std::slice::from_ref(&map), notes, written, path)
+    }))
 }
 
 /// One first-person step: a tenth of the view, forward (north), right (east) or up (zooming out).

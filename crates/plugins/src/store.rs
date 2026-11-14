@@ -6,6 +6,7 @@
 //! <data>/plugins/unpacked/<id>/   an installed process plugin's files, where its program runs
 //! <data>/plugins/state.json       {"disabled": [ids], "folders": [plugin folders]}
 //! <data>/plugins/blocklist.json   the registry's blocklist, as last fetched
+//! <data>/plugins/settings/<id>.json  what a plugin remembered (see [`crate::settings`])
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -308,9 +309,15 @@ pub fn install_path(path: &Path) -> Result<Arc<Plugin>, String> {
     Ok(plugin)
 }
 
-/// Uninstalls a plugin: unloads it, deletes its package, or forgets its folder.
+/// Uninstalls a plugin: unloads it, deletes its package, or forgets its folder. What it
+/// remembered (its settings) goes with its package, or when nothing installed remains for the id.
 pub fn uninstall(id: &str) -> Result<(), String> {
     let plugin = crate::get(id).ok_or_else(|| format!("no plugin '{id}'"))?;
+    // The installed package, if there is one, and whether it is the plugin that is loaded.
+    // Uninstalling a development folder that shadows an installed copy leaves the copy, and so
+    // what the copy remembered.
+    let package = dir().map(|d| d.join(format!("{id}.rgplugin"))).filter(|p| p.is_file());
+    let is_package = package.as_ref().is_some_and(|p| p.display().to_string() == plugin.source);
     let mut st = read_state();
     st.folders.retain(|f| *f != plugin.source);
     st.disabled.retain(|d| d != id);
@@ -319,15 +326,26 @@ pub fn uninstall(id: &str) -> Result<(), String> {
     // installed copy leaves the copy).
     write_state(&st)?;
     crate::unload(id);
-    if let Some(d) = dir() {
-        let path = d.join(format!("{id}.rgplugin"));
-        if path.is_file() && path.display().to_string() == plugin.source {
-            std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            if let Some(unpacked) = unpacked_dir(id).filter(|u| u.is_dir()) {
-                std::fs::remove_dir_all(&unpacked).map_err(|e| format!("{}: {e}", unpacked.display()))?;
-            }
-            crate::pyenv::remove(id)?;
+    if let Some(path) = package.as_ref().filter(|_| is_package) {
+        std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    // Its settings go last, once it can't come back and its files are gone. Uninstalling can't be
+    // tried again from here (it is gone), so a step that fails now says where they are when they
+    // stay (a later install of the id would find them).
+    let erase = is_package || package.is_none();
+    let file = dir().map(|d| d.join("settings").join(format!("{id}.json")));
+    let kept = |e: String| match file.as_ref().filter(|f| erase && f.exists()) {
+        Some(f) => format!("{e} (the plugin was uninstalled; its saved settings were kept: remove {} by hand)", f.display()),
+        None => e,
+    };
+    if is_package {
+        if let Some(unpacked) = unpacked_dir(id).filter(|u| u.is_dir()) {
+            std::fs::remove_dir_all(&unpacked).map_err(|e| kept(format!("{}: {e}", unpacked.display())))?;
         }
+        crate::pyenv::remove(id).map_err(kept)?;
+    }
+    if erase {
+        crate::settings::remove(id).map_err(kept)?;
     }
     Ok(())
 }

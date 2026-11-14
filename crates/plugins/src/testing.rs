@@ -20,6 +20,10 @@
 //!   Imagery plugin's would look.
 //! - `q` (echo): returns the request itself, so a test sees what the plugin was sent; its
 //!   `panel` (the panel's values) is then the answer's, and is taken in again.
+//! - `t` (tool host request): what `f` does for a tool request with no layers, whose params start
+//!   at byte 65 (`{"abi":1,"id":"t","kind":"tool","lang":"en","layers":{},"params":…}`): it sends
+//!   its params to RustGIS as a host request and returns the reply as the tool's reply, so a test
+//!   sees what a tool's host answers.
 //!
 //! [`panel_manifest`] declares a panel over `p` and `q`, and [`pick_manifest`] one of picks on
 //! the map over `q`. With a panel, requests carry `panel` before `params`, so `f` reads them only
@@ -66,6 +70,11 @@ const WAT: &str = r#"
       (return (call $reply (i32.const 0) (i32.const 24)))))
     (if (i32.eq (local.get $c) (i32.const 102)) (then
       (local.set $len (call $call (i32.add (local.get $p) (i32.const 56)) (i32.sub (local.get $n) (i32.const 57))))
+      (local.set $buf (call $alloc (local.get $len)))
+      (call $result (local.get $buf))
+      (return (call $reply (local.get $buf) (local.get $len)))))
+    (if (i32.eq (local.get $c) (i32.const 116)) (then
+      (local.set $len (call $call (i32.add (local.get $p) (i32.const 65)) (i32.sub (local.get $n) (i32.const 66))))
       (local.set $buf (call $alloc (local.get $len)))
       (call $result (local.get $buf))
       (return (call $reply (local.get $buf) (local.get $len)))))

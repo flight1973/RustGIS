@@ -1176,6 +1176,72 @@ pub(crate) fn tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Largest custom CA certificate bundle read (`sslrootcert`, `ssl-ca`, `ca`).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const MAX_CA_BYTES: u64 = 1 << 20;
+
+/// How [`read_ca_roots`] treats non-PEM custom CA files.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaDer {
+    /// PEM only (`sslrootcert`).
+    None,
+    /// Single DER certificate when the file extension is `.der` (`ca`).
+    Extension,
+    /// Single DER certificate regardless of extension when no PEM block header is present (`ssl-ca`).
+    Fallback,
+}
+
+/// Reads and validates a custom CA certificate file (`<= 1 MiB`, regular file, valid PEM or single
+/// DER per `der`), never echoing file contents in an error.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn read_ca_roots(label: &str, file: &Path, der: CaDer) -> Result<rustls::RootCertStore> {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    use std::io::Read;
+
+    let bad = |msg: &str| DataError::Format(format!("{label} {}: {msg}", file.display()));
+    let io_err = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::NotFound => bad("no such file"),
+        std::io::ErrorKind::PermissionDenied => bad("permission denied"),
+        _ => bad("couldn't read file"),
+    };
+    let meta = std::fs::metadata(file).map_err(io_err)?;
+    if !meta.is_file() {
+        return Err(bad("not a file"));
+    }
+    if meta.len() > MAX_CA_BYTES {
+        return Err(bad("file is larger than 1 MB"));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    std::fs::File::open(file).map_err(io_err)?.take(MAX_CA_BYTES + 1).read_to_end(&mut bytes).map_err(io_err)?;
+    if bytes.len() as u64 > MAX_CA_BYTES {
+        return Err(bad("file is larger than 1 MB"));
+    }
+    if bytes.is_empty() {
+        return Err(bad("no certificates"));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let pem_bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    let has_pem = pem_bytes.windows(10).any(|w| w == b"-----BEGIN");
+    let try_der = match der {
+        CaDer::None => false,
+        CaDer::Extension => !has_pem && file.extension().is_some_and(|e| e.eq_ignore_ascii_case("der")),
+        CaDer::Fallback => !has_pem,
+    };
+    if try_der {
+        roots.add(CertificateDer::from(bytes)).map_err(|_| bad("invalid certificate"))?;
+        return Ok(roots);
+    }
+    for cert in CertificateDer::pem_slice_iter(pem_bytes) {
+        let cert = cert.map_err(|_| bad("invalid certificate"))?;
+        roots.add(cert).map_err(|_| bad("invalid certificate"))?;
+    }
+    if roots.is_empty() {
+        return Err(bad("no certificates"));
+    }
+    Ok(roots)
+}
+
 #[cfg(test)]
 pub(crate) mod tests;
 

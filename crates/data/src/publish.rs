@@ -1449,13 +1449,31 @@ mod tests {
             }
             ds.features = rows.into();
             let published = shapefile(&ds, &path, &sync).unwrap();
-            if code == "EPSG:2274" {
-                assert_eq!(published.notes.len(), 1, "{:?}", published.notes);
+            // Whether the moved shape's round trip through the projection is exact depends on
+            // the platform's libm (exact on macOS, off in the last bits on Linux for EPSG:2274),
+            // so the note is checked against what the file reads back as.
+            let (back, _) = read(&path);
+            let off: Vec<usize> = ds
+                .features
+                .iter()
+                .zip(back.features.iter())
+                .enumerate()
+                .filter(|(_, (f, g))| !same_coords(&geometry_parts(f.geometry.as_ref()), &geometry_parts(g.geometry.as_ref()), 0.0))
+                .map(|(k, _)| k + 1)
+                .collect();
+            if cfg!(target_os = "linux") && code == "EPSG:2274" {
+                assert_eq!(off, [2], "{code}: the round-off this test expects on Linux");
+            }
+            if let Some(first) = off.first() {
+                assert_eq!(published.notes.len(), 1, "{code}: {:?}", published.notes);
                 let note = &published.notes[0];
                 assert!(
-                    note.contains("shapes with projection round-off: 1") && note.contains("feature 2") && note.contains("degrees"),
-                    "{note}"
+                    note.contains(&format!("shapes with projection round-off: {} (the first, feature {first})", off.len()))
+                        && note.contains("degrees"),
+                    "{code}: {note}"
                 );
+            } else {
+                assert!(published.notes.is_empty(), "{code}: {:?}", published.notes);
             }
             let shapes = |b: &[u8]| -> Vec<_> {
                 let mut r = shapefile::ShapeReader::new(std::io::Cursor::new(b.to_vec())).unwrap();
@@ -1465,5 +1483,22 @@ mod tests {
             assert_eq!(was[0], now[0], "{code}");
             assert_ne!(was[1], now[1], "{code}");
         }
+    }
+
+    /// Round-off in the read-back is counted, the first feature named and the largest difference
+    /// given; an exact read-back gives no note. Independent of any platform's libm.
+    #[test]
+    fn projection_round_off_is_counted_and_named() {
+        let ds = parcels();
+        assert!(projection_note(&ds, &ds).unwrap().is_none());
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        if let Some(Geometry::Polygon(polys)) = &mut rows[1].geometry {
+            polys[0][0][2].x += 1e-12;
+        }
+        let mut back = ds.clone();
+        back.features = rows.into();
+        let note = projection_note(&ds, &back).unwrap().unwrap();
+        assert!(note.contains("shapes with projection round-off: 1 (the first, feature 2)"), "{note}");
+        assert!(note.contains("degrees"), "{note}");
     }
 }

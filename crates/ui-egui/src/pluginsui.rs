@@ -531,8 +531,13 @@ fn retry(app: &mut RustGisApp, id: &str, ctx: &egui::Context) {
     start_restore(app, saved, Some(ctx.clone()), true);
 }
 
-/// Forgets an unloaded plugin: the app stops trying to load it at start.
+/// Forgets an unloaded plugin: the app stops trying to load it at start, and what it kept
+/// (its settings) is erased. If that fails the plugin stays listed, so Remove can be tried again.
 fn remove_unloaded(app: &mut RustGisApp, id: &str) {
+    if let Err(e) = rp::settings::remove(id) {
+        app.plugins.message = Some((false, crate::i18n::fmt("{id} wasn't removed: {error}", &[("id", id), ("error", &e)])));
+        return;
+    }
     app.plugins.unloaded.retain(|u| u.saved.id != id);
     update_saved(app, |list| list.retain(|s| s.id != id));
     app.plugins.message = Some((true, crate::i18n::fmt("Removed {id}.", &[("id", id)])));
@@ -1266,6 +1271,16 @@ mod tests {
         }
     }
 
+    /// A plugins folder of the test's own, one test at a time (the folder is global, and plugin
+    /// settings are kept in it: removing a plugin erases them).
+    fn isolated_settings() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let held = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        rp::store::set_dir(Some(dir.path().to_path_buf()));
+        (held, dir)
+    }
+
     /// An app whose downloads all end the way `answer` says, at once.
     fn app_fetching(answer: impl Fn(&str) -> Result<Vec<u8>, String> + 'static) -> RustGisApp {
         let mut app = RustGisApp::with_sample();
@@ -1288,6 +1303,7 @@ mod tests {
     /// Plugins the web app couldn't load at start are listed, kept, and told once (#1352).
     #[test]
     fn plugins_that_fail_at_start_are_listed_and_told_once() {
+        let _settings = isolated_settings();
         // Two that can't be downloaded: one notice naming both, a count, and where to go.
         let mut app = app_fetching(|_| Err("unreachable".into()));
         let told = start(&mut app, vec![record("demo", "0"), record("gone", "0")]);
@@ -1365,6 +1381,7 @@ mod tests {
     /// A plugin that wasn't loaded is listed on the Installed tab, with Retry and Remove (#1352).
     #[test]
     fn unloaded_plugins_offer_retry_and_remove() {
+        let _settings = isolated_settings();
         use egui_kittest::kittest::Queryable;
         let mut app = app_fetching(|_| Err("still unreachable".into()));
         app.plugins.unloaded.push(Unloaded { saved: record("demo", "0"), reason: "unreachable".into() });
@@ -1419,5 +1436,34 @@ mod tests {
         h.run();
         assert!(h.query_by_label("Remove").is_some());
         assert!(h.query_by_label("Retry").is_none());
+    }
+
+    /// Removing an unloaded plugin erases what it kept, and when that fails it stays listed (#1261).
+    #[test]
+    fn plugin_settings_are_erased_when_an_unloaded_plugin_is_removed() {
+        let (_turn, dir) = isolated_settings();
+        let mut app = app_fetching(|_| Err("unreachable".into()));
+        app.plugins.unloaded.push(Unloaded { saved: record("demo", "0"), reason: "unreachable".into() });
+        let kept = || rp::settings::patch("demo", &json!({"values": {"favourites": ["l:1"]}})).unwrap();
+        kept();
+        let file = dir.path().join("settings").join("demo.json");
+        assert!(file.is_file());
+
+        // Erasing fails: the plugin stays listed, with the reason on the tab, to try again.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        remove_unloaded(&mut app, "demo");
+        assert_eq!(app.plugins.unloaded.len(), 1);
+        let Some((false, why)) = app.plugins.message.clone() else { panic!("{:?}", app.plugins.message) };
+        assert!(why.starts_with("demo wasn't removed: ") && why.contains("couldn't erase the saved settings of 'demo'"), "{why}");
+
+        // Then it is removed, with what it kept.
+        std::fs::remove_dir(&file).unwrap();
+        kept();
+        remove_unloaded(&mut app, "demo");
+        assert!(app.plugins.unloaded.is_empty());
+        assert_eq!(app.plugins.message, Some((true, "Removed demo.".to_string())));
+        assert!(!file.exists());
+        assert_eq!(rp::settings::read("demo").unwrap(), json!({}));
     }
 }

@@ -244,8 +244,12 @@ fn uninstall(_: &mut Session, p: &Value) -> CmdResult {
     #[cfg(not(target_arch = "wasm32"))]
     rustgis_plugins::store::uninstall(id)?;
     #[cfg(target_arch = "wasm32")]
-    if !rustgis_plugins::unload(id) {
-        return Err(format!("no plugin '{id}'"));
+    {
+        if rustgis_plugins::get(id).is_none() {
+            return Err(format!("no plugin '{id}'"));
+        }
+        rustgis_plugins::settings::remove(id)?;
+        rustgis_plugins::unload(id);
     }
     Ok(json!({"uninstalled": id}))
 }

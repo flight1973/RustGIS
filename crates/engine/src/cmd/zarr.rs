@@ -20,7 +20,7 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("raster.zarrInfo", "Zarr Variables", "Home › Add › Add Data › Zarr", info).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files))
             .view()
-            .params(r#"{"path": "a Zarr store's folder" | "url": "https://… a store with consolidated metadata", "bbox"?: [west, south, east, north] (in the grid's coordinates: the window of cells it is in a variable's grid, for layer.addZarr's cells), "variable"?: (with bbox; default the first)} → variables with their dimensions and chunks"#),
+            .params(r#"{"path": "a Zarr store's folder" | "url": "https://… a store with consolidated metadata", "bbox"?: [west, south, east, north] (in the grid's coordinates: the window of cells it is in a variable's grid, for layer.addZarr's cells), "variable"?: (with bbox; default the first)} → variables with their dimensions, chunks and shards' chunks (innerChunks)"#),
         C::new("zarr.series", "Time Series at a Point", "View › Time Series", series).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).view().params(
             r#"{"lon", "lat", "layer"? (a Zarr layer: its store, variable and steps; default the active layer) | "path": folder | "url": "https://…", "variable"?, "index"?: {"level": 0} (the other dimensions' steps), "start"?, "end"?: dates (default: the layer's period, else the whole axis), "crs"?: for a projected store that doesn't say} → dates, values (null for no data) and labels along the variable's time dimension at the cell holding the point (desktop)"#,
         ),
@@ -28,7 +28,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer"? (a Zarr layer: its store, variable and steps; default the active layer) | "path": folder | "url": "https://…", "variable"?, "index"?, "stat": "mean"|"min"|"max"|"sum"|"std" (the population standard deviation, n)|"count"|"countAbove", "above"?: number (countAbove's threshold), "start"?, "end"?: dates (default: the layer's period, else the whole axis), "months"?: [1–12] (a season across years: [12, 1, 2]), "minValid"?: 0–1 (a cell with a smaller share of values is left empty; default 0), "name"?: text, "crs"?} → a raster layer of the statistic (desktop)"#,
         ),
         C::new("layer.addZarr", "Add Zarr Variable", "Home › Add › Add Data", add).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Network).with(crate::policy::Effect::Files)).params(
-            r#"{"path": folder | "url": "https://…", "variable"?: "its path in the store (default: the first)", "index"?: {"time": 3, "level": 0} (other dimensions' steps, default 0), "cells"?: [first column, first row, end column, end row] (a window of the map's cells as stored, the ends not included, at least 2 × 2: only the chunks it touches are read, and only its coordinates) | "bbox"?: [west, south, east, north] (a window by the grid's coordinates: degrees for a longitude/latitude grid; its coordinates are read to place it), "crs"?: "EPSG:… for a store that doesn't say", "name"?: text, "time"?: bool (follow the time slider: the layer shows the step the slider is at, and turns the slider on over the variable's dates when it is off; desktop), "start"?, "end"?: dates (with time: the period to take, for an axis longer than the slider's 20,000 steps), "ran"?: (internal: a slice the app has read), "summary"?: bool (internal: with ran, a summary over time rather than a slice)}"#,
+            r#"{"path": folder | "url": "https://…", "variable"?: "its path in the store (default: the first)", "index"?: {"time": 3, "level": 0} (other dimensions' steps, default 0), "cells"?: [first column, first row, end column, end row] (a window of the map's cells as stored, the ends not included, at least 2 × 2: only the chunks it touches are read, and in shards only their chunks it needs, by range) | "bbox"?: [west, south, east, north] (a window by the grid's coordinates: degrees for a longitude/latitude grid; its coordinates are read to place it), "crs"?: "EPSG:… for a store that doesn't say", "name"?: text, "time"?: bool (follow the time slider: the layer shows the step the slider is at, and turns the slider on over the variable's dates when it is off; desktop), "start"?, "end"?: dates (with time: the period to take, for an axis longer than the slider's 20,000 steps), "ran"?: (internal: a slice the app has read), "summary"?: bool (internal: with ran, a summary over time rather than a slice)}"#,
         ),
     ]
 }
@@ -90,25 +90,32 @@ fn fetch(root: &str, keys: &[String]) -> Result<(HashMap<String, Vec<u8>>, usize
 /// Fetches bytes of a store's files ([`zarr::Part`]s, by range), each kept by its id, as [`fetch`].
 #[cfg(not(target_arch = "wasm32"))]
 fn fetch_parts(root: &str, parts: &[zarr::Part]) -> Result<(HashMap<String, Vec<u8>>, usize), String> {
-    use crate::render::rustgis_tiles::cache::RANGE;
+    use crate::render::rustgis_tiles::cache::{RANGE, TAIL};
     let items: Vec<(String, String)> = parts
         .iter()
         .map(|p| {
-            let zarr::Span::Bytes(a, b) = p.span;
-            (p.id.clone(), format!("{}{RANGE}{a}-{b}", p.key))
+            let at = match p.span {
+                zarr::Span::Bytes(a, b) => format!("{RANGE}{a}-{b}"),
+                zarr::Span::Tail(n) => format!("{TAIL}{n}"),
+            };
+            (p.id.clone(), format!("{}{at}", p.key))
         })
         .collect();
     fetch_items(root, &items)
 }
 
-/// Fetches what a slice's plan reads: its whole files, then its bytes of files. A file refused
-/// (HTTP 403) is counted.
+/// Fetches what a slice's plan reads: its whole files, its bytes of files, then (a window of a
+/// sharded variable) the shards' chunks their indexes give. A file refused (HTTP 403) is counted.
 #[cfg(not(target_arch = "wasm32"))]
-fn fetch_plan(root: &str, plan: &zarr::Plan) -> Result<(HashMap<String, Vec<u8>>, usize), String> {
-    let (mut got, forbidden) = fetch(root, &plan.keys)?;
+fn fetch_plan(root: &str, store: &zarr::Store, plan: &zarr::Plan) -> Result<(HashMap<String, Vec<u8>>, usize), String> {
+    let (mut got, mut forbidden) = fetch(root, &plan.keys)?;
     let (parts, f) = fetch_parts(root, &plan.parts)?;
     got.extend(parts);
-    Ok((got, forbidden + f))
+    let inner = zarr::inner_parts(store, plan, &got).map_err(|e| crate::sources::message_with_address(root, &e.to_string()))?;
+    let (chunks, g) = fetch_parts(root, &inner)?;
+    got.extend(chunks);
+    forbidden += f + g;
+    Ok((got, forbidden))
 }
 
 /// [`fetch`] of `(id, file)` pairs: each file (a key, with a byte range's mark) kept by its id.
@@ -477,7 +484,7 @@ pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
             pick_variable(&store, &mut sel)?;
             let cut = place_window(&u, &store, &mut sel, asked)?;
             let plan = zarr::plan(&store, &sel).map_err(|e| crate::sources::message_with_address(&u, &e.to_string()))?;
-            let (chunks, forbidden) = fetch_plan(&u, &plan)?;
+            let (chunks, forbidden) = fetch_plan(&u, &store, &plan)?;
             if forbidden > 0 {
                 return Err(crate::sources::message_with_address(
                     &u,

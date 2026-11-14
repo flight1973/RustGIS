@@ -1004,6 +1004,19 @@ fn offline_group(app: &mut RustGisApp, ui: &mut Ui) {
             false,
         );
         col(ui, |ui| {
+            // A field package sent back from a phone: its edits and photos, to its offline area.
+            crate::widgets::small(
+                ui,
+                app,
+                "open",
+                "Bring Back",
+                "Bring a field package's edits and photos back to the offline area it was made from.",
+                "ui.openItem",
+                json!({"kind": "fieldPackage"}),
+                false,
+            );
+        });
+        col(ui, |ui| {
             for (icon, label, cmd, desc) in [
                 ("redo", "Sync", "offline.sync", "Send offline edits back and refresh."),
                 ("map", "Open", "offline.open", "Open an offline area to edit."),
@@ -1761,7 +1774,7 @@ fn analysis_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 app,
                 "relief",
                 "Raster Functions",
-                "Slope, aspect, hillshade, NDVI, band math, thresholds.",
+                "Slope (degrees), aspect, hillshade, NDVI, band math, thresholds.",
                 "ui.pane.workflows",
                 json!({"section": "rasterFunctions"}),
                 false,
@@ -2114,6 +2127,18 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
                 "map.displayType",
                 json!({"mode": if v.fast { "quality" } else { "speed" }}),
                 v.fast,
+            );
+            // Drawn and written by the desktop app only: the browser's `ui.dialog` refuses it.
+            #[cfg(not(target_arch = "wasm32"))]
+            small(
+                ui,
+                app,
+                "maneuver_roundabout",
+                "Export Orbit…",
+                "Write a turn of the view about its centre as an animated GIF or PNG frames.",
+                "ui.dialog",
+                json!({"name": "exportOrbit"}),
+                false,
             );
         });
     });
@@ -2642,6 +2667,25 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
         if r.clicked() {
             app.map.cancel_sketch();
         }
+        let can_box = crate::boxedit::ready(app);
+        ui.add_enabled_ui(can_box, |ui| {
+            let r = big(
+                ui,
+                app,
+                "g_rect",
+                "Rotated\nBox",
+                "Draw boxes; drag the paddle to rotate, corners to resize. Space or middle-drag pans.",
+                "tool.set",
+                json!({"tool":"rotatedBox"}),
+                app.session.tool == Tool::RotatedBox,
+                false,
+            );
+            if r.clicked() {
+                app.map.cancel_sketch();
+                app.ui.open_right(RightPane::Editing);
+            }
+            r.on_disabled_hover_text(tl!("Turn editing on and select a loaded polygon layer in a flat Earth map."));
+        });
         big(ui, app, "delete", "Delete", "Delete the selected features.", "edit.delete", Value::Null, false, false);
         let r = big(
             ui,
@@ -4233,7 +4277,7 @@ fn imagery_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 app,
                 "relief",
                 "Raster Functions",
-                "Slope, hillshade, NDVI and more.",
+                "Slope (degrees), hillshade, NDVI and more.",
                 "ui.pane.workflows",
                 wf("rasterFunctions"),
                 false,

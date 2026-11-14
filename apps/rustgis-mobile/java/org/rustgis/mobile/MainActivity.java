@@ -51,6 +51,11 @@ public class MainActivity extends NativeActivity {
     private boolean locating;
     /** Whether positions are wanted out of sight too, with TrackService running (the main thread's alone). */
     private boolean keepLocating;
+    /**
+     * Whether the Rust side wants positions out of sight (the main thread's alone): kept when
+     * TrackService is refused, so it is tried again the next time the app comes into sight.
+     */
+    private boolean keepWanted;
     /** Events dropped past MOST_EVENTS since the Rust side last took them (guarded by events). */
     private int dropped;
     /** Why TrackService couldn't run, until takeEvents says so. */
@@ -219,6 +224,7 @@ public class MainActivity extends NativeActivity {
     public void keepLocating(final boolean on) {
         runOnUiThread(() -> {
             keepLocating = on;
+            keepWanted = on;
             Intent service = new Intent(this, TrackService.class);
             if (!on) {
                 stopService(service);
@@ -271,6 +277,12 @@ public class MainActivity extends NativeActivity {
             if (allowed(android.Manifest.permission.ACCESS_FINE_LOCATION)
                     || allowed(android.Manifest.permission.ACCESS_COARSE_LOCATION)) {
                 startLocating();
+                // A track still wants positions out of sight that TrackService was refused for
+                // (started out of sight, say): tried again now, in sight.
+                if (keepWanted && !keepLocating) {
+                    keepLocating = true;
+                    startTrackService();
+                }
             } else {
                 stopped("RustGIS is no longer given leave to use this device's location.");
             }

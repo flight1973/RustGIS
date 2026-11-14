@@ -144,6 +144,7 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
                     } else {
                         0
                     }
+                    + usize::from(app.session.map().name.ends_with(" (offline)"))
             }
             Sheet::Capture => capture_rows(app, &ctx),
             Sheet::None => 0,
@@ -935,13 +936,15 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let taken = std::mem::take(&mut app.photos);
         match picked.filter(|_| state.edit_mode) {
             Some((row, _)) => {
-                // Not attached (the refusal is said): where the photos are kept is said too.
+                // Not attached (the refusal is said): where the photos are kept is said too, and
+                // they stay in the form, for the next feature or to try again.
                 if !photos::attach(app, target.id, row, &taken) {
                     let kept = taken.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
                     app.session.notify(
                         rustgis_ui_egui::i18n::fmt("The photo wasn't attached to the feature. It is kept at {paths}.", &[("paths", &kept)]),
                         true,
                     );
+                    state.photos.extend(taken);
                 }
             }
             None => state.photos.extend(taken),
@@ -1434,6 +1437,12 @@ fn more(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 }
             }
         }
+        // A map opened from a field package goes back as one: its edits and photos, for Bring Back
+        // on the computer it came from.
+        if app.session.map().name.ends_with(" (offline)") && row(ui, t, "package", tl!("Send Field Package")) {
+            set_sheet(&ctx, Sheet::None);
+            run(app, "ui.saveItem", json!({"kind": "fieldPackage"}));
+        }
         // The whole of RustGIS is still there, for a tablet or a job the touch interface has no
         // button for yet. The Project page's Start brings this interface back at the next start.
         if row(ui, t, "pane", tl!("Use the Desktop Interface")) {
@@ -1442,6 +1451,9 @@ fn more(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             // couldn't be keeps this interface, which can still stop it.
             if stop_track(app, &ctx) {
                 app.chrome = None;
+                // Nothing to keep positions coming for out of sight now, and no interface that
+                // would say so.
+                app.keep_locating = false;
                 app.session.notify(tl!("The desktop interface is on until RustGIS is started again."), false);
             }
         }

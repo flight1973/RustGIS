@@ -136,8 +136,12 @@ pub(crate) fn raster(s: &Session, p: &Value) -> Result<Arc<Raster>, String> {
     raster_named(s, raster_name(p)?)
 }
 
-pub(crate) fn name(p: &Value, d: String) -> String {
-    ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(200).collect()).unwrap_or(d)
+/// The output's name the parameters give, else `d`; one over 200 characters is refused (#1888).
+pub(crate) fn name(p: &Value, d: String) -> Result<String, String> {
+    match ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => super::within("name", "the output's name", n, 200),
+        None => Ok(d),
+    }
 }
 
 pub(crate) fn bands_param(p: &Value, r: &Raster) -> Result<Vec<usize>, String> {
@@ -191,7 +195,7 @@ pub(crate) fn classify_work(s: &Session, p: &Value) -> Result<super::workflows::
         None => 5,
         Some(_) => uint(p, "classes").filter(|k| (2..=50).contains(k)).ok_or("classes is 2 to 50")? as usize,
     };
-    let out = name(p, format!("{}_classes", r.name));
+    let out = name(p, format!("{}_classes", r.name))?;
     Ok(Box::new(move || {
         let classes = rasterops::kmeans(&r, &bands, k, 20)?;
         let layer = class_layer(rasterops::derive(&r, &out, vec![classes])?)?;
@@ -341,7 +345,8 @@ fn warp_to_fit(s: &mut Session, p: &Value, layer: &str, r: &Raster) -> CmdResult
         None | Some(Value::Null) => None,
         Some(v) => Some(v.as_str().filter(|t| is_tif(t)).ok_or("path is a *.tif or *.tiff file")?.to_string()),
     };
-    let new_layer = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(200).collect::<String>());
+    let new_layer =
+        ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(|n| super::within("name", "a layer's name", n, 200)).transpose()?;
     let out_name = new_layer.clone().unwrap_or_else(|| r.name.clone());
     let mut out = warp::warp(r, &fit, &warp::Options { crs, points_crs, resampling, cell, name: out_name })?;
     let used = warp::Method::Sample(resampling).used_on(r);
@@ -403,7 +408,7 @@ fn project_raster(s: &mut Session, p: &Value) -> CmdResult {
     };
     let grid = grid_param(s, p, r.crs, |crs| warp::footprint_in(&r, crs).map(|(bounds, pixel)| (bounds, Some(pixel))))?;
     let path = tif_path(p)?;
-    let out_name = name(p, format!("{} projected", r.name));
+    let out_name = name(p, format!("{} projected", r.name))?;
     let out = warp::project(&r, &grid, method, out_name.clone())?;
     let used = method.used_on(&r);
     report_resampled_classes(s, &r, &out, used.id());
@@ -479,7 +484,7 @@ fn rasterize(s: &mut Session, p: &Value) -> CmdResult {
         Some(v) => v.as_f64().filter(|v| v.is_finite() && v.abs() <= f64::from(f32::MAX)).ok_or("nodata is a number")?,
     };
     let path = tif_path(p)?;
-    let out_name = name(p, format!("{ln} raster"));
+    let out_name = name(p, format!("{ln} raster"))?;
     // The features burned: the selection, else all, in the layer's order (a later one wins).
     let mut rows: Vec<usize> = if l.selection.is_empty() { (0..ds.features.len()).collect() } else { l.selection.clone() };
     rows.sort_unstable();
@@ -880,7 +885,7 @@ pub(crate) fn change_work(s: &Session, p: &Value) -> Result<super::workflows::Wo
     let band = uint(p, "band").unwrap_or(1).saturating_sub(1) as usize;
     a.bands.get(band).ok_or("no such band")?;
     bfr.bands.get(band).ok_or_else(|| format!("{} has no band {}", bfr.name, band + 1))?;
-    let out_name = name(p, format!("{}_change", a.name));
+    let out_name = name(p, format!("{}_change", a.name))?;
     Ok(Box::new(move || {
         let av = &a.bands.get(band).ok_or("no such band")?.data;
         let bv = rasterops::resample_to(&bfr, band, &a)?;
@@ -1110,7 +1115,7 @@ pub(crate) fn supervised_work(s: &Session, p: &Value) -> Result<super::workflows
     let fi = l.dataset.field_index(ps(p, "classField").ok_or("classField is required")?).ok_or("no such class field")?;
     // All the training polygons: a layer read in place is read whole as the work runs.
     let rows = super::whole::Whole::of(l);
-    let out = name(p, format!("{}_classified", r.name));
+    let out = name(p, format!("{}_classified", r.name))?;
     Ok(Box::new(move || {
         let (ds, unread) = rows.read()?;
         let explain = |e: String| unread.explain(e);
@@ -1153,7 +1158,7 @@ pub(crate) fn index_work(s: &Session, p: &Value) -> Result<super::workflows::Wor
         "evi" => format!("2.5 * (b{nir} - b{red}) / (b{nir} + 6 * b{red} - 7.5 * b{blue} + 1)"),
         o => return Err(format!("unknown index '{o}'")),
     };
-    let out = name(p, format!("{}_{idx}", r.name));
+    let out = name(p, format!("{}_{idx}", r.name))?;
     Ok(Box::new(move || super::workflows::made(rasterops::derive(&r, &out, vec![rasterops::band_math(&r, &expr)?])?, None)))
 }
 
@@ -1193,6 +1198,8 @@ pub(crate) fn process_work(s: &Session, p: &Value) -> Result<super::workflows::W
         "clip" if p.get("polygon").is_some_and(|v| !v.is_null()) => {
             // Before the mask, which places the polygons on the raster's coordinates.
             r.require_coordinates()?;
+            // A name over the limit is refused before any feature is transformed.
+            let out = name(p, format!("{}_clip", r.name))?;
             let pl = clip_polygon(p).ok_or("polygon is a polygon layer's name")?;
             let l = s
                 .map()
@@ -1246,7 +1253,7 @@ pub(crate) fn process_work(s: &Session, p: &Value) -> Result<super::workflows::W
             if !failed_features.is_empty() {
                 log::warn!("{pl}: {} feature(s) failed polygon validation during clipping", failed_features.len());
             }
-            let (out, pl, skipped) = (name(p, format!("{}_clip", r.name)), pl.to_string(), failed_features.len());
+            let (pl, skipped) = (pl.to_string(), failed_features.len());
             Ok(Box::new(move || {
                 let mut failed_parts = Vec::new();
                 let (cols, rows, mask) = rasterops::polygon_mask_with_failures(&r, &polygons, &mut failed_parts)?.ok_or_else(|| {
@@ -1297,7 +1304,7 @@ pub(crate) fn process_work(s: &Session, p: &Value) -> Result<super::workflows::W
             if c1 <= c0 || r1 <= r0 {
                 return Err("the extent doesn't overlap the raster".into());
             }
-            let out = name(p, format!("{}_clip", r.name));
+            let out = name(p, format!("{}_clip", r.name))?;
             Ok(Box::new(move || super::workflows::made(clip_window(&r, c0..c1, r0..r1, None, out)?, None)))
         }
         "resample" => {
@@ -1306,7 +1313,7 @@ pub(crate) fn process_work(s: &Session, p: &Value) -> Result<super::workflows::W
             r.require_coordinates()?;
             let k = (uint(p, "factor").unwrap_or(2).clamp(2, 64) as u32).min(r.width.min(r.height)).max(1);
             let (w, h) = ((r.width / k).max(1), (r.height / k).max(1));
-            let out = name(p, format!("{}_resampled", r.name));
+            let out = name(p, format!("{}_resampled", r.name))?;
             Ok(Box::new(move || {
                 // Each output pixel is the mean of the valid pixels it covers.
                 let bands = r
@@ -1406,6 +1413,8 @@ fn raster_mosaic(s: &mut Session, p: &Value) -> CmdResult {
     if inputs.len() > MAX_MOSAIC_INPUTS {
         return Err(format!("a mosaic takes at most {MAX_MOSAIC_INPUTS} inputs"));
     }
+    // The name given, checked before any input is read; empty when none is (the first input's then).
+    let given = name(p, String::new())?;
     let max = rustgis_data::raster::max_samples() as i64;
     let mut rs: Vec<Arc<Raster>> = Vec::with_capacity(inputs.len());
     // Each input's place on the first one's grid, and the bounds of them all so far.
@@ -1490,7 +1499,7 @@ fn raster_mosaic(s: &mut Session, p: &Value) -> CmdResult {
     let o = first.transform.to_world(c0 as f64, r0 as f64);
     let gt = GeoTransform { origin_x: o.x, origin_y: o.y, ..first.transform };
     let mut out = Raster::new(
-        name(p, format!("{}_mosaic", first.name)),
+        if given.is_empty() { format!("{}_mosaic", first.name) } else { given },
         w,
         h,
         bands,

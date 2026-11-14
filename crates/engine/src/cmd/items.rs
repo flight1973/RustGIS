@@ -22,6 +22,9 @@ fn max_file() -> u64 {
     crate::project::max_bytes()
 }
 
+/// The most steps a task takes (`task.new`).
+const MAX_TASK_STEPS: usize = 200;
+
 /// What an item past [`max_file`] is told.
 fn too_large() -> String {
     format!("the file is too large (maximum {})", crate::project::limit_said(max_file()))
@@ -79,11 +82,23 @@ pub fn commands() -> Vec<C> {
         C::new("style.new", "New Style", "Style › Styles", |s, p| {
             let id = s.layer_id(p)?;
             let l = s.map().layer(id).ok_or("no such layer")?;
-            let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| l.name.clone());
+            // A name given past the limit is refused, not cut (#1972). Without one, the
+            // style takes the layer's name, the first of it when that's longer, and says so.
+            let given = ps(p, "name").map(str::trim).filter(|n| !n.is_empty());
+            if let Some(n) = given {
+                let length = n.chars().count();
+                if length > MAX_STYLE_NAME {
+                    return Err(format!("name is {length} characters: a style's name takes at most {MAX_STYLE_NAME}"));
+                }
+            }
+            let name = given.map(String::from).unwrap_or_else(|| l.name.clone());
             let (renderer, left_out) = super::layer::renderer_with_fills(l);
             let layer = l.name.clone();
-            let item = StyleItem { name: name.clone(), geometry: l.geometry_type(), renderer, labels: l.labels.clone(), transparency: l.transparency };
-            add_style(s, item);
+            let item = StyleItem { name, geometry: l.geometry_type(), renderer, labels: l.labels.clone(), transparency: l.transparency };
+            let (name, cut) = add_style(s, item);
+            if cut {
+                s.notify(format!("New Style: the style takes the first {MAX_STYLE_NAME} characters of the layer's name"), false);
+            }
             if left_out > 0 {
                 s.notify(format!("Style {name} from {layer}: {left_out} fill(s) No Fill hid couldn't be put back in it, as their classes have fills of their own now, are gone or their opacity wasn't kept; it draws them as the layer does now"), false);
             }
@@ -95,12 +110,7 @@ pub fn commands() -> Vec<C> {
             let text = read_text(p)?;
             crate::project::check_format(&text, "style file")?;
             let items: Vec<StyleItem> = serde_json::from_str(&text).map_err(|e| format!("not a RustGIS style file: {e}"))?;
-            let mut n = 0;
-            for it in items.into_iter().take(1000) {
-                add_style(s, it);
-                n += 1;
-            }
-            Ok(json!({"added": n}))
+            Ok(json!({"added": add_file_styles(s, "Add Style", items)}))
         }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .params(r#"{"path"?: "*.rgisstyle", "text"?: style file JSON, "data"?: base64 file}"#),
         C::new("style.import", "Import Styles", "Style › Styles", import_styles).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(r#"{"path"?: "*.rgislyr|*.rgismap|*.rgis", "text"?: JSON, "data"?: base64 file}"#),
@@ -208,6 +218,8 @@ pub fn commands() -> Vec<C> {
         .view()
         .params(r#"{"path": "*.rgistemplate", "name"?: template name}"#),
         C::new("project.fromTemplate", "Open Custom Template", "Command Search", |s, p| {
+            let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Untitled");
+            let name = super::within("name", "a project's name", name, 200)?;
             let text = read_text(p)?;
             super::connections::clear_active();
             let mut proj = match Project::from_import_json(&text, None) {
@@ -217,7 +229,7 @@ pub fn commands() -> Vec<C> {
                     return Err(error.replace("RustGIS project", "RustGIS template").replace("this project ", "this template "));
                 }
             };
-            proj.name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Untitled").chars().take(200).collect();
+            proj.name = name;
             super::project::reset_to(s, proj);
             s.path = None;
             super::connections::resolve_project(s);
@@ -242,19 +254,27 @@ pub fn commands() -> Vec<C> {
         // Tasks.
         C::new("task.new", "New Task", "Analyze › Tasks", |s, p| {
             let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Task");
+            let name = super::within("name", "a task's name", name, 200)?;
+            let description = super::within("description", "a task's description", ps(p, "description").unwrap_or(""), 2000)?;
+            // The successful runs in the history left out for a tool that isn't available.
+            let mut unavailable = 0;
             let steps: Vec<TaskStep> = match p.get("steps") {
-                Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("steps: {e}"))?,
+                Some(v) => {
+                    let steps: Vec<TaskStep> = serde_json::from_value(v.clone()).map_err(|e| format!("steps: {e}"))?;
+                    super::at_most("steps", "a task", &steps, MAX_TASK_STEPS)?;
+                    steps
+                }
                 // A task can replay the geoprocessing history, one step per successful run.
-                None if b(p, "fromHistory").unwrap_or(false) => s
-                    .project
-                    .gp_history
-                    .iter()
-                    .filter(|r| r.ok)
-                    .filter_map(|r| {
-                        let tool = super::gp::tool_id(&r.tool)?;
-                        Some(TaskStep { title: r.tool.clone(), instructions: r.messages.first().cloned().unwrap_or_default(), command: "gp.run".into(), params: json!({"tool": tool, "params": r.params}) })
-                    })
-                    .collect(),
+                None if b(p, "fromHistory").unwrap_or(false) => {
+                    let mut steps = Vec::new();
+                    for r in s.project.gp_history.iter().filter(|r| r.ok) {
+                        match super::gp::tool_id(&r.tool) {
+                            Some(tool) => steps.push(TaskStep { title: r.tool.clone(), instructions: r.messages.first().cloned().unwrap_or_default(), command: "gp.run".into(), params: json!({"tool": tool, "params": r.params}) }),
+                            None => unavailable += 1,
+                        }
+                    }
+                    steps
+                }
                 None => Vec::new(),
             };
             for st in &steps {
@@ -262,14 +282,36 @@ pub fn commands() -> Vec<C> {
                     return Err(format!("step '{}' runs an unknown command '{}'", st.title, st.command));
                 }
             }
-            let mut name = name.chars().take(200).collect::<String>();
+            // A task from the history leaves out the runs it can't replay, and keeps its first
+            // runs when there are more than a task takes; each is said, with its count.
+            if unavailable > 0 {
+                let said = if unavailable == 1 {
+                    "1 successful run in the history uses a tool that isn't available, so it's left out".to_string()
+                } else {
+                    format!("{unavailable} successful runs in the history use a tool that isn't available, so they're left out")
+                };
+                s.notify(format!("{name}: {said}"), false);
+            }
+            let mut steps = steps;
+            if steps.len() > MAX_TASK_STEPS {
+                s.notify(format!("{name}: the task takes the first {MAX_TASK_STEPS} of the {} successful runs it can replay from the history", steps.len()), false);
+                steps.truncate(MAX_TASK_STEPS);
+            }
+            let mut name = name;
             let base = name.clone();
             let mut i = 1;
             while s.project.tasks.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
                 i += 1;
-                name = format!("{base} {i}");
+                // The suffix that tells it apart fits within the name's 200 characters: the name
+                // given gives way to it, and that is said.
+                let suffix = format!(" {i}");
+                name = base.chars().take(200 - suffix.chars().count()).chain(suffix.chars()).collect();
             }
-            s.project.tasks.push(Task { name: name.clone(), description: ps(p, "description").unwrap_or("").chars().take(2000).collect(), steps: steps.into_iter().take(200).collect() });
+            let kept = name.chars().count() - if i > 1 { format!(" {i}").chars().count() } else { 0 };
+            if kept < base.chars().count() {
+                s.notify(format!("New Task: a task has that name already, so the name given is cut to {kept} characters to fit \" {i}\""), false);
+            }
+            s.project.tasks.push(Task { name: name.clone(), description, steps });
             Ok(json!({"task": name}))
         }).roles(&[crate::ParamRole { key: "steps", role: crate::Role::TaskSteps }]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name"?: string, "description"?: string, "steps"?: [{"title", "instructions"?, "command": id, "params"?: {}}], "fromHistory"?: bool (one step per geoprocessing run), "imported"?: bool (from a file: its steps may not touch files)}"#),
@@ -293,6 +335,8 @@ pub fn commands() -> Vec<C> {
             if title.is_some_and(|t| t.trim().is_empty()) {
                 return Err("a step needs a title".into());
             }
+            let title = title.map(|t| super::within("title", "a step's title", t.trim(), 200)).transpose()?;
+            let instructions = instructions.map(|t| super::within("instructions", "a step's instructions", t, 4000)).transpose()?;
             if title.is_none() && instructions.is_none() {
                 return Err("title or instructions is required".into());
             }
@@ -300,8 +344,8 @@ pub fn commands() -> Vec<C> {
             let t = task_mut(s, p)?;
             let n = t.steps.len();
             let st = t.steps.get_mut(step).ok_or_else(|| format!("{} has {n} steps", t.name))?;
-            let title = title.map_or_else(|| st.title.clone(), |t| t.trim().chars().take(200).collect());
-            let instructions = instructions.map_or_else(|| st.instructions.clone(), |t| t.chars().take(4000).collect());
+            let title = title.unwrap_or_else(|| st.title.clone());
+            let instructions = instructions.unwrap_or_else(|| st.instructions.clone());
             // Changing nothing would still leave an undo step.
             if title == st.title && instructions == st.instructions {
                 return Err(format!("step {step} already reads so"));
@@ -532,13 +576,48 @@ fn not_a(error: String, kinds: &str) -> String {
     }
 }
 
-fn add_style(s: &mut Session, mut item: StyleItem) {
-    item.name = item.name.trim().chars().take(200).collect();
+/// The most characters a style's name takes.
+const MAX_STYLE_NAME: usize = 200;
+/// The most styles one file adds.
+const MAX_FILE_STYLES: usize = 1000;
+
+/// Keeps a style, in place of any of its name: its name as kept, and whether it was cut to fit.
+fn add_style(s: &mut Session, mut item: StyleItem) -> (String, bool) {
+    let name = item.name.trim();
+    let cut = name.chars().nth(MAX_STYLE_NAME).is_some();
+    item.name = name.chars().take(MAX_STYLE_NAME).collect();
     if item.name.is_empty() {
         item.name = "Style".into();
     }
+    let kept = item.name.clone();
     s.project.styles.retain(|t| !t.name.eq_ignore_ascii_case(&item.name));
     s.project.styles.push(item);
+    (kept, cut)
+}
+
+/// A file's styles, as many as one file adds. A file isn't refused for what it holds: what it
+/// loses is said, one notice a kind with its count (#1972). The number of styles the
+/// project gains or has replaced, one a name.
+fn add_file_styles(s: &mut Session, what: &str, items: Vec<StyleItem>) -> usize {
+    let total = items.len();
+    let mut names = std::collections::HashSet::new();
+    let (mut cut, mut replaced) = (0usize, 0usize);
+    for item in items.into_iter().take(MAX_FILE_STYLES) {
+        let (name, was_cut) = add_style(s, item);
+        cut += usize::from(was_cut);
+        // A later style of the same name takes the place of an earlier one from the file.
+        replaced += usize::from(!names.insert(name.to_ascii_lowercase()));
+    }
+    if total > MAX_FILE_STYLES {
+        s.notify(format!("{what}: the first {MAX_FILE_STYLES} of the file's {total} styles are added"), false);
+    }
+    if cut > 0 {
+        s.notify(format!("{what}: {cut} style name(s) cut to {MAX_STYLE_NAME} characters"), false);
+    }
+    if replaced > 0 {
+        s.notify(format!("{what}: {replaced} style(s) replaced by a later one of the same name in the file"), false);
+    }
+    names.len()
 }
 
 /// Styles from every feature layer of a layer file, map file or project.
@@ -567,24 +646,21 @@ fn import_styles(s: &mut Session, p: &Value) -> CmdResult {
         }
         project.maps.into_iter().flat_map(|m| m.layers).collect()
     };
-    let mut n = 0;
-    for l in layers.into_iter().filter(|l| !l.is_raster() && l.geometry_type() != GeometryType::None).take(1000) {
-        add_style(
-            s,
-            StyleItem {
-                name: l.name.clone(),
-                geometry: l.geometry_type(),
-                renderer: l.renderer,
-                labels: l.labels,
-                transparency: l.transparency,
-            },
-        );
-        n += 1;
-    }
-    if n == 0 {
+    let items: Vec<StyleItem> = layers
+        .into_iter()
+        .filter(|l| !l.is_raster() && l.geometry_type() != GeometryType::None)
+        .map(|l| StyleItem {
+            name: l.name.clone(),
+            geometry: l.geometry_type(),
+            renderer: l.renderer,
+            labels: l.labels,
+            transparency: l.transparency,
+        })
+        .collect();
+    if items.is_empty() {
         return Err("no feature layers to take styles from".into());
     }
-    Ok(json!({"imported": n}))
+    Ok(json!({"imported": add_file_styles(s, "Import Styles", items)}))
 }
 
 /// Copies `old`'s saved label moves into the class of the same name in `new` (Default into
@@ -1577,7 +1653,7 @@ pub fn item_bytes(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec
             s.project.ensure_imports_complete()?;
             let (mut t, TemplateLosses { label_moves, offline_areas, archived_edits, source_references }) = template(&s.project);
             if let Some(n) = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
-                t.name = n.chars().take(200).collect();
+                t.name = super::within("name", "a template's name", n, 200)?;
             }
             let name = t.name.clone();
             let bytes = durable_bytes(s, t)?;

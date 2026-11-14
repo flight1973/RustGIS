@@ -7,7 +7,7 @@ use std::sync::Arc;
 use rustgis_data::raster::{self, Raster};
 use rustgis_geom::Extent;
 use rustgis_map::raster::{
-    Normalizer, RasterLayer, RasterMask, RasterRenderer, RasterStyle, Resampling, Stretch, classify_masked, unique_values,
+    Normalizer, RasterLayer, RasterMask, RasterRenderer, RasterStyle, Resampling, Rock, Stretch, classify_masked, unique_values,
 };
 use rustgis_map::{ClassMethod, Ramp, RasterDefaults};
 use serde_json::{Value, json};
@@ -36,7 +36,7 @@ pub fn commands() -> Vec<C> {
         C::new("layer.addDataBytes", "Add Data (from file contents)", "Home › Add", add_bytes).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k|.dxf (JPEG 2000: desktop, through GDAL)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "blocks"?, "stream"?, "as"? (as layer.addData)}"#),
         C::new("raster.symbology", "Symbology", "Style › Rendering", symbology).when(need_raster).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "grey"?: bool (shadedRelief without its colour ramp)}"#,
+            r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "rock"?: {"from"?: 0..90, "to"?: 0..90, "color"?: #RRGGBB} | false (shadedRelief: steep slopes tinted toward a rock colour before the light, from the ground's own slope in degrees, without the Z factor: the ramp below from, the colour above to, blended between; left out, kept; an object's missing keys keep the current rock's, or 25, 40 and #B2ACA4; false or null removes it), "grey"?: bool (shadedRelief without its colour ramp)}"#,
         ),
         C::new("raster.stretch", "Stretch Type", "Style › Rendering", stretch).inputs(stretch_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_raster)
@@ -791,10 +791,10 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
                 RasterRenderer::Colormap
             }
             "shadedrelief" | "hillshade" => {
-                // Left out, a Shaded Relief keeps its own shadows, sky and fill light; a new one has none.
-                let (cur_shadow, cur_sky, cur_fill) = match rl.style.renderer {
-                    RasterRenderer::ShadedRelief { shadow, sky, fill, .. } => (shadow, sky, fill),
-                    _ => (0.0, 0.0, 0.0),
+                // Left out, a Shaded Relief keeps its own shadows, sky, fill light and rock; a new one has none.
+                let (cur_shadow, cur_sky, cur_fill, cur_rock) = match rl.style.renderer {
+                    RasterRenderer::ShadedRelief { shadow, sky, fill, rock, .. } => (shadow, sky, fill, rock),
+                    _ => (0.0, 0.0, 0.0, None),
                 };
                 RasterRenderer::ShadedRelief {
                     band: bi,
@@ -805,6 +805,10 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
                     shadow: f(p, "shadow").unwrap_or(cur_shadow).clamp(0.0, 1.0),
                     sky: f(p, "sky").unwrap_or(cur_sky).clamp(0.0, 1.0),
                     fill: f(p, "fill").unwrap_or(cur_fill).clamp(0.0, 1.0),
+                    rock: match p.get("rock") {
+                        None => cur_rock,
+                        Some(v) => relief_rock(v, cur_rock)?,
+                    },
                 }
             }
             other => return Err(format!("unknown raster symbology '{other}'")),
@@ -816,6 +820,31 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
         }
         Ok(())
     })
+}
+
+/// The rock of a Shaded Relief's `"rock"` (see `raster.symbology`): `false` or null for none, or
+/// an object whose missing keys keep `cur`'s, or else [`Rock::DEFAULT`]'s.
+fn relief_rock(v: &Value, cur: Option<Rock>) -> Result<Option<Rock>, String> {
+    if v.is_null() || *v == Value::Bool(false) {
+        return Ok(None);
+    }
+    if !v.is_object() {
+        return Err("rock must be an object with from, to and color, or false".into());
+    }
+    let was = cur.unwrap_or(Rock::DEFAULT);
+    let angle = |k: &str, d: f64| match v.get(k).filter(|x| !x.is_null()) {
+        None => Ok(d),
+        Some(x) => x.as_f64().filter(|a| a.is_finite()).map(|a| a.clamp(0.0, 90.0)).ok_or_else(|| format!("rock's {k} must be degrees")),
+    };
+    let (from, to) = (angle("from", was.from)?, angle("to", was.to)?);
+    if from >= to {
+        return Err(format!("rock's from ({from}°) must be below its to ({to}°)"));
+    }
+    let color = super::layout::color(v, "color", was.color)?;
+    if color.a() != 255 {
+        return Err("rock's color must be #RRGGBB: the rock is opaque".into());
+    }
+    Ok(Some(Rock { from, to, color }))
 }
 
 /// Most values a mask lists.

@@ -756,6 +756,15 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
             }
             continue;
         }
+        // Esc cancels a held box gesture before leaving the drawing tool on another press.
+        if id == "tool.set"
+            && p.get("tool").and_then(serde_json::Value::as_str) == Some("explore")
+            && app.session.tool == rustgis_engine::Tool::RotatedBox
+            && crate::boxedit::drawing(app)
+        {
+            crate::boxedit::cancel(app);
+            continue;
+        }
         // With Edit Vertices, Delete removes the chosen vertex rather than the feature.
         if id == "edit.delete"
             && app.session.active_layout.is_none()
@@ -912,6 +921,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "map.package" => SaveItem("mapPackage"),
         "map.rename" => Dialog("renameMap"),
         "map.goToXY" => Dialog("goToXY"),
+        "map.exportOrbit" => Dialog("exportOrbit"),
         "map.findPlace" => Dialog("findPlace"),
         "map.camera" | "map.setScale" => Dialog("camera"),
         "map.basemap" => Dialog("basemap"),

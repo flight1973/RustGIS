@@ -1150,6 +1150,32 @@ impl Default for ZarrTime {
     }
 }
 
+/// Shaded Relief's rock colour on steep slopes (#1913): below `from` degrees of slope the ramp's
+/// colour is kept, above `to` it is `color`, and between them the two are blended on a smooth
+/// step. The slope is the ground's own, without the Z factor (see [`slope`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Rock {
+    pub from: f64,
+    pub to: f64,
+    pub color: Rgba,
+}
+
+impl Rock {
+    /// What a rock turned on without settings is: a light warm grey from 25° to 40°, which a 30 m
+    /// DEM reaches on its real scarps (it averages a cliff with its foot).
+    pub const DEFAULT: Rock = Rock { from: 25.0, to: 40.0, color: Rgba::rgb(0xB2, 0xAC, 0xA4) };
+
+    /// The share of rock (0 to 1) on a slope of `degrees`: 0 up to `from`, 1 from `to` on, and a
+    /// smooth step between them, so no hard outline follows a contour of slope.
+    pub fn share(&self, degrees: f64) -> f64 {
+        if self.to - self.from <= 0.0 {
+            return if degrees >= self.to { 1.0 } else { 0.0 };
+        }
+        let t = ((degrees - self.from) / (self.to - self.from)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+}
+
 fn is_no_light(v: &f64) -> bool {
     *v == 0.0
 }
@@ -1358,7 +1384,8 @@ pub enum RasterRenderer {
     /// is how much the share of the sky each cell sees scales its ambient light
     /// ([`crate::shadow::sky`]); 0, the default, leaves it whole. `fill` (0 to 1) is a fill light
     /// from the side opposite the sun, 55° up, that lightens only the slopes turned toward it; 0,
-    /// the default, has none.
+    /// the default, has none. `rock` tints steep slopes toward a rock colour before the lights
+    /// shade them (see [`Rock`]); none, the default, keeps the ramp.
     ShadedRelief {
         band: usize,
         ramp: Option<Ramp>,
@@ -1371,6 +1398,8 @@ pub enum RasterRenderer {
         sky: f64,
         #[serde(default, skip_serializing_if = "is_no_light")]
         fill: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rock: Option<Rock>,
     },
 }
 
@@ -1929,17 +1958,25 @@ impl<'a> Colorizer<'a> {
     /// The colour of a pixel from its renderer band values (`NaN` = no data), or `None` for
     /// transparent. `hillshade` (0–255) is used by Shaded Relief.
     pub fn color(&self, vals: &[f32], hillshade: Option<u8>) -> Option<[u8; 4]> {
-        self.color_lit(vals, hillshade, None, None)
+        self.color_lit(vals, hillshade, None, None, None)
     }
 
     /// [`Colorizer::color`], with Shaded Relief's ambient light scaled by `ambient` (0–255, the
-    /// share of it the sky a cell sees leaves, see [`RasterRenderer::ShadedRelief`]'s `sky`), and
-    /// `fill` (0–255, a share of the colour) added for its fill light (its `fill`).
-    pub fn color_lit(&self, vals: &[f32], hillshade: Option<u8>, ambient: Option<u8>, fill: Option<u8>) -> Option<[u8; 4]> {
+    /// share of it the sky a cell sees leaves, see [`RasterRenderer::ShadedRelief`]'s `sky`),
+    /// `fill` (0–255, a share of the colour) added for its fill light (its `fill`), and its colour
+    /// moved `rock` (0–255) of the way to its rock colour (its `rock`, see [`Rock::share`]).
+    pub fn color_lit(
+        &self,
+        vals: &[f32],
+        hillshade: Option<u8>,
+        ambient: Option<u8>,
+        fill: Option<u8>,
+        rock: Option<u8>,
+    ) -> Option<[u8; 4]> {
         // The renderer masks values as it samples them (they arrive as NaN); this is for other callers.
         let mask = &self.style.mask;
         if mask.is_empty() || !vals.iter().any(|v| mask.hides(*v)) {
-            return self.paint(vals, hillshade, ambient, fill);
+            return self.paint(vals, hillshade, ambient, fill, rock);
         }
         // Masked values are no data. The renderer bands are at most three.
         let mut kept = [f32::NAN; 3];
@@ -1948,10 +1985,10 @@ impl<'a> Colorizer<'a> {
                 *k = *v;
             }
         }
-        self.paint(kept.get(..vals.len().min(3)).unwrap_or(&kept), hillshade, ambient, fill)
+        self.paint(kept.get(..vals.len().min(3)).unwrap_or(&kept), hillshade, ambient, fill, rock)
     }
 
-    fn paint(&self, vals: &[f32], hillshade: Option<u8>, ambient: Option<u8>, fill: Option<u8>) -> Option<[u8; 4]> {
+    fn paint(&self, vals: &[f32], hillshade: Option<u8>, ambient: Option<u8>, fill: Option<u8>, rock: Option<u8>) -> Option<[u8; 4]> {
         let v0 = *vals.first()?;
         let c = match &self.style.renderer {
             RasterRenderer::Rgb { .. } => {
@@ -1978,9 +2015,14 @@ impl<'a> Colorizer<'a> {
                 }
                 *self.palette.get(i as usize)?
             }
-            RasterRenderer::ShadedRelief { ramp, .. } => {
+            RasterRenderer::ShadedRelief { ramp, rock: steep, .. } => {
                 let h = hillshade.unwrap_or(180) as f64 / 255.0;
                 let base = if ramp.is_some() { *self.ramp_lut.get(self.byte(0, v0) as usize)? } else { [255, 255, 255, 255] };
+                // Steep ground first takes on the rock colour; the light then shades either.
+                let base = match (steep, rock) {
+                    (Some(steep), Some(share)) if share > 0 => Rgba(base).lerp(steep.color.with_alpha(255), f64::from(share) / 255.0).0,
+                    _ => base,
+                };
                 // Multiply the tint by the hillshade, keeping some ambient light (less of it where
                 // the terrain hides part of the sky), and adding the fill light on its own.
                 let a = 0.25 * ambient.map_or(1.0, |a| f64::from(a) / 255.0);
@@ -1993,16 +2035,29 @@ impl<'a> Colorizer<'a> {
     }
 }
 
-/// Hillshade (0–255) from a 3×3 window of elevations (row by row), Horn's method.
-pub fn hillshade(z: &[f64; 9], cell_x: f64, cell_y: f64, azimuth: f64, altitude: f64, z_factor: f64) -> u8 {
+/// The slope (degrees) of a 3×3 window of elevations (row by row), from the gradient
+/// [`hillshade`] uses: the ground's own, with no Z factor.
+pub fn slope(z: &[f64; 9], cell_x: f64, cell_y: f64) -> f64 {
+    let (dzdx, dzdy) = horn(z, cell_x, cell_y);
+    dzdx.hypot(dzdy).atan().to_degrees()
+}
+
+/// The east and south gradients of a 3×3 window of elevations, Horn's method.
+fn horn(z: &[f64; 9], cell_x: f64, cell_y: f64) -> (f64, f64) {
     let [a, b, c, d, _, f, g, h, i] = *z;
     let dzdx = ((c + 2.0 * f + i) - (a + 2.0 * d + g)) / (8.0 * cell_x.max(1e-9));
     let dzdy = ((g + 2.0 * h + i) - (a + 2.0 * b + c)) / (8.0 * cell_y.max(1e-9));
-    let slope = (z_factor * (dzdx * dzdx + dzdy * dzdy).sqrt()).atan();
+    (dzdx, dzdy)
+}
+
+/// Hillshade (0–255) from a 3×3 window of elevations (row by row), Horn's method.
+pub fn hillshade(z: &[f64; 9], cell_x: f64, cell_y: f64, azimuth: f64, altitude: f64, z_factor: f64) -> u8 {
+    let (dzdx, dzdy) = horn(z, cell_x, cell_y);
+    let tilt = (z_factor * (dzdx * dzdx + dzdy * dzdy).sqrt()).atan();
     let aspect = if dzdx != 0.0 || dzdy != 0.0 { dzdy.atan2(-dzdx) } else { 0.0 };
     let zenith = (90.0 - altitude.clamp(0.0, 90.0)).to_radians();
     let az = (360.0 - azimuth + 90.0).rem_euclid(360.0).to_radians();
-    let v = zenith.cos() * slope.cos() + zenith.sin() * slope.sin() * (az - aspect).cos();
+    let v = zenith.cos() * tilt.cos() + zenith.sin() * tilt.sin() * (az - aspect).cos();
     (v.max(0.0) * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
@@ -2300,6 +2355,11 @@ mod tests {
     use rustgis_data::raster::{Crs, GeoTransform};
 
     use super::*;
+
+    /// A Shaded Relief without a ramp or rock, lit from `azimuth` and `altitude`.
+    fn grey_relief(azimuth: f64, altitude: f64, z_factor: f64, shadow: f64, sky: f64) -> RasterRenderer {
+        RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth, altitude, z_factor, shadow, sky, fill: 0.0, rock: None }
+    }
 
     /// The legend names a class as the file does (#889), and gives the value of one it doesn't.
     #[test]
@@ -2787,14 +2847,76 @@ mod tests {
         assert!(plain.opening.is_none(), "an anonymous web raster is not fetched whole");
     }
 
+    /// Rock on steep slopes (#1913): the ramp's colour up to `from`, the rock's from `to` on, and a
+    /// smooth step between them; the slope is the ground's own, which no Z factor changes; and the
+    /// rock is saved only when set.
+    #[test]
+    fn rock_tints_steep_slopes_by_the_grounds_own_slope() {
+        let rock = Rock { from: 20.0, to: 40.0, color: Rgba::rgb(200, 100, 50) };
+        assert_eq!((rock.share(0.0), rock.share(20.0), rock.share(40.0), rock.share(70.0)), (0.0, 0.0, 1.0, 1.0));
+        assert!((rock.share(30.0) - 0.5).abs() < 1e-12);
+        let (a, b) = (rock.share(22.0), rock.share(25.0));
+        assert!(0.0 < a && a < b && b < 0.5, "a smooth step, slow at its ends: {a}, {b}");
+        // A plane rising one metre a metre eastward is 45 degrees, whatever the light's Z factor.
+        let z = [0.0, 10.0, 20.0, 0.0, 10.0, 20.0, 0.0, 10.0, 20.0];
+        assert!((slope(&z, 10.0, 10.0) - 45.0).abs() < 1e-9);
+        assert_ne!(hillshade(&z, 10.0, 10.0, 270.0, 45.0, 1.0), hillshade(&z, 10.0, 10.0, 270.0, 45.0, 3.0));
+
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let r =
+            Raster::new("dem", 10, 10, vec![(0..100).map(|v| v as f32).collect()], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32")
+                .unwrap();
+        let relief = |rock| RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: Some(Ramp::Terrain),
+            azimuth: 315.0,
+            altitude: 45.0,
+            z_factor: 1.0,
+            shadow: 0.0,
+            sky: 0.0,
+            fill: 0.0,
+            rock,
+        };
+        let (mut rocky, mut plain) = (RasterStyle::default_for(&r), RasterStyle::default_for(&r));
+        (rocky.renderer, plain.renderer) = (relief(Some(rock)), relief(None));
+        let (with, without) = (Colorizer::new(&rocky, &r, None), Colorizer::new(&plain, &r, None));
+        for (v, h) in [(10.0, 0), (50.0, 128), (90.0, 255)] {
+            let plain = without.color_lit(&[v], Some(h), None, None, None);
+            assert_eq!(with.color_lit(&[v], Some(h), None, None, None), plain, "no share of rock: the ramp");
+            assert_eq!(with.color_lit(&[v], Some(h), None, None, Some(0)), plain, "flat ground: the ramp");
+            assert_eq!(without.color_lit(&[v], Some(h), None, None, Some(255)), plain, "no rock set: the ramp");
+            // All rock: the rock colour, lit as the ramp is (a quarter ambient, the rest the sun).
+            let lit = |c: u8| (f64::from(c) * (0.25 + 0.75 * f64::from(h) / 255.0)).round() as u8;
+            assert_eq!(with.color_lit(&[v], Some(h), None, None, Some(255)), Some([lit(200), lit(100), lit(50), 255]));
+            // Half way: half way between the two colours.
+            let half = with.color_lit(&[v], Some(255), None, None, Some(128)).unwrap();
+            let ramp = without.color_lit(&[v], Some(255), None, None, None).unwrap();
+            for (k, end) in [200u8, 100, 50].into_iter().enumerate() {
+                let mid = (f64::from(ramp[k]) + f64::from(end)) / 2.0;
+                assert!((f64::from(half[k]) - mid).abs() <= 1.5, "{v}: channel {k} {} not near {mid}", half[k]);
+            }
+            // With the sky and the fill light (#1912) too: the rock colour first, then every light
+            // shades it, as they shade the ramp.
+            let all = |c: u8| (f64::from(c) * (0.25 * 128.0 / 255.0 + 0.75 * f64::from(h) / 255.0 + 40.0 / 255.0)).round() as u8;
+            assert_eq!(with.color_lit(&[v], Some(h), Some(128), Some(40), Some(255)), Some([all(200), all(100), all(50), 255]));
+            let filled = without.color_lit(&[v], Some(h), Some(128), Some(40), None);
+            assert_eq!(with.color_lit(&[v], Some(h), Some(128), Some(40), Some(0)), filled, "flat ground: the filled ramp");
+        }
+
+        // Saved only when set, and read back as it was.
+        let saved = serde_json::to_string(&relief(None)).unwrap();
+        assert!(!saved.contains("rock"), "{saved}");
+        let saved = serde_json::to_string(&relief(Some(rock))).unwrap();
+        assert_eq!(serde_json::from_str::<RasterRenderer>(&saved).unwrap(), relief(Some(rock)));
+    }
+
     /// A tower lit from the east, drawn as Shaded Relief with `shadow`.
     fn tower(shadow: f64) -> RasterLayer {
         let gt = GeoTransform { origin_x: 0.0, origin_y: 0.0, pixel_width: 30.0, pixel_height: -30.0 };
         let data: Vec<f32> = (0..400).map(|i| if i == 10 * 20 + 10 { 900.0 } else { 0.0 }).collect();
         let r = Raster::new("tower", 20, 20, vec![data], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
         let mut rl = RasterLayer::from_path(r, "tower.tif");
-        rl.style.renderer =
-            RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth: 90.0, altitude: 30.0, z_factor: 1.0, shadow, sky: 0.0, fill: 0.0 };
+        rl.style.renderer = grey_relief(90.0, 30.0, 1.0, shadow, 0.0);
         rl
     }
 
@@ -2852,16 +2974,7 @@ mod tests {
         let r = Raster::new("hills", 1200, 1200, vec![data], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
         let mut rl = RasterLayer::from_path(r, "hills.tif");
         let lit = |rl: &mut RasterLayer, az: f64| {
-            rl.style.renderer = RasterRenderer::ShadedRelief {
-                band: 0,
-                ramp: None,
-                azimuth: az,
-                altitude: 10.0,
-                z_factor: 1.0,
-                shadow: 1.0,
-                sky: 0.0,
-                fill: 0.0,
-            };
+            rl.style.renderer = grey_relief(az, 10.0, 1.0, 1.0, 0.0);
         };
         let other = |az: f64, rl: &RasterLayer| {
             let mut c = rl.clone();
@@ -2920,16 +3033,7 @@ mod tests {
         let data: Vec<f32> = (0..2000 * 2000).map(|i| ((i % 2000) as f32 * 0.01) + ((i / 2000) as f32 * 0.01)).collect();
         let r = Raster::new("plain", 2000, 2000, vec![data], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
         let mut rl = RasterLayer::from_path(r, "plain.tif");
-        rl.style.renderer = RasterRenderer::ShadedRelief {
-            band: 0,
-            ramp: None,
-            azimuth: 135.0,
-            altitude: 2.0,
-            z_factor: 1.0,
-            shadow: 1.0,
-            sky: 0.0,
-            fill: 0.0,
-        };
+        rl.style.renderer = grey_relief(135.0, 2.0, 1.0, 1.0, 0.0);
         let (sent, landings) = std::sync::mpsc::channel::<()>();
         {
             let _cancelled = rustgis_data::progress::install(Some(std::sync::Arc::new(Cancelled)));
@@ -2957,16 +3061,7 @@ mod tests {
         let data: Vec<f32> = (0..800 * 800).map(|i| ((i % 800) as f32 * 0.01) + ((i / 800) as f32 * 0.01)).collect();
         let r = Raster::new("plain", 800, 800, vec![data], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
         let mut rl = RasterLayer::from_path(r, "plain.tif");
-        rl.style.renderer = RasterRenderer::ShadedRelief {
-            band: 0,
-            ramp: None,
-            azimuth: 135.0,
-            altitude: 3.0,
-            z_factor: 1.0,
-            shadow: 1.0,
-            sky: 0.0,
-            fill: 0.0,
-        };
+        rl.style.renderer = grey_relief(135.0, 3.0, 1.0, 1.0, 0.0);
         let (sent, landings) = std::sync::mpsc::channel::<&'static str>();
         let told = |who: &'static str| {
             let tx = sent.clone();

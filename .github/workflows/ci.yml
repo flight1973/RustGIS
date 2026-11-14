@@ -18,8 +18,11 @@ on:
         options: [all, linux]
         default: all
 
+# A pull request's runs are grouped by its number, not by github.ref: a run GitHub creates after
+# the pull request has merged gets the base branch's ref (refs/heads/main), and would otherwise
+# join main's group and cancel main's run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.ref }}
   cancel-in-progress: true
 
 env:

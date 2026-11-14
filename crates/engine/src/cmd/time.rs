@@ -382,11 +382,15 @@ pub(super) fn frames(
     Err("exporting animations needs the desktop app".into())
 }
 
+/// See [`frames`]: the browser build leaves the GIF encoder out.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn animate(_: usize, _: Option<u32>, _: impl FnMut(usize) -> Result<Vec<u8>, String>) -> Result<Vec<u8>, String> {
+    Err("exporting animations needs the desktop app".into())
+}
+
 /// Renders the map `n` times at `(width, height, dpi)`, after `go` set the session up for each
-/// frame (a time step, a turn of the camera): an animated GIF that loops, each frame shown for
-/// `gif` milliseconds, or (`None`) a zip of PNGs. A run asked to stop (`rustgis_data::progress`)
-/// stops between frames with nothing made, and what the frames said of their cast shadows is
-/// said once, about `what`, not once a frame.
+/// frame (a time step): the animation [`animate`] writes. What the frames said of their cast
+/// shadows is said once, about `what`, not once a frame.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn frames(
     s: &mut Session,
@@ -396,7 +400,29 @@ pub(super) fn frames(
     gif: Option<u32>,
     mut go: impl FnMut(&mut Session, usize),
 ) -> Result<Vec<u8>, String> {
+    super::share::saying_shadows(s, what, |s| {
+        animate(n, gif, |i| {
+            go(s, i);
+            // Natively the frame (through rustgis_render::render_complete) fetches the tiles it
+            // lacks and waits for them before it draws: dated tile layers have this step's
+            // address by now, so each frame shows its own date's imagery.
+            let png = super::share::map_png_unsaid(s, Some(w), Some(h), Some(dpi))?;
+            // What this frame's file left out, said while its header is surely in (a cleared
+            // tile cache could drop it before the export ends): the slider moves on before the
+            // command's own landing check.
+            s.notice_landed_rasters();
+            Ok(png)
+        })
+    })
+}
+
+/// The `n` PNGs `frame` draws, one a call, as an animated GIF that loops, each frame shown for
+/// `gif` milliseconds, or (`None`) a zip of PNGs. The frames are its progress
+/// (`rustgis_data::progress`), and a run asked to stop stops between them with nothing made.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn animate(n: usize, gif: Option<u32>, mut frame: impl FnMut(usize) -> Result<Vec<u8>, String>) -> Result<Vec<u8>, String> {
     use image::codecs::gif::{GifEncoder, Repeat};
+    let stop = || rustgis_data::progress::check().map_err(|e| e.to_string());
     let mut out = Vec::new();
     let mut pngs = Vec::new();
     {
@@ -408,33 +434,23 @@ pub(super) fn frames(
             }
             None => None,
         };
-        super::share::saying_shadows(s, what, |s| {
-            for i in 0..n {
-                // Before the frame, so a run already asked to stop draws nothing.
-                rustgis_data::progress::check().map_err(|e| e.to_string())?;
-                go(s, i);
-                // Natively the frame (through rustgis_render::render_complete) fetches the tiles
-                // it lacks and waits for them before it draws: dated tile layers have this
-                // step's address by now, so each frame shows its own date's imagery, and a
-                // turned view its own ground.
-                let png = super::share::map_png_unsaid(s, Some(w), Some(h), Some(dpi))?;
-                // What this frame's file left out, said while its header is surely in (a cleared
-                // tile cache could drop it before the export ends): the slider, or the camera,
-                // moves on before the command's own landing check.
-                s.notice_landed_rasters();
-                // After the frame, so one whose wait for tiles was cut short is never kept.
-                rustgis_data::progress::check().map_err(|e| e.to_string())?;
-                match (&mut enc, gif) {
-                    (Some(e), Some(ms)) => {
-                        let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).map_err(|e| e.to_string())?.to_rgba8();
-                        let delay = image::Delay::from_numer_denom_ms(ms, 1);
-                        e.encode_frame(image::Frame::from_parts(img, 0, 0, delay)).map_err(|e| e.to_string())?;
-                    }
-                    _ => pngs.push((format!("frame_{:04}.png", i + 1), png)),
+        rustgis_data::progress::begin(n);
+        for i in 0..n {
+            // Before the frame, so a run already asked to stop draws nothing.
+            stop()?;
+            let png = frame(i)?;
+            // After the frame, so one whose wait for tiles was cut short is never kept.
+            stop()?;
+            match (&mut enc, gif) {
+                (Some(e), Some(ms)) => {
+                    let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).map_err(|e| e.to_string())?.to_rgba8();
+                    let delay = image::Delay::from_numer_denom_ms(ms, 1);
+                    e.encode_frame(image::Frame::from_parts(img, 0, 0, delay)).map_err(|e| e.to_string())?;
                 }
+                _ => pngs.push((format!("frame_{:04}.png", i + 1), png)),
             }
-            Ok(())
-        })?;
+            rustgis_data::progress::step(1).map_err(|e| e.to_string())?;
+        }
     }
     if gif.is_some() { Ok(out) } else { rustgis_data::zip::write(&pngs) }
 }

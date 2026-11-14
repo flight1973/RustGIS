@@ -100,10 +100,16 @@ ending in `.gif` gives an animated GIF that loops, each frame shown for `"speed"
 (default 50; a GIF keeps times to the hundredth of a second, so 55 shows as 50 or 60); one ending in `.zip` gives the frames as PNGs (`frame_0001.png`…), to build a video
 with another tool, since a GIF's 256 colours can band a smooth relief. A turn of 360° stops one
 step short of where it began, so the loop has no frame twice; a part of a turn ends on its last
-bearing. The light of a shaded relief stays with the ground, not the camera. The view comes back
-to where it was afterwards. The export runs to its end before the command answers; the frames
-count against a limit of 300 million pixels in all (170 frames at 1600 × 1100, say), and a size
-past it is refused:
+bearing. The light of a shaded relief stays with the ground, not the camera. The frames are drawn
+from a copy of the map, so the view doesn't move. The frames count against a limit of 300 million
+pixels in all (170 frames at 1600 × 1100, say), and a size past it is refused.
+
+In the desktop app, **View › Scene › Export Orbit…** opens a dialog with the frames, the turn,
+the size and a GIF's frame time (an empty box keeps the default); **Export…** checks them and
+only then asks where to write the file. The frames are then drawn in the background, so the window stays free: the status bar
+shows the export, how many frames it has drawn, and **Cancel**, which stops it between frames
+and writes nothing. From a script or the command line the command runs to its end before it
+answers:
 
 ```bash
 rustgis-cli run --cmd 'project.open={"path":"massif.rgis"}' --cmd 'map.setPitch={"pitch":60}' --cmd 'map.exportOrbit={"path":"massif.gif","frames":72,"width":800,"height":500}'

@@ -133,6 +133,11 @@ plugin with that permission can send information it can read to addresses it cho
 Desktop process plugins are not sandboxed and can access files and the network as ordinary
 programs. Review the permissions and publisher before installing; see [Plugins](plugins.md).
 
+Plugins can keep settings of their own on your computer: a file per plugin in the desktop app's
+plugins folder, or the browser's localStorage in the web app. They are not sent anywhere by
+RustGIS, and uninstalling a plugin erases them (for a development folder, see
+[Plugins](plugins.md)).
+
 On the desktop, **Help › Check for Updates** contacts GitHub's latest-release API only when
 you ask. It does not upload your project. On Windows, **Download and Install** then downloads
 the release's installer and its `SHA256SUMS` from GitHub's release downloads, only when you

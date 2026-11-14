@@ -2,6 +2,8 @@
 //! and the workflows (suitability, visibility, lines of sight, interpolation, network routes,
 //! neighbourhoods, simulation, data profiles, exploration, similarity and format conversion).
 
+use std::collections::HashMap;
+
 use rustgis_analysis::{network, rasterops};
 use rustgis_data::raster::{Crs, Raster};
 use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
@@ -52,10 +54,10 @@ pub fn commands() -> Vec<C> {
         C::new("script.run", "Run Script", "Analyze › Geoprocessing", run_script).roles(&[crate::ParamRole { key: "script", role: crate::Role::Script }]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Automation))
             .params(r#"{"script": "one command per line: id {json}; # comments"}"#),
         C::new("raster.function", "Raster Functions", "Analyze › Raster", raster_function).inputs(function_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample", "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]], "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
+            r#"{"layer": raster, "function": "slope"|"aspect"|"hillshade"|"ndvi"|"bandMath"|"remap"|"threshold"|"resample" (slope returns degrees, not percent), "band"?: 1-based, "expression"?: "(b4-b3)/(b4+b3)", "ranges"?: [[lo, hi, value]], "value"?: number, "keep"?: bool (remap: keep unmatched cells), "nir"?, "red"?: band numbers (ndvi; default 4 and 3), "azimuth"?, "altitude"?, "zFactor"?, "target"?: raster (resample onto its grid), "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
         C::new("raster.functionChain", "Function Editor", "Analyze › Raster", function_chain).inputs(chain_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"layer": raster, "steps": [{"function", …}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
+            .params(r#"{"layer": raster, "steps": [{"function", … (as raster.function; slope returns degrees, not percent)}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#),
         C::new("analysis.suitability", "Suitability Modeler", "Analyze › Workflows", suitability).inputs(suitability_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"criteria": [{"layer": raster, "band"?: 1-based, "ranges": [[lo, hi, score]], "weight": number}], "name"?: output, "ran"?: (internal: a raster the app has worked out)}"#,
         ),
@@ -494,7 +496,11 @@ pub fn gallery_list(kind: &str) -> CmdResult {
         .collect();
     if kind == "raster" {
         for (id, name, summary) in [
-            ("raster.function", "Raster Functions", "Slope, aspect, hillshade, NDVI, band math, remap, threshold and resampling."),
+            (
+                "raster.function",
+                "Raster Functions",
+                "Slope (degrees), aspect, hillshade, NDVI, band math, remap, threshold and resampling.",
+            ),
             ("analysis.suitability", "Suitability Modeler", "Weighted overlay of scored rasters."),
             ("analysis.viewshed", "Viewshed", "The cells visible from an observer on a DEM."),
             ("analysis.interpolate", "Interpolate (IDW)", "A raster surface from point values."),
@@ -562,19 +568,58 @@ fn note_passed_graph(s: &mut Session, p: &Value) {
     }
 }
 
+/// The most characters a model's name takes.
+const MAX_MODEL_NAME: usize = 200;
+
+/// Makes a model from a graph, steps or the run history. It stays on the UI thread (the Analyze
+/// pane's "New Model From History" calls it there) because no tool runs here: each history run is
+/// read once, so the work is linear in the history.
 fn new_model(s: &mut Session, p: &Value) -> CmdResult {
-    let base = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Model").chars().take(200).collect::<String>();
+    // A name given past its limit is refused, not cut.
+    let base = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Model").to_string();
+    let length = base.chars().count();
+    if length > MAX_MODEL_NAME {
+        return Err(format!("name is {length} characters: a model's name takes at most {MAX_MODEL_NAME}"));
+    }
+    // A graph, steps or the history is one way to make a model: given two, the other would be
+    // dropped without a word, so that is refused.
+    let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
+    let ways = usize::from(given("graph")) + usize::from(given("steps")) + usize::from(b(p, "fromHistory").unwrap_or(false));
+    if ways > 1 {
+        return Err("give a graph, steps or fromHistory, not more than one of them".into());
+    }
     let (graph, dropped) = read_graph(p)?;
-    let steps: Vec<ModelStep> = match p.get("steps") {
+    // From the history: the successful runs left out for a tool that isn't available, and the
+    // steps that read a layer one of them made.
+    let (mut from_history, mut unavailable, mut unmade_at) = (false, 0usize, Vec::<usize>::new());
+    // A null steps is none given, as the check for more than one way above takes it.
+    let steps: Vec<ModelStep> = match p.get("steps").filter(|v| !v.is_null()) {
         _ if graph.is_some() => graph.as_ref().map(crate::model::graph_to_steps).unwrap_or_default(),
-        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("steps: {e}"))?,
+        // Steps given past a model's limit are refused, not cut.
+        Some(v) => {
+            let steps: Vec<ModelStep> = serde_json::from_value(v.clone()).map_err(|e| format!("steps: {e}"))?;
+            if steps.len() > crate::model::MAX_NODES {
+                return Err(format!("steps has {} entries: a model takes at most {}", steps.len(), crate::model::MAX_NODES));
+            }
+            steps
+        }
         None if b(p, "fromHistory").unwrap_or(false) => {
+            from_history = true;
             // Each successful run becomes a step; inputs naming an earlier run's output become
             // references to it, so the model re-runs as a chain.
             let mut steps: Vec<ModelStep> = Vec::new();
-            let mut outputs: Vec<Vec<String>> = Vec::new();
+            // Each name holds the latest run that made it, with that run's step when it's replayed:
+            // a run left out still made what it made, so a later step isn't wired to an older run's
+            // output of the same name.
+            let mut made: HashMap<&str, Option<usize>> = HashMap::new();
             for r in s.project.gp_history.iter().filter(|r| r.ok) {
-                let Some(tool) = super::gp::tool_id(&r.tool) else { continue };
+                let Some(tool) = super::gp::tool_id(&r.tool) else {
+                    unavailable += 1;
+                    for name in r.outputs.iter() {
+                        made.insert(name.as_str(), None);
+                    }
+                    continue;
+                };
                 let mut params = r.params.clone();
                 // Only layer parameters can name an earlier output.
                 let spec = rustgis_analysis::resolve_published(tool).map(|r| r.spec());
@@ -590,25 +635,39 @@ fn new_model(s: &mut Session, p: &Value) -> CmdResult {
                         )
                     })
                 };
+                let mut reads_unmade = false;
                 if let Value::Object(o) = &mut params {
                     for (key, v) in o.iter_mut() {
                         if let Some(t) = v.as_str().filter(|_| is_layer(key))
                             // The latest run that made that name (names can be reused).
-                            && let Some(k) = outputs.iter().rposition(|outs| outs.iter().any(|x| x == t))
+                            && let Some(&made_by) = made.get(t)
                         {
-                            *v = json!(format!("%{}", k + 1));
+                            match made_by {
+                                Some(k) => *v = json!(format!("%{}", k + 1)),
+                                // Made by a run left out: the step reads the layer of that name,
+                                // as the project has it, and that is said.
+                                None => reads_unmade = true,
+                            }
                         }
                     }
                 }
+                if reads_unmade {
+                    unmade_at.push(steps.len());
+                }
+                for name in r.outputs.iter() {
+                    made.insert(name.as_str(), Some(steps.len()));
+                }
                 steps.push(ModelStep { tool: tool.to_string(), params });
-                outputs.push(r.outputs.clone());
             }
             steps
         }
         None => Vec::new(),
     };
-    // A graph may name tools not installed here (its problems say so); steps may not.
+    // A history longer than a model takes keeps its first runs; that is said below. A graph's
+    // steps are within the limit already (read_graph refuses a larger graph).
+    let replayable = steps.len();
     let steps: Vec<ModelStep> = steps.into_iter().take(crate::model::MAX_NODES).collect();
+    // A graph may name tools not installed here (its problems say so); steps may not.
     if graph.is_none() {
         for st in &steps {
             if super::gp::tool_id(&st.tool).is_none() {
@@ -621,11 +680,45 @@ fn new_model(s: &mut Session, p: &Value) -> CmdResult {
     let mut i = 1;
     while s.project.models.iter().any(|m| m.name.eq_ignore_ascii_case(&name)) {
         i += 1;
-        name = format!("{base} {i}");
+        // The suffix that tells it apart fits within the name's limit: the name given gives way
+        // to it, and that is said. A cut that lands on a space keeps no space before the suffix.
+        let suffix = format!(" {i}");
+        let head: String = base.chars().take(MAX_MODEL_NAME - suffix.chars().count()).collect();
+        name = format!("{}{suffix}", head.trim_end());
     }
     let n = steps.len();
+    // Of the steps the model keeps.
+    let unmade = unmade_at.iter().filter(|&&i| i < n).count();
     s.project.models.push(Model { name: name.clone(), steps, graph });
     notify_graph_dropped(s, dropped);
+    let kept = name.chars().count() - if i > 1 { format!(" {i}").chars().count() } else { 0 };
+    if kept < length {
+        s.notify(
+            format!("ModelBuilder: a model has that name already, so the name given is cut to {kept} characters to fit \" {i}\""),
+            false,
+        );
+    }
+    // From the history: what it can't replay, and where it cuts, each said with its count.
+    if unavailable > 0 {
+        let said = if unavailable == 1 {
+            "1 successful run in the history uses a tool that isn't available, so it's left out".to_string()
+        } else {
+            format!("{unavailable} successful runs in the history use a tool that isn't available, so they're left out")
+        };
+        s.notify(format!("{name}: {said}"), false);
+    }
+    if unmade > 0 {
+        s.notify(
+            format!("{name}: {unmade} step(s) read a layer made by a run that's left out, so they read the project's layer of that name"),
+            false,
+        );
+    }
+    if from_history && replayable > n {
+        s.notify(
+            format!("{name}: the model takes the first {n} of the {replayable} successful runs it can replay from the history"),
+            false,
+        );
+    }
     Ok(json!({"model": name, "steps": n}))
 }
 
@@ -1107,12 +1200,25 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
     }
     Ok(Box::new(move || {
         let pixels = apply_function(&src, &p, target.as_deref())?;
-        if is_hillshade(&p) {
-            return made_hillshade(rasterops::derive_hillshade(&src, &name, pixels)?, &defaults);
-        }
         // Only a resample takes another raster's grid.
-        made(rasterops::derive(target.as_deref().unwrap_or(&src), &name, vec![pixels])?, None)
+        let raster = derive_function(target.as_deref().unwrap_or(&src), &name, &p, pixels)?;
+        if is_hillshade(&p) { made_hillshade(raster, &defaults) } else { made(raster, None) }
     }))
+}
+
+/// Wraps a function's pixels on its output grid, keeping a slope's unit in its band description
+/// and a hillshade's byte storage. A later function starts with its own description.
+fn derive_function(r: &Raster, name: &str, p: &Value, pixels: Vec<f32>) -> Result<Raster, String> {
+    if is_hillshade(p) {
+        return rasterops::derive_hillshade(r, name, pixels);
+    }
+    let mut out = rasterops::derive(r, name, vec![pixels])?;
+    if ps(p, "function") == Some("slope")
+        && let Some(band) = out.bands.first_mut()
+    {
+        band.name = "Slope (degrees)".into();
+    }
+    Ok(out)
 }
 
 /// Whether raster function step `p` is a hillshade, whose pixels are bytes
@@ -1165,11 +1271,7 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
             let f = func(st);
             let pixels = apply_function(&cur, st, target.as_deref()).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
             // Only a resample takes another raster's grid; otherwise the grid is the current one.
-            cur = if is_hillshade(st) {
-                rasterops::derive_hillshade(&cur, &cur.name, pixels)?
-            } else {
-                rasterops::derive(target.as_deref().unwrap_or(&cur), &cur.name, vec![pixels])?
-            };
+            cur = derive_function(target.as_deref().unwrap_or(&cur), &cur.name, st, pixels)?;
             names.push(f);
         }
         cur.name = named.unwrap_or_else(|| format!("{}_{}", cur.name, names.join("_")));

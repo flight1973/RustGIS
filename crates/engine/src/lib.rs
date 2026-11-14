@@ -5,6 +5,7 @@
 //! [`Session::run`]. Programmatic calls never open dialogs.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod box_edit;
 pub mod cmd;
 pub mod connections;
 pub mod durable;
@@ -405,6 +406,8 @@ pub enum Tool {
     CreatePolygon,
     /// Moves, inserts and deletes the vertices of the selected features.
     EditVertices,
+    /// Draws and edits session-local rectangle constructions on ordinary polygon layers.
+    RotatedBox,
     /// Drags a layer's label to where it should be (`labels.move`), as QGIS's Move Label tool;
     /// dragging anything else pans the map.
     MoveLabel,
@@ -446,6 +449,7 @@ impl Tool {
             Tool::CreateLine => "createLine",
             Tool::CreatePolygon => "createPolygon",
             Tool::EditVertices => "editVertices",
+            Tool::RotatedBox => "rotatedBox",
             Tool::MoveLabel => "moveLabel",
             Tool::CutPolygon => "cutPolygon",
             Tool::Reshape => "reshape",
@@ -469,6 +473,7 @@ impl Tool {
             Tool::CreateLine,
             Tool::CreatePolygon,
             Tool::EditVertices,
+            Tool::RotatedBox,
             Tool::MoveLabel,
             Tool::CutPolygon,
             Tool::Reshape,
@@ -490,6 +495,7 @@ impl Tool {
             Tool::CreateLine => "Create Line",
             Tool::CreatePolygon => "Create Polygon",
             Tool::EditVertices => "Edit Vertices",
+            Tool::RotatedBox => "Rotated Box",
             Tool::MoveLabel => "Move Label",
             Tool::CutPolygon => "Cut Polygon",
             Tool::Reshape => "Reshape",
@@ -588,8 +594,16 @@ struct ProjectFiles {
 /// An undo or redo step: the project before it, the layout open then, its label, who made it,
 /// and which state of the project it is ([`Session::dirty`]). File origins accompany changes
 /// made by the command only: undoing an ordinary edit must not undo a subsequent Save As.
-type Step =
-    (Project, Option<usize>, &'static str, Option<String>, u64, Option<ProjectFiles>, (policy::Trust, policy::Trust, policy::Trust));
+type Step = (
+    Project,
+    Option<usize>,
+    &'static str,
+    Option<String>,
+    u64,
+    Option<ProjectFiles>,
+    (policy::Trust, policy::Trust, policy::Trust),
+    box_edit::Cache,
+);
 
 /// What a project holds in the session beside itself: what [`Session::clear_history`] forgets
 /// when another project starts, and what opening one sets (its file, layer, tool…). When another
@@ -598,6 +612,7 @@ type Step =
 /// ([`Session::take_project_state`]) serves both, and giving it back names every field, so a
 /// field forgotten here can't be wiped by a replacement without coming back.
 struct PutAside {
+    boxes: box_edit::Cache,
     /// The project these belong to (`Session::opened` before the replacement).
     opened: u64,
     undo: Vec<Step>,
@@ -656,6 +671,7 @@ struct PutAside {
 }
 
 pub struct Session {
+    pub(crate) boxes: box_edit::Cache,
     policy: policy::State,
     pub project: Project,
     pub path: Option<PathBuf>,
@@ -1217,6 +1233,7 @@ impl Session {
             active_report: None,
             active_presentation: None,
             active_notebook: None,
+            boxes: Default::default(),
             edit_counts: std::collections::HashMap::new(),
             topology_errors: Vec::new(),
             measurements: Vec::new(),
@@ -1788,6 +1805,7 @@ impl Session {
     /// and restored if `f` fails or panics.
     pub(crate) fn guarded(&mut self, label: &'static str, mutates: bool, f: impl FnOnce(&mut Session) -> CmdResult) -> CmdResult {
         let snapshot = mutates.then(|| self.project.clone());
+        let box_snapshot = self.boxes.clone();
         let trust = (self.trusted_tasks.clone(), self.trusted_models.clone(), self.trusted_notebooks.clone());
         let state = self.state;
         // The merge key asked for applies to this command only, whatever it does; and to a
@@ -1866,7 +1884,7 @@ impl Session {
                     files.identity != self.file_identity || files.path != self.path || files.opened_package != self.opened_package
                 });
                 if key.is_none() || key != self.merged || self.undo.is_empty() {
-                    self.undo.push((snap, open_layout, label, self.actor.clone(), state, files, trust.clone()));
+                    self.undo.push((snap, open_layout, label, self.actor.clone(), state, files, trust.clone(), box_snapshot));
                     if self.undo.len() > UNDO_LIMIT {
                         self.undo.remove(0);
                     }
@@ -1904,6 +1922,7 @@ impl Session {
                     self.opened_package = files.opened_package;
                 }
                 self.opened = opened;
+                self.boxes = box_snapshot;
                 self.sync_policy_generation();
                 self.state = state;
                 if let Some(c) = counts {
@@ -1987,6 +2006,7 @@ impl Session {
         use std::mem::take;
         (self.merge, self.merged) = (None, None);
         PutAside {
+            boxes: take(&mut self.boxes),
             opened: self.opened,
             undo: take(&mut self.undo),
             redo: take(&mut self.redo),
@@ -2043,6 +2063,7 @@ impl Session {
     fn give_back(&mut self, opened: u64) {
         let Some(a) = self.put_aside.take_if(|a| a.opened == opened) else { return };
         let PutAside {
+            boxes,
             opened: _,
             undo,
             redo,
@@ -2091,6 +2112,7 @@ impl Session {
             raster_runs,
             edit_counts,
         } = *a;
+        self.boxes = boxes;
         (self.undo, self.redo, self.back, self.forward, self.last_camera) = (undo, redo, back, forward, last_camera);
         self.history_projection = history_projection;
         (self.state, self.saved) = (state, saved);
@@ -2646,9 +2668,10 @@ impl Session {
 
     pub(crate) fn undo(&mut self) -> bool {
         self.merged = None;
-        let Some((p, saved, label, actor, state, mut files, trust)) = self.undo.pop() else { return false };
+        let Some((p, saved, label, actor, state, mut files, trust, boxes)) = self.undo.pop() else { return false };
         let (open, was) = (self.open_layout_name(), self.active_layout);
         let cur = std::mem::replace(&mut self.project, p);
+        let old_boxes = std::mem::replace(&mut self.boxes, boxes);
         let old_trust = (
             std::mem::replace(&mut self.trusted_tasks, trust.0),
             std::mem::replace(&mut self.trusted_models, trust.1),
@@ -2665,16 +2688,17 @@ impl Session {
         self.keep_tile_pick(&cur);
         self.keep_headers_said(&cur);
         self.keep_synced(&cur);
-        self.redo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust));
+        self.redo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust, old_boxes));
         self.touch_all_geometry();
         true
     }
 
     pub(crate) fn redo(&mut self) -> bool {
         self.merged = None;
-        let Some((p, saved, label, actor, state, mut files, trust)) = self.redo.pop() else { return false };
+        let Some((p, saved, label, actor, state, mut files, trust, boxes)) = self.redo.pop() else { return false };
         let (open, was) = (self.open_layout_name(), self.active_layout);
         let cur = std::mem::replace(&mut self.project, p);
+        let old_boxes = std::mem::replace(&mut self.boxes, boxes);
         let old_trust = (
             std::mem::replace(&mut self.trusted_tasks, trust.0),
             std::mem::replace(&mut self.trusted_models, trust.1),
@@ -2691,7 +2715,7 @@ impl Session {
         self.keep_tile_pick(&cur);
         self.keep_headers_said(&cur);
         self.keep_synced(&cur);
-        self.undo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust));
+        self.undo.push((cur, was, label, actor, std::mem::replace(&mut self.state, state), files, old_trust, old_boxes));
         self.touch_all_geometry();
         true
     }

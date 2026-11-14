@@ -256,6 +256,10 @@ pub fn commands() -> Vec<C> {
         .roles(&[])
         .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .params(r#"{"path": "*.rgisfield", "name"?: offline area name, "extent"?: [minLon, minLat, maxLon, maxLat]}"#),
+        C::new("offline.bringBack", "Bring Back Edits", "Data › Offline", super::field::bring_back)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
+            .params(r#"{"path"?: "*.rgisfield", "data"?: base64 of one}"#),
         C::new("offline.sync", "Sync", "Data › Offline", offline_sync).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"name": offline area}"#),
         C::new("offline.remove", "Remove", "Data › Offline", |s, p| {
             let n = ps(p, "name").ok_or("name is required")?;
@@ -694,6 +698,22 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
     let area = s.project.offline_areas.get(ai).cloned().ok_or("no such area")?;
     let offline_map = format!("{} (offline)", area.name);
     let edited = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(&offline_map)).cloned().unwrap_or_else(|| area.data.clone());
+    sync_area(s, ai, &edited)
+}
+
+/// Copies the edits `edited` holds of offline area `ai` (its offline map, here or from a field
+/// package) back to the area's source map, as [`offline_sync`] describes, and refreshes the area.
+///
+/// A feature added offline keeps its id when the source doesn't use it, so the next sync of the
+/// same copy (a field package's phone keeps its ids) finds it again as the same feature. One whose
+/// id is taken gets a fresh one, counted in `renumbered` (a field package's Bring Back says it; an
+/// offline map here is renewed from the source after the sync, so it has the new id): a later sync
+/// of a copy that kept the old id finds it under it, so the source's copy is deleted and the
+/// area's added again (no feature twice, but a new id, and a change made to it here meanwhile is
+/// said as a conflict).
+pub(crate) fn sync_area(s: &mut Session, ai: usize, edited: &rustgis_map::Map) -> CmdResult {
+    let area = s.project.offline_areas.get(ai).cloned().ok_or("no such area")?;
+    let offline_map = format!("{} (offline)", area.name);
     let si = s
         .project
         .maps
@@ -702,6 +722,8 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
         .ok_or_else(|| format!("the source map '{}' is gone", area.map))?;
     crate::project::ensure_map_imports_complete(s.project.maps.get(si).ok_or("the source map is gone")?)?;
     let (mut updated, mut added, mut deleted, mut skipped) = (0, 0, 0, 0);
+    // Added offline, given a fresh id: theirs was taken.
+    let mut renumbered = 0usize;
     // Features changed in the source since the last sync whose changes the area's version (or its
     // deletion) replaced, and features changed offline whose edits a deletion in the source
     // dropped, as "layer #id".
@@ -759,9 +781,15 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
                         _ => {}
                     }
                 } else {
-                    // Added offline (its id may clash with one outside the area): a fresh id, above
-                    // any the source or the area has used.
-                    let id = sl.dataset.features.iter().map(|x| x.id).chain(had.iter().copied()).max().unwrap_or(0).saturating_add(1);
+                    // Added offline: its own id when the source and the area haven't used it, else
+                    // a fresh one above any they have (its id clashed with one outside the area).
+                    let taken = sl.dataset.features.iter().any(|x| x.id == f.id) || had.contains(&f.id);
+                    let id = if taken {
+                        renumbered += 1;
+                        sl.dataset.features.iter().map(|x| x.id).chain(had.iter().copied()).max().unwrap_or(0).saturating_add(1)
+                    } else {
+                        f.id
+                    };
                     sl.dataset.features.push(rustgis_data::Feature { id, ..f.clone() });
                     added += 1;
                 }
@@ -818,7 +846,9 @@ fn offline_sync(s: &mut Session, p: &Value) -> CmdResult {
             false,
         );
     }
-    Ok(json!({"updated": updated, "added": added, "deleted": deleted, "skipped": skipped, "conflicts": conflicts.len()}))
+    Ok(
+        json!({"updated": updated, "added": added, "deleted": deleted, "skipped": skipped, "conflicts": conflicts.len(), "renumbered": renumbered}),
+    )
 }
 
 /// Binds the elevation raster and literal selected-line source.

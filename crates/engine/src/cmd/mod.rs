@@ -143,6 +143,27 @@ pub(crate) fn parse_crs(s: &mut Session, text: &str) -> Result<rustgis_data::ras
     Ok(crs)
 }
 
+/// `text`, given as a command's `key`, when it has at most `limit` characters; else an error
+/// saying how long it is and what `of` takes. A name or a text a command is given is refused rather
+/// than cut without a word (#1888), as `layer.rename` refuses a long name (#1817). Characters are
+/// counted, not bytes.
+pub(crate) fn within(key: &str, of: &str, text: &str, limit: usize) -> Result<String, String> {
+    let n = text.chars().count();
+    if n > limit {
+        return Err(format!("{key} is {n} characters: {of} takes at most {limit}"));
+    }
+    Ok(text.to_string())
+}
+
+/// `items`, given as a command's `key`, when there are at most `limit`; else an error saying how
+/// many there are and how many `of` takes, rather than the rest dropped without a word (#1888).
+pub(crate) fn at_most<T>(key: &str, of: &str, items: &[T], limit: usize) -> Result<(), String> {
+    if items.len() > limit {
+        return Err(format!("{key} has {} entries: {of} takes at most {limit}", items.len()));
+    }
+    Ok(())
+}
+
 /// Report a CRS already validated by a pure options parser, after its options were applied.
 pub(crate) fn say_crs_note(s: &mut Session, text: &str) {
     if let Ok(crs) = rustgis_data::raster::Crs::parse(text)

@@ -177,14 +177,24 @@ pub fn commands() -> Vec<C> {
             crate::model::check_file(&v)?;
             let name = v["name"].as_str().unwrap_or("Tool").chars().take(200).collect::<String>();
             // A model file (`*.model.json`) holds a graph; a web tool its steps.
+            let mark = s.notice_mark();
             let imported = if let Some(graph) = v.get("graph") {
                 s.run("model.new", &json!({"name": name, "graph": graph, "imported": true}))?
             } else {
                 let steps = v.get("steps").cloned().ok_or("not a RustGIS model or web tool (no graph or steps)")?;
                 s.run("model.new", &json!({"name": name, "steps": steps, "imported": true}))?
             };
-            if v.get("name").map_or(Some("Tool"), Value::as_str) != imported.get("model").and_then(Value::as_str) {
-                s.notify("1 model name was trimmed, shortened, replaced or made unique during import.", false);
+            // A name `model.new` cut to tell it apart is said once, by it (#1923), unless this cut
+            // it first: `model.new` saw only the first 200 characters, so that cut is said here.
+            let said = s.notices_since(mark).iter().any(|n| n.text.starts_with("ModelBuilder: a model has that name already"));
+            let cut_here = v["name"].as_str().is_some_and(|n| n.chars().count() > 200);
+            if (cut_here || !said) && v.get("name").map_or(Some("Tool"), Value::as_str) != imported.get("model").and_then(Value::as_str) {
+                // A cut to the 200 says how much it cut.
+                let text = match v["name"].as_str() {
+                    Some(n) if cut_here => format!("1 model name was cut from {} to 200 characters, a model name's limit, during import.", n.chars().count()),
+                    _ => "1 model name was trimmed, shortened, replaced or made unique during import.".to_string(),
+                };
+                s.notify(text, false);
             }
             Ok(imported)
         }).roles(&[crate::ParamRole { key: "text", role: crate::Role::Document(crate::Document::Model) }]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files))

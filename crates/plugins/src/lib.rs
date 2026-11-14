@@ -27,6 +27,7 @@ pub mod registry;
 pub mod runtime;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod session;
+pub mod settings;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod store;
 #[cfg(any(test, feature = "testing"))]
@@ -429,6 +430,16 @@ fn call_with_timeout(
     tool: bool,
     timeout: Option<std::time::Duration>,
 ) -> Result<Value, String> {
+    // A command's settings requests are answered here, by this plugin's own id, however it runs.
+    // A tool gets none: it runs off the UI thread, in models and on copies, and its output must
+    // not depend on what was saved (it makes no host requests).
+    let mut scoped;
+    let host: &mut dyn Host = if tool {
+        host
+    } else {
+        scoped = settings::Scoped::new(&plugin.manifest.id, host);
+        &mut scoped
+    };
     match &plugin.code {
         Code::Wasm(module) => match timeout.filter(|_| !tool) {
             Some(limit) => call_wasm_limited(module, host, request, limit),

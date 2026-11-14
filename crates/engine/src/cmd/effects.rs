@@ -146,12 +146,18 @@ fn display_filters(s: &mut Session, p: &Value) -> CmdResult {
     let ds = &s.map().layer(id).ok_or("no such layer")?.dataset;
     let list = p.get("filters").and_then(Value::as_array).ok_or("filters is required (an empty list clears them)")?;
     let mut filters = Vec::new();
-    for v in list.iter().take(50) {
+    super::at_most("filters", "a layer", list, 50)?;
+    for v in list {
         let w = v.get("where").and_then(Value::as_str).map(str::trim).filter(|w| !w.is_empty()).ok_or("each filter has a where clause")?;
         rustgis_data::query::parse(w, ds)?;
         let scale = |k: &str| v.get(k).and_then(Value::as_f64).filter(|x| x.is_finite() && *x > 0.0);
         filters.push(DisplayFilter {
-            name: v.get("name").and_then(Value::as_str).unwrap_or("Filter").chars().take(100).collect(),
+            name: super::within(
+                "a filter's name",
+                "a display filter's name",
+                v.get("name").and_then(Value::as_str).unwrap_or("Filter"),
+                100,
+            )?,
             min_scale: scale("minScale"),
             max_scale: scale("maxScale"),
             where_: w.to_string(),

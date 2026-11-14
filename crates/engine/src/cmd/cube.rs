@@ -1002,7 +1002,10 @@ pub fn trend_start(s: &mut Session, p: &Value) -> Result<TrendRun, String> {
     let day = |i: usize| rustgis_data::time::format(cube.dates().get(i).copied().unwrap_or(f64::NAN), "YYYY-MM-DD");
     let (a, z) = (steps.first().copied().unwrap_or(0), steps.last().copied().unwrap_or(0));
     let label = format!("{} {}–{}", cube.label(), day(a), day(z));
-    let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map_or(label, |n| n.chars().take(200).collect());
+    let name = match ps(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => super::within("name", "the outputs' name", n, 200)?,
+        None => label,
+    };
     Ok(TrendRun { cube, steps, test, alpha, min_valid, per, name, max_pairs: MAX_PAIRS })
 }
 
@@ -1851,7 +1854,8 @@ pub fn reduce_start(s: &mut Session, p: &Value) -> Result<ReduceRun, String> {
     } else {
         format!(" (months {})", months.iter().map(u32::to_string).collect::<Vec<_>>().join(","))
     };
-    let given = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(200).collect::<String>());
+    let given =
+        ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(|n| super::within("name", "the outputs' name", n, 200)).transpose()?;
     let base = format!("{} {}", cube.label(), stat.code());
     let groups = found
         .iter()

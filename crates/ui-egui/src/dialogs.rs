@@ -171,6 +171,7 @@ impl Dialogs {
             "zarr" => "zarr",
             "exportLayer" => "exportLayer",
             "saveProject" => "saveProject",
+            "exportOrbit" => "exportOrbit",
             other => return Err(format!("unknown dialog '{other}'")),
         };
         if matches!(name, "addField" | "calculateField" | "renameLayer" | "exportLayer" | "defineProjection") && active.is_none() {
@@ -184,6 +185,9 @@ impl Dialogs {
         }
         if matches!(name, "gpkgSave" | "gpkgDiscard") && !s.map().layers.iter().any(|l| l.gpkg.is_some()) {
             return Err(tl!("the map has no GeoPackage layer loaded for editing (Home › Add Data › Edit GeoPackage Table…)").into());
+        }
+        if name == "exportOrbit" && cfg!(target_arch = "wasm32") {
+            return Err("exporting an orbit needs the desktop app".into());
         }
         if name == "selectByAttributes" && s.map().layers.is_empty() {
             return Err("the map has no layers".into());
@@ -224,6 +228,8 @@ impl Dialogs {
                 self.c = format!("{:.0}", s.scale());
             }
             "addField" => self.b = "Double".into(),
+            // The command's defaults: 60 frames once round, 640 × 400 points, 50 ms a frame.
+            "exportOrbit" => [self.a, self.b, self.c, self.d, self.e] = ["60", "360", "640", "400", "50"].map(String::from),
             "calculateField" => {
                 self.a = active.and_then(|l| calculation_fields(&l.dataset).last()).map(|f| f.name.clone()).unwrap_or_default()
             }
@@ -345,6 +351,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "zarr" => "Add Zarr Variable",
         "exportLayer" => "Export Features",
         "saveProject" => "Save Project As",
+        "exportOrbit" => "Export Orbit",
         "renameMap" => "Rename Map",
         "renameLayout" => "Rename Layout",
         "renameServiceGroup" => "Rename Service Group",
@@ -512,6 +519,41 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     let (lon, lat, scale) = (n(&app.dialogs.a, "Longitude")?, n(&app.dialogs.b, "Latitude")?, n(&app.dialogs.c, "Scale")?);
                     app.run("map.camera", json!({"lon": lon, "lat": lat, "scale": scale})).map(|_| ())
                 });
+            }
+            "exportOrbit" => {
+                ui.label(tl!("Turns the view about its centre, keeping its scale and pitch, and writes a frame a step: a .gif loops, a .zip holds the frames as PNGs."));
+                egui::Grid::new("orbit").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+                    let d = &mut app.dialogs;
+                    for (label, v) in [
+                        ("Frames", &mut d.a),
+                        ("Turn (degrees)", &mut d.b),
+                        ("Width (points)", &mut d.c),
+                        ("Height (points)", &mut d.d),
+                        ("Frame time (ms, GIF)", &mut d.e),
+                    ] {
+                        let input_label = ui.label(tl!(label));
+                        ui.add(egui::TextEdit::singleline(v).desired_width(120.0)).labelled_by(input_label.id);
+                        ui.end_row();
+                    }
+                });
+                // A file picker cancelled keeps the dialog open, the values typed still in it:
+                // `ui.exportOrbit` answers null when no file was picked.
+                let mut picked = true;
+                close = buttons(app, ui, "Export…", |app| {
+                    // Empty keeps the command's default; anything else must be a number, which
+                    // the command checks against its range.
+                    let mut p = json!({});
+                    let d = &app.dialogs;
+                    for (key, label, v) in [("frames", "Frames", &d.a), ("turn", "Turn", &d.b), ("width", "Width", &d.c), ("height", "Height", &d.d), ("speed", "Frame time", &d.e)] {
+                        let v = v.trim();
+                        if !v.is_empty() {
+                            let n = v.parse::<f64>().ok().filter(|n| n.is_finite());
+                            p[key] = json!(n.ok_or_else(|| crate::i18n::fmt("{what} must be a number", &[("what", tl_raw!(label))]))?);
+                        }
+                    }
+                    picked = !app.run("ui.exportOrbit", p)?.is_null();
+                    Ok(())
+                }) && picked;
             }
             "bookmark" => {
                 let input_label = ui.label(tl!("Name"));

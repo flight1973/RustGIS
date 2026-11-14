@@ -1899,9 +1899,31 @@ fn process_packages_unpack_safely() {
     assert!(dir.join("data/b.txt").is_file());
     assert!(!plugins.join("unpacked/evil.txt").exists() && !plugins.join("evil.txt").exists());
     assert!(dir.join("data/b.txt").is_file(), "the installed copy stays");
-    // Uninstalling removes the files.
-    crate::store::uninstall("unpacked").unwrap();
-    assert!(!dir.exists());
+    // A step after the package is gone that fails (its unpacked folder can't be removed) says
+    // the plugin's settings were kept, and where, since uninstalling can't be tried again.
+    let settings = plugins.join("settings").join("unpacked.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        crate::settings::patch("unpacked", &json!({"values": {"kept": true}})).unwrap();
+        let parent = plugins.join("unpacked");
+        let mode = std::fs::metadata(&parent).unwrap().permissions();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed = crate::store::uninstall("unpacked");
+        std::fs::set_permissions(&parent, mode).unwrap();
+        // Root removes it anyway: then there is nothing to check here.
+        if let Err(e) = failed {
+            assert!(e.contains("its saved settings were kept") && e.contains(&settings.display().to_string()), "{e}");
+            assert!(settings.is_file() && crate::get("unpacked").is_none());
+        }
+        let _ = std::fs::remove_file(&settings);
+        crate::store::install_bytes(&changed).unwrap();
+    }
+    // Uninstalling removes the files, also when its settings can't be erased (they go last).
+    std::fs::create_dir_all(&settings).unwrap();
+    let e = crate::store::uninstall("unpacked").unwrap_err();
+    assert!(e.contains("couldn't erase the saved settings of 'unpacked'") && e.contains("remove") && e.contains("by hand"), "{e}");
+    assert!(!dir.exists() && crate::get("unpacked").is_none() && !plugins.join("unpacked.rgplugin").exists());
     let _ = std::fs::remove_dir_all(&plugins);
 }
 
@@ -2575,4 +2597,278 @@ fn a_bad_platform_package_is_dropped_alone() {
             assert!(e.available() || !e.platforms().is_empty(), "{platform}: {}", e.id);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// plugin settings (#1261)
+
+/// The plugins folder of the settings tests: not the user's.
+fn plugins_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("rustgis-test-plugin-settings-{}", std::process::id()))
+}
+
+/// Where the plugins folder in use keeps plugin settings.
+fn settings_dir() -> std::path::PathBuf {
+    crate::store::dir().unwrap().join("settings")
+}
+
+/// The lock of [`store_lock`], with the plugins folder one of the tests' own and no settings in it.
+fn fresh_settings() -> std::sync::MutexGuard<'static, ()> {
+    let held = store_lock();
+    crate::store::set_dir(Some(plugins_dir()));
+    let _ = std::fs::remove_dir_all(settings_dir());
+    held
+}
+
+/// Runs the forwarding command of the test plugin `id`: it sends `op` with `params` to the host.
+fn forwarded(id: &str, op: &str, params: Value) -> Result<Value, String> {
+    let cmd = crate::command(&format!("plugin:{id}/f")).unwrap();
+    crate::run_command(&cmd, &mut Recorder::default(), &json!({"op": op, "params": params}))
+}
+
+fn remembered(id: &str) -> Result<Value, String> {
+    forwarded(id, "host.settings", json!({}))
+}
+
+fn remember(id: &str, values: Value) -> Result<Value, String> {
+    forwarded(id, "host.setSettings", json!({"values": values}))
+}
+
+#[test]
+fn plugin_settings_are_kept_per_plugin_across_updates_and_toggles() {
+    let _store = fresh_settings();
+    load("settings-a", &[]);
+    load("settings-b", &[]);
+    assert_eq!(remembered("settings-a").unwrap(), json!({}));
+
+    // Merged at the top level; the answer is the whole object.
+    let first = json!({"favourites": ["l:123", "l:456"], "unit": "m", "nested": {"x": null}});
+    assert_eq!(remember("settings-a", first).unwrap(), json!({"favourites": ["l:123", "l:456"], "unit": "m", "nested": {"x": null}}));
+    let both = json!({"favourites": ["l:123", "l:456"], "nested": {"x": null}, "limit": 5});
+    assert_eq!(remember("settings-a", json!({"unit": null, "limit": 5})).unwrap(), both);
+    assert_eq!(remembered("settings-a").unwrap(), both);
+    let on_disk = std::fs::read_to_string(settings_dir().join("settings-a.json")).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&on_disk).unwrap(), json!({"version": 1, "values": both}));
+    assert!(!on_disk.contains(char::is_whitespace), "compact: {on_disk}");
+
+    // Another plugin has its own, and a request can't name whose to read.
+    assert_eq!(remembered("settings-b").unwrap(), json!({}));
+    let named = forwarded("settings-b", "host.settings", json!({"id": "settings-a", "plugin": "settings-a"}));
+    assert_eq!(named.unwrap(), json!({}));
+    remember("settings-b", json!({"unit": "ft"})).unwrap();
+    assert_eq!(remembered("settings-a").unwrap(), both);
+
+    // The host never sees these requests: they need nothing of it, and no permission.
+    let cmd = crate::command("plugin:settings-a/f").unwrap();
+    let mut host = Recorder::default();
+    let params = json!({"op": "host.setSettings", "params": {"values": {"seen": true}}});
+    crate::run_command(&cmd, &mut host, &params).unwrap();
+    assert!(host.ops.is_empty(), "{:?}", host.ops);
+
+    // Bad values are errors that change nothing.
+    for bad in [json!({}), json!({"values": null}), json!({"values": []}), json!({"values": "x"})] {
+        let e = forwarded("settings-a", "host.setSettings", bad).unwrap_err();
+        assert!(e.contains("values must be a JSON object"), "{e}");
+    }
+    assert_eq!(remembered("settings-a").unwrap()["limit"], 5);
+
+    // A new version of the plugin, turning it off and on, and unloading it keep them.
+    load("settings-a", &[]);
+    crate::set_enabled("settings-a", false).unwrap();
+    assert!(crate::command("plugin:settings-a/f").is_none(), "a disabled plugin runs nothing");
+    crate::set_enabled("settings-a", true).unwrap();
+    assert_eq!(remembered("settings-a").unwrap()["limit"], 5);
+    assert!(crate::unload("settings-a"));
+    load("settings-a", &[]);
+    assert_eq!(remembered("settings-a").unwrap()["limit"], 5);
+
+    // The limit holds through a plugin: exactly 64 KiB fits, one byte more is an error.
+    let exactly = "a".repeat(crate::settings::MAX_BYTES - 8);
+    assert!(remember("settings-b", json!({"unit": null, "x": exactly})).is_ok());
+    let e = remember("settings-b", json!({"x": format!("{exactly}a")})).unwrap_err();
+    assert!(e.contains("plugin settings exceed 65536 bytes"), "{e}");
+    assert_eq!(remembered("settings-b").unwrap(), json!({"x": exactly}));
+
+    // A folder that can't be written to is an error, and what was kept stays.
+    let blocked = std::env::temp_dir().join(format!("rustgis-test-plugin-settings-blocked-{}", std::process::id()));
+    std::fs::write(&blocked, b"not a folder").unwrap();
+    crate::store::set_dir(Some(blocked.clone()));
+    let e = remember("settings-a", json!({"unit": "yd"})).unwrap_err();
+    // Whether the folder can't be read (Unix) or only not written (elsewhere), nothing is saved.
+    assert!(e.contains("the settings of 'settings-a'"), "{e}");
+    assert!(!e.contains(&*blocked.display().to_string()), "the plugin isn't told where: {e}");
+    crate::store::set_dir(Some(plugins_dir()));
+    let _ = std::fs::remove_file(&blocked);
+    let with_seen = json!({"favourites": ["l:123", "l:456"], "nested": {"x": null}, "limit": 5, "seen": true});
+    assert_eq!(remembered("settings-a").unwrap(), with_seen);
+
+    // A damaged record is an error, never `{}` and never overwritten; uninstalling erases it.
+    std::fs::write(settings_dir().join("settings-a.json"), "{").unwrap();
+    let e = remembered("settings-a").unwrap_err();
+    assert!(e.contains("damaged"), "{e}");
+    assert!(remember("settings-a", json!({"unit": "yd"})).is_err());
+    assert_eq!(std::fs::read_to_string(settings_dir().join("settings-a.json")).unwrap(), "{");
+    crate::settings::remove("settings-a").unwrap();
+    assert_eq!(remembered("settings-a").unwrap(), json!({}));
+    crate::unload("settings-a");
+    crate::unload("settings-b");
+}
+
+#[test]
+fn plugin_settings_are_for_commands_not_tools() {
+    let _store = fresh_settings();
+    let plugin = load("settings-tool", &[]);
+    // The tool `t` sends its params to the host as a request (see `testing`).
+    let job = |params: Value| crate::tools::Job {
+        plugin: plugin.clone(),
+        name: "Remember".into(),
+        request: json!({"abi": 1, "kind": "tool", "id": "t", "params": params, "layers": {}, "lang": "en"}),
+    };
+    let control = crate::tools::Control::default();
+    for op in ["host.settings", "host.setSettings"] {
+        let e = job(json!({"op": op, "params": {"values": {"messages": ["one"]}}})).run(&control).unwrap_err();
+        assert!(e.contains(&format!("tools can't use '{op}'")), "{e}");
+    }
+    assert_eq!(remembered("settings-tool").unwrap(), json!({}));
+    assert!(!settings_dir().join("settings-tool.json").exists());
+    // A process plugin's tool request goes to the host it was given (a tool's host refuses it), not the settings.
+    let dir = process_folder("proc-settings-tool", &[]);
+    let p = crate::prepare(Package::from_dir(&dir).unwrap(), "test").unwrap();
+    let tool = json!({"abi": 1, "kind": "tool", "id": "f", "params": {"op": "host.setSettings", "params": {"values": {"a": 1}}}, "layers": {}, "lang": "en"});
+    let mut host = Recorder::default();
+    let e = crate::call(&p, &mut host, &tool, true).unwrap_err();
+    assert!(e.contains("no 'host.setSettings'"), "{e}");
+    assert_eq!(host.ops, ["host.setSettings"]);
+    assert_eq!(crate::settings::read("proc-settings-tool").unwrap(), json!({}));
+    crate::unload("settings-tool");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn plugin_settings_reach_process_plugins() {
+    let _store = fresh_settings();
+    let dir = process_folder("proc-settings", &[]);
+    let p = crate::prepare(Package::from_dir(&dir).unwrap(), "test").unwrap();
+    let request =
+        |op: &str, params: Value| json!({"abi": 1, "kind": "command", "id": "f", "params": {"op": op, "params": params}, "lang": "en"});
+    let mut host = Recorder::default();
+    let saved = json!({"a": [1, {"b": null}]});
+    let set = crate::call(&p, &mut host, &request("host.setSettings", json!({"values": saved})), false).unwrap();
+    assert_eq!(set, json!({"a": [1, {"b": null}]}));
+    assert_eq!(crate::call(&p, &mut host, &request("host.settings", json!({})), false).unwrap(), set);
+    assert!(host.ops.is_empty(), "answered before the host: {:?}", host.ops);
+    assert!(settings_dir().join("proc-settings.json").is_file());
+    let e = crate::call(&p, &mut host, &request("host.setSettings", json!({"values": 1})), false).unwrap_err();
+    assert!(e.contains("values must be a JSON object"), "{e}");
+    // Other requests still reach the host.
+    assert_eq!(crate::call(&p, &mut host, &request("host.echo", json!({"a": 1})), false).unwrap(), json!({"a": 1}));
+    assert_eq!(host.ops, ["host.echo"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn plugin_settings_answer_session_programs_between_commands() {
+    let _store = fresh_settings();
+    let (p, dir) = session_plugin("sess-settings");
+    let mut host = Recorder::default();
+    let forward =
+        |op: &str, params: Value| json!({"abi": 1, "kind": "command", "id": "f", "params": {"op": op, "params": params}, "lang": "en"});
+    // Inside a command.
+    let during = forward("host.setSettings", json!({"values": {"during": 1}}));
+    assert_eq!(crate::call(&p, &mut host, &during, false).unwrap(), json!({"during": 1}));
+    // Between commands: the program asks when it likes, and is answered by its own id.
+    let later = json!({"abi": 1, "kind": "command", "id": "k", "params": {"op": "host.setSettings", "params": {"values": {"between": 2}}}, "lang": "en"});
+    assert_eq!(crate::call(&p, &mut host, &later, false).unwrap(), "asked");
+    poll_until("sess-settings", &mut host, |polled, _| polled.handled > 0);
+    let heard = crate::call(&p, &mut host, &command("v"), false).unwrap();
+    assert_eq!(heard["answers"], json!([{"ok": {"during": 1, "between": 2}, "id": "a2"}]));
+    assert!(host.ops.is_empty(), "answered before the host: {:?}", host.ops);
+    assert_eq!(crate::settings::read("sess-settings").unwrap(), json!({"during": 1, "between": 2}));
+    crate::session::stop("sess-settings");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn plugin_settings_are_erased_only_by_uninstalling() {
+    let _store = fresh_settings();
+    let plugins = std::env::temp_dir().join(format!("rustgis-test-settings-store-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&plugins);
+    crate::store::set_dir(Some(plugins.clone()));
+    let file = settings_dir().join("settings-store.json");
+    let package = testing::package("settings-store", &[]);
+    crate::store::install_bytes(&package).unwrap();
+    remember("settings-store", json!({"favourites": ["l:1"]})).unwrap();
+
+    // Installing a new version, turning it off and on, and forgetting it for this run keep them.
+    crate::store::install_bytes(&package).unwrap();
+    crate::store::set_enabled("settings-store", false).unwrap();
+    crate::store::set_enabled("settings-store", true).unwrap();
+    crate::unload("settings-store");
+    assert!(file.is_file());
+    crate::store::install_bytes(&package).unwrap();
+    assert_eq!(remembered("settings-store").unwrap(), json!({"favourites": ["l:1"]}));
+
+    // Uninstalling erases them: a plugin installed again starts with none.
+    crate::store::uninstall("settings-store").unwrap();
+    assert!(!file.exists() && crate::get("settings-store").is_none());
+    crate::store::install_bytes(&package).unwrap();
+    assert_eq!(remembered("settings-store").unwrap(), json!({}));
+
+    // A step of the uninstall that fails (here the plugins folder can't be written) leaves the
+    // settings with the plugin still installed.
+    remember("settings-store", json!({"favourites": ["l:2"]})).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&plugins).unwrap().permissions();
+        std::fs::set_permissions(&plugins, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed = crate::store::uninstall("settings-store");
+        std::fs::set_permissions(&plugins, mode).unwrap();
+        // Root writes anyway: then it was uninstalled, and that is checked below instead.
+        if failed.is_err() {
+            assert!(file.is_file() && plugins.join("settings-store.rgplugin").is_file());
+            assert_eq!(remembered("settings-store").unwrap(), json!({"favourites": ["l:2"]}));
+        } else {
+            crate::store::install_bytes(&package).unwrap();
+            remember("settings-store", json!({"favourites": ["l:2"]})).unwrap();
+        }
+    }
+
+    // A record that can't be erased: said once the plugin is gone, and the record stays.
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let e = crate::store::uninstall("settings-store").unwrap_err();
+    assert!(e.contains("couldn't erase the saved settings of 'settings-store'") && e.contains("the plugin was uninstalled"), "{e}");
+    assert!(crate::get("settings-store").is_none() && !plugins.join("settings-store.rgplugin").exists() && file.is_dir());
+
+    // A damaged record doesn't: erasing is what clears it.
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::write(&file, "{").unwrap();
+    crate::store::install_bytes(&package).unwrap();
+    crate::store::uninstall("settings-store").unwrap();
+    assert!(!file.exists() && crate::get("settings-store").is_none() && !plugins.join("settings-store.rgplugin").exists());
+
+    // A development folder that shadows an installed copy: removing it leaves the copy, and what
+    // the copy remembered.
+    crate::store::install_bytes(&package).unwrap();
+    remember("settings-store", json!({"favourites": ["l:3"]})).unwrap();
+    let folder = plugins.join("dev");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("plugin.json"), testing::manifest("settings-store", &[])).unwrap();
+    std::fs::write(folder.join("plugin.wasm"), testing::wasm()).unwrap();
+    crate::store::install_path(&folder).unwrap();
+    assert_eq!(crate::get("settings-store").map(|p| p.source.clone()), Some(folder.display().to_string()));
+    crate::store::uninstall("settings-store").unwrap();
+    assert!(file.is_file() && plugins.join("settings-store.rgplugin").is_file());
+    assert!(crate::store::load_installed().iter().all(|e| !e.contains("settings-store")));
+    assert_eq!(remembered("settings-store").unwrap(), json!({"favourites": ["l:3"]}));
+    crate::store::uninstall("settings-store").unwrap();
+    assert!(!file.exists());
+
+    // A development folder with no installed copy: nothing else owns its settings, so they go.
+    crate::store::install_path(&folder).unwrap();
+    remember("settings-store", json!({"favourites": ["l:4"]})).unwrap();
+    crate::store::uninstall("settings-store").unwrap();
+    assert!(!file.exists() && crate::get("settings-store").is_none());
+    let _ = std::fs::remove_dir_all(&plugins);
 }

@@ -310,7 +310,7 @@ The desktop app and the command line keep their files in three folders:
 | Folder | Holds | Windows | macOS | Linux |
 | --- | --- | --- | --- | --- |
 | Settings | preferences (`prefs.json`), the crash log, AI Assistant sign-ins and skills | `%APPDATA%\RustGIS` | `~/Library/Application Support/RustGIS` | `$XDG_CONFIG_HOME/rustgis` (`~/.config/rustgis`) |
-| Data | installed plugins, the GeoLibre runner and recovery copies of unsaved work | `%LOCALAPPDATA%\RustGIS` | `~/Library/Application Support/RustGIS` | `$XDG_DATA_HOME/rustgis` (`~/.local/share/rustgis`) |
+| Data | installed plugins and what they remember (`plugins/settings/`), the GeoLibre runner and recovery copies of unsaved work | `%LOCALAPPDATA%\RustGIS` | `~/Library/Application Support/RustGIS` | `$XDG_DATA_HOME/rustgis` (`~/.local/share/rustgis`) |
 | Cache | GDAL and DuckDB conversions | `%LOCALAPPDATA%\RustGIS\cache` | `~/Library/Caches/RustGIS` | `$XDG_CACHE_HOME/rustgis` (`~/.cache/rustgis`) |
 
 Set `RUSTGIS_CONFIG_DIR`, `RUSTGIS_APP_DATA_DIR` or `RUSTGIS_CACHE_DIR` to use another folder
