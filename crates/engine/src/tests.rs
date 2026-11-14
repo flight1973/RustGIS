@@ -29064,6 +29064,31 @@ fn a_failed_multi_file_add_leaves_the_map_as_it_was() {
 /// thumbnail; photos without a position are named, not added; an upload joins the Photos layer;
 /// a project keeps the thumbnails.
 #[test]
+fn a_jpeg_with_a_world_file_opens_placed_not_as_a_photo() {
+    // #2075: a JPEG with a `.jgw` (and a `.prj`) beside it is a raster placed by them; without
+    // them it would join the photo layer.
+    let dir = std::env::temp_dir().join(format!("rustgis-jgw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    image::RgbImage::from_pixel(8, 4, image::Rgb([200, 100, 50])).save(dir.join("aerial.jpg")).unwrap();
+    std::fs::write(dir.join("aerial.jgw"), "0.25\n0\n0\n-0.25\n-96.875\n33.125\n").unwrap();
+    std::fs::write(
+        dir.join("aerial.prj"),
+        r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#,
+    )
+    .unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": dir.join("aerial.jpg").display().to_string()})).unwrap();
+    assert!(s.map().layer_by_name("Photos").is_none());
+    let l = s.map().layer_by_name("aerial").unwrap();
+    let r = l.raster.as_ref().and_then(|r| r.data.as_ref()).unwrap();
+    assert!(r.georeferenced);
+    let e = r.extent();
+    assert!((e.min_x + 97.0).abs() < 1e-9 && (e.max_y - 33.25).abs() < 1e-9, "{e:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn geotagged_photos_become_a_photo_layer() {
     use base64::Engine;
     use rustgis_data::photo;
