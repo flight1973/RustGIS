@@ -11,8 +11,8 @@
 //! fails here until the case is moved to [`Expect::Said`], so the list only shrinks. Exports have
 //! their own test, `never_silent_roundtrip.rs`.
 //!
-//! Text formats only so far: binary ones (Shapefile, GeoPackage, FlatGeobuf, GeoParquet, OSM PBF,
-//! KMZ, spreadsheets) are still to add (ROADMAP.md).
+//! Text formats only so far, without CityJSON and CityGML; those and the binary ones (Shapefile,
+//! GeoPackage, FlatGeobuf, GeoParquet, OSM PBF, KMZ, spreadsheets) are still to add (ROADMAP.md).
 use rustgis_engine::{Project, Session};
 use serde_json::json;
 
