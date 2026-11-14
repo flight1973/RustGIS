@@ -180,6 +180,58 @@ pub struct Feature {
     pub id: u64,
     pub geometry: Option<Geometry>,
     pub attrs: Vec<Value>,
+    /// The heights and measures of the geometry's vertices, if it has any ([`Zm`]). `None` for 2D
+    /// data, which costs the pointer and nothing per vertex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zm: Option<Box<Zm>>,
+}
+
+/// Heights (Z) and measures (M) beside a feature's 2D geometry: each array, when there is one,
+/// holds one value per vertex in the geometry's own vertex order, the order
+/// [`Geometry::for_each_coord`] walks (parts, then rings, then points, every ring's closing point
+/// included).
+///
+/// Nothing ties the arrays to the geometry but that count and order, so whatever changes a
+/// geometry's vertices must carry the arrays only when the vertices are the same ones in the same
+/// order, and empty them otherwise ([`Feature::zm_after`]). A writer checks [`Feature::zm_fits`]
+/// before using them, and writes 2D, with a notice, when they don't fit: an emptied array never
+/// fits, so a feature that lost its heights says so on export instead of losing them silently.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Zm {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub z: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub m: Option<Vec<f64>>,
+}
+
+impl Feature {
+    /// Whether every array in `zm` has one value per vertex of the geometry (true without `zm`).
+    /// A feature without geometry fits only without arrays.
+    pub fn zm_fits(&self) -> bool {
+        let Some(zm) = &self.zm else { return true };
+        let n = self.geometry.as_ref().map_or(0, Geometry::coord_count);
+        n > 0 && [&zm.z, &zm.m].into_iter().flatten().all(|a| a.len() == n)
+    }
+
+    /// The heights of the vertices, when they fit the geometry ([`Feature::zm_fits`]).
+    pub fn z(&self) -> Option<&[f64]> {
+        if !self.zm_fits() {
+            return None;
+        }
+        self.zm.as_ref()?.z.as_deref()
+    }
+
+    /// This feature's `zm` for a geometry that replaces its own: carried when `same` (the same
+    /// vertices in the same order, perhaps moved), else emptied, so that the arrays no longer fit
+    /// and an export says the heights were lost rather than writing them on the wrong vertices.
+    /// `None` when the feature had none.
+    pub fn zm_after(&self, same: bool) -> Option<Box<Zm>> {
+        let zm = self.zm.as_ref()?;
+        if same {
+            return Some(zm.clone());
+        }
+        Some(Box::new(Zm { z: zm.z.as_ref().map(|_| Vec::new()), m: zm.m.as_ref().map(|_| Vec::new()) }))
+    }
 }
 
 /// A dataset's features, shared until changed: cloning them (an undo snapshot, a copy of the
@@ -216,14 +268,14 @@ impl Features {
     fn push_with_new_id(&mut self, geometry: Option<Geometry>, attrs: Vec<Value>) {
         let max = self.max_id.unwrap_or_else(|| self.rows.iter().map(|f| f.id).max().unwrap_or(0));
         let id = max.saturating_add(1);
-        std::sync::Arc::make_mut(&mut self.rows).push(Feature { id, geometry, attrs });
+        std::sync::Arc::make_mut(&mut self.rows).push(Feature { id, geometry, attrs, zm: None });
         self.max_id = Some(id);
     }
 
     /// Appends a row with the id one past the last row's, keeping the largest id if it is known.
     fn push_after_last(&mut self, geometry: Option<Geometry>, attrs: Vec<Value>) {
         let id = self.rows.last().map(|f| f.id.saturating_add(1)).unwrap_or(1);
-        std::sync::Arc::make_mut(&mut self.rows).push(Feature { id, geometry, attrs });
+        std::sync::Arc::make_mut(&mut self.rows).push(Feature { id, geometry, attrs, zm: None });
         self.max_id = self.max_id.map(|m| m.max(id));
     }
 }
@@ -323,8 +375,9 @@ pub struct Dataset {
     /// recover it; import the original file with a CRS override instead. Kept across project saves.
     #[serde(default)]
     pub crs_incomplete: bool,
-    /// The source had Z or M values (heights or measures), which RustGIS doesn't keep: they were
-    /// dropped on import, so an export writes x and y only. Kept across project saves.
+    /// The source had Z or M values (heights or measures) that reading dropped, so no export has
+    /// them: all of them for most formats; for GeoJSON, which keeps heights in [`Feature::zm`],
+    /// only those it couldn't keep. Kept across project saves.
     #[serde(default)]
     pub zm_dropped: bool,
     /// The features are a window onto a source read in place (the part of a large file in view),
@@ -407,11 +460,40 @@ pub fn zm_export_note<'a>(layers: impl IntoIterator<Item = &'a Dataset>, target:
     let names: Vec<&str> = layers.into_iter().filter(|ds| ds.zm_dropped).map(|ds| ds.name.as_str()).collect();
     match names.as_slice() {
         [] => None,
-        [one] => Some(format!("{target}: its geometry has no Z or M values, which were dropped when {one} was read")),
-        _ => {
-            Some(format!("{target}: its geometry has no Z or M values for {}, which were dropped when they were read", layer_list(&names)))
-        }
+        [one] => Some(format!("{target}: its geometry lacks Z or M values that were dropped when {one} was read")),
+        _ => Some(format!("{target}: its geometry lacks Z or M values of {}, which were dropped when they were read", layer_list(&names))),
     }
+}
+
+/// What an export of `ds` to a `.ext` file named `target` says of the heights and measures its
+/// features hold ([`Zm`]) but the file doesn't get. GeoJSON is the only format written with
+/// heights: it leaves out those that no longer fit their geometry ([`Feature::zm_after`]),
+/// and measures, which GeoJSON doesn't define. Any other format leaves out both.
+pub fn zm_written_note(ds: &Dataset, ext: &str, target: &str) -> Vec<String> {
+    let count = |n: usize| if n == 1 { "1 feature".to_string() } else { format!("{n} features") };
+    let with: Vec<&Feature> = ds.features.iter().filter(|f| f.zm.is_some()).collect();
+    if with.is_empty() {
+        return Vec::new();
+    }
+    if !matches!(ext.to_ascii_lowercase().as_str(), "geojson" | "json") {
+        return vec![format!(
+            "{target}: heights or measures (Z or M) of {} weren't written: only GeoJSON exports keep heights",
+            count(with.len())
+        )];
+    }
+    let unfit = with.iter().filter(|f| !f.zm_fits()).count();
+    let measured = with.iter().filter(|f| f.zm_fits() && f.zm.as_ref().is_some_and(|zm| zm.m.is_some())).count();
+    let mut notes = Vec::new();
+    if unfit > 0 {
+        notes.push(format!(
+            "{target}: heights (Z) of {} weren't written: an edit or a tool changed their vertices, so their heights no longer fit them",
+            count(unfit)
+        ));
+    }
+    if measured > 0 {
+        notes.push(format!("{target}: measures (M) of {} weren't written: GeoJSON has none", count(measured)));
+    }
+    notes
 }
 
 /// `3 layers (a, b, c)`: the count, and the first five names.
@@ -818,7 +900,7 @@ mod tests {
         assert_eq!(ids, vec![500, 2, 3, 101, 501]);
         // Rows built elsewhere start without one; a clone keeps it with the rows it shares.
         let mut from: Dataset = Dataset::new("u", GeometryType::Point, vec![]);
-        from.features = vec![Feature { id: 7, geometry: None, attrs: vec![] }].into();
+        from.features = vec![Feature { id: 7, geometry: None, attrs: vec![], zm: None }].into();
         assert_eq!(from.features.max_id, None);
         from.push(None, vec![]);
         let mut copy = from.clone();
@@ -831,5 +913,64 @@ mod tests {
         assert_eq!(copy.features.max_id, Some(10));
         copy.push(None, vec![]);
         assert_eq!(copy.features.last().map(|f| f.id), Some(11));
+    }
+
+    /// Heights beside the geometry cost a pointer a feature (64 bytes before, on a 64-bit
+    /// computer), and 8 bytes a vertex for a feature that has them.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn heights_cost_a_pointer_a_feature() {
+        assert_eq!(std::mem::size_of::<Feature>(), 72);
+        assert_eq!(std::mem::size_of::<Option<Box<Zm>>>(), 8);
+        assert_eq!(std::mem::size_of::<Zm>(), 48);
+    }
+
+    #[test]
+    fn heights_fit_their_geometry_until_its_vertices_change() {
+        let line = Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]]);
+        let zm = |z: Vec<f64>| Some(Box::new(Zm { z: Some(z), m: None }));
+        let mut f = Feature { id: 1, geometry: Some(line.clone()), attrs: vec![], zm: zm(vec![1.0, 2.0]) };
+        assert!(f.zm_fits());
+        assert_eq!(f.z(), Some(&[1.0, 2.0][..]));
+        // Carried for the same vertices; emptied, so never fitting, for others.
+        assert_eq!(f.zm_after(true), f.zm);
+        let lost = f.zm_after(false);
+        assert_eq!(lost, Some(Box::new(Zm { z: Some(vec![]), m: None })));
+        f.zm = lost;
+        assert!(!f.zm_fits() && f.z().is_none());
+        // Too few or too many values, or values without geometry, don't fit either.
+        for (g, z) in [(Some(line.clone()), vec![1.0]), (Some(line), vec![1.0, 2.0, 3.0]), (None, vec![1.0])] {
+            let f = Feature { id: 1, geometry: g, attrs: vec![], zm: zm(z) };
+            assert!(!f.zm_fits());
+        }
+        // Without heights a feature has nothing to fit, and nothing to carry.
+        let flat = Feature { id: 1, geometry: None, attrs: vec![], zm: None };
+        assert!(flat.zm_fits() && flat.zm_after(false).is_none());
+    }
+
+    /// A project saved with heights, read by a release before them: its `Feature` has no `zm`, and
+    /// serde skips a field a struct doesn't name, so it opens with the heights silently left out
+    /// (and saving it again loses them for good). 2D features are written as before.
+    #[test]
+    fn a_reader_without_heights_skips_them_silently() {
+        #[derive(Deserialize)]
+        struct Before {
+            id: u64,
+            geometry: Option<Geometry>,
+            attrs: Vec<Value>,
+        }
+        let f = Feature {
+            id: 3,
+            geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))),
+            attrs: vec![Value::Int(4)],
+            zm: Some(Box::new(Zm { z: Some(vec![9.0]), m: None })),
+        };
+        let text = serde_json::to_string(&f).unwrap();
+        assert!(text.ends_with(r#""zm":{"z":[9.0]}}"#), "{text}");
+        let old: Before = serde_json::from_str(&text).unwrap();
+        assert_eq!((old.id, old.geometry, old.attrs), (f.id, f.geometry.clone(), f.attrs.clone()));
+        assert_eq!(serde_json::from_str::<Feature>(&text).unwrap(), f);
+        let flat = Feature { zm: None, ..f };
+        assert!(!serde_json::to_string(&flat).unwrap().contains("zm"));
     }
 }

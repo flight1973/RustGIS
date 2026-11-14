@@ -225,7 +225,7 @@ impl FeatureSource for ShpSource {
             } else {
                 vec![Value::Null; self.table.columns.len()]
             };
-            features.push(Feature { id: u64::from(i) + 1, geometry, attrs });
+            features.push(Feature { id: u64::from(i) + 1, geometry, attrs, zm: None });
             Ok(())
         })?;
         Ok(Batch { features, matched, complete, skipped, unread_dates })
@@ -294,7 +294,7 @@ impl FeatureSource for ShpSource {
             } else {
                 vec![Value::Null; self.table.columns.len()]
             };
-            chunks.push(Feature { id: u64::from(i) + 1, geometry, attrs })
+            chunks.push(Feature { id: u64::from(i) + 1, geometry, attrs, zm: None })
         })?;
         chunks.flush()?;
         Ok(Batch { features: Vec::new(), matched, complete, skipped, unread_dates })

@@ -20,7 +20,7 @@ fn harness(bearing: f64) -> Harness<'static, RustGisApp> {
     let mut session = Session::new(Project::new("Vertex snapping"));
     let geometry = Geometry::Line(vec![vec![c(0., 0.), c(0., 160.)], vec![c(180., 0.), c(180., 160.)]]);
     let mut data = Dataset::new("Editable paths", geometry.kind(), vec![]);
-    data.features = vec![Feature { id: 1, geometry: Some(geometry), attrs: vec![] }].into();
+    data.features = vec![Feature { id: 1, geometry: Some(geometry), attrs: vec![], zm: None }].into();
     let id = session.map_mut().add_dataset(data);
     session.map_mut().layer_mut(id).unwrap().selection.push(0);
     session.map_mut().camera.center = Coord::new(90., 80.);

@@ -25,6 +25,7 @@ fn harness() -> Harness<'static, RustGisApp> {
             id: i as u64 + 40,
             geometry: Some(Geometry::Polygon(vec![vec![vec![c(l, b), c(r, b), c(r, t), c(l, t), c(l, b)]]])),
             attrs: vec![],
+            zm: None,
         })
         .collect::<Vec<_>>()
         .into();
@@ -203,8 +204,8 @@ fn lines_and_points_keep_the_existing_move_path() {
         let data = &mut h.state_mut().session.map_mut().layers[0].dataset;
         data.geometry_type = geometry.kind();
         data.features = vec![
-            Feature { id: 1, geometry: Some(geometry.clone()), attrs: vec![] },
-            Feature { id: 2, geometry: Some(geometry.clone()), attrs: vec![] },
+            Feature { id: 1, geometry: Some(geometry.clone()), attrs: vec![], zm: None },
+            Feature { id: 2, geometry: Some(geometry.clone()), attrs: vec![], zm: None },
         ]
         .into();
         h.state_mut().run("ui.moveSharedVertices", json!({"on":true})).unwrap();

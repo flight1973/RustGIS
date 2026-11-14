@@ -304,6 +304,7 @@ pub fn feature(file: &str, bytes: &[u8], id: u64) -> std::result::Result<Feature
             text(camera),
             Value::Text(thumb),
         ],
+        zm: None,
     })
 }
 

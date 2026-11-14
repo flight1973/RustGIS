@@ -170,7 +170,7 @@ impl EditTable {
                 }
                 let attrs = values;
                 out.versions.push((id, hash.cast_signed()));
-                out.features.push(Feature { id, geometry, attrs });
+                out.features.push(Feature { id, geometry, attrs, zm: None });
             }
         }
         tx.commit().map_err(err)?;
@@ -387,7 +387,7 @@ impl EditTable {
             let geometry = self
                 .geometry(ValueRef::from(row.get(geom).ok_or_else(|| self.shape_error())?))
                 .ok_or_else(|| DataError::Format(format!("row {k}: its stored geometry can't be read, so nothing was saved")))?;
-            let mut feature = Feature { id: k.cast_unsigned(), geometry, attrs: vec![Value::Null; fields.len()] };
+            let mut feature = Feature { id: k.cast_unsigned(), geometry, attrs: vec![Value::Null; fields.len()], zm: None };
             if let Some(original) = original {
                 for &i in &unstored_fields {
                     if let (Some(target), Some(submitted)) = (feature.attrs.get_mut(i), original.attrs.get(i)) {
@@ -856,7 +856,7 @@ mod tests {
         conn.execute("UPDATE gpkg_contents SET last_change = '2099-01-01T00:00:00.000Z'", []).unwrap();
         let table = EditTable::open(&path, "roads").unwrap();
         let loaded = table.read_editable(MAX_EDITABLE).unwrap();
-        let edits = Edits { inserts: vec![Feature { id: 100, geometry: Some(line(4.0)), attrs: vec![] }], ..Default::default() };
+        let edits = Edits { inserts: vec![Feature { id: 100, geometry: Some(line(4.0)), attrs: vec![], zm: None }], ..Default::default() };
         let saved = table.save(&edits, &table.info().fields, [1].into_iter(), &loaded.revision).unwrap().unwrap();
         assert!(saved.revision > loaded.revision);
         drop(table);
@@ -899,7 +899,7 @@ mod tests {
             let loaded = table.read_editable(MAX_EDITABLE).unwrap();
             Connection::open(&path).unwrap().execute(mutation, []).unwrap();
             assert!(table.read_editable(MAX_EDITABLE).is_err(), "{mutation}");
-            let edits = Edits { inserts: vec![Feature { id: 100, geometry: None, attrs: vec![] }], ..Default::default() };
+            let edits = Edits { inserts: vec![Feature { id: 100, geometry: None, attrs: vec![], zm: None }], ..Default::default() };
             let error = table.save(&edits, &table.info().fields, [1].into_iter(), &loaded.revision).unwrap_err();
             assert!(error.to_string().contains("missing or invalid"), "{mutation}: {error}");
             assert_eq!(Connection::open(&path).unwrap().query_row("SELECT count(*) FROM roads", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
@@ -953,7 +953,8 @@ mod tests {
                 }
                 let table = EditTable::open(&path, "roads").unwrap();
                 let read = table.read_editable(MAX_EDITABLE).unwrap();
-                let edits = Edits { inserts: vec![Feature { id: 100, geometry: Some(line(10.0)), attrs: vec![] }], ..Default::default() };
+                let edits =
+                    Edits { inserts: vec![Feature { id: 100, geometry: Some(line(10.0)), attrs: vec![], zm: None }], ..Default::default() };
                 table.save(&edits, &table.info().fields, read.versions.iter().map(|(k, _)| *k), &read.revision).unwrap().unwrap();
                 let bounds: (f64, f64, f64, f64) = conn
                     .query_row("SELECT min_x, min_y, max_x, max_y FROM gpkg_contents", [], |r| {
@@ -1021,7 +1022,12 @@ mod tests {
             changed.attrs[0] = Value::Text("move".into());
             let edits = Edits {
                 updates: vec![(changed, read.versions[0].1)],
-                inserts: vec![Feature { id: 100, geometry: Some(line(4.0)), attrs: vec![Value::Text("move".into()), Value::Null] }],
+                inserts: vec![Feature {
+                    id: 100,
+                    geometry: Some(line(4.0)),
+                    attrs: vec![Value::Text("move".into()), Value::Null],
+                    zm: None,
+                }],
                 ..Default::default()
             };
             let saved = table.save(&edits, &table.info().fields, [1].into_iter(), &read.revision).unwrap().unwrap();
@@ -1362,7 +1368,7 @@ mod tests {
         let read = table.read_editable(MAX_EDITABLE).unwrap();
         let mut changed = read.features[0].clone();
         changed.attrs[0] = Value::Text("partial".into());
-        let new = Feature { id: 100, geometry: Some(line(7.0)), attrs: vec![Value::Text("bad".into()), Value::Null] };
+        let new = Feature { id: 100, geometry: Some(line(7.0)), attrs: vec![Value::Text("bad".into()), Value::Null], zm: None };
         let edits = Edits { updates: vec![(changed, read.versions[0].1)], inserts: vec![new], ..Default::default() };
         let before: String = conn.query_row("SELECT last_change FROM gpkg_contents", [], |r| r.get(0)).unwrap();
         assert!(table.save(&edits, &table.info().fields, std::iter::empty(), &read.revision).unwrap_err().to_string().contains("bad name"));
@@ -1452,11 +1458,11 @@ mod tests {
         assert_eq!(blob_at(&path, 1), original);
         conn.execute("UPDATE gpkg_geometry_columns SET z = 1", []).unwrap();
         let table = EditTable::open(&path, "roads").unwrap();
-        let edits = Edits { inserts: vec![Feature { id: 100, geometry: Some(line(4.0)), attrs: vec![] }], ..Default::default() };
+        let edits = Edits { inserts: vec![Feature { id: 100, geometry: Some(line(4.0)), attrs: vec![], zm: None }], ..Default::default() };
         assert!(
             table.save(&edits, &table.info().fields, std::iter::empty(), &saved.revision).unwrap_err().to_string().contains("needs Z or M")
         );
-        let edits = Edits { inserts: vec![Feature { id: 100, geometry: None, attrs: vec![] }], ..Default::default() };
+        let edits = Edits { inserts: vec![Feature { id: 100, geometry: None, attrs: vec![], zm: None }], ..Default::default() };
         assert_eq!(
             table.save(&edits, &table.info().fields, std::iter::empty(), &saved.revision).unwrap().unwrap().changes.inserted,
             vec![(100, 2)]
@@ -1487,7 +1493,7 @@ mod tests {
         let read = table.read_editable(MAX_EDITABLE).unwrap();
         let edits = Edits {
             deletes: read.versions,
-            inserts: vec![Feature { id: 100, geometry: Some(line(20.0)), attrs: vec![] }],
+            inserts: vec![Feature { id: 100, geometry: Some(line(20.0)), attrs: vec![], zm: None }],
             ..Default::default()
         };
         let saved = table.save(&edits, &table.info().fields, std::iter::empty(), &read.revision).unwrap().unwrap();
@@ -1622,11 +1628,13 @@ mod tests {
                 Value::Text("added-default".into()),
                 Value::Int(999),
             ],
+            zm: None,
         };
         let inserted = Feature {
             id: 100,
             geometry: None,
             attrs: vec![Value::Null, Value::Text("insert-only".into()), Value::Null, Value::Null, Value::Int(999)],
+            zm: None,
         };
         let edits = Edits { updates: vec![(unchanged, version)], inserts: vec![inserted], ..Default::default() };
         let saved = table.save(&edits, &fields, [1].into_iter(), REVISION).unwrap().unwrap();
@@ -1648,6 +1656,7 @@ mod tests {
                     Value::Text("added-default".into()),
                     Value::Int(2),
                 ],
+                zm: None,
             }
         );
         let reopened = EditTable::open(&path, "roads").unwrap();
@@ -1696,6 +1705,7 @@ mod tests {
                         id: 100,
                         geometry: Some(line(4.0)),
                         attrs: vec![Value::Text("broken".into()), Value::Null],
+                        zm: None,
                     });
                 }
                 let error = table.save(&edits, &table.info().fields, [1].into_iter(), &read.revision).unwrap_err();
@@ -1718,7 +1728,7 @@ mod tests {
         let read = table.read_editable(MAX_EDITABLE).unwrap();
         conn.execute("DELETE FROM roads WHERE fid = 3", []).unwrap();
         let edits = Edits {
-            inserts: vec![Feature { id: 999, geometry: None, attrs: vec![Value::Text("new".into()), Value::Null] }],
+            inserts: vec![Feature { id: 999, geometry: None, attrs: vec![Value::Text("new".into()), Value::Null], zm: None }],
             ..Default::default()
         };
         let saved = table.save(&edits, &table.info().fields, read.versions.iter().map(|(k, _)| *k), &read.revision).unwrap().unwrap();
@@ -1742,7 +1752,7 @@ mod tests {
         )
         .unwrap();
         let table = EditTable::open(&path, "roads").unwrap();
-        let edits = Edits { inserts: vec![Feature { id: 999, geometry: None, attrs: vec![] }], ..Default::default() };
+        let edits = Edits { inserts: vec![Feature { id: 999, geometry: None, attrs: vec![], zm: None }], ..Default::default() };
         let saved = table.save(&edits, &table.info().fields, [70].into_iter(), REVISION).unwrap().unwrap();
         assert_eq!(saved.changes.inserted, vec![(999, 101)]);
         assert_eq!(saved.features[0].id, 101);
@@ -1775,7 +1785,10 @@ mod tests {
             changed.attrs[0] = Value::Text("partial".into());
             let edits = Edits {
                 updates: vec![(changed, before.versions[0].1)],
-                inserts: vec![Feature { id: 100, geometry: None, attrs: vec![] }, Feature { id: 101, geometry: None, attrs: vec![] }],
+                inserts: vec![
+                    Feature { id: 100, geometry: None, attrs: vec![], zm: None },
+                    Feature { id: 101, geometry: None, attrs: vec![], zm: None },
+                ],
                 ..Default::default()
             };
             let reserved = if high_water_source == "reserved" { (i64::MAX - 1).cast_unsigned() } else { 1 };
@@ -1819,7 +1832,7 @@ mod tests {
             let read = table.read_editable(MAX_EDITABLE).unwrap();
             let mut changed = read.features[0].clone();
             changed.attrs[0] = Value::Text("must roll back".into());
-            let inserted = Feature { id: 99, geometry: Some(geometry), attrs: vec![Value::Text("new".into()), Value::Null] };
+            let inserted = Feature { id: 99, geometry: Some(geometry), attrs: vec![Value::Text("new".into()), Value::Null], zm: None };
             let edits = Edits { updates: vec![(changed, read.versions[0].1)], inserts: vec![inserted], ..Default::default() };
             assert!(table.save(&edits, &table.info().fields, std::iter::empty(), &read.revision).is_err(), "{ty}");
             let stored: (i64, String) = conn.query_row("SELECT count(*), name FROM roads", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();

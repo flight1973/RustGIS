@@ -509,7 +509,8 @@ pub fn commands() -> Vec<C> {
         .when(need_editable_selection)
         .params(r#"{"factor": number}"#),
         C::new("edit.flip", "Flip Line", "Edit › Features › Modify", |s, _| {
-            modify(s, |_, g| match g {
+            // Reversed, the vertices are in another order: their heights don't follow.
+            modify(s, false, |_, g| match g {
                 Geometry::Line(parts) => Ok(Some(Geometry::Line(parts.iter().rev().map(|p| p.iter().rev().copied().collect()).collect()))),
                 _ => Ok(None),
             })
@@ -1027,7 +1028,7 @@ fn polar_transform(
 /// infinite one) where it was: says how many of the features it changed have one.
 fn move_features(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>) -> CmdResult {
     let mut missing = 0usize;
-    let done = modify(s, |key, g| {
+    let done = modify(s, true, |key, g| {
         let moved = change(key, g)?;
         if moved.is_some() {
             let mut has = false;
@@ -1043,7 +1044,10 @@ fn move_features(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry
 }
 
 /// Applies a geometry change to every selected feature of every layer (in the selection's layers).
-fn modify(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>) -> CmdResult {
+/// `moves` says the change only moves vertices, keeping them and their order, so that heights stay
+/// with them when their number is unchanged; otherwise a feature's heights are emptied
+/// ([`rustgis_data::Feature::zm_after`]).
+fn modify(s: &mut Session, moves: bool, mut change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>) -> CmdResult {
     let mut n = 0;
     let ids: Vec<u32> = s.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster()).map(|l| l.id).collect();
     for id in ids {
@@ -1054,6 +1058,7 @@ fn modify(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry) -> Re
             let Some(g) = f.geometry.as_ref().map(|g| change((id, r), g)).transpose()?.flatten() else { continue };
             super::edit::validate(&g)?;
             let before = f.clone();
+            f.zm = f.zm_after(moves && f.geometry.as_ref().map(Geometry::coord_count) == Some(g.coord_count()));
             f.geometry = Some(g);
             changes.push(Change { before: Some(before), row: Some(r) });
             n += 1;
@@ -1071,7 +1076,7 @@ fn set_geometry(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
     let row = p.get("row").and_then(Json::as_u64).ok_or("row is required")? as usize;
     let g = super::edit::geometry_param(p)?;
-    replace_geometry(s, id, row, g)?;
+    replace_geometry(s, id, row, g, false)?;
     Ok(Json::Null)
 }
 
@@ -1103,21 +1108,23 @@ fn edit_vertex(s: &mut Session, p: &Json) -> CmdResult {
         .geometry
         .clone()
         .ok_or("the feature has no shape")?;
-    let (g, v) = match ps(p, "action").ok_or("action is required")? {
-        "move" => (g.move_vertex(v, at()?).ok_or("no such vertex")?, v),
+    // A vertex moved keeps its height; one added or removed leaves the heights unplaced.
+    let (g, v, moves) = match ps(p, "action").ok_or("action is required")? {
+        "move" => (g.move_vertex(v, at()?).ok_or("no such vertex")?, v, true),
         "insert" => {
             let g = g.insert_vertex(v, at()?).ok_or("vertices can only be inserted in lines and polygons")?;
-            (g, rustgis_data::VertexId::new(v.part, v.ring, v.index + 1))
+            (g, rustgis_data::VertexId::new(v.part, v.ring, v.index + 1), false)
         }
-        "delete" => (g.delete_vertex(v)?, v),
+        "delete" => (g.delete_vertex(v)?, v, false),
         a => return Err(format!("unknown action '{a}'")),
     };
-    replace_geometry(s, id, row, g)?;
+    replace_geometry(s, id, row, g, moves)?;
     Ok(json!({"part": v.part, "ring": v.ring, "index": v.index}))
 }
 
-/// Replaces a feature's shape with one of the layer's kind, as one edit.
-fn replace_geometry(s: &mut Session, id: u32, row: usize, g: Geometry) -> Result<(), String> {
+/// Replaces a feature's shape with one of the layer's kind, as one edit. `moves` says it has the
+/// same vertices in the same order, so their heights stay with them.
+fn replace_geometry(s: &mut Session, id: u32, row: usize, g: Geometry, moves: bool) -> Result<(), String> {
     super::edit::validate(&g)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     if l.geometry_type() != GeometryType::None && l.geometry_type() != g.kind() {
@@ -1125,6 +1132,7 @@ fn replace_geometry(s: &mut Session, id: u32, row: usize, g: Geometry) -> Result
     }
     let f = l.dataset.features.get_mut(row).ok_or("no such row")?;
     let before = f.clone();
+    f.zm = f.zm_after(moves || f.geometry.as_ref() == Some(&g));
     f.geometry = Some(g);
     l.touch_geometry();
     apply(s, id, vec![Change { before: Some(before), row: Some(row) }])
@@ -1168,6 +1176,7 @@ fn merge(s: &mut Session, _: &Json) -> CmdResult {
     }
     let f = l.dataset.features.get_mut(keep).ok_or("no such row")?;
     let before = f.clone();
+    f.zm = f.zm_after(false);
     f.geometry = Some(merged);
     changes.push(Change { before: Some(before), row: Some(keep) });
     l.selection = vec![keep];
@@ -1191,12 +1200,17 @@ fn explode(s: &mut Session, _: &Json) -> CmdResult {
             continue;
         }
         let mut it = parts.into_iter();
+        // Each part keeps the feature's heights emptied, so an export says they were lost.
         if let (Some(first), Some(feat)) = (it.next(), l.dataset.features.get_mut(r)) {
             feat.geometry = Some(first);
+            feat.zm = f.zm_after(false);
             changes.push(Change { before: Some(f.clone()), row: Some(r) });
         }
         for g in it {
             l.dataset.push(Some(g), f.attrs.clone());
+            if let Some(last) = l.dataset.features.last_mut() {
+                last.zm = f.zm_after(false);
+            }
             let nr = l.dataset.features.len() - 1;
             new_rows.push(nr);
             changes.push(Change { before: None, row: Some(nr) });
@@ -1328,9 +1342,13 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
         b_parts.extend(parts.iter().skip(pi + 1).cloned());
         if let Some(feat) = l.dataset.features.get_mut(r) {
             feat.geometry = Some(Geometry::Line(a_parts));
+            feat.zm = f.zm_after(false);
             changes.push(Change { before: Some(f.clone()), row: Some(r) });
         }
         l.dataset.push(Some(Geometry::Line(b_parts)), f.attrs.clone());
+        if let Some(last) = l.dataset.features.last_mut() {
+            last.zm = f.zm_after(false);
+        }
         changes.push(Change { before: None, row: Some(l.dataset.features.len() - 1) });
         rough += usize::from(unsure);
     }

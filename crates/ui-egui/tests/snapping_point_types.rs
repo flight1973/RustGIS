@@ -18,7 +18,7 @@ fn c(x: f64, y: f64) -> Coord {
 /// Creates an ordinary upstream feature layer; no files, provider or product shell is involved.
 fn add(session: &mut Session, name: &str, geometry: Geometry) -> u32 {
     let mut data = Dataset::new(name, geometry.kind(), vec![]);
-    data.features = vec![Feature { id: 1, geometry: Some(geometry), attrs: vec![] }].into();
+    data.features = vec![Feature { id: 1, geometry: Some(geometry), attrs: vec![], zm: None }].into();
     session.map_mut().add_dataset(data)
 }
 

@@ -20590,7 +20590,7 @@ fn dropped_z_values_are_said_on_import_and_export() {
         let out = dir.join(format!("out-{stream}.geojson"));
         let mark = s.notice_mark();
         s.run("share.exportLayer", &json!({"layer": id, "path": out})).unwrap();
-        let said = |s: &Session, mark| s.notices_since(mark).iter().any(|n| n.text.contains("its geometry has no Z or M values"));
+        let said = |s: &Session, mark| s.notices_since(mark).iter().any(|n| n.text.contains("its geometry lacks Z or M values"));
         assert!(said(&s, mark), "stream {stream}: {:?}", s.notices_since(mark));
         assert!(std::fs::read_to_string(&out).unwrap().contains("[1.0,2.0]"));
         let mark = s.notice_mark();
@@ -20629,7 +20629,7 @@ fn exporting_a_table_says_its_dropped_z_values() {
         let out = dir.join(format!("wells.{ext}")).display().to_string();
         let mark = s.notice_mark();
         s.run("share.exportTable", &json!({"table": "wells", "path": out})).unwrap();
-        assert_eq!(said(&s, mark), [format!("{out}: its geometry has no Z or M values, which were dropped when wells was read")], ".{ext}");
+        assert_eq!(said(&s, mark), [format!("{out}: its geometry lacks Z or M values that were dropped when wells was read")], ".{ext}");
     }
     // The file holds x and y only.
     assert!(std::fs::read_to_string(dir.join("wells.geojson")).unwrap().contains("[1.0,2.0]"));
@@ -20650,7 +20650,7 @@ fn exporting_a_table_says_its_dropped_z_values() {
     let out = dir.join("opened.geojson").display().to_string();
     let mark = t.notice_mark();
     t.run("share.exportTable", &json!({"table": "wells", "path": out})).unwrap();
-    assert_eq!(said(&t, mark), [format!("{out}: its geometry has no Z or M values, which were dropped when wells was read")]);
+    assert_eq!(said(&t, mark), [format!("{out}: its geometry lacks Z or M values that were dropped when wells was read")]);
     // A write that fails says nothing of what the file would have lacked.
     let missing = dir.join("missing").join("wells.geojson").display().to_string();
     let mark = s.notice_mark();
@@ -26693,7 +26693,7 @@ fn streamed_layer_outside_its_zoom_range_reads_nothing() {
         for j in 0..200u32 {
             let c = rustgis_geom::Coord::new(-179.0 + 1.79 * f64::from(i), -80.0 + 0.8 * f64::from(j));
             let n = u64::from(i * 200 + j);
-            ds.features.push(Feature { id: n + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(n as i64)] });
+            ds.features.push(Feature { id: n + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(n as i64)], zm: None });
         }
     }
     let (base, sent) = serve_ranges(rustgis_data::source::fgb::write(&ds).unwrap());
@@ -26728,7 +26728,7 @@ fn load_all_features_waits_for_a_source_still_opening() {
     let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
     for i in 0..100u32 {
         let c = rustgis_geom::Coord::new(f64::from(i) * 0.1, 1.0);
-        ds.features.push(Feature { id: u64::from(i) + 1, geometry: Some(Geometry::Point(c)), attrs: vec![] });
+        ds.features.push(Feature { id: u64::from(i) + 1, geometry: Some(Geometry::Point(c)), attrs: vec![], zm: None });
     }
     let fgb = rustgis_data::source::fgb::write(&ds).unwrap();
     let (base, _) = serve_ranges(fgb.clone());
@@ -26763,7 +26763,7 @@ fn flatgeobuf_and_geoparquet_by_address_are_read_in_place() {
         for j in 0..200u32 {
             let c = rustgis_geom::Coord::new(-179.0 + 1.79 * f64::from(i), -80.0 + 0.8 * f64::from(j));
             let n = u64::from(i * 200 + j);
-            ds.features.push(Feature { id: n + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(n as i64)] });
+            ds.features.push(Feature { id: n + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(n as i64)], zm: None });
         }
     }
     let fgb = rustgis_data::source::fgb::write(&ds).unwrap();
@@ -27854,7 +27854,12 @@ fn overture_files_are_added_all_or_none() {
     let mut ds = Dataset::new("b", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
     for i in 0..50u32 {
         let c = rustgis_geom::Coord::new(7.0 + 0.01 * f64::from(i), 46.0);
-        ds.features.push(Feature { id: u64::from(i) + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(i64::from(i))] });
+        ds.features.push(Feature {
+            id: u64::from(i) + 1,
+            geometry: Some(Geometry::Point(c)),
+            attrs: vec![Value::Int(i64::from(i))],
+            zm: None,
+        });
     }
     let (good, _) = serve_ranges(rustgis_data::source::fgb::write(&ds).unwrap());
     let (bad, _) = serve_ranges(b"not a flatgeobuf at all".to_vec());
@@ -27891,7 +27896,12 @@ fn a_failed_multi_file_add_leaves_the_map_as_it_was() {
     let mut ds = Dataset::new("b", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
     for i in 0..20u32 {
         let c = rustgis_geom::Coord::new(7.0 + 0.01 * f64::from(i), 46.0);
-        ds.features.push(Feature { id: u64::from(i) + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(i64::from(i))] });
+        ds.features.push(Feature {
+            id: u64::from(i) + 1,
+            geometry: Some(Geometry::Point(c)),
+            attrs: vec![Value::Int(i64::from(i))],
+            zm: None,
+        });
     }
     let (good, _) = serve_ranges(rustgis_data::source::fgb::write(&ds).unwrap());
     let (bad, _) = serve_ranges(b"not a flatgeobuf at all".to_vec());

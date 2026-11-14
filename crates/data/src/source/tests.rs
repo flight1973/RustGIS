@@ -2044,6 +2044,7 @@ fn big(n: usize, parquet: bool) -> Vec<u8> {
                 id: id + 1,
                 geometry: Some(Geometry::Point(c)),
                 attrs: vec![Value::Text(format!("p{i}_{j}")), Value::Int(id as i64)],
+                zm: None,
             });
         }
     }

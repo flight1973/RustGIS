@@ -517,7 +517,7 @@ impl FeatureSource for ParquetSource {
                     continue;
                 }
                 let values = attrs.iter().enumerate().map(|(field, col)| col.value(k, field, &mut unread_dates)).collect();
-                sample.keep(Feature { id: base.saturating_add(r as u64 + 1), geometry, attrs: values });
+                sample.keep(Feature { id: base.saturating_add(r as u64 + 1), geometry, attrs: values, zm: None });
             }
         }
         let matched = (if late { sample.seen() } else { matched }).saturating_mul(thinned as u64);
@@ -605,7 +605,7 @@ impl FeatureSource for ParquetSource {
                 }
                 let values = attrs.iter().enumerate().map(|(field, col)| col.value(k, field, &mut out.unread_dates)).collect();
                 out.matched += 1;
-                chunks.push(Feature { id: start.saturating_add(r as u64 + 1), geometry, attrs: values })?;
+                chunks.push(Feature { id: start.saturating_add(r as u64 + 1), geometry, attrs: values, zm: None })?;
             }
         }
         chunks.flush()?;

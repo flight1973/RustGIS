@@ -42,7 +42,8 @@ pub fn commands() -> Vec<C> {
             let default = t.dataset.name.clone();
             let null_numbers = rustgis_data::export::numbers_written_as_null(&t.dataset.features, &t.dataset.fields, &ext);
             // Tables may retain geometry and its import losses, just as feature layers do.
-            let notes = rustgis_data::export_notes([(&t.dataset, t.dataset.extent())], path, Crs::LonLat);
+            let mut notes = rustgis_data::export_notes([(&t.dataset, t.dataset.extent())], path, Crs::LonLat);
+            notes.extend(rustgis_data::zm_written_note(&t.dataset, &ext, path));
             let mut dbf_notes = Vec::new();
             if matches!(ext.as_str(), "shp" | "zip") {
                 dbf_notes.extend(rustgis_data::io::shapefile_names_note(&t.dataset.fields, path));
@@ -729,6 +730,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     // raster layer's extent is its raster's, which the file doesn't hold.
     let extent = if chunks.is_some() { l.extent() } else { ds.extent() };
     let mut notes = rustgis_data::export_notes([(ds, extent)], path, crs);
+    notes.extend(rustgis_data::zm_written_note(ds, &ext, path));
     notes.extend(moved);
     // A Shapefile (`.shp`, or zipped to `.zip`) cuts field names to dBase's.
     let shapefile = matches!(ext.as_str(), "shp" | "zip");

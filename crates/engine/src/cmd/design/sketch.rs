@@ -70,13 +70,18 @@ pub(super) fn cut_polygon(s: &mut Session, p: &Value) -> CmdResult {
     let (mut changes, mut selection) = (Vec::new(), Vec::new());
     for (r, before, pieces) in cuts {
         let mut pieces = pieces.into_iter();
+        // The pieces' vertices aren't the polygon's: its heights are emptied, so an export says so.
         if let (Some(first), Some(feat)) = (pieces.next(), l.dataset.features.get_mut(r)) {
             feat.geometry = Some(first);
+            feat.zm = before.zm_after(false);
         }
         changes.push(Change { before: Some(before.clone()), row: Some(r) });
         selection.push(r);
         for g in pieces {
             l.dataset.push(Some(g), before.attrs.clone());
+            if let Some(last) = l.dataset.features.last_mut() {
+                last.zm = before.zm_after(false);
+            }
             let row = l.dataset.features.len() - 1;
             changes.push(Change { before: None, row: Some(row) });
             selection.push(row);
@@ -106,6 +111,7 @@ pub(super) fn reshape(s: &mut Session, p: &Value) -> CmdResult {
     super::super::edit::validate(&done.geometry)?;
     if let Some(feat) = l.dataset.features.get_mut(r) {
         feat.geometry = Some(done.geometry);
+        feat.zm = f.zm_after(false);
     }
     l.touch_geometry();
     apply(s, id, vec![Change { before: Some(f), row: Some(r) }])?;

@@ -409,7 +409,7 @@ fn read_points<R: Read + Seek + Send + Sync>(mut r: R, name: &str, crs: Option<C
                 attrs.push(Value::Int(i64::from(if wide { v >> 8 } else { v })));
             }
         }
-        ds.features.push(Feature { id: id as u64, geometry: Some(Geometry::Point(c)), attrs });
+        ds.features.push(Feature { id: id as u64, geometry: Some(Geometry::Point(c)), attrs, zm: None });
     }
     if lost > 0 {
         report.skipped += lost;

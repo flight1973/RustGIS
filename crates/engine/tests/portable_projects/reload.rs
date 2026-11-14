@@ -663,7 +663,7 @@ fn reload_reconverts_original_gdal_folder_and_accepts_its_declared_empty_table()
         let mark = s.notice_mark();
         s.run("share.exportLayer", &json!({"layer": id, "path": output})).unwrap();
         assert_eq!(
-            s.notices_since(mark).iter().filter(|n| n.text.contains("its geometry has no Z or M values")).count(),
+            s.notices_since(mark).iter().filter(|n| n.text.contains("its geometry lacks Z or M values")).count(),
             usize::from(z),
             "{:?}",
             s.notices_since(mark)

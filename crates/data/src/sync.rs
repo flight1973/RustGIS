@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn a_rows_digest_tells_a_non_finite_number_from_an_empty_cell() {
         use crate::{Dataset, Feature, Field, FieldType, GeometryType, Value};
-        let row = |v: Value| vec![Feature { id: 1, geometry: None, attrs: vec![v] }].into();
+        let row = |v: Value| vec![Feature { id: 1, geometry: None, attrs: vec![v], zm: None }].into();
         let mut ds = Dataset::new("a".to_string(), GeometryType::None, vec![Field::new("v", FieldType::Double)]);
         ds.features = row(Value::Float(f64::NAN));
         let digest = |v: Value| {
@@ -332,6 +332,7 @@ mod tests {
             id: 1,
             geometry: Some(Geometry::Point(Coord { x: -90.05, y: 35.15 })),
             attrs: vec![Value::Text("Main St".into()), Value::Int(4)],
+            zm: None,
         }]
         .into();
         assert_eq!(rows_digest(&ds).unwrap(), 1_724_049_670_388_433_092);

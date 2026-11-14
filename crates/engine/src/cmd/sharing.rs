@@ -597,17 +597,24 @@ pub(crate) fn note_export(s: &mut Session, kind: &str, p: &Value, target: &str) 
             .layer_id(p)
             .ok()
             .and_then(|id| s.map().layer(id))
-            .map(|l| rustgis_data::export_notes([(&l.dataset, l.extent())], target, rustgis_data::raster::Crs::LonLat))
+            .map(|l| {
+                // Shared GeoJSON is written without heights.
+                let mut notes = rustgis_data::export_notes([(&l.dataset, l.extent())], target, rustgis_data::raster::Crs::LonLat);
+                notes.extend(rustgis_data::zm_written_note(&l.dataset, "", target));
+                notes
+            })
             .unwrap_or_default(),
         "webMap" | "geodataService" => map_of(s, p)
             .ok()
             .map(|m| {
                 let shared = |l: &&Layer| if kind == "webMap" { l.visible } else { !l.is_raster() && !l.graphics };
-                rustgis_data::export_notes(
+                let mut notes = rustgis_data::export_notes(
                     m.layers.iter().filter(shared).map(|l| (&l.dataset, l.extent())),
                     target,
                     rustgis_data::raster::Crs::LonLat,
-                )
+                );
+                notes.extend(m.layers.iter().filter(shared).flat_map(|l| rustgis_data::zm_written_note(&l.dataset, "", target)));
+                notes
             })
             .unwrap_or_default(),
         _ => Vec::new(),

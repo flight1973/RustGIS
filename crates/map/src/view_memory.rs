@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn unchanged_allocations_reuse_totals_and_weak_keys_do_not_retain_rows() {
-        let mut rows: Features = vec![Feature { id: 1, geometry: None, attrs: vec![] }].into();
+        let mut rows: Features = vec![Feature { id: 1, geometry: None, attrs: vec![], zm: None }].into();
         let key = rows.allocation_key();
         let mut measured = Allocation::default();
         assert_eq!(measured.get(key.clone(), || 123), 123);

@@ -185,13 +185,15 @@ fn run_with_room(
         }
         attrs.resize(width, Value::Null);
         attrs.push(Value::Text(item.repairs));
+        // A repaired geometry's vertices aren't known to be the same ones: its heights are emptied.
+        let zm = f.zm_after(matches!(item.geometry, Written::Same));
         let geometry = match item.geometry {
             Written::Same => f.geometry.as_ref().map(crate::merge::clone_geometry).transpose().map_err(no_memory)?,
             Written::Without => None,
             Written::Repaired(g) => Some(g),
         };
         // The input's id, so a row leads back to its feature.
-        list.push(Feature { id: f.id, geometry, attrs });
+        list.push(Feature { id: f.id, geometry, attrs, zm });
     }
     out.features = list.into();
 

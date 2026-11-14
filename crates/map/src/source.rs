@@ -1964,6 +1964,7 @@ mod tests {
             id: 3,
             geometry: Some(Geometry::Point(Coord { x: 1.5, y: -2.0 })),
             attrs: vec![Value::Text("Main St".into()), Value::Int(4), Value::Null],
+            zm: None,
         };
         let bytes = serde_json::to_vec(&(&f.geometry, &f.attrs)).unwrap();
         let fnv = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3));
@@ -1977,7 +1978,7 @@ mod tests {
     fn clearing_nonfinite_source_values_is_a_row_update() {
         use rustgis_data::{Feature, Value};
         for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let loaded = Feature { id: 1, geometry: None, attrs: vec![Value::Float(number)] };
+            let loaded = Feature { id: 1, geometry: None, attrs: vec![Value::Float(number)], zm: None };
             let versions: super::Versions = [(1, super::RowVersion { version: 7, hash: super::row_hash(&loaded) })].into_iter().collect();
             assert!(versions.changes(std::slice::from_ref(&loaded)).is_empty());
             let cleared = Feature { attrs: vec![Value::Null], ..loaded };
@@ -1994,6 +1995,7 @@ mod tests {
             id,
             geometry: Some(Geometry::Point(Coord { x: id as f64, y: 1.0 })),
             attrs: vec![Value::Text(name.into())],
+            zm: None,
         };
         let loaded = [row(1, "a"), row(2, "b"), row(3, "c")];
         let edit = super::PostgisEdit {

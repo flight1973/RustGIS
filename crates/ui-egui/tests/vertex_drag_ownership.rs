@@ -23,7 +23,7 @@ fn harness() -> Harness<'static, RustGisApp> {
 fn harness_with(geometry: Geometry) -> Harness<'static, RustGisApp> {
     let mut session = Session::new(Project::new("Vertex drag ownership"));
     let mut data = Dataset::new("Paths", geometry.kind(), vec![]);
-    data.features = vec![Feature { id: 1, geometry: Some(geometry), attrs: vec![] }].into();
+    data.features = vec![Feature { id: 1, geometry: Some(geometry), attrs: vec![], zm: None }].into();
     let id = session.map_mut().add_dataset(data);
     session.map_mut().layer_mut(id).unwrap().selection.push(0);
     session.map_mut().camera.center = Coord::new(80., 80.);
@@ -144,7 +144,7 @@ fn row_reuse_without_touch_rejects_queued_release() {
     let to = drag(&mut h, false);
     let layer = &mut h.state_mut().session.map_mut().layers[0];
     let revision = layer.geometry_rev;
-    layer.dataset.features = vec![Feature { id: 1, geometry: Some(line(30.)), attrs: vec![] }].into();
+    layer.dataset.features = vec![Feature { id: 1, geometry: Some(line(30.)), attrs: vec![], zm: None }].into();
     assert_eq!(layer.geometry_rev, revision);
     release(&mut h, to);
     assert_eq!(first(&h), c(30., 0.));

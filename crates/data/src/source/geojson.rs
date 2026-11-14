@@ -292,7 +292,7 @@ impl FeatureSource for GeoJsonSource {
             if geometry.as_ref().is_some_and(|g| !in_request(g, req)) {
                 continue;
             }
-            features.push(Feature { id: u64::from(i) + 1, geometry, attrs: geojson_attrs(&json, &self.info.fields) });
+            features.push(Feature { id: u64::from(i) + 1, geometry, attrs: geojson_attrs(&json, &self.info.fields), zm: None });
         }
         Ok(Batch { features, matched: matched as u64, complete: step == 1, skipped, unread_dates: Vec::new() })
     }

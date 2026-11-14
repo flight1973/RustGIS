@@ -363,6 +363,7 @@ fn edit(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(g) = placed {
         let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
         if let Some(ft) = l.dataset.features.get_mut(row) {
+            ft.zm = ft.zm_after(false);
             ft.geometry = Some(g);
         }
         l.touch_geometry();

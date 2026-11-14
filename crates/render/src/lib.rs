@@ -11339,6 +11339,7 @@ mod tests {
             id: 0,
             geometry: Some(Geometry::Line(vec![vec![Coord::new(-2.0, 0.0), Coord::new(2.0, 0.0)]])),
             attrs: vec![Value::Text("Obere Töss".into())],
+            zm: None,
         }]
         .into();
         m.layer_mut(line).unwrap().touch_geometry();

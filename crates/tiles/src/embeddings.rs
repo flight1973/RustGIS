@@ -838,7 +838,7 @@ pub fn points_dataset(name: &str, v: &Vectors, dim: Option<usize>) -> Dataset {
         if let Some(d) = dim {
             attrs.push(v.values.get(i * v.dims + d).map(|x| Value::Float(f64::from(*x))).unwrap_or_default());
         }
-        ds.features.push(Feature { id: i as u64 + 1, geometry: Some(Geometry::Point(Coord::new(*x, *y))), attrs });
+        ds.features.push(Feature { id: i as u64 + 1, geometry: Some(Geometry::Point(Coord::new(*x, *y))), attrs, zm: None });
     }
     ds
 }
@@ -910,6 +910,7 @@ mod tests {
             id: 1,
             geometry: Some(Geometry::Polygon(ring(x))),
             attrs: vec![Value::Text("1".into()), Value::Int(ms), Value::Text(href.into()), Value::Text("EPSG:32610".into())],
+            zm: None,
         };
         let batch = Batch {
             features: vec![
@@ -966,6 +967,7 @@ mod tests {
                 Value::Text(href.into()),
                 Value::Text("EPSG:32723".into()),
             ],
+            zm: None,
         };
         let base = "s3://us-west-2.opendata.source.coop/tge-labs/aef/v1/annual";
         let batch = Batch {

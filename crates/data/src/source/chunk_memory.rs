@@ -26,7 +26,14 @@ pub fn feature_bytes(f: &Feature) -> usize {
             _ => 0,
         })
     });
-    attrs.saturating_add(f.geometry.as_ref().map_or(0, geometry_bytes))
+    // Heights and measures: the box, and each array's spare capacity too.
+    let zm = f.zm.as_ref().map_or(0, |zm| {
+        [&zm.z, &zm.m]
+            .into_iter()
+            .flatten()
+            .fold(size_of::<crate::Zm>(), |n, a| n.saturating_add(a.capacity().saturating_mul(size_of::<f64>())))
+    });
+    attrs.saturating_add(f.geometry.as_ref().map_or(0, geometry_bytes)).saturating_add(zm)
 }
 
 /// Actual allocated chunk storage, including spare capacity.

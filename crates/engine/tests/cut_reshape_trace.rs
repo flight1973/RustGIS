@@ -25,7 +25,7 @@ fn fixture(kind: GeometryType, shapes: Vec<Geometry>) -> (Session, u32) {
     data.features = shapes
         .into_iter()
         .enumerate()
-        .map(|(i, g)| Feature { id: i as u64, geometry: Some(g), attrs: vec![Cell::Text(format!("p{i}"))] })
+        .map(|(i, g)| Feature { id: i as u64, geometry: Some(g), attrs: vec![Cell::Text(format!("p{i}"))], zm: None })
         .collect::<Vec<_>>()
         .into();
     let id = s.map_mut().add_dataset(data);

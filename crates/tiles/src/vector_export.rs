@@ -651,7 +651,7 @@ mod tests {
 
     fn dataset(geometry: Geometry) -> Dataset {
         let mut ds = Dataset::new("Deterministic export", geometry.kind(), vec![]);
-        ds.features.push(Feature { id: u64::MAX, geometry: Some(geometry), attrs: vec![] });
+        ds.features.push(Feature { id: u64::MAX, geometry: Some(geometry), attrs: vec![], zm: None });
         ds
     }
     fn coords(points: &[(f64, f64)]) -> Vec<Coord> {
@@ -743,6 +743,7 @@ mod tests {
                 id,
                 geometry: Some(Geometry::Point(Coord::new(20.0, 30.0))),
                 attrs: (0..10).map(|i| Value::Text(format!("v{i}"))).collect(),
+                zm: None,
             })
             .collect();
         // Retained properties and encoder scratch fit, but retaining every feature's
@@ -780,6 +781,7 @@ mod tests {
             id: invalid_id,
             geometry: Some(Geometry::Polygon(vec![vec![coords(&[(30.0, 10.0), (40.0, 20.0), (30.0, 20.0), (40.0, 10.0), (30.0, 10.0)])]])),
             attrs: vec![],
+            zm: None,
         });
         let error = match export(&ds, &[], 0, 0, "polygons") {
             Ok(_) => return Err("invalid polygon returned an archive instead of rejecting the whole export".into()),
@@ -1028,7 +1030,7 @@ mod tests {
     #[test]
     fn selected_rows_multipart_and_invalid_coordinates() -> Result<(), String> {
         let mut ds = dataset(Geometry::MultiPoint(coords(&[(1.0, 2.0), (3.0, 4.0)])));
-        ds.features.push(Feature { id: 42, geometry: Some(Geometry::Point(Coord::new(10.0, 20.0))), attrs: vec![] });
+        ds.features.push(Feature { id: 42, geometry: Some(Geometry::Point(Coord::new(10.0, 20.0))), attrs: vec![], zm: None });
         let selected = export(&ds, &[1], 0, 0, "test")?;
         assert_eq!(only_tile(&selected.bytes)?.layers[0].features[0].id, Some(42));
         assert!(export(&ds, &[2], 0, 0, "test").is_err());

@@ -348,7 +348,7 @@ impl FeatureSource for GpkgMemSource {
                     // has no place to match an extent.
                     Some(Val::Null | Val::Blob(_)) | None => {
                         if native.is_none() && sample.wants() {
-                            sample.keep(Feature { id: rowid as u64, geometry: None, attrs: self.attrs(r, &mut unread_dates) });
+                            sample.keep(Feature { id: rowid as u64, geometry: None, attrs: self.attrs(r, &mut unread_dates), zm: None });
                         }
                         return ControlFlow::Continue(());
                     }
@@ -380,7 +380,7 @@ impl FeatureSource for GpkgMemSource {
                     return ControlFlow::Continue(());
                 }
                 // Integer keys, negative ones too, map to distinct ids.
-                sample.keep(Feature { id: rowid as u64, geometry: Some(geometry), attrs: self.attrs(r, &mut unread_dates) });
+                sample.keep(Feature { id: rowid as u64, geometry: Some(geometry), attrs: self.attrs(r, &mut unread_dates), zm: None });
                 ControlFlow::Continue(())
             })
             .map_err(err)?;
@@ -431,7 +431,7 @@ impl FeatureSource for GpkgMemSource {
                     }
                 };
                 out.matched += 1;
-                match chunks.push(Feature { id: rowid as u64, geometry, attrs: self.attrs(r, &mut out.unread_dates) }) {
+                match chunks.push(Feature { id: rowid as u64, geometry, attrs: self.attrs(r, &mut out.unread_dates), zm: None }) {
                     Ok(()) => ControlFlow::Continue(()),
                     Err(e) => {
                         failed = Some(e);

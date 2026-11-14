@@ -21,7 +21,12 @@ impl Fixture {
         // The DEM's centre, in longitude/latitude.
         let centre = Crs::from_epsg(32617).unwrap().transformer().unwrap().to_lonlat(Coord::new(500_600.0, 4_649_400.0)).unwrap();
         let mut points = Dataset::new("pts", rustgis_data::GeometryType::Point, vec![Field::new("id", FieldType::Integer)]);
-        points.features.push(Feature { id: 1, geometry: Some(Geometry::Point(centre)), attrs: vec![rustgis_data::Value::Int(1)] });
+        points.features.push(Feature {
+            id: 1,
+            geometry: Some(Geometry::Point(centre)),
+            attrs: vec![rustgis_data::Value::Int(1)],
+            zm: None,
+        });
         let tiff = rustgis_data::raster::geotiff::write(&dem, 0).unwrap();
         let scan = dem.clone().into_scan().unwrap();
         Fixture { dem, scan, points, tiff }

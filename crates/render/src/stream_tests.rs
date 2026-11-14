@@ -793,6 +793,7 @@ fn perspective_snapshot_budget_counts_all_layers_capacity_and_nested_values() {
         id: 1,
         geometry: Some(Geometry::MultiPoint(vec![Coord::new(0.0, 0.0); 8])),
         attrs: vec![Value::Text("large attribute".repeat(16))],
+        zm: None,
     };
     let row_bytes = rustgis_data::source::chunk_memory::feature_bytes(&row) + std::mem::size_of::<Feature>();
     let mut budget = SnapshotBudget::new(row_bytes);

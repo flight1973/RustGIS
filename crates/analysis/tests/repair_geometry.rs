@@ -717,14 +717,21 @@ fn attributes_crs_ids_and_names_are_kept() {
         id: 41,
         geometry: Some(poly(&[SQUARE])),
         attrs: vec![Value::Text("ok".into()), Value::Float(1.5), Value::Int(1)],
+        zm: None,
     });
     // A short row: its missing value is null.
-    l.ds.features.push(Feature { id: 42, geometry: Some(poly(&[BOWTIE])), attrs: vec![Value::Text("bad".into()), Value::Float(2.5)] });
+    l.ds.features.push(Feature {
+        id: 42,
+        geometry: Some(poly(&[BOWTIE])),
+        attrs: vec![Value::Text("bad".into()), Value::Float(2.5)],
+        zm: None,
+    });
     // A long row: its extra value is left out, and said so.
     l.ds.features.push(Feature {
         id: 7,
         geometry: None,
         attrs: vec![Value::Text("none".into()), Value::Null, Value::Int(3), Value::Int(9)],
+        zm: None,
     });
     let named = |output: Option<&str>| {
         let mut p = json!({"input": "input"});

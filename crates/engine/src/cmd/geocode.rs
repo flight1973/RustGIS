@@ -243,7 +243,7 @@ fn geocode(s: &mut Session, p: &Value) -> CmdResult {
             unmatched += 1;
         }
         // Rows not found stay in the table, without a point.
-        ds.features.push(Feature { id: i as u64, geometry: place.map(|pl| Geometry::Point(Coord::new(pl.lon, pl.lat))), attrs });
+        ds.features.push(Feature { id: i as u64, geometry: place.map(|pl| Geometry::Point(Coord::new(pl.lon, pl.lat))), attrs, zm: None });
     }
     if matched == 0 {
         return Err("none of the addresses was found".into());

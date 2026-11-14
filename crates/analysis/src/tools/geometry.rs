@@ -141,7 +141,7 @@ fn segment_feature(id: u64, pair: &[Coord], own: &[Value], width: usize) -> Resu
     parts.try_reserve_exact(1)?;
     parts.push(coords);
     let attrs = clone_attrs(own, width)?;
-    Ok(Feature { id, geometry: Some(Geometry::Line(parts)), attrs })
+    Ok(Feature { id, geometry: Some(Geometry::Line(parts)), attrs, zm: None })
 }
 
 /// Copies schema-width attributes fallibly, including text, and pads missing values with null.
@@ -328,6 +328,7 @@ mod tests {
                 Coord::new(3.0, 0.0),
             ]])),
             attrs: vec![Value::Text("x".repeat(4096))],
+            zm: None,
         }];
         let (n, need, skipped) = size_segments(&features, 1, true).unwrap();
         assert_eq!((n, skipped), (3, 0));

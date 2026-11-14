@@ -17,7 +17,7 @@ fn c(x: f64, y: f64) -> Coord {
 fn fixture(g: Geometry) -> (Session, u32) {
     let mut s = Session::new(Project::new("Source vertex snapping"));
     let mut data = Dataset::new("Paths", g.kind(), vec![]);
-    data.features = vec![Feature { id: 1, geometry: Some(g), attrs: vec![] }].into();
+    data.features = vec![Feature { id: 1, geometry: Some(g), attrs: vec![], zm: None }].into();
     let id = s.map_mut().add_dataset(data);
     s.map_mut().camera.res = 1.0;
     s.map_mut().editing.snapping = Snapping { enabled: true, tolerance_px: 2.0, vertex: false, edge: true, end: false };
@@ -151,7 +151,12 @@ fn legacy_policy_and_invalid_addresses_are_preserved() {
 fn source_row_order_and_visibility_still_choose_the_first_tie() {
     let (mut s, id) = fixture(Geometry::Line(vec![vec![c(100., 100.), c(-1., 0.)]]));
     let layer = s.map_mut().layer_mut(id).unwrap();
-    layer.dataset.features.push(Feature { id: 2, geometry: Some(Geometry::Line(vec![vec![c(200., 100.), c(1., 0.)]])), attrs: vec![] });
+    layer.dataset.features.push(Feature {
+        id: 2,
+        geometry: Some(Geometry::Line(vec![vec![c(200., 100.), c(1., 0.)]])),
+        attrs: vec![],
+        zm: None,
+    });
     s.map_mut().editing.snapping.vertex = true;
     s.map_mut().editing.snapping.edge = false;
     hit(snap_vertex_except(&mut s, c(0., 0.), Some((id, 1, VertexId::new(0, 0, 0)))), c(-1., 0.), "vertex");

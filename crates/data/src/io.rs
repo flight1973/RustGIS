@@ -877,12 +877,19 @@ pub fn geometry_from_geojson(mut g: &Json) -> Option<Geometry> {
 }
 
 pub fn geometry_to_geojson(g: &Geometry) -> Json {
-    fn c(c: &Coord) -> Json {
-        json!([c.x, c.y])
-    }
-    fn l(v: &[Coord]) -> Json {
-        Json::Array(v.iter().map(c).collect())
-    }
+    geometry_to_geojson_z(g, None)
+}
+
+/// [`geometry_to_geojson`] with heights: `z` holds one per vertex in the geometry's vertex order
+/// ([`crate::Zm`]), and each position is written `[x, y, z]`. Check that they fit first
+/// ([`crate::Feature::zm_fits`]); a vertex past the last height is written `[x, y]`.
+pub fn geometry_to_geojson_z(g: &Geometry, z: Option<&[f64]>) -> Json {
+    let mut z = z.unwrap_or_default().iter();
+    let mut c = |p: &Coord| match z.next() {
+        Some(h) => json!([p.x, p.y, h]),
+        None => json!([p.x, p.y]),
+    };
+    let mut l = |v: &[Coord]| Json::Array(v.iter().map(&mut c).collect());
     match g {
         Geometry::Point(p) => json!({"type": "Point", "coordinates": c(p)}),
         Geometry::MultiPoint(v) => json!({"type": "MultiPoint", "coordinates": l(v)}),
@@ -1205,6 +1212,79 @@ pub(crate) fn geojson_has_z(f: &Json) -> bool {
     f.get("geometry").is_some_and(has_z)
 }
 
+/// What a feature's positions hold past x and y, in the order [`geometry_from_geojson`] reads its
+/// vertices: their heights when every position has one, and whether any were left out.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct GeojsonZ {
+    /// One height per position, when every position has a numeric third value.
+    pub(crate) z: Option<Vec<f64>>,
+    /// Some positions had a height and some didn't, so none were kept.
+    pub(crate) partial: bool,
+    /// A position had a number past its third value (a measure: RFC 7946 §3.1.1 says positions
+    /// SHOULD NOT have more than three), which isn't kept.
+    pub(crate) m: bool,
+}
+
+/// The heights of a feature's geometry ([`GeojsonZ`]): a `null` third value isn't one. Only the
+/// geometry [`geometry_from_geojson`] reads counts (a single-member collection's member).
+pub(crate) fn geojson_z(f: &Json) -> GeojsonZ {
+    /// Calls `each` with every position `depth` arrays down from `v` (at most 3).
+    fn walk(v: &Json, depth: u8, each: &mut impl FnMut(&[Json])) {
+        match (depth, v.as_array()) {
+            (0, Some(p)) => each(p),
+            (d, Some(a)) => a.iter().for_each(|c| walk(c, d.saturating_sub(1), each)),
+            _ => {}
+        }
+    }
+    let mut out = GeojsonZ::default();
+    let Some(mut g) = f.get("geometry") else { return out };
+    while g.get("type").and_then(Json::as_str) == Some("GeometryCollection") {
+        match g.get("geometries").and_then(Json::as_array).map(Vec::as_slice) {
+            Some([only]) => g = only,
+            _ => return out,
+        }
+    }
+    let depth = match g.get("type").and_then(Json::as_str) {
+        Some("Point") => 0,
+        Some("MultiPoint" | "LineString") => 1,
+        Some("MultiLineString" | "Polygon") => 2,
+        Some("MultiPolygon") => 3,
+        _ => return out,
+    };
+    let Some(coordinates) = g.get("coordinates") else { return out };
+    let (mut positions, mut zs) = (0usize, Vec::new());
+    walk(coordinates, depth, &mut |p| {
+        positions += 1;
+        zs.extend(p.get(2).and_then(Json::as_f64));
+        out.m |= p.iter().skip(3).any(Json::is_number);
+    });
+    if !zs.is_empty() {
+        if zs.len() == positions {
+            out.z = Some(zs);
+        } else {
+            out.partial = true;
+        }
+    }
+    out
+}
+
+/// What a GeoJSON read says of the heights and measures it couldn't keep: `partial` features with
+/// heights on only some positions, `m` features with a fourth value.
+pub(crate) fn geojson_zm_notes(partial: usize, m: usize) -> Vec<String> {
+    let count = |n: usize| if n == 1 { "1 feature".to_string() } else { format!("{n} features") };
+    let mut notes = Vec::new();
+    if partial > 0 {
+        notes.push(format!("{} had heights (Z) on only some of their points, which were dropped: exports won't have them", count(partial)));
+    }
+    if m > 0 {
+        notes.push(format!(
+            "{} had a fourth number in their positions (a measure, which GeoJSON doesn't define), which was dropped: exports won't have it",
+            count(m)
+        ));
+    }
+    notes
+}
+
 /// A feature's geometry: `Ok(None)` for none, `Err` for one that can't be read.
 pub(crate) fn geojson_geometry(f: &Json) -> std::result::Result<Option<Geometry>, ()> {
     match f.get("geometry").filter(|g| !g.is_null()) {
@@ -1217,9 +1297,9 @@ pub(crate) fn geojson_geometry(f: &Json) -> std::result::Result<Option<Geometry>
 #[derive(Default)]
 struct Collector {
     schema: Schema,
-    /// Each feature's geometry, its values by field (typed once every feature is in) and whether
-    /// its geometry had heights, which are dropped.
-    features: Vec<(Option<Geometry>, Vec<(usize, Value)>, bool)>,
+    /// Each feature's geometry, its values by field (typed once every feature is in) and its
+    /// heights ([`GeojsonZ`]).
+    features: Vec<(Option<Geometry>, Vec<(usize, Value)>, GeojsonZ)>,
     skipped: usize,
 }
 
@@ -1239,14 +1319,14 @@ impl FeatureSink for Collector {
 
 impl Collector {
     /// Takes one feature: its properties into the schema, its geometry (or counts it unreadable),
-    /// and whether it had heights.
+    /// and its heights.
     fn add(&mut self, f: &Json) {
         let props = f.get("properties").and_then(Json::as_object);
         // Every feature's properties count in the schema, those with unreadable geometry too.
         let attrs: Vec<(usize, Value)> = props.into_iter().flatten().map(|(k, v)| (self.schema.see(k, v), Value::from_json(v))).collect();
         match geojson_geometry(f) {
             Ok(geom) => {
-                let zm = geom.is_some() && geojson_has_z(f);
+                let zm = if geom.is_some() { geojson_z(f) } else { GeojsonZ::default() };
                 self.features.push((geom, attrs, zm));
             }
             Err(()) => self.skipped += 1,
@@ -1263,11 +1343,11 @@ impl Collector {
         }
         let declared = declared_crs(root, &mut report.messages)?;
         let mut unconverted = 0usize;
-        // Only features kept count toward the heights dropped.
-        let mut zm = 0usize;
+        // Only features kept count toward the heights and measures dropped.
+        let (mut partial, mut measured) = (0usize, 0usize);
         // Features kept, as longitude/latitude, with a latitude past the poles.
         let mut swapped = 0usize;
-        for (n, (geom, values, had_z)) in self.features.into_iter().enumerate() {
+        for (n, (geom, values, read_z)) in self.features.into_iter().enumerate() {
             // A feature that can't be converted is dropped, and its id is not reused, as when the
             // file is read in place.
             let geom = match (&declared, geom) {
@@ -1286,11 +1366,18 @@ impl Collector {
                     *slot = coerce(v, field.ty);
                 }
             }
-            zm += usize::from(had_z);
+            partial += usize::from(read_z.partial);
+            measured += usize::from(read_z.m);
+            // The heights stay beside the vertices they were read with. Converting x and y from a
+            // declared system keeps the vertices and their order, and leaves the heights as given.
+            let zm = read_z
+                .z
+                .filter(|z| geom.as_ref().is_some_and(|g| g.coord_count() == z.len()))
+                .map(|z| Box::new(crate::Zm { z: Some(z), m: None }));
             // Converted geometry is already within ±90.5° (or dropped above), so only what is read
             // as longitude/latitude can be swapped.
             swapped += usize::from(declared.is_none() && geom.as_ref().is_some_and(latitude_past_poles));
-            ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
+            ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs, zm });
         }
         ds.geometry_type = dominant_type(&ds);
         if let Some((crs, _)) = &declared {
@@ -1306,8 +1393,10 @@ impl Collector {
             ds.crs_incomplete = unconverted > 0;
         }
         report.messages.extend(swapped_latitude_note(swapped));
-        // Last, as a source read in place notes it.
-        ds.drop_zm(&mut report, zm);
+        // Last, as a source read in place notes it. Heights kept aren't dropped.
+        let notes = geojson_zm_notes(partial, measured);
+        ds.zm_dropped = !notes.is_empty();
+        report.messages.extend(notes);
         Ok((ds, report))
     }
 }
@@ -1402,7 +1491,10 @@ fn feature_to_geojson(fields: &[Field], f: &crate::Feature) -> Json {
     for (field, v) in fields.iter().zip(&f.attrs) {
         props.insert(field.name.clone(), v.to_json());
     }
-    json!({"type": "Feature", "id": f.id, "properties": props, "geometry": f.geometry.as_ref().map(geometry_to_geojson)})
+    // Heights that no longer fit the geometry (an edit changed its vertices) aren't written; the
+    // export says so ([`crate::zm_written_note`]).
+    let geometry = f.geometry.as_ref().map(|g| geometry_to_geojson_z(g, f.z()));
+    json!({"type": "Feature", "id": f.id, "properties": props, "geometry": geometry})
 }
 
 /// Writes a GeoJSON FeatureCollection a run of features at a time, for exports that never hold
@@ -4026,10 +4118,16 @@ mod tests {
                 r#"{{"type":"FeatureCollection","features":[{{"type":"Feature","properties":{{}},"geometry":{{"type":"GeometryCollection","geometries":[{{"type":"LineString","coordinates":[{pos},[3,4]]}}]}}}}]}}"#
             )
         };
+        // Read whole, heights on every position are kept (the member's), on only some dropped.
+        let some = |r: &ReadReport| r.messages.iter().any(|m| m.contains("heights (Z) on only some of their points"));
         let (ds, rep) = read_geojson(&doc("[1,2,9]"), "track").unwrap();
-        assert!(ds.zm_dropped && said(&rep));
+        assert!(ds.zm_dropped && some(&rep) && ds.features[0].zm.is_none());
+        let all = r#"{"type":"Feature","properties":{},"geometry":{"type":"GeometryCollection","geometries":[{"type":"LineString","coordinates":[[1,2,9],[3,4,-1]]}]}}"#;
+        let (ds, rep) = read_geojson(all, "track").unwrap();
+        assert!(!ds.zm_dropped && rep.messages.is_empty(), "{:?}", rep.messages);
+        assert_eq!(ds.features[0].z(), Some(&[9.0, -1.0][..]));
         let (ds, rep) = read_geojson(&doc("[1,2]"), "track").unwrap();
-        assert!(!ds.zm_dropped && !said(&rep));
+        assert!(!ds.zm_dropped && !said(&rep) && !some(&rep));
         let path = dir.path().join("track.geojson");
         std::fs::write(&path, doc("[1,2,9]")).unwrap();
         assert!(crate::source::geojson::GeoJsonSource::open_path(&path, "track").unwrap().info().zm_dropped);
@@ -4079,7 +4177,7 @@ mod tests {
         let flat = Dataset::new("roads", GeometryType::Polyline, vec![]);
         assert_eq!(
             crate::zm_export_note([&ds, &flat, &other], "site.zip").as_deref(),
-            Some("site.zip: its geometry has no Z or M values for 2 layers (pts, wells), which were dropped when they were read")
+            Some("site.zip: its geometry lacks Z or M values of 2 layers (pts, wells), which were dropped when they were read")
         );
         assert_eq!(crate::zm_export_note([&flat], "roads.zip"), None);
 
@@ -4390,10 +4488,10 @@ mod tests {
         assert_eq!(losses, CsvLosses { as_one_point: 0, unwritten: 1, points: false });
         assert!(losses.notes("t.csv")[0].contains("the geometry of 1 feature wasn't written"));
         assert!(!to_csv(&ds).unwrap().contains("longitude"));
-        let points = [crate::Feature { id: 0, geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))), attrs: vec![] }];
+        let points = [crate::Feature { id: 0, geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))), attrs: vec![], zm: None }];
         assert_eq!(CsvLosses::of(&points, GeometryType::Point), CsvLosses { points: true, ..CsvLosses::default() });
         // A multipoint without a point in a point layer gets empty coordinate cells.
-        let empty = [crate::Feature { id: 1, geometry: Some(Geometry::MultiPoint(vec![])), attrs: vec![] }];
+        let empty = [crate::Feature { id: 1, geometry: Some(Geometry::MultiPoint(vec![])), attrs: vec![], zm: None }];
         assert_eq!(CsvLosses::of(&empty, GeometryType::Point), CsvLosses { as_one_point: 0, unwritten: 1, points: true });
     }
 
@@ -5086,6 +5184,7 @@ mod tests {
                 id: i + 1,
                 geometry: Some(Geometry::Point(c)),
                 attrs: vec![Value::Text(format!("p{i}")), Value::Int(i as i64)],
+                zm: None,
             });
         }
         let dir = tempfile::tempdir().unwrap();

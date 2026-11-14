@@ -399,7 +399,7 @@ impl GpkgSource {
             // A row without geometry (NULL, or an empty one) is kept in a whole read; it has no
             // place to match an extent.
             ValueRef::Null | ValueRef::Blob(_) if req.extent.is_none() => {
-                return Ok(Row::Feature(Feature { id, geometry: None, attrs: attrs() }));
+                return Ok(Row::Feature(Feature { id, geometry: None, attrs: attrs(), zm: None }));
             }
             ValueRef::Null | ValueRef::Blob(_) => return Ok(Row::Skip),
             _ => return Ok(Row::Bad),
@@ -414,7 +414,7 @@ impl GpkgSource {
         if !in_request(&geometry, req) {
             return Ok(Row::Skip);
         }
-        Ok(Row::Feature(Feature { id, geometry: Some(geometry), attrs: attrs() }))
+        Ok(Row::Feature(Feature { id, geometry: Some(geometry), attrs: attrs(), zm: None }))
     }
 }
 

@@ -13,7 +13,7 @@ fn layer(kind: GeometryType, geometries: Vec<Geometry>) -> (Session, u32) {
     data.features = geometries
         .into_iter()
         .zip(1..)
-        .map(|(g, id)| Feature { id, geometry: Some(g), attrs: vec![Value::Int(0)] })
+        .map(|(g, id)| Feature { id, geometry: Some(g), attrs: vec![Value::Int(0)], zm: None })
         .collect::<Vec<_>>()
         .into();
     let mut s = Session::new(Project::new("Polar edits"));

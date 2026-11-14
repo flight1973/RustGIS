@@ -376,7 +376,12 @@ pub fn join_field(target: &Dataset, source: &Dataset, opts: &JoinFieldOptions<'_
             }
         }
 
-        out_features.push(rustgis_data::Feature { id: t_feat.id, geometry: t_feat.geometry.clone(), attrs: new_attrs });
+        out_features.push(rustgis_data::Feature {
+            id: t_feat.id,
+            geometry: t_feat.geometry.clone(),
+            attrs: new_attrs,
+            zm: t_feat.zm.clone(),
+        });
     }
 
     out.features = out_features.into();
@@ -1045,6 +1050,7 @@ mod tests {
             id: 1,
             geometry: None,
             attrs: vec![Value::Int(42)], // Missing desc and category in row attrs
+            zm: None,
         });
 
         let source = make_table(
@@ -1121,6 +1127,7 @@ mod tests {
             id: 10,
             geometry: None,
             attrs: vec![Value::Int(1), Value::Text("unexpected extra value".into())],
+            zm: None,
         });
         let source = make_table(
             "source",

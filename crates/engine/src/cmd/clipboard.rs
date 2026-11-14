@@ -178,7 +178,7 @@ fn paste(s: &mut Session, p: &Value) -> CmdResult {
                 None => Attr::Null,
             })
             .collect();
-        l.dataset.features.push(Feature { id: next, geometry: ft.geometry, attrs });
+        l.dataset.features.push(Feature { id: next, geometry: ft.geometry, attrs, zm: ft.zm });
     }
     let n = l.dataset.features.len() - first;
     l.touch_geometry();

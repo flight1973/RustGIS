@@ -733,7 +733,10 @@ fn package_map(s: &mut Session, mobile: bool, tol: f64) -> Result<Vec<u8>, Strin
             }
             for f in &mut l.dataset.features {
                 if let Some(g) = &f.geometry {
-                    f.geometry = Some(rustgis_analysis::simplify_geometry(g, tol * 111_320.0));
+                    let simple = rustgis_analysis::simplify_geometry(g, tol * 111_320.0);
+                    // Simplified, the vertices left aren't known to be the same ones.
+                    f.zm = f.zm_after(simple == *g);
+                    f.geometry = Some(simple);
                 }
             }
             l.touch_geometry();

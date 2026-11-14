@@ -628,6 +628,13 @@ dimensions, only a sample is checked: the first 16 rows of a GeoParquet file wit
 (in its first row group), and the first 16 rows with a geometry of a GeoPackage table with optional
 Z or M (in the web app, its first 16 rows) or of an unconstrained PostGIS column.
 
+GeoJSON read whole (up to 32 MB) is the exception, as a prototype of keeping heights: a feature
+whose positions all have a third number keeps them as its heights, and a GeoJSON export writes them
+back as `[x, y, z]`. A feature with heights on only some positions, or with a fourth number (a
+measure, which GeoJSON doesn't define), loses them, with a notice. An edit or tool that changes a
+feature's vertices leaves its heights out of the export, with a notice; other formats are written
+without heights, with a notice. A saved project keeps them.
+
 Exporting, converting or sharing a layer also repeats what adding it said about its positions. A
 coordinate system defined in a file whose datum has no shift to WGS 84 (a NAD 27 `.prj` without
 `TOWGS84`, say) makes positions approximate, possibly a few hundred metres off, so an export in
