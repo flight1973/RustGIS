@@ -42,7 +42,7 @@ pub fn commands() -> Vec<C> {
             .params(r#"{"extent": [minLon, minLat, maxLon, maxLat]}"#),
         C::new("map.goToXY", "By Coordinates…", "Home › Navigate › Locate", go_to_xy).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
-            .params(r#"{"lon" | "x": number, "lat" | "y": number, "position"?: text in place of lon and lat, as the search box reads it (40.7128, -74.006; 40°42′46″N 74°0′22″W; 18north 583959 4507351; 18TWL8395907350), "scale"?: number, "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85)}"#),
+            .params(r#"{"lon" | "x": degrees (-74.006, or text such as 74°0′22″W), "lat" | "y": degrees (40.7128, or text such as 40°42′46″N), "position"?: text in place of lon and lat, as the search box reads it, latitude first (40.7128, -74.006; 18north 583959 4507351; 18TWL8395907350), "scale"?: number, "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85)}"#),
         C::new("map.goToLink", "Go To Map Link", "Home › Navigate", go_to_link).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"url": a map link ending in #zoom/lat/lon[/bearing[/pitch]] (as MapLibre writes them; also #map=…), or just zoom/lat/lon[/bearing[/pitch]]}"#),
@@ -333,9 +333,9 @@ fn zoom(s: &mut Session, factor: f64) -> CmdResult {
 /// degrees and minutes or degrees, minutes and seconds (`40.7128, -74.006`,
 /// `40°42'46"N 74°0'22"W`), or on the Earth's map a UTM position or an MGRS reference
 /// (`18north 583959 4507351`, `18TWL8395907350`). A reference that names no place says why, as
-/// the search box does. An MGRS reference coarser than a meter names a square, not a point: the
-/// place is its center, and the second value is the square's side in meters, for a notice.
-pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, Option<f64>), String> {
+/// the search box does. What the reading assumed comes with the place, for a notice
+/// ([`PositionRead`]).
+pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, PositionRead), String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("the position is empty".into());
@@ -344,7 +344,9 @@ pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, Option<f64>
         return Err(format!("the position is longer than {} characters", super::search::MAX_CHARS));
     }
     if let Some(c) = super::search::parse_lat_lon(text) {
-        return Ok((c, None));
+        // Without N, S, E or W the order is the reader's assumption, so it is said.
+        let lettered = text.chars().any(char::is_alphabetic);
+        return Ok((c, if lettered { PositionRead::AsWritten } else { PositionRead::Ordered }));
     }
     // Two plain decimal numbers (`40.7, 200`) that aren't a latitude and a longitude: out of
     // range, not misspelled.
@@ -367,10 +369,101 @@ pub(crate) fn read_position(map: &Map, text: &str) -> Result<(Coord, Option<f64>
         });
     }
     match super::search::read_grid_reference(text) {
-        Ok(c) => Ok((c, rustgis_geom::parse_mgrs(text).ok().filter(|m| m.digits < 5).map(|m| m.precision_m()))),
+        Ok(c) => Ok((
+            c,
+            rustgis_geom::parse_mgrs(text)
+                .ok()
+                .filter(|m| m.digits < 5)
+                .map_or(PositionRead::AsWritten, |m| PositionRead::Square(m.precision_m())),
+        )),
         Err(rustgis_geom::GridError::Syntax) => Err(format!("{degrees}, UTM (18north 583959 4507351) or MGRS (18TWL8395907350)")),
         Err(e) => Err(format!("no place at this grid reference: {e}")),
     }
+}
+
+/// What reading a typed position assumed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PositionRead {
+    /// Nothing: hemisphere letters, a UTM position or an MGRS reference to the meter.
+    AsWritten,
+    /// Two numbers without N, S, E or W, taken as latitude, then longitude (or the other way
+    /// round when the first can only be a longitude): the order is said, so `2.35, 48.85` typed
+    /// as x, y shows where it went.
+    Ordered,
+    /// An MGRS reference coarser than a meter, which names a square of this side in meters: the
+    /// place is its center.
+    Square(f64),
+}
+
+/// One axis typed on its own, as By Coordinates' Longitude (X) and Latitude (Y) boxes take it:
+/// decimal degrees (`-74.006`), or degrees, minutes and seconds with or without marks and a
+/// hemisphere letter before or after (`74°0′22″W`, `W 74 0 22`, `40 42 46.1 N`). A letter of the
+/// other axis (N in the longitude) is refused rather than taken as the other axis.
+pub(crate) fn read_axis(text: &str, latitude: bool) -> Result<f64, String> {
+    let name = if latitude { "latitude" } else { "longitude" };
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(format!("the {name} is empty"));
+    }
+    if text.chars().nth(64).is_some() {
+        return Err(format!("the {name} is longer than 64 characters"));
+    }
+    let (own, other) = if latitude { (['N', 'S'], ['E', 'W']) } else { (['E', 'W'], ['N', 'S']) };
+    let mut hemisphere = None;
+    let mut rest = text;
+    for at_end in [false, true] {
+        let c = if at_end { rest.chars().next_back() } else { rest.chars().next() };
+        if let Some(c) = c.map(|c| c.to_ascii_uppercase())
+            && (own.contains(&c) || other.contains(&c))
+        {
+            if other.contains(&c) {
+                return Err(format!("{c} belongs to the {}; write the {name} here", if latitude { "longitude" } else { "latitude" }));
+            }
+            if hemisphere.replace(c).is_some() {
+                return Err(format!("the {name} has two hemisphere letters"));
+            }
+            // The letter is ASCII, one byte.
+            rest = if at_end { rest.get(..rest.len().saturating_sub(1)) } else { rest.get(1..) }.unwrap_or("").trim();
+        }
+    }
+    let marks = |c: char| c.is_whitespace() || matches!(c, '°' | 'º' | '\'' | '′' | '"' | '″' | ',');
+    let parts: Vec<&str> = rest.split(marks).filter(|w| !w.is_empty()).collect();
+    let usage = || format!("write the {name} in degrees (-74.006) or degrees, minutes and seconds (74°0′22″W)");
+    if parts.is_empty() || parts.len() > 3 {
+        return Err(usage());
+    }
+    let mut nums = Vec::with_capacity(3);
+    for p in &parts {
+        let v: f64 = p.replace('−', "-").parse().map_err(|_| usage())?;
+        if !v.is_finite() {
+            return Err(usage());
+        }
+        nums.push(v);
+    }
+    let (d, ms) = nums.split_first().ok_or_else(usage)?;
+    if ms.iter().any(|v| !(0.0..60.0).contains(v)) {
+        return Err(format!("the {name}'s minutes and seconds must be from 0 to under 60"));
+    }
+    if hemisphere.is_some() && d.is_sign_negative() {
+        return Err(format!("the {name} has both a minus sign and a hemisphere letter"));
+    }
+    let m = ms.first().copied().unwrap_or(0.0);
+    let sec = ms.get(1).copied().unwrap_or(0.0);
+    let mut v = d.abs() + m / 60.0 + sec / 3600.0;
+    if d.is_sign_negative() || matches!(hemisphere, Some('S' | 'W')) {
+        v = -v;
+    }
+    let limit = if latitude { 90.0 } else { 180.0 };
+    if v.abs() > limit {
+        return Err(format!("the {name} must be within ±{limit}"));
+    }
+    Ok(v)
+}
+
+/// A number of degrees as typed back to the user: six decimals at most, no trailing zeros.
+fn degrees_text(v: f64) -> String {
+    let v = (v * 1e6).round() / 1e6;
+    if v == 0.0 { "0".into() } else { format!("{v}") }
 }
 
 pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
@@ -380,26 +473,38 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
         Some(_) => return Err("position must be text, such as \"40.7128, -74.006\" or \"18TWL8395907350\"".into()),
     };
     let given = |k: &str| !matches!(p.get(k), None | Some(Value::Null));
-    // An MGRS square's center is said once the map has moved there, not before a refusal.
+    // What the reading assumed is said once the map has moved there, not before a refusal.
     let (lon, lat, square) = if let Some(text) = position {
         if ["lon", "lat", "x", "y"].iter().any(|k| given(k)) {
             return Err("give a position or lon and lat, not both".into());
         }
-        let (c, side) = read_position(s.map(), text)?;
-        let square = side.map(|side| {
-            let side = if side >= 1000.0 { format!("{} km", side / 1000.0) } else { format!("{side} m") };
-            crate::notice_text::NoticeText::format(
-                "{reference} names a {side} square, not a point: went to its center",
-                [("reference", text.trim().to_string().into()), ("side", side.into())],
-            )
-        });
-        (c.x, c.y, square)
+        let (c, read) = read_position(s.map(), text)?;
+        let reference = || text.trim().to_string().into();
+        let said = match read {
+            PositionRead::AsWritten => None,
+            PositionRead::Ordered => Some(crate::notice_text::NoticeText::format(
+                "Read {position} as latitude {lat}, longitude {lon}",
+                [("position", reference()), ("lat", degrees_text(c.y).into()), ("lon", degrees_text(c.x).into())],
+            )),
+            PositionRead::Square(side) => {
+                let side = if side >= 1000.0 { format!("{} km", side / 1000.0) } else { format!("{side} m") };
+                Some(crate::notice_text::NoticeText::format(
+                    "{reference} names a {side} square, not a point: went to its center",
+                    [("reference", reference()), ("side", side.into())],
+                ))
+            }
+        };
+        (c.x, c.y, said)
     } else {
-        (
-            f(p, "lon").or_else(|| f(p, "x")).ok_or("lon is required (or a position)")?,
-            f(p, "lat").or_else(|| f(p, "y")).ok_or("lat is required (or a position)")?,
-            None,
-        )
+        // A number, or text in degrees or degrees, minutes and seconds (`74°0′22″W`).
+        let axis = |keys: [&str; 2], latitude: bool| -> Result<f64, String> {
+            let key = keys.iter().find(|k| given(k)).ok_or_else(|| format!("{} is required (or a position)", keys[0]))?;
+            match p.get(*key) {
+                Some(Value::String(t)) => t.trim().parse::<f64>().ok().filter(|v| v.is_finite()).map_or_else(|| read_axis(t, latitude), Ok),
+                _ => f(p, key).ok_or_else(|| format!("{key} must be a number of degrees, or text such as \"74°0′22″W\"")),
+            }
+        };
+        (axis(["lon", "x"], false)?, axis(["lat", "y"], true)?, None)
     };
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
         return Err("longitude must be within ±180 and latitude within ±90".into());

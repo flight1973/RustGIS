@@ -4431,21 +4431,33 @@ fn zonal_statistics_shows_available_band_range() {
 /// search box does: MGRS here; a reference that names no place keeps the dialog open with the
 /// reason.
 #[test]
-fn by_coordinates_reads_one_position_box() {
+fn by_coordinates_reads_x_y_and_a_grid_reference() {
     let mut h = harness();
     h.state_mut().run("map.goToXY", json!({"lon": 10, "lat": 50})).unwrap();
     h.state_mut().run("ui.dialog", json!({"name": "goToXY"})).unwrap();
     h.step();
     assert_eq!(h.state().dialogs.open, Some("goToXY"));
-    assert_eq!(h.state().dialogs.a, "50, 10");
-    h.state_mut().dialogs.a = "33UZZ1234512345".into();
+    assert_eq!((h.state().dialogs.a.as_str(), h.state().dialogs.b.as_str()), ("10.0000", "50.0000"));
+    // Each box takes degrees, minutes and seconds.
+    h.state_mut().dialogs.a = "74°0′22″W".into();
+    h.state_mut().dialogs.b = "40°42′46″N".into();
+    h.step();
+    h.get_by_label("Go").click();
+    h.step();
+    assert_eq!(h.state().dialogs.open, None, "{:?}", h.state().dialogs.error);
+    let c = h.state().session.map().center_lonlat();
+    assert!((c.y - 40.7128).abs() < 1e-3 && (c.x + 74.006).abs() < 1e-3, "{c:?}");
+    // A grid reference goes in place of both; one that names no place says why.
+    h.state_mut().run("ui.dialog", json!({"name": "goToXY"})).unwrap();
+    h.step();
+    h.state_mut().dialogs.text = "33UZZ1234512345".into();
     h.step();
     h.get_by_label("Go").click();
     h.step();
     assert_eq!(h.state().dialogs.open, Some("goToXY"));
     assert!(h.state().dialogs.error.as_deref().is_some_and(|e| e.contains("100 km square")), "{:?}", h.state().dialogs.error);
     // A scale it can't read is said, not dropped.
-    h.state_mut().dialogs.a = "18TWL8395907350".into();
+    h.state_mut().dialogs.text = "18TWL8395907350".into();
     h.state_mut().dialogs.c = "50k".into();
     h.step();
     h.get_by_label("Go").click();
@@ -4473,7 +4485,7 @@ fn by_coordinates_wraps_the_longitude_past_the_antimeridian() {
     assert!(lon > 180.0, "the camera is past the antimeridian: {lon}");
     h.state_mut().run("ui.dialog", json!({"name": "goToXY"})).unwrap();
     h.step();
-    assert_eq!(h.state().dialogs.a, "10, -170");
+    assert_eq!((h.state().dialogs.a.as_str(), h.state().dialogs.b.as_str()), ("-170.0000", "10.0000"));
     h.step();
     h.get_by_label("Go").click();
     h.step();

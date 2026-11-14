@@ -45396,18 +45396,41 @@ fn go_to_xy_reads_a_position_as_the_search_box_does() {
         assert_eq!(at(&s), (40.713, -74.006), "{q}");
     }
     assert!((s.map().scale() - 50_000.0).abs() < 1.0);
-    // An MGRS reference coarser than a meter goes to its square's center and says so; one to the
-    // meter, or degrees, say nothing.
-    for (q, said) in [("18TWL", Some("100 km square")), ("18TWL8307", Some("1 km square")), ("18TWL8395907350", None), ("40.7, -74", None)]
-    {
+    // What the reading assumed is said: an MGRS square's center, or the order of two bare numbers
+    // (so `2.35, 48.85` typed as x, y shows where it went, and a swap shows too). A reference to
+    // the meter, or degrees with hemisphere letters, say nothing.
+    for (q, said) in [
+        ("18TWL", Some("names a 100 km square, not a point: went to its center")),
+        ("18TWL8307", Some("names a 1 km square")),
+        ("2.35, 48.85", Some("Read 2.35, 48.85 as latitude 2.35, longitude 48.85")),
+        ("-122.4, 37.8", Some("as latitude 37.8, longitude -122.4")),
+        ("18TWL8395907350", None),
+        ("40°42′46″N 74°0′22″W", None),
+    ] {
         let mark = s.notice_mark();
         s.run("map.goToXY", &json!({"position": q})).unwrap();
         let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
         match said {
-            Some(t) => assert!(notices.len() == 1 && notices[0].contains(t) && notices[0].contains("center"), "{q}: {notices:?}"),
+            Some(t) => assert!(notices.len() == 1 && notices[0].contains(t), "{q}: {notices:?}"),
             None => assert!(notices.is_empty(), "{q}: {notices:?}"),
         }
     }
+    // Longitude and latitude each take degrees, minutes and seconds, as the dialog's boxes send
+    // them; a letter of the other axis is refused, not swapped; numbers say nothing.
+    for (lon, lat) in [("74°0′22″W", "40°42′46″N"), ("W 74 0 22", "N 40 42 46"), ("-74 0 22", "40 42 46"), ("-74.006", "40.7128")]
+    {
+        let mark = s.notice_mark();
+        s.run("map.goToXY", &json!({"lon": lon, "lat": lat})).unwrap();
+        assert_eq!(at(&s), (40.713, -74.006), "{lon} {lat}");
+        assert!(s.notices_since(mark).is_empty());
+    }
+    let axis_refused = |s: &mut Session, lon: &str, lat: &str| s.run("map.goToXY", &json!({"lon": lon, "lat": lat})).unwrap_err();
+    assert!(axis_refused(&mut s, "40°42′46″N", "74°0′22″W").contains("belongs to the latitude"));
+    assert!(axis_refused(&mut s, "74 60 0", "40").contains("under 60"));
+    assert!(axis_refused(&mut s, "-74W", "40").contains("both a minus sign"));
+    assert!(axis_refused(&mut s, "74", "91 N").contains("within ±90"));
+    assert!(axis_refused(&mut s, "Paris", "40").contains("write the longitude"));
+    assert!(axis_refused(&mut s, &"9".repeat(500), "40").contains("longer than"));
     // Numbers still go as before.
     s.run("map.goToXY", &json!({"lon": 10, "lat": 50})).unwrap();
     assert_eq!(at(&s), (50.0, 10.0));

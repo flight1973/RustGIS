@@ -154,11 +154,11 @@ impl Dialogs {
                 self.a = if is_code { self.text.trim_start_matches(|c: char| !c.is_ascii_digit()).to_string() } else { String::new() };
             }
             "goToXY" => {
-                // The map's center as the search box writes a place: `lat, lon`, the longitude
-                // within ±180 even when the view has been panned past the antimeridian.
+                // The map's center, the longitude within ±180 even when the view has been panned
+                // past the antimeridian.
                 let c = s.map().center_lonlat();
-                let lon = crate::mapmenu::wrap_lon(c.x);
-                self.a = rustgis_engine::cmd::search::format_lat_lon((c.y * 1e4).round() / 1e4, (lon * 1e4).round() / 1e4);
+                self.a = format!("{:.4}", crate::mapmenu::wrap_lon(c.x));
+                self.b = format!("{:.4}", c.y);
             }
             "bookmark" => self.text = rustgis_engine::cmd::navigate::new_bookmark_name(s.map()),
             "camera" => {
@@ -328,24 +328,43 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         match which {
             "selectByAttributes" => close = select_by_attributes(app, ui, &t),
             "goToXY" => {
+                // UTM and MGRS are the Earth's grids, so another body's map offers degrees alone.
+                // A grid reference, once typed, is where Go goes: the degree boxes gray out.
+                let earth = app.session.map().body().is_earth();
+                let by_grid = earth && !app.dialogs.text.trim().is_empty();
                 egui::Grid::new("xy").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-                    let input_label = ui.label(tl!("Position"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).desired_width(300.0)).labelled_by(input_label.id);
+                    let input_label = ui.label(tl!("Longitude (X)"));
+                    ui.add_enabled(!by_grid, egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("-74.006 · 74°0′22″W").desired_width(300.0))
+                        .labelled_by(input_label.id);
                     ui.end_row();
+                    let input_label = ui.label(tl!("Latitude (Y)"));
+                    ui.add_enabled(!by_grid, egui::TextEdit::singleline(&mut app.dialogs.b).hint_text("40.7128 · 40°42′46″N").desired_width(300.0))
+                        .labelled_by(input_label.id);
+                    ui.end_row();
+                    if earth {
+                        let input_label = ui.label(tl!("Or grid reference"));
+                        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("18TWL8395907350 · 18north 583959 4507351").desired_width(300.0))
+                            .labelled_by(input_label.id);
+                        ui.end_row();
+                    }
                     let input_label = ui.label(tl!("Scale 1:"));
                     ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("keep current")).desired_width(300.0)).labelled_by(input_label.id);
                     ui.end_row();
                 });
-                // Below the boxes, wrapped to the dialog's width rather than widening it. UTM and
-                // MGRS are the Earth's grids, so another body's map offers degrees alone.
-                let hint = if app.session.map().body().is_earth() {
-                    tl!("Latitude, then longitude, or a UTM or MGRS reference: 40.7128, -74.006 · 40°42′46″N 74°0′22″W · 18north 583959 4507351 · 18TWL8395907350")
+                // Below the boxes, wrapped to the dialog's width rather than widening it.
+                let hint = if earth {
+                    tl!("Degrees as decimals or degrees, minutes and seconds; or a UTM or MGRS reference in place of both.")
                 } else {
-                    tl!("Latitude, then longitude: 18.4, 77.5 · 18°24′N 77°30′E")
+                    tl!("Degrees as decimals or degrees, minutes and seconds.")
                 };
                 ui.label(egui::RichText::new(hint).weak());
                 close = buttons(app, ui, "Go", |app| {
-                    let mut p = json!({"position": app.dialogs.a.trim()});
+                    let grid = app.dialogs.text.trim();
+                    let mut p = if app.session.map().body().is_earth() && !grid.is_empty() {
+                        json!({"position": grid})
+                    } else {
+                        json!({"lon": app.dialogs.a.trim(), "lat": app.dialogs.b.trim()})
+                    };
                     // The command refuses a scale it can't use.
                     let scale = app.dialogs.c.trim().replace(',', "");
                     if !scale.is_empty() {
