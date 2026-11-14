@@ -45882,6 +45882,17 @@ fn go_to_xy_reads_a_position_as_the_search_box_does() {
     assert!(axis_refused(&mut s, "2,35", "48").contains("one value"));
     assert!(axis_refused(&mut s, "48.85, 2.35", "48").contains("one value"));
     assert!(axis_refused(&mut s, "48.85 2.35", "48").contains("write the longitude"));
+    // A mark says which place a number fills: seconds after degrees with no minutes are seconds,
+    // not minutes; marks out of order, or no degrees, are refused.
+    for (lat, want) in [("40°30″N", 40.008), ("40 30″", 40.008), ("40°30′N", 40.5), ("40°30", 40.5), ("40°0′30″", 40.008)] {
+        s.run("map.goToXY", &json!({"lon": 0, "lat": 0})).unwrap();
+        s.run("map.goToXY", &json!({"lon": "10", "lat": lat})).unwrap();
+        assert_eq!(at(&s).0, want, "{lat}");
+    }
+    assert!(axis_refused(&mut s, "10", "30″40°").contains("out of order"));
+    assert!(axis_refused(&mut s, "10", "40′30′").contains("out of order"));
+    assert!(axis_refused(&mut s, "10", "30′").contains("write the latitude"));
+    assert!(axis_refused(&mut s, "10", "°40").contains("write the latitude"));
     // Typographic quotes, as pasted from a document, are marks like any other.
     s.run("map.goToXY", &json!({"lon": 0, "lat": 0})).unwrap();
     s.run("map.goToXY", &json!({"lon": "74°0’22”W", "lat": "40°42’46”N"})).unwrap();

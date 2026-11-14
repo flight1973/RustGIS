@@ -430,20 +430,71 @@ pub(crate) fn read_axis(text: &str, latitude: bool) -> Result<f64, String> {
     if rest.contains(',') {
         return Err(format!("the {name} box takes one value, with a point for decimals (-74.006, not -74,006 or two numbers)"));
     }
-    let marks = |c: char| c.is_whitespace() || matches!(c, '°' | 'º' | '\'' | '′' | '’' | '"' | '″' | '”');
-    let parts: Vec<&str> = rest.split(marks).filter(|w| !w.is_empty()).collect();
     let usage = || format!("write the {name} in degrees (-74.006) or degrees, minutes and seconds (74°0′22″W)");
-    if parts.is_empty() || parts.len() > 3 {
-        return Err(usage());
-    }
-    let mut nums = Vec::with_capacity(3);
-    for p in &parts {
-        let v: f64 = p.replace('−', "-").parse().map_err(|_| usage())?;
+    // Each number goes where its mark says (° degrees, ′ minutes, ″ seconds), so `40°30″` is 40°
+    // and 30 seconds, not 30 minutes; a number without a mark takes the place after the last.
+    let mark = |c: char| match c {
+        '°' | 'º' => Some(0),
+        '\'' | '′' | '’' => Some(1),
+        '"' | '″' | '”' => Some(2),
+        _ => None,
+    };
+    let mut places: [Option<f64>; 3] = [None; 3];
+    let mut next = 0usize;
+    let mut number = String::new();
+    let mut last: Option<usize> = None;
+    // A number, once read, waits for a mark that may follow it; it is placed when the next number
+    // starts or the text ends.
+    let mut pending: Option<f64> = None;
+    let mut place = |v: f64, at: Option<usize>, next: &mut usize, last: &mut Option<usize>| -> Result<(), String> {
+        let at = at.unwrap_or(*next);
+        let slot = places.get_mut(at).ok_or_else(usage)?;
+        if slot.is_some() || last.is_some_and(|l| at <= l) {
+            return Err(format!("the {name}'s degrees, minutes and seconds are out of order"));
+        }
+        *slot = Some(v);
+        *last = Some(at);
+        *next = at + 1;
+        Ok(())
+    };
+    let finish = |number: &mut String| -> Result<Option<f64>, String> {
+        if number.is_empty() {
+            return Ok(None);
+        }
+        let v: f64 = number.replace('−', "-").parse().map_err(|_| usage())?;
+        number.clear();
         if !v.is_finite() {
             return Err(usage());
         }
-        nums.push(v);
+        Ok(Some(v))
+    };
+    for c in rest.chars().chain(std::iter::once(' ')) {
+        if c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | '−') {
+            number.push(c);
+            continue;
+        }
+        if let Some(v) = finish(&mut number)? {
+            if let Some(p) = pending.take() {
+                place(p, None, &mut next, &mut last)?;
+            }
+            pending = Some(v);
+        }
+        if let Some(at) = mark(c) {
+            let v = pending.take().ok_or_else(usage)?;
+            place(v, Some(at), &mut next, &mut last)?;
+        } else if !c.is_whitespace() {
+            return Err(usage());
+        }
     }
+    if let Some(p) = pending.take() {
+        place(p, None, &mut next, &mut last)?;
+    }
+    // Degrees come first; a place skipped before a later one is zero (`40°30″` is 40° 0′ 30″).
+    let filled = last.ok_or_else(usage)? + 1;
+    if places.first().is_none_or(Option::is_none) {
+        return Err(usage());
+    }
+    let nums: Vec<f64> = places.iter().take(filled).map(|v| v.unwrap_or(0.0)).collect();
     // Minutes follow whole degrees and seconds whole minutes (`48.85 2.35` is two values, not
     // degrees and minutes).
     if nums.iter().rev().skip(1).any(|v| v.fract() != 0.0) {
