@@ -99,10 +99,10 @@ pub fn beside(path: &Path) -> Option<(PathBuf, Result<WorldFile, String>)> {
 }
 
 /// Whether the picture at `path` is placed by a world file: one beside it can be read, and a
-/// `.prj` beside it says the coordinate system. (A JPEG so placed opens as a raster, not as a
-/// photo; a stray world file, or one without a `.prj`, leaves it a photo.)
+/// `.prj` beside it says a coordinate system RustGIS uses. (A JPEG so placed opens as a raster,
+/// not as a photo; a stray world file, or one without a usable `.prj`, leaves it a photo.)
 pub fn places(path: &Path) -> bool {
-    matches!(beside(path), Some((_, Ok(_)))) && std::fs::metadata(path.with_extension("prj")).is_ok_and(|m| m.is_file())
+    matches!(beside(path), Some((_, Ok(_)))) && matches!(super::sidecar_crs(path), Ok((Some(_), _)))
 }
 
 #[cfg(test)]
@@ -244,6 +244,8 @@ mod tests {
         let r = crate::raster::read_path(&dir.join("p.png")).unwrap();
         assert!(!r.georeferenced, "{:?}", r.lost);
         assert!(r.lost.iter().any(|m| m.contains("p.pgw")), "{:?}", r.lost);
+        // Nor does that .prj make the picture one a world file places (a JPEG stays a photo).
+        assert!(!places(&dir.join("p.png")));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

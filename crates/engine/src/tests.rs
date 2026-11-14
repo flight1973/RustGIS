@@ -29103,6 +29103,36 @@ fn a_jpeg_with_a_world_file_opens_placed_not_as_a_photo() {
     let mut u = Session::new(Project::default());
     u.run("project.openText", &json!({"text": text})).unwrap();
     assert_eq!(scan(&u), Some((true, Some(false))));
+
+    // A picture that opened without coordinates for want of a .prj isn't a scan asked for: once
+    // its .prj is there, the project reopens it placed.
+    image::GrayImage::from_pixel(4, 2, image::Luma([7])).save(dir.join("plan.png")).unwrap();
+    std::fs::write(dir.join("plan.pgw"), "0.5\n0\n0\n-0.5\n10.25\n49.75\n").unwrap();
+    let mut v = Session::new(Project::default());
+    v.run("layer.addData", &json!({"path": path("plan.png")})).unwrap();
+    let plan = |v: &Session| {
+        v.map().layer_by_name("plan").and_then(|l| l.raster.as_ref()).map(|r| (r.scan, r.data.as_ref().map(|d| d.georeferenced)))
+    };
+    assert_eq!(plan(&v), Some((false, Some(false))));
+    let text = serde_json::to_string(&v.project).unwrap();
+    std::fs::copy(dir.join("aerial.prj"), dir.join("plan.prj")).unwrap();
+    let mut w = Session::new(Project::default());
+    w.run("project.openText", &json!({"text": text})).unwrap();
+    assert_eq!(plan(&w), Some((false, Some(true))));
+
+    // A GeoTIFF added as a scan reopens as one, without its own coordinates.
+    let placed = rustgis_data::raster::read_path(&dir.join("plan.png")).unwrap();
+    rustgis_data::raster::cogwrite::write_file(&placed, 0, &dir.join("tagged.tif")).unwrap();
+    let mut x = Session::new(Project::default());
+    x.run("layer.addData", &json!({"path": path("tagged.tif"), "as": "scan"})).unwrap();
+    let tagged = |x: &Session| {
+        x.map().layer_by_name("tagged").and_then(|l| l.raster.as_ref()).and_then(|r| r.data.as_ref()).map(|d| d.georeferenced)
+    };
+    assert_eq!(tagged(&x), Some(false));
+    let text = serde_json::to_string(&x.project).unwrap();
+    let mut y = Session::new(Project::default());
+    y.run("project.openText", &json!({"text": text})).unwrap();
+    assert_eq!(tagged(&y), Some(false));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

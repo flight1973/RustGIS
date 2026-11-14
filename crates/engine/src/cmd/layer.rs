@@ -2016,7 +2016,7 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
         return None;
     }
     if rustgis_data::raster::is_raster_name(&path) {
-        let key = super::raster::read_key(&path);
+        let key = super::raster::read_key(&path, scan);
         return Some(ahead(NAME, key, move || super::raster::read_raster_as(&path, scan)));
     }
     if rustgis_data::raster::zarr::is_store(Path::new(&path)) {

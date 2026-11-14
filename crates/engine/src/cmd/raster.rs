@@ -563,7 +563,7 @@ pub(crate) fn say_losses(s: &mut Session, losses: Vec<(String, String)>) {
 
 /// Opens a raster file by path.
 pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, scan: bool) -> CmdResult {
-    let mut r = match super::reads::take(s, &read_key(path)) {
+    let mut r = match super::reads::take(s, &read_key(path, scan)) {
         Some(r) => r,
         None => read_raster_as(path, scan),
     }?;
@@ -574,7 +574,10 @@ pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, scan: bool) -> 
     // Absolute, so the project finds it again from anywhere (`absolute`, unlike `canonicalize`,
     // gives plain paths on Windows rather than `\\?\` ones).
     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
-    add_raster(s, &name, RasterLayer::from_path(r, full))
+    let mut layer = RasterLayer::from_path(r, full);
+    // A scan asked for reopens as one (#2075).
+    layer.scan = scan;
+    add_raster(s, &name, layer)
 }
 
 /// The raster at `path`, read whole; for a `scan`, as the file holds it, without the world file
@@ -584,9 +587,10 @@ pub(crate) fn read_raster_as(path: &str, scan: bool) -> Result<Raster, String> {
     read.map_err(|e| format!("{path}: {e}"))
 }
 
-/// The key [`add_path`]'s read of `path` is taken by (see [`super::reads`]).
-pub(crate) fn read_key(path: &str) -> String {
-    format!("raster:{path}")
+/// The key [`add_path`]'s read of `path` is taken by (see [`super::reads`]): a scan's read, without
+/// the world file, isn't another's.
+pub(crate) fn read_key(path: &str, scan: bool) -> String {
+    if scan { format!("raster-scan:{path}") } else { format!("raster:{path}") }
 }
 
 /// A raster GDAL converts and the conversion it read.

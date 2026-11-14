@@ -1110,8 +1110,9 @@ impl Raster {
             self.transform = GeoTransform { origin_x: affine[0], origin_y: affine[3], pixel_width: affine[1], pixel_height: affine[5] };
             self
         } else {
-            let data: Vec<Vec<f32>> = self.bands.iter().map(|b| b.data.clone()).collect();
-            let (data, ow, oh, t) = match north_up(data, self.width, self.height, affine, max_samples()) {
+            // The bands are only read, so a picture that can't be turned comes back as it was.
+            let data: Vec<&[f32]> = self.bands.iter().map(|b| b.data.as_slice()).collect();
+            let (data, ow, oh, t) = match north_up(&data, self.width, self.height, affine, max_samples()) {
                 Ok(turned) => turned,
                 Err(e) => return Err((Box::new(self), e.to_string())),
             };
@@ -1126,7 +1127,8 @@ impl Raster {
                 old.stats = new.stats.clone();
                 *new = old;
             }
-            (r.source, r.lost, r.overview, r.copyright) = (self.source, self.lost, self.overview, self.copyright);
+            // Resampled to a grid of its own: its pixels are neither the file's nor an overview's.
+            (r.source, r.lost, r.copyright) = (self.source, self.lost, self.copyright);
             (r.rounded, r.rounded_some) = (self.rounded, self.rounded_some);
             r
         };
@@ -1322,7 +1324,7 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
         r.apply_pam(p, pam::SIDECAR);
     }
     if world && matches!(ext.as_str(), "tif" | "tiff" | "png" | "jpg" | "jpeg") {
-        r = with_world_file(path, r);
+        r = apply_world_file(path, r);
     }
     r.source = Some(path.display().to_string());
     Ok(r)
@@ -1333,7 +1335,7 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
 /// be used, a world file that can't be read, or one that places it nowhere it can be drawn), the
 /// picture still opens as the scan it was, and a notice says why. A GeoTIFF keeps its own tags,
 /// and says so when the world file places it differently.
-fn with_world_file(path: &Path, mut r: Raster) -> Raster {
+pub fn apply_world_file(path: &Path, mut r: Raster) -> Raster {
     let Some((found, read)) = world::beside(path) else { return r };
     let name = found.file_name().map_or_else(|| found.display().to_string(), |n| n.to_string_lossy().into_owned());
     let unplaced = "it opens without coordinates";
@@ -1586,7 +1588,7 @@ fn rotate(r: &Raster, degrees: f64) -> Result<Raster> {
 /// row, y, y per column, y per row), resampled (nearest pixel) to the north-up grid of square
 /// pixels over its bounding box: pixels of the same area, coarser if that would hold more than
 /// `max` samples. Outside the image is NaN (transparent). Returns the bands, their size and grid.
-fn north_up(bands: Vec<Vec<f32>>, w: u32, h: u32, affine: [f64; 6], max: usize) -> Result<(Vec<Vec<f32>>, u32, u32, GeoTransform)> {
+fn north_up<B: AsRef<[f32]>>(bands: &[B], w: u32, h: u32, affine: [f64; 6], max: usize) -> Result<(Vec<Vec<f32>>, u32, u32, GeoTransform)> {
     let [x0, xc, xr, y0, yc, yr] = affine;
     let det = xc * yr - xr * yc;
     if !affine.iter().all(|v| v.is_finite()) || !det.is_normal() {
@@ -1626,8 +1628,8 @@ fn north_up(bands: Vec<Vec<f32>>, w: u32, h: u32, affine: [f64; 6], max: usize) 
             }
             let src = r as usize * w as usize + c as usize;
             let dst = row as usize * ow as usize + col as usize;
-            for (o, b) in out.iter_mut().zip(&bands) {
-                if let (Some(o), Some(v)) = (o.get_mut(dst), b.get(src)) {
+            for (o, b) in out.iter_mut().zip(bands) {
+                if let (Some(o), Some(v)) = (o.get_mut(dst), b.as_ref().get(src)) {
                     *o = *v;
                 }
             }

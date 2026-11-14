@@ -1685,7 +1685,7 @@ pub(super) fn read_limited_with_nodata(
     transform.pixel_height *= sy;
     let (bands, w, h) = match geo.affine {
         Some([x, xc, xr, y, yc, yr]) => {
-            let (bands, ow, oh, north_up) = super::north_up(bands, w, h, [x, xc * sx, xr * sy, y, yc * sx, yr * sy], max)?;
+            let (bands, ow, oh, north_up) = super::north_up(&bands, w, h, [x, xc * sx, xr * sy, y, yc * sx, yr * sy], max)?;
             transform = north_up;
             (bands, ow, oh)
         }
