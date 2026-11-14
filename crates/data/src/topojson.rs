@@ -4,6 +4,11 @@
 //!
 //! The file is hostile: arc indices are checked, nesting is fixed by the geometry types, and the
 //! number of coordinates rebuilt is bounded.
+//!
+//! A position may hold more than x and y (TopoJSON specification §2.1.1, which leaves their meaning
+//! open). The first further number (a height or measure) is carried into the rebuilt GeoJSON as is,
+//! neither scaled nor delta-decoded (§2.1.2: the reference implementation copies it), so the
+//! GeoJSON reading counts the features that had one and says it dropped them.
 
 use serde_json::{Map, Value as Json, json};
 
@@ -29,39 +34,64 @@ pub fn looks_like_topojson(text: &str) -> bool {
     squeezed.contains("\"type\":\"Topology\"")
 }
 
+/// A position: x, y and its first further number (a height or measure), or NaN for none (JSON
+/// holds no NaN, so it can't be one read).
+type Pos = [f64; 3];
+
+/// The first number after a position's x and y, or NaN.
+fn extra(a: &[Json]) -> f64 {
+    a.iter().skip(2).find_map(Json::as_f64).unwrap_or(f64::NAN)
+}
+
+/// A position as GeoJSON: `[x, y]`, or `[x, y, extra]` when it had a further number.
+fn pos_json(p: &Pos) -> Json {
+    let [x, y, e] = *p;
+    if e.is_nan() { json!([x, y]) } else { json!([x, y, e]) }
+}
+
+/// Positions as a GeoJSON coordinate array.
+fn line_json(l: &[Pos]) -> Json {
+    Json::Array(l.iter().map(pos_json).collect())
+}
+
+/// Rings (or lines) as nested GeoJSON coordinate arrays.
+fn rings_json(r: &[Vec<Pos>]) -> Json {
+    Json::Array(r.iter().map(|l| line_json(l)).collect())
+}
+
 struct Topology {
     /// The arcs, decoded to coordinates.
-    arcs: Vec<Vec<[f64; 2]>>,
+    arcs: Vec<Vec<Pos>>,
     transform: Option<([f64; 2], [f64; 2])>,
     budget: usize,
 }
 
 impl Topology {
-    fn point(&self, p: &Json) -> Option<[f64; 2]> {
+    fn point(&self, p: &Json) -> Option<Pos> {
         let a = p.as_array()?;
         let (x, y) = (a.first()?.as_f64()?, a.get(1)?.as_f64()?);
         Some(match self.transform {
-            Some(([sx, sy], [tx, ty])) => [x * sx + tx, y * sy + ty],
-            None => [x, y],
+            Some(([sx, sy], [tx, ty])) => [x * sx + tx, y * sy + ty, extra(a)],
+            None => [x, y, extra(a)],
         })
     }
 
     /// A line from arc indices (`~i` is arc `i` reversed), shared ends written once.
-    fn line(&mut self, ids: &Json) -> Option<Vec<[f64; 2]>> {
-        let mut out: Vec<[f64; 2]> = Vec::new();
+    fn line(&mut self, ids: &Json) -> Option<Vec<Pos>> {
+        let mut out: Vec<Pos> = Vec::new();
         for id in ids.as_array()? {
             let i = id.as_i64()?;
             let (k, rev) = if i < 0 { (!i, true) } else { (i, false) };
             let arc = self.arcs.get(usize::try_from(k).ok()?)?;
             self.budget = self.budget.checked_sub(arc.len())?;
-            let pts: Vec<[f64; 2]> = if rev { arc.iter().rev().copied().collect() } else { arc.clone() };
+            let pts: Vec<Pos> = if rev { arc.iter().rev().copied().collect() } else { arc.clone() };
             let skip = usize::from(!out.is_empty());
             out.extend(pts.into_iter().skip(skip));
         }
         Some(out)
     }
 
-    fn rings(&mut self, v: &Json) -> Option<Vec<Vec<[f64; 2]>>> {
+    fn rings(&mut self, v: &Json) -> Option<Vec<Vec<Pos>>> {
         v.as_array()?.iter().map(|r| self.line(r)).collect()
     }
 
@@ -71,16 +101,16 @@ impl Topology {
         let arcs = g.get("arcs");
         let coords = g.get("coordinates");
         Some(match ty {
-            "Point" => json!({"type": ty, "coordinates": self.point(coords?)?}),
+            "Point" => json!({"type": ty, "coordinates": pos_json(&self.point(coords?)?)}),
             "MultiPoint" => {
-                let pts: Option<Vec<[f64; 2]>> = coords?.as_array()?.iter().map(|p| self.point(p)).collect();
-                json!({"type": ty, "coordinates": pts?})
+                let pts: Option<Vec<Pos>> = coords?.as_array()?.iter().map(|p| self.point(p)).collect();
+                json!({"type": ty, "coordinates": line_json(&pts?)})
             }
-            "LineString" => json!({"type": ty, "coordinates": self.line(arcs?)?}),
-            "MultiLineString" | "Polygon" => json!({"type": ty, "coordinates": self.rings(arcs?)?}),
+            "LineString" => json!({"type": ty, "coordinates": line_json(&self.line(arcs?)?)}),
+            "MultiLineString" | "Polygon" => json!({"type": ty, "coordinates": rings_json(&self.rings(arcs?)?)}),
             "MultiPolygon" => {
-                let polys: Option<Vec<Vec<Vec<[f64; 2]>>>> = arcs?.as_array()?.iter().map(|p| self.rings(p)).collect();
-                json!({"type": ty, "coordinates": polys?})
+                let polys: Option<Vec<Vec<Vec<Pos>>>> = arcs?.as_array()?.iter().map(|p| self.rings(p)).collect();
+                json!({"type": ty, "coordinates": polys?.iter().map(|p| rings_json(p)).collect::<Vec<_>>()})
             }
             "GeometryCollection" if depth < 4 => {
                 let gs: Vec<Json> = g.get("geometries")?.as_array()?.iter().filter_map(|x| self.geometry(x, depth + 1)).collect();
@@ -104,21 +134,23 @@ pub fn read(file_name: &str, text: &str) -> Result<Vec<(Dataset, ReadReport)>> {
         let tr = t.get("translate")?.as_array()?;
         Some(([s.first()?.as_f64()?, s.get(1)?.as_f64()?], [tr.first()?.as_f64()?, tr.get(1)?.as_f64()?]))
     });
-    // Arcs: delta-encoded integers with a transform, plain coordinates without.
+    // Arcs: x and y delta-encoded integers with a transform, plain coordinates without; a further
+    // number is copied as is.
     let mut total = 0usize;
     let mut arcs = Vec::new();
     for a in v.get("arcs").and_then(Json::as_array).map(Vec::as_slice).unwrap_or_default() {
         let mut pts = Vec::new();
         let (mut x, mut y) = (0.0f64, 0.0f64);
         for p in a.as_array().map(Vec::as_slice).unwrap_or_default() {
-            let (Some(px), Some(py)) = (p.get(0).and_then(Json::as_f64), p.get(1).and_then(Json::as_f64)) else { continue };
+            let Some(a) = p.as_array() else { continue };
+            let (Some(px), Some(py)) = (a.first().and_then(Json::as_f64), a.get(1).and_then(Json::as_f64)) else { continue };
             let pt = match transform {
                 Some(([sx, sy], [tx, ty])) => {
                     x += px;
                     y += py;
-                    [x * sx + tx, y * sy + ty]
+                    [x * sx + tx, y * sy + ty, extra(a)]
                 }
-                None => [px, py],
+                None => [px, py, extra(a)],
             };
             pts.push(pt);
         }
@@ -225,6 +257,62 @@ mod tests {
         let (ds, rep) = crate::io::read_bytes("us.json", two.as_bytes()).unwrap();
         assert_eq!(ds.features.len(), 1);
         assert!(rep.messages.iter().any(|m| m.contains("also holds")), "{:?}", rep.messages);
+    }
+
+    /// What reading `text` says of dropped heights, and whether the layer is marked as having lost
+    /// them.
+    fn zm_said(text: &str) -> (bool, Vec<String>) {
+        let (ds, rep) = read("z.topojson", text).unwrap().remove(0);
+        (ds.zm_dropped, rep.messages)
+    }
+
+    #[test]
+    fn heights_dropped_are_said() {
+        // The specification's example says nothing: it has no heights.
+        let (lost, said) = zm_said(TOPO);
+        assert!(!lost && said.is_empty(), "{said:?}");
+
+        // A quantized arc with a height on one position; the point and the line use it, the
+        // polygon doesn't. The height is copied, not delta-decoded or scaled.
+        let quantized = r#"{"type":"Topology","transform":{"scale":[1,1],"translate":[0,0]},
+"objects":{"o":{"type":"GeometryCollection","geometries":[
+{"type":"Point","coordinates":[1,2,30]},
+{"type":"LineString","arcs":[0]},
+{"type":"Polygon","arcs":[[1]]}]}},
+"arcs":[[[0,0],[1,1,12.5]],[[0,0],[0,1],[1,0],[-1,-1]]]}"#;
+        let (lost, said) = zm_said(quantized);
+        assert!(lost && said == [crate::zm_note(Some(2))], "{said:?}");
+
+        // Without a transform: a height on a plain arc, read through a reversed index.
+        let plain = r#"{"type":"Topology","objects":{"o":{"type":"LineString","arcs":[-1]}},
+"arcs":[[[10,10,100],[11,11,101]]]}"#;
+        let (lost, said) = zm_said(plain);
+        assert!(lost && said == [crate::zm_note(Some(1))], "{said:?}");
+        // The x and y read are unchanged by the height.
+        let (ds, _) = read("z.topojson", plain).unwrap().remove(0);
+        let Some(Geometry::Line(l)) = &ds.features[0].geometry else { panic!() };
+        assert_eq!((l[0][0].x, l[0][0].y, l[0][1].x), (11.0, 11.0, 10.0));
+
+        // A measure alone (the third value null, a fourth a number) is dropped too.
+        let measure = r#"{"type":"Topology","objects":{"o":{"type":"MultiPoint","coordinates":[[1,2,null,7],[3,4]]}},"arcs":[]}"#;
+        let (lost, said) = zm_said(measure);
+        assert!(lost && said == [crate::zm_note(Some(1))], "{said:?}");
+
+        // A null third value is no height.
+        let null = r#"{"type":"Topology","objects":{"o":{"type":"Point","coordinates":[1,2,null]}},"arcs":[]}"#;
+        let (lost, said) = zm_said(null);
+        assert!(!lost && said.is_empty(), "{said:?}");
+    }
+
+    #[test]
+    fn a_geometry_not_read_isnt_counted_as_dropping_heights() {
+        // The first geometry's arc doesn't exist; the second has a height.
+        let text = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[
+{"type":"LineString","arcs":[5]},
+{"type":"Point","coordinates":[1,2,3]}]}},"arcs":[[[0,0,9],[1,1,9]]]}"#;
+        let (ds, rep) = read("z.topojson", text).unwrap().remove(0);
+        assert_eq!(rep.skipped, 1);
+        assert!(ds.zm_dropped && rep.messages.contains(&crate::zm_note(Some(1))), "{:?}", rep.messages);
     }
 
     #[test]
