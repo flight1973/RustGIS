@@ -56,7 +56,7 @@ fn heights_survive_a_geojson_round_trip_exactly() {
     let (read, said) = add(&mut s, &src);
     assert!(of_heights(&said).is_empty(), "nothing lost on reading: {said:?}");
     assert!(!read.zm_dropped);
-    let expected = vec![
+    let expected = [
         Some(vec![0.1f64]),
         Some(vec![-12345.678901234567, 1e-300, 8848.86]),
         Some(vec![10., 11., 12., 10., 5., 6., 7., 5.]),
