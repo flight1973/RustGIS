@@ -7862,7 +7862,7 @@ mod tests {
         assert!(e.contains("'Loop': 1 ring in 1 feature goes around a pole"), "{e}");
         // Only the selected square: a tool reading the selection says nothing; Count Points, which
         // reads every polygon whatever is selected, says what it read.
-        let third = Ci(HashMap::from([("loop".to_string(), caps), ("pts".to_string(), pts)]), vec![2]);
+        let third = Ci(HashMap::from([("loop".to_string(), caps.clone()), ("pts".to_string(), pts)]), vec![2]);
         let r = crate::run("featureToPoint", &third, &serde_json::json!({"input": "loop"})).unwrap();
         assert!(!r.messages.iter().any(|t| about(t)), "{:?}", r.messages);
         let r = crate::run("countPoints", &third, &serde_json::json!({"polygons": "loop", "points": "pts"})).unwrap();
@@ -7872,6 +7872,27 @@ mod tests {
         assert!(!about(&e), "{e}");
         let e = crate::run("spatialJoin", &all, &serde_json::json!({"target": "study_area", "join": "loop"})).unwrap_err();
         assert!(!about(&e), "{e}");
+        // A loop layer named `area` and a field error naming 'area': not a refusal of no area.
+        let mut area = caps.clone();
+        area.name = "area".into();
+        let named = Ci(HashMap::from([("area".to_string(), area)]), vec![]);
+        let e = crate::run("dissolve", &named, &serde_json::json!({"input": "area", "field": "area"})).unwrap_err();
+        assert!(!about(&e), "{e}");
+        // One layer read through two names with different selections: every row read through
+        // either is counted, once. Spatial Join reads the square (row 2) as target and a loop
+        // (row 1) as join.
+        struct ByName(HashMap<String, Dataset>);
+        impl Inputs for ByName {
+            fn dataset(&self, layer: &str) -> Option<&Dataset> {
+                self.0.iter().find(|(k, _)| k.eq_ignore_ascii_case(layer)).map(|(_, d)| d)
+            }
+            fn selection(&self, layer: &str) -> &[usize] {
+                if layer == "Loop" { &[2] } else { &[1] }
+            }
+        }
+        let both = ByName(HashMap::from([("loop".to_string(), caps.clone())]));
+        let r = crate::run("spatialJoin", &both, &serde_json::json!({"target": "Loop", "join": "loop"})).unwrap();
+        assert!(r.messages.iter().any(|t| about(t) && t.contains("1 ring in 1 feature")), "{:?}", r.messages);
     }
 
     #[test]
