@@ -625,7 +625,7 @@ pub struct Raster {
     /// With `overview`, whether the pixels are every `step`-th of the file's, from its top-left
     /// corner (a picture too large to read whole): each then spans exactly `step` of its pixels,
     /// where an overview's span its size over the file's. 1 otherwise.
-    pub step: u32,
+    pub(crate) step: u32,
     /// `false` for a scan (a TIFF with no GeoTIFF tags, a PNG, a JPEG): `transform` is then only
     /// a stand-in until the picture is placed or georeferenced, and says nothing about the ground.
     pub georeferenced: bool,
@@ -1013,7 +1013,8 @@ impl Raster {
         if self.georeferenced {
             return Err((Box::new(self), "only a raster with no coordinates can be placed".into()));
         }
-        let (affine, transformer) = match world_placement(wf, crs, self.width, self.height, self.file_pixels()) {
+        let (sx, sy) = self.file_pixels();
+        let (affine, transformer) = match world_placement(wf, crs, self.width, self.height, (sx, sy)) {
             Ok(placed) => placed,
             Err(why) => return Err((Box::new(self), why)),
         };
@@ -1041,8 +1042,11 @@ impl Raster {
                 old.stats = new.stats.clone();
                 *new = old;
             }
-            // A picture read at a reduced size still says so, as a turned GeoTIFF does.
-            (r.source, r.lost, r.overview, r.copyright) = (self.source, self.lost, self.overview, self.copyright);
+            // A picture read at a reduced size still says so, as a turned GeoTIFF does: of the
+            // turned grid at the file's resolution, so the two sizes said are alike.
+            let full = |n: u32, s: f64| (f64::from(n) * s).round().clamp(1.0, f64::from(u32::MAX)) as u32;
+            r.overview = self.overview.map(|_| (full(ow, sx), full(oh, sy)));
+            (r.source, r.lost, r.copyright) = (self.source, self.lost, self.copyright);
             (r.rounded, r.rounded_some) = (self.rounded, self.rounded_some);
             r
         };

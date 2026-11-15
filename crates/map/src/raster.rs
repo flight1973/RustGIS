@@ -222,7 +222,7 @@ impl RasterLayer {
             return Err("give a raster file or Zarr store on this computer: web addresses aren't repaired here".into());
         }
         let sub = subdataset.or(self.subdataset.as_deref());
-        let r = self.read_placed(path, sub).map_err(|e| format!("{path}: {e}"))?;
+        let r = self.read_placed(path, sub, false).map_err(|e| format!("{path}: {e}"))?;
         self.validate_replacement(&r, path)?;
         let mut style = self.style.clone();
         style.repair(&r);
@@ -554,7 +554,7 @@ impl RasterLayer {
             rustgis_data::raster::read_bytes(self.file_name.as_deref().unwrap_or("raster.tif"), bytes)
                 .and_then(|r| placed(r, self.placement))
         } else if let Some(p) = &self.path {
-            self.read_placed(p, self.subdataset.as_deref())
+            self.read_placed(p, self.subdataset.as_deref(), true)
         } else {
             return Err("the raster has no source".into());
         };
@@ -1090,10 +1090,11 @@ impl RasterLayer {
     ///   a placement when added) is read without the world file beside it (#2075), its subdataset
     ///   and coordinate system kept, and laid where it was, a GeoTIFF's own coordinates set aside: a
     ///   world file or `.prj` that turns up later doesn't move it (add it again).
-    /// - Any other layer is read as [`rustgis_data::raster::read_path_with`] reads it. One that
-    ///   has no coordinates now (the `.prj` or world file that placed it gone) still opens, and
-    ///   says so, rather than being drawn at its stand-in near 0°, 0° without a word.
-    fn read_placed(&self, path: &str, subdataset: Option<&str>) -> rustgis_data::Result<Raster> {
+    /// - Any other layer is read as [`rustgis_data::raster::read_path_with`] reads it. When
+    ///   `reopening` its own file, one that has no coordinates now (the `.prj` or world file that
+    ///   placed it gone) still opens, and says so, rather than being drawn at its stand-in near
+    ///   0°, 0° without a word. (A source repaired to another file says nothing of the first.)
+    fn read_placed(&self, path: &str, subdataset: Option<&str>, reopening: bool) -> rustgis_data::Result<Raster> {
         use rustgis_data::raster::{read_path_unplaced, read_path_with};
         let p = std::path::Path::new(path);
         let crs = self.crs.as_deref();
@@ -1101,7 +1102,7 @@ impl RasterLayer {
             return placed(read_path_unplaced(p, subdataset, crs)?, self.placement);
         }
         let mut r = read_path_with(p, subdataset, crs)?;
-        if !r.georeferenced {
+        if reopening && !r.georeferenced {
             r.lost.push("it has no coordinates now, though it had them when added: it is drawn at a stand-in place".into());
         }
         Ok(r)

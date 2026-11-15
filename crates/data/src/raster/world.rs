@@ -84,18 +84,59 @@ pub fn names(path: &Path) -> Vec<PathBuf> {
     out.into_iter().map(|e| path.with_extension(e)).collect()
 }
 
-/// The world file beside `path`, if there is one: its path and what reading it gave.
+/// The most entries of a folder looked through for a world file named in mixed case.
+const MAX_LISTED: usize = 100_000;
+
+/// The world file beside `path`, if there is one: its path and what reading it gave. Each name
+/// there is tried in turn ([`names`]), so a stray empty `.tfw` doesn't hide a good `.wld`; when
+/// none can be read, the first one's reason is given. When no name is there as written, the
+/// folder is looked through for one in any case (`Scan.Tfw`, from a system that ignores case).
 pub fn beside(path: &Path) -> Option<(PathBuf, Result<WorldFile, String>)> {
-    let (found, len) = names(path).into_iter().find_map(|p| match std::fs::metadata(&p) {
-        Ok(m) if m.is_file() => Some((p, m.len())),
-        _ => None,
-    })?;
-    let read = if len > MAX_BYTES {
-        Err("it is too large to be a world file".to_string())
-    } else {
-        std::fs::read_to_string(&found).map_err(|e| e.to_string()).and_then(|t| WorldFile::parse(&t))
-    };
-    Some((found, read))
+    let mut there: Vec<(PathBuf, u64)> = names(path)
+        .into_iter()
+        .filter_map(|p| match std::fs::metadata(&p) {
+            Ok(m) if m.is_file() => Some((p, m.len())),
+            _ => None,
+        })
+        .collect();
+    if there.is_empty() {
+        there = in_any_case(path);
+    }
+    let mut first_failed = None;
+    for (found, len) in there {
+        let read = if len > MAX_BYTES {
+            Err("it is too large to be a world file".to_string())
+        } else {
+            std::fs::read_to_string(&found).map_err(|e| e.to_string()).and_then(|t| WorldFile::parse(&t))
+        };
+        match read {
+            Ok(wf) => return Some((found, Ok(wf))),
+            Err(e) => {
+                first_failed.get_or_insert((found, Err(e)));
+            }
+        }
+    }
+    first_failed
+}
+
+/// World files beside `path` whose names match [`names`] in any case, in that order: looked for in
+/// its folder, at most [`MAX_LISTED`] entries of it.
+fn in_any_case(path: &Path) -> Vec<(PathBuf, u64)> {
+    let wanted: Vec<String> =
+        names(path).iter().filter_map(|p| p.file_name().and_then(|n| n.to_str())).map(str::to_ascii_lowercase).collect();
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut found: Vec<(usize, PathBuf, u64)> = entries
+        .take(MAX_LISTED)
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let at = wanted.iter().position(|w| e.file_name().to_str().is_some_and(|n| n.to_ascii_lowercase() == *w))?;
+            let meta = e.metadata().ok().filter(std::fs::Metadata::is_file)?;
+            Some((at, e.path(), meta.len()))
+        })
+        .collect();
+    found.sort_by_key(|(at, ..)| *at);
+    found.into_iter().map(|(_, p, len)| (p, len)).collect()
 }
 
 /// Whether the picture at `path` is placed by a world file: one beside it can be read, a `.prj`
@@ -161,13 +202,34 @@ mod tests {
         let (found, read) = beside(&pic).unwrap();
         assert_eq!(found.extension().unwrap(), "wld");
         assert!(read.unwrap().is_north_up());
-        // The specific name wins over `.wld`.
+        // A specific name that can be read wins over `.wld`.
+        std::fs::write(dir.join("p.pgw"), "2\n0\n0\n-2\n1\n9\n").unwrap();
+        let (found, read) = beside(&pic).unwrap();
+        assert_eq!((found.extension().unwrap().to_str(), read.unwrap().a), (Some("pgw"), 2.0));
+        // One that can't be read doesn't hide the `.wld`.
         std::fs::write(dir.join("p.pgw"), "x").unwrap();
         let (found, read) = beside(&pic).unwrap();
-        assert_eq!(found.extension().unwrap(), "pgw");
-        assert!(read.is_err());
+        assert_eq!(found.extension().unwrap(), "wld");
+        assert!(read.is_ok());
+        // With none readable, the first one's reason is given.
+        std::fs::remove_file(dir.join("p.wld")).unwrap();
         std::fs::write(dir.join("p.pgw"), "1 ".repeat(3000)).unwrap();
         assert!(beside(&pic).unwrap().1.unwrap_err().contains("too large"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_world_file_named_in_mixed_case_is_found() {
+        let dir = std::env::temp_dir().join(format!("rustgis-world-mixed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Scan.Tfw"), "1\n0\n0\n-1\n0.5\n9.5\n").unwrap();
+        // Found by name where the file system ignores case (macOS, Windows), by looking through the
+        // folder where it doesn't (Linux).
+        let (found, read) = beside(&dir.join("Scan.Tif")).unwrap();
+        assert_eq!(found.file_name().unwrap().to_ascii_lowercase(), "scan.tfw");
+        assert!(read.is_ok());
+        assert!(beside(&dir.join("Other.tif")).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
