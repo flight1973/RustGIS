@@ -2749,6 +2749,7 @@ pub(crate) fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: O
     crate::dbf::readable_header_date(&mut parts.dbf);
     let date_columns = crate::dbf::dates_as_text(&mut parts.dbf);
     crate::dbf::floats_as_numeric(&mut parts.dbf);
+    let decimals = crate::dbf::field_decimals(&parts.dbf);
     let dbf = shapefile::dbase::ReaderBuilder::new()
         .with_encoding(encoding.decoder())
         // A date's year may be padded with spaces on the left (`   10101`): keep them.
@@ -2793,7 +2794,7 @@ pub(crate) fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: O
             t
         }),
     };
-    let (mut converted, mut unconverted, mut zm_shapes) = (0usize, 0usize, 0usize);
+    let (mut converted, mut unconverted, mut zm_shapes, mut not_numbers) = (0usize, 0usize, 0usize, 0usize);
     let mut unread_dates = vec![0usize; ds.fields.len()];
     // Numbers that aren't finite (`nan`, `inf`), read as empty and counted for a notice.
     let mut nonfinite = vec![0usize; ds.fields.len()];
@@ -2838,6 +2839,16 @@ pub(crate) fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: O
         {
             source_kind = g.kind();
         }
+        // A coordinate that isn't a number (NaN, which some writers use for an empty point, or an
+        // infinity) has no place: the shape keeps its attributes without its geometry, counted
+        // (#1985). Checked before converting, so it isn't taken for a conversion that failed.
+        let geom = match geom {
+            Some(g) if !g.is_finite() => {
+                not_numbers += 1;
+                None
+            }
+            g => g,
+        };
         let geom = match (&to_lonlat, geom) {
             (Some(t), Some(g)) => {
                 let mut ok = true;
@@ -2892,16 +2903,21 @@ pub(crate) fn read_shapefile_parts(mut parts: ShapefileParts, name: &str, crs: O
     ds.geometry_type = dominant_type(&ds);
     // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
     // conversion warning. Its shapes can be recovered by importing with an override.
-    if ds.geometry_type == GeometryType::None && unconverted > 0 {
+    if ds.geometry_type == GeometryType::None && (unconverted > 0 || not_numbers > 0) {
         ds.geometry_type = source_kind;
     }
-    integral_numeric_to_integer(&mut ds);
+    integral_numeric_to_integer(&mut ds, &decimals);
     let e = ds.extent();
     if !e.is_empty() && (e.min_x < -180.5 || e.max_x > 180.5 || e.min_y < -90.5 || e.max_y > 90.5) {
         report.messages.push("coordinates are not longitude/latitude; RustGIS reads them as WGS 84 and they may draw out of place".into());
     }
     if report.skipped > 0 {
         report.messages.push(format!("{} shapes were unreadable or unsupported", report.skipped));
+    }
+    if not_numbers > 0 {
+        report.messages.push(format!(
+            "{name}: {not_numbers} shape(s) have a coordinate that isn't a number (NaN or infinite): their features are kept without geometry"
+        ));
     }
     ds.crs_incomplete = unconverted > 0;
     if unconverted > 0 && converted == 0 {
@@ -2945,12 +2961,17 @@ fn shapefile_crs(prj: Option<&str>, report: &mut ReadReport) -> Result<Option<(C
     }
 }
 
-/// The .dbf header doesn't say whether a Numeric column has decimals, so a Double column whose
-/// values are all whole numbers within i64 range is read as Integer.
-fn integral_numeric_to_integer(ds: &mut Dataset) {
+/// A dBASE Numeric column with no decimals declared whose values are all whole numbers
+/// within ±9.0e15 is read as Integer. A column with decimals declared (decimals > 0)
+/// remains Double.
+fn integral_numeric_to_integer(ds: &mut Dataset, decimals: &[u8]) {
     const LIMIT: f64 = 9.0e15;
     for fi in 0..ds.fields.len() {
         if ds.fields.get(fi).map(|f| f.ty) != Some(FieldType::Double) {
+            continue;
+        }
+        // Decimals missing from a malformed header can't be ruled out: the column stays Double.
+        if decimals.get(fi).is_none_or(|&d| d > 0) {
             continue;
         }
         let whole = ds.features.iter().all(|f| match f.attrs.get(fi) {
@@ -3806,6 +3827,7 @@ fn kept_column(ds: &Dataset, k: usize, name: &str, style: &DbfStyle) -> (Spec, O
         encoding.encode(&text).map_or(text.len(), |b| b.len())
     };
     let fits = match (field.ty, ty) {
+        (FieldType::Integer, b'N' | b'F') if was.decimals > 0 => false,
         (FieldType::Integer | FieldType::Double, b'N' | b'F') => values().all(|v| {
             let d = usize::from(was.decimals);
             dbf_number(v, field.ty, d, usize::from(was.len)).is_some_and(|x| {
@@ -4006,6 +4028,23 @@ pub(crate) fn group_rings(rings: Vec<(Vec<Coord>, bool)>) -> Geometry {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A whole-valued Double is read as Integer only when the header declares no decimals for it;
+    /// when the header doesn't give its decimals at all, it stays Double.
+    #[test]
+    fn a_double_with_undeclared_decimals_stays_double() {
+        let layer = || {
+            let mut ds = Dataset::new("t", GeometryType::None, vec![Field::new("V", FieldType::Double)]);
+            ds.push(None, vec![Value::Float(100.0)]);
+            ds
+        };
+        let mut missing = layer();
+        integral_numeric_to_integer(&mut missing, &[]);
+        assert_eq!(missing.fields[0].ty, FieldType::Double);
+        let mut none_declared = layer();
+        integral_numeric_to_integer(&mut none_declared, &[0]);
+        assert_eq!(none_declared.fields[0].ty, FieldType::Integer);
+    }
 
     /// Text is cut to what its code page holds in the bytes given, at a character boundary.
     #[test]
@@ -5457,6 +5496,63 @@ mod tests {
         assert!(rep.messages.iter().any(|m| m.contains("not longitude/latitude")), "{:?}", rep.messages);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// A shape with a coordinate that isn't a number (NaN, as some writers mark an empty point, or
+    /// an infinity) keeps its attributes without its geometry, counted (#1985), with or without a
+    /// `.prj` to convert from, and isn't taken for a failed conversion. A clean file says nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shapefile_coordinates_that_arent_numbers_are_left_out_and_said() {
+        use shapefile::dbase::{FieldValue, Record, TableWriterBuilder};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let write = |name: &str, points: &[(f64, f64)]| {
+            let shp = dir.join(name);
+            let table = TableWriterBuilder::new().add_character_field("name".try_into().unwrap(), 10);
+            let mut w = shapefile::Writer::from_path(&shp, table).unwrap();
+            for (i, &(x, y)) in points.iter().enumerate() {
+                let mut r = Record::default();
+                r.insert("name".into(), FieldValue::Character(Some(format!("p{i}"))));
+                w.write_shape_and_record(&shapefile::Point::new(x, y), &r).unwrap();
+            }
+            shp
+        };
+        let said = |m: &[String]| m.iter().any(|m| m.contains("isn't a number"));
+        let bad = write("bad.shp", &[(f64::NAN, 20.0), (11.0, 21.0), (f64::INFINITY, 22.0)]);
+        let (ds, rep) = read_path(&bad).unwrap();
+        assert_eq!(ds.features.len(), 3, "the features are kept");
+        assert!(ds.features[0].geometry.is_none() && ds.features[2].geometry.is_none());
+        assert_eq!(ds.features[1].geometry, Some(Geometry::Point(Coord::new(11.0, 21.0))));
+        assert_eq!(ds.value(0, 0), &Value::Text("p0".into()), "with their attributes");
+        assert_eq!(ds.geometry_type, GeometryType::Point);
+        assert_eq!(ds.unsaved_coordinates(), 0);
+        assert!(
+            rep.messages.contains(
+                &"bad: 2 shape(s) have a coordinate that isn't a number (NaN or infinite): their features are kept without geometry"
+                    .to_string()
+            ),
+            "{:?}",
+            rep.messages
+        );
+        // Every shape so: still a point layer, not a table.
+        let all = write("all.shp", &[(f64::NAN, f64::NAN)]);
+        let (ds, rep) = read_path(&all).unwrap();
+        assert_eq!(ds.geometry_type, GeometryType::Point);
+        assert!(said(&rep.messages), "{:?}", rep.messages);
+        // With a .prj to convert from, said as not a number, not as a failed conversion.
+        let prj = r#"PROJCS["WGS_1984_UTM_Zone_31N",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",3.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]"#;
+        let utm = write("utm.shp", &[(f64::NAN, 5_411_550.2), (451_219.33, 5_411_550.2)]);
+        std::fs::write(dir.join("utm.prj"), prj).unwrap();
+        let (ds, rep) = read_path(&utm).unwrap();
+        assert!(ds.features[0].geometry.is_none() && ds.features[1].geometry.is_some());
+        assert!(said(&rep.messages), "{:?}", rep.messages);
+        assert!(!rep.messages.iter().any(|m| m.contains("converted")), "{:?}", rep.messages);
+        assert!(!ds.crs_incomplete);
+        // A clean file says nothing of it.
+        let clean = write("clean.shp", &[(10.0, 20.0)]);
+        let (_, rep) = read_path(&clean).unwrap();
+        assert!(!said(&rep.messages), "{:?}", rep.messages);
+    }
     /// An ESRI .prj without an authority retains the national datum shift (issue #807).
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -6200,5 +6296,22 @@ mod tests {
         for e in ["shp", "shx", "dbf"] {
             assert!(dir.path().join(format!("out.{e}")).exists());
         }
+    }
+
+    #[test]
+    fn shapefile_dbf_double_with_whole_numbers_remains_double() {
+        let dir = tempfile::tempdir().unwrap();
+        let shp = dir.path().join("values.shp");
+        let fields = vec![Field::new("rate", FieldType::Double), Field::new("count", FieldType::Integer)];
+        let mut ds = Dataset::new("values", GeometryType::Point, fields);
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Float(10.0), Value::Int(1)]);
+        ds.push(Some(Geometry::Point(Coord::new(2.0, 3.0))), vec![Value::Float(20.0), Value::Int(2)]);
+        write_path(&ds, &shp).unwrap();
+
+        let (read_back, _) = read_shapefile_in(&shp, "values", None).unwrap();
+        assert_eq!(read_back.fields[0].ty, FieldType::Double);
+        assert_eq!(read_back.features[0].attrs[0], Value::Float(10.0));
+        assert_eq!(read_back.fields[1].ty, FieldType::Integer);
+        assert_eq!(read_back.features[0].attrs[1], Value::Int(1));
     }
 }

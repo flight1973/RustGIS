@@ -2,6 +2,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod antimeridian;
+pub mod arcgis_style;
 pub mod camera;
 pub mod color;
 pub mod content;
@@ -3023,7 +3024,7 @@ impl Map {
             navigator: _,
             first_person: _,
         } = view;
-        if let Some(view::Terrain { source, exaggeration: _ }) = terrain {
+        if let Some(view::Terrain { source, exaggeration: _, water: _ }) = terrain {
             match source {
                 view::TerrainSource::Tiles { url, encoding: _ } => {
                     out.push(Slot { at: SlotPos::Terrain, value: url, address: true, local_path: false })

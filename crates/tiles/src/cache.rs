@@ -2628,7 +2628,10 @@ mod native {
             let bound = crate::logins::inherit(url, &prepared.url);
             let login = crate::logins::apply(&bound)?;
             carried_login = login.is_some();
-            let mut req = agent.post(prepared.url.as_str()).header("Content-Type", "application/json").header("Accept", "application/json");
+            let mut req = agent
+                .post(login.as_ref().map_or(prepared.url.as_str(), |a| a.url.as_str()))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json");
             if let Some((name, value)) = login.as_ref().and_then(|a| a.header.as_ref()) {
                 req = req.header(name.as_str(), value.as_str());
             }
@@ -4097,7 +4100,7 @@ mod tests {
         let _alarm = super::alarm_turn();
         let before = generation();
         notify_at(Instant::now() + Duration::from_millis(20));
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        std::thread::sleep(std::time::Duration::from_millis(40)); // test-wait: cross the scheduled redraw alarm deadline
         assert!(generation() > before);
     }
 
@@ -4274,7 +4277,7 @@ mod tests {
                 if stream.write_all(&[0u8; 1000]).is_err() {
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: simulate a slow download body
             }
         });
         let wanted = std::sync::Arc::new(AtomicBool::new(true));
@@ -4289,11 +4292,11 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while progress.received() < 5_000 {
             assert!(std::time::Instant::now() < deadline, "nothing counted: {progress:?}");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: legacy polling for download progress
         }
         assert_eq!(progress.total.load(Ordering::Relaxed), 1_000_000);
         let first = progress.received();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(200)); // test-wait: sample progress again after more body chunks
         let then = progress.received();
         assert!(then > first && then < 1_000_000, "{first} then {then}");
         assert!(progress.fraction().is_some_and(|f| f > 0.0 && f < 1.0), "{progress:?}");
@@ -4356,7 +4359,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while progress.received() < 5_000 {
             assert!(std::time::Instant::now() < deadline, "nothing counted: {progress:?}");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: legacy polling for download progress
         }
         assert_eq!(progress.fraction(), None, "{progress:?}");
         let _ = release.send(());
@@ -4535,6 +4538,99 @@ mod tests {
         assert!(!request.contains("first-secret") && !request.contains("second-secret"));
         assert!(logins::deactivate(&first));
         assert!(logins::deactivate(&second));
+    }
+
+    /// An API key in the query goes to the login's origin on every hop there, replacing a stale
+    /// copy of the parameter (once, in any case or escaping), and never to a redirect's other origin.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn query_logins_reach_their_origin_only_and_never_a_redirect_target() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        let (other, other_asked) = serve_recorded(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile".to_vec()]);
+        let (base, asked) = serve_recorded(vec![
+            b"HTTP/1.1 302 Found\r\nLocation: /next?%41PI_key=stale-two&y=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            format!("HTTP/1.1 302 Found\r\nLocation: {other}/tile?api_key=foreign\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .into_bytes(),
+        ]);
+        let secret = "query-secret/+é";
+        let encoded = "query-secret%2F%2B%C3%A9";
+        let first = logins::activate(&base, "query-first", Method::Query("api_key".into()), secret, true).unwrap();
+        let second = logins::activate(&other, "query-second", Method::Query("api_key".into()), "second-secret", true).unwrap();
+        let url = logins::bind(&first, &format!("{base}/start?x=1&Api_Key=stale-one")).unwrap();
+        assert_eq!(native::get(&native::agent(), &url, &[]).unwrap(), b"tile");
+        let timeout = std::time::Duration::from_secs(5);
+        let one = asked.recv_timeout(timeout).unwrap();
+        let two = asked.recv_timeout(timeout).unwrap();
+        assert!(one.starts_with(&format!("GET /start?x=1&api_key={encoded} HTTP/1.1\r\n")), "{one}");
+        assert!(two.starts_with(&format!("GET /next?y=2&api_key={encoded} HTTP/1.1\r\n")), "{two}");
+        let foreign = other_asked.recv_timeout(timeout).unwrap();
+        assert!(foreign.starts_with("GET /tile?api_key=foreign HTTP/1.1\r\n"), "{foreign}");
+        for text in [&one, &two, &foreign] {
+            assert!(!text.contains("stale") && !text.contains("second-secret"), "{text}");
+        }
+        assert!(!foreign.contains(encoded) && !foreign.contains(secret));
+        assert!(logins::deactivate(&first));
+        assert!(logins::deactivate(&second));
+    }
+
+    /// A HEAD and a POST carry the query key too, to the address the caller named.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn query_logins_go_with_head_and_post_requests() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        let (base, asked) = serve_recorded(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec(),
+        ]);
+        let binding = logins::activate(&base, "query-head-post", Method::Query("key-name".into()), "a b&c", true).unwrap();
+        let url = logins::bind(&binding, &format!("{base}/data?q=1#frag")).unwrap();
+        let agent = native::agent();
+        native::head_with(&agent, &url).unwrap();
+        assert_eq!(native::post_with(&agent, &url, "{}").unwrap(), b"{}");
+        for (method, request) in ["HEAD", "POST"].into_iter().zip(asked.iter().take(2)) {
+            assert!(request.starts_with(&format!("{method} /data?q=1&key-name=a%20b%26c HTTP/1.1\r\n")), "{request}");
+        }
+        assert!(logins::deactivate(&binding));
+    }
+
+    /// A refused request that carried a query key is recorded by its plain address: neither the
+    /// key (raw or encoded), nor the binding, nor the key's parameter reaches the history, a
+    /// failure message or its report.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn query_logins_diagnostics_never_record_the_key() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        use rustgis_data::diagnostics::{Filter, History};
+        let refused = b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (base, asked) = serve_recorded(vec![refused; 3]);
+        let secret = "query diagnostics/secret";
+        let encoded = "query%20diagnostics%2Fsecret";
+        let binding = logins::activate(&base, "query-diagnostics", Method::Query("diagnostic_login".into()), secret, true).unwrap();
+        let history = History::default();
+        let _scope = history.enter();
+        let plain = format!("{base}/data.parquet");
+        let url = logins::bind(&binding, &plain).unwrap();
+        let agent = native::agent();
+        let failures = [
+            native::get(&agent, &url, &[]).unwrap_err(),
+            native::head_with(&agent, &url).unwrap_err(),
+            native::post_with(&agent, &url, "{}").unwrap_err(),
+        ];
+        for request in asked.iter().take(3) {
+            assert!(request.contains(&format!("diagnostic_login={encoded}")), "{request}");
+        }
+        let records = history.records();
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert_eq!(network_records(&history, &plain).len(), 3, "every record names the plain address: {records:?}");
+        let everything = format!("{failures:?}\n{records:?}\n{}", history.report(Filter::All));
+        for private in [secret, encoded, binding.as_str(), "diagnostic_login", rustgis_data::login_address::PREFIX] {
+            assert!(!everything.contains(private), "{private} reached the diagnostics: {everything}");
+        }
+        assert!(everything.contains(&plain));
+        assert!(logins::deactivate(&binding));
     }
 
     /// A failed request that carried a login is recorded by its plain address and scrubbed text:
@@ -4969,7 +5065,7 @@ mod tests {
                 resolved = Some(r);
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for bound style resolution
         }
         let resolved = resolved.expect("style must resolve from fetched documents");
         let Source::Vector { tiles, .. } = &resolved.style.sources[0].1 else { panic!("vector source") };
@@ -5784,7 +5880,7 @@ mod tests {
                     m.fetch_max(now, Ordering::SeqCst);
                     let mut buf = [0u8; 2048];
                     let _ = stream.read(&mut buf);
-                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    std::thread::sleep(std::time::Duration::from_millis(150)); // test-wait: keep fixture requests overlapping to measure concurrency
                     o.fetch_sub(1, Ordering::SeqCst);
                     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile");
                 });
@@ -6108,7 +6204,7 @@ mod tests {
                 started_tx.send(()).unwrap();
             } else {
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(std::time::Duration::from_millis(50)); // test-wait: complete the fake download asynchronously
                     done(Ok(b"1".to_vec()));
                 });
             }

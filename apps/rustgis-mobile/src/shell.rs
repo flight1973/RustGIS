@@ -35,6 +35,12 @@ pub trait Phone: Platform {
     fn picking(&self) -> bool {
         self.busy()
     }
+
+    /// Whether the soft keyboard's Return was pressed since the last frame, where the system
+    /// passes it on as no key egui knows (iOS). The shell gives egui an Enter for it.
+    fn take_return(&self) -> bool {
+        false
+    }
 }
 
 /// What a service couldn't do, kept until the next frame says it in the window (a service has
@@ -340,10 +346,12 @@ fn read_batch(purpose: &str, files: Vec<(String, PathBuf)>, inbox: &Inbox, probl
     inbox.lock().unwrap_or_else(|e| e.into_inner()).extend(read.into_iter().map(|(name, bytes)| (format!("{mark}{name}"), bytes)));
 }
 
-/// Removes a picked file's copy, and its folder once that is empty.
+/// Removes a picked file's copy, and its folders once they are empty: the one for its source
+/// folder, and the one for its pick.
 fn remove_copy(path: &Path) {
     let _ = std::fs::remove_file(path);
-    if let Some(folder) = path.parent() {
+    for folder in path.ancestors().skip(1).take(2) {
+        // Not removed while it holds anything (another copy).
         let _ = std::fs::remove_dir(folder);
     }
 }
@@ -464,6 +472,19 @@ impl<P: Phone> eframe::App for App<P> {
             self.keyboard = keyboard;
         }
         self.take_phone_events(ctx, raw_input);
+        // The soft keyboard's Return, as the Enter key egui knows: each field does with it what
+        // it does with Enter.
+        if self.phone.as_ref().is_some_and(|phone| phone.take_return()) {
+            for pressed in [true, false] {
+                raw_input.events.push(egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
         self.kept = self.phone.as_ref().is_some_and(|phone| phone.picking()).then(|| Kept::of(&self.app));
         // The pushed files open as files dropped on the desktop window do: once the window
         // runs, read off its thread with progress and Cancel, each failure said in the window.

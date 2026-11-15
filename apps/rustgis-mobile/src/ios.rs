@@ -40,6 +40,10 @@ use std::sync::{Arc, Mutex};
 /// Android. Past it the oldest go, and how many is said ([`crate::Queue`]).
 const MOST_POSITIONS: usize = 200_000;
 
+/// How long a picker presented may show neither as presented nor as being presented before it
+/// is taken for declined: UIKit starts a presentation on a later turn of the run loop.
+const PRESENTING: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// What the delegates report, until the next frame takes it.
 struct Shared {
     events: Mutex<crate::Queue>,
@@ -148,7 +152,15 @@ impl PickerDelegate {
         let ivars = self.ivars();
         let shared = ivars.shared.clone();
         match ivars.asked.borrow_mut().take() {
-            // Answered already.
+            // Answered already, or taken for declined (`check_presented`) and shown after all: files
+            // chosen then aren't opened, which is said.
+            None if !urls.is_empty() => {
+                shared.failed(i18n::fmt(
+                    "The picker answered after it was taken for not shown: nothing was opened or saved. Try again.",
+                    &[],
+                ));
+                wake(self.mtm());
+            }
             None => {}
             Some(Asked::Save { name, temporary }) => {
                 if urls.is_empty() {
@@ -310,10 +322,12 @@ fn safe_name(name: &str) -> String {
     }
 }
 
-/// Removes `path` and its folder once that is empty.
+/// Removes `path`, and its folders once they are empty.
 fn remove_with_folder(path: &Path) {
     let _ = std::fs::remove_file(path);
-    if let Some(folder) = path.parent() {
+    // Its folder and the one above (a pick's folder for its source folders), each only while
+    // empty.
+    for folder in path.ancestors().skip(1).take(2) {
         let _ = std::fs::remove_dir(folder);
     }
 }
@@ -598,6 +612,61 @@ fn attach_window() {
         window.makeKeyAndVisible();
     }
     fill_screen(&window);
+    match window.rootViewController().and_then(|controller| controller.view()) {
+        Some(view) => take_return(&view),
+        // winit makes its view controller with the window, so this shouldn't happen: said in the
+        // log, as Return then does nothing for the session.
+        None => log::warn!("winit's window has no view yet: the soft keyboard's Return won't reach the form"),
+    }
+}
+
+/// The name of [`take_return`]'s class.
+const RETURN_KEY: &std::ffi::CStr = c"RustGISKeyView";
+
+thread_local! {
+    /// Whether the soft keyboard's Return was pressed since the shell last asked
+    /// ([`Ios::take_return`]).
+    static RETURNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes the soft keyboard's Return reach egui, by making winit's view an instance of a
+/// subclass of winit's whose `insertText:` keeps a Return for the shell ([`RETURNED`]) and
+/// passes everything else on. winit 0.30 hands Return on as the character `"\n"`, which egui
+/// takes for no key at all: a field then couldn't be left with Return. As Enter, it does what
+/// each field does with Enter.
+fn take_return(view: &objc2_ui_kit::UIView) {
+    use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
+    if view.class().name() == RETURN_KEY {
+        return;
+    }
+    extern "C-unwind" fn insert_text(this: &AnyObject, _cmd: Sel, text: &NSString) {
+        if text.to_string() == "\n" {
+            RETURNED.with(|r| r.set(true));
+            if let Some(mtm) = MainThreadMarker::new() {
+                wake(mtm);
+            }
+            return;
+        }
+        let Some(winit) = this.class().superclass() else {
+            // A subclass always has one: said in the log should it not, as the text is dropped.
+            log::warn!("typed text was dropped: winit's view has no superclass");
+            return;
+        };
+        // SAFETY: `this` is winit's view (the class is only given to it), whose class is the
+        // superclass here; its `insertText:` takes the text.
+        unsafe { msg_send![super(this, winit), insertText: text] }
+    }
+    let class = AnyClass::get(RETURN_KEY).or_else(|| {
+        let mut builder = ClassBuilder::new(RETURN_KEY, view.class())?;
+        // SAFETY: the method has the signature UIKeyInput's `insertText:` has.
+        unsafe { builder.add_method(sel!(insertText:), insert_text as extern "C-unwind" fn(_, _, _)) };
+        Some(builder.register())
+    });
+    if let Some(class) = class {
+        // SAFETY: the new class is a subclass of the view's own, with no instance variables of
+        // its own, so the view is a valid instance of it.
+        unsafe { objc2::ffi::object_setClass((view as *const objc2_ui_kit::UIView).cast_mut().cast(), class) };
+    }
 }
 
 /// The name of [`fill_screen`]'s class.
@@ -732,6 +801,10 @@ pub struct Ios {
     keyboard: Retained<KeyboardObserver>,
     /// A file to save being written, until its export picker shows.
     saving: RefCell<Option<Saving>>,
+    /// The picker last presented, and when, until it is seen shown or declined
+    /// ([`Ios::check_presented`]).
+    /// With whether it is the camera.
+    presenting: RefCell<Option<(Retained<UIViewController>, std::time::Instant, bool)>>,
 }
 
 /// Whether a file to save is written: `None` while it is being written.
@@ -774,6 +847,7 @@ impl Ios {
             located,
             keyboard: KeyboardObserver::new(mtm),
             saving: RefCell::new(None),
+            presenting: RefCell::new(None),
         }
     }
 
@@ -805,29 +879,60 @@ impl Ios {
         let delegate = PickerDelegate::new(self.mtm, self.shared.clone(), self.folders.clone(), Asked::Save { name, temporary });
         picker.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         self.picker.replace(Some(delegate));
-        if let Err(error) = self.present(&presenter, &picker) {
-            // Not shown: its delegate will never answer, so the file goes now.
-            if let Some(Asked::Save { name, temporary }) =
-                self.picker.borrow().as_ref().and_then(|delegate| delegate.ivars().asked.borrow_mut().take())
-            {
+        // Declined, it is seen on a later frame ([`Ios::check_presented`]).
+        let _ = self.present(&presenter, &picker, false);
+    }
+
+    /// Shows `picker` over `presenter`, counted as showing until it answers. UIKit declines a
+    /// presentation (another under way, a presenter leaving the window) with only a log line, and
+    /// then no delegate ever answers: counted, it would hold back every later picker until the app
+    /// is started again. UIKit starts a presentation on a later turn of the run loop, so whether
+    /// it was declined is seen on the frames after ([`Ios::check_presented`]).
+    fn present(&self, presenter: &UIViewController, picker: &UIViewController, camera: bool) -> Result<(), String> {
+        count(&self.shared.showing, true);
+        presenter.presentViewController_animated_completion(picker, true, None);
+        self.presenting.replace(Some((picker.retain(), std::time::Instant::now(), camera)));
+        Ok(())
+    }
+
+    /// Looks, each frame, at the picker last presented: shown (it has a presenting controller),
+    /// it is let go; neither shown nor being shown a while after, UIKit declined it, so it is
+    /// uncounted and said (a file waiting to be saved is removed).
+    fn check_presented(&self) {
+        let (declined, camera) = match self.presenting.borrow().as_ref() {
+            None => return,
+            Some((picker, _, _)) if picker.presentingViewController().is_some() => (false, false),
+            Some((picker, at, _)) if picker.isBeingPresented() || at.elapsed() < PRESENTING => return,
+            Some((_, _, camera)) => (true, *camera),
+        };
+        self.presenting.replace(None);
+        if !declined {
+            return;
+        }
+        count(&self.shared.showing, false);
+        let error = i18n::fmt("The picker couldn't be shown just now: try again.", &[]);
+        // The camera's answer is none: as when it is cancelled, so the shell lets go of the photo
+        // it was waiting for.
+        if camera {
+            if let Some(delegate) = self.camera.borrow().as_ref() {
+                delegate.ivars().answered.set(true);
+            }
+            self.shared.failed(error);
+            self.shared.add(Event::Cancelled);
+            return;
+        }
+        match self.picker.borrow().as_ref().and_then(|delegate| delegate.ivars().asked.borrow_mut().take()) {
+            Some(Asked::Save { name, temporary }) => {
                 remove_with_folder(&temporary);
                 self.shared.failed(i18n::fmt("{name} wasn't saved: {error}", &[("name", &name), ("error", &error)]));
             }
+            // A request for files that will get none ends by name.
+            Some(Asked::Open { purpose }) => {
+                self.shared.failed(error);
+                self.shared.add(Event::Ended { purpose });
+            }
+            None => self.shared.failed(error),
         }
-    }
-
-    /// Shows `picker` over `presenter`, counted as showing until it answers; or says why it
-    /// couldn't be. UIKit declines a presentation (another under way, a presenter leaving the
-    /// window) with only a log line, and then no delegate ever answers: counted, it would hold
-    /// back every later picker until the app is started again.
-    fn present(&self, presenter: &UIViewController, picker: &UIViewController) -> Result<(), String> {
-        count(&self.shared.showing, true);
-        presenter.presentViewController_animated_completion(picker, true, None);
-        if picker.presentingViewController().is_none() {
-            count(&self.shared.showing, false);
-            return Err(i18n::fmt("The picker couldn't be shown just now: try again.", &[]));
-        }
-        Ok(())
     }
 
     /// The window's view controller on top, to show a picker over.
@@ -877,7 +982,7 @@ impl Platform for Ios {
             PickerDelegate::new(self.mtm, self.shared.clone(), self.folders.clone(), Asked::Open { purpose: purpose.to_string() });
         picker.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         self.picker.replace(Some(delegate));
-        self.present(&presenter, &picker)
+        self.present(&presenter, &picker, false)
     }
 
     fn save_file(&self, name: &str, bytes: Vec<u8>) -> Result<(), String> {
@@ -952,10 +1057,11 @@ impl Platform for Ios {
         // SAFETY: the delegate conforms to both protocols the picker asks of it.
         unsafe { picker.setDelegate(Some(&delegate)) };
         self.camera.replace(Some(delegate));
-        self.present(&presenter, &picker)
+        self.present(&presenter, &picker, true)
     }
 
     fn take_events(&self) -> Vec<Event> {
+        self.check_presented();
         self.show_export();
         self.shared.events.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
@@ -987,10 +1093,18 @@ impl shell::Phone for Ios {
         }
     }
 
+    fn take_return(&self) -> bool {
+        RETURNED.with(|r| r.replace(false))
+    }
+
     fn busy(&self) -> bool {
         // Not while a picker is merely up (the user may browse for minutes): its answer wakes
         // the window ([`wake`]).
-        self.shared.working() || self.saving.borrow().is_some() || !self.shared.events.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        // A picker just presented is looked at until it shows (`check_presented`).
+        self.shared.working()
+            || self.saving.borrow().is_some()
+            || self.presenting.borrow().is_some()
+            || !self.shared.events.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     fn picking(&self) -> bool {
