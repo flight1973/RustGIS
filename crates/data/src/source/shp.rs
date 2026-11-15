@@ -129,10 +129,17 @@ impl ShpSource {
             Some(c) => Reproject::from_crs(c, &mut notes),
             None => shp_reproject(crate::raster::read_prj(path).as_deref(), &mut notes)?,
         };
-        // A header box with a corner that isn't a number (a shape's NaN or infinity, #1985) is
-        // no extent at all.
+        // The header's box, unless it can't be used: empty, a corner that isn't a number (a shape's
+        // NaN or infinity, #1985), or a file with no records (often 0, 0, 0, 0, which would frame
+        // Null Island). Then the records' own finite boxes, as the index holds them; none, no
+        // extent.
         let finite = [native.min_x, native.min_y, native.max_x, native.max_y].iter().all(|v| v.is_finite());
-        let extent = if native.is_empty() || !finite { Extent::EMPTY } else { reproject.extent_to_lonlat(&native) };
+        let native = if native.is_empty() || !finite || index.count == 0 {
+            index.bounds.map(|[x0, y0, x1, y1]| Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1)))
+        } else {
+            Some(native)
+        };
+        let extent = native.map_or(Extent::EMPTY, |n| reproject.extent_to_lonlat(&n));
         if reproject.is_lonlat()
             && !extent.is_empty()
             && (extent.min_x < -180.5 || extent.max_x > 180.5 || extent.min_y < -90.5 || extent.max_y > 90.5)

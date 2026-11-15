@@ -87,10 +87,7 @@ impl DiskIndex {
                 if b.iter().all(|v| v.is_finite()) && x0 <= x1 && y0 <= y1 {
                     bounds.execute(params![id, x0, x1, y0, y1]).map_err(sql)?;
                     covered += 1;
-                    all_bounds = Some(match all_bounds {
-                        Some([a, b, x, y]) => [a.min(x0), b.min(y0), x.max(x1), y.max(y1)],
-                        None => [x0, y0, x1, y1],
-                    });
+                    union(&mut all_bounds, b);
                 }
                 Ok(())
             })?
@@ -194,6 +191,20 @@ impl DiskIndex {
 pub(super) struct Index {
     storage: Storage,
     pub count: u64,
+    /// The union of the records' finite boxes (rounded outward to f32): `None` when no record has
+    /// one (every shape null, or a coordinate that isn't a number).
+    pub bounds: Option<[f32; 4]>,
+}
+
+/// `b` added to `all`, when it's a finite box.
+fn union(all: &mut Option<[f32; 4]>, b: [f32; 4]) {
+    let [x0, y0, x1, y1] = b;
+    if b.iter().all(|v| v.is_finite()) && x0 <= x1 && y0 <= y1 {
+        *all = Some(match *all {
+            Some([a, b, x, y]) => [a.min(x0), b.min(y0), x.max(x1), y.max(y1)],
+            None => [x0, y0, x1, y1],
+        });
+    }
 }
 enum Storage {
     Disk(DiskIndex),
@@ -202,14 +213,18 @@ enum Storage {
 impl Index {
     pub fn open(path: &Path, len: u64, notes: &mut Vec<String>) -> Result<Self> {
         match DiskIndex::open(path, len, notes) {
-            Ok(disk) => Ok(Self { count: disk.count, storage: Storage::Disk(disk) }),
+            Ok(disk) => Ok(Self { count: disk.count, bounds: disk.bounds, storage: Storage::Disk(disk) }),
             Err(error) => {
-                let (count, note) = scan(path, len, |_, _, _| Ok(()))?;
+                let mut bounds = None;
+                let (count, note) = scan(path, len, |_, _, b| {
+                    union(&mut bounds, b);
+                    Ok(())
+                })?;
                 notes.push(format!("spatial index unavailable ({error}); reading the .shp by scanning record headers"));
                 if !note.is_empty() {
                     notes.push(note);
                 }
-                Ok(Self { count: u64::from(count), storage: Storage::Scan { path: path.to_path_buf(), len } })
+                Ok(Self { count: u64::from(count), bounds, storage: Storage::Scan { path: path.to_path_buf(), len } })
             }
         }
     }

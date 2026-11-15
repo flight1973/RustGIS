@@ -22,6 +22,83 @@ fn dir() -> PathBuf {
 fn write_shapefile(ds: &Dataset, path: &Path) {
     crate::io::write_path(ds, path).unwrap();
 }
+/// A header box with a corner that isn't a number (an infinity, a NaN) can't frame the layer: the
+/// records' own finite boxes do, from the index or from scanning record headers, so a NaN shape
+/// doesn't lose the layer its extent (#1985), and no false "not longitude/latitude" note is given.
+/// A file whose records have no finite box, or that has none at all (a 0, 0, 0, 0 header), has no
+/// extent rather than Null Island. A clean header is used as it is.
+#[test]
+fn a_header_box_that_isnt_a_number_falls_back_to_the_records() {
+    let folder = dir();
+    let write = |name: &str, points: &[Option<(f64, f64)>]| {
+        let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+        for p in points {
+            ds.push(p.map(|(x, y)| Geometry::Point(Coord::new(x, y))), vec![]);
+        }
+        let path = folder.join(name);
+        write_shapefile(&ds, &path);
+        path
+    };
+    // Little-endian f64s: the header's box at 36, 44, 52, 60; the first record's point x at 112.
+    let patch = |path: &Path, at: usize, v: f64| {
+        let mut b = std::fs::read(path).unwrap();
+        b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        std::fs::write(path, b).unwrap();
+    };
+    let three = [Some((10.0, 20.0)), Some((11.0, 21.0)), Some((12.0, 22.0))];
+    let lonlat_note = |s: &ShpSource| s.info().notes.iter().any(|n| n.contains("not longitude/latitude"));
+    // The index's union of record boxes; the scan fallback gathers the same boxes with the same
+    // `union` when no cache folder can be written.
+    {
+        let indexed = true;
+        cache::with_index_dir(folder.join("cache"), || {
+            let open = |p: &Path| {
+                let s = ShpSource::open_path(p, "pts").unwrap();
+                assert_eq!(s.info().indexed, indexed);
+                s
+            };
+            let whole = Extent::new(10.0, 20.0, 12.0, 22.0);
+            let clean = open(&write(&format!("clean-{indexed}.shp"), &three));
+            assert_eq!(clean.info().extent, whole, "a clean header is used as it is");
+            assert!(!lonlat_note(&clean));
+            for (k, (at, v)) in [(44, f64::INFINITY), (52, f64::NEG_INFINITY), (60, f64::NAN)].into_iter().enumerate() {
+                let p = write(&format!("corner-{indexed}-{k}.shp"), &three);
+                patch(&p, at, v);
+                let s = open(&p);
+                assert_eq!(s.info().extent, whole, "corner at {at}: the records' boxes");
+                assert!(!lonlat_note(&s), "corner at {at}: {:?}", s.info().notes);
+            }
+            // A NaN shape and the box its writer made from it: the other shapes frame the layer.
+            let p = write(&format!("nan-shape-{indexed}.shp"), &three);
+            patch(&p, 112, f64::NAN);
+            patch(&p, 36, f64::NAN);
+            assert_eq!(open(&p).info().extent, Extent::new(11.0, 21.0, 12.0, 22.0));
+            // Nothing with a finite box: no extent, not Null Island. Every record made null (its
+            // shape type, at 108 + 28 per record, set to 0) under a box that isn't a number:
+            let p = write(&format!("null-{indexed}.shp"), &three);
+            let mut b = std::fs::read(&p).unwrap();
+            for at in [108, 136, 164] {
+                b[at..at + 4].copy_from_slice(&0i32.to_le_bytes());
+            }
+            b[52..60].copy_from_slice(&f64::INFINITY.to_le_bytes());
+            std::fs::write(&p, b).unwrap();
+            assert!(open(&p).info().extent.is_empty());
+            // A file of no records, its header box 0, 0, 0, 0 (its length, at 24, in 16-bit words).
+            let p = write(&format!("empty-{indexed}.shp"), &three);
+            for file in [p.clone(), p.with_extension("shx")] {
+                let mut b = std::fs::read(&file).unwrap();
+                b.truncate(100);
+                b[24..28].copy_from_slice(&50i32.to_be_bytes());
+                b[36..68].fill(0);
+                std::fs::write(&file, b).unwrap();
+            }
+            let s = open(&p);
+            assert_eq!(s.info().count, Some(0));
+            assert!(s.info().extent.is_empty(), "{:?}", s.info().extent);
+        });
+    }
+    std::fs::remove_dir_all(folder).unwrap();
+}
 fn points_shapefile(path: &Path) {
     let mut ds = Dataset::new("grid", GeometryType::Point, vec![]);
     for x in 0..30 {
