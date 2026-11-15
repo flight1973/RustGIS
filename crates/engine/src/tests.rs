@@ -48388,6 +48388,25 @@ fn a_shapefile_coordinate_that_isnt_a_number_reaches_no_layer() {
     }
 }
 
+#[test]
+fn plugin_installs_are_refused_with_the_reason_where_they_cant_be() {
+    let mut s = Session::new(Project::default());
+    rustgis_plugins::refuse_installs_on_this_thread(true);
+    // The registry isn't fetched (no network here) and nothing is read: each says why.
+    let refused: Vec<Result<Value, String>> = [
+        ("plugin.registry", json!({})),
+        ("plugin.installFromRegistry", json!({"id": "vector-toolkit"})),
+        ("plugin.install", json!({"path": "no-such.rgplugin"})),
+    ]
+    .iter()
+    .map(|(id, p)| s.run(id, p))
+    .collect();
+    rustgis_plugins::refuse_installs_on_this_thread(false);
+    for r in refused {
+        assert!(r.as_ref().is_err_and(|e| e.contains(rustgis_plugins::NOT_INSTALLED_HERE)), "{r:?}");
+    }
+}
+
 /// Column inspection rejects the same invalid gzip encoding as import, on disk and upload.
 #[test]
 fn gzip_columns_require_utf8() {

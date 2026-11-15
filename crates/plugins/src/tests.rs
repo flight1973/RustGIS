@@ -599,6 +599,20 @@ fn versions_and_translations() {
     m.i18n.insert("zh-CN".into(), [("Hello".to_string(), "你好".to_string())].into());
     assert_eq!(m.translate("zh", "Hello"), "你好");
     assert_eq!(m.translate("zh-TW", "Hello"), "哈囉");
+    // The interface's `zh-tw` matches `zh-TW`, and a Hong Kong or `zh-Hant` interface finds
+    // the plugin's Traditional text.
+    assert_eq!(m.translate("zh-tw", "Hello"), "哈囉");
+    assert_eq!(m.translate("zh-Hant", "Hello"), "哈囉");
+    // Chinese falls back only within its script: English, never the other script's text.
+    let mut simplified_only = Manifest::parse(&testing::manifest("tr", &[])).unwrap();
+    simplified_only.i18n.insert("zh".into(), [("Hello".to_string(), "你好".to_string())].into());
+    simplified_only.i18n.insert("zh-CN".into(), [("Bye".to_string(), "再见".to_string())].into());
+    assert_eq!(simplified_only.translate("zh-tw", "Hello"), "Hello");
+    assert_eq!(simplified_only.translate("zh-tw", "Bye"), "Bye");
+    assert_eq!(simplified_only.translate("zh-Hans-TW", "Hello"), "你好");
+    let mut traditional_only = Manifest::parse(&testing::manifest("tr", &[])).unwrap();
+    traditional_only.i18n.insert("zh-TW".into(), [("Hello".to_string(), "哈囉".to_string())].into());
+    assert_eq!(traditional_only.translate("zh", "Hello"), "Hello");
     // Loaded plugins translate for the interface (tool names, parameters), by language.
     load("unit-i18n", &[]);
     assert_eq!(crate::translate("de", "Hello").as_deref(), Some("Hallo"));
@@ -2928,4 +2942,23 @@ fn plugin_settings_are_erased_only_by_uninstalling() {
     crate::store::uninstall("settings-store").unwrap();
     assert!(!file.exists() && crate::get("settings-store").is_none());
     let _ = std::fs::remove_dir_all(&plugins);
+}
+
+#[test]
+fn installing_is_refused_with_the_reason_where_plugins_cant_be_installed() {
+    assert_eq!(crate::allowed(true), Ok(()));
+    let refused = crate::allowed(false);
+    assert_eq!(refused, Err(crate::NOT_INSTALLED_HERE.to_string()));
+    assert!(crate::NOT_INSTALLED_HERE.contains("iOS"));
+    // Where plugins can be installed, installing goes on to read the package.
+    if crate::INSTALLS {
+        assert!(crate::store::install_bytes(b"not a package").is_err_and(|e| e != crate::NOT_INSTALLED_HERE));
+    }
+    // Refused as on iOS: both ways in say why before reading anything.
+    crate::refuse_installs_on_this_thread(true);
+    let bytes = crate::store::install_bytes(b"not a package").err();
+    let path = crate::store::install_path(std::path::Path::new("no-such.rgplugin")).err();
+    crate::refuse_installs_on_this_thread(false);
+    assert_eq!(bytes.as_deref(), Some(crate::NOT_INSTALLED_HERE));
+    assert_eq!(path.as_deref(), Some(crate::NOT_INSTALLED_HERE));
 }

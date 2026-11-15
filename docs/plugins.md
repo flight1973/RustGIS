@@ -43,6 +43,11 @@ is gone or has changed), the web app says so once and lists it on the **Installe
 loaded*, with why. **Retry** downloads a plugin from the registry again; **Remove** forgets it, so
 the web app stops trying at start. A plugin that fails to load is never forgotten on its own.
 
+The iOS app installs no plugins, from the registry or from a file, and doesn't fetch the
+registry: Apple's App Review doesn't let an app download code that adds to what it does
+(guideline 2.5.2), and a plugin is such code. The **Browse** tab says so, and so does any way of
+installing one.
+
 On the command line:
 
 ```sh
@@ -293,8 +298,10 @@ English strings and their translations, written exactly as they appear in `plugi
   and toolboxes, parameter labels and `choice` values, the tab, group and menu labels, and the
   panel's title, help and widget labels. A string with no translation shows in English.
 - Alongside English (`en`), RustGIS's interface languages are `de`, `es`, `fr`, `it`, `nl`,
-  `pt`, `ru`, `tr`, `az`, `id`, `vi`, `fa`, `zh`, `ja`, `ko` and `ka`. A code with a region
-  matches its language: `zh-CN` serves `zh`.
+  `pt`, `ru`, `tr`, `az`, `id`, `vi`, `fa`, `zh`, `zh-tw`, `ja`, `ko` and `ka`. A code with a
+  region matches its language: `zh-CN` serves `zh`. Chinese matches only within its script: a
+  plugin's `zh-TW` or `zh-Hant` text serves `zh-tw`, and a Traditional interface shows English
+  rather than a plugin's Simplified text (and the other way round).
 - The registry copies the name and description translations into `registry.json`, so the
   Plugin Manager lists plugins in the interface language before they are installed.
 - Messages a plugin builds while it runs can follow the interface language too: every request
