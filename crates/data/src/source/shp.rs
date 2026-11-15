@@ -210,6 +210,12 @@ impl FeatureSource for ShpSource {
                 return Ok(());
             }
             let geometry = match parse_shape(&buf) {
+                // A coordinate that isn't a number (NaN or infinite) has no place: the record is
+                // left out and counted, as one that can't be converted (#1985).
+                Ok(Some(g)) if !g.is_finite() => {
+                    skipped += 1;
+                    return Ok(());
+                }
                 Ok(Some(g)) => match self.reproject.geometry(g) {
                     Some(g) => Some(g),
                     None => {
@@ -302,6 +308,12 @@ impl FeatureSource for ShpSource {
                 return Ok(());
             }
             let geometry = match parse_shape(&buf) {
+                // A coordinate that isn't a number (NaN or infinite) has no place: the record is
+                // left out and counted, as one that can't be converted (#1985).
+                Ok(Some(g)) if !g.is_finite() => {
+                    skipped += 1;
+                    return Ok(());
+                }
                 Ok(Some(g)) => match self.reproject.geometry(g) {
                     Some(g) => Some(g),
                     None => {

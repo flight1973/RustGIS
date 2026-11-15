@@ -821,10 +821,9 @@ impl Reproject {
         self.crs.custom_def().map(|d| d.proj4.clone()).unwrap_or_else(|| self.label())
     }
 
-    /// The geometry in longitude/latitude; `None` when a coordinate can't be converted, or isn't a
-    /// number to begin with (NaN or infinite, #1985), as when it's already longitude/latitude.
+    /// The geometry in longitude/latitude; `None` when a coordinate can't be converted.
     pub(crate) fn geometry(&self, g: Geometry) -> Option<Geometry> {
-        let Some(t) = &self.t else { return g.is_finite().then_some(g) };
+        let Some(t) = &self.t else { return Some(g) };
         let mut ok = true;
         let out = g.map_coords(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
         out.for_each_coord(|c| ok &= c.is_finite());

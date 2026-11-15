@@ -47847,7 +47847,7 @@ fn a_save_refuses_coordinates_that_arent_numbers_and_keeps_the_file() {
     layer.touch_geometry();
     for ((cmd, file), was) in saves.iter().zip(&before) {
         let e = s.run(cmd, &json!({"path": path(file)})).unwrap_err();
-        assert!(e.contains("2 feature(s) in 'ways' have a coordinate that isn't a number"), "{cmd}: {e}");
+        assert!(e.contains("2 feature(s) in 'ways' (rows 2, 3) have a coordinate that isn't a number"), "{cmd}: {e}");
         assert_eq!(&std::fs::read(path(file)).unwrap(), was, "{cmd} kept the file as it was");
     }
     // Their geometry gone, the features save and open again.

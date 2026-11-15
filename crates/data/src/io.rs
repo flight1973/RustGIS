@@ -5134,8 +5134,8 @@ mod tests {
     #[test]
     fn shapefile_coordinates_that_arent_numbers_are_left_out_and_said() {
         use shapefile::dbase::{FieldValue, Record, TableWriterBuilder};
-        let dir = std::env::temp_dir().join(format!("rustgis-shp-nan-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         let write = |name: &str, points: &[(f64, f64)]| {
             let shp = dir.join(name);
             let table = TableWriterBuilder::new().add_character_field("name".try_into().unwrap(), 10);
@@ -5182,7 +5182,6 @@ mod tests {
         let clean = write("clean.shp", &[(10.0, 20.0)]);
         let (_, rep) = read_path(&clean).unwrap();
         assert!(!said(&rep.messages), "{:?}", rep.messages);
-        std::fs::remove_dir_all(&dir).ok();
     }
     /// An ESRI .prj without an authority retains the national datum shift (issue #807).
     #[cfg(not(target_arch = "wasm32"))]
