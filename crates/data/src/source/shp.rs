@@ -129,16 +129,27 @@ impl ShpSource {
             Some(c) => Reproject::from_crs(c, &mut notes),
             None => shp_reproject(crate::raster::read_prj(path).as_deref(), &mut notes)?,
         };
-        // The header's box, unless it can't be used: empty, a corner that isn't a number (a shape's
-        // NaN or infinity, #1985), or a file with no records (often 0, 0, 0, 0, which would frame
-        // Null Island). Then the records' own finite boxes, as the index holds them; none, no
-        // extent.
-        let finite = [native.min_x, native.min_y, native.max_x, native.max_y].iter().all(|v| v.is_finite());
-        let native = if native.is_empty() || !finite || index.count == 0 {
-            index.bounds.map(|[x0, y0, x1, y1]| Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1)))
-        } else {
-            Some(native)
-        };
+        // The records' own boxes frame the layer, as the index holds them (rounded outward to f32);
+        // with none (no records, or every shape null or not a number) it has no extent, never the
+        // 0, 0, 0, 0 a header often holds then (Null Island). The header's box, exact, stands for
+        // them when it frames them all; one that doesn't (a corner that isn't a number, #1985, or
+        // stale after records were added) is set aside, and said.
+        let records = index.bounds.map(|[x0, y0, x1, y1]| Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1)));
+        let native = records.map(|r| {
+            // Within the f32 rounding of the records' boxes.
+            let slack = |v: f64| 1e-6 * v.abs().max(1.0);
+            let frames = [native.min_x, native.min_y, native.max_x, native.max_y].iter().all(|v| v.is_finite())
+                && native.min_x <= r.min_x + slack(r.min_x)
+                && native.min_y <= r.min_y + slack(r.min_y)
+                && native.max_x >= r.max_x - slack(r.max_x)
+                && native.max_y >= r.max_y - slack(r.max_y);
+            if frames {
+                native
+            } else {
+                notes.push("the .shp header's bounding box doesn't frame its shapes: the layer's extent is taken from the shapes".into());
+                r
+            }
+        });
         let extent = native.map_or(Extent::EMPTY, |n| reproject.extent_to_lonlat(&n));
         if reproject.is_lonlat()
             && !extent.is_empty()

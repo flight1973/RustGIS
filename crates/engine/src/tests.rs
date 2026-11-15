@@ -50711,14 +50711,15 @@ fn a_save_refuses_coordinates_that_arent_numbers_and_keeps_the_file() {
     layer.dataset.push(Some(Geometry::Point(Coord::new(f64::INFINITY, 0.0))), vec![]);
     // Ids that aren't their rows (2 and 3), as after deletions: they're named by id, as the
     // attribute table shows them.
+    assert_eq!(layer.dataset.features.len(), 3);
     layer.dataset.features = layer
         .dataset
         .features
         .iter()
-        .enumerate()
-        .map(|(i, f)| {
+        .zip([1, 20, 30])
+        .map(|(f, id)| {
             let mut f = f.clone();
-            f.id = [1, 20, 30][i];
+            f.id = id;
             f
         })
         .collect();
