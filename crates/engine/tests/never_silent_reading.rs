@@ -155,7 +155,7 @@ fn cases() -> Vec<Case> {
             "a.topojson",
             topo_nested(""),
             topo_nested(r#",{"type":"LineString","arcs":[9]}"#),
-            Said("member of a geometry collection"),
+            Said("geometry couldn't be read"),
         ),
         // CSV.
         case(
