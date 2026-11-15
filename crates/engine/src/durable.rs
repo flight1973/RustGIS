@@ -286,18 +286,17 @@ impl<'a> Prepare<'a> {
     pub(crate) fn count_numbers(&mut self, dataset: &rustgis_data::Dataset) {
         let unsaved = dataset.unsaved_coordinates();
         if unsaved > 0 && self.refusal.is_none() {
-            // The first few by row number (from 1), so they can be found: such a feature isn't one
-            // without geometry, which a filter would find.
+            // The first few by feature id, as the attribute table shows them, so they can be
+            // found: such a feature isn't one without geometry, which a filter would find.
             let rows: Vec<String> = dataset
                 .features
                 .iter()
-                .enumerate()
-                .filter(|(_, f)| f.geometry.as_ref().is_some_and(|g| !g.is_finite()))
+                .filter(|f| f.geometry.as_ref().is_some_and(|g| !g.is_finite()))
                 .take(3)
-                .map(|(i, _)| (i + 1).to_string())
+                .map(|f| f.id.to_string())
                 .collect();
             let more = if unsaved > rows.len() { ", …" } else { "" };
-            let word = if unsaved == 1 { "row" } else { "rows" };
+            let word = if unsaved == 1 { "id" } else { "ids" };
             self.refusal = Some(format!(
                 "not saved: {unsaved} feature(s) in '{}' ({word} {}{more}) have a coordinate that isn't a number (NaN or infinite), which the saved file couldn't hold or be opened again with; delete or redraw their geometry first",
                 crate::project::short_name(&dataset.name),
