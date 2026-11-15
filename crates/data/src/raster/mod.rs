@@ -940,70 +940,7 @@ impl Raster {
 
     /// Longitude/latitude bounds, from points along the grid's edges.
     fn compute_extent(&self) -> Extent {
-        let mut e = Extent::EMPTY;
-        let (w, h) = (self.width as f64, self.height as f64);
-        let steps = 32;
-        let mut add = |col: f64, row: f64| {
-            if let Some(c) = self.transformer.to_lonlat_for_extent(self.transform.to_world(col, row)) {
-                e.expand(Coord::new(c.x, c.y.clamp(-90.0, 90.0)));
-            }
-        };
-        for i in 0..=steps {
-            let t = i as f64 / steps as f64;
-            for (col, row) in [(t * w, 0.0), (t * w, h), (0.0, t * h), (w, t * h)] {
-                add(col, row);
-            }
-        }
-        // Interior points too: in polar and other projections the grid can reach further than its
-        // edges do. (A raster crossing the antimeridian still gets a world-wide extent.)
-        let n = 16;
-        for i in 1..n {
-            for j in 1..n {
-                add(w * i as f64 / n as f64, h * j as f64 / n as f64);
-            }
-        }
-        // Normalize the transformed range as a whole, retaining its winding: a range crossing
-        // the antimeridian needs world-wide bounds to include both strips in a single Extent.
-        // A native full turn remains world-wide even if a datum shift contracts its samples.
-        if !e.is_empty() && self.transformer.is_geographic() && w * self.transform.pixel_width.abs() >= 360.0 {
-            (e.min_x, e.max_x) = (-180.0, 180.0);
-        } else if !e.is_empty() && (e.min_x < -180.0 || e.max_x > 180.0) {
-            let shift = 360.0 * ((e.min_x + 180.0) / 360.0).floor();
-            let (lo, hi) = (e.min_x - shift, e.max_x - shift);
-            (e.min_x, e.max_x) = if lo >= -180.0 && hi <= 180.0 { (lo, hi) } else { (-180.0, 180.0) };
-        }
-        // A whole world in Natural Earth, Winkel Tripel or Eckert IV reaches the antimeridian and the
-        // poles at its outline's edge, which samples miss when the grid's edges are a little past
-        // it (its corners are off the outline): whatever of them is in the grid is in its extent
-        // (#1701).
-        if let Some(centre) = self.transformer.world_central_meridian().filter(|_| !e.is_empty()) {
-            let inside = |lon: f64, lat: f64| {
-                self.transformer.from_lonlat(Coord::new(lon, lat)).is_some_and(|m| {
-                    let (col, row) = self.transform.to_pixel(m);
-                    (-1e-6..=w + 1e-6).contains(&col) && (-1e-6..=h + 1e-6).contains(&row)
-                })
-            };
-            let along = |i: usize| -180.0 + 360.0 * i as f64 / steps as f64;
-            if (0..=steps).any(|i| inside(180.0, along(i) / 2.0)) {
-                e.max_x = 180.0;
-            }
-            if (0..=steps).any(|i| inside(-180.0, along(i) / 2.0)) {
-                e.min_x = -180.0;
-            }
-            if (0..=steps).any(|i| inside(along(i), 90.0)) {
-                e.max_y = 90.0;
-            }
-            if (0..=steps).any(|i| inside(along(i), -90.0)) {
-                e.min_y = -90.0;
-            }
-            // Centred elsewhere than on 0°, the outline's edges are another meridian than the
-            // antimeridian: the one opposite its centre, on either side of it.
-            let edge = (centre + 360.0).rem_euclid(360.0) - 180.0;
-            if edge.abs() < 180.0 - 1e-6 && (0..=steps).any(|i| [-1e-9, 1e-9].iter().any(|d| inside(edge + d, along(i) / 2.0))) {
-                (e.min_x, e.max_x) = (e.min_x.min(edge), e.max_x.max(edge));
-            }
-        }
-        e
+        extent_of(&self.transform, &self.transformer, self.width, self.height)
     }
 
     /// Refuses a raster with no coordinates, for the tools that would give their result a place
@@ -1076,36 +1013,10 @@ impl Raster {
         if self.georeferenced {
             return Err((Box::new(self), "only a raster with no coordinates can be placed".into()));
         }
-        let transformer = match crs.transformer() {
-            Ok(t) => t,
-            Err(e) => return Err((Box::new(self), e)),
+        let (affine, transformer) = match world_placement(wf, crs, self.width, self.height, self.file_pixels()) {
+            Ok(placed) => placed,
+            Err(why) => return Err((Box::new(self), why)),
         };
-        let (sx, sy) = self.file_pixels();
-        let [x0, xc, xr, y0, yc, yr] = wf.affine();
-        let affine = [x0, xc * sx, xr * sy, y0, yc * sx, yr * sy];
-        // Where it would lie, checked on the box of its corners before anything changes.
-        let (fw, fh) = (f64::from(self.width), f64::from(self.height));
-        let corners = [(0.0, 0.0), (fw, 0.0), (0.0, fh), (fw, fh)]
-            .map(|(c, r)| (affine[0] + c * affine[1] + r * affine[2], affine[3] + c * affine[4] + r * affine[5]));
-        let (min_x, max_x) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), (x, _)| (a.min(*x), b.max(*x)));
-        let (min_y, max_y) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), (_, y)| (a.min(*y), b.max(*y)));
-        let boxed = GeoTransform {
-            origin_x: min_x,
-            origin_y: max_y,
-            pixel_width: (max_x - min_x) / fw.max(1.0),
-            pixel_height: -(max_y - min_y) / fh.max(1.0),
-        };
-        let before = (self.transform, std::mem::replace(&mut self.transformer, transformer.clone()));
-        self.transform = boxed;
-        let extent = self.compute_extent();
-        (self.transform, self.transformer) = before;
-        // In a geographic system, corners past the poles or at longitudes no wrapping explains are
-        // numbers in another system than the .prj says (UTM meters with a longitude/latitude
-        // .prj). The extent can't show it: it clamps latitudes and wraps longitudes.
-        let on_earth = !transformer.is_geographic() || (min_y >= -90.5 && max_y <= 90.5 && min_x >= -540.0 && max_x <= 540.0);
-        if !boxed.is_valid() || extent.is_empty() || !on_earth {
-            return Err((Box::new(self), format!("it places the picture nowhere it can be drawn in {}", crs.label())));
-        }
         let mut r = if wf.is_north_up() {
             self.transform = GeoTransform { origin_x: affine[0], origin_y: affine[3], pixel_width: affine[1], pixel_height: affine[5] };
             self.crs = crs;
@@ -1246,11 +1157,12 @@ pub fn read_path(path: &Path) -> Result<Raster> {
     read_path_placing(path, true)
 }
 
-/// [`read_path`] without the world file beside a picture: the picture as the file holds it, for
-/// one opened as a scan (`"as": "scan"`, or a project's scan reopened), so a world file that is
-/// there, or turns up later, doesn't place or resample it.
-pub fn read_path_unplaced(path: &Path) -> Result<Raster> {
-    read_path_placing(path, false)
+/// [`read_path_with`] without the world file beside a picture: the picture as the file holds it,
+/// for one opened as a scan (`"as": "scan"`, or a layer laid over a placement reopened), so a
+/// world file that is there, or turns up later, doesn't place or resample it. A GDAL file's
+/// `subdataset` and `crs`, a Zarr store's variable, are read as [`read_path_with`] reads them.
+pub fn read_path_unplaced(path: &Path, subdataset: Option<&str>, crs: Option<&str>) -> Result<Raster> {
+    read_path_with_placing(path, subdataset, crs, false)
 }
 
 /// [`read_path`], applying a picture's world file when `world` is true.
@@ -1401,12 +1313,6 @@ fn world_file_agrees(r: &Raster, wf: &world::WorldFile) -> bool {
 /// them.
 pub fn read_path_with(path: &Path, subdataset: Option<&str>, crs: Option<&str>) -> Result<Raster> {
     read_path_with_placing(path, subdataset, crs, true)
-}
-
-/// [`read_path_with`] without the world file beside a picture ([`read_path_unplaced`]): a layer
-/// laid over a placement, read again as it was added.
-pub fn read_path_with_unplaced(path: &Path, subdataset: Option<&str>, crs: Option<&str>) -> Result<Raster> {
-    read_path_with_placing(path, subdataset, crs, false)
 }
 
 fn read_path_with_placing(path: &Path, subdataset: Option<&str>, crs: Option<&str>, world: bool) -> Result<Raster> {
@@ -1740,15 +1646,42 @@ fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
 /// and in a geographic system lie within the poles and at longitudes wrapping explains (the
 /// check [`Raster::placed_by_world_file`] makes, on the corners alone, without the pixels).
 pub(crate) fn lands_on_earth(wf: &world::WorldFile, crs: Crs, w: u32, h: u32) -> bool {
-    let Ok(transformer) = crs.transformer() else { return false };
+    world_placement(wf, crs, w, h, (1.0, 1.0)).is_ok()
+}
+
+/// Where a world file lays a `w` × `h` picture whose pixels each span `(sx, sy)` of the file's, in
+/// `crs`: the affine of those pixels' corners (GDAL's order) and the system's transformer, or why
+/// it lays the picture nowhere it can be drawn. Checked on the box of its corners, before any
+/// pixel moves: the grid over it must be valid with an extent, and in a geographic system its
+/// corners within the poles and at longitudes wrapping explains, since the extent clamps
+/// latitudes and wraps longitudes and can't show numbers in another system (UTM meters with a
+/// longitude/latitude .prj).
+fn world_placement(
+    wf: &world::WorldFile,
+    crs: Crs,
+    w: u32,
+    h: u32,
+    (sx, sy): (f64, f64),
+) -> std::result::Result<([f64; 6], Transformer), String> {
+    let transformer = crs.transformer()?;
     let [x0, xc, xr, y0, yc, yr] = wf.affine();
+    let affine = [x0, xc * sx, xr * sy, y0, yc * sx, yr * sy];
     let (fw, fh) = (f64::from(w), f64::from(h));
-    let corners = [(0.0, 0.0), (fw, 0.0), (0.0, fh), (fw, fh)].map(|(c, r)| Coord::new(x0 + c * xc + r * xr, y0 + c * yc + r * yr));
-    if transformer.is_geographic() {
-        corners.iter().all(|p| (-90.5..=90.5).contains(&p.y) && (-540.0..=540.0).contains(&p.x))
-    } else {
-        corners.iter().all(|p| transformer.to_lonlat_for_extent(*p).is_some_and(|q| q.x.is_finite() && q.y.is_finite()))
+    let corners = [(0.0, 0.0), (fw, 0.0), (0.0, fh), (fw, fh)]
+        .map(|(c, r)| (affine[0] + c * affine[1] + r * affine[2], affine[3] + c * affine[4] + r * affine[5]));
+    let (min_x, max_x) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), (x, _)| (a.min(*x), b.max(*x)));
+    let (min_y, max_y) = corners.iter().fold((f64::MAX, f64::MIN), |(a, b), (_, y)| (a.min(*y), b.max(*y)));
+    let boxed = GeoTransform {
+        origin_x: min_x,
+        origin_y: max_y,
+        pixel_width: (max_x - min_x) / fw.max(1.0),
+        pixel_height: -(max_y - min_y) / fh.max(1.0),
+    };
+    let on_earth = !transformer.is_geographic() || (min_y >= -90.5 && max_y <= 90.5 && min_x >= -540.0 && max_x <= 540.0);
+    if !boxed.is_valid() || !on_earth || extent_of(&boxed, &transformer, w, h).is_empty() {
+        return Err(format!("it places the picture nowhere it can be drawn in {}", crs.label()));
     }
+    Ok((affine, transformer))
 }
 
 /// The `.prj` next to a file, in lower or upper case (`.PRJ`, beside an `IMAGE.TFW`), for file
@@ -1765,6 +1698,76 @@ pub fn read_prj(path: &Path) -> Option<String> {
         return None;
     }
     std::fs::read_to_string(prj).ok()
+}
+
+/// Longitude/latitude bounds of a `width` × `height` grid placed by `transform` in `transformer`'s
+/// system, from points along its edges and inside it ([`Raster::compute_extent`]): also for a
+/// placement checked before any pixel is moved.
+fn extent_of(transform: &GeoTransform, transformer: &Transformer, width: u32, height: u32) -> Extent {
+    let mut e = Extent::EMPTY;
+    let (w, h) = (width as f64, height as f64);
+    let steps = 32;
+    let mut add = |col: f64, row: f64| {
+        if let Some(c) = transformer.to_lonlat_for_extent(transform.to_world(col, row)) {
+            e.expand(Coord::new(c.x, c.y.clamp(-90.0, 90.0)));
+        }
+    };
+    for i in 0..=steps {
+        let t = i as f64 / steps as f64;
+        for (col, row) in [(t * w, 0.0), (t * w, h), (0.0, t * h), (w, t * h)] {
+            add(col, row);
+        }
+    }
+    // Interior points too: in polar and other projections the grid can reach further than its
+    // edges do. (A raster crossing the antimeridian still gets a world-wide extent.)
+    let n = 16;
+    for i in 1..n {
+        for j in 1..n {
+            add(w * i as f64 / n as f64, h * j as f64 / n as f64);
+        }
+    }
+    // Normalize the transformed range as a whole, retaining its winding: a range crossing
+    // the antimeridian needs world-wide bounds to include both strips in a single Extent.
+    // A native full turn remains world-wide even if a datum shift contracts its samples.
+    if !e.is_empty() && transformer.is_geographic() && w * transform.pixel_width.abs() >= 360.0 {
+        (e.min_x, e.max_x) = (-180.0, 180.0);
+    } else if !e.is_empty() && (e.min_x < -180.0 || e.max_x > 180.0) {
+        let shift = 360.0 * ((e.min_x + 180.0) / 360.0).floor();
+        let (lo, hi) = (e.min_x - shift, e.max_x - shift);
+        (e.min_x, e.max_x) = if lo >= -180.0 && hi <= 180.0 { (lo, hi) } else { (-180.0, 180.0) };
+    }
+    // A whole world in Natural Earth, Winkel Tripel or Eckert IV reaches the antimeridian and the
+    // poles at its outline's edge, which samples miss when the grid's edges are a little past
+    // it (its corners are off the outline): whatever of them is in the grid is in its extent
+    // (#1701).
+    if let Some(centre) = transformer.world_central_meridian().filter(|_| !e.is_empty()) {
+        let inside = |lon: f64, lat: f64| {
+            transformer.from_lonlat(Coord::new(lon, lat)).is_some_and(|m| {
+                let (col, row) = transform.to_pixel(m);
+                (-1e-6..=w + 1e-6).contains(&col) && (-1e-6..=h + 1e-6).contains(&row)
+            })
+        };
+        let along = |i: usize| -180.0 + 360.0 * i as f64 / steps as f64;
+        if (0..=steps).any(|i| inside(180.0, along(i) / 2.0)) {
+            e.max_x = 180.0;
+        }
+        if (0..=steps).any(|i| inside(-180.0, along(i) / 2.0)) {
+            e.min_x = -180.0;
+        }
+        if (0..=steps).any(|i| inside(along(i), 90.0)) {
+            e.max_y = 90.0;
+        }
+        if (0..=steps).any(|i| inside(along(i), -90.0)) {
+            e.min_y = -90.0;
+        }
+        // Centred elsewhere than on 0°, the outline's edges are another meridian than the
+        // antimeridian: the one opposite its centre, on either side of it.
+        let edge = (centre + 360.0).rem_euclid(360.0) - 180.0;
+        if edge.abs() < 180.0 - 1e-6 && (0..=steps).any(|i| [-1e-9, 1e-9].iter().any(|d| inside(edge + d, along(i) / 2.0))) {
+            (e.min_x, e.max_x) = (e.min_x.min(edge), e.max_x.max(edge));
+        }
+    }
+    e
 }
 
 #[cfg(test)]

@@ -574,16 +574,14 @@ pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, scan: bool) -> 
     // Absolute, so the project finds it again from anywhere (`absolute`, unlike `canonicalize`,
     // gives plain paths on Windows rather than `\\?\` ones).
     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
-    let mut layer = RasterLayer::from_path(r, full);
-    // A scan asked for reopens as one (#2075).
-    layer.scan = scan;
-    add_raster(s, &name, layer)
+    // A scan is laid over the view as it is added, and that placement makes it reopen as one.
+    add_raster(s, &name, RasterLayer::from_path(r, full))
 }
 
 /// The raster at `path`, read whole; for a `scan`, as the file holds it, without the world file
 /// beside it (#2075).
 pub(crate) fn read_raster_as(path: &str, scan: bool) -> Result<Raster, String> {
-    let read = if scan { raster::read_path_unplaced(Path::new(path)) } else { raster::read_path(Path::new(path)) };
+    let read = if scan { raster::read_path_unplaced(Path::new(path), None, None) } else { raster::read_path(Path::new(path)) };
     read.map_err(|e| format!("{path}: {e}"))
 }
 

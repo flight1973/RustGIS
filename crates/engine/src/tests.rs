@@ -29095,8 +29095,12 @@ fn a_jpeg_with_a_world_file_opens_placed_not_as_a_photo() {
     // As a scan, the world file is passed over; the project reopens it as one.
     let mut t = Session::new(Project::default());
     t.run("layer.addData", &json!({"path": path("aerial.jpg"), "as": "scan", "name": "scan"})).unwrap();
+    // (Laid over a placement, and georeferenced or not.)
     let scan = |t: &Session| {
-        t.map().layer_by_name("scan").and_then(|l| l.raster.as_ref()).map(|r| (r.scan, r.data.as_ref().map(|d| d.georeferenced)))
+        t.map()
+            .layer_by_name("scan")
+            .and_then(|l| l.raster.as_ref())
+            .map(|r| (r.placement.is_some(), r.data.as_ref().map(|d| d.georeferenced)))
     };
     assert_eq!(scan(&t), Some((true, Some(false))));
     let text = serde_json::to_string(&t.project).unwrap();
@@ -29111,26 +29115,29 @@ fn a_jpeg_with_a_world_file_opens_placed_not_as_a_photo() {
     let mut v = Session::new(Project::default());
     v.run("layer.addData", &json!({"path": path("plan.png")})).unwrap();
     let plan = |v: &Session| {
-        v.map().layer_by_name("plan").and_then(|l| l.raster.as_ref()).map(|r| (r.scan, r.data.as_ref().map(|d| d.georeferenced)))
+        v.map()
+            .layer_by_name("plan")
+            .and_then(|l| l.raster.as_ref())
+            .map(|r| (r.placement.is_some(), r.data.as_ref().map(|d| d.georeferenced)))
     };
-    assert_eq!(plan(&v), Some((false, Some(false))));
+    assert_eq!(plan(&v), Some((true, Some(false))));
     assert!(v.notices.iter().any(|n| n.text.contains("add it again")), "the missing .prj is said");
     let text = serde_json::to_string(&v.project).unwrap();
     std::fs::copy(dir.join("aerial.prj"), dir.join("plan.prj")).unwrap();
     let mut w = Session::new(Project::default());
     w.run("project.openText", &json!({"text": text})).unwrap();
-    assert_eq!(plan(&w), Some((false, Some(false))));
-    // Added now, it is placed; a project that kept it placed says so when the .prj is gone,
-    // rather than drawing it at a stand-in near 0°, 0°.
+    assert_eq!(plan(&w), Some((true, Some(false))));
+    // Added now, it is placed; a project that kept it placed still opens it when the .prj is
+    // gone, and says it has no coordinates now, rather than drawing it near 0°, 0° without a word.
     let mut z = Session::new(Project::default());
     z.run("layer.addData", &json!({"path": path("plan.png")})).unwrap();
     assert_eq!(plan(&z), Some((false, Some(true))));
     let text = serde_json::to_string(&z.project).unwrap();
     std::fs::remove_file(dir.join("plan.prj")).unwrap();
     let mut gone = Session::new(Project::default());
-    let _ = gone.run("project.openText", &json!({"text": text}));
-    let error = gone.map().layer_by_name("plan").and_then(|l| l.raster.as_ref()).and_then(|r| r.error.clone());
-    assert!(error.as_deref().is_some_and(|e| e.contains("no coordinates now")), "{error:?}");
+    gone.run("project.openText", &json!({"text": text})).unwrap();
+    let lost = gone.map().layer_by_name("plan").and_then(|l| l.raster.as_ref()).and_then(|r| r.data.as_ref()).map(|d| d.lost.clone());
+    assert!(lost.as_ref().is_some_and(|l| l.iter().any(|m| m.contains("no coordinates now"))), "{lost:?}");
     std::fs::copy(dir.join("aerial.prj"), dir.join("plan.prj")).unwrap();
 
     // A GeoTIFF added as a scan reopens as one, without its own coordinates.

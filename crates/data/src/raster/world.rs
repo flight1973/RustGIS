@@ -104,6 +104,10 @@ pub fn beside(path: &Path) -> Option<(PathBuf, Result<WorldFile, String>)> {
 /// not as a photo; a stray world file, one without a usable `.prj`, or one whose numbers belong
 /// to another system leaves it a photo.
 pub fn places(path: &Path) -> bool {
+    // Only a regular file's header is read: a FIFO or a device named like a picture isn't opened.
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
     let Some((_, Ok(wf))) = beside(path) else { return false };
     let Ok((Some(crs), _)) = super::sidecar_crs(path) else { return false };
     image::image_dimensions(path).is_ok_and(|(w, h)| super::lands_on_earth(&wf, crs, w, h))
@@ -291,7 +295,7 @@ mod tests {
         let dir = picture("unplaced");
         std::fs::write(dir.join("p.wld"), "0\n-1\n-1\n0\n11.5\n49.5\n").unwrap();
         std::fs::write(dir.join("p.prj"), PRJ).unwrap();
-        let r = crate::raster::read_path_unplaced(&dir.join("p.png")).unwrap();
+        let r = crate::raster::read_path_unplaced(&dir.join("p.png"), None, None).unwrap();
         // The file's pixels, not turned, and nothing said of a world file it wasn't asked to use.
         assert!(!r.georeferenced && (r.width, r.height) == (4, 2) && r.lost.is_empty(), "{:?}", r.lost);
         assert!(places(&dir.join("p.png")));
@@ -316,7 +320,7 @@ mod tests {
     #[test]
     fn a_turned_scan_keeps_its_bands_classes_and_names() {
         let dir = picture("classes");
-        let mut r = crate::raster::read_path_unplaced(&dir.join("p.png")).unwrap();
+        let mut r = crate::raster::read_path_unplaced(&dir.join("p.png"), None, None).unwrap();
         r.bands[0].name = "landcover".into();
         r.bands[0].classes = vec!["water".into(), "forest".into()];
         let wf = WorldFile::parse("0\n-1\n-1\n0\n11.5\n49.5\n").unwrap();
