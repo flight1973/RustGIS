@@ -274,7 +274,7 @@ fn cases() -> Vec<Case> {
             "a.rss",
             georss(&[&georss_polygon("1 1 1 2 2 2 1 1")]),
             georss(&[&georss_polygon("1 x")]),
-            Silent("the hole is left out of the polygon"),
+            Said("hole in a polygon was unreadable"),
         ),
         case(
             "GeoRSS: a point with more than one pair",
