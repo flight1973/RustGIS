@@ -11,7 +11,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
 use rustgis_engine::{
     Project, Session,
-    data::{Coord, Dataset, Feature, Field, FieldType, Geometry, GeometryType, Value},
+    data::{Coord, Dataset, Date, Feature, Field, FieldType, Geometry, GeometryType, Value},
 };
 use serde_json::json;
 
@@ -33,12 +33,18 @@ const LIMITS: &[(&str, &str, &str)] = &[
     ("csv", "field type changed", "a column's type comes from its values"),
     ("csv", "field of nulls type changed", "a column's type comes from its values"),
     ("csv", "boolean became text", "yes/no values are written as True/False, read back as text"),
+    ("csv", "date became text", "dates are written as ISO 8601 text, and a CSV date stays text on read (#853)"),
+    ("csv", "datetime became text", "dates are written as ISO 8601 text, and a CSV date stays text on read (#853)"),
     ("csv", "number became text", "a column with a value that isn't a number is text"),
     ("csv", "text became a number", "a column of numbers is a number column"),
     ("csv", "infinity or NaN became text", "inf and NaN aren't read as numbers"),
     ("csv", "not read back: nothing", "a layer without geometry or values is an empty file"),
     // GeoJSON types a property from its values.
     ("geojson", "field of nulls type changed", "a property that is null everywhere has no type"),
+    ("geojson", "field type changed Date → Text", "a date is written as ISO 8601 text and stays text on read (#853)"),
+    ("geojson", "field type changed DateTime → Text", "a date is written as ISO 8601 text and stays text on read (#853)"),
+    ("geojson", "date became text", "a date is written as ISO 8601 text and stays text on read (#853)"),
+    ("geojson", "datetime became text", "a date is written as ISO 8601 text and stays text on read (#853)"),
     ("geojson", "not read back: nothing", "a layer without geometry or values reads as nothing"),
     // dBase pads text with spaces and has no null text; reading makes a whole-number column an
     // integer one.
@@ -59,6 +65,8 @@ const TEXT_FORMAT_LIMITS: &[&str] = &[
     "field of nulls missing",
     "field renamed",
     "boolean became text",
+    "date became text",
+    "datetime became text",
     "number became text",
     "text became a number",
     "infinity or NaN became text",
@@ -119,6 +127,40 @@ fn field_name() -> impl Strategy<Value = String> {
     ]
 }
 
+/// Days and moments on the edges of the model: the ends of years 1 to 9999, the days around the
+/// epoch, leap days, microseconds, no zone, `Z` and odd offsets.
+const DATES: [&str; 12] = [
+    "0001-01-01",
+    "9999-12-31",
+    "1969-12-31",
+    "1970-01-01",
+    "1900-02-28",
+    "1900-03-01",
+    "2000-02-29",
+    "2024-02-29",
+    "2026-03-05",
+    "1582-10-15",
+    "0001-12-31",
+    "9999-01-01",
+];
+/// Wall-clock times with and without microseconds, at the ends of years 1 to 9999.
+const LOCAL_TIMES: [&str; 12] = [
+    "0001-01-01T00:00:00",
+    "9999-12-31T23:59:59.999999",
+    "1969-12-31T23:59:59.999999",
+    "1970-01-01T00:00:00",
+    "1970-01-01T00:00:00.000001",
+    "2000-02-29T12:00:00.5",
+    "2024-02-29T23:59:59.123456",
+    "2026-03-05T14:30:00",
+    "2026-03-05T00:00:00",
+    "1900-02-28T08:15:00",
+    "2026-03-05T09:00:00.100",
+    "1900-03-01T23:59:59",
+];
+/// No zone, `Z` and odd offsets.
+const ZONES: [&str; 7] = ["", "Z", "+05:45", "-09:30", "+14:00", "-12:00", "+00:30"];
+
 /// Values of a field's type, leaning on edges: extremes, NaN, long and odd text, nulls.
 fn value(ty: FieldType) -> BoxedStrategy<Value> {
     let v = match ty {
@@ -130,6 +172,17 @@ fn value(ty: FieldType) -> BoxedStrategy<Value> {
         FieldType::Double => prop_oneof![
             4 => (-1e6..1e6f64).prop_map(Value::Float),
             1 => prop::sample::select(vec![0.1, -0.0, 1e300, 5e-324, 0.1234567891, f64::NAN, f64::INFINITY]).prop_map(Value::Float),
+        ]
+        .boxed(),
+        FieldType::Date => prop_oneof![
+            3 => (-719_162i64..=2_932_896).prop_map(|n| Date::from_days(n).map_or(Value::Null, Value::Date)),
+            3 => prop::sample::select(&DATES).prop_map(|t| Value::parse(t, FieldType::Date)),
+        ]
+        .boxed(),
+        FieldType::DateTime => prop_oneof![
+            2 => prop::sample::select(&LOCAL_TIMES).prop_map(|t| Value::parse(t, FieldType::DateTime)),
+            4 => (prop::sample::select(&LOCAL_TIMES), prop::sample::select(&ZONES))
+                .prop_map(|(t, z)| Value::parse(&format!("{t}{z}"), FieldType::DateTime)),
         ]
         .boxed(),
         FieldType::Text => prop_oneof![
@@ -155,7 +208,14 @@ fn value(ty: FieldType) -> BoxedStrategy<Value> {
 /// geometry).
 fn layer() -> impl Strategy<Value = Dataset> {
     let kind = prop::sample::select(vec![GeometryType::Point, GeometryType::Polyline, GeometryType::Polygon]);
-    let types = prop::sample::select(vec![FieldType::Integer, FieldType::Double, FieldType::Text, FieldType::Boolean]);
+    let types = prop::sample::select(vec![
+        FieldType::Integer,
+        FieldType::Double,
+        FieldType::Text,
+        FieldType::Boolean,
+        FieldType::Date,
+        FieldType::DateTime,
+    ]);
     let fields = prop::collection::vec((field_name(), types), 0..5).prop_map(|fs| {
         let mut seen = std::collections::HashSet::new();
         fs.into_iter().filter(|(n, _)| seen.insert(n.clone())).map(|(n, t)| Field::new(n, t)).collect::<Vec<_>>()
@@ -209,6 +269,8 @@ fn tag(v: &Value) -> &'static str {
         Value::Int(_) => "integer",
         Value::Float(_) => "number",
         Value::Text(_) => "text",
+        Value::Date(_) => "date",
+        Value::DateTime(_) => "datetime",
         _ => "boolean",
     }
 }
@@ -263,6 +325,8 @@ fn value_change(a: &Value, b: &Value) -> Option<String> {
         }
         (_, Value::Text(y)) if reads_as(y, a) => "number became text".into(),
         (Value::Bool(x), Value::Text(y)) if y == if *x { "True" } else { "False" } => "boolean became text".into(),
+        // A date as its ISO 8601 text, which is how it is shown; any other text is another date.
+        (Value::Date(_) | Value::DateTime(_), Value::Text(y)) if *y == a.to_string() => format!("{} became text", tag(a)),
         // Another value, which no limit allows.
         _ if tag(a) == tag(b) => format!("{} changed", tag(a)),
         _ => format!("{} changed to {}", tag(a), tag(b)),

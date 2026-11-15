@@ -376,6 +376,13 @@ fn styled(l: &PlacedLabel) -> bool {
     l.italic || l.spacing != 0.0 || l.font.is_some()
 }
 
+/// How far (pixels, its text `px` pixels high) a bold label is drawn a second time to its right:
+/// none unless it is bold in the interface fonts and they have no heavier face
+/// ([`crate::fonts::bold_is_synthetic`]); an installed family's own faces are drawn as they are.
+pub fn thickening(l: &PlacedLabel, px: f32) -> f32 {
+    if l.bold && l.font.is_none() && crate::fonts::bold_is_synthetic() { crate::fonts::bold_thickening(px) } else { 0.0 }
+}
+
 /// The face a label is drawn in.
 pub fn label_face(l: &PlacedLabel) -> Face {
     Face { bold: l.bold, italic: l.italic, serif: false, family: l.font }
@@ -728,11 +735,15 @@ fn draw_upright(pm: &mut Canvas, l: &PlacedLabel, ppp: f32, ink: Ink) {
         })
         .collect();
     let (styled, spacing) = (styled(l), l.spacing * 1.33 * ppp);
+    // Bold with no heavier face to draw it in: each line drawn again a little to its right.
+    let thick = thickening(l, px);
     let put = |pm: &mut Canvas, &(line, left, lw, y): &(&str, f32, f32, f32), color: Rgba, (dx, dy): (f32, f32)| {
-        if styled {
-            styled_at(pm, line, left + dx, y + dy, px, color, label_face(l), spacing);
-        } else {
-            draw_text(pm, line, left + lw / 2.0, y, px, color, l.bold, (dx, dy));
+        for dx in std::iter::once(dx).chain((thick > 0.0).then_some(dx + thick)) {
+            if styled {
+                styled_at(pm, line, left + dx, y + dy, px, color, label_face(l), spacing);
+            } else {
+                draw_text(pm, line, left + lw / 2.0, y, px, color, l.bold, (dx, dy));
+            }
         }
     };
     if pm.is_recording() {

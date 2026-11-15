@@ -35,6 +35,7 @@ pub fn esri_codes() -> impl Iterator<Item = u32> {
 
 /// A raster's coordinate system. Saved as its EPSG code, or a custom one as its definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(into = "SavedCrs", try_from = "SavedCrs")]
 pub enum Crs {
     /// WGS 84 longitude/latitude in degrees (EPSG:4326).
@@ -51,6 +52,7 @@ pub enum Crs {
 /// How a [`Crs`] is saved: a custom system by its PROJ definition, never by its number in a run's
 /// table.
 #[derive(Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 enum SavedCrs {
     LonLat,
     WebMercator,
@@ -476,6 +478,13 @@ fn in_degrees(def: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// A definition's parameters as terrio-crs reads them: its ellipsoid's axes in metres, the prime
+/// meridian (and other angles) in degrees, and metres per unit. Angles given in radians or with
+/// the `D`/`°` marks are turned into degrees before terrio-crs reads them.
+pub(crate) fn def_params(def: &str) -> Option<terrio_crs::ProjParams> {
+    terrio_crs::SpatialRef::from_proj4(&in_degrees(def)).ok()?.projection_params()
 }
 
 /// The prime meridians PROJ 9.8.1 knows by name (`proj -lm`), as terrio-crs reads them.
@@ -1316,7 +1325,7 @@ mod tests {
         assert_eq!(parse_angle("30d30'36\"S"), Some(-30.51));
         assert_eq!(parse_angle("-52.5N"), Some(52.5));
         assert_eq!(parse_angle("-5W"), Some(-5.0));
-        // The degree marks PROJ reads besides `d`, as proj4rs read them before (main).
+        // The degree marks PROJ reads besides `d`.
         assert_eq!(parse_angle("38D30'"), Some(38.5));
         assert_eq!(parse_angle("38°30'"), Some(38.5));
         assert_eq!(parse_angle("30d30\"\""), None);

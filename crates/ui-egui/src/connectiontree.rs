@@ -99,7 +99,7 @@ pub(crate) fn name_recent(app: &mut RustGisApp, before: u64, origin: Option<&str
     }
     let Some(mut added) = app.session.sources.recent.first().cloned() else { return };
     added.name = origin.to_string();
-    app.session.sources.note(added);
+    app.session.note_source(added);
 }
 
 pub enum Entry {

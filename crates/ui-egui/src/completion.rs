@@ -121,6 +121,11 @@ impl<O: Offered> List<O> {
         self.open = None;
     }
 
+    /// Lets the offer Escape closed show again (asked for again, Ctrl+Space).
+    pub fn reopen(&mut self) {
+        self.dismissed = None;
+    }
+
     /// Closes the list as Escape does: not shown again until what's typed changes. Whether one
     /// was open.
     pub fn close(&mut self) -> bool {
@@ -129,11 +134,15 @@ impl<O: Offered> List<O> {
         true
     }
 
-    /// Before the box sees the keys, with the list open and the box focused: ↑/↓ move the
-    /// highlight, Enter or Tab accept it (so Enter doesn't break the line, nor Tab indent), Escape
-    /// closes the list (and the box keeps the focus). Returns the item to accept, if any.
-    pub fn keys(&mut self, ui: &Ui) -> Option<(O, String)> {
+    /// Before the box (its id `id`) sees the keys, with the list open and the box focused: ↑/↓
+    /// move the highlight, Enter or Tab accept it (so Enter doesn't break the line, nor Tab indent
+    /// or move the focus), Escape closes the list (and the box keeps the focus). Returns the item
+    /// to accept, if any. Without the focus the keys are another widget's: none is taken.
+    pub fn keys(&mut self, ui: &Ui, id: Id) -> Option<(O, String)> {
         let (offer, selected) = self.open.clone()?;
+        if !ui.memory(|m| m.has_focus(id)) {
+            return None;
+        }
         let n = offer.items().len();
         // Nothing to move to nor accept (`show` opens no empty list).
         if n == 0 {
@@ -325,9 +334,11 @@ mod tests {
             // Opened afresh each frame, so it is open when the key comes.
             let mut h = egui_kittest::Harness::new_ui_state(
                 move |ui, left: &mut Option<bool>| {
+                    let id = egui::Id::unique("box");
+                    ui.memory_mut(|m| m.request_focus(id));
                     let mut list = super::List { open: Some((Words(Vec::new()), 0)), ..Default::default() };
                     let came = pressed(ui);
-                    assert_eq!(list.keys(ui), None);
+                    assert_eq!(list.keys(ui, id), None);
                     assert!(!list.is_open());
                     if came {
                         *left = Some(pressed(ui));
@@ -339,6 +350,27 @@ mod tests {
             h.run();
             assert_eq!(*h.state(), Some(true), "{key:?} left for the box");
         }
+    }
+
+    /// Without the box's focus the keys are another widget's: the list takes none.
+    #[test]
+    fn a_list_takes_no_keys_without_the_focus() {
+        let list = super::List { open: Some((Words(vec!["one".to_string()]), 0)), ..Default::default() };
+        let enter = |ui: &egui::Ui| ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: egui::Key::Enter, .. })));
+        let mut h = egui_kittest::Harness::new_ui_state(
+            move |ui, (list, left): &mut (super::List<Words>, bool)| {
+                let came = enter(ui);
+                assert_eq!(list.keys(ui, egui::Id::unique("box")), None);
+                if came {
+                    *left = enter(ui);
+                }
+            },
+            (list, false),
+        );
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.state().1, "Enter left for whatever has the focus");
+        assert!(h.state().0.is_open(), "the list stays as it was");
     }
 
     /// An offer with items opens the list under a focused box; one with none opens nothing.

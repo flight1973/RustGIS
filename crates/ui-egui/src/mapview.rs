@@ -2083,6 +2083,11 @@ fn draw_label(p: &egui::Painter, l: &PlacedLabel, at: Pos2) {
 /// Draws a label (not a curved one) at `at`: its halo when `halo`, its text when `text`.
 fn draw_label_ink(p: &egui::Painter, l: &PlacedLabel, at: Pos2, halo: bool, text: bool) {
     let family = crate::labelfonts::family(p.ctx(), l.font, l.bold, l.italic);
+    // Bold with no heavier face to draw it in: drawn again a little to its right, as exports do.
+    // (In the interface fonts: those of a named family not loaded yet too.)
+    use rustgis_engine::render::fonts;
+    let thick = if family.is_none() && l.bold && fonts::bold_is_synthetic() { fonts::bold_thickening(l.size * 1.33) } else { 0.0 };
+    let strikes = std::iter::once(egui::Vec2::ZERO).chain((thick > 0.0).then_some(vec2(thick, 0.0)));
     let galley = p.layout_job(label_job(&l.text, l.size, l.bold, l.italic, l.spacing, l.line_align, family));
     // Text set beside an icon is lined up by its edge, with egui's own measure of its width.
     let anchor = if l.align < -0.25 {
@@ -2106,11 +2111,15 @@ fn draw_label_ink(p: &egui::Painter, l: &PlacedLabel, at: Pos2, halo: bool, text
         if let Some(h) = l.halo.filter(|h| halo && h.a() > 0) {
             let (offsets, hc) = halo_coats(l, h);
             for offset in offsets {
-                p.add(shape(offset, hc));
+                for s in strikes.clone() {
+                    p.add(shape(offset + s, hc));
+                }
             }
         }
         if text {
-            p.add(shape(egui::Vec2::ZERO, c32(l.color)));
+            for s in strikes {
+                p.add(shape(s, c32(l.color)));
+            }
         }
         return;
     }
@@ -2126,11 +2135,15 @@ fn draw_label_ink(p: &egui::Painter, l: &PlacedLabel, at: Pos2, halo: bool, text
     if let Some(h) = l.halo.filter(|h| halo && h.a() > 0) {
         let (offsets, hc) = halo_coats(l, h);
         for offset in offsets {
-            p.galley_with_override_text_color(pos + offset, galley.clone(), hc);
+            for s in strikes.clone() {
+                p.galley_with_override_text_color(pos + offset + s, galley.clone(), hc);
+            }
         }
     }
     if text {
-        p.galley_with_override_text_color(pos, galley, c32(l.color));
+        for s in strikes {
+            p.galley_with_override_text_color(pos + s, galley.clone(), c32(l.color));
+        }
     }
 }
 

@@ -33,6 +33,8 @@ pub mod s3_keys;
 #[cfg(test)]
 mod s3_saved_tests;
 pub mod sample;
+#[cfg(feature = "schema")]
+pub mod schema;
 pub mod service_logins;
 pub mod sources;
 #[cfg(test)]
@@ -514,6 +516,7 @@ impl Tool {
 
 /// One geoprocessing history row.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GpRecord {
     /// The tool's name, as shown.
     pub tool: String,
@@ -1719,7 +1722,7 @@ impl Session {
         if res.is_ok()
             && let Some(src) = sources::added_by(id, params)
         {
-            self.sources.note(src);
+            self.note_source(src);
         }
         res
     }
@@ -2167,9 +2170,16 @@ impl Session {
         for map in &mut self.project.maps {
             for layer in &mut map.layers {
                 // Values in date fields that weren't dates, once for a layer read in place.
-                if let Some(note) = layer.source.as_mut().and_then(|source| source.take_unread_dates()) {
+                let (unread, rounded) = layer.source.as_mut().map(|source| source.take_unread_dates()).unwrap_or_default();
+                if let Some(note) = unread {
                     dates.push(format!(
                         "{}: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, {note}",
+                        layer.name
+                    ));
+                }
+                if let Some(note) = rounded {
+                    dates.push(format!(
+                        "{}: some date-times in it have digits past the microsecond and are rounded (Load All Features counts them all); so far, {note}",
                         layer.name
                     ));
                 }
@@ -2381,6 +2391,17 @@ impl Session {
             }
         }
         started
+    }
+
+    /// Records `src` in the Data Sources pane's Recent list ([`sources::Sources::note`]), and says
+    /// any value it left out because, beside the source as now listed, it holds a secret.
+    pub fn note_source(&mut self, src: sources::Source) {
+        let before = self.sources.secrets_left_out();
+        self.sources.note(src);
+        let left_out = self.sources.secrets_left_out().saturating_sub(before);
+        if left_out > 0 {
+            self.notify(sources::secrets_notice(left_out), false);
+        }
     }
 
     pub fn notify(&mut self, text: impl Into<String>, error: bool) {

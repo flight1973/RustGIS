@@ -8,7 +8,7 @@
 //! v11.022, 2024-11-05) with pyproj 3.7.2, for the codes of crs-definitions 0.6.0 and
 //! `epsg_gap.rs`: run it again for a newer release of either. A code is listed when EPSG's first
 //! axis for it is a northing or a latitude (a southing-first one is in [`UNKNOWN`]), unless its
-//! PROJ string's `+axis=` already puts a north or south axis first: proj4rs applies `+axis`, so
+//! PROJ string's `+axis=` already puts a north or south axis first: terrio-crs applies `+axis`, so
 //! its coordinates come out in EPSG's order and are written as they come. Of the codes here, only
 //! EPSG:8352 (S-JTSK (Ferro) / Krovak, `+axis=swu`) is such, so it isn't listed; the 28 southern
 //! African Lo grids (`+axis=wsu`: EPSG:2046–2055, the odd codes 22275–22293 and 29371–29385) are

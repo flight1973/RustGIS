@@ -50,7 +50,7 @@ fn guarded<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
 pub fn read(bytes: &[u8], name: &str, sheet: Option<&str>, opts: &CsvOptions) -> Result<(Dataset, ReadReport)> {
     let g = grid(bytes, sheet)?;
     let title = if g.names.len() > 1 { format!("{name} {}", g.pick) } else { name.to_string() };
-    let (ds, mut report) = read_rows(&g.headers, &g.rows, 0, &title, opts, Some(&g.dates))?;
+    let (ds, mut report) = read_rows(&g.headers, &g.rows, 0, &title, opts, Some((&g.dates, &g.phantom_dates)))?;
     let rounded: usize = g.rounded_dates.iter().sum();
     if rounded > 0 {
         let fields: Vec<Field> = g.headers.iter().map(|h| Field::new(h, FieldType::Text)).collect();
@@ -81,6 +81,8 @@ struct Grid {
     rows: Vec<Vec<String>>,
     dates: Vec<Option<FieldType>>,
     rounded_dates: Vec<usize>,
+    /// Per column that isn't one of dates, the serial-60 cells read as empty.
+    phantom_dates: Vec<usize>,
 }
 
 fn grid(bytes: &[u8], sheet: Option<&str>) -> Result<Grid> {
@@ -156,7 +158,24 @@ fn grid_unguarded(bytes: &[u8], sheet: Option<&str>) -> Result<Grid> {
             Ok(if seen { ty } else { None })
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut rows = range.rows().map(|r| r.iter().map(cell).collect::<Vec<String>>());
+    // Serial 60 is the 1900 system's 1900-02-29, a day that never was. A column of dates reads it
+    // as one that isn't a date (null, and counted); in a column of other things it is read as
+    // empty and counted here, as it would not be text of a day.
+    let mut phantom_dates = vec![0usize; w];
+    let mut rows = range.rows().map(|r| {
+        r.iter()
+            .enumerate()
+            .map(|(k, d)| match (d, dates.get(k)) {
+                (Data::DateTime(t), Some(None)) if is_phantom_day(t) => {
+                    if let Some(n) = phantom_dates.get_mut(k) {
+                        *n += 1;
+                    }
+                    String::new()
+                }
+                _ => cell(d),
+            })
+            .collect::<Vec<String>>()
+    });
     // The first row with anything in it names the columns.
     let headers: Vec<String> = rows.by_ref().find(|r| r.iter().any(|c| !c.trim().is_empty())).unwrap_or_default();
     if headers.is_empty() {
@@ -171,7 +190,7 @@ fn grid_unguarded(bytes: &[u8], sheet: Option<&str>) -> Result<Grid> {
         .map(|(i, h)| if h.trim().is_empty() { column_letter(first_col + i) } else { h.trim().to_string() })
         .collect();
     let rows: Vec<Vec<String>> = rows.filter(|r| r.iter().any(|c| !c.trim().is_empty())).collect();
-    Ok(Grid { names, pick, headers, rows, dates, rounded_dates })
+    Ok(Grid { names, pick, headers, rows, dates, rounded_dates, phantom_dates })
 }
 
 /// A zipped workbook (`.xlsx`, `.ods`) that would inflate past [`crate::zip::MAX_TOTAL`] is
@@ -428,6 +447,11 @@ fn cell(d: &Data) -> String {
     }
 }
 
+/// Whether a date cell is serial 60, the 1900 system's 1900-02-29.
+fn is_phantom_day(dt: &ExcelDateTime) -> bool {
+    !dt.is_duration() && (dt.as_f64() + if is_1904(dt) { DAYS_1900_TO_1904 } else { 0.0 }).floor() == 60.0
+}
+
 /// Days from the 1900 date system's day 0 to the 1904 one's (workbooks made on old Macs).
 const DAYS_1900_TO_1904: f64 = 1462.0;
 
@@ -624,6 +648,59 @@ mod tests {
                 assert_eq!(ds.value(0, 0).to_string(), "02:57:46.666570");
             }
         }
+    }
+
+    /// Serial 60, Excel's 1900-02-29, is no day: in a column of dates it is empty and counted, and
+    /// so it is in a column of other things (not text of a day that never was). Other serials
+    /// there, and time-only cells, are as they were.
+    #[test]
+    fn the_phantom_leap_day_is_empty_and_counted_in_a_mixed_column() {
+        let book = |cells: [&str; 3]| {
+            let rows: Vec<String> =
+                cells.iter().map(|c| if *c == "x" { (*c).to_string() } else { format!(r#"<c s="0"><v>{c}</v></c>"#) }).collect();
+            let book = xlsx(&[("Dates", &[&["a"], &[&rows[0]], &[&rows[1]], &[&rows[2]]])]);
+            let mut entries = crate::zip::read(&book).unwrap();
+            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="14"/></cellXfs></styleSheet>"#.to_vec()));
+            read(&crate::zip::write(&entries).unwrap(), "dates", None, &CsvOptions::default()).unwrap()
+        };
+        // A column of dates: the cell is null and counted.
+        let (ds, report) = book(["45000", "60", "45002"]);
+        assert_eq!(ds.fields[0].ty, FieldType::Date);
+        assert!(ds.value(1, 0).is_null());
+        assert_eq!(report.unread_dates.as_deref(), Some("1 value isn't a date and was read as empty, in 'a'"));
+        // A mixed column (text among the dates) says the same, and keeps the rest as text.
+        let (ds, report) = book(["45000", "60", "x"]);
+        assert_eq!(ds.fields[0].ty, FieldType::Text);
+        // (A row left with nothing in it is skipped, as any empty row is.)
+        let seen: Vec<String> = (0..ds.features.len()).map(|r| ds.value(r, 0).to_string()).collect();
+        assert_eq!(seen, ["2023-03-15", "x"], "{seen:?}");
+        assert_eq!(report.unread_dates.as_deref(), Some("1 value isn't a date and was read as empty, in 'a'"));
+        // Without it, nothing is said.
+        let (_, report) = book(["45000", "61", "x"]);
+        assert_eq!(report.unread_dates, None);
+    }
+
+    /// Serial 60 in the WKT column: the cell is empty, so its row has no geometry, and that is said;
+    /// a WKT column without one says nothing of it.
+    #[test]
+    fn the_phantom_leap_day_in_a_wkt_column_is_said() {
+        let book = |second: &str| {
+            let book = xlsx(&[("Places", &[&["name", "wkt"], &["a", "POINT (1 2)"], &["b", second]])]);
+            let mut entries = crate::zip::read(&book).unwrap();
+            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="14"/></cellXfs></styleSheet>"#.to_vec()));
+            let opts = CsvOptions { wkt: Some("wkt".into()), ..CsvOptions::default() };
+            read(&crate::zip::write(&entries).unwrap(), "places", None, &opts).unwrap()
+        };
+        let (ds, report) = book(r#"<c s="0"><v>60</v></c>"#);
+        assert_eq!(ds.features.len(), 2);
+        assert_eq!(ds.features.iter().filter(|f| f.geometry.is_none()).count(), 1);
+        assert!(
+            report.messages.contains(&"1 value in 'wkt' isn't a date and was read as empty, so its row has no geometry".to_string()),
+            "{:?}",
+            report.messages
+        );
+        let (_, report) = book("POINT (3 4)");
+        assert!(!report.messages.iter().any(|m| m.contains("isn't a date")), "{:?}", report.messages);
     }
 
     #[test]

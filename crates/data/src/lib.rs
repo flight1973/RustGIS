@@ -195,6 +195,7 @@ mod secret_redaction_tests {
 
 /// One row: an optional geometry and one value per field.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Feature {
     pub id: u64,
     pub geometry: Option<Geometry>,
@@ -316,6 +317,17 @@ impl Serialize for Features {
     }
 }
 
+/// Features are saved as a list of [`Feature`]s.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Features {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Features".into()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <Vec<Feature>>::json_schema(generator)
+    }
+}
+
 impl<'de> Deserialize<'de> for Features {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Features, D::Error> {
         Vec::<Feature>::deserialize(d).map(Features::from)
@@ -416,6 +428,9 @@ pub struct ReadReport {
     /// What a read of a source says of values in date fields that weren't dates
     /// ([`source::unread_dates_note`]), also in `messages`: for a caller that says only this.
     pub unread_dates: Option<String>,
+    /// What it says of date-times it rounded to the microsecond ([`source::rounded_dates_note`]),
+    /// also in `messages`.
+    pub rounded_dates: Option<String>,
 }
 
 /// What a read says when it drops Z or M values (see [`Dataset::zm_dropped`]): from `features` of

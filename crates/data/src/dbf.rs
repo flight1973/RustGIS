@@ -270,12 +270,22 @@ pub(crate) fn raw_table(dbf: &[u8]) -> Option<RawTable<'_>> {
 }
 
 /// A date (`D`) field's value, `YYYYMMDD`: `Ok(None)` when it's blank or zeros, as writers leave
-/// a date empty, and `Err(())` when it isn't a date (`20260230`, `2026-3-5`).
+/// a date empty, and `Err(())` when it isn't a date (`20260230`, `2026-3-5`). A year padded with
+/// spaces (`   10101`, year 1, as GDAL writes it with `%4d`) is read as the zeros it stands for.
 pub(crate) fn date(field: &[u8]) -> std::result::Result<Option<crate::date::Date>, ()> {
     let t = field.trim_ascii();
     if t.is_empty() || t == b"00000000" || field.iter().all(|b| *b == 0) {
         return Ok(None);
     }
+    let padded: [u8; 8];
+    let t = match <[u8; 8]>::try_from(field) {
+        Ok(mut f) if t.len() != 8 => {
+            f.iter_mut().take(4).take_while(|b| **b == b' ').for_each(|b| *b = b'0');
+            padded = f;
+            &padded[..]
+        }
+        _ => t,
+    };
     let [y0, y1, y2, y3, m0, m1, d0, d1] = *t else { return Err(()) };
     let digits = |b: &[u8]| -> std::result::Result<i64, ()> {
         b.iter().try_fold(0i64, |n, c| if c.is_ascii_digit() { Ok(n * 10 + i64::from(c - b'0')) } else { Err(()) })
@@ -324,10 +334,26 @@ mod tests {
         let day = |y, m, d| Ok(crate::date::Date::from_ymd(y, m, d));
         assert_eq!(date(b"20260305"), day(2026, 3, 5));
         assert_eq!(date(b"00010101"), day(1, 1, 1));
+        // GDAL pads the year with spaces (`%4d%02d%02d`).
+        assert_eq!(date(b"   10101"), day(1, 1, 1));
+        assert_eq!(date(b"  990101"), day(99, 1, 1));
+        assert_eq!(date(b" 9991231"), day(999, 12, 31));
         for empty in [&b""[..], b"        ", b"00000000", b"\0\0\0\0\0\0\0\0"] {
             assert_eq!(date(empty), Ok(None), "{empty:?}");
         }
-        for bad in [&b"20260230"[..], b"20261301", b"2026-3-5", b"2026030", b"202603050", b"abcdefgh", b"00000101", b"0000    "] {
+        for bad in [
+            &b"20260230"[..],
+            b"20261301",
+            b"2026-3-5",
+            b"2026030",
+            b"202603050",
+            b"abcdefgh",
+            b"00000101",
+            b"0000    ",
+            b"  2 0101",
+            b"    0101",
+            b"   1 101",
+        ] {
             assert_eq!(date(bad), Err(()), "{bad:?}");
         }
     }

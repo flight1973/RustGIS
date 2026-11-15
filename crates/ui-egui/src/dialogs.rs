@@ -216,8 +216,10 @@ impl Dialogs {
                 self.flag = true;
             }
             "goToXY" => {
+                // The map's center, the longitude within ±180 even when the view has been panned
+                // past the antimeridian.
                 let c = s.map().center_lonlat();
-                self.a = format!("{:.4}", c.x);
+                self.a = format!("{:.4}", crate::mapmenu::wrap_lon(c.x));
                 self.b = format!("{:.4}", c.y);
             }
             "bookmark" => self.text = rustgis_engine::cmd::navigate::new_bookmark_name(s.map()),
@@ -394,21 +396,48 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         match which {
             "selectByAttributes" => close = select_by_attributes(app, ui, &t),
             "goToXY" => {
+                // UTM and MGRS are the Earth's grids, so another body's map offers degrees alone.
+                // A grid reference, once typed, is where Go goes: the degree boxes gray out.
+                let earth = app.session.map().body().is_earth();
+                let by_grid = earth && !app.dialogs.text.trim().is_empty();
                 egui::Grid::new("xy").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
                     let input_label = ui.label(tl!("Longitude (X)"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).desired_width(200.0)).labelled_by(input_label.id);
+                    ui.add_enabled(!by_grid, egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("-74.006 · 74°0′22″W").desired_width(300.0))
+                        .labelled_by(input_label.id);
                     ui.end_row();
                     let input_label = ui.label(tl!("Latitude (Y)"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.b).desired_width(200.0)).labelled_by(input_label.id);
+                    ui.add_enabled(!by_grid, egui::TextEdit::singleline(&mut app.dialogs.b).hint_text("40.7128 · 40°42′46″N").desired_width(300.0))
+                        .labelled_by(input_label.id);
                     ui.end_row();
+                    if earth {
+                        let input_label = ui.label(tl!("Or grid reference"));
+                        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("18TWL8395907350 · 18north 583959 4507351").desired_width(300.0))
+                            .labelled_by(input_label.id);
+                        ui.end_row();
+                    }
                     let input_label = ui.label(tl!("Scale 1:"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("keep current")).desired_width(200.0)).labelled_by(input_label.id);
+                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("keep current")).desired_width(300.0)).labelled_by(input_label.id);
                     ui.end_row();
                 });
+                // Below the boxes, wrapped to the dialog's width rather than widening it.
+                let hint = if earth {
+                    tl!("Degrees as decimals or degrees, minutes and seconds; or a UTM or MGRS reference in place of both.")
+                } else {
+                    tl!("Degrees as decimals or degrees, minutes and seconds.")
+                };
+                ui.label(egui::RichText::new(hint).weak());
                 close = buttons(app, ui, "Go", |app| {
-                    let mut p = json!({"lon": app.dialogs.a.trim(), "lat": app.dialogs.b.trim()});
-                    if let Ok(s) = app.dialogs.c.trim().replace(',', "").parse::<f64>() {
-                        p["scale"] = json!(s);
+                    let grid = app.dialogs.text.trim();
+                    let mut p = if app.session.map().body().is_earth() && !grid.is_empty() {
+                        json!({"position": grid})
+                    } else {
+                        json!({"lon": app.dialogs.a.trim(), "lat": app.dialogs.b.trim()})
+                    };
+                    // The command refuses a scale it can't use: commas go only where they group
+                    // thousands (50,000), so a decimal comma (1,5) is refused, not read as 15.
+                    let scale = scale_text(&app.dialogs.c);
+                    if !scale.is_empty() {
+                        p["scale"] = json!(scale);
                     }
                     app.run("map.goToXY", p).map(|_| ())
                 });
@@ -591,9 +620,17 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "calculateField" => {
                 /// The data Calculate Field reads: the table's it was opened on, else the active layer's.
                 fn data(app: &crate::RustGisApp) -> Option<&rustgis_engine::data::Dataset> {
-                    match app.dialogs.table {
-                        Some((opened, id)) => app.session.project.table(id).filter(|_| opened == app.session.opened).map(|t| &t.dataset),
-                        None => app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| &l.dataset),
+                    data_of(app.dialogs.table, &app.session)
+                }
+                /// The same, from the dialog's table and the session apart, so the box can be
+                /// written while it's read.
+                fn data_of(
+                    table: Option<(u64, u32)>,
+                    session: &rustgis_engine::Session,
+                ) -> Option<&rustgis_engine::data::Dataset> {
+                    match table {
+                        Some((opened, id)) => session.project.table(id).filter(|_| opened == session.opened).map(|t| &t.dataset),
+                        None => session.active_layer.and_then(|id| session.map().layer(id)).map(|l| &l.dataset),
                     }
                 }
                 let fields: Vec<String> = data(app).map(|d| calculation_fields(d).map(|f| f.name.clone()).collect()).unwrap_or_default();
@@ -606,12 +643,16 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     }).response.labelled_by(input_label.id);
                 });
                 let input_label = ui.label(format!("{} =", app.dialogs.a));
-                let edit = egui::TextEdit::singleline(&mut app.dialogs.text)
-                    .hint_text(tl!("e.g.  pop_est / 1000000   or   upper(name) || ' ' || round(area, 1)"))
-                    .char_limit(rustgis_engine::data::query::MAX_LEN)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY);
-                ui.add(edit).labelled_by(input_label.id);
+                // Suggestions as it's typed: the fields, functions, variables and keywords (#1240).
+                let ds = data_of(app.dialogs.table, &app.session);
+                fn style(edit: egui::TextEdit<'_>) -> egui::TextEdit<'_> {
+                    edit.hint_text(tl!("e.g.  pop_est / 1000000   or   upper(name) || ' ' || round(area, 1)"))
+                        .char_limit(rustgis_engine::data::query::MAX_LEN)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                }
+                crate::exprcomplete::expr_edit(ui, egui::Id::unique("cf_expression"), &mut app.dialogs.text, ds, style)
+                    .labelled_by(input_label.id);
                 let text = app.dialogs.text.trim();
                 let reads = data(app).filter(|_| !text.is_empty()).map(|d| rustgis_engine::cmd::edit::check_calculation(text, d));
                 if let Some(Err(e)) = reads {
@@ -708,7 +749,7 @@ fn save_project(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         edit.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(end))));
         edit.state.store(ui.ctx(), edit.response.id);
     }
-    let place = if cfg!(target_os = "android") {
+    let place = if cfg!(any(target_os = "android", target_os = "ios")) {
         tl!("You choose where the project is saved next.")
     } else {
         tl!("The project downloads as this file, to the folder your browser saves downloads in.")
@@ -2637,6 +2678,23 @@ fn crs_details(ui: &mut egui::Ui, chosen: &str, current: &str, t: &Tokens) {
     }
 }
 
+/// A scale box's text as the command reads it: commas that group thousands (`50,000`,
+/// `1,000,000.5`) taken out, any other comma (a decimal comma, `1,5`) left in, so the command
+/// refuses it rather than reading `15`.
+fn scale_text(text: &str) -> String {
+    let text = text.trim();
+    let whole = text.split_once('.').map_or(text, |(w, _)| w);
+    let grouped = whole.contains(',') && {
+        let mut groups = whole.split(',');
+        let first = groups.next().unwrap_or("");
+        (1..=3).contains(&first.len())
+            && first.chars().all(|c| c.is_ascii_digit())
+            && groups.all(|g| g.len() == 3 && g.chars().all(|c| c.is_ascii_digit()))
+    };
+    let decimals = text.split_once('.').is_none_or(|(_, d)| !d.contains(','));
+    if grouped && decimals { text.replace(',', "") } else { text.to_string() }
+}
+
 /// The columns a name-based edit can reach. Keep both the initial choice and the picker in
 /// step with the command's case-insensitive lookup, including duplicate names in imported data.
 fn calculation_fields(dataset: &rustgis_engine::data::Dataset) -> impl Iterator<Item = &rustgis_engine::data::Field> {
@@ -2646,6 +2704,29 @@ fn calculation_fields(dataset: &rustgis_engine::data::Dataset) -> impl Iterator<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scale's commas go only where they group thousands: a decimal comma is left for the
+    /// command to refuse, not read as a bigger number.
+    #[test]
+    fn a_scale_box_takes_commas_only_between_thousands() {
+        for (typed, sent) in [
+            ("50,000", "50000"),
+            (" 1,000,000 ", "1000000"),
+            ("1,000,000.5", "1000000.5"),
+            ("50000", "50000"),
+            ("1,5", "1,5"),
+            ("50,00", "50,00"),
+            ("1234,567", "1234,567"),
+            (",500", ",500"),
+            ("1,000.5,5", "1,000.5,5"),
+            ("", ""),
+        ] {
+            assert_eq!(scale_text(typed), sent, "{typed}");
+        }
+        let mut s = rustgis_engine::Session::new(rustgis_engine::Project::default());
+        let refused = s.run("map.goToXY", &json!({"lon": 0, "lat": 0, "scale": scale_text("1,5")})).unwrap_err();
+        assert!(refused.contains("scale must be a positive number"), "{refused}");
+    }
 
     /// A field dialog opened on a standalone table acts on that table, and on no other once
     /// another project is open: table ids start again in each project.
@@ -2698,6 +2779,39 @@ mod tests {
         let ds = &h.state().session.project.tables[0].dataset;
         assert_eq!(ds.value(0, 0), &rustgis_engine::data::Value::Text("changed".into()));
         assert_eq!(ds.value(0, 1), &rustgis_engine::data::Value::Text("second".into()));
+    }
+
+    /// Calculate Field suggests as the expression is typed (#1240): Enter takes the highlighted
+    /// field, quoted as the expression needs, and doesn't calculate; Escape closes the list and
+    /// leaves the dialog and the text as they are.
+    #[test]
+    fn calculate_field_suggests_the_fields_as_its_expression_is_typed() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::new(Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addDataText", json!({"fileName": "pops.csv", "text": "Pop Est,name\n1,a\n"})).unwrap();
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        let id = app.session.project.tables[0].id;
+        app.run("ui.dialog", json!({"name": "calculateField", "table": id})).unwrap();
+        let mut h = app_harness(app);
+        h.run_steps(3);
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("cf_expression")));
+        h.run();
+        h.event(egui::Event::Text("po".into()));
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, "\"Pop Est\"").is_some(), "the field offered, as written");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.text, "\"Pop Est\"");
+        assert_eq!(h.state().dialogs.open, Some("calculateField"), "Enter took the field, not Calculate");
+        h.event(egui::Event::Text(" * ro".into()));
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, "round()").is_some(), "the function offered");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, "round()").is_none(), "the list closed");
+        assert_eq!(h.state().dialogs.text, "\"Pop Est\" * ro");
+        assert_eq!(h.state().dialogs.open, Some("calculateField"));
     }
 
     /// The app in a harness, its fonts installed on the first pass (the dialog draws on the next).

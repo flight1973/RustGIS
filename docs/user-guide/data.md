@@ -8,7 +8,7 @@ Formats](data-formats.md).
 | Format | Read | Write |
 | --- | --- | --- |
 | GeoJSON (`.geojson`, `.json`) | Yes | Yes |
-| Delimited text (`.csv`, `.tsv`, `.txt`) with x/y columns in a supported coordinate system, or WKT geometry | Yes | Yes |
+| Delimited text (`.csv`, `.tsv`, `.txt`, recognised `.dat`; also UTF-8 gzip-compressed text) with x/y columns in a supported coordinate system, or WKT geometry | Yes | CSV |
 | Shapefile (`.shp` + `.dbf`, or zipped in a `.zip`) | Yes (the web app also accepts sidecar files picked or dropped together) | Yes (`share.exportLayer`) |
 | GeoPackage (`.gpkg`, feature tables) | Yes | Yes (desktop) |
 | GeoParquet (`.parquet`, `.geoparquet`, WKB geometry) | Yes | Yes |
@@ -61,7 +61,7 @@ feature table explicitly adds only that table.
 On the desktop, **Home › Add › Add Data › Add Folder…** connects a folder to the Browser; the web
 app does not offer folder connections.
 On the desktop, a file Add Data reads whole (a GeoTIFF or another raster, one GDAL converts, a
-GeoJSON of up to 32 MB, delimited text or a spreadsheet) is read in the background, so the map
+GeoJSON of up to 32 MB, delimited text, a ZIP archive or a spreadsheet) is read in the background, so the map
 and the rest of the window stay in use: the status bar shows **Add Data**, how many files wait
 after it, and **Cancel**. Files dropped or added together are read one at a time and added in
 that order; one that asks which layers to add joins them once you choose. Cancel drops the file
@@ -71,6 +71,26 @@ service or a database adds as before, and scripts read the file where the comman
 **Delimited Text…**: it reads the file with the columns picked as you press **Add**, so a read
 that fails (a column that isn't in the file, a coordinate system it doesn't know) keeps the
 dialog open for another try.
+
+Published pipe-delimited `.dat` files open as tables when their header and rows reveal a
+separator; otherwise give `"delimiter":"|"` to `layer.addData`, or rename a text file to `.txt`.
+Gzip-compressed UTF-8 `.csv.gz`, `.tsv.gz`, `.txt.gz` and `.dat.gz` open directly, including by
+URL or upload. Decompression streams records, checks the gzip checksum and stops at 256 MiB of
+expanded text. Table rows are still kept in memory for type inference; CSV imports also refuse
+a retained-table estimate above a quarter of physical memory, between 256 MiB (the browser
+budget) and 4 GiB. This estimate includes cell objects and the dataset built alongside the rows. Delimited members
+in one ZIP share this allowance, including gzip-compressed members.
+For another encoding, decompress the file and add the `.txt` file, whose reader detects the encoding. Delimited text
+is exported as `.csv`; gzip is an input format.
+
+A GTFS zip adds its delimited `.txt` members as standalone tables; `stop_lon` and `stop_lat`
+place stops as points. This imports the tables, not a transit routing network. The archive's
+usual 32-layer/table limit applies, and skipped readable members are named in a notice. Text
+members that do not resemble tables, including single-column `README.txt` documentation, are
+skipped with a notice. Give `"crs"` when the archive's text tables use projected coordinates.
+A zipped File Geodatabase must be unzipped first: on the desktop, add the
+`.gdb` folder. The archive reader says this when it finds one, including beside readable files.
+
 **Home › Add › Add Data › Delimited Text…** asks for a CSV or a spreadsheet first, then lists its columns to pick the x and y (or WKT)
 ones from, with the coordinate system (such as `EPSG:2263`) and the separator (changing it reads
 the columns again); `info.fileColumns` lists them for scripts. Add Data finds them itself
@@ -99,10 +119,14 @@ FlatGeobuf, FileGDB, workbook date cells and GPX timestamps. Ordinary spreadshee
 looks like a date stays text. A workbook column mixing date cells with ordinary text is read
 entirely as text; clean that column in the workbook before using date operations.
 Invalid dates become empty values with a notice naming the fields
-and counting the values; dates cover years 1–9999. Fractional seconds are kept to microseconds.
-Floating-point serial dates in workbooks and FileGDB are rounded to the nearest microsecond,
-with a notice when rounding is needed. Parquet timestamps with finer nonzero precision are
-read as empty with a notice. Times without a day stay text; Parquet clocks retain `Z` when declared UTC.
+and counting the values; dates cover years 1–9999. Fractional seconds are kept to microseconds:
+digits past the sixth (nanosecond timestamps in Parquet, text read from a GeoPackage or FlatGeobuf, or
+converted by Convert Field) are rounded to the nearest microsecond, and a read says how many values it
+rounded and in which fields. Text typed in, kept in a project, read from GPX or compared in a
+where clause isn't rounded: with more digits than that it isn't a date. Floating-point serial dates in workbooks and FileGDB are rounded
+the same way, with a notice when rounding is needed. A workbook's 1900-02-29 (serial 60, a day
+that never existed) is read as empty and counted, in a column of dates or any other.
+Times without a day stay text; Parquet clocks retain `Z` when declared UTC.
 
 GeoParquet exports use native dates and microsecond timestamps. Zoned date-times are written
 as UTC instants, with a notice when their displayed offsets change; unzoned times stay unzoned.
@@ -115,7 +139,8 @@ again to use its current schema; the saved fields are kept unchanged. Saved GeoP
 again. Their saved fields, filters and styles are kept unchanged rather than partially migrated. An old integer field that
 now reads as time-only text is refused in the same way.
 FlatGeobuf exports use its native DateTime column type for both dates and date-times. Local
-files are scanned to distinguish date-only columns, date-times and time-only text. Reopening
+files are scanned to distinguish date-only columns, date-times and time-only text. With no value
+to scan, a date field comes back as a date-time field, and the export says which fields. Reopening
 a saved desktop layer runs that scan off the window thread, with progress and Cancel in the
 status bar. Remote
 FlatGeobuf date/time columns stay ISO text with a notice so opening them can keep reading by
@@ -247,8 +272,10 @@ reuses the conversion until the file changes, and large layers stream like any l
 (below). Every layer of the file is added; a layer mixing geometry types is added as one layer
 per type, its points on top and its polygons at the bottom. Curves become straight segments, and
 3D surfaces (an Esri multipatch, such as the buildings of swissBUILDINGS3D, is read as a TIN)
-become flat polygons, one part per face, without their heights. Projects remember the original
-file and convert it again if the cached copy is gone.
+become flat polygons, one part per face, without their heights. The conversion leaves out a
+feature it can't index, such as a polygon with no coordinates; when GDAL gives the layer's feature
+count, adding the file says how many were left out, also when it reuses a conversion. Projects
+remember the original file and convert it again if the cached copy is gone.
 
 ## SQL queries and DuckDB databases
 
@@ -283,8 +310,8 @@ WHERE bbox.xmin BETWEEN -83.95 AND -83.89 AND bbox.ymin BETWEEN 35.94 AND 35.98
 
 The first geometry column becomes the layer's geometry; other columns become its attributes (types
 RustGIS doesn't read, such as lists, as text). `DATE` columns become dates, `TIMESTAMP` columns
-date-times without a zone and `TIMESTAMPTZ` columns instants in UTC; a `TIMESTAMP_NS` stays text,
-which keeps its nanoseconds. A geometry that says its coordinate system
+date-times without a zone and `TIMESTAMPTZ` columns instants in UTC; a `TIMESTAMP_NS` is a
+date-time too, rounded to the microsecond, with a notice. A geometry that says its coordinate system
 is converted to longitude/latitude; give `"crs"` (such as `EPSG:2263`) for one that doesn't. A
 result mixing geometry types becomes a layer per type (points on top, polygons at the bottom), and
 rows without a geometry are left out.
@@ -435,8 +462,9 @@ trigger failure also rolls everything back; pending edits remain in the layer. N
 get source-assigned keys that cannot alias loaded rows, and unrelated columns and tables remain
 intact. The saved rows are read back within the transaction, so the layer keeps values assigned
 by defaults and triggers before it starts tracking its next edits. Dates are saved as a
-GeoPackage export writes them: a date-time with another offset than UTC's is saved in UTC, and a
-notice says so. A stored date that isn't one loads as empty, with a notice, and is left as it is
+GeoPackage export writes them: a date-time with another offset than UTC's is saved in UTC, and one
+with digits past the millisecond (a GeoPackage DATETIME holds milliseconds, `YYYY-MM-DDTHH:MM:SS.SSSZ`)
+is rounded to the nearest millisecond, and a notice says each. A stored date that isn't one loads as empty, with a notice, and is left as it is
 unless that value is edited. If a DELETE trigger recreates
 a target row, that stored row reappears in the layer and is not counted as deleted. If triggers
 change or remove other rows already loaded in the layer, those rows are refreshed or removed

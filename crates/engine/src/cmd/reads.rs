@@ -1,6 +1,6 @@
 //! Reads the desktop app makes on a thread of its own before a command adds what they read
 //! (#1291 step 3): Add Data's whole-file reads (a raster, a raster GDAL converts, a GeoJSON,
-//! delimited text or spreadsheet read whole, a CityJSON or CityGML model's layers), Repair/Reload Data, Load All
+//! delimited text or spreadsheet read whole, a ZIP or CityJSON/CityGML model's layers), Repair/Reload Data, Load All
 //! Features, Convert To Annotation's read of a layer read in place, native models or scripts, the
 //! Error Inspector's topology check (#1291) and Source File State's hashing of a layer's file. [`read_ahead`]
 //! takes what the read needs of the session, [`ReadAhead::run`] reads on the thread, and [`read_land`]

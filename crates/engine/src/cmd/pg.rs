@@ -166,7 +166,7 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
         if !saved.skipped_fields.is_empty() {
             s.notify(format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")), false);
         }
-        for note in postgis::saved_dates_notes(&fields, &saved, &format!("{name}: {table}")) {
+        for note in postgis::saved_dates_notes(&fields, &saved, &super::saved_target(&name, &table)) {
             s.notify(note, false);
         }
         Ok(json!({

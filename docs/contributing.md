@@ -66,6 +66,7 @@ Other workspace tasks:
 
 | Task | Purpose |
 | --- | --- |
+| `cargo xtask changed [--list] [base]` | Run the `cargo xtask ci` checks on only the packages your branch changes and those that depend on them: a quicker check while you work. A file outside every package that no package includes, such as `Cargo.lock`, checks the whole workspace. `--list` prints the packages without checking them |
 | `cargo xtask layers` | Check crate dependency direction and keep UI dependencies out of lower layers |
 | `cargo xtask notices` | Regenerate the shipped `THIRD-PARTY-LICENSES.txt` files after changing dependencies, or after adding code or data from another project to `INCLUDED` in `xtask/src/notices.rs` (with its licence text in `third-party/`); requires `cargo-about` |
 | `cargo xtask notices --check` | Check the notices without writing them; stale notices warn in CI but block releases |

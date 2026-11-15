@@ -12,15 +12,17 @@ workspace = true
 rustgis-geom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+schemars = { workspace = true, optional = true }
 thiserror = { workspace = true }
 csv = { workspace = true }
+# Streaming gzip text imports; use the pure-Rust backend in the browser too.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 shapefile = { workspace = true }
 encoding_rs = { workspace = true }
 # Zstandard, the usual compression of COGs, is C code that compiles to WebAssembly with clang
 # (on the CI runners), so the browser decodes it too.
 tiff = { workspace = true, features = ["zstd"] }
 weezl.workspace = true
-proj4rs = { workspace = true }
 crs-definitions = { workspace = true }
 terrio-crs = { workspace = true }
 miniz_oxide = { workspace = true }
@@ -47,10 +49,6 @@ lerc-reader = { workspace = true }
 lerc-core = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# proj4rs reads the PROJ definitions WKT is turned into (`wkt`), azimuthal equidistant ones too
-# (native only: its geodesic routines need libm, which wasm32-unknown-unknown lacks). Transforms
-# are terrio-crs's.
-proj4rs = { workspace = true, features = ["aeqd"] }
 rusqlite = { workspace = true }
 postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
@@ -77,6 +75,10 @@ rustls-native-certs = "0.8"
 [target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
 # Safe effective-UID and no-follow operations for private Shapefile index caches.
 rustix = { version = "1.1", features = ["process", "fs"] }
+
+[features]
+# The JSON Schema of the saved types (`cargo xtask schema`).
+schema = ["dep:schemars", "rustgis-geom/schema"]
 
 [dev-dependencies]
 # Writing sample GeoParquet files.

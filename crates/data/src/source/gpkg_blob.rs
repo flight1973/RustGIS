@@ -75,10 +75,32 @@ pub(crate) fn field_type(decl: &str) -> Option<FieldType> {
 }
 
 /// A DATE or DATETIME column's value, from its text (`None` for a number or a blob): ISO 8601, as
-/// GeoPackage stores them ([`crate::Value::parse_stored`]). `None` when it isn't a date of the field's type, which a read gives as
-/// null and counts ([`super::Batch::unread_dates`]); empty text is null without being counted.
-pub(crate) fn temporal(text: Option<&str>, ty: FieldType) -> Option<crate::Value> {
-    let text = text?;
-    let v = crate::Value::parse_stored(text, ty);
-    (!v.is_null() || crate::Value::Text(text.to_string()).asks_null()).then_some(v)
+/// GeoPackage stores them ([`crate::Value::parse_stored`]). Null when it isn't a date of the field's
+/// type (a number or a blob in the column included), which a read counts as the field `k`'s in
+/// `unread` ([`super::Batch::unread_dates`]); empty text is null without being counted. With
+/// `rounded`, digits past the microsecond are rounded off and counted there
+/// ([`super::Batch::rounded_dates`]); without, such a value isn't a date.
+pub(crate) fn temporal(
+    text: Option<&str>,
+    ty: FieldType,
+    unread: &mut Vec<usize>,
+    rounded: Option<&mut Vec<usize>>,
+    k: usize,
+) -> crate::Value {
+    let Some(text) = text else {
+        super::unread_date(unread, k);
+        return crate::Value::Null;
+    };
+    let (v, cut) = match rounded {
+        Some(_) => crate::Value::parse_stored_counted(text, ty),
+        None => (crate::Value::parse_stored(text, ty), false),
+    };
+    if v.is_null() {
+        if !crate::Value::Text(text.to_string()).asks_null() {
+            super::unread_date(unread, k);
+        }
+    } else if cut && let Some(rounded) = rounded {
+        super::unread_date(rounded, k);
+    }
+    v
 }

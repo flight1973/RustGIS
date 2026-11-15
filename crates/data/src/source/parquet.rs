@@ -582,7 +582,7 @@ impl FeatureSource for ParquetSource {
                 return Err(remote::need());
             }
         }
-        let mut unread_dates = Vec::new();
+        let (mut unread_dates, mut rounded_dates) = (Vec::new(), Vec::new());
         let mut skipped = 0;
         let mut starts = Vec::with_capacity(md.num_row_groups());
         let mut first_row = 0u64;
@@ -634,12 +634,13 @@ impl FeatureSource for ParquetSource {
                 if !matches_extent || (late && !sample.wants()) {
                     continue;
                 }
-                let values = attrs.iter().enumerate().map(|(field, col)| col.value(k, field, &mut unread_dates)).collect();
+                let values =
+                    attrs.iter().enumerate().map(|(field, col)| col.value(k, field, &mut unread_dates, &mut rounded_dates)).collect();
                 sample.keep(Feature { id: base.saturating_add(r as u64 + 1), geometry, attrs: values });
             }
         }
         let matched = (if late { sample.seen() } else { matched }).saturating_mul(thinned as u64);
-        Ok(Batch { matched, complete: sample.complete() && thinned == 1, skipped, features: sample.items, unread_dates })
+        Ok(Batch { matched, complete: sample.complete() && thinned == 1, skipped, features: sample.items, unread_dates, rounded_dates })
     }
 
     fn remote(&self) -> Option<Arc<Remote>> {
@@ -729,7 +730,11 @@ impl FeatureSource for ParquetSource {
                 if !geometry.as_ref().map_or(req.extent.is_none(), |g| in_request(g, &req)) {
                     continue;
                 }
-                let values = attrs.iter().enumerate().map(|(field, col)| col.value(k, field, &mut out.unread_dates)).collect();
+                let values = attrs
+                    .iter()
+                    .enumerate()
+                    .map(|(field, col)| col.value(k, field, &mut out.unread_dates, &mut out.rounded_dates))
+                    .collect();
                 out.matched += 1;
                 chunks.push(Feature { id: start.saturating_add(r as u64 + 1), geometry, attrs: values })?;
             }
@@ -1161,62 +1166,77 @@ fn read_column<T: PqType>(r: &mut ColumnReaderImpl<T>, take: &[bool], max_def: i
     Ok(out)
 }
 
-/// Native Parquet dates and timestamps, respecting UTC adjustment and refusing sub-microsecond
-/// values rather than truncating them. Legacy converted timestamps are UTC, INT96 is unzoned.
-fn temporal_value(c: &ColumnDescPtr, n: i64) -> Value {
+/// Native Parquet dates and timestamps, respecting UTC adjustment. Nanoseconds are rounded to the
+/// nearest microsecond (cut where that would leave years 1 to 9999); the flag says they were.
+/// Legacy converted timestamps are UTC, INT96 is unzoned.
+fn temporal_value(c: &ColumnDescPtr, n: i64) -> (Value, bool) {
     use parquet::basic::TimeUnit;
     if field_type(c) == Some(FieldType::Date) {
-        return crate::Date::from_days(n).map(Value::Date).unwrap_or_default();
+        return (crate::Date::from_days(n).map(Value::Date).unwrap_or_default(), false);
     }
     let (unit, utc) = match (c.logical_type_ref(), c.converted_type()) {
         (Some(LogicalType::Timestamp(t)), _) => (t.unit, t.is_adjusted_to_u_t_c),
         (None, ConvertedType::TIMESTAMP_MILLIS) => (TimeUnit::MILLIS, true),
         (None, ConvertedType::TIMESTAMP_MICROS) => (TimeUnit::MICROS, true),
-        _ => return Value::Null,
+        _ => return (Value::Null, false),
     };
-    let micros = match unit {
-        TimeUnit::MILLIS => n.checked_mul(1000),
-        TimeUnit::MICROS => Some(n),
-        TimeUnit::NANOS => (n % 1000 == 0).then_some(n / 1000),
+    let (rounded, cut, lossy) = match unit {
+        TimeUnit::MILLIS => (n.checked_mul(1000), None, false),
+        TimeUnit::MICROS => (Some(n), None, false),
+        TimeUnit::NANOS => nanos_to_micros(n),
     };
-    micros
-        .and_then(|v| if utc { crate::DateTime::with_offset(v, 0) } else { crate::DateTime::local(v) })
-        .map(Value::DateTime)
-        .unwrap_or_default()
+    let at = |v: i64| if utc { crate::DateTime::with_offset(v, 0) } else { crate::DateTime::local(v) };
+    match rounded.and_then(at).or_else(|| cut.and_then(at)) {
+        Some(t) => (Value::DateTime(t), lossy),
+        None => (Value::Null, false),
+    }
+}
+
+/// Nanoseconds since 1970 as microseconds: rounded to the nearest (halves up), the same cut down
+/// for where rounding up would leave the supported years, and whether any were lost.
+fn nanos_to_micros(n: i64) -> (Option<i64>, Option<i64>, bool) {
+    let (cut, rest) = (n.div_euclid(1000), n.rem_euclid(1000));
+    (Some(cut + i64::from(rest >= 500)), Some(cut), rest != 0)
 }
 
 /// One decoded column, with invalid non-null dates distinguished from stored nulls. Flags
 /// follow sampled row order so only features accepted by the geometry filter are counted.
 struct ColumnValues {
     values: Vec<Value>,
-    invalid: Vec<bool>,
+    /// Per row: 0, 1 for an invalid date, [`ROUNDED`] for a date-time rounded to the microsecond.
+    flags: Vec<u8>,
 }
+const INVALID: u8 = 1;
+const ROUNDED: u8 = 2;
 impl ColumnValues {
-    /// Returns an accepted feature's value and counts its invalid date, excluding filtered rows.
-    fn value(&self, row: usize, field: usize, counts: &mut Vec<usize>) -> Value {
-        if self.invalid.get(row) == Some(&true) {
-            super::unread_date(counts, field);
+    /// Returns an accepted feature's value and counts its invalid or rounded date, excluding filtered
+    /// rows.
+    fn value(&self, row: usize, field: usize, unread: &mut Vec<usize>, rounded: &mut Vec<usize>) -> Value {
+        match self.flags.get(row) {
+            Some(&INVALID) => super::unread_date(unread, field),
+            Some(&ROUNDED) => super::unread_date(rounded, field),
+            _ => {}
         }
         self.values.get(row).cloned().unwrap_or_default()
     }
 }
 
-/// Reads a field column for the selected rows, keeping invalid-date flags for the final filter.
+/// Reads a field column for the selected rows, keeping date flags for the final filter.
 fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<ColumnValues> {
     let desc = rg.metadata().column(col).column_descr_ptr();
     let max_def = desc.max_def_level();
     let scale = decimal_scale(&desc).map(|s| 10f64.powi(-s));
-    let mut invalid = Vec::new();
+    let mut flags = Vec::new();
     let mut int = |v: Option<i64>| {
-        invalid.push(false);
+        flags.push(0u8);
         if let Some(unit) = clock_kind(&desc) {
             return v
                 .map(|n| {
                     let value = clock_value(n, unit);
                     if value.is_null()
-                        && let Some(flag) = invalid.last_mut()
+                        && let Some(flag) = flags.last_mut()
                     {
-                        *flag = true;
+                        *flag = INVALID;
                     }
                     value
                 })
@@ -1225,11 +1245,15 @@ fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Col
         if matches!(field_type(&desc), Some(FieldType::Date | FieldType::DateTime)) {
             return v
                 .map(|i| {
-                    let value = temporal_value(&desc, i);
-                    if value.is_null()
-                        && let Some(flag) = invalid.last_mut()
-                    {
-                        *flag = true;
+                    let (value, rounded) = temporal_value(&desc, i);
+                    if let Some(flag) = flags.last_mut() {
+                        *flag = if value.is_null() {
+                            INVALID
+                        } else if rounded {
+                            ROUNDED
+                        } else {
+                            0
+                        };
                     }
                     value
                 })
@@ -1250,19 +1274,22 @@ fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Col
         ColumnReader::Int96ColumnReader(mut r) => read_column(&mut r, take, max_def)?
             .into_iter()
             .map(|v| {
-                invalid.push(false);
+                flags.push(0u8);
                 v.map(|v| {
                     let words = v.data();
                     let ns = u64::from(words.first().copied().unwrap_or(0)) | (u64::from(words.get(1).copied().unwrap_or(0)) << 32);
                     let day = i64::from(words.get(2).copied().unwrap_or(0)) - 2_440_588;
-                    let t = (ns < 86_400_000_000_000 && ns.is_multiple_of(1000))
-                        .then_some(())
-                        .and_then(|_| day.checked_mul(86_400_000_000)?.checked_add((ns / 1000) as i64))
-                        .and_then(crate::DateTime::local);
-                    if t.is_none()
-                        && let Some(flag) = invalid.last_mut()
-                    {
-                        *flag = true;
+                    let (rounded, cut, lossy) = nanos_to_micros(ns as i64);
+                    let at = |us: Option<i64>| day.checked_mul(86_400_000_000)?.checked_add(us?).and_then(crate::DateTime::local);
+                    let t = if ns < 86_400_000_000_000 { at(rounded).or_else(|| at(cut)) } else { None };
+                    if let Some(flag) = flags.last_mut() {
+                        *flag = if t.is_none() {
+                            INVALID
+                        } else if lossy {
+                            ROUNDED
+                        } else {
+                            0
+                        };
                     }
                     t.map(Value::DateTime).unwrap_or_default()
                 })
@@ -1281,7 +1308,7 @@ fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Col
             .collect(),
         _ => Vec::new(),
     };
-    Ok(ColumnValues { values, invalid })
+    Ok(ColumnValues { values, flags })
 }
 
 /// Longest plain-encoded binary dictionary entry without copying values. Validate lengths

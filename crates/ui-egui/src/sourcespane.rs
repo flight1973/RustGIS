@@ -53,12 +53,22 @@ pub fn load(app: &mut RustGisApp) {
         return;
     }
     app.ui.sources.loaded = true;
+    // A change made before this first read (a source just added, which is what usually brings
+    // it on) is still to be saved, with the stored lists.
+    let changed = app.session.sources.generation != app.ui.sources_saved;
     if let Some(text) = app.services.load_pref.as_ref().and_then(|load| load(PREF)) {
         // What this session already has (added, saved or made favourite before the first read)
-        // stays; the stored lists are added after it.
-        app.session.sources.merge(rustgis_engine::sources::Sources::from_json(&text));
+        // stays; the stored lists are added after it. What of them isn't used here is said.
+        let stored = rustgis_engine::sources::Sources::from_json(&text);
+        app.session.sources.merge(stored);
+        // After the merge: sources it moved past a list's limit are said too.
+        for said in app.session.sources.unread() {
+            app.session.warn(said);
+        }
     }
-    app.ui.sources_saved = app.session.sources.generation;
+    if !changed {
+        app.ui.sources_saved = app.session.sources.generation;
+    }
 }
 
 /// Keeps the sources with the preferences when they changed.

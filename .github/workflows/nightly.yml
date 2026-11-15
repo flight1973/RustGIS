@@ -125,6 +125,7 @@ jobs:
           PROPERTY_CASES=200000 cargo test --locked -p rustgis-data --test reprojection_round_trip
           PROPERTY_CASES=100000 cargo test --locked -p rustgis-geom --test geodesic_identities
           cargo test --locked -p rustgis-data --test extent_query_properties
+          PROPERTY_CASES=20000 cargo test --locked -p rustgis-data --test date_properties
 
   report:
     name: Report

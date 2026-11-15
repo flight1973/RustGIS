@@ -947,6 +947,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Scripted Delimited Text picks join the same background queue as ordinary file picks.
+    #[test]
+    fn scripted_delimited_picks_run_in_background() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let gzip = base64::engine::general_purpose::STANDARD.decode("H4sIAAAAAAAC/8tMqUlNLC6pycsvKsngcqwxNKgxMuACACT4xC0WAAAA").unwrap();
+        for (name, bytes) in [("scripted.dat", b"id|east|north\nA|10|20\n".as_slice()), ("scripted.csv.gz", gzip.as_slice())] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            app.reads_off_frame = true;
+            crate::dialogs::PICKED.with(|p| *p.borrow_mut() = Some(path.display().to_string()));
+            let result = app.run("ui.addDelimited", json!({"x":"east", "y":"north", "delimiter":"|"})).unwrap();
+            assert_eq!(result["started"], "Add Data");
+            assert!(app.session.map().layers.is_empty());
+            landed(&mut app, 30);
+            let point = app.session.map().layers[0].dataset.features[0].geometry.as_ref().unwrap().label_point().unwrap();
+            assert_eq!((point.x, point.y), (10.0, 20.0));
+        }
+    }
+
     /// The Error Inspector's check runs on a thread of its own (#1291), and its errors are kept as
     /// it lands.
     #[test]

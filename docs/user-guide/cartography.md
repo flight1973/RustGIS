@@ -711,6 +711,17 @@ range); **Aggregation** draws points as hexagon or square bins coloured by count
 oblique view on an untilted flat map and in perspective on a tilted map; the globe draws the
 polygons flat. See [Rotating and tilting the map](maps.md#navigating).
 
+An extrusion can stand on a **base**: its walls rise from the base to the base plus the height,
+so a balcony or a bridge floats above the ground. The base is a numeric field's value (such as the
+`base_height` the CityGML and CityJSON readers give each part), else a constant in metres, both
+multiplied by the same **Factor** as the height. A value that is no number takes the constant,
+and a negative base is the ground. Shadows fall from the base, roof labels sit at the top, and a
+web scene (**Publish › Share As › Web Scene**) raises the parts too. It is set with the
+`layer.extrusionBase` command (`field`, `base`), which changes nothing else; `"field": null`
+clears the field, and turning extrusion off drops the base with it. Without a tilt, and on a
+tilted map drawn without the graphics card, extrusions are painted in the order they stand on the
+ground, so a part raised over a building behind it may be painted under it.
+
 For a raster layer, the **Style** tab also has **Layer Blend** (multiply, screen, overlay,
 darken, lighten, difference), **Swipe** (the layer shows only left of a divider you slide, to
 compare it with what's beneath), **Masking** and **Rotation**.

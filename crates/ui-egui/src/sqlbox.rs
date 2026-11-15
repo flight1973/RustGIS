@@ -180,7 +180,7 @@ fn chips(ui: &mut Ui, text: &mut String, ds: &Dataset) {
         ui.label(RichText::new(tl!("Fields:")).small().weak());
         for f in ds.fields.iter().take(MAX_CHIPS) {
             if ui.small_button(&f.name).clicked() {
-                crate::dialogs::add_word(text, &field_ref(&f.name));
+                crate::dialogs::add_word(text, &crate::exprcomplete::field_ref(&f.name));
             }
         }
     });
@@ -192,28 +192,4 @@ fn chips(ui: &mut Ui, text: &mut String, ds: &Dataset) {
         }
         crate::dialogs::expr_menus(ui, text);
     });
-}
-
-/// A field as a clause names it: as it is when it reads as a plain name, else in double quotes.
-fn field_ref(name: &str) -> String {
-    let plain = name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && name.chars().all(|c| c.is_alphanumeric() || c == '_');
-    // The words the clause language reads itself (`rustgis_data::query`), values included.
-    let keyword = ["AND", "OR", "NOT", "LIKE", "IN", "IS", "NULL", "TRUE", "FALSE"].iter().any(|k| k.eq_ignore_ascii_case(name));
-    if plain && !keyword { name.to_string() } else { format!("\"{}\"", name.replace('"', "\"\"")) }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::field_ref;
-
-    #[test]
-    fn a_field_is_quoted_only_when_a_clause_needs_it() {
-        assert_eq!(field_ref("pop_max"), "pop_max");
-        assert_eq!(field_ref("Name 2"), "\"Name 2\"");
-        assert_eq!(field_ref("2020"), "\"2020\"");
-        assert_eq!(field_ref("in"), "\"in\"");
-        assert_eq!(field_ref("True"), "\"True\"");
-        assert_eq!(field_ref("año"), "año");
-        assert_eq!(field_ref("a\"b"), "\"a\"\"b\"");
-    }
 }

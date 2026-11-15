@@ -30,6 +30,7 @@ pub(crate) struct Unread {
     layer: String,
     rows: usize,
     dates: Option<String>,
+    rounded: Option<String>,
 }
 
 impl Whole {
@@ -70,12 +71,12 @@ impl Whole {
 
 impl Unread {
     /// What a whole read of `layer` couldn't read, to say.
-    fn of(layer: String, unread: Unreadable) -> Self {
-        Unread { layer, rows: unread.rows, dates: unread.dates }
+    pub(crate) fn of(layer: String, unread: Unreadable) -> Self {
+        Unread { layer, rows: unread.rows, dates: unread.dates, rounded: unread.rounded }
     }
 
-    /// Says the rows left out, as Load All Features says them, and the dates read as null
-    /// (nothing when there were none).
+    /// Says the rows left out, as Load All Features says them, the dates read as null and the
+    /// date-times rounded to the microsecond (nothing when there were none).
     pub(crate) fn say(&self, s: &mut Session) {
         if self.rows > 0 {
             s.warn(unread_notice(&self.layer, self.rows));
@@ -83,6 +84,16 @@ impl Unread {
         if let Some(dates) = &self.dates {
             s.notify(format!("{}: {dates}", self.layer), false);
         }
+        if let Some(rounded) = &self.rounded {
+            s.notify(format!("{}: {rounded}", self.layer), false);
+        }
+    }
+
+    /// What [`Unread::say`] says, as lines: for a tool's messages.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        let rows = (self.rows > 0).then(|| unread_notice(&self.layer, self.rows));
+        let dates = [&self.dates, &self.rounded].into_iter().flatten().map(|n| format!("{}: {n}", self.layer));
+        rows.into_iter().chain(dates).collect()
     }
 
     /// `error`, with the rows left out when there were any: they may be why it failed.

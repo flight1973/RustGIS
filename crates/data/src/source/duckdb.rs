@@ -43,9 +43,10 @@ const KEEP: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600)
 /// The column added to sort rows into geometry families; never in a result.
 const DIM: &str = "__rustgis_dim";
 
-/// What a converted table is written as: raised when that changes (dates as dates in 2), so a
-/// table converted before is converted again rather than kept as it was.
-const CONVERSION: u32 = 2;
+/// What a converted table is written as: raised when that changes (dates as dates in 2, nanosecond
+/// timestamps as timestamps in 3), so a table converted before is converted again rather than
+/// kept as it was.
+const CONVERSION: u32 = 3;
 
 /// A database named by commands: DuckDB files, PostgreSQL connections (also queryable through
 /// DuckDB's `postgres` extension), or live-only MySQL, MariaDB and SQL Server connections.
@@ -640,7 +641,7 @@ struct Column {
 
 /// Column types the GeoParquet provider reads as they are; others are written as text. Dates and
 /// timestamps are written as Parquet's own (a `TIMESTAMPTZ` as a UTC instant); a `TIMESTAMP_NS`
-/// stays text, which keeps its nanoseconds.
+/// too, which is read rounded to the microsecond and said.
 fn kept_as_is(ty: &str) -> bool {
     matches!(
         ty,
@@ -658,6 +659,7 @@ fn kept_as_is(ty: &str) -> bool {
             | "DATE"
             | "TIMESTAMP"
             | "TIMESTAMP_MS"
+            | "TIMESTAMP_NS"
             | "TIMESTAMP WITH TIME ZONE"
     ) || ty.starts_with("DECIMAL(")
 }
@@ -1370,7 +1372,8 @@ mod tests {
         .unwrap();
         assert_eq!(g, "geom");
         assert!(s.contains("(SELECT \"d\", ") && s.contains(", \"t\", ") && s.contains("ST_Force2D(\"geom\") AS \"geom\""), "{s}");
-        assert!(s.contains("CAST(\"ns\" AS VARCHAR)") && s.contains("CAST(\"l\" AS VARCHAR)"), "{s}");
+        assert!(s.contains("\"ns\",") && !s.contains("CAST(\"ns\""), "{s}");
+        assert!(s.contains("CAST(\"l\" AS VARCHAR)"), "{s}");
         assert!(s.contains("CAST(\"s\" AS TIMESTAMP) AS \"s\""), "{s}");
         assert!(s.contains(", \"n\",") && s.contains("ST_AsText(\"g2\")"), "{s}");
         // A geometry that says its coordinate system is converted; one given is used.
@@ -1486,6 +1489,20 @@ mod tests {
         let infinite = open(&out.parts[0].path).read(&crate::source::Request { extent: None, limit: 10 }).unwrap();
         assert_eq!(infinite.features.len(), 1);
         assert_eq!(infinite.unread_dates, [0, 1, 1, 1, 1, 1]);
+        // A nanosecond timestamp is a timestamp, rounded to the microsecond and counted.
+        let sql = "SELECT 1 AS id, TIMESTAMP_NS '2026-03-05 12:34:56.123456789' AS n, TIMESTAMP_NS '2026-03-05 12:34:56.123456' AS m, \
+            ST_Point(1, 2) AS geom";
+        let out = run_in(&cache, &Query { sql, ..Query::default() }, false).unwrap();
+        let nanos = open(&out.parts[0].path);
+        assert_eq!(
+            nanos.info().fields.iter().map(|f| f.ty).collect::<Vec<_>>(),
+            [crate::FieldType::Integer, crate::FieldType::DateTime, crate::FieldType::DateTime]
+        );
+        let batch = nanos.read(&crate::source::Request { extent: None, limit: 10 }).unwrap();
+        assert!(batch.unread_dates.is_empty());
+        assert_eq!(batch.rounded_dates, [0, 1]);
+        assert_eq!(batch.features[0].attrs[1].to_string(), "2026-03-05T12:34:56.123457");
+        assert_eq!(batch.features[0].attrs[2].to_string(), "2026-03-05T12:34:56.123456");
         // No temporary files are left.
         let names: Vec<String> =
             std::fs::read_dir(&cache).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();

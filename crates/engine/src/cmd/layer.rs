@@ -28,7 +28,7 @@ pub fn commands() -> Vec<C> {
             .view()
             .params(r#"{"path": string, "crs"?: "EPSG:… for a CityJSON model (.city.json, a .json, or in a zip) or a CityGML model (.gml, .xml, or in a zip): it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows (as layer.addData)"}"#),
         C::new("info.fileColumns", "List Columns in File", "Home › Add › Add Data › Delimited Text", file_columns).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
-            r#"{"path": "a delimited text file (CSV, TSV, TXT) or a spreadsheet", "delimiter"?: ","|";"|"\\t"|"|", "layer"?: "a spreadsheet's sheet (the first by default)"}"#,
+            r#"{"path": "a delimited text file (CSV, TSV, TXT, DAT, or gzip-compressed text) or a spreadsheet", "delimiter"?: ","|";"|"\\t"|"|", "layer"?: "a spreadsheet's sheet (the first by default)"}"#,
         ),
         C::new("layer.addSql", "Add Data From SQL", "Home › Add", add_sql)
             .roles(&[
@@ -1780,7 +1780,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         return add_gdal(s, p, path);
     }
     if rustgis_data::dxf::is_dxf_name(path) {
-        let (full, reads) = match super::reads::take::<CityRead>(s, &whole_key(path)) {
+        let (full, reads) = match super::reads::take::<LayersRead>(s, &whole_key(path)) {
             Some(read) => read,
             None => read_dxf_file(p, path),
         }?;
@@ -1790,14 +1790,14 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         return add_reads(s, p, &full, reads, Vec::new(), None);
     }
     if rustgis_data::io::is_multi_layer_name(path) {
-        // A city model read ahead (the desktop app's, on a thread of its own): its layers, as
-        // add_layers reads them here.
-        if let Some(read) = super::reads::take::<CityRead>(s, &city_key(path)) {
+        // A city model or ZIP read ahead on the desktop: add the prepared layers without
+        // reading the file again on the UI thread.
+        if let Some(read) = super::reads::take::<LayersRead>(s, &layers_key(path)) {
             if let Some(crs) = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()) {
                 super::say_crs_note(s, crs);
             }
             let (full, reads) = read?;
-            return add_picked(s, p, &full, reads, true, Vec::new(), None);
+            return add_picked(s, p, &full, reads, !path.to_ascii_lowercase().ends_with(".zip"), Vec::new(), None);
         }
         let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
         if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
@@ -1823,7 +1823,7 @@ fn whole_key(path: &str) -> String {
 }
 
 /// A city model's layers in the coordinate system given, over the one it names: what
-/// [`add_layers`] reads, and Add Data's read ahead ([`read_city_file`]).
+/// [`add_layers`] reads, and Add Data's read ahead ([`read_layers_file`]).
 fn city_reads(file_name: &str, bytes: &[u8], crs: Option<rustgis_data::raster::Crs>) -> Result<Vec<rustgis_data::io::LayerRead>, String> {
     Ok(rustgis_data::io::read_city_model(file_name, bytes, crs)
         .map_err(|e| e.to_string())?
@@ -1835,12 +1835,12 @@ fn city_reads(file_name: &str, bytes: &[u8], crs: Option<rustgis_data::raster::C
         .collect())
 }
 
-/// A city model's layers, read whole, with the full path they are read under.
-type CityRead = Result<(String, Vec<rustgis_data::io::LayerRead>), String>;
+/// A city model or ZIP's layers, read whole, with the full path they are read under.
+type LayersRead = Result<(String, Vec<rustgis_data::io::LayerRead>), String>;
 
-/// The key Add Data's read of the city model at `path` is taken by.
-fn city_key(path: &str) -> String {
-    format!("city:{path}")
+/// The key Add Data's read of the layers at `path` is taken by.
+fn layers_key(path: &str) -> String {
+    format!("layers:{path}")
 }
 
 /// Whether Add Data reads `path` as a city model's layers: a CityJSON model named `.city.json`, or
@@ -1861,10 +1861,11 @@ fn is_city_model_path(path: &str) -> bool {
         .is_ok_and(|_| rustgis_data::citygml::looks_like_citygml(&head))
 }
 
-/// A city model's layers, read as [`add_layers`] reads them: in the coordinate system `p` gives
-/// (over the one the model names), or as the file says.
+/// A city model or ZIP's layers, as [`add_layers`] reads them. The desktop runs this off the
+/// UI thread; a ZIP's CRS applies to Shapefiles, text tables and unnamed city models, as when read inline.
+/// Reading the compressed file and inflating one ZIP member cannot be interrupted mid-read.
 #[cfg(not(target_arch = "wasm32"))]
-fn read_city_file(p: &Value, path: &str) -> CityRead {
+fn read_layers_file(p: &Value, path: &str) -> LayersRead {
     let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
     if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
         return Err(format!("{path} is too large to open"));
@@ -1873,6 +1874,13 @@ fn read_city_file(p: &Value, path: &str) -> CityRead {
     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty());
     let reads = match crs {
+        Some(text) if full.to_ascii_lowercase().ends_with(".zip") => {
+            rustgis_data::io::read_zip_in(&full, &bytes, Some(rustgis_data::raster::Crs::parse(text)?))
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|(dataset, report)| rustgis_data::io::LayerRead { dataset, report, styles: Vec::new() })
+                .collect()
+        }
         Some(text) if rustgis_data::io::is_city_model(&full, &bytes) => {
             city_reads(&full, &bytes, Some(rustgis_data::raster::Crs::parse(text)?))?
         }
@@ -1883,7 +1891,7 @@ fn read_city_file(p: &Value, path: &str) -> CityRead {
 
 /// A DXF drawing read whole with its import options. Parsing checks Cancel between entities;
 /// decoding and the bounded file read complete before cancellation can be observed.
-fn read_dxf_file(p: &Value, path: &str) -> CityRead {
+fn read_dxf_file(p: &Value, path: &str) -> LayersRead {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut bytes = Vec::new();
@@ -2041,11 +2049,11 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
         && !(lower.ends_with(".json") && (given("crs") || given("layer")))
         && std::fs::metadata(&path)
             .is_ok_and(|m| m.is_file() && (b(p, "stream") == Some(false) || m.len() <= rustgis_data::source::geojson::IN_PLACE_ABOVE));
-    // A city model: its layers, read whole. A model named `.json` (not `.city.json`) is a file of
-    // several layers only with a coordinate system or a layer given, which Add Data reads as it runs.
-    if rustgis_data::io::is_multi_layer_name(&path) && is_city_model_path(&path) {
-        let (key, q) = (city_key(&path), p.clone());
-        return Some(ahead(NAME, key, move || read_city_file(&q, &path)));
+    // A ZIP or city model: its layers, read whole. A model named `.json` (not `.city.json`) is a
+    // file of several layers only with options given, which Add Data reads as it runs.
+    if lower.ends_with(".zip") || (rustgis_data::io::is_multi_layer_name(&path) && is_city_model_path(&path)) {
+        let (key, q) = (layers_key(&path), p.clone());
+        return Some(ahead(NAME, key, move || read_layers_file(&q, &path)));
     }
     // A Shapefile read whole, in the coordinate system given if one is: as add_data reads it (one
     // past the whole-file reader's cap, or with more records than it takes, is read in place).
@@ -2683,8 +2691,14 @@ fn add_source_with(
                 l.renderer = r;
             }
             ids.push(id);
+            // The source names itself by its file (a DuckDB result's cache file); the layer has the
+            // name the user knows.
+            let shown = s.map().layer(id).map_or_else(|| info.name.clone(), |l| l.name.clone());
             for m in report.messages {
-                s.notify(m, false);
+                match m.strip_prefix(&format!("{}: ", info.name)) {
+                    Some(rest) => s.notify(format!("{shown}: {rest}"), false),
+                    None => s.notify(m, false),
+                }
             }
         }
     }
@@ -3577,6 +3591,12 @@ pub fn columns_in_file(path: &str, p: &Value) -> CmdResult {
     if meta.len() > limit {
         return Err(format!("{path} is too large to open"));
     }
+    if rustgis_data::io::is_gzip_text_name(path) {
+        let reader = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let prefix = rustgis_data::io::gzip_text_prefix(reader, COLUMNS_PREFIX).map_err(|e| format!("{path}: {e}"))?;
+        let plain = path.get(..path.len().saturating_sub(3)).unwrap_or(path);
+        return gzip_columns(plain, &prefix, p);
+    }
     let mut bytes = Vec::new();
     let read = if sheet {
         std::fs::File::open(path).and_then(|mut f| f.read_to_end(&mut bytes))
@@ -3585,6 +3605,16 @@ pub fn columns_in_file(path: &str, p: &Value) -> CmdResult {
     };
     read.map_err(|e| format!("{path}: {e}"))?;
     columns_of(path, &bytes, p)
+}
+
+/// Gzip import accepts UTF-8 only. A bounded picker prefix may end inside one character.
+fn gzip_columns(plain: &str, prefix: &[u8], p: &Value) -> CmdResult {
+    let text = match std::str::from_utf8(prefix) {
+        Ok(text) => text,
+        Err(e) if e.error_len().is_none() => std::str::from_utf8(prefix.get(..e.valid_up_to()).unwrap_or_default()).unwrap_or_default(),
+        Err(_) => return Err(format!("{plain}.gz: gzip text must be UTF-8; decompress and add as .txt for another encoding")),
+    };
+    columns_of(plain, text.as_bytes(), p)
 }
 
 /// What `info.fileColumns` reads of delimited text: its header and first rows, not all of it.
@@ -3599,6 +3629,10 @@ pub fn columns_of(name: &str, bytes: &[u8], p: &Value) -> CmdResult {
     let c = if rustgis_data::sheets::is_sheet_name(name) {
         let sheet = ps(p, "layer").map(str::trim).filter(|l| !l.is_empty());
         rustgis_data::sheets::columns(bytes, sheet).map_err(err)?
+    } else if rustgis_data::io::is_gzip_text_name(name) {
+        let prefix = rustgis_data::io::gzip_text_prefix(bytes, COLUMNS_PREFIX).map_err(err)?;
+        let plain = name.get(..name.len().saturating_sub(3)).unwrap_or(name);
+        return gzip_columns(plain, &prefix, p);
     } else if is_delimited_name(name) {
         let bytes = bytes.get(..COLUMNS_PREFIX).unwrap_or(bytes);
         let text = match std::str::from_utf8(bytes) {
@@ -3612,7 +3646,7 @@ pub fn columns_of(name: &str, bytes: &[u8], p: &Value) -> CmdResult {
         };
         rustgis_data::io::csv_columns(&text, parse_delimiter(ps(p, "delimiter"))?).map_err(err)?
     } else {
-        return Err(format!("{name}: not delimited text (CSV, TSV, TXT) or a spreadsheet"));
+        return Err(format!("{name}: not delimited text (CSV, TSV, TXT, DAT, or gzip-compressed text) or a spreadsheet"));
     };
     Ok(json!({
         "columns": c.names,
@@ -3623,10 +3657,9 @@ pub fn columns_of(name: &str, bytes: &[u8], p: &Value) -> CmdResult {
     }))
 }
 
-/// Whether a file name is delimited text (CSV, TSV, TXT).
+/// Whether a file name is delimited text (CSV, TSV, TXT or DAT).
 fn is_delimited_name(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    n.ends_with(".csv") || n.ends_with(".tsv") || n.ends_with(".txt")
+    rustgis_data::io::is_delimited_name(name)
 }
 
 /// Reads delimited text with the options `p` gives, or `None` when it gives none (or the file
@@ -3639,18 +3672,26 @@ fn read_delimited(
     if !is_delimited_name(name) {
         return Ok(None);
     }
-    let Some(opts) = csv_options(p)? else { return Ok(None) };
-    let bytes = bytes()?;
-    let (text, note) = rustgis_data::io::delimited_text(name, &bytes).map_err(|e| e.to_string())?;
-    let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
-    let (ds, mut report) = rustgis_data::io::read_csv_with(&text, stem, &opts).map_err(|e| format!("{name}: {e}"))?;
-    report.messages.extend(note);
+    if csv_options(p)?.is_none() {
+        return Ok(None);
+    }
+    read_delimited_bytes(p, name, &bytes()?).map(Some)
+}
+
+/// Reads local/uploaded delimited bytes with the same options and CRS notices on every path.
+pub(crate) fn read_delimited_bytes(
+    p: &Value,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(rustgis_data::Dataset, rustgis_data::ReadReport), String> {
+    let opts = csv_options(p)?.unwrap_or_default();
+    let (ds, mut report) = rustgis_data::io::read_delimited_bytes(name, bytes, &opts).map_err(|e| format!("{name}: {e}"))?;
     if let (Some(text), Some(crs)) = (ps(p, "crs"), opts.crs)
         && let Some(note) = rustgis_data::raster::wkt::typed_crs_note(text, crs)
     {
         report.messages.push(format!("crs: {note}"));
     }
-    Ok(Some((ds, report)))
+    Ok((ds, report))
 }
 
 /// The file name for data downloaded from `url`: its last path segment when that has an extension

@@ -138,6 +138,11 @@ pub fn commands() -> Vec<C> {
         .effects(crate::policy::Effects::NONE)
         .when(need_polygons)
         .params(r#"{"layer"?, "lighting"?: bool, "shadows"?: bool}"#),
+        C::new("layer.extrusionBase", "Extrusion Base", "Style › Extrusion", extrusion_base)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE)
+            .when(need_polygons)
+            .params(r#"{"layer"?, "field"?: numeric field (metres; null or "" clears it), "base"?: metres (0 to 10,000,000)}"#),
     ]
 }
 
@@ -175,19 +180,7 @@ fn extrusion(s: &mut Session, p: &Value) -> CmdResult {
     let x = match ps(p, "type").ok_or("type is required")? {
         "none" => None,
         t @ ("height" | "field") => {
-            let field = if t == "field" {
-                let n = ps(p, "field").ok_or("field is required")?;
-                Some(
-                    l.dataset
-                        .field_index(n)
-                        .and_then(|i| l.dataset.fields.get(i))
-                        .filter(|f| f.ty.is_numeric())
-                        .map(|f| f.name.clone())
-                        .ok_or_else(|| format!("no numeric field '{n}'"))?,
-                )
-            } else {
-                None
-            };
+            let field = if t == "field" { Some(numeric_field(&l.dataset, ps(p, "field").ok_or("field is required")?)?) } else { None };
             let keep = prev.unwrap_or_default();
             Some(Extrusion {
                 field,
@@ -206,6 +199,54 @@ fn extrusion(s: &mut Session, p: &Value) -> CmdResult {
         o.insert("note".into(), json!("extrusion shows on flat maps; the globe draws the polygons flat"));
     }
     Ok(r)
+}
+
+/// The name of the numeric field `n` (matched as `field_index` matches), or why there is none.
+fn numeric_field(ds: &rustgis_data::Dataset, n: &str) -> Result<String, String> {
+    ds.field_index(n)
+        .and_then(|i| ds.fields.get(i))
+        .filter(|f| f.ty.is_numeric())
+        .map(|f| f.name.clone())
+        .ok_or_else(|| format!("no numeric field '{n}'"))
+}
+
+/// `layer.extrusionBase`: what an extruded layer's walls stand on, a numeric field (`field`) else
+/// a constant (`base`), in metres times the extrusion's factor. Each left out stays as it is, so
+/// the height, its field and the factor never change here; null or an empty name clears the
+/// field, and a base that is no number, or is outside 0 to 1e7 metres (the height's limit), is
+/// refused rather than changed.
+fn extrusion_base(s: &mut Session, p: &Value) -> CmdResult {
+    let id = s.layer_id(p)?;
+    let l = s.map().layer(id).ok_or("no such layer")?;
+    if l.extrusion.is_none() {
+        return Err("turn extrusion on first (Layer Extrusion)".into());
+    }
+    let field = match p.get("field") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(v) => match v.as_str().ok_or("field is a field name, or null to clear it")? {
+            "" => Some(None),
+            n => Some(Some(numeric_field(&l.dataset, n)?)),
+        },
+    };
+    let base = match p.get("base") {
+        None => None,
+        Some(_) => {
+            let b = f(p, "base").ok_or("base is a number of metres")?;
+            if !(0.0..=1e7).contains(&b) {
+                return Err("base is between 0 and 10,000,000 metres".into());
+            }
+            Some(b)
+        }
+    };
+    change_extrusion(s, p, |x| {
+        if let Some(v) = field {
+            x.base_field = v;
+        }
+        if let Some(v) = base {
+            x.base = v;
+        }
+    })
 }
 
 fn change_extrusion(s: &mut Session, p: &Value, f: impl FnOnce(&mut Extrusion)) -> CmdResult {

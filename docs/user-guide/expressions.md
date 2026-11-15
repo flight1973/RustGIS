@@ -190,6 +190,14 @@ text against a pattern of many `%`s) is unknown.
 
 ## Calculate Field
 
+As the expression is typed, a list under the cursor suggests what can go there: the fields
+(quoted when their name needs it: `"Pop Est"`), the functions, the variables and the keywords
+that start with what's typed, each with its help beside (a function's signature, description
+and example; a field's type). Ctrl+Space opens it with nothing typed (on macOS, where Ctrl+Space
+may switch the input source, type the first letter instead). ↑/↓ move through it, Enter
+or Tab take the highlighted item (Enter doesn't calculate while the list is open) and Escape
+closes it. Inside a quoted field name (`"Pop`) only fields are suggested.
+
 A number goes into a number field as it is: a decimal field keeps every digit of `1 / 3` (a
 whole number past 2^53 becomes the nearest decimal, as a decimal field holds it). A whole-number
 field holds whole numbers, so a decimal result, or text written as one, loses its fraction toward

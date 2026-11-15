@@ -40,6 +40,7 @@ mod editpanes;
 mod embeddingsui;
 #[cfg(not(target_arch = "wasm32"))]
 mod exportjob;
+mod exprcomplete;
 mod extensionsui;
 mod failureui;
 mod fieldlists;
@@ -78,6 +79,8 @@ mod popupmedia;
 mod portalsui;
 #[cfg(not(target_arch = "wasm32"))]
 mod readjob;
+#[cfg(not(target_arch = "wasm32"))]
+mod syncmark;
 
 /// How a command asked for ended ([`readjob::run_then`] on the desktop; the browser runs it where
 /// it's asked): what it answered when it ran, or why it never ran (cancelled, or left), which is
@@ -1205,6 +1208,9 @@ pub struct RustGisApp {
     pub watch_files: bool,
     #[cfg(not(target_arch = "wasm32"))]
     diskwatch: diskwatch::Watch,
+    /// Which layers hold edits their file lacks, for the Layers pane.
+    #[cfg(not(target_arch = "wasm32"))]
+    syncmark: syncmark::Marks,
     /// ModelBuilder's view: the model on its canvas.
     pub mb: modelbuilder::ModelBuilder,
     pub ws: workspacepanes::WorkspaceState,
@@ -1476,6 +1482,8 @@ impl RustGisApp {
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]
             diskwatch: diskwatch::Watch::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            syncmark: syncmark::Marks::default(),
             mb: modelbuilder::ModelBuilder::default(),
             ws: workspacepanes::WorkspaceState::default(),
             time: timebar::TimeBarState::default(),
@@ -2001,14 +2009,17 @@ impl RustGisApp {
             || rustgis_engine::data::source::is_source_name(name)
             || rustgis_engine::data::io::is_multi_layer_name(name)
             || rustgis_engine::data::sheets::is_sheet_name(name)
+            || lower.ends_with(".gz")
+            || (lower.ends_with(".dat") && std::str::from_utf8(bytes).is_err())
         {
             use base64::Engine;
             let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut p = json!({"fileName": name, "data": data});
-            // A picked spreadsheet, Shapefile ZIP or DXF takes its import options.
+            // Picked vector files and delimited tables retain their import options.
             let takes_options = rustgis_engine::data::sheets::is_sheet_name(name)
                 || lower.ends_with(".zip")
-                || rustgis_engine::data::dxf::is_dxf_name(name);
+                || rustgis_engine::data::dxf::is_dxf_name(name)
+                || rustgis_engine::data::io::is_delimited_name(name);
             if let Some(Value::Object(opts)) = opts.filter(|_| takes_options) {
                 for (k, v) in opts {
                     p[k] = v;
@@ -2030,7 +2041,7 @@ impl RustGisApp {
             r
         } else {
             let mut p = json!({"fileName": name, "text": text});
-            if let Some(Value::Object(opts)) = opts.filter(|_| [".csv", ".tsv", ".txt"].iter().any(|e| lower.ends_with(e))) {
+            if let Some(Value::Object(opts)) = opts.filter(|_| rustgis_engine::data::io::is_delimited_name(name)) {
                 for (k, v) in opts {
                     p[k] = v;
                 }
@@ -2075,7 +2086,7 @@ impl RustGisApp {
         }
         // On Android the file is written once the user has chosen its place, and the shell
         // says then whether it was.
-        let offered = if cfg!(target_os = "android") {
+        let offered = if cfg!(any(target_os = "android", target_os = "ios")) {
             crate::i18n::fmt("Choose where to save {name}.", &[("name", &file)])
         } else {
             crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)])
@@ -2100,7 +2111,7 @@ impl RustGisApp {
                     self.session.notify(e, true);
                     return false;
                 }
-                let offered = if cfg!(target_os = "android") {
+                let offered = if cfg!(any(target_os = "android", target_os = "ios")) {
                     crate::i18n::fmt("Choose where to save {name}.", &[("name", name)])
                 } else {
                     crate::i18n::fmt("Download offered: {name}", &[("name", name)])
@@ -3685,13 +3696,18 @@ impl RustGisApp {
                     // `null`: the dialog, for the file picked.
                     self.ui.pending_csv = Some(opts.unwrap_or(Value::Null));
                     open("text");
-                } else if let Some(path) =
-                    dialogs::pick_open(&["csv", "tsv", "txt", "xlsx", "xlsm", "xlsb", "xls", "ods"], tl!("Delimited text and spreadsheets"))
-                {
+                } else if let Some(path) = dialogs::pick_open(
+                    &["csv", "tsv", "txt", "dat", "gz", "xlsx", "xlsm", "xlsb", "xls", "ods"],
+                    tl!("Delimited text and spreadsheets"),
+                ) {
                     return match opts {
                         Some(mut q) => {
                             q["path"] = json!(path);
-                            self.run("layer.addData", q)
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let added = readjob::run(self, "layer.addData", q);
+                            #[cfg(target_arch = "wasm32")]
+                            let added = self.run("layer.addData", q);
+                            added
                         }
                         None => dialogs::open_csv(self, &path.clone(), dialogs::CsvSource::Path(path)),
                     };
@@ -3891,6 +3907,9 @@ impl RustGisApp {
                             "json",
                             "csv",
                             "tsv",
+                            "txt",
+                            "dat",
+                            "gz",
                             "xlsx",
                             "xlsm",
                             "xlsb",
@@ -4603,7 +4622,7 @@ impl RustGisApp {
                 if lost.rows > 0 {
                     dbf_notes.push(format!("{name}: {} rows couldn't be read and were left out", lost.rows));
                 }
-                dbf_notes.extend(lost.dates.iter().map(|n| format!("{name}: {}: {n}, so they're empty in the export", l.name)));
+                dbf_notes.extend(rustgis_engine::cmd::share::read_date_notes(&name, &l.name, &lost));
                 // CSV holds a point a row, GPX a name for each feature and no areas.
                 dbf_notes.extend(io::export_losses_notes(ds, &ext, io::name_field(ds), &name));
                 if let Some(note) = io::left_out_note(&name, &ext, left_out) {
@@ -5904,6 +5923,8 @@ impl RustGisApp {
         if self.watch_files {
             diskwatch::tick(self, ctx);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        syncmark::tick(self);
         self.ensure_script_font();
         // Fonts downloaded by the web app.
         let fonts: Vec<(String, Vec<u8>)> = match &self.services.font_inbox {
@@ -5969,13 +5990,22 @@ impl RustGisApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(250));
             }
         }
-        // A picker Android doesn't have was asked for: said, as the click did nothing.
+        // A picker the phone doesn't have was asked for: said, as the click did nothing.
         #[cfg(target_os = "android")]
         for what in filedialog::take_refused() {
             let text = match what {
                 "choose a folder" => tl!("Choosing a folder isn't available on Android yet."),
                 "save a file" => tl!("Saving to a file of your choice isn't available here on Android yet."),
                 _ => tl!("Choosing a file isn't available here on Android yet."),
+            };
+            self.session.notify(text, false);
+        }
+        #[cfg(target_os = "ios")]
+        for what in filedialog::take_refused() {
+            let text = match what {
+                "choose a folder" => tl!("Choosing a folder isn't available on iOS yet."),
+                "save a file" => tl!("Saving to a file of your choice isn't available here on iOS yet."),
+                _ => tl!("Choosing a file isn't available here on iOS yet."),
             };
             self.session.notify(text, false);
         }

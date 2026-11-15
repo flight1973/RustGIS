@@ -235,7 +235,7 @@ basemaps; [Natural Earth](https://www.naturalearthdata.com),
 [OpenStreetMap](https://www.openstreetmap.org), [Overture Maps](https://overturemaps.org) and the
 EPSG dataset; and the Rust crates it is made of, among them [egui](https://github.com/emilk/egui),
 [wgpu](https://wgpu.rs), [tiny-skia](https://github.com/linebender/tiny-skia),
-[geo](https://github.com/georust/geo), [proj4rs](https://crates.io/crates/proj4rs),
+[geo](https://github.com/georust/geo), [terrio-crs](https://github.com/opengeos/terrio),
 [tiff](https://github.com/image-rs/image-tiff), Apache Arrow and Parquet,
 [rusqlite](https://github.com/rusqlite/rusqlite) and [wasmi](https://github.com/wasmi-labs/wasmi).
 See the [acknowledgements](https://rustgis.app/acknowledgements/) for the full list, and

@@ -838,6 +838,9 @@ mod native {
         }
     }
 
+    /// The sign-in store at `path` (none: no account). One that isn't JSON, or that a newer
+    /// RustGIS saved (a `version` above [`STORE_VERSION`]), is an error: every change reads it
+    /// first, so it is never written over.
     fn read_accounts(path: &Path) -> Result<Accounts, Error> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -845,6 +848,21 @@ mod native {
             Err(e) => return Err(e.to_string().into()),
         };
         let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|_| "the sign-in store isn't JSON")?;
+        // One a newer RustGIS wrote may hold what this version would lose by writing it again: it
+        // is neither used nor written over.
+        match v.get("version").map(|version| version.as_u64().ok_or(version)) {
+            Some(Ok(version)) if version > STORE_VERSION => {
+                return Err(Error::new(
+                    Recovery::Auth,
+                    format!(
+                        "the ChatGPT sign-ins were saved by a newer RustGIS (version {version}; this one reads {STORE_VERSION}): use that RustGIS, or update this one"
+                    ),
+                ));
+            }
+            // A version that isn't a plain integer can't be told from a newer one's.
+            Some(Err(_)) => return Err("the sign-in store's version isn't a whole number".into()),
+            _ => {}
+        }
         if let Some(entries) = v.get("accounts").and_then(Value::as_array) {
             let entries = entries.iter().map(Credentials::from_json).collect::<Result<Vec<_>, _>>()?;
             let active =
@@ -857,6 +875,11 @@ mod native {
         }
     }
 
+    /// The version of the sign-in store this RustGIS reads and writes.
+    const STORE_VERSION: u64 = 2;
+
+    /// Writes the sign-in store as version [`STORE_VERSION`], without tokens except a settings
+    /// file's own from before the keychain.
     fn write_accounts(path: &Path, accounts: &Accounts) -> Result<(), Error> {
         let active = accounts.active.as_ref().map(|(client, subject)| serde_json::json!({"client_id": client, "subject": subject}));
         let entry = |c: &Credentials| {
@@ -871,7 +894,7 @@ mod native {
         };
         write_private(
             path,
-            &serde_json::json!({"version": 2, "active": active, "accounts": accounts.entries.iter().map(entry).collect::<Vec<_>>()})
+            &serde_json::json!({"version": STORE_VERSION, "active": active, "accounts": accounts.entries.iter().map(entry).collect::<Vec<_>>()})
                 .to_string(),
         )
     }
@@ -2021,6 +2044,35 @@ mod native {
             remove_at(&path, &v, "oaiapp_other", "user-1").unwrap();
             assert!(read_accounts(&path).unwrap().selected().is_none());
             assert!(remove_at(&path, &v, "oaiapp_other", "user-1").unwrap().is_none());
+        }
+
+        /// A store a newer RustGIS saved is neither used nor written over, whatever is asked of it.
+        #[test]
+        fn a_store_from_a_newer_version_is_kept_as_it_is() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("auth.json");
+            let store = Arc::new(MemorySecrets::new());
+            let v = sharing(&store);
+            write_credentials(&path, &v, &synthetic(now() + 100_000)).unwrap();
+            let mut newer: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            newer["version"] = serde_json::json!(3);
+            newer["devices"] = serde_json::json!([{"id": "d1"}]);
+            let text = newer.to_string();
+            std::fs::write(&path, &text).unwrap();
+            let e = read_accounts(&path).err().unwrap();
+            assert!(e.to_string().contains("newer RustGIS (version 3; this one reads 2)"), "{e}");
+            assert!(read_credentials(&path, &v).is_err());
+            assert!(write_credentials(&path, &v, &synthetic(now() + 100_000)).is_err());
+            assert!(sign_out_at(&path, &v).is_err());
+            assert!(remove_at(&path, &v, "oaiapp_synthetic", "user-1").is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            // A version that isn't a plain integer is unreadable, not newer-or-not.
+            for odd in [serde_json::json!("3"), serde_json::json!(3.0), serde_json::json!(true)] {
+                let mut v: Value = serde_json::from_str(&text).unwrap();
+                v["version"] = odd;
+                std::fs::write(&path, v.to_string()).unwrap();
+                assert!(read_accounts(&path).is_err());
+            }
         }
 
         #[test]

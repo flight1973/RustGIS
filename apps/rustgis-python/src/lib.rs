@@ -174,7 +174,7 @@ impl Engine {
                     1 => session.warn(format!("{name}: 1 row couldn't be read and was left out")),
                     n => session.warn(format!("{name}: {n} rows couldn't be read and were left out")),
                 }
-                if let Some(dates) = unread.dates {
+                for dates in [unread.dates, unread.rounded].into_iter().flatten() {
                     session.notify(format!("{name}: {dates}"), false);
                 }
                 return Ok(rustgis_engine::data::io::to_geojson(&ds).to_string());

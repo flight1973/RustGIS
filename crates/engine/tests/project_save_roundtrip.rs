@@ -15,7 +15,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestCaseError, TestRng, TestRunner};
 use rustgis_engine::{
     Project, Session,
-    data::{Dataset, Field, FieldType, GeometryType},
+    data::{Dataset, Field, FieldType, GeometryType, Value as DataValue},
 };
 use serde_json::{Value, json};
 use std::path::Path;
@@ -71,7 +71,7 @@ fn step() -> impl Strategy<Value = (&'static str, Value)> {
     let layer = (0usize..4).prop_map(|i| format!("@L{i}"));
     prop_oneof![
         (layer.clone(), color()).prop_map(|(l, c)| ("layer.symbology", json!({"layer": l, "type": "single", "color": c}))),
-        (layer.clone(), prop::sample::select(vec!["name", "flag", "pop"]))
+        (layer.clone(), prop::sample::select(vec!["name", "flag", "pop", "day", "seen"]))
             .prop_map(|(l, f)| ("layer.symbology", json!({"layer": l, "type": "unique", "field": f}))),
         layer.clone().prop_map(|l| ("layer.symbology", json!({"layer": l, "type": "unique", "expression": "name || '!'"}))),
         (layer.clone(), 1u32..13, prop::sample::select(vec!["equal", "quantile", "natural", "manual"]))
@@ -87,7 +87,7 @@ fn step() -> impl Strategy<Value = (&'static str, Value)> {
         (layer.clone(), color(), number()).prop_map(|(l, c, w)| ("layer.outline", json!({"layer": l, "color": c, "width": w / 10.0}))),
         (layer.clone(), prop::sample::select(vec!["A", "★", "😀"]), number())
             .prop_map(|(l, c, n)| ("layer.marker", json!({"layer": l, "char": c, "size": n}))),
-        (layer.clone(), prop::sample::select(vec!["pop > 10", "name = 'é'", ""]))
+        (layer.clone(), prop::sample::select(vec!["pop > 10", "name = 'é'", "", "day >= '2000-01-01'", "seen < '2026-03-05T08:00Z'"]))
             .prop_map(|(l, w)| ("layer.definitionQuery", json!({"layer": l, "where": w}))),
         (layer.clone(), prop::sample::select(vec!["multiply", "screen", "normal"]))
             .prop_map(|(l, m)| ("layer.blend", json!({"layer": l, "mode": m}))),
@@ -112,7 +112,8 @@ fn step() -> impl Strategy<Value = (&'static str, Value)> {
         (name(), layer.clone(), layer.clone()).prop_map(|(n, a, b)| ("group.add", json!({"name": n, "layers": [a, b]}))),
         (layer.clone(), layer.clone()).prop_map(|(a, b)| ("@nest", json!([a, b]))),
         name().prop_map(|n| ("bookmark.add", json!({"name": n}))),
-        layer.clone().prop_map(|l| ("time.bind", json!({"layer": l, "field": "when"}))),
+        (layer.clone(), prop::sample::select(vec!["when", "day", "seen"]))
+            .prop_map(|(l, f)| ("time.bind", json!({"layer": l, "field": f}))),
         (prop::sample::select(vec!["2015-01", "2020-02-29", "1900-01-01"]), 1u32..5, prop::sample::select(vec!["cumulative", "wide"]))
             .prop_map(|(d, i, w)| ("time.set", json!({"start": "1900", "end": "2030", "date": d, "interval": i, "show": w}))),
         name().prop_map(|n| ("layout.new", json!({"name": n}))),
@@ -131,6 +132,12 @@ fn step() -> impl Strategy<Value = (&'static str, Value)> {
             .prop_map(|(l, row, v)| ("@poison", json!([l, row, v.to_string()]))),
     ]
 }
+
+/// Dates and moments of the fixture's rows (rows past them hold null), at the ends of years 1 to
+/// 9999, around the epoch, on leap days, with microseconds, no zone, `Z` and odd offsets.
+const DAYS: [&str; 4] = ["0001-01-01", "1969-12-31", "2024-02-29", "9999-12-31"];
+const MOMENTS: [&str; 4] =
+    ["9999-12-31T23:59:59.999999", "2026-03-05T14:30:00.123456+05:45", "0001-01-01T00:00:00-12:00", "1969-12-31T23:59:59-09:30"];
 
 /// The fixture: points, lines and polygons with text, numbers, dates and yes/no values, and an
 /// empty layer, each under a generated name.
@@ -151,8 +158,27 @@ fn layers(s: &mut Session, names: &[String]) -> Vec<u32> {
         s.run("layer.addDataText", &json!({"fileName": "layer.geojson", "text": text, "name": name})).unwrap();
         ids.extend(s.map().layers.iter().map(|l| l.id).filter(|id| !before.contains(id)));
     }
+    // GeoJSON dates stay text, so the date fields are added as a reader of a typed format leaves
+    // them: days and moments on the edges of the model, with offsets, and nulls.
+    for id in &ids {
+        let Some(l) = s.map_mut().layer_mut(*id) else { continue };
+        let (day, seen) = (l.dataset.ensure_field("day", FieldType::Date), l.dataset.ensure_field("seen", FieldType::DateTime));
+        for (i, f) in l.dataset.features.iter_mut().enumerate() {
+            let cell = |t: Option<&&str>, ty| t.map_or(DataValue::Null, |t| DataValue::parse(t, ty));
+            if let Some(c) = f.attrs.get_mut(day) {
+                *c = cell(DAYS.get(i), FieldType::Date);
+            }
+            if let Some(c) = f.attrs.get_mut(seen) {
+                *c = cell(MOMENTS.get(i), FieldType::DateTime);
+            }
+        }
+    }
     // A file without features isn't read as a layer, so the empty one is added as a reader leaves it.
-    let fields = ["name", "when"].map(|f| Field::new(f, FieldType::Text)).into_iter().chain([Field::new("pop", FieldType::Double)]);
+    let fields = ["name", "when"].map(|f| Field::new(f, FieldType::Text)).into_iter().chain([
+        Field::new("pop", FieldType::Double),
+        Field::new("day", FieldType::Date),
+        Field::new("seen", FieldType::DateTime),
+    ]);
     let empty = Dataset::new(names.get(3).map_or("", String::as_str), GeometryType::Point, fields.collect());
     ids.push(s.map_mut().add_dataset(empty));
     ids
@@ -229,6 +255,29 @@ fn seen(s: &Session) -> Value {
     serde_json::to_value(&s.project).unwrap()
 }
 
+/// Each map's layers' date and date-time fields (name, type) and their values, as they are held. Other
+/// fields are left out: a NaN is written as null and said so, and compares unequal to itself.
+fn held_values(s: &Session) -> Vec<Vec<Vec<(String, FieldType, Vec<DataValue>)>>> {
+    s.project
+        .maps
+        .iter()
+        .map(|m| {
+            m.layers
+                .iter()
+                .map(|l| {
+                    let d = &l.dataset;
+                    let dates = d.fields.iter().enumerate().filter(|(_, f)| matches!(f.ty, FieldType::Date | FieldType::DateTime));
+                    dates
+                        .map(|(i, f)| {
+                            (f.name.clone(), f.ty, d.features.iter().map(|x| x.attrs.get(i).cloned().unwrap_or(DataValue::Null)).collect())
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// What notices since `mark` said, besides that a file was saved or opened.
 fn said(s: &Session, mark: u64) -> Vec<String> {
     s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| !t.starts_with("Saved ") && !t.starts_with("Opened ")).collect()
@@ -289,6 +338,7 @@ fn a_saved_project_opens_as_it_was_saved() {
         cases.set(cases.get() + usize::from(applied > 0));
         edits.set(edits.get() + applied);
         let before = seen(&s);
+        let held = held_values(&s);
         let (notices, opened) = save_and_open(&mut s, &path).map_err(|e| TestCaseError::fail(format!("didn't save and open: {e}")))?;
         let mut changed = Vec::new();
         diff("", &before, &seen(&opened), &mut changed);
@@ -296,6 +346,11 @@ fn a_saved_project_opens_as_it_was_saved() {
         // Values that aren't finite numbers, which saving writes as null and says so, are null in
         // what the user sees before saving too (`Value`'s `Serialize`): nothing is excused.
         changed.retain(|c| !declared(c));
+        // Dates and moments come back exactly: type, value and offset (`Value`'s `==` compares what
+        // is stored).
+        if held_values(&opened) != held {
+            changed.push(format!("field types or values: {held:?} → {:?}", held_values(&opened)));
+        }
         if !changed.is_empty() {
             return Err(TestCaseError::fail(format!("changed, saying {notices:?}: {changed:#?}")));
         }

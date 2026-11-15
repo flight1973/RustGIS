@@ -173,6 +173,13 @@ pub(crate) fn say_crs_note(s: &mut Session, text: &str) {
     }
 }
 
+/// What a save to a database table calls itself in a notice: the layer and the table, or the one
+/// name when they are the same (`wells: 1 date-time…`, not `wells: wells: 1 date-time…`).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn saved_target(layer: &str, table: &str) -> String {
+    if layer == table { layer.to_string() } else { format!("{layer}: {table}") }
+}
+
 pub(crate) fn ps<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
     p.get(k).and_then(Value::as_str)
 }

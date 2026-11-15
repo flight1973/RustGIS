@@ -48,6 +48,30 @@ fn read(path: &str) -> Option<Vec<u8>> {
 /// export.
 pub const SEMIBOLD_WEIGHT: f32 = 600.0;
 
+/// Whether bold text in the interface fonts has no heavier face to be drawn in: the semibold face
+/// is the regular one, with no weight axis to draw it heavier (the built-in Ubuntu Light, which the
+/// browser always has, or a system font found without its bold file). Bold text is then thickened
+/// by hand ([`bold_thickening`]), as italic is slanted where there is no italic face. Both
+/// renderers ask here, so bold text is as heavy on screen as in an export.
+pub fn bold_is_synthetic() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| {
+        let f = ui_fonts();
+        synthetic_bold(&f.regular, &f.semibold)
+    })
+}
+
+fn synthetic_bold(regular: &[u8], semibold: &[u8]) -> bool {
+    use ab_glyph::VariableFont;
+    regular == semibold && ab_glyph::FontRef::try_from_slice(semibold).is_ok_and(|f| !f.variations().iter().any(|a| &a.tag == b"wght"))
+}
+
+/// How far (pixels, at a text size of `px` pixels) bold text thickened by hand is drawn a second
+/// time to the right of itself: a thirtieth of its size, about the stem a bold face adds.
+pub fn bold_thickening(px: f32) -> f32 {
+    if px.is_finite() && px > 0.0 { (px / 30.0).clamp(0.25, 3.0) } else { 0.0 }
+}
+
 /// The interface fonts, discovered once.
 pub fn ui_fonts() -> &'static UiFonts {
     static F: OnceLock<UiFonts> = OnceLock::new();
@@ -434,6 +458,21 @@ pub fn script_font_url(script: ScriptFont) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use super::{bold_thickening, synthetic_bold};
+
+    /// Bold is thickened by hand only where the bold face is the regular one, with no weight axis
+    /// (the built-in face, which the browser has): not where there is a bold file.
+    #[test]
+    fn bold_is_thickened_only_without_a_heavier_face() {
+        let ubuntu = epaint_default_fonts::UBUNTU_LIGHT;
+        assert!(synthetic_bold(ubuntu, ubuntu), "one face for both");
+        assert!(!synthetic_bold(ubuntu, epaint_default_fonts::HACK_REGULAR), "a bold file of its own");
+        assert!(!synthetic_bold(&[], &[]), "not a font");
+        assert_eq!(bold_thickening(30.0), 1.0);
+        assert_eq!((bold_thickening(1.0), bold_thickening(1000.0)), (0.25, 3.0), "kept visible, and within reason");
+        assert_eq!((bold_thickening(f32::NAN), bold_thickening(-4.0)), (0.0, 0.0));
+    }
+
     #[test]
     fn bengali_coverage_requires_bengali_and_latin_glyphs() {
         assert!(!super::covers_bengali(epaint_default_fonts::UBUNTU_LIGHT));

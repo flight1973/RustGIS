@@ -1045,6 +1045,30 @@ fn text_fields_convert_to_dates() {
     s.run("edit.convertField", &json!({"layer": "Cities", "field": "founded", "type": "date"})).unwrap();
     assert!(s.notices_since(mark).is_empty());
 
+    // A field with text and none of it a date is refused, and stays text; digits past the
+    // microsecond are rounded and said, none said for fewer.
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "us", "type": "text"})).unwrap();
+    for (row, text) in ["03/05/2026", "05.03.2026", "", "<null>"].into_iter().enumerate() {
+        s.run("edit.setValue", &json!({"layer": "Cities", "row": row, "field": "us", "value": text})).unwrap();
+    }
+    let mark = s.notice_mark();
+    let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "us", "type": "date"})).unwrap_err();
+    assert_eq!(err, "'us' stays text: none of its values is a date (ISO 8601, like 2026-03-05), first '03/05/2026'");
+    assert_eq!(column(&s, "us").0, FieldType::Text);
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.starts_with("Convert Field")));
+    s.run("edit.addField", &json!({"layer": "Cities", "name": "fine", "type": "text"})).unwrap();
+    for (row, text) in
+        ["2026-03-05T14:30:00.123456789Z", "2026-03-05T14:30:00.5Z", "2026-03-05T14:30:00.000000400Z", ""].into_iter().enumerate()
+    {
+        s.run("edit.setValue", &json!({"layer": "Cities", "row": row, "field": "fine", "value": text})).unwrap();
+    }
+    let mark = s.notice_mark();
+    let out = s.run("edit.convertField", &json!({"layer": "Cities", "field": "fine", "type": "datetime"})).unwrap();
+    assert_eq!((out["converted"].as_u64(), out["null"].as_u64()), (Some(3), Some(0)));
+    let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(notices, ["Convert Field: 2 values were rounded to the microsecond in 'fine', as more digits than that aren't kept"]);
+    assert_eq!(column(&s, "fine").1[0], at("2026-03-05T14:30:00.123457Z"));
+
     let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "founded", "type": "date"})).unwrap_err();
     assert_eq!(err, "'founded' is a Date field: only a text field converts to dates");
     let err = s.run("edit.convertField", &json!({"layer": "Cities", "field": "name", "type": "long"})).unwrap_err();
@@ -1117,6 +1141,76 @@ fn a_streamed_shapefile_says_dates_it_could_not_read_once() {
     s.run("edit.addField", &json!({"layer": "permits", "name": "note", "type": "text"})).unwrap_err();
     let err = s.run("edit.convertField", &json!({"layer": "permits", "field": "issued", "type": "datetime"})).unwrap_err();
     assert!(err.contains("Load All Features"), "{err}");
+}
+
+/// Load All Features of a GeoPackage read in place says the date-times it read rounded to the
+/// microsecond; a clean one says nothing of them.
+#[test]
+fn loading_a_streamed_layer_whole_says_the_date_times_it_rounded() {
+    use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("rustgis-whole-rounded-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, stored, said) in [("fine", "2026-03-05T14:30:00.123456789Z", 1), ("clean", "2026-03-05T14:30:00.123456Z", 0)] {
+        let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new("seen", FieldType::DateTime)]);
+        ds.push(Some(Geometry::Point(rustgis_geom::Coord::new(1.0, 1.0))), vec![V::parse("2026-01-01T00:00:00Z", FieldType::DateTime)]);
+        let path = dir.join(format!("{name}.gpkg"));
+        rustgis_data::io::write_path(&ds, &path).unwrap();
+        // The spatial index's triggers call GeoPackage functions a plain connection lacks; the
+        // geometry isn't changed, so the index stays right without them.
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let triggers: Vec<String> = c
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for t in triggers {
+            c.execute(&format!("DROP TRIGGER \"{t}\""), []).unwrap();
+        }
+        c.execute(&format!("UPDATE \"{name}\" SET seen = ?1"), [stored]).unwrap();
+        let mut s = Session::new(Project::default());
+        s.run("layer.addData", &json!({"path": path.display().to_string(), "stream": true})).unwrap();
+        assert!(s.map().layers[0].is_streamed(), "{name} is read in place");
+        let rounded = |s: &Session, mark| -> Vec<String> {
+            s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("rounded to the microsecond")).collect()
+        };
+        // A tool reading the layer whole, and a share of it, say it too.
+        let mark = s.notice_mark();
+        let out = s.run("gp.run", &json!({"tool": "buffer", "params": {"input": name, "distance": 10}})).unwrap();
+        assert_eq!(rounded(&s, mark).len(), said, "{name} buffer: {out}");
+        let mark = s.notice_mark();
+        crate::cmd::sharing::share_bytes(&mut s, "webLayer", &json!({"layer": name})).unwrap();
+        assert_eq!(rounded(&s, mark).len(), said, "{name} share");
+        let mark = s.notice_mark();
+        s.run("layer.loadAll", &json!({"layer": name})).unwrap();
+        let said_now = rounded(&s, mark);
+        assert_eq!(said_now.len(), said, "{name}: {said_now:?}");
+        if said == 1 {
+            assert!(said_now[0].starts_with(&format!("{name}: 1 date-time was rounded to the microsecond")), "{said_now:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every export of a layer read in place, the browser's download too, says what its whole read did
+/// to dates: values read as empty and date-times rounded; a clean read says nothing.
+#[test]
+fn an_export_says_what_its_whole_read_did_to_dates() {
+    let lost = rustgis_map::Unreadable {
+        rows: 0,
+        dates: Some("1 value isn't a date and was read as empty, in 'day'".into()),
+        rounded: Some("1 date-time was rounded to the microsecond, as more digits than that aren't kept, in 'at'".into()),
+    };
+    assert_eq!(
+        crate::cmd::share::read_date_notes("out.geojson", "Sites", &lost),
+        [
+            "out.geojson: Sites: 1 value isn't a date and was read as empty, in 'day', so they're empty in the export",
+            "out.geojson: Sites: 1 date-time was rounded to the microsecond, as more digits than that aren't kept, in 'at' when read for the export",
+        ]
+    );
+    assert!(crate::cmd::share::read_date_notes("out.geojson", "Sites", &rustgis_map::Unreadable::default()).is_empty());
 }
 
 /// A polygon layer stacks fills (a colour, hatch lines, markers on a grid), for the layer or a
@@ -11601,6 +11695,99 @@ fn the_graticule_takes_a_type_and_a_measured_grids_system() {
     assert!(!text.contains("graticule_type") && !text.contains("graticule_crs"));
 }
 
+/// Ranges whose ends are equal or reversed still match nothing; Raster Functions, a chain and a
+/// suitability say which, and a result with no values, once per kind, also after a background run.
+#[test]
+fn remap_reports_empty_ranges_and_no_valid_cells() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+    let mut s = Session::new(Project::default());
+    let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 0.1, pixel_height: -0.1 };
+    let r = Raster::new("classes", 3, 1, vec![vec![20.0, 21.0, 22.0]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+    let bytes = geotiff::write(&r, 0).unwrap();
+    crate::cmd::raster::add_raster(&mut s, "classes", rustgis_map::RasterLayer::from_bytes(r, "classes.tif", bytes)).unwrap();
+    for background in [false, true] {
+        if background && cfg!(target_arch = "wasm32") {
+            continue;
+        }
+        for command in ["raster.function", "raster.functionChain", "analysis.suitability"] {
+            for (ranges, keep, expected, notices) in [
+                (json!([[21, 21, 1], [23, 22, 2]]), false, vec![None, None, None], 2),
+                (json!([[21, 21, 1]]), true, vec![Some(20.0), Some(21.0), Some(22.0)], 1),
+                (json!([[21, 22, 1]]), false, vec![None, Some(1.0), None], 0),
+                (json!([[30, 31, 1]]), false, vec![None, None, None], 1),
+            ] {
+                // Suitability always discards unmatched cells; it has no keep parameter.
+                if keep && command == "analysis.suitability" {
+                    continue;
+                }
+                let step = json!({"function": "remap", "ranges": ranges, "keep": keep});
+                let mut p = match command {
+                    "raster.functionChain" => json!({"layer": "classes", "steps": [step]}),
+                    "analysis.suitability" => json!({"criteria": [{"layer": "classes", "ranges": ranges, "weight": 1}]}),
+                    _ => {
+                        let mut p = step;
+                        p["layer"] = json!("classes");
+                        p
+                    }
+                };
+                let mark = s.notice_mark();
+                #[cfg(not(target_arch = "wasm32"))]
+                if background {
+                    use crate::cmd::workflows::{raster_land, raster_start};
+                    let run = raster_start(&mut s, command, &p).unwrap();
+                    let id = run.id;
+                    let made = std::thread::spawn(move || run.run(&rustgis_analysis::control::Control::new())).join().unwrap().unwrap();
+                    assert_eq!(raster_land(&mut s, id, made), Ok(true));
+                    assert!(s.notices_since(mark).is_empty(), "delivered only when the result is added");
+                    p["ran"] = json!(id);
+                }
+                let result = s.run(command, &p).unwrap();
+                let layer = s.map().layer(result["layer"].as_u64().unwrap() as u32).unwrap();
+                let r = layer.raster.as_ref().unwrap().data.as_ref().unwrap();
+                let got: Vec<_> = r.bands[0].data.iter().map(|v| r.is_valid(*v).then_some(*v)).collect();
+                assert_eq!(got, expected, "{command}, background={background}, {ranges}");
+                let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.as_str()).collect();
+                assert_eq!(said.len(), notices, "{command}: {said:?}");
+                if ranges[0][0] == ranges[0][1] {
+                    assert!(said[0].contains("up to, but not including, its high end, so [21, 22] picks 21"), "{said:?}");
+                    if ranges.as_array().unwrap().len() == 2 {
+                        assert!(said[0].starts_with("2 remap ranges match nothing ([21, 21], [23, 22] in classes)"), "{said:?}");
+                    } else {
+                        assert!(said[0].starts_with("1 remap range matches nothing ([21, 21] in classes)"), "{said:?}");
+                    }
+                }
+                if expected.iter().all(Option::is_none) {
+                    let last = said.last().unwrap();
+                    if command == "analysis.suitability" {
+                        assert!(last.ends_with("no cell is scored by every criterion, so the result has no cells with values"), "{said:?}");
+                    } else {
+                        assert_eq!(*last, "classes: the remap left no cells with values", "{said:?}");
+                    }
+                }
+            }
+        }
+    }
+    // One notice of each kind however many remaps meet it: two empty steps in a chain.
+    let mark = s.notice_mark();
+    let chain = json!({"layer": "classes", "steps": [
+        {"function": "remap", "ranges": [[20, 20, 1]], "keep": true},
+        {"function": "remap", "ranges": [[21, 21, 1]], "keep": false},
+    ]});
+    s.run("raster.functionChain", &chain).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said.len(), 2, "{said:?}");
+    assert!(said[0].starts_with("2 remap ranges match nothing ([20, 20], [21, 21] in classes)"), "{said:?}");
+    // Criteria that each score some cells, but none in common, leave the overlay empty, and say so.
+    let mark = s.notice_mark();
+    let apart = json!({"criteria": [
+        {"layer": "classes", "ranges": [[20, 21, 5]], "weight": 1},
+        {"layer": "classes", "ranges": [[22, 23, 5]], "weight": 1},
+    ], "name": "Apart"});
+    s.run("analysis.suitability", &apart).unwrap();
+    let said: Vec<_> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said, ["Apart: no cell is scored by every criterion, so the result has no cells with values"]);
+}
+
 #[test]
 fn analysis_workflows_models_scripts_and_raster_functions() {
     let mut s = world();
@@ -20920,6 +21107,71 @@ fn repair_source_checks_the_extrusion_base_field() {
     std::fs::remove_dir_all(dir).ok();
 }
 
+/// Extrusion Base sets what an extrusion stands on, a numeric field or a constant, and changes
+/// nothing else: the height, its field and the factor stay, as does whatever is left out. Null or
+/// an empty name clears the field; a field that isn't numeric, or a base that is no number or is
+/// outside 0 to 1e7 metres, is refused, not changed (#1269).
+#[test]
+fn extrusion_base_sets_the_base_and_nothing_else() {
+    let mut s = world();
+    let x = |s: &Session| s.map().layer_by_name("Countries").and_then(|l| l.extrusion.clone());
+    for p in [json!({"layer": "Countries", "base": 5}), json!({"layer": "Countries", "field": "name"})] {
+        let e = s.run("layer.extrusionBase", &p).unwrap_err();
+        assert!(e.contains("turn extrusion on first"), "{p}: {e}");
+    }
+    s.run("layer.extrusion", &json!({"layer": "Countries", "type": "height", "height": 30, "factor": 2})).unwrap();
+    s.run("layer.extrusionBase", &json!({"layer": "Countries", "field": "pop_est", "base": 12})).unwrap();
+    let got = x(&s).unwrap();
+    assert_eq!((got.base_field.as_deref(), got.base), (Some("pop_est"), 12.0));
+    assert_eq!((got.field, got.height, got.factor), (None, 30.0, 2.0), "the height and factor stay");
+    // Each left out stays.
+    s.run("layer.extrusionBase", &json!({"layer": "Countries", "base": 20})).unwrap();
+    assert_eq!(x(&s).unwrap().base_field.as_deref(), Some("pop_est"));
+    s.run("layer.extrusionBase", &json!({"layer": "Countries", "field": "pop_est"})).unwrap();
+    assert_eq!(x(&s).unwrap().base, 20.0);
+    // A field that isn't numeric, or isn't there (a blank name too), a field that isn't a name,
+    // and a base that is no number or is outside 0 to 1e7 metres are refused, and change nothing.
+    let bad = [
+        json!({"field": "name"}),
+        json!({"field": "nowhere"}),
+        json!({"field": " "}),
+        json!({"field": 7}),
+        json!({"base": "ten"}),
+        json!({"base": null}),
+        json!({"base": -5}),
+        json!({"base": 1e12}),
+    ];
+    for bad in bad {
+        let mut p = bad.clone();
+        p["layer"] = json!("Countries");
+        assert!(s.run("layer.extrusionBase", &p).is_err(), "{bad}");
+    }
+    let e = s.run("layer.extrusionBase", &json!({"layer": "Countries", "field": "name"})).unwrap_err();
+    assert!(e.contains("no numeric field 'name'"), "{e}");
+    let e = s.run("layer.extrusionBase", &json!({"layer": "Countries", "base": -5})).unwrap_err();
+    assert!(e.contains("between 0 and 10,000,000 metres"), "{e}");
+    assert_eq!((x(&s).unwrap().base_field.as_deref(), x(&s).unwrap().base), (Some("pop_est"), 20.0));
+    // Null or an empty name clears the field; the constant stays.
+    s.run("layer.extrusionBase", &json!({"layer": "Countries", "field": null})).unwrap();
+    assert_eq!((x(&s).unwrap().base_field, x(&s).unwrap().base), (None, 20.0));
+    s.run("layer.extrusionBase", &json!({"layer": "Countries", "field": "pop_est"})).unwrap();
+    s.run("layer.extrusionBase", &json!({"layer": "Countries", "field": ""})).unwrap();
+    assert_eq!(x(&s).unwrap().base_field, None);
+    // Both ends of the constant's range are taken.
+    s.run("layer.extrusionBase", &json!({"layer": "Countries", "base": 0})).unwrap();
+    assert_eq!(x(&s).unwrap().base, 0.0);
+    s.run("layer.extrusionBase", &json!({"layer": "Countries", "base": 1e7})).unwrap();
+    assert_eq!(x(&s).unwrap().base, 1e7);
+    // Changing the height keeps the base; each change undoes on its own.
+    s.run("layer.extrusion", &json!({"layer": "Countries", "type": "field", "field": "pop_est"})).unwrap();
+    assert_eq!(x(&s).unwrap().base, 1e7);
+    s.undo();
+    s.undo();
+    assert_eq!(x(&s).unwrap().base, 0.0);
+    let got = x(&s).unwrap();
+    assert_eq!((got.field, got.height, got.factor), (None, 30.0, 2.0), "nothing else changed on the way");
+}
+
 #[test]
 fn area_review_attribute_edits_keep_retained_display_expressions() {
     let (mut session, id) = area_review_fixture();
@@ -28862,6 +29114,27 @@ fn connection_browse_levels_and_adds() {
     s.run("connection.browse", &json!({"id": "W", "answer": wms_caps})).unwrap();
     assert_eq!(s.connections.connections.len(), saved);
     assert!(!s.can_undo());
+}
+
+/// A kept field that only holds a secret once a source's details change is left out then, and
+/// said then, not only at start (the start-up notice has already been shown).
+#[test]
+fn a_secret_left_out_when_a_source_changes_is_said() {
+    let mut s = Session::new(Project::default());
+    s.sources = crate::sources::Sources::from_json(r#"{"saved":[{"kind":"file","name":"A","address":"/a.csv","key":"abc"}]}"#);
+    // Kept at start as a setting this version doesn't know: nothing beside it makes it a secret.
+    assert!(!s.sources.unread().iter().any(|t| t.contains("password")), "{:?}", s.sources.unread());
+    let mark = s.notices_given();
+    s.run("sources.save", &json!({"kind": "file", "name": "A", "address": "/a.csv"})).unwrap();
+    assert!(s.notices_since(mark).is_empty(), "{:?}", s.notices_since(mark));
+    s.run("sources.save", &json!({"kind": "file", "name": "A", "address": "/a.csv", "extra": {"endpoint": "https://api.example"}}))
+        .unwrap();
+    assert!(
+        s.notices_since(mark).iter().any(|n| n.text.starts_with("1 value in the saved data sources holds a password")),
+        "{:?}",
+        s.notices_since(mark)
+    );
+    assert!(!s.sources.to_json().contains("abc"));
 }
 
 fn rustgis_engine_sources_roundtrip(text: &str) -> crate::sources::Sources {
@@ -41114,7 +41387,7 @@ fn a_layout_pdf_georeferences_its_map_frames() {
     // (PDF 1.5 for its layers, #1815.)
     assert!(pdf.starts_with("%PDF-1.5") && !pdf.contains("/VP ["));
     assert!(said.iter().any(|t| t == &format!("The PDF doesn't georeference 1 map frame ({}: it is tilted)", frame.name)), "{said:?}");
-    // A world projection proj4rs doesn't read (Winkel Tripel) is written as WKT too.
+    // A world projection (Winkel Tripel) is written as WKT too.
     s.run("layout.update", &json!({"element": frame.id, "pitch": 0})).unwrap();
     s.run("map.projection", &json!({"type": "winkelTripel"})).unwrap();
     let (pdf, said) = export(&mut s);
@@ -47476,6 +47749,135 @@ fn native_date_source_repair_and_reload_use_finished_candidates() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// `map.goToXY` takes a `position` written as the search box reads one (#1042, discussion
+/// #1157): decimal degrees, degrees, minutes and seconds, UTM and MGRS; one that names no place
+/// says why, and the Earth's grids name no place on another body.
+#[test]
+fn go_to_xy_reads_a_position_as_the_search_box_does() {
+    let mut s = world();
+    let at = |s: &Session| {
+        let c = s.map().center_lonlat();
+        ((c.y * 1e3).round() / 1e3, (c.x * 1e3).round() / 1e3)
+    };
+    // The forms the dialog's hint shows, all New York (GeographicLib's `GeoConvert` for the grids).
+    assert_eq!(rustgis_geom::format_utm(rustgis_geom::Coord::new(-74.006, 40.7128)).as_deref(), Some("18north 583959 4507351"));
+    assert_eq!(
+        rustgis_geom::to_mgrs(rustgis_geom::Coord::new(-74.006, 40.7128), 5).map(|m| m.compact()).as_deref(),
+        Some("18TWL8395907350")
+    );
+    for q in [
+        "40.7128, -74.006",
+        "40°42'46\"N 74°0'22\"W",
+        "40°42′46″N 74°0′22″W",
+        "18north 583959 4507351",
+        "18T WL 83959 07350",
+        "18TWL8395907350",
+    ] {
+        s.run("map.goToXY", &json!({"lon": 0, "lat": 0})).unwrap();
+        s.run("map.goToXY", &json!({"position": q, "scale": 50_000})).unwrap();
+        assert_eq!(at(&s), (40.713, -74.006), "{q}");
+    }
+    assert!((s.map().scale() - 50_000.0).abs() < 1.0);
+    // What the reading assumed is said: an MGRS square's center, or the order of two bare numbers
+    // (so `2.35, 48.85` typed as x, y shows where it went, and a swap shows too). A reference to
+    // the meter, or degrees with hemisphere letters, say nothing.
+    for (q, said) in [
+        ("18TWL", Some("names a 100 km square, not a point: went to its center")),
+        ("18TWL8307", Some("names a 1 km square")),
+        ("2.35, 48.85", Some("Read 2.35, 48.85 as latitude 2.35, longitude 48.85")),
+        ("-122.4, 37.8", Some("as latitude 37.8, longitude -122.4")),
+        ("18TWL8395907350", None),
+        ("40°42′46″N 74°0′22″W", None),
+    ] {
+        let mark = s.notice_mark();
+        s.run("map.goToXY", &json!({"position": q})).unwrap();
+        let notices: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        match said {
+            Some(t) => assert!(notices.len() == 1 && notices[0].contains(t), "{q}: {notices:?}"),
+            None => assert!(notices.is_empty(), "{q}: {notices:?}"),
+        }
+    }
+    // Longitude and latitude each take degrees, minutes and seconds, as the dialog's boxes send
+    // them; a letter of the other axis is refused, not swapped; numbers say nothing.
+    for (lon, lat) in [("74°0′22″W", "40°42′46″N"), ("W 74 0 22", "N 40 42 46"), ("-74 0 22", "40 42 46"), ("-74.006", "40.7128")]
+    {
+        // From elsewhere each time, so the text is what moves the map.
+        s.run("map.goToXY", &json!({"lon": 0, "lat": 0})).unwrap();
+        let mark = s.notice_mark();
+        s.run("map.goToXY", &json!({"lon": lon, "lat": lat})).unwrap();
+        assert_eq!(at(&s), (40.713, -74.006), "{lon} {lat}");
+        assert!(s.notices_since(mark).is_empty());
+    }
+    let axis_refused = |s: &mut Session, lon: &str, lat: &str| s.run("map.goToXY", &json!({"lon": lon, "lat": lat})).unwrap_err();
+    assert!(axis_refused(&mut s, "40°42′46″N", "74°0′22″W").contains("belongs to the latitude"));
+    assert!(axis_refused(&mut s, "74 60 0", "40").contains("under 60"));
+    assert!(axis_refused(&mut s, "-74W", "40").contains("both a minus sign"));
+    assert!(axis_refused(&mut s, "74", "91 N").contains("within ±90"));
+    // A word that ends in N, S, E or W is no hemisphere: it gets the usage message.
+    for word in ["Paris", "Lisbon"] {
+        let refused = axis_refused(&mut s, word, "40");
+        assert!(refused.contains("write the longitude") && !refused.contains("belongs to"), "{refused}");
+    }
+    // A decimal comma or a pasted pair in one box is refused, not read as degrees and minutes.
+    assert!(axis_refused(&mut s, "2,35", "48").contains("one value"));
+    assert!(axis_refused(&mut s, "48.85, 2.35", "48").contains("one value"));
+    assert!(axis_refused(&mut s, "48.85 2.35", "48").contains("write the longitude"));
+    // A mark says which place a number fills: seconds after degrees with no minutes are seconds,
+    // not minutes; marks out of order, or no degrees, are refused.
+    for (lat, want) in [("40°30″N", 40.008), ("40 30″", 40.008), ("40°30′N", 40.5), ("40°30", 40.5), ("40°0′30″", 40.008)] {
+        s.run("map.goToXY", &json!({"lon": 0, "lat": 0})).unwrap();
+        s.run("map.goToXY", &json!({"lon": "10", "lat": lat})).unwrap();
+        assert_eq!(at(&s).0, want, "{lat}");
+    }
+    assert!(axis_refused(&mut s, "10", "30″40°").contains("out of order"));
+    assert!(axis_refused(&mut s, "10", "40′30′").contains("out of order"));
+    assert!(axis_refused(&mut s, "10", "30′").contains("write the latitude"));
+    assert!(axis_refused(&mut s, "10", "°40").contains("write the latitude"));
+    // Typographic quotes, as pasted from a document, are marks like any other.
+    s.run("map.goToXY", &json!({"lon": 0, "lat": 0})).unwrap();
+    s.run("map.goToXY", &json!({"lon": "74°0’22”W", "lat": "40°42’46”N"})).unwrap();
+    assert_eq!(at(&s), (40.713, -74.006));
+    assert!(axis_refused(&mut s, &"9".repeat(500), "40").contains("longer than"));
+    // Numbers still go as before.
+    s.run("map.goToXY", &json!({"lon": 10, "lat": 50})).unwrap();
+    assert_eq!(at(&s), (50.0, 10.0));
+    // Refused, with the reason the search box gives, and the map stays where it was.
+    let refused = |s: &mut Session, p: Value| s.run("map.goToXY", &p).unwrap_err();
+    let e = refused(&mut s, json!({"position": "33UZZ1234512345"}));
+    assert!(e.starts_with("no place at this grid reference") && e.contains("100 km square"), "{e}");
+    assert!(refused(&mut s, json!({"position": "Paris"})).contains("write a position as"));
+    // Minutes follow whole degrees and seconds whole minutes, as in the X and Y boxes: `40.5°30′`
+    // isn't read as 41°.
+    for q in ["40.5°30′N 74°W", "40°30.5′15″N 74°W"] {
+        assert!(refused(&mut s, json!({"position": q})).contains("write a position as"), "{q}");
+    }
+    for q in ["40.7, 200", "95, 100", "-91, 200"] {
+        assert!(refused(&mut s, json!({"position": q})).contains("within ±90"), "{q}");
+    }
+    // Not plain decimals, so not a range: `1e1` isn't how a latitude is written.
+    let e = refused(&mut s, json!({"position": "1e1, 2"}));
+    assert!(!e.contains("within ±90"), "{e}");
+    assert!(refused(&mut s, json!({"position": "  "})).contains("empty"));
+    assert!(refused(&mut s, json!({"position": "4".repeat(10_000)})).contains("longer than"));
+    assert!(refused(&mut s, json!({"position": 40.7})).contains("must be text"));
+    assert!(refused(&mut s, json!({"position": "40.7, -74", "lon": 1})).contains("not both"));
+    assert!(refused(&mut s, json!({})).contains("lon is required"));
+    // A scale that can't be used is refused, not dropped, whether a position or numbers are given.
+    for scale in [json!("50k"), json!(0), json!(-5), json!(true)] {
+        assert!(refused(&mut s, json!({"position": "40.7, -74", "scale": scale})).contains("scale must be"), "{scale}");
+        assert!(refused(&mut s, json!({"lon": 1, "lat": 1, "scale": scale})).contains("scale must be"), "{scale}");
+    }
+    assert!(refused(&mut s, json!({"position": "., 5"})).contains("write a position as"));
+    assert_eq!(at(&s), (50.0, 10.0));
+    // On another body degrees still name a place; the Earth's grids don't.
+    s.run("map.body", &json!({"name": "Mars"})).unwrap();
+    s.run("map.goToXY", &json!({"position": "18.4, 77.5"})).unwrap();
+    assert_eq!(at(&s), (18.4, 77.5));
+    assert!(refused(&mut s, json!({"position": "18TWL8395907350"})).contains("Earth's grids"));
+    let e = refused(&mut s, json!({"position": "Olympus"}));
+    assert!(e.contains("write a position as") && !e.contains("UTM"), "{e}");
+}
+
 /// A mobile map package says what simplifying its layers changed or left alone (#1811): a line
 /// reaching 95° (bad data) has its vertex taken as the pole, and a part of one vertex left out;
 /// lines with a longitude too far out are left as they were; one notice per kind. A clean layer,
@@ -47779,6 +48181,69 @@ fn an_animation_export_says_its_missing_cast_shadows_once() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A FlatGeobuf has no date type, so a date field with no values in the export reads back as a
+/// date-time field: the export says so, for a layer held whole and one read in place. A date
+/// field with a value, and one only in features without geometry (not written), are the other
+/// two cases.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_flatgeobuf_export_says_which_empty_date_fields_read_back_as_date_times() {
+    use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value as V};
+    let dir = std::env::temp_dir().join(format!("rustgis-fgb-dates-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fields = vec![Field::new("empty", FieldType::Date), Field::new("full", FieldType::Date), Field::new("lost", FieldType::Date)];
+    let day = V::parse("2026-03-05", FieldType::Date);
+    let mut ds = Dataset::new("days", GeometryType::Point, fields);
+    ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![V::Null, day.clone(), V::Null]);
+    ds.push(None, vec![V::Null, V::Null, day.clone()]);
+    let gpkg = dir.join("days.gpkg");
+    rustgis_data::io::write_path(&ds, &gpkg).unwrap();
+    for stream in [false, true] {
+        let mut s = Session::new(Project::default());
+        s.run("layer.addData", &json!({"path": gpkg.display().to_string(), "stream": stream})).unwrap();
+        let (mark, fgb) = (s.notice_mark(), dir.join(format!("days-{stream}.fgb")));
+        s.run("share.exportLayer", &json!({"layer": "days", "path": fgb.display().to_string()})).unwrap();
+        let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains("date field")).collect();
+        assert_eq!(said.len(), 1, "stream {stream}: {said:?}");
+        assert!(said[0].ends_with("2 date fields have no values, and FlatGeobuf can't tell a date from a date-time, so it reads back as a date-time field, in 'empty', 'lost'"), "{said:?}");
+        // The other formats say nothing of it.
+        let (mark, shp) = (s.notice_mark(), dir.join(format!("days-{stream}.gpkg")));
+        s.run("share.exportLayer", &json!({"layer": "days", "path": shp.display().to_string()})).unwrap();
+        assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("FlatGeobuf")));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A save to a table names the layer and the table in its notices, and once when they're the same.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_save_names_a_layer_and_its_table_once_when_they_are_the_same() {
+    assert_eq!(crate::cmd::saved_target("wells", "wells"), "wells");
+    assert_eq!(crate::cmd::saved_target("Wells", "wells"), "Wells: wells");
+}
+
+/// What reading a DuckDB result says of its dates names the layer the user knows, not the cache
+/// file it was converted into. Runs only when DuckDB is installed (`RUSTGIS_DUCKDB_BIN`).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_duckdb_result_names_its_layer_in_its_date_notices() {
+    if !rustgis_data::source::duckdb::available() {
+        eprintln!("skipped: DuckDB isn't installed");
+        return;
+    }
+    let mut s = Session::new(Project::default());
+    let sql = "SELECT 1 AS id, DATE 'infinity' AS day, TIMESTAMP_NS '2026-03-05 12:34:56.123456789' AS at, ST_Point(1, 2) AS geom";
+    let mark = s.notice_mark();
+    s.run("layer.addSql", &json!({"sql": sql, "name": "Chosen", "stream": false})).unwrap();
+    let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(said.contains(&"Chosen: 1 value isn't a date and was read as empty, in 'day'".to_string()), "{said:?}");
+    assert!(
+        said.contains(&"Chosen: 1 date-time was rounded to the microsecond, as more digits than that aren't kept, in 'at'".to_string()),
+        "{said:?}"
+    );
+    assert!(said.iter().all(|n| !n.contains(".points")), "{said:?}");
+}
+
 /// A zoom to a place wholly past a Web Mercator map's 85° leaves the view where it is, says so,
 /// and is said not to have framed it (as `"zoomed"` reports); one reaching into them fits, clamped.
 #[test]
@@ -47921,4 +48386,86 @@ fn a_shapefile_coordinate_that_isnt_a_number_reaches_no_layer() {
         t.run("project.saveAs", &json!({"path": saved})).unwrap();
         Session::new(Project::default()).run("project.open", &json!({"path": saved})).unwrap();
     }
+}
+
+/// Column inspection rejects the same invalid gzip encoding as import, on disk and upload.
+#[test]
+fn gzip_columns_require_utf8() {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode("H4sIAAAAAAAC/8tM0clLzE3lctRJTkx7yQUACDIXQA8AAAA=").unwrap();
+    let p = json!({});
+    assert!(super::cmd::layer::columns_of("latin.csv.gz", &bytes, &p).unwrap_err().contains("UTF-8"));
+    let path = std::env::temp_dir().join(format!("rustgis-latin-columns-{}.csv.gz", std::process::id()));
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(super::cmd::layer::columns_in_file(path.to_str().unwrap(), &p).unwrap_err().contains("UTF-8"));
+    assert!(rustgis_data::io::read_bytes("latin.csv.gz", &bytes).is_err());
+    std::fs::remove_file(path).unwrap();
+    // The documented fallback still accepts the decompressed Windows-1252 text.
+    assert!(super::cmd::layer::columns_of("latin.txt", b"id,name\nA,caf\xe9\n", &p).is_ok());
+}
+
+/// Compressed and DAT imports reach the same command options through files and uploads.
+#[test]
+fn published_text_import_paths() {
+    use base64::Engine as _;
+    use rustgis_data::{Coord, Geometry};
+    let encoded = "H4sIAAAAAAAC/8tMqUlNLC6pycsvKsngcqwxNKgxMuACACT4xC0WAAAA";
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+    let path = std::env::temp_dir().join(format!("rustgis-published-text-{}.csv.gz", std::process::id()));
+    std::fs::write(&path, &bytes).unwrap();
+    let mut s = Session::new(Project::default());
+    let opts = json!({"x":"east", "y":"north", "delimiter":"|"});
+    let columns = super::cmd::layer::columns_of("points.csv.gz", &bytes, &opts).unwrap();
+    assert_eq!(columns["columns"], json!(["id", "east", "north"]));
+    let mut p = opts.clone();
+    p["path"] = json!(&path);
+    assert_eq!(s.run("info.fileColumns", &p).unwrap(), columns);
+    s.run("layer.addData", &p).unwrap();
+    p = opts.clone();
+    p["fileName"] = json!("points.csv.gz");
+    p["data"] = json!(encoded);
+    s.run("layer.addDataBytes", &p).unwrap();
+    assert_eq!(s.map().layers.len(), 2);
+    for layer in &s.map().layers {
+        let ds = &layer.dataset;
+        assert_eq!(ds.features.len(), 1);
+        assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(10.0, 20.0))));
+    }
+    let mut p = opts;
+    p["fileName"] = json!("summary.dat");
+    p["text"] = json!("id|east|north\nA|10|20\n");
+    s.run("layer.addDataText", &p).unwrap();
+    assert_eq!(s.map().layers.len(), 3);
+    let utf16: Vec<u8> = [0xff, 0xfe].into_iter().chain("id|east|north\nA|10|20\n".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+    p.as_object_mut().unwrap().remove("text");
+    p["data"] = json!(base64::engine::general_purpose::STANDARD.encode(utf16));
+    s.run("layer.addDataBytes", &p).unwrap();
+    assert_eq!(s.map().layers.len(), 4);
+    std::fs::remove_file(path).unwrap();
+
+    // A desktop ZIP read lands from its prepared data, even after the source is gone.
+    use crate::cmd::reads::{read_ahead, read_land};
+    use rustgis_analysis::control::Control;
+    let zip = rustgis_data::zip::write(&[
+        ("stops.txt".into(), b"stop_id,stop_lon,stop_lat\ns1,10,20\n".to_vec()),
+        ("routes.txt".into(), b"route_id,route_short_name\nr1,Main\n".to_vec()),
+    ])
+    .unwrap();
+    let path = std::env::temp_dir().join(format!("rustgis-published-gtfs-{}.zip", std::process::id()));
+    std::fs::write(&path, zip).unwrap();
+    let p = json!({"path": &path});
+    let mut s = Session::new(Project::default());
+    let ahead = read_ahead(&mut s, "layer.addData", &p).unwrap();
+    assert!(ahead.reads());
+    let read = ahead.run(&Control::new()).unwrap();
+    let control = Control::cancelled_once_started();
+    let cancelled = read_ahead(&mut s, "layer.addData", &p).unwrap().run(&control);
+    assert!(cancelled.is_err());
+    assert!(control.looked() > 0);
+    std::fs::remove_file(path).unwrap();
+    read_land(&mut s, read).unwrap();
+    assert_eq!(s.map().layers.len(), 1);
+    assert_eq!(s.project.tables.len(), 1);
+    assert_eq!(s.project.tables[0].dataset.name, "routes");
+    assert!(s.read_ahead.is_none());
 }

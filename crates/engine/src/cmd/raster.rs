@@ -719,6 +719,13 @@ pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: V
     if rustgis_data::source::is_source_name(&name) {
         return super::layer::add_source(s, p, super::layer::Origin::Bytes(&name, std::sync::Arc::new(bytes)), zoom);
     }
+    if name.to_ascii_lowercase().ends_with(".gz") && !rustgis_data::io::is_gzip_text_name(&name) {
+        return Err(format!("{name}: decompress it first, then add the supported file inside"));
+    }
+    if rustgis_data::io::is_gzip_text_name(&name) || (name.to_ascii_lowercase().ends_with(".dat") && std::str::from_utf8(&bytes).is_err()) {
+        let read = super::layer::read_delimited_bytes(p, &name, &bytes)?;
+        return super::layer::add_read(s, p, read, zoom);
+    }
     let text = String::from_utf8(bytes).map_err(|_| format!("{name} is not a text file"))?;
     // The delimited-text and naming parameters carry over (not the data, already decoded).
     let mut q = json!({"fileName": name, "text": text});

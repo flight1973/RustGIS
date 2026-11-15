@@ -36,7 +36,9 @@ pub struct Completion {
     /// The keywords that can go here, in [`Kw::ALL`] order. With an operand they include the
     /// ones that are values (`NULL`, `TRUE`, `FALSE`) and `CASE`.
     pub keywords: Vec<Kw>,
-    /// The operators and punctuation that can go here (`=`, `+`, `||`, `)`, `,`…), each once.
+    /// The operators and punctuation that can go here (`=`, `+`, `||`, `)`, `,`…), each once
+    /// and in one spelling (`<>`, not `!=`; `=`, not `==`). Where a value goes, the `(` or the
+    /// sign (`-1`) that can start one isn't listed: the value is (`operand`).
     pub symbols: Vec<&'static str>,
     /// The function whose arguments the cursor is in, and which argument (from 0); `None`
     /// outside a call or in a call of a name no function has.
@@ -106,13 +108,14 @@ pub fn complete_at(text: &str, cursor: usize, ds: &Dataset) -> Option<Completion
     let keywords = Kw::ALL.iter().copied().filter(|k| keywords.contains(k)).collect();
     let symbols = SYMBOLS.into_iter().filter(|s| probe.symbols.contains(s)).collect();
     let call = probe.call.and_then(|(f, arg)| Some((f?.spec(), arg)));
-    // Inside text only its call and the field it is compared with mean anything.
-    let code = place != Place::Text;
+    // Inside text only its call and the field it is compared with mean anything; inside a
+    // field's quotes, a field name: no keyword nor symbol goes in a name.
+    let code = place == Place::Code;
     Some(Completion {
         word,
         prefix,
         place,
-        operand: probe.operand && code,
+        operand: probe.operand && place != Place::Text,
         keywords: if code { keywords } else { Vec::new() },
         symbols: if code { symbols } else { Vec::new() },
         call,
@@ -244,6 +247,8 @@ mod tests {
     #[test]
     fn a_quoted_field_being_typed() {
         let c = at_end("\"Pop E");
+        // A name goes in the quotes: no keyword nor symbol.
+        assert!(c.keywords.is_empty() && c.symbols.is_empty(), "{c:?}");
         assert_eq!((c.place, c.word, c.prefix.as_str(), c.operand), (Place::Field, 0..6, "Pop E", true));
         let c = at_end("pop > 1 AND !Pop");
         assert_eq!((c.place, c.word, c.prefix.as_str()), (Place::Field, 12..16, "Pop"));

@@ -310,13 +310,14 @@ impl GpkgMemSource {
     }
 }
 
-/// An attribute value of a field's type: `None` for one a date field can't hold, read as null
-/// and counted ([`Batch::unread_dates`]).
-fn value(v: &Val, ty: FieldType) -> Option<Value> {
-    Some(match (v, ty) {
+/// An attribute value of a field's type, for the field `k`. One a date field can't hold is null,
+/// and counted in `unread` ([`Batch::unread_dates`]); a date-time with digits past the microsecond
+/// is rounded and counted in `rounded` ([`Batch::rounded_dates`]).
+fn value(v: &Val, ty: FieldType, unread: &mut Vec<usize>, rounded: &mut Vec<usize>, k: usize) -> Value {
+    match (v, ty) {
         (Val::Null, _) => Value::Null,
         (v, FieldType::Date | FieldType::DateTime) => {
-            return super::gpkg_blob::temporal(if let Val::Text(t) = v { Some(t) } else { None }, ty);
+            super::gpkg_blob::temporal(if let Val::Text(t) = v { Some(t) } else { None }, ty, unread, Some(rounded), k)
         }
         (Val::Blob(_), _) => Value::Null,
         (Val::Int(i), FieldType::Boolean) => Value::Bool(*i != 0),
@@ -326,7 +327,7 @@ fn value(v: &Val, ty: FieldType) -> Option<Value> {
         (Val::Real(f), _) => Value::Float(*f),
         (Val::Text(t), FieldType::Text) => Value::Text(t.clone()),
         (Val::Text(t), ty) => Value::parse_source(t, ty),
-    })
+    }
 }
 
 impl FeatureSource for GpkgMemSource {
@@ -345,7 +346,7 @@ impl FeatureSource for GpkgMemSource {
         }
         // A whole read knows its count; an extent, bounded natively or not, is matched as it goes.
         let mut sample = if req.extent.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
-        let (mut skipped, mut unread_dates) = (0, Vec::new());
+        let (mut skipped, mut unread_dates, mut rounded_dates) = (0, Vec::new(), Vec::new());
         let mut failed = None;
         crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
         self.db
@@ -360,7 +361,11 @@ impl FeatureSource for GpkgMemSource {
                     // has no place to match an extent.
                     Some(Val::Null | Val::Blob(_)) | None => {
                         if req.extent.is_none() && sample.wants() {
-                            sample.keep(Feature { id: rowid as u64, geometry: None, attrs: self.attrs(r, &mut unread_dates) });
+                            sample.keep(Feature {
+                                id: rowid as u64,
+                                geometry: None,
+                                attrs: self.attrs(r, &mut unread_dates, &mut rounded_dates),
+                            });
                         }
                         return ControlFlow::Continue(());
                     }
@@ -392,14 +397,18 @@ impl FeatureSource for GpkgMemSource {
                     return ControlFlow::Continue(());
                 }
                 // Integer keys, negative ones too, map to distinct ids.
-                sample.keep(Feature { id: rowid as u64, geometry: Some(geometry), attrs: self.attrs(r, &mut unread_dates) });
+                sample.keep(Feature {
+                    id: rowid as u64,
+                    geometry: Some(geometry),
+                    attrs: self.attrs(r, &mut unread_dates, &mut rounded_dates),
+                });
                 ControlFlow::Continue(())
             })
             .map_err(err)?;
         if let Some(e) = failed {
             return Err(e);
         }
-        Ok(Batch { matched: sample.seen(), complete: sample.complete(), features: sample.items, skipped, unread_dates })
+        Ok(Batch { matched: sample.seen(), complete: sample.complete(), features: sample.items, skipped, unread_dates, rounded_dates })
     }
 
     /// The upload is held in memory already, so every table can be visited.
@@ -452,7 +461,11 @@ impl FeatureSource for GpkgMemSource {
                     }
                 };
                 out.matched += 1;
-                match chunks.push(Feature { id: rowid as u64, geometry, attrs: self.attrs(r, &mut out.unread_dates) }) {
+                match chunks.push(Feature {
+                    id: rowid as u64,
+                    geometry,
+                    attrs: self.attrs(r, &mut out.unread_dates, &mut out.rounded_dates),
+                }) {
                     Ok(()) => ControlFlow::Continue(()),
                     Err(e) => {
                         failed = Some(e);
@@ -472,15 +485,11 @@ impl FeatureSource for GpkgMemSource {
 impl GpkgMemSource {
     /// A row's field values, in `info.fields` order, counting in `unread_dates` the dates that
     /// aren't ones.
-    fn attrs(&self, r: &[Val], unread_dates: &mut Vec<usize>) -> Vec<Value> {
+    fn attrs(&self, r: &[Val], unread_dates: &mut Vec<usize>, rounded_dates: &mut Vec<usize>) -> Vec<Value> {
         let mut out = Vec::with_capacity(self.info.fields.len());
         for (k, (f, &c)) in self.info.fields.iter().zip(&self.field_cols).enumerate() {
-            out.push(match r.get(c).map(|v| value(v, f.ty)) {
-                Some(Some(v)) => v,
-                Some(None) => {
-                    super::unread_date(unread_dates, k);
-                    Value::Null
-                }
+            out.push(match r.get(c) {
+                Some(v) => value(v, f.ty, unread_dates, rounded_dates, k),
                 None => Value::Null,
             });
         }

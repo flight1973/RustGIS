@@ -42,7 +42,8 @@ A text column's menu also has **Convert to Date** and **Convert to Date and Time
 (`edit.convertField`, `"type"`: `date` or `datetime`): the field becomes a date field and each
 value is read as ISO 8601 (`2026-03-05`; `2026-03-05T14:30:00+02:00`, or with a space for the
 `T`). Text that isn't a date becomes empty, and a notice counts those rows and shows the first
-few; undo brings the text back. Use it for dates from CSV, GeoJSON or other files that hold them as
+few; undo brings the text back. Digits past the microsecond are rounded to it, and a notice counts
+those. A field with text and none of it a date is refused and stays text. Use it for dates from CSV, GeoJSON or other files that hold them as
 text. A field with a domain, subtypes or contingent values, or one a definition query or display
 filter would no longer read as dates (comparing it with a number), is refused.
 
@@ -1343,6 +1344,12 @@ aren't converted). On a geographic DEM the cell size is worked out in metres onc
 raster, at the latitude of its centre (longitude spacing × 111,320 × cos(latitude), latitude
 spacing × 110,574), so elevations must be in metres. `zFactor` multiplies the elevations first:
 `0.3048` turns feet into metres.
+
+A remap range, in Raster Functions, the Function Editor and the Suitability Modeler, takes values
+from its low end up to, but not including, its high end: `[21, 22, 1]` maps class 21 to 1, and
+`[21, 21, 1]` matches nothing. The first range that matches a cell wins. One notice lists the
+ranges that can match nothing, and another says when a remap, or a suitability whose criteria
+score no cell in common, leaves no cells with values.
 
 Network routing rebuilds its graph for each request and solves each edge length on WGS 84.
 Large line networks can therefore take longer to route than with spherical lengths; repeated

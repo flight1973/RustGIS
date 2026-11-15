@@ -1112,7 +1112,7 @@ pub fn keys(ui: &Ui, box_id: Id, script: &str) -> Option<(Offer, String)> {
         }
         return None;
     }
-    if !state.list.is_open() || !ui.memory(|m| m.has_focus(box_id)) {
+    if !state.list.is_open() {
         return None;
     }
     if state.worked.as_ref().is_none_or(|w| w.text != egui::util::hash(script)) {
@@ -1120,7 +1120,7 @@ pub fn keys(ui: &Ui, box_id: Id, script: &str) -> Option<(Offer, String)> {
         store(ui, box_id, state);
         return None;
     }
-    let picked = state.list.keys(ui);
+    let picked = state.list.keys(ui, box_id);
     store(ui, box_id, state);
     picked
 }

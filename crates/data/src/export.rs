@@ -47,9 +47,18 @@ pub struct Exported {
     /// written as null ([`crate::source::Batch::unread_dates`], said by
     /// [`crate::source::unread_dates_note`]).
     pub unread_dates: Vec<usize>,
+    /// Per field of the layer, date-times of the source rounded to the microsecond as it was read
+    /// ([`crate::source::Batch::rounded_dates`], said by [`crate::source::rounded_dates_note`]).
+    pub rounded_dates: Vec<usize>,
     /// Per field of the layer, date-times a GeoPackage holds in UTC rather than at their own
     /// offset ([`crate::io::offset_dates`]; empty for the other formats).
     pub utc_dates: Vec<usize>,
+    /// Per field of the layer, date-times a GeoPackage holds rounded to the millisecond
+    /// ([`crate::io::fine_dates`]; empty for the other formats).
+    pub fine_dates: Vec<usize>,
+    /// Per field of the layer, the values a FlatGeobuf export wrote ([`crate::io::written_values`];
+    /// empty for the other formats).
+    pub written_values: Vec<usize>,
     /// GeoParquet timestamp representation changes counted during export.
     pub date_messages: Vec<String>,
 }
@@ -135,7 +144,10 @@ fn write_chunks_as(
     let mut null_numbers = 0usize;
     let mut csv = crate::io::CsvLosses::default();
     let mut unread_dates = Vec::new();
+    let mut rounded_dates = Vec::new();
     let mut utc_dates = Vec::new();
+    let mut fine_dates = Vec::new();
+    let mut written_values = Vec::new();
     let mut feed = |add: &mut dyn FnMut(&[Feature]) -> Result<()>| -> Result<()> {
         // A GeoPackage export that starts again feeds the features again, and counts them again.
         total = 0;
@@ -143,6 +155,8 @@ fn write_chunks_as(
         null_numbers = 0;
         csv = crate::io::CsvLosses::default();
         utc_dates.clear();
+        fine_dates.clear();
+        written_values.clear();
         // The source counts scanned rows; nested writers only check Cancel, so rows count once.
         crate::progress::begin(src.info().count.map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)));
         let batch = src.visit_chunks(None, bytes, &mut |mut chunk| {
@@ -165,11 +179,16 @@ fn write_chunks_as(
             }
             if ext == "gpkg" {
                 crate::source::add_unread_dates(&mut utc_dates, &crate::io::offset_dates(chunk.iter(), &layer.fields));
+                crate::source::add_unread_dates(&mut fine_dates, &crate::io::fine_dates(chunk.iter(), &layer.fields));
+            }
+            if ext == "fgb" {
+                crate::source::add_unread_dates(&mut written_values, &crate::io::written_values(chunk.iter(), &layer.fields));
             }
             crate::progress::without_counting(|| add(&chunk))
         })?;
         skipped = batch.skipped;
         unread_dates = batch.unread_dates;
+        rounded_dates = batch.rounded_dates;
         Ok(())
     };
     let mut table = None;
@@ -211,7 +230,21 @@ fn write_chunks_as(
     };
     let written = total.saturating_sub(left_out);
     Ok((
-        Exported { written, left_out, skipped, null_numbers, unfit, beyond_web_mercator, csv, unread_dates, utc_dates, date_messages },
+        Exported {
+            written,
+            left_out,
+            skipped,
+            null_numbers,
+            unfit,
+            beyond_web_mercator,
+            csv,
+            unread_dates,
+            rounded_dates,
+            utc_dates,
+            fine_dates,
+            written_values,
+            date_messages,
+        },
         table,
     ))
 }

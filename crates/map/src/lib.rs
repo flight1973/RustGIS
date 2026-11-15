@@ -150,6 +150,9 @@ pub struct Unreadable {
     /// What it says of values in date fields that weren't dates, read as null
     /// ([`rustgis_data::source::unread_dates_note`]).
     pub dates: Option<String>,
+    /// What it says of date-times rounded to the microsecond
+    /// ([`rustgis_data::source::rounded_dates_note`]).
+    pub rounded: Option<String>,
 }
 
 /// A layer: a dataset drawn with a renderer and labels.
@@ -611,7 +614,7 @@ impl Layer {
         // previous view's features.
         match src.poll(block) {
             source::Polled::Done(_, batch) => {
-                src.saw_unread_dates(&batch.unread_dates);
+                src.saw_unread_dates(&batch.unread_dates, &batch.rounded_dates);
                 self.install(batch.features)
             }
             source::Polled::Failed(_) => self.install(Vec::new()),
@@ -622,7 +625,7 @@ impl Layer {
             src.start(e, block);
             match src.poll(block) {
                 source::Polled::Done(_, batch) => {
-                    src.saw_unread_dates(&batch.unread_dates);
+                    src.saw_unread_dates(&batch.unread_dates, &batch.rounded_dates);
                     self.install(batch.features)
                 }
                 source::Polled::Failed(_) => self.install(Vec::new()),
@@ -800,7 +803,7 @@ impl Layer {
             }
         }
         ds.source = self.dataset.source.clone();
-        Ok((ds, Unreadable { rows: report.skipped, dates: report.unread_dates }))
+        Ok((ds, Unreadable { rows: report.skipped, dates: report.unread_dates, rounded: report.rounded_dates }))
     }
 
     /// A streamed layer's source, to export whole a chunk at a time, with a dataset of no

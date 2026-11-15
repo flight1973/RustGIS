@@ -670,11 +670,12 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         .map(|b| (b.stats.min, b.stats.max))
                         .unwrap_or((0.0, 1.0));
                     let step = (st.1 - st.0) / 10.0;
+                    // A constant raster gives empty middle ranges: they match nothing, so leave them out.
                     let ranges: Vec<Value> = (0..10)
-                        .map(|i| {
-                            let lo = st.0 + step * i as f64;
-                            let hi = if i == 9 { f64::MAX } else { lo + step };
-                            json!([if i == 0 { f64::MIN } else { lo }, hi, if high { i + 1 } else { 10 - i }])
+                        .filter_map(|i| {
+                            let lo = if i == 0 { f64::MIN } else { st.0 + step * i as f64 };
+                            let hi = if i == 9 { f64::MAX } else { st.0 + step * (i + 1) as f64 };
+                            (lo < hi).then(|| json!([lo, hi, if high { i + 1 } else { 10 - i }]))
                         })
                         .collect();
                     json!({"layer": n, "ranges": ranges, "weight": w})

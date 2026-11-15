@@ -111,13 +111,21 @@ impl DateTime {
 
     /// Reads `YYYY-MM-DD`, then optionally `T` or a space and `HH:MM[:SS[.ffffff]]`, then
     /// optionally `Z` or an offset (`+05:30`, `-0800`, `+02`). A date alone is its midnight.
-    /// Digits past microseconds are refused unless they're zeros, so nothing is cut.
+    /// Digits past microseconds are refused unless they're zeros, so nothing is cut; a reader
+    /// that says how many it rounded uses [`parse_rounding`](Self::parse_rounding).
     pub fn parse(s: &str) -> Option<DateTime> {
+        DateTime::parse_rounding(s).filter(|(_, rounded)| !rounded).map(|(t, _)| t)
+    }
+
+    /// [`parse`](Self::parse), but digits past microseconds round to the nearest microsecond (halves
+    /// up, cut instead at the end of year 9999, where rounding up would leave the range). The
+    /// boolean says that nonzero digits were lost, for the reader to count.
+    pub fn parse_rounding(s: &str) -> Option<(DateTime, bool)> {
         let s = s.trim();
         let date = Date::parse(s.get(..10)?)?;
         let rest = s.get(10..)?;
         if rest.is_empty() {
-            return Some(DateTime::from_date(date));
+            return Some((DateTime::from_date(date), false));
         }
         let rest = rest.strip_prefix(['T', 't', ' '])?;
         // The zone starts at `Z` or at a sign after the clock.
@@ -132,6 +140,8 @@ impl DateTime {
         let (h, m) = (digits(b.get(0..2)?)?, digits(b.get(3..5)?)?);
         let mut us = 0i64;
         let mut sec = 0i64;
+        // The first digit past the microsecond, and whether any of them isn't zero.
+        let (mut next, mut cut) = (0u8, false);
         if b.len() > 5 {
             if b.get(5) != Some(&b':') || b.len() < 8 {
                 return None;
@@ -139,39 +149,46 @@ impl DateTime {
             sec = digits(b.get(6..8)?)?;
             if b.len() > 8 {
                 let frac = b.get(8..)?.strip_prefix(b".")?;
-                if frac.is_empty() || !frac.iter().all(u8::is_ascii_digit) || frac.iter().skip(6).any(|&c| c != b'0') {
+                if frac.is_empty() || !frac.iter().all(u8::is_ascii_digit) {
                     return None;
                 }
                 for i in 0..6 {
                     us = us * 10 + frac.get(i).map(|c| i64::from(c - b'0')).unwrap_or(0);
                 }
+                next = frac.get(6).map_or(0, |c| c - b'0');
+                cut = frac.iter().skip(6).any(|&c| c != b'0');
             }
         }
         if h > 23 || m > 59 || sec > 59 {
             return None;
         }
         let wall = date.sort_key() + ((h * 60 + m) * 60 + sec) * 1_000_000 + us;
-        match zone {
-            None => DateTime::local(wall),
-            Some(z) if z.eq_ignore_ascii_case("z") => DateTime::with_offset(wall, 0),
-            // `Z` followed by more (`Z0200`) is no zone: refused, not read as an offset.
-            Some(z) if !z.starts_with(['+', '-']) => None,
-            Some(z) => {
-                let sign = if z.starts_with('-') { -1 } else { 1 };
-                let z = z.get(1..)?.as_bytes();
-                let (hh, mm) = match z.len() {
-                    2 => (digits(z)?, 0),
-                    4 => (digits(z.get(0..2)?)?, digits(z.get(2..4)?)?),
-                    5 if z.get(2) == Some(&b':') => (digits(z.get(0..2)?)?, digits(z.get(3..5)?)?),
-                    _ => return None,
-                };
-                if mm > 59 {
-                    return None;
+        let at = |wall: i64| -> Option<DateTime> {
+            match zone {
+                None => DateTime::local(wall),
+                Some(z) if z.eq_ignore_ascii_case("z") => DateTime::with_offset(wall, 0),
+                // `Z` followed by more (`Z0200`) is no zone: refused, not read as an offset.
+                Some(z) if !z.starts_with(['+', '-']) => None,
+                Some(z) => {
+                    let sign = if z.starts_with('-') { -1 } else { 1 };
+                    let z = z.get(1..)?.as_bytes();
+                    let (hh, mm) = match z.len() {
+                        2 => (digits(z)?, 0),
+                        4 => (digits(z.get(0..2)?)?, digits(z.get(2..4)?)?),
+                        5 if z.get(2) == Some(&b':') => (digits(z.get(0..2)?)?, digits(z.get(3..5)?)?),
+                        _ => return None,
+                    };
+                    if mm > 59 {
+                        return None;
+                    }
+                    let off = i16::try_from(sign * (hh * 60 + mm)).ok()?;
+                    DateTime::with_offset(wall.checked_sub(i64::from(off) * MINUTE_US)?, off)
                 }
-                let off = i16::try_from(sign * (hh * 60 + mm)).ok()?;
-                DateTime::with_offset(wall.checked_sub(i64::from(off) * MINUTE_US)?, off)
             }
-        }
+        };
+        // Rounded up when it fits; cut when that would leave the range.
+        let rounded = if next >= 5 { at(wall + 1).or_else(|| at(wall)) } else { at(wall) };
+        rounded.map(|t| (t, cut))
     }
 
     /// Whether its day says all of it: midnight, without a zone. Otherwise [`date`](Self::date)
@@ -230,6 +247,39 @@ impl<'de> Deserialize<'de> for Date {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         Date::parse(&s).ok_or_else(|| serde::de::Error::custom(format!("'{s}' isn't a date (YYYY-MM-DD, years 1 to 9999)")))
+    }
+}
+
+/// A date is saved as its ISO 8601 text (`2026-03-05`), from year 1 to 9999.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for Date {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Date".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "A calendar day as ISO 8601 text (YYYY-MM-DD), years 1 to 9999, maybe with spaces around it. The pattern can't tell a day that doesn't exist (2026-02-30); the reader refuses it.",
+            "pattern": "^\\s*([1-9][0-9]{3}|0[1-9][0-9]{2}|00[1-9][0-9]|000[1-9])-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])\\s*$"
+        })
+    }
+}
+
+/// A date-time is saved as its ISO 8601 text, with its offset when it has one.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for DateTime {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "DateTime".into()
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // The day as for `Date`, then maybe a clock after `T`, `t` or a space (HH:MM, seconds and
+        // up to six fraction digits optional, zeros past them), then maybe `Z` or an offset
+        // (+02, +0200, +02:00) of at most 18 hours, as `MAX_OFFSET_MIN`.
+        schemars::json_schema!({
+            "type": "string",
+            "description": "A date and time as ISO 8601 text, years 1 to 9999, with its offset (Z, +02:00) when it has one, without one when it has none, maybe with spaces around it. The pattern can't tell a day that doesn't exist (2026-02-30) or an instant before year 1 or past year 9999 once its offset is applied (0001-01-01T00:00:00+01:00); the reader refuses them.",
+            "pattern": "^\\s*([1-9][0-9]{3}|0[1-9][0-9]{2}|00[1-9][0-9]|000[1-9])-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])([Tt ]([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9](\\.[0-9]{1,6}0*)?)?([Zz]|[+-]((0[0-9]|1[0-7])(:?[0-5][0-9])?|18(:?00)?))?)?\\s*$"
+        })
     }
 }
 
@@ -323,8 +373,29 @@ mod tests {
     }
 
     #[test]
-    fn digits_past_microseconds_are_refused_unless_zeros() {
+    fn digits_past_microseconds_round_only_where_asked_and_are_refused_otherwise() {
+        let at = |s: &str| DateTime::parse_rounding(s).map(|(t, rounded)| (t.to_string(), rounded));
+        let said = |s: &str, t: &str| assert_eq!(at(s), Some((t.to_string(), true)), "{s}");
+        said("2026-03-05T14:30:00.123456789Z", "2026-03-05T14:30:00.123457Z");
+        said("2026-03-05T14:30:00.1234564Z", "2026-03-05T14:30:00.123456Z");
+        said("2026-03-05T14:30:00.1234565+02:00", "2026-03-05T14:30:00.123457+02:00");
+        said("2026-03-05 14:30:00.0000005", "2026-03-05T14:30:00.000001");
+        said("2026-03-05T14:30:59.9999996", "2026-03-05T14:31:00");
+        said("2026-03-05T00:00:00.0000001", "2026-03-05T00:00:00");
+        said("1969-12-31T23:59:59.9999995Z", "1970-01-01T00:00:00Z");
+        // Zeros past the microsecond, or none, lose nothing.
+        assert_eq!(at("2026-03-05T14:30:00.123456000Z"), Some(("2026-03-05T14:30:00.123456Z".into(), false)));
+        assert_eq!(at("2026-03-05T14:30:00.123Z"), Some(("2026-03-05T14:30:00.123Z".into(), false)));
+        // Rounding up past the last microsecond of year 9999 (in UTC, or as shown) cuts instead.
+        said("9999-12-31T23:59:59.9999995", "9999-12-31T23:59:59.999999");
+        said("9999-12-31T23:59:59.9999995Z", "9999-12-31T23:59:59.999999Z");
+        said("9999-12-31T23:59:59.9999995+02:00", "9999-12-31T23:59:59.999999+02:00");
+        // `parse` itself refuses what it would round.
         assert!(DateTime::parse("2026-03-05T14:30:00.123456789Z").is_none(), "nothing is cut");
+        assert!(DateTime::parse("2026-03-05T14:30:00.0000001").is_none());
+        assert!(DateTime::parse("9999-12-31T23:59:59.9999995").is_none());
+        assert!(DateTime::parse("2026-03-05T14:30:00.Z").is_none());
+        assert!(DateTime::parse("2026-03-05T14:30:00.12x").is_none());
         assert!(DateTime::parse("2026-03-05T14:30:00Z0200").is_none(), "Z then an offset is no zone");
         assert_eq!(
             DateTime::parse("2026-03-05T14:30:00.123456000Z").map(|t| t.to_string()),

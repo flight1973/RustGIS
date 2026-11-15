@@ -217,13 +217,13 @@ fn share_bytes_inner(s: &mut Session, kind: &str, p: &Value) -> Result<(String, 
     match kind {
         "webMap" => {
             let mut m = map_of(s, p)?;
-            m.layers.iter_mut().filter(|l| shared_layer("webMap", l)).try_for_each(load_whole)?;
+            m.layers.iter_mut().filter(|l| shared_layer("webMap", l)).try_for_each(|l| load_whole(s, l))?;
             let html = web_map_html(&m, &m.name)?;
             Ok((m.name.clone(), html.into_bytes(), m.name))
         }
         "webLayer" => {
             let mut l = layer_of(s, p)?;
-            load_whole(&mut l)?;
+            load_whole(s, &mut l)?;
             Ok((l.name.clone(), web_layer_zip(s, &l)?, l.name.clone()))
         }
         "webStyle" => {
@@ -240,7 +240,7 @@ fn share_bytes_inner(s: &mut Session, kind: &str, p: &Value) -> Result<(String, 
         }
         "geodataService" => {
             let mut m = map_of(s, p)?;
-            m.layers.iter_mut().filter(|l| shared_layer("geodataService", l)).try_for_each(load_whole)?;
+            m.layers.iter_mut().filter(|l| shared_layer("geodataService", l)).try_for_each(|l| load_whole(s, l))?;
             let mut layers: Vec<&Dataset> = m.layers.iter().filter(|l| shared_layer("geodataService", l)).map(|l| &l.dataset).collect();
             layers.extend(s.project.tables.iter().map(|t| &t.dataset));
             Ok((m.name.clone(), ogc_zip(&m.name, &layers, &[])?, m.name.clone()))
@@ -270,7 +270,7 @@ fn share_bytes_inner(s: &mut Session, kind: &str, p: &Value) -> Result<(String, 
         }
         "webScene" => {
             let mut m = map_of(s, p)?;
-            m.layers.iter_mut().filter(|l| shared_layer("webScene", l)).try_for_each(load_whole)?;
+            m.layers.iter_mut().filter(|l| shared_layer("webScene", l)).try_for_each(|l| load_whole(s, l))?;
             let scene = gltf(&m, s.view_size)?;
             for note in scene.notes() {
                 s.notify(note, false);
@@ -307,10 +307,13 @@ fn map_of(s: &Session, p: &Value) -> Result<Map, String> {
     Ok(m)
 }
 
-/// A streamed layer shares its whole source, not the features read for the current view.
-fn load_whole(l: &mut Layer) -> Result<(), String> {
+/// A streamed layer shares its whole source, not the features read for the current view; what
+/// that read couldn't read as it is (rows left out, dates read as null or rounded) is said.
+fn load_whole(s: &mut Session, l: &mut Layer) -> Result<(), String> {
     if l.is_streamed() {
-        l.dataset = l.load_all()?;
+        let (ds, unread) = l.load_all_counted()?;
+        l.dataset = ds;
+        super::whole::Unread::of(l.name.clone(), unread).say(s);
     }
     Ok(())
 }

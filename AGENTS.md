@@ -24,6 +24,9 @@ Before picking work, read [ROADMAP.md](ROADMAP.md) (check Underway) and
 - A file or setting from a newer RustGIS is refused or kept unchanged, never saved again without
   what this version couldn't read; a reader checks the version it is given
   ([saved files](docs/maintaining.md#saved-files-and-settings)).
+- A change to what a project saves runs `cargo xtask schema` and commits
+  `schema/project.schema.json` with it; a change to how a project is read adds or updates a fixture
+  in `schema/fixtures/`.
 
 ## Never hold the window
 On the desktop, a command whose work grows with its input (features, cells, tiles, files,
@@ -111,6 +114,9 @@ is out of scope.
 
 ## Quality gates
 `cargo xtask ci` (fmt, clippy -D warnings, tests, layers) before every commit.
+While you work, `cargo xtask changed` runs the same checks on only the packages your branch changes
+and those that depend on them, or on the whole workspace when a changed file such as `Cargo.lock` is
+outside every package and nothing includes it.
 A new dependency must have a licence `deny.toml` allows (CI runs `cargo deny check licenses`); after
 changing dependencies, run `cargo xtask notices` to refresh the `THIRD-PARTY-LICENSES.txt` files the
 packages ship (the release build fails on stale ones).
