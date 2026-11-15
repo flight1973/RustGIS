@@ -148,13 +148,15 @@ impl Topology {
         Ok(())
     }
 
-    /// A point's position, quantized (not delta-encoded) with a transform.
+    /// A point's position, quantized (not delta-encoded) with a transform. One past f64's range
+    /// (a huge scale or translate) is unreadable, not an infinite coordinate.
     fn point(&self, p: &Json) -> Option<Pos> {
         let [x, y, e] = position(p)?;
-        Some(match self.transform {
+        let pos = match self.transform {
             Some(([sx, sy], [tx, ty])) => [x * sx + tx, y * sy + ty, e],
             None => [x, y, e],
-        })
+        };
+        (pos[0].is_finite() && pos[1].is_finite()).then_some(pos)
     }
 
     /// A line from arc ids, shared ends written once. Its ids are checked by [`Self::line_len`]
@@ -336,7 +338,10 @@ fn read_with(file_name: &str, text: &str, budget: usize) -> Result<Vec<(Dataset,
                         let [px, py, e] = position(p)?;
                         x += px;
                         y += py;
-                        Some([x * sx + tx, y * sy + ty, e])
+                        // Past f64's range, the position is unreadable: the arc is, as its later
+                        // positions are deltas from it.
+                        let pos = [x * sx + tx, y * sy + ty, e];
+                        (pos[0].is_finite() && pos[1].is_finite()).then_some(pos)
                     })
                     .collect()
             }
@@ -754,6 +759,20 @@ mod tests {
         let (ds, rep) = read("e.topojson", text).unwrap().remove(0);
         assert!(ds.features[0].geometry.is_none());
         assert!(rep.messages.iter().any(|m| m.starts_with("1 geometry couldn't be read")), "{:?}", rep.messages);
+    }
+
+    #[test]
+    fn a_position_past_the_range_of_a_number_isnt_read() {
+        // A scale of 1e308 puts 10 * scale past f64::MAX: the point and the line's arc are
+        // unreadable, and neither is kept as an infinite coordinate.
+        let text = r#"{"type":"Topology","transform":{"scale":[1e308,1e308],"translate":[0,0]},
+"objects":{"o":{"type":"GeometryCollection","geometries":[
+{"type":"Point","coordinates":[10,10]},
+{"type":"LineString","arcs":[0]}]}},
+"arcs":[[[10,10],[10,10]]]}"#;
+        let (ds, rep) = read("i.topojson", text).unwrap().remove(0);
+        assert!(ds.features[0].geometry.is_none() && ds.features[1].geometry.is_none(), "{:?}", rep.messages);
+        assert!(rep.messages.iter().any(|m| m.starts_with("2 geometries couldn't be read")), "{:?}", rep.messages);
     }
 
     #[test]
