@@ -87,8 +87,12 @@ use Lost::Unreadable;
 /// Whether a geometry object holds nothing to lose: no type, a JSON null type or the text "null",
 /// and no arcs, coordinates or geometries. The specification's types (§2) have no null type; such
 /// an object is read as a feature without geometry, as GeoJSON's null geometry, without a notice.
-/// One that has data but no type it lists can't be read, and is said.
+/// One that has data but no type it lists can't be read, and is said. Anything else that isn't an
+/// object (a number, an array) is not empty: it is read, and said when it can't be.
 fn empty_on_purpose(g: &Json) -> bool {
+    if !g.is_object() && !g.is_null() {
+        return false;
+    }
     let none = |k: &str| g.get(k).is_none_or(Json::is_null);
     let null_type = match g.get("type") {
         None | Some(Json::Null) => true,
@@ -191,7 +195,9 @@ impl Topology {
     /// Checks a geometry whole, members of a collection included, and counts the coordinates
     /// rebuilding it takes from arcs, before anything is rebuilt. It is read whole or not at all
     /// (GeoJSON reads a collection so): one member that can't be read, or nesting past four
-    /// collections deep, leaves out the geometry, said once.
+    /// collections deep, leaves out the geometry, said once. Once empty members are dropped, a
+    /// collection must have exactly one left, since GeoJSON holds one; any other count is
+    /// unreadable, and takes no coordinates from the limit.
     fn need(&self, g: &Json, depth: usize) -> std::result::Result<usize, Lost> {
         let ty = g.get("type").and_then(Json::as_str).ok_or(Unreadable)?;
         let arcs = || g.get("arcs").ok_or(Unreadable);
@@ -209,7 +215,9 @@ impl Topology {
             }
             "GeometryCollection" if depth < 4 => {
                 let members = g.get("geometries").and_then(Json::as_array).ok_or(Unreadable)?;
-                members.iter().filter(|m| !empty_on_purpose(m)).try_fold(0usize, |n, m| Ok(n.saturating_add(self.need(m, depth + 1)?)))
+                let kept: Vec<&Json> = members.iter().filter(|m| !empty_on_purpose(m)).collect();
+                let [only] = kept.as_slice() else { return Err(Unreadable) };
+                self.need(only, depth + 1)
             }
             _ => Err(Unreadable),
         }
@@ -276,6 +284,13 @@ fn arcs_used(g: &Json, depth: usize, used: &mut std::collections::BTreeSet<usize
     }
 }
 
+/// A transform's scale and translate, for x and y; `None` when either can't be read.
+fn read_transform(t: &Json) -> Option<([f64; 2], [f64; 2])> {
+    let s = t.get("scale")?.as_array()?;
+    let tr = t.get("translate")?.as_array()?;
+    Some(([s.first()?.as_f64()?, s.get(1)?.as_f64()?], [tr.first()?.as_f64()?, tr.get(1)?.as_f64()?]))
+}
+
 /// Reads a TopoJSON topology into a layer per object.
 pub fn read(file_name: &str, text: &str) -> Result<Vec<(Dataset, ReadReport)>> {
     read_with(file_name, text, MAX_COORDS)
@@ -289,11 +304,12 @@ fn read_with(file_name: &str, text: &str, budget: usize) -> Result<Vec<(Dataset,
     if v.get("type").and_then(Json::as_str) != Some("Topology") {
         return Err(DataError::Format(format!("{file_name}: not a TopoJSON topology")));
     }
-    let transform = v.get("transform").and_then(|t| {
-        let s = t.get("scale")?.as_array()?;
-        let tr = t.get("translate")?.as_array()?;
-        Some(([s.first()?.as_f64()?, s.get(1)?.as_f64()?], [tr.first()?.as_f64()?, tr.get(1)?.as_f64()?]))
-    });
+    // A transform that is there but can't be read would leave every quantized position wrong, so
+    // the file is refused rather than read as if unquantized.
+    let transform = match v.get("transform") {
+        None | Some(Json::Null) => None,
+        Some(t) => Some(read_transform(t).ok_or_else(|| DataError::Format(format!("{file_name}: the transform can't be read")))?),
+    };
     // Arcs: x and y delta-encoded integers with a transform, plain coordinates without; a further
     // number is copied as is. A plain position that can't be read inside an arc is left out of it
     // and counted; one at its end (a joint), or a quantized one (every later position is a delta
@@ -418,7 +434,10 @@ fn read_with(file_name: &str, text: &str, budget: usize) -> Result<Vec<(Dataset,
     if objects.len() > MAX_OBJECTS
         && let Some((_, rep)) = out.first_mut()
     {
-        rep.messages.push(format!("only the first {MAX_OBJECTS} objects are read"));
+        rep.messages.push(format!(
+            "{} left out past the limit of {MAX_OBJECTS} objects: only the first {MAX_OBJECTS} are read",
+            counted(objects.len() - MAX_OBJECTS, "object", "objects")
+        ));
     }
     if out.is_empty() {
         return Err(DataError::Format(format!("{file_name}: no objects")));
@@ -586,12 +605,57 @@ mod tests {
         assert!(rep.messages.iter().any(|m| m.starts_with("1 geometry left out at the limit of 4 coordinates")), "{:?}", rep.messages);
         assert!(rep.messages.iter().all(|m| !m.contains("couldn't be read")), "{:?}", rep.messages);
 
-        // Members of a nested collection at the limit are said as such too.
+        // A nested collection at the limit is said as such too (one member, which GeoJSON holds).
         let nested = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[
-{"type":"GeometryCollection","geometries":[{"type":"LineString","arcs":[0]},{"type":"LineString","arcs":[0]}]}]}},
+{"type":"GeometryCollection","geometries":[{"type":"LineString","arcs":[0]}]}]}},
 "arcs":[[[0,0],[1,1]]]}"#;
-        let (_, rep) = read_with("n.topojson", nested, 2).unwrap().remove(0);
-        assert!(rep.messages.iter().any(|m| m.starts_with("1 geometry left out at the limit of 2")), "{:?}", rep.messages);
+        let (_, rep) = read_with("n.topojson", nested, 1).unwrap().remove(0);
+        assert!(rep.messages.iter().any(|m| m.starts_with("1 geometry left out at the limit of 1")), "{:?}", rep.messages);
+    }
+
+    #[test]
+    fn a_collection_the_reader_cannot_keep_takes_no_coordinates() {
+        // Two lines in a collection (4 coordinates) can't be kept: GeoJSON holds one member. It is
+        // said unreadable and takes nothing from the limit of 2, so the line after it is read.
+        let text = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[
+{"type":"GeometryCollection","geometries":[{"type":"LineString","arcs":[0]},{"type":"LineString","arcs":[0]}]},
+{"type":"LineString","arcs":[0]}]}},"arcs":[[[0,0],[1,1]]]}"#;
+        let (ds, rep) = read_with("c.topojson", text, 2).unwrap().remove(0);
+        assert!(ds.features[0].geometry.is_none(), "{:?}", rep.messages);
+        assert!(ds.features[1].geometry.is_some(), "{:?}", rep.messages);
+        assert!(rep.messages.iter().any(|m| m.starts_with("1 geometry couldn't be read")), "{:?}", rep.messages);
+        assert!(rep.messages.iter().all(|m| !m.contains("limit")), "{:?}", rep.messages);
+    }
+
+    #[test]
+    fn a_member_that_is_not_an_object_is_said() {
+        // A number and an array are not empty geometries: each is said unreadable, not dropped.
+        let text = r#"{"type":"Topology","objects":{"o":{"type":"GeometryCollection","geometries":[5,[1,2],{"type":"Point","coordinates":[1,2]}]}},"arcs":[]}"#;
+        let (ds, rep) = read("m.topojson", text).unwrap().remove(0);
+        assert_eq!((ds.features.len(), rep.skipped), (3, 0));
+        assert!(rep.messages.iter().any(|m| m.starts_with("2 geometries couldn't be read")), "{:?}", rep.messages);
+        let top = r#"{"type":"Topology","objects":{"o":5},"arcs":[]}"#;
+        let (ds, rep) = read("m.topojson", top).unwrap().remove(0);
+        assert_eq!(ds.features.len(), 1);
+        assert!(rep.messages.iter().any(|m| m.starts_with("1 geometry couldn't be read")), "{:?}", rep.messages);
+    }
+
+    #[test]
+    fn a_transform_that_cant_be_read_refuses_the_file() {
+        let text = r#"{"type":"Topology","transform":{"scale":"x","translate":[0,0]},"objects":{"o":{"type":"Point","coordinates":[1,2]}},"arcs":[]}"#;
+        assert!(read("t.topojson", text).is_err());
+        // Absent, or null, there is no transform to read.
+        let none = r#"{"type":"Topology","transform":null,"objects":{"o":{"type":"Point","coordinates":[1,2]}},"arcs":[]}"#;
+        assert!(read("t.topojson", none).is_ok());
+    }
+
+    #[test]
+    fn objects_past_the_limit_are_said() {
+        let objects: Vec<String> = (0..=MAX_OBJECTS).map(|i| format!("\"o{i}\":{{\"type\":\"Point\",\"coordinates\":[1,2]}}")).collect();
+        let text = format!(r#"{{"type":"Topology","objects":{{{}}},"arcs":[]}}"#, objects.join(","));
+        let layers = read("many.topojson", &text).unwrap();
+        assert_eq!(layers.len(), MAX_OBJECTS);
+        assert!(layers[0].1.messages.iter().any(|m| m.starts_with("1 object left out past the limit of 64")), "{:?}", layers[0].1.messages);
     }
 
     #[test]
