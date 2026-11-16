@@ -126,7 +126,14 @@ fn cases() -> Vec<Case> {
 
     let mut out = vec![
         // GeoJSON.
-        case("GeoJSON: a height", "a.geojson", geojson(&[point]), geojson(&[r#"{"type":"Point","coordinates":[1,2,3]}"#]), Said("Z or M")),
+        // A height alone is kept (a 3-D layer); a measure beside it isn't.
+        case(
+            "GeoJSON: a measure",
+            "a.geojson",
+            geojson(&[point]),
+            geojson(&[r#"{"type":"Point","coordinates":[1,2,3,4]}"#]),
+            Said("Z or M"),
+        ),
         case(
             "GeoJSON: an unreadable geometry",
             "a.geojson",
