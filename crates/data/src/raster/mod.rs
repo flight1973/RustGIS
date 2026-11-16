@@ -1268,8 +1268,8 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
         e if ELEVATION_EXTENSIONS.contains(&e) => {
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
             if ext == "hgt" {
-                hgt::check(file_name, meta.len())?;
-                hgt::read(file_name, &crate::provenance::read(path)?)?
+                let checked = hgt::check(file_name, meta.len())?;
+                hgt::read_checked(file_name, checked, &crate::provenance::read(path)?)?
             } else {
                 if meta.len() > dted::MAX_BYTES {
                     return Err(DataError::Format("DTED: the file is larger than any DTED cell".into()));

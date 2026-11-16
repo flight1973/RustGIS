@@ -98,9 +98,24 @@ pub fn check(file_name: &str, len: u64) -> Result<(i32, i32, usize)> {
     Ok((lat, lon, side))
 }
 
+/// [`read`] of a tile [`check`] has placed: `checked` is what it gave for the file's name and
+/// size. The bytes are still held to that size (the file may have changed since), but the name
+/// isn't parsed again.
+pub fn read_checked(file_name: &str, checked: (i32, i32, usize), bytes: &[u8]) -> Result<Raster> {
+    read_checked_limited(file_name, checked, bytes, max_samples())
+}
+
 /// [`read`], holding at most `max` samples (the tests' small limit exercises the reduction).
 fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
-    let (lat, lon, side) = check(file_name, bytes.len() as u64)?;
+    let checked = check(file_name, bytes.len() as u64)?;
+    read_checked_limited(file_name, checked, bytes, max)
+}
+
+/// [`read_checked`], holding at most `max` samples.
+fn read_checked_limited(file_name: &str, (lat, lon, side): (i32, i32, usize), bytes: &[u8], max: usize) -> Result<Raster> {
+    if bytes.len() as u64 != (side * side * 2) as u64 {
+        return Err(bad(format!("the file is {} bytes now, not the {side} × {side} tile's it was", bytes.len())));
+    }
     let step = step_within(side, side, max).ok_or_else(|| bad("the tile is too large to open".into()))?;
     let out = side.div_ceil(step);
     let mut data = super::grid::<f32>(out, out)?;
@@ -282,6 +297,17 @@ mod tests {
         // Within the desktop's least budget it would be read whole.
         assert_eq!(step_within(side, side, crate::raster::SAMPLES_FLOOR), Some(1));
         assert_eq!(check("N45E006.hgt", bytes.len() as u64).unwrap(), (45, 6, 7201));
+    }
+
+    #[test]
+    fn a_checked_tile_is_read_once_its_bytes_agree() {
+        let bytes = tile(|_, _| 9);
+        let checked = check("N37W122.hgt", bytes.len() as u64).unwrap();
+        let r = read_checked("N37W122.hgt", checked, &bytes).unwrap();
+        assert_eq!((r.width, r.value(0, 0, 0)), (1201, Some(9.0)));
+        // Bytes that no longer match the size checked are refused.
+        let e = read_checked("N37W122.hgt", checked, &bytes[..bytes.len() - 2]).unwrap_err().to_string();
+        assert!(e.contains("not the 1201 × 1201 tile's it was"), "{e}");
     }
 
     #[test]
