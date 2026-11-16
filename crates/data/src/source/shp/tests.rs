@@ -124,12 +124,15 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
             .map(|e| e.path())
             .find(|p| p.extension().is_some_and(|e| e == "sqlite"))
             .unwrap();
-        let db = rusqlite::Connection::open(&db_path).unwrap();
-        assert_eq!(db.execute("UPDATE metadata SET bounds = '[12,22,10,20]'", []).unwrap(), 1);
-        drop(db);
-        let s = ShpSource::open_path(&p, "pts").unwrap();
-        assert!(s.info().indexed, "built again, not scanned: {:?}", s.info().notes);
-        assert_eq!(s.info().extent, whole, "{:?}", s.info().extent);
+        // Inverted, or none while its records are covered: either way not the rule it was built by.
+        for stored in ["'[12,22,10,20]'", "'null'"] {
+            let db = rusqlite::Connection::open(&db_path).unwrap();
+            assert_eq!(db.execute(&format!("UPDATE metadata SET bounds = {stored}"), []).unwrap(), 1);
+            drop(db);
+            let s = ShpSource::open_path(&p, "pts").unwrap();
+            assert!(s.info().indexed, "{stored}: built again, not scanned: {:?}", s.info().notes);
+            assert_eq!(s.info().extent, whole, "{stored}: {:?}", s.info().extent);
+        }
     });
 }
 /// A record of no points (an empty geometry, which some writers give a 0, 0, 0, 0 box) has no box,

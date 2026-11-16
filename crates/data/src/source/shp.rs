@@ -136,8 +136,8 @@ impl ShpSource {
         // stale after records were added) is set aside, and said.
         let native = index.bounds.map(|[x0, y0, x1, y1]| {
             // The header, a box itself, rounded outward as the records' boxes are, holds them all:
-            // so a header written exactly always passes, and one short of a shape by less than
-            // the f32 rounding (under a meter in UTM) does too.
+            // so a header written exactly always passes, as does one short of a shape by so little
+            // that both round to the same f32 (under a meter in UTM).
             let frames = [native.min_x, native.min_y, native.max_x, native.max_y].iter().all(|v| v.is_finite())
                 && !native.is_empty()
                 && f32_down(native.min_x) <= x0
