@@ -265,6 +265,24 @@ itself is UTM. On the map of another body than the Earth the readout shows *No U
 it steps to the next one. A saved format this version doesn't know, say from a newer RustGIS,
 reads as decimal degrees with a notice, and stays saved until you pick a format.
 
+`map.convertPosition` gives a place in all of these forms at once, without moving the map, for
+scripts, Python and the AI Assistant. It takes the place as `map.goToXY` does: `lon` and `lat`
+(numbers, or degrees, minutes and seconds), or a `position` written in any form the search box
+reads, and says what it assumed the same way. It answers with `lon` and `lat`, `decimal` and
+`dms` as the readout writes them, `grid` (`utm`, or `ups` in the polar areas), `utm` with its
+`zone`, `band`, `hemisphere`, `easting` and `northing` in meters (UPS has no zone or band), and
+`mgrs` spaced as the readout writes it and `mgrsCompact` in one word. `digits` (0 to 5, 5 by
+default) sets the MGRS precision, from 100 km to 1 m. On another body's map the grids are
+`null`, and `note` says why.
+
+```
+rustgis-cli run --cmd 'map.convertPosition={"position":"18TWL8395907350"}'
+```
+
+```python
+s.run("map.convertPosition", {"lon": -74.006, "lat": 40.7128})["utm"]  # '18north 583959 4507351'
+```
+
 The [search box](#navigating) takes the same grid references, in any case (polar references have
 their own rules, below):
 

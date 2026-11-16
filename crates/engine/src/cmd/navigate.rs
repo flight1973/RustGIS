@@ -43,6 +43,9 @@ pub fn commands() -> Vec<C> {
         C::new("map.goToXY", "By Coordinates…", "Home › Navigate › Locate", go_to_xy).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .params(r#"{"lon" | "x": degrees (-74.006, or text such as 74°0′22″W), "lat" | "y": degrees (40.7128, or text such as 40°42′46″N), "position"?: text in place of lon and lat, as the search box reads it, latitude first (40.7128, -74.006; 18north 583959 4507351; 18TWL8395907350), "scale"?: number, "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85)}"#),
+        C::new("map.convertPosition", "Convert Position", "Home › Navigate › Locate", convert_position).roles(&[]).effects(crate::policy::Effects::NONE)
+            .view()
+            .params(r#"{"lon" | "x": degrees (-74.006, or text such as 74°0′22″W), "lat" | "y": degrees (40.7128, or text such as 40°42′46″N), "position"?: text in place of lon and lat, as the search box reads it, latitude first (40.7128, -74.006; 18north 583959 4507351; 18TWL8395907350; Z AC 77146 62481), "digits"?: MGRS digits per axis, 0 (100 km) to 5 (1 m, the default)}"#),
         C::new("map.goToLink", "Go To Map Link", "Home › Navigate", go_to_link).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"url": a map link ending in #zoom/lat/lon[/bearing[/pitch]] (as MapLibre writes them; also #map=…), or just zoom/lat/lon[/bearing[/pitch]]}"#),
@@ -527,19 +530,23 @@ fn degrees_text(v: f64) -> String {
     if v == 0.0 { "0".into() } else { format!("{v}") }
 }
 
-pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
+/// The place a command's parameters give, as `map.goToXY` and `map.convertPosition` take it: a
+/// `position` written as the search box reads one, or `lon` and `lat` (or `x` and `y`), each a
+/// number or text in degrees, minutes and seconds. With it, what the reading assumed, for a
+/// notice: two bare numbers taken in an order, or an MGRS square taken at its center (`moving`
+/// says whether the map goes there, which the notice's wording follows).
+fn typed_place(map: &Map, p: &Value, moving: bool) -> Result<(Coord, Option<crate::notice_text::NoticeText>), String> {
     let position = match p.get("position") {
         None | Some(Value::Null) => None,
         Some(Value::String(t)) => Some(t.as_str()),
         Some(_) => return Err("position must be text, such as \"40.7128, -74.006\" or \"18TWL8395907350\"".into()),
     };
     let given = |k: &str| !matches!(p.get(k), None | Some(Value::Null));
-    // What the reading assumed is said once the map has moved there, not before a refusal.
     let (lon, lat, notice) = if let Some(text) = position {
         if ["lon", "lat", "x", "y"].iter().any(|k| given(k)) {
             return Err("give a position or lon and lat, not both".into());
         }
-        let (c, read) = read_position(s.map(), text)?;
+        let (c, read) = read_position(map, text)?;
         let reference = || text.trim().to_string().into();
         let said = match read {
             PositionRead::AsWritten => None,
@@ -549,10 +556,12 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
             )),
             PositionRead::Square(side) => {
                 let side = if side >= 1000.0 { format!("{} km", side / 1000.0) } else { format!("{side} m") };
-                Some(crate::notice_text::NoticeText::format(
-                    "{reference} names a {side} square, not a point: went to its center",
-                    [("reference", reference()), ("side", side.into())],
-                ))
+                let args = [("reference", reference()), ("side", side.into())];
+                Some(if moving {
+                    crate::notice_text::NoticeText::format("{reference} names a {side} square, not a point: went to its center", args)
+                } else {
+                    crate::notice_text::NoticeText::format("{reference} names a {side} square, not a point: gave its center", args)
+                })
             }
         };
         (c.x, c.y, said)
@@ -570,6 +579,71 @@ pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
         return Err("longitude must be within ±180 and latitude within ±90".into());
     }
+    Ok((Coord::new(lon, lat), notice))
+}
+
+/// A place in every form RustGIS writes one (#1042): longitude and latitude, in decimal degrees
+/// and in degrees, minutes and seconds as the status bar shows them, UTM (UPS north of 84° N and
+/// south of 80° S) with its parts, and MGRS spaced as the readout writes it and in one word, to
+/// `digits` digits (5 by default: 1 m). The place is read as `map.goToXY` reads it, and what the
+/// reading assumed is said the same way. The map doesn't move. On another body's map the Earth's
+/// grids are `null`, and `note` says why.
+fn convert_position(s: &mut Session, p: &Value) -> CmdResult {
+    let digits = match p.get("digits") {
+        None | Some(Value::Null) => 5,
+        Some(v) => v.as_u64().filter(|d| *d <= 5).ok_or("digits must be a whole number from 0 (100 km) to 5 (1 m)")? as u8,
+    };
+    let (c, notice) = typed_place(s.map(), p, false)?;
+    let mut out = json!({
+        "lon": c.x,
+        "lat": c.y,
+        "decimal": rustgis_geom::format_lonlat(c),
+        "dms": rustgis_geom::format_dms(c),
+        "grid": null,
+        "utm": null,
+        "zone": null,
+        "band": null,
+        "hemisphere": null,
+        "easting": null,
+        "northing": null,
+        "mgrs": null,
+        "mgrsCompact": null,
+    });
+    // To the millimeter: the projections are good to a fraction of that.
+    let mm = |v: f64| (v * 1000.0).round() / 1000.0;
+    if !s.map().body().is_earth() {
+        out["note"] = json!("UTM and MGRS are the Earth's grids and name no place on this map");
+    } else if let Some(u) = rustgis_geom::to_utm(c) {
+        out["grid"] = json!("utm");
+        out["utm"] = json!(u.to_string());
+        out["zone"] = json!(u.zone);
+        out["band"] = json!(u.band.to_string());
+        out["hemisphere"] = json!(u.hemisphere());
+        out["easting"] = json!(mm(u.easting));
+        out["northing"] = json!(mm(u.northing));
+    } else if let Some(u) = rustgis_geom::to_ups(c) {
+        out["grid"] = json!("ups");
+        out["utm"] = json!(u.to_string());
+        out["hemisphere"] = json!(u.hemisphere());
+        out["easting"] = json!(mm(u.easting));
+        out["northing"] = json!(mm(u.northing));
+    }
+    if s.map().body().is_earth()
+        && let Some(m) = rustgis_geom::to_mgrs(c, digits)
+    {
+        out["mgrs"] = json!(m.to_string());
+        out["mgrsCompact"] = json!(m.compact());
+    }
+    if let Some(said) = notice {
+        s.notify_text(said, false);
+    }
+    Ok(out)
+}
+
+pub(crate) fn go_to_xy(s: &mut Session, p: &Value) -> CmdResult {
+    // What the reading assumed is said once the map has moved there, not before a refusal.
+    let (c, notice) = typed_place(s.map(), p, true)?;
+    let (lon, lat) = (c.x, c.y);
     // A scale that can't be used is refused, not dropped.
     let scale = match p.get("scale") {
         None | Some(Value::Null) => None,
