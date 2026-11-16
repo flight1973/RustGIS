@@ -1881,12 +1881,12 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
             app,
             "graticule",
             "Graticule",
-            "Show or hide the graticule over the basemap: latitudes and longitudes, a measured grid or the UTM zones.",
+            "Show or hide the graticule over the basemap: latitudes and longitudes, a measured grid, the UTM zones or the MGRS grid.",
             "map.graticule",
             Value::Null,
             g,
             "Graticule options",
-            "What the graticule draws: latitudes and longitudes, a measured grid or the UTM zones.",
+            "What the graticule draws: latitudes and longitudes, a measured grid, the UTM zones or the MGRS grid.",
             true,
             graticule_menu,
         );
@@ -5476,6 +5476,11 @@ mod tests {
         h.get_by_label("UTM Zones").click();
         h.run();
         assert!(h.state().session.map().graticule && h.state().session.map().graticule_type == GraticuleType::Utm);
+        h.get_by_label("Graticule options").click();
+        h.run();
+        h.get_by_label("MGRS").click();
+        h.run();
+        assert!(h.state().session.map().graticule && h.state().session.map().graticule_type == GraticuleType::Mgrs);
         // A system typed as an EPSG code: clicking into the field keeps the menu open.
         h.get_by_label("Graticule options").click();
         h.run();

@@ -4204,8 +4204,12 @@ fn render_frame(
     }
     if map.graticule && grat.a() > 0 {
         let p = paint(grat, 1.0);
-        // A measured or UTM graticule's lines (#1042), else latitudes and longitudes.
-        let grid = mapgrid::lines(map, view);
+        // A measured, UTM or MGRS graticule's lines (#1042), else latitudes and longitudes; the
+        // MGRS grid's grid zone designations and 100 km lines (`major`) are drawn heavier.
+        let (major, grid) = match mapgrid::lines(map, view) {
+            Some(g) => (g.major, Some(g.minor)),
+            None => (Vec::new(), None),
+        };
         let step = if view.camera.res > 8000.0 {
             30.0
         } else if view.camera.res > 2000.0 {
@@ -4230,32 +4234,42 @@ fn render_frame(
             }
             lines
         });
-        let lines = if globe.is_some() {
-            lines
-        } else if custom {
-            // Parallels are cut at the map's edge like any line (#209).
-            match flat.project(&Geometry::Line(lines)) {
-                Geometry::Line(parts) => parts,
-                _ => Vec::new(),
-            }
-        } else {
-            lines.into_iter().map(|l| l.into_iter().map(lonlat_to_merc).collect()).collect()
-        };
-        if gpu {
-            let mut e = Extent::EMPTY;
-            for l in &lines {
-                for c in l {
-                    e.expand(*c);
+        let project = |lines: Vec<Vec<Coord>>| -> Vec<Vec<Coord>> {
+            if globe.is_some() {
+                lines
+            } else if custom {
+                // Parallels are cut at the map's edge like any line (#209).
+                match flat.project(&Geometry::Line(lines)) {
+                    Geometry::Line(parts) => parts,
+                    _ => Vec::new(),
                 }
+            } else {
+                lines.into_iter().map(|l| l.into_iter().map(lonlat_to_merc).collect()).collect()
             }
-            flush_acc(pm.pixels(), &mut cmds, &mut cpu_dirty)?;
-            let tessellated = !e.is_empty() && mesh::collect_graticule(&mut cmds, &lines, &e, grat, ctx.ppp, map_per_px).is_ok();
-            if !tessellated {
-                ctx.line(&mut pm, &lines, &p, 0.6);
-                cpu_dirty = true;
+        };
+        let (lines, major) = (project(lines), project(major));
+        // The minor lines always (as every graticule drew its lines before #1042's MGRS grid),
+        // the major ones over them when there are any.
+        for (lines, width, always) in [(lines, 0.6f32, true), (major, 1.2, false)] {
+            if !always && lines.is_empty() {
+                continue;
             }
-        } else {
-            ctx.line(&mut pm, &lines, &p, 0.6);
+            if gpu {
+                let mut e = Extent::EMPTY;
+                for l in &lines {
+                    for c in l {
+                        e.expand(*c);
+                    }
+                }
+                flush_acc(pm.pixels(), &mut cmds, &mut cpu_dirty)?;
+                let tessellated = !e.is_empty() && mesh::collect_graticule(&mut cmds, &lines, &e, grat, width, ctx.ppp, map_per_px).is_ok();
+                if !tessellated {
+                    ctx.line(&mut pm, &lines, &p, width);
+                    cpu_dirty = true;
+                }
+            } else {
+                ctx.line(&mut pm, &lines, &p, width);
+            }
         }
     }
 
@@ -5652,7 +5666,51 @@ fn render_frame(
         };
         post::apply(pm.pixels(), &map.view.effects, vision, &lonlat);
     }
-    let labels = placed.labels;
+    let mut labels = placed.labels;
+    let mut label_layers = label_layers;
+    // The MGRS graticule's names (#1042), over the placed labels and apart from their collisions,
+    // with no layer of their own in a recording. A tilted view's bands draw none: their places
+    // would repeat from band to band.
+    if map.graticule && grat.a() > 0 && matches!(labels_to, Labels::Own | Labels::Turned(_)) {
+        let color = Rgba::rgb(grat.r(), grat.g(), grat.b());
+        for (text, x, y) in mapgrid::labels(map, view, |t| text::measure(t, mapgrid::LABEL_PT, false)) {
+            // Into the turned view's screen, as the placed labels are.
+            let (x, y) = match turned {
+                Some(to) => {
+                    let (sx, sy) = to.to_screen(view.camera.to_map(f64::from(x), f64::from(y), view.width, view.height));
+                    if !((0.0..=to.width).contains(&sx) && (0.0..=to.height).contains(&sy)) {
+                        continue;
+                    }
+                    (sx as f32, sy as f32)
+                }
+                None => (x, y),
+            };
+            labels.push(PlacedLabel {
+                text,
+                x,
+                y,
+                size: mapgrid::LABEL_PT,
+                color,
+                halo: Some(halo_for(color)),
+                halo_width: None,
+                bold: false,
+                icon: None,
+                align: 0.0,
+                framed: false,
+                italic: false,
+                spacing: 0.0,
+                font: None,
+                line_align: TextAlign::Center,
+                angle: None,
+                collide: Default::default(),
+                glyphs: Vec::new(),
+                background: None,
+            });
+            if pm.is_recording() {
+                label_layers.push((u32::MAX, String::new()));
+            }
+        }
+    }
     let attribution = tile_out.attribution;
     let tiles_pending = tile_out.pending;
     let tile_errors = tile_out.errors;
@@ -8670,6 +8728,31 @@ mod tests {
         let png = render_png(&mut m, &view).unwrap();
         assert!(png.len() > 1000);
         assert!(!world().is_empty());
+    }
+
+    /// The MGRS graticule's names (#1042) come with the frame's placed labels, after them, in the
+    /// graticule's color with a halo, on a turned view too; another graticule has none, nor does
+    /// a hidden one.
+    #[test]
+    fn the_mgrs_graticule_names_come_with_the_labels() {
+        let mut m = Map::new("Map");
+        m.graticule_type = rustgis_map::graticule::GraticuleType::Mgrs;
+        let camera = Camera { center: lonlat_to_merc(Coord::new(14.5, 48.2)), res: 500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+        let grid = |m: &mut Map, view: &View| -> Vec<PlacedLabel> {
+            render(m, view).unwrap().labels.into_iter().filter(|l| l.size == mapgrid::LABEL_PT && l.halo.is_some()).collect()
+        };
+        let named = grid(&mut m, &view);
+        assert!(named.iter().any(|l| l.text == "33U VP"), "{:?}", named.iter().map(|l| &l.text).collect::<Vec<_>>());
+        let (.., grat) = m.palette();
+        assert!(named.iter().all(|l| (l.color.r(), l.color.g(), l.color.b(), l.color.a()) == (grat.r(), grat.g(), grat.b(), 255)));
+        let turned = View { camera: Camera { bearing: 30.0, ..camera }, ..view };
+        assert!(!grid(&mut m, &turned).is_empty());
+        m.graticule_type = rustgis_map::graticule::GraticuleType::Utm;
+        assert!(grid(&mut m, &view).is_empty());
+        m.graticule_type = rustgis_map::graticule::GraticuleType::Mgrs;
+        m.graticule = false;
+        assert!(grid(&mut m, &view).is_empty());
     }
 
     #[test]

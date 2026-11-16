@@ -76,7 +76,7 @@ pub fn commands() -> Vec<C> {
         C::new("map.basemap", "Basemap", "Home › Add", basemap).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"name": "paper"|"midnight"|"ocean"|"atlas"|"blank", "keepTiles"?: bool (keeps the web tile basemaps over it)}"#),
         C::new("map.graticule", "Graticule", "View › Display", graticule).roles(&[]).effects(crate::policy::Effects::NONE)
-        .params(r#"{"on"?: bool (toggles when omitted, on when a type or crs is given), "type"?: "degrees"|"measured"|"utm", "crs"?: a projected system for the measured grid (EPSG:2056, WKT or a PROJ string; "" or null: the map's own when projected, else the UTM zone at the view's centre)}"#),
+        .params(r#"{"on"?: bool (toggles when omitted, on when a type or crs is given), "type"?: "degrees"|"measured"|"utm"|"mgrs", "crs"?: a projected system for the measured grid (EPSG:2056, WKT or a PROJ string; "" or null: the map's own when projected, else the UTM zone at the view's centre)}"#),
         C::new("map.reloadWebLayers", "Reload Web Layers", "View › Display", |_, _| {
             // The map view draws again when the tile cache's generation moves.
             crate::render::rustgis_tiles::cache::clear();

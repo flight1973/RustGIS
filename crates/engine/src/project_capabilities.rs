@@ -191,9 +191,12 @@ fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
 }
 
 fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static str> {
-    let (mut block, mut water, mut shore, mut relief, mut light, mut legends, mut pictures) =
-        (false, false, false, false, false, false, false);
+    let (mut block, mut water, mut shore, mut relief, mut light, mut legends, mut pictures, mut mgrs) =
+        (false, false, false, false, false, false, false, false);
     for map in maps {
+        // An older reader doesn't know the MGRS graticule (#1042 piece 8): it refuses the
+        // project by name rather than failing to read the type.
+        mgrs |= map.graticule_type == rustgis_map::graticule::GraticuleType::Mgrs;
         if let Some(t) = &map.view.terrain {
             block |= t.block.is_some();
             water |= t.water.is_some();
@@ -215,6 +218,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (light, "shaded-relief-light"),
         (legends, "normalized-legend-urls"),
         (pictures, "picture-markers"),
+        (mgrs, "graticule-mgrs"),
     ]
     .into_iter()
     .filter_map(|(used, name)| used.then_some(name))

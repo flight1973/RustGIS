@@ -1530,7 +1530,7 @@ pub struct Map {
     pub bookmarks: Vec<Bookmark>,
     #[serde(default = "yes")]
     pub graticule: bool,
-    /// What the graticule draws: latitudes and longitudes, a measured grid or the UTM zones.
+    /// What the graticule draws: latitudes and longitudes, a measured grid, the UTM zones or MGRS.
     #[serde(default, skip_serializing_if = "graticule::GraticuleType::is_degrees")]
     pub graticule_type: graticule::GraticuleType,
     /// A measured graticule's coordinate system (`EPSG:2056`, WKT or a PROJ string): none is the
