@@ -650,7 +650,12 @@ mod tests {
         assert_eq!((r.width, r.height, r.overview, r.step), (6, 6, Some((11, 11)), 2));
         // Output (col 1, row 1) is column 2, point 10 - 2 = 8.
         assert_eq!(r.value(0, 1, 1), Some(208.0));
-        assert!((r.transform.pixel_width - 0.2).abs() < 1e-12 && (r.transform.origin_x + 0.05).abs() < 1e-12);
+        // Cells are two posts wide, each centered on the post kept: column 2, point 8 is at 0.2°E,
+        // 0.8°N.
+        let t = r.transform;
+        assert!((t.pixel_width - 0.2).abs() < 1e-12 && (t.origin_x + 0.1).abs() < 1e-12 && (t.origin_y - 1.1).abs() < 1e-12);
+        let kept = t.to_world(1.5, 1.5);
+        assert!((kept.x - 0.2).abs() < 1e-9 && (kept.y - 0.8).abs() < 1e-9, "{kept:?}");
     }
 
     #[test]

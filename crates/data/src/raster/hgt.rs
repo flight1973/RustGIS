@@ -8,14 +8,17 @@
 //!   from 37°N to 38°N and from 122°W to 121°W (`S` and `E` likewise; latitude in two digits,
 //!   longitude in three).
 //! - It is a square grid of 16-bit signed, big-endian (Motorola order) heights in meters, with no
-//!   header: 1201 × 1201 samples at 3 arc-seconds, or 3601 × 3601 at 1 arc-second. Its size alone
-//!   says which, and nothing else is read: another size is refused rather than guessed.
+//!   header: 1201 × 1201 samples at 3 arc-seconds, or 3601 × 3601 at 1 arc-second. GDAL's SRTMHGT
+//!   driver documentation adds 0.5 arc-second tiles (since GDAL 3.10), 7201 × 7201, read here too,
+//!   on the same grid rule. Its size alone says which, and nothing else is read: another size is
+//!   refused rather than guessed. A 7201 × 7201 tile holds more samples than the browser does, so
+//!   there it is read at a step ([`step_within`]).
 //! - Rows run north to south, and samples within a row west to east.
 //! - −32768 is a void (no data).
 //! - Horizontal datum WGS 84; heights are above the EGM96 geoid (mean sea level), not the
 //!   ellipsoid.
 //! - Samples are points on the grid lines, the first and last row and column lying exactly on
-//!   the tile's whole-degree edges, so that 1° holds 1201 (or 3601) of them and neighboring tiles
+//!   the tile's whole-degree edges, so that 1° holds 1201 (3601, 7201) of them and neighboring tiles
 //!   share an edge row and column.
 //!
 //! As a raster, each sample is a cell centered on its point: the raster's cells reach half a cell
@@ -27,8 +30,8 @@ use crate::{DataError, Result};
 
 /// The no-data value of a tile: a void.
 pub const VOID: i16 = i16::MIN;
-/// The sides a tile can have: 3 arc-seconds (SRTM3) and 1 arc-second (SRTM1).
-pub const SIDES: [usize; 2] = [1201, 3601];
+/// The sides a tile can have: 3 arc-seconds (SRTM3), 1 arc-second (SRTM1) and 0.5 arc-second.
+pub const SIDES: [usize; 3] = [1201, 3601, 7201];
 
 /// Whether `len` bytes are a tile of one of [`SIDES`], and its side.
 pub fn side_of(len: u64) -> Option<usize> {
@@ -42,7 +45,9 @@ pub fn side_of(len: u64) -> Option<usize> {
 pub fn tile_corner(file_name: &str) -> Option<(i32, i32)> {
     let base = std::path::Path::new(file_name).file_name()?.to_str()?;
     let tile = base.get(..7)?;
-    if !matches!(base.get(7..8), None | Some(".")) {
+    // The tile code ends the name or a `.` follows it (`None` when byte 7 is inside a character).
+    let rest = base.get(7..)?;
+    if !(rest.is_empty() || rest.starts_with('.')) {
         return None;
     }
     let bytes = tile.as_bytes();
@@ -68,12 +73,14 @@ pub fn tile_corner(file_name: &str) -> Option<(i32, i32)> {
 
 /// The transform of a grid of posts (samples on grid lines) whose south-west post is at
 /// (`west`, `south`), `cols` × `rows` of them `dx` and `dy` degrees apart, read every `step`-th
-/// post: each post becomes a cell centered on it, so the grid's edges lie half a cell beyond
-/// the outer posts. `step` makes each cell `step` posts wide, from the north-west post.
+/// post from the north-west one: each post kept becomes a cell centered on it, `step` posts wide,
+/// so the grid's edges lie half a cell beyond the outer posts kept. (At `step` 1, half a post's
+/// spacing beyond the outer posts.)
 pub(super) fn post_transform(west: f64, south: f64, rows: usize, dx: f64, dy: f64, step: usize) -> GeoTransform {
     let north = south + (rows.saturating_sub(1)) as f64 * dy;
     let k = step.max(1) as f64;
-    GeoTransform { origin_x: west - dx / 2.0, origin_y: north + dy / 2.0, pixel_width: dx * k, pixel_height: -dy * k }
+    let (cell_x, cell_y) = (dx * k, dy * k);
+    GeoTransform { origin_x: west - cell_x / 2.0, origin_y: north + cell_y / 2.0, pixel_width: cell_x, pixel_height: -cell_y }
 }
 
 /// The step at which a `w` × `h` grid fits in `max` samples: 1, or the smallest power of two
@@ -117,7 +124,7 @@ fn bad(m: String) -> DataError {
 }
 
 /// Where a tile named `file_name` of `len` bytes lies and its side: its south-west corner
-/// (latitude, longitude) and 1201 or 3601. Checked before a file is read, so a wrong one is
+/// (latitude, longitude) and 1201, 3601 or 7201. Checked before a file is read, so a wrong one is
 /// refused unread, saying why: a name that isn't a tile's, or a size that isn't one.
 pub fn check(file_name: &str, len: u64) -> Result<(i32, i32, usize)> {
     let (lat, lon) = tile_corner(file_name).ok_or_else(|| {
@@ -127,8 +134,8 @@ pub fn check(file_name: &str, len: u64) -> Result<(i32, i32, usize)> {
     })?;
     let side = side_of(len).ok_or_else(|| {
         bad(format!(
-            "{len} bytes isn't a tile's size: a tile is 1201 × 1201 heights (2,884,802 bytes) or 3601 × 3601 (25,934,402 bytes){}",
-            if len < 2 * 1201 * 1201 { "; the file may be cut short" } else { "" }
+            "{len} bytes isn't a tile's size: a tile is 1201 × 1201 heights (2,884,802 bytes), 3601 × 3601 (25,934,402 bytes) or 7201 × 7201 (103,708,802 bytes){}",
+            if len < 2 * 7201 * 7201 { "; the file may be cut short" } else { "" }
         ))
     })?;
     Ok((lat, lon, side))
@@ -200,6 +207,8 @@ mod tests {
             "N37W122x.hgt",
             "N+7W122.hgt",
             "ÑÑÑÑ.hgt",
+            "N37W122é.hgt",
+            "N37W122é",
         ] {
             assert_eq!(tile_corner(bad), None, "{bad}");
         }
@@ -259,7 +268,15 @@ mod tests {
         let mut longer = bytes.clone();
         longer.extend_from_slice(&[0, 0]);
         let e = read("N37W122.hgt", &longer).unwrap_err().to_string();
+        assert!(e.contains("isn't a tile's size") && e.contains("7201 × 7201 (103,708,802 bytes)"), "{e}");
+        // Any size short of the largest tile may be one cut short; past it, it can't be.
+        let e = check("N37W122.hgt", 2 * 3601 * 3601 + 2).unwrap_err().to_string();
+        assert!(e.contains("cut short"), "{e}");
+        let e = check("N37W122.hgt", 2 * 7201 * 7201 - 2).unwrap_err().to_string();
+        assert!(e.contains("cut short"), "{e}");
+        let e = check("N37W122.hgt", 2 * 7201 * 7201 + 2).unwrap_err().to_string();
         assert!(e.contains("isn't a tile's size") && !e.contains("cut short"), "{e}");
+        assert_eq!(check("N37W122.hgt", 2 * 3601 * 3601).unwrap(), (37, -122, 3601));
         // 1200 × 1200 or 1201 × 1200 would be guesses.
         assert!(read("N37W122.hgt", &vec![0; 2 * 1200 * 1200]).is_err());
         assert!(read("N37W122.hgt", &vec![0; 2 * 1201 * 1200]).is_err());
@@ -271,10 +288,43 @@ mod tests {
         let r = read_limited("N10E020.hgt", &bytes, 1201 * 1201 - 1).unwrap();
         assert_eq!((r.width, r.height, r.overview, r.step), (601, 601, Some((1201, 1201)), 2));
         assert_eq!(r.value(0, 3, 5), Some(26.0), "file row 10 × 2 + file column 6 % 7");
-        // Its west and north edges stay where the file's are; cells are two samples wide.
+        // Cells are two samples wide, each centered on the sample kept: output (3, 5) is file
+        // column 6, row 10, at 20° + 6d east and 11° − 10d north.
         let d = 1.0 / 1200.0;
-        assert!((r.transform.origin_x - (20.0 - d / 2.0)).abs() < 1e-12);
+        assert!((r.transform.origin_x - (20.0 - d)).abs() < 1e-12);
+        assert!((r.transform.origin_y - (11.0 + d)).abs() < 1e-12);
         assert!((r.transform.pixel_width - 2.0 * d).abs() < 1e-15);
+        let kept = r.transform.to_world(3.5, 5.5);
+        assert!((kept.x - (20.0 + 6.0 * d)).abs() < 1e-9 && (kept.y - (11.0 - 10.0 * d)).abs() < 1e-9, "{kept:?}");
+    }
+
+    #[test]
+    fn a_half_arc_second_tile_is_read_within_the_budget() {
+        // 7201 × 7201 at 0.5″: 51,854,401 samples, more than the browser holds, read at a step.
+        let side = 7201;
+        let mut bytes = vec![0u8; 2 * side * side];
+        let mut put = |row: usize, col: usize, v: i16| {
+            let at = 2 * (row * side + col);
+            bytes[at..at + 2].copy_from_slice(&v.to_be_bytes());
+        };
+        put(0, 0, 11);
+        put(8 * 3, 8 * 5, 853);
+        put(7200, 7200, -4);
+        let r = read_limited("N45E006.hgt", &bytes, 1_000_000).unwrap();
+        assert_eq!((r.width, r.height, r.overview, r.step), (901, 901, Some((7201, 7201)), 8));
+        assert_eq!(r.value(0, 0, 0), Some(11.0));
+        assert_eq!(r.value(0, 5, 3), Some(853.0));
+        assert_eq!(r.value(0, 900, 900), Some(-4.0), "the south-east sample is kept");
+        let d = 1.0 / 7200.0;
+        let t = r.transform;
+        assert!((t.pixel_width - 8.0 * d).abs() < 1e-15 && (t.pixel_height + 8.0 * d).abs() < 1e-15);
+        let kept = t.to_world(5.5, 3.5);
+        assert!((kept.x - (6.0 + 40.0 * d)).abs() < 1e-9 && (kept.y - (46.0 - 24.0 * d)).abs() < 1e-9, "{kept:?}");
+        let se = t.to_world(900.5, 900.5);
+        assert!((se.x - 7.0).abs() < 1e-9 && (se.y - 45.0).abs() < 1e-9, "{se:?}");
+        // Within the desktop's least budget it would be read whole.
+        assert_eq!(step_within(side, side, crate::raster::SAMPLES_FLOOR), Some(1));
+        assert_eq!(check("N45E006.hgt", bytes.len() as u64).unwrap(), (45, 6, 7201));
     }
 
     #[test]
