@@ -1868,6 +1868,10 @@ mod tests {
         // this records the reading, not a slip.
         let wide = [(0.0, 0.0), (300.0, 0.0), (150.0, 80.0), (0.0, 0.0)];
         assert_eq!(ring_pole_turns(&wide.map(|(x, y)| Coord::new(x, y))), -1);
+        // A layer in meters is read into degrees before any tool sees it; one that never was has
+        // a y past 90 almost at once, and gives 0: a 1 km triangle doesn't wind.
+        let meters = [(0.0, 0.0), (1000.0, 0.0), (500.0, 800.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&meters.map(|(x, y)| Coord::new(x, y))), 0);
         // An edge of exactly 360 between a step north and a step south is a full turn, not folded:
         // the short-way steps would sum to -360, but this ring gives 0.
         let full = [(0.0, 0.0), (360.0, 0.0), (360.0, 10.0), (240.0, 10.0), (120.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
