@@ -136,7 +136,8 @@ impl ShpSource {
         // stale after records were added) is set aside, and said.
         let native = index.bounds.map(|[x0, y0, x1, y1]| {
             // The header, a box itself, rounded outward as the records' boxes are, holds them all:
-            // exact, no allowance needed.
+            // so a header written exactly always passes, and one short of a shape by less than
+            // the f32 rounding (under a meter in UTM) does too.
             let frames = [native.min_x, native.min_y, native.max_x, native.max_y].iter().all(|v| v.is_finite())
                 && !native.is_empty()
                 && f32_down(native.min_x) <= x0
@@ -423,11 +424,15 @@ fn record_box(c: &[u8]) -> [f32; 4] {
             _ => return NONE,
         },
         Some(t @ (3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28 | 31)) => {
-            // A shape of no points (an empty geometry some writers give a 0, 0, 0, 0 box) has
-            // nothing to frame. Its count follows the box: at 36 for a multipoint, else at 40
-            // after the parts' count.
-            let points = if matches!(t, 8 | 18 | 28) { le_i32(c, 36) } else { le_i32(c, 40) };
-            if points == Some(0) {
+            // A shape of no points, or no parts (an empty geometry some writers give a 0, 0, 0, 0
+            // box), has nothing to frame. The counts follow the box: a multipoint's points at 36,
+            // else the parts at 36 and the points at 40.
+            let empty = if matches!(t, 8 | 18 | 28) {
+                le_i32(c, 36).is_some_and(|n| n <= 0)
+            } else {
+                le_i32(c, 36).is_some_and(|n| n <= 0) || le_i32(c, 40).is_some_and(|n| n <= 0)
+            };
+            if empty {
                 return NONE;
             }
             match (le_f64(c, 4), le_f64(c, 12), le_f64(c, 20), le_f64(c, 28)) {
