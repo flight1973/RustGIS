@@ -38,11 +38,17 @@
 //! raster each post is a cell centered on it, and the cells reach half a cell beyond the cell's
 //! whole-degree lines ([`super::hgt::post_transform`]), as an SRTM tile's do.
 //!
-//! A column whose record header or checksum is wrong is read as no data, and the columns are
-//! counted in a notice: a wrong checksum means some byte of the column is wrong, and which one
-//! can't be told, so its heights could be anything; drawing them as terrain (for a viewshed,
-//! a line of sight) would be worse than a gap that says why. The rest of the cell is still good.
-//! A file cut short is read as far as it goes, the missing columns as no data, and said.
+//! A column whose record header is damaged (not the sentinel, or the wrong counts) is read as no
+//! data, and the columns are counted in a notice: its place in the cell can't be trusted. A column
+//! whose checksum doesn't match its heights is read as stored, and counted in a notice too: GDAL's
+//! DTED driver documentation says some producers write wrong checksums, and that GDAL ignores
+//! them by default. A file cut short is read as far as it goes, the missing columns as no data,
+//! and said.
+//!
+//! The same documentation says some producers write heights in two's complement rather than
+//! signed magnitude. Signed magnitude reads such a negative height as one below −16000 m, which no
+//! terrain has, so a height decoding below −16000 (other than the void, every bit set) is decoded
+//! as two's complement instead, and counted in a notice ([`decode_height`]).
 
 use super::hgt::{post_transform, step_within, vertical_note, void_note};
 use super::{ColorHint, Crs, Raster, max_samples};
@@ -98,6 +104,21 @@ fn signed_magnitude(bytes: &[u8]) -> i64 {
     if raw & top != 0 { -magnitude } else { magnitude }
 }
 
+/// A height as a record stores it (3.11.1): signed magnitude, with the void (every bit set) as
+/// [`VOID`]. A value below −16000 m that isn't the void is taken for two's complement, the way some
+/// producers write heights, and decoded so; the `bool` says when. Such a producer's void (−32767,
+/// `0x8001` in two's complement) reads as −1 in signed magnitude, a plausible height: it can't be
+/// told apart, and is read as −1.
+fn decode_height(raw: [u8; 2]) -> (i16, bool) {
+    let word = u16::from_be_bytes(raw);
+    if word == 0xFFFF {
+        return (VOID, false);
+    }
+    let magnitude = (word & 0x7FFF) as i16;
+    let v = if word & 0x8000 != 0 { -magnitude } else { magnitude };
+    if v < -16000 { (i16::from_be_bytes(raw), true) } else { (v, false) }
+}
+
 /// The longitude interval MIL-PRF-89020B sets, in tenths of seconds, for DTED `level` (0–2) in
 /// the cell whose south edge is `south` (3.9.2, Tables I–III): the latitude interval times one,
 /// two, three, four or six, by the zone of the cell's edge nearer the equator.
@@ -127,7 +148,7 @@ pub fn spec_latitude_interval(level: u8) -> Option<u32> {
 }
 
 /// Reads a DTED file: `bytes` are the file, `file_name` its name (its extension gives the level
-/// the spacing is checked against).
+/// the spacing is checked against when the DSI doesn't name one).
 pub fn read(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     read_limited(file_name, bytes, max_samples())
 }
@@ -172,18 +193,26 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     if !differ.is_empty() {
         lost.push(format!("its DSI record gives a different {}; the UHL's are used", differ.join(", ")));
     }
+    // The level: the DSI's series designator (3.12 d), or the extension when it names none.
     let ext = std::path::Path::new(file_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let level = match ext.as_str() {
-        "dt0" => Some(0),
+    let named = match ext.as_str() {
+        "dt0" => Some(0u8),
         "dt1" => Some(1),
         "dt2" => Some(2),
-        _ => match field(bytes, DSI + 59, 5) {
-            Some("DTED0") => Some(0),
-            Some("DTED1") => Some(1),
-            Some("DTED2") => Some(2),
-            _ => None,
-        },
+        _ => None,
     };
+    let designated = match field(bytes, DSI + 59, 5) {
+        Some("DTED0") => Some(0u8),
+        Some("DTED1") => Some(1),
+        Some("DTED2") => Some(2),
+        _ => None,
+    };
+    if let (Some(d), Some(n)) = (designated, named)
+        && d != n
+    {
+        lost.push(format!("its DSI says DTED level {d} but the file is named .{ext}; the DSI's level is used"));
+    }
+    let level = designated.or(named);
     if let Some(level) = level {
         let tenths = |t: u32| format!("{}″", f64::from(t) / 10.0);
         let want = (spec_latitude_interval(level), spec_longitude_interval(level, south.floor()));
@@ -224,7 +253,8 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     let step = step_within(cols, rows, max).ok_or_else(|| bad("the cell is too large to open"))?;
     let (w, h) = (cols.div_ceil(step), rows.div_ceil(step));
     let mut data = super::filled(w, h, f32::from(VOID))?;
-    let (mut damaged, mut failed, mut voids) = (0usize, 0usize, 0u64);
+    let (mut damaged, mut mismatched, mut voids, mut twos) = (0usize, 0usize, 0u64, 0u64);
+    let mut column = Vec::with_capacity(rows);
     for (i, rec) in body.chunks_exact(record).take(cols).enumerate() {
         let Some((head, (heights, sum))) =
             rec.split_at_checked(8).and_then(|(head, rest)| Some((head, rest.split_at_checked(rest.len().checked_sub(4)?)?)))
@@ -238,25 +268,30 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
             damaged += 1;
             continue;
         }
+        // A wrong checksum is counted, and the heights read as stored (see the module's notes).
         let total: u64 = head.iter().chain(heights).map(|b| u64::from(*b)).sum();
         if signed_magnitude(sum) != total as i64 {
-            failed += 1;
-            continue;
+            mismatched += 1;
         }
-        let height = |j: usize| heights.get(2 * j..2 * j + 2).map_or(VOID, |b| signed_magnitude(b) as i16);
-        voids += (0..rows).filter(|j| height(*j) == VOID).count() as u64;
+        column.clear();
+        for raw in heights.as_chunks::<2>().0.iter().take(rows) {
+            let (v, two) = decode_height(*raw);
+            voids += u64::from(v == VOID);
+            twos += u64::from(two);
+            column.push(v);
+        }
         if i % step != 0 {
             continue;
         }
         // Rows run north to south: output row `r` is the latitude point `rows - 1 - r × step`.
         for r in 0..h {
             if let Some(cell) = data.get_mut(r * w + i / step) {
-                *cell = f32::from(height(rows.saturating_sub(1 + r * step)));
+                *cell = f32::from(column.get(rows.saturating_sub(1 + r * step)).copied().unwrap_or(VOID));
             }
         }
     }
-    if damaged + failed == present {
-        return Err(bad("no data record is whole: every one has a damaged header or a wrong checksum"));
+    if damaged == present {
+        return Err(bad("no data record is whole: every one has a damaged header"));
     }
     let count = |n: usize| if n == 1 { format!("1 of its {cols} columns has") } else { format!("{n} of its {cols} columns have") };
     if present < cols {
@@ -270,12 +305,24 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
             count(damaged)
         ));
     }
-    if failed > 0 {
-        lost.push(format!(
-            "{} a wrong checksum, so {} read as no data rather than trusted",
-            count(failed),
-            if failed == 1 { "it is" } else { "they are" }
-        ));
+    match mismatched {
+        0 => {}
+        1 => lost.push(format!(
+            "1 of its {cols} columns' checksum doesn't match its heights (some producers write them wrongly); its heights are read as stored"
+        )),
+        n => lost.push(format!(
+            "{n} of its {cols} columns' checksums don't match their heights (some producers write them wrongly); their heights are read as stored"
+        )),
+    }
+    match twos {
+        0 => {}
+        1 => lost.push(
+            "1 of its heights was written in two's complement, not the signed magnitude MIL-PRF-89020B sets; it is read as two's complement"
+                .into(),
+        ),
+        n => lost.push(format!(
+            "{n} of its heights were written in two's complement, not the signed magnitude MIL-PRF-89020B sets; they are read as two's complement"
+        )),
     }
     lost.extend(void_note(voids, (rows * cols) as u64, VOID));
     let name = std::path::Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or("dted").to_string();
@@ -359,6 +406,58 @@ mod tests {
         assert_eq!(signed_magnitude(&[0x80, 0x00]), 0);
         assert_eq!(signed_magnitude(&[0x00, 0x01, 0x02, 0x03]), 0x010203);
         assert_eq!(signed_magnitude(&[]), 0);
+    }
+
+    #[test]
+    fn heights_below_minus_16000_are_read_as_twos_complement() {
+        assert_eq!(decode_height([0x80, 0x05]), (-5, false));
+        assert_eq!(decode_height([0x00, 0x05]), (5, false));
+        assert_eq!(decode_height([0xff, 0xff]), (VOID, false), "the void, not two's complement −1");
+        assert_eq!(decode_height([0xbe, 0x80]), (-16000, false), "−16000 itself is signed magnitude");
+        assert_eq!(decode_height([0xff, 0xfb]), (-5, true));
+        assert_eq!(decode_height([0xc1, 0x80]), (-16000, true));
+        // A two's-complement producer's void (0x8001) reads as −1: it can't be told apart.
+        assert_eq!(decode_height([0x80, 0x01]), (-1, false));
+    }
+
+    #[test]
+    fn a_twos_complement_height_is_read_and_said() {
+        let rows = 11;
+        let mut b = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |i, j| Some((i + j) as i16));
+        // Column 4, point 2 holds −5 as two's complement (0xFFFB); its checksum is made right.
+        let rec = at(4, rows);
+        b[rec + 8 + 2 * 2..rec + 8 + 2 * 2 + 2].copy_from_slice(&(-5i16).to_be_bytes());
+        let sum: u32 = b[rec..rec + 8 + 2 * rows].iter().map(|v| u32::from(*v)).sum();
+        b[rec + 8 + 2 * rows..rec + 12 + 2 * rows].copy_from_slice(&sum.to_be_bytes());
+        let r = read("x.dt1", &b).unwrap();
+        assert_eq!(r.value(0, 4, 10 - 2), Some(-5.0));
+        assert!(
+            r.lost.iter().any(|l| l
+                == "1 of its heights was written in two's complement, not the signed magnitude MIL-PRF-89020B sets; it is read as two's complement"),
+            "{:?}",
+            r.lost
+        );
+        assert!(!r.lost.iter().any(|l| l.contains("checksum")), "{:?}", r.lost);
+    }
+
+    #[test]
+    fn the_dsi_names_the_level() {
+        // 11 × 11 posts of 3″ is no level's spacing: the notice names the level checked against.
+        let b = dted("0000000E", "0000000N", (30, 30), (11, 11), |_, _| Some(1));
+        let r = read("x.dt2", &b).unwrap();
+        assert!(
+            r.lost.iter().any(|l| l == "its DSI says DTED level 1 but the file is named .dt2; the DSI's level is used"),
+            "{:?}",
+            r.lost
+        );
+        assert!(!r.lost.iter().any(|l| l.contains("isn't the")), "level 1's spacing is 3″ by 3″: {:?}", r.lost);
+        // Agreeing, nothing is said; without a designator the extension gives the level.
+        assert!(!read("x.dt1", &b).unwrap().lost.iter().any(|l| l.contains("DSI says")));
+        let mut blank = b.clone();
+        blank[DSI + 59..DSI + 64].copy_from_slice(b"     ");
+        let r = read("x.dt2", &blank).unwrap();
+        assert!(!r.lost.iter().any(|l| l.contains("DSI says")), "{:?}", r.lost);
+        assert!(r.lost.iter().any(|l| l.contains("isn't the 1″ by 1″") && l.contains("level 2")), "{:?}", r.lost);
     }
 
     #[test]
@@ -452,17 +551,34 @@ mod tests {
         let c2 = at(2, rows) + 8;
         bytes[c2 + 1] ^= 1;
         bytes[at(5, rows)] = 0xab;
-        let r = read("x.dt2", &bytes).unwrap();
-        assert_eq!(r.value(0, 2, 3), None, "a column failing its checksum is no data");
-        assert_eq!(r.value(0, 5, 3), None);
+        let r = read("x.dt1", &bytes).unwrap();
+        // Column 2's heights are read as stored: point 3's is 2 + 3 = 5, point 0's (the flipped
+        // byte's) 2 + 0 + 1 = 3.
+        assert_eq!(r.value(0, 2, 10 - 3), Some(5.0), "a column failing its checksum is read as stored");
+        assert_eq!(r.value(0, 2, 10), Some(3.0));
+        assert_eq!(r.value(0, 5, 3), None, "a damaged header is no data");
         assert_eq!(r.value(0, 4, 3), Some(11.0));
         assert!(
-            r.lost.iter().any(|l| l == "1 of its 11 columns has a wrong checksum, so it is read as no data rather than trusted"),
+            r.lost.iter().any(|l| l
+                == "1 of its 11 columns' checksum doesn't match its heights (some producers write them wrongly); its heights are read as stored"),
             "{:?}",
             r.lost
         );
         assert!(r.lost.iter().any(|l| l.starts_with("1 of its 11 columns has a damaged record header")), "{:?}", r.lost);
         assert!(!r.lost.iter().any(|l| l.contains("void")), "voids in bad columns aren't counted: {:?}", r.lost);
+        // Every checksum wrong: the cell still opens, read as stored, and the count says so.
+        let mut sums = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |i, j| Some((i + j) as i16));
+        for i in 0..11 {
+            sums[at(i, rows) + 12 + 2 * rows - 1] ^= 1;
+        }
+        let r = read("x.dt1", &sums).unwrap();
+        assert_eq!(r.value(0, 7, 10), Some(7.0));
+        assert!(
+            r.lost.iter().any(|l| l
+                == "11 of its 11 columns' checksums don't match their heights (some producers write them wrongly); their heights are read as stored"),
+            "{:?}",
+            r.lost
+        );
         // A wrong column number is damage too.
         let mut moved = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |_, _| Some(1));
         moved[at(7, rows) + 5] = 9;
