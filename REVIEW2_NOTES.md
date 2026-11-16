@@ -7,4 +7,4 @@
 - [x] 3. Read at step k, overview is (width·k, height·k) in dted and hgt, so overview / width == step == file_pixels and the warp scale. Extent unchanged (cells centered on kept posts). Test: a_step_that_doesnt_divide_the_posts_keeps_the_scale_exact (9 × 13 at step 2).
 - [x] 4. A wrong-size .hgt gives the nearest tile sizes (n bytes more than one, m fewer than the next); "may be cut short" only below 1201 × 1201. Tests: 1201² + 2, 3601² + 2, 7201² ± 2, 0 bytes.
 - [x] 5. elevation_ignores no longer says DTED is always WGS 84: the "crs" notice says the files give their own coordinates, read as WGS 84 (a DTED file naming another datum says so); the "layer" notice says they hold one band. Engine tests pin all three texts.
-- [ ] 9. Reduced-reading efficiency.
+- [x] 9. DTED: columns skipped at a step are only counted (voids and two's complement, via twos_complement), not decoded or pushed. HGT: one pass counts voids and keeps every step-th sample. Test: counts_at_a_step_are_the_whole_files.

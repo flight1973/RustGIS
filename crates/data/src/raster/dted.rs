@@ -114,9 +114,18 @@ fn decode_height(raw: [u8; 2]) -> (i16, bool) {
     if word == 0xFFFF {
         return (VOID, false);
     }
+    if twos_complement(word) {
+        return (i16::from_be_bytes(raw), true);
+    }
     let magnitude = (word & 0x7FFF) as i16;
-    let v = if word & 0x8000 != 0 { -magnitude } else { magnitude };
-    if v < -16000 { (i16::from_be_bytes(raw), true) } else { (v, false) }
+    (if word & 0x8000 != 0 { -magnitude } else { magnitude }, false)
+}
+
+/// Whether [`decode_height`] takes a stored word for two's complement: negative in signed
+/// magnitude, below −16000, and not the void. Counted for columns skipped at a step without
+/// decoding them.
+fn twos_complement(word: u16) -> bool {
+    word != 0xFFFF && word & 0x8000 != 0 && word & 0x7FFF > 16000
 }
 
 /// The longitude interval MIL-PRF-89020B sets, in tenths of seconds, for DTED `level` (0–2) in
@@ -277,15 +286,21 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
         if signed_magnitude(sum) != total as i64 {
             mismatched += 1;
         }
+        let raws = heights.as_chunks::<2>().0.iter().take(rows);
+        if i % step != 0 {
+            // A column skipped at a step: only counted, for the notices speak of the whole file.
+            for word in raws.map(|raw| u16::from_be_bytes(*raw)) {
+                voids += u64::from(word == 0xFFFF);
+                twos += u64::from(twos_complement(word));
+            }
+            continue;
+        }
         column.clear();
-        for raw in heights.as_chunks::<2>().0.iter().take(rows) {
+        for raw in raws {
             let (v, two) = decode_height(*raw);
             voids += u64::from(v == VOID);
             twos += u64::from(two);
             column.push(v);
-        }
-        if i % step != 0 {
-            continue;
         }
         // Rows run north to south: output row `r` is the latitude point `rows - 1 - r × step`.
         for r in 0..h {
@@ -723,6 +738,24 @@ mod tests {
         assert!(((e.min_x + e.max_x) / 2.0 - 0.2).abs() < 1e-9 && ((e.min_y + e.max_y) / 2.0 - 0.3).abs() < 1e-9, "{e:?}");
         assert_eq!(r.value(0, 4, 0), Some(812.0), "column 8, point 12");
         assert_eq!(r.value(0, 4, 6), Some(800.0), "column 8, point 0");
+    }
+
+    #[test]
+    fn counts_at_a_step_are_the_whole_files() {
+        // Voids and two's-complement heights in kept and skipped columns alike.
+        let rows = 11;
+        let mut b = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |i, j| if (i + j) % 4 == 0 { None } else { Some(1) });
+        for (i, j) in [(1, 2), (4, 3), (7, 7)] {
+            let rec = at(i, rows);
+            b[rec + 8 + 2 * j..rec + 10 + 2 * j].copy_from_slice(&(-20i16).to_be_bytes());
+        }
+        let whole = read("x.dt1", &b).unwrap();
+        let stepped = read_limited("x.dt1", &b, 40).unwrap();
+        assert_eq!(stepped.step, 2);
+        let notes = |r: &Raster| r.lost.iter().filter(|l| l.contains("void") || l.contains("two's")).cloned().collect::<Vec<_>>();
+        assert_eq!(notes(&whole), notes(&stepped));
+        assert!(notes(&whole).iter().any(|l| l.starts_with("3 of its heights were written in two's complement")), "{:?}", whole.lost);
+        assert!(notes(&whole).iter().any(|l| l.starts_with("30 of its 121 heights are voids")), "{:?}", whole.lost);
     }
 
     #[test]

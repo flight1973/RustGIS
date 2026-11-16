@@ -136,16 +136,17 @@ fn read_checked_limited(file_name: &str, (lat, lon, side): (i32, i32, usize), by
     let step = step_within(side, side, max).ok_or_else(|| bad("the tile is too large to open".into()))?;
     let out = side.div_ceil(step);
     let mut data = super::grid::<f32>(out, out)?;
-    let height = |row: usize, col: usize| -> i16 {
-        let at = (row * side + col) * 2;
-        bytes.get(at..at + 2).and_then(|b| <[u8; 2]>::try_from(b).ok()).map_or(VOID, i16::from_be_bytes)
-    };
-    for row in (0..side).step_by(step) {
-        for col in (0..side).step_by(step) {
-            data.push(f32::from(height(row, col)));
+    // One pass: every sample's void counted, every `step`-th kept.
+    let mut voids = 0u64;
+    for (row, line) in bytes.as_chunks::<2>().0.chunks(side).enumerate() {
+        let keep = row % step == 0;
+        for (col, raw) in line.iter().enumerate() {
+            voids += u64::from(*raw == VOID.to_be_bytes());
+            if keep && col % step == 0 {
+                data.push(f32::from(i16::from_be_bytes(*raw)));
+            }
         }
     }
-    let voids = bytes.as_chunks::<2>().0.iter().filter(|b| **b == VOID.to_be_bytes()).count() as u64;
     let d = 1.0 / (side - 1) as f64;
     let transform = post_transform(f64::from(lon), f64::from(lat), side, d, d, step);
     let name = std::path::Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or("srtm").to_string();
