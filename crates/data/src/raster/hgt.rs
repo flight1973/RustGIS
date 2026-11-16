@@ -91,11 +91,28 @@ pub fn check(file_name: &str, len: u64) -> Result<(i32, i32, usize)> {
     })?;
     let side = side_of(len).ok_or_else(|| {
         bad(format!(
-            "{len} bytes isn't a tile's size: a tile is 1201 × 1201 heights (2,884,802 bytes), 3601 × 3601 (25,934,402 bytes) or 7201 × 7201 (103,708,802 bytes){}",
-            if len < 2 * 7201 * 7201 { "; the file may be cut short" } else { "" }
+            "{len} bytes isn't a tile's size: a tile is 1201 × 1201 heights (2,884,802 bytes), 3601 × 3601 (25,934,402 bytes) or 7201 × 7201 (103,708,802 bytes) ({})",
+            nearest_sizes(len)
         ))
     })?;
     Ok((lat, lon, side))
+}
+
+/// How `len` bytes, no tile's size, compares with the tiles' sizes nearest it: smaller than the
+/// smallest, the file may be cut short; else the tile it is larger than, and the one it is smaller
+/// than, if any.
+fn nearest_sizes(len: u64) -> String {
+    let bytes = |s: usize| (s * s * 2) as u64;
+    let below = SIDES.into_iter().rev().find(|s| bytes(*s) < len);
+    let above = SIDES.into_iter().find(|s| bytes(*s) > len);
+    match (below, above) {
+        (None, Some(s)) => format!("{} bytes fewer than a {s} × {s} tile; the file may be cut short", bytes(s) - len),
+        (Some(b), Some(a)) => {
+            format!("{} bytes more than a {b} × {b} tile, {} fewer than a {a} × {a} one", len - bytes(b), bytes(a) - len)
+        }
+        (Some(b), None) => format!("{} bytes more than a {b} × {b} tile", len - bytes(b)),
+        (None, None) => "no tile is near it".into(),
+    }
 }
 
 /// [`read`] of a tile [`check`] has placed: `checked` is what it gave for the file's name and
@@ -236,19 +253,32 @@ mod tests {
         let bytes = tile(|_, _| 3);
         let e = read("srtm.hgt", &bytes).unwrap_err().to_string();
         assert!(e.contains("doesn't say where the tile is"), "{e}");
+        // Smaller than the smallest tile, the file may be cut short.
         let e = read("N37W122.hgt", &bytes[..bytes.len() - 2]).unwrap_err().to_string();
-        assert!(e.contains("isn't a tile's size") && e.contains("cut short"), "{e}");
+        assert!(
+            e.contains("isn't a tile's size") && e.ends_with("(2 bytes fewer than a 1201 × 1201 tile; the file may be cut short)"),
+            "{e}"
+        );
+        // Between sizes, the nearest are given, not a cut.
         let mut longer = bytes.clone();
         longer.extend_from_slice(&[0, 0]);
         let e = read("N37W122.hgt", &longer).unwrap_err().to_string();
         assert!(e.contains("isn't a tile's size") && e.contains("7201 × 7201 (103,708,802 bytes)"), "{e}");
-        // Any size short of the largest tile may be one cut short; past it, it can't be.
+        assert!(
+            e.ends_with("(2 bytes more than a 1201 × 1201 tile, 23049598 fewer than a 3601 × 3601 one)") && !e.contains("cut short"),
+            "{e}"
+        );
         let e = check("N37W122.hgt", 2 * 3601 * 3601 + 2).unwrap_err().to_string();
-        assert!(e.contains("cut short"), "{e}");
+        assert!(
+            e.ends_with("(2 bytes more than a 3601 × 3601 tile, 77774398 fewer than a 7201 × 7201 one)") && !e.contains("cut short"),
+            "{e}"
+        );
         let e = check("N37W122.hgt", 2 * 7201 * 7201 - 2).unwrap_err().to_string();
-        assert!(e.contains("cut short"), "{e}");
+        assert!(e.contains("2 fewer than a 7201 × 7201 one") && !e.contains("cut short"), "{e}");
         let e = check("N37W122.hgt", 2 * 7201 * 7201 + 2).unwrap_err().to_string();
-        assert!(e.contains("isn't a tile's size") && !e.contains("cut short"), "{e}");
+        assert!(e.ends_with("(2 bytes more than a 7201 × 7201 tile)") && !e.contains("cut short"), "{e}");
+        let e = check("N37W122.hgt", 0).unwrap_err().to_string();
+        assert!(e.ends_with("(2884802 bytes fewer than a 1201 × 1201 tile; the file may be cut short)"), "{e}");
         assert_eq!(check("N37W122.hgt", 2 * 3601 * 3601).unwrap(), (37, -122, 3601));
         // 1200 × 1200 or 1201 × 1200 would be guesses.
         assert!(read("N37W122.hgt", &vec![0; 2 * 1200 * 1200]).is_err());
