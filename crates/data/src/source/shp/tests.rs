@@ -31,7 +31,8 @@ fn write_shapefile(ds: &Dataset, path: &Path) {
 /// A cached index whose stored box isn't one is built again, not believed.
 #[test]
 fn a_streamed_shapefile_is_framed_by_its_records() {
-    let folder = dir();
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().to_path_buf();
     let write = |name: &str, points: &[Option<(f64, f64)>]| {
         let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
         for p in points {
@@ -60,8 +61,18 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
         let clean = open(&write("clean.shp", &three));
         assert_eq!(clean.info().extent, whole, "a clean header is used as it is");
         assert!(!has(&clean, SET_ASIDE) && !has(&clean, "not longitude/latitude"), "{:?}", clean.info().notes);
+        // Coordinates f32 can't hold, the records' boxes rounded outward past them: the header,
+        // exact, still frames them, with nothing said (projected, as UTM's are).
+        let odd = [Some((10.1, 20.3)), Some((12.7, 22.9))];
+        let s = open(&write("odd.shp", &odd));
+        assert_eq!(s.info().extent, Extent::new(10.1, 20.3, 12.7, 22.9));
+        assert!(!has(&s, SET_ASIDE), "{:?}", s.info().notes);
+        let utm = [Some((500_000.123, 4_500_000.789)), Some((512_345.678, 4_512_345.678))];
+        let s = open(&write("utm.shp", &utm));
+        assert!(!has(&s, SET_ASIDE), "{:?}", s.info().notes);
         // A corner that isn't a number, or one too small for the shapes: the records' boxes.
-        for (k, (at, v)) in [(44, f64::INFINITY), (52, f64::NEG_INFINITY), (60, f64::NAN), (52, 11.0)].into_iter().enumerate() {
+        // (An inverted header too: its min x past its max.)
+        for (k, (at, v)) in [(44, f64::INFINITY), (52, f64::NEG_INFINITY), (60, f64::NAN), (52, 11.0), (36, 13.0)].into_iter().enumerate() {
             let p = write(&format!("corner-{k}.shp"), &three);
             patch(&p, at, v);
             let s = open(&p);
@@ -73,7 +84,9 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
         let p = write("nan-shape.shp", &three);
         patch(&p, 112, f64::NAN);
         patch(&p, 36, f64::NAN);
-        assert_eq!(open(&p).info().extent, Extent::new(11.0, 21.0, 12.0, 22.0));
+        let s = open(&p);
+        assert_eq!(s.info().extent, Extent::new(11.0, 21.0, 12.0, 22.0));
+        assert!(has(&s, SET_ASIDE) && !has(&s, "not longitude/latitude"), "{:?}", s.info().notes);
         // Every record null (its shape type, at 108 + 28 per record, set to 0) under the 0, 0, 0, 0
         // box writers give such a file: no extent, not Null Island.
         let p = write("null.shp", &three);
@@ -115,9 +128,31 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
         assert_eq!(db.execute("UPDATE metadata SET bounds = '[12,22,10,20]'", []).unwrap(), 1);
         drop(db);
         let s = ShpSource::open_path(&p, "pts").unwrap();
+        assert!(s.info().indexed, "built again, not scanned: {:?}", s.info().notes);
         assert_eq!(s.info().extent, whole, "{:?}", s.info().extent);
     });
-    std::fs::remove_dir_all(folder).unwrap();
+}
+/// A record of no points (an empty geometry, which some writers give a 0, 0, 0, 0 box) has no box,
+/// so it doesn't stretch the layer's extent to 0, 0 and set aside a header that's right.
+#[test]
+fn an_empty_shape_has_no_box() {
+    // Shape type, the box, then a polygon's counts of parts and points, or a multipoint's points.
+    let record = |shape: i32, counts: &[i32]| {
+        let mut raw = shape.to_le_bytes().to_vec();
+        for v in [0.0f64, 0.0, 0.0, 0.0] {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        for c in counts {
+            raw.extend_from_slice(&c.to_le_bytes());
+        }
+        raw
+    };
+    let none = |b: [f32; 4]| b.iter().all(|v| v.is_nan());
+    assert!(none(record_box(&record(5, &[0, 0]))), "an empty polygon");
+    assert!(none(record_box(&record(3, &[0, 0]))), "an empty line");
+    assert!(none(record_box(&record(8, &[0]))), "an empty multipoint");
+    assert_eq!(record_box(&record(5, &[1, 4])), [0.0; 4], "a polygon with points keeps its box");
+    assert_eq!(record_box(&record(8, &[2])), [0.0; 4], "a multipoint with points keeps its box");
 }
 fn points_shapefile(path: &Path) {
     let mut ds = Dataset::new("grid", GeometryType::Point, vec![]);

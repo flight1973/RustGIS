@@ -52,6 +52,7 @@ impl DiskIndex {
             // Held to the rule it was built by: a damaged or planted entry is built again rather
             // than giving the layer a box that isn't one (#1985).
             && bounds.is_none_or(usable)
+            && bounds.is_some() == (covered > 0)
             && db.prepare("SELECT id, offset, len FROM records LIMIT 0").is_ok()
             && db.prepare("SELECT id FROM bounds LIMIT 0").is_ok()
         {
@@ -295,7 +296,8 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
     f.seek_relative(100)?;
     let mut pos = 100u64;
     let mut count = 0u32;
-    let mut head = [0u8; 44];
+    // A record's header, its shape type and box, and its counts of parts and points.
+    let mut head = [0u8; 52];
     let mut note = String::new();
     while pos + 8 <= len {
         let want = (len - pos).min(head.len() as u64) as usize;
