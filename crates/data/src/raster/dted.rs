@@ -38,9 +38,10 @@
 //! raster each post is a cell centered on it, and the cells reach half a cell beyond the cell's
 //! whole-degree lines ([`super::post_transform`]), as an SRTM tile's do.
 //!
-//! A column whose record header is damaged (not the sentinel, or the wrong counts) is read as no
-//! data, and the columns are counted in a notice: its place in the cell can't be trusted. A column
-//! whose checksum doesn't match its heights is read as stored, and counted in a notice too: GDAL's
+//! A column whose record doesn't start with the sentinel is damaged and read as no data, and the
+//! columns are counted in a notice. A record whose longitude or latitude count disagrees with its
+//! place in the file (a producer numbering them differently, from 1, say) is read by its place,
+//! and the columns are counted in a notice. A column whose checksum doesn't match its heights is read as stored, and counted in a notice too: GDAL's
 //! DTED driver documentation says some producers write wrong checksums, and that GDAL ignores
 //! them by default. A file cut short is read as far as it goes, the missing columns as no data,
 //! and said.
@@ -252,7 +253,7 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     let step = step_within(cols, rows, max).ok_or_else(|| bad("the cell is too large to open"))?;
     let (w, h) = (cols.div_ceil(step), rows.div_ceil(step));
     let mut data = super::filled(w, h, f32::from(VOID))?;
-    let (mut damaged, mut mismatched, mut voids, mut twos) = (0usize, 0usize, 0u64, 0u64);
+    let (mut damaged, mut misnumbered, mut mismatched, mut voids, mut twos) = (0usize, 0usize, 0usize, 0u64, 0u64);
     let mut column = Vec::with_capacity(rows);
     for (i, rec) in body.chunks_exact(record).take(cols).enumerate() {
         let Some((head, (heights, sum))) =
@@ -263,9 +264,13 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
         };
         let lon_count = signed_magnitude(head.get(4..6).unwrap_or_default());
         let lat_count = signed_magnitude(head.get(6..8).unwrap_or_default());
-        if head.first() != Some(&SENTINEL) || lon_count != i as i64 || lat_count != 0 {
+        if head.first() != Some(&SENTINEL) {
             damaged += 1;
             continue;
+        }
+        // Counts other than the record's place are said, and the record read by its place.
+        if lon_count != i as i64 || lat_count != 0 {
+            misnumbered += 1;
         }
         // A wrong checksum is counted, and the heights read as stored (see the module's notes).
         let total: u64 = head.iter().chain(heights).map(|b| u64::from(*b)).sum();
@@ -290,7 +295,7 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
         }
     }
     if damaged == present {
-        return Err(bad("no data record is whole: every one has a damaged header"));
+        return Err(bad("no data record is whole: none starts with the 0xAA sentinel"));
     }
     let count = |n: usize| if n == 1 { format!("1 of its {cols} columns has") } else { format!("{n} of its {cols} columns have") };
     if present < cols {
@@ -299,10 +304,12 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
         lost.push(format!("{extra} bytes after its last column are ignored"));
     }
     if damaged > 0 {
-        lost.push(format!(
-            "{} a damaged record header (not the 0xAA sentinel, or the wrong longitude or latitude count), read as no data",
-            count(damaged)
-        ));
+        lost.push(format!("{} a damaged record header (not the 0xAA sentinel), read as no data", count(damaged)));
+    }
+    match misnumbered {
+        0 => {}
+        1 => lost.push(format!("1 of its {cols} columns' record counts don't match its place in the file; it is read by place")),
+        n => lost.push(format!("{n} of its {cols} columns' record counts don't match their place in the file; they are read by place")),
     }
     match mismatched {
         0 => {}
@@ -578,11 +585,18 @@ mod tests {
             "{:?}",
             r.lost
         );
-        // A wrong column number is damage too.
-        let mut moved = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |_, _| Some(1));
+        // A wrong column number or latitude count is read by its place, and said.
+        let mut moved = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |i, _| Some(i as i16));
         moved[at(7, rows) + 5] = 9;
+        moved[at(8, rows) + 7] = 1;
         let r = read("x.dt2", &moved).unwrap();
-        assert!(r.lost.iter().any(|l| l.contains("damaged record header")), "{:?}", r.lost);
+        assert_eq!((r.value(0, 7, 4), r.value(0, 8, 4)), (Some(7.0), Some(8.0)), "read by place");
+        assert!(!r.lost.iter().any(|l| l.contains("damaged record header")), "{:?}", r.lost);
+        assert!(
+            r.lost.iter().any(|l| l == "2 of its 11 columns' record counts don't match their place in the file; they are read by place"),
+            "{:?}",
+            r.lost
+        );
         // Cut in the middle of column 8: columns 8–10 are missing.
         let cut = &bytes[..at(8, rows) + 7];
         let r = read("x.dt2", cut).unwrap();
@@ -597,7 +611,37 @@ mod tests {
         let mut none = dted("0000000E", "0000000N", (3600, 3600), (2, rows), |_, _| Some(1));
         none[at(0, rows)] = 0;
         none[at(1, rows)] = 0;
-        assert!(read("x.dt2", &none).unwrap_err().to_string().contains("no data record is whole"));
+        assert!(read("x.dt2", &none).unwrap_err().to_string().contains("none starts with the 0xAA sentinel"));
+    }
+
+    #[test]
+    fn records_numbered_from_1_are_read_by_place() {
+        let rows = 11;
+        let mut b = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |i, j| Some((i * 100 + j) as i16));
+        // Every longitude count one more than its place, the checksums made right.
+        for i in 0..11 {
+            let rec = at(i, rows);
+            b[rec + 4..rec + 6].copy_from_slice(&(i as u16 + 1).to_be_bytes());
+            let sum: u32 = b[rec..rec + 8 + 2 * rows].iter().map(|v| u32::from(*v)).sum();
+            b[rec + 8 + 2 * rows..rec + 12 + 2 * rows].copy_from_slice(&sum.to_be_bytes());
+        }
+        let r = read("x.dt1", &b).unwrap();
+        assert_eq!(r.value(0, 0, 10), Some(0.0), "column 0, point 0");
+        assert_eq!(r.value(0, 10, 0), Some(1010.0), "column 10, point 10");
+        assert_eq!(
+            r.lost.iter().filter(|l| l.contains("record counts")).collect::<Vec<_>>(),
+            ["11 of its 11 columns' record counts don't match their place in the file; they are read by place"]
+        );
+        assert!(!r.lost.iter().any(|l| l.contains("damaged") || l.contains("checksum")), "{:?}", r.lost);
+        // One column out of place is said in the singular.
+        let mut one = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |_, _| Some(1));
+        one[at(3, rows) + 5] = 4;
+        let r = read("x.dt1", &one).unwrap();
+        assert!(
+            r.lost.iter().any(|l| l == "1 of its 11 columns' record counts don't match its place in the file; it is read by place"),
+            "{:?}",
+            r.lost
+        );
     }
 
     #[test]

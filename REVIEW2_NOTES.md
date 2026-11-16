@@ -3,7 +3,7 @@
 - [x] 6. step_within, post_transform, vertical_note and void_note moved to raster/mod.rs; hgt, dted and read_scan_limited call them there. No behavior change.
 - [x] 7. ELEVATION_EXTENSIONS and is_elevation_name in raster/mod.rs; used by elevation_ignores, read_path_placing, read_bytes, the web picker, the desktop picker and the folder browser; a test holds READ_EXTENSIONS to it.
 - [x] 8. read_path_placing calls hgt::check once and passes its result to hgt::read_checked, which holds the bytes to the size checked; hgt::read keeps name-and-bytes callers.
-- [ ] 2. DTED record counts.
+- [x] 2. Only a bad sentinel makes a DTED column damaged; records whose counts disagree with their place are read by place and counted in one notice; refused only when no record has the sentinel. Test: records_numbered_from_1_are_read_by_place.
 - [ ] 3. Steps that don't divide.
 - [ ] 4. HGT size message.
 - [ ] 5. Ignored-option notice.
