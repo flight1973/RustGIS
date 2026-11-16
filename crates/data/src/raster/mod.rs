@@ -1409,21 +1409,23 @@ fn read_path_with_placing(path: &Path, subdataset: Option<&str>, crs: Option<&st
 }
 
 /// What reading an SRTM tile or DTED file (`name`) with a subdataset (`"layer"`) or a coordinate
-/// system (`"crs"`) says: they are WGS 84 with one band, so neither applies, and the file is read
-/// without them. A command may give them, and so may a project saved when these files went
-/// through GDAL. `None` for other files, or when neither is given.
+/// system (`"crs"`) says: they hold one band and give their own coordinates, so neither applies,
+/// and the file is read without them. A command may give them, and so may a project saved when
+/// these files went through GDAL. `None` for other files, or when neither is given.
 pub fn elevation_ignores(name: &str, subdataset: Option<&str>, crs: Option<&str>) -> Option<String> {
     if !is_elevation_name(name) {
         return None;
     }
+    // A DTED file naming a datum other than WGS 84 says so as it is read (`dted::read`).
+    const PLACE: &str = "give their own coordinates, read as WGS 84 longitude/latitude (a DTED file naming another datum says so)";
+    const BAND: &str = "hold one band of heights, with no layers to choose from";
     let given = |v: Option<&str>| v.is_some_and(|v| !v.trim().is_empty());
-    let what = match (given(subdataset), given(crs)) {
-        (true, true) => "the \"layer\" and \"crs\" given are",
-        (true, false) => "the \"layer\" given is",
-        (false, true) => "the \"crs\" given is",
+    Some(match (given(subdataset), given(crs)) {
+        (true, true) => format!("the \"layer\" and \"crs\" given are ignored: SRTM and DTED files {BAND}, and {PLACE}"),
+        (true, false) => format!("the \"layer\" given is ignored: SRTM and DTED files {BAND}"),
+        (false, true) => format!("the \"crs\" given is ignored: SRTM and DTED files {PLACE}"),
         (false, false) => return None,
-    };
-    Some(format!("{what} ignored: SRTM and DTED files are WGS 84 longitude/latitude, with one band"))
+    })
 }
 
 /// Reads the GeoTIFF GDAL converted `path` to, named and sourced as `path` (and its subdataset).

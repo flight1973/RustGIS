@@ -112,20 +112,21 @@ fn a_crs_or_subdataset_given_for_srtm_or_dted_is_said_and_ignored() {
     // As a project saved when these went through GDAL reopens them: read, the options said.
     let r = rustgis_data::raster::read_path_with(&hgt, Some("band2"), Some("EPSG:32610")).unwrap();
     assert_eq!((r.width, r.crs), (1201, rustgis_data::raster::Crs::LonLat));
-    let both = "the \"layer\" and \"crs\" given are ignored: SRTM and DTED files are WGS 84 longitude/latitude, with one band";
+    let both = "the \"layer\" and \"crs\" given are ignored: SRTM and DTED files hold one band of heights, with no layers to choose from, and give their own coordinates, read as WGS 84 longitude/latitude (a DTED file naming another datum says so)";
     assert!(r.lost.iter().any(|l| l == both), "{:?}", r.lost);
     let r = rustgis_data::raster::read_path_with(&dt1, None, Some("EPSG:4326")).unwrap();
-    assert!(r.lost.iter().any(|l| l.starts_with("the \"crs\" given is ignored")), "{:?}", r.lost);
+    let crs = "the \"crs\" given is ignored: SRTM and DTED files give their own coordinates, read as WGS 84 longitude/latitude (a DTED file naming another datum says so)";
+    assert!(r.lost.iter().any(|l| l == crs), "{:?}", r.lost);
     let r = rustgis_data::raster::read_path_with(&dt1, None, None).unwrap();
     assert!(!r.lost.iter().any(|l| l.contains("ignored")), "{:?}", r.lost);
     // From a command, by path and as an upload.
     let mut s = Session::new(Project::default());
     s.run("layer.addData", &json!({"path": hgt, "layer": "x"})).unwrap();
-    let layer = "the \"layer\" given is ignored: SRTM and DTED files are WGS 84 longitude/latitude, with one band";
+    let layer = "the \"layer\" given is ignored: SRTM and DTED files hold one band of heights, with no layers to choose from";
     assert!(s.notices.iter().any(|n| n.text.ends_with(layer)), "{:?}", s.notices);
     let data = base64::engine::general_purpose::STANDARD.encode(dt1_cell());
     let mut s = Session::new(Project::default());
     s.run("layer.addDataBytes", &json!({"fileName": "S45E006.dt1", "data": data, "crs": "EPSG:3857"})).unwrap();
-    assert!(s.notices.iter().any(|n| n.text.contains("the \"crs\" given is ignored")), "{:?}", s.notices);
+    assert!(s.notices.iter().any(|n| n.text.ends_with(crs)), "{:?}", s.notices);
     std::fs::remove_dir_all(dir).unwrap();
 }
