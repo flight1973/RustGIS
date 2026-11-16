@@ -335,7 +335,10 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     let transform = post_transform(west, south, rows, dx, dy, step);
     let mut r = Raster::new(name, w as u32, h as u32, vec![data], transform, Crs::LonLat, Some(f64::from(VOID)), ColorHint::Gray, "Int16")?;
     if step > 1 {
-        r.overview = Some((cols as u32, rows as u32));
+        // Each cell read stands for exactly `step` posts across and down (`file_pixels`, and
+        // the warp's scale, divide this by the size read), though the last may reach past the
+        // file's posts when `step` doesn't divide them.
+        r.overview = Some(((w * step) as u32, (h * step) as u32));
         r.step = step as u32;
     }
     r.lost = lost;
@@ -690,7 +693,7 @@ mod tests {
     fn a_level_2_cell_past_the_budget_is_read_at_every_other_post() {
         let bytes = dted("0000000E", "0000000N", (3600, 3600), (11, 11), |i, j| Some((i * 100 + j) as i16));
         let r = read_limited("x.dt2", &bytes, 100).unwrap();
-        assert_eq!((r.width, r.height, r.overview, r.step), (6, 6, Some((11, 11)), 2));
+        assert_eq!((r.width, r.height, r.overview, r.step), (6, 6, Some((12, 12)), 2));
         // Output (col 1, row 1) is column 2, point 10 - 2 = 8.
         assert_eq!(r.value(0, 1, 1), Some(208.0));
         // Cells are two posts wide, each centered on the post kept: column 2, point 8 is at 0.2°E,
@@ -699,6 +702,27 @@ mod tests {
         assert!((t.pixel_width - 0.2).abs() < 1e-12 && (t.origin_x + 0.1).abs() < 1e-12 && (t.origin_y - 1.1).abs() < 1e-12);
         let kept = t.to_world(1.5, 1.5);
         assert!((kept.x - 0.2).abs() < 1e-9 && (kept.y - 0.8).abs() < 1e-9, "{kept:?}");
+    }
+
+    #[test]
+    fn a_step_that_doesnt_divide_the_posts_keeps_the_scale_exact() {
+        // 9 × 13 posts at step 2, as a level 2 cell at 75°–80° (901 × 3601) is at a step: 5 × 7
+        // cells, each exactly two posts across and down.
+        let (cols, rows) = (9, 13);
+        let bytes = dted("0000000E", "0000000N", (1800, 1800), (cols, rows), |i, j| Some((i * 100 + j) as i16));
+        let r = read_limited("x.dt2", &bytes, 100).unwrap();
+        assert_eq!((r.width, r.height, r.step), (5, 7, 2));
+        let (ow, oh) = r.overview.unwrap();
+        assert_eq!((ow / r.width, oh / r.height, ow % r.width, oh % r.height), (2, 2, 0, 0));
+        // The kept posts are columns 0, 2, …, 8 and points 12, 10, …, 0, 0.05° apart: the extent
+        // reaches one post (half a cell) past the outer ones on every side.
+        let e = r.extent();
+        for (got, want) in [(e.min_x, -0.05), (e.max_x, 0.45), (e.min_y, -0.05), (e.max_y, 0.65)] {
+            assert!((got - want).abs() < 1e-9, "{e:?}");
+        }
+        assert!(((e.min_x + e.max_x) / 2.0 - 0.2).abs() < 1e-9 && ((e.min_y + e.max_y) / 2.0 - 0.3).abs() < 1e-9, "{e:?}");
+        assert_eq!(r.value(0, 4, 0), Some(812.0), "column 8, point 12");
+        assert_eq!(r.value(0, 4, 6), Some(800.0), "column 8, point 0");
     }
 
     #[test]
