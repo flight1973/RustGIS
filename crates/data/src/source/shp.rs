@@ -134,20 +134,20 @@ impl ShpSource {
         // 0, 0, 0, 0 a header often holds then (Null Island). The header's box, exact, stands for
         // them when it frames them all; one that doesn't (a corner that isn't a number, #1985, or
         // stale after records were added) is set aside, and said.
-        let records = index.bounds.map(|[x0, y0, x1, y1]| Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1)));
-        let native = records.map(|r| {
-            // Within the f32 rounding of the records' boxes.
-            let slack = |v: f64| 1e-6 * v.abs().max(1.0);
+        let native = index.bounds.map(|[x0, y0, x1, y1]| {
+            // The header, a box itself, rounded outward as the records' boxes are, holds them all:
+            // exact, no allowance needed.
             let frames = [native.min_x, native.min_y, native.max_x, native.max_y].iter().all(|v| v.is_finite())
-                && native.min_x <= r.min_x + slack(r.min_x)
-                && native.min_y <= r.min_y + slack(r.min_y)
-                && native.max_x >= r.max_x - slack(r.max_x)
-                && native.max_y >= r.max_y - slack(r.max_y);
+                && !native.is_empty()
+                && f32_down(native.min_x) <= x0
+                && f32_down(native.min_y) <= y0
+                && f32_up(native.max_x) >= x1
+                && f32_up(native.max_y) >= y1;
             if frames {
                 native
             } else {
                 notes.push("the .shp header's bounding box doesn't frame its shapes: the layer's extent is taken from the shapes".into());
-                r
+                Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1))
             }
         });
         let extent = native.map_or(Extent::EMPTY, |n| reproject.extent_to_lonlat(&n));
@@ -422,24 +422,37 @@ fn record_box(c: &[u8]) -> [f32; 4] {
             (Some(x), Some(y)) => [x, y, x, y],
             _ => return NONE,
         },
-        Some(3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28 | 31) => match (le_f64(c, 4), le_f64(c, 12), le_f64(c, 20), le_f64(c, 28)) {
-            (Some(a), Some(b), Some(x), Some(y)) => [a, b, x, y],
-            _ => return NONE,
-        },
+        Some(t @ (3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28 | 31)) => {
+            // A shape of no points (an empty geometry some writers give a 0, 0, 0, 0 box) has
+            // nothing to frame. Its count follows the box: at 36 for a multipoint, else at 40
+            // after the parts' count.
+            let points = if matches!(t, 8 | 18 | 28) { le_i32(c, 36) } else { le_i32(c, 40) };
+            if points == Some(0) {
+                return NONE;
+            }
+            match (le_f64(c, 4), le_f64(c, 12), le_f64(c, 20), le_f64(c, 28)) {
+                (Some(a), Some(b), Some(x), Some(y)) => [a, b, x, y],
+                _ => return NONE,
+            }
+        }
         _ => return NONE,
     };
     if b.iter().any(|v| !v.is_finite()) {
         return NONE;
     }
-    let down = |v: f64| {
-        let f = v as f32;
-        if f64::from(f) > v { f.next_down() } else { f }
-    };
-    let up = |v: f64| {
-        let f = v as f32;
-        if f64::from(f) < v { f.next_up() } else { f }
-    };
-    [down(b[0]), down(b[1]), up(b[2]), up(b[3])]
+    [f32_down(b[0]), f32_down(b[1]), f32_up(b[2]), f32_up(b[3])]
+}
+
+/// The nearest f32 at or below `v`, as the index rounds a box's low corner.
+fn f32_down(v: f64) -> f32 {
+    let f = v as f32;
+    if f64::from(f) > v { f.next_down() } else { f }
+}
+
+/// The nearest f32 at or above `v`, as the index rounds a box's high corner.
+fn f32_up(v: f64) -> f32 {
+    let f = v as f32;
+    if f64::from(f) < v { f.next_up() } else { f }
 }
 
 /// Most parts and points one shape may have (a record's own length bounds them first).
