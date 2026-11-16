@@ -471,7 +471,12 @@ pub fn ring_area_is_ambiguous(ring: &[Coord]) -> bool {
 /// steps cancel. A loop such as a parallel written all the way round (`[0, 80]`, `[30, 80]`, …,
 /// `[330, 80]`) gives ±1, and the analysis plane, which reads longitude and latitude as x and y,
 /// sees it as a line with no area. 0 for a ring with fewer than three vertices or a coordinate
-/// that isn't a longitude and latitude.
+/// that isn't finite or lies past ±90° of latitude.
+///
+/// Only the coordinates are read, as longitude and latitude, as the analysis reads every layer:
+/// a ring of other x and y read so (a projected layer taken for degrees) more than 180 wide can
+/// wind too. The triangle `[0, 0]`, `[300, 0]`, `[150, 80]` steps -60°, -150° and -150° the short
+/// way, so it gives -1 though as x and y it's a plain triangle.
 pub fn ring_pole_turns(ring: &[Coord]) -> i64 {
     if ring.len() < 3 || !ring.iter().all(|c| c.is_finite() && c.y.abs() <= 90.0) || ring.iter().any(|c| at_pole(c.y)) {
         return 0;
@@ -1850,5 +1855,12 @@ mod tests {
         }
         assert_eq!(ring_pole_turns(&missing), 0, "a coordinate missing");
         assert_eq!(ring_pole_turns(&[Coord::new(0.0, 80.0), Coord::new(180.0, 80.0)]), 0, "too short");
+        // Coordinates are read as longitude and latitude, whatever they were meant as: a plain
+        // triangle of x and y more than 180 wide winds once when its steps are taken the short way.
+        let wide = [(0.0, 0.0), (300.0, 0.0), (150.0, 80.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&wide.map(|(x, y)| Coord::new(x, y))), -1);
+        // The same triangle within 180 doesn't.
+        let narrow = [(0.0, 0.0), (150.0, 0.0), (75.0, 80.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&narrow.map(|(x, y)| Coord::new(x, y))), 0);
     }
 }
