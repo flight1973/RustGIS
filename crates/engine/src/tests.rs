@@ -47428,7 +47428,8 @@ fn cancel_exports(out: &dyn Fn(&str) -> String, dem: &str) -> Vec<(&'static str,
 }
 
 /// The tools whose work grows past a second or two on real data: buffers, overlays, joins, hulls,
-/// densities and interpolation. A new long tool is added here (AGENTS.md › Never hold the window).
+/// densities, interpolation and the geometry checks and repairs. A new long tool is added here
+/// (AGENTS.md › Never hold the window).
 #[cfg(not(target_arch = "wasm32"))]
 fn cancel_tools(dem: &str) -> Vec<(&'static str, Value)> {
     vec![
@@ -47450,6 +47451,8 @@ fn cancel_tools(dem: &str) -> Vec<(&'static str, Value)> {
         ("kernelDensity", json!({"input": "Cities", "crs": "EPSG:3857"})),
         ("kriging", json!({"input": "Cities", "field": "pop_max"})),
         ("tabulateArea", json!({"raster": dem, "zones": "Countries"})),
+        ("checkGeometry", json!({"input": "Countries"})),
+        ("repairGeometry", json!({"input": "Countries"})),
     ]
 }
 
