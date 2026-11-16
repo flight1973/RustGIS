@@ -18,6 +18,29 @@
       ],
       "type": "object"
     },
+    "CoordZ": {
+      "description": "A 3-D coordinate: x and y as in [`Coord`] and a height `z`. A layer read with heights holds its\ngeometry in these, so whatever moves or copies a point moves its height with it, and a new\npoint can't be made without deciding its height.",
+      "properties": {
+        "x": {
+          "format": "double",
+          "type": "number"
+        },
+        "y": {
+          "format": "double",
+          "type": "number"
+        },
+        "z": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "z"
+      ],
+      "type": "object"
+    },
     "Crs": {
       "description": "A raster's coordinate system. Saved as its EPSG code, or a custom one as its definition.",
       "oneOf": [
@@ -108,7 +131,7 @@
       "type": "object"
     },
     "Feature": {
-      "description": "One row: an optional geometry and one value per field.",
+      "description": "One row: an optional geometry and one value per field.\n\nA feature of a 3-D layer (one read with heights) also holds its own geometry with a height at\nevery position ([`Feature::geometry_z`]). That one is canonical; `geometry` is its x and y,\nwhich the map, selection and every 2-D tool read. The two are kept together by the setters\nhere; code that writes `geometry` alone leaves the heights behind, and from then on\n[`Feature::geometry_z`] gives none (the heights are lost, never paired with other points).",
       "properties": {
         "attrs": {
           "items": {
@@ -119,12 +142,23 @@
         "geometry": {
           "anyOf": [
             {
-              "$ref": "#/$defs/Geometry"
+              "$ref": "#/$defs/GeometryCoord"
             },
             {
               "type": "null"
             }
           ]
+        },
+        "geometry_z": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GeometryCoordZ"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The geometry with heights, for a 3-D layer. Private: set only with `geometry` from it."
         },
         "id": {
           "format": "uint64",
@@ -201,8 +235,8 @@
         }
       ]
     },
-    "Geometry": {
-      "description": "A geometry. Lines hold parts; polygons hold polygons of rings (first ring = exterior).",
+    "GeometryCoord": {
+      "description": "A geometry of positions `C`. Lines hold parts; polygons hold polygons of rings (first ring =\nexterior). [`Geometry`] holds x and y ([`Coord`]); [`GeometryZ`] holds x, y and a height\n([`CoordZ`]) for a layer read with heights, in the same shape, so reversing, rewinding, closing\nor copying its positions moves each height with its point.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -257,6 +291,77 @@
                 "items": {
                   "items": {
                     "$ref": "#/$defs/Coord"
+                  },
+                  "type": "array"
+                },
+                "type": "array"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "Polygon"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "GeometryCoordZ": {
+      "description": "A geometry of positions `C`. Lines hold parts; polygons hold polygons of rings (first ring =\nexterior). [`Geometry`] holds x and y ([`Coord`]); [`GeometryZ`] holds x, y and a height\n([`CoordZ`]) for a layer read with heights, in the same shape, so reversing, rewinding, closing\nor copying its positions moves each height with its point.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Point": {
+              "$ref": "#/$defs/CoordZ"
+            }
+          },
+          "required": [
+            "Point"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "MultiPoint": {
+              "items": {
+                "$ref": "#/$defs/CoordZ"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "MultiPoint"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Line": {
+              "items": {
+                "items": {
+                  "$ref": "#/$defs/CoordZ"
+                },
+                "type": "array"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "Line"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Polygon": {
+              "items": {
+                "items": {
+                  "items": {
+                    "$ref": "#/$defs/CoordZ"
                   },
                   "type": "array"
                 },
@@ -1058,7 +1163,8 @@
           "shaded-relief-effects",
           "normalized-legend-urls",
           "field-origin",
-          "slope-percent"
+          "slope-percent",
+          "feature-heights"
         ],
         "type": "string"
       },
@@ -1128,7 +1234,8 @@
     "shaded-relief-effects",
     "normalized-legend-urls",
     "field-origin",
-    "slope-percent"
+    "slope-percent",
+    "feature-heights"
   ],
   "x-rustgis-reads-format": 2,
   "x-rustgis-writes-format": 2
