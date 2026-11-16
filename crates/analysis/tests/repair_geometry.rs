@@ -979,11 +979,6 @@ fn what_is_inside_where_rules_differ() {
             multi(&[&[SQUARE], &[&[(10., 0.), (10., 10.), (0., 10.), (0., 0.), (10., 0.)]]]),
             fixed(poly(&[SQUARE]), "parts_overlap"),
         ),
-        (
-            "the same part twice, reversed",
-            multi(&[&[SQUARE], &[&[(0., 0.), (0., 10.), (10., 10.), (10., 0.), (0., 0.)]]]),
-            fixed(poly(&[SQUARE]), "parts_overlap"),
-        ),
         ("a ring traced twice", poly(&[twice]), fixed(poly(&[SQUARE]), "self_intersection")),
         ("a ring traced twice beside a part", multi(&[&[twice], &[small]]), fixed(multi(&[&[SQUARE], &[small]]), "self_intersection")),
         (
@@ -998,15 +993,16 @@ fn what_is_inside_where_rules_differ() {
         ),
     ];
     for (name, g, (want, code)) in cases {
-        // The rebuilt rings wind as OGC says whichever way the input's do.
-        for (winding, g) in [("as written", g.clone()), ("reversed", reversed(&g))] {
+        // The rebuilt rings wind as OGC says whichever way the input's do, and when one ring is
+        // wound against the rest.
+        for (winding, g) in windings(&g) {
             let (got, repairs) = one(GeometryType::Polygon, Some(g));
             assert_eq!(repairs, code, "{name}, {winding}");
             assert_eq!(got.as_ref().map(norm), want.as_ref().map(norm), "{name}, {winding}");
         }
     }
-    // Valid as they are, so copied exactly: OGC sets no winding, and an island in another part's
-    // hole touches nothing.
+    // Valid as they are, so copied exactly in every winding: OGC sets no winding, and an island in
+    // another part's hole touches nothing.
     for (name, g) in [
         ("hole wound as its shell", poly(&[SQUARE, &[(2., 2.), (4., 2.), (4., 4.), (2., 4.), (2., 2.)]])),
         (
@@ -1017,8 +1013,25 @@ fn what_is_inside_where_rules_differ() {
             ]),
         ),
     ] {
-        assert_eq!(one(GeometryType::Polygon, Some(g.clone())), (Some(g), String::new()), "{name}");
+        for (winding, g) in windings(&g) {
+            assert_eq!(one(GeometryType::Polygon, Some(g.clone())), (Some(g), String::new()), "{name}, {winding}");
+        }
     }
+}
+
+/// `g` as written, with every ring reversed, and with each ring on its own reversed.
+fn windings(g: &Geometry) -> Vec<(String, Geometry)> {
+    let mut all = vec![("as written".to_string(), g.clone()), ("reversed".to_string(), reversed(g))];
+    if let Geometry::Polygon(parts) = g {
+        for (p, rings) in parts.iter().enumerate() {
+            for r in 0..rings.len() {
+                let mut mixed = parts.clone();
+                mixed[p][r].reverse();
+                all.push((format!("ring {r} of part {p} reversed"), Geometry::Polygon(mixed)));
+            }
+        }
+    }
+    all
 }
 
 /// The two examples of overlapping parts in the PostGIS manual's ST_MakeValid page
