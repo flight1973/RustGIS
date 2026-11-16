@@ -12,7 +12,7 @@
 //!   driver documentation adds 0.5 arc-second tiles (since GDAL 3.10), 7201 × 7201, read here too,
 //!   on the same grid rule. Its size alone says which, and nothing else is read: another size is
 //!   refused rather than guessed. A 7201 × 7201 tile holds more samples than the browser does, so
-//!   there it is read at a step ([`step_within`]).
+//!   there it is read at a step ([`super::step_within`]).
 //! - Rows run north to south, and samples within a row west to east.
 //! - −32768 is a void (no data).
 //! - Horizontal datum WGS 84; heights are above the EGM96 geoid (mean sea level), not the
@@ -23,9 +23,9 @@
 //!
 //! As a raster, each sample is a cell centered on its point: the raster's cells reach half a cell
 //! beyond the whole-degree lines on every side, so a tile's extent is one degree plus one cell
-//! wide ([`post_transform`]).
+//! wide ([`super::post_transform`]).
 
-use super::{ColorHint, Crs, GeoTransform, Raster, max_samples};
+use super::{ColorHint, Crs, Raster, max_samples, post_transform, step_within, vertical_note, void_note};
 use crate::{DataError, Result};
 
 /// The no-data value of a tile: a void.
@@ -69,49 +69,6 @@ pub fn tile_corner(file_name: &str) -> Option<(i32, i32)> {
     };
     // The tile spans a degree north and east of its corner.
     ((-90..=89).contains(&lat) && (-180..=179).contains(&lon)).then_some((lat, lon))
-}
-
-/// The transform of a grid of posts (samples on grid lines) whose south-west post is at
-/// (`west`, `south`), `cols` × `rows` of them `dx` and `dy` degrees apart, read every `step`-th
-/// post from the north-west one: each post kept becomes a cell centered on it, `step` posts wide,
-/// so the grid's edges lie half a cell beyond the outer posts kept. (At `step` 1, half a post's
-/// spacing beyond the outer posts.)
-pub(super) fn post_transform(west: f64, south: f64, rows: usize, dx: f64, dy: f64, step: usize) -> GeoTransform {
-    let north = south + (rows.saturating_sub(1)) as f64 * dy;
-    let k = step.max(1) as f64;
-    let (cell_x, cell_y) = (dx * k, dy * k);
-    GeoTransform { origin_x: west - cell_x / 2.0, origin_y: north + cell_y / 2.0, pixel_width: cell_x, pixel_height: -cell_y }
-}
-
-/// The step at which a `w` × `h` grid fits in `max` samples: 1, or the smallest power of two
-/// whose every-`step`-th sample does ([`super::read_scan`] reduces pictures with it too). `None`
-/// when none does, up to a step of 2^20.
-pub(super) fn step_within(w: usize, h: usize, max: usize) -> Option<usize> {
-    let mut k = 1usize;
-    while w.div_ceil(k).saturating_mul(h.div_ceil(k)) > max {
-        k = k.checked_mul(2)?;
-        if k > 1 << 20 {
-            return None;
-        }
-    }
-    Some(k)
-}
-
-/// What a tile says of its heights' vertical reference, once a layer (a raster's `lost`): the
-/// layer's coordinate system is horizontal only, so this is where it is said.
-pub(super) fn vertical_note(surface: &str) -> String {
-    format!(
-        "heights are meters above {surface}, not the WGS 84 ellipsoid; the layer's coordinate system doesn't carry a vertical datum, so compare it with ellipsoidal heights (GPS, many lidar files) only after a geoid correction"
-    )
-}
-
-/// What reading a grid's no-data posts says: `None` when there are none.
-pub(super) fn void_note(voids: u64, total: u64, value: i16) -> Option<String> {
-    match voids {
-        0 => None,
-        1 => Some(format!("1 of its {total} heights is a void ({value}), read as no data")),
-        n => Some(format!("{n} of its {total} heights are voids ({value}), read as no data")),
-    }
 }
 
 /// Reads an SRTM tile: `bytes` are the file, `file_name` its name (which places it).

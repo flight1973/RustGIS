@@ -36,7 +36,7 @@
 //!
 //! Posts lie on the grid lines (true longitude = count × interval + origin, 3.12 f), so as a
 //! raster each post is a cell centered on it, and the cells reach half a cell beyond the cell's
-//! whole-degree lines ([`super::hgt::post_transform`]), as an SRTM tile's do.
+//! whole-degree lines ([`super::post_transform`]), as an SRTM tile's do.
 //!
 //! A column whose record header is damaged (not the sentinel, or the wrong counts) is read as no
 //! data, and the columns are counted in a notice: its place in the cell can't be trusted. A column
@@ -50,8 +50,7 @@
 //! terrain has, so a height decoding below −16000 (other than the void, every bit set) is decoded
 //! as two's complement instead, and counted in a notice ([`decode_height`]).
 
-use super::hgt::{post_transform, step_within, vertical_note, void_note};
-use super::{ColorHint, Crs, Raster, max_samples};
+use super::{ColorHint, Crs, Raster, max_samples, post_transform, step_within, vertical_note, void_note};
 use crate::{DataError, Result};
 
 /// The headers' length: the UHL, DSI and ACC (3.10.7.4).
