@@ -51383,21 +51383,25 @@ fn convert_position_gives_every_form() {
         assert_eq!(v["mgrs"], "18T WL 83959 07350", "{p}");
         assert_eq!(v["mgrsCompact"], "18TWL8395907350", "{p}");
         assert_eq!(v["decimal"], "74.0060° W  40.7128° N", "{p}");
+        assert!(v["ups"].is_null() && v["note"].is_null(), "{p}: {v}");
     }
+    // Degrees from degrees, minutes and seconds come back without float noise.
+    let v = convert(&mut s, json!({"lon": "74°0′21.6″W", "lat": "40°42′46.08″N"}));
+    assert_eq!((v["lon"].as_f64(), v["lat"].as_f64()), (Some(-74.006), Some(40.7128)), "{v}");
     let v = convert(&mut s, json!({"lon": -74.006, "lat": 40.7128}));
     assert!((v["easting"].as_f64().unwrap() - 583_959.0).abs() < 1.0 && (v["northing"].as_f64().unwrap() - 4_507_351.0).abs() < 1.0, "{v}");
     assert_eq!(v["dms"], rustgis_geom::format_dms(rustgis_geom::Coord::new(-74.006, 40.7128)));
     // Fewer MGRS digits truncate, as MGRS does: 1 km here.
     let v = convert(&mut s, json!({"lon": -74.006, "lat": 40.7128, "digits": 2}));
     assert_eq!((v["mgrs"].as_str(), v["mgrsCompact"].as_str()), (Some("18T WL 83 07"), Some("18TWL8307")));
-    // North of 84° N it is UPS, with no zone or band; polar MGRS has no zone number. Svalbard
-    // takes its own zone, 33, at 10° E.
+    // North of 84° N it is UPS, in `ups` not `utm`, with no zone or UTM band; polar MGRS has no
+    // zone number. Svalbard takes its own zone, 33, at 10° E.
     let v = convert(&mut s, json!({"lon": 30, "lat": 85}));
     assert_eq!(
-        (v["grid"].as_str(), v["utm"].as_str(), v["hemisphere"].as_str()),
+        (v["grid"].as_str(), v["ups"].as_str(), v["hemisphere"].as_str()),
         (Some("ups"), Some("north 2277729 1518960"), Some("north"))
     );
-    assert!(v["zone"].is_null() && v["band"].is_null(), "{v}");
+    assert!(v["utm"].is_null() && v["zone"].is_null() && v["band"].is_null(), "{v}");
     assert_eq!(v["mgrs"], "Z CC 77728 18959");
     let v = convert(&mut s, json!({"position": "north 2277729 1518960"}));
     assert!((v["lat"].as_f64().unwrap() - 85.0).abs() < 1e-5 && (v["lon"].as_f64().unwrap() - 30.0).abs() < 1e-4, "{v}");

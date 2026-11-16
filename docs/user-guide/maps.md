@@ -269,11 +269,12 @@ reads as decimal degrees with a notice, and stays saved until you pick a format.
 scripts, Python and the AI Assistant. It takes the place as `map.goToXY` does: `lon` and `lat`
 (numbers, or degrees, minutes and seconds), or a `position` written in any form the search box
 reads, and says what it assumed the same way. It answers with `lon` and `lat`, `decimal` and
-`dms` as the readout writes them, `grid` (`utm`, or `ups` in the polar areas), `utm` with its
-`zone`, `band`, `hemisphere`, `easting` and `northing` in meters (UPS has no zone or band), and
-`mgrs` spaced as the readout writes it and `mgrsCompact` in one word. `digits` (0 to 5, 5 by
-default) sets the MGRS precision, from 100 km to 1 m. On another body's map the grids are
-`null`, and `note` says why.
+`dms` as the readout writes them, `grid` (`utm`, or `ups` in the polar areas), the reference in
+`utm` or `ups` (whichever `grid` names; the other is `null`), the UTM `zone` and latitude `band`
+(`null` in UPS), `hemisphere`, `easting` and `northing` in meters, and `mgrs` spaced as the
+readout writes it and `mgrsCompact` in one word. `digits` (0 to 5, 5 by default) sets the MGRS
+precision, from 100 km to 1 m. Every key is always there, `null` where it has no value; on
+another body's map the grids are `null`, and `note` says why.
 
 ```
 rustgis-cli run --cmd 'map.convertPosition={"position":"18TWL8395907350"}'

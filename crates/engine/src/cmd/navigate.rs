@@ -583,24 +583,30 @@ fn typed_place(map: &Map, p: &Value, moving: bool) -> Result<(Coord, Option<crat
 }
 
 /// A place in every form RustGIS writes one (#1042): longitude and latitude, in decimal degrees
-/// and in degrees, minutes and seconds as the status bar shows them, UTM (UPS north of 84° N and
-/// south of 80° S) with its parts, and MGRS spaced as the readout writes it and in one word, to
-/// `digits` digits (5 by default: 1 m). The place is read as `map.goToXY` reads it, and what the
-/// reading assumed is said the same way. The map doesn't move. On another body's map the Earth's
-/// grids are `null`, and `note` says why.
+/// and in degrees, minutes and seconds as the status bar shows them; UTM, or UPS north of 84° N
+/// and south of 80° S, with the easting and northing (`grid` says which: `utm` and `ups` each hold
+/// only their own); and MGRS spaced as the readout writes it and in one word, to `digits` digits
+/// (5 by default: 1 m). The place is read as `map.goToXY` reads it, and what the reading assumed
+/// is said the same way. The map doesn't move. Every key is always there, `null` where it has no
+/// value; on another body's map the Earth's grids are `null` and `note` says why.
 fn convert_position(s: &mut Session, p: &Value) -> CmdResult {
     let digits = match p.get("digits") {
         None | Some(Value::Null) => 5,
         Some(v) => v.as_u64().filter(|d| *d <= 5).ok_or("digits must be a whole number from 0 (100 km) to 5 (1 m)")? as u8,
     };
     let (c, notice) = typed_place(s.map(), p, false)?;
+    // Degrees to 1e-9 (under a millimeter), so text in degrees, minutes and seconds doesn't come
+    // back as -74.00600000000001; grid meters to the millimeter, which the projections are good to.
+    let nano = |v: f64| (v * 1e9).round() / 1e9;
+    let mm = |v: f64| (v * 1000.0).round() / 1000.0;
     let mut out = json!({
-        "lon": c.x,
-        "lat": c.y,
+        "lon": nano(c.x),
+        "lat": nano(c.y),
         "decimal": rustgis_geom::format_lonlat(c),
         "dms": rustgis_geom::format_dms(c),
         "grid": null,
         "utm": null,
+        "ups": null,
         "zone": null,
         "band": null,
         "hemisphere": null,
@@ -608,31 +614,34 @@ fn convert_position(s: &mut Session, p: &Value) -> CmdResult {
         "northing": null,
         "mgrs": null,
         "mgrsCompact": null,
+        "note": null,
     });
-    // To the millimeter: the projections are good to a fraction of that.
-    let mm = |v: f64| (v * 1000.0).round() / 1000.0;
     if !s.map().body().is_earth() {
         out["note"] = json!("UTM and MGRS are the Earth's grids and name no place on this map");
-    } else if let Some(u) = rustgis_geom::to_utm(c) {
-        out["grid"] = json!("utm");
-        out["utm"] = json!(u.to_string());
-        out["zone"] = json!(u.zone);
-        out["band"] = json!(u.band.to_string());
-        out["hemisphere"] = json!(u.hemisphere());
-        out["easting"] = json!(mm(u.easting));
-        out["northing"] = json!(mm(u.northing));
-    } else if let Some(u) = rustgis_geom::to_ups(c) {
-        out["grid"] = json!("ups");
-        out["utm"] = json!(u.to_string());
-        out["hemisphere"] = json!(u.hemisphere());
-        out["easting"] = json!(mm(u.easting));
-        out["northing"] = json!(mm(u.northing));
-    }
-    if s.map().body().is_earth()
-        && let Some(m) = rustgis_geom::to_mgrs(c, digits)
-    {
-        out["mgrs"] = json!(m.to_string());
-        out["mgrsCompact"] = json!(m.compact());
+    } else {
+        if let Some(u) = rustgis_geom::to_utm(c) {
+            out["grid"] = json!("utm");
+            out["utm"] = json!(u.to_string());
+            out["zone"] = json!(u.zone);
+            out["band"] = json!(u.band.to_string());
+            out["hemisphere"] = json!(u.hemisphere());
+            out["easting"] = json!(mm(u.easting));
+            out["northing"] = json!(mm(u.northing));
+        } else if let Some(u) = rustgis_geom::to_ups(c) {
+            out["grid"] = json!("ups");
+            out["ups"] = json!(u.to_string());
+            out["hemisphere"] = json!(u.hemisphere());
+            out["easting"] = json!(mm(u.easting));
+            out["northing"] = json!(mm(u.northing));
+        }
+        match rustgis_geom::to_mgrs(c, digits) {
+            Some(m) => {
+                out["mgrs"] = json!(m.to_string());
+                out["mgrsCompact"] = json!(m.compact());
+            }
+            // Not reached by any place on the Earth today, but said rather than left a bare null.
+            None => out["note"] = json!("no MGRS reference names this place"),
+        }
     }
     if let Some(said) = notice {
         s.notify_text(said, false);
