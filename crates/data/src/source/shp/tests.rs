@@ -151,8 +151,33 @@ fn an_empty_shape_has_no_box() {
     assert!(none(record_box(&record(5, &[0, 0]))), "an empty polygon");
     assert!(none(record_box(&record(3, &[0, 0]))), "an empty line");
     assert!(none(record_box(&record(8, &[0]))), "an empty multipoint");
+    assert!(none(record_box(&record(5, &[0, 4]))), "a polygon of no parts");
+    assert!(none(record_box(&record(5, &[1, -1]))), "a count that can't be");
     assert_eq!(record_box(&record(5, &[1, 4])), [0.0; 4], "a polygon with points keeps its box");
     assert_eq!(record_box(&record(8, &[2])), [0.0; 4], "a multipoint with points keeps its box");
+    // A whole file: a multipoint emptied (its box, at 112, made 0, 0, 0, 0 and its count of
+    // points, at 144, 0) under a header that's right. The header stands, with nothing said, as
+    // the index and a scan of the records both read it.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+    for (x, y) in [(10.0, 20.0), (12.0, 22.0)] {
+        ds.push(Some(Geometry::MultiPoint(vec![Coord::new(x, y), Coord::new(x + 0.5, y + 0.5)])), vec![]);
+    }
+    let path = tmp.path().join("multi.shp");
+    write_shapefile(&ds, &path);
+    let mut b = std::fs::read(&path).unwrap();
+    assert_eq!(i32::from_le_bytes(b[108..112].try_into().unwrap()), 8, "a multipoint file");
+    b[112..144].fill(0);
+    b[144..148].copy_from_slice(&0i32.to_le_bytes());
+    std::fs::write(&path, &b).unwrap();
+    let (count, _, bounds) = index::scanned(&path, b.len() as u64).unwrap();
+    assert_eq!((count, bounds), (2, Some([12.0, 22.0, 12.5, 22.5])));
+    cache::with_index_dir(tmp.path().join("cache"), || {
+        let s = ShpSource::open_path(&path, "pts").unwrap();
+        assert!(s.info().indexed);
+        assert_eq!(s.info().extent, Extent::new(10.0, 20.0, 12.5, 22.5), "the header, as written");
+        assert!(!s.info().notes.iter().any(|n| n.contains("doesn't frame")), "{:?}", s.info().notes);
+    });
 }
 fn points_shapefile(path: &Path) {
     let mut ds = Dataset::new("grid", GeometryType::Point, vec![]);
