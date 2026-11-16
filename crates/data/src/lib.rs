@@ -899,6 +899,20 @@ mod heights_tests {
         assert!(!f.has_z());
     }
 
+    /// The limit of the check: a 2-D reorder whose x and y come out the same, as reversing a
+    /// vertical line does (a borehole: one place, many depths), can't be seen, so its heights
+    /// stay in the old order. Only code that edits the 3-D geometry (as `edit.flip` does) gets
+    /// such a feature right.
+    #[test]
+    fn a_2d_reorder_that_leaves_the_same_xy_is_not_seen() {
+        let hole = Geom::Line(vec![vec![CoordZ::new(5.0, 5.0, 0.0), CoordZ::new(5.0, 5.0, -100.0)]]);
+        let mut f = Feature::new_z(1, hole.clone(), vec![]);
+        if let Some(Geom::Line(parts)) = &mut f.geometry {
+            parts[0].reverse();
+        }
+        assert_eq!(f.geometry_z(), Some(&hole));
+    }
+
     #[test]
     fn a_height_on_an_edge_is_linear_along_it() {
         let z = Geom::Polygon(vec![vec![vec![

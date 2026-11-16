@@ -6184,7 +6184,7 @@ mod batch_tests {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [10.0, 20.0, 30.0]
+                    "coordinates": [10.0, 20.0, 30.0, 4.0]
                 },
                 "properties": {"name": "Test"}
             }]
@@ -6258,7 +6258,7 @@ mod batch_tests {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [10.0, 20.0, 30.0]
+                    "coordinates": [10.0, 20.0, 30.0, 4.0]
                 },
                 "properties": {"name": "Inside"}
             }]
@@ -6274,7 +6274,7 @@ mod batch_tests {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [100.0, 100.0, 30.0]
+                    "coordinates": [100.0, 100.0, 30.0, 4.0]
                 },
                 "properties": {"name": "Outside"}
             }]
