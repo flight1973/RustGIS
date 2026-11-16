@@ -13,6 +13,8 @@ struct DiskIndex {
     pub count: u64,
     covered: u32,
     bounds: Option<[f32; 4]>,
+    /// Records with a shape whose box isn't one ([`not_a_box`]), left out of `bounds`.
+    unboxed: u32,
     _lease: super::cache::Lease,
 }
 
@@ -42,12 +44,19 @@ impl DiskIndex {
         });
         if let Ok(Some(lease)) = pinned
             && let Ok(db) = connect(lease.path(), false)
-            && let Ok((saved, count, note, covered, bounds)) =
-                db.query_row("SELECT signature, count, note, covered, bounds FROM metadata", [], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, String>(2)?, r.get::<_, u32>(3)?, r.get::<_, String>(4)?))
+            && let Ok((saved, count, note, covered, bounds, unboxed)) =
+                db.query_row("SELECT signature, count, note, covered, bounds, unboxed FROM metadata", [], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, u32>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, u32>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, u32>(5)?,
+                    ))
                 })
             && saved == signature
-            && covered <= count
+            && covered.checked_add(unboxed).is_some_and(|n| n <= count)
             && let Ok(bounds) = serde_json::from_str::<Option<[f32; 4]>>(&bounds)
             // Held to the rule it was built by: a damaged or planted entry is built again rather
             // than giving the layer a box that isn't one (#1985).
@@ -60,7 +69,7 @@ impl DiskIndex {
                 notes.push(note);
             }
             // A reused index adds nothing to the cache, so there is nothing to sweep (#1230).
-            return Ok(Self { db: Mutex::new(db), count: u64::from(count), covered, bounds, _lease: lease });
+            return Ok(Self { db: Mutex::new(db), count: u64::from(count), covered, bounds, unboxed, _lease: lease });
         }
         // Building one sweeps each cache folder it tries once: when the index is committed or, if
         // it fails, when it is released or its reservation fails. Abandoned builds and indexes past
@@ -76,11 +85,11 @@ impl DiskIndex {
             "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
             CREATE TABLE records(id INTEGER PRIMARY KEY, offset INTEGER NOT NULL, len INTEGER NOT NULL);
             CREATE VIRTUAL TABLE bounds USING rtree(id, x0, x1, y0, y1);
-            CREATE TABLE metadata(signature TEXT, count INTEGER, note TEXT, covered INTEGER, bounds TEXT);",
+            CREATE TABLE metadata(signature TEXT, count INTEGER, note TEXT, covered INTEGER, bounds TEXT, unboxed INTEGER);",
         )
         .map_err(sql)?;
         let tx = db.transaction().map_err(sql)?;
-        let mut covered = 0u32;
+        let (mut covered, mut unboxed) = (0u32, 0u32);
         let mut all_bounds: Option<[f32; 4]> = None;
         let (count, note) = {
             let mut record = tx.prepare("INSERT INTO records VALUES(?1,?2,?3)").map_err(sql)?;
@@ -91,6 +100,8 @@ impl DiskIndex {
                     let [x0, y0, x1, y1] = b;
                     bounds.execute(params![id, x0, x1, y0, y1]).map_err(sql)?;
                     covered += 1;
+                } else if not_a_box(b) {
+                    unboxed += 1;
                 }
                 Ok(())
             })?
@@ -100,7 +111,8 @@ impl DiskIndex {
             return Err(bad("the .shp changed while its spatial index was being built"));
         }
         let bounds_json = serde_json::to_string(&all_bounds).map_err(|e| bad(e.to_string()))?;
-        tx.execute("INSERT INTO metadata VALUES(?1,?2,?3,?4,?5)", params![signature, count, note, covered, bounds_json]).map_err(sql)?;
+        tx.execute("INSERT INTO metadata VALUES(?1,?2,?3,?4,?5,?6)", params![signature, count, note, covered, bounds_json, unboxed])
+            .map_err(sql)?;
         tx.commit().map_err(sql)?;
         drop(db);
         lease.commit()?;
@@ -108,7 +120,7 @@ impl DiskIndex {
         if !note.is_empty() {
             notes.push(note);
         }
-        Ok(Self { db: Mutex::new(db), count: u64::from(count), covered, bounds: all_bounds, _lease: lease })
+        Ok(Self { db: Mutex::new(db), count: u64::from(count), covered, bounds: all_bounds, unboxed, _lease: lease })
     }
 
     pub fn covers_bbox(&self, extent: [f32; 4]) -> bool {
@@ -197,6 +209,15 @@ pub(super) struct Index {
     /// The union of the records' finite boxes (rounded outward to f32): `None` when no record has
     /// one (every shape null or empty, or a coordinate that isn't a number).
     pub bounds: Option<[f32; 4]>,
+    /// Records with a shape whose box isn't one ([`not_a_box`]): left out of `bounds` and of the
+    /// R-tree, and said.
+    pub unboxed: u32,
+}
+
+/// Whether `b` is a record's box that isn't one: a shape there (not null or empty, whose box is
+/// NaN), but a corner that isn't a number or is past f32's range (`record_box`).
+fn not_a_box(b: [f32; 4]) -> bool {
+    !usable(b) && !b.iter().all(|v| v.is_nan())
 }
 
 /// Whether `b` is a box: its corners numbers, in order.
@@ -219,15 +240,27 @@ fn union(all: &mut Option<[f32; 4]>, b: [f32; 4]) -> bool {
     true
 }
 
-/// The records counted by scanning their headers, with any note on a truncated file and their
-/// boxes' union: what a disk index holds, for when none can be written.
-pub(super) fn scanned(path: &Path, len: u64) -> Result<(u32, String, Option<[f32; 4]>)> {
-    let mut bounds = None;
+/// What scanning the records' headers gathers, as a disk index holds it, for when none can be
+/// written.
+pub(super) struct Scanned {
+    pub count: u32,
+    /// A note on a truncated file; empty when there's none.
+    pub note: String,
+    pub bounds: Option<[f32; 4]>,
+    pub unboxed: u32,
+}
+
+/// The records counted by scanning their headers, their boxes' union, and the shapes whose box
+/// isn't one.
+pub(super) fn scanned(path: &Path, len: u64) -> Result<Scanned> {
+    let (mut bounds, mut unboxed) = (None, 0u32);
     let (count, note) = scan(path, len, |_, _, b| {
-        union(&mut bounds, b);
+        if !union(&mut bounds, b) && not_a_box(b) {
+            unboxed += 1;
+        }
         Ok(())
     })?;
-    Ok((count, note, bounds))
+    Ok(Scanned { count, note, bounds, unboxed })
 }
 enum Storage {
     Disk(DiskIndex),
@@ -236,14 +269,14 @@ enum Storage {
 impl Index {
     pub fn open(path: &Path, len: u64, notes: &mut Vec<String>) -> Result<Self> {
         match DiskIndex::open(path, len, notes) {
-            Ok(disk) => Ok(Self { count: disk.count, bounds: disk.bounds, storage: Storage::Disk(disk) }),
+            Ok(disk) => Ok(Self { count: disk.count, bounds: disk.bounds, unboxed: disk.unboxed, storage: Storage::Disk(disk) }),
             Err(error) => {
-                let (count, note, bounds) = scanned(path, len)?;
+                let Scanned { count, note, bounds, unboxed } = scanned(path, len)?;
                 notes.push(format!("spatial index unavailable ({error}); reading the .shp by scanning record headers"));
                 if !note.is_empty() {
                     notes.push(note);
                 }
-                Ok(Self { count: u64::from(count), bounds, storage: Storage::Scan { path: path.to_path_buf(), len } })
+                Ok(Self { count: u64::from(count), bounds, unboxed, storage: Storage::Scan { path: path.to_path_buf(), len } })
             }
         }
     }
@@ -342,9 +375,11 @@ mod tests {
         let mut b = std::fs::read(&path).unwrap();
         b[112..120].copy_from_slice(&f64::NAN.to_le_bytes());
         std::fs::write(&path, &b).unwrap();
-        let (count, note, bounds) = scanned(&path, b.len() as u64).unwrap();
-        assert_eq!((count, note.as_str()), (3, ""));
-        assert_eq!(bounds, Some([11.0, 21.0, 12.0, 22.0]));
+        let s = scanned(&path, b.len() as u64).unwrap();
+        assert_eq!((s.count, s.note.as_str()), (3, ""));
+        assert_eq!(s.bounds, Some([11.0, 21.0, 12.0, 22.0]));
+        assert_eq!(s.unboxed, 1, "the NaN shape is counted as left out");
+        assert!(not_a_box([f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY]) && !not_a_box([f32::NAN; 4]));
         assert!(usable([0.0, 0.0, 1.0, 1.0]));
         assert!(!usable([f32::NAN, 0.0, 1.0, 1.0]) && !usable([2.0, 0.0, 1.0, 1.0]) && !usable([0.0, 0.0, f32::INFINITY, 1.0]));
     }
