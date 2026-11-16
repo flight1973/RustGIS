@@ -1055,16 +1055,18 @@ the table it names with `read_features`, a row per county.
 **Tabulate Intersection** (`tabulateIntersection`) measures how much of each zone each class of
 polygons covers, and shares the classes' totals out to the zones by area. Both layers are polygon
 layers. Zone features sharing the values of the `zoneFields` (one field, or several as a list) make
-one zone, and class features sharing the values of the `classFields` make one class; with no class
-fields, all the class features are one class. The tool makes a standalone table with a row for each
-zone and class that overlap (pairs that only touch get none), sorted by the zone fields' values,
+one zone. Zone Fields is optional: when empty, each zone feature is a separate zone, with its
+zero-based input row in an integer `zone_row` field. These zones stay in input row order; selecting
+features keeps their original row numbers. Class features sharing the values of the `classFields`
+make one class; with no class fields, all the class features are one class. The tool makes a
+standalone table with a row for each zone and class that overlap (pairs that only touch get none), sorted by the zone fields' values,
 then the class fields', with empty values first, as Summary Statistics sorts its rows:
 
 | Field | Holds |
 | --- | --- |
-| The zone fields | The zone's values |
+| The zone fields, or `zone_row` | The zone's values, or the zero-based input row when no zone fields are given |
 | The class fields | The class's values |
-| `area_km2` | The ground area of the class in the zone, in km², where class features overlap each other counted once |
+| `area_<unit>` (`area_km2` by default) | The ground area of the class in the zone, in the chosen unit, where class features overlap each other counted once |
 | `percentage` | The class's area in the zone as a percentage of the zone's area, both measured as the map draws them (below; empty for a zone with no area) |
 | Each of `sumFields` | The sum, over the class's features, of the field's value times the part of the feature's area inside the zone |
 
@@ -1076,7 +1078,12 @@ school district: a block half inside a district gives it half its population. Th
 and can't also be class fields. Zones that overlap each other each get their share, so a value can
 be shared out more than once; the value of a feature's part outside every zone isn't shared out.
 
-`area_km2` is measured on the ellipsoid, as Calculate Geometry Attributes measures it. The
+The optional `areaUnit` uses the same unit keys as Calculate Geometry and `area()`: `m2` (square
+metres), `km2` (square kilometres, the default), `ha` (hectares), `ac` (acres), `ft2` (square feet)
+and `mi2` (square miles). It changes the area values and field name, for example `area_ac` for
+acres; percentages and sum shares stay the same. Existing calls keep `area_km2` and its values.
+
+The area is measured on the ellipsoid, as Calculate Geometry Attributes measures it. The
 percentages and shares compare areas measured on a sphere with each edge as the map draws it (a
 straight line on the map), the lines the tool cuts along, so the shares of a feature that zones
 cover without overlapping each other add up to its whole value, up to the overlay's rounding of the
@@ -1107,6 +1114,7 @@ features are used when a layer has a selection, and the table is named `<zones>_
 ```text
 gp.run={"tool":"tabulateIntersection","params":{"zones":"districts","zoneFields":"district","classes":"blocks","sumFields":["population"]}}
 gp.run={"tool":"tabulateIntersection","params":{"zones":"counties","zoneFields":"county","classes":"landcover","classFields":"class"}}
+gp.run={"tool":"tabulateIntersection","params":{"zones":"parcels","classes":"floodplain","areaUnit":"ac"}}
 ```
 
 <figure markdown="span">
@@ -1335,6 +1343,22 @@ it installed and removes the `geolibre` folder only if it is empty. Other files 
 you located yourself, and one on your `PATH` are left alone; RustGIS looks for a runner again.
 You can install the tools again at any time. In the browser,
 **Remove** unloads the tools and stops loading them when RustGIS starts.
+
+**In your language.** The tools' names, descriptions, parameters and toolboxes come in English.
+GeoLibre translates them into some twenty languages, in
+[language packs](https://github.com/opengeos/geolibre-language-packs) of about 2 MB each that it
+keeps out of its builds, and RustGIS reads the same packs. With the interface in a language GeoLibre
+has a pack for, click **Translate tools** beside *GeoLibre* at the top of the Tools pane: RustGIS
+downloads that language's pack from `languages.geolibre.app`, checks it as GeoLibre does (its format
+and version, text only, 5 MB at most) and keeps it in a `geolibre-languages` folder in its data
+folder, so it works offline from then on, and in later sessions, whenever the interface is in that
+language. **Remove translations** deletes it. Find Tools then finds a tool by its translated name as
+well as its English one, with or without accents (`curvas de nivel` finds *Curvas de nível a partir
+de raster*). Only what the tools show is translated: scripts, the command line and the layers a
+tool adds keep the English names. From the command line, `gp.installGeolibreLanguage`
+(`{"locale": "pt"}`) downloads a pack, `gp.importGeolibreLanguage` (`{"path": …}`) reads one from a
+file (one you made or edited, in the same format), `gp.uninstallGeolibreLanguage` deletes one, and
+`gp.geolibre` lists them under `languages`. The browser shows the tools in English.
 
 To install it yourself instead, download the archive for your platform
 (`geolibre-<version>-<platform>.tar.gz`, or `.zip` on Windows), unpack it anywhere, and click

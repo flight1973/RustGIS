@@ -46,8 +46,24 @@ pub fn commands() -> Vec<C> {
         C::new("gp.geolibre", "GeoLibre Tools", "Analyze › Geoprocessing", |_, _| {
             let mut status = geolibre_status();
             status["passedOver"] = json!(geolibre_passed_over());
+            status["languages"] = geolibre_languages();
             Ok(status)
         }).roles(&[]).effects(crate::policy::Effects::NONE).view(),
+        C::new("gp.installGeolibreLanguage", "Download GeoLibre Tool Translations", "Analyze › Geoprocessing", install_geolibre_language_cmd)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved))
+            .view()
+            .params(r#"{"locale": "the language's code, such as \"pt\" (one GeoLibre publishes a pack for)"}"#),
+        C::new("gp.importGeolibreLanguage", "Import GeoLibre Tool Translations", "Analyze › Geoprocessing", import_geolibre_language)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved).with(crate::policy::Effect::Files))
+            .view()
+            .params(r#"{"path": "a GeoLibre language pack (.json)"}"#),
+        C::new("gp.uninstallGeolibreLanguage", "Remove GeoLibre Tool Translations", "Analyze › Geoprocessing", uninstall_geolibre_language)
+            .roles(&[])
+            .effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Reserved))
+            .view()
+            .params(r#"{"locale": "the language's code"}"#),
         C::new("gp.installGeolibre", "Install GeoLibre Tools", "Analyze › Geoprocessing", |_, _| {
             let path = install_geolibre(&|_, _| {})?;
             #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
@@ -133,6 +149,143 @@ pub fn geolibre_passed_over() -> Option<String> {
     }
     #[cfg(not(all(feature = "geolibre", not(target_arch = "wasm32"))))]
     None
+}
+
+/// The GeoLibre tool translations (#2224): the languages GeoLibre publishes a pack for, the ones
+/// kept in the data folder, and the one in use.
+fn geolibre_languages() -> Value {
+    #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
+    {
+        let errors: serde_json::Map<String, Value> =
+            rustgis_geolibre::langpack::load_errors().into_iter().map(|(locale, e)| (locale, Value::String(e))).collect();
+        json!({"available": rustgis_geolibre::langpack::LOCALES, "installed": rustgis_geolibre::langpack::kept(),
+            "active": rustgis_geolibre::langpack::active_locale(), "errors": errors})
+    }
+    #[cfg(not(all(feature = "geolibre", not(target_arch = "wasm32"))))]
+    {
+        json!({"available": [], "installed": [], "active": null, "errors": {}})
+    }
+}
+
+/// Whether GeoLibre publishes tool translations for `locale`, and this build can download them.
+pub fn geolibre_language_available(locale: &str) -> bool {
+    #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
+    {
+        rustgis_geolibre::langpack::url(locale).is_some()
+    }
+    #[cfg(not(all(feature = "geolibre", not(target_arch = "wasm32"))))]
+    {
+        let _ = locale;
+        false
+    }
+}
+
+/// Whether tool translations for `locale` are in use (kept in the data folder, read the first
+/// time this is asked, then from memory).
+pub fn geolibre_language_in_use(locale: &str) -> bool {
+    #[cfg(feature = "geolibre")]
+    {
+        rustgis_geolibre::langpack::in_use(locale)
+    }
+    #[cfg(not(feature = "geolibre"))]
+    {
+        let _ = locale;
+        false
+    }
+}
+
+/// `english`, a GeoLibre tool's text (its name, summary, a parameter's label or help, a toolbox
+/// name), in `locale`, from the translations kept for it; the interface's catalogue falls back to
+/// it as to a plugin's `i18n`. `None` without them.
+pub fn geolibre_translate(locale: &str, english: &str) -> Option<String> {
+    #[cfg(feature = "geolibre")]
+    {
+        rustgis_geolibre::langpack::translate(locale, english)
+    }
+    #[cfg(not(feature = "geolibre"))]
+    {
+        let _ = (locale, english);
+        None
+    }
+}
+
+/// Why the tool translations kept for `locale` can't be used (a damaged file, another format
+/// version), once they were tried: the Tools pane shows it beside **Translate tools**.
+pub fn geolibre_language_error(locale: &str) -> Option<String> {
+    #[cfg(feature = "geolibre")]
+    {
+        rustgis_geolibre::langpack::load_error(locale)
+    }
+    #[cfg(not(feature = "geolibre"))]
+    {
+        let _ = locale;
+        None
+    }
+}
+
+/// Changes whenever [`geolibre_translate`] may answer differently (translations installed or
+/// removed, the tools reloaded), so a cache of its answers starts over.
+pub fn geolibre_language_revision() -> u64 {
+    #[cfg(feature = "geolibre")]
+    {
+        rustgis_geolibre::langpack::revision()
+    }
+    #[cfg(not(feature = "geolibre"))]
+    0
+}
+
+/// Downloads GeoLibre's tool translations for `locale` (about 2 MB), keeps them and puts them in
+/// use; returns how many of the listed tools they name. Blocks on one request: the app calls it from a
+/// background thread. Native only.
+pub fn install_geolibre_language(locale: &str) -> Result<usize, String> {
+    #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
+    {
+        rustgis_geolibre::langpack::download(locale)
+    }
+    #[cfg(not(all(feature = "geolibre", not(target_arch = "wasm32"))))]
+    {
+        let _ = locale;
+        Err("this build can't download GeoLibre tool translations".into())
+    }
+}
+
+/// `gp.installGeolibreLanguage`. It runs where it is called, without Cancel, because its work
+/// doesn't grow with anything the user has: one request for one file, read up to 5 MB and given
+/// up after 60 s, then one parse, the same for every project. The Tools pane's button, the way
+/// the app downloads a pack, runs it on a thread of its own; called from a script, the command line
+/// or Python, it waits for that one request like `gp.installGeolibre` waits for the runner's.
+fn install_geolibre_language_cmd(_s: &mut Session, p: &Value) -> CmdResult {
+    let locale = ps(p, "locale").map(str::trim).filter(|l| !l.is_empty()).ok_or("give the language's \"locale\", such as \"pt\"")?;
+    let tools = install_geolibre_language(locale)?;
+    Ok(json!({"locale": locale, "tools": tools}))
+}
+
+fn import_geolibre_language(_s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
+    {
+        let path = ps(p, "path").map(str::trim).filter(|p| !p.is_empty()).ok_or("give the pack's \"path\"")?;
+        let (locale, tools) = rustgis_geolibre::langpack::import(std::path::Path::new(path))?;
+        Ok(json!({"locale": locale, "tools": tools}))
+    }
+    #[cfg(not(all(feature = "geolibre", not(target_arch = "wasm32"))))]
+    {
+        let _ = p;
+        Err("this build can't import GeoLibre tool translations".into())
+    }
+}
+
+fn uninstall_geolibre_language(_s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
+    {
+        let locale = ps(p, "locale").map(str::trim).filter(|l| !l.is_empty()).ok_or("give the language's \"locale\"")?;
+        rustgis_geolibre::langpack::remove(locale)?;
+        Ok(geolibre_languages())
+    }
+    #[cfg(not(all(feature = "geolibre", not(target_arch = "wasm32"))))]
+    {
+        let _ = p;
+        Err("this build keeps no GeoLibre tool translations".into())
+    }
 }
 
 /// Downloads and installs the pinned GeoLibre runner release for this platform; returns the
@@ -284,6 +437,7 @@ pub fn external_complete(s: &mut Session, id: u64, ran: ExternalOutput) -> Resul
         });
         let tool_id = format!("{}{}", rustgis_geolibre::PREFIX, job.tool);
         s.pending.push(crate::PendingRun {
+            inputs: Vec::new(),
             id,
             continuation,
             tool: job.name.clone(),
@@ -485,6 +639,7 @@ fn complete(
     }
     fit_to_windows(s, &mut result, &full_ids);
     s.pending.push(crate::PendingRun {
+        inputs: Vec::new(),
         id,
         continuation: run.continuation,
         tool: run.name,
@@ -512,11 +667,13 @@ pub struct ToolRun {
     pub tool: &'static str,
     snap: Snapshot<'static>,
     params: Value,
+    capture_inputs: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 /// What a [`ToolRun`] made, for [`tool_complete`].
 pub struct ToolDone {
+    inputs: Vec<rustgis_data::provenance::Fingerprint>,
     result: Result<rustgis_analysis::ToolResult, String>,
     full_ids: FullIds,
 }
@@ -526,32 +683,43 @@ impl ToolRun {
     /// Reads the tool's inputs and runs it, blocking until it ends; `control` stops it and counts
     /// its progress (see [`rustgis_analysis::control`]).
     pub fn run(self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> ToolDone {
+        let captured = self.capture_inputs.then(rustgis_data::provenance::Capture::start);
         let ToolRun { pin, continuation, snap, params, .. } = self;
         let spec = pin.spec();
         let name = spec.name;
         if let Err(e) = continuation.check() {
-            return ToolDone { result: Err(e), full_ids: FullIds::new() };
+            return ToolDone { inputs: Vec::new(), result: Err(e), full_ids: FullIds::new() };
         }
         if control.is_cancelled() {
-            return ToolDone { result: Err(format!("{name} was cancelled before it started")), full_ids: FullIds::new() };
+            return ToolDone {
+                inputs: Vec::new(),
+                result: Err(format!("{name} was cancelled before it started")),
+                full_ids: FullIds::new(),
+            };
         }
         let current = continuation.clone();
         let still = std::sync::Arc::new(move || current.check().is_ok()) as crate::render::rustgis_tiles::cache::Still;
         // A bug in reading the inputs, like one in a tool, must not take the app down.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::render::rustgis_tiles::cache::with_still(still, || {
                 let inputs = match inputs_of(snap, Some(spec), &params) {
                     Ok(inputs) => inputs,
-                    Err(e) => return ToolDone { result: Err(e), full_ids: FullIds::new() },
+                    Err(e) => return ToolDone { inputs: Vec::new(), result: Err(e), full_ids: FullIds::new() },
                 };
                 let mut result = pin.run(&inputs, &params, control, &|| continuation.check());
                 if let Ok(r) = &mut result {
                     r.messages.extend(inputs.messages.iter().cloned());
                 }
-                ToolDone { result, full_ids: full_ids(&inputs.loaded) }
+                ToolDone { inputs: Vec::new(), result, full_ids: full_ids(&inputs.loaded) }
             })
         }))
-        .unwrap_or_else(|_| ToolDone { result: Err(format!("{name} failed unexpectedly")), full_ids: FullIds::new() })
+        .unwrap_or_else(|_| ToolDone {
+            inputs: Vec::new(),
+            result: Err(format!("{name} failed unexpectedly")),
+            full_ids: FullIds::new(),
+        });
+        done.inputs = captured.as_ref().map_or_else(Vec::new, rustgis_data::provenance::Capture::inputs);
+        done
     }
 }
 
@@ -592,7 +760,7 @@ pub fn tool_start(s: &mut Session, tool: &str, params: &Value) -> Result<ToolRun
     if s.plugin_runs.len() > MAX_ASYNC_RUNS {
         s.plugin_runs.remove(0);
     }
-    Ok(ToolRun { id, tool: spec.id, snap: Snapshot::owned(s), params: resolved, pin, continuation })
+    Ok(ToolRun { id, tool: spec.id, snap: Snapshot::owned(s), params: resolved, pin, continuation, capture_inputs: s.log.on() })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -612,7 +780,11 @@ pub fn tool_abandon(s: &mut Session, id: u64) {
 /// Finishes a run from [`tool_start`] with what [`ToolRun::run`] made: `gp.finish {"id"}` then
 /// applies it like `gp.run` would, with undo and history.
 pub fn tool_complete(s: &mut Session, id: u64, done: ToolDone) -> Result<(), String> {
-    complete(s, id, done.result, Some(done.full_ids))
+    complete(s, id, done.result, Some(done.full_ids))?;
+    if let Some(run) = s.pending.iter_mut().find(|run| run.id == id) {
+        run.inputs = done.inputs;
+    }
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -992,6 +1164,7 @@ fn finish(s: &mut Session, p: &Value) -> CmdResult {
     let i = s.pending.iter().position(|r| r.id == id).ok_or("no finished run with that id")?;
     s.check_gp_finish(&s.pending[i].continuation, landing(&s.pending[i].result))?;
     let r = s.pending.remove(i);
+    rustgis_data::provenance::record(r.inputs.clone());
     let c = r.continuation.clone();
     s.resume_gp(&c, landing(&r.result), |s| {
         apply(s, Ran { name: r.tool, id: r.tool_id, command: None, started: r.started }, r.params, r.result, r.millis)

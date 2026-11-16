@@ -19,19 +19,28 @@ use crate::layout::{MAX_PIXELS, PageInfo, expand, page_geometry, record_element,
 /// Writes `layout` as an SVG document, pictures drawn at `dpi`, and the elements (id and name)
 /// drawn as pictures because their vectors would pass the budget. Refuses a source changed during drawing.
 pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Result<(String, Vec<(u32, String)>), String> {
+    let _budget = crate::layout::legend_budget();
     let revisions = crate::layout::archive_revisions(layout, maps);
-    let result = layout_svg_inner(layout, maps, dpi, info);
+    let mut source_error = None;
+    let result = layout_svg_inner(layout, maps, dpi, info, &mut source_error);
+    crate::layout::finish_legends()?;
     revisions.finish_revision(
         crate::layout::archive_revisions(layout, maps),
         result,
-        "could not draw the page; check its map sources and export size",
+        source_error.as_deref().unwrap_or("could not draw the page; check its map sources and export size"),
     )
 }
 
-fn layout_svg_inner(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<(String, Vec<(u32, String)>)> {
+fn layout_svg_inner(
+    layout: &Layout,
+    maps: &mut [Map],
+    dpi: f64,
+    info: &PageInfo,
+    source_error: &mut Option<String>,
+) -> Option<(String, Vec<(u32, String)>)> {
     let mut defs = vectors::Defs::default();
     let mut pictured = Vec::new();
-    let mut body = elements(layout, maps, dpi, info, &mut defs, &mut pictured)?;
+    let mut body = elements(layout, maps, dpi, info, &mut defs, &mut pictured, source_error)?;
     let (pw, ph) = (layout.width, layout.height);
     // The head (with the defs the body refers to) goes in front of the body in place: a large
     // export's pictures are never held twice.
@@ -67,6 +76,7 @@ fn elements(
     info: &PageInfo,
     defs: &mut vectors::Defs,
     pictured: &mut Vec<(u32, String)>,
+    source_error: &mut Option<String>,
 ) -> Option<String> {
     let ppp = page_geometry(layout, dpi).2 / PT_PER_MM;
     let mut s = String::new();
@@ -77,6 +87,9 @@ fn elements(
     let mut written = 0usize;
     for e in layout.elements.iter().filter(|e| e.visible) {
         let _ = writeln!(s, r#"<g id="element-{}" inkscape:label="{}" inkscape:groupmode="layer">"#, e.id, esc(&e.name));
+        // Its background first, as a shape of its own (#2257): the content drawn as a picture
+        // below leaves it out (`draw_page` draws backgrounds only on the whole page).
+        background(&mut s, e);
         let (x, y, w, h) = (e.x, e.y, e.w, e.h);
         match &e.kind {
             ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation } => {
@@ -172,7 +185,7 @@ fn elements(
                 // bounds; past the budget (its own, or the page's with the elements before it), a
                 // picture of it at the pictures' resolution.
                 let mut frames = Vec::new();
-                if let Some((drawing, [ix, iy, ..], k)) = record_element(layout, e.id, maps, dpi, info, &mut frames)? {
+                if let Some((drawing, [ix, iy, ..], k)) = record_element(layout, e.id, maps, dpi, info, &mut frames, source_error)? {
                     let total = written.saturating_add(drawing.cost());
                     if !drawing.overflowed() && total <= crate::vector::max_cost() {
                         written = total;
@@ -197,7 +210,7 @@ fn elements(
     let picture_dpi = picture_dpi(layout, dpi, |e| as_pictures.contains(&e.id));
     for id in as_pictures {
         let mut image_tag = String::new();
-        if let Some((image, [ix, iy, iw, ih])) = render_element(layout, id, maps, picture_dpi, info)? {
+        if let Some((image, [ix, iy, iw, ih])) = render_element(layout, id, maps, picture_dpi, info, source_error)? {
             let png = image.encode_png().ok()?;
             let _ = writeln!(
                 image_tag,
@@ -298,6 +311,28 @@ fn stroke(color: rustgis_map::Rgba, width: f64, dash: Option<&rustgis_map::symbo
     } else {
         r#" stroke="none""#.into()
     }
+}
+
+/// An element's background (#2257) as a `<rect>`: its box grown by the padding, its corners
+/// rounded as the page rounds them (at most half the shorter side), turned with a turned text.
+fn background(s: &mut String, e: &rustgis_map::layout::Element) {
+    let Some(b) = e.background else { return };
+    let (x, y, w, h) = e.background_box();
+    let _ = write!(
+        s,
+        r#"<rect x="{}" y="{}" width="{}" height="{}" rx="{}"{}{}"#,
+        num(x),
+        num(y),
+        num(w),
+        num(h),
+        num(b.radius.min(w.min(h) / 2.0).max(0.0)),
+        paint("fill", b.fill),
+        stroke(b.outline, b.width, None)
+    );
+    if e.rotation() != 0.0 {
+        let _ = write!(s, r#" transform="rotate({} {} {})""#, num(e.rotation()), num(e.x + e.w / 2.0), num(e.y + e.h / 2.0));
+    }
+    s.push_str("/>\n");
 }
 
 /// ` fill="#rrggbb"` (or stroke), with its opacity when it isn't opaque.
@@ -482,13 +517,13 @@ mod tests {
         assert!(key.contains(r#"aria-label="Map legend""#) && key.contains("<use xlink:href=\"#glyph"));
         assert!(svg.contains("<defs>") && svg.find("<defs>") < svg.find("<g id=\"element-"));
         // A surround drawn as a picture (past the budget) keeps its page context and transparency.
-        let (pm, _) = render_element(&layout, legend, &mut maps, 72.0, &info).unwrap().unwrap();
+        let (pm, _) = render_element(&layout, legend, &mut maps, 72.0, &info, &mut None).unwrap().unwrap();
         assert!(pm.pixels().iter().any(|p| p.alpha() == 0), "no opaque page behind the legend");
         assert!(pm.pixels().iter().any(|p| p.alpha() > 0), "the title still uses the frame context");
         let (mut base, mut maps, _) = page();
         let mut expected = crate::layout::render(&base, &mut maps, 72.0, &info).unwrap();
         assert!(pm.width() < expected.width() / 2 && pm.height() < expected.height() / 2, "only the surround's bounds are allocated");
-        let (image, [x, y, ..]) = render_element(&layout, legend, &mut maps, 72.0, &info).unwrap().unwrap();
+        let (image, [x, y, ..]) = render_element(&layout, legend, &mut maps, 72.0, &info, &mut None).unwrap().unwrap();
         let k = PT_PER_MM * 72.0 / 96.0;
         expected.draw_pixmap(
             (x * k).round() as i32,
@@ -523,7 +558,7 @@ mod tests {
         let (mut layout, mut maps, _) = page();
         let id = layout.add("Picture", (-5.3, 70.2, 20.7, 20.0), ElementKind::Picture { image: String::new() });
         let info = PageInfo::default();
-        let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, &info).unwrap().unwrap();
+        let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, &info, &mut None).unwrap().unwrap();
         let [x, y, w, h] = bounds;
         let k = PT_PER_MM * 36.0 / 96.0;
         assert_eq!(x, 0.0);
@@ -534,7 +569,7 @@ mod tests {
         // Placed at its pixel bounds, as its picture would be.
         assert!(svg.contains(&format!(r#"<g transform="translate({} {}) scale("#, num(x), num(y))), "{svg}");
         layout.element_mut(id).unwrap().x = 110.0;
-        assert!(render_element(&layout, id, &mut maps, 36.0, &info).unwrap().is_none());
+        assert!(render_element(&layout, id, &mut maps, 36.0, &info, &mut None).unwrap().is_none());
         assert!(layout_svg(&layout, &mut maps, 36.0, &info).is_ok(), "an off-page image is harmless");
     }
 
@@ -590,5 +625,37 @@ mod tests {
         assert_eq!(esc("valid\u{fffe}\u{ffff}\t🙂"), "valid\t🙂");
         assert_eq!(paint("fill", rustgis_map::Rgba::new(255, 0, 16, 128)), r##" fill="#ff0010" fill-opacity="0.502""##);
         assert_eq!(stroke(rustgis_map::Rgba::rgb(0, 0, 0), 0.0, None), r#" stroke="none""#);
+    }
+
+    /// An element's background (#2257) is a `<rect>` of its own under the element, its box grown
+    /// by the padding, turned with a turned text; an element with none has none.
+    #[test]
+    fn a_background_is_its_own_rect_under_the_element() {
+        use rustgis_map::layout::{Background, ElementKind};
+        let svg = |turn: f64, background: Option<Background>| {
+            let mut layout = Layout::new("L", 100.0, 100.0);
+            let mut kind = ElementKind::text("Fonte", 12.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+            if let ElementKind::Text { rotation, .. } = &mut kind {
+                *rotation = turn;
+            }
+            let id = layout.add("T", (40.0, 40.0, 20.0, 10.0), kind);
+            layout.element_mut(id).unwrap().background = background;
+            layout_svg(&layout, &mut [], 96.0, &PageInfo::default()).unwrap().0
+        };
+        // The page's own paper is a rect too: the background is one more, and none by default.
+        let plain = svg(0.0, None).matches("<rect").count();
+        let b = Background {
+            outline: rustgis_map::Rgba::rgb(0, 0, 0),
+            width: 1.0,
+            radius: 2.0,
+            padding: 1.5,
+            ..Background::filled(rustgis_map::Rgba::new(255, 255, 255, 204))
+        };
+        let s = svg(0.0, Some(b));
+        let rect = r##"<rect x="38.5" y="38.5" width="23" height="13" rx="2" fill="#ffffff" fill-opacity="0.8""##;
+        assert_eq!(s.matches("<rect").count(), plain + 1, "{s}");
+        assert!(s.find(rect).is_some_and(|at| at < s.find("<text").unwrap_or(0)), "under the text: {s}");
+        let turned = svg(90.0, Some(b));
+        assert!(turned.contains(r#"stroke-width="0.265" transform="rotate(90 50 45)"/>"#), "turned about the box's centre: {turned}");
     }
 }

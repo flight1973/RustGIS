@@ -24,6 +24,7 @@ pub mod policy;
 pub mod prefs;
 pub mod project;
 mod roles;
+pub mod shape_conversion;
 pub use peer::Peer;
 pub(crate) use roles::{Document, ParamRole, Role};
 mod parameters;
@@ -1032,6 +1033,7 @@ const MAX_URL_REQUESTS: usize = 16;
 
 /// A finished tool run, held until `gp.finish` applies it.
 pub(crate) struct PendingRun {
+    pub(crate) inputs: Vec<rustgis_data::provenance::Fingerprint>,
     pub(crate) continuation: policy::Continuation,
     pub id: u64,
     pub tool: String,
@@ -1182,7 +1184,7 @@ fn edits_features(id: &str) -> bool {
 }
 
 impl Session {
-    /// Marks this thread as the desktop window owner for column statistics. Adapters with a
+    /// Marks this thread as the desktop window owner for column statistics and shape fitting. Adapters with a
     /// window use the prepared read queue; headless adapters leave this disabled.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn statistics_need_read_ahead(&mut self, enabled: bool) {
@@ -1599,6 +1601,7 @@ impl Session {
     /// Shared command bookkeeping for ordinary dispatch and execution of an already pinned retry.
     pub(crate) fn command_epilogue(&mut self, id: &str, params: &Value, run: impl FnOnce(&mut Self) -> CmdResult) -> CmdResult {
         let outermost = self.depth == 0;
+        let _inputs = (outermost && self.log.on()).then(rustgis_data::provenance::Capture::start);
         #[cfg(not(target_arch = "wasm32"))]
         let _diagnostic_scope = self.requests_into.as_ref().map_or_else(|| self.diagnostics.enter(), |c| c.enter());
         #[cfg(target_arch = "wasm32")]
@@ -1667,7 +1670,7 @@ impl Session {
                         };
                         let project = (project_log::kept_name(&self.title()), self.opened);
                         let e = project_log::entry(project, id, params, partial, &res, at, start.elapsed());
-                        if joins && res.is_ok() { self.log.join_last(e) } else { self.log.push(e) }
+                        self.log_entry(e, joins && res.is_ok());
                     }
                 }));
                 if logged.is_err() {
@@ -1785,9 +1788,12 @@ impl Session {
     /// the active one; a command that takes a standalone table is checked against the one they
     /// name.
     fn conditions(&mut self, spec: &CommandSpec, params: &Value) -> (Option<&'static str>, Option<u32>, Option<u32>) {
-        let named = match params.get("layer") {
+        // Apply carries its explicit target inside the preview, even when another layer is
+        // active. Conditions and the streamed-edit preflight must judge that same target.
+        let layer_params = if spec.id == "edit.applyShapeConversion" { params.get("preview").unwrap_or(params) } else { params };
+        let named = match layer_params.get("layer") {
             Some(serde_json::Value::Array(list)) => list.first().and_then(|v| self.layer_id(&serde_json::json!({"layer": v})).ok()),
-            Some(_) => self.layer_id(params).ok(),
+            Some(_) => self.layer_id(layer_params).ok(),
             None => None,
         };
         let active = self.active_layer;
@@ -1842,6 +1848,22 @@ impl Session {
     /// Runs `f` as the command `label`: when it `mutates`, the project is snapshotted for undo
     /// and restored if `f` fails or panics.
     pub(crate) fn guarded(&mut self, label: &'static str, mutates: bool, f: impl FnOnce(&mut Session) -> CmdResult) -> CmdResult {
+        self.guarded_inner(label, mutates, true, f)
+    }
+
+    /// An atomic host-call savepoint. The enclosing plugin transaction owns Undo; a guest may
+    /// handle this call's error and still succeed, so failure must restore its changes here.
+    pub(crate) fn savepoint(&mut self, label: &'static str, f: impl FnOnce(&mut Session) -> CmdResult) -> CmdResult {
+        self.guarded_inner(label, true, false, f)
+    }
+
+    fn guarded_inner(
+        &mut self,
+        label: &'static str,
+        mutates: bool,
+        record_undo: bool,
+        f: impl FnOnce(&mut Session) -> CmdResult,
+    ) -> CmdResult {
         let snapshot = mutates.then(|| self.project.clone());
         let construction_snapshot = self.constructions.clone();
         let trust = (self.trusted_tasks.clone(), self.trusted_models.clone(), self.trusted_notebooks.clone());
@@ -1888,6 +1910,7 @@ impl Session {
             // [`Session::request_url`]) changed nothing: no undo step, nothing to save yet. The
             // session's own flag says so, not the answer, which a plugin's command could forge.
             (Ok(_), Some(_)) if std::mem::take(&mut self.request_only) => {}
+            (Ok(_), Some(_)) if !record_undo => {}
             (Ok(_), Some(mut snap)) => {
                 // A successful script may publish and then remove the layer. Its undo
                 // snapshot still needs the committed file record, even without a live layer
@@ -2189,7 +2212,8 @@ impl Session {
     /// read, and why; and what the header of a cloud-optimised GeoTIFF drawn as a tile layer
     /// leaves out, once that header lands (each date's file of a dated series as it is shown).
     /// Once for each layer's pixels, failure or file, one notice of each kind; the app calls it
-    /// each frame.
+    /// each frame. Also reports streamed vector read failures once, naming their linked file
+    /// and how to repair it when one is available.
     pub fn notice_landed_rasters(&mut self) {
         cmd::terrain_blocks::landed(self);
         self.notice_landed_pixels();
@@ -2203,8 +2227,25 @@ impl Session {
         // once, keeping the same counted notice channel as retained resident expressions.
         let mut landed = Vec::new();
         let mut dates = Vec::new();
+        let mut source_errors = Vec::new();
+        let mut source_error_count = 0;
         for map in &mut self.project.maps {
             for layer in &mut map.layers {
+                // Only a source with a local file is said here; others keep their error for their own reports.
+                if let Some(source) = &mut layer.source
+                    && source.linked_file().is_some()
+                    && let Some(error) = source.error_unsaid()
+                    && let Some(path) = source.linked_file()
+                {
+                    source_error_count += 1;
+                    // Keep a moved folder's notice readable, marking every failure said.
+                    if source_errors.len() < 5 {
+                        source_errors.push(notice_text::NoticeText::format(
+                            "{name}: {path} ({error})",
+                            [("name", layer.name.clone().into()), ("path", path.to_string().into()), ("error", error.into())],
+                        ));
+                    }
+                }
                 // Values in date fields that weren't dates, once for a layer read in place.
                 let (unread, rounded) = layer.source.as_mut().map(|source| source.take_unread_dates()).unwrap_or_default();
                 if let Some(note) = unread {
@@ -2229,6 +2270,9 @@ impl Session {
         }
         for note in dates {
             self.notify(note, false);
+        }
+        if let Some(message) = notice_text::NoticeText::source_errors(source_error_count, source_errors, source_error_count) {
+            self.notify_text(message, true);
         }
         let (mut lost, mut held, mut failed, mut dropped) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for m in &mut self.project.maps {

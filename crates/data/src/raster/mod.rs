@@ -13,6 +13,7 @@ pub mod crs;
 pub(crate) mod epsg_axes;
 mod epsg_gap;
 mod esri;
+mod esri_datums;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
 pub mod geotiff;
@@ -1193,15 +1194,15 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
             #[cfg(not(target_arch = "wasm32"))]
             let r = geotiff::read_file_with_nodata(path, &name, sidecar_nodata)?;
             #[cfg(target_arch = "wasm32")]
-            let r = geotiff::read_with_nodata(std::io::BufReader::new(std::fs::File::open(path)?), &name, sidecar_nodata)?;
+            let r = geotiff::read_with_nodata(std::io::BufReader::new(crate::provenance::open(path)?), &name, sidecar_nodata)?;
             r
         }
-        "png" | "jpg" | "jpeg" => read_scan(&name, std::io::BufReader::new(std::fs::File::open(path)?))?,
+        "png" | "jpg" | "jpeg" => read_scan(&name, std::io::BufReader::new(crate::provenance::open(path)?))?,
         "asc" => {
             if meta.len() > MAX_ASCII_BYTES {
                 return Err(DataError::Format("the ASCII grid is too large to open".into()));
             }
-            let text = std::fs::read_to_string(path)?;
+            let text = crate::provenance::read_to_string(path)?;
             read_ascii(path, &text, &name, sidecar_nodata)?
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -1227,12 +1228,12 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
         // The second read gives all the first did: the first goes before it, so two aren't held.
         drop(r);
         r = if ext == "asc" {
-            read_ascii(path, &std::fs::read_to_string(path)?, &name, nd)?
+            read_ascii(path, &crate::provenance::read_to_string(path)?, &name, nd)?
         } else {
             #[cfg(not(target_arch = "wasm32"))]
             let again = geotiff::read_file_with_nodata(path, &name, nd)?;
             #[cfg(target_arch = "wasm32")]
-            let again = geotiff::read_with_nodata(std::io::BufReader::new(std::fs::File::open(path)?), &name, nd)?;
+            let again = geotiff::read_with_nodata(std::io::BufReader::new(crate::provenance::open(path)?), &name, nd)?;
             again
         };
     }
@@ -1337,12 +1338,32 @@ fn read_path_with_placing(path: &Path, subdataset: Option<&str>, crs: Option<&st
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_converted(path: &Path, c: &gdal::Converted) -> Result<Raster> {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("raster");
-    let mut r = geotiff::read_file(&c.path, stem)?;
+    crate::provenance::path(path);
+    let mut r = crate::provenance::without(|| geotiff::read_file(&c.path, stem))?;
     if let Some(s) = &c.subdataset {
         r.name = format!("{stem} {}", gdal::short_name(s));
     }
     r.source = Some(path.display().to_string());
+    // What converting found that the GeoTIFF it made doesn't say (that file names the system GDAL
+    // assumed as if it had been the file's own): said with the raster's other losses, whichever way
+    // it is read, as a reload says them again.
+    if c.assumed_lonlat {
+        r.lost.push(format!("{} (give \"crs\" if not)", assumed_wgs84_note("it doesn't say its coordinate system")));
+    }
+    if !c.others.is_empty() {
+        let shown: Vec<&str> = c.others.iter().take(20).map(String::as_str).collect();
+        let more = c.others.len().saturating_sub(shown.len());
+        let tail = if more > 0 { format!(", and {more} more") } else { String::new() };
+        r.lost.push(format!("it has {} more variables ({}{tail}): add one with \"layer\"", c.others.len(), shown.join(", ")));
+    }
     Ok(r)
+}
+
+/// What a reader says when a grid whose file gives no usable coordinate system is read as WGS 84
+/// longitude/latitude, because its coordinates fit in degrees (AGENTS.md, Never silent): `why` is
+/// what the file lacks or gets wrong. One line a raster, whatever its size.
+pub(crate) fn assumed_wgs84_note(why: &str) -> String {
+    format!("{why}; its coordinates look like longitude/latitude, so it's read as WGS 84")
 }
 
 /// The stand-in transform of a scan of `w` × `h` pixels: square pixels, the longer side one degree,
@@ -1611,13 +1632,13 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
 /// An ASCII grid at `path` (its `text`), in the coordinate system of the `.prj` next to it.
 fn read_ascii(path: &Path, text: &str, name: &str, nodata: Option<f64>) -> Result<Raster> {
     let (crs, note) = sidecar_crs(path)?;
-    let mut r = ascii::read_with_nodata(text, name, crs, nodata)?;
-    // Planetary body notices have their own path. Preserve the method warning without duplicating
-    // those, and only assume lon/lat for an unreadable definition.
-    r.lost.extend(note.map(|message| match crs {
-        Some(_) => format!("the .prj file: {message}"),
-        None => format!("the .prj file: {message}; coordinates are read as longitude/latitude"),
-    }));
+    let note = note.map(|message| format!("the .prj file: {message}"));
+    // An unreadable definition explains the assumption itself; a missing definition says it is
+    // missing. A readable system keeps its other notes, without repeating the planetary body.
+    let mut r = ascii::read_with_nodata(text, name, crs, nodata, note.as_deref().filter(|_| crs.is_none()))?;
+    if crs.is_some() {
+        r.lost.extend(note);
+    }
     Ok(r)
 }
 
@@ -1701,7 +1722,7 @@ pub fn read_prj(path: &Path) -> Option<String> {
     if !meta.is_file() || meta.len() > 1 << 20 {
         return None;
     }
-    std::fs::read_to_string(prj).ok()
+    crate::provenance::read_to_string(prj).ok()
 }
 
 /// Longitude/latitude bounds of a `width` × `height` grid placed by `transform` in `transformer`'s
@@ -2336,6 +2357,80 @@ pub(crate) mod tests {
             let off = wkt::tests::metres_apart(ll, lonlat);
             assert!(off < 0.01, "{what}: {off} m off");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ASCII grid on disk says it is read as WGS 84 when no `.prj` gives its system, and says
+    /// nothing when one does; a `.prj` that can't be read adds why, and the assumption is said once.
+    #[test]
+    fn an_ascii_grid_on_disk_says_what_its_prj_leaves_out() {
+        let dir = std::env::temp_dir().join(format!("rustgis-ascii-assumed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let asc = dir.join("g.asc");
+        std::fs::write(&asc, "ncols 2\nnrows 1\nxllcorner 10\nyllcorner 40\ncellsize 1\n1 2\n").unwrap();
+        let r = read_path(&asc).unwrap();
+        assert_eq!(r.crs, Crs::LonLat);
+        assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
+        assert!(r.lost[0].contains("doesn't say its coordinate system") && r.lost[0].contains("WGS 84"), "{:?}", r.lost);
+        std::fs::write(dir.join("g.prj"), wkt::to_wkt(Crs::LonLat).unwrap()).unwrap();
+        let r = read_path(&asc).unwrap();
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
+        std::fs::write(dir.join("g.prj"), "not a coordinate system").unwrap();
+        let r = read_path(&asc).unwrap();
+        assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
+        let note = &r.lost[0];
+        assert!(note.starts_with("the .prj file: ") && note.contains("so it's read as WGS 84"), "{note}");
+        assert!(!note.contains("it doesn't say its coordinate system"), "{note}");
+        std::fs::write(&asc, "ncols 2\nnrows 1\nxllcorner 1000\nyllcorner 4000\ncellsize 1\n1 2\n").unwrap();
+        let error = read_path(&asc).unwrap_err().to_string();
+        assert!(error.contains("the .prj file:") && error.contains("unknown coordinate system"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What GDAL's conversion found (a coordinate system it assumed, variables it didn't add) stays
+    /// with the raster read from the converted file, whichever way it is read; a conversion that found
+    /// nothing says nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_converted_raster_keeps_what_converting_found() {
+        let dir = std::env::temp_dir().join(format!("rustgis-converted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gt = GeoTransform { origin_x: 10.0, origin_y: 41.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let made = Raster::new("g", 2, 1, vec![vec![1.0, 2.0]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let tif = dir.join("converted.tif");
+        std::fs::write(&tif, geotiff::write(&made, 0).unwrap()).unwrap();
+        let lossy = gdal::Converted {
+            path: tif.clone(),
+            subdataset: Some("temperature".into()),
+            others: vec!["pressure".into(), "wind".into()],
+            assumed_lonlat: true,
+        };
+        let r = read_converted(Path::new("/data/climate.nc"), &lossy).unwrap();
+        assert_eq!(r.lost.len(), 2, "{:?}", r.lost);
+        assert!(
+            r.lost.iter().any(|n| n.contains("doesn't say its coordinate system") && n.contains("WGS 84") && n.contains("\"crs\"")),
+            "{:?}",
+            r.lost
+        );
+        assert!(r.lost.iter().any(|n| n.contains("pressure") && n.contains("wind") && n.contains("\"layer\"")), "{:?}", r.lost);
+        // Past the 20 names shown, the count of the rest is said too.
+        let many = gdal::Converted {
+            path: tif.clone(),
+            subdataset: None,
+            others: (1..=35).map(|i| format!("band{i}")).collect(),
+            assumed_lonlat: false,
+        };
+        let r = read_converted(Path::new("/data/climate.nc"), &many).unwrap();
+        assert!(
+            r.lost
+                .iter()
+                .any(|n| n.contains("35 more variables") && n.contains("band20") && !n.contains("band21") && n.contains("and 15 more")),
+            "{:?}",
+            r.lost
+        );
+        let clean = gdal::Converted { path: tif, subdataset: None, others: Vec::new(), assumed_lonlat: false };
+        let r = read_converted(Path::new("/data/climate.nc"), &clean).unwrap();
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

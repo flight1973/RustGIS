@@ -173,10 +173,13 @@ GeoParquet and FlatGeobuf carry their coordinate system in the file. Rasters kee
 coordinate system and are reprojected as they draw. The map uses Web Mercator by default, but
 **View › Projection** can change it; see [Maps](maps.md).
 
-ESRI `.prj` files without an EPSG code use their projection parameters and, for ED50,
-Monte Mario (from Greenwich or from Rome), OSGB36, DHDN, Amersfoort, GGRS87, CH1903/CH1903+
-and S-JTSK, the same built-in Helmert datum transformation as the EPSG definition. In a `.prj`
-or other WKT:
+ESRI `.prj` files without an EPSG code use their projection parameters and, for ED50, Monte
+Mario (from Greenwich or from Rome), OSGB36, DHDN, Amersfoort, GGRS87, CH1903/CH1903+ and
+S-JTSK, the same built-in Helmert datum transformation as the EPSG definition. Other datums are
+recognized by the name Esri gives them (`D_Philippine_Reference_System_1992`, `D_Pulkovo_1942`,
+`D_Tokyo` and some 320 more) and take their EPSG definition's transformation, when all the EPSG
+systems on the datum share one Helmert transformation and the file's ellipsoid is the datum's
+own. In a `.prj` or other WKT:
 
 - A transformation in the file (a `TOWGS84`, or a WKT2 `BOUNDCRS`'s) takes precedence, also over
   the built-in one of an EPSG code in the WKT, as in PROJ and GDAL. It also takes precedence over
@@ -203,7 +206,18 @@ or other WKT:
   and a GeoPackage or FlatGeobuf system read by its EPSG code, say of these only the two above: a transformation that isn't
   applied, and a `BOUNDCRS` without one (typed WKT also says its projection method's formula, as
   below). A Zarr store's `crs` says them only when the slice uses it: a store that gives its own
-  system, or a longitude/latitude grid, doesn't. A PostGIS, MySQL or SQL Server layer's `crs` is
+  system, or a longitude/latitude grid, doesn't. A Zarr store whose axes are longitude/latitude is
+  read in the geographic system it gives (a datum such as ED50, or another body's, said once).
+  With no system, or a projected system on degree axes, it uses WGS 84 and says so once for a
+  slice or a point series. When the store gives no system, the notice names a caller's
+  non-WGS84 `crs` that is ignored on those axes; explicit WGS 84 is not an assumption.
+  A declared store system takes precedence over the caller's fallback. A PROJ definition that names an ellipsoid
+  and no datum shift says so, as a WKT's datum without one does. Point time series use the
+  geographic system too when locating a WGS 84 query. A web store's slice or a directory window
+  is kept in a project as a GeoTIFF; if its keys cannot preserve the declared system (such as
+  another body's or a custom datum shift), adding it is refused rather than relabelling it
+  WGS 84. Imported slices retain the read notices that the GeoTIFF cannot carry.
+  A PostGIS, MySQL or SQL Server layer's `crs` is
   read only for a geometry with no SRID of its own, by its EPSG code, with the same two notices; a
   geometry that has an SRID ignores it, so nothing is said of it. A DuckDB query's `crs` isn't
   read by RustGIS: it goes to DuckDB, which transforms the geometry from it even when the
@@ -1336,7 +1350,7 @@ by picking it. Local ASCII grids can be up to 1 GiB; ASCII-grid uploads are limi
 A TIFF or PNG without coordinates opens as a scan to place with **Georeference**; see
 [Supported Data Formats](data-formats.md). An ASCII grid takes its coordinate system from a `.prj`
 file next to it (as a Shapefile does); otherwise, and always for uploads, it must be in
-longitude/latitude degrees. On the desktop, a GDAL `.aux.xml` file next to a raster (`dem.tif.aux.xml`
+longitude/latitude degrees, and is read as WGS 84 with a notice. On the desktop, a GDAL `.aux.xml` file next to a raster (`dem.tif.aux.xml`
 or `dem.aux.xml`) names its bands from their descriptions, gives the no-data value when the file
 has none, and supplies the band statistics when only an overview of the raster is read. Its
 category names (GDAL's `SetCategoryNames`, one per value) label the classes in the legend of a
@@ -1370,8 +1384,12 @@ table, as land cover such as the NLCD is) or multiband, of any pixel type, tiled
 compressed with Deflate, LZW, PackBits, JPEG, Zstandard or LERC (alone, or wrapped in Deflate or
 Zstandard, as GDAL writes it; samples LERC marks invalid are no-data, and an alpha GDAL kept as
 LERC's mask is put back). JPEG-compressed YCbCr images are shown
-as RGB; other YCbCr and CMYK images aren't read. A rotated or skewed image is resampled to a
-north-up grid as it is read. The coordinate system is an EPSG code,
+as RGB; other YCbCr and CMYK images aren't read. A rotated or skewed image is resampled (nearest pixel)
+to a north-up grid as it is read, and a notice gives the grid's size and cell, and says when the cell had
+to be coarser than the file's original full-resolution cells to stay within the sample limit,
+including when an overview or every few pixels of the image were read. A GeoTIFF with no coordinate system whose
+coordinates fit in degrees is read as WGS 84 with a notice, as is one whose own projection can't be read
+(the notice says why); metres of a system that can't be read are refused. The coordinate system is an EPSG code,
 or the file's own projection described in its GeoKeys (Albers, Lambert conformal conic, transverse
 Mercator, Mercator, Lambert azimuthal, stereographic, equirectangular, sinusoidal and others), which an
 exported GeoTIFF keeps. A raster too large to hold in memory (more than 120 million samples, or
@@ -1462,6 +1480,24 @@ with its foot, so its walls come out gentler than they are: 25° to 40° suits i
 can start higher. Missing keys keep the current rock's (or those defaults), and `"rock": false`
 removes it; it is off by default and saved with the project only when set.
 
+**Ambient** and **Balanced light**, on a Shaded Relief layer (`raster.symbology` `"ambient"`, 0 to
+1, and `"balanced"`, true or false), set how the sun's light shades the colour. Each cell is drawn
+at `ambient × sky + (1 − ambient) × h × direct` of its colour, where `h` is how squarely it faces
+the sun (0 to 1), `sky` the share of the sky it sees (1 without sky visibility) and `direct` what
+cast shadows leave of the sun (1 without them); the fill light is added to that. So `ambient` is the
+share a slope turned fully from the sun keeps: lower draws deeper shadows. With the balanced light,
+`h` is divided by its value on flat ground (`sin altitude`), and the sum is held to at most 1.3
+before the fill light is added: flat ground that sees the whole sky is drawn in the ramp's own colour, the colour the legend
+shows, slopes turned to the sun brighten (each channel clamped to 255) and slopes turned away fall
+toward `ambient`. A sun within about 0.1° of the horizon lights no flat ground, so there the
+balanced light is drawn as the plain one, with its own ambient; below about 1° the picture changes
+sharply with small changes of altitude, so keep the sun higher with the balanced light. A layout's colour bar shows the
+colour of flat open ground, so with the balanced light it is the ramp itself; where sky visibility
+hides part of the sky, the ground is drawn darker than the bar. Left unset, `ambient` is
+0.25, as the relief was always drawn, or 0.5 with the balanced light, which keeps about the same
+contrast; `"ambient": null` goes back to that default. A Z factor of 1.5 to 2 suits the balanced
+light on 30 m data. Both are saved with the project only when set.
+
 With **Resampling** set to bilinear, a Shaded Relief layer's light (its hillshade, cast shadows,
 sky visibility and fill light) and its rock tint are blended between the cells' centres, as its
 values are, so a cell drawn over many pixels shades smoothly instead of in squares; nearest keeps
@@ -1523,7 +1559,7 @@ a few at a time, in the background.
 Stores are read in pure Rust, in the web app as well as on the desktop: Zarr 2 with consolidated
 metadata (`.zmetadata`, as xarray writes) and Zarr 3 (`zarr.json`, sharded arrays too), chunks
 compressed with blosc (LZ4, zlib or zstd, byte- or bit-shuffled), zlib, gzip, zstd or LZ4, of
-integer or float values, in C or Fortran order. A sharded array's shards are fetched whole, except in a window (below).
+integer or float values, in C or Fortran order. A sharded array's shards are fetched whole, except in a window (below) and in a series at a point (`zarr.series`), which reads each shard's index and then only the chunk holding the cell, by range.
 `_FillValue`, `missing_value` and a Zarr 2 array's fill value are no data; a Zarr 3 array's fill
 value isn't: chunks never written are left empty, but chunks missing from inside a shard show the
 fill value. `scale_factor` and `add_offset` are applied. The coordinates must be evenly spaced (a curvilinear grid isn't read);
@@ -1543,8 +1579,9 @@ the root's `spatial:dimensions` and the coordinates its dimensions name are then
 (`raster.zarrInfo` without one says so). The Add Data › Zarr dialog can't name a variable before
 it connects yet: give it the address of one array.
 Blosclz-compressed and transposed chunks and shards inside shards aren't read yet, and say so. A
-store by web address must allow the browser to fetch it (CORS) for the web app;
-Google Cloud's CMIP6 bucket does, ARCO-ERA5's doesn't (the desktop reads both).
+blosc or LZ4 chunk whose header claims more bytes than its data can make, or whose blocks lie
+outside it, is refused, naming the array. A store by web address must allow the browser to fetch it
+(CORS) for the web app; Google Cloud's CMIP6 bucket does, ARCO-ERA5's doesn't (the desktop reads both).
 
 ```sh
 rustgis-cli run --cmd 'layer.addZarr={"url":"https://storage.googleapis.com/gcp-public-data-arco-era5/ar/1959-2022-full_37-1h-0p25deg-chunk-1.zarr-v2","variable":"2m_temperature","index":{"time":539100}}'
@@ -1589,6 +1626,9 @@ point. Pick a Zarr layer, then **Pick a Point** on the map. A layer that follows
 gives its period, a slice the whole axis, and `"start"`/`"end"` any other. Only the chunks holding
 that point's cell are read. A store chunked one step at a time, such as ARCO-ERA5's map-oriented
 copy, reads a chunk per step: about 4,000 steps at most, so a long axis needs a shorter period.
+A sharded variable counts the chunks inside its shards the same way, since each one is its own
+request; each shard read also takes one request for its index, which the cap doesn't count, so a
+series with one step per shard makes about twice as many requests as it has steps.
 The chart draws up to six points as lines and marks the time slider's step, and a click on it
 takes the slider to that date. **Export CSV…** writes the date and value of each point.
 

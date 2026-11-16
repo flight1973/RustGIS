@@ -1548,7 +1548,7 @@ fn add_photos(s: &mut Session, p: &Value) -> CmdResult {
                         reader.leave_out(format!("{shown}: larger than {} MB", photo::MAX_BYTES >> 20))
                     }
                     // Read, parsed and thumbnailed, then the bytes are dropped before the next.
-                    Ok(_) => match std::fs::read(path) {
+                    Ok(_) => match rustgis_data::provenance::read(path) {
                         Ok(bytes) => reader.add(&shown, &bytes),
                         Err(e) => reader.leave_out(format!("{shown}: {e}")),
                     },
@@ -1630,8 +1630,26 @@ fn add_geodatabase(s: &mut Session, p: &Value, path: &str) -> CmdResult {
 
 /// Opens a file through its format's reader. A Shapefile CRS override is applied before any
 /// conversion in both whole-file and streamed paths; the source file is never rewritten.
+/// DBF picks with geometry follow the full Shapefile import path.
 fn add_data(s: &mut Session, p: &Value) -> CmdResult {
     let path = s_req(p, "path")?;
+    #[cfg(not(target_arch = "wasm32"))]
+    if Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("dbf")) {
+        if let Some(read) = super::reads::take::<WholeRead>(s, &dbf_shapefile_key(path)) {
+            if let Some(crs) = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()) {
+                super::parse_crs(s, crs)?;
+            }
+            return add_read(s, p, read?, None);
+        }
+        // A standalone table already read stays a table if a companion appears meanwhile.
+        if !super::reads::placed_for(s, &whole_key(path))
+            && let Some(shp) = rustgis_data::io::shapefile_for_dbf(Path::new(path))
+        {
+            let mut q = p.clone();
+            q["path"] = json!(shp.display().to_string());
+            return add_data(s, &q);
+        }
+    }
     let path = &*gdb_path(path);
     // `"as": "scan"` opens a TIFF, PNG or JPEG as a picture with no coordinates, a photo too.
     let scan = super::raster::wants_scan(p, path)?;
@@ -1673,7 +1691,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         && ["crs", "layer"].iter().any(|k| ps(p, k).is_some_and(|c| !c.trim().is_empty()))
         && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() <= rustgis_data::io::MAX_BYTES)
     {
-        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         if rustgis_data::io::is_cityjson(path, &bytes) {
             let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
             return add_layers(s, p, &full, &bytes, None, true);
@@ -1809,7 +1827,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
             return Err(format!("{path} is too large to open"));
         }
-        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
         return add_layers(s, p, &full, &bytes, None, true);
     }
@@ -1822,6 +1840,12 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
 
 /// A file Add Data reads whole: the features, and what reading them said.
 type WholeRead = Result<(rustgis_data::Dataset, rustgis_data::ReadReport), String>;
+
+/// A companion Shapefile read belongs to the initiating DBF pick even if the files go away.
+#[cfg(not(target_arch = "wasm32"))]
+fn dbf_shapefile_key(path: &str) -> String {
+    format!("dbf-shapefile:{path}")
+}
 
 /// The key Add Data's whole read of `path` is taken by (see [`super::reads`]).
 fn whole_key(path: &str) -> String {
@@ -1862,7 +1886,7 @@ fn is_city_model_path(path: &str) -> bool {
         return false;
     }
     let mut head = Vec::new();
-    std::fs::File::open(path)
+    rustgis_data::provenance::open(path)
         .and_then(|f| f.take(rustgis_data::citygml::HEAD_BYTES as u64).read_to_end(&mut head))
         .is_ok_and(|_| rustgis_data::citygml::looks_like_citygml(&head))
 }
@@ -1876,7 +1900,7 @@ fn read_layers_file(p: &Value, path: &str) -> LayersRead {
     if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
         return Err(format!("{path} is too large to open"));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty());
     let reads = match crs {
@@ -1899,9 +1923,12 @@ fn read_layers_file(p: &Value, path: &str) -> LayersRead {
 /// decoding and the bounded file read complete before cancellation can be observed.
 fn read_dxf_file(p: &Value, path: &str) -> LayersRead {
     use std::io::Read;
-    let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let file = rustgis_data::provenance::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut bytes = Vec::new();
-    file.take(rustgis_data::io::MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("{path}: {e}"))?;
+    (&file).take(rustgis_data::io::MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("{path}: {e}"))?;
+    if bytes.len() as u64 <= rustgis_data::io::MAX_BYTES {
+        rustgis_data::provenance::buffer(Path::new(path), &file, &bytes);
+    }
     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()).map(rustgis_data::raster::Crs::parse).transpose()?;
     Ok((full.clone(), dxf_reads(p, &full, &bytes, crs)?))
@@ -1936,7 +1963,7 @@ fn read_sheet_file(p: &Value, path: &str) -> WholeRead {
     if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
         return Err(format!("{path} is too large to open"));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
     // Read from disk: the table keeps the workbook's path, so an export can't replace it.
     let mut read = read_sheet(p, path, &bytes)?;
     read.0.source = Some(std::path::absolute(path).map_or_else(|_| path.to_string(), |a| a.display().to_string()));
@@ -1951,7 +1978,7 @@ fn read_whole(p: &Value, path: &str) -> WholeRead {
         if meta.len() > rustgis_data::io::MAX_BYTES {
             return Err(format!("{path} is too large to open"));
         }
-        std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+        rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))
     })?;
     if let Some(read) = delimited {
         return Ok(read);
@@ -2015,8 +2042,8 @@ fn read_synced(path: &str, read: impl FnOnce() -> WholeRead) -> WholeRead {
 
 /// Add Data's read of the file `p` names, made before it runs ([`super::reads`]): a raster read
 /// whole or converted by GDAL, a GeoJSON read whole, delimited text, a spreadsheet or a city model
-/// (CityJSON or CityGML) or DXF drawing read into its layers, a Shapefile read whole. `None` for
-/// any other file, which [`add_data`] reads as it adds it. Each is picked only where `add_data`
+/// (CityJSON or CityGML) or DXF drawing read into its layers, a Shapefile read whole, or a
+/// standalone dBASE table. `None` for any other file, which [`add_data`] reads as it adds it. Each is picked only where `add_data`
 /// takes that read, so a read made is never wasted; a few it makes whole are left to it (a `.json`
 /// with a coordinate system or layer given, a large GeoJSON that isn't a FeatureCollection).
 #[cfg(not(target_arch = "wasm32"))]
@@ -2024,6 +2051,11 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
     use super::reads::ahead;
     const NAME: &str = "Add Data";
     let path = gdb_path(ps(p, "path")?).into_owned();
+    if let Some(shp) = rustgis_data::io::shapefile_for_dbf(Path::new(&path)) {
+        let mut q = p.clone();
+        q["path"] = json!(shp.display().to_string());
+        return add_data_ahead(&q).map(|work| work.with_key(dbf_shapefile_key(&path)));
+    }
     let scan = super::raster::wants_scan(p, &path).ok()?;
     if !scan && rustgis_data::photo::is_photo_name(&path) && !rustgis_data::raster::world::places(Path::new(&path)) {
         return None;
@@ -2086,7 +2118,7 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
     if rustgis_data::sheets::is_sheet_name(&path) {
         return Some(ahead(NAME, key, move || read_sheet_file(&q, &path)));
     }
-    (geojson || is_delimited_name(&path)).then(|| ahead(NAME, key, move || read_whole(&q, &path)))
+    (geojson || is_delimited_name(&path) || lower.ends_with(".dbf")).then(|| ahead(NAME, key, move || read_whole(&q, &path)))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2445,7 +2477,7 @@ fn file_layers(s: &mut Session, p: &Value) -> CmdResult {
         if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
             return Err(format!("{path} is too large to open"));
         }
-        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         let layers = rustgis_data::sheets::sheet_names(&bytes).map_err(err)?;
         return Ok(json!({"count": layers.len(), "layers": layers}));
     }
@@ -2460,7 +2492,7 @@ fn file_layers(s: &mut Session, p: &Value) -> CmdResult {
         if meta.len() > rustgis_data::io::MAX_BYTES {
             return Err(format!("{path} is too large to open"));
         }
-        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         let layers = rustgis_data::dxf::layers(path, &bytes).map_err(err)?;
         return Ok(json!({"count": layers.len(), "layers": layers}));
     }
@@ -2473,7 +2505,7 @@ fn file_layers(s: &mut Session, p: &Value) -> CmdResult {
         if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
             return Err(format!("{path} is too large to open"));
         }
-        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         let zip = path.to_ascii_lowercase().ends_with(".zip");
         let layers: Vec<String> = match crs.filter(|_| zip || rustgis_data::io::is_city_model(path, &bytes)) {
             Some(crs) => {
@@ -3344,7 +3376,25 @@ pub(crate) fn add_converted(s: &mut Session, p: &Value, label: &str, original: &
         }
         let file = c.path.display().to_string();
         // One layer that can't be added doesn't stop the others.
-        let r = match add_source(s, &q, Origin::Path(&file), None) {
+        let added = match &c.origin {
+            ConvertedOrigin::Gdal(_) => {
+                rustgis_data::source::fgb::FgbSource::open_converted_path(&c.path, &c.name, Path::new(original), None)
+                    .map_err(|e| format!("{original}: {e}"))
+                    .and_then(|opened| add_source_with(s, &q, Origin::Path(&file), Some(Box::new(opened)), None))
+            }
+            ConvertedOrigin::Duckdb(d) => {
+                use rustgis_data::source::{duckdb::Database, parquet::ParquetSource};
+                let database = d.database.as_deref().map(Database::parse);
+                let original = match &database {
+                    Some(Database::File(path)) => Some(path.as_path()),
+                    _ => None,
+                };
+                ParquetSource::open_converted_path(&c.path, &c.name, original, None)
+                    .map_err(|e| format!("{file}: {e}"))
+                    .and_then(|opened| add_source_with(s, &q, Origin::Path(&file), Some(Box::new(opened)), None))
+            }
+        };
+        let r = match added {
             Ok(r) => r,
             Err(e) if !single => {
                 s.notify(format!("{}: {e}", c.name), true);
@@ -3608,18 +3658,18 @@ pub fn columns_in_file(path: &str, p: &Value) -> CmdResult {
         return Err(format!("{path} is too large to open"));
     }
     if rustgis_data::io::is_gzip_text_name(path) {
-        let reader = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+        let reader = rustgis_data::provenance::open(path).map_err(|e| format!("{path}: {e}"))?;
         let prefix = rustgis_data::io::gzip_text_prefix(reader, COLUMNS_PREFIX).map_err(|e| format!("{path}: {e}"))?;
         let plain = path.get(..path.len().saturating_sub(3)).unwrap_or(path);
         return gzip_columns(plain, &prefix, p);
     }
     let mut bytes = Vec::new();
-    let read = if sheet {
-        std::fs::File::open(path).and_then(|mut f| f.read_to_end(&mut bytes))
-    } else {
-        std::fs::File::open(path).and_then(|f| f.take(COLUMNS_PREFIX as u64).read_to_end(&mut bytes))
-    };
+    let mut file = rustgis_data::provenance::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let read = if sheet { file.read_to_end(&mut bytes) } else { (&file).take(COLUMNS_PREFIX as u64).read_to_end(&mut bytes) };
     read.map_err(|e| format!("{path}: {e}"))?;
+    if sheet {
+        rustgis_data::provenance::buffer(Path::new(path), &file, &bytes);
+    }
     columns_of(path, &bytes, p)
 }
 
@@ -4837,6 +4887,9 @@ pub struct WindowAsked {
     /// The bands the file must have, when the caller needs a number of them (checked from its
     /// header, before anything else is read).
     bands: Option<usize>,
+    /// Whether `cell` was worked out by the caller (not asked for by the user): a window whose full
+    /// image has finer cells than it is the intended read, not something to say.
+    auto_cell: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4846,7 +4899,13 @@ impl WindowAsked {
     /// with that box and `"cellSize"` reads it; a file without `bands` bands is refused from its
     /// header.
     pub(crate) fn of(url: &str, bbox: [f64; 4], cell: Option<f64>, bands: usize) -> WindowAsked {
-        WindowAsked { url: url.to_string(), bbox, cell, name: None, bands: Some(bands) }
+        WindowAsked { url: url.to_string(), bbox, cell, name: None, bands: Some(bands), auto_cell: false }
+    }
+    /// The cell size is the caller's own choice, not the user's: a full image finer than it is
+    /// read without saying so.
+    pub(crate) fn automatic(mut self) -> WindowAsked {
+        self.auto_cell = true;
+        self
     }
 }
 
@@ -4881,7 +4940,7 @@ fn window_settled(s: &Session, p: &Value, url: &str, seen: Option<[f64; 4]>) -> 
         Some(v) => Some(v.as_f64().filter(|c| c.is_finite() && *c > 0.0).ok_or_else(|| named("cellSize is a size above 0".into()))?),
     };
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(String::from);
-    Ok(WindowAsked { url: url.to_string(), bbox, cell, name, bands: None })
+    Ok(WindowAsked { url: url.to_string(), bbox, cell, name, bands: None, auto_cell: false })
 }
 
 /// A window the app reads off the frame: `p`, a `layer.addUrl` with `"bbox"` and its address bound
@@ -4924,6 +4983,13 @@ fn add_cog_window(s: &mut Session, p: &Value, url: &str) -> CmdResult {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_cog_window(asked: &WindowAsked) -> Result<CogWindow, String> {
     read_cog_window_until(asked, &std::sync::atomic::AtomicBool::new(false))
+}
+
+/// The cell size to say is finer than the file's own: the one asked, when no level has cells that
+/// small (`fits` false) and the user asked it (not `auto`, a size the caller worked out).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn finer_than_file(cell: Option<f64>, fits: bool, auto: bool) -> Option<f64> {
+    cell.filter(|_| !fits && !auto)
 }
 
 /// [`read_cog_window`]'s raster, giving up within a moment of `stop` being set (the app's Cancel of
@@ -5051,7 +5117,7 @@ pub(crate) fn read_window_raster(asked: &WindowAsked, stop: &std::sync::atomic::
     let fits =
         cell.and_then(|c| (0..layout.levels.len()).rev().find(|i| layout.levels.get(*i).is_some_and(|l| size_of(l) <= c * (1.0 + 1e-9))));
     let level = fits.unwrap_or(0);
-    let finer = cell.filter(|_| fits.is_none());
+    let finer = finer_than_file(cell, fits.is_some(), asked.auto_cell);
     let lv = layout.levels.get(level).ok_or_else(|| named("the file has no image".into()))?;
     let (c0, c1, r0, r1) = window(lv);
     if c1 <= c0 || r1 <= r0 {
@@ -5361,6 +5427,13 @@ fn window_box(s: &Session, p: &Value, seen: Option<[f64; 4]>) -> Result<[f64; 4]
     if w < e && so < n && lon(w) && lon(e) && lat(so) && lat(n) { Ok([w, so, e, n]) } else { Err(NEED.into()) }
 }
 
+/// A window's box as `layer.addUrl` settles it from `p`'s `"bbox"` (the view, or a box in degrees),
+/// for another command that reads windows.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn window_box_of(s: &Session, p: &Value) -> Result<[f64; 4], String> {
+    window_box(s, p, None)
+}
+
 /// `"bbox": "view"`, in any case or spacing.
 #[cfg(not(target_arch = "wasm32"))]
 fn is_view(bbox: Option<&Value>) -> bool {
@@ -5560,6 +5633,9 @@ pub(crate) fn add_read(
     let id = add_dataset(s, ds);
     if let Some(l) = s.map_mut().layer_mut(id) {
         l.synced = synced;
+        if let Some(x) = report.extrusion {
+            stand(l, &x);
+        }
     }
     if zoom.unwrap_or(empty_before)
         && let Some(e) = s.map().layer(id).map(|l| l.extent())
@@ -5567,6 +5643,20 @@ pub(crate) fn add_read(
         s.zoom_to(&e);
     }
     Ok(json!({"layer": id, "features": n}))
+}
+
+/// Extrudes a layer just added as its reader suggests (a city model's buildings and bridges): by
+/// its height field, on its base field, each only when it is numeric. A layer that isn't of
+/// polygons, or has no numeric height field, stays flat; the height where the field holds no number
+/// is 0, so an object with none stays flat too.
+fn stand(l: &mut rustgis_map::Layer, x: &rustgis_data::SuggestedExtrusion) {
+    if l.dataset.geometry_type != GeometryType::Polygon {
+        return;
+    }
+    let numeric = |n: &str| super::effects::numeric_field(&l.dataset, n).ok();
+    let Some(field) = numeric(&x.height_field) else { return };
+    let base_field = numeric(&x.base_field);
+    l.extrusion = Some(rustgis_map::effects::Extrusion { field: Some(field), base_field, ..Default::default() });
 }
 
 fn add_sample(s: &mut Session, p: &Value) -> CmdResult {
@@ -5697,6 +5787,14 @@ fn references_follow_layer(s: &mut Session, old: &str, new: &str) {
     // And its block's walls layer (#1914).
     if let Some(walls) = s.map_mut().view.terrain.as_mut().and_then(|t| t.block.as_mut()).and_then(|b| b.walls_layer.as_mut()) {
         replace(walls);
+    }
+    // And the lines point labels are turned square to (#2263).
+    for layer in &mut s.map_mut().layers {
+        for class in std::iter::once(&mut layer.labels.default).chain(layer.labels.classes.iter_mut()) {
+            if let Some(to) = &mut class.square_to {
+                replace(&mut to.layer);
+            }
+        }
     }
     // Elevation and Map Series selectors compare spellings exactly, even though lookup does not.
     if case_only {
@@ -5838,8 +5936,27 @@ pub(crate) fn drop_layers(s: &mut Session, ids: &[u32]) {
     m.release_tiles(ids);
     m.layers.retain(|l| !ids.contains(&l.id));
     terrain_follows_removal(s, &names);
+    square_labels_follow_removal(s, &names);
     for n in &names {
         legends_follow_layer(s, n, None);
+    }
+}
+
+/// After layers called `names` are removed: point labels turned square to one of them (#2263)
+/// keep its name, so a layer of that name brings their line back, and are placed as auto
+/// meanwhile: said once a layer, as for the terrain's water.
+fn square_labels_follow_removal(s: &mut Session, names: &[String]) {
+    for n in names {
+        let used = s.map().layers.iter().flat_map(|l| l.labels.in_order()).any(|c| {
+            c.placement == rustgis_map::LabelPlacement::Perpendicular
+                && c.square_to.as_ref().is_some_and(|t| t.layer.eq_ignore_ascii_case(n))
+        });
+        if used && named_layers(s, n) == 0 {
+            s.notify(
+                format!("Labels: the perpendicular labels' line layer '{n}' was removed, so they are placed as auto until a layer of that name comes back"),
+                false,
+            );
+        }
     }
 }
 
@@ -5897,6 +6014,7 @@ fn remove(s: &mut Session, p: &Value) -> CmdResult {
     let next = m.layers.get(at.min(m.layers.len().saturating_sub(1))).map(|l| l.id);
     s.set_layer_selection(next.into_iter().collect(), next);
     terrain_follows_removal(s, &names);
+    square_labels_follow_removal(s, &names);
     // A legend that left it out forgets it.
     for name in names {
         legends_follow_layer(s, &name, None);

@@ -97,15 +97,29 @@ release has no such file format. Current-writer examples do not replace these hi
 
 New project saves and map/layer exports write format 2. Their `requires` header names only
 features present in the saved payload: `terrain-block`, `terrain-water`,
-`shaded-relief-effects` (cast shadows, sky visibility, fill light or rock colour) and
+`shaded-relief-effects` (cast shadows, sky visibility, fill light or rock colour),
+`shaded-relief-light` (a Shaded Relief's ambient or balanced light) and
 `normalized-legend-urls` for normalized legend addresses. Project
-requirements include offline map snapshots. Earlier format-2 readers refuse unknown required
+requirements include offline map snapshots. `table-export-order` protects saved task commands,
+command notebook cells and replayable history using Export Table sort or limit options.
+Earlier format-2 readers refuse unknown required
 capabilities instead of opening and later saving away those settings; legacy format-1 files
 still open.
 
 Projects, model files and web tools that save a percent-slope function require `slope-percent`:
 an older reader must refuse them rather than run the saved function in degrees. Project
 requirements also cover executable task steps, replayable history and notebook command cells.
+The same saved containers require `tabulate-intersection-unit` for Tabulate Intersection
+with a non-default `areaUnit`, so older readers refuse instead of silently using km².
+Omitted units and explicit `km2` require nothing extra; omitted zone fields need no
+capability because older tools refuse them.
+
+Projects with a background on a layout element, or a saved task step, script, notebook command
+cell or history entry that gives one (`layout.addElement` or `layout.update` with a
+`background` other than `null`), require `layout-element-background`, so an older reader
+refuses them instead of opening the layout and saving it again, or running the command,
+without the background. Layout files (`.rgislayout`) carry no format header yet and are not
+covered (#2277).
 
 ## New dependencies
 

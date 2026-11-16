@@ -655,10 +655,11 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY)
                 }
-                crate::exprcomplete::expr_edit(ui, egui::Id::unique("cf_expression"), &mut app.dialogs.text, ds, style)
-                    .labelled_by(input_label.id);
+                let id = egui::Id::unique("cf_expression");
+                crate::exprcomplete::expr_edit(ui, id, &mut app.dialogs.text, ds, style).labelled_by(input_label.id);
+                // Read once no suggestion is offered: a word still being chosen isn't an error yet.
                 let text = app.dialogs.text.trim();
-                let reads = data(app).filter(|_| !text.is_empty()).map(|d| rustgis_engine::cmd::edit::check_calculation(text, d));
+                let reads = data(app).filter(|_| !text.is_empty() && !crate::exprcomplete::offering(ui, id)).map(|d| rustgis_engine::cmd::edit::check_calculation(text, d));
                 if let Some(Err(e)) = reads {
                     let t = Tokens::get(ui.ctx());
                     ui.label(egui::RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", &e)])).small().color(t.red));
@@ -2310,20 +2311,27 @@ pub(crate) fn expr_menus(ui: &mut egui::Ui, text: &mut String) {
     });
 }
 
-/// Buttons that add one of `fields` (the first 24), an operator, a function or a variable to the
-/// clause `text`, as Select By Attributes and the Layer Properties pane's Query tab offer them.
+/// The most fields a clause's buttons offer (a wider table is typed).
+const MAX_FIELD_CHIPS: usize = 40;
+
+/// Buttons that add one of `fields` (the first [`MAX_FIELD_CHIPS`]), as the expression names it
+/// (`"Pop Est"` in quotes), an operator, a function or a variable to the clause `text`: the one
+/// row Select By Attributes, the Layer Properties pane's Query tab and a label class's SQL query
+/// offer. A field an earlier one shadows (`name` after `Name`: the expression reads the first,
+/// letter case aside) gets no button, as the completion list doesn't offer it.
 pub(crate) fn field_chips(ui: &mut egui::Ui, fields: &[rustgis_engine::data::Field], text: &mut String) {
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(tl!("Fields:")).small().weak());
-        for f in fields.iter().take(24) {
+        let named = fields.iter().enumerate().filter(|(i, f)| !fields.iter().take(*i).any(|g| g.name.eq_ignore_ascii_case(&f.name)));
+        for (_, f) in named.take(MAX_FIELD_CHIPS) {
             if ui.small_button(&f.name).clicked() {
-                add_word(text, &f.name);
+                add_word(text, &crate::exprcomplete::field_ref(&f.name));
             }
         }
     });
     // Wrapped, as the fields are: a narrow pane (the Query tab) would cut the last ones off.
     ui.horizontal_wrapped(|ui| {
-        for op in ["=", "<>", ">", "<", "LIKE", "AND", "OR", "IS NULL"] {
+        for op in ["=", "<>", ">", "<", ">=", "<=", "LIKE", "IN", "IS NULL", "AND", "OR", "NOT"] {
             if ui.small_button(op).clicked() {
                 add_word(text, op);
             }
@@ -2734,6 +2742,35 @@ fn calculation_fields(dataset: &rustgis_engine::data::Dataset) -> impl Iterator<
 mod tests {
     use super::*;
 
+    /// A clause's buttons add a field as the expression names it (`"Pop Est"` in quotes, a plain
+    /// name as it is), and every operator, `>=` and `NOT` among them; at most `MAX_FIELD_CHIPS`
+    /// fields are offered, and none an earlier one shadows (`POP` after `pop`), which takes no
+    /// place among them.
+    #[test]
+    fn the_buttons_add_a_field_as_the_expression_names_it() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::{Field, FieldType};
+        let mut fields =
+            vec![Field::new("Pop Est", FieldType::Integer), Field::new("pop", FieldType::Integer), Field::new("POP", FieldType::Integer)];
+        fields.extend((0..MAX_FIELD_CHIPS).map(|i| Field::new(format!("f{i}"), FieldType::Integer)));
+        // Without the interface fonts (`theme::install_fonts`) egui's faces have no "▾".
+        let mut h = egui_kittest::Harness::builder()
+            .allow_missing_glyphs()
+            .build_ui_state(move |ui, text: &mut String| field_chips(ui, &fields, text), String::new());
+        h.run();
+        for button in ["Pop Est", ">=", "pop", "AND", "NOT", "IN"] {
+            h.get_by_role_and_label(Role::Button, button).click();
+            h.run();
+        }
+        assert_eq!(h.state(), "\"Pop Est\" >= pop AND NOT IN ");
+        assert!(h.query_by_role_and_label(Role::Button, "POP").is_none(), "a shadowed field");
+        let last = format!("f{}", MAX_FIELD_CHIPS - 3);
+        assert!(h.query_by_role_and_label(Role::Button, &last).is_some(), "the first {MAX_FIELD_CHIPS} fields");
+        let past = format!("f{}", MAX_FIELD_CHIPS - 2);
+        assert!(h.query_by_role_and_label(Role::Button, &past).is_none(), "no more");
+    }
+
     /// A scale's commas go only where they group thousands: a decimal comma is left for the
     /// command to refuse, not read as a bigger number.
     #[test]
@@ -2849,6 +2886,33 @@ mod tests {
         h.run();
         assert!(h.query_by_role_and_label(Role::Label, "round(x[, places])").is_none(), "the signature closed");
         assert_eq!(h.state().dialogs.open, Some("calculateField"), "Escape took the signature, not the dialog");
+    }
+
+    /// A word still being chosen from the suggestions isn't called invalid: `pop_` (with
+    /// `pop_est` offered) shows no error; `pop_x`, which nothing matches, does.
+    #[test]
+    fn calculate_field_reads_the_expression_once_no_suggestion_is_offered() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::new(Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addDataText", json!({"fileName": "pops.csv", "text": "pop_est,name\n1,a\n"})).unwrap();
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        let id = app.session.project.tables[0].id;
+        app.run("ui.dialog", json!({"name": "calculateField", "table": id})).unwrap();
+        let mut h = app_harness(app);
+        h.run_steps(3);
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("cf_expression")));
+        h.run();
+        // Counted, as the Field box may show `pop_est` too.
+        let shown = |h: &egui_kittest::Harness<'static, RustGisApp>| h.query_all_by_role_and_label(Role::Button, "pop_est").count();
+        h.event(egui::Event::Text("pop_".into()));
+        h.run();
+        let offered = shown(&h);
+        assert!(h.query_by_label_contains("Invalid:").is_none(), "no error while it is offered");
+        h.event(egui::Event::Text("x".into()));
+        h.run();
+        assert_eq!(shown(&h) + 1, offered, "the field was offered, and no longer is");
+        assert!(h.query_by_label_contains("no field named 'pop_x'").is_some(), "the error once nothing is");
     }
 
     /// The app in a harness, its fonts installed on the first pass (the dialog draws on the next).

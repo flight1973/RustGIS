@@ -36,7 +36,7 @@ pub fn commands() -> Vec<C> {
         C::new("layer.addDataBytes", "Add Data (from file contents)", "Home › Add", add_bytes).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k|.dxf (JPEG 2000: desktop, through GDAL)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "blocks"?, "stream"?, "as"? (as layer.addData)}"#),
         C::new("raster.symbology", "Symbology", "Style › Rendering", symbology).when(need_raster).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "rock"?: {"from"?: 0..90, "to"?: 0..90, "color"?: #RRGGBB} | false (shadedRelief: steep slopes tinted toward a rock colour before the light, from the ground's own slope in degrees, without the Z factor: the ramp below from, the colour above to, blended between; left out, kept; an object's missing keys keep the current rock's, or 25, 40 and #B2ACA4; false or null removes it), "grey"?: bool (shadedRelief without its colour ramp)}"#,
+            r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "ambient"?: 0..1|null (shadedRelief: the share of the colour a slope turned fully from the sun keeps; left out, kept; null, the default: 0.25, or 0.5 balanced), "balanced"?: bool (shadedRelief: flat ground keeps the ramp's colour and slopes facing the sun brighten, up to 1.3; left out, kept; false, the default, lights as before), "rock"?: {"from"?: 0..90, "to"?: 0..90, "color"?: #RRGGBB} | false (shadedRelief: steep slopes tinted toward a rock colour before the light, from the ground's own slope in degrees, without the Z factor: the ramp below from, the colour above to, blended between; left out, kept; an object's missing keys keep the current rock's, or 25, 40 and #B2ACA4; false or null removes it), "grey"?: bool (shadedRelief without its colour ramp)}"#,
         ),
         C::new("raster.stretch", "Stretch Type", "Style › Rendering", stretch).inputs(stretch_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_raster)
@@ -620,13 +620,8 @@ pub(crate) fn add_gdal_path(s: &mut Session, p: &Value, path: &str) -> CmdResult
         Some(read) => read,
         None => read_gdal(path, text("layer"), text("crs")),
     }?;
-    if c.assumed_lonlat {
-        s.notify(format!("{path} doesn't say its coordinate system; its coordinates look like longitude/latitude, so it's read as WGS 84 (give \"crs\" if not)"), false);
-    }
-    if !c.others.is_empty() {
-        let shown: Vec<&str> = c.others.iter().take(20).map(String::as_str).collect();
-        s.notify(format!("{path} has more variables ({}): add one with \"layer\"", shown.join(", ")), false);
-    }
+    // What converting found (a system GDAL assumed, variables not added) is in `r.lost`
+    // ([`raster::read_converted`]), said once with the layer's other losses by `read_notices`.
     let name = text("name").map(str::to_string).unwrap_or_else(|| r.name.clone());
     // A project names the file itself, with the subdataset and coordinate system chosen, and
     // converts it again (from the cache, while it is there) when it opens.
@@ -723,6 +718,11 @@ pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: V
     if rustgis_data::source::is_source_name(&name) {
         return super::layer::add_source(s, p, super::layer::Origin::Bytes(&name, std::sync::Arc::new(bytes)), zoom);
     }
+    // A standalone dBASE table is binary too, and uses the usual non-spatial table path.
+    if name.to_ascii_lowercase().ends_with(".dbf") {
+        let read = rustgis_data::io::read_bytes(&name, &bytes).map_err(|e| e.to_string())?;
+        return super::layer::add_read(s, p, read, zoom);
+    }
     if name.to_ascii_lowercase().ends_with(".gz") && !rustgis_data::io::is_gzip_text_name(&name) {
         return Err(format!("{name}: decompress it first, then add the supported file inside"));
     }
@@ -802,10 +802,13 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
                 RasterRenderer::Colormap
             }
             "shadedrelief" | "hillshade" => {
-                // Left out, a Shaded Relief keeps its own shadows, sky, fill light and rock; a new one has none.
-                let (cur_shadow, cur_sky, cur_fill, cur_rock) = match rl.style.renderer {
-                    RasterRenderer::ShadedRelief { shadow, sky, fill, rock, .. } => (shadow, sky, fill, rock),
-                    _ => (0.0, 0.0, 0.0, None),
+                // Left out, a Shaded Relief keeps its own shadows, sky, fill light, rock, ambient
+                // and balanced light; a new one has none (and the default ambient).
+                let (cur_shadow, cur_sky, cur_fill, cur_rock, cur_ambient, cur_balanced) = match rl.style.renderer {
+                    RasterRenderer::ShadedRelief { shadow, sky, fill, rock, ambient, balanced, .. } => {
+                        (shadow, sky, fill, rock, ambient, balanced)
+                    }
+                    _ => (0.0, 0.0, 0.0, None, None, false),
                 };
                 RasterRenderer::ShadedRelief {
                     band: bi,
@@ -820,6 +823,13 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
                         None => cur_rock,
                         Some(v) => relief_rock(v, cur_rock)?,
                     },
+                    // null goes back to the default, which follows `balanced`.
+                    ambient: match p.get("ambient") {
+                        None => cur_ambient,
+                        Some(Value::Null) => None,
+                        Some(_) => Some(f(p, "ambient").ok_or("\"ambient\" must be a number from 0 to 1, or null")?.clamp(0.0, 1.0)),
+                    },
+                    balanced: b(p, "balanced").unwrap_or(cur_balanced),
                 }
             }
             other => return Err(format!("unknown raster symbology '{other}'")),

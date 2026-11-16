@@ -93,11 +93,12 @@ pub fn unsupported_table_counts_bytes(bytes: &[u8]) -> Result<Vec<(String, u64)>
     let mut copy = tempfile::NamedTempFile::new()?;
     copy.write_all(bytes)?;
     copy.flush()?;
-    unsupported_table_counts(copy.path())
+    crate::provenance::without(|| unsupported_table_counts(copy.path()))
 }
 
 fn open_db(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(err)?;
+    crate::provenance::sqlite(path);
     // A cap on SQLite's page cache, so a huge database can't take all the memory; and the file is
     // hostile: nothing it defines (views, triggers, generated columns) may call functions, and
     // nothing writes.
@@ -137,8 +138,11 @@ impl GpkgSource {
     pub fn open(path: &Path, layer: Option<&str>) -> Result<Self> {
         // The identity is taken before the database is opened: a file put in its place after
         // this leaves it describing the file opened, which a traversal then refuses to swap.
-        let id = file_identity(path);
-        Self::open_conn(open_db(path)?, layer, None, id)
+        // Made absolute first, so the file opened and the path kept for a traversal are one even
+        // if the working directory changes in between.
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let id = file_identity(&path);
+        Self::open_conn(open_db(&path)?, &path, layer, None, id)
     }
 
     /// Opens a GeoPackage held in memory, through a temporary copy (SQLite reads files). The copy
@@ -152,7 +156,9 @@ impl GpkgSource {
             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
             let salt = std::collections::hash_map::RandomState::new();
             let tag = std::hash::BuildHasher::hash_one(&salt, (nanos, N.fetch_add(1, Ordering::Relaxed)));
-            let p = std::env::temp_dir().join(format!("rustgis-{}-{tag:016x}.gpkg", std::process::id()));
+            let p = std::path::absolute(std::env::temp_dir())
+                .unwrap_or_else(|_| std::env::temp_dir())
+                .join(format!("rustgis-{}-{tag:016x}.gpkg", std::process::id()));
             let mut o = std::fs::OpenOptions::new();
             o.write(true).create_new(true);
             // Readable by this user only: the copy holds their data, in a shared folder.
@@ -170,7 +176,7 @@ impl GpkgSource {
         }
         drop(f);
         let id = file_identity(&p);
-        match open_db(&p).and_then(|c| Self::open_conn(c, layer, Some(p.clone()), id)) {
+        match crate::provenance::without(|| open_db(&p)).and_then(|c| Self::open_conn(c, &p, layer, Some(p.clone()), id)) {
             Ok(s) => Ok(s),
             Err(e) => {
                 let _ = std::fs::remove_file(&p);
@@ -182,7 +188,9 @@ impl GpkgSource {
     /// Opens a feature table (`layer`, else the first) on an open database from its metadata,
     /// noting what reading changes: an unknown coordinate system, other tables, Z or M values
     /// dropped. `id` is the file's identity taken before it was opened.
-    fn open_conn(conn: Connection, layer: Option<&str>, temp: Option<PathBuf>, id: Option<(u64, u64)>) -> Result<Self> {
+    /// `path` is the file as the caller named it, made absolute. SQLite's own name for it resolves symbolic links
+    /// (macOS's temporary folder `/var` is `/private/var`), so it isn't the path to record.
+    fn open_conn(conn: Connection, path: &Path, layer: Option<&str>, temp: Option<PathBuf>, id: Option<(u64, u64)>) -> Result<Self> {
         let tables = feature_tables(&conn)?;
         let table = match layer {
             Some(l) => tables
@@ -307,7 +315,7 @@ impl GpkgSource {
             notes,
             zm_dropped: false,
         };
-        let file = conn.path().filter(|p| !p.is_empty()).map(|p| (PathBuf::from(p), id));
+        let file = Some((path.to_path_buf(), id));
         let mut src = GpkgSource { info, conn: Mutex::new(Some(conn)), table, geom, pk, rtree, reproject, temp, file };
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = src.peek_kind();
@@ -432,6 +440,12 @@ impl FeatureSource for GpkgSource {
     /// Samples native-envelope matches, or decoded view matches when the native box is refused.
     /// Scans count records and check Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
+        if self.temp.is_none()
+            && let Some((path, id)) = &self.file
+            && file_identity(path) == *id
+        {
+            crate::provenance::sqlite(path);
+        }
         let limit = clamp_limit(req.limit);
         let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
         let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;
@@ -548,7 +562,8 @@ impl FeatureSource for GpkgSource {
             Ok(())
         };
         same_file()?;
-        let conn = open_db(path)?;
+        // An upload's SQLite copy is generated; its bytes were supplied by the caller.
+        let conn = if self.temp.is_some() { crate::provenance::without(|| open_db(path)) } else { open_db(path) }?;
         same_file()?;
         let req = Request { extent, limit: usize::MAX };
         let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));

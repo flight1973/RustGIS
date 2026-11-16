@@ -12,7 +12,7 @@ use crate::GpRecord;
 mod capabilities;
 #[path = "project_label_losses.rs"]
 pub(crate) mod label_losses;
-pub(crate) use capabilities::{layer_file_bytes, map_file_bytes, model_uses_percent_slope};
+pub(crate) use capabilities::{layer_file_bytes, map_file_bytes, model_capabilities};
 
 /// A map export cannot keep runtime-only download reservations, even in a larger project.
 pub(crate) fn ensure_map_imports_complete(map: &Map) -> Result<(), String> {
@@ -70,8 +70,18 @@ pub const FORMAT: u32 = 2;
 pub const READ_FORMAT: u32 = 2;
 /// The saved additions this RustGIS understands. Writers require only capabilities used by
 /// their payload, so a format-2 reader without them refuses instead of discarding their fields.
-pub const CAPABILITIES: &[&str] =
-    &["terrain-block", "terrain-water", "shaded-relief-effects", "normalized-legend-urls", "field-origin", "slope-percent"];
+pub const CAPABILITIES: &[&str] = &[
+    "terrain-block",
+    "terrain-water",
+    "shaded-relief-effects",
+    "normalized-legend-urls",
+    "field-origin",
+    "slope-percent",
+    "shaded-relief-light",
+    "table-export-order",
+    "tabulate-intersection-unit",
+    "layout-element-background",
+];
 /// The most entries a document's `requires` may list: past it the document is refused without
 /// the rest being read.
 pub(crate) const MAX_REQUIRES: usize = 256;
@@ -1405,6 +1415,13 @@ impl Project {
                 // The camera is in the lost projection's units: start from the whole world.
                 m.camera = rustgis_map::Camera::world();
             }
+            // A terrain water's glint from 0 to 1, as `map.terrain` checks it: another value (a hand
+            // edit, or a newer file) is brought into that range, and said.
+            if let Some(w) = m.view.terrain.as_mut().and_then(|t| t.water.as_mut()) {
+                let g = w.glint;
+                w.glint = if g.is_finite() { g.clamp(0.0, 1.0) } else { rustgis_map::view::WATER_GLINT };
+                done.water_glint.add(usize::from(w.glint != g), &m.name);
+            }
             m.camera.clamp();
             // The time slider's window and dated tile addresses, before the addresses are checked.
             m.apply_time();
@@ -1828,12 +1845,12 @@ pub(crate) fn read_file(path: &Path, max: u64) -> Result<Vec<u8>, String> {
         return Err(too_large());
     }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|f| f.take(max.saturating_add(1)).read_to_end(&mut bytes))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let file = rustgis_data::provenance::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    (&file).take(max.saturating_add(1)).read_to_end(&mut bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     if bytes.len() as u64 > max {
         return Err(too_large());
     }
+    rustgis_data::provenance::buffer(path, &file, &bytes);
     Ok(bytes)
 }
 
@@ -1986,6 +2003,7 @@ struct Repaired {
     content_images: Tally,
     content_settings: Tally,
     projection_lost: Tally,
+    water_glint: Tally,
     /// A map whose projection was lost has bookmarks, which stay in that projection's units.
     bookmarks_kept: bool,
     tile_addresses: Tally,
@@ -2100,6 +2118,12 @@ impl Repaired {
         );
         let t = &self.group_parents;
         say(ReadPart::Maps, t, message("{n} group(s) with an invalid parent moved to the top level {when} (in {places})", t, vec![]));
+        let t = &self.water_glint;
+        say(
+            ReadPart::Maps,
+            t,
+            message("{n} terrain water glint(s) outside 0 to 1 brought into that range {when} (in {places})", t, vec![]),
+        );
         let t = &self.projection_lost;
         let bookmarks = if self.bookmarks_kept {
             NoticeText::term("; their bookmarks are still in the old projection's units")
@@ -2168,7 +2192,7 @@ pub(crate) fn layout_notices(
     let adjusted = total(|r| r.elements_adjusted);
     if adjusted > 0 {
         notices.push(format!(
-            "{name}: {adjusted} layout element(s) with a value out of range, a repeated id, an over-long name or a missing map frame reference repaired {when} (in {})",
+            "{name}: {adjusted} layout element(s) with a value out of range, a repeated id, an over-long name, a missing map frame reference or a background on a map frame repaired {when} (in {})",
             layout_names(repairs, |r| r.elements_adjusted)
         ));
     }
