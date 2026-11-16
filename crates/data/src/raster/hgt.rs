@@ -84,8 +84,8 @@ pub(super) fn post_transform(west: f64, south: f64, rows: usize, dx: f64, dy: f6
 }
 
 /// The step at which a `w` × `h` grid fits in `max` samples: 1, or the smallest power of two
-/// whose every-`step`-th sample does ([`super::read_scan`] reduces pictures the same way). `None`
-/// when none does.
+/// whose every-`step`-th sample does ([`super::read_scan`] reduces pictures with it too). `None`
+/// when none does, up to a step of 2^20.
 pub(super) fn step_within(w: usize, h: usize, max: usize) -> Option<usize> {
     let mut k = 1usize;
     while w.div_ceil(k).saturating_mul(h.div_ceil(k)) > max {
