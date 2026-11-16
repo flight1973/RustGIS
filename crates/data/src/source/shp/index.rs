@@ -206,16 +206,17 @@ impl DiskIndex {
 pub(super) struct Index {
     storage: Storage,
     pub count: u64,
-    /// The union of the records' finite boxes (rounded outward to f32): `None` when no record has
-    /// one (every shape null or empty, or a coordinate that isn't a number).
+    /// The union of the records' usable boxes (rounded outward to f32): `None` when no record has
+    /// one (every shape null or empty, or every box not one: [`not_a_box`]).
     pub bounds: Option<[f32; 4]>,
-    /// Records with a shape whose box isn't one ([`not_a_box`]): left out of `bounds` and of the
-    /// R-tree, and said.
+    /// Records whose box isn't one ([`not_a_box`]): left out of `bounds` and of every read by
+    /// area (the R-tree and the scan alike), and said.
     pub unboxed: u32,
 }
 
-/// Whether `b` is a record's box that isn't one: a shape there (not null or empty, whose box is
-/// NaN), but a corner that isn't a number or is past f32's range (`record_box`).
+/// Whether `b` is a record's box that isn't one: a record there (not a null or empty shape, whose
+/// box is NaN), but a corner that isn't a number or is past f32's range, a box that's backwards,
+/// or a record that can't be read (`record_box`).
 fn not_a_box(b: [f32; 4]) -> bool {
     !usable(b) && !b.iter().all(|v| v.is_nan())
 }
@@ -294,10 +295,12 @@ impl Index {
         match &self.storage {
             Storage::Disk(disk) => disk.visit(extent, limit, visit),
             Storage::Scan { path, len } => {
+                // By area, only a record whose box is one ([`usable`]), as the disk index's R-tree
+                // takes it: a backwards box, say, isn't read by area on either path.
                 let matches = |b: [f32; 4]| {
                     extent.is_none_or(|[x0, y0, x1, y1]| {
-                        let [a, b, x, y] = b;
-                        a <= x1 && x >= x0 && b <= y1 && y >= y0
+                        let [a, by, x, y] = b;
+                        usable(b) && a <= x1 && x >= x0 && by <= y1 && y >= y0
                     })
                 };
                 let mut matched = 0u64;
