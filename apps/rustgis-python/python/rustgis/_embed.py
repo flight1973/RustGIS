@@ -31,7 +31,7 @@ EMBED_LIMIT = 2 << 20
 
 # The extensions `layer.addDataBytes` reads from a file's contents.
 _EMBEDDABLE = {
-    ".tif", ".tiff", ".asc", ".geojson", ".json", ".csv", ".tsv", ".txt", ".zip", ".kml", ".kmz",
+    ".tif", ".tiff", ".asc", ".hgt", ".dt0", ".dt1", ".dt2", ".geojson", ".json", ".csv", ".tsv", ".txt", ".zip", ".kml", ".kmz",
     ".gpx", ".parquet", ".geoparquet", ".fgb", ".gpkg", ".mbtiles", ".xlsx", ".xls", ".ods",
 }
 

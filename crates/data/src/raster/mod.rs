@@ -10,6 +10,7 @@ pub mod ascii;
 pub mod cog;
 pub mod cogwrite;
 pub mod crs;
+pub mod dted;
 pub(crate) mod epsg_axes;
 mod epsg_gap;
 mod esri;
@@ -17,6 +18,7 @@ mod esri_datums;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
 pub mod geotiff;
+pub mod hgt;
 mod image_grid;
 mod lerc;
 mod lzw;
@@ -94,8 +96,9 @@ pub fn max_samples() -> usize {
 }
 /// Largest ASCII grid file read (1 GiB).
 pub const MAX_ASCII_BYTES: u64 = 1 << 30;
-/// File extensions read as rasters.
-pub const READ_EXTENSIONS: &[&str] = &["tif", "tiff", "asc", "png", "jpg", "jpeg"];
+/// File extensions read as rasters. SRTM height tiles (`.hgt`) and DTED (`.dt0`–`.dt2`) are
+/// read natively ([`hgt`], [`dted`]), on the desktop and in the browser.
+pub const READ_EXTENSIONS: &[&str] = &["tif", "tiff", "asc", "png", "jpg", "jpeg", "hgt", "dt0", "dt1", "dt2"];
 
 /// Whether a file name is a raster this module reads.
 pub fn is_raster_name(name: &str) -> bool {
@@ -1205,6 +1208,20 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
             let text = crate::provenance::read_to_string(path)?;
             read_ascii(path, &text, &name, sidecar_nodata)?
         }
+        // Elevation, read whole once its name and size are checked: an SRTM tile's size says its
+        // grid, and a DTED file is no larger than its largest cell.
+        "hgt" | "dt0" | "dt1" | "dt2" => {
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if ext == "hgt" {
+                hgt::check(file_name, meta.len())?;
+                hgt::read(file_name, &crate::provenance::read(path)?)?
+            } else {
+                if meta.len() > dted::MAX_BYTES {
+                    return Err(DataError::Format("DTED: the file is larger than any DTED cell".into()));
+                }
+                dted::read(file_name, &crate::provenance::read(path)?)?
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         _ if gdal::is_gdal_raster_name(&path.to_string_lossy()) => {
             // Converted once to a GeoTIFF in the cache; the layer still names this file.
@@ -1625,6 +1642,9 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
             let text = std::str::from_utf8(bytes).map_err(|_| DataError::Format("not a text file".into()))?;
             ascii::read(text, &name, None)
         }
+        // An upload keeps its file name, which places an SRTM tile.
+        "hgt" => hgt::read(file_name, bytes),
+        "dt0" | "dt1" | "dt2" => dted::read(file_name, bytes),
         other => Err(DataError::Unsupported(format!(".{other}"))),
     }
 }

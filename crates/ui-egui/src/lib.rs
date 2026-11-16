@@ -4093,6 +4093,10 @@ impl RustGisApp {
                             "tif",
                             "tiff",
                             "asc",
+                            "hgt",
+                            "dt0",
+                            "dt1",
+                            "dt2",
                         ][..],
                         // Rasters GDAL reads (every one it is asked to read).
                         #[cfg(not(target_arch = "wasm32"))]
