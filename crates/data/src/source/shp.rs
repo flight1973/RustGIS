@@ -166,12 +166,13 @@ impl ShpSource {
             notes.push("the .shp has no shapes to frame: its header's box isn't used, and the layer has no extent".into());
         }
         // Records whose box isn't one (a coordinate that isn't a number or past f32's range, a box
-        // that's backwards, or a record that can't be read) are left out of the extent (and of
-        // the spatial index): said, with how many, and when nothing else frames the layer, so.
+        // that's backwards, or a record that can't be read) are left out of the extent and of
+        // every read by area (the R-tree and the scan alike): said, with how many, and when
+        // nothing else frames the layer, so.
         if index.unboxed > 0 {
             let none = if native.is_none() { ", so the layer has no extent" } else { "" };
             notes.push(format!(
-                "{} shape(s) have no usable bounding box (a coordinate that isn't a number or is out of range, a box that's backwards, or a record that can't be read): they're left out of the layer's extent{none}",
+                "{} shape(s) have no usable bounding box (a coordinate that isn't a number or is out of range, a box that's backwards, or a record that can't be read): they're left out of the layer's extent and of reads by area{none}",
                 index.unboxed
             ));
         }
@@ -452,18 +453,22 @@ fn record_box(c: &[u8]) -> [f32; 4] {
             (Some(x), Some(y)) => [x, y, x, y],
             _ => return NOT_A_BOX,
         },
-        Some(t @ (3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28 | 31)) => {
+        // A multipatch, which the reader doesn't read, frames nothing it draws: counted.
+        Some(t @ (3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28)) => {
             // The counts follow the box: a multipoint's points at 36, else the parts at 36 and
-            // the points at 40. A record too short to hold them can't be read; a shape of no
-            // points, or no parts (an empty geometry some writers give a 0, 0, 0, 0 box), has
-            // nothing to frame.
-            let counts = if matches!(t, 8 | 18 | 28) { [le_i32(c, 36), Some(1)] } else { [le_i32(c, 36), le_i32(c, 40)] };
-            let [Some(a), Some(b)] = counts else { return NOT_A_BOX };
-            if a <= 0 || b <= 0 {
+            // the points at 40. A record too short to hold them, or a count below 0, can't be
+            // read; a shape of no points, or no parts (an empty geometry some writers give a 0,
+            // 0, 0, 0 box), has nothing to frame.
+            let (parts, points) = if matches!(t, 8 | 18 | 28) { (Some(1), le_i32(c, 36)) } else { (le_i32(c, 36), le_i32(c, 40)) };
+            let (Some(parts), Some(points)) = (parts, points) else { return NOT_A_BOX };
+            if parts < 0 || points < 0 {
+                return NOT_A_BOX;
+            }
+            if parts == 0 || points == 0 {
                 return NONE;
             }
             match (le_f64(c, 4), le_f64(c, 12), le_f64(c, 20), le_f64(c, 28)) {
-                (Some(a), Some(b), Some(x), Some(y)) => [a, b, x, y],
+                (Some(x0), Some(y0), Some(x1), Some(y1)) => [x0, y0, x1, y1],
                 _ => return NOT_A_BOX,
             }
         }

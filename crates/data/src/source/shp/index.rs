@@ -13,7 +13,7 @@ struct DiskIndex {
     pub count: u64,
     covered: u32,
     bounds: Option<[f32; 4]>,
-    /// Records with a shape whose box isn't one ([`not_a_box`]), left out of `bounds`.
+    /// Records whose box isn't one ([`not_a_box`]): left out of `bounds` and of the R-tree.
     unboxed: u32,
     _lease: super::cache::Lease,
 }
@@ -34,10 +34,10 @@ impl DiskIndex {
         use super::cache;
         use crate::source::external::{fnv1a, stamp};
         let canonical = path.canonicalize()?;
-        let signature = format!("shp-index-v4:{canonical:?}:{:?}", stamp(path)?);
+        let signature = format!("shp-index-v5:{canonical:?}:{:?}", stamp(path)?);
         let mut dir = cache::index_dir();
         let budget = cache::index_budget();
-        let key = format!("{:016x}-{:016x}", fnv1a(format!("shp-index-v4:{canonical:?}").as_bytes()), fnv1a(signature.as_bytes()));
+        let key = format!("{:016x}-{:016x}", fnv1a(format!("shp-index-v5:{canonical:?}").as_bytes()), fnv1a(signature.as_bytes()));
         let pinned = cache::pin_index(&dir, &key, budget).or_else(|_| {
             dir = cache::index_fallback_dir();
             cache::pin_index(&dir, &key, budget)
@@ -107,7 +107,7 @@ impl DiskIndex {
             })?
         };
         // Do not retain an index built while the original file was being replaced/edited.
-        if signature != format!("shp-index-v4:{canonical:?}:{:?}", stamp(path)?) {
+        if signature != format!("shp-index-v5:{canonical:?}:{:?}", stamp(path)?) {
             return Err(bad("the .shp changed while its spatial index was being built"));
         }
         let bounds_json = serde_json::to_string(&all_bounds).map_err(|e| bad(e.to_string()))?;

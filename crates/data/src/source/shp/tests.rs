@@ -107,22 +107,26 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
         assert_eq!(s.info().extent, Extent::new(11.0, 21.0, 12.0, 22.0));
         assert!(has(&s, SET_ASIDE) && !has(&s, "not longitude/latitude"), "{:?}", s.info().notes);
         assert!(has(&s, &format!("1 shape(s) {UNBOXED}")), "{:?}", s.info().notes);
-        // Opened again from its cached index (the indexes as they were, so reused, not built
-        // again; a reuse only renews its lease), it says the same.
-        let cached = || {
-            let mut files: Vec<_> = std::fs::read_dir(folder.join("cache"))
+        // Opened again from its cached index, it says the same: a probe table written into every
+        // index there is still there after, so the index was reused, not built again.
+        let indexes = || {
+            std::fs::read_dir(folder.join("cache"))
                 .unwrap()
                 .flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "sqlite"))
-                .map(|e| (e.path(), e.metadata().and_then(|m| m.modified()).ok()))
-                .collect();
-            files.sort();
-            files
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "sqlite"))
+                .collect::<Vec<_>>()
         };
         drop(s);
-        let before = cached();
+        for index in indexes() {
+            rusqlite::Connection::open(&index).unwrap().execute_batch("CREATE TABLE reuse_probe(value INTEGER)").unwrap();
+        }
         let s = open(&p);
-        assert_eq!(cached(), before, "the cached index reused");
+        let probed = |index: &Path| {
+            let db = rusqlite::Connection::open(index).unwrap();
+            db.query_row("SELECT count(*) FROM sqlite_master WHERE name='reuse_probe'", [], |r| r.get::<_, i64>(0)).unwrap() == 1
+        };
+        assert!(indexes().iter().all(|i| probed(i)), "the cached index reused");
         assert!(has(&s, &format!("1 shape(s) {UNBOXED}")), "from the cache: {:?}", s.info().notes);
         // Every record null (its shape type, at 108 + 28 per record, set to 0): no extent, not
         // Null Island. Under the 0, 0, 0, 0 box writers give such a file, nothing to say; under a
@@ -214,7 +218,8 @@ fn an_empty_shape_has_no_box() {
     assert!(none(record_box(&record(3, &[0, 0]))), "an empty line");
     assert!(none(record_box(&record(8, &[0]))), "an empty multipoint");
     assert!(none(record_box(&record(5, &[0, 4]))), "a polygon of no parts");
-    assert!(none(record_box(&record(5, &[1, -1]))), "a count that can't be");
+    assert!(unread(record_box(&record(5, &[1, -1]))), "a count that can't be");
+    assert!(unread(record_box(&record(31, &[1, 4]))), "a multipatch, which isn't read");
     assert!(unread(record_box(&record(5, &[]))), "a polygon too short for its counts");
     assert!(unread(record_box(&record(5, &[1]))), "a polygon too short for its points' count");
     assert!(unread(record_box(&record(8, &[]))), "a multipoint too short for its count");
