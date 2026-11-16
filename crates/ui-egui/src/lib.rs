@@ -4093,11 +4093,9 @@ impl RustGisApp {
                             "tif",
                             "tiff",
                             "asc",
-                            "hgt",
-                            "dt0",
-                            "dt1",
-                            "dt2",
                         ][..],
+                        // SRTM height tiles and DTED, read natively.
+                        &rustgis_engine::data::raster::ELEVATION_EXTENSIONS[..],
                         // Rasters GDAL reads (every one it is asked to read).
                         #[cfg(not(target_arch = "wasm32"))]
                         rustgis_engine::data::raster::gdal::EXTENSIONS,

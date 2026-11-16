@@ -143,8 +143,17 @@ fn void_note(voids: u64, total: u64, value: i16) -> Option<String> {
 /// Largest ASCII grid file read (1 GiB).
 pub const MAX_ASCII_BYTES: u64 = 1 << 30;
 /// File extensions read as rasters. SRTM height tiles (`.hgt`) and DTED (`.dt0`–`.dt2`) are
-/// read natively ([`hgt`], [`dted`]), on the desktop and in the browser.
+/// read natively ([`hgt`], [`dted`]), on the desktop and in the browser: the last four are
+/// [`ELEVATION_EXTENSIONS`] (a test holds them to it).
 pub const READ_EXTENSIONS: &[&str] = &["tif", "tiff", "asc", "png", "jpg", "jpeg", "hgt", "dt0", "dt1", "dt2"];
+/// The extensions of the elevation files read natively: SRTM height tiles and DTED levels 0–2.
+pub const ELEVATION_EXTENSIONS: [&str; 4] = ["hgt", "dt0", "dt1", "dt2"];
+
+/// Whether a file name is an SRTM height tile's or a DTED file's ([`ELEVATION_EXTENSIONS`]).
+pub fn is_elevation_name(name: &str) -> bool {
+    let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    ELEVATION_EXTENSIONS.contains(&ext.as_str())
+}
 
 /// Whether a file name is a raster this module reads.
 pub fn is_raster_name(name: &str) -> bool {
@@ -1256,7 +1265,7 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
         }
         // Elevation, read whole once its name and size are checked: an SRTM tile's size says its
         // grid, and a DTED file is no larger than its largest cell.
-        "hgt" | "dt0" | "dt1" | "dt2" => {
+        e if ELEVATION_EXTENSIONS.contains(&e) => {
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
             if ext == "hgt" {
                 hgt::check(file_name, meta.len())?;
@@ -1404,8 +1413,7 @@ fn read_path_with_placing(path: &Path, subdataset: Option<&str>, crs: Option<&st
 /// without them. A command may give them, and so may a project saved when these files went
 /// through GDAL. `None` for other files, or when neither is given.
 pub fn elevation_ignores(name: &str, subdataset: Option<&str>, crs: Option<&str>) -> Option<String> {
-    let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    if !matches!(ext.as_str(), "hgt" | "dt0" | "dt1" | "dt2") {
+    if !is_elevation_name(name) {
         return None;
     }
     let given = |v: Option<&str>| v.is_some_and(|v| !v.trim().is_empty());
@@ -1707,7 +1715,7 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
         }
         // An upload keeps its file name, which places an SRTM tile.
         "hgt" => hgt::read(file_name, bytes),
-        "dt0" | "dt1" | "dt2" => dted::read(file_name, bytes),
+        e if ELEVATION_EXTENSIONS.contains(&e) => dted::read(file_name, bytes),
         other => Err(DataError::Unsupported(format!(".{other}"))),
     }
 }
@@ -1881,6 +1889,16 @@ fn extent_of(transform: &GeoTransform, transformer: &Transformer, width: u32, he
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn elevation_files_are_raster_names() {
+        for ext in ELEVATION_EXTENSIONS {
+            assert!(READ_EXTENSIONS.contains(&ext), "{ext}");
+            assert!(is_raster_name(&format!("/d/N37W122.{}", ext.to_uppercase())), "{ext}");
+            assert!(is_elevation_name(&format!("x.{ext}")), "{ext}");
+        }
+        assert!(!is_elevation_name("x.tif") && !is_elevation_name("hgt") && !is_elevation_name(""));
+    }
 
     /// A large band's statistics, counted on any number of threads, are those of one pass on
     /// one thread (#1252) to the bit: the sums in the band's order, the counts, range, histogram
