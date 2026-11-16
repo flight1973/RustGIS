@@ -185,7 +185,8 @@ impl Geometry {
     }
 
     /// Rings, holes included, that loop around a pole without being cut at ±180°
-    /// ([`rustgis_geom::ring_pole_turns`]).
+    /// ([`rustgis_geom::ring_pole_turns`]), their coordinates read as longitude and latitude: a
+    /// ring that was never in degrees, with an edge more than 180 long in x, counts too.
     pub fn pole_loop_rings(&self) -> usize {
         match self {
             Geometry::Polygon(polys) => polys.iter().flatten().filter(|r| rustgis_geom::ring_pole_turns(r) != 0).count(),

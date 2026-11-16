@@ -470,13 +470,15 @@ pub fn ring_area_is_ambiguous(ring: &[Coord]) -> bool {
 /// RustGIS takes for a polygon around a pole, reaches the pole and gives 0; so does any ring whose
 /// steps cancel. A loop such as a parallel written all the way round (`[0, 80]`, `[30, 80]`, …,
 /// `[330, 80]`) gives ±1, and the analysis plane, which reads longitude and latitude as x and y,
-/// sees it as a line with no area. 0 for a ring with fewer than three vertices or a coordinate
-/// that isn't finite or lies past ±90° of latitude.
+/// sees it as a line with no area. 0 for a ring with fewer than three vertices, a coordinate that
+/// isn't finite or lies past ±90° of latitude, or a vertex at a pole.
 ///
-/// Only the coordinates are read, as longitude and latitude, as the analysis reads every layer:
-/// a ring of other x and y read so (a projected layer taken for degrees) more than 180 wide can
-/// wind too. The triangle `[0, 0]`, `[300, 0]`, `[150, 80]` steps -60°, -150° and -150° the short
-/// way, so it gives -1 though as x and y it's a plain triangle.
+/// Only the coordinates are read, as longitude and latitude, as the analysis reads every layer (a
+/// layer with a coordinate system is read into them): a ring whose x and y were never degrees (a
+/// layer with no coordinate system, in small units, taken for degrees) winds too when an edge of it
+/// runs more than 180 in x. The triangle `[0, 0]`, `[300, 0]`, `[150, 80]` steps -60°, -150° and
+/// -150° the short way, so it gives -1 though as x and y it's a plain triangle; a ring as wide
+/// with no edge longer than 180 doesn't wind.
 pub fn ring_pole_turns(ring: &[Coord]) -> i64 {
     if ring.len() < 3 || !ring.iter().all(|c| c.is_finite() && c.y.abs() <= 90.0) || ring.iter().any(|c| at_pole(c.y)) {
         return 0;
@@ -1855,11 +1857,15 @@ mod tests {
         }
         assert_eq!(ring_pole_turns(&missing), 0, "a coordinate missing");
         assert_eq!(ring_pole_turns(&[Coord::new(0.0, 80.0), Coord::new(180.0, 80.0)]), 0, "too short");
-        // Coordinates are read as longitude and latitude, whatever they were meant as: a plain
-        // triangle of x and y more than 180 wide winds once when its steps are taken the short way.
+        // Coordinates are read as longitude and latitude, as the analysis reads every layer: a plain
+        // triangle of x and y with an edge more than 180 long winds once when its steps are taken
+        // the short way. As degrees that's what it does, so this records the reading, not a slip.
         let wide = [(0.0, 0.0), (300.0, 0.0), (150.0, 80.0), (0.0, 0.0)];
         assert_eq!(ring_pole_turns(&wide.map(|(x, y)| Coord::new(x, y))), -1);
-        // The same triangle within 180 doesn't.
+        // As wide, but no edge longer than 180: no winding. Nor within 180.
+        let stepped =
+            [(0.0, 0.0), (100.0, 0.0), (200.0, 0.0), (300.0, 0.0), (300.0, 10.0), (200.0, 10.0), (100.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&stepped.map(|(x, y)| Coord::new(x, y))), 0);
         let narrow = [(0.0, 0.0), (150.0, 0.0), (75.0, 80.0), (0.0, 0.0)];
         assert_eq!(ring_pole_turns(&narrow.map(|(x, y)| Coord::new(x, y))), 0);
     }
