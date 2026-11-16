@@ -1032,6 +1032,7 @@ const MAX_URL_REQUESTS: usize = 16;
 
 /// A finished tool run, held until `gp.finish` applies it.
 pub(crate) struct PendingRun {
+    pub(crate) inputs: Vec<rustgis_data::provenance::Fingerprint>,
     pub(crate) continuation: policy::Continuation,
     pub id: u64,
     pub tool: String,
@@ -1599,6 +1600,7 @@ impl Session {
     /// Shared command bookkeeping for ordinary dispatch and execution of an already pinned retry.
     pub(crate) fn command_epilogue(&mut self, id: &str, params: &Value, run: impl FnOnce(&mut Self) -> CmdResult) -> CmdResult {
         let outermost = self.depth == 0;
+        let _inputs = (outermost && self.log.on()).then(rustgis_data::provenance::Capture::start);
         #[cfg(not(target_arch = "wasm32"))]
         let _diagnostic_scope = self.requests_into.as_ref().map_or_else(|| self.diagnostics.enter(), |c| c.enter());
         #[cfg(target_arch = "wasm32")]
@@ -1667,7 +1669,7 @@ impl Session {
                         };
                         let project = (project_log::kept_name(&self.title()), self.opened);
                         let e = project_log::entry(project, id, params, partial, &res, at, start.elapsed());
-                        if joins && res.is_ok() { self.log.join_last(e) } else { self.log.push(e) }
+                        self.log_entry(e, joins && res.is_ok());
                     }
                 }));
                 if logged.is_err() {
@@ -2189,7 +2191,8 @@ impl Session {
     /// read, and why; and what the header of a cloud-optimised GeoTIFF drawn as a tile layer
     /// leaves out, once that header lands (each date's file of a dated series as it is shown).
     /// Once for each layer's pixels, failure or file, one notice of each kind; the app calls it
-    /// each frame.
+    /// each frame. Also reports streamed vector read failures once, naming their linked file
+    /// and how to repair it when one is available.
     pub fn notice_landed_rasters(&mut self) {
         cmd::terrain_blocks::landed(self);
         self.notice_landed_pixels();
@@ -2203,8 +2206,25 @@ impl Session {
         // once, keeping the same counted notice channel as retained resident expressions.
         let mut landed = Vec::new();
         let mut dates = Vec::new();
+        let mut source_errors = Vec::new();
+        let mut source_error_count = 0;
         for map in &mut self.project.maps {
             for layer in &mut map.layers {
+                // Only a source with a local file is said here; others keep their error for their own reports.
+                if let Some(source) = &mut layer.source
+                    && source.linked_file().is_some()
+                    && let Some(error) = source.error_unsaid()
+                    && let Some(path) = source.linked_file()
+                {
+                    source_error_count += 1;
+                    // Keep a moved folder's notice readable, marking every failure said.
+                    if source_errors.len() < 5 {
+                        source_errors.push(notice_text::NoticeText::format(
+                            "{name}: {path} ({error})",
+                            [("name", layer.name.clone().into()), ("path", path.to_string().into()), ("error", error.into())],
+                        ));
+                    }
+                }
                 // Values in date fields that weren't dates, once for a layer read in place.
                 let (unread, rounded) = layer.source.as_mut().map(|source| source.take_unread_dates()).unwrap_or_default();
                 if let Some(note) = unread {
@@ -2229,6 +2249,9 @@ impl Session {
         }
         for note in dates {
             self.notify(note, false);
+        }
+        if let Some(message) = notice_text::NoticeText::source_errors(source_error_count, source_errors, source_error_count) {
+            self.notify_text(message, true);
         }
         let (mut lost, mut held, mut failed, mut dropped) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for m in &mut self.project.maps {
