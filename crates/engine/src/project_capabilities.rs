@@ -87,8 +87,11 @@ fn relief_effects(layer: &Layer) -> bool {
 }
 
 fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static str> {
-    let (mut block, mut water, mut relief, mut legends) = (false, false, false, false);
+    let (mut block, mut water, mut relief, mut legends, mut heights) = (false, false, false, false, false);
     for map in maps {
+        // Heights are saved with the features of a 3-D layer; a reader without them would open
+        // its 2-D shapes and lose the heights when saving again.
+        heights |= map.layers.iter().any(|l| !l.dataset.windowed && l.dataset.has_z());
         if let Some(t) = &map.view.terrain {
             block |= t.block.is_some();
             water |= t.water.is_some();
@@ -98,10 +101,16 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
             tile.legends.iter().any(|legend| rustgis_data::login_address::inner(&legend.url).len() > rustgis_map::tiles::MAX_LEGEND_URL)
         });
     }
-    [(block, "terrain-block"), (water, "terrain-water"), (relief, "shaded-relief-effects"), (legends, "normalized-legend-urls")]
-        .into_iter()
-        .filter_map(|(used, name)| used.then_some(name))
-        .collect()
+    [
+        (block, "terrain-block"),
+        (water, "terrain-water"),
+        (relief, "shaded-relief-effects"),
+        (legends, "normalized-legend-urls"),
+        (heights, "feature-heights"),
+    ]
+    .into_iter()
+    .filter_map(|(used, name)| used.then_some(name))
+    .collect()
 }
 
 #[derive(Serialize)]

@@ -3,7 +3,7 @@
 //! Corrections. Every feature edit goes through [`apply`], which enforces the layer's design.
 
 use rustgis_data::value::PastClasses;
-use rustgis_data::{Feature, FieldType, Geometry, GeometryType, Value};
+use rustgis_data::{Feature, FieldType, Geom, Geometry, GeometryType, GeometryZ, Value};
 use rustgis_geom::{
     Aeqd, Coord, MAX_LAT, POLE_TOLERANCE, SphericalMean, haversine_m, lonlat_to_merc, lonlat_to_plane, merc_to_lonlat, plane_to_lonlat,
 };
@@ -533,17 +533,21 @@ pub fn commands() -> Vec<C> {
         .when(need_editable_selection)
         .params(r#"{"factor": number}"#),
         C::new("edit.flip", "Flip Line", "Edit › Features › Modify", |s, _| {
-            modify(s, |_, g| match g {
-                Geometry::Line(parts) => Ok(Some(Geometry::Line(parts.iter().rev().map(|p| p.iter().rev().copied().collect()).collect()))),
-                _ => Ok(None),
-            })
+            // Written once for both kinds of position: a height reverses with its point.
+            fn flipped<C: Copy>(g: &Geom<C>) -> Option<Geom<C>> {
+                match g {
+                    Geom::Line(parts) => Some(Geom::Line(parts.iter().rev().map(|p| p.iter().rev().copied().collect()).collect())),
+                    _ => None,
+                }
+            }
+            modify_z(s, |_, g| Ok(flipped(g)), flipped)
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_editable_selection),
         C::new("edit.setGeometry", "Set Geometry", "Edit › Features › Modify", set_geometry).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_editable)
             .params(r#"{"layer"?, "row": number, "geometry": GeoJSON geometry}"#),
         C::new("edit.vertex", "Edit Vertex", "Edit › Features › Modify", edit_vertex).roles(&[]).effects(crate::policy::Effects::NONE).when(need_editable).params(
-            r#"{"layer"?, "row": number, "action": "move"|"insert"|"delete", "part"?: number, "ring"?: number, "index": number (insert: the vertex the new one follows), "lon"?, "lat"?}"#,
+            r#"{"layer"?, "row": number, "action": "move"|"insert"|"delete", "part"?: number, "ring"?: number, "index": number (insert: the vertex the new one follows), "lon"?, "lat"?, "z"?: number (move, in a layer with heights; default: the vertex's own)}"#,
         ),
         C::new("edit.merge", "Merge", "Edit › Features › Modify", merge).roles(&[]).effects(crate::policy::Effects::NONE).when(need_editable_selection),
         C::new("edit.moveSharedVertex", "Move Shared Vertex", "Edit › Features › Modify", shared_vertex::run).roles(&[]).effects(crate::policy::Effects::NONE).when(need_editable).params(
@@ -1067,18 +1071,38 @@ fn move_features(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry
 }
 
 /// Applies a geometry change to every selected feature of every layer (in the selection's layers).
-fn modify(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>) -> CmdResult {
-    let mut n = 0;
+/// The change is made in 2-D: a feature with heights loses them, and a notice says so.
+fn modify(s: &mut Session, change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>) -> CmdResult {
+    modify_z(s, change, |_| None)
+}
+
+/// [`modify`], with `change_z` the same change made to a feature's geometry with heights, keeping
+/// each height with its point. Where it gives `None`, the change is made in 2-D and the feature's
+/// heights are dropped, with a notice.
+fn modify_z(
+    s: &mut Session,
+    mut change: impl FnMut((u32, usize), &Geometry) -> Result<Option<Geometry>, String>,
+    change_z: impl Fn(&GeometryZ) -> Option<GeometryZ>,
+) -> CmdResult {
+    let (mut n, mut dropped) = (0, 0usize);
     let ids: Vec<u32> = s.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster()).map(|l| l.id).collect();
     for id in ids {
         let mut changes = Vec::new();
         let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
         for r in l.selection.clone() {
             let Some(f) = l.dataset.features.get_mut(r) else { continue };
+            if let Some(z) = f.geometry_z().and_then(&change_z) {
+                super::edit::validate(&z.to_2d())?;
+                let before = f.clone();
+                f.set_geometry_z(z);
+                changes.push(Change { before: Some(before), row: Some(r) });
+                n += 1;
+                continue;
+            }
             let Some(g) = f.geometry.as_ref().map(|g| change((id, r), g)).transpose()?.flatten() else { continue };
             super::edit::validate(&g)?;
             let before = f.clone();
-            f.geometry = Some(g);
+            dropped += usize::from(f.set_geometry_2d(Some(g)));
             changes.push(Change { before: Some(before), row: Some(r) });
             n += 1;
         }
@@ -1088,7 +1112,15 @@ fn modify(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry) -> Re
     if n == 0 {
         return Err("nothing selected can be changed this way".into());
     }
+    heights_dropped_notice(s, dropped);
     Ok(json!({"modified": n}))
+}
+
+/// Says that `n` features lost their heights to a change made in 2-D.
+fn heights_dropped_notice(s: &mut Session, n: usize) {
+    if n > 0 {
+        s.warn(format!("{n} feature(s) lost their heights (Z): this change is made in 2-D, so their shapes have x and y only now"));
+    }
 }
 
 fn set_geometry(s: &mut Session, p: &Json) -> CmdResult {
@@ -1119,15 +1151,37 @@ fn edit_vertex(s: &mut Session, p: &Json) -> CmdResult {
         }
         Ok(Coord::new(lon, lat))
     };
-    let g = s
-        .map()
-        .layer(id)
-        .and_then(|l| l.dataset.features.get(row))
-        .ok_or("no such row")?
-        .geometry
-        .clone()
-        .ok_or("the feature has no shape")?;
-    let (g, v) = match ps(p, "action").ok_or("action is required")? {
+    let feature = s.map().layer(id).and_then(|l| l.dataset.features.get(row)).ok_or("no such row")?;
+    let action = ps(p, "action").ok_or("action is required")?;
+    // A feature with heights is edited in 3-D: a moved vertex keeps its height (or takes `z`), an
+    // inserted one takes the height along the edge it is put on.
+    if let Some(z) = feature.geometry_z() {
+        let (z, v) = match action {
+            "move" => {
+                let old = z.vertex(v).ok_or("no such vertex")?;
+                let height = match p.get("z") {
+                    None | Some(Json::Null) => old.z,
+                    Some(h) => h.as_f64().filter(|h| h.is_finite()).ok_or("z must be a number")?,
+                };
+                let c = at()?;
+                (z.move_vertex(v, rustgis_data::CoordZ::new(c.x, c.y, height)).ok_or("no such vertex")?, v)
+            }
+            "insert" => {
+                let c = at()?;
+                let height = z.height_on_edge(v, c).ok_or("vertices can only be inserted in lines and polygons")?;
+                let z = z
+                    .insert_vertex(v, rustgis_data::CoordZ::new(c.x, c.y, height))
+                    .ok_or("vertices can only be inserted in lines and polygons")?;
+                (z, rustgis_data::VertexId::new(v.part, v.ring, v.index + 1))
+            }
+            "delete" => (z.delete_vertex(v)?, v),
+            a => return Err(format!("unknown action '{a}'")),
+        };
+        replace_geometry_z(s, id, row, z)?;
+        return Ok(json!({"part": v.part, "ring": v.ring, "index": v.index}));
+    }
+    let g = feature.geometry.clone().ok_or("the feature has no shape")?;
+    let (g, v) = match action {
         "move" => (g.move_vertex(v, at()?).ok_or("no such vertex")?, v),
         "insert" => {
             let g = g.insert_vertex(v, at()?).ok_or("vertices can only be inserted in lines and polygons")?;
@@ -1149,7 +1203,23 @@ pub(crate) fn replace_geometry(s: &mut Session, id: u32, row: usize, g: Geometry
     }
     let f = l.dataset.features.get_mut(row).ok_or("no such row")?;
     let before = f.clone();
-    f.geometry = Some(g);
+    let dropped = f.set_geometry_2d(Some(g));
+    l.touch_geometry();
+    apply(s, id, vec![Change { before: Some(before), row: Some(row) }])?;
+    heights_dropped_notice(s, usize::from(dropped));
+    Ok(())
+}
+
+/// Replaces a feature's shape with heights, as one edit.
+fn replace_geometry_z(s: &mut Session, id: u32, row: usize, g: GeometryZ) -> Result<(), String> {
+    super::edit::validate(&g.to_2d())?;
+    if !g.is_finite() {
+        return Err("every vertex needs a finite height".into());
+    }
+    let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+    let f = l.dataset.features.get_mut(row).ok_or("no such row")?;
+    let before = f.clone();
+    f.set_geometry_z(g);
     l.touch_geometry();
     apply(s, id, vec![Change { before: Some(before), row: Some(row) }])
 }

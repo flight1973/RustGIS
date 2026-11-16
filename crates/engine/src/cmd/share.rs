@@ -776,6 +776,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     let extent = if chunks.is_some() { l.extent() } else { ds.extent() };
     let mut notes = rustgis_data::export_notes([(ds, extent)], path, crs);
     coalesce_read_zm(&mut notes, path, ds, &unreadable);
+    notes.extend(rustgis_data::z_export_note(ds, &ext, path));
     if asked.is_none() {
         notes.extend(rustgis_data::io::default_export_note(ds, path));
     }

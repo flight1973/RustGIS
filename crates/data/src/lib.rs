@@ -534,6 +534,36 @@ pub fn zm_export_note<'a>(layers: impl IntoIterator<Item = &'a Dataset>, target:
     }
 }
 
+/// Whether an export to a file with extension `ext` writes heights: GeoJSON only, so far.
+pub fn writes_z(ext: &str) -> bool {
+    matches!(ext.to_ascii_lowercase().as_str(), "geojson" | "json")
+}
+
+/// What an export of 3-D layer `ds` to `target`, a file with extension `ext`, says of its
+/// heights, or `None` for a 2-D layer: that the format doesn't hold them, or how many features
+/// were written without them because an edit or tool changed their shape in 2-D.
+pub fn z_export_note(ds: &Dataset, ext: &str, target: &str) -> Option<String> {
+    if !ds.has_z() {
+        return None;
+    }
+    if !writes_z(ext) {
+        return Some(format!(
+            "{target}: {} has heights (Z), which RustGIS writes only to GeoJSON so far, so this file has x and y only",
+            ds.name
+        ));
+    }
+    match ds.features_without_z() {
+        0 => None,
+        1 => {
+            Some(format!("{target}: 1 feature of {} was written without heights: its shape was changed in 2-D since it was read", ds.name))
+        }
+        n => Some(format!(
+            "{target}: {n} features of {} were written without heights: their shapes were changed in 2-D since they were read",
+            ds.name
+        )),
+    }
+}
+
 /// `3 layers (a, b, c)`: the count, and the first five names.
 fn layer_list(names: &[&str]) -> String {
     let shown = names.iter().take(5).copied().collect::<Vec<_>>().join(", ");
@@ -717,6 +747,16 @@ impl Dataset {
         }
     }
 
+    /// Makes a 3-D layer 2-D as it is read: every feature's heights dropped, counted in `report`
+    /// as [`Dataset::drop_zm`] says them. Nothing for a 2-D layer.
+    pub(crate) fn flatten_z(&mut self, report: &mut ReadReport) {
+        if !self.has_z() {
+            return;
+        }
+        let dropped = self.features.iter_mut().map(Feature::drop_z).filter(|had| *had).count();
+        self.drop_zm(report, dropped);
+    }
+
     /// Creates an empty, complete dataset whose coordinates are assumed to be WGS 84.
     pub fn new(name: impl Into<String>, geometry_type: GeometryType, fields: Vec<Field>) -> Self {
         Dataset {
@@ -819,6 +859,60 @@ impl Dataset {
         v.truncate(limit);
         v.sort_by(order);
         (v.into_iter().map(|(t, _)| t.into_text()).collect(), value::PastClasses { features, by_number })
+    }
+}
+
+#[cfg(test)]
+mod heights_tests {
+    use super::*;
+
+    /// What heights cost in memory (64-bit): 2-D positions are as before, a feature grows by the
+    /// pointer to its heights, and a 3-D position holds its height beside its x and y.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn sizes() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<Coord>(), 16);
+        assert_eq!(size_of::<CoordZ>(), 24);
+        assert_eq!(size_of::<Geometry>(), size_of::<GeometryZ>());
+        assert_eq!(size_of::<Feature>(), 72);
+        assert_eq!(size_of::<Dataset>(), 112);
+    }
+
+    #[test]
+    fn heights_left_behind_by_a_2d_change_read_as_lost() {
+        let z = Geom::Line(vec![vec![CoordZ::new(0.0, 0.0, 1.0), CoordZ::new(1.0, 0.0, 2.0)]]);
+        let mut f = Feature::new_z(1, z.clone(), vec![]);
+        assert_eq!(f.geometry_z(), Some(&z));
+        assert!(!f.lost_z());
+        // Reversed in 2-D, as code that knows nothing of heights would: the heights don't follow.
+        if let Some(Geom::Line(parts)) = &mut f.geometry {
+            parts[0].reverse();
+        }
+        assert!(f.geometry_z().is_none() && f.lost_z());
+        // Set again in 3-D, they fit.
+        let flipped = Geom::Line(vec![vec![CoordZ::new(1.0, 0.0, 2.0), CoordZ::new(0.0, 0.0, 1.0)]]);
+        f.set_geometry_z(flipped.clone());
+        assert_eq!(f.geometry_z(), Some(&flipped));
+        // Made 2-D on purpose: gone, and said to have been there.
+        assert!(f.set_geometry_2d(Some(z.to_2d())));
+        assert!(!f.has_z());
+    }
+
+    #[test]
+    fn a_height_on_an_edge_is_linear_along_it() {
+        let z = Geom::Polygon(vec![vec![vec![
+            CoordZ::new(0.0, 0.0, 0.0),
+            CoordZ::new(2.0, 0.0, 10.0),
+            CoordZ::new(2.0, 2.0, 20.0),
+            CoordZ::new(0.0, 0.0, 0.0),
+        ]]]);
+        assert_eq!(z.height_on_edge(VertexId::new(0, 0, 0), Coord::new(0.5, 0.0)), Some(2.5));
+        // Off the edge: its nearest place on it, clamped to the ends.
+        assert_eq!(z.height_on_edge(VertexId::new(0, 0, 0), Coord::new(5.0, 1.0)), Some(10.0));
+        // The ring's last edge comes back to its first vertex.
+        assert_eq!(z.height_on_edge(VertexId::new(0, 0, 2), Coord::new(1.0, 1.0)), Some(10.0));
+        assert_eq!(z.height_on_edge(VertexId::new(0, 0, 9), Coord::new(1.0, 1.0)), None);
     }
 }
 

@@ -422,7 +422,9 @@ fn read_with(file_name: &str, text: &str, budget: usize) -> Result<Vec<(Dataset,
             .collect();
         let fc = json!({"type": "FeatureCollection", "features": features});
         let title = if objects.len() == 1 { stem.to_string() } else { format!("{stem} {name}") };
-        let (ds, mut rep) = crate::io::read_geojson(&fc.to_string(), &title)?;
+        let (mut ds, mut rep) = crate::io::read_geojson(&fc.to_string(), &title)?;
+        // TopoJSON keeps x and y only for now: the heights of a 3-D read are dropped, and said.
+        ds.flatten_z(&mut rep);
         if properties_left_out > 0 {
             let what = if properties_left_out == 1 {
                 "1 property on a nested geometry was".to_string()

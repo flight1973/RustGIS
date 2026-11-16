@@ -592,9 +592,38 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
             Some((_, runner)) => runner(spec, inputs, &p),
             None => (spec.run)(inputs, &p),
         };
-        with_pole_loop_notes(result, spec, inputs, &p)
+        with_pole_loop_notes(result, spec, inputs, &p).map(|mut r| {
+            r.messages.extend(heights_note(spec, inputs, &p, &r.output));
+            r
+        })
     }))
     .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
+}
+
+/// What a tool says when an input layer has heights (Z) and an output with shapes doesn't keep
+/// them all: tools work in 2-D, on each feature's x and y, so their new shapes have none. `None`
+/// when no input has heights, or every output kept them (a tool that only adds fields).
+fn heights_note(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value, output: &Output) -> Option<String> {
+    let with_z: Vec<&str> = spec
+        .params
+        .iter()
+        .filter(|param| matches!(param.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::VectorLayer))
+        .filter_map(|param| inputs.dataset(p.get(param.name)?.as_str()?))
+        .filter(|ds| ds.has_z())
+        .map(|ds| ds.name.as_str())
+        .collect();
+    if with_z.is_empty() {
+        return None;
+    }
+    let lost = |ds: &Dataset| ds.features.iter().any(|f| f.geometry.is_some()) && (!ds.has_z() || ds.features_without_z() > 0);
+    let lost_any = match output {
+        Output::Layer(ds) | Output::Update { dataset: ds, .. } => lost(ds),
+        Output::Layers(layers) => layers.iter().any(|l| matches!(l, OutputLayer::Vector(ds) if lost(ds))),
+        Output::Selection { .. } | Output::Table(_) | Output::File { .. } => false,
+    };
+    let names = with_z.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ");
+    lost_any
+        .then(|| format!("{}: the heights (Z) of {names} weren't kept: the tool works in 2-D, so its output has x and y only", spec.name))
 }
 
 /// A tool's result with [`pole_loop_note`] added: to its messages, or to a refusal of polygons
@@ -789,7 +818,10 @@ pub fn run_resolved(
                 Some(runner) => runner(tool.spec, inputs, &params),
                 None => (tool.spec.run)(inputs, &params),
             };
-            with_pole_loop_notes(result, tool.spec, inputs, &params)
+            with_pole_loop_notes(result, tool.spec, inputs, &params).map(|mut r| {
+                r.messages.extend(heights_note(tool.spec, inputs, &params, &r.output));
+                r
+            })
         }))
         .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", tool.spec.name)))
     })

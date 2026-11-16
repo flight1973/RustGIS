@@ -26,7 +26,7 @@ use crate::dbf::{Column, RawTable};
 use crate::io::{DbfStyle, ShapefileParts};
 use crate::raster::Crs;
 use crate::sync::{FileSync, Synced};
-use crate::{DataError, Dataset, Feature, FieldType, Geometry, Result, Value};
+use crate::{DataError, Dataset, Feature, FieldType, Geom, Geometry, Position, Result, Value};
 use std::path::{Path, PathBuf};
 
 mod json;
@@ -668,22 +668,28 @@ fn same_value(ty: FieldType, a: &Value, b: &Value) -> bool {
 /// and turned to run the same way whichever way it was drawn (a Shapefile orders a ring's
 /// vertices by whether it is a hole).
 fn geometry_parts(g: Option<&Geometry>) -> Vec<Vec<(f64, f64)>> {
-    let xy = |cs: &[crate::Coord]| cs.iter().map(|c| (c.x, c.y)).collect::<Vec<_>>();
+    closed_parts(g).into_iter().map(|part| part.into_iter().map(|c| (c.x, c.y)).collect()).collect()
+}
+
+/// [`geometry_parts`] for any kind of position: closing a ring copies its first position, and
+/// turning it reverses the positions, so a height stays with its point.
+fn closed_parts<C: Position>(g: Option<&Geom<C>>) -> Vec<Vec<C>> {
     match g {
         None => Vec::new(),
-        Some(Geometry::Point(c)) => vec![vec![(c.x, c.y)]],
-        Some(Geometry::MultiPoint(cs)) => cs.iter().map(|c| vec![(c.x, c.y)]).collect(),
-        Some(Geometry::Line(parts)) => parts.iter().map(|p| xy(p)).collect(),
-        Some(Geometry::Polygon(polys)) => polys
+        Some(Geom::Point(c)) => vec![vec![*c]],
+        Some(Geom::MultiPoint(cs)) => cs.iter().map(|c| vec![*c]).collect(),
+        Some(Geom::Line(parts)) => parts.clone(),
+        Some(Geom::Polygon(polys)) => polys
             .iter()
             .flatten()
             .map(|r| {
-                let mut ring = xy(r);
-                if ring.first() != ring.last() {
+                let mut ring = r.clone();
+                if ring.first().map(|c| c.xy()) != ring.last().map(|c| c.xy()) {
                     ring.extend(ring.first().copied());
                 }
                 // Twice the signed area: positive runs anticlockwise.
-                let area: f64 = ring.windows(2).map(|w| w.first().zip(w.get(1)).map_or(0.0, |(p, q)| p.0 * q.1 - q.0 * p.1)).sum();
+                let area: f64 =
+                    ring.windows(2).map(|w| w.first().zip(w.get(1)).map_or(0.0, |(p, q)| p.xy().x * q.xy().y - q.xy().x * p.xy().y)).sum();
                 if area < 0.0 {
                     ring.reverse();
                 }
@@ -763,6 +769,27 @@ fn same_rows(ds: &Dataset, back: &Dataset, tolerance: f64) -> Option<String> {
         out.push(format!("{shapes} shapes would read back otherwise (the first, feature {})", k + 1));
     }
     (!out.is_empty()).then(|| out.join("; "))
+}
+
+#[cfg(test)]
+mod heights_tests {
+    use super::closed_parts;
+    use crate::{CoordZ, Geom};
+
+    #[test]
+    fn closing_and_turning_a_ring_keeps_each_height_with_its_point() {
+        // Clockwise and open: closing copies the first point's height, turning reverses them all.
+        let p = |x: f64, y: f64, z: f64| CoordZ::new(x, y, z);
+        let ring = vec![p(0.0, 0.0, 1.0), p(0.0, 1.0, 2.0), p(1.0, 1.0, 3.0), p(1.0, 0.0, 4.0)];
+        let parts = closed_parts(Some(&Geom::Polygon(vec![vec![ring.clone()]])));
+        let [turned] = parts.as_slice() else { panic!("one ring: {parts:?}") };
+        assert_eq!(turned, &[p(0.0, 0.0, 1.0), p(1.0, 0.0, 4.0), p(1.0, 1.0, 3.0), p(0.0, 1.0, 2.0), p(0.0, 0.0, 1.0)]);
+        // Each point still has the height it was read with.
+        for c in turned {
+            let read = ring.iter().find(|r| r.xy() == c.xy()).unwrap();
+            assert_eq!(read.z, c.z);
+        }
+    }
 }
 
 #[cfg(test)]
