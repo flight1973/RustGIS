@@ -133,38 +133,41 @@ impl ShpSource {
         // with none (no records, or every shape null, empty or not a number) it has no extent,
         // never the 0, 0, 0, 0 a header often holds then (Null Island). The header's box, exact,
         // stands for them when it is their box (the specification's minimum bounding rectangle);
-        // one that isn't (a corner that isn't a number, #1985, stale after records were added or
-        // removed, or junk) is set aside, and said.
+        // one that isn't is set aside: said when it misses a shape or isn't a box (a corner that
+        // isn't a number, #1985, or stale after records were added), not when it only holds more
+        // (editors that only grow it, or junk).
         let header_finite = [native.min_x, native.min_y, native.max_x, native.max_y].iter().all(|v| v.is_finite());
         let header = native;
         let native = index.bounds.map(|[x0, y0, x1, y1]| {
             // Rounded outward as the records' boxes are, the header is theirs on every side: so a
             // header written exactly always passes, whatever its size, as does one off by less
             // than one f32 step (a meter or two at UTM and Web Mercator northings).
-            let matches = header_finite
-                && !header.is_empty()
-                && f32_down(header.min_x) == x0
-                && f32_down(header.min_y) == y0
-                && f32_up(header.max_x) == x1
-                && f32_up(header.max_y) == y1;
-            if matches {
-                header
-            } else {
-                notes.push("the .shp header's bounding box doesn't match its shapes: the layer's extent is taken from the shapes".into());
-                Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1))
+            let a_box = header_finite && !header.is_empty();
+            let [h0, h1, h2, h3] = [f32_down(header.min_x), f32_down(header.min_y), f32_up(header.max_x), f32_up(header.max_y)];
+            if a_box && h0 == x0 && h1 == y0 && h2 == x1 && h3 == y1 {
+                return header;
             }
+            // Larger than the shapes but holding them (left so by editors that only grow it, or
+            // junk): the shapes' box, with nothing to say. One that misses a shape, or isn't a box,
+            // is said.
+            if !(a_box && h0 <= x0 && h1 <= y0 && h2 >= x1 && h3 >= y1) {
+                notes.push("the .shp header's bounding box doesn't hold its shapes: the layer's extent is taken from the shapes".into());
+            }
+            Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1))
         });
-        // No shape to frame, under a header box that says otherwise (not the 0, 0, 0, 0 such a
-        // file usually holds): said, as the layer has no extent.
+        // No shape to frame (no records, or every shape null or empty), under a header box that
+        // says otherwise (not the 0, 0, 0, 0 such a file usually holds): said, as the layer has no
+        // extent. Shapes there but without a usable box are said below instead, with how many.
         let zero = [header.min_x, header.min_y, header.max_x, header.max_y].iter().all(|v| *v == 0.0);
-        if native.is_none() && index.count > 0 && header_finite && !header.is_empty() && !zero {
-            notes.push("the .shp's shapes have no usable bounding box: its header's box isn't used, and the layer has no extent".into());
+        if native.is_none() && index.unboxed == 0 && header_finite && !header.is_empty() && !zero {
+            notes.push("the .shp has no shapes to frame: its header's box isn't used, and the layer has no extent".into());
         }
-        // Shapes whose box isn't one (a coordinate that isn't a number, or past f32's range) are
-        // left out of the extent and of the spatial index: said, with how many.
+        // Shapes whose box isn't one (a coordinate that isn't a number or past f32's range, or a
+        // box that's backwards) are left out of the extent and of the spatial index, so of every
+        // read by area: said, with how many.
         if index.unboxed > 0 {
             notes.push(format!(
-                "{} shape(s) have no usable bounding box (a coordinate that isn't a number, or out of range): they're left out of the layer's extent",
+                "{} shape(s) have no usable bounding box (a coordinate that isn't a number or is out of range, or a box that's backwards): they're left out of the layer's extent and of reads by area",
                 index.unboxed
             ));
         }

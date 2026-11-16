@@ -34,10 +34,10 @@ impl DiskIndex {
         use super::cache;
         use crate::source::external::{fnv1a, stamp};
         let canonical = path.canonicalize()?;
-        let signature = format!("shp-index-v3:{canonical:?}:{:?}", stamp(path)?);
+        let signature = format!("shp-index-v4:{canonical:?}:{:?}", stamp(path)?);
         let mut dir = cache::index_dir();
         let budget = cache::index_budget();
-        let key = format!("{:016x}-{:016x}", fnv1a(format!("shp-index-v3:{canonical:?}").as_bytes()), fnv1a(signature.as_bytes()));
+        let key = format!("{:016x}-{:016x}", fnv1a(format!("shp-index-v4:{canonical:?}").as_bytes()), fnv1a(signature.as_bytes()));
         let pinned = cache::pin_index(&dir, &key, budget).or_else(|_| {
             dir = cache::index_fallback_dir();
             cache::pin_index(&dir, &key, budget)
@@ -107,7 +107,7 @@ impl DiskIndex {
             })?
         };
         // Do not retain an index built while the original file was being replaced/edited.
-        if signature != format!("shp-index-v3:{canonical:?}:{:?}", stamp(path)?) {
+        if signature != format!("shp-index-v4:{canonical:?}:{:?}", stamp(path)?) {
             return Err(bad("the .shp changed while its spatial index was being built"));
         }
         let bounds_json = serde_json::to_string(&all_bounds).map_err(|e| bad(e.to_string()))?;

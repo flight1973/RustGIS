@@ -53,9 +53,9 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
     let three = [Some((10.0, 20.0)), Some((11.0, 21.0)), Some((12.0, 22.0))];
     let whole = Extent::new(10.0, 20.0, 12.0, 22.0);
     let has = |s: &ShpSource, what: &str| s.info().notes.iter().any(|n| n.contains(what));
-    const SET_ASIDE: &str = "header's bounding box doesn't match its shapes";
+    const SET_ASIDE: &str = "header's bounding box doesn't hold its shapes";
     const UNBOXED: &str = "have no usable bounding box (a coordinate";
-    const NO_SHAPE_BOX: &str = "shapes have no usable bounding box: its header's box isn't used";
+    const NO_SHAPE_BOX: &str = "has no shapes to frame: its header's box isn't used";
     let quiet = |s: &ShpSource| [SET_ASIDE, UNBOXED, NO_SHAPE_BOX, "not longitude/latitude"].iter().all(|w| !has(s, w));
     cache::with_index_dir(folder.join("cache"), || {
         let open = |p: &Path| {
@@ -77,17 +77,24 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
         let s = open(&write("utm.shp", &utm));
         assert_eq!(s.info().extent.max_y, 9_999_999.3, "the header, exact");
         assert!(!has(&s, SET_ASIDE), "{:?}", s.info().notes);
-        // A corner that isn't a number, one too small or too large for the shapes (a stale or junk
-        // header), or an inverted header: the records' boxes.
-        for (k, (at, v)) in [(44, f64::INFINITY), (52, f64::NEG_INFINITY), (60, f64::NAN), (52, 11.0), (36, 13.0), (36, 5.0), (60, 1e300)]
-            .into_iter()
-            .enumerate()
-        {
+        // A corner that isn't a number, one too small for the shapes (stale), or an inverted
+        // header: the records' boxes, said. One larger than the shapes but holding them (left so
+        // by editors that only grow it, or junk): the records' boxes, with nothing to say.
+        let corners = [
+            (44, f64::INFINITY, true),
+            (52, f64::NEG_INFINITY, true),
+            (60, f64::NAN, true),
+            (52, 11.0, true),
+            (36, 13.0, true),
+            (36, 5.0, false),
+            (60, 1e300, false),
+        ];
+        for (k, (at, v, said)) in corners.into_iter().enumerate() {
             let p = write(&format!("corner-{k}.shp"), &three);
             patch(&p, at, v);
             let s = open(&p);
             assert_eq!(s.info().extent, whole, "corner at {at} = {v}");
-            assert!(has(&s, SET_ASIDE), "corner at {at} = {v}: {:?}", s.info().notes);
+            assert_eq!(has(&s, SET_ASIDE), said, "corner at {at} = {v}: {:?}", s.info().notes);
             assert!(!has(&s, "not longitude/latitude"), "corner at {at} = {v}: {:?}", s.info().notes);
         }
         // A NaN shape and the box its writer made from it: the other shapes frame the layer, and
@@ -99,6 +106,10 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
         assert_eq!(s.info().extent, Extent::new(11.0, 21.0, 12.0, 22.0));
         assert!(has(&s, SET_ASIDE) && !has(&s, "not longitude/latitude"), "{:?}", s.info().notes);
         assert!(has(&s, &format!("1 shape(s) {UNBOXED}")), "{:?}", s.info().notes);
+        // Opened again from its cached index, it says the same.
+        drop(s);
+        let s = open(&p);
+        assert!(has(&s, &format!("1 shape(s) {UNBOXED}")), "from the cache: {:?}", s.info().notes);
         // Every record null (its shape type, at 108 + 28 per record, set to 0): no extent, not
         // Null Island. Under the 0, 0, 0, 0 box writers give such a file, nothing to say; under a
         // header claiming a box, said.
@@ -120,19 +131,27 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
         let s = nulled("null-boxed.shp", [10.0, 20.0, 12.0, 22.0]);
         assert!(s.info().extent.is_empty(), "{:?}", s.info().extent);
         assert!(has(&s, NO_SHAPE_BOX) && !has(&s, UNBOXED), "{:?}", s.info().notes);
-        // A file of no records, its header box 0, 0, 0, 0 (its length, at 24, in 16-bit words).
-        let p = write("empty.shp", &three);
-        for file in [p.clone(), p.with_extension("shx")] {
-            let mut b = std::fs::read(&file).unwrap();
-            b.truncate(100);
-            b[24..28].copy_from_slice(&50i32.to_be_bytes());
-            b[36..68].fill(0);
-            std::fs::write(&file, b).unwrap();
+        // A file of no records (its length, at 24, in 16-bit words): under a 0, 0, 0, 0 header box,
+        // nothing to say; under a box left from the records it had, said.
+        for (name, header, said) in [("empty.shp", [0.0f64; 4], false), ("emptied.shp", [10.0, 20.0, 12.0, 22.0], true)] {
+            let p = write(name, &three);
+            for file in [p.clone(), p.with_extension("shx")] {
+                let mut b = std::fs::read(&file).unwrap();
+                b.truncate(100);
+                b[24..28].copy_from_slice(&50i32.to_be_bytes());
+                for (k, v) in header.iter().enumerate() {
+                    b[36 + 8 * k..44 + 8 * k].copy_from_slice(&v.to_le_bytes());
+                }
+                std::fs::write(&file, b).unwrap();
+            }
+            let s = open(&p);
+            assert_eq!(s.info().count, Some(0));
+            assert!(s.info().extent.is_empty(), "{name}: {:?}", s.info().extent);
+            assert_eq!(has(&s, NO_SHAPE_BOX), said, "{name}: {:?}", s.info().notes);
+            if !said {
+                assert!(quiet(&s), "{name}: {:?}", s.info().notes);
+            }
         }
-        let s = open(&p);
-        assert_eq!(s.info().count, Some(0));
-        assert!(s.info().extent.is_empty(), "{:?}", s.info().extent);
-        assert!(quiet(&s), "{:?}", s.info().notes);
     });
     // A cached index whose stored box isn't one (inverted, as damage or a planted file could
     // leave it) is built again.
