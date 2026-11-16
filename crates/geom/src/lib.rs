@@ -473,12 +473,14 @@ pub fn ring_area_is_ambiguous(ring: &[Coord]) -> bool {
 /// sees it as a line with no area. 0 for a ring with fewer than three vertices, a coordinate that
 /// isn't finite or lies past ±90° of latitude, or a vertex at a pole.
 ///
-/// Only the coordinates are read, as longitude and latitude, as the analysis reads every layer (a
-/// layer with a coordinate system is read into them): a ring whose x and y were never degrees (a
-/// layer with no coordinate system, in small units, taken for degrees) winds too when an edge of it
-/// runs more than 180 in x. The triangle `[0, 0]`, `[300, 0]`, `[150, 80]` steps -60°, -150° and
-/// -150° the short way, so it gives -1 though as x and y it's a plain triangle; a ring as wide
-/// with no edge longer than 180 doesn't wind.
+/// Only the coordinates are read, as longitude and latitude, as the analysis tools that read areas
+/// in the plane take a layer's (a layer with a coordinate system is read into them): a ring whose x
+/// and y were never degrees (a layer with no coordinate system, in small units, taken for degrees)
+/// can wind too, but only with an edge more than 180 long in x, and the short-way steps decide it.
+/// The triangle `[0, 0]`, `[300, 0]`, `[150, 80]` steps -60°, -150° and -150°, so it gives -1
+/// though as x and y it's a plain triangle; the rectangle `[0, 0]`, `[300, 0]`, `[300, 10]`,
+/// `[0, 10]` has two such edges, whose steps cancel, and gives 0; a ring as wide with no edge longer
+/// than 180 gives 0 too.
 pub fn ring_pole_turns(ring: &[Coord]) -> i64 {
     if ring.len() < 3 || !ring.iter().all(|c| c.is_finite() && c.y.abs() <= 90.0) || ring.iter().any(|c| at_pole(c.y)) {
         return 0;
@@ -1862,6 +1864,10 @@ mod tests {
         // the short way. As degrees that's what it does, so this records the reading, not a slip.
         let wide = [(0.0, 0.0), (300.0, 0.0), (150.0, 80.0), (0.0, 0.0)];
         assert_eq!(ring_pole_turns(&wide.map(|(x, y)| Coord::new(x, y))), -1);
+        // Two edges more than 180 long whose steps cancel: no winding. An edge that long is
+        // needed, not enough.
+        let rect = [(0.0, 0.0), (300.0, 0.0), (300.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&rect.map(|(x, y)| Coord::new(x, y))), 0);
         // As wide, but no edge longer than 180: no winding. Nor within 180.
         let stepped =
             [(0.0, 0.0), (100.0, 0.0), (200.0, 0.0), (300.0, 0.0), (300.0, 10.0), (200.0, 10.0), (100.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
