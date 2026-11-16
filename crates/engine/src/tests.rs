@@ -51392,8 +51392,14 @@ fn convert_position_gives_every_form() {
     assert!((v["easting"].as_f64().unwrap() - 583_959.0).abs() < 1.0 && (v["northing"].as_f64().unwrap() - 4_507_351.0).abs() < 1.0, "{v}");
     assert_eq!(v["dms"], rustgis_geom::format_dms(rustgis_geom::Coord::new(-74.006, 40.7128)));
     // Fewer MGRS digits truncate, as MGRS does: 1 km here.
-    let v = convert(&mut s, json!({"lon": -74.006, "lat": 40.7128, "digits": 2}));
-    assert_eq!((v["mgrs"].as_str(), v["mgrsCompact"].as_str()), (Some("18T WL 83 07"), Some("18TWL8307")));
+    // Fewer digits as a whole number sent as 2.0 too, as Python or JavaScript may send it.
+    for digits in [json!(2), json!(2.0)] {
+        let v = convert(&mut s, json!({"lon": -74.006, "lat": 40.7128, "digits": digits}));
+        assert_eq!((v["mgrs"].as_str(), v["mgrsCompact"].as_str()), (Some("18T WL 83 07"), Some("18TWL8307")), "{digits}");
+    }
+    // A tiny negative comes back as 0, not -0.
+    let v = convert(&mut s, json!({"lon": -1e-12, "lat": -1e-12}));
+    assert!(v["lon"].as_f64().unwrap().is_sign_positive() && v["lat"].as_f64().unwrap().is_sign_positive(), "{v}");
     // North of 84° N it is UPS, in `ups` not `utm`, with no zone or UTM band; polar MGRS has no
     // zone number. Svalbard takes its own zone, 33, at 10° E.
     let v = convert(&mut s, json!({"lon": 30, "lat": 85}));

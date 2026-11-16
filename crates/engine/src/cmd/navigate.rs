@@ -556,12 +556,13 @@ fn typed_place(map: &Map, p: &Value, moving: bool) -> Result<(Coord, Option<crat
             )),
             PositionRead::Square(side) => {
                 let side = if side >= 1000.0 { format!("{} km", side / 1000.0) } else { format!("{side} m") };
-                let args = [("reference", reference()), ("side", side.into())];
-                Some(if moving {
-                    crate::notice_text::NoticeText::format("{reference} names a {side} square, not a point: went to its center", args)
+                // Both whole, as the translation catalogs take them.
+                let template = if moving {
+                    "{reference} names a {side} square, not a point: went to its center"
                 } else {
-                    crate::notice_text::NoticeText::format("{reference} names a {side} square, not a point: gave its center", args)
-                })
+                    "{reference} names a {side} square, not a point: gave its center"
+                };
+                Some(crate::notice_text::NoticeText::format(template, [("reference", reference()), ("side", side.into())]))
             }
         };
         (c.x, c.y, said)
@@ -583,7 +584,7 @@ fn typed_place(map: &Map, p: &Value, moving: bool) -> Result<(Coord, Option<crat
 }
 
 /// A place in every form RustGIS writes one (#1042): longitude and latitude, in decimal degrees
-/// and in degrees, minutes and seconds as the status bar shows them; UTM, or UPS north of 84° N
+/// and in degrees, minutes and seconds as the status bar shows them; UTM, or UPS from 84° N
 /// and south of 80° S, with the easting and northing (`grid` says which: `utm` and `ups` each hold
 /// only their own); and MGRS spaced as the readout writes it and in one word, to `digits` digits
 /// (5 by default: 1 m). The place is read as `map.goToXY` reads it, and what the reading assumed
@@ -592,12 +593,17 @@ fn typed_place(map: &Map, p: &Value, moving: bool) -> Result<(Coord, Option<crat
 fn convert_position(s: &mut Session, p: &Value) -> CmdResult {
     let digits = match p.get("digits") {
         None | Some(Value::Null) => 5,
-        Some(v) => v.as_u64().filter(|d| *d <= 5).ok_or("digits must be a whole number from 0 (100 km) to 5 (1 m)")? as u8,
+        // A whole number sent as 2.0 (as Python or JavaScript may) is as good as 2.
+        Some(v) => v
+            .as_f64()
+            .filter(|d| d.fract() == 0.0 && (0.0..=5.0).contains(d))
+            .ok_or("digits must be a whole number from 0 (100 km) to 5 (1 m)")? as u8,
     };
     let (c, notice) = typed_place(s.map(), p, false)?;
     // Degrees to 1e-9 (under a millimeter), so text in degrees, minutes and seconds doesn't come
     // back as -74.00600000000001; grid meters to the millimeter, which the projections are good to.
-    let nano = |v: f64| (v * 1e9).round() / 1e9;
+    // Adding 0.0 turns a -0.0 from a tiny negative into 0.
+    let nano = |v: f64| (v * 1e9).round() / 1e9 + 0.0;
     let mm = |v: f64| (v * 1000.0).round() / 1000.0;
     let mut out = json!({
         "lon": nano(c.x),
