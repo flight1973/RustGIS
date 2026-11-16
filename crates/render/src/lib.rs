@@ -12253,11 +12253,11 @@ mod tests {
         m.label_display.locked = false;
         m.label_lock = None;
         // Wrapped at its spaces, centred; not curved character by character.
-        m.layer_mut(line).unwrap().dataset.features = vec![rustgis_data::Feature {
-            id: 0,
-            geometry: Some(Geometry::Line(vec![vec![Coord::new(-2.0, 0.0), Coord::new(2.0, 0.0)]])),
-            attrs: vec![Value::Text("Obere Töss".into())],
-        }]
+        m.layer_mut(line).unwrap().dataset.features = vec![rustgis_data::Feature::new(
+            0,
+            Some(Geometry::Line(vec![vec![Coord::new(-2.0, 0.0), Coord::new(2.0, 0.0)]])),
+            vec![Value::Text("Obere Töss".into())],
+        )]
         .into();
         m.layer_mut(line).unwrap().touch_geometry();
         let c = &mut m.layer_mut(line).unwrap().labels.default;

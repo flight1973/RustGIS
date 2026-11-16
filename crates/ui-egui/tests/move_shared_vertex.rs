@@ -21,10 +21,8 @@ fn harness() -> Harness<'static, RustGisApp> {
     data.features = [(0., 0., 160., 160.), (-160., 0., 0., 160.), (-160., -160., 0., 0.), (0., -160., 160., 0.)]
         .into_iter()
         .enumerate()
-        .map(|(i, (l, b, r, t))| Feature {
-            id: i as u64 + 40,
-            geometry: Some(Geometry::Polygon(vec![vec![vec![c(l, b), c(r, b), c(r, t), c(l, t), c(l, b)]]])),
-            attrs: vec![],
+        .map(|(i, (l, b, r, t))| {
+            Feature::new(i as u64 + 40, Some(Geometry::Polygon(vec![vec![vec![c(l, b), c(r, b), c(r, t), c(l, t), c(l, b)]]])), vec![])
         })
         .collect::<Vec<_>>()
         .into();
@@ -202,11 +200,7 @@ fn lines_and_points_keep_the_existing_move_path() {
         let mut h = harness();
         let data = &mut h.state_mut().session.map_mut().layers[0].dataset;
         data.geometry_type = geometry.kind();
-        data.features = vec![
-            Feature { id: 1, geometry: Some(geometry.clone()), attrs: vec![] },
-            Feature { id: 2, geometry: Some(geometry.clone()), attrs: vec![] },
-        ]
-        .into();
+        data.features = vec![Feature::new(1, Some(geometry.clone()), vec![]), Feature::new(2, Some(geometry.clone()), vec![])].into();
         h.state_mut().run("ui.moveSharedVertices", json!({"on":true})).unwrap();
         h.step();
         let to = drag(&mut h, c(0., 0.), c(45., 30.));

@@ -511,8 +511,7 @@ mod tests {
     fn app(geometries: impl Iterator<Item = Geometry>) -> RustGisApp {
         let mut session = Session::new(Project::new("Shared preview cache"));
         let mut data = Dataset::new("Parcels", rustgis_engine::data::GeometryType::Polygon, vec![]);
-        data.features =
-            geometries.enumerate().map(|(id, g)| Feature { id: id as u64, geometry: Some(g), attrs: vec![] }).collect::<Vec<_>>().into();
+        data.features = geometries.enumerate().map(|(id, g)| Feature::new(id as u64, Some(g), vec![])).collect::<Vec<_>>().into();
         let id = session.map_mut().add_dataset(data);
         session.active_layer = Some(id);
         session.map_mut().layer_mut(id).unwrap().selection = vec![0];
@@ -597,12 +596,9 @@ mod tests {
             vec![vec![o, a, o, b, o], vec![Coord::new(f64::EPSILON, 0.), a, b]],
         ]);
         let expected: Vec<_> = g.edges().into_iter().filter(|(_, a, b)| *a == o || *b == o).map(|(_, a, b)| (a, b)).collect();
-        let features = [
-            Feature { id: 0, geometry: Some(g), attrs: vec![] },
-            Feature { id: 1, geometry: Some(Geometry::Line(vec![vec![o, a]])), attrs: vec![] },
-        ];
+        let features = [Feature::new(0, Some(g), vec![]), Feature::new(1, Some(Geometry::Line(vec![vec![o, a]])), vec![])];
         assert_eq!(shared_edges(features.iter(), o), expected);
-        let dense = Feature { id: 2, geometry: Some(Geometry::Polygon(vec![vec![vec![o; MAX_HANDLES * 2]]])), attrs: vec![] };
+        let dense = Feature::new(2, Some(Geometry::Polygon(vec![vec![vec![o; MAX_HANDLES * 2]]])), vec![]);
         SCANNED_EDGES.set(0);
         assert_eq!(shared_edges(std::iter::once(&dense), o).len(), MAX_HANDLES);
         assert_eq!(SCANNED_EDGES.get(), MAX_HANDLES, "also stop inside one large ring");

@@ -838,7 +838,7 @@ impl SqlServerSource {
                 .unwrap_or(Value::Null)
             })
             .collect();
-        Some(Feature { id, geometry: Some(geometry), attrs })
+        Some(Feature::new(id, Some(geometry), attrs))
     }
 
     /// Reads what a request asks for, each statement timing out after `timeout` seconds (else the

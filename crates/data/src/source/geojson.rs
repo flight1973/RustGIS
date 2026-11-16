@@ -312,7 +312,7 @@ impl FeatureSource for GeoJsonSource {
             if late && !sample.wants() {
                 continue;
             }
-            let feature = Feature { id: u64::from(i) + 1, geometry, attrs: geojson_attrs(&json, &self.info.fields) };
+            let feature = Feature::new(u64::from(i) + 1, geometry, geojson_attrs(&json, &self.info.fields));
             if late {
                 sample.keep(feature);
             } else {

@@ -10,12 +10,8 @@ use serde_json::json;
 fn layer(kind: GeometryType, geometries: Vec<Geometry>) -> (Session, u32) {
     let mut data = Dataset::new("Polar", kind, vec![Field::new("n", FieldType::Integer)]);
     let n = geometries.len();
-    data.features = geometries
-        .into_iter()
-        .zip(1..)
-        .map(|(g, id)| Feature { id, geometry: Some(g), attrs: vec![Value::Int(0)] })
-        .collect::<Vec<_>>()
-        .into();
+    data.features =
+        geometries.into_iter().zip(1..).map(|(g, id)| Feature::new(id, Some(g), vec![Value::Int(0)])).collect::<Vec<_>>().into();
     let mut s = Session::new(Project::new("Polar edits"));
     let id = s.map_mut().add_dataset(data);
     s.active_layer = Some(id);

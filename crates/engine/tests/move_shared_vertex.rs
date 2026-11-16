@@ -37,7 +37,7 @@ fn add_layer(s: &mut Session, name: &str, geometries: Vec<Geometry>) -> u32 {
     data.features = geometries
         .into_iter()
         .enumerate()
-        .map(|(i, geometry)| Feature { id: 40 + i as u64, geometry: Some(geometry), attrs: vec![Cell::Int(i as i64)] })
+        .map(|(i, geometry)| Feature::new(40 + i as u64, Some(geometry), vec![Cell::Int(i as i64)]))
         .collect::<Vec<_>>()
         .into();
     s.map_mut().add_dataset(data)
@@ -120,13 +120,13 @@ fn multipart_holes_and_repeated_nodes_follow_the_original_coordinate() {
 fn near_vertices_and_other_layers_remain_unchanged() {
     let (mut s, id) = fixture();
     let near = rectangle(f64::EPSILON, 0., 2., 2.);
-    s.map_mut().layer_mut(id).unwrap().dataset.features.push(Feature { id: 99, geometry: Some(near.clone()), attrs: vec![Cell::Int(9)] });
-    s.map_mut().layer_mut(id).unwrap().dataset.features.push(Feature {
-        id: 100,
-        geometry: Some(Geometry::Point(Coord::new(0., 0.))),
-        attrs: vec![Cell::Int(10)],
-    });
-    s.map_mut().layer_mut(id).unwrap().dataset.features.push(Feature { id: 101, geometry: None, attrs: vec![Cell::Int(11)] });
+    s.map_mut().layer_mut(id).unwrap().dataset.features.push(Feature::new(99, Some(near.clone()), vec![Cell::Int(9)]));
+    s.map_mut().layer_mut(id).unwrap().dataset.features.push(Feature::new(
+        100,
+        Some(Geometry::Point(Coord::new(0., 0.))),
+        vec![Cell::Int(10)],
+    ));
+    s.map_mut().layer_mut(id).unwrap().dataset.features.push(Feature::new(101, None, vec![Cell::Int(11)]));
     let unchanged = features(&s, id).into_iter().skip(4).collect::<Vec<_>>();
     let other = add_layer(&mut s, "Other", vec![rectangle(0., 0., 1., 1.)]);
     let untouched = features(&s, other);

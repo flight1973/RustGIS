@@ -366,7 +366,7 @@ impl FgbSource {
             }
             super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
             super::add_unread_dates(&mut out.rounded_dates, &props.rounded_dates);
-            sample.keep(Feature { id, geometry: Some(geometry), attrs: props.values });
+            sample.keep(Feature::new(id, Some(geometry), props.values));
         }
         out.matched = if late || matched == 0 { sample.seen() } else { matched };
         out.complete = sample.complete();
@@ -432,7 +432,7 @@ impl FgbSource {
             super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
             super::add_unread_dates(&mut out.rounded_dates, &props.rounded_dates);
             out.matched += 1;
-            chunks.push(Feature { id, geometry: Some(geometry), attrs: props.values })?;
+            chunks.push(Feature::new(id, Some(geometry), props.values))?;
         }
         chunks.flush()?;
         Ok(out)
@@ -742,7 +742,7 @@ impl FgbSource {
             }
             super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
             super::add_unread_dates(&mut out.rounded_dates, &props.rounded_dates);
-            let feature = Feature { id, geometry: Some(geometry), attrs: props.values };
+            let feature = Feature::new(id, Some(geometry), props.values);
             if late {
                 sample.keep(feature);
             } else {
@@ -1145,8 +1145,8 @@ mod write_tests {
     fn a_streamed_point_layer_mixing_points_and_multipoints_starts_again() {
         use crate::{Coord, Geometry};
         let chunks = [
-            vec![Feature { id: 1, geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))), attrs: vec![] }],
-            vec![Feature { id: 2, geometry: Some(Geometry::MultiPoint(vec![Coord::new(3.0, 4.0), Coord::new(5.0, 6.0)])), attrs: vec![] }],
+            vec![Feature::new(1, Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![])],
+            vec![Feature::new(2, Some(Geometry::MultiPoint(vec![Coord::new(3.0, 4.0), Coord::new(5.0, 6.0)])), vec![])],
         ];
         let mut runs = 0;
         let mut out = Vec::new();
@@ -1160,7 +1160,7 @@ mod write_tests {
         let mut got: Vec<_> = back.features.iter().filter_map(|f| f.geometry.clone()).collect();
         got.sort_by_key(|g| matches!(g, Geometry::MultiPoint(_)));
         assert_eq!(got, chunks.iter().flatten().filter_map(|f| f.geometry.clone()).collect::<Vec<_>>());
-        let line = Feature { id: 3, geometry: Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]])), attrs: vec![] };
+        let line = Feature::new(3, Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]])), vec![]);
         let with_line = [chunks[0].clone(), chunks[1].clone(), vec![line]];
         let e = write_features("m", GeometryType::Point, &[], Crs::LonLat, &mut Vec::new(), &mut |add| {
             with_line.iter().try_for_each(|c| add(c))

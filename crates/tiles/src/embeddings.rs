@@ -841,7 +841,7 @@ pub fn points_dataset(name: &str, v: &Vectors, dim: Option<usize>) -> Dataset {
         if let Some(d) = dim {
             attrs.push(v.values.get(i * v.dims + d).map(|x| Value::Float(f64::from(*x))).unwrap_or_default());
         }
-        ds.features.push(Feature { id: i as u64 + 1, geometry: Some(Geometry::Point(Coord::new(*x, *y))), attrs });
+        ds.features.push(Feature::new(i as u64 + 1, Some(Geometry::Point(Coord::new(*x, *y))), attrs));
     }
     ds
 }
@@ -909,10 +909,12 @@ mod tests {
                 Coord::new(x, 40.0),
             ]]]
         };
-        let row = |x: f64, ms: i64, href: &str| Feature {
-            id: 1,
-            geometry: Some(Geometry::Polygon(ring(x))),
-            attrs: vec![Value::Text("1".into()), Value::Int(ms), Value::Text(href.into()), Value::Text("EPSG:32610".into())],
+        let row = |x: f64, ms: i64, href: &str| {
+            Feature::new(
+                1,
+                Some(Geometry::Polygon(ring(x))),
+                vec![Value::Text("1".into()), Value::Int(ms), Value::Text(href.into()), Value::Text("EPSG:32610".into())],
+            )
         };
         let batch = Batch {
             features: vec![
@@ -955,21 +957,23 @@ mod tests {
             Field::new(AEF_HREF, FieldType::Text),
             Field::new("proj:epsg", FieldType::Text),
         ];
-        let row = |x: f64, year: i32, href: &str| Feature {
-            id: 1,
-            geometry: Some(Geometry::Polygon(vec![vec![vec![
-                Coord::new(x, -21.0),
-                Coord::new(x + 0.8, -21.0),
-                Coord::new(x + 0.8, -20.7),
-                Coord::new(x, -20.7),
-                Coord::new(x, -21.0),
-            ]]])),
-            attrs: vec![
-                Value::Text("1".into()),
-                Value::Int(year_start_ms(year) as i64),
-                Value::Text(href.into()),
-                Value::Text("EPSG:32723".into()),
-            ],
+        let row = |x: f64, year: i32, href: &str| {
+            Feature::new(
+                1,
+                Some(Geometry::Polygon(vec![vec![vec![
+                    Coord::new(x, -21.0),
+                    Coord::new(x + 0.8, -21.0),
+                    Coord::new(x + 0.8, -20.7),
+                    Coord::new(x, -20.7),
+                    Coord::new(x, -21.0),
+                ]]])),
+                vec![
+                    Value::Text("1".into()),
+                    Value::Int(year_start_ms(year) as i64),
+                    Value::Text(href.into()),
+                    Value::Text("EPSG:32723".into()),
+                ],
+            )
         };
         let base = "s3://us-west-2.opendata.source.coop/tge-labs/aef/v1/annual";
         let batch = Batch {

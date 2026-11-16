@@ -5,7 +5,7 @@ use std::path::Path;
 use serde_json::{Map, Value as Json, json};
 
 use crate::raster::{Crs, planetary};
-use crate::{Coord, DataError, Dataset, Field, FieldType, Geometry, GeometryType, ReadReport, Result, Value};
+use crate::{Coord, CoordZ, DataError, Dataset, Field, FieldType, Geom, Geometry, GeometryType, GeometryZ, ReadReport, Result, Value};
 
 /// Largest file read into memory (256 MiB). Parsing JSON can take several times the file size.
 pub const MAX_BYTES: u64 = 256 << 20;
@@ -969,18 +969,20 @@ fn coord(v: &Json) -> Option<Coord> {
     c.is_finite().then_some(c)
 }
 
-fn coords(v: &Json) -> Option<Vec<Coord>> {
-    v.as_array()?.iter().map(coord).collect()
+/// A position with exactly three numbers, x, y and a height (RFC 7946 §3.1.1), all finite.
+fn coord_z(v: &Json) -> Option<CoordZ> {
+    let [x, y, z] = v.as_array()?.as_slice() else { return None };
+    let c = CoordZ::new(x.as_f64()?, y.as_f64()?, z.as_f64()?);
+    c.is_finite().then_some(c)
 }
 
-fn rings(v: &Json) -> Option<Vec<Vec<Coord>>> {
-    v.as_array()?.iter().map(coords).collect()
-}
-
-/// Parses a GeoJSON geometry object. Collections must contain exactly one member, since
-/// `Geometry` cannot represent a collection. Unwraps nested single-member collections without
-/// recursion; rejects empty or multi-member collections rather than retaining partial geometry.
-pub fn geometry_from_geojson(mut g: &Json) -> Option<Geometry> {
+/// Parses a GeoJSON geometry object, each position by `coord`. Collections must contain exactly
+/// one member, since `Geometry` cannot represent a collection. Unwraps nested single-member
+/// collections without recursion; rejects empty or multi-member collections rather than retaining
+/// partial geometry.
+fn geom_from_geojson<C>(mut g: &Json, coord: fn(&Json) -> Option<C>) -> Option<Geom<C>> {
+    let coords = |v: &Json| -> Option<Vec<C>> { v.as_array()?.iter().map(coord).collect() };
+    let rings = |v: &Json| -> Option<Vec<Vec<C>>> { v.as_array()?.iter().map(coords).collect() };
     while g.get("type")?.as_str()? == "GeometryCollection" {
         let [only] = g.get("geometries")?.as_array()?.as_slice() else {
             return None;
@@ -989,36 +991,52 @@ pub fn geometry_from_geojson(mut g: &Json) -> Option<Geometry> {
     }
     let c = g.get("coordinates");
     match g.get("type")?.as_str()? {
-        "Point" => coord(c?).map(Geometry::Point),
-        "MultiPoint" => coords(c?).map(Geometry::MultiPoint),
-        "LineString" => coords(c?).map(|l| Geometry::Line(vec![l])),
-        "MultiLineString" => rings(c?).map(Geometry::Line),
-        "Polygon" => rings(c?).map(|r| Geometry::Polygon(vec![r])),
-        "MultiPolygon" => c?.as_array()?.iter().map(rings).collect::<Option<Vec<_>>>().map(Geometry::Polygon),
+        "Point" => coord(c?).map(Geom::Point),
+        "MultiPoint" => coords(c?).map(Geom::MultiPoint),
+        "LineString" => coords(c?).map(|l| Geom::Line(vec![l])),
+        "MultiLineString" => rings(c?).map(Geom::Line),
+        "Polygon" => rings(c?).map(|r| Geom::Polygon(vec![r])),
+        "MultiPolygon" => c?.as_array()?.iter().map(rings).collect::<Option<Vec<_>>>().map(Geom::Polygon),
         _ => None,
     }
 }
 
-pub fn geometry_to_geojson(g: &Geometry) -> Json {
-    fn c(c: &Coord) -> Json {
-        json!([c.x, c.y])
-    }
-    fn l(v: &[Coord]) -> Json {
-        Json::Array(v.iter().map(c).collect())
-    }
+/// Parses a GeoJSON geometry object in x and y (any height dropped).
+pub fn geometry_from_geojson(g: &Json) -> Option<Geometry> {
+    geom_from_geojson(g, coord)
+}
+
+/// Parses a GeoJSON geometry object whose every position has a height: `None` when one hasn't,
+/// or has a fourth value.
+pub fn geometry_z_from_geojson(g: &Json) -> Option<GeometryZ> {
+    geom_from_geojson(g, coord_z)
+}
+
+/// A geometry as a GeoJSON geometry object, each position written by `c`.
+fn geom_to_geojson<C>(g: &Geom<C>, c: fn(&C) -> Json) -> Json {
+    let l = |v: &[C]| Json::Array(v.iter().map(c).collect());
     match g {
-        Geometry::Point(p) => json!({"type": "Point", "coordinates": c(p)}),
-        Geometry::MultiPoint(v) => json!({"type": "MultiPoint", "coordinates": l(v)}),
-        Geometry::Line(parts) if let [only] = parts.as_slice() => json!({"type": "LineString", "coordinates": l(only)}),
-        Geometry::Line(parts) => json!({"type": "MultiLineString", "coordinates": parts.iter().map(|p| l(p)).collect::<Vec<_>>()}),
-        Geometry::Polygon(polys) if let [only] = polys.as_slice() => {
+        Geom::Point(p) => json!({"type": "Point", "coordinates": c(p)}),
+        Geom::MultiPoint(v) => json!({"type": "MultiPoint", "coordinates": l(v)}),
+        Geom::Line(parts) if let [only] = parts.as_slice() => json!({"type": "LineString", "coordinates": l(only)}),
+        Geom::Line(parts) => json!({"type": "MultiLineString", "coordinates": parts.iter().map(|p| l(p)).collect::<Vec<_>>()}),
+        Geom::Polygon(polys) if let [only] = polys.as_slice() => {
             json!({"type": "Polygon", "coordinates": only.iter().map(|r| l(r)).collect::<Vec<_>>()})
         }
-        Geometry::Polygon(polys) => json!({"type": "MultiPolygon", "coordinates": polys
+        Geom::Polygon(polys) => json!({"type": "MultiPolygon", "coordinates": polys
             .iter()
             .map(|rings| rings.iter().map(|r| l(r)).collect::<Vec<_>>())
             .collect::<Vec<_>>()}),
     }
+}
+
+pub fn geometry_to_geojson(g: &Geometry) -> Json {
+    geom_to_geojson(g, |c| json!([c.x, c.y]))
+}
+
+/// A geometry with heights as a GeoJSON geometry object, each position `[x, y, z]`.
+pub fn geometry_z_to_geojson(g: &GeometryZ) -> Json {
+    geom_to_geojson(g, |c| json!([c.x, c.y, c.z]))
 }
 
 /// Reads a GeoJSON FeatureCollection, Feature or bare geometry.
@@ -1336,13 +1354,19 @@ pub(crate) fn geojson_geometry(f: &Json) -> std::result::Result<Option<Geometry>
     }
 }
 
+/// A feature's shape as read: a height at every position, or x and y (any heights dropped).
+enum ReadShape {
+    Z(GeometryZ),
+    Flat(Option<Geometry>),
+}
+
 /// Features as they're read, and the schema so far.
 #[derive(Default)]
 struct Collector {
     schema: Schema,
     /// Each feature's geometry, its values by field (typed once every feature is in) and whether
-    /// its geometry had heights, which are dropped.
-    features: Vec<(Option<Geometry>, Vec<(usize, Value)>, bool)>,
+    /// its geometry had heights.
+    features: Vec<(ReadShape, Vec<(usize, Value)>, bool)>,
     skipped: usize,
 }
 
@@ -1370,7 +1394,13 @@ impl Collector {
         match geojson_geometry(f) {
             Ok(geom) => {
                 let zm = geom.is_some() && geojson_has_z(f);
-                self.features.push((geom, attrs, zm));
+                // A height at every position, and nothing past it, keeps them all.
+                let z = zm.then(|| f.get("geometry").and_then(geometry_z_from_geojson)).flatten();
+                let shape = match z {
+                    Some(z) => ReadShape::Z(z),
+                    None => ReadShape::Flat(geom),
+                };
+                self.features.push((shape, attrs, zm));
             }
             Err(()) => self.skipped += 1,
         }
@@ -1390,9 +1420,29 @@ impl Collector {
         let mut zm = 0usize;
         // Features kept, as longitude/latitude, with a latitude past the poles.
         let mut swapped = 0usize;
-        for (n, (geom, values, had_z)) in self.features.into_iter().enumerate() {
+        // The layer is 3-D when every feature with a shape has a height at every position; one
+        // without them makes it a 2-D layer, and every height is dropped, with a notice.
+        let three_d = self.features.iter().any(|(shape, _, _)| matches!(shape, ReadShape::Z(_)))
+            && self.features.iter().all(|(shape, _, _)| !matches!(shape, ReadShape::Flat(Some(_))));
+        for (n, (shape, values, had_z)) in self.features.into_iter().enumerate() {
             // A feature that can't be converted is dropped, and its id is not reused, as when the
             // file is read in place.
+            let (geom, z) = match shape {
+                ReadShape::Z(z) if three_d => (None, Some(z)),
+                ReadShape::Z(z) => (Some(z.to_2d()), None),
+                ReadShape::Flat(g) => (g, None),
+            };
+            let z = match (&declared, z) {
+                // Heights stay as given: the legacy `crs` names no vertical system.
+                (Some((_, t)), Some(z)) => match geometry_to_lonlat(&z.to_2d(), t) {
+                    Some(_) => Some(z.map_xy(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)))),
+                    None => {
+                        unconverted += 1;
+                        continue;
+                    }
+                },
+                (_, z) => z,
+            };
             let geom = match (&declared, geom) {
                 (Some((_, t)), Some(g)) => match geometry_to_lonlat(&g, t) {
                     Some(g) => Some(g),
@@ -1409,11 +1459,15 @@ impl Collector {
                     *slot = coerce(v, field.ty);
                 }
             }
-            zm += usize::from(had_z);
+            zm += usize::from(had_z && z.is_none());
+            let feature = match z {
+                Some(z) => crate::Feature::new_z(n as u64 + 1, z, attrs),
+                None => crate::Feature::new(n as u64 + 1, geom, attrs),
+            };
             // Converted geometry is already within ±90.5° (or dropped above), so only what is read
             // as longitude/latitude can be swapped.
-            swapped += usize::from(declared.is_none() && geom.as_ref().is_some_and(latitude_past_poles));
-            ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
+            swapped += usize::from(declared.is_none() && feature.geometry.as_ref().is_some_and(latitude_past_poles));
+            ds.features.push(feature);
         }
         ds.geometry_type = dominant_type(&ds);
         if let Some((crs, _)) = &declared {
@@ -1525,7 +1579,13 @@ fn feature_to_geojson(fields: &[Field], f: &crate::Feature) -> Json {
     for (field, v) in fields.iter().zip(&f.attrs) {
         props.insert(field.name.clone(), v.to_json());
     }
-    json!({"type": "Feature", "id": f.id, "properties": props, "geometry": f.geometry.as_ref().map(geometry_to_geojson)})
+    // Heights that still fit the shape are written with it; heights left behind aren't
+    // (`z_export_notes` counts them).
+    let geometry = match f.geometry_z() {
+        Some(z) => Some(geometry_z_to_geojson(z)),
+        None => f.geometry.as_ref().map(geometry_to_geojson),
+    };
+    json!({"type": "Feature", "id": f.id, "properties": props, "geometry": geometry})
 }
 
 /// Writes a GeoJSON FeatureCollection a run of features at a time, for exports that never hold
@@ -5360,10 +5420,10 @@ mod tests {
         assert_eq!(losses, CsvLosses { as_one_point: 0, unwritten: 1, points: false });
         assert!(losses.notes("t.csv")[0].contains("the geometry of 1 feature wasn't written"));
         assert!(!to_csv(&ds).unwrap().contains("longitude"));
-        let points = [crate::Feature { id: 0, geometry: Some(Geometry::Point(Coord::new(1.0, 2.0))), attrs: vec![] }];
+        let points = [crate::Feature::new(0, Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![])];
         assert_eq!(CsvLosses::of(&points, GeometryType::Point), CsvLosses { points: true, ..CsvLosses::default() });
         // A multipoint without a point in a point layer gets empty coordinate cells.
-        let empty = [crate::Feature { id: 1, geometry: Some(Geometry::MultiPoint(vec![])), attrs: vec![] }];
+        let empty = [crate::Feature::new(1, Some(Geometry::MultiPoint(vec![])), vec![])];
         assert_eq!(CsvLosses::of(&empty, GeometryType::Point), CsvLosses { as_one_point: 0, unwritten: 1, points: true });
     }
 
@@ -6506,11 +6566,11 @@ mod tests {
         let mut ds = Dataset::new("points", GeometryType::Point, fields);
         for i in 0..3000u64 {
             let c = Coord::new(i as f64 / 100.0, (i % 80) as f64);
-            ds.features.push(crate::Feature {
-                id: i + 1,
-                geometry: Some(Geometry::Point(c)),
-                attrs: vec![Value::Text(format!("p{i}")), Value::Int(i as i64)],
-            });
+            ds.features.push(crate::Feature::new(
+                i + 1,
+                Some(Geometry::Point(c)),
+                vec![Value::Text(format!("p{i}")), Value::Int(i as i64)],
+            ));
         }
         let dir = tempfile::tempdir().unwrap();
         let exts = ["geojson", "csv", "fgb", "gpkg", "parquet", "shp", "kml", "gpx"];

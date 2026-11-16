@@ -29432,7 +29432,7 @@ fn streamed_layer_outside_its_zoom_range_reads_nothing() {
         for j in 0..200u32 {
             let c = rustgis_geom::Coord::new(-179.0 + 1.79 * f64::from(i), -80.0 + 0.8 * f64::from(j));
             let n = u64::from(i * 200 + j);
-            ds.features.push(Feature { id: n + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(n as i64)] });
+            ds.features.push(Feature::new(n + 1, Some(Geometry::Point(c)), vec![Value::Int(n as i64)]));
         }
     }
     let (base, sent) = serve_ranges(rustgis_data::source::fgb::write(&ds).unwrap());
@@ -29467,7 +29467,7 @@ fn load_all_features_waits_for_a_source_still_opening() {
     let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
     for i in 0..100u32 {
         let c = rustgis_geom::Coord::new(f64::from(i) * 0.1, 1.0);
-        ds.features.push(Feature { id: u64::from(i) + 1, geometry: Some(Geometry::Point(c)), attrs: vec![] });
+        ds.features.push(Feature::new(u64::from(i) + 1, Some(Geometry::Point(c)), vec![]));
     }
     let fgb = rustgis_data::source::fgb::write(&ds).unwrap();
     let (base, _) = serve_ranges(fgb.clone());
@@ -29502,7 +29502,7 @@ fn flatgeobuf_and_geoparquet_by_address_are_read_in_place() {
         for j in 0..200u32 {
             let c = rustgis_geom::Coord::new(-179.0 + 1.79 * f64::from(i), -80.0 + 0.8 * f64::from(j));
             let n = u64::from(i * 200 + j);
-            ds.features.push(Feature { id: n + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(n as i64)] });
+            ds.features.push(Feature::new(n + 1, Some(Geometry::Point(c)), vec![Value::Int(n as i64)]));
         }
     }
     let fgb = rustgis_data::source::fgb::write(&ds).unwrap();
@@ -30638,7 +30638,7 @@ fn overture_files_are_added_all_or_none() {
     let mut ds = Dataset::new("b", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
     for i in 0..50u32 {
         let c = rustgis_geom::Coord::new(7.0 + 0.01 * f64::from(i), 46.0);
-        ds.features.push(Feature { id: u64::from(i) + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(i64::from(i))] });
+        ds.features.push(Feature::new(u64::from(i) + 1, Some(Geometry::Point(c)), vec![Value::Int(i64::from(i))]));
     }
     let (good, _) = serve_ranges(rustgis_data::source::fgb::write(&ds).unwrap());
     let (bad, _) = serve_ranges(b"not a flatgeobuf at all".to_vec());
@@ -30675,7 +30675,7 @@ fn a_failed_multi_file_add_leaves_the_map_as_it_was() {
     let mut ds = Dataset::new("b", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
     for i in 0..20u32 {
         let c = rustgis_geom::Coord::new(7.0 + 0.01 * f64::from(i), 46.0);
-        ds.features.push(Feature { id: u64::from(i) + 1, geometry: Some(Geometry::Point(c)), attrs: vec![Value::Int(i64::from(i))] });
+        ds.features.push(Feature::new(u64::from(i) + 1, Some(Geometry::Point(c)), vec![Value::Int(i64::from(i))]));
     }
     let (good, _) = serve_ranges(rustgis_data::source::fgb::write(&ds).unwrap());
     let (bad, _) = serve_ranges(b"not a flatgeobuf at all".to_vec());

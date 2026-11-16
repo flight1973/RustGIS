@@ -58,8 +58,10 @@ pub mod xml;
 pub mod zip;
 
 pub use date::{Date, DateTime};
-pub use geometry::{Geometry, GeometryType, Measure, VertexId, ambiguous_area_message, pole_loop_count, pole_loop_message};
-pub use rustgis_geom::{Coord, Extent};
+pub use geometry::{
+    Geom, Geometry, GeometryType, GeometryZ, Measure, Position, VertexId, ambiguous_area_message, pole_loop_count, pole_loop_message,
+};
+pub use rustgis_geom::{Coord, CoordZ, Extent};
 pub use value::{Field, FieldType, Value};
 
 use serde::{Deserialize, Serialize};
@@ -195,12 +197,69 @@ mod secret_redaction_tests {
 }
 
 /// One row: an optional geometry and one value per field.
+///
+/// A feature of a 3-D layer (one read with heights) also holds its own geometry with a height at
+/// every position ([`Feature::geometry_z`]). That one is canonical; `geometry` is its x and y,
+/// which the map, selection and every 2-D tool read. The two are kept together by the setters
+/// here; code that writes `geometry` alone leaves the heights behind, and from then on
+/// [`Feature::geometry_z`] gives none (the heights are lost, never paired with other points).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Feature {
     pub id: u64,
     pub geometry: Option<Geometry>,
     pub attrs: Vec<Value>,
+    /// The geometry with heights, for a 3-D layer. Private: set only with `geometry` from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    geometry_z: Option<Box<GeometryZ>>,
+}
+
+impl Feature {
+    /// A 2-D feature.
+    pub fn new(id: u64, geometry: Option<Geometry>, attrs: Vec<Value>) -> Feature {
+        Feature { id, geometry, attrs, geometry_z: None }
+    }
+
+    /// A 3-D feature: its geometry with heights, and its x and y as `geometry`.
+    pub fn new_z(id: u64, geometry: GeometryZ, attrs: Vec<Value>) -> Feature {
+        Feature { id, geometry: Some(geometry.to_2d()), attrs, geometry_z: Some(Box::new(geometry)) }
+    }
+
+    /// Its geometry with heights, if it has them and `geometry` is still their x and y. After
+    /// code that changed `geometry` alone (a 2-D edit or tool), the heights no longer belong to
+    /// its points, so there are none: they are lost, not moved to other points.
+    pub fn geometry_z(&self) -> Option<&GeometryZ> {
+        let z = self.geometry_z.as_deref()?;
+        self.geometry.as_ref().is_some_and(|g| z.same_xy(g)).then_some(z)
+    }
+
+    /// Whether it was given heights: a feature of a 3-D layer, whether or not they still fit.
+    pub fn has_z(&self) -> bool {
+        self.geometry_z.is_some()
+    }
+
+    /// Whether it was given heights that no longer fit its geometry ([`Feature::geometry_z`]).
+    pub fn lost_z(&self) -> bool {
+        self.has_z() && self.geometry_z().is_none()
+    }
+
+    /// Sets its geometry with heights, and `geometry` to its x and y.
+    pub fn set_geometry_z(&mut self, geometry: GeometryZ) {
+        self.geometry = Some(geometry.to_2d());
+        self.geometry_z = Some(Box::new(geometry));
+    }
+
+    /// Sets a 2-D geometry and drops any heights: the explicit step for writing a 2-D result into
+    /// a feature that had them. Returns whether it had any, for the caller's notice.
+    pub fn set_geometry_2d(&mut self, geometry: Option<Geometry>) -> bool {
+        self.geometry = geometry;
+        self.geometry_z.take().is_some()
+    }
+
+    /// Drops its heights, keeping `geometry`. Returns whether it had any.
+    pub fn drop_z(&mut self) -> bool {
+        self.geometry_z.take().is_some()
+    }
 }
 
 /// A dataset's features, shared until changed: cloning them (an undo snapshot, a copy of the
@@ -237,14 +296,14 @@ impl Features {
     fn push_with_new_id(&mut self, geometry: Option<Geometry>, attrs: Vec<Value>) {
         let max = self.max_id.unwrap_or_else(|| self.rows.iter().map(|f| f.id).max().unwrap_or(0));
         let id = max.saturating_add(1);
-        std::sync::Arc::make_mut(&mut self.rows).push(Feature { id, geometry, attrs });
+        std::sync::Arc::make_mut(&mut self.rows).push(Feature::new(id, geometry, attrs));
         self.max_id = Some(id);
     }
 
     /// Appends a row with the id one past the last row's, keeping the largest id if it is known.
     fn push_after_last(&mut self, geometry: Option<Geometry>, attrs: Vec<Value>) {
         let id = self.rows.last().map(|f| f.id.saturating_add(1)).unwrap_or(1);
-        std::sync::Arc::make_mut(&mut self.rows).push(Feature { id, geometry, attrs });
+        std::sync::Arc::make_mut(&mut self.rows).push(Feature::new(id, geometry, attrs));
         self.max_id = self.max_id.map(|m| m.max(id));
     }
 }
@@ -384,6 +443,22 @@ impl Dataset {
             return 0;
         }
         self.features.iter().filter(|f| f.geometry.as_ref().is_some_and(|g| !g.is_finite())).count()
+    }
+
+    /// Whether it is a 3-D layer: read with heights, so its features hold them
+    /// ([`Feature::geometry_z`]).
+    pub fn has_z(&self) -> bool {
+        self.features.iter().any(Feature::has_z)
+    }
+
+    /// In a 3-D layer, its features with a shape but no heights that fit it: heights left behind
+    /// by an edit or a tool that changed the shape in 2-D, or a feature added in 2-D. Zero for a
+    /// 2-D layer.
+    pub fn features_without_z(&self) -> usize {
+        if !self.has_z() {
+            return 0;
+        }
+        self.features.iter().filter(|f| f.geometry.is_some() && f.geometry_z().is_none()).count()
     }
 }
 
@@ -863,7 +938,7 @@ mod tests {
         assert_eq!(ids, vec![500, 2, 3, 101, 501]);
         // Rows built elsewhere start without one; a clone keeps it with the rows it shares.
         let mut from: Dataset = Dataset::new("u", GeometryType::Point, vec![]);
-        from.features = vec![Feature { id: 7, geometry: None, attrs: vec![] }].into();
+        from.features = vec![Feature::new(7, None, vec![])].into();
         assert_eq!(from.features.max_id, None);
         from.push(None, vec![]);
         let mut copy = from.clone();

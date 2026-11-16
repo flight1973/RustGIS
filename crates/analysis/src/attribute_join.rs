@@ -376,7 +376,7 @@ pub fn join_field(target: &Dataset, source: &Dataset, opts: &JoinFieldOptions<'_
             }
         }
 
-        out_features.push(rustgis_data::Feature { id: t_feat.id, geometry: t_feat.geometry.clone(), attrs: new_attrs });
+        out_features.push(rustgis_data::Feature::new(t_feat.id, t_feat.geometry.clone(), new_attrs));
     }
 
     out.features = out_features.into();
@@ -1041,11 +1041,11 @@ mod tests {
         let schema_fields =
             vec![Field::new("id", FieldType::Integer), Field::new("desc", FieldType::Text), Field::new("category", FieldType::Text)];
         let mut target = Dataset::new("target", GeometryType::None, schema_fields);
-        target.features.push(rustgis_data::Feature {
-            id: 1,
-            geometry: None,
-            attrs: vec![Value::Int(42)], // Missing desc and category in row attrs
-        });
+        target.features.push(rustgis_data::Feature::new(
+            1,
+            None,
+            vec![Value::Int(42)], // Missing desc and category in row attrs
+        ));
 
         let source = make_table(
             "source",
@@ -1117,11 +1117,7 @@ mod tests {
     #[test]
     fn test_reject_oversized_target_row() {
         let mut target = Dataset::new("target", GeometryType::None, vec![Field::new("id", FieldType::Integer)]);
-        target.features.push(rustgis_data::Feature {
-            id: 10,
-            geometry: None,
-            attrs: vec![Value::Int(1), Value::Text("unexpected extra value".into())],
-        });
+        target.features.push(rustgis_data::Feature::new(10, None, vec![Value::Int(1), Value::Text("unexpected extra value".into())]));
         let source = make_table(
             "source",
             vec![("id", FieldType::Integer), ("val", FieldType::Text)],

@@ -81,6 +81,34 @@ impl Coord {
     }
 }
 
+/// A 3-D coordinate: x and y as in [`Coord`] and a height `z`. A layer read with heights holds its
+/// geometry in these, so whatever moves or copies a point moves its height with it, and a new
+/// point can't be made without deciding its height.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CoordZ {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl CoordZ {
+    pub const fn new(x: f64, y: f64, z: f64) -> Self {
+        CoordZ { x, y, z }
+    }
+    /// The point on the map: x and y, without the height.
+    pub const fn xy(self) -> Coord {
+        Coord { x: self.x, y: self.y }
+    }
+    /// The same height at another place: what a move, a reprojection or a snap keeps.
+    pub const fn with_xy(self, c: Coord) -> Self {
+        CoordZ { x: c.x, y: c.y, z: self.z }
+    }
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
+}
+
 /// An axis-aligned rectangle. An "empty" extent has `min > max`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

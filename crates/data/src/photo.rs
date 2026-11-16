@@ -292,10 +292,10 @@ pub fn feature(file: &str, bytes: &[u8], id: u64) -> std::result::Result<Feature
     };
     let text = |s: Option<String>| s.map(Value::Text).unwrap_or(Value::Null);
     let num = |v: Option<f64>| v.map(Value::Float).unwrap_or(Value::Null);
-    Ok(Feature {
+    Ok(Feature::new(
         id,
-        geometry: Some(Geometry::Point(Coord::new(lon, lat))),
-        attrs: vec![
+        Some(Geometry::Point(Coord::new(lon, lat))),
+        vec![
             Value::Text(stem.to_string()),
             Value::Text(file.to_string()),
             text(x.time),
@@ -304,7 +304,7 @@ pub fn feature(file: &str, bytes: &[u8], id: u64) -> std::result::Result<Feature
             text(camera),
             Value::Text(thumb),
         ],
-    })
+    ))
 }
 
 /// Builds a photo layer one photo at a time, so only one file's bytes need be held at once.

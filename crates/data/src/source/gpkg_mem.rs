@@ -361,11 +361,7 @@ impl FeatureSource for GpkgMemSource {
                     // has no place to match an extent.
                     Some(Val::Null | Val::Blob(_)) | None => {
                         if req.extent.is_none() && sample.wants() {
-                            sample.keep(Feature {
-                                id: rowid as u64,
-                                geometry: None,
-                                attrs: self.attrs(r, &mut unread_dates, &mut rounded_dates),
-                            });
+                            sample.keep(Feature::new(rowid as u64, None, self.attrs(r, &mut unread_dates, &mut rounded_dates)));
                         }
                         return ControlFlow::Continue(());
                     }
@@ -397,11 +393,7 @@ impl FeatureSource for GpkgMemSource {
                     return ControlFlow::Continue(());
                 }
                 // Integer keys, negative ones too, map to distinct ids.
-                sample.keep(Feature {
-                    id: rowid as u64,
-                    geometry: Some(geometry),
-                    attrs: self.attrs(r, &mut unread_dates, &mut rounded_dates),
-                });
+                sample.keep(Feature::new(rowid as u64, Some(geometry), self.attrs(r, &mut unread_dates, &mut rounded_dates)));
                 ControlFlow::Continue(())
             })
             .map_err(err)?;
@@ -461,11 +453,7 @@ impl FeatureSource for GpkgMemSource {
                     }
                 };
                 out.matched += 1;
-                match chunks.push(Feature {
-                    id: rowid as u64,
-                    geometry,
-                    attrs: self.attrs(r, &mut out.unread_dates, &mut out.rounded_dates),
-                }) {
+                match chunks.push(Feature::new(rowid as u64, geometry, self.attrs(r, &mut out.unread_dates, &mut out.rounded_dates))) {
                     Ok(()) => ControlFlow::Continue(()),
                     Err(e) => {
                         failed = Some(e);

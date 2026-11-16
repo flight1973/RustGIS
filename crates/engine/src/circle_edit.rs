@@ -413,11 +413,7 @@ mod tests {
         let b = spec();
         assert!(s.run("edit.addCircle", &json!({"circle":b,"attributes":{"missing":"lost"}})).is_err());
         assert!(s.map().layer(id).unwrap().dataset.features.is_empty());
-        s.map_mut().layer_mut(id).unwrap().dataset.features.push(rustgis_data::Feature {
-            id: u64::MAX,
-            geometry: Some(b.geometry().unwrap()),
-            attrs: vec![],
-        });
+        s.map_mut().layer_mut(id).unwrap().dataset.features.push(rustgis_data::Feature::new(u64::MAX, Some(b.geometry().unwrap()), vec![]));
         assert!(s.run("edit.addCircle", &json!({"circle":b})).is_err());
         assert_eq!(s.map().layer(id).unwrap().dataset.features.len(), 1);
         assert!(s.circle_spec(id, 0).is_none());

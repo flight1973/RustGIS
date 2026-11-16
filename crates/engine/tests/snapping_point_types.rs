@@ -16,7 +16,7 @@ fn c(x: f64, y: f64) -> Coord {
 /// Adds one ordinary feature without importing any external data or application-specific state.
 fn add(s: &mut Session, geometry: Geometry) -> u32 {
     let mut data = Dataset::new("Targets", geometry.kind(), vec![]);
-    data.features = vec![Feature { id: 1, geometry: Some(geometry), attrs: vec![] }].into();
+    data.features = vec![Feature::new(1, Some(geometry), vec![])].into();
     s.map_mut().add_dataset(data)
 }
 
@@ -79,7 +79,7 @@ fn both_point_types_obey_every_switch_combination() {
 #[test]
 fn mixed_targets_preserve_priority_and_ties() {
     let (mut s, id) = fixture(Geometry::MultiPoint(vec![c(-1., 0.), c(1., 0.), c(-1., 0.)]));
-    s.map_mut().layer_mut(id).unwrap().dataset.features.push(Feature { id: 2, geometry: Some(Geometry::Point(c(1., 0.))), attrs: vec![] });
+    s.map_mut().layer_mut(id).unwrap().dataset.features.push(Feature::new(2, Some(Geometry::Point(c(1., 0.))), vec![]));
     hit(snap_at(&mut s, c(0., 0.)), c(-1., 0.), "vertex");
     add(&mut s, Geometry::Point(c(1., 0.)));
     add(&mut s, Geometry::Line(vec![vec![c(-10., 0.), c(10., 0.)]]));
@@ -108,11 +108,7 @@ fn whole_feature_exclusion_and_read_only_queries_remain_intact() {
     for geometry in [Geometry::Point(c(0., 0.)), Geometry::MultiPoint(vec![c(0., 0.), c(1., 0.)])] {
         let (mut s, id) = fixture(geometry);
         assert!(snap_except(&mut s, c(0.5, 0.), Some((id, 0))).is_none());
-        s.map_mut().layer_mut(id).unwrap().dataset.features.push(Feature {
-            id: 2,
-            geometry: Some(Geometry::Point(c(1.5, 0.))),
-            attrs: vec![],
-        });
+        s.map_mut().layer_mut(id).unwrap().dataset.features.push(Feature::new(2, Some(Geometry::Point(c(1.5, 0.))), vec![]));
         hit(snap_except(&mut s, c(0.5, 0.), Some((id, 0))), c(1.5, 0.), "vertex");
         let before = serde_json::to_value(&s.project).unwrap();
         let revision = s.revision;

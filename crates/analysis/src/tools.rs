@@ -1492,7 +1492,7 @@ fn buffer_rows(
                     attrs.push(try_clone_value(value).map_err(|_| BUFFER_STORAGE_ERROR)?);
                 }
                 attrs.resize(fields, Value::Null);
-                let feature = Feature { id: 0, geometry: Some(geometry), attrs };
+                let feature = Feature::new(0, Some(geometry), attrs);
                 let actual = rustgis_data::source::chunk_memory::feature_bytes(&feature);
                 storage.charge(actual.saturating_sub(requested))?;
                 Ok(Some(feature))
@@ -3242,7 +3242,7 @@ impl PointList {
         match point_row(own, kept, extra) {
             Ok(attrs) => {
                 let id = u64::try_from(self.points.len()).map_or(u64::MAX, |i| i.saturating_add(1));
-                self.points.push(rustgis_data::Feature { id, geometry: Some(Geometry::Point(c)), attrs });
+                self.points.push(rustgis_data::Feature::new(id, Some(Geometry::Point(c)), attrs));
                 ControlFlow::Continue(())
             }
             Err(e) => {
@@ -7585,7 +7585,7 @@ fn zonal_stats_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<
             };
             attrs.push(val);
         }
-        out.features.push(rustgis_data::Feature { id: f.id, geometry: f.geometry.clone(), attrs });
+        out.features.push(rustgis_data::Feature::new(f.id, f.geometry.clone(), attrs));
     }
 
     let n_features = out.features.len();
@@ -8934,7 +8934,7 @@ mod tests {
         let c = Coord::new;
         let mut gpkg = Dataset::new("gpkg", GeometryType::Polyline, vec![]);
         let line = Some(Geometry::Line(vec![vec![c(0.0, 0.0), c(1.0, 1.0)]]));
-        gpkg.features = vec![Feature { id: (-2i64).cast_unsigned(), geometry: line, attrs: vec![] }].into();
+        gpkg.features = vec![Feature::new((-2i64).cast_unsigned(), line, vec![])].into();
         let m = Map(HashMap::from([("gpkg".to_string(), gpkg)]));
         let v = layer(crate::run("featureVerticesToPoints", &m, &serde_json::json!({"input": "gpkg"})).unwrap());
         assert_eq!(v.value(1, v.field_index("orig_fid").unwrap()), &Value::Int(-2));
@@ -8954,8 +8954,8 @@ mod tests {
         let line = Geometry::Line(vec![vec![c(0.0, 0.0), c(1.0, 1.0), c(2.0, 2.0)]]);
         let mut attrs = own.to_vec();
         attrs.push(Value::Text("not copied".into()));
-        let a = Feature { id: 1, geometry: Some(line), attrs };
-        let b = Feature { id: 2, geometry: None, attrs: vec![] };
+        let a = Feature::new(1, Some(line), attrs);
+        let b = Feature::new(2, None, vec![]);
         assert_eq!(size_output_points([&a, &b], 2, 6, false, u64::MAX, vertex_count), (3, None));
         assert_eq!(size_output_points([&a, &b], 2, 6, true, u64::MAX, vertex_count), (3, Some(3 * point_bytes(&own, 6))));
         // Over the limit after the first feature, the second isn't counted.
@@ -10268,7 +10268,7 @@ mod tests {
         let g = Geometry::Point(Coord::new(8.0, 46.0));
         let mut ds = Dataset::new("points", GeometryType::Point, vec![Field::new("text", FieldType::Text)]);
         ds.push(Some(g.clone()), vec![Value::Text("x".repeat(4096))]);
-        let expected = Feature { id: 1, geometry: geodesic_buffer(&g, 5000.0), attrs: ds.features[0].attrs.clone() };
+        let expected = Feature::new(1, geodesic_buffer(&g, 5000.0), ds.features[0].attrs.clone());
         let bytes = std::mem::size_of::<Feature>() + rustgis_data::source::chunk_memory::feature_bytes(&expected);
         let m = Map(HashMap::from([("points".into(), ds)]));
         let p = serde_json::json!({"input":"points", "distance":5});
@@ -14643,7 +14643,7 @@ mod tests {
     fn summarize_within_statistics_fill_short_rows() {
         let mut polys =
             Dataset::new("polys", GeometryType::Polygon, vec![Field::new("a", FieldType::Text), Field::new("b", FieldType::Text)]);
-        polys.features.push(Feature { id: 0, geometry: Some(sq(0.0, 0.0, 2.0)), attrs: vec![] });
+        polys.features.push(Feature::new(0, Some(sq(0.0, 0.0, 2.0)), vec![]));
         let mut pts = Dataset::new("pts", GeometryType::Point, vec![Field::new("v", FieldType::Integer)]);
         pts.push(Some(Geometry::Point(Coord::new(1.0, 1.0))), vec![Value::Int(4)]);
         pts.push(Some(Geometry::Point(Coord::new(1.5, 1.0))), vec![Value::Int(6)]);
@@ -15356,15 +15356,15 @@ mod tests {
         let geom = Some(sq_geom(0.0, 3.0, 2.0, 4.0)); // 2 cells: 1.0, 2.0
 
         // Feature 1: shorter attribute array (only 1 attribute instead of 3)
-        ds.features.push(Feature { id: 1, geometry: geom.clone(), attrs: vec![Value::Text("FeatureA".into())] });
+        ds.features.push(Feature::new(1, geom.clone(), vec![Value::Text("FeatureA".into())]));
         // Feature 2: full attribute array (3 attributes)
-        ds.features.push(Feature {
-            id: 2,
-            geometry: geom.clone(),
-            attrs: vec![Value::Text("FeatureB".into()), Value::Text("Cat1".into()), Value::Float(88.5)],
-        });
+        ds.features.push(Feature::new(
+            2,
+            geom.clone(),
+            vec![Value::Text("FeatureB".into()), Value::Text("Cat1".into()), Value::Float(88.5)],
+        ));
         // Feature 3: empty attribute array (0 attributes)
-        ds.features.push(Feature { id: 3, geometry: geom, attrs: vec![] });
+        ds.features.push(Feature::new(3, geom, vec![]));
 
         let m =
             RasterMap { datasets: HashMap::from([("zones_pad".to_string(), ds)]), rasters: HashMap::from([("elev".to_string(), &raster)]) };
@@ -15468,18 +15468,18 @@ mod tests {
             sq_ring(0.0, 1.0, 3.0, 4.0), // outer 3x3 = 9 cells
             sq_ring(1.0, 2.0, 2.0, 3.0), // hole 1x1 = 1 cell
         ]]);
-        ds.features.push(Feature { id: 101, geometry: Some(f1_geom), attrs: vec![Value::Int(1)] });
+        ds.features.push(Feature::new(101, Some(f1_geom), vec![Value::Int(1)]));
 
         // Feature 2: Defective polygon: hole has fewer than 3 vertices!
         let f2_geom = Geometry::Polygon(vec![vec![
             sq_ring(0.0, 1.0, 3.0, 4.0),
             vec![Coord::new(1.0, 2.0), Coord::new(2.0, 3.0)], // only 2 points!
         ]]);
-        ds.features.push(Feature { id: 102, geometry: Some(f2_geom), attrs: vec![Value::Int(2)] });
+        ds.features.push(Feature::new(102, Some(f2_geom), vec![Value::Int(2)]));
 
         // Feature 3: Valid simple polygon
         let f3_geom = Geometry::Polygon(vec![vec![sq_ring(0.0, 3.0, 1.0, 4.0)]]); // 1 cell
-        ds.features.push(Feature { id: 103, geometry: Some(f3_geom), attrs: vec![Value::Int(3)] });
+        ds.features.push(Feature::new(103, Some(f3_geom), vec![Value::Int(3)]));
 
         let m = RasterMap {
             datasets: HashMap::from([("mixed_zones".to_string(), ds)]),

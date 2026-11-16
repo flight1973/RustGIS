@@ -798,7 +798,9 @@ pub(crate) fn sync_area(s: &mut Session, ai: usize, edited: &rustgis_map::Map) -
                     } else {
                         f.id
                     };
-                    sl.dataset.features.push(rustgis_data::Feature { id, ..f.clone() });
+                    let mut f = f.clone();
+                    f.id = id;
+                    sl.dataset.features.push(f);
                     added += 1;
                 }
             }

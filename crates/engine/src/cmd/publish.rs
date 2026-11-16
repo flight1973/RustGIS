@@ -95,7 +95,11 @@ pub(crate) fn publish_work(s: &Session, p: &Value) -> Result<super::exports::Wor
                 .features
                 .iter()
                 .zip(&ids)
-                .map(|(f, id)| rustgis_data::Feature { id: *id, ..f.clone() })
+                .map(|(f, id)| {
+                    let mut f = f.clone();
+                    f.id = *id;
+                    f
+                })
                 .collect::<Vec<_>>()
                 .into();
             held.fields = published.read.fields.clone();

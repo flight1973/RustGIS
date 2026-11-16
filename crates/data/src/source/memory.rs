@@ -57,7 +57,7 @@ mod tests {
         let mut text = String::with_capacity(1024);
         text.push('x');
         let mut rows = Vec::with_capacity(8);
-        rows.push(Feature { id: 1, geometry: Some(g), attrs: vec![Value::Text(text)] });
+        rows.push(Feature::new(1, Some(g), vec![Value::Text(text)]));
         let expected = rows.capacity() * size_of::<Feature>()
             + 100 * size_of::<crate::Coord>()
             + size_of::<Vec<Vec<crate::Coord>>>()

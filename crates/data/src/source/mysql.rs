@@ -958,7 +958,7 @@ impl MysqlSource {
             })
             .collect();
         // A negative key keeps its bits: still one id per row, and the same on every read.
-        Some(Feature { id, geometry: Some(geometry), attrs })
+        Some(Feature::new(id, Some(geometry), attrs))
     }
 }
 

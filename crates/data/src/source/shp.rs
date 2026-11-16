@@ -257,7 +257,7 @@ impl FeatureSource for ShpSource {
                 }
                 vec![Value::Null; self.table.columns.len()]
             };
-            let f = Feature { id: u64::from(i) + 1, geometry, attrs };
+            let f = Feature::new(u64::from(i) + 1, geometry, attrs);
             if late {
                 sample.keep(f)
             } else {
@@ -348,7 +348,7 @@ impl FeatureSource for ShpSource {
             } else {
                 vec![Value::Null; self.table.columns.len()]
             };
-            chunks.push(Feature { id: u64::from(i) + 1, geometry, attrs })
+            chunks.push(Feature::new(u64::from(i) + 1, geometry, attrs))
         })?;
         chunks.flush()?;
         Ok(Batch { features: Vec::new(), matched, complete, skipped, unread_dates, rounded_dates: Vec::new() })

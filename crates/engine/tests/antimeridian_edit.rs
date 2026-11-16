@@ -12,7 +12,7 @@ fn across_180() -> (Session, u32) {
     let c = Coord::new;
     let ring = vec![c(179.6, 10.0), c(180.2, 10.0), c(180.2, 10.3), c(179.6, 10.3), c(179.6, 10.0)];
     let mut data = Dataset::new("Across", GeometryType::Polygon, vec![Field::new("n", FieldType::Integer)]);
-    data.features = vec![Feature { id: 1, geometry: Some(Geometry::Polygon(vec![vec![ring]])), attrs: vec![Value::Int(0)] }].into();
+    data.features = vec![Feature::new(1, Some(Geometry::Polygon(vec![vec![ring]])), vec![Value::Int(0)])].into();
     let mut s = Session::new(Project::new("Across 180"));
     let id = s.map_mut().add_dataset(data);
     s.active_layer = Some(id);

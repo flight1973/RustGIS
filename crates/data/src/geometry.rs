@@ -1,6 +1,6 @@
 //! Geometry: points, polylines and polygons (each possibly multi-part), plus hit testing.
 
-use rustgis_geom::{Coord, Extent, wgs84_length_m, wgs84_ring_perimeter_area_m2};
+use rustgis_geom::{Coord, CoordZ, Extent, wgs84_length_m, wgs84_ring_perimeter_area_m2};
 use serde::{Deserialize, Serialize};
 
 /// Subdivisions of the label fallback grid; both endpoints are sampled.
@@ -135,25 +135,138 @@ impl Measure {
     }
 }
 
-/// A geometry. Lines hold parts; polygons hold polygons of rings (first ring = exterior).
+/// A geometry of positions `C`. Lines hold parts; polygons hold polygons of rings (first ring =
+/// exterior). [`Geometry`] holds x and y ([`Coord`]); [`GeometryZ`] holds x, y and a height
+/// ([`CoordZ`]) for a layer read with heights, in the same shape, so reversing, rewinding, closing
+/// or copying its positions moves each height with its point.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub enum Geometry {
-    Point(Coord),
-    MultiPoint(Vec<Coord>),
-    Line(Vec<Vec<Coord>>),
-    Polygon(Vec<Vec<Vec<Coord>>>),
+#[cfg_attr(feature = "schema", schemars(rename = "Geometry{C}"))]
+pub enum Geom<C> {
+    Point(C),
+    MultiPoint(Vec<C>),
+    Line(Vec<Vec<C>>),
+    Polygon(Vec<Vec<Vec<C>>>),
 }
 
-impl Geometry {
+/// A geometry in x and y: what the map draws and every 2-D tool reads.
+pub type Geometry = Geom<Coord>;
+/// A geometry with a height at every position: a 3-D layer's own geometry
+/// ([`crate::Feature::geometry_z`]).
+pub type GeometryZ = Geom<CoordZ>;
+
+/// A position a geometry can hold: x and y, and for [`CoordZ`] a height.
+pub trait Position: Copy {
+    /// Where it is on the map.
+    fn xy(self) -> Coord;
+}
+
+impl Position for Coord {
+    fn xy(self) -> Coord {
+        self
+    }
+}
+
+impl Position for CoordZ {
+    fn xy(self) -> Coord {
+        CoordZ::xy(self)
+    }
+}
+
+impl<C: Position> Geom<C> {
     pub fn kind(&self) -> GeometryType {
         match self {
-            Geometry::Point(_) | Geometry::MultiPoint(_) => GeometryType::Point,
-            Geometry::Line(_) => GeometryType::Polyline,
-            Geometry::Polygon(_) => GeometryType::Polygon,
+            Geom::Point(_) | Geom::MultiPoint(_) => GeometryType::Point,
+            Geom::Line(_) => GeometryType::Polyline,
+            Geom::Polygon(_) => GeometryType::Polygon,
         }
     }
 
+    /// The same shape with every position turned into another kind: `to_2d` and `with_z` are
+    /// built on it. Order and nesting are kept, so each new position comes from the old one at its
+    /// place.
+    pub fn map_positions<D>(&self, f: &impl Fn(C) -> D) -> Geom<D> {
+        match self {
+            Geom::Point(c) => Geom::Point(f(*c)),
+            Geom::MultiPoint(v) => Geom::MultiPoint(v.iter().map(|c| f(*c)).collect()),
+            Geom::Line(parts) => Geom::Line(parts.iter().map(|p| p.iter().map(|c| f(*c)).collect()).collect()),
+            Geom::Polygon(polys) => {
+                Geom::Polygon(polys.iter().map(|rings| rings.iter().map(|r| r.iter().map(|c| f(*c)).collect()).collect()).collect())
+            }
+        }
+    }
+
+    /// The geometry on the map: x and y of every position, heights left out.
+    pub fn to_2d(&self) -> Geometry {
+        self.map_positions(&|c: C| c.xy())
+    }
+
+    /// Calls `f` with every position, in order: parts, rings, points, closing points included.
+    pub fn for_each_position(&self, mut f: impl FnMut(C)) {
+        match self {
+            Geom::Point(c) => f(*c),
+            Geom::MultiPoint(v) => v.iter().copied().for_each(f),
+            Geom::Line(parts) => parts.iter().flatten().copied().for_each(f),
+            Geom::Polygon(polys) => polys.iter().flatten().flatten().copied().for_each(f),
+        }
+    }
+
+    /// Whether `other` has the same shape and every position of it the same x and y as this one's
+    /// (NaN matched by its bits). What keeps a 3-D feature's heights on their points: its 2-D
+    /// geometry must be exactly this one's x and y.
+    pub fn same_xy<D: Position>(&self, other: &Geom<D>) -> bool {
+        fn path<C: Position, D: Position>(a: &[C], b: &[D]) -> bool {
+            a.len() == b.len() && a.iter().zip(b).all(|(p, q)| same_point(&p.xy(), &q.xy()))
+        }
+        match (self, other) {
+            (Geom::Point(a), Geom::Point(b)) => same_point(&a.xy(), &b.xy()),
+            (Geom::MultiPoint(a), Geom::MultiPoint(b)) => path(a, b),
+            (Geom::Line(a), Geom::Line(b)) => a.len() == b.len() && a.iter().zip(b).all(|(p, q)| path(p, q)),
+            (Geom::Polygon(a), Geom::Polygon(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(p, q)| p.len() == q.len() && p.iter().zip(q).all(|(r, t)| path(r, t)))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl GeometryZ {
+    /// Heights for a 2-D geometry, one per position from `z`, which is called with each position
+    /// in order.
+    pub fn from_2d(g: &Geometry, z: &impl Fn(Coord) -> f64) -> GeometryZ {
+        g.map_positions(&|c: Coord| CoordZ::new(c.x, c.y, z(c)))
+    }
+
+    /// A copy with every x and y transformed and every height kept (a reprojection).
+    pub fn map_xy(&self, f: &impl Fn(Coord) -> Coord) -> GeometryZ {
+        self.map_positions(&|c: CoordZ| c.with_xy(f(c.xy())))
+    }
+
+    /// Whether every x, y and height is a number.
+    pub fn is_finite(&self) -> bool {
+        let mut all = true;
+        self.for_each_position(|c| all &= c.is_finite());
+        all
+    }
+
+    /// The height a point `c` placed on the edge that starts at vertex `after` gets: linear along
+    /// the edge in x and y, from `c`'s nearest place on it (clamped to its ends). `None` when
+    /// there is no such edge. A zero-length edge gives its start's height.
+    pub fn height_on_edge(&self, after: VertexId, c: Coord) -> Option<f64> {
+        let mut found = None;
+        self.for_each_edge(|v, a, b| {
+            if v == after && found.is_none() {
+                let (dx, dy) = (b.x - a.x, b.y - a.y);
+                let len2 = dx * dx + dy * dy;
+                let t = if len2 > 0.0 { (((c.x - a.x) * dx + (c.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+                found = Some(a.z + (b.z - a.z) * t);
+            }
+        });
+        found.filter(|z| z.is_finite())
+    }
+}
+
+impl Geometry {
     /// Calls `f` with every coordinate.
     pub fn for_each_coord(&self, mut f: impl FnMut(Coord)) {
         match self {
@@ -419,9 +532,9 @@ impl VertexId {
 }
 
 /// How many vertices a path has: a closed ring's repeated last point doesn't count.
-fn open_len(path: &[Coord], ring: bool) -> usize {
+fn open_len<C: Position>(path: &[C], ring: bool) -> usize {
     match (path.first(), path.last()) {
-        (Some(a), Some(b)) if ring && path.len() > 1 && same_point(a, b) => path.len() - 1,
+        (Some(a), Some(b)) if ring && path.len() > 1 && same_point(&a.xy(), &b.xy()) => path.len() - 1,
         _ => path.len(),
     }
 }
@@ -434,19 +547,19 @@ fn same_point(a: &Coord, b: &Coord) -> bool {
     same(a.x, b.x) && same(a.y, b.y)
 }
 
-impl Geometry {
+impl<C: Position> Geom<C> {
     /// Calls `f` with each path that vertices lie on: its part and ring, and whether it is a polygon
     /// ring. Nothing is allocated, so a geometry of many parts costs no memory to walk.
-    fn for_each_path(&self, mut f: impl FnMut(usize, usize, &[Coord], bool)) {
+    fn for_each_path(&self, mut f: impl FnMut(usize, usize, &[C], bool)) {
         match self {
-            Geometry::Point(c) => f(0, 0, std::slice::from_ref(c), false),
-            Geometry::MultiPoint(v) => f(0, 0, v.as_slice(), false),
-            Geometry::Line(parts) => {
+            Geom::Point(c) => f(0, 0, std::slice::from_ref(c), false),
+            Geom::MultiPoint(v) => f(0, 0, v.as_slice(), false),
+            Geom::Line(parts) => {
                 for (i, p) in parts.iter().enumerate() {
                     f(i, 0, p.as_slice(), false);
                 }
             }
-            Geometry::Polygon(polys) => {
+            Geom::Polygon(polys) => {
                 for (i, rings) in polys.iter().enumerate() {
                     for (j, r) in rings.iter().enumerate() {
                         f(i, j, r.as_slice(), true);
@@ -457,19 +570,19 @@ impl Geometry {
     }
 
     /// The path a vertex lies on, and whether it is a polygon ring. It picks out the same path that
-    /// [`Geometry::for_each_path`] passes to its callback for these indices, so the two must change
+    /// [`Geom::for_each_path`] passes to its callback for these indices, so the two must change
     /// together.
-    fn path(&self, part: usize, ring: usize) -> Option<(&[Coord], bool)> {
+    fn path(&self, part: usize, ring: usize) -> Option<(&[C], bool)> {
         match self {
-            Geometry::Point(c) => (part == 0 && ring == 0).then_some((std::slice::from_ref(c), false)),
-            Geometry::MultiPoint(v) => (part == 0 && ring == 0).then_some((v.as_slice(), false)),
-            Geometry::Line(parts) => parts.get(part).filter(|_| ring == 0).map(|p| (p.as_slice(), false)),
-            Geometry::Polygon(polys) => polys.get(part).and_then(|rings| rings.get(ring)).map(|r| (r.as_slice(), true)),
+            Geom::Point(c) => (part == 0 && ring == 0).then_some((std::slice::from_ref(c), false)),
+            Geom::MultiPoint(v) => (part == 0 && ring == 0).then_some((v.as_slice(), false)),
+            Geom::Line(parts) => parts.get(part).filter(|_| ring == 0).map(|p| (p.as_slice(), false)),
+            Geom::Polygon(polys) => polys.get(part).and_then(|rings| rings.get(ring)).map(|r| (r.as_slice(), true)),
         }
     }
 
     /// Calls `f` with every vertex, a closed ring's repeated last point left out.
-    pub fn for_each_vertex(&self, mut f: impl FnMut(VertexId, Coord)) {
+    pub fn for_each_vertex(&self, mut f: impl FnMut(VertexId, C)) {
         self.for_each_path(|part, ring, path, closed| {
             for (index, c) in path.iter().take(open_len(path, closed)).enumerate() {
                 f(VertexId { part, ring, index }, *c);
@@ -478,7 +591,7 @@ impl Geometry {
     }
 
     /// Every vertex, a closed ring's repeated last point left out.
-    pub fn vertices(&self) -> Vec<(VertexId, Coord)> {
+    pub fn vertices(&self) -> Vec<(VertexId, C)> {
         let mut out = Vec::new();
         self.for_each_vertex(|v, c| out.push((v, c)));
         out
@@ -487,8 +600,8 @@ impl Geometry {
     /// Calls `f` with every edge of a line or polygon: the vertex it starts at and its two ends
     /// (a ring's last edge comes back to its first vertex). A vertex inserted on an edge goes
     /// after its start.
-    pub fn for_each_edge(&self, mut f: impl FnMut(VertexId, Coord, Coord)) {
-        if matches!(self, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+    pub fn for_each_edge(&self, mut f: impl FnMut(VertexId, C, C)) {
+        if matches!(self, Geom::Point(_) | Geom::MultiPoint(_)) {
             return;
         }
         self.for_each_path(|part, ring, path, closed| {
@@ -502,34 +615,34 @@ impl Geometry {
         });
     }
 
-    /// Every edge of a line or polygon (see [`Geometry::for_each_edge`]).
-    pub fn edges(&self) -> Vec<(VertexId, Coord, Coord)> {
+    /// Every edge of a line or polygon (see [`Geom::for_each_edge`]).
+    pub fn edges(&self) -> Vec<(VertexId, C, C)> {
         let mut out = Vec::new();
         self.for_each_edge(|v, a, b| out.push((v, a, b)));
         out
     }
 
     /// The vertex's position, if it has one.
-    pub fn vertex(&self, v: VertexId) -> Option<Coord> {
+    pub fn vertex(&self, v: VertexId) -> Option<C> {
         let (path, closed) = self.path(v.part, v.ring)?;
         (v.index < open_len(path, closed)).then(|| path.get(v.index).copied()).flatten()
     }
 
     /// The path a vertex lies on, mutably, and whether it is a polygon ring.
-    fn path_mut(&mut self, part: usize, ring: usize) -> Option<(&mut Vec<Coord>, bool)> {
+    fn path_mut(&mut self, part: usize, ring: usize) -> Option<(&mut Vec<C>, bool)> {
         match self {
-            Geometry::Point(_) => None,
-            Geometry::MultiPoint(v) => (part == 0 && ring == 0).then_some((v, false)),
-            Geometry::Line(parts) => parts.get_mut(part).filter(|_| ring == 0).map(|p| (p, false)),
-            Geometry::Polygon(polys) => polys.get_mut(part).and_then(|rings| rings.get_mut(ring)).map(|r| (r, true)),
+            Geom::Point(_) => None,
+            Geom::MultiPoint(v) => (part == 0 && ring == 0).then_some((v, false)),
+            Geom::Line(parts) => parts.get_mut(part).filter(|_| ring == 0).map(|p| (p, false)),
+            Geom::Polygon(polys) => polys.get_mut(part).and_then(|rings| rings.get_mut(ring)).map(|r| (r, true)),
         }
     }
 
     /// A copy with a vertex moved to `c` (a ring's closing point goes with its first vertex).
-    pub fn move_vertex(&self, v: VertexId, c: Coord) -> Option<Geometry> {
+    pub fn move_vertex(&self, v: VertexId, c: C) -> Option<Geom<C>> {
         self.vertex(v)?;
         let mut g = self.clone();
-        if let Geometry::Point(p) = &mut g {
+        if let Geom::Point(p) = &mut g {
             *p = c;
             return Some(g);
         }
@@ -544,8 +657,8 @@ impl Geometry {
 
     /// A copy with a vertex at `c` inserted after `after`, on the edge it starts (lines and
     /// polygons only).
-    pub fn insert_vertex(&self, after: VertexId, c: Coord) -> Option<Geometry> {
-        if matches!(self, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+    pub fn insert_vertex(&self, after: VertexId, c: C) -> Option<Geom<C>> {
+        if matches!(self, Geom::Point(_) | Geom::MultiPoint(_)) {
             return None;
         }
         self.vertex(after)?;
@@ -557,11 +670,11 @@ impl Geometry {
 
     /// A copy without a vertex, refused when a line would keep fewer than two vertices, a
     /// polygon ring fewer than three or a multipoint none.
-    pub fn delete_vertex(&self, v: VertexId) -> Result<Geometry, &'static str> {
+    pub fn delete_vertex(&self, v: VertexId) -> Result<Geom<C>, &'static str> {
         self.vertex(v).ok_or("no such vertex")?;
         let mut g = self.clone();
         let kind = g.kind();
-        let multi = matches!(g, Geometry::MultiPoint(_));
+        let multi = matches!(g, Geom::MultiPoint(_));
         let Some((path, ring)) = g.path_mut(v.part, v.ring) else {
             return Err("a point has only one vertex");
         };

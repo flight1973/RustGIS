@@ -2091,11 +2091,11 @@ fn big(n: usize, parquet: bool) -> Vec<u8> {
         for j in 0..n {
             let c = Coord::new(-179.0 + 358.0 * i as f64 / n as f64, -80.0 + 160.0 * j as f64 / n as f64);
             let id = (i * n + j) as u64;
-            ds.features.push(crate::Feature {
-                id: id + 1,
-                geometry: Some(Geometry::Point(c)),
-                attrs: vec![Value::Text(format!("p{i}_{j}")), Value::Int(id as i64)],
-            });
+            ds.features.push(crate::Feature::new(
+                id + 1,
+                Some(Geometry::Point(c)),
+                vec![Value::Text(format!("p{i}_{j}")), Value::Int(id as i64)],
+            ));
         }
     }
     if !parquet {
@@ -4474,8 +4474,7 @@ fn streamed_export_progress_counts_each_source_row_once() {
 fn unbounded_parquet_view_bounds_aggregate_row_masks() {
     let p = dir().join("many-groups.parquet");
     let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
-    ds.features =
-        (0..40_000).map(|id| crate::Feature { id, geometry: Some(Geometry::Point(Coord::new(-81.0, 0.0))), attrs: vec![] }).collect();
+    ds.features = (0..40_000).map(|id| crate::Feature::new(id, Some(Geometry::Point(Coord::new(-81.0, 0.0))), vec![])).collect();
     write_projected_parquet_fixture(&ds, &p, 100, true);
     let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_scan_bytes(32 << 10);
     let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };

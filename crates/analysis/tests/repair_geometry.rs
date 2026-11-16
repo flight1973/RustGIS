@@ -713,19 +713,11 @@ fn attributes_crs_ids_and_names_are_kept() {
     l.ds.crs = Some(rustgis_data::raster::Crs::Epsg(2180));
     l.ds.crs_incomplete = true;
     l.ds.zm_dropped = true;
-    l.ds.features.push(Feature {
-        id: 41,
-        geometry: Some(poly(&[SQUARE])),
-        attrs: vec![Value::Text("ok".into()), Value::Float(1.5), Value::Int(1)],
-    });
+    l.ds.features.push(Feature::new(41, Some(poly(&[SQUARE])), vec![Value::Text("ok".into()), Value::Float(1.5), Value::Int(1)]));
     // A short row: its missing value is null.
-    l.ds.features.push(Feature { id: 42, geometry: Some(poly(&[BOWTIE])), attrs: vec![Value::Text("bad".into()), Value::Float(2.5)] });
+    l.ds.features.push(Feature::new(42, Some(poly(&[BOWTIE])), vec![Value::Text("bad".into()), Value::Float(2.5)]));
     // A long row: its extra value is left out, and said so.
-    l.ds.features.push(Feature {
-        id: 7,
-        geometry: None,
-        attrs: vec![Value::Text("none".into()), Value::Null, Value::Int(3), Value::Int(9)],
-    });
+    l.ds.features.push(Feature::new(7, None, vec![Value::Text("none".into()), Value::Null, Value::Int(3), Value::Int(9)]));
     let named = |output: Option<&str>| {
         let mut p = json!({"input": "input"});
         if let Some(o) = output {

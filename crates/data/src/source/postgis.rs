@@ -1120,7 +1120,7 @@ impl PostgisSource {
             })
             .collect();
         // A negative key keeps its bits: still one id per row, and the same on every read.
-        Some(Feature { id: id.cast_unsigned(), geometry: Some(geometry), attrs })
+        Some(Feature::new(id.cast_unsigned(), Some(geometry), attrs))
     }
 
     /// The table's spatial index on the column, if it has one (a view has none of its own).

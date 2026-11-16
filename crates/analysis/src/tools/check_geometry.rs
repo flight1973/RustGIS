@@ -150,7 +150,7 @@ fn run_with_room(
         let geometry =
             if item.non_finite { None } else { f.geometry.as_ref().map(crate::merge::clone_geometry).transpose().map_err(no_memory)? };
         // The input's id, so a row leads back to its feature.
-        list.push(Feature { id: f.id, geometry, attrs });
+        list.push(Feature::new(f.id, geometry, attrs));
     }
     out.features = list.into();
 

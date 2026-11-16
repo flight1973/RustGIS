@@ -252,13 +252,9 @@ fn attributes_crs_ids_and_names_are_kept() {
     l.ds.crs = Some(rustgis_data::raster::Crs::Epsg(2180));
     l.ds.crs_incomplete = true;
     l.ds.zm_dropped = true;
-    l.ds.features.push(Feature {
-        id: 41,
-        geometry: Some(poly(&[SQUARE])),
-        attrs: vec![Value::Text("ok".into()), Value::Float(1.5), Value::Int(1)],
-    });
+    l.ds.features.push(Feature::new(41, Some(poly(&[SQUARE])), vec![Value::Text("ok".into()), Value::Float(1.5), Value::Int(1)]));
     // A short row: its missing value is null.
-    l.ds.features.push(Feature { id: 42, geometry: Some(poly(&[BOWTIE])), attrs: vec![Value::Text("bad".into()), Value::Float(2.5)] });
+    l.ds.features.push(Feature::new(42, Some(poly(&[BOWTIE])), vec![Value::Text("bad".into()), Value::Float(2.5)]));
     let named = |output: Option<&str>| {
         let mut p = json!({"input": "input"});
         if let Some(o) = output {
@@ -489,7 +485,7 @@ fn long_lists_of_problems_are_cut_with_a_count() {
 #[test]
 fn extra_attribute_values_are_reported() {
     let mut l = layer(GeometryType::Polygon);
-    l.ds.features.push(Feature { id: 1, geometry: Some(poly(&[BOWTIE])), attrs: vec![Value::Text("a".into()), Value::Int(9)] });
+    l.ds.features.push(Feature::new(1, Some(poly(&[BOWTIE])), vec![Value::Text("a".into()), Value::Int(9)]));
     let r = run(&l);
     let ds = dataset(&r);
     assert_eq!(ds.features[0].attrs.len(), 3);
