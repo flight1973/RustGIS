@@ -1347,8 +1347,29 @@ fn read_path_with_placing(path: &Path, subdataset: Option<&str>, crs: Option<&st
     if (subdataset.is_some() || crs.is_some()) && gdal::is_gdal_raster_name(&path.to_string_lossy()) {
         return read_converted(path, &gdal::convert(path, subdataset, crs)?);
     }
-    let _ = (subdataset, crs);
-    read_path_placing(path, world)
+    let ignored = elevation_ignores(&path.to_string_lossy(), subdataset, crs);
+    let mut r = read_path_placing(path, world)?;
+    r.lost.extend(ignored);
+    Ok(r)
+}
+
+/// What reading an SRTM tile or DTED file (`name`) with a subdataset (`"layer"`) or a coordinate
+/// system (`"crs"`) says: they are WGS 84 with one band, so neither applies, and the file is read
+/// without them. A command may give them, and so may a project saved when these files went
+/// through GDAL. `None` for other files, or when neither is given.
+pub fn elevation_ignores(name: &str, subdataset: Option<&str>, crs: Option<&str>) -> Option<String> {
+    let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !matches!(ext.as_str(), "hgt" | "dt0" | "dt1" | "dt2") {
+        return None;
+    }
+    let given = |v: Option<&str>| v.is_some_and(|v| !v.trim().is_empty());
+    let what = match (given(subdataset), given(crs)) {
+        (true, true) => "the \"layer\" and \"crs\" given are",
+        (true, false) => "the \"layer\" given is",
+        (false, true) => "the \"crs\" given is",
+        (false, false) => return None,
+    };
+    Some(format!("{what} ignored: SRTM and DTED files are WGS 84 longitude/latitude, with one band"))
 }
 
 /// Reads the GeoTIFF GDAL converted `path` to, named and sourced as `path` (and its subdataset).

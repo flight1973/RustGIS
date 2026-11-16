@@ -561,12 +561,14 @@ pub(crate) fn say_losses(s: &mut Session, losses: Vec<(String, String)>) {
     }
 }
 
-/// Opens a raster file by path.
-pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, scan: bool) -> CmdResult {
+/// Opens a raster file by path; `ignored` is said with what reading it lost (options given that
+/// don't apply to it).
+pub fn add_path(s: &mut Session, path: &str, name: Option<&str>, scan: bool, ignored: Option<String>) -> CmdResult {
     let mut r = match super::reads::take(s, &read_key(path, scan)) {
         Some(r) => r,
         None => read_raster_as(path, scan),
     }?;
+    r.lost.extend(ignored);
     if scan {
         r = r.into_scan().map_err(|e| format!("{path}: {e}"))?;
     }
@@ -691,6 +693,7 @@ pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: V
     }
     if raster::is_raster_name(&name) {
         let mut r = raster::read_bytes(&name, &bytes).map_err(|e| format!("{name}: {e}"))?;
+        r.lost.extend(raster::elevation_ignores(&name, ps(p, "layer"), ps(p, "crs")));
         if scan {
             r = r.into_scan().map_err(|e| format!("{name}: {e}"))?;
         }

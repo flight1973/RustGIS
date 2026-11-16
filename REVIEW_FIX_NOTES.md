@@ -6,8 +6,8 @@
 - [x] 3. HGT 7201 sizes, cut-short hint
 - [x] 4. Stepped post_transform: kept post at its cell's center
 - [x] 5. Multi-byte char after the tile code
-- [ ] 7. crs/layer ignored notice for hgt/dted
+- [x] 7. crs/layer ignored notice for hgt/dted
 - [ ] 8. Python embed list
 - [ ] 9. read_scan_limited uses step_within if identical
 
-Next: 7, the crs/layer notice in mod.rs read_path_with_placing.
+Next: 8, the Python embed list.
