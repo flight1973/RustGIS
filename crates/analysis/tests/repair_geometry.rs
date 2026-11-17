@@ -1311,3 +1311,18 @@ fn even_odd_builds_part_by_part() {
     assert!(messages.iter().any(|m| m.contains("joined into one")), "{messages:?}");
     assert_eq!(got.map(|g| area(&g)), Some(202.0));
 }
+
+/// What Even-Odd's notices say is what it did: a part repeated whole is left out as a duplicate,
+/// not said as an overlap left out, and where two holes of a part overlap is area again.
+#[test]
+fn even_odd_notices_match_the_result() {
+    let (got, repairs, messages) = one_by("Even-Odd", multi(&[&[SQUARE], &[SQUARE]]));
+    assert_eq!(got.map(|g| area(&g)), Some(100.0), "{repairs}");
+    assert!(messages.iter().any(|m| m.contains("1 duplicate ring was left out")), "{messages:?}");
+    assert!(messages.iter().any(|m| m.contains("a part repeated whole is kept once")), "{messages:?}");
+    let left: Ring = &[(2., 2.), (6., 2.), (6., 6.), (2., 6.), (2., 2.)];
+    let right: Ring = &[(4., 4.), (8., 4.), (8., 8.), (4., 8.), (4., 4.)];
+    let (got, _, messages) = one_by("Even-Odd", poly(&[SQUARE, left, right]));
+    assert_eq!(got.map(|g| area(&g)), Some(100.0 - 28.0 + 4.0));
+    assert!(messages.iter().any(|m| m.contains("where two holes overlap is area again")), "{messages:?}");
+}

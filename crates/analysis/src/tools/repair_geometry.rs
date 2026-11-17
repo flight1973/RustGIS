@@ -304,7 +304,7 @@ fn notices(t: &Tally, field: &str, rule: Rule) -> Vec<String> {
     }
     if merged > 0 && rule == Rule::EvenOdd {
         messages.push(format!(
-            "{TOOL}: the parts that overlapped or touched along a line in {} were combined by the Even-Odd rule: where they overlapped is left out, and parts meeting along a line were joined into one",
+            "{TOOL}: the parts that overlapped or touched along a line in {} were combined by the Even-Odd rule: where they overlapped is left out, except that a part repeated whole is kept once, and parts meeting along a line were joined into one",
             features(merged)
         ));
     }
@@ -326,7 +326,7 @@ fn notices(t: &Tally, field: &str, rule: Rule) -> Vec<String> {
     }
     if t.even_odd > 0 {
         messages.push(format!(
-            "{TOOL}: {} {} rebuilt by the Even-Odd rule, with {EVEN_ODD} in {field}: each keeps what lies inside an odd number of its rings, whatever their roles, so where rings overlap is left out, a ring inside another is a hole, and what of a hole lies outside its exterior ring is a part",
+            "{TOOL}: {} {} rebuilt by the Even-Odd rule, with {EVEN_ODD} in {field}: each part keeps what lies inside an odd number of its rings, whatever their roles, so where two holes overlap is area again, a ring inside another is a hole, and what of a hole lies outside its exterior ring is a part; then the parts are combined the same way",
             features(t.even_odd),
             was(t.even_odd)
         ));

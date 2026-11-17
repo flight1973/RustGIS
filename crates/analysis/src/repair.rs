@@ -139,22 +139,32 @@ pub(crate) enum Rule {
     ShellsMinusHoles,
     /// Each ring's own area as [`Rule::ShellsMinusHoles`] reads it (its loops by winding, so a
     /// ring traced twice or a bowtie keeps its area), then the rings combined by parity whatever
-    /// their roles: what lies inside an odd number of rings is in (GEOS's "linework" gives the same
-    /// area). Where two parts overlap is left out, a ring listed as a part inside another is a
-    /// hole, and what of a hole lies outside its exterior ring is a part. Exact duplicate rings of
-    /// one role are dropped first, since a pair would cancel out ([`Repaired::duplicates`]).
+    /// their roles, first within each part and then the parts together: what lies inside an odd
+    /// number of rings is in, close to GEOS's "linework" method. Where two parts overlap is left
+    /// out, where two holes of a part overlap is area again, a ring listed as a part inside another
+    /// is a hole, and what of a hole lies outside its exterior ring is a part. A hole repeated in
+    /// its part and a part repeated whole are dropped first, since a pair would cancel out
+    /// ([`Repaired::duplicates`]); linework would cancel them.
     EvenOdd,
 }
 
 /// Each rule by the name Repair Geometry's `rule` parameter gives it, in the order it offers them.
-const NAMED: [(&str, Rule); 2] = [("Shells Minus Holes", Rule::ShellsMinusHoles), ("Even-Odd", Rule::EvenOdd)];
-/// The names of [`NAMED`], as the parameter's choices.
-pub(crate) const RULES: [&str; 2] = [NAMED[0].0, NAMED[1].0];
+const NAMED: &[(&str, Rule)] = &[("Shells Minus Holes", Rule::ShellsMinusHoles), ("Even-Odd", Rule::EvenOdd)];
+/// The names of [`NAMED`], in its order, as the parameter's choices.
+pub(crate) const RULES: [&str; NAMED.len()] = {
+    let mut names = [""; NAMED.len()];
+    let mut i = 0;
+    while i < NAMED.len() {
+        names[i] = NAMED[i].0;
+        i += 1;
+    }
+    names
+};
 
 impl Rule {
-    /// The rule a tool parameter names, as [`NAMED`] spells it.
+    /// The rule a tool parameter names, as [`NAMED`] spells it, in any case.
     pub(crate) fn named(name: &str) -> Option<Rule> {
-        NAMED.iter().find(|(n, _)| *n == name).map(|(_, rule)| *rule)
+        NAMED.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, rule)| *rule)
     }
 }
 
@@ -605,21 +615,17 @@ fn ring_area(ring: &[Coord], at: (usize, usize), crossing: &[(usize, usize)], ro
 ///   parts meeting along a line are joined.
 ///
 /// Besides the checks' codes it finds those the checks can't tell of a part with a ring crossing
-/// itself ([`unrelated_hole_codes`]), and [`Code::PartsOverlap`] when a part was another's
-/// duplicate, or when the parts' combination makes fewer polygons than it was given (parts joined)
+/// itself ([`unrelated_hole_codes`]), and [`Code::PartsOverlap`] when the parts' combination makes fewer polygons than it was given (parts joined)
 /// or less area than they had, by more than rounding to the grid could take: it moves each edge by
 /// at most half a step on each axis, so changes the area by less than the rings' length times a
 /// step.
 fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -> Result<Rebuilt, Kept> {
     let empty = geo::MultiPolygon::<f64>::new(vec![]);
-    let Distinct { keep, duplicates, duplicate_parts } = distinct_rings(parts, room).map_err(kept_for)?;
+    let Distinct { keep, duplicates } = distinct_rings(parts, room).map_err(kept_for)?;
     let mut all: Vec<geo::Polygon<f64>> = Vec::new();
     let mut no_area = 0usize;
     let mut narrow = 0usize;
     let mut found = Found::new();
-    if duplicate_parts > 0 {
-        found.push(Code::PartsOverlap);
-    }
     // `keep` is by part, then ring, and keeps every exterior ring of a part it keeps.
     for kept in keep.chunk_by(|a, b| a.0 == b.0) {
         let Some(&(p, 0)) = kept.first() else { continue };
@@ -646,6 +652,9 @@ fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room)
         if !cut.is_empty() {
             let step = on_grid(rings_of(&shell.0).chain(rings_of(&cut)))?;
             cut = wider(cut, step, &mut narrow, room)?;
+            // What is left is on that grid too; checked again all the same, since a panic in the
+            // overlay can't be caught in the browser.
+            on_grid(rings_of(&shell.0).chain(rings_of(&cut)))?;
         }
         let part = if cut.is_empty() {
             shell
@@ -673,6 +682,7 @@ fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room)
         // step checks the grid can take every vertex, which holds for those left.
         let step = on_grid(rings_of(&all))?;
         let all = wider(all, step, &mut narrow, room)?;
+        on_grid(rings_of(&all))?;
         let given = all.len();
         let each: f64 = all.iter().map(Area::unsigned_area).sum();
         let length: f64 = rings_of(&all).map(|r| Euclidean.length(r)).sum();
@@ -709,9 +719,8 @@ fn unrelated_hole_codes(shell: &geo::MultiPolygon<f64>, cut: &geo::MultiPolygon<
 struct Distinct {
     /// The rings to combine, by part and then ring.
     keep: Vec<(usize, usize)>,
-    /// How many rings were left out as duplicates, and how many parts.
+    /// How many rings were left out as duplicates.
     duplicates: usize,
-    duplicate_parts: usize,
 }
 
 /// The rings of `parts` to combine under [`Rule::EvenOdd`], without exact duplicates whose
@@ -724,6 +733,13 @@ struct Distinct {
 fn distinct_rings(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<Distinct, Limit> {
     let n = parts.iter().map(Vec::len).fold(0usize, usize::saturating_add);
     let mut keep: Vec<(usize, usize)> = room.vec(n)?;
+    // One part with one hole or none can have no duplicate.
+    if let [rings] = parts
+        && rings.len() < 3
+    {
+        keep.extend((0..rings.len()).map(|r| (0, r)));
+        return Ok(Distinct { keep, duplicates: 0 });
+    }
     let mut duplicates = 0usize;
     for (p, rings) in parts.iter().enumerate() {
         let Some((_, rest)) = rings.split_first() else { continue };
@@ -775,7 +791,7 @@ fn distinct_rings(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<Distinct, Lim
     repeated.sort_unstable();
     let before = keep.len();
     keep.retain(|(p, _)| repeated.binary_search(p).is_err());
-    Ok(Distinct { duplicates: duplicates + (before - keep.len()), duplicate_parts: repeated.len(), keep })
+    Ok(Distinct { duplicates: duplicates + (before - keep.len()), keep })
 }
 
 /// Of `rings` (an id and the ring), the ids of those that aren't an exact duplicate of another with

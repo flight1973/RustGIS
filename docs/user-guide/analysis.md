@@ -1276,7 +1276,7 @@ either way.
   them.
 - **Even-Odd** reads each ring's own area the same way, so a bowtie keeps both triangles and a ring
   traced twice counts once, then keeps what lies inside an odd number of rings, whatever their
-  roles. This matches the "linework" method of make-valid tools. Where two parts overlap is left
+  roles. This is close to the "linework" method of make-valid tools. Where two parts overlap is left
   out, a ring listed as a part inside another is a hole, and what of a hole lies outside its
   exterior ring is a part. It suits data whose ring roles may be wrong, such as a hole stored as a
   part of its own: Shells Minus Holes fills it, Even-Odd keeps it a hole. Each part is combined
