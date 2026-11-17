@@ -601,13 +601,16 @@ fn convert_position(s: &mut Session, p: &Value) -> CmdResult {
     };
     let (c, notice) = typed_place(s.map(), p, false)?;
     // Degrees to 1e-9 (under a millimeter), so text in degrees, minutes and seconds doesn't come
-    // back as -74.00600000000001; grid meters to the millimeter, which the projections are good to.
-    // Adding 0.0 turns a -0.0 from a tiny negative into 0.
+    // back as -74.00600000000001; adding 0.0 turns a -0.0 from a tiny negative into 0. Every form
+    // below is made from this one place, so they all agree on its hemisphere.
     let nano = |v: f64| (v * 1e9).round() / 1e9 + 0.0;
-    let mm = |v: f64| (v * 1000.0).round() / 1000.0;
+    let c = Coord::new(nano(c.x), nano(c.y));
+    // Grid meters truncated to the millimeter, as MGRS truncates: rounding could lift a southern
+    // northing a hair short of the equator to 10,000,000 m, the equator itself.
+    let mm = |v: f64| (v * 1000.0).floor() / 1000.0;
     let mut out = json!({
-        "lon": nano(c.x),
-        "lat": nano(c.y),
+        "lon": c.x,
+        "lat": c.y,
         "decimal": rustgis_geom::format_lonlat(c),
         "dms": rustgis_geom::format_dms(c),
         "grid": null,
@@ -623,7 +626,7 @@ fn convert_position(s: &mut Session, p: &Value) -> CmdResult {
         "note": null,
     });
     if !s.map().body().is_earth() {
-        out["note"] = json!("UTM and MGRS are the Earth's grids and name no place on this map");
+        out["note"] = json!("UTM, UPS and MGRS are the Earth's grids and name no place on this map");
     } else {
         if let Some(u) = rustgis_geom::to_utm(c) {
             out["grid"] = json!("utm");

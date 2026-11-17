@@ -273,7 +273,9 @@ reads, and says what it assumed the same way. It answers with `lon` and `lat`, `
 `utm` or `ups` (whichever `grid` names; the other is `null`), the UTM `zone` and latitude `band`
 (`null` in UPS), `hemisphere`, `easting` and `northing` in meters, and `mgrs` spaced as the
 readout writes it and `mgrsCompact` in one word. `digits` (0 to 5, 5 by default) sets the MGRS
-precision, from 100 km to 1 m. Every key is always there, `null` where it has no value; on
+precision, from 100 km to 1 m. As in the readouts, the `utm` and `ups` text round to the meter
+while MGRS truncates, so the two can differ by a meter; `easting` and `northing` give the place
+to the millimeter (truncated). Every key is always there, `null` where it has no value; on
 another body's map the grids are `null`, and `note` says why.
 
 ```

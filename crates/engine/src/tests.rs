@@ -51378,7 +51378,14 @@ fn convert_position_gives_every_form() {
         let v = convert(&mut s, p.clone());
         assert!((v["lon"].as_f64().unwrap() + 74.006).abs() < 1e-5 && (v["lat"].as_f64().unwrap() - 40.7128).abs() < 1e-5, "{p}: {v}");
         assert_eq!(v["grid"], "utm", "{p}");
-        assert_eq!(v["utm"], "18north 583959 4507351", "{p}");
+        if p["position"] == "18TWL8395907350" {
+            // A 1 m square, read at its center, 583959.5 4507350.5: rounding that to the meter
+            // can go either way, so the center itself is checked.
+            let (e, n) = (v["easting"].as_f64().unwrap(), v["northing"].as_f64().unwrap());
+            assert!((e - 583_959.5).abs() < 0.01 && (n - 4_507_350.5).abs() < 0.01, "{v}");
+        } else {
+            assert_eq!(v["utm"], "18north 583959 4507351", "{p}");
+        }
         assert_eq!((v["zone"].as_u64(), v["band"].as_str(), v["hemisphere"].as_str()), (Some(18), Some("T"), Some("north")), "{p}");
         assert_eq!(v["mgrs"], "18T WL 83959 07350", "{p}");
         assert_eq!(v["mgrsCompact"], "18TWL8395907350", "{p}");
@@ -51397,9 +51404,17 @@ fn convert_position_gives_every_form() {
         let v = convert(&mut s, json!({"lon": -74.006, "lat": 40.7128, "digits": digits}));
         assert_eq!((v["mgrs"].as_str(), v["mgrsCompact"].as_str()), (Some("18T WL 83 07"), Some("18TWL8307")), "{digits}");
     }
-    // A tiny negative comes back as 0, not -0.
+    // A tiny negative comes back as 0, not -0, and every form agrees it is on the equator, in the
+    // north: the same place throughout.
     let v = convert(&mut s, json!({"lon": -1e-12, "lat": -1e-12}));
     assert!(v["lon"].as_f64().unwrap().is_sign_positive() && v["lat"].as_f64().unwrap().is_sign_positive(), "{v}");
+    assert_eq!((v["hemisphere"].as_str(), v["band"].as_str(), v["northing"].as_f64()), (Some("north"), Some("N"), Some(0.0)), "{v}");
+    assert_eq!(v["decimal"], "0.0000° E  0.0000° N", "{v}");
+    // Just south of the equator the northing stays short of 10,000,000 m (the equator), as MGRS
+    // does, so the two forms of one answer name the same side.
+    let v = convert(&mut s, json!({"lon": 3, "lat": -3e-9}));
+    assert_eq!((v["hemisphere"].as_str(), v["band"].as_str()), (Some("south"), Some("M")), "{v}");
+    assert!(v["northing"].as_f64().unwrap() < 10_000_000.0, "{v}");
     // North of 84° N it is UPS, in `ups` not `utm`, with no zone or UTM band; polar MGRS has no
     // zone number. Svalbard takes its own zone, 33, at 10° E.
     let v = convert(&mut s, json!({"lon": 30, "lat": 85}));
