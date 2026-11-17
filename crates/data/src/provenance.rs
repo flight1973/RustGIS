@@ -231,6 +231,32 @@ pub fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Reads as [`read`] does, but no more than `max` bytes: a file larger than that (one that grew
+/// or was replaced after its size was checked) is an error, read no further than `max + 1` bytes.
+pub fn read_at_most(path: impl AsRef<Path>, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let path = path.as_ref();
+    let file = File::open(path)?;
+    let metadata = file.metadata().ok();
+    let mut out = Vec::new();
+    let read = file.take(max.saturating_add(1)).read_to_end(&mut out);
+    let too_large = u64::try_from(out.len()).map_or(true, |n| n > max);
+    if read.is_err() || too_large {
+        if active() && metadata.as_ref().is_none_or(Metadata::is_file) {
+            observe(path, metadata.as_ref(), None);
+        }
+        read?;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("the file grew past {max} bytes after its size was checked"),
+        ));
+    }
+    if active() {
+        bytes(path, metadata.as_ref(), &out);
+    }
+    Ok(out)
+}
+
 /// Reads UTF-8 text with the same input capture as a byte read.
 pub fn read_to_string(path: impl AsRef<Path>) -> std::io::Result<String> {
     use std::io::Read;
@@ -254,6 +280,21 @@ pub fn read_to_string(path: impl AsRef<Path>) -> std::io::Result<String> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_at_most_refuses_a_file_that_grew_past_its_checked_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("N00E000.hgt");
+        std::fs::write(&path, [7u8; 10]).unwrap();
+        assert_eq!(read_at_most(&path, 10).unwrap(), vec![7u8; 10]);
+        assert_eq!(read_at_most(&path, 12).unwrap().len(), 10);
+        let err = read_at_most(&path, 9).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("grew past 9 bytes"), "{err}");
+        let _capture = Capture::start();
+        assert!(read_at_most(&path, 9).is_err());
+        assert_eq!(read_at_most(&path, 10).unwrap().len(), 10);
+    }
 
     /// An atomic pathname replacement cannot pair replacement metadata with the original bytes.
     #[cfg(unix)]

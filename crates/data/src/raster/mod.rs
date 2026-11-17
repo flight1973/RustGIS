@@ -1279,12 +1279,12 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
             if ext == "hgt" {
                 let checked = hgt::check(file_name, meta.len())?;
-                hgt::read_checked(file_name, checked, &crate::provenance::read(path)?)?
+                hgt::read_checked(file_name, checked, &crate::provenance::read_at_most(path, meta.len())?)?
             } else {
                 if meta.len() > dted::MAX_BYTES {
                     return Err(DataError::Format("DTED: the file is larger than any DTED cell".into()));
                 }
-                dted::read(file_name, &crate::provenance::read(path)?)?
+                dted::read(file_name, &crate::provenance::read_at_most(path, meta.len())?)?
             }
         }
         #[cfg(not(target_arch = "wasm32"))]

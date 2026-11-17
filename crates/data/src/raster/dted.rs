@@ -206,6 +206,17 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     if !differ.is_empty() {
         lost.push(format!("its DSI record gives a different {}; the UHL's are used", differ.join(", ")));
     }
+    // A partial cell (3.11.3) in the magnetic-tape layout counts only the lines that have heights,
+    // and its records leave out missing posts, so they differ in length (3.11.3.2.2, 3.13.4 s, t).
+    // The CD-ROM layout always has the full grid, and is the one read here.
+    let full = |tenths: u32| (36_000 % tenths == 0).then(|| 36_000 / tenths as usize + 1);
+    if let Some(percent) = digits(bytes, DSI + 289, 2).filter(|p| (1..=99).contains(p))
+        && (full(lon_tenths).is_some_and(|n| n != cols) || full(lat_tenths).is_some_and(|n| n != rows))
+    {
+        return Err(bad(&format!(
+            "a partial cell ({percent}% coverage) in the magnetic-tape layout, which counts only the {cols} longitude lines and {rows} latitude points with heights and leaves missing posts out of its records; only the full-grid layout, as on CD-ROM, is read"
+        )));
+    }
     // The level: the DSI's series designator (3.12 d), or the extension when it names none.
     let ext = std::path::Path::new(file_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let named = match ext.as_str() {
@@ -762,6 +773,27 @@ mod tests {
         assert_eq!(notes(&whole), notes(&stepped));
         assert!(notes(&whole).iter().any(|l| l.starts_with("3 of its heights were written in two's complement")), "{:?}", whole.lost);
         assert!(notes(&whole).iter().any(|l| l.starts_with("30 of its 121 heights are voids")), "{:?}", whole.lost);
+    }
+
+    #[test]
+    fn a_partial_cell_is_read_on_its_full_grid_and_refused_in_the_tape_layout() {
+        let partial = |mut b: Vec<u8>| {
+            b[DSI + 289..DSI + 291].copy_from_slice(b"50");
+            b
+        };
+        // At 6′ spacing a whole cell is 11 × 11 posts. With the full grid (as on CD-ROM), a
+        // partial cell's missing posts are voids, read as no data and said.
+        let cdrom = partial(dted("1220000W", "0370000N", (3600, 3600), (11, 11), |i, _| (i < 5).then_some(100)));
+        let r = read("n37.dt1", &cdrom).unwrap();
+        assert_eq!(r.value(0, 0, 0), Some(100.0));
+        assert_eq!(r.value(0, 8, 0), None);
+        assert!(r.lost.iter().any(|l| l.contains("no data")), "{:?}", r.lost);
+        // On tape it counts only its 6 longitude lines with heights: refused, not misplaced.
+        let tape = partial(dted("1220000W", "0370000N", (3600, 3600), (6, 11), |_, _| Some(100)));
+        let err = read("n37.dt1", &tape).unwrap_err().to_string();
+        assert!(err.contains("partial cell (50% coverage) in the magnetic-tape layout"), "{err}");
+        // The same counts in a complete cell's file (indicator 00) are read as before.
+        assert!(read("n37.dt1", &dted("1220000W", "0370000N", (3600, 3600), (6, 11), |_, _| Some(100))).is_ok());
     }
 
     #[test]
