@@ -358,19 +358,14 @@ const BEYOND_PROJECTION: &str = "The place lies beyond what the map's projection
 
 /// What a command (#194) or a tool (#2307) says of the parameters it was given but doesn't read,
 /// so a script or an agent can correct itself: "Buffer ignores 'unit' (it reads input, distance,
-/// units, dissolve, output)". `None` when `unknown` is empty. Bounded, since the keys come from the
-/// caller: the first five, sorted, each cut to 40 characters, then how many more.
-pub(crate) fn ignored_keys(name: &str, mut unknown: Vec<&str>, known: &[&str]) -> Option<String> {
+/// units, dissolve, output)". `None` when `unknown` is empty. The keys are listed as a tool's
+/// missing-parameter error lists them ([`rustgis_analysis::quoted_keys`]).
+pub(crate) fn ignored_keys(name: &str, unknown: Vec<&str>, known: &[&str]) -> Option<String> {
     if unknown.is_empty() {
         return None;
     }
-    unknown.sort_unstable();
-    let mut said: Vec<String> = unknown.iter().take(5).map(|k| format!("'{}'", clip(k, 40))).collect();
-    if unknown.len() > 5 {
-        said.push(format!("{} more", unknown.len() - 5));
-    }
     let reads = if known.is_empty() { "no parameters".to_string() } else { known.join(", ") };
-    Some(format!("{name} ignores {} (it reads {reads})", said.join(", ")))
+    Some(format!("{name} ignores {} (it reads {reads})", rustgis_analysis::quoted_keys(unknown)))
 }
 
 /// `s` cut to `n` characters, with `…` when cut.

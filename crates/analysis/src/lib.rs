@@ -451,20 +451,27 @@ pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> 
 /// The keys of `params` that `spec` doesn't read, for an error that a required parameter is
 /// missing (#2307): a misspelled key is the likely reason, and a failed run's warnings are taken
 /// back, so the error says it: " (given 'clips', which Clip doesn't read)". Empty when there are
-/// none. Bounded: the first three, sorted, each cut to 40 characters, then how many more.
+/// none. Bounded as [`quoted_keys`] bounds them.
 fn unread(spec: &ToolSpec, params: &Value) -> String {
     let Some(given) = params.as_object() else { return String::new() };
-    let mut unknown: Vec<&str> = given.keys().map(String::as_str).filter(|k| !is_accepted_param(spec, k)).collect();
+    let unknown: Vec<&str> = given.keys().map(String::as_str).filter(|k| !is_accepted_param(spec, k)).collect();
     if unknown.is_empty() {
         return String::new();
     }
+    format!(" (given {}, which {} doesn't read)", quoted_keys(unknown), spec.name)
+}
+
+/// Parameter keys a command or tool was given but doesn't read, quoted for a notice or an error
+/// (#194, #2307): `'a', 'b', 'c', 'd', 'e', 2 more`. Bounded, since the keys come from the caller:
+/// the first five, sorted, each cut to 40 characters, then how many more.
+pub fn quoted_keys(mut unknown: Vec<&str>) -> String {
     unknown.sort_unstable();
     let clip = |k: &str| if k.chars().count() > 40 { k.chars().take(40).chain(['…']).collect() } else { k.to_string() };
-    let mut said: Vec<String> = unknown.iter().take(3).map(|k| format!("'{}'", clip(k))).collect();
-    if unknown.len() > 3 {
-        said.push(format!("{} more", unknown.len() - 3));
+    let mut said: Vec<String> = unknown.iter().take(5).map(|k| format!("'{}'", clip(k))).collect();
+    if unknown.len() > 5 {
+        said.push(format!("{} more", unknown.len() - 5));
     }
-    format!(" (given {}, which {} doesn't read)", said.join(", "), spec.name)
+    said.join(", ")
 }
 
 /// Applies the captured schema without looking its suite up again after a reload.

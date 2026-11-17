@@ -22,7 +22,7 @@ pub fn commands() -> Vec<C> {
         C::new("gp.spatialJoin", "Spatial Join", "Analyze › Overlay", spatial_join).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_layers)
             .params(
-                r#"{"target": layer, "join": layer, "match"?: "Intersects" (default) | "Contains" | "Within", "operation"?: "Join one to one" (default) | "Join one to many", "keepAll"?: "Keep all" (default) | "Keep only matching", "prefix"?: "join_", "output"?: text}"#,
+                r#"{"target": layer, "join": layer, "match"?: "Intersects" (default) | "Contains" | "Within" | "Have their center in" | "Largest overlap" | "Closest" | "Within a distance", "distance"?: number (Closest: how far to look; Within a distance: required), "units"?: "Kilometers" (default) | "Meters" | "Miles" | "Feet", "distanceField"?: text (a field for the distance, Closest and Within a distance), "operation"?: "Join one to one" (default) | "Join one to many", "keepAll"?: "Keep all" (default) | "Keep only matching", "merge"?: [{"field", "rule": "first" | "last" | "sum" | "mean" | "min" | "max" | "count" | "join", "delimiter"?}] (one to one), "prefix"?: "join_", "output"?: text}"#,
             ),
         C::new("gp.zonalStats", "Zonal Statistics", "Analyze › Raster", zonal_stats).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_layers)
@@ -2499,8 +2499,9 @@ pub(crate) fn ignored_params(spec: &rustgis_analysis::ToolSpec, params: &Value) 
 /// The run of `tool` admitted, as [`Session::authorize_tool`] admits it, warning which of
 /// `params` it ignores ([`ignored_params`]). A refused run's error says them itself when a
 /// required parameter is missing, the likely reason (a failed command takes its warnings back).
-/// For the runs started from what a caller wrote (`gp.run`, the app's runs); a command that runs
-/// a tool for its own parameters (`gp.spatialJoin`) has said them already, as a command.
+/// For the runs started from what a caller wrote (`gp.run`, the app's runs). A command that runs a
+/// tool with its own parameters (`gp.spatialJoin`, `gp.zonalStats`) declares the tool's keys as
+/// its own, so `Session::run` has said any it ignores, as a command.
 pub(crate) fn admitted_saying(
     s: &mut Session,
     tool: &str,
@@ -2516,18 +2517,22 @@ pub(crate) fn admitted_saying(
 /// [`run_tool`] for parameters a caller wrote (`gp.run`, a model's step), saying first which of
 /// them the tool ignores ([`admitted_saying`]).
 pub(crate) fn run_tool_saying(s: &mut Session, tool: &str, params: &Value) -> CmdResult {
-    use rustgis_analysis::control::Control;
-    let control = if s.stoppable { Control::stoppable() } else { Control::new() };
+    let control = run_control(s);
     let op = admitted_saying(s, tool, params)?;
     s.invoke_tool(op, &control)
 }
 
-/// Runs a (built-in) tool and applies its result, as `gp.run` does. Where a person at a terminal
-/// can stop it with Ctrl-C ([`Session::stoppable`](crate::Session::stoppable)), it takes no work
-/// cap ([`rustgis_analysis::control::Control::stoppable`]).
-pub fn run_tool(s: &mut Session, tool: &str, params: &Value) -> CmdResult {
+/// The control a tool run in the session takes: where a person at a terminal can stop it with
+/// Ctrl-C ([`Session::stoppable`](crate::Session::stoppable)), no work cap
+/// ([`rustgis_analysis::control::Control::stoppable`]).
+fn run_control(s: &Session) -> std::sync::Arc<rustgis_analysis::control::Control> {
     use rustgis_analysis::control::Control;
-    let control = if s.stoppable { Control::stoppable() } else { Control::new() };
+    if s.stoppable { Control::stoppable() } else { Control::new() }
+}
+
+/// Runs a (built-in) tool and applies its result, as `gp.run` does, under [`run_control`].
+pub fn run_tool(s: &mut Session, tool: &str, params: &Value) -> CmdResult {
+    let control = run_control(s);
     run_tool_with(s, tool, params, &control)
 }
 
@@ -5659,6 +5664,15 @@ mod batch_tests {
         s.run("gp.spatialJoin", &json!({"target": "Cities", "join": "Parks", "prefx": "j_"})).unwrap();
         let got = said(&s, mark);
         assert!(got.len() == 1 && got[0].starts_with("gp.spatialJoin ignores 'prefx'"), "{got:?}");
+        // It declares every key its tool reads, so those aren't taken for strays.
+        let mark = s.notices.len() as u64;
+        let join = json!({"target": "Cities", "join": "Parks", "match": "Within a distance", "distance": 5000, "units": "Miles", "distanceField": "d"});
+        s.run("gp.spatialJoin", &join).unwrap();
+        assert!(said(&s, mark).is_empty(), "{:?}", said(&s, mark));
+        let command = s.registry.get("gp.spatialJoin").and_then(|c| c.param_keys()).unwrap();
+        let tool = resolve_tool("spatialJoin").unwrap();
+        let missing: Vec<&str> = tool.params.iter().map(|p| p.name).filter(|k| !command.contains(k)).collect();
+        assert!(missing.is_empty(), "gp.spatialJoin doesn't declare {missing:?}");
         // A run started in the background says it too, before its work.
         let mark = s.notices.len() as u64;
         let _run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 100, "unit": "Miles"})).unwrap();

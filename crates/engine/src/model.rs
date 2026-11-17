@@ -246,7 +246,7 @@ pub fn validate(s: &Session, g: &ModelGraph) -> Vec<Problem> {
 /// for `units`). Each step's run says it again. A graph past the size bound has none listed:
 /// [`validate`] refuses it.
 pub fn warnings(g: &ModelGraph) -> Vec<Problem> {
-    if g.nodes.len() > MAX_NODES {
+    if g.nodes.len() > MAX_NODES || g.edges.len() > MAX_EDGES {
         return Vec::new();
     }
     g.nodes
