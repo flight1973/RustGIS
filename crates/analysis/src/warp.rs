@@ -223,7 +223,7 @@ pub fn warp(r: &Raster, fit: &Fit, o: &Options) -> Result<Raster, String> {
     let re = Reproject::new(o.points_crs, o.crs)?;
     let (w, h) = (f64::from(r.width), f64::from(r.height));
     // An overview's pixels are bigger than the full image's, which the fit is in.
-    let (sx, sy) = r.overview.map_or((1.0, 1.0), |(fw, fh)| (f64::from(fw) / w, f64::from(fh) / h));
+    let (sx, sy) = r.file_pixels();
     let place = |c: f64, row: f64| fit.to_map(c * sx, row * sy).and_then(|(x, y)| re.forward(x, y));
 
     let [min_x, min_y, max_x, max_y] = footprint(w, h, &place).ok_or("the image's edge can't be placed in the output coordinate system")?;

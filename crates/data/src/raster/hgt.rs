@@ -153,8 +153,8 @@ fn read_checked_limited(file_name: &str, (lat, lon, side): (i32, i32, usize), by
     let (w, h) = (out as u32, out as u32);
     let mut r = Raster::new(name, w, h, vec![data], transform, Crs::LonLat, Some(f64::from(VOID)), ColorHint::Gray, "Int16")?;
     if step > 1 {
-        // Each cell read stands for exactly `step` samples across and down (see `dted::read`).
-        r.overview = Some(((out * step) as u32, (out * step) as u32));
+        // The file's own size; each cell read stands for exactly `step` samples (see `dted::read`).
+        r.overview = Some((side as u32, side as u32));
         r.step = step as u32;
     }
     r.lost.push(vertical_note("the EGM96 geoid (mean sea level)"));
@@ -290,7 +290,7 @@ mod tests {
     fn a_tile_past_the_budget_is_read_at_every_other_sample() {
         let bytes = tile(|row, col| (row * 2 + col % 7) as i16);
         let r = read_limited("N10E020.hgt", &bytes, 1201 * 1201 - 1).unwrap();
-        assert_eq!((r.width, r.height, r.overview, r.step), (601, 601, Some((1202, 1202)), 2));
+        assert_eq!((r.width, r.height, r.overview, r.step), (601, 601, Some((1201, 1201)), 2));
         assert_eq!(r.value(0, 3, 5), Some(26.0), "file row 10 × 2 + file column 6 % 7");
         // Cells are two samples wide, each centered on the sample kept: output (3, 5) is file
         // column 6, row 10, at 20° + 6d east and 11° − 10d north.
@@ -315,7 +315,7 @@ mod tests {
         put(8 * 3, 8 * 5, 853);
         put(7200, 7200, -4);
         let r = read_limited("N45E006.hgt", &bytes, 1_000_000).unwrap();
-        assert_eq!((r.width, r.height, r.overview, r.step), (901, 901, Some((7208, 7208)), 8));
+        assert_eq!((r.width, r.height, r.overview, r.step), (901, 901, Some((7201, 7201)), 8));
         assert_eq!(r.value(0, 0, 0), Some(11.0));
         assert_eq!(r.value(0, 5, 3), Some(853.0));
         assert_eq!(r.value(0, 900, 900), Some(-4.0), "the south-east sample is kept");

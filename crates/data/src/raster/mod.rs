@@ -1054,8 +1054,9 @@ impl Raster {
     }
 
     /// How many of the file's pixels one pixel read spans, across and down: exactly `step` for
-    /// every `step`-th pixel, an overview's size over the file's, else 1.
-    fn file_pixels(&self) -> (f64, f64) {
+    /// every `step`-th pixel, an overview's size over the file's, else 1. (`overview` stays the
+    /// file's own size, which `step` needn't divide, so a reader at a step goes by `step`.)
+    pub fn file_pixels(&self) -> (f64, f64) {
         if self.step > 1 {
             return (f64::from(self.step), f64::from(self.step));
         }
