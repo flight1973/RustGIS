@@ -315,6 +315,28 @@ mod tests {
         serde_json::from_slice(bytes).unwrap()
     }
 
+    /// A saved MGRS graticule drawn on top in a color of its own (#1042 piece 8) reads back as it
+    /// was, and saving names all three again; a map without them names none.
+    #[test]
+    fn graticule_mgrs_fixture_reads_its_grid() {
+        use rustgis_map::graticule::GraticuleType;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/graticule_mgrs.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["graticule-mgrs", "graticule-on-top", "graticule-color"]));
+        let map = &fixture.maps[0];
+        assert_eq!(map.graticule_type, GraticuleType::Mgrs);
+        assert!(map.graticule && map.graticule_on_top);
+        assert_eq!(map.graticule_color.map(|c| (c.r(), c.g(), c.b(), c.a())), Some((48, 48, 48, 153)));
+        let reopened = Project::from_json(&saved.to_string()).unwrap();
+        assert_eq!(serde_json::to_value(&reopened).unwrap(), saved);
+        let mut plain = fixture;
+        let map = &mut plain.maps[0];
+        map.graticule_type = GraticuleType::Utm;
+        map.graticule_on_top = false;
+        map.graticule_color = None;
+        assert!(serde_json::to_value(&plain).unwrap().get("requires").is_none());
+    }
+
     /// A saved image marker reads back as the image it was, and saving names it again.
     #[test]
     fn picture_markers_fixture_reads_its_image() {
