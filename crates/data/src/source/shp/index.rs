@@ -273,7 +273,7 @@ impl Index {
         match DiskIndex::open(path, len, notes) {
             Ok(disk) => Ok(Self { count: disk.count, bounds: disk.bounds, unboxed: disk.unboxed, storage: Storage::Disk(disk) }),
             // Canceled while it was built: the run stops, not a scan in its place.
-            Err(crate::DataError::Cancelled) => Err(crate::DataError::Cancelled),
+            Err(e @ crate::DataError::Cancelled) => Err(e),
             Err(error) => {
                 notes.push(format!("spatial index unavailable ({error}); reading the .shp by scanning record headers"));
                 Self::scanning(path, len, notes)
@@ -388,6 +388,11 @@ fn box_from_points(shp: &mut Option<super::Cursor>, buf: &mut Vec<u8>, path: &Pa
         return Ok(None);
     }
     let e = g.extent();
+    // Read, but no points in any part (as part starts can leave it): an empty shape, as reads
+    // give it, with nothing to frame (NaN, not counted as left out), not a box that's wrong.
+    if e.is_empty() {
+        return Ok(Some([f32::NAN; 4]));
+    }
     let b = [super::f32_down(e.min_x), super::f32_down(e.min_y), super::f32_up(e.max_x), super::f32_up(e.max_y)];
     Ok(usable(b).then_some(b))
 }
@@ -520,5 +525,59 @@ mod tests {
             let disk = Index::open(&bad, len, &mut notes).unwrap();
             assert_eq!((disk.bounds, disk.unboxed), (first, 1));
         });
+    }
+
+    /// A backwards box over a line whose part starts leave it no points (it reads as an empty
+    /// line) has nothing to frame: not counted as left out, as reads give it, on both paths.
+    #[test]
+    fn a_backwards_box_over_a_shape_of_no_points_is_nothing_to_frame() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lines.shp");
+        let mut ds = Dataset::new("lines", GeometryType::Polyline, vec![]);
+        for (x, y) in [(10.0, 20.0), (12.0, 22.0)] {
+            ds.push(Some(Geometry::Line(vec![vec![Coord::new(x, y), Coord::new(x + 0.5, y + 0.5)]])), vec![]);
+        }
+        crate::io::write_path(&ds, &path).unwrap();
+        // The first record: its box (at 112) backwards, its one part (counts at 144 and 148)
+        // starting at 2, past its 2 points (the part's start at 152).
+        let mut b = std::fs::read(&path).unwrap();
+        assert_eq!(i32::from_le_bytes(b[108..112].try_into().unwrap()), 3, "a line file");
+        assert_eq!(i32::from_le_bytes(b[144..148].try_into().unwrap()), 1, "one part");
+        assert_eq!(i32::from_le_bytes(b[148..152].try_into().unwrap()), 2, "two points");
+        for (k, v) in [10.5f64, 20.0, 10.0, 20.5].iter().enumerate() {
+            b[112 + 8 * k..120 + 8 * k].copy_from_slice(&v.to_le_bytes());
+        }
+        b[152..156].copy_from_slice(&2i32.to_le_bytes());
+        std::fs::write(&path, &b).unwrap();
+        let len = b.len() as u64;
+        let second = Some([12.0, 22.0, 12.5, 22.5]);
+        let mut notes = Vec::new();
+        let scan = Index::scanning(&path, len, &mut notes).unwrap();
+        assert_eq!((scan.bounds, scan.unboxed), (second, 0));
+        super::super::cache::with_index_dir(tmp.path().join("cache"), || {
+            let disk = Index::open(&path, len, &mut notes).unwrap();
+            assert_eq!((disk.bounds, disk.unboxed), (second, 0));
+        });
+    }
+
+    /// Canceled while the records are scanned, an index build stops the open: no scan in its
+    /// place, nor a note that the index is unavailable; a scan without one stops too.
+    #[test]
+    fn cancel_stops_an_index_build_and_a_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pts.shp");
+        let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(Coord::new(10.0, 20.0))), vec![]);
+        crate::io::write_path(&ds, &path).unwrap();
+        let len = std::fs::metadata(&path).unwrap().len();
+        let probe = std::sync::Arc::new(crate::progress::tests::Counted::default());
+        probe.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _installed = crate::progress::install(Some(probe));
+        let mut notes = Vec::new();
+        super::super::cache::with_index_dir(tmp.path().join("cache"), || {
+            assert!(matches!(Index::open(&path, len, &mut notes), Err(crate::DataError::Cancelled)));
+        });
+        assert!(notes.is_empty(), "{notes:?}");
+        assert!(matches!(Index::scanning(&path, len, &mut notes), Err(crate::DataError::Cancelled)));
     }
 }
