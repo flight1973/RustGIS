@@ -1065,7 +1065,9 @@
           "tabulate-intersection-unit",
           "layout-element-background",
           "picture-markers",
-          "graticule-mgrs"
+          "graticule-mgrs",
+          "graticule-on-top",
+          "graticule-color"
         ],
         "type": "string"
       },
@@ -1142,7 +1144,9 @@
     "tabulate-intersection-unit",
     "layout-element-background",
     "picture-markers",
-    "graticule-mgrs"
+    "graticule-mgrs",
+    "graticule-on-top",
+    "graticule-color"
   ],
   "x-rustgis-reads-format": 2,
   "x-rustgis-writes-format": 2

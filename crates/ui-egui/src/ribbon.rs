@@ -1832,8 +1832,8 @@ fn analysis_groups(app: &mut RustGisApp, ui: &mut Ui) {
     });
 }
 
-/// View › Display › Graticule's menu: the graticule's type (choosing one shows it), and the
-/// measured grid's coordinate system.
+/// View › Display › Graticule's menu: the graticule's type (choosing one shows it), whether its
+/// lines go over the layers, their color, and the measured grid's coordinate system.
 fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
     use rustgis_engine::map::graticule::GraticuleType;
     let (on, kind) = (app.session.map().graticule, app.session.map().graticule_type);
@@ -1845,6 +1845,39 @@ fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
             ui.close();
         }
     }
+    ui.separator();
+    // Under the layers, filled ones hide the lines; over them, only the labels are on top.
+    let mut on_top = app.session.map().graticule_on_top;
+    if ui
+        .checkbox(&mut on_top, tl!("Draw on top of layers"))
+        .on_hover_text(tl!("Draw the grid lines over the map's layers, under the labels; off: under the layers"))
+        .changed()
+        && let Err(e) = app.run("map.graticule", json!({"onTop": on_top}))
+    {
+        app.session.notify(e, true);
+    }
+    let set = app.session.map().graticule_color.is_some();
+    let mut color = crate::theme::c32(app.session.map().graticule_rgba());
+    ui.horizontal(|ui| {
+        let name = ui.label(tl!("Grid color"));
+        // Named by its label, for a screen reader.
+        let resp = crate::widgets::color_button(ui, &mut color).on_hover_text(tl!("The grid's color and opacity")).labelled_by(name.id);
+        if resp.changed() {
+            crate::widgets::one_step_per_press(app, &resp);
+            if let Err(e) = app.run("map.graticule", json!({"color": crate::theme::rgba(color).hex8()})) {
+                app.session.notify(e, true);
+            }
+        }
+        if ui
+            .add_enabled(set, egui::Button::new(tl!("Default")))
+            .on_hover_text(tl!("The basemap's grid color"))
+            .on_disabled_hover_text(tl!("The grid already has the basemap's color"))
+            .clicked()
+            && let Err(e) = app.run("map.graticule", json!({"color": null}))
+        {
+            app.session.notify(e, true);
+        }
+    });
     ui.separator();
     let name = ui.label(tl!("Measured grid's coordinate system"));
     ui.horizontal(|ui| {
@@ -5507,6 +5540,35 @@ mod tests {
             "{:?}",
             h.state().session.notices.last()
         );
+    }
+
+    /// View › Display › Graticule's menu: "Draw on top of layers" puts the lines over the layers
+    /// and back, without showing or hiding the grid; "Default" is offered only once a color is set,
+    /// and takes the grid back to the basemap's.
+    #[test]
+    fn the_graticule_menu_draws_it_on_top_and_resets_its_color() {
+        use egui_kittest::kittest::NodeT;
+        let mut h = tab_harness(RustGisApp::with_sample(), view_tab);
+        let on = h.state().session.map().graticule;
+        assert!(!h.state().session.map().graticule_on_top);
+        h.get_by_label("Graticule options").click();
+        h.run();
+        assert!(h.get_by_label("Default").accesskit_node().is_disabled(), "no color set yet");
+        // The color button, named by its label.
+        h.get_by_role_and_label(egui::accesskit::Role::ColorWell, "Grid color");
+        h.get_by_label("Draw on top of layers").click();
+        h.run();
+        assert!(h.state().session.map().graticule_on_top);
+        assert_eq!(h.state().session.map().graticule, on);
+        // Still open: unticked again.
+        h.get_by_label("Draw on top of layers").click();
+        h.run();
+        assert!(!h.state().session.map().graticule_on_top);
+        h.state_mut().session.run("map.graticule", &json!({"color": "#FF000080"})).unwrap();
+        h.run();
+        h.get_by_label("Default").click();
+        h.run();
+        assert_eq!(h.state().session.map().graticule_color, None);
     }
 
     /// The language list names every language in English while the interface is English, with the

@@ -4124,7 +4124,7 @@ fn render_frame(
     };
 
     // Basemap.
-    let (water, land, outline, grat) = map.palette();
+    let (water, land, outline, _) = map.palette();
     match &globe {
         Some(g) => globe_backdrop(pm.pixels(), g, water, space(view, map), view.pixels_per_point as f32),
         None if !gpu => pm.fill(tiny_skia::Color::from_rgba8(water.r(), water.g(), water.b(), 255)),
@@ -4202,75 +4202,86 @@ fn render_frame(
             }
         }
     }
-    if map.graticule && grat.a() > 0 {
-        let p = paint(grat, 1.0);
-        // A measured, UTM or MGRS graticule's lines (#1042), else latitudes and longitudes; the
-        // MGRS grid's grid zone designations and 100 km lines (`major`) are drawn heavier.
-        let (major, grid) = match mapgrid::lines(map, view) {
-            Some(g) => (g.major, Some(g.minor)),
-            None => (Vec::new(), None),
-        };
-        let step = if view.camera.res > 8000.0 {
-            30.0
-        } else if view.camera.res > 2000.0 {
-            15.0
-        } else if view.camera.res > 400.0 {
-            5.0
-        } else {
-            1.0
-        };
-        let (lat_max, lat_min) = if globe.is_some() { (90.0, -90.0) } else { (85.0, -85.0) };
-        let lines = grid.unwrap_or_else(|| {
-            let mut lines = Vec::new();
-            let mut lon = -180.0;
-            while lon <= 180.0 {
-                lines.push((0..=36).map(|i| Coord::new(lon, lat_min + (lat_max - lat_min) * i as f64 / 36.0)).collect::<Vec<_>>());
-                lon += step;
-            }
-            let mut lat = -90.0 + step;
-            while lat < 90.0 {
-                lines.push((0..=72).map(|i| Coord::new(-180.0 + i as f64 * 5.0, lat)).collect::<Vec<_>>());
-                lat += step;
-            }
-            lines
-        });
-        let project = |lines: Vec<Vec<Coord>>| -> Vec<Vec<Coord>> {
-            if globe.is_some() {
-                lines
-            } else if custom {
-                // Parallels are cut at the map's edge like any line (#209).
-                match flat.project(&Geometry::Line(lines)) {
-                    Geometry::Line(parts) => parts,
-                    _ => Vec::new(),
-                }
-            } else {
-                lines.into_iter().map(|l| l.into_iter().map(lonlat_to_merc).collect()).collect()
-            }
-        };
-        let (lines, major) = (project(lines), project(major));
-        // The minor lines always (as every graticule drew its lines before #1042's MGRS grid),
-        // the major ones over them when there are any.
-        for (lines, width, always) in [(lines, 0.6f32, true), (major, 1.2, false)] {
-            if !always && lines.is_empty() {
-                continue;
-            }
-            if gpu {
-                let mut e = Extent::EMPTY;
-                for l in &lines {
-                    for c in l {
-                        e.expand(*c);
+    // The graticule's lines: with the basemap, under the layers and web tile layers, or over them
+    // all (`graticule_on_top`), still under the labels.
+    let grat = map.graticule_rgba();
+    macro_rules! draw_graticule {
+        () => {{
+            if map.graticule && grat.a() > 0 {
+                let p = paint(grat, 1.0);
+                // A measured, UTM or MGRS graticule's lines (#1042), else latitudes and longitudes; the
+                // MGRS grid's grid zone designations and 100 km lines (`major`) are drawn heavier.
+                let (major, grid) = match mapgrid::lines(map, view) {
+                    Some(g) => (g.major, Some(g.minor)),
+                    None => (Vec::new(), None),
+                };
+                let step = if view.camera.res > 8000.0 {
+                    30.0
+                } else if view.camera.res > 2000.0 {
+                    15.0
+                } else if view.camera.res > 400.0 {
+                    5.0
+                } else {
+                    1.0
+                };
+                let (lat_max, lat_min) = if globe.is_some() { (90.0, -90.0) } else { (85.0, -85.0) };
+                let lines = grid.unwrap_or_else(|| {
+                    let mut lines = Vec::new();
+                    let mut lon = -180.0;
+                    while lon <= 180.0 {
+                        lines.push((0..=36).map(|i| Coord::new(lon, lat_min + (lat_max - lat_min) * i as f64 / 36.0)).collect::<Vec<_>>());
+                        lon += step;
+                    }
+                    let mut lat = -90.0 + step;
+                    while lat < 90.0 {
+                        lines.push((0..=72).map(|i| Coord::new(-180.0 + i as f64 * 5.0, lat)).collect::<Vec<_>>());
+                        lat += step;
+                    }
+                    lines
+                });
+                let project = |lines: Vec<Vec<Coord>>| -> Vec<Vec<Coord>> {
+                    if globe.is_some() {
+                        lines
+                    } else if custom {
+                        // Parallels are cut at the map's edge like any line (#209).
+                        match flat.project(&Geometry::Line(lines)) {
+                            Geometry::Line(parts) => parts,
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        lines.into_iter().map(|l| l.into_iter().map(lonlat_to_merc).collect()).collect()
+                    }
+                };
+                let (lines, major) = (project(lines), project(major));
+                // The minor lines always (as every graticule drew its lines before #1042's MGRS grid),
+                // the major ones over them when there are any.
+                for (lines, width, always) in [(lines, 0.6f32, true), (major, 1.2, false)] {
+                    if !always && lines.is_empty() {
+                        continue;
+                    }
+                    if gpu {
+                        let mut e = Extent::EMPTY;
+                        for l in &lines {
+                            for c in l {
+                                e.expand(*c);
+                            }
+                        }
+                        flush_acc(pm.pixels(), &mut cmds, &mut cpu_dirty)?;
+                        let tessellated =
+                            !e.is_empty() && mesh::collect_graticule(&mut cmds, &lines, &e, grat, width, ctx.ppp, map_per_px).is_ok();
+                        if !tessellated {
+                            ctx.line(&mut pm, &lines, &p, width);
+                            cpu_dirty = true;
+                        }
+                    } else {
+                        ctx.line(&mut pm, &lines, &p, width);
                     }
                 }
-                flush_acc(pm.pixels(), &mut cmds, &mut cpu_dirty)?;
-                let tessellated = !e.is_empty() && mesh::collect_graticule(&mut cmds, &lines, &e, grat, width, ctx.ppp, map_per_px).is_ok();
-                if !tessellated {
-                    ctx.line(&mut pm, &lines, &p, width);
-                    cpu_dirty = true;
-                }
-            } else {
-                ctx.line(&mut pm, &lines, &p, width);
             }
-        }
+        }};
+    }
+    if !map.graticule_on_top {
+        draw_graticule!();
     }
 
     // Web tile layers, at their places in the drawing order (#808): those under all the map's
@@ -5563,6 +5574,9 @@ fn render_frame(
     if let Some(id) = below {
         draw_tiles!(Some(id));
     }
+    if map.graticule_on_top {
+        draw_graticule!();
+    }
     // A band of a tilted view: the sun's glint on the terrain's water, over the water's own fill.
     if matches!(labels_to, Labels::Tilted(..) | Labels::Shared)
         && let Some(g) = TILT_GLINT.with(|g| g.borrow().clone())
@@ -5669,8 +5683,8 @@ fn render_frame(
     let mut labels = placed.labels;
     let mut label_layers = label_layers;
     // The MGRS graticule's names (#1042), over the placed labels and apart from their collisions,
-    // with no layer of their own in a recording. A tilted view's bands draw none: their places
-    // would repeat from band to band.
+    // with no layer of their own in a recording, in the graticule's color made opaque. A tilted
+    // view's bands draw none: their places would repeat from band to band.
     if map.graticule && grat.a() > 0 && matches!(labels_to, Labels::Own | Labels::Turned(_)) {
         let color = Rgba::rgb(grat.r(), grat.g(), grat.b());
         for (text, x, y) in mapgrid::labels(map, view, |t| text::measure(t, mapgrid::LABEL_PT, false)) {
@@ -8753,6 +8767,87 @@ mod tests {
         m.graticule_type = rustgis_map::graticule::GraticuleType::Mgrs;
         m.graticule = false;
         assert!(grid(&mut m, &view).is_empty());
+    }
+
+    /// The graticule's lines are drawn with the basemap, so an opaque filled layer hides them,
+    /// unless they are on top (over the layers, under the labels), in every type; a color set for
+    /// them is used, with its opacity, and the MGRS names take it opaque. On the GPU the lines'
+    /// meshes come before the layer's, or after it when on top.
+    #[test]
+    fn the_graticule_draws_over_the_layers_when_on_top_in_its_own_color() {
+        use rustgis_map::graticule::GraticuleType;
+        let mut m = Map::new("Map");
+        let id = square_layer(&mut m, "cover", -40.0, -40.0, 80.0);
+        let red = Rgba::rgb(255, 0, 0);
+        if let Some(l) = m.layer_mut(id) {
+            l.renderer = rustgis_map::Renderer::Single(rustgis_map::Symbol { fill: red, stroke_width: 0.0, ..l.symbol(0) });
+        }
+        // Lines through the view's center whatever the step, at four pixels a point so that the
+        // thinnest (0.6 pt) has pixels it covers whole.
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 6000.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 100.0, height: 75.0, pixels_per_point: 4.0, camera, sky: false };
+        let pixels = |m: &mut Map| -> Vec<[u8; 4]> {
+            render(m, &view)
+                .unwrap()
+                .pixmap
+                .pixels()
+                .iter()
+                .map(|p| {
+                    let c = p.demultiply();
+                    [c.red(), c.green(), c.blue(), c.alpha()]
+                })
+                .collect()
+        };
+        let not_red = |px: &[[u8; 4]]| px.iter().filter(|p| p[..3] != [255, 0, 0]).count();
+        // Under the layer: all of it the layer's fill, the default grid as much as a set one.
+        assert_eq!(not_red(&pixels(&mut m)), 0);
+        m.graticule_color = Some(Rgba::rgb(0, 0, 255));
+        assert_eq!(not_red(&pixels(&mut m)), 0);
+        // On top: the lines over the fill, in their color.
+        m.graticule_on_top = true;
+        for t in GraticuleType::ALL {
+            m.graticule_type = t;
+            let px = pixels(&mut m);
+            assert!(px.contains(&[0, 0, 255, 255]), "{t:?}");
+        }
+        m.graticule_type = GraticuleType::Degrees;
+        // The basemap's color when none is set, now seen over the fill too.
+        m.graticule_color = None;
+        assert!(not_red(&pixels(&mut m)) > 0);
+        // A color's opacity is kept: half see-through blue over red.
+        m.graticule_color = Some(Rgba::new(0, 0, 255, 128));
+        let px = pixels(&mut m);
+        assert!(px.iter().any(|p| p[0] > 100 && p[0] < 160 && p[2] > 100 && p[2] < 160), "half blue over red");
+        assert!(!px.contains(&[0, 0, 255, 255]));
+        // Hidden: none either way.
+        m.graticule = false;
+        assert_eq!(not_red(&pixels(&mut m)), 0);
+        m.graticule = true;
+        // The MGRS names in the set color, made opaque.
+        m.graticule_type = GraticuleType::Mgrs;
+        let near = View { camera: Camera { center: lonlat_to_merc(Coord::new(14.5, 48.2)), res: 500.0, ..camera }, ..view };
+        let named: Vec<PlacedLabel> =
+            render(&mut m, &near).unwrap().labels.into_iter().filter(|l| l.size == mapgrid::LABEL_PT && l.halo.is_some()).collect();
+        assert!(!named.is_empty() && named.iter().all(|l| l.color == Rgba::rgb(0, 0, 255)));
+        // On the GPU: the grid's mesh (its color) after the layer's when on top, before it when not.
+        m.graticule_type = GraticuleType::Degrees;
+        m.graticule_color = Some(Rgba::rgb(0, 0, 255));
+        let blue = [0.0f32, 0.0, 1.0, 1.0];
+        for on_top in [false, true] {
+            m.graticule_on_top = on_top;
+            let Some(RenderOutput::Gpu(scene)) = render_backend(&mut m, &view, Backend::Gpu) else { panic!("gpu scene") };
+            let meshes: Vec<bool> = scene
+                .cmds
+                .iter()
+                .filter_map(|c| match c {
+                    gpu_scene::DrawCmd::Mesh { vertices, .. } => Some(vertices.iter().any(|v| v.color == blue)),
+                    _ => None,
+                })
+                .collect();
+            let (grid, layer) = (meshes.iter().position(|g| *g), meshes.iter().rposition(|g| !*g));
+            let (Some(grid), Some(layer)) = (grid, layer) else { panic!("{meshes:?}") };
+            assert_eq!(grid > layer, on_top, "{meshes:?}");
+        }
     }
 
     #[test]

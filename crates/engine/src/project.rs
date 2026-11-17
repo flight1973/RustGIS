@@ -84,6 +84,8 @@ pub const CAPABILITIES: &[&str] = &[
     "layout-element-background",
     "picture-markers",
     "graticule-mgrs",
+    "graticule-on-top",
+    "graticule-color",
 ];
 /// The most entries a document's `requires` may list: past it the document is refused without
 /// the rest being read.

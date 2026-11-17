@@ -760,6 +760,19 @@ latitudes and longitudes, they aren't drawn on the copies of the world a flat ma
 this version can't use (one in degrees, or a PROJ string the web app can't read) opens without it,
 and says so.
 
+Two more settings in the same menu apply to every type, and are saved with the map:
+
+- **Draw on top of layers** (`"onTop"` in the command; off by default): by default the grid lines
+  are drawn with the basemap, under the map's layers and web tile layers, so a filled layer hides
+  them. With it on, they are drawn over every layer and tile layer, still under the labels.
+- **Grid color** (`"color"`: `"#RRGGBB"` or `"#RRGGBBAA"`, with its opacity): the lines' color. By
+  default it is the basemap's own grid color, which is faint; **Default** (`null` or `""` in the
+  command) goes back to it. The MGRS names take the same color, fully opaque. Major and minor
+  lines keep their widths.
+
+Neither setting shows or hides the grid. A project that uses either needs a RustGIS that knows
+it: an older one refuses to open it rather than drop the setting.
+
 **Global** shows a globe; **Local** a flat view centred where you are (azimuthal equidistant;
 not in the web app, which doesn't include that projection).
 **Wireframe** draws polygons as outlines; **Raise Priority** and **Lower Priority** change a

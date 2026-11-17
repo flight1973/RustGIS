@@ -85,7 +85,29 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("tabulate-intersection-unit", command_uses_tabulate_unit),
     ("layout-element-background", command_uses_element_background),
     ("picture-markers", command_uses_picture_marker),
+    ("graticule-on-top", command_puts_graticule_on_top),
+    ("graticule-color", command_colors_graticule),
 ];
+
+/// A saved `map.graticule` that draws the grid over the layers: an older reader ignores the key
+/// and leaves it under them. `false` is what that reader does anyway.
+fn command_puts_graticule_on_top(id: &str, params: &Value) -> bool {
+    match id {
+        "map.graticule" => params.get("onTop").is_some_and(|v| v.as_bool() == Some(true)),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_puts_graticule_on_top)),
+        _ => false,
+    }
+}
+
+/// A saved `map.graticule` that gives the grid a color of its own: an older reader ignores the
+/// key and draws the palette's. `null` or `""` only goes back to the palette.
+fn command_colors_graticule(id: &str, params: &Value) -> bool {
+    match id {
+        "map.graticule" => params.get("color").and_then(Value::as_str).is_some_and(|c| !c.trim().is_empty()),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_colors_graticule)),
+        _ => false,
+    }
+}
 
 /// A layout command that gives an element a background: an older reader warns that it ignores
 /// the key and makes the element without one. `null` only takes a background away, which an
@@ -191,12 +213,15 @@ fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
 }
 
 fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static str> {
-    let (mut block, mut water, mut shore, mut relief, mut light, mut legends, mut pictures, mut mgrs) =
-        (false, false, false, false, false, false, false, false);
+    let (mut block, mut water, mut shore, mut relief, mut light, mut legends, mut pictures, mut mgrs, mut on_top, mut grid_color) =
+        (false, false, false, false, false, false, false, false, false, false);
     for map in maps {
         // An older reader doesn't know the MGRS graticule (#1042 piece 8): it refuses the
         // project by name rather than failing to read the type.
         mgrs |= map.graticule_type == rustgis_map::graticule::GraticuleType::Mgrs;
+        // Nor the graticule drawn over the layers or in a color of its own: it would save them away.
+        on_top |= map.graticule_on_top;
+        grid_color |= map.graticule_color.is_some();
         if let Some(t) = &map.view.terrain {
             block |= t.block.is_some();
             water |= t.water.is_some();
@@ -219,6 +244,8 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (legends, "normalized-legend-urls"),
         (pictures, "picture-markers"),
         (mgrs, "graticule-mgrs"),
+        (on_top, "graticule-on-top"),
+        (grid_color, "graticule-color"),
     ]
     .into_iter()
     .filter_map(|(used, name)| used.then_some(name))
