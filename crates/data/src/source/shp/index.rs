@@ -414,8 +414,12 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
             crate::progress::check()?;
         }
         let want = (len - pos).min(head.len() as u64) as usize;
+        // A read that fails here (the file cut or changed since its length was taken, or an I/O
+        // error) leaves out the rest, said as a cut file is.
+        let unread = |n: u32| format!("the .shp couldn't be read from record {n}; the rest are left out");
         let Some(buf) = head.get_mut(..want) else { break };
         if f.read_exact(buf).is_err() {
+            note = unread(count + 1);
             break;
         }
         let bytes = u64::try_from(be_i32(&head, 4).unwrap_or(-1)).unwrap_or(u64::MAX).saturating_mul(2);
@@ -427,10 +431,15 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
         let c = head.get(8..(want as u64).min(8 + bytes) as usize).unwrap_or(&[]);
         // A line or polygon of more than two parts: the rest of its parts' starts, which the record
         // has room for, read on (each 4 bytes, against 16 for each point) so they're checked too.
-        // A count past what a read takes (MAX_PARTS) isn't read for: the record is refused anyway.
-        let more = match (le_i32(c, 0), le_i32(c, 36)) {
-            (Some(3 | 5 | 13 | 15 | 23 | 25), Some(parts))
-                if parts > 2 && parts as usize <= super::MAX_PARTS && 44 + 4 * u64::from(parts.unsigned_abs()) <= bytes =>
+        // Counts past what a read takes (MAX_PARTS), or a record too short for its points too,
+        // aren't read for: the record is refused anyway.
+        let more = match (le_i32(c, 0), le_i32(c, 36), le_i32(c, 40)) {
+            (Some(3 | 5 | 13 | 15 | 23 | 25), Some(parts), Some(points))
+                if parts > 2
+                    && points >= 0
+                    && parts as usize <= super::MAX_PARTS
+                    && points as usize <= super::MAX_PARTS
+                    && 44 + 4 * u64::from(parts.unsigned_abs()) + 16 * u64::from(points.unsigned_abs()) <= bytes =>
             {
                 4 * (parts.unsigned_abs() as usize - 2)
             }
@@ -441,6 +450,7 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
             starts.extend_from_slice(c);
             starts.resize(c.len() + more, 0);
             if f.read_exact(starts.get_mut(c.len()..).unwrap_or(&mut [])).is_err() {
+                note = unread(count + 1);
                 break;
             }
             let b = record_box(&starts, bytes);
@@ -457,6 +467,9 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
         pos = content + bytes;
         let read = (want as u64).saturating_sub(8) + more as u64;
         if f.seek_relative(bytes as i64 - read as i64).is_err() {
+            if pos + 8 <= len {
+                note = unread(count + 1);
+            }
             break;
         }
     }
@@ -627,6 +640,26 @@ mod tests {
         for got in both(&bad, &mut notes, "bad") {
             assert_eq!(got, (2, Some([30.0, 40.0, 30.5, 40.5]), 1), "a start past the points");
         }
+    }
+
+    /// A file that can't be read as far as its length said (cut, or changed, after the length was
+    /// taken) keeps the records read before, and says the rest are left out, from which record.
+    #[test]
+    fn a_read_that_fails_partway_says_what_it_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pts.shp");
+        let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+        for i in 0..5 {
+            ds.push(Some(Geometry::Point(Coord::new(10.0 + f64::from(i), 20.0))), vec![]);
+        }
+        crate::io::write_path(&ds, &path).unwrap();
+        // Records of 28 bytes from 100 to 240, each read 60 bytes ahead: past the real end (taken as
+        // 100 bytes further) from the fourth.
+        let len = std::fs::metadata(&path).unwrap().len() + 100;
+        let mut notes = Vec::new();
+        let scan = Index::scanning(&path, len, &mut notes).unwrap();
+        assert_eq!(scan.count, 3);
+        assert!(notes.iter().any(|n| n.contains("couldn't be read from record 4; the rest are left out")), "{notes:?}");
     }
 
     /// Canceled while the records are scanned, an index build stops the open: no scan in its
