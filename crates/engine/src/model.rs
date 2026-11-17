@@ -241,6 +241,24 @@ pub fn validate(s: &Session, g: &ModelGraph) -> Vec<Problem> {
     out
 }
 
+/// What a graph does that it may not mean, without keeping it from running (#2307): a tool's
+/// parameter the tool doesn't read, so the step runs with the tool's default (a misspelled `unit`
+/// for `units`). Each step's run says it again. A graph past the size bound has none listed:
+/// [`validate`] refuses it.
+pub fn warnings(g: &ModelGraph) -> Vec<Problem> {
+    if g.nodes.len() > MAX_NODES {
+        return Vec::new();
+    }
+    g.nodes
+        .iter()
+        .filter(|n| n.kind == ModelNodeKind::Tool)
+        .filter_map(|n| {
+            let said = crate::cmd::gp::ignored_params(tool_of(n)?, &n.params)?;
+            Some(problem("unknown-param", Some(&n.id), said))
+        })
+        .collect()
+}
+
 impl PortKind {
     /// The more specific of a node's known kind and its port's.
     fn max_kind(self, port: PortKind) -> PortKind {
@@ -699,7 +717,8 @@ fn run_into(s: &mut Session, g: &ModelGraph, report: &mut RunReport) -> Result<V
                 let params = Value::Object(params);
                 let before: HashSet<u32> = s.map().layers.iter().map(|l| l.id).collect();
                 let history = s.project.gp_history.len();
-                match crate::cmd::gp::run_tool(s, tool, &params) {
+                // As gp.run runs it, saying which of its parameters the tool ignores (#2307).
+                match crate::cmd::gp::run_tool_saying(s, tool, &params) {
                     Ok(r) => {
                         let ids: Vec<u32> = s.map().layers.iter().filter(|l| !before.contains(&l.id)).map(|l| l.id).collect();
                         // The first layer it added (else the first output it recorded: a table).

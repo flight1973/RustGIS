@@ -448,6 +448,25 @@ pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> 
     params_for(spec, params, source_of(spec).is_none())
 }
 
+/// The keys of `params` that `spec` doesn't read, for an error that a required parameter is
+/// missing (#2307): a misspelled key is the likely reason, and a failed run's warnings are taken
+/// back, so the error says it: " (given 'clips', which Clip doesn't read)". Empty when there are
+/// none. Bounded: the first three, sorted, each cut to 40 characters, then how many more.
+fn unread(spec: &ToolSpec, params: &Value) -> String {
+    let Some(given) = params.as_object() else { return String::new() };
+    let mut unknown: Vec<&str> = given.keys().map(String::as_str).filter(|k| !is_accepted_param(spec, k)).collect();
+    if unknown.is_empty() {
+        return String::new();
+    }
+    unknown.sort_unstable();
+    let clip = |k: &str| if k.chars().count() > 40 { k.chars().take(40).chain(['…']).collect() } else { k.to_string() };
+    let mut said: Vec<String> = unknown.iter().take(3).map(|k| format!("'{}'", clip(k))).collect();
+    if unknown.len() > 3 {
+        said.push(format!("{} more", unknown.len() - 3));
+    }
+    format!(" (given {}, which {} doesn't read)", said.join(", "), spec.name)
+}
+
 /// Applies the captured schema without looking its suite up again after a reload.
 fn params_for(spec: &ToolSpec, params: &Value, built_in: bool) -> Result<Value, String> {
     let mut p = params.as_object().cloned().unwrap_or_default();
@@ -462,7 +481,7 @@ fn params_for(spec: &ToolSpec, params: &Value, built_in: bool) -> Result<Value, 
             p.insert(ps.name.to_string(), v);
         }
         if ps.required && p.get(ps.name).is_none_or(|v| v.is_null() || v.as_str() == Some("")) {
-            return Err(format!("{}: '{}' is required", spec.name, ps.label));
+            return Err(format!("{}: '{}' is required{}", spec.name, ps.label, unread(spec, params)));
         }
         // The built-in tools' choices are the whole list. An external tool's (GeoLibre's, a
         // plugin's) can be looser, such as GeoLibre's comma-separated lists of options: its own

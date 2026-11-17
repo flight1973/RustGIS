@@ -384,7 +384,7 @@ pub type ExternalOutput = Result<(Vec<(String, Vec<u8>)>, Vec<String>), String>;
 pub fn external_start(s: &mut Session, tool: &str, params: &Value) -> Result<ExternalRun, String> {
     #[cfg(feature = "geolibre")]
     {
-        let op = s.authorize_tool(tool, params)?;
+        let op = admitted_saying(s, tool, params)?;
         let continuation = s.tool_continuation(&op)?;
         let crate::policy::ToolOp { pin, params } = op.op();
         let spec = pin.spec();
@@ -524,7 +524,7 @@ fn preparing<T>(continuation: &crate::policy::Continuation, f: impl FnOnce() -> 
 /// Prepares a run of a plugin tool on the active map, as `gp.run` would run it: its parameters
 /// checked and its layers read now, so that the map can change while it runs.
 pub fn plugin_start(s: &mut Session, tool: &str, params: &Value) -> Result<PluginRun, String> {
-    let op = s.authorize_tool(tool, params)?;
+    let op = admitted_saying(s, tool, params)?;
     let continuation = s.tool_continuation(&op)?;
     let crate::policy::ToolOp { pin, params: resolved } = op.op();
     let spec = pin.spec();
@@ -731,7 +731,7 @@ impl ToolRun {
 /// layer edited meanwhile is handled as for a plugin tool. Plugin tools start with
 /// [`plugin_start`].
 pub fn tool_start(s: &mut Session, tool: &str, params: &Value) -> Result<ToolRun, String> {
-    let op = s.authorize_tool(tool, params)?;
+    let op = admitted_saying(s, tool, params)?;
     let continuation = s.tool_continuation(&op)?;
     let crate::policy::ToolOp { pin, params: resolved } = op.op();
     let pin = pin.clone();
@@ -1540,7 +1540,7 @@ impl Inputs for MapInputs<'_> {
 fn run(s: &mut Session, p: &Value) -> CmdResult {
     let tool = ps(p, "tool").ok_or("tool is required")?.to_string();
     let params = p.get("params").cloned().unwrap_or(json!({}));
-    run_tool(s, &tool, &params)
+    run_tool_saying(s, &tool, &params)
 }
 
 /// Whether `inputs` is the wildcard `"*"` (either as a string or a single-element array `["*"]`).
@@ -2483,6 +2483,43 @@ fn spatial_join(s: &mut Session, p: &Value) -> CmdResult {
 /// Calculates raster summary statistics for polygon zones.
 fn zonal_stats(s: &mut Session, p: &Value) -> CmdResult {
     run_tool(s, "zonalStats", p)
+}
+
+/// What a tool says of the keys in `params` it doesn't read (#2307), as `Session::run` says it of a
+/// command's (#194) and `gp.batch` of its items': "Buffer ignores 'unit' (it reads input,
+/// distance, units, dissolve, output)". `None` when it reads them all. A misspelled parameter
+/// would otherwise leave the tool at its default without a word: `"unit": "Miles"` buffers in
+/// kilometers.
+pub(crate) fn ignored_params(spec: &rustgis_analysis::ToolSpec, params: &Value) -> Option<String> {
+    let unknown = params.as_object()?.keys().map(String::as_str).filter(|k| !rustgis_analysis::is_accepted_param(spec, k)).collect();
+    let reads: Vec<&str> = spec.params.iter().map(|p| p.name).collect();
+    crate::ignored_keys(spec.name, unknown, &reads)
+}
+
+/// The run of `tool` admitted, as [`Session::authorize_tool`] admits it, warning which of
+/// `params` it ignores ([`ignored_params`]). A refused run's error says them itself when a
+/// required parameter is missing, the likely reason (a failed command takes its warnings back).
+/// For the runs started from what a caller wrote (`gp.run`, the app's runs); a command that runs
+/// a tool for its own parameters (`gp.spatialJoin`) has said them already, as a command.
+pub(crate) fn admitted_saying(
+    s: &mut Session,
+    tool: &str,
+    params: &Value,
+) -> Result<crate::policy::Authorized<crate::policy::ToolOp>, String> {
+    let op = s.authorize_tool(tool, params)?;
+    if let Some(said) = ignored_params(op.op().pin.spec(), params) {
+        s.warn(said);
+    }
+    Ok(op)
+}
+
+/// [`run_tool`] for parameters a caller wrote (`gp.run`, a model's step), saying first which of
+/// them the tool ignores ([`admitted_saying`]).
+pub(crate) fn run_tool_saying(s: &mut Session, tool: &str, params: &Value) -> CmdResult {
+    use rustgis_analysis::control::Control;
+    let control = if s.stoppable { Control::stoppable() } else { Control::new() };
+    let op = admitted_saying(s, tool, params)?;
+    s.invoke_tool(op, &control)
 }
 
 /// Runs a (built-in) tool and applies its result, as `gp.run` does. Where a person at a terminal
@@ -5574,6 +5611,78 @@ mod batch_tests {
             !recent_clean.iter().any(|n| n.text.contains("unrecognised")),
             "clean call must not emit unrecognised notice: {recent_clean:?}"
         );
+    }
+
+    /// `gp.run`, a run started in the background and a model's step say which parameters a tool
+    /// ignores (#2307), as `gp.batch` does: a misspelled `unit` would otherwise leave Buffer at its
+    /// default, kilometers, without a word. The run itself is as before; a clean run says nothing;
+    /// a batch says it once, its own way; `model.validate` lists it as a warning, which doesn't
+    /// keep the model from running.
+    #[test]
+    fn a_tool_says_which_parameters_it_ignores() {
+        let said = |s: &Session, mark: u64| -> Vec<String> {
+            s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains(" ignores ")).collect()
+        };
+        let buffer = "Buffer ignores 'unit' (it reads input, distance, units, dissolve, output)";
+        let mut s = test_session();
+        let mark = s.notices.len() as u64;
+        s.run("gp.run", &json!({"tool": "buffer", "params": {"input": "Cities", "distance": 100, "unit": "Miles"}})).unwrap();
+        assert_eq!(said(&s, mark), [buffer]);
+        // The run is as before: the default units, which its own message names.
+        assert!(s.notices_since(mark).iter().any(|n| n.text.contains("at 100 Kilometers")));
+        let mark = s.notices.len() as u64;
+        s.run("gp.run", &json!({"tool": "buffer", "params": {"input": "Cities", "distance": 100, "units": "Miles"}})).unwrap();
+        assert!(said(&s, mark).is_empty(), "{:?}", said(&s, mark));
+        // Many keys: the first five, sorted, each cut to 40 characters, then how many more.
+        let mark = s.notices.len() as u64;
+        let long = "x".repeat(60);
+        let mut params = json!({"input": "Cities", "distance": 1, "a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 1});
+        params[&long] = json!(1);
+        s.run("gp.run", &json!({"tool": "buffer", "params": params})).unwrap();
+        let got = said(&s, mark);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].starts_with("Buffer ignores 'a', 'b', 'c', 'd', 'e', 2 more"), "{got:?}");
+        let mark = s.notices.len() as u64;
+        s.run("gp.run", &json!({"tool": "buffer", "params": {"input": "Cities", "distance": 1, &long: 1}})).unwrap();
+        assert!(said(&s, mark)[0].contains(&format!("'{}…'", "x".repeat(40))), "{:?}", said(&s, mark));
+        // A run refused for want of a parameter that was misspelled says which key it didn't read,
+        // in its error: a failed command takes its warnings back.
+        let e = s.run("gp.run", &json!({"tool": "clip", "params": {"input": "Cities", "clips": "Parks"}})).unwrap_err();
+        assert!(e.ends_with("'Clip Features' is required (given 'clips', which Clip doesn't read)"), "{e}");
+        // So does a model's step that fails for it.
+        s.run("model.new", &json!({"name": "Clips", "steps": [{"tool": "clip", "params": {"input": "Cities", "clips": "Parks"}}]}))
+            .unwrap();
+        let e = s.run("model.run", &json!({"name": "Clips"})).unwrap_err();
+        assert!(e.contains("(given 'clips', which Clip doesn't read)"), "{e}");
+        // A command that runs a tool for its own parameters says a stray key once, as a command.
+        let mark = s.notices.len() as u64;
+        s.run("gp.spatialJoin", &json!({"target": "Cities", "join": "Parks", "prefx": "j_"})).unwrap();
+        let got = said(&s, mark);
+        assert!(got.len() == 1 && got[0].starts_with("gp.spatialJoin ignores 'prefx'"), "{got:?}");
+        // A run started in the background says it too, before its work.
+        let mark = s.notices.len() as u64;
+        let _run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 100, "unit": "Miles"})).unwrap();
+        assert_eq!(said(&s, mark), [buffer]);
+        // A batch says it once, its own way, not once per item as well.
+        let mark = s.notices.len() as u64;
+        s.run("gp.batch", &json!({"tool": "buffer", "inputs": ["Cities"], "params": {"distance": 10, "unit": "Miles"}})).unwrap();
+        assert!(said(&s, mark).is_empty(), "{:?}", said(&s, mark));
+        assert!(s.notices_since(mark).iter().any(|n| n.text.contains("unrecognised parameter(s) ignored in 'params' (unit)")));
+        // A model: validate warns without refusing it, and its step says it as it runs.
+        let step = |p: Value| json!({"name": "Typo", "steps": [{"tool": "buffer", "params": p}]});
+        s.run("model.new", &step(json!({"input": "Cities", "distance": 100, "unit": "Miles"}))).unwrap();
+        let v = s.run("model.validate", &json!({"name": "Typo"})).unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        let warnings = v["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1, "{v}");
+        assert_eq!((warnings[0]["code"].as_str(), warnings[0]["message"].as_str()), (Some("unknown-param"), Some(buffer)), "{v}");
+        let mark = s.notices.len() as u64;
+        s.run("model.run", &json!({"name": "Typo"})).unwrap();
+        assert_eq!(said(&s, mark), [buffer]);
+        s.run("model.new", &json!({"name": "Clean", "steps": [{"tool": "buffer", "params": {"input": "Cities", "distance": 100}}]}))
+            .unwrap();
+        let v = s.run("model.validate", &json!({"name": "Clean"})).unwrap();
+        assert_eq!(v["warnings"], json!([]), "{v}");
     }
 
     #[test]

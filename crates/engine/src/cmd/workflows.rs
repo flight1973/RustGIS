@@ -37,7 +37,9 @@ pub fn commands() -> Vec<C> {
             let (_, g, _) = model_graph(s, p)?;
             note_passed_graph(s, p);
             let problems = crate::model::validate(s, &g);
-            Ok(json!({"ok": problems.is_empty(), "problems": problems}))
+            // What the model does that it may not mean, which doesn't keep it from running.
+            let warnings = crate::model::warnings(&g);
+            Ok(json!({"ok": problems.is_empty(), "problems": problems, "warnings": warnings}))
         }).roles(&[crate::ParamRole { key: "graph", role: crate::Role::ModelGraph }]).effects(crate::policy::Effects::NONE)
         .view()
         .params(r#"{"name"?: model (default: the last), "graph"?: graph}"#),
@@ -1050,7 +1052,8 @@ fn run_steps(s: &mut Session, model: Model) -> CmdResult {
         let mut params = st.params.clone();
         wire(&mut params, &outputs, i, 0)?;
         let before = s.project.gp_history.len();
-        let r = super::gp::run_tool(s, &st.tool, &params).map_err(|e| format!("step {} ({}): {e}", i + 1, st.tool))?;
+        // As gp.run runs it, saying which of its parameters the tool ignores (#2307).
+        let r = super::gp::run_tool_saying(s, &st.tool, &params).map_err(|e| format!("step {} ({}): {e}", i + 1, st.tool))?;
         // A step that made no layer leaves nothing for a later %n to use.
         let out =
             (s.project.gp_history.len() > before).then(|| s.project.gp_history.last().and_then(|h| h.outputs.first().cloned())).flatten();
