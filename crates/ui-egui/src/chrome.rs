@@ -657,10 +657,13 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     crate::modelbuilder::shortcuts(app, ctx);
     // The search box (or a table cell) was typed in until egui took its focus away on Escape:
-    // that Escape clears the box (leaves the cell as it was), not the tool.
+    // that Escape clears the box (leaves the cell as it was), not the tool. An open list (a
+    // clause's Functions) keeps the same keys as a box, those without Ctrl (⌘): Escape closes it.
     let pass = ctx.cumulative_pass_nr();
-    let typing =
-        ctx.egui_wants_keyboard_input() || crate::searchbox::had_focus(&app.ui.search, pass) || crate::table::had_focus(&app.table, pass);
+    let typing = ctx.egui_wants_keyboard_input()
+        || crate::completion::menu_is_open(ctx)
+        || crate::searchbox::had_focus(&app.ui.search, pass)
+        || crate::table::had_focus(&app.table, pass);
     // A text field focused, not any widget (a button reached with Tab): it has an undo of its own.
     let text_field = ctx.text_edit_focused();
     // An element selected in the open layout, for the layout's own keys.
@@ -897,6 +900,7 @@ pub(crate) const UI_COMMANDS: &[(&str, &str, &str)] = &[
     ("ui.traceEdges", "Trace", "Edit › Features"),
     ("ui.exportMap", "Export Map…", "Publish › Output"),
     ("ui.checkUpdate", "Check for Updates…", "Help › Help"),
+    ("ui.touchInterface", "Use the Touch Interface", "View › Interface"),
 ];
 
 /// Command Search's interactive entry points. These collect input without changing the engine API.
@@ -1047,6 +1051,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "cube.catalog" | "cube.open" => Dialog("dataCubes"),
         "nationalMap.add" => Dialog("nationalMap"),
         "fieldsOfTheWorld.add" => Dialog("fieldsOfTheWorld"),
+        "copernicus.login" | "copernicus.logout" | "copernicus.status" => Dialog("copernicus"),
         "portal.add" | "portal.search" => Command("ui.searchOpenData"),
         "stac.addAsset" | "stac.addFootprints" | "stac.search" => Command("ui.stac"),
         _ => return None,
@@ -1198,6 +1203,10 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             // Match the platform availability used by the shortcut editor, including desktop
             // theme files and the loopback relay.
             if !command_available(id, cfg!(target_arch = "wasm32")) {
+                continue;
+            }
+            // Only a shell with a touch interface (a phone's) has one to go back to.
+            if id == "ui.touchInterface" && app.touch.is_none() {
                 continue;
             }
             if ql.is_empty() || label.to_lowercase().contains(&ql) || tl!(label).to_lowercase().contains(&ql) {

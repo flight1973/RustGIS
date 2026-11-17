@@ -2056,7 +2056,10 @@ pub(crate) fn read_rows(
         .filter_map(|&i| {
             let ty = types
                 .and_then(|t| t.get(i).copied().flatten())
-                .unwrap_or_else(|| text_type(rows.iter().filter_map(|r| r.get(i)).map(|s| s.as_str())));
+                // `<Null>` is read as empty, so it types a column no more than an empty cell does.
+                .unwrap_or_else(|| {
+                    text_type(rows.iter().filter_map(|r| r.get(i)).map(|s| s.as_str()).filter(|s| !Value::is_null_marker(s)))
+                });
             Some(Field::new(headers.get(i)?.trim(), ty))
         })
         .collect();
@@ -2067,7 +2070,7 @@ pub(crate) fn read_rows(
     let gt = if xy.is_some() { GeometryType::Point } else { GeometryType::None };
     let mut ds = Dataset::new(name, gt, fields);
     let mut srid: Option<u32> = None;
-    let mut unread_dates = Vec::new();
+    let (mut unread_dates, mut null_text) = (Vec::new(), Vec::new());
     for (k, &i) in columns.iter().enumerate() {
         crate::source::unread_dates_by(&mut unread_dates, k, workbook.and_then(|(_, empty)| empty.get(i)).copied().unwrap_or(0));
     }
@@ -2119,8 +2122,13 @@ pub(crate) fn read_rows(
             .enumerate()
             .map(|(k, (&i, f))| {
                 let text = unguard(r.get(i).map(|s| s.as_str()).unwrap_or(""));
-                let value = Value::parse_source(&text, f.ty);
-                if f.ty.is_temporal() && !text.trim().is_empty() && value.is_null() {
+                let marker = Value::is_null_marker(&text);
+                if marker {
+                    crate::source::null_text_at(&mut null_text, k);
+                }
+                let value = Value::parse_file(&text, f.ty);
+                // The marker is counted once, as one, not also as a date that isn't one.
+                if f.ty.is_temporal() && !marker && !text.trim().is_empty() && value.is_null() {
                     crate::source::unread_date(&mut unread_dates, k);
                 }
                 value
@@ -2200,6 +2208,7 @@ pub(crate) fn read_rows(
     }
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
     report.messages.extend(report.unread_dates.clone());
+    report.messages.extend(crate::source::null_text_note(&ds.fields, &null_text));
     Ok((ds, report))
 }
 
@@ -2912,8 +2921,7 @@ fn dbf_reader(mut bytes: Vec<u8>, cpg: Option<&[u8]>) -> Result<DbfRead> {
 fn read_dbf(bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str, budget: &mut usize) -> Result<(Dataset, ReadReport)> {
     let DbfRead { mut reader, fields, decimals, mut report } = dbf_reader(bytes, cpg)?;
     let mut ds = Dataset::new(name, GeometryType::None, fields);
-    let mut unread_dates = vec![0; ds.fields.len()];
-    let mut nonfinite = vec![0; ds.fields.len()];
+    let mut counts = DbfCounts::new(ds.fields.len());
     let allowance = *budget;
     let mut left = allowance;
     crate::progress::begin(reader.header().num_records as usize);
@@ -2921,7 +2929,7 @@ fn read_dbf(bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str, budget: &mut usize) 
         crate::progress::step(1)?;
         match record {
             Ok(record) => {
-                let attrs = dbf_attrs(&record, &ds.fields, &mut unread_dates, &mut nonfinite);
+                let attrs = dbf_attrs(&record, &ds.fields, &mut counts);
                 let cost = attrs
                     .iter()
                     .fold(
@@ -2953,7 +2961,7 @@ fn read_dbf(bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str, budget: &mut usize) 
     if deleted > 0 {
         report.messages.push(format!("{name}: {deleted} dBASE records marked deleted were left out"));
     }
-    dbf_notices(&ds, &mut report, &unread_dates, &nonfinite);
+    dbf_notices(&ds, &mut report, &counts);
     integral_numeric_to_integer(&mut ds, &decimals);
     if report.skipped > 0 {
         report.messages.push(format!("{name}: {} dBASE records were unreadable and left out", report.skipped));
@@ -2963,12 +2971,20 @@ fn read_dbf(bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str, budget: &mut usize) 
 }
 
 /// Converts one record to typed values, sharing loss counts with the containing dataset.
-fn dbf_attrs(record: &shapefile::dbase::Record, fields: &[Field], unread_dates: &mut [usize], nonfinite: &mut [usize]) -> Vec<Value> {
+fn dbf_attrs(record: &shapefile::dbase::Record, fields: &[Field], counts: &mut DbfCounts) -> Vec<Value> {
     use shapefile::dbase::FieldValue;
+    let DbfCounts { unread_dates, nonfinite, null_text } = counts;
     fields
         .iter()
+        .enumerate()
         .zip(unread_dates.iter_mut().zip(nonfinite.iter_mut()))
-        .map(|(f, (unread, nonfinite))| match record.get(&f.name) {
+        .map(|((k, f), (unread, nonfinite))| match record.get(&f.name) {
+            // `<Null>` is a missing value's marker, in a date column too; other text keeps its
+            // leading spaces (the reader drops only the padding after it).
+            Some(FieldValue::Character(Some(s))) if Value::is_null_marker(s) => {
+                crate::source::null_text_at(null_text, k);
+                Value::Null
+            }
             Some(FieldValue::Character(Some(s))) if f.ty == FieldType::Date => match crate::dbf::date(s.as_bytes()) {
                 Ok(d) => d.map_or(Value::Null, Value::Date),
                 Err(()) => {
@@ -2976,7 +2992,7 @@ fn dbf_attrs(record: &shapefile::dbase::Record, fields: &[Field], unread_dates: 
                     Value::Null
                 }
             },
-            Some(FieldValue::Character(Some(s))) => Value::Text(s.trim().to_string()),
+            Some(FieldValue::Character(Some(s))) => Value::Text(s.clone()),
             Some(FieldValue::Numeric(Some(n))) if n.is_finite() => Value::Float(*n),
             Some(FieldValue::Numeric(Some(_))) => {
                 *nonfinite += 1;
@@ -2992,8 +3008,23 @@ fn dbf_attrs(record: &shapefile::dbase::Record, fields: &[Field], unread_dates: 
         .collect()
 }
 
-/// Reports date and numeric cells read as null, identically for tables and Shapefiles.
-fn dbf_notices(ds: &Dataset, report: &mut ReadReport, unread_dates: &[usize], nonfinite: &[usize]) {
+/// Values a `.dbf` read changed, counted for each field by its position: dates that weren't
+/// ones, numbers that weren't finite, and text `<Null>`, all read as null.
+struct DbfCounts {
+    unread_dates: Vec<usize>,
+    nonfinite: Vec<usize>,
+    null_text: Vec<usize>,
+}
+
+impl DbfCounts {
+    fn new(fields: usize) -> Self {
+        DbfCounts { unread_dates: vec![0; fields], nonfinite: vec![0; fields], null_text: Vec::new() }
+    }
+}
+
+/// Reports date, numeric and `<Null>` cells read as null, identically for tables and Shapefiles.
+fn dbf_notices(ds: &Dataset, report: &mut ReadReport, counts: &DbfCounts) {
+    let DbfCounts { unread_dates, nonfinite, null_text } = counts;
     let name = &ds.name;
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, unread_dates);
     report.messages.extend(report.unread_dates.iter().map(|n| format!("{name}: {n}")));
@@ -3006,6 +3037,7 @@ fn dbf_notices(ds: &Dataset, report: &mut ReadReport, unread_dates: &[usize], no
         };
         report.messages.push(format!("{name}: {what} read as empty, in {}", named_fields(&ds.fields, nonfinite)));
     }
+    report.messages.extend(crate::source::null_text_note(&ds.fields, null_text).map(|n| format!("{name}: {n}")));
 }
 
 /// The files of a Shapefile, read into memory.
@@ -3042,9 +3074,7 @@ pub(crate) fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Optio
         }),
     };
     let (mut converted, mut unconverted, mut zm_shapes, mut not_numbers) = (0usize, 0usize, 0usize, 0usize);
-    let mut unread_dates = vec![0usize; ds.fields.len()];
-    // Numbers that aren't finite (`nan`, `inf`), read as empty and counted for a notice.
-    let mut nonfinite = vec![0usize; ds.fields.len()];
+    let mut counts = DbfCounts::new(ds.fields.len());
     let mut source_kind = GeometryType::None;
     let pt = |x: f64, y: f64| Coord::new(x, y);
     for item in reader.iter_shapes_and_records() {
@@ -3107,11 +3137,11 @@ pub(crate) fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Optio
             }
             (_, g) => g,
         };
-        let attrs = dbf_attrs(&record, &ds.fields, &mut unread_dates, &mut nonfinite);
+        let attrs = dbf_attrs(&record, &ds.fields, &mut counts);
         ds.push_next(geom, attrs);
     }
     ds.drop_zm(&mut report, zm_shapes);
-    dbf_notices(&ds, &mut report, &unread_dates, &nonfinite);
+    dbf_notices(&ds, &mut report, &counts);
     ds.geometry_type = dominant_type(&ds);
     // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
     // conversion warning. Its shapes can be recovered by importing with an override.
@@ -5048,8 +5078,10 @@ mod tests {
         );
         assert!(crate::export_notes([(&lonlat, ext(&lonlat))], "out.geojson", Crs::LonLat).is_empty());
 
-        // NAD 27 without TOWGS84, as its WKT is kept with the layer and saved with the project.
-        let wkt = r#"PROJCS["NAD_1927_UTM_Zone_16N",GEOGCS["GCS_North_American_1927",DATUM["D_North_American_1927",SPHEROID["Clarke_1866",6378206.4,294.9786982]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-87.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]"#;
+        // A datum no one knows a shift of (NAD 27's ellipsoid under a local name; NAD 27 itself is
+        // transformed by its name, as PROJ 9.8.1 does), as its WKT is kept with the layer and
+        // saved with the project.
+        let wkt = r#"PROJCS["NAD_1927_UTM_Zone_16N",GEOGCS["GCS_Local",DATUM["D_Local_Survey",SPHEROID["Clarke_1866",6378206.4,294.9786982]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-87.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]"#;
         let (nad27, note) = crate::raster::wkt::read_wkt(wkt).unwrap();
         assert!(note.is_some());
         let mut parcels = lonlat.clone();
@@ -5598,6 +5630,69 @@ mod tests {
         assert_eq!(to_csv(&back).unwrap(), once, "export/import is stable");
     }
 
+    /// `<Null>` in a `.dbf` date column is counted once, as the marker, not also as a date that
+    /// isn't one, whole and streamed.
+    #[test]
+    fn a_null_marker_in_a_date_column_is_not_an_unread_date() {
+        let mut ds = Dataset::new("permits", GeometryType::Point, vec![Field::new("issued", FieldType::Date)]);
+        for day in ["2026-01-02", "2026-01-03"] {
+            ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::parse(day, FieldType::Date)]);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shp = dir.path().join("permits.shp");
+        write_path(&ds, &shp).unwrap();
+        let dbf = shp.with_extension("dbf");
+        let original = std::fs::read(&dbf).unwrap();
+        // Padded with spaces, or with NULs as some writers do.
+        for marker in [b"<Null>  ", b"<Null>\0\0"] {
+            let mut table = original.clone();
+            let at = table.windows(8).position(|w| w == b"20260103").unwrap();
+            table[at..at + 8].copy_from_slice(marker);
+            std::fs::write(&dbf, table).unwrap();
+            let whole = read_shapefile_in(&shp, "permits", None).unwrap();
+            let streamed = crate::source::materialize(&crate::source::shp::ShpSource::open_path(&shp, "permits").unwrap()).unwrap();
+            for (read, (back, report)) in [("whole", whole), ("streamed", streamed)] {
+                assert_eq!(back.features[1].attrs[0], Value::Null, "{read}");
+                let said = "permits: 1 value written as Null was read as empty, in 'issued'";
+                assert!(report.messages.iter().any(|m| m == said), "{read}: {:?}", report.messages);
+                assert!(!report.messages.iter().any(|m| m.contains("date")), "{read}: {:?}", report.messages);
+            }
+        }
+    }
+
+    /// Text cells read as the file has them (#2059): spaces kept, all-space text kept, an empty cell
+    /// null, `<Null>` null and counted; a number column still reads past the spaces, and `<Null>`
+    /// doesn't make it text.
+    #[test]
+    fn csv_and_workbook_text_is_read_as_the_file_has_it() {
+        // A workbook keeps the spaces of a cell marked so, as spreadsheet programs mark them.
+        let kept = |t: &str| format!(r#"<c t="inlineStr"><is><t xml:space="preserve">{t}</t></is></c>"#);
+        let (lead, blank, trail) = (kept(" 2535"), kept("   "), kept("x  "));
+        let rows: &[&[&str]] = &[
+            &["code", "n", "note", "x"],
+            &[&lead, " 7 ", "a", "1.5"],
+            &[&blank, "8", "&lt;null&gt;", "&lt;Null&gt;"],
+            &["&lt;Null&gt;", "", "b", "2.5"],
+            &[&trail, "9", "c", "3.5"],
+        ];
+        let text = "code,n,note,x\n 2535, 7 ,a,1.5\n   ,8,<null>,<Null>\n<Null>,,b,2.5\nx  ,9,c,3.5\n";
+        let csv = read_csv(text, "t").unwrap();
+        let book = crate::sheets::read(&crate::sheets::xlsx(&[("Sheet1", rows)]), "t", None, &CsvOptions::default()).unwrap();
+        for (what, (ds, report)) in [("csv", csv), ("xlsx", book)] {
+            let column = |k: usize| ds.features.iter().map(|f| f.attrs[k].clone()).collect::<Vec<_>>();
+            let text = |t: &str| Value::Text(t.into());
+            assert_eq!(column(0), [text(" 2535"), text("   "), Value::Null, text("x  ")], "{what}");
+            assert_eq!(column(1), [Value::Int(7), Value::Int(8), Value::Null, Value::Int(9)], "{what}: numbers read past the spaces");
+            assert_eq!(column(2), [text("a"), Value::Null, text("b"), text("c")], "{what}");
+            assert_eq!(ds.fields[3].ty, FieldType::Double, "{what}: `<Null>` doesn't type a column");
+            assert_eq!(column(3), [Value::Float(1.5), Value::Null, Value::Float(2.5), Value::Float(3.5)], "{what}");
+            let said = "3 values written as Null were read as empty, in 'code', 'note', 'x'";
+            assert!(report.messages.iter().any(|m| m == said), "{what}: {:?}", report.messages);
+        }
+        let (_, report) = read_csv("code\n 2535\n", "t").unwrap();
+        assert!(report.messages.iter().all(|m| !m.contains("written as Null")), "{:?}", report.messages);
+    }
+
     #[test]
     fn csv_digits_a_number_cannot_hold_stay_text() {
         let text = "id,share,mixed,n,x\n12345678901234567891,0.12345678901234567891,9007199254740993,7,1.50\n2,0.5,1.5,8,1e300\n";
@@ -5948,24 +6043,23 @@ mod tests {
         assert!(!said(&rep.messages), "{:?}", rep.messages);
     }
     /// An ESRI .prj without an authority retains the national datum shift: Monte Mario in Milan
-    /// (#807), and PRS92 in Manila, known by its Esri datum name (#2258).
+    /// (#807), and PRS92 in Manila, known by its Esri datum name (#2258). Positions are the
+    /// corpus's PROJ 9.8.1 references for the row's WKT.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn shapefile_esri_national_datum() {
         use shapefile::dbase::{Record, TableWriterBuilder};
         let dir = tempfile::tempdir().unwrap();
-        let points = [
-            ("3003", 1_514_881.490_594_152, 5_034_556.812_441_661, 9.19, 45.4642),
-            ("3123", 499_853.537_328_088_83, 1_614_717.322_006_204_6, 121.0, 14.6),
-        ];
-        for (code, x, y, lon, lat) in points {
+        for code in ["3003", "3123"] {
+            let row = include_str!("raster/esri_datum_corpus.tsv").lines().find(|l| l.starts_with(&format!("{code}\t"))).unwrap();
+            let f: Vec<&str> = row.split('\t').collect();
+            let [x, y, lon, lat] = [1, 2, 3, 4].map(|i| f[i].parse::<f64>().unwrap());
             let shp = dir.path().join(format!("{code}.shp"));
             {
                 let mut writer = shapefile::Writer::from_path(&shp, TableWriterBuilder::new()).unwrap();
                 writer.write_shape_and_record(&shapefile::Point::new(x, y), &Record::default()).unwrap();
             }
-            let row = include_str!("raster/esri_datum_corpus.tsv").lines().find(|l| l.starts_with(&format!("{code}\t"))).unwrap();
-            std::fs::write(shp.with_extension("prj"), row.split('\t').nth(5).unwrap()).unwrap();
+            std::fs::write(shp.with_extension("prj"), f[5]).unwrap();
             let (ds, report) = read_path(&shp).unwrap();
             let c = ds.features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
             assert!((c.x - lon).abs() < 1e-7 && (c.y - lat).abs() < 1e-7, "EPSG:{code}: {c:?}");
