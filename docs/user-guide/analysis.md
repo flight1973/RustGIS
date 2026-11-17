@@ -1279,8 +1279,10 @@ either way.
   roles. This matches the "linework" method of make-valid tools. Where two parts overlap is left
   out, a ring listed as a part inside another is a hole, and what of a hole lies outside its
   exterior ring is a part. It suits data whose ring roles may be wrong, such as a hole stored as a
-  part of its own: Shells Minus Holes fills it, Even-Odd keeps it a hole. Exact duplicate rings of
-  one role, an exterior of another exterior or a hole of another hole, are left out first, since
+  part of its own: Shells Minus Holes fills it, Even-Odd keeps it a hole. Each part is combined
+  first, then the parts together, so a hole two parts both have stays out of both, and a part
+  whose exterior ring has no area is dropped with its holes, as under Shells Minus Holes. Exact
+  duplicates, a hole repeated in its own part or a part repeated whole, are left out first, since
   each pair would cancel out, and the tool says how many. Features rebuilt under Even-Odd have
   `even_odd` in `repairs` after the codes.
 

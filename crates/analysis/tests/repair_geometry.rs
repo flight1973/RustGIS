@@ -1276,3 +1276,38 @@ fn even_odd_says_what_it_did() {
     assert_eq!(got.map(|g| area(&g)), Some(100.0));
     assert!(messages.iter().any(|m| m.contains("1 duplicate ring was left out")), "{messages:?}");
 }
+
+/// Even-Odd leaves out only duplicates no one means, gives an arealess part nothing, and says what
+/// it did with holes and parts, without taking a part's own hole or an island in it for an overlap.
+#[test]
+fn even_odd_builds_part_by_part() {
+    let far: Ring = &[(20., 0.), (22., 2.), (22., 0.), (20., 2.), (20., 0.)];
+    let inner: Ring = &[(2., 2.), (8., 2.), (8., 8.), (2., 8.), (2., 2.)];
+    let middle: Ring = &[(4., 4.), (6., 4.), (6., 6.), (4., 6.), (4., 4.)];
+    // Two parts with the same hole: the hole is in neither, so it stays out, and the inner part,
+    // inside the outer, is a hole.
+    let (got, repairs, messages) = one_by("Even-Odd", multi(&[&[SQUARE, middle], &[inner, middle]]));
+    assert_eq!(got.map(|g| area(&g)), Some(64.0), "{repairs}");
+    assert!(repairs.contains("parts_overlap"), "{repairs}");
+    assert!(!messages.iter().any(|m| m.contains("duplicate")), "{messages:?}");
+    // An island in another part's hole, and a bowtie part well apart: no overlap.
+    let (got, repairs, _) = one_by("Even-Odd", multi(&[&[SQUARE, inner], &[middle], &[far]]));
+    assert_eq!(repairs, "self_intersection, even_odd");
+    assert_eq!(got.map(|g| area(&g)), Some(100.0 - 36.0 + 4.0 + 2.0));
+    // A part whose exterior ring has no area takes its holes with it, as under the default.
+    let flat: Ring = &[(0., 0.), (5., 0.), (10., 0.), (0., 0.)];
+    let g = poly(&[flat, HOLE]);
+    assert_eq!(one_by("Even-Odd", g.clone()).0, one_by("Shells Minus Holes", g).0);
+    // A hole crossing itself with a lobe outside its exterior ring: said, as under the default.
+    let lobes: Ring = &[(8., 4.), (12., 6.), (12., 4.), (8., 6.), (8., 4.)];
+    for rule in ["Shells Minus Holes", "Even-Odd"] {
+        let (_, repairs, _) = one_by(rule, poly(&[SQUARE, lobes]));
+        assert!(repairs.contains("hole_outside_shell"), "{rule}: {repairs}");
+    }
+    // Parts meeting along a line are joined, and that is said.
+    let side: Ring = &[(10., 0.), (20., 0.), (20., 10.), (10., 10.), (10., 0.)];
+    let (got, repairs, messages) = one_by("Even-Odd", multi(&[&[SQUARE], &[side], &[far]]));
+    assert!(repairs.contains("parts_overlap"), "{repairs}");
+    assert!(messages.iter().any(|m| m.contains("joined into one")), "{messages:?}");
+    assert_eq!(got.map(|g| area(&g)), Some(202.0));
+}

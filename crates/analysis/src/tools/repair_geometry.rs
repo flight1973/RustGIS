@@ -302,6 +302,12 @@ fn notices(t: &Tally, field: &str, rule: Rule) -> Vec<String> {
     if merged > 0 && rule == Rule::ShellsMinusHoles {
         messages.push(format!("{TOOL}: the parts that overlapped or touched along a line were merged in {}", features(merged)));
     }
+    if merged > 0 && rule == Rule::EvenOdd {
+        messages.push(format!(
+            "{TOOL}: the parts that overlapped or touched along a line in {} were combined by the Even-Odd rule: where they overlapped is left out, and parts meeting along a line were joined into one",
+            features(merged)
+        ));
+    }
     let split = t.count(Code::DisconnectedInterior);
     if split > 0 {
         messages.push(format!(
