@@ -76,7 +76,7 @@ pub fn commands() -> Vec<C> {
         C::new("map.basemap", "Basemap", "Home › Add", basemap).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"name": "paper"|"midnight"|"ocean"|"atlas"|"blank", "keepTiles"?: bool (keeps the web tile basemaps over it)}"#),
         C::new("map.graticule", "Graticule", "View › Display", graticule).roles(&[]).effects(crate::policy::Effects::NONE)
-        .params(r##"{"on"?: bool (toggles when omitted, on when a type or crs is given), "type"?: "degrees"|"measured"|"utm"|"mgrs", "crs"?: a projected system for the measured grid (EPSG:2056, WKT or a PROJ string; "" or null: the map's own when projected, else the UTM zone at the view's centre), "onTop"?: bool (the lines over the layers, under the labels; false: with the basemap, under the layers), "color"?: "#RRGGBB"|"#RRGGBBAA" ("" or null: the basemap's)}"##),
+        .params(r##"{"on"?: bool (toggles when omitted, on when a type or crs is given), "type"?: "degrees"|"measured"|"utm"|"mgrs", "crs"?: a projected system for the measured grid (EPSG:2056, WKT or a PROJ string; "" or null: the map's own when projected, else the UTM zone at the view's centre), "onTop"?: bool (the lines over the layers, under the labels; false or null: with the basemap, under the layers), "color"?: "#RRGGBB"|"#RRGGBBAA" ("" or null: the basemap's)}"##),
         C::new("map.reloadWebLayers", "Reload Web Layers", "View › Display", |_, _| {
             // The map view draws again when the tile cache's generation moves.
             crate::render::rustgis_tiles::cache::clear();
@@ -779,7 +779,9 @@ fn set_bearing(s: &mut Session, p: &Value) -> CmdResult {
 fn graticule(s: &mut Session, p: &Value) -> CmdResult {
     use rustgis_map::graticule::GraticuleType;
     let on_top = match p.get("onTop") {
-        None | Some(Value::Null) => None,
+        None => None,
+        // As for the color: null puts the default back (under the layers).
+        Some(Value::Null) => Some(false),
         Some(v) => Some(super::bool_value(v).ok_or_else(|| format!("onTop must be true or false, not {v}"))?),
     };
     let color = match p.get("color") {

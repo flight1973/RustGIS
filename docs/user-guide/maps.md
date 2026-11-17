@@ -762,9 +762,10 @@ and says so.
 
 Two more settings in the same menu apply to every type, and are saved with the map:
 
-- **Draw on top of layers** (`"onTop"` in the command; off by default): by default the grid lines
-  are drawn with the basemap, under the map's layers and web tile layers, so a filled layer hides
-  them. With it on, they are drawn over every layer and tile layer, still under the labels.
+- **Draw on top of layers** (`"onTop"` in the command; off by default, and `null` goes back to
+  it): by default the grid lines are drawn with the basemap, under the map's layers and web tile
+  layers, so a filled layer hides them. With it on, they are drawn over every layer and tile
+  layer, still under the labels.
 - **Grid color** (`"color"`: `"#RRGGBB"` or `"#RRGGBBAA"`, with its opacity): the lines' color. By
   default it is the basemap's own grid color, which is faint; **Default** (`null` or `""` in the
   command) goes back to it. The MGRS names take the same color, fully opaque. Major and minor

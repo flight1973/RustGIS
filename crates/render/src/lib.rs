@@ -5684,15 +5684,19 @@ fn render_frame(
     let mut label_layers = label_layers;
     // The MGRS graticule's names (#1042), over the placed labels and apart from their collisions,
     // with no layer of their own in a recording, in the graticule's color made opaque. A tilted
-    // view's bands draw none: their places would repeat from band to band.
-    if map.graticule && grat.a() > 0 && matches!(labels_to, Labels::Own | Labels::Turned(_)) {
+    // view's bands draw none: their places would repeat from band to band. Paused labels pause
+    // them too (and so drapes and tilt patches, drawn paused, leave them out).
+    if map.graticule && grat.a() > 0 && !map.label_display.paused && matches!(labels_to, Labels::Own | Labels::Turned(_)) {
         let color = Rgba::rgb(grat.r(), grat.g(), grat.b());
-        for (text, x, y) in mapgrid::labels(map, view, |t| text::measure(t, mapgrid::LABEL_PT, false)) {
-            // Into the turned view's screen, as the placed labels are.
+        let measure = |t: &str| text::measure(t, mapgrid::LABEL_PT, false);
+        for (text, x, y) in mapgrid::labels(map, view, measure) {
+            // Into the turned view's screen, as the placed labels are, and only a name all of
+            // which shows there: the north-up frame reaches past the turned view's edges.
             let (x, y) = match turned {
                 Some(to) => {
                     let (sx, sy) = to.to_screen(view.camera.to_map(f64::from(x), f64::from(y), view.width, view.height));
-                    if !((0.0..=to.width).contains(&sx) && (0.0..=to.height).contains(&sy)) {
+                    let (hw, hh) = mapgrid::label_reach(measure(&text));
+                    if !(hw <= sx && sx <= to.width - hw && hh <= sy && sy <= to.height - hh) {
                         continue;
                     }
                     (sx as f32, sy as f32)
@@ -8767,6 +8771,36 @@ mod tests {
         m.graticule_type = rustgis_map::graticule::GraticuleType::Mgrs;
         m.graticule = false;
         assert!(grid(&mut m, &view).is_empty());
+    }
+
+    /// The MGRS names pause with the labels; on a turned view, a name is kept only when all of it
+    /// shows, never cut at the view's edge.
+    #[test]
+    fn mgrs_names_pause_and_keep_within_a_turned_view() {
+        let mut m = Map::new("Map");
+        m.graticule_type = rustgis_map::graticule::GraticuleType::Mgrs;
+        let camera = Camera { center: lonlat_to_merc(Coord::new(14.5, 48.2)), res: 500.0, bearing: 30.0, pitch: 0.0 };
+        let view = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+        let grid = |m: &mut Map, view: &View| -> Vec<PlacedLabel> {
+            render(m, view).unwrap().labels.into_iter().filter(|l| l.size == mapgrid::LABEL_PT && l.halo.is_some()).collect()
+        };
+        // Views over several places, so some names fall near the turned view's edges.
+        for i in 0..12 {
+            let at = Coord::new(12.0 + 0.37 * f64::from(i), 47.0 + 0.23 * f64::from(i));
+            let v = View { camera: Camera { center: lonlat_to_merc(at), ..camera }, ..view };
+            let named = grid(&mut m, &v);
+            assert!(!named.is_empty());
+            for l in &named {
+                let hw = f64::from(text::measure(&l.text, mapgrid::LABEL_PT, false)) / 2.0;
+                let hh = f64::from(mapgrid::LABEL_PT) * 1.33 * 1.2 / 2.0;
+                let (x, y) = (f64::from(l.x), f64::from(l.y));
+                assert!(x - hw >= 0.0 && x + hw <= v.width && y - hh >= 0.0 && y + hh <= v.height, "{} at {x}, {y}", l.text);
+            }
+        }
+        m.label_display.paused = true;
+        for v in [view, View { camera: Camera { bearing: 0.0, ..camera }, ..view }] {
+            assert!(grid(&mut m, &v).is_empty());
+        }
     }
 
     /// The graticule's lines are drawn with the basemap, so an opaque filled layer hides them,

@@ -12665,9 +12665,9 @@ fn an_mgrs_graticule_is_required_by_name_in_the_saved_project() {
     assert!(serde_json::to_value(&s.project).unwrap().get("requires").is_none());
 }
 
-/// A saved task or script that puts the graticule on top or colors it names that among what the
-/// project requires, so an older RustGIS refuses it rather than running it without the key; one
-/// that only goes back to the defaults (false, null, "") names nothing.
+/// A saved task or script that sets whether the graticule is on top, or its color, names that among
+/// what the project requires, so an older RustGIS refuses it rather than running it without the
+/// key (and toggling the grid instead); one that sets neither names nothing.
 #[test]
 fn saved_graticule_settings_are_required_by_name() {
     let s = world();
@@ -12682,8 +12682,16 @@ fn saved_graticule_settings_are_required_by_name() {
     assert_eq!(with_task(json!({"onTop": true})), Some(json!(["graticule-on-top"])));
     assert_eq!(with_task(json!({"color": "#ff000080"})), Some(json!(["graticule-color"])));
     assert_eq!(with_task(json!({"onTop": true, "color": "#000"})), Some(json!(["graticule-on-top", "graticule-color"])));
-    for defaults in [json!({"onTop": false}), json!({"color": null}), json!({"color": " "}), json!({"type": "utm"})] {
-        assert_eq!(with_task(defaults.clone()), None, "{defaults}");
+    // Any value, null included: an older reader would toggle the grid where this one keeps it, even
+    // for the defaults, and `onTop` reads "true" and 1 as true.
+    for on_top in [json!(null), json!(false), json!("true"), json!(1)] {
+        assert_eq!(with_task(json!({"onTop": on_top})), Some(json!(["graticule-on-top"])), "{on_top}");
+    }
+    for color in [json!(null), json!(""), json!(" ")] {
+        assert_eq!(with_task(json!({"color": color})), Some(json!(["graticule-color"])), "{color}");
+    }
+    for nothing in [json!({"type": "utm"}), json!({"on": false})] {
+        assert_eq!(with_task(nothing.clone()), None, "{nothing}");
     }
     // In a script, too.
     let mut project = s.project.clone();
@@ -12694,6 +12702,29 @@ fn saved_graticule_settings_are_required_by_name() {
         .unwrap(),
     ];
     assert_eq!(serde_json::to_value(&project).unwrap()["requires"], json!(["graticule-on-top"]));
+}
+
+/// A saved command that switches the graticule to MGRS names the MGRS grid among what the project
+/// requires, its type read as the command reads it; other types don't.
+#[test]
+fn saved_commands_switching_to_mgrs_require_it() {
+    let s = world();
+    let with_step = |command: &str, params: Value| {
+        let mut project = s.project.clone();
+        project.tasks = vec![
+            serde_json::from_value(json!({"name": "Grid", "steps": [{"title": "Grid", "command": command, "params": params}]})).unwrap(),
+        ];
+        serde_json::to_value(&project).unwrap().get("requires").cloned()
+    };
+    for mgrs in ["mgrs", " MGRS ", "Mgrs"] {
+        assert_eq!(with_step("map.graticule", json!({"type": mgrs})), Some(json!(["graticule-mgrs"])), "{mgrs}");
+    }
+    for other in [json!("utm"), json!("degrees"), json!("measured"), json!("ups"), json!(null), json!(1)] {
+        assert_eq!(with_step("map.graticule", json!({"type": other})), None, "{other}");
+    }
+    let script = |line: &str| with_step("script.run", json!({"script": line}));
+    assert_eq!(script("map.graticule {\"type\": \"mgrs\"}"), Some(json!(["graticule-mgrs"])));
+    assert_eq!(script("map.graticule {\"type\": \"utm\"}"), None);
 }
 
 /// The graticule's lines over the layers, and their color (#1042): set without showing or hiding
@@ -12734,6 +12765,10 @@ fn the_graticule_goes_on_top_in_a_color_of_its_own() {
     assert_eq!((r["onTop"].clone(), r["color"].clone()), (json!(false), json!(null)));
     s.run("map.graticule", &json!({"color": "#123456"})).unwrap();
     s.run("map.graticule", &json!({"color": " "})).unwrap();
+    // `onTop: null` puts the default back too, without showing or hiding the grid.
+    s.run("map.graticule", &json!({"onTop": true})).unwrap();
+    let r = s.run("map.graticule", &json!({"onTop": null})).unwrap();
+    assert_eq!((r["on"].clone(), r["onTop"].clone()), (json!(on), json!(false)));
     assert_eq!(s.map().graticule_color, None);
     assert_eq!(s.map().graticule_rgba(), s.map().palette().3);
     assert_eq!(s.map().graticule, on);

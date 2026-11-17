@@ -85,25 +85,42 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("tabulate-intersection-unit", command_uses_tabulate_unit),
     ("layout-element-background", command_uses_element_background),
     ("picture-markers", command_uses_picture_marker),
+    ("graticule-mgrs", command_draws_mgrs_graticule),
     ("graticule-on-top", command_puts_graticule_on_top),
     ("graticule-color", command_colors_graticule),
 ];
 
-/// A saved `map.graticule` that draws the grid over the layers: an older reader ignores the key
-/// and leaves it under them. `false` is what that reader does anyway.
+/// A saved `map.graticule` that switches to the MGRS grid, its type read as the command reads it:
+/// an older reader refuses the type, so the command would fail there.
+fn command_draws_mgrs_graticule(id: &str, params: &Value) -> bool {
+    match id {
+        "map.graticule" => params
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(rustgis_map::graticule::GraticuleType::from_name)
+            .is_some_and(|t| t == rustgis_map::graticule::GraticuleType::Mgrs),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_draws_mgrs_graticule)),
+        _ => false,
+    }
+}
+
+/// A saved `map.graticule` that sets whether the grid draws over the layers, or puts the default
+/// back with `null`: an older reader ignores the key, and without `on`, `type` or `crs` it toggles
+/// the grid where this one keeps it as it is, so any value needs it.
 fn command_puts_graticule_on_top(id: &str, params: &Value) -> bool {
     match id {
-        "map.graticule" => params.get("onTop").is_some_and(|v| v.as_bool() == Some(true)),
+        "map.graticule" => params.get("onTop").is_some(),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_puts_graticule_on_top)),
         _ => false,
     }
 }
 
-/// A saved `map.graticule` that gives the grid a color of its own: an older reader ignores the
-/// key and draws the palette's. `null` or `""` only goes back to the palette.
+/// A saved `map.graticule` that sets the grid's color, or puts the palette's back with `null` or
+/// `""`: an older reader ignores the key, and without `on`, `type` or `crs` it toggles the grid
+/// where this one keeps it as it is, so any value needs it.
 fn command_colors_graticule(id: &str, params: &Value) -> bool {
     match id {
-        "map.graticule" => params.get("color").and_then(Value::as_str).is_some_and(|c| !c.trim().is_empty()),
+        "map.graticule" => params.get("color").is_some(),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_colors_graticule)),
         _ => false,
     }

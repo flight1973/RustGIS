@@ -36,6 +36,8 @@ const MGRS_FINEST: f64 = 100.0;
 const FEW_CELLS: usize = 4;
 /// The size of the MGRS graticule's labels, in points (as a layout's MGRS square labels).
 pub(crate) const LABEL_PT: f32 = 10.0;
+/// A label's height in points: a line of [`LABEL_PT`] text.
+const LABEL_H: f64 = LABEL_PT as f64 * 1.33 * 1.2;
 /// The places across and down a 100 km square (and half as many across a grid zone designation)
 /// whose middle on the screen places its label.
 const LABEL_SAMPLES: u32 = 8;
@@ -172,12 +174,6 @@ fn cells() -> impl Iterator<Item = (u8, char, Extent)> {
     })
 }
 
-/// How many zone-and-band cells the view itself shows (`shown`: places over it).
-fn cells_seen(shown: &[Coord]) -> usize {
-    let seen_parts = extents(shown);
-    cells().filter(|(_, _, c)| seen_parts.iter().any(|e| overlaps(c, e))).count()
-}
-
 /// The UTM graticule's lines (all of them minor; see [`zones`]).
 #[cfg(test)]
 fn utm(center: Coord, shown: &[Coord], around: &[Coord]) -> Vec<Vec<Coord>> {
@@ -197,11 +193,13 @@ fn zones(center: Coord, shown: &[Coord], around: &[Coord], mgrs: bool) -> GridLi
     let has_lon =
         |lon: f64, south: f64, north: f64| parts.iter().any(|e| e.min_x <= lon && lon <= e.max_x && e.min_y <= north && south <= e.max_y);
     let edges = if mgrs { &mut out.major } else { &mut out.minor };
+    // (Made once a frame: the map redraws often.)
+    let all: Vec<(u8, char, Extent)> = cells().collect();
     // Each zone's western edge within each band, and the last zone's eastern one at 180°, so the
-    // Norway and Svalbard zones are drawn as they are.
-    for band in BANDS.chars() {
-        let Some((south, north)) = band_latitudes(band) else { continue };
-        for (_, _, cell) in cells().filter(|(_, b, _)| *b == band) {
+    // Norway and Svalbard zones are drawn as they are. (`cells` gives them band by band.)
+    for band_cells in all.chunk_by(|a, b| a.1 == b.1) {
+        let Some((south, north)) = band_cells.first().map(|(_, _, c)| (c.min_y, c.max_y)) else { continue };
+        for (_, _, cell) in band_cells {
             if has_lon(cell.min_x, south, north) {
                 edges.push(meridian(cell.min_x, south, north));
             }
@@ -219,11 +217,12 @@ fn zones(center: Coord, shown: &[Coord], around: &[Coord], mgrs: bool) -> GridLi
     }
     // Eastings and northings when few zone-and-band cells are in the view itself (not counting
     // the margin, so they don't come and go as it pans), drawn over the margin too.
-    let seen_cells = cells_seen(shown);
+    let seen_parts = extents(shown);
+    let seen_cells = all.iter().filter(|(_, _, c)| seen_parts.iter().any(|e| overlaps(c, e))).count();
     if seen_cells == 0 || seen_cells > MAX_GRIDDED_CELLS {
         return out;
     }
-    let in_view: Vec<_> = cells().filter_map(|(z, b, c)| parts.iter().find(|e| overlaps(&c, e)).map(|e| (z, b, c, *e))).collect();
+    let in_view: Vec<_> = all.iter().filter_map(|&(z, b, c)| parts.iter().find(|e| overlaps(&c, e)).map(|e| (z, b, c, *e))).collect();
     let step = zone_transformer(center)
         .and_then(|tr| if mgrs { span_over(&tr, shown).map(|span| mgrs_step(span, seen_cells)) } else { step_over(&tr, shown) });
     let Some(step) = step else { return out };
@@ -239,13 +238,7 @@ fn zones(center: Coord, shown: &[Coord], around: &[Coord], mgrs: bool) -> GridLi
             max_x: cell.max_x.min(e.max_x),
             max_y: cell.max_y.min(e.max_y),
         };
-        let frame: Vec<Coord> = (0..=8)
-            .flat_map(|i| {
-                let t = f64::from(i) / 8.0;
-                let (x, y) = (part.min_x + part.width() * t, part.min_y + part.height() * t);
-                [Coord::new(x, part.min_y), Coord::new(x, part.max_y), Coord::new(part.min_x, y), Coord::new(part.max_x, y)]
-            })
-            .collect();
+        let frame = frame_of(&part);
         let g = Grid { kind: GridKind::Measured, step, labels: false, ..Grid::default() };
         let mut zone_lines = Vec::new();
         measured_lines(&g, &tr, &frame, false, &mut zone_lines);
@@ -293,7 +286,6 @@ pub(crate) fn labels(map: &Map, view: &View, width: impl Fn(&str) -> f32) -> Vec
         return Vec::new();
     }
     // A 100 km square's side on the screen at the view's center, from a kilometer's.
-    let label_h = f64::from(LABEL_PT) * 1.33 * 1.2;
     let square_pt = place(w / 2.0, h / 2.0).and_then(|c| {
         let (zone, north) = (utm_zone(c)?, c.y >= 0.0);
         let (e, n) = to_utm_in_zone(c, zone, north)?;
@@ -302,7 +294,7 @@ pub(crate) fn labels(map: &Map, view: &View, width: impl Fn(&str) -> f32) -> Vec
         Some(side(from_utm(zone, north, e + 1000.0, n))?.min(side(from_utm(zone, north, e, n + 1000.0))?))
     });
     // Squares named once the 100 km lines are drawn and a square is three labels tall.
-    let squares = seen.len() <= MAX_GRIDDED_CELLS && square_pt.is_some_and(|s| s >= 3.0 * label_h);
+    let squares = seen.len() <= MAX_GRIDDED_CELLS && square_pt.is_some_and(|s| s >= 3.0 * LABEL_H);
     // The grid zone designations in view: with more than one, a square's name carries its own.
     let mut gzds: Vec<(u8, char)> = shown.iter().filter_map(|c| Some((utm_zone(*c)?, latitude_band(c.y)?))).collect();
     gzds.sort_unstable();
@@ -325,7 +317,7 @@ pub(crate) fn labels(map: &Map, view: &View, width: impl Fn(&str) -> f32) -> Vec
                 let samples = grid_of(LABEL_SAMPLES / 2, part.min_x, part.min_y, part.max_x, part.max_y).filter(|c| in_cell(*c));
                 let Some((x, y)) = middle(samples.filter_map(&screen)) else { continue };
                 let fits = |c: Coord| in_cell(c);
-                if !named.contains(&(zone, band, 0, 0)) && label_fits(&gzd, (x, y), &width, label_h, on_view, place, fits) {
+                if !named.contains(&(zone, band, 0, 0)) && label_fits(&gzd, (x, y), &width, on_view, place, fits) {
                     named.insert((zone, band, 0, 0));
                     out.push((gzd.clone(), x as f32, y as f32));
                 }
@@ -365,7 +357,7 @@ pub(crate) fn labels(map: &Map, view: &View, width: impl Fn(&str) -> f32) -> Vec
                         && to_utm_in_zone(c, zone, north)
                             .is_some_and(|(x, y)| (x / SQUARE).floor() as i64 == ie && (y / SQUARE).floor() as i64 == inn)
                 };
-                if !named.contains(&(zone, band, ie, inn)) && label_fits(&text, (x, y), &width, label_h, on_view, place, fits) {
+                if !named.contains(&(zone, band, ie, inn)) && label_fits(&text, (x, y), &width, on_view, place, fits) {
                     named.insert((zone, band, ie, inn));
                     out.push((text, x as f32, y as f32));
                 }
@@ -412,18 +404,23 @@ fn label_fits(
     text: &str,
     (x, y): (f64, f64),
     width: impl Fn(&str) -> f32,
-    label_h: f64,
     on_view: impl Fn((f64, f64)) -> bool,
     place: impl Fn(f64, f64) -> Option<Coord>,
     fits: impl Fn(Coord) -> bool,
 ) -> bool {
-    let (hw, hh) = (f64::from(width(text)) / 2.0 + 2.0, label_h / 2.0 + 2.0);
+    let (hw, hh) = label_reach(width(text));
     [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0), (0.0, 0.0), (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)].iter().all(
         |&(kx, ky)| {
             let p = (x + kx * hw, y + ky * hh);
             on_view(p) && place(p.0, p.1).is_some_and(&fits)
         },
     )
+}
+
+/// How far a label `width` points across reaches from its center, across and down (points), with
+/// a little room around it.
+pub(crate) fn label_reach(width: f32) -> (f64, f64) {
+    (f64::from(width) / 2.0 + 2.0, LABEL_H / 2.0 + 2.0)
 }
 
 /// The transformer of the UTM zone at `c` (by its 6° zone and hemisphere), made once a code.
