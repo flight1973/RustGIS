@@ -1207,6 +1207,34 @@ mod tests {
     }
 
     #[test]
+    fn a_picture_read_at_a_step_is_warped_by_the_step_exactly() {
+        // A 61-pixel-wide file read at every second pixel: 31 cells, each exactly two of the
+        // file's pixels from the corner (61 isn't a multiple of 2, so 61/31 ≈ 1.968 would put
+        // the far cells about one cell off). The fit is in the file's pixels; each cell holds
+        // the file column it was read from.
+        let (w, h) = (31u32, 4u32);
+        let data: Vec<f32> = (0..w * h).map(|i| 2.0 * (i % w) as f32).collect();
+        let r = scan(w, h, vec![data], ColorHint::Gray, "Float32").read_at_step(2, (61, 7));
+        assert_eq!(r.file_pixels(), (2.0, 2.0));
+        let map = |c: f64, rw: f64| (500_000.0 + 10.0 * c, 4_000_000.0 - 10.0 * rw);
+        let fit = georef::fit(Kind::Affine, &gcps(61.0, 7.0, map)).unwrap();
+        let out = warp(&r, &fit, &opts(Some(5.0), Resampling::Nearest)).unwrap();
+        let mut checked = 0;
+        for col in 0..i64::from(out.width) {
+            let p = out.transform.to_world(col as f64 + 0.5, 1.5);
+            let Some((c, _)) = fit.to_pixel(p.x, p.y) else { continue };
+            // Away from the cells' edges, where nearest could go either way.
+            if !(0.2..61.8).contains(&c) || (c % 2.0 - 1.0).abs() < 0.2 || c % 2.0 < 0.2 {
+                continue;
+            }
+            let v = out.value(0, col, 1).unwrap();
+            assert_eq!(f64::from(v), 2.0 * (c / 2.0).floor(), "file column {c}");
+            checked += 1;
+        }
+        assert!(checked > 40, "{checked}");
+    }
+
+    #[test]
     fn hostile_fits_and_options_are_refused() {
         let r = scan(4, 4, vec![vec![1.0; 16]], ColorHint::Gray, "Float32");
         let map = |c: f64, rw: f64| (500_000.0 + c, 4_000_000.0 - rw);

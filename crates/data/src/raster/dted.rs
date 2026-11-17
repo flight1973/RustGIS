@@ -41,9 +41,9 @@
 //! A column whose record doesn't start with the sentinel is damaged and read as no data, and the
 //! columns are counted in a notice. A record whose longitude or latitude count disagrees with its
 //! place in the file (a producer numbering them differently, from 1, say) is read by its place,
-//! and the columns are counted in a notice. A column whose checksum doesn't match its heights is read as stored, and counted in a notice too: GDAL's
-//! DTED driver documentation says some producers write wrong checksums, and that GDAL ignores
-//! them by default. A file cut short is read as far as it goes, the missing columns as no data,
+//! and the columns are counted in a notice. A column whose checksum doesn't match its heights is
+//! read as stored, and counted in a notice too: GDAL's DTED driver documentation says some
+//! producers write wrong checksums, and that GDAL ignores them by default. A file cut short is read as far as it goes, the missing columns as no data,
 //! and said.
 //!
 //! The same documentation says some producers write heights in two's complement rather than
@@ -158,6 +158,10 @@ pub fn spec_latitude_interval(level: u8) -> Option<u32> {
 
 /// Reads a DTED file: `bytes` are the file, `file_name` its name (its extension gives the level
 /// the spacing is checked against when the DSI doesn't name one).
+///
+/// One step that doesn't look at Cancel: the file is already in memory and is read in a single
+/// pass over its records. On the desktop it runs in Add Data's read-ahead, off the UI thread, and
+/// a Cancel takes effect when it returns.
 pub fn read(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     read_limited(file_name, bytes, max_samples())
 }

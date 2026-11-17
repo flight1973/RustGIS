@@ -72,6 +72,10 @@ pub fn tile_corner(file_name: &str) -> Option<(i32, i32)> {
 }
 
 /// Reads an SRTM tile: `bytes` are the file, `file_name` its name (which places it).
+///
+/// One step that doesn't look at Cancel: the file is already in memory and is read in a single
+/// pass over it. On the desktop it runs in Add Data's read-ahead, off the UI thread, and a Cancel
+/// takes effect when it returns.
 pub fn read(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     read_limited(file_name, bytes, max_samples())
 }

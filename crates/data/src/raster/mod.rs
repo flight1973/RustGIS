@@ -1064,6 +1064,15 @@ impl Raster {
         (f64::from(full_w) / f64::from(self.width.max(1)), f64::from(full_h) / f64::from(self.height.max(1)))
     }
 
+    /// For other crates' tests: this raster as if read at every `step`-th pixel of a file of
+    /// `full` pixels, as the readers mark one read within the memory budget.
+    #[doc(hidden)]
+    pub fn read_at_step(mut self, step: u32, full: (u32, u32)) -> Raster {
+        self.step = step.max(1);
+        self.overview = Some(full);
+        self
+    }
+
     /// A scan placed by its world file, in `crs`: georeferenced. The world file speaks of the
     /// file's pixels, so a scan read at a reduced size keeps its place with pixels as much
     /// larger. A rotated, skewed or mirrored one is resampled north up, as a rotated GeoTIFF is,
