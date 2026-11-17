@@ -109,6 +109,9 @@ pub(crate) struct Repaired {
     /// When the overlay rebuilt it, how far its coordinates may have moved, in their units (degrees,
     /// as coordinates are stored).
     pub moved: Option<f64>,
+    /// Under [`Rule::EvenOdd`], exact duplicate rings of one role dropped before the rings were
+    /// combined, since a pair would cancel out.
+    pub duplicates: usize,
 }
 
 /// What [`repair`] made of one geometry.
@@ -121,17 +124,55 @@ pub(crate) enum Outcome {
     Kept(Kept),
 }
 
-/// Repairs one geometry, spending at most [`validity::MAX_WORK`] on each check and on the
-/// overlay, and asking `has_room` whether the browser can give the overlay's memory before it runs
-/// (see `web_has_room` in the tools).
-pub(crate) fn repair(g: Option<&Geometry>, has_room: &dyn Fn(u64) -> bool) -> Outcome {
-    repair_with(g, validity::MAX_WORK, &|_| true, has_room)
+/// How the rebuild by area decides what is inside a polygon whose rings cross, overlap or sit in
+/// the wrong place (#2003). Both give a valid geometry; they differ in what the rings are taken to
+/// mean, and only for such polygons: one valid as it is, or fixed without moving a coordinate, is
+/// written the same either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Rule {
+    /// Each part is its exterior ring's area less the union of its holes', and the feature is the
+    /// union of its parts: the rings' roles as OGC gives them (GEOS's "structure"). Parts that
+    /// overlap merge, a hole outside its exterior ring disappears, and a ring listed as a part of
+    /// its own is filled even when it lies inside another part.
+    #[default]
+    ShellsMinusHoles,
+    /// Each ring's own area as [`Rule::ShellsMinusHoles`] reads it (its loops by winding, so a
+    /// ring traced twice or a bowtie keeps its area), then the rings combined by parity whatever
+    /// their roles: what lies inside an odd number of rings is in (GEOS's "linework" gives the same
+    /// area). Where two parts overlap is left out, a ring listed as a part inside another is a
+    /// hole, and what of a hole lies outside its exterior ring is a part. Exact duplicate rings of
+    /// one role are dropped first, since a pair would cancel out ([`Repaired::duplicates`]).
+    EvenOdd,
 }
 
-/// [`repair`] with a work `budget`, asking `allow` before each reservation of a buffer whether to
+impl Rule {
+    /// The rule a tool parameter names, as its choices spell it.
+    pub(crate) fn named(name: &str) -> Option<Rule> {
+        match name {
+            "Shells Minus Holes" => Some(Rule::ShellsMinusHoles),
+            "Even-Odd" => Some(Rule::EvenOdd),
+            _ => None,
+        }
+    }
+}
+
+/// Repairs one geometry under `rule`, spending at most [`validity::MAX_WORK`] on each check and on
+/// the overlay, and asking `has_room` whether the browser can give the overlay's memory before it
+/// runs (see `web_has_room` in the tools).
+pub(crate) fn repair_by(g: Option<&Geometry>, rule: Rule, has_room: &dyn Fn(u64) -> bool) -> Outcome {
+    repair_by_with(g, rule, validity::MAX_WORK, &|_| true, has_room)
+}
+
+/// [`repair_by`] with a work `budget`, asking `allow` before each reservation of a buffer whether to
 /// try it, as [`validity::check_with`] does: tests refuse some to stand in for running out of
 /// memory.
-pub(crate) fn repair_with(g: Option<&Geometry>, budget: u64, allow: &dyn Fn(usize) -> bool, has_room: &dyn Fn(u64) -> bool) -> Outcome {
+pub(crate) fn repair_by_with(
+    g: Option<&Geometry>,
+    rule: Rule,
+    budget: u64,
+    allow: &dyn Fn(usize) -> bool,
+    has_room: &dyn Fn(u64) -> bool,
+) -> Outcome {
     let first = validity::check_with(g, budget, allow);
     if first.problems.is_empty() {
         return Outcome::Valid;
@@ -148,11 +189,13 @@ pub(crate) fn repair_with(g: Option<&Geometry>, budget: u64, allow: &dyn Fn(usiz
         Geometry::Line(parts) => match lines(parts, room) {
             Err(limit) => Outcome::Kept(kept_for(limit)),
             Ok((parts, _)) if parts.is_empty() => Outcome::Gone(Gone::TooFewPoints),
-            Ok((parts, dropped)) => {
-                verified(Repaired { geometry: Geometry::Line(parts), codes: first.codes(), dropped, narrow: 0, moved: None }, budget, allow)
-            }
+            Ok((parts, dropped)) => verified(
+                Repaired { geometry: Geometry::Line(parts), codes: first.codes(), dropped, narrow: 0, moved: None, duplicates: 0 },
+                budget,
+                allow,
+            ),
         },
-        Geometry::Polygon(polys) => polygon(polys, &first, budget, allow, has_room),
+        Geometry::Polygon(polys) => polygon(polys, &first, rule, budget, allow, has_room),
         // A point's only problems, a missing or non-finite coordinate, are handled above.
         Geometry::Point(_) | Geometry::MultiPoint(_) => Outcome::Kept(Kept::Failed),
     }
@@ -264,6 +307,7 @@ fn rings(polys: &[Vec<Vec<Coord>>], room: Room) -> Result<(Vec<Vec<Vec<Coord>>>,
 fn polygon(
     polys: &[Vec<Vec<Coord>>],
     first: &Checked,
+    rule: Rule,
     budget: u64,
     allow: &dyn Fn(usize) -> bool,
     has_room: &dyn Fn(u64) -> bool,
@@ -297,7 +341,7 @@ fn polygon(
     }
     codes.sort_unstable();
     if second.problems.is_empty() {
-        return Outcome::Repaired(Repaired { geometry: fixed, codes, dropped, narrow: 0, moved: None });
+        return Outcome::Repaired(Repaired { geometry: fixed, codes, dropped, narrow: 0, moved: None, duplicates: 0 });
     }
     let Geometry::Polygon(parts) = &fixed else { return Outcome::Kept(Kept::Failed) };
     if gone(second).is_some() {
@@ -322,8 +366,11 @@ fn polygon(
         Ok(c) => c,
         Err(limit) => return Outcome::Kept(kept_for(limit)),
     };
-    let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| by_area(parts, &crossing, room)));
-    let Rebuilt { polys, no_area, narrow, found } = match rebuilt {
+    let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match rule {
+        Rule::ShellsMinusHoles => by_area(parts, &crossing, room),
+        Rule::EvenOdd => by_parity(parts, &crossing, room),
+    }));
+    let Rebuilt { polys, no_area, narrow, found, duplicates } = match rebuilt {
         Ok(Ok(rebuilt)) => rebuilt,
         Ok(Err(kept)) => return Outcome::Kept(kept),
         Err(_) => return Outcome::Kept(Kept::Failed),
@@ -338,7 +385,11 @@ fn polygon(
     }
     codes.sort_unstable();
     let moved = Some(step * GRID_STEPS_MOVED);
-    verified(Repaired { geometry: Geometry::Polygon(polys), codes, dropped: dropped.saturating_add(no_area), narrow, moved }, budget, allow)
+    verified(
+        Repaired { geometry: Geometry::Polygon(polys), codes, dropped: dropped.saturating_add(no_area), narrow, moved, duplicates },
+        budget,
+        allow,
+    )
 }
 
 /// The step of the integer grid i_overlay rounds the points `pts` to: it takes half the larger
@@ -512,6 +563,119 @@ struct Rebuilt {
     /// Holes and parts dropped as narrower than a step of the overlay's grid in any direction.
     narrow: usize,
     found: Found,
+    /// Exact duplicate rings of one role dropped first ([`Rule::EvenOdd`] only).
+    duplicates: usize,
+}
+
+/// The area `ring` stands for, as both rules read one ring: as it is when simple (it isn't in
+/// `crossing`, the rings that cross, touch or run back over themselves, by part and ring, sorted),
+/// otherwise its loops by non-zero winding, so both lobes of a bowtie count and a ring traced twice
+/// counts once.
+fn ring_area(ring: &[Coord], at: (usize, usize), crossing: &[(usize, usize)], room: Room) -> Result<geo::MultiPolygon<f64>, Kept> {
+    let ring = geo::LineString(room.collect(ring.len(), ring.iter().map(|c| geo::Coord { x: c.x, y: c.y })).map_err(kept_for)?);
+    let poly = geo::Polygon::new(ring, vec![]);
+    if crossing.binary_search(&at).is_err() {
+        // A simple ring: its area as it is, wound as the overlay expects.
+        return Ok(geo::MultiPolygon::new(vec![poly.orient(Direction::Default)]));
+    }
+    on_grid(std::iter::once(poly.exterior()))?;
+    Ok(poly.boolean_op_with_fill_rule(&geo::MultiPolygon::new(vec![]), OpType::Union, FillRule::NonZero))
+}
+
+/// The rebuild under [`Rule::EvenOdd`] of `parts` (closed rings, each with 3 distinct points or
+/// more; `crossing` as in [`ring_area`]): exact duplicate rings of one role dropped
+/// ([`distinct_rings`]), each ring's own area ([`ring_area`]), pieces narrower than a step of the
+/// overlay's grid dropped and counted as [`by_area`] drops them, then the pieces combined by
+/// parity in one overlay. No codes are found beyond the checks': the rings' roles, which they
+/// would be about, don't decide the result.
+fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -> Result<Rebuilt, Kept> {
+    let (keep, duplicates) = distinct_rings(parts, room).map_err(kept_for)?;
+    let mut pieces: Vec<geo::Polygon<f64>> = Vec::new();
+    let mut no_area = 0usize;
+    let mut narrow = 0usize;
+    for (p, r) in keep {
+        let Some(ring) = parts.get(p).and_then(|rings| rings.get(r)) else { continue };
+        let area = ring_area(ring, (p, r), crossing, room)?;
+        if area.0.is_empty() {
+            no_area += 1;
+        }
+        for piece in area.0 {
+            room.grow(&mut pieces).map_err(kept_for)?;
+            pieces.push(piece);
+        }
+    }
+    if pieces.len() > 1 {
+        // Pieces narrower than a step of the grid the combining overlay rounds to are dropped first.
+        let step = on_grid(rings_of(&pieces))?;
+        pieces = wider(pieces, step, &mut narrow, room)?;
+    }
+    let pieces = geo::MultiPolygon::new(pieces);
+    let combined = if pieces.0.len() > 1 {
+        on_grid(rings_of(&pieces.0))?;
+        pieces.boolean_op_with_fill_rule(&geo::MultiPolygon::new(vec![]), OpType::Union, FillRule::EvenOdd)
+    } else {
+        pieces
+    };
+    Ok(Rebuilt { polys: polygons(&combined, room).map_err(kept_for)?, no_area, narrow, found: Found::new(), duplicates })
+}
+
+/// The rings of `parts` to combine under [`Rule::EvenOdd`], by part and ring in their order, and
+/// how many were left out as exact duplicates of an earlier ring of the same role: an exterior ring
+/// of another exterior ring, a hole of another hole (of any part). The same ring is the same points
+/// in the same cyclic order, from any vertex and in either direction. A ring isn't compared with one
+/// of the other role: a hole equal to its exterior ring leaves its part no area, as it does under
+/// [`Rule::ShellsMinusHoles`]. Found by sorting each ring's normal form, in buffers reserved
+/// fallibly.
+fn distinct_rings(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<(Vec<(usize, usize)>, usize), Limit> {
+    let n = parts.iter().map(Vec::len).fold(0usize, usize::saturating_add);
+    // (whether a hole, the ring's normal form, part, ring)
+    let mut all: Vec<(bool, Vec<(u64, u64)>, usize, usize)> = room.vec(n)?;
+    for (p, rings) in parts.iter().enumerate() {
+        for (r, ring) in rings.iter().enumerate() {
+            all.push((r > 0, normal_form(ring, room)?, p, r));
+        }
+    }
+    all.sort_unstable_by(|a, b| (a.0, &a.1, a.2, a.3).cmp(&(b.0, &b.1, b.2, b.3)));
+    let mut keep: Vec<(usize, usize)> = room.vec(all.len())?;
+    let mut duplicates = 0usize;
+    for (i, (hole, form, p, r)) in all.iter().enumerate() {
+        // Sorted, so a duplicate follows the first of its kind, which has the lowest part and ring.
+        if i > 0 && all.get(i - 1).is_some_and(|prev| prev.0 == *hole && prev.1 == *form) {
+            duplicates += 1;
+        } else {
+            keep.push((*p, *r));
+        }
+    }
+    keep.sort_unstable();
+    Ok((keep, duplicates))
+}
+
+/// A closed ring's points as bits, without the closing repeat, from its least vertex (by x, then
+/// y) and in whichever direction reads less: the same for the same ring whatever vertex it starts
+/// at and whichever way it is wound. A vertex the ring passes more than once is tried as a start
+/// each time.
+fn normal_form(ring: &[Coord], room: Room) -> Result<Vec<(u64, u64)>, Limit> {
+    let pts = match ring.split_last() {
+        Some((last, rest)) if Some(last) == rest.first() => rest,
+        _ => ring,
+    };
+    let bits = |c: &Coord| (c.x.to_bits(), c.y.to_bits());
+    let n = pts.len();
+    let least = pts
+        .iter()
+        .map(|c| (c.x, c.y))
+        .fold((f64::INFINITY, f64::INFINITY), |m, c| if c.0.total_cmp(&m.0).then(c.1.total_cmp(&m.1)).is_lt() { c } else { m });
+    let mut best: Option<Vec<(u64, u64)>> = None;
+    for (start, _) in pts.iter().enumerate().filter(|(_, c)| (c.x, c.y) == least) {
+        for forward in [true, false] {
+            let at = |k: usize| if forward { (start + k) % n } else { (start + n - k % n) % n };
+            let form = room.collect(n, (0..n).filter_map(|k| pts.get(at(k)).map(bits)))?;
+            if best.as_ref().is_none_or(|b| form < *b) {
+                best = Some(form);
+            }
+        }
+    }
+    Ok(best.unwrap_or_default())
 }
 
 /// The rebuild by area (see the module doc) of `parts`, closed rings each with 3 distinct points
@@ -525,16 +689,7 @@ struct Rebuilt {
 /// ones are dropped first, so their vanishing isn't taken for a merge).
 fn by_area(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -> Result<Rebuilt, Kept> {
     let empty = geo::MultiPolygon::<f64>::new(vec![]);
-    let area = |ring: &Vec<Coord>, at: (usize, usize)| -> Result<geo::MultiPolygon<f64>, Kept> {
-        let ring = geo::LineString(room.collect(ring.len(), ring.iter().map(|c| geo::Coord { x: c.x, y: c.y })).map_err(kept_for)?);
-        let poly = geo::Polygon::new(ring, vec![]);
-        if crossing.binary_search(&at).is_err() {
-            // A simple ring: its area as it is, wound as the overlay expects.
-            return Ok(geo::MultiPolygon::new(vec![poly.orient(Direction::Default)]));
-        }
-        on_grid(std::iter::once(poly.exterior()))?;
-        Ok(poly.boolean_op_with_fill_rule(&empty, OpType::Union, FillRule::NonZero))
-    };
+    let area = |ring: &Vec<Coord>, at: (usize, usize)| ring_area(ring, at, crossing, room);
     let mut all: Vec<geo::Polygon<f64>> = Vec::new();
     let mut no_area = 0usize;
     let mut narrow = 0usize;
@@ -611,7 +766,7 @@ fn by_area(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -
     } else {
         all
     };
-    Ok(Rebuilt { polys: polygons(&merged, room).map_err(kept_for)?, no_area, narrow, found })
+    Ok(Rebuilt { polys: polygons(&merged, room).map_err(kept_for)?, no_area, narrow, found, duplicates: 0 })
 }
 
 /// The overlay's polygons as rings, copied fallibly.
@@ -634,6 +789,16 @@ fn polygons(m: &geo::MultiPolygon<f64>, room: Room) -> Result<Vec<Vec<Vec<Coord>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`repair_by`] under the default rule.
+    fn repair(g: Option<&Geometry>, has_room: &dyn Fn(u64) -> bool) -> Outcome {
+        repair_by(g, Rule::default(), has_room)
+    }
+
+    /// [`repair_by_with`] under the default rule.
+    fn repair_with(g: Option<&Geometry>, budget: u64, allow: &dyn Fn(usize) -> bool, has_room: &dyn Fn(u64) -> bool) -> Outcome {
+        repair_by_with(g, Rule::default(), budget, allow, has_room)
+    }
 
     type Ring<'a> = &'a [(f64, f64)];
 
@@ -910,9 +1075,10 @@ mod tests {
 
     #[test]
     fn a_repair_that_is_not_valid_is_not_kept() {
-        let bad = Repaired { geometry: poly(&[BOWTIE]), codes: vec![Code::SelfIntersection], dropped: 0, narrow: 0, moved: None };
+        let bad =
+            Repaired { geometry: poly(&[BOWTIE]), codes: vec![Code::SelfIntersection], dropped: 0, narrow: 0, moved: None, duplicates: 0 };
         assert_eq!(verified(bad, validity::MAX_WORK, &|_| true), Outcome::Kept(Kept::Failed));
-        let busy = Repaired { geometry: poly(&[BOWTIE]), codes: vec![], dropped: 0, narrow: 0, moved: None };
+        let busy = Repaired { geometry: poly(&[BOWTIE]), codes: vec![], dropped: 0, narrow: 0, moved: None, duplicates: 0 };
         assert_eq!(verified(busy, 0, &|_| true), Outcome::Kept(Kept::Work));
     }
 }

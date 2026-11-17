@@ -3,7 +3,7 @@
 //! repaired.
 use super::check_geometry::{features, joined, row_bytes};
 use super::*;
-use crate::repair::{self, Gone, Kept, Outcome};
+use crate::repair::{self, Gone, Kept, Outcome, Rule};
 use crate::validity::Code;
 
 const TOOL: &str = "Repair Geometry";
@@ -12,8 +12,21 @@ const TOOL: &str = "Repair Geometry";
 /// valid ones as stored, repaired ones with their new geometry, those that can't be repaired
 /// without geometry, and those left as they were (too complex, or the repair failed) as stored.
 pub(super) fn run(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
-    run_with_room(inp, p, &web_has_room, |g| repair::repair(g, &web_has_room))
+    let rule = rule_of(p)?;
+    run_with_room(inp, p, &web_has_room, |g| repair::repair_by(g, rule, &web_has_room))
 }
+
+/// The rule `p` names (#2003), Shells Minus Holes when it names none.
+fn rule_of(p: &Json) -> Result<Rule, String> {
+    match p.get("rule") {
+        None | Some(Json::Null) => Ok(Rule::default()),
+        Some(v) => v.as_str().and_then(Rule::named).ok_or_else(|| format!("{TOOL}: rule is \"Shells Minus Holes\" or \"Even-Odd\"")),
+    }
+}
+
+/// What a feature rebuilt under the Even-Odd rule has in its repairs field, after the codes: data,
+/// never translated.
+const EVEN_ODD: &str = "even_odd";
 
 /// A feature's geometry in the output.
 enum Written {
@@ -58,6 +71,11 @@ struct Tally {
     moved: f64,
     /// Features with more attribute values than the layer has fields.
     extra: usize,
+    /// Under the Even-Odd rule: features it rebuilt, and duplicate rings left out first, from how
+    /// many features.
+    even_odd: usize,
+    duplicates: usize,
+    duplicate_features: usize,
 }
 
 impl Tally {
@@ -74,6 +92,7 @@ fn run_with_room(
     has_room: &dyn Fn(u64) -> bool,
     repair: impl Fn(Option<&Geometry>) -> Outcome,
 ) -> Result<ToolResult, String> {
+    let rule = rule_of(p)?;
     let ds = input(inp, p, "input")?;
     if ds.geometry_type == GeometryType::None {
         return Err(format!("{TOOL} needs a layer with geometry: '{}' is a table", ds.name));
@@ -122,9 +141,15 @@ fn run_with_room(
                     tally.overlaid += 1;
                     tally.moved = tally.moved.max(moved);
                 }
-                // A hole or part with no area on the overlay's grid is said after the codes.
+                // The Even-Odd rule decides only what the overlay rebuilds: said for those features.
+                let even_odd = rule == Rule::EvenOdd && r.moved.is_some();
+                tally.even_odd += usize::from(even_odd);
+                tally.duplicates += r.duplicates;
+                tally.duplicate_features += usize::from(r.duplicates > 0);
+                // A hole or part with no area on the overlay's grid is said after the codes, then the
+                // rule when it isn't the default.
                 let narrow = (r.narrow > 0).then_some(Gone::NoArea.as_str());
-                let names: Vec<&str> = r.codes.iter().map(|c| c.as_str()).chain(narrow).collect();
+                let names: Vec<&str> = r.codes.iter().map(|c| c.as_str()).chain(narrow).chain(even_odd.then_some(EVEN_ODD)).collect();
                 (joined(&names, ", ").map_err(no_memory)?, Written::Repaired(r.geometry))
             }
             Outcome::Gone(why) => {
@@ -289,6 +314,21 @@ fn notices(t: &Tally, field: &str) -> Vec<String> {
             rounded_up(t.moved)
         ));
     }
+    if t.even_odd > 0 {
+        messages.push(format!(
+            "{TOOL}: {} {} rebuilt by the Even-Odd rule, with {EVEN_ODD} in {field}: where their rings overlap is left out, and a ring inside another is a hole, whatever its role",
+            features(t.even_odd),
+            was(t.even_odd)
+        ));
+    }
+    if t.duplicates > 0 {
+        messages.push(format!(
+            "{TOOL}: {} duplicate {} left out of {} before the Even-Odd rule, which would have canceled each pair out",
+            t.duplicates,
+            if t.duplicates == 1 { "ring was" } else { "rings were" },
+            features(t.duplicate_features)
+        ));
+    }
     if t.extra > 0 {
         messages.push(format!(
             "{TOOL}: {} had more attribute values than the layer has fields; the extra values aren't in the output",
@@ -364,7 +404,7 @@ mod tests {
                 asked.set(need);
                 true
             },
-            |g| repair::repair(g, &|_| true),
+            |g| repair::repair_by(g, Rule::default(), &|_| true),
         )
         .unwrap();
         let Output::Layer(out) = &r.output else { panic!("a layer") };
@@ -377,7 +417,7 @@ mod tests {
         let first = point_bytes(&inp.0.features[0].attrs, 2) + "ring_not_closed".len() as u64 + ALLOCATION_OVERHEAD + 2 * geometry;
         let second = point_bytes(&inp.0.features[1].attrs, 2) + "null_geometry".len() as u64 + ALLOCATION_OVERHEAD;
         assert_eq!(asked.get(), first + second);
-        let e = run_with_room(&inp, &p, &|_| false, |g| repair::repair(g, &|_| true)).err().unwrap();
+        let e = run_with_room(&inp, &p, &|_| false, |g| repair::repair_by(g, Rule::default(), &|_| true)).err().unwrap();
         assert_eq!(e, "Repair Geometry: the 2 features would need about 3 MiB, more than the browser can give now: select fewer features");
     }
 
@@ -420,7 +460,7 @@ mod tests {
         let r = run_with_room(&inp, &p, &|_| true, |g| {
             repaired.set(repaired.get() + 1);
             control.cancel();
-            repair::repair(g, &|_| true)
+            repair::repair_by(g, Rule::default(), &|_| true)
         });
         assert_eq!(r.err().as_deref(), Some(crate::control::CANCELLED));
         assert_eq!(repaired.get(), 1, "stopped before the second feature");
@@ -434,7 +474,7 @@ mod tests {
                 control.cancel();
                 true
             },
-            |g| repair::repair(g, &|_| true),
+            |g| repair::repair_by(g, Rule::default(), &|_| true),
         );
         assert_eq!(r.err().as_deref(), Some(crate::control::CANCELLED), "stopped in the copies");
     }
