@@ -166,8 +166,8 @@ impl ShpSource {
             notes.push("the .shp has no shapes to frame: its header's box isn't used, and the layer has no extent".into());
         }
         // Records with no usable box, neither stored nor from their own points (a coordinate that
-        // isn't a number or past f32's range, or a record that can't be read; a wrong stored box
-        // over good points is framed by the points instead) are left out of the extent and of
+        // isn't a number or past f32's range, or a record that can't be read; a backwards stored
+        // box over good points is framed by the points instead) are left out of the extent and of
         // every read by area (the R-tree and the scan alike): said, with how many, and when
         // nothing else frames the layer, so.
         if index.unboxed > 0 {
@@ -443,8 +443,9 @@ fn le_f64(b: &[u8], at: usize) -> Option<f64> {
 /// A record's box from the start of its content (shape type, then a point or a box), rounded
 /// outward to `f32`. NaN for a null or empty shape, which has nothing to frame, so no extent meets
 /// it; infinite for a record whose box isn't one (a coordinate that isn't a number or past `f32`'s
-/// range, a box that's backwards, an unknown shape type, or a record too short for what it says),
-/// so it is counted where it's left out ([`index::Index::unboxed`]).
+/// range, an unknown shape type, or a record too short for what it says), so it is counted where
+/// it's left out ([`index::Index::unboxed`]). A backwards box is given as stored, finite but out of
+/// order, for the index to put right from its points where they read ([`index::scan_boxed`]).
 fn record_box(c: &[u8]) -> [f32; 4] {
     const NONE: [f32; 4] = [f32::NAN; 4];
     const NOT_A_BOX: [f32; 4] = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];

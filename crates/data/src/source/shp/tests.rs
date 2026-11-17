@@ -210,7 +210,8 @@ fn an_empty_shape_has_no_box() {
         raw
     };
     // Nothing to frame (a null or empty shape): NaN, not counted. A record whose box isn't one
-    // (unreadable, an unknown type, a box that's backwards): infinite, counted as left out.
+    // (unreadable, an unknown type): infinite, counted as left out. A backwards box is kept as
+    // stored here; the index puts it right from the points (`index::scan_boxed`).
     let none = |b: [f32; 4]| b.iter().all(|v| v.is_nan());
     let unread = |b: [f32; 4]| b == [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
     assert!(none(record_box(&0i32.to_le_bytes())), "a null shape");
@@ -236,7 +237,7 @@ fn an_empty_shape_has_no_box() {
     backwards.extend_from_slice(&4i32.to_le_bytes());
     let b = record_box(&backwards);
     assert_eq!(b, [5.0, 0.0, 1.0, 1.0]);
-    assert!(b[0] > b[2] && !none(b), "counted as left out, not as nothing");
+    assert!(b[0] > b[2] && !none(b), "backwards, for the index to put right, not nothing");
     // A whole file: a multipoint emptied (its box, at 112, made 0, 0, 0, 0 and its count of
     // points, at 144, 0) under a header that's the others' box. The header stands, with nothing
     // said, as the index and a scan of the records both read it.
