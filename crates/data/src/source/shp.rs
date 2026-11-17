@@ -165,14 +165,15 @@ impl ShpSource {
         if native.is_none() && index.count > 0 && index.unboxed == 0 && a_box && !zero {
             notes.push("the .shp has no shapes to frame: its header's box isn't used, and the layer has no extent".into());
         }
-        // Records whose box isn't one (a coordinate that isn't a number or past f32's range, a box
-        // that's backwards, or a record that can't be read) are left out of the extent and of
+        // Records with no usable box, neither stored nor from their own points (a coordinate that
+        // isn't a number or past f32's range, or a record that can't be read; a wrong stored box
+        // over good points is framed by the points instead) are left out of the extent and of
         // every read by area (the R-tree and the scan alike): said, with how many, and when
         // nothing else frames the layer, so.
         if index.unboxed > 0 {
             let none = if native.is_none() { ", so the layer has no extent" } else { "" };
             notes.push(format!(
-                "{} shape(s) have no usable bounding box (a coordinate that isn't a number or is out of range, a box that's backwards, or a record that can't be read): they're left out of the layer's extent and of reads by area{none}",
+                "{} shape(s) have no usable bounding box (a coordinate that isn't a number or is out of range, or a record that can't be read): they're left out of the layer's extent and of reads by area{none}",
                 index.unboxed
             ));
         }
