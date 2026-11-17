@@ -130,27 +130,53 @@ impl ShpSource {
             None => shp_reproject(crate::raster::read_prj(path).as_deref(), &mut notes)?,
         };
         // The records' own boxes frame the layer, as the index holds them (rounded outward to f32);
-        // with none (no records, or every shape null or not a number) it has no extent, never the
-        // 0, 0, 0, 0 a header often holds then (Null Island). The header's box, exact, stands for
-        // them when it frames them all; one that doesn't (a corner that isn't a number, #1985, or
-        // stale after records were added) is set aside, and said.
+        // with none (no records, or every shape null, empty or not a number) it has no extent,
+        // never the 0, 0, 0, 0 a header often holds then (Null Island). The header's box, exact,
+        // stands for them when it is their box (the specification's minimum bounding rectangle);
+        // one that isn't is set aside: said when it misses a shape or isn't a box (a corner that
+        // isn't a number, #1985, or stale after records were added), not when it only holds more
+        // (editors that only grow it, or junk).
+        let header = native;
+        // A box at all: its corners numbers, in order.
+        let a_box = [header.min_x, header.min_y, header.max_x, header.max_y].iter().all(|v| v.is_finite()) && !header.is_empty();
         let native = index.bounds.map(|[x0, y0, x1, y1]| {
-            // The header, a box itself, rounded outward as the records' boxes are, holds them all:
-            // so a header written exactly always passes, as does one short of a shape by so little
-            // that both round to the same f32 (under a meter in UTM).
-            let frames = [native.min_x, native.min_y, native.max_x, native.max_y].iter().all(|v| v.is_finite())
-                && !native.is_empty()
-                && f32_down(native.min_x) <= x0
-                && f32_down(native.min_y) <= y0
-                && f32_up(native.max_x) >= x1
-                && f32_up(native.max_y) >= y1;
-            if frames {
-                native
-            } else {
-                notes.push("the .shp header's bounding box doesn't frame its shapes: the layer's extent is taken from the shapes".into());
-                Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1))
+            // Rounded outward as the records' boxes are, the header is theirs on every side: so a
+            // header written exactly always passes, whatever its size, as does one off by less
+            // than one f32 step (a meter or two at UTM and Web Mercator northings).
+            let [h0, h1, h2, h3] = [f32_down(header.min_x), f32_down(header.min_y), f32_up(header.max_x), f32_up(header.max_y)];
+            if a_box && h0 == x0 && h1 == y0 && h2 == x1 && h3 == y1 {
+                return header;
             }
+            // Larger than the shapes but holding them (left so by editors that only grow it, or
+            // junk): the shapes' box, with nothing to say. One that misses a shape, or isn't a box,
+            // is said.
+            if !(a_box && h0 <= x0 && h1 <= y0 && h2 >= x1 && h3 >= y1) {
+                notes.push(
+                    "the .shp header's bounding box doesn't hold its shapes, or isn't a box: the layer's extent is taken from the shapes"
+                        .into(),
+                );
+            }
+            Extent::new(f64::from(x0), f64::from(y0), f64::from(x1), f64::from(y1))
         });
+        // Records, every shape null or empty, under a header box that says otherwise (not the 0, 0,
+        // 0, 0 such a file usually holds): said, as the layer has no extent. A file of no records
+        // loses nothing by it; shapes there but without a usable box are said below instead.
+        let zero = [header.min_x, header.min_y, header.max_x, header.max_y].iter().all(|v| *v == 0.0);
+        if native.is_none() && index.count > 0 && index.unboxed == 0 && a_box && !zero {
+            notes.push("the .shp has no shapes to frame: its header's box isn't used, and the layer has no extent".into());
+        }
+        // Records with no usable box, neither stored nor from their own points (a coordinate that
+        // isn't a number or past f32's range, or a record that can't be read; a backwards stored
+        // box over good points is framed by the points instead) are left out of the extent and of
+        // every read by area (the R-tree and the scan alike): said, with how many, and when
+        // nothing else frames the layer, so.
+        if index.unboxed > 0 {
+            let none = if native.is_none() { ", so the layer has no extent" } else { "" };
+            notes.push(format!(
+                "{} shape(s) have no usable bounding box (a coordinate that isn't a number or is out of range, or a record that can't be read): they're left out of the layer's extent and of reads by area{none}",
+                index.unboxed
+            ));
+        }
         let extent = native.map_or(Extent::EMPTY, |n| reproject.extent_to_lonlat(&n));
         if reproject.is_lonlat()
             && !extent.is_empty()
@@ -415,36 +441,45 @@ fn le_f64(b: &[u8], at: usize) -> Option<f64> {
 }
 
 /// A record's box from the start of its content (shape type, then a point or a box), rounded
-/// outward to `f32`; NaN for a null or unreadable shape, so no extent meets it.
+/// outward to `f32`. NaN for a null or empty shape, which has nothing to frame, so no extent meets
+/// it; infinite for a record whose box isn't one (a coordinate that isn't a number or past `f32`'s
+/// range, an unknown shape type, or a record too short for what it says), so it is counted where
+/// it's left out ([`index::Index::unboxed`]). A backwards box is given as stored, finite but out of
+/// order, for the index to put right from its points where they read ([`index::scan_boxed`]).
 fn record_box(c: &[u8]) -> [f32; 4] {
     const NONE: [f32; 4] = [f32::NAN; 4];
+    const NOT_A_BOX: [f32; 4] = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
     let b = match le_i32(c, 0) {
+        Some(0) => return NONE,
         Some(1 | 11 | 21) => match (le_f64(c, 4), le_f64(c, 12)) {
             (Some(x), Some(y)) => [x, y, x, y],
-            _ => return NONE,
+            _ => return NOT_A_BOX,
         },
-        Some(t @ (3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28 | 31)) => {
-            // A shape of no points, or no parts (an empty geometry some writers give a 0, 0, 0, 0
-            // box), has nothing to frame. The counts follow the box: a multipoint's points at 36,
-            // else the parts at 36 and the points at 40.
-            let empty = if matches!(t, 8 | 18 | 28) {
-                le_i32(c, 36).is_some_and(|n| n <= 0)
-            } else {
-                le_i32(c, 36).is_some_and(|n| n <= 0) || le_i32(c, 40).is_some_and(|n| n <= 0)
-            };
-            if empty {
+        // A multipatch, which the reader doesn't read, frames nothing it draws: counted.
+        Some(t @ (3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28)) => {
+            // The counts follow the box: a multipoint's points at 36, else the parts at 36 and
+            // the points at 40. A record too short to hold them, or a count below 0, can't be
+            // read; a shape of no points, or no parts (an empty geometry some writers give a 0,
+            // 0, 0, 0 box), has nothing to frame.
+            let (parts, points) = if matches!(t, 8 | 18 | 28) { (Some(1), le_i32(c, 36)) } else { (le_i32(c, 36), le_i32(c, 40)) };
+            let (Some(parts), Some(points)) = (parts, points) else { return NOT_A_BOX };
+            if parts < 0 || points < 0 {
+                return NOT_A_BOX;
+            }
+            if parts == 0 || points == 0 {
                 return NONE;
             }
             match (le_f64(c, 4), le_f64(c, 12), le_f64(c, 20), le_f64(c, 28)) {
-                (Some(a), Some(b), Some(x), Some(y)) => [a, b, x, y],
-                _ => return NONE,
+                (Some(x0), Some(y0), Some(x1), Some(y1)) => [x0, y0, x1, y1],
+                _ => return NOT_A_BOX,
             }
         }
-        _ => return NONE,
+        _ => return NOT_A_BOX,
     };
     if b.iter().any(|v| !v.is_finite()) {
-        return NONE;
+        return NOT_A_BOX;
     }
+    // Past f32's range, a corner rounds to an infinity: not a box either, and counted so.
     [f32_down(b[0]), f32_down(b[1]), f32_up(b[2]), f32_up(b[3])]
 }
 

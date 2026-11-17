@@ -12,6 +12,9 @@ struct DiskIndex {
     pub count: u64,
     covered: u32,
     bounds: Option<[f32; 4]>,
+    /// Records with no usable box, stored or from their points: left out of `bounds` and of the
+    /// R-tree.
+    unboxed: u32,
     _lease: super::cache::Lease,
 }
 
@@ -31,22 +34,29 @@ impl DiskIndex {
         use super::cache;
         use crate::source::external::{fnv1a, stamp};
         let canonical = path.canonicalize()?;
-        let signature = format!("shp-index-v3:{canonical:?}:{:?}", stamp(path)?);
+        let signature = format!("shp-index-v7:{canonical:?}:{:?}", stamp(path)?);
         let mut dir = cache::index_dir();
         let budget = cache::index_budget();
-        let key = format!("{:016x}-{:016x}", fnv1a(format!("shp-index-v3:{canonical:?}").as_bytes()), fnv1a(signature.as_bytes()));
+        let key = format!("{:016x}-{:016x}", fnv1a(format!("shp-index-v7:{canonical:?}").as_bytes()), fnv1a(signature.as_bytes()));
         let pinned = cache::pin_index(&dir, &key, budget).or_else(|_| {
             dir = cache::index_fallback_dir();
             cache::pin_index(&dir, &key, budget)
         });
         if let Ok(Some(lease)) = pinned
             && let Ok(db) = connect(lease.path(), false)
-            && let Ok((saved, count, note, covered, bounds)) =
-                db.query_row("SELECT signature, count, note, covered, bounds FROM metadata", [], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?, r.get::<_, String>(2)?, r.get::<_, u32>(3)?, r.get::<_, String>(4)?))
+            && let Ok((saved, count, note, covered, bounds, unboxed)) =
+                db.query_row("SELECT signature, count, note, covered, bounds, unboxed FROM metadata", [], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, u32>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, u32>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, u32>(5)?,
+                    ))
                 })
             && saved == signature
-            && covered <= count
+            && covered.checked_add(unboxed).is_some_and(|n| n <= count)
             && let Ok(bounds) = serde_json::from_str::<Option<[f32; 4]>>(&bounds)
             // Held to the rule it was built by: a damaged or planted entry is built again rather
             // than giving the layer a box that isn't one (#1985).
@@ -59,7 +69,7 @@ impl DiskIndex {
                 notes.push(note);
             }
             // A reused index adds nothing to the cache, so there is nothing to sweep (#1230).
-            return Ok(Self { db: Mutex::new(db), count: u64::from(count), covered, bounds, _lease: lease });
+            return Ok(Self { db: Mutex::new(db), count: u64::from(count), covered, bounds, unboxed, _lease: lease });
         }
         // Building one sweeps each cache folder it tries once: when the index is committed or, if
         // it fails, when it is released or its reservation fails. Abandoned builds and indexes past
@@ -75,31 +85,34 @@ impl DiskIndex {
             "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
             CREATE TABLE records(id INTEGER PRIMARY KEY, offset INTEGER NOT NULL, len INTEGER NOT NULL);
             CREATE VIRTUAL TABLE bounds USING rtree(id, x0, x1, y0, y1);
-            CREATE TABLE metadata(signature TEXT, count INTEGER, note TEXT, covered INTEGER, bounds TEXT);",
+            CREATE TABLE metadata(signature TEXT, count INTEGER, note TEXT, covered INTEGER, bounds TEXT, unboxed INTEGER);",
         )
         .map_err(sql)?;
         let tx = db.transaction().map_err(sql)?;
-        let mut covered = 0u32;
+        let (mut covered, mut unboxed) = (0u32, 0u32);
         let mut all_bounds: Option<[f32; 4]> = None;
         let (count, note) = {
             let mut record = tx.prepare("INSERT INTO records VALUES(?1,?2,?3)").map_err(sql)?;
             let mut bounds = tx.prepare("INSERT INTO bounds VALUES(?1,?2,?3,?4,?5)").map_err(sql)?;
-            scan(path, len, |id, place, b| {
+            scan_boxed(path, len, |id, place, b| {
                 record.execute(params![id, place.offset, place.len]).map_err(sql)?;
                 if union(&mut all_bounds, b) {
                     let [x0, y0, x1, y1] = b;
                     bounds.execute(params![id, x0, x1, y0, y1]).map_err(sql)?;
                     covered += 1;
+                } else if not_a_box(b) {
+                    unboxed += 1;
                 }
                 Ok(())
             })?
         };
         // Do not retain an index built while the original file was being replaced/edited.
-        if signature != format!("shp-index-v3:{canonical:?}:{:?}", stamp(path)?) {
+        if signature != format!("shp-index-v7:{canonical:?}:{:?}", stamp(path)?) {
             return Err(bad("the .shp changed while its spatial index was being built"));
         }
         let bounds_json = serde_json::to_string(&all_bounds).map_err(|e| bad(e.to_string()))?;
-        tx.execute("INSERT INTO metadata VALUES(?1,?2,?3,?4,?5)", params![signature, count, note, covered, bounds_json]).map_err(sql)?;
+        tx.execute("INSERT INTO metadata VALUES(?1,?2,?3,?4,?5,?6)", params![signature, count, note, covered, bounds_json, unboxed])
+            .map_err(sql)?;
         tx.commit().map_err(sql)?;
         drop(db);
         lease.commit()?;
@@ -107,7 +120,7 @@ impl DiskIndex {
         if !note.is_empty() {
             notes.push(note);
         }
-        Ok(Self { db: Mutex::new(db), count: u64::from(count), covered, bounds: all_bounds, _lease: lease })
+        Ok(Self { db: Mutex::new(db), count: u64::from(count), covered, bounds: all_bounds, unboxed, _lease: lease })
     }
 
     pub fn covers_bbox(&self, extent: [f32; 4]) -> bool {
@@ -193,9 +206,20 @@ impl DiskIndex {
 pub(super) struct Index {
     storage: Storage,
     pub count: u64,
-    /// The union of the records' finite boxes (rounded outward to f32): `None` when no record has
-    /// one (every shape null or empty, or a coordinate that isn't a number).
+    /// The union of the records' usable boxes (rounded outward to f32): `None` when no record has
+    /// one (every shape null or empty, or every box not one even from its points: [`not_a_box`]).
     pub bounds: Option<[f32; 4]>,
+    /// Records with no usable box, stored or from their points ([`not_a_box`],
+    /// [`box_from_points`]): left out of `bounds` and of every read by area (the R-tree and the
+    /// scan alike), and said.
+    pub unboxed: u32,
+}
+
+/// Whether `b` is a record's box that isn't one: a record there (not a null or empty shape, whose
+/// box is NaN), but a corner that isn't a number or is past f32's range, a box that's backwards,
+/// or a record that can't be read (`record_box`).
+fn not_a_box(b: [f32; 4]) -> bool {
+    !usable(b) && !b.iter().all(|v| v.is_nan())
 }
 
 /// Whether `b` is a box: its corners numbers, in order.
@@ -218,15 +242,27 @@ fn union(all: &mut Option<[f32; 4]>, b: [f32; 4]) -> bool {
     true
 }
 
-/// The records counted by scanning their headers, with any note on a truncated file and their
-/// boxes' union: what a disk index holds, for when none can be written.
-pub(super) fn scanned(path: &Path, len: u64) -> Result<(u32, String, Option<[f32; 4]>)> {
-    let mut bounds = None;
-    let (count, note) = scan(path, len, |_, _, b| {
-        union(&mut bounds, b);
+/// What scanning the records' headers gathers, as a disk index holds it, for when none can be
+/// written.
+pub(super) struct Scanned {
+    pub count: u32,
+    /// A note on a truncated file; empty when there's none.
+    pub note: String,
+    pub bounds: Option<[f32; 4]>,
+    pub unboxed: u32,
+}
+
+/// The records counted by scanning their headers, their boxes' union, and the shapes whose box
+/// isn't one.
+pub(super) fn scanned(path: &Path, len: u64) -> Result<Scanned> {
+    let (mut bounds, mut unboxed) = (None, 0u32);
+    let (count, note) = scan_boxed(path, len, |_, _, b| {
+        if !union(&mut bounds, b) && not_a_box(b) {
+            unboxed += 1;
+        }
         Ok(())
     })?;
-    Ok((count, note, bounds))
+    Ok(Scanned { count, note, bounds, unboxed })
 }
 enum Storage {
     Disk(DiskIndex),
@@ -235,16 +271,22 @@ enum Storage {
 impl Index {
     pub fn open(path: &Path, len: u64, notes: &mut Vec<String>) -> Result<Self> {
         match DiskIndex::open(path, len, notes) {
-            Ok(disk) => Ok(Self { count: disk.count, bounds: disk.bounds, storage: Storage::Disk(disk) }),
+            Ok(disk) => Ok(Self { count: disk.count, bounds: disk.bounds, unboxed: disk.unboxed, storage: Storage::Disk(disk) }),
+            // Canceled while it was built: the run stops, not a scan in its place.
+            Err(crate::DataError::Cancelled) => Err(crate::DataError::Cancelled),
             Err(error) => {
-                let (count, note, bounds) = scanned(path, len)?;
                 notes.push(format!("spatial index unavailable ({error}); reading the .shp by scanning record headers"));
-                if !note.is_empty() {
-                    notes.push(note);
-                }
-                Ok(Self { count: u64::from(count), bounds, storage: Storage::Scan { path: path.to_path_buf(), len } })
+                Self::scanning(path, len, notes)
             }
         }
+    }
+    /// The index without a cache: the records' headers scanned now, and again for each read.
+    fn scanning(path: &Path, len: u64, notes: &mut Vec<String>) -> Result<Self> {
+        let Scanned { count, note, bounds, unboxed } = scanned(path, len)?;
+        if !note.is_empty() {
+            notes.push(note);
+        }
+        Ok(Self { count: u64::from(count), bounds, unboxed, storage: Storage::Scan { path: path.to_path_buf(), len } })
     }
     /// Complete file-order traversal without holding the shared interaction connection.
     pub fn visit_complete(&self, extent: Option<[f32; 4]>, visit: impl FnMut(u32, Place) -> Result<()>) -> Result<(u64, bool)> {
@@ -260,21 +302,23 @@ impl Index {
         match &self.storage {
             Storage::Disk(disk) => disk.visit(extent, limit, visit),
             Storage::Scan { path, len } => {
+                // By area, only a record whose box is one ([`usable`], after [`scan_boxed`] has put
+                // a backwards box right from its points), as the disk index's R-tree takes it.
                 let matches = |b: [f32; 4]| {
                     extent.is_none_or(|[x0, y0, x1, y1]| {
-                        let [a, b, x, y] = b;
-                        a <= x1 && x >= x0 && b <= y1 && y >= y0
+                        let [a, by, x, y] = b;
+                        usable(b) && a <= x1 && x >= x0 && by <= y1 && y >= y0
                     })
                 };
                 let mut matched = 0u64;
-                scan(path, *len, |_, _, b| {
+                scan_for(path, *len, extent.is_some(), |_, _, b| {
                     matched += u64::from(matches(b));
                     Ok(())
                 })?;
                 let step = crate::source::stride(matched, limit);
                 let mut ordinal = 0u64;
                 let mut kept = 0usize;
-                scan(path, *len, |id, place, b| {
+                scan_for(path, *len, extent.is_some(), |id, place, b| {
                     if matches(b) {
                         if ordinal.is_multiple_of(step) && kept < limit {
                             visit(id, place)?;
@@ -290,6 +334,64 @@ impl Index {
     }
 }
 
+/// [`scan_boxed`] for a read by area; plain [`scan`] for a whole read, where no box is looked at,
+/// so no record is read for its points.
+fn scan_for(path: &Path, len: u64, by_area: bool, visit: impl FnMut(u32, Place, [f32; 4]) -> Result<()>) -> Result<(u32, String)> {
+    if by_area { scan_boxed(path, len, visit) } else { scan(path, len, visit) }
+}
+
+/// [`scan`], a record whose stored box is backwards (numbers, but out of order: a writer's slip)
+/// given the box of its own points instead where they read and are all numbers
+/// ([`box_from_points`]): what every path (the disk index, its bounds, a scan by area) takes a
+/// record's box to be, so such a shape is still framed and found. Only a backwards box is read
+/// for: a NaN or infinite stored box is taken as it is, counted (most come from points that aren't
+/// numbers, as #1985's files have by the thousand, and reading each would cost a whole record),
+/// and a record that can't be read, or a point (whose box is the point), has nothing more to give.
+fn scan_boxed(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Result<()>) -> Result<(u32, String)> {
+    let (mut shp, mut buf) = (None, Vec::new());
+    scan(path, len, |id, place, b| {
+        let backwards = b.iter().all(|v| v.is_finite()) && !usable(b);
+        let b = if backwards {
+            // A whole record read: Cancel is looked at for each, as there may be many.
+            crate::progress::check()?;
+            let framed = box_from_points(&mut shp, &mut buf, path, place)?;
+            // A huge record's buffer isn't kept for the rest of the scan.
+            if buf.capacity() > 1 << 20 {
+                buf = Vec::new();
+            }
+            framed.unwrap_or(b)
+        } else {
+            b
+        };
+        visit(id, place, b)
+    })
+}
+
+/// The box of a record's own points, rounded outward as the stored ones are: `None` when it doesn't
+/// parse, or a point isn't a number (a read leaves it out then too); an error when the file won't
+/// open or read. Read through `shp`, opened on first use as few records need it, into `buf`, kept
+/// from record to record.
+fn box_from_points(shp: &mut Option<super::Cursor>, buf: &mut Vec<u8>, path: &Path, place: Place) -> Result<Option<[f32; 4]>> {
+    if u64::from(place.len) > super::MAX_RECORD {
+        return Ok(None);
+    }
+    // A file that won't open or read again is an error, not a record without a box: the index
+    // isn't built (nor kept) on it.
+    let cursor = match shp {
+        Some(c) => c,
+        None => shp.insert(super::Cursor::open(path)?),
+    };
+    buf.resize(place.len as usize, 0);
+    cursor.read_at(u64::from(place.offset), buf)?;
+    let Ok(Some(g)) = super::parse_shape(buf) else { return Ok(None) };
+    if !g.is_finite() {
+        return Ok(None);
+    }
+    let e = g.extent();
+    let b = [super::f32_down(e.min_x), super::f32_down(e.min_y), super::f32_up(e.max_x), super::f32_up(e.max_y)];
+    Ok(usable(b).then_some(b))
+}
+
 fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Result<()>) -> Result<(u32, String)> {
     let mut f = BufReader::with_capacity(BUFFER, crate::provenance::open(path)?);
     f.seek_relative(100)?;
@@ -299,6 +401,10 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
     let mut head = [0u8; 52];
     let mut note = String::new();
     while pos + 8 <= len {
+        // Cancel is looked at every so many records, on every path (an index built, a scan read).
+        if count.is_multiple_of(4096) {
+            crate::progress::check()?;
+        }
         let want = (len - pos).min(head.len() as u64) as usize;
         let Some(buf) = head.get_mut(..want) else { break };
         if f.read_exact(buf).is_err() {
@@ -341,10 +447,78 @@ mod tests {
         let mut b = std::fs::read(&path).unwrap();
         b[112..120].copy_from_slice(&f64::NAN.to_le_bytes());
         std::fs::write(&path, &b).unwrap();
-        let (count, note, bounds) = scanned(&path, b.len() as u64).unwrap();
-        assert_eq!((count, note.as_str()), (3, ""));
-        assert_eq!(bounds, Some([11.0, 21.0, 12.0, 22.0]));
+        let s = scanned(&path, b.len() as u64).unwrap();
+        assert_eq!((s.count, s.note.as_str()), (3, ""));
+        assert_eq!(s.bounds, Some([11.0, 21.0, 12.0, 22.0]));
+        assert_eq!(s.unboxed, 1, "the NaN shape is counted as left out");
+        assert!(not_a_box([f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY]) && !not_a_box([f32::NAN; 4]));
         assert!(usable([0.0, 0.0, 1.0, 1.0]));
         assert!(!usable([f32::NAN, 0.0, 1.0, 1.0]) && !usable([2.0, 0.0, 1.0, 1.0]) && !usable([0.0, 0.0, f32::INFINITY, 1.0]));
+    }
+
+    /// A record whose stored box is wrong (backwards) over good points is framed by its points on
+    /// every path: in the bounds, not counted, and found by a read by area through the disk index
+    /// and through a scan without one (built here directly) alike.
+    #[test]
+    fn a_wrong_stored_box_is_framed_by_its_points_on_every_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("multi.shp");
+        let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+        for (x, y) in [(10.0, 20.0), (12.0, 22.0)] {
+            ds.push(Some(Geometry::MultiPoint(vec![Coord::new(x, y), Coord::new(x + 0.5, y + 0.5)])), vec![]);
+        }
+        crate::io::write_path(&ds, &path).unwrap();
+        // The first record's stored box (at 112) made backwards: min x 10.5 past max x 10.
+        let mut b = std::fs::read(&path).unwrap();
+        assert_eq!(i32::from_le_bytes(b[108..112].try_into().unwrap()), 8, "a multipoint file");
+        for (k, v) in [10.5f64, 20.0, 10.0, 20.5].iter().enumerate() {
+            b[112 + 8 * k..120 + 8 * k].copy_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(&path, &b).unwrap();
+        let len = b.len() as u64;
+        let whole = Some([10.0, 20.0, 12.5, 22.5]);
+        let s = scanned(&path, len).unwrap();
+        assert_eq!((s.bounds, s.unboxed), (whole, 0));
+        // Around the first record only.
+        let area = Some([9.0f32, 19.0, 11.0, 21.0]);
+        let found = |index: &Index| {
+            let mut ids = Vec::new();
+            index
+                .visit(area, usize::MAX, |id, _| {
+                    ids.push(id);
+                    Ok(())
+                })
+                .unwrap();
+            ids
+        };
+        let mut notes = Vec::new();
+        let scan = Index::scanning(&path, len, &mut notes).unwrap();
+        assert!(!scan.indexed());
+        assert_eq!((scan.bounds, scan.unboxed), (whole, 0));
+        assert_eq!(found(&scan), [0], "the scan finds it by area");
+        super::super::cache::with_index_dir(tmp.path().join("cache"), || {
+            let disk = Index::open(&path, len, &mut notes).unwrap();
+            assert!(disk.indexed());
+            assert_eq!((disk.bounds, disk.unboxed), (whole, 0));
+            assert_eq!(found(&disk), [0], "the index finds it by area");
+        });
+        // A backwards box over a point that isn't a number (the second record: its box at 192, its
+        // first point's x at 228) can't be put right: left out, and counted, on both paths.
+        let bad = tmp.path().join("bad.shp");
+        for ext in ["shx", "dbf"] {
+            std::fs::copy(path.with_extension(ext), bad.with_extension(ext)).unwrap();
+        }
+        for (k, v) in [12.5f64, 22.0, 12.0, 22.5].iter().enumerate() {
+            b[192 + 8 * k..200 + 8 * k].copy_from_slice(&v.to_le_bytes());
+        }
+        b[228..236].copy_from_slice(&f64::NAN.to_le_bytes());
+        std::fs::write(&bad, &b).unwrap();
+        let first = Some([10.0, 20.0, 10.5, 20.5]);
+        let scan = Index::scanning(&bad, len, &mut notes).unwrap();
+        assert_eq!((scan.bounds, scan.unboxed), (first, 1));
+        super::super::cache::with_index_dir(tmp.path().join("cache"), || {
+            let disk = Index::open(&bad, len, &mut notes).unwrap();
+            assert_eq!((disk.bounds, disk.unboxed), (first, 1));
+        });
     }
 }
