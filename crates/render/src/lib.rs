@@ -4253,10 +4253,10 @@ fn render_frame(
                     }
                 };
                 let (lines, major) = (project(lines), project(major));
-                // The minor lines always (as every graticule drew its lines before #1042's MGRS grid),
-                // the major ones over them when there are any.
-                for (lines, width, always) in [(lines, 0.6f32, true), (major, 1.2, false)] {
-                    if !always && lines.is_empty() {
+                // The minor lines, then the major ones over them. An empty set (an MGRS view
+                // zoomed out has only major lines) draws nothing: no CPU image in the GPU scene.
+                for (lines, width) in [(lines, 0.6f32), (major, 1.2)] {
+                    if lines.is_empty() {
                         continue;
                     }
                     if gpu {
@@ -8881,6 +8881,29 @@ mod tests {
             let (grid, layer) = (meshes.iter().position(|g| *g), meshes.iter().rposition(|g| !*g));
             let (Some(grid), Some(layer)) = (grid, layer) else { panic!("{meshes:?}") };
             assert_eq!(grid > layer, on_top, "{meshes:?}");
+        }
+    }
+
+    /// An MGRS view at the 100 km step has major lines only; on the GPU its empty set of minor
+    /// lines adds no CPU image to the scene, under the layers or on top of them.
+    #[test]
+    fn an_mgrs_grid_of_major_lines_only_adds_no_image_on_the_gpu() {
+        let mut m = Map::new("Map");
+        m.graticule_type = rustgis_map::graticule::GraticuleType::Mgrs;
+        let camera = Camera { center: lonlat_to_merc(Coord::new(14.5, 48.2)), res: 2000.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 800.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+        let grid = mapgrid::lines(&m, &view).unwrap();
+        assert!(grid.minor.is_empty() && !grid.major.is_empty(), "{} minor, {} major", grid.minor.len(), grid.major.len());
+        let images = |m: &mut Map| {
+            let Some(RenderOutput::Gpu(scene)) = render_backend(m, &view, Backend::Gpu) else { panic!("gpu scene") };
+            scene.cmds.iter().filter(|c| matches!(c, gpu_scene::DrawCmd::Image { .. })).count()
+        };
+        m.graticule = false;
+        let without = images(&mut m);
+        m.graticule = true;
+        for on_top in [false, true] {
+            m.graticule_on_top = on_top;
+            assert_eq!(images(&mut m), without, "on top: {on_top}");
         }
     }
 

@@ -285,9 +285,12 @@ pub(crate) fn labels(map: &Map, view: &View, width: impl Fn(&str) -> f32) -> Vec
     if seen.is_empty() {
         return Vec::new();
     }
-    // A 100 km square's side on the screen at the view's center, from a kilometer's.
-    let square_pt = place(w / 2.0, h / 2.0).and_then(|c| {
-        let (zone, north) = (utm_zone(c)?, c.y >= 0.0);
+    // A 100 km square's side on the screen, from a kilometer's, at the view's center or else the
+    // first place in view in a grid zone designation (a view centered past 84° N still shows
+    // band X).
+    let square_pt = place(w / 2.0, h / 2.0).into_iter().chain(shown.iter().copied()).find_map(|c| {
+        let &(zone, band, _) = seen.iter().find(|(_, _, cell)| cell.contains(c))?;
+        let north = band >= 'N';
         let (e, n) = to_utm_in_zone(c, zone, north)?;
         let (sx, sy) = screen(c)?;
         let side = |p: Option<Coord>| p.and_then(project).map(|(x, y)| (x - sx).hypot(y - sy) * SQUARE / 1000.0);
@@ -295,11 +298,9 @@ pub(crate) fn labels(map: &Map, view: &View, width: impl Fn(&str) -> f32) -> Vec
     });
     // Squares named once the 100 km lines are drawn and a square is three labels tall.
     let squares = seen.len() <= MAX_GRIDDED_CELLS && square_pt.is_some_and(|s| s >= 3.0 * LABEL_H);
-    // The grid zone designations in view: with more than one, a square's name carries its own.
-    let mut gzds: Vec<(u8, char)> = shown.iter().filter_map(|c| Some((utm_zone(*c)?, latitude_band(c.y)?))).collect();
-    gzds.sort_unstable();
-    gzds.dedup();
-    let one_gzd = gzds.len() <= 1;
+    // With more than one grid zone designation reaching into the view, a square's name carries
+    // its own: every named square is in one of the `seen` cells.
+    let one_gzd = seen.len() <= 1;
     let mut out: Vec<(String, f32, f32)> = Vec::new();
     let mut named = std::collections::BTreeSet::new();
     for (zone, band, cell) in seen {
@@ -889,5 +890,31 @@ mod tests {
         let got = labels_on(&m, &view);
         assert!(got.iter().any(|(t, _, _)| t.starts_with("34U ")) && got.iter().any(|(t, _, _)| t.starts_with("33U ")), "{got:?}");
         name_their_places(&m, &view, &got, |r| format!("{} {}{}", gzd(r), r.column, r.row));
+    }
+
+    /// A view of 33U with a narrow strip of 34U at its right edge (north up and turned), or of
+    /// 33T at its bottom, names its squares with their grid zone designations.
+    #[test]
+    fn a_narrow_strip_of_another_grid_zone_designation_prefixes_the_names() {
+        let per_pt = 50.0 / 111_319.490_793;
+        for bearing in [0.0, 30.0] {
+            for (lon, lat) in [(18.0 - 360.0 * per_pt, 49.5), (15.0, 48.0 + 270.0 * per_pt * 0.66)] {
+                let (m, mut view) = mgrs_view(lon, lat, 50.0);
+                view.camera.bearing = bearing;
+                let got = labels_on(&m, &view);
+                assert!(!got.is_empty() && got.iter().all(|(t, _, _)| t.len() == 6), "{bearing}: {got:?}");
+                name_their_places(&m, &view, &got, |r| format!("{} {}{}", gzd(r), r.column, r.row));
+            }
+        }
+    }
+
+    /// A view centered past 84° N, where no UTM zone is, names the band X squares it shows (the
+    /// view reaches down to about 83.9° N).
+    #[test]
+    fn a_view_centered_past_84_north_names_band_x_squares() {
+        let (m, view) = mgrs_view(15.0, 84.3, 1500.0);
+        let got = labels_on(&m, &view);
+        assert!(!got.is_empty() && got.iter().all(|(t, _, _)| t.len() == 2), "{got:?}");
+        name_their_places(&m, &view, &got, |r| format!("{}{}", r.column, r.row));
     }
 }
