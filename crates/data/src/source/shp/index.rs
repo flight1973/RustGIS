@@ -416,7 +416,7 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
             note = format!("the .shp ends partway through record {}; the rest are left out", count + 1);
             break;
         }
-        let b = record_box(head.get(8..(want as u64).min(8 + bytes) as usize).unwrap_or(&[]));
+        let b = record_box(head.get(8..(want as u64).min(8 + bytes) as usize).unwrap_or(&[]), bytes);
         visit(count, Place { offset: content as u32, len: bytes as u32 }, b)?;
         count += 1;
         pos = content + bytes;

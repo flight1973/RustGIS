@@ -98,6 +98,15 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
             assert_eq!(has(&s, SET_ASIDE), said, "corner at {at} = {v}: {:?}", s.info().notes);
             assert!(!has(&s, "not longitude/latitude"), "corner at {at} = {v}: {:?}", s.info().notes);
         }
+        // A 0, 0, 0, 0 header over shapes (a writer that keeps no box): the shapes' box, and
+        // nothing wrong to say.
+        let p = write("zero-header.shp", &three);
+        for at in [36, 44, 52, 60] {
+            patch(&p, at, 0.0);
+        }
+        let s = open(&p);
+        assert_eq!(s.info().extent, whole);
+        assert!(quiet(&s), "{:?}", s.info().notes);
         // A NaN shape and the box its writer made from it: the other shapes frame the layer, and
         // the shape left out is counted.
         let p = write("nan-shape.shp", &three);
@@ -147,6 +156,10 @@ fn a_streamed_shapefile_is_framed_by_its_records() {
         assert!(s.info().extent.is_empty(), "{:?}", s.info().extent);
         assert!(quiet(&s), "{:?}", s.info().notes);
         let s = nulled("null-boxed.shp", [10.0, 20.0, 12.0, 22.0]);
+        assert!(s.info().extent.is_empty(), "{:?}", s.info().extent);
+        assert!(has(&s, NO_SHAPE_BOX) && !has(&s, UNBOXED), "{:?}", s.info().notes);
+        // Under a header that isn't a box (a corner that isn't a number), said too.
+        let s = nulled("null-nan.shp", [10.0, f64::NAN, 12.0, 22.0]);
         assert!(s.info().extent.is_empty(), "{:?}", s.info().extent);
         assert!(has(&s, NO_SHAPE_BOX) && !has(&s, UNBOXED), "{:?}", s.info().notes);
         // A file of no records (its length, at 24, in 16-bit words), under a 0, 0, 0, 0 header box or
@@ -214,20 +227,33 @@ fn an_empty_shape_has_no_box() {
     // stored here; the index puts it right from the points (`index::scan_boxed`).
     let none = |b: [f32; 4]| b.iter().all(|v| v.is_nan());
     let unread = |b: [f32; 4]| b == [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
-    assert!(none(record_box(&0i32.to_le_bytes())), "a null shape");
-    assert!(none(record_box(&record(5, &[0, 0]))), "an empty polygon");
-    assert!(none(record_box(&record(3, &[0, 0]))), "an empty line");
-    assert!(none(record_box(&record(8, &[0]))), "an empty multipoint");
-    assert!(none(record_box(&record(5, &[0, 4]))), "a polygon of no parts");
-    assert!(unread(record_box(&record(5, &[1, -1]))), "a count that can't be");
-    assert!(unread(record_box(&record(31, &[1, 4]))), "a multipatch, which isn't read");
-    assert!(unread(record_box(&record(5, &[]))), "a polygon too short for its counts");
-    assert!(unread(record_box(&record(5, &[1]))), "a polygon too short for its points' count");
-    assert!(unread(record_box(&record(8, &[]))), "a multipoint too short for its count");
-    assert!(unread(record_box(&record(99, &[1, 4]))), "a shape type that isn't one");
-    assert!(unread(record_box(&1i32.to_le_bytes())), "a point too short for its coordinates");
-    assert_eq!(record_box(&record(5, &[1, 4])), [0.0; 4], "a polygon with points keeps its box");
-    assert_eq!(record_box(&record(8, &[2])), [0.0; 4], "a multipoint with points keeps its box");
+    // The record as given, its length as long as it is.
+    let whole = |c: &[u8]| record_box(c, c.len() as u64);
+    assert!(none(whole(&0i32.to_le_bytes())), "a null shape");
+    assert!(none(whole(&record(5, &[0, 0]))), "an empty polygon");
+    assert!(none(whole(&record(3, &[0, 0]))), "an empty line");
+    assert!(none(whole(&record(8, &[0]))), "an empty multipoint");
+    assert!(none(whole(&record(5, &[0, 4]))), "a polygon of no parts");
+    assert!(unread(whole(&record(5, &[1, -1]))), "a count that can't be");
+    assert!(unread(whole(&record(31, &[1, 4]))), "a multipatch, which isn't read");
+    assert!(unread(whole(&record(5, &[]))), "a polygon too short for its counts");
+    assert!(unread(whole(&record(5, &[1]))), "a polygon too short for its points' count");
+    assert!(unread(whole(&record(8, &[]))), "a multipoint too short for its count");
+    assert!(unread(whole(&record(99, &[1, 4]))), "a shape type that isn't one");
+    assert!(unread(whole(&1i32.to_le_bytes())), "a point too short for its coordinates");
+    // Counts that say more points than the record holds: a read refuses it, so it frames nothing.
+    assert!(unread(whole(&record(8, &[1]))), "a multipoint of one point and no coordinates");
+    assert!(unread(record_box(&record(5, &[1, 4]), 111)), "a polygon a byte short of its 4 points");
+    assert!(unread(record_box(&record(8, &[2]), 71)), "a multipoint a byte short of its 2 points");
+    assert!(unread(record_box(&record(8, &[1 << 25]), u64::MAX)), "more points than a shape may have");
+    // A point's record shorter than its x and y, though its bytes run on into the next record.
+    let mut point = 1i32.to_le_bytes().to_vec();
+    point.extend_from_slice(&[0; 16]);
+    assert!(unread(record_box(&point, 19)), "a point a byte short of its coordinates");
+    assert_eq!(record_box(&point, 20), [0.0; 4], "a point with its coordinates");
+    // Long enough for its parts' starts and its points: 44 + 4 + 4 × 16, and 40 + 2 × 16.
+    assert_eq!(record_box(&record(5, &[1, 4]), 112), [0.0; 4], "a polygon with points keeps its box");
+    assert_eq!(record_box(&record(8, &[2]), 72), [0.0; 4], "a multipoint with points keeps its box");
     // A box that's backwards (min x 5, max x 1): kept as stored, and not a box where it's taken.
     let mut backwards = 5i32.to_le_bytes().to_vec();
     for v in [5.0f64, 0.0, 1.0, 1.0] {
@@ -235,9 +261,19 @@ fn an_empty_shape_has_no_box() {
     }
     backwards.extend_from_slice(&1i32.to_le_bytes());
     backwards.extend_from_slice(&4i32.to_le_bytes());
-    let b = record_box(&backwards);
+    let b = record_box(&backwards, 112);
     assert_eq!(b, [5.0, 0.0, 1.0, 1.0]);
     assert!(b[0] > b[2] && !none(b), "backwards, for the index to put right, not nothing");
+    // Backwards by less than an f32 step on both sides: rounded outward each side would come out
+    // in order, and be taken as a box; it stays backwards.
+    let mut slight = 5i32.to_le_bytes().to_vec();
+    for v in [1.000_000_02f64, 2.000_000_04, 1.000_000_01, 2.000_000_02] {
+        slight.extend_from_slice(&v.to_le_bytes());
+    }
+    slight.extend_from_slice(&1i32.to_le_bytes());
+    slight.extend_from_slice(&4i32.to_le_bytes());
+    let [x0, y0, x1, y1] = record_box(&slight, 112);
+    assert!(x0 > x1 && y0 > y1, "still backwards: {x0} > {x1}, {y0} > {y1}");
     // A whole file: a multipoint emptied (its box, at 112, made 0, 0, 0, 0 and its count of
     // points, at 144, 0) under a header that's the others' box. The header stands, with nothing
     // said, as the index and a scan of the records both read it.
@@ -443,7 +479,7 @@ fn disk_queries_match_legacy_scan_sampling_and_edges() {
                     raw.extend_from_slice(&1i32.to_le_bytes());
                     raw.extend_from_slice(&p.x.to_le_bytes());
                     raw.extend_from_slice(&p.y.to_le_bytes());
-                    let b = record_box(&raw);
+                    let b = record_box(&raw, raw.len() as u64);
                     extent
                         .is_none_or(|e| {
                             b[0] <= e.max_x as f32 && b[2] >= e.min_x as f32 && b[1] <= e.max_y as f32 && b[3] >= e.min_y as f32
@@ -490,7 +526,7 @@ fn shapefile_disk_index_benchmark() {
         let mut matched = 0u64;
         let bytes = std::fs::read(&path).unwrap();
         for raw in bytes.get(100..).unwrap().as_chunks::<28>().0 {
-            let [x0, y0, x1, y1] = record_box(raw.get(8..).unwrap());
+            let [x0, y0, x1, y1] = record_box(raw.get(8..).unwrap(), 20);
             if x0 <= 1.0 && x1 >= -1.0 && y0 <= 1.0 && y1 >= -1.0 {
                 matched += 1;
             }
