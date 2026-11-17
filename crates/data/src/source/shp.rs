@@ -176,7 +176,7 @@ impl ShpSource {
         if index.unboxed > 0 {
             let none = if native.is_none() { ", so the layer has no extent" } else { "" };
             notes.push(format!(
-                "{} shape(s) have no usable bounding box (a coordinate that isn't a number or is out of range, or a record that can't be read): they're left out of the layer's extent and of reads by area{none}",
+                "{} shape(s) have no usable bounding box (a coordinate that isn't a number or is out of range, a record that can't be read, or a shape RustGIS doesn't read, such as a multipatch): they're left out of the layer's extent and of reads by area{none}",
                 index.unboxed
             ));
         }
@@ -463,23 +463,23 @@ fn record_box(c: &[u8], len: u64) -> [f32; 4] {
         // A multipatch, which the reader doesn't read, frames nothing it draws: counted.
         Some(t @ (3 | 5 | 8 | 13 | 15 | 18 | 23 | 25 | 28)) => {
             // The counts follow the box: a multipoint's points at 36, else the parts at 36 and
-            // the points at 40. A record too short to hold them, or a count below 0, can't be
-            // read; a shape of no points, or no parts (an empty geometry some writers give a 0,
-            // 0, 0, 0 box), has nothing to frame.
+            // the points at 40. A record too short to hold them, or the parts' starts and points
+            // they count (as a read needs), or a count below 0, can't be read; one that reads but
+            // has no points, or no parts (an empty geometry some writers give a 0, 0, 0, 0 box),
+            // has nothing to frame.
             let (parts, points) = if matches!(t, 8 | 18 | 28) { (Some(1), le_i32(c, 36)) } else { (le_i32(c, 36), le_i32(c, 40)) };
             let (Some(parts), Some(points)) = (parts, points) else { return NOT_A_BOX };
             if parts < 0 || points < 0 {
                 return NOT_A_BOX;
             }
-            if parts == 0 || points == 0 {
-                return NONE;
-            }
-            // Room for the parts' starts and the points' x and y, as a read needs.
             let (parts, points) = (parts.unsigned_abs(), points.unsigned_abs());
             let need =
                 if matches!(t, 8 | 18 | 28) { 40 + 16 * u64::from(points) } else { 44 + 4 * u64::from(parts) + 16 * u64::from(points) };
             if parts as usize > MAX_PARTS || points as usize > MAX_PARTS || len < need {
                 return NOT_A_BOX;
+            }
+            if parts == 0 || points == 0 {
+                return NONE;
             }
             match (le_f64(c, 4), le_f64(c, 12), le_f64(c, 20), le_f64(c, 28)) {
                 (Some(x0), Some(y0), Some(x1), Some(y1)) => [x0, y0, x1, y1],

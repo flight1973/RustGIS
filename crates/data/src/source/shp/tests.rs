@@ -233,7 +233,8 @@ fn an_empty_shape_has_no_box() {
     assert!(none(whole(&record(5, &[0, 0]))), "an empty polygon");
     assert!(none(whole(&record(3, &[0, 0]))), "an empty line");
     assert!(none(whole(&record(8, &[0]))), "an empty multipoint");
-    assert!(none(whole(&record(5, &[0, 4]))), "a polygon of no parts");
+    assert!(none(record_box(&record(5, &[0, 4]), 108)), "a polygon of no parts");
+    assert!(unread(whole(&record(5, &[0, 4]))), "a polygon of no parts, too short for its 4 points");
     assert!(unread(whole(&record(5, &[1, -1]))), "a count that can't be");
     assert!(unread(whole(&record(31, &[1, 4]))), "a multipatch, which isn't read");
     assert!(unread(whole(&record(5, &[]))), "a polygon too short for its counts");
