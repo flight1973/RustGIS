@@ -450,7 +450,9 @@ fn le_f64(b: &[u8], at: usize) -> Option<f64> {
 /// it's left out ([`index::Index::unboxed`]). A backwards box is given as stored, finite but out of
 /// order, for the index to put right from its points where they read ([`index::scan_boxed`]).
 /// `len` is the record's content length as its header gives it: one too short for the points its
-/// counts say ([`parse_shape`]'s rule, so a record it won't read frames nothing) isn't a box.
+/// counts say, or a line or polygon whose parts' starts don't fit its points ([`parse_shape`]'s
+/// rules, so a record it won't read frames nothing), isn't a box. `c` holds a line's or polygon's
+/// whole array of parts' starts where the record has room for it.
 fn record_box(c: &[u8], len: u64) -> [f32; 4] {
     const NONE: [f32; 4] = [f32::NAN; 4];
     const NOT_A_BOX: [f32; 4] = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
@@ -477,6 +479,18 @@ fn record_box(c: &[u8], len: u64) -> [f32; 4] {
                 if matches!(t, 8 | 18 | 28) { 40 + 16 * u64::from(points) } else { 44 + 4 * u64::from(parts) + 16 * u64::from(points) };
             if parts as usize > MAX_PARTS || points as usize > MAX_PARTS || len < need {
                 return NOT_A_BOX;
+            }
+            // Each part runs from its start to the next one's (the last to the end of the points):
+            // a start below 0, past the next, or past the points can't be read.
+            if !matches!(t, 8 | 18 | 28) {
+                let start = |p: u32| le_i32(c, 44 + 4 * p as usize).and_then(|s| u32::try_from(s).ok());
+                for p in 0..parts {
+                    let end = if p + 1 < parts { start(p + 1) } else { Some(points) };
+                    match (start(p), end) {
+                        (Some(s), Some(e)) if s <= e && e <= points => {}
+                        _ => return NOT_A_BOX,
+                    }
+                }
             }
             if parts == 0 || points == 0 {
                 return NONE;

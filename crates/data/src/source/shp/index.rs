@@ -1,6 +1,6 @@
 //! Disk-backed record directory and R-tree. Neither grows the provider's resident heap.
 
-use super::{BUFFER, Place, bad, be_i32, record_box};
+use super::{BUFFER, Place, bad, be_i32, le_i32, record_box};
 use crate::Result;
 use rusqlite::{Connection, OpenFlags, params};
 use std::io::{BufReader, Read};
@@ -402,8 +402,11 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
     f.seek_relative(100)?;
     let mut pos = 100u64;
     let mut count = 0u32;
-    // A record's header, its shape type and box, and its counts of parts and points.
-    let mut head = [0u8; 52];
+    // A record's header (8 bytes), its shape type and box, and its counts of parts and points, with
+    // its first two parts' starts; `starts`, the content with the rest of them, for a line or polygon
+    // of more.
+    let mut head = [0u8; 60];
+    let mut starts: Vec<u8> = Vec::new();
     let mut note = String::new();
     while pos + 8 <= len {
         // Cancel is looked at every so many records, on every path (an index built, a scan read).
@@ -421,11 +424,39 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
             note = format!("the .shp ends partway through record {}; the rest are left out", count + 1);
             break;
         }
-        let b = record_box(head.get(8..(want as u64).min(8 + bytes) as usize).unwrap_or(&[]), bytes);
+        let c = head.get(8..(want as u64).min(8 + bytes) as usize).unwrap_or(&[]);
+        // A line or polygon of more than two parts: the rest of its parts' starts, which the record
+        // has room for, read on (each 4 bytes, against 16 for each point) so they're checked too.
+        // A count past what a read takes (MAX_PARTS) isn't read for: the record is refused anyway.
+        let more = match (le_i32(c, 0), le_i32(c, 36)) {
+            (Some(3 | 5 | 13 | 15 | 23 | 25), Some(parts))
+                if parts > 2 && parts as usize <= super::MAX_PARTS && 44 + 4 * u64::from(parts.unsigned_abs()) <= bytes =>
+            {
+                4 * (parts.unsigned_abs() as usize - 2)
+            }
+            _ => 0,
+        };
+        let b = if more > 0 {
+            starts.clear();
+            starts.extend_from_slice(c);
+            starts.resize(c.len() + more, 0);
+            if f.read_exact(starts.get_mut(c.len()..).unwrap_or(&mut [])).is_err() {
+                break;
+            }
+            let b = record_box(&starts, bytes);
+            // A huge array isn't kept for the rest of the scan.
+            if starts.capacity() > 1 << 20 {
+                starts = Vec::new();
+            }
+            b
+        } else {
+            record_box(c, bytes)
+        };
         visit(count, Place { offset: content as u32, len: bytes as u32 }, b)?;
         count += 1;
         pos = content + bytes;
-        if f.seek_relative(bytes as i64 - (want as u64).saturating_sub(8) as i64).is_err() {
+        let read = (want as u64).saturating_sub(8) + more as u64;
+        if f.seek_relative(bytes as i64 - read as i64).is_err() {
             break;
         }
     }
@@ -558,6 +589,44 @@ mod tests {
             let disk = Index::open(&path, len, &mut notes).unwrap();
             assert_eq!((disk.bounds, disk.unboxed), (second, 0));
         });
+    }
+
+    /// A line of more than two parts has the rest of its parts' starts read on and checked: one
+    /// that starts past its points frames nothing, counted, and the record after it is still read
+    /// in its place, on both paths; a clean file of the same shapes frames them all.
+    #[test]
+    fn every_parts_start_of_a_record_is_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("parts.shp");
+        let mut ds = Dataset::new("lines", GeometryType::Polyline, vec![]);
+        let part = |x: f64, y: f64| vec![Coord::new(x, y), Coord::new(x + 0.5, y + 0.5)];
+        ds.push(Some(Geometry::Line(vec![part(10.0, 20.0), part(11.0, 21.0), part(12.0, 22.0)])), vec![]);
+        ds.push(Some(Geometry::Line(vec![part(30.0, 40.0)])), vec![]);
+        crate::io::write_path(&ds, &path).unwrap();
+        let mut b = std::fs::read(&path).unwrap();
+        let len = b.len() as u64;
+        let mut notes = Vec::new();
+        let both = |p: &Path, notes: &mut Vec<String>, cache: &str| {
+            let scan = Index::scanning(p, len, notes).unwrap();
+            let disk = super::super::cache::with_index_dir(tmp.path().join(cache), || Index::open(p, len, notes).unwrap());
+            assert!(disk.indexed());
+            [(scan.count, scan.bounds, scan.unboxed), (disk.count, disk.bounds, disk.unboxed)]
+        };
+        for got in both(&path, &mut notes, "clean") {
+            assert_eq!(got, (2, Some([10.0, 20.0, 30.5, 40.5]), 0), "clean");
+        }
+        // The first record: 3 parts (count at 144) of 6 points, its third part's start (at 160) 7.
+        assert_eq!(i32::from_le_bytes(b[144..148].try_into().unwrap()), 3, "three parts");
+        assert_eq!(i32::from_le_bytes(b[160..164].try_into().unwrap()), 4, "the third part's start");
+        b[160..164].copy_from_slice(&7i32.to_le_bytes());
+        let bad = tmp.path().join("bad.shp");
+        for ext in ["shx", "dbf"] {
+            std::fs::copy(path.with_extension(ext), bad.with_extension(ext)).unwrap();
+        }
+        std::fs::write(&bad, &b).unwrap();
+        for got in both(&bad, &mut notes, "bad") {
+            assert_eq!(got, (2, Some([30.0, 40.0, 30.5, 40.5]), 1), "a start past the points");
+        }
     }
 
     /// Canceled while the records are scanned, an index build stops the open: no scan in its

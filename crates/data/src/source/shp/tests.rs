@@ -253,7 +253,16 @@ fn an_empty_shape_has_no_box() {
     assert!(unread(record_box(&point, 19)), "a point a byte short of its coordinates");
     assert_eq!(record_box(&point, 20), [0.0; 4], "a point with its coordinates");
     // Long enough for its parts' starts and its points: 44 + 4 + 4 × 16, and 40 + 2 × 16.
-    assert_eq!(record_box(&record(5, &[1, 4]), 112), [0.0; 4], "a polygon with points keeps its box");
+    assert_eq!(record_box(&record(5, &[1, 4, 0]), 112), [0.0; 4], "a polygon with points keeps its box");
+    // Parts' starts a read refuses (one past the points, past the next part's, below 0, or not
+    // there at all): it frames nothing. Starts in order, within the points, keep the box. A line
+    // of 1 part and 2 points is 44 + 4 + 32 bytes; of 2 parts and 4 points, 44 + 8 + 64.
+    assert!(unread(record_box(&record(3, &[1, 2, 3]), 80)), "a part starting past the points");
+    assert!(unread(record_box(&record(3, &[2, 4, 3, 1]), 116)), "a part starting past the next");
+    assert!(unread(record_box(&record(3, &[1, 2, -1]), 80)), "a part starting below 0");
+    assert!(unread(record_box(&record(3, &[1, 2]), 80)), "a start that isn't there");
+    assert_eq!(record_box(&record(3, &[2, 4, 0, 2]), 116), [0.0; 4], "two parts in order");
+    assert_eq!(record_box(&record(3, &[2, 4, 0, 4]), 116), [0.0; 4], "a last part of no points still reads");
     assert_eq!(record_box(&record(8, &[2]), 72), [0.0; 4], "a multipoint with points keeps its box");
     // A box that's backwards (min x 5, max x 1): kept as stored, and not a box where it's taken.
     let mut backwards = 5i32.to_le_bytes().to_vec();
@@ -262,6 +271,7 @@ fn an_empty_shape_has_no_box() {
     }
     backwards.extend_from_slice(&1i32.to_le_bytes());
     backwards.extend_from_slice(&4i32.to_le_bytes());
+    backwards.extend_from_slice(&0i32.to_le_bytes());
     let b = record_box(&backwards, 112);
     assert_eq!(b, [5.0, 0.0, 1.0, 1.0]);
     assert!(b[0] > b[2] && !none(b), "backwards, for the index to put right, not nothing");
@@ -273,6 +283,7 @@ fn an_empty_shape_has_no_box() {
     }
     slight.extend_from_slice(&1i32.to_le_bytes());
     slight.extend_from_slice(&4i32.to_le_bytes());
+    slight.extend_from_slice(&0i32.to_le_bytes());
     let [x0, y0, x1, y1] = record_box(&slight, 112);
     assert!(x0 > x1 && y0 > y1, "still backwards: {x0} > {x1}, {y0} > {y1}");
     // A whole file: a multipoint emptied (its box, at 112, made 0, 0, 0, 0 and its count of
