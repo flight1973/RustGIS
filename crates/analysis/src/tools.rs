@@ -103,7 +103,7 @@ pub static TOOLS: &[ToolSpec] = &[
             P {
                 name: "rule",
                 label: "Rule",
-                kind: K::Choice(&["Shells Minus Holes", "Even-Odd"]),
+                kind: K::Choice(&crate::repair::RULES),
                 required: false,
                 default: "\"Shells Minus Holes\"",
                 help: "What is inside a polygon whose rings cross, overlap or sit in the wrong place. Shells Minus Holes: each part is its outer ring less its holes, and overlapping parts merge. Even-Odd: what lies inside an odd number of rings, so where two parts overlap is left out and a ring listed as a part inside another is a hole. Valid polygons are written the same either way.",

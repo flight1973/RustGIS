@@ -12,8 +12,7 @@ const TOOL: &str = "Repair Geometry";
 /// valid ones as stored, repaired ones with their new geometry, those that can't be repaired
 /// without geometry, and those left as they were (too complex, or the repair failed) as stored.
 pub(super) fn run(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
-    let rule = rule_of(p)?;
-    run_with_room(inp, p, &web_has_room, |g| repair::repair_by(g, rule, &web_has_room))
+    run_with_room(inp, p, &web_has_room, |g, rule| repair::repair_by(g, rule, &web_has_room))
 }
 
 /// The rule `p` names (#2003), Shells Minus Holes when it names none.
@@ -90,7 +89,7 @@ fn run_with_room(
     inp: &dyn Inputs,
     p: &Json,
     has_room: &dyn Fn(u64) -> bool,
-    repair: impl Fn(Option<&Geometry>) -> Outcome,
+    repair: impl Fn(Option<&Geometry>, Rule) -> Outcome,
 ) -> Result<ToolResult, String> {
     let rule = rule_of(p)?;
     let ds = input(inp, p, "input")?;
@@ -124,7 +123,7 @@ fn run_with_room(
         crate::control::reached(i);
         let Some(f) = ds.features.get(*row) else { continue };
         tally.extra += usize::from(f.attrs.len() > width);
-        let (repairs, geometry) = match repair(f.geometry.as_ref()) {
+        let (repairs, geometry) = match repair(f.geometry.as_ref(), rule) {
             Outcome::Valid => (String::new(), Written::Same),
             Outcome::Repaired(r) => {
                 tally.repaired += 1;
@@ -220,7 +219,7 @@ fn run_with_room(
     }
     out.features = list.into();
 
-    let mut messages = notices(&tally, &field);
+    let mut messages = notices(&tally, &field, rule);
     messages.extend(notes);
     Ok(ToolResult { output: Output::Layer(out), messages })
 }
@@ -229,7 +228,7 @@ fn run_with_room(
 /// and per kind of change beyond the codes: pieces dropped (with too few points or no area, or
 /// narrower than a step of the overlay's grid in any direction), holes taken out, parts merged or
 /// split, coordinates moved. `field` is the output's repairs field.
-fn notices(t: &Tally, field: &str) -> Vec<String> {
+fn notices(t: &Tally, field: &str, rule: Rule) -> Vec<String> {
     let mut messages = vec![summary(t)];
     let is = |n: usize| if n == 1 { "is" } else { "are" };
     let was = |n: usize| if n == 1 { "was" } else { "were" };
@@ -287,15 +286,17 @@ fn notices(t: &Tally, field: &str) -> Vec<String> {
             Gone::NoArea.as_str()
         ));
     }
+    // What Shells Minus Holes does with a hole outside its ring and with overlapping parts; Even-Odd
+    // does otherwise, and its own notice says what.
     let holes = t.count(Code::HoleOutsideShell);
-    if holes > 0 {
+    if holes > 0 && rule == Rule::ShellsMinusHoles {
         messages.push(format!(
             "{TOOL}: holes not inside their exterior ring were taken out of {}; what of a hole is inside its exterior ring stays a hole",
             features(holes)
         ));
     }
     let merged = t.count(Code::PartsOverlap);
-    if merged > 0 {
+    if merged > 0 && rule == Rule::ShellsMinusHoles {
         messages.push(format!("{TOOL}: the parts that overlapped or touched along a line were merged in {}", features(merged)));
     }
     let split = t.count(Code::DisconnectedInterior);
@@ -316,7 +317,7 @@ fn notices(t: &Tally, field: &str) -> Vec<String> {
     }
     if t.even_odd > 0 {
         messages.push(format!(
-            "{TOOL}: {} {} rebuilt by the Even-Odd rule, with {EVEN_ODD} in {field}: where their rings overlap is left out, and a ring inside another is a hole, whatever its role",
+            "{TOOL}: {} {} rebuilt by the Even-Odd rule, with {EVEN_ODD} in {field}: each keeps what lies inside an odd number of its rings, whatever their roles, so where rings overlap is left out, a ring inside another is a hole, and what of a hole lies outside its exterior ring is a part",
             features(t.even_odd),
             was(t.even_odd)
         ));
@@ -404,7 +405,7 @@ mod tests {
                 asked.set(need);
                 true
             },
-            |g| repair::repair_by(g, Rule::default(), &|_| true),
+            |g, rule| repair::repair_by(g, rule, &|_| true),
         )
         .unwrap();
         let Output::Layer(out) = &r.output else { panic!("a layer") };
@@ -417,7 +418,7 @@ mod tests {
         let first = point_bytes(&inp.0.features[0].attrs, 2) + "ring_not_closed".len() as u64 + ALLOCATION_OVERHEAD + 2 * geometry;
         let second = point_bytes(&inp.0.features[1].attrs, 2) + "null_geometry".len() as u64 + ALLOCATION_OVERHEAD;
         assert_eq!(asked.get(), first + second);
-        let e = run_with_room(&inp, &p, &|_| false, |g| repair::repair_by(g, Rule::default(), &|_| true)).err().unwrap();
+        let e = run_with_room(&inp, &p, &|_| false, |g, rule| repair::repair_by(g, rule, &|_| true)).err().unwrap();
         assert_eq!(e, "Repair Geometry: the 2 features would need about 3 MiB, more than the browser can give now: select fewer features");
     }
 
@@ -427,7 +428,7 @@ mod tests {
     fn features_left_as_they_were_are_counted_by_reason() {
         let t = Tally { processed: 9, failed: 1, ..Tally::default() };
         assert_eq!(
-            notices(&t, "repairs"),
+            notices(&t, "repairs", Rule::default()),
             [
                 "Repair Geometry: repaired 0 of 9 features",
                 "Repair Geometry: 1 feature couldn't be repaired, because geo's geometry operations failed on it, and is written unchanged, with repair_failed in repairs",
@@ -435,14 +436,14 @@ mod tests {
         );
         let t = Tally { processed: 9, work: 2, memory: 3, failed: 2, ..Tally::default() };
         assert_eq!(
-            notices(&t, "repairs_2")[1..],
+            notices(&t, "repairs_2", Rule::default())[1..],
             [
                 "Repair Geometry: 2 features were too complex to repair within the work limit and are written unchanged, with too_complex in repairs_2",
                 "Repair Geometry: 3 features couldn't be repaired, because there wasn't enough memory to repair them, and are written unchanged, with too_complex in repairs_2",
                 "Repair Geometry: 2 features couldn't be repaired, because geo's geometry operations failed on them, and are written unchanged, with repair_failed in repairs_2",
             ]
         );
-        assert_eq!(notices(&Tally::default(), "repairs"), ["Repair Geometry: no features to repair"]);
+        assert_eq!(notices(&Tally::default(), "repairs", Rule::default()), ["Repair Geometry: no features to repair"]);
     }
 
     /// A cancel stops the repairs at the next feature, and the copies at the next row.
@@ -457,10 +458,10 @@ mod tests {
         let control = crate::control::Control::new();
         let _installed = crate::control::install(Some(control.clone()));
         let repaired = std::cell::Cell::new(0);
-        let r = run_with_room(&inp, &p, &|_| true, |g| {
+        let r = run_with_room(&inp, &p, &|_| true, |g, rule| {
             repaired.set(repaired.get() + 1);
             control.cancel();
-            repair::repair_by(g, Rule::default(), &|_| true)
+            repair::repair_by(g, rule, &|_| true)
         });
         assert_eq!(r.err().as_deref(), Some(crate::control::CANCELLED));
         assert_eq!(repaired.get(), 1, "stopped before the second feature");
@@ -474,7 +475,7 @@ mod tests {
                 control.cancel();
                 true
             },
-            |g| repair::repair_by(g, Rule::default(), &|_| true),
+            |g, rule| repair::repair_by(g, rule, &|_| true),
         );
         assert_eq!(r.err().as_deref(), Some(crate::control::CANCELLED), "stopped in the copies");
     }

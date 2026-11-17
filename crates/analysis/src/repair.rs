@@ -29,6 +29,7 @@
 //! of the browser before it runs. Natively a panic is caught, and the feature is left as it was.
 
 use crate::validity::{self, At, Checked, Code, Limit, Problem, Room};
+use geo::Area;
 use geo::algorithm::bool_ops::{BooleanOps, FillRule, OpType};
 use geo::orient::{Direction, Orient};
 use rustgis_data::{Coord, Geometry};
@@ -145,16 +146,24 @@ pub(crate) enum Rule {
     EvenOdd,
 }
 
+/// The rules as Repair Geometry's `rule` parameter offers them, in [`Rule`]'s order: its choices
+/// and [`Rule::named`] read this one list.
+pub(crate) const RULES: [&str; 2] = ["Shells Minus Holes", "Even-Odd"];
+
 impl Rule {
-    /// The rule a tool parameter names, as its choices spell it.
+    /// The rule a tool parameter names, as [`RULES`] spells it.
     pub(crate) fn named(name: &str) -> Option<Rule> {
-        match name {
-            "Shells Minus Holes" => Some(Rule::ShellsMinusHoles),
-            "Even-Odd" => Some(Rule::EvenOdd),
-            _ => None,
+        match RULES.iter().position(|r| *r == name)? {
+            0 => Some(Rule::ShellsMinusHoles),
+            _ => Some(Rule::EvenOdd),
         }
     }
 }
+
+/// The memory, per vertex, that [`Rule::EvenOdd`] holds besides the overlay's
+/// ([`OVERLAY_BYTES`]): each ring's normal form, and while it is made, its two readings
+/// ([`distinct_rings`]).
+const EVEN_ODD_BYTES: u64 = 48;
 
 /// Repairs one geometry under `rule`, spending at most [`validity::MAX_WORK`] on each check and on
 /// the overlay, and asking `has_room` whether the browser can give the overlay's memory before it
@@ -353,7 +362,8 @@ fn polygon(
     if size.saturating_mul(OVERLAY_COST) > budget {
         return Outcome::Kept(Kept::Work);
     }
-    if !has_room(size.saturating_mul(OVERLAY_BYTES)) {
+    let per_vertex = if rule == Rule::EvenOdd { OVERLAY_BYTES + EVEN_ODD_BYTES } else { OVERLAY_BYTES };
+    if !has_room(size.saturating_mul(per_vertex)) {
         return Outcome::Kept(Kept::Memory);
     }
     let Some(step) = grid_step(parts.iter().flatten().flatten().map(|c| (c.x, c.y))) else { return Outcome::Kept(Kept::Failed) };
@@ -605,18 +615,25 @@ fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room)
         }
     }
     if pieces.len() > 1 {
-        // Pieces narrower than a step of the grid the combining overlay rounds to are dropped first.
+        // Pieces narrower than a step of the grid the combining overlay rounds to are dropped first
+        // (finding the step also tells the overlay can run on them).
         let step = on_grid(rings_of(&pieces))?;
         pieces = wider(pieces, step, &mut narrow, room)?;
     }
     let pieces = geo::MultiPolygon::new(pieces);
+    let mut found = Found::new();
     let combined = if pieces.0.len() > 1 {
-        on_grid(rings_of(&pieces.0))?;
-        pieces.boolean_op_with_fill_rule(&geo::MultiPolygon::new(vec![]), OpType::Union, FillRule::EvenOdd)
+        let combined = pieces.boolean_op_with_fill_rule(&geo::MultiPolygon::new(vec![]), OpType::Union, FillRule::EvenOdd);
+        // Area left out where pieces overlapped: said as the checks would have said it (they don't
+        // relate a part with a ring crossing itself), in a tenth of a grid step's worth of area.
+        if parts.len() > 1 && combined.unsigned_area() < pieces.unsigned_area() * (1.0 - 1e-9) {
+            found.push(Code::PartsOverlap);
+        }
+        combined
     } else {
         pieces
     };
-    Ok(Rebuilt { polys: polygons(&combined, room).map_err(kept_for)?, no_area, narrow, found: Found::new(), duplicates })
+    Ok(Rebuilt { polys: polygons(&combined, room).map_err(kept_for)?, no_area, narrow, found, duplicates })
 }
 
 /// The rings of `parts` to combine under [`Rule::EvenOdd`], by part and ring in their order, and
@@ -650,32 +667,64 @@ fn distinct_rings(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<(Vec<(usize, 
     Ok((keep, duplicates))
 }
 
-/// A closed ring's points as bits, without the closing repeat, from its least vertex (by x, then
-/// y) and in whichever direction reads less: the same for the same ring whatever vertex it starts
-/// at and whichever way it is wound. A vertex the ring passes more than once is tried as a start
-/// each time.
+/// A closed ring's points as bits, without the closing repeat: its least rotation (as a sequence
+/// of points) in whichever direction reads less, the same for the same ring whatever vertex it
+/// starts at and whichever way it is wound. In time and memory linear in the ring, however often
+/// it passes one vertex ([`least_rotation`]).
 fn normal_form(ring: &[Coord], room: Room) -> Result<Vec<(u64, u64)>, Limit> {
     let pts = match ring.split_last() {
         Some((last, rest)) if Some(last) == rest.first() => rest,
         _ => ring,
     };
-    let bits = |c: &Coord| (c.x.to_bits(), c.y.to_bits());
     let n = pts.len();
-    let least = pts
-        .iter()
-        .map(|c| (c.x, c.y))
-        .fold((f64::INFINITY, f64::INFINITY), |m, c| if c.0.total_cmp(&m.0).then(c.1.total_cmp(&m.1)).is_lt() { c } else { m });
+    // Plus 0.0 makes -0.0 the same as 0.0: the same point, which writers and reprojection give either way.
+    let forward = room.collect(n, pts.iter().map(|c| ((c.x + 0.0).to_bits(), (c.y + 0.0).to_bits())))?;
+    let backward = room.collect(n, forward.iter().rev().copied())?;
     let mut best: Option<Vec<(u64, u64)>> = None;
-    for (start, _) in pts.iter().enumerate().filter(|(_, c)| (c.x, c.y) == least) {
-        for forward in [true, false] {
-            let at = |k: usize| if forward { (start + k) % n } else { (start + n - k % n) % n };
-            let form = room.collect(n, (0..n).filter_map(|k| pts.get(at(k)).map(bits)))?;
-            if best.as_ref().is_none_or(|b| form < *b) {
-                best = Some(form);
-            }
+    for seq in [forward, backward] {
+        let start = least_rotation(&seq, room)?;
+        let form = room.collect(n, seq.iter().skip(start).chain(seq.iter().take(start)).copied())?;
+        if best.as_ref().is_none_or(|b| form < *b) {
+            best = Some(form);
         }
     }
     Ok(best.unwrap_or_default())
+}
+
+/// Where the lexicographically least rotation of `s` starts, by Booth's algorithm in linear time
+/// (K. S. Booth, "Lexicographically least circular substrings", Information Processing Letters
+/// 10(4–5), 1980, 240–242): a failure function over `s` read twice round, as Knuth–Morris–Pratt
+/// matching uses one. 0 for an empty `s`.
+fn least_rotation(s: &[(u64, u64)], room: Room) -> Result<usize, Limit> {
+    let n = s.len();
+    let len = n.saturating_mul(2);
+    // f[j]: the failure function's value at j, one more than the index it points to (0 for none),
+    // so it stays unsigned.
+    let mut f: Vec<usize> = room.collect(len, std::iter::repeat_n(0, len))?;
+    let at = |i: usize| s.get(i % n.max(1)).copied().unwrap_or_default();
+    let mut k = 0usize;
+    for j in 1..len {
+        let sj = at(j);
+        let mut i = f.get(j.saturating_sub(k + 1)).copied().unwrap_or(0);
+        while i != 0 && sj != at(k + i) {
+            if sj < at(k + i) {
+                k = j.saturating_sub(i);
+            }
+            i = f.get(i.saturating_sub(1)).copied().unwrap_or(0);
+        }
+        if sj != at(k + i) {
+            // i == 0 here: no proper prefix matches.
+            if sj < at(k) {
+                k = j;
+            }
+            if let Some(v) = f.get_mut(j.saturating_sub(k)) {
+                *v = 0;
+            }
+        } else if let Some(v) = f.get_mut(j.saturating_sub(k)) {
+            *v = i + 1;
+        }
+    }
+    Ok(k % n.max(1))
 }
 
 /// The rebuild by area (see the module doc) of `parts`, closed rings each with 3 distinct points
@@ -798,6 +847,50 @@ mod tests {
     /// [`repair_by_with`] under the default rule.
     fn repair_with(g: Option<&Geometry>, budget: u64, allow: &dyn Fn(usize) -> bool, has_room: &dyn Fn(u64) -> bool) -> Outcome {
         repair_by_with(g, Rule::default(), budget, allow, has_room)
+    }
+
+    /// Booth's least rotation agrees with trying every rotation, on every sequence of up to 8
+    /// symbols from 3, repeats and all.
+    #[test]
+    fn least_rotation_is_the_least_of_all_rotations() {
+        let room = Room(&|_| true);
+        for n in 1..=8usize {
+            for code in 0..3usize.pow(n as u32) {
+                let s: Vec<(u64, u64)> = (0..n).map(|k| ((code / 3usize.pow(k as u32) % 3) as u64, 0)).collect();
+                let rotation = |start: usize| -> Vec<(u64, u64)> { s[start..].iter().chain(&s[..start]).copied().collect() };
+                let least = (0..n).map(rotation).min().unwrap();
+                assert_eq!(rotation(least_rotation(&s, room).unwrap()), least, "{s:?}");
+            }
+        }
+        assert_eq!(least_rotation(&[], room).unwrap(), 0);
+    }
+
+    /// The same ring has one normal form from any vertex, in either direction, and a different ring
+    /// another; a ring passing one vertex 100,000 times takes linear time, where trying each pass as
+    /// a start would take about 10^10 steps.
+    #[test]
+    fn a_ring_has_one_normal_form() {
+        let room = Room(&|_| true);
+        let square: Vec<Coord> = ring(SQUARE);
+        let want = normal_form(&square, room).unwrap();
+        let open = &square[..square.len() - 1];
+        for start in 0..open.len() {
+            for reversed in [false, true] {
+                let mut r: Vec<Coord> = open[start..].iter().chain(&open[..start]).copied().collect();
+                if reversed {
+                    r.reverse();
+                }
+                r.push(r[0]);
+                assert_eq!(normal_form(&r, room).unwrap(), want, "from {start}, reversed {reversed}");
+            }
+        }
+        assert_ne!(normal_form(&ring(&[(0., 0.), (10., 0.), (10., 11.), (0., 10.), (0., 0.)]), room).unwrap(), want);
+        let mut star = vec![Coord::new(0., 0.)];
+        for k in 0..100_000 {
+            let a = f64::from(k) * 1e-5;
+            star.extend([Coord::new(a.cos(), a.sin()), Coord::new(0., 0.)]);
+        }
+        assert_eq!(normal_form(&star, room).unwrap().len(), star.len() - 1);
     }
 
     type Ring<'a> = &'a [(f64, f64)];

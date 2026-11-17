@@ -1246,3 +1246,23 @@ fn an_unknown_rule_is_refused() {
     assert!(e.contains("Shells Minus Holes") && e.contains("Even-Odd"), "{e}");
     assert!(rustgis_analysis::run("repairGeometry", &l, &json!({"input": "input", "rule": "even-odd"})).is_ok());
 }
+
+/// Under Even-Odd the notices say what Even-Odd did: not the default's "merged" or "taken out";
+/// parts that overlap are said even when a part's ring crosses itself (which keeps the checks from
+/// relating it); and a duplicate written with -0.0 where the other has 0.0 is the same ring.
+#[test]
+fn even_odd_says_what_it_did() {
+    let (_, repairs, messages) = one_by("Even-Odd", multi(&[&[SQUARE], &[OVERLAPPING]]));
+    assert_eq!(repairs, "parts_overlap, even_odd");
+    assert!(!messages.iter().any(|m| m.contains("were merged") || m.contains("were taken out")), "{messages:?}");
+    // A bowtie part with a square overlapping one lobe: the overlap is left out and said.
+    let lobes: Ring = &[(0., 0.), (4., 4.), (4., 0.), (0., 4.), (0., 0.)];
+    let (got, repairs, _) = one_by("Even-Odd", multi(&[&[lobes], &[&[(3., 1.), (6., 1.), (6., 3.), (3., 3.), (3., 1.)]]]));
+    assert!(repairs.contains("parts_overlap") && repairs.contains("self_intersection"), "{repairs}");
+    assert!(got.is_some(), "{repairs}");
+    // -0.0 and 0.0: one ring, left out once as a duplicate rather than canceled.
+    let neg: Ring = &[(-0.0, 0.), (10., 0.), (10., 10.), (-0.0, 10.), (-0.0, 0.)];
+    let (got, _, messages) = one_by("Even-Odd", multi(&[&[SQUARE], &[neg]]));
+    assert_eq!(got.map(|g| area(&g)), Some(100.0));
+    assert!(messages.iter().any(|m| m.contains("1 duplicate ring was left out")), "{messages:?}");
+}
