@@ -1288,7 +1288,7 @@ either way.
 | --- | --- | --- |
 | Two overlapping squares | one merged polygon | two pieces, the overlap left out |
 | A square with a ring listed as a part inside it | the square, filled | the square with a hole |
-| A hole partly outside its square | the square with a notch | the notch, and the part outside as its own piece |
+| A hole partly outside its square | the square with a notch | the square with a notch, and the part outside as its own piece |
 
 When a ring of a part crosses itself, Check Geometry doesn't check that part against its other
 rings or the other parts; Repair Geometry checks the feature again after the fixes that move no

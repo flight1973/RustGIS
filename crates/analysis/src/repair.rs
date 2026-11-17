@@ -146,24 +146,26 @@ pub(crate) enum Rule {
     EvenOdd,
 }
 
-/// The rules as Repair Geometry's `rule` parameter offers them, in [`Rule`]'s order: its choices
-/// and [`Rule::named`] read this one list.
+/// The rules as Repair Geometry's `rule` parameter offers them: its choices and [`Rule::named`]
+/// read this one list, and [`RULE_OF`] gives the rule of each, in the same order.
 pub(crate) const RULES: [&str; 2] = ["Shells Minus Holes", "Even-Odd"];
+/// The rule each of [`RULES`] names.
+const RULE_OF: [Rule; 2] = [Rule::ShellsMinusHoles, Rule::EvenOdd];
+// A rule named without a rule to run, or the other way round, doesn't compile.
+const _: () = assert!(RULES.len() == RULE_OF.len());
 
 impl Rule {
     /// The rule a tool parameter names, as [`RULES`] spells it.
     pub(crate) fn named(name: &str) -> Option<Rule> {
-        match RULES.iter().position(|r| *r == name)? {
-            0 => Some(Rule::ShellsMinusHoles),
-            _ => Some(Rule::EvenOdd),
-        }
+        RULES.iter().position(|r| *r == name).and_then(|i| RULE_OF.get(i).copied())
     }
 }
 
 /// The memory, per vertex, that [`Rule::EvenOdd`] holds besides the overlay's
-/// ([`OVERLAY_BYTES`]): each ring's normal form, and while it is made, its two readings
-/// ([`distinct_rings`]).
-const EVEN_ODD_BYTES: u64 = 48;
+/// ([`OVERLAY_BYTES`]), at most, while [`distinct_rings`] finds duplicates: each ring's normal form
+/// kept (16), and while one is made its two readings (32), Booth's failure table (16), a rotation
+/// (16) and the least so far (16).
+const EVEN_ODD_BYTES: u64 = 96;
 
 /// Repairs one geometry under `rule`, spending at most [`validity::MAX_WORK`] on each check and on
 /// the overlay, and asking `has_room` whether the browser can give the overlay's memory before it
@@ -596,11 +598,14 @@ fn ring_area(ring: &[Coord], at: (usize, usize), crossing: &[(usize, usize)], ro
 /// more; `crossing` as in [`ring_area`]): exact duplicate rings of one role dropped
 /// ([`distinct_rings`]), each ring's own area ([`ring_area`]), pieces narrower than a step of the
 /// overlay's grid dropped and counted as [`by_area`] drops them, then the pieces combined by
-/// parity in one overlay. No codes are found beyond the checks': the rings' roles, which they
-/// would be about, don't decide the result.
+/// parity in one overlay. Beyond the checks' codes it finds one: [`Code::PartsOverlap`] when parts'
+/// exterior rings overlap (the checks don't relate a part with a ring crossing itself), told by
+/// [`parts_overlap`].
 fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -> Result<Rebuilt, Kept> {
-    let (keep, duplicates) = distinct_rings(parts, room).map_err(kept_for)?;
+    let Distinct { keep, duplicates, exterior_duplicates } = distinct_rings(parts, room).map_err(kept_for)?;
     let mut pieces: Vec<geo::Polygon<f64>> = Vec::new();
+    // The exterior rings' own areas, kept apart to tell whether parts overlap.
+    let mut exteriors: Vec<geo::Polygon<f64>> = Vec::new();
     let mut no_area = 0usize;
     let mut narrow = 0usize;
     for (p, r) in keep {
@@ -610,9 +615,18 @@ fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room)
             no_area += 1;
         }
         for piece in area.0 {
+            if r == 0 && parts.len() > 1 {
+                room.grow(&mut exteriors).map_err(kept_for)?;
+                exteriors.push(piece.clone());
+            }
             room.grow(&mut pieces).map_err(kept_for)?;
             pieces.push(piece);
         }
+    }
+    let mut found = Found::new();
+    // A part left out as another's duplicate overlapped it all.
+    if exterior_duplicates > 0 || parts_overlap(&exteriors)? {
+        found.push(Code::PartsOverlap);
     }
     if pieces.len() > 1 {
         // Pieces narrower than a step of the grid the combining overlay rounds to are dropped first
@@ -621,50 +635,88 @@ fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room)
         pieces = wider(pieces, step, &mut narrow, room)?;
     }
     let pieces = geo::MultiPolygon::new(pieces);
-    let mut found = Found::new();
     let combined = if pieces.0.len() > 1 {
-        let combined = pieces.boolean_op_with_fill_rule(&geo::MultiPolygon::new(vec![]), OpType::Union, FillRule::EvenOdd);
-        // Area left out where pieces overlapped: said as the checks would have said it (they don't
-        // relate a part with a ring crossing itself), in a tenth of a grid step's worth of area.
-        if parts.len() > 1 && combined.unsigned_area() < pieces.unsigned_area() * (1.0 - 1e-9) {
-            found.push(Code::PartsOverlap);
-        }
-        combined
+        // The pieces left must be on a grid the overlay can represent too: in the browser a panic
+        // in it can't be caught.
+        on_grid(rings_of(&pieces.0))?;
+        pieces.boolean_op_with_fill_rule(&geo::MultiPolygon::new(vec![]), OpType::Union, FillRule::EvenOdd)
     } else {
         pieces
     };
     Ok(Rebuilt { polys: polygons(&combined, room).map_err(kept_for)?, no_area, narrow, found, duplicates })
 }
 
-/// The rings of `parts` to combine under [`Rule::EvenOdd`], by part and ring in their order, and
-/// how many were left out as exact duplicates of an earlier ring of the same role: an exterior ring
-/// of another exterior ring, a hole of another hole (of any part). The same ring is the same points
-/// in the same cyclic order, from any vertex and in either direction. A ring isn't compared with one
-/// of the other role: a hole equal to its exterior ring leaves its part no area, as it does under
-/// [`Rule::ShellsMinusHoles`]. Found by sorting each ring's normal form, in buffers reserved
-/// fallibly.
-fn distinct_rings(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<(Vec<(usize, usize)>, usize), Limit> {
+/// Whether the areas of parts' exterior rings overlap, by an area more than rounding to the
+/// overlay's grid could take: combined by parity, overlaps drop out, and rounding moves each edge
+/// by at most half a step on each axis, so it changes the area by less than the rings' length
+/// times a step. Holes play no part, so a hole in its own part isn't taken for an overlap.
+fn parts_overlap(exteriors: &[geo::Polygon<f64>]) -> Result<bool, Kept> {
+    if exteriors.len() < 2 {
+        return Ok(false);
+    }
+    let step = on_grid(rings_of(exteriors))?;
+    let each: f64 = exteriors.iter().map(Area::unsigned_area).sum();
+    let combined = geo::MultiPolygon::new(exteriors.to_vec()).boolean_op_with_fill_rule(
+        &geo::MultiPolygon::new(vec![]),
+        OpType::Union,
+        FillRule::EvenOdd,
+    );
+    let length: f64 = rings_of(exteriors).map(|r| r.lines().map(|l| (l.end.x - l.start.x).hypot(l.end.y - l.start.y)).sum::<f64>()).sum();
+    Ok(each - combined.unsigned_area() > length * step)
+}
+
+/// What [`distinct_rings`] keeps of a polygon's rings.
+struct Distinct {
+    /// The rings to combine, by part and ring, in their order.
+    keep: Vec<(usize, usize)>,
+    /// How many were left out as duplicates, and how many of those were exterior rings.
+    duplicates: usize,
+    exterior_duplicates: usize,
+}
+
+/// The rings of `parts` to combine under [`Rule::EvenOdd`], leaving out exact duplicates of an
+/// earlier ring of the same role: an exterior ring of another exterior ring, a hole of another
+/// hole (of any part). The same ring is the same points in the same cyclic order, from any vertex
+/// and in either direction ([`normal_form`]). A ring isn't compared with one of the other role: a
+/// hole equal to its exterior ring leaves its part no area, as it does under
+/// [`Rule::ShellsMinusHoles`]. Only rings of one role and one length are compared, so a polygon
+/// whose rings can have no duplicate costs no normal form. In buffers reserved fallibly.
+fn distinct_rings(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<Distinct, Limit> {
     let n = parts.iter().map(Vec::len).fold(0usize, usize::saturating_add);
-    // (whether a hole, the ring's normal form, part, ring)
-    let mut all: Vec<(bool, Vec<(u64, u64)>, usize, usize)> = room.vec(n)?;
+    // (whether a hole, its length, part, ring), sorted so rings that may be the same are together.
+    let mut all: Vec<(bool, usize, usize, usize)> = room.vec(n)?;
     for (p, rings) in parts.iter().enumerate() {
         for (r, ring) in rings.iter().enumerate() {
-            all.push((r > 0, normal_form(ring, room)?, p, r));
+            all.push((r > 0, ring.len(), p, r));
         }
     }
-    all.sort_unstable_by(|a, b| (a.0, &a.1, a.2, a.3).cmp(&(b.0, &b.1, b.2, b.3)));
-    let mut keep: Vec<(usize, usize)> = room.vec(all.len())?;
-    let mut duplicates = 0usize;
-    for (i, (hole, form, p, r)) in all.iter().enumerate() {
+    all.sort_unstable();
+    let mut keep: Vec<(usize, usize)> = room.vec(n)?;
+    // (whether a hole, the normal form, part, ring) of the rings that share a role and a length.
+    let mut keyed: Vec<(bool, Vec<(u64, u64)>, usize, usize)> = Vec::new();
+    for group in all.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
+        for &(hole, _, p, r) in group {
+            if group.len() == 1 {
+                keep.push((p, r));
+            } else if let Some(ring) = parts.get(p).and_then(|rings| rings.get(r)) {
+                room.grow(&mut keyed)?;
+                keyed.push((hole, normal_form(ring, room)?, p, r));
+            }
+        }
+    }
+    keyed.sort_unstable();
+    let (mut duplicates, mut exterior_duplicates) = (0usize, 0usize);
+    for (i, (hole, form, p, r)) in keyed.iter().enumerate() {
         // Sorted, so a duplicate follows the first of its kind, which has the lowest part and ring.
-        if i > 0 && all.get(i - 1).is_some_and(|prev| prev.0 == *hole && prev.1 == *form) {
+        if i > 0 && keyed.get(i - 1).is_some_and(|prev| prev.0 == *hole && prev.1 == *form) {
             duplicates += 1;
+            exterior_duplicates += usize::from(!hole);
         } else {
             keep.push((*p, *r));
         }
     }
     keep.sort_unstable();
-    Ok((keep, duplicates))
+    Ok(Distinct { keep, duplicates, exterior_duplicates })
 }
 
 /// A closed ring's points as bits, without the closing repeat: its least rotation (as a sequence

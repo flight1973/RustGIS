@@ -1260,6 +1260,16 @@ fn even_odd_says_what_it_did() {
     let (got, repairs, _) = one_by("Even-Odd", multi(&[&[lobes], &[&[(3., 1.), (6., 1.), (6., 3.), (3., 3.), (3., 1.)]]]));
     assert!(repairs.contains("parts_overlap") && repairs.contains("self_intersection"), "{repairs}");
     assert!(got.is_some(), "{repairs}");
+    // A part's own hole is no overlap: a square with a hole, and a bowtie part well apart, which
+    // sends the feature to the overlay.
+    let far: Ring = &[(20., 0.), (22., 2.), (22., 0.), (20., 2.), (20., 0.)];
+    let (_, repairs, _) = one_by("Even-Odd", multi(&[&[SQUARE, HOLE], &[far]]));
+    assert_eq!(repairs, "self_intersection, even_odd");
+    // Parts sharing an edge, rounded to the grid, aren't taken for overlapping either (they touch
+    // along a line, which the checks say as such).
+    let side: Ring = &[(10., 0.), (20., 0.), (20., 10.), (10., 10.), (10., 0.)];
+    let (_, repairs, _) = one_by("Even-Odd", multi(&[&[SQUARE], &[side], &[far]]));
+    assert!(repairs.contains("even_odd"), "{repairs}");
     // -0.0 and 0.0: one ring, left out once as a duplicate rather than canceled.
     let neg: Ring = &[(-0.0, 0.), (10., 0.), (10., 10.), (-0.0, 10.), (-0.0, 0.)];
     let (got, _, messages) = one_by("Even-Odd", multi(&[&[SQUARE], &[neg]]));

@@ -19,7 +19,10 @@ pub(super) fn run(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 fn rule_of(p: &Json) -> Result<Rule, String> {
     match p.get("rule") {
         None | Some(Json::Null) => Ok(Rule::default()),
-        Some(v) => v.as_str().and_then(Rule::named).ok_or_else(|| format!("{TOOL}: rule is \"Shells Minus Holes\" or \"Even-Odd\"")),
+        Some(v) => v
+            .as_str()
+            .and_then(Rule::named)
+            .ok_or_else(|| format!("{TOOL}: rule is one of {}", repair::RULES.map(|r| format!("\"{r}\"")).join(", "))),
     }
 }
 
