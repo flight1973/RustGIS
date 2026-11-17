@@ -206,15 +206,18 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     if !differ.is_empty() {
         lost.push(format!("its DSI record gives a different {}; the UHL's are used", differ.join(", ")));
     }
-    // A partial cell (3.11.3) in the magnetic-tape layout counts only the lines that have heights,
-    // and its records leave out missing posts, so they differ in length (3.11.3.2.2, 3.13.4 s, t).
-    // The CD-ROM layout always has the full grid, and is the one read here.
-    let full = |tenths: u32| (36_000 % tenths == 0).then(|| 36_000 / tenths as usize + 1);
+    // A partial cell (3.11.3) in the magnetic-tape layout: the UHL counts a full cell (3.12 c), but
+    // the DSI counts only the lines that have heights, and the records leave missing posts out, so
+    // they differ in length (3.11.3.2.2, 3.13.4 s, t). The CD-ROM layout always has the full grid
+    // in both, and is the one read here.
+    let (dsi_rows, dsi_cols) = (dsi[2].0.map(|n| n as usize), dsi[3].0.map(|n| n as usize));
     if let Some(percent) = digits(bytes, DSI + 289, 2).filter(|p| (1..=99).contains(p))
-        && (full(lon_tenths).is_some_and(|n| n != cols) || full(lat_tenths).is_some_and(|n| n != rows))
+        && (dsi_cols.is_some_and(|n| n < cols) || dsi_rows.is_some_and(|n| n < rows))
     {
         return Err(bad(&format!(
-            "a partial cell ({percent}% coverage) in the magnetic-tape layout, which counts only the {cols} longitude lines and {rows} latitude points with heights and leaves missing posts out of its records; only the full-grid layout, as on CD-ROM, is read"
+            "a partial cell ({percent}% coverage) in the magnetic-tape layout, whose DSI counts only the {} of {cols} longitude lines and {} of {rows} latitude points with heights and whose records leave missing posts out; only the full-grid layout, as on CD-ROM, is read",
+            dsi_cols.unwrap_or(cols),
+            dsi_rows.unwrap_or(rows)
         )));
     }
     // The level: the DSI's series designator (3.12 d), or the extension when it names none.
@@ -788,12 +791,18 @@ mod tests {
         assert_eq!(r.value(0, 0, 0), Some(100.0));
         assert_eq!(r.value(0, 8, 0), None);
         assert!(r.lost.iter().any(|l| l.contains("no data")), "{:?}", r.lost);
-        // On tape it counts only its 6 longitude lines with heights: refused, not misplaced.
-        let tape = partial(dted("1220000W", "0370000N", (3600, 3600), (6, 11), |_, _| Some(100)));
+        // On tape the UHL still counts the whole cell, but the DSI only its 6 longitude lines
+        // with heights: refused, not misplaced.
+        let mut tape = partial(dted("1220000W", "0370000N", (3600, 3600), (11, 11), |_, _| Some(100)));
+        tape[DSI + 285..DSI + 289].copy_from_slice(b"0006");
         let err = read("n37.dt1", &tape).unwrap_err().to_string();
         assert!(err.contains("partial cell (50% coverage) in the magnetic-tape layout"), "{err}");
-        // The same counts in a complete cell's file (indicator 00) are read as before.
-        assert!(read("n37.dt1", &dted("1220000W", "0370000N", (3600, 3600), (6, 11), |_, _| Some(100))).is_ok());
+        assert!(err.contains("only the 6 of 11 longitude lines"), "{err}");
+        // A complete cell's file (indicator 00) whose DSI disagrees is read, the difference said.
+        let mut complete = dted("1220000W", "0370000N", (3600, 3600), (11, 11), |_, _| Some(100));
+        complete[DSI + 285..DSI + 289].copy_from_slice(b"0006");
+        let r = read("n37.dt1", &complete).unwrap();
+        assert!(r.lost.iter().any(|l| l.contains("DSI record gives a different")), "{:?}", r.lost);
     }
 
     #[test]
