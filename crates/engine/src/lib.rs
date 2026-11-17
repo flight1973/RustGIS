@@ -39,6 +39,7 @@ pub mod sample;
 #[cfg(feature = "schema")]
 pub mod schema;
 pub mod service_logins;
+pub mod service_tokens;
 pub mod sources;
 #[cfg(test)]
 mod tests;
@@ -2257,6 +2258,12 @@ impl Session {
                 if let Some(note) = rounded {
                     dates.push(format!(
                         "{}: some date-times in it have digits past the microsecond and are rounded (Load All Features counts them all); so far, {note}",
+                        layer.name
+                    ));
+                }
+                if let Some(note) = layer.source.as_mut().and_then(|source| source.take_null_text()) {
+                    dates.push(format!(
+                        "{}: some text values written as Null in it show as empty (Load All Features counts them all); so far, {note}",
                         layer.name
                     ));
                 }

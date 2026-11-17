@@ -77,6 +77,8 @@ same files. New and changed code follows these rules; not every existing reader 
   `.rgis` format 2 before any writes it (`READ_FORMAT` and `CAPABILITIES` in
   `crates/engine/src/project.rs`), so what is added to format 2 after that comes with a capability
   name, added to `CAPABILITIES` where it is read.
+  Independent sizes on classified point layers use `classified-point-size`; only documents
+  containing a `size_by` mapping list that requirement.
 - `schema/project.schema.json` is the JSON Schema of the project file, generated from the types
   it is saved from by `cargo xtask schema`. A pull request that changes what a project saves
   regenerates it and commits it in the same pull request; CI's `cargo xtask schema --check` fails
@@ -126,6 +128,23 @@ cell or history entry that gives one (`layout.addElement` or `layout.update` wit
 refuses them instead of opening the layout and saving it again, or running the command,
 without the background. Layout files (`.rgislayout`) carry no format header yet and are not
 covered (#2277).
+
+Projects with an ink on a legend, colorbar, table or chart (`color` on those elements) require
+`layout-element-ink`, so an older reader refuses them instead of drawing those elements in dark
+grey and saving them again without it. Saved `layout.addElement` and `layout.update` commands
+that set one need nothing: an older reader refuses `color` on those elements, so the command
+fails there instead of losing the ink. A saved `layout.import` whose `text` gives an element an
+ink requires `layout-element-ink`, and one whose `text` gives an element a background requires
+`layout-element-background`, since an older reader would read that layout without them. Layout
+files are not covered, as for backgrounds (#2277).
+
+A coordinate system read from WKT is saved with its PROJ definition, which older readers read,
+and its WKT beside it (`wkt`), which this release reads first. Projects, map files and layer
+files require `crs-wkt` when a saved system's definition doesn't place points as its WKT does
+(within a centimetre, at its centre and a few degrees around it): angles in grads, a datum
+transformation the definition can't hold, or no definition. An older reader refuses those
+instead of misplacing the layer. Others need nothing: an older reader opens them by the
+definition and, saving them again, drops only the WKT.
 
 ## New dependencies
 

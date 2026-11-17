@@ -109,7 +109,7 @@ impl Session {
         }
         self.capture_read(command, params)
     }
-    /// Admits one standalone archive or column-statistics command before dispatch, retaining its original
+    /// Admits one standalone archive, column-statistics or size-by-field command before dispatch, retaining its original
     /// scope and one-use approval through the worker and landing. Composite/handler capture
     /// remains forbidden, including when an approval cursor is already active.
     pub fn start_scoped_archive_read(
@@ -122,10 +122,17 @@ impl Session {
             return Err("background reads can only start before handler dispatch".into());
         }
         let CallKind::Command { id, params } = &call.kind else {
-            return Err("only standalone archive or column-statistics commands can prepare a scoped read".into());
+            return Err(
+                "only standalone archive, column-statistics, shape-conversion or size-by-field commands can prepare a scoped read".into()
+            );
         };
-        if !matches!(id.as_str(), "map.reloadTiles" | "map.repairTiles" | "table.statistics" | "edit.previewShapeConversion") {
-            return Err("only standalone archive or column-statistics commands can prepare a scoped read".into());
+        if !matches!(
+            id.as_str(),
+            "map.reloadTiles" | "map.repairTiles" | "table.statistics" | "edit.previewShapeConversion" | "layer.sizeBy"
+        ) {
+            return Err(
+                "only standalone archive, column-statistics, shape-conversion or size-by-field commands can prepare a scoped read".into()
+            );
         }
         let capture = |s: &mut Session| s.capture_read(id, params);
         match permit {
@@ -157,9 +164,10 @@ impl Session {
                 | "source.syncState"
                 | "table.statistics"
                 | "edit.previewShapeConversion"
+                | "layer.sizeBy"
         ) && crate::cmd::edit::table_edit_in_background(command).is_none()
         {
-            return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service reads, topology, Source File State and Column Statistics prepare background work".into());
+            return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service reads, topology, Source File State, Column Statistics and Size by Field prepare background work".into());
         }
         let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
         // Scoped previews retain the raw invocation that was approved. Their admitted owner
@@ -173,6 +181,7 @@ impl Session {
                 | "source.syncState"
                 | "table.statistics"
                 | "edit.previewShapeConversion"
+                | "layer.sizeBy"
         ) && (command != "edit.previewShapeConversion" || self.policy_user())
             || (command == "edit.convertField" && params.get("table").is_none_or(Value::is_null))
         {
@@ -1008,7 +1017,7 @@ impl Session {
             opened: self.opened,
             map: self.map().instance_id(),
             epoch: self.policy.epoch.clone(),
-            accounts: if reads { self.policy_accounts() } else { Value::Null },
+            accounts: if reads { self.continuation_accounts(&node) } else { Value::Null },
             sources,
             time_sources: node_time_sources(&node),
             tables,
@@ -1075,6 +1084,17 @@ impl Session {
         let node = self.policy.nodes.last().cloned().ok_or("late work needs an authorized initiating operation")?;
         self.continuation_for(node)
     }
+    /// Retains the admitted token-generation authority without its password. Canonicalizing the
+    /// already-resolved connection selector keeps name-based calls bound to the same login identity.
+    pub(crate) fn token_continuation(&self, id: &str) -> Result<Continuation, String> {
+        let node = self.policy.nodes.last().ok_or("late work needs an authorized initiating operation")?;
+        let mut clean = (**node).clone();
+        if let Some(params) = clean.params.as_object_mut() {
+            params.remove("password");
+            params.insert("id".into(), json!(id));
+        }
+        self.continuation_for(Arc::new(clean))
+    }
     /// Checks generation, map, revocation, current load and private source/account identity.
     pub(crate) fn check_continuation(&self, c: &Continuation) -> Result<(), String> {
         self.check_continuation_origin(c)?;
@@ -1108,7 +1128,7 @@ impl Session {
         if c.opened != self.opened {
             return Err("this run belongs to a replaced project".into());
         }
-        if !c.accounts.is_null() && c.accounts != self.policy_accounts() {
+        if !c.accounts.is_null() && c.accounts != self.continuation_accounts(&c.node) {
             return Err("the live source or account changed since this request started".into());
         }
         Ok(())
@@ -1190,6 +1210,15 @@ impl Session {
     /// Refuses foreign ingress before a failed start may retire its owner's queued work.
     pub(crate) fn check_delivery_owner(&self, c: &Continuation) -> Result<(), String> {
         if !self.policy.scopes.is_empty() && !self.scope().same_caller(&c.scope) {
+            return Err("this run belongs to another caller".into());
+        }
+        Ok(())
+    }
+    /// Exactly the caller that started the late work, root and scoped alike: another caller (even
+    /// the trusted native root, which `check_delivery_owner` lets deliver) is refused before it
+    /// can read, consume or cancel the owner's result.
+    pub(crate) fn same_owner(&self, c: &Continuation) -> Result<(), String> {
+        if !self.scope().same_caller(&c.scope) {
             return Err("this run belongs to another caller".into());
         }
         Ok(())

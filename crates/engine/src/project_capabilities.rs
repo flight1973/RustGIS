@@ -33,6 +33,12 @@ impl Project {
         if !self.origin_id.is_empty() || self.field_origin.is_some() || self.offline_areas.iter().any(|area| !area.id.is_empty()) {
             required.push("field-origin");
         }
+        // A return check an older reader would drop on saving, and then accept any copy.
+        if self.field_origin.as_ref().is_some_and(|origin| !origin.generation.is_empty())
+            || self.offline_areas.iter().any(|area| !area.generation.is_empty())
+        {
+            required.push("field-generation");
+        }
         // Saved symbology keeps its images too.
         if !required.contains(&"picture-markers") && self.styles.iter().any(|s| s.renderer.has_picture_markers()) {
             required.push("picture-markers");
@@ -61,6 +67,21 @@ impl Project {
         {
             required.push("layout-element-background");
         }
+        if !required.contains(&"layout-element-ink") && self.layouts.iter().any(|l| l.elements.iter().any(|e| e.kind.ink().is_some())) {
+            required.push("layout-element-ink");
+        }
+        // A coordinate system whose PROJ definition, which an older reader reads, doesn't place
+        // points as its WKT does (angles in grads, a datum transformation the definition can't
+        // hold).
+        struct Payload<'a>(&'a Project);
+        impl Serialize for Payload<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                Project::serialize(self.0, serializer)
+            }
+        }
+        if rustgis_data::raster::crs::saves_wkt(&Payload(self)) {
+            required.push("crs-wkt");
+        }
         required
     }
 
@@ -88,6 +109,7 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("graticule-mgrs", command_draws_mgrs_graticule),
     ("graticule-on-top", command_puts_graticule_on_top),
     ("graticule-color", command_colors_graticule),
+    ("layout-element-ink", command_uses_element_ink),
 ];
 
 /// A saved `map.graticule` that switches to the MGRS grid, its type read as the command reads it:
@@ -132,9 +154,35 @@ fn command_colors_graticule(id: &str, params: &Value) -> bool {
 fn command_uses_element_background(id: &str, params: &Value) -> bool {
     match id {
         "layout.addElement" | "layout.update" => params.get("background").is_some_and(|b| !b.is_null()),
+        "layout.import" => imported_layout_uses(params, "\"background\"", |e| e.background.is_some()),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_background)),
         _ => false,
     }
+}
+
+/// A layout command that gives a legend, colorbar, table or chart an ink (#2257). Only an
+/// imported layout's: an older reader refuses "color" on those elements in `layout.addElement`
+/// and `layout.update`, so such a command fails there instead of losing the ink.
+fn command_uses_element_ink(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.import" => imported_layout_uses(params, "\"color\"", |e| e.kind.ink().is_some()),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_ink)),
+        _ => false,
+    }
+}
+
+/// Whether a `layout.import` carries its layout as `"text"` with an element `uses`: an older
+/// reader reads it without the keys it doesn't know. One read from a `"path"` is a layout file,
+/// which carries no format header yet (#2277). Every save asks, so a text without the feature's
+/// `key` (a saved layout writes it only when set) isn't read through, unless it has a backslash:
+/// JSON may spell the key with escapes (`"\u0063olor"`).
+fn imported_layout_uses(params: &Value, key: &str, uses: fn(&rustgis_map::layout::Element) -> bool) -> bool {
+    params
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|t| t.contains(key) || t.contains('\\'))
+        .and_then(|t| serde_json::from_str::<rustgis_map::layout::Layout>(t).ok())
+        .is_some_and(|l| l.elements.iter().any(uses))
 }
 
 /// Require only executable payloads being saved: graph files omit steps, web tools omit graphs.
@@ -222,6 +270,7 @@ fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
     [
         (relief_effects(layer), "shaded-relief-effects"),
         (relief_light(layer), "shaded-relief-light"),
+        (layer.size_by.is_some(), super::SIZE_BY_CAPABILITY),
         (layer.has_picture_markers(), "picture-markers"),
     ]
     .into_iter()
@@ -230,8 +279,8 @@ fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
 }
 
 fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static str> {
-    let (mut block, mut water, mut shore, mut relief, mut light, mut legends, mut pictures, mut mgrs, mut on_top, mut grid_color) =
-        (false, false, false, false, false, false, false, false, false, false);
+    let (mut block, mut water, mut shore, mut relief, mut light, mut legends, mut sized, mut pictures, mut mgrs, mut on_top, mut grid_color) =
+        (false, false, false, false, false, false, false, false, false, false, false);
     for map in maps {
         // An older reader doesn't know the MGRS graticule (#1042 piece 8): it refuses the
         // project by name rather than failing to read the type.
@@ -247,6 +296,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         }
         relief |= map.layers.iter().any(relief_effects);
         light |= map.layers.iter().any(relief_light);
+        sized |= map.layers.iter().any(|layer| layer.size_by.is_some());
         pictures |= map.layers.iter().any(Layer::has_picture_markers);
         legends |= map.tiles.iter().any(|tile| {
             tile.legends.iter().any(|legend| rustgis_data::login_address::inner(&legend.url).len() > rustgis_map::tiles::MAX_LEGEND_URL)
@@ -259,6 +309,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (relief, "shaded-relief-effects"),
         (light, "shaded-relief-light"),
         (legends, "normalized-legend-urls"),
+        (sized, super::SIZE_BY_CAPABILITY),
         (pictures, "picture-markers"),
         (mgrs, "graticule-mgrs"),
         (on_top, "graticule-on-top"),
@@ -280,12 +331,20 @@ struct Item<'a, T> {
 
 /// A map file has its own header, independent of the project it came from.
 pub(crate) fn map_file_bytes(map: &Map) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(&Item { format: FORMAT, requires: map_capabilities([map]), value: map }).map_err(|e| e.to_string())
+    let mut requires = map_capabilities([map]);
+    if rustgis_data::raster::crs::saves_wkt(map) {
+        requires.push("crs-wkt");
+    }
+    serde_json::to_vec(&Item { format: FORMAT, requires, value: map }).map_err(|e| e.to_string())
 }
 
 /// A layer file keeps the same renderer capabilities as the layer saved inside a project.
 pub(crate) fn layer_file_bytes(layer: &Layer) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(&Item { format: FORMAT, requires: layer_capabilities(layer), value: layer }).map_err(|e| e.to_string())
+    let mut requires = layer_capabilities(layer);
+    if rustgis_data::raster::crs::saves_wkt(layer) {
+        requires.push("crs-wkt");
+    }
+    serde_json::to_vec(&Item { format: FORMAT, requires, value: layer }).map_err(|e| e.to_string())
 }
 
 /// Only executable export options require the capability, not fields in unrelated data.
@@ -310,6 +369,28 @@ fn script_uses_table_export_order(script: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    /// A coordinate system saved with its WKT requires `crs-wkt` only when its PROJ definition,
+    /// which an older release reads, doesn't place points as the WKT does: one in grads (NTF
+    /// (Paris), EPSG:4807 as GDAL writes it) does; the fixture's, whose definition does, doesn't,
+    /// so an older release still opens it.
+    #[test]
+    fn a_system_only_its_wkt_places_requires_crs_wkt() {
+        let mut p = Project::from_json(include_str!("../../../schema/fixtures/crs_with_wkt.rgis")).unwrap();
+        assert!(!p.required_capabilities().contains(&"crs-wkt"));
+        let grads = r#"GEOGCS["NTF (Paris)",DATUM["Nouvelle_Triangulation_Francaise_Paris",SPHEROID["Clarke 1880 (IGN)",6378249.2,293.466021293627,AUTHORITY["EPSG","7011"]],AUTHORITY["EPSG","6807"]],PRIMEM["Paris",2.33722917,AUTHORITY["EPSG","8903"]],UNIT["grad",0.0157079632679489,AUTHORITY["EPSG","9105"]]]"#;
+        p.tables[0].crs = Some(rustgis_data::raster::wkt::crs_from_wkt(grads).unwrap());
+        let saved = serde_json::to_value(&p).unwrap();
+        assert_eq!(saved["requires"], json!(["crs-wkt"]));
+        // Saved again, the same: finding out serializes the payload, not the project with its
+        // header, so it doesn't ask again.
+        assert_eq!(serde_json::to_value(&p).unwrap(), saved);
+        // Read back, the same.
+        let again = Project::from_json(&saved.to_string()).unwrap();
+        assert_eq!(serde_json::to_value(&again).unwrap()["requires"], json!(["crs-wkt"]));
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/crs_wkt_required.rgis")).unwrap();
+        assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["crs-wkt"]));
+    }
 
     fn json_bytes(bytes: &[u8]) -> Value {
         serde_json::from_slice(bytes).unwrap()
@@ -530,6 +611,62 @@ mod tests {
         assert_eq!(saved["requires"], json!(["layout-element-background"]));
     }
 
+    /// A legend's, colorbar's, table's or chart's ink is required where it is saved, so an older
+    /// reader refuses the project instead of drawing them dark grey and saving them so (#2257).
+    /// A saved command that sets one needs nothing: an older reader refuses its "color".
+    #[test]
+    fn element_ink_capability_follows_saved_layouts() {
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_element_ink.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-element-ink"]));
+        let inks = |p: &Project| p.layouts[0].elements.iter().map(|e| e.kind.ink()).collect::<Vec<_>>();
+        let reopened = Project::from_json(&saved.to_string()).unwrap();
+        assert_eq!(inks(&reopened), inks(&fixture));
+        assert_eq!(inks(&fixture).iter().filter(|i| i.is_some()).count(), 4, "{:?}", inks(&fixture));
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let Some(ink) = e.kind.ink_mut() {
+                *ink = None;
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "default inks need nothing");
+        let mut document = base.clone();
+        document["tasks"] = json!([{"name": "Task", "steps": [{"title": "Ink", "command": "layout.update", "params": {"element": 2, "color": "#FFFFFF"}}]}]);
+        assert!(serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap().get("requires").is_none());
+        // A layout imported from its text keeps unknown keys out in an older reader, so a saved
+        // import of one with an ink or a background needs them; one without, or from a path, doesn't.
+        let layout = &saved["layouts"][0];
+        let mut plain = layout.clone();
+        for e in plain["elements"].as_array_mut().unwrap() {
+            if let Some(kind) = e["kind"].as_object_mut().and_then(|k| k.values_mut().next()).and_then(Value::as_object_mut) {
+                kind.remove("color");
+            }
+        }
+        let mut boxed = plain.clone();
+        boxed["elements"][1]["background"] = json!({"fill": [255, 255, 255, 255]});
+        for (params, required) in [
+            (json!({"text": layout.to_string()}), json!(["layout-element-ink"])),
+            // The same key spelled with an escape is the same key.
+            (json!({"text": layout.to_string().replace("\"color\"", "\"\\u0063olor\"")}), json!(["layout-element-ink"])),
+            (json!({"text": boxed.to_string()}), json!(["layout-element-background"])),
+            (json!({"text": plain.to_string()}), Value::Null),
+            (json!({"path": "inks.rgislayout"}), Value::Null),
+            (json!({"text": "not a layout"}), Value::Null),
+        ] {
+            let script = format!("layout.import= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Import", "command": "layout.import", "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Import", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), required, "{params}");
+            }
+        }
+    }
+
     #[test]
     fn field_identity_is_preserved_and_required_in_a_plain_saved_project() {
         let project = Project::from_json(include_str!("../../../schema/fixtures/field_origin.rgis")).unwrap();
@@ -545,6 +682,40 @@ mod tests {
         assert!(serde_json::to_value(&clean).unwrap().get("requires").is_none());
         clean.origin_id = "0123456789abcdef0123456789abcdef".into();
         assert_eq!(serde_json::to_value(&clean).unwrap()["requires"], json!(["field-origin"]));
+    }
+
+    /// A return check (a package's or an area's generation) is kept on saving and requires its own
+    /// capability; an invalid one is refused, and an area never packaged has none and requires nothing.
+    #[test]
+    fn field_generation_is_preserved_and_required_and_must_be_an_identity() {
+        let project = Project::from_json(include_str!("../../../schema/fixtures/field_generation.rgis")).unwrap();
+        let saved = serde_json::to_value(&project).unwrap();
+        assert_eq!(saved["requires"], json!(["field-origin", "field-generation"]));
+        let reopened = Project::from_json(&saved.to_string()).unwrap();
+        assert_eq!(reopened.field_origin, project.field_origin);
+        assert_eq!(reopened.field_origin.as_ref().map(|o| o.generation.as_str()), Some("8899aabbccddeeff0011223344556677"));
+        let mut invalid = saved.clone();
+        invalid["field_origin"]["generation"] = json!("not-an-id");
+        assert!(Project::from_json(&invalid.to_string()).unwrap_err().contains("identity"));
+        // The same for an area's own, once it holds a snapshot of a map.
+        let mut with_area = Project::from_json(include_str!("../../../schema/fixtures/field_origin.rgis")).unwrap();
+        with_area.offline_areas.push(super::super::OfflineArea {
+            id: "0123456789abcdef0123456789abcdef".into(),
+            name: "Field".into(),
+            map: "Map".into(),
+            extent: rustgis_geom::Extent::new(0.0, 0.0, 1.0, 1.0),
+            created: 0.0,
+            synced: 0.0,
+            generation: String::new(),
+            data: with_area.map().clone(),
+        });
+        assert_eq!(serde_json::to_value(&with_area).unwrap()["requires"], json!(["field-origin"]));
+        with_area.offline_areas[0].generation = "8899aabbccddeeff0011223344556677".into();
+        let saved = serde_json::to_value(&with_area).unwrap();
+        assert_eq!(saved["requires"], json!(["field-origin", "field-generation"]));
+        let mut invalid = saved;
+        invalid["offline_areas"][0]["generation"] = json!("nope");
+        assert!(Project::from_json(&invalid.to_string()).unwrap_err().contains("identity"));
     }
 
     #[test]
@@ -563,6 +734,7 @@ mod tests {
             extent: rustgis_geom::Extent::new(0.0, 0.0, 1.0, 1.0),
             created: 0.0,
             synced: 0.0,
+            generation: String::new(),
             data: p.map().clone(),
         });
         p.maps[0].tiles.clear();
@@ -588,6 +760,7 @@ mod tests {
             extent: rustgis_geom::Extent::new(0.0, 0.0, 1.0, 1.0),
             created: 0.0,
             synced: 0.0,
+            generation: String::new(),
             data: p.map().clone(),
         });
         p.maps[0].view.terrain = None;

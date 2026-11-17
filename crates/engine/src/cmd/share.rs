@@ -555,7 +555,14 @@ fn map_crs(m: &rustgis_map::Map) -> Result<Crs, String> {
                 return Ok(crs);
             }
             let shown = label.clone();
-            let def = rustgis_data::raster::crs::CustomCrs { proj4, label, geokeys: Vec::new(), doubles: Vec::new(), ascii: String::new() };
+            let def = rustgis_data::raster::crs::CustomCrs {
+                proj4,
+                label,
+                geokeys: Vec::new(),
+                doubles: Vec::new(),
+                ascii: String::new(),
+                wkt: None,
+            };
             let crs = Crs::custom(def)?;
             if !rustgis_data::raster::geotiff::describes(crs) {
                 return Err(format!(
@@ -712,6 +719,10 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
             dates.extend(
                 rustgis_data::source::rounded_dates_note(&layer.fields, &e.rounded_dates)
                     .map(|n| format!("{path}: {}: {n} when read for the export", layer.name)),
+            );
+            dates.extend(
+                rustgis_data::source::null_text_note(&layer.fields, &e.null_text)
+                    .map(|n| format!("{path}: {}: {n}, so they're empty in the export", layer.name)),
             );
             dates.extend(rustgis_data::io::utc_dates_note(&layer.fields, &e.utc_dates, path));
             dates.extend(rustgis_data::io::fine_dates_note(&layer.fields, &e.fine_dates, path));
