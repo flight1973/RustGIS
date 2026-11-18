@@ -152,14 +152,16 @@ and **Data › Layer Templates** adds empty layers with ready-made schemas to dr
 Dates and date-times remain typed when reading Shapefile, GeoPackage, GeoParquet, local
 FlatGeobuf, FileGDB, workbook date cells and GPX timestamps. Ordinary spreadsheet text that
 looks like a date stays text. A workbook column mixing date cells with ordinary text is read
-entirely as text; clean that column in the workbook before using date operations.
+entirely as text; clean that column in the workbook before using date operations. Empty cells and
+`<Null>` cells don't count as text there: they are read as empty values.
 Invalid dates become empty values with a notice naming the fields
 and counting the values; dates cover years 1–9999. Fractional seconds are kept to microseconds:
-digits past the sixth (nanosecond timestamps in Parquet, text read from a GeoPackage or FlatGeobuf, or
-converted by Convert Field) are rounded to the nearest microsecond, and a read says how many values it
-rounded and in which fields. Text typed in, kept in a project, read from GPX or compared in a
-where clause isn't rounded: with more digits than that it isn't a date. Floating-point serial dates in workbooks and FileGDB are rounded
-the same way, with a notice when rounding is needed. A workbook's 1900-02-29 (serial 60, a day
+digits past the sixth (nanosecond timestamps in Parquet, text read from a GeoPackage, FlatGeobuf,
+GPX timestamps or workbook date cells, or converted by Convert Field) are rounded to the nearest
+microsecond, and a read says how many values it rounded and in which fields. Text typed in, kept in a
+project or compared in a where clause isn't rounded: with more digits than that it isn't a date.
+Floating-point serial dates in workbooks and FileGDB are rounded the same way, with a notice only
+when the serial holds more than a microsecond can say (a whole minute or second isn't reported). A workbook's 1900-02-29 (serial 60, a day
 that never existed) is read as empty and counted, in a column of dates or any other.
 Times without a day stay text; Parquet clocks retain `Z` when declared UTC.
 

@@ -92,7 +92,7 @@ pub(crate) fn temporal(
     k: usize,
 ) -> crate::Value {
     let Some(text) = text else {
-        super::unread_date(unread, k);
+        super::count_at(unread, k);
         return crate::Value::Null;
     };
     let (v, cut) = match rounded {
@@ -101,10 +101,10 @@ pub(crate) fn temporal(
     };
     if v.is_null() {
         if !crate::Value::Text(text.to_string()).asks_null() {
-            super::unread_date(unread, k);
+            super::count_at(unread, k);
         }
     } else if cut && let Some(rounded) = rounded {
-        super::unread_date(rounded, k);
+        super::count_at(rounded, k);
     }
     v
 }

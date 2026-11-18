@@ -2077,6 +2077,17 @@ fn read_csv_with_budget(text: &str, name: &str, opts: &CsvOptions, budget: &mut 
     read_csv_records(&mut rdr, name, opts, budget)
 }
 
+/// What a workbook knows of a sheet's columns beyond their text, by column ([`read_rows`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Workbook<'a> {
+    /// The type its cells give a column, which overrides text inference.
+    pub types: &'a [Option<FieldType>],
+    /// Date cells of a day that never was (serial 60), read as empty.
+    pub phantom_dates: &'a [usize],
+    /// Serial date-times that held more than the microsecond, rounded to it.
+    pub rounded_dates: &'a [usize],
+}
+
 /// Rows of text cells under a header row (delimited text, a spreadsheet's sheet) as a dataset, as
 /// [`read_csv_with`] describes; `malformed` rows were already passed over. A workbook gives its
 /// cell types, which may override text inference by source column, and the dates it already read
@@ -2087,9 +2098,9 @@ pub(crate) fn read_rows(
     malformed: usize,
     name: &str,
     opts: &CsvOptions,
-    workbook: Option<(&[Option<FieldType>], &[usize])>,
+    workbook: Option<Workbook<'_>>,
 ) -> Result<(Dataset, ReadReport)> {
-    let types = workbook.map(|(types, _)| types);
+    let types = workbook.map(|wb| wb.types);
     let named = |n: &Option<String>, what: &str| -> Result<Option<usize>> {
         match n.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
             Some(n) => headers
@@ -2143,15 +2154,21 @@ pub(crate) fn read_rows(
     let gt = if xy.is_some() { GeometryType::Point } else { GeometryType::None };
     let mut ds = Dataset::new(name, gt, fields);
     let mut srid: Option<u32> = None;
-    let (mut unread_dates, mut null_text) = (Vec::new(), Vec::new());
-    for (k, &i) in columns.iter().enumerate() {
-        crate::source::unread_dates_by(&mut unread_dates, k, workbook.and_then(|(_, empty)| empty.get(i)).copied().unwrap_or(0));
+    let (mut unread_dates, mut null_text, mut rounded_dates) = (Vec::new(), Vec::new(), Vec::new());
+    for (k, (&i, field)) in columns.iter().zip(&ds.fields).enumerate() {
+        crate::source::count_by(&mut unread_dates, k, workbook.and_then(|wb| wb.phantom_dates.get(i)).copied().unwrap_or(0));
+        // A workbook's serial date-times that held more than the microsecond, counted with the
+        // date-time text rounded below: one notice says both. A date field keeps only the day,
+        // so nothing of the microsecond is lost there.
+        if field.ty != FieldType::Date {
+            crate::source::count_by(&mut rounded_dates, k, workbook.and_then(|wb| wb.rounded_dates.get(i)).copied().unwrap_or(0));
+        }
     }
     // The WKT column is the geometry, not a field: a workbook date there that never was is empty,
     // so its row has no geometry, said here.
     if let Some(w) = wkt {
         let column = headers.get(w).map_or("", |h| h.trim());
-        match workbook.and_then(|(_, empty)| empty.get(w)).copied().unwrap_or(0) {
+        match workbook.and_then(|wb| wb.phantom_dates.get(w)).copied().unwrap_or(0) {
             0 => {}
             1 => report.messages.push(format!("1 value in '{column}' isn't a date and was read as empty, so its row has no geometry")),
             n => report
@@ -2197,12 +2214,20 @@ pub(crate) fn read_rows(
                 let text = unguard(r.get(i).map(|s| s.as_str()).unwrap_or(""));
                 let marker = Value::is_null_marker(&text);
                 if marker {
-                    crate::source::null_text_at(&mut null_text, k);
+                    crate::source::count_at(&mut null_text, k);
                 }
-                let value = Value::parse_file(&text, f.ty);
+                // A date-time with digits past the microsecond (a workbook's ISO cell, as .NET
+                // writes them) is rounded to it and counted, not dropped.
+                let (value, rounded) = match f.ty {
+                    FieldType::DateTime => Value::parse_stored_counted(&text, f.ty),
+                    _ => (Value::parse_file(&text, f.ty), false),
+                };
+                if rounded {
+                    crate::source::count_at(&mut rounded_dates, k);
+                }
                 // The marker is counted once, as one, not also as a date that isn't one.
                 if f.ty.is_temporal() && !marker && !text.trim().is_empty() && value.is_null() {
-                    crate::source::unread_date(&mut unread_dates, k);
+                    crate::source::count_at(&mut unread_dates, k);
                 }
                 value
             })
@@ -2281,6 +2306,8 @@ pub(crate) fn read_rows(
     }
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
     report.messages.extend(report.unread_dates.clone());
+    report.rounded_dates = crate::source::rounded_dates_note(&ds.fields, &rounded_dates);
+    report.messages.extend(report.rounded_dates.clone());
     report.messages.extend(crate::source::null_text_note(&ds.fields, &null_text));
     Ok((ds, report))
 }
@@ -3052,7 +3079,7 @@ fn dbf_attrs(record: &shapefile::dbase::Record, fields: &[Field], counts: &mut D
             // `<Null>` is a missing value's marker, in a date column too; other text keeps its
             // leading spaces (the reader drops only the padding after it).
             Some(FieldValue::Character(Some(s))) if Value::is_null_marker(s) => {
-                crate::source::null_text_at(null_text, k);
+                crate::source::count_at(null_text, k);
                 Value::Null
             }
             Some(FieldValue::Character(Some(s))) if f.ty == FieldType::Date => match crate::dbf::date(s.as_bytes()) {
@@ -5924,6 +5951,18 @@ mod tests {
         assert_eq!(back.value(0, 2), &Value::Text("-abc".into()));
         assert_eq!(back.value(1, 2), &Value::Text("=x".into()));
         assert_eq!(to_csv(&back).unwrap(), once, "export/import is stable");
+    }
+
+    /// Delimited text never types a column as dates, so date-time text with digits past the
+    /// microsecond is kept as it is written, and nothing is said; six digits likewise.
+    #[test]
+    fn csv_date_time_text_is_kept_as_written() {
+        for time in ["2019-07-04T12:30:15.1234567Z", "2019-07-04T12:30:15.123456Z"] {
+            let (ds, report) = read_csv(&format!("when\n{time}\n"), "t").unwrap();
+            assert_eq!(ds.fields[0].ty, FieldType::Text);
+            assert_eq!(ds.value(0, 0), &Value::Text(time.into()));
+            assert!(report.messages.is_empty() && report.rounded_dates.is_none(), "{report:?}");
+        }
     }
 
     /// `<Null>` in a `.dbf` date column is counted once, as the marker, not also as a date that

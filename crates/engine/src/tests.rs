@@ -53683,3 +53683,23 @@ fn a_city_models_volumes_come_in_extruded() {
     s.run("layer.addDataText", &json!({"fileName": "b.geojson", "text": geojson})).unwrap();
     assert!(s.map().layers.iter().all(|l| l.extrusion.is_none()), "only a reader that knows the type extrudes");
 }
+
+/// A GPX time with digits past the microsecond is said to be rounded once when the file is read,
+/// and an export of the layer doesn't say it twice (#1894).
+#[test]
+fn a_rounded_gpx_time_is_said_once() {
+    let gpx = r#"<gpx><wpt lat="1" lon="1"><time>2019-07-04T12:30:15.1234567Z</time></wpt></gpx>"#;
+    let mut s = Session::new(Project::default());
+    let rounded = |s: &Session, mark| s.notices_since(mark).iter().filter(|n| n.text.contains("rounded to the microsecond")).count();
+    let mark = s.notice_mark();
+    s.run("layer.addDataText", &json!({"fileName": "trip.gpx", "text": gpx})).unwrap();
+    assert_eq!(rounded(&s, mark), 1, "{:?}", s.notices_since(mark));
+    let id = s.map().layers.first().unwrap().id;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("rustgis-gpx-rounded-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mark = s.notice_mark();
+    s.run("share.exportLayer", &json!({"layer": id, "path": dir.join("trip.csv")})).unwrap();
+    assert!(rounded(&s, mark) <= 1, "{:?}", s.notices_since(mark));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

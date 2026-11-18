@@ -1249,8 +1249,8 @@ impl ColumnValues {
     /// rows.
     fn value(&self, row: usize, field: usize, unread: &mut Vec<usize>, rounded: &mut Vec<usize>) -> Value {
         match self.flags.get(row) {
-            Some(&INVALID) => super::unread_date(unread, field),
-            Some(&ROUNDED) => super::unread_date(rounded, field),
+            Some(&INVALID) => super::count_at(unread, field),
+            Some(&ROUNDED) => super::count_at(rounded, field),
             _ => {}
         }
         self.values.get(row).cloned().unwrap_or_default()

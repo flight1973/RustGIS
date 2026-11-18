@@ -934,14 +934,17 @@ fn filegdb_temporal_fields_keep_days_offsets_and_null_notices() {
     assert_eq!(gdb_datetime(25_569.5, None).to_string(), "1970-01-01T12:00:00");
     assert!(gdb_datetime(25_569.0, Some(i16::MIN)).is_null());
     assert!(gdb_datetime(1e100, None).is_null());
-    // Exercise the reader/report boundary as well as the shared serial helper.
-    for (serial, rounded) in [(45_000.5, false), (45_000.1, true)] {
+    // Exercise the reader/report boundary as well as the shared serial helper. 45000.1 isn't
+    // 45000.1 in binary, but it is the f64 02:24:00 makes, so nothing finer was lost (#1894);
+    // serials holding more than the microsecond are rounded and said.
+    for (serial, rounded) in [(45_000.5, false), (45_000.1, false), (1.0 + 0.123_456_789 / 86_400.0, true), (45_000.123_456_789, true)] {
         let (t, x) = table(0, &[F::Date("moment", 5)], &[vec![V::Date(Some((serial, None)))]]);
         let (_, report) = read_table("dates", &t, &x, None).unwrap().unwrap();
-        let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded to the nearest microsecond")).collect();
+        let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded")).collect();
         assert_eq!(notices.len(), usize::from(rounded), "{serial}: {report:?}");
+        assert_eq!(report.rounded_dates.is_some(), rounded, "{serial}");
         if rounded {
-            assert!(notices[0].contains("1 serial date") && notices[0].contains("moment"));
+            assert_eq!(notices[0], "1 date-time was rounded to the microsecond, as more digits than that aren't kept, in 'moment'");
         }
     }
 }

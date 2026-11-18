@@ -668,7 +668,7 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
                 .enumerate()
                 .map(|(k, f)| match attrs.get(&f.name) {
                     Some(v) if Value::is_null_marker(v) => {
-                        crate::source::null_text_at(&mut null_text, k);
+                        crate::source::count_at(&mut null_text, k);
                         Value::Null
                     }
                     Some(v) => Value::parse_file(v, f.ty),

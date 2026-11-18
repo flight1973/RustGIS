@@ -402,7 +402,7 @@ pub fn read(mif: &str, mid: Option<&str>, name: &str) -> Result<(Dataset, ReadRe
             .map(|(c, f)| {
                 let text = row.and_then(|r| r.get(c)).map(String::as_str).unwrap_or("");
                 if Value::is_null_marker(text) {
-                    crate::source::null_text_at(&mut null_text, c);
+                    crate::source::count_at(&mut null_text, c);
                 }
                 Value::parse_file(text, f.ty)
             })

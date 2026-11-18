@@ -954,9 +954,9 @@ impl PropertyProcessor for Props<'_> {
             (Some(ty @ (FieldType::Date | FieldType::DateTime)), Value::Text(s)) => {
                 let (value, rounded) = Value::parse_stored_counted(&s, ty);
                 if !s.trim().is_empty() && value.is_null() {
-                    super::unread_date(&mut self.unread_dates, idx);
+                    super::count_at(&mut self.unread_dates, idx);
                 } else if rounded {
-                    super::unread_date(&mut self.rounded_dates, idx);
+                    super::count_at(&mut self.rounded_dates, idx);
                 }
                 value
             }

@@ -258,19 +258,14 @@ pub struct Batch {
     pub notes: Vec<String>,
 }
 
-/// Counts one more value of the field at `k` that wasn't a date, or one date-time rounded to the
-/// microsecond ([`Batch::unread_dates`], [`Batch::rounded_dates`]).
-pub(crate) fn unread_date(counts: &mut Vec<usize>, k: usize) {
-    unread_dates_by(counts, k, 1);
+/// Counts one more value in the field at `k`, in per-field counts such as
+/// [`Batch::unread_dates`], [`Batch::rounded_dates`] and [`Batch::null_text`].
+pub(crate) fn count_at(counts: &mut Vec<usize>, k: usize) {
+    count_by(counts, k, 1);
 }
 
-/// Counts one more text value `<Null>` read as null in the field at `k` ([`Batch::null_text`]).
-pub(crate) fn null_text_at(counts: &mut Vec<usize>, k: usize) {
-    unread_dates_by(counts, k, 1);
-}
-
-/// [`unread_date`], `n` more times.
-pub(crate) fn unread_dates_by(counts: &mut Vec<usize>, k: usize, n: usize) {
+/// [`count_at`], `n` more times.
+pub(crate) fn count_by(counts: &mut Vec<usize>, k: usize, n: usize) {
     if n == 0 {
         return;
     }
@@ -332,7 +327,14 @@ pub fn rounded_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<S
     if total == 0 {
         return None;
     }
-    let what = if total == 1 { "1 date-time was".to_string() } else { format!("{total} date-times were") };
+    // A serial date read into a text field (a time without a day) is said as a time too.
+    let date_times = fields.iter().zip(counts).all(|(f, n)| *n == 0 || f.ty == crate::FieldType::DateTime);
+    let what = match (total, date_times) {
+        (1, true) => "1 date-time was".to_string(),
+        (n, true) => format!("{n} date-times were"),
+        (1, false) => "1 date or time value was".to_string(),
+        (n, false) => format!("{n} date or time values were"),
+    };
     Some(format!("{what} rounded to the microsecond, as more digits than that aren't kept, in {}", crate::io::named_fields(fields, counts)))
 }
 

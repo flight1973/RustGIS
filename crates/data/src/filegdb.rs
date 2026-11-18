@@ -383,10 +383,10 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
         let mut attrs: Vec<Value> = Vec::with_capacity(ds.fields.len());
         for (k, &c) in columns.iter().enumerate() {
             if values.get(c).is_some_and(|v| v.invalid_date) {
-                crate::source::unread_date(&mut unread_dates, k);
+                crate::source::count_at(&mut unread_dates, k);
             }
             if values.get(c).is_some_and(|v| v.rounded_date) {
-                crate::source::unread_date(&mut rounded_dates, k);
+                crate::source::count_at(&mut rounded_dates, k);
             }
             attrs.push(match table.fields.get(c).map(|f| f.kind) {
                 Some(Kind::ObjectId) => Value::Int(i64::try_from(row).unwrap_or(i64::MAX)),
@@ -427,13 +427,8 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
         };
         ds.push_next(geometry, attrs);
     }
-    let rounded: usize = rounded_dates.iter().sum();
-    if rounded > 0 {
-        report.messages.push(format!(
-            "{rounded} serial date values were rounded to the nearest microsecond, in {}",
-            crate::io::named_fields(&ds.fields, &rounded_dates)
-        ));
-    }
+    report.rounded_dates = crate::source::rounded_dates_note(&ds.fields, &rounded_dates);
+    report.messages.extend(report.rounded_dates.clone());
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
     report.messages.extend(report.unread_dates.clone());
     if curves > 0 {

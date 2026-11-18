@@ -137,20 +137,26 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<(Dataset, ReadReport)>>
             if let Some(field) = ds.fields.get_mut(k) {
                 field.ty = FieldType::DateTime;
             }
-            let mut counts = Vec::new();
+            let (mut counts, mut rounded) = (Vec::new(), Vec::new());
             for feature in &mut ds.features {
                 crate::progress::step(1)?;
                 if let Some(value @ Value::Text(_)) = feature.attrs.get_mut(k) {
                     let Value::Text(s) = &*value else { continue };
-                    let parsed = crate::DateTime::parse(s).filter(|_| s.contains(['T', 't']));
-                    if parsed.is_none() {
-                        crate::source::unread_date(&mut counts, k);
+                    // Digits past the microsecond (.NET writes seven) are rounded to it and counted.
+                    let (parsed, was_rounded) =
+                        if s.contains(['T', 't']) { Value::parse_stored_counted(s, FieldType::DateTime) } else { (Value::Null, false) };
+                    if parsed.is_null() {
+                        crate::source::count_at(&mut counts, k);
+                    } else if was_rounded {
+                        crate::source::count_at(&mut rounded, k);
                     }
-                    *value = parsed.map(Value::DateTime).unwrap_or_default();
+                    *value = parsed;
                 }
             }
             report.unread_dates = crate::source::unread_dates_note(&ds.fields, &counts);
             report.messages.extend(report.unread_dates.clone());
+            report.rounded_dates = crate::source::rounded_dates_note(&ds.fields, &rounded);
+            report.messages.extend(report.rounded_dates.clone());
         }
         out.push((ds, report));
     }
@@ -213,6 +219,28 @@ mod tests {
         assert_eq!(ds.value(1, k).to_string(), "2026-03-05T14:30:00.123456+02:00");
         assert!(report.unread_dates.as_deref().unwrap().starts_with("1 value"));
         assert!(read("clean.gpx", GPX.as_bytes()).unwrap().iter().all(|(_, r)| r.unread_dates.is_none()));
+    }
+
+    /// A time with seven fractional digits, as .NET's round-trip format writes it, is rounded to
+    /// the microsecond and said, not read as empty (#1894); six digits are kept as they are.
+    #[test]
+    fn gpx_times_past_the_microsecond_are_rounded_and_said() {
+        let gpx = |time: &str| {
+            format!(r#"<gpx><wpt lat="1" lon="1"><time>{time}</time></wpt><wpt lat="2" lon="2"><time>{time}</time></wpt></gpx>"#)
+        };
+        let layers = read("net.gpx", gpx("2019-07-04T12:30:15.1234567Z").as_bytes()).unwrap();
+        let (ds, report) = &layers[0];
+        let k = ds.field_index("time").unwrap();
+        assert_eq!(ds.value(0, k).to_string(), "2019-07-04T12:30:15.123457Z");
+        assert_eq!(report.unread_dates, None);
+        let note = report.rounded_dates.as_deref().unwrap();
+        assert_eq!(note, "2 date-times were rounded to the microsecond, as more digits than that aren't kept, in 'time'");
+        assert_eq!(report.messages.iter().filter(|m| m.contains("rounded")).count(), 1, "{report:?}");
+        let layers = read("six.gpx", gpx("2019-07-04T12:30:15.123456Z").as_bytes()).unwrap();
+        let (ds, report) = &layers[0];
+        assert_eq!(ds.value(0, k).to_string(), "2019-07-04T12:30:15.123456Z");
+        assert_eq!((report.rounded_dates.as_deref(), report.unread_dates.as_deref()), (None, None));
+        assert!(report.messages.is_empty(), "{report:?}");
     }
 
     #[test]

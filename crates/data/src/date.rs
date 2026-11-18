@@ -301,16 +301,34 @@ impl<'de> Deserialize<'de> for DateTime {
 
 /// A binary floating-point day count from an epoch, rounded to microseconds. Split whole
 /// days before scaling: scaling an absolute date as f64 loses low time bits in distant years.
-/// The boolean says that fractional microseconds were rounded, for the reader's notice.
+/// The boolean says that the serial held more than its microsecond, for the reader's notice: the
+/// f64 given is farther from the microsecond read than a serial of that microsecond can be, so
+/// something finer was lost. A serial of an exact time is the f64 nearest it (within half its
+/// unit in the last place), or one a program built by adding the day's fraction, itself rounded,
+/// to the whole days (`DATE() + TIME()`, `45000 + s / 86400`), which may be off by half the
+/// fraction's unit more. A whole-minute serial such as 45000.1 (02:24:00) isn't exact in binary,
+/// but it is such an f64, so nothing was lost.
 pub(crate) fn serial_datetime(days: f64, epoch: i64) -> Option<(DateTime, bool)> {
     if !days.is_finite() || days.abs() > 4_000_000.0 {
         return None;
     }
     let whole = days.floor() as i64;
     let day = Date::from_days(whole.checked_add(epoch)?)?;
-    let fraction = (days - whole as f64) * DAY_US as f64;
-    let micros = day.sort_key().checked_add(fraction.round() as i64)?;
-    DateTime::local(micros).map(|t| (t, fraction.fract() != 0.0))
+    // The fraction of the day and its microseconds are each rounded once; the errors of both are
+    // recovered (Knuth's two-sum for `days - whole`, which isn't exact between -0.5 and 0; a
+    // fused multiply-add for the product), so `off` is how far the serial is from the
+    // microsecond read, in microseconds, to within a rounding of its own.
+    let minus_whole = -(whole as f64);
+    let fraction = days + minus_whole;
+    let (back_minus, back_days) = (fraction - days, fraction - (fraction - days));
+    let lost = (days - back_days) + (minus_whole - back_minus);
+    let scaled = fraction * DAY_US as f64;
+    let rounded = scaled.round();
+    let off = (scaled - rounded) + fraction.mul_add(DAY_US as f64, -scaled) + lost * DAY_US as f64;
+    let unit = |x: f64| f64::from_bits(x.abs().to_bits() + 1) - x.abs();
+    let allowed = (unit(days) + unit(fraction)) / 2.0 * DAY_US as f64;
+    let micros = day.sort_key().checked_add(rounded as i64)?;
+    DateTime::local(micros).map(|t| (t, off.abs() > allowed))
 }
 
 /// Whether microseconds since 1970 fall in years 1 to 9999.
@@ -526,11 +544,72 @@ mod tests {
         let serial = 2_958_465.25 + 2f64.powi(-31);
         let (t, rounded) = serial_datetime(serial, -25_569).unwrap();
         assert_eq!(t.to_string(), "9999-12-31T06:00:00.000040");
-        assert!(rounded);
+        // That step is the f64's unit in the last place here, and this f64 is the one nearest
+        // 06:00:00.000040 (0.233 µs from it): nothing finer was lost, and nothing is said.
+        assert!(!rounded);
         assert_eq!(serial_datetime(25_569.5, -25_569).unwrap(), (dt("1970-01-01T12:00:00"), false));
         for bad in [f64::NAN, f64::INFINITY, -1e100, 2_958_466.0] {
             assert!(serial_datetime(bad, -25_569).is_none());
         }
+    }
+
+    /// The f64 nearest `day + seconds / 86400`, from its decimal text to 30 places (the parse
+    /// rounds once), so the test doesn't round twice as `day + seconds / 86400.0` can.
+    fn nearest_serial(day: i64, seconds: i64) -> f64 {
+        let total = day * 86_400 + seconds;
+        let (sign, n) = if total < 0 { ("-", -total) } else { ("", total) };
+        let mut text = format!("{sign}{}.", n / 86_400);
+        let mut rest = n % 86_400;
+        for _ in 0..30 {
+            rest *= 10;
+            text.push(char::from(b'0' + (rest / 86_400) as u8));
+            rest %= 86_400;
+        }
+        text.parse().unwrap()
+    }
+
+    /// A whole-second or whole-minute time's binary serial is rarely the time exactly, but it is
+    /// the f64 nearest it: that representation noise isn't rounding (#1894). A serial with digits
+    /// finer than the microsecond is.
+    #[test]
+    fn serial_noise_is_not_reported_as_rounding() {
+        // Days 1, 2 and 100, and -1 (1899-12-29, which FileGDB can hold), to the second.
+        for day in [1, 2, 100, -1] {
+            let start = serial_datetime(day as f64, -25_569).unwrap().0.micros();
+            for second in 0..86_400 {
+                let (t, rounded) = serial_datetime(nearest_serial(day, second), -25_569).unwrap();
+                assert_eq!(t.micros() - start, second * 1_000_000, "day {day}, second {second}");
+                assert!(!rounded, "day {day}, second {second}");
+            }
+        }
+        let day = serial_datetime(45_000.0, -25_569).unwrap().0.micros();
+        for minute in 0..1440 {
+            let (t, rounded) = serial_datetime(nearest_serial(45_000, minute * 60), -25_569).unwrap();
+            assert_eq!(t.micros() - day, minute * MINUTE_US, "minute {minute}");
+            assert!(!rounded, "minute {minute}");
+            // As a spreadsheet computes it, too.
+            assert!(!serial_datetime(45_000.0 + minute as f64 / 1440.0, -25_569).unwrap().1, "minute {minute}");
+        }
+        // Every second of the day as a program adds it to the day (two roundings).
+        for second in 0..86_400 {
+            let (t, rounded) = serial_datetime(45_000.0 + second as f64 / 86_400.0, -25_569).unwrap();
+            assert_eq!(t.micros() - day, second * 1_000_000, "second {second}");
+            assert!(!rounded, "second {second}");
+        }
+        // 00:00:00.123456789 on the day after the epoch.
+        let (t, rounded) = serial_datetime(1.0 + 0.123_456_789 / 86_400.0, -25_569).unwrap();
+        assert_eq!(t.to_string(), "1899-12-31T00:00:00.123457");
+        assert!(rounded);
+        // A fraction of a day past the microsecond in a recent year: 10666666569.49 µs.
+        let (t, rounded) = serial_datetime(45_000.123_456_789, -25_569).unwrap();
+        assert_eq!(t.to_string(), "2023-03-15T02:57:46.666569");
+        assert!(rounded);
+        // 45000.0000000001 is 8.64 µs past midnight, but its f64 is 8.80 µs past it, 0.2 µs from
+        // 00:00:00.000009, within the 0.31 µs a serial of that microsecond may be off (steps are
+        // 0.63 µs here): the f64 can't tell them apart, so nothing is said.
+        let (t, rounded) = serial_datetime(45_000.000_000_000_1, -25_569).unwrap();
+        assert_eq!(t.to_string(), "2023-03-15T00:00:00.000009");
+        assert!(!rounded);
     }
 
     #[test]
