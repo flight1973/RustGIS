@@ -1111,16 +1111,21 @@ impl Raster {
                 old.stats = new.stats.clone();
                 *new = old;
             }
-            // A picture read at a reduced size still says so, as a turned GeoTIFF does: of the
-            // turned grid at the file's resolution, so the two sizes said are alike.
-            let full = |n: u32, s: f64| (f64::from(n) * s).round().clamp(1.0, f64::from(u32::MAX)) as u32;
-            r.overview = self.overview.map(|_| (full(ow, sx), full(oh, sy)));
+            // A picture read at a reduced size still says so, as a turned GeoTIFF does, with the
+            // size the whole file has turned at its own resolution (its corners turned, over a
+            // cell of its pixels' area, as `north_up` sizes a grid).
+            let [_, xc, xr, _, yc, yr] = wf.affine();
+            let file_cell = (xc * yr - xr * yc).abs().sqrt();
+            r.overview = self.overview.map(|(fw, fh)| turned_size([xc, xr, yc, yr], fw, fh));
+            // Each turned cell is exactly `step` of the file's pixels across, unless the turned
+            // grid had to be made coarser to fit; then the sizes' ratio is the scale.
+            let exact = (r.transform.pixel_width.abs() / (f64::from(self.step) * file_cell) - 1.0).abs() < 1e-9;
+            r.step = if exact { self.step } else { 1 };
             (r.source, r.lost, r.copyright) = (self.source, self.lost, self.copyright);
             (r.rounded, r.rounded_some) = (self.rounded, self.rounded_some);
             r
         };
         r.georeferenced = true;
-        r.step = 1;
         Ok(r)
     }
 
@@ -1623,6 +1628,20 @@ fn rotate(r: &Raster, degrees: f64) -> Result<Raster> {
     }
     let transform = GeoTransform { origin_x: cx + min_x, origin_y: cy + max_y, pixel_width: px, pixel_height: -py };
     Raster::new(r.name.clone(), ow, oh, bands, transform, r.crs, None, r.color.clone(), r.data_type.clone())
+}
+
+/// The size, in cells of a pixel's area, of the north-up box around `w`×`h` pixels placed by
+/// `[x per column, x per row, y per column, y per row]`, as [`north_up`] sizes its grid.
+fn turned_size([xc, xr, yc, yr]: [f64; 4], w: u32, h: u32) -> (u32, u32) {
+    let cell = (xc * yr - xr * yc).abs().sqrt();
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    let span = |a: f64, b: f64| (0.0f64).max(a).max(b).max(a + b) - (0.0f64).min(a).min(b).min(a + b);
+    // A thousandth of a cell of slack, so a size that is whole on paper isn't rounded up by noise.
+    let n = |len: f64| ((len / cell) - 1e-3).ceil().clamp(1.0, f64::from(u32::MAX)) as u32;
+    if !cell.is_normal() {
+        return (w.max(1), h.max(1));
+    }
+    (n(span(fw * xc, fh * xr)), n(span(fw * yc, fh * yr)))
 }
 
 /// A `w`×`h` image placed by a rotated or skewed `affine` (GDAL's order: x, x per column, x per
@@ -2552,6 +2571,18 @@ pub(crate) mod tests {
 mod scan_tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn a_turned_size_is_the_grid_north_up_makes() {
+        let (w, h) = (40u32, 17u32);
+        let band = vec![1.0f32; (w * h) as usize];
+        for degrees in [0.0f64, 30.0, 90.0, 135.0, 200.0, 271.0] {
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            let (xc, xr, yc, yr) = (2.5 * cos, 2.5 * sin, 2.5 * sin, -2.5 * cos);
+            let (_, ow, oh, _) = north_up(&[band.as_slice()], w, h, [100.0, xc, xr, 50.0, yc, yr], usize::MAX).unwrap();
+            assert_eq!(turned_size([xc, xr, yc, yr], w, h), (ow, oh), "{degrees}°");
+        }
+    }
 
     fn tiff(tags: &[(u16, &[f64])]) -> Vec<u8> {
         use tiff::encoder::{TiffEncoder, colortype};
