@@ -1160,6 +1160,13 @@ fn rule_cases() -> Vec<(&'static str, Geometry, Vec<usize>, f64, &'static str)> 
             100.0,
             "parts_overlap, even_odd",
         ),
+        (
+            "the same part twice, once with a vertex in the middle of an edge",
+            multi(&[&[SQUARE], &[&[(0., 0.), (5., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.)]]]),
+            vec![0],
+            100.0,
+            "parts_overlap, even_odd",
+        ),
         // A ring's own area is read as the default reads it: traced twice, it counts once.
         ("a ring traced twice", poly(&[twice]), vec![0], 100.0, "self_intersection, even_odd"),
         ("a ring traced twice beside a part", multi(&[&[twice], &[small]]), vec![0, 0], 104.0, "self_intersection, even_odd"),

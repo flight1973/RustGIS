@@ -734,10 +734,11 @@ struct Distinct {
 /// The rings of `parts` to combine under [`Rule::EvenOdd`], without exact duplicates whose
 /// canceling out no one means: a hole repeated in its own part, and a part repeated whole (its
 /// exterior ring and its holes, after the first). A hole repeated in another part is kept: each of
-/// the parts has it, and leaving one out would fill it. The same ring is the same points in the
-/// same cyclic order, from any vertex and in either direction ([`normal_form`]); only rings, and
-/// parts, of the same size are compared, so a polygon that can have no duplicate costs no normal
-/// form. In buffers reserved fallibly.
+/// the parts has it, and leaving one out would fill it. The same ring is the same corners in the
+/// same cyclic order, from any vertex and in either direction, a vertex in the middle of a straight
+/// edge aside ([`normal_form`]): a copy with one more such vertex would cancel its twin out as
+/// surely. Only rings, and parts, of as many corners are compared, so a polygon that can have no
+/// duplicate costs no normal form. In buffers reserved fallibly.
 fn distinct_rings(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<Distinct, Limit> {
     let n = parts.iter().map(Vec::len).fold(0usize, usize::saturating_add);
     let mut keep: Vec<(usize, usize)> = room.vec(n)?;
@@ -761,7 +762,7 @@ fn distinct_rings(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<Distinct, Lim
     let mut sizes: Vec<(usize, usize, usize)> = room.vec(parts.len())?;
     for kept in keep.chunk_by(|a, b| a.0 == b.0) {
         let Some(&(p, _)) = kept.first() else { continue };
-        let points = kept.iter().filter_map(|&(p, r)| parts.get(p)?.get(r)).map(Vec::len).fold(0usize, usize::saturating_add);
+        let points = kept.iter().filter_map(|&(p, r)| parts.get(p)?.get(r)).map(|r| corner_count(r)).fold(0usize, usize::saturating_add);
         sizes.push((kept.len(), points, p));
     }
     sizes.sort_unstable();
@@ -803,17 +804,19 @@ fn distinct_rings(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<Distinct, Lim
 }
 
 /// Of `rings` (an id and the ring), the ids of those that aren't an exact duplicate of another with
-/// a lower id, in order, and how many are. Only rings of one length get a normal form.
+/// a lower id, in order, and how many are. Only rings with as many corners ([`corner_count`]) get
+/// a normal form.
 fn first_of_each(rings: &mut [(usize, &[Coord])], room: Room) -> Result<(Vec<usize>, usize), Limit> {
-    rings.sort_unstable_by_key(|(id, ring)| (ring.len(), *id));
+    let mut sized = room.collect(rings.len(), rings.iter().map(|&(id, ring)| (corner_count(ring), id, ring)))?;
+    sized.sort_unstable_by_key(|&(n, id, _)| (n, id));
     let mut kept: Vec<usize> = room.vec(rings.len())?;
     let mut keyed: Vec<(Vec<(u64, u64)>, usize)> = Vec::new();
-    for group in rings.chunk_by(|a, b| a.1.len() == b.1.len()) {
-        if let [(id, _)] = group {
+    for group in sized.chunk_by(|a, b| a.0 == b.0) {
+        if let [(_, id, _)] = group {
             kept.push(*id);
             continue;
         }
-        for &(id, ring) in group {
+        for &(_, id, ring) in group {
             room.grow(&mut keyed)?;
             keyed.push((normal_form(ring, room)?, id));
         }
@@ -831,18 +834,57 @@ fn first_of_each(rings: &mut [(usize, &[Coord])], room: Room) -> Result<(Vec<usi
     Ok((kept, duplicates))
 }
 
-/// A closed ring's points as bits, without the closing repeat: its least rotation (as a sequence
-/// of points) in whichever direction reads less, the same for the same ring whatever vertex it
-/// starts at and whichever way it is wound. In time and memory linear in the ring, however often
-/// it passes one vertex ([`least_rotation`]).
-fn normal_form(ring: &[Coord], room: Room) -> Result<Vec<(u64, u64)>, Limit> {
-    let pts = match ring.split_last() {
+/// A ring without its closing repeat.
+fn open(ring: &[Coord]) -> &[Coord] {
+    match ring.split_last() {
         Some((last, rest)) if Some(last) == rest.first() => rest,
         _ => ring,
-    };
+    }
+}
+
+/// Whether `b`, between `a` and `c` in a ring, lies on the straight line from `a` to `c`, exactly
+/// (by Shewchuk's adaptive orientation test, as geo's robust kernel gives it: J. R. Shewchuk,
+/// "Adaptive precision floating-point arithmetic and fast robust geometric predicates", Discrete &
+/// Computational Geometry 18(3), 1997, 305–363), and strictly between them: a vertex in the middle
+/// of a straight edge, which doesn't change the ring. A spike, going back the way it came, isn't.
+fn straight_through(a: Coord, b: Coord, c: Coord) -> bool {
+    use geo::kernels::{Kernel, Orientation, RobustKernel};
+    let g = |p: Coord| geo::Coord { x: p.x, y: p.y };
+    let within = |lo: f64, v: f64, hi: f64| lo.min(hi) <= v && v <= lo.max(hi);
+    b != a && b != c && within(a.x, b.x, c.x) && within(a.y, b.y, c.y) && RobustKernel::orient2d(g(a), g(b), g(c)) == Orientation::Collinear
+}
+
+/// The corners of an open ring: its vertices but those in the middle of a straight edge
+/// ([`straight_through`]), each tested against its neighbors as written, so a straight run of
+/// several loses them all. A ring of fewer than three vertices keeps them.
+fn corners(pts: &[Coord]) -> impl Iterator<Item = &Coord> {
     let n = pts.len();
+    pts.iter()
+        .enumerate()
+        .filter(move |&(i, &b)| {
+            n < 3 || {
+                let (a, c) = (pts.get((i + n - 1) % n), pts.get((i + 1) % n));
+                !matches!((a, c), (Some(&a), Some(&c)) if straight_through(a, b, c))
+            }
+        })
+        .map(|(_, c)| c)
+}
+
+/// How many corners a closed ring has ([`corners`]): the size its [`normal_form`] has.
+fn corner_count(ring: &[Coord]) -> usize {
+    corners(open(ring)).count()
+}
+
+/// A closed ring's corners ([`corners`]) as bits, without the closing repeat: its least rotation
+/// (as a sequence of points) in whichever direction reads less, the same for the same ring whatever
+/// vertex it starts at, whichever way it is wound, and whatever vertices it has in the middle of a
+/// straight edge. In time and memory linear in the ring, however often it passes one vertex
+/// ([`least_rotation`]).
+fn normal_form(ring: &[Coord], room: Room) -> Result<Vec<(u64, u64)>, Limit> {
+    let pts = open(ring);
+    let n = corners(pts).count();
     // Plus 0.0 makes -0.0 the same as 0.0: the same point, which writers and reprojection give either way.
-    let forward = room.collect(n, pts.iter().map(|c| ((c.x + 0.0).to_bits(), (c.y + 0.0).to_bits())))?;
+    let forward = room.collect(n, corners(pts).map(|c| ((c.x + 0.0).to_bits(), (c.y + 0.0).to_bits())))?;
     let backward = room.collect(n, forward.iter().rev().copied())?;
     let mut best: Option<Vec<(u64, u64)>> = None;
     for seq in [forward, backward] {
@@ -1036,6 +1078,16 @@ mod tests {
             }
         }
         assert_ne!(normal_form(&ring(&[(0., 0.), (10., 0.), (10., 11.), (0., 10.), (0., 0.)]), room).unwrap(), want);
+        // A vertex in the middle of a straight edge, or a straight run of them, doesn't change the
+        // ring; one past the edge's end (a spike out and back along it) does.
+        let mid = ring(&[(0., 0.), (2.5, 0.), (5., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.)]);
+        assert_eq!(normal_form(&mid, room).unwrap(), want);
+        assert_eq!(corner_count(&mid), 4);
+        let past = ring(&[(0., 0.), (12., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.)]);
+        assert_ne!(normal_form(&past, room).unwrap(), want);
+        // At the closing vertex too: a square starting mid-edge.
+        let from_mid = ring(&[(5., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.), (5., 0.)]);
+        assert_eq!(normal_form(&from_mid, room).unwrap(), want);
         let mut star = vec![Coord::new(0., 0.)];
         for k in 0..100_000 {
             let a = f64::from(k) * 1e-5;
