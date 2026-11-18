@@ -239,6 +239,12 @@ pub fn read_at_most(path: impl AsRef<Path>, max: u64) -> std::io::Result<Vec<u8>
     let file = File::open(path)?;
     let metadata = file.metadata().ok();
     let mut out = Vec::new();
+    // Sized once: reading through `take` loses the size hint `File::read_to_end` uses, so a large
+    // file would be copied as the buffer grows. One byte more finds a file that grew. Space that
+    // can't be had now is only grown into.
+    if let Some(m) = &metadata {
+        let _ = out.try_reserve_exact(usize::try_from(m.len().min(max).saturating_add(1)).unwrap_or(0));
+    }
     let read = file.take(max.saturating_add(1)).read_to_end(&mut out);
     let too_large = u64::try_from(out.len()).map_or(true, |n| n > max);
     if read.is_err() || too_large {
