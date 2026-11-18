@@ -110,7 +110,7 @@ pub(crate) struct Repaired {
     /// When the overlay rebuilt it, how far its coordinates may have moved, in their units (degrees,
     /// as coordinates are stored).
     pub moved: Option<f64>,
-    /// Under [`Rule::EvenOdd`], exact duplicate rings of one role dropped before the rings were
+    /// Under [`Rule::EvenOdd`], duplicate rings (the same corners, [`normal_form`]) of one role dropped before the rings were
     /// combined, since a pair would cancel out.
     pub duplicates: usize,
 }
@@ -171,8 +171,9 @@ impl Rule {
 /// The memory, per vertex, that [`Rule::EvenOdd`] holds besides the overlay's
 /// ([`OVERLAY_BYTES`]), at most, while [`distinct_rings`] finds duplicates: each ring's normal form
 /// kept (16), and while one is made its two readings (32), Booth's failure table (16), a rotation
-/// (16) and the least so far (16).
-const EVEN_ODD_BYTES: u64 = 96;
+/// (16) and the least so far (16); and a part's holes listed with their corner counts (32 a ring,
+/// a ring at least 4 vertices: 8).
+const EVEN_ODD_BYTES: u64 = 104;
 
 /// Repairs one geometry under `rule`, spending at most [`validity::MAX_WORK`] on each check and on
 /// the overlay, and asking `has_room` whether the browser can give the overlay's memory before it
@@ -604,7 +605,7 @@ fn ring_area(ring: &[Coord], at: (usize, usize), crossing: &[(usize, usize)], ro
 /// The rebuild under [`Rule::EvenOdd`] of `parts` (closed rings, each with 3 distinct points or
 /// more; `crossing` as in [`ring_area`]), built as [`by_area`] builds its own, part by part and then
 /// the parts together, with parity in place of shells minus holes:
-/// - exact duplicates left out first ([`distinct_rings`]): a hole repeated in its part, and a part
+/// - duplicates (the same corners, [`normal_form`]) left out first ([`distinct_rings`]): a hole repeated in its part, and a part
 ///   repeated whole, which parity would otherwise cancel out;
 /// - each ring's own area ([`ring_area`]); a part whose exterior ring has none is left out with its
 ///   holes, as [`by_area`] leaves it;
@@ -731,7 +732,7 @@ struct Distinct {
     duplicates: usize,
 }
 
-/// The rings of `parts` to combine under [`Rule::EvenOdd`], without exact duplicates whose
+/// The rings of `parts` to combine under [`Rule::EvenOdd`], without duplicates whose
 /// canceling out no one means: a hole repeated in its own part, and a part repeated whole (its
 /// exterior ring and its holes, after the first). A hole repeated in another part is kept: each of
 /// the parts has it, and leaving one out would fill it. The same ring is the same corners in the
@@ -803,10 +804,14 @@ fn distinct_rings(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<Distinct, Lim
     Ok(Distinct { duplicates: duplicates + (before - keep.len()), keep })
 }
 
-/// Of `rings` (an id and the ring), the ids of those that aren't an exact duplicate of another with
+/// Of `rings` (an id and the ring), the ids of those that aren't a duplicate (the same corners, [`normal_form`]) of another with
 /// a lower id, in order, and how many are. Only rings with as many corners ([`corner_count`]) get
 /// a normal form.
 fn first_of_each(rings: &mut [(usize, &[Coord])], room: Room) -> Result<(Vec<usize>, usize), Limit> {
+    // One ring or none: no duplicate, and no corners to count.
+    if let [] | [_] = rings {
+        return Ok((room.collect(rings.len(), rings.iter().map(|&(id, _)| id))?, 0));
+    }
     let mut sized = room.collect(rings.len(), rings.iter().map(|&(id, ring)| (corner_count(ring), id, ring)))?;
     sized.sort_unstable_by_key(|&(n, id, _)| (n, id));
     let mut kept: Vec<usize> = room.vec(rings.len())?;
@@ -851,7 +856,15 @@ fn straight_through(a: Coord, b: Coord, c: Coord) -> bool {
     use geo::kernels::{Kernel, Orientation, RobustKernel};
     let g = |p: Coord| geo::Coord { x: p.x, y: p.y };
     let within = |lo: f64, v: f64, hi: f64| lo.min(hi) <= v && v <= lo.max(hi);
-    b != a && b != c && within(a.x, b.x, c.x) && within(a.y, b.y, c.y) && RobustKernel::orient2d(g(a), g(b), g(c)) == Orientation::Collinear
+    // The test assumes its products don't overflow: where they would (coordinates near 1e154 and
+    // beyond), its NaN reads as collinear, so the vertex is kept as a corner instead.
+    let det = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    det.is_finite()
+        && b != a
+        && b != c
+        && within(a.x, b.x, c.x)
+        && within(a.y, b.y, c.y)
+        && RobustKernel::orient2d(g(a), g(b), g(c)) == Orientation::Collinear
 }
 
 /// The corners of an open ring: its vertices but those in the middle of a straight edge
@@ -1085,6 +1098,14 @@ mod tests {
         assert_eq!(corner_count(&mid), 4);
         let past = ring(&[(0., 0.), (12., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.)]);
         assert_ne!(normal_form(&past, room).unwrap(), want);
+        // Where the orientation test would overflow (about 1e154 and beyond), a vertex off the line
+        // is a corner, not taken for one on it: these two triangles aren't one ring.
+        let c = Coord::new;
+        assert!(!straight_through(c(-1e200, -1e200), c(0., 0.5e200), c(1e200, 1e200)));
+        assert!(straight_through(c(-1e100, -1e100), c(0., 0.), c(1e100, 1e100)));
+        let t1 = ring(&[(-1e200, -1e200), (1e200, 1e200), (1e200, -1e200), (-1e200, -1e200)]);
+        let t2 = ring(&[(-1e200, -1e200), (0., 0.5e200), (1e200, 1e200), (1e200, -1e200), (-1e200, -1e200)]);
+        assert_ne!(normal_form(&t1, room).unwrap(), normal_form(&t2, room).unwrap());
         // At the closing vertex too: a square starting mid-edge.
         let from_mid = ring(&[(5., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.), (5., 0.)]);
         assert_eq!(normal_form(&from_mid, room).unwrap(), want);

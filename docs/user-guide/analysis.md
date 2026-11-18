@@ -1281,9 +1281,10 @@ either way.
   exterior ring is a part. It suits data whose ring roles may be wrong, such as a hole stored as a
   part of its own: Shells Minus Holes fills it, Even-Odd keeps it a hole. Each part is combined
   first, then the parts together, so a hole two parts both have stays out of both, and a part
-  whose exterior ring has no area is dropped with its holes, as under Shells Minus Holes. Exact
-  duplicates, a hole repeated in its own part or a part repeated whole, are left out first, since
-  each pair would cancel out, and the tool says how many. Features rebuilt under Even-Odd have
+  whose exterior ring has no area is dropped with its holes, as under Shells Minus Holes. Duplicates,
+  a hole repeated in its own part or a part repeated whole (the same corners in the same order,
+  from any vertex and either way round, a vertex in the middle of a straight edge aside), are left
+  out first, since each pair would cancel out, and the tool says how many. Features rebuilt under Even-Odd have
   `even_odd` in `repairs` after the codes.
 
 | Shape | Shells Minus Holes | Even-Odd |
