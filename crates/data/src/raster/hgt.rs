@@ -75,7 +75,9 @@ pub fn tile_corner(file_name: &str) -> Option<(i32, i32)> {
 ///
 /// One step that doesn't look at Cancel: the file is already in memory and is read in a single
 /// pass over it. On the desktop it runs in Add Data's read-ahead, off the UI thread, and a Cancel
-/// takes effect when it returns.
+/// takes effect when it returns. It stays on one thread: turning big-endian words into numbers is
+/// about 0.12 s for the largest (7201 × 7201) tile in a release build, less than reading its
+/// 104 MB from disk, so threads would add little.
 pub fn read(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     read_limited(file_name, bytes, max_samples())
 }

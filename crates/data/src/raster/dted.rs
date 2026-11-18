@@ -161,7 +161,8 @@ pub fn spec_latitude_interval(level: u8) -> Option<u32> {
 ///
 /// One step that doesn't look at Cancel: the file is already in memory and is read in a single
 /// pass over its records. On the desktop it runs in Add Data's read-ahead, off the UI thread, and
-/// a Cancel takes effect when it returns.
+/// a Cancel takes effect when it returns. It stays on one thread, as [`super::hgt::read`] does: a
+/// cell is at most a quarter of the largest SRTM tile's size.
 pub fn read(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     read_limited(file_name, bytes, max_samples())
 }
