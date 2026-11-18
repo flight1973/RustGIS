@@ -171,9 +171,10 @@ impl Rule {
 /// The memory, per vertex, that [`Rule::EvenOdd`] holds besides the overlay's
 /// ([`OVERLAY_BYTES`]), at most, while [`distinct_rings`] finds duplicates: each ring's normal form
 /// kept (16), and while one is made its two readings (32), Booth's failure table (16), a rotation
-/// (16) and the least so far (16); and a part's holes listed with their corner counts (32 a ring,
-/// a ring at least 4 vertices: 8).
-const EVEN_ODD_BYTES: u64 = 104;
+/// (16) and the least so far (16); and, held with them, a part's holes listed (24 a ring), with
+/// their corner counts (32), the ids kept (8) and their keys (32): 96 a ring, a ring at least 4
+/// vertices, so 24.
+const EVEN_ODD_BYTES: u64 = 120;
 
 /// Repairs one geometry under `rule`, spending at most [`validity::MAX_WORK`] on each check and on
 /// the overlay, and asking `has_room` whether the browser can give the overlay's memory before it
@@ -847,19 +848,33 @@ fn open(ring: &[Coord]) -> &[Coord] {
     }
 }
 
+/// How far from 0, and how close together, coordinates may be for [`straight_through`]'s test to be
+/// exact: products of differences up to 4e200 and down to 1e-200, and the error terms Shewchuk's
+/// test adds below them, all stay within an f64's normal range.
+const EXACT_SPAN: f64 = 1e100;
+
 /// Whether `b`, between `a` and `c` in a ring, lies on the straight line from `a` to `c`, exactly
 /// (by Shewchuk's adaptive orientation test, as geo's robust kernel gives it: J. R. Shewchuk,
 /// "Adaptive precision floating-point arithmetic and fast robust geometric predicates", Discrete &
 /// Computational Geometry 18(3), 1997, 305–363), and strictly between them: a vertex in the middle
 /// of a straight edge, which doesn't change the ring. A spike, going back the way it came, isn't.
+///
+/// The test is exact only where its products neither overflow nor underflow (Shewchuk's own
+/// condition; past it, an overflow's NaN reads as collinear and an underflow's 0 as on the line):
+/// so only within [`EXACT_SPAN`] of 0, and with no two coordinates closer than its inverse but
+/// equal, is a vertex taken for one mid-edge. Elsewhere it stays a corner. Real coordinates, in
+/// degrees, meters or feet, are well inside.
 fn straight_through(a: Coord, b: Coord, c: Coord) -> bool {
     use geo::kernels::{Kernel, Orientation, RobustKernel};
     let g = |p: Coord| geo::Coord { x: p.x, y: p.y };
     let within = |lo: f64, v: f64, hi: f64| lo.min(hi) <= v && v <= lo.max(hi);
-    // The test assumes its products don't overflow: where they would (coordinates near 1e154 and
-    // beyond), its NaN reads as collinear, so the vertex is kept as a corner instead.
-    let det = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-    det.is_finite()
+    let small = |p: Coord| p.x.abs() <= EXACT_SPAN && p.y.abs() <= EXACT_SPAN;
+    let apart = |u: f64, v: f64| u == v || (u - v).abs() >= 1.0 / EXACT_SPAN;
+    let exact = small(a)
+        && small(b)
+        && small(c)
+        && [(a.x, b.x), (a.x, c.x), (b.x, c.x), (a.y, b.y), (a.y, c.y), (b.y, c.y)].iter().all(|&(u, v)| apart(u, v));
+    exact
         && b != a
         && b != c
         && within(a.x, b.x, c.x)
@@ -1098,11 +1113,15 @@ mod tests {
         assert_eq!(corner_count(&mid), 4);
         let past = ring(&[(0., 0.), (12., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.)]);
         assert_ne!(normal_form(&past, room).unwrap(), want);
-        // Where the orientation test would overflow (about 1e154 and beyond), a vertex off the line
-        // is a corner, not taken for one on it: these two triangles aren't one ring.
+        // Where the orientation test isn't exact (its products overflowing or underflowing), a
+        // vertex is a corner, never taken for one on the line, on it or not: these two triangles
+        // aren't one ring. Within its range, one on the line is mid-edge.
         let c = Coord::new;
         assert!(!straight_through(c(-1e200, -1e200), c(0., 0.5e200), c(1e200, 1e200)));
+        assert!(!straight_through(c(0., 0.), c(0., 1.), c(1e200, 1e200)), "off the line, overflowing");
+        assert!(!straight_through(c(0., 0.), c(1e-200, 1.5e-200), c(2e-200, 2e-200)), "off the line, underflowing");
         assert!(straight_through(c(-1e100, -1e100), c(0., 0.), c(1e100, 1e100)));
+        assert!(straight_through(c(0., 0.), c(1e-90, 1e-90), c(2e-90, 2e-90)));
         let t1 = ring(&[(-1e200, -1e200), (1e200, 1e200), (1e200, -1e200), (-1e200, -1e200)]);
         let t2 = ring(&[(-1e200, -1e200), (0., 0.5e200), (1e200, 1e200), (1e200, -1e200), (-1e200, -1e200)]);
         assert_ne!(normal_form(&t1, room).unwrap(), normal_form(&t2, room).unwrap());
