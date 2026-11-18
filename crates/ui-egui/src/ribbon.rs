@@ -1878,14 +1878,18 @@ fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
         app.session.notify(e, true);
     }
     let set = app.session.map().graticule_color.is_some();
-    let mut color = crate::theme::c32(app.session.map().graticule_rgba());
+    let current = app.session.map().graticule_rgba();
     ui.horizontal(|ui| {
         let name = ui.label(tl!("Grid color"));
-        // Named by its label, for a screen reader.
-        let resp = crate::widgets::color_button(ui, &mut color).on_hover_text(tl!("The grid's color and opacity")).labelled_by(name.id);
-        if resp.changed() {
+        // Named by its label, for a screen reader. The saved color's RGB is kept at no opacity
+        // (`rgba_button`), so raising only the opacity keeps the color.
+        let (resp, picked) = crate::widgets::rgba_button(ui, current);
+        let resp = resp.on_hover_text(tl!("The grid's color and opacity")).labelled_by(name.id);
+        if resp.changed()
+            && let Some(picked) = picked
+        {
             crate::widgets::one_step_per_press(app, &resp);
-            if let Err(e) = app.run("map.graticule", json!({"color": crate::theme::rgba(color).hex8()})) {
+            if let Err(e) = app.run("map.graticule", json!({"color": picked.hex8()})) {
                 app.session.notify(e, true);
             }
         }
