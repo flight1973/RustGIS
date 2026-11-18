@@ -767,7 +767,8 @@ Two more settings in the same menu apply to every type, and are saved with the m
   layers, so a filled layer hides them. With it on, they are drawn over every layer and tile
   layer, still under the labels. They then also draw over the highlights of selected features.
   The MGRS names are labels, so they're drawn over the layers either way, as the layers' own
-  labels are: a filled layer can hide the lines under a name but not the name.
+  labels are: a filled layer can hide the lines under a name but not the name. They go with the
+  lines when the grid's opacity is 0, and pause with the labels.
 - **Grid color** (`"color"`: `"#RRGGBB"` or `"#RRGGBBAA"`, with its opacity): the lines' color. By
   default it is the basemap's own grid color, which is faint; **Default** (`null` or `""` in the
   command) goes back to it. The MGRS names take the same color, fully opaque. Major and minor

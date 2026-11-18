@@ -1885,9 +1885,7 @@ fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
         // (`rgba_button`), so raising only the opacity keeps the color.
         let (resp, picked) = crate::widgets::rgba_button(ui, current);
         let resp = resp.on_hover_text(tl!("The grid's color and opacity")).labelled_by(name.id);
-        if resp.changed()
-            && let Some(picked) = picked
-        {
+        if let Some(picked) = picked {
             crate::widgets::one_step_per_press(app, &resp);
             if let Err(e) = app.run("map.graticule", json!({"color": picked.hex8()})) {
                 app.session.notify(e, true);
