@@ -24652,7 +24652,7 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
     for format in ["kml", "gpx"] {
         let n = said(&mut s, "data.convert", json!({"layer": "Rows", "format": format}));
         assert!(n.len() == 2 && n.iter().any(|t| t.contains("1 features without drawable geometry were left out")), "{format}: {n:?}");
-        let height = if format == "kml" { "no column for it: 'height'" } else { "1 field wasn't written: 'height'" };
+        let height = if format == "kml" { "no column of its own for it: 'height'" } else { "1 field wasn't written: 'height'" };
         assert!(n.iter().any(|t| t.contains(height)), "{format}: {n:?}");
     }
     // A standalone table keeps geometry too: Export Table says the same, and nothing for a clean one.

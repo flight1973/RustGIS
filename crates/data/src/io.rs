@@ -4081,9 +4081,9 @@ impl TextLosses {
         let n: usize = missing.iter().sum();
         if n > 0 {
             let what = if n == 1 {
-                "1 field is empty in every feature, so reading the file back has no column for it".to_string()
+                "1 field has no value in any feature written, so reading the file back has no column of its own for it".to_string()
             } else {
-                format!("{n} fields are empty in every feature, so reading the file back has no columns for them")
+                format!("{n} fields have no value in any feature written, so reading the file back has no columns of their own for them")
             };
             notes.push(format!("{target}: {what}: {}", named_fields(fields, &missing)));
         }
@@ -5932,7 +5932,7 @@ mod tests {
             [
                 "t: 3 text values start or end with spaces, tabs or line breaks, which reading the file back drops, in 'name', 'note'",
                 "t: 2 blank text values read back as empty (null), in 'name', 'code'",
-                "t: 1 field is empty in every feature, so reading the file back has no column for it: 'gone'",
+                "t: 1 field has no value in any feature written, so reading the file back has no column of its own for it: 'gone'",
             ]
         );
         assert_eq!(text_notes(&ds, "kmz"), text_notes(&ds, "kml"));
@@ -6053,7 +6053,7 @@ mod tests {
         for f in ds.features.iter_mut() {
             f.attrs[0] = Value::Null;
         }
-        assert_eq!(losses(&ds), ["t: 1 field is empty in every feature, so reading the file back has no column for it: 'title'"]);
+        assert_eq!(losses(&ds), ["t: 1 field has no value in any feature written, so reading the file back has no column of its own for it: 'title'"]);
         let clean = text_layer(&["title"], &[&[Some("a")], &[Some("b")]]);
         assert!(losses(&clean).is_empty());
     }
@@ -6083,7 +6083,7 @@ mod tests {
     fn a_kml_name_column_without_values_of_another_field_is_said() {
         let mut ds = text_layer(&["title", "name"], &[&[Some("a"), None], &[Some("b"), None]]);
         let losses = |ds: &Dataset| TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, "kml", Some(0)).notes(&ds.fields, "t");
-        assert_eq!(losses(&ds), ["t: 1 field is empty in every feature, so reading the file back has no column for it: 'name'"]);
+        assert_eq!(losses(&ds), ["t: 1 field has no value in any feature written, so reading the file back has no column of its own for it: 'name'"]);
         let back = crate::interop::to_kml(&ds, Some(0)).unwrap();
         let read = &crate::kml::read("t.kml", back.as_bytes()).unwrap()[0].dataset;
         let column = |n: &str| read.field_index(n).map(|i| read.features.iter().map(|f| f.attrs[i].clone()).collect::<Vec<_>>());
