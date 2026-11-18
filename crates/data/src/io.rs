@@ -5953,11 +5953,11 @@ mod tests {
         };
         let point = Geometry::Point(Coord::new(1.0, 2.0));
         assert_eq!(
-            gpx_notes(&layer(&[point.clone()]), None, "t"),
+            gpx_notes(&layer(std::slice::from_ref(&point)), None, "t"),
             ["t: GPX holds a name for each feature, so 1 field wasn't written: 'number'"]
         );
         assert_eq!(
-            gpx_notes(&layer(&[line.clone()]), None, "t"),
+            gpx_notes(&layer(std::slice::from_ref(&line)), None, "t"),
             ["t: GPX holds a name for each feature, so 1 field wasn't written: 'ele'"]
         );
         assert_eq!(
