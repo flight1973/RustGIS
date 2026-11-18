@@ -573,7 +573,7 @@ fn wider(mut polys: Vec<geo::Polygon<f64>>, step: f64, narrow: &mut usize, room:
 /// itself isn't related to its other rings or to other parts (see `Checked::unrelated`).
 type Found = Vec<Code>;
 
-/// What [`by_area`] made of a feature's parts.
+/// What [`by_area`] or [`by_parity`] made of a feature's parts.
 struct Rebuilt {
     /// The rings of the result.
     polys: Vec<Vec<Vec<Coord>>>,

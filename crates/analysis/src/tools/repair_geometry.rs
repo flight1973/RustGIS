@@ -304,7 +304,7 @@ fn notices(t: &Tally, field: &str, rule: Rule) -> Vec<String> {
     }
     if merged > 0 && rule == Rule::EvenOdd {
         messages.push(format!(
-            "{TOOL}: the parts that overlapped or touched along a line in {} were combined by the Even-Odd rule: where they overlapped is left out, except that a part repeated whole is kept once, and parts meeting along a line were joined into one",
+            "{TOOL}: the parts that overlapped or touched along a line in {} were combined by the Even-Odd rule, which leaves out where parts overlap, keeps a part repeated whole once, and joins parts that meet along a line",
             features(merged)
         ));
     }

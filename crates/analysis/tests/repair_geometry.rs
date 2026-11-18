@@ -1308,7 +1308,7 @@ fn even_odd_builds_part_by_part() {
     let side: Ring = &[(10., 0.), (20., 0.), (20., 10.), (10., 10.), (10., 0.)];
     let (got, repairs, messages) = one_by("Even-Odd", multi(&[&[SQUARE], &[side], &[far]]));
     assert!(repairs.contains("parts_overlap"), "{repairs}");
-    assert!(messages.iter().any(|m| m.contains("joined into one")), "{messages:?}");
+    assert!(messages.iter().any(|m| m.contains("joins parts that meet along a line")), "{messages:?}");
     assert_eq!(got.map(|g| area(&g)), Some(202.0));
 }
 
@@ -1319,7 +1319,7 @@ fn even_odd_notices_match_the_result() {
     let (got, repairs, messages) = one_by("Even-Odd", multi(&[&[SQUARE], &[SQUARE]]));
     assert_eq!(got.map(|g| area(&g)), Some(100.0), "{repairs}");
     assert!(messages.iter().any(|m| m.contains("1 duplicate ring was left out")), "{messages:?}");
-    assert!(messages.iter().any(|m| m.contains("a part repeated whole is kept once")), "{messages:?}");
+    assert!(messages.iter().any(|m| m.contains("keeps a part repeated whole once")), "{messages:?}");
     let left: Ring = &[(2., 2.), (6., 2.), (6., 6.), (2., 6.), (2., 2.)];
     let right: Ring = &[(4., 4.), (8., 4.), (8., 8.), (4., 8.), (4., 4.)];
     let (got, _, messages) = one_by("Even-Odd", poly(&[SQUARE, left, right]));
