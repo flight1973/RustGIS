@@ -2,6 +2,7 @@
 
 mod check_geometry;
 mod geometry;
+mod network_analysis;
 mod repair_geometry;
 mod tabulate_area;
 
@@ -278,6 +279,124 @@ pub static TOOLS: &[ToolSpec] = &[
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
         run: near,
+    },
+    ToolSpec {
+        id: "serviceArea",
+        name: "Service Area",
+        toolbox: "Analysis › Network",
+        summary: "Finds the lines reachable within one or more travel costs of points, along a line network.",
+        params: &[
+            P {
+                name: "network",
+                label: "Network Lines",
+                kind: K::VectorLayer,
+                required: true,
+                default: "",
+                help: "A line layer. Lines join where their vertices meet.",
+            },
+            P {
+                name: "facilities",
+                label: "Facilities",
+                kind: K::PointLayer,
+                required: true,
+                default: "",
+                help: "The points to measure from. Each is moved onto the nearest line.",
+            },
+            P {
+                name: "breaks",
+                label: "Breaks",
+                kind: K::Text,
+                required: true,
+                default: "\"1, 2, 5\"",
+                help: "Costs to stop at, separated by commas, in the units below. Each part of a line is labelled with the band it lies in and the facility nearest to it.",
+            },
+            P { name: "units", label: "Units", kind: K::Choice(UNITS), required: false, default: "\"Kilometers\"", help: "" },
+            P {
+                name: "costField",
+                label: "Cost Field",
+                kind: K::NumericField,
+                required: false,
+                default: "",
+                help: "Multiplies each line's length, so breaks count weighted distance. Empty counts the length alone; 0 or less closes a line.",
+            },
+            P {
+                name: "snapDistance",
+                label: "Snap Distance (m)",
+                kind: K::Number,
+                required: false,
+                default: "1000",
+                help: "How far a facility may be moved onto the network, in metres. Farther ones are left out.",
+            },
+            P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
+        ],
+        run: network_analysis::service_area,
+    },
+    ToolSpec {
+        id: "odCostMatrix",
+        name: "OD Cost Matrix",
+        toolbox: "Analysis › Network",
+        summary: "Measures the cost and length of the cheapest way along a line network from each origin to each destination.",
+        params: &[
+            P {
+                name: "network",
+                label: "Network Lines",
+                kind: K::VectorLayer,
+                required: true,
+                default: "",
+                help: "A line layer. Lines join where their vertices meet.",
+            },
+            P {
+                name: "origins",
+                label: "Origins",
+                kind: K::PointLayer,
+                required: true,
+                default: "",
+                help: "Each is moved onto the nearest line.",
+            },
+            P {
+                name: "destinations",
+                label: "Destinations",
+                kind: K::PointLayer,
+                required: true,
+                default: "",
+                help: "Each is moved onto the nearest line.",
+            },
+            P { name: "units", label: "Units", kind: K::Choice(UNITS), required: false, default: "\"Kilometers\"", help: "" },
+            P {
+                name: "costField",
+                label: "Cost Field",
+                kind: K::NumericField,
+                required: false,
+                default: "",
+                help: "Multiplies each line's length. Empty counts the length alone; 0 or less closes a line.",
+            },
+            P {
+                name: "cutoff",
+                label: "Cutoff",
+                kind: K::Number,
+                required: false,
+                default: "",
+                help: "Leaves out destinations costing more than this, in the units above. Empty: no limit.",
+            },
+            P {
+                name: "count",
+                label: "Destinations to Find",
+                kind: K::Number,
+                required: false,
+                default: "",
+                help: "Keeps only this many of the cheapest destinations from each origin. Empty: all.",
+            },
+            P {
+                name: "snapDistance",
+                label: "Snap Distance (m)",
+                kind: K::Number,
+                required: false,
+                default: "1000",
+                help: "How far an origin or destination may be moved onto the network, in metres. Farther ones are left out.",
+            },
+            P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
+        ],
+        run: network_analysis::od_cost_matrix,
     },
     ToolSpec {
         id: "convexHull",
@@ -691,6 +810,14 @@ pub static TOOLS: &[ToolSpec] = &[
                 required: false,
                 default: "\"km2\"",
                 help: "Square metres (m2), square kilometres (km2), hectares (ha), acres (ac), square feet (ft2) or square miles (mi2), as in Calculate Geometry and area(). The area field is named area_<unit>.",
+            },
+            P {
+                name: "includeEmptyZones",
+                label: "Include Empty Zones",
+                kind: K::Bool,
+                required: false,
+                default: "false",
+                help: "Keep one row for each polygon zone with no class overlap, even if the class layer is empty. Class fields are blank, and area, percentage and sum fields are zero. Off by default.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -6061,6 +6188,10 @@ struct TabulateCell {
 /// with no value in a sum field and, with sum fields, class features not wholly inside the zones,
 /// whose values are not wholly shared out.
 ///
+/// With `includeEmptyZones`, a polygon zone with no overlapping class gets one row with null class
+/// fields and zero area, percentage and sums. Progress and Cancel are checked between items; one
+/// zone mask, feature overlay or cell union can run as a single step.
+///
 /// Without zone fields, each feature is a separate zone, identified by `zone_row` (its zero-based
 /// input row); those zones stay in input order, including when a selection is used.
 /// The area defaults to `area_km2` and is measured on the ellipsoid, as Calculate Geometry
@@ -6079,6 +6210,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         }
     }
     let zone_keys = key_fields(zones, p.get("zoneFields"), "Zone Field")?;
+    let include_empty = p.get("includeEmptyZones").and_then(Json::as_bool).unwrap_or(false);
     let area_unit = p.get("areaUnit").and_then(Json::as_str).unwrap_or("km2");
     let area_divisor = Measure::Area.unit(area_unit).ok_or("unknown area unit")?;
     let class_keys = key_fields(classes, p.get("classFields"), "Class Field")?;
@@ -6152,17 +6284,18 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     let zone_list: Vec<TabulateZone> = zone_groups
         .into_iter()
         .map(|group| {
+            crate::control::check()?;
             let shapes: Vec<&Geometry> =
                 group.rows.iter().filter_map(|&r| zones.features.get(r)?.geometry.as_ref()).filter(|g| has_shape(g)).collect();
             let ext = shapes.iter().fold(Extent::EMPTY, |e, g| e.union(&g.extent()));
             let mask = mask_of(MultiPolygon::new(shapes.iter().filter_map(|g| to_multipolygon(g)).flat_map(|m| m.0).collect()));
             let map_area = from_multipolygon(&mask).map_or(0.0, |g| map_area_m2(&g));
             let merc_ext = merc_extent(&mask);
-            TabulateZone { key: group.key, ext, mask, merc_ext, map_area_m2: map_area }
+            Ok(TabulateZone { key: group.key, ext, mask, merc_ext, map_area_m2: map_area })
         })
-        .collect();
+        .collect::<Result<_, crate::control::Cancelled>>()?;
     let class_groups = crate::stats::group_rows(classes, &class_rows, &class_keys);
-    let index = ExtentIndex::new(zone_list.iter().map(|z| z.ext));
+    let index = ExtentIndex::with_checks(zone_list.iter().map(|z| z.ext), crate::control::check)?;
     let mut cells: std::collections::BTreeMap<(usize, usize), TabulateCell> = std::collections::BTreeMap::new();
     // For each sum field, the class features in some zone whose value isn't a number.
     let mut missing = vec![0usize; sum_fields.len()];
@@ -6175,14 +6308,20 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     // indices: neighbouring features near the same zones reuse them, as Clip reuses its masks.
     const MAX_CACHED_UNIONS: usize = 8;
     let mut near_unions: std::collections::VecDeque<(Vec<usize>, MultiPolygon<f64>)> = std::collections::VecDeque::new();
+    crate::control::begin(class_rows.len());
     for (ci, group) in class_groups.iter().enumerate() {
         for &r in &group.rows {
-            let Some(g) = classes.features.get(r).and_then(|f| f.geometry.as_ref()).filter(|g| has_shape(g)) else { continue };
+            crate::control::check()?;
+            let Some(g) = classes.features.get(r).and_then(|f| f.geometry.as_ref()).filter(|g| has_shape(g)) else {
+                crate::control::advance(1);
+                continue;
+            };
             let ext = g.extent();
             let near: Vec<usize> =
                 index.candidates(&ext).into_iter().filter(|&zi| zone_list.get(zi).is_some_and(|z| z.ext.intersects(&ext))).collect();
             if near.is_empty() {
                 outside += usize::from(!sum_fields.is_empty());
+                crate::control::advance(1);
                 continue;
             }
             // Overlapping parts of one feature are unioned once, so they count once.
@@ -6200,6 +6339,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
             let mut held = false;
             let mut cut_part = false;
             for &zi in &near {
+                crate::control::check()?;
                 let Some(zone) = zone_list.get(zi) else { continue };
                 // A cut that leaves nothing, or nothing with area, when the feature's interior meets
                 // the zone's lost that part to rounding. Only a feature the grid doesn't resolve can
@@ -6303,8 +6443,10 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
                 };
                 outside += usize::from(lies_outside);
             }
+            crate::control::advance(1);
         }
     }
+    crate::control::finish();
     let mut out = Dataset::new(
         out_name(p, format!("{}_Tabulate", zones.name)),
         GeometryType::None,
@@ -6326,39 +6468,60 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         let name = unique_field(&out, base);
         out.fields.push(Field::new(name, FieldType::Double));
     }
-    let mut zones_hit: HashSet<usize> = HashSet::new();
-    for ((zi, ci), cell) in cells {
-        let (Some(zone), Some(class)) = (zone_list.get(zi), class_groups.get(ci)) else { continue };
-        zones_hit.insert(zi);
-        // Parts of a class's features that overlap each other are unioned, so they count once.
-        let union;
-        let covered = match cell.parts.as_slice() {
-            [one] => one,
-            parts => {
-                let polys: Vec<MultiPolygon<f64>> = parts.iter().filter_map(to_multipolygon).collect();
-                let Some(g) = from_multipolygon(&union_all(polys.iter().flat_map(|m| m.0.iter()))) else {
-                    let key: Vec<String> = zone.key.iter().map(ToString::to_string).collect();
-                    return Err(format!(
-                        "Tabulate Intersection: the parts of a class in the zone '{}' could not be combined",
-                        key.join(", ")
-                    ));
-                };
-                union = g;
-                &union
+    let mut cells = cells.into_iter().peekable();
+    let mut omitted_zones = 0;
+    crate::control::begin(zone_list.len());
+    for (zi, zone) in zone_list.iter().enumerate() {
+        crate::control::check()?;
+        crate::control::reached(zi);
+        if cells.peek().is_none_or(|((index, _), _)| *index != zi) {
+            // A group without any polygon is counted by the missing-polygon notice.
+            if !zone.ext.is_empty() {
+                if include_empty {
+                    let mut row = zone.key.clone();
+                    row.extend(std::iter::repeat_n(Value::Null, class_keys.len()));
+                    row.extend(std::iter::repeat_n(Value::Float(0.0), 2 + sum_fields.len()));
+                    out.push_next(None, row);
+                } else {
+                    omitted_zones += 1;
+                }
             }
-        };
-        let mut row = zone.key.clone();
-        row.extend(class.key.iter().cloned());
-        if let Some(message) = rustgis_data::ambiguous_area_message(std::iter::once(covered)) {
-            return Err(format!("Tabulate Intersection: {message}"));
+            continue;
         }
-        row.push(Value::Float(ground_area_perimeter(covered).0 / area_divisor));
-        let covered_area = map_area_m2(covered);
-        row.push(if zone.map_area_m2 > 0.0 { Value::Float(covered_area / zone.map_area_m2 * 100.0) } else { Value::Null });
-        row.extend(cell.sums.into_iter().map(Value::Float));
-        // One past the last id: `push` would search them all for each row.
-        out.push_next(None, row);
+        while let Some(((_, ci), cell)) = cells.next_if(|((index, _), _)| *index == zi) {
+            crate::control::check()?;
+            let Some(class) = class_groups.get(ci) else { continue };
+            // Parts of a class's features that overlap each other are unioned, so they count once.
+            let union;
+            let covered = match cell.parts.as_slice() {
+                [one] => one,
+                parts => {
+                    let polys: Vec<MultiPolygon<f64>> = parts.iter().filter_map(to_multipolygon).collect();
+                    let Some(g) = from_multipolygon(&union_all(polys.iter().flat_map(|m| m.0.iter()))) else {
+                        let key: Vec<String> = zone.key.iter().map(ToString::to_string).collect();
+                        return Err(format!(
+                            "Tabulate Intersection: the parts of a class in the zone '{}' could not be combined",
+                            key.join(", ")
+                        ));
+                    };
+                    union = g;
+                    &union
+                }
+            };
+            let mut row = zone.key.clone();
+            row.extend(class.key.iter().cloned());
+            if let Some(message) = rustgis_data::ambiguous_area_message(std::iter::once(covered)) {
+                return Err(format!("Tabulate Intersection: {message}"));
+            }
+            row.push(Value::Float(ground_area_perimeter(covered).0 / area_divisor));
+            let covered_area = map_area_m2(covered);
+            row.push(if zone.map_area_m2 > 0.0 { Value::Float(covered_area / zone.map_area_m2 * 100.0) } else { Value::Null });
+            row.extend(cell.sums.into_iter().map(Value::Float));
+            // One past the last id: `push` would search them all for each row.
+            out.push_next(None, row);
+        }
     }
+    crate::control::finish();
     let mut messages = vec![match out.features.len() {
         1 => "Tabulate Intersection: 1 row".to_string(),
         n => format!("Tabulate Intersection: {n} rows"),
@@ -6370,8 +6533,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
             n => messages.push(format!("{n} {layer} features have no polygon and were left out")),
         }
     }
-    // Zones without geometry are counted above, not again here.
-    match zone_list.iter().enumerate().filter(|(zi, z)| !z.ext.is_empty() && !zones_hit.contains(zi)).count() {
+    match omitted_zones {
         0 => {}
         1 => messages.push("1 zone overlaps no class feature, so it has no rows".into()),
         n => messages.push(format!("{n} zones overlap no class feature, so they have no rows")),
