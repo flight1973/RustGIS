@@ -397,8 +397,19 @@ fn box_from_points(shp: &mut Option<super::Cursor>, buf: &mut Vec<u8>, path: &Pa
     Ok(usable(b).then_some(b))
 }
 
-fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Result<()>) -> Result<(u32, String)> {
-    let mut f = BufReader::with_capacity(BUFFER, crate::provenance::open(path)?);
+fn scan(path: &Path, len: u64, visit: impl FnMut(u32, Place, [f32; 4]) -> Result<()>) -> Result<(u32, String)> {
+    scan_from(BufReader::with_capacity(BUFFER, crate::provenance::open(path)?), len, visit)
+}
+
+/// [`scan`] of a reader `len` bytes long. A file that ends before then (cut, or changed since its
+/// length was taken) keeps the records read before it, with a note saying from which record the
+/// rest are left out; any other error reading it is an error, so no index is built (nor kept) on
+/// what was read before it.
+fn scan_from<R: Read + std::io::Seek>(
+    mut f: BufReader<R>,
+    len: u64,
+    mut visit: impl FnMut(u32, Place, [f32; 4]) -> Result<()>,
+) -> Result<(u32, String)> {
     f.seek_relative(100)?;
     let mut pos = 100u64;
     let mut count = 0u32;
@@ -414,12 +425,18 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
             crate::progress::check()?;
         }
         let want = (len - pos).min(head.len() as u64) as usize;
-        // A read that fails here (the file cut or changed since its length was taken, or an I/O
-        // error) leaves out the rest, said as a cut file is.
-        let unread = |n: u32| format!("the .shp couldn't be read from record {n}; the rest are left out");
+        // The file ending early (cut, or changed since its length was taken) leaves out the rest,
+        // said; another error is one.
+        let unread = |e: std::io::Error, n: u32| -> Result<String> {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                Ok(format!("the .shp couldn't be read from record {n}; the rest are left out"))
+            } else {
+                Err(e.into())
+            }
+        };
         let Some(buf) = head.get_mut(..want) else { break };
-        if f.read_exact(buf).is_err() {
-            note = unread(count + 1);
+        if let Err(e) = f.read_exact(buf) {
+            note = unread(e, count + 1)?;
             break;
         }
         let bytes = u64::try_from(be_i32(&head, 4).unwrap_or(-1)).unwrap_or(u64::MAX).saturating_mul(2);
@@ -449,8 +466,8 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
             starts.clear();
             starts.extend_from_slice(c);
             starts.resize(c.len() + more, 0);
-            if f.read_exact(starts.get_mut(c.len()..).unwrap_or(&mut [])).is_err() {
-                note = unread(count + 1);
+            if let Err(e) = f.read_exact(starts.get_mut(c.len()..).unwrap_or(&mut [])) {
+                note = unread(e, count + 1)?;
                 break;
             }
             let b = record_box(&starts, bytes);
@@ -466,12 +483,8 @@ fn scan(path: &Path, len: u64, mut visit: impl FnMut(u32, Place, [f32; 4]) -> Re
         count += 1;
         pos = content + bytes;
         let read = (want as u64).saturating_sub(8) + more as u64;
-        if f.seek_relative(bytes as i64 - read as i64).is_err() {
-            if pos + 8 <= len {
-                note = unread(count + 1);
-            }
-            break;
-        }
+        // A seek that fails is no file ending early: an error.
+        f.seek_relative(bytes as i64 - read as i64)?;
     }
     Ok((count, note))
 }
@@ -660,6 +673,44 @@ mod tests {
         let scan = Index::scanning(&path, len, &mut notes).unwrap();
         assert_eq!(scan.count, 3);
         assert!(notes.iter().any(|n| n.contains("couldn't be read from record 4; the rest are left out")), "{notes:?}");
+    }
+
+    /// An error reading the records that isn't the file ending (a network drive gone, EIO) is an
+    /// error, not a cut file: nothing is built on what was read before it, nor cached.
+    #[test]
+    fn an_io_error_partway_is_an_error_not_a_cut_file() {
+        use std::io::{Cursor, Seek, SeekFrom};
+        struct Failing(Cursor<Vec<u8>>, u64);
+        impl Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0.position() >= self.1 {
+                    return Err(std::io::Error::other("the drive went away"));
+                }
+                let n = buf.len().min((self.1 - self.0.position()) as usize);
+                self.0.read(&mut buf[..n])
+            }
+        }
+        impl Seek for Failing {
+            fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(to)
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pts.shp");
+        let mut ds = Dataset::new("pts", GeometryType::Point, vec![]);
+        for i in 0..5 {
+            ds.push(Some(Geometry::Point(Coord::new(10.0 + f64::from(i), 20.0))), vec![]);
+        }
+        crate::io::write_path(&ds, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let len = bytes.len() as u64;
+        // Failing from the third record on (records of 28 bytes from 100).
+        let reader = BufReader::with_capacity(64, Failing(Cursor::new(bytes.clone()), 160));
+        let got = scan_from(reader, len, |_, _, _| Ok(()));
+        assert!(matches!(got, Err(crate::DataError::Io(_))), "{got:?}");
+        // The same bytes, read whole: every record.
+        let reader = BufReader::with_capacity(64, Failing(Cursor::new(bytes), u64::MAX));
+        assert_eq!(scan_from(reader, len, |_, _, _| Ok(())).unwrap(), (5, String::new()));
     }
 
     /// Canceled while the records are scanned, an index build stops the open: no scan in its
