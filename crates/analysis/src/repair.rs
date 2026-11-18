@@ -171,10 +171,12 @@ impl Rule {
 /// The memory, per vertex, that [`Rule::EvenOdd`] holds besides the overlay's
 /// ([`OVERLAY_BYTES`]), at most, while [`distinct_rings`] finds duplicates: each ring's normal form
 /// kept (16), and while one is made its two readings (32), Booth's failure table (16), a rotation
-/// (16) and the least so far (16); and, held with them, a part's holes listed (24 a ring), with
-/// their corner counts (32), the ids kept (8) and their keys (32): 96 a ring, a ring at least 4
-/// vertices, so 24.
-const EVEN_ODD_BYTES: u64 = 120;
+/// (16) and the least so far (16; the table and the rotation are never held together); and, held
+/// with them, a ring's place in `keep` (16), a part's holes listed (24 a ring), with their corner
+/// counts (32), the ids kept (8) and their keys (32, up to twice that as a growing list reserves),
+/// a ring at least 4 vertices. At most about 116 a vertex for large rings, about 48 for many small
+/// ones; 128 leaves room.
+const EVEN_ODD_BYTES: u64 = 128;
 
 /// Repairs one geometry under `rule`, spending at most [`validity::MAX_WORK`] on each check and on
 /// the overlay, and asking `has_room` whether the browser can give the overlay's memory before it
@@ -848,9 +850,12 @@ fn open(ring: &[Coord]) -> &[Coord] {
     }
 }
 
-/// How far from 0, and how close together, coordinates may be for [`straight_through`]'s test to be
-/// exact: products of differences up to 4e200 and down to 1e-200, and the error terms Shewchuk's
-/// test adds below them, all stay within an f64's normal range.
+/// How far from 0, how near it, and how close together coordinates may be for
+/// [`straight_through`]'s test to be exact: each 0 or between `1 / EXACT_SPAN` and `EXACT_SPAN` in
+/// size, and any two on one axis equal or at least `1 / EXACT_SPAN` apart. The differences'
+/// products then run from 1e-200 to 4e200, and the rounding tails the test's later stages
+/// multiply together (each at least about 1e-116, from a coordinate or difference of 1e-100) stay
+/// within an f64's normal range too.
 const EXACT_SPAN: f64 = 1e100;
 
 /// Whether `b`, between `a` and `c` in a ring, lies on the straight line from `a` to `c`, exactly
@@ -868,7 +873,8 @@ fn straight_through(a: Coord, b: Coord, c: Coord) -> bool {
     use geo::kernels::{Kernel, Orientation, RobustKernel};
     let g = |p: Coord| geo::Coord { x: p.x, y: p.y };
     let within = |lo: f64, v: f64, hi: f64| lo.min(hi) <= v && v <= lo.max(hi);
-    let small = |p: Coord| p.x.abs() <= EXACT_SPAN && p.y.abs() <= EXACT_SPAN;
+    let sized = |v: f64| v == 0.0 || (1.0 / EXACT_SPAN..=EXACT_SPAN).contains(&v.abs());
+    let small = |p: Coord| sized(p.x) && sized(p.y);
     let apart = |u: f64, v: f64| u == v || (u - v).abs() >= 1.0 / EXACT_SPAN;
     let exact = small(a)
         && small(b)
@@ -1120,6 +1126,11 @@ mod tests {
         assert!(!straight_through(c(-1e200, -1e200), c(0., 0.5e200), c(1e200, 1e200)));
         assert!(!straight_through(c(0., 0.), c(0., 1.), c(1e200, 1e200)), "off the line, overflowing");
         assert!(!straight_through(c(0., 0.), c(1e-200, 1.5e-200), c(2e-200, 2e-200)), "off the line, underflowing");
+        // A tiny coordinate beside ordinary ones, where the test's later stages would underflow: off
+        // the line by 1e-400, which the test would read as 0.
+        assert!(!straight_through(c(1e-200, -1.), c(0.5, -1e-200), c(1., 1.)), "a tiny coordinate");
+        // Ordinary data, floating-point noise near 0 included, is within the test's range.
+        assert!(straight_through(c(0., 0.), c(6e-17, 6e-17), c(1., 1.)));
         assert!(straight_through(c(-1e100, -1e100), c(0., 0.), c(1e100, 1e100)));
         assert!(straight_through(c(0., 0.), c(1e-90, 1e-90), c(2e-90, 2e-90)));
         let t1 = ring(&[(-1e200, -1e200), (1e200, 1e200), (1e200, -1e200), (-1e200, -1e200)]);
