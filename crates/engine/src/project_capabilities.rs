@@ -279,8 +279,19 @@ fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
 }
 
 fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static str> {
-    let (mut block, mut water, mut shore, mut relief, mut light, mut legends, mut sized, mut pictures, mut mgrs, mut on_top, mut grid_color) =
-        (false, false, false, false, false, false, false, false, false, false, false);
+    let (
+        mut block,
+        mut water,
+        mut shore,
+        mut relief,
+        mut light,
+        mut legends,
+        mut sized,
+        mut pictures,
+        mut mgrs,
+        mut on_top,
+        mut grid_color,
+    ) = (false, false, false, false, false, false, false, false, false, false, false);
     for map in maps {
         // An older reader doesn't know the MGRS graticule (#1042 piece 8): it refuses the
         // project by name rather than failing to read the type.
