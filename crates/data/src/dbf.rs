@@ -307,8 +307,8 @@ pub(crate) fn date(field: &[u8]) -> std::result::Result<Option<crate::date::Date
 }
 
 /// A code-page label should be a few bytes. Bound reads even for a hostile sidecar.
-pub(crate) fn read_cpg(path: &std::path::Path, notes: &mut Vec<String>) -> Option<Vec<u8>> {
-    match try_read_cpg(path) {
+pub(crate) fn read_cpg(cpg: Option<&std::path::Path>, notes: &mut Vec<String>) -> Option<Vec<u8>> {
+    match try_read_cpg(cpg?) {
         Ok(bytes) => bytes,
         Err(e) => {
             notes.push(format!("Shapefile: could not read .cpg ({e}); using the .dbf code page, or UTF-8 if unavailable"));
@@ -317,27 +317,21 @@ pub(crate) fn read_cpg(path: &std::path::Path, notes: &mut Vec<String>) -> Optio
     }
 }
 
-/// Every ASCII case of the `.cpg` extension, the conventional spellings first: tried in turn,
-/// without scanning a potentially large directory, and the first there wins.
-pub(crate) const CPG_SPELLINGS: [&str; 8] = ["cpg", "CPG", "Cpg", "cPg", "cpG", "CPg", "CpG", "cPG"];
-
-fn try_read_cpg(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
+/// The `.cpg` at `cpg`, as [`crate::sidecar::Sidecars`] finds it beside a table.
+fn try_read_cpg(cpg: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
-    for ext in CPG_SPELLINGS {
-        match crate::provenance::open(path.with_extension(ext)) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                (&file).take(MAX_CPG_BYTES as u64 + 1).read_to_end(&mut bytes)?;
-                if bytes.len() <= MAX_CPG_BYTES {
-                    crate::provenance::buffer(&path.with_extension(ext), &file, &bytes);
-                }
-                return Ok(Some(bytes));
+    match crate::provenance::open(cpg) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            (&file).take(MAX_CPG_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() <= MAX_CPG_BYTES {
+                crate::provenance::buffer(cpg, &file, &bytes);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Ok(Some(bytes))
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
     }
-    Ok(None)
 }
 
 #[cfg(test)]

@@ -1712,10 +1712,10 @@ fn read_ascii(path: &Path, text: &str, name: &str, nodata: Option<f64>) -> Resul
 /// doesn't understand is an error instead, because the grid would land in the wrong place as
 /// longitude/latitude.
 fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
-    let Some(prj) = read_prj(path) else {
+    let found = prj_path(path);
+    let Some(prj) = found.as_deref().and_then(read_prj_file) else {
         // One that is there but can't be read as text (not UTF-8, too large to be one) is said too.
-        let there = prj_path(path).is_some();
-        return Ok((None, there.then(|| "it can't be read as text".to_string())));
+        return Ok((None, found.is_some().then(|| "it can't be read as text".to_string())));
     };
     match wkt::read_wkt(&prj) {
         Ok((crs, note)) => {
@@ -1774,16 +1774,20 @@ fn world_placement(
     Ok((affine, transformer))
 }
 
-/// The `.prj` next to a file, in lower or upper case (`.PRJ`, beside an `IMAGE.TFW`), for file
-/// systems that tell them apart.
+/// The `.prj` next to a file, in whichever case it is spelled (`.PRJ`, beside an `IMAGE.TFW`),
+/// for file systems that tell them apart.
 fn prj_path(path: &Path) -> Option<std::path::PathBuf> {
-    ["prj", "PRJ"].into_iter().map(|e| path.with_extension(e)).find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+    crate::sidecar::find_one(path, "prj")
 }
 
 /// The text of the `.prj` next to a file (`None` when there's none, or it's too large to be one).
 pub fn read_prj(path: &Path) -> Option<String> {
-    let prj = prj_path(path)?;
-    let meta = std::fs::metadata(&prj).ok()?;
+    read_prj_file(&prj_path(path)?)
+}
+
+/// The text of the `.prj` at `prj` (`None` when it isn't a file, or it's too large to be one).
+pub(crate) fn read_prj_file(prj: &Path) -> Option<String> {
+    let meta = std::fs::metadata(prj).ok()?;
     if !meta.is_file() || meta.len() > 1 << 20 {
         return None;
     }

@@ -762,6 +762,10 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     let mut dbf_notes = Vec::new();
     if shapefile {
         dbf_notes.extend(rustgis_data::io::shapefile_names_note(&ds.fields, path));
+        // A part there under another spelling too (`ROADS.dbf` beside `ROADS.DBF`) is kept.
+        if ext == "shp" {
+            dbf_notes.extend(rustgis_data::io::shapefile_spellings_note(Path::new(path)));
+        }
         dbf_notes.extend(rustgis_data::io::shapefile_values_notes(ds, path));
         dbf_notes.extend(rustgis_data::io::shapefile_geometry_notes(ds, path, crs));
     }

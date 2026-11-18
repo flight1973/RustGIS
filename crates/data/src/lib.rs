@@ -46,6 +46,7 @@ pub mod raster;
 pub mod s3_address;
 pub mod secrets;
 pub mod sheets;
+mod sidecar;
 pub mod source;
 pub mod source_layers;
 pub mod sqlite;

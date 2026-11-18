@@ -94,25 +94,58 @@ pub fn is_syncable(path: &str) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::{FileStamp, FileSync};
+    use crate::sidecar::Sidecars;
     use crate::{DataError, Result};
     use std::path::{Path, PathBuf};
 
     /// The files of the source at `path`, each as a name beside it and its path: for a
-    /// Shapefile the companions its reader opens (the `.cpg` in whichever case is there, else
-    /// `.cpg`), otherwise the file alone.
+    /// Shapefile the parts [`FileSync::parts_of`] names, otherwise the file alone.
     fn parts(path: &Path) -> Vec<(String, PathBuf)> {
-        let mut paths = vec![path.to_path_buf()];
         if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("shp")) {
-            // The table in whichever case the reader finds it.
-            paths.extend([path.with_extension("shx"), crate::io::dbf_sidecar(path), path.with_extension("prj")]);
-            let cpg = crate::dbf::CPG_SPELLINGS
-                .iter()
-                .map(|e| path.with_extension(e))
-                .find(|p| p.is_file())
-                .unwrap_or_else(|| path.with_extension("cpg"));
-            paths.push(cpg);
+            return FileSync::parts_of(&Sidecars::shapefile(path));
         }
+        named(vec![path.to_path_buf()])
+    }
+
+    /// Each path with its file name.
+    fn named(paths: Vec<PathBuf>) -> Vec<(String, PathBuf)> {
         paths.into_iter().map(|p| (p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), p)).collect()
+    }
+
+    /// The part of `now` that a recorded `name` is: the one of that name, else the one whose name
+    /// differs from it only in ASCII case. A record made where the file system ignores case, or
+    /// before parts were found in any case, can name `ROADS.shx` for what is `ROADS.SHX` now; the
+    /// two are taken for one file, unchanged only when its size and hash are those recorded.
+    fn part_named<'a>(now: &'a [(String, PathBuf)], name: &str) -> Option<&'a (String, PathBuf)> {
+        now.iter().find(|(n, _)| n == name).or_else(|| now.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)))
+    }
+
+    /// Whether the record's `name`, recorded missing, is an index an older RustGIS couldn't see:
+    /// before #1958 a record of `ROADS.SHP` looked for its `.shx` in lower case only, so
+    /// `ROADS.shx` was recorded missing while `ROADS.SHX` was there. This RustGIS names a missing
+    /// part of an upper-case `.SHP` in upper case, so such an entry only comes from an older one,
+    /// and says nothing of the file there now (`now`). It isn't counted as a change: a `.shx`
+    /// holds only where each record of the `.shp` is, which a publish writes again from the
+    /// `.shp`, so writing over it loses nothing. Its `.prj` was recorded the same way, but isn't
+    /// taken so: a publish reads the file in the layer's system, so a `.prj` changed since would
+    /// be written over unseen; such a layer is refused once, and publishes once added again.
+    fn missed_by_an_older_lookup(
+        files: &[(String, Option<FileStamp>)],
+        name: &str,
+        was: &Option<FileStamp>,
+        now: &(String, PathBuf),
+    ) -> bool {
+        let upper_set = files
+            .first()
+            .and_then(|(n, _)| n.rsplit_once('.'))
+            .is_some_and(|(_, e)| !e.is_empty() && !e.bytes().any(|b| b.is_ascii_lowercase()));
+        was.is_none() && upper_set && name.ends_with(".shx") && now.0 != name && now.1.exists()
+    }
+
+    /// The name a differing file is reported under: the one it has now when it is there (a part
+    /// added as `a.CPG` where `a.cpg` was recorded missing), else the one recorded.
+    fn shown(recorded: &str, now: &(String, PathBuf)) -> String {
+        if now.1.exists() { now.0.clone() } else { recorded.to_string() }
     }
 
     /// The file's size, or `None` when it isn't there.
@@ -173,9 +206,23 @@ mod native {
         /// the bytes written to it) by those bytes, so a write made since by someone else isn't
         /// taken for this one; any other part as it is on the disk.
         pub fn of_written(path: &Path, written: &[(PathBuf, Vec<u8>)]) -> Result<FileSync> {
+            FileSync::of_written_among(&parts(path), written)
+        }
+
+        /// The parts of a Shapefile a record keeps, each as a name and its path, as `files` found
+        /// them: the `.shp`, then its `.shx`, `.dbf`, `.prj` and `.cpg` each in whichever case is
+        /// there, else as a new one would be named.
+        pub(crate) fn parts_of(files: &Sidecars) -> Vec<(String, PathBuf)> {
+            let mut paths = vec![files.file().to_path_buf()];
+            paths.extend(crate::sidecar::SHAPEFILE_COMPANIONS.map(|ext| files.path(ext)));
+            named(paths)
+        }
+
+        /// As [`FileSync::of_written`], with the source's parts as [`FileSync::parts_of`] gives them.
+        pub(crate) fn of_written_among(now: &[(String, PathBuf)], written: &[(PathBuf, Vec<u8>)]) -> Result<FileSync> {
             use sha2::Digest;
             let mut files = Vec::new();
-            for (name, p) in parts(path) {
+            for (name, p) in now.iter().cloned() {
                 let stamp = match written.iter().find(|(w, _)| *w == p) {
                     Some((_, bytes)) => Some(FileStamp {
                         len: bytes.len() as u64,
@@ -212,25 +259,33 @@ mod native {
         /// whole and hashed, so its work grows with the file: a caller on the desktop's UI
         /// thread does it on a thread of its own. Errs only when the run is cancelled.
         pub fn changed(&self, path: &Path) -> Result<Vec<String>> {
-            let now = parts(path);
+            self.changed_among(&parts(path))
+        }
+
+        /// As [`FileSync::changed`], with the source's parts as [`FileSync::parts_of`] gives them.
+        pub(crate) fn changed_among(&self, now: &[(String, PathBuf)]) -> Result<Vec<String>> {
             let mut changed = Vec::new();
-            // Files there now that the record lacks (a `.cpg` added in another case); not the
-            // `.cpg` name `parts` falls back to when there is none.
-            for (name, p) in &now {
-                if !self.files.iter().any(|(n, _)| n == name) && p.exists() {
+            // Files there now under a name the record has in no case; not a name `parts` gives
+            // for a part that isn't there.
+            for (name, p) in now {
+                if !self.files.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) && p.exists() {
                     changed.push(name.clone());
                 }
             }
             let total = self.files.iter().filter_map(|(_, s)| s.as_ref()).map(|s| s.len).sum();
             crate::progress::begin(count(total));
             for (name, was) in &self.files {
-                let Some((_, p)) = now.iter().find(|(n, _)| n == name) else {
+                let Some(part) = part_named(now, name) else {
                     // Out of the set now: changed if it held anything.
                     if was.is_some() {
                         changed.push(name.clone());
                     }
                     continue;
                 };
+                if missed_by_an_older_lookup(&self.files, name, was, part) {
+                    continue;
+                }
+                let p = &part.1;
                 let same = match (was, len(p)) {
                     (None, Ok(None)) => true,
                     (Some(was), Ok(Some(len))) if len == was.len => match sha256(p) {
@@ -241,7 +296,7 @@ mod native {
                     _ => false,
                 };
                 if !same {
-                    changed.push(name.clone());
+                    changed.push(shown(name, part));
                 }
             }
             Ok(changed)
@@ -252,17 +307,23 @@ mod native {
         /// isn't seen; [`FileSync::changed`] hashes them. An unreadable file counts as differing.
         pub fn resized(&self, path: &Path) -> Vec<String> {
             let now = parts(path);
-            let mut differ: Vec<String> =
-                now.iter().filter(|(name, p)| !self.files.iter().any(|(n, _)| n == name) && p.exists()).map(|(n, _)| n.clone()).collect();
+            let mut differ: Vec<String> = now
+                .iter()
+                .filter(|(name, p)| !self.files.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) && p.exists())
+                .map(|(n, _)| n.clone())
+                .collect();
             for (name, was) in &self.files {
-                let is = now.iter().find(|(n, _)| n == name).map(|(_, p)| len(p));
-                let same = match (was, is) {
+                let part = part_named(&now, name);
+                if part.is_some_and(|part| missed_by_an_older_lookup(&self.files, name, was, part)) {
+                    continue;
+                }
+                let same = match (was, part.map(|(_, p)| len(p))) {
                     (None, None | Some(Ok(None))) => true,
                     (Some(was), Some(Ok(Some(len)))) => len == was.len,
                     _ => false,
                 };
                 if !same {
-                    differ.push(name.clone());
+                    differ.push(part.map_or_else(|| name.clone(), |part| shown(name, part)));
                 }
             }
             differ
@@ -351,6 +412,44 @@ mod tests {
         let cpg = sync.files.iter_mut().find(|(n, _)| n == "a.cpg").unwrap();
         *cpg = ("a.CPG".into(), Some(FileStamp { len: 5, sha256: "00".into() }));
         assert_eq!(sync.changed(&path).unwrap(), ["a.CPG"]);
+    }
+
+    /// A record naming `a.shx` for what is `a.SHX` now is the same file when its size and hash
+    /// are those recorded, and changed when they aren't, said under the name it has now.
+    #[test]
+    fn a_part_recorded_in_another_case_is_compared_by_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for ext in ["shp", "SHX", "dbf"] {
+            std::fs::write(d.join(format!("a.{ext}")), ext.to_ascii_lowercase()).unwrap();
+        }
+        let path = d.join("a.shp");
+        let mut sync = FileSync::read(&path).unwrap();
+        let shx = sync.files.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case("a.shx")).unwrap();
+        assert_eq!(shx.0, "a.SHX");
+        shx.0 = "a.shx".into();
+        assert!(sync.changed(&path).unwrap().is_empty());
+        assert!(sync.resized(&path).is_empty());
+        std::fs::write(d.join("a.SHX"), "SHX").unwrap();
+        assert_eq!(sync.changed(&path).unwrap(), ["a.SHX"]);
+        std::fs::write(d.join("a.SHX"), "shx!").unwrap();
+        assert_eq!(sync.resized(&path), ["a.SHX"]);
+    }
+
+    /// A `.cpg` added in another case than the one recorded missing is said under its own name.
+    #[test]
+    fn a_part_added_in_another_case_is_named_as_it_is_spelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for ext in ["shp", "shx", "dbf"] {
+            std::fs::write(d.join(format!("a.{ext}")), ext).unwrap();
+        }
+        let path = d.join("a.shp");
+        let sync = FileSync::read(&path).unwrap();
+        assert!(sync.files.iter().any(|(n, s)| n == "a.cpg" && s.is_none()));
+        std::fs::write(d.join("a.CPG"), "UTF-8").unwrap();
+        assert_eq!(sync.changed(&path).unwrap(), ["a.CPG"]);
+        assert_eq!(sync.resized(&path), ["a.CPG"]);
     }
 
     #[test]

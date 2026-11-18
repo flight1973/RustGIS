@@ -30,7 +30,7 @@ fn bad(msg: impl std::fmt::Display) -> DataError {
 
 /// The number of records a Shapefile holds, from the size of its `.shx` (without reading it).
 pub fn record_count(path: &Path) -> Option<u64> {
-    let len = std::fs::metadata(path.with_extension("shx")).ok()?.len();
+    let len = std::fs::metadata(crate::sidecar::find_one(path, "shx")?).ok()?.len();
     Some(len.checked_sub(100)? / 8)
 }
 
@@ -89,13 +89,14 @@ impl ShpSource {
         if let Some(c) = crs {
             c.transformer().map_err(DataError::Format)?;
         }
-        let dbf = crate::io::dbf_sidecar(path);
+        let files = crate::sidecar::Sidecars::shapefile(path);
+        let dbf = files.path("dbf");
         if !dbf.is_file() {
             return Err(bad(format!("{} is missing", dbf.display())));
         }
         let mut notes = Vec::new();
         let table = read_table(&dbf)?;
-        let cpg = crate::dbf::read_cpg(path, &mut notes);
+        let cpg = crate::dbf::read_cpg(files.existing("cpg"), &mut notes);
         let encoding = crate::dbf::encoding(cpg.as_deref(), table.ldid, &mut notes);
         let shp_len = std::fs::metadata(path)?.len();
         if shp_len > u64::from(u32::MAX) {
@@ -127,7 +128,7 @@ impl ShpSource {
         }
         let reproject = match crs {
             Some(c) => Reproject::from_crs(c, &mut notes),
-            None => shp_reproject(crate::raster::read_prj(path).as_deref(), &mut notes)?,
+            None => shp_reproject(files.existing("prj").and_then(crate::raster::read_prj_file).as_deref(), &mut notes)?,
         };
         // The records' own boxes frame the layer, as the index holds them (rounded outward to f32);
         // with none (no records, or every shape null, empty or not a number) it has no extent,

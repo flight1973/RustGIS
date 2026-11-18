@@ -386,7 +386,7 @@ pub fn read_path(path: &Path) -> Result<(Dataset, ReadReport)> {
         "dbf" => {
             check_size(path)?;
             let mut notes = Vec::new();
-            let cpg = crate::dbf::read_cpg(path, &mut notes);
+            let cpg = crate::dbf::read_cpg(crate::sidecar::find_one(path, "cpg").as_deref(), &mut notes);
             let (ds, mut report) = read_dbf(std::fs::read(path)?, cpg.as_deref(), &name, &mut csv_memory_budget())?;
             report.messages.extend(notes);
             (ds, report)
@@ -688,10 +688,34 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
             }
         }
         "shp" => {
+            // Each part under the name it has (`ROADS.DBF`), a new one in the case of the `.shp`.
+            let files = crate::sidecar::Sidecars::shapefile(path);
+            if let Some(other) = files.other_shp() {
+                return Err(DataError::Format(format!(
+                    "{}: {} is there too, a Shapefile of the same name in another case whose parts can't be told from this one's; rename one of them; nothing was written",
+                    path.display(),
+                    other.display()
+                )));
+            }
             crate::progress::begin(ds.features.len());
             let (parts, left_out) = shapefile_parts_in(ds, crs)?;
-            let parts: Vec<(std::path::PathBuf, Vec<u8>)> = parts.into_iter().map(|(e, bytes)| (shapefile_part(path, e), bytes)).collect();
-            place_shapefile(path, &stage_shapefile(&parts)?)?;
+            // A system no `.prj` can describe: the old file's `.prj` would say another one.
+            if !parts.iter().any(|(e, _)| *e == "prj")
+                && let Some(prj) = files.existing("prj")
+            {
+                return Err(DataError::Format(format!(
+                    "{}: {} has no .prj form, and {} would go on saying the old file's system; remove it or save to another name; nothing was written",
+                    path.display(),
+                    crs.label(),
+                    prj.display()
+                )));
+            }
+            // Its spatial indexes would no longer match; another spelling of a part stays, as
+            // [`shapefile_spellings_note`] says.
+            let stale: Vec<std::path::PathBuf> =
+                crate::sidecar::SHAPEFILE_INDEXES.iter().flat_map(|e| files.spellings(e)).map(Path::to_path_buf).collect();
+            let parts: Vec<(std::path::PathBuf, Vec<u8>)> = parts.into_iter().map(|(e, bytes)| (files.path(e), bytes)).collect();
+            place_shapefile(files.file(), &stage_shapefile(&parts)?, &stale)?;
             Ok((left_out, None))
         }
         _ if crs != Crs::LonLat && !PROJECTED_FORMATS.contains(&ext.as_str()) => {
@@ -703,12 +727,6 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
             Ok((left_out, None))
         }
     }
-}
-
-/// The path of the part with extension `ext` of the Shapefile at `path`: the `.shp` keeps the
-/// name given (`Roads.SHP` stays so); the others take its stem.
-pub(crate) fn shapefile_part(path: &Path, ext: &str) -> std::path::PathBuf {
-    if ext == "shp" { path.to_path_buf() } else { path.with_extension(ext) }
 }
 
 /// Writes each of a Shapefile's parts (its path and bytes) to a temporary file beside it, synced
@@ -742,9 +760,14 @@ pub(crate) fn unstage(staged: &[(std::path::PathBuf, std::path::PathBuf)]) {
 /// Renames each staged part of the Shapefile at `path` ([`stage_shapefile`]) into place, the
 /// `.shp` last, so a failed write leaves the old Shapefile whole: each old part is moved aside
 /// first and put back if any new part fails to land, and a Cancel before the last part lands
-/// rolls back the same way. Once all have landed, the old parts and the spatial indexes that
-/// would no longer match (`.qix`, `.sbn`, `.sbx`) are removed.
-pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::path::PathBuf)]) -> Result<()> {
+/// rolls back the same way. Once all have landed, the old parts and the `stale` files (the
+/// spatial indexes that would no longer match, `.qix`, `.sbn`, `.sbx`, and any other the caller
+/// replaces) are removed.
+pub(crate) fn place_shapefile(
+    path: &Path,
+    staged: &[(std::path::PathBuf, std::path::PathBuf)],
+    stale: &[std::path::PathBuf],
+) -> Result<()> {
     let mut written: Vec<&(std::path::PathBuf, std::path::PathBuf)> = staged.iter().collect();
     written.sort_by_key(|(_, target)| target == path);
     let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
@@ -808,16 +831,8 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
         let _ = std::fs::remove_file(bak);
     }
     // A spatial index left from an older file of the same name would no longer match.
-    for stale in ["qix", "sbn", "sbx"] {
-        // Sidecars may use any letter case, even beside a lowercase `.shp`.
-        for capitals in 0..8 {
-            let extension: String = stale
-                .bytes()
-                .enumerate()
-                .map(|(i, b)| char::from(if capitals & (1 << i) == 0 { b } else { b.to_ascii_uppercase() }))
-                .collect();
-            let _ = std::fs::remove_file(path.with_extension(extension));
-        }
+    for p in stale {
+        let _ = std::fs::remove_file(p);
     }
     // Every part is renamed within `path`'s folder.
     sync_folder(path);
@@ -2515,48 +2530,50 @@ impl<W: std::io::Write> CsvWriter<W> {
 // ---------------------------------------------------------------------------------------------
 // Shapefile
 
-/// A DBF picked by its path opens the Shapefile beside it when present. Try every ASCII
-/// spelling of the extension without scanning a directory; standalone tables return `None`.
+/// A DBF picked by its path opens the Shapefile beside it when present, its `.shp` in whichever
+/// ASCII case it is spelled; standalone tables return `None`.
 pub fn shapefile_for_dbf(path: &Path) -> Option<std::path::PathBuf> {
     if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("dbf")) {
         return None;
     }
-    ["shp", "SHP", "Shp", "sHp", "shP", "SHp", "ShP", "sHP"].iter().map(|e| path.with_extension(e)).find(|p| p.is_file())
+    crate::sidecar::find_one(path, "shp")
 }
 
-/// Finds the attributes beside a Shapefile, accepting every ASCII case of `.dbf` in whole
-/// and streamed reads. A missing sidecar keeps the usual lowercase path for the error.
-pub(crate) fn dbf_sidecar(path: &Path) -> std::path::PathBuf {
-    ["dbf", "DBF", "Dbf", "dBf", "dbF", "DBf", "DbF", "dBF"]
-        .iter()
-        .map(|e| path.with_extension(e))
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| path.with_extension("dbf"))
+/// The note for a Shapefile at `path` with a part there under more than one spelling
+/// (`ROADS.dbf` and `ROADS.DBF`, where case is told apart): the one read and written, and that
+/// the others are left as they are. For an export over such a file to say.
+pub fn shapefile_spellings_note(path: &Path) -> Option<String> {
+    crate::sidecar::Sidecars::shapefile(path).duplicates_note()
 }
 
 /// Reads a Shapefile with an optional source CRS replacing its `.prj`, before any geometry is
 /// converted. This changes only interpretation; the files on disk are never modified.
 pub fn read_shapefile_in(path: &Path, name: &str, crs: Option<Crs>) -> Result<(Dataset, ReadReport)> {
     check_size_with(path, shapefile_size_error)?;
-    let dbf = dbf_sidecar(path);
+    let files = crate::sidecar::Sidecars::shapefile(path);
+    let dbf = files.path("dbf");
     if !dbf.is_file() {
         return Err(DataError::Format(format!("Shapefile: {} is missing", dbf.display())));
     }
     check_size_with(&dbf, shapefile_size_error)?;
-    let shx = path.with_extension("shx");
-    if shx.is_file() {
-        check_size_with(&shx, shapefile_size_error)?;
+    let shx = files.existing("shx");
+    if let Some(shx) = shx {
+        check_size_with(shx, shapefile_size_error)?;
     }
     let mut notes = Vec::new();
     let parts = ShapefileParts {
         shp: crate::provenance::read(path)?,
-        shx: if shx.is_file() { Some(crate::provenance::read(shx)?) } else { None },
+        shx: match shx {
+            Some(shx) => Some(crate::provenance::read(shx)?),
+            None => None,
+        },
         dbf: crate::provenance::read(dbf)?,
-        prj: crate::raster::read_prj(path),
-        cpg: crate::dbf::read_cpg(path, &mut notes),
+        prj: files.existing("prj").and_then(crate::raster::read_prj_file),
+        cpg: crate::dbf::read_cpg(files.existing("cpg"), &mut notes),
     };
     let (ds, mut report) = read_shapefile_parts(parts, name, crs)?;
     report.messages.extend(notes);
+    report.messages.extend(files.duplicates_note());
     Ok((ds, report))
 }
 
