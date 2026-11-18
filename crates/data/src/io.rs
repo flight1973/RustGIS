@@ -3866,6 +3866,9 @@ pub struct TextLosses {
     layers: Vec<Vec<FieldText>>,
     /// Only the spaces after text are dropped (dBase).
     ends_only: bool,
+    /// Features written that reading skips (KML, GPX): no coordinate in longitude/latitude, or
+    /// too few for their shape.
+    unread: usize,
 }
 
 /// One field's [`TextLosses`] in one layer read back.
@@ -3968,6 +3971,7 @@ impl TextLosses {
             .collect();
         // KML reads a layer for each kind of geometry, and types each one's columns apart.
         let mut layers = vec![fresh; if kml { 3 } else { 1 }];
+        let mut unread = 0usize;
         let layer_of = |g: &Geometry| match g.kind() {
             _ if !kml => 0,
             GeometryType::Point => 0,
@@ -3990,6 +3994,13 @@ impl TextLosses {
                     if let Some(first) = layers.first_mut() {
                         first.iter_mut().zip(&feature.attrs).for_each(|(loss, v)| loss.valued |= !v.is_null());
                     }
+                    unread = unread.saturating_add(1);
+                    continue;
+                }
+                // Written, and skipped on reading (an empty multipoint isn't written at all, and
+                // is said as left out).
+                Some(g) if gpx && !matches!(g, Geometry::MultiPoint(v) if v.is_empty()) => {
+                    unread = unread.saturating_add(1);
                     continue;
                 }
                 _ => continue,
@@ -4035,7 +4046,7 @@ impl TextLosses {
                 }
             }
         }
-        Self { layers, ends_only: shp }
+        Self { layers, ends_only: shp, unread }
     }
 
     /// One notice for each loss of a layer with `fields` written to `target`, with a count and
@@ -4087,6 +4098,12 @@ impl TextLosses {
             };
             notes.push(format!("{target}: {what}: {}", named_fields(fields, &missing)));
         }
+        if self.unread > 0 {
+            let what = if self.unread == 1 { "1 feature is".to_string() } else { format!("{} features are", self.unread) };
+            notes.push(format!(
+                "{target}: {what} written but won't read back: no coordinate is inside longitude/latitude, or too few for the shape"
+            ));
+        }
         notes
     }
 }
@@ -4098,6 +4115,7 @@ impl std::ops::AddAssign for TextLosses {
             *self = other;
             return;
         }
+        self.unread = self.unread.saturating_add(other.unread);
         for (a, b) in self.layers.iter_mut().zip(other.layers).flat_map(|(a, b)| a.iter_mut().zip(b)) {
             a.padded += b.padded;
             a.name_padded += b.name_padded;
@@ -6009,15 +6027,18 @@ mod tests {
         ds.push(Some(Geometry::MultiPoint(vec![])), vec![Value::Text("".into()), Value::Text("".into())]);
         ds.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0)]])), vec![Value::Text(" ".into()), Value::Text(" ".into())]);
         // 'note' has values only where reading skips the placemark: its padded text doesn't come
-        // back, but its name still gives a column, of nulls.
-        assert!(text_notes(&ds, "kml").is_empty());
+        // back, but its name still gives a column, of nulls. The skipped placemarks are said.
+        let unread =
+            |n: &str| format!("t: {n} written but won't read back: no coordinate is inside longitude/latitude, or too few for the shape");
+        assert_eq!(text_notes(&ds, "kml"), [unread("3 features are")]);
         let (bytes, _) = write_bytes(&ds, "kml").unwrap();
         let layers = crate::kml::read("t.kml", &bytes).unwrap();
         assert_eq!(layers.len(), 1);
         let back = &layers[0].dataset;
         assert_eq!(back.features.len(), 1);
         assert_eq!(back.field_index("note").map(|i| back.value(0, i).clone()), Some(Value::Null));
-        assert!(text_notes(&ds, "gpx").is_empty());
+        // GPX doesn't write the empty multipoint (said as left out); the other two it skips.
+        assert_eq!(text_notes(&ds, "gpx"), [unread("2 features are")]);
         let (bytes, _) = write_bytes(&ds, "gpx").unwrap();
         let read = crate::gpx::read("t.gpx", &bytes).unwrap();
         // One waypoint, and no track (its lone point, unnamed, is among the track points).
@@ -6053,7 +6074,10 @@ mod tests {
         for f in ds.features.iter_mut() {
             f.attrs[0] = Value::Null;
         }
-        assert_eq!(losses(&ds), ["t: 1 field has no value in any feature written, so reading the file back has no column of its own for it: 'title'"]);
+        assert_eq!(
+            losses(&ds),
+            ["t: 1 field has no value in any feature written, so reading the file back has no column of its own for it: 'title'"]
+        );
         let clean = text_layer(&["title"], &[&[Some("a")], &[Some("b")]]);
         assert!(losses(&clean).is_empty());
     }
@@ -6083,7 +6107,10 @@ mod tests {
     fn a_kml_name_column_without_values_of_another_field_is_said() {
         let mut ds = text_layer(&["title", "name"], &[&[Some("a"), None], &[Some("b"), None]]);
         let losses = |ds: &Dataset| TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, "kml", Some(0)).notes(&ds.fields, "t");
-        assert_eq!(losses(&ds), ["t: 1 field has no value in any feature written, so reading the file back has no column of its own for it: 'name'"]);
+        assert_eq!(
+            losses(&ds),
+            ["t: 1 field has no value in any feature written, so reading the file back has no column of its own for it: 'name'"]
+        );
         let back = crate::interop::to_kml(&ds, Some(0)).unwrap();
         let read = &crate::kml::read("t.kml", back.as_bytes()).unwrap()[0].dataset;
         let column = |n: &str| read.field_index(n).map(|i| read.features.iter().map(|f| f.attrs[i].clone()).collect::<Vec<_>>());
