@@ -619,6 +619,9 @@ fn ring_area(ring: &[Coord], at: (usize, usize), crossing: &[(usize, usize)], ro
 /// or less area than they had, by more than rounding to the grid could take: it moves each edge by
 /// at most half a step on each axis, so changes the area by less than the rings' length times a
 /// step.
+///
+/// It has no Cancel check of its own: its passes over the rings are bounded by the work budget
+/// `polygon` checks before calling it, and the tool looks at Cancel between features.
 fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room) -> Result<Rebuilt, Kept> {
     let empty = geo::MultiPolygon::<f64>::new(vec![]);
     let Distinct { keep, duplicates } = distinct_rings(parts, room).map_err(kept_for)?;
@@ -682,6 +685,11 @@ fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room)
         // step checks the grid can take every vertex, which holds for those left.
         let step = on_grid(rings_of(&all))?;
         let all = wider(all, step, &mut narrow, room)?;
+        // Every part narrower than a step (two thin rectangles overlapping): none left, so no area,
+        // as a part with none is, not a grid with no coordinates to check.
+        if all.is_empty() {
+            return Ok(Rebuilt { polys: Vec::new(), no_area, narrow, found, duplicates });
+        }
         on_grid(rings_of(&all))?;
         let given = all.len();
         let each: f64 = all.iter().map(Area::unsigned_area).sum();
@@ -1192,6 +1200,17 @@ mod tests {
         assert_eq!(hull_of(&[(0., 0.), (1., 1.), (2., 2.)]), [(0., 0.), (2., 2.)]);
         assert_eq!(hull_of(&[(1., 1.)]), [(1., 1.)]);
         assert_eq!(hull_of(&[]), []);
+    }
+
+    /// Under Even-Odd, parts all narrower than a step of the grid (two thin overlapping rectangles,
+    /// a billionth wide, where a step is 2⁻²⁷) are dropped, leaving no area: the feature has none,
+    /// not a repair that failed.
+    #[test]
+    fn parts_all_too_narrow_leave_no_area_under_even_odd() {
+        let a: Ring = &[(0., 0.), (1e-9, 0.), (1e-9, 10.), (0., 10.), (0., 0.)];
+        let b: Ring = &[(0.5e-9, 0.), (1.5e-9, 0.), (1.5e-9, 10.), (0.5e-9, 10.), (0.5e-9, 0.)];
+        let g = multi(&[&[a], &[b]]);
+        assert_eq!(repair_by(Some(&g), Rule::EvenOdd, &|_| true), Outcome::Gone(Gone::NoArea));
     }
 
     #[test]
