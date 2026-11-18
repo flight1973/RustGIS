@@ -263,6 +263,10 @@ fn an_empty_shape_has_no_box() {
     assert!(unread(record_box(&record(3, &[1, 2]), 80)), "a start that isn't there");
     assert_eq!(record_box(&record(3, &[2, 4, 0, 2]), 116), [0.0; 4], "two parts in order");
     assert_eq!(record_box(&record(3, &[2, 4, 0, 4]), 116), [0.0; 4], "a last part of no points still reads");
+    // Every part empty (the first starts at the end of the points): read as an empty shape, it has
+    // nothing to frame, as a shape of no points hasn't, whatever its stored box.
+    assert!(none(record_box(&record(3, &[1, 2, 2]), 80)), "one part starting at the end of its points");
+    assert!(none(record_box(&record(5, &[2, 4, 4, 4]), 116)), "two parts, both empty");
     assert_eq!(record_box(&record(8, &[2]), 72), [0.0; 4], "a multipoint with points keeps its box");
     // A box that's backwards (min x 5, max x 1): kept as stored, and not a box where it's taken.
     let mut backwards = 5i32.to_le_bytes().to_vec();

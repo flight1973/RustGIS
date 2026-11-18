@@ -491,6 +491,12 @@ fn record_box(c: &[u8], len: u64) -> [f32; 4] {
                         _ => return NOT_A_BOX,
                     }
                 }
+                // Starts in order, the last part running to the end of the points: every part is
+                // empty when the first starts there, and the shape reads as empty, framing nothing
+                // whatever its stored box.
+                if parts > 0 && start(0) == Some(points) {
+                    return NONE;
+                }
             }
             if parts == 0 || points == 0 {
                 return NONE;
