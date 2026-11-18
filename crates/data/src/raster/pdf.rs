@@ -6,9 +6,11 @@
 //! it, as readers of GeoPDFs do.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_interpret::util::TransformExt;
+use hayro::hayro_interpret::{InterpreterSettings, InterpreterWarning};
 use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::object::{Array, Dict, Name, String as PdfString};
 use hayro::hayro_syntax::page::Page;
@@ -24,7 +26,9 @@ use crate::{DataError, Result};
 pub const DPI: f64 = 150.0;
 /// The longest side a page is drawn at, in pixels (the renderer's limit).
 const MAX_SIDE: f64 = 65_535.0;
-/// The largest PDF file read: it is held in memory whole while its page is drawn.
+/// The largest PDF file read: it is held in memory whole while its page is drawn. The file's size
+/// doesn't bound the memory drawing it takes: a small compressed stream or image can decode to far
+/// more ([`read_bytes`]).
 pub const MAX_BYTES: u64 = 1 << 30;
 /// The most other pages a notice names.
 const NAMED_PAGES: usize = 20;
@@ -54,6 +58,11 @@ pub fn read_file(path: &Path, page: Option<&str>, place: bool) -> Result<Raster>
 /// at before, between and after them where the run asks for it ([`crate::progress`], as the read
 /// queue's does). A download's page the app draws on a thread of its own is given up by the app
 /// instead, before its turn, or dropped once drawn.
+///
+/// The memory and time drawing takes aren't bounded by the file's size, and can't be stopped: a
+/// compressed stream can inflate to many times its size, an image can say it is far larger than
+/// its data, and forms drawn within forms multiply the work. `hayro` gives no way to bound or stop
+/// any of them (tracked separately).
 pub fn read_bytes(name: &str, bytes: Vec<u8>, page: Option<&str>, place: bool) -> Result<Raster> {
     read_limited(name, bytes, page, place, max_samples())
 }
@@ -124,7 +133,24 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
         return Err(DataError::Format("the page is too large to draw".into()));
     }
     let settings = PixmapSettings { x_scale: scale as f32, y_scale: scale as f32, bg_color: WHITE };
-    let pixmap = hayro::render(page, &RenderCache::new(), &InterpreterSettings::default(), &RenderSettings::default(), &settings);
+    // What couldn't be drawn, counted by kind: images, fonts, annotations, and anything else.
+    let warned: Arc<[AtomicUsize; 4]> = Arc::new(Default::default());
+    let sink = Arc::clone(&warned);
+    let interpret = InterpreterSettings {
+        warning_sink: Arc::new(move |w| {
+            let kind = match w {
+                InterpreterWarning::ImageDecodeFailure => 0,
+                InterpreterWarning::UnsupportedFont => 1,
+                InterpreterWarning::UnresolvedAnnotationAppearance => 2,
+                _ => 3,
+            };
+            if let Some(n) = sink.get(kind) {
+                n.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+        ..InterpreterSettings::default()
+    };
+    let pixmap = hayro::render(page, &RenderCache::new(), &interpret, &RenderSettings::default(), &settings);
     let (pw, ph) = (u32::from(pixmap.width()), u32::from(pixmap.height()));
     // On an opaque background every pixel is opaque, so its premultiplied colour is its colour:
     // red, green and blue, the alpha left out.
@@ -141,6 +167,22 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
     if scale < wanted * 0.999 {
         let why = if fits <= largest { "to fit in memory" } else { "the largest size it can be drawn at" };
         r.lost.push(format!("its page is drawn at {:.0} dots an inch, not {DPI:.0}, {why}", scale * 72.0));
+    }
+    // `hayro` says so each time it meets one (an image each time it is drawn, a font each time
+    // text is set in it), not which one it is: the counts are of times, not of images or fonts.
+    let [images, fonts, annotations, other] = warned.each_ref().map(|n| n.load(Ordering::Relaxed));
+    let times = |n: usize| if n == 1 { "once".to_string() } else { format!("{n} times") };
+    if images > 0 {
+        r.lost.push(format!("an image that can't be decoded is left blank where it is drawn ({})", times(images)));
+    }
+    if fonts > 0 {
+        r.lost.push(format!("text set in a font that can't be read is drawn in a stand-in font ({})", times(fonts)));
+    }
+    if annotations > 0 {
+        r.lost.push(format!("an annotation whose appearance can't be found is left out ({})", times(annotations)));
+    }
+    if other > 0 {
+        r.lost.push(format!("part of the page can't be drawn and is left out ({})", times(other)));
     }
     Ok((r, scale))
 }
@@ -235,7 +277,7 @@ fn viewport(vp: &Dict<'_>, measure: &Dict<'_>) -> std::result::Result<Viewport, 
     }
     let gcs = measure.get::<Dict>(b"GCS".as_slice()).ok_or("it doesn't say its coordinate system")?;
     let epsg = gcs.get::<i64>(b"EPSG".as_slice()).and_then(|c| u32::try_from(c).ok());
-    let text = gcs.get::<PdfString>(b"WKT".as_slice()).map(|w| String::from_utf8_lossy(w.as_bytes()).into_owned());
+    let text = gcs.get::<PdfString>(b"WKT".as_slice()).map(|w| text_string(w.as_bytes()));
     // As a `.prj` and a code are read together elsewhere (a GeoPackage's): the code, unless the
     // text gives another shift or body; the text alone when the code isn't one RustGIS knows.
     let unknown = |code: u32| format!("its coordinate system, EPSG:{code}, isn't one RustGIS knows");
@@ -258,6 +300,29 @@ fn viewport(vp: &Dict<'_>, measure: &Dict<'_>) -> std::result::Result<Viewport, 
     Ok(Viewport { bbox, gpts, lpts, crs, def, note })
 }
 
+/// A PDF text string's text (ISO 32000-2 § 7.9.2.2): UTF-16 after a byte order mark (FE FF, big
+/// endian, as RustGIS writes one; or FF FE), UTF-8 after its own (EF BB BF). Without one, UTF-8
+/// where the bytes are that, else each byte its Latin-1 character, which PDFDocEncoding's are from
+/// A1 on.
+fn text_string(b: &[u8]) -> String {
+    let utf16 = |b: &[u8], big: bool| -> String {
+        let units = b.as_chunks::<2>().0.iter().map(|&p| if big { u16::from_be_bytes(p) } else { u16::from_le_bytes(p) });
+        char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
+    };
+    if let Some(rest) = b.strip_prefix(&[0xFE, 0xFF]) {
+        utf16(rest, true)
+    } else if let Some(rest) = b.strip_prefix(&[0xFF, 0xFE]) {
+        utf16(rest, false)
+    } else if let Some(rest) = b.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        String::from_utf8_lossy(rest).into_owned()
+    } else {
+        match std::str::from_utf8(b) {
+            Ok(s) => s.to_string(),
+            Err(_) => b.iter().map(|&c| char::from(c)).collect(),
+        }
+    }
+}
+
 /// `r`, the drawn page at `scale` pixels a point, placed by the largest of its GeoPDF viewports:
 /// left a scan when it has none, or none that can be used (said in `lost`).
 fn place_by_viewport(mut r: Raster, page: &Page<'_>, scale: f64) -> Raster {
@@ -266,6 +331,9 @@ fn place_by_viewport(mut r: Raster, page: &Page<'_>, scale: f64) -> Raster {
     if found.is_empty() {
         if let Some(why) = &unread.first {
             r.lost.push(format!("{} ({why}, the first): {unplaced}", unusable_frames(unread.count)));
+        } else if page.raw().contains_key(b"LGIDict".as_slice()) {
+            // The OGC's GeoPDF encoding, older than ISO 32000's viewports, isn't read.
+            r.lost.push(format!("its coordinates are in a form RustGIS doesn't read (OGC /LGIDict): {unplaced}"));
         }
         return r;
     }
@@ -415,26 +483,124 @@ mod tests {
     /// A one-page PDF of `media` points with a blue square drawn, its page dictionary given
     /// `extra` (a `/VP`, say), with a correct cross-reference table.
     fn tiny_pdf(media: &str, extra: &str) -> Vec<u8> {
-        let content = "0 0 1 rg 0 0 10 10 re f";
-        let objects = [
-            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
-            format!("<< /Type /Page /Parent 2 0 R /MediaBox [{media}] /Contents 4 0 R {extra} >>"),
-            format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        pdf_of(media, extra, b"0 0 1 rg 0 0 10 10 re f", &[])
+    }
+
+    /// A one-page PDF of `media` points drawing `content`, its page dictionary given `extra`, and
+    /// objects `more` numbered from 5, with a correct cross-reference table.
+    fn pdf_of(media: &str, extra: &str, content: &[u8], more: &[Vec<u8>]) -> Vec<u8> {
+        let mut objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [{media}] /Contents 4 0 R {extra} >>").into_bytes(),
+            stream("", content),
         ];
-        let mut out = String::from("%PDF-1.7\n");
+        objects.extend_from_slice(more);
+        let mut out = b"%PDF-1.7\n".to_vec();
         let mut at = Vec::new();
         for (i, o) in objects.iter().enumerate() {
             at.push(out.len());
-            out.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
+            out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+            out.extend_from_slice(o);
+            out.extend_from_slice(b"\nendobj\n");
         }
         let xref = out.len();
-        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes());
         for a in at {
-            out.push_str(&format!("{a:010} 00000 n \n"));
+            out.extend_from_slice(format!("{a:010} 00000 n \n").as_bytes());
         }
-        out.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1));
-        out.into_bytes()
+        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).as_bytes());
+        out
+    }
+
+    /// A stream object of dictionary entries `dict` holding `data`.
+    fn stream(dict: &str, data: &[u8]) -> Vec<u8> {
+        let mut o = format!("<< {dict} /Length {} >>\nstream\n", data.len()).into_bytes();
+        o.extend_from_slice(data);
+        o.extend_from_slice(b"\nendstream");
+        o
+    }
+
+    /// A 72 × 36 point page drawing image object 5, of dictionary entries `dict` and `data`, by
+    /// `content`.
+    fn image_page(dict: &str, data: &[u8], content: &[u8]) -> Vec<u8> {
+        let image = stream(&format!("/Type /XObject /Subtype /Image {dict}"), data);
+        pdf_of("0 0 72 36", "/Resources << /XObject << /Im0 5 0 R >> >>", content, &[image])
+    }
+
+    /// A 72 × 36 point page showing text in font object 5, of dictionary `font`, by `content`.
+    fn text_page(font: &str, content: &[u8]) -> Vec<u8> {
+        pdf_of("0 0 72 36", "/Resources << /Font << /F1 5 0 R >> >>", content, &[font.as_bytes().to_vec()])
+    }
+
+    #[test]
+    fn what_cant_be_drawn_is_said_with_how_often() {
+        // An image whose JPEG data is junk, drawn once and then twice: left blank, and said with
+        // the times it is drawn.
+        let junk = "/Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode";
+        let once = b"q 72 0 0 36 0 0 cm /Im0 Do Q";
+        let r = read_bytes("x", image_page(junk, b"not a jpeg at all", once), None, true).unwrap();
+        assert_eq!(r.lost, ["an image that can't be decoded is left blank where it is drawn (once)"]);
+        let twice = b"q 36 0 0 36 0 0 cm /Im0 Do Q q 36 0 0 36 36 0 cm /Im0 Do Q";
+        let r = read_bytes("x", image_page(junk, b"not a jpeg at all", twice), None, true).unwrap();
+        assert_eq!(r.lost, ["an image that can't be decoded is left blank where it is drawn (2 times)"]);
+        // A font of a kind that doesn't exist, set once and then twice: its text drawn in a
+        // stand-in, and said with the times.
+        let nonsense = "<< /Type /Font /Subtype /Nonsense /BaseFont /Bogus >>";
+        let r = read_bytes("x", text_page(nonsense, b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET"), None, true).unwrap();
+        assert_eq!(r.lost, ["text set in a font that can't be read is drawn in a stand-in font (once)"]);
+        let r = read_bytes("x", text_page(nonsense, b"BT /F1 12 Tf 5 10 Td (Hi) Tj /F1 9 Tf (there) Tj ET"), None, true).unwrap();
+        assert_eq!(r.lost, ["text set in a font that can't be read is drawn in a stand-in font (2 times)"]);
+        // An annotation whose appearance can't be found: left out, and said.
+        let annot = "/Annots [<< /Type /Annot /Subtype /Square /Rect [0 0 10 10] /AP << /D 9 >> >>]";
+        let r = read_bytes("x", tiny_pdf("0 0 72 36", annot), None, true).unwrap();
+        assert_eq!(r.lost, ["an annotation whose appearance can't be found is left out (once)"]);
+        // The same kinds, drawable: nothing said.
+        let red = [255u8, 0, 0].repeat(4);
+        let r =
+            read_bytes("x", image_page("/Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8", &red, once), None, true).unwrap();
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
+        assert_eq!((r.bands[0].data[150 * 37 + 75], r.bands[1].data[150 * 37 + 75]), (255.0, 0.0));
+        let helvetica = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+        let r = read_bytes("x", text_page(helvetica, b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET"), None, true).unwrap();
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
+    }
+
+    #[test]
+    fn an_ogc_lgidict_page_says_its_coordinates_arent_read() {
+        let lgi = "<< /Type /LGIDict /Version (2.1) /CTM [(0.0277777778) (0) (0) (0.0277777778) (10) (40)] \
+                   /Projection << /Type /Projection /ProjectionType (GEOGRAPHIC) /Datum (WGE) >> >>";
+        for extra in [format!("/LGIDict [{lgi}]"), format!("/LGIDict {lgi}")] {
+            let r = read_bytes("lgi", tiny_pdf("0 0 72 36", &extra), None, true).unwrap();
+            assert!(!r.georeferenced, "{extra}");
+            assert_eq!(r.lost, ["its coordinates are in a form RustGIS doesn't read (OGC /LGIDict): it opens without coordinates"]);
+            // Opened as a scan, nothing is said.
+            let r = read_bytes("lgi", tiny_pdf("0 0 72 36", &extra), None, false).unwrap();
+            assert!(r.lost.is_empty(), "{:?}", r.lost);
+        }
+        // An ISO viewport beside it places the page, and nothing is said of the other.
+        let both = format!("/LGIDict {lgi} {}", geo("/Type /GEOGCS /EPSG 4326"));
+        let r = read_bytes("lgi", tiny_pdf("0 0 72 36", &both), None, true).unwrap();
+        assert!(r.georeferenced && r.lost.is_empty(), "{:?}", r.lost);
+    }
+
+    #[test]
+    fn a_utf16_coordinate_system_is_read() {
+        let hex16 = |s: &str| format!("<FEFF{}>", s.encode_utf16().map(|u| format!("{u:04X}")).collect::<String>());
+        // As RustGIS writes a GeoPDF of a `local:10,45` map: its label has degree signs, so its
+        // text is UTF-16, and it has no EPSG code to fall back on.
+        let def = "+proj=aeqd +lat_0=45 +lon_0=10 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs";
+        let own = wkt::proj4_to_wkt(def, "Local (10.00°, 45.00°)").unwrap();
+        let r = read_bytes("geo", tiny_pdf("0 0 72 36", &geo(&format!("/Type /PROJCS /WKT {}", hex16(&own)))), None, true).unwrap();
+        assert!(r.georeferenced, "{:?}", r.lost);
+        let e = r.extent();
+        assert!(e.min_x < e.max_x && e.min_y < e.max_y, "{e:?}");
+        // Text strings in their other forms.
+        assert_eq!(text_string(&[0xFF, 0xFE, b'G', 0, 0xB0, 0]), "G°");
+        assert_eq!(text_string(&[0xEF, 0xBB, 0xBF, b'G', 0xC2, 0xB0]), "G°");
+        assert_eq!(text_string(&[b'G', 0xC2, 0xB0]), "G°");
+        assert_eq!(text_string(&[b'G', 0xB0]), "G°");
+        assert_eq!(text_string(&[0xFE, 0xFF, 0, b'G', 0]), "G");
     }
 
     /// A viewport over `bbox` on the page, its corners at 10–12° E, 40–41° N.
