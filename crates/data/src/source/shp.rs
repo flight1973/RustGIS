@@ -462,6 +462,11 @@ fn le_f64(b: &[u8], at: usize) -> Option<f64> {
 /// counts say, or a line or polygon whose parts' starts don't fit its points ([`parse_shape`]'s
 /// rules, so a record it won't read frames nothing), isn't a box. `c` holds a line's or polygon's
 /// whole array of parts' starts where the record has room for it.
+///
+/// The points themselves aren't read: a line, polygon or multipoint with a finite stored box over a
+/// point that isn't a number keeps that box here, though a read leaves the shape out (and counts
+/// it). Telling it apart would mean reading every record's points to build the index, for files
+/// (#1985's) with such shapes by the thousand.
 fn record_box(c: &[u8], len: u64) -> [f32; 4] {
     const NONE: [f32; 4] = [f32::NAN; 4];
     const NOT_A_BOX: [f32; 4] = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
