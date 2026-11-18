@@ -3989,9 +3989,9 @@ impl TextLosses {
         if n > 0 {
             let what = match (n, self.ends_only) {
                 (1, true) => "1 text value ends with spaces".to_string(),
-                (1, false) => "1 text value starts or ends with spaces".to_string(),
+                (1, false) => "1 text value starts or ends with spaces, tabs or line breaks".to_string(),
                 (n, true) => format!("{n} text values end with spaces"),
-                (n, false) => format!("{n} text values start or end with spaces"),
+                (n, false) => format!("{n} text values start or end with spaces, tabs or line breaks"),
             };
             notes.push(format!("{target}: {what}, which reading the file back drops, in {names}"));
         }
@@ -5840,7 +5840,7 @@ mod tests {
         assert_eq!(
             text_notes(&ds, "kml"),
             [
-                "t: 3 text values start or end with spaces, which reading the file back drops, in 'name', 'note'",
+                "t: 3 text values start or end with spaces, tabs or line breaks, which reading the file back drops, in 'name', 'note'",
                 "t: 2 blank text values read back as empty (null), in 'name', 'code'",
                 "t: 1 field is empty in every feature, so reading the file back has no column for it: 'gone'",
             ]
@@ -5867,7 +5867,7 @@ mod tests {
         assert_eq!(
             text_notes(&ds, "gpx"),
             [
-                "t: 1 text value starts or ends with spaces, which reading the file back drops, in 'name'",
+                "t: 1 text value starts or ends with spaces, tabs or line breaks, which reading the file back drops, in 'name'",
                 "t: 1 blank text value reads back as empty (null), in 'name'",
                 "t: 1 field is empty in every feature, so reading the file back has no column for it: 'gone'",
             ]
