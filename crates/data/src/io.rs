@@ -3948,10 +3948,21 @@ impl TextLosses {
                 reads
             })
             .collect();
-        let fresh: Vec<FieldText> = (fields.iter().zip(&reads))
-            .map(|(f, r)| FieldText {
+        // A KML field without a value still comes back as the reader's own column of its name
+        // when that column reads as null: the folder and the style, which aren't written, the
+        // description unless another field is the description written, and the name only for the
+        // name field (another one reads back each placemark's name).
+        let description = fields.iter().position(|f| f.name == "description" && f.ty == FieldType::Text);
+        let own_column = |k: usize, f: &Field| {
+            let is = |c: &str| f.name.eq_ignore_ascii_case(c);
+            KML_COLUMNS.iter().any(|c| is(c))
+                && (!is("name") || Some(k) == name_field)
+                && (!is("description") || description.is_none_or(|d| d == k))
+        };
+        let fresh: Vec<FieldText> = (fields.iter().enumerate().zip(&reads))
+            .map(|((k, f), r)| FieldText {
                 column: (csv || r.contains(&TextRead::Data)).then(TextColumn::default),
-                needs_value: kml && !KML_COLUMNS.iter().any(|c| f.name.eq_ignore_ascii_case(c)),
+                needs_value: kml && !own_column(k, f),
                 ..FieldText::default()
             })
             .collect();
@@ -6064,6 +6075,27 @@ mod tests {
         assert_eq!(column("code"), Some(vec![Value::Int(5), Value::Int(6)]));
         let clean = text_layer(&["code"], &[&[Some("5")], &[Some("6")]]);
         assert!(losses(&clean).is_empty());
+    }
+
+    /// A KML field without a value called `name` that isn't the name field comes back as the
+    /// placemarks' names, so it is said; one called like a column the reader leaves null isn't.
+    #[test]
+    fn a_kml_name_column_without_values_of_another_field_is_said() {
+        let mut ds = text_layer(&["title", "name"], &[&[Some("a"), None], &[Some("b"), None]]);
+        let losses = |ds: &Dataset| TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, "kml", Some(0)).notes(&ds.fields, "t");
+        assert_eq!(losses(&ds), ["t: 1 field is empty in every feature, so reading the file back has no column for it: 'name'"]);
+        let back = crate::interop::to_kml(&ds, Some(0)).unwrap();
+        let read = &crate::kml::read("t.kml", back.as_bytes()).unwrap()[0].dataset;
+        let column = |n: &str| read.field_index(n).map(|i| read.features.iter().map(|f| f.attrs[i].clone()).collect::<Vec<_>>());
+        assert_eq!(column("name"), Some(vec![Value::Text("a".into()), Value::Text("b".into())]));
+        // The name field itself, and columns the reader leaves null without a value, come back.
+        assert!(TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, "kml", Some(1)).notes(&ds.fields, "t").is_empty());
+        ds.fields[1] = Field::new("description", FieldType::Integer);
+        assert!(losses(&ds).is_empty());
+        let back = crate::interop::to_kml(&ds, Some(0)).unwrap();
+        let read = &crate::kml::read("t.kml", back.as_bytes()).unwrap()[0].dataset;
+        let column = |n: &str| read.field_index(n).map(|i| read.features.iter().map(|f| f.attrs[i].clone()).collect::<Vec<_>>());
+        assert_eq!(column("description"), Some(vec![Value::Null, Value::Null]));
     }
 
     /// CSV and dBase read text `<Null>`, in any case and with spaces around it, as null.
