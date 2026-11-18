@@ -29,7 +29,21 @@ fn child_text(n: &Node, name: &str) -> Option<String> {
 fn coord(n: &Node) -> Option<Coord> {
     let x = n.attribute("lon")?.trim().parse::<f64>().ok()?;
     let y = n.attribute("lat")?.trim().parse::<f64>().ok()?;
-    ((-180.0..=180.0).contains(&x) && (-90.0..=90.0).contains(&y)).then(|| Coord::new(x, y))
+    crate::io::lon_lat_in_range(x, y).then(|| Coord::new(x, y))
+}
+
+/// Whether reading keeps a feature that [`crate::interop::to_gpx`] writes with geometry `g`: a
+/// waypoint in range ([`coord`]), or a track with a segment of two such points.
+pub(crate) fn keeps(g: &Geometry) -> bool {
+    let kept = |c: &&Coord| crate::io::lon_lat_in_range(c.x, c.y);
+    let segment = |p: &Vec<Coord>| p.iter().filter(kept).count() >= 2;
+    match g {
+        Geometry::Point(c) => kept(&c),
+        Geometry::MultiPoint(v) => v.iter().any(|c| kept(&c)),
+        Geometry::Line(parts) => parts.iter().any(segment),
+        // Written as a track along each part's outer ring.
+        Geometry::Polygon(polys) => polys.iter().filter_map(|rings| rings.first()).any(segment),
+    }
 }
 
 fn text(v: Option<String>) -> Value {

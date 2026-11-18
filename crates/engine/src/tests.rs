@@ -24610,15 +24610,15 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
         (Geometry::MultiPoint(vec![Coord::new(3.0, 4.0), Coord::new(5.0, 6.0)]), vec![V::Text("M".into()), V::Null]),
     ];
     s.map_mut().add_dataset(layer("Sites", GeometryType::Point, pts));
-    // A field null everywhere has no column when a GPX or KML file is read back, so a clean layer
-    // holds only names.
+    let clean = vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])];
+    s.map_mut().add_dataset(layer("Clean", GeometryType::Point, clean.clone()));
+    // Names alone, which GPX holds whole.
     let named = |mut ds: Dataset| {
         ds.fields.truncate(1);
         ds.features.iter_mut().for_each(|f| f.attrs.truncate(1));
         ds
     };
-    let clean = vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])];
-    s.map_mut().add_dataset(named(layer("Clean", GeometryType::Point, clean)));
+    s.map_mut().add_dataset(named(layer("Names", GeometryType::Point, clean)));
     let said = |s: &mut Session, id: &str, p: Value| {
         let mark = s.notices.len();
         s.run(id, &p).unwrap();
@@ -24638,8 +24638,9 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
         "{n:?}"
     );
     let n = said(&mut s, "share.exportLayer", json!({"layer": "Sites", "path": out("sites.gpx")}));
-    assert!(n.len() == 2 && n[0].contains("1 multipoint was written as a waypoint for each"), "{n:?}");
-    assert!(n[1].contains("1 field is empty in every feature, so reading the file back has no column for it: 'height'"), "{n:?}");
+    // GPX writes only names: 'height', without a value, has no column read back either.
+    assert!(n.len() == 2 && n[0].contains("1 field wasn't written: 'height'"), "{n:?}");
+    assert!(n[1].contains("1 multipoint was written as a waypoint for each"), "{n:?}");
     let n = said(&mut s, "data.convert", json!({"layer": "Areas", "format": "gpx"}));
     assert!(n.iter().any(|t| t.contains("'height'")) && n.iter().any(|t| t.contains("tracks")), "{n:?}");
     let n = said(&mut s, "data.convert", json!({"layer": "Areas", "format": "csv"}));
@@ -24651,30 +24652,34 @@ fn csv_and_gpx_exports_say_what_they_leave_out() {
     for format in ["kml", "gpx"] {
         let n = said(&mut s, "data.convert", json!({"layer": "Rows", "format": format}));
         assert!(n.len() == 2 && n.iter().any(|t| t.contains("1 features without drawable geometry were left out")), "{format}: {n:?}");
-        assert!(n.iter().any(|t| t.contains("no column for it: 'height'")), "{format}: {n:?}");
+        let height = if format == "kml" { "no column for it: 'height'" } else { "1 field wasn't written: 'height'" };
+        assert!(n.iter().any(|t| t.contains(height)), "{format}: {n:?}");
     }
     // A standalone table keeps geometry too: Export Table says the same, and nothing for a clean one.
     let areas = layer("Area table", GeometryType::Polygon, vec![(square(0.0, true), vec![V::Text("A".into()), V::Float(2.5)])]);
     let points =
-        named(layer("Point table", GeometryType::Point, vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])]));
+        layer("Point table", GeometryType::Point, vec![(Geometry::Point(Coord::new(1.0, 2.0)), vec![V::Text("P".into()), V::Null])]);
     s.project.tables.push(crate::project::Table::new(9001, areas));
     s.project.tables.push(crate::project::Table::new(9002, points));
     let n = said(&mut s, "share.exportTable", json!({"table": 9001, "path": out("table.csv")}));
     assert!(n.len() == 1 && n[0].contains("the geometry of 1 feature wasn't written"), "{n:?}");
     let n = said(&mut s, "share.exportTable", json!({"table": 9001, "path": out("table.gpx")}));
     assert!(n.iter().any(|t| t.contains("'height'")) && n.iter().any(|t| t.contains("1 hole left out")), "{n:?}");
-    for ext in ["csv", "gpx"] {
-        let n = said(&mut s, "share.exportTable", json!({"table": 9002, "path": out(&format!("clean-table.{ext}"))}));
-        assert_eq!(n, Vec::<String>::new(), "{ext}");
-    }
-    // Points alone, with only a name: CSV and GPX hold them whole.
-    for ext in ["csv", "gpx"] {
-        assert_eq!(
-            said(&mut s, "share.exportLayer", json!({"layer": "Clean", "path": out(&format!("clean.{ext}"))})),
-            Vec::<String>::new()
-        );
-        assert_eq!(said(&mut s, "data.convert", json!({"layer": "Clean", "format": ext})), Vec::<String>::new());
-    }
+    // Points alone, their other field empty: CSV holds them whole, GPX all but that field.
+    let height = |n: &[String]| n.len() == 1 && n[0].contains("GPX holds a name for each feature, so 1 field wasn't written: 'height'");
+    let n = said(&mut s, "share.exportTable", json!({"table": 9002, "path": out("clean-table.csv")}));
+    assert_eq!(n, Vec::<String>::new());
+    let n = said(&mut s, "share.exportTable", json!({"table": 9002, "path": out("clean-table.gpx")}));
+    assert!(height(&n), "{n:?}");
+    assert_eq!(said(&mut s, "share.exportLayer", json!({"layer": "Clean", "path": out("clean.csv")})), Vec::<String>::new());
+    assert_eq!(said(&mut s, "data.convert", json!({"layer": "Clean", "format": "csv"})), Vec::<String>::new());
+    let n = said(&mut s, "share.exportLayer", json!({"layer": "Clean", "path": out("clean.gpx")}));
+    assert!(height(&n), "{n:?}");
+    let n = said(&mut s, "data.convert", json!({"layer": "Clean", "format": "gpx"}));
+    assert!(height(&n), "{n:?}");
+    // Names alone: GPX holds them whole.
+    assert_eq!(said(&mut s, "share.exportLayer", json!({"layer": "Names", "path": out("names.gpx")})), Vec::<String>::new());
+    assert_eq!(said(&mut s, "data.convert", json!({"layer": "Names", "format": "gpx"})), Vec::<String>::new());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
