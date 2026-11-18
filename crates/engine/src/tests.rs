@@ -1828,13 +1828,28 @@ fn an_image_is_a_marker_kept_in_the_project_file_that_an_older_reader_refuses() 
     // A task that sets one names it too (once), and one that only sizes doesn't.
     let mut project = s.project.clone();
     project.styles.clear();
-    let task = |params: Value| {
-        serde_json::from_value(json!({"name": "Icons", "steps": [{"title": "Icon", "command": "layer.marker", "params": params}]})).unwrap()
+    let step = |command: &str, params: Value| {
+        serde_json::from_value(json!({"name": "Icons", "steps": [{"title": "Icon", "command": command, "params": params}]})).unwrap()
     };
+    let task = |params: Value| step("layer.marker", params);
     project.tasks = vec![task(json!({"size": 9}))];
     assert!(serde_json::to_value(&project).unwrap().get("requires").is_none());
     project.tasks = vec![task(json!({"image": b64})), task(json!({"image": b64}))];
     assert_eq!(serde_json::to_value(&project).unwrap()["requires"], json!(["picture-markers"]));
+    // A stroke's markers or a dot fill set to an image by a step too (#2266); shapes don't.
+    for (command, plain, image) in [
+        (
+            "layer.lineStrokes",
+            json!({"strokes": [{"markers": {"mark": "star"}}]}),
+            json!({"strokes": [{"width": 1}, {"markers": {"image": b64}}]}),
+        ),
+        ("layer.fillLayers", json!({"fills": [{"pattern": "dots"}]}), json!({"fills": [{"pattern": "dots", "image": b64}]})),
+    ] {
+        project.tasks = vec![step(command, plain)];
+        assert!(serde_json::to_value(&project).unwrap().get("requires").is_none(), "{command}");
+        project.tasks = vec![step(command, image)];
+        assert_eq!(serde_json::to_value(&project).unwrap()["requires"], json!(["picture-markers"]), "{command}");
+    }
     let depth = s.undo_depth();
     for (bad, says) in [
         (json!({"layer": "Cities", "image": 7}), "PNG or JPEG image as base64"),
@@ -1851,6 +1866,87 @@ fn an_image_is_a_marker_kept_in_the_project_file_that_an_older_reader_refuses() 
     }
     assert_eq!(s.undo_depth(), depth);
     assert_eq!(marker(&s), Marker::Circle);
+}
+
+/// An image is a marker along a line, a mark at a point and a dot fill's marker, as it is a
+/// point's (#2266), kept the first time and found where it's kept when given again; a call refused
+/// for its layer, its class or what it names with the image keeps none.
+#[test]
+fn an_image_marks_a_line_a_point_and_a_dot_fill() {
+    use base64::Engine;
+    use rustgis_map::fills::FillPattern;
+    use rustgis_map::{LineMark, Marker, Picture};
+    let png = |rgb: [u8; 3]| {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(8, 4, image::Rgba([rgb[0], rgb[1], rgb[2], 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(&png)
+    };
+    // Each command is first given an image nothing kept yet, then the same image again.
+    let (b64, dots) = (png([12, 34, 56]), png([65, 66, 67]));
+    assert_eq!((Picture::kept(&b64), Picture::kept(&dots)), (None, None));
+    let mut s = world();
+    let depth = s.undo_depth();
+    let mark_of = |s: &Session, layer: &str| s.map().layer_by_name(layer).unwrap().line_strokes[0].markers.map(|m| m.mark);
+    // Along a line, with or without "mark": "image"; at a point, as one of its marks.
+    for markers in [json!({"image": b64, "size": 12}), json!({"mark": "image", "image": b64})] {
+        s.run("layer.lineStrokes", &json!({"layer": "Rivers", "strokes": [{"width": 1}, {"markers": markers}]})).unwrap();
+        let picture = Marker::Picture(Picture::kept(&b64).expect("kept by the command"));
+        assert_eq!(s.map().layer_by_name("Rivers").unwrap().line_strokes[1].markers.map(|m| m.mark), Some(LineMark::Marker(picture)));
+    }
+    let picture = Marker::Picture(Picture::new(&b64));
+    s.run("layer.lineStrokes", &json!({"layer": "Cities", "strokes": [{"markers": {"image": b64}}]})).unwrap();
+    assert_eq!(mark_of(&s, "Cities"), Some(LineMark::Marker(picture)));
+    // A dot fill's marker.
+    for fill in [json!({"pattern": "dots", "image": dots, "size": 6}), json!({"pattern": "dots", "marker": "image", "image": dots})] {
+        s.run("layer.fillLayers", &json!({"layer": "Countries", "fills": [fill]})).unwrap();
+        let picture = Marker::Picture(Picture::kept(&dots).expect("kept by the command"));
+        let f = s.map().layer_by_name("Countries").unwrap().fill_layers.clone();
+        assert!(matches!(f[0].pattern, FillPattern::Dots { marker, .. } if marker == picture), "{f:?}");
+    }
+    assert_eq!(s.undo_depth(), depth + 5);
+    // Refused, changing nothing; on the wrong layer, or named with something else, before the
+    // image is kept.
+    let unkept = png([201, 202, 203]);
+    let junk = "bm90IGFuIGltYWdl";
+    // Kept, as a file gives one, but not an image: refused where it's kept.
+    let _ = Picture::new("bm90IGFuIGltYWdlIGVpdGhlcg==");
+    let too_long = "A".repeat(rustgis_map::symbology::MAX_PICTURE_BYTES + 4);
+    for (layer, markers, says) in [
+        ("Rivers", json!({"image": 7}), "PNG or JPEG image as base64"),
+        ("Rivers", json!({"image": junk}), "PNG or JPEG image as base64"),
+        ("Rivers", json!({"image": "bm90IGFuIGltYWdlIGVpdGhlcg=="}), "PNG or JPEG image as base64"),
+        ("Rivers", json!({"image": too_long}), "at most 2 MiB"),
+        ("Rivers", json!({"mark": "image"}), "needs its image"),
+        ("Rivers", json!({"mark": "circle", "image": unkept}), "only one"),
+        ("Rivers", json!({"mark": "hash", "image": unkept}), "only one"),
+        ("Rivers", json!({"char": "x", "image": unkept}), "only one"),
+        ("Countries", json!({"image": unkept}), "line and point layers"),
+    ] {
+        let err = s.run("layer.lineStrokes", &json!({"layer": layer, "strokes": [{"markers": markers}]})).unwrap_err();
+        assert!(err.contains(says), "{err}");
+    }
+    for (layer, fill, says) in [
+        ("Countries", json!({"pattern": "dots", "image": 7}), "PNG or JPEG image as base64"),
+        ("Countries", json!({"pattern": "dots", "image": junk}), "PNG or JPEG image as base64"),
+        ("Countries", json!({"pattern": "dots", "image": too_long}), "at most 2 MiB"),
+        ("Countries", json!({"pattern": "dots", "marker": "image"}), "needs its image"),
+        ("Countries", json!({"pattern": "dots", "marker": "star", "image": unkept}), "only one"),
+        ("Countries", json!({"pattern": "dots", "char": "x", "image": unkept}), "only one"),
+        ("Rivers", json!({"pattern": "dots", "image": unkept}), "containing polygons"),
+        // Another pattern would drop it.
+        ("Countries", json!({"pattern": "hatch", "image": unkept}), "an image is a dots fill's marker"),
+        ("Countries", json!({"image": unkept}), "an image is a dots fill's marker"),
+    ] {
+        let err = s.run("layer.fillLayers", &json!({"layer": layer, "fills": [fill]})).unwrap_err();
+        assert!(err.contains(says), "{err}");
+    }
+    // A class the layer doesn't have, as the wrong layer.
+    s.run("layer.lineStrokes", &json!({"layer": "Rivers", "index": 99, "strokes": [{"markers": {"image": unkept}}]})).unwrap_err();
+    s.run("layer.fillLayers", &json!({"layer": "Countries", "index": 99, "fills": [{"pattern": "dots", "image": unkept}]})).unwrap_err();
+    assert_eq!(Picture::kept(&unkept), None, "none of these refused calls kept its image");
+    assert_eq!(s.undo_depth(), depth + 5);
 }
 
 #[test]
@@ -2800,6 +2896,289 @@ fn qgis_bookmarks_relations_rotation_and_time_import() {
     let on = s.run("time.bind", &json!({"layer": "events"})).unwrap();
     assert_ne!(on["field"], "note", "{on}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// QGIS's other sources come in as RustGIS reads them: a GPX file's tracks, a memory layer empty
+/// with its fields (as QGIS opens it), a virtual layer on another layer as that layer with the
+/// filters of both, vector tiles (by XYZ address and with a MapLibre style) with their style
+/// noted, and database tables noted with a saved connection to log in to, made once a database
+/// and never with a password. What isn't read is noted.
+#[test]
+fn qgis_sources_import_as_their_layers() {
+    let dir = std::env::temp_dir().join(format!("rustgis-qgis-sources-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("trip.gpx"),
+        r#"<gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1"><wpt lat="47.4" lon="8.5"><name>a</name></wpt><trk><name>b</name><trkseg><trkpt lat="47.4" lon="8.5"/><trkpt lat="47.5" lon="8.6"/></trkseg></trk></gpx>"#,
+    )
+    .unwrap();
+    let point = |kind: &str, value: i32| {
+        format!(
+            r#"{{"type":"Feature","properties":{{"kind":"{kind}","value":{value}}},"geometry":{{"type":"Point","coordinates":[8.5,47.4]}}}}"#
+        )
+    };
+    let features = [point("x", 1), point("x", 30), point("y", 30)].join(",");
+    std::fs::write(dir.join("pts.geojson"), format!(r#"{{"type":"FeatureCollection","features":[{features}]}}"#)).unwrap();
+    let layer = |id: &str, kind: &str, provider: &str, source: &str| {
+        format!(
+            r#"<maplayer type="{kind}"><id>{id}</id><datasource>{source}</datasource><layername>{id}</layername><provider>{provider}</provider></maplayer>"#
+        )
+    };
+    let layers = [
+        layer("track", "vector", "gpx", "./trip.gpx?type=track"),
+        layer("scratch", "vector", "memory", "memory?geometry=LineString&amp;crs=EPSG:2056&amp;field=name:string(20,0)&amp;field=at:time(0,0)"),
+        layer("pts", "vector", "ogr", "./pts.geojson|subset=\"kind\" = 'x'"),
+        layer("big", "vector", "virtual", "?layer_ref=pts:p&amp;query=SELECT%20*%20FROM%20p%20WHERE%20value%20%3E%2020"),
+        layer("counts", "vector", "virtual", "?layer_ref=pts:p&amp;query=SELECT%20kind,%20count(*)%20FROM%20p%20GROUP%20BY%20kind"),
+        layer("tiles", "vector-tile", "xyzvectortiles", "type=xyz&amp;url=https://e.invalid/%7Bz%7D/%7Bx%7D/%7By%7D.pbf&amp;zmax=14&amp;zmin=0"),
+        layer("towns", "vector", "postgres", "dbname='gis' host=db.invalid port=5432 user='me' password='secret' sslmode=disable sslrootcert='/k/ca.pem' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=1 key='id' srid=2056 type=Point table=\"public\".\"towns\" (geom)"),
+        layer("roads", "vector", "postgres", "dbname='gis' host=db.invalid port=5432 user='me' password='secret' sslmode=disable table=\"public\".\"roads\" (geom) sql=\"value\" &gt; 20"),
+        layer("sites", "vector", "mssql", "dbname='gis' host=sql.invalid\\main user='me' password='secret' table=\"dbo\".\"sites\" (geom)"),
+        layer("named", "vector", "postgres", "service='prod' sslrootcert='/k/x.pem' table=\"public\".\"x\" (geom)"),
+        layer("bag", "vector", "memory", "GeometryCollection?crs=EPSG:4326&amp;field=a:integer"),
+        layer("served", "vector", "postgres", "service='prod' host=db.invalid table=\"public\".\"y\" (geom)"),
+        layer("escaped", "vector", "postgres", r"dbname='gis' host=db.invalid port=5432 user='me' password='p4ss\' table=x' sslmode=disable table=public.z"),
+        layer("web mbtiles", "vector-tile", "mbtilesvectortiles", "type=mbtiles&amp;url=https://e.invalid/t.mbtiles"),
+        layer("share", "vector-tile", "xyzvectortiles", "type=xyz&amp;url=file://server/share/t.pmtiles"),
+        layer("gone", "vector-tile", "mbtilesvectortiles", "type=mbtiles&amp;url=.%2Fnope.mbtiles"),
+        layer("look one", "vector-tile", "xyzvectortiles", "type=xyz&amp;url=https://same.invalid/%7Bz%7D/%7Bx%7D/%7By%7D.pbf"),
+        layer("look two", "vector-tile", "xyzvectortiles", "type=xyz&amp;url=https://same.invalid/%7Bz%7D/%7Bx%7D/%7By%7D.pbf"),
+        // Two layers of one name (each with its own id, as QGIS writes them) on the same tiles.
+        layer("osm_1", "raster", "wms", "type=xyz&amp;url=https://twin.invalid/%7Bz%7D/%7Bx%7D/%7By%7D.png").replace("<layername>osm_1<", "<layername>osm<"),
+        layer("osm_2", "raster", "wms", "type=xyz&amp;url=https://twin.invalid/%7Bz%7D/%7Bx%7D/%7By%7D.png").replace("<layername>osm_2<", "<layername>osm<"),
+        // A memory layer with Z values and a repeated field name; virtual layers on a name
+        // none of their sources has, on a layer id the project lacks, and on the latter.
+        layer("zm", "vector", "memory", "PointZ?crs=EPSG:4326&amp;field=a:string&amp;field=A:integer"),
+        layer("lost", "vector", "virtual", "?layer=ogr:.%2Fpts.geojson:p&amp;query=SELECT%20*%20FROM%20nosuch"),
+        layer("orphan", "vector", "virtual", "?layer_ref=gone_1:g&amp;query=SELECT%20*%20FROM%20g"),
+        layer("on orphan", "vector", "virtual", "?layer_ref=orphan:o&amp;query=SELECT%20*%20FROM%20o"),
+        // On a virtual layer on a memory layer: not a ring, not too deep.
+        layer("on mem", "vector", "virtual", "?layer_ref=scratch:s&amp;query=SELECT%20*%20FROM%20s"),
+        layer("on on mem", "vector", "virtual", "?layer_ref=on mem:o&amp;query=SELECT%20*%20FROM%20o"),
+        // A project layer of a GeoPackage named without a layer, and a virtual layer on it.
+        layer("whole gpkg", "vector", "ogr", "./sample.gpkg"),
+        layer("on whole gpkg", "vector", "virtual", "?layer_ref=whole gpkg:w&amp;query=SELECT%20*%20FROM%20w"),
+        layer("ring a", "vector", "virtual", "?layer_ref=ring b:b&amp;query=SELECT%20*%20FROM%20b"),
+        layer("deep 0", "vector", "virtual", "?layer_ref=deep 1:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 1", "vector", "virtual", "?layer_ref=deep 2:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 2", "vector", "virtual", "?layer_ref=deep 3:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 3", "vector", "virtual", "?layer_ref=deep 4:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 4", "vector", "virtual", "?layer_ref=deep 5:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 5", "vector", "virtual", "?layer_ref=deep 6:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 6", "vector", "virtual", "?layer_ref=deep 7:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 7", "vector", "virtual", "?layer_ref=deep 8:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 8", "vector", "virtual", "?layer_ref=deep 9:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 9", "vector", "virtual", "?layer_ref=deep 10:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 10", "vector", "virtual", "?layer_ref=deep 11:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("deep 11", "vector", "virtual", "?layer_ref=pts:p&amp;query=SELECT%20*%20FROM%20p"),
+        layer("ring b", "vector", "virtual", "?layer_ref=ring a:a&amp;query=SELECT%20*%20FROM%20a"),
+        // A raster PMTiles archive: read as an archive, not as a tile address.
+        layer("raster archive", "raster", "wms", "type=xyz&amp;url=.%2Fnone.pmtiles"),
+        // A network share's archive, by its Windows path.
+        layer("unc share", "vector-tile", "mbtilesvectortiles", "type=mbtiles&amp;url=%5C%5Cserver%5Cshare%5Ct.mbtiles"),
+        // Two tile layers on the same tiles, of the name of a file layer added before them.
+        layer("dup_1", "raster", "wms", "type=xyz&amp;url=https://dup.invalid/%7Bz%7D/%7Bx%7D/%7By%7D.png").replace("<layername>dup_1<", "<layername>dup<"),
+        layer("dup_2", "raster", "wms", "type=xyz&amp;url=https://dup.invalid/%7Bz%7D/%7Bx%7D/%7By%7D.png").replace("<layername>dup_2<", "<layername>dup<"),
+        layer("dup_3", "vector", "gpx", "./trip.gpx?type=track").replace("<layername>dup_3<", "<layername>dup<"),
+    ]
+    .concat();
+    let qgs = format!(r#"<qgis version="4.2.3"><projectlayers>{layers}</projectlayers></qgis>"#);
+    let mut s = world();
+    // A tile layer of the user's own on the twin tiles stays: the import makes a map of its own.
+    s.run("map.addTiles", &json!({"url": "https://twin.invalid/{z}/{x}/{y}.png", "name": "mine", "overlay": true})).unwrap();
+    let mine = s.project.active_map;
+    let before = s.connections.connections.len();
+    let out = s.run("project.importQgis", &json!({"text": qgs, "dir": dir.display().to_string()})).unwrap();
+    let notes = serde_json::to_string(&out["notes"]).unwrap();
+    let m = s.map();
+    // The GPX file's tracks alone.
+    let track = m.layer_by_name("track").unwrap();
+    assert_eq!((track.dataset.geometry_type, track.dataset.features.len()), (rustgis_data::GeometryType::Polyline, 1), "{notes}");
+    assert!(m.layers.iter().all(|l| !l.name.contains("waypoints")), "{notes}");
+    // Empty, with its fields; the one of a kind RustGIS hasn't as text.
+    let scratch = m.layer_by_name("scratch").unwrap();
+    let fields: Vec<(&str, rustgis_data::FieldType)> = scratch.dataset.fields.iter().map(|f| (f.name.as_str(), f.ty)).collect();
+    assert_eq!(fields, [("name", rustgis_data::FieldType::Text), ("at", rustgis_data::FieldType::Text)]);
+    assert!(scratch.dataset.features.is_empty() && scratch.dataset.geometry_type == rustgis_data::GeometryType::Polyline);
+    assert!(notes.contains("its fields of kinds RustGIS hasn't, as text (1: at (time))"), "{notes}");
+    assert!(scratch.dataset.crs.is_some(), "{notes}");
+    // The virtual layer: its base layer's file with both filters, one feature of three.
+    let big = m.layer_by_name("big").unwrap();
+    let keeps = |l: &rustgis_map::Layer| {
+        let q = rustgis_data::query::parse(l.definition_query.as_deref().unwrap(), &l.dataset).unwrap();
+        (0..l.dataset.features.len()).filter(|&i| rustgis_data::query::eval(&q, &l.dataset, i)).count()
+    };
+    assert_eq!(keeps(big), 1, "{:?}", big.definition_query);
+    assert!(notes.contains("the virtual layer `SELECT kind, count(*) FROM p GROUP BY kind`"), "{notes}");
+    assert!(m.layer_by_name("counts").is_none());
+    // Vector tiles, their style noted.
+    assert!(m.tiles.iter().any(|t| t.name == "tiles"), "{notes}");
+    assert!(notes.contains("its vector tile style: drawn in RustGIS's colours"), "{notes}");
+    // One saved connection a database (two tables of one PostGIS database), none for a service
+    // name; no password kept.
+    assert_eq!(s.connections.connections.len(), before + 2, "{notes}");
+    let pg = s.connections.connections.iter().find(|c| c.kind == "postgres").unwrap();
+    assert_eq!(pg.address, "postgres:host=db.invalid port=5432 dbname=gis user=me sslmode=disable");
+    let sql = s.connections.connections.iter().find(|c| c.kind == "sqlserver").unwrap();
+    assert_eq!(sql.address, "mssql://me@sql.invalid/gis?instance=main");
+    assert!(!format!("{:?}", s.connections.connections).contains("secret"));
+    assert!(!notes.contains("secret") && !notes.contains("p4ss"), "{notes}");
+    assert!(notes.contains(&format!("log in to the saved connection '{}' (to db.invalid, sslmode disable;", pg.name)), "{notes}");
+    for (table, c) in
+        [("PostGIS table public.towns", &pg.name), ("PostGIS table public.roads", &pg.name), ("SQL Server table dbo.sites", &sql.name)]
+    {
+        assert!(notes.contains(&format!("the {table}: log in to the saved connection '{c}'")), "{table}: {notes}");
+    }
+    assert!(notes.contains("the PostGIS table public.x (service=prod): connect to the database to add it"), "{notes}");
+    assert!(notes.contains("the PostGIS table public.y (service=prod host=db.invalid): connect to the database to add it"), "{notes}");
+    assert!(notes.contains("the PostGIS table public.z: log in to the saved connection"), "{notes}");
+    assert!(notes.contains("the tile archive at a web address"), "{notes}");
+    assert!(notes.contains("the saved connection leaves out these settings of the project's: sslrootcert, and 1 more"), "{notes}");
+    // A table's filter (`sql=`) is named among them, not its text.
+    assert!(
+        notes.contains("the PostGIS table public.roads: log in to the saved connection")
+            && notes.contains("settings of the project's: sql"),
+        "{notes}"
+    );
+    assert!(!notes.contains("value\" > 20") && !notes.contains("\"value\" &gt;"), "{notes}");
+    // No saved connection: the connection text's left-out settings are named too.
+    assert!(
+        notes.contains(
+            "(service=prod): connect to the database to add it; the connection text leaves out these settings of the project's: sslrootcert"
+        ),
+        "{notes}"
+    );
+    assert!(notes.contains("none.pmtiles: no file there"), "{notes}");
+    assert!(m.tiles.iter().all(|t| t.name != "raster archive"), "{notes}");
+    assert!(!notes.contains("/k/ca.pem"), "{notes}");
+    assert!(notes.contains("its geometry (geometrycollection), of a kind RustGIS hasn't: a table without geometry"), "{notes}");
+    assert!(notes.contains("the tile archive on a network share"), "{notes}");
+    assert!(notes.contains("nope.mbtiles: no file there"), "{notes}");
+    // Two layers on the same tiles: the one on top takes the other's place, said; the other
+    // isn't listed as added.
+    let said = |layer: &str, text: &str| {
+        out["notes"].as_array().unwrap().iter().any(|n| n["layer"] == layer && n["text"].as_str().unwrap().contains(text))
+    };
+    assert!(said("unc share", "the tile archive on a network share"), "{notes}");
+    assert!(s.project.maps[mine].tiles.iter().any(|t| t.name == "mine"), "{notes}");
+    assert!(said("zm", "its geometry's Z and M values: RustGIS keeps x and y"), "{notes}");
+    assert!(said("zm", "its fields of a name an earlier field has (1)"), "{notes}");
+    assert!(said("lost", "the layer `nosuch` it selects from isn't in the project"), "{notes}");
+    assert!(said("orphan", "the layer with id `gone_1` it selects from isn't in the project"), "{notes}");
+    assert!(said("on orphan", "the layer with id `gone_1` it selects from isn't in the project"), "{notes}");
+    assert!(said("ring a", "the virtual layers it selects from select from each other"), "{notes}");
+    assert!(said("on on mem", "on a layer RustGIS doesn't read as a file's layer"), "{notes}");
+    assert!(said("on whole gpkg", "its source names no layer of sample.gpkg, a file that holds several"), "{notes}");
+    // A chain deeper than RustGIS follows (each pass resolves one link, as they come after the
+    // layers they select from): those near the file come in, the farthest are said.
+    assert!(m.layer_by_name("deep 11").is_some(), "{notes}");
+    assert!(said("deep 0", "or go deeper than the 8 RustGIS follows"), "{notes}");
+    assert!(said("look two", "the layer: the same tiles as look one, which takes its place"), "{notes}");
+    assert!(said("osm", "the layer: the same tiles as osm, which takes its place"), "{notes}");
+    let listed: Vec<&str> = out["layers"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(listed.contains(&"look one") && !listed.contains(&"look two"), "{listed:?}");
+    assert_eq!(listed.iter().filter(|n| **n == "osm").count(), 1, "{listed:?}");
+    // The file layer named as the replaced tile layer stays listed: the tile layer on top and it.
+    assert_eq!(listed.iter().filter(|n| **n == "dup").count(), 2, "{listed:?}");
+    assert!(s.map().layer_by_name("dup").is_some(), "{notes}");
+    assert_eq!(s.map().tiles.iter().filter(|t| t.name == "osm").count(), 1);
+    assert!(m.tiles.iter().all(|t| t.name != "web mbtiles" && t.name != "share"), "{notes}");
+    // Imported again: the saved connections are used, none made twice.
+    let pg_name = pg.name.clone();
+    let mut again = s.run("project.importQgis", &json!({"text": qgs, "dir": dir.display().to_string()})).unwrap();
+    assert_eq!(s.connections.connections.len(), before + 2);
+    assert!(serde_json::to_string(&again["notes"].take()).unwrap().contains(&format!("log in to the saved connection '{pg_name}'")));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Sources that carry over whole give no notes: a GPX file's tracks, a memory layer of kinds
+/// RustGIS has, and a virtual layer that filters a file's layer.
+#[test]
+fn qgis_sources_that_carry_over_whole_are_not_noted() {
+    let dir = std::env::temp_dir().join(format!("rustgis-qgis-clean-sources-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("trip.gpx"),
+        r#"<gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>b</name><trkseg><trkpt lat="47.4" lon="8.5"/><trkpt lat="47.5" lon="8.6"/></trkseg></trk></gpx>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("pts.geojson"),
+        r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"value":30},"geometry":{"type":"Point","coordinates":[8.5,47.4]}},{"type":"Feature","properties":{"value":10},"geometry":{"type":"Point","coordinates":[8.6,47.4]}}]}"#,
+    )
+    .unwrap();
+    let layer = |id: &str, provider: &str, source: &str| {
+        format!(
+            r#"<maplayer type="vector"><id>{id}</id><datasource>{source}</datasource><layername>{id}</layername><provider>{provider}</provider></maplayer>"#
+        )
+    };
+    let layers = [
+        layer("track", "gpx", "./trip.gpx?type=track"),
+        layer(
+            "scratch",
+            "memory",
+            "memory?geometry=Point&amp;crs=EPSG:4326&amp;field=name:string(20,0)&amp;field=n:integer(10,0)&amp;field=d:date",
+        ),
+        layer("big", "virtual", "?layer=ogr:.%2Fpts.geojson:p&amp;query=SELECT%20*%20FROM%20p%20WHERE%20p.value%20%3E%2020"),
+    ]
+    .concat();
+    let qgs = format!(r#"<qgis version="4.2.3"><projectlayers>{layers}</projectlayers></qgis>"#);
+    let mut s = world();
+    let out = s.run("project.importQgis", &json!({"text": qgs, "dir": dir.display().to_string()})).unwrap();
+    assert_eq!(out["notes"], json!([]), "{}", out["notes"]);
+    assert_eq!(out["layers"].as_array().map(Vec::len), Some(3), "{out}");
+    // The filter, its field written with the table, keeps one feature of the two.
+    let big = s.map().layer_by_name("big").unwrap();
+    let q = rustgis_data::query::parse(big.definition_query.as_deref().unwrap(), &big.dataset).unwrap();
+    let kept: Vec<usize> = (0..big.dataset.features.len()).filter(|&i| rustgis_data::query::eval(&q, &big.dataset, i)).collect();
+    assert_eq!(kept.len(), 1, "{:?}", big.definition_query);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An import makes at most 16 saved connections, and none whose address it would have to guess
+/// at (a quoted value, a Windows user), each table still noted.
+#[test]
+fn qgis_database_connections_are_bounded_and_never_guessed() {
+    let layer = |i: usize, provider: &str, source: &str| {
+        format!(
+            r#"<maplayer type="vector"><id>l{i}</id><datasource>{source}</datasource><layername>l{i}</layername><provider>{provider}</provider></maplayer>"#
+        )
+    };
+    // First those no address is made for, then more databases than an import makes connections for.
+    let mut layers = vec![
+        layer(20, "postgres", r#"dbname='my gis' host=db.invalid table="public"."t" (geom)"#),
+        layer(21, "mssql", r#"dbname='gis' host=sql.invalid user='CORP\\me' table="dbo"."t" (geom)"#),
+        layer(22, "mssql", r#"dbname='gis' host=,1433 table="dbo"."t" (geom)"#),
+        layer(23, "postgres", r#"dbname='gis' host=db.invalid user='a\\b' table="public"."t" (geom)"#),
+    ];
+    layers
+        .extend((0..20).map(|i| layer(i, "postgres", &format!(r#"dbname='gis' host=db{i}.invalid user='me' table="public"."t" (geom)"#))));
+    let qgs = format!(r#"<qgis version="4.2.3"><projectlayers>{}</projectlayers></qgis>"#, layers.concat());
+    let mut s = world();
+    let before = s.connections.connections.len();
+    let out = s.run("project.importQgis", &json!({"text": qgs})).unwrap();
+    let notes = serde_json::to_string(&out["notes"]).unwrap();
+    assert_eq!(s.connections.connections.len(), before + 16, "{notes}");
+    assert_eq!(notes.matches("log in to the saved connection").count(), 16, "{notes}");
+    assert_eq!(notes.matches("connect to the database to add it").count(), 8, "{notes}");
+    // Those past the limit say why no connection was saved; those not guessed at don't.
+    assert_eq!(notes.matches("(no connection could be saved: an import makes at most 16)").count(), 4, "{notes}");
+    let addresses: Vec<&str> = s.connections.connections.iter().map(|c| c.address.as_str()).collect();
+    assert!(!addresses.iter().any(|a| ["my gis", "CORP", "a\\b", "host=,"].iter().any(|t| a.contains(t))), "{addresses:?}");
+}
+
+/// A vector tile layer with a MapLibre style keeps its own tiles, its style noted (without the
+/// style's address, which may carry a key).
+#[test]
+fn qgis_vector_tiles_with_a_style_keep_their_tiles() {
+    let qgs = r#"<qgis version="4.2.3"><projectlayers><maplayer type="vector-tile"><id>t</id><datasource>styleUrl=https://e.invalid/style.json&amp;type=xyz&amp;url=https://e.invalid/%7Bz%7D/%7Bx%7D/%7By%7D.pbf</datasource><layername>styled</layername><provider>xyzvectortiles</provider></maplayer></projectlayers></qgis>"#;
+    let mut s = world();
+    let out = s.run("project.importQgis", &json!({"text": qgs})).unwrap();
+    let notes = serde_json::to_string(&out["notes"]).unwrap();
+    let t = s.map().tiles.iter().find(|t| t.name == "styled").unwrap_or_else(|| panic!("{notes}"));
+    assert!(format!("{t:?}").contains("https://e.invalid/{z}/{x}/{y}.pbf"), "{t:?}");
+    assert!(notes.contains("its vector tile style, and the MapLibre style QGIS made it from: drawn in RustGIS's colours"), "{notes}");
+    assert!(!notes.contains("style.json"), "{notes}");
 }
 
 /// A bookmark the map's projection doesn't reach isn't saved with another place's view, and a
@@ -45101,6 +45480,53 @@ fn layer_invert_ramp_refuses_a_graphics_layer() {
     let id = s.map().layers.iter().find(|l| l.graphics).map(|l| l.id).unwrap();
     let err = s.run("layer.invertRamp", &json!({"layer": id})).unwrap_err();
     assert!(err.contains("graphics layer"), "{err}");
+}
+
+#[test]
+fn calculate_field_bulk_edit_keeps_validation_archive_and_undo() {
+    use rustgis_data::Value as V;
+    let mut s = Session::new(Project::default());
+    let points = json!({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"n": 1, "legacy": 0}, "geometry": {"type": "Point", "coordinates": [0, 0]}},
+        {"type": "Feature", "properties": {"n": 2, "legacy": 0}, "geometry": {"type": "Point", "coordinates": [1, 0]}},
+        {"type": "Feature", "properties": {"n": 3, "legacy": 0}, "geometry": {"type": "Point", "coordinates": [2, 0]}}
+    ]});
+    s.run("layer.addDataText", &json!({"fileName": "calc.geojson", "text": points.to_string()})).unwrap();
+    s.run("edit.addField", &json!({"layer": "calc", "name": "extra", "type": "long"})).unwrap();
+    let ds = &s.map().layer_by_name("calc").unwrap().dataset;
+    assert!(ds.features.iter().all(|row| row.attrs.capacity() < 4));
+    s.run("data.domain", &json!({"layer": "calc", "field": "legacy", "min": 1, "max": 5, "force": true})).unwrap();
+    s.run("data.domain", &json!({"layer": "calc", "field": "n", "min": 0, "max": 4})).unwrap();
+    s.run("data.archive", &json!({"layer": "calc"})).unwrap();
+    s.run("select.rows", &json!({"layer": "calc", "rows": [2, 0]})).unwrap();
+    let params = |expr| json!({"layer": "calc", "field": "n", "expression": expr});
+    let values = |s: &Session| {
+        let ds = &s.map().layer_by_name("calc").unwrap().dataset;
+        let n = ds.field_index("n").unwrap();
+        [0, 1, 2].map(|r| ds.value(r, n).clone())
+    };
+    let before = values(&s);
+    assert!(s.run("edit.calculateField", &params("n + 2")).unwrap_err().contains("domain"));
+    assert_eq!(values(&s), before);
+    assert!(s.map().layer_by_name("calc").unwrap().design.archive.as_ref().unwrap().is_empty());
+    assert_eq!(s.run("edit.calculateField", &params("n + 1")).unwrap()["rows"], 2);
+    assert_eq!(values(&s), [V::Int(2), V::Int(2), V::Int(4)]);
+    let layer = s.map().layer_by_name("calc").unwrap();
+    let archive = layer.design.archive.as_ref().unwrap();
+    let n = layer.dataset.field_index("n").unwrap();
+    assert_eq!(archive.len(), 2);
+    assert_eq!(
+        archive
+            .iter()
+            .map(|entry| (entry.before.as_ref().unwrap().attrs[n].clone(), entry.after.as_ref().unwrap().attrs[n].clone()))
+            .collect::<Vec<_>>(),
+        [(V::Int(1), V::Int(2)), (V::Int(3), V::Int(4))]
+    );
+    s.run("edit.undo", &Value::Null).unwrap();
+    assert_eq!(values(&s), before);
+    assert!(s.map().layer_by_name("calc").unwrap().design.archive.as_ref().unwrap().is_empty());
+    s.run("edit.redo", &Value::Null).unwrap();
+    assert_eq!(values(&s), [V::Int(2), V::Int(2), V::Int(4)]);
 }
 
 /// Calculate Field keeps a decimal result as it is in a decimal field, rather than rounding it to
