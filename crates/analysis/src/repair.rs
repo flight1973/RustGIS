@@ -1254,6 +1254,23 @@ mod tests {
         assert_eq!(hull_of(&[]), []);
     }
 
+    /// Under Even-Odd, a part repeated with a vertex in the middle of a straight edge is the same
+    /// part, left out as a duplicate, not a copy that cancels its twin out.
+    #[test]
+    fn a_part_repeated_with_a_vertex_mid_edge_is_a_duplicate_under_even_odd() {
+        // The same square twice, once with a vertex in the middle of its bottom edge: without
+        // seeing them as one, parity cancels them out and the feature has no area.
+        let mid: Ring = &[(0., 0.), (5., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.)];
+        let g = multi(&[&[SQUARE], &[mid]]);
+        match repair_by(Some(&g), Rule::EvenOdd, &|_| true) {
+            Outcome::Repaired(r) => {
+                assert_eq!(r.duplicates, 1);
+                assert!((area(&r.geometry) - 100.0).abs() < 1e-9, "{:?}", r.geometry);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// Under Even-Odd, parts all narrower than a step of the grid (two thin overlapping rectangles,
     /// a billionth wide, where a step is 2⁻²⁷) are dropped, leaving no area: the feature has none,
     /// not a repair that failed.
