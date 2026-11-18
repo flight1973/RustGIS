@@ -205,6 +205,11 @@ fn a_streamed_export_writes_what_a_whole_export_writes() {
                     beyond_web_mercator: 0,
                     // Counted over the chunks as the whole layer counts it.
                     csv: if ext == "csv" { crate::io::CsvLosses::of(&whole.features, whole.geometry_type) } else { Default::default() },
+                    text: if ext == "csv" {
+                        crate::io::TextLosses::of(&whole.features, &whole.fields, whole.geometry_type, ext, None)
+                    } else {
+                        Default::default()
+                    },
                     unread_dates: Vec::new(),
                     rounded_dates: Vec::new(),
                     null_text: Vec::new(),
