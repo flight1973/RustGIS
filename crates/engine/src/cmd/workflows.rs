@@ -1930,6 +1930,7 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
             let mut notes = rustgis_data::export_notes([(&ds, layer.extent())], &path, rustgis_data::raster::Crs::LonLat);
             if format == "csv" {
                 notes.extend(result.csv.notes(&path));
+                notes.extend(result.csv.coordinates_note(&ds.fields, &path));
                 notes.extend(result.text.notes(&ds.fields, &path));
             }
             if result.skipped > 0 {
