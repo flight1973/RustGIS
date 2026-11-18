@@ -43,8 +43,9 @@
 //! place in the file (a producer numbering them differently, from 1, say) is read by its place,
 //! and the columns are counted in a notice. A column whose checksum doesn't match its heights is
 //! read as stored, and counted in a notice too: GDAL's DTED driver documentation says some
-//! producers write wrong checksums, and that GDAL ignores them by default. A file cut short is read as far as it goes, the missing columns as no data,
-//! and said.
+//! producers write wrong checksums, and that GDAL ignores them by default. A complete cell cut
+//! short is read as far as it goes, the missing columns as no data, and said; a partial cell cut
+//! short is refused, as it can't be told from the magnetic-tape layout.
 //!
 //! The same documentation says some producers write heights in two's complement rather than
 //! signed magnitude. Signed magnitude reads such a negative height as one below −16000 m, which no
@@ -210,16 +211,25 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     // A partial cell (3.11.3) in the magnetic-tape layout: the UHL counts a full cell (3.12 c), but
     // the DSI counts only the lines that have heights, and the records leave missing posts out, so
     // they differ in length (3.11.3.2.2, 3.13.4 s, t). The CD-ROM layout always has the full grid
-    // in both, and is the one read here.
+    // in both, and is the one read here (3.11.3.2.1), so its file holds every record whole. A tape
+    // cell with a height on every line counts the whole cell in its DSI too, but leaving posts out
+    // makes its file shorter than the full grid's: refused as well, said as cut short or tape.
     let (dsi_rows, dsi_cols) = (dsi[2].0.map(|n| n as usize), dsi[3].0.map(|n| n as usize));
-    if let Some(percent) = digits(bytes, DSI + 289, 2).filter(|p| (1..=99).contains(p))
-        && (dsi_cols.is_some_and(|n| n < cols) || dsi_rows.is_some_and(|n| n < rows))
-    {
-        return Err(bad(&format!(
-            "a partial cell ({percent}% coverage) in the magnetic-tape layout, whose DSI counts only the {} of {cols} longitude lines and {} of {rows} latitude points with heights and whose records leave missing posts out; only the full-grid layout, as on CD-ROM, is read",
-            dsi_cols.unwrap_or(cols),
-            dsi_rows.unwrap_or(rows)
-        )));
+    if let Some(percent) = digits(bytes, DSI + 289, 2).filter(|p| (1..=99).contains(p)) {
+        if dsi_cols.is_some_and(|n| n < cols) || dsi_rows.is_some_and(|n| n < rows) {
+            return Err(bad(&format!(
+                "a partial cell ({percent}% coverage) in the magnetic-tape layout, whose DSI counts only the {} of {cols} longitude lines and {} of {rows} latitude points with heights and whose records leave missing posts out; only the full-grid layout, as on CD-ROM, is read",
+                dsi_cols.unwrap_or(cols),
+                dsi_rows.unwrap_or(rows)
+            )));
+        }
+        let full = HEADERS.saturating_add(cols.saturating_mul(12 + 2 * rows));
+        if bytes.len() < full {
+            return Err(bad(&format!(
+                "a partial cell ({percent}% coverage) whose file is {} bytes shorter than its full grid of {cols} × {rows} posts: cut short, or in the magnetic-tape layout, which leaves missing posts out. A partial cell is read only whole, in the full-grid layout as on CD-ROM, since the two can't be told apart",
+                full - bytes.len()
+            )));
+        }
     }
     // The level: the DSI's series designator (3.12 d), or the extension when it names none.
     let ext = std::path::Path::new(file_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -799,6 +809,28 @@ mod tests {
         let err = read("n37.dt1", &tape).unwrap_err().to_string();
         assert!(err.contains("partial cell (50% coverage) in the magnetic-tape layout"), "{err}");
         assert!(err.contains("only the 6 of 11 longitude lines"), "{err}");
+        // On tape with a height on every line the DSI counts the whole cell too, but the record
+        // that starts 5 points up is 10 bytes short, so the file is: refused, as is a partial cell
+        // cut short, which can't be told from it.
+        let mut tape = cdrom.clone();
+        tape[at(0, 11) + 7] = 5;
+        tape.drain(at(0, 11) + 8..at(0, 11) + 18);
+        let err = read("n37.dt1", &tape).unwrap_err().to_string();
+        assert!(
+            err.contains("whose file is 10 bytes shorter than its full grid of 11 × 11 posts: cut short, or in the magnetic-tape layout"),
+            "{err}"
+        );
+        let err = read("n37.dt1", &cdrom[..cdrom.len() - 3]).unwrap_err().to_string();
+        assert!(err.contains("3 bytes shorter"), "{err}");
+        // A complete cell cut short is still read as far as it goes, and a whole partial cell
+        // with a damaged record is read with the damage said.
+        let complete = dted("1220000W", "0370000N", (3600, 3600), (11, 11), |_, _| Some(100));
+        let r = read("n37.dt1", &complete[..complete.len() - 3]).unwrap();
+        assert!(r.lost.iter().any(|l| l.contains("the file is cut short")), "{:?}", r.lost);
+        let mut damaged = cdrom.clone();
+        damaged[at(3, 11)] = 0;
+        let r = read("n37.dt1", &damaged).unwrap();
+        assert!(r.lost.iter().any(|l| l.contains("damaged record header")), "{:?}", r.lost);
         // A complete cell's file (indicator 00) whose DSI disagrees is read, the difference said.
         let mut complete = dted("1220000W", "0370000N", (3600, 3600), (11, 11), |_, _| Some(100));
         complete[DSI + 285..DSI + 289].copy_from_slice(b"0006");
