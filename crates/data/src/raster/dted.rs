@@ -41,16 +41,15 @@
 //! A column whose record doesn't start with the sentinel is damaged and read as no data, and the
 //! columns are counted in a notice. A record whose latitude count isn't 0 is refused, naming the
 //! file and column: a full-grid record starts at latitude point 0 (3.12 f), and its heights would
-//! otherwise be placed north or south of where they belong. A record whose longitude count
-//! disagrees with its place in the file is read by its place, and the columns are counted in a
-//! notice, when the place can be trusted: a whole cell numbered from 1, or a count that names no column or a column that
-//! has its own record. Counts that name a column with no record of their own (leading columns left
-//! out, or counts offset) mean the heights belong elsewhere, and the file is refused
-//! ([`placement`]). A column whose checksum doesn't match its heights is
-//! read as stored, and counted in a notice too: GDAL's DTED driver documentation says some
-//! producers write wrong checksums, and that GDAL ignores them by default. A complete cell cut
-//! short is read as far as it goes, the missing columns as no data, and said; a partial cell cut
-//! short is refused, as it can't be told from the magnetic-tape layout.
+//! otherwise be placed north or south of where they belong. A whole cell whose longitude counts
+//! all number the lines from 1 rather than 0 is read by place, and the columns are counted in a
+//! notice. Any other longitude count that disagrees with its place (leading columns left out,
+//! counts offset, or a stray count) means the heights may belong to another column, and the file
+//! is refused, naming the first such record ([`placement`]). A column whose checksum doesn't
+//! match its heights is read as stored, and counted in a notice too: GDAL's DTED driver
+//! documentation says some producers write wrong checksums, and that GDAL ignores them by default.
+//! A complete cell cut short is read as far as it goes, the missing columns as no data, and said;
+//! a partial cell cut short is refused, as it can't be told from the magnetic-tape layout.
 //!
 //! The same documentation says some producers write heights in two's complement rather than
 //! signed magnitude. Signed magnitude reads such a negative height as one below −16000 m, which no
@@ -166,31 +165,24 @@ pub fn spec_latitude_interval(level: u8) -> Option<u32> {
 /// for one without its sentinel) in a cell of `cols` longitude lines; `Err` gives the place and
 /// count of the first record whose heights may belong to another column.
 ///
-/// The counts number the lines from 0 at the origin (3.12 f). Read by place are:
+/// The counts number the lines from 0 at the origin (3.12 f). Read by place are only:
 /// - every record counting its own place;
 /// - a whole cell numbered from 1: every column's record there, each counting its place + 1, so the
-///   last counts `cols`, which no line from 0 can;
-/// - a record whose count names no column (negative, or `cols` and above), or names a column that
-///   has its own record counting it: the count is wrong, not the place.
+///   last counts `cols`, which no line from 0 can.
 ///
-/// Any other count names a column with no record of its own, as when leading columns are left
-/// out (counts 100 to 500 in a cell of 3601 lines) or the counts are offset; read by place, those
-/// heights would land in the wrong columns, so the file is refused.
+/// Any other count may mean the heights belong to another column, as when leading columns are
+/// left out (counts 100 to 500 in a cell of 3601 lines) or the counts are offset, even past the
+/// cell's last line; read by place, those heights would land in the wrong columns, so the file is
+/// refused.
 fn placement(counts: &[Option<i64>], cols: usize) -> std::result::Result<(), (usize, i64)> {
     let numbered_from_one = counts.len() == cols && counts.iter().enumerate().all(|(i, c)| c.is_none_or(|c| c == i as i64 + 1));
     if numbered_from_one {
         return Ok(());
     }
-    for (i, count) in counts.iter().enumerate() {
-        let Some(c) = *count else { continue };
-        if c == i as i64 || c < 0 || c >= cols as i64 {
-            continue;
-        }
-        if counts.get(c as usize).copied().flatten() != Some(c) {
-            return Err((i, c));
-        }
+    match counts.iter().enumerate().find_map(|(i, c)| c.filter(|c| *c != i as i64).map(|c| (i, c))) {
+        Some(first) => Err(first),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Reads a DTED file: `bytes` are the file, `file_name` its name (its extension gives the level
@@ -334,7 +326,7 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
         .collect();
     placement(&lon_counts, cols).map_err(|(place, count)| {
         bad(&format!(
-            "{file_name}: the record at column {place} counts itself as column {count}, and column {count} has no record of its own that says so: its heights may belong to column {count} (columns left out, or counts offset), so the file is refused rather than read with heights in the wrong columns"
+            "{file_name}: the record at column {place} counts itself as column {count}, not {place}: its heights may belong to another column (columns left out, or counts offset), so the file is refused rather than read with heights in the wrong columns. Only a whole cell numbered from 1 is read by place"
         ))
     })?;
     // A full-grid record's first height is latitude point 0 (3.12 f); one counting another point
@@ -365,8 +357,8 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
             damaged += 1;
             continue;
         }
-        // A longitude count other than the record's place is said, and the record read by its
-        // place (latitude counts other than 0 were refused above).
+        // A whole cell numbered from 1 is read by place, and said (any other longitude count that
+        // isn't the record's place, and any latitude count other than 0, was refused above).
         if lon_count != i as i64 {
             misnumbered += 1;
         }
@@ -412,8 +404,10 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     }
     match misnumbered {
         0 => {}
-        1 => lost.push(format!("1 of its {cols} columns' longitude count doesn't match its place in the file; it is read by place")),
-        n => lost.push(format!("{n} of its {cols} columns' longitude counts don't match their place in the file; they are read by place")),
+        1 => lost.push(format!("1 of its {cols} columns' longitude count numbers it from 1, not 0; it is read by its place in the file")),
+        n => lost.push(format!(
+            "{n} of its {cols} columns' longitude counts number them from 1, not 0; they are read by their place in the file"
+        )),
     }
     match mismatched {
         0 => {}
@@ -692,28 +686,7 @@ mod tests {
             "{:?}",
             r.lost
         );
-        // A wrong column number is read by its place, and said.
-        let mut moved = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |i, _| Some(i as i16));
-        moved[at(7, rows) + 5] = 9;
-        let r = read("x.dt2", &moved).unwrap();
-        assert_eq!(r.value(0, 7, 4), Some(7.0), "read by place");
-        assert!(!r.lost.iter().any(|l| l.contains("damaged record header")), "{:?}", r.lost);
-        assert!(
-            r.lost.iter().any(|l| l == "1 of its 11 columns' longitude count doesn't match its place in the file; it is read by place"),
-            "{:?}",
-            r.lost
-        );
-        // A latitude count other than 0 would shift the column's heights: refused, naming the
-        // file, column and count.
-        moved[at(8, rows) + 7] = 1;
-        let e = read("n00e000.dt2", &moved).unwrap_err().to_string();
-        assert!(
-            e.contains("n00e000.dt2")
-                && e.contains("the record at column 8 counts its first height as latitude point 1, not 0")
-                && e.contains("refused"),
-            "{e}"
-        );
-        // Latitude count 0 everywhere (the clean file) says nothing about counts.
+        // Every count its place (the clean file) says nothing about counts.
         let clean = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |i, _| Some(i as i16));
         let r = read("x.dt2", &clean).unwrap();
         assert!(!r.lost.iter().any(|l| l.contains("count")), "{:?}", r.lost);
@@ -750,18 +723,33 @@ mod tests {
         assert_eq!(r.value(0, 10, 0), Some(1010.0), "column 10, point 10");
         assert_eq!(
             r.lost.iter().filter(|l| l.contains("longitude count")).collect::<Vec<_>>(),
-            ["11 of its 11 columns' longitude counts don't match their place in the file; they are read by place"]
+            ["11 of its 11 columns' longitude counts number them from 1, not 0; they are read by their place in the file"]
         );
         assert!(!r.lost.iter().any(|l| l.contains("damaged") || l.contains("checksum")), "{:?}", r.lost);
-        // One column out of place is said in the singular.
+        // One column numbered from 1 among columns numbered from 0 isn't a cell numbered from 1:
+        // refused, naming it.
         let mut one = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |_, _| Some(1));
-        one[at(3, rows) + 5] = 4;
-        let r = read("x.dt1", &one).unwrap();
+        renumber(&mut one, at(3, rows), rows, 4);
+        let e = read("x.dt1", &one).unwrap_err().to_string();
+        assert!(e.contains("the record at column 3 counts itself as column 4, not 3"), "{e}");
+    }
+
+    #[test]
+    fn a_cell_missing_its_first_100_columns_is_refused() {
+        // A full cell of 3601 longitude lines (1″ apart), partial-cell indicator 00, holding only
+        // the 401 records counted 100 to 500, from the first data byte. By place, column 100's
+        // heights would land in column 0.
+        let rows = 11;
+        let b = dted("0000000E", "0000000N", (10, 3600), (3601, rows), |i, j| Some((i % 1000 * 10 + j) as i16));
+        let mut offset = b[..HEADERS].to_vec();
+        offset.extend(&b[at(100, rows)..at(501, rows)]);
+        let e = read("n00e000.dt2", &offset).unwrap_err().to_string();
         assert!(
-            r.lost.iter().any(|l| l == "1 of its 11 columns' longitude count doesn't match its place in the file; it is read by place"),
-            "{:?}",
-            r.lost
+            e.contains("n00e000.dt2") && e.contains("the record at column 0 counts itself as column 100, not 0") && e.contains("refused"),
+            "{e}"
         );
+        // The whole cell, every count its place, opens.
+        assert!(read("n00e000.dt2", &b).is_ok());
     }
 
     /// Sets the longitude count of the record at `rec` to `count`, its checksum made right.
@@ -813,17 +801,49 @@ mod tests {
             renumber(&mut gap, at(i, rows), rows, i as u16 + 1);
         }
         refused(&gap[..at(10, rows)], 5, 6);
-        // A count naming no column, or one with its own record, is a wrong count: read by place.
-        let mut wrong = full();
-        renumber(&mut wrong, at(2, rows), rows, 40);
-        renumber(&mut wrong, at(6, rows), rows, 9);
-        let r = read("x.dt1", &wrong).unwrap();
-        assert_eq!((r.value(0, 2, 10), r.value(0, 6, 10)), (Some(200.0), Some(600.0)));
-        assert!(
-            r.lost.iter().any(|l| l == "2 of its 11 columns' longitude counts don't match their place in the file; they are read by place"),
-            "{:?}",
-            r.lost
-        );
+        // Offset past the cell's last line: every count names no column, so none can be trusted.
+        let mut past = full();
+        for i in 0..11 {
+            renumber(&mut past, at(i, rows), rows, i as u16 + 20);
+        }
+        refused(&past, 0, 20);
+        // A count naming no column, or a column that has its own record, is refused too.
+        let mut stray = full();
+        renumber(&mut stray, at(2, rows), rows, 40);
+        refused(&stray, 2, 40);
+        let mut twice = full();
+        renumber(&mut twice, at(6, rows), rows, 9);
+        refused(&twice, 6, 9);
+    }
+
+    #[test]
+    fn a_nonzero_latitude_count_is_refused() {
+        // A full-grid record starts at latitude point 0 (3.12 f); one counting another point would
+        // place its heights north or south of where they belong: refused, naming the file, column
+        // and count.
+        let rows = 11;
+        let full = || dted("0000000E", "0000000N", (3600, 3600), (11, rows), |i, j| Some((i * 100 + j) as i16));
+        let set = |b: &mut [u8], i: usize, raw: [u8; 2]| {
+            let rec = at(i, rows);
+            b[rec + 6..rec + 8].copy_from_slice(&raw);
+            let sum: u32 = b[rec..rec + 8 + 2 * rows].iter().map(|v| u32::from(*v)).sum();
+            b[rec + 8 + 2 * rows..rec + 12 + 2 * rows].copy_from_slice(&sum.to_be_bytes());
+        };
+        for (i, raw, point) in [(8, [0, 1], 1), (0, [0x80, 0x03], -3)] {
+            let mut b = full();
+            set(&mut b, i, raw);
+            let e = read("n00e000.dt1", &b).unwrap_err().to_string();
+            assert!(
+                e.contains("n00e000.dt1")
+                    && e.contains(&format!("the record at column {i} counts its first height as latitude point {point}, not 0"))
+                    && e.contains("refused"),
+                "{e}"
+            );
+        }
+        // Every latitude count 0 (the clean file) opens and says nothing about counts.
+        let r = read("n00e000.dt1", &full()).unwrap();
+        assert_eq!(r.value(0, 10, 0), Some(1010.0));
+        assert!(!r.lost.iter().any(|l| l.contains("count")), "{:?}", r.lost);
     }
 
     #[test]
