@@ -53694,9 +53694,16 @@ fn a_rounded_time_is_said_once() {
         "Times",
         &[&["moment", "longitude", "latitude"], &[r#"<c t="d"><v>2019-07-04T12:30:15.1234567Z</v></c>"#, "10", "20"]],
     )]);
+    // Removed when the test ends, passing or not (the engine's tests have no tempfile).
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let dir = std::env::temp_dir().join(format!("rustgis-rounded-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-rounded-{}-{nanos}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
     for (what, command, params) in [
         ("gpx", "layer.addDataText", json!({"fileName": "trip.gpx", "text": gpx})),
         (
@@ -53712,8 +53719,7 @@ fn a_rounded_time_is_said_once() {
         assert_eq!(rounded(&s, mark), 1, "{what}: {:?}", s.notices_since(mark));
         let id = s.map().layers.first().unwrap().id;
         let mark = s.notice_mark();
-        s.run("share.exportLayer", &json!({"layer": id, "path": dir.join(format!("{what}.csv"))})).unwrap();
+        s.run("share.exportLayer", &json!({"layer": id, "path": dir.0.join(format!("{what}.csv"))})).unwrap();
         assert_eq!(rounded(&s, mark), 0, "{what}: {:?}", s.notices_since(mark));
     }
-    std::fs::remove_dir_all(&dir).unwrap();
 }

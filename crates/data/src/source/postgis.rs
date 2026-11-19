@@ -1086,7 +1086,7 @@ impl PostgisSource {
             let (Some(f), Some(v)) = (self.feature(r, &mut unread), r.try_get::<_, Option<i64>>(version).ok().flatten()) else {
                 continue;
             };
-            super::add_unread_dates(&mut out.unread_dates, &unread);
+            super::add_counts(&mut out.unread_dates, &unread);
             out.versions.push((f.id, v));
             out.features.push(f);
         }
@@ -1637,7 +1637,7 @@ impl FeatureSource for PostgisSource {
             {
                 continue;
             }
-            super::add_unread_dates(&mut out.unread_dates, &unread);
+            super::add_counts(&mut out.unread_dates, &unread);
             out.features.push(feature);
         }
         out.complete = step <= 1 && (rows.len() as u64) >= out.matched;

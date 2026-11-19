@@ -895,7 +895,7 @@ impl SqlServerSource {
                 continue;
             };
             if f.geometry.as_ref().is_some_and(|g| in_request(g, req)) {
-                super::add_unread_dates(&mut out.unread_dates, &unread);
+                super::add_counts(&mut out.unread_dates, &unread);
                 out.features.push(f);
             }
         }

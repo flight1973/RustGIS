@@ -429,8 +429,8 @@ impl EditTable {
                 let (mut unread, mut rounded) = (Vec::new(), Vec::new());
                 let read = value(ValueRef::from(stored), field.ty, &mut unread, Some(&mut rounded), i);
                 if before.get(&(k, c)) != Some(stored) {
-                    crate::source::add_unread_dates(&mut unread_dates, &unread);
-                    crate::source::add_unread_dates(&mut rounded_dates, &rounded);
+                    crate::source::add_counts(&mut unread_dates, &unread);
+                    crate::source::add_counts(&mut rounded_dates, &rounded);
                 }
                 *attr = read;
             }

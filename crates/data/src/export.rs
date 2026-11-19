@@ -186,11 +186,11 @@ fn write_chunks_as(
                 csv += crate::io::CsvLosses::of(&chunk, geometry_type, &layer.fields)?;
             }
             if ext == "gpkg" {
-                crate::source::add_unread_dates(&mut utc_dates, &crate::io::offset_dates(chunk.iter(), &layer.fields));
-                crate::source::add_unread_dates(&mut fine_dates, &crate::io::fine_dates(chunk.iter(), &layer.fields));
+                crate::source::add_counts(&mut utc_dates, &crate::io::offset_dates(chunk.iter(), &layer.fields));
+                crate::source::add_counts(&mut fine_dates, &crate::io::fine_dates(chunk.iter(), &layer.fields));
             }
             if ext == "fgb" {
-                crate::source::add_unread_dates(&mut written_values, &crate::io::written_values(chunk.iter(), &layer.fields));
+                crate::source::add_counts(&mut written_values, &crate::io::written_values(chunk.iter(), &layer.fields));
             }
             crate::progress::without_counting(|| add(&chunk))
         })?;

@@ -287,8 +287,9 @@ pub(crate) fn server_date(text: Option<&str>, ty: crate::FieldType, unread: &mut
     gpkg_blob::temporal(Some(text), ty, unread, None, k)
 }
 
-/// Adds the counts of a later read to `counts` ([`Batch::unread_dates`]).
-pub fn add_unread_dates(counts: &mut Vec<usize>, more: &[usize]) {
+/// Adds the per-field counts of a later read to `counts` ([`Batch::unread_dates`],
+/// [`Batch::rounded_dates`], [`Batch::null_text`]).
+pub fn add_counts(counts: &mut Vec<usize>, more: &[usize]) {
     if counts.len() < more.len() {
         counts.resize(more.len(), 0);
     }
@@ -323,22 +324,24 @@ pub fn null_text_note(fields: &[crate::Field], counts: &[usize]) -> Option<Strin
 /// What a read says of date-times it rounded to the microsecond ([`Batch::rounded_dates`]), naming
 /// the first five fields. `None` when there were none.
 pub fn rounded_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
-    let total: usize = counts.iter().sum();
-    if total == 0 {
-        return None;
-    }
-    let what = if total == 1 { "1 date-time was".to_string() } else { format!("{total} date-times were") };
-    Some(format!("{what} rounded to the microsecond, as more digits than that aren't kept, in {}", crate::io::named_fields(fields, counts)))
+    rounded_note(fields, counts, ("date-time", "date-times"))
 }
 
 /// [`rounded_dates_note`], for a reader whose serial dates may be kept as text (a time without a
 /// day): said as date or time values when a counted field isn't a date-time field.
 pub(crate) fn rounded_serials_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
+    let date_times = fields.iter().zip(counts).all(|(f, n)| *n == 0 || f.ty == crate::FieldType::DateTime);
+    rounded_note(fields, counts, if date_times { ("date-time", "date-times") } else { ("date or time value", "date or time values") })
+}
+
+/// What a read says of `counts` values rounded to the microsecond, called by `noun` (one, many).
+fn rounded_note(fields: &[crate::Field], counts: &[usize], noun: (&str, &str)) -> Option<String> {
     let total: usize = counts.iter().sum();
-    if fields.iter().zip(counts).all(|(f, n)| *n == 0 || f.ty == crate::FieldType::DateTime) {
-        return rounded_dates_note(fields, counts);
-    }
-    let what = if total == 1 { "1 date or time value was".to_string() } else { format!("{total} date or time values were") };
+    let what = match total {
+        0 => return None,
+        1 => format!("1 {} was", noun.0),
+        n => format!("{n} {} were", noun.1),
+    };
     Some(format!("{what} rounded to the microsecond, as more digits than that aren't kept, in {}", crate::io::named_fields(fields, counts)))
 }
 

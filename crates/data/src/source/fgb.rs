@@ -399,8 +399,8 @@ impl FgbSource {
                 out.skipped += 1;
                 continue;
             }
-            super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
-            super::add_unread_dates(&mut out.rounded_dates, &props.rounded_dates);
+            super::add_counts(&mut out.unread_dates, &props.unread_dates);
+            super::add_counts(&mut out.rounded_dates, &props.rounded_dates);
             sample.keep(Feature { id, geometry: Some(geometry), attrs: props.values });
         }
         out.matched = if late || matched == 0 { sample.seen() } else { matched };
@@ -464,8 +464,8 @@ impl FgbSource {
                 out.skipped += 1;
                 continue;
             }
-            super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
-            super::add_unread_dates(&mut out.rounded_dates, &props.rounded_dates);
+            super::add_counts(&mut out.unread_dates, &props.unread_dates);
+            super::add_counts(&mut out.rounded_dates, &props.rounded_dates);
             out.matched += 1;
             chunks.push(Feature { id, geometry: Some(geometry), attrs: props.values })?;
         }
@@ -777,8 +777,8 @@ impl FgbSource {
                 out.skipped += 1;
                 continue;
             }
-            super::add_unread_dates(&mut out.unread_dates, &props.unread_dates);
-            super::add_unread_dates(&mut out.rounded_dates, &props.rounded_dates);
+            super::add_counts(&mut out.unread_dates, &props.unread_dates);
+            super::add_counts(&mut out.rounded_dates, &props.rounded_dates);
             let feature = Feature { id, geometry: Some(geometry), attrs: props.values };
             if late {
                 sample.keep(feature);

@@ -931,13 +931,25 @@ fn filegdb_temporal_fields_keep_days_offsets_and_null_notices() {
     );
     assert!(report.unread_dates.unwrap().starts_with("1 value"));
     assert!(ds.features[1].attrs.iter().all(Value::is_null));
-    assert_eq!(gdb_datetime(25_569.5, None).to_string(), "1970-01-01T12:00:00");
-    assert!(gdb_datetime(25_569.0, Some(i16::MIN)).is_null());
-    assert!(gdb_datetime(1e100, None).is_null());
+    assert_eq!(gdb_datetime(25_569.5, None).0.to_string(), "1970-01-01T12:00:00");
+    assert!(gdb_datetime(25_569.0, Some(i16::MIN)).0.is_null());
+    assert!(gdb_datetime(1e100, None).0.is_null());
+    // A date-only field keeps the day: a time finer than the microsecond in it isn't counted.
+    let (t, x) = table(0, &[F::Date("day", 14)], &[vec![V::Date(Some((45_000.0 + 0.123_456_789 / 86_400.0, None)))]]);
+    let (ds, report) = read_table("dates", &t, &x, None).unwrap().unwrap();
+    assert!(report.rounded_dates.is_none(), "{report:?}");
+    assert!(ds.value(0, 0).is_null(), "a time of day isn't a date: {:?}", ds.value(0, 0));
     // Exercise the reader/report boundary as well as the shared serial helper. 45000.1 isn't
     // 45000.1 in binary, but it is the f64 02:24:00 makes, so nothing finer was lost (#1894);
-    // serials holding more than the microsecond are rounded and said.
-    for (serial, rounded) in [(45_000.5, false), (45_000.1, false), (1.0 + 0.123_456_789 / 86_400.0, true), (45_000.123_456_789, true)] {
+    // 45000.123456789, 15 significant digits, is what a program writing 15 digits writes for its
+    // microsecond; serials holding more than the microsecond are rounded and said.
+    for (serial, rounded) in [
+        (45_000.5, false),
+        (45_000.1, false),
+        (1.0 + 0.123_456_789 / 86_400.0, true),
+        (45_000.123_456_789, false),
+        (45_000.0 + 0.123_456_789 / 86_400.0, true),
+    ] {
         let (t, x) = table(0, &[F::Date("moment", 5)], &[vec![V::Date(Some((serial, None)))]]);
         let (_, report) = read_table("dates", &t, &x, None).unwrap().unwrap();
         let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded to the microsecond")).collect();

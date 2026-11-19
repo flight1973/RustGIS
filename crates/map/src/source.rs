@@ -731,10 +731,10 @@ impl SourceLayer {
     /// Each kind is counted until its own notice is said, so saying one doesn't silence the other.
     pub fn saw_unread_dates(&mut self, unread: &[usize], rounded: &[usize]) {
         if !self.unread_dates_said && unread.iter().any(|n| *n > 0) {
-            rustgis_data::source::add_unread_dates(self.unread_dates.get_or_insert_with(Vec::new), unread);
+            rustgis_data::source::add_counts(self.unread_dates.get_or_insert_with(Vec::new), unread);
         }
         if !self.rounded_dates_said && rounded.iter().any(|n| *n > 0) {
-            rustgis_data::source::add_unread_dates(self.rounded_dates.get_or_insert_with(Vec::new), rounded);
+            rustgis_data::source::add_counts(self.rounded_dates.get_or_insert_with(Vec::new), rounded);
         }
     }
 
@@ -759,7 +759,7 @@ impl SourceLayer {
     /// [`SourceLayer::take_null_text`] says it, as [`SourceLayer::saw_unread_dates`] does for dates.
     pub fn saw_null_text(&mut self, counts: &[usize]) {
         if !self.null_text_said && counts.iter().any(|n| *n > 0) {
-            rustgis_data::source::add_unread_dates(self.null_text.get_or_insert_with(Vec::new), counts);
+            rustgis_data::source::add_counts(self.null_text.get_or_insert_with(Vec::new), counts);
         }
     }
 

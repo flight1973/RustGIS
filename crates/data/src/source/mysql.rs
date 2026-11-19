@@ -1085,7 +1085,7 @@ impl MysqlSource {
             if !in_request(g, req) {
                 continue;
             }
-            super::add_unread_dates(&mut out.unread_dates, &unread);
+            super::add_counts(&mut out.unread_dates, &unread);
             out.features.push(f);
         }
         out.complete = step <= 1 && (rows.len() as u64) >= out.matched;

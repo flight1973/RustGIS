@@ -810,12 +810,14 @@ impl Table {
             let text = |b: &[u8]| if self.utf8 { String::from_utf8_lossy(b).into_owned() } else { utf16(b) };
             let cell = |value: Value| Cell { value, blob: None, invalid_date: false, rounded_date: false };
             let date_cell = |days: f64, offset: Option<i16>, only: bool| {
-                let value = match gdb_datetime(days, offset) {
+                let (value, rounded) = gdb_datetime(days, offset);
+                let value = match value {
                     Value::DateTime(t) if only && t.is_date() => Value::Date(t.date()),
                     Value::DateTime(_) if only => Value::Null,
                     v => v,
                 };
-                let rounded_date = !value.is_null() && serial_rounds(days);
+                // A date-only field keeps only the day, so nothing of the microsecond is lost.
+                let rounded_date = rounded && !only && !value.is_null();
                 Cell { invalid_date: value.is_null(), rounded_date, value, blob: None }
             };
             out.push(match f.kind {
@@ -857,20 +859,16 @@ fn float(v: f64) -> Value {
     if v.is_finite() { Value::Float(v) } else { Value::Null }
 }
 
-/// Whether the floating-point serial has precision below the microsecond RustGIS stores.
-fn serial_rounds(days: f64) -> bool {
-    crate::date::serial_datetime(days, -25_569).is_some_and(|(_, rounded)| rounded)
-}
-
 /// FileGDB days count from 1899-12-30. Offset fields store local clock days and minutes east
-/// of UTC. Round the binary floating-point serial to microseconds, retaining its precision.
-fn gdb_datetime(days: f64, offset: Option<i16>) -> Value {
-    let Some((wall, _)) = crate::date::serial_datetime(days, -25_569) else { return Value::Null };
+/// of UTC. Round the binary floating-point serial to microseconds, retaining its precision; the
+/// boolean says the serial held more than the microsecond.
+fn gdb_datetime(days: f64, offset: Option<i16>) -> (Value, bool) {
+    let Some((wall, rounded)) = crate::date::serial_datetime(days, -25_569) else { return (Value::Null, false) };
     let t = match offset {
         None => Some(wall),
         Some(off) => wall.micros().checked_sub(i64::from(off) * 60_000_000).and_then(|v| crate::DateTime::with_offset(v, off)),
     };
-    t.map(Value::DateTime).unwrap_or_default()
+    (t.map(Value::DateTime).unwrap_or_default(), rounded)
 }
 
 /// Days since 1899-12-30 as text in `fmt`.

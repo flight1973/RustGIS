@@ -154,8 +154,12 @@ fn grid_unguarded(mut wb: Sheets<Cursor<&[u8]>>, sheet: Option<&str>) -> Result<
     // Serial date-times below the header that held more than the microsecond, counted as their
     // text is made.
     let mut rounded_dates = vec![0usize; w];
-    let mut rows = range.rows().enumerate().map(|(at, r)| {
-        r.iter()
+    // The header is the first row with anything in it once made text, as it is taken below.
+    let mut header_seen = false;
+    let mut rows = range.rows().map(|r| {
+        let mut rounded_here = Vec::new();
+        let row = r
+            .iter()
             .enumerate()
             .map(|(k, d)| match (d, dates.get(k)) {
                 (Data::DateTime(t), Some(None)) if is_phantom_day(t) => {
@@ -166,17 +170,24 @@ fn grid_unguarded(mut wb: Sheets<Cursor<&[u8]>>, sheet: Option<&str>) -> Result<
                 }
                 (Data::DateTime(t), _) if !t.is_duration() => {
                     let (text, rounded) = excel_date(t.as_f64(), is_1904(t), true);
-                    if rounded
-                        && at > header_at
-                        && let Some(n) = rounded_dates.get_mut(k)
-                    {
-                        *n += 1;
+                    if rounded {
+                        rounded_here.push(k);
                     }
                     text
                 }
                 _ => cell(d),
             })
-            .collect::<Vec<String>>()
+            .collect::<Vec<String>>();
+        if header_seen {
+            for k in rounded_here {
+                if let Some(n) = rounded_dates.get_mut(k) {
+                    *n += 1;
+                }
+            }
+        } else {
+            header_seen = row.iter().any(|c| !c.trim().is_empty());
+        }
+        row
     });
     // The first row with anything in it names the columns.
     let headers: Vec<String> = rows.by_ref().find(|r| r.iter().any(|c| !c.trim().is_empty())).unwrap_or_default();
@@ -664,6 +675,22 @@ mod tests {
 
     /// A `<Null>` cell among date cells is read as empty and said, and doesn't make the column
     /// text (#1894); a column of dates alone says nothing.
+    /// A workbook's `book` with its cells styled by number format `fmt` (`<c s="0">`), of the 1904
+    /// date system when `date1904`.
+    fn styled_xlsx(book: &[u8], fmt: u32, date1904: bool) -> Vec<u8> {
+        let mut entries = crate::zip::read(book).unwrap();
+        let styles = format!(
+            r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="{fmt}"/></cellXfs></styleSheet>"#
+        );
+        entries.push(("xl/styles.xml".into(), styles.into_bytes()));
+        if date1904 {
+            let at = entries.iter().position(|(n, _)| n == "xl/workbook.xml").unwrap();
+            let xml = String::from_utf8(entries[at].1.clone()).unwrap().replace("<sheets>", r#"<workbookPr date1904="1"/><sheets>"#);
+            entries[at].1 = xml.into_bytes();
+        }
+        crate::zip::write(&entries).unwrap()
+    }
+
     #[test]
     fn a_null_cell_does_not_make_a_date_column_text() {
         let date = |d: &str| format!(r#"<c t="d"><v>{d}</v></c>"#);
@@ -695,10 +722,9 @@ mod tests {
         // A serial cell that held more than the microsecond, in the same column, is said in the
         // same notice.
         let book =
-            xlsx(&[("Times", &[&["moment"], &[&cell("2019-07-04T12:30:15.1234567Z")], &[r#"<c s="0"><v>45000.123456789</v></c>"#]])]);
-        let mut entries = crate::zip::read(&book).unwrap();
-        entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="22"/></cellXfs></styleSheet>"#.to_vec()));
-        let (ds, report) = read(&crate::zip::write(&entries).unwrap(), "times", None, &CsvOptions::default()).unwrap();
+            xlsx(&[("Times", &[&["moment"], &[&cell("2019-07-04T12:30:15.1234567Z")], &[r#"<c s="0"><v>45000.000001428896</v></c>"#]])]);
+        let book = styled_xlsx(&book, 22, false);
+        let (ds, report) = read(&book, "times", None, &CsvOptions::default()).unwrap();
         assert_eq!(ds.fields[0].ty, FieldType::DateTime);
         assert_eq!(report.messages, ["2 date-times were rounded to the microsecond, as more digits than that aren't kept, in 'moment'"]);
         let book = xlsx(&[("Times", &[&["moment"], &[&cell("2019-07-04T12:30:15.123456Z")]])]);
@@ -722,14 +748,8 @@ mod tests {
             rows.extend(cells.iter().map(|c| vec![c.as_str()]));
             let rows: Vec<&[&str]> = rows.iter().map(Vec::as_slice).collect();
             let book = xlsx(&[("Dates", &rows)]);
-            let mut entries = crate::zip::read(&book).unwrap();
-            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="22"/></cellXfs></styleSheet>"#.to_vec()));
-            if date1904 {
-                let at = entries.iter().position(|(n, _)| n == "xl/workbook.xml").unwrap();
-                let xml = String::from_utf8(entries[at].1.clone()).unwrap().replace("<sheets>", r#"<workbookPr date1904="1"/><sheets>"#);
-                entries[at].1 = xml.into_bytes();
-            }
-            let (ds, report) = read(&crate::zip::write(&entries).unwrap(), "dates", None, &CsvOptions::default()).unwrap();
+            let book = styled_xlsx(&book, 22, date1904);
+            let (ds, report) = read(&book, "dates", None, &CsvOptions::default()).unwrap();
             assert_eq!(ds.fields[0].ty, FieldType::DateTime, "day {day}");
             assert!(report.messages.is_empty() && report.rounded_dates.is_none(), "day {day}: {report:?}");
             let micros = |row: usize| match ds.value(row, 0) {
@@ -753,12 +773,8 @@ mod tests {
             let mut rows: Vec<Vec<&str>> = vec![vec!["day"]];
             rows.extend(cells.iter().map(|c| vec![c.as_str()]));
             let rows: Vec<&[&str]> = rows.iter().map(Vec::as_slice).collect();
-            let mut entries = crate::zip::read(&xlsx(&[("Dates", &rows)])).unwrap();
-            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="14"/></cellXfs></styleSheet>"#.to_vec()));
-            let at = entries.iter().position(|(n, _)| n == "xl/workbook.xml").unwrap();
-            let xml = String::from_utf8(entries[at].1.clone()).unwrap().replace("<sheets>", r#"<workbookPr date1904="1"/><sheets>"#);
-            entries[at].1 = xml.into_bytes();
-            read(&crate::zip::write(&entries).unwrap(), "dates", None, &CsvOptions::default()).unwrap()
+            let book = styled_xlsx(&xlsx(&[("Dates", &rows)]), 14, true);
+            read(&book, "dates", None, &CsvOptions::default()).unwrap()
         };
         let (ds, report) = book(&["59", "60", "61"]);
         assert_eq!(ds.fields[0].ty, FieldType::Date);
@@ -767,19 +783,21 @@ mod tests {
         assert!(report.messages.is_empty(), "{report:?}");
         // A negative serial: no date, and counted, as before.
         let (ds, report) = book(&["-1000", "61"]);
-        assert!(ds.value(0, 0).is_null() || ds.fields[0].ty == FieldType::Text, "{:?}", ds.value(0, 0));
-        assert!(!report.messages.iter().any(|m| m.contains("rounded")), "{report:?}");
+        assert_eq!(ds.fields[0].ty, FieldType::Date);
+        assert!(ds.value(0, 0).is_null(), "{:?}", ds.value(0, 0));
+        assert_eq!(ds.value(1, 0).to_string(), "1904-03-02");
+        assert_eq!(report.unread_dates.as_deref(), Some("1 value isn't a date and was read as empty, in 'day'"));
+        assert_eq!(report.messages, ["1 value isn't a date and was read as empty, in 'day'"]);
     }
 
     /// A rounded serial in the WKT column isn't WKT, so its row has no geometry, and the bad-WKT
     /// notice counts it.
     #[test]
     fn a_serial_in_the_wkt_column_is_counted_as_bad_wkt() {
-        let book = xlsx(&[("Dates", &[&["geom", "name"], &[r#"<c s="0"><v>45000.123456789</v></c>"#, "a"]])]);
-        let mut entries = crate::zip::read(&book).unwrap();
-        entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="22"/></cellXfs></styleSheet>"#.to_vec()));
+        let book = xlsx(&[("Dates", &[&["geom", "name"], &[r#"<c s="0"><v>45000.000001428896</v></c>"#, "a"]])]);
+        let book = styled_xlsx(&book, 22, false);
         let opts = CsvOptions { wkt: Some("geom".into()), ..CsvOptions::default() };
-        let (ds, report) = read(&crate::zip::write(&entries).unwrap(), "dates", None, &opts).unwrap();
+        let (ds, report) = read(&book, "dates", None, &opts).unwrap();
         assert!(ds.features[0].geometry.is_none());
         assert!(report.messages.iter().any(|m| m == "1 rows had geometry that isn't readable WKT"), "{report:?}");
     }
@@ -787,18 +805,26 @@ mod tests {
     /// Native numeric date styles reach the public reader's rounding notice, including
     /// time-only text. A serial is said to be rounded only when it holds more than the
     /// microsecond: 45000.1 isn't 45000.1 in binary, but it is the f64 02:24:00 makes, so nothing
-    /// finer was lost (#1894); 0.123456789 days is 02:57:46.6665696 and 45000.123456789 is
-    /// 02:57:46.66656949, which were.
+    /// finer was lost (#1894). 45000.123456789 is 15 significant digits, which hold the time here
+    /// only to 8.64 µs, so it is what a program writing 15 digits writes for its microsecond.
+    /// 0.123456789 days is 02:57:46.6665696, and 45000.000001428896 is 0.12345663 s past
+    /// midnight, which were rounded.
     #[test]
     fn workbook_serial_dates_report_rounding_and_keep_clock_fractions() {
-        let cases =
-            [("45000.5", false), ("45000.1", false), ("0.5", false), ("0.500001", false), ("0.123456789", true), ("45000.123456789", true)];
+        let cases = [
+            ("45000.5", false),
+            ("45000.1", false),
+            ("0.5", false),
+            ("0.500001", false),
+            ("0.123456789", true),
+            ("45000.123456789", false),
+            ("45000.000001428896", true),
+        ];
         for (serial, rounded) in cases {
             let cell = format!(r#"<c s="0"><v>{serial}</v></c>"#);
             let book = xlsx(&[("Dates", &[&["moment"], &[&cell]])]);
-            let mut entries = crate::zip::read(&book).unwrap();
-            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="22"/></cellXfs></styleSheet>"#.to_vec()));
-            let (ds, report) = read(&crate::zip::write(&entries).unwrap(), "dates", None, &CsvOptions::default()).unwrap();
+            let book = styled_xlsx(&book, 22, false);
+            let (ds, report) = read(&book, "dates", None, &CsvOptions::default()).unwrap();
             let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded to the microsecond")).collect();
             assert_eq!(notices.len(), usize::from(rounded), "{serial}: {report:?}");
             assert_eq!(report.rounded_dates.is_some(), rounded, "{serial}");
@@ -810,6 +836,9 @@ mod tests {
             }
             if serial == "45000.123456789" {
                 assert_eq!(ds.value(0, 0).to_string(), "2023-03-15T02:57:46.666569");
+            }
+            if serial == "45000.000001428896" {
+                assert_eq!(ds.value(0, 0).to_string(), "2023-03-15T00:00:00.123457");
             }
             if serial == "0.500001" {
                 assert_eq!(ds.fields[0].ty, FieldType::Text);
@@ -833,9 +862,8 @@ mod tests {
             let rows: Vec<String> =
                 cells.iter().map(|c| if *c == "x" { (*c).to_string() } else { format!(r#"<c s="0"><v>{c}</v></c>"#) }).collect();
             let book = xlsx(&[("Dates", &[&["a"], &[&rows[0]], &[&rows[1]], &[&rows[2]]])]);
-            let mut entries = crate::zip::read(&book).unwrap();
-            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="14"/></cellXfs></styleSheet>"#.to_vec()));
-            read(&crate::zip::write(&entries).unwrap(), "dates", None, &CsvOptions::default()).unwrap()
+            let book = styled_xlsx(&book, 14, false);
+            read(&book, "dates", None, &CsvOptions::default()).unwrap()
         };
         // A column of dates: the cell is null and counted.
         let (ds, report) = book(["45000", "60", "45002"]);
@@ -860,10 +888,9 @@ mod tests {
     fn the_phantom_leap_day_in_a_wkt_column_is_said() {
         let book = |second: &str| {
             let book = xlsx(&[("Places", &[&["name", "wkt"], &["a", "POINT (1 2)"], &["b", second]])]);
-            let mut entries = crate::zip::read(&book).unwrap();
-            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="14"/></cellXfs></styleSheet>"#.to_vec()));
+            let book = styled_xlsx(&book, 14, false);
             let opts = CsvOptions { wkt: Some("wkt".into()), ..CsvOptions::default() };
-            read(&crate::zip::write(&entries).unwrap(), "places", None, &opts).unwrap()
+            read(&book, "places", None, &opts).unwrap()
         };
         let (ds, report) = book(r#"<c s="0"><v>60</v></c>"#);
         assert_eq!(ds.features.len(), 2);
@@ -1038,7 +1065,7 @@ mod tests {
             refused_before_calamine(&book, "too large");
             let mut entries = crate::zip::read(&book).unwrap();
             entries.iter_mut().find(|(name, _)| name == "mimetype").unwrap().1.extend(b"\n");
-            refused_before_calamine(&crate::zip::write(&entries).unwrap(), "too large");
+            refused_before_calamine(&book, "too large");
         }
         // All sheets load eagerly, including those not selected by read/columns.
         let rows = MAX_CELLS / 16_384 / 2 + 1;
