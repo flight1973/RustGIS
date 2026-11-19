@@ -568,8 +568,7 @@ impl<'a> Cur<'a> {
 }
 
 fn utf16(b: &[u8]) -> String {
-    let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
-    String::from_utf16_lossy(&units)
+    crate::io::utf16_text(b, false).0
 }
 
 // ---------------------------------------------------------------------------------------------

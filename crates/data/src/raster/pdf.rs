@@ -5,10 +5,12 @@
 //! The whole page is drawn, its title and legend too, and the map frame's coordinates run across
 //! it, as readers of GeoPDFs do.
 
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use hayro::hayro_interpret::font::FontQuery;
 use hayro::hayro_interpret::util::TransformExt;
 use hayro::hayro_interpret::{InterpreterSettings, InterpreterWarning};
 use hayro::hayro_syntax::Pdf;
@@ -150,6 +152,28 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
         }),
         ..InterpreterSettings::default()
     };
+    // A font not in the file is drawn in one of the stand-ins `hayro` carries. It asks for the
+    // stand-in with the font's name only for a CID font; for the rest the names are found in the
+    // page's resources ([`missing_fonts`]), said once `hayro` has asked for a stand-in at all.
+    let asked = Arc::new(AtomicBool::new(false));
+    let named: Arc<Mutex<Vec<String>>> = Arc::default();
+    let resolve = Arc::clone(&interpret.font_resolver);
+    let (asked_by, named_by) = (Arc::clone(&asked), Arc::clone(&named));
+    let interpret = InterpreterSettings {
+        font_resolver: Arc::new(move |query: &FontQuery| {
+            asked_by.store(true, Ordering::Relaxed);
+            if let FontQuery::Fallback(f) = query
+                && let Some(name) = f.post_script_name.clone().or_else(|| f.font_name.clone()).or_else(|| f.font_family.clone())
+                && let Ok(mut names) = named_by.lock()
+                && !names.contains(&name)
+                && names.len() < MISSING_FONTS_KEPT
+            {
+                names.push(name);
+            }
+            resolve(query)
+        }),
+        ..interpret
+    };
     let pixmap = hayro::render(page, &RenderCache::new(), &interpret, &RenderSettings::default(), &settings);
     let (pw, ph) = (u32::from(pixmap.width()), u32::from(pixmap.height()));
     // On an opaque background every pixel is opaque, so its premultiplied colour is its colour:
@@ -168,23 +192,140 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
         let why = if fits <= largest { "to fit in memory" } else { "the largest size it can be drawn at" };
         r.lost.push(format!("its page is drawn at {:.0} dots an inch, not {DPI:.0}, {why}", scale * 72.0));
     }
-    // `hayro` says so each time it meets one (an image each time it is drawn, a font each time
-    // text is set in it), not which one it is: the counts are of times, not of images or fonts.
-    let [images, fonts, annotations, other] = warned.each_ref().map(|n| n.load(Ordering::Relaxed));
-    let times = |n: usize| if n == 1 { "once".to_string() } else { format!("{n} times") };
-    if images > 0 {
-        r.lost.push(format!("an image that can't be decoded is left blank where it is drawn ({})", times(images)));
+    // `hayro` warns each time it meets one, not which one it is: an image (or its soft mask, which
+    // it can't be told from) each time it is drawn, a font each time it is chosen (`Tf`), whether
+    // or not text is then shown in it. The counts are of times, not of images or fonts.
+    let warnings = [
+        "an image or its mask can't be decoded: the image is left blank, or drawn without its mask",
+        "a font that can't be read is chosen: its text is drawn in a stand-in font",
+        "an annotation whose appearance can't be found is left out",
+        "part of the page can't be drawn and is left out",
+    ];
+    for (count, what) in warned.iter().map(|n| n.load(Ordering::Relaxed)).zip(warnings) {
+        match count {
+            0 => {}
+            1 => r.lost.push(format!("{what} (once)")),
+            n => r.lost.push(format!("{what} ({n} times)")),
+        }
     }
-    if fonts > 0 {
-        r.lost.push(format!("text set in a font that can't be read is drawn in a stand-in font ({})", times(fonts)));
-    }
-    if annotations > 0 {
-        r.lost.push(format!("an annotation whose appearance can't be found is left out ({})", times(annotations)));
-    }
-    if other > 0 {
-        r.lost.push(format!("part of the page can't be drawn and is left out ({})", times(other)));
+    if asked.load(Ordering::Relaxed) {
+        let mut names = named.lock().map(|n| n.clone()).unwrap_or_default();
+        let (found, more) = missing_fonts(page);
+        for name in found {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        if !names.is_empty() {
+            let shown = names.iter().take(MISSING_FONTS_NAMED).cloned().collect::<Vec<_>>().join(", ");
+            let left = names.len().saturating_sub(MISSING_FONTS_NAMED);
+            let tail = match (more, left) {
+                (true, _) => ", and perhaps more".to_string(),
+                (false, 0) => String::new(),
+                (false, n) => format!(", and {n} more"),
+            };
+            r.lost.push(format!("fonts not in the file are drawn in a stand-in font: {shown}{tail}"));
+        }
     }
     Ok((r, scale))
+}
+
+/// The most names of fonts not in the file kept, and named in a notice.
+const MISSING_FONTS_KEPT: usize = 100;
+const MISSING_FONTS_NAMED: usize = 10;
+/// The most forms within forms, and objects, looked through for fonts not in the file.
+const FONT_SEARCH_DEPTH: usize = 32;
+const FONT_SEARCH_OBJECTS: usize = 10_000;
+
+/// The standard 14 fonts (ISO 32000-2 § 9.6.2.2), drawn in `hayro`'s own when not in the file, as
+/// every reader draws them in its own: not a stand-in for something else.
+const STANDARD_FONTS: [&str; 14] = [
+    "Helvetica",
+    "Helvetica-Bold",
+    "Helvetica-Oblique",
+    "Helvetica-BoldOblique",
+    "Courier",
+    "Courier-Bold",
+    "Courier-Oblique",
+    "Courier-BoldOblique",
+    "Times-Roman",
+    "Times-Bold",
+    "Times-Italic",
+    "Times-BoldItalic",
+    "Symbol",
+    "ZapfDingbats",
+];
+
+/// The names of the fonts in the page's resources, and its forms' (looked through without
+/// decoding anything), whose programs aren't in the file and which aren't one of the
+/// [`STANDARD_FONTS`], and whether there were more resources than are looked through. A font
+/// named in the resources but never drawn is named too.
+fn missing_fonts(page: &Page<'_>) -> (Vec<String>, bool) {
+    let (mut names, mut seen, mut looked) = (Vec::new(), HashSet::new(), 0usize);
+    let res = page.resources();
+    let mut todo: Vec<(Dict<'_>, Dict<'_>, usize)> = vec![(res.fonts.clone(), res.x_objects.clone(), 0)];
+    while let Some((fonts, xobjects, depth)) = todo.pop() {
+        for key in fonts.keys() {
+            looked += 1;
+            if looked > FONT_SEARCH_OBJECTS {
+                return (names, true);
+            }
+            let Some(font) = fonts.get::<Dict<'_>>(&key) else { continue };
+            if font.obj_id().is_some_and(|id| !seen.insert(id)) {
+                continue;
+            }
+            if let Some(name) = missing_font(&font)
+                && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+        for key in xobjects.keys() {
+            looked += 1;
+            if looked > FONT_SEARCH_OBJECTS {
+                return (names, true);
+            }
+            let Some(form) = xobjects.get::<hayro::hayro_syntax::object::Stream<'_>>(&key) else { continue };
+            let d = form.dict();
+            if !seen.insert(form.obj_id()) || d.get::<Name<'_>>(b"Subtype".as_slice()).is_none_or(|n| n.as_str() != "Form") {
+                continue;
+            }
+            let Some(r) = d.get::<Dict<'_>>(b"Resources".as_slice()) else { continue };
+            if depth >= FONT_SEARCH_DEPTH {
+                return (names, true);
+            }
+            let get = |k: &[u8]| r.get::<Dict<'_>>(k).unwrap_or_default();
+            todo.push((get(b"Font"), get(b"XObject"), depth + 1));
+        }
+    }
+    (names, false)
+}
+
+/// A font's name when its program isn't in the file (no `/FontFile`, `/FontFile2` or `/FontFile3`
+/// in its descriptor, or its descendant's for a composite font) and it isn't one of the
+/// [`STANDARD_FONTS`]. A Type 3 font draws its glyphs itself; one of a kind `hayro` can't read
+/// is said as a font that can't be read.
+fn missing_font(font: &Dict<'_>) -> Option<String> {
+    let subtype = font.get::<Name<'_>>(b"Subtype".as_slice())?;
+    if !matches!(subtype.as_str(), "Type1" | "MMType1" | "TrueType" | "Type0") {
+        return None;
+    }
+    let described = if subtype.as_str() == "Type0" {
+        font.get::<Array<'_>>(b"DescendantFonts".as_slice()).and_then(|a| a.iter::<Dict<'_>>().next())?
+    } else {
+        font.clone()
+    };
+    let embedded = described
+        .get::<Dict<'_>>(b"FontDescriptor".as_slice())
+        .is_some_and(|d| [b"FontFile".as_slice(), b"FontFile2".as_slice(), b"FontFile3".as_slice()].iter().any(|k| d.contains_key(k)));
+    let name = font.get::<Name<'_>>(b"BaseFont".as_slice())?;
+    // A subset's name starts with six capitals and a plus (ISO 32000-2 § 9.6.4).
+    let name = name.as_str();
+    let name = match name.split_once('+') {
+        Some((tag, rest)) if tag.len() == 6 && tag.bytes().all(|b| b.is_ascii_uppercase()) => rest,
+        _ => name,
+    };
+    (!embedded && !STANDARD_FONTS.contains(&name)).then(|| name.to_string())
 }
 
 /// A GeoPDF viewport: its rectangle on the page, its control points (latitude, longitude) and
@@ -197,6 +338,8 @@ struct Viewport {
     crs: Crs,
     def: Option<String>,
     note: Option<String>,
+    /// What of its coordinate system's text couldn't be read.
+    text_note: Option<String>,
 }
 
 impl Viewport {
@@ -277,7 +420,12 @@ fn viewport(vp: &Dict<'_>, measure: &Dict<'_>) -> std::result::Result<Viewport, 
     }
     let gcs = measure.get::<Dict>(b"GCS".as_slice()).ok_or("it doesn't say its coordinate system")?;
     let epsg = gcs.get::<i64>(b"EPSG".as_slice()).and_then(|c| u32::try_from(c).ok());
-    let text = gcs.get::<PdfString>(b"WKT".as_slice()).map(|w| text_string(w.as_bytes()));
+    let (text, unread) =
+        gcs.get::<PdfString>(b"WKT".as_slice()).map(|w| text_string(w.as_bytes())).map_or((None, 0), |(t, n)| (Some(t), n));
+    let text_note = (unread > 0).then(|| {
+        let chars = if unread == 1 { "1 character".to_string() } else { format!("{unread} characters") };
+        format!("{chars} of its coordinate system's text (/WKT) couldn't be read: replaced or left out")
+    });
     // As a `.prj` and a code are read together elsewhere (a GeoPackage's): the code, unless the
     // text gives another shift or body; the text alone when the code isn't one RustGIS knows.
     let unknown = |code: u32| format!("its coordinate system, EPSG:{code}, isn't one RustGIS knows");
@@ -297,30 +445,51 @@ fn viewport(vp: &Dict<'_>, measure: &Dict<'_>) -> std::result::Result<Viewport, 
         Crs::Custom(_) => crs.custom_def().map(|d| d.proj4.clone()),
         _ => None,
     };
-    Ok(Viewport { bbox, gpts, lpts, crs, def, note })
+    Ok(Viewport { bbox, gpts, lpts, crs, def, note, text_note })
 }
 
-/// A PDF text string's text (ISO 32000-2 § 7.9.2.2): UTF-16 after a byte order mark (FE FF, big
-/// endian, as RustGIS writes one; or FF FE), UTF-8 after its own (EF BB BF). Without one, UTF-8
-/// where the bytes are that, else each byte its Latin-1 character, which PDFDocEncoding's are from
-/// A1 on.
-fn text_string(b: &[u8]) -> String {
-    let utf16 = |b: &[u8], big: bool| -> String {
-        let units = b.as_chunks::<2>().0.iter().map(|&p| if big { u16::from_be_bytes(p) } else { u16::from_le_bytes(p) });
-        char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect()
-    };
-    if let Some(rest) = b.strip_prefix(&[0xFE, 0xFF]) {
-        utf16(rest, true)
+/// A PDF text string's text (ISO 32000-2 § 7.9.2.2), and how many characters couldn't be read
+/// (each the replacement character, U+FFFD, or left out). UTF-16 after a byte-order mark (FE FF,
+/// big-endian, as RustGIS writes one; or FF FE), UTF-8 after its own (EF BB BF), either with its
+/// language escapes (between two U+001B) taken out. Without a mark, UTF-8 where the bytes are
+/// that (as some writers use, though the standard says PDFDocEncoding); else PDFDocEncoding read
+/// as Latin-1, which it matches from A1 to FF but AD. The bytes where the two differ (18–1F,
+/// 7F–A0, AD) are replaced, not misread.
+fn text_string(b: &[u8]) -> (String, usize) {
+    let (text, bad) = if let Some(rest) = b.strip_prefix(&[0xFE, 0xFF]) {
+        crate::io::utf16_text(rest, true)
     } else if let Some(rest) = b.strip_prefix(&[0xFF, 0xFE]) {
-        utf16(rest, false)
+        crate::io::utf16_text(rest, false)
     } else if let Some(rest) = b.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        String::from_utf8_lossy(rest).into_owned()
+        let (mut text, mut bad) = (String::new(), 0);
+        for chunk in rest.utf8_chunks() {
+            text.push_str(chunk.valid());
+            if !chunk.invalid().is_empty() {
+                text.push(char::REPLACEMENT_CHARACTER);
+                bad += 1;
+            }
+        }
+        (text, bad)
+    } else if let Ok(s) = std::str::from_utf8(b) {
+        return (s.to_string(), 0);
     } else {
-        match std::str::from_utf8(b) {
-            Ok(s) => s.to_string(),
-            Err(_) => b.iter().map(|&c| char::from(c)).collect(),
+        let differs = |c: u8| matches!(c, 0x18..=0x1F | 0x7F..=0xA0 | 0xAD);
+        let text = b.iter().map(|&c| if differs(c) { char::REPLACEMENT_CHARACTER } else { char::from(c) }).collect();
+        return (text, b.iter().filter(|&&c| differs(c)).count());
+    };
+    // A language escape: U+001B, a language code, U+001B. One left open runs to the end, and is
+    // counted as unread.
+    let mut parts = text.split('\u{1B}');
+    let mut kept: String = parts.next().unwrap_or_default().to_string();
+    let rest: Vec<&str> = parts.collect();
+    for (i, part) in rest.iter().enumerate() {
+        // After the first mark the parts alternate: inside an escape, then after it.
+        if i % 2 == 1 {
+            kept.push_str(part);
         }
     }
+    let open = usize::from(rest.len() % 2 == 1);
+    (kept, bad + open)
 }
 
 /// `r`, the drawn page at `scale` pixels a point, placed by the largest of its GeoPDF viewports:
@@ -328,13 +497,17 @@ fn text_string(b: &[u8]) -> String {
 fn place_by_viewport(mut r: Raster, page: &Page<'_>, scale: f64) -> Raster {
     let (mut found, unread) = viewports(page);
     let unplaced = "it opens without coordinates";
+    // The OGC's GeoPDF encoding, older than ISO 32000's viewports, isn't read: said whenever the
+    // page is left without coordinates.
+    let lgidict = page
+        .raw()
+        .contains_key(b"LGIDict".as_slice())
+        .then(|| format!("its coordinates are in a form RustGIS doesn't read (OGC /LGIDict): {unplaced}"));
     if found.is_empty() {
         if let Some(why) = &unread.first {
             r.lost.push(format!("{} ({why}, the first): {unplaced}", unusable_frames(unread.count)));
-        } else if page.raw().contains_key(b"LGIDict".as_slice()) {
-            // The OGC's GeoPDF encoding, older than ISO 32000's viewports, isn't read.
-            r.lost.push(format!("its coordinates are in a form RustGIS doesn't read (OGC /LGIDict): {unplaced}"));
         }
+        r.lost.extend(lgidict);
         return r;
     }
     // The largest first; one that can't be fitted or placed gives way to the next.
@@ -360,6 +533,7 @@ fn place_by_viewport(mut r: Raster, page: &Page<'_>, scale: f64) -> Raster {
                 if let Some(why) = failed.first().or(unread.first.as_ref()) {
                     placed.lost.push(format!("{unusable} of its map frames have coordinates that can't be used ({why}, the first)"));
                 }
+                placed.lost.extend(v.text_note);
                 placed.lost.extend(v.note);
                 if off > 1.0 {
                     placed.lost.push(format!("its map frame's corners don't lie on one flat grid: placed to within {off:.0} pixels"));
@@ -375,6 +549,7 @@ fn place_by_viewport(mut r: Raster, page: &Page<'_>, scale: f64) -> Raster {
     if let Some(why) = failed.first().or(unread.first.as_ref()) {
         r.lost.push(format!("{} ({why}, the first): {unplaced}", unusable_frames(failed.len() + unread.count)));
     }
+    r.lost.extend(lgidict);
     r
 }
 
@@ -539,24 +714,42 @@ mod tests {
         // the times it is drawn.
         let junk = "/Width 8 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode";
         let once = b"q 72 0 0 36 0 0 cm /Im0 Do Q";
+        let image = "an image or its mask can't be decoded: the image is left blank, or drawn without its mask";
         let r = read_bytes("x", image_page(junk, b"not a jpeg at all", once), None, true).unwrap();
-        assert_eq!(r.lost, ["an image that can't be decoded is left blank where it is drawn (once)"]);
+        assert_eq!(r.lost, [format!("{image} (once)")]);
         let twice = b"q 36 0 0 36 0 0 cm /Im0 Do Q q 36 0 0 36 36 0 cm /Im0 Do Q";
         let r = read_bytes("x", image_page(junk, b"not a jpeg at all", twice), None, true).unwrap();
-        assert_eq!(r.lost, ["an image that can't be decoded is left blank where it is drawn (2 times)"]);
-        // A font of a kind that doesn't exist, set once and then twice: its text drawn in a
-        // stand-in, and said with the times.
+        assert_eq!(r.lost, [format!("{image} (2 times)")]);
+        // A sound image whose soft mask is junk: drawn without the mask, and said the same way.
+        let red = [255u8, 0, 0].repeat(4);
+        let masked =
+            stream("/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R", &red);
+        let mask = stream(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode",
+            b"junk",
+        );
+        let r =
+            read_bytes("x", pdf_of("0 0 72 36", "/Resources << /XObject << /Im0 5 0 R >> >>", once, &[masked, mask]), None, true).unwrap();
+        assert_eq!(r.lost, [format!("{image} (once)")]);
+        // A font of a kind that doesn't exist, chosen once and then twice: its text drawn in a
+        // stand-in, and said with the times it is chosen, shown or not.
         let nonsense = "<< /Type /Font /Subtype /Nonsense /BaseFont /Bogus >>";
+        let font = "a font that can't be read is chosen: its text is drawn in a stand-in font";
         let r = read_bytes("x", text_page(nonsense, b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET"), None, true).unwrap();
-        assert_eq!(r.lost, ["text set in a font that can't be read is drawn in a stand-in font (once)"]);
-        let r = read_bytes("x", text_page(nonsense, b"BT /F1 12 Tf 5 10 Td (Hi) Tj /F1 9 Tf (there) Tj ET"), None, true).unwrap();
-        assert_eq!(r.lost, ["text set in a font that can't be read is drawn in a stand-in font (2 times)"]);
+        assert_eq!(r.lost, [format!("{font} (once)")]);
+        let r = read_bytes("x", text_page(nonsense, b"BT /F1 12 Tf 5 10 Td (Hi) Tj /F1 9 Tf ET"), None, true).unwrap();
+        assert_eq!(r.lost, [format!("{font} (2 times)")]);
+        // A font not in the file (no program, not one of the standard 14): drawn in a stand-in,
+        // and named.
+        let arial = "<< /Type /Font /Subtype /TrueType /BaseFont /Arial,Bold /Encoding /WinAnsiEncoding >>";
+        let r = read_bytes("x", text_page(arial, b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET"), None, true).unwrap();
+        assert_eq!(r.lost, ["fonts not in the file are drawn in a stand-in font: Arial,Bold"]);
         // An annotation whose appearance can't be found: left out, and said.
         let annot = "/Annots [<< /Type /Annot /Subtype /Square /Rect [0 0 10 10] /AP << /D 9 >> >>]";
         let r = read_bytes("x", tiny_pdf("0 0 72 36", annot), None, true).unwrap();
         assert_eq!(r.lost, ["an annotation whose appearance can't be found is left out (once)"]);
-        // The same kinds, drawable: nothing said.
-        let red = [255u8, 0, 0].repeat(4);
+        // The same kinds, drawable: nothing said. Helvetica, one of the standard 14, isn't a
+        // stand-in for anything.
         let r =
             read_bytes("x", image_page("/Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8", &red, once), None, true).unwrap();
         assert!(r.lost.is_empty(), "{:?}", r.lost);
@@ -582,6 +775,12 @@ mod tests {
         let both = format!("/LGIDict {lgi} {}", geo("/Type /GEOGCS /EPSG 4326"));
         let r = read_bytes("lgi", tiny_pdf("0 0 72 36", &both), None, true).unwrap();
         assert!(r.georeferenced && r.lost.is_empty(), "{:?}", r.lost);
+        // One that can't be used (it gives no system): both are said.
+        let both = format!("/LGIDict {lgi} {}", geo("/Type /GEOGCS"));
+        let r = read_bytes("lgi", tiny_pdf("0 0 72 36", &both), None, true).unwrap();
+        assert!(!r.georeferenced && r.lost.len() == 2, "{:?}", r.lost);
+        assert!(r.lost[0].starts_with("1 map frame has coordinates that can't be used"), "{:?}", r.lost);
+        assert!(r.lost[1].contains("(OGC /LGIDict)"), "{:?}", r.lost);
     }
 
     #[test]
@@ -595,12 +794,30 @@ mod tests {
         assert!(r.georeferenced, "{:?}", r.lost);
         let e = r.extent();
         assert!(e.min_x < e.max_x && e.min_y < e.max_y, "{e:?}");
-        // Text strings in their other forms.
-        assert_eq!(text_string(&[0xFF, 0xFE, b'G', 0, 0xB0, 0]), "G°");
-        assert_eq!(text_string(&[0xEF, 0xBB, 0xBF, b'G', 0xC2, 0xB0]), "G°");
-        assert_eq!(text_string(&[b'G', 0xC2, 0xB0]), "G°");
-        assert_eq!(text_string(&[b'G', 0xB0]), "G°");
-        assert_eq!(text_string(&[0xFE, 0xFF, 0, b'G', 0]), "G");
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
+        // The same with an odd last byte: placed, and what couldn't be read said.
+        let odd = hex16(&own).replace('>', "00>");
+        let r = read_bytes("geo", tiny_pdf("0 0 72 36", &geo(&format!("/Type /PROJCS /WKT {odd}"))), None, true).unwrap();
+        assert!(r.georeferenced, "{:?}", r.lost);
+        assert_eq!(r.lost, ["1 character of its coordinate system's text (/WKT) couldn't be read: replaced or left out"]);
+        // Text strings in their other forms, and what each couldn't read.
+        let read = |b: &[u8]| text_string(b);
+        assert_eq!(read(&[0xFF, 0xFE, b'G', 0, 0xB0, 0]), ("G°".into(), 0));
+        assert_eq!(read(&[0xEF, 0xBB, 0xBF, b'G', 0xC2, 0xB0]), ("G°".into(), 0));
+        assert_eq!(read(&[b'G', 0xC2, 0xB0]), ("G°".into(), 0));
+        assert_eq!(read(&[b'G', 0xB0]), ("G°".into(), 0));
+        // An odd last byte, a lone surrogate, and bytes that aren't UTF-8 after its mark.
+        assert_eq!(read(&[0xFE, 0xFF, 0, b'G', 0]), ("G".into(), 1));
+        assert_eq!(read(&[0xFE, 0xFF, 0xD8, 0x00, 0, b'G']), ("\u{FFFD}G".into(), 1));
+        assert_eq!(read(&[0xEF, 0xBB, 0xBF, b'G', 0xFF]), ("G\u{FFFD}".into(), 1));
+        // A language escape is taken out; one left open is counted.
+        let escaped: Vec<u8> = [0xFE, 0xFF].into_iter().chain("a\u{1B}en\u{1B}b".encode_utf16().flat_map(u16::to_be_bytes)).collect();
+        assert_eq!(read(&escaped), ("ab".into(), 0));
+        let open: Vec<u8> = [0xFE, 0xFF].into_iter().chain("a\u{1B}en".encode_utf16().flat_map(u16::to_be_bytes)).collect();
+        assert_eq!(read(&open), ("a".into(), 1));
+        // Without a mark and not UTF-8: Latin-1 where PDFDocEncoding matches it, replaced in the
+        // ranges where the two differ.
+        assert_eq!(read(&[b'G', 0xFF, 0xE9, 0x80, 0xAD]), ("Gÿé\u{FFFD}\u{FFFD}".into(), 2));
     }
 
     /// A viewport over `bbox` on the page, its corners at 10–12° E, 40–41° N.

@@ -1857,6 +1857,24 @@ pub fn delimited_text<'a>(file_name: &str, bytes: &'a [u8]) -> Result<(std::borr
     Ok((text, Some(format!("{file_name} isn't UTF-8 text: it was read as Windows-1252 (Latin-1)"))))
 }
 
+/// UTF-16 text from its bytes (big-endian when `big_endian`, without a byte-order mark), and how
+/// many characters couldn't be read: a lone surrogate, each the replacement character (U+FFFD),
+/// and an odd last byte, left out.
+pub(crate) fn utf16_text(bytes: &[u8], big_endian: bool) -> (String, usize) {
+    let (pairs, odd) = bytes.as_chunks::<2>();
+    let units = pairs.iter().map(|&p| if big_endian { u16::from_be_bytes(p) } else { u16::from_le_bytes(p) });
+    let mut bad = odd.len();
+    let text: String = char::decode_utf16(units)
+        .map(|c| {
+            c.unwrap_or_else(|_| {
+                bad += 1;
+                char::REPLACEMENT_CHARACTER
+            })
+        })
+        .collect();
+    (text, bad)
+}
+
 /// Whether a name is gzip-compressed delimited text, rather than an arbitrary gzip archive.
 pub fn is_gzip_text_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
