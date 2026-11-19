@@ -1547,6 +1547,18 @@ fn traverse(s: &mut Session, p: &Json) -> CmdResult {
     super::edit::add_feature(s, &json!({"layer": id, "geometry": g}))
 }
 
+/// Refuses `what` on field `name` while another field is named the same but for case: design finds
+/// its field by name ignoring case, so it would apply to the first of them whichever was meant
+/// (#1955).
+fn case_twins_refused(ds: &rustgis_data::Dataset, name: &str, what: &str) -> Result<(), String> {
+    if ds.fields.iter().filter(|f| f.name.eq_ignore_ascii_case(name)).count() > 1 {
+        return Err(format!(
+            "'{name}' has a field named the same but for case, and {what} would apply to whichever comes first: rename one of them first"
+        ));
+    }
+    Ok(())
+}
+
 fn domain(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
     let field = ps(p, "field").ok_or("field is required")?;
@@ -1558,6 +1570,7 @@ fn domain(s: &mut Session, p: &Json) -> CmdResult {
         l.design.domains.retain(|d| !d.field.eq_ignore_ascii_case(&fname));
         return Ok(Json::Null);
     }
+    case_twins_refused(&l.dataset, &fname, "a domain")?;
     let kind = if let Some(codes) = p.get("coded").and_then(Json::as_array) {
         let pairs: Vec<(Value, String)> = codes
             .iter()
@@ -1605,6 +1618,7 @@ fn subtypes(s: &mut Session, p: &Json) -> CmdResult {
     let l = s.map().layer(id).ok_or("no such layer")?;
     let fi = l.dataset.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
     let f = l.dataset.fields.get(fi).ok_or("no field")?;
+    case_twins_refused(&l.dataset, &f.name, "subtypes")?;
     if f.ty != FieldType::Integer {
         return Err(format!("{} must be an integer field to hold subtype codes", f.name));
     }

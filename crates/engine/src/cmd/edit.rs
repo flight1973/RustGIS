@@ -115,10 +115,25 @@ fn data_mut(s: &mut Session, t: Target) -> Result<&mut Dataset, String> {
     }
 }
 
-/// Field `name`'s index in the data of `t`: the first matching it ignoring case, as expressions
-/// and queries find fields.
+/// Field `name`'s index in the data of `t` ([`field_in`]).
 fn field_of(s: &Session, t: Target, name: &str) -> Result<usize, String> {
-    data(s, t)?.field_index(name).ok_or_else(|| format!("no field named '{name}'"))
+    field_in(&data(s, t)?.fields, name)?.ok_or_else(|| format!("no field named '{name}'"))
+}
+
+/// The index of the field a command names `name` in `fields`: the field named exactly so, else the
+/// only field named so ignoring case, so an edit never lands on a field the caller didn't name
+/// (#1955). A name matching more than one field but none exactly is refused. Expressions and
+/// queries read fields differently ([`Dataset::field_index`]).
+pub(crate) fn field_in(fields: &[Field], name: &str) -> Result<Option<usize>, String> {
+    if let Some(i) = fields.iter().position(|f| f.name == name) {
+        return Ok(Some(i));
+    }
+    let mut matches = fields.iter().enumerate().filter(|(_, f)| f.name.eq_ignore_ascii_case(name));
+    let first = matches.next().map(|(i, _)| i);
+    if matches.next().is_some() {
+        return Err(format!("'{name}' matches more than one field: use an exact field name"));
+    }
+    Ok(first)
 }
 
 /// A table's rows change only while editing is on, as a layer's features do
@@ -203,11 +218,11 @@ struct LeftOut {
     taken: Vec<String>,
 }
 
-/// Each field's value in `"attributes"`, by field. A key gives one field: the one named exactly
-/// so, else the only field named so ignoring case (ambiguous keys are refused); the keys named
-/// exactly go first, so `Name` fills `Name` even when `name` comes first. A key naming no field,
-/// or a field another key gives, is left out and said ([`notify_left_out`]). Non-object values
-/// other than null are refused before any row is inserted.
+/// Each field's value in `"attributes"`, by field. A key gives one field ([`field_in`]: the one
+/// named exactly so, else the only field named so ignoring case; ambiguous keys are refused); the
+/// keys named exactly go first, so `Name` fills `Name` even when `name` comes first. A key naming
+/// no field, or a field another key gives, is left out and said ([`notify_left_out`]). Non-object
+/// values other than null are refused before any row is inserted.
 fn given_attributes<'a>(fields: &[Field], p: &'a Json) -> Result<(Vec<Option<&'a Json>>, LeftOut), String> {
     let mut given = vec![None; fields.len()];
     let mut left = LeftOut::default();
@@ -216,20 +231,16 @@ fn given_attributes<'a>(fields: &[Field], p: &'a Json) -> Result<(Vec<Option<&'a
         Some(Json::Object(attributes)) => attributes,
         Some(_) => return Err("attributes is an object of field names and values".into()),
     };
-    let exact = |k: &str| fields.iter().position(|f| f.name == k);
-    for (k, v) in attributes.iter().filter(|(k, _)| exact(k).is_some()) {
-        match exact(k).and_then(|i| given.get_mut(i)) {
-            Some(slot @ None) => *slot = Some(v),
-            _ => left.taken.push(k.clone()),
-        }
+    let mut keys = Vec::with_capacity(attributes.len());
+    for (k, v) in attributes {
+        let i = field_in(fields, k).map_err(|e| format!("attribute {e}"))?;
+        let inexact = !i.and_then(|i| fields.get(i)).is_some_and(|f| f.name == *k);
+        keys.push((inexact, k, v, i));
     }
-    for (k, v) in attributes.iter().filter(|(k, _)| exact(k).is_none()) {
-        let mut matches = fields.iter().enumerate().filter(|(_, f)| f.name.eq_ignore_ascii_case(k));
-        let first = matches.next().map(|(i, _)| i);
-        if matches.next().is_some() {
-            return Err(format!("attribute '{k}' matches more than one field: use an exact field name"));
-        }
-        match first.map(|i| given.get_mut(i)) {
+    // Stable: the keys named exactly first, each kind in the order given.
+    keys.sort_by_key(|(inexact, ..)| *inexact);
+    for (_, k, v, i) in keys {
+        match i.map(|i| given.get_mut(i)) {
             None => left.no_field.push(k.clone()),
             Some(Some(slot @ None)) => *slot = Some(v),
             Some(_) => left.taken.push(k.clone()),
@@ -841,10 +852,14 @@ fn check_layer_dates(s: &Session, id: u32, fi: usize, ty: FieldType) -> Result<S
     if field.ty != FieldType::Text {
         return Err(format!("'{name}' is a {} field: only a text field converts to dates", field.ty.label()));
     }
+    // Design applies to the first field named so ignoring case ([`Dataset::field_index`]): to this
+    // one unless a field before it is named the same but for case (#1955).
+    let read = !l.dataset.fields.iter().take(fi).any(|f| f.name.eq_ignore_ascii_case(&name));
+    let names = |f: &str| read && f.eq_ignore_ascii_case(&name);
     let d = &l.design;
-    let designed = d.domains.iter().any(|x| x.field.eq_ignore_ascii_case(&name))
-        || d.subtypes.as_ref().is_some_and(|st| st.field.eq_ignore_ascii_case(&name))
-        || d.contingent.iter().any(|c| c.fields.iter().any(|f| f.eq_ignore_ascii_case(&name)));
+    let designed = d.domains.iter().any(|x| names(&x.field))
+        || d.subtypes.as_ref().is_some_and(|st| names(&st.field))
+        || d.contingent.iter().any(|c| c.fields.iter().any(|f| names(f)));
     if designed {
         return Err(format!("'{name}' has a domain, subtypes or contingent values, which hold text: remove them first"));
     }
@@ -1013,6 +1028,13 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
         .collect();
     // A Default class still as the layer made it loses nothing by starting again: that restart isn't said.
     let default_untouched = l.labels.default == rustgis_map::LabelClass::default_for(&l.dataset);
+    // What the layer keeps by a field's name (renderer, labels, design, diagram…) is read from the
+    // first field so named ignoring case ([`Dataset::field_index`]), so a name read the deleted
+    // field when it names it in any case and no field before it is named the same but for case.
+    // A name that read a twin left keeps it; one that read the deleted field would go on to read
+    // the twin, so it goes too (#1955).
+    let read = !l.dataset.fields.iter().take(fi).any(|f| f.name.eq_ignore_ascii_case(&name));
+    let names_removed = |f: &str| read && f.eq_ignore_ascii_case(&name);
     let removed = l.dataset.fields.remove(fi).name;
     for f in &mut l.dataset.features {
         if fi < f.attrs.len() {
@@ -1023,7 +1045,7 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     // (Classes by an expression that read until now go the same way.)
     let unread = read_before && l.renderer.expression().is_some_and(|e| rustgis_data::query::parse_fields(e, &l.dataset).is_err());
     let mut single = None;
-    if unread || l.renderer.field().is_some_and(|f| f.eq_ignore_ascii_case(&removed)) {
+    if unread || l.renderer.field().is_some_and(names_removed) {
         l.renderer = rustgis_map::Renderer::Single(l.renderer.base_symbol());
         single = Some(l.name.clone());
     }
@@ -1064,7 +1086,7 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     // no features, which go on to the next class: it is kept to edit, not dropped with its text
     // symbol.
     let mut restart_note = None;
-    if l.labels.default.field.eq_ignore_ascii_case(&removed) {
+    if names_removed(&l.labels.default.field) {
         let by_text = l.labels.default.by.text.as_deref().is_some_and(|t| rustgis_data::query::parse_fields(t, &l.dataset).is_ok());
         if by_text {
             l.labels.default.field.clear();
@@ -1082,25 +1104,45 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
             });
         }
     }
+    // Another class on the deleted field labels with Default's field instead, as
+    // `repoint_missing_fields` would point it, said; including one whose name would now find a
+    // twin (#1955).
+    let fallback = match l.dataset.field_index(&l.labels.default.field) {
+        Some(_) => l.labels.default.field.clone(),
+        None => rustgis_map::LabelClass::default_for(&l.dataset).field,
+    };
+    let mut moved = Vec::new();
+    for c in &mut l.labels.classes {
+        let by_text = c.by.text.as_deref().is_some_and(|t| rustgis_data::query::parse_fields(t, &l.dataset).is_ok());
+        if names_removed(&c.field) && !by_text {
+            c.field.clone_from(&fallback);
+            moved.push(c.name.clone());
+        }
+    }
+    let moved_note = (!moved.is_empty()).then(|| {
+        let on = if fallback.is_empty() { "no field".to_string() } else { format!("field {fallback}") };
+        let (classes, it) = if moved.len() == 1 { ("class", "it labels") } else { ("classes", "they label") };
+        format!("{}: its label {classes} {} labeled the deleted field {removed}, so {it} {on}", l.name, moved.join(", "))
+    });
     l.labels.repoint_missing_fields(&l.dataset);
     // A definition query that reads the field was refused above; one that already didn't read is
     // kept as it is, so its text isn't lost.
     // Nor its data design: domains, subtypes, contingent values, and rules that used it.
     let d = &mut l.design;
-    d.domains.retain(|x| !x.field.eq_ignore_ascii_case(&removed));
-    if d.subtypes.as_ref().is_some_and(|st| st.field.eq_ignore_ascii_case(&removed)) {
+    d.domains.retain(|x| !names_removed(&x.field));
+    if d.subtypes.as_ref().is_some_and(|st| names_removed(&st.field)) {
         d.subtypes = None;
     }
     if let Some(st) = &mut d.subtypes {
         for sub in &mut st.subtypes {
-            sub.defaults.retain(|(f, _)| !f.eq_ignore_ascii_case(&removed));
+            sub.defaults.retain(|(f, _)| !names_removed(f));
         }
     }
-    d.contingent.retain(|c| !c.fields.iter().any(|f| f.eq_ignore_ascii_case(&removed)));
+    d.contingent.retain(|c| !c.fields.iter().any(|f| names_removed(f)));
     let ds = rustgis_data::Dataset::new(l.dataset.name.clone(), l.dataset.geometry_type, l.dataset.fields.clone());
     let before = d.rules.len();
     d.rules.retain(|r| {
-        !r.field.eq_ignore_ascii_case(&removed)
+        !names_removed(&r.field)
             && match r.kind {
                 rustgis_map::design::RuleKind::Calculation => Calculation::parse(&r.expression, &ds).is_ok(),
                 rustgis_map::design::RuleKind::Constraint => rustgis_data::query::parse_fields(&r.expression, &ds).is_ok(),
@@ -1111,9 +1153,9 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     // measured again without it, and a diagram left with no field goes too. Said once.
     let mut diagram_note = None;
     if let Some(dg) = &mut l.diagram
-        && dg.categories.iter().any(|c| c.field.eq_ignore_ascii_case(&removed))
+        && dg.categories.iter().any(|c| names_removed(&c.field))
     {
-        dg.categories.retain(|c| !c.field.eq_ignore_ascii_case(&removed));
+        dg.categories.retain(|c| !names_removed(&c.field));
         if dg.categories.is_empty() {
             l.diagram = None;
             diagram_note = Some(format!("{}: its diagram drew only the deleted field {removed}, so it is removed", l.name));
@@ -1131,7 +1173,7 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     if let Some(x) = &mut l.extrusion {
         let mut what = Vec::new();
         for (read, name) in [(&mut x.field, "height"), (&mut x.base_field, "base")] {
-            if read.as_deref().is_some_and(|f| f.eq_ignore_ascii_case(&removed)) {
+            if read.as_deref().is_some_and(names_removed) {
                 *read = None;
                 what.push(name);
             }
@@ -1143,12 +1185,12 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
         }
     }
     let mut rotation_note = None;
-    if l.marker_rotation.as_ref().is_some_and(|r| r.field.eq_ignore_ascii_case(&removed)) {
+    if l.marker_rotation.as_ref().is_some_and(|r| names_removed(&r.field)) {
         l.marker_rotation = None;
         rotation_note = Some(format!("{}: its markers turned by the deleted field {removed}, so they are no longer turned", l.name));
     }
     let mut size_note = None;
-    if l.size_by.as_ref().is_some_and(|b| b.field.eq_ignore_ascii_case(&removed)) {
+    if l.size_by.as_ref().is_some_and(|b| names_removed(&b.field)) {
         l.size_by = None;
         size_note = Some(format!("{}: its markers were sized by the deleted field {removed}, so they keep their class sizes", l.name));
     }
@@ -1178,7 +1220,7 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
             Some(format!("{}: its symbol's {} expressions read the deleted field {removed}, so they are removed", l.name, and_list(many)))
         }
     };
-    for note in [extrusion_note, rotation_note, size_note, by_note, label_note, restart_note].into_iter().flatten() {
+    for note in [extrusion_note, rotation_note, size_note, by_note, label_note, restart_note, moved_note].into_iter().flatten() {
         s.notify(note, false);
     }
     if let Some(note) = diagram_note {
@@ -1192,7 +1234,7 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     let layer_name = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
     if let Some(w) = s.map_mut().view.terrain.as_mut().and_then(|t| t.water.as_mut())
         && w.layer.eq_ignore_ascii_case(&layer_name)
-        && w.level.as_deref().is_some_and(|f| f.eq_ignore_ascii_case(&removed))
+        && w.level.as_deref().is_some_and(names_removed)
     {
         w.level = None;
         s.notify(
@@ -1421,9 +1463,8 @@ fn land_table_edit(s: &mut Session, p: &Json, command: &str) -> Option<CmdResult
 
 /// Evaluates and writes a table on its worker, checking Cancel between rows. An expression's
 /// evaluation on one row and the shared row storage's first copy cannot be interrupted;
-/// cancellation never installs partial output.
-fn calculate_table(input: &Dataset, p: &Json) -> Result<(Dataset, WriteLosses), String> {
-    let fi = input.field_index(ps(p, "field").ok_or("field is required")?).ok_or("no field")?;
+/// cancellation never installs partial output. Writes field `fi`.
+fn calculate_table(input: &Dataset, fi: usize, p: &Json) -> Result<(Dataset, WriteLosses), String> {
     let ty = input.fields.get(fi).map(|f| f.ty).ok_or("no field")?;
     let expr = ps(p, "expression").map(str::trim).filter(|e| !e.is_empty()).ok_or("expression is required")?;
     let calc = Calculation::parse(expr, input)?;
@@ -1449,12 +1490,13 @@ fn calculate_field(s: &mut Session, p: &Json) -> CmdResult {
     }
     let t = write_target(s, p)?;
     let field = ps(p, "field").ok_or("field is required")?;
-    let fi = data(s, t)?.field_index(field).ok_or_else(|| format!("no field named '{field}'; use Add Field (edit.addField) first"))?;
+    let fi =
+        field_in(&data(s, t)?.fields, field)?.ok_or_else(|| format!("no field named '{field}'; use Add Field (edit.addField) first"))?;
     let expr = ps(p, "expression").map(str::trim).filter(|e| !e.is_empty()).ok_or("expression is required")?.to_string();
     let Target::Layer(id) = t else {
         editing_on(s)?;
         let (ty, field) = data(s, t)?.fields.get(fi).map(|f| (f.ty, f.name.clone())).ok_or("no field")?;
-        let (result, losses) = calculate_table(data(s, t)?, p)?;
+        let (result, losses) = calculate_table(data(s, t)?, fi, p)?;
         let n = result.features.len();
         data_mut(s, t)?.features = result.features;
         calculation_notices(s, &field, ty, &losses);
@@ -1764,6 +1806,177 @@ mod tests {
             s.run("edit.calculateField", &p).unwrap();
             let ds = data(&s, t).unwrap();
             assert_eq!(ds.value(0, ds.field_index("T2").unwrap()), &Value::Float(14.0));
+        }
+    }
+
+    /// An edit by field name picks the field named exactly so, else the only one named so but
+    /// for case; a name matching case twins but neither exactly is refused, changing nothing
+    /// (#1955). On a layer and a standalone table, as the GeoJSON and CSV readers make twins.
+    #[test]
+    fn edits_by_field_name_pick_the_exact_field() {
+        let names = |s: &Session, t: Target| -> Vec<String> { data(s, t).unwrap().fields.iter().map(|f| f.name.clone()).collect() };
+        let row = |s: &Session, t: Target| -> Vec<Value> { data(s, t).unwrap().features[0].attrs.clone() };
+        for table in [false, true] {
+            let fresh = |fields: &[&str]| {
+                let mut s = Session::new(crate::Project::default());
+                let fields = fields.iter().map(|f| Field::new(*f, FieldType::Text)).collect();
+                let mut ds = Dataset::new("twins", GeometryType::None, fields);
+                let n = ds.fields.len();
+                ds.push(None, (0..n).map(|i| Value::Text(format!("2020-01-0{}", i + 1))).collect());
+                let target = if table {
+                    json!({"table": s.project.add_table(ds)})
+                } else {
+                    let id = s.map_mut().add_dataset(ds);
+                    json!({"layer": id})
+                };
+                let t = super::target(&s, &target).unwrap();
+                (s, target, t)
+            };
+            let with = |target: &Json, extra: Json| {
+                let mut p = target.clone();
+                for (k, v) in extra.as_object().unwrap() {
+                    p[k] = v.clone();
+                }
+                p
+            };
+            let date = |d: &str| Value::Text(d.into());
+
+            // The exact twin is the one changed.
+            let (mut s, target, t) = fresh(&["Name", "name"]);
+            s.run("edit.setValue", &with(&target, json!({"row": 0, "field": "name", "value": "CHANGED"}))).unwrap();
+            assert_eq!(row(&s, t), [date("2020-01-01"), date("CHANGED")], "setValue, table {table}");
+            s.run("edit.calculateField", &with(&target, json!({"field": "name", "expression": "'calc'"}))).unwrap();
+            assert_eq!(row(&s, t), [date("2020-01-01"), date("calc")], "calculateField, table {table}");
+            let (mut s, target, t) = fresh(&["Name", "name"]);
+            s.run("edit.convertField", &with(&target, json!({"field": "name", "type": "date"}))).unwrap();
+            let types: Vec<FieldType> = data(&s, t).unwrap().fields.iter().map(|f| f.ty).collect();
+            assert_eq!(types, [FieldType::Text, FieldType::Date], "convertField, table {table}");
+            let (mut s, target, t) = fresh(&["Name", "name"]);
+            s.run("edit.deleteField", &with(&target, json!({"field": "name"}))).unwrap();
+            assert_eq!(names(&s, t), ["Name"], "deleteField, table {table}");
+
+            // A unique name but for case still finds its field.
+            let (mut s, target, t) = fresh(&["Name", "other"]);
+            s.run("edit.setValue", &with(&target, json!({"row": 0, "field": "NAME", "value": "CHANGED"}))).unwrap();
+            assert_eq!(row(&s, t), [date("CHANGED"), date("2020-01-02")], "unique setValue, table {table}");
+            s.run("edit.calculateField", &with(&target, json!({"field": "NAME", "expression": "'calc'"}))).unwrap();
+            assert_eq!(row(&s, t), [date("calc"), date("2020-01-02")], "unique calculateField, table {table}");
+            s.run("edit.deleteField", &with(&target, json!({"field": "NAME"}))).unwrap();
+            assert_eq!(names(&s, t), ["other"], "unique deleteField, table {table}");
+
+            // A name matching both twins but neither exactly is refused, and nothing changes.
+            let (mut s, target, t) = fresh(&["Name", "name"]);
+            for (command, extra) in [
+                ("edit.setValue", json!({"row": 0, "field": "NAME", "value": "CHANGED"})),
+                ("edit.calculateField", json!({"field": "NAME", "expression": "'calc'"})),
+                ("edit.convertField", json!({"field": "NAME", "type": "date"})),
+                ("edit.deleteField", json!({"field": "NAME"})),
+            ] {
+                let error = s.run(command, &with(&target, extra)).unwrap_err();
+                assert_eq!(error, "'NAME' matches more than one field: use an exact field name", "{command}, table {table}");
+                assert_eq!(names(&s, t), ["Name", "name"], "{command}, table {table}");
+                assert_eq!(row(&s, t), [date("2020-01-01"), date("2020-01-02")], "{command}, table {table}");
+                let types: Vec<FieldType> = data(&s, t).unwrap().fields.iter().map(|f| f.ty).collect();
+                assert_eq!(types, [FieldType::Text, FieldType::Text], "{command}, table {table}");
+            }
+        }
+    }
+
+    /// What a layer keeps by a field's name is read from the first field so named ignoring case,
+    /// whichever twin's name it stores. Deleting that field takes and says what read it; deleting
+    /// its twin, which nothing read, leaves all of it and says nothing (#1955).
+    #[test]
+    fn deleting_a_case_twin_takes_what_read_it() {
+        for stored in ["Name", "name"] {
+            for (deleted, read) in [("name", false), ("Name", true)] {
+                let mut s = Session::new(crate::Project::default());
+                let fields = ["Name", "name", "n"].map(|f| Field::new(f, FieldType::Double)).to_vec();
+                let mut ds = Dataset::new("twins", GeometryType::Point, fields);
+                let at = Geometry::Point(rustgis_data::Coord::new(3.0, 4.0));
+                ds.push(Some(at), vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]);
+                let id = s.map_mut().add_dataset(ds);
+                s.run("layer.symbology", &json!({"layer": id, "type": "unique", "field": "n"})).unwrap();
+                s.run("layer.diagram", &json!({"layer": id, "kind": "pie", "fields": [stored, "n"]})).unwrap();
+                let l = s.map_mut().layer_mut(id).unwrap();
+                if let rustgis_map::Renderer::Unique { field, .. } = &mut l.renderer {
+                    *field = stored.into();
+                }
+                l.labels.default.field = stored.into();
+                l.labels.enabled = true;
+                let mut other = l.labels.default.clone();
+                other.name = "Other".into();
+                l.labels.classes.push(other);
+                let kind = rustgis_map::design::DomainKind::Range { min: 0.0, max: 10.0 };
+                l.design.domains.push(rustgis_map::design::Domain { field: stored.into(), kind });
+                let mark = s.notice_mark();
+                s.run("edit.deleteField", &json!({"layer": id, "field": deleted})).unwrap();
+                let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+                let l = s.map().layer(id).unwrap();
+                let slices: Vec<&str> = l.diagram.as_ref().unwrap().categories.iter().map(|c| c.field.as_str()).collect();
+                let case = format!("'{stored}' stored, '{deleted}' deleted: {said:?}");
+                if read {
+                    assert_eq!(l.renderer.field(), None, "{case}");
+                    assert!(l.design.domains.is_empty(), "{case}");
+                    assert_eq!(slices, ["n"], "{case}");
+                    for part in [
+                        "its classes read the deleted field Name",
+                        "the deleted field Name, so it starts again",
+                        "its label class Other labeled the deleted field Name",
+                        "its diagram drew the deleted field Name",
+                    ] {
+                        assert!(said.iter().any(|n| n.contains(part)), "{part}: {case}");
+                    }
+                } else {
+                    assert_eq!(l.renderer.field(), Some(stored), "{case}");
+                    assert!(l.labels.enabled && l.labels.default.field == stored, "{case}");
+                    assert_eq!(l.labels.classes.iter().map(|c| c.field.as_str()).collect::<Vec<_>>(), [stored], "{case}");
+                    assert_eq!(l.design.domains.iter().map(|d| d.field.as_str()).collect::<Vec<_>>(), [stored], "{case}");
+                    assert_eq!(slices, [stored, "n"], "{case}");
+                    assert!(said.iter().all(|n| !n.contains("deleted field")), "{case}");
+                }
+            }
+        }
+    }
+
+    /// Converting and calculating geometry into a field named the same as another but for case
+    /// work on the field named; the design guard follows the field design applies to; and design
+    /// is refused on twins, which it couldn't tell apart (#1955).
+    #[test]
+    fn field_commands_and_case_twins() {
+        let mut s = Session::new(crate::Project::default());
+        let fields = vec![
+            Field::new("Name", FieldType::Text),
+            Field::new("name", FieldType::Text),
+            Field::new("X", FieldType::Double),
+            Field::new("x", FieldType::Double),
+        ];
+        let mut ds = Dataset::new("twins", GeometryType::Point, fields);
+        let text = |t: &str| Value::Text(t.into());
+        ds.push(
+            Some(Geometry::Point(rustgis_data::Coord::new(3.0, 4.0))),
+            vec![text("a"), text("2020-01-02"), Value::Float(0.0), Value::Float(0.0)],
+        );
+        let id = s.map_mut().add_dataset(ds);
+        let domains = |s: &Session| -> Vec<String> { s.map().layer(id).unwrap().design.domains.iter().map(|d| d.field.clone()).collect() };
+        // A domain stored as "name" applies to `Name`, the first so named: `name` may become
+        // dates, `Name` may not.
+        let kind = rustgis_map::design::DomainKind::Coded(vec![(text("a"), "A".into())]);
+        s.map_mut().layer_mut(id).unwrap().design.domains.push(rustgis_map::design::Domain { field: "name".into(), kind });
+        s.run("edit.convertField", &json!({"layer": id, "field": "name", "type": "date"})).unwrap();
+        let error = s.run("edit.convertField", &json!({"layer": id, "field": "Name", "type": "date"})).unwrap_err();
+        assert!(error.contains("has a domain"), "{error}");
+        let types: Vec<FieldType> = s.map().layer(id).unwrap().dataset.fields.iter().map(|f| f.ty).collect();
+        assert_eq!(types, [FieldType::Text, FieldType::Date, FieldType::Double, FieldType::Double]);
+        // Calculate Geometry fills `x`, not `X`.
+        let p = json!({"layer": id, "field": "x", "property": "x", "unit": "deg", "scope": "all", "overwrite": true});
+        s.run("edit.calculateGeometry", &p).unwrap();
+        let ds = &s.map().layer(id).unwrap().dataset;
+        assert_eq!((ds.value(0, 2), ds.value(0, 3)), (&Value::Float(0.0), &Value::Float(3.0)));
+        // A domain on either twin, by any case, is refused, and nothing changes.
+        for field in ["X", "x", "NAME"] {
+            let error = s.run("data.domain", &json!({"layer": id, "field": field, "min": 0, "max": 5})).unwrap_err();
+            assert!(error.contains("named the same but for case"), "{field}: {error}");
+            assert_eq!(domains(&s), ["name"]);
         }
     }
 

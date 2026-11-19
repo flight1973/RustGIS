@@ -4810,17 +4810,17 @@ fn degenerate_geometry_and_deleted_fields() {
     let l = s.map().layer_by_name("Countries").unwrap();
     assert!(l.dataset.field_index("pop_est").is_some() && l.display_filters.len() == 1);
     s.run("layer.displayFilters", &json!({"layer": "Countries", "filters": []})).unwrap();
-    // Two fields named the same but for case: the query reads the first, which deleting `pop`
-    // removes; it would otherwise go on to read the second without a word.
+    // Two fields named the same but for case: the query `pop > 1` reads the first, which deleting
+    // `Pop` removes; it would otherwise go on to read the second without a word.
     s.run("layer.addDataText", &json!({"fileName": "twins.csv", "text": "lon,lat,Pop,pop\n1,2,5,0\n3,4,0,5\n"})).unwrap();
     s.run("layer.definitionQuery", &json!({"layer": "twins", "where": "pop > 1"})).unwrap();
-    let e = s.run("edit.deleteField", &json!({"layer": "twins", "field": "pop"})).unwrap_err();
+    let e = s.run("edit.deleteField", &json!({"layer": "twins", "field": "Pop"})).unwrap_err();
     assert!(e.contains("definition query (pop > 1) uses 'Pop'"), "{e}");
     // The same with a field named like a keyword: `null` reads the field `Null` while it exists,
-    // and would read the other one once it is gone.
+    // and would read the other one once deleting `Null` removes it.
     s.run("layer.addDataText", &json!({"fileName": "keywords.csv", "text": "lon,lat,Null,null\n1,2,5,0\n3,4,0,5\n"})).unwrap();
     s.run("layer.definitionQuery", &json!({"layer": "keywords", "where": "null = 5"})).unwrap();
-    let e = s.run("edit.deleteField", &json!({"layer": "keywords", "field": "null"})).unwrap_err();
+    let e = s.run("edit.deleteField", &json!({"layer": "keywords", "field": "Null"})).unwrap_err();
     assert!(e.contains("definition query (null = 5) uses 'Null'"), "{e}");
     s.run("edit.deleteField", &json!({"layer": "Countries", "field": "pop_est"})).unwrap();
     let l = s.map().layer_by_name("Countries").unwrap();
@@ -23902,12 +23902,12 @@ fn deleting_a_field_clears_the_extrusion_marker_rotation_and_symbol_expressions_
     s.run("edit.undo", &Value::Null).unwrap();
     let got = by(&s, "Cities");
     assert_eq!((got.size.as_deref(), got.angle.as_deref()), (Some("turn / 10 + 4"), Some("TURN")));
-    // Two fields named the same but for case: `pop` reads the first, which deleting `pop` removes.
+    // Two fields named the same but for case: `pop` reads the first, which deleting `Pop` removes.
     // Its text would still parse, reading the second, so it is judged by the field it read.
     s.run("layer.addDataText", &json!({"fileName": "twins.csv", "text": "lon,lat,Pop,pop\n1,2,5,0\n3,4,0,5\n"})).unwrap();
     s.run("layer.symbolBy", &json!({"layer": "twins", "size": "pop * 2"})).unwrap();
     let mark = s.notice_mark();
-    s.run("edit.deleteField", &json!({"layer": "twins", "field": "pop"})).unwrap();
+    s.run("edit.deleteField", &json!({"layer": "twins", "field": "Pop"})).unwrap();
     assert_eq!(by(&s, "twins").size, None);
     assert_eq!(about(&s, mark, "expression"), ["twins: its symbol's size expression read the deleted field Pop, so it is removed"]);
 }

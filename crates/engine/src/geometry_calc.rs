@@ -56,7 +56,8 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
     };
     let field = p.get("field").and_then(Json::as_str).map(str::trim).filter(|n| !n.is_empty()).ok_or("field is required")?;
     let create = p.get("create").and_then(Json::as_bool).unwrap_or(false);
-    let existing = l.dataset.field_index(field);
+    // A new field may not match one ignoring case; an existing one is the field named ([`field_in`]).
+    let existing = if create { l.dataset.field_index(field) } else { crate::cmd::edit::field_in(&l.dataset.fields, field)? };
     let ty = if create {
         if existing.is_some() {
             return Err("field already exists".into());
