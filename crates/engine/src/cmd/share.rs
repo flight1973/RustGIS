@@ -705,6 +705,8 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         return Err(format!("{path}: {e}"));
     }
     let parquet = matches!(ext.as_str(), "parquet" | "geoparquet");
+    // The old file's `.prj` a Shapefile in a system without one removes, found before it goes.
+    let stale_prj = if ext == "shp" { rustgis_data::io::shapefile_stale_prj(Path::new(path), crs) } else { None };
     let (written, left_out, skipped, table, unfit, null_numbers, moved, format_notes, dates) = match &chunks {
         Some((src, layer)) => {
             let (e, table) =
@@ -786,7 +788,12 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     said.extend(unfit);
     said.extend(dates);
     if shapefile && rustgis_data::raster::wkt::to_wkt(crs).is_none() {
-        said.push(format!("{path}: no .prj written, as {} has no WKT form", crs.label()));
+        let removed = stale_prj
+            .as_deref()
+            .and_then(Path::file_name)
+            .map(|n| format!("; {} was removed, as it said the old file's system", n.to_string_lossy()))
+            .unwrap_or_default();
+        said.push(format!("{path}: no .prj written, as {} has no WKT form{removed}", crs.label()));
     }
     said.push(format!("Exported {path}"));
     let answer = json!({"path": path, "features": written, "leftOut": left_out, "crs": crs.label()});

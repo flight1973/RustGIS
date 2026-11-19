@@ -397,9 +397,19 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
                 return Err(refused(path, format!("{} didn't read back as written", tmp.display())));
             }
         }
-        // Found again: a part or link put there under another spelling meanwhile is seen.
+        // Found again: a part or link put there under another spelling meanwhile is seen, and so
+        // is one the reader would now take instead of the one written.
         let again = Sidecars::shapefile(path);
         unchanged(&again, "while the layer was written")?;
+        for ext in std::iter::once("shp").chain(crate::sidecar::SHAPEFILE_COMPANIONS) {
+            let (was, now) = (files.path(ext), again.path(ext));
+            if was != now {
+                return Err(refused(
+                    path,
+                    format!("{} is there now and would be read instead of {}, which this would write", now.display(), was.display()),
+                ));
+            }
+        }
         Ok(again)
     })();
     let again = match checked {
@@ -943,9 +953,9 @@ mod tests {
         dir.join("ROADS.SHP")
     }
 
-    /// A record made before parts were found in any case, or where the file system ignores case,
-    /// names `ROADS.shx` for `ROADS.SHX`: the same file by its size and hash, so the layer still
-    /// publishes, under the names the files have.
+    /// A record made where the file system ignores case can name `ROADS.shx` for `ROADS.SHX`:
+    /// there the same file by its size and hash, so the layer still publishes, under the names
+    /// the files have. Where case is told apart, those names are other files, so it is refused.
     #[test]
     fn a_record_naming_its_parts_in_another_case_still_publishes() {
         let dir = tempfile::tempdir().unwrap();
@@ -959,13 +969,88 @@ mod tests {
                 *name = format!("{base}.{}", ext.to_ascii_lowercase());
             }
         }
-        assert!(sync.files.changed(&path).unwrap().is_empty());
-        assert!(sync.files.resized(&path).is_empty());
         let rows: Vec<_> = ds.features.iter().skip(1).cloned().collect();
         ds.features = rows.into();
+        if !crate::sidecar::tests::ignores_case(dir.path()) {
+            assert!(!sync.files.changed(&path).unwrap().is_empty());
+            assert!(shapefile(&ds, &path, &sync).is_err());
+            assert_eq!(file_names(dir.path()), before);
+            return;
+        }
+        assert!(sync.files.changed(&path).unwrap().is_empty());
+        assert!(sync.files.resized(&path).is_empty());
         let published = shapefile(&ds, &path, &sync).unwrap();
         assert!(published.notes.is_empty(), "{:?}", published.notes);
         assert_eq!(file_names(dir.path()), before);
+    }
+
+    /// Where case is told apart, a part that appears under a new spelling beside the one
+    /// recorded (`ROADS.dbf` beside `ROADS.DBF`, even with the same bytes) is a new file the
+    /// reader would take: refused when there before the publish, and when it appears while the
+    /// layer is written.
+    #[test]
+    fn a_new_spelling_of_a_part_is_refused_where_case_is_told_apart() {
+        struct Plant(PathBuf, std::sync::atomic::AtomicBool);
+        impl crate::progress::Probe for Plant {
+            fn cancelled(&self) -> bool {
+                use std::sync::atomic::Ordering;
+                let staged = std::fs::read_dir(&self.0).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".tmp"));
+                if staged && !self.1.swap(true, Ordering::SeqCst) {
+                    std::fs::copy(self.0.join("ROADS.DBF"), self.0.join("ROADS.dbf")).unwrap();
+                }
+                false
+            }
+            fn begin(&self, _: u64) {}
+            fn advance(&self, _: u64) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        if crate::sidecar::tests::ignores_case(dir.path()) {
+            return;
+        }
+        let path = roads(dir.path(), None, |e| e.to_ascii_uppercase());
+        let (mut ds, sync) = read(&path);
+        let rows: Vec<_> = ds.features.iter().skip(1).cloned().collect();
+        ds.features = rows.into();
+        std::fs::copy(dir.path().join("ROADS.DBF"), dir.path().join("ROADS.dbf")).unwrap();
+        let e = shapefile(&ds, &path, &sync).err().expect("a new spelling is a change").to_string();
+        assert!(e.contains("ROADS.dbf") && e.contains("changed since the layer was read"), "{e}");
+        std::fs::remove_file(dir.path().join("ROADS.dbf")).unwrap();
+        let shp = std::fs::read(&path).unwrap();
+        let planted = std::sync::Arc::new(Plant(dir.path().to_path_buf(), std::sync::atomic::AtomicBool::new(false)));
+        let e = {
+            let _probe = crate::progress::install(Some(planted.clone()));
+            shapefile(&ds, &path, &sync).err().expect("a new spelling while writing is refused").to_string()
+        };
+        assert!(planted.1.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(e.contains("while the layer was written") || e.contains("would be read instead"), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), shp);
+    }
+
+    /// Where case is told apart, reading `ROADS.SHP` beside another Shapefile `ROADS.shp` takes
+    /// the parts spelled in its own case (`ROADS.DBF`, not `ROADS.dbf`) and says the other is
+    /// there.
+    #[test]
+    fn reading_beside_a_shp_of_the_name_in_another_case_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        if crate::sidecar::tests::ignores_case(dir.path()) {
+            return;
+        }
+        let path = roads(dir.path(), None, |e| e.to_ascii_uppercase());
+        let other = tempfile::tempdir().unwrap();
+        let mut one = parcels();
+        let rows: Vec<_> = one.features.iter().skip(1).cloned().collect();
+        one.features = rows.into();
+        crate::io::write_path(&one, &other.path().join("x.shp")).unwrap();
+        for ext in ["shp", "shx", "dbf"] {
+            std::fs::copy(other.path().join(format!("x.{ext}")), dir.path().join(format!("ROADS.{ext}"))).unwrap();
+        }
+        let (ds, report) = crate::io::read_path(&path).unwrap();
+        let owners: Vec<_> = ds.features.iter().map(|f| f.attrs[0].clone()).collect();
+        assert_eq!(owners, [Value::Text("Smith".into()), Value::Text("Jones".into())]);
+        assert!(report.messages.iter().any(|m| m.contains("ROADS.shp is there too") && m.contains("ROADS.DBF")), "{:?}", report.messages);
+        let source = crate::source::shp::ShpSource::open_path(&path, "roads").unwrap();
+        let notes = &crate::source::FeatureSource::info(&source).notes;
+        assert!(notes.iter().any(|m| m.contains("ROADS.shp is there too")), "{notes:?}");
     }
 
     /// Beside `ROADS.SHP`, parts spelled in lower case keep their names when published, also
@@ -1054,24 +1139,22 @@ mod tests {
         assert_eq!(bytes(&before), was);
     }
 
-    /// Saving over a Shapefile in a system no `.prj` can describe is refused while its `.prj`
-    /// (in any case) is there: kept, it would say the old file's system.
+    /// Saving over a Shapefile in a system no `.prj` can describe writes none and removes the
+    /// old file's `.prj` (in any case), which would say another system; the export is told
+    /// which one beforehand ([`crate::io::shapefile_stale_prj`]) to say so.
     #[test]
-    fn saving_in_a_system_without_a_prj_over_one_with_a_prj_is_refused() {
+    fn saving_in_a_system_without_a_prj_removes_the_old_prj() {
         let dir = tempfile::tempdir().unwrap();
         let path = roads(dir.path(), None, |e| e.to_ascii_uppercase());
-        let before = file_names(dir.path());
-        let shp = std::fs::read(&path).unwrap();
         let gnomonic = Crs::parse("+proj=gnom +lat_0=35 +lon_0=-90 +datum=WGS84 +units=m +no_defs").unwrap();
         assert!(crate::raster::wkt::to_wkt(gnomonic).is_none());
-        let e = crate::io::write_path_in(&parcels(), &path, gnomonic).unwrap_err().to_string();
-        assert!(e.contains("has no .prj form") && e.contains("ROADS.PRJ") && e.contains("nothing was written"), "{e}");
-        assert_eq!(file_names(dir.path()), before);
-        assert_eq!(std::fs::read(&path).unwrap(), shp);
-        // Without a `.prj` there, it is written, with none.
-        std::fs::remove_file(dir.path().join("ROADS.PRJ")).unwrap();
+        let stale = crate::io::shapefile_stale_prj(&path, gnomonic).unwrap();
+        assert_eq!(std::fs::read(&stale).unwrap(), std::fs::read(dir.path().join("ROADS.PRJ")).unwrap());
+        assert_eq!(crate::io::shapefile_stale_prj(&path, Crs::LonLat), None);
         crate::io::write_path_in(&parcels(), &path, gnomonic).unwrap();
-        assert!(!file_names(dir.path()).iter().any(|n| n.to_ascii_lowercase().ends_with(".prj")));
+        assert!(!file_names(dir.path()).iter().any(|n| n.to_ascii_lowercase().ends_with(".prj")), "{:?}", file_names(dir.path()));
+        assert_eq!(crate::io::shapefile_stale_prj(&path, gnomonic), None);
+        assert_eq!(crate::io::read_path(&path).unwrap().0.features.len(), 2);
     }
 
     /// A record from before #1958 of `ROADS.SHP` names `ROADS.shx` missing, as its lower-case

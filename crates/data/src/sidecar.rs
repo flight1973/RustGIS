@@ -6,15 +6,33 @@
 
 use std::path::{Path, PathBuf};
 
-/// A Shapefile's files by their extensions in lower case: its shapes, index, table, coordinate
-/// system and code page, then the spatial indexes a rewrite leaves stale.
-pub(crate) const SHAPEFILE: [&str; 8] = ["shp", "shx", "dbf", "prj", "cpg", "qix", "sbn", "sbx"];
-
 /// The parts of a Shapefile besides its `.shp` that are read and written.
 pub(crate) const SHAPEFILE_COMPANIONS: [&str; 4] = ["shx", "dbf", "prj", "cpg"];
 
 /// The spatial indexes beside a Shapefile, which no longer match once it is written again.
 pub(crate) const SHAPEFILE_INDEXES: [&str; 3] = ["qix", "sbn", "sbx"];
+
+/// A Shapefile's files by their extensions in lower case: its shapes, its
+/// [`SHAPEFILE_COMPANIONS`], then its [`SHAPEFILE_INDEXES`].
+pub(crate) const SHAPEFILE: [&str; 8] = {
+    let [shx, dbf, prj, cpg] = SHAPEFILE_COMPANIONS;
+    let [qix, sbn, sbx] = SHAPEFILE_INDEXES;
+    ["shp", shx, dbf, prj, cpg, qix, sbn, sbx]
+};
+
+/// Whether an extension is in upper case (`SHP`, not `shp` or `Shp`): a part written for the
+/// first time beside such a `.shp` is named in upper case too.
+pub(crate) fn upper_extension(ext: &[u8]) -> bool {
+    !ext.is_empty() && !ext.iter().any(u8::is_ascii_lowercase)
+}
+
+/// Whether two paths reach one file ([`Identity`]); `false` when either reaches nothing.
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.metadata(), b.metadata()) {
+        (Ok(ma), Ok(mb)) => identity(a, &ma) == identity(b, &mb),
+        _ => false,
+    }
+}
 
 /// The most folder entries one listing reads; a larger folder has each spelling tried instead.
 const LISTING_LIMIT: usize = 100_000;
@@ -98,7 +116,7 @@ impl Sidecars {
     /// each spelling of each part is tried instead, keeping every one there but for spellings
     /// that reach a file already kept.
     pub(crate) fn shapefile(path: &Path) -> Sidecars {
-        let upper_of = |p: &Path| p.extension().is_some_and(|e| !e.is_empty() && !e.as_encoded_bytes().iter().any(u8::is_ascii_lowercase));
+        let upper_of = |p: &Path| p.extension().is_some_and(|e| upper_extension(e.as_encoded_bytes()));
         let mut found: Vec<(&'static str, Vec<PathBuf>)> = SHAPEFILE.iter().map(|&e| (e, Vec::new())).collect();
         let file = match (path.file_name(), list(path)) {
             (Some(name), Some(entries)) => {
@@ -135,9 +153,23 @@ impl Sidecars {
                 file
             }
             _ => {
+                let upper = upper_of(path);
                 for (ext, part) in &mut found {
                     let mut seen: Vec<Identity> = Vec::new();
-                    for spelling in case_spellings(ext) {
+                    // Spellings that reach the `.shp` itself are it, never another Shapefile.
+                    if *ext == "shp"
+                        && let Ok(meta) = path.symlink_metadata()
+                    {
+                        seen.push(identity(path, &meta));
+                        part.push(path.to_path_buf());
+                    }
+                    // Where case is ignored every spelling reaches one file: it is named as the
+                    // `.shp`'s case suggests, the guess nearest the name it has.
+                    let mut spellings = case_spellings(ext);
+                    if upper {
+                        spellings.sort_by_key(|s| !upper_extension(s.as_bytes()));
+                    }
+                    for spelling in spellings {
                         let p = path.with_extension(&spelling);
                         let Ok(meta) = p.symlink_metadata() else { continue };
                         let id = identity(&p, &meta);
@@ -151,12 +183,17 @@ impl Sidecars {
                 path.to_path_buf()
             }
         };
+        let upper = upper_of(&file);
+        // Beside another `.shp` of the name in another case, a part spelled in this one's case
+        // (`ROADS.DBF` for `ROADS.SHP`, `ROADS.dbf` for `ROADS.shp`) is taken for this one's.
+        let paired = found.iter().any(|(e, f)| *e == "shp" && f.iter().any(|p| *p != file));
         let parts = found
             .into_iter()
             .map(|(ext, mut entries)| {
                 entries.sort_by_key(|p| {
                     let e = p.extension().map(|e| e.as_encoded_bytes().to_vec()).unwrap_or_default();
-                    (e != ext.as_bytes(), e, p.as_os_str().as_encoded_bytes().to_vec())
+                    let unlike = paired && (if upper { !upper_extension(&e) } else { e != ext.as_bytes() });
+                    (unlike, e != ext.as_bytes(), e.clone(), p.as_os_str().as_encoded_bytes().to_vec())
                 });
                 let found = entries
                     .into_iter()
@@ -168,7 +205,7 @@ impl Sidecars {
                 Part { ext, found }
             })
             .collect();
-        Sidecars { upper: upper_of(&file), file, parts }
+        Sidecars { upper, file, parts }
     }
 
     fn part(&self, ext: &str) -> Option<&Part> {
@@ -218,6 +255,20 @@ impl Sidecars {
         self.spellings("shp").into_iter().find(|p| *p != self.file.as_path())
     }
 
+    /// A note for reading beside another `.shp` of the name in another case ([`Sidecars::other_shp`]):
+    /// the parts taken for this one's, those spelled in its case, can't be told apart for sure.
+    pub(crate) fn other_shp_note(&self) -> Option<String> {
+        let other = self.other_shp()?;
+        let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let taken: Vec<String> = SHAPEFILE_COMPANIONS.iter().filter_map(|e| self.existing(e)).map(name).collect();
+        Some(format!(
+            "Shapefile: {}: {} is there too, a Shapefile of the same name in another case; RustGIS reads the parts spelled in this one's case ({}), and can't tell for sure which belong to which",
+            self.file.display(),
+            name(other),
+            if taken.is_empty() { "none".to_string() } else { taken.join(", ") }
+        ))
+    }
+
     /// A note naming each part there under more than one spelling (`roads.dbf` and
     /// `roads.DBF`): which one is read and written, and that the others are left as they are.
     pub(crate) fn duplicates_note(&self) -> Option<String> {
@@ -243,18 +294,25 @@ impl Sidecars {
     }
 }
 
-/// The names in `path`'s folder, each with whether it is a folder; `None` when the folder can't
-/// be listed or holds more than [`LISTING_LIMIT`] entries.
+/// The names in `path`'s folder whose stem is `path`'s in any ASCII case, each with whether it
+/// is a folder; `None` when the folder can't be listed or holds more than [`LISTING_LIMIT`]
+/// entries, which it stops at.
 fn list(path: &Path) -> Option<Vec<(std::ffi::OsString, bool)>> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let stem = path.file_stem()?.as_encoded_bytes();
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(dir).ok()? {
-        if entries.len() >= LISTING_LIMIT {
+    for (i, entry) in std::fs::read_dir(dir).ok()?.enumerate() {
+        if i >= LISTING_LIMIT {
             return None;
         }
         let entry = entry.ok()?;
-        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-        entries.push((entry.file_name(), is_dir));
+        let name = entry.file_name();
+        let bytes = name.as_encoded_bytes();
+        let base = bytes.iter().rposition(|&b| b == b'.').and_then(|dot| bytes.get(..dot)).unwrap_or(bytes);
+        if base.eq_ignore_ascii_case(stem) {
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            entries.push((name, is_dir));
+        }
     }
     Some(entries)
 }
@@ -323,6 +381,32 @@ pub(crate) mod tests {
         assert_eq!(files.existing("dbf"), None);
         assert_eq!(files.path("dbf"), dir.path().join("roads.dbf"));
         assert_eq!(files.other_shp(), Some(dir.path().join("roads.SHP").as_path()));
+    }
+
+    /// Trying each spelling (a folder that can't be listed), every spelling of `ROADS.SHP` that
+    /// reaches it (all of them, where case is ignored) is it, not another Shapefile.
+    #[cfg(unix)]
+    #[test]
+    fn trying_each_spelling_never_takes_the_shp_for_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for ext in ["SHP", "SHX", "DBF"] {
+            std::fs::write(d.join(format!("ROADS.{ext}")), ext).unwrap();
+        }
+        let mut perms = std::fs::metadata(d).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o300);
+        std::fs::set_permissions(d, perms.clone()).unwrap();
+        let listed = std::fs::read_dir(d).is_ok();
+        let files = Sidecars::shapefile(&d.join("ROADS.SHP"));
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(d, perms).unwrap();
+        if listed {
+            return; // Running as a user who reads any folder (root).
+        }
+        assert_eq!(files.other_shp(), None);
+        assert_eq!(files.spellings("shp"), [d.join("ROADS.SHP")]);
+        assert_eq!(std::fs::read_to_string(files.existing("shx").unwrap()).unwrap(), "SHX");
+        assert_eq!(files.path("dbf").file_name().unwrap().to_string_lossy().to_ascii_lowercase(), "roads.dbf");
     }
 
     /// Trying each spelling (a folder that can't be listed): a dangling `roads.prj` doesn't hide

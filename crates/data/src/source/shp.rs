@@ -97,6 +97,8 @@ impl ShpSource {
         let mut notes = Vec::new();
         let table = read_table(&dbf)?;
         let cpg = crate::dbf::read_cpg(files.existing("cpg"), &mut notes);
+        notes.extend(files.other_shp_note());
+        notes.extend(files.duplicates_note());
         let encoding = crate::dbf::encoding(cpg.as_deref(), table.ldid, &mut notes);
         let shp_len = std::fs::metadata(path)?.len();
         if shp_len > u64::from(u32::MAX) {

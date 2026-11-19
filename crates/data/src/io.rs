@@ -697,23 +697,17 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
                     other.display()
                 )));
             }
+            // Its spatial indexes would no longer match; another spelling of a part stays, as
+            // [`shapefile_spellings_note`] says. In a system no `.prj` can describe, none is
+            // written, and the old file's (in any spelling) goes too, as
+            // [`shapefile_stale_prj`] says: it would go on saying another system.
+            let mut stale: Vec<std::path::PathBuf> =
+                crate::sidecar::SHAPEFILE_INDEXES.iter().flat_map(|e| files.spellings(e)).map(Path::to_path_buf).collect();
+            if shapefile_prj(crs).is_none() {
+                stale.extend(files.spellings("prj").into_iter().map(Path::to_path_buf));
+            }
             crate::progress::begin(ds.features.len());
             let (parts, left_out) = shapefile_parts_in(ds, crs)?;
-            // A system no `.prj` can describe: the old file's `.prj` would say another one.
-            if !parts.iter().any(|(e, _)| *e == "prj")
-                && let Some(prj) = files.existing("prj")
-            {
-                return Err(DataError::Format(format!(
-                    "{}: {} has no .prj form, and {} would go on saying the old file's system; remove it or save to another name; nothing was written",
-                    path.display(),
-                    crs.label(),
-                    prj.display()
-                )));
-            }
-            // Its spatial indexes would no longer match; another spelling of a part stays, as
-            // [`shapefile_spellings_note`] says.
-            let stale: Vec<std::path::PathBuf> =
-                crate::sidecar::SHAPEFILE_INDEXES.iter().flat_map(|e| files.spellings(e)).map(Path::to_path_buf).collect();
             let parts: Vec<(std::path::PathBuf, Vec<u8>)> = parts.into_iter().map(|(e, bytes)| (files.path(e), bytes)).collect();
             place_shapefile(files.file(), &stage_shapefile(&parts)?, &stale)?;
             Ok((left_out, None))
@@ -2539,6 +2533,21 @@ pub fn shapefile_for_dbf(path: &Path) -> Option<std::path::PathBuf> {
     crate::sidecar::find_one(path, "shp")
 }
 
+/// The `.prj` a Shapefile in `crs` is written with: `None` for a system WKT can't describe.
+fn shapefile_prj(crs: Crs) -> Option<String> {
+    if crs == Crs::LonLat { Some(WGS84_PRJ.to_string()) } else { crate::raster::wkt::to_wkt(crs) }
+}
+
+/// The `.prj` beside the Shapefile at `path` that saving it in `crs` removes: one is there (in
+/// any spelling) and `crs` has no `.prj` form, so none is written and the old one would go on
+/// saying another system. For the export to say; checked before the save.
+pub fn shapefile_stale_prj(path: &Path, crs: Crs) -> Option<std::path::PathBuf> {
+    if shapefile_prj(crs).is_some() {
+        return None;
+    }
+    crate::sidecar::find_one(path, "prj")
+}
+
 /// The note for a Shapefile at `path` with a part there under more than one spelling
 /// (`ROADS.dbf` and `ROADS.DBF`, where case is told apart): the one read and written, and that
 /// the others are left as they are. For an export over such a file to say.
@@ -2573,6 +2582,7 @@ pub fn read_shapefile_in(path: &Path, name: &str, crs: Option<Crs>) -> Result<(D
     };
     let (ds, mut report) = read_shapefile_parts(parts, name, crs)?;
     report.messages.extend(notes);
+    report.messages.extend(files.other_shp_note());
     report.messages.extend(files.duplicates_note());
     Ok((ds, report))
 }
@@ -4398,7 +4408,7 @@ pub(crate) fn shapefile_parts_styled(
             return Err(DataError::Unsupported(format!("{what} as a Shapefile")));
         }
     }
-    let prj = if crs == Crs::LonLat { Some(WGS84_PRJ.to_string()) } else { crate::raster::wkt::to_wkt(crs) };
+    let prj = shapefile_prj(crs);
     let mut dbf = dbf.into_inner();
     if let Some(style) = style {
         // The file's language driver, whatever `dbase` takes the encoding for, and its float

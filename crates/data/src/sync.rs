@@ -112,12 +112,47 @@ mod native {
         paths.into_iter().map(|p| (p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), p)).collect()
     }
 
-    /// The part of `now` that a recorded `name` is: the one of that name, else the one whose name
-    /// differs from it only in ASCII case. A record made where the file system ignores case, or
-    /// before parts were found in any case, can name `ROADS.shx` for what is `ROADS.SHX` now; the
-    /// two are taken for one file, unchanged only when its size and hash are those recorded.
-    fn part_named<'a>(now: &'a [(String, PathBuf)], name: &str) -> Option<&'a (String, PathBuf)> {
-        now.iter().find(|(n, _)| n == name).or_else(|| now.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)))
+    /// What a recorded entry is among the parts there now.
+    enum Pair {
+        /// The part at this index of `now`.
+        At(usize),
+        /// A `.shx` an older lookup missed ([`missed_by_an_older_lookup`]): no change.
+        Missed,
+        /// None of them: the file is gone, or was never there.
+        Gone,
+    }
+
+    /// Each recorded entry's [`Pair`] among the parts there now (`now`), and which of `now` are
+    /// the record's. A recorded name is the part of that name, else one whose name differs from
+    /// it only in ASCII case when the two names reach one file: where the file system ignores
+    /// case, a record can name `ROADS.shx` for what is `ROADS.SHX` now (made there, or before
+    /// parts were found in any case), and it is that file, unchanged only when its size and hash
+    /// are those recorded. Where case is told apart, a part under a new spelling (`ROADS.dbf`
+    /// beside the recorded `ROADS.DBF`) is a new file.
+    fn pair(files: &[(String, Option<FileStamp>)], now: &[(String, PathBuf)]) -> (Vec<Pair>, Vec<bool>) {
+        let mut theirs = vec![false; now.len()];
+        let mut pairs = Vec::with_capacity(files.len());
+        for (name, was) in files {
+            let one_file =
+                |(n, p): &(String, PathBuf)| n.eq_ignore_ascii_case(name) && crate::sidecar::same_file(&p.with_file_name(name), p);
+            let exact = now.iter().position(|(n, _)| n == name);
+            let missed = || now.iter().position(|part| missed_by_an_older_lookup(files, name, was, part));
+            let (pair, at) = match exact {
+                Some(i) => (Pair::At(i), Some(i)),
+                None => match missed() {
+                    Some(i) => (Pair::Missed, Some(i)),
+                    None => match now.iter().position(one_file) {
+                        Some(i) => (Pair::At(i), Some(i)),
+                        None => (Pair::Gone, None),
+                    },
+                },
+            };
+            if let Some(t) = at.and_then(|i| theirs.get_mut(i)) {
+                *t = true;
+            }
+            pairs.push(pair);
+        }
+        (pairs, theirs)
     }
 
     /// Whether the record's `name`, recorded missing, is an index an older RustGIS couldn't see:
@@ -135,11 +170,9 @@ mod native {
         was: &Option<FileStamp>,
         now: &(String, PathBuf),
     ) -> bool {
-        let upper_set = files
-            .first()
-            .and_then(|(n, _)| n.rsplit_once('.'))
-            .is_some_and(|(_, e)| !e.is_empty() && !e.bytes().any(|b| b.is_ascii_lowercase()));
-        was.is_none() && upper_set && name.ends_with(".shx") && now.0 != name && now.1.exists()
+        let upper_set =
+            files.first().and_then(|(n, _)| n.rsplit_once('.')).is_some_and(|(_, e)| crate::sidecar::upper_extension(e.as_bytes()));
+        was.is_none() && upper_set && name.ends_with(".shx") && now.0 != name && now.0.eq_ignore_ascii_case(name) && now.1.exists()
     }
 
     /// The name a differing file is reported under: the one it has now when it is there (a part
@@ -262,29 +295,52 @@ mod native {
             self.changed_among(&parts(path))
         }
 
+        /// Whether every file is as recorded by its size, told by looking at each recorded name
+        /// alone, without listing the folder (a source checked often, as the desktop's watch on
+        /// it does): for a Shapefile, also that no other spelling of a part's name is there but
+        /// one that reaches the same file. `false` whenever something differs or might.
+        fn sized_as_recorded(&self, path: &Path) -> bool {
+            let shapefile = self.files.first().is_some_and(|(n, _)| n.to_ascii_lowercase().ends_with(".shp"));
+            self.files.iter().all(|(name, was)| {
+                let p = path.with_file_name(name);
+                let sized = match was {
+                    Some(was) => len(&p).is_ok_and(|l| l == Some(was.len)),
+                    None => p.symlink_metadata().is_err(),
+                };
+                let Some((_, ext)) = name.rsplit_once('.').filter(|_| shapefile && sized) else { return sized };
+                crate::sidecar::case_spellings(&ext.to_ascii_lowercase()).iter().all(|e| {
+                    let other = p.with_extension(e);
+                    other.symlink_metadata().is_err() || (was.is_some() && crate::sidecar::same_file(&other, &p))
+                })
+            })
+        }
+
         /// As [`FileSync::changed`], with the source's parts as [`FileSync::parts_of`] gives them.
         pub(crate) fn changed_among(&self, now: &[(String, PathBuf)]) -> Result<Vec<String>> {
             let mut changed = Vec::new();
-            // Files there now under a name the record has in no case; not a name `parts` gives
-            // for a part that isn't there.
-            for (name, p) in now {
-                if !self.files.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) && p.exists() {
+            let (pairs, theirs) = pair(&self.files, now);
+            // Files there now that aren't the record's; not a name `parts` gives for a part that
+            // isn't there.
+            for ((name, p), theirs) in now.iter().zip(&theirs) {
+                if !theirs && p.exists() {
                     changed.push(name.clone());
                 }
             }
             let total = self.files.iter().filter_map(|(_, s)| s.as_ref()).map(|s| s.len).sum();
             crate::progress::begin(count(total));
-            for (name, was) in &self.files {
-                let Some(part) = part_named(now, name) else {
+            for ((name, was), pair) in self.files.iter().zip(&pairs) {
+                let part = match pair {
+                    Pair::Missed => continue,
+                    Pair::At(i) => now.get(*i),
+                    Pair::Gone => None,
+                };
+                let Some(part) = part else {
                     // Out of the set now: changed if it held anything.
                     if was.is_some() {
                         changed.push(name.clone());
                     }
                     continue;
                 };
-                if missed_by_an_older_lookup(&self.files, name, was, part) {
-                    continue;
-                }
                 let p = &part.1;
                 let same = match (was, len(p)) {
                     (None, Ok(None)) => true,
@@ -306,17 +362,19 @@ mod native {
         /// added, removed, or another length. Reads no file, so a change that keeps every length
         /// isn't seen; [`FileSync::changed`] hashes them. An unreadable file counts as differing.
         pub fn resized(&self, path: &Path) -> Vec<String> {
+            if self.sized_as_recorded(path) {
+                return Vec::new();
+            }
             let now = parts(path);
-            let mut differ: Vec<String> = now
-                .iter()
-                .filter(|(name, p)| !self.files.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) && p.exists())
-                .map(|(n, _)| n.clone())
-                .collect();
-            for (name, was) in &self.files {
-                let part = part_named(&now, name);
-                if part.is_some_and(|part| missed_by_an_older_lookup(&self.files, name, was, part)) {
-                    continue;
-                }
+            let (pairs, theirs) = pair(&self.files, &now);
+            let mut differ: Vec<String> =
+                now.iter().zip(&theirs).filter(|((_, p), theirs)| !**theirs && p.exists()).map(|((n, _), _)| n.clone()).collect();
+            for ((name, was), pair) in self.files.iter().zip(&pairs) {
+                let part = match pair {
+                    Pair::Missed => continue,
+                    Pair::At(i) => now.get(*i),
+                    Pair::Gone => None,
+                };
                 let same = match (was, part.map(|(_, p)| len(p))) {
                     (None, None | Some(Ok(None))) => true,
                     (Some(was), Some(Ok(Some(len)))) => len == was.len,
@@ -414,8 +472,10 @@ mod tests {
         assert_eq!(sync.changed(&path).unwrap(), ["a.CPG"]);
     }
 
-    /// A record naming `a.shx` for what is `a.SHX` now is the same file when its size and hash
-    /// are those recorded, and changed when they aren't, said under the name it has now.
+    /// A record naming `a.shx` for what is `a.SHX` now: where the file system ignores case, the
+    /// same file, unchanged when its size and hash are those recorded and changed, said under
+    /// the name it has now, when they aren't; where case is told apart, a new file, and the
+    /// recorded one gone.
     #[test]
     fn a_part_recorded_in_another_case_is_compared_by_its_bytes() {
         let dir = tempfile::tempdir().unwrap();
@@ -428,6 +488,11 @@ mod tests {
         let shx = sync.files.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case("a.shx")).unwrap();
         assert_eq!(shx.0, "a.SHX");
         shx.0 = "a.shx".into();
+        if !crate::sidecar::tests::ignores_case(d) {
+            assert_eq!(sync.changed(&path).unwrap(), ["a.SHX", "a.shx"]);
+            assert_eq!(sync.resized(&path), ["a.SHX", "a.shx"]);
+            return;
+        }
         assert!(sync.changed(&path).unwrap().is_empty());
         assert!(sync.resized(&path).is_empty());
         std::fs::write(d.join("a.SHX"), "SHX").unwrap();
