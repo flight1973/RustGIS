@@ -16,7 +16,7 @@ use hayro::hayro_interpret::{InterpreterSettings, InterpreterWarning};
 use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::content::TypedIter;
 use hayro::hayro_syntax::content::ops::TypedInstruction;
-use hayro::hayro_syntax::object::{Array, Dict, Name, ObjectIdentifier, Stream, String as PdfString};
+use hayro::hayro_syntax::object::{Array, Dict, Name, Stream, String as PdfString};
 use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, Point};
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -200,7 +200,7 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
     }
     // Only when `hayro` asked for a font not in the file is the page looked through for which.
     if asked.load(Ordering::Relaxed) {
-        let found = substituted_fonts(page);
+        let found = substituted_fonts(page, FONT_SEARCH_BYTES, FONT_SEARCH_WORK);
         if !found.names.is_empty() || found.stopped {
             let shown: Vec<&str> = found.names.iter().take(MISSING_FONTS_NAMED).map(String::as_str).collect();
             let left = found.keys.len().saturating_sub(shown.len());
@@ -223,9 +223,12 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
 const MISSING_FONTS_KEPT: usize = 100;
 const MISSING_FONTS_NAMED: usize = 10;
 const MISSING_FONTS_COUNTED: usize = 10_000;
-/// The most forms within forms, and content streams, looked through for the fonts chosen.
+/// The most forms within forms, and content streams, looked through for the fonts chosen; the
+/// most bytes their content decodes to in all; and the most fonts chosen and annotations looked at.
 const FONT_SEARCH_DEPTH: usize = 32;
 const FONT_SEARCH_STREAMS: usize = 1_000;
+const FONT_SEARCH_BYTES: usize = 32 << 20;
+const FONT_SEARCH_WORK: usize = 1_000_000;
 
 /// The standard 14 fonts (ISO 32000-2 § 9.6.2.2), drawn in `hayro`'s own when not in the file, as
 /// every reader draws them in its own: not a stand-in for something else.
@@ -267,33 +270,54 @@ impl<'a> Res<'a> {
     }
 }
 
+/// Where an object's dictionary lies in the bytes it was read from: one key for an object
+/// however it is reached, with an object number or without (a dictionary written in place).
+fn span(d: &Dict<'_>) -> (usize, usize) {
+    let bytes = d.data();
+    (bytes.as_ptr() as usize, bytes.len())
+}
+
 /// The fonts not in the file that the page chooses, found by [`substituted_fonts`]: their names
 /// (at most [`MISSING_FONTS_KEPT`]), the fonts told apart (at most [`MISSING_FONTS_COUNTED`]), and
-/// whether the search stopped before it had looked at everything.
+/// whether the search stopped before it had looked at everything; and what it has left to spend.
 #[derive(Default)]
 struct FontSearch<'a> {
     names: Vec<String>,
     keys: HashSet<String>,
     stopped: bool,
-    seen: HashSet<ObjectIdentifier>,
+    /// The streams queued, and the fonts looked at, by [`span`].
+    seen: HashSet<(usize, usize)>,
+    fonts: HashSet<(usize, usize)>,
     streams: usize,
+    /// The bytes content may still decode to, and the fonts chosen and annotations that may
+    /// still be looked at.
+    bytes_left: usize,
+    work_left: usize,
+    /// The bytes decoded so far.
+    decoded: usize,
     todo: Vec<(Stream<'a>, Res<'a>, usize)>,
 }
 
 /// The fonts the page chooses (`Tf`) whose programs aren't in the file and which aren't one of the
 /// [`STANDARD_FONTS`] ([`missing_font`]): `hayro` draws their text in a stand-in. The page's
 /// content is followed as `hayro` draws it, into the forms it draws, soft-mask groups, tiling
-/// patterns, Type 3 fonts' glyphs, and its annotations' appearances, to [`FONT_SEARCH_DEPTH`]
-/// deep and [`FONT_SEARCH_STREAMS`] streams. Forms' content is decoded again for it (`hayro`
-/// doesn't keep it), so it is done only once `hayro` has asked for a font not in the file.
-fn substituted_fonts<'a>(page: &Page<'a>) -> FontSearch<'a> {
-    let mut search = FontSearch::default();
+/// patterns and its annotations' appearances, to [`FONT_SEARCH_DEPTH`] deep and
+/// [`FONT_SEARCH_STREAMS`] streams. Forms' content is decoded again for it (`hayro` doesn't keep
+/// it), at most `bytes` in all: a stream whose stored length, or what it decodes to, is more than
+/// is left stops the search. It looks at most `work` chosen fonts and annotations. A Type 3 font's
+/// glyphs aren't decoded: a font chosen inside one isn't named. Done only once `hayro` has asked
+/// for a font not in the file.
+fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> FontSearch<'a> {
+    let mut search = FontSearch { bytes_left: bytes, work_left: work, ..FontSearch::default() };
     let res = page.resources();
     let page_res =
         Res { fonts: res.fonts.clone(), xobjects: res.x_objects.clone(), states: res.ext_g_states.clone(), patterns: res.patterns.clone() };
     search.ops(page.typed_operations(), &page_res, 0);
     if let Some(annots) = page.raw().get::<Array<'a>>(b"Annots".as_slice()) {
         for annot in annots.iter::<Dict<'a>>() {
+            if !search.spend() {
+                break;
+            }
             // The normal appearance is the one drawn.
             let Some(ap) = annot.get::<Dict<'a>>(b"AP".as_slice()) else { continue };
             if let Some(s) = ap.get::<Stream<'a>>(b"N".as_slice()) {
@@ -308,25 +332,44 @@ fn substituted_fonts<'a>(page: &Page<'a>) -> FontSearch<'a> {
         }
     }
     while let Some((stream, res, depth)) = search.todo.pop() {
-        if search.streams >= FONT_SEARCH_STREAMS {
+        // Its stored length first, as it decodes to at least about that (an unknown one, as much
+        // as it holds).
+        let stored = stream.dict().get::<usize>(b"Length".as_slice()).unwrap_or_else(|| stream.raw_data().len());
+        if search.streams >= FONT_SEARCH_STREAMS || stored > search.bytes_left {
             search.stopped = true;
             break;
         }
         search.streams += 1;
-        if let Ok(data) = stream.decoded_data() {
-            search.ops(TypedIter::new(&data), &res, depth);
+        let Ok(data) = stream.decoded_data() else { continue };
+        if data.len() > search.bytes_left {
+            search.stopped = true;
+            break;
         }
+        search.bytes_left -= data.len();
+        search.decoded += data.len();
+        search.ops(TypedIter::new(&data), &res, depth);
     }
     search
 }
 
 impl<'a> FontSearch<'a> {
+    /// Spends one of the fonts chosen and annotations that may be looked at: false, and the
+    /// search stopped, when none are left.
+    fn spend(&mut self) -> bool {
+        if self.work_left == 0 {
+            self.stopped = true;
+            return false;
+        }
+        self.work_left -= 1;
+        true
+    }
+
     /// Queues content stream `s`, drawn with `res`, `depth` forms deep: once, and not past
     /// [`FONT_SEARCH_DEPTH`].
     fn queue(&mut self, res: Res<'a>, s: Stream<'a>, depth: usize) {
         if depth > FONT_SEARCH_DEPTH {
             self.stopped = true;
-        } else if self.seen.insert(s.obj_id()) {
+        } else if self.seen.insert(span(s.dict())) {
             self.todo.push((s, res, depth));
         }
     }
@@ -337,7 +380,10 @@ impl<'a> FontSearch<'a> {
         while let Some(op) = ops.next() {
             let drawn = match op {
                 TypedInstruction::TextFont(t) => {
-                    self.font(t.0, res, depth);
+                    if !self.spend() {
+                        return;
+                    }
+                    self.font(t.0, res);
                     None
                 }
                 TypedInstruction::XObject(x) => res
@@ -359,23 +405,14 @@ impl<'a> FontSearch<'a> {
         }
     }
 
-    /// A font chosen by name in `res`: named when not in the file; a Type 3 font's glyphs, which
-    /// may choose fonts of their own, followed.
-    fn font(&mut self, name: &Name<'_>, res: &Res<'a>, depth: usize) {
+    /// A font chosen by name in `res`: named when not in the file. Each font is looked at once,
+    /// however often it is chosen; a Type 3 font is passed over ([`missing_font`]).
+    fn font(&mut self, name: &Name<'_>, res: &Res<'a>) {
         let Some(font) = res.fonts.get::<Dict<'a>>(name) else { return };
-        if font.get::<Name<'_>>(b"Subtype".as_slice()).is_some_and(|s| s.as_str() == "Type3") {
-            if font.obj_id().is_some_and(|id| !self.seen.insert(id)) {
-                return;
-            }
-            let glyph_res = font.get::<Dict<'a>>(b"Resources".as_slice()).map_or_else(|| res.clone(), |d| Res::of(&d));
-            if let Some(procs) = font.get::<Dict<'a>>(b"CharProcs".as_slice()) {
-                for glyph in procs.keys() {
-                    if let Some(s) = procs.get::<Stream<'a>>(&glyph) {
-                        self.queue(glyph_res.clone(), s, depth + 1);
-                    }
-                }
-            }
-        } else if let Some(name) = missing_font(&font) {
+        if !self.fonts.insert(span(&font)) {
+            return;
+        }
+        if let Some(name) = missing_font(&font) {
             if self.keys.len() >= MISSING_FONTS_COUNTED {
                 self.stopped = true;
             } else if self.keys.insert(font_key(&name)) && self.names.len() < MISSING_FONTS_KEPT {
@@ -1060,8 +1097,53 @@ mod tests {
             b"BT /T3 12 Tf 5 10 Td (H) Tj ET",
             &[type3.as_bytes().to_vec(), glyph, font],
         );
-        assert_eq!(read_bytes("x", glyphs, None, true).unwrap().lost, [notice("Arial,Bold")]);
+        // Chosen inside a Type 3 font's glyph: not named, as its glyphs aren't decoded for the
+        // search (a bound on its work).
+        assert!(read_bytes("x", glyphs, None, true).unwrap().lost.is_empty());
         assert_eq!(font_key("Arial,Bold"), font_key("Arial-BoldMT"));
+    }
+
+    /// The first page of `pdf`, searched for the fonts not in the file it chooses with `bytes` to
+    /// decode and `work` to spend.
+    fn search(pdf: Vec<u8>, bytes: usize, work: usize) -> (Vec<String>, bool, usize, usize) {
+        let pdf = Pdf::new(pdf).unwrap();
+        let pages = pdf.pages();
+        let found = substituted_fonts(pages.first().unwrap(), bytes, work);
+        (found.names, found.stopped, found.decoded, found.streams)
+    }
+
+    #[test]
+    fn the_font_search_stops_at_its_bytes_and_its_work() {
+        let arial = |name: &str| format!("<< /Type /Font /Subtype /TrueType /BaseFont /{name} /Encoding /WinAnsiEncoding >>").into_bytes();
+        // Two forms, each choosing a font not in the file, whose content is 1,000 bytes.
+        let form = |font: u32| {
+            let mut content = b"BT /A 12 Tf 5 10 Td (x) Tj ET".to_vec();
+            content.resize(1000, b' ');
+            stream(&format!("/Type /XObject /Subtype /Form /BBox [0 0 72 36] /Resources << /Font << /A {font} 0 R >> >>"), &content)
+        };
+        let pdf = pdf_of(
+            "0 0 72 36",
+            "/Resources << /XObject << /F1 5 0 R /F2 6 0 R >> >>",
+            b"/F1 Do /F2 Do",
+            &[form(7), form(8), arial("Arial"), arial("Verdana")],
+        );
+        // Room for both: both named.
+        let (names, stopped, decoded, _) = search(pdf.clone(), 10_000, 1000);
+        assert!(names.len() == 2 && !stopped && decoded == 2000, "{names:?} {stopped} {decoded}");
+        // Room for one: one named, the search stopped, and nothing past the bytes decoded.
+        let (names, stopped, decoded, _) = search(pdf, 1500, 1000);
+        assert!(names.len() == 1 && stopped && decoded == 1000, "{names:?} {stopped} {decoded}");
+        // A Type 3 font written in place (no object number) chosen 1,000 times: looked at once,
+        // its glyphs not decoded; each choice spends from the work.
+        let type3 = "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] \
+                     /CharProcs << /H 5 0 R >> /Encoding << /Differences [72 /H] >> /FirstChar 72 /LastChar 72 /Widths [1000] >>";
+        let content = format!("BT {} ET", "/T3 12 Tf (H) Tj ".repeat(1000));
+        let pdf =
+            pdf_of("0 0 72 36", &format!("/Resources << /Font << /T3 {type3} >> >>"), content.as_bytes(), &[stream("", b"1000 0 d0")]);
+        let (names, stopped, decoded, streams) = search(pdf.clone(), 10_000, 2000);
+        assert!(names.is_empty() && !stopped && decoded == 0 && streams == 0, "{names:?} {stopped} {decoded} {streams}");
+        let (_, stopped, _, _) = search(pdf, 10_000, 10);
+        assert!(stopped);
     }
 
     /// A viewport over `bbox` on the page, its corners at 10–12° E, 40–41° N.
