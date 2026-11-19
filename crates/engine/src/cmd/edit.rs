@@ -120,19 +120,24 @@ fn field_of(s: &Session, t: Target, name: &str) -> Result<usize, String> {
     field_in(&data(s, t)?.fields, name)?.ok_or_else(|| format!("no field named '{name}'"))
 }
 
-/// The field a command that changes a field's values, or the field itself, names: the field named
-/// exactly so, else the only field named so ignoring case, so an edit never lands on a field the
-/// caller didn't name (#1955); a name matching several fields but none exactly is refused, naming
-/// them. The tools find their fields the same way. What a layer keeps by a field's name, and
-/// expressions and queries, read the first field so named ignoring case
-/// ([`Dataset::field_index`], [`reads_field`]).
-pub(crate) use rustgis_analysis::find_field as field_in;
+/// The field a command that changes a field's values, or the field itself, names
+/// ([`rustgis_data::find_field`]): an edit never lands on a field the caller didn't name (#1955).
+/// What a layer keeps by a field's name is read otherwise ([`kept_field`]).
+pub(crate) use rustgis_data::find_field as field_in;
 
-/// Whether `name`, a field name a layer keeps (its renderer's, labels', design's…), reads field
-/// `fi` of `fields`: as they are read, by the first field so named ignoring case
-/// ([`Dataset::field_index`]) (#1955).
-pub(crate) fn reads_field(fields: &[Field], fi: usize, name: &str) -> bool {
-    fields.iter().position(|f| f.name.eq_ignore_ascii_case(name)) == Some(fi)
+/// The field `what`, kept by a field's name (design, a diagram, a size, a report…), will read for
+/// `name`: the first field so named ignoring case ([`Dataset::field_index`]). Refused when the layer
+/// has more than one field so named, even if one is named exactly so, since it would read the
+/// first of them whichever was meant (#1955).
+pub(crate) fn kept_field(ds: &Dataset, name: &str, what: &str) -> Result<Option<usize>, String> {
+    if ds.has_case_twin(name) {
+        let twins: Vec<String> = ds.fields.iter().filter(|f| f.name.eq_ignore_ascii_case(name)).map(|f| format!("'{}'", f.name)).collect();
+        return Err(format!(
+            "'{name}' names {} ignoring case, and {what} reads its field by name ignoring case, so it would use the first: rename one of them first",
+            twins.join(" and ")
+        ));
+    }
+    Ok(ds.field_index(name))
 }
 
 /// A table's rows change only while editing is on, as a layer's features do
@@ -851,13 +856,17 @@ fn check_layer_dates(s: &Session, id: u32, fi: usize, ty: FieldType) -> Result<S
     if field.ty != FieldType::Text {
         return Err(format!("'{name}' is a {} field: only a text field converts to dates", field.ty.label()));
     }
-    let names = |f: &str| reads_field(&l.dataset.fields, fi, f);
+    // Design reads its field by name as the first so named ignoring case (#1955).
+    let names = |f: &str| l.dataset.reads_field(fi, f);
     let d = &l.design;
     let designed = d.domains.iter().any(|x| names(&x.field))
-        || d.subtypes.as_ref().is_some_and(|st| names(&st.field))
-        || d.contingent.iter().any(|c| c.fields.iter().any(|f| names(f)));
+        || d.subtypes.as_ref().is_some_and(|st| names(&st.field) || st.subtypes.iter().any(|s| s.defaults.iter().any(|(f, _)| names(f))))
+        || d.contingent.iter().any(|c| c.fields.iter().any(|f| names(f)))
+        || d.rules.iter().any(|r| r.kind == rustgis_map::design::RuleKind::Calculation && names(&r.field));
     if designed {
-        return Err(format!("'{name}' has a domain, subtypes or contingent values, which hold text: remove them first"));
+        return Err(format!(
+            "'{name}' has a domain, subtypes, subtype defaults, contingent values or a calculation rule, which hold or write text: remove them first"
+        ));
     }
     // Saving edits writes values, not column types: the table's column would stay text.
     if l.gpkg.is_some() {
@@ -1025,10 +1034,10 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     // A Default class still as the layer made it loses nothing by starting again: that restart isn't said.
     let default_untouched = l.labels.default == rustgis_map::LabelClass::default_for(&l.dataset);
     // What the layer keeps by a field's name (renderer, labels, design, diagram…) read the deleted
-    // field when it names it in any case and the field is the first so named ([`reads_field`]). A
-    // name that read a twin left keeps it; one that read the deleted field would go on to read the
-    // twin, so it goes too (#1955).
-    let read = reads_field(&l.dataset.fields, fi, &name);
+    // field when it names it in any case and the field is the first so named
+    // ([`Dataset::reads_field`]). A name that read a twin left keeps it; one that read the deleted
+    // field would go on to read the twin, so it goes too (#1955).
+    let read = l.dataset.reads_field(fi, &name);
     let names_removed = |f: &str| read && f.eq_ignore_ascii_case(&name);
     let removed = l.dataset.fields.remove(fi).name;
     for f in &mut l.dataset.features {
@@ -1099,11 +1108,10 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
             });
         }
     }
-    // Another class on the deleted field labels with Default's field instead. Where a field named
-    // the same but for case is left, which its name would now find, that is said (#1955).
+    // Another class on the deleted field labels with Default's field instead, said (#1955). One
+    // whose text is an expression shows the same text either way.
     let moved = l.labels.repoint_fields(&l.dataset, names_removed);
-    let twin_left = l.dataset.field_index(&removed).is_some();
-    let moved_note = (twin_left && !moved.is_empty()).then(|| {
+    let moved_note = (!moved.is_empty()).then(|| {
         let on = match l.labels.classes.iter().find(|c| moved.contains(&c.name)).map(|c| c.field.as_str()) {
             Some(f) if !f.is_empty() => format!("field {f}"),
             _ => "no field".to_string(),
@@ -1113,28 +1121,62 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     });
     // A definition query that reads the field was refused above; one that already didn't read is
     // kept as it is, so its text isn't lost.
-    // Nor its data design: domains, subtypes, contingent values, and rules that used it.
+    // Nor its data design: domains, subtypes, subtype defaults, contingent values, and rules that
+    // used it, said once with what went (#1955).
     let d = &mut l.design;
+    let mut design_gone = Vec::new();
+    let domains = d.domains.len();
     d.domains.retain(|x| !names_removed(&x.field));
+    match domains - d.domains.len() {
+        0 => {}
+        1 => design_gone.push("its domain".to_string()),
+        n => design_gone.push(format!("{n} domains")),
+    }
     if d.subtypes.as_ref().is_some_and(|st| names_removed(&st.field)) {
         d.subtypes = None;
+        design_gone.push("the subtypes".into());
     }
     if let Some(st) = &mut d.subtypes {
+        let mut defaults = 0;
         for sub in &mut st.subtypes {
+            let before = sub.defaults.len();
             sub.defaults.retain(|(f, _)| !names_removed(f));
+            defaults += before - sub.defaults.len();
+        }
+        match defaults {
+            0 => {}
+            1 => design_gone.push("1 subtype default".into()),
+            n => design_gone.push(format!("{n} subtype defaults")),
         }
     }
+    let quoted = |names: Vec<String>| names.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ");
+    let contingent: Vec<String> =
+        d.contingent.iter().filter(|c| c.fields.iter().any(|f| names_removed(f))).map(|c| c.name.clone()).collect();
     d.contingent.retain(|c| !c.fields.iter().any(|f| names_removed(f)));
+    if !contingent.is_empty() {
+        design_gone.push(format!("contingent values {}", quoted(contingent)));
+    }
     let ds = rustgis_data::Dataset::new(l.dataset.name.clone(), l.dataset.geometry_type, l.dataset.fields.clone());
-    let before = d.rules.len();
-    d.rules.retain(|r| {
+    let reads_on = |r: &rustgis_map::design::AttributeRule| {
         !names_removed(&r.field)
             && match r.kind {
                 rustgis_map::design::RuleKind::Calculation => Calculation::parse(&r.expression, &ds).is_ok(),
                 rustgis_map::design::RuleKind::Constraint => rustgis_data::query::parse_fields(&r.expression, &ds).is_ok(),
             }
+    };
+    let rules: Vec<String> = d.rules.iter().filter(|r| !reads_on(r)).map(|r| r.name.clone()).collect();
+    d.rules.retain(reads_on);
+    let removed_rules = rules.len();
+    if !rules.is_empty() {
+        design_gone.push(format!("attribute {} {}", if rules.len() == 1 { "rule" } else { "rules" }, quoted(rules)));
+    }
+    let design_note = (!design_gone.is_empty()).then(|| {
+        format!(
+            "{}: its data design used the deleted field {removed}, so it loses {}",
+            l.name,
+            and_list(&design_gone.iter().map(String::as_str).collect::<Vec<_>>())
+        )
     });
-    let removed_rules = before - d.rules.len();
     // Nor its diagram: the field's slice or bar goes, the range of sums a scaled size grows over is
     // measured again without it, and a diagram left with no field goes too. Said once.
     let mut diagram_note = None;
@@ -1206,7 +1248,8 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
             Some(format!("{}: its symbol's {} expressions read the deleted field {removed}, so they are removed", l.name, and_list(many)))
         }
     };
-    for note in [extrusion_note, rotation_note, size_note, by_note, label_note, restart_note, moved_note].into_iter().flatten() {
+    for note in [extrusion_note, rotation_note, size_note, by_note, label_note, restart_note, moved_note, design_note].into_iter().flatten()
+    {
         s.notify(note, false);
     }
     if let Some(note) = diagram_note {
@@ -1860,7 +1903,7 @@ mod tests {
             ] {
                 let error = s.run(command, &with(&target, extra)).unwrap_err();
                 assert_eq!(
-                    error, "field name 'NAME' is ambiguous: case-insensitive collision between 'Name' and 'name'",
+                    error, "field name 'NAME' is ambiguous: case-insensitive collision between 'Name' and 'name'; use an exact field name",
                     "{command}, table {table}"
                 );
                 assert_eq!(names(&s, t), ["Name", "name"], "{command}, table {table}");
@@ -1885,8 +1928,16 @@ mod tests {
                 ds.push(Some(at), vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]);
                 let id = s.map_mut().add_dataset(ds);
                 s.run("layer.symbology", &json!({"layer": id, "type": "unique", "field": "n"})).unwrap();
-                s.run("layer.diagram", &json!({"layer": id, "kind": "pie", "fields": [stored, "n"]})).unwrap();
+                // (layer.diagram refuses a twin's name now: the slice is put there as a project
+                // from before would have it.)
+                s.run("layer.diagram", &json!({"layer": id, "kind": "pie", "fields": ["n"]})).unwrap();
                 let l = s.map_mut().layer_mut(id).unwrap();
+                if let Some(dg) = &mut l.diagram
+                    && let Some(mut slice) = dg.categories.first().cloned()
+                {
+                    slice.field = stored.into();
+                    dg.categories.insert(0, slice);
+                }
                 if let rustgis_map::Renderer::Unique { field, .. } = &mut l.renderer {
                     *field = stored.into();
                 }
@@ -1914,8 +1965,10 @@ mod tests {
                     for part in [
                         "its classes read the deleted field Name",
                         "the deleted field Name, so it starts again",
-                        "its label classes Other, Expr used the deleted field Name, so they label field name",
+                        // Expr's text comes from its expression, which still reads: not said.
+                        "its label class Other used the deleted field Name, so it labels field name",
                         "its diagram drew the deleted field Name",
+                        "its data design used the deleted field Name, so it loses its domain",
                     ] {
                         assert!(said.iter().any(|n| n.contains(part)), "{part}: {case}");
                     }
@@ -1969,7 +2022,10 @@ mod tests {
         // A domain on either twin, by any case, is refused, and nothing changes.
         for field in ["X", "x", "NAME"] {
             let error = s.run("data.domain", &json!({"layer": id, "field": field, "min": 0, "max": 5})).unwrap_err();
-            assert!(error.contains("named the same but for case"), "{field}: {error}");
+            assert!(
+                error.contains("ignoring case, and a domain reads its field by name ignoring case, so it would use the first"),
+                "{field}: {error}"
+            );
             assert_eq!(domains(&s), ["name"]);
         }
     }
@@ -1996,14 +2052,14 @@ mod tests {
             ("data.subtypes", json!({"layer": id, "field": "code", "subtypes": [{"code": 1, "name": "one", "defaults": {"x": 2}}]})),
         ] {
             let error = s.run(command, &p).unwrap_err();
-            assert!(error.contains("named the same but for case"), "{command}: {error}");
+            assert!(error.contains("so it would use the first: rename one of them first"), "{command}: {error}");
         }
         let d = &s.map().layer(id).unwrap().design;
         assert!(d.rules.is_empty() && d.contingent.is_empty() && d.subtypes.is_none());
         // The reply names the field written as it is named.
         let p = json!({"layer": id, "field": "LON", "property": "x", "unit": "deg", "scope": "all", "overwrite": true});
         assert_eq!(s.run("edit.calculateGeometry", &p).unwrap()["field"], "Lon");
-        // No twin: a class on the deleted field moves to Default's, as before, without a notice.
+        // No twin: a class on the deleted field moves to Default's, as before, and now says so.
         let l = s.map_mut().layer_mut(id).unwrap();
         l.labels.default.field = "code".into();
         let mut other = l.labels.default.clone();
@@ -2014,7 +2070,84 @@ mod tests {
         s.run("edit.deleteField", &json!({"layer": id, "field": "Lon"})).unwrap();
         assert_eq!(s.map().layer(id).unwrap().labels.classes[0].field, "code");
         let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
-        assert!(said.iter().all(|n| !n.contains("used the deleted field")), "{said:?}");
+        assert_eq!(said, ["twins: its label class Other used the deleted field Lon, so it labels field code"]);
+    }
+
+    /// What a layer keeps by a field's name (a diagram, a size, a report, an interpolation) is
+    /// refused on a field with a case twin; a text field with subtype defaults or a calculation rule
+    /// on it doesn't become dates; deleting a field says what its data design lost; and an
+    /// ambiguous attribute names the fields and asks for the exact one (#1955).
+    #[test]
+    fn kept_fields_refuse_case_twins_and_deletions_say_what_went() {
+        let mut s = Session::new(crate::Project::default());
+        let fields = vec![
+            Field::new("X", FieldType::Double),
+            Field::new("x", FieldType::Double),
+            Field::new("code", FieldType::Integer),
+            Field::new("n", FieldType::Double),
+        ];
+        let mut ds = Dataset::new("twins", GeometryType::Point, fields);
+        for (i, at) in [(1.0, 1.0), (2.0, 3.0), (4.0, 2.0)].into_iter().enumerate() {
+            let v = Value::Float(i as f64 + 1.0);
+            ds.push(Some(Geometry::Point(rustgis_data::Coord::new(at.0, at.1))), vec![v.clone(), v.clone(), Value::Int(1), v]);
+        }
+        let id = s.map_mut().add_dataset(ds);
+        s.run("layer.symbology", &json!({"layer": id, "type": "unique", "field": "code"})).unwrap();
+        s.run("report.new", &json!({"layer": "twins", "name": "R", "fields": ["code"]})).unwrap();
+        for (command, p) in [
+            ("layer.diagram", json!({"layer": id, "kind": "pie", "fields": ["x", "n"]})),
+            ("layer.sizeBy", json!({"layer": id, "field": "X"})),
+            ("analysis.interpolate", json!({"layer": id, "field": "x"})),
+            ("report.field", json!({"field": "x"})),
+        ] {
+            let error = s.run(command, &p).unwrap_err();
+            assert!(
+                error.contains("'x' names 'X' and 'x' ignoring case") || error.contains("'X' names 'X' and 'x' ignoring case"),
+                "{command}: {error}"
+            );
+        }
+        let l = s.map().layer(id).unwrap();
+        assert!(l.diagram.is_none() && l.size_by.is_none());
+
+        let mut s = Session::new(crate::Project::default());
+        let fields =
+            vec![Field::new("when", FieldType::Text), Field::new("other", FieldType::Text), Field::new("code", FieldType::Integer)];
+        let mut ds = Dataset::new("dates", GeometryType::Point, fields);
+        let text = |t: &str| Value::Text(t.into());
+        ds.push(Some(Geometry::Point(rustgis_data::Coord::new(1.0, 1.0))), vec![text("2020-01-01"), text("b"), Value::Int(1)]);
+        let id = s.map_mut().add_dataset(ds);
+        let convert = json!({"layer": id, "field": "when", "type": "date"});
+        let rule = json!({"layer": id, "name": "r", "kind": "calculation", "field": "when", "expression": "'2020-01-01'"});
+        // A calculation rule writing the field keeps it text.
+        s.run("data.attributeRule", &rule).unwrap();
+        assert!(s.run("edit.convertField", &convert).unwrap_err().contains("calculation rule"));
+        s.run("data.attributeRule", &json!({"layer": id, "name": "r", "remove": true})).unwrap();
+        // So does a subtype default for it.
+        let subtypes = json!({"layer": id, "field": "code", "symbolize": false, "subtypes": [{"code": 1, "name": "one", "defaults": {"when": "2020-01-01"}}]});
+        s.run("data.subtypes", &subtypes).unwrap();
+        assert!(s.run("edit.convertField", &convert).unwrap_err().contains("subtype defaults"));
+        // Deleting it says what the design lost.
+        s.run("data.attributeRule", &rule).unwrap();
+        s.run("data.domain", &json!({"layer": id, "field": "when", "coded": [["2020-01-01", "day"]]})).unwrap();
+        s.run("data.contingentValues", &json!({"layer": id, "name": "pair", "fields": ["when", "other"], "combos": [["2020-01-01", "b"]]}))
+            .unwrap();
+        let mark = s.notice_mark();
+        let reply = s.run("edit.deleteField", &json!({"layer": id, "field": "when"})).unwrap();
+        assert_eq!(reply["rulesRemoved"], 1);
+        let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(
+            said.contains(&"dates: its data design used the deleted field when, so it loses its domain, 1 subtype default, contingent values 'pair' and attribute rule 'r'".to_string()),
+            "{said:?}"
+        );
+        let d = &s.map().layer(id).unwrap().design;
+        assert!(d.domains.is_empty() && d.contingent.is_empty() && d.rules.is_empty());
+        assert!(d.subtypes.as_ref().is_some_and(|st| st.subtypes.iter().all(|x| x.defaults.is_empty())));
+
+        // An ambiguous attribute names both fields and asks for the exact name.
+        let fields = vec![Field::new("Name", FieldType::Text), Field::new("name", FieldType::Text)];
+        let table = s.project.add_table(Dataset::new("t", GeometryType::None, fields));
+        let error = s.run("edit.addFeature", &json!({"table": table, "attributes": {"NAME": "a"}})).unwrap_err();
+        assert!(error.contains("between 'Name' and 'name'; use an exact field name"), "{error}");
     }
 
     /// Not a number is null in a whole-number field, said as such, not past its range; a number

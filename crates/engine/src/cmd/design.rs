@@ -1547,30 +1547,27 @@ fn traverse(s: &mut Session, p: &Json) -> CmdResult {
     super::edit::add_feature(s, &json!({"layer": id, "geometry": g}))
 }
 
-/// Refuses `what` on field `name` while another field is named the same but for case: design finds
-/// its field by name ignoring case, so it would apply to the first of them whichever was meant
-/// (#1955).
-fn case_twins_refused(ds: &rustgis_data::Dataset, name: &str, what: &str) -> Result<(), String> {
-    if ds.fields.iter().filter(|f| f.name.eq_ignore_ascii_case(name)).count() > 1 {
-        return Err(format!(
-            "'{name}' has a field named the same but for case, and {what} would apply to whichever comes first: rename one of them first"
-        ));
-    }
-    Ok(())
+/// The field design names `name` ([`super::edit::kept_field`]): design reads its field by name,
+/// the first so named ignoring case, so a name with case twins is refused. Every design command
+/// finds its fields through this (#1955).
+fn design_field(ds: &rustgis_data::Dataset, name: &str, what: &str) -> Result<usize, String> {
+    super::edit::kept_field(ds, name, what)?.ok_or_else(|| format!("no field named '{name}'"))
 }
 
 fn domain(s: &mut Session, p: &Json) -> CmdResult {
     let id = s.layer_id(p)?;
     let field = ps(p, "field").ok_or("field is required")?;
     let l = s.map().layer(id).ok_or("no such layer")?;
-    let fi = l.dataset.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
-    let (fname, ty) = l.dataset.fields.get(fi).map(|f| (f.name.clone(), f.ty)).ok_or("no field")?;
     if b(p, "clear").unwrap_or(false) {
+        // Clearing takes off whatever domain the name reads, twins or not.
+        let fi = l.dataset.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
+        let fname = l.dataset.fields.get(fi).map(|f| f.name.clone()).ok_or("no field")?;
         let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
         l.design.domains.retain(|d| !d.field.eq_ignore_ascii_case(&fname));
         return Ok(Json::Null);
     }
-    case_twins_refused(&l.dataset, &fname, "a domain")?;
+    let fi = design_field(&l.dataset, field, "a domain")?;
+    let (fname, ty) = l.dataset.fields.get(fi).map(|f| (f.name.clone(), f.ty)).ok_or("no field")?;
     let kind = if let Some(codes) = p.get("coded").and_then(Json::as_array) {
         let pairs: Vec<(Value, String)> = codes
             .iter()
@@ -1616,9 +1613,8 @@ fn subtypes(s: &mut Session, p: &Json) -> CmdResult {
     }
     let field = ps(p, "field").ok_or("field is required")?;
     let l = s.map().layer(id).ok_or("no such layer")?;
-    let fi = l.dataset.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
+    let fi = design_field(&l.dataset, field, "subtypes")?;
     let f = l.dataset.fields.get(fi).ok_or("no field")?;
-    case_twins_refused(&l.dataset, &f.name, "subtypes")?;
     if f.ty != FieldType::Integer {
         return Err(format!("{} must be an integer field to hold subtype codes", f.name));
     }
@@ -1640,8 +1636,9 @@ fn subtypes(s: &mut Session, p: &Json) -> CmdResult {
             .map(|o| o.iter().map(|(k, v)| (k.clone(), Value::from_json(v))).collect())
             .unwrap_or_default();
         for (field, value) in &defaults {
-            case_twins_refused(&l.dataset, field, "a subtype default")?;
-            if let Some(ty) = l.dataset.field_index(field).and_then(|i| l.dataset.fields.get(i)).map(|f| f.ty)
+            // (A default for a field the layer doesn't have is kept, as before.)
+            if let Some(ty) =
+                super::edit::kept_field(&l.dataset, field, "a subtype default")?.and_then(|i| l.dataset.fields.get(i)).map(|f| f.ty)
                 && super::edit::non_finite_input(value, ty)
             {
                 return Err(format!("field '{field}' requires a finite number"));
@@ -1726,13 +1723,9 @@ fn attribute_rule(s: &mut Session, p: &Json) -> CmdResult {
     let field = match kind {
         RuleKind::Calculation => {
             let fl = ps(p, "field").ok_or("a calculation rule sets a field")?;
-            case_twins_refused(&l.dataset, fl, "a calculation rule")?;
+            let fi = design_field(&l.dataset, fl, "a calculation rule")?;
             super::edit::Calculation::parse(&expression, &l.dataset)?;
-            l.dataset
-                .field_index(fl)
-                .and_then(|i| l.dataset.fields.get(i))
-                .map(|f| f.name.clone())
-                .ok_or_else(|| format!("no field named '{fl}'"))?
+            l.dataset.fields.get(fi).map(|f| f.name.clone()).ok_or("no field")?
         }
         RuleKind::Constraint => {
             rustgis_data::query::parse(&expression, &l.dataset)?;
@@ -1761,12 +1754,8 @@ fn contingent(s: &mut Session, p: &Json) -> CmdResult {
         .iter()
         .map(|v| {
             let n = v.as_str().ok_or("fields are names")?;
-            case_twins_refused(&l.dataset, n, "contingent values")?;
-            l.dataset
-                .field_index(n)
-                .and_then(|i| l.dataset.fields.get(i))
-                .map(|f| (f.name.clone(), f.ty))
-                .ok_or_else(|| format!("no field named '{n}'"))
+            let fi = design_field(&l.dataset, n, "contingent values")?;
+            l.dataset.fields.get(fi).map(|f| (f.name.clone(), f.ty)).ok_or_else(|| "no field".to_string())
         })
         .collect::<Result<_, String>>()?;
     if fields.len() < 2 {
@@ -1888,7 +1877,8 @@ fn relate(s: &mut Session, p: &Json) -> CmdResult {
     }
     let field_of = |layer: &str, key: &str| -> Result<(String, String), String> {
         let l = s.map().layer_by_name(layer).filter(|l| !l.is_raster()).ok_or_else(|| format!("no layer '{layer}'"))?;
-        let f = l.dataset.field_index(key).and_then(|i| l.dataset.fields.get(i)).ok_or_else(|| format!("{layer} has no field '{key}'"))?;
+        let fi = super::edit::kept_field(&l.dataset, key, "a relationship")?.ok_or_else(|| format!("{layer} has no field '{key}'"))?;
+        let f = l.dataset.fields.get(fi).ok_or_else(|| format!("{layer} has no field '{key}'"))?;
         Ok((l.name.clone(), f.name.clone()))
     };
     let [origin_name, destination_name] = relationship_names(p)?;
@@ -1947,7 +1937,7 @@ fn template(s: &mut Session, p: &Json) -> CmdResult {
     let mut defaults = Vec::new();
     if let Some(o) = p.get("defaults").and_then(Json::as_object) {
         for (k, v) in o {
-            let fi = l.dataset.field_index(k).ok_or_else(|| format!("no field named '{k}'"))?;
+            let fi = design_field(&l.dataset, k, "a template default")?;
             let ty = l.dataset.fields.get(fi).map(|f| f.ty).unwrap_or(FieldType::Text);
             let value = Value::from_json(v);
             if super::edit::non_finite_input(&value, ty) {

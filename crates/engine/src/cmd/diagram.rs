@@ -153,7 +153,7 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
     }
     // Every field must be there, and hold numbers.
     for (field, _) in &asked {
-        let fi = l.dataset.field_index(field).ok_or_else(|| format!("no field named '{field}'"))?;
+        let fi = super::edit::kept_field(&l.dataset, field, "a diagram")?.ok_or_else(|| format!("no field named '{field}'"))?;
         if !l.dataset.fields.get(fi).is_some_and(|fd| fd.ty.is_numeric()) {
             return Err(format!("'{field}' is not a numeric field"));
         }

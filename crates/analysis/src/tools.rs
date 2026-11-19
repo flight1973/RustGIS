@@ -1540,25 +1540,7 @@ fn keep_source_crs(out: &mut Dataset, ds: &Dataset, overlay: &Dataset) {
 /// If multiple fields in `ds.fields` match `name` case-insensitively, returns an error
 /// detailing the collision rather than silently selecting an arbitrary field.
 pub fn find_field_case_insensitive(ds: &Dataset, name: &str) -> Result<usize, String> {
-    find_field(&ds.fields, name)?.ok_or_else(|| format!("no field named '{name}'"))
-}
-
-/// The index of the field `name` names in `fields`: the one named exactly so, else the only one
-/// named so ignoring case; `None` when none is. A name that matches several fields ignoring case
-/// but none exactly is an error naming them, rather than an arbitrary pick.
-pub fn find_field(fields: &[Field], name: &str) -> Result<Option<usize>, String> {
-    if let Some(idx) = fields.iter().position(|f| f.name == name) {
-        return Ok(Some(idx));
-    }
-    let matches: Vec<&str> = fields.iter().filter(|f| f.name.eq_ignore_ascii_case(name)).map(|f| f.name.as_str()).collect();
-    match matches.as_slice() {
-        [] => Ok(None),
-        [_] => Ok(fields.iter().position(|f| f.name.eq_ignore_ascii_case(name))),
-        _ => Err(format!(
-            "field name '{name}' is ambiguous: case-insensitive collision between {}",
-            matches.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(" and ")
-        )),
-    }
+    ds.find_field(name)?.ok_or_else(|| format!("no field named '{name}'"))
 }
 
 /// Union of polygons; rings are oriented first because the overlay infers its fill rule from

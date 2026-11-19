@@ -786,7 +786,7 @@ fn size_by(s: &mut Session, p: &Value) -> CmdResult {
             "size by field goes with Unique Values or Graduated Colors; a single symbol sized by a field is Proportional Symbols".into()
         );
     }
-    let fi = l.dataset.field_index(&field).ok_or_else(|| format!("no field named '{field}'"))?;
+    let fi = super::edit::kept_field(&l.dataset, &field, "a size by field")?.ok_or_else(|| format!("no field named '{field}'"))?;
     if !l.dataset.fields.get(fi).is_some_and(|fd| fd.ty.is_numeric()) {
         return Err(format!("'{field}' is not a numeric field"));
     }

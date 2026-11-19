@@ -277,7 +277,7 @@ fn field_of(input: &impl super::InputSource, p: &Value, key: &str) -> Result<(us
     let i = index_input(input, p)?;
     let name = ps(p, key).ok_or_else(|| format!("{key} is required"))?;
     let l = layer_of_input(input, i)?;
-    let fi = l.dataset.field_index(name).ok_or_else(|| format!("'{}' has no field '{name}'", l.name))?;
+    let fi = super::edit::kept_field(&l.dataset, name, "a report")?.ok_or_else(|| format!("'{}' has no field '{name}'", l.name))?;
     let field = l.dataset.fields.get(fi).map(|f| f.name.clone()).ok_or("no such field")?;
     Ok((i, field))
 }

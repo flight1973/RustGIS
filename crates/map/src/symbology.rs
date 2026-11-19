@@ -3333,7 +3333,8 @@ impl Labeling {
 
     /// As [`Labeling::repoint_missing_fields`], and also every class on a field name `gone` says
     /// was deleted, even when the name now finds another field (one named the same but for case)
-    /// or its text is an expression. Returns the names of the classes `gone` moved.
+    /// or its text is an expression. Returns the names of the classes `gone` moved whose text came
+    /// from their field (an expression's text doesn't change).
     pub fn repoint_fields(&mut self, ds: &Dataset, gone: impl Fn(&str) -> bool) -> Vec<String> {
         // Default's field, or (it is gone too, cleared by a refresh) the first name-like one, so
         // a class isn't left on no field.
@@ -3346,10 +3347,13 @@ impl Labeling {
         let by_text = |c: &LabelClass| c.by.text.as_deref().is_some_and(|t| rustgis_data::query::parse_fields(t, ds).is_ok());
         let mut moved = Vec::new();
         for c in &mut self.classes {
-            // A class on a deleted field labels another field now, even if it's named alike.
+            // A class on a deleted field labels another field now, even if it's named alike; one
+            // whose text is an expression shows the same text, so it isn't counted.
             if gone(&c.field) {
                 c.field.clone_from(&fallback);
-                moved.push(c.name.clone());
+                if !by_text(c) {
+                    moved.push(c.name.clone());
+                }
             } else if ds.field_index(&c.field).is_none() && !by_text(c) {
                 c.field.clone_from(&fallback);
             }

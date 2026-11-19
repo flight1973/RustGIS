@@ -665,6 +665,30 @@ pub fn export_error(ds: &Dataset, crs: raster::Crs) -> Option<String> {
     ds.crs.and_then(|from| raster::planetary::export_error(from, crs)).map(|e| format!("{}: {e}", ds.name))
 }
 
+/// The index of the field `name` names in `fields`, for a command that changes a field (its
+/// values, or the field itself) or a tool: the field named exactly so, else the only field named
+/// so ignoring case; `None` when none is. A name matching several fields ignoring case but none
+/// exactly is an error naming them, rather than an arbitrary pick (#1955).
+pub fn find_field(fields: &[Field], name: &str) -> std::result::Result<Option<usize>, String> {
+    let mut alike = Vec::new();
+    for (i, f) in fields.iter().enumerate() {
+        if f.name == name {
+            return Ok(Some(i));
+        }
+        if f.name.eq_ignore_ascii_case(name) {
+            alike.push(i);
+        }
+    }
+    match alike.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(*only)),
+        _ => Err(format!(
+            "field name '{name}' is ambiguous: case-insensitive collision between {}; use an exact field name",
+            alike.iter().filter_map(|i| fields.get(*i)).map(|f| format!("'{}'", f.name)).collect::<Vec<_>>().join(" and ")
+        )),
+    }
+}
+
 impl Dataset {
     /// Marks the dataset as having lost the Z or M values of `features` features (none: nothing)
     /// and says so in `report`.
@@ -690,9 +714,26 @@ impl Dataset {
         }
     }
 
-    /// Index of a field by case-insensitive name.
+    /// Index of a field by case-insensitive name: the first so named. Expressions, queries and
+    /// what a layer keeps by a field's name (its renderer's, labels', design's…) read fields so.
     pub fn field_index(&self, name: &str) -> Option<usize> {
         self.fields.iter().position(|f| f.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The field a command that changes a field names ([`find_field`]).
+    pub fn find_field(&self, name: &str) -> std::result::Result<Option<usize>, String> {
+        find_field(&self.fields, name)
+    }
+
+    /// Whether `name`, read as [`Dataset::field_index`] reads it, reads field `fi`.
+    pub fn reads_field(&self, fi: usize, name: &str) -> bool {
+        self.field_index(name) == Some(fi)
+    }
+
+    /// Whether more than one field is named `name` ignoring case: then what is kept by that name
+    /// reads the first of them ([`Dataset::field_index`]), whichever was meant.
+    pub fn has_case_twin(&self, name: &str) -> bool {
+        self.fields.iter().filter(|f| f.name.eq_ignore_ascii_case(name)).nth(1).is_some()
     }
 
     /// Value of `field` for feature `row` (Null when out of range).
