@@ -3869,6 +3869,9 @@ pub struct TextLosses {
     /// Features written that reading skips (KML, GPX): no coordinate in longitude/latitude, or
     /// too few for their shape.
     unread: usize,
+    /// Vertices of the features reading keeps (KML, GPX) that don't read back with them
+    /// ([`crate::kml::lost_vertices`], [`crate::gpx::lost_vertices`]).
+    vertices: usize,
 }
 
 /// One field's [`TextLosses`] in one layer read back.
@@ -3972,6 +3975,7 @@ impl TextLosses {
         // KML reads a layer for each kind of geometry, and types each one's columns apart.
         let mut layers = vec![fresh; if kml { 3 } else { 1 }];
         let mut unread = 0usize;
+        let mut vertices = 0usize;
         let layer_of = |g: &Geometry| match g.kind() {
             _ if !kml => 0,
             GeometryType::Point => 0,
@@ -3979,16 +3983,17 @@ impl TextLosses {
             _ => 2,
         };
         for feature in features {
-            // GPX writes a waypoint for each point of a multipoint, each with the name; reading
-            // keeps those in range.
-            let copies = match &feature.geometry {
-                Some(Geometry::MultiPoint(v)) if gpx => v.iter().filter(|c| lon_lat_in_range(c.x, c.y)).count(),
-                _ => 1,
-            };
             let layer = match &feature.geometry {
                 _ if csv => 0,
                 g if shp && shapefile_keeps(g.as_ref(), gt) => 0,
-                Some(g) if kml && crate::kml::keeps(g) || gpx && crate::gpx::keeps(g) => layer_of(g),
+                Some(g) if kml && crate::kml::keeps(g) => {
+                    vertices = vertices.saturating_add(crate::kml::lost_vertices(g));
+                    layer_of(g)
+                }
+                Some(g) if gpx && crate::gpx::keeps(g) => {
+                    vertices = vertices.saturating_add(crate::gpx::lost_vertices(g));
+                    layer_of(g)
+                }
                 // A placemark reading skips still gives its extended data's names columns.
                 Some(_) if kml => {
                     if let Some(first) = layers.first_mut() {
@@ -4027,7 +4032,10 @@ impl TextLosses {
                 }
                 let Value::Text(s) = v else { continue };
                 let trimmed = s.trim();
-                for read in reads {
+                // A value is counted once, however many copies of it are written (a KML name
+                // field's extended data, a GPX multipoint's waypoints): by its first copy, the
+                // name, whose loss is never less than the extended data's.
+                if let Some(read) = reads.first() {
                     let count = match read {
                         TextRead::Cell if s.is_empty() => &mut loss.blank,
                         TextRead::Cell | TextRead::Dbf if Value::is_null_marker(s) => &mut loss.markers,
@@ -4042,11 +4050,11 @@ impl TextLosses {
                         TextRead::Data if trimmed.len() < s.len() => &mut loss.padded,
                         _ => continue,
                     };
-                    *count += if *read == TextRead::Name { copies } else { 1 };
+                    *count += 1;
                 }
             }
         }
-        Self { layers, ends_only: shp, unread }
+        Self { layers, ends_only: shp, unread, vertices }
     }
 
     /// One notice for each loss of a layer with `fields` written to `target`, with a count and
@@ -4104,6 +4112,12 @@ impl TextLosses {
                 "{target}: {what} written but won't read back: no coordinate is inside longitude/latitude, or too few for the shape"
             ));
         }
+        if self.vertices > 0 {
+            let what = if self.vertices == 1 { "1 vertex won't".to_string() } else { format!("{} vertices won't", self.vertices) };
+            notes.push(format!(
+                "{target}: {what} read back with the features kept: outside longitude/latitude, or in a part left with too few to keep"
+            ));
+        }
         notes
     }
 }
@@ -4116,6 +4130,7 @@ impl std::ops::AddAssign for TextLosses {
             return;
         }
         self.unread = self.unread.saturating_add(other.unread);
+        self.vertices = self.vertices.saturating_add(other.vertices);
         for (a, b) in self.layers.iter_mut().zip(other.layers).flat_map(|(a, b)| a.iter_mut().zip(b)) {
             a.padded += b.padded;
             a.name_padded += b.name_padded;
@@ -6051,16 +6066,17 @@ mod tests {
     }
 
     /// A KML name field not called `name` is the placemark's name and its own extended data
-    /// column, read with a type from its values.
+    /// column, read with a type from its values: each value is counted once.
     #[test]
-    fn a_kml_name_field_of_another_name_is_counted_as_both_columns() {
+    fn a_kml_name_field_of_another_name_counts_each_value_once() {
         let mut ds = text_layer(&["title", "other"], &[&[Some(" a"), Some("x")], &[Some(""), Some("y")], &[Some("5"), Some("z")]]);
         let losses = |ds: &Dataset| TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, "kml", Some(0)).notes(&ds.fields, "t");
-        // In the name, " a" is trimmed and "" null; in 'title', a text column, " a" is trimmed.
+        // In the name, " a" is trimmed and "" null; in 'title', a text column, " a" is trimmed too,
+        // the same value.
         assert_eq!(
             losses(&ds),
             [
-                "t: 2 text values start or end with spaces, tabs or line breaks, which reading the file back drops, in 'title'",
+                "t: 1 text value starts or ends with spaces, tabs or line breaks, which reading the file back drops, in 'title'",
                 "t: 1 blank text value reads back as empty (null), in 'title'",
             ]
         );
@@ -6167,16 +6183,20 @@ mod tests {
         assert!(gpx_notes(&ds, Some(0), "t").is_empty());
     }
 
-    /// GPX writes a waypoint for each point of a multipoint, each with the name: each one reading
-    /// keeps trims it.
+    /// GPX writes a waypoint for each point of a multipoint, each with the name: reading trims each
+    /// copy, and the value is counted once. The point out of range is a vertex that doesn't read
+    /// back.
     #[test]
-    fn gpx_counts_a_multipoints_name_once_for_each_waypoint() {
+    fn gpx_counts_a_multipoints_name_once() {
         let mut ds = Dataset::new("t", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
         let points = vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0), Coord::new(200.0, 0.0)];
         ds.push(Some(Geometry::MultiPoint(points)), vec![Value::Text(" a".into())]);
         assert_eq!(
             text_notes(&ds, "gpx"),
-            ["t: 2 text values start or end with spaces, tabs or line breaks, which reading the file back drops, in 'name'"]
+            [
+                "t: 1 text value starts or ends with spaces, tabs or line breaks, which reading the file back drops, in 'name'",
+                "t: 1 vertex won't read back with the features kept: outside longitude/latitude, or in a part left with too few to keep",
+            ]
         );
         let (bytes, _) = write_bytes(&ds, "gpx").unwrap();
         let read = crate::gpx::read("t.gpx", &bytes).unwrap();
@@ -6184,7 +6204,62 @@ mod tests {
         let names: Vec<_> = waypoints.features.iter().map(|f| f.attrs[0].clone()).collect();
         assert_eq!(names, [Value::Text("a".into()), Value::Text("a".into())]);
         ds.features[0].attrs = vec![Value::Text("a".into())];
+        ds.features[0].geometry = Some(Geometry::MultiPoint(vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]));
         assert!(text_notes(&ds, "gpx").is_empty());
+    }
+
+    /// KML and GPX readers drop a vertex outside longitude/latitude one at a time, and a part left
+    /// with too few: the features kept lose those vertices, which are counted.
+    #[test]
+    fn kml_and_gpx_count_vertices_that_dont_read_back() {
+        let c = Coord::new;
+        let geometries = [
+            // One vertex out of range; the line keeps two.
+            Geometry::Line(vec![vec![c(0.0, 0.0), c(200.0, 0.0), c(1.0, 1.0)]]),
+            // A second part left with one vertex is dropped whole: 2 vertices.
+            Geometry::Line(vec![vec![c(0.0, 0.0), c(1.0, 1.0)], vec![c(2.0, 2.0), c(0.0, 95.0)]]),
+            // Two points of three out of range.
+            Geometry::MultiPoint(vec![c(0.0, 0.0), c(181.0, 0.0), c(0.0, -91.0)]),
+        ];
+        let mut ds = Dataset::new("t", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        for g in geometries {
+            ds.push(Some(g), vec![Value::Text("a".into())]);
+        }
+        let vertices = |n: usize| {
+            format!(
+                "t: {n} vertices won't read back with the features kept: outside longitude/latitude, or in a part left with too few to keep"
+            )
+        };
+        assert_eq!(text_notes(&ds, "kml"), [vertices(5)]);
+        assert_eq!(text_notes(&ds, "gpx"), [vertices(5)]);
+        // Reading the file back keeps the other 5 of the 10 vertices written.
+        let (bytes, _) = write_bytes(&ds, "kml").unwrap();
+        let read = crate::kml::read("t.kml", &bytes).unwrap();
+        let kept: usize =
+            read.iter().flat_map(|l| &l.dataset.features).filter_map(|f| f.geometry.as_ref()).map(Geometry::coord_count).sum();
+        assert_eq!(kept, 10 - 5);
+        // A polygon: an outer ring of four in range keeps them; a hole left with two is dropped
+        // (4 vertices), and a part whose outer ring is left with two is dropped with its hole.
+        let square = |x: f64| vec![c(x, 0.0), c(x + 1.0, 0.0), c(x + 1.0, 1.0), c(x, 0.0)];
+        let polygon = Geometry::Polygon(vec![
+            vec![square(0.0), vec![c(0.1, 0.1), c(200.0, 0.0), c(200.0, 1.0), c(0.1, 0.1)]],
+            vec![vec![c(2.0, 0.0), c(300.0, 0.0), c(300.0, 1.0), c(2.0, 1.0)], square(2.0)],
+        ]);
+        let mut ds = Dataset::new("t", GeometryType::Polygon, vec![Field::new("name", FieldType::Text)]);
+        ds.push(Some(polygon), vec![Value::Text("a".into())]);
+        assert_eq!(text_notes(&ds, "kml"), [vertices(12)]);
+        let (bytes, _) = write_bytes(&ds, "kml").unwrap();
+        let read = crate::kml::read("t.kml", &bytes).unwrap();
+        assert_eq!(read[0].dataset.features[0].geometry, Some(Geometry::Polygon(vec![vec![square(0.0)]])));
+        // GPX writes the outer rings as a track: the second is left with two, so isn't dropped.
+        assert_eq!(text_notes(&ds, "gpx"), [vertices(2)]);
+        // In range, nothing is said.
+        let mut clean = Dataset::new("t", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        clean.push(Some(Geometry::Line(vec![vec![c(0.0, 0.0), c(180.0, 90.0)]])), vec![Value::Text("a".into())]);
+        clean.push(Some(Geometry::MultiPoint(vec![c(-180.0, -90.0), c(1.0, 1.0)])), vec![Value::Text("b".into())]);
+        clean.push(Some(Geometry::Polygon(vec![vec![square(0.0), square(0.0)]])), vec![Value::Text("c".into())]);
+        assert!(text_notes(&clean, "kml").is_empty());
+        assert!(text_notes(&clean, "gpx").is_empty());
     }
 
     /// KML reads a layer for each kind of geometry and types each one's columns apart: a blank in

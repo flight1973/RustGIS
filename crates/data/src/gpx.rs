@@ -46,6 +46,24 @@ pub(crate) fn keeps(g: &Geometry) -> bool {
     }
 }
 
+/// The vertices of a feature reading keeps ([`keeps`]) that don't read back with it: points of a
+/// multipoint outside longitude/latitude ([`coord`]), and those of a track's segments (a polygon's
+/// outer rings) out of range, or all of a segment left with fewer than two, which reading leaves
+/// out of the track.
+pub(crate) fn lost_vertices(g: &Geometry) -> usize {
+    let in_range = |p: &[Coord]| p.iter().filter(|c| crate::io::lon_lat_in_range(c.x, c.y)).count();
+    let segment = |p: &Vec<Coord>| {
+        let n = in_range(p);
+        if n >= 2 { p.len().saturating_sub(n) } else { p.len() }
+    };
+    match g {
+        Geometry::Point(_) => 0,
+        Geometry::MultiPoint(v) => v.len().saturating_sub(in_range(v)),
+        Geometry::Line(parts) => parts.iter().map(segment).sum(),
+        Geometry::Polygon(polys) => polys.iter().filter_map(|rings| rings.first()).map(segment).sum(),
+    }
+}
+
 fn text(v: Option<String>) -> Value {
     v.map(Value::Text).unwrap_or_default()
 }
