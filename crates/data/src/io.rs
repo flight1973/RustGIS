@@ -3929,6 +3929,11 @@ impl TextLosses {
     /// The losses of `features`, with `fields`, in a layer of type `gt` written to a file of
     /// extension `ext` (lowercase), each KML or GPX feature named from field `name_field`; none
     /// for another format.
+    ///
+    /// One pass over the features without a check for Cancel: the counts of a pass stopped half
+    /// way would understate the losses, so it can't return early. It formats each value once,
+    /// in memory, which is less than the write it follows (the same formatting, plus the write),
+    /// and a streamed export counts a chunk at a time, looking at Cancel between chunks.
     pub fn of(features: &[crate::Feature], fields: &[Field], gt: GeometryType, ext: &str, name_field: Option<usize>) -> Self {
         let (csv, shp, kml, gpx) = (matches!(ext, "csv" | "wkt"), matches!(ext, "shp" | "zip"), matches!(ext, "kml" | "kmz"), ext == "gpx");
         if !(csv || shp || kml || gpx) {
