@@ -542,12 +542,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
-name = "crs-definitions"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed764c927c2a19ec1cb85deb88e93560872c04653b0e9e63fbdf6a8edf968bcb"
-
-[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2384,7 +2378,6 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "calamine",
- "crs-definitions",
  "csv",
  "encoding_rs",
  "flate2",
@@ -3053,7 +3046,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3062,8 +3055,7 @@ dependencies = [
 [[package]]
 name = "terrio-crs"
 version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a75b204c693afa267f00b04e9bf7a4158a6132cd0d0213bfe0e1317aa59d6b33"
+source = "git+https://github.com/opengeos/terrio?rev=bbc0aaef92c21844c4adfaa8808e9ba15f0faa8f#bbc0aaef92c21844c4adfaa8808e9ba15f0faa8f"
 dependencies = [
  "geographiclib-rs",
  "libc",

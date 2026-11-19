@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::theme::{Tokens, regular, semibold};
 use crate::widgets::{
     CONTENT_H, Dragged, LABEL_H, big, big_form_menu, big_menu, big_split_form_menu, big_split_menu, col, group, menu_item, small,
-    small_form_menu, small_menu, submenu_row, text_w,
+    small_form_menu, small_menu, submenu, submenu_row, text_w,
 };
 use crate::{RightPane, RustGisApp, icons};
 
@@ -1143,16 +1143,11 @@ fn publication_style(id: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
-/// A publication profile's name in the menu: a `tl!` literal each, so the catalogs find it (the
-/// engine's labels, which it matches in English); `None` for a profile added without one.
+/// A publication figure's name in the menu: a `tl!` literal each, so the catalogs find it (the
+/// engine's labels, which it matches in English); `None` for a figure added without one. Sheets
+/// are named by their page size, as New Layout names it.
 fn publication_label(id: &str) -> Option<&'static str> {
     Some(match id {
-        "a4-portrait" => tl!("A4 portrait sheet"),
-        "a4-landscape" => tl!("A4 landscape sheet"),
-        "a3-portrait" => tl!("A3 portrait sheet"),
-        "a3-landscape" => tl!("A3 landscape sheet"),
-        "a2-portrait" => tl!("A2 portrait sheet"),
-        "a2-landscape" => tl!("A2 landscape sheet"),
         "figure-1col" => tl!("Journal figure, 1 column (90 mm)"),
         "figure-1.5col" => tl!("Journal figure, 1.5 columns (140 mm)"),
         "figure-2col" => tl!("Journal figure, 2 columns (190 mm)"),
@@ -1162,34 +1157,60 @@ fn publication_label(id: &str) -> Option<&'static str> {
     })
 }
 
+/// A sheet of `size` (a page size's id) turned `orientation`, as `layout.publication` names it.
+fn publication_sheet(size: &str, orientation: &str) -> Option<&'static rustgis_engine::cmd::layout::PublicationProfile> {
+    let id = format!("{size}-{orientation}");
+    rustgis_engine::cmd::layout::PUBLICATION_PROFILES.iter().find(|p| p.sheet && p.id == id)
+}
+
+/// A page size as the menus name it: `A4 (210 × 297 mm)`, its name translated.
+fn page_label(label: &str, w: f64, h: f64) -> String {
+    format!("{} ({w:.0} × {h:.0} mm)", tl!(label))
+}
+
+/// A sheet's styles as buttons, each making `profile` in it.
+fn publication_style_buttons(app: &mut RustGisApp, ui: &mut Ui, profile: &rustgis_engine::cmd::layout::PublicationProfile) {
+    for (style, name) in rustgis_engine::cmd::layout::PUBLICATION_STYLES {
+        let (name, about) = publication_style(style).unwrap_or_else(|| (tl!(*name), ""));
+        if ui.button(name).on_hover_text(about).clicked() {
+            publication_layout(app, profile, Some(style));
+            ui.close();
+        }
+    }
+}
+
 fn project_group(app: &mut RustGisApp, ui: &mut Ui) {
     group(ui, "Project", |ui| {
         big(ui, app, "new_map", "New\nMap", "Add a new map to the project.", "map.new", Value::Null, false, false);
         big_menu(ui, app, "new_layout", "New\nLayout", "Add a page layout for printing and exporting the map.", |ui, app| {
             for (id, label, w, h) in rustgis_engine::map::layout::PAGES {
-                let text = format!("{} ({w:.0} × {h:.0} mm)", tl!(*label));
-                if ui.button(text).clicked() {
+                if ui.button(page_label(label, *w, *h)).clicked() {
                     let _ = app.run("layout.new", json!({"page": id}));
                     app.ui.tab = "Publish".into();
                     ui.close();
                 }
             }
             // A finished sheet or figure of the map view, its texts to fill in on the page.
-            ui.menu_button(tl!("Publication Layout"), |ui| {
-                for profile in rustgis_engine::cmd::layout::PUBLICATION_PROFILES {
+            submenu(ui, tl!("Publication Layout"), |ui| {
+                // A sheet on each page size, as listed above; its styles under each orientation, so
+                // the list stays as short as the sizes (a figure leaves the style to its caption).
+                for (id, label, w, h) in rustgis_engine::map::layout::PAGES {
+                    submenu(ui, &page_label(label, *w, *h), |ui| {
+                        if let Some(portrait) = publication_sheet(id, "portrait") {
+                            ui.label(egui::RichText::new(tl!("Portrait")).small().weak());
+                            publication_style_buttons(app, ui, portrait);
+                        }
+                        if let Some(landscape) = publication_sheet(id, "landscape") {
+                            ui.separator();
+                            ui.label(egui::RichText::new(tl!("Landscape")).small().weak());
+                            publication_style_buttons(app, ui, landscape);
+                        }
+                    });
+                }
+                ui.separator();
+                for profile in rustgis_engine::cmd::layout::PUBLICATION_PROFILES.iter().filter(|p| !p.sheet) {
                     let label = publication_label(profile.id).unwrap_or_else(|| tl!(profile.label));
-                    if profile.sheet {
-                        // A sheet is arranged in one of the styles; a figure leaves that to its caption.
-                        ui.menu_button(label, |ui| {
-                            for (style, name) in rustgis_engine::cmd::layout::PUBLICATION_STYLES {
-                                let (name, about) = publication_style(style).unwrap_or_else(|| (tl!(*name), ""));
-                                if ui.button(name).on_hover_text(about).clicked() {
-                                    publication_layout(app, profile, Some(style));
-                                    ui.close();
-                                }
-                            }
-                        });
-                    } else if ui.button(label).clicked() {
+                    if ui.button(label).clicked() {
                         publication_layout(app, profile, None);
                         ui.close();
                     }
@@ -1238,7 +1259,7 @@ fn report_group(app: &mut RustGisApp, ui: &mut Ui) {
                     );
                     menu_item(ui, app, "new_layout", "New Template (a layout page)", "report.newTemplate", Value::Null);
                     let layouts: Vec<String> = app.session.project.layouts.iter().map(|l| l.name.clone()).collect();
-                    ui.menu_button(tl!("Existing Template"), |ui| {
+                    submenu_row(ui, "", tl!("Existing Template"), |ui| {
                         for l in layouts {
                             menu_item(ui, app, "", &l, "report.existingTemplate", json!({"layout": l}));
                         }
@@ -1254,7 +1275,7 @@ fn report_group(app: &mut RustGisApp, ui: &mut Ui) {
                         .filter(|(j, _)| Some(*j) != active)
                         .map(|(_, r)| r.name.clone())
                         .collect();
-                    ui.menu_button(tl!("Related Report"), |ui| {
+                    submenu_row(ui, "", tl!("Related Report"), |ui| {
                         if others.is_empty() {
                             ui.label(egui::RichText::new(tl!("No other reports")).weak());
                         }
@@ -1264,7 +1285,7 @@ fn report_group(app: &mut RustGisApp, ui: &mut Ui) {
                     });
                     let rels: Vec<String> =
                         app.session.project.maps.iter().flat_map(|m| m.editing.relationships.iter().map(|r| r.name.clone())).collect();
-                    ui.menu_button(tl!("Subreport"), |ui| {
+                    submenu_row(ui, "", tl!("Subreport"), |ui| {
                         if rels.is_empty() {
                             ui.label(egui::RichText::new(tl!("No relationships (Data Design › Relationships)")).weak());
                         }
@@ -1287,7 +1308,7 @@ fn report_group(app: &mut RustGisApp, ui: &mut Ui) {
                         .map(|l| l.dataset.fields.iter().map(|f| f.name.clone()).collect())
                         .unwrap_or_default();
                     let field_menu = |ui: &mut Ui, app: &mut RustGisApp, label: &str, id: &str, key: &str| {
-                        ui.menu_button(tl!(label), |ui| {
+                        submenu_row(ui, "", tl!(label), |ui| {
                             for f in &fields {
                                 menu_item(ui, app, "", f, id, json!({key: f}));
                             }
@@ -1295,9 +1316,9 @@ fn report_group(app: &mut RustGisApp, ui: &mut Ui) {
                     };
                     field_menu(ui, app, "Field", "report.field", "field");
                     menu_item(ui, app, "field", "Autofill Fields", "report.autofill", Value::Null);
-                    ui.menu_button(tl!("Statistics"), |ui| {
+                    submenu_row(ui, "", tl!("Statistics"), |ui| {
                         for f in &fields {
-                            ui.menu_button(f.as_str(), |ui| {
+                            submenu_row(ui, "", f.as_str(), |ui| {
                                 for k in ["count", "sum", "mean", "min", "max"] {
                                     menu_item(ui, app, "", k, "report.statistics", json!({"field": f, "kind": k}));
                                 }
@@ -1512,7 +1533,7 @@ fn graphics_and_text_group(app: &mut RustGisApp, ui: &mut Ui) {
             true,
         );
         egui::Popup::menu(&resp).show(|ui| {
-            ui.set_min_width(200.0);
+            ui.set_min_width(crate::widgets::MENU_MIN_W);
             for &(token, what) in rustgis_engine::map::graphics::TOKENS {
                 if ui.button(format!("{}  {token}", tl!(what))).clicked() {
                     app.map.cancel_sketch();
@@ -1847,18 +1868,31 @@ fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
     }
     ui.separator();
     let name = ui.label(tl!("Measured grid's coordinate system"));
-    ui.horizontal(|ui| {
-        let edit = ui.add(egui::TextEdit::singleline(&mut app.ui.graticule_crs_input).hint_text("2056").desired_width(90.0)).on_hover_text(
-            tl!("An EPSG code, WKT or a PROJ string; empty: the map's own when it is projected, else the UTM zone at the view's centre"),
+    ui.vertical(|ui| {
+        let recent = app.ui.recent_crs.clone();
+        let t = crate::theme::Tokens::get(ui.ctx());
+        let (edit, taken) = crate::crspicker::crs_box(
+            ui,
+            "graticule",
+            &mut app.ui.graticule_crs_input,
+            &recent,
+            crate::crspicker::Offer::Projected,
+            150.0,
+            tl!("name or code"),
+            &t,
         );
+        let edit = edit.on_hover_text(tl!(
+            "A name or EPSG code, WKT or a PROJ string; empty: the map's own when it is projected, else the UTM zone at the view's centre"
+        ));
         // Named by the label above it, for a screen reader (the hint is only a placeholder).
         let edit = edit.labelled_by(name.id);
         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if ui.button(tl!("Use System")).clicked() || enter {
+        if ui.button(tl!("Use System")).clicked() || enter || taken {
             let typed = app.ui.graticule_crs_input.trim();
             let crs = if typed.is_empty() { String::new() } else { crate::dialogs::typed_crs(typed) };
             match app.run("map.graticule", json!({"type": "measured", "crs": crs})) {
                 Ok(_) => {
+                    app.remember_crs_if_listed(&crs);
                     app.ui.graticule_crs_input.clear();
                     ui.close();
                 }
@@ -1874,6 +1908,23 @@ fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
 }
 
 fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
+    // On a phone that left its touch interface for this one: the way back, first so a
+    // phone's narrow ribbon shows it.
+    if app.touch.is_some() {
+        group(ui, "Interface", |ui| {
+            big(
+                ui,
+                app,
+                "pane",
+                "Touch\nInterface",
+                "Go back to the phone's interface: the map with large buttons under it.",
+                "ui.touchInterface",
+                Value::Null,
+                false,
+                false,
+            );
+        });
+    }
     group(ui, "Display", |ui| {
         let g = app.session.map().graticule;
         big_split_form_menu(
@@ -3149,7 +3200,7 @@ fn layout_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 let landscape = layout.width > layout.height;
                 let (pw, ph) = if landscape { (h.max(*w), h.min(*w)) } else { (*w, *h) };
                 let on = (layout.width - pw).abs() < 0.5 && (layout.height - ph).abs() < 0.5;
-                if ui.radio(on, format!("{} ({w:.0} × {h:.0} mm)", tl!(*label))).clicked() {
+                if ui.radio(on, page_label(label, *w, *h)).clicked() {
                     let _ = app.run(
                         "layout.page",
                         json!({"layout": li, "page": id, "orientation": if landscape { "landscape" } else { "portrait" }}),
@@ -3679,7 +3730,8 @@ fn plugin_tab(app: &mut RustGisApp, ui: &mut Ui, plugin: &str) {
     }
 }
 
-/// The Settings tab: theme, scale, customization, language, start-up and autosave.
+/// The Settings tab: theme, scale, customization, language, start-up, datum grids, map tiles,
+/// performance and autosave.
 fn settings_tab(app: &mut RustGisApp, ui: &mut Ui) {
     group(ui, "Theme", |ui| {
         theme_menu(app, ui);
@@ -3714,6 +3766,32 @@ fn settings_tab(app: &mut RustGisApp, ui: &mut Ui) {
         worldview_menu(app, ui);
     });
     group(ui, "Start-up", |ui| start_project_menu(app, ui));
+    group(ui, "Datum Grids", |ui| {
+        let mut on = app.ui.download_grids;
+        // The browser keeps what it downloads for the session; a computer, in a folder.
+        let tip = if cfg!(target_arch = "wasm32") {
+            tl!(
+                "When a coordinate system's most accurate datum transformation needs a grid RustGIS doesn't have, download it from PROJ's grid server (cdn.proj.org). Grids already downloaded stay in use for this session when this is off."
+            )
+        } else {
+            tl!(
+                "When a coordinate system's most accurate datum transformation needs a grid RustGIS doesn't have, download it from PROJ's grid server (cdn.proj.org). Grids already downloaded stay in use when this is off: to stop using them, delete the datum-grids folder in RustGIS's app data and start RustGIS again (grids installed for PROJ are still used)."
+            )
+        };
+        let resp = ui.checkbox(&mut on, tl!("Download Datum Grids")).on_hover_text(tip);
+        if resp.clicked() {
+            let _ = app.run("ui.datumGrids", json!({"on": on}));
+        }
+    });
+    group(ui, "Map Tiles", |ui| {
+        let mut on = app.ui.sharp_tiles;
+        let tip = tl!(
+            "On a high-resolution (HiDPI) display, fetch raster tiles and WMS pictures for the display's own pixels, up to twice the detail: text and lines in them come out sharp and smaller. Off, they are fetched for its logical pixels and stretched: softer, with larger text."
+        );
+        if ui.checkbox(&mut on, tl!("Sharp Tiles on HiDPI Displays")).on_hover_text(tip).clicked() {
+            let _ = app.run("ui.sharpTiles", json!({"on": on}));
+        }
+    });
     // The browser has no threads to set.
     if !cfg!(target_arch = "wasm32") {
         group(ui, "Performance", |ui| threads_menu(app, ui));
@@ -3968,21 +4046,38 @@ fn start_projection_menu(app: &mut RustGisApp, ui: &mut Ui) {
     big_form_menu(ui, app, "basemap", &label, "The projection the map opens in.", move |ui, app| {
         let mut items: Vec<(String, String)> = vec![("mercator".into(), "Web Mercator".into()), ("globe".into(), "Globe".into())];
         items.extend(rustgis_engine::map::projection::PRESETS.iter().map(|(id, label, _)| (id.to_string(), label.to_string())));
-        for (id, label) in items {
-            if ui.add(egui::Button::selectable(is_projection(&current, &id), tl!(label.as_str()))).clicked() {
-                let _ = app.run("ui.startup", json!({"projection": id}));
-                ui.close();
+        // While a search is typed its list offers the matching ones of these, and the menu stays
+        // within the window.
+        if app.ui.start_projection_input.trim().is_empty() || !crate::crspicker::list_is_shown(ui.ctx()) {
+            for (id, label) in items {
+                if ui.add(egui::Button::selectable(is_projection(&current, &id), tl!(label.as_str()))).clicked() {
+                    let _ = app.run("ui.startup", json!({"projection": id}));
+                    ui.close();
+                }
             }
+            ui.separator();
         }
-        ui.separator();
-        ui.label(tl!("EPSG or ESRI code"));
-        ui.horizontal(|ui| {
-            let edit = ui.add(egui::TextEdit::singleline(&mut app.ui.start_projection_input).hint_text("3010").desired_width(90.0));
+        let name = ui.label(tl!("Search by name or code"));
+        ui.vertical(|ui| {
+            let recent = app.ui.recent_crs.clone();
+            let t = crate::theme::Tokens::get(ui.ctx());
+            let (edit, taken) = crate::crspicker::crs_box(
+                ui,
+                "startProjection",
+                &mut app.ui.start_projection_input,
+                &recent,
+                crate::crspicker::Offer::Map,
+                150.0,
+                tl!("3010, lv95"),
+                &t,
+            );
+            let edit = edit.labelled_by(name.id);
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button(tl!("Use")).clicked() || enter {
+            if ui.button(tl!("Use")).clicked() || enter || taken {
                 let code = crate::dialogs::typed_crs(&app.ui.start_projection_input);
                 match app.run("ui.startup", json!({"projection": code})) {
                     Ok(_) => {
+                        app.remember_crs_if_listed(&code);
                         app.ui.start_projection_input.clear();
                         ui.close();
                     }
@@ -4657,7 +4752,7 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                 let _ = app.run("layer.symbology", json!({"type": "single"}));
                 ui.close();
             }
-            ui.menu_button(tl!("Unique Values"), |ui| {
+            submenu(ui, tl!("Unique Values"), |ui| {
                 for f in &text_f {
                     if ui.button(f).clicked() {
                         let _ = app.run("layer.symbology", json!({"type": "unique", "field": f}));
@@ -4665,7 +4760,7 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                     }
                 }
             });
-            ui.menu_button(tl!("Graduated Colors"), |ui| {
+            submenu(ui, tl!("Graduated Colors"), |ui| {
                 for f in &numeric {
                     if ui.button(f).clicked() {
                         let _ = app.run("layer.symbology", json!({"type": "graduated", "field": f}));
@@ -4674,7 +4769,7 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                 }
             });
             if is_point {
-                ui.menu_button(tl!("Proportional Symbols"), |ui| {
+                submenu(ui, tl!("Proportional Symbols"), |ui| {
                     for f in &numeric {
                         if ui.button(f).clicked() {
                             let _ = app.run("layer.symbology", json!({"type": "proportional", "field": f}));
@@ -4685,12 +4780,15 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
             }
         });
         col(ui, |ui| {
-            let mut c = crate::theme::c32(layer.renderer.base_symbol().fill);
+            // A fill No Fill hides shows the opacity Restore Fill gives back, so a colour picked
+            // here is drawn (#2308).
+            let fill = layer.renderer.base_symbol().fill;
+            let shown = rustgis_engine::cmd::layer::hidden_fill_opacity(layer, None);
             ui.horizontal(|ui| {
-                let resp = crate::widgets::color_button(ui, &mut c);
-                if resp.changed() {
+                let (resp, picked) = crate::widgets::rgba_button(ui, shown.map_or(fill, |a| fill.with_alpha(a)));
+                if let Some(c) = picked {
                     crate::widgets::one_step_per_press(app, &resp);
-                    let _ = app.run("layer.color", json!({"color": crate::theme::rgba(c).hex8()}));
+                    let _ = app.run("layer.color", json!({"color": c.hex8()}));
                 }
                 // A line has no inside: its colour is the line's (the outline is the "Outline" width below).
                 let name = if layer.geometry_type() == GeometryType::Polyline { tl!("Color") } else { tl!("Fill") };
@@ -4895,7 +4993,7 @@ fn raster_style_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 ui.separator();
                 for (key, label, slot) in [("red", "Red", 0usize), ("green", "Green", 1), ("blue", "Blue", 2)] {
-                    ui.menu_button(tl!(label), |ui| {
+                    submenu(ui, tl!(label), |ui| {
                         for (i, b) in bands.iter().enumerate() {
                             if ui
                                 .add(egui::Button::selectable(
@@ -5412,7 +5510,11 @@ fn worldview_menu(app: &mut RustGisApp, ui: &mut Ui) {
 fn language_menu(app: &mut RustGisApp, ui: &mut Ui) {
     let current = app.chosen_lang();
     let auto = app.ui.language == crate::i18n::AUTO;
-    let label = if auto { format!("{} ({})", tl!("Automatic"), shown_name(ui, current)) } else { shown_name(ui, current).to_string() };
+    let label = if auto {
+        crate::i18n::fmt("Automatic ({kind})", &[("kind", shown_name(ui, current))])
+    } else {
+        shown_name(ui, current).to_string()
+    };
     big_menu(ui, app, "globe_lang", &label, "Choose the interface language.", move |ui, app| {
         if ui.selectable_label(auto, tl!("Automatic (system language)")).clicked() {
             let _ = app.run("ui.language", json!({"code": crate::i18n::AUTO}));
@@ -5502,6 +5604,18 @@ mod tests {
             "{:?}",
             h.state().session.notices.last()
         );
+        // Found by name in the open menu: a click on the row uses it and remembers it.
+        // (The menu is still open: a refused system leaves it so.)
+        h.state_mut().ui.graticule_crs_input.clear();
+        let field = || egui::accesskit::Role::TextInput;
+        h.get_by_role_and_label(field(), "Measured grid's coordinate system").click();
+        h.run();
+        h.get_by_role_and_label(field(), "Measured grid's coordinate system").type_text("utm 33n");
+        h.run();
+        h.get_by_label_contains("WGS 84 / UTM zone 33N").click();
+        h.run();
+        assert_eq!(h.state().session.map().graticule_crs.as_deref(), Some("EPSG:32633"));
+        assert_eq!(h.state().ui.recent_crs.first().map(String::as_str), Some("EPSG:32633"));
     }
 
     /// The language list names every language in English while the interface is English, with the
@@ -5740,6 +5854,157 @@ mod tests {
         assert_eq!(color(h.state()), before);
         h.state_mut().run("edit.redo", json!(null)).unwrap();
         assert_eq!(color(h.state()), after);
+    }
+
+    /// A colour picked in the Fill swatch after No Fill is drawn at the opacity No Fill hid, not
+    /// kept at No Fill's 0 (#2308).
+    #[test]
+    fn a_fill_picked_after_no_fill_is_drawn() {
+        let mut h = drawing_harness();
+        h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+        h.run();
+        let id = h.state().session.active_layer.unwrap();
+        let fill = |app: &RustGisApp| app.session.map().layer(id).unwrap().renderer.base_symbol().fill;
+        let before = fill(h.state());
+        h.get_by_label("No Fill").click();
+        h.run();
+        assert_eq!(fill(h.state()).a(), 0);
+        h.get_by_role(egui::accesskit::Role::ColorWell).click();
+        h.run();
+        // The picker's R/G/B/A numbers come first, then Outline: a new red.
+        let red = if before.r() == 200 { "100" } else { "200" };
+        type_into(&mut h, 0, red);
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let after = fill(h.state());
+        assert_eq!(after.r().to_string(), red, "the colour picked");
+        assert_eq!(after.a(), before.a(), "drawn at the opacity No Fill hid");
+        assert!(h.state().session.map().layer(id).unwrap().no_fill.is_none());
+    }
+
+    /// A fill transparent before No Fill shows so in the Fill swatch, as Restore Fill gives it back,
+    /// and keeps the colour picked there: its hue isn't lost at 0 opacity (#2308).
+    #[test]
+    fn a_transparent_fill_picked_after_no_fill_keeps_its_colour() {
+        let mut h = drawing_harness();
+        h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+        h.state_mut().run("layer.color", json!({"color": "#33669900"})).unwrap();
+        h.run();
+        let id = h.state().session.active_layer.unwrap();
+        let fill = |app: &RustGisApp| app.session.map().layer(id).unwrap().renderer.base_symbol().fill;
+        h.get_by_label("No Fill").click();
+        h.run();
+        h.get_by_role(egui::accesskit::Role::ColorWell).click();
+        h.run();
+        // A transparent picker edits linear values: a new red, half way up.
+        type_into(&mut h, 0, "0.5");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let after = fill(h.state());
+        assert_eq!((after.r(), after.g(), after.b(), after.a()), (188, 0x66, 0x99, 0), "the new red, the rest kept, still transparent");
+        assert!(h.state().session.map().layer(id).unwrap().no_fill.is_none());
+    }
+
+    /// Opening the Fill swatch and leaving it open picks nothing, for a colour egui's own colour
+    /// model doesn't round-trip exactly too: No Fill stays on, and there is no step to undo.
+    #[test]
+    fn opening_the_fill_swatch_picks_nothing() {
+        let mut h = drawing_harness();
+        h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+        h.state_mut().run("layer.color", json!({"color": "#0000fcff"})).unwrap();
+        h.state_mut().run("layer.noFill", json!(null)).unwrap();
+        h.run();
+        let id = h.state().session.active_layer.unwrap();
+        let undo = h.state().session.undo_depth();
+        h.get_by_role(egui::accesskit::Role::ColorWell).click();
+        for _ in 0..5 {
+            h.step();
+        }
+        assert!(h.state().session.map().layer(id).unwrap().no_fill.is_some(), "No Fill stays on");
+        assert_eq!(h.state().session.undo_depth(), undo, "nothing to undo");
+    }
+
+    /// Dragging a transparent fill's opacity up in its picker only raises it: the picker's numbers
+    /// keep their units while the drag makes the colour opaque.
+    #[test]
+    fn dragging_a_transparent_fills_opacity_up_raises_it() {
+        let mut h = drawing_harness();
+        h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+        h.state_mut().run("layer.color", json!({"color": "#33669900"})).unwrap();
+        h.run();
+        let id = h.state().session.active_layer.unwrap();
+        let alpha = |app: &RustGisApp| app.session.map().layer(id).unwrap().renderer.base_symbol().fill.a();
+        h.get_by_role(egui::accesskit::Role::ColorWell).click();
+        h.run();
+        // R, G, B, then A.
+        let at = h.query_all_by_role(egui::accesskit::Role::SpinButton).nth(3).unwrap().rect().center();
+        let mut seen = vec![alpha(h.state())];
+        drag_by(&mut h, at, |app| seen.push(alpha(app)));
+        seen.push(alpha(h.state()));
+        assert!(seen.windows(2).all(|w| w[1] >= w[0]) && seen.last() > seen.first(), "{seen:?}");
+    }
+
+    /// Typing a transparent fill's opacity, key by key, keeps the picker's units: the number typed
+    /// is the one set, though the colour turns opaque half way through.
+    #[test]
+    fn typing_a_transparent_fills_opacity_keeps_its_units() {
+        let mut h = drawing_harness();
+        h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+        h.state_mut().run("layer.color", json!({"color": "#33669900"})).unwrap();
+        h.run();
+        let id = h.state().session.active_layer.unwrap();
+        let alpha = |app: &RustGisApp| app.session.map().layer(id).unwrap().renderer.base_symbol().fill.a();
+        h.get_by_role(egui::accesskit::Role::ColorWell).click();
+        h.run();
+        // R, G, B, then A, in linear units while transparent.
+        h.query_all_by_role(egui::accesskit::Role::SpinButton).nth(3).unwrap().focus();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        for key in ["0", ".", "5", "5"] {
+            h.event(egui::Event::Text(key.into()));
+            h.run();
+        }
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(alpha(h.state()), 140, "0.55 of 255");
+        // Now opaque: the next number, focused straight from this one, is in bytes.
+        let red = |app: &RustGisApp| app.session.map().layer(id).unwrap().renderer.base_symbol().fill.r();
+        h.query_all_by_role(egui::accesskit::Role::SpinButton).next().unwrap().focus();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.event(egui::Event::Text("200".into()));
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!((red(h.state()), alpha(h.state())), (200, 140), "a red of 200, in bytes");
+    }
+
+    /// Units held for one number don't carry to the next, focused straight from it: an opaque
+    /// fill's opacity typed to 0 makes the red typed next a linear one.
+    #[test]
+    fn the_next_number_takes_the_units_for_the_colour_it_finds() {
+        let mut h = drawing_harness();
+        h.state_mut().run("layer.select", json!({"layer": "Countries"})).unwrap();
+        h.state_mut().run("layer.color", json!({"color": "#336699ff"})).unwrap();
+        h.run();
+        let id = h.state().session.active_layer.unwrap();
+        let fill = |app: &RustGisApp| app.session.map().layer(id).unwrap().renderer.base_symbol().fill;
+        h.get_by_role(egui::accesskit::Role::ColorWell).click();
+        h.run();
+        let typed = |h: &mut egui_kittest::Harness<'static, RustGisApp>, nth: usize, text: &str| {
+            h.query_all_by_role(egui::accesskit::Role::SpinButton).nth(nth).unwrap().focus();
+            h.run();
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+            h.event(egui::Event::Text(text.into()));
+            h.run();
+        };
+        // A, in bytes while opaque, then R straight after, with no Enter between.
+        typed(&mut h, 3, "0");
+        assert_eq!(fill(h.state()).a(), 0);
+        typed(&mut h, 0, "1");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!((fill(h.state()).r(), fill(h.state()).a()), (255, 0), "a full red, in linear units, still transparent");
     }
 
     /// Focuses the harness's `nth` number to type into it, and types `text` over its value.
@@ -6205,13 +6470,21 @@ mod tests {
         assert_eq!(size(h.state()), before);
     }
 
-    /// Every publication profile has its literal name in the menu, the engine's label word for word
-    /// (the test runs in English), so neither can be renamed without the other.
+    /// Every publication figure has its literal name in the menu, the engine's label word for word
+    /// (the test runs in English), so neither can be renamed without the other; every page size
+    /// New Layout lists has its sheet in the menu, portrait and landscape, and the menu offers no
+    /// other sheet.
     #[test]
-    fn every_publication_profile_is_named_by_a_literal() {
-        for p in rustgis_engine::cmd::layout::PUBLICATION_PROFILES {
+    fn every_publication_profile_is_in_the_menu() {
+        use rustgis_engine::cmd::layout::PUBLICATION_PROFILES;
+        for p in PUBLICATION_PROFILES.iter().filter(|p| !p.sheet) {
             assert_eq!(publication_label(p.id), Some(p.label), "{}", p.id);
         }
+        let pages = rustgis_engine::map::layout::PAGES;
+        for (id, ..) in pages {
+            assert!(publication_sheet(id, "portrait").is_some() && publication_sheet(id, "landscape").is_some(), "{id}");
+        }
+        assert_eq!(PUBLICATION_PROFILES.iter().filter(|p| p.sheet).count(), 2 * pages.len());
     }
 
     /// Every sheet style has its literal name in the menu, the engine's name word for word, and
@@ -6245,19 +6518,24 @@ mod tests {
         let open = |h: &mut egui_kittest::Harness<'static, RustGisApp>, path: &[&str]| {
             h.get_by_label("New Layout").click();
             h.run();
+            // A size is listed twice, New Layout's page and Publication Layout's sheet: the
+            // latter, the menu opened last.
             for row in path {
-                h.get_by_label(row).hover();
+                h.query_all_by_label(row).last().unwrap_or_else(|| panic!("{row}")).hover();
                 h.run();
             }
         };
         let before = h.state().session.project.layouts.len();
-        open(&mut h, &["Publication Layout", "A4 portrait sheet"]);
-        h.get_by_label("Panel").click();
+        open(&mut h, &["Publication Layout", "A4 (210 × 297 mm)"]);
+        // The styles under Portrait first, then under Landscape (#2309).
+        assert_eq!(h.query_all_by_label("Panel").count(), 2);
+        h.query_all_by_label("Panel").next().unwrap().click();
         h.run();
         let app = h.state();
         assert_eq!(app.session.project.layouts.len(), before + 1);
         let l = app.session.project.layouts.last().unwrap();
         assert!(l.elements.iter().any(|e| e.name == "Panel Box"), "the panel style");
+        assert!((l.width, l.height) == (210.0, 297.0), "an A4 portrait sheet: {} × {}", l.width, l.height);
         let title = app.session.map().name.clone();
         assert!(
             l.elements.iter().any(|e| matches!(&e.kind, rustgis_engine::map::layout::ElementKind::Text { text, .. } if *text == title)),
@@ -6265,13 +6543,78 @@ mod tests {
         );
         assert_eq!(app.ui.tab, "Publish");
         assert!(h.query_by_label("Banner").is_none(), "the menu closed");
+        // A size in inches, turned landscape.
+        open(&mut h, &["Publication Layout", "Tabloid (279 × 432 mm)"]);
+        h.query_all_by_label("Classic").last().unwrap().click();
+        h.run();
+        let l = h.state().session.project.layouts.last().unwrap();
+        assert!((l.width, l.height) == (431.8, 279.4), "a Tabloid landscape sheet: {} × {}", l.width, l.height);
         // A figure: no styles under it.
         open(&mut h, &["Publication Layout"]);
         h.get_by_label("Journal figure, 1 column (90 mm)").click();
         h.run();
-        assert_eq!(h.state().session.project.layouts.len(), before + 2);
+        assert_eq!(h.state().session.project.layouts.len(), before + 3);
         let l = h.state().session.project.layouts.last().unwrap();
         assert!(l.elements.iter().all(|e| e.name != "Panel Box" && e.name != "Title"), "a figure, its title left to the caption");
+    }
+
+    /// A submenu of short rows (a sheet's styles) opens at least SUBMENU_MIN_W wide, not as a
+    /// strip, and the row opening it is as tall as the menu's other rows (#2398).
+    #[test]
+    fn a_submenu_of_short_rows_is_not_a_strip() {
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                ui.horizontal(|ui| project_group(app, ui));
+            },
+            cities(),
+        );
+        h.run();
+        h.get_by_label("New Layout").click();
+        h.run();
+        // A size is listed twice, New Layout's page and Publication Layout's sheet: the latter.
+        for row in ["Publication Layout", "Letter (216 × 279 mm)"] {
+            h.query_all_by_label(row).last().unwrap_or_else(|| panic!("{row}")).hover();
+            h.run();
+        }
+        // A menu's rows fill its width, so a style's row is as wide as the submenu: at least the
+        // 100 pt agreed in #2398 (written here, not read from the constant), less rounding.
+        let style = h.query_all_by_label("Panel").next().expect("the sheet's styles").rect();
+        assert!(style.width() >= 99.5, "a style's row is {} px wide", style.width());
+        // A row opening a submenu is as tall as the plain rows beside it.
+        let sheet = h.query_all_by_label("Letter (216 × 279 mm)").last().unwrap().rect();
+        let figure = h.get_by_label("Journal figure, 1 column (90 mm)").rect();
+        let (sheet, figure) = (sheet.height(), figure.height());
+        assert!((sheet - figure).abs() < 0.5, "a sheet's row is {sheet} px tall, a figure's {figure}");
+    }
+
+    /// In a menu of `menu_item` rows (Report Section), the row opening a submenu is as tall as
+    /// the rows beside it (#2398).
+    #[test]
+    fn a_submenu_row_is_as_tall_as_the_menu_items_beside_it() {
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                ui.horizontal(|ui| report_group(app, ui));
+            },
+            cities(),
+        );
+        h.run();
+        h.get_by_label("Report Section").click();
+        h.run();
+        let opener = h.get_by_label("Existing Template").rect().height();
+        let item = h.get_by_label("New Template (a layout page)").rect().height();
+        assert!((opener - item).abs() < 0.5, "Existing Template is {opener} px tall, New Template {item}");
     }
 
     #[test]

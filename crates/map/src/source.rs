@@ -106,6 +106,11 @@ pub struct SourceLayer {
     unread_dates_said: bool,
     #[serde(skip)]
     rounded_dates_said: bool,
+    /// Text values `<Null>` a view read read as null ([`Batch::null_text`]), likewise.
+    #[serde(skip)]
+    null_text: Option<Vec<usize>>,
+    #[serde(skip)]
+    null_text_said: bool,
     #[serde(skip)]
     window: Option<Window>,
     /// Whole-source thinning decisions shared by render snapshots, independent of view rows.
@@ -131,6 +136,10 @@ pub struct SourceLayer {
     /// explicit source reset discards them. Display-only resets preserve them in `sync_sources`.
     #[serde(skip)]
     pub(crate) saved_selection: Vec<u64>,
+    /// The datum grids this window was read with ([`rustgis_data::raster::crs::grid_generation`]):
+    /// a window read before a grid arrived is read again, as after a change of projection.
+    #[serde(skip)]
+    pub(crate) grids: Option<u64>,
     #[serde(skip)]
     pub(crate) window_fields: Option<usize>,
     /// The layer's definition query, applied while a view is read rather than to the rows read.
@@ -744,6 +753,23 @@ impl SourceLayer {
             unread.and_then(|c| rustgis_data::source::unread_dates_note(&fields, &c)),
             rounded.and_then(|c| rustgis_data::source::rounded_dates_note(&fields, &c)),
         )
+    }
+
+    /// Keeps what view reads found of text values `<Null>` read as null, until
+    /// [`SourceLayer::take_null_text`] says it, as [`SourceLayer::saw_unread_dates`] does for dates.
+    pub fn saw_null_text(&mut self, counts: &[usize]) {
+        if !self.null_text_said && counts.iter().any(|n| *n > 0) {
+            rustgis_data::source::add_unread_dates(self.null_text.get_or_insert_with(Vec::new), counts);
+        }
+    }
+
+    /// What view reads found of text values `<Null>` read as null
+    /// ([`rustgis_data::source::null_text_note`]), once for the source.
+    pub fn take_null_text(&mut self) -> Option<String> {
+        let fields = self.info().map(|i| i.fields.clone())?;
+        let counts = self.null_text.take()?;
+        self.null_text_said = true;
+        rustgis_data::source::null_text_note(&fields, &counts)
     }
 
     /// Whether another installed window needs its retained display expressions checked.
@@ -1398,7 +1424,7 @@ impl SourceLayer {
             n => n,
         };
         let count = h.info().count;
-        let query = Query { text: query.to_string(), fields: fields.to_vec() };
+        let query = Query { text: query.to_string(), fields: fields.to_vec(), env: Default::default() };
         let crowded = count.is_none_or(|c| c > most as u64) || self.sampled().is_some();
         (window::walked(h.as_ref(), &query).is_none() && crowded).then_some((count, most))
     }
@@ -1475,6 +1501,8 @@ impl SourceLayer {
         self.rounded_dates = None;
         self.unread_dates_said = false;
         self.rounded_dates_said = false;
+        self.null_text = None;
+        self.null_text_said = false;
         self.reset();
         self.open()
     }
@@ -1522,10 +1550,15 @@ impl SourceLayer {
 
     /// Applies the layer's definition query (`fields` are the layer's) as views are read; a
     /// different one reads the view again.
-    pub(crate) fn set_query(&mut self, text: Option<&str>, fields: &[rustgis_data::Field]) {
+    pub(crate) fn set_query(&mut self, text: Option<&str>, fields: &[rustgis_data::Field], env: &rustgis_data::query::Env) {
         let text = text.map(str::trim).filter(|t| !t.is_empty());
-        if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice())) != text.map(|t| (t, fields)) {
-            self.query = text.map(|t| Query { text: t.to_string(), fields: fields.to_vec() });
+        let page = env.page.as_ref().filter(|_| text.is_some_and(rustgis_data::query::reads_series_page));
+        if self.query.as_ref().map(|q| (q.text.as_str(), q.fields.as_slice(), q.env.page.as_ref())) != text.map(|t| (t, fields, page)) {
+            self.query = text.map(|t| Query {
+                text: t.to_string(),
+                fields: fields.to_vec(),
+                env: rustgis_data::query::Env { page: page.cloned(), ..Default::default() },
+            });
             // A source that can't be walked reads the same rows whatever the query.
             if self.handle.as_ref().is_some_and(|h| h.visits_chunks()) {
                 self.reread();
@@ -1776,6 +1809,7 @@ impl SourceLayer {
             estimated_row_bytes: _,
             full_read: _,
             saved_selection: _,
+            grids: _,
             window_fields: _,
             query: _,
             opening: _,
@@ -1795,6 +1829,8 @@ impl SourceLayer {
             rounded_dates: _,
             unread_dates_said: _,
             rounded_dates_said: _,
+            null_text: _,
+            null_text_said: _,
             gdal,
             duckdb,
             postgis,

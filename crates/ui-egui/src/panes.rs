@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use egui::{Align2, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::Session;
 use rustgis_engine::analysis::{ParamKind, tools};
+use rustgis_engine::cmd::layer::hidden_fill_opacity;
 use rustgis_engine::data::GeometryType;
 use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle, Rock, relief_ambient};
 use rustgis_engine::map::symbology::{
@@ -81,11 +82,11 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         let room = ui.available_width();
         let max = (room - MIN_MAP_WIDTH).max(RIGHT_PANE_MAX.min(room)).max(260.0);
         // The Web Data pane's searches and lists want room, and the Notebook opens on half of
-        // it (at least 320 where the room allows), beside the map: each keeps its own width.
+        // it (at least 320 where the room allows), beside the map: each keeps its own width. Every
+        // other pane shares one, so switching tabs among them never moves the pane's edge (#2416).
         let (id, width) = match right {
             RightPane::WebData => ("right_pane_web", 440.0),
             RightPane::Notebook => ("right_pane_notebook", (room / 2.0).max(320.0).min(max)),
-            RightPane::DiagnosticLog => ("right_pane_diagnostic_log", 480.0),
             _ => ("right_pane", 320.0),
         };
         let pane = egui::Panel::right(id).resizable(true).default_size(width).size_range(260.0..=max).frame(frame).show(ui, |ui| {
@@ -494,10 +495,22 @@ fn glyph(p: &egui::Painter, at: egui::Pos2, g: Glyph, px: f32, c: egui::Color32)
 
 /// Paints a symbol patch for a layer of geometry type `g`.
 pub fn patch(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType) {
+    patch_sized(p, r, s, g, s.size.clamp(4.0, 14.0), (s.size * 1.4).clamp(8.0, 18.0));
+}
+
+/// [`patch`] with a point drawn `size` across and a character marker at `glyph_px`, as given,
+/// for rows whose sizes compare (size legends).
+fn patch_sized(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType, size: f32, glyph_px: f32) {
     match g {
         GeometryType::Point => {
-            let rad = (s.size.clamp(4.0, 14.0)) / 2.0;
+            let rad = size / 2.0;
             let c = r.center();
+            // An image, without the symbol's colours, as on the map; one that doesn't draw is the
+            // circle below, as there.
+            if let Some(image) = crate::markerimages::image(p.ctx(), s.marker) {
+                image.paint(p, c, size);
+                return;
+            }
             match s.marker {
                 Marker::Square => {
                     p.rect_filled(Rect::from_center_size(c, vec2(rad * 1.8, rad * 1.8)), 0.0, c32(s.fill));
@@ -525,7 +538,7 @@ pub fn patch(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType) {
                 // An outline-only character shows in its outline's colour.
                 Marker::Char(g) => {
                     let col = if s.fill.a() == 0 && s.stroke_width > 0.0 { s.stroke } else { s.fill };
-                    glyph(p, c, g, (s.size * 1.4).clamp(8.0, 18.0), c32(col));
+                    glyph(p, c, g, glyph_px, c32(col));
                 }
                 _ => {
                     p.circle_filled(c, rad, c32(s.fill));
@@ -1693,7 +1706,7 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
                 action = Some(("map.setTiles", json!({"index": i, "opacity": o / 100.0})));
             }
         });
-        ui.menu_button(crate::i18n::fmt("Blend: {mode}", &[("mode", tl_raw!(tile.blend.label()))]), |ui| {
+        crate::widgets::submenu(ui, &crate::i18n::fmt("Blend: {mode}", &[("mode", tl_raw!(tile.blend.label()))]), |ui| {
             for b in rustgis_engine::map::effects::Blend::ALL {
                 if ui.radio(tile.blend == b, tl!(b.label())).clicked() {
                     action = Some(("map.setTiles", json!({"index": i, "blend": b.code()})));
@@ -1701,7 +1714,6 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
                 }
             }
         })
-        .response
         .on_hover_text(tl!("How the layer's colours combine with the tile layers and basemap beneath."));
         // A layer its service draws on request: one picture of the view, or tiles (#1162).
         if tile.on_request() {
@@ -1712,7 +1724,7 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
             } else {
                 tl!("Tiles").to_string()
             };
-            ui.menu_button(crate::i18n::fmt("Draw as: {how}", &[("how", &shown)]), |ui| {
+            crate::widgets::submenu(ui, &crate::i18n::fmt("Draw as: {how}", &[("how", &shown)]), |ui| {
                 if ui.radio(tile.single_image, tl!("Single image")).on_hover_text(tl!("One picture of the view: symbols and labels aren't cut at tile edges, and the service is asked once a view. Drawn in tiles on the globe, on a tilted map, or in a projection the service doesn't offer.")).clicked() {
                     action = Some(("map.setTiles", json!({"index": i, "singleImage": true})));
                     ui.close();
@@ -1730,7 +1742,6 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
                     ui.close();
                 }
             })
-            .response
             .on_hover_text(tl!("Whether the service is asked for one picture of the view or for tiles."));
         }
         ui.separator();
@@ -1971,7 +1982,7 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
         Some(_) => Vec::new(),
         None => l
             .shown_legend(scale)
-            .or_else(|| (!l.in_scale_range(scale)).then(|| l.renderer.legend_for(&l.dataset, &l.visible_rows())))
+            .or_else(|| (!l.in_scale_range(scale)).then(|| l.with_size_legend(l.renderer.legend_for(&l.dataset, &l.visible_rows()))))
             .unwrap_or_default(),
     };
     let has_legend = match &raster_legend {
@@ -2127,11 +2138,20 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
             ui.add_space(74.0);
             ui.label(egui::RichText::new(field).size(11.0).color(t.text_dim));
         });
-        for e in vector_legend.iter().take(40) {
+        // At most 40 classes, then the size rows the legend ends with.
+        let sizes = l.with_size_legend(Vec::new()).len().min(vector_legend.len());
+        let (classes, sized) = vector_legend.split_at(vector_legend.len() - sizes);
+        // The size rows share one scale, so the patch's box keeps them apart.
+        let top = sized.iter().map(|e| e.symbol.size).fold(0.0, f32::max);
+        let k = if top > 14.0 { 14.0 / top } else { 1.0 };
+        for (e, scale) in classes.iter().take(40).map(|e| (e, None)).chain(sized.iter().map(|e| (e, Some(k)))) {
             let (r, response) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
             response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &e.label));
             let pr = Rect::from_center_size(pos2(r.min.x + 84.0, r.center().y), vec2(18.0, 14.0));
-            patch(ui.painter(), pr, &e.symbol, l.geometry_type());
+            match scale {
+                Some(k) => patch_sized(ui.painter(), pr, &e.symbol, l.geometry_type(), e.symbol.size * k, e.symbol.size * k * 1.4),
+                None => patch(ui.painter(), pr, &e.symbol, l.geometry_type()),
+            }
             ui.painter().text(pos2(r.min.x + 100.0, r.center().y), Align2::LEFT_CENTER, &e.label, regular(11.5), t.text);
         }
     }
@@ -2193,7 +2213,7 @@ fn extrusion_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32]) {
     };
     let by = |f: &str| crate::i18n::fmt("By {field}", &[("field", f)]);
     let no_field = tl!("These layers share no numeric field.");
-    ui.menu_button(tl!("Extrusion"), |ui| {
+    crate::widgets::submenu(ui, tl!("Extrusion"), |ui| {
         head(ui);
         if ui.button(tl!("None")).clicked() {
             run(app, ui, "layer.extrusion", json!({"type": "none"}));
@@ -2212,7 +2232,7 @@ fn extrusion_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32]) {
             .on_disabled_hover_text(tl!("Extrude them all first: the base is what their walls stand on."));
         return;
     }
-    ui.menu_button(tl!("Extrusion Base"), |ui| {
+    crate::widgets::submenu(ui, tl!("Extrusion Base"), |ui| {
         head(ui);
         if ui.button(tl!("Ground")).clicked() {
             run(app, ui, "layer.extrusionBase", json!({"field": null, "base": 0}));
@@ -2279,7 +2299,7 @@ fn layers_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32], reorder: bool)
             .and_then(|id| m.group_of(*id))
             .map(|g| g.id)
             .filter(|g| picked.iter().all(|id| m.group_of(*id).map(|x| x.id) == Some(*g)));
-        ui.menu_button(tl!("Group"), |ui| {
+        crate::widgets::submenu(ui, tl!("Group"), |ui| {
             if ui.button(tl!("New Group")).clicked() {
                 new_group(app, json!({"layers": picked, "parent": shared}));
                 ui.close();
@@ -2474,7 +2494,7 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let m = app.session.map();
         let groups: Vec<(u32, String)> = m.groups.iter().map(|g| (g.id, group_path(m, g.id))).collect();
         let current = m.group_of(l.id).map(|g| g.id);
-        ui.menu_button(tl!("Group"), |ui| {
+        crate::widgets::submenu(ui, tl!("Group"), |ui| {
             // In the layer's group, if it has one (#836).
             if ui.button(tl!("New Group")).clicked() {
                 new_group(app, json!({"layers": [l.id], "parent": current}));
@@ -4630,7 +4650,7 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         ui.add_space(6.0);
     }
     match &l.renderer {
-        Renderer::Single(s) => symbol_editor(app, ui, *s, g, t),
+        Renderer::Single(s) => symbol_editor(app, ui, *s, hidden_fill_opacity(&l, None), g, t),
         Renderer::Unique { field, classes, ramp, expression, .. } => {
             field_combo(app, ui, "Field", if expression.is_some() { tl!("(expression)") } else { field.as_str() }, &all, "unique");
             // Or by an expression's values: blank goes back to the field.
@@ -4682,13 +4702,16 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         }
         Renderer::Proportional { field, base, .. } => {
             field_combo(app, ui, "Field", field, &numeric, "proportional");
-            symbol_editor(app, ui, *base, g, t);
+            symbol_editor(app, ui, *base, hidden_fill_opacity(&l, None), g, t);
             legend_list(app, ui, &l, t);
         }
     }
     if g == GeometryType::Point && !l.graphics {
         ui.add_space(8.0);
         marker_rotation_row(app, ui, &l);
+        if matches!(l.renderer, Renderer::Unique { .. } | Renderer::Graduated { .. }) {
+            size_by_rows(app, ui, &l);
+        }
     }
     if matches!(g, GeometryType::Polyline | GeometryType::Point) && !l.graphics {
         ui.add_space(8.0);
@@ -4970,19 +4993,7 @@ fn diagram_section(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, numeric: &[Stri
 /// fully transparent colour keeps its colour through an edit; and an opacity-only edit keeps
 /// `old`'s channels, which the picker's rounding would change.
 fn diagram_colour(ui: &mut Ui, old: rustgis_engine::map::Rgba) -> (egui::Response, Option<rustgis_engine::map::Rgba>) {
-    let mut hsva = egui::ecolor::Hsva::from_srgb([old.r(), old.g(), old.b()]);
-    hsva.a = f32::from(old.a()) / 255.0;
-    let alpha = hsva.a;
-    let resp = egui::color_picker::color_edit_button_hsva(ui, &mut hsva, egui::color_picker::Alpha::OnlyBlend);
-    let picked = resp.changed().then(|| picked_colour(hsva, alpha, old));
-    (resp, picked)
-}
-
-/// The colour a picker left at `hsva` for `old`, whose opacity was `alpha` when it opened: an
-/// opacity-only edit keeps `old`'s own channels; any other is the picker's colour, unpremultiplied.
-fn picked_colour(hsva: egui::ecolor::Hsva, alpha: f32, old: rustgis_engine::map::Rgba) -> rustgis_engine::map::Rgba {
-    let rgb = rustgis_engine::map::Rgba(hsva.to_srgba_unmultiplied());
-    if hsva.a != alpha { old.with_alpha(rgb.a()) } else { rgb }
+    crate::widgets::rgba_button(ui, old)
 }
 
 /// A number dragged or typed in the Diagram section. It is held in the UI's memory while the drag
@@ -5337,32 +5348,12 @@ fn legend_list(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     p
                 };
                 ui.horizontal(|ui| {
-                    // Construct hue independently of alpha: Color32 discards hidden RGB at zero.
+                    // A fill No Fill hides shows the opacity Restore Fill gives back, so a colour
+                    // picked here is drawn (#2308).
                     let fill = e.symbol.fill;
-                    let mut hsva = egui::ecolor::Hsva::from_srgb([fill.r(), fill.g(), fill.b()]);
-                    hsva.a = f32::from(fill.a()) / 255.0;
-                    let alpha = hsva.a;
-                    // egui creates the popup from the context, not this Ui's scoped style.
-                    // Borrow linear numeric editing only while a transparent picker is open.
-                    let styles = (fill.a() == 0 && egui::Popup::is_any_open(ui.ctx()))
-                        .then(|| [egui::Theme::Light, egui::Theme::Dark].map(|theme| (theme, ui.ctx().style_of(theme))));
-                    if styles.is_some() {
-                        ui.ctx().global_style_mut(|style| style.visuals.numeric_color_space = egui::style::NumericColorSpace::Linear);
-                    }
-                    let response = egui::color_picker::color_edit_button_hsva(ui, &mut hsva, egui::color_picker::Alpha::OnlyBlend);
-                    if let Some(styles) = styles {
-                        // The popup's numeric-mode button can change both themes; restore both
-                        // immediately so no other picker or later frame inherits the override.
-                        for (theme, style) in styles {
-                            ui.ctx().set_style_of(theme, style);
-                        }
-                    }
-                    let picked = response.on_hover_text(tl!("Class color")).changed().then(|| {
-                        let edited = rustgis_engine::map::Rgba(hsva.to_srgba_unmultiplied());
-                        // The numeric alpha editor also rounds RGB through Color32; an
-                        // opacity-only edit must keep the class's original channels exactly.
-                        if hsva.a != alpha { fill.with_alpha(edited.a()) } else { edited }
-                    });
+                    let fill = hidden_fill_opacity(l, Some(class_ref)).map_or(fill, |a| fill.with_alpha(a));
+                    let (response, picked) = crate::widgets::rgba_button(ui, fill);
+                    response.on_hover_text(tl!("Class color"));
                     if let Some(color) = picked {
                         // Keep FF too: six-digit polygon colours deliberately preserve translucency.
                         let params = with("color", json!(color.hex8()));
@@ -5492,7 +5483,8 @@ fn manual_breaks(app: &mut RustGisApp, ui: &mut Ui, field: &str, breaks: &[f64],
     }
 }
 
-fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, g: GeometryType, t: &Tokens) {
+/// `hidden`: the opacity of a fill No Fill hides, which its swatch shows ([`hidden_fill_opacity`]).
+fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, hidden: Option<u8>, g: GeometryType, t: &Tokens) {
     egui::Frame::NONE.fill(t.pane_header).corner_radius(CornerRadius::same(8)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
@@ -5505,11 +5497,10 @@ fn symbol_editor(app: &mut RustGisApp, ui: &mut Ui, s: Symbol, g: GeometryType, 
             if g != GeometryType::Polyline {
                 // The same name as the ribbon's Drawing group gives this `layer.color` button.
                 ui.label(tl!("Fill"));
-                let mut c = c32(s.fill);
-                let resp = crate::widgets::color_button(ui, &mut c);
-                if resp.changed() {
+                let (resp, picked) = crate::widgets::rgba_button(ui, hidden.map_or(s.fill, |a| s.fill.with_alpha(a)));
+                if let Some(c) = picked {
                     crate::widgets::one_step_per_press(app, &resp);
-                    let _ = app.run("layer.color", json!({"color": rgba(c).hex8()}));
+                    let _ = app.run("layer.color", json!({"color": c.hex8()}));
                 }
                 ui.end_row();
             }
@@ -5627,10 +5618,15 @@ fn stroke_json(st: &LineStroke) -> Value {
     })
 }
 
-/// A stroke's markers as `layer.lineStrokes` takes them.
+/// A stroke's markers as `layer.lineStrokes` takes them: an image with its base64, sent again
+/// with every change so the stroke keeps it.
 fn markers_json(m: &LineMarkers) -> Value {
     let glyph = match m.mark {
         LineMark::Marker(Marker::Char(g)) => Some(g),
+        _ => None,
+    };
+    let image = match m.mark {
+        LineMark::Marker(Marker::Picture(p)) => Some(p.base64()),
         _ => None,
     };
     json!({
@@ -5640,6 +5636,7 @@ fn markers_json(m: &LineMarkers) -> Value {
         },
         "char": glyph.map(|g| g.ch.to_string()),
         "font": glyph.map(|g| g.font.as_str()),
+        "image": image,
         "size": m.size,
         "at": m.at.codes(),
         "interval": m.interval,
@@ -5695,6 +5692,21 @@ fn marker_places() -> [(&'static str, Placements); 7] {
 
 /// Sets the layer's stacked strokes, or `class`'s own.
 fn set_strokes(app: &mut RustGisApp, class: Option<&ClassRef>, strokes: &[LineStroke]) {
+    let mut replaced = 0;
+    let strokes: Vec<LineStroke> = strokes
+        .iter()
+        .map(|st| {
+            let markers = st.markers.map(|m| match m.mark {
+                LineMark::Marker(shape) => {
+                    let (shape, lost) = drawn_marker(shape);
+                    replaced += usize::from(lost);
+                    LineMarkers { mark: LineMark::Marker(shape), ..m }
+                }
+                LineMark::Hash => m,
+            });
+            LineStroke { markers, ..*st }
+        })
+        .collect();
     let mut p = json!({"strokes": strokes.iter().map(stroke_json).collect::<Vec<_>>()});
     match class {
         Some(ClassRef::Value(v)) => p["value"] = json!(v),
@@ -5702,7 +5714,33 @@ fn set_strokes(app: &mut RustGisApp, class: Option<&ClassRef>, strokes: &[LineSt
         Some(ClassRef::Other) => p["other"] = json!(true),
         None => {}
     }
-    let _ = app.run("layer.lineStrokes", p);
+    if app.run("layer.lineStrokes", p).is_ok() {
+        notify_image_replaced(app, replaced);
+    }
+}
+
+/// A marker as an editor sends it back: an image that can't be drawn (one a file gave that wasn't
+/// kept, or that doesn't decode) becomes the circle it is drawn as, which the command takes where
+/// it refuses the image. Whether it was replaced.
+pub(crate) fn drawn_marker(m: Marker) -> (Marker, bool) {
+    match m {
+        Marker::Picture(p) if !rustgis_engine::render::picture_marker_draws(p) => (Marker::Circle, true),
+        m => (m, false),
+    }
+}
+
+/// Says how many images an editor couldn't draw and replaced with circles ([`drawn_marker`]) on
+/// the active layer, which the editors set; nothing when there were none.
+pub(crate) fn notify_image_replaced(app: &mut RustGisApp, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let layer = app.session.active_layer.and_then(|id| app.session.map().layer(id)).map(|l| l.name.clone()).unwrap_or_default();
+    let text = crate::i18n::fmt(
+        "Image markers that can't be drawn were replaced by the circles they showed as: {count} on \"{layer}\"",
+        &[("count", &count.to_string()), ("layer", &layer)],
+    );
+    app.session.notify(text, false);
 }
 
 /// The classes a line layer's strokes can be set for, with their legend labels and symbols.
@@ -5731,8 +5769,9 @@ pub(crate) fn stroke_classes(r: &Renderer) -> Vec<(ClassRef, String, Symbol)> {
 }
 
 /// A stroke's markers along the editor's preview line, from `x.0` to `x.1` at `y`, scaled by `k`:
-/// markers as dots (squares as squares), hash marks as ticks, `w` wide. A sketch, not the map's
-/// drawing: other shapes and outlines aren't shown, and inner placements are marked at the middle.
+/// markers as dots (squares as squares, images as themselves, unturned), hash marks as ticks, `w`
+/// wide. A sketch, not the map's drawing: other shapes and outlines aren't shown, and inner
+/// placements are marked at the middle.
 fn marker_preview(ui: &Ui, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: egui::Color32, w: f32) {
     let mut xs = Vec::new();
     if m.at.has(Placements::INTERVAL) {
@@ -5753,7 +5792,13 @@ fn marker_preview(ui: &Ui, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: eg
         xs.push((x.0 + x.1) / 2.0);
     }
     let half = (m.size * k).max(1.0) / 2.0;
+    // An image, looked up once for all its places.
+    let image = if let LineMark::Marker(mark) = m.mark { crate::markerimages::image(ui.ctx(), mark) } else { None };
     for at in xs {
+        if let Some(image) = &image {
+            image.paint(ui.painter(), pos2(at, y), 2.0 * half);
+            continue;
+        }
         match m.mark {
             LineMark::Hash => {
                 let (sin, cos) = m.angle.to_radians().sin_cos();
@@ -5953,6 +5998,152 @@ fn marker_rotation_row(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
     });
 }
 
+/// The field a classified point layer's markers are sized by (`layer.sizeBy`), beside its classes'
+/// colours: none, or one of its number fields, with the values and sizes at the two ends and how
+/// the size grows between them.
+fn size_by_rows(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::map::Layer) {
+    use rustgis_engine::map::symbol_by::{MAX_SIZE, SizeBy, SizeScaling};
+    let cur = l.size_by.as_ref();
+    let pending_id = egui::Id::unique(("size_by_pending", l.instance_id()));
+    let mut pending = ui.data_mut(|d| d.get_temp::<(Option<SizeBy>, SizeBy)>(pending_id));
+    // A command, undo or a completed worker supersedes a draft based on the old mapping.
+    if pending.as_ref().is_some_and(|(base, _)| base.as_ref() != cur) {
+        pending = None;
+    }
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Size by"));
+        let selected = pending.as_ref().map(|(_, by)| by.clone()).or_else(|| cur.cloned());
+        let shown = selected.as_ref().map_or_else(|| tl!("None").to_string(), |s| s.field.clone());
+        egui::ComboBox::from_id_salt(("size_by", l.id))
+            .selected_text(shown)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(selected.is_none(), tl!("None")).clicked() {
+                    pending = None;
+                    if cur.is_some() {
+                        let _ = app.run("layer.sizeBy", json!({"layer": l.id, "field": null}));
+                    }
+                }
+                for f in l.dataset.fields.iter().filter(|f| f.ty.is_numeric()) {
+                    let on = pending.as_ref().map(|(_, by)| by).or(cur).is_some_and(|s| s.field == f.name);
+                    if ui.selectable_label(on, &f.name).clicked() && !on {
+                        pending = if cur.is_some_and(|by| by.field == f.name) {
+                            None
+                        } else {
+                            Some((
+                                cur.cloned(),
+                                SizeBy {
+                                    field: f.name.clone(),
+                                    min: 0.0,
+                                    max: 100.0,
+                                    min_size: cur.map_or(4.0, |by| by.min_size),
+                                    max_size: cur.map_or(24.0, |by| by.max_size),
+                                    scaling: cur.map_or(SizeScaling::Area, |by| by.scaling),
+                                },
+                            ))
+                        };
+                    }
+                }
+            })
+            .response
+            .on_hover_text(tl!("Size each point by a number field, keeping its class's colours"))
+            .labelled_by(input_label.id);
+    });
+    let is_pending = pending.is_some();
+    let Some(mut by) = pending.as_ref().map(|(_, by)| by.clone()).or_else(|| cur.cloned()) else {
+        ui.data_mut(|d| d.remove::<(Option<SizeBy>, SizeBy)>(pending_id));
+        return;
+    };
+    let field = by.field.clone();
+    let set = |app: &mut RustGisApp, resp: &egui::Response, p: Value| {
+        if !is_pending && crate::widgets::changed(resp) {
+            crate::widgets::one_step_per_press(app, resp);
+            let mut params = json!({"layer": l.id, "field": field});
+            if let (Some(params), Some(p)) = (params.as_object_mut(), p.as_object()) {
+                params.extend(p.clone());
+            }
+            let _ = app.run("layer.sizeBy", params);
+        }
+    };
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Values"));
+        let resp = ui.add(egui::DragValue::new(&mut by.min).update_while_editing(false).speed(0.1)).labelled_by(input_label.id);
+        set(app, &resp, json!({"min": by.min}));
+        ui.label(tl!("to"));
+        let resp = ui.add(egui::DragValue::new(&mut by.max).update_while_editing(false).speed(0.1)).labelled_by(input_label.id);
+        set(app, &resp, json!({"max": by.max}));
+    });
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Sizes"));
+        let resp = ui
+            .add(egui::DragValue::new(&mut by.min_size).update_while_editing(false).range(0.0..=MAX_SIZE).suffix(" pt"))
+            .labelled_by(input_label.id);
+        set(app, &resp, json!({"minSize": by.min_size}));
+        ui.label(tl!("to"));
+        let resp = ui
+            .add(egui::DragValue::new(&mut by.max_size).update_while_editing(false).range(0.0..=MAX_SIZE).suffix(" pt"))
+            .labelled_by(input_label.id);
+        set(app, &resp, json!({"maxSize": by.max_size}));
+    });
+    ui.horizontal(|ui| {
+        let input_label = ui.label(tl!("Scaling"));
+        let name = |k: SizeScaling| match k {
+            SizeScaling::Area => tl!("By area"),
+            SizeScaling::Radius => tl!("By radius"),
+        };
+        egui::ComboBox::from_id_salt(("size_by_scaling", l.id))
+            .selected_text(name(by.scaling))
+            .show_ui(ui, |ui| {
+                for k in [SizeScaling::Area, SizeScaling::Radius] {
+                    if ui.selectable_label(by.scaling == k, name(k)).clicked() && by.scaling != k {
+                        if is_pending {
+                            by.scaling = k;
+                        } else {
+                            let _ = app.run("layer.sizeBy", json!({"layer": l.id, "field": by.field, "scaling": k.code()}));
+                        }
+                    }
+                }
+            })
+            .response
+            .on_hover_text(tl!("By area: a value twice another draws a marker of about twice the area. By radius: twice the size."))
+            .labelled_by(input_label.id);
+    });
+    let mut keep_pending = is_pending;
+    if is_pending {
+        ui.horizontal(|ui| {
+            // Once asked, the scan is under way with its own Cancel (the status bar's): the draft
+            // closes, so its Cancel can't look like it stops the scan.
+            if ui.button(tl!("Use field range")).clicked()
+                && app
+                    .run(
+                        "layer.sizeBy",
+                        json!({"layer": l.id, "field": by.field,
+                        "minSize": by.min_size, "maxSize": by.max_size, "scaling": by.scaling.code()}),
+                    )
+                    .is_ok()
+            {
+                keep_pending = false;
+            }
+            if ui.add_enabled(by.min.is_finite() && by.max.is_finite() && by.max > by.min, egui::Button::new(tl!("Apply"))).clicked() {
+                let _ = app.run(
+                    "layer.sizeBy",
+                    json!({"layer": l.id, "field": by.field, "min": by.min, "max": by.max,
+                    "minSize": by.min_size, "maxSize": by.max_size, "scaling": by.scaling.code()}),
+                );
+            }
+            if ui.button(tl!("Cancel")).clicked() {
+                keep_pending = false;
+            }
+        });
+    }
+    ui.data_mut(|d| {
+        if keep_pending {
+            d.insert_temp(pending_id, (cur.cloned(), by));
+        } else {
+            d.remove::<(Option<SizeBy>, SizeBy)>(pending_id);
+        }
+    });
+}
+
 /// The By Expression section: the symbol's size, colors, outline width and (on points) angle per
 /// feature, each from an expression (`layer.symbolBy`). An expression applies when its box loses
 /// focus; one that doesn't read shows why as it is typed, and stays in its box unapplied until
@@ -6105,12 +6296,7 @@ fn line_strokes_editor(app: &mut RustGisApp, ui: &mut Ui, l: &rustgis_engine::ma
                 } else {
                     (tl!("Add Stroke"), tl!("Stack another stroke on top"))
                 };
-                // A point's first mark is its symbol's marker and later ones copy the top one; no mark
-                // can be an image yet (a file's is kept, but not edited).
-                let image = (points && strokes.is_empty() && matches!(base.marker, Marker::Picture(_)))
-                    || rustgis_engine::map::symbology::strokes_have_pictures(&strokes, |_| true);
-                let add = ui.add_enabled(strokes.len() < MAX_STROKES && !image, egui::Button::new(label).small());
-                let add = if image { add.on_disabled_hover_text(tl!("An image marker takes no marks yet")) } else { add };
+                let add = ui.add_enabled(strokes.len() < MAX_STROKES, egui::Button::new(label).small());
                 if add.on_hover_text(tip).clicked() {
                     let mut next = strokes.clone();
                     // The first stroke stands for the symbol's own; later ones copy the top one. A
@@ -7404,6 +7590,101 @@ pub(crate) fn layout_menu(app: &mut RustGisApp, ui: &mut Ui, n: &str) {
 mod tests {
     use super::*;
 
+    /// A point layer given an image by `layer.marker` shows it in its patch (the Layers row and the
+    /// symbol editor's swatch), and a stroke's image marker shows on the stroke editor's line, not
+    /// circles (#2266).
+    #[test]
+    fn a_picture_marker_shows_in_its_patch() {
+        let png =
+            "iVBORw0KGgoAAAANSUhEUgAAABgAAAAMCAYAAAB4MH11AAAAIElEQVR4nGO4ICPznxQsE3OBJMwwasGoBaMWjFpAGAMALk9r//PjorkAAAAASUVORK5CYII=";
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.marker", json!({"layer": "Cities", "image": png, "size": 14})).unwrap();
+        let l = app.session.map().layer_by_name("Cities").unwrap();
+        let (s, g) = (l.renderer.base_symbol(), l.geometry_type());
+        let ctx = egui::Context::default();
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(18.0, 14.0));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| patch(ui.painter(), r, &s, g));
+        // The image alone: one mesh on its own texture (not the font atlas's), and no circle.
+        let image = |c: &egui::epaint::ClippedShape| matches!(&c.shape, egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default());
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes.iter().all(image));
+        // On the stroke editor's line: once at its middle, once more at each end.
+        let one = LineMarkers { mark: LineMark::Marker(s.marker), size: 12.0, at: Placements::MIDDLE, ..LineMarkers::default() };
+        let ends = LineMarkers { at: Placements::VERTICES, ..one };
+        for (m, n) in [(one, 1), (ends, 2)] {
+            let line = |ui: &mut Ui| marker_preview(ui, &m, (0.0, 80.0), 7.0, 1.0, egui::Color32::RED, 1.0);
+            let shapes = ctx.run_ui(egui::RawInput::default(), line).shapes;
+            assert_eq!((shapes.len(), shapes.iter().all(image)), (n, true), "{:?}", m.at);
+        }
+        // (Its texture's upload isn't handed to a renderer here.)
+        out.textures_delta.clear();
+    }
+
+    /// The stroke and fill editors send an image back with every change, so it is kept; one that
+    /// can't be drawn (a file's, not kept or not an image) becomes the circle it showed as, which
+    /// is said, rather than every change being refused (#2266).
+    #[test]
+    fn the_editors_keep_an_image_and_replace_one_that_cannot_be_drawn() {
+        use base64::Engine;
+        use rustgis_engine::map::Picture;
+        use rustgis_engine::map::fills::{FillLayer, FillPattern};
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(6, 3, image::Rgba([10, 120, 230, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let image = Marker::Picture(Picture::new(&base64::engine::general_purpose::STANDARD.encode(&png)));
+        let broken = Marker::Picture(Picture::new("bm90IGFuIGltYWdl"));
+        let dropped = Marker::Picture(Picture::read(&"A".repeat(rustgis_engine::map::symbology::MAX_PICTURE_BYTES + 4)));
+        assert!(matches!(dropped, Marker::Picture(p) if p.is_dropped()));
+        let mut app = RustGisApp::with_sample();
+        // The notices of replaced images since `mark`, one per change, with how many and where.
+        let said = |app: &RustGisApp, mark| -> Vec<String> {
+            app.session
+                .notices_since(mark)
+                .iter()
+                .filter(|n| n.text.contains("replaced by the circles") && !n.error)
+                .map(|n| n.text.clone())
+                .collect()
+        };
+        let marks = |shape| LineMarkers { mark: LineMark::Marker(shape), size: 9.0, ..LineMarkers::default() };
+        let stroke = |shape| LineStroke { markers: Some(marks(shape)), ..LineStroke::default() };
+        for layer in ["Rivers", "Cities"] {
+            app.session.active_layer = app.session.map().layer_by_name(layer).map(|l| l.id);
+            let strokes = |app: &RustGisApp| app.session.map().layer_by_name(layer).unwrap().line_strokes.clone();
+            let mark = app.session.notice_mark();
+            set_strokes(&mut app, None, &[stroke(image)]);
+            assert_eq!(strokes(&app), [stroke(image)], "{layer}: kept");
+            assert!(said(&app, mark).is_empty());
+            let mark = app.session.notice_mark();
+            set_strokes(&mut app, None, &[stroke(broken), stroke(dropped), stroke(image)]);
+            assert_eq!(strokes(&app), [stroke(Marker::Circle), stroke(Marker::Circle), stroke(image)], "{layer}");
+            assert_eq!(
+                said(&app, mark),
+                [format!("Image markers that can't be drawn were replaced by the circles they showed as: 2 on \"{layer}\"")]
+            );
+        }
+        app.session.active_layer = app.session.map().layer_by_name("Countries").map(|l| l.id);
+        let dots = |marker| FillLayer {
+            color: None,
+            pattern: FillPattern::Dots {
+                marker,
+                size: 5.0,
+                outline: None,
+                outline_width: 0.0,
+                spacing: [9.0, 9.0],
+                displacement: [0.0, 0.0],
+                offset: [0.0, 0.0],
+            },
+        };
+        let fills = |app: &RustGisApp| app.session.map().layer_by_name("Countries").unwrap().fill_layers.clone();
+        crate::fill_editor::set_fills(&mut app, None, &[dots(image)]);
+        assert_eq!(fills(&app), [dots(image)]);
+        let mark = app.session.notice_mark();
+        crate::fill_editor::set_fills(&mut app, None, &[dots(broken), dots(image)]);
+        assert_eq!(fills(&app), [dots(Marker::Circle), dots(image)]);
+        assert_eq!(said(&app, mark), ["Image markers that can't be drawn were replaced by the circles they showed as: 1 on \"Countries\""]);
+    }
+
     /// Find Tools finds a tool by what it shows in the interface's language as well as by its
     /// English name and id, without minding case or accents (#2224).
     #[test]
@@ -8337,6 +8618,42 @@ mod tests {
         assert!(h.query_by_label("No Fill").is_some());
     }
 
+    /// A size field with no usable automatic range still exposes bounds and can be applied,
+    /// without changing the layer until Apply is clicked.
+    #[test]
+    fn size_fields_with_constant_or_missing_values_can_be_configured() {
+        use egui_kittest::kittest::Queryable;
+        for value in [rustgis_engine::data::Value::Float(5.0), rustgis_engine::data::Value::Null] {
+            let mut app = RustGisApp::with_sample();
+            let id = layer(&app, "Cities");
+            app.run("layer.symbology", json!({"layer": id, "type": "unique", "field": "name"})).unwrap();
+            let l = app.session.map_mut().layer_mut(id).unwrap();
+            let field = l.dataset.field_index("pop_max").unwrap();
+            for feature in l.dataset.features.iter_mut() {
+                feature.attrs[field] = value.clone();
+            }
+            let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 400.0)).with_max_steps(64).build_ui_state(
+                move |ui, app: &mut RustGisApp| {
+                    let l = app.session.map().layer(id).unwrap().clone();
+                    size_by_rows(app, ui, &l);
+                },
+                app,
+            );
+            h.run_steps(3);
+            h.query_all_by_role(egui::accesskit::Role::ComboBox).find(|n| n.value().as_deref() == Some("None")).unwrap().click();
+            h.run_steps(3);
+            h.get_by_label("pop_max").click();
+            h.run_steps(3);
+            let bounds: Vec<_> = h.query_all_by_label("Values").filter_map(|n| n.value()).collect();
+            assert_eq!(bounds, ["0.0", "100.0"]);
+            assert!(h.state().session.map().layer(id).unwrap().size_by.is_none());
+            h.get_by_label("Apply").click();
+            h.run_steps(3);
+            let by = h.state().session.map().layer(id).unwrap().size_by.as_ref().unwrap();
+            assert_eq!((by.field.as_str(), by.min, by.max), ("pop_max", 0.0, 100.0));
+        }
+    }
+
     fn symbology_retry_harness() -> egui_kittest::Harness<'static, RustGisApp> {
         let mut app = RustGisApp::new(Session::new(rustgis_engine::Project::default()));
         app.run(
@@ -8594,11 +8911,22 @@ mod tests {
         let old = Rgba::new(0x4D, 0x4D, 0x4D, 0);
         let mut hsva = egui::ecolor::Hsva::from_srgb([200, 30, 40]);
         hsva.a = 0.0;
-        let picked = picked_colour(hsva, 0.0, old);
+        let mut shown = egui::ecolor::Hsva::from_srgb([0x4D, 0x4D, 0x4D]);
+        shown.a = 0.0;
+        let picked = crate::widgets::picked_colour(hsva, shown, old);
         assert_eq!((picked.r(), picked.g(), picked.b(), picked.a()), (200, 30, 40, 0), "the RGB picked at zero opacity is kept");
         let mut raised = egui::ecolor::Hsva::from_srgb([200, 30, 40]);
         raised.a = 1.0;
-        assert_eq!(picked_colour(raised, 0.0, picked), picked.with_alpha(255), "raising the opacity shows it");
+        assert_eq!(crate::widgets::picked_colour(raised, hsva, picked), picked.with_alpha(255), "raising the opacity shows it");
+        // A new colour and opacity in the same frame (two accessibility requests) keep both.
+        let red = Rgba::new(255, 0, 0, 255);
+        let mut before = egui::ecolor::Hsva::from_srgb([255, 0, 0]);
+        before.a = 1.0;
+        let mut blue = egui::ecolor::Hsva::from_srgb([0, 0, 255]);
+        blue.a = 0.5;
+        let both = crate::widgets::picked_colour(blue, before, red);
+        assert_eq!((both.r(), both.g(), both.b()), (0, 0, 255), "the new colour is kept with the new opacity");
+        assert!(both.a() > 0 && both.a() < 255, "and the new opacity: {}", both.a());
     }
 
     /// The Unique Values list shows as many classes as can be drawn from a QGIS rule style

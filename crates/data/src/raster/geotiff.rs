@@ -196,7 +196,8 @@ fn geo_tags_with_keys<R: Read + Seek>(dec: &mut Decoder<R>, keys: &[u16]) -> Res
     let gascii = dec.find_tag(Tag::Unknown(34737)).ok().flatten().and_then(|v| v.into_string().ok()).unwrap_or_default();
     // A projected file with a user-defined projection (the NLCD's Albers, say) defines it in its
     // keys: read as its own system, never as the geographic system it's based on.
-    let user_defined = key(1024) == Some(1) && key(3072).is_none_or(|c| !usable(&c));
+    // So is one in an ESRI PE citation, which GDAL writes with a user-defined model type (32767).
+    let user_defined = (key(1024) == Some(1) && key(3072).is_none_or(|c| !usable(&c))) || key(1024) == Some(32767);
     let citation = |k: u16| match geokey(keys, &gdoubles, &gascii, k) {
         Some(KeyValue::Ascii(t)) if !t.trim().is_empty() => Some(t),
         _ => None,
@@ -216,17 +217,23 @@ fn geo_tags_with_keys<R: Read + Seek>(dec: &mut Decoder<R>, keys: &[u16]) -> Res
     // A projection the keys don't describe well enough is left unknown (the open goes on, and fails
     // later only if the coordinates aren't degrees), its reason kept for the message.
     let mut custom_error = None;
+    let by_code = || {
+        let code = key(3072).filter(usable).or(key(2048).filter(usable)).map(u32::from);
+        (code, code.and_then(Crs::from_epsg))
+    };
     let (code, crs) = if user_defined {
         match custom_crs(keys, &gdoubles, &gascii) {
             Ok(crs) => (None, Some(crs)),
+            // A user-defined model type whose keys can't be read, but that names a code, is read
+            // by the code, as before.
+            Err(_) if key(1024) == Some(32767) && by_code().1.is_some() => by_code(),
             Err(e) => {
                 custom_error = Some(e.to_string());
                 (None, None)
             }
         }
     } else {
-        let code = key(3072).filter(usable).or(key(2048).filter(usable)).map(u32::from);
-        (code, code.and_then(Crs::from_epsg))
+        by_code()
     };
     // Another body's system ([`super::planetary`]). A geographic one is its own system, not WGS 84:
     // its longitude/latitude are read as they are, and a GeoTIFF written from it keeps its keys.
@@ -412,6 +419,47 @@ fn axis_unit(keys: &[u16], doubles: &[f64], ascii: &str, a: f64) -> Option<f64> 
     }
 }
 
+/// The keys and double parameters with the ellipsoid's axes in metres ([`axis_unit`]), as GDAL
+/// 3.10 doesn't read them: it takes them for metres whatever GeogLinearUnits says, so the Earth's
+/// semi-major axis in feet would be another body's. Axes in a unit the keys don't size are an error.
+fn axes_in_metres(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<(Vec<u16>, Vec<f64>)> {
+    // The axes are read from the file's values, not from the slots added below.
+    let original = doubles;
+    let (mut keys, mut doubles) = (keys.to_vec(), doubles.to_vec());
+    let Some(KeyValue::Double(a)) = geokey(&keys, &doubles, ascii, 2057) else { return Ok((keys, doubles)) };
+    let to_m = axis_unit(&keys, &doubles, ascii, a).ok_or_else(|| {
+        let unit = match geokey(&keys, &doubles, ascii, 2052) {
+            Some(KeyValue::Short(u)) => format!(" (GeogLinearUnits {u})"),
+            _ => String::new(),
+        };
+        err(format!("the file's ellipsoid axes are in a unit{unit} that isn't supported"))
+    })?;
+    if to_m != 1.0 {
+        // GeogSemiMajorAxis and GeogSemiMinorAxis, each in metres in a value of its own after the
+        // others (keys may share one value, which would be converted twice, or another key's),
+        // then GeogLinearUnits as metres.
+        for entry in keys.get_mut(4..).into_iter().flat_map(|k| k.as_chunks_mut::<4>().0) {
+            match entry {
+                [2057 | 2058, 34736, _, offset] => {
+                    // An axis whose value is missing would stay in its unit, read as metres.
+                    let metres = original
+                        .get(usize::from(*offset))
+                        .map(|v| v * to_m)
+                        .ok_or_else(|| err("the file's ellipsoid axis points past its double parameters"))?;
+                    // A slot past the last a key can address: the axes can't be put in metres.
+                    let at = u16::try_from(doubles.len())
+                        .map_err(|_| err("the file's ellipsoid axes can't be converted to metres: too many double parameters"))?;
+                    doubles.push(metres);
+                    *offset = at;
+                }
+                [2052, 0, _, value] => *value = 9001,
+                _ => {}
+            }
+        }
+    }
+    Ok((keys, doubles))
+}
+
 /// The semi-major and semi-minor axes, in metres, of the ellipsoid a file's keys give by its axes
 /// (GeogSemiMajorAxis with GeogSemiMinorAxis or GeogInvFlattening, in GeogLinearUnits), when it is
 /// another body's than the Earth's ([`super::planetary`]).
@@ -483,237 +531,81 @@ fn planetary_geographic(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<Op
         geokeys: keys.to_vec(),
         doubles: doubles.to_vec(),
         ascii: ascii.to_string(),
+        wkt: None,
     };
     Crs::custom(def).map(Some).map_err(err)
 }
 
-/// A user-defined projection from a file's GeoKeys, as a PROJ definition.
+/// A user-defined projection from a file's GeoKeys, as terrio-crs reads them (GDAL's
+/// `GTIFGetOGISDefnAsOSR`, ESRI PE citations included), kept by its WKT. One the keys say is an
+/// EPSG system RustGIS knows (a UTM zone by its citation) is that system.
 fn custom_crs(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<Crs> {
-    let (proj4, label) = proj4_of_keys(keys, doubles, ascii)?;
-    Crs::custom(CustomCrs { proj4, label, geokeys: keys.to_vec(), doubles: doubles.to_vec(), ascii: ascii.to_string() }).map_err(err)
-}
-
-/// A user-defined projection's PROJ definition and name, from its GeoKeys.
-fn proj4_of_keys(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<(String, String)> {
-    let short = |k| match geokey(keys, doubles, ascii, k) {
-        Some(KeyValue::Short(v)) => Some(v),
-        _ => None,
+    let (in_metres, metres) = axes_in_metres(keys, doubles, ascii)?;
+    let read = terrio_crs::geokeys::read(&in_metres, &metres, ascii.as_bytes());
+    let sr = match (read.crs, read.unsupported_method) {
+        (Some(sr), _) => sr,
+        (None, Some(c)) => return Err(err(format!("the file's own projection (coordinate transformation {c}) isn't supported"))),
+        (None, None) => return Err(err("the file's own projection isn't described in its keys")),
     };
-    let num = |k| match geokey(keys, doubles, ascii, k) {
-        Some(KeyValue::Double(v)) if v.is_finite() => Some(v),
-        _ => None,
-    };
+    // Not when the keys give a shift of their own (an ESRI PE citation's TOWGS84): that would be
+    // set aside for the code's, as a WKT with its own shift isn't read as the code beside it.
+    let own_shift = sr.to_wkt().is_some_and(|w| shift_differs(&w, sr.epsg));
+    if let Some(crs) = sr.epsg.filter(|_| !own_shift).and_then(Crs::from_epsg) {
+        return Ok(crs);
+    }
     let text = |k| match geokey(keys, doubles, ascii, k) {
-        Some(KeyValue::Ascii(s)) => Some(s),
+        Some(KeyValue::Ascii(s)) if !s.trim().is_empty() => Some(s),
         _ => None,
     };
-    // The first of several keys a parameter may be given by.
-    let any = |ks: &[u16]| ks.iter().find_map(|k| num(*k));
-    // Metres per linear unit: false eastings and northings are in the file's units, PROJ's in
-    // metres.
-    let (to_m, units) = match short(3076) {
-        Some(9002) => (0.3048, "+units=ft".to_string()),
-        Some(9003) => (1200.0 / 3937.0, "+units=us-ft".to_string()),
-        _ => match num(3077) {
-            Some(m) if m > 0.0 && (m - 1.0).abs() > 1e-12 => (m, format!("+to_meter={m}")),
-            _ => (1.0, "+units=m".to_string()),
-        },
-    };
-    let lat0 = any(&[3081, 3085, 3089]).unwrap_or(0.0);
-    let lon0 = any(&[3080, 3084, 3088, 3095]).unwrap_or(0.0);
-    let x0 = any(&[3082, 3086, 3090]).unwrap_or(0.0) * to_m;
-    let y0 = any(&[3083, 3087, 3091]).unwrap_or(0.0) * to_m;
-    let k0 = any(&[3092, 3093]).unwrap_or(1.0);
-    let (lat1, lat2) = (num(3078).unwrap_or(lat0), num(3079).unwrap_or(lat0));
-    let proj = match short(3075) {
-        Some(1) => format!("+proj=tmerc +lat_0={lat0} +lon_0={lon0} +k_0={k0} +x_0={x0} +y_0={y0}"),
-        Some(7) => format!("+proj=merc +lon_0={lon0} +k_0={k0} +x_0={x0} +y_0={y0}"),
-        Some(8) => format!("+proj=lcc +lat_1={lat1} +lat_2={lat2} +lat_0={lat0} +lon_0={lon0} +x_0={x0} +y_0={y0}"),
-        Some(9) => format!("+proj=lcc +lat_1={lat0} +lat_0={lat0} +lon_0={lon0} +k_0={k0} +x_0={x0} +y_0={y0}"),
-        Some(10) => format!("+proj=laea +lat_0={lat0} +lon_0={lon0} +x_0={x0} +y_0={y0}"),
-        Some(11) => format!("+proj=aea +lat_1={lat1} +lat_2={lat2} +lat_0={lat0} +lon_0={lon0} +x_0={x0} +y_0={y0}"),
-        Some(12) => format!("+proj=aeqd +lat_0={lat0} +lon_0={lon0} +x_0={x0} +y_0={y0}"),
-        Some(14) => format!("+proj=stere +lat_0={lat0} +lon_0={lon0} +k_0={k0} +x_0={x0} +y_0={y0}"),
-        Some(15) => {
-            // Polar: the pole on the side of the latitude of true scale.
-            let pole = if lat0 < 0.0 { -90.0 } else { 90.0 };
-            format!("+proj=stere +lat_0={pole} +lat_ts={lat0} +lon_0={lon0} +k_0={k0} +x_0={x0} +y_0={y0}")
-        }
-        Some(16) => format!("+proj=sterea +lat_0={lat0} +lon_0={lon0} +k_0={k0} +x_0={x0} +y_0={y0}"),
-        Some(17) => format!("+proj=eqc +lat_ts={lat1} +lon_0={lon0} +x_0={x0} +y_0={y0}"),
-        // CT_Orthographic: EPSG's method 9840, on the ellipsoid.
-        Some(21) => format!("+proj=ortho +lat_0={lat0} +lon_0={lon0} +x_0={x0} +y_0={y0}"),
-        // CT_Robinson.
-        Some(23) => format!("+proj=robin +lon_0={lon0} +x_0={x0} +y_0={y0}"),
-        // MODIS's grid.
-        Some(24) => format!("+proj=sinu +lon_0={lon0} +x_0={x0} +y_0={y0}"),
-        Some(28) => format!("+proj=cea +lat_ts={lat1} +lon_0={lon0} +x_0={x0} +y_0={y0}"),
-        Some(c) => return Err(err(format!("the file's own projection (coordinate transformation {c}) isn't supported"))),
-        None => return Err(err("the file's own projection isn't described in its keys")),
-    };
-    // The datum or ellipsoid, by code or by its axes, in metres.
-    let earth = match (short(2048), short(2050), short(2056)) {
-        (Some(4326), _, _) | (_, Some(6326), _) | (_, _, Some(7030)) => "+datum=WGS84".to_string(),
-        (Some(4269), _, _) | (_, Some(6269), _) | (_, _, Some(7019)) => "+ellps=GRS80 +towgs84=0,0,0".to_string(),
-        (Some(4267), _, _) | (_, Some(6267), _) | (_, _, Some(7008)) => "+ellps=clrk66".to_string(),
-        _ => {
-            // Axes in a unit the keys don't size can't be taken for metres: the ellipsoid, and so
-            // every cell, would be another size.
-            let axis_m = match num(2057) {
-                Some(a) => axis_unit(keys, doubles, ascii, a).ok_or_else(|| {
-                    let unit = short(2052).map(|u| format!(" (GeogLinearUnits {u})")).unwrap_or_default();
-                    err(format!("the file's ellipsoid axes are in a unit{unit} that isn't supported"))
-                })?,
-                None => 1.0,
-            };
-            match (num(2057).map(|a| a * axis_m), num(2059), num(2058).map(|b| b * axis_m)) {
-                (Some(a), Some(rf), _) if a > 0.0 && rf > 0.0 => format!("+a={a} +rf={rf}"),
-                (Some(a), _, Some(b)) if a > 0.0 && b > 0.0 => format!("+a={a} +b={b}"),
-                // Another body's sphere (no flattening, or 0): not WGS 84, which would read its
-                // metres as the Earth's ([`super::planetary`]).
-                (Some(a), rf, None) if super::planetary::off_earth(a) && rf.is_none_or(|rf| rf == 0.0) => format!("+a={a} +b={a}"),
-                _ => "+datum=WGS84".to_string(),
-            }
-        }
-    };
-    let label = text(3073).or_else(|| text(1026)).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "Custom projection".into());
-    Ok((format!("{proj} {earth} {units} +no_defs"), label))
+    let label = text(3073).or_else(|| text(1026)).or_else(|| sr.name()).unwrap_or_else(|| "Custom projection".into());
+    let wkt = sr.to_wkt().ok_or_else(|| err("the file's own projection has no definition"))?;
+    // Where PROJ writes no string, the one RustGIS wrote before, as for WKT, so a project saved
+    // with the system still opens in an older release.
+    let proj4 = sr.to_proj4().map(|d| d.replace(" +type=crs", "")).or_else(|| super::wkt::legacy_proj4(&wkt)).unwrap_or_default();
+    Crs::custom(CustomCrs { proj4, label, geokeys: keys.to_vec(), doubles: doubles.to_vec(), ascii: ascii.to_string(), wkt: Some(wkt) })
+        .map_err(err)
 }
 
-/// Whether two PROJ definitions place the same points: points around the projection's origin,
-/// unprojected by both, land within a centimetre.
-fn same_projection(a: &str, b: &str) -> bool {
-    let offsets = [(0.0, 0.0), (100_000.0, 50_000.0), (-250_000.0, 150_000.0), (300_000.0, -200_000.0), (-50_000.0, -400_000.0)];
-    let (Ok(ta), Ok(tb)) = (super::crs::transformer_of(a), super::crs::transformer_of(b)) else { return false };
-    // The same map points in both, offset from the first's false origin, so a different false
-    // origin is a different projection.
-    let num = |k: &str| a.split_whitespace().find_map(|t| t.strip_prefix(k)?.parse::<f64>().ok()).filter(|v| v.is_finite()).unwrap_or(0.0);
-    let (x0, y0) = (num("+x_0="), num("+y_0="));
-    offsets.iter().all(|(dx, dy)| {
-        let m = rustgis_geom::Coord::new(x0 + dx, y0 + dy);
-        // Degrees: 1e-7 is about a centimetre.
-        matches!((ta.to_lonlat(m), tb.to_lonlat(m)), (Some(p), Some(q)) if (p.x - q.x).abs() < 1e-7 && (p.y - q.y).abs() < 1e-7)
-    })
+/// Whether WKT `wkt` gives a shift of its own (a `TOWGS84`, a `BOUNDCRS`) that places points
+/// otherwise than the EPSG `code` it is identified as ([`super::wkt::places_as`]); a shift equal to
+/// the code's is the code.
+fn shift_differs(wkt: &str, code: Option<u32>) -> bool {
+    let upper: String = wkt.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_uppercase();
+    (upper.contains("TOWGS84[") || upper.contains("BOUNDCRS["))
+        && code.and_then(Crs::from_epsg).is_none_or(|c| !super::wkt::places_as(wkt, c))
 }
 
 /// Whether a raster in `crs` can be written as a GeoTIFF: an EPSG system always, a user-defined
-/// one when it came with GeoKeys or its PROJ definition can be said as them (see
-/// [`keys_from_proj4`]).
+/// one when it came with GeoKeys or can be written as them (see [`terrio_keys`]).
 pub fn describes(crs: Crs) -> bool {
-    crs.custom_def().is_none_or(|d| !d.geokeys.is_empty() || keys_from_proj4(&d.proj4, &d.label).is_some())
+    crs.custom_def().is_none_or(|d| !d.geokeys.is_empty() || terrio_keys(&d).is_some())
 }
 
-/// GeoKeys for a user-defined projection from its PROJ definition (one read from WKT, which
-/// came with no keys), the inverse of [`custom_crs`]: the key directory, its double parameters and
-/// its ASCII parameters. `None` for a projection the keys can't say.
-fn keys_from_proj4(proj4: &str, label: &str) -> Option<(Vec<u16>, Vec<f64>, String)> {
-    let params: Vec<(&str, &str)> = proj4.split_whitespace().take(64).filter_map(|t| t.trim_start_matches('+').split_once('=')).collect();
-    let get = |k: &str| params.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
-    // The keys are written in metres: a definition in other units isn't written.
-    if get("units").is_some_and(|u| u != "m") || get("to_meter").is_some() {
-        return None;
-    }
-    // Nor one with a parameter they can't say (a datum shift, a prime meridian, an axis order,
-    // grids): it would be written as another projection.
-    const SAID: [&str; 16] =
-        ["proj", "lat_0", "lon_0", "lat_1", "lat_2", "lat_ts", "x_0", "y_0", "k_0", "k", "datum", "ellps", "a", "b", "R", "rf"];
-    let tokens = proj4.split_whitespace().map(|t| t.trim_start_matches('+'));
-    if tokens.map(|t| t.split('=').next().unwrap_or(t)).any(|k| !SAID.contains(&k) && !matches!(k, "units" | "no_defs" | "type" | "wktext"))
-    {
-        return None;
-    }
-    // A latitude of true scale is said only for the projections that take one.
-    // A scale factor only for the projections whose keys carry one.
-    let scaled = get("k_0").or(get("k")).and_then(|v| v.parse::<f64>().ok()).is_some_and(|k| (k - 1.0).abs() > 1e-12);
-    if scaled && !matches!(get("proj"), Some("tmerc" | "merc" | "lcc" | "stere" | "sterea")) {
-        return None;
-    }
-    let polar = get("lat_0").and_then(|v| v.parse::<f64>().ok()).is_some_and(|l| l.abs() == 90.0);
-    if get("lat_ts").is_some() && !(matches!(get("proj"), Some("eqc" | "cea")) || (get("proj") == Some("stere") && polar)) {
-        return None;
-    }
-    let num = |k: &str| get(k).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite());
-    let (lat0, lon0) = (num("lat_0").unwrap_or(0.0), num("lon_0").unwrap_or(0.0));
-    let (x0, y0, k0) = (num("x_0").unwrap_or(0.0), num("y_0").unwrap_or(0.0), num("k_0").or(num("k")).unwrap_or(1.0));
-    // The transformation, and its parameters by key (in metres and degrees).
-    let (ct, mut doubles_by_key): (u16, Vec<(u16, f64)>) = match get("proj")? {
-        "tmerc" => (1, vec![(3080, lon0), (3081, lat0), (3082, x0), (3083, y0), (3092, k0)]),
-        "merc" => (7, vec![(3080, lon0), (3082, x0), (3083, y0), (3092, k0)]),
-        // Two standard parallels (CT 8) carry no scale factor: one that isn't 1 is said by the
-        // one-parallel form (CT 9), when the parallels are one, or not at all.
-        "lcc" => {
-            let lat1 = num("lat_1").unwrap_or(lat0);
-            match num("lat_2") {
-                Some(lat2) if (k0 - 1.0).abs() < 1e-12 => {
-                    (8, vec![(3078, lat1), (3079, lat2), (3084, lon0), (3085, lat0), (3086, x0), (3087, y0)])
-                }
-                Some(lat2) if (lat2 - lat1).abs() > 1e-12 => return None,
-                // The one-parallel form's latitude is both the parallel and the origin's.
-                _ if (lat1 - lat0).abs() > 1e-12 => return None,
-                _ => (9, vec![(3080, lon0), (3081, lat1), (3082, x0), (3083, y0), (3092, k0)]),
-            }
-        }
-        "laea" => (10, vec![(3080, lon0), (3081, lat0), (3082, x0), (3083, y0)]),
-        "aea" => (
-            11,
-            vec![
-                (3078, num("lat_1").unwrap_or(lat0)),
-                (3079, num("lat_2").unwrap_or(lat0)),
-                (3084, lon0),
-                (3085, lat0),
-                (3086, x0),
-                (3087, y0),
-            ],
-        ),
-        "aeqd" => (12, vec![(3080, lon0), (3081, lat0), (3082, x0), (3083, y0)]),
-        // Polar: the latitude of true scale is the key's latitude.
-        // Its longitude is the straight vertical pole's (3095), as GDAL writes it.
-        "stere" if lat0.abs() == 90.0 => {
-            (15, vec![(3081, num("lat_ts").unwrap_or(lat0)), (3082, x0), (3083, y0), (3092, k0), (3095, lon0)])
-        }
-        "stere" => (14, vec![(3080, lon0), (3081, lat0), (3082, x0), (3083, y0), (3092, k0)]),
-        "sterea" => (16, vec![(3080, lon0), (3081, lat0), (3082, x0), (3083, y0), (3092, k0)]),
-        "eqc" => (17, vec![(3078, num("lat_ts").unwrap_or(0.0)), (3080, lon0), (3082, x0), (3083, y0)]),
-        // By the projection centre's keys (3088, 3089), as GDAL writes them.
-        "ortho" => (21, vec![(3082, x0), (3083, y0), (3088, lon0), (3089, lat0)]),
-        "robin" => (23, vec![(3082, x0), (3083, y0), (3088, lon0)]),
-        "cea" => (28, vec![(3078, num("lat_ts").unwrap_or(0.0)), (3080, lon0), (3082, x0), (3083, y0)]),
-        // Its longitude is the projection centre's (3088), as GDAL and MODIS write it.
-        "sinu" => (24, vec![(3082, x0), (3083, y0), (3088, lon0)]),
-        _ => return None,
+/// GeoKeys for a user-defined system as GDAL 3.12.1 writes them (terrio-crs's
+/// `SpatialRef::to_geokeys`): from its WKT, else its PROJ definition; a system the keys can't
+/// hold goes in an ESRI PE citation. The key directory (with the raster type as area), its
+/// double parameters and its ASCII parameters; `None` when it can't be written at all.
+fn terrio_keys(d: &CustomCrs) -> Option<(Vec<u16>, Vec<f64>, String)> {
+    // A system with a shift of its own keeps it: terrio-crs writes its own keys or its declared
+    // code with GeogTOWGS84GeoKey (2062), never a code it is only identified as.
+    let sr = match &d.wkt {
+        Some(w) => terrio_crs::SpatialRef::from_wkt(w),
+        None => terrio_crs::SpatialRef::from_proj4(&format!("{} +type=crs", d.proj4)).ok()?,
     };
-    // The earth: WGS 84 by code, any other by its axes.
-    let mut shorts: Vec<(u16, u16)> = vec![(1024, 1), (1025, 1), (3072, 32767), (3074, 32767), (3075, ct), (3076, 9001)];
-    if get("datum") == Some("WGS84") || (get("ellps") == Some("WGS84") && get("a").is_none()) {
-        shorts.push((2048, 4326));
-    } else {
-        let (a, b) = match (num("a").or(num("R")), num("b"), num("rf")) {
-            (Some(a), Some(b), _) => (a, b),
-            (Some(a), None, Some(rf)) if rf > 0.0 => (a, a - a / rf),
-            (Some(r), None, _) => (r, r),
-            _ => return None,
-        };
-        shorts.extend([(2048, 32767), (2050, 32767), (2056, 32767)]);
-        doubles_by_key.extend([(2057, a), (2058, b)]);
-    }
-    // The key directory: sorted by key, doubles and ASCII at their offsets.
-    // TIFF's ASCII is 7-bit.
-    let label: String = label.chars().filter(|c| c.is_ascii() && !c.is_ascii_control() && *c != '|').take(200).collect();
-    let mut entries: Vec<[u16; 4]> = shorts.iter().map(|(k, v)| [*k, 0, 1, *v]).collect();
-    doubles_by_key.sort_by_key(|(k, _)| *k);
-    let doubles: Vec<f64> = doubles_by_key.iter().map(|(_, v)| *v).collect();
-    for (i, (k, _)) in doubles_by_key.iter().enumerate() {
-        entries.push([*k, 34736, 1, i as u16]);
-    }
-    let ascii = format!("{label}|");
-    entries.push([3073, 34737, ascii.len() as u16, 0]);
+    let tags = sr.to_geokeys().ok()?.encode().ok()?;
+    Some((with_raster_type(&tags.directory)?, tags.doubles, tags.ascii))
+}
+
+/// Key directory `keys` with GTRasterTypeGeoKey (1025) as area (1), added in its place by id;
+/// `None` when the directory can't count its keys.
+fn with_raster_type(keys: &[u16]) -> Option<Vec<u16>> {
+    let (Some(head), Some(entries)) = (keys.get(..4), keys.get(4..)) else { return Some(keys.to_vec()) };
+    let mut entries: Vec<[u16; 4]> = entries.as_chunks::<4>().0.iter().copied().filter(|e| e[0] != 1025).collect();
+    entries.push([1025, 0, 1, 1]);
     entries.sort_by_key(|e| e[0]);
-    let mut keys = vec![1, 1, 0, entries.len() as u16];
-    keys.extend(entries.iter().flatten());
-    // The keys must say the same projection: read back, it places points where the definition
-    // does (anything they can't carry, written differently, is refused rather than shifted).
-    let (back, _) = proj4_of_keys(&keys, &doubles, &ascii).ok()?;
-    same_projection(proj4, &back).then_some((keys, doubles, ascii))
+    let mut out = vec![head[0], head[1], head[2], u16::try_from(entries.len()).ok()?];
+    out.extend(entries.iter().flatten());
+    Some(out)
 }
 
 /// The samples as `f32`, with their type's name. Their memory is reserved first: when it can't be
@@ -1088,6 +980,21 @@ impl Chunks {
         u64::from(self.per_plane) * self.planes as u64
     }
 
+    /// The bytes the first chunk decodes to at `bits` a sample, each row padded to whole bytes: as
+    /// the tiff crate holds it, cropped to the image, then with a tile's padding, as the LZW and
+    /// LERC readers hold it. The first chunk is the largest (only the last strip and the edge tiles are
+    /// smaller), and one always read, since it holds the image's first pixel.
+    fn first_bytes(&self, bits: u16) -> (u64, u64) {
+        let size = |cols: u32, rows: u32| {
+            let row_bits = u64::from(cols).saturating_mul(self.samples as u64).saturating_mul(u64::from(bits));
+            row_bits.div_ceil(8).saturating_mul(u64::from(rows))
+        };
+        // The tiff crate gives a bottom tile of every band after the first, when the bands are stored
+        // apart, its padding rows too (see `place`); a strip's rows are within the image already.
+        let rows = if self.planes > 1 { self.ch } else { self.ch.min(self.h) };
+        (size(self.cw.min(self.w), rows), size(self.cw, self.ch))
+    }
+
     /// Where chunk `c` of a plane lies: its corner, then the columns and rows of it the image
     /// holds (the rest is padding). In `u64`: `x0 + cw` and the next multiple of a step pass
     /// `u32::MAX` in an image that wide, which in `u32` panics in a debug build and wraps in a
@@ -1182,6 +1089,12 @@ impl Chunks {
     }
 }
 
+/// The most bytes the tiff crate decodes one chunk to, or a whole image to: the sample limit as
+/// 32-bit floats.
+fn decoding_limit() -> usize {
+    max_samples().saturating_mul(4)
+}
+
 /// Fewest chunks worth decoding on more than one thread.
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_CHUNKS: u64 = 16;
@@ -1205,8 +1118,27 @@ fn decimate<R: Read + Seek>(
     crate::progress::check()?;
     let k = k.max(1);
     let (ow, oh) = (w.div_ceil(k) as usize, h.div_ceil(k) as usize);
-    let mut bands = (0..nbands).map(|_| super::filled(ow, oh, f32::NAN)).collect::<Result<Vec<_>>>()?;
     let chunks = Chunks::new(dec, w, h, nbands, planar);
+    // A chunk larger than its decoder takes can't be read: said before the bands are set aside,
+    // which can be gigabytes for a header claiming a vast image (a few hundred bytes of file, found
+    // by fuzzing, #1952). LERC chunks go to its reader only, which holds 8 bytes a sample with a
+    // tile's padding; LZW ones to the tiff crate, then to our reader, which keeps the padding too;
+    // the rest to the tiff crate only, which holds a chunk cropped to the image.
+    let sample_bits = bits(dec);
+    let (cropped, padded) = chunks.first_bytes(sample_bits);
+    // The LZW reader takes 8- to 64-bit samples only.
+    let lzw_reads = lzw(dec) && matches!(sample_bits, 8 | 16 | 32 | 64);
+    let refused = if super::lerc::is_lerc(dec) {
+        let lerc = chunks.first_bytes(64).1;
+        (lerc > super::lerc::MAX_CHUNK_BYTES as u64).then_some(((chunks.cw, chunks.ch), lerc))
+    } else {
+        let tiff = (chunks.cw.min(w), if chunks.planes > 1 { chunks.ch } else { chunks.ch.min(h) });
+        (cropped > decoding_limit() as u64 && (!lzw_reads || padded > super::lzw::MAX_CHUNK_BYTES as u64)).then_some((tiff, cropped))
+    };
+    if let Some(((cols, rows), bytes)) = refused {
+        return Err(err(format!("a strip or tile of {cols} × {rows} pixels is too large to read ({} MB)", bytes >> 20)));
+    }
+    let mut bands = (0..nbands).map(|_| super::filled(ow, oh, f32::NAN)).collect::<Result<Vec<_>>>()?;
     #[cfg(not(target_arch = "wasm32"))]
     if let Some((open, image, limits)) = open
         && chunks.count() >= PARALLEL_CHUNKS
@@ -1423,7 +1355,7 @@ pub(super) fn read_limited_with_nodata(
     let wide_rgb = r.first_is_wide_rgb();
     let limits = {
         let mut l = Limits::default();
-        l.decoding_buffer_size = max_samples().saturating_mul(4);
+        l.decoding_buffer_size = decoding_limit();
         l.intermediate_buffer_size = 256 << 20;
         l.ifd_value_size = 64 << 20;
         l
@@ -1498,9 +1430,14 @@ pub(super) fn read_limited_with_nodata(
         }
         let (dw, dh) = (full_w.div_ceil(k), full_h.div_ceil(k));
         let decimated = (k <= 1 << 20).then_some(u64::from(dw) * u64::from(dh));
+        // As detailed as every k-th pixel is an overview of the full size over k, rounded either
+        // way: GDAL rounds up, some writers down (terrio's 10439 × 9842 for 83517 × 78739 over
+        // 8, #1965), and one a pixel short must not make the whole full image be read instead.
+        let as_detailed = |pixels: u64| pixels >= u64::from((full_w / k).max(1)) * u64::from((full_h / k).max(1));
         match best {
-            // An overview at least as detailed as the full image read sparsely: only it is read.
-            Some((index, ow, oh)) if decimated.is_none_or(|d| u64::from(ow) * u64::from(oh) >= d) => {
+            // An overview as detailed, to the rounding of its size, as the full image read
+            // sparsely: only it is read.
+            Some((index, ow, oh)) if decimated.is_none() || as_detailed(u64::from(ow) * u64::from(oh)) => {
                 dec.seek_to_image(index).map_err(err)?;
                 image = index;
                 (w, h) = (ow, oh);
@@ -1818,7 +1755,7 @@ pub(super) fn geo_keys(r: &Raster) -> Result<GeoKeys> {
         // A system read from WKT (or a saved project) has no keys: they're made from its PROJ
         // definition when they can be.
         if d.geokeys.is_empty()
-            && let Some((geokeys, doubles, ascii)) = keys_from_proj4(&d.proj4, &d.label)
+            && let Some((geokeys, doubles, ascii)) = terrio_keys(&d)
         {
             std::sync::Arc::new(CustomCrs { geokeys, doubles, ascii, ..(*d).clone() })
         } else {
@@ -2210,6 +2147,51 @@ mod tests {
         }
     }
 
+    /// A few hundred bytes claiming an 8-band image of 8 × 4,160,741,449 pixels in one strip (the
+    /// fuzzer's `oom-76cff910…`, #1952): the strip can't be decoded, which is said before the bands
+    /// of the overview made as it is read are set aside (some 2 GB of them on a computer with 16).
+    #[test]
+    fn a_strip_too_large_to_decode_is_refused_before_the_bands_are_set_aside() {
+        let entries: [(u16, u16, u32); 9] = [
+            (256, 4, 8),             // ImageWidth
+            (257, 4, 4_160_741_449), // ImageLength
+            (258, 3, 8),             // BitsPerSample (one value for every sample, as readers allow)
+            (259, 3, 1),             // Compression: none
+            (262, 3, 1),             // PhotometricInterpretation: black is zero
+            (273, 4, 128),           // StripOffsets
+            (277, 3, 8),             // SamplesPerPixel
+            (278, 4, 4_160_741_449), // RowsPerStrip: one strip
+            (279, 4, 135),           // StripByteCounts
+        ];
+        let mut file = b"II*\0".to_vec();
+        file.extend(8u32.to_le_bytes());
+        file.extend((entries.len() as u16).to_le_bytes());
+        for (tag, kind, value) in entries {
+            file.extend(tag.to_le_bytes());
+            file.extend(kind.to_le_bytes());
+            file.extend(1u32.to_le_bytes());
+            file.extend(if kind == 3 { u32::from(value as u16) } else { value }.to_le_bytes());
+        }
+        file.extend(0u32.to_le_bytes());
+        file.resize(128 + 135, 0);
+        let e = read(std::io::Cursor::new(&file), "vast.tif").map(|r| (r.width, r.height)).unwrap_err().to_string();
+        assert!(e.contains("a strip or tile of 8 × 4160741449 pixels is too large to read"), "{e}");
+    }
+
+    /// The first chunk's size as each decoder holds it: rows padded to whole bytes, and a tile larger
+    /// than the image cropped to it for the tiff crate but not for the LZW and LERC readers.
+    #[test]
+    fn the_first_chunk_is_sized_as_its_decoders_hold_it() {
+        // One 1-bit band, 1 × 4,160,741,449 in one strip: a byte a row, not an eighth.
+        assert_eq!(chunk_grid(1, 4_160_741_449, 1, 4_160_741_449, 1).first_bytes(1), (4_160_741_449, 4_160_741_449));
+        // A 1024 × 1024 byte image in one 65536-pixel tile: 1 MB cropped, 4 GB padded.
+        assert_eq!(chunk_grid(1024, 1024, 65536, 65536, 1).first_bytes(8), (1 << 20, 1 << 32));
+        // Bands stored apart: the tiff crate keeps a tile's full height for the later planes.
+        let mut planar = chunk_grid(1024, 1024, 1024, 65536, 1);
+        planar.planes = 2;
+        assert_eq!(planar.first_bytes(8), (1 << 26, 1 << 26));
+    }
+
     /// An image `u32` can just count the width (or height) of, in chunks of 2^20 pixels, every 2^20th
     /// pixel: the last chunk ends where `u32` does, so `x0 + cw` and the walk's last step pass it.
     /// In `u32` that panics in a debug build and wraps into an endless walk in a release build.
@@ -2485,6 +2467,11 @@ mod tests {
         assert_eq!(r.crs, Crs::LonLat);
         assert_eq!(r.lost.len(), 1, "{:?}", r.lost);
         assert!(r.lost[0].contains("no EPSG code, so its datum isn't read"), "{:?}", r.lost);
+        // A user-defined model type (32767) whose keys don't define a system but name a code is
+        // read by the code, as before.
+        let named = [1u16, 1, 0, 3, 1024, 0, 1, 32767, 1025, 0, 1, 1, 3072, 0, 1, 32633];
+        let r = read_tiff(placed_tiff((500_000.0, 4_000_000.0), 30.0, Some(&named))).unwrap();
+        assert_eq!(r.crs, Crs::from_epsg(32633).unwrap());
         // Files that give their system say nothing: WGS 84 by its code, and a UTM zone.
         let wgs84 = [1u16, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326];
         let utm = [1u16, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32633];
@@ -2682,37 +2669,101 @@ mod tests {
         let r = Raster::new("hrrr", 2, 2, vec![vec![1.0, 2.0, 3.0, 4.0]], gt, crs, None, ColorHint::Gray, "Float32").unwrap();
         let back = read(std::io::Cursor::new(write(&r, 0).unwrap()), "hrrr").unwrap();
         let p = back.crs.custom_def().unwrap().proj4.clone();
-        assert!(p.contains("+proj=lcc") && p.contains("+lon_0=-97.5") && p.contains("+a=6371229"), "{p}");
+        assert!(p.contains("+proj=lcc") && p.contains("+lon_0=-97.5"), "{p}");
         // The same place either way.
         let c = rustgis_geom::Coord { x: 0.0, y: 0.0 };
         let (a, b) = (r.crs.transformer().unwrap().to_lonlat(c).unwrap(), back.crs.transformer().unwrap().to_lonlat(c).unwrap());
         assert!((a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9 && (a.x + 97.5).abs() < 1e-6, "{a:?} {b:?}");
-        // One the keys can't say is refused, as before.
-        assert!(keys_from_proj4("+proj=moll +lon_0=0 +datum=WGS84", "x").is_none());
-        assert!(keys_from_proj4("junk", "x").is_none());
-        assert!(keys_from_proj4("+proj=tmerc +lon_0=0 +units=us-ft +datum=WGS84", "x").is_none(), "only metres");
-        for unsaid in [
+        // What GeoTIFF's projection keys can't say (another method, a unit, a shift, a prime
+        // meridian) goes in an ESRI PE citation, as GDAL 3.12.1 writes it, and reads back alike.
+        assert!(terrio_keys(&CustomCrs { proj4: "junk".into(), ..CustomCrs::default() }).is_none());
+        for def in [
+            "+proj=moll +lon_0=0 +datum=WGS84",
+            "+proj=tmerc +lon_0=0 +units=us-ft +datum=WGS84",
             "+proj=stere +lat_0=45 +lat_ts=30 +datum=WGS84",
             "+proj=lcc +lat_1=30 +lat_0=40 +lon_0=-96 +datum=WGS84",
             "+proj=eqc +lat_0=30 +lon_0=0 +datum=WGS84",
-            "+proj=laea +lat_0=52 +lon_0=10 +k_0=0.9 +datum=WGS84",
-            "+proj=lcc +lat_1=30 +lat_2=40 +k_0=0.9996 +datum=WGS84",
+            "+proj=laea +lat_0=52 +lon_0=10 +datum=WGS84",
             "+proj=merc +lat_ts=33 +datum=WGS84",
             "+proj=tmerc +ellps=bessel +towgs84=598.1,73.7,418.2",
-            "+proj=lcc +lat_1=40 +pm=paris +a=6378249.2 +b=6356515",
+            "+proj=lcc +lat_1=40 +lat_0=40 +pm=paris +a=6378249.2 +b=6356515",
+            // A one-parallel conic with a scale factor, and a polar stereographic.
+            "+proj=lcc +lat_1=46.8 +lat_2=46.8 +lat_0=46.8 +lon_0=2.3 +k_0=0.99987742 +datum=WGS84",
+            "+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m",
         ] {
-            assert!(keys_from_proj4(unsaid, "x").is_none(), "{unsaid}");
+            keys_round_trip(def);
         }
-        // A one-parallel conic with a scale factor (as WKT's 1SP gives it, both parallels the same)
-        // keeps it.
-        let (k, d, a) =
-            keys_from_proj4("+proj=lcc +lat_1=46.8 +lat_2=46.8 +lat_0=46.8 +lon_0=2.3 +k_0=0.99987742 +datum=WGS84", "x").unwrap();
-        assert!(custom_crs(&k, &d, &a).unwrap().custom_def().unwrap().proj4.contains("+k_0=0.99987742"));
-        // A polar stereographic round trip: the pole's longitude comes back.
-        let (k, d, a) =
-            keys_from_proj4("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m", "NSIDC").unwrap();
-        let back = custom_crs(&k, &d, &a).unwrap().custom_def().unwrap().proj4.clone();
-        assert!(back.contains("+lat_0=90") && back.contains("+lat_ts=70") && back.contains("+lon_0=-45"), "{back}");
+    }
+
+    /// User-defined keys GDAL reads otherwise than the plain key set: the centre's easting and
+    /// northing (ProjCenterEastingGeoKey, ProjCenterNorthingGeoKey) in place of the false ones,
+    /// and a Hotine without its rectified grid angle, which GDAL takes as 90°. Where GDAL 3.12.2
+    /// places them (its WKT2, then pyproj 3.8.0 from EPSG:4326; 3.10.3 agrees). RustGIS read the
+    /// first and last as GDAL does and refused the second.
+    #[test]
+    fn projection_keys_are_read_as_gdal_reads_them() {
+        fn keys(transformation: u16, params: &[(u16, f64)]) -> (Vec<u16>, Vec<f64>) {
+            // Projected, user-defined, on WGS 84, in metres.
+            let mut entries: Vec<[u16; 4]> = vec![
+                [1024, 0, 1, 1],
+                [1025, 0, 1, 1],
+                [2048, 0, 1, 4326],
+                [3072, 0, 1, 32767],
+                [3074, 0, 1, 32767],
+                [3075, 0, 1, transformation],
+                [3076, 0, 1, 9001],
+            ];
+            let mut doubles = vec![];
+            for (k, v) in params {
+                entries.push([*k, 34736, 1, doubles.len() as u16]);
+                doubles.push(*v);
+            }
+            entries.sort_unstable();
+            let mut keys = vec![1, 1, 0, entries.len() as u16];
+            keys.extend(entries.into_iter().flatten());
+            (keys, doubles)
+        }
+        let cases = [
+            (
+                keys(1, &[(3080, 9.0), (3081, 0.0), (3092, 0.9996), (3090, 500_000.0), (3091, 0.0)]),
+                (10.0, 45.0),
+                (578_815.303, 4_983_436.768),
+            ),
+            (
+                keys(3, &[(3088, 10.0), (3089, 40.0), (3094, 30.0), (3093, 1.0), (3082, 0.0), (3083, 0.0)]),
+                (11.0, 41.0),
+                (5_038_140.229, -17_104.251),
+            ),
+            // Polar stereographic about the pole with a standard parallel beside it: GDAL 3.12.2
+            // (and 3.10.3) take the pole as the standard parallel, scale 1, as RustGIS read it.
+            (keys(15, &[(3095, 0.0), (3081, 90.0), (3078, 71.0), (3082, 0.0), (3083, 0.0)]), (10.0, 80.0), (194_428.508, -1_102_658.862)),
+        ];
+        for ((k, d), (lon, lat), (x, y)) in cases {
+            let crs = custom_crs(&k, &d, "").unwrap_or_else(|e| panic!("{e}: {k:?}"));
+            let p = crs.transformer().unwrap().from_lonlat(rustgis_geom::Coord::new(lon, lat)).unwrap();
+            assert!((p.x - x).abs() < 0.01 && (p.y - y).abs() < 0.01, "{p:?}: {k:?}");
+        }
+    }
+
+    /// `def` written as GeoKeys ([`terrio_keys`]) and read back ([`custom_crs`]): a system that
+    /// places points as `def` does, near its centre. The keys and the system read back.
+    fn keys_round_trip(def: &str) -> (Vec<u16>, Vec<f64>, String, Crs) {
+        let crs = Crs::parse(def).unwrap_or_else(|e| panic!("{def}: {e}"));
+        let d = crs.custom_def().unwrap();
+        let (k, dd, a) = terrio_keys(&d).unwrap_or_else(|| panic!("{def}"));
+        let back = custom_crs(&k, &dd, &a).unwrap_or_else(|e| panic!("{def}: {e}"));
+        let num = |key: &str| def.split_whitespace().find_map(|t| t.strip_prefix(key)?.parse::<f64>().ok());
+        let (lon0, lat0) = (num("+lon_0=").unwrap_or(0.0), num("+lat_0=").unwrap_or(45.0));
+        let at = rustgis_geom::Coord::new(lon0 + 1.0, if lat0.abs() >= 80.0 { lat0.signum() * 80.0 } else { lat0 + 1.0 });
+        let (p, q) = (crs.transformer().unwrap().from_lonlat(at).unwrap(), back.transformer().unwrap().from_lonlat(at).unwrap());
+        assert!((p.x - q.x).hypot(p.y - q.y) < 1e-3, "{def}: {p:?} {q:?} ({:?})", back.custom_def().map(|d| d.proj4.clone()));
+        // And through a file, as GeoTIFF writes and reads it.
+        let gt = GeoTransform { origin_x: p.x, origin_y: p.y, pixel_width: 1.0, pixel_height: -1.0 };
+        let r = Raster::new("k", 1, 1, vec![vec![1.0]], gt, crs, None, ColorHint::Gray, "Float32").unwrap();
+        let file = read(std::io::Cursor::new(write(&r, 0).unwrap()), "k").unwrap_or_else(|e| panic!("{def}: {e}"));
+        let q = file.crs.transformer().unwrap().from_lonlat(at).unwrap();
+        assert!((p.x - q.x).hypot(p.y - q.y) < 1e-3, "{def}: file {p:?} {q:?}");
+        (k, dd, a, back)
     }
 
     /// Orthographic and Robinson systems from WKT are written as keys (CT_Orthographic 21 and
@@ -2727,17 +2778,9 @@ mod tests {
             ("+proj=eqc +lat_ts=30 +lon_0=-90 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs", 17),
             ("+proj=eqc +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +a=3396190 +rf=169.894447223612 +units=m +no_defs", 17),
         ] {
-            let (k, d, a) = keys_from_proj4(def, "x").unwrap_or_else(|| panic!("{def}"));
+            let (k, d, a, _) = keys_round_trip(def);
             assert_eq!(geokey(&k, &d, &a, 3075).map(|v| matches!(v, KeyValue::Short(c) if c == ct)), Some(true), "{def}");
-            let back = custom_crs(&k, &d, &a).unwrap().custom_def().unwrap().proj4.clone();
-            assert!(same_projection(def, &back), "{def}: {back}");
         }
-        // PROJ 9.8 computes it on the ellipsoid: on the sphere of its semi-major axis it is
-        // another projection.
-        assert!(!same_projection(
-            "+proj=eqc +lat_ts=0 +lon_0=0 +datum=WGS84 +units=m +no_defs",
-            "+proj=eqc +lat_ts=0 +lon_0=0 +R=6378137 +units=m +no_defs"
-        ));
     }
 
     #[test]
@@ -2882,6 +2925,29 @@ mod tests {
         let Partial::Done(back) = read_sparse_limited(&kept, "back", 1 << 20).unwrap() else { panic!("parts missing") };
         assert_eq!((back.width, back.height), (r.width, r.height));
         assert_eq!(back.value(0, 517, 300), r.value(0, 517, 300));
+    }
+
+    /// #1965: an overview a pixel short of every k-th pixel of the full image, as a writer that
+    /// rounds its overviews' sizes down makes it (terrio's 10439 × 9842 for 83517 × 78739 over 8),
+    /// is read rather than the whole full image, whose every k-th pixel is only a pixel larger. A
+    /// 10 GB mosaic took minutes to open so.
+    #[test]
+    fn an_overview_rounded_down_is_read_rather_than_the_full_image() {
+        use super::super::cog::{Example, example_with};
+        // 1001 pixels a side in 256-pixel tiles, overviews of 500 and 250. At most 260,000
+        // samples: every second pixel is 501 × 501, the 500 overview a pixel short each way.
+        let file = example_with(&Example { size: 1001, tile: 256, rounded_down: true, ..Example::default() });
+        let max = 260_000;
+        let whole = read_limited(reader(std::io::Cursor::new(&file)).unwrap(), "rounded", max, None).unwrap();
+        assert_eq!((whole.width, whole.height, whole.overview), (500, 500, Some((1001, 1001))));
+        // Only the overview's tiles are read, none of the full image's (most of the file).
+        let (r, parts) = read_in_parts(&file, 64 << 10, max);
+        assert_eq!((r.width, r.height), (500, 500));
+        assert!(parts.held() < file.len() as u64 / 3, "{} of {}", parts.held(), file.len());
+        // One rounded up, as GDAL writes it, is read as before.
+        let up = example_with(&Example { size: 1001, tile: 256, ..Example::default() });
+        let r = read_limited(reader(std::io::Cursor::new(&up)).unwrap(), "up", max, None).unwrap();
+        assert_eq!((r.width, r.height), (501, 501));
     }
 
     #[test]
@@ -3830,6 +3896,61 @@ mod tests {
         assert!(custom_crs(&odd, &doubles, "").is_err());
     }
 
+    /// Axes in kilometres converted to metres in slots of their own; past the last slot a key can
+    /// address (65,535), refused rather than left in kilometres under a metre unit.
+    #[test]
+    fn axes_in_metres_need_room_for_their_slots() {
+        let keys = [1u16, 1, 0, 3, 2052, 0, 1, 9036, 2057, 34736, 1, 0, 2058, 34736, 1, 1];
+        let (k, d) = axes_in_metres(&keys, &[3396.19, 3376.2], "").unwrap();
+        assert_eq!((d[2], d[3], k[7]), (3_396_190.0, 3_376_200.0, 9001));
+        for len in [65_535, 65_536] {
+            let mut doubles = vec![0.0; len];
+            doubles[..2].copy_from_slice(&[3396.19, 3376.2]);
+            let e = axes_in_metres(&keys, &doubles, "").unwrap_err().to_string();
+            assert!(e.contains("too many double parameters"), "{len}: {e}");
+        }
+        // A semi-minor axis past the doubles isn't left in kilometres under a unit of metres.
+        let e = axes_in_metres(&keys, &[3396.19], "").unwrap_err().to_string();
+        assert!(e.contains("points past its double parameters"), "{e}");
+    }
+
+    /// An ESRI PE citation with a shift of its own (British National Grid with another TOWGS84) is
+    /// read by that WKT, as the `.prj` is, not as EPSG:27700 with the code's shift; without one it
+    /// is the code.
+    #[test]
+    fn a_citation_with_its_own_shift_is_not_its_epsg_code() {
+        let bng = r#"PROJCS["British_National_Grid",GEOGCS["GCS_OSGB_1936",DATUM["D_OSGB_1936",SPHEROID["Airy_1830",6377563.396,299.3249646],TOWGS84[375,-111,431,0,0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",400000.0],PARAMETER["False_Northing",-100000.0],PARAMETER["Central_Meridian",-2.0],PARAMETER["Scale_Factor",0.9996012717],PARAMETER["Latitude_Of_Origin",49.0],UNIT["Meter",1.0]]"#;
+        let keys = |ascii: &str| vec![1, 1, 0, 3, 1024, 0, 1, 1, 1026, 34737, u16::try_from(ascii.len()).unwrap(), 0, 3072, 0, 1, 32767];
+        let cited = format!("ESRI PE String = {bng}|");
+        let crs = custom_crs(&keys(&cited), &[], &cited).unwrap();
+        assert_ne!(crs, Crs::Epsg(27700));
+        let prj = crate::raster::wkt::crs_from_wkt(bng).unwrap();
+        let at = rustgis_geom::Coord::new(400_000.0, 300_000.0);
+        let (a, b) = (crs.transformer().unwrap().to_lonlat(at).unwrap(), prj.transformer().unwrap().to_lonlat(at).unwrap());
+        assert!((a.x - b.x).abs() < 1e-12 && (a.y - b.y).abs() < 1e-12, "{a:?} {b:?}");
+        let plain = format!("ESRI PE String = {}|", bng.replace(",TOWGS84[375,-111,431,0,0,0,0]", ""));
+        assert_eq!(custom_crs(&keys(&plain), &[], &plain).unwrap(), Crs::Epsg(27700));
+        // Read from its `.prj` and written as keys, it keeps its shift: read back, it places
+        // points as the `.prj` does.
+        let (k, d, a) = terrio_keys(&prj.custom_def().unwrap()).unwrap();
+        assert!(!k.chunks(4).any(|e| e == [3072, 0, 1, 27700]), "{k:?}");
+        assert!(k.chunks(4).skip(1).any(|e| e[0] == 2062), "{k:?}");
+        let back = custom_crs(&k, &d, &a).unwrap();
+        let c = back.transformer().unwrap().to_lonlat(at).unwrap();
+        assert!((c.x - b.x).abs() < 1e-9 && (c.y - b.y).abs() < 1e-9, "{c:?} {b:?}");
+        // A shift of zero on another datum than WGS 84 (Lambert 93 on RGF93, as Esri writes it)
+        // is written as user-defined keys with that shift, as GDAL 3.10.3 writes them too (no
+        // 2154), and as RustGIS wrote it before: read back, it places points as the `.prj` does.
+        let l93 = r#"PROJCS["RGF93_Lambert_93",GEOGCS["GCS_RGF_1993",DATUM["D_RGF_1993",SPHEROID["GRS_1980",6378137.0,298.257222101],TOWGS84[0,0,0,0,0,0,0]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Lambert_Conformal_Conic"],PARAMETER["False_Easting",700000.0],PARAMETER["False_Northing",6600000.0],PARAMETER["Central_Meridian",3.0],PARAMETER["Standard_Parallel_1",44.0],PARAMETER["Standard_Parallel_2",49.0],PARAMETER["Latitude_Of_Origin",46.5],UNIT["Meter",1.0]]"#;
+        let l93 = crate::raster::wkt::crs_from_wkt(l93).unwrap();
+        let (k, d, a) = terrio_keys(&l93.custom_def().unwrap_or_else(|| panic!("{l93:?}"))).unwrap();
+        assert!(k.chunks(4).any(|e| e == [3072, 0, 1, 32767]), "{k:?}");
+        let at = rustgis_geom::Coord::new(652_469.0, 6_862_035.0);
+        let (back, prj) = (custom_crs(&k, &d, &a).unwrap().transformer().unwrap(), l93.transformer().unwrap());
+        let (c, e) = (back.to_lonlat(at).unwrap(), prj.to_lonlat(at).unwrap());
+        assert!((c.x - e.x).abs() < 1e-9 && (c.y - e.y).abs() < 1e-9, "{c:?} {e:?}");
+    }
+
     /// MODIS's sinusoidal grid (coordinate transformation 24), as a MOD13Q1 tile's GeoKeys give
     /// it: h12v10, whose corner is at 60.925597° W, 10° S (pyproj 3.7.1).
     #[test]
@@ -3855,7 +3976,7 @@ mod tests {
         }
         let r = read(std::io::Cursor::new(&tiff), "modis").unwrap();
         let p = r.crs.custom_def().unwrap().proj4.clone();
-        assert!(p.contains("+proj=sinu") && p.contains("+a=6371007.181 +b=6371007.181"), "{p}");
+        assert!(p.contains("+proj=sinu") && crate::raster::crs::def_params(&p).is_some_and(|e| e.a == 6_371_007.181 && e.b == e.a), "{p}");
         let t = r.crs.transformer().unwrap();
         let ll = t.to_lonlat(rustgis_geom::Coord::new(-6_671_703.118, -1_111_950.519_667)).unwrap();
         assert!((ll.x + 60.925_597).abs() < 1e-6 && (ll.y + 10.0).abs() < 1e-9, "{ll:?}");
@@ -3866,18 +3987,11 @@ mod tests {
         assert_eq!(back.crs.custom_def().unwrap().proj4, p);
         let again: Crs = serde_json::from_str(&serde_json::to_string(&r.crs).unwrap()).unwrap();
         assert_eq!(again.custom_def().unwrap().proj4, p);
-        // ESRI:54008's definition, on WGS 84, is written as keys too.
-        let (k, d, a) = keys_from_proj4("+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs", "World_Sinusoidal").unwrap();
-        assert!(custom_crs(&k, &d, &a).unwrap().custom_def().unwrap().proj4.starts_with("+proj=sinu"));
-        // A central meridian and false origin away from 0 (ESRI:102011, Africa Sinusoidal, at 15°)
-        // go through the keys and back as the same projection.
-        let africa = "+proj=sinu +lon_0=15 +x_0=200000 +y_0=-100000 +datum=WGS84 +units=m +no_defs";
-        let (k, d, a) = keys_from_proj4(africa, "Africa_Sinusoidal").unwrap();
-        let back = custom_crs(&k, &d, &a).unwrap().custom_def().unwrap().proj4.clone();
-        assert!(same_projection(africa, &back), "{back}");
-        // A false easting or northing of its own is another projection.
-        assert!(!same_projection(africa, "+proj=sinu +lon_0=15 +x_0=0 +y_0=-100000 +datum=WGS84 +units=m +no_defs"));
-        assert!(!same_projection(africa, "+proj=sinu +lon_0=15 +x_0=200000 +y_0=0 +datum=WGS84 +units=m +no_defs"));
+        // ESRI:54008's definition, on WGS 84, and one with a central meridian and false origin
+        // away from 0 (ESRI:102011, Africa Sinusoidal, at 15°) go through the keys and back as the
+        // same projection.
+        keys_round_trip("+proj=sinu +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs");
+        keys_round_trip("+proj=sinu +lon_0=15 +x_0=200000 +y_0=-100000 +datum=WGS84 +units=m +no_defs");
     }
 
     /// A tiled, LZW-compressed Float32 GeoTIFF, `w × h` in `tile`-pixel tiles, written as GDAL

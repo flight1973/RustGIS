@@ -11,6 +11,13 @@ use crate::{RustGisApp, icons};
 pub const CONTENT_H: f32 = 72.0;
 pub const LABEL_H: f32 = 18.0;
 
+/// The least width of a ribbon button's menu.
+pub const MENU_MIN_W: f32 = 200.0;
+
+/// The least width of a submenu, so one of short rows (a page size's styles) doesn't open as a
+/// strip; narrower than a menu, whose rows have room for an icon and a shortcut (#2398).
+pub const SUBMENU_MIN_W: f32 = 100.0;
+
 /// A number its caller lends saved each frame and saves only once it is settled, kept across a
 /// drag (#597, #607). egui's `DragValue` keeps the value dragged so far in its own memory and
 /// forgets it when the pointer is released, a frame on which `dragged()` is false: lent the saved
@@ -450,11 +457,13 @@ fn big_split_menu_with(
         let _ = app.run_by_user(id, params);
     }
     egui::Popup::menu(&arrow).close_behavior(close).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
     (primary, arrow)
 }
+
+pub(crate) const SMALL_ICON_BUTTON_WIDTH: f32 = 26.0;
 
 /// A small button: 18 px icon with an optional label.
 pub fn small(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, id: &str, params: Value, checked: bool) -> Response {
@@ -495,7 +504,7 @@ fn small_button(
     let (label, desc) = (tl!(label), tl!(desc));
     let t = Tokens::get(ui.ctx());
     let tw = if label.is_empty() { 0.0 } else { text_w(ui, label, regular(11.5)) + 8.0 };
-    let (r, resp) = ui.allocate_exact_size(vec2(26.0 + tw, 22.0), Sense::click());
+    let (r, resp) = ui.allocate_exact_size(vec2(SMALL_ICON_BUTTON_WIDTH + tw, 22.0), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, on, if label.is_empty() { desc } else { label }));
     bg(ui, r, &resp, checked, &t);
     let ic = Rect::from_center_size(pos2(r.min.x + 13.0, r.center().y), vec2(18.0, 18.0));
@@ -523,7 +532,7 @@ fn small_button(
 pub fn big_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, menu: impl FnOnce(&mut Ui, &mut RustGisApp)) {
     let resp = big(ui, app, icon, label, desc, "ui.menu", Value::Null, false, true);
     egui::Popup::menu(&resp).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -533,7 +542,7 @@ pub fn big_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc
 pub fn big_form_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, menu: impl FnOnce(&mut Ui, &mut RustGisApp)) {
     let resp = big(ui, app, icon, label, desc, "ui.menu", Value::Null, false, true);
     egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -576,7 +585,7 @@ fn small_menu_with(
     caret(ui.painter(), pos2(r.max.x - 9.0, r.center().y), t.text);
     let resp = tooltip(app, resp, label, desc, "ui.menu", &Value::Null);
     egui::Popup::menu(&resp).close_behavior(close).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -620,13 +629,35 @@ pub fn menu_row(ui: &mut Ui, icon: &str, label: &str, shortcut: &str, on: bool) 
     resp
 }
 
-/// A menu row with an icon that opens a submenu of `add`'s rows.
+/// A menu row with an icon and a highlight when it represents the current choice.
+pub(crate) fn selectable_menu_row(ui: &mut Ui, icon: &str, label: &str, selected: bool) -> Response {
+    let button = egui::Button::selectable(selected, menu_text(ui, icon, label)).min_size(vec2(ui.available_width(), 0.0));
+    let response = ui.add(button);
+    menu_icon(ui, &response, icon);
+    response
+}
+
+/// A menu row with an icon that opens a submenu of `add`'s rows, at least [`SUBMENU_MIN_W`]
+/// wide: in a menu of [`menu_item`] rows, as tall as they are.
 pub fn submenu_row(ui: &mut Ui, icon: &str, label: &str, add: impl FnOnce(&mut Ui)) {
     let button = egui::Button::new(menu_text(ui, icon, label))
         .min_size(vec2(0.0, 24.0))
         .right_text(egui::containers::menu::SubMenuButton::arrow_atom(None));
-    let (resp, _) = egui::containers::menu::SubMenuButton::from_button(button).ui(ui, add);
+    let (resp, _) = egui::containers::menu::SubMenuButton::from_button(button).ui(ui, |ui| {
+        ui.set_min_width(SUBMENU_MIN_W);
+        add(ui);
+    });
     menu_icon(ui, &resp, icon);
+}
+
+/// A row that opens a submenu of `add`'s rows, at least [`SUBMENU_MIN_W`] wide: in a menu of
+/// plain buttons, as tall as they are (a menu of [`menu_item`] rows uses [`submenu_row`]).
+pub fn submenu(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) -> Response {
+    ui.menu_button(label, |ui| {
+        ui.set_min_width(SUBMENU_MIN_W);
+        add(ui);
+    })
+    .response
 }
 
 /// A menu row's label: with an icon, it starts after it, so the icon is drawn inside the row (and the menu).
@@ -840,6 +871,75 @@ pub fn color_button(ui: &mut Ui, color: &mut egui::Color32) -> Response {
     egui::color_picker::color_edit_button_srgba(ui, color, egui::color_picker::Alpha::OnlyBlend)
 }
 
+/// A colour button for a symbol's fill, which may be transparent: its hue survives an opacity of
+/// 0, where `Color32` (and [`color_button`]) loses it. The colour picked, if one was.
+pub fn rgba_button(ui: &mut Ui, color: rustgis_engine::map::Rgba) -> (Response, Option<rustgis_engine::map::Rgba>) {
+    // The picker's own state while it shows this colour, as egui keeps it for its buttons: the hue
+    // stays where it was on black or grey, which have none of their own.
+    let id = ui.next_auto_id().with("rgba_button");
+    let kept = ui.data(|d| d.get_temp::<([u8; 4], egui::ecolor::Hsva)>(id)).filter(|(c, _)| *c == color.0);
+    let mut hsva = kept.map_or_else(
+        || {
+            // Construct hue independently of alpha: Color32 discards hidden RGB at zero.
+            let mut hsva = egui::ecolor::Hsva::from_srgb([color.r(), color.g(), color.b()]);
+            hsva.a = f32::from(color.a()) / 255.0;
+            hsva
+        },
+        |(_, hsva)| hsva,
+    );
+    let before = hsva;
+    // egui creates the popup from the context, not this Ui's scoped style.
+    // Borrow linear numeric editing only while a transparent picker is open. The units chosen
+    // when an edit begins hold until it ends (the pointer let go, no number being typed), so they
+    // don't change in the middle of a drag or of typing that moves the opacity to or from 0.
+    // This button's own popup, as egui names it, not any popup.
+    let open = egui::Popup::is_id_open(ui.ctx(), ui.auto_id_with("popup"));
+    let linear_id = id.with("linear");
+    // An edit is a press held down, or typing into one number: the same one, as focus can pass
+    // straight to another; the button itself keeping focus isn't one.
+    let button = ui.next_auto_id();
+    let typing = ui.ctx().memory(|m| m.focused()).filter(|f| *f != button);
+    let pressed = ui.input(|i| i.pointer.any_down());
+    let held = ui
+        .data(|d| d.get_temp::<(Option<egui::Id>, bool)>(linear_id))
+        .filter(|(was, _)| pressed || (typing.is_some() && *was == typing))
+        .map(|(_, linear)| linear);
+    let linear = open && held.unwrap_or(color.a() == 0);
+    if open {
+        ui.data_mut(|d| d.insert_temp(linear_id, (typing, linear)));
+    } else {
+        ui.data_mut(|d| d.remove::<(Option<egui::Id>, bool)>(linear_id));
+    }
+    let styles = linear.then(|| [egui::Theme::Light, egui::Theme::Dark].map(|theme| (theme, ui.ctx().style_of(theme))));
+    if styles.is_some() {
+        ui.ctx().global_style_mut(|style| style.visuals.numeric_color_space = egui::style::NumericColorSpace::Linear);
+    }
+    let response = egui::color_picker::color_edit_button_hsva(ui, &mut hsva, egui::color_picker::Alpha::OnlyBlend);
+    if let Some(styles) = styles {
+        // The popup's numeric-mode button can change both themes; restore both
+        // immediately so no other picker or later frame inherits the override.
+        for (theme, style) in styles {
+            ui.ctx().set_style_of(theme, style);
+        }
+    }
+    let shown = picked_colour(hsva, before, color);
+    // egui's round trip through its own colour model can report a change that isn't one, every
+    // frame the popup is open: only a colour that differs is picked.
+    let picked = (response.changed() && shown != color).then_some(shown);
+    // Kept for the colour the caller holds next frame: the one picked, else this one.
+    ui.data_mut(|d| d.insert_temp(id, (picked.unwrap_or(color).0, hsva)));
+    (response, picked)
+}
+
+/// The colour a picker left at `hsva` for `old`, which it showed as `before`: the picker's colour
+/// when its red, green or blue changed, else `old`'s own channels at the picker's opacity, as an
+/// opacity-only edit leaves channels the picker may not hold exactly (at opacity 0, its own
+/// colour model can't). Both may change in one frame (two accessibility requests).
+pub fn picked_colour(hsva: egui::ecolor::Hsva, before: egui::ecolor::Hsva, old: rustgis_engine::map::Rgba) -> rustgis_engine::map::Rgba {
+    let rgb = rustgis_engine::map::Rgba(hsva.to_srgba_unmultiplied());
+    if hsva.to_srgb() != before.to_srgb() { rgb } else { old.with_alpha(rgb.a()) }
+}
+
 #[cfg(test)]
 mod tests {
     use egui_kittest::kittest::Queryable;
@@ -861,6 +961,10 @@ mod tests {
         }));
         assert!(!offers_additive(|ui, c| {
             super::color_button(ui, c);
+        }));
+        assert!(!offers_additive(|ui, c| {
+            let [r, g, b, a] = c.to_srgba_unmultiplied();
+            super::rgba_button(ui, rustgis_engine::map::Rgba([r, g, b, a]));
         }));
     }
 

@@ -495,6 +495,11 @@ async fn read_together(files: Vec<web_sys::File>, mark: &str, inbox: &Inbox, not
                 .push((rustgis_ui_egui::tl!("Shortcut file exceeds the size limit.").into(), true));
             continue;
         }
+        if mark == rustgis_ui_egui::SCRIPT_PICK && file.size() > rustgis_ui_egui::SCRIPT_FILE_MAX_BYTES as f64 {
+            let text = rustgis_ui_egui::i18n::fmt("{file} is larger than 1 MB", &[("file", &name)]);
+            notes.lock().unwrap_or_else(|e| e.into_inner()).push((text, true));
+            continue;
+        }
         if let Some(bytes) = crate::parts::read_file(file, notes.clone()).await {
             read.push((name, bytes));
         } else if mark.starts_with(rustgis_ui_egui::DXF_PICK) {
@@ -671,7 +676,7 @@ async fn fetch_reached(
     let mut diagnostics = RequestDiagnostics::with_capture(url, "GET", capture);
     diagnostics.omit_statuses(omit);
     let answer = async {
-        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{address, cache, logins};
+        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{address, cache, copernicus, logins};
         let (promise, abort, range, tail, max, url, bound, authenticated) = crate::request::prepare_and_send(
             &still,
             || async {
@@ -687,25 +692,38 @@ async fn fetch_reached(
                 let prepared = cache::prepare_get(url)?;
                 let url = prepared.url.as_str();
                 let destination = check_destination(url, ceiling)?;
+                // A connection's own ArcGIS token (already in the login's address) outranks the portal
+                // sign-in: with one applied, the sign-in's token is neither renewed nor added.
+                let target = logins::inherit(bound, url);
+                let bare = prepared.bare();
+                let mut login = if bare { None } else { logins::apply(&target).map_err(str::to_string)? };
+                let explicit = login.as_ref().is_some_and(|applied| applied.arcgis);
                 // An ArcGIS sign-in's token, for the portal and the servers it covers, renewed first when it
                 // is about to expire. It goes as the request's `token` parameter, not a header: ArcGIS's
                 // query endpoints answer the header's CORS preflight with an error.
-                if !prepared.signed {
+                if !bare && !explicit {
                     crate::arcgis::renew_if_due(url, still.clone()).await;
+                    crate::copernicus::renew_if_due(url, still.clone()).await;
                     cache::check_still(&still)?;
+                    // The renewal suspended this request: its login is looked at once more.
+                    login = logins::apply(&target).map_err(str::to_string)?;
                 }
-                let target = logins::inherit(bound, url);
-                let login = if prepared.signed { None } else { logins::apply(&target).map_err(str::to_string)? };
                 let login_url = login.as_ref().map_or(url, |applied| applied.url.as_str());
-                let arcgis =
-                    if prepared.signed { None } else { rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::arcgis_auth::with_token(login_url) };
+                let arcgis = if bare || explicit {
+                    None
+                } else {
+                    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::arcgis_auth::with_token(login_url)
+                };
+                // A Copernicus Data Space sign-in's token goes to its data hosts only, as on the
+                // desktop; the request then refuses any redirect, so it never leaves them.
+                let copernicus = if prepared.signed || login.is_some() { None } else { copernicus::authorization(url) };
                 // Only the request carries credentials: messages and cache keys keep the original address.
                 let request = arcgis.as_deref().unwrap_or(login_url);
                 // URL parsing in a browser can normalize a numeric or escaped hostname. Judge
                 // that actual destination against the already checked, prepared address.
                 let normalized = web_sys::Url::new(request).map_err(|_| "not a valid request address")?;
                 address::check_reach(&normalized.href(), ceiling)?;
-                let authenticated = prepared.signed || arcgis.is_some() || login.is_some();
+                let authenticated = prepared.signed || arcgis.is_some() || login.is_some() || copernicus.is_some();
                 let err = |e: wasm_bindgen::JsValue| {
                     if authenticated { "the browser couldn't process the authenticated request".to_string() } else { format!("{e:?}") }
                 };
@@ -721,7 +739,7 @@ async fn fetch_reached(
                 if let Some(a) = &abort {
                     init.set_signal(Some(&a.signal()));
                 }
-                if asked.is_some() || !prepared.headers.is_empty() || login_header.is_some() {
+                if asked.is_some() || !prepared.headers.is_empty() || login_header.is_some() || copernicus.is_some() {
                     let headers = web_sys::Headers::new().map_err(err)?;
                     if let Some(r) = &asked {
                         headers.set("Range", r).map_err(err)?;
@@ -734,13 +752,17 @@ async fn fetch_reached(
                     if let Some((name, value)) = login_header {
                         headers.set(name, value).map_err(err)?;
                     }
+                    if let Some(auth) = &copernicus {
+                        headers.set("Authorization", auth).map_err(err)?;
+                    }
                     init.set_headers(&headers);
                 }
                 // Fetch hides a manual redirect's Location, so the app cannot check its next
                 // destination. Refuse it instead of letting the browser follow it unchecked.
                 init.set_redirect(if authenticated { web_sys::RequestRedirect::Error } else { web_sys::RequestRedirect::Manual });
                 // A credential-bearing address goes nowhere else: no referrer from it, no cookies with it.
-                if arcgis.is_some() || login.is_some() {
+                // An anonymous request sends no cookies either.
+                if arcgis.is_some() || login.is_some() || copernicus.is_some() || prepared.anonymous {
                     init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
                     init.set_credentials(web_sys::RequestCredentials::Omit);
                 }
@@ -778,6 +800,10 @@ async fn fetch_reached(
                 .map_err(err)?;
             diagnostics.answered(resp.status());
             check_redirect(&resp)?;
+            // A data host refusing the request (or the token): say what to do.
+            if resp.status() == 401 && copernicus::is_data_host(&url) {
+                return Err(copernicus::refused_message(&url));
+            }
             if !resp.ok() {
                 return Err(refused(&resp));
             }
@@ -881,7 +907,7 @@ async fn post_json(
                 }
                 let destination = check_destination(&prepared.url, ceiling)?;
                 let target = logins::inherit(url, &destination);
-                let login = logins::apply(&target).map_err(str::to_string)?;
+                let login = if prepared.anonymous { None } else { logins::apply(&target).map_err(str::to_string)? };
                 let request = match &login {
                     Some(applied) => check_destination(&applied.url, ceiling)?,
                     None => destination,
@@ -904,7 +930,8 @@ async fn post_json(
                 }
                 init.set_headers(&headers);
                 init.set_body(&wasm_bindgen::JsValue::from_str(body));
-                if login.is_some() {
+                // No referrer from a credential-bearing address; an anonymous request sends no cookies.
+                if login.is_some() || prepared.anonymous {
                     init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
                     init.set_credentials(web_sys::RequestCredentials::Omit);
                 }
@@ -975,7 +1002,7 @@ async fn head(
                 }
                 let destination = check_destination(&prepared.url, ceiling)?;
                 let target = logins::inherit(bound, &destination);
-                let login = logins::apply(&target).map_err(str::to_string)?;
+                let login = if prepared.anonymous { None } else { logins::apply(&target).map_err(str::to_string)? };
                 let request = match &login {
                     Some(applied) => check_destination(&applied.url, ceiling)?,
                     None => destination.clone(),
@@ -999,7 +1026,8 @@ async fn head(
                     }
                     init.set_headers(&headers);
                 }
-                if login.is_some() {
+                // No referrer from a credential-bearing address; an anonymous request sends no cookies.
+                if login.is_some() || prepared.anonymous {
                     init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
                     init.set_credentials(web_sys::RequestCredentials::Omit);
                 }
@@ -1164,6 +1192,8 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             done,
         ));
     });
+    // So are the token requests of ArcGIS connections made from a user and password.
+    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::arcgis_token::set_generator(crate::arcgis::generate_token);
     let open_inbox = inbox.clone();
     let font_ctx = ctx.clone();
     let (gl_list_ctx, gl_run_ctx) = (ctx.clone(), ctx.clone());
@@ -1182,6 +1212,7 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
     // Plugins' settings, bound before `with_services` restores the plugins that were installed.
     rustgis_ui_egui::rustgis_engine::plugins::settings::set_browser_storage(plugin_settings_storage(embedded));
     let arcgis_ctx = ctx.clone();
+    let copernicus_ctx = ctx.clone();
     let clipboard_ctx = ctx.clone();
     Services {
         // The browser's camera isn't asked yet (a phone's shell asks its own).
@@ -1203,6 +1234,9 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             })
         }),
         arcgis_sign_in: Some(Box::new(move |portal, client_id, slot| crate::arcgis::sign_in(portal, client_id, slot, arcgis_ctx.clone()))),
+        copernicus_sign_in: Some(Box::new(move |username, password, totp, slot| {
+            crate::copernicus::sign_in(username, password, totp, slot, copernicus_ctx.clone())
+        })),
         load_pref: Some(load_pref),
         save_pref: Some(save_pref),
         // No keychain in the browser: script on the page could read anything stored (#754).
@@ -1241,6 +1275,7 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             } else {
                 match (purpose, tool_exts) {
                     ("shortcuts", _) => rustgis_ui_egui::SHORTCUT_PICK,
+                    ("script", _) => rustgis_ui_egui::SCRIPT_PICK,
                     ("text", _) => rustgis_ui_egui::DELIMITED_PICK,
                     ("shapefile", _) => rustgis_ui_egui::SHAPEFILE_PICK,
                     (_, Some(_)) => rustgis_ui_egui::TOOL_FILE_PICK,
@@ -1253,6 +1288,8 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 if exts.is_empty() { rfd::AsyncFileDialog::new() } else { rfd::AsyncFileDialog::new().add_filter(exts.join(", "), &exts) }
             } else if purpose == "shortcuts" {
                 rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("Keyboard shortcuts"), &["json", "rgisshortcuts"])
+            } else if purpose == "script" {
+                rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("Script"), &["txt"])
             } else if purpose == "shapefile" {
                 rfd::AsyncFileDialog::new().add_filter("Shapefile", &["shp", "dbf", "shx", "prj", "cpg", "zip"])
             } else if purpose == "project" {

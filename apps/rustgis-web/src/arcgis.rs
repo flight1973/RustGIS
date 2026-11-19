@@ -8,7 +8,8 @@
 use std::cell::Cell;
 
 use rustgis_ui_egui::Slot;
-use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{arcgis_auth, cache};
+use rustgis_ui_egui::rustgis_engine::data::secrets::Secret;
+use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{arcgis_auth, arcgis_token, cache};
 use wasm_bindgen::JsCast as _;
 
 /// How long a request to the portal may take before it is given up.
@@ -47,7 +48,7 @@ fn redirect() -> Result<String, String> {
 }
 
 /// Waits `ms`; an error when no timer can be set (the caller gives up rather than spin).
-async fn sleep(ms: i32) -> Result<(), String> {
+pub(crate) async fn sleep(ms: i32) -> Result<(), String> {
     let window = web_sys::window().ok_or("no window")?;
     let mut timed = Ok(());
     let promise = js_sys::Promise::new(&mut |resolve, _| {
@@ -65,6 +66,18 @@ async fn request(url: &str, form: Option<&str>) -> Result<Vec<u8>, String> {
 
 /// A renewal caused by a claimed download checks its owned predicate on first poll and send.
 async fn request_claimed(url: &str, form: Option<&str>, still: Option<cache::Still>) -> Result<Vec<u8>, String> {
+    let (status, body) = form_request(url, form, still, "the portal").await?;
+    // A server error says nothing of the request: it counts as the portal not being reached.
+    if status >= 500 {
+        return Err(format!("the portal answered HTTP {status}"));
+    }
+    Ok(body)
+}
+
+/// A request to a sign-in server (`who`, for the messages): a form POSTed, or a GET; its status
+/// and answer. Never redirected, never with the page's cookies; the error never quotes the form.
+/// Also Copernicus Data Space's (see `copernicus.rs`).
+pub(crate) async fn form_request(url: &str, form: Option<&str>, still: Option<cache::Still>, who: &str) -> Result<(u16, Vec<u8>), String> {
     cache::check_still(&still)?;
     let window = web_sys::window().ok_or("no window")?;
     let init = web_sys::RequestInit::new();
@@ -89,27 +102,25 @@ async fn request_claimed(url: &str, form: Option<&str>, still: Option<cache::Sti
     let read = async {
         let promise =
             crate::request::prepare_and_send(&still, || async { Ok(()) }, |()| window.fetch_with_str_and_init(url, &init)).await?;
-        let resp: web_sys::Response = wasm_bindgen_futures::JsFuture::from(promise)
-            .await
-            .map_err(|_| "couldn't reach the portal".to_string())?
-            .dyn_into()
-            .map_err(err)?;
-        // A server error says nothing of the request: it counts as the portal not being reached.
-        if resp.status() >= 500 {
-            return Err(format!("the portal answered HTTP {}", resp.status()));
+        let resp: web_sys::Response =
+            wasm_bindgen_futures::JsFuture::from(promise).await.map_err(|_| format!("couldn't reach {who}"))?.dyn_into().map_err(err)?;
+        let status = resp.status();
+        // A server error says nothing of the request: its answer isn't read, so a large or unreadable
+        // one still reports the status.
+        if status >= 500 {
+            return Ok((status, Vec::new()));
         }
         let length = resp.headers().get("content-length").ok().flatten().and_then(|l| l.parse::<usize>().ok());
         if length.is_some_and(|n| n > MAX_ANSWER) {
-            return Err("the portal's answer is too large".into());
+            return Err(format!("{who}'s answer is too large"));
         }
-        let buf = wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(err)?)
-            .await
-            .map_err(|_| "couldn't reach the portal".to_string())?;
+        let buf =
+            wasm_bindgen_futures::JsFuture::from(resp.array_buffer().map_err(err)?).await.map_err(|_| format!("couldn't reach {who}"))?;
         let bytes = js_sys::Uint8Array::new(&buf);
         if bytes.length() as usize > MAX_ANSWER {
-            return Err("the portal's answer is too large".into());
+            return Err(format!("{who}'s answer is too large"));
         }
-        Ok(bytes.to_vec())
+        Ok((status, bytes.to_vec()))
     };
     let result = read.await;
     if let Some(t) = timer {
@@ -207,4 +218,108 @@ pub async fn renew_if_due(url: &str, still: Option<cache::Still>) {
         return;
     }
     arcgis_auth::renewal_done(&r, answer.as_deref().map_err(String::clone));
+}
+
+/// How often a token request looks at its cancellation predicate and its deadline.
+const TOKEN_WATCH_MS: i32 = 50;
+
+/// Asks an ArcGIS Server for a token (see `rustgis_tiles::arcgis_token`): the form is POSTed to
+/// `endpoint` once. The request is never redirected and carries no cookies, referrer or other
+/// login; its answer is read in chunks up to the limit; every failure is a fixed sentence, never
+/// the browser's own text. It is given up, and the fetch aborted, when `still` turns false
+/// (checked every 50 ms) or at the deadline. `done` is called exactly once, whatever happens.
+pub fn generate_token(endpoint: String, body: Secret, still: cache::Still, done: arcgis_token::Done) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let result = token_request(&endpoint, &body, &still).await;
+        done(result);
+    });
+}
+
+async fn token_request(endpoint: &str, body: &Secret, still: &cache::Still) -> Result<arcgis_token::Credential, String> {
+    use std::{cell::Cell, rc::Rc};
+    let held = Some(still.clone());
+    let stopped = |_: String| arcgis_token::CANCELLED.to_string();
+    cache::check_still(&held).map_err(stopped)?;
+    let window = web_sys::window().ok_or(arcgis_token::FAILED)?;
+    let failed = |_: wasm_bindgen::JsValue| arcgis_token::FAILED.to_string();
+    let abort = web_sys::AbortController::new().map_err(failed)?;
+    let init = web_sys::RequestInit::new();
+    init.set_method("POST");
+    init.set_redirect(web_sys::RequestRedirect::Error);
+    init.set_credentials(web_sys::RequestCredentials::Omit);
+    init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
+    let headers = web_sys::Headers::new().map_err(failed)?;
+    headers.set("Content-Type", "application/x-www-form-urlencoded").map_err(failed)?;
+    headers.set("Accept", "application/json").map_err(failed)?;
+    init.set_headers(&headers);
+    init.set_body(&wasm_bindgen::JsValue::from_str(body.expose()));
+    init.set_signal(Some(&abort.signal()));
+    // The watchdog aborts the fetch the moment the request is cancelled or out of time, saying why.
+    let why: Rc<Cell<Option<&'static str>>> = Rc::default();
+    let began = web_time::Instant::now();
+    let watch = {
+        let (abort, still, why) = (abort.clone(), still.clone(), why.clone());
+        wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+            if !still() {
+                why.set(Some(arcgis_token::CANCELLED));
+                abort.abort();
+            } else if began.elapsed() >= std::time::Duration::from_secs(arcgis_token::DEADLINE_SECS) {
+                why.set(Some(arcgis_token::TIMED_OUT));
+                abort.abort();
+            }
+        })
+    };
+    let timer =
+        window.set_interval_with_callback_and_timeout_and_arguments_0(watch.as_ref().unchecked_ref(), TOKEN_WATCH_MS).map_err(failed)?;
+    let read = async {
+        // The last look before the request leaves.
+        cache::check_still(&held).map_err(stopped)?;
+        let response: web_sys::Response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str_and_init(endpoint, &init))
+            .await
+            .map_err(failed)?
+            .dyn_into()
+            .map_err(failed)?;
+        let status = response.status();
+        if response
+            .headers()
+            .get("content-length")
+            .ok()
+            .flatten()
+            .and_then(|l| l.parse::<usize>().ok())
+            .is_some_and(|n| n > arcgis_token::MAX_ANSWER)
+        {
+            return Err(arcgis_token::TOO_LARGE.to_string());
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        if let Some(stream) = response.body() {
+            let reader: web_sys::ReadableStreamDefaultReader =
+                stream.get_reader().dyn_into().map_err(|_| arcgis_token::FAILED.to_string())?;
+            loop {
+                let chunk = wasm_bindgen_futures::JsFuture::from(reader.read()).await.map_err(failed)?;
+                if js_sys::Reflect::get(&chunk, &"done".into()).ok().and_then(|d| d.as_bool()).unwrap_or(true) {
+                    break;
+                }
+                let value = js_sys::Uint8Array::new(&js_sys::Reflect::get(&chunk, &"value".into()).map_err(failed)?);
+                if bytes.len() + value.length() as usize > arcgis_token::MAX_ANSWER {
+                    let _ = reader.cancel();
+                    return Err(arcgis_token::TOO_LARGE.to_string());
+                }
+                let at = bytes.len();
+                bytes.resize(at + value.length() as usize, 0);
+                value.copy_to(bytes.get_mut(at..).unwrap_or_default());
+            }
+        }
+        // An answer that arrives after a cancel, or past the deadline a throttled timer missed, is discarded.
+        cache::check_still(&held).map_err(stopped)?;
+        if began.elapsed() >= std::time::Duration::from_secs(arcgis_token::DEADLINE_SECS) {
+            return Err(arcgis_token::TIMED_OUT.to_string());
+        }
+        arcgis_token::from_answer(status, &bytes, arcgis_token::now_millis())
+    };
+    let result = read.await;
+    window.clear_interval_with_handle(timer);
+    abort.abort();
+    drop(watch);
+    // An abort reads as the browser's failure: what the watchdog saw is why.
+    result.map_err(|e| why.get().map(str::to_string).unwrap_or(e))
 }

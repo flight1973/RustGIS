@@ -156,6 +156,7 @@ pub fn geolibre_passed_over() -> Option<String> {
 fn geolibre_languages() -> Value {
     #[cfg(all(feature = "geolibre", not(target_arch = "wasm32")))]
     {
+        rustgis_geolibre::langpack::check_kept();
         let errors: serde_json::Map<String, Value> =
             rustgis_geolibre::langpack::load_errors().into_iter().map(|(locale, e)| (locale, Value::String(e))).collect();
         json!({"available": rustgis_geolibre::langpack::LOCALES, "installed": rustgis_geolibre::langpack::kept(),
@@ -1210,7 +1211,8 @@ struct MapInputs<'a> {
     /// The rows of each layer (by lowercase name) the tool runs on: the selection or the
     /// environment's extent.
     rows: std::collections::HashMap<String, Vec<usize>>,
-    /// Streamed layers the tool reads, loaded whole (by lowercase name).
+    /// Streamed layers the tool reads, loaded whole, and copies of layers in another system than
+    /// longitude/latitude, converted ([`lonlat_inputs`]), by lowercase name.
     loaded: std::collections::HashMap<String, Dataset>,
     /// Import warnings from local file inputs, kept in the tool result and history.
     messages: Vec<String>,
@@ -1265,27 +1267,10 @@ fn inputs_of<'a>(snap: Snapshot<'a>, spec: Option<&rustgis_analysis::ToolSpec>, 
             }
         }
     }
+    #[cfg(target_arch = "wasm32")]
+    let mut full = full;
+    lonlat_inputs(&snap.map, spec, params, &mut full)?;
     let mut rows = env_inputs(&snap.map, &full, &snap.env, params)?;
-    for (name, dataset) in &full {
-        let Some(layer) = snap.map.layer_by_name(name).filter(|l| !l.selection.is_empty()) else { continue };
-        let missing = || format!("{}: a selected feature is no longer in the source", layer.name);
-        let mut by_id = layer
-            .selection
-            .iter()
-            .map(|row| layer.dataset.features.get(*row).map(|f| (f.id, None)).ok_or_else(missing))
-            .collect::<Result<std::collections::HashMap<u64, Option<usize>>, _>>()?;
-        for (row, feature) in dataset.features.iter().enumerate() {
-            if let Some(selected_row) = by_id.get_mut(&feature.id) {
-                *selected_row = Some(row);
-            }
-        }
-        let selected = layer
-            .selection
-            .iter()
-            .map(|row| layer.dataset.features.get(*row).and_then(|f| by_id.get(&f.id)).copied().flatten().ok_or_else(missing))
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.insert(name.clone(), selected);
-    }
     narrow_to_queries(&snap.map, spec, params, &full, &mut rows, &mut messages)?;
     Ok(MapInputs { snap, rows, loaded: full, messages, flat: std::cell::OnceCell::new(), view: std::cell::OnceCell::new() })
 }
@@ -1323,6 +1308,7 @@ fn narrow_to_queries(
         }
     }
     let mut seen = std::collections::HashSet::new();
+    let mut query_errors = Vec::new();
     for name in named {
         let Some(layer) = map.layer_by_name(name) else { continue };
         let key = layer.name.to_ascii_lowercase();
@@ -1330,19 +1316,22 @@ fn narrow_to_queries(
             continue;
         }
         let dataset = full.get(&key).unwrap_or(&layer.dataset);
-        let Some(keep) = layer.query_rows(dataset) else { continue };
-        let kept = |row: &usize| keep.get(*row).is_none_or(|k| *k);
-        let current = rows.get(&key).cloned().or_else(|| (!layer.selection.is_empty()).then(|| layer.selection.clone()));
-        let narrowed: Vec<usize> = match &current {
-            Some(rs) => rs.iter().copied().filter(kept).collect(),
-            None => (0..keep.len()).filter(kept).collect(),
-        };
-        if narrowed.is_empty() && !keep.is_empty() {
-            return Err(format!("{}: its definition query hides every feature the tool would read", layer.name));
+        let resolved = layer.resolve_rows(dataset, rustgis_map::rows::Policy::SelectionAndQuery, rows.get(&key).map(Vec::as_slice))?;
+        if let Some(error) = resolved.query_error {
+            query_errors.push(format!("{}: {error}", layer.name));
         }
-        if narrowed.len() < current.as_ref().map_or(keep.len(), Vec::len) {
+        if let rustgis_map::rows::Rows::Subset(narrowed) = resolved.rows {
+            if narrowed.is_empty() && !dataset.features.is_empty() {
+                return Err(format!("{}: its definition query hides every feature the tool would read", layer.name));
+            }
             rows.insert(key, narrowed);
         }
+    }
+    if !query_errors.is_empty() {
+        let count = query_errors.len();
+        let (layers, queries) = if count == 1 { ("layer", "that query") } else { ("layers", "those queries") };
+        messages
+            .push(format!("{count} {layers} with an unreadable definition query; reading without {queries}: {}", query_errors.join("; ")));
     }
     let name = spec.map_or("", |t| t.name);
     let mut told = std::collections::HashSet::new();
@@ -1396,6 +1385,47 @@ fn streamed_inputs(
         }
     }
     Ok((full, said))
+}
+
+/// The layers a tool reads, in longitude/latitude, the space analysis tools work in
+/// ([`Inputs::dataset`]): those read whole (streamed layers, files) converted where they are, and
+/// a converted copy of each other layer it names whose coordinates are in another system. Nothing
+/// is copied while every dataset is in longitude/latitude, as every one is today.
+fn lonlat_inputs(
+    map: &rustgis_map::Map,
+    spec: Option<&rustgis_analysis::ToolSpec>,
+    params: &Value,
+    full: &mut std::collections::HashMap<String, Dataset>,
+) -> Result<(), String> {
+    for ds in full.values_mut() {
+        if let std::borrow::Cow::Owned(converted) = ds.in_lonlat()? {
+            *ds = converted;
+        }
+    }
+    // Every text the parameters hold that names a layer, not only layer parameters: a tool may
+    // name one elsewhere, and a layer it reads must be in longitude/latitude.
+    fn texts<'v>(v: &'v Value, out: &mut Vec<&'v str>) {
+        match v {
+            Value::String(s) => out.push(s),
+            Value::Array(a) => a.iter().for_each(|x| texts(x, out)),
+            Value::Object(o) => o.values().for_each(|x| texts(x, out)),
+            _ => {}
+        }
+    }
+    let mut names = layer_names(spec, params);
+    texts(params, &mut names);
+    for n in names {
+        let key = n.to_ascii_lowercase();
+        if full.contains_key(&key) {
+            continue;
+        }
+        if let Some(l) = map.layer_by_name(n).filter(|l| !l.is_raster())
+            && let std::borrow::Cow::Owned(converted) = l.dataset.in_lonlat()?
+        {
+            full.insert(key, converted);
+        }
+    }
+    Ok(())
 }
 
 /// The executor's source-read choice, shared with pure permission planning.
@@ -1471,11 +1501,13 @@ fn env_rows(
         .filter(|l| !l.is_raster() && l.selection.is_empty())
         .map(|l| {
             let ds = full.get(&l.name.to_ascii_lowercase()).unwrap_or(&l.dataset);
+            // The extent in the layer's own coordinates, as its features' boxes are.
+            let own = ds.extent_from_lonlat(&e);
             let rows: Vec<usize> = ds
                 .features
                 .iter()
                 .enumerate()
-                .filter(|(_, f)| f.geometry.as_ref().is_some_and(|g| g.extent().intersects(&e)))
+                .filter(|(_, f)| f.geometry.as_ref().is_some_and(|g| g.extent().intersects(&own)))
                 .map(|(i, _)| i)
                 .collect();
             (l.name.to_ascii_lowercase(), rows)
@@ -1506,7 +1538,10 @@ impl Inputs for MapInputs<'_> {
         self.loaded
             .get(layer)
             .or_else(|| self.loaded.get(&layer.to_ascii_lowercase()))
-            .or_else(|| project_input(&self.snap.map, &self.snap.tables, layer, false).map(|i| i.dataset()))
+            // A layer read as it is only in longitude/latitude: one in another system is
+            // converted before the run ([`lonlat_inputs`]) when the tool names it, and isn't read
+            // in its own coordinates otherwise.
+            .or_else(|| project_input(&self.snap.map, &self.snap.tables, layer, false).map(|i| i.dataset()).filter(|d| d.edits_in_lonlat()))
     }
     fn table(&self, id: u32) -> Option<&Dataset> {
         self.snap.tables.iter().find(|t| t.id == id).map(|t| &t.dataset)
@@ -2887,7 +2922,8 @@ fn apply_with(
         }
         Output::Update { layer, dataset } => {
             let l = s.map_mut().layers.iter_mut().find(|l| l.name.eq_ignore_ascii_case(&layer)).ok_or("the input layer disappeared")?;
-            l.dataset = dataset;
+            // Made in longitude/latitude, written back in the layer's own coordinates.
+            l.dataset = l.dataset.results_from_lonlat(dataset)?;
             // Under the layer's name now: a background run's layer may have been renamed meanwhile.
             l.dataset.name.clone_from(&l.name);
             // A streamed layer updated by a tool holds the whole result in memory from now on.

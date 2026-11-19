@@ -54,8 +54,9 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<Layer>> {
         path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("kmz")) || bytes.starts_with(b"PK\x03\x04");
     let owned;
     let text_bytes: &[u8] = if is_kmz {
-        // Inflated within the size a file may be read at.
-        let budget = usize::try_from(crate::io::MAX_BYTES).unwrap_or(usize::MAX);
+        // Inflated within the size every computer reads (a KML or KMZ is read as it is added, on
+        // the UI thread in the desktop app, so it stays there, #2408).
+        let budget = usize::try_from(crate::io::BYTES_FLOOR).unwrap_or(usize::MAX);
         let mut entries = crate::zip::read_matching_within(bytes, |n| n.to_ascii_lowercase().ends_with(".kml"), budget)
             .map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
         // doc.kml by convention, else the shallowest .kml.
@@ -102,13 +103,21 @@ pub struct GroundOverlay {
     pub rotation: f64,
 }
 
-/// The ground overlays a document lays out, and how many it has that can't be drawn (a
-/// `gx:LatLonQuad`, no picture, a bad box). A KMZ's pictures are returned with them; other
-/// documents name theirs by `href` only.
-pub fn ground_overlays(file_name: &str, bytes: &[u8]) -> Result<(Vec<(GroundOverlay, Option<Vec<u8>>)>, usize)> {
+/// A document's ground overlays: those it lays out (with a KMZ's pictures; other documents name
+/// theirs by `href` only), how many can't be drawn (a `gx:LatLonQuad`, no picture, a bad box), and
+/// how many of a KMZ's are left out because their pictures' copies would pass the archive's budget.
+pub type Overlays = (Vec<(GroundOverlay, Option<Vec<u8>>)>, usize, usize);
+
+/// The ground overlays a document lays out ([`Overlays`]).
+pub fn ground_overlays(file_name: &str, bytes: &[u8]) -> Result<Overlays> {
+    // As [`read`] inflates it: within the size every computer reads.
+    ground_overlays_within(file_name, bytes, usize::try_from(crate::io::BYTES_FLOOR).unwrap_or(usize::MAX))
+}
+
+/// [`ground_overlays`] with a KMZ expanded, and its pictures copied, within `budget` bytes.
+fn ground_overlays_within(file_name: &str, bytes: &[u8], budget: usize) -> Result<Overlays> {
     let is_kmz = std::path::Path::new(file_name).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("kmz"))
         || bytes.starts_with(b"PK\x03\x04");
-    let budget = usize::try_from(crate::io::MAX_BYTES).unwrap_or(usize::MAX);
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     let owned;
     let (doc_bytes, doc_dir): (&[u8], String) = if is_kmz {
@@ -126,6 +135,13 @@ pub fn ground_overlays(file_name: &str, bytes: &[u8]) -> Result<(Vec<(GroundOver
     let doc = crate::xml::parse(text.trim_start_matches('\u{feff}'), opts).map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
     let mut out = Vec::new();
     let mut undrawn = 0usize;
+    // The pictures handed back are copies, one for each overlay naming one: together within the
+    // budget the archive was expanded within, less the archive and the document's copy (held
+    // while they are copied), so many overlays of one large picture aren't many copies of it. Past that an
+    // overlay is left out, and counted.
+    let held: usize = entries.iter().map(|(_, b)| b.len()).sum::<usize>() + if is_kmz { doc_bytes.len() } else { 0 };
+    let mut pictures_left = budget.saturating_sub(held);
+    let mut over_budget = 0usize;
     let all = doc.descendants().filter(|n| n.is_element() && local(n) == "GroundOverlay").count();
     // Past the first 256, overlays are counted as not drawn.
     undrawn += all.saturating_sub(256);
@@ -151,17 +167,25 @@ pub fn ground_overlays(file_name: &str, bytes: &[u8]) -> Result<(Vec<(GroundOver
             continue;
         }
         // A KMZ's picture, by its path relative to the document.
-        let picture = is_kmz.then(|| {
+        let found = is_kmz.then(|| {
             let want = format!("{doc_dir}{}", href.trim_start_matches("./"));
             entries
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case(&want) || n.eq_ignore_ascii_case(href.trim_start_matches("./")))
-                .map(|(_, b)| b.clone())
+                .map(|(_, b)| b)
         });
+        if let Some(Some(b)) = found {
+            let Some(left) = pictures_left.checked_sub(b.len()) else {
+                over_budget += 1;
+                continue;
+            };
+            pictures_left = left;
+        }
+        let picture = found.map(|b| b.cloned());
         let name = child_text(&g, "name").unwrap_or_else(|| "Ground overlay".into());
         out.push((GroundOverlay { name, href, bbox: [w, s, e, n], rotation }, picture.flatten()));
     }
-    Ok((out, undrawn))
+    Ok((out, undrawn, over_budget))
 }
 
 /// One placemark, before it's put in a layer.
@@ -201,9 +225,18 @@ fn child<'a, 'i>(n: &Node<'a, 'i>, name: &str) -> Option<Node<'a, 'i>> {
     n.children().find(|c| c.is_element() && local(c) == name)
 }
 
+/// The text and CDATA children joined, keeping description whitespace as data.
+fn raw_text_of(n: &Node) -> String {
+    n.children().filter(|c| c.is_text()).filter_map(|c| c.text()).collect()
+}
+
 /// The text of an element (its text and CDATA children joined), trimmed.
 fn text_of(n: &Node) -> String {
-    n.children().filter(|c| c.is_text()).filter_map(|c| c.text()).collect::<String>().trim().to_string()
+    raw_text_of(n).trim().to_string()
+}
+
+fn data_text(n: &Node, key: &str) -> String {
+    if key == "description" { raw_text_of(n) } else { text_of(n) }
 }
 
 fn child_text(n: &Node, name: &str) -> Option<String> {
@@ -436,8 +469,10 @@ impl Reader {
         if let Some(ext) = child(pm, "ExtendedData") {
             for d in ext.descendants().filter(|d| d.is_element()) {
                 let pair = match local(&d) {
-                    "Data" => d.attribute("name").map(|k| (k.to_string(), child_text(&d, "value").unwrap_or_default())),
-                    "SimpleData" => d.attribute("name").map(|k| (k.to_string(), text_of(&d))),
+                    "Data" => {
+                        d.attribute("name").map(|k| (k.to_string(), child(&d, "value").map(|v| data_text(&v, k)).unwrap_or_default()))
+                    }
+                    "SimpleData" => d.attribute("name").map(|k| (k.to_string(), data_text(&d, k))),
                     _ => None,
                 };
                 if let Some((k, v)) = pair.filter(|(k, _)| !k.trim().is_empty()) {
@@ -463,7 +498,7 @@ impl Reader {
         let style = self.style_for(pm);
         let folder = folders.iter().filter(|f| !f.is_empty()).cloned().collect::<Vec<_>>().join(" / ");
         let name = child_text(pm, "name");
-        let description = child_text(pm, "description");
+        let description = child(pm, "description").map(|n| raw_text_of(&n));
         // A placemark mixing kinds (a MultiGeometry of a point and a line) gives one feature per
         // kind, each in its layer.
         let mut any = false;
@@ -529,7 +564,7 @@ impl Reader {
                 };
                 r.data.iter().find(|(dk, _)| dk == k).is_none_or(|(_, v)| v == fixed.unwrap_or_default())
             };
-            if self.rows.iter().all(repeats) {
+            if (i != 1 || k == "description") && self.rows.iter().all(repeats) {
                 continue;
             }
             let column = crate::io::free_column_name(&taken, k);
@@ -613,6 +648,23 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A KMZ's overlays of one picture are copied within the archive's budget; those past it are
+    /// left out and counted apart from those that can't be drawn.
+    #[test]
+    fn overlay_pictures_are_copied_within_the_budget() {
+        let overlay = r#"<GroundOverlay><Icon><href>p.png</href></Icon><LatLonBox><north>1</north><south>0</south><east>1</east><west>0</west></LatLonBox></GroundOverlay>"#;
+        let doc = format!(r#"<kml xmlns="http://www.opengis.net/kml/2.2"><Document>{}</Document></kml>"#, overlay.repeat(5));
+        let kmz = crate::zip::write(&[("doc.kml".to_string(), doc.clone().into_bytes()), ("p.png".to_string(), vec![7; 1000])]).unwrap();
+        // Room for the archive, the document's copy and two and a half copies of the picture:
+        // two are made.
+        let max = (2 * doc.len() + 1000 + 2500) as u64;
+        let (out, undrawn, over_budget) = ground_overlays_within("a.kmz", &kmz, max as usize).unwrap();
+        assert_eq!((out.len(), undrawn, over_budget), (2, 0, 3));
+        assert!(out.iter().all(|(_, p)| p.as_deref().is_some_and(|p| p.len() == 1000)));
+        let (out, _, over_budget) = ground_overlays("a.kmz", &kmz).unwrap();
+        assert_eq!((out.len(), over_budget), (5, 0));
+    }
 
     const DOC: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2">
@@ -734,8 +786,8 @@ mod tests {
         let said = format!("trip lines: {}", crate::zm_note(Some(1)));
         assert!(layers[1].report.messages.contains(&said), "{:?}", layers[1].report.messages);
         // The ground overlay has no box: it can't be laid out.
-        let (overlays, undrawn) = ground_overlays("t.kml", DOC.as_bytes()).unwrap();
-        assert_eq!((overlays.len(), undrawn), (0, 1));
+        let (overlays, undrawn, over_budget) = ground_overlays("t.kml", DOC.as_bytes()).unwrap();
+        assert_eq!((overlays.len(), undrawn, over_budget), (0, 1, 0));
 
         let lines = &layers[1].dataset;
         assert_eq!(lines.features.len(), 2, "the route and the track");
@@ -749,6 +801,141 @@ mod tests {
         let style = polys.dataset.value(0, polys.dataset.field_index("style").unwrap()).to_string();
         assert_eq!(style, "#inline-1");
         assert_eq!(polys.styles[0].1.fill, Some([0, 170, 0, 255]));
+    }
+
+    #[test]
+    fn exported_text_descriptions_keep_their_column_on_repeated_kml_and_kmz_round_trips() {
+        let descriptions = [
+            Some("<b>Café & \"river\"</b>\nSecond line"),
+            Some("]]> <plain> & text"),
+            Some("a\rb"),
+            Some("a\r\nb"),
+            Some("a\u{7f}b\u{85}c\u{9f}"),
+            Some(" padded \n"),
+            Some("\t  \r\n "),
+            Some(""),
+            None,
+        ];
+        for ext in ["kml", "kmz"] {
+            let mut ds = Dataset::new(
+                "places",
+                GeometryType::Point,
+                vec![Field::new("name", FieldType::Text), Field::new("description", FieldType::Text)],
+            );
+            for (row, description) in descriptions.iter().enumerate() {
+                ds.push(
+                    Some(Geometry::Point(Coord::new(row as f64, 2.0))),
+                    vec![Value::Text(format!("Place {row}")), description.map(|v| Value::Text(v.into())).unwrap_or_default()],
+                );
+            }
+            for _ in 0..3 {
+                let xml = crate::interop::to_kml(&ds, Some(0)).unwrap();
+                let doc = roxmltree::Document::parse(&xml).unwrap();
+                let placemarks: Vec<_> =
+                    doc.descendants().filter(|n| n.has_tag_name(("http://www.opengis.net/kml/2.2", "Placemark"))).collect();
+                for (pm, expected) in placemarks.iter().zip(descriptions) {
+                    assert_eq!(child(pm, "description").map(|n| raw_text_of(&n)).as_deref(), expected);
+                }
+                let (bytes, skipped) = crate::io::write_bytes(&ds, ext).unwrap();
+                assert_eq!(skipped, 0);
+                let layers = read(&format!("places.{ext}"), &bytes).unwrap();
+                assert_eq!(layers.len(), 1);
+                let layer = &layers[0];
+                assert!(layer.report.messages.is_empty(), "{ext}: {:?}", layer.report.messages);
+                let back = &layer.dataset;
+                assert!(back.field_index("description_1").is_none());
+                let fi = back.field_index("description").unwrap();
+                for (row, expected) in descriptions.iter().enumerate() {
+                    let expected = expected.map(|v| Value::Text(v.into())).unwrap_or_default();
+                    assert_eq!(back.value(row, fi), &expected, "{ext}, row {row}");
+                }
+                ds = back.clone();
+            }
+        }
+    }
+
+    #[test]
+    fn unrepresentable_description_characters_are_refused_with_their_count_and_location() {
+        for bad in ['\0', '\u{b}', '\u{1b}', '\u{1f}', '\u{fffe}', '\u{ffff}'] {
+            let mut ds = Dataset::new("places", GeometryType::Point, vec![Field::new("description", FieldType::Text)]);
+            ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Text(format!("a{bad}b{bad}c"))]);
+            let error = crate::interop::to_kml(&ds, None).unwrap_err().to_string();
+            assert!(error.contains("places") && error.contains(&format!("feature id {}", ds.features[0].id)), "{error}");
+            assert!(error.contains("description: 2 character(s)") && error.contains(&format!("U+{:04X}", bad as u32)), "{error}");
+            for ext in ["kml", "kmz"] {
+                assert_eq!(crate::io::write_bytes(&ds, ext).unwrap_err().to_string(), error);
+            }
+        }
+    }
+
+    #[test]
+    fn description_copies_keep_whitespace_in_data_and_simple_data() {
+        for copy in [
+            "<Data name=\"description\"><value> padded &#13;\n</value></Data>",
+            "<SchemaData><SimpleData name=\"description\"> padded &#13;\n</SimpleData></SchemaData>",
+        ] {
+            let xml = format!(
+                "<kml><Placemark><description> padded &#13;\n</description><ExtendedData>{copy}</ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark></kml>"
+            );
+            let layers = read("spaces.kml", xml.as_bytes()).unwrap();
+            let layer = &layers[0];
+            assert!(layer.report.messages.is_empty(), "{:?}", layer.report.messages);
+            let ds = &layer.dataset;
+            assert_eq!(ds.value(0, ds.field_index("description").unwrap()), &Value::Text(" padded \r\n".into()));
+            assert!(ds.field_index("description_1").is_none());
+        }
+    }
+
+    #[test]
+    fn exported_case_variant_descriptions_stay_distinct_from_the_canonical_column() {
+        for variant in ["Description", "DESCRIPTION"] {
+            for other in ["Keep case", "Another value"] {
+                for ext in ["kml", "kmz"] {
+                    let mut ds = Dataset::new(
+                        "places",
+                        GeometryType::Point,
+                        vec![
+                            Field::new("name", FieldType::Text),
+                            Field::new("description", FieldType::Text),
+                            Field::new(variant, FieldType::Text),
+                        ],
+                    );
+                    ds.push(
+                        Some(Geometry::Point(Coord::new(1.0, 2.0))),
+                        vec![Value::Text("Place".into()), Value::Text("Keep case".into()), Value::Text(other.into())],
+                    );
+                    let (bytes, _) = crate::io::write_bytes(&ds, ext).unwrap();
+                    let layers = read(&format!("places.{ext}"), &bytes).unwrap();
+                    let layer = &layers[0];
+                    let back = &layer.dataset;
+                    assert_eq!(back.value(0, back.field_index("description").unwrap()), &Value::Text("Keep case".into()));
+                    assert_eq!(back.value(0, back.field_index(&format!("{variant}_1")).unwrap()), &Value::Text(other.into()));
+                    assert_eq!(layer.report.messages.len(), 1, "{:?}", layer.report.messages);
+                    assert!(layer.report.messages[0].contains(&format!("'{variant}' → '{variant}_1'")), "{:?}", layer.report.messages);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exported_other_reserved_columns_still_report_their_collisions() {
+        for (name, ty, value) in [
+            ("description", FieldType::Double, Value::Float(2.5)),
+            ("Description", FieldType::Text, Value::Text("Keep case".into())),
+            ("folder", FieldType::Text, Value::Text("My folder".into())),
+            ("style", FieldType::Text, Value::Text("My style".into())),
+        ] {
+            let mut ds = Dataset::new("places", GeometryType::Point, vec![Field::new(name, ty)]);
+            ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![value.clone()]);
+            let xml = crate::interop::to_kml(&ds, None).unwrap();
+            assert!(!xml.contains("<description>"), "{xml}");
+            let layers = read("places.kml", xml.as_bytes()).unwrap();
+            let layer = &layers[0];
+            let fi = layer.dataset.field_index(&format!("{name}_1")).unwrap();
+            assert_eq!(layer.dataset.value(0, fi), &value);
+            assert_eq!(layer.report.messages.len(), 1, "{:?}", layer.report.messages);
+            assert!(layer.report.messages[0].contains("renamed"), "{:?}", layer.report.messages);
+        }
     }
 
     #[test]

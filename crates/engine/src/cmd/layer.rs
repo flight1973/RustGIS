@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rustgis_data::{GeometryType, photo};
+use rustgis_data::{Dataset, GeometryType, photo};
 use rustgis_map::symbology::{ClassRef, ClassStyle, LABEL_SIZE, MAX_STROKES};
 use rustgis_map::{
     ClassMethod, Glyph, HiddenFills, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, Marker, NoFill, Picture, Placements, Ramp,
@@ -21,7 +21,7 @@ pub const MAX_LAYER_NAME: usize = 200;
 pub fn commands() -> Vec<C> {
     vec![
         C::new("layer.addData", "Add Data", "Home › Add", add_data).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
-            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer", "paperSpace"?: "bool: a DXF's layout entities too", "blocks"?: "bool: a DXF's block (图块) contents, true by default", "stream"?: bool, "as"?: "scan" (a TIFF, PNG or JPEG, even a photo or a GeoTIFF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a DXF (which never says), a CityJSON or CityGML model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say (GDAL takes an authority code such as EPSG:2263 or the exact names WGS84, WGS72, NAD27, NAD83, not WKT or a file)", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
+            .params(r#"{"path": string, "name"?: string, "layer"?: "GeoPackage, GDAL, DuckDB or DXF layer, or a PDF's page number (the first when left out or blank)", "paperSpace"?: "bool: a DXF's layout entities too", "blocks"?: "bool: a DXF's block (图块) contents, true by default", "stream"?: bool, "as"?: "scan" (a TIFF, PNG, JPEG or PDF page, even a photo, a GeoTIFF or a GeoPDF, as a picture with no coordinates), "crs"?: "EPSG:… (or WKT) for Shapefile coordinates (overrides .prj), a CSV, a DXF (which never says), a CityJSON or CityGML model (it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows), or a GDAL or DuckDB file that doesn't say (GDAL takes an authority code such as EPSG:2263 or the exact names WGS84, WGS72, NAD27, NAD83, not WKT or a file)", "x"?: "CSV x/longitude column", "y"?: "CSV y/latitude column", "wkt"?: "CSV WKT geometry column", "delimiter"?: ","|";"|"\\t"|"|"}"#),
         C::new("layer.addPhotos", "Add Photos", "Home › Add", add_photos).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
             r#"{"paths"?: [JPEG photo files], "folder"?: "a folder of photos (every JPEG in it)", "name"?: "the layer (default Photos; photos join it when it exists)"}"#,
         ),
@@ -150,7 +150,7 @@ pub fn commands() -> Vec<C> {
         .when(need_layer),
         C::new("layer.symbology", "Symbology", "Style › Drawing", symbology).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
-            .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "expression"?: text|null (unique: class by this expression's values instead of a field; blank or null: by a field; with neither key, Unique Values keep the layer's expression), "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile"|"geometricInterval"|"standardDeviation"|"arithmeticProgression"|"headTailBreaks"|"manual", "breaks"?: [numbers] (manual: the classes' upper bounds, closed by the field's largest value), "ramp"?: string}"#),
+            .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "expression"?: expression|null (unique: class by this expression's values instead of a field; blank or null: by a field; with neither key, Unique Values keep the layer's expression), "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile"|"geometricInterval"|"standardDeviation"|"arithmeticProgression"|"headTailBreaks"|"manual", "breaks"?: [numbers] (manual: the classes' upper bounds, closed by the field's largest value), "ramp"?: string}"#),
         C::new("layer.ramp", "Color Scheme", "Style › Drawing", |s, p| {
             let r = s.ramp(s_req(p, "ramp")?)?;
             let mut dropped = None;
@@ -347,12 +347,12 @@ pub fn commands() -> Vec<C> {
         C::new("layer.lineStrokes", "Line Strokes", "Style › Drawing", line_strokes).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_lines_or_points)
             .params(
-                r##"{"layer"?, "strokes": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the renderer's line colour), "width"?: points|null (null: the renderer's width), "offset"?: points (positive: right of the line's direction, negative: left), "cap"?: "round"|"flat"|"square", "join"?: "round"|"miter"|"bevel", "level"?: 0..255|null (with layer.strokeLevels: the level it draws at; null: its place in the stack), "dash"?: [points, …]|null (dash, gap, … in turn, at most 8; null: solid), "markers"?: {"mark"?: "circle"|"square"|"triangle"|"diamond"|"star"|"character"|"hash" (a mark across the line), "char"?: text (a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "size"?: points (a marker's size, a hash mark's length; default 4), "at"?: "interval"|"vertices"|"innerVertices"|"first"|"last"|"middle"|"segmentMiddles" or a list of them (default "interval"), "interval"?: points (default 12), "offsetAlong"?: points (from the start, back from the end, on from the middle), "rotate"?: bool (turned with the line; default true), "averageAngle"?: points (the stretch of line a marker at an interval turns with; 0: its segment), "angle"?: degrees clockwise (a hash mark at 0 crosses the line square), "outline"?: "#RRGGBB"|"#RRGGBBAA" (the markers' outline, as wide as the stroke)}|null (markers or hash marks along the line in the stroke's colour, instead of a line; cap, join and dash don't apply)}] (drawn bottom first; [] goes back to the single stroke, or for a class to the layer's strokes; on a point layer they are its marks: each stroke's markers drawn at the point in place of the symbol's, "offsetAlong" shifting a mark right and "offset" down, both turned with its "angle", and "rotate" turning it by layer.markerRotation's field), "value"?: text|number (a Unique Values class's own strokes), "index"?: number (a Graduated Colors class's, 0 = the lowest), "other"?: true (Unique Values' <all other values>)}"##,
+                r##"{"layer"?, "strokes": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the renderer's line colour), "width"?: points|null (null: the renderer's width), "offset"?: points (positive: right of the line's direction, negative: left), "cap"?: "round"|"flat"|"square", "join"?: "round"|"miter"|"bevel", "level"?: 0..255|null (with layer.strokeLevels: the level it draws at; null: its place in the stack), "dash"?: [points, …]|null (dash, gap, … in turn, at most 8; null: solid), "markers"?: {"mark"?: "circle"|"square"|"triangle"|"diamond"|"star"|"character"|"image"|"hash" (a mark across the line), "char"?: text (a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "image"?: text (a PNG or JPEG image as base64 of at most 2 MiB, as the marker instead of a shape: as wide as its size, as tall as its proportions make it; the stroke's colour and the outline don't show), "size"?: points (a marker's size, a hash mark's length; default 4), "at"?: "interval"|"vertices"|"innerVertices"|"first"|"last"|"middle"|"segmentMiddles" or a list of them (default "interval"), "interval"?: points (default 12), "offsetAlong"?: points (from the start, back from the end, on from the middle), "rotate"?: bool (turned with the line; default true), "averageAngle"?: points (the stretch of line a marker at an interval turns with; 0: its segment), "angle"?: degrees clockwise (a hash mark at 0 crosses the line square), "outline"?: "#RRGGBB"|"#RRGGBBAA" (the markers' outline, as wide as the stroke)}|null (markers or hash marks along the line in the stroke's colour, instead of a line; cap, join and dash don't apply)}] (drawn bottom first; [] goes back to the single stroke, or for a class to the layer's strokes; on a point layer they are its marks: each stroke's markers drawn at the point in place of the symbol's, "offsetAlong" shifting a mark right and "offset" down, both turned with its "angle", and "rotate" turning it by layer.markerRotation's field), "value"?: text|number (a Unique Values class's own strokes), "index"?: number (a Graduated Colors class's, 0 = the lowest), "other"?: true (Unique Values' <all other values>)}"##,
             ),
         C::new("layer.fillLayers", "Fill Layers", "Style › Drawing", fill_layers).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_polygon_features)
             .params(
-                r##"{"layer"?, "value"?|"index"?|"other"?: a class of Unique Values (its value, or other: true) or Graduated Colors (its index) to set its own fills (none: the layer's), "fills": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the feature's fill colour, so the fills follow the classes), "pattern"?: "solid" (default)|"hatch" (parallel lines)|"dots" (markers on a grid)|"gradient" (from color to color2 across the feature)|"shapeburst" (from color at the edge to color2 inside), "angle"?: degrees anticlockwise from east (hatch), "spacing"?: points between lines (hatch, 1 to 500; default 8) or points across and down between markers, a number or [across, down] (dots), "width"?: a hatch line's width in points (0 to 50; default 1), "offset"?: points across the lines (hatch) or [across, down] (dots), "marker"?: "circle"|"square"|"triangle"|"diamond"|"star" (dots), "char"?: text (dots: a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "size"?: a marker's size in points (default 3), "outline"?: a marker's outline colour or null, "outlineWidth"?: points, "displacement"?: [across, down] points every other row and column are shifted by (dots), "color2"?: "#RRGGBB"|"#RRGGBBAA" (gradient, shapeburst: the second colour; default white), "stops"?: [[0..1, "#RRGGBB"|"#RRGGBBAA"], …] (gradient, shapeburst: colours between the two, at most 16), "discrete"?: bool (each colour held until the next stop), "shape"?: "linear" (default)|"radial"|"conical" (gradient), "from"?: [across, down]|"centroid" (gradient: where color is, 0..1 in the feature's box; default [0.5, 0], the top middle), "to"?: [across, down]|"centroid" (where color2 is; default [0.5, 1]), "spread"?: "pad" (default)|"reflect"|"repeat" (gradient: past its points), "angle"?: degrees anticlockwise (gradient: turned round its box's middle), "inView"?: bool (gradient: from and to in the map view's box, not the feature's), "distance"?: points|null (shapeburst: how deep it shades; null or none: to the point deepest inside), "blur"?: 0..17 (shapeburst: pixels), "ignoreRings"?: bool (shapeburst: holes' edges left out)}] (bottom first, at most 8; [] for the symbol's single fill; the outline is drawn over them)}"##,
+                r##"{"layer"?, "value"?|"index"?|"other"?: a class of Unique Values (its value, or other: true) or Graduated Colors (its index) to set its own fills (none: the layer's), "fills": [{"color"?: "#RRGGBB"|"#RRGGBBAA"|null (null: the feature's fill colour, so the fills follow the classes), "pattern"?: "solid" (default)|"hatch" (parallel lines)|"dots" (markers on a grid)|"gradient" (from color to color2 across the feature)|"shapeburst" (from color at the edge to color2 inside), "angle"?: degrees anticlockwise from east (hatch), "spacing"?: points between lines (hatch, 1 to 500; default 8) or points across and down between markers, a number or [across, down] (dots), "width"?: a hatch line's width in points (0 to 50; default 1), "offset"?: points across the lines (hatch) or [across, down] (dots), "marker"?: "circle"|"square"|"triangle"|"diamond"|"star"|"image" (dots), "char"?: text (dots: a character of a font as the marker instead of a shape), "font"?: text (the installed family it is drawn from; none: the label font), "image"?: text (dots: a PNG or JPEG image as base64 of at most 2 MiB, as the marker instead of a shape: as wide as its size, as tall as its proportions make it; the colour and the outline don't show), "size"?: a marker's size in points (default 3), "outline"?: a marker's outline colour or null, "outlineWidth"?: points, "displacement"?: [across, down] points every other row and column are shifted by (dots), "color2"?: "#RRGGBB"|"#RRGGBBAA" (gradient, shapeburst: the second colour; default white), "stops"?: [[0..1, "#RRGGBB"|"#RRGGBBAA"], …] (gradient, shapeburst: colours between the two, at most 16), "discrete"?: bool (each colour held until the next stop), "shape"?: "linear" (default)|"radial"|"conical" (gradient), "from"?: [across, down]|"centroid" (gradient: where color is, 0..1 in the feature's box; default [0.5, 0], the top middle), "to"?: [across, down]|"centroid" (where color2 is; default [0.5, 1]), "spread"?: "pad" (default)|"reflect"|"repeat" (gradient: past its points), "angle"?: degrees anticlockwise (gradient: turned round its box's middle), "inView"?: bool (gradient: from and to in the map view's box, not the feature's), "distance"?: points|null (shapeburst: how deep it shades; null or none: to the point deepest inside), "blur"?: 0..17 (shapeburst: pixels), "ignoreRings"?: bool (shapeburst: holes' edges left out)}] (bottom first, at most 8; [] for the symbol's single fill; the outline is drawn over them)}"##,
             ),
         C::new("layer.markerRotation", "Marker Rotation", "Style › Drawing", |s, p| {
             let field = match p.get("field") {
@@ -382,9 +382,12 @@ pub fn commands() -> Vec<C> {
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_points)
         .params(r#"{"layer"?, "field": numeric field name|null (each point's marker turned by the angle in it, in degrees; null: not turned), "counterclockwise"?: bool (the angles run counterclockwise, as in mathematics; default clockwise, as on a compass)}"#),
+        C::new("layer.sizeBy", "Size by Field", "Style › Drawing", size_by).roles(&[]).effects(crate::policy::Effects::NONE)
+        .when(need_points)
+        .params(r#"{"layer"?, "field"?: numeric field name|null (each marker sized by its value, keeping its Unique Values or Graduated Colors class's colours; null: the classes' own sizes; left out: the mapping's field, to change its other settings), "min"?: number (the value drawn smallest; default the field's smallest, or the mapping's), "max"?: number (the value drawn largest, above min; default the field's largest, or the mapping's), "minSize"?: points (default 4, or the mapping's), "maxSize"?: points (default 24, or the mapping's), "scaling"?: "area"|"radius" (area: the marker's area grows with the value, as Proportional Symbols; radius: its size grows in a straight line, as MapLibre's; default area, or the mapping's)} (values past min or max take the end's size; a null or non-numeric value keeps its class's size)"#),
         C::new("layer.symbolBy", "Symbol by Expression", "Style › Drawing", symbol_by).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
-            .params(r#"{"layer"?, "size"?: expression|null (a point's marker size in points), "fill"?: expression|null (the fill colour: '#RRGGBB', a CSS colour name or 'r,g,b[,a]' as color_rgb gives it), "stroke"?: expression|null (the outline colour, a line's colour), "strokeWidth"?: expression|null (the outline's width in points, a line's width), "angle"?: expression|null (point layers: each marker turned by it, in degrees clockwise, in place of layer.markerRotation's field)} (each expression in the language of queries, per feature, @map_scale the map's scale; a key left out keeps its expression, null or "" removes it; where an expression gives null the symbol's own value is drawn)"#),
+            .params(r#"{"layer"?, "size"?: expression|null (a point's marker size in points), "fill"?: expression|null (the fill colour: '#RRGGBB', a CSS colour name or 'r,g,b[,a]' as color_rgb gives it), "stroke"?: expression|null (the outline colour, a line's colour), "strokeWidth"?: expression|null (the outline's width in points, a line's width), "angle"?: expression|null (point layers: each marker turned by it, in degrees clockwise, in place of layer.markerRotation's field)} (each expression in the language of queries, per feature, @map_scale the map's scale, @page_feature_id, @page_name and @page_number the map series page (null off a series page); a key left out keeps its expression, null or "" removes it; where an expression gives null the symbol's own value is drawn)"#),
         C::new("layer.strokeLevels", "Stroke Levels", "Style › Drawing", |s, p| {
             let on = b(p, "on").ok_or("on is true or false")?;
             let id = s.layer_id(p)?;
@@ -401,10 +404,11 @@ pub fn commands() -> Vec<C> {
             let shape = ps(p, "shape").map(|n| Marker::ALL.into_iter().find(|m| m.label().eq_ignore_ascii_case(n)).ok_or("unknown marker shape")).transpose()?;
             let size = f(p, "size").map(|v| v.clamp(1.0, 80.0) as f32);
             let (ch, font) = (character(p)?, ps(p, "font"));
+            // Refused before the image is kept: a call that changes nothing keeps nothing.
+            not_empty(p.get("image"))?;
             if shape.is_some() && ch.is_some() {
                 return Err("give a shape or a char, not both".into());
             }
-            // Refused before the image is kept: a call that changes nothing keeps nothing.
             if p.get("image").is_some_and(|v| !v.is_null()) && (shape.is_some() || ch.is_some()) {
                 return Err("give a shape, a char or an image, only one".into());
             }
@@ -412,7 +416,9 @@ pub fn commands() -> Vec<C> {
             s.map().layer(id).ok_or("no such layer")?;
             // Decoded here, on the UI thread, as any command runs: at most 2 MiB of base64, whose
             // declared size is checked before the decoder, capped in memory, runs.
-            let image = picture(p)?;
+            let mut new = Vec::new();
+            let mut image = picture(p, &mut new)?;
+            keep_pictures(image.iter_mut(), new)?;
             with(s, p, |l| {
                 l.renderer.map_symbols(|sym| {
                     if let Some(m) = shape {
@@ -438,7 +444,7 @@ pub fn commands() -> Vec<C> {
             })
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_feature_layer)
-        .params(r#"{"layer"?, "shape"?: "circle"|"square"|"triangle"|"diamond"|"star", "char"?: text (a character of a font as the marker, its first; sized by the font's em), "font"?: text (the installed family the character is drawn from; "" or one not installed: the label font), "image"?: text (a PNG or JPEG image as base64, at most 2 MiB, as the marker: as wide as the size, as tall as its proportions make it; its fill and outline don't show), "size"?: number}"#),
+        .params(r#"{"layer"?, "shape"?: "circle"|"square"|"triangle"|"diamond"|"star", "char"?: text (a character of a font as the marker, its first; sized by the font's em), "font"?: text (the installed family the character is drawn from; "" or one not installed: the label font), "image"?: text (a PNG or JPEG image as base64 of at most 2 MiB, as the marker: as wide as the size, as tall as its proportions make it; its fill and outline don't show), "size"?: number}"#),
         C::new("layer.transparency", "Transparency", "Style › Effects", |s, p| {
             let t = f(p, "value").ok_or("value (0–100) is required")?.clamp(0.0, 100.0) as f32;
             with(s, p, |l| l.transparency = t)
@@ -545,6 +551,16 @@ pub fn commands() -> Vec<C> {
                 None => None,
                 Some(_) => Some(f(p, "spacing").ok_or("spacing must be a number of points")?.clamp(sp.0, sp.1) as f32),
             };
+            // How much of a line's room a fitted label is spread over (#2265; null: the default).
+            let stretch = match p.get("stretch") {
+                None => None,
+                Some(Value::Null) => Some(None),
+                Some(_) => {
+                    let st = rustgis_map::symbology::LABEL_STRETCH;
+                    let v = f(p, "stretch").filter(|v| v.is_finite()).ok_or("stretch must be a share of the line, 0.1 to 1, or null")?;
+                    Some(Some((v as f32).clamp(*st.start(), *st.end())))
+                }
+            };
             let background = match p.get("background") {
                 None => None,
                 Some(v) => Some(super::labels::background_change(v)?),
@@ -597,6 +613,9 @@ pub fn commands() -> Vec<C> {
                 if let Some(v) = spacing {
                     c.spacing = v;
                 }
+                if let Some(v) = stretch {
+                    c.stretch = v;
+                }
                 if let Some(name) = font.clone() {
                     c.font = name;
                 }
@@ -618,7 +637,7 @@ pub fn commands() -> Vec<C> {
             })
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_feature_layer)
-        .params(r##"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "size"?: number, "color"?: "#RRGGBB"|"#RRGGBBAA", "halo"?: bool, "haloColor"?: "#RRGGBB"|"#RRGGBBAA"|"" (""/null: white or dark, whichever stands out from the text), "haloWidth"?: points 0-10|null (null: the thin halo), "spacing"?: points between letters (-5 to 50), "bold"?: bool, "italic"?: bool, "font"?: installed family name (labels.fonts lists them; "" is the label font), "background"?: false|null (none) | true (white, a thin dark outline) | {"fill"?: "#RRGGBB"|"#RRGGBBAA"|"" ("": none), "stroke"?: colour|"" (the outline; "": none), "strokeWidth"?: points 0-10, "padding"?: [across, up and down] points 0-50, "radius"?: corner radius in points 0-50} (a rectangle behind the text; what isn't given is kept, or the default's), "wrapChar"?: text (a line break wherever it occurs, left out; a space puts each word on its own line; "" for none), "wrapLength"?: characters (a longest line, broken between words; 0 for none; at most 500), "lineAlign"?: "left"|"center"|"right" (how a label's lines line up)}"##),
+        .params(r##"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "size"?: number, "color"?: "#RRGGBB"|"#RRGGBBAA", "halo"?: bool, "haloColor"?: "#RRGGBB"|"#RRGGBBAA"|"" (""/null: white or dark, whichever stands out from the text), "haloWidth"?: points 0-10|null (null: the thin halo), "spacing"?: points between letters (-5 to 50), "stretch"?: share of a line's room, 0.1 to 1, a label placed curved with "fit": "auto" spreads its letters over when the line has room to spare (null: 0.6), "bold"?: bool, "italic"?: bool, "font"?: installed family name (labels.fonts lists them; "" is the label font), "background"?: false|null (none) | true (white, a thin dark outline) | {"fill"?: "#RRGGBB"|"#RRGGBBAA"|"" ("": none), "stroke"?: colour|"" (the outline; "": none), "strokeWidth"?: points 0-10, "padding"?: [across, up and down] points 0-50, "radius"?: corner radius in points 0-50} (a rectangle behind the text; what isn't given is kept, or the default's), "wrapChar"?: text (a line break wherever it occurs, left out; a space puts each word on its own line; "" for none), "wrapLength"?: characters (a longest line, broken between words; 0 for none; at most 500), "lineAlign"?: "left"|"center"|"right" (how a label's lines line up)}"##),
         C::new("layer.definitionQuery", "Definition Query", "Data › Definition Query", |s, p| {
             let q = ps(p, "where").map(str::trim).unwrap_or("").to_string();
             let id = s.layer_id(p)?;
@@ -649,7 +668,7 @@ pub fn commands() -> Vec<C> {
             with(s, p, |l| l.definition_query = if q.is_empty() { None } else { Some(q.clone()) })
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_feature_layer)
-        .params(r#"{"layer"?, "where": "SQL clause, empty to clear"}"#),
+        .params(r#"{"layer"?, "where": sql (empty to clear)}"#),
         C::new("table.open", "Attribute Table", "Data › Table", |s, p| {
             s.table_layer = Some(s.layer_id(p)?);
             Ok(Value::Null)
@@ -738,6 +757,166 @@ fn need_lines(s: &Session) -> Option<&'static str> {
     }
 }
 
+/// `layer.sizeBy`: sets (or removes) a classified point layer's marker size from a numeric
+/// field ([`rustgis_map::Layer::size_by`]). What isn't given keeps the mapping's, else the
+/// field's range, 4 to 24 points and area scaling. Desktop range scans use the background read
+/// queue with progress and Cancel; synchronous adapters must dispatch off their window thread.
+fn size_by(s: &mut Session, p: &Value) -> CmdResult {
+    use rustgis_map::symbol_by::{MAX_SIZE, SizeBy, SizeScaling};
+    // Left out, the mapping's own field (to change its other settings); null or "" removes it.
+    let field = match p.get("field") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(f)) if f.is_empty() => Some(None),
+        Some(Value::String(f)) => Some(Some(f.clone())),
+        Some(_) => return Err("field is a field's name, or null for none".into()),
+    };
+    let num = |k: &str| match p.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => f(p, k).map(Some).ok_or_else(|| format!("{k} is a number")),
+    };
+    let (min, max, min_size, max_size) = (num("min")?, num("max")?, num("minSize")?, num("maxSize")?);
+    let scaling = match p.get("scaling") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) => Some(SizeScaling::from_code(t).ok_or("scaling is \"area\" or \"radius\"")?),
+        Some(_) => return Err("scaling is \"area\" or \"radius\"".into()),
+    };
+    let id = s.layer_id(p)?;
+    let ahead = super::reads::take::<SizeRangeAhead>(s, &format!("layer.sizeBy:{id}"));
+    #[cfg(not(target_arch = "wasm32"))]
+    let on_window = s.statistics_window_thread == Some(std::thread::current().id());
+    let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+    if l.geometry_type() != GeometryType::Point || l.graphics {
+        return Err("this works on point layers".into());
+    }
+    let field = match field {
+        Some(field) => field,
+        None => Some(l.size_by.as_ref().map(|b| b.field.clone()).ok_or("give a field: the layer has no size mapping to change")?),
+    };
+    let Some(field) = field else {
+        l.size_by = None;
+        return Ok(Value::Null);
+    };
+    if !matches!(l.renderer, rustgis_map::Renderer::Unique { .. } | rustgis_map::Renderer::Graduated { .. }) {
+        return Err(
+            "size by field goes with Unique Values or Graduated Colors; a single symbol sized by a field is Proportional Symbols".into()
+        );
+    }
+    let fi = l.dataset.field_index(&field).ok_or_else(|| format!("no field named '{field}'"))?;
+    if !l.dataset.fields.get(fi).is_some_and(|fd| fd.ty.is_numeric()) {
+        return Err(format!("'{field}' is not a numeric field"));
+    }
+    let field = l.dataset.fields.get(fi).map(|fd| fd.name.clone()).unwrap_or(field);
+    // The mapping's own where it is of the same field, else the field's range.
+    let had = l.size_by.as_ref().filter(|h| l.dataset.field_index(&h.field) == Some(fi));
+    let (min, max) = (min.or(had.map(|h| h.min)), max.or(had.map(|h| h.max)));
+    let range = if min.is_none() || max.is_none() {
+        // A streamed layer holds the view's features only, so their range would be the view's.
+        if l.is_streamed() {
+            return Err("a size range needs all of a streamed layer: layer.loadAll first, or give min and max".into());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if ahead.is_none() && on_window {
+            return Err(
+                "size range detection needs the desktop background read queue; give min and max or run layer.sizeBy in the background"
+                    .into(),
+            );
+        }
+        match ahead {
+            Some(a) if a.field == fi && a.dataset.fields == l.dataset.fields && a.dataset.features.shares(&l.dataset.features) => a.range?,
+            Some(_) => return Err("the layer changed while its size range was read: ask again".into()),
+            None => size_range(&l.dataset, fi)?,
+        }
+    } else {
+        None
+    };
+    let min = min.or(range.map(|r| r.0)).ok_or_else(|| format!("'{field}' has no numeric values: give min and max"))?;
+    let max = max.or(range.map(|r| r.1)).ok_or_else(|| format!("'{field}' has no numeric values: give min and max"))?;
+    if max <= min {
+        return Err(format!("max ({max}) must be above min ({min})"));
+    }
+    if !(max - min).is_finite() {
+        return Err(format!("the range from {min} to {max} is too wide to scale sizes over"));
+    }
+    let size = |v: Option<f64>, had: Option<f32>, default: f32, k: &str| -> Result<f32, String> {
+        match v {
+            Some(v) if (0.0..=f64::from(MAX_SIZE)).contains(&v) => Ok(v as f32),
+            Some(_) => Err(format!("{k} is from 0 to {MAX_SIZE} points")),
+            None => Ok(had.unwrap_or(default)),
+        }
+    };
+    let prev = l.size_by.as_ref();
+    let min_size = size(min_size, prev.map(|h| h.min_size), 4.0, "minSize")?;
+    let max_size = size(max_size, prev.map(|h| h.max_size), 24.0, "maxSize")?;
+    let scaling = scaling.or(prev.map(|h| h.scaling)).unwrap_or_default();
+    let by = SizeBy { field, min, max, min_size, max_size, scaling };
+    let out = json!({"field": by.field, "min": by.min, "max": by.max, "minSize": by.min_size, "maxSize": by.max_size, "scaling": by.scaling.code()});
+    l.size_by = Some(by);
+    size_hidden_notice(s, id);
+    Ok(out)
+}
+
+/// Says when a layer's size mapping doesn't show because its points are aggregated into bins,
+/// which are drawn instead of them. Called by `layer.sizeBy` and `layer.aggregation`, whichever
+/// comes second, as for a diagram ([`super::diagram::hidden_notice`]).
+pub(crate) fn size_hidden_notice(s: &mut Session, id: u32) {
+    let text = s.map().layer(id).filter(|l| l.aggregation.is_some() && rustgis_map::symbol_by::SizeBy::applies_to(l)).and_then(|l| {
+        let by = l.size_by.as_ref()?;
+        Some(format!(
+            "Layer '{}': its sizes by {} don't show while its points are aggregated into bins; turn Aggregation off to see them",
+            crate::project::short_name(&l.name),
+            by.field
+        ))
+    });
+    if let Some(text) = text {
+        s.notify(text, false);
+    }
+}
+
+/// A size range prepared on shared rows; landing refuses edits to those rows or their fields.
+struct SizeRangeAhead {
+    dataset: Dataset,
+    field: usize,
+    range: Result<Option<(f64, f64)>, String>,
+}
+
+/// Scans one numeric field once, checking Cancel and advancing progress every 1024 rows.
+fn size_range(dataset: &Dataset, field: usize) -> Result<Option<(f64, f64)>, String> {
+    let count = dataset.features.len();
+    rustgis_data::progress::begin(count);
+    let mut range: Option<(f64, f64)> = None;
+    for (row, feature) in dataset.features.iter().enumerate() {
+        if row % 1024 == 0 {
+            rustgis_data::progress::step((count - row).min(1024)).map_err(|e| e.to_string())?;
+        }
+        if let Some(value) = feature.attrs.get(field).and_then(rustgis_data::Value::as_f64).filter(|v| v.is_finite()) {
+            range = Some(range.map_or((value, value), |(lo, hi)| (lo.min(value), hi.max(value))));
+        }
+    }
+    Ok(range)
+}
+
+/// Prepares range detection off the desktop frame only when the mapping needs bounds. Invalid
+/// requests are left to the command to explain without scanning their data.
+pub(crate) fn size_by_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
+    let id = s.layer_id(p).ok()?;
+    let layer = s.map().layer(id)?;
+    let field = layer.dataset.field_index(ps(p, "field")?)?;
+    if !rustgis_map::symbol_by::SizeBy::applies_to(layer) || layer.is_streamed() || !layer.dataset.fields.get(field)?.ty.is_numeric() {
+        return None;
+    }
+    if (f(p, "min").is_some() && f(p, "max").is_some())
+        || layer.size_by.as_ref().is_some_and(|by| layer.dataset.field_index(&by.field) == Some(field))
+    {
+        return None;
+    }
+    let dataset = layer.dataset.clone();
+    Some(super::reads::ahead("Size by Field", format!("layer.sizeBy:{id}"), move || {
+        let range = size_range(&dataset, field);
+        SizeRangeAhead { dataset, field, range }
+    }))
+}
+
 /// `layer.symbolBy`: sets (or removes) the expressions a layer's symbol takes per feature, each
 /// checked against its fields first.
 fn symbol_by(s: &mut Session, p: &Value) -> CmdResult {
@@ -783,7 +962,18 @@ fn line_strokes(s: &mut Session, p: &Value) -> CmdResult {
     if list.len() > MAX_STROKES {
         return Err(format!("at most {MAX_STROKES} strokes"));
     }
-    let mut strokes = Vec::with_capacity(list.len());
+    // Refused before the strokes are read: a call on the wrong layer or class keeps none of their
+    // images.
+    let id = s.layer_id(p)?;
+    let l = s.map().layer(id).ok_or("no such layer")?;
+    let points = l.geometry_type() == GeometryType::Point;
+    if !(points || l.geometry_type() == GeometryType::Polyline) || l.graphics {
+        return Err("this works on line and point layers".into());
+    }
+    if let Some(c) = &class {
+        l.renderer.class_strokes(c)?;
+    }
+    let (mut strokes, mut new) = (Vec::with_capacity(list.len()), Vec::new());
     for (i, v) in list.iter().enumerate() {
         let o = v.as_object().ok_or_else(|| format!("stroke {} is not an object", i + 1))?;
         let color = match o.get("color") {
@@ -841,24 +1031,25 @@ fn line_strokes(s: &mut Session, p: &Value) -> CmdResult {
             }
             Some(_) => return Err(bad_dash()),
         };
+        // A point draws marks only: a line stroke would draw nothing there.
+        if points && o.get("markers").is_none_or(Value::is_null) {
+            return Err(format!("stroke {}: a point layer's strokes are markers", i + 1));
+        }
         let markers = match o.get("markers") {
             None | Some(Value::Null) => None,
-            Some(m) => Some(line_markers(m).map_err(|e| format!("stroke {}: markers: {e}", i + 1))?),
+            Some(m) => Some(line_markers(m, &mut new).map_err(|e| format!("stroke {}: markers: {e}", i + 1))?),
         };
         strokes.push(
             LineStroke { color, width: num("width")?, offset: num("offset")?.unwrap_or(0.0), cap, join, level, dash, markers }.clamped(),
         );
     }
-    let id = s.layer_id(p)?;
+    // Every stroke checked: their new images are kept.
+    let slots = strokes.iter_mut().filter_map(|st: &mut LineStroke| match st.markers.as_mut().map(|m| &mut m.mark) {
+        Some(LineMark::Marker(Marker::Picture(p))) => Some(p),
+        _ => None,
+    });
+    keep_pictures(slots, new)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-    let points = l.geometry_type() == GeometryType::Point;
-    if !(points || l.geometry_type() == GeometryType::Polyline) || l.graphics {
-        return Err("this works on line and point layers".into());
-    }
-    // A point draws marks only: a line stroke would draw nothing there.
-    if let Some(i) = strokes.iter().position(|st| st.markers.is_none()).filter(|_| points) {
-        return Err(format!("stroke {}: a point layer's strokes are markers", i + 1));
-    }
     let n = strokes.len();
     match class {
         Some(c) => l.renderer.set_class_strokes(&c, strokes)?,
@@ -1113,6 +1304,44 @@ pub(crate) fn renderer_with_fills(l: &rustgis_map::Layer) -> (Renderer, usize) {
     (r, left_out)
 }
 
+/// The opacity a colour swatch shows for a fill No Fill made transparent: the one Restore Fill
+/// gives it back (the default when that wasn't kept), so that a colour picked from the swatch is
+/// drawn as Restore Fill would draw it, not kept at No Fill's 0 (#2308). The layer's base symbol,
+/// or `class`'s. `None` for a fill No Fill doesn't hide that way, which the swatch shows as it is.
+/// It reads in place, without a copy of the renderer: the swatches ask for it every frame.
+pub fn hidden_fill_opacity(l: &rustgis_map::Layer, class: Option<&ClassRef>) -> Option<u8> {
+    if l.no_fill != Some(NoFill::Symbols) {
+        return None;
+    }
+    let (at, count, now) = symbol_slot(&l.renderer, class)?;
+    // A fill shown since (given a colour of its own while No Fill was on) is drawn as it is.
+    if now > 0 {
+        return None;
+    }
+    // Kept only while they still match the symbols, as Restore Fill needs.
+    let kept = l.hidden_fills.as_ref().filter(|h| h.alphas.len() == count).and_then(|h| h.alphas.get(at).copied());
+    Some(kept.unwrap_or_else(shown_fill_alpha))
+}
+
+/// Where the layer's base symbol (as [`Renderer::base_symbol`] picks it), or `class`'s, comes
+/// among [`Renderer::map_symbols`]', which is the order No Fill keeps their opacities in; how many
+/// symbols that walks; and the symbol's fill opacity now.
+fn symbol_slot(r: &Renderer, class: Option<&ClassRef>) -> Option<(usize, usize, u8)> {
+    let at = match (r, class) {
+        (_, Some(c)) => symbol_position(r, c)?,
+        (Renderer::Graduated { symbols, .. }, None) => symbols.len().checked_sub(1)?,
+        (_, None) => 0,
+    };
+    let (symbol, count) = match r {
+        Renderer::Single(s) | Renderer::Proportional { base: s, .. } => ((at == 0).then_some(s), 1),
+        Renderer::Unique { classes, other, .. } => {
+            (if at == classes.len() { Some(other) } else { classes.get(at).map(|(_, s)| s) }, classes.len() + 1)
+        }
+        Renderer::Graduated { symbols, .. } => (symbols.get(at), symbols.len()),
+    };
+    Some((at, count, symbol?.fill.a()))
+}
+
 /// The layer's own fill layers No Fill hid come back unless it has fill layers of its own now;
 /// those stay, and a note says the hidden ones weren't put back.
 fn put_back_layer_fills(l: &mut rustgis_map::Layer, fills: Vec<rustgis_map::fills::FillLayer>, notes: &mut Vec<String>) {
@@ -1157,7 +1386,17 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
     if list.len() > MAX_FILLS {
         return Err(format!("at most {MAX_FILLS} fills"));
     }
-    let mut fills = Vec::with_capacity(list.len());
+    // Refused before the fills are read: a call on the wrong layer or class keeps none of their
+    // images.
+    let id = s.layer_id(p)?;
+    let l = s.map().layer(id).ok_or("no such layer")?;
+    if !l.has_geometry(GeometryType::Polygon) || l.graphics || l.is_raster() {
+        return Err("this works on layers containing polygons".into());
+    }
+    if let Some(c) = &class {
+        l.renderer.class_fills(c)?;
+    }
+    let (mut fills, mut new) = (Vec::with_capacity(list.len()), Vec::new());
     for (i, v) in list.iter().enumerate() {
         let n = i + 1;
         let o = v.as_object().ok_or_else(|| format!("fill {n} is not an object"))?;
@@ -1190,6 +1429,11 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
                 Some(v) => number(v).map(|x| [x, x]).ok_or_else(|| format!("fill {n}: {k} is a number or [across, down]")),
             }
         };
+        not_empty(o.get("image")).map_err(|e| format!("fill {n}: {e}"))?;
+        // An image is a dots fill's marker: another pattern would drop it.
+        if o.get("image").is_some_and(|v| !v.is_null()) && o.get("pattern").and_then(Value::as_str) != Some("dots") {
+            return Err(format!("fill {n}: an image is a dots fill's marker"));
+        }
         let pattern = match o.get("pattern").filter(|v| !v.is_null()).map(|v| v.as_str()) {
             None | Some(Some("solid")) => FillPattern::Solid,
             Some(Some("hatch")) => FillPattern::Hatch {
@@ -1199,21 +1443,37 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
                 offset: num("offset", 0.0)?,
             },
             Some(Some("dots")) => {
+                let image = o.get("image").is_some_and(|v| !v.is_null());
                 let marker = match o.get("marker") {
                     None | Some(Value::Null) => Marker::Circle,
+                    // Its `image` says which.
+                    Some(Value::String(m)) if m.trim().eq_ignore_ascii_case("image") => {
+                        if !image {
+                            return Err(format!("fill {n}: an image marker needs its image"));
+                        }
+                        Marker::Circle
+                    }
                     Some(Value::String(m)) => Marker::ALL
                         .into_iter()
                         .find(|s| s.label().eq_ignore_ascii_case(m.trim()))
                         .ok_or_else(|| format!("fill {n}: unknown marker '{m}'"))?,
-                    Some(_) => return Err(format!("fill {n}: marker is \"circle\", \"square\", \"triangle\", \"diamond\" or \"star\"")),
+                    Some(_) => {
+                        return Err(format!(
+                            "fill {n}: marker is \"circle\", \"square\", \"triangle\", \"diamond\", \"star\" or \"image\""
+                        ));
+                    }
                 };
+                image_alone(o, "marker").map_err(|e| format!("fill {n}: {e}"))?;
                 // A character of a font instead of a shape, as `layer.marker` takes it.
                 let marker = match character(v).map_err(|e| format!("fill {n}: {e}"))? {
                     Some(_) if o.get("marker").is_some_and(|m| !m.is_null()) => {
                         return Err(format!("fill {n}: give a marker or a char, not both"));
                     }
                     Some(c) => Marker::Char(Glyph::new(c, o.get("font").and_then(Value::as_str).unwrap_or_default())),
-                    None => marker,
+                    None => match picture(v, &mut new).map_err(|e| format!("fill {n}: {e}"))? {
+                        Some(img) => Marker::Picture(img),
+                        None => marker,
+                    },
                 };
                 FillPattern::Dots {
                     marker,
@@ -1317,11 +1577,13 @@ fn fill_layers(s: &mut Session, p: &Value) -> CmdResult {
         };
         fills.push(FillLayer { color: hex("color")?, pattern }.clamped());
     }
-    let id = s.layer_id(p)?;
+    // Every fill checked: their new images are kept.
+    let slots = fills.iter_mut().filter_map(|f: &mut FillLayer| match &mut f.pattern {
+        FillPattern::Dots { marker: Marker::Picture(p), .. } => Some(p),
+        _ => None,
+    });
+    keep_pictures(slots, new)?;
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-    if !l.has_geometry(GeometryType::Polygon) || l.graphics || l.is_raster() {
-        return Err("this works on layers containing polygons".into());
-    }
     // A fill in the symbol's colour, or the symbol's own fill ([]), asked for after No Fill: the
     // symbols' fills are shown again, or they would draw nothing (#1301). A class's fills show
     // that class's alone.
@@ -1367,8 +1629,32 @@ fn character(p: &Value) -> Result<Option<char>, String> {
     }
 }
 
-/// `layer.marker`'s `image`: a PNG or JPEG image as base64, which must decode.
-fn picture(p: &Value) -> Result<Option<Picture>, String> {
+/// A line marker's or a dot fill's `image` named with a shape, a character or a hash mark under
+/// `key` (`"mark"`, `"marker"`), or with a `char`: refused before the image is kept.
+fn image_alone(o: &serde_json::Map<String, Value>, key: &str) -> Result<(), String> {
+    not_empty(o.get("image"))?;
+    let other = o.get("char").is_some_and(|c| !c.is_null())
+        || o.get(key).and_then(Value::as_str).is_some_and(|m| !m.trim().eq_ignore_ascii_case("image"));
+    if o.get("image").is_some_and(|v| !v.is_null()) && other {
+        return Err(format!("give a {key}, a char or an image, only one"));
+    }
+    Ok(())
+}
+
+/// An `image` given as `""` (or blanks): refused as empty, before anything else it's named with
+/// is weighed against it.
+fn not_empty(image: Option<&Value>) -> Result<(), String> {
+    if image.and_then(Value::as_str).is_some_and(|b64| b64.trim().is_empty()) {
+        return Err("image is empty: give a PNG or JPEG image as base64, or leave it out".into());
+    }
+    Ok(())
+}
+
+/// An `image` (`layer.marker`'s, a line marker's, a dot fill's): a PNG or JPEG image as base64,
+/// which must decode. One kept already is returned; a new one is only checked, its base64 put in
+/// `new` and an empty picture returned in its place, for [`keep_pictures`] to keep once the whole
+/// call is checked: a call refused for a later stroke or fill keeps none of its images.
+fn picture<'a>(p: &'a Value, new: &mut Vec<&'a str>) -> Result<Option<Picture>, String> {
     const WHAT: &str = "image is a PNG or JPEG image as base64";
     let b64 = match p.get("image") {
         None | Some(Value::Null) => return Ok(None),
@@ -1378,18 +1664,35 @@ fn picture(p: &Value) -> Result<Option<Picture>, String> {
     if b64.len() > rustgis_map::symbology::MAX_PICTURE_BYTES {
         return Err(format!("image is at most {} MiB of base64", rustgis_map::symbology::MAX_PICTURE_BYTES >> 20));
     }
-    if !rustgis_render::picture_marker_readable(b64) {
+    // One given again (the editor sends a stroke's or a fill's image with every change, a slider
+    // every frame) is found where it's kept, and decoded once into the drawing's cache.
+    if let Some(kept) = Picture::kept(b64) {
+        return if rustgis_render::picture_marker_draws(kept) { Ok(Some(kept)) } else { Err(WHAT.into()) };
+    }
+    // One met earlier in the call was checked then: an image decodes once per call.
+    if !new.contains(&b64) && !rustgis_render::picture_marker_readable(b64) {
         return Err(WHAT.into());
     }
-    let picture = Picture::new(b64);
-    if picture.is_default() {
-        return Err("no more images can be kept this session: restart RustGIS to use another".into());
+    new.push(b64);
+    Ok(Some(Picture::default()))
+}
+
+/// Keeps the images [`picture`] checked (`new`, in the order it met them) in the empty pictures it
+/// left in their places (`slots`, in the same order): all of them, or none when the session can't
+/// keep them all.
+fn keep_pictures<'a>(slots: impl Iterator<Item = &'a mut Picture>, new: Vec<&str>) -> Result<(), String> {
+    if new.is_empty() {
+        return Ok(());
     }
-    Ok(Some(picture))
+    let kept = Picture::new_all(&new).ok_or("no more images can be kept this session: restart RustGIS to use another")?;
+    for (slot, p) in slots.filter(|p| p.is_default()).zip(kept) {
+        *slot = p;
+    }
+    Ok(())
 }
 
 /// A stroke's `markers`: what it draws along the line instead of a line, and where.
-fn line_markers(v: &Value) -> Result<LineMarkers, String> {
+fn line_markers<'a>(v: &'a Value, new: &mut Vec<&'a str>) -> Result<LineMarkers, String> {
     let o = v.as_object().ok_or("an object, such as {\"mark\": \"circle\", \"interval\": 12}")?;
     let num = |k: &str| -> Result<Option<f32>, String> {
         match o.get(k) {
@@ -1400,9 +1703,17 @@ fn line_markers(v: &Value) -> Result<LineMarkers, String> {
         }
     };
     let d = LineMarkers::default();
+    let image = o.get("image").is_some_and(|v| !v.is_null());
     let mark = match o.get("mark") {
         None | Some(Value::Null) => d.mark,
         Some(Value::String(m)) if m.trim().eq_ignore_ascii_case("hash") => LineMark::Hash,
+        // Its `image` says which.
+        Some(Value::String(m)) if m.trim().eq_ignore_ascii_case("image") => {
+            if !image {
+                return Err("an image mark needs its image".into());
+            }
+            d.mark
+        }
         // Its `char` says which.
         Some(Value::String(m)) if m.trim().eq_ignore_ascii_case("character") => {
             if character(v)?.is_none() {
@@ -1413,8 +1724,11 @@ fn line_markers(v: &Value) -> Result<LineMarkers, String> {
         Some(Value::String(m)) => LineMark::Marker(
             Marker::ALL.into_iter().find(|s| s.label().eq_ignore_ascii_case(m.trim())).ok_or_else(|| format!("unknown mark '{m}'"))?,
         ),
-        Some(_) => return Err("mark is \"circle\", \"square\", \"triangle\", \"diamond\", \"star\", \"character\" or \"hash\"".into()),
+        Some(_) => {
+            return Err("mark is \"circle\", \"square\", \"triangle\", \"diamond\", \"star\", \"character\", \"image\" or \"hash\"".into());
+        }
     };
+    image_alone(o, "mark")?;
     // A character of a font instead of a shape.
     let mark = match (character(v)?, o.get("font")) {
         (Some(_), _) if mark == LineMark::Hash => return Err("hash marks take no char".into()),
@@ -1423,7 +1737,7 @@ fn line_markers(v: &Value) -> Result<LineMarkers, String> {
             return Err("give a shape or a char, not both".into());
         }
         (Some(c), font) => LineMark::Marker(Marker::Char(Glyph::new(c, font.and_then(Value::as_str).unwrap_or_default()))),
-        (None, _) => mark,
+        (None, _) => picture(v, new)?.map_or(mark, |img| LineMark::Marker(Marker::Picture(img))),
     };
     let bad_at = || format!("at is a placement or a list of them: {}", Placements::all_codes());
     let at = match o.get("at") {
@@ -1511,8 +1825,9 @@ pub(crate) fn add_photos_to(s: &mut Session, name: &str, zoom: Option<bool>, fee
     }
     // The reader took no more than there is room for; `take` keeps that so if it ever changes.
     let added = ds.features.len().min(room);
-    let extent =
+    let own =
         ds.features.iter().take(added).filter_map(|f| f.geometry.as_ref()).fold(rustgis_geom::Extent::EMPTY, |e, g| e.union(&g.extent()));
+    let extent = ds.extent_to_lonlat(&own);
     let id = match existing {
         Some(id) => {
             let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
@@ -1695,9 +2010,11 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         return add_photos(s, &json!({"paths": [path], "name": name}));
     }
     if rustgis_data::raster::is_raster_name(path) {
+        let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty());
+        let page = super::raster::pdf_page(path, p)?;
         // An SRTM tile or DTED file has no subdataset or coordinate system to choose: said.
         let ignored = rustgis_data::raster::elevation_ignores(path, ps(p, "layer"), ps(p, "crs"));
-        return super::raster::add_path(s, path, ps(p, "name").map(str::trim).filter(|n| !n.is_empty()), scan, ignored);
+        return super::raster::add_path(s, path, name, page.as_deref(), scan, ignored);
     }
     // A Zarr store's folder: its first variable, or the one "layer" names.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1721,11 +2038,13 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         return add_source(s, p, Origin::Path(path), None);
     }
     // A CityJSON model named .json, in the coordinate system given or with a layer picked: as a
-    // .city.json, all its layers (a .city.json is added below, as a file of several layers).
+    // .city.json, all its layers (a .city.json is added below, as a file of several layers). It is
+    // read whole to tell, here on the calling thread, so only up to the size every computer reads
+    // (a larger model is named `.city.json` to be read as one).
     if path.to_ascii_lowercase().ends_with(".json")
         && !rustgis_data::cityjson::is_cityjson_name(path)
         && ["crs", "layer"].iter().any(|k| ps(p, k).is_some_and(|c| !c.trim().is_empty()))
-        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() <= rustgis_data::io::MAX_BYTES)
+        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() <= rustgis_data::io::BYTES_FLOOR)
     {
         let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         if rustgis_data::io::is_cityjson(path, &bytes) {
@@ -1748,8 +2067,21 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         let name = Path::new(path).file_stem().and_then(|n| n.to_str()).unwrap_or("layer");
         match rustgis_data::source::geojson::GeoJsonSource::open_path(Path::new(path), name) {
             Ok(src) => return add_source_with(s, p, Origin::Path(path), Some(Box::new(src)), None),
-            // Not a FeatureCollection: read whole below.
-            Err(rustgis_data::DataError::Unsupported(_)) => {}
+            // Not a FeatureCollection: read whole below, on this thread (the UI thread in the
+            // desktop app, as only small GeoJSON files are read ahead), so within the size every
+            // computer reads, as before #2408, not the larger limit: the window isn't held longer.
+            Err(rustgis_data::DataError::Unsupported(_)) => {
+                let floor = rustgis_data::io::BYTES_FLOOR;
+                if let Ok(m) = std::fs::metadata(path)
+                    && m.len() > floor
+                {
+                    return Err(format!(
+                        "{path}: a GeoJSON document that isn't a FeatureCollection is read whole, so at most {} MiB; it is {} MiB (a CityJSON model named .json: rename it .city.json)",
+                        floor >> 20,
+                        m.len().div_ceil(1 << 20)
+                    ));
+                }
+            }
             Err(e) => return Err(format!("{path}: {e}")),
         }
     }
@@ -1850,18 +2182,34 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
         return add_reads(s, p, &full, reads, Vec::new(), None);
     }
     if rustgis_data::io::is_multi_layer_name(path) {
-        // A city model or ZIP read ahead on the desktop: add the prepared layers without
+        // A file read ahead on the desktop ([`read_ahead_whole`]): add the prepared layers without
         // reading the file again on the UI thread.
         if let Some(read) = super::reads::take::<LayersRead>(s, &layers_key(path)) {
             if let Some(crs) = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty()) {
                 super::say_crs_note(s, crs);
             }
             let (full, reads) = read?;
-            return add_picked(s, p, &full, reads, !path.to_ascii_lowercase().ends_with(".zip"), Vec::new(), None);
+            // Whole for a city model only (its first layer says what the file does), not for the
+            // other files read ahead too.
+            #[cfg(not(target_arch = "wasm32"))]
+            let whole = is_city_model_path(path);
+            #[cfg(target_arch = "wasm32")]
+            let whole = !path.to_ascii_lowercase().ends_with(".zip");
+            return add_picked(s, p, &full, reads, whole, Vec::new(), None);
         }
         let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
-        if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
-            return Err(format!("{path} is too large to open"));
+        // A file the desktop app doesn't read ahead (a KML or KMZ, with its overlays; a LandXML;
+        // RSS or Atom) is read here, on the UI thread there: within the size every computer reads,
+        // as before #2408, so the window isn't held longer; said first, as it is the limit that
+        // applies. The others ([`read_ahead_whole`]) take the larger limit: the desktop app reads
+        // them ahead (`readjob`, for drops, pickers and Add Data), so this branch reads them for
+        // the command line, Python, MCP and the tests, which hold no window.
+        if let Some(e) = past_read_as_added(path, meta.len()) {
+            return Err(e);
+        }
+        let max = rustgis_data::io::max_bytes();
+        if meta.len() > max {
+            return Err(rustgis_data::io::file_size_error(path, max));
         }
         let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
@@ -1909,6 +2257,30 @@ fn layers_key(path: &str) -> String {
     format!("layers:{path}")
 }
 
+/// The refusal of a file of several layers of `len` bytes that the desktop app reads as it is
+/// added, on the UI thread (not [`read_ahead_whole`]: a KML or KMZ, a LandXML, RSS, Atom or
+/// GeoRSS), past the size every computer reads, as before #2408, so the window isn't held longer.
+/// Said before the larger limit, as it is the one that applies.
+fn past_read_as_added(path: &str, len: u64) -> Option<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let ahead = read_ahead_whole(path);
+    #[cfg(target_arch = "wasm32")]
+    let ahead = false;
+    let floor = rustgis_data::io::BYTES_FLOOR;
+    (!ahead && len > floor).then(|| rustgis_data::io::file_size_error(path, floor))
+}
+
+/// Whether the desktop app reads a file of several layers whole ahead, off the UI thread
+/// ([`add_data_ahead`], [`read_layers_file`]): a ZIP, a city model, a GML, GPX or TopoJSON file,
+/// an OpenStreetMap extract (`.pbf`; a large one goes to GDAL instead where it is installed, and
+/// isn't read ahead, [`large_osm`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn read_ahead_whole(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".zip", ".gml", ".gpx", ".topojson", ".pbf"].iter().any(|e| lower.ends_with(e))
+        || (rustgis_data::io::is_multi_layer_name(path) && is_city_model_path(path))
+}
+
 /// Whether Add Data reads `path` as a city model's layers: a CityJSON model named `.city.json`, or
 /// a `.gml` or `.xml` file whose root (in its first bytes, read here) is a CityGML city model.
 #[cfg(not(target_arch = "wasm32"))]
@@ -1933,8 +2305,12 @@ fn is_city_model_path(path: &str) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 fn read_layers_file(p: &Value, path: &str) -> LayersRead {
     let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
-    if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
-        return Err(format!("{path} is too large to open"));
+    if let Some(e) = past_read_as_added(path, meta.len()) {
+        return Err(e);
+    }
+    let max = rustgis_data::io::max_bytes();
+    if meta.len() > max {
+        return Err(rustgis_data::io::file_size_error(path, max));
     }
     let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
@@ -1961,8 +2337,15 @@ fn read_dxf_file(p: &Value, path: &str) -> LayersRead {
     use std::io::Read;
     let file = rustgis_data::provenance::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut bytes = Vec::new();
-    (&file).take(rustgis_data::io::MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("{path}: {e}"))?;
-    if bytes.len() as u64 <= rustgis_data::io::MAX_BYTES {
+    let max = rustgis_data::io::max_bytes();
+    // One that says it is too large is refused before any of it is read.
+    if let Ok(meta) = file.metadata()
+        && meta.len() > max
+    {
+        return Err(rustgis_data::io::file_size_error(path, max));
+    }
+    (&file).take(max + 1).read_to_end(&mut bytes).map_err(|e| format!("{path}: {e}"))?;
+    if bytes.len() as u64 <= max {
         rustgis_data::provenance::buffer(Path::new(path), &file, &bytes);
     }
     let full = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
@@ -1977,8 +2360,9 @@ fn dxf_reads(
     bytes: &[u8],
     crs: Option<rustgis_data::raster::Crs>,
 ) -> Result<Vec<rustgis_data::io::LayerRead>, String> {
-    if bytes.len() as u64 > rustgis_data::io::MAX_BYTES {
-        return Err(format!("{name} is too large to open"));
+    let max = rustgis_data::io::max_bytes();
+    if bytes.len() as u64 > max {
+        return Err(rustgis_data::io::file_size_error(name, max));
     }
     let opts = rustgis_data::dxf::Options {
         crs,
@@ -1997,7 +2381,7 @@ fn dxf_reads(
 fn read_sheet_file(p: &Value, path: &str) -> WholeRead {
     let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
     if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
-        return Err(format!("{path} is too large to open"));
+        return Err(rustgis_data::io::file_size_error(path, super::raster::MAX_UPLOAD_BYTES as u64));
     }
     let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
     // Read from disk: the table keeps the workbook's path, so an export can't replace it.
@@ -2011,15 +2395,16 @@ fn read_whole(p: &Value, path: &str) -> WholeRead {
     let delimited = read_delimited(p, path, || {
         let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
         // The limit the text readers keep without options too.
-        if meta.len() > rustgis_data::io::MAX_BYTES {
-            return Err(format!("{path} is too large to open"));
+        let max = rustgis_data::io::max_bytes();
+        if meta.len() > max {
+            return Err(rustgis_data::io::file_size_error(path, max));
         }
         rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))
     })?;
     if let Some(read) = delimited {
         return Ok(read);
     }
-    let read = || rustgis_data::io::read_path(Path::new(path)).map_err(|e| format!("{path}: {e}"));
+    let read = || rustgis_data::io::read_path(Path::new(path)).map_err(|e| whole_read_error(path, e));
     // A file its edits can be written back to: the files as read, to compare with before then.
     #[cfg(not(target_arch = "wasm32"))]
     if rustgis_data::sync::is_syncable(path) {
@@ -2042,13 +2427,16 @@ fn read_shapefile_with(path: &str, name: &str, crs: rustgis_data::raster::Crs) -
 /// `read`, the read of the file at `path`, with the record of what it read: the files hashed
 /// just before ([`rustgis_data::sync::FileSync::around`]) and the digest of the rows read. Its
 /// work grows with the file, so the desktop app makes it off the UI thread ([`add_data_ahead`]).
+/// A large GeoJSON document that isn't a FeatureCollection, without `"stream": false`, is read
+/// whole on the calling thread instead, and so kept within [`rustgis_data::io::BYTES_FLOOR`]
+/// (`add_data`), as are the files of several layers that aren't read ahead.
 /// When the files couldn't be hashed the layer has no record, and a note says it can't be
 /// compared with its file later.
 #[cfg(not(target_arch = "wasm32"))]
 fn read_synced(path: &str, read: impl FnOnce() -> WholeRead) -> WholeRead {
     // A file past what the readers take (a Shapefile's `.dbf` too) is refused by the read: not
     // hashed first.
-    let over = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.len() > rustgis_data::io::MAX_BYTES);
+    let over = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.len() > rustgis_data::io::max_bytes());
     let shp = path.to_ascii_lowercase().ends_with(".shp");
     if over(Path::new(path)) || (shp && over(&Path::new(path).with_extension("dbf"))) {
         return read();
@@ -2097,8 +2485,10 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
         return None;
     }
     if rustgis_data::raster::is_raster_name(&path) {
-        let key = super::raster::read_key(&path, scan);
-        return Some(ahead(NAME, key, move || super::raster::read_raster_as(&path, scan)));
+        // A page that isn't one is refused when the command runs.
+        let page = super::raster::pdf_page(&path, p).ok()?;
+        let key = super::raster::read_key(&path, page.as_deref(), scan);
+        return Some(ahead(NAME, key, move || super::raster::read_raster_as(&path, page.as_deref(), scan)));
     }
     if rustgis_data::raster::zarr::is_store(Path::new(&path)) {
         return None;
@@ -2123,9 +2513,10 @@ pub(crate) fn add_data_ahead(p: &Value) -> Option<super::reads::ReadWork> {
         && !(lower.ends_with(".json") && (given("crs") || given("layer")))
         && std::fs::metadata(&path)
             .is_ok_and(|m| m.is_file() && (b(p, "stream") == Some(false) || m.len() <= rustgis_data::source::geojson::IN_PLACE_ABOVE));
-    // A ZIP or city model: its layers, read whole. A model named `.json` (not `.city.json`) is a
-    // file of several layers only with options given, which Add Data reads as it runs.
-    if lower.ends_with(".zip") || (rustgis_data::io::is_multi_layer_name(&path) && is_city_model_path(&path)) {
+    // A ZIP, a city model, a GML or a GPX file: its layers, read whole. A model named `.json` (not
+    // `.city.json`) is a file of several layers only with options given, which Add Data reads as
+    // it runs. A KML or KMZ (with its ground overlays) and a LandXML file are read as they are added.
+    if read_ahead_whole(&path) && !large_osm(&path) {
         let (key, q) = (layers_key(&path), p.clone());
         return Some(ahead(NAME, key, move || read_layers_file(&q, &path)));
     }
@@ -2345,10 +2736,20 @@ fn add_reads(
 /// A KML or KMZ's ground overlays as rasters: pictures inside a KMZ, or files beside a KML on
 /// disk (by a relative path that stays in its folder). Overlays that can't be drawn are said.
 fn ground_overlays(s: &mut Session, file_name: &str, bytes: &[u8], local_file: bool) -> Vec<(String, rustgis_data::raster::Raster)> {
-    let (found, undrawn) = match rustgis_data::kml::ground_overlays(file_name, bytes) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
+    match rustgis_data::kml::ground_overlays(file_name, bytes) {
+        Ok(overlays) => overlays_drawn(s, file_name, overlays, local_file),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The ground overlays of [`rustgis_data::kml::ground_overlays`] drawn, and those that can't be
+/// said in one notice.
+fn overlays_drawn(
+    s: &mut Session,
+    file_name: &str,
+    (found, undrawn, over_budget): rustgis_data::kml::Overlays,
+    local_file: bool,
+) -> Vec<(String, rustgis_data::raster::Raster)> {
     let mut out = Vec::new();
     let mut notes = Vec::new();
     let dir = local_file.then(|| Path::new(file_name).parent()).flatten().filter(|d| d.is_absolute());
@@ -2395,6 +2796,12 @@ fn ground_overlays(s: &mut Session, file_name: &str, bytes: &[u8], local_file: b
     }
     if undrawn > 0 {
         notes.push(format!("{undrawn} ground overlays without a picture or a box (LatLonBox)"));
+    }
+    if over_budget > 0 {
+        notes.push(format!(
+            "{over_budget} ground overlays left out: their pictures don't fit beside the archive in the {} MiB a KMZ is expanded within",
+            rustgis_data::io::BYTES_FLOOR >> 20
+        ));
     }
     if !notes.is_empty() {
         s.notify(format!("{file_name}: {}", notes.join("; ")), false);
@@ -2511,7 +2918,7 @@ fn file_layers(s: &mut Session, p: &Value) -> CmdResult {
     if rustgis_data::sheets::is_sheet_name(path) {
         let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
         if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
-            return Err(format!("{path} is too large to open"));
+            return Err(rustgis_data::io::file_size_error(path, super::raster::MAX_UPLOAD_BYTES as u64));
         }
         let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         let layers = rustgis_data::sheets::sheet_names(&bytes).map_err(err)?;
@@ -2525,21 +2932,28 @@ fn file_layers(s: &mut Session, p: &Value) -> CmdResult {
     // A DXF drawing's own layers (the ones it draws on), picked with "layer".
     if rustgis_data::dxf::is_dxf_name(path) {
         let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
-        if meta.len() > rustgis_data::io::MAX_BYTES {
-            return Err(format!("{path} is too large to open"));
+        let max = rustgis_data::io::max_bytes();
+        if meta.len() > max {
+            return Err(rustgis_data::io::file_size_error(path, max));
         }
         let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         let layers = rustgis_data::dxf::layers(path, &bytes).map_err(err)?;
         return Ok(json!({"count": layers.len(), "layers": layers}));
     }
-    // A CityJSON model named .json: all its layers, as Add Data adds them by name.
+    // A CityJSON model named .json: all its layers, as Add Data adds them by name. Read whole to
+    // tell, so only up to the size every computer reads, as Add Data does.
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty());
     let model_json = path.to_ascii_lowercase().ends_with(".json")
-        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() <= rustgis_data::io::MAX_BYTES);
+        && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() <= rustgis_data::io::BYTES_FLOOR);
     if rustgis_data::io::is_multi_layer_name(path) || model_json {
         let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
-        if meta.len() > super::raster::MAX_UPLOAD_BYTES as u64 {
-            return Err(format!("{path} is too large to open"));
+        // Listed within the size Add Data takes it at.
+        if let Some(e) = past_read_as_added(path, meta.len()) {
+            return Err(e);
+        }
+        let max = rustgis_data::io::max_bytes();
+        if meta.len() > max {
+            return Err(rustgis_data::io::file_size_error(path, max));
         }
         let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         let zip = path.to_ascii_lowercase().ends_with(".zip");
@@ -2847,11 +3261,13 @@ fn lidar_renderer(src: &dyn rustgis_data::source::FeatureSource, seed: u32) -> O
 }
 
 /// The parameters with `"stream": true` for a Shapefile whose `.shp` or `.dbf` is past what the
-/// whole-file reader takes, when they don't say whether to stream; `None` otherwise.
+/// whole-file reader takes on every computer ([`rustgis_data::io::BYTES_FLOOR`]), when they don't
+/// say whether to stream; `None` otherwise. Read in place, it never needs memory for it whole, so a
+/// computer whose reader takes more streams it too.
 #[cfg(not(target_arch = "wasm32"))]
 fn past_cap_shapefile(path: &str, p: &Value) -> Option<Value> {
     let shp = Path::new(path);
-    let past = |f: &Path| std::fs::metadata(f).is_ok_and(|m| m.len() > rustgis_data::io::MAX_BYTES);
+    let past = |f: &Path| std::fs::metadata(f).is_ok_and(|m| m.len() > rustgis_data::io::BYTES_FLOOR);
     if !path.to_ascii_lowercase().ends_with(".shp") || b(p, "stream").is_some() || !(past(shp) || past(&shp.with_extension("dbf"))) {
         return None;
     }
@@ -2860,12 +3276,13 @@ fn past_cap_shapefile(path: &str, p: &Value) -> Option<Value> {
     Some(q)
 }
 
-/// An OpenStreetMap extract past what the native reader takes, opened through GDAL instead when it
-/// is installed (country-size extracts).
+/// An OpenStreetMap extract past what the native reader takes on every computer
+/// ([`rustgis_data::io::BYTES_FLOOR`]), opened through GDAL instead when it is installed
+/// (country-size extracts): GDAL converts it once to a file read in place.
 #[cfg(not(target_arch = "wasm32"))]
 fn large_osm(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".pbf")
-        && std::fs::metadata(path).is_ok_and(|m| m.len() > rustgis_data::io::MAX_BYTES)
+        && std::fs::metadata(path).is_ok_and(|m| m.len() > rustgis_data::io::BYTES_FLOOR)
         && rustgis_data::source::gdal::available()
 }
 
@@ -3691,10 +4108,10 @@ pub fn columns_in_file(path: &str, p: &Value) -> CmdResult {
     }
     // Add Data's limits: a spreadsheet is read whole, delimited text within the text readers' limit.
     let sheet = rustgis_data::sheets::is_sheet_name(path);
-    let limit = if sheet { super::raster::MAX_UPLOAD_BYTES as u64 } else { rustgis_data::io::MAX_BYTES };
+    let limit = if sheet { super::raster::MAX_UPLOAD_BYTES as u64 } else { rustgis_data::io::max_bytes() };
     let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
     if meta.len() > limit {
-        return Err(format!("{path} is too large to open"));
+        return Err(rustgis_data::io::file_size_error(path, limit));
     }
     if rustgis_data::io::is_gzip_text_name(path) {
         let reader = rustgis_data::provenance::open(path).map_err(|e| format!("{path}: {e}"))?;
@@ -3784,6 +4201,13 @@ fn read_delimited(
     read_delimited_bytes(p, name, &bytes()?).map(Some)
 }
 
+/// Adds file context to a reader error. A size refusal already names the file it could not read,
+/// which may be a sidecar of the requested file.
+fn whole_read_error(path: &str, error: rustgis_data::DataError) -> String {
+    let message = error.to_string();
+    if rustgis_data::io::file_size_error_args(&message).is_some() { message } else { format!("{path}: {message}") }
+}
+
 /// Reads local/uploaded delimited bytes with the same options and CRS notices on every path.
 pub(crate) fn read_delimited_bytes(
     p: &Value,
@@ -3791,7 +4215,7 @@ pub(crate) fn read_delimited_bytes(
     bytes: &[u8],
 ) -> Result<(rustgis_data::Dataset, rustgis_data::ReadReport), String> {
     let opts = csv_options(p)?.unwrap_or_default();
-    let (ds, mut report) = rustgis_data::io::read_delimited_bytes(name, bytes, &opts).map_err(|e| format!("{name}: {e}"))?;
+    let (ds, mut report) = rustgis_data::io::read_delimited_bytes(name, bytes, &opts).map_err(|e| whole_read_error(name, e))?;
     if let (Some(text), Some(crs)) = (ps(p, "crs"), opts.crs)
         && let Some(note) = rustgis_data::raster::wkt::typed_crs_note(text, crs)
     {
@@ -5572,7 +5996,12 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
         url_file_name(&url, &bytes).map_err(|e| crate::sources::message_with_address(&url, &e))?
     };
     let left_out = parts_left_out(&url, &bytes, p);
-    let r = super::raster::add_named_bytes(s, p, name, bytes, b(p, "zoom"))?;
+    // A PDF's page the app drew off the frame as it landed (#2336).
+    #[cfg(not(target_arch = "wasm32"))]
+    let drawn = s.landed_pages.iter().position(|(d, _)| *d == id).map(|i| s.landed_pages.remove(i).1);
+    #[cfg(target_arch = "wasm32")]
+    let drawn = None;
+    let r = super::raster::add_named_bytes_read(s, p, name, bytes, b(p, "zoom"), drawn)?;
     if let Some(n) = left_out {
         s.notify(n, false);
     }
@@ -6474,6 +6903,52 @@ pub(crate) fn external_dataset_selector(command: &str) -> bool {
 mod tests {
     use crate::Session;
     use serde_json::json;
+
+    /// Overlays left out for their pictures' size are said, with the budget; none, nothing said.
+    #[test]
+    fn overlays_left_out_for_their_pictures_are_said_and_none_otherwise() {
+        let mut s = Session::new(crate::Project::default());
+        let mark = s.notice_mark();
+        assert!(super::overlays_drawn(&mut s, "a.kmz", (Vec::new(), 0, 0), false).is_empty());
+        assert!(s.notices_since(mark).is_empty(), "nothing left out, nothing said");
+        let mark = s.notice_mark();
+        super::overlays_drawn(&mut s, "a.kmz", (Vec::new(), 0, 2), false);
+        let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert_eq!(
+            said,
+            ["a.kmz: 2 ground overlays left out: their pictures don't fit beside the archive in the 256 MiB a KMZ is expanded within"]
+        );
+    }
+
+    /// Refuses a sparse KML before reading its bytes, with the same advice when listing its layers.
+    #[test]
+    fn oversized_kml_reports_limit_and_alternatives() {
+        let dir = std::env::temp_dir().join(format!("rustgis-kml-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("permits.kml");
+        // A KML is read as it is added, on the UI thread: within the floor, whatever the memory.
+        let limit = rustgis_data::io::BYTES_FLOOR;
+        std::fs::File::create(&path).unwrap().set_len(crate::cmd::raster::MAX_UPLOAD_BYTES as u64 + 1).unwrap();
+        let params = json!({"path": path});
+        let path = path.to_str().unwrap();
+        let mut session = Session::new(crate::Project::default());
+        let check = |error: String| {
+            let limit = (limit >> 20).to_string();
+            assert_eq!(
+                rustgis_data::io::file_size_error_args(&error),
+                Some((path, limit.as_str(), rustgis_data::io::FileSizeAdvice::Vector)),
+                "{error}"
+            );
+            assert!(error.contains("Split it into smaller files") && error.contains("FlatGeobuf"), "{error}");
+        };
+        for command in ["layer.addData", "info.fileLayers"] {
+            check(session.run(command, &params).unwrap_err());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        check(super::read_layers_file(&params, path).err().unwrap());
+        assert!(session.map().layers.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A URL a web document restricted to public addresses stays restricted when a later request
     /// comes from a local origin: its blocking download goes through the public agent, which

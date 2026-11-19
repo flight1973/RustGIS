@@ -2,7 +2,8 @@
 //! and sheets that rise over it, in place of the desktop's ribbon and panes.
 //!
 //! It is drawn around the egui front end's own map view and runs the same commands: a shell
-//! turns it on with `app.chrome = Some(rustgis_ui_touch::chrome)`. Dialogs, notices and the
+//! turns it on with `app.chrome = Some(rustgis_ui_touch::chrome)`, and keeps it in `app.touch` so
+//! the desktop interface's View › Touch Interface can bring it back. Dialogs, notices and the
 //! Project page stay the front end's.
 //!
 //! What is here: the map, the bar (Layers, Add Data, Capture, More), the Layers sheet (show,
@@ -232,7 +233,7 @@ pub fn chrome(app: &mut RustGisApp, ui: &mut Ui) {
                 && let (Some(target), Some(editing)) = (capture_layer(app, &state), state.editing)
                 && let Some(shape) = edit::row_of(app, target.id, editing.feature).and_then(|row| edit::shape_ref(app, target.id, row))
             {
-                edit::draw(app, &painter, shape, editing.vertex, &t);
+                edit::draw(app, &painter, &shape, editing.vertex, &t);
             }
             if let Some(snapped) = state.snap {
                 edit::draw_snap(app, &painter, snapped, map.center(), &t);
@@ -941,7 +942,7 @@ fn capture(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // The feature being edited, while it is still there (an undo may have taken it away).
     let picked = state.editing.and_then(|e| edit::row_of(app, target.id, e.feature).map(|row| (row, e)));
     // A picked vertex an Undo moved or took away is let go.
-    let picked = picked.map(|(row, e)| (row, e.checked(edit::shape_ref(app, target.id, row))));
+    let picked = picked.map(|(row, e)| (row, e.checked(edit::shape_ref(app, target.id, row).as_deref())));
     state.editing = picked.map(|(_, e)| e);
     // Photos the camera took: for the feature being edited, attached to it now; else kept for
     // the next feature.
@@ -1337,7 +1338,7 @@ fn edit_sheet(
         return;
     };
     // The shape is borrowed for each look at it, not copied each frame: the buttons change it.
-    let Some(status) = edit::shape_ref(app, target.id, row).map(|shape| edit::status(target.kind, shape, editing.vertex)) else {
+    let Some(status) = edit::shape_ref(app, target.id, row).map(|shape| edit::status(target.kind, &shape, editing.vertex)) else {
         state.editing = None;
         return;
     };
@@ -1356,8 +1357,8 @@ fn edit_sheet(
         let has = editing.vertex.is_some();
         if action(ui, t, tl!("Pick Vertex at Cross"), width, !has, true) {
             let middle = app.map.view_rect.map(|(rect, _)| rect.center());
-            match middle.and_then(|at| edit::vertex_near(app, edit::shape_ref(app, target.id, row)?, at)) {
-                Some(v) => state.editing = Some(editing.picking(Some(v), edit::shape_ref(app, target.id, row))),
+            match middle.and_then(|at| edit::vertex_near(app, edit::shape_ref(app, target.id, row)?.as_ref(), at)) {
+                Some(v) => state.editing = Some(editing.picking(Some(v), edit::shape_ref(app, target.id, row).as_deref())),
                 None => app.session.notify(tl!("No vertex is near the cross. Move the map so the cross is on one."), true),
             }
         }
@@ -1373,14 +1374,14 @@ fn edit_sheet(
                     if act != "delete" && at.is_none() {
                         app.session.notify(off(), true);
                     } else if let Some(at) = at
-                        && edit::shape_ref(app, target.id, row).is_some_and(|shape| edit::doubles(app, shape, v, act, at))
+                        && edit::shape_ref(app, target.id, row).is_some_and(|shape| edit::doubles(app, &shape, v, act, at))
                     {
                         app.session.notify(
                             tl!("Nothing was changed: the cross is on the vertex next to it, and two in one place make an edge of no length. Move the map."),
                             true,
                         );
                     } else if let Some(next) = edit::vertex(app, target.id, row, v, act, at) {
-                        state.editing = Some(editing.picking(next, edit::shape_ref(app, target.id, row)));
+                        state.editing = Some(editing.picking(next, edit::shape_ref(app, target.id, row).as_deref()));
                     }
                 }
             }
@@ -1467,7 +1468,7 @@ fn more(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             copies_row(app, ui, t, &ctx);
         }
         // The whole of RustGIS is still there, for a tablet or a job the touch interface has no
-        // button for yet. The Project page's Start brings this interface back at the next start.
+        // button for yet. View › Touch Interface (`ui.touchInterface`) brings this one back.
         if row(ui, t, "pane", tl!("Use the Desktop Interface")) {
             set_sheet(ui.ctx(), Sheet::None);
             // A track being recorded is added before the bar that stops it goes away; one that
@@ -1477,7 +1478,7 @@ fn more(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 // Nothing to keep positions coming for out of sight now, and no interface that
                 // would say so.
                 app.keep_locating = false;
-                app.session.notify(tl!("The desktop interface is on until RustGIS is started again."), false);
+                app.session.notify(tl!("The desktop interface is on. View › Touch Interface brings this one back."), false);
             }
         }
     });

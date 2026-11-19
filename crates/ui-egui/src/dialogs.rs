@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::RustGisApp;
 use crate::theme::{Tokens, semibold};
+use crate::{RustGisApp, i18n};
 
 #[derive(Default)]
 pub struct Dialogs {
@@ -202,10 +202,7 @@ impl Dialogs {
             "defineProjection" => {
                 self.projection_layer = active.map(|l| l.id);
                 self.projection_map = Some((s.opened, s.project.active_map, s.map().name.clone()));
-                self.text = active
-                    .and_then(|l| l.dataset.crs)
-                    .map(|c| c.custom_def().map(|d| d.proj4.clone()).unwrap_or_else(|| c.label()))
-                    .unwrap_or_else(|| "EPSG:4326".into());
+                self.text = active.and_then(|l| l.dataset.crs).map(|c| c.definition_text()).unwrap_or_else(|| "EPSG:4326".into());
             }
             "coordinateSystem" => {
                 self.text = s.map().projection.code();
@@ -450,16 +447,27 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "addShapefile" => {
                 ui.label(tl!("Choose the source coordinate system before importing. It replaces a missing or incorrect .prj without changing the original file."));
                 let input_label = ui.label(tl!("Source coordinate system"));
-                let response = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:2263").desired_width(f32::INFINITY)).labelled_by(input_label.id);
+                let recent = app.ui.recent_crs.clone();
+                let width = ui.available_width();
+                let (response, _) = crate::crspicker::crs_box(ui, "addShapefile", &mut app.dialogs.text, &recent, crate::crspicker::Offer::All, width, "EPSG:2263", &t);
+                let response = response.labelled_by(input_label.id);
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Source coordinate system")));
                 ui.label(tl!("In the browser, pick the .shp and .dbf together, with any sidecars, or pick a ZIP. The override applies to every Shapefile in the ZIP."));
-                close = buttons(app, ui, "Choose File…", |app| app.run("ui.importShapefile", json!({"crs": app.dialogs.text.trim()})).map(|_| ()));
+                close = buttons(app, ui, "Choose File…", |app| {
+                    let crs = app.dialogs.text.trim().to_string();
+                    // Remembered once a file is picked (`ui.importShapefile`).
+                    app.run("ui.importShapefile", json!({"crs": crs}))?;
+                    Ok(())
+                });
             }
             "defineProjection" => {
                 ui.label(egui::RichText::new(&app.dialogs.layer).strong());
                 ui.label(tl!("Interpret the layer's native coordinates in this coordinate system. This changes where it draws; the source file is unchanged."));
                 let input_label = ui.label(tl!("Source coordinate system"));
-                let label = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:2263").desired_width(f32::INFINITY)).labelled_by(input_label.id);
+                let recent = app.ui.recent_crs.clone();
+                let width = ui.available_width();
+                let (label, _) = crate::crspicker::crs_box(ui, "defineProjection", &mut app.dialogs.text, &recent, crate::crspicker::Offer::All, width, "EPSG:2263", &t);
+                let label = label.labelled_by(input_label.id);
                 label.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Source coordinate system")));
                 ui.label(egui::RichText::new(tl!("Geometry lost during import cannot be recovered here. Use Import Original File to choose its coordinate system before reading it. Streamed layers must first be loaded into memory.")).weak());
                 if ui.button(tl!("Import Original File…")).clicked() {
@@ -475,7 +483,10 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                         return Err(tl!("The active project or map changed; reopen Define Projection for the intended layer.").into());
                     }
                     let id = app.dialogs.projection_layer.ok_or(tl!("No layer selected"))?;
-                    app.run("layer.defineProjection", json!({"layer": id, "crs": app.dialogs.text.trim()})).map(|_| ())
+                    let crs = app.dialogs.text.trim().to_string();
+                    app.run("layer.defineProjection", json!({"layer": id, "crs": crs}))?;
+                    app.remember_crs_if_listed(&crs);
+                    Ok(())
                 });
             }
             "basemap" | "body" | "addSample" | "layerTemplate" => {
@@ -720,7 +731,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             }
         }
         if let Some(e) = &app.dialogs.error {
-            ui.label(egui::RichText::new(e).color(t.red));
+            let translated = i18n::file_size_error(e, i18n::fmt);
+            ui.label(egui::RichText::new(translated.as_deref().unwrap_or(e)).color(t.red));
         }
         if let Some(i) = &app.dialogs.info {
             ui.label(egui::RichText::new(i).color(t.green));
@@ -862,6 +874,7 @@ pub fn open_csv(app: &mut RustGisApp, name: &str, source: CsvSource) -> Result<V
     app.run("ui.dialog", json!({"name": "addCsv"}))?;
     let file = CsvFile { name: name.to_string(), source };
     app.dialogs.mode = "auto";
+    app.dialogs.csv_picked = false;
     let found = csv_columns(&file, "auto", &app.dialogs.text);
     show_columns(&mut app.dialogs, found);
     app.dialogs.csv = Some(file);
@@ -925,7 +938,17 @@ fn add_dxf(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     );
     egui::Grid::new("dxf").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
         let input_label = ui.label(tl!("Coordinate system"));
-        let response = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:3857").desired_width(260.0));
+        let recent = app.ui.recent_crs.clone();
+        let (response, _) = crate::crspicker::crs_box(
+            ui,
+            "dxf",
+            &mut app.dialogs.text,
+            &recent,
+            crate::crspicker::Offer::All,
+            260.0,
+            "EPSG:3857",
+            &Tokens::get(ui.ctx()),
+        );
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Coordinate system")));
         response.labelled_by(input_label.id);
         ui.end_row();
@@ -937,6 +960,7 @@ fn add_dxf(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         if !app.dialogs.text.trim().is_empty() {
             p["crs"] = json!(app.dialogs.text.trim());
         }
+        let crs = app.dialogs.text.trim().to_string();
         let file = app.dialogs.dxf.take().ok_or("choose a file first")?;
         let r = match &file.source {
             DxfSource::Path(path) => {
@@ -945,9 +969,11 @@ fn add_dxf(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             }
             DxfSource::Bytes(bytes) => app.import_dxf_bytes(&file.name, bytes, p),
         };
-        // Kept for another try.
+        // Kept for another try; a system is remembered once its import has started.
         if r.is_err() {
             app.dialogs.dxf = Some(file);
+        } else {
+            app.remember_crs_if_listed(&crs);
         }
         r.map(|_| ())
     })
@@ -1026,7 +1052,12 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     let sheet = rustgis_engine::data::sheets::is_sheet_name(&name);
     let shown = std::path::Path::new(&name).file_name().and_then(|n| n.to_str()).unwrap_or(&name).to_string();
     ui.label(egui::RichText::new(shown).strong());
-    ui.label(egui::RichText::new(tl!("Columns named like longitude/latitude, easting/northing or geometry are picked for you.")).weak());
+    ui.label(
+        egui::RichText::new(tl!(
+            "Automatic chooses columns using the whole file. Open a list to see the preview suggestions or choose columns yourself."
+        ))
+        .weak(),
+    );
     let mut reread = false;
     let mut crs_committed = false;
     egui::Grid::new("csv").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
@@ -1040,20 +1071,24 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
                 _ => &mut d.c,
             };
             let before = v.clone();
-            let selected = if v.is_empty() { tl!("None").to_string() } else { v.clone() };
-            egui::ComboBox::from_id_salt(("csv_column", i))
-                .selected_text(selected)
-                .width(240.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(v, String::new(), tl!("None"));
-                    for c in &columns {
-                        ui.selectable_value(v, c.clone(), c.as_str());
-                    }
-                })
-                .response
-                .labelled_by(input_label.id);
+            let selected = if !d.csv_picked {
+                tl!("Automatic").to_string()
+            } else if v.is_empty() {
+                tl!("None").to_string()
+            } else {
+                v.clone()
+            };
+            let menu = egui::ComboBox::from_id_salt(("csv_column", i)).selected_text(selected).width(240.0).show_ui(ui, |ui| {
+                let mut picked = ui.selectable_value(v, String::new(), tl!("None")).clicked();
+                for c in &columns {
+                    picked |= ui.selectable_value(v, c.clone(), c.as_str()).clicked();
+                }
+                picked
+            });
+            menu.response.labelled_by(input_label.id);
+            // Selecting the suggested name also pins it as an explicit choice.
+            d.csv_picked |= menu.inner.unwrap_or(false);
             // x/y columns or a WKT column, not both.
-            d.csv_picked |= *v != before;
             if *v != before && !v.is_empty() {
                 if i == 2 {
                     (d.a, d.b) = (String::new(), String::new());
@@ -1064,11 +1099,20 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             ui.end_row();
         }
         let input_label = ui.label(tl!("Coordinate system"));
-        let response = ui
-            .add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("EPSG:4326").desired_width(240.0))
-            .labelled_by(input_label.id);
-        app.dialogs.csv_crs_dirty |= response.changed();
-        if response.lost_focus() && app.dialogs.csv_crs_dirty {
+        let recent = app.ui.recent_crs.clone();
+        let (response, taken) = crate::crspicker::crs_box(
+            ui,
+            "csv",
+            &mut app.dialogs.text,
+            &recent,
+            crate::crspicker::Offer::All,
+            240.0,
+            "EPSG:4326",
+            &Tokens::get(ui.ctx()),
+        );
+        let response = response.labelled_by(input_label.id);
+        app.dialogs.csv_crs_dirty |= response.changed() || taken;
+        if (response.lost_focus() || taken) && app.dialogs.csv_crs_dirty {
             app.dialogs.csv_crs_dirty = false;
             crs_committed = true;
         }
@@ -1094,7 +1138,7 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     });
     // Only untouched defaults follow a committed CRS edit (Enter also ends a single-line edit).
     // Parsing a PROJ string registers it, so never parse while the user is still typing.
-    // Another separator keeps the previous picks when its columns still exist.
+    // Another separator keeps explicit picks when their columns still exist.
     let crs = app.dialogs.text.trim();
     if (reread || (crs_committed && !app.dialogs.csv_picked))
         && let Some(file) = &app.dialogs.csv
@@ -1102,16 +1146,21 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         let found = csv_columns(file, app.dialogs.mode, crs);
         let picked = [app.dialogs.a.clone(), app.dialogs.b.clone(), app.dialogs.c.clone()];
         show_columns(&mut app.dialogs, found);
-        if reread {
+        if reread && app.dialogs.csv_picked {
             keep_picked(&mut app.dialogs, picked);
         }
     }
     buttons(app, ui, "Add", |app| {
         let mut p = json!({});
-        for (key, v) in [("x", &app.dialogs.a), ("y", &app.dialogs.b), ("wkt", &app.dialogs.c), ("crs", &app.dialogs.text)] {
-            if !v.trim().is_empty() {
-                p[key] = json!(v.trim());
+        if app.dialogs.csv_picked {
+            for (key, v) in [("x", &app.dialogs.a), ("y", &app.dialogs.b), ("wkt", &app.dialogs.c)] {
+                if !v.trim().is_empty() {
+                    p[key] = json!(v.trim());
+                }
             }
+        }
+        if !app.dialogs.text.trim().is_empty() {
+            p["crs"] = json!(app.dialogs.text.trim());
         }
         if app.dialogs.mode != "auto" && !sheet {
             p["delimiter"] = json!(app.dialogs.mode);
@@ -1124,9 +1173,12 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             }
             CsvSource::Bytes(bytes) => app.open_bytes_with(&file.name, bytes, Some(p)),
         };
-        // Kept for another try.
+        // Kept for another try; a system is remembered once its import has started.
         if r.is_err() {
             app.dialogs.csv = Some(file);
+        } else {
+            let crs = app.dialogs.text.trim().to_string();
+            app.remember_crs_if_listed(&crs);
         }
         r.map(|_| ())
     })
@@ -1969,17 +2021,40 @@ fn gpkg_add_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         ui.add(egui::TextEdit::singleline(&mut app.dialogs.e).hint_text("100000").desired_width(280.0)).labelled_by(input_label.id);
         ui.end_row();
     });
-    if app.dialogs.listed.as_deref().is_some_and(|path| path != app.dialogs.a) {
+    if app.dialogs.listed.as_deref().is_some_and(|path| path != app.dialogs.a.trim()) {
         app.dialogs.listed = None;
         app.dialogs.list.clear();
         app.dialogs.c.clear();
         app.dialogs.info = None;
     }
-    if list {
-        match app.run("info.fileLayers", json!({"path": app.dialogs.a})) {
+    // Listed here, on the frame: a GeoPackage's tables in place, without reading their features;
+    // a file of several layers (a KML, a zip) only within the size every computer reads, as
+    // before #2408, as it is read whole to list it.
+    let path = app.dialogs.a.trim().to_string();
+    // Only a file of several layers is refused past the floor: it is read whole to list it. Others
+    // are listed as before #2408 (a Shapefile or FlatGeobuf by name, a spreadsheet by its sheets).
+    // The browser has no file paths to measure; a file comes in there by upload, within its limit.
+    #[cfg(not(target_arch = "wasm32"))]
+    let too_large = || {
+        rustgis_engine::data::io::is_multi_layer_name(&path)
+            && std::fs::metadata(&path).is_ok_and(|m| m.len() > rustgis_engine::data::io::BYTES_FLOOR)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let too_large = || false;
+    if list && too_large() {
+        app.dialogs.listed = None;
+        app.dialogs.list.clear();
+        app.dialogs.c.clear();
+        app.dialogs.info = None;
+        app.dialogs.error = Some(crate::i18n::fmt(
+            "List Tables reads a file of several layers (a KML, a zip) whole, up to {limit} MiB; add it with Add Data",
+            &[("limit", &(rustgis_engine::data::io::BYTES_FLOOR >> 20).to_string())],
+        ));
+    } else if list {
+        match app.run("info.fileLayers", json!({"path": path})) {
             Ok(v) => {
                 app.dialogs.list = v["layers"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)).collect();
-                app.dialogs.listed = Some(app.dialogs.a.clone());
+                app.dialogs.listed = Some(path.clone());
                 app.dialogs.error = None;
                 app.dialogs.info = Some(crate::i18n::fmt("{n} tables with geometry", &[("n", &app.dialogs.list.len().to_string())]));
             }
@@ -2252,12 +2327,24 @@ pub(crate) fn text_box(text: &mut String) -> egui::TextEdit<'_> {
 
 /// OK/Cancel row; returns true when the dialog should close.
 pub(crate) fn buttons(app: &mut RustGisApp, ui: &mut egui::Ui, ok: &str, f: impl FnOnce(&mut RustGisApp) -> Result<(), String>) -> bool {
+    buttons_enabled(app, ui, ok, true, f)
+}
+
+/// OK/Cancel row whose submit can be disabled without disabling Cancel.
+pub(crate) fn buttons_enabled(
+    app: &mut RustGisApp,
+    ui: &mut egui::Ui,
+    ok: &str,
+    enabled: bool,
+    f: impl FnOnce(&mut RustGisApp) -> Result<(), String>,
+) -> bool {
     let mut close = false;
     ui.add_space(4.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
         let t = Tokens::get(ui.ctx());
         let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-        if crate::widgets::dialog_button(ui, tl!(ok), Some(t.accent), vec2(84.0, 28.0)).clicked() || enter {
+        let submit = ui.add_enabled_ui(enabled, |ui| crate::widgets::dialog_button(ui, tl!(ok), Some(t.accent), vec2(84.0, 28.0))).inner;
+        if enabled && (submit.clicked() || enter) {
             match f(app) {
                 Ok(()) => close = true,
                 Err(e) => app.dialogs.error = Some(e),
@@ -2294,8 +2381,8 @@ const MAX_FIELD_CHIPS: usize = 40;
 pub(crate) fn field_chips(ui: &mut egui::Ui, fields: &[rustgis_engine::data::Field], text: &mut String) {
     ui.horizontal_wrapped(|ui| {
         ui.label(egui::RichText::new(tl!("Fields:")).small().weak());
-        let named = fields.iter().enumerate().filter(|(i, f)| !fields.iter().take(*i).any(|g| g.name.eq_ignore_ascii_case(&f.name)));
-        for (_, f) in named.take(MAX_FIELD_CHIPS) {
+        let mut seen = std::collections::HashSet::new();
+        for f in fields.iter().filter(|f| seen.insert(f.name.to_ascii_lowercase())).take(MAX_FIELD_CHIPS) {
             if ui.small_button(&f.name).clicked() {
                 add_word(text, &crate::exprcomplete::field_ref(&f.name));
             }
@@ -2450,13 +2537,80 @@ fn coordinate_system(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> boo
     choices.extend(rustgis_engine::map::projection::PRESETS.iter().map(|(id, label, _)| (id.to_string(), label.to_string())));
     // Two panes of a fixed height, so the dialog doesn't stretch to the window.
     let pane_h = 340.0;
+    // Enter on a code typed in full: the picker leaves it to the dialog, which applies it.
+    let mut enter_applies = false;
     ui.allocate_ui_with_layout(vec2(ui.available_width(), pane_h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
         ui.set_height(pane_h);
         ui.vertical(|ui| {
             ui.set_width(270.0);
-            egui::ScrollArea::vertical().id_salt("crs_list").max_height(pane_h - 44.0).auto_shrink([false, false]).show(ui, |ui| {
+            let input_label = ui.label(tl!("Search by name or code"));
+            let recent = app.ui.recent_crs.clone();
+            let (r, taken) = crate::crspicker::crs_box(
+                ui,
+                "map",
+                &mut app.dialogs.a,
+                &recent,
+                crate::crspicker::Offer::Map,
+                262.0,
+                tl!("e.g. 3035, lv95, vn2000tm3"),
+                t,
+            );
+            let r = r.labelled_by(input_label.id);
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Search by name or code")));
+            enter_applies = taken && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Words being typed to search are no system yet: the selection stays until they are one.
+            // A code or a definition (`3035`, `EPSG:3035`, `albers +lat_1=…`) is what was asked for,
+            // its error shown and Apply off when it can't be drawn.
+            // Emptied: the map's own system again, not a code typed before and left.
+            if r.changed() && app.dialogs.a.trim().is_empty() && app.dialogs.text != current {
+                let invalid = rustgis_engine::map::Projection::from_code(&app.dialogs.text).is_err();
+                if invalid {
+                    app.dialogs.text = current.clone();
+                }
+            }
+            if (r.changed() || taken) && !app.dialogs.a.trim().is_empty() {
+                let typed = typed_crs(&app.dialogs.a);
+                let a = app.dialogs.a.trim();
+                let explicit = a.contains(['+', ':', '=']) || a.bytes().all(|b| b.is_ascii_digit());
+                if taken || explicit || rustgis_engine::map::Projection::from_code(&typed).is_ok() {
+                    app.dialogs.text = typed;
+                }
+            }
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().id_salt("crs_list").max_height(pane_h - 52.0).auto_shrink([false, false]).show(ui, |ui| {
                 ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
                     let picked = rustgis_engine::map::projection::parse_preset(&app.dialogs.text).ok().flatten().map(|(id, _)| id);
+                    // The systems last applied, then the presets.
+                    let recent: Vec<(String, String)> = recent
+                        .iter()
+                        .filter_map(|code| rustgis_engine::data::raster::crs_search::name_of(code).map(|n| (code.clone(), n.to_string())))
+                        .filter(|(code, _)| crate::crspicker::map_usable(code))
+                        .take(crate::crspicker::RECENT_MAX)
+                        .collect();
+                    // Shown while anything is remembered, also systems only the other boxes list (one
+                    // in degrees), so they can be forgotten here too.
+                    if !app.ui.recent_crs.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(tl!("Recently used")).size(11.0).color(t.text_dim));
+                            // The way back: the list is the user's own, kept between sessions.
+                            if ui
+                                .small_button(tl!("Clear"))
+                                .on_hover_text(tl!("Forget the recently used coordinate systems, in every coordinate system box"))
+                                .clicked()
+                            {
+                                app.clear_recent_crs();
+                            }
+                        });
+                        for (code, name) in &recent {
+                            let selected = app.dialogs.text.eq_ignore_ascii_case(code);
+                            if ui.selectable_label(selected, format!("{name} ({code})")).clicked() {
+                                app.dialogs.text = code.clone();
+                                app.dialogs.a.clear();
+                            }
+                        }
+                        ui.separator();
+                        ui.label(egui::RichText::new(tl!("Presets")).size(11.0).color(t.text_dim));
+                    }
                     for (id, label) in &choices {
                         let selected = app.dialogs.text.eq_ignore_ascii_case(id) || picked == Some(id.as_str());
                         if ui.selectable_label(selected, tl!(label.as_str())).clicked() {
@@ -2465,16 +2619,6 @@ fn coordinate_system(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> boo
                         }
                     }
                 });
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                let input_label = ui.label(tl!("EPSG or ESRI code"));
-                let r = ui
-                    .add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("3035, vn2000tm3").desired_width(120.0))
-                    .labelled_by(input_label.id);
-                if r.changed() && !app.dialogs.a.trim().is_empty() {
-                    app.dialogs.text = typed_crs(&app.dialogs.a);
-                }
             });
         });
         ui.separator();
@@ -2492,9 +2636,11 @@ fn coordinate_system(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> boo
     let same = check.as_ref().is_ok_and(|p| p.code() == current);
     let mut close = false;
     ui.horizontal(|ui| {
-        if ui.add_enabled(check.is_ok() && !same, egui::Button::new(tl!("Apply"))).clicked() {
+        let apply = ui.add_enabled(check.is_ok() && !same, egui::Button::new(tl!("Apply"))).clicked();
+        if apply || (enter_applies && check.is_ok() && !same) {
             match app.run("map.projection", json!({"type": chosen})) {
                 Ok(_) => {
+                    app.remember_crs_if_listed(&chosen);
                     let _ = app.run("map.zoomFull", Value::Null);
                     close = true;
                 }
@@ -2575,12 +2721,17 @@ fn preset_fields(app: &mut RustGisApp, ui: &mut egui::Ui) {
 }
 
 /// A typed coordinate system code: `ESRI:102033` or `Epsg: 3035` as it is (`lookup` reads the
-/// prefix in any case and spacing), a bare number as an EPSG code, or a Vietnamese province with
+/// prefix in any case and spacing), a bare number as `Crs::parse` reads it (EPSG's, or ESRI's for
+/// one EPSG lacks and ESRI has, such as `102033`), or a Vietnamese province with
 /// the `vn2000:` prefix (`vn2000:hanoi`); a bare name such as `hue` is not taken for one.
 pub(crate) fn typed_crs(text: &str) -> String {
     let text = text.trim();
     if text.starts_with(|c: char| c.is_ascii_digit()) {
-        format!("EPSG:{text}")
+        let number = text.bytes().all(|b| b.is_ascii_digit()).then(|| text.parse::<u32>().ok()).flatten();
+        match number {
+            Some(n) if rustgis_engine::data::raster::crs::bare_number_is_esri(n) => format!("ESRI:{n}"),
+            _ => format!("EPSG:{text}"),
+        }
     } else if let Some(lon) = rustgis_engine::map::projection::resolve_vn2000_alias(text) {
         format!("vn2000tm3 +lon_0={lon}")
     } else {
@@ -2600,6 +2751,10 @@ fn crs_details(ui: &mut egui::Ui, chosen: &str, current: &str, t: &Tokens) {
     };
     let code = projection.code();
     ui.label(egui::RichText::new(tl!(projection.label().as_str())).font(crate::theme::semibold(14.0)));
+    // A code is named as the catalog names it: `CH1903+ / LV95` under `EPSG:2056`.
+    if let Some(name) = rustgis_engine::data::raster::crs_search::name_of(&code).filter(|n| *n != projection.label()) {
+        ui.label(egui::RichText::new(name).size(13.0));
+    }
     if code == current {
         ui.label(egui::RichText::new(tl!("In use")).size(11.0).color(t.accent_text));
     }
@@ -2745,6 +2900,281 @@ mod tests {
         assert!(h.query_by_role_and_label(Role::Button, &past).is_none(), "no more");
     }
 
+    /// The Functions and Variables menus are lists as a box's suggestions are: each entry named
+    /// as the list names it, the first highlighted with its help beside (a function's description
+    /// and example), the help following the pointer; a click adds the entry (a function open),
+    /// ↓ and Enter add the next one, Escape closes the list.
+    #[test]
+    fn the_menus_are_lists_with_their_help() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::query;
+        let fs: Vec<_> = query::functions().take(2).collect();
+        let (first, second) = (fs[0], fs[1]);
+        let name = |f: query::FuncSpec| format!("{}()", f.name);
+        let open = |f: query::FuncSpec| if f.max > 0 { format!("{}(", f.name) } else { format!("{}() ", f.name) };
+        let var = *query::VARS[1].names.first().unwrap();
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(1000.0, 700.0))
+            .allow_missing_glyphs()
+            .build_ui_state(move |ui, text: &mut String| field_chips(ui, &[], text), String::new());
+        h.run();
+        let shows = |h: &egui_kittest::Harness<'_, String>, label: &str| h.query_by_role_and_label(Role::Label, label).is_some();
+        h.get_by_role_and_label(Role::Button, "Functions ▾").click();
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, &name(first)).is_some(), "named as the list names it");
+        assert!(shows(&h, first.description) && shows(&h, first.example), "the first highlighted, its help shown");
+        // Moved onto it: a first position has no motion (egui's pointer delta), so it starts beside.
+        let at = h.get_by_role_and_label(Role::Button, &name(second)).rect().center();
+        for at in [at - vec2(40.0, 0.0), at] {
+            h.event(egui::Event::PointerMoved(at));
+            h.run();
+        }
+        assert!(shows(&h, second.description) && shows(&h, second.example), "the help follows the pointer");
+        assert!(!shows(&h, first.description), "one help at a time");
+        h.get_by_role_and_label(Role::Button, &name(second)).click();
+        h.run();
+        assert_eq!(*h.state(), open(second), "added, a function open");
+        assert!(h.query_by_role_and_label(Role::Button, &name(second)).is_none(), "the list closed");
+        h.get_by_role_and_label(Role::Button, "Variables ▾").click();
+        h.run();
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        assert!(shows(&h, query::VARS[1].description), "the help follows the highlight");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(*h.state(), format!("{}{var} ", open(second)), "↓ and Enter add the next");
+        h.get_by_role_and_label(Role::Button, "Functions ▾").click();
+        h.run();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, &name(first)).is_none(), "Escape closes it");
+        assert_eq!(*h.state(), format!("{}{var} ", open(second)), "adding nothing");
+    }
+
+    /// From the keyboard: Tab to Functions ▾ and Enter opens it, ↓ moves the highlight and Enter
+    /// adds that function, the focus staying on the button (the arrows don't move it to another
+    /// button for Enter to press); Escape closes the list.
+    #[test]
+    fn the_menus_work_from_the_keyboard() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::query;
+        let fs: Vec<_> = query::functions().take(2).collect();
+        let (first, second) = (format!("{}()", fs[0].name), fs[1]);
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(1000.0, 700.0))
+            .allow_missing_glyphs()
+            .build_ui_state(move |ui, text: &mut String| field_chips(ui, &[], text), String::new());
+        h.run();
+        let on_button = |h: &egui_kittest::Harness<'_, String>| h.get_by_role_and_label(Role::Button, "Functions ▾").is_focused();
+        for _ in 0..20 {
+            if on_button(&h) {
+                break;
+            }
+            h.key_press(egui::Key::Tab);
+            h.run();
+        }
+        assert!(on_button(&h), "reached with Tab");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "Enter opens it");
+        assert_eq!(*h.state(), "", "and adds nothing yet");
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        assert!(on_button(&h), "the arrow moves the highlight, not the focus");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let added = if second.max > 0 { format!("{}(", second.name) } else { format!("{}() ", second.name) };
+        assert_eq!(*h.state(), added, "Enter adds the highlighted one");
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_none(), "and closes the list");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_none(), "Escape closes it");
+        assert_eq!(*h.state(), added, "adding nothing");
+        // Tab on with the list open: it closes at once, and the very next Enter (the next frame)
+        // is the next widget's, Variables ▾, rather than the list's.
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "open again");
+        h.key_press(egui::Key::Tab);
+        h.step();
+        h.key_press(egui::Key::Enter);
+        h.step();
+        h.run();
+        assert!(!on_button(&h), "the focus moved on");
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_none(), "Tab closed it");
+        let var = rustgis_engine::data::query::VARS[0].names[0];
+        assert!(h.query_by_role_and_label(Role::Button, var).is_some(), "Enter opened Variables ▾");
+        assert_eq!(*h.state(), added, "and added nothing");
+    }
+
+    /// In the app, Enter on Functions ▾ (focused from the keyboard) opens its list and is taken
+    /// by it: the dialog doesn't also run with the clause half written.
+    #[test]
+    fn enter_on_a_clause_menu_does_not_run_the_dialog() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.dialog", json!({"name": "selectByAttributes"})).unwrap();
+        app.dialogs.text = "pop_est >".into();
+        let mut h = app_harness(app);
+        h.run_steps(3);
+        h.get_by_role_and_label(Role::Button, "Functions ▾").focus();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let first = format!("{}()", rustgis_engine::data::query::functions().next().unwrap().name);
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "the list opened");
+        assert_eq!(h.state().dialogs.open, Some("selectByAttributes"), "the dialog is still open");
+        assert_eq!(h.state().dialogs.error, None, "and didn't run");
+    }
+
+    /// In the app (its whole frame, shortcuts included), Escape closes a clause's Functions list:
+    /// the Escape shortcut (the Explore tool) doesn't take it first, so the tool is left as it was.
+    #[test]
+    fn escape_closes_a_clause_list_in_the_app() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("tool.set", json!({"tool": "zoomIn"})).unwrap();
+        app.run("ui.dialog", json!({"name": "selectByAttributes"})).unwrap();
+        app.dialogs.text = "pop_est > 1".into();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        // Typing in the clause first: a click on the button doesn't leave the box's focus behind
+        // to close the list it opens.
+        h.query_all_by_role(Role::MultilineTextInput).find(|n| n.value().as_deref() == Some("pop_est > 1")).unwrap().click();
+        h.run_steps(2);
+        assert!(
+            h.query_all_by_role(Role::MultilineTextInput).any(|n| n.value().as_deref() == Some("pop_est > 1") && n.is_focused()),
+            "the clause has the focus"
+        );
+        h.get_by_role_and_label(Role::Button, "Functions ▾").click();
+        h.run_steps(2);
+        let first = format!("{}()", rustgis_engine::data::query::functions().next().unwrap().name);
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "open, and still open a frame later");
+        // A shortcut with Ctrl (⌘) isn't the list's: it still runs (Mod+Minus zooms out).
+        let res = h.state().session.map().camera.res;
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Minus);
+        h.run_steps(2);
+        assert!(h.state().session.map().camera.res > res, "zoomed out");
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "with the list still open");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(h.query_by_role_and_label(Role::Button, &first).is_none(), "Escape closed it");
+        assert_eq!(h.state().dialogs.open, Some("selectByAttributes"), "not the dialog");
+        assert_eq!(h.state().session.tool, rustgis_engine::Tool::ZoomIn, "nor switched the tool");
+    }
+
+    /// In the app, Escape in a coordinate system box closes its list, not the dialog, and the
+    /// Escape shortcut (the Explore tool) doesn't take it; Enter in the blank box takes no recent
+    /// system, while ↓ then Enter does.
+    #[test]
+    fn a_coordinate_system_box_keeps_its_keys_in_the_app() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.ui.recent_crs = vec!["EPSG:2056".into()];
+        app.run("tool.set", json!({"tool": "zoomIn"})).unwrap();
+        app.run("ui.dialog", json!({"name": "coordinateSystem"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        h.get_by_role_and_label(Role::TextInput, "Search by name or code").click();
+        h.run_steps(2);
+        // Under the box, and in the dialog's own list.
+        let shown = |h: &egui_kittest::Harness<'_, RustGisApp>| h.query_all_by_label_contains("CH1903+ / LV95").count();
+        assert_eq!(shown(&h), 2, "the recent list opened");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert_eq!(shown(&h), 1, "Escape closed it");
+        assert_eq!(h.state().dialogs.open, Some("coordinateSystem"), "not the dialog");
+        assert_eq!(h.state().session.tool, rustgis_engine::Tool::ZoomIn, "nor switched the tool");
+        // Blank and Enter: no system taken.
+        h.get_by_role_and_label(Role::TextInput, "Search by name or code").click();
+        h.run_steps(2);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.a, "", "a blank box stays blank");
+        // ↓ chooses the recent one, Enter takes it.
+        h.get_by_role_and_label(Role::TextInput, "Search by name or code").click();
+        h.run_steps(2);
+        h.key_press(egui::Key::ArrowDown);
+        h.run_steps(1);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.a, "EPSG:2056");
+        assert_eq!(h.state().dialogs.text, "EPSG:2056");
+        // Emptied again: that ↓ chose nothing for the next time.
+        h.state_mut().dialogs.a.clear();
+        h.get_by_role_and_label(Role::TextInput, "Search by name or code").click();
+        h.run_steps(2);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.a, "", "no stale choice");
+    }
+
+    /// In the Coordinate System dialog, Enter on a code typed in full applies it; a definition that
+    /// can't be drawn is shown as such, not replaced by the system chosen before.
+    #[test]
+    fn the_map_dialog_applies_a_full_code_on_enter() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.dialog", json!({"name": "coordinateSystem"})).unwrap();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1400.0, 1000.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(4);
+        // A definition the map can't be drawn in: shown, not the system chosen before.
+        h.get_by_role_and_label(Role::TextInput, "Search by name or code").click();
+        h.run_steps(2);
+        h.get_by_role_and_label(Role::TextInput, "Search by name or code").type_text("albers +lat_1=-30 +lat_2=30");
+        h.run_steps(2);
+        assert!(h.state().dialogs.text.starts_with("albers +lat_1=-30"), "{}", h.state().dialogs.text);
+        // A code in full, then Enter: applied, the dialog closed.
+        h.state_mut().dialogs.a.clear();
+        h.get_by_role_and_label(Role::TextInput, "Search by name or code").click();
+        h.run_steps(2);
+        h.get_by_role_and_label(Role::TextInput, "Search by name or code").type_text("3035");
+        h.run_steps(2);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(3);
+        assert_eq!(h.state().session.map().projection.code(), "EPSG:3035");
+        assert_eq!(h.state().dialogs.open, None);
+    }
+
+    /// A bare number in a box is read as `Crs::parse` reads it: EPSG's, or ESRI's for one EPSG lacks.
+    #[test]
+    fn a_bare_number_is_typed_as_the_parser_reads_it() {
+        use rustgis_engine::data::raster::Crs;
+        for (typed, code) in [("2056", "EPSG:2056"), ("102100", "EPSG:102100"), ("102033", "ESRI:102033")] {
+            assert_eq!(typed_crs(typed), code);
+            assert_eq!(Crs::parse(typed).map(|c| c.label()), Crs::parse(code).map(|c| c.label()), "{typed}");
+        }
+    }
+
     /// A scale's commas go only where they group thousands: a decimal comma is left for the
     /// command to refuse, not read as a bigger number.
     #[test]
@@ -2887,6 +3317,16 @@ mod tests {
         h.run();
         assert_eq!(shown(&h) + 1, offered, "the field was offered, and no longer is");
         assert!(h.query_by_label_contains("no field named 'pop_x'").is_some(), "the error once nothing is");
+        // Offered again, then closed with Escape: the word is read as it is, and the dialog stays.
+        h.key_press(egui::Key::Backspace);
+        h.run();
+        assert_eq!(shown(&h), offered, "offered again");
+        assert!(h.query_by_label_contains("Invalid:").is_none(), "no error while it is offered");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert_eq!(shown(&h) + 1, offered, "the list closed");
+        assert!(h.query_by_label_contains("no field named 'pop_'").is_some(), "the error once the list is closed");
+        assert_eq!(h.state().dialogs.open, Some("calculateField"), "Escape took the list, not the dialog");
     }
 
     /// The app in a harness, its fonts installed on the first pass (the dialog draws on the next).
@@ -2949,6 +3389,37 @@ mod tests {
             // Enter also confirms Add through the dialog's usual OK/Cancel row.
             assert_eq!(h.state().dialogs.open, if pick == Some("None") { Some("addCsv") } else { None });
             assert!(h.state().dialogs.error.is_none());
+        }
+    }
+
+    /// The dialog previews the first thousand rows and only submits explicit column picks.
+    #[test]
+    fn delimited_suggestions_use_whole_file_inference_until_picked() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut csv = String::from("Longitude,Latitude,X,Y\n");
+        csv.push_str(&"-93,44,20,40\n".repeat(1_000));
+        csv.push_str(",,21,41\n");
+        for explicit in [false, true] {
+            let mut app = RustGisApp::new(Session::new(rustgis_engine::Project::default()));
+            open_csv(&mut app, "points.csv", CsvSource::Bytes(csv.as_bytes().to_vec())).unwrap();
+            let mut h = app_harness(app);
+            h.run_steps(3);
+            assert_eq!((&*h.state().dialogs.a, &*h.state().dialogs.b), ("Longitude", "Latitude"));
+            assert_eq!(h.get_by_role_and_label(Role::ComboBox, "X column").value().as_deref(), Some("Automatic"));
+            if explicit {
+                h.get_by_role_and_label(Role::ComboBox, "X column").click();
+                h.run_steps(2);
+                h.get_by_role_and_label(Role::Button, "Longitude").click();
+                h.run_steps(2);
+                assert_eq!(h.get_by_role_and_label(Role::ComboBox, "X column").value().as_deref(), Some("Longitude"));
+            }
+            h.get_by_label("Add").click();
+            h.run_steps(3);
+            assert!(h.state().dialogs.error.is_none(), "{:?}", h.state().dialogs.error);
+            let features = &h.state().session.map().layers.last().unwrap().dataset.features;
+            assert_eq!(features.len(), 1_001);
+            assert_eq!(features.last().unwrap().geometry.is_some(), !explicit);
         }
     }
 

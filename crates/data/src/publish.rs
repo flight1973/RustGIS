@@ -145,10 +145,10 @@ struct Original {
     cpg: Option<(PathBuf, Vec<u8>)>,
 }
 
-/// Reads the file at `p`, `None` when it isn't there; refuses one past what a reader takes.
-fn read_part(p: &Path) -> Result<Option<Vec<u8>>> {
+/// Reads an original file at `p`, `None` when absent. The caller supplies format-specific size advice.
+fn read_part(p: &Path, size_error: fn(&str, u64) -> String) -> Result<Option<Vec<u8>>> {
     match std::fs::metadata(p) {
-        Ok(m) if m.len() > crate::io::MAX_BYTES => Err(DataError::Format(format!("{} is too large to read", p.display()))),
+        Ok(m) if m.len() > crate::io::max_bytes() => Err(DataError::Format(size_error(&p.to_string_lossy(), crate::io::max_bytes()))),
         Ok(_) => Ok(Some(std::fs::read(p)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
@@ -159,16 +159,17 @@ impl Original {
     /// Reads the parts of the Shapefile at `path`: its `.shp` and `.dbf` must be there; its
     /// `.shx`, `.prj` and `.cpg` (in whichever case it is spelled) may be.
     fn read(path: &Path) -> Result<Original> {
+        let read = |part: &Path| read_part(part, crate::io::shapefile_size_error);
         let missing = |ext: &str| refused(path, format!("its .{ext} isn't there"));
-        let shp = read_part(path)?.ok_or_else(|| missing("shp"))?;
+        let shp = read(path)?.ok_or_else(|| missing("shp"))?;
         let dbf_path = crate::io::dbf_sidecar(path);
-        let dbf = read_part(&dbf_path)?.ok_or_else(|| missing("dbf"))?;
-        let shx = read_part(&path.with_extension("shx"))?;
-        let prj = read_part(&path.with_extension("prj"))?;
+        let dbf = read(&dbf_path)?.ok_or_else(|| missing("dbf"))?;
+        let shx = read(&path.with_extension("shx"))?;
+        let prj = read(&path.with_extension("prj"))?;
         let mut cpg = None;
         for ext in crate::dbf::CPG_SPELLINGS {
             let p = path.with_extension(ext);
-            if let Some(bytes) = read_part(&p)? {
+            if let Some(bytes) = read(&p)? {
                 cpg = Some((p, bytes));
                 break;
             }
@@ -406,7 +407,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
 /// shape that failed conversion is refused: missing geometry cannot identify its source shape.
 fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Dataset)>) -> Result<std::borrow::Cow<'a, Dataset>> {
     let Some(c) = crs else { return Ok(std::borrow::Cow::Borrowed(ds)) };
-    let t = c.transformer().map_err(DataError::Format)?;
+    let t = Crs::LonLat.to(c).map_err(DataError::Format)?;
     let (read, raw): (Vec<&Feature>, Vec<&Feature>) = match as_held {
         Some((read, raw)) => (read.features.iter().collect(), raw.features.iter().collect()),
         None => (Vec::new(), Vec::new()),
@@ -440,7 +441,7 @@ fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Da
         match held {
             Some(h) => row.geometry = h.geometry.clone(),
             // Looks at Cancel without counting: the write that follows counts the features.
-            None => crate::io::project_each(std::slice::from_mut(&mut row), &t, c, false)?,
+            None => crate::io::project_each(std::slice::from_mut(&mut row), &t, false)?,
         }
         rows.push(row);
     }
@@ -912,6 +913,23 @@ mod tests {
         assert!(shapefile(&ds, &path, &sync).err().unwrap().to_string().contains("changed since the layer was read"));
     }
 
+    /// The publisher's original-file read stops before loading an oversized attribute sidecar.
+    #[test]
+    fn oversized_shapefile_dbf_read_for_publish_gives_dataset_advice() {
+        use crate::io::{FileSizeAdvice, file_size_error_args, max_bytes};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let dbf = path.with_extension("dbf");
+        written(&parcels(), &path);
+        std::fs::OpenOptions::new().write(true).open(&dbf).unwrap().set_len(max_bytes() + 1).unwrap();
+
+        let error = Original::read(&path).err().unwrap().to_string();
+        let limit = (max_bytes() >> 20).to_string();
+        assert_eq!(file_size_error_args(&error), Some((dbf.to_str().unwrap(), limit.as_str(), FileSizeAdvice::Shapefile)));
+        assert_eq!(std::fs::metadata(&dbf).unwrap().len(), max_bytes() + 1);
+    }
+
     /// A duplicated descriptor must not keep a finished publisher's lock alive.
     #[test]
     fn a_source_lock_releases_while_a_duplicate_descriptor_stays_open() {
@@ -1235,15 +1253,36 @@ mod tests {
     fn what_a_read_loses_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parcels.shp");
+        let mut ds = parcels();
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[0] = Value::Text("Smiths".into());
+        ds.features = rows.into();
+        crate::io::write_path(&ds, &path).unwrap();
+        // The first owner `<Null>`, as another program may have written a missing value: it reads
+        // as empty, and would be written back blank.
+        let mut dbf = std::fs::read(path.with_extension("dbf")).unwrap();
+        let at = dbf.windows(6).position(|w| w == b"Smiths").unwrap();
+        dbf.splice(at..at + 6, *b"<Null>");
+        std::fs::write(path.with_extension("dbf"), &dbf).unwrap();
+        let (ds, sync) = read(&path);
+        let e = shapefile(&ds, &path, &sync).err().unwrap().to_string();
+        assert!(e.contains("table wouldn't be the same") && e.contains("'<Null>'"), "{e}");
+    }
+
+    /// Text with a space before it reads as the file has it, so it is written back unchanged (#2059).
+    #[test]
+    fn a_leading_space_is_written_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
         crate::io::write_path(&parcels(), &path).unwrap();
-        // The first owner with a space before it, as another program may have written it.
         let mut dbf = std::fs::read(path.with_extension("dbf")).unwrap();
         let at = dbf.windows(5).position(|w| w == b"Smith").unwrap();
         dbf.splice(at..at + 5, *b" Smit");
         std::fs::write(path.with_extension("dbf"), &dbf).unwrap();
         let (ds, sync) = read(&path);
-        let e = shapefile(&ds, &path, &sync).err().unwrap().to_string();
-        assert!(e.contains("table wouldn't be the same") && e.contains("' Smit'"), "{e}");
+        shapefile(&ds, &path, &sync).unwrap();
+        let (back, _) = read(&path);
+        assert!(back.features.iter().any(|f| f.attrs.contains(&Value::Text(" Smit".into()))), "{:?}", back.features);
     }
 
     /// A float (`F`) column reads every digit its text holds, not the seven of an `f32`, and is

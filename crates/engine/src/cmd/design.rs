@@ -11,6 +11,7 @@ use rustgis_map::design::{
     AttributeRule, ContingentSet, Domain, DomainKind, Elevation, FeatureTemplate, Relationship, RuleKind, Subtype, Subtypes, TopologyRule,
 };
 use serde_json::{Value as Json, json};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 
 use super::{b, f, need_feature_layer, ps};
@@ -23,9 +24,15 @@ mod snap_vertex;
 
 /// One edited feature: its state before (none for an insert) and its row after (none for a
 /// delete).
-pub(crate) struct Change {
-    pub before: Option<Feature>,
+pub(crate) struct Change<B = Feature> {
+    pub before: Option<B>,
     pub row: Option<usize>,
+}
+
+impl<B: Borrow<Feature>> Change<B> {
+    fn before(&self) -> Option<&Feature> {
+        self.before.as_ref().map(Borrow::borrow)
+    }
 }
 
 /// Edits since the last save, per layer: (added, modified, deleted).
@@ -128,27 +135,12 @@ pub(crate) fn apply(s: &mut Session, id: u32, changes: Vec<Change>) -> Result<()
 /// [`apply`], with `new_defaults` false for added rows that carry another feature's attributes
 /// (the pieces of a cut): they keep them, with no subtype defaults or elevation filled in.
 /// Calculation rules and checks still run on every row.
-pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_defaults: bool) -> Result<(), String> {
+pub(crate) fn apply_with<B: Borrow<Feature>>(s: &mut Session, id: u32, changes: Vec<Change<B>>, new_defaults: bool) -> Result<(), String> {
     if changes.is_empty() {
         return Ok(());
     }
     if !s.map().editing.settings.enabled {
         return Err("editing is turned off (Edit › Edit)".into());
-    }
-    // Construction belongs to an object, not a reusable numeric id. Each removed or inserted
-    // feature that passes here (cut/paste, split pieces, edits) forgets its construction. Some
-    // row changes don't (GeoPackage and offline-area syncs, archive restore): there a feature
-    // keeps its construction only while its geometry still equals it (see `box_spec`). Undo
-    // keeps its own cache snapshot.
-    for change in &changes {
-        let feature = match (&change.before, change.row) {
-            (Some(before), None) => Some(before.id),
-            (None, Some(row)) => s.map().layer(id).and_then(|l| l.dataset.features.get(row)).map(|f| f.id),
-            _ => None,
-        };
-        if let Some(feature) = feature {
-            crate::construction::forget_feature(s, id, feature);
-        }
     }
     let elevation = s.map().editing.settings.elevation.clone();
     // Elevation from a surface: sampled before the layer is borrowed mutably.
@@ -166,12 +158,35 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
     };
     let new_rows: Vec<usize> =
         if new_defaults { changes.iter().filter(|c| c.before.is_none()).filter_map(|c| c.row).collect() } else { Vec::new() };
-    let zs: Vec<(usize, Option<f64>)> = new_rows
-        .iter()
-        .map(|r| {
-            (*r, s.map().layer(id).and_then(|l| l.dataset.features.get(*r)).and_then(|f| f.geometry.as_ref()).and_then(|g| z_of(s, g)))
-        })
-        .collect();
+    // Sampled from a surface at each place in longitude/latitude, from the layer's own coordinates:
+    // a place that can't be converted refuses the edit rather than leave the feature without its
+    // `z`. Without a surface, the place isn't converted. Done before anything below changes the
+    // session, so a refusal leaves it as it was.
+    let mut zs: Vec<(usize, Option<f64>)> = Vec::with_capacity(new_rows.len());
+    for r in &new_rows {
+        let stored = s.map().layer(id).and_then(|l| Some((l, l.dataset.features.get(*r)?.geometry.as_ref()?)));
+        let z = match (stored, &elevation) {
+            (None, _) => None,
+            (Some((l, g)), Elevation::Surface(_)) => z_of(s, l.dataset.geometry_to_lonlat(g)?.as_ref()),
+            (Some((_, g)), _) => z_of(s, g),
+        };
+        zs.push((*r, z));
+    }
+    // Construction belongs to an object, not a reusable numeric id. Each removed or inserted
+    // feature that passes here (cut/paste, split pieces, edits) forgets its construction. Some
+    // row changes don't (GeoPackage and offline-area syncs, archive restore): there a feature
+    // keeps its construction only while its geometry still equals it (see `box_spec`). Undo
+    // keeps its own cache snapshot.
+    for change in &changes {
+        let feature = match (change.before(), change.row) {
+            (Some(before), None) => Some(before.id),
+            (None, Some(row)) => s.map().layer(id).and_then(|l| l.dataset.features.get(row)).map(|f| f.id),
+            _ => None,
+        };
+        if let Some(feature) = feature {
+            crate::construction::forget_feature(s, id, feature);
+        }
+    }
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     // New features: subtype defaults fill empty fields; elevation goes in `z`.
     if let Some(st) = l.design.subtypes.clone()
@@ -207,8 +222,9 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
     let rows: Vec<usize> = changes.iter().filter_map(|c| c.row).collect();
     // What each calculation rule's whole-number field cut: the rule and the field's name. Each
     // rule's cuts are said, even when a later rule writes the same field: it may read them.
-    // With them, per rule, how many results its field couldn't hold (written as null), and its type.
-    let mut cuts: Vec<(String, String, super::edit::Cuts, usize, FieldType)> = Vec::new();
+    // With them, per rule, the results its field couldn't hold and those an error made null
+    // (`WriteLosses`), and its type.
+    let mut cuts: Vec<(String, String, super::edit::WriteLosses, FieldType)> = Vec::new();
     // Parsing against the fields separates a measurement failure from a stale rule. The latter
     // may still be skipped below, but an ambiguous area must never disable a valid rule.
     let metadata = rustgis_data::Dataset::new(l.dataset.name.clone(), l.dataset.geometry_type, l.dataset.fields.clone());
@@ -220,9 +236,9 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
         .iter()
         .any(|rule| (rule.kind == RuleKind::Constraint || l.dataset.field_index(&rule.field).is_some()) && uses_area(&rule.expression));
     if (display_area || rule_area)
-        && let Some(message) = rustgis_data::ambiguous_area_message(changes.iter().filter_map(|change| {
+        && let Some(message) = l.dataset.ambiguous_area_message(changes.iter().filter_map(|change| {
             let feature = l.dataset.features.get(change.row?)?;
-            (rule_area || change.before.as_ref().is_none_or(|before| before.geometry != feature.geometry))
+            (rule_area || change.before().is_none_or(|before| before.geometry != feature.geometry))
                 .then_some(feature.geometry.as_ref())
                 .flatten()
         }))
@@ -236,22 +252,17 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
         // A rule that no longer reads (its field was removed, or a hand-edited file) is skipped
         // rather than blocking every edit.
         let Ok(calc) = super::edit::Calculation::parse(&rule.expression, &metadata) else { continue };
-        let mut cut = super::edit::Cuts::default();
-        let mut unread = 0usize;
+        // Counted as Calculate Field counts them.
+        // A change set may repeat a row: its losses are counted once.
+        let mut losses = super::edit::WriteLosses::once_per_row();
         for r in &rows {
-            let result = calc.eval(&l.dataset, *r);
-            let asked_null = result.asks_null();
-            let (v, c) = super::edit::coerce_cut(result, ty);
-            // A result the field can't hold (a date in a number field) is null: counted, as
-            // Calculate Field counts it.
-            unread += usize::from(!asked_null && v.is_null() && c == super::edit::Cut::None);
-            cut.add(c);
+            let v = losses.write(*r, calc.eval_or_fault(&l.dataset, *r), ty);
             if let Some(cell) = l.dataset.features.get_mut(*r).and_then(|f| f.attrs.get_mut(fi)) {
                 *cell = v;
             }
         }
         let name = l.dataset.fields.get(fi).map(|f| f.name.clone()).unwrap_or_default();
-        cuts.push((rule.name.clone(), name, cut, unread, ty));
+        cuts.push((rule.name.clone(), name, losses, ty));
     }
     // Validation. Domains and contingent values are checked on the fields an edit changed (all
     // of a new feature's), so a value set before the domain doesn't block unrelated edits.
@@ -264,14 +275,18 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
             rustgis_data::query::parse(&rule.expression, &metadata).ok().map(|e| (rule.name.clone(), rule.expression.clone(), e))
         })
         .collect();
-    let changed_fields = |r: usize| -> Option<Vec<bool>> {
-        let before = changes.iter().find(|c| c.row == Some(r))?.before.as_ref()?;
-        let now = l.dataset.features.get(r)?;
-        Some((0..l.dataset.fields.len()).map(|i| before.attrs.get(i) != now.attrs.get(i)).collect())
-    };
+    let mut original = HashMap::new();
+    if !l.design.domains.is_empty() || !l.design.contingent.is_empty() {
+        // A row edited more than once still validates against its state before the first edit.
+        for c in &changes {
+            if let Some(r) = c.row {
+                original.entry(r).or_insert_with(|| c.before());
+            }
+        }
+    }
     for r in &rows {
-        let changed = changed_fields(*r);
-        let touched = |fi: usize| changed.as_ref().is_none_or(|c| c.get(fi).copied().unwrap_or(true));
+        let before = original.get(r).copied().flatten().zip(l.dataset.features.get(*r));
+        let touched = |fi: usize| before.is_none_or(|(old, now)| old.attrs.get(fi) != now.attrs.get(fi));
         for d in &l.design.domains {
             if let Some(fi) = l.dataset.field_index(&d.field).filter(|fi| touched(*fi)) {
                 let v = l.dataset.value(*r, fi);
@@ -308,15 +323,15 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
     let mut entries = Vec::new();
     for c in &changes {
         let after = c.row.and_then(|r| l.dataset.features.get(r));
-        match (&c.before, after) {
+        match (c.before(), after) {
             (None, Some(_)) => counts.added += 1,
             (Some(_), None) => counts.deleted += 1,
             _ => counts.modified += 1,
         }
         // Features are copied into the archive only when the layer keeps one.
         if archiving {
-            let fid = c.before.as_ref().or(after).map(|f| f.id).unwrap_or(0);
-            entries.push(rustgis_map::design::ArchiveEntry { time: t, id: fid, before: c.before.clone(), after: after.cloned() });
+            let fid = c.before().or(after).map(|f| f.id).unwrap_or(0);
+            entries.push(rustgis_map::design::ArchiveEntry { time: t, id: fid, before: c.before().cloned(), after: after.cloned() });
         }
     }
     if let Some(archive) = &mut l.design.archive {
@@ -332,13 +347,10 @@ pub(crate) fn apply_with(s: &mut Session, id: u32, changes: Vec<Change>, new_def
     e.modified += counts.modified;
     e.deleted += counts.deleted;
     // Said once the edit is kept: a rejected one changed nothing.
-    for (rule, field, cut, unread, ty) in cuts {
-        for notice in cut.notices(&format!("Attribute rule {rule}"), &field) {
-            s.notify(notice, false);
-        }
-        if unread > 0 {
-            let rows = if unread == 1 { "1 row".to_string() } else { format!("{unread} rows") };
-            s.notify(format!("Attribute rule {rule}: '{field}' is null in {rows}, whose result isn't a {} value", ty.label()), false);
+    for (rule, field, losses, ty) in cuts {
+        let by = crate::notice_text::NoticeText::format("Attribute rule {rule}", [("rule", rule.into())]);
+        for (code, notice) in losses.notices(by, &field, ty) {
+            s.notify_loss(code, notice);
         }
     }
     Ok(())
@@ -356,7 +368,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer"?, "field": integer field, "subtypes": [{"code": n, "name": string, "defaults"?: {field: value}}], "symbolize"?: bool, "clear"?: bool}"#,
         ),
         C::new("data.attributeRule", "Attribute Rules", "Data › Data Design", attribute_rule).roles(&[]).effects(crate::policy::Effects::NONE).when(need_feature_layer).params(
-            r#"{"layer"?, "name": string, "kind": "calculation"|"constraint", "field"?: field set by a calculation, "expression": calculator expression or SQL where clause, "remove"?: bool}"#,
+            r#"{"layer"?, "name": string, "kind": "calculation"|"constraint", "field"?: field set by a calculation, "expression": expression (a calculation's value, or a constraint's condition), "remove"?: bool}"#,
         ),
         C::new("data.contingentValues", "Contingent Values", "Data › Data Design", contingent).roles(&[]).effects(crate::policy::Effects::NONE).when(need_feature_layer).params(
             r#"{"layer"?, "name": string, "fields": [field, …], "combos": [[value, …], …], "remove"?: bool}"#,
@@ -452,7 +464,13 @@ pub fn commands() -> Vec<C> {
             let mut shifted: HashMap<(u32, usize), Geometry> = HashMap::new();
             for l in s.map().layers.iter().filter(|l| !l.is_raster()) {
                 for r in &l.selection {
-                    let Some(g) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()).filter(|g| within_square(g)) else { continue };
+                    // Moved in longitude/latitude, from the layer's own coordinates (`modify` writes
+                    // it back in them).
+                    let Some(own) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()) else { continue };
+                    let g = l.dataset.geometry_to_lonlat(own)?;
+                    if !within_square(&g) {
+                        continue;
+                    }
                     // A vertex missing a coordinate stays as it was, as on the ground.
                     let done = g.map_coords(&|c: Coord| if c.is_finite() { shift(c, dx, dy) } else { c });
                     if within_square(&done) {
@@ -826,13 +844,14 @@ fn move_planes(
     stays: impl Fn((u32, usize)) -> bool,
     reach_m: f64,
 ) -> Result<(HashMap<(u32, usize), Coord>, usize, usize), String> {
-    let selected: Vec<((u32, usize), &Geometry)> = s
-        .map()
-        .layers
-        .iter()
-        .filter(|l| !l.is_raster())
-        .flat_map(|l| l.selection.iter().filter_map(move |r| Some(((l.id, *r), l.dataset.features.get(*r)?.geometry.as_ref()?))))
-        .collect();
+    // In longitude/latitude, from each layer's own coordinates.
+    let mut selected: Vec<((u32, usize), std::borrow::Cow<'_, Geometry>)> = Vec::new();
+    for l in s.map().layers.iter().filter(|l| !l.is_raster()) {
+        for r in &l.selection {
+            let Some(g) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()) else { continue };
+            selected.push(((l.id, *r), l.dataset.geometry_to_lonlat(g)?));
+        }
+    }
     // Most moves stay within the square: then no feature needs grouping.
     let stay: Vec<bool> = selected.iter().map(|(key, _)| stays(*key)).collect();
     if stay.iter().all(|s| *s) {
@@ -893,7 +912,7 @@ fn move_planes(
     }
     let (mut planes, mut ground, mut steps) = (HashMap::new(), 0usize, CenterSteps::new());
     for ids in members.values() {
-        let geoms = || ids.iter().filter_map(|i| selected.get(*i).map(|(_, g)| *g));
+        let geoms = || ids.iter().filter_map(|i| selected.get(*i).map(|(_, g)| &**g));
         if ids.iter().all(|i| stay.get(*i).copied().unwrap_or(true)) {
             continue;
         }
@@ -1072,17 +1091,31 @@ fn modify(s: &mut Session, mut change: impl FnMut((u32, usize), &Geometry) -> Re
     let ids: Vec<u32> = s.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster()).map(|l| l.id).collect();
     for id in ids {
         let mut changes = Vec::new();
-        let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
-        for r in l.selection.clone() {
-            let Some(f) = l.dataset.features.get_mut(r) else { continue };
-            let Some(g) = f.geometry.as_ref().map(|g| change((id, r), g)).transpose()?.flatten() else { continue };
+        let selection = s.map().layer(id).ok_or("no such layer")?.selection.clone();
+        for r in selection {
+            // Read first, writing only a row that changes: the first write copies the layer's rows
+            // when Undo shares them, and frees history set aside for that copy (#2431).
+            // Changed in longitude/latitude, and written back in the layer's own coordinates,
+            // keeping what the change left as stored.
+            let l = s.map().layer(id).ok_or("no such layer")?;
+            let Some(f) = l.dataset.features.get(r) else { continue };
+            let Some(own) = f.geometry.as_ref() else { continue };
+            let lonlat = l.dataset.geometry_to_lonlat(own)?;
+            let Some(g) = change((id, r), &lonlat)? else { continue };
             super::edit::validate(&g)?;
+            // A change of the whole shape (a move, a rotation) has no place of its own to snap:
+            // only the feature's own places are held, with no search of other features.
+            let mut held = rustgis_data::HeldPlaces::default();
+            l.dataset.hold_places(own, None, &mut held);
+            let g = l.dataset.edit_from_lonlat(g, &held)?;
+            let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+            let Some(f) = l.dataset.features.get_mut(r) else { continue };
             let before = f.clone();
             f.geometry = Some(g);
             changes.push(Change { before: Some(before), row: Some(r) });
             n += 1;
         }
-        l.touch_geometry();
+        s.map_mut().layer_mut(id).ok_or("no such layer")?.touch_geometry();
         apply(s, id, changes)?;
     }
     if n == 0 {
@@ -1119,14 +1152,10 @@ fn edit_vertex(s: &mut Session, p: &Json) -> CmdResult {
         }
         Ok(Coord::new(lon, lat))
     };
-    let g = s
-        .map()
-        .layer(id)
-        .and_then(|l| l.dataset.features.get(row))
-        .ok_or("no such row")?
-        .geometry
-        .clone()
-        .ok_or("the feature has no shape")?;
+    // In longitude/latitude, from the layer's own coordinates (`replace_geometry` writes it back).
+    let l = s.map().layer(id).ok_or("no such row")?;
+    let own = l.dataset.features.get(row).ok_or("no such row")?.geometry.as_ref().ok_or("the feature has no shape")?;
+    let g = l.dataset.geometry_to_lonlat(own)?.into_owned();
     let (g, v) = match ps(p, "action").ok_or("action is required")? {
         "move" => (g.move_vertex(v, at()?).ok_or("no such vertex")?, v),
         "insert" => {
@@ -1140,12 +1169,78 @@ fn edit_vertex(s: &mut Session, p: &Json) -> CmdResult {
     Ok(json!({"part": v.part, "ring": v.ring, "index": v.index}))
 }
 
-/// Replaces a feature's shape with one of the layer's kind, as one edit.
+/// The places an edit of layer `id`, given in longitude/latitude (`edited`), keeps as stored when
+/// written back ([`rustgis_data::Dataset::edit_from_lonlat`]): those of the features it changes
+/// (`originals`, in the layer's own coordinates), and a stored place of a feature in a layer of the
+/// same system that one of its other places reads exactly as (a vertex snapped to, a feature
+/// pasted where it was copied from). Each other place is converted on its own to find what is
+/// stored near it, so no stored place is missed however large the edit, and only stored places
+/// one of them reads as are held. The search reads the box of every feature of the layers in its
+/// system, each from its vertices, once a command (an added feature, a paste): work that grows
+/// with those layers, which C2 is to take to a spatial index.
+/// Empty while the layer is in longitude/latitude, as every layer is today: its edits are written
+/// as they are.
+pub(crate) fn held_places(s: &Session, id: u32, originals: &[&Geometry], edited: &[&Geometry]) -> rustgis_data::HeldPlaces {
+    let mut held = rustgis_data::HeldPlaces::default();
+    let Some(l) = s.map().layer(id).filter(|l| !l.dataset.edits_in_lonlat()) else { return held };
+    for g in originals {
+        l.dataset.hold_places(g, None, &mut held);
+    }
+    // Only what an edited place still lacks is held from here on.
+    held.want_only(edited);
+    let system = l.dataset.coord_crs();
+    let Ok(to_own) = rustgis_data::raster::Crs::LonLat.to(system) else { return held };
+    // The places not held yet, each in the layer's coordinates, and the box they are in there,
+    // padded by what a round trip moves a place: a stored place reading as one lies within it.
+    let mut within = rustgis_geom::Extent::EMPTY;
+    for g in edited {
+        g.for_each_coord(|c| {
+            if c.is_finite()
+                && held.get(c).is_none()
+                && let Some(own) = to_own.point(c)
+            {
+                let r = round_trip_reach(own);
+                within = within.union(&rustgis_geom::Extent { min_x: own.x - r, min_y: own.y - r, max_x: own.x + r, max_y: own.y + r });
+            }
+        });
+    }
+    if within.is_empty() {
+        return held;
+    }
+    for m in s.map().layers.iter().filter(|m| !m.is_raster() && m.dataset.coord_crs() == system) {
+        for f in &m.dataset.features {
+            if let Some(g) = &f.geometry
+                && g.extent().intersects(&within)
+            {
+                m.dataset.hold_places(g, Some(&within), &mut held);
+            }
+        }
+    }
+    held
+}
+
+/// How far a round trip through longitude/latitude may move place `c`, in its own units, with
+/// room to spare: a millionth of its size.
+fn round_trip_reach(c: Coord) -> f64 {
+    1e-6 * c.x.abs().max(c.y.abs()).max(1.0)
+}
+
+/// Replaces a feature's shape with one of the layer's kind, as one edit: `g` in longitude/latitude,
+/// written in the layer's own coordinates.
 pub(crate) fn replace_geometry(s: &mut Session, id: u32, row: usize, g: Geometry) -> Result<(), String> {
     super::edit::validate(&g)?;
+    // What the edit left of the feature, or snapped to, stays as stored.
+    let original = s.map().layer(id).and_then(|l| l.dataset.features.get(row)?.geometry.as_ref());
+    let held = held_places(s, id, &original.into_iter().collect::<Vec<_>>(), &[&g]);
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+    let g = l.dataset.edit_from_lonlat(g, &held)?;
     if l.geometry_type() != GeometryType::None && l.geometry_type() != g.kind() {
         return Err(format!("a {} can't replace a {}", g.kind().label(), l.geometry_type().label()));
+    }
+    // The row checked before writing: the first write copies the layer's rows when Undo shares
+    // them, and frees history set aside for that copy (#2431).
+    if l.dataset.features.get(row).is_none() {
+        return Err("no such row".into());
     }
     let f = l.dataset.features.get_mut(row).ok_or("no such row")?;
     let before = f.clone();
@@ -1173,7 +1268,11 @@ fn merge(s: &mut Session, _: &Json) -> CmdResult {
     if sel.len() < 2 {
         return Err("select two or more features to merge".into());
     }
-    let geoms: Vec<Geometry> = sel.iter().filter_map(|r| l.dataset.features.get(*r)?.geometry.clone()).collect();
+    // Merged in longitude/latitude, from the layer's own coordinates, and written back in them, the
+    // places it keeps as stored.
+    let originals: Vec<&Geometry> = sel.iter().filter_map(|r| l.dataset.features.get(*r)?.geometry.as_ref()).collect();
+    let geoms: Vec<Geometry> =
+        originals.iter().map(|g| l.dataset.geometry_to_lonlat(g).map(std::borrow::Cow::into_owned)).collect::<Result<_, _>>()?;
     let kind = |g: &Geometry| match g {
         Geometry::Point(_) | Geometry::MultiPoint(_) => 0,
         Geometry::Line(_) => 1,
@@ -1183,6 +1282,11 @@ fn merge(s: &mut Session, _: &Json) -> CmdResult {
         return Err("merge features of one kind (all points, all lines or all polygons), each with a shape".into());
     }
     let merged = rustgis_analysis::topology::merge(&geoms).ok_or("these features can't be merged")?;
+    let mut held = rustgis_data::HeldPlaces::default();
+    for g in &originals {
+        l.dataset.hold_places(g, None, &mut held);
+    }
+    let merged = l.dataset.edit_from_lonlat(merged, &held)?;
     let keep = sel.first().copied().ok_or("nothing selected")?;
     let mut changes = Vec::new();
     for r in sel.iter().skip(1).rev() {
@@ -1246,9 +1350,15 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
     // A vertex past ±90° is no place: the search would take it for the pole, so the lines are
     // refused up front, before any is split.
+    // The lines are split in longitude/latitude, from the layer's own coordinates, and the pieces
+    // written back in them.
+    // Only lines are split, so only they are converted: another feature selected with them
+    // doesn't refuse the split.
     let mut beyond_pole = false;
     for feat in l.selection.iter().filter_map(|r| l.dataset.features.get(*r)) {
-        if let Some(Geometry::Line(parts)) = &feat.geometry {
+        if let Some(g @ Geometry::Line(_)) = &feat.geometry
+            && let Geometry::Line(parts) = &*l.dataset.geometry_to_lonlat(g)?
+        {
             beyond_pole |= parts.iter().flatten().any(|c| c.is_finite() && c.y.abs() > 90.0);
         }
     }
@@ -1263,7 +1373,9 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
     let mut unmeasured = 0usize;
     for r in l.selection.clone() {
         let Some(f) = l.dataset.features.get(r).cloned() else { continue };
-        let Some(Geometry::Line(parts)) = &f.geometry else { continue };
+        let Some(own @ Geometry::Line(_)) = &f.geometry else { continue };
+        let lonlat = l.dataset.geometry_to_lonlat(own)?;
+        let Geometry::Line(parts) = &*lonlat else { continue };
         steps.floor = f64::INFINITY;
         // The nearest segment of the nearest part, in the analysis plane (Web Mercator within
         // ±85.05°, not clamped beyond it, #1033). Where the point asked or the line reaches beyond
@@ -1350,11 +1462,16 @@ fn split(s: &mut Session, p: &Json) -> CmdResult {
         a_parts.push(first);
         let mut b_parts = vec![second];
         b_parts.extend(parts.iter().skip(pi + 1).cloned());
+        // The line's places stay as stored in both pieces; only the place it is split at is new.
+        let mut held = rustgis_data::HeldPlaces::default();
+        l.dataset.hold_places(own, None, &mut held);
+        let (a, b) =
+            (l.dataset.edit_from_lonlat(Geometry::Line(a_parts), &held)?, l.dataset.edit_from_lonlat(Geometry::Line(b_parts), &held)?);
         if let Some(feat) = l.dataset.features.get_mut(r) {
-            feat.geometry = Some(Geometry::Line(a_parts));
+            feat.geometry = Some(a);
             changes.push(Change { before: Some(f.clone()), row: Some(r) });
         }
-        l.dataset.push(Some(Geometry::Line(b_parts)), f.attrs.clone());
+        l.dataset.push(Some(b), f.attrs.clone());
         changes.push(Change { before: None, row: Some(l.dataset.features.len() - 1) });
         rough += usize::from(unsure);
     }
@@ -1824,9 +1941,9 @@ fn archive_restore(s: &mut Session, p: &Json) -> CmdResult {
             rule.kind == RuleKind::Constraint
                 && rustgis_data::query::parse_fields(&rule.expression, &l.dataset).is_ok_and(|expr| rustgis_data::query::uses_area(&expr))
         }))
-        && let Some(message) = rustgis_data::ambiguous_area_message(
-            touched.iter().filter_map(|(fid, _)| l.dataset.features.get(*index.get(fid)?)?.geometry.as_ref()),
-        )
+        && let Some(message) = l
+            .dataset
+            .ambiguous_area_message(touched.iter().filter_map(|(fid, _)| l.dataset.features.get(*index.get(fid)?)?.geometry.as_ref()))
     {
         return Err(format!("{}: {message}", l.dataset.name));
     }
@@ -2002,11 +2119,14 @@ fn snap_excluding(
     let scale = s.scale();
     let (flat, key) = (s.map().flat(), s.map().projection.code());
     // Vertices and ends win over edges whenever one is within the tolerance.
-    let (mut best_point, mut best_edge): (Option<(f64, Coord, &'static str)>, Option<(f64, Coord, &'static str)>) = (None, None);
+    // Each with the feature (layer id, row) it is of.
+    type Best = Option<(f64, Coord, &'static str, (u32, usize))>;
+    let (mut best_point, mut best_edge): (Best, Best) = (None, None);
+    let of = std::cell::Cell::new((0u32, 0usize));
     let mut consider = |d2: f64, at: Coord, kind: &'static str| {
         let slot = if kind == "edge" { &mut best_edge } else { &mut best_point };
         if d2 <= tol * tol && slot.is_none_or(|b| d2 < b.0) {
-            *slot = Some((d2, at, kind));
+            *slot = Some((d2, at, kind, of.get()));
         }
     };
     let held = s.map().held_by_group(scale);
@@ -2021,9 +2141,13 @@ fn snap_excluding(
             if !g.extent().padded(0.0, tol).contains(m) {
                 continue;
             }
+            of.set((id, row));
             if let Some((_, _, v)) = vertex.filter(|(layer, source_row, _)| *layer == id && *source_row == row) {
-                if let Some(source) = l.dataset.features.get(row).and_then(|f| f.geometry.as_ref()) {
-                    snap_vertex::consider(source, v, &flat, sn, m, &mut consider);
+                // In longitude/latitude, from the layer's own coordinates, as the map projects it.
+                if let Some(source) =
+                    l.dataset.features.get(row).and_then(|f| f.geometry.as_ref()).and_then(|g| l.dataset.geometry_to_lonlat(g).ok())
+                {
+                    snap_vertex::consider(&source, v, &flat, sn, m, &mut consider);
                 }
                 continue;
             }
@@ -2066,7 +2190,51 @@ fn snap_excluding(
             }
         }
     }
-    best_point.or(best_edge).and_then(|(_, at, kind)| s.map().to_lonlat(at).map(|ll| (ll, kind)))
+    // A vertex or a line end is the feature's own place, exactly as it reads in longitude/latitude,
+    // not the map's place for it brought back (a hair off it): an edit snapped to it lands on it,
+    // and is written as it is stored.
+    if let Some((_, at, kind, (id, row))) = best_point
+        && let Some(own) = stored_place(s, id, row, at)
+    {
+        return Some((own, kind));
+    }
+    best_point.or(best_edge).and_then(|(_, at, kind, _)| s.map().to_lonlat(at).map(|ll| (ll, kind)))
+}
+
+/// The place of feature `row` of layer `id`, in longitude/latitude, that the map shows at `at`
+/// (map units): the vertex it projects to within a thousandth of a pixel. `None` where the map
+/// shows no vertex of its own there (a place where its shape is cut at the map's edge).
+fn stored_place(s: &Session, id: u32, row: usize, at: Coord) -> Option<Coord> {
+    let l = s.map().layer(id)?;
+    let own = l.dataset.features.get(row)?.geometry.as_ref()?;
+    // Only its places within a millionth of where the map shows the hit, in its own coordinates,
+    // are read and projected: a snap asks on every pointer move.
+    let to_lonlat = l.dataset.lonlat_conversion().ok()?;
+    let shown = rustgis_data::raster::Crs::LonLat.to(l.dataset.coord_crs()).ok()?.point(s.map().to_lonlat(at)?)?;
+    let reach = round_trip_reach(shown);
+    // A world projection draws a longitude past ±180° (a shape drawn across the antimeridian) one
+    // turn round; Web Mercator draws it past its edge. A place matched as read wins over one
+    // matched only one turn round: (0°, 0°) shown at the hit is that vertex, not one stored at 360°.
+    let geographic = to_lonlat.is_identity();
+    let turn = |dx: f64| if geographic { (dx + 180.0).rem_euclid(360.0) - 180.0 } else { dx };
+    let near = (s.map().camera.res * 1e-3).powi(2);
+    let off = |r: Coord| s.map().to_map(r).map(|m| (m.x - at.x).powi(2) + (m.y - at.y).powi(2)).filter(|d2| *d2 <= near);
+    let mut best: Option<((u8, f64), Coord)> = None;
+    own.for_each_coord(|c| {
+        if turn(c.x - shown.x).abs() <= reach
+            && (c.y - shown.y).abs() <= reach
+            && let Some(read) = to_lonlat.point(c)
+        {
+            let wrapped = Coord::new((read.x + 180.0).rem_euclid(360.0) - 180.0, read.y);
+            let rank = off(read).map(|d2| (0, d2)).or_else(|| off(wrapped).map(|d2| (1, d2)));
+            if let Some(rank) = rank
+                && best.is_none_or(|b| rank < b.0)
+            {
+                best = Some((rank, read));
+            }
+        }
+    });
+    best.map(|(_, c)| c)
 }
 
 fn topology_rules(s: &mut Session, p: &Json) -> CmdResult {
@@ -2126,9 +2294,13 @@ fn topology_rules(s: &mut Session, p: &Json) -> CmdResult {
 struct TopologyInput {
     rule: TopologyRule,
     layer: String,
+    /// The layer in longitude/latitude, where the rules are checked, and its covering layer's.
     data: rustgis_data::Dataset,
     rows: Vec<usize>,
     by: Option<rustgis_data::Dataset>,
+    /// Why the layer, or its covering layer, can't be given in longitude/latitude: the check is
+    /// refused rather than run on coordinates of another system.
+    unreadable: Option<String>,
 }
 
 /// The rules as the map has them now, each with what it reads; a rule whose layer is gone is left
@@ -2140,11 +2312,21 @@ fn topology_checks(s: &Session) -> Vec<TopologyInput> {
         let rows: Vec<usize> = l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect();
         // A covering layer that is gone leaves the rule with nothing to check (its layer's
         // latitudes are still checked).
-        let by = match &rule {
-            TopologyRule::MustBeCoveredBy { by, .. } => s.map().layer_by_name(by).map(|b| b.dataset.clone()),
-            _ => None,
+        // Both in longitude/latitude: a copy only of a layer in another system.
+        let lonlat = |d: &rustgis_data::Dataset| d.in_lonlat().map(std::borrow::Cow::into_owned);
+        let (by, by_unreadable) = match &rule {
+            TopologyRule::MustBeCoveredBy { by, .. } => match s.map().layer_by_name(by).map(|b| lonlat(&b.dataset)) {
+                Some(Ok(d)) => (Some(d), None),
+                Some(Err(e)) => (None, Some(e)),
+                None => (None, None),
+            },
+            _ => (None, None),
         };
-        inputs.push(TopologyInput { rule, layer: l.name.clone(), data: l.dataset.clone(), rows, by });
+        let (data, unreadable) = match lonlat(&l.dataset) {
+            Ok(d) => (d, by_unreadable),
+            Err(e) => (l.dataset.clone(), Some(e)),
+        };
+        inputs.push(TopologyInput { rule, layer: l.name.clone(), data, rows, by, unreadable });
     }
     inputs
 }
@@ -2182,6 +2364,9 @@ fn check_topology(inputs: &[TopologyInput], tol: f64) -> Result<Vec<rustgis_anal
         // A cancelled run stops between rules too (a gaps rule's union doesn't look), as an error,
         // so no result short of its rules is ever taken.
         rustgis_data::progress::check().map_err(|_| "the topology check was cancelled".to_string())?;
+        if let Some(e) = &i.unreadable {
+            return Err(format!("{}: {e}", i.layer));
+        }
         rustgis_analysis::validate_latitudes(&i.data, i.rows.iter().copied())?;
         found.push(match (&i.rule, &i.by) {
             (TopologyRule::MustNotOverlap { .. }, _) => t::overlaps(&i.data, &i.rows),

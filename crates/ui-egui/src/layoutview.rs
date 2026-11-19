@@ -240,6 +240,7 @@ fn pan_preview(app: &mut RustGisApp, ctx: &egui::Context, layout: &Layout, id: u
     if *pitch != 0.0 {
         return None;
     }
+    let env = rustgis_engine::render::layout::series_env(layout, &app.session.project.maps);
     let m = app.session.project.maps.iter_mut().find(|m| m.name.eq_ignore_ascii_case(map))?;
     let cam = frame_camera(m, *center, *scale, *bearing, *pitch);
     let k = 1.0 + 2.0 * PAN_OVERSCAN;
@@ -249,7 +250,7 @@ fn pan_preview(app: &mut RustGisApp, ctx: &egui::Context, layout: &Layout, id: u
     // thin frame could pass the first and not the second).
     let side = (ctx.input(|i| i.max_texture_side) as f64).min(PAN_PREVIEW_SIDE);
     let ppp = screen.min((PAN_PREVIEW_PIXELS / (w * h).max(1.0)).sqrt()).min(side / w.max(h).max(1.0)).max(0.01);
-    let pm = rustgis_engine::render::layout::frame_map_preview(m, cam, w, h, ppp)?;
+    let pm = rustgis_engine::render::layout::frame_map_preview_with(m, cam, w, h, ppp, &env)?;
     let img = egui::ColorImage::from_rgba_premultiplied([pm.width() as usize, pm.height() as usize], pm.data());
     Some(ctx.load_texture("layout_pan_preview", img, egui::TextureOptions::LINEAR))
 }
@@ -2092,11 +2093,12 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         );
     });
     // A layout's text: the form a text graphic has too (#516, #535), with the page's dynamic text.
-    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name, .. } = &e.kind {
+    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name, wrap, .. } = &e.kind {
         let key = (li, id, "text");
         let mut buf = app.layout.typing.remove(&key).unwrap_or_else(|| text.clone());
         let (mut sz, mut c, mut bb) = (*size, crate::theme::c32(*color), *bold);
         let (mut it, mut al, mut ls, mut fam, mut named) = (*italic, *align, *letter_spacing, *font, font_name.clone());
+        let mut wr = *wrap;
         let tokens = [rustgis_engine::map::graphics::TOKENS, rustgis_engine::map::layout::PAGE_TOKENS];
         let fields = crate::textform::Fields {
             text: &mut buf,
@@ -2105,6 +2107,7 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             bold: Some(&mut bb),
             italic: Some(&mut it),
             align: Some(&mut al),
+            wrap: Some(&mut wr),
             letter_spacing: Some(&mut ls),
             font: Some(&mut fam),
             font_name: Some(&mut named),
@@ -2133,6 +2136,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         }
         if settled.align {
             update(app, json!({"align": al.code()}));
+        }
+        if settled.wrap {
+            update(app, json!({"wrap": wr}));
         }
         if settled.letter_spacing {
             update(app, json!({"letterSpacing": ls}));
@@ -3286,6 +3292,48 @@ mod tests {
         // Said where no serif is installed, and only there.
         let said = h.query_by_label_contains("No serif font is installed").is_some();
         assert_eq!(said, !rustgis_engine::render::fonts::serif_available());
+    }
+
+    /// A text element's "Wrap to the box" (#2346): off as it is added, on when ticked, as one
+    /// undoable step, and off again.
+    #[test]
+    fn a_text_element_wraps_to_its_box_when_ticked() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::map::layout::ElementKind;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Notes"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().id;
+        app.layout.selected = Some(title);
+        let wraps =
+            |app: &RustGisApp| matches!(app.session.project.layouts[li].element(title).unwrap().kind, ElementKind::Text { wrap: true, .. });
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        assert!(!wraps(h.state()));
+        h.get_by_role_and_label(Role::CheckBox, "Wrap to the box").click();
+        h.run_steps(3);
+        assert!(wraps(h.state()));
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        assert!(!wraps(h.state()), "one step undoes it");
+        h.run_steps(3);
+        h.get_by_role_and_label(Role::CheckBox, "Wrap to the box").click();
+        h.run_steps(3);
+        assert!(wraps(h.state()));
+        h.get_by_role_and_label(Role::CheckBox, "Wrap to the box").click();
+        h.run_steps(3);
+        assert!(!wraps(h.state()));
     }
 
     /// A number dragged in the Format pane and let go is applied (#607): X moves the element by

@@ -17,14 +17,16 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
 
 - **Publication layouts**: Home › New Layout › **Publication Layout** builds a finished sheet or
   figure of the map view in one step, with `layout.publication` behind it:
-  - **Sheets** (A4, A3 or A2, portrait or landscape): a frame and margin, the title and subtitle,
+  - **Sheets** (on every page size New Layout lists: Letter, Legal, Tabloid and A5 to A0,
+    portrait or landscape; the menu lists the sizes, each with its styles under Portrait and
+    under Landscape): a frame and margin, the title and subtitle,
     the map, and a footer of two boxed columns (sources, and the cartographic reference; one
     with nothing in it is left out, the other taking the width) with a note and the authorship
     under them. When the legend sits at the right of the map (its right edge in the frame's
     right tenth), starting between 45 % and 70 % of the frame's width, the right column starts
     where the legend does, unless its texts would then need a taller box. Text sizes follow the
-    sheet: an A3's are 1.41 times an A4's. Given its size alone (`"a4"`, the default, `"a3"`
-    or `"a2"`), a sheet is turned to
+    sheet's short side: an A3's are 1.41 times an A4's, an A0's four times. Given its size alone
+    (`"a4"`, the default, or any other: `"letter"`, `"a0"`…), a sheet is turned to
     portrait or landscape, whichever the map comes out larger on: the area's extent east to west
     against north to south, on the map's projection, with the room the style leaves the map. The
     result names the profile chosen (`"profile": "a4-landscape"`); give it with its orientation
@@ -116,6 +118,15 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     latitude), the layout has no north arrow: the graticule gives north there, and one arrow can't
     point north across the whole frame. A warning says so; `"northArrow": "always"` draws one, and
     `"none"` leaves it out at any span.
+  - **On the globe**: with the map on the Globe projection and no `extent`, the sheet shows the
+    globe whole. The globe nearly fills the frame, centred where the view looks, and the
+    surrounds go in the room around it. It has no scale bar, since a globe's scale holds only at
+    its centre. A sheet has no locator by default either, since it would only show the same globe
+    again, smaller; `"locator": "globe"` or `"inset"` still adds one. Warnings say both. Near a
+    pole the frame can't draw the globe that small at the view's latitude, so the globe is
+    centred as near it as fits, and a warning says where. With an `extent`, a sheet on the globe
+    is laid out as on a flat map. In any frame on the globe, the light space around the globe is
+    room for the surrounds, as the blank page is.
   - **Legend box**: over the map, the legend's box is left clear where the map shows nothing under
     it but its light plain paper or water: no layer, label, context layer, basemap shape or graticule
     line, no web tiles, and no veil. Dark basemaps keep a white backing so the dark legend text
@@ -138,7 +149,12 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
     layers held in the project. Streamed layers, rasters, points, lines and labels are left out.
     What simplifying changes or leaves alone there (a vertex past a pole taken to the pole, a
     polygon left as it was for a missing coordinate, or too intricate to simplify whole) is said
-    in the layout's warnings; one kept as it was because its ring would collapse is not.
+    in the layout's warnings; one kept as it was because its ring would collapse is not. The
+    globe is whole in its circle: near a pole, where it can't be drawn that small at the area's
+    latitude, it is centred as near the area as fits, the area still outlined on it, and the
+    warnings say so. A locator too small for the whole globe anywhere (a figure's, under about
+    20 mm), or one that would have to move so far that the area went behind the globe's rim,
+    stays centred on the area, its circle clipping the globe, which the warnings also say.
     It uses the map's basemap, not its web tiles, in a round frame, the globe
     nearly filling it and the area outlined in red; `"inset"` shows the surrounding region (about
     four times the area across) on the map itself, outlined the same way; `"none"` (a figure's
@@ -186,7 +202,12 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   the outline's **Color** and **Line width** (red and 2 pt to begin with), so it can sit quietly on a
   muted page, and **Remove Extent Indicator** takes it away. Scripts set the same with `color`
   and `width` on `layout.addElement` (`kind` `extentIndicator`), or `layout.update` with
-  `"extentIndicator": {"color": "#555555", "width": 1}` (`false` removes it).
+  `"extentIndicator": {"color": "#555555", "width": 1}` (`false` removes it). The outline breaks
+  where the other frame's edge leaves the Earth (off a globe's disc, or past the edge of its
+  projection's world) and runs up to it there, and where the overview's own projection can't show
+  the place. An outline across the overview map's edge (on a world projection, the meridian
+  opposite its central one) is cut there, each piece on its side of the map, and so is a frame on
+  the globe around a pole outlined on Web Mercator, at ±180°.
 - **Grids**: the **Grid** section of a frame's properties turns the grid on and sets its
   **Interval** in degrees (**Auto** picks one from the frame's extent), its **Style** (full lines
   across the frame, ticks along its neatline only, or both, with the **Tick length**), its colour
@@ -197,7 +218,9 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   running along the edge. From a command:
   `layout.addElement={"kind":"grid","step":0.5,"style":"ticks","format":"dms","edges":["top","bottom","left","right"],"labelOrientation":"vertical"}`
   (given again, it changes only the options it names), or `layout.update` with
-  `"grid": {…}` (`false` removes the grid).
+  `"grid": {…}` (`false` removes the grid). On a map on the globe the lines are drawn on the
+  globe, and stop at its horizon. A frame that shows the whole globe has nothing beyond its rim,
+  and so no labels along its edges.
 - **Measured grids**: a grid's **Type** is a **Graticule** (latitudes and longitudes, as above)
   or a **Measured grid**, as ArcGIS Pro has them: eastings and northings in a projected coordinate
   system, for maps read with UTM or national grid coordinates (a hiking map at 1:25,000 with a
@@ -362,7 +385,7 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   legend title runs off the page, or a text element has more lines than its height allows.
   The notice counts and names the affected elements with their IDs. A line may extend beyond
   its element's width while remaining on the page; that alone is not clipped. Reduce the size,
-  add line breaks, or resize or move the element to keep all its text.
+  add line breaks, turn on **Wrap to the box**, or resize or move the element to keep all its text.
 - **Text** and **Dynamic Text**: `{date}`, `{time}`, `{scale}`, `{map}`, `{crs}`, `{page}`,
   `{pages}`, `{pageName}` and `{layout}` fill in when the page is drawn; the Format pane's
   **Insert Dynamic Text** menu, under the text, lists each with what it shows. The text, its
@@ -397,6 +420,17 @@ Layouts open as tabs next to the maps; while one is open, its groups lead the Pu
   before; its selection and handles follow the turned box. Every export draws it turned (PNG, PDF,
   GeoPDF, SVG). Scripts set `"rotation": 90` on `layout.addElement` and `layout.update`; an angle
   outside -180 to 180 is kept as the same turn within it (450 is 90).
+  **Wrap to the box** breaks a text into lines at spaces to fit the width of its box, for a note,
+  a source line or a caption: the lines follow the box when it is resized and the text when it is
+  edited or its size changes, so there are no line breaks to put in by hand. It is off by default,
+  so a text breaks lines only where it has a line break, as before. Dynamic text wraps once filled
+  in, the text's own line breaks are kept, a word wider than the box (a long address) is broken
+  across lines, and a turned text wraps to the width of its unturned box. The layout view and
+  every export (PNG, PDF, SVG) break the same lines. Spaces running together in a wrapped text
+  are drawn as one, and none are kept at a line's start or end. Lines that don't fit the box's
+  height are left out, and the export notice above names the text. Scripts set `"wrap": true` on
+  `layout.addElement` and `layout.update`. A project with a wrapped text needs this release or a
+  later one to open.
   Scripts give the family's name: `"font": "Garamond"`, with `"fallback": "serif"` if wanted;
   `labels.fonts` lists the installed families. The project keeps the name, never a file. A PDF
   sets its text in the letters' own outlines, so it shows the family wherever it is opened, and
@@ -547,6 +581,23 @@ The locator outlines the main frame's changing extent as the series turns its pa
 more, with a warning. Split longer books' index data into layers of at most 500 features.
 `layout.export` with `"allPages":false` writes only the current PDF page; PNG and SVG always
 write the current page.
+
+### Mark the page's own feature
+
+Set [Symbols by Expression](cartography.md#symbols-by-expression) on the index layer. Use
+`$id = @page_feature_id` to give the current feature a heavier outline and draw the rest in gray.
+For an index layer called **Tracts**, the command is:
+
+```text
+layer.symbolBy={"layer":"Tracts","strokeWidth":"if($id = @page_feature_id, 3, 0.6)","stroke":"if($id = @page_feature_id, '#174a7e', '#9ca3af')","fill":"if($id = @page_feature_id, '#8bbce8', '#e5e7eb')"}
+```
+
+Use a style rather than a definition query: a definition query such as `$id = @page_feature_id`
+leaves the layer empty in the map view, where the variables are null. Step through the pages to see the
+style follow the index feature. The expression also works in a
+locator frame that shows the index layer. Feature IDs are local to each layer, so use the ID
+comparison on the index layer. Outside a series page the comparison never matches, and every
+feature gets the gray style.
 
 ## Reports
 
