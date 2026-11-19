@@ -163,11 +163,16 @@ mod prefs {
             // `retry_prefs` writes it on a later frame (and `on_exit` at the end).
             save_pref: Some(Box::new(|key: &str, value: &str| match rustgis_engine::prefs::write(key, value) {
                 Ok(rustgis_engine::prefs::Updated::Saved(set_aside)) => saved(Ok(set_aside)),
-                Ok(rustgis_engine::prefs::Updated::Newer) => saved(Err(rustgis_engine::prefs::newer_notice(key))),
+                // Never written over, nor tried again this session; said once for the key.
+                Ok(rustgis_engine::prefs::Updated::Newer) => {
+                    if let Some(notice) = rustgis_engine::prefs::newer_notice_once(key) {
+                        saved(Err(notice));
+                    }
+                }
                 Ok(_) => {}
                 Err(error) => saved(Err(error)),
             })),
-            retry_prefs: Some(Box::new(|| retry_saves(std::time::Duration::ZERO))),
+            retry_prefs: Some(Box::new(retry_saves)),
             update_pref: Some(Box::new(|key: &str, value: &mut dyn FnMut(Option<&str>) -> Option<String>| {
                 use rustgis_engine::prefs::Updated;
                 use rustgis_ui_egui::PrefUpdate;
@@ -178,10 +183,10 @@ mod prefs {
                     }
                     Ok(Updated::Unchanged) => PrefUpdate::Unchanged,
                     Ok(Updated::Busy) => PrefUpdate::Busy,
-                    // Never written over; said (once, while it stays the last failure).
+                    // Never written over; the window says it (once) and stops trying.
                     Ok(Updated::Newer) => {
-                        saved(Err(rustgis_engine::prefs::newer_notice(key)));
-                        PrefUpdate::Failed
+                        log::warn!("{}", rustgis_engine::prefs::newer_notice(key));
+                        PrefUpdate::Refused
                     }
                     Err(error) => {
                         saved(Err(error));
@@ -507,11 +512,9 @@ impl eframe::App for App {
         self.0.end_exports();
         self.0.end_autosave();
         // Settings left to save while another copy of RustGIS saved its own: tried once more,
-        // waiting a little for it (closing isn't the path that must answer at once).
-        self.0.save_sources_at_exit();
-        if prefs::retry_saves(std::time::Duration::from_millis(1500)) {
-            log::warn!("some settings couldn't be saved: another copy of RustGIS kept its preferences busy");
-        }
+        // waiting a little for it within one deadline (closing isn't the path that must answer at
+        // once); what still isn't saved is logged with why and said in the session.
+        self.0.save_prefs_at_exit(std::time::Duration::from_millis(1500));
         // Session plugins' programs end with the app, with what they started.
         rustgis_engine::plugins::session::stop_all();
         // The installer starts before the marker goes, so a RustGIS started meanwhile finds this

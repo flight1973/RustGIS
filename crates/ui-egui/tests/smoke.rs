@@ -1559,13 +1559,14 @@ fn two_windows_keep_each_others_data_sources() {
     a.run("sources.favourite", favorite("/a.csv")).unwrap();
     b.run("sources.favourite", favorite("/b.csv")).unwrap();
     let stored = || stored_favorites(&store);
-    assert_eq!(stored(), ["/old.csv", "/a.csv", "/b.csv"]);
+    // Each window's own additions come first, as reading the stored ones put them.
+    assert_eq!(stored(), ["/b.csv", "/a.csv", "/old.csv"]);
     a.run("sources.remove", json!({"list": "favourites", "kind": "file", "address": "/old.csv"})).unwrap();
     b.run("sources.favourite", favorite("/b2.csv")).unwrap();
-    assert_eq!(stored(), ["/a.csv", "/b.csv", "/b2.csv"]);
+    assert_eq!(stored(), ["/b.csv", "/a.csv", "/b2.csv"]);
     // The window that saved last lists the other's favorites too.
     let listed: Vec<_> = b.session.sources.favourites.iter().map(|f| f.address.as_str()).collect();
-    assert_eq!(listed, ["/a.csv", "/b.csv", "/b2.csv"]);
+    assert_eq!(listed, ["/b.csv", "/a.csv", "/b2.csv"]);
 
     // The stored sources removed or reset: the next save writes the window's whole list, not
     // only the source it just added.
@@ -1676,15 +1677,68 @@ fn data_sources_left_to_save_are_saved_at_exit() {
     app.run("sources.favourite", json!({"kind": "file", "address": "/exit.csv"})).unwrap();
     assert!(stored_favorites(&store).is_empty());
     // The retry delay hasn't passed; at exit it is tried anyway, through one more busy answer.
-    app.save_sources_at_exit();
+    app.save_prefs_at_exit(std::time::Duration::from_millis(1500));
     assert_eq!(stored_favorites(&store), ["/exit.csv"]);
     // Still busy at the end of the wait: said, not lost silently.
     outcomes.lock().unwrap().extend(std::iter::repeat_n(PrefUpdate::Busy, 1000));
     app.run("sources.favourite", json!({"kind": "file", "address": "/late.csv"})).unwrap();
-    app.save_sources_at_exit();
+    app.save_prefs_at_exit(std::time::Duration::from_millis(1500));
     let said: Vec<_> = app.session.notices_since(0).iter().map(|n| n.text.clone()).collect();
     assert!(said.iter().any(|t| t.contains("weren't saved as RustGIS closed")), "{said:?}");
     assert!(!stored_favorites(&store).contains(&"/late.csv".to_string()));
+}
+
+/// The data sources and the other settings share one deadline at exit: however long the data
+/// sources wait for another copy, the other settings get only what is left of it, and what
+/// isn't saved of either is said.
+#[test]
+fn settings_left_to_save_share_one_deadline_at_exit() {
+    use rustgis_ui_egui::PrefUpdate;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let store: PrefStore = Arc::new(Mutex::new(HashMap::from([("data_sources".to_string(), json!({"favourites": []}).to_string())])));
+    let outcomes = PrefOutcomes::default();
+    let mut app = window_over(&store, &outcomes);
+    let given = Arc::new(Mutex::new(Vec::new()));
+    let log = given.clone();
+    app.services.retry_prefs = Some(Box::new(move |wait| {
+        log.lock().unwrap().push(wait);
+        true
+    }));
+    outcomes.lock().unwrap().extend(std::iter::repeat_n(PrefUpdate::Busy, 1000));
+    app.run("sources.favourite", json!({"kind": "file", "address": "/x.csv"})).unwrap();
+    let wait = std::time::Duration::from_millis(400);
+    let started = std::time::Instant::now();
+    app.save_prefs_at_exit(wait);
+    assert!(started.elapsed() < wait + std::time::Duration::from_millis(300), "{:?}", started.elapsed());
+    let given = given.lock().unwrap().last().copied();
+    assert!(given.is_some_and(|g| g < std::time::Duration::from_millis(100)), "the rest of the one deadline: {given:?}");
+    let said: Vec<_> = app.session.notices_since(0).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains("data sources changed in this session weren't saved")), "{said:?}");
+    assert!(said.iter().any(|t| t.contains("Some settings changed in this session weren't saved")), "{said:?}");
+}
+
+/// A data sources save refused because a newer RustGIS stored them in a form this version can't
+/// read is said once and not tried again on a timer, only after another change here.
+#[test]
+fn a_refused_data_sources_save_is_not_retried() {
+    use rustgis_ui_egui::PrefUpdate;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let store: PrefStore = Arc::new(Mutex::new(HashMap::from([("data_sources".to_string(), json!({"favourites": []}).to_string())])));
+    let outcomes = PrefOutcomes::default();
+    let mut app = window_over(&store, &outcomes);
+    outcomes.lock().unwrap().push_back(PrefUpdate::Refused);
+    app.run("sources.favourite", json!({"kind": "file", "address": "/a.csv"})).unwrap();
+    // Well past any retry delay, nothing is tried: a try now would find the store free and save.
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // test-wait: past the longest first retry delay
+    app.run("sources.list", json!({})).unwrap();
+    assert!(stored_favorites(&store).is_empty());
+    let said: Vec<_> = app.session.notices_since(0).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said.iter().filter(|t| t.contains("a newer RustGIS saved them")).count(), 1, "{said:?}");
+    // Another change here tries again.
+    app.run("sources.favourite", json!({"kind": "file", "address": "/b.csv"})).unwrap();
+    assert_eq!(stored_favorites(&store), ["/a.csv", "/b.csv"]);
 }
 
 /// Saved connections from a newer RustGIS (#1405): a preference of a newer version is said, isn't

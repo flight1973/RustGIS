@@ -388,6 +388,9 @@ pub enum PrefUpdate {
     Busy,
     /// Saving failed (the hook said why).
     Failed,
+    /// What is stored is a newer version's, in a form this one can't read: never written over,
+    /// and not tried again until something else changes.
+    Refused,
 }
 
 /// Platform hooks. The desktop app leaves them empty and uses native file dialogs; the web app
@@ -418,9 +421,10 @@ pub struct Services {
     /// keeps its preferences (the browser): `save_pref` is used.
     pub update_pref: Option<Box<dyn Fn(&str, &mut dyn FnMut(Option<&str>) -> Option<String>) -> PrefUpdate>>,
     /// Saves again what `save_pref` left to save while another copy of the app saved its own
-    /// preferences (the desktop's), never waiting; whether any is still left. Tried each frame
-    /// while one is. `None` where nothing is ever left (the browser).
-    pub retry_prefs: Option<Box<dyn Fn() -> bool>>,
+    /// preferences (the desktop's), waiting up to the given time for it (none during the run,
+    /// a little as the app closes); whether any is still left. `None` where nothing is ever
+    /// left (the browser).
+    pub retry_prefs: Option<Box<dyn Fn(std::time::Duration) -> bool>>,
     /// The system's secret store (see `docs/architecture.md` › Secrets): the desktop's keychain.
     /// `None` in the browser and on the command line, where secrets last for the session only.
     pub secrets: Option<std::sync::Arc<dyn rustgis_engine::data::secrets::SecretStore>>,
@@ -2690,11 +2694,12 @@ impl RustGisApp {
         }
     }
 
-    /// As the app closes (the desktop app's `on_exit`): data sources left to save are tried once
-    /// more, waiting up to a second and a half for another copy of the app to let go of the
-    /// preferences; what still can't be saved is said and logged.
-    pub fn save_sources_at_exit(&mut self) {
-        sourcespane::save_at_exit(self, std::time::Duration::from_millis(1500));
+    /// As the app closes (the desktop app's `on_exit`): the data sources and other settings left
+    /// to save are tried once more, all within `wait` (a second and a half on the desktop) while
+    /// another copy of the app keeps the preferences busy. What still isn't saved is logged with
+    /// why and said in this session's messages; with the window closing, only the log keeps it.
+    pub fn save_prefs_at_exit(&mut self, wait: std::time::Duration) {
+        sourcespane::save_prefs_at_exit(self, wait);
     }
 
     /// A clean exit (the desktop app's `on_exit`): the recovery copy of this run's unsaved work

@@ -65,33 +65,62 @@ pub fn write(key: &str, value: &str) -> Result<Updated, String> {
 fn write_in(path: &Path, key: &str, value: &str) -> Result<Updated, String> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let done = update_file(path, key, |_| Some(value.to_string()));
-    let mut pending = PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let id = (path.to_path_buf(), key.to_string());
+    let mut pending = PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut refused = REFUSED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.remove(&id);
+    refused.remove(&id);
     match done {
-        // Left to save: the lock was busy, or what is stored is a newer RustGIS's (refused, and
-        // tried again in case it changes).
-        Ok(Updated::Busy | Updated::Newer) => {
+        // Left to save: tried again once the other copy lets go of the lock.
+        Ok(Updated::Busy) => {
             pending.insert(id, value.to_string());
         }
-        _ => {
-            pending.remove(&id);
+        // What is stored is a newer RustGIS's: never written over, and not tried again this
+        // session (a later write of the key tries once more).
+        Ok(Updated::Newer) => {
+            refused.insert(id, value.to_string());
         }
+        _ => {}
     }
     done
 }
 
-/// Values [`write`] couldn't save yet, by file and key: the latest of each.
-static PENDING: Mutex<std::collections::BTreeMap<(PathBuf, String), String>> = Mutex::new(std::collections::BTreeMap::new());
+type Values = Mutex<std::collections::BTreeMap<(PathBuf, String), String>>;
 
-/// The value of `key` left to save, if [`write`] left one: newer than what the file holds, so a
-/// read of the setting gives it.
+/// Values [`write`] couldn't save yet while another copy held the lock, by file and key: the
+/// latest of each, tried again by [`retry_pending`].
+static PENDING: Values = Mutex::new(std::collections::BTreeMap::new());
+
+/// Values refused because a newer RustGIS stored the key in a form this version can't read:
+/// kept for this session (a read of the setting gives them), never tried again.
+static REFUSED: Values = Mutex::new(std::collections::BTreeMap::new());
+
+/// Keys whose refusal ([`newer_notice`]) has been said, so each is said once a session.
+static SAID_NEWER: Mutex<std::collections::BTreeSet<(PathBuf, String)>> = Mutex::new(std::collections::BTreeSet::new());
+
+/// The value of `key` left to save, if [`write`] left one (waiting for the lock, or refused for
+/// a newer RustGIS's setting): newer than what the file holds for this session, so a read of
+/// the setting gives it.
 pub fn pending(key: &str) -> Option<String> {
     let dir = rustgis_data::dirs::config_dir()?;
     pending_in(&dir.join(FILE), key)
 }
 
 fn pending_in(path: &Path, key: &str) -> Option<String> {
-    PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&(path.to_path_buf(), key.to_string())).cloned()
+    let id = (path.to_path_buf(), key.to_string());
+    let pending = PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&id).cloned();
+    pending.or_else(|| REFUSED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&id).cloned())
+}
+
+/// [`newer_notice`] for `key` the first time it is refused this session; none after.
+pub fn newer_notice_once(key: &str) -> Option<String> {
+    let dir = rustgis_data::dirs::config_dir()?;
+    newer_notice_once_in(&dir.join(FILE), key)
+}
+
+fn newer_notice_once_in(path: &Path, key: &str) -> Option<String> {
+    let first = SAID_NEWER.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert((path.to_path_buf(), key.to_string()));
+    first.then(|| newer_notice(key))
 }
 
 /// Writes again what [`write`] left to save. `wait` bounds how long it waits for another copy
@@ -108,6 +137,10 @@ fn retry_pending_in(only: Option<&Path>, wait: std::time::Duration) -> (Vec<Resu
         pending.iter().filter(|((path, _), _)| only.is_none_or(|o| o == path)).map(|(k, v)| (k.clone(), v.clone())).collect()
     };
     let mut said = Vec::new();
+    // Nothing left (the usual case): no lock taken, no file read.
+    if todo().is_empty() {
+        return (said, false);
+    }
     // The browser keeps no preferences file: nothing is ever left to write there.
     #[cfg(not(target_arch = "wasm32"))]
     let start = std::time::Instant::now();
@@ -119,19 +152,25 @@ fn retry_pending_in(only: Option<&Path>, wait: std::time::Duration) -> (Vec<Resu
             let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             for ((path, key), value) in todo() {
                 let done = update_file(&path, &key, |_| Some(value.clone()));
+                if done == Ok(Updated::Busy) {
+                    busy = true;
+                    break;
+                }
+                let id = (path.clone(), key.clone());
+                PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
                 match done {
-                    Ok(Updated::Busy) => {
-                        busy = true;
-                        break;
+                    // Refused once, it isn't tried again (not on the next pass at exit either),
+                    // and is said once.
+                    Ok(Updated::Newer) => {
+                        REFUSED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(id, value);
+                        if let Some(notice) = newer_notice_once_in(&path, &key) {
+                            said.push(Err(notice));
+                        }
                     }
-                    Ok(Updated::Newer) => said.push(Err(newer_notice(&key))),
-                    done => {
-                        PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&(path, key));
-                        said.push(done.map(|d| match d {
-                            Updated::Saved(set_aside) => set_aside,
-                            _ => None,
-                        }));
-                    }
+                    done => said.push(done.map(|d| match d {
+                        Updated::Saved(set_aside) => set_aside,
+                        _ => None,
+                    })),
                 }
             }
         }
@@ -606,14 +645,53 @@ mod tests {
         assert_eq!(update_file(&path, "data_sources", |_| Some("{}".into())).unwrap(), Updated::Newer);
         assert_eq!(write_in(&path, "data_sources", "{}").unwrap(), Updated::Newer);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
-        assert_eq!(pending_in(&path, "data_sources").as_deref(), Some("{}"), "kept to save");
+        assert_eq!(pending_in(&path, "data_sources").as_deref(), Some("{}"), "read as the setting this session");
+        // Refused for good this session: not retried (no file read, nothing left), said once.
         let (said, left) = retry_pending_in(Some(&path), std::time::Duration::ZERO);
-        assert!(left && matches!(said.as_slice(), [Err(e)] if e.contains("newer RustGIS")), "{said:?}");
+        assert!(said.is_empty() && !left, "{said:?}");
+        assert!(newer_notice_once_in(&path, "data_sources").is_some_and(|n| n.contains("newer RustGIS")));
+        assert_eq!(newer_notice_once_in(&path, "data_sources"), None, "said once a session");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
         // Other settings are still written beside it.
         assert_eq!(write_in(&path, "theme", "dark").unwrap(), Updated::Saved(None));
         assert_eq!(read_at(&path).unwrap().get("data_sources"), Some(&serde_json::json!({"version": 2, "lists": []})));
-        PENDING.lock().unwrap().retain(|(p, _), _| p != &path);
+        forget_values(&path);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Drops what this test folder left in the session-wide sets.
+    fn forget_values(path: &Path) {
+        PENDING.lock().unwrap().retain(|(p, _), _| p != path);
+        REFUSED.lock().unwrap().retain(|(p, _), _| p != path);
+        SAID_NEWER.lock().unwrap().retain(|(p, _)| p != path);
+    }
+
+    /// At exit, a value left to save that turns out refused (a newer RustGIS stored the key
+    /// meanwhile) is tried once, said once, and not counted as left, however long the wait.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_value_refused_at_exit_is_tried_once() {
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-exit-refused-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        let held = lock(&path).unwrap();
+        assert_eq!(write_in(&path, "data_sources", "{}").unwrap(), Updated::Busy);
+        // The other copy, a newer RustGIS, stores the key as an object, then lets go.
+        let newer = r#"{"data_sources":{"version":2}}"#;
+        std::fs::write(&path, newer).unwrap();
+        let other = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100)); // test-wait: another copy holding the lock briefly
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let (said, left) = retry_pending_in(Some(&path), std::time::Duration::from_millis(1500));
+        other.join().unwrap();
+        assert!(!left, "a refused value isn't left");
+        assert_eq!(said.iter().filter(|r| r.as_ref().is_err_and(|e| e.contains("newer RustGIS"))).count(), 1, "{said:?}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(1000), "no more passes once refused");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        forget_values(&path);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
