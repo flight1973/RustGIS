@@ -39,9 +39,11 @@
 //! whole-degree lines ([`super::post_transform`]), as an SRTM tile's do.
 //!
 //! A column whose record doesn't start with the sentinel is damaged and read as no data, and the
-//! columns are counted in a notice. A record whose longitude or latitude count disagrees with its
-//! place in the file is read by its place, and the columns are counted in a notice, when the place
-//! can be trusted: a whole cell numbered from 1, or a count that names no column or a column that
+//! columns are counted in a notice. A record whose latitude count isn't 0 is refused, naming the
+//! file and column: a full-grid record starts at latitude point 0 (3.12 f), and its heights would
+//! otherwise be placed north or south of where they belong. A record whose longitude count
+//! disagrees with its place in the file is read by its place, and the columns are counted in a
+//! notice, when the place can be trusted: a whole cell numbered from 1, or a count that names no column or a column that
 //! has its own record. Counts that name a column with no record of their own (leading columns left
 //! out, or counts offset) mean the heights belong elsewhere, and the file is refused
 //! ([`placement`]). A column whose checksum doesn't match its heights is
@@ -335,6 +337,17 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
             "{file_name}: the record at column {place} counts itself as column {count}, and column {count} has no record of its own that says so: its heights may belong to column {count} (columns left out, or counts offset), so the file is refused rather than read with heights in the wrong columns"
         ))
     })?;
+    // A full-grid record's first height is latitude point 0 (3.12 f); one counting another point
+    // would place every height in its column north or south of where it belongs, so it is refused.
+    let shifted = body.chunks_exact(record).take(cols).enumerate().find_map(|(i, rec)| {
+        let count = signed_magnitude(rec.get(6..8).unwrap_or_default());
+        (rec.first() == Some(&SENTINEL) && count != 0).then_some((i, count))
+    });
+    if let Some((place, count)) = shifted {
+        return Err(bad(&format!(
+            "{file_name}: the record at column {place} counts its first height as latitude point {count}, not 0, where every full-grid record starts: its heights would be placed {count} points from where they belong, so the file is refused"
+        )));
+    }
     let step = step_within(cols, rows, max).ok_or_else(|| bad("the cell is too large to open"))?;
     let (w, h) = (cols.div_ceil(step), rows.div_ceil(step));
     let mut data = super::filled(w, h, f32::from(VOID))?;
@@ -348,13 +361,13 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
             continue;
         };
         let lon_count = signed_magnitude(head.get(4..6).unwrap_or_default());
-        let lat_count = signed_magnitude(head.get(6..8).unwrap_or_default());
         if head.first() != Some(&SENTINEL) {
             damaged += 1;
             continue;
         }
-        // Counts other than the record's place are said, and the record read by its place.
-        if lon_count != i as i64 || lat_count != 0 {
+        // A longitude count other than the record's place is said, and the record read by its
+        // place (latitude counts other than 0 were refused above).
+        if lon_count != i as i64 {
             misnumbered += 1;
         }
         // A wrong checksum is counted, and the heights read as stored (see the module's notes).
@@ -399,8 +412,8 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     }
     match misnumbered {
         0 => {}
-        1 => lost.push(format!("1 of its {cols} columns' record counts don't match its place in the file; it is read by place")),
-        n => lost.push(format!("{n} of its {cols} columns' record counts don't match their place in the file; they are read by place")),
+        1 => lost.push(format!("1 of its {cols} columns' longitude count doesn't match its place in the file; it is read by place")),
+        n => lost.push(format!("{n} of its {cols} columns' longitude counts don't match their place in the file; they are read by place")),
     }
     match mismatched {
         0 => {}
@@ -679,18 +692,31 @@ mod tests {
             "{:?}",
             r.lost
         );
-        // A wrong column number or latitude count is read by its place, and said.
+        // A wrong column number is read by its place, and said.
         let mut moved = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |i, _| Some(i as i16));
         moved[at(7, rows) + 5] = 9;
-        moved[at(8, rows) + 7] = 1;
         let r = read("x.dt2", &moved).unwrap();
-        assert_eq!((r.value(0, 7, 4), r.value(0, 8, 4)), (Some(7.0), Some(8.0)), "read by place");
+        assert_eq!(r.value(0, 7, 4), Some(7.0), "read by place");
         assert!(!r.lost.iter().any(|l| l.contains("damaged record header")), "{:?}", r.lost);
         assert!(
-            r.lost.iter().any(|l| l == "2 of its 11 columns' record counts don't match their place in the file; they are read by place"),
+            r.lost.iter().any(|l| l == "1 of its 11 columns' longitude count doesn't match its place in the file; it is read by place"),
             "{:?}",
             r.lost
         );
+        // A latitude count other than 0 would shift the column's heights: refused, naming the
+        // file, column and count.
+        moved[at(8, rows) + 7] = 1;
+        let e = read("n00e000.dt2", &moved).unwrap_err().to_string();
+        assert!(
+            e.contains("n00e000.dt2")
+                && e.contains("the record at column 8 counts its first height as latitude point 1, not 0")
+                && e.contains("refused"),
+            "{e}"
+        );
+        // Latitude count 0 everywhere (the clean file) says nothing about counts.
+        let clean = dted("0000000E", "0000000N", (3600, 3600), (11, rows), |i, _| Some(i as i16));
+        let r = read("x.dt2", &clean).unwrap();
+        assert!(!r.lost.iter().any(|l| l.contains("count")), "{:?}", r.lost);
         // Cut in the middle of column 8: columns 8–10 are missing.
         let cut = &bytes[..at(8, rows) + 7];
         let r = read("x.dt2", cut).unwrap();
@@ -723,8 +749,8 @@ mod tests {
         assert_eq!(r.value(0, 0, 10), Some(0.0), "column 0, point 0");
         assert_eq!(r.value(0, 10, 0), Some(1010.0), "column 10, point 10");
         assert_eq!(
-            r.lost.iter().filter(|l| l.contains("record counts")).collect::<Vec<_>>(),
-            ["11 of its 11 columns' record counts don't match their place in the file; they are read by place"]
+            r.lost.iter().filter(|l| l.contains("longitude count")).collect::<Vec<_>>(),
+            ["11 of its 11 columns' longitude counts don't match their place in the file; they are read by place"]
         );
         assert!(!r.lost.iter().any(|l| l.contains("damaged") || l.contains("checksum")), "{:?}", r.lost);
         // One column out of place is said in the singular.
@@ -732,7 +758,7 @@ mod tests {
         one[at(3, rows) + 5] = 4;
         let r = read("x.dt1", &one).unwrap();
         assert!(
-            r.lost.iter().any(|l| l == "1 of its 11 columns' record counts don't match its place in the file; it is read by place"),
+            r.lost.iter().any(|l| l == "1 of its 11 columns' longitude count doesn't match its place in the file; it is read by place"),
             "{:?}",
             r.lost
         );
@@ -761,7 +787,7 @@ mod tests {
         // The clean file: every count its place, nothing said about counts.
         let r = read("x.dt1", &full()).unwrap();
         assert_eq!(r.value(0, 10, 0), Some(1010.0));
-        assert!(!r.lost.iter().any(|l| l.contains("record counts")), "{:?}", r.lost);
+        assert!(!r.lost.iter().any(|l| l.contains("longitude count")), "{:?}", r.lost);
         // Leading columns left out: only the records of columns 3 to 7, counted 3 to 7, from the
         // first data byte. By place, column 3's heights would land in column 0.
         let b = full();
@@ -794,7 +820,7 @@ mod tests {
         let r = read("x.dt1", &wrong).unwrap();
         assert_eq!((r.value(0, 2, 10), r.value(0, 6, 10)), (Some(200.0), Some(600.0)));
         assert!(
-            r.lost.iter().any(|l| l == "2 of its 11 columns' record counts don't match their place in the file; they are read by place"),
+            r.lost.iter().any(|l| l == "2 of its 11 columns' longitude counts don't match their place in the file; they are read by place"),
             "{:?}",
             r.lost
         );
