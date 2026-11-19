@@ -3726,7 +3726,7 @@ fn geopackage_export_adds_and_replaces_tables_and_keeps_the_others() {
     }
     let to = |mode, name: Option<&str>| GpkgTable { mode, name: name.map(String::from) };
     let written = write_path_to(&permits, &path, Crs::LonLat, &to(GpkgMode::AddTable, None)).unwrap();
-    assert_eq!(written, (0, Some(GpkgWritten { table: "permits".into(), replaced: false, dependents: vec![] })));
+    assert_eq!(written, (0, Some(GpkgWritten { table: "permits".into(), replaced: false, dependents: vec![] }), Default::default()));
     rusqlite::Connection::open(&path).unwrap().execute_batch("INSERT INTO gpkg_ogr_contents VALUES ('permits', 3)").unwrap();
     assert_eq!(gpkg_tables(&path), ["owners", "parcels", "permits"]);
     // The file's own trigger on its contents didn't run.

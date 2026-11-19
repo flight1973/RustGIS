@@ -7,7 +7,7 @@ pub(super) use table::table_work;
 
 use std::path::Path;
 
-use rustgis_data::io::{GpkgMode, GpkgTable, GpkgWritten};
+use rustgis_data::io::{GpkgMode, GpkgTable, GpkgWritten, ShapefileSaved};
 use rustgis_data::raster::Crs;
 use rustgis_render::View;
 use serde_json::{Value, json};
@@ -705,8 +705,9 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         return Err(format!("{path}: {e}"));
     }
     let parquet = matches!(ext.as_str(), "parquet" | "geoparquet");
-    // The old file's `.prj` a Shapefile in a system without one removes, found before it goes.
-    let stale_prj = if ext == "shp" { rustgis_data::io::shapefile_stale_prj(Path::new(path), crs) } else { None };
+    // What saving a Shapefile over one did besides writing it (a `.prj` removed, a part kept
+    // under another spelling), as the save found it.
+    let mut shapefile_saved = ShapefileSaved::default();
     let (written, left_out, skipped, table, unfit, null_numbers, moved, format_notes, dates) = match &chunks {
         Some((src, layer)) => {
             let (e, table) =
@@ -740,7 +741,8 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
         None => {
             let format_notes =
                 rustgis_data::io::export_losses_notes(ds, &ext, rustgis_data::io::name_field(ds), path).map_err(|e| e.to_string())?;
-            let (left_out, table) = rustgis_data::io::write_path_to(ds, Path::new(&path), crs, &gpkg).map_err(|e| e.to_string())?;
+            let (left_out, table, saved) = rustgis_data::io::write_path_to(ds, Path::new(&path), crs, &gpkg).map_err(|e| e.to_string())?;
+            shapefile_saved = saved;
             let unfit = if parquet { rustgis_data::source::parquet::values_note(ds, path) } else { None };
             let null_numbers = rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, &ext);
             let mut dates = read_notes(path, &ds.name, &unreadable);
@@ -765,9 +767,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     if shapefile {
         dbf_notes.extend(rustgis_data::io::shapefile_names_note(&ds.fields, path));
         // A part there under another spelling too (`ROADS.dbf` beside `ROADS.DBF`) is kept.
-        if ext == "shp" {
-            dbf_notes.extend(rustgis_data::io::shapefile_spellings_note(Path::new(path)));
-        }
+        dbf_notes.extend(shapefile_saved.kept.clone());
         dbf_notes.extend(rustgis_data::io::shapefile_values_notes(ds, path));
         dbf_notes.extend(rustgis_data::io::shapefile_geometry_notes(ds, path, crs));
     }
@@ -788,12 +788,9 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, gpkg: Gpk
     said.extend(unfit);
     said.extend(dates);
     if shapefile && rustgis_data::raster::wkt::to_wkt(crs).is_none() {
-        let removed = stale_prj
-            .as_deref()
-            .and_then(Path::file_name)
-            .map(|n| format!("; {} was removed, as it said the old file's system", n.to_string_lossy()))
-            .unwrap_or_default();
-        said.push(format!("{path}: no .prj written, as {} has no WKT form{removed}", crs.label()));
+        said.push(format!("{path}: no .prj written, as {} has no WKT form", crs.label()));
+        // The old file's `.prj`, every spelling removed, by the names they had.
+        said.extend(ShapefileSaved { removed_prj: shapefile_saved.removed_prj.clone(), kept: None }.notes(path));
     }
     said.push(format!("Exported {path}"));
     let answer = json!({"path": path, "features": written, "leftOut": left_out, "crs": crs.label()});

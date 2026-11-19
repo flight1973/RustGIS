@@ -155,24 +155,28 @@ mod native {
         (pairs, theirs)
     }
 
-    /// Whether the record's `name`, recorded missing, is an index an older RustGIS couldn't see:
-    /// before #1958 a record of `ROADS.SHP` looked for its `.shx` in lower case only, so
-    /// `ROADS.shx` was recorded missing while `ROADS.SHX` was there. This RustGIS names a missing
-    /// part of an upper-case `.SHP` in upper case, so such an entry only comes from an older one,
-    /// and says nothing of the file there now (`now`). It isn't counted as a change: a `.shx`
-    /// holds only where each record of the `.shp` is, which a publish writes again from the
-    /// `.shp`, so writing over it loses nothing. Its `.prj` was recorded the same way, but isn't
-    /// taken so: a publish reads the file in the layer's system, so a `.prj` changed since would
-    /// be written over unseen; such a layer is refused once, and publishes once added again.
+    /// Whether the record's `name`, recorded missing, is a name an older RustGIS looked a part up
+    /// by alone: before #1958 a Shapefile's `.shx` and `.prj` were looked for in lower case only
+    /// (`ROADS.shx`, `ROADS.prj`), so one there in another case (`ROADS.SHX`) was recorded
+    /// missing. Such an entry says nothing of the file there now under another spelling.
+    fn older_lookup_name(files: &[(String, Option<FileStamp>)], name: &str, was: &Option<FileStamp>) -> bool {
+        let Some((stem, _)) = files.first().and_then(|(n, _)| n.rsplit_once('.')) else { return false };
+        was.is_none() && [".shx", ".prj"].iter().any(|ext| name.strip_suffix(ext) == Some(stem))
+    }
+
+    /// Whether the record's `name`, recorded missing, was [missed by an older
+    /// lookup](older_lookup_name) and is there now (`now`) under another spelling: it isn't
+    /// counted as a change by itself, as the record can't say what it held. A `.shx` holds only
+    /// where each record of the `.shp` is, which a publish writes again from the `.shp`; a
+    /// `.prj` is said ([`FileSync::unverified_among`]), and a publish takes it only when the file
+    /// read in that system is the layer as it was read.
     fn missed_by_an_older_lookup(
         files: &[(String, Option<FileStamp>)],
         name: &str,
         was: &Option<FileStamp>,
         now: &(String, PathBuf),
     ) -> bool {
-        let upper_set =
-            files.first().and_then(|(n, _)| n.rsplit_once('.')).is_some_and(|(_, e)| crate::sidecar::upper_extension(e.as_bytes()));
-        was.is_none() && upper_set && name.ends_with(".shx") && now.0 != name && now.0.eq_ignore_ascii_case(name) && now.1.exists()
+        older_lookup_name(files, name, was) && now.0 != name && now.0.eq_ignore_ascii_case(name) && now.1.exists()
     }
 
     /// The name a differing file is reported under: the one it has now when it is there (a part
@@ -308,11 +312,32 @@ mod native {
                     None => p.symlink_metadata().is_err(),
                 };
                 let Some((_, ext)) = name.rsplit_once('.').filter(|_| shapefile && sized) else { return sized };
-                crate::sidecar::case_spellings(&ext.to_ascii_lowercase()).iter().all(|e| {
+                // Another spelling there is a change only when it would be taken instead: before
+                // the one recorded, in the order spellings are taken in, or where the record says
+                // the part was missing (but for a name an older lookup missed it by).
+                let spellings = crate::sidecar::case_spellings(&ext.to_ascii_lowercase());
+                let rank = spellings.iter().position(|e| e == ext).unwrap_or(0);
+                let excused = older_lookup_name(&self.files, name, was);
+                spellings.iter().enumerate().filter(|(_, e)| *e != ext).all(|(i, e)| {
                     let other = p.with_extension(e);
-                    other.symlink_metadata().is_err() || (was.is_some() && crate::sidecar::same_file(&other, &p))
+                    let there = other.symlink_metadata().is_ok();
+                    match was {
+                        Some(_) => !there || i > rank || crate::sidecar::same_file(&other, &p),
+                        None => !there || excused,
+                    }
                 })
             })
+        }
+
+        /// The names of the parts there now that a record from an older RustGIS couldn't speak
+        /// for ([`missed_by_an_older_lookup`]), so [`FileSync::changed`] doesn't count them: the
+        /// caller about to write over the file checks them otherwise.
+        pub(crate) fn unverified_among(&self, now: &[(String, PathBuf)]) -> Vec<String> {
+            self.files
+                .iter()
+                .filter_map(|(name, was)| now.iter().find(|part| missed_by_an_older_lookup(&self.files, name, was, part)))
+                .map(|(n, _)| n.clone())
+                .collect()
         }
 
         /// As [`FileSync::changed`], with the source's parts as [`FileSync::parts_of`] gives them.

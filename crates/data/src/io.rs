@@ -653,15 +653,59 @@ pub struct GpkgWritten {
     pub dependents: Vec<String>,
 }
 
+/// What saving a Shapefile over files there did besides writing its parts, for the caller to
+/// say ([`ShapefileSaved::notes`]). Empty for other formats and for a Shapefile saved anew.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShapefileSaved {
+    /// The old file's `.prj` files removed, every spelling that was there by the name it had: the
+    /// system written has no `.prj` form, and they would go on saying another.
+    pub removed_prj: Vec<std::path::PathBuf>,
+    /// The note for parts kept under another spelling beside the ones written (`ROADS.DBF`
+    /// beside the `ROADS.dbf` written, where case is told apart).
+    pub kept: Option<String>,
+}
+
+impl ShapefileSaved {
+    /// What to say of it, each note naming `path`.
+    pub fn notes(&self, path: &str) -> Vec<String> {
+        let mut notes: Vec<String> = self.kept.iter().cloned().collect();
+        if !self.removed_prj.is_empty() {
+            let names: Vec<String> =
+                self.removed_prj.iter().map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+            notes.push(format!(
+                "{path}: {} removed: {} the old file's system, and the one written has no .prj form",
+                names.join(", "),
+                if names.len() == 1 { "it said" } else { "they said" }
+            ));
+        }
+        notes
+    }
+}
+
 /// As [`write_path`], in the coordinate system `crs` (a GeoPackage, Shapefile or FlatGeobuf; see
-/// [`write_bytes_in`]).
+/// [`write_bytes_in`]). With nothing to say what it did besides, a Shapefile saved over one
+/// with a `.prj` in a system that has no `.prj` form is refused rather than its `.prj` removed
+/// unsaid ([`write_path_to`] removes it and says so).
 pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
-    write_path_to(ds, path, crs, &GpkgTable::default()).map(|(left_out, _)| left_out)
+    write_path_saving(ds, path, crs, &GpkgTable::default(), false).map(|(left_out, _, _)| left_out)
 }
 
 /// As [`write_path_in`], a GeoPackage's table placed as `gpkg` says (other formats ignore it):
-/// also returns the table written.
-pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> Result<(usize, Option<GpkgWritten>)> {
+/// also returns the table written, and what saving a Shapefile over one did besides
+/// ([`ShapefileSaved`]), for the caller to say.
+pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> Result<(usize, Option<GpkgWritten>, ShapefileSaved)> {
+    write_path_saving(ds, path, crs, gpkg, true)
+}
+
+/// [`write_path_to`]; `remove_prj` says whether the caller says a `.prj` removed, else such a
+/// save is refused.
+fn write_path_saving(
+    ds: &Dataset,
+    path: &Path,
+    crs: Crs,
+    gpkg: &GpkgTable,
+    remove_prj: bool,
+) -> Result<(usize, Option<GpkgWritten>, ShapefileSaved)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let projected;
     let ds = if crs == Crs::LonLat || !PROJECTED_FORMATS.contains(&ext.as_str()) {
@@ -679,7 +723,7 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
                 // Every feature is written: a layer of several kinds of geometry gets a GEOMETRY
                 // column, and one that declares no type takes its geometry's.
                 let table = crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?;
-                Ok((0, Some(table)))
+                Ok((0, Some(table), ShapefileSaved::default()))
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -697,20 +741,51 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
                     other.display()
                 )));
             }
-            // Its spatial indexes would no longer match; another spelling of a part stays, as
-            // [`shapefile_spellings_note`] says. In a system no `.prj` can describe, none is
-            // written, and the old file's (in any spelling) goes too, as
-            // [`shapefile_stale_prj`] says: it would go on saying another system.
+            // Its spatial indexes would no longer match; another spelling of a part stays, and is
+            // said. In a system no `.prj` can describe, none is written, and the old file's (in
+            // any spelling) goes too, and is said: it would go on saying another system.
             let mut stale: Vec<std::path::PathBuf> =
                 crate::sidecar::SHAPEFILE_INDEXES.iter().flat_map(|e| files.spellings(e)).map(Path::to_path_buf).collect();
-            if shapefile_prj(crs).is_none() {
-                stale.extend(files.spellings("prj").into_iter().map(Path::to_path_buf));
+            let old_prj: Vec<std::path::PathBuf> = if shapefile_prj(crs).is_none() {
+                files.spellings("prj").into_iter().filter(|p| p.symlink_metadata().is_ok()).map(Path::to_path_buf).collect()
+            } else {
+                Vec::new()
+            };
+            if let Some(prj) = old_prj.first().filter(|_| !remove_prj) {
+                return Err(DataError::Format(format!(
+                    "{}: {} has no .prj form, and {} would go on saying the old file's system; remove it or save to another name; nothing was written",
+                    path.display(),
+                    crs.label(),
+                    prj.display()
+                )));
             }
+            stale.extend(old_prj.iter().cloned());
             crate::progress::begin(ds.features.len());
             let (parts, left_out) = shapefile_parts_in(ds, crs)?;
+            let exts: Vec<&str> = parts.iter().map(|(e, _)| *e).collect();
             let parts: Vec<(std::path::PathBuf, Vec<u8>)> = parts.into_iter().map(|(e, bytes)| (files.path(e), bytes)).collect();
-            place_shapefile(files.file(), &stage_shapefile(&parts)?, &stale)?;
-            Ok((left_out, None))
+            let staged = stage_shapefile(&parts)?;
+            // Found again before the parts are placed: a part put there under another spelling
+            // meanwhile, which a reader would take instead of the one written, refuses the save.
+            let again = crate::sidecar::Sidecars::shapefile(path);
+            let moved = again
+                .other_shp()
+                .map(Path::to_path_buf)
+                .or_else(|| exts.iter().map(|e| again.path(e)).find(|p| !parts.iter().any(|(t, _)| t == p)));
+            if let Some(moved) = moved {
+                unstage(&staged);
+                return Err(DataError::Format(format!(
+                    "{}: {} appeared while it was written, and would be read instead of the part written; nothing was written",
+                    path.display(),
+                    moved.display()
+                )));
+            }
+            place_shapefile(files.file(), &staged, &stale)?;
+            let saved = ShapefileSaved {
+                removed_prj: old_prj.into_iter().filter(|p| p.symlink_metadata().is_err()).collect(),
+                kept: files.duplicates_note(),
+            };
+            Ok((left_out, None, saved))
         }
         _ if crs != Crs::LonLat && !PROJECTED_FORMATS.contains(&ext.as_str()) => {
             Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())))
@@ -718,7 +793,7 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
         _ => {
             let (bytes, left_out) = projected_bytes(ds, &ext, crs)?;
             write_atomic(path, &bytes)?;
-            Ok((left_out, None))
+            Ok((left_out, None, ShapefileSaved::default()))
         }
     }
 }
@@ -2536,23 +2611,6 @@ pub fn shapefile_for_dbf(path: &Path) -> Option<std::path::PathBuf> {
 /// The `.prj` a Shapefile in `crs` is written with: `None` for a system WKT can't describe.
 fn shapefile_prj(crs: Crs) -> Option<String> {
     if crs == Crs::LonLat { Some(WGS84_PRJ.to_string()) } else { crate::raster::wkt::to_wkt(crs) }
-}
-
-/// The `.prj` beside the Shapefile at `path` that saving it in `crs` removes: one is there (in
-/// any spelling) and `crs` has no `.prj` form, so none is written and the old one would go on
-/// saying another system. For the export to say; checked before the save.
-pub fn shapefile_stale_prj(path: &Path, crs: Crs) -> Option<std::path::PathBuf> {
-    if shapefile_prj(crs).is_some() {
-        return None;
-    }
-    crate::sidecar::find_one(path, "prj")
-}
-
-/// The note for a Shapefile at `path` with a part there under more than one spelling
-/// (`ROADS.dbf` and `ROADS.DBF`, where case is told apart): the one read and written, and that
-/// the others are left as they are. For an export over such a file to say.
-pub fn shapefile_spellings_note(path: &Path) -> Option<String> {
-    crate::sidecar::Sidecars::shapefile(path).duplicates_note()
 }
 
 /// Reads a Shapefile with an optional source CRS replacing its `.prj`, before any geometry is
