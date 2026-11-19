@@ -647,7 +647,7 @@ fn shapefile_record_past_the_cap_is_skipped_not_allocated() {
 /// A line with a coordinate that isn't a number under a stored box that is one: the index takes
 /// the stored box (the points aren't read to build it), and a read leaves the line out. Both
 /// reads, sampled and in chunks, count it and say so, once with its count, whole or by area; a
-/// clean file says nothing.
+/// limited read says its count is of the shapes it read; a clean file says nothing.
 #[test]
 fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
     let fixture = dir();
@@ -696,7 +696,29 @@ fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
         let by_area = src.read(&Request { extent: area, ..Request::all() }).unwrap();
         assert_eq!((by_area.features.len(), by_area.skipped, said(&by_area.notes)), (0, 1, one.clone()));
         assert_eq!(chunk_notes(src.as_ref(), None), (1, one.clone()));
-        assert_eq!(chunk_notes(src.as_ref(), area), (1, one));
+        assert_eq!(chunk_notes(src.as_ref(), area), (1, one.clone()));
+        // A limited read visits a sample (here the first and third records), so its count is of
+        // the shapes it read, not a total: the first record's point made NaN (content at 108,
+        // its first x at 108 + 48 = 156).
+        let p = write("nan_first.shp");
+        let mut b = std::fs::read(&p).unwrap();
+        b[156..164].copy_from_slice(&f64::NAN.to_le_bytes());
+        std::fs::write(&p, b).unwrap();
+        let src = open_path(&p, None).unwrap();
+        let some = src.read(&Request { limit: 2, ..Request::all() }).unwrap();
+        assert!(!some.complete);
+        assert_eq!(
+            (some.features.len(), some.skipped, said(&some.notes)),
+            (
+                1,
+                1,
+                vec![format!(
+                    "1 of the shapes read (a sample of the layer, which may hold more) {SAID}: they're left out of the read, but the layer's extent and its index still take in their stored boxes"
+                )]
+            )
+        );
+        // A whole read of the same file still gives the total.
+        assert_eq!(said(&src.read(&Request::all()).unwrap().notes), one);
     });
     std::fs::remove_dir_all(fixture).unwrap();
 }

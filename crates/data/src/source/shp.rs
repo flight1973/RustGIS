@@ -330,7 +330,8 @@ impl FeatureSource for ShpSource {
             unread_dates,
             rounded_dates: Vec::new(),
             null_text,
-            notes: boxed_off_note(boxed_off),
+            // A sampled read visits only some of the matches, so its count is of those.
+            notes: boxed_off_note(boxed_off, !late && !complete),
         })
     }
     fn streams_chunks(&self) -> bool {
@@ -420,20 +421,23 @@ impl FeatureSource for ShpSource {
             unread_dates,
             rounded_dates: Vec::new(),
             null_text,
-            notes: boxed_off_note(boxed_off),
+            notes: boxed_off_note(boxed_off, false),
         })
     }
 }
 
 /// Says how many shapes a read left out for a coordinate that isn't a number while their stored
 /// box is a box: [`record_box`] doesn't read the points, so the layer's extent and its index still
-/// take in those boxes.
-fn boxed_off_note(n: u64) -> Vec<String> {
+/// take in those boxes. A `sampled` read visited only some of the matches, so its count is of
+/// the shapes it read, not of the layer.
+fn boxed_off_note(n: u64, sampled: bool) -> Vec<String> {
     if n == 0 {
         return Vec::new();
     }
+    let what =
+        if sampled { format!("{n} of the shapes read (a sample of the layer, which may hold more)") } else { format!("{n} shape(s)") };
     vec![format!(
-        "{n} shape(s) have a coordinate that isn't a number under a bounding box that is one: they're left out of the read, but the layer's extent and its index still take in their stored boxes"
+        "{what} have a coordinate that isn't a number under a bounding box that is one: they're left out of the read, but the layer's extent and its index still take in their stored boxes"
     )]
 }
 
