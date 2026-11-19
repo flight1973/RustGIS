@@ -96,7 +96,7 @@ impl ShpSource {
         }
         let mut notes = Vec::new();
         let table = read_table(&dbf)?;
-        let cpg = crate::dbf::read_cpg(files.existing("cpg"), &mut notes);
+        let cpg = crate::dbf::read_cpg(files.existing("cpg").or(files.unreadable("cpg")), &mut notes);
         notes.extend(files.other_shp_note());
         notes.extend(files.duplicates_note());
         let encoding = crate::dbf::encoding(cpg.as_deref(), table.ldid, &mut notes);

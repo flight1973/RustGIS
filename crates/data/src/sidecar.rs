@@ -27,6 +27,7 @@ pub(crate) fn upper_extension(ext: &[u8]) -> bool {
 }
 
 /// Whether two paths reach one file ([`Identity`]); `false` when either reaches nothing.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
     match (a.metadata(), b.metadata()) {
         (Ok(ma), Ok(mb)) => identity(a, &ma) == identity(b, &mb),
@@ -56,12 +57,18 @@ pub(crate) fn find_one(path: &Path, ext: &str) -> Option<PathBuf> {
     case_spellings(ext).into_iter().map(|e| path.with_extension(e)).find(|p| p.is_file())
 }
 
+/// As [`find_one`], the first spelling there in any form (following a link): a folder or
+/// another entry that isn't a file too, for a reader to try and say why it couldn't read it.
+pub(crate) fn find_present(path: &Path, ext: &str) -> Option<PathBuf> {
+    case_spellings(ext).into_iter().map(|e| path.with_extension(e)).find(|p| p.metadata().is_ok())
+}
+
 /// One extension's entries beside the file.
 #[derive(Debug, Clone)]
 struct Part {
     ext: &'static str,
-    /// Its entries (any but folders, so a dangling link too), the lower-case spelling first and
-    /// then the others in byte order, each with whether it is a file (following a link).
+    /// Its entries (a folder or a dangling link too), the lower-case spelling first and then the
+    /// others in byte order, each with whether it is a file (following a link).
     found: Vec<(PathBuf, bool)>,
 }
 
@@ -121,29 +128,29 @@ impl Sidecars {
         let file = match (path.file_name(), list(path)) {
             (Some(name), Some(entries)) => {
                 let name = name.as_encoded_bytes();
-                let exact = entries.iter().any(|(n, _)| n.as_encoded_bytes() == name);
-                let other = entries.iter().find(|(n, _)| n.as_encoded_bytes() != name && n.as_encoded_bytes().eq_ignore_ascii_case(name));
+                let exact = entries.iter().any(|n| n.as_encoded_bytes() == name);
+                let other = entries.iter().find(|n| n.as_encoded_bytes() != name && n.as_encoded_bytes().eq_ignore_ascii_case(name));
                 // Whether the folder ignores case: the file is there under another spelling, or
                 // its name in the opposite case, not listed, still reaches a file.
                 let ignores_case = if exact {
                     let flipped: Vec<u8> =
                         name.iter().map(|b| if b.is_ascii_lowercase() { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() }).collect();
                     flipped != name
-                        && !entries.iter().any(|(n, _)| n.as_encoded_bytes() == flipped.as_slice())
+                        && !entries.iter().any(|n| n.as_encoded_bytes() == flipped.as_slice())
                         && std::str::from_utf8(&flipped).is_ok_and(|f| path.with_file_name(f).symlink_metadata().is_ok())
                 } else {
                     other.is_some() && path.symlink_metadata().is_ok()
                 };
                 let file = match other {
-                    Some((n, _)) if !exact && ignores_case => path.with_file_name(n),
+                    Some(n) if !exact && ignores_case => path.with_file_name(n),
                     _ => path.to_path_buf(),
                 };
                 let stem = file.file_stem().map(|s| s.as_encoded_bytes().to_vec()).unwrap_or_default();
-                for (n, is_dir) in &entries {
+                for n in &entries {
                     let bytes = n.as_encoded_bytes();
                     let Some(dot) = bytes.iter().rposition(|&b| b == b'.') else { continue };
                     let (base, ext) = (bytes.get(..dot).unwrap_or_default(), bytes.get(dot + 1..).unwrap_or_default());
-                    if *is_dir || !(base == stem.as_slice() || (ignores_case && base.eq_ignore_ascii_case(&stem))) {
+                    if !(base == stem.as_slice() || (ignores_case && base.eq_ignore_ascii_case(&stem))) {
                         continue;
                     }
                     if let Some((_, part)) = found.iter_mut().find(|(e, _)| e.as_bytes().eq_ignore_ascii_case(ext)) {
@@ -173,7 +180,7 @@ impl Sidecars {
                         let p = path.with_extension(&spelling);
                         let Ok(meta) = p.symlink_metadata() else { continue };
                         let id = identity(&p, &meta);
-                        if meta.is_dir() || seen.contains(&id) {
+                        if seen.contains(&id) {
                             continue;
                         }
                         seen.push(id);
@@ -186,7 +193,7 @@ impl Sidecars {
         let upper = upper_of(&file);
         // Beside another `.shp` of the name in another case, a part spelled in this one's case
         // (`ROADS.DBF` for `ROADS.SHP`, `ROADS.dbf` for `ROADS.shp`) is taken for this one's.
-        let paired = found.iter().any(|(e, f)| *e == "shp" && f.iter().any(|p| *p != file));
+        let paired = found.iter().any(|(e, f)| *e == "shp" && f.iter().any(|p| *p != file && p.is_file()));
         let parts = found
             .into_iter()
             .map(|(ext, mut entries)| {
@@ -252,7 +259,17 @@ impl Sidecars {
     /// Another `.shp` of this name in another case (`roads.SHP` beside `roads.shp`, where case is
     /// told apart): a second Shapefile whose parts can't be told from this one's.
     pub(crate) fn other_shp(&self) -> Option<&Path> {
-        self.spellings("shp").into_iter().find(|p| *p != self.file.as_path())
+        let part = self.part("shp")?;
+        part.found.iter().find(|(p, file)| *file && *p != self.file).map(|(p, _)| p.as_path())
+    }
+
+    /// The part `ext` when it is there but not as a file (a folder at `places.cpg`): what a
+    /// reader tries, to say it couldn't read it, when [`Sidecars::existing`] finds none.
+    pub(crate) fn unreadable(&self, ext: &str) -> Option<&Path> {
+        if self.existing(ext).is_some() {
+            return None;
+        }
+        self.part(ext)?.found.iter().map(|(p, _)| p.as_path()).find(|p| p.metadata().is_ok())
     }
 
     /// A note for reading beside another `.shp` of the name in another case ([`Sidecars::other_shp`]):
@@ -294,10 +311,9 @@ impl Sidecars {
     }
 }
 
-/// The names in `path`'s folder whose stem is `path`'s in any ASCII case, each with whether it
-/// is a folder; `None` when the folder can't be listed or holds more than [`LISTING_LIMIT`]
-/// entries, which it stops at.
-fn list(path: &Path) -> Option<Vec<(std::ffi::OsString, bool)>> {
+/// The names in `path`'s folder whose stem is `path`'s in any ASCII case; `None` when the
+/// folder can't be listed or holds more than [`LISTING_LIMIT`] entries, which it stops at.
+fn list(path: &Path) -> Option<Vec<std::ffi::OsString>> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let stem = path.file_stem()?.as_encoded_bytes();
     let mut entries = Vec::new();
@@ -310,8 +326,7 @@ fn list(path: &Path) -> Option<Vec<(std::ffi::OsString, bool)>> {
         let bytes = name.as_encoded_bytes();
         let base = bytes.iter().rposition(|&b| b == b'.').and_then(|dot| bytes.get(..dot)).unwrap_or(bytes);
         if base.eq_ignore_ascii_case(stem) {
-            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-            entries.push((name, is_dir));
+            entries.push(name);
         }
     }
     Some(entries)
@@ -343,6 +358,10 @@ pub(crate) mod tests {
         let found = find_one(&dir.path().join("a.tfw"), "prj").unwrap();
         assert_eq!(std::fs::read_to_string(found).unwrap(), "GEOGCS");
         assert_eq!(find_one(&dir.path().join("a.tfw"), "cpg"), None);
+        // A folder at the name is no file, but is there for a reader to say it can't read it.
+        std::fs::create_dir(dir.path().join("a.cpg")).unwrap();
+        assert_eq!(find_one(&dir.path().join("a.tfw"), "cpg"), None);
+        assert_eq!(find_present(&dir.path().join("a.tfw"), "cpg"), Some(dir.path().join("a.cpg")));
     }
 
     /// On a file system that ignores case, a project naming `roads.shp` finds `ROADS.*` and
@@ -443,7 +462,8 @@ pub(crate) mod tests {
             assert_eq!(files.spellings("prj").len(), 1);
             assert_eq!(std::fs::read_to_string(files.existing("prj").unwrap()).unwrap(), "GEOGCS");
         }
+        // A folder at a part's name is no part, but is there for a reader to say so.
         assert_eq!(files.existing("dbf"), None);
-        assert!(files.spellings("dbf").is_empty());
+        assert_eq!(files.unreadable("dbf"), Some(d.join("roads.dbf").as_path()));
     }
 }

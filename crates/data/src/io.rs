@@ -386,7 +386,7 @@ pub fn read_path(path: &Path) -> Result<(Dataset, ReadReport)> {
         "dbf" => {
             check_size(path)?;
             let mut notes = Vec::new();
-            let cpg = crate::dbf::read_cpg(crate::sidecar::find_one(path, "cpg").as_deref(), &mut notes);
+            let cpg = crate::dbf::read_cpg(crate::sidecar::find_present(path, "cpg").as_deref(), &mut notes);
             let (ds, mut report) = read_dbf(std::fs::read(path)?, cpg.as_deref(), &name, &mut csv_memory_budget())?;
             report.messages.extend(notes);
             (ds, report)
@@ -2578,7 +2578,7 @@ pub fn read_shapefile_in(path: &Path, name: &str, crs: Option<Crs>) -> Result<(D
         },
         dbf: crate::provenance::read(dbf)?,
         prj: files.existing("prj").and_then(crate::raster::read_prj_file),
-        cpg: crate::dbf::read_cpg(files.existing("cpg"), &mut notes),
+        cpg: crate::dbf::read_cpg(files.existing("cpg").or(files.unreadable("cpg")), &mut notes),
     };
     let (ds, mut report) = read_shapefile_parts(parts, name, crs)?;
     report.messages.extend(notes);
