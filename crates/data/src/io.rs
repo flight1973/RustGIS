@@ -932,34 +932,45 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
     atomic_write_at(&path, write)
 }
 
-/// Opens (creating it, empty) an app-managed file used only to lock on: never through a symbolic
-/// link (on Unix the open itself refuses one, so none can be swapped in between a check and the
-/// open), only a regular file, readable and writable by its owner alone. Elsewhere a link or
-/// other non-regular file at `path` is refused before and after the open.
-pub fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+/// Opens an app-managed file used only to lock on, read and write, creating it empty when
+/// `create` is set: never through a symbolic link (on Unix the open itself refuses one, so none
+/// can be swapped in between a check and the open) and only a regular file; elsewhere a link or
+/// other non-regular file is refused before and after the open. A file this call creates gets
+/// `mode` on Unix, set through the open handle so the umask doesn't narrow it (`0o600` for one
+/// user's own, `0o666` for a lock accounts share); an existing one keeps its own.
+pub fn open_lock_file(path: &Path, create: bool, mode: u32) -> std::io::Result<std::fs::File> {
     let refused = || std::io::Error::other(format!("{} isn't a regular file", path.display()));
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
-    }
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    let _ = mode;
+    let open = |create_new: bool| {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(create_new);
+        #[cfg(all(unix, not(target_arch = "wasm32")))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
+        }
+        options.open(path).map_err(|e| if e.raw_os_error() == Some(rustix_eloop()) { refused() } else { e })
+    };
     #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
     if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
         return Err(refused());
     }
-    let file = options.open(path).map_err(|e| if e.raw_os_error() == Some(rustix_eloop()) { refused() } else { e })?;
+    let (file, created) = match create.then(|| open(true)) {
+        Some(Ok(file)) => (file, true),
+        Some(Err(e)) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        _ => (open(false)?, false),
+    };
     if !file.metadata()?.is_file() || std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
         return Err(refused());
     }
     #[cfg(all(unix, not(target_arch = "wasm32")))]
-    {
+    if created {
         use std::os::unix::fs::PermissionsExt;
-        if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     }
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    let _ = created;
     Ok(file)
 }
 

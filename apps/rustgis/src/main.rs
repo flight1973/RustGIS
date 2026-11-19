@@ -155,11 +155,15 @@ mod prefs {
         // The ChatGPT sign-in's tokens go to the same keychain (its accounts stay in the file).
         rustgis_assistant::chatgpt::set_secret_store(Some(secrets.clone()));
         Services {
-            load_pref: Some(Box::new(|key: &str| read().get(key).and_then(Value::as_str).map(str::to_string))),
+            // A value left to save is newer than the file's: it is what the setting is.
+            load_pref: Some(Box::new(|key: &str| {
+                rustgis_engine::prefs::pending(key).or_else(|| read().get(key).and_then(Value::as_str).map(str::to_string))
+            })),
             // While another copy of RustGIS saves its preferences, a value is kept to save and
             // `retry_prefs` writes it on a later frame (and `on_exit` at the end).
             save_pref: Some(Box::new(|key: &str, value: &str| match rustgis_engine::prefs::write(key, value) {
                 Ok(rustgis_engine::prefs::Updated::Saved(set_aside)) => saved(Ok(set_aside)),
+                Ok(rustgis_engine::prefs::Updated::Newer) => saved(Err(rustgis_engine::prefs::newer_notice(key))),
                 Ok(_) => {}
                 Err(error) => saved(Err(error)),
             })),
@@ -174,6 +178,11 @@ mod prefs {
                     }
                     Ok(Updated::Unchanged) => PrefUpdate::Unchanged,
                     Ok(Updated::Busy) => PrefUpdate::Busy,
+                    // Never written over; said (once, while it stays the last failure).
+                    Ok(Updated::Newer) => {
+                        saved(Err(rustgis_engine::prefs::newer_notice(key)));
+                        PrefUpdate::Failed
+                    }
                     Err(error) => {
                         saved(Err(error));
                         PrefUpdate::Failed

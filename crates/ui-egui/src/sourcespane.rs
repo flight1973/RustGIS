@@ -29,24 +29,52 @@ pub struct State {
     /// What this session last wrote: a save that finds it stored has nothing to lay its changes
     /// over.
     last_written: Option<String>,
-    /// When a save that didn't happen (the preferences busy, unreadable or failing) is tried
-    /// again, and how many have failed in a row.
-    retry_at: Option<web_time::Instant>,
-    failures: u32,
+    /// When a data sources save that didn't happen (the preferences busy, unreadable or
+    /// failing) is tried again.
+    retry: Retry,
     /// Since when another copy of the app has kept the preferences busy.
     busy_since: Option<web_time::Instant>,
+    /// When the other preferences left to save (`retry_prefs`) are tried again.
+    prefs_retry: Retry,
+}
+
+/// When a save that didn't happen is tried again, so a frame doesn't retry it each time:
+/// shared by the data sources and the app's other preferences.
+#[derive(Default)]
+struct Retry {
+    at: Option<web_time::Instant>,
+    /// Failed tries in a row.
+    failures: u32,
+}
+
+impl Retry {
+    fn due(&self, now: web_time::Instant) -> bool {
+        self.at.is_none_or(|at| now >= at)
+    }
+    /// Tried again after `delay`, whatever failed before (another copy busy).
+    fn after(&mut self, now: web_time::Instant, delay: std::time::Duration) {
+        self.at = Some(now + delay);
+    }
+    /// One more failure in a row: tried again after `first`, doubling each time up to `most`.
+    fn failed(&mut self, now: web_time::Instant, first: std::time::Duration, most: std::time::Duration) {
+        self.failures = self.failures.saturating_add(1);
+        self.at = Some(now + first.saturating_mul(1 << self.failures.saturating_sub(1).min(16)).min(most));
+    }
+    fn done(&mut self) {
+        *self = Retry::default();
+    }
+    /// How long until it is due, if it waits.
+    fn wait(&self, now: web_time::Instant) -> Option<std::time::Duration> {
+        self.at.map(|at| at.saturating_duration_since(now))
+    }
 }
 
 /// How soon a save is tried again while another copy of the app saves its preferences.
 const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
 /// How long another copy may keep them busy before that is said.
 const BUSY_SAY: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// How long after `failures` failed saves in a row the next is tried: one second, doubling up
-/// to a minute.
-fn backoff(failures: u32) -> std::time::Duration {
-    std::time::Duration::from_secs(1u64 << failures.saturating_sub(1).min(6)).min(std::time::Duration::from_secs(60))
-}
+/// A failed data sources save is tried again after a second, doubling up to a minute.
+const FAILED_RETRY: (std::time::Duration, std::time::Duration) = (std::time::Duration::from_secs(1), std::time::Duration::from_secs(60));
 
 /// The sources to show this frame: the last snapshot unless they changed since.
 fn snapshot(app: &mut RustGisApp) -> std::sync::Arc<rustgis_engine::sources::Sources> {
@@ -134,7 +162,7 @@ pub fn save(app: &mut RustGisApp) {
         }
         return;
     }
-    if app.ui.sources.retry_at.is_some_and(|at| web_time::Instant::now() < at) {
+    if !app.ui.sources.retry.due(web_time::Instant::now()) {
         return;
     }
     attempt(app);
@@ -142,27 +170,16 @@ pub fn save(app: &mut RustGisApp) {
 
 /// One try at saving the data sources through `update_pref`: what it came to.
 fn attempt(app: &mut RustGisApp) -> Option<crate::PrefUpdate> {
-    use rustgis_engine::sources::Sources;
-    enum Next {
-        /// What is stored is what this session last wrote: its lists are written as they are.
-        Own(String),
-        Rebased(Box<Sources>, String),
-    }
     let update = app.services.update_pref.as_ref()?;
     let now = web_time::Instant::now();
     let (mut next, mut unreadable) = (None, None);
     let (sources, last) = (&app.session.sources, app.ui.sources.last_written.as_deref());
     let outcome = update(PREF, &mut |stored| {
-        if stored.is_some() && stored == last {
-            let text = sources.to_json();
-            next = Some(Next::Own(text.clone()));
-            return Some(text);
-        }
         let mut rebased = sources.clone();
         match rebased.rebase(stored, last) {
             Ok(()) => {
                 let text = rebased.to_json();
-                next = Some(Next::Rebased(Box::new(rebased), text.clone()));
+                next = Some((rebased, text.clone()));
                 Some(text)
             }
             // Never written over: the changes wait until it can be read (or is removed).
@@ -174,26 +191,17 @@ fn attempt(app: &mut RustGisApp) -> Option<crate::PrefUpdate> {
     });
     let state = &mut app.ui.sources;
     match (outcome, next) {
-        (crate::PrefUpdate::Saved, Some(next)) => {
-            (state.retry_at, state.failures, state.busy_since, state.refusal_said) = (None, 0, None, false);
+        (crate::PrefUpdate::Saved, Some((sources, text))) => {
+            state.retry.done();
+            (state.busy_since, state.refusal_said, state.last_written) = (None, false, Some(text));
             state.said.retain(|(kind, _)| *kind != "busy");
-            let text = match next {
-                Next::Own(text) => {
-                    app.session.sources.stored();
-                    text
-                }
-                Next::Rebased(sources, text) => {
-                    app.session.sources = *sources;
-                    text
-                }
-            };
-            app.ui.sources.last_written = Some(text);
+            app.session.sources = sources;
             app.ui.sources_saved = app.session.sources.generation;
             say_unread(app);
         }
         (crate::PrefUpdate::Busy, _) => {
             let since = *state.busy_since.get_or_insert(now);
-            state.retry_at = Some(now + BUSY_RETRY);
+            state.retry.after(now, BUSY_RETRY);
             if now.duration_since(since) >= BUSY_SAY {
                 let said =
                     crate::tl!("The data sources aren't saved yet: another copy of RustGIS keeps its preferences busy. Trying again.");
@@ -202,8 +210,7 @@ fn attempt(app: &mut RustGisApp) -> Option<crate::PrefUpdate> {
         }
         _ => {
             state.busy_since = None;
-            state.failures = state.failures.saturating_add(1);
-            state.retry_at = Some(now + backoff(state.failures));
+            state.retry.failed(now, FAILED_RETRY.0, FAILED_RETRY.1);
             // Said when a save refuses, though the same was said when the sources were read.
             if let Some(why) = unreadable
                 && !state.refusal_said
@@ -218,8 +225,9 @@ fn attempt(app: &mut RustGisApp) -> Option<crate::PrefUpdate> {
 
 /// As the app closes: data sources left to save are tried once more whatever the retry delay,
 /// trying again for up to `wait` while another copy of the app keeps the preferences busy
-/// (closing isn't the path that must answer at once). What still can't be saved is said and
-/// logged.
+/// (closing isn't the path that must answer at once). What still can't be saved is logged and
+/// said in this session's messages; with the window closing, only the log keeps it for later
+/// (the next start doesn't say it).
 pub fn save_at_exit(app: &mut RustGisApp, wait: std::time::Duration) {
     if !app.ui.sources.loaded || app.session.sources.generation == app.ui.sources_saved || app.services.update_pref.is_none() {
         return;
@@ -234,9 +242,11 @@ pub fn save_at_exit(app: &mut RustGisApp, wait: std::time::Duration) {
         if !busy || start.elapsed() >= wait {
             let why = if busy { "another copy of RustGIS kept its preferences busy" } else { "they couldn't be written" };
             log::warn!("the data sources changed in this session weren't saved: {why}");
+            let said =
+                if busy { crate::tl!("another copy of RustGIS kept its preferences busy") } else { crate::tl!("they couldn't be written") };
             app.session.warn(crate::i18n::fmt(
                 "The data sources changed in this session weren't saved as RustGIS closed: {why}.",
-                &[("why", why)],
+                &[("why", said)],
             ));
             return;
         }
@@ -251,8 +261,27 @@ pub fn retry_in(app: &RustGisApp) -> Option<std::time::Duration> {
     if app.session.sources.generation == app.ui.sources_saved {
         return None;
     }
-    let at = app.ui.sources.retry_at?;
-    Some(at.saturating_duration_since(web_time::Instant::now()))
+    app.ui.sources.retry.wait(web_time::Instant::now())
+}
+
+/// Saves again the app's other preferences left to save while another copy saved its own
+/// (`Services::retry_prefs`), when due: tried at once, then after a quarter second, doubling up
+/// to five seconds while they stay left, so a long-held lock doesn't cost every frame. How soon
+/// it is tried again, if anything is left.
+pub fn retry_prefs(app: &mut RustGisApp) -> Option<std::time::Duration> {
+    let retry = app.services.retry_prefs.as_ref()?;
+    let now = web_time::Instant::now();
+    let state = &mut app.ui.sources.prefs_retry;
+    if !state.due(now) {
+        return state.wait(now);
+    }
+    if retry() {
+        state.failed(now, std::time::Duration::from_millis(250), std::time::Duration::from_secs(5));
+        state.wait(now)
+    } else {
+        state.done();
+        None
+    }
 }
 
 /// Loads connections before commands can run, importing legacy saved endpoints only once.

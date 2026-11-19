@@ -119,18 +119,8 @@ fn lease_file(path: &Path, create: bool) -> io::Result<Flock> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
         return Err(io::Error::other("cache lease is not a regular file"));
     }
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(create).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
-    }
-    let file = options.open(path)?;
+    let file = crate::io::open_lock_file(path, create, 0o600)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(io::Error::other("cache lease is not a regular file"));
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

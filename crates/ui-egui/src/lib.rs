@@ -6434,10 +6434,8 @@ impl RustGisApp {
         if let Some(retry) = sourcespane::retry_in(self) {
             ctx.request_repaint_after(retry);
         }
-        if let Some(retry) = &self.services.retry_prefs
-            && retry()
-        {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        if let Some(retry) = sourcespane::retry_prefs(self) {
+            ctx.request_repaint_after(retry);
         }
         sourcespane::save_connections(self);
         self.save_raster_defaults();

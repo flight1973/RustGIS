@@ -59,16 +59,18 @@ pub fn write(key: &str, value: &str) -> Result<Updated, String> {
     write_in(&dir.join(FILE), key, value)
 }
 
-/// [`write`] of the file at `path` (a test folder in tests).
+/// [`write`] of the file at `path` (a test folder in tests). The write and what is left to save
+/// change together under [`WRITE_LOCK`], so a value left to save is never older than one written
+/// since.
 fn write_in(path: &Path, key: &str, value: &str) -> Result<Updated, String> {
-    let done = {
-        let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        update_file(path, key, |_| Some(value.to_string()))
-    };
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let done = update_file(path, key, |_| Some(value.to_string()));
     let mut pending = PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let id = (path.to_path_buf(), key.to_string());
     match done {
-        Ok(Updated::Busy) => {
+        // Left to save: the lock was busy, or what is stored is a newer RustGIS's (refused, and
+        // tried again in case it changes).
+        Ok(Updated::Busy | Updated::Newer) => {
             pending.insert(id, value.to_string());
         }
         _ => {
@@ -78,9 +80,19 @@ fn write_in(path: &Path, key: &str, value: &str) -> Result<Updated, String> {
     done
 }
 
-/// Values [`write`] couldn't save while another copy held the lock, by file and key: the latest
-/// of each.
+/// Values [`write`] couldn't save yet, by file and key: the latest of each.
 static PENDING: Mutex<std::collections::BTreeMap<(PathBuf, String), String>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The value of `key` left to save, if [`write`] left one: newer than what the file holds, so a
+/// read of the setting gives it.
+pub fn pending(key: &str) -> Option<String> {
+    let dir = rustgis_data::dirs::config_dir()?;
+    pending_in(&dir.join(FILE), key)
+}
+
+fn pending_in(path: &Path, key: &str) -> Option<String> {
+    PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(&(path.to_path_buf(), key.to_string())).cloned()
+}
 
 /// Writes again what [`write`] left to save. `wait` bounds how long it waits for another copy
 /// to let go of the lock: zero on the UI thread (it never waits there), a second or two at exit.
@@ -101,24 +113,27 @@ fn retry_pending_in(only: Option<&Path>, wait: std::time::Duration) -> (Vec<Resu
     let start = std::time::Instant::now();
     loop {
         let mut busy = false;
-        for ((path, key), value) in todo() {
-            let done = {
-                let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                update_file(&path, &key, |_| Some(value.clone()))
-            };
-            if done == Ok(Updated::Busy) {
-                busy = true;
-                break;
+        {
+            // What is left is read and written under the same lock a write takes, so a value
+            // written meanwhile is never put back with an older one.
+            let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for ((path, key), value) in todo() {
+                let done = update_file(&path, &key, |_| Some(value.clone()));
+                match done {
+                    Ok(Updated::Busy) => {
+                        busy = true;
+                        break;
+                    }
+                    Ok(Updated::Newer) => said.push(Err(newer_notice(&key))),
+                    done => {
+                        PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&(path, key));
+                        said.push(done.map(|d| match d {
+                            Updated::Saved(set_aside) => set_aside,
+                            _ => None,
+                        }));
+                    }
+                }
             }
-            let mut pending = PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            // A newer value written meanwhile stays to save.
-            if pending.get(&(path.clone(), key.clone())) == Some(&value) {
-                pending.remove(&(path, key));
-            }
-            said.push(done.map(|d| match d {
-                Updated::Saved(set_aside) => set_aside,
-                Updated::Unchanged | Updated::Busy => None,
-            }));
         }
         #[cfg(not(target_arch = "wasm32"))]
         if busy && start.elapsed() < wait {
@@ -141,6 +156,18 @@ pub enum Updated {
     /// Another copy of RustGIS is saving its preferences: nothing was read or written. Try again
     /// later; this never waits for it.
     Busy,
+    /// What is stored under the key isn't text: a newer RustGIS's setting this version can't
+    /// read. Never written over (as AGENTS.md's rule for newer settings asks); [`newer_notice`]
+    /// says so.
+    Newer,
+}
+
+/// Says that `key` was saved by a newer RustGIS in a form this version can't read, so a change
+/// to it here isn't saved.
+pub fn newer_notice(key: &str) -> String {
+    format!(
+        "the setting \"{key}\" was saved by a newer RustGIS in a form this version can't read: it is kept as it is, and this change isn't saved"
+    )
 }
 
 /// Updates one desktop preference from its stored value: `value` is given what is stored now
@@ -205,7 +232,7 @@ fn lock(path: &Path) -> Result<Locked, String> {
     // Never through a link (the open itself refuses one on Unix), only a regular file, its
     // owner's alone.
     let file = std::fs::create_dir_all(dir)
-        .and_then(|_| rustgis_data::io::open_lock_file(&lock_path))
+        .and_then(|_| rustgis_data::io::open_lock_file(&lock_path, true, 0o600))
         .map_err(|error| format!("could not save preferences: couldn't open {}: {error}", lock_path.display()))?;
     match file.try_lock() {
         Ok(()) => Ok(Locked::Held(Lock(file))),
@@ -247,6 +274,7 @@ fn write_at_with_bytes(
     match write_with(path, key, |_| Some(value.to_string()), bytes, sync)? {
         Updated::Saved(set_aside) => Ok(set_aside),
         Updated::Unchanged | Updated::Busy => Ok(None),
+        Updated::Newer => Err(newer_notice(key)),
     }
 }
 
@@ -267,7 +295,13 @@ fn write_with(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Map::new(), None),
         Err(error) => return Err(format!("could not read preferences: {error}")),
     };
-    let Some(value) = value(map.get(key).and_then(Value::as_str)) else { return Ok(Updated::Unchanged) };
+    // A newer RustGIS's setting this version can't read (not text) is never written over.
+    let stored = match map.get(key) {
+        Some(Value::String(text)) => Some(text.as_str()),
+        Some(_) => return Ok(Updated::Newer),
+        None => None,
+    };
+    let Some(value) = value(stored) else { return Ok(Updated::Unchanged) };
     let set_aside = match malformed {
         Some(bytes) => Some(set_aside(path, &bytes)?),
         None => None,
@@ -542,6 +576,44 @@ mod tests {
         other.join().unwrap();
         assert_eq!((said.len(), left), (1, false), "{said:?}");
         assert_eq!(read_at(&path).unwrap().get("theme").and_then(Value::as_str), Some("exit"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A value left to save is what the setting reads as until it is written, never written
+    /// over a newer one saved since; and a setting a newer RustGIS stored as something other than
+    /// text is never written over, the change kept to save and said.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pending_values_stay_newest_and_newer_settings_are_kept() {
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-pending-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        let held = lock(&path).unwrap();
+        assert_eq!(write_in(&path, "theme", "old").unwrap(), Updated::Busy);
+        assert_eq!(pending_in(&path, "theme").as_deref(), Some("old"), "read as the setting until written");
+        drop(held);
+        // A newer value saved meanwhile: the old one is no longer left, so a retry never puts it back.
+        assert_eq!(write_in(&path, "theme", "new").unwrap(), Updated::Saved(None));
+        assert_eq!(pending_in(&path, "theme"), None);
+        let (said, left) = retry_pending_in(Some(&path), std::time::Duration::ZERO);
+        assert!(said.is_empty() && !left, "{said:?}");
+        assert_eq!(read_at(&path).unwrap().get("theme").and_then(Value::as_str), Some("new"));
+
+        // A newer RustGIS stored data_sources as an object: never written over.
+        let newer = r#"{"data_sources":{"version":2,"lists":[]},"theme":"new"}"#;
+        std::fs::write(&path, newer).unwrap();
+        assert_eq!(update_file(&path, "data_sources", |_| Some("{}".into())).unwrap(), Updated::Newer);
+        assert_eq!(write_in(&path, "data_sources", "{}").unwrap(), Updated::Newer);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        assert_eq!(pending_in(&path, "data_sources").as_deref(), Some("{}"), "kept to save");
+        let (said, left) = retry_pending_in(Some(&path), std::time::Duration::ZERO);
+        assert!(left && matches!(said.as_slice(), [Err(e)] if e.contains("newer RustGIS")), "{said:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        // Other settings are still written beside it.
+        assert_eq!(write_in(&path, "theme", "dark").unwrap(), Updated::Saved(None));
+        assert_eq!(read_at(&path).unwrap().get("data_sources"), Some(&serde_json::json!({"version": 2, "lists": []})));
+        PENDING.lock().unwrap().retain(|(p, _), _| p != &path);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

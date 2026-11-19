@@ -98,35 +98,11 @@ fn source_lock(path: &Path) -> Result<SourceLock> {
     if std::fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.file_type().is_file()) {
         return Err(refused(path, format!("{} isn't a regular lock file", lock_path.display())));
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
-    }
-    let opened = match options.open(&lock_path) {
-        Ok(file) => {
-            // The empty sidecar contains no source data. Accounts sharing the directory need
-            // read/write access regardless of source groups, ACLs or a private umask: NFS
-            // exclusive locks require a writable handle. Set modes through the open handle.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(std::fs::Permissions::from_mode(0o666))?;
-            }
-            Ok(file)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            options.create_new(false);
-            options.open(&lock_path)
-        }
-        Err(e) => Err(e),
-    };
-    let file = opened.map_err(|e| refused(path, format!("couldn't open {}: {e}", lock_path.display())))?;
-    if !file.metadata()?.is_file() {
-        return Err(refused(path, "its lock isn't a regular file"));
-    }
+    // The empty sidecar contains no source data. Accounts sharing the directory need read/write
+    // access regardless of source groups, ACLs or a private umask: NFS exclusive locks require a
+    // writable handle, so a new one is made 0o666.
+    let file = crate::io::open_lock_file(&lock_path, true, 0o666)
+        .map_err(|e| refused(path, format!("couldn't open {}: {e}", lock_path.display())))?;
     file.try_lock().map_err(|e| match e {
         std::fs::TryLockError::WouldBlock => refused(path, "another RustGIS publisher holds this source; try again after it finishes"),
         std::fs::TryLockError::Error(e) => refused(path, format!("couldn't lock {}: {e}", lock_path.display())),
