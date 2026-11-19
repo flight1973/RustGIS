@@ -1040,6 +1040,11 @@ pub enum ElementKind {
         /// box stays the unturned one. Left out when 0, so layouts saved before keep their bytes.
         #[serde(default, skip_serializing_if = "is_zero")]
         rotation: f64,
+        /// Broken into lines at spaces to fit the width of its (unturned) box when drawn, after
+        /// its dynamic text is filled in (#2346); off, its lines break only where the text has a
+        /// line break. Left out when off, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "is_false")]
+        wrap: bool,
     },
     Picture {
         /// Base64 PNG or JPEG.
@@ -1128,6 +1133,7 @@ impl ElementKind {
             font: FontFamily::Sans,
             font_name: None,
             rotation: 0.0,
+            wrap: false,
         }
     }
 
@@ -1369,6 +1375,15 @@ pub struct MapSeries {
     pub page: usize,
 }
 
+/// A series row's name, or its one-based row number when the field is missing, null or blank.
+pub fn series_page_name(layer: &Layer, fi: Option<usize>, row: usize) -> String {
+    fi.map(|i| layer.dataset.value(row, i))
+        .filter(|v| !v.is_null())
+        .map(ToString::to_string)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| (row + 1).to_string())
+}
+
 fn margin() -> f64 {
     0.1
 }
@@ -1413,6 +1428,14 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Resolves a series' index layer from its frame and the optional page-name column.
+    pub fn series_index<'a>(&self, maps: &'a [Map]) -> Option<(&'a Layer, Option<usize>)> {
+        let series = self.series.as_ref()?;
+        let ElementKind::MapFrame { map, .. } = &self.element(series.frame)?.kind else { return None };
+        let layer = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?.layer_by_name(&series.layer)?;
+        Some((layer, layer.dataset.field_index(&series.name_field)))
+    }
+
     pub fn new(name: impl Into<String>, width: f64, height: f64) -> Self {
         Layout {
             name: name.into(),

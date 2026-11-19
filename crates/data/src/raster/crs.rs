@@ -1,20 +1,148 @@
 //! Coordinate reference systems for rasters, by EPSG code or by definition.
 //!
-//! WGS 84 longitude/latitude and Web Mercator are handled directly; any other EPSG code is
-//! looked up in a built-in table of PROJ definitions ([`epsg_proj4`]) and transformed with a
-//! pure-Rust PROJ port, so the browser build works too. A file's own (user-defined) projection,
+//! WGS 84 longitude/latitude and Web Mercator are handled directly; any other EPSG or ESRI code is
+//! looked up in terrio-crs's catalog ([`epsg_proj4`], [`esri_proj4`]) and transformed by
+//! terrio-crs, a pure-Rust PROJ port, so the browser build works too. A file's own (user-defined) projection,
 //! such as the Albers of the NLCD land cover, is a [`Crs::Custom`]: its PROJ definition, kept in a
 //! table for the run.
 
 use rustgis_geom::{Coord, lonlat_to_merc, merc_to_lonlat};
 use serde::{Deserialize, Serialize};
 
-/// The PROJ definition of an EPSG code: from the `crs-definitions` table, or from the built-in
-/// table of the codes it lacks (EPSG 9020–20003 and newer ones such as Equi7's,
-/// [`super::epsg_gap`]). `None` for a code that is neither. terrio-crs computes the code from it
+/// The PROJ definition of an EPSG code, as GDAL 3.13.3 writes it (`OSRExportToProj4`, with its
+/// `+towgs84`) from terrio-crs's EPSG catalog (PROJ 9.9.0, EPSG v13.102), or of a code the catalog
+/// can't compute that RustGIS read before ([`UNCOMPUTED_EPSG`]). `None` for a code neither has, or
+/// one of heights alone. terrio-crs transforms a catalog code from the catalog itself
 /// ([`Crs::transformer`]).
 pub fn epsg_proj4(code: u16) -> Option<&'static str> {
-    crs_definitions::from_code(code).map(|d| d.proj4).or_else(|| super::epsg_gap::proj4(code))
+    catalog_proj4(code).or_else(|| UNCOMPUTED_EPSG.iter().find(|&&(c, _)| c == code).map(|&(_, def)| def))
+}
+
+/// EPSG codes RustGIS read before (by PostGIS's `spatial_ref_sys` definitions) whose method PROJ
+/// 9.9.0 can't write as a PROJ string, and terrio-crs's catalog doesn't compute: data written with
+/// them still opens where it did.
+const UNCOMPUTED_EPSG: &[(u16, &str)] = &[
+    // WGS 84 / Mercator 41: a Mercator whose latitude of origin isn't the equator.
+    (3752, "+proj=merc +lon_0=100 +lat_ts=-41 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"),
+    // Deir ez Zor / Levant Zone: Lambert Conic Near-Conformal, written as the conformal conic.
+    (
+        22700,
+        "+proj=lcc +lat_1=34.65 +lat_0=34.65 +lon_0=37.35 +k_0=0.9996256 +x_0=300000 +y_0=300000 +a=6378249.2 +b=6356515 +towgs84=-190.421,8.532,238.69,0,0,0,0 +units=m +no_defs",
+    ),
+];
+
+/// The PROJ definition of an EPSG code of terrio-crs's catalog, kept for the run (once a code:
+/// there are at most as many as the catalog has codes).
+fn catalog_proj4(code: u16) -> Option<&'static str> {
+    static KEPT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u16, Option<&'static str>>>> = std::sync::OnceLock::new();
+    if epsg_catalog_codes().binary_search(&u32::from(code)).is_err() {
+        return None;
+    }
+    let kept = KEPT.get_or_init(Default::default);
+    if let Some(&def) = kept.lock().unwrap_or_else(|e| e.into_inner()).get(&code) {
+        return def;
+    }
+    // Worked out without the lock, so other threads' codes aren't held up by this one's first
+    // look-up; two threads asking for the same new code at once keep the first's.
+    let def = terrio_crs::SpatialRef::from_epsg(u32::from(code))
+        .ok()
+        .and_then(|sr| sr.to_proj4_gdal())
+        // A vertical system alone (`+vunits=m`, heights without a place) isn't a layer's or a
+        // raster's.
+        .filter(|def| def.starts_with("+proj="))
+        .map(|def| with_shift(def, Some(u32::from(code))));
+    *kept.lock().unwrap_or_else(|e| e.into_inner()).entry(code).or_insert_with(|| def.map(|d| &*Box::leak(d.into_boxed_str())))
+}
+
+/// `def` with the shift to WGS 84 PROJ 9.9.0 takes without grids for the EPSG geographic system
+/// `geog` (or a projected one on it), where `def` gives none. GDAL 3.13.3 writes no `+towgs84` for a
+/// datum with several transformations to WGS 84 (ED50, OSGB 1936, Pulkovo 1942, …), so a file's
+/// WKT with that shift wouldn't be the code's own.
+fn with_shift(def: String, geog: Option<u32>) -> String {
+    if ["+towgs84=", "+datum=", "+nadgrids="].iter().any(|k| def.contains(k)) {
+        return def;
+    }
+    let Some(shift) = geog.and_then(terrio_crs::helmert_to_wgs84) else { return def };
+    let towgs84 = format!("+towgs84={}", shift.iter().map(f64::to_string).collect::<Vec<_>>().join(","));
+    // Where GDAL writes it: after the ellipsoid, before the units.
+    match def.find(" +units=").or_else(|| def.find(" +no_defs")) {
+        Some(at) => {
+            def.get(..at).zip(def.get(at..)).map_or_else(|| format!("{def} {towgs84}"), |(head, tail)| format!("{head} {towgs84}{tail}"))
+        }
+        None => format!("{def} {towgs84}"),
+    }
+}
+
+/// The EPSG codes of terrio-crs's catalog, deprecated ones included (data written with them holds
+/// their coordinates), sorted.
+fn epsg_catalog_codes() -> &'static [u32] {
+    static CODES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    CODES.get_or_init(|| {
+        let query = terrio_crs::CrsQuery { authorities: vec!["EPSG".into()], include_deprecated: true, ..Default::default() };
+        let mut codes: Vec<u32> = terrio_crs::list_crs(&query).into_iter().map(|e| e.code).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        codes
+    })
+}
+
+/// Whether the EPSG system `code` is written north (or latitude) first, as EPSG defines its axes:
+/// WMS 1.3.0 (§6.7.3.3) and WMTS 1.0.0 write a bounding box and a tile matrix's `TopLeftCorner` in
+/// that order, where RustGIS's coordinates are east first. `Some(true)` for a system whose first
+/// axis is a northing or a latitude (EPSG:3035, 31467, 4326), `Some(false)` for another RustGIS
+/// knows, and `None` for one whose order isn't known: a code RustGIS doesn't know, or a first axis
+/// pointing south or west that RustGIS doesn't turn so (`+axis=`), whose coordinates swapping
+/// can't put in its order. A system whose `+axis=` RustGIS applies (Krovak, EPSG:5513 and 8352;
+/// the southern African Lo grids) has its coordinates in its own order already, as are polar
+/// stereographic systems' easting and northing pointing along meridians (EPSG:3413).
+pub(crate) fn epsg_north_first(code: u16) -> Option<bool> {
+    // Asked once per bounding box of a service's layers: kept for the run, at most once per code.
+    static KEPT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u16, Option<bool>>>> = std::sync::OnceLock::new();
+    let kept = KEPT.get_or_init(Default::default);
+    if let Some(n) = kept.lock().unwrap_or_else(|e| e.into_inner()).get(&code) {
+        return *n;
+    }
+    let n = north_first_of(code);
+    kept.lock().unwrap_or_else(|e| e.into_inner()).insert(code, n);
+    n
+}
+
+/// [`epsg_north_first`], worked out.
+fn north_first_of(code: u16) -> Option<bool> {
+    let Ok(sr) = terrio_crs::SpatialRef::from_epsg(u32::from(code)) else {
+        // A code the catalog doesn't compute, which RustGIS still reads (EPSG:3752, 22700): east
+        // first, as EPSG defines both.
+        return epsg_proj4(code).map(|_| false);
+    };
+    if sr.to_proj4().is_some_and(|d| d.split_whitespace().any(|t| t.starts_with("+axis="))) {
+        return Some(false);
+    }
+    match sr.axis_order() {
+        terrio_crs::AxisOrder::NorthEast => Some(true),
+        terrio_crs::AxisOrder::EastNorth => Some(false),
+        terrio_crs::AxisOrder::Other => {
+            // The root's first axis: the second-to-last `AXIS[` (the root's two close the WKT),
+            // by its name (a polar system's `"Easting",SOUTH`), else its direction (`"Y",NORTH`).
+            // Southing or westing first can't be given by swapping.
+            let wkt = sr.to_wkt()?;
+            let axes: Vec<&str> = wkt.match_indices("AXIS[").filter_map(|(i, _)| wkt.get(i + 5..)?.split(']').next()).collect();
+            let first = axes.len().checked_sub(2).and_then(|i| axes.get(i))?.to_ascii_uppercase();
+            let name = first.split(',').next().unwrap_or_default().trim().trim_matches('"').trim().to_string();
+            let direction = first.split(',').nth(1).unwrap_or_default().trim().to_string();
+            if name.starts_with("NORTH") || name.contains("LAT") {
+                Some(true)
+            } else if name.starts_with("EAST") || name.contains("LON") {
+                Some(false)
+            } else if direction.starts_with("NORTH") {
+                Some(true)
+            } else if direction.starts_with("EAST") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Why a file's EPSG code can't be used.
@@ -22,15 +150,106 @@ pub fn unusable_epsg(code: u32) -> String {
     format!("the coordinate system EPSG:{code} isn't supported")
 }
 
+/// Whether a bare number (`102033`) is read as ESRI's code: it isn't one RustGIS reads as EPSG's
+/// (`2056`, and Web Mercator's `102100`), and ESRI has it. [`Crs::parse`], the coordinate system
+/// boxes and their lists all read a bare number by this.
+pub fn bare_number_is_esri(code: u32) -> bool {
+    Crs::from_epsg(code).is_none() && esri_proj4(code).is_some()
+}
+
 /// The PROJ definition of one of Esri's projected coordinate systems (`ESRI:102033`, South
-/// America Albers), from the built-in table ([`super::esri`]). `None` for a code it lacks.
+/// America Albers), as GDAL 3.13.3 writes it from terrio-crs's catalog of them (PROJ 9.9.0's ESRI
+/// authority), else of one the catalog lacks that RustGIS read before ([`UNCOMPUTED_ESRI`]).
+/// `None` for a code neither has.
 pub fn esri_proj4(code: u32) -> Option<&'static str> {
-    super::esri::proj4(code)
+    catalog_esri(code).map(|(def, _)| def).or_else(|| UNCOMPUTED_ESRI.iter().find(|&&(c, _)| c == code).map(|&(_, def)| def))
+}
+
+/// ESRI codes RustGIS read before that terrio-crs's catalog lacks: data written with them still
+/// opens where it did.
+const UNCOMPUTED_ESRI: &[(u32, &str)] = &[
+    // WGS_1984_Agriculture_Canada_Albers and WGS_1984_SIRES_TMQ, which PROJ 9.9.0 no longer has,
+    // as PROJ 9.7.1 wrote them.
+    (10820, "+proj=aea +lat_0=40 +lon_0=-96 +lat_1=44.75 +lat_2=55.75 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"),
+    (65162, "+proj=tmerc +lat_0=0 +lon_0=-78.5 +k=1.0004584 +x_0=500000 +y_0=10000000 +datum=WGS84 +units=m +no_defs"),
+];
+
+/// An ESRI projected coordinate system of terrio-crs's catalog, kept for the run (at most once a
+/// code): its PROJ definition and the WKT GDAL writes for it, which terrio-crs transforms with as
+/// PROJ 9.9.0 does. `None` for a code the catalog lacks, isn't projected or isn't computed.
+fn catalog_esri(code: u32) -> Option<(&'static str, &'static str)> {
+    type Kept = std::collections::HashMap<u32, Option<(&'static str, &'static str)>>;
+    static KEPT: std::sync::OnceLock<std::sync::Mutex<Kept>> = std::sync::OnceLock::new();
+    if esri_catalog_codes().binary_search(&code).is_err() {
+        return None;
+    }
+    let kept = KEPT.get_or_init(Default::default);
+    if let Some(&def) = kept.lock().unwrap_or_else(|e| e.into_inner()).get(&code) {
+        return def;
+    }
+    // Worked out without the lock, as [`catalog_proj4`] does.
+    let def = terrio_crs::SpatialRef::from_esri(code)
+        .ok()
+        .and_then(|sr| Some((with_shift(sr.to_proj4_gdal()?, sr.geographic_code()), sr.to_wkt()?)));
+    *kept
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(code)
+        .or_insert_with(|| def.map(|(d, w)| (&*Box::leak(d.into_boxed_str()), &*Box::leak(w.into_boxed_str()))))
+}
+
+/// The projected ESRI codes of terrio-crs's catalog that it computes, deprecated ones included
+/// (ArcGIS still writes many of them), sorted.
+fn esri_catalog_codes() -> &'static [u32] {
+    static CODES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    CODES.get_or_init(|| {
+        let query = terrio_crs::CrsQuery {
+            authorities: vec!["ESRI".into()],
+            kinds: vec![terrio_crs::CrsKind::Projected],
+            include_deprecated: true,
+            ..Default::default()
+        };
+        let mut codes: Vec<u32> = terrio_crs::list_crs(&query).into_iter().map(|e| e.code).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        codes
+    })
 }
 
 /// Every ESRI code [`esri_proj4`] knows, in order.
 pub fn esri_codes() -> impl Iterator<Item = u32> {
-    super::esri::DEFS.iter().map(|&(c, _)| c)
+    let mut codes: Vec<u32> = UNCOMPUTED_ESRI
+        .iter()
+        .map(|&(c, _)| c)
+        .chain(esri_catalog_codes().iter().copied().filter(|&c| catalog_esri(c).is_some()))
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    codes.into_iter()
+}
+
+/// The WKT terrio-crs's catalog gives the ESRI projected system `code`, which places its points as
+/// PROJ 9.9.0 does. `None` for a code the catalog doesn't compute.
+pub fn esri_wkt(code: u32) -> Option<&'static str> {
+    catalog_esri(code).map(|(_, wkt)| wkt)
+}
+
+/// One of Esri's projected coordinate systems by its code (`ESRI:102033`): transformed by the WKT
+/// terrio-crs's catalog gives it, with the datum transformation PROJ 9.9.0 picks, where the
+/// catalog has it; else (or where its WKT can't be transformed) by its PROJ definition. `None`
+/// for a code [`esri_proj4`] lacks.
+pub fn esri_crs(code: u32) -> Option<Crs> {
+    let proj4 = esri_proj4(code)?;
+    let custom = |wkt: Option<&str>| {
+        Crs::custom(CustomCrs {
+            proj4: proj4.to_string(),
+            label: format!("ESRI:{code}"),
+            wkt: wkt.map(str::to_string),
+            ..CustomCrs::default()
+        })
+        .ok()
+    };
+    catalog_esri(code).and_then(|(_, wkt)| custom(Some(wkt))).or_else(|| custom(None))
 }
 
 /// A raster's coordinate system. Saved as its EPSG code, or a custom one as its definition.
@@ -288,8 +507,9 @@ impl Crs {
         }
     }
 
-    /// A coordinate system given as text: `EPSG:2263`, `2263`, an OGC URN or URL ending in the
-    /// code, WKT, a PROJ string (`+proj=…`, naming no grid or definition files), or an explicit
+    /// A coordinate system given as text: `EPSG:2263`, `2263` (a number EPSG lacks and ESRI has,
+    /// such as `102033`, is ESRI's: [`bare_number_is_esri`]), `ESRI:102033`, an OGC URN or URL
+    /// ending in the code, WKT, a PROJ string (`+proj=…`, naming no grid or definition files), or an explicit
     /// VN-2000 system: `VN-2000 / UTM zone 48N` (EPSG:3405), `… 49N` (EPSG:3406) or
     /// `VN-2000 / TM-3` (EPSG:5897, central meridian 105°). A bare `VN-2000` is ambiguous.
     pub fn parse(text: &str) -> Result<Crs, String> {
@@ -326,9 +546,22 @@ impl Crs {
             return vn2000_epsg(t).and_then(|c| Crs::from_epsg(c.into())).ok_or_else(|| format!("unknown coordinate system '{t}'"));
         }
         let code = t.rsplit([':', '/']).next().unwrap_or(t).trim();
+        // `ESRI:102033`, as the coordinate system boxes offer it and a `.prj` names it.
+        if let Some(rest) = up.strip_prefix("ESRI")
+            && let Some(n) = rest.trim_start().strip_prefix(':').map(str::trim)
+        {
+            let c = Some(n)
+                .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|n| n.parse::<u32>().ok())
+                .ok_or_else(|| format!("'{t}': an ESRI code is a number, such as ESRI:102033"))?;
+            return esri_crs(c).ok_or_else(|| format!("unknown coordinate system ESRI:{c}"));
+        }
         let known = t.chars().all(|c| c.is_ascii_digit()) || up.contains("EPSG");
         match code.parse::<u32>() {
-            Ok(c) if known => Crs::from_epsg(c).ok_or_else(|| format!("unknown coordinate system EPSG:{c}")),
+            // A bare number EPSG lacks and ESRI lists (`102033`) is ESRI's, as the boxes find it.
+            Ok(c) if known => Crs::from_epsg(c)
+                .or_else(|| (t.bytes().all(|b| b.is_ascii_digit()) && bare_number_is_esri(c)).then(|| esri_crs(c)).flatten())
+                .ok_or_else(|| format!("unknown coordinate system EPSG:{c}")),
             _ => Err(format!("'{t}': give a coordinate system as EPSG:<code>, WKT, or +proj string")),
         }
     }
@@ -506,6 +739,7 @@ impl Crs {
             // bundled PROJ definition.
             Crs::Epsg(c) => match epsg_proj4(c) {
                 Some(def) => {
+                    wait_for_grids(self);
                     note_used(def, || format!("EPSG:{c}"));
                     let t = match epsg_transformer(c) {
                         Some(t) => t,
@@ -518,6 +752,7 @@ impl Crs {
             },
             _ => {
                 let def = self.custom_def().ok_or("an unknown custom coordinate system")?;
+                wait_for_grids(self);
                 note_used(&def.grid_key(), || def.label.clone());
                 def.transformer().map_err(|e| format!("{}: {e}", def.label))
             }
@@ -567,7 +802,7 @@ impl CustomCrs {
 }
 
 /// Whether PROJ definition `proj4` places points as `wkt` does ([`CustomCrs::wkt_needed`]).
-fn places_as_wkt(proj4: &str, wkt: &str) -> bool {
+pub(crate) fn places_as_wkt(proj4: &str, wkt: &str) -> bool {
     if proj4.is_empty() {
         return false;
     }
@@ -607,10 +842,8 @@ pub fn transformer_of_wkt(wkt: &str) -> Result<Transformer, String> {
         return t.clone();
     }
     let flushing = FLUSHING.try_with(|l| l.replace(Some(key.clone()))).ok().flatten();
-    let t = build_wkt(wkt);
-    let mut map = built().lock().unwrap_or_else(|e| e.into_inner());
-    let t = if map.len() < MAX_BUILT || map.contains_key(&key) { map.entry(key).or_insert(t).clone() } else { t };
-    drop(map);
+    let generation = grid_generation();
+    let t = keep_built(key, build_wkt(wkt), generation);
     let _ = FLUSHING.try_with(|l| l.replace(flushing));
     t
 }
@@ -621,7 +854,7 @@ fn build_wkt(wkt: &str) -> Result<Transformer, String> {
 }
 
 /// The transformer of an EPSG code, from terrio-crs's EPSG catalog, which transforms the code's
-/// system as PROJ 9.8.1 does (its datum transformation included); `None` for a code terrio-crs
+/// system as PROJ 9.9.0 does (its datum transformation included); `None` for a code terrio-crs
 /// doesn't hold or can't build, which is transformed by its bundled PROJ definition instead.
 fn epsg_transformer(code: u16) -> Option<Transformer> {
     let key = format!("EPSG {code}");
@@ -629,8 +862,15 @@ fn epsg_transformer(code: u16) -> Option<Transformer> {
         return t.clone().ok();
     }
     let flushing = FLUSHING.try_with(|l| l.replace(Some(key.clone()))).ok().flatten();
+    let generation = grid_generation();
     // A code the catalog gives another's definition goes by its bundled one ([`catalog_has_own`]).
-    let t = if catalog_has_own(code) {
+    // A compound code (a horizontal system and heights, EPSG:5832 DB_REF / 3-degree Gauss-Krüger
+    // zone 3 + DHHN2016) is the catalog's too: its horizontal part, with its datum transformation
+    // as PROJ 9.9.0 picks it, where its bundled definition named no shift (175 m off there).
+    // No WKT of its own in the catalog: a compound code (or one the catalog doesn't compute, which
+    // `from_epsg` refuses below as before).
+    let compound = terrio_crs::epsg_wkt(u32::from(code)).is_none();
+    let t = if catalog_has_own(code) || compound {
         if let Some(def) = epsg_proj4(code) {
             let mut codes = epsg_built().lock().unwrap_or_else(|e| e.into_inner());
             if codes.len() < MAX_BUILT && !codes.iter().any(|(c, _)| *c == code) {
@@ -641,16 +881,14 @@ fn epsg_transformer(code: u16) -> Option<Transformer> {
     } else {
         Err(format!("EPSG:{code} is given another code's definition"))
     };
-    let mut map = built().lock().unwrap_or_else(|e| e.into_inner());
-    let t = if map.len() < MAX_BUILT || map.contains_key(&key) { map.entry(key).or_insert(t).clone() } else { t };
-    drop(map);
+    let t = keep_built(key, t, generation);
     let _ = FLUSHING.try_with(|l| l.replace(flushing));
     t.ok()
 }
 
-/// Whether terrio-crs's EPSG catalog gives `code` its own definition. A deprecated code keeps its
-/// own, as PROJ 9.8.1 does, since data written with it holds its coordinates; terrio-crs gives its
-/// replacement's (GDAL's default), whose WKT names the replacement's code.
+/// Whether terrio-crs's EPSG catalog gives `code` its own definition, a WKT whose root names
+/// `code`. A deprecated code keeps its own, as PROJ 9.9.0 does, since data written with it holds
+/// its coordinates.
 pub(crate) fn catalog_has_own(code: u16) -> bool {
     terrio_crs::epsg_wkt(u32::from(code)).is_some_and(|w| root_epsg_code(w) == Some(u32::from(code)))
 }
@@ -712,6 +950,258 @@ fn built() -> &'static std::sync::Mutex<Built> {
 /// custom table is. One past it is built each time it is asked for.
 const MAX_BUILT: usize = 4 * MAX_CUSTOM;
 
+/// Transformer `t`, built for `key` while the grids were those of `generation`
+/// ([`grid_generation`]), kept in [`built`] and shared: the first one built is kept, as another
+/// thread may have built it meanwhile. One built before a grid arrived isn't kept, as it was
+/// made without it.
+fn keep_built(key: String, t: Result<Transformer, String>, generation: u64) -> Result<Transformer, String> {
+    let mut map = built().lock().unwrap_or_else(|e| e.into_inner());
+    let t = t.map(|t| t.keyed(&key, generation));
+    if grid_generation() != generation {
+        return t;
+    }
+    if map.len() < MAX_BUILT || map.contains_key(&key) { map.entry(key).or_insert(t).clone() } else { t }
+}
+
+/// How many times datum grids have become available this run ([`grids_changed`]). A transformer
+/// keeps the operation it chose when it was built, as PROJ's does, so whatever keeps one (a
+/// map's projection, a tile warp) builds it again when this changes.
+pub fn grid_generation() -> u64 {
+    GRID_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+static GRID_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The folders RustGIS reads datum grids from, in order ([`set_grid_folders`]): none until the app
+/// sets them, so a library caller or a test lands a place where it does on every computer.
+fn grid_folders() -> &'static std::sync::RwLock<Vec<std::path::PathBuf>> {
+    static FOLDERS: std::sync::RwLock<Vec<std::path::PathBuf>> = std::sync::RwLock::new(Vec::new());
+    &FOLDERS
+}
+
+/// The folder RustGIS keeps the datum grids it downloads in: the first of its grid folders
+/// ([`use_grid_folders`]). `None` before the app sets them, and in the browser, which registers
+/// the grids it fetches ([`register_grid`]).
+pub fn grid_dir() -> Option<std::path::PathBuf> {
+    if !KEEPS_FIRST.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    grid_folders().read().unwrap_or_else(|e| e.into_inner()).first().cloned()
+}
+
+/// Whether the first grid folder is RustGIS's own, where downloads are kept: not when there is no
+/// app data folder, so a download never lands in PROJ's.
+static KEEPS_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Reads datum grids from RustGIS's own folder (`datum-grids` in its app data), where it keeps the
+/// ones it downloads, then from those PROJ and terrio-crs use on this computer (`TERRIO_GRID_DIR`,
+/// `PROJ_DATA`, `PROJ_LIB`, PROJ's user folder, terrio's download cache), so grids installed for
+/// PROJ count. Called by the desktop app, the command line and Python as they start; nothing in
+/// the browser, which has no folders.
+pub fn use_grid_folders() {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let own = crate::dirs::app_data_dir().map(|d| d.join("datum-grids"));
+        let mut dirs: Vec<std::path::PathBuf> = own.iter().cloned().collect();
+        for d in terrio_crs::default_grid_search_paths() {
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+        set_folders(dirs, own.is_some());
+    }
+}
+
+/// Reads datum grids from `dirs`, in order, the first being where downloaded ones are kept
+/// ([`grid_dir`]), and builds transformers again with them. A grid named by a path in a definition
+/// (`+nadgrids=/data/a.gsb`) stays refused, so a file read can't make RustGIS read others.
+pub fn set_grid_folders(dirs: Vec<std::path::PathBuf>) {
+    set_folders(dirs, true);
+}
+
+/// [`set_grid_folders`], the first of `dirs` being where downloads are kept only if `keeps_first`.
+fn set_folders(dirs: Vec<std::path::PathBuf>, keeps_first: bool) {
+    KEEPS_FIRST.store(keeps_first, std::sync::atomic::Ordering::SeqCst);
+    // The first setting up done (on whatever thread started it), so it can't put the folders
+    // read before these after them.
+    grids_set_up();
+    *grid_folders().write().unwrap_or_else(|e| e.into_inner()) = dirs.clone();
+    terrio_crs::set_network_enabled(Some(false));
+    terrio_crs::set_grid_search_paths(Some(dirs));
+    grids_changed();
+}
+
+/// Points terrio-crs at the grid folders (none unless the app set some), once a run, with its own
+/// network off: RustGIS fetches grids itself.
+fn grids_set_up() {
+    static SET_UP: std::sync::Once = std::sync::Once::new();
+    SET_UP.call_once(|| {
+        let dirs = grid_folders().read().unwrap_or_else(|e| e.into_inner()).clone();
+        terrio_crs::set_grid_search_paths(Some(dirs));
+        terrio_crs::set_network_enabled(Some(false));
+    });
+}
+
+/// Says that datum grids have become available (a file put in [`grid_dir`], a grid registered):
+/// transformers are built again, with them, and the notes that a grid was missing are asked again.
+pub fn grids_changed() {
+    grids_set_up();
+    // terrio-crs first, so whatever is built from here on finds the grids; then the generation and
+    // the transformers kept, together, so none built before is kept after ([`keep_built`]) and none
+    // kept after was built before (one [`Live::now`] builds again finds only those).
+    terrio_crs::reset_grid_cache();
+    {
+        let mut built = built().lock().unwrap_or_else(|e| e.into_inner());
+        GRID_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        built.clear();
+    }
+    epsg_built().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    needs_grid().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    probed().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// A datum grid a system needs that RustGIS doesn't have and can download: its name on PROJ's
+/// grid server (`us_noaa_conus.tif`, the name it is kept and registered under) and its address.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MissingGrid {
+    pub name: String,
+    pub url: String,
+}
+
+/// The datum grids `crs`'s most accurate transformation needs where its data usually are (the
+/// middle of its area of use, [`area_of_use`]) that RustGIS doesn't have and can download (PROJ's
+/// grid server gives the file itself), as terrio-crs lists them (PROJ's
+/// `proj_coordoperation_get_grid_used`). Once those have arrived, ask again: the next operation's
+/// grids come up where the first one doesn't reach. None for a system without a datum
+/// transformation, or without an area of use to ask at.
+pub fn missing_grids(crs: Crs) -> Vec<MissingGrid> {
+    let Some(at) = area_of_use(crs) else { return Vec::new() };
+    crs.transformer().map(|t| t.missing_grids_at(at)).unwrap_or_default()
+}
+
+/// Whether RustGIS downloads `grid`: one it doesn't have and needs (not optional), the file itself
+/// on PROJ's grid server (the only server it contacts for them) under an open licence. A
+/// definition read from a file can name any grid PROJ knows: this keeps what it can make RustGIS
+/// fetch to PROJ's own, freely licensed grids. Only its GeoTIFF grids: the server's other files
+/// (deformation models, point lists) aren't grids RustGIS downloads.
+fn downloadable(grid: &terrio_crs::GridUse) -> bool {
+    !grid.available
+        && grid.name.ends_with(".tif")
+        && !grid.optional
+        && grid.direct_download
+        && grid.open_license
+        && grid.url.as_deref().is_some_and(|u| u.strip_prefix("https://cdn.proj.org/").is_some_and(|n| n == grid.name))
+}
+
+/// What waits for the datum grids a system needs ([`set_grid_waiter`]): the system, and the read
+/// it waits for (a number of this thread's own), so a read's systems share one wait.
+type GridWaiter = fn(Crs, u64);
+
+fn grid_waiter() -> &'static std::sync::RwLock<Option<GridWaiter>> {
+    static WAITER: std::sync::RwLock<Option<GridWaiter>> = std::sync::RwLock::new(None);
+    &WAITER
+}
+
+thread_local! {
+    /// This thread may wait for datum grids before it transforms ([`waiting_for_grids`]).
+    static MAY_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The systems this read has already waited for: each is asked about once.
+    static WAITED: std::cell::RefCell<Vec<Crs>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The read on this thread ([`waiting_for_grids`]), counted.
+    static READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Puts [`MAY_WAIT`] back as it was when dropped, a panic included.
+struct MayWait(bool);
+
+impl MayWait {
+    fn set(to: bool) -> MayWait {
+        MayWait(MAY_WAIT.try_with(|m| m.replace(to)).unwrap_or(false))
+    }
+}
+
+impl Drop for MayWait {
+    fn drop(&mut self) {
+        let _ = MAY_WAIT.try_with(|m| m.set(self.0));
+    }
+}
+
+/// Installs what gets the datum grids a system needs before a file in it is read on a thread that
+/// may wait ([`waiting_for_grids`]): the app's download, when its user turned it on. `None` takes
+/// it away.
+pub fn set_grid_waiter(waiter: Option<GridWaiter>) {
+    *grid_waiter().write().unwrap_or_else(|e| e.into_inner()) = waiter;
+}
+
+/// Runs `f`, a read on a thread of its own (never the window's), so that a system it transforms
+/// first gets the datum grids it needs ([`set_grid_waiter`]): its features then land where those
+/// grids put them, not where the next transformation does.
+pub fn waiting_for_grids<R>(f: impl FnOnce() -> R) -> R {
+    let outer = !MAY_WAIT.try_with(std::cell::Cell::get).unwrap_or(false);
+    if outer {
+        let _ = WAITED.try_with(|w| w.borrow_mut().clear());
+        let _ = READ.try_with(|r| r.set(r.get().wrapping_add(1)));
+    }
+    let _may = MayWait::set(true);
+    f()
+}
+
+/// Runs `f` without waiting for datum grids, on a thread that otherwise may: for a transformer
+/// asked for only to compare with, whose grids the read may not use.
+pub(crate) fn not_waiting_for_grids<R>(f: impl FnOnce() -> R) -> R {
+    let _may = MayWait::set(false);
+    f()
+}
+
+/// Waits for the grids `crs` needs, on a thread that may ([`waiting_for_grids`]), once a read.
+fn wait_for_grids(crs: Crs) {
+    if !MAY_WAIT.try_with(std::cell::Cell::get).unwrap_or(false) {
+        return;
+    }
+    let first = WAITED
+        .try_with(|w| {
+            let mut w = w.borrow_mut();
+            let first = !w.contains(&crs);
+            if first {
+                w.push(crs);
+            }
+            first
+        })
+        .unwrap_or(false);
+    if !first {
+        return;
+    }
+    let Some(waiter) = *grid_waiter().read().unwrap_or_else(|e| e.into_inner()) else { return };
+    // The waiter asks for transformers itself: not again from inside it.
+    let _may = MayWait::set(false);
+    waiter(crs, READ.try_with(std::cell::Cell::get).unwrap_or(0));
+}
+
+/// The middle of the area of use of `crs`: an EPSG code's own, else that of the geographic system
+/// a custom one is on (`None` when that has no EPSG code).
+pub fn area_of_use(crs: Crs) -> Option<Coord> {
+    match crs {
+        Crs::Epsg(c) => area_centre(c),
+        Crs::Custom(_) => {
+            let d = crs.custom_def()?;
+            let sr = match &d.wkt {
+                Some(w) => terrio_crs::SpatialRef::from_wkt(w),
+                None => terrio_crs::SpatialRef::from_proj4(&format!("{} +type=crs", d.proj4)).ok()?,
+            };
+            sr.geographic_code().and_then(|c| u16::try_from(c).ok()).and_then(area_centre)
+        }
+        Crs::LonLat | Crs::WebMercator => None,
+    }
+}
+
+/// Makes a datum grid available from its bytes, under its name (`us_noaa_conus.tif`): how the
+/// browser, without files, uses one it fetched.
+pub fn register_grid(name: &str, bytes: Vec<u8>) {
+    grids_set_up();
+    terrio_crs::register_grid(name, bytes);
+    grids_changed();
+}
+
 /// A transformer between the system a PROJ definition describes and WGS 84 longitude/latitude,
 /// computed by terrio-crs. Winkel Tripel's standard parallel (`+lat_1`) must be a latitude short
 /// of a pole, where the projection has no width. Natural Earth, Winkel Tripel and Eckert IV have no scale factor:
@@ -723,6 +1213,7 @@ pub fn transformer_of(def: &str) -> Result<Transformer, String> {
     // What a transformer built here says as it is dropped (one that fails its checks, or one
     // another thread built first) is this definition's ([`record_warning`]).
     let flushing = FLUSHING.try_with(|l| l.replace(Some(def.to_string()))).ok().flatten();
+    let generation = grid_generation();
     let degrees = in_degrees(def);
     let param = |key: &str| degrees.split_whitespace().find_map(|t| t.strip_prefix(key));
     let world = param("+proj=").is_some_and(|m| WORLD_METHODS.contains(&m));
@@ -738,10 +1229,7 @@ pub fn transformer_of(def: &str) -> Result<Transformer, String> {
     } else {
         misread_parameter(def).and_then(|()| build(&degrees))
     };
-    let mut map = built().lock().unwrap_or_else(|e| e.into_inner());
-    // The first one built is kept and shared: another thread may have built it meanwhile.
-    let t = if map.len() < MAX_BUILT || map.contains_key(def) { map.entry(def.to_string()).or_insert(t).clone() } else { t };
-    drop(map);
+    let t = keep_built(def.to_string(), t, generation);
     let _ = FLUSHING.try_with(|l| l.replace(flushing));
     t
 }
@@ -946,6 +1434,18 @@ mod datum_tests {
 /// takes `def`'s own geographic system puts the point (a GeoPDF's corners, #1191). The same
 /// point where `def`'s datum has no shift from WGS 84.
 pub fn lonlat_on_datum_of(def: &str, c: Coord) -> Option<Coord> {
+    transformer_of(&geographic_of(def)).ok()?.from_lonlat(c)
+}
+
+/// The WGS 84 longitude/latitude of `c`, a longitude/latitude on the datum of the PROJ definition
+/// `def`: [`lonlat_on_datum_of`] the other way, for a GeoPDF's corners read back (#2336).
+pub fn lonlat_from_datum_of(def: &str, c: Coord) -> Option<Coord> {
+    transformer_of(&geographic_of(def)).ok()?.to_lonlat(c)
+}
+
+/// The longitude/latitude system on the datum of the PROJ definition `def`: its datum, ellipsoid,
+/// shift and prime meridian, without its projection.
+fn geographic_of(def: &str) -> String {
     const DATUM: [&str; 9] = ["datum", "ellps", "towgs84", "a", "b", "rf", "f", "R", "pm"];
     let mut geographic = String::from("+proj=longlat");
     for t in def.split_whitespace() {
@@ -956,7 +1456,7 @@ pub fn lonlat_on_datum_of(def: &str, c: Coord) -> Option<Coord> {
         }
     }
     geographic.push_str(" +no_defs");
-    transformer_of(&geographic).ok()?.from_lonlat(c)
+    geographic
 }
 
 /// How far (degrees of latitude, or of longitude scaled to the ground) a place taken into a
@@ -983,7 +1483,104 @@ enum Kind {
     LonLat,
     Merc,
     /// Computed by terrio-crs, in both directions.
-    Terrio(std::sync::Arc<Terrio>),
+    Terrio(std::sync::Arc<Live>),
+}
+
+/// A system terrio-crs computes, built again with the datum grids that have arrived since
+/// ([`grid_generation`]): a transformer keeps the operation it chose when it was built, and what
+/// keeps one (a streamed layer, a tile warp, a map's projection) needn't know.
+struct Live {
+    /// What it was built for, as [`built`] keeps it (a PROJ definition, `WKT …`, `EPSG n`), to
+    /// build it again; `None` for one that can't be.
+    key: Option<String>,
+    /// As first built: its conversion (axes, unit, parameters), which no grid changes.
+    first: std::sync::Arc<Terrio>,
+    /// The generation of grids it is built for.
+    generation: std::sync::atomic::AtomicU64,
+    /// Built again, once grids have arrived since it was first: `None` while it is as first built,
+    /// which then needs no lock.
+    again: std::sync::RwLock<Option<std::sync::Arc<Terrio>>>,
+    /// Whether [`Live::again`] holds one.
+    rebuilt: std::sync::atomic::AtomicBool,
+}
+
+/// [`Live::now`]'s answer: the system as first built, or as built again.
+enum Now<'a> {
+    First(&'a Terrio),
+    Again(std::sync::Arc<Terrio>),
+}
+
+impl std::ops::Deref for Now<'_> {
+    type Target = Terrio;
+    fn deref(&self) -> &Terrio {
+        match self {
+            Now::First(t) => t,
+            Now::Again(t) => t,
+        }
+    }
+}
+
+impl Live {
+    fn new(key: Option<String>, generation: u64, t: std::sync::Arc<Terrio>) -> Live {
+        Live {
+            key,
+            first: t,
+            generation: std::sync::atomic::AtomicU64::new(generation),
+            again: std::sync::RwLock::new(None),
+            rebuilt: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// As built for the grids there are now: built again when grids have arrived since. One that
+    /// can't be built again goes on as it was. Without grids arriving, two atomic loads.
+    fn now(&self) -> Now<'_> {
+        use std::sync::atomic::Ordering;
+        let generation = grid_generation();
+        if self.generation.load(Ordering::Acquire) != generation && self.key.is_some() {
+            let again = self.key.as_deref().and_then(rebuilt);
+            let mut kept = self.again.write().unwrap_or_else(|e| e.into_inner());
+            match again {
+                Some(t) => {
+                    *kept = Some(t);
+                    self.rebuilt.store(true, Ordering::Release);
+                }
+                // Said once: it goes on with the transformation it had, without the grid.
+                None => {
+                    if let Some(key) = &self.key {
+                        note_rebuild_failure(key);
+                    }
+                }
+            }
+            self.generation.store(generation, Ordering::Release);
+        }
+        if !self.rebuilt.load(Ordering::Acquire) {
+            return Now::First(&self.first);
+        }
+        match &*self.again.read().unwrap_or_else(|e| e.into_inner()) {
+            Some(t) => Now::Again(std::sync::Arc::clone(t)),
+            None => Now::First(&self.first),
+        }
+    }
+
+    /// As it is, without building it again.
+    fn peek(&self) -> std::sync::Arc<Terrio> {
+        self.again.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| std::sync::Arc::clone(&self.first))
+    }
+}
+
+/// The system [`built`] keeps under `key`, built for the grids there are now.
+fn rebuilt(key: &str) -> Option<std::sync::Arc<Terrio>> {
+    let t = if let Some(wkt) = key.strip_prefix("WKT ") {
+        transformer_of_wkt(wkt).ok()
+    } else if let Some(code) = key.strip_prefix("EPSG ").and_then(|c| c.parse::<u16>().ok()) {
+        epsg_transformer(code)
+    } else {
+        transformer_of(key).ok()
+    }?;
+    match &t.kind {
+        Kind::Terrio(live) => Some(live.peek()),
+        _ => None,
+    }
 }
 
 /// A system terrio-crs computes: the transformers to and from longitude/latitude, built once.
@@ -1074,7 +1671,7 @@ impl Terrio {
 
 /// What a transformation had to do that changes where places land: a datum transformation that
 /// needs a grid RustGIS doesn't have, so the next one was used (NAD27's to WGS 84 then places
-/// features about 10 m off). The flags terrio-crs keeps for a transformer are turned into notes
+/// features up to about 10 m off). The flags terrio-crs keeps for a transformer are turned into notes
 /// by [`grid_note`].
 fn record_warning(message: String) {
     // terrio-crs's other notes: a datum shift the system doesn't give, which reading it says
@@ -1108,6 +1705,93 @@ fn record_warning(message: String) {
 
 /// A transformer RustGIS didn't keep ([`MAX_BUILT`]) needed a missing grid: [`record_warning`].
 static UNNAMED_NEEDS_GRID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The systems (by the key they are kept under) whose transformer couldn't be built again when
+/// grids arrived, each once for the run, in order: they go on with the transformation they had
+/// ([`Live::now`]), and every session reads them from its own place ([`rebuild_failures_since`]).
+/// The first [`REBUILD_KEPT`] by name, the rest counted.
+struct RebuildFailures {
+    named: Vec<String>,
+    said: std::collections::BTreeSet<String>,
+    /// Those past the named, counted once each (by a fingerprint of their key, the first
+    /// [`REBUILD_COUNTED`]; past those, each failure of a system not among them).
+    more: usize,
+    counted: std::collections::BTreeSet<u64>,
+}
+
+const REBUILD_COUNTED: usize = 1 << 16;
+
+const REBUILD_KEPT: usize = 256;
+
+impl RebuildFailures {
+    fn add(&mut self, key: &str) {
+        if self.said.contains(key) {
+            return;
+        }
+        if self.named.len() < REBUILD_KEPT {
+            self.said.insert(key.to_string());
+            self.named.push(key.to_string());
+        } else {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut h);
+            // Once each by fingerprint; past those kept, a new one still counts each time.
+            let h = h.finish();
+            if !self.counted.contains(&h) {
+                if self.counted.len() < REBUILD_COUNTED {
+                    self.counted.insert(h);
+                }
+                self.more += 1;
+            }
+        }
+    }
+}
+
+static REBUILD_FAILED: std::sync::Mutex<RebuildFailures> = std::sync::Mutex::new(RebuildFailures {
+    named: Vec::new(),
+    said: std::collections::BTreeSet::new(),
+    more: 0,
+    counted: std::collections::BTreeSet::new(),
+});
+
+/// Records that the system kept under `key` ("EPSG 4267", "WKT …") couldn't be built again with
+/// grids that arrived: for the sessions to say ([`rebuild_failures_since`]). Public for tests of
+/// the sessions' notice; [`Live::now`] calls it.
+#[doc(hidden)]
+pub fn note_rebuild_failure(key: &str) {
+    REBUILD_FAILED.lock().unwrap_or_else(|e| e.into_inner()).add(key);
+}
+
+/// Where a session has read the rebuild failures to ([`rebuild_failures_since`]): now's, for
+/// a session starting now.
+pub fn rebuild_failures_told() -> (usize, usize) {
+    let f = REBUILD_FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    (f.named.len(), f.more)
+}
+
+/// How many coordinate systems couldn't be built again with grids that arrived since `seen`
+/// (from [`rebuild_failures_told`]), and the first of them as said ("EPSG:4267", or a
+/// definition's start), and moves `seen` on: for the session to say they go on without them.
+pub fn rebuild_failures_since(seen: &mut (usize, usize)) -> (usize, Vec<String>) {
+    let f = REBUILD_FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    let keys = f.named.get(seen.0..).unwrap_or_default();
+    let shown = keys
+        .iter()
+        .take(3)
+        .map(|k| match k.strip_prefix("EPSG ") {
+            Some(code) => format!("EPSG:{code}"),
+            None => {
+                // On one line: a WKT read from a file may hold line breaks.
+                let k = k.strip_prefix("WKT ").unwrap_or(k).split_whitespace().collect::<Vec<_>>().join(" ");
+                let cut: String = k.chars().take(40).collect();
+                if k.chars().count() > 40 { format!("{cut}…") } else { cut }
+            }
+        })
+        .collect();
+    let count = keys.len() + f.more.saturating_sub(seen.1);
+    *seen = (f.named.len(), f.more);
+    (count, shown)
+}
 
 /// Whether a coordinate system RustGIS can't name, one of more than [`MAX_BUILT`] used this run,
 /// needed a missing datum grid since this was last asked: for the session to say so.
@@ -1163,7 +1847,7 @@ pub fn definition_and_label(crs: Crs) -> Option<(String, String)> {
 /// ([`needs_a_missing_grid`]), `names` naming them (the app lists a few and counts the rest):
 /// one notice for all of them, with their count.
 pub fn grid_notes_text(count: usize, names: &str) -> String {
-    const TAIL: &str = "the most accurate datum transformation needs a grid RustGIS doesn't have yet, so the next one was used; places may be metres off (NAD27, for one, is about 10 m off without its grid)";
+    const TAIL: &str = "the most accurate datum transformation needs a grid RustGIS doesn't have yet, so the next one was used; places may be metres off (NAD27, for one, up to about 10 m off without its grid)";
     match count {
         1 => format!("{names}: {TAIL}"),
         _ => format!("{count} coordinate systems ({names}): {TAIL}"),
@@ -1201,6 +1885,12 @@ fn area_centre_uncached(code: u16) -> Option<Coord> {
     Some(Coord::new(lon, (s + n) / 2.0))
 }
 
+/// The definitions [`probe_grid`] has asked about, since grids last changed.
+fn probed() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static PROBED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    PROBED.get_or_init(Default::default)
+}
+
 /// Whether a definition's most accurate datum transformation needs a grid RustGIS doesn't have,
 /// asked once per definition at a place where it is used (`at`: the middle of an EPSG code's area
 /// of use): terrio-crs notes a missing grid by the first place a transformer takes, which may be
@@ -1208,17 +1898,16 @@ fn area_centre_uncached(code: u16) -> Option<Coord> {
 /// without a code, which has no area of use to ask at, has only that first place. The first use
 /// of a code reads terrio-crs's catalog of areas ([`area_centre`]: about 50 ms, once a run).
 pub fn probe_grid(def: &str, at: impl FnOnce() -> Option<Coord>) {
-    static PROBED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
     {
-        let probed = PROBED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        let probed = probed().lock().unwrap_or_else(|e| e.into_inner());
         // Without a limit: only EPSG codes' definitions are probed, a table's worth at most.
         if probed.contains(def) {
             return;
         }
     }
     let Some(at) = at().filter(|c| c.is_finite()) else { return };
-    PROBED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner()).insert(def.to_string());
-    no_grids();
+    probed().lock().unwrap_or_else(|e| e.into_inner()).insert(def.to_string());
+    grids_set_up();
     let strict = terrio_crs::TransformOptions { only_best: true, ..Default::default() };
     let Ok(sr) = terrio_crs::SpatialRef::from_proj4(&in_degrees(def)) else { return };
     let Ok(wgs84) = terrio_crs::SpatialRef::from_epsg(4326) else { return };
@@ -1271,7 +1960,8 @@ pub fn needs_a_missing_grid(def: &str) -> bool {
     let codes: Vec<String> = epsg_codes_of(def).into_iter().map(|c| format!("EPSG {c}")).collect();
     let map = built().lock().unwrap_or_else(|e| e.into_inner());
     for key in std::iter::once(def).chain(codes.iter().map(String::as_str)) {
-        if let Some(Ok(Transformer { kind: Kind::Terrio(t) })) = map.get(key) {
+        if let Some(Ok(Transformer { kind: Kind::Terrio(live) })) = map.get(key) {
+            let t = live.peek();
             let _ = FLUSHING.try_with(|l| *l.borrow_mut() = Some(key.to_string()));
             t.to_lonlat.flush_warnings();
             t.from_lonlat.flush_warnings();
@@ -1302,7 +1992,7 @@ impl std::fmt::Debug for Transformer {
         match &self.kind {
             Kind::LonLat => write!(f, "Transformer(lonlat)"),
             Kind::Merc => write!(f, "Transformer(mercator)"),
-            Kind::Terrio(t) => write!(f, "Transformer({})", t.params.as_ref().map_or("?", |p| p.method.as_str())),
+            Kind::Terrio(live) => write!(f, "Transformer({})", live.first.params.as_ref().map_or("?", |p| p.method.as_str())),
         }
     }
 }
@@ -1311,24 +2001,12 @@ impl std::fmt::Debug for Transformer {
 /// central one (#1701), by PROJ's name.
 const WORLD_METHODS: [&str; 3] = ["natearth", "wintri", "eck4"];
 
-/// No datum grids yet (opengeos/RustGIS#2032, A4): none read from the computer's PROJ folders,
-/// from paths a definition names (a project file's), or downloaded, so a place lands where it does
-/// on every computer and in the browser. A transformation that needs one takes the next PROJ
-/// lists, and says so ([`grid_note`]). Set before terrio-crs builds any transformer.
-fn no_grids() {
-    static NO_GRIDS: std::sync::Once = std::sync::Once::new();
-    NO_GRIDS.call_once(|| {
-        terrio_crs::set_grid_search_paths(Some(Vec::new()));
-        terrio_crs::set_network_enabled(Some(false));
-    });
-}
-
 impl Transformer {
     /// The transformer between `sr` and WGS 84 longitude/latitude; `geographic` when its
     /// coordinates are degrees. A system on another body than the Earth goes to and from its own
     /// longitude/latitude instead, which is read as it is, on the Earth ([`Crs::is_planetary`]).
     fn of(sr: &terrio_crs::SpatialRef, geographic: bool, (lat_first, west): (bool, bool)) -> Result<Transformer, String> {
-        no_grids();
+        grids_set_up();
         let wgs84 = terrio_crs::SpatialRef::from_epsg(4326).map_err(|e| e.to_string())?;
         let pair = |to: &terrio_crs::SpatialRef| -> Result<_, String> {
             let forward = terrio_crs::Transformer::new(sr, to).map_err(|e| e.to_string())?.with_warning_handler(record_warning);
@@ -1375,7 +2053,26 @@ impl Transformer {
             wraps,
             eck4,
         };
-        Ok(Transformer { kind: Kind::Terrio(std::sync::Arc::new(t)) })
+        Ok(Transformer { kind: Kind::Terrio(std::sync::Arc::new(Live::new(None, grid_generation(), std::sync::Arc::new(t)))) })
+    }
+
+    /// This transformer, built again under `key` ([`built`]'s) when datum grids arrive after
+    /// `generation`, the one it was built for.
+    fn keyed(self, key: &str, generation: u64) -> Transformer {
+        match self.kind {
+            Kind::Terrio(live) if live.key.is_none() => {
+                Transformer { kind: Kind::Terrio(std::sync::Arc::new(Live::new(Some(key.to_string()), generation, live.peek()))) }
+            }
+            kind => Transformer { kind },
+        }
+    }
+
+    /// The grids its most accurate transformation needs at `at` (longitude/latitude) that RustGIS
+    /// doesn't have and can download ([`missing_grids`]).
+    pub fn missing_grids_at(&self, at: Coord) -> Vec<MissingGrid> {
+        let Kind::Terrio(live) = &self.kind else { return Vec::new() };
+        let Ok(uses) = live.now().from_lonlat.best_operation_grids_at(at.x, at.y, 0.0) else { return Vec::new() };
+        uses.into_iter().filter(downloadable).filter_map(|g| Some(MissingGrid { url: g.url?, name: g.name })).collect()
     }
 
     /// Native coordinates to longitude/latitude.
@@ -1383,7 +2080,8 @@ impl Transformer {
         let out = match &self.kind {
             Kind::LonLat => c,
             Kind::Merc => merc_to_lonlat(c),
-            Kind::Terrio(t) => {
+            Kind::Terrio(live) => {
+                let t = live.now();
                 // A latitude past a pole is no place (terrio-crs would fold it back to one): past
                 // 90°, in the system's unit (100 grads).
                 let lat = if t.lat_first { c.x } else { c.y };
@@ -1410,9 +2108,10 @@ impl Transformer {
     /// datum shift. Only whole turns change; other consumers keep `to_lonlat`'s usual branch.
     pub(super) fn to_lonlat_for_extent(&self, c: Coord) -> Option<Coord> {
         let mut out = self.to_lonlat(c)?;
-        if let Kind::Terrio(t) = &self.kind
-            && t.geographic
+        if let Kind::Terrio(live) = &self.kind
+            && live.first.geographic
         {
+            let t = &live.first;
             let lon = t.lon_sign * t.unit * if t.lat_first { c.y } else { c.x };
             let greenwich = lon + t.params.as_ref().map_or(0.0, |p| p.prime_meridian);
             out.x += 360.0 * ((greenwich - out.x) / 360.0).round();
@@ -1429,15 +2128,22 @@ impl Transformer {
     /// (#1925). A place that comes back keeps the projection's coordinates.
     pub fn from_lonlat(&self, c: Coord) -> Option<Coord> {
         let out = self.from_lonlat_unchecked(c)?;
-        if let Kind::Terrio(t) = &self.kind
-            && !t.geographic
+        if let Kind::Terrio(live) = &self.kind
+            && !live.first.geographic
         {
+            let t = live.now();
             let back = match &t.own {
-                // On the projection's own datum: the place there, and where its coordinates go back.
-                Some((onto, unproject, project)) => {
-                    let there = onto.transform(c.x, c.y).ok().map(|(x, y)| Coord::new(x, y));
-                    there.zip(t.unproject(unproject, project, out))
-                }
+                // On the projection's own datum: the place there, projected and taken back. Its
+                // coordinates from there, not `out`: WGS 84 onto that datum may go by another
+                // transformation than the system's own (ESRI:31491 in the North Sea, outside the
+                // DHDN Helmert's area, where the system's is a ballpark), and the projection
+                // alone is what may fold. `out` itself isn't checked: it is the same projection
+                // of a place a datum shift away, so only a strip that wide along a fold (metres,
+                // or hundreds of metres for a ballpark) could be judged differently.
+                Some((onto, unproject, project)) => onto.transform(c.x, c.y).ok().and_then(|(x, y)| {
+                    let (px, py) = project.transform(x, y).ok()?;
+                    Some((Coord::new(x, y), t.unproject(unproject, project, Coord::new(px, py))?))
+                }),
                 None => self.to_lonlat(out).map(|back| (c, back)),
             };
             let pole = if t.eck4 { ECK4_POLE_DEG } else { 0.0 };
@@ -1454,11 +2160,11 @@ impl Transformer {
         let out = match &self.kind {
             Kind::LonLat => c,
             Kind::Merc => lonlat_to_merc(c),
-            Kind::Terrio(t) => {
+            Kind::Terrio(live) => {
                 if !c.is_finite() || c.y.abs() > 90.0 + 1e-9 {
                     return None;
                 }
-                let (x, y) = t.from_lonlat.transform(c.x, c.y).ok()?;
+                let (x, y) = live.now().from_lonlat.transform(c.x, c.y).ok()?;
                 Coord::new(x, y)
             }
         };
@@ -1470,7 +2176,7 @@ impl Transformer {
         match &self.kind {
             Kind::LonLat => true,
             Kind::Merc => false,
-            Kind::Terrio(t) => t.geographic,
+            Kind::Terrio(live) => live.first.geographic,
         }
     }
 
@@ -1478,7 +2184,7 @@ impl Transformer {
     /// other than PROJ's ballpark, which knows no shift for the datum there.
     pub fn shift_at(&self, at: Coord) -> bool {
         match &self.kind {
-            Kind::Terrio(t) => t.from_lonlat.operation_at(at.x, at.y, 0.0).ok().flatten().is_some_and(|o| !o.ballpark),
+            Kind::Terrio(live) => live.now().from_lonlat.operation_at(at.x, at.y, 0.0).ok().flatten().is_some_and(|o| !o.ballpark),
             _ => false,
         }
     }
@@ -1487,7 +2193,7 @@ impl Transformer {
     /// terrio-crs computes that has some.
     pub fn params(&self) -> Option<&terrio_crs::ProjParams> {
         match &self.kind {
-            Kind::Terrio(t) => t.params.as_ref(),
+            Kind::Terrio(live) => live.first.params.as_ref(),
             _ => None,
         }
     }
@@ -1513,6 +2219,108 @@ impl Transformer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ESRI code reads as the system the picker offers for it (`ESRI:102033`, as a `.prj` and
+    /// the coordinate system boxes name it); one the catalog lacks is refused with its name.
+    #[test]
+    fn an_esri_code_is_read() {
+        for text in ["ESRI:102033", "esri:102033", " ESRI : 102033 "] {
+            assert_eq!(Crs::parse(text).map(|c| c.label()), Ok("ESRI:102033".to_string()), "{text}");
+        }
+        assert!(Crs::parse("ESRI:1").is_err_and(|e| e.contains("ESRI:1")));
+        assert!(Crs::parse("ESRI:x").is_err() && Crs::parse("ESRI:+102033").is_err());
+        // A bare number: EPSG's, else ESRI's.
+        assert_eq!(Crs::parse("102033").map(|c| c.label()), Ok("ESRI:102033".to_string()));
+        assert_eq!(Crs::parse("2056").map(|c| c.epsg()), Ok(2056));
+        assert!(Crs::parse("EPSG:102033").is_err(), "an EPSG code stays EPSG's");
+        // Web Mercator's old number is read as before.
+        assert_eq!(Crs::parse("102100"), Ok(Crs::WebMercator));
+        assert_eq!(Crs::parse("0102033").map(|c| c.label()), Ok("ESRI:102033".to_string()));
+    }
+
+    /// A kept transformer that can't be built again when grids arrive goes on as it was, said
+    /// once however many grids arrive; one that is built again isn't said.
+    #[test]
+    fn a_transformer_that_cant_be_built_again_goes_on_and_is_said() {
+        let Some(Transformer { kind: Kind::Terrio(live), .. }) = epsg_transformer(4267) else { panic!("EPSG:4267") };
+        // Kept under a key that no longer builds, and from another grid generation than now's.
+        // (Generations no test reaches, so another test's grids arriving meanwhile can't match them.)
+        let stale = Live::new(Some("WKT not a definition".into()), u64::MAX, live.peek());
+        let mut seen = rebuild_failures_told();
+        let mut other = seen;
+        assert!(matches!(stale.now(), Now::First(_)), "goes on with the transformation it had");
+        let (failed, shown) = rebuild_failures_since(&mut seen);
+        assert!(failed >= 1 && shown.iter().any(|s| s == "not a definition"), "{failed} {shown:?}");
+        // Said once: not again in this generation, nor when more grids arrive.
+        let _ = stale.now();
+        stale.generation.store(u64::MAX - 1, std::sync::atomic::Ordering::SeqCst);
+        let _ = stale.now();
+        assert!(!rebuild_failures_since(&mut seen).1.iter().any(|s| s == "not a definition"));
+        // Another session hears it too, once.
+        assert!(rebuild_failures_since(&mut other).1.iter().any(|s| s == "not a definition"));
+        assert!(!rebuild_failures_since(&mut other).1.iter().any(|s| s == "not a definition"));
+        // Past those kept by name, counted.
+        let mut f = RebuildFailures { named: Vec::new(), said: Default::default(), more: 0, counted: Default::default() };
+        for i in 0..REBUILD_KEPT + 3 {
+            f.add(&format!("EPSG {i}"));
+        }
+        // Each once, past the named too.
+        f.add("EPSG 0");
+        f.add(&format!("EPSG {}", REBUILD_KEPT + 1));
+        assert_eq!((f.named.len(), f.more), (REBUILD_KEPT, 3));
+        // Past the fingerprints kept, one already counted still isn't counted again.
+        for i in 0..REBUILD_COUNTED {
+            f.add(&format!("WKT {i}"));
+        }
+        let more = f.more;
+        f.add("WKT 0");
+        f.add(&format!("EPSG {}", REBUILD_KEPT + 1));
+        assert_eq!(f.more, more);
+        f.add("WKT new");
+        assert_eq!(f.more, more + 1, "a new one past them counts");
+        // One that is built again: nothing said.
+        let fine = Live::new(Some("EPSG 4267".into()), u64::MAX, live.peek());
+        assert!(matches!(fine.now(), Now::Again(_)));
+        assert!(!rebuild_failures_since(&mut seen).1.iter().any(|s| s == "EPSG:4267"));
+    }
+
+    /// Only PROJ's own grid server, a grid file itself and an open licence: a definition read
+    /// from a file names any grid PROJ knows, some of them elsewhere (rdtrans2008.gsb, on
+    /// salsa.debian.org, without an open licence), and none of those is fetched.
+    #[test]
+    fn only_open_grids_on_projs_server_are_downloaded() {
+        let grid = |name: &str, url: Option<&str>, direct: bool, open: bool, available: bool, optional: bool| terrio_crs::GridUse {
+            name: name.into(),
+            url: url.map(str::to_string),
+            direct_download: direct,
+            open_license: open,
+            available,
+            optional,
+        };
+        let cdn = Some("https://cdn.proj.org/us_noaa_conus.tif");
+        assert!(downloadable(&grid("us_noaa_conus.tif", cdn, true, true, false, false)));
+        for g in [
+            grid("us_noaa_conus.tif", cdn, true, true, true, false),
+            grid("us_noaa_conus.tif", cdn, true, true, false, true),
+            grid("us_noaa_conus.tif", cdn, false, true, false, false),
+            grid("us_noaa_conus.tif", cdn, true, false, false, false),
+            grid("us_noaa_conus.tif", None, true, true, false, false),
+            grid(
+                "rdtrans2008.gsb",
+                Some("https://salsa.debian.org/debian-gis-team/proj-rdnap/raw/upstream/2008/rdtrans2008.gsb"),
+                true,
+                true,
+                false,
+                false,
+            ),
+            grid("../a.tif", Some("https://cdn.proj.org/us_noaa_conus.tif"), true, true, false, false),
+            // On the server, but not a GeoTIFF grid.
+            grid("nz_linz_nzgd2000-20180701.json", Some("https://cdn.proj.org/nz_linz_nzgd2000-20180701.json"), true, true, false, false),
+            grid("a.tif", Some("http://cdn.proj.org/a.tif"), true, true, false, false),
+        ] {
+            assert!(!downloadable(&g), "{g:?}");
+        }
+    }
 
     /// A system read from WKT is saved with its WKT beside a PROJ string, so a newer release reads
     /// the WKT and an older one, which ignores the field, the PROJ string; a project saved without
@@ -1999,10 +2807,62 @@ mod tests {
         assert!((back.x - lonlat.0).abs() < 1e-7 && (back.y - lonlat.1).abs() < 1e-7, "EPSG:{code}: {back:?}");
     }
 
-    /// EPSG codes 9020–20003 come from the built-in gap table (opengeos/RustGIS#198); the
-    /// expected coordinates are pyproj's (PROJ 9.8, EPSG dataset v12.029).
+    /// An ESRI code is transformed as PROJ 9.9.0 transforms it (network off,
+    /// `Transformer.from_crs("EPSG:4326", "ESRI:<code>", always_xy=True)`), its datum
+    /// transformation included, by the WKT terrio-crs's catalog gives it: Merchich UTM zone 28N
+    /// (ESRI:102144) in the Canary Islands, 246 m from the Helmert the bundled table wrote, and
+    /// Germany zone 1 in the North Sea, past the DHDN Helmert's area, where PROJ goes by a
+    /// ballpark that the projection's round trip once refused.
     #[test]
-    fn codes_crs_definitions_lacks() {
+    fn esri_codes_place_points_as_proj_9_9_0() {
+        for (code, (lon, lat), (x, y)) in
+            [(102144u32, (-15.0, 28.34), (500_000.000, 3_134_617.542)), (31491, (3.925, 55.58), (1_558_329.555, 6_161_550.584))]
+        {
+            let crs = esri_crs(code).unwrap();
+            assert_eq!(crs.label(), format!("ESRI:{code}"));
+            let at = crs.transformer().unwrap().from_lonlat(Coord::new(lon, lat)).unwrap();
+            assert!((at.x - x).abs() < 0.01 && (at.y - y).abs() < 0.01, "ESRI:{code}: {at:?}");
+            // A project with it needs its WKT where the PROJ definition older releases read places
+            // points elsewhere (Merchich, 246 m; DHDN past its Helmert's area), as for any other
+            // system.
+            assert!(crs.custom_def().unwrap().wkt_needed(), "ESRI:{code}");
+        }
+        // One whose PROJ definition places points as its WKT does (World Robinson, on WGS 84)
+        // doesn't need it: older releases read it as this one does.
+        assert!(!esri_crs(54030).unwrap().custom_def().unwrap().wkt_needed());
+        // Projected codes the bundled table lacked are the catalog's (World Miller Cylindrical),
+        // and geographic ones aren't ESRI projected systems.
+        assert!(esri_proj4(54003).is_some_and(|d| d.contains("+proj=mill")));
+        assert!(esri_codes().count() > 2000);
+        assert_eq!(esri_proj4(104000), None);
+    }
+
+    #[test]
+    fn axis_order_as_epsg_defines_it() {
+        // Latitude first; northing first (LAEA and LCC Europe, Gauss-Krüger, SWEREF99 TM, Poland's
+        // 1992, Austria's Lambert, ETRS89 UTM (N-E), UPS North and South, RSPS2000), and a code newer than
+        // the table RustGIS kept before (EPSG:10952).
+        for code in [4326, 4258, 4269, 3035, 3034, 31466, 31467, 31468, 31469, 3006, 2180, 31287, 3040, 32661, 32761, 5482, 10952] {
+            assert_eq!(epsg_north_first(code), Some(true), "EPSG:{code}");
+        }
+        // Easting first: Web Mercator, LV95 and LV03, ETRS89 UTM, WGS 84 UTM, a State Plane in feet,
+        // Krovak East North; westing first (Lo15, `+axis=wsu`); polar stereographic, north and
+        // south; southing first but turned so by its PROJ string (`+axis=swu`: 8352, 5513); Equi7
+        // Europe (aeqd); a code PROJ dropped (EPSG:3752).
+        for code in [3857, 2056, 21781, 25832, 25833, 32633, 2264, 5514, 2046, 3031, 3413, 8352, 5513, 27704, 3752] {
+            assert_eq!(epsg_north_first(code), Some(false), "EPSG:{code}");
+        }
+        // Southing then westing, which swapping can't give (the Gusterberg and St. Stephen grids);
+        // a code that doesn't exist.
+        for code in [8044, 8045, 1] {
+            assert_eq!(epsg_north_first(code), None, "EPSG:{code}");
+        }
+    }
+
+    /// EPSG codes PostGIS's table lacked, which RustGIS read from its own gap table before
+    /// (opengeos/RustGIS#198), from terrio-crs's catalog; the expected coordinates are pyproj's.
+    #[test]
+    fn codes_postgis_lacked() {
         // SIRGAS-Chile 2016 / UTM zone 19S: Santiago de Chile.
         check(9155, (-70.65, -33.45), (346_642.695, 6_297_606.833), 0.01);
         assert!(!Crs::from_epsg(9155).unwrap().is_geographic());
@@ -2134,9 +2994,9 @@ mod tests {
         assert!(bare_vn2000_error("VN-2000").contains("ambiguous"));
 
         // Embedded EPSG definitions verification
-        let p3405 = epsg_proj4(3405).expect("EPSG:3405 must be present in crs_definitions");
+        let p3405 = epsg_proj4(3405).expect("EPSG:3405");
         assert!(p3405.contains("+proj=utm") && p3405.contains("+zone=48"), "{p3405}");
-        let p3406 = epsg_proj4(3406).expect("EPSG:3406 must be present in crs_definitions");
+        let p3406 = epsg_proj4(3406).expect("EPSG:3406");
         assert!(p3406.contains("+proj=utm") && p3406.contains("+zone=49"), "{p3406}");
         assert_eq!(Crs::from_epsg(65534), None);
         assert!(Crs::parse("EPSG:65534").is_err());
@@ -2198,9 +3058,17 @@ mod tests {
         // 9.8.1 applies it without grids ("NAD27 to WGS 84 (4)"; pyproj 3.8.0, network off,
         // `Transformer.from_crs("EPSG:4326", "EPSG:9311", always_xy=True)`).
         check(9311, (-77.04, 38.89), (1_958_660.023, -405_359.527), 0.01);
-        // EPSG:10622 (an orthographic) has no implementation, so it is left out rather than
-        // listed and refused.
-        assert_eq!(Crs::from_epsg(10622), None);
+        // Codes the bundled tables lacked, from terrio-crs's catalog, against PROJ 9.9.0 (network
+        // off, `Transformer.from_crs("EPSG:4326", "EPSG:<code>", always_xy=True)`): EPSG:10622,
+        // an orthographic with an azimuth and a scale (in US survey feet), at San Francisco
+        // airport, and EPSG:5225, Modified Krovak East North on Ferro, in Prague.
+        check(10622, (-122.39, 37.62), (2_532.630, -2_356.763), 0.01);
+        check(5225, (14.42, 50.09), (-5_742_860.106, -6_042_721.337), 0.01);
+        // EPSG:6247, MAGNA-SIRGAS / Bogota urban grid (Colombia Urban), in Bogotá.
+        check(6247, (-74.08, 4.6), (99_727.065, 100_417.445), 0.01);
+        // A vertical system alone isn't a place's (EGM2008 height, NAVD88 height in feet).
+        assert_eq!(Crs::from_epsg(3855), None);
+        assert_eq!(Crs::from_epsg(6360), None);
         // The Equi7 grids, above the gap (azimuthal equidistant on WGS 84), against PROJ 9's
         // cs2cs: a capital, or McMurdo, in each continent's system.
         for (code, lonlat, xy) in [
@@ -2219,42 +3087,71 @@ mod tests {
         assert_eq!(unusable_epsg(28707), "the coordinate system EPSG:28707 isn't supported");
     }
 
-    /// The ESRI table (opengeos/RustGIS#213) is in order and holds only projected systems on Earth.
+    /// The ESRI codes (opengeos/RustGIS#213) are in order and only projected systems on Earth.
     #[test]
-    fn esri_table_is_sound() {
-        let defs = super::super::esri::DEFS;
-        assert!(defs.len() > 1900, "{}", defs.len());
-        for pair in defs.windows(2) {
-            assert!(pair[0].0 < pair[1].0, "out of order at ESRI:{}", pair[1].0);
+    fn esri_codes_are_sound() {
+        let codes: Vec<u32> = esri_codes().collect();
+        for pair in codes.windows(2) {
+            assert!(pair[0] < pair[1], "out of order at ESRI:{}", pair[1]);
         }
-        for &(code, def) in defs {
-            assert_eq!(esri_proj4(code), Some(def));
+        let defs: Vec<(u32, &str)> = codes.iter().filter_map(|&c| Some((c, esri_proj4(c)?))).collect();
+        assert!(defs.len() > 2000, "{}", defs.len());
+        // Every catalog code's WKT, which places its points, is transformed (else [`esri_crs`]
+        // falls back to the PROJ definition).
+        for &c in &codes {
+            if let Some((_, wkt)) = catalog_esri(c) {
+                assert!(build_wkt(wkt).is_ok(), "ESRI:{c}");
+            }
+        }
+        for &(code, def) in &defs {
             assert!(def.starts_with("+proj=") && !def.contains("+proj=longlat") && !def.contains("+proj=geocent"), "ESRI:{code}");
+            assert!(!def.contains("+type=crs"), "ESRI:{code}");
         }
-        assert_eq!(esri_codes().count(), defs.len());
         // South America Albers Equal Area Conic, which opened the issue.
         assert!(esri_proj4(102033).is_some_and(|d| d.contains("+proj=aea") && d.contains("+lon_0=-60")));
-        // Left out: World Miller (left out when RustGIS computed it on a sphere), a lunar system, a
-        // Hammer–Aitoff PROJ can't write as a string, and codes that don't exist.
-        for code in [54003, 103877, 54044, 0, 4326, u32::MAX] {
+        // A datum PROJ 9.9.0 goes from by a ballpark (Roma 1940, ESRI:102093) gets no shift.
+        assert!(esri_proj4(102093).is_some_and(|d| d.contains("+ellps=intl") && !d.contains("+towgs84")));
+        // One whose geographic system has a single Helmert gets PROJ's (OSGB 1936, ESRI:102799,
+        // as GDAL 3.13.3 and PROJ 9.9.0 write it).
+        assert!(esri_proj4(102799).is_some_and(|d| d.contains("+towgs84=446,-99,544,0.945,0.261,0.435,-20.8927 ")));
+        // Tokyo UTM zone 51N, which RustGIS kept itself before terrio-crs had it, as PROJ 9.9.0
+        // writes it (`projinfo -o PROJ ESRI:102151`).
+        assert_eq!(esri_proj4(102151), Some("+proj=utm +zone=51 +ellps=bessel +towgs84=-147.54,507.26,680.47,0,0,0,0 +units=m +no_defs"));
+        // Left out: a lunar system, a Hammer–Aitoff PROJ can't write as a string, and codes that
+        // don't exist.
+        for code in [103877, 54044, 0, 4326, u32::MAX] {
             assert_eq!(esri_proj4(code), None, "ESRI:{code}");
         }
     }
 
-    /// Every entry in the gap table is wanted (upstream still lacks it), in order, and usable.
+    /// Codes terrio-crs's catalog doesn't compute that RustGIS read before still read, by the
+    /// definitions they had, and the catalog doesn't have them now (else they'd go).
     #[test]
-    fn gap_table_is_sound() {
-        let defs = super::super::epsg_gap::DEFS;
-        assert!(defs.len() > 400, "{}", defs.len());
-        for pair in defs.windows(2) {
-            assert!(pair[0].0 < pair[1].0, "out of order at EPSG:{}", pair[1].0);
-        }
-        for &(code, def) in defs {
-            assert!(crs_definitions::from_code(code).is_none(), "crs-definitions has EPSG:{code} now: drop it from the table");
+    fn uncomputed_codes_still_read() {
+        for &(code, def) in UNCOMPUTED_EPSG {
+            assert!(catalog_proj4(code).is_none(), "the catalog has EPSG:{code} now: drop it from the list");
             assert_eq!(epsg_proj4(code), Some(def));
             let crs = Crs::from_epsg(u32::from(code)).unwrap_or_else(|| panic!("EPSG:{code}"));
-            assert_eq!(crs.is_geographic(), def.contains("+proj=longlat"), "EPSG:{code}");
             crs.transformer().unwrap_or_else(|e| panic!("EPSG:{code}: {e}"));
         }
+        for &(code, def) in UNCOMPUTED_ESRI {
+            assert!(catalog_esri(code).is_none(), "the catalog has ESRI:{code} now: drop it from the list");
+            assert_eq!(esri_proj4(code), Some(def));
+            assert!(esri_codes().any(|c| c == code), "ESRI:{code}");
+            esri_crs(code).unwrap_or_else(|| panic!("ESRI:{code}")).transformer().unwrap_or_else(|e| panic!("ESRI:{code}: {e}"));
+        }
+    }
+
+    /// EPSG:11476 (SIRGAS-Chile 2025 / UTM zone 19S, EPSG v13.102, opengeos/RustGIS#2335) reads
+    /// and places points as PROJ 9.9.0 does. Reference: PROJ 9.9.0 (pyproj 3.8.0 built against it,
+    /// PROJ_NETWORK=OFF), `Transformer.from_crs("EPSG:4326", "EPSG:11476", always_xy=True)` at
+    /// (-70.6, -33.45): (351290.3712547213, 6297679.510189325). Its only transformation to WGS 84
+    /// is time-specific, so PROJ uses a ballpark one, and so does RustGIS.
+    #[test]
+    fn sirgas_chile_2025_places_points_as_proj_9_9_0() {
+        let crs = Crs::from_epsg(11476).expect("EPSG:11476");
+        assert_eq!(crs.label(), "EPSG:11476");
+        let p = crs.transformer().unwrap().from_lonlat(Coord::new(-70.6, -33.45)).unwrap();
+        assert!((p.x - 351290.3712547213).abs() < 1e-6 && (p.y - 6297679.510189325).abs() < 1e-6, "{p:?}");
     }
 }

@@ -682,7 +682,7 @@ fn origin(url: &str) -> &str {
 }
 
 /// The value of a query parameter, by its whole name (any case).
-fn query_value<'a>(url: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn query_value<'a>(url: &'a str, key: &str) -> Option<&'a str> {
     let url = crate::login_address::inner(url);
     let q = url.split('#').next()?.split_once('?')?.1;
     q.split('&').find_map(|kv| {
@@ -1255,7 +1255,7 @@ fn wms_candidates(crs: &[String]) -> Vec<Candidate> {
 /// candidates (see [`wms_candidates`]), and the one a Web Mercator map takes its pictures in: Web
 /// Mercator itself (`mercator`), else the first. `None` for a layer offered in Web Mercator
 /// alone (its address stays as it was) or in nothing usable. In WMS 1.3.0 a bounding box follows
-/// the system's axes as EPSG defines them ([`crate::raster::epsg_axes`]); for a system whose
+/// the system's axes as EPSG defines them ([`crate::raster::crs::epsg_north_first`]); for a system whose
 /// order RustGIS doesn't know, as the layer's own `BoundingBox` in it is written (else latitude
 /// first in a geographic system other than CRS:84).
 fn wms_native<'a, 'i>(
@@ -1325,11 +1325,11 @@ fn wms_native<'a, 'i>(
 type LayerBoxes<'a, 'i> = std::collections::HashMap<roxmltree::NodeId, std::collections::HashMap<u32, Node<'a, 'i>>>;
 
 /// Whether `system` is written north (or latitude) first as EPSG defines its axes, when
-/// RustGIS's table knows it ([`crate::raster::epsg_axes`]).
+/// it is known ([`crate::raster::crs::epsg_north_first`]).
 fn epsg_north_first(system: crate::raster::Crs) -> Option<bool> {
     match system {
         crate::raster::Crs::Custom(_) => None,
-        s => crate::raster::epsg_axes::north_first(s.epsg()),
+        s => crate::raster::crs::epsg_north_first(s.epsg()),
     }
 }
 
@@ -3098,8 +3098,9 @@ pub const PAGED_FEATURES_CEILING: usize = 1_000_000;
 /// Most features read from a collection that comes in pages: on the desktop, as many as a quarter
 /// of the computer's memory holds at 20 KB each (about 100,000 for every 8 GB, the pages read
 /// included), from [`PAGED_FEATURES_FLOOR`] up to [`PAGED_FEATURES_CEILING`] (#1318).
+/// Less once RustGIS holds more than half the memory, never below the floor ([`crate::memory::planned`], #2431).
 pub fn max_paged_features() -> usize {
-    crate::memory::scaled(crate::memory::physical(), PAGED_FEATURES_FLOOR, PAGED_FEATURES_CEILING, 20 << 10)
+    crate::memory::planned(PAGED_FEATURES_FLOOR, PAGED_FEATURES_CEILING, 20 << 10)
 }
 
 /// The most bytes of why a layer's protocol buffer pages couldn't be read that its note says.
@@ -3123,8 +3124,9 @@ pub const DECODED_CEILING: usize = 3 << 30;
 /// Most memory, in bytes, an ArcGIS layer's protocol buffer pages may take once read: on the
 /// desktop a quarter of the computer's memory, from [`DECODED_FLOOR`] up to [`DECODED_CEILING`].
 /// The download budget doesn't bound it: a vertex takes 1 to 3 bytes in a page and 16 read.
+/// Less once RustGIS holds more than half the memory, never below the floor ([`crate::memory::planned`], #2431).
 pub fn max_decoded_bytes() -> usize {
-    crate::memory::scaled(crate::memory::physical(), DECODED_FLOOR, DECODED_CEILING, 1)
+    crate::memory::planned(DECODED_FLOOR, DECODED_CEILING, 1)
 }
 
 /// A feature collection page's JSON `next` link, resolved against the page's address.
@@ -3157,7 +3159,7 @@ fn drawing_unread(why: &str) -> String {
 }
 
 /// Whether an address is an ArcGIS layer's query (`…/FeatureServer/0/query`, `…/MapServer/3/query`).
-fn is_arcgis_query(url: &str) -> bool {
+pub(crate) fn is_arcgis_query(url: &str) -> bool {
     let b = base(url).trim_end_matches('/').to_ascii_lowercase();
     b.ends_with("/query") && (b.contains("/featureserver/") || b.contains("/mapserver/"))
 }
@@ -3165,16 +3167,16 @@ fn is_arcgis_query(url: &str) -> bool {
 /// How an ArcGIS layer is read past its record limit: pages of `size` features, in the order of
 /// its object ids (`order`) so that no feature is skipped or read twice.
 #[derive(Debug, PartialEq)]
-struct ArcgisPaging {
-    size: Option<usize>,
-    order: Option<String>,
+pub(crate) struct ArcgisPaging {
+    pub(crate) size: Option<usize>,
+    pub(crate) order: Option<String>,
 }
 
 /// How a layer's description (`…/FeatureServer/0?f=json`) lets it be read in pages: `None` unless it
 /// says it supports them (`advancedQueryCapabilities.supportsPagination`, from ArcGIS Server 10.3).
 /// Its `maxRecordCount` is the page size when it is a count RustGIS would ask for; its object id
 /// field, the order, when it is a plain field name (it goes into the address).
-fn arcgis_paging(layer: &serde_json::Value) -> Option<ArcgisPaging> {
+pub(crate) fn arcgis_paging(layer: &serde_json::Value) -> Option<ArcgisPaging> {
     if layer.pointer("/advancedQueryCapabilities/supportsPagination").and_then(|p| p.as_bool()) != Some(true) {
         return None;
     }
@@ -3203,7 +3205,7 @@ fn arcgis_paging(layer: &serde_json::Value) -> Option<ArcgisPaging> {
 
 /// Whether a layer's description lists protocol buffers among the formats its queries answer in
 /// (`supportedQueryFormats`, such as `"JSON, geoJSON, PBF"`).
-fn supports_pbf(layer: &serde_json::Value) -> bool {
+pub(crate) fn supports_pbf(layer: &serde_json::Value) -> bool {
     layer.get("supportedQueryFormats").and_then(|f| f.as_str()).is_some_and(|f| f.split(',').any(|f| f.trim().eq_ignore_ascii_case("pbf")))
 }
 
@@ -3214,7 +3216,7 @@ fn with_format(query: &str, format: &str) -> String {
 }
 
 /// Replaces one query value in any case, preserving opaque settings, login bindings and fragments.
-fn with_query_value(query: &str, key: &str, value: &str) -> String {
+pub(crate) fn with_query_value(query: &str, key: &str, value: &str) -> String {
     if let Ok(Some(bound)) = crate::login_address::parse(query) {
         return crate::login_address::inherit(query, &with_query_value(bound.url, key, value));
     }
@@ -3244,7 +3246,7 @@ fn arcgis_page_error(bytes: &[u8]) -> Option<String> {
 
 /// What an ArcGIS answer already read (`v`) says when it is the service's error (`{"error": …}`),
 /// whatever its size, as [`arcgis_page_error`] says it.
-fn arcgis_error_text(v: &serde_json::Value) -> Option<String> {
+pub(crate) fn arcgis_error_text(v: &serde_json::Value) -> Option<String> {
     let error = v.get("error")?.as_object()?;
     let code = error.get("code").and_then(serde_json::Value::as_u64).unwrap_or(0);
     let message = error.get("message").and_then(serde_json::Value::as_str).unwrap_or("query refused");
@@ -3280,7 +3282,7 @@ fn smaller_page_may_help(error: &str) -> bool {
 
 /// The description of the layer an ArcGIS query reads (`…/FeatureServer/0?f=json`), with the
 /// query's token.
-fn arcgis_layer_url(query: &str) -> String {
+pub(crate) fn arcgis_layer_url(query: &str) -> String {
     if let Ok(Some(bound)) = crate::login_address::parse(query) {
         return crate::login_address::inherit(query, &arcgis_layer_url(bound.url));
     }

@@ -125,27 +125,75 @@ pub struct Picture(&'static str);
 /// Where [`Picture::is_dropped`] points: an image a file gave that wasn't kept.
 static DROPPED: &str = "(dropped)";
 
+/// Whether `more` pictures taking `more_bytes` of base64 fit beside `count` kept ones taking
+/// `bytes` ([`MAX_PICTURES`], [`MAX_PICTURES_BYTES`]).
+fn fits((count, bytes): (usize, usize), (more, more_bytes): (usize, usize)) -> bool {
+    count + more <= MAX_PICTURES && bytes + more_bytes <= MAX_PICTURES_BYTES
+}
+
+/// Pictures kept, and the bytes of base64 they take.
+type Store = (std::collections::HashSet<&'static str>, usize);
+
+/// The pictures kept this run.
+fn kept_pictures() -> std::sync::MutexGuard<'static, Store> {
+    use std::sync::{Mutex, OnceLock};
+    static KEPT: OnceLock<Mutex<Store>> = OnceLock::new();
+    KEPT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Keeps trimmed, non-empty `images` in `store`, all or none ([`Picture::new_all`]): where each
+/// is kept, in the order given, or `None` with nothing kept when the new ones don't fit together.
+fn keep_all(store: &mut Store, images: &[&str]) -> Option<Vec<&'static str>> {
+    let (pictures, bytes) = store;
+    let mut more: Vec<&str> = images.iter().copied().filter(|b64| !pictures.contains(*b64)).collect();
+    more.sort_unstable();
+    more.dedup();
+    if !fits((pictures.len(), *bytes), (more.len(), more.iter().map(|b64| b64.len()).sum())) {
+        return None;
+    }
+    for b64 in more {
+        let p: &'static str = Box::leak(b64.to_owned().into_boxed_str());
+        pictures.insert(p);
+        *bytes += p.len();
+    }
+    images.iter().map(|b64| pictures.get(*b64).copied()).collect()
+}
+
 impl Picture {
     pub fn new(base64: &str) -> Picture {
-        use std::collections::HashSet;
-        use std::sync::{Mutex, OnceLock};
-        static KEPT: OnceLock<Mutex<(HashSet<&'static str>, usize)>> = OnceLock::new();
         let base64 = base64.trim();
         if base64.is_empty() || base64.len() > MAX_PICTURE_BYTES {
             return Picture::default();
         }
-        let mut kept = KEPT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = kept_pictures();
         let (pictures, bytes) = &mut *kept;
         if let Some(p) = pictures.get(base64) {
             return Picture(p);
         }
-        if pictures.len() >= MAX_PICTURES || *bytes + base64.len() > MAX_PICTURES_BYTES {
+        if !fits((pictures.len(), *bytes), (1, base64.len())) {
             return Picture::default();
         }
         let p: &'static str = Box::leak(base64.to_owned().into_boxed_str());
         pictures.insert(p);
         *bytes += p.len();
         Picture(p)
+    }
+
+    /// [`Picture::new`] for several images at once, all or none: `None`, keeping nothing, when one
+    /// is empty or too long, or when together they don't fit beside those already kept. Each
+    /// image's picture, in the order given (the same image twice is the same picture).
+    pub fn new_all(images: &[&str]) -> Option<Vec<Picture>> {
+        let images: Vec<&str> = images.iter().map(|b64| b64.trim()).collect();
+        if images.iter().any(|b64| b64.is_empty() || b64.len() > MAX_PICTURE_BYTES) {
+            return None;
+        }
+        keep_all(&mut kept_pictures(), &images).map(|kept| kept.into_iter().map(Picture).collect())
+    }
+
+    /// The picture already kept for `base64`, keeping nothing new: a command given an image again
+    /// (a slider dragged in the editor sends it every frame) finds it without decoding it again.
+    pub fn kept(base64: &str) -> Option<Picture> {
+        kept_pictures().0.get(base64.trim()).copied().map(Picture)
     }
 
     /// [`Picture::new`] for an image a file gives: one that isn't kept is [`Picture::is_dropped`],
@@ -1048,11 +1096,13 @@ impl Renderer {
     /// Its class expression ([`Renderer::expression`]) compiled against `ds` for drawing at the
     /// map scale 1:`map_scale` (none: no map, as in an export of the features).
     pub fn classer(&self, ds: &Dataset, map_scale: Option<f64>) -> Classer {
+        self.classer_with(ds, rustgis_data::query::Env::default().at_scale(map_scale))
+    }
+
+    /// Compiles class expressions for the scale and page being drawn.
+    pub fn classer_with(&self, ds: &Dataset, env: rustgis_data::query::Env) -> Classer {
         let Some(text) = self.expression() else { return Classer::default() };
-        Classer {
-            expr: rustgis_data::query::parse_fields(text, ds).ok(),
-            env: rustgis_data::query::Env { map_scale: map_scale.filter(|s| s.is_finite() && *s > 0.0) },
-        }
+        Classer { expr: rustgis_data::query::parse_fields(text, ds).ok(), env }
     }
 
     /// The first symbol (the single symbol, or a representative).
@@ -1135,7 +1185,7 @@ impl Renderer {
         }
         let e = rustgis_data::query::parse_fields(text, ds)?;
         if rustgis_data::query::uses_area(&e)
-            && let Some(message) = rustgis_data::ambiguous_area_message(
+            && let Some(message) = ds.ambiguous_area_message(
                 ds.features
                     .iter()
                     .enumerate()
@@ -1600,6 +1650,11 @@ impl Renderer {
     /// Values by an expression reading `@map_scale` class by. One whose expression would take
     /// more than [`MAX_LEGEND_STEPS`] to class every kept feature lists all its classes.
     pub fn legend_at(&self, ds: &Dataset, rows: &[bool], map_scale: Option<f64>) -> Vec<LegendEntry> {
+        self.legend_with(ds, rows, rustgis_data::query::Env::default().at_scale(map_scale))
+    }
+
+    /// Classes present among the kept rows at the drawing scale and page.
+    pub fn legend_with(&self, ds: &Dataset, rows: &[bool], env: rustgis_data::query::Env) -> Vec<LegendEntry> {
         let Renderer::Unique {
             field,
             classes,
@@ -1636,7 +1691,7 @@ impl Renderer {
         }
         let fi = ds.field_index(field);
         // By expression: each feature classed as it is drawn.
-        let classer = expression.as_ref().map(|_| self.classer(ds, map_scale));
+        let classer = expression.as_ref().map(|_| self.classer_with(ds, env));
         let mut used = vec![false; classes.len()];
         let mut other_used = false;
         // Distinct classes still unseen: once every class and "other" are in, the rest can't add any.
@@ -2512,6 +2567,23 @@ pub struct LabelClass {
     /// [`Perpendicular`](LabelPlacement::Perpendicular) (#2263); none labels it as `Auto`.
     #[serde(default, deserialize_with = "de_square_to", skip_serializing_if = "Option::is_none")]
     pub square_to: Option<SquareTo>,
+    /// Along a line placed curved, how the label fits the room its line gives (#2265): off places
+    /// it as before; [`LabelFit::Auto`] abbreviates a name that doesn't fit, sets one that takes
+    /// more than a third of the line on its straightest stretch, and spreads one over
+    /// [`stretch`](LabelClass::stretch) of a line with room to spare.
+    #[serde(default, deserialize_with = "de_fit", skip_serializing_if = "LabelFit::is_off")]
+    pub fit: LabelFit,
+    /// The words a fitted label abbreviates when it doesn't fit, each to its abbreviation (#2265):
+    /// whole words, matched ignoring case, taking the place of the built-in list's for the same
+    /// word. At most [`MAX_ABBREVIATIONS`], each word and abbreviation at most
+    /// [`MAX_ABBREVIATION_CHARS`] characters.
+    #[serde(default, deserialize_with = "de_abbreviations", skip_serializing_if = "BTreeMap::is_empty")]
+    pub abbreviations: BTreeMap<String, String>,
+    /// How much of its line's room a fitted label's letters are spread over when the line has
+    /// room to spare (#2265), a share within [`LABEL_STRETCH`]; none is
+    /// [`DEFAULT_LABEL_STRETCH`].
+    #[serde(default, deserialize_with = "de_stretch", skip_serializing_if = "Option::is_none")]
+    pub stretch: Option<f32>,
     /// Labels moved by hand (the Move Label tool, as QGIS's): each feature's, by its id, drawn
     /// where it was put, a callout's line back to the feature when the class has callouts. At
     /// most [`MAX_MOVED_LABELS`], kept in order of id (so a label's is found without a scan).
@@ -2964,6 +3036,65 @@ fn default_square_within() -> f32 {
     20.0
 }
 
+/// How a label along a line fits the room the line gives ([`LabelClass::fit`], #2265).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LabelFit {
+    /// Placed as its placement says, whatever room there is.
+    #[default]
+    Off,
+    /// Abbreviated when it doesn't fit, set on the line's straightest stretch when it takes more
+    /// than a third of it, and spread when the line has room to spare.
+    Auto,
+}
+
+impl LabelFit {
+    pub fn is_off(&self) -> bool {
+        *self == LabelFit::Off
+    }
+}
+
+/// Most words a class abbreviates ([`LabelClass::abbreviations`]).
+pub const MAX_ABBREVIATIONS: usize = 256;
+
+/// Most characters in an abbreviated word, or in its abbreviation.
+pub const MAX_ABBREVIATION_CHARS: usize = 64;
+
+/// Whether `word` → `short` can be kept in [`LabelClass::abbreviations`]: one word (no spaces),
+/// each side not blank and at most [`MAX_ABBREVIATION_CHARS`] characters.
+pub fn is_abbreviation(word: &str, short: &str) -> bool {
+    let fine = |s: &str| !s.trim().is_empty() && s.chars().nth(MAX_ABBREVIATION_CHARS).is_none();
+    fine(word) && fine(short) && !word.chars().any(char::is_whitespace)
+}
+
+/// The shares of a line's room a fitted label may be spread over ([`LabelClass::stretch`]).
+pub const LABEL_STRETCH: std::ops::RangeInclusive<f32> = 0.1..=1.0;
+
+/// The share of a line's room a fitted label is spread over when its class gives none.
+pub const DEFAULT_LABEL_STRETCH: f32 = 0.6;
+
+/// A project file's `stretch`, brought into [`LABEL_STRETCH`]; one that isn't a number is none.
+fn de_stretch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(lenient::<D, f64>(d)?.filter(|s| s.is_finite()).map(|s| (s as f32).clamp(*LABEL_STRETCH.start(), *LABEL_STRETCH.end())))
+}
+
+/// A project file's `fit`: one that doesn't read is off.
+fn de_fit<'de, D: serde::Deserializer<'de>>(d: D) -> Result<LabelFit, D::Error> {
+    Ok(lenient::<D, LabelFit>(d)?.unwrap_or_default())
+}
+
+/// A project file's `abbreviations`: those [`is_abbreviation`] keeps, at most
+/// [`MAX_ABBREVIATIONS`]; one that isn't an object of texts is none.
+fn de_abbreviations<'de, D: serde::Deserializer<'de>>(d: D) -> Result<BTreeMap<String, String>, D::Error> {
+    let all = lenient::<D, BTreeMap<String, serde_json::Value>>(d)?.unwrap_or_default();
+    Ok(all
+        .into_iter()
+        .filter_map(|(w, s)| Some((w, s.as_str()?.to_owned())))
+        .filter(|(w, s)| is_abbreviation(w, s))
+        .take(MAX_ABBREVIATIONS)
+        .collect())
+}
+
 /// A project file's `square_to`: one that doesn't read, or names no layer, is none; its
 /// `within` brought into range.
 fn de_square_to<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<SquareTo>, D::Error> {
@@ -2992,8 +3123,8 @@ pub enum LabelPlacement {
     /// Along a line, straight, turned to its direction across the text, at its middle; points
     /// and polygons are labelled as `Auto`.
     Parallel,
-    /// Along a line, each character turned with it where it bends, at its middle; points and
-    /// polygons are labelled as `Auto`.
+    /// Along a line, each character turned with it where it bends, at its middle; a polygon's
+    /// along its centre line (#2262), as `Auto` where it doesn't fit; points as `Auto`.
     Curved,
     /// A point's label turned square to the nearest line of [`LabelClass::square_to`], starting
     /// at the point (#2263); a point with no line that near, lines and polygons as `Auto`. (Not
@@ -3144,6 +3275,9 @@ impl LabelClass {
             show_all: false,
             callout: None,
             square_to: None,
+            fit: LabelFit::Off,
+            abbreviations: BTreeMap::new(),
+            stretch: None,
             moved: Vec::new(),
             by: Default::default(),
         }
@@ -3195,7 +3329,11 @@ impl<'a> LabelMatcher<'a> {
     /// `map_scale`: the scale (1:N) the labels are drawn at, which a clause may read
     /// (`@map_scale`); none: no map.
     pub fn new(labels: &'a Labeling, ds: &Dataset, map_scale: Option<f64>) -> Self {
-        let env = rustgis_data::query::Env { map_scale: map_scale.filter(|s| s.is_finite() && *s > 0.0) };
+        Self::with_env(labels, ds, rustgis_data::query::Env::default().at_scale(map_scale))
+    }
+
+    /// Compiles the label class filters with the drawing scale and page available.
+    pub fn with_env(labels: &'a Labeling, ds: &Dataset, env: rustgis_data::query::Env) -> Self {
         LabelMatcher { classes: labels.in_order().map(|c| (c, c.query(ds))).collect(), env }
     }
 
@@ -3546,6 +3684,45 @@ mod tests {
         assert!(std::ptr::eq(FontName::new("Some Family").as_str(), FontName::new("Some Family ").as_str()));
     }
 
+    /// `Picture::kept` finds an image kept before, and keeps none it doesn't know.
+    #[test]
+    fn kept_finds_a_kept_picture_and_keeps_nothing_new() {
+        let unseen = "a picture never kept, for this test alone";
+        assert_eq!(Picture::kept(unseen), None);
+        assert_eq!(Picture::kept(unseen), None, "the lookup kept nothing");
+        let p = Picture::new("kept, for this test alone");
+        assert_eq!(Picture::kept(" kept, for this test alone "), Some(p), "trimmed, as new trims");
+    }
+
+    /// Several images are kept together or not at all: the store's limits are weighed for the
+    /// lot, images already kept and repeated ones counted once.
+    #[test]
+    fn pictures_are_kept_all_or_none() {
+        assert!(fits((MAX_PICTURES - 2, 0), (2, 10)) && !fits((MAX_PICTURES - 1, 0), (2, 10)));
+        assert!(fits((0, MAX_PICTURES_BYTES - 10), (1, 10)) && !fits((0, MAX_PICTURES_BYTES - 10), (2, 11)));
+        let old = Picture::new("YWxsLW9yLW5vbmUtb2xk");
+        let all = Picture::new_all(&["YWxsLW9yLW5vbmUtYQ==", " YWxsLW9yLW5vbmUtb2xk ", "YWxsLW9yLW5vbmUtYQ=="]).unwrap();
+        assert_eq!((all[1], all[0]), (old, all[2]));
+        assert_eq!(Picture::kept("YWxsLW9yLW5vbmUtYQ=="), Some(all[0]));
+        // One that can't be kept refuses the lot.
+        assert_eq!(Picture::new_all(&["YWxsLW9yLW5vbmUtYg==", " "]), None);
+        assert_eq!(Picture::kept("YWxsLW9yLW5vbmUtYg=="), None);
+        // A store one picture short of full (a store of its own, not the run's): two new images
+        // don't fit, and neither is kept; one does, beside one kept already.
+        let mut store: Store = Default::default();
+        for i in 1..MAX_PICTURES {
+            let p: &'static str = Box::leak(format!("p{i}").into_boxed_str());
+            store.0.insert(p);
+            store.1 += p.len();
+        }
+        let before = (store.0.len(), store.1);
+        assert_eq!(keep_all(&mut store, &["bmV3LW9uZQ==", "bmV3LXR3bw==", "p1"]), None);
+        assert_eq!((store.0.len(), store.1), before, "nothing kept");
+        let kept = keep_all(&mut store, &["bmV3LW9uZQ==", "p1", "bmV3LW9uZQ=="]).unwrap();
+        assert_eq!((kept[0], kept[1]), ("bmV3LW9uZQ==", "p1"));
+        assert!(std::ptr::eq(kept[0], kept[2]) && store.0.len() == MAX_PICTURES);
+    }
+
     /// A picture marker is written with its image, and read back as the same kept image; one a
     /// crafted file makes too long, or not text, is no image (drawn as a circle), and the rest
     /// still reads.
@@ -3611,6 +3788,11 @@ mod tests {
         // Its dots show in a feature of no fill, as the point's image does.
         assert!(dots(m).draws(none) && !dots(Marker::Circle).draws(none));
         assert!(!dots(Marker::Picture(Picture::default())).draws(none));
+        let mut sizeless = dots(m);
+        if let crate::fills::FillPattern::Dots { size, .. } = &mut sizeless.pattern {
+            *size = 0.0;
+        }
+        assert!(!sizeless.draws(none), "an image of no size");
         assert!(!crate::fills::fills_have_pictures(&[dots(Marker::Circle), crate::fills::FillLayer::default()], |_| true));
     }
 

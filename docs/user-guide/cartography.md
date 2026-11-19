@@ -91,13 +91,14 @@ draws a circle, so the point still shows. By command:
 layer.marker={"layer":"Peaks","char":"▲","font":"DejaVu Sans","size":12}
 ```
 
-A marker can also be an **image**: a PNG or JPEG, given by command as base64 (at most 2 MiB).
+A marker can also be an **image**: a PNG or JPEG, given by command as base64 (at most 2 MiB of base64 text, an image of about 1.5 MiB). Other formats, such as GIF, aren't taken.
 Its size is its width, and it is as tall as its proportions make it, as QGIS draws a raster image
 marker; the symbol's fill and outline don't show. It turns with **Rotation**, is ringed when
 selected, and is kept in the project file. A project that has one opens only in a RustGIS that
 draws them. An image that doesn't decode draws a circle, so the point still shows; opening a
 project, map file or layer file, or adding styles, says which layers and styles have such an image,
-or one too large to keep:
+or one too large to keep. The **Layers** pane, its legend and the editors' previews (the symbol's,
+the strokes' and the fills') show the image too, whole within their patch and not turned:
 
 ```text
 layer.marker={"layer":"Schools","image":"iVBORw0KGgo…","size":16}
@@ -110,8 +111,8 @@ symbol's: a white disc under a sign, say, so it reads on any background. Each ma
 colour, outline, shape, size and angle, and is shifted right (**Offset right**) and down
 (**Offset down**); its offset turns with its angle, as QGIS turns it. **With the field** turns a
 mark by the rotation field too, or keeps it still. A layer with classes can have marks for one
-class of its own, as line strokes can. By command, `layer.markerRotation` and the point layer's
-strokes of markers:
+class of its own, as line strokes can. A mark can be an image too, by command, as along a line
+(below). By command, `layer.markerRotation` and the point layer's strokes of markers:
 
 ```text
 layer.markerRotation={"layer":"Signs","field":"angle","counterclockwise":true}
@@ -335,13 +336,18 @@ Markers take a **Shape** (a character of a font too, as for points) and a **Size
 its start), at its vertices or its inner ones, at either end or both, or in its middle. **With the
 line** turns each mark with the line's direction; the **Angle** turns it further, clockwise. Marks
 take the stroke's colour, its width as a hash mark's line (or a marker's outline, by command), and
-its offset to either side. Stack them with line strokes: a casing, a core and ticks across it. By
-command, `"markers"` on a stroke:
+its offset to either side. Stack them with line strokes: a casing, a core and ticks across it. A
+marker can also be an image, by command (`"image"`, a PNG or JPEG as base64 of at most 2 MiB): as
+wide as its **Size** and as tall as its proportions make it, turned with the line, the stroke's
+colour and outline left out; selected, each is framed. An image a file gave that can't be drawn
+(too large to keep, or one that doesn't decode) shows as a circle; changing the strokes in the
+pane makes it the circle, and says so. By command, `"markers"` on a stroke:
 
 ```text
 layer.lineStrokes={"layer":"Railways","strokes":[{"color":"#333333","width":1.5},{"color":"#333333","width":1,"markers":{"mark":"hash","size":6,"interval":10}}]}
 layer.lineStrokes={"layer":"Rivers","strokes":[{"width":1},{"markers":{"mark":"triangle","size":7,"at":"middle"}}]}
 layer.lineStrokes={"layer":"Trails","strokes":[{"markers":{"mark":"character","char":"»","font":"DejaVu Sans","size":8,"interval":16}}]}
+layer.lineStrokes={"layer":"Pipelines","strokes":[{"width":1},{"markers":{"image":"iVBORw0KGgo…","size":12,"at":"middle"}}]}
 ```
 
 `"at"` takes `"interval"`, `"vertices"`, `"innerVertices"`, `"first"`, `"last"`, `"middle"` and
@@ -359,7 +365,8 @@ arrows move one up or down and the cross removes it; the top fill is listed firs
 **Solid**, **Hatch lines** (parallel lines at an **Angle**, anticlockwise from east, **Spacing**
 apart, of a **Line width**, shifted across by an **Offset**), **Markers** (a **Marker** shape
 of a **Size** on a grid **Spacing across** and **Spacing down** apart, **Rows shifted** to
-stagger them), **Gradient** or **Shapeburst**. A gradient shades each feature from its colour to
+stagger them; by command the marker can be an image, `"image"`, as along a line), **Gradient** or
+**Shapeburst**. A gradient shades each feature from its colour to
 a **Second color**: by default top to bottom, of a **Type** that runs **Linear** (straight
 across), **Radial** (in rings from its first point) or **Conical** (round its first point),
 turned by an **Angle** (anticlockwise), and past its points a **Spread** of **Pad** (its end
@@ -388,6 +395,20 @@ A gradient's `from` and `to` are places in the feature's box (`[across, down]`, 
 `[]` goes back to the single fill (for a class, to the layer's fills). Fills draw on the CPU (on the
 globe, patterns keep to the screen rather than the map as it turns); the
 legend shows the symbol's colour.
+
+**Hatch only flagged polygons.** Use an overlay to hatch unreliable estimates while keeping
+the choropleth's colours visible.
+
+1. On the choropleth layer, use **Select By Attributes** with `FLAG = 1`, then **Data ›
+   Selection › Make Layer From Selected Features**. Clear the selection on the original layer.
+2. Keep the new layer above the choropleth and rename it **Unreliable estimates (hatched)**.
+   In its **Symbology › Fills**, add one fill and set **Draw** to **Hatch lines**. Set the line
+   colour and spacing so the choropleth shows through. Set **Outline width** to 0 if the
+   choropleth already draws the boundaries.
+3. Include both layers in the [layout legend](layouts.md#layouts). The overlay's swatch
+   uses a solid colour, so keep “(hatched)” in its name or legend label to explain the pattern.
+
+The new layer contains a copy of the selected features. Recreate it if the flag values change.
 
 ### Reference scale
 
@@ -633,8 +654,13 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   in view, centred on the line and kept upright, and may run past its ends by about a letter; a
   line too short for its text, or (curved) one bending more than 25° from one character to the
   next, is left unlabelled. A text over 200 characters long is set straight rather than
-  curved. Points and polygons with these placements are labelled as automatic
-  (`labels.placement={"layer": "Rivers", "position": "curved"}`).
+  curved. Points with these placements, and polygons placed parallel, are labelled as automatic
+  (`labels.placement={"layer": "Rivers", "position": "curved"}`). A polygon placed **Curved**
+  has its label on one line along its centre line, the longest path down the middle of its part
+  in view, as a lake's or a valley's name follows its shape: from its middle, else as near it as
+  the text fits, with the polygon at least half the text's height either side and the centre
+  line trimmed short of its tips. A polygon too short, narrow or sharply bent for its text is
+  labelled as automatic (`labels.placement={"layer": "Lakes", "position": "curved"}`).
 - **Other places round points**: a point's label whose place another label takes tries the
   other places round the point, corners first (above right, above left, below right, below left,
   right, left, above, below, leaving out its own), and goes to the first where
@@ -652,6 +678,27 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   the setting does nothing there or at a position off the line. Off by default, for the same reason
   as round points, and Lock keeps the place each label took
   (`labels.placement={"layer": "Rivers", "position": "curved", "otherPositions": true}`).
+- **Names that fit their line**: a Curved label with `"fit": "auto"` is fitted to the room its
+  line gives, as hand-lettered maps name streams. A name that can't follow the line anywhere it is
+  tried is abbreviated (whole words: Córrego → Cór., Ribeirão → Rib., Rio → R., Creek → Cr.,
+  River → R., Arroyo → Ao., from a built-in English, Portuguese and Spanish list, or the class's
+  own `"abbreviations"`, which go first) and tried again; still too long, it is left out. A name
+  that takes more than a third of the line goes on its straightest stretch rather than at the
+  middle: the stretch whose ends are farthest apart for its length. With other places along the
+  line on, the next straightest stretches are its other places. On a line with room to spare
+  (more than three times the name), the letters are spread, more as the room grows, toward
+  `"stretch"` of the line (`labels.style`, 0.1 to 1; 0.6 by default), which they reach on a line
+  six times the name or longer (a `"stretch"` under a sixth spreads only once the line is more
+  than 1/`"stretch"` times the name). They are never more than three letters' widths apart, so on
+  a much longer line the name covers less. A spread name is tried at the middle first, then
+  farther along; where it can't follow the line, it is set close. A spread name follows a
+  smoother course, so it can also go where the close-set name was too bent to follow. With a
+  `repeat`, a line more than two spread names long gets the spread name at its middle and the
+  close-set name at the repeats clear of it, as a river is named along its valley and again
+  toward its ends; a shorter line keeps its repeats close-set.
+  Text size by a stream's importance (a Strahler order or a class field) comes from label classes
+  or `labels.by` `"size"` (`labels.placement={"layer": "Rivers", "position": "curved", "fit":
+  "auto", "abbreviations": {"Creek": "Ck"}}`).
 - **Lock** keeps the labelled features fixed while you pan and zoom; **Pause** stops drawing
   labels for faster navigation; **View Unplaced** draws the labels that didn't fit in red. They
   apply to the whole map, so they are on the ribbon (Labeling › Map Labeling), not in the pane.

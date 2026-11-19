@@ -11,6 +11,13 @@ use crate::{RustGisApp, icons};
 pub const CONTENT_H: f32 = 72.0;
 pub const LABEL_H: f32 = 18.0;
 
+/// The least width of a ribbon button's menu.
+pub const MENU_MIN_W: f32 = 200.0;
+
+/// The least width of a submenu, so one of short rows (a page size's styles) doesn't open as a
+/// strip; narrower than a menu, whose rows have room for an icon and a shortcut (#2398).
+pub const SUBMENU_MIN_W: f32 = 100.0;
+
 /// A number its caller lends saved each frame and saves only once it is settled, kept across a
 /// drag (#597, #607). egui's `DragValue` keeps the value dragged so far in its own memory and
 /// forgets it when the pointer is released, a frame on which `dragged()` is false: lent the saved
@@ -450,11 +457,13 @@ fn big_split_menu_with(
         let _ = app.run_by_user(id, params);
     }
     egui::Popup::menu(&arrow).close_behavior(close).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
     (primary, arrow)
 }
+
+pub(crate) const SMALL_ICON_BUTTON_WIDTH: f32 = 26.0;
 
 /// A small button: 18 px icon with an optional label.
 pub fn small(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, id: &str, params: Value, checked: bool) -> Response {
@@ -495,7 +504,7 @@ fn small_button(
     let (label, desc) = (tl!(label), tl!(desc));
     let t = Tokens::get(ui.ctx());
     let tw = if label.is_empty() { 0.0 } else { text_w(ui, label, regular(11.5)) + 8.0 };
-    let (r, resp) = ui.allocate_exact_size(vec2(26.0 + tw, 22.0), Sense::click());
+    let (r, resp) = ui.allocate_exact_size(vec2(SMALL_ICON_BUTTON_WIDTH + tw, 22.0), Sense::click());
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, on, if label.is_empty() { desc } else { label }));
     bg(ui, r, &resp, checked, &t);
     let ic = Rect::from_center_size(pos2(r.min.x + 13.0, r.center().y), vec2(18.0, 18.0));
@@ -523,7 +532,7 @@ fn small_button(
 pub fn big_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, menu: impl FnOnce(&mut Ui, &mut RustGisApp)) {
     let resp = big(ui, app, icon, label, desc, "ui.menu", Value::Null, false, true);
     egui::Popup::menu(&resp).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -533,7 +542,7 @@ pub fn big_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc
 pub fn big_form_menu(ui: &mut Ui, app: &mut RustGisApp, icon: &str, label: &str, desc: &str, menu: impl FnOnce(&mut Ui, &mut RustGisApp)) {
     let resp = big(ui, app, icon, label, desc, "ui.menu", Value::Null, false, true);
     egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -576,7 +585,7 @@ fn small_menu_with(
     caret(ui.painter(), pos2(r.max.x - 9.0, r.center().y), t.text);
     let resp = tooltip(app, resp, label, desc, "ui.menu", &Value::Null);
     egui::Popup::menu(&resp).close_behavior(close).show(|ui| {
-        ui.set_min_width(200.0);
+        ui.set_min_width(MENU_MIN_W);
         menu(ui, app);
     });
 }
@@ -620,13 +629,35 @@ pub fn menu_row(ui: &mut Ui, icon: &str, label: &str, shortcut: &str, on: bool) 
     resp
 }
 
-/// A menu row with an icon that opens a submenu of `add`'s rows.
+/// A menu row with an icon and a highlight when it represents the current choice.
+pub(crate) fn selectable_menu_row(ui: &mut Ui, icon: &str, label: &str, selected: bool) -> Response {
+    let button = egui::Button::selectable(selected, menu_text(ui, icon, label)).min_size(vec2(ui.available_width(), 0.0));
+    let response = ui.add(button);
+    menu_icon(ui, &response, icon);
+    response
+}
+
+/// A menu row with an icon that opens a submenu of `add`'s rows, at least [`SUBMENU_MIN_W`]
+/// wide: in a menu of [`menu_item`] rows, as tall as they are.
 pub fn submenu_row(ui: &mut Ui, icon: &str, label: &str, add: impl FnOnce(&mut Ui)) {
     let button = egui::Button::new(menu_text(ui, icon, label))
         .min_size(vec2(0.0, 24.0))
         .right_text(egui::containers::menu::SubMenuButton::arrow_atom(None));
-    let (resp, _) = egui::containers::menu::SubMenuButton::from_button(button).ui(ui, add);
+    let (resp, _) = egui::containers::menu::SubMenuButton::from_button(button).ui(ui, |ui| {
+        ui.set_min_width(SUBMENU_MIN_W);
+        add(ui);
+    });
     menu_icon(ui, &resp, icon);
+}
+
+/// A row that opens a submenu of `add`'s rows, at least [`SUBMENU_MIN_W`] wide: in a menu of
+/// plain buttons, as tall as they are (a menu of [`menu_item`] rows uses [`submenu_row`]).
+pub fn submenu(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) -> Response {
+    ui.menu_button(label, |ui| {
+        ui.set_min_width(SUBMENU_MIN_W);
+        add(ui);
+    })
+    .response
 }
 
 /// A menu row's label: with an icon, it starts after it, so the icon is drawn inside the row (and the menu).

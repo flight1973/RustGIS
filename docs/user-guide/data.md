@@ -27,6 +27,7 @@ Formats](data-formats.md).
 | GeoTIFF and cloud-optimised GeoTIFF (`.tif`, `.tiff`) | Yes | Yes |
 | ASCII grid (`.asc`, with an optional `.prj`) | Yes | No |
 | Unreferenced TIFF and PNG scans; JPEG with `"as": "scan"` | Yes | GeoTIFF after georeferencing |
+| PDF pages: GeoPDFs placed by their coordinates, other pages as scans | Yes (desktop, command line and Python) | GeoTIFF after georeferencing |
 | Through GDAL: JPEG 2000, ERDAS Imagine, SRTM HGT, DTED, NetCDF, HDF, ENVI, SAGA… | Yes (desktop, when GDAL is installed) | No |
 | Web tiles: XYZ/TMS/WMS rasters, Mapbox Vector Tiles, MapLibre styles, PMTiles and MBTiles archives | Yes | Yes (Imagery › Create Hosted Imagery) |
 | RustGIS project (`.rgis`; older `.rgisx` files open too) | Yes | Yes |
@@ -82,8 +83,8 @@ dialog open for another try.
 Published pipe-delimited `.dat` files open as tables when their header and rows reveal a
 separator; otherwise give `"delimiter":"|"` to `layer.addData`, or rename a text file to `.txt`.
 Gzip-compressed UTF-8 `.csv.gz`, `.tsv.gz`, `.txt.gz` and `.dat.gz` open directly, including by
-URL or upload. Decompression streams records, checks the gzip checksum and stops at 256 MiB of
-expanded text. Table rows are still kept in memory for type inference; CSV imports also refuse
+URL or upload. Decompression streams records, checks the gzip checksum and stops at the size read into memory
+(256 MiB in the web app; on the desktop it follows the computer's memory) of expanded text. Table rows are still kept in memory for type inference; CSV imports also refuse
 a retained-table estimate above a quarter of physical memory, between 256 MiB (the browser
 budget) and 4 GiB. This estimate includes cell objects and the dataset built alongside the rows. Delimited members
 in one ZIP share this allowance, including gzip-compressed members.
@@ -103,16 +104,31 @@ ones from, with the coordinate system (such as `EPSG:2263`) and the separator (c
 the columns again); `info.fileColumns` lists them for scripts. Add Data finds them itself
 (columns named like longitude/latitude, including GTFS `stop_lon`/`stop_lat`, easting/northing or
 geometry, and EWKT's `SRID=`). With no projected coordinate system or explicit column choices,
-a specific longitude/latitude pair is preferred over generic X/Y when it gives in-range,
-non-0,0 positions on at least as many rows as the first pair gives finite positions.
-That pair is used for the whole file.
+RustGIS compares complete longitude/latitude and X/Y pairs regardless of column order.
+X/Y includes planar aliases such as easting/northing. RustGIS counts in-range, non-0,0 positions
+for each pair, preferring longitude/latitude when the counts are equal and nonzero.
+That pair is used for the whole file. Automatic detection keeps X/Y and longitude/latitude
+separate. If it finds candidate names for both axes but no matching pair or WKT column,
+the file opens as a table with a notice naming the candidates so you can choose x and y.
 The published aliases `Longitude Decimal Degrees`/`Latitude Decimal Degrees` and
-`Longitutde`/`Lattitude` are recognised too. The dialog checks the first 1,000 rows of delimited
-text, or every row of a spreadsheet, to pick defaults. It recomputes unchanged defaults when you
+`Longitutde`, `Longtitude` and `Lattitude` are recognised too, and so are longitude and latitude
+in other languages and scripts: Chinese (`經度`/`緯度`, `座標經度`/`座標緯度`, `经度`/`纬度`), Japanese
+(`経度`/`緯度`), Korean (`경도`/`위도`), and the words for them in Vietnamese, Thai, Indonesian, Hindi,
+Arabic, Persian, Hebrew, Russian, Ukrainian, Greek, German (`Längengrad`/`Breitengrad`), Dutch,
+Spanish (`longitud`/`latitud`), Italian, the Nordic languages, Polish, Czech, Hungarian, Turkish
+and others, in any case. A note in brackets after a name (`經度(X)`, `Longitude (WGS84)`,
+`lat [deg]`) is set aside; a name as written comes before one with a note, in English and in
+other languages. A word that is also an object's length or width (German `Länge` and `Breite`)
+isn't taken as a coordinate, nor named in the notice; Spanish `longitud`, which is also a length,
+is taken only as written and beside `latitud`. English names come first when a file has both,
+and export writes English names. A name whose accents a file saved as separate marks (as some
+Macs save Vietnamese) reads as one typed with them. The dialog checks the first 1,000 rows
+of delimited text, or every row of a spreadsheet, to pick defaults. It recomputes unchanged defaults when you
 leave the coordinate-system box or press Enter; columns you picked stay picked. With a projected
 coordinate system, defaults prefer X/Y or easting/northing columns when the file also has
 longitude/latitude columns.
-Add Data checks all rows. Coordinates still outside degree ranges are counted in a
+If you leave the suggested columns untouched, Add Data checks all rows before choosing the pair.
+Coordinates still outside degree ranges are counted in a
 notice. Points placed at exactly 0,0 are also counted in a notice: these often mean missing
 coordinates, but the points are kept. A CSV without coordinate columns, or a layer without geometry, opens as a
 standalone table, listed under the map in Layers; right-click it to open or remove it. Tables
@@ -123,6 +139,15 @@ the table's name beside it (`input_name`). The **XY Table To Point** tool
 ([Geoprocessing](analysis.md), and a table's right-click menu) makes points of a table already in
 the project, from two fields of coordinates and their coordinate system. In a text field a single comma is the decimal separator
 (`1,234` is 1.234); thousands separators are not read.
+
+**Use a polygon's published interior point.** To place TIGER interior points, run **XY Table
+To Point** with the polygon layer as **Input Table**. Set **X Field** to `INTPTLON` and **Y Field**
+to `INTPTLAT` (use `INTPTLON20` and `INTPTLAT20` when the fields have that suffix). The tool
+reads signed, zero-padded text directly, such as `-093.1445780` and `+44.9500000`.
+Set the tool's **Coordinate System** (`crs`) to the fields' system: NAD83, `EPSG:4269`, for
+TIGER/Line. Left empty, it places them as WGS 84. The new layer
+keeps the attributes and places points at the published coordinates. Check the tool's messages
+for any rows kept without a point.
 
 Excel `.xls` records, formula operands and sheet bounds are checked before opening, including
 sheets that were not selected. The workbook shares a memory budget across its sheets and retained
@@ -173,8 +198,14 @@ GeoParquet and FlatGeobuf carry their coordinate system in the file. Rasters kee
 coordinate system and are reprojected as they draw. The map uses Web Mercator by default, but
 **View › Projection** can change it; see [Maps](maps.md).
 
-Coordinate systems are read and transformed as PROJ 9.8.1 does, through terrio-crs. ESRI `.prj`
-files without an EPSG code use their projection parameters, and their datum is recognized by
+Coordinate systems are read and transformed as PROJ 9.9.0 does, through terrio-crs. A few EPSG
+and ESRI codes PROJ 9.9.0 dropped or can't compute (EPSG:3752 and 22700, ESRI:10820 and 65162)
+keep the definitions RustGIS read them by before, so they don't follow PROJ exactly. A project
+saved by an earlier release keeps the definition it saved for a layer in an ESRI code, so that
+layer is placed as it was then (ESRI:102144 246 m from PROJ 9.9.0, for one); the same code read
+from a file now is placed as PROJ places it.
+
+ESRI `.prj` files without an EPSG code use their projection parameters, and their datum is recognized by
 the name Esri gives it (ED50, OSGB36, DHDN, `D_Philippine_Reference_System_1992`,
 `D_Pulkovo_1942`, `D_Tokyo` and others): it takes the transformation PROJ uses for that datum
 and place. In a `.prj` or other WKT:
@@ -358,6 +389,53 @@ database is trusted like the query, since its views run as part of it.
 
 **Home › Add › Add Data** opens a DuckDB database file (`.duckdb`, `.ddb`): every table with a geometry
 column becomes a layer (`"layer"` picks one).
+
+### Count GTFS departures per stop
+
+To count scheduled departures from 07:00 up to but excluding 09:00 on Tuesday, 8 December 2026,
+unzip the feed and run this in **Analyze › SQL** with DuckDB installed. Use the extracted files'
+full paths in `read_csv`. Reading the fields as text keeps IDs such as `006` distinct from `6`.
+
+```sql
+WITH exceptions AS (
+  SELECT service_id, exception_type
+  FROM read_csv('calendar_dates.txt', all_varchar = true)
+  WHERE date = '20261208'
+), active AS (
+  SELECT service_id
+  FROM read_csv('calendar.txt', all_varchar = true)
+  WHERE tuesday = '1' AND '20261208' BETWEEN start_date AND end_date
+    AND service_id NOT IN (SELECT service_id FROM exceptions WHERE exception_type = '2')
+  UNION
+  SELECT service_id FROM exceptions WHERE exception_type = '1'
+)
+SELECT s.stop_id, count(*) AS departures
+FROM read_csv('stop_times.txt', all_varchar = true) AS s
+JOIN read_csv('trips.txt', all_varchar = true) AS t USING (trip_id)
+JOIN active AS a ON a.service_id = t.service_id
+WHERE lpad(s.departure_time, 8, '0') >= '07:00:00'
+  AND lpad(s.departure_time, 8, '0') < '09:00:00'
+  AND s.stop_id IS NOT NULL
+  -- With frequencies.txt in the feed, also leave out its template trips:
+  -- AND t.trip_id NOT IN (SELECT trip_id FROM read_csv('frequencies.txt', all_varchar = true))
+GROUP BY s.stop_id
+ORDER BY s.stop_id
+```
+
+Match date exceptions to the weekly calendar by `service_id`. Type 2 removes service and
+type 1 adds it, even when the ID has no weekly row. Then match active services to trips by
+`service_id` and trips to stop times by `trip_id`. For another date, change both date literals
+and the weekday column. If the feed uses only `calendar_dates.txt`, keep just the additions
+in `active`. If it uses only `calendar.txt`, keep the weekly rule and omit the exception checks.
+
+The time filter pads one-digit hours and uses the feed's local service-day times, where
+`24:30:00` is after midnight on that service day. The result counts timed rows per `stop_id`,
+including repeat visits by a trip. Stops with no departures in the window have no row. The SQL
+pane previews the first 200 rows. This query uses the times in `stop_times.txt`. Frequency-based trips need a
+separate calculation using [`frequencies.txt`](https://gtfs.org/documentation/schedule/reference/#frequenciestxt),
+and their `trip_id`s left out of this query: their stop times are a template, which it would
+count as one departure. When the feed has that file, remove the `-- ` before the
+`AND t.trip_id NOT IN …` line.
 
 ### PostgreSQL and PostGIS
 
@@ -976,6 +1054,10 @@ of `id`. With `probe: true`, it returns the secret-free address to fetch (`fetch
 databases). For non-database kinds, pass that response text as `answer` with the same definition
 to parse it without a network request. Database kinds ignore `answer` and test through their
 driver. An anonymous S3 test needs at least one named bucket.
+
+**Test** does not send service requests to XYZ URL templates with tile coordinates
+(`{z}/{x}/{y}`, also `{zoom}` or `{-y}`). To add one to the map, use
+**Home › Add › Basemap › Add Tile Layer…** (`map.addTiles`) instead.
 
 `connection.browse` lists what a connection offers, a level at a time: database roots list the
 schemas returned by their provider; opening a schema lists its spatial tables. Services list their
@@ -1637,9 +1719,12 @@ coordinates, read whole, so it takes grids of up to 4,000,000 cells a side; a lo
 size. A box reaching past the grid is read within it, and says so; one over a longitude grid's
 edge (0°/360°, or ±180°) is refused: give a box on each side (one round the whole globe is the
 whole grid); `raster.zarrInfo` with
-`"bbox"` gives the cells a box covers (`window.cells`). A window is at least 2 × 2 cells (a box within one cell is widened to two, and says so), and
-doesn't follow the time slider yet. A window is kept in the project as a GeoTIFF, as a web
-store's slice is, also from a folder.
+`"bbox"` gives the cells a box covers (`window.cells`). A window is at least 2 × 2 cells (a box within one cell is widened to two, and says so). A window
+is kept in the project as a GeoTIFF, as a web store's slice is, also from a folder; with
+`"time": true` it follows the time slider instead, each step reading only the window, and the
+project keeps the window's cells with the store. A grid whose axes aren't named or measured as
+longitude, but whose store gives a geographic system, takes a box or a point written either way
+round the globe too, as it is drawn.
 
 **Follow the time slider** (desktop; `layer.addZarr` with `"time": true`) adds the variable as one
 layer whose step is the time slider's. The slider turns on over the variable's dates when it is

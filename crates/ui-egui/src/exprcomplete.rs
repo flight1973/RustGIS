@@ -7,11 +7,11 @@
 
 use egui::text::{CCursor, CCursorRange};
 use egui::widgets::text_edit::{TextEditOutput, TextEditState};
-use egui::{Id, Key, Modifiers, Ui};
+use egui::{Id, Ui};
 use rustgis_engine::data::Dataset;
 use rustgis_engine::data::query::{self, Call, Completion, FuncSpec, Kw, Place, VARS};
 
-use crate::completion::{Before, GAP, Keyed, List, Offered, Tip, Worked, byte_at, char_at, pairs};
+use crate::completion::{Asked, Before, GAP, Keyed, List, Offered, Tip, Worked, byte_at, char_at, pairs};
 
 /// The most fields the list holds (typing narrows them; it scrolls): a table of hundreds of
 /// columns mustn't draw hundreds of rows. The functions, variables and keywords after them are
@@ -20,7 +20,7 @@ const MAX_FIELDS: usize = 50;
 
 /// How many lines a call's signature is first guessed to take (the signature, and the
 /// description on up to three): where it goes before it's drawn once.
-const TIP_ROWS: usize = 4;
+pub(crate) const TIP_ROWS: usize = 4;
 
 /// What an item stands for.
 #[derive(Clone, Debug, PartialEq)]
@@ -55,6 +55,13 @@ impl Offered for Offer {
     }
 }
 
+impl Offer {
+    /// Where the word it replaces starts (a char index of the expression).
+    pub(crate) fn start(&self) -> usize {
+        self.start
+    }
+}
+
 /// A field as an expression names it: as it is when it reads as a plain name, else in double
 /// quotes (a space, a leading digit, a keyword of the language).
 pub(crate) fn field_ref(name: &str) -> String {
@@ -72,7 +79,7 @@ fn starts_with(name: &str, prefix: &str) -> bool {
 /// what goes there that starts with the word typed (the word typed whole isn't offered again).
 /// Only once a character of the word is typed (a quote begun counts), unless `asked`
 /// (Ctrl+Space).
-fn offer_from(c: &Completion, text: &str, ds: &Dataset, asked: bool) -> Option<Offer> {
+pub(crate) fn offer_from(c: &Completion, text: &str, ds: &Dataset, asked: bool) -> Option<Offer> {
     if c.place == Place::Text || (c.word.is_empty() && !asked) {
         return None;
     }
@@ -138,9 +145,8 @@ struct State {
     /// The signature of the call the cursor is in, floating by it while the list is closed, for
     /// the call's `(` (where it starts).
     tip: Tip<usize>,
-    /// Where Ctrl+Space asked for the list (the text's hash and the cursor): it shows there with
-    /// no word typed, until the text or the cursor moves on.
-    asked: Option<(u64, usize)>,
+    /// Where Ctrl+Space asked for the list: it shows there with no word typed.
+    asked: Asked,
     /// Where an item was just accepted (the text's hash and the cursor): nothing is offered there
     /// (`pop` taken mustn't offer `"Pop Est"`, for Enter to take next), until the text or the
     /// cursor moves on, or Ctrl+Space asks.
@@ -175,9 +181,7 @@ pub(crate) fn expr_edit(
 ) -> egui::Response {
     let mut state = load(ui, id);
     // The list's keys, taken before the box sees them: Ctrl+Space asks for the list.
-    if ui.memory(|m| m.has_focus(id)) && ui.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Space)) {
-        let at = TextEditState::load(ui.ctx(), id).and_then(|s| s.cursor.char_range()).map(|r| r.primary.index.0);
-        state.asked = at.map(|at| (egui::util::hash(text.as_str()), at));
+    if state.asked.keys(ui, id, text) {
         state.list.reopen();
     }
     if state.worked.as_ref().is_some_and(|w| w.text != egui::util::hash(text.as_str())) {
@@ -205,11 +209,7 @@ pub(crate) fn expr_edit(
     let asked = &mut state.asked;
     let accepted = &mut state.accepted;
     let work = |at: Option<usize>| {
-        // Asked here, and still here.
-        let here = at.is_some_and(|at| *asked == Some((hash, at)));
-        if !here {
-            *asked = None;
-        }
+        let here = asked.here(hash, at);
         // Just accepted here, and not asked since.
         if at.map(|at| (hash, at)) != *accepted {
             *accepted = None;
@@ -225,13 +225,8 @@ pub(crate) fn expr_edit(
         });
         offer
     };
-    let icon = |offer: &Offer, item: &str| matches!(find(offer, item), Some(Item::Field(_))).then_some("field");
-    let draw = |ui: &mut Ui, offer: &Offer, item: &str, width: f32| {
-        if let Some(of) = find(offer, item) {
-            ui.add_space(GAP);
-            draw_help(ui, of, ds, width);
-        }
-    };
+    let icon = |offer: &Offer, item: &str| names_field(offer, item).then_some("field");
+    let draw = |ui: &mut Ui, offer: &Offer, item: &str, width: f32| draw_item(ui, offer, item, ds, width);
     let clicked = state.list.show(ui, id.with("expr_list"), &out, visible, work, icon, draw);
     // The call the cursor is in, kept with the offer `work` worked out for the list this frame
     // (it works one out for the cursor whenever the box has the focus). Shown while no list is open: one open only hides
@@ -379,7 +374,7 @@ fn signature_job(
 
 /// The signature of the function the cursor is in a call of, coloured as the list's help colours
 /// one, the argument the cursor is in marked, and what the function gives.
-fn draw_call(ui: &mut Ui, call: &Call, width: f32) {
+pub(crate) fn draw_call(ui: &mut Ui, call: &Call, width: f32) {
     let palette = crate::scriptcolor::Palette::of(&crate::theme::Tokens::get(ui.ctx()));
     let mono = egui::TextStyle::Monospace.resolve(ui.style());
     let mark = (ui.visuals().selection.bg_fill, ui.visuals().selection.stroke.color);
@@ -395,6 +390,20 @@ fn draw_call(ui: &mut Ui, call: &Call, width: f32) {
 /// What `item` (as shown) of `offer` stands for.
 fn find<'a>(offer: &'a Offer, item: &str) -> Option<&'a Item> {
     offer.items.iter().position(|i| i == item).and_then(|i| offer.of.get(i))
+}
+
+/// Whether `item` of `offer` is a field, shown after a field's icon.
+pub(crate) fn names_field(offer: &Offer, item: &str) -> bool {
+    matches!(find(offer, item), Some(Item::Field(_)))
+}
+
+/// The help of `item` of `offer` beside the list, after a gap (`draw_help`): the expression box's
+/// list and the Script's show the same.
+pub(crate) fn draw_item(ui: &mut Ui, offer: &Offer, item: &str, ds: Option<&Dataset>, width: f32) {
+    if let Some(of) = find(offer, item) {
+        ui.add_space(GAP);
+        draw_help(ui, of, ds, width);
+    }
 }
 
 /// The help beside the list: a function's signature, coloured as the Script colours one, what
@@ -536,7 +545,7 @@ fn word_rest(rest: &[char], quote: Option<char>) -> usize {
 /// `text` with `item` of `offer` accepted (`accept`), and where the cursor goes (chars). None
 /// past the longest expression read (`MAX_LEN`, as the box takes no more): nothing is put in
 /// part, as a call left open there couldn't be closed.
-fn written(text: &str, offer: &Offer, item: &str) -> Option<(String, usize)> {
+pub(crate) fn written(text: &str, offer: &Offer, item: &str) -> Option<(String, usize)> {
     let of = find(offer, item)?;
     let chars: Vec<char> = text.chars().collect();
     let (before, rest) = (chars.get(..offer.start)?, chars.get(offer.end..)?);
@@ -576,6 +585,7 @@ fn written(text: &str, offer: &Offer, item: &str) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::{Key, Modifiers};
     use rustgis_engine::data::{Field, FieldType, GeometryType};
 
     fn ds() -> Dataset {

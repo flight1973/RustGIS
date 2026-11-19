@@ -70,6 +70,9 @@ impl Project {
         if !required.contains(&"layout-element-ink") && self.layouts.iter().any(|l| l.elements.iter().any(|e| e.kind.ink().is_some())) {
             required.push("layout-element-ink");
         }
+        if !required.contains(&"layout-element-wrap") && self.layouts.iter().any(|l| l.elements.iter().any(wraps)) {
+            required.push("layout-element-wrap");
+        }
         // A coordinate system whose PROJ definition, which an older reader reads, doesn't place
         // points as its WKT does (angles in grads, a datum transformation the definition can't
         // hold).
@@ -104,12 +107,14 @@ type CommandCheck = fn(&str, &Value) -> bool;
 const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("slope-percent", command_uses_percent_slope),
     ("tabulate-intersection-unit", command_uses_tabulate_unit),
+    ("tabulate-intersection-empty-zones", command_uses_tabulate_empty_zones),
     ("layout-element-background", command_uses_element_background),
     ("picture-markers", command_uses_picture_marker),
     ("graticule-mgrs", command_draws_mgrs_graticule),
     ("graticule-on-top", command_puts_graticule_on_top),
     ("graticule-color", command_colors_graticule),
     ("layout-element-ink", command_uses_element_ink),
+    ("layout-element-wrap", command_uses_element_wrap),
 ];
 
 /// A saved `map.graticule` that switches to the MGRS grid, its type read as the command reads it:
@@ -171,6 +176,23 @@ fn command_uses_element_ink(id: &str, params: &Value) -> bool {
     }
 }
 
+/// Whether a layout element is a text that wraps to its box (#2346).
+fn wraps(e: &rustgis_map::layout::Element) -> bool {
+    matches!(e.kind, rustgis_map::layout::ElementKind::Text { wrap: true, .. })
+}
+
+/// A layout command that makes a text wrap (#2346): an older reader warns that it ignores
+/// `wrap` and draws the text unwrapped. `"wrap": false` only keeps a text as an older reader's
+/// texts always are.
+fn command_uses_element_wrap(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.addElement" | "layout.update" => params.get("wrap").and_then(crate::cmd::bool_value) == Some(true),
+        "layout.import" => imported_layout_uses(params, "\"wrap\"", wraps),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_wrap)),
+        _ => false,
+    }
+}
+
 /// Whether a `layout.import` carries its layout as `"text"` with an element `uses`: an older
 /// reader reads it without the keys it doesn't know. One read from a `"path"` is a layout file,
 /// which carries no format header yet (#2277). Every save asks, so a text without the feature's
@@ -212,30 +234,49 @@ fn command_uses_percent_slope(id: &str, params: &serde_json::Value) -> bool {
     }
 }
 
-/// Inspect known command envelopes; unrelated data containing an areaUnit is not executable.
-/// Blank unit choices use the km² default and need no capability.
+/// Blank and km² unit choices need no capability.
 fn command_uses_tabulate_unit(id: &str, params: &Value) -> bool {
-    let non_default = |p: &Value| {
+    tabulate_uses(id, params, |p| {
         p.get("areaUnit").and_then(Value::as_str).map(str::trim).is_some_and(|u| !u.is_empty() && !u.eq_ignore_ascii_case("km2"))
-    };
+    })
+}
+
+/// Only a run that requests zero rows needs the capability. Tool booleans also accept text.
+fn command_uses_tabulate_empty_zones(id: &str, params: &Value) -> bool {
+    tabulate_uses(id, params, |p| match p.get("includeEmptyZones") {
+        Some(Value::Bool(on)) => *on,
+        Some(Value::String(on)) => on.trim().eq_ignore_ascii_case("true"),
+        _ => false,
+    })
+}
+
+/// Tests Tabulate Intersection parameters in executable commands, including nested envelopes.
+fn tabulate_uses(id: &str, params: &Value, uses: fn(&Value) -> bool) -> bool {
     if crate::cmd::gp::tool_id(id) == Some("tabulateIntersection") {
-        return non_default(params);
+        return uses(params);
     }
     let tabulate = params.get("tool").and_then(Value::as_str).and_then(crate::cmd::gp::tool_id) == Some("tabulateIntersection");
     match id {
-        "gp.run" if tabulate => crate::parameters::params_envelope(params.get("params")).is_ok_and(|p| non_default(&p)),
-        // Batch ignores non-object shared params; binding areaUnit itself is refused by older tools.
-        "gp.batch" if tabulate => params.get("params").filter(|p| p.is_object()).is_some_and(non_default),
-        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_tabulate_unit)),
+        "gp.run" if tabulate => crate::parameters::params_envelope(params.get("params")).is_ok_and(|p| uses(&p)),
+        // Batch ignores non-object shared params; older tools refuse unknown binding parameters.
+        "gp.batch" if tabulate => params.get("params").filter(|p| p.is_object()).is_some_and(uses),
+        "script.run" => {
+            params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, |id, params| tabulate_uses(id, params, uses)))
+        }
         _ => false,
     }
 }
 
-/// `layer.marker` given an image: an older reader would leave its `image` out and keep the marker
-/// it had.
+/// `layer.marker`, a line stroke's markers or a dot fill given an image: an older reader would
+/// leave its `image` out and keep the marker it had, or refuse `"image"` as a mark.
 fn command_uses_picture_marker(id: &str, params: &Value) -> bool {
+    let any = |list: &str, image: fn(&Value) -> Option<&Value>| {
+        params.get(list).and_then(Value::as_array).is_some_and(|l| l.iter().any(|v| image(v).is_some_and(Value::is_string)))
+    };
     match id {
         "layer.marker" => params.get("image").is_some_and(Value::is_string),
+        "layer.lineStrokes" => any("strokes", |st| st.get("markers")?.get("image")),
+        "layer.fillLayers" => any("fills", |f| f.get("image")),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_picture_marker)),
         _ => false,
     }
@@ -243,7 +284,7 @@ fn command_uses_picture_marker(id: &str, params: &Value) -> bool {
 
 /// Use the executor's line grammar; comments/invalid lines are not executable commands, and
 /// script_line refuses nested scripts, so this check cannot recurse through script.run.
-fn script_uses(script: &str, uses: CommandCheck) -> bool {
+fn script_uses(script: &str, uses: impl Fn(&str, &Value) -> bool) -> bool {
     script
         .lines()
         .take(crate::cmd::workflows::MAX_SCRIPT_LINES)
@@ -265,13 +306,20 @@ fn relief_light(layer: &Layer) -> bool {
     )
 }
 
-/// The renderer capabilities a layer needs, in [`map_capabilities`]'s order.
+/// Whether a layer is a window of a Zarr variable following the time slider (#1720): an older
+/// reader would drop the window and read the whole map at each step.
+fn zarr_window(layer: &Layer) -> bool {
+    layer.raster.as_ref().and_then(|r| r.time_zarr.as_ref()).is_some_and(|z| z.window.is_some())
+}
+
+/// The capabilities a layer needs, in [`map_capabilities`]'s order.
 fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
     [
         (relief_effects(layer), "shaded-relief-effects"),
         (relief_light(layer), "shaded-relief-light"),
         (layer.size_by.is_some(), super::SIZE_BY_CAPABILITY),
         (layer.has_picture_markers(), "picture-markers"),
+        (zarr_window(layer), "zarr-window"),
     ]
     .into_iter()
     .filter_map(|(used, name)| used.then_some(name))
@@ -281,6 +329,7 @@ fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
 fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static str> {
     let (
         mut block,
+        mut shape,
         mut water,
         mut shore,
         mut relief,
@@ -288,10 +337,11 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         mut legends,
         mut sized,
         mut pictures,
+        mut zarr,
         mut mgrs,
         mut on_top,
         mut grid_color,
-    ) = (false, false, false, false, false, false, false, false, false, false, false);
+    ) = (false, false, false, false, false, false, false, false, false, false, false, false, false);
     for map in maps {
         // An older reader doesn't know the MGRS graticule (#1042 piece 8): it refuses the
         // project by name rather than failing to read the type.
@@ -301,6 +351,8 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         grid_color |= map.graticule_color.is_some();
         if let Some(t) = &map.view.terrain {
             block |= t.block.is_some();
+            // A round block (#2318), which an older reader would draw and save as a box.
+            shape |= t.block.as_ref().is_some_and(|b| !b.shape.is_box());
             water |= t.water.is_some();
             // A shore band other than the default, which an older reader would save away.
             shore |= t.water.as_ref().is_some_and(|w| w.shore != rustgis_map::view::WATER_SHORE);
@@ -309,12 +361,14 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         light |= map.layers.iter().any(relief_light);
         sized |= map.layers.iter().any(|layer| layer.size_by.is_some());
         pictures |= map.layers.iter().any(Layer::has_picture_markers);
+        zarr |= map.layers.iter().any(zarr_window);
         legends |= map.tiles.iter().any(|tile| {
             tile.legends.iter().any(|legend| rustgis_data::login_address::inner(&legend.url).len() > rustgis_map::tiles::MAX_LEGEND_URL)
         });
     }
     [
         (block, "terrain-block"),
+        (shape, "terrain-block-shape"),
         (water, "terrain-water"),
         (shore, "terrain-water-shore"),
         (relief, "shaded-relief-effects"),
@@ -322,6 +376,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (legends, "normalized-legend-urls"),
         (sized, super::SIZE_BY_CAPABILITY),
         (pictures, "picture-markers"),
+        (zarr, "zarr-window"),
         (mgrs, "graticule-mgrs"),
         (on_top, "graticule-on-top"),
         (grid_color, "graticule-color"),
@@ -439,20 +494,33 @@ mod tests {
         assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["picture-markers"]));
     }
 
-    /// All replayable project containers require the unit only when it differs from km².
+    /// All replayable project containers require non-default options only when requested.
     /// Selection of executable notebook cells follows the notebook runner's language boundary.
     #[test]
-    fn tabulate_unit_capability_follows_saved_executables() {
+    fn tabulate_capabilities_follow_saved_executables() {
+        let empty_zones = Project::from_json(include_str!("../../../schema/fixtures/tabulate_intersection_empty_zones.rgis")).unwrap();
+        assert_eq!(empty_zones.models[0].steps[0].params["includeEmptyZones"], true);
+        assert_eq!(serde_json::to_value(&empty_zones).unwrap()["requires"], json!(["tabulate-intersection-empty-zones"]));
+
         let mut fixture = Project::from_json(include_str!("../../../schema/fixtures/tabulate_intersection_unit.rgis")).unwrap();
         assert_eq!(fixture.models[0].steps[0].params["areaUnit"], "ac");
         assert_eq!(serde_json::to_value(&fixture).unwrap()["requires"], json!(["tabulate-intersection-unit"]));
         fixture.models.clear();
         let base = serde_json::to_value(&fixture).unwrap();
-        for unit in [None, Some(""), Some(" \t\n "), Some("km2"), Some(" KM2 "), Some("ac")] {
-            let mut params = json!({"zones":"Zones", "classes":"Classes"});
-            if let Some(unit) = unit {
-                params["areaUnit"] = json!(unit);
-            }
+        for (option, expected) in [
+            (json!({}), vec![]),
+            (json!({"areaUnit":""}), vec![]),
+            (json!({"areaUnit":" \t\n "}), vec![]),
+            (json!({"areaUnit":"km2"}), vec![]),
+            (json!({"areaUnit":" KM2 "}), vec![]),
+            (json!({"areaUnit":"ac"}), vec!["tabulate-intersection-unit"]),
+            (json!({"includeEmptyZones":false}), vec![]),
+            (json!({"includeEmptyZones":" TRUE "}), vec!["tabulate-intersection-empty-zones"]),
+            (json!({"areaUnit":"ac", "includeEmptyZones":true}), vec!["tabulate-intersection-unit", "tabulate-intersection-empty-zones"]),
+        ] {
+            let mut params = option;
+            params["zones"] = json!("Zones");
+            params["classes"] = json!("Classes");
             let run = json!({"tool":"tabulateIntersection", "params": params});
             let script = format!("# Tabulate\ngp.run= {run}");
             for (field, value) in [
@@ -490,12 +558,12 @@ mod tests {
                 document[field] = value;
                 let project = Project::from_json(&document.to_string()).unwrap();
                 let saved = serde_json::to_value(&project).unwrap();
-                if unit == Some("ac") {
-                    assert_eq!(saved["requires"], json!(["tabulate-intersection-unit"]), "{field}");
-                    assert_eq!(saved["format"], 2);
-                } else {
-                    assert!(saved.get("requires").is_none(), "{field} {unit:?}");
+                if expected.is_empty() {
+                    assert!(saved.get("requires").is_none(), "{field} {params}");
                     assert_eq!(saved["format"], FORMAT);
+                } else {
+                    assert_eq!(saved["requires"], json!(expected), "{field} {params}");
+                    assert_eq!(saved["format"], 2);
                 }
                 assert_eq!(Project::from_json(&saved.to_string()).unwrap().required_capabilities(), project.required_capabilities());
             }
@@ -678,6 +746,51 @@ mod tests {
         }
     }
 
+    /// A text that wraps to its box is required where it is saved (#2346), so an older reader
+    /// refuses the project instead of drawing it on its own line breaks; so is a saved command
+    /// that makes one wrap, which an older reader would run without it. Unwrapping needs nothing.
+    #[test]
+    fn element_wrap_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::ElementKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_element_wrap.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-element-wrap"]));
+        let wrapped = |p: &Project| p.layouts[0].elements.iter().filter(|e| matches!(e.kind, ElementKind::Text { wrap: true, .. })).count();
+        assert_eq!(wrapped(&Project::from_json(&saved.to_string()).unwrap()), 1);
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let ElementKind::Text { wrap, .. } = &mut e.kind {
+                *wrap = false;
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "unwrapped texts need nothing");
+        assert!(!base["layouts"].to_string().contains("wrap"), "nor write it");
+        let layout = &saved["layouts"][0];
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "text", "wrap": true}), true),
+            ("layout.update", json!({"element": 2, "wrap": "on"}), true),
+            ("layout.update", json!({"element": 2, "wrap": false}), false),
+            ("layout.update", json!({"element": 2, "wrap": null}), false),
+            ("layout.update", json!({"element": 2, "text": "wrap"}), false),
+            ("layout.import", json!({"text": layout.to_string()}), true),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+            ("layout.import", json!({"path": "notes.rgislayout"}), false),
+        ] {
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Note", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Note", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-element-wrap"]) } else { Value::Null };
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
+            }
+        }
+    }
+
     #[test]
     fn field_identity_is_preserved_and_required_in_a_plain_saved_project() {
         let project = Project::from_json(include_str!("../../../schema/fixtures/field_origin.rgis")).unwrap();
@@ -790,6 +903,30 @@ mod tests {
         let mut unknown = saved;
         unknown["requires"] = json!(["future-terrain"]);
         assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-terrain"));
+    }
+
+    /// A Zarr window following the time slider (#1720) is required by name in a project, a map
+    /// file and a layer file: an older reader would drop it and read the whole map at each step.
+    #[test]
+    fn a_zarr_window_is_required_where_it_is_saved() {
+        let mut p = Project::from_json(include_str!("../../../schema/fixtures/zarr_window.rgis")).unwrap();
+        let layer = p.map().layers[0].clone();
+        assert_eq!(
+            layer.raster.as_ref().and_then(|r| r.time_zarr.as_ref()).and_then(|z| z.window),
+            Some([1526419, 1162633, 1526643, 1162857])
+        );
+        let saved = serde_json::to_value(&p).unwrap();
+        assert_eq!(saved["requires"], json!(["zarr-window"]));
+        assert_eq!(json_bytes(&map_file_bytes(p.map()).unwrap())["requires"], saved["requires"]);
+        assert_eq!(json_bytes(&layer_file_bytes(&layer).unwrap())["requires"], saved["requires"]);
+        // The whole variable following the slider needs nothing new.
+        if let Some(z) = p.maps[0].layers[0].raster.as_mut().and_then(|r| r.time_zarr.as_mut()) {
+            z.window = None;
+        }
+        assert!(serde_json::to_value(&p).unwrap().get("requires").is_none());
+        let mut unknown = saved;
+        unknown["requires"] = json!(["zarr-window", "future-zarr"]);
+        assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-zarr"));
     }
 
     /// Nondefault relief effects survive project, map and layer files; ordinary relief needs none.
