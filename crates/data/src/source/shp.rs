@@ -239,7 +239,7 @@ impl FeatureSource for ShpSource {
         let mut buf = Vec::new();
         let mut row = vec![0u8; self.table.row_len];
         let mut features = Vec::new();
-        let (mut skipped, mut unread_dates, mut null_text) = (0, Vec::new(), Vec::new());
+        let (mut skipped, mut unread_dates, mut null_text, mut boxed_off) = (0, Vec::new(), Vec::new(), 0u64);
         // An extent the file's system couldn't bound (#1925) has no boxes for the index to sample
         // by: every record is visited, tested, and the matches sampled as they come.
         let late = req.extent.is_some() && bounds.is_none();
@@ -262,9 +262,11 @@ impl FeatureSource for ShpSource {
             }
             let geometry = match parse_shape(&buf) {
                 // A coordinate that isn't a number (NaN or infinite) has no place: the record is
-                // left out and counted, as one that can't be converted (#1985).
+                // left out and counted, as one that can't be converted (#1985). One under a stored
+                // box that is one is counted apart too, as the index framed it by that box.
                 Ok(Some(g)) if !g.is_finite() => {
                     skipped += 1;
+                    boxed_off += u64::from(record_box(&buf, u64::from(place.len)).iter().all(|v| v.is_finite()));
                     return Ok(());
                 }
                 Ok(Some(g)) => match self.reproject.geometry(g) {
@@ -320,7 +322,16 @@ impl FeatureSource for ShpSource {
         } else {
             self.index.visit(bounds, limit, &mut each)?
         };
-        Ok(Batch { features, matched, complete, skipped, unread_dates, rounded_dates: Vec::new(), null_text, notes: Vec::new() })
+        Ok(Batch {
+            features,
+            matched,
+            complete,
+            skipped,
+            unread_dates,
+            rounded_dates: Vec::new(),
+            null_text,
+            notes: boxed_off_note(boxed_off),
+        })
     }
     fn streams_chunks(&self) -> bool {
         true
@@ -340,7 +351,7 @@ impl FeatureSource for ShpSource {
         let mut dbf = Cursor::open(&self.dbf)?;
         let mut buf = Vec::new();
         let mut row = vec![0u8; self.table.row_len];
-        let (mut skipped, mut unread_dates, mut null_text) = (0, Vec::new(), Vec::new());
+        let (mut skipped, mut unread_dates, mut null_text, mut boxed_off) = (0, Vec::new(), Vec::new(), 0u64);
         // The same directory, ordering, extent rules and read-only scan fallback as sampled
         // reads, with no interaction row cap. The index visits records without materializing
         // their directory or the complete feature collection in memory.
@@ -360,9 +371,11 @@ impl FeatureSource for ShpSource {
             }
             let geometry = match parse_shape(&buf) {
                 // A coordinate that isn't a number (NaN or infinite) has no place: the record is
-                // left out and counted, as one that can't be converted (#1985).
+                // left out and counted, as one that can't be converted (#1985). One under a stored
+                // box that is one is counted apart too, as the index framed it by that box.
                 Ok(Some(g)) if !g.is_finite() => {
                     skipped += 1;
+                    boxed_off += u64::from(record_box(&buf, u64::from(place.len)).iter().all(|v| v.is_finite()));
                     return Ok(());
                 }
                 Ok(Some(g)) => match self.reproject.geometry(g) {
@@ -407,9 +420,21 @@ impl FeatureSource for ShpSource {
             unread_dates,
             rounded_dates: Vec::new(),
             null_text,
-            notes: Vec::new(),
+            notes: boxed_off_note(boxed_off),
         })
     }
+}
+
+/// Says how many shapes a read left out for a coordinate that isn't a number while their stored
+/// box is a box: [`record_box`] doesn't read the points, so the layer's extent and its index still
+/// take in those boxes.
+fn boxed_off_note(n: u64) -> Vec<String> {
+    if n == 0 {
+        return Vec::new();
+    }
+    vec![format!(
+        "{n} shape(s) have a coordinate that isn't a number under a bounding box that is one: they're left out of the read, but the layer's extent and its index still take in their stored boxes"
+    )]
 }
 
 /// A file read at offsets, through a buffer that a nearby offset reuses.
@@ -464,9 +489,9 @@ fn le_f64(b: &[u8], at: usize) -> Option<f64> {
 /// whole array of parts' starts where the record has room for it.
 ///
 /// The points themselves aren't read: a line, polygon or multipoint with a finite stored box over a
-/// point that isn't a number keeps that box here, though a read leaves the shape out (and counts
-/// it). Telling it apart would mean reading every record's points to build the index, for files
-/// (#1985's) with such shapes by the thousand.
+/// point that isn't a number keeps that box here, though a read leaves the shape out, counts it and
+/// says so ([`boxed_off_note`]). Telling it apart here would mean reading every record's points to
+/// build the index, for files (#1985's) with such shapes by the thousand.
 fn record_box(c: &[u8], len: u64) -> [f32; 4] {
     const NONE: [f32; 4] = [f32::NAN; 4];
     const NOT_A_BOX: [f32; 4] = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];

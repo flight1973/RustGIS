@@ -643,3 +643,60 @@ fn shapefile_record_past_the_cap_is_skipped_not_allocated() {
     });
     std::fs::remove_dir_all(fixture).unwrap();
 }
+
+/// A line with a coordinate that isn't a number under a stored box that is one: the index takes
+/// the stored box (the points aren't read to build it), and a read leaves the line out. Both
+/// reads, sampled and in chunks, count it and say so, once with its count, whole or by area; a
+/// clean file says nothing.
+#[test]
+fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
+    let fixture = dir();
+    cache::with_index_dir(fixture.join("cache"), || {
+        let write = |name: &str| {
+            let mut ds = Dataset::new("roads", GeometryType::Polyline, vec![]);
+            for k in 0..3 {
+                let k = f64::from(k);
+                ds.push(Some(Geometry::Line(vec![vec![Coord::new(k, k), Coord::new(k + 1.0, k + 1.0)]])), vec![]);
+            }
+            let p = fixture.join(name);
+            write_shapefile(&ds, &p);
+            p
+        };
+        const SAID: &str = "have a coordinate that isn't a number under a bounding box that is one";
+        let said = |notes: &[String]| notes.iter().filter(|n| n.contains(SAID)).cloned().collect::<Vec<_>>();
+        let chunk_notes = |src: &dyn FeatureSource, extent| {
+            let batch = src.visit_chunks(extent, 1 << 20, &mut |_| Ok(())).unwrap();
+            (batch.skipped, said(&batch.notes))
+        };
+        let clean = open_path(&write("clean.shp"), None).unwrap();
+        let (_, report) = crate::source::materialize(clean.as_ref()).unwrap();
+        assert!(said(&report.messages).is_empty(), "{:?}", report.messages);
+        assert!(said(&clean.read(&Request::all()).unwrap().notes).is_empty());
+        assert_eq!(chunk_notes(clean.as_ref(), None), (0, Vec::new()));
+        // The second record (each record 8 + 80 bytes, so its content at 100 + 88 + 8): its first
+        // point's x at 196 + 48 = 244, its stored box (1, 1, 2, 2) left as it is.
+        let p = write("nan.shp");
+        let mut b = std::fs::read(&p).unwrap();
+        b[244..252].copy_from_slice(&f64::NAN.to_le_bytes());
+        std::fs::write(&p, b).unwrap();
+        let src = open_path(&p, None).unwrap();
+        assert!(src.info().indexed);
+        assert_eq!(src.info().extent, Extent::new(0.0, 0.0, 3.0, 3.0), "the stored box framed");
+        let one = vec![format!(
+            "1 shape(s) {SAID}: they're left out of the read, but the layer's extent and its index still take in their stored boxes"
+        )];
+        let (ds, report) = crate::source::materialize(src.as_ref()).unwrap();
+        assert_eq!((ds.features.len(), report.skipped), (2, 1));
+        assert_eq!(said(&report.messages).len(), 1, "{:?}", report.messages);
+        assert!(report.messages.iter().any(|m| m.ends_with(&one[0])), "{:?}", report.messages);
+        let all = src.read(&Request::all()).unwrap();
+        assert_eq!((all.skipped, said(&all.notes)), (1, one.clone()));
+        // By area, over the stored box only: matched by it, left out, said.
+        let area = Some(Extent::new(1.4, 1.4, 1.6, 1.6));
+        let by_area = src.read(&Request { extent: area, ..Request::all() }).unwrap();
+        assert_eq!((by_area.features.len(), by_area.skipped, said(&by_area.notes)), (0, 1, one.clone()));
+        assert_eq!(chunk_notes(src.as_ref(), None), (1, one.clone()));
+        assert_eq!(chunk_notes(src.as_ref(), area), (1, one));
+    });
+    std::fs::remove_dir_all(fixture).unwrap();
+}
