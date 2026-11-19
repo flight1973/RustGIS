@@ -315,20 +315,50 @@ pub(crate) fn serial_datetime(days: f64, epoch: i64) -> Option<(DateTime, bool)>
     let whole = days.floor() as i64;
     let day = Date::from_days(whole.checked_add(epoch)?)?;
     // The fraction of the day and its microseconds are each rounded once; the errors of both are
-    // recovered (Knuth's two-sum for `days - whole`, which isn't exact between -0.5 and 0; a
-    // fused multiply-add for the product), so `off` is how far the serial is from the
-    // microsecond read, in microseconds, to within a rounding of its own.
+    // recovered (Knuth's two-sum for `days - whole`, which isn't exact between -0.5 and 0;
+    // Dekker's two-product for the scaling, which needs no fused multiply-add), so `off` is how
+    // far the serial is from the microsecond read, in microseconds, to within a rounding of its
+    // own.
     let minus_whole = -(whole as f64);
     let fraction = days + minus_whole;
     let (back_minus, back_days) = (fraction - days, fraction - (fraction - days));
     let lost = (days - back_days) + (minus_whole - back_minus);
     let scaled = fraction * DAY_US as f64;
     let rounded = scaled.round();
-    let off = (scaled - rounded) + fraction.mul_add(DAY_US as f64, -scaled) + lost * DAY_US as f64;
+    let off = (scaled - rounded) + product_error(fraction, DAY_US as f64, scaled) + lost * DAY_US as f64;
     let unit = |x: f64| f64::from_bits(x.abs().to_bits() + 1) - x.abs();
     let allowed = (unit(days) + unit(fraction)) / 2.0 * DAY_US as f64;
     let micros = day.sort_key().checked_add(rounded as i64)?;
     DateTime::local(micros).map(|t| (t, off.abs() > allowed))
+}
+
+/// The rounding error of `p = a * b`, exactly: `a * b - p` (Dekker's two-product, with Veltkamp's
+/// split of each factor into halves of 26 bits whose products are exact). For finite factors whose
+/// product neither overflows nor underflows.
+fn product_error(a: f64, b: f64, p: f64) -> f64 {
+    let split = |x: f64| {
+        let c = 134_217_729.0 * x; // 2^27 + 1
+        let hi = c - (c - x);
+        (hi, x - hi)
+    };
+    let ((a_hi, a_lo), (b_hi, b_lo)) = (split(a), split(b));
+    ((a_hi * b_hi - p) + a_hi * b_lo + a_lo * b_hi) + a_lo * b_lo
+}
+
+/// The decimal text, to 30 places, of `whole + part / per_day` days: read as an f64, the serial
+/// nearest that time (the parse rounds once), for tests of serial dates.
+#[cfg(test)]
+pub(crate) fn serial_text(whole: i64, part: i64, per_day: i64) -> String {
+    let total = whole * per_day + part;
+    let (sign, n) = if total < 0 { ("-", -total) } else { ("", total) };
+    let mut text = format!("{sign}{}.", n / per_day);
+    let mut rest = n % per_day;
+    for _ in 0..30 {
+        rest *= 10;
+        text.push(char::from(b'0' + u8::try_from(rest / per_day).unwrap_or(0)));
+        rest %= per_day;
+    }
+    text
 }
 
 /// Whether microseconds since 1970 fall in years 1 to 9999.
@@ -556,16 +586,7 @@ mod tests {
     /// The f64 nearest `day + seconds / 86400`, from its decimal text to 30 places (the parse
     /// rounds once), so the test doesn't round twice as `day + seconds / 86400.0` can.
     fn nearest_serial(day: i64, seconds: i64) -> f64 {
-        let total = day * 86_400 + seconds;
-        let (sign, n) = if total < 0 { ("-", -total) } else { ("", total) };
-        let mut text = format!("{sign}{}.", n / 86_400);
-        let mut rest = n % 86_400;
-        for _ in 0..30 {
-            rest *= 10;
-            text.push(char::from(b'0' + (rest / 86_400) as u8));
-            rest %= 86_400;
-        }
-        text.parse().unwrap()
+        super::serial_text(day, seconds, 86_400).parse().unwrap()
     }
 
     /// A whole-second or whole-minute time's binary serial is rarely the time exactly, but it is

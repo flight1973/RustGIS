@@ -480,7 +480,7 @@ fn cell(d: &Data) -> String {
 
 /// Whether a date cell is serial 60, the 1900 system's 1900-02-29.
 fn is_phantom_day(dt: &ExcelDateTime) -> bool {
-    !dt.is_duration() && (dt.as_f64() + if is_1904(dt) { DAYS_1900_TO_1904 } else { 0.0 }).floor() == 60.0
+    !dt.is_duration() && !is_1904(dt) && dt.as_f64().floor() == 60.0
 }
 
 /// Days from the 1900 date system's day 0 to the 1904 one's (workbooks made on old Macs).
@@ -520,9 +520,9 @@ fn excel_date(stored: f64, date1904: bool, with_time: bool) -> (String, bool) {
             .and_then(|(t, rounded)| t.to_string().split_once('T').map(|(_, clock)| (clock.to_string(), rounded)))
             .unwrap_or_else(|| (serial.to_string(), false));
     }
-    // Serial 60 is the workbook's fictitious 1900-02-29. Keep that invalid spelling so
+    // Serial 60 is the 1900 system's fictitious 1900-02-29. Keep that invalid spelling so
     // a typed read reports it instead of silently changing it to a real day.
-    if serial.floor() == 60.0 {
+    if !date1904 && serial.floor() == 60.0 {
         return ("1900-02-29".into(), false);
     }
     // The 1904 system's day 0 is 1462 days after the 1900 one's; the 1900 system counts a day that
@@ -716,17 +716,7 @@ mod tests {
         // is added before 1900-03-01), 16383 and 32767 in the 1904 system (1462 days are added).
         for (day, date1904) in [(1i64, false), (3, false), (16_383, true), (32_767, true)] {
             // The minute's serial as decimal text to 30 places, which the reader rounds once.
-            let serial = |minute: i64| {
-                let total = day * 1440 + minute;
-                let mut text = format!("{}.", total / 1440);
-                let mut rest = total % 1440;
-                for _ in 0..30 {
-                    rest *= 10;
-                    text.push(char::from(b'0' + (rest / 1440) as u8));
-                    rest %= 1440;
-                }
-                format!(r#"<c s="0"><v>{text}</v></c>"#)
-            };
+            let serial = |minute: i64| format!(r#"<c s="0"><v>{}</v></c>"#, crate::date::serial_text(day, minute, 1440));
             let cells: Vec<String> = (0..1440).map(serial).collect();
             let mut rows: Vec<Vec<&str>> = vec![vec!["moment"]];
             rows.extend(cells.iter().map(|c| vec![c.as_str()]));
@@ -752,6 +742,48 @@ mod tests {
         }
     }
 
+    /// A workbook of the 1904 date system has no 1900-02-29: its serial 60 is a real day, and its
+    /// serials read as they did before serials were judged as stored. A negative serial isn't
+    /// taken for the 1904 system (`is_1904` looks at serials from 0), so it reads as the number it
+    /// is, then as no date, as it always has.
+    #[test]
+    fn a_1904_workbook_has_no_phantom_leap_day() {
+        let book = |serials: &[&str]| {
+            let cells: Vec<String> = serials.iter().map(|s| format!(r#"<c s="0"><v>{s}</v></c>"#)).collect();
+            let mut rows: Vec<Vec<&str>> = vec![vec!["day"]];
+            rows.extend(cells.iter().map(|c| vec![c.as_str()]));
+            let rows: Vec<&[&str]> = rows.iter().map(Vec::as_slice).collect();
+            let mut entries = crate::zip::read(&xlsx(&[("Dates", &rows)])).unwrap();
+            entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="14"/></cellXfs></styleSheet>"#.to_vec()));
+            let at = entries.iter().position(|(n, _)| n == "xl/workbook.xml").unwrap();
+            let xml = String::from_utf8(entries[at].1.clone()).unwrap().replace("<sheets>", r#"<workbookPr date1904="1"/><sheets>"#);
+            entries[at].1 = xml.into_bytes();
+            read(&crate::zip::write(&entries).unwrap(), "dates", None, &CsvOptions::default()).unwrap()
+        };
+        let (ds, report) = book(&["59", "60", "61"]);
+        assert_eq!(ds.fields[0].ty, FieldType::Date);
+        let days: Vec<String> = (0..3).map(|r| ds.value(r, 0).to_string()).collect();
+        assert_eq!(days, ["1904-02-29", "1904-03-01", "1904-03-02"]);
+        assert!(report.messages.is_empty(), "{report:?}");
+        // A negative serial: no date, and counted, as before.
+        let (ds, report) = book(&["-1000", "61"]);
+        assert!(ds.value(0, 0).is_null() || ds.fields[0].ty == FieldType::Text, "{:?}", ds.value(0, 0));
+        assert!(!report.messages.iter().any(|m| m.contains("rounded")), "{report:?}");
+    }
+
+    /// A rounded serial in the WKT column isn't WKT, so its row has no geometry, and the bad-WKT
+    /// notice counts it.
+    #[test]
+    fn a_serial_in_the_wkt_column_is_counted_as_bad_wkt() {
+        let book = xlsx(&[("Dates", &[&["geom", "name"], &[r#"<c s="0"><v>45000.123456789</v></c>"#, "a"]])]);
+        let mut entries = crate::zip::read(&book).unwrap();
+        entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="22"/></cellXfs></styleSheet>"#.to_vec()));
+        let opts = CsvOptions { wkt: Some("geom".into()), ..CsvOptions::default() };
+        let (ds, report) = read(&crate::zip::write(&entries).unwrap(), "dates", None, &opts).unwrap();
+        assert!(ds.features[0].geometry.is_none());
+        assert!(report.messages.iter().any(|m| m == "1 rows had geometry that isn't readable WKT"), "{report:?}");
+    }
+
     /// Native numeric date styles reach the public reader's rounding notice, including
     /// time-only text. A serial is said to be rounded only when it holds more than the
     /// microsecond: 45000.1 isn't 45000.1 in binary, but it is the f64 02:24:00 makes, so nothing
@@ -767,7 +799,7 @@ mod tests {
             let mut entries = crate::zip::read(&book).unwrap();
             entries.push(("xl/styles.xml".into(), br#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cellXfs count="1"><xf numFmtId="22"/></cellXfs></styleSheet>"#.to_vec()));
             let (ds, report) = read(&crate::zip::write(&entries).unwrap(), "dates", None, &CsvOptions::default()).unwrap();
-            let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded")).collect();
+            let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded to the microsecond")).collect();
             assert_eq!(notices.len(), usize::from(rounded), "{serial}: {report:?}");
             assert_eq!(report.rounded_dates.is_some(), rounded, "{serial}");
             if rounded {

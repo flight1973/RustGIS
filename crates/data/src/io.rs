@@ -2306,7 +2306,7 @@ pub(crate) fn read_rows(
     }
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, &unread_dates);
     report.messages.extend(report.unread_dates.clone());
-    report.rounded_dates = crate::source::rounded_dates_note(&ds.fields, &rounded_dates);
+    report.rounded_dates = crate::source::rounded_serials_note(&ds.fields, &rounded_dates);
     report.messages.extend(report.rounded_dates.clone());
     report.messages.extend(crate::source::null_text_note(&ds.fields, &null_text));
     Ok((ds, report))

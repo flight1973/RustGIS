@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(report.unread_dates, None);
         let note = report.rounded_dates.as_deref().unwrap();
         assert_eq!(note, "2 date-times were rounded to the microsecond, as more digits than that aren't kept, in 'time'");
-        assert_eq!(report.messages.iter().filter(|m| m.contains("rounded")).count(), 1, "{report:?}");
+        assert_eq!(report.messages.iter().filter(|m| m.contains("rounded to the microsecond")).count(), 1, "{report:?}");
         let layers = read("six.gpx", gpx("2019-07-04T12:30:15.123456Z").as_bytes()).unwrap();
         let (ds, report) = &layers[0];
         assert_eq!(ds.value(0, k).to_string(), "2019-07-04T12:30:15.123456Z");

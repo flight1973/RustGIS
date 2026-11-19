@@ -53684,22 +53684,36 @@ fn a_city_models_volumes_come_in_extruded() {
     assert!(s.map().layers.iter().all(|l| l.extrusion.is_none()), "only a reader that knows the type extrudes");
 }
 
-/// A GPX time with digits past the microsecond is said to be rounded once when the file is read,
-/// and an export of the layer doesn't say it twice (#1894).
+/// A GPX time or a workbook date-time cell with digits past the microsecond is said to be
+/// rounded once when the file is read, and an export of the layer doesn't say it again (#1894).
 #[test]
-fn a_rounded_gpx_time_is_said_once() {
+fn a_rounded_time_is_said_once() {
+    use base64::Engine;
     let gpx = r#"<gpx><wpt lat="1" lon="1"><time>2019-07-04T12:30:15.1234567Z</time></wpt></gpx>"#;
-    let mut s = Session::new(Project::default());
-    let rounded = |s: &Session, mark| s.notices_since(mark).iter().filter(|n| n.text.contains("rounded to the microsecond")).count();
-    let mark = s.notice_mark();
-    s.run("layer.addDataText", &json!({"fileName": "trip.gpx", "text": gpx})).unwrap();
-    assert_eq!(rounded(&s, mark), 1, "{:?}", s.notices_since(mark));
-    let id = s.map().layers.first().unwrap().id;
+    let book = rustgis_data::sheets::xlsx(&[(
+        "Times",
+        &[&["moment", "longitude", "latitude"], &[r#"<c t="d"><v>2019-07-04T12:30:15.1234567Z</v></c>"#, "10", "20"]],
+    )]);
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let dir = std::env::temp_dir().join(format!("rustgis-gpx-rounded-{}-{nanos}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("rustgis-rounded-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mark = s.notice_mark();
-    s.run("share.exportLayer", &json!({"layer": id, "path": dir.join("trip.csv")})).unwrap();
-    assert!(rounded(&s, mark) <= 1, "{:?}", s.notices_since(mark));
+    for (what, command, params) in [
+        ("gpx", "layer.addDataText", json!({"fileName": "trip.gpx", "text": gpx})),
+        (
+            "xlsx",
+            "layer.addDataBytes",
+            json!({"fileName": "times.xlsx", "data": base64::engine::general_purpose::STANDARD.encode(&book), "x": "longitude", "y": "latitude"}),
+        ),
+    ] {
+        let mut s = Session::new(Project::default());
+        let rounded = |s: &Session, mark| s.notices_since(mark).iter().filter(|n| n.text.contains("rounded to the microsecond")).count();
+        let mark = s.notice_mark();
+        s.run(command, &params).unwrap();
+        assert_eq!(rounded(&s, mark), 1, "{what}: {:?}", s.notices_since(mark));
+        let id = s.map().layers.first().unwrap().id;
+        let mark = s.notice_mark();
+        s.run("share.exportLayer", &json!({"layer": id, "path": dir.join(format!("{what}.csv"))})).unwrap();
+        assert_eq!(rounded(&s, mark), 0, "{what}: {:?}", s.notices_since(mark));
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

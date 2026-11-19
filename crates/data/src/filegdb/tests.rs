@@ -940,7 +940,7 @@ fn filegdb_temporal_fields_keep_days_offsets_and_null_notices() {
     for (serial, rounded) in [(45_000.5, false), (45_000.1, false), (1.0 + 0.123_456_789 / 86_400.0, true), (45_000.123_456_789, true)] {
         let (t, x) = table(0, &[F::Date("moment", 5)], &[vec![V::Date(Some((serial, None)))]]);
         let (_, report) = read_table("dates", &t, &x, None).unwrap().unwrap();
-        let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded")).collect();
+        let notices: Vec<_> = report.messages.iter().filter(|n| n.contains("rounded to the microsecond")).collect();
         assert_eq!(notices.len(), usize::from(rounded), "{serial}: {report:?}");
         assert_eq!(report.rounded_dates.is_some(), rounded, "{serial}");
         if rounded {

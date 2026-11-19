@@ -327,14 +327,18 @@ pub fn rounded_dates_note(fields: &[crate::Field], counts: &[usize]) -> Option<S
     if total == 0 {
         return None;
     }
-    // A serial date read into a text field (a time without a day) is said as a time too.
-    let date_times = fields.iter().zip(counts).all(|(f, n)| *n == 0 || f.ty == crate::FieldType::DateTime);
-    let what = match (total, date_times) {
-        (1, true) => "1 date-time was".to_string(),
-        (n, true) => format!("{n} date-times were"),
-        (1, false) => "1 date or time value was".to_string(),
-        (n, false) => format!("{n} date or time values were"),
-    };
+    let what = if total == 1 { "1 date-time was".to_string() } else { format!("{total} date-times were") };
+    Some(format!("{what} rounded to the microsecond, as more digits than that aren't kept, in {}", crate::io::named_fields(fields, counts)))
+}
+
+/// [`rounded_dates_note`], for a reader whose serial dates may be kept as text (a time without a
+/// day): said as date or time values when a counted field isn't a date-time field.
+pub(crate) fn rounded_serials_note(fields: &[crate::Field], counts: &[usize]) -> Option<String> {
+    let total: usize = counts.iter().sum();
+    if fields.iter().zip(counts).all(|(f, n)| *n == 0 || f.ty == crate::FieldType::DateTime) {
+        return rounded_dates_note(fields, counts);
+    }
+    let what = if total == 1 { "1 date or time value was".to_string() } else { format!("{total} date or time values were") };
     Some(format!("{what} rounded to the microsecond, as more digits than that aren't kept, in {}", crate::io::named_fields(fields, counts)))
 }
 
