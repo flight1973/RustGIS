@@ -20,6 +20,32 @@ pub struct State {
     /// The sources as last shown, and their generation.
     shown: Option<(u64, std::sync::Arc<rustgis_engine::sources::Sources>)>,
     connections: Option<(u64, std::sync::Arc<Vec<Connection>>)>,
+    /// The kinds of notice said of the stored sources, with the count each was said at: reading
+    /// them again at a save says a kind again only when more is affected than was said.
+    said: Vec<(&'static str, usize)>,
+    /// Whether a save refused to write over unreadable stored sources has been said since the
+    /// last save that happened.
+    refusal_said: bool,
+    /// What this session last wrote: a save that finds it stored has nothing to lay its changes
+    /// over.
+    last_written: Option<String>,
+    /// When a save that didn't happen (the preferences busy, unreadable or failing) is tried
+    /// again, and how many have failed in a row.
+    retry_at: Option<web_time::Instant>,
+    failures: u32,
+    /// Since when another copy of the app has kept the preferences busy.
+    busy_since: Option<web_time::Instant>,
+}
+
+/// How soon a save is tried again while another copy of the app saves its preferences.
+const BUSY_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long another copy may keep them busy before that is said.
+const BUSY_SAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long after `failures` failed saves in a row the next is tried: one second, doubling up
+/// to a minute.
+fn backoff(failures: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(1u64 << failures.saturating_sub(1).min(6)).min(std::time::Duration::from_secs(60))
 }
 
 /// The sources to show this frame: the last snapshot unless they changed since.
@@ -62,16 +88,38 @@ pub fn load(app: &mut RustGisApp) {
         let stored = rustgis_engine::sources::Sources::from_json(&text);
         app.session.sources.merge(stored);
         // After the merge: sources it moved past a list's limit are said too.
-        for said in app.session.sources.unread() {
-            app.session.warn(said);
-        }
+        say_unread(app);
     }
     if !changed {
         app.ui.sources_saved = app.session.sources.generation;
     }
 }
 
-/// Keeps the sources with the preferences when they changed.
+/// Says what of the stored sources isn't used here: each kind once, and again when more of it
+/// is affected than was said (another window's newer sources, more rows unreadable).
+fn say_unread(app: &mut RustGisApp) {
+    for (kind, count, said) in app.session.sources.unread_by_kind() {
+        say_more(app, kind, count, said);
+    }
+}
+
+/// Says `said` unless its kind was said at `count` or more already.
+fn say_more(app: &mut RustGisApp, kind: &'static str, count: usize, said: String) {
+    let known = &mut app.ui.sources.said;
+    match known.iter_mut().find(|(k, _)| *k == kind) {
+        Some((_, at)) if *at >= count => return,
+        Some((_, at)) => *at = count,
+        None => known.push((kind, count)),
+    }
+    app.session.warn(said);
+}
+
+/// Keeps the sources with the preferences when they changed. Where another copy of the app
+/// keeps them too (the desktop), what is stored is read again and this session's changes laid
+/// over it ([`Sources::rebase`](rustgis_engine::sources::Sources::rebase)), so neither copy
+/// writes over the other's. A save that doesn't happen (another copy saving, the stored
+/// sources unreadable, the file failing) leaves the changes to save, tried again later
+/// ([`retry_in`]); it never waits.
 pub fn save(app: &mut RustGisApp) {
     if !app.ui.sources.loaded {
         load(app);
@@ -79,10 +127,132 @@ pub fn save(app: &mut RustGisApp) {
     if app.session.sources.generation == app.ui.sources_saved {
         return;
     }
-    app.ui.sources_saved = app.session.sources.generation;
-    if let Some(save) = &app.services.save_pref {
-        save(PREF, &app.session.sources.to_json());
+    if app.services.update_pref.is_none() {
+        app.ui.sources_saved = app.session.sources.generation;
+        if let Some(save) = &app.services.save_pref {
+            save(PREF, &app.session.sources.to_json());
+        }
+        return;
     }
+    if app.ui.sources.retry_at.is_some_and(|at| web_time::Instant::now() < at) {
+        return;
+    }
+    attempt(app);
+}
+
+/// One try at saving the data sources through `update_pref`: what it came to.
+fn attempt(app: &mut RustGisApp) -> Option<crate::PrefUpdate> {
+    use rustgis_engine::sources::Sources;
+    enum Next {
+        /// What is stored is what this session last wrote: its lists are written as they are.
+        Own(String),
+        Rebased(Box<Sources>, String),
+    }
+    let update = app.services.update_pref.as_ref()?;
+    let now = web_time::Instant::now();
+    let (mut next, mut unreadable) = (None, None);
+    let (sources, last) = (&app.session.sources, app.ui.sources.last_written.as_deref());
+    let outcome = update(PREF, &mut |stored| {
+        if stored.is_some() && stored == last {
+            let text = sources.to_json();
+            next = Some(Next::Own(text.clone()));
+            return Some(text);
+        }
+        let mut rebased = sources.clone();
+        match rebased.rebase(stored, last) {
+            Ok(()) => {
+                let text = rebased.to_json();
+                next = Some(Next::Rebased(Box::new(rebased), text.clone()));
+                Some(text)
+            }
+            // Never written over: the changes wait until it can be read (or is removed).
+            Err(why) => {
+                unreadable = Some(why);
+                None
+            }
+        }
+    });
+    let state = &mut app.ui.sources;
+    match (outcome, next) {
+        (crate::PrefUpdate::Saved, Some(next)) => {
+            (state.retry_at, state.failures, state.busy_since, state.refusal_said) = (None, 0, None, false);
+            state.said.retain(|(kind, _)| *kind != "busy");
+            let text = match next {
+                Next::Own(text) => {
+                    app.session.sources.stored();
+                    text
+                }
+                Next::Rebased(sources, text) => {
+                    app.session.sources = *sources;
+                    text
+                }
+            };
+            app.ui.sources.last_written = Some(text);
+            app.ui.sources_saved = app.session.sources.generation;
+            say_unread(app);
+        }
+        (crate::PrefUpdate::Busy, _) => {
+            let since = *state.busy_since.get_or_insert(now);
+            state.retry_at = Some(now + BUSY_RETRY);
+            if now.duration_since(since) >= BUSY_SAY {
+                let said =
+                    crate::tl!("The data sources aren't saved yet: another copy of RustGIS keeps its preferences busy. Trying again.");
+                say_more(app, "busy", 1, said.to_string());
+            }
+        }
+        _ => {
+            state.busy_since = None;
+            state.failures = state.failures.saturating_add(1);
+            state.retry_at = Some(now + backoff(state.failures));
+            // Said when a save refuses, though the same was said when the sources were read.
+            if let Some(why) = unreadable
+                && !state.refusal_said
+            {
+                state.refusal_said = true;
+                app.session.warn(why);
+            }
+        }
+    }
+    Some(outcome)
+}
+
+/// As the app closes: data sources left to save are tried once more whatever the retry delay,
+/// trying again for up to `wait` while another copy of the app keeps the preferences busy
+/// (closing isn't the path that must answer at once). What still can't be saved is said and
+/// logged.
+pub fn save_at_exit(app: &mut RustGisApp, wait: std::time::Duration) {
+    if !app.ui.sources.loaded || app.session.sources.generation == app.ui.sources_saved || app.services.update_pref.is_none() {
+        return;
+    }
+    let start = web_time::Instant::now();
+    loop {
+        let outcome = attempt(app);
+        if app.session.sources.generation == app.ui.sources_saved {
+            return;
+        }
+        let busy = outcome == Some(crate::PrefUpdate::Busy);
+        if !busy || start.elapsed() >= wait {
+            let why = if busy { "another copy of RustGIS kept its preferences busy" } else { "they couldn't be written" };
+            log::warn!("the data sources changed in this session weren't saved: {why}");
+            app.session.warn(crate::i18n::fmt(
+                "The data sources changed in this session weren't saved as RustGIS closed: {why}.",
+                &[("why", why)],
+            ));
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// How soon a data sources save left to do is tried again, if one is: the frame that tries it
+/// is asked for.
+pub fn retry_in(app: &RustGisApp) -> Option<std::time::Duration> {
+    if app.session.sources.generation == app.ui.sources_saved {
+        return None;
+    }
+    let at = app.ui.sources.retry_at?;
+    Some(at.saturating_duration_since(web_time::Instant::now()))
 }
 
 /// Loads connections before commands can run, importing legacy saved endpoints only once.

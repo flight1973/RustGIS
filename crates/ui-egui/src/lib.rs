@@ -378,6 +378,18 @@ pub fn parse_extent(text: &str) -> Option<[f64; 4]> {
     Some([e.min_x, e.min_y, e.max_x, e.max_y])
 }
 
+/// What a [`Services::update_pref`] came to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PrefUpdate {
+    Saved,
+    /// The function gave back none: nothing was written.
+    Unchanged,
+    /// Another copy of the app is saving its preferences: try again later.
+    Busy,
+    /// Saving failed (the hook said why).
+    Failed,
+}
+
 /// Platform hooks. The desktop app leaves them empty and uses native file dialogs; the web app
 /// supplies an asynchronous file picker (results arrive in `inbox`) and browser downloads.
 #[derive(Default)]
@@ -399,6 +411,16 @@ pub struct Services {
     pub load_pref: Option<Box<dyn Fn(&str) -> Option<String>>>,
     /// Saves a preference.
     pub save_pref: Option<Box<dyn Fn(&str, &str)>>,
+    /// Saves a preference made from the value stored now, which another copy of the app may have
+    /// changed since it was read (the desktop's, locked against the others meanwhile): the
+    /// function is given that value and returns the one to save, or none to leave it. It never
+    /// waits for another copy: [`PrefUpdate::Busy`] instead. `None` where one copy of the app
+    /// keeps its preferences (the browser): `save_pref` is used.
+    pub update_pref: Option<Box<dyn Fn(&str, &mut dyn FnMut(Option<&str>) -> Option<String>) -> PrefUpdate>>,
+    /// Saves again what `save_pref` left to save while another copy of the app saved its own
+    /// preferences (the desktop's), never waiting; whether any is still left. Tried each frame
+    /// while one is. `None` where nothing is ever left (the browser).
+    pub retry_prefs: Option<Box<dyn Fn() -> bool>>,
     /// The system's secret store (see `docs/architecture.md` › Secrets): the desktop's keychain.
     /// `None` in the browser and on the command line, where secrets last for the session only.
     pub secrets: Option<std::sync::Arc<dyn rustgis_engine::data::secrets::SecretStore>>,
@@ -2666,6 +2688,13 @@ impl RustGisApp {
                 false
             }
         }
+    }
+
+    /// As the app closes (the desktop app's `on_exit`): data sources left to save are tried once
+    /// more, waiting up to a second and a half for another copy of the app to let go of the
+    /// preferences; what still can't be saved is said and logged.
+    pub fn save_sources_at_exit(&mut self) {
+        sourcespane::save_at_exit(self, std::time::Duration::from_millis(1500));
     }
 
     /// A clean exit (the desktop app's `on_exit`): the recovery copy of this run's unsaved work
@@ -6402,6 +6431,14 @@ impl RustGisApp {
         // Sources the AI Assistant or a background add brought in (not through `run`) are kept
         // too: a generation compared each frame. So is a default raster style it set.
         sourcespane::save(self);
+        if let Some(retry) = sourcespane::retry_in(self) {
+            ctx.request_repaint_after(retry);
+        }
+        if let Some(retry) = &self.services.retry_prefs
+            && retry()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         sourcespane::save_connections(self);
         self.save_raster_defaults();
         self.save_layout_favourite();

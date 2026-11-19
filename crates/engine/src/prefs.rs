@@ -49,19 +49,182 @@ fn parse_preferences(bytes: &[u8]) -> Result<Map<String, Value>, String> {
 /// overwritten. The new file is written under a name of its own beside the old one, synced to
 /// disk, then renamed over it, so a crash or power cut leaves the old file or the new one, never
 /// a partly written one, and two copies of RustGIS saving at once never share a temporary file.
-pub fn write(key: &str, value: &str) -> Result<Option<PathBuf>, String> {
+///
+/// It reads, changes and writes the file under the lock [`update`] takes, so it never puts back
+/// what another copy of RustGIS wrote meanwhile. While another copy holds that lock it writes
+/// nothing and returns [`Updated::Busy`]: the value is kept to save, the latest of each key, and
+/// [`retry_pending`] writes it later (a later write of the key replaces it).
+pub fn write(key: &str, value: &str) -> Result<Updated, String> {
+    let dir = rustgis_data::dirs::config_dir().ok_or("the settings folder isn't available")?;
+    write_in(&dir.join(FILE), key, value)
+}
+
+/// [`write`] of the file at `path` (a test folder in tests).
+fn write_in(path: &Path, key: &str, value: &str) -> Result<Updated, String> {
+    let done = {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        update_file(path, key, |_| Some(value.to_string()))
+    };
+    let mut pending = PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let id = (path.to_path_buf(), key.to_string());
+    match done {
+        Ok(Updated::Busy) => {
+            pending.insert(id, value.to_string());
+        }
+        _ => {
+            pending.remove(&id);
+        }
+    }
+    done
+}
+
+/// Values [`write`] couldn't save while another copy held the lock, by file and key: the latest
+/// of each.
+static PENDING: Mutex<std::collections::BTreeMap<(PathBuf, String), String>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Writes again what [`write`] left to save. `wait` bounds how long it waits for another copy
+/// to let go of the lock: zero on the UI thread (it never waits there), a second or two at exit.
+/// Returns what each write tried came to (to report), and whether any is still left.
+pub fn retry_pending(wait: std::time::Duration) -> (Vec<Result<Option<PathBuf>, String>>, bool) {
+    retry_pending_in(None, wait)
+}
+
+/// [`retry_pending`], of the file at `only` alone when given (a test folder in tests).
+fn retry_pending_in(only: Option<&Path>, wait: std::time::Duration) -> (Vec<Result<Option<PathBuf>, String>>, bool) {
+    let todo = || -> Vec<((PathBuf, String), String)> {
+        let pending = PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.iter().filter(|((path, _), _)| only.is_none_or(|o| o == path)).map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let mut said = Vec::new();
+    // The browser keeps no preferences file: nothing is ever left to write there.
+    #[cfg(not(target_arch = "wasm32"))]
+    let start = std::time::Instant::now();
+    loop {
+        let mut busy = false;
+        for ((path, key), value) in todo() {
+            let done = {
+                let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                update_file(&path, &key, |_| Some(value.clone()))
+            };
+            if done == Ok(Updated::Busy) {
+                busy = true;
+                break;
+            }
+            let mut pending = PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A newer value written meanwhile stays to save.
+            if pending.get(&(path.clone(), key.clone())) == Some(&value) {
+                pending.remove(&(path, key));
+            }
+            said.push(done.map(|d| match d {
+                Updated::Saved(set_aside) => set_aside,
+                Updated::Unchanged | Updated::Busy => None,
+            }));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if busy && start.elapsed() < wait {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = wait;
+        return (said, busy || !todo().is_empty());
+    }
+}
+
+/// What [`update`] came to.
+#[derive(Debug, PartialEq)]
+pub enum Updated {
+    /// Saved; where a malformed file was set aside, if one was.
+    Saved(Option<PathBuf>),
+    /// The value given back none: nothing was written.
+    Unchanged,
+    /// Another copy of RustGIS is saving its preferences: nothing was read or written. Try again
+    /// later; this never waits for it.
+    Busy,
+}
+
+/// Updates one desktop preference from its stored value: `value` is given what is stored now
+/// (none when nothing is, or the file is malformed) and returns what to save, or none to leave
+/// it. Another copy of RustGIS saving meanwhile can't read or write the preferences until this
+/// one is written, so a value merged with what is stored keeps that copy's changes; while one
+/// is saving, this returns [`Updated::Busy`] at once. Otherwise as [`write`].
+pub fn update(key: &str, value: impl FnOnce(Option<&str>) -> Option<String>) -> Result<Updated, String> {
     let dir = rustgis_data::dirs::config_dir().ok_or("the settings folder isn't available")?;
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    write_at(&dir.join(FILE), key, value)
+    update_file(&dir.join(FILE), key, value)
+}
+
+/// [`update`] of the file at `path` (a test folder in tests), with its lock.
+fn update_file(path: &Path, key: &str, value: impl FnOnce(Option<&str>) -> Option<String>) -> Result<Updated, String> {
+    let _held = match lock(path)? {
+        Locked::Busy => return Ok(Updated::Busy),
+        Locked::Held(held) => Some(held),
+        Locked::Unlockable => None,
+    };
+    write_with(path, key, value, std::fs::read(path), sync_directory)
 }
 
 /// [`write`] to the file at `path` (a test folder in tests): returns where a malformed file went.
+#[cfg(test)]
 fn write_at(path: &Path, key: &str, value: &str) -> Result<Option<PathBuf>, String> {
     write_at_with_sync(path, key, value, sync_directory)
 }
 
+/// A lock on the preferences shared by every copy of RustGIS on this computer: held while one
+/// reads, changes and writes them, released when dropped (or when the process ends). It is an
+/// empty file beside them, never removed, so two copies always lock the same one.
+#[cfg(not(target_arch = "wasm32"))]
+struct Lock(std::fs::File);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// The browser keeps no preferences file (and has one copy of RustGIS a page): nothing to lock.
+#[cfg(target_arch = "wasm32")]
+struct Lock;
+
+/// What trying the preferences lock came to.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+enum Locked {
+    Held(Lock),
+    /// Another copy of RustGIS holds it.
+    Busy,
+    /// This folder can't be locked at all (some network folders): saved without it, as before.
+    Unlockable,
+}
+
+/// Tries the lock once, never waiting: [`Locked::Busy`] while another copy holds it.
+#[cfg(not(target_arch = "wasm32"))]
+fn lock(path: &Path) -> Result<Locked, String> {
+    let lock_path = path.with_extension("json.lock");
+    let dir = path.parent().ok_or("the settings folder isn't available")?;
+    // Never through a link (the open itself refuses one on Unix), only a regular file, its
+    // owner's alone.
+    let file = std::fs::create_dir_all(dir)
+        .and_then(|_| rustgis_data::io::open_lock_file(&lock_path))
+        .map_err(|error| format!("could not save preferences: couldn't open {}: {error}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Locked::Held(Lock(file))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Locked::Busy),
+        Err(std::fs::TryLockError::Error(error)) => {
+            log::warn!("preferences saved without a lock: couldn't lock {}: {error}", lock_path.display());
+            Ok(Locked::Unlockable)
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn lock(_: &Path) -> Result<Locked, String> {
+    Ok(Locked::Held(Lock))
+}
+
 /// Separates replacement from its final directory flush; an unconfirmed flush must not claim
 /// that the already-visible file was left unchanged. The callback permits a post-rename fault test.
+#[cfg(test)]
 fn write_at_with_sync(
     path: &Path,
     key: &str,
@@ -73,6 +236,7 @@ fn write_at_with_sync(
 
 /// Uses one read result for a save. Only successfully read, malformed bytes permit recovery;
 /// a transient read failure cannot replace a valid file with a new one containing a single key.
+#[cfg(test)]
 fn write_at_with_bytes(
     path: &Path,
     key: &str,
@@ -80,15 +244,35 @@ fn write_at_with_bytes(
     bytes: std::io::Result<Vec<u8>>,
     sync: impl FnOnce(&Path) -> std::io::Result<()>,
 ) -> Result<Option<PathBuf>, String> {
-    let (mut map, set_aside) = match bytes {
+    match write_with(path, key, |_| Some(value.to_string()), bytes, sync)? {
+        Updated::Saved(set_aside) => Ok(set_aside),
+        Updated::Unchanged | Updated::Busy => Ok(None),
+    }
+}
+
+/// [`write_at_with_bytes`] with the value made from the one stored under `key` in `bytes` (none
+/// to leave it as it is).
+fn write_with(
+    path: &Path,
+    key: &str,
+    value: impl FnOnce(Option<&str>) -> Option<String>,
+    bytes: std::io::Result<Vec<u8>>,
+    sync: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<Updated, String> {
+    let (mut map, malformed) = match bytes {
         Ok(bytes) => match parse_preferences(&bytes) {
             Ok(map) => (map, None),
-            Err(_) => (Map::new(), Some(set_aside(path, &bytes)?)),
+            Err(_) => (Map::new(), Some(bytes)),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Map::new(), None),
         Err(error) => return Err(format!("could not read preferences: {error}")),
     };
-    map.insert(key.to_string(), Value::String(value.to_string()));
+    let Some(value) = value(map.get(key).and_then(Value::as_str)) else { return Ok(Updated::Unchanged) };
+    let set_aside = match malformed {
+        Some(bytes) => Some(set_aside(path, &bytes)?),
+        None => None,
+    };
+    map.insert(key.to_string(), Value::String(value));
     let text = serde_json::to_vec(&map).map_err(|_| "could not serialize preferences")?;
     let dir = path.parent().ok_or("the settings folder isn't available")?;
     std::fs::create_dir_all(dir).and_then(|_| rustgis_data::io::replace_atomic(path, &text)).map_err(|error| match &set_aside {
@@ -102,7 +286,7 @@ fn write_at_with_bytes(
         ),
         None => format!("preferences were replaced, but their durability could not be confirmed: {error}"),
     })?;
-    Ok(set_aside)
+    Ok(Updated::Saved(set_aside))
 }
 
 /// How many malformed preference files are kept: `prefs.json.bad`, then `prefs.json.bad2` to
@@ -249,6 +433,152 @@ pub fn use_saved_secrets(s: &mut crate::Session, prefs: &Map<String, Value>, sto
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two copies of RustGIS read the same saved data sources and save their own changes: each
+    /// keeps the other's, and a source one forgot stays forgotten.
+    #[test]
+    fn two_copies_keep_each_others_data_sources() {
+        use crate::sources::{Source, Sources};
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-two-copies-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        let file = |address: &str| Source { kind: "file".into(), address: address.into(), ..Source::default() };
+        let mut first = Sources::default();
+        first.keep("favourites", file("/old.csv")).unwrap();
+        first.keep("favourites", file("/gone.csv")).unwrap();
+        write_at(&path, "data_sources", &first.to_json()).unwrap();
+        // As the desktop saves: read again, this copy's changes laid over what is stored, written.
+        let save = |s: &mut Sources| {
+            let mut next = None;
+            let done = update_file(&path, "data_sources", |stored| {
+                let mut n = s.clone();
+                n.rebase(stored, None).ok()?;
+                let text = n.to_json();
+                next = Some(n);
+                Some(text)
+            })
+            .unwrap();
+            assert!(matches!(done, Updated::Saved(_)), "{done:?}");
+            *s = next.unwrap();
+        };
+        let stored = || Sources::from_json(read_at(&path).unwrap().get("data_sources").and_then(Value::as_str).unwrap());
+        let favorites = |s: &Sources| s.favourites.iter().map(|f| f.address.clone()).collect::<Vec<_>>();
+        let (mut a, mut b) = (stored(), stored());
+        a.keep("favourites", file("/a.csv")).unwrap();
+        save(&mut a);
+        b.keep("favourites", file("/b.csv")).unwrap();
+        save(&mut b);
+        assert_eq!(favorites(&stored()), ["/old.csv", "/gone.csv", "/a.csv", "/b.csv"]);
+        // The copy that saved last lists the other's too.
+        assert_eq!(favorites(&b), favorites(&stored()));
+        // One forgets a source and saves after the other did: it stays forgotten.
+        assert!(a.forget("favourites", "file", "/gone.csv").unwrap());
+        b.note(file("/b-recent.csv"));
+        save(&mut b);
+        save(&mut a);
+        assert_eq!(favorites(&stored()), ["/old.csv", "/a.csv", "/b.csv"]);
+        assert_eq!(stored().recent.iter().map(|r| r.address.as_str()).collect::<Vec<_>>(), ["/b-recent.csv"]);
+        // The other, saving again with what it read before, doesn't bring it back.
+        b.keep("saved", file("/b-saved.csv")).unwrap();
+        save(&mut b);
+        assert_eq!(favorites(&stored()), ["/old.csv", "/a.csv", "/b.csv"]);
+        assert_eq!(stored().saved.len(), 1);
+        // Forgotten and kept again here, a source is listed again.
+        assert!(a.forget("favourites", "file", "/a.csv").unwrap());
+        a.keep("favourites", file("/a.csv")).unwrap();
+        save(&mut a);
+        assert!(favorites(&stored()).contains(&"/a.csv".to_string()));
+        // With nothing stored (the preferences removed, or reset), a save writes this copy's whole
+        // list, not just what it changed since.
+        for gone in [None, Some("")] {
+            match gone {
+                None => std::fs::remove_file(&path).unwrap(),
+                Some(empty) => write_at(&path, "data_sources", empty).map(drop).unwrap(),
+            }
+            let all = favorites(&a);
+            a.keep("favourites", file("/after.csv")).unwrap();
+            save(&mut a);
+            assert_eq!(favorites(&stored()), [all, vec!["/after.csv".to_string()]].concat());
+            assert!(a.forget("favourites", "file", "/after.csv").unwrap());
+            save(&mut a);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Every preference write goes through the lock: while another copy holds it, a write is
+    /// kept (the latest of its key), writes nothing, and is written later over what that copy
+    /// saved meanwhile, never putting its old value back; at exit the retry waits a little.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_write_while_another_copy_saves_is_kept_and_written_later() {
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        write_at(&path, "data_sources", "old").unwrap();
+        let held = lock(&path).unwrap();
+        assert_eq!(write_in(&path, "theme", "light").unwrap(), Updated::Busy);
+        assert_eq!(write_in(&path, "theme", "dark").unwrap(), Updated::Busy);
+        assert!(read_at(&path).unwrap().get("theme").is_none(), "nothing written while it is held");
+        let (said, left) = retry_pending_in(Some(&path), std::time::Duration::ZERO);
+        assert!(said.is_empty() && left);
+        // The other copy saves its own while it holds the lock.
+        write_at(&path, "data_sources", "theirs").unwrap();
+        drop(held);
+        let (said, left) = retry_pending_in(Some(&path), std::time::Duration::ZERO);
+        assert_eq!((said.len(), left), (1, false), "{said:?}");
+        let map = read_at(&path).unwrap();
+        assert_eq!(map.get("theme").and_then(Value::as_str), Some("dark"), "the latest value");
+        assert_eq!(map.get("data_sources").and_then(Value::as_str), Some("theirs"), "the other copy's save stays");
+        // At exit the retry waits (a little) for the other copy to let go.
+        let held = lock(&path).unwrap();
+        assert_eq!(write_in(&path, "theme", "exit").unwrap(), Updated::Busy);
+        let other = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200)); // test-wait: another copy holding the lock briefly
+            drop(held);
+        });
+        let (said, left) = retry_pending_in(Some(&path), std::time::Duration::from_millis(1500));
+        other.join().unwrap();
+        assert_eq!((said.len(), left), (1, false), "{said:?}");
+        assert_eq!(read_at(&path).unwrap().get("theme").and_then(Value::as_str), Some("exit"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The preferences lock is shared by every copy of RustGIS: while one holds it, another's
+    /// update returns at once, reading and writing nothing, and saves once it is let go.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_held_preferences_lock_never_waits() {
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        let held = lock(&path).unwrap();
+        assert!(matches!(held, Locked::Held(_)));
+        assert!(matches!(lock(&path).unwrap(), Locked::Busy));
+        let started = std::time::Instant::now();
+        let busy = update_file(&path, "k", |_| panic!("nothing is read while another copy saves")).unwrap();
+        assert_eq!(busy, Updated::Busy);
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert!(!path.exists());
+        drop(held);
+        assert_eq!(update_file(&path, "k", |_| Some("v".into())).unwrap(), Updated::Saved(None));
+        assert_eq!(read_at(&path).unwrap().get("k").and_then(Value::as_str), Some("v"));
+        // A value given back as none leaves the preference as it was.
+        assert_eq!(update_file(&path, "k", |_| None).unwrap(), Updated::Unchanged);
+        assert_eq!(read_at(&path).unwrap().get("k").and_then(Value::as_str), Some("v"));
+        // A link in the lock's place is refused, never followed.
+        #[cfg(unix)]
+        {
+            let lock_path = path.with_extension("json.lock");
+            std::fs::remove_file(&lock_path).unwrap();
+            std::os::unix::fs::symlink(dir.join("elsewhere"), &lock_path).unwrap();
+            assert!(lock(&path).is_err());
+            assert!(!dir.join("elsewhere").exists());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// Recovery preserves the malformed snapshot, even if the path now contains another save.
     #[test]

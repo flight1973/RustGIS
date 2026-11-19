@@ -932,6 +932,49 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
     atomic_write_at(&path, write)
 }
 
+/// Opens (creating it, empty) an app-managed file used only to lock on: never through a symbolic
+/// link (on Unix the open itself refuses one, so none can be swapped in between a check and the
+/// open), only a regular file, readable and writable by its owner alone. Elsewhere a link or
+/// other non-regular file at `path` is refused before and after the open.
+pub fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let refused = || std::io::Error::other(format!("{} isn't a regular file", path.display()));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32);
+    }
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    if std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
+        return Err(refused());
+    }
+    let file = options.open(path).map_err(|e| if e.raw_os_error() == Some(rustix_eloop()) { refused() } else { e })?;
+    if !file.metadata()?.is_file() || std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_file()) {
+        return Err(refused());
+    }
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
+}
+
+/// The error a no-follow open gives for a symbolic link.
+fn rustix_eloop() -> i32 {
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        rustix::io::Errno::LOOP.raw_os_error()
+    }
+    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    {
+        -1
+    }
+}
+
 /// Atomically replaces an app-managed file, replacing a final symbolic link rather than
 /// writing through it. Parent directories must be trusted, as for [`write_atomic`]. Existing
 /// regular files keep their permissions; a replaced link uses a new file's permissions.

@@ -1219,6 +1219,9 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
         arcgis_sign_in: Some(Box::new(move |portal, client_id, slot| crate::arcgis::sign_in(portal, client_id, slot, arcgis_ctx.clone()))),
         load_pref: Some(load_pref),
         save_pref: Some(save_pref),
+        // One copy of RustGIS a page keeps its preferences: nothing stored to merge with.
+        update_pref: None,
+        retry_prefs: None,
         // No keychain in the browser: script on the page could read anything stored (#754).
         secrets: None,
         // No autosave in the browser yet: localStorage is too small for a project (#873).

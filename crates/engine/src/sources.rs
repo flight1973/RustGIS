@@ -48,6 +48,13 @@ pub struct Sources {
     /// What of the preference this version couldn't use, written back as it was.
     #[serde(skip)]
     kept: Kept,
+    /// What this session changed since the sources were last stored, by list, kind and address:
+    /// the sources it kept or noted, and the ones it forgot. [`Sources::rebase`] lays these over
+    /// the stored sources, so another window's changes stay.
+    #[serde(skip)]
+    touched: BTreeSet<(&'static str, String, String)>,
+    #[serde(skip)]
+    removed: BTreeSet<(&'static str, String, String)>,
 }
 
 /// The three lists, as the preference names them.
@@ -68,14 +75,19 @@ struct Kept {
     over: usize,
     /// Fields of read sources this version doesn't know, by list, kind and address.
     fields: BTreeMap<(&'static str, String, String), Map<String, Value>>,
+    /// Details (`extra`) of read sources that [`clean`] leaves out but a newer RustGIS may have
+    /// written (a number, a list, more than eight entries…), by list, kind and address: the
+    /// entries left out, or the whole value when it isn't an object. Only for rows without a
+    /// password, key or token; written back beside the details this version uses.
+    extra: BTreeMap<(&'static str, String, String), Value>,
     /// Keys beside the three lists this version doesn't know.
     top: Map<String, Value>,
     /// Rows and fields that couldn't be read and held a password, key or token: not kept, since
     /// this version can't strip it from what it doesn't understand.
     secrets: usize,
     /// Readable sources whose name, address or details [`clean`] changed (a name too long or with
-    /// control characters, an address with a password, key or token, details that aren't short
-    /// text, more than eight, or secret-looking): saved that way.
+    /// control characters, an address with a password, key or token, or details of a row holding
+    /// one): saved that way. The details of other rows are kept in `extra` instead.
     cut: usize,
     /// Readable rows that repeat the identity of an earlier row of their list: dropped (the first
     /// one wins, with its unknown fields).
@@ -136,6 +148,21 @@ fn cut(before: &Source, after: &Source) -> bool {
     (!name.is_empty() && after.name != name) || after.address != before.address.trim() || extra
 }
 
+/// What [`clean`] left out of a source's details `before` (now `after`): the entries it dropped, or
+/// the whole value when it isn't an object (none when nothing was left out).
+fn left_out(before: &Value, after: &Value) -> Option<Value> {
+    match before {
+        Value::Null => None,
+        Value::Object(o) => {
+            let used = after.as_object();
+            let out: Map<String, Value> =
+                o.iter().filter(|(k, _)| !used.is_some_and(|u| u.contains_key(*k))).map(|(k, v)| (k.clone(), v.clone())).collect();
+            (!out.is_empty()).then_some(Value::Object(out))
+        }
+        other => Some(other.clone()),
+    }
+}
+
 /// A saved row: the source, and the fields this version doesn't know.
 #[derive(Deserialize)]
 struct Row {
@@ -186,21 +213,33 @@ impl Sources {
                 // Entry by entry: one that doesn't read is kept as it was, not the whole list.
                 let read = serde_json::from_value::<Row>(row.clone()).ok().and_then(|r| {
                     let mut cleaned = clean(r.source.clone()).ok()?;
-                    let was_cut = cut(&r.source, &cleaned);
+                    // Details this version doesn't use, from a row without a secret, are kept as
+                    // they were: a newer RustGIS may have written them. A row holding a secret
+                    // can't be kept as it was, so its details are saved cleaned (and said).
+                    let newer = if holds_secret(&row) { None } else { left_out(&r.source.extra, &cleaned.extra) };
+                    let before = match newer {
+                        Some(_) => Source { extra: cleaned.extra.clone(), ..r.source.clone() },
+                        None => r.source.clone(),
+                    };
+                    let was_cut = cut(&before, &cleaned);
                     // A login binding is the app's own output, never authority from an earlier
                     // process's login: it isn't kept, and clearing it is no loss.
                     crate::s3_connections::clear_bindings(std::iter::once(&mut cleaned.address));
-                    Some((was_cut, cleaned, r.other))
+                    Some((was_cut, cleaned, r.other, newer))
                 });
                 match read {
                     // The first row of an identity wins; a repeat is dropped, and said.
-                    Some((_, source, _)) if seen.contains(&identity(&source.kind, &source.address)) => s.kept.repeated += 1,
-                    Some((was_cut, source, other)) if into.len() < cap => {
+                    Some((_, source, _, _)) if seen.contains(&identity(&source.kind, &source.address)) => s.kept.repeated += 1,
+                    Some((was_cut, source, other, newer)) if into.len() < cap => {
                         seen.insert(identity(&source.kind, &source.address));
                         s.kept.cut += usize::from(was_cut);
                         let other = s.kept.without_secrets(other, &source.address, &source.extra);
+                        let key = (list, source.kind.clone(), source.address.clone());
                         if !other.is_empty() {
-                            s.kept.fields.insert((list, source.kind.clone(), source.address.clone()), other);
+                            s.kept.fields.insert(key.clone(), other);
+                        }
+                        if let Some(newer) = newer {
+                            s.kept.extra.insert(key, newer);
                         }
                         into.push(source);
                     }
@@ -221,52 +260,67 @@ impl Sources {
     /// What of the preference read by [`Sources::from_json`] isn't used here, one line per kind
     /// (none when all of it is).
     pub fn unread(&self) -> Vec<String> {
+        self.unread_by_kind().into_iter().map(|(_, _, said)| said).collect()
+    }
+
+    /// [`Sources::unread`], each line with its kind (`"whole"`, `"repeated"`, `"over"`, `"rows"`,
+    /// `"newer"`, `"cut"` or `"secrets"`) and how many it is about, so a caller says each kind once,
+    /// and again only when it is about more.
+    pub fn unread_by_kind(&self) -> Vec<(&'static str, usize, String)> {
         let k = &self.kept;
         if let Some((_, why)) = &k.whole {
-            return vec![format!(
-                "The saved data sources couldn't be read ({why}): none is listed, and the favourites, recent and saved sources of this session aren't kept over them; fix or remove \"data_sources\" in the preferences file to keep them"
+            return vec![(
+                "whole",
+                1,
+                format!(
+                    "The saved data sources couldn't be read ({why}): none is listed, and the favourites, recent and saved sources of this session aren't kept over them; fix or remove \"data_sources\" in the preferences file to keep them"
+                ),
             )];
         }
         let mut said = Vec::new();
         let rows = k.rows.values().map(Vec::len).sum::<usize>().saturating_sub(k.over);
         if k.repeated > 0 {
             let n = k.repeated;
-            said.push(format!(
-                "{n} repeated saved data source{} removed (the first of each is kept, with its settings)",
-                if n == 1 { " was" } else { "s were" }
+            said.push((
+                "repeated",
+                n,
+                format!(
+                    "{n} repeated saved data source{} removed (the first of each is kept, with its settings)",
+                    if n == 1 { " was" } else { "s were" }
+                ),
             ));
         }
         if k.over > 0 {
             let n = k.over;
-            said.push(format!(
+            said.push(("over", n, format!(
                 "{n} saved data source{} past the lists' limits ({MAX_KEPT} favourites or saved, {MAX_RECENT} recent): not listed, and kept as {} when the sources are saved",
                 if n == 1 { " is" } else { "s are" },
                 if n == 1 { "it was" } else { "they were" }
-            ));
+            )));
         }
         if rows > 0 {
-            said.push(format!(
+            said.push(("rows", rows, format!(
                 "{rows} saved data source{} couldn't be read (from a newer RustGIS, or damaged): not listed, and kept as {} when the sources are saved",
                 if rows == 1 { "" } else { "s" },
                 if rows == 1 { "it was" } else { "they were" }
-            ));
+            )));
         }
-        if !k.fields.is_empty() {
-            let n = k.fields.len();
-            said.push(format!(
+        if !k.fields.is_empty() || !k.extra.is_empty() {
+            let n = k.fields.keys().chain(k.extra.keys()).collect::<BTreeSet<_>>().len();
+            said.push(("newer", n, format!(
                 "{n} saved data source{} settings this version doesn't know (from a newer RustGIS): ignored here, and kept when the sources are saved",
                 if n == 1 { " has" } else { "s have" }
-            ));
+            )));
         }
         if k.cut > 0 {
             let n = k.cut;
-            said.push(format!(
-                "{n} saved data source{} a name, address or details this version changes (a name too long or with control characters, an address with a password, key or token, details that aren't short text, more than eight, or secret-looking): saved changed",
+            said.push(("cut", n, format!(
+                "{n} saved data source{} a name, address or details this version changes (a name too long or with control characters, an address with a password, key or token, or details of a source holding one): saved changed",
                 if n == 1 { " has" } else { "s have" }
-            ));
+            )));
         }
         if k.secrets > 0 {
-            said.push(secrets_notice(k.secrets));
+            said.push(("secrets", k.secrets, secrets_notice(k.secrets)));
         }
         said
     }
@@ -297,7 +351,9 @@ impl Sources {
                     now.push(source);
                 } else {
                     over.push((list, stored.row(list, &source)));
-                    stored.kept.fields.remove(&(list, source.kind.clone(), source.address.clone()));
+                    let key = key_of(list, &source);
+                    stored.kept.fields.remove(&key);
+                    stored.kept.extra.remove(&key);
                 }
             }
         }
@@ -309,14 +365,7 @@ impl Sources {
         // A readable row kept past a limit for a source that is listed gives it its fields.
         for list in LISTS {
             if self.kept.rows.contains_key(list) {
-                let ids: Vec<_> = match list {
-                    "favourites" => &self.favourites,
-                    "saved" => &self.saved,
-                    _ => &self.recent,
-                }
-                .iter()
-                .map(|s| identity(&s.kind, &s.address))
-                .collect();
+                let ids: Vec<_> = self.list(list).iter().map(|s| identity(&s.kind, &s.address)).collect();
                 for id in ids {
                     self.adopt(list, &id);
                 }
@@ -324,6 +373,105 @@ impl Sources {
         }
         self.recheck_fields();
         self.generation += 1;
+    }
+
+    /// Lays this session's changes over the sources kept with the preferences as they are now,
+    /// which another window may have changed since they were read: the sources this session kept
+    /// or noted since then are taken as it has them, the ones it forgot stay forgotten, and every
+    /// other source is as stored (another window's additions stay, its removals too). A recent
+    /// source this session noted comes first.
+    ///
+    /// `stored` is the preference as it is now, `last_written` what this session last wrote of
+    /// it. When nothing is stored (the preferences removed or reset), or what is stored is what
+    /// this session wrote, there is nothing to lay the changes over: this session's sources are
+    /// kept whole. Stored sources that can't be read at all are never written over (as
+    /// [`Sources::merge`] does): an error says why, `self` is unchanged and its changes wait.
+    pub fn rebase(&mut self, stored: Option<&str>, last_written: Option<&str>) -> Result<(), String> {
+        let stored = stored.filter(|s| !s.trim_start_matches('\u{feff}').trim().is_empty());
+        let Some(stored) = stored.filter(|s| Some(*s) != last_written) else {
+            // This session's lists are what is stored now; what it read but can't use is kept.
+            self.kept.whole = None;
+            self.touched.clear();
+            self.removed.clear();
+            self.generation += 1;
+            return Ok(());
+        };
+        let mut next = Sources::from_json(stored);
+        if next.kept.whole.is_some() {
+            return Err(next.unread().into_iter().next().unwrap_or_default());
+        }
+        for (list, kind, address) in &self.removed {
+            let _ = next.forget(list, kind, address);
+        }
+        // A source this session changed is written with what this session keeps for it, exactly:
+        // its fields and details from a newer RustGIS, or none (replaced with other details, its
+        // old ones went), never the stored row's again.
+        let exact = |next: &mut Sources, key: &(&'static str, String, String)| {
+            match self.kept.fields.get(key) {
+                Some(fields) => next.kept.fields.insert(key.clone(), fields.clone()),
+                None => next.kept.fields.remove(key),
+            };
+            match self.kept.extra.get(key) {
+                Some(newer) => next.kept.extra.insert(key.clone(), newer.clone()),
+                None => next.kept.extra.remove(key),
+            };
+        };
+        for list in LISTS {
+            let cap = if list == "recent" { MAX_RECENT } else { MAX_KEPT };
+            let ours: Vec<Source> = self.list(list).iter().filter(|s| self.touched.contains(&key_of(list, s))).cloned().collect();
+            for source in &ours {
+                exact(&mut next, &key_of(list, source));
+            }
+            if list == "recent" {
+                next.recent.retain(|r| !ours.iter().any(|o| same(o, r)));
+                let older = std::mem::replace(&mut next.recent, ours.clone());
+                next.recent.extend(older);
+                next.recent.truncate(MAX_RECENT);
+                let recent = &next.recent;
+                next.kept.fields.retain(|(l, k, a), _| still_listed(recent, l, k, a));
+                next.kept.extra.retain(|(l, k, a), _| still_listed(recent, l, k, a));
+            } else {
+                let mut over = Vec::new();
+                let Ok(now) = next.list_mut(list) else { continue };
+                for source in ours.iter().cloned() {
+                    if let Some(slot) = now.iter_mut().find(|r| same(r, &source)) {
+                        *slot = source;
+                    } else if now.len() < cap {
+                        now.push(source);
+                    } else {
+                        over.push(source);
+                    }
+                }
+                // Past the limit (another window filled the list): kept as rows, and said.
+                for source in over {
+                    let row = next.row(list, &source);
+                    let key = key_of(list, &source);
+                    next.kept.fields.remove(&key);
+                    next.kept.extra.remove(&key);
+                    next.kept.rows.entry(list).or_default().push(row);
+                    next.kept.over += 1;
+                }
+            }
+            let ids: Vec<_> = next.list(list).iter().map(|s| identity(&s.kind, &s.address)).collect();
+            for id in ids {
+                next.adopt(list, &id);
+            }
+            // Adopting a stored row past the limit mustn't bring its details back either.
+            for source in &ours {
+                let key = key_of(list, source);
+                if next.list(list).iter().any(|s| same(s, source)) {
+                    exact(&mut next, &key);
+                }
+            }
+        }
+        next.kept.fields.retain(|_, f| !f.is_empty());
+        next.recheck_fields();
+        // Stored as they are now: nothing is this session's own change any more.
+        next.touched.clear();
+        next.removed.clear();
+        next.generation = self.generation + 1;
+        *self = next;
+        Ok(())
     }
 
     /// Classifies the fields kept for each listed source again, against the source as it is now
@@ -334,18 +482,26 @@ impl Sources {
         let keys: Vec<_> = self.kept.fields.keys().cloned().collect();
         for key in keys {
             let (list, kind, address) = &key;
-            let listed = match *list {
-                "favourites" => &self.favourites,
-                "saved" => &self.saved,
-                _ => &self.recent,
-            };
             let id = (kind.clone(), address.clone());
-            let Some(source) = listed.iter().find(|s| identity(&s.kind, &s.address) == id).cloned() else { continue };
+            let Some(source) = self.list(list).iter().find(|s| identity(&s.kind, &s.address) == id).cloned() else { continue };
             if let Some(fields) = self.kept.fields.remove(&key) {
                 let fields = self.kept.without_secrets(fields, &source.address, &source.extra);
                 if !fields.is_empty() {
                     self.kept.fields.insert(key, fields);
                 }
+            }
+        }
+        // Kept details passed with the row as it was read; beside details changed since (a web
+        // address next to a bare `key`), the row they make may hold a secret: then they go.
+        let keys: Vec<_> = self.kept.extra.keys().cloned().collect();
+        for key in keys {
+            let (list, kind, address) = &key;
+            let id = (kind.clone(), address.clone());
+            let Some(source) = self.list(list).iter().find(|s| identity(&s.kind, &s.address) == id) else { continue };
+            if holds_secret(&self.row(list, source))
+                && let Some(gone) = self.kept.extra.remove(&key)
+            {
+                self.kept.secrets += gone.as_object().map_or(1, Map::len);
             }
         }
     }
@@ -358,15 +514,24 @@ impl Sources {
         rows.retain(|r| {
             let ours = row_identity(r).as_ref() == Some(id);
             if ours && let Ok(row) = serde_json::from_value::<Row>(r.clone()) {
-                taken.push(row.other);
+                // Its details this version doesn't use go along too, unless the row holds a secret.
+                let newer = match clean(row.source.clone()) {
+                    Ok(cleaned) if !holds_secret(r) => left_out(&row.source.extra, &cleaned.extra),
+                    _ => None,
+                };
+                taken.push((row.other, newer));
             }
             !ours
         });
         self.kept.over = self.kept.over.saturating_sub(taken.len());
-        for other in taken {
-            let fields = self.kept.fields.entry((list, id.0.clone(), id.1.clone())).or_default();
+        let key = (list, id.0.clone(), id.1.clone());
+        for (other, newer) in taken {
+            let fields = self.kept.fields.entry(key.clone()).or_default();
             for (k, v) in other {
                 fields.entry(k).or_insert(v);
+            }
+            if let Some(newer) = newer {
+                self.kept.extra.entry(key.clone()).or_insert(newer);
             }
         }
         self.kept.fields.retain(|_, f| !f.is_empty());
@@ -387,13 +552,30 @@ impl Sources {
         Value::Object(o).to_string()
     }
 
-    /// A source as a preference row: with the fields kept for it that this version doesn't know.
+    /// A source as a preference row: with the fields and details kept for it that this version
+    /// doesn't know (what this version sets wins).
     fn row(&self, list: &'static str, source: &Source) -> Value {
         let mut row = serde_json::to_value(source).unwrap_or(Value::Null);
         let (kind, address) = identity(&source.kind, &source.address);
-        if let (Value::Object(row), Some(other)) = (&mut row, self.kept.fields.get(&(list, kind, address))) {
-            for (k, v) in other {
-                row.entry(k.clone()).or_insert_with(|| v.clone());
+        let key = (list, kind, address);
+        if let Value::Object(row) = &mut row {
+            if let Some(other) = self.kept.fields.get(&key) {
+                for (k, v) in other {
+                    row.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+            match self.kept.extra.get(&key) {
+                Some(Value::Object(newer)) => {
+                    if let Value::Object(extra) = row.entry("extra").or_insert_with(|| Value::Object(Map::new())) {
+                        for (k, v) in newer {
+                            extra.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                }
+                Some(whole) => {
+                    row.entry("extra").or_insert_with(|| whole.clone());
+                }
+                None => {}
             }
         }
         row
@@ -402,16 +584,23 @@ impl Sources {
     /// Notes a source just added (the most recent first, each once).
     pub fn note(&mut self, s: Source) {
         let Ok(s) = clean(s) else { return };
+        let changed = self.recent.iter().any(|r| same(r, &s) && *r != s);
         self.recent.retain(|r| !same(r, &s));
         self.recent.insert(0, s);
         self.recent.truncate(MAX_RECENT);
         let id = identity(&self.recent[0].kind, &self.recent[0].address);
+        // Noted with other details, as in [`Sources::keep`].
+        if changed {
+            self.kept.extra.remove(&("recent", id.0.clone(), id.1.clone()));
+        }
         self.adopt("recent", &id);
         // A source no longer recent takes the fields kept for it along.
         let recent = &self.recent;
-        self.kept.fields.retain(|(list, kind, address), _| {
-            *list != "recent" || recent.iter().any(|r| identity(&r.kind, &r.address) == identity(kind, address))
-        });
+        self.kept.fields.retain(|(list, kind, address), _| still_listed(recent, list, kind, address));
+        self.kept.extra.retain(|(list, kind, address), _| still_listed(recent, list, kind, address));
+        self.touched.retain(|(list, kind, address)| still_listed(recent, list, kind, address));
+        self.removed.remove(&("recent", id.0.clone(), id.1.clone()));
+        self.touched.insert(("recent", id.0, id.1));
         self.recheck_fields();
         self.generation += 1;
     }
@@ -423,7 +612,9 @@ impl Sources {
         let list = LISTS.into_iter().find(|l| *l == list).ok_or_else(|| format!("unknown list '{list}' (favourites, saved or recent)"))?;
         let l = self.list_mut(list)?;
         // The same source keeps its place.
+        let mut changed = false;
         if let Some(slot) = l.iter_mut().find(|r| same(r, &s)) {
+            changed = *slot != s;
             *slot = s.clone();
         } else {
             if l.len() >= MAX_KEPT {
@@ -431,7 +622,15 @@ impl Sources {
             }
             l.push(s.clone());
         }
-        self.adopt(list, &identity(&s.kind, &s.address));
+        let id = identity(&s.kind, &s.address);
+        // Replaced with other details, a source's kept details from a newer RustGIS were about
+        // the old ones (a WMS layer kept beside a WMTS source's): they go with them.
+        if changed {
+            self.kept.extra.remove(&(list, id.0.clone(), id.1.clone()));
+        }
+        self.adopt(list, &id);
+        self.removed.remove(&(list, id.0.clone(), id.1.clone()));
+        self.touched.insert((list, id.0, id.1));
         self.recheck_fields();
         self.generation += 1;
         // What was stored (cleaned): the caller reports it, wherever it sits in the list.
@@ -448,6 +647,7 @@ impl Sources {
         let mut kept_gone = false;
         if let Some(list) = LISTS.into_iter().find(|l| *l == list) {
             self.kept.fields.retain(|(l, k, a), _| *l != list || identity(k, a) != id);
+            self.kept.extra.retain(|(l, k, a), _| *l != list || identity(k, a) != id);
             // A readable row kept past the list's limit with the same identity would be listed
             // again by the next start; a row this version can't read is not this source's.
             if let Some(rows) = self.kept.rows.get_mut(list) {
@@ -456,11 +656,33 @@ impl Sources {
                 self.kept.over = self.kept.over.saturating_sub(before - rows.len());
                 kept_gone = rows.len() != before;
             }
+            if gone || kept_gone {
+                let key = (list, id.0.clone(), id.1.clone());
+                self.touched.remove(&key);
+                self.removed.insert(key);
+            }
         }
         if gone || kept_gone {
             self.generation += 1;
         }
         Ok(gone || kept_gone)
+    }
+
+    /// The list named `list` (the recent one for a name that isn't another's).
+    fn list(&self, list: &str) -> &Vec<Source> {
+        match list {
+            "favourites" => &self.favourites,
+            "saved" => &self.saved,
+            _ => &self.recent,
+        }
+    }
+
+    /// Marks these sources as what is stored: what this session changed is written. For a
+    /// caller that wrote [`Sources::to_json`] over what it last wrote itself, with nothing to lay
+    /// its changes over ([`Sources::rebase`] does this itself).
+    pub fn stored(&mut self) {
+        self.touched.clear();
+        self.removed.clear();
     }
 
     fn list_mut(&mut self, list: &str) -> Result<&mut Vec<Source>, String> {
@@ -479,6 +701,18 @@ fn identity(kind: &str, address: &str) -> (String, String) {
     let mut address = address.to_string();
     crate::s3_connections::clear_bindings(std::iter::once(&mut address));
     (kind.to_string(), address)
+}
+
+/// The key what is kept for a source in `list` goes under: the list and its identity.
+fn key_of(list: &'static str, source: &Source) -> (&'static str, String, String) {
+    let (kind, address) = identity(&source.kind, &source.address);
+    (list, kind, address)
+}
+
+/// Whether what is kept under `list`, `kind` and `address` still has its source: always, but in
+/// the recent list (`recent`), which drops its oldest.
+fn still_listed(recent: &[Source], list: &str, kind: &str, address: &str) -> bool {
+    list != "recent" || recent.iter().any(|r| identity(&r.kind, &r.address) == identity(kind, address))
 }
 
 /// The identity of a saved row [`Sources::from_json`] reads (none for one it can't).
@@ -1396,14 +1630,24 @@ MIIE
         let signed = json!({"saved": [{"kind": "url", "name": "U", "address": "https://a/x.fgb?sig=hidden"}]});
         let s = Sources::from_json(&signed.to_string());
         assert!(matches!(s.unread().as_slice(), [one] if one.starts_with("1 saved data source has")), "{:?}", s.unread());
-        // Details and a name this version cuts down when it reads them are said.
+        // A name this version cuts down when it reads it is said, and saved cut. Details it doesn't
+        // use are no longer cut: they may be a newer RustGIS's, which an older one never saves
+        // again without (AGENTS.md, "Never silent"), so they are kept as they were and said as
+        // kept, not as changed.
         let long = "n".repeat(300);
         let cut = json!({"saved": [
             {"kind": "service", "name": "S", "address": "https://h/wms", "extra": {"type": "wms", "future": {"mode": 1}}},
             {"kind": "file", "name": long, "address": "/a.csv"}
         ]});
         let s = Sources::from_json(&cut.to_string());
-        assert!(matches!(s.unread().as_slice(), [one] if one.starts_with("2 saved data sources have")), "{:?}", s.unread());
+        assert!(
+            matches!(s.unread().as_slice(), [kept, cut] if kept.starts_with("1 saved data source has settings")
+                && cut.starts_with("1 saved data source has a name")),
+            "{:?}",
+            s.unread()
+        );
+        assert_eq!(s.saved[0].extra, json!({"type": "wms"}));
+        assert!(s.to_json().contains(r#""extra":{"future":{"mode":1},"type":"wms"}"#), "{}", s.to_json());
         for clean in [
             "",
             r#"{"favourites": [], "recent": [], "saved": []}"#,
@@ -1412,6 +1656,157 @@ MIIE
         ] {
             assert!(Sources::from_json(clean).unread().is_empty(), "{clean}");
         }
+    }
+
+    /// Details a newer RustGIS wrote that this version doesn't use (a number, a list, more than
+    /// eight entries, a value that isn't an object) survive reading, noting a source and saving:
+    /// this version uses what it can, and writes the rest back as it was.
+    #[test]
+    fn newer_details_survive_a_save() {
+        let nine: Map<String, Value> = (0..9).map(|i| (format!("k{i}"), json!(format!("v{i}")))).collect();
+        let rows = json!({"saved": [
+            {"kind": "tiles", "name": "T", "address": "https://h/{z}/{x}/{y}.png", "extra": {"type": "xyz", "tileSize": 512}},
+            {"kind": "service", "name": "S", "address": "https://h/wms", "extra": {"layers": ["a", "b"], "type": "wms"}},
+            {"kind": "file", "name": "N", "address": "/n.csv", "extra": nine},
+            {"kind": "file", "name": "W", "address": "/w.csv", "extra": [1, 2]}
+        ]});
+        let mut s = Sources::from_json(&rows.to_string());
+        // This version uses only what it can.
+        assert_eq!(s.saved[0].extra, json!({"type": "xyz"}));
+        assert_eq!(s.saved[1].extra, json!({"type": "wms"}));
+        assert_eq!(s.saved[2].extra.as_object().map(Map::len), Some(8));
+        assert_eq!(s.saved[3].extra, Value::Null);
+        // Nothing is lost, so nothing is said to be changed: only that settings are kept.
+        assert!(
+            matches!(s.unread().as_slice(), [one] if one.starts_with("4 saved data sources have settings") && one.contains("kept")),
+            "{:?}",
+            s.unread()
+        );
+        s.note(Source { kind: "file".into(), address: "/new.csv".into(), ..Source::default() });
+        let saved: Value = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(saved["saved"], rows["saved"], "{saved}");
+        // Read again by this version: the same, and saved the same again.
+        let again = Sources::from_json(&s.to_json());
+        assert_eq!(serde_json::from_str::<Value>(&again.to_json()).unwrap()["saved"], rows["saved"]);
+        // Kept again unchanged, a source keeps the details kept for it.
+        let same = s.saved[1].clone();
+        s.keep("saved", same).unwrap();
+        assert!(s.to_json().contains(r#""layers":["a","b"]"#), "{}", s.to_json());
+        // Replaced with other details, its kept ones were about the old: they go (a WMTS source
+        // saved over a WMS one doesn't keep the WMS layers).
+        s.keep(
+            "saved",
+            Source { kind: "service".into(), name: "S".into(), address: "https://h/wms".into(), extra: json!({"type": "wmts"}) },
+        )
+        .unwrap();
+        let saved: Value = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(saved["saved"][1]["extra"], json!({"type": "wmts"}));
+        s.keep("saved", Source { kind: "file".into(), name: "N".into(), address: "/n.csv".into(), extra: json!({"k8": "mine"}) }).unwrap();
+        let saved: Value = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(saved["saved"][2]["extra"], json!({"k8": "mine"}));
+        // Noted again with other details, a recent source drops them too.
+        let mut r = Sources::from_json(
+            &json!({"recent": [{"kind": "tiles", "name": "T", "address": "https://h/t", "extra": {"type": "xyz", "tileSize": 512}}]})
+                .to_string(),
+        );
+        r.note(Source { kind: "tiles".into(), name: "T".into(), address: "https://h/t".into(), extra: json!({"type": "xyz"}) });
+        assert!(r.to_json().contains("tileSize"), "unchanged details keep it: {}", r.to_json());
+        r.note(Source { kind: "tiles".into(), name: "T".into(), address: "https://h/t".into(), extra: json!({"type": "tms"}) });
+        assert!(!r.to_json().contains("tileSize"), "{}", r.to_json());
+        // Forgotten, a source's kept details go with it.
+        assert!(s.forget("saved", "tiles", "https://h/{z}/{x}/{y}.png").unwrap());
+        assert!(!s.to_json().contains("tileSize"));
+
+        // A normal row is written back unchanged, with no notice.
+        let plain =
+            json!({"saved": [{"kind": "service", "name": "S", "address": "https://h/wms", "extra": {"type": "wms", "layer": "roads"}}]});
+        let mut s = Sources::from_json(&plain.to_string());
+        assert!(s.unread().is_empty(), "{:?}", s.unread());
+        s.note(Source { kind: "file".into(), address: "/new.csv".into(), ..Source::default() });
+        assert_eq!(serde_json::from_str::<Value>(&s.to_json()).unwrap()["saved"], plain["saved"]);
+
+        // A row holding a secret is still cleaned and saved without it, and said.
+        for secret in [
+            json!({"kind": "service", "name": "S", "address": "https://h/wms", "extra": {"type": "wms", "token": "hidden", "tileSize": 512}}),
+            json!({"kind": "url", "name": "U", "address": "https://h/x.fgb?sig=hidden", "extra": {"tileSize": 512}}),
+        ] {
+            let mut s = Sources::from_json(&json!({"saved": [secret]}).to_string());
+            assert!(s.unread().iter().any(|t| t.contains("saved changed")), "{:?}", s.unread());
+            s.note(Source { kind: "file".into(), address: "/new.csv".into(), ..Source::default() });
+            let saved = s.to_json();
+            assert!(!saved.contains("hidden") && !saved.contains("tileSize"), "{saved}");
+        }
+        // Kept details that would sit beside a secret once this version changes the source go.
+        let mut s = Sources::from_json(
+            &json!({"saved": [{"kind": "file", "name": "F", "address": "/f.csv", "extra": {"key": "feature_id"}}]}).to_string(),
+        );
+        assert!(s.to_json().contains("feature_id"));
+        s.keep(
+            "saved",
+            Source { kind: "file".into(), name: "F".into(), address: "/f.csv".into(), extra: json!({"endpoint": "https://api.example"}) },
+        )
+        .unwrap();
+        assert!(!s.to_json().contains("feature_id"), "{}", s.to_json());
+    }
+
+    /// Laying this session's changes over what is stored: nothing stored (removed, reset, or set
+    /// aside as malformed) or only what this session last wrote keeps its whole list; a stored
+    /// preference that can't be read is never written over, and the changes wait.
+    #[test]
+    fn rebase_keeps_the_whole_list_when_nothing_else_is_stored() {
+        let file = |address: &str| Source { kind: "file".into(), address: address.into(), ..Source::default() };
+        let stored =
+            json!({"favourites": (0..50).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect::<Vec<_>>()})
+                .to_string();
+        let mut s = Sources::from_json(&stored);
+        s.keep("favourites", file("/new.csv")).unwrap();
+        for nothing in [None, Some(""), Some("\u{feff} \n")] {
+            let mut next = s.clone();
+            next.rebase(nothing, None).unwrap();
+            assert_eq!(next.favourites.len(), 51, "{nothing:?}");
+            assert_eq!(Sources::from_json(&next.to_json()).favourites.len(), 51);
+        }
+        // What this session last wrote is its own: its list is kept whole, no rebase needed.
+        let mut next = s.clone();
+        next.rebase(Some(&stored), Some(&stored)).unwrap();
+        assert_eq!(next.favourites.len(), 51);
+        // Another window's list is merged with.
+        let theirs = json!({"favourites": [{"kind": "file", "name": "", "address": "/theirs.csv"}]}).to_string();
+        let mut next = s.clone();
+        next.rebase(Some(&theirs), Some(&stored)).unwrap();
+        let listed: Vec<_> = next.favourites.iter().map(|f| f.address.as_str()).collect();
+        assert_eq!(listed, ["/theirs.csv", "/new.csv"]);
+        // Unreadable: an error that says so, and nothing of this session changed or written.
+        let mut next = s.clone();
+        let error = next.rebase(Some("[\"not\", \"an object\"]"), None).unwrap_err();
+        assert!(error.contains("couldn't be read"), "{error}");
+        assert_eq!(next, s);
+    }
+
+    /// Through the desktop's save (laid over what is stored): a source this session saved again
+    /// with other details is written with what this session keeps for it, never the stored row's
+    /// old details glued back; a source it didn't change keeps the stored row's.
+    #[test]
+    fn rebase_writes_this_sessions_details_for_what_it_changed() {
+        let stored = json!({"saved": [
+            {"kind": "service", "name": "S", "address": "https://h/wms", "extra": {"type": "wms", "layers": ["a"]}, "future": 1},
+            {"kind": "tiles", "name": "T", "address": "https://h/t", "extra": {"type": "xyz", "tileSize": 512}}
+        ]})
+        .to_string();
+        let mut s = Sources::from_json(&stored);
+        let wmts = Source { kind: "service".into(), name: "S".into(), address: "https://h/wms".into(), extra: json!({"type": "wmts"}) };
+        s.keep("saved", wmts).unwrap();
+        // As another window stored it since, then this one saves.
+        s.rebase(Some(&stored), None).unwrap();
+        let written: Value = serde_json::from_str(&s.to_json()).unwrap();
+        assert_eq!(written["saved"][0]["extra"], json!({"type": "wmts"}), "{written}");
+        assert_eq!(written["saved"][0]["future"], json!(1), "unknown fields stay");
+        assert_eq!(written["saved"][1]["extra"], json!({"type": "xyz", "tileSize": 512}));
+        // Saved again later, the old details don't come back from what was stored either.
+        let again = s.to_json();
+        s.keep("saved", Source { kind: "file".into(), address: "/x.csv".into(), ..Source::default() }).unwrap();
+        s.rebase(Some(&again), None).unwrap();
+        assert!(!s.to_json().contains("layers"), "{}", s.to_json());
     }
 
     #[test]

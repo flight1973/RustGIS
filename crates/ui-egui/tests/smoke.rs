@@ -1506,6 +1506,187 @@ fn saved_sources_from_a_newer_version_survive_recording_a_recent_one() {
     }
 }
 
+/// Two windows of the desktop app keep the same data sources: each one's save reads what is
+/// stored again and lays its own changes over it, so neither writes over the other's favorites,
+/// and a source one removes stays removed.
+type PrefStore = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>;
+type PrefOutcomes = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<rustgis_ui_egui::PrefUpdate>>>;
+
+/// A desktop window over a shared preferences store, its saves going through `update_pref`
+/// as the desktop's do. `outcomes` scripts saves that don't happen (busy, failed), in turn.
+fn window_over(store: &PrefStore, outcomes: &PrefOutcomes) -> RustGisApp {
+    use rustgis_ui_egui::PrefUpdate;
+    let (load, update, outcomes) = (store.clone(), store.clone(), outcomes.clone());
+    let services = rustgis_ui_egui::Services {
+        load_pref: Some(Box::new(move |k| load.lock().unwrap().get(k).cloned())),
+        save_pref: Some(Box::new(|k, _| assert_ne!(k, "data_sources", "the desktop saves data sources through update_pref"))),
+        update_pref: Some(Box::new(move |k, value| {
+            if let Some(outcome) = outcomes.lock().unwrap().pop_front() {
+                return outcome;
+            }
+            let mut store = update.lock().unwrap();
+            match value(store.get(k).map(String::as_str)) {
+                Some(next) => {
+                    store.insert(k.to_string(), next);
+                    PrefUpdate::Saved
+                }
+                None => PrefUpdate::Unchanged,
+            }
+        })),
+        ..Default::default()
+    };
+    RustGisApp::with_sample().with_services(services)
+}
+
+fn stored_favorites(store: &PrefStore) -> Vec<String> {
+    let text = store.lock().unwrap()["data_sources"].clone();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    v["favourites"].as_array().unwrap().iter().map(|f| f["address"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn two_windows_keep_each_others_data_sources() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let store: PrefStore = Arc::new(Mutex::new(HashMap::from([(
+        "data_sources".to_string(),
+        json!({"favourites": [{"kind": "file", "name": "Old", "address": "/old.csv"}]}).to_string(),
+    )])));
+    let outcomes = PrefOutcomes::default();
+    let window = || window_over(&store, &outcomes);
+    let favorite = |address: &str| json!({"kind": "file", "address": address});
+    let (mut a, mut b) = (window(), window());
+    a.run("sources.favourite", favorite("/a.csv")).unwrap();
+    b.run("sources.favourite", favorite("/b.csv")).unwrap();
+    let stored = || stored_favorites(&store);
+    assert_eq!(stored(), ["/old.csv", "/a.csv", "/b.csv"]);
+    a.run("sources.remove", json!({"list": "favourites", "kind": "file", "address": "/old.csv"})).unwrap();
+    b.run("sources.favourite", favorite("/b2.csv")).unwrap();
+    assert_eq!(stored(), ["/a.csv", "/b.csv", "/b2.csv"]);
+    // The window that saved last lists the other's favorites too.
+    let listed: Vec<_> = b.session.sources.favourites.iter().map(|f| f.address.as_str()).collect();
+    assert_eq!(listed, ["/a.csv", "/b.csv", "/b2.csv"]);
+
+    // The stored sources removed or reset: the next save writes the window's whole list, not
+    // only the source it just added.
+    for reset in [None, Some(String::new())] {
+        match reset {
+            None => drop(store.lock().unwrap().remove("data_sources")),
+            Some(empty) => drop(store.lock().unwrap().insert("data_sources".into(), empty)),
+        }
+        let before: Vec<_> = b.session.sources.favourites.iter().map(|f| f.address.clone()).collect();
+        b.run("sources.favourite", favorite("/after.csv")).unwrap();
+        assert_eq!(stored(), [before, vec!["/after.csv".to_string()]].concat());
+        b.run("sources.favourite", json!({"kind": "file", "address": "/after.csv", "on": false})).unwrap();
+    }
+}
+
+/// A save of the data sources that doesn't happen (another copy busy, the file failing, the
+/// stored sources unreadable) loses nothing: the changes stay to save and are tried again
+/// later, without waiting, and the window's other sources stay with them.
+#[test]
+fn a_data_sources_save_that_does_not_happen_is_tried_again() {
+    use rustgis_ui_egui::PrefUpdate;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let stored = json!({"favourites": [{"kind": "file", "name": "", "address": "/kept.csv"}]}).to_string();
+    let store: PrefStore = Arc::new(Mutex::new(HashMap::from([("data_sources".to_string(), stored)])));
+    let outcomes = PrefOutcomes::default();
+    let mut app = window_over(&store, &outcomes);
+    let favorite = |address: &str| json!({"kind": "file", "address": address});
+    for outcome in [PrefUpdate::Busy, PrefUpdate::Failed] {
+        outcomes.lock().unwrap().push_back(outcome);
+        let address = format!("/{outcome:?}.csv");
+        let started = std::time::Instant::now();
+        app.run("sources.favourite", favorite(&address)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "a save never waits");
+        assert!(!stored_favorites(&store).contains(&address), "{outcome:?}: not saved yet");
+        // Tried again once its wait is over (a quarter second busy, a second after a failure).
+        std::thread::sleep(std::time::Duration::from_millis(1100)); // test-wait: the retry delay the save sets
+        app.run("sources.list", json!({})).unwrap();
+        let listed = stored_favorites(&store);
+        assert!(listed.contains(&address) && listed.contains(&"/kept.csv".to_string()), "{outcome:?}: {listed:?}");
+    }
+    // Unreadable stored sources are never written over: the change waits, and is saved once
+    // they can be read again.
+    store.lock().unwrap().insert("data_sources".into(), "[\"not\", \"an object\"]".into());
+    app.run("sources.favourite", favorite("/waits.csv")).unwrap();
+    assert_eq!(store.lock().unwrap()["data_sources"], "[\"not\", \"an object\"]");
+    let said: Vec<_> = app.session.notices_since(0).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said.iter().filter(|t| t.contains("couldn't be read")).count(), 1, "{said:?}");
+    store.lock().unwrap().remove("data_sources");
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // test-wait: the retry delay the save sets
+    app.run("sources.list", json!({})).unwrap();
+    assert!(stored_favorites(&store).contains(&"/waits.csv".to_string()));
+}
+
+/// What can't be used of the stored data sources is said once a kind while as much is affected,
+/// and again when more is (another window stored more of it); a save that refuses to write over
+/// unreadable stored sources says so, though the same was said when they were read.
+#[test]
+fn data_sources_notices_are_said_again_only_for_more() {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let newer = |n: usize| {
+        let rows: Vec<_> = (0..n).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv"), "opened": i})).collect();
+        json!({"favourites": rows}).to_string()
+    };
+    let store: PrefStore = Arc::new(Mutex::new(HashMap::from([("data_sources".to_string(), newer(1))])));
+    let mut app = window_over(&store, &PrefOutcomes::default());
+    let favorite = |address: &str| json!({"kind": "file", "address": address});
+    let unknown = |app: &RustGisApp| -> Vec<String> {
+        let said = app.session.notices_since(0);
+        said.iter().map(|n| n.text.clone()).filter(|t| t.contains("settings this version doesn't know")).collect()
+    };
+    // Read, then saved over the same: said once.
+    app.run("sources.favourite", favorite("/a.csv")).unwrap();
+    store.lock().unwrap().insert("data_sources".into(), newer(1));
+    app.run("sources.favourite", favorite("/a2.csv")).unwrap();
+    assert_eq!(unknown(&app).len(), 1, "{:?}", unknown(&app));
+    // Another window stored more of it: said again, with the new count.
+    store.lock().unwrap().insert("data_sources".into(), newer(3));
+    app.run("sources.favourite", favorite("/b.csv")).unwrap();
+    let said = unknown(&app);
+    assert!(said.len() == 2 && said[1].starts_with("3 saved data sources"), "{said:?}");
+    // The other window's list wins for what this one didn't change (it dropped /a.csv, /a2.csv).
+    assert_eq!(stored_favorites(&store), ["/0.csv", "/1.csv", "/2.csv", "/b.csv"]);
+
+    // Unreadable when read and still when saved over: said both times.
+    let bad = "[\"not\", \"an object\"]".to_string();
+    let store: PrefStore = Arc::new(Mutex::new(HashMap::from([("data_sources".to_string(), bad.clone())])));
+    let mut app = window_over(&store, &PrefOutcomes::default());
+    app.run("sources.favourite", favorite("/c.csv")).unwrap();
+    let said: Vec<_> = app.session.notices_since(0).iter().map(|n| n.text.clone()).collect();
+    assert_eq!(said.iter().filter(|t| t.contains("couldn't be read")).count(), 2, "{said:?}");
+    assert_eq!(store.lock().unwrap()["data_sources"], bad);
+}
+
+/// As the app closes, data sources left to save are tried again whatever the retry delay,
+/// waiting a little while another copy keeps the preferences busy; what still can't be saved
+/// is said.
+#[test]
+fn data_sources_left_to_save_are_saved_at_exit() {
+    use rustgis_ui_egui::PrefUpdate;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    let store: PrefStore = Arc::new(Mutex::new(HashMap::from([("data_sources".to_string(), json!({"favourites": []}).to_string())])));
+    let outcomes = PrefOutcomes::default();
+    let mut app = window_over(&store, &outcomes);
+    outcomes.lock().unwrap().extend([PrefUpdate::Busy, PrefUpdate::Busy]);
+    app.run("sources.favourite", json!({"kind": "file", "address": "/exit.csv"})).unwrap();
+    assert!(stored_favorites(&store).is_empty());
+    // The retry delay hasn't passed; at exit it is tried anyway, through one more busy answer.
+    app.save_sources_at_exit();
+    assert_eq!(stored_favorites(&store), ["/exit.csv"]);
+    // Still busy at the end of the wait: said, not lost silently.
+    outcomes.lock().unwrap().extend(std::iter::repeat_n(PrefUpdate::Busy, 1000));
+    app.run("sources.favourite", json!({"kind": "file", "address": "/late.csv"})).unwrap();
+    app.save_sources_at_exit();
+    let said: Vec<_> = app.session.notices_since(0).iter().map(|n| n.text.clone()).collect();
+    assert!(said.iter().any(|t| t.contains("weren't saved as RustGIS closed")), "{said:?}");
+    assert!(!stored_favorites(&store).contains(&"/late.csv".to_string()));
+}
+
 /// Saved connections from a newer RustGIS (#1405): a preference of a newer version is said, isn't
 /// used and stays byte for byte through other changes to the preferences, recording a recent
 /// source among them; rows and fields this version can't read survive a connection made here.

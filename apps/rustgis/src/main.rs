@@ -110,6 +110,15 @@ mod prefs {
         }
     }
 
+    /// Writes again the settings left to save while another copy of RustGIS saved its own,
+    /// waiting up to `wait` for it (none on the UI thread); what they came to is kept as
+    /// [`saved`] keeps it. Whether any is still left.
+    pub fn retry_saves(wait: std::time::Duration) -> bool {
+        let (results, left) = rustgis_engine::prefs::retry_pending(wait);
+        results.into_iter().for_each(saved);
+        left
+    }
+
     /// The problems since the last call, oldest first.
     pub fn take_notices() -> Vec<Notice> {
         std::mem::take(&mut *notices())
@@ -147,7 +156,30 @@ mod prefs {
         rustgis_assistant::chatgpt::set_secret_store(Some(secrets.clone()));
         Services {
             load_pref: Some(Box::new(|key: &str| read().get(key).and_then(Value::as_str).map(str::to_string))),
-            save_pref: Some(Box::new(|key: &str, value: &str| saved(rustgis_engine::prefs::write(key, value)))),
+            // While another copy of RustGIS saves its preferences, a value is kept to save and
+            // `retry_prefs` writes it on a later frame (and `on_exit` at the end).
+            save_pref: Some(Box::new(|key: &str, value: &str| match rustgis_engine::prefs::write(key, value) {
+                Ok(rustgis_engine::prefs::Updated::Saved(set_aside)) => saved(Ok(set_aside)),
+                Ok(_) => {}
+                Err(error) => saved(Err(error)),
+            })),
+            retry_prefs: Some(Box::new(|| retry_saves(std::time::Duration::ZERO))),
+            update_pref: Some(Box::new(|key: &str, value: &mut dyn FnMut(Option<&str>) -> Option<String>| {
+                use rustgis_engine::prefs::Updated;
+                use rustgis_ui_egui::PrefUpdate;
+                match rustgis_engine::prefs::update(key, value) {
+                    Ok(Updated::Saved(set_aside)) => {
+                        saved(Ok(set_aside));
+                        PrefUpdate::Saved
+                    }
+                    Ok(Updated::Unchanged) => PrefUpdate::Unchanged,
+                    Ok(Updated::Busy) => PrefUpdate::Busy,
+                    Err(error) => {
+                        saved(Err(error));
+                        PrefUpdate::Failed
+                    }
+                }
+            })),
             secrets: Some(secrets),
             ..Services::default()
         }
@@ -465,6 +497,12 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         self.0.end_exports();
         self.0.end_autosave();
+        // Settings left to save while another copy of RustGIS saved its own: tried once more,
+        // waiting a little for it (closing isn't the path that must answer at once).
+        self.0.save_sources_at_exit();
+        if prefs::retry_saves(std::time::Duration::from_millis(1500)) {
+            log::warn!("some settings couldn't be saved: another copy of RustGIS kept its preferences busy");
+        }
         // Session plugins' programs end with the app, with what they started.
         rustgis_engine::plugins::session::stop_all();
         // The installer starts before the marker goes, so a RustGIS started meanwhile finds this
