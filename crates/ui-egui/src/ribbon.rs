@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::theme::{Tokens, regular, semibold};
 use crate::widgets::{
     CONTENT_H, Dragged, LABEL_H, big, big_form_menu, big_menu, big_split_form_menu, big_split_menu, col, group, menu_item, small,
-    small_form_menu, small_menu, submenu_row, text_w,
+    small_form_menu, small_menu, submenu, submenu_row, text_w,
 };
 use crate::{RightPane, RustGisApp, icons};
 
@@ -1191,11 +1191,11 @@ fn project_group(app: &mut RustGisApp, ui: &mut Ui) {
                 }
             }
             // A finished sheet or figure of the map view, its texts to fill in on the page.
-            ui.menu_button(tl!("Publication Layout"), |ui| {
+            submenu(ui, tl!("Publication Layout"), |ui| {
                 // A sheet on each page size, as listed above; its styles under each orientation, so
                 // the list stays as short as the sizes (a figure leaves the style to its caption).
                 for (id, label, w, h) in rustgis_engine::map::layout::PAGES {
-                    ui.menu_button(page_label(label, *w, *h), |ui| {
+                    submenu(ui, &page_label(label, *w, *h), |ui| {
                         if let Some(portrait) = publication_sheet(id, "portrait") {
                             ui.label(egui::RichText::new(tl!("Portrait")).small().weak());
                             publication_style_buttons(app, ui, portrait);
@@ -1259,7 +1259,7 @@ fn report_group(app: &mut RustGisApp, ui: &mut Ui) {
                     );
                     menu_item(ui, app, "new_layout", "New Template (a layout page)", "report.newTemplate", Value::Null);
                     let layouts: Vec<String> = app.session.project.layouts.iter().map(|l| l.name.clone()).collect();
-                    ui.menu_button(tl!("Existing Template"), |ui| {
+                    submenu_row(ui, "", tl!("Existing Template"), |ui| {
                         for l in layouts {
                             menu_item(ui, app, "", &l, "report.existingTemplate", json!({"layout": l}));
                         }
@@ -1275,7 +1275,7 @@ fn report_group(app: &mut RustGisApp, ui: &mut Ui) {
                         .filter(|(j, _)| Some(*j) != active)
                         .map(|(_, r)| r.name.clone())
                         .collect();
-                    ui.menu_button(tl!("Related Report"), |ui| {
+                    submenu_row(ui, "", tl!("Related Report"), |ui| {
                         if others.is_empty() {
                             ui.label(egui::RichText::new(tl!("No other reports")).weak());
                         }
@@ -1285,7 +1285,7 @@ fn report_group(app: &mut RustGisApp, ui: &mut Ui) {
                     });
                     let rels: Vec<String> =
                         app.session.project.maps.iter().flat_map(|m| m.editing.relationships.iter().map(|r| r.name.clone())).collect();
-                    ui.menu_button(tl!("Subreport"), |ui| {
+                    submenu_row(ui, "", tl!("Subreport"), |ui| {
                         if rels.is_empty() {
                             ui.label(egui::RichText::new(tl!("No relationships (Data Design › Relationships)")).weak());
                         }
@@ -1308,7 +1308,7 @@ fn report_group(app: &mut RustGisApp, ui: &mut Ui) {
                         .map(|l| l.dataset.fields.iter().map(|f| f.name.clone()).collect())
                         .unwrap_or_default();
                     let field_menu = |ui: &mut Ui, app: &mut RustGisApp, label: &str, id: &str, key: &str| {
-                        ui.menu_button(tl!(label), |ui| {
+                        submenu_row(ui, "", tl!(label), |ui| {
                             for f in &fields {
                                 menu_item(ui, app, "", f, id, json!({key: f}));
                             }
@@ -1316,9 +1316,9 @@ fn report_group(app: &mut RustGisApp, ui: &mut Ui) {
                     };
                     field_menu(ui, app, "Field", "report.field", "field");
                     menu_item(ui, app, "field", "Autofill Fields", "report.autofill", Value::Null);
-                    ui.menu_button(tl!("Statistics"), |ui| {
+                    submenu_row(ui, "", tl!("Statistics"), |ui| {
                         for f in &fields {
-                            ui.menu_button(f.as_str(), |ui| {
+                            submenu_row(ui, "", f.as_str(), |ui| {
                                 for k in ["count", "sum", "mean", "min", "max"] {
                                     menu_item(ui, app, "", k, "report.statistics", json!({"field": f, "kind": k}));
                                 }
@@ -1533,7 +1533,7 @@ fn graphics_and_text_group(app: &mut RustGisApp, ui: &mut Ui) {
             true,
         );
         egui::Popup::menu(&resp).show(|ui| {
-            ui.set_min_width(200.0);
+            ui.set_min_width(crate::widgets::MENU_MIN_W);
             for &(token, what) in rustgis_engine::map::graphics::TOKENS {
                 if ui.button(format!("{}  {token}", tl!(what))).clicked() {
                     app.map.cancel_sketch();
@@ -1868,18 +1868,31 @@ fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
     }
     ui.separator();
     let name = ui.label(tl!("Measured grid's coordinate system"));
-    ui.horizontal(|ui| {
-        let edit = ui.add(egui::TextEdit::singleline(&mut app.ui.graticule_crs_input).hint_text("2056").desired_width(90.0)).on_hover_text(
-            tl!("An EPSG code, WKT or a PROJ string; empty: the map's own when it is projected, else the UTM zone at the view's centre"),
+    ui.vertical(|ui| {
+        let recent = app.ui.recent_crs.clone();
+        let t = crate::theme::Tokens::get(ui.ctx());
+        let (edit, taken) = crate::crspicker::crs_box(
+            ui,
+            "graticule",
+            &mut app.ui.graticule_crs_input,
+            &recent,
+            crate::crspicker::Offer::Projected,
+            150.0,
+            tl!("name or code"),
+            &t,
         );
+        let edit = edit.on_hover_text(tl!(
+            "A name or EPSG code, WKT or a PROJ string; empty: the map's own when it is projected, else the UTM zone at the view's centre"
+        ));
         // Named by the label above it, for a screen reader (the hint is only a placeholder).
         let edit = edit.labelled_by(name.id);
         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if ui.button(tl!("Use System")).clicked() || enter {
+        if ui.button(tl!("Use System")).clicked() || enter || taken {
             let typed = app.ui.graticule_crs_input.trim();
             let crs = if typed.is_empty() { String::new() } else { crate::dialogs::typed_crs(typed) };
             match app.run("map.graticule", json!({"type": "measured", "crs": crs})) {
                 Ok(_) => {
+                    app.remember_crs_if_listed(&crs);
                     app.ui.graticule_crs_input.clear();
                     ui.close();
                 }
@@ -4033,21 +4046,38 @@ fn start_projection_menu(app: &mut RustGisApp, ui: &mut Ui) {
     big_form_menu(ui, app, "basemap", &label, "The projection the map opens in.", move |ui, app| {
         let mut items: Vec<(String, String)> = vec![("mercator".into(), "Web Mercator".into()), ("globe".into(), "Globe".into())];
         items.extend(rustgis_engine::map::projection::PRESETS.iter().map(|(id, label, _)| (id.to_string(), label.to_string())));
-        for (id, label) in items {
-            if ui.add(egui::Button::selectable(is_projection(&current, &id), tl!(label.as_str()))).clicked() {
-                let _ = app.run("ui.startup", json!({"projection": id}));
-                ui.close();
+        // While a search is typed its list offers the matching ones of these, and the menu stays
+        // within the window.
+        if app.ui.start_projection_input.trim().is_empty() || !crate::crspicker::list_is_shown(ui.ctx()) {
+            for (id, label) in items {
+                if ui.add(egui::Button::selectable(is_projection(&current, &id), tl!(label.as_str()))).clicked() {
+                    let _ = app.run("ui.startup", json!({"projection": id}));
+                    ui.close();
+                }
             }
+            ui.separator();
         }
-        ui.separator();
-        ui.label(tl!("EPSG or ESRI code"));
-        ui.horizontal(|ui| {
-            let edit = ui.add(egui::TextEdit::singleline(&mut app.ui.start_projection_input).hint_text("3010").desired_width(90.0));
+        let name = ui.label(tl!("Search by name or code"));
+        ui.vertical(|ui| {
+            let recent = app.ui.recent_crs.clone();
+            let t = crate::theme::Tokens::get(ui.ctx());
+            let (edit, taken) = crate::crspicker::crs_box(
+                ui,
+                "startProjection",
+                &mut app.ui.start_projection_input,
+                &recent,
+                crate::crspicker::Offer::Map,
+                150.0,
+                tl!("3010, lv95"),
+                &t,
+            );
+            let edit = edit.labelled_by(name.id);
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button(tl!("Use")).clicked() || enter {
+            if ui.button(tl!("Use")).clicked() || enter || taken {
                 let code = crate::dialogs::typed_crs(&app.ui.start_projection_input);
                 match app.run("ui.startup", json!({"projection": code})) {
                     Ok(_) => {
+                        app.remember_crs_if_listed(&code);
                         app.ui.start_projection_input.clear();
                         ui.close();
                     }
@@ -4722,7 +4752,7 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                 let _ = app.run("layer.symbology", json!({"type": "single"}));
                 ui.close();
             }
-            ui.menu_button(tl!("Unique Values"), |ui| {
+            submenu(ui, tl!("Unique Values"), |ui| {
                 for f in &text_f {
                     if ui.button(f).clicked() {
                         let _ = app.run("layer.symbology", json!({"type": "unique", "field": f}));
@@ -4730,7 +4760,7 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                     }
                 }
             });
-            ui.menu_button(tl!("Graduated Colors"), |ui| {
+            submenu(ui, tl!("Graduated Colors"), |ui| {
                 for f in &numeric {
                     if ui.button(f).clicked() {
                         let _ = app.run("layer.symbology", json!({"type": "graduated", "field": f}));
@@ -4739,7 +4769,7 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                 }
             });
             if is_point {
-                ui.menu_button(tl!("Proportional Symbols"), |ui| {
+                submenu(ui, tl!("Proportional Symbols"), |ui| {
                     for f in &numeric {
                         if ui.button(f).clicked() {
                             let _ = app.run("layer.symbology", json!({"type": "proportional", "field": f}));
@@ -4963,7 +4993,7 @@ fn raster_style_groups(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 ui.separator();
                 for (key, label, slot) in [("red", "Red", 0usize), ("green", "Green", 1), ("blue", "Blue", 2)] {
-                    ui.menu_button(tl!(label), |ui| {
+                    submenu(ui, tl!(label), |ui| {
                         for (i, b) in bands.iter().enumerate() {
                             if ui
                                 .add(egui::Button::selectable(
@@ -5480,7 +5510,11 @@ fn worldview_menu(app: &mut RustGisApp, ui: &mut Ui) {
 fn language_menu(app: &mut RustGisApp, ui: &mut Ui) {
     let current = app.chosen_lang();
     let auto = app.ui.language == crate::i18n::AUTO;
-    let label = if auto { format!("{} ({})", tl!("Automatic"), shown_name(ui, current)) } else { shown_name(ui, current).to_string() };
+    let label = if auto {
+        crate::i18n::fmt("Automatic ({kind})", &[("kind", shown_name(ui, current))])
+    } else {
+        shown_name(ui, current).to_string()
+    };
     big_menu(ui, app, "globe_lang", &label, "Choose the interface language.", move |ui, app| {
         if ui.selectable_label(auto, tl!("Automatic (system language)")).clicked() {
             let _ = app.run("ui.language", json!({"code": crate::i18n::AUTO}));
@@ -5570,6 +5604,18 @@ mod tests {
             "{:?}",
             h.state().session.notices.last()
         );
+        // Found by name in the open menu: a click on the row uses it and remembers it.
+        // (The menu is still open: a refused system leaves it so.)
+        h.state_mut().ui.graticule_crs_input.clear();
+        let field = || egui::accesskit::Role::TextInput;
+        h.get_by_role_and_label(field(), "Measured grid's coordinate system").click();
+        h.run();
+        h.get_by_role_and_label(field(), "Measured grid's coordinate system").type_text("utm 33n");
+        h.run();
+        h.get_by_label_contains("WGS 84 / UTM zone 33N").click();
+        h.run();
+        assert_eq!(h.state().session.map().graticule_crs.as_deref(), Some("EPSG:32633"));
+        assert_eq!(h.state().ui.recent_crs.first().map(String::as_str), Some("EPSG:32633"));
     }
 
     /// The language list names every language in English while the interface is English, with the
@@ -6510,6 +6556,65 @@ mod tests {
         assert_eq!(h.state().session.project.layouts.len(), before + 3);
         let l = h.state().session.project.layouts.last().unwrap();
         assert!(l.elements.iter().all(|e| e.name != "Panel Box" && e.name != "Title"), "a figure, its title left to the caption");
+    }
+
+    /// A submenu of short rows (a sheet's styles) opens at least SUBMENU_MIN_W wide, not as a
+    /// strip, and the row opening it is as tall as the menu's other rows (#2398).
+    #[test]
+    fn a_submenu_of_short_rows_is_not_a_strip() {
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                ui.horizontal(|ui| project_group(app, ui));
+            },
+            cities(),
+        );
+        h.run();
+        h.get_by_label("New Layout").click();
+        h.run();
+        // A size is listed twice, New Layout's page and Publication Layout's sheet: the latter.
+        for row in ["Publication Layout", "Letter (216 × 279 mm)"] {
+            h.query_all_by_label(row).last().unwrap_or_else(|| panic!("{row}")).hover();
+            h.run();
+        }
+        // A menu's rows fill its width, so a style's row is as wide as the submenu: at least the
+        // 100 pt agreed in #2398 (written here, not read from the constant), less rounding.
+        let style = h.query_all_by_label("Panel").next().expect("the sheet's styles").rect();
+        assert!(style.width() >= 99.5, "a style's row is {} px wide", style.width());
+        // A row opening a submenu is as tall as the plain rows beside it.
+        let sheet = h.query_all_by_label("Letter (216 × 279 mm)").last().unwrap().rect();
+        let figure = h.get_by_label("Journal figure, 1 column (90 mm)").rect();
+        let (sheet, figure) = (sheet.height(), figure.height());
+        assert!((sheet - figure).abs() < 0.5, "a sheet's row is {sheet} px tall, a figure's {figure}");
+    }
+
+    /// In a menu of `menu_item` rows (Report Section), the row opening a submenu is as tall as
+    /// the rows beside it (#2398).
+    #[test]
+    fn a_submenu_row_is_as_tall_as_the_menu_items_beside_it() {
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                ui.horizontal(|ui| report_group(app, ui));
+            },
+            cities(),
+        );
+        h.run();
+        h.get_by_label("Report Section").click();
+        h.run();
+        let opener = h.get_by_label("Existing Template").rect().height();
+        let item = h.get_by_label("New Template (a layout page)").rect().height();
+        assert!((opener - item).abs() < 0.5, "Existing Template is {opener} px tall, New Template {item}");
     }
 
     #[test]

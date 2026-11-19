@@ -29,6 +29,7 @@ mod connectionui;
 mod connectui;
 mod coordreadout;
 mod copernicusui;
+mod crspicker;
 mod cswui;
 mod cubesui;
 mod diagnosticlog;
@@ -66,6 +67,7 @@ mod localagents;
 mod mapgpu;
 mod mapmenu;
 mod mapview;
+mod markerimages;
 mod measure_units;
 mod modelbuilder;
 mod navui;
@@ -194,6 +196,14 @@ pub const TOOL_FILE_PURPOSE: &str = "toolfile:";
 
 /// Marks a returned shortcut picker file; cancellation leaves no pending routing state.
 pub const SHORTCUT_PICK: &str = "\u{1}shortcuts:";
+
+/// Starts the name of a script file the shell's `"script"` picker put in the inbox, for the
+/// Script pane's Load….
+pub const SCRIPT_PICK: &str = "\u{1}script:";
+
+/// The largest script file the Script pane's Load… reads, as the assistant's command file; the
+/// browser's shell refuses a larger one before reading it.
+pub const SCRIPT_FILE_MAX_BYTES: usize = 1024 * 1024;
 
 /// Maximum portable shortcut document size: saved overrides plus room for version metadata.
 pub const SHORTCUT_FILE_MAX_BYTES: usize = keymap::MAX_PREF_BYTES + 100;
@@ -419,6 +429,10 @@ pub struct Services {
     /// Online and RustGIS's own app) in a pop-up window, putting who signed in, or why not, in the
     /// slot (the browser; the desktop runs `arcgis.signIn`).
     pub arcgis_sign_in: Option<Box<dyn Fn(String, String, Slot<Result<String, String>>)>>,
+    /// Signs in to Copernicus Data Space with a username, a password and a one-time code (blank
+    /// for an account without two-factor authentication), putting who signed in, or why not, in
+    /// the slot (the browser, which sends the request itself; the desktop runs `copernicus.login`).
+    pub copernicus_sign_in: Option<Box<dyn Fn(String, String, String, Slot<Result<String, String>>)>>,
 }
 
 /// A new private folder for one print job: unique, created fresh (never an existing path) and,
@@ -785,6 +799,9 @@ pub struct UiState {
     pub start_projection_input: String,
     /// The coordinate system typed in View › Graticule's menu for the measured grid.
     pub graticule_crs_input: String,
+    /// The coordinate systems last chosen in a coordinate system box, the latest first
+    /// (`crspicker::RECENT_PREF`).
+    pub recent_crs: Vec<String>,
     /// Start-up preference: the extent the map opens on, `[minLon, minLat, maxLon, maxLat]`;
     /// `None` for the full extent.
     pub start_extent: Option<[f64; 4]>,
@@ -813,6 +830,7 @@ pub struct UiState {
     pub hidden_tabs: Vec<String>,
     /// Extra Quick Access Toolbar commands.
     pub quick_access: Vec<String>,
+    pub(crate) history_jump: Option<chrome::HistoryJump>,
     /// Whether a layout's PDF georeferences its map frames (Layout › Export › Georeference PDF).
     pub(crate) pdf_georeference: bool,
     /// The native title bar the header is drawn into; set by the desktop app on macOS.
@@ -1051,6 +1069,7 @@ impl Default for UiState {
             start_projection: String::new(),
             start_projection_input: String::new(),
             graticule_crs_input: String::new(),
+            recent_crs: Vec::new(),
             start_extent: None,
             start_view: None,
             ribbon_minimized: false,
@@ -1132,6 +1151,7 @@ impl Default for UiState {
             geolibre_zarr: Vec::new(),
             hidden_tabs: Vec::new(),
             quick_access: Vec::new(),
+            history_jump: None,
             pdf_georeference: true,
             titlebar: None,
             pane_sets: Vec::new(),
@@ -1663,6 +1683,13 @@ impl RustGisApp {
             self.ui.start_projection = p.code();
         }
         self.ui.start_extent = self.services.load_pref.as_ref().and_then(|load| load("start_extent")).and_then(|v| parse_extent(&v));
+        self.ui.recent_crs = self
+            .services
+            .load_pref
+            .as_ref()
+            .and_then(|load| load(crspicker::RECENT_PREF))
+            .map(|v| crspicker::from_pref(&v))
+            .unwrap_or_default();
         // How new single-band rasters are drawn (Save as Default in the raster Symbology pane).
         if let Some(d) = self.services.load_pref.as_ref().and_then(|load| load(RASTER_DEFAULTS_PREF))
             && let Ok(d) = serde_json::from_str::<rustgis_engine::map::RasterDefaults>(&d)
@@ -1812,8 +1839,7 @@ impl RustGisApp {
         }
         let found = [CjkRegion::SimplifiedChinese, CjkRegion::Japanese, CjkRegion::Korean].into_iter().find_map(cjk_font);
         if let Some((bytes, index)) = found {
-            let mut face = egui::FontData::from_static(bytes);
-            face.index = *index;
+            let face = theme::installed_face(bytes, *index, true);
             self.extra_fonts.push(("cjk-fallback".into(), std::sync::Arc::new(face), None));
         }
     }
@@ -1826,8 +1852,7 @@ impl RustGisApp {
             return;
         }
         if let Some((bytes, index)) = rustgis_engine::render::fonts::symbol_font() {
-            let mut face = egui::FontData::from_static(bytes);
-            face.index = *index;
+            let face = theme::installed_face(bytes, *index, false);
             self.extra_fonts.push(("symbol-fallback".into(), std::sync::Arc::new(face), None));
         }
     }
@@ -1868,8 +1893,7 @@ impl RustGisApp {
         }
         self.fonts_requested.push(name.clone());
         if let Some((bytes, index)) = script_font(region) {
-            let mut face = egui::FontData::from_static(bytes);
-            face.index = *index;
+            let face = theme::installed_face(bytes, *index, matches!(region, rustgis_engine::render::fonts::ScriptFont::Cjk(_)));
             self.extra_fonts.push((name, std::sync::Arc::new(face), Some(region)));
             self.fonts_dirty = true;
         } else if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(region)) {
@@ -2034,11 +2058,16 @@ impl RustGisApp {
     /// Opens a file from the inbox: one the `"text"` picker marked ([`DELIMITED_PICK`]) opens Add
     /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
     /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`];
-    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview; DXF picks
+    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview; script picks
+    /// carry [`SCRIPT_PICK`] and open in the Script pane; DXF picks
     /// carry [`DXF_PICK`] and open Import DXF.
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
         if name.starts_with(SHORTCUT_PICK) {
             return shortcutfile::picked(self, bytes);
+        }
+        if let Some(name) = name.strip_prefix(SCRIPT_PICK) {
+            // An answer with no name is a cancelled picker.
+            return if name.is_empty() { Ok(Value::Null) } else { analysispane::script_picked(self, name, bytes) };
         }
         if let Some(name) = name.strip_prefix(TOOL_FILE_PICK) {
             panes::received_file(self, name, bytes);
@@ -2055,6 +2084,11 @@ impl RustGisApp {
                 self.session.notify(error.clone(), true);
                 return Err(error);
             };
+            // Remembered once a file is picked, as on the desktop, not when the picker opened.
+            if let Some(crs) = options.get("crs").and_then(Value::as_str) {
+                let crs = crs.to_string();
+                self.remember_crs_if_listed(&crs);
+            }
             return self.open_bytes_with(name, bytes, Some(options));
         }
         if let Some(picked) = name.strip_prefix(DXF_PICK) {
@@ -2274,6 +2308,7 @@ impl RustGisApp {
             // Save As changed the document even when it began clean. Offering a download
             // cannot confirm that this renamed document reached a file.
             self.session.mark_unsaved();
+            self.ui.history_jump = None;
         }
         // On Android the file is written once the user has chosen its place, and the shell
         // says then whether it was.
@@ -2431,6 +2466,30 @@ impl RustGisApp {
                 ),
                 false,
             );
+        }
+    }
+
+    /// Notes `code` as the latest coordinate system used, for the coordinate system boxes, and
+    /// keeps the list.
+    fn remember_crs(&mut self, code: &str) {
+        if crspicker::remember(&mut self.ui.recent_crs, code) {
+            self.save_pref(crspicker::RECENT_PREF, &self.ui.recent_crs.join("\n"));
+        }
+    }
+
+    /// Forgets the recently used coordinate systems.
+    pub(crate) fn clear_recent_crs(&mut self) {
+        self.ui.recent_crs.clear();
+        self.save_pref(crspicker::RECENT_PREF, "");
+    }
+
+    /// [`Self::remember_crs`] for a code the catalog lists (`EPSG:2056`), not a preset or a
+    /// PROJ string, which the coordinate system boxes offer otherwise or can't name.
+    pub(crate) fn remember_crs_if_listed(&mut self, code: &str) {
+        // As the catalog spells it, so `epsg: 2056` and `EPSG:2056` are one system.
+        if let Some(found) = rustgis_engine::data::raster::crs_search::lookup(code) {
+            let code = found.code.clone();
+            self.remember_crs(&code);
         }
     }
 
@@ -4168,6 +4227,8 @@ impl RustGisApp {
                     }
                     open("shapefile");
                 } else if let Some(path) = dialogs::pick_open(&["shp", "zip"], tl!("Shapefile")) {
+                    let text = text.to_string();
+                    self.remember_crs_if_listed(&text);
                     // Read on a thread of its own, as Add Data's other files are.
                     #[cfg(not(target_arch = "wasm32"))]
                     return readjob::run(self, "layer.addData", json!({"path": path, "crs": text}));
@@ -4918,17 +4979,20 @@ impl RustGisApp {
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
-                let (whole, lost) = if l.is_streamed() {
-                    let (ds, lost) = l.load_all_counted()?;
-                    (Some(ds), lost)
+                use std::borrow::Cow;
+                let (mut ds, lost) = if l.is_streamed() {
+                    let (dataset, lost) = l.load_all_counted()?;
+                    (Cow::Owned(dataset), lost)
                 } else {
-                    (None, Default::default())
+                    (Cow::Borrowed(&l.dataset), Default::default())
                 };
+                let query_report =
+                    rustgis_engine::data::export::filter_dataset(&mut ds, l.definition_query.as_deref()).map_err(|e| e.to_string())?;
+                let layer_name = l.name.clone();
                 // In the layer's own coordinate system, as share.exportLayer writes a file.
-                let ds = whole.as_ref().unwrap_or(&l.dataset);
                 use rustgis_engine::data::io;
-                let crs = io::default_export_crs(ds, &ext);
-                let written = io::write_bytes_in(ds, &ext, crs).map_err(|e| e.to_string());
+                let crs = io::default_export_crs(&ds, &ext);
+                let written = io::write_bytes_in(&ds, &ext, crs).map_err(|e| e.to_string());
                 let (bytes, left_out) = match written {
                     Ok(w) => w,
                     Err(e) => {
@@ -4938,27 +5002,28 @@ impl RustGisApp {
                 };
                 let ext = if ext == "shp" { "zip".to_string() } else { ext };
                 let name = format!("{}.{ext}", l.name);
-                // The features written, read whole, give their own extent (not a raster's, or the
-                // one a streamed layer's source declares).
-                let mut notes = rustgis_engine::data::export_notes([(ds, ds.extent())], &name, crs);
-                rustgis_engine::cmd::share::coalesce_read_zm(&mut notes, &name, ds, &lost);
+                // The features written, read whole, give their own extent, in longitude/latitude
+                // (not a raster's, or the one a streamed layer's source declares).
+                let mut notes = rustgis_engine::data::export_notes([(ds.as_ref(), ds.lonlat_extent())], &name, crs);
+                rustgis_engine::cmd::share::coalesce_read_zm(&mut notes, &name, &ds, &lost);
                 let mut dbf_notes = Vec::new();
                 if ext == "zip" {
                     dbf_notes.extend(io::shapefile_names_note(&ds.fields, &name));
-                    dbf_notes.extend(io::shapefile_values_notes(ds, &name));
-                    dbf_notes.extend(io::shapefile_geometry_notes(ds, &name, crs));
+                    dbf_notes.extend(io::shapefile_values_notes(&ds, &name));
+                    dbf_notes.extend(io::shapefile_geometry_notes(&ds, &name, crs));
                 }
                 if matches!(ext.as_str(), "parquet" | "geoparquet") {
-                    dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(ds, &name));
+                    dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(&ds, &name));
                 }
                 dbf_notes.extend(io::dates_as_text_note(&ds.fields, &name));
-                dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(ds, &ext, &name));
+                dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(&ds, &ext, &name));
                 if lost.rows > 0 {
                     dbf_notes.push(format!("{name}: {} rows couldn't be read and were left out", lost.rows));
                 }
                 dbf_notes.extend(rustgis_engine::cmd::share::read_notes(&name, &l.name, &lost));
                 // CSV holds a point a row, GPX a name for each feature and no areas; reading text back trims it or reads blanks as null.
-                dbf_notes.extend(io::export_losses_notes(ds, &ext, io::name_field(ds), &name));
+                dbf_notes.extend(io::export_losses_notes(&ds, &ext, io::name_field(&ds), &name).map_err(|e| e.to_string())?);
+                drop(ds);
                 if let Some(note) = io::left_out_note(&name, &ext, left_out) {
                     self.session.notify(note, false);
                 }
@@ -4966,6 +5031,7 @@ impl RustGisApp {
                     self.session.notify(format!("{name}: no .prj written, as {} has no WKT form", crs.label()), false);
                 }
                 if self.download(&name, bytes) {
+                    rustgis_engine::cmd::share::notify_export_query(&mut self.session, &name, &layer_name, &query_report);
                     for note in notes.into_iter().chain(dbf_notes).chain(construction_notes) {
                         self.session.notify(note, false);
                     }
@@ -6550,6 +6616,15 @@ impl RustGisApp {
         for (name, bytes) in arrived {
             let _ = self.open_picked(&name, &bytes);
         }
+        // A script file for the Script pane's Load…, opened with the context its undo needs; said,
+        // not dropped, if something in the inbox started a run meanwhile.
+        if let Some(script) = self.workflow.script_picked.take() {
+            if analysispane::script_running(self) {
+                self.session.notify(tl!("Wait for the run to finish").to_string(), true);
+            } else {
+                analysispane::open_script(self, ctx, script);
+            }
+        }
         // Files dropped on the desktop window arrive as paths. (The web shell reads browser drops
         // asynchronously and passes them through the inbox instead.)
         if !cfg!(target_arch = "wasm32") {
@@ -6651,6 +6726,7 @@ impl RustGisApp {
         self.themes_revision
     }
 
+    /// Draws the current workspace and processes toolbar actions once the interface fonts are ready.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let _diagnostics = self.session.diagnostics.enter();
         // See `logic`.
@@ -6741,6 +6817,8 @@ impl RustGisApp {
             self.sent_title = title;
         }
         pluginstart::frame_drawn(self, &ctx);
+        // Cancel, save prompts and any project changes from UI controls take effect first.
+        chrome::advance_history_jump(self, &ctx);
         // CJK text this frame drew with no face for it: the next frame's `logic` deals with it
         // (`ensure_data_cjk_font`), so there must be a next frame, though no input comes.
         if rustgis_engine::render::fonts::peek_missing_cjk().iter().any(|s| !self.cjk_scripts_handled.contains(s)) {
@@ -8418,6 +8496,37 @@ mod download_service_tests {
         assert!(!app.download("archive.pmtiles", vec![1, 2, 3]));
         assert!(app.session.notices.iter().any(|n| n.error && n.text.contains("browser rejected download")));
         assert!(!app.session.notices.iter().any(|n| n.text.contains("Downloaded")));
+    }
+
+    /// The web download encodes the filtered rows and reports the count once the bytes are accepted.
+    #[test]
+    fn feature_download_respects_the_definition_query() {
+        let file = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let downloaded = file.clone();
+        let mut app = RustGisApp::with_sample().with_services(Services {
+            download: Some(Box::new(move |_, bytes| {
+                *downloaded.lock().unwrap() = bytes;
+                Ok(())
+            })),
+            ..Default::default()
+        });
+        let layer = app.session.map().layer_by_name("Cities").unwrap();
+        let (id, total) = (layer.id, layer.dataset.features.len());
+        for (query, count) in [("@row_number = 1", 1), ("", total)] {
+            app.run("layer.definitionQuery", json!({"layer": id, "where": query})).unwrap();
+            let mark = app.session.notice_mark();
+            app.run("ui.exportLayer", json!({"layer": id, "format": "geojson"})).unwrap();
+            let data: serde_json::Value = serde_json::from_slice(&file.lock().unwrap()).unwrap();
+            assert_eq!(data["features"].as_array().unwrap().len(), count);
+            let notes: Vec<_> = app.session.notices_since(mark).iter().filter(|n| n.text.contains("definition query")).collect();
+            assert_eq!(notes.len(), usize::from(!query.is_empty()));
+            if let Some(note) = notes.first() {
+                assert_eq!(
+                    note.text,
+                    format!("Cities.geojson: the definition query on Cities left out {} of the source features", total - 1)
+                );
+            }
+        }
     }
 
     /// The web app's Shapefile download says which field names it changed, once the browser takes

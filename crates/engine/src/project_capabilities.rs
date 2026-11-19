@@ -70,6 +70,9 @@ impl Project {
         if !required.contains(&"layout-element-ink") && self.layouts.iter().any(|l| l.elements.iter().any(|e| e.kind.ink().is_some())) {
             required.push("layout-element-ink");
         }
+        if !required.contains(&"layout-element-wrap") && self.layouts.iter().any(|l| l.elements.iter().any(wraps)) {
+            required.push("layout-element-wrap");
+        }
         // A coordinate system whose PROJ definition, which an older reader reads, doesn't place
         // points as its WKT does (angles in grads, a datum transformation the definition can't
         // hold).
@@ -108,6 +111,7 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("layout-element-background", command_uses_element_background),
     ("picture-markers", command_uses_picture_marker),
     ("layout-element-ink", command_uses_element_ink),
+    ("layout-element-wrap", command_uses_element_wrap),
 ];
 
 /// A layout command that gives an element a background: an older reader warns that it ignores
@@ -129,6 +133,23 @@ fn command_uses_element_ink(id: &str, params: &Value) -> bool {
     match id {
         "layout.import" => imported_layout_uses(params, "\"color\"", |e| e.kind.ink().is_some()),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_ink)),
+        _ => false,
+    }
+}
+
+/// Whether a layout element is a text that wraps to its box (#2346).
+fn wraps(e: &rustgis_map::layout::Element) -> bool {
+    matches!(e.kind, rustgis_map::layout::ElementKind::Text { wrap: true, .. })
+}
+
+/// A layout command that makes a text wrap (#2346): an older reader warns that it ignores
+/// `wrap` and draws the text unwrapped. `"wrap": false` only keeps a text as an older reader's
+/// texts always are.
+fn command_uses_element_wrap(id: &str, params: &Value) -> bool {
+    match id {
+        "layout.addElement" | "layout.update" => params.get("wrap").and_then(crate::cmd::bool_value) == Some(true),
+        "layout.import" => imported_layout_uses(params, "\"wrap\"", wraps),
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_element_wrap)),
         _ => false,
     }
 }
@@ -246,13 +267,20 @@ fn relief_light(layer: &Layer) -> bool {
     )
 }
 
-/// The renderer capabilities a layer needs, in [`map_capabilities`]'s order.
+/// Whether a layer is a window of a Zarr variable following the time slider (#1720): an older
+/// reader would drop the window and read the whole map at each step.
+fn zarr_window(layer: &Layer) -> bool {
+    layer.raster.as_ref().and_then(|r| r.time_zarr.as_ref()).is_some_and(|z| z.window.is_some())
+}
+
+/// The capabilities a layer needs, in [`map_capabilities`]'s order.
 fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
     [
         (relief_effects(layer), "shaded-relief-effects"),
         (relief_light(layer), "shaded-relief-light"),
         (layer.size_by.is_some(), super::SIZE_BY_CAPABILITY),
         (layer.has_picture_markers(), "picture-markers"),
+        (zarr_window(layer), "zarr-window"),
     ]
     .into_iter()
     .filter_map(|(used, name)| used.then_some(name))
@@ -260,11 +288,13 @@ fn layer_capabilities(layer: &Layer) -> Vec<&'static str> {
 }
 
 fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static str> {
-    let (mut block, mut water, mut shore, mut relief, mut light, mut legends, mut sized, mut pictures) =
-        (false, false, false, false, false, false, false, false);
+    let (mut block, mut shape, mut water, mut shore, mut relief, mut light, mut legends, mut sized, mut pictures, mut zarr) =
+        (false, false, false, false, false, false, false, false, false, false);
     for map in maps {
         if let Some(t) = &map.view.terrain {
             block |= t.block.is_some();
+            // A round block (#2318), which an older reader would draw and save as a box.
+            shape |= t.block.as_ref().is_some_and(|b| !b.shape.is_box());
             water |= t.water.is_some();
             // A shore band other than the default, which an older reader would save away.
             shore |= t.water.as_ref().is_some_and(|w| w.shore != rustgis_map::view::WATER_SHORE);
@@ -273,12 +303,14 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         light |= map.layers.iter().any(relief_light);
         sized |= map.layers.iter().any(|layer| layer.size_by.is_some());
         pictures |= map.layers.iter().any(Layer::has_picture_markers);
+        zarr |= map.layers.iter().any(zarr_window);
         legends |= map.tiles.iter().any(|tile| {
             tile.legends.iter().any(|legend| rustgis_data::login_address::inner(&legend.url).len() > rustgis_map::tiles::MAX_LEGEND_URL)
         });
     }
     [
         (block, "terrain-block"),
+        (shape, "terrain-block-shape"),
         (water, "terrain-water"),
         (shore, "terrain-water-shore"),
         (relief, "shaded-relief-effects"),
@@ -286,6 +318,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (legends, "normalized-legend-urls"),
         (sized, super::SIZE_BY_CAPABILITY),
         (pictures, "picture-markers"),
+        (zarr, "zarr-window"),
     ]
     .into_iter()
     .filter_map(|(used, name)| used.then_some(name))
@@ -630,6 +663,51 @@ mod tests {
         }
     }
 
+    /// A text that wraps to its box is required where it is saved (#2346), so an older reader
+    /// refuses the project instead of drawing it on its own line breaks; so is a saved command
+    /// that makes one wrap, which an older reader would run without it. Unwrapping needs nothing.
+    #[test]
+    fn element_wrap_capability_follows_saved_layouts_and_commands() {
+        use rustgis_map::layout::ElementKind;
+        let fixture = Project::from_json(include_str!("../../../schema/fixtures/layout_element_wrap.rgis")).unwrap();
+        let saved = serde_json::to_value(&fixture).unwrap();
+        assert_eq!(saved["requires"], json!(["layout-element-wrap"]));
+        let wrapped = |p: &Project| p.layouts[0].elements.iter().filter(|e| matches!(e.kind, ElementKind::Text { wrap: true, .. })).count();
+        assert_eq!(wrapped(&Project::from_json(&saved.to_string()).unwrap()), 1);
+        let mut clean = fixture;
+        for e in &mut clean.layouts[0].elements {
+            if let ElementKind::Text { wrap, .. } = &mut e.kind {
+                *wrap = false;
+            }
+        }
+        let base = serde_json::to_value(&clean).unwrap();
+        assert!(base.get("requires").is_none(), "unwrapped texts need nothing");
+        assert!(!base["layouts"].to_string().contains("wrap"), "nor write it");
+        let layout = &saved["layouts"][0];
+        for (id, params, required) in [
+            ("layout.addElement", json!({"kind": "text", "wrap": true}), true),
+            ("layout.update", json!({"element": 2, "wrap": "on"}), true),
+            ("layout.update", json!({"element": 2, "wrap": false}), false),
+            ("layout.update", json!({"element": 2, "wrap": null}), false),
+            ("layout.update", json!({"element": 2, "text": "wrap"}), false),
+            ("layout.import", json!({"text": layout.to_string()}), true),
+            ("layout.import", json!({"text": base["layouts"][0].to_string()}), false),
+            ("layout.import", json!({"path": "notes.rgislayout"}), false),
+        ] {
+            let script = format!("{id}= {params}");
+            for value in [
+                json!([{"name": "Task", "steps": [{"title": "Note", "command": id, "params": params}]}]),
+                json!([{"name": "Script", "steps": [{"title": "Note", "command": "script.run", "params": {"script": script}}]}]),
+            ] {
+                let mut document = base.clone();
+                document["tasks"] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                let expected = if required { json!(["layout-element-wrap"]) } else { Value::Null };
+                assert_eq!(saved.get("requires").cloned().unwrap_or(Value::Null), expected, "{id} {params}");
+            }
+        }
+    }
+
     #[test]
     fn field_identity_is_preserved_and_required_in_a_plain_saved_project() {
         let project = Project::from_json(include_str!("../../../schema/fixtures/field_origin.rgis")).unwrap();
@@ -742,6 +820,30 @@ mod tests {
         let mut unknown = saved;
         unknown["requires"] = json!(["future-terrain"]);
         assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-terrain"));
+    }
+
+    /// A Zarr window following the time slider (#1720) is required by name in a project, a map
+    /// file and a layer file: an older reader would drop it and read the whole map at each step.
+    #[test]
+    fn a_zarr_window_is_required_where_it_is_saved() {
+        let mut p = Project::from_json(include_str!("../../../schema/fixtures/zarr_window.rgis")).unwrap();
+        let layer = p.map().layers[0].clone();
+        assert_eq!(
+            layer.raster.as_ref().and_then(|r| r.time_zarr.as_ref()).and_then(|z| z.window),
+            Some([1526419, 1162633, 1526643, 1162857])
+        );
+        let saved = serde_json::to_value(&p).unwrap();
+        assert_eq!(saved["requires"], json!(["zarr-window"]));
+        assert_eq!(json_bytes(&map_file_bytes(p.map()).unwrap())["requires"], saved["requires"]);
+        assert_eq!(json_bytes(&layer_file_bytes(&layer).unwrap())["requires"], saved["requires"]);
+        // The whole variable following the slider needs nothing new.
+        if let Some(z) = p.maps[0].layers[0].raster.as_mut().and_then(|r| r.time_zarr.as_mut()) {
+            z.window = None;
+        }
+        assert!(serde_json::to_value(&p).unwrap().get("requires").is_none());
+        let mut unknown = saved;
+        unknown["requires"] = json!(["zarr-window", "future-zarr"]);
+        assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-zarr"));
     }
 
     /// Nondefault relief effects survive project, map and layer files; ordinary relief needs none.

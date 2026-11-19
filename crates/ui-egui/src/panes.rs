@@ -82,11 +82,11 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
         let room = ui.available_width();
         let max = (room - MIN_MAP_WIDTH).max(RIGHT_PANE_MAX.min(room)).max(260.0);
         // The Web Data pane's searches and lists want room, and the Notebook opens on half of
-        // it (at least 320 where the room allows), beside the map: each keeps its own width.
+        // it (at least 320 where the room allows), beside the map: each keeps its own width. Every
+        // other pane shares one, so switching tabs among them never moves the pane's edge (#2416).
         let (id, width) = match right {
             RightPane::WebData => ("right_pane_web", 440.0),
             RightPane::Notebook => ("right_pane_notebook", (room / 2.0).max(320.0).min(max)),
-            RightPane::DiagnosticLog => ("right_pane_diagnostic_log", 480.0),
             _ => ("right_pane", 320.0),
         };
         let pane = egui::Panel::right(id).resizable(true).default_size(width).size_range(260.0..=max).frame(frame).show(ui, |ui| {
@@ -505,6 +505,12 @@ fn patch_sized(p: &egui::Painter, r: Rect, s: &Symbol, g: GeometryType, size: f3
         GeometryType::Point => {
             let rad = size / 2.0;
             let c = r.center();
+            // An image, without the symbol's colours, as on the map; one that doesn't draw is the
+            // circle below, as there.
+            if let Some(image) = crate::markerimages::image(p.ctx(), s.marker) {
+                image.paint(p, c, size);
+                return;
+            }
             match s.marker {
                 Marker::Square => {
                     p.rect_filled(Rect::from_center_size(c, vec2(rad * 1.8, rad * 1.8)), 0.0, c32(s.fill));
@@ -1700,7 +1706,7 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
                 action = Some(("map.setTiles", json!({"index": i, "opacity": o / 100.0})));
             }
         });
-        ui.menu_button(crate::i18n::fmt("Blend: {mode}", &[("mode", tl_raw!(tile.blend.label()))]), |ui| {
+        crate::widgets::submenu(ui, &crate::i18n::fmt("Blend: {mode}", &[("mode", tl_raw!(tile.blend.label()))]), |ui| {
             for b in rustgis_engine::map::effects::Blend::ALL {
                 if ui.radio(tile.blend == b, tl!(b.label())).clicked() {
                     action = Some(("map.setTiles", json!({"index": i, "blend": b.code()})));
@@ -1708,7 +1714,6 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
                 }
             }
         })
-        .response
         .on_hover_text(tl!("How the layer's colours combine with the tile layers and basemap beneath."));
         // A layer its service draws on request: one picture of the view, or tiles (#1162).
         if tile.on_request() {
@@ -1719,7 +1724,7 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
             } else {
                 tl!("Tiles").to_string()
             };
-            ui.menu_button(crate::i18n::fmt("Draw as: {how}", &[("how", &shown)]), |ui| {
+            crate::widgets::submenu(ui, &crate::i18n::fmt("Draw as: {how}", &[("how", &shown)]), |ui| {
                 if ui.radio(tile.single_image, tl!("Single image")).on_hover_text(tl!("One picture of the view: symbols and labels aren't cut at tile edges, and the service is asked once a view. Drawn in tiles on the globe, on a tilted map, or in a projection the service doesn't offer.")).clicked() {
                     action = Some(("map.setTiles", json!({"index": i, "singleImage": true})));
                     ui.close();
@@ -1737,7 +1742,6 @@ fn tile_row(app: &mut RustGisApp, ui: &mut Ui, i: usize, moves: [bool; 2], reord
                     ui.close();
                 }
             })
-            .response
             .on_hover_text(tl!("Whether the service is asked for one picture of the view or for tiles."));
         }
         ui.separator();
@@ -2209,7 +2213,7 @@ fn extrusion_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32]) {
     };
     let by = |f: &str| crate::i18n::fmt("By {field}", &[("field", f)]);
     let no_field = tl!("These layers share no numeric field.");
-    ui.menu_button(tl!("Extrusion"), |ui| {
+    crate::widgets::submenu(ui, tl!("Extrusion"), |ui| {
         head(ui);
         if ui.button(tl!("None")).clicked() {
             run(app, ui, "layer.extrusion", json!({"type": "none"}));
@@ -2228,7 +2232,7 @@ fn extrusion_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32]) {
             .on_disabled_hover_text(tl!("Extrude them all first: the base is what their walls stand on."));
         return;
     }
-    ui.menu_button(tl!("Extrusion Base"), |ui| {
+    crate::widgets::submenu(ui, tl!("Extrusion Base"), |ui| {
         head(ui);
         if ui.button(tl!("Ground")).clicked() {
             run(app, ui, "layer.extrusionBase", json!({"field": null, "base": 0}));
@@ -2295,7 +2299,7 @@ fn layers_menu(app: &mut RustGisApp, ui: &mut Ui, picked: &[u32], reorder: bool)
             .and_then(|id| m.group_of(*id))
             .map(|g| g.id)
             .filter(|g| picked.iter().all(|id| m.group_of(*id).map(|x| x.id) == Some(*g)));
-        ui.menu_button(tl!("Group"), |ui| {
+        crate::widgets::submenu(ui, tl!("Group"), |ui| {
             if ui.button(tl!("New Group")).clicked() {
                 new_group(app, json!({"layers": picked, "parent": shared}));
                 ui.close();
@@ -2490,7 +2494,7 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
         let m = app.session.map();
         let groups: Vec<(u32, String)> = m.groups.iter().map(|g| (g.id, group_path(m, g.id))).collect();
         let current = m.group_of(l.id).map(|g| g.id);
-        ui.menu_button(tl!("Group"), |ui| {
+        crate::widgets::submenu(ui, tl!("Group"), |ui| {
             // In the layer's group, if it has one (#836).
             if ui.button(tl!("New Group")).clicked() {
                 new_group(app, json!({"layers": [l.id], "parent": current}));
@@ -5763,8 +5767,9 @@ pub(crate) fn stroke_classes(r: &Renderer) -> Vec<(ClassRef, String, Symbol)> {
 }
 
 /// A stroke's markers along the editor's preview line, from `x.0` to `x.1` at `y`, scaled by `k`:
-/// markers as dots (squares as squares), hash marks as ticks, `w` wide. A sketch, not the map's
-/// drawing: other shapes and outlines aren't shown, and inner placements are marked at the middle.
+/// markers as dots (squares as squares, images as themselves, unturned), hash marks as ticks, `w`
+/// wide. A sketch, not the map's drawing: other shapes and outlines aren't shown, and inner
+/// placements are marked at the middle.
 fn marker_preview(ui: &Ui, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: egui::Color32, w: f32) {
     let mut xs = Vec::new();
     if m.at.has(Placements::INTERVAL) {
@@ -5785,7 +5790,13 @@ fn marker_preview(ui: &Ui, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: eg
         xs.push((x.0 + x.1) / 2.0);
     }
     let half = (m.size * k).max(1.0) / 2.0;
+    // An image, looked up once for all its places.
+    let image = if let LineMark::Marker(mark) = m.mark { crate::markerimages::image(ui.ctx(), mark) } else { None };
     for at in xs {
+        if let Some(image) = &image {
+            image.paint(ui.painter(), pos2(at, y), 2.0 * half);
+            continue;
+        }
         match m.mark {
             LineMark::Hash => {
                 let (sin, cos) = m.angle.to_radians().sin_cos();
@@ -7576,6 +7587,36 @@ pub(crate) fn layout_menu(app: &mut RustGisApp, ui: &mut Ui, n: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A point layer given an image by `layer.marker` shows it in its patch (the Layers row and the
+    /// symbol editor's swatch), and a stroke's image marker shows on the stroke editor's line, not
+    /// circles (#2266).
+    #[test]
+    fn a_picture_marker_shows_in_its_patch() {
+        let png =
+            "iVBORw0KGgoAAAANSUhEUgAAABgAAAAMCAYAAAB4MH11AAAAIElEQVR4nGO4ICPznxQsE3OBJMwwasGoBaMWjFpAGAMALk9r//PjorkAAAAASUVORK5CYII=";
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.marker", json!({"layer": "Cities", "image": png, "size": 14})).unwrap();
+        let l = app.session.map().layer_by_name("Cities").unwrap();
+        let (s, g) = (l.renderer.base_symbol(), l.geometry_type());
+        let ctx = egui::Context::default();
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(18.0, 14.0));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| patch(ui.painter(), r, &s, g));
+        // The image alone: one mesh on its own texture (not the font atlas's), and no circle.
+        let image = |c: &egui::epaint::ClippedShape| matches!(&c.shape, egui::Shape::Mesh(m) if m.texture_id != egui::TextureId::default());
+        assert_eq!(out.shapes.len(), 1);
+        assert!(out.shapes.iter().all(image));
+        // On the stroke editor's line: once at its middle, once more at each end.
+        let one = LineMarkers { mark: LineMark::Marker(s.marker), size: 12.0, at: Placements::MIDDLE, ..LineMarkers::default() };
+        let ends = LineMarkers { at: Placements::VERTICES, ..one };
+        for (m, n) in [(one, 1), (ends, 2)] {
+            let line = |ui: &mut Ui| marker_preview(ui, &m, (0.0, 80.0), 7.0, 1.0, egui::Color32::RED, 1.0);
+            let shapes = ctx.run_ui(egui::RawInput::default(), line).shapes;
+            assert_eq!((shapes.len(), shapes.iter().all(image)), (n, true), "{:?}", m.at);
+        }
+        // (Its texture's upload isn't handed to a renderer here.)
+        out.textures_delta.clear();
+    }
 
     /// The stroke and fill editors send an image back with every change, so it is kept; one that
     /// can't be drawn (a file's, not kept or not an image) becomes the circle it showed as, which

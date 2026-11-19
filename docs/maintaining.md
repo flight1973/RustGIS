@@ -103,7 +103,8 @@ the files by version and checks that the current reader still opens them correct
 in the fixtures' README and in the test's `SKIPS` when a release has no such file format.
 
 New project saves and map/layer exports write format 2. Their `requires` header names only
-features present in the saved payload: `terrain-block`, `terrain-water`,
+features present in the saved payload: `terrain-block`, `terrain-block-shape` (a block
+diagram cut to a circle), `terrain-water`,
 `terrain-water-shore` (a terrain water's shore band other than the default),
 `shaded-relief-effects` (cast shadows, sky visibility, fill light or rock colour),
 `shaded-relief-light` (a Shaded Relief's ambient or balanced light) and
@@ -137,6 +138,11 @@ refuses them instead of opening the layout and saving it again, or running the c
 without the background. Layout files (`.rgislayout`) carry no format header yet and are not
 covered (#2277).
 
+Projects, map files and layer files with a window of a Zarr variable that follows the time slider
+(`layer.addZarr` with `"time": true` and `"cells"` or `"bbox"`) require `zarr-window`, so an older
+reader refuses them instead of reading the whole map at each step. A saved `layer.addZarr` command
+with both needs nothing: an older RustGIS refuses it when it runs.
+
 Projects with an ink on a legend, colorbar, table or chart (`color` on those elements) require
 `layout-element-ink`, so an older reader refuses them instead of drawing those elements in dark
 grey and saving them again without it. Saved `layout.addElement` and `layout.update` commands
@@ -145,6 +151,13 @@ fails there instead of losing the ink. A saved `layout.import` whose `text` give
 ink requires `layout-element-ink`, and one whose `text` gives an element a background requires
 `layout-element-background`, since an older reader would read that layout without them. Layout
 files are not covered, as for backgrounds (#2277).
+
+Projects with a layout text that wraps to its box (`wrap` on a text element) require
+`layout-element-wrap`, so an older reader refuses them instead of drawing the text on its own
+line breaks and saving it again without the option. Saved `layout.addElement` and `layout.update`
+commands with `"wrap": true` require it too, since an older reader warns that it ignores the key
+and adds the text unwrapped; `"wrap": false` needs nothing. A saved `layout.import` whose `text`
+has a wrapped text requires it as well. Layout files are not covered, as for backgrounds (#2277).
 
 A coordinate system read from WKT is saved with its PROJ definition, which older readers read,
 and its WKT beside it (`wkt`), which this release reads first. Projects, map files and layer

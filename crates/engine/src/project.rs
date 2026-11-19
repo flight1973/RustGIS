@@ -72,6 +72,7 @@ pub const READ_FORMAT: u32 = 2;
 /// their payload, so a format-2 reader without them refuses instead of discarding their fields.
 pub const CAPABILITIES: &[&str] = &[
     "terrain-block",
+    "terrain-block-shape",
     "terrain-water",
     "terrain-water-shore",
     "shaded-relief-effects",
@@ -86,8 +87,10 @@ pub const CAPABILITIES: &[&str] = &[
     SIZE_BY_CAPABILITY,
     "picture-markers",
     "layout-element-ink",
+    "layout-element-wrap",
     "field-generation",
     "crs-wkt",
+    "zarr-window",
 ];
 /// Independent marker sizes alongside classified point colours (`Layer::size_by`).
 pub(crate) const SIZE_BY_CAPABILITY: &str = "classified-point-size";
