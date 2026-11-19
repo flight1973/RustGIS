@@ -263,10 +263,11 @@ impl FeatureSource for ShpSource {
             let geometry = match parse_shape(&buf) {
                 // A coordinate that isn't a number (NaN or infinite) has no place: the record is
                 // left out and counted, as one that can't be converted (#1985). One under a stored
-                // box that is one is counted apart too, as the index framed it by that box.
+                // box the index takes ([`index::usable`]) is counted apart too, as the index framed
+                // it by that box; a backwards one it can't frame, and counts as unboxed instead.
                 Ok(Some(g)) if !g.is_finite() => {
                     skipped += 1;
-                    boxed_off += u64::from(record_box(&buf, u64::from(place.len)).iter().all(|v| v.is_finite()));
+                    boxed_off += u64::from(index::usable(record_box(&buf, u64::from(place.len))));
                     return Ok(());
                 }
                 Ok(Some(g)) => match self.reproject.geometry(g) {
@@ -373,10 +374,11 @@ impl FeatureSource for ShpSource {
             let geometry = match parse_shape(&buf) {
                 // A coordinate that isn't a number (NaN or infinite) has no place: the record is
                 // left out and counted, as one that can't be converted (#1985). One under a stored
-                // box that is one is counted apart too, as the index framed it by that box.
+                // box the index takes ([`index::usable`]) is counted apart too, as the index framed
+                // it by that box; a backwards one it can't frame, and counts as unboxed instead.
                 Ok(Some(g)) if !g.is_finite() => {
                     skipped += 1;
-                    boxed_off += u64::from(record_box(&buf, u64::from(place.len)).iter().all(|v| v.is_finite()));
+                    boxed_off += u64::from(index::usable(record_box(&buf, u64::from(place.len))));
                     return Ok(());
                 }
                 Ok(Some(g)) => match self.reproject.geometry(g) {
@@ -427,8 +429,10 @@ impl FeatureSource for ShpSource {
 }
 
 /// Says how many shapes a read left out for a coordinate that isn't a number while their stored
-/// box is a box: [`record_box`] doesn't read the points, so the layer's extent and its index still
-/// take in those boxes. A `sampled` read visited only some of the matches, so its count is of
+/// box is one the index takes (finite and in order, [`index::usable`]): [`record_box`] doesn't read
+/// the points, so the layer's extent and its index still take in those boxes. A backwards stored
+/// box over such a point isn't counted here: the index can't frame it from the points, so it's
+/// left out of the extent and counted with the shapes that have no usable box. A `sampled` read visited only some of the matches, so its count is of
 /// the shapes it read, not of the layer.
 fn boxed_off_note(n: u64, sampled: bool) -> Vec<String> {
     if n == 0 {
@@ -492,9 +496,10 @@ fn le_f64(b: &[u8], at: usize) -> Option<f64> {
 /// rules, so a record it won't read frames nothing), isn't a box. `c` holds a line's or polygon's
 /// whole array of parts' starts where the record has room for it.
 ///
-/// The points themselves aren't read: a line, polygon or multipoint with a finite stored box over a
-/// point that isn't a number keeps that box here, though a read leaves the shape out, counts it and
-/// says so ([`boxed_off_note`]). Telling it apart here would mean reading every record's points to
+/// The points themselves aren't read: a line, polygon or multipoint with a stored box in order over
+/// a point that isn't a number keeps that box here, though a read leaves the shape out, counts it
+/// and says so ([`boxed_off_note`]). A backwards one stays backwards, as the index can't frame it
+/// from points that don't read, so it's counted as having no usable box instead. Telling it apart here would mean reading every record's points to
 /// build the index, for files (#1985's) with such shapes by the thousand.
 fn record_box(c: &[u8], len: u64) -> [f32; 4] {
     const NONE: [f32; 4] = [f32::NAN; 4];

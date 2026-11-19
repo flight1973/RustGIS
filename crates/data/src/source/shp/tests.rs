@@ -719,6 +719,25 @@ fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
         );
         // A whole read of the same file still gives the total.
         assert_eq!(said(&src.read(&Request::all()).unwrap().notes), one);
+        // The second record's stored box made backwards, (2, 2, 1, 1) at 200..232, over the same
+        // NaN point: the index can't frame it from the points, so it's left out of the extent and
+        // said as having no usable box, and the read doesn't claim the index took it in.
+        let p = write("nan_backwards.shp");
+        let mut b = std::fs::read(&p).unwrap();
+        for (at, v) in [(200, 2.0), (208, 2.0), (216, 1.0), (224, 1.0)] {
+            b[at..at + 8].copy_from_slice(&f64::to_le_bytes(v));
+        }
+        b[244..252].copy_from_slice(&f64::NAN.to_le_bytes());
+        std::fs::write(&p, b).unwrap();
+        let src = open_path(&p, None).unwrap();
+        let unboxed = "1 shape(s) have no usable bounding box";
+        let (ds, report) = crate::source::materialize(src.as_ref()).unwrap();
+        assert_eq!((ds.features.len(), report.skipped), (2, 1));
+        assert!(said(&report.messages).is_empty(), "{:?}", report.messages);
+        assert!(report.messages.iter().any(|m| m.contains(unboxed)), "{:?}", report.messages);
+        let all = src.read(&Request::all()).unwrap();
+        assert_eq!((all.skipped, said(&all.notes)), (1, Vec::new()));
+        assert_eq!(chunk_notes(src.as_ref(), None), (1, Vec::new()));
     });
     std::fs::remove_dir_all(fixture).unwrap();
 }
