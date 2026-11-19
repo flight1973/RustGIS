@@ -5614,6 +5614,40 @@ mod tests {
         assert_eq!(h.state().session.map().graticule_color, None);
     }
 
+    /// The graticule menu's color picker keeps a saved color's RGB at no opacity: raising only the
+    /// opacity of `#33669900` saves `#33669980`, not black at that opacity. Drives the same
+    /// `rgba_button` the menu calls, fed the color the menu feeds it (`graticule_rgba`), typing the
+    /// opacity into the picker's A number, then saves what it picked through `map.graticule` as the
+    /// menu does. (The picker is driven on its own: kittest closes the menu on the click that opens
+    /// the picker's popup.)
+    #[test]
+    fn the_graticule_color_keeps_its_rgb_when_only_the_opacity_is_raised() {
+        let mut app = RustGisApp::with_sample();
+        app.session.run("map.graticule", &json!({"color": "#33669900"})).unwrap();
+        let current = app.session.map().graticule_rgba();
+        assert_eq!(current.hex8(), "#33669900");
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(600.0, 400.0)).build_ui_state(
+            |ui, picked: &mut Option<rustgis_engine::map::Rgba>| {
+                if let (_, Some(c)) = crate::widgets::rgba_button(ui, current) {
+                    *picked = Some(c);
+                }
+            },
+            None,
+        );
+        h.get_by_role(egui::accesskit::Role::ColorWell).click();
+        h.run();
+        // A transparent picker edits linear values; the picker's numbers are R, G, B, A.
+        h.query_all_by_role(egui::accesskit::Role::SpinButton).nth(3).unwrap().focus();
+        h.run();
+        h.event(egui::Event::Text("0.5".into()));
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let picked = h.state().expect("the picker gave a color");
+        app.session.run("map.graticule", &json!({"color": picked.hex8()})).unwrap();
+        assert_eq!(app.session.map().graticule_rgba().hex8(), "#33669980");
+    }
+
     /// The language list names every language in English while the interface is English, with the
     /// language's own name as the tooltip; in another language each keeps its own name, or its
     /// English one where no font can draw it.
