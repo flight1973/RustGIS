@@ -7,14 +7,16 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 
 use hayro::hayro_interpret::font::FontQuery;
 use hayro::hayro_interpret::util::TransformExt;
 use hayro::hayro_interpret::{InterpreterSettings, InterpreterWarning};
 use hayro::hayro_syntax::Pdf;
-use hayro::hayro_syntax::object::{Array, Dict, Name, String as PdfString};
+use hayro::hayro_syntax::content::TypedIter;
+use hayro::hayro_syntax::content::ops::TypedInstruction;
+use hayro::hayro_syntax::object::{Array, Dict, Name, ObjectIdentifier, Stream, String as PdfString};
 use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, Point};
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -64,7 +66,8 @@ pub fn read_file(path: &Path, page: Option<&str>, place: bool) -> Result<Raster>
 /// The memory and time drawing takes aren't bounded by the file's size, and can't be stopped: a
 /// compressed stream can inflate to many times its size, an image can say it is far larger than
 /// its data, and forms drawn within forms multiply the work. `hayro` gives no way to bound or stop
-/// any of them (tracked separately).
+/// any of them; this is tracked in an issue to be filed: decoded-size and work limits need hayro
+/// support.
 pub fn read_bytes(name: &str, bytes: Vec<u8>, page: Option<&str>, place: bool) -> Result<Raster> {
     read_limited(name, bytes, page, place, max_samples())
 }
@@ -135,9 +138,13 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
         return Err(DataError::Format("the page is too large to draw".into()));
     }
     let settings = PixmapSettings { x_scale: scale as f32, y_scale: scale as f32, bg_color: WHITE };
-    // What couldn't be drawn, counted by kind: images, fonts, annotations, and anything else.
+    // What couldn't be drawn, counted by kind: images, fonts, annotations, and anything else; and
+    // whether `hayro` asked for a font not in the file, which it then draws in a stand-in it carries.
     let warned: Arc<[AtomicUsize; 4]> = Arc::new(Default::default());
-    let sink = Arc::clone(&warned);
+    let asked = Arc::new(AtomicBool::new(false));
+    let defaults = InterpreterSettings::default();
+    let resolve = Arc::clone(&defaults.font_resolver);
+    let (sink, asked_by) = (Arc::clone(&warned), Arc::clone(&asked));
     let interpret = InterpreterSettings {
         warning_sink: Arc::new(move |w| {
             let kind = match w {
@@ -150,29 +157,11 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
                 n.fetch_add(1, Ordering::Relaxed);
             }
         }),
-        ..InterpreterSettings::default()
-    };
-    // A font not in the file is drawn in one of the stand-ins `hayro` carries. It asks for the
-    // stand-in with the font's name only for a CID font; for the rest the names are found in the
-    // page's resources ([`missing_fonts`]), said once `hayro` has asked for a stand-in at all.
-    let asked = Arc::new(AtomicBool::new(false));
-    let named: Arc<Mutex<Vec<String>>> = Arc::default();
-    let resolve = Arc::clone(&interpret.font_resolver);
-    let (asked_by, named_by) = (Arc::clone(&asked), Arc::clone(&named));
-    let interpret = InterpreterSettings {
         font_resolver: Arc::new(move |query: &FontQuery| {
             asked_by.store(true, Ordering::Relaxed);
-            if let FontQuery::Fallback(f) = query
-                && let Some(name) = f.post_script_name.clone().or_else(|| f.font_name.clone()).or_else(|| f.font_family.clone())
-                && let Ok(mut names) = named_by.lock()
-                && !names.contains(&name)
-                && names.len() < MISSING_FONTS_KEPT
-            {
-                names.push(name);
-            }
             resolve(query)
         }),
-        ..interpret
+        ..defaults
     };
     let pixmap = hayro::render(page, &RenderCache::new(), &interpret, &RenderSettings::default(), &settings);
     let (pw, ph) = (u32::from(pixmap.width()), u32::from(pixmap.height()));
@@ -194,12 +183,13 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
     }
     // `hayro` warns each time it meets one, not which one it is: an image (or its soft mask, which
     // it can't be told from) each time it is drawn, a font each time it is chosen (`Tf`), whether
-    // or not text is then shown in it. The counts are of times, not of images or fonts.
+    // or not text is then shown in it. The counts are of times, not of images or fonts. The last
+    // is for a kind of warning a later `hayro` may add.
     let warnings = [
         "an image or its mask can't be decoded: the image is left blank, or drawn without its mask",
         "a font that can't be read is chosen: its text is drawn in a stand-in font",
         "an annotation whose appearance can't be found is left out",
-        "part of the page can't be drawn and is left out",
+        "something on the page can't be drawn and is left out",
     ];
     for (count, what) in warned.iter().map(|n| n.load(Ordering::Relaxed)).zip(warnings) {
         match count {
@@ -208,34 +198,34 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
             n => r.lost.push(format!("{what} ({n} times)")),
         }
     }
+    // Only when `hayro` asked for a font not in the file is the page looked through for which.
     if asked.load(Ordering::Relaxed) {
-        let mut names = named.lock().map(|n| n.clone()).unwrap_or_default();
-        let (found, more) = missing_fonts(page);
-        for name in found {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-        if !names.is_empty() {
-            let shown = names.iter().take(MISSING_FONTS_NAMED).cloned().collect::<Vec<_>>().join(", ");
-            let left = names.len().saturating_sub(MISSING_FONTS_NAMED);
-            let tail = match (more, left) {
-                (true, _) => ", and perhaps more".to_string(),
+        let found = substituted_fonts(page);
+        if !found.names.is_empty() || found.stopped {
+            let shown: Vec<&str> = found.names.iter().take(MISSING_FONTS_NAMED).map(String::as_str).collect();
+            let left = found.keys.len().saturating_sub(shown.len());
+            let tail = match (found.stopped, left) {
                 (false, 0) => String::new(),
                 (false, n) => format!(", and {n} more"),
+                (true, 0) => ", and perhaps others".to_string(),
+                (true, n) => format!(", and {n} more (perhaps others)"),
             };
-            r.lost.push(format!("fonts not in the file are drawn in a stand-in font: {shown}{tail}"));
+            if !shown.is_empty() {
+                r.lost.push(format!("fonts not in the file are drawn in a stand-in font: {}{tail}", shown.join(", ")));
+            }
         }
     }
     Ok((r, scale))
 }
 
-/// The most names of fonts not in the file kept, and named in a notice.
+/// The most names of fonts not in the file kept, the most named in a notice, and the most told
+/// apart.
 const MISSING_FONTS_KEPT: usize = 100;
 const MISSING_FONTS_NAMED: usize = 10;
-/// The most forms within forms, and objects, looked through for fonts not in the file.
+const MISSING_FONTS_COUNTED: usize = 10_000;
+/// The most forms within forms, and content streams, looked through for the fonts chosen.
 const FONT_SEARCH_DEPTH: usize = 32;
-const FONT_SEARCH_OBJECTS: usize = 10_000;
+const FONT_SEARCH_STREAMS: usize = 1_000;
 
 /// The standard 14 fonts (ISO 32000-2 § 9.6.2.2), drawn in `hayro`'s own when not in the file, as
 /// every reader draws them in its own: not a stand-in for something else.
@@ -256,49 +246,150 @@ const STANDARD_FONTS: [&str; 14] = [
     "ZapfDingbats",
 ];
 
-/// The names of the fonts in the page's resources, and its forms' (looked through without
-/// decoding anything), whose programs aren't in the file and which aren't one of the
-/// [`STANDARD_FONTS`], and whether there were more resources than are looked through. A font
-/// named in the resources but never drawn is named too.
-fn missing_fonts(page: &Page<'_>) -> (Vec<String>, bool) {
-    let (mut names, mut seen, mut looked) = (Vec::new(), HashSet::new(), 0usize);
+/// The resources a content stream's names are looked up in.
+#[derive(Clone, Default)]
+struct Res<'a> {
+    fonts: Dict<'a>,
+    xobjects: Dict<'a>,
+    states: Dict<'a>,
+    patterns: Dict<'a>,
+}
+
+impl<'a> Res<'a> {
+    fn of(d: &Dict<'a>) -> Self {
+        let get = |k: &[u8]| d.get::<Dict<'a>>(k).unwrap_or_default();
+        Res { fonts: get(b"Font"), xobjects: get(b"XObject"), states: get(b"ExtGState"), patterns: get(b"Pattern") }
+    }
+
+    /// Stream `s`'s own resources, else these, which it is then drawn with.
+    fn within(&self, s: &Stream<'a>) -> Self {
+        s.dict().get::<Dict<'a>>(b"Resources".as_slice()).map_or_else(|| self.clone(), |d| Res::of(&d))
+    }
+}
+
+/// The fonts not in the file that the page chooses, found by [`substituted_fonts`]: their names
+/// (at most [`MISSING_FONTS_KEPT`]), the fonts told apart (at most [`MISSING_FONTS_COUNTED`]), and
+/// whether the search stopped before it had looked at everything.
+#[derive(Default)]
+struct FontSearch<'a> {
+    names: Vec<String>,
+    keys: HashSet<String>,
+    stopped: bool,
+    seen: HashSet<ObjectIdentifier>,
+    streams: usize,
+    todo: Vec<(Stream<'a>, Res<'a>, usize)>,
+}
+
+/// The fonts the page chooses (`Tf`) whose programs aren't in the file and which aren't one of the
+/// [`STANDARD_FONTS`] ([`missing_font`]): `hayro` draws their text in a stand-in. The page's
+/// content is followed as `hayro` draws it, into the forms it draws, soft-mask groups, tiling
+/// patterns, Type 3 fonts' glyphs, and its annotations' appearances, to [`FONT_SEARCH_DEPTH`]
+/// deep and [`FONT_SEARCH_STREAMS`] streams. Forms' content is decoded again for it (`hayro`
+/// doesn't keep it), so it is done only once `hayro` has asked for a font not in the file.
+fn substituted_fonts<'a>(page: &Page<'a>) -> FontSearch<'a> {
+    let mut search = FontSearch::default();
     let res = page.resources();
-    let mut todo: Vec<(Dict<'_>, Dict<'_>, usize)> = vec![(res.fonts.clone(), res.x_objects.clone(), 0)];
-    while let Some((fonts, xobjects, depth)) = todo.pop() {
-        for key in fonts.keys() {
-            looked += 1;
-            if looked > FONT_SEARCH_OBJECTS {
-                return (names, true);
+    let page_res =
+        Res { fonts: res.fonts.clone(), xobjects: res.x_objects.clone(), states: res.ext_g_states.clone(), patterns: res.patterns.clone() };
+    search.ops(page.typed_operations(), &page_res, 0);
+    if let Some(annots) = page.raw().get::<Array<'a>>(b"Annots".as_slice()) {
+        for annot in annots.iter::<Dict<'a>>() {
+            // The normal appearance is the one drawn.
+            let Some(ap) = annot.get::<Dict<'a>>(b"AP".as_slice()) else { continue };
+            if let Some(s) = ap.get::<Stream<'a>>(b"N".as_slice()) {
+                search.queue(page_res.within(&s), s, 1);
+            } else if let Some(states) = ap.get::<Dict<'a>>(b"N".as_slice()) {
+                for state in states.keys() {
+                    if let Some(s) = states.get::<Stream<'a>>(&state) {
+                        search.queue(page_res.within(&s), s, 1);
+                    }
+                }
             }
-            let Some(font) = fonts.get::<Dict<'_>>(&key) else { continue };
-            if font.obj_id().is_some_and(|id| !seen.insert(id)) {
-                continue;
-            }
-            if let Some(name) = missing_font(&font)
-                && !names.contains(&name)
-            {
-                names.push(name);
-            }
-        }
-        for key in xobjects.keys() {
-            looked += 1;
-            if looked > FONT_SEARCH_OBJECTS {
-                return (names, true);
-            }
-            let Some(form) = xobjects.get::<hayro::hayro_syntax::object::Stream<'_>>(&key) else { continue };
-            let d = form.dict();
-            if !seen.insert(form.obj_id()) || d.get::<Name<'_>>(b"Subtype".as_slice()).is_none_or(|n| n.as_str() != "Form") {
-                continue;
-            }
-            let Some(r) = d.get::<Dict<'_>>(b"Resources".as_slice()) else { continue };
-            if depth >= FONT_SEARCH_DEPTH {
-                return (names, true);
-            }
-            let get = |k: &[u8]| r.get::<Dict<'_>>(k).unwrap_or_default();
-            todo.push((get(b"Font"), get(b"XObject"), depth + 1));
         }
     }
-    (names, false)
+    while let Some((stream, res, depth)) = search.todo.pop() {
+        if search.streams >= FONT_SEARCH_STREAMS {
+            search.stopped = true;
+            break;
+        }
+        search.streams += 1;
+        if let Ok(data) = stream.decoded_data() {
+            search.ops(TypedIter::new(&data), &res, depth);
+        }
+    }
+    search
+}
+
+impl<'a> FontSearch<'a> {
+    /// Queues content stream `s`, drawn with `res`, `depth` forms deep: once, and not past
+    /// [`FONT_SEARCH_DEPTH`].
+    fn queue(&mut self, res: Res<'a>, s: Stream<'a>, depth: usize) {
+        if depth > FONT_SEARCH_DEPTH {
+            self.stopped = true;
+        } else if self.seen.insert(s.obj_id()) {
+            self.todo.push((s, res, depth));
+        }
+    }
+
+    /// Follows a content stream drawn with `res`: the fonts it chooses, and the forms, soft-mask
+    /// groups and tiling patterns it draws.
+    fn ops(&mut self, mut ops: TypedIter<'_>, res: &Res<'a>, depth: usize) {
+        while let Some(op) = ops.next() {
+            let drawn = match op {
+                TypedInstruction::TextFont(t) => {
+                    self.font(t.0, res, depth);
+                    None
+                }
+                TypedInstruction::XObject(x) => res
+                    .xobjects
+                    .get::<Stream<'a>>(x.0)
+                    .filter(|s| s.dict().get::<Name<'_>>(b"Subtype".as_slice()).is_some_and(|n| n.as_str() == "Form")),
+                TypedInstruction::SetGraphicsState(g) => res
+                    .states
+                    .get::<Dict<'a>>(g.0)
+                    .and_then(|s| s.get::<Dict<'a>>(b"SMask".as_slice()))
+                    .and_then(|m| m.get::<Stream<'a>>(b"G".as_slice())),
+                TypedInstruction::NonStrokeColorNamed(c) => c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)),
+                TypedInstruction::StrokeColorNamed(c) => c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)),
+                _ => None,
+            };
+            if let Some(s) = drawn {
+                self.queue(res.within(&s), s, depth + 1);
+            }
+        }
+    }
+
+    /// A font chosen by name in `res`: named when not in the file; a Type 3 font's glyphs, which
+    /// may choose fonts of their own, followed.
+    fn font(&mut self, name: &Name<'_>, res: &Res<'a>, depth: usize) {
+        let Some(font) = res.fonts.get::<Dict<'a>>(name) else { return };
+        if font.get::<Name<'_>>(b"Subtype".as_slice()).is_some_and(|s| s.as_str() == "Type3") {
+            if font.obj_id().is_some_and(|id| !self.seen.insert(id)) {
+                return;
+            }
+            let glyph_res = font.get::<Dict<'a>>(b"Resources".as_slice()).map_or_else(|| res.clone(), |d| Res::of(&d));
+            if let Some(procs) = font.get::<Dict<'a>>(b"CharProcs".as_slice()) {
+                for glyph in procs.keys() {
+                    if let Some(s) = procs.get::<Stream<'a>>(&glyph) {
+                        self.queue(glyph_res.clone(), s, depth + 1);
+                    }
+                }
+            }
+        } else if let Some(name) = missing_font(&font) {
+            if self.keys.len() >= MISSING_FONTS_COUNTED {
+                self.stopped = true;
+            } else if self.keys.insert(font_key(&name)) && self.names.len() < MISSING_FONTS_KEPT {
+                self.names.push(name);
+            }
+        }
+    }
+}
+
+/// A font's name as a key that two spellings of one font share: its letters and digits in lower
+/// case, without an `MT` or `PS` maker's suffix ("Arial,Bold" and "Arial-BoldMT" alike).
+fn font_key(name: &str) -> String {
+    let key: String = name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect();
+    ["mt", "ps"].iter().find_map(|s| key.strip_suffix(s).filter(|k| !k.is_empty())).map_or(key.clone(), str::to_string)
 }
 
 /// A font's name when its program isn't in the file (no `/FontFile`, `/FontFile2` or `/FontFile3`
@@ -422,24 +513,25 @@ fn viewport(vp: &Dict<'_>, measure: &Dict<'_>) -> std::result::Result<Viewport, 
     let epsg = gcs.get::<i64>(b"EPSG".as_slice()).and_then(|c| u32::try_from(c).ok());
     let (text, unread) =
         gcs.get::<PdfString>(b"WKT".as_slice()).map(|w| text_string(w.as_bytes())).map_or((None, 0), |(t, n)| (Some(t), n));
-    let text_note = (unread > 0).then(|| {
-        let chars = if unread == 1 { "1 character".to_string() } else { format!("{unread} characters") };
-        format!("{chars} of its coordinate system's text (/WKT) couldn't be read: replaced or left out")
-    });
     // As a `.prj` and a code are read together elsewhere (a GeoPackage's): the code, unless the
     // text gives another shift or body; the text alone when the code isn't one RustGIS knows.
     let unknown = |code: u32| format!("its coordinate system, EPSG:{code}, isn't one RustGIS knows");
     let unreadable = |e: String| format!("its coordinate system can't be read ({e})");
-    let (crs, note) = match (text.as_deref(), epsg) {
+    let ((crs, note), text_used) = match (text.as_deref(), epsg) {
         (Some(t), Some(code)) => match (wkt::read_wkt_over_code(t, code), Crs::from_epsg(code)) {
-            (Some(read), _) => read.map_err(unreadable)?,
-            (None, Some(crs)) => (crs, None),
-            (None, None) => wkt::read_wkt(t).map_err(|_| unknown(code))?,
+            (Some(read), _) => (read.map_err(unreadable)?, true),
+            (None, Some(crs)) => ((crs, None), false),
+            (None, None) => (wkt::read_wkt(t).map_err(|_| unknown(code))?, true),
         },
-        (Some(t), None) => wkt::read_wkt(t).map_err(unreadable)?,
-        (None, Some(code)) => (Crs::from_epsg(code).ok_or_else(|| unknown(code))?, None),
+        (Some(t), None) => (wkt::read_wkt(t).map_err(unreadable)?, true),
+        (None, Some(code)) => ((Crs::from_epsg(code).ok_or_else(|| unknown(code))?, None), false),
         (None, None) => return Err("it doesn't say its coordinate system".into()),
     };
+    // What couldn't be read of the text is said only where the text placed the page.
+    let text_note = (text_used && unread > 0).then(|| {
+        let chars = if unread == 1 { "1 character".to_string() } else { format!("{unread} characters") };
+        format!("{chars} of its coordinate system's text (/WKT) couldn't be read: replaced or left out")
+    });
     let def = match crs {
         Crs::Epsg(c) => crs::epsg_proj4(c).map(str::to_string),
         Crs::Custom(_) => crs.custom_def().map(|d| d.proj4.clone()),
@@ -448,13 +540,63 @@ fn viewport(vp: &Dict<'_>, measure: &Dict<'_>) -> std::result::Result<Viewport, 
     Ok(Viewport { bbox, gpts, lpts, crs, def, note, text_note })
 }
 
+/// PDFDocEncoding's characters for bytes 18–1F and 80–A0, where they differ from Latin-1's;
+/// `None` where it defines none (ISO 32000-1:2008, Annex D, Table D.2).
+const PDF_DOC_18: [char; 8] = ['\u{02D8}', '\u{02C7}', '\u{02C6}', '\u{02D9}', '\u{02DD}', '\u{02DB}', '\u{02DA}', '\u{02DC}'];
+const PDF_DOC_80: [Option<char>; 33] = [
+    Some('\u{2022}'),
+    Some('\u{2020}'),
+    Some('\u{2021}'),
+    Some('\u{2026}'),
+    Some('\u{2014}'),
+    Some('\u{2013}'),
+    Some('\u{0192}'),
+    Some('\u{2044}'),
+    Some('\u{2039}'),
+    Some('\u{203A}'),
+    Some('\u{2212}'),
+    Some('\u{2030}'),
+    Some('\u{201E}'),
+    Some('\u{201C}'),
+    Some('\u{201D}'),
+    Some('\u{2018}'),
+    Some('\u{2019}'),
+    Some('\u{201A}'),
+    Some('\u{2122}'),
+    Some('\u{FB01}'),
+    Some('\u{FB02}'),
+    Some('\u{0141}'),
+    Some('\u{0152}'),
+    Some('\u{0160}'),
+    Some('\u{0178}'),
+    Some('\u{017D}'),
+    Some('\u{0131}'),
+    Some('\u{0142}'),
+    Some('\u{0153}'),
+    Some('\u{0161}'),
+    Some('\u{017E}'),
+    None,
+    Some('\u{20AC}'),
+];
+
+/// A byte's character in PDFDocEncoding (ISO 32000-1:2008, Annex D, Table D.2), or `None` where
+/// it defines none: 00–08, 0B, 0C, 0E–17, 7F, 9F and AD. Elsewhere it is Latin-1's but for
+/// 18–1F and 80–A0.
+fn pdf_doc_char(c: u8) -> Option<char> {
+    match c {
+        0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x17 | 0x7F | 0xAD => None,
+        0x18..=0x1F => PDF_DOC_18.get(usize::from(c - 0x18)).copied(),
+        0x80..=0xA0 => PDF_DOC_80.get(usize::from(c - 0x80)).copied().flatten(),
+        _ => Some(char::from(c)),
+    }
+}
+
 /// A PDF text string's text (ISO 32000-2 § 7.9.2.2), and how many characters couldn't be read
 /// (each the replacement character, U+FFFD, or left out). UTF-16 after a byte-order mark (FE FF,
 /// big-endian, as RustGIS writes one; or FF FE), UTF-8 after its own (EF BB BF), either with its
-/// language escapes (between two U+001B) taken out. Without a mark, UTF-8 where the bytes are
-/// that (as some writers use, though the standard says PDFDocEncoding); else PDFDocEncoding read
-/// as Latin-1, which it matches from A1 to FF but AD. The bytes where the two differ (18–1F,
-/// 7F–A0, AD) are replaced, not misread.
+/// language escapes taken out ([`without_language_escapes`]). Without a mark, UTF-8 where the
+/// bytes are that (as some writers use, though the standard says PDFDocEncoding); else
+/// PDFDocEncoding ([`pdf_doc_char`]), a byte it defines no character for replaced.
 fn text_string(b: &[u8]) -> (String, usize) {
     let (text, bad) = if let Some(rest) = b.strip_prefix(&[0xFE, 0xFF]) {
         crate::io::utf16_text(rest, true)
@@ -473,23 +615,38 @@ fn text_string(b: &[u8]) -> (String, usize) {
     } else if let Ok(s) = std::str::from_utf8(b) {
         return (s.to_string(), 0);
     } else {
-        let differs = |c: u8| matches!(c, 0x18..=0x1F | 0x7F..=0xA0 | 0xAD);
-        let text = b.iter().map(|&c| if differs(c) { char::REPLACEMENT_CHARACTER } else { char::from(c) }).collect();
-        return (text, b.iter().filter(|&&c| differs(c)).count());
+        let chars: Vec<Option<char>> = b.iter().map(|&c| pdf_doc_char(c)).collect();
+        let bad = chars.iter().filter(|c| c.is_none()).count();
+        return (chars.into_iter().map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)).collect(), bad);
     };
-    // A language escape: U+001B, a language code, U+001B. One left open runs to the end, and is
-    // counted as unread.
-    let mut parts = text.split('\u{1B}');
-    let mut kept: String = parts.next().unwrap_or_default().to_string();
-    let rest: Vec<&str> = parts.collect();
-    for (i, part) in rest.iter().enumerate() {
-        // After the first mark the parts alternate: inside an escape, then after it.
-        if i % 2 == 1 {
-            kept.push_str(part);
+    let (text, stray) = without_language_escapes(&text);
+    (text, bad + stray)
+}
+
+/// `text` without its language escapes (ISO 32000-2 § 7.9.2.2): U+001B, a two-letter language
+/// code, an optional two-letter country code, and U+001B. An escape mark that doesn't begin one
+/// is taken out and counted, and the text after it kept.
+fn without_language_escapes(text: &str) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let (mut kept, mut stray, mut i) = (String::with_capacity(text.len()), 0, 0);
+    while let Some(&c) = chars.get(i) {
+        if c != '\u{1B}' {
+            kept.push(c);
+            i += 1;
+            continue;
+        }
+        let letters = |from: usize, n: usize| chars.get(from..from + n).is_some_and(|s| s.iter().all(char::is_ascii_alphabetic));
+        let closes = |at: usize| chars.get(at) == Some(&'\u{1B}');
+        if letters(i + 1, 2) && closes(i + 3) {
+            i += 4;
+        } else if letters(i + 1, 4) && closes(i + 5) {
+            i += 6;
+        } else {
+            stray += 1;
+            i += 1;
         }
     }
-    let open = usize::from(rest.len() % 2 == 1);
-    (kept, bad + open)
+    (kept, stray)
 }
 
 /// `r`, the drawn page at `scale` pixels a point, placed by the largest of its GeoPDF viewports:
@@ -810,14 +967,101 @@ mod tests {
         assert_eq!(read(&[0xFE, 0xFF, 0, b'G', 0]), ("G".into(), 1));
         assert_eq!(read(&[0xFE, 0xFF, 0xD8, 0x00, 0, b'G']), ("\u{FFFD}G".into(), 1));
         assert_eq!(read(&[0xEF, 0xBB, 0xBF, b'G', 0xFF]), ("G\u{FFFD}".into(), 1));
-        // A language escape is taken out; one left open is counted.
-        let escaped: Vec<u8> = [0xFE, 0xFF].into_iter().chain("a\u{1B}en\u{1B}b".encode_utf16().flat_map(u16::to_be_bytes)).collect();
-        assert_eq!(read(&escaped), ("ab".into(), 0));
-        let open: Vec<u8> = [0xFE, 0xFF].into_iter().chain("a\u{1B}en".encode_utf16().flat_map(u16::to_be_bytes)).collect();
-        assert_eq!(read(&open), ("a".into(), 1));
-        // Without a mark and not UTF-8: Latin-1 where PDFDocEncoding matches it, replaced in the
-        // ranges where the two differ.
-        assert_eq!(read(&[b'G', 0xFF, 0xE9, 0x80, 0xAD]), ("Gÿé\u{FFFD}\u{FFFD}".into(), 2));
+        // Language escapes (a language, or a language and a country) are taken out, and what is
+        // in them isn't counted. A mark that begins none is taken out and counted, and the text
+        // after it kept.
+        let utf16 = |s: &str| -> Vec<u8> { [0xFE, 0xFF].into_iter().chain(s.encode_utf16().flat_map(u16::to_be_bytes)).collect() };
+        assert_eq!(read(&utf16("a\u{1B}en\u{1B}b\u{1B}deCH\u{1B}c")), ("abc".into(), 0));
+        assert_eq!(read(&utf16("a\u{1B}en")), ("aen".into(), 1));
+        assert_eq!(read(&utf16("a\u{1B}e1\u{1B}b")), ("ae1b".into(), 2));
+        // Without a mark and not UTF-8: PDFDocEncoding, as ISO 32000-1 Table D.2 gives it (0x80 a
+        // bullet, 0xA0 the euro sign, 0x18 a breve), and a byte it defines no character for
+        // (0xAD) replaced.
+        assert_eq!(read(&[b'G', 0xFF, 0xE9, 0x80, 0xA0, 0x18, 0xAD]), ("Gÿé•€˘\u{FFFD}".into(), 1));
+    }
+
+    #[test]
+    fn a_coordinate_systems_unreadable_text_is_said_only_where_it_is_used() {
+        let ascii = r#"GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#;
+        // UTF-16 with an odd last byte.
+        let odd = format!("<FEFF{}00>", ascii.encode_utf16().map(|u| format!("{u:04X}")).collect::<String>());
+        let note = "1 character of its coordinate system's text (/WKT) couldn't be read: replaced or left out";
+        // The text alone places the page: said.
+        let r = read_bytes("geo", tiny_pdf("0 0 72 36", &geo(&format!("/Type /GEOGCS /WKT {odd}"))), None, true).unwrap();
+        assert!(r.georeferenced && r.lost == [note], "{:?}", r.lost);
+        // A code it gives no other shift or body than places it: the text isn't used, and
+        // nothing is said of it.
+        let r = read_bytes("geo", tiny_pdf("0 0 72 36", &geo(&format!("/Type /GEOGCS /EPSG 4326 /WKT {odd}"))), None, true).unwrap();
+        assert!(r.georeferenced && r.lost.is_empty(), "{:?}", r.lost);
+    }
+
+    #[test]
+    fn fonts_not_in_the_file_are_named_where_they_are_chosen() {
+        let notice = |names: &str| format!("fonts not in the file are drawn in a stand-in font: {names}");
+        let arial = "<< /Type /Font /Subtype /TrueType /BaseFont /Arial,Bold /Encoding /WinAnsiEncoding >>";
+        let helvetica = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
+        // Text in Helvetica (a standard font) with Arial in the resources but never chosen:
+        // nothing said of Arial.
+        let unused = pdf_of(
+            "0 0 72 36",
+            "/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>",
+            b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET",
+            &[helvetica.as_bytes().to_vec(), arial.as_bytes().to_vec()],
+        );
+        let r = read_bytes("x", unused, None, true).unwrap();
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
+        // Two spellings of one font, both chosen: named once.
+        let mt = "<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+Arial-BoldMT /Encoding /WinAnsiEncoding >>";
+        let both = pdf_of(
+            "0 0 72 36",
+            "/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>",
+            b"BT /F1 12 Tf 5 10 Td (Hi) Tj /F2 12 Tf (there) Tj ET",
+            &[arial.as_bytes().to_vec(), mt.as_bytes().to_vec()],
+        );
+        let r = read_bytes("x", both, None, true).unwrap();
+        assert_eq!(r.lost, [notice("Arial,Bold")]);
+        // Chosen only inside an annotation's appearance, a soft-mask group, a tiling pattern, or a
+        // Type 3 font's glyph: named.
+        let text = b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET";
+        let with_font =
+            |kind: &str| format!("/Type /XObject /Subtype /Form /BBox [0 0 72 36] /Resources << /Font << /F1 6 0 R >> >> {kind}");
+        let font = arial.as_bytes().to_vec();
+        let appearance = stream(&with_font(""), text);
+        let annotated = pdf_of(
+            "0 0 72 36",
+            "/Annots [<< /Type /Annot /Subtype /Square /Rect [0 0 72 36] /AP << /N 5 0 R >> >>]",
+            b"",
+            &[appearance, font.clone()],
+        );
+        assert_eq!(read_bytes("x", annotated, None, true).unwrap().lost, [notice("Arial,Bold")]);
+        let group = stream(&with_font("/Group << /S /Transparency /CS /DeviceGray >>"), text);
+        let masked = pdf_of(
+            "0 0 72 36",
+            "/Resources << /ExtGState << /G0 << /SMask << /S /Luminosity /G 5 0 R >> >> >> >>",
+            b"/G0 gs 0 0 1 rg 0 0 10 10 re f",
+            &[group, font.clone()],
+        );
+        assert_eq!(read_bytes("x", masked, None, true).unwrap().lost, [notice("Arial,Bold")]);
+        let tile = stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 72 36] /XStep 72 /YStep 36 \
+             /Resources << /Font << /F1 6 0 R >> >>",
+            text,
+        );
+        let patterned =
+            pdf_of("0 0 72 36", "/Resources << /Pattern << /P0 5 0 R >> >>", b"/Pattern cs /P0 scn 0 0 72 36 re f", &[tile, font.clone()]);
+        assert_eq!(read_bytes("x", patterned, None, true).unwrap().lost, [notice("Arial,Bold")]);
+        let type3 = "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] \
+                     /CharProcs << /H 6 0 R >> /Encoding << /Differences [72 /H] >> /FirstChar 72 /LastChar 72 /Widths [1000] \
+                     /Resources << /Font << /F1 7 0 R >> >> >>";
+        let glyph = stream("", b"1000 0 d0 BT /F1 500 Tf 0 0 Td (x) Tj ET");
+        let glyphs = pdf_of(
+            "0 0 72 36",
+            "/Resources << /Font << /T3 5 0 R >> >>",
+            b"BT /T3 12 Tf 5 10 Td (H) Tj ET",
+            &[type3.as_bytes().to_vec(), glyph, font],
+        );
+        assert_eq!(read_bytes("x", glyphs, None, true).unwrap().lost, [notice("Arial,Bold")]);
+        assert_eq!(font_key("Arial,Bold"), font_key("Arial-BoldMT"));
     }
 
     /// A viewport over `bbox` on the page, its corners at 10–12° E, 40–41° N.

@@ -303,6 +303,25 @@ fn reads_a_feature_class_with_fields_nulls_and_holes() {
 }
 
 #[test]
+fn a_field_name_that_isnt_utf16_is_said() {
+    let fields = [F::Oid, F::Text("Qname")];
+    let rows = vec![vec![V::Text(Some("a"))]];
+    let notice = "of its field names, aliases or coordinate system couldn't be read";
+    // A clean name: nothing said.
+    let files = geodatabase(vec![("Clean", table(0, &fields, &rows))]);
+    let layers = read_files(&files).unwrap();
+    assert!(!layers[0].1.messages.iter().any(|m| m.contains(notice)), "{:?}", layers[0].1.messages);
+    // Its first character made a lone surrogate (D800): replaced, and said with the count.
+    let (mut t, x) = table(0, &fields, &rows);
+    let at = t.windows(10).position(|w| w == utf16_bytes("Qname").as_slice()).unwrap();
+    t[at..at + 2].copy_from_slice(&[0x00, 0xD8]);
+    let layers = read_files(&geodatabase(vec![("Broken", (t, x))])).unwrap();
+    let (ds, report) = &layers[0];
+    assert_eq!(ds.fields[1].name, "\u{FFFD}name");
+    assert!(report.messages.iter().any(|m| m == &format!("1 character {notice}: replaced or left out")), "{:?}", report.messages);
+}
+
+#[test]
 fn a_multipatch_is_its_footprint_with_its_heights() {
     // A 10 m box from z 400 to 410: its roof as two triangles (a strip), a floor ring, and walls,
     // which show nothing from above.

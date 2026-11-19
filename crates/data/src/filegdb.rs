@@ -316,6 +316,10 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
     let table = Table::parse(t)?;
     let rows = row_offsets(x)?;
     let mut report = ReadReport::default();
+    if table.unreadable > 0 {
+        let chars = if table.unreadable == 1 { "1 character".to_string() } else { format!("{} characters", table.unreadable) };
+        report.messages.push(format!("{chars} of its field names, aliases or coordinate system couldn't be read: replaced or left out"));
+    }
     let layer_type = match table.shape {
         _ if table.geometry.is_none() => GeometryType::None,
         Shape::Point | Shape::Multipoint => GeometryType::Point,
@@ -661,6 +665,8 @@ struct Table {
     utf8: bool,
     /// How many fields have a bit in each row's null flags.
     nullable: usize,
+    /// Characters of its field names, aliases and coordinate system that couldn't be read.
+    unreadable: usize,
     /// The geometries carry Z values (which reading drops, but a multipatch keeps as fields).
     has_z: bool,
     /// The geometries carry M values (which reading drops).
@@ -699,13 +705,19 @@ impl Table {
             other => Shape::Other(other as u8),
         };
         let mut fields = Vec::with_capacity(count);
+        let mut unreadable = 0;
+        let mut text16 = |b: &[u8]| {
+            let (text, bad) = crate::io::utf16_text(b, false);
+            unreadable += bad;
+            text
+        };
         let mut geometry = None;
         for _ in 0..count {
             let field = (|| -> Option<(FieldDef, Option<GeomDef>)> {
                 let n = usize::from(c.u8()?);
-                let name = utf16(c.bytes(n * 2)?);
+                let name = text16(c.bytes(n * 2)?);
                 let n = usize::from(c.u8()?);
-                let alias = utf16(c.bytes(n * 2)?);
+                let alias = text16(c.bytes(n * 2)?);
                 let code = c.u8()?;
                 let kind = Kind::of(code)?;
                 let mut geom = None;
@@ -727,7 +739,7 @@ impl Table {
                         c.skip(1)?;
                         let flag = c.u8()?;
                         let n = usize::try_from(c.i16()?).ok()?;
-                        let wkt = utf16(c.bytes(n)?);
+                        let wkt = text16(c.bytes(n)?);
                         let g = c.u8()?;
                         let (z, m) = (g & 2 != 0, g & 4 != 0);
                         let (x0, y0, xy_scale) = (c.f64()?, c.f64()?, c.f64()?);
@@ -789,7 +801,7 @@ impl Table {
                 nullable += 1;
             }
         }
-        Ok(Table { fields, geometry, shape, utf8: flags & 0x100 != 0, nullable, has_z, has_m })
+        Ok(Table { fields, geometry, shape, utf8: flags & 0x100 != 0, nullable, unreadable, has_z, has_m })
     }
 
     fn field(&self, name: &str) -> Option<usize> {
