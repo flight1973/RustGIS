@@ -317,10 +317,12 @@ pub(crate) fn read_cpg(cpg: Option<&std::path::Path>, notes: &mut Vec<String>) -
     }
 }
 
-/// The `.cpg` at `cpg`, as [`crate::sidecar::Sidecars`] finds it beside a table.
+/// The `.cpg` at `cpg`, as [`crate::sidecar::Sidecars`] finds it beside a table: anything there
+/// but a regular file (a folder, a named pipe) is an error, never opened for reading
+/// ([`crate::provenance::open_regular`]).
 fn try_read_cpg(cpg: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
-    match crate::provenance::open(cpg) {
+    match crate::provenance::open_regular(cpg) {
         Ok(file) => {
             let mut bytes = Vec::new();
             (&file).take(MAX_CPG_BYTES as u64 + 1).read_to_end(&mut bytes)?;

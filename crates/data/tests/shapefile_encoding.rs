@@ -271,6 +271,33 @@ fn unreadable_cpg_reports_fallback_without_preventing_native_imports() {
     }
 }
 
+/// A named pipe at `places.cpg` (no writer, so opening it to read would wait forever) is never
+/// opened: both readers return at once, saying the `.cpg` couldn't be read.
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_at_the_cpg_is_reported_without_waiting_on_it() {
+    use rustgis_data::source::FeatureSource;
+    let dir = tempfile::tempdir().unwrap();
+    for (name, bytes) in parts("München".as_bytes(), 0, None) {
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+    let status = std::process::Command::new("mkfifo").arg(dir.path().join("places.cpg")).status().unwrap();
+    assert!(status.success());
+    let path = dir.path().join("places.shp");
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (ds, report) = io::read_path(&path).unwrap();
+        let src = open_shp(&path, "places").unwrap();
+        let _ = done.send((ds.value(0, 0).clone(), report.messages, src.info().notes.clone()));
+    });
+    // A read that opened the pipe would never finish: the deadline makes that a failure, not a hang.
+    let (value, messages, notes) =
+        finished.recv_timeout(std::time::Duration::from_secs(60)).expect("reading beside a named pipe must not wait on it");
+    assert_eq!(value, Value::Text("München".into()));
+    assert!(messages.iter().any(|m| m.contains(".cpg") && m.contains("not a regular file")), "{messages:?}");
+    assert!(notes.iter().any(|m| m.contains(".cpg") && m.contains("not a regular file")), "{notes:?}");
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn shapefile_decodes_legacy_field_names_in_all_readers() {

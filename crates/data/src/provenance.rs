@@ -211,6 +211,35 @@ pub fn open(path: impl AsRef<Path>) -> std::io::Result<File> {
     Ok(file)
 }
 
+/// As [`open`], for a file that may be anything at its path (a sidecar found by name, which can
+/// be a folder or a named pipe): only a regular file is opened, and anything else is an error
+/// ("not a regular file") given without waiting on it. On Unix it is opened without blocking (a
+/// named pipe with no writer would hold the open forever) and checked again through the open
+/// handle, so something put there between the check and the open is caught too.
+pub(crate) fn open_regular(path: impl AsRef<Path>) -> std::io::Result<File> {
+    let path = path.as_ref();
+    let not_regular = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file");
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_regular());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(not_regular());
+    }
+    if active() {
+        observe(path, Some(&metadata), None);
+    }
+    Ok(file)
+}
+
 /// Reads once; a cheap digest uses those bytes, never a second file read.
 pub fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
