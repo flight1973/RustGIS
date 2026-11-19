@@ -1640,6 +1640,7 @@ fn subtypes(s: &mut Session, p: &Json) -> CmdResult {
             .map(|o| o.iter().map(|(k, v)| (k.clone(), Value::from_json(v))).collect())
             .unwrap_or_default();
         for (field, value) in &defaults {
+            case_twins_refused(&l.dataset, field, "a subtype default")?;
             if let Some(ty) = l.dataset.field_index(field).and_then(|i| l.dataset.fields.get(i)).map(|f| f.ty)
                 && super::edit::non_finite_input(value, ty)
             {
@@ -1725,6 +1726,7 @@ fn attribute_rule(s: &mut Session, p: &Json) -> CmdResult {
     let field = match kind {
         RuleKind::Calculation => {
             let fl = ps(p, "field").ok_or("a calculation rule sets a field")?;
+            case_twins_refused(&l.dataset, fl, "a calculation rule")?;
             super::edit::Calculation::parse(&expression, &l.dataset)?;
             l.dataset
                 .field_index(fl)
@@ -1759,6 +1761,7 @@ fn contingent(s: &mut Session, p: &Json) -> CmdResult {
         .iter()
         .map(|v| {
             let n = v.as_str().ok_or("fields are names")?;
+            case_twins_refused(&l.dataset, n, "contingent values")?;
             l.dataset
                 .field_index(n)
                 .and_then(|i| l.dataset.fields.get(i))

@@ -153,6 +153,8 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
     }
     let l = s.map_mut().layer_mut(id).ok_or("no layer")?;
     let fi = if create { l.dataset.ensure_field(field, FieldType::Double) } else { existing.ok_or("no field")? };
+    // The reply names the field written as it is named, not as it was asked for.
+    let written = l.dataset.fields.get(fi).map(|f| f.name.clone()).ok_or("no field")?;
     let mut changes = Vec::with_capacity(values.len());
     for (row, value) in values {
         let f = l.dataset.features.get_mut(row).ok_or("no feature")?;
@@ -161,5 +163,5 @@ pub fn run(s: &mut Session, p: &Json) -> CmdResult {
         changes.push(crate::cmd::design::Change { before: Some(before), row: Some(row) });
     }
     crate::cmd::design::apply(s, id, changes)?;
-    Ok(json!({"rows": rows.len(), "nulls": nulls, "field": field}))
+    Ok(json!({"rows": rows.len(), "nulls": nulls, "field": written}))
 }

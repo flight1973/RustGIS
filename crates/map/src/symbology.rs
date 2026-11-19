@@ -3328,6 +3328,13 @@ impl Labeling {
     /// name-like one when Default's is gone too (a field deleted, a style from another layer, a
     /// service's fields changed). The class is kept, with its clause and text symbol.
     pub fn repoint_missing_fields(&mut self, ds: &Dataset) {
+        self.repoint_fields(ds, |_| false);
+    }
+
+    /// As [`Labeling::repoint_missing_fields`], and also every class on a field name `gone` says
+    /// was deleted, even when the name now finds another field (one named the same but for case)
+    /// or its text is an expression. Returns the names of the classes `gone` moved.
+    pub fn repoint_fields(&mut self, ds: &Dataset, gone: impl Fn(&str) -> bool) -> Vec<String> {
         // Default's field, or (it is gone too, cleared by a refresh) the first name-like one, so
         // a class isn't left on no field.
         let fallback = match ds.field_index(&self.default.field) {
@@ -3335,11 +3342,19 @@ impl Labeling {
             None => LabelClass::default_for(ds).field,
         };
         // (A class whose text is an expression that still reads keeps its own, which it doesn't
-        // label from.)
+        // label from, unless it was deleted.)
         let by_text = |c: &LabelClass| c.by.text.as_deref().is_some_and(|t| rustgis_data::query::parse_fields(t, ds).is_ok());
-        for c in self.classes.iter_mut().filter(|c| ds.field_index(&c.field).is_none() && !by_text(c)) {
-            c.field.clone_from(&fallback);
+        let mut moved = Vec::new();
+        for c in &mut self.classes {
+            // A class on a deleted field labels another field now, even if it's named alike.
+            if gone(&c.field) {
+                c.field.clone_from(&fallback);
+                moved.push(c.name.clone());
+            } else if ds.field_index(&c.field).is_none() && !by_text(c) {
+                c.field.clone_from(&fallback);
+            }
         }
+        moved
     }
 
     /// Off, on the first text field that looks like a name, with only its Default class.

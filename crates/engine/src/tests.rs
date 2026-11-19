@@ -418,7 +418,7 @@ fn a_standalone_table_is_edited_with_the_edit_commands() {
     let rows = s.project.tables[1].dataset.features.len();
     let depth = s.undo_depth();
     let err = s.run("edit.addFeature", &json!({"table": "twins", "attributes": {"Name": "A", "NAME": "B"}})).unwrap_err();
-    assert!(err.contains("matches more than one field"), "{err}");
+    assert!(err.contains("is ambiguous: case-insensitive collision between 'Name' and 'name'"), "{err}");
     assert_eq!(s.project.tables[1].dataset.features.len(), rows);
     assert_eq!(s.undo_depth(), depth);
     let mark = s.notice_mark();
