@@ -632,8 +632,9 @@ fn pdf_doc_char(c: u8) -> Option<char> {
 /// (each the replacement character, U+FFFD, or left out). UTF-16 after a byte-order mark (FE FF,
 /// big-endian, as RustGIS writes one; or FF FE), UTF-8 after its own (EF BB BF), either with its
 /// language escapes taken out ([`without_language_escapes`]). Without a mark, UTF-8 where the
-/// bytes are that (as some writers use, though the standard says PDFDocEncoding); else
-/// PDFDocEncoding ([`pdf_doc_char`]), a byte it defines no character for replaced.
+/// bytes are that (as some writers use, though the standard says PDFDocEncoding), its characters
+/// below U+0080 read as PDFDocEncoding; else PDFDocEncoding ([`pdf_doc_char`]). Either way a byte
+/// PDFDocEncoding defines no character for is replaced.
 fn text_string(b: &[u8]) -> (String, usize) {
     let (text, bad) = if let Some(rest) = b.strip_prefix(&[0xFE, 0xFF]) {
         crate::io::utf16_text(rest, true)
@@ -650,7 +651,20 @@ fn text_string(b: &[u8]) -> (String, usize) {
         }
         (text, bad)
     } else if let Ok(s) = std::str::from_utf8(b) {
-        return (s.to_string(), 0);
+        // A character below U+0080 is its one byte in UTF-8, which PDFDocEncoding reads its own
+        // way there: 18–1F are accents, and 00–08, 0B, 0C, 0E–17 and 7F are no character.
+        let mut bad = 0;
+        let text = s
+            .chars()
+            .map(|c| match u8::try_from(c) {
+                Ok(byte) if byte < 0x80 => pdf_doc_char(byte).unwrap_or_else(|| {
+                    bad += 1;
+                    char::REPLACEMENT_CHARACTER
+                }),
+                _ => c,
+            })
+            .collect();
+        return (text, bad);
     } else {
         let chars: Vec<Option<char>> = b.iter().map(|&c| pdf_doc_char(c)).collect();
         let bad = chars.iter().filter(|c| c.is_none()).count();
@@ -1015,6 +1029,13 @@ mod tests {
         // bullet, 0xA0 the euro sign, 0x18 a breve), and a byte it defines no character for
         // (0xAD) replaced.
         assert_eq!(read(&[b'G', 0xFF, 0xE9, 0x80, 0xA0, 0x18, 0xAD]), ("Gÿé•€˘\u{FFFD}".into(), 1));
+        // Without a mark and UTF-8: the bytes below 0x80 are still PDFDocEncoding's, so 0x18 is a
+        // breve and 0x7F, which it defines no character for, is replaced and counted, beside
+        // UTF-8's own characters; tab, line feed and carriage return are kept.
+        assert_eq!(read(b"G\x18"), ("G\u{02D8}".into(), 0));
+        assert_eq!(read(b"G\x7F"), ("G\u{FFFD}".into(), 1));
+        assert_eq!(read(&[b'G', 0x18, 0xC2, 0xB0]), ("G\u{02D8}°".into(), 0));
+        assert_eq!(read(b"a\tb\nc\r"), ("a\tb\nc\r".into(), 0));
     }
 
     #[test]
