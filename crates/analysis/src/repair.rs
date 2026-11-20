@@ -380,8 +380,9 @@ fn polygon(
     if size.saturating_mul(OVERLAY_COST) > budget {
         return Outcome::Kept(Kept::Work);
     }
-    // Even-Odd's duplicate keys only where [`distinct_rings`] makes them: not for one part with one
-    // hole or none, which can have no duplicate.
+    // Even-Odd's duplicate keys aren't charged for one part with one hole or none, which can have
+    // no duplicate ([`distinct_rings`] makes none). Otherwise they are, an upper bound: rings and
+    // parts of sizes no other shares get no key either.
     let keyed = !matches!(parts.as_slice(), [rings] if rings.len() < 3);
     let per_vertex = if rule == Rule::EvenOdd && keyed { OVERLAY_BYTES + EVEN_ODD_BYTES } else { OVERLAY_BYTES };
     if !has_room(size.saturating_mul(per_vertex)) {

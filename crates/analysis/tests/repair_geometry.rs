@@ -1215,8 +1215,10 @@ fn even_odd_keeps_what_lies_inside_an_odd_number_of_rings() {
     // As under the default: a hole equal to its exterior ring leaves no area (they aren't of one
     // role, so they aren't duplicates), and so does a ring with all its points on one line.
     for g in [poly(&[SQUARE, SQUARE]), poly(&[&[(0., 0.), (5., 5.), (10., 10.), (0., 0.)]])] {
-        let (got, repairs, _) = one_by("Even-Odd", g.clone());
+        let (got, repairs, messages) = one_by("Even-Odd", g.clone());
         assert_eq!((got, repairs.as_str()), (None, "no_area"), "{g:?}");
+        // No duplicate was left out, so none is said.
+        assert!(!messages.iter().any(|m| m.contains("duplicate ring")), "{g:?}: {messages:?}");
     }
     // Two holes covering the square, one with a vertex mid-edge: one is a duplicate, left out, the
     // other cancels the square, so no area is left, and the duplicate is still said.
