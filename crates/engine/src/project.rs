@@ -72,6 +72,7 @@ pub const READ_FORMAT: u32 = 2;
 /// their payload, so a format-2 reader without them refuses instead of discarding their fields.
 pub const CAPABILITIES: &[&str] = &[
     "terrain-block",
+    "terrain-block-shape",
     "terrain-water",
     "terrain-water-shore",
     "shaded-relief-effects",
@@ -86,7 +87,10 @@ pub const CAPABILITIES: &[&str] = &[
     SIZE_BY_CAPABILITY,
     "picture-markers",
     "layout-element-ink",
+    "layout-element-wrap",
+    "layout-chart-data",
     "field-generation",
+    "offline-map-area-id",
     "crs-wkt",
     "zarr-window",
 ];
@@ -525,6 +529,8 @@ impl From<TableFile> for Table {
                 crs_incomplete,
                 zm_dropped,
                 windowed: false,
+                // Saved in longitude/latitude, as `Dataset`'s own saving writes them.
+                held_in: rustgis_data::raster::Crs::LonLat,
             },
         }
     }
@@ -1700,6 +1706,7 @@ impl Project {
             }
         })?;
         let mut area_ids = std::collections::HashSet::new();
+        let mut offline_map_ids = std::collections::HashSet::new();
         if (!p.origin_id.is_empty() && !valid_field_id(&p.origin_id))
             || p.field_origin.as_ref().is_some_and(|origin| {
                 !valid_field_id(&origin.project)
@@ -1710,6 +1717,7 @@ impl Project {
                 (!area.id.is_empty() && (!valid_field_id(&area.id) || !area_ids.insert(area.id.as_str())))
                     || (!area.generation.is_empty() && !valid_field_id(&area.generation))
             })
+            || p.maps.iter().any(|map| map.offline_area_id.as_deref().is_some_and(|id| !valid_field_id(id) || !offline_map_ids.insert(id)))
         {
             return Err("not a RustGIS project: an offline field identity is invalid or duplicated".into());
         }
@@ -2455,6 +2463,7 @@ impl Durable for Table {
             crs_incomplete: _,
             zm_dropped: _,
             windowed: _,
+            held_in: _,
         } = dataset;
         if let Some(v) = provenance {
             p.string(Leaf::Table, v, true, rustgis_map::paths::is_local(v));

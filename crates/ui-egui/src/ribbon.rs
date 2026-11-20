@@ -335,7 +335,13 @@ fn tab_strip(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
             let icon = if app.ui.ribbon_minimized { "chevron_down" } else { "up" };
             icons::paint(ui.painter(), cr.shrink(5.0), icon, t.text_dim, t.accent);
-            let tip = if app.ui.ribbon_minimized { tl!("Expand the ribbon (Ctrl+F1)") } else { tl!("Collapse the ribbon (Ctrl+F1)") };
+            let title = if app.ui.ribbon_minimized { tl_raw!("Expand the ribbon") } else { tl_raw!("Collapse the ribbon") };
+            let shortcut = crate::keymap::shortcut_text(ui.ctx(), app, "ui.ribbon", &Value::Null);
+            let tip = if shortcut.is_empty() {
+                crate::i18n::fmt("{title}", &[("title", title)])
+            } else {
+                crate::i18n::fmt("{title} ({shortcut})", &[("title", title), ("shortcut", &shortcut)])
+            };
             if cresp.on_hover_text(tip).clicked() {
                 let _ = app.run("ui.ribbon", Value::Null);
             }
@@ -1868,18 +1874,31 @@ fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
     }
     ui.separator();
     let name = ui.label(tl!("Measured grid's coordinate system"));
-    ui.horizontal(|ui| {
-        let edit = ui.add(egui::TextEdit::singleline(&mut app.ui.graticule_crs_input).hint_text("2056").desired_width(90.0)).on_hover_text(
-            tl!("An EPSG code, WKT or a PROJ string; empty: the map's own when it is projected, else the UTM zone at the view's centre"),
+    ui.vertical(|ui| {
+        let recent = app.ui.recent_crs.clone();
+        let t = crate::theme::Tokens::get(ui.ctx());
+        let (edit, taken) = crate::crspicker::crs_box(
+            ui,
+            "graticule",
+            &mut app.ui.graticule_crs_input,
+            &recent,
+            crate::crspicker::Offer::Projected,
+            150.0,
+            tl!("name or code"),
+            &t,
         );
+        let edit = edit.on_hover_text(tl!(
+            "A name or EPSG code, WKT or a PROJ string; empty: the map's own when it is projected, else the UTM zone at the view's centre"
+        ));
         // Named by the label above it, for a screen reader (the hint is only a placeholder).
         let edit = edit.labelled_by(name.id);
         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if ui.button(tl!("Use System")).clicked() || enter {
+        if ui.button(tl!("Use System")).clicked() || enter || taken {
             let typed = app.ui.graticule_crs_input.trim();
             let crs = if typed.is_empty() { String::new() } else { crate::dialogs::typed_crs(typed) };
             match app.run("map.graticule", json!({"type": "measured", "crs": crs})) {
                 Ok(_) => {
+                    app.remember_crs_if_listed(&crs);
                     app.ui.graticule_crs_input.clear();
                     ui.close();
                 }
@@ -3532,7 +3551,13 @@ fn plugins_tab(app: &mut RustGisApp, ui: &mut Ui) {
             for c in &m.commands {
                 let icon = if crate::icons::ALL.contains(&c.icon.as_str()) { c.icon.as_str() } else { "plugin" };
                 let id = rustgis_engine::plugins::command_id(&m.id, &c.id);
-                big(ui, app, icon, m.translate(lang, &c.label), m.translate(lang, &c.help), &id, Value::Null, false, false);
+                let (help, kept) = login_help(ui.ctx(), c.login, m.translate(lang, &c.help));
+                let resp = big(ui, app, icon, m.translate(lang, &c.label), &help, &id, Value::Null, false, false);
+                if let Some(kept) = kept {
+                    let t = Tokens::get(ui.ctx());
+                    let behind = crate::widgets::bg_fill(&resp, false, &t).unwrap_or(t.ribbon);
+                    login_key(ui, crate::widgets::big_icon_rect(resp.rect), kept, behind);
+                }
             }
             for t in &m.tools {
                 let id = rustgis_engine::plugins::command_id(&m.id, &t.id);
@@ -3573,27 +3598,43 @@ fn plugin_entry(
 ) {
     use rustgis_engine::plugins::{Entry, Layout, command_id};
     let open = panel_open(app, &m.id);
-    let mut show = |icon: &str, label: &str, help: &str, id: &str, params: Value| {
+    // For the sign-in state: `show` borrows `ui` until its last use.
+    let ctx = ui.ctx().clone();
+    // Draws the entry; returns the rectangle of its icon and the colour behind it. A menu row shows
+    // `help` only with `tip` (a command's sign-in line), as other menu rows show none.
+    let mut show = |icon: &str, label: &str, help: &str, id: &str, params: Value, tip: bool| -> (Rect, egui::Color32) {
         let label = if layout != Some(Layout::Large) && label.contains('\n') {
             std::borrow::Cow::Owned(label.replace('\n', " "))
         } else {
             std::borrow::Cow::Borrowed(label)
         };
         let checked = open && id == "ui.pane.plugin";
+        let t = Tokens::get(ui.ctx());
         match layout {
             Some(Layout::Large) => {
-                big(ui, app, icon, &label, help, id, params, checked, false);
+                let resp = big(ui, app, icon, &label, help, id, params, checked, false);
+                (crate::widgets::big_icon_rect(resp.rect), crate::widgets::bg_fill(&resp, checked, &t).unwrap_or(t.ribbon))
             }
             Some(Layout::Small) => {
-                small(ui, app, icon, &label, help, id, params, checked);
+                let resp = small(ui, app, icon, &label, help, id, params, checked);
+                (crate::widgets::small_icon_rect(resp.rect), crate::widgets::bg_fill(&resp, checked, &t).unwrap_or(t.ribbon))
             }
-            None => menu_item(ui, app, icon, &label, id, params),
+            None => {
+                let resp = crate::widgets::menu_item_response(ui, app, icon, &label, id, params);
+                let resp = if tip { resp.on_hover_text(help) } else { resp };
+                let behind = crate::widgets::row_fill(resp.enabled(), &resp, &t).unwrap_or(ui.visuals().window_fill());
+                (crate::widgets::menu_icon_rect(ui, &resp), behind)
+            }
         }
     };
     match m.entry(entry) {
         Some(Entry::Command(c)) => {
             let icon = if crate::icons::ALL.contains(&c.icon.as_str()) { c.icon.as_str() } else { "plugin" };
-            show(icon, m.translate(lang, &c.label), m.translate(lang, &c.help), &command_id(&m.id, &c.id), Value::Null);
+            let (help, kept) = login_help(&ctx, c.login, m.translate(lang, &c.help));
+            let (ic, behind) = show(icon, m.translate(lang, &c.label), &help, &command_id(&m.id, &c.id), Value::Null, kept.is_some());
+            if let Some(kept) = kept {
+                login_key(ui, ic, kept, behind);
+            }
         }
         Some(Entry::Tool(t)) => {
             let name = m.translate(lang, &t.name);
@@ -3602,14 +3643,81 @@ fn plugin_entry(
             } else {
                 std::borrow::Cow::Borrowed(name)
             };
-            show("toolbox", &label, m.translate(lang, &t.summary), "ui.gp.open", json!({"tool": command_id(&m.id, &t.id)}));
+            show("toolbox", &label, m.translate(lang, &t.summary), "ui.gp.open", json!({"tool": command_id(&m.id, &t.id)}), false);
         }
         Some(Entry::Panel(d)) => {
             let (icon, label, help) = panel_button(m, d, lang);
-            show(icon, &label, &help, "ui.pane.plugin", json!({"id": m.id}));
+            show(icon, &label, &help, "ui.pane.plugin", json!({"id": m.id}), false);
         }
         None => {}
     }
+}
+
+/// A plugin command's `help` with, when it needs the sign-in `login`, a line saying which and
+/// whether it is kept; and whether it is, for its key.
+fn login_help<'a>(
+    ctx: &egui::Context,
+    login: Option<rustgis_engine::plugins::Login>,
+    help: &'a str,
+) -> (std::borrow::Cow<'a, str>, Option<bool>) {
+    let Some(login) = login else { return (std::borrow::Cow::Borrowed(help), None) };
+    let kept = login_kept(ctx, login);
+    let gap = if help.is_empty() { "" } else { "\n\n" };
+    (std::borrow::Cow::Owned(format!("{help}{gap}{}", login_text(login, kept))), Some(kept))
+}
+
+/// Whether the sign-in `login` is kept: an Earthdata token that hasn't expired (one remembered on
+/// this computer is read at launch); a Copernicus Data Space sign-in, or one remembered that a request can still use; an ArcGIS
+/// session that renews itself or hasn't expired. Read from what the app keeps in memory, never
+/// from the system's credential store, and once a frame however many buttons ask.
+fn login_kept(ctx: &egui::Context, login: rustgis_engine::plugins::Login) -> bool {
+    use rustgis_engine::plugins::Login;
+    use rustgis_engine::render::rustgis_tiles::{arcgis_auth, copernicus, earthdata};
+    let id = egui::Id::unique("plugin_login_kept");
+    let pass = ctx.cumulative_pass_nr();
+    let slot = match login {
+        Login::Earthdata => 0,
+        Login::Copernicus => 1,
+        Login::Arcgis => 2,
+    };
+    let mut known = ctx.data(|d| d.get_temp::<(u64, [Option<bool>; 3])>(id)).filter(|(p, _)| *p == pass).map_or([None; 3], |(_, k)| k);
+    if let Some(kept) = known[slot] {
+        return kept;
+    }
+    let kept = match login {
+        // A remembered token is read into the session at launch; remembered with none in the
+        // session means one that expired or was damaged and couldn't be deleted.
+        Login::Earthdata => earthdata::has_token() && !earthdata::token_expired(),
+        Login::Copernicus => copernicus::signed_in().is_some() || copernicus::is_usable_remembered_now() == Some(true),
+        Login::Arcgis => arcgis_auth::kept(),
+    };
+    known[slot] = Some(kept);
+    ctx.data_mut(|d| d.insert_temp(id, (pass, known)));
+    kept
+}
+
+/// The tooltip line of a command that needs the sign-in `login`, `kept` or not.
+fn login_text(login: rustgis_engine::plugins::Login, kept: bool) -> String {
+    use rustgis_engine::plugins::Login;
+    let (what, place) = match login {
+        Login::Earthdata => (tl_raw!("the Earthdata Login token"), tl_raw!("Home › Add › Web Data › NASA Earthaccess")),
+        Login::Copernicus => (tl_raw!("a Copernicus Data Space sign-in"), tl_raw!("Home › Add › Web Data › Copernicus Data Space")),
+        Login::Arcgis => (tl_raw!("an ArcGIS sign-in"), tl_raw!("Home › Add › Add Data › From Service")),
+    };
+    if kept {
+        crate::i18n::fmt("Needs {what}: kept.", &[("what", what)])
+    } else {
+        crate::i18n::fmt("Needs {what}, which isn't given: {place}.", &[("what", what), ("place", place)])
+    }
+}
+
+/// The key over the lower-right corner of a command's icon `ic`: green when its sign-in is kept,
+/// red and struck through when it is missing, on a disc of `behind`, the colour behind the button.
+fn login_key(ui: &Ui, ic: Rect, kept: bool, behind: egui::Color32) {
+    let fill = if kept { egui::Color32::from_rgb(0x1E, 0x9E, 0x4A) } else { egui::Color32::from_rgb(0xD6, 0x33, 0x33) };
+    let side = (ic.width() * 0.5).max(10.0);
+    let r = Rect::from_min_size(ic.max - vec2(side * 0.8, side * 0.8), vec2(side, side));
+    icons::key_badge(ui.painter(), r, fill, egui::Color32::from_gray(40), behind, !kept);
 }
 
 /// Popup entries always use menu rows; nested menus cascade rather than opening another ribbon.
@@ -4033,21 +4141,38 @@ fn start_projection_menu(app: &mut RustGisApp, ui: &mut Ui) {
     big_form_menu(ui, app, "basemap", &label, "The projection the map opens in.", move |ui, app| {
         let mut items: Vec<(String, String)> = vec![("mercator".into(), "Web Mercator".into()), ("globe".into(), "Globe".into())];
         items.extend(rustgis_engine::map::projection::PRESETS.iter().map(|(id, label, _)| (id.to_string(), label.to_string())));
-        for (id, label) in items {
-            if ui.add(egui::Button::selectable(is_projection(&current, &id), tl!(label.as_str()))).clicked() {
-                let _ = app.run("ui.startup", json!({"projection": id}));
-                ui.close();
+        // While a search is typed its list offers the matching ones of these, and the menu stays
+        // within the window.
+        if app.ui.start_projection_input.trim().is_empty() || !crate::crspicker::list_is_shown(ui.ctx()) {
+            for (id, label) in items {
+                if ui.add(egui::Button::selectable(is_projection(&current, &id), tl!(label.as_str()))).clicked() {
+                    let _ = app.run("ui.startup", json!({"projection": id}));
+                    ui.close();
+                }
             }
+            ui.separator();
         }
-        ui.separator();
-        ui.label(tl!("EPSG or ESRI code"));
-        ui.horizontal(|ui| {
-            let edit = ui.add(egui::TextEdit::singleline(&mut app.ui.start_projection_input).hint_text("3010").desired_width(90.0));
+        let name = ui.label(tl!("Search by name or code"));
+        ui.vertical(|ui| {
+            let recent = app.ui.recent_crs.clone();
+            let t = crate::theme::Tokens::get(ui.ctx());
+            let (edit, taken) = crate::crspicker::crs_box(
+                ui,
+                "startProjection",
+                &mut app.ui.start_projection_input,
+                &recent,
+                crate::crspicker::Offer::Map,
+                150.0,
+                tl!("3010, lv95"),
+                &t,
+            );
+            let edit = edit.labelled_by(name.id);
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button(tl!("Use")).clicked() || enter {
+            if ui.button(tl!("Use")).clicked() || enter || taken {
                 let code = crate::dialogs::typed_crs(&app.ui.start_projection_input);
                 match app.run("ui.startup", json!({"projection": code})) {
                     Ok(_) => {
+                        app.remember_crs_if_listed(&code);
                         app.ui.start_projection_input.clear();
                         ui.close();
                     }
@@ -5506,6 +5631,20 @@ mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable;
 
+    /// A plugin command's sign-in line says which sign-in, and where to give it when it's missing
+    /// (#2378).
+    #[test]
+    fn login_tooltip_names_the_sign_in_and_where_to_give_it() {
+        use rustgis_engine::plugins::Login;
+        assert_eq!(login_text(Login::Earthdata, true), "Needs the Earthdata Login token: kept.");
+        assert_eq!(
+            login_text(Login::Earthdata, false),
+            "Needs the Earthdata Login token, which isn't given: Home › Add › Web Data › NASA Earthaccess."
+        );
+        assert!(login_text(Login::Copernicus, false).ends_with("Home › Add › Web Data › Copernicus Data Space."));
+        assert!(login_text(Login::Arcgis, false).ends_with("Home › Add › Add Data › From Service."));
+    }
+
     /// The sample with Cities selected, recording the steps run from here on.
     fn cities() -> RustGisApp {
         let mut app = RustGisApp::with_sample();
@@ -5574,6 +5713,18 @@ mod tests {
             "{:?}",
             h.state().session.notices.last()
         );
+        // Found by name in the open menu: a click on the row uses it and remembers it.
+        // (The menu is still open: a refused system leaves it so.)
+        h.state_mut().ui.graticule_crs_input.clear();
+        let field = || egui::accesskit::Role::TextInput;
+        h.get_by_role_and_label(field(), "Measured grid's coordinate system").click();
+        h.run();
+        h.get_by_role_and_label(field(), "Measured grid's coordinate system").type_text("utm 33n");
+        h.run();
+        h.get_by_label_contains("WGS 84 / UTM zone 33N").click();
+        h.run();
+        assert_eq!(h.state().session.map().graticule_crs.as_deref(), Some("EPSG:32633"));
+        assert_eq!(h.state().ui.recent_crs.first().map(String::as_str), Some("EPSG:32633"));
     }
 
     /// The language list names every language in English while the interface is English, with the

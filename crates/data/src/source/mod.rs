@@ -17,6 +17,7 @@ pub(crate) mod external;
 pub mod fgb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
+pub mod geodatabase;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod geojson;
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,6 +35,7 @@ pub mod pgconn;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod postgis;
 pub mod remote;
+pub mod sdefile;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod shp;
 #[cfg(not(target_arch = "wasm32"))]
@@ -364,6 +366,12 @@ pub trait FeatureSource: Send + Sync {
         Err(DataError::Unsupported("a source that can't be read a chunk at a time".into()))
     }
     fn info(&self) -> &SourceInfo;
+    /// The coordinate system of the features it gives: longitude/latitude, which every source
+    /// converts its own to today. Once sources hand over their own coordinates (#2032 C2), a
+    /// source says its system here, and one that wraps another says the other's.
+    fn coord_crs(&self) -> crate::raster::Crs {
+        crate::raster::Crs::LonLat
+    }
     /// Whether features were left out of every read because the coordinate system the source
     /// declares can't place them, so that defining its projection again can't bring them back.
     fn lost_to_crs(&self) -> bool {
@@ -617,6 +625,10 @@ impl FeatureSource for Fetching {
         self.0.info()
     }
 
+    fn coord_crs(&self) -> crate::raster::Crs {
+        self.0.coord_crs()
+    }
+
     fn lost_to_crs(&self) -> bool {
         self.0.lost_to_crs()
     }
@@ -667,6 +679,7 @@ fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, 
         unread_dates: unread_dates.clone(),
         rounded_dates: rounded.clone(),
         extrusion: None,
+        losses: Vec::new(),
     };
     let null_text = null_text_note(&info.fields, &null_text);
     report.messages.extend(unread_dates.into_iter().chain(rounded).chain(null_text).chain(notes).map(|n| format!("{}: {n}", info.name)));

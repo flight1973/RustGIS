@@ -29,6 +29,7 @@ mod connectionui;
 mod connectui;
 mod coordreadout;
 mod copernicusui;
+mod crspicker;
 mod cswui;
 mod cubesui;
 mod diagnosticlog;
@@ -66,6 +67,7 @@ mod localagents;
 mod mapgpu;
 mod mapmenu;
 mod mapview;
+mod markerimages;
 mod measure_units;
 mod modelbuilder;
 mod navui;
@@ -409,6 +411,9 @@ pub struct Services {
     /// Offers bytes as a download named `file_name`; success means submission to the host's
     /// download mechanism. Browsers do not expose confirmation that the file was saved.
     pub download: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
+    /// Starts saving a project through the phone's native picker. The shell reports the
+    /// eventual result through [`RustGisApp::complete_project_save`].
+    pub save_project: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
     pub inbox: Option<Inbox>,
     /// Reads a saved preference (`language`, …).
     pub load_pref: Option<Box<dyn Fn(&str) -> Option<String>>>,
@@ -453,6 +458,10 @@ pub struct Services {
     /// Online and RustGIS's own app) in a pop-up window, putting who signed in, or why not, in the
     /// slot (the browser; the desktop runs `arcgis.signIn`).
     pub arcgis_sign_in: Option<Box<dyn Fn(String, String, Slot<Result<String, String>>)>>,
+    /// Signs in to Copernicus Data Space with a username, a password and a one-time code (blank
+    /// for an account without two-factor authentication), putting who signed in, or why not, in
+    /// the slot (the browser, which sends the request itself; the desktop runs `copernicus.login`).
+    pub copernicus_sign_in: Option<Box<dyn Fn(String, String, String, Slot<Result<String, String>>)>>,
 }
 
 /// A new private folder for one print job: unique, created fresh (never an existing path) and,
@@ -819,6 +828,9 @@ pub struct UiState {
     pub start_projection_input: String,
     /// The coordinate system typed in View › Graticule's menu for the measured grid.
     pub graticule_crs_input: String,
+    /// The coordinate systems last chosen in a coordinate system box, the latest first
+    /// (`crspicker::RECENT_PREF`).
+    pub recent_crs: Vec<String>,
     /// Start-up preference: the extent the map opens on, `[minLon, minLat, maxLon, maxLat]`;
     /// `None` for the full extent.
     pub start_extent: Option<[f64; 4]>,
@@ -1086,6 +1098,7 @@ impl Default for UiState {
             start_projection: String::new(),
             start_projection_input: String::new(),
             graticule_crs_input: String::new(),
+            recent_crs: Vec::new(),
             start_extent: None,
             start_view: None,
             ribbon_minimized: false,
@@ -1213,17 +1226,50 @@ const CAPTURE_MIN_DPI: f64 = 36.0;
 pub const FIXES_KEPT: usize = 200_000;
 
 impl RustGisApp {
-    /// Keeps a position the shell reported: the last one in [`RustGisApp::position`], and each in
-    /// [`RustGisApp::fixes`] until an interface takes them (the oldest dropped past
-    /// [`FIXES_KEPT`]).
+    /// Updates the live position if this fix is recent and accurate enough. Queues every fix
+    /// for tracking and averaging (the oldest dropped past [`FIXES_KEPT`]).
     pub fn report_position(&mut self, fix: rustgis_engine::platform::Fix) {
-        self.position = Some(fix);
+        if self.position.is_none_or(|current| replaces_live_position(current, fix)) {
+            self.position = Some(fix);
+        }
         if self.fixes.len() >= FIXES_KEPT {
             self.fixes.pop_front();
             self.fixes_dropped += 1;
         }
         self.fixes.push_back(fix);
     }
+}
+
+/// Whether `fix` replaces the shown position: not when it is older, nor when it is much less
+/// accurate and the shown one is recent. Android compares its monotonic time, which a change to
+/// the wall clock doesn't move. iOS has only the fix's UTC timestamp: a fix a little behind the
+/// shown one is a late one and is dropped, while one further behind than the hold means the clock
+/// was set back, and it is taken rather than freezing the position until the clock catches up.
+fn replaces_live_position(current: rustgis_engine::platform::Fix, fix: rustgis_engine::platform::Fix) -> bool {
+    use std::time::Duration;
+    const HOLD: Duration = Duration::from_secs(5);
+
+    let age = match (current.elapsed_realtime_nanos, fix.elapsed_realtime_nanos) {
+        (Some(current), Some(new)) => match new.checked_sub(current) {
+            Some(age) => Duration::from_nanos(age),
+            None => return false,
+        },
+        (None, None) => match current.time.zip(fix.time) {
+            Some((current, new)) if new >= current => Duration::from_millis(new.abs_diff(current)),
+            Some((current, new)) => return Duration::from_millis(new.abs_diff(current)) >= HOLD,
+            None => return true,
+        },
+        _ => return true,
+    };
+    // At the usual one fix per second this bridges a brief GPS dropout. After five seconds a
+    // walking crew may already be outside the old fix's accuracy radius.
+    if age >= HOLD {
+        return true;
+    }
+    // Held back only when much worse (a network fix after a GPS one), so the usual jitter of a
+    // few metres in GPS accuracy still moves the marker with every fix.
+    let shown = current.accuracy.unwrap_or(f64::INFINITY);
+    fix.accuracy.unwrap_or(f64::INFINITY) <= shown * 2.0
 }
 
 pub struct RustGisApp {
@@ -1260,13 +1306,12 @@ pub struct RustGisApp {
     /// Whether the user wants the device's position shown: a shell that can report one (a
     /// phone's) starts and stops its positioning by this, and fills in [`RustGisApp::position`].
     pub locate: bool,
-    /// Where the device is, as the shell last reported it; `None` until it has, and again once
-    /// positioning is off. An interface draws it on the map and can capture at it.
+    /// The selected live fix for the marker and capture cross, if positioning is on and a fix
+    /// has arrived.
     pub position: Option<rustgis_engine::platform::Fix>,
-    /// Every position the shell reported since an interface last took them, oldest first (at most
-    /// [`FIXES_KEPT`]: the oldest go first). [`RustGisApp::position`] is only the last: a track
-    /// or an average needs each, including those that arrived together after the app was out of
-    /// sight.
+    /// Every fix the shell reported since an interface last took them, in arrival order (at most
+    /// [`FIXES_KEPT`]). A track or average needs each, including those that arrived together after
+    /// the app was out of sight.
     pub fixes: std::collections::VecDeque<rustgis_engine::platform::Fix>,
     /// Whether the interface wants positions while the app is out of sight too (a track being
     /// recorded): a phone's shell keeps them coming then, with the notice its system requires.
@@ -1699,6 +1744,13 @@ impl RustGisApp {
             self.ui.start_projection = p.code();
         }
         self.ui.start_extent = self.services.load_pref.as_ref().and_then(|load| load("start_extent")).and_then(|v| parse_extent(&v));
+        self.ui.recent_crs = self
+            .services
+            .load_pref
+            .as_ref()
+            .and_then(|load| load(crspicker::RECENT_PREF))
+            .map(|v| crspicker::from_pref(&v))
+            .unwrap_or_default();
         // How new single-band rasters are drawn (Save as Default in the raster Symbology pane).
         if let Some(d) = self.services.load_pref.as_ref().and_then(|load| load(RASTER_DEFAULTS_PREF))
             && let Ok(d) = serde_json::from_str::<rustgis_engine::map::RasterDefaults>(&d)
@@ -2093,6 +2145,11 @@ impl RustGisApp {
                 self.session.notify(error.clone(), true);
                 return Err(error);
             };
+            // Remembered once a file is picked, as on the desktop, not when the picker opened.
+            if let Some(crs) = options.get("crs").and_then(Value::as_str) {
+                let crs = crs.to_string();
+                self.remember_crs_if_listed(&crs);
+            }
             return self.open_bytes_with(name, bytes, Some(options));
         }
         if let Some(picked) = name.strip_prefix(DXF_PICK) {
@@ -2314,13 +2371,7 @@ impl RustGisApp {
             self.session.mark_unsaved();
             self.ui.history_jump = None;
         }
-        // On Android the file is written once the user has chosen its place, and the shell
-        // says then whether it was.
-        let offered = if cfg!(any(target_os = "android", target_os = "ios")) {
-            crate::i18n::fmt("Choose where to save {name}.", &[("name", &file)])
-        } else {
-            crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)])
-        };
+        let offered = crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)]);
         self.session.notify(offered, false);
         report.notify(&mut self.session);
         for note in construction_notes {
@@ -2470,6 +2521,30 @@ impl RustGisApp {
                 ),
                 false,
             );
+        }
+    }
+
+    /// Notes `code` as the latest coordinate system used, for the coordinate system boxes, and
+    /// keeps the list.
+    fn remember_crs(&mut self, code: &str) {
+        if crspicker::remember(&mut self.ui.recent_crs, code) {
+            self.save_pref(crspicker::RECENT_PREF, &self.ui.recent_crs.join("\n"));
+        }
+    }
+
+    /// Forgets the recently used coordinate systems.
+    pub(crate) fn clear_recent_crs(&mut self) {
+        self.ui.recent_crs.clear();
+        self.save_pref(crspicker::RECENT_PREF, "");
+    }
+
+    /// [`Self::remember_crs`] for a code the catalog lists (`EPSG:2056`), not a preset or a
+    /// PROJ string, which the coordinate system boxes offer otherwise or can't name.
+    pub(crate) fn remember_crs_if_listed(&mut self, code: &str) {
+        // As the catalog spells it, so `epsg: 2056` and `EPSG:2056` are one system.
+        if let Some(found) = rustgis_engine::data::raster::crs_search::lookup(code) {
+            let code = found.code.clone();
+            self.remember_crs(&code);
         }
     }
 
@@ -4215,6 +4290,8 @@ impl RustGisApp {
                     }
                     open("shapefile");
                 } else if let Some(path) = dialogs::pick_open(&["shp", "zip"], tl!("Shapefile")) {
+                    let text = text.to_string();
+                    self.remember_crs_if_listed(&text);
                     // Read on a thread of its own, as Add Data's other files are.
                     #[cfg(not(target_arch = "wasm32"))]
                     return readjob::run(self, "layer.addData", json!({"path": path, "crs": text}));
@@ -4328,6 +4405,9 @@ impl RustGisApp {
                     }
                     return r;
                 }
+            }
+            "ui.save" | "ui.saveAs" if self.services.save_project.is_some() => {
+                saveprompt::start_project_save(self)?;
             }
             // The browser can't write a file in place: Save downloads the project again under the
             // file name it was saved or opened as, and Save As (or a first Save) asks for one.
@@ -4965,17 +5045,20 @@ impl RustGisApp {
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
-                let (whole, lost) = if l.is_streamed() {
-                    let (ds, lost) = l.load_all_counted()?;
-                    (Some(ds), lost)
+                use std::borrow::Cow;
+                let (mut ds, lost) = if l.is_streamed() {
+                    let (dataset, lost) = l.load_all_counted()?;
+                    (Cow::Owned(dataset), lost)
                 } else {
-                    (None, Default::default())
+                    (Cow::Borrowed(&l.dataset), Default::default())
                 };
+                let query_report =
+                    rustgis_engine::data::export::filter_dataset(&mut ds, l.definition_query.as_deref()).map_err(|e| e.to_string())?;
+                let layer_name = l.name.clone();
                 // In the layer's own coordinate system, as share.exportLayer writes a file.
-                let ds = whole.as_ref().unwrap_or(&l.dataset);
                 use rustgis_engine::data::io;
-                let crs = io::default_export_crs(ds, &ext);
-                let written = io::write_bytes_in(ds, &ext, crs).map_err(|e| e.to_string());
+                let crs = io::default_export_crs(&ds, &ext);
+                let written = io::write_bytes_in(&ds, &ext, crs).map_err(|e| e.to_string());
                 let (bytes, left_out) = match written {
                     Ok(w) => w,
                     Err(e) => {
@@ -4985,26 +5068,27 @@ impl RustGisApp {
                 };
                 let ext = if ext == "shp" { "zip".to_string() } else { ext };
                 let name = format!("{}.{ext}", l.name);
-                // The features written, read whole, give their own extent (not a raster's, or the
-                // one a streamed layer's source declares).
-                let mut notes = rustgis_engine::data::export_notes([(ds, ds.extent())], &name, crs);
-                rustgis_engine::cmd::share::coalesce_read_zm(&mut notes, &name, ds, &lost);
+                // The features written, read whole, give their own extent, in longitude/latitude
+                // (not a raster's, or the one a streamed layer's source declares).
+                let mut notes = rustgis_engine::data::export_notes([(ds.as_ref(), ds.lonlat_extent())], &name, crs);
+                rustgis_engine::cmd::share::coalesce_read_zm(&mut notes, &name, &ds, &lost);
                 let mut dbf_notes = Vec::new();
                 if ext == "zip" {
                     dbf_notes.extend(io::shapefile_names_note(&ds.fields, &name));
-                    dbf_notes.extend(io::shapefile_values_notes(ds, &name));
-                    dbf_notes.extend(io::shapefile_geometry_notes(ds, &name, crs));
+                    dbf_notes.extend(io::shapefile_values_notes(&ds, &name));
+                    dbf_notes.extend(io::shapefile_geometry_notes(&ds, &name, crs));
                 }
                 if matches!(ext.as_str(), "parquet" | "geoparquet") {
-                    dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(ds, &name));
+                    dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(&ds, &name));
                 }
                 dbf_notes.extend(io::dates_as_text_note(&ds.fields, &name));
-                dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(ds, &ext, &name));
+                dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(&ds, &ext, &name));
                 if lost.rows > 0 {
                     dbf_notes.push(format!("{name}: {} rows couldn't be read and were left out", lost.rows));
                 }
                 dbf_notes.extend(rustgis_engine::cmd::share::read_notes(&name, &l.name, &lost));
-                dbf_notes.extend(io::export_losses_notes(ds, &ext, io::name_field(ds), &name).map_err(|e| e.to_string())?);
+                dbf_notes.extend(io::export_losses_notes(&ds, &ext, io::name_field(&ds), &name).map_err(|e| e.to_string())?);
+                drop(ds);
                 if let Some(note) = io::left_out_note(&name, &ext, left_out) {
                     self.session.notify(note, false);
                 }
@@ -5012,6 +5096,7 @@ impl RustGisApp {
                     self.session.notify(format!("{name}: no .prj written, as {} has no WKT form", crs.label()), false);
                 }
                 if self.download(&name, bytes) {
+                    rustgis_engine::cmd::share::notify_export_query(&mut self.session, &name, &layer_name, &query_report);
                     for note in notes.into_iter().chain(dbf_notes).chain(construction_notes) {
                         self.session.notify(note, false);
                     }
@@ -8482,6 +8567,37 @@ mod download_service_tests {
         assert!(!app.download("archive.pmtiles", vec![1, 2, 3]));
         assert!(app.session.notices.iter().any(|n| n.error && n.text.contains("browser rejected download")));
         assert!(!app.session.notices.iter().any(|n| n.text.contains("Downloaded")));
+    }
+
+    /// The web download encodes the filtered rows and reports the count once the bytes are accepted.
+    #[test]
+    fn feature_download_respects_the_definition_query() {
+        let file = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let downloaded = file.clone();
+        let mut app = RustGisApp::with_sample().with_services(Services {
+            download: Some(Box::new(move |_, bytes| {
+                *downloaded.lock().unwrap() = bytes;
+                Ok(())
+            })),
+            ..Default::default()
+        });
+        let layer = app.session.map().layer_by_name("Cities").unwrap();
+        let (id, total) = (layer.id, layer.dataset.features.len());
+        for (query, count) in [("@row_number = 1", 1), ("", total)] {
+            app.run("layer.definitionQuery", json!({"layer": id, "where": query})).unwrap();
+            let mark = app.session.notice_mark();
+            app.run("ui.exportLayer", json!({"layer": id, "format": "geojson"})).unwrap();
+            let data: serde_json::Value = serde_json::from_slice(&file.lock().unwrap()).unwrap();
+            assert_eq!(data["features"].as_array().unwrap().len(), count);
+            let notes: Vec<_> = app.session.notices_since(mark).iter().filter(|n| n.text.contains("definition query")).collect();
+            assert_eq!(notes.len(), usize::from(!query.is_empty()));
+            if let Some(note) = notes.first() {
+                assert_eq!(
+                    note.text,
+                    format!("Cities.geojson: the definition query on Cities left out {} of the source features", total - 1)
+                );
+            }
+        }
     }
 
     /// The web app's Shapefile download says which field names it changed, once the browser takes

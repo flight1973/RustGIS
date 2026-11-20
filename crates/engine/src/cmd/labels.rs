@@ -328,7 +328,7 @@ pub fn commands() -> Vec<C> {
         .inputs(super::Inputs::single_layer)
         .when(need_feature_layer)
         .params(
-            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends)|"perpendicular" (a point's, square to the nearest line of `to`, starting at the point; none that near: as auto) (required without offset, repeat, lineOffset, otherPositions, showAll, callout, to, side, fit or abbreviations), "to"?: {"layer": a line or polygon layer's name, "within"?: points (1 to 500; 20)} | null, "side"?: "away" (the side of the line the point isn't on; the default)|"left"|"right" (as the line runs), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; perpendicular: [out along the normal, down as the text reads]; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only), "lineOffset"?: points (-200 to 200) between a line and its label's nearest edge, above the line as the text reads, negative below it (0 or null: on the line; parallel and curved only), "otherPositions"?: bool (a label whose place is taken tries others: a point's round the point, corners first; a line's along the line, nearest its middle first, placed parallel or curved without a repeat; true is refused for any other line label and on polygons), "fit"?: "auto"|"off" (curved along a line: "auto" abbreviates a name that can't follow the line, and sets one longer than a third of it on its straightest stretch; "off" or null: as placed), "abbreviations"?: {word: abbreviation} (whole words a fitted label puts short, ignoring case, over the built-in English, Portuguese and Spanish list, as {"Creek": "Cr.", "Córrego": "Cór."}; null or {}: the built-in list alone), "showAll"?: bool (every label drawn, over the others where they crowd), "callout"?: true|false|points (5 to 500: a label crowded off its spot moves to a free one nearby, a line drawn back to its feature at most this long; true keeps its length, or 40; false, 0 or null: none; not labels along a line or with an icon)}"#,
+            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends)|"perpendicular" (a point's, square to the nearest line of `to`, starting at the point; none that near: as auto) (required without offset, repeat, lineOffset, otherPositions, showAll, callout, to, side, fit or abbreviations), "to"?: {"layer": a line or polygon layer's name, "within"?: points (1 to 500; 20)} | null, "side"?: "away" (the side of the line the point isn't on; the default)|"left"|"right" (as the line runs), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; perpendicular: [out along the normal, down as the text reads]; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only), "lineOffset"?: points (-200 to 200) between a line and its label's nearest edge, above the line as the text reads, negative below it (0 or null: on the line; parallel and curved only), "otherPositions"?: bool (a label whose place is taken tries others: a point's round the point, corners first; a line's along the line, nearest its middle first, placed parallel or curved without a repeat; true is refused for any other line label and on polygons), "fit"?: "auto"|"off" (curved along a line: "auto" abbreviates a name that can't follow the line, sets one longer than a third of it on its straightest stretch, and spreads one over labels.style's stretch of a line more than three times its length; "off" or null: as placed), "abbreviations"?: {word: abbreviation} (whole words a fitted label puts short, ignoring case, over the built-in English, Portuguese and Spanish list, as {"Creek": "Cr.", "Córrego": "Cór."}; null or {}: the built-in list alone), "showAll"?: bool (every label drawn, over the others where they crowd), "callout"?: true|false|points (5 to 500: a label crowded off its spot moves to a free one nearby, a line drawn back to its feature at most this long; true keeps its length, or 40; false, 0 or null: none; not labels along a line or with an icon)}"#,
         ),
         // Labels moved by hand (the Move Label tool, as QGIS's): kept by their feature's id.
         C::new("labels.move", "Move Label", "Labeling › Label Placement", |s, p| {
@@ -867,11 +867,14 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         out_fields,
     );
     let mut moved = Vec::new();
-    for (row, ft) in l.dataset.features.iter().enumerate() {
+    for (row, ft) in l.dataset.features.rows().enumerate() {
         if rows.get(row) != Some(&true) {
             continue;
         }
-        let Some(at) = ft.geometry.as_ref().and_then(Geometry::label_point) else { continue };
+        // In longitude/latitude, as the annotation layer holds its points and moved labels are.
+        let Some(g) = ft.geometry() else { continue };
+        let g = l.dataset.geometry_to_lonlat(g).map_err(|e| format!("{}: feature {}: {e}", l.name, ft.id()))?;
+        let Some(at) = g.label_point() else { continue };
         for (i, class) in matcher.classes_of(&l.dataset, row).filter(|(_, c)| c.visible) {
             let text = match by_text(i).and_then(|e| e.text_cut(&l.dataset, row)) {
                 Some(Some((t, was_cut))) => {
@@ -894,7 +897,7 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
             }
             // A label moved by hand becomes an annotation where it was put, and stays moved there
             // (its class's offset leaves it).
-            let put = class.moved_to(ft.id);
+            let put = class.moved_to(ft.id());
             let at = put.map_or(at, |[x, y]| Coord::new(x, y));
             let e = exprs.get(i).and_then(Option::as_ref);
             let number = |v: Option<f32>| v.map_or(Attr::Null, |v| Attr::Float(f64::from(v)));
@@ -906,11 +909,11 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
                 attrs.push(c.map_or(Attr::Null, |c| Attr::Text(format!("{},{},{},{}", c.r(), c.g(), c.b(), c.a()))));
             }
             if by_angle {
-                let turns = class.by.angle.is_some() && !along(class, ft.geometry.as_ref());
+                let turns = class.by.angle.is_some() && !along(class, ft.geometry());
                 attrs.push(number(e.filter(|_| turns).and_then(|e| e.angle(&l.dataset, row))));
             }
             ds.push(Some(Geometry::Point(at)), attrs);
-            let flat = put.is_none() && along(class, ft.geometry.as_ref());
+            let flat = put.is_none() && along(class, ft.geometry());
             flattened += usize::from(flat);
             repeated += usize::from(flat && class.repeat.is_some());
             if let (Some(put), Some(new)) = (put, ds.features.last()) {
