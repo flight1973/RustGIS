@@ -40,8 +40,8 @@ pub fn is_field_package(name: &str) -> bool {
 
 /// A field package of the active map, as (name, bytes).
 ///
-/// An offline area's map (`<area> (offline)` of one of this project's areas, or the map of a
-/// project opened from a field package) is packaged as it is, to bring its edits back. Any other map is first made an offline area of this project (`extent`
+/// The map of a home offline area or of an opened field package goes as it is, so its edits
+/// can come back. Any other map is first made an offline area of this project (`extent`
 /// and `name` as for `offline.download`, the view by default), whose map is packaged.
 ///
 /// Never silent: the raster layers an offline area leaves behind, the tile layers that stay
@@ -109,15 +109,12 @@ fn build_package(s: &mut Session, p: &Value, notes: &mut Vec<String>) -> Result<
     if opened_field && s.project.maps.len() != 1 {
         return Err("a returning field project must hold only its original field map: remove added maps before sending it back".into());
     }
-    // An offline area's map: named for one of this project's areas, or opened from a field
-    // package (the phone's project holds no areas). A map only named so is packaged as any other.
-    let returning = s
-        .map()
-        .name
-        .strip_suffix(OFFLINE)
-        .map(str::to_string)
-        .filter(|area| opened_field || s.project.offline_areas.iter().any(|a| a.name.eq_ignore_ascii_case(area)))
-        .or_else(|| opened_field.then(|| s.map().name.clone()));
+    let home_area = if opened_field { None } else { super::workspace::map_area_index(&s.project, s.project.active_map) };
+    let returning = if opened_field {
+        Some(s.map().name.strip_suffix(OFFLINE).unwrap_or(&s.map().name).to_string())
+    } else {
+        home_area.and_then(|i| s.project.offline_areas.get(i)).map(|area| area.name.clone())
+    };
     // Only a map coming back from the field carries its photos. Its persisted provenance
     // survives an ordinary Save As; going out, the photos named are at home.
     let coming_back = returning.is_some() && opened_field;
@@ -168,9 +165,7 @@ fn build_package(s: &mut Session, p: &Value, notes: &mut Vec<String>) -> Result<
                     false,
                 );
             }
-            let mut m = data;
-            m.name = format!("{name}{OFFLINE}");
-            (name, m)
+            (name, data)
         }
     };
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
@@ -272,7 +267,9 @@ fn build_package(s: &mut Session, p: &Value, notes: &mut Vec<String>) -> Result<
         }
         s.project.field_origin.clone()
     } else {
-        let ai = s.project.offline_areas.iter().position(|a| a.name.eq_ignore_ascii_case(&area)).ok_or("the offline area was not found")?;
+        let ai = home_area
+            .or_else(|| s.project.offline_areas.iter().position(|a| a.name.eq_ignore_ascii_case(&area)))
+            .ok_or("the offline area was not found")?;
         let new_home = s.project.origin_id.is_empty().then(crate::project::field_id).transpose()?;
         let new_area = s.project.offline_areas.get(ai).is_some_and(|a| a.id.is_empty()).then(crate::project::field_id).transpose()?;
         // The first package of an area gives it the state a return is checked against; later ones
@@ -317,7 +314,12 @@ fn build_package(s: &mut Session, p: &Value, notes: &mut Vec<String>) -> Result<
     }
     let mut project = crate::project::Project::new(area.clone());
     project.field_origin = origin;
-    // Rasters were taken out above, so the map goes as it is.
+    // The package has no home offline areas and carries its association in field_origin.
+    map.offline_area_id = None;
+    if !coming_back {
+        // Older phones also look at the outgoing title to show Send Field Package.
+        map.name = format!("{area}{OFFLINE}");
+    }
     project.maps = vec![map];
     let home = &s.project;
     let stayed: Vec<String> = [
@@ -915,9 +917,39 @@ fn unpack_into(bytes: &[u8], dir: &Path) -> Result<String, String> {
     Ok(text)
 }
 
-/// Reads a field package's project, its relative paths resolved against `dir`.
+/// Reads a field package with paths to its unpacked basemaps and photos. Absolute paths to
+/// photos stay usable after opening a recovery copy, which has no unpack directory of its own.
+/// References that cannot store an absolute path are left relative and reported on open.
 pub(crate) fn project_in(text: &str, dir: &Path) -> Result<Project, String> {
-    Project::from_import_json(text, Some(dir))
+    let mut project = Project::from_import_json(text, Some(dir))?;
+    let photos = std::path::absolute(dir.join(PHOTOS)).map_err(|e| e.to_string())?;
+    let mut relative = 0_usize;
+    if photos.is_dir() {
+        for map in &mut project.maps {
+            rewrite_photos(map, |path| {
+                if let Some(name) = path.strip_prefix("photos/").filter(|name| plain_file(name)) {
+                    let file = photos.join(name);
+                    if file.is_file() {
+                        if let Some(path) = file.to_str() {
+                            return path.to_string();
+                        }
+                        relative += 1;
+                    }
+                }
+                path.to_string()
+            });
+        }
+    }
+    if relative > 0 {
+        project.read_notices.push((
+            crate::project::ReadPart::Maps,
+            crate::notice_text::NoticeText::format(
+                "{count} unpacked field photo reference(s) kept their relative paths because the unpack folder is not UTF-8. They may stop resolving after Save As or recovery.",
+                [("count", relative.to_string().into())],
+            ),
+        ));
+    }
+    Ok(project)
 }
 
 /// Removes the offline areas past the first `had` of this project: those a field package just made,
@@ -1213,6 +1245,45 @@ mod tests {
     fn value(s: &Session, name: &str, row: usize, field: &str) -> String {
         let l = s.map().layers.iter().find(|l| l.name == name).unwrap();
         l.dataset.value(row, l.dataset.field_index(field).unwrap()).to_string()
+    }
+
+    /// A package names the unpacked photo by absolute path so it can be saved or recovered elsewhere.
+    #[test]
+    fn field_photo_fixture_resolves_to_the_unpacked_file() {
+        let temp = Temp::new("field-photo-fixture");
+        let relative = "photos/site.jpg";
+        let archive = rustgis_data::zip::write(&[
+            ("Survey.rgis".into(), include_bytes!("../../../../schema/fixtures/field_photos.rgis").to_vec()),
+            (relative.into(), b"photo bytes".to_vec()),
+        ])
+        .unwrap();
+        let photo_notices = |project: &mut Project| {
+            project
+                .take_read_notices(&[crate::project::ReadPart::Maps])
+                .iter()
+                .map(crate::notice_text::NoticeText::english)
+                .filter(|notice| notice.contains("unpacked field photo reference"))
+                .collect::<Vec<_>>()
+        };
+        let unpacked = temp.path().join("unpacked");
+        let text = unpack_into(&archive, &unpacked).unwrap();
+        let mut project = project_in(&text, &unpacked).unwrap();
+        assert!(photo_notices(&mut project).is_empty());
+        let photo = unpacked.join(relative);
+        assert_eq!(value(&Session::new(project), "Sites", 0, "photos"), photo.display().to_string());
+        assert_eq!(std::fs::read(photo).unwrap(), b"photo bytes");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let unpacked = temp.path().join(std::ffi::OsStr::from_bytes(b"non-utf8-\xff"));
+            let text = unpack_into(&archive, &unpacked).unwrap();
+            let mut project = project_in(&text, &unpacked).unwrap();
+            let notices = photo_notices(&mut project);
+            assert_eq!(notices.len(), 1);
+            assert!(notices[0].starts_with("1 unpacked field photo reference"));
+            assert_eq!(value(&Session::new(project), "Sites", 0, "photos"), relative);
+        }
     }
 
     #[test]

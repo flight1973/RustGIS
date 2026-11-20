@@ -18,6 +18,7 @@ pub mod graticule;
 pub mod label_by;
 pub mod layout;
 pub mod lod;
+pub mod look;
 pub mod palette;
 pub mod paths;
 pub mod planets;
@@ -350,6 +351,11 @@ pub struct Layer {
     /// The coordinate system the cache was projected from ([`Dataset::coord_crs`]).
     #[serde(skip)]
     projected_crs: Option<Crs>,
+    /// Its geometry in longitude/latitude for the globe, when held in another system
+    /// ([`Layer::lonlat_in`]): a slot of its own, so the globe and a flat projection (hit-testing,
+    /// snapping) don't evict each other.
+    #[serde(skip)]
+    lonlat: LonLatCopy,
     /// Allocation identities and byte totals, shared with render snapshots without retaining rows.
     #[serde(skip)]
     view_memory: view_memory::Cache,
@@ -555,6 +561,7 @@ impl Layer {
             projected_rev: u64::MAX,
             projected_for: String::new(),
             projected_crs: None,
+            lonlat: LonLatCopy::default(),
             geometry_rev: 0,
             view_memory: Default::default(),
             geometry_kinds: Default::default(),
@@ -747,6 +754,8 @@ impl Layer {
         self.view_memory
             .total(&self.dataset.features, &self.projected, &self.projected_extents, &self.thinned)
             .saturating_add(self.display_levels.iter().map(|d| d.bytes).sum::<usize>())
+            // The globe's copy of a held layer, kept beside the flat projection.
+            .saturating_add(if self.lonlat.fits(self) { self.lonlat.bytes } else { 0 })
     }
 
     /// Every feature of a streamed layer's source (up to the read limit), for tools and for
@@ -1081,28 +1090,59 @@ impl Layer {
     /// vertex index, which only the source geometry has.
     pub fn projected_in(&mut self, flat: &projection::Flat, key: &str) -> &[Option<Geometry>] {
         if !self.is_cached(key) {
-            self.display = None;
             if !matches!(flat, projection::Flat::Mercator) {
                 self.display_levels.clear();
             }
-            // From the layer's own coordinate system. Longitude/latitude, every layer's today,
-            // can't fail; a system that can't be converted draws nothing (a layer read in one is
-            // converted as it is read, which says why it can't be).
-            let crs = self.dataset.coord_crs();
-            let to_lonlat = crs.to(Crs::LonLat).ok();
-            let projected: Vec<Option<Geometry>> =
-                self.dataset.features.iter().map(|ft| flat.project_from(to_lonlat.as_ref()?, ft.geometry.as_ref()?)).collect();
-            self.projected_extents =
-                std::sync::Arc::new(projected.iter().map(|g| g.as_ref().map_or(Extent::EMPTY, Geometry::extent)).collect());
-            self.projected_vertices = projected.iter().flatten().map(lod::thinnable).sum();
-            self.projected = std::sync::Arc::new(projected);
-            self.thinned = Default::default();
-            self.projected_rev = self.geometry_rev;
-            self.projected_for = key.to_string();
-            self.projected_crs = Some(crs);
-            self.trim_display_levels(self.lod_budget());
+            self.fill_projected(key, |to_lonlat, g| flat.project_from(to_lonlat, g));
         }
         &self.projected
+    }
+
+    /// Its geometry in longitude/latitude, for the globe, which draws there: kept in a cache of
+    /// its own beside the projected one ([`Layer::projected_cache`]), so it is converted once, not
+    /// every frame, and a flat projection made meanwhile (hit-testing, snapping) doesn't evict it.
+    /// Empty while its coordinates are longitude/latitude, as every layer's are unless held in
+    /// another system: the geometry is then drawn as it is.
+    pub fn lonlat_in(&mut self) -> &[Option<Geometry>] {
+        let crs = self.dataset.coord_crs();
+        if crs == Crs::LonLat {
+            return &[];
+        }
+        if !self.lonlat.fits(self) {
+            // A system that can't be converted draws nothing, as on a flat map.
+            let to_lonlat = crs.to(Crs::LonLat).ok();
+            let geoms: Vec<Option<Geometry>> =
+                self.dataset.features.rows().map(|r| Some(to_lonlat.as_ref()?.geometry(r.geometry()?))).collect();
+            let bytes = lod::cache_bytes(&geoms);
+            self.lonlat = LonLatCopy { geoms: std::sync::Arc::new(geoms), bytes, rev: self.geometry_rev, crs: Some(crs) };
+        }
+        &self.lonlat.geoms
+    }
+
+    /// Its copy in longitude/latitude as [`Layer::lonlat_in`] last made it: empty when none is.
+    pub fn lonlat_cache(&self) -> &[Option<Geometry>] {
+        if self.lonlat.fits(self) { &self.lonlat.geoms } else { &[] }
+    }
+
+    /// Fills the projected geometry cache for `key` with `project` of each geometry, given the
+    /// conversion of the layer's own coordinate system to longitude/latitude. Longitude/latitude,
+    /// every layer's unless held in another, can't fail; a system that can't be converted draws
+    /// nothing (a layer read in one is converted as it is read, which says why it can't be).
+    fn fill_projected(&mut self, key: &str, project: impl Fn(&rustgis_data::raster::Reprojection, &Geometry) -> Option<Geometry>) {
+        self.display = None;
+        let crs = self.dataset.coord_crs();
+        let to_lonlat = crs.to(Crs::LonLat).ok();
+        let projected: Vec<Option<Geometry>> =
+            self.dataset.features.iter().map(|ft| project(to_lonlat.as_ref()?, ft.geometry.as_ref()?)).collect();
+        self.projected_extents =
+            std::sync::Arc::new(projected.iter().map(|g| g.as_ref().map_or(Extent::EMPTY, Geometry::extent)).collect());
+        self.projected_vertices = projected.iter().flatten().map(lod::thinnable).sum();
+        self.projected = std::sync::Arc::new(projected);
+        self.thinned = Default::default();
+        self.projected_rev = self.geometry_rev;
+        self.projected_for = key.to_string();
+        self.projected_crs = Some(crs);
+        self.trim_display_levels(self.lod_budget());
     }
 
     /// Web Mercator copies of every geometry (see [`Layer::projected_in`]).
@@ -1271,6 +1311,7 @@ impl Layer {
         self.projected_rev = u64::MAX;
         self.projected_for.clear();
         self.projected_crs = None;
+        self.lonlat = LonLatCopy::default();
     }
 
     /// Takes the projected geometry cache `other` (a copy of this layer, such as one drawn off
@@ -1278,6 +1319,11 @@ impl Layer {
     /// a pointer. Display-only results preserve this layer's exact cache; optional copies are
     /// trimmed to its remaining budget. False when the rows or source settings don't match.
     pub fn adopt_cache(&mut self, other: &Layer) -> bool {
+        // The globe's copy goes with the rows and geometry alone: a frame drawn only on the globe
+        // has no flat projection to share.
+        if other.dataset.features.shares(&self.dataset.features) && other.geometry_rev == self.geometry_rev && other.lonlat.fits(other) {
+            self.lonlat = other.lonlat.clone();
+        }
         let fits = other.dataset.features.shares(&self.dataset.features)
             && other.geometry_rev == self.geometry_rev
             && (other.is_cached(&other.projected_for) || other.display_cache().is_some())
@@ -1316,6 +1362,12 @@ impl Layer {
             && self.projected_rev == self.geometry_rev
             && self.projected.len() == self.dataset.features.len()
             && self.projected_crs == Some(self.dataset.coord_crs())
+    }
+
+    /// Its geometry's revision, bumped by [`Layer::touch_geometry`]: what a check made once per
+    /// version of the geometry is keyed by.
+    pub fn geometry_rev(&self) -> u64 {
+        self.geometry_rev
     }
 
     /// Marks geometry as changed.
@@ -1597,6 +1649,9 @@ pub enum Drawn {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Map {
     pub name: String,
+    /// The home project's offline area this map edits, independent of the tab title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_area_id: Option<String>,
     pub layers: Vec<Layer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_groups: Vec<ServiceGroup>,
@@ -1756,6 +1811,7 @@ impl Map {
     pub fn new(name: impl Into<String>) -> Self {
         Map {
             name: name.into(),
+            offline_area_id: None,
             layers: Vec::new(),
             service_groups: Vec::new(),
             groups: Vec::new(),
@@ -3160,6 +3216,7 @@ impl Map {
     pub fn slots(&self) -> Vec<Slot<'_>> {
         let Map {
             name: _,
+            offline_area_id: _,
             layers,
             service_groups,
             groups: _,
@@ -3306,6 +3363,7 @@ impl Layer {
             projected_rev: _,
             projected_for: _,
             projected_crs: _,
+            lonlat: _,
             view_memory: _,
             geometry_kinds: _,
             geometry_rev: _,
@@ -3323,6 +3381,7 @@ impl Layer {
             crs_incomplete: _,
             zm_dropped: _,
             windowed: _,
+            held_in: _,
         } = dataset;
         if let Some(v) = provenance {
             out.push((LayerRole::Dataset, v.as_str(), true, paths::is_local(v)));
@@ -3357,6 +3416,24 @@ impl Layer {
             LayerRole::GpkgPath => Some(&mut self.gpkg.as_mut()?.path),
             LayerRole::PostgisEditDatabase => Some(&mut self.postgis.as_mut()?.origin.database),
         }
+    }
+}
+
+/// A layer's geometry in longitude/latitude, made from its rows at a geometry revision in a
+/// coordinate system ([`Layer::lonlat_in`]).
+#[derive(Clone, Debug, Default)]
+struct LonLatCopy {
+    geoms: std::sync::Arc<Vec<Option<Geometry>>>,
+    /// Its size, counted once when it is made ([`Layer::view_cache_bytes`]).
+    bytes: usize,
+    rev: u64,
+    crs: Option<Crs>,
+}
+
+impl LonLatCopy {
+    /// Whether it is of `layer`'s rows as they are now.
+    fn fits(&self, layer: &Layer) -> bool {
+        self.crs == Some(layer.dataset.coord_crs()) && self.rev == layer.geometry_rev && self.geoms.len() == layer.dataset.features.len()
     }
 }
 
@@ -4190,6 +4267,39 @@ mod tests {
         l.touch_geometry();
         assert!(!l.prepare_display(&flat, 0.001, false));
         assert_eq!(lod::DISPLAY_BUILDS.get(), before + 4);
+    }
+
+    /// A layer held in another system keeps its globe copy in longitude/latitude beside a flat
+    /// projection: hit-testing or snapping in Web Mercator doesn't make the globe convert it again.
+    #[test]
+    fn a_held_layers_globe_copy_and_flat_projection_are_kept_apart() {
+        let mut d = Dataset::new("held", GeometryType::Point, vec![]);
+        d.push(Some(Geometry::Point(Coord::new(11.5, 48.7))), vec![]);
+        d.hold_in(Crs::Epsg(32632)).unwrap();
+        let mut l = Layer::new(1, d);
+        let before = l.view_cache_bytes();
+        let globe = l.lonlat_in().as_ptr();
+        assert!(l.view_cache_bytes() > before, "the globe copy is counted in the layer's cache memory");
+        // A copy drawn only on the globe hands its copy back, with no flat projection to share.
+        let mut receiver = l.clone();
+        receiver.clear_cache();
+        receiver.adopt_cache(&l);
+        assert_eq!(receiver.lonlat_cache().as_ptr(), globe, "the globe copy wasn't adopted");
+        let Some(Geometry::Point(c)) = &l.lonlat_cache()[0] else { panic!("a point") };
+        assert!((c.x - 11.5).abs() < 1e-9 && (c.y - 48.7).abs() < 1e-9, "{c:?}");
+        l.projected();
+        assert!(l.is_cached("mercator"));
+        assert_eq!(l.lonlat_in().as_ptr(), globe, "the flat projection evicted the globe copy");
+        assert!(l.is_cached("mercator"), "the globe copy evicted the flat projection");
+        // An edit makes both again; clearing the caches drops both.
+        l.touch_geometry();
+        assert!(l.lonlat_cache().is_empty());
+        assert!(!l.lonlat_in().is_empty());
+        l.clear_cache();
+        assert!(l.lonlat_cache().is_empty());
+        // A layer in longitude/latitude has none: the globe draws its rows.
+        let mut plain = long_line(10);
+        assert!(plain.lonlat_in().is_empty());
     }
 
     #[test]

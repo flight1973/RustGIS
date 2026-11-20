@@ -766,11 +766,7 @@ fn save_project(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         edit.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(end))));
         edit.state.store(ui.ctx(), edit.response.id);
     }
-    let place = if cfg!(any(target_os = "android", target_os = "ios")) {
-        tl!("You choose where the project is saved next.")
-    } else {
-        tl!("The project downloads as this file, to the folder your browser saves downloads in.")
-    };
+    let place = tl!("The project downloads as this file, to the folder your browser saves downloads in.");
     ui.label(egui::RichText::new(place).small().weak());
     buttons(app, ui, "Save", |app| {
         let file = app.dialogs.text.clone();
@@ -3327,6 +3323,32 @@ mod tests {
         assert_eq!(shown(&h) + 1, offered, "the list closed");
         assert!(h.query_by_label_contains("no field named 'pop_'").is_some(), "the error once the list is closed");
         assert_eq!(h.state().dialogs.open, Some("calculateField"), "Escape took the list, not the dialog");
+    }
+
+    /// A call's signature floats over the box, so the error under it stays in view: `sqrt()`
+    /// shows both, apart.
+    #[test]
+    fn calculate_field_keeps_the_error_in_view_under_a_signature() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::new(Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addDataText", json!({"fileName": "pops.csv", "text": "pop_est,name\n1,a\n"})).unwrap();
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        let id = app.session.project.tables[0].id;
+        app.run("ui.dialog", json!({"name": "calculateField", "table": id})).unwrap();
+        let mut h = app_harness(app);
+        h.run_steps(3);
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("cf_expression")));
+        h.run();
+        h.event(egui::Event::Text("sqrt()".into()));
+        h.run();
+        h.key_press(egui::Key::ArrowLeft);
+        h.run_steps(3);
+        let signature = h.get_by_role_and_label(Role::Label, "sqrt(x)").rect();
+        let error = h.get_by_label_contains("Invalid:").rect();
+        let input = h.get_by_role(Role::TextInput).rect();
+        assert!(!signature.intersects(error), "the signature {signature:?} covers the error {error:?}");
+        assert!(signature.bottom() <= input.top(), "the signature {signature:?} floats over the box {input:?}");
     }
 
     /// The app in a harness, its fonts installed on the first pass (the dialog draws on the next).
