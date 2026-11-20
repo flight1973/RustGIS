@@ -496,6 +496,18 @@ impl Sources {
             }
         }
         next.kept.fields.retain(|_, f| !f.is_empty());
+        // A source this session lists keeps its address as this session has it: reading what is
+        // stored drops login bindings (another process's are never authority), but this session's
+        // own stay with its sources whether or not it changed them since.
+        for list in LISTS {
+            let mine = self.list(list);
+            let Ok(now) = next.list_mut(list) else { continue };
+            for source in now.iter_mut() {
+                if let Some(own) = mine.iter().find(|m| same(m, source)) {
+                    source.address.clone_from(&own.address);
+                }
+            }
+        }
         next.recheck_fields();
         // Stored as they are now: nothing is this session's own change any more.
         next.touched.clear();
@@ -630,7 +642,9 @@ impl Sources {
     pub fn note(&mut self, s: Source) {
         let Ok(s) = clean(s) else { return };
         // Only details this session changed from what it had drop the kept ones (a new name or
-        // place keeps them); a source new here takes the stored row's when one exists by then.
+        // place keeps them). A source new here brings details of its own, which win over a
+        // stored row's when one exists by then.
+        let new = !self.recent.iter().any(|r| same(r, &s));
         let changed = self.recent.iter().any(|r| same(r, &s) && r.extra != s.extra);
 
         self.recent.retain(|r| !same(r, &s));
@@ -640,6 +654,8 @@ impl Sources {
         // Noted with other details, as in [`Sources::keep`].
         if changed {
             self.kept.extra.remove(&("recent", id.0.clone(), id.1.clone()));
+        }
+        if changed || new {
             self.details_changed.insert(("recent", id.0.clone(), id.1.clone()));
         }
         self.adopt("recent", &id);
@@ -671,9 +687,9 @@ impl Sources {
             if l.len() >= MAX_KEPT {
                 return Err(format!("up to {MAX_KEPT} sources in {list}"));
             }
-            // New here: no details of its own changed (a stored row's, if one exists by the save, win).
+            // New here: its details are its own, and win over a stored row's at the save.
             l.push(s.clone());
-            false
+            true
         };
         let id = identity(&s.kind, &s.address);
         // Replaced with other details, a source's kept details from a newer RustGIS were about
@@ -1849,8 +1865,8 @@ MIIE
         let file = |address: &str| Source { kind: "file".into(), address: address.into(), ..Source::default() };
         let favorites = |s: &Sources| s.favourites.iter().map(|f| f.address.clone()).collect::<Vec<_>>();
 
-        // A source new to this session that another window stored since, with details a newer
-        // RustGIS wrote: the stored row's details win; this session didn't change them.
+        // A source new to this session that another window stored since, with other details: this
+        // session's details win, as it added them itself.
         let mut s = Sources::from_json(&json!({"favourites": []}).to_string());
         s.keep(
             "favourites",
@@ -1861,7 +1877,25 @@ MIIE
             .to_string();
         s.rebase(Some(&theirs), None).unwrap();
         let written: Value = serde_json::from_str(&s.to_json()).unwrap();
-        assert_eq!(written["favourites"][0]["extra"], json!({"type": "wmts", "tileSize": 512}), "{written}");
+        assert_eq!(written["favourites"][0]["extra"], json!({"type": "wms"}), "{written}");
+        // Window B stored layer roads; window A newly adds the same address with rivers: rivers.
+        // A source A already had and didn't change takes B's details.
+        let wms = |layer: &str| Source {
+            kind: "service".into(),
+            name: "S".into(),
+            address: "https://h/wms".into(),
+            extra: json!({"type": "wms", "layer": layer}),
+        };
+        let theirs = json!({"favourites": [wms("roads")], "recent": [wms("roads")]}).to_string();
+        let mut a = Sources::from_json(&json!({}).to_string());
+        a.keep("favourites", wms("rivers")).unwrap();
+        a.note(wms("rivers"));
+        a.rebase(Some(&theirs), None).unwrap();
+        assert_eq!((a.favourites[0].extra["layer"].clone(), a.recent[0].extra["layer"].clone()), (json!("rivers"), json!("rivers")));
+        let mut a = Sources::from_json(&json!({"favourites": [wms("lakes")]}).to_string());
+        a.keep("favourites", file("/other.csv")).unwrap();
+        a.rebase(Some(&theirs), None).unwrap();
+        assert_eq!(a.favourites.iter().find(|f| f.kind == "service").map(|f| f.extra["layer"].clone()), Some(json!("roads")));
 
         // This session's additions keep their place: before what it had, first; after, right
         // after it (past what another window added there).
@@ -1891,6 +1925,32 @@ MIIE
         assert_eq!(rows, 1, "{:?}", s.kept.rows);
         assert_eq!(s.kept.over, 2, "/{MAX_KEPT}.csv and /z.csv");
         assert_eq!(s.to_json().matches("/z.csv").count(), 1);
+    }
+
+    /// A source this session lists keeps its login binding through a save that lays its changes
+    /// over what another window stored, though it didn't change that source; without one, what is
+    /// stored is read as it was (#1962).
+    #[test]
+    fn a_saved_rebase_keeps_this_sessions_login_bindings() {
+        let bound = rustgis_data::s3_address::bind("0123456789abcdef", "https://s3.example.org", "s3://data/a.fgb").unwrap();
+        let mut s = Sources::from_json("{}");
+        s.note(Source { kind: "url".into(), name: "B".into(), address: bound.clone(), ..Source::default() });
+        assert_eq!(s.recent[0].address, bound);
+        s.rebase(None, None).unwrap();
+        let written = s.to_json();
+        // An unrelated change here, and another window's change stored since.
+        s.keep("favourites", Source { kind: "file".into(), address: "/a.csv".into(), ..Source::default() }).unwrap();
+        let mut theirs: Value = serde_json::from_str(&written).unwrap();
+        theirs["saved"] = json!([{"kind": "file", "name": "", "address": "/theirs.csv"}]);
+        s.rebase(Some(&theirs.to_string()), Some(&written)).unwrap();
+        assert_eq!(s.recent[0].address, bound);
+        assert_eq!(s.saved.len(), 1);
+        // A source this session doesn't list is read as stored, without a binding.
+        let stored = json!({"recent": [{"kind": "url", "name": "B", "address": bound}]}).to_string();
+        let mut other = Sources::from_json("{}");
+        other.keep("favourites", Source { kind: "file".into(), address: "/b.csv".into(), ..Source::default() }).unwrap();
+        other.rebase(Some(&stored), None).unwrap();
+        assert!(rustgis_data::s3_address::parse(&other.recent[0].address).unwrap().unwrap().binding.is_empty());
     }
 
     /// Kept details from a newer RustGIS rechecked beside details changed since: only the entries
