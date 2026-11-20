@@ -130,6 +130,11 @@ mod prefs {
         if !notices().is_empty() {
             ctx.request_repaint();
         }
+        // A setting left to save while another copy saves its own is tried again on a frame a
+        // quarter second on, which an idle window wouldn't otherwise draw.
+        if rustgis_engine::prefs::has_pending() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
 
     /// A notice's text in the current language.

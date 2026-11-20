@@ -6524,12 +6524,13 @@ impl RustGisApp {
         if let Some(retry) = sourcespane::retry_in(self) {
             ctx.request_repaint_after(retry);
         }
-        if let Some(retry) = sourcespane::retry_prefs(self) {
-            ctx.request_repaint_after(retry);
-        }
         sourcespane::save_connections(self);
         self.save_raster_defaults();
         self.save_layout_favourite();
+        // After the frame's other saves, so one that found another copy saving is tried again.
+        if let Some(retry) = sourcespane::retry_prefs(self) {
+            ctx.request_repaint_after(retry);
+        }
         cswui::poll(self);
         stacui::poll(self, ctx);
         s3ui::poll(self, ctx);
