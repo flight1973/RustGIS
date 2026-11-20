@@ -1038,11 +1038,6 @@ fn windings(g: &Geometry) -> Vec<(String, Geometry)> {
     all
 }
 
-/// The two examples of overlapping parts in the PostGIS manual's ST_MakeValid page
-/// (https://postgis.net/docs/ST_MakeValid.html), whose "structure" method gives one polygon for
-/// each, as merging the parts does here. The manual gives no areas: the expected ones are this
-/// tool's own (geo's overlay), pinned so that a change shows, and checked against what any union
-/// of the parts must cover: at least the largest part, less than all of them added up.
 /// The PostGIS manual's two ST_MakeValid examples of overlapping parts
 /// (https://postgis.net/docs/ST_MakeValid.html), each ring a part of its own, with the area this
 /// tool gives them merged (see [`the_postgis_manual_examples_merge_into_one_polygon`]).
@@ -1082,6 +1077,11 @@ fn postgis_examples() -> Vec<(Vec<Vec<(f64, f64)>>, f64)> {
     examples.into()
 }
 
+/// The two examples of overlapping parts in the PostGIS manual's ST_MakeValid page
+/// (https://postgis.net/docs/ST_MakeValid.html), whose "structure" method gives one polygon for
+/// each, as merging the parts does here. The manual gives no areas: the expected ones are this
+/// tool's own (geo's overlay), pinned so that a change shows, and checked against what any union
+/// of the parts must cover: at least the largest part, less than all of them added up.
 #[test]
 fn the_postgis_manual_examples_merge_into_one_polygon() {
     let examples = postgis_examples();

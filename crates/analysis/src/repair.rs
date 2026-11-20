@@ -110,8 +110,9 @@ pub(crate) struct Repaired {
     /// When the overlay rebuilt it, how far its coordinates may have moved, in their units (degrees,
     /// as coordinates are stored).
     pub moved: Option<f64>,
-    /// Under [`Rule::EvenOdd`], duplicate rings (the same corners, [`normal_form`]) of one role dropped before the rings were
-    /// combined, since a pair would cancel out.
+    /// Under [`Rule::EvenOdd`], rings dropped as duplicates before the rings were combined, since a
+    /// pair would cancel out: a hole repeated in its part, and every ring of a part repeated whole
+    /// (the same corners, [`normal_form`]).
     pub duplicates: usize,
 }
 
@@ -596,7 +597,8 @@ struct Rebuilt {
     /// Holes and parts dropped as narrower than a step of the overlay's grid in any direction.
     narrow: usize,
     found: Found,
-    /// Exact duplicate rings of one role dropped first ([`Rule::EvenOdd`] only).
+    /// Rings dropped first as duplicates, a hole repeated in its part or every ring of a part
+    /// repeated whole ([`Rule::EvenOdd`] only).
     duplicates: usize,
 }
 
