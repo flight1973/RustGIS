@@ -321,6 +321,23 @@ fn a_field_name_that_isnt_utf16_is_said() {
     assert!(report.messages.iter().any(|m| m == &format!("1 character {notice}: replaced or left out")), "{:?}", report.messages);
 }
 
+/// The geometry field's name isn't kept as a field, so a character of it that can't be read isn't
+/// said; one of a field kept is.
+#[test]
+fn only_kept_field_names_that_arent_utf16_are_said() {
+    let fields = [F::Oid, F::Shape { z: false, wkt: LONLAT }, F::Text("name")];
+    let rows = vec![vec![V::Blob(polygon(&square(20.0, 20.0, 5.0))), V::Text(Some("a"))]];
+    let notice = "of its field names or aliases couldn't be read";
+    let said = |what: &str| {
+        let (mut t, x) = table(4, &fields, &rows);
+        let at = t.windows(what.len() * 2).position(|w| w == utf16_bytes(what).as_slice()).unwrap();
+        t[at..at + 2].copy_from_slice(&[0x00, 0xD8]);
+        read_table("places", &t, &x, None).unwrap().unwrap().1.messages
+    };
+    assert!(said("SHAPE").iter().all(|m| !m.contains(notice)), "{:?}", said("SHAPE"));
+    assert!(said("name").iter().any(|m| m == &format!("1 character {notice}: replaced or left out")), "{:?}", said("name"));
+}
+
 /// A coordinate system's WKT that isn't all UTF-16 is said only when the WKT places the layer:
 /// a code (WKID 4326) placing it instead leaves it unread, and nothing is said.
 #[test]

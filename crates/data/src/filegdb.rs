@@ -313,9 +313,6 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
     let rows = row_offsets(x)?;
     let mut report = ReadReport::default();
     let chars = |n: usize| if n == 1 { "1 character".to_string() } else { format!("{n} characters") };
-    if table.unreadable > 0 {
-        report.messages.push(format!("{} of its field names or aliases couldn't be read: replaced or left out", chars(table.unreadable)));
-    }
     let layer_type = match table.shape {
         _ if table.geometry.is_none() => GeometryType::None,
         Shape::Point | Shape::Multipoint => GeometryType::Point,
@@ -336,6 +333,7 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
     // The attribute fields: every field but the geometry, and the object ID first.
     let mut fields: Vec<Field> = Vec::new();
     let mut columns: Vec<usize> = Vec::new();
+    let mut unreadable = 0;
     for (i, f) in table.fields.iter().enumerate() {
         let ty = match f.kind {
             Kind::Geometry | Kind::Binary | Kind::Raster => continue,
@@ -346,8 +344,13 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
             Kind::Text | Kind::Xml | Kind::Guid | Kind::GlobalId | Kind::TimeOnly => FieldType::Text,
         };
         let alias = (!f.alias.is_empty() && f.alias != f.name).then(|| f.alias.clone());
+        // What of the names and aliases kept couldn't be read (not the geometry field's).
+        unreadable += f.name_unreadable + if alias.is_some() { f.alias_unreadable } else { 0 };
         fields.push(Field { name: f.name.clone(), ty, alias });
         columns.push(i);
+    }
+    if unreadable > 0 {
+        report.messages.push(format!("{} of its field names or aliases couldn't be read: replaced or left out", chars(unreadable)));
     }
     let patches = table.shape == Shape::Multipatch;
     // A multipatch's lowest and highest Z, and the difference (what an extrusion stands it up by),
@@ -635,6 +638,9 @@ struct FieldDef {
     kind: Kind,
     /// Its bit in each row's null flags, for a field that can be null.
     null_bit: Option<usize>,
+    /// Characters of its name and of its alias that couldn't be read.
+    name_unreadable: usize,
+    alias_unreadable: usize,
 }
 
 /// How a geometry field's coordinates are stored.
@@ -670,8 +676,6 @@ struct Table {
     utf8: bool,
     /// How many fields have a bit in each row's null flags.
     nullable: usize,
-    /// Characters of its field names and aliases that couldn't be read.
-    unreadable: usize,
     /// The geometries carry Z values (which reading drops, but a multipatch keeps as fields).
     has_z: bool,
     /// The geometries carry M values (which reading drops).
@@ -710,19 +714,13 @@ impl Table {
             other => Shape::Other(other as u8),
         };
         let mut fields = Vec::with_capacity(count);
-        let mut unreadable = 0;
-        let mut text16 = |b: &[u8]| {
-            let (text, bad) = crate::io::utf16_text(b, false);
-            unreadable += bad;
-            text
-        };
         let mut geometry = None;
         for _ in 0..count {
             let field = (|| -> Option<(FieldDef, Option<GeomDef>)> {
                 let n = usize::from(c.u8()?);
-                let name = text16(c.bytes(n * 2)?);
+                let (name, name_unreadable) = crate::io::utf16_text(c.bytes(n * 2)?, false);
                 let n = usize::from(c.u8()?);
-                let alias = text16(c.bytes(n * 2)?);
+                let (alias, alias_unreadable) = crate::io::utf16_text(c.bytes(n * 2)?, false);
                 let code = c.u8()?;
                 let kind = Kind::of(code)?;
                 let mut geom = None;
@@ -789,7 +787,8 @@ impl Table {
                     }
                 };
                 let nullable = kind != Kind::ObjectId && flag & 1 != 0;
-                Some((FieldDef { name, alias, kind, null_bit: nullable.then_some(0) }, geom))
+                let def = FieldDef { name, alias, kind, null_bit: nullable.then_some(0), name_unreadable, alias_unreadable };
+                Some((def, geom))
             })();
             let Some((f, g)) = field else {
                 return Err(DataError::Unsupported("a field this reader doesn't know (a raster field?)".into()));
@@ -807,7 +806,7 @@ impl Table {
                 nullable += 1;
             }
         }
-        Ok(Table { fields, geometry, shape, utf8: flags & 0x100 != 0, nullable, unreadable, has_z, has_m })
+        Ok(Table { fields, geometry, shape, utf8: flags & 0x100 != 0, nullable, has_z, has_m })
     }
 
     fn field(&self, name: &str) -> Option<usize> {
