@@ -75,6 +75,10 @@ fn write_in(path: &Path, key: &str, value: &str) -> Result<Updated, String> {
         Ok(Updated::Busy) => {
             pending.insert(id, value.to_string());
         }
+        // Saved: a refusal of the key said before is over, and is said again if one comes back.
+        Ok(Updated::Saved(_)) => {
+            SAID_NEWER.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
+        }
         // What is stored is a newer RustGIS's: never written over, and not tried again this
         // session (a later write of the key tries once more).
         Ok(Updated::Newer) => {
@@ -95,6 +99,9 @@ static PENDING: Values = Mutex::new(std::collections::BTreeMap::new());
 /// kept for this session (a read of the setting gives them), never tried again.
 static REFUSED: Values = Mutex::new(std::collections::BTreeMap::new());
 
+/// Values left to save whose last retry failed, said once until one is saved.
+static FAILED: Mutex<std::collections::BTreeSet<(PathBuf, String)>> = Mutex::new(std::collections::BTreeSet::new());
+
 /// Keys whose refusal ([`newer_notice`]) has been said, so each is said once a session.
 static SAID_NEWER: Mutex<std::collections::BTreeSet<(PathBuf, String)>> = Mutex::new(std::collections::BTreeSet::new());
 
@@ -104,6 +111,11 @@ static SAID_NEWER: Mutex<std::collections::BTreeSet<(PathBuf, String)>> = Mutex:
 pub fn pending(key: &str) -> Option<String> {
     let dir = rustgis_data::dirs::config_dir()?;
     pending_in(&dir.join(FILE), key)
+}
+
+/// Whether any value is left to save ([`write`] found another copy saving).
+pub fn has_pending() -> bool {
+    !PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty()
 }
 
 fn pending_in(path: &Path, key: &str) -> Option<String> {
@@ -157,7 +169,10 @@ fn retry_pending_in(only: Option<&Path>, wait: std::time::Duration) -> (Vec<Resu
                     break;
                 }
                 let id = (path.clone(), key.clone());
-                PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
+                // Saved or refused, it is no longer left to save; an error leaves it, to try again.
+                if done.is_ok() {
+                    PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
+                }
                 match done {
                     // Refused once, it isn't tried again (not on the next pass at exit either),
                     // and is said once.
@@ -167,10 +182,22 @@ fn retry_pending_in(only: Option<&Path>, wait: std::time::Duration) -> (Vec<Resu
                             said.push(Err(notice));
                         }
                     }
-                    done => said.push(done.map(|d| match d {
-                        Updated::Saved(set_aside) => set_aside,
-                        _ => None,
-                    })),
+                    // A failure is said once while the value stays left, not at each retry.
+                    Err(error) => {
+                        if FAILED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(id) {
+                            said.push(Err(error));
+                        }
+                    }
+                    Ok(done) => {
+                        FAILED.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
+                        if matches!(done, Updated::Saved(_)) {
+                            SAID_NEWER.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&id);
+                        }
+                        said.push(Ok(match done {
+                            Updated::Saved(set_aside) => set_aside,
+                            _ => None,
+                        }));
+                    }
                 }
             }
         }
@@ -277,7 +304,11 @@ fn lock(path: &Path) -> Result<Locked, String> {
         Ok(()) => Ok(Locked::Held(Lock(file))),
         Err(std::fs::TryLockError::WouldBlock) => Ok(Locked::Busy),
         Err(std::fs::TryLockError::Error(error)) => {
-            log::warn!("preferences saved without a lock: couldn't lock {}: {error}", lock_path.display());
+            // Said once a session: every save would say it again.
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("preferences saved without a lock: couldn't lock {}: {error}", lock_path.display());
+            }
             Ok(Locked::Unlockable)
         }
     }
@@ -334,11 +365,12 @@ fn write_with(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Map::new(), None),
         Err(error) => return Err(format!("could not read preferences: {error}")),
     };
-    // A newer RustGIS's setting this version can't read (not text) is never written over.
+    // A newer RustGIS's setting this version can't read (an object or a list) is never written
+    // over. A null, true or false, or a number was never a newer form: written over, as before.
     let stored = match map.get(key) {
         Some(Value::String(text)) => Some(text.as_str()),
-        Some(_) => return Ok(Updated::Newer),
-        None => None,
+        Some(Value::Object(_) | Value::Array(_)) => return Ok(Updated::Newer),
+        _ => None,
     };
     let Some(value) = value(stored) else { return Ok(Updated::Unchanged) };
     let set_aside = match malformed {
@@ -659,11 +691,64 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Only an object or a list stored under a key is a newer RustGIS's setting: a null, a flag
+    /// or a number is written over. A key saved again may be said again when refused later. A
+    /// value left to save that fails to write stays left, to try again (#1962).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn newer_settings_are_objects_or_lists_and_failed_retries_stay_left() {
+        let dir = std::env::temp_dir().join(format!("rustgis-preferences-newer-kinds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE);
+        std::fs::write(&path, r#"{"flag":true,"n":5,"z":null,"o":{"v":2},"a":[1]}"#).unwrap();
+        for key in ["flag", "n", "z"] {
+            assert_eq!(write_in(&path, key, "text").unwrap(), Updated::Saved(None), "{key}");
+        }
+        for key in ["o", "a"] {
+            assert_eq!(write_in(&path, key, "text").unwrap(), Updated::Newer, "{key}");
+        }
+        // Refused and said; saved once the stored value is text again; refused later, said again.
+        assert!(newer_notice_once_in(&path, "o").is_some());
+        assert_eq!(newer_notice_once_in(&path, "o"), None);
+        let mut map = read_at(&path).unwrap();
+        map.insert("o".into(), Value::String("old".into()));
+        std::fs::write(&path, serde_json::to_vec(&map).unwrap()).unwrap();
+        assert_eq!(write_in(&path, "o", "text").unwrap(), Updated::Saved(None));
+        map.insert("o".into(), serde_json::json!({"v": 3}));
+        std::fs::write(&path, serde_json::to_vec(&map).unwrap()).unwrap();
+        assert_eq!(write_in(&path, "o", "again").unwrap(), Updated::Newer);
+        assert!(newer_notice_once_in(&path, "o").is_some(), "said again after a save of the key");
+
+        // Left to save while another copy saves; then the file can't be read (a folder in its
+        // place): the retry fails, and the value stays left; once it can be, it is written.
+        let held = lock(&path).unwrap();
+        assert_eq!(write_in(&path, "theme", "dark").unwrap(), Updated::Busy);
+        drop(held);
+        let kept = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let (said, left) = retry_pending_in(Some(&path), std::time::Duration::ZERO);
+        assert!(said.iter().any(Result::is_err) && left, "{said:?}");
+        assert_eq!(pending_in(&path, "theme").as_deref(), Some("dark"));
+        // Failing again: still left, and not said again.
+        let (said, left) = retry_pending_in(Some(&path), std::time::Duration::ZERO);
+        assert!(said.is_empty() && left, "{said:?}");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, kept).unwrap();
+        let (said, left) = retry_pending_in(Some(&path), std::time::Duration::ZERO);
+        assert!(said.iter().all(Result::is_ok) && !left, "{said:?}");
+        assert_eq!(read_at(&path).unwrap().get("theme").and_then(Value::as_str), Some("dark"));
+        forget_values(&path);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Drops what this test folder left in the session-wide sets.
     fn forget_values(path: &Path) {
         PENDING.lock().unwrap().retain(|(p, _), _| p != path);
         REFUSED.lock().unwrap().retain(|(p, _), _| p != path);
         SAID_NEWER.lock().unwrap().retain(|(p, _)| p != path);
+        FAILED.lock().unwrap().retain(|(p, _)| p != path);
     }
 
     /// At exit, a value left to save that turns out refused (a newer RustGIS stored the key
