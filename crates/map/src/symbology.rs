@@ -125,12 +125,38 @@ pub struct Picture(&'static str);
 /// Where [`Picture::is_dropped`] points: an image a file gave that wasn't kept.
 static DROPPED: &str = "(dropped)";
 
-/// The pictures kept this run, and the bytes of base64 they take.
-fn kept_pictures() -> std::sync::MutexGuard<'static, (std::collections::HashSet<&'static str>, usize)> {
-    use std::collections::HashSet;
+/// Whether `more` pictures taking `more_bytes` of base64 fit beside `count` kept ones taking
+/// `bytes` ([`MAX_PICTURES`], [`MAX_PICTURES_BYTES`]).
+fn fits((count, bytes): (usize, usize), (more, more_bytes): (usize, usize)) -> bool {
+    count + more <= MAX_PICTURES && bytes + more_bytes <= MAX_PICTURES_BYTES
+}
+
+/// Pictures kept, and the bytes of base64 they take.
+type Store = (std::collections::HashSet<&'static str>, usize);
+
+/// The pictures kept this run.
+fn kept_pictures() -> std::sync::MutexGuard<'static, Store> {
     use std::sync::{Mutex, OnceLock};
-    static KEPT: OnceLock<Mutex<(HashSet<&'static str>, usize)>> = OnceLock::new();
+    static KEPT: OnceLock<Mutex<Store>> = OnceLock::new();
     KEPT.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Keeps trimmed, non-empty `images` in `store`, all or none ([`Picture::new_all`]): where each
+/// is kept, in the order given, or `None` with nothing kept when the new ones don't fit together.
+fn keep_all(store: &mut Store, images: &[&str]) -> Option<Vec<&'static str>> {
+    let (pictures, bytes) = store;
+    let mut more: Vec<&str> = images.iter().copied().filter(|b64| !pictures.contains(*b64)).collect();
+    more.sort_unstable();
+    more.dedup();
+    if !fits((pictures.len(), *bytes), (more.len(), more.iter().map(|b64| b64.len()).sum())) {
+        return None;
+    }
+    for b64 in more {
+        let p: &'static str = Box::leak(b64.to_owned().into_boxed_str());
+        pictures.insert(p);
+        *bytes += p.len();
+    }
+    images.iter().map(|b64| pictures.get(*b64).copied()).collect()
 }
 
 impl Picture {
@@ -144,13 +170,24 @@ impl Picture {
         if let Some(p) = pictures.get(base64) {
             return Picture(p);
         }
-        if pictures.len() >= MAX_PICTURES || *bytes + base64.len() > MAX_PICTURES_BYTES {
+        if !fits((pictures.len(), *bytes), (1, base64.len())) {
             return Picture::default();
         }
         let p: &'static str = Box::leak(base64.to_owned().into_boxed_str());
         pictures.insert(p);
         *bytes += p.len();
         Picture(p)
+    }
+
+    /// [`Picture::new`] for several images at once, all or none: `None`, keeping nothing, when one
+    /// is empty or too long, or when together they don't fit beside those already kept. Each
+    /// image's picture, in the order given (the same image twice is the same picture).
+    pub fn new_all(images: &[&str]) -> Option<Vec<Picture>> {
+        let images: Vec<&str> = images.iter().map(|b64| b64.trim()).collect();
+        if images.iter().any(|b64| b64.is_empty() || b64.len() > MAX_PICTURE_BYTES) {
+            return None;
+        }
+        keep_all(&mut kept_pictures(), &images).map(|kept| kept.into_iter().map(Picture).collect())
     }
 
     /// The picture already kept for `base64`, keeping nothing new: a command given an image again
@@ -1148,7 +1185,7 @@ impl Renderer {
         }
         let e = rustgis_data::query::parse_fields(text, ds)?;
         if rustgis_data::query::uses_area(&e)
-            && let Some(message) = rustgis_data::ambiguous_area_message(
+            && let Some(message) = ds.ambiguous_area_message(
                 ds.features
                     .iter()
                     .enumerate()
@@ -2531,8 +2568,9 @@ pub struct LabelClass {
     #[serde(default, deserialize_with = "de_square_to", skip_serializing_if = "Option::is_none")]
     pub square_to: Option<SquareTo>,
     /// Along a line placed curved, how the label fits the room its line gives (#2265): off places
-    /// it as before; [`LabelFit::Auto`] abbreviates a name that doesn't fit and sets one that takes
-    /// more than a third of the line on its straightest stretch.
+    /// it as before; [`LabelFit::Auto`] abbreviates a name that doesn't fit, sets one that takes
+    /// more than a third of the line on its straightest stretch, and spreads one over
+    /// [`stretch`](LabelClass::stretch) of a line with room to spare.
     #[serde(default, deserialize_with = "de_fit", skip_serializing_if = "LabelFit::is_off")]
     pub fit: LabelFit,
     /// The words a fitted label abbreviates when it doesn't fit, each to its abbreviation (#2265):
@@ -2541,6 +2579,11 @@ pub struct LabelClass {
     /// [`MAX_ABBREVIATION_CHARS`] characters.
     #[serde(default, deserialize_with = "de_abbreviations", skip_serializing_if = "BTreeMap::is_empty")]
     pub abbreviations: BTreeMap<String, String>,
+    /// How much of its line's room a fitted label's letters are spread over when the line has
+    /// room to spare (#2265), a share within [`LABEL_STRETCH`]; none is
+    /// [`DEFAULT_LABEL_STRETCH`].
+    #[serde(default, deserialize_with = "de_stretch", skip_serializing_if = "Option::is_none")]
+    pub stretch: Option<f32>,
     /// Labels moved by hand (the Move Label tool, as QGIS's): each feature's, by its id, drawn
     /// where it was put, a callout's line back to the feature when the class has callouts. At
     /// most [`MAX_MOVED_LABELS`], kept in order of id (so a label's is found without a scan).
@@ -3000,8 +3043,8 @@ pub enum LabelFit {
     /// Placed as its placement says, whatever room there is.
     #[default]
     Off,
-    /// Abbreviated when it doesn't fit, and set on the line's straightest stretch when it takes
-    /// more than a third of it.
+    /// Abbreviated when it doesn't fit, set on the line's straightest stretch when it takes more
+    /// than a third of it, and spread when the line has room to spare.
     Auto,
 }
 
@@ -3022,6 +3065,17 @@ pub const MAX_ABBREVIATION_CHARS: usize = 64;
 pub fn is_abbreviation(word: &str, short: &str) -> bool {
     let fine = |s: &str| !s.trim().is_empty() && s.chars().nth(MAX_ABBREVIATION_CHARS).is_none();
     fine(word) && fine(short) && !word.chars().any(char::is_whitespace)
+}
+
+/// The shares of a line's room a fitted label may be spread over ([`LabelClass::stretch`]).
+pub const LABEL_STRETCH: std::ops::RangeInclusive<f32> = 0.1..=1.0;
+
+/// The share of a line's room a fitted label is spread over when its class gives none.
+pub const DEFAULT_LABEL_STRETCH: f32 = 0.6;
+
+/// A project file's `stretch`, brought into [`LABEL_STRETCH`]; one that isn't a number is none.
+fn de_stretch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(lenient::<D, f64>(d)?.filter(|s| s.is_finite()).map(|s| (s as f32).clamp(*LABEL_STRETCH.start(), *LABEL_STRETCH.end())))
 }
 
 /// A project file's `fit`: one that doesn't read is off.
@@ -3223,6 +3277,7 @@ impl LabelClass {
             square_to: None,
             fit: LabelFit::Off,
             abbreviations: BTreeMap::new(),
+            stretch: None,
             moved: Vec::new(),
             by: Default::default(),
         }
@@ -3637,6 +3692,35 @@ mod tests {
         assert_eq!(Picture::kept(unseen), None, "the lookup kept nothing");
         let p = Picture::new("kept, for this test alone");
         assert_eq!(Picture::kept(" kept, for this test alone "), Some(p), "trimmed, as new trims");
+    }
+
+    /// Several images are kept together or not at all: the store's limits are weighed for the
+    /// lot, images already kept and repeated ones counted once.
+    #[test]
+    fn pictures_are_kept_all_or_none() {
+        assert!(fits((MAX_PICTURES - 2, 0), (2, 10)) && !fits((MAX_PICTURES - 1, 0), (2, 10)));
+        assert!(fits((0, MAX_PICTURES_BYTES - 10), (1, 10)) && !fits((0, MAX_PICTURES_BYTES - 10), (2, 11)));
+        let old = Picture::new("YWxsLW9yLW5vbmUtb2xk");
+        let all = Picture::new_all(&["YWxsLW9yLW5vbmUtYQ==", " YWxsLW9yLW5vbmUtb2xk ", "YWxsLW9yLW5vbmUtYQ=="]).unwrap();
+        assert_eq!((all[1], all[0]), (old, all[2]));
+        assert_eq!(Picture::kept("YWxsLW9yLW5vbmUtYQ=="), Some(all[0]));
+        // One that can't be kept refuses the lot.
+        assert_eq!(Picture::new_all(&["YWxsLW9yLW5vbmUtYg==", " "]), None);
+        assert_eq!(Picture::kept("YWxsLW9yLW5vbmUtYg=="), None);
+        // A store one picture short of full (a store of its own, not the run's): two new images
+        // don't fit, and neither is kept; one does, beside one kept already.
+        let mut store: Store = Default::default();
+        for i in 1..MAX_PICTURES {
+            let p: &'static str = Box::leak(format!("p{i}").into_boxed_str());
+            store.0.insert(p);
+            store.1 += p.len();
+        }
+        let before = (store.0.len(), store.1);
+        assert_eq!(keep_all(&mut store, &["bmV3LW9uZQ==", "bmV3LXR3bw==", "p1"]), None);
+        assert_eq!((store.0.len(), store.1), before, "nothing kept");
+        let kept = keep_all(&mut store, &["bmV3LW9uZQ==", "p1", "bmV3LW9uZQ=="]).unwrap();
+        assert_eq!((kept[0], kept[1]), ("bmV3LW9uZQ==", "p1"));
+        assert!(std::ptr::eq(kept[0], kept[2]) && store.0.len() == MAX_PICTURES);
     }
 
     /// A picture marker is written with its image, and read back as the same kept image; one a

@@ -150,18 +150,19 @@ struct Original {
 /// reading ([`crate::provenance::open_regular`]).
 fn read_part(p: &Path, size_error: fn(&str, u64) -> String) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
+    let limit = crate::io::max_bytes();
     let file = match crate::provenance::open_regular(p) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(DataError::Format(format!("{}: {e}", p.display()))),
     };
-    if file.metadata()?.len() > crate::io::MAX_BYTES {
-        return Err(DataError::Format(size_error(&p.to_string_lossy(), crate::io::MAX_BYTES)));
+    if file.metadata()?.len() > limit {
+        return Err(DataError::Format(size_error(&p.to_string_lossy(), limit)));
     }
     let mut bytes = Vec::new();
-    (&file).take(crate::io::MAX_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > crate::io::MAX_BYTES {
-        return Err(DataError::Format(size_error(&p.to_string_lossy(), crate::io::MAX_BYTES)));
+    (&file).take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(DataError::Format(size_error(&p.to_string_lossy(), limit)));
     }
     Ok(Some(bytes))
 }
@@ -459,7 +460,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
 /// shape that failed conversion is refused: missing geometry cannot identify its source shape.
 fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Dataset)>) -> Result<std::borrow::Cow<'a, Dataset>> {
     let Some(c) = crs else { return Ok(std::borrow::Cow::Borrowed(ds)) };
-    let t = c.transformer().map_err(DataError::Format)?;
+    let t = Crs::LonLat.to(c).map_err(DataError::Format)?;
     let (read, raw): (Vec<&Feature>, Vec<&Feature>) = match as_held {
         Some((read, raw)) => (read.features.iter().collect(), raw.features.iter().collect()),
         None => (Vec::new(), Vec::new()),
@@ -493,7 +494,7 @@ fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Da
         match held {
             Some(h) => row.geometry = h.geometry.clone(),
             // Looks at Cancel without counting: the write that follows counts the features.
-            None => crate::io::project_each(std::slice::from_mut(&mut row), &t, c, false)?,
+            None => crate::io::project_each(std::slice::from_mut(&mut row), &t, false)?,
         }
         rows.push(row);
     }
@@ -1446,18 +1447,18 @@ mod tests {
     /// The publisher's original-file read stops before loading an oversized attribute sidecar.
     #[test]
     fn oversized_shapefile_dbf_read_for_publish_gives_dataset_advice() {
-        use crate::io::{FileSizeAdvice, MAX_BYTES, file_size_error_args};
+        use crate::io::{FileSizeAdvice, file_size_error_args, max_bytes};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parcels.shp");
         let dbf = path.with_extension("dbf");
         written(&parcels(), &path);
-        std::fs::OpenOptions::new().write(true).open(&dbf).unwrap().set_len(MAX_BYTES + 1).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&dbf).unwrap().set_len(max_bytes() + 1).unwrap();
 
         let error = Original::read(&Sidecars::shapefile(&path)).err().unwrap().to_string();
-        let limit = (MAX_BYTES >> 20).to_string();
+        let limit = (max_bytes() >> 20).to_string();
         assert_eq!(file_size_error_args(&error), Some((dbf.to_str().unwrap(), limit.as_str(), FileSizeAdvice::Shapefile)));
-        assert_eq!(std::fs::metadata(&dbf).unwrap().len(), MAX_BYTES + 1);
+        assert_eq!(std::fs::metadata(&dbf).unwrap().len(), max_bytes() + 1);
     }
 
     /// A duplicated descriptor must not keep a finished publisher's lock alive.
