@@ -26,6 +26,7 @@ pub mod projection;
 pub mod qgis;
 pub mod raster;
 pub mod report;
+pub mod rows;
 pub mod shadow;
 pub mod slots;
 pub mod source;
@@ -57,6 +58,7 @@ pub struct LockedPlace {
     pub callout: Option<[f32; 2]>,
 }
 
+use rustgis_data::raster::Crs;
 use rustgis_data::{Dataset, Geometry, GeometryType};
 use rustgis_geom::{Coord, Extent};
 use serde::{Deserialize, Serialize};
@@ -345,6 +347,9 @@ pub struct Layer {
     /// The projection the cache is in.
     #[serde(skip)]
     projected_for: String,
+    /// The coordinate system the cache was projected from ([`Dataset::coord_crs`]).
+    #[serde(skip)]
+    projected_crs: Option<Crs>,
     /// Allocation identities and byte totals, shared with render snapshots without retaining rows.
     #[serde(skip)]
     view_memory: view_memory::Cache,
@@ -549,6 +554,7 @@ impl Layer {
             thinned: Default::default(),
             projected_rev: u64::MAX,
             projected_for: String::new(),
+            projected_crs: None,
             geometry_rev: 0,
             view_memory: Default::default(),
             geometry_kinds: Default::default(),
@@ -720,6 +726,8 @@ impl Layer {
             self.projected_extents = cache.extents;
             self.projected_vertices = cache.vertices;
             self.projected_for = cache.key;
+            // A source reads its window in longitude/latitude, and its read projects from there.
+            self.projected_crs = Some(Crs::LonLat);
             self.projected_rev = self.geometry_rev;
             let feature_bytes =
                 if padded { rustgis_data::source::memory::features_bytes(&self.dataset.features) } else { cache.feature_bytes };
@@ -1072,13 +1080,18 @@ impl Layer {
     /// the projection can't use breaks a line): hit-testing and snapping use the shape, never a
     /// vertex index, which only the source geometry has.
     pub fn projected_in(&mut self, flat: &projection::Flat, key: &str) -> &[Option<Geometry>] {
-        if self.projected_rev != self.geometry_rev || self.projected.len() != self.dataset.features.len() || self.projected_for != key {
+        if !self.is_cached(key) {
             self.display = None;
             if !matches!(flat, projection::Flat::Mercator) {
                 self.display_levels.clear();
             }
+            // From the layer's own coordinate system. Longitude/latitude, every layer's today,
+            // can't fail; a system that can't be converted draws nothing (a layer read in one is
+            // converted as it is read, which says why it can't be).
+            let crs = self.dataset.coord_crs();
+            let to_lonlat = crs.to(Crs::LonLat).ok();
             let projected: Vec<Option<Geometry>> =
-                self.dataset.features.iter().map(|ft| ft.geometry.as_ref().map(|g| flat.project(g))).collect();
+                self.dataset.features.iter().map(|ft| flat.project_from(to_lonlat.as_ref()?, ft.geometry.as_ref()?)).collect();
             self.projected_extents =
                 std::sync::Arc::new(projected.iter().map(|g| g.as_ref().map_or(Extent::EMPTY, Geometry::extent)).collect());
             self.projected_vertices = projected.iter().flatten().map(lod::thinnable).sum();
@@ -1086,6 +1099,7 @@ impl Layer {
             self.thinned = Default::default();
             self.projected_rev = self.geometry_rev;
             self.projected_for = key.to_string();
+            self.projected_crs = Some(crs);
             self.trim_display_levels(self.lod_budget());
         }
         &self.projected
@@ -1103,7 +1117,9 @@ impl Layer {
     /// Every failure clears the active display; recent reusable levels may remain cached.
     pub fn prepare_display(&mut self, flat: &projection::Flat, tol: f64, whole_layer_eligible: bool) -> bool {
         self.display = None;
-        let Some(level) = lod::level(tol).filter(|_| matches!(flat, projection::Flat::Mercator)) else { return false };
+        // The display copies are made from longitude/latitude rows ([`lod::display`]).
+        let lonlat = self.dataset.coord_crs() == Crs::LonLat;
+        let Some(level) = lod::level(tol).filter(|_| lonlat && matches!(flat, projection::Flat::Mercator)) else { return false };
         self.trim_thinned_levels(self.lod_budget());
         let used: usize = self.thinned.iter().filter_map(|(_, c)| c.as_ref()).map(|c| lod::cache_bytes(c)).sum();
         let budget = self.lod_budget().saturating_sub(used);
@@ -1201,7 +1217,9 @@ impl Layer {
             }
             None => {
                 let t = lod::tolerance(level);
-                let copy = if matches!(flat, projection::Flat::Mercator) {
+                // Projected and thinned at once from longitude/latitude rows; from any other
+                // system, the projected geometry is thinned.
+                let copy = if matches!(flat, projection::Flat::Mercator) && self.dataset.coord_crs() == Crs::LonLat {
                     lod::project_budgeted(&self.dataset.features, level, budget)
                 } else {
                     lod::thin_budgeted(&self.projected, t, budget)
@@ -1252,6 +1270,7 @@ impl Layer {
         self.thinned = Default::default();
         self.projected_rev = u64::MAX;
         self.projected_for.clear();
+        self.projected_crs = None;
     }
 
     /// Takes the projected geometry cache `other` (a copy of this layer, such as one drawn off
@@ -1279,6 +1298,7 @@ impl Layer {
                 self.thinned = other.thinned.clone();
                 self.projected_rev = other.projected_rev;
                 self.projected_for.clone_from(&other.projected_for);
+                self.projected_crs = other.projected_crs;
             }
             let budget = self.lod_budget();
             self.trim_thinned_levels(budget);
@@ -1289,9 +1309,13 @@ impl Layer {
         fits
     }
 
-    /// Whether the projected geometry cache is filled for a projection.
+    /// Whether the projected geometry cache is filled for a projection, from the layer's current
+    /// rows and its coordinate system ([`Dataset::coord_crs`]).
     pub fn is_cached(&self, key: &str) -> bool {
-        self.projected_for == key && self.projected_rev == self.geometry_rev && self.projected.len() == self.dataset.features.len()
+        self.projected_for == key
+            && self.projected_rev == self.geometry_rev
+            && self.projected.len() == self.dataset.features.len()
+            && self.projected_crs == Some(self.dataset.coord_crs())
     }
 
     /// Marks geometry as changed.
@@ -1397,9 +1421,8 @@ impl Layer {
 
     /// Applies the definition query in the supplied drawing context.
     pub fn query_rows_with(&self, dataset: &Dataset, env: &rustgis_data::query::Env) -> Option<Vec<bool>> {
-        let query = self.definition_query.as_deref().filter(|q| !q.trim().is_empty())?;
-        let expr = rustgis_data::query::parse_fields(query, dataset).ok()?;
-        Some((0..dataset.features.len()).map(|r| rustgis_data::query::matches(&expr, dataset, r, env)).collect())
+        let query = rustgis_data::rows::Query::compile(self.definition_query.as_deref(), dataset).ok()?;
+        query.is_filtered().then(|| (0..dataset.features.len()).map(|row| query.matches(dataset, row, env)).collect())
     }
 
     /// Extent in longitude/latitude.
@@ -1407,8 +1430,8 @@ impl Layer {
         match (&self.raster, &self.source) {
             (Some(r), _) => r.data.as_ref().map(|d| d.extent()).unwrap_or(Extent::EMPTY),
             // A streamed layer's whole extent, not just the part read.
-            (None, Some(s)) => s.info().map(|i| i.extent).filter(|e| !e.is_empty()).unwrap_or_else(|| self.dataset.extent()),
-            (None, None) => self.dataset.extent(),
+            (None, Some(s)) => s.info().map(|i| i.extent).filter(|e| !e.is_empty()).unwrap_or_else(|| self.dataset.lonlat_extent()),
+            (None, None) => self.dataset.lonlat_extent(),
         }
     }
 
@@ -1419,20 +1442,25 @@ impl Layer {
         if !query || self.raster.is_some() || self.source.is_some() {
             return self.extent();
         }
-        self.visible_rows()
-            .iter()
-            .zip(&self.dataset.features)
-            .filter(|(v, _)| **v)
-            .filter_map(|(_, f)| f.geometry.as_ref())
-            .fold(Extent::EMPTY, |e, g| e.union(&g.extent()))
+        let shown = self.visible_rows();
+        self.rows_extent(shown.iter().enumerate().filter_map(|(r, v)| v.then_some(r)))
     }
 
+    /// Extent in longitude/latitude of its selected features.
     pub fn selection_extent(&self) -> Extent {
-        self.selection
-            .iter()
-            .filter_map(|r| self.dataset.features.get(*r))
+        self.rows_extent(self.selection.iter().copied())
+    }
+
+    /// Extent in longitude/latitude of the features in `rows` (rows past the last and features
+    /// without geometry left out): the box around them in the dataset's own coordinates, converted
+    /// ([`Dataset::extent_to_lonlat`]).
+    pub fn rows_extent(&self, rows: impl IntoIterator<Item = usize>) -> Extent {
+        let own = rows
+            .into_iter()
+            .filter_map(|r| self.dataset.features.get(r))
             .filter_map(|f| f.geometry.as_ref())
-            .fold(Extent::EMPTY, |e, g| e.union(&g.extent()))
+            .fold(Extent::EMPTY, |e, g| e.union(&g.extent()));
+        self.dataset.extent_to_lonlat(&own)
     }
 
     pub fn opacity(&self) -> f32 {
@@ -3261,6 +3289,7 @@ impl Layer {
             thinned: _,
             projected_rev: _,
             projected_for: _,
+            projected_crs: _,
             view_memory: _,
             geometry_kinds: _,
             geometry_rev: _,
@@ -4315,6 +4344,26 @@ mod tests {
         m.layers[0].definition_query = Some("n = 2".into());
         assert_eq!(m.shown_extent(), Extent::new(10.0, 10.0, 10.0, 10.0));
         assert_eq!(m.full_extent(), Extent::new(0.0, 0.0, 10.0, 10.0));
+    }
+
+    /// A layer's extents are in longitude/latitude, converted from its dataset's own coordinates
+    /// (`Dataset::coord_crs`). That is longitude/latitude for every dataset today, whatever system
+    /// it records, so this covers the identity: the boxes are its geometry's. Rows past the last
+    /// are left out.
+    #[test]
+    fn a_layers_extents_are_identity_converted_to_lonlat() {
+        let mut m = Map::new("Map");
+        let mut ds = points();
+        ds.crs = Some(Crs::Epsg(2056));
+        m.add_dataset(ds);
+        let l = &mut m.layers[0];
+        assert_eq!(l.extent(), Extent::new(0.0, 0.0, 10.0, 10.0));
+        assert_eq!(l.extent(), l.dataset.lonlat_extent());
+        assert_eq!(l.rows_extent([1, 99]), Extent::new(10.0, 10.0, 10.0, 10.0));
+        assert!(l.rows_extent([99]).is_empty());
+        l.selection = vec![0];
+        assert_eq!(l.selection_extent(), Extent::new(0.0, 0.0, 0.0, 0.0));
+        assert_eq!(m.selection_extent(), Extent::new(0.0, 0.0, 0.0, 0.0));
     }
 
     #[test]

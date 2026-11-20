@@ -639,7 +639,7 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
             if let Some(r) = inputs.raster(n) {
                 raster_crs.push(r.raster.crs);
             } else if let Some(ds) = inputs.dataset(n) {
-                vector_extents.push(ds.extent());
+                vector_extents.push(ds.lonlat_extent());
             }
         }
     }
@@ -874,7 +874,7 @@ pub fn finish(job: &Job, files: &[(String, Vec<u8>)], lines: &[String], dir: Opt
     if layers.is_empty() && messages.is_empty() {
         messages.push(format!("{} finished without output", job.name));
     }
-    ToolResult { output: Output::Layers(layers), messages }
+    ToolResult { losses: Vec::new(), output: Output::Layers(layers), messages }
 }
 
 /// Runs a tool to completion: natively through the `geolibre` program; in the browser the

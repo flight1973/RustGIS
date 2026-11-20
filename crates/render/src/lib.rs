@@ -603,6 +603,13 @@ pub fn picture_marker_draws(p: rustgis_map::Picture) -> bool {
     picture::marker_aspect(p).is_some()
 }
 
+/// Picture marker `p`'s image at most `side` pixels per side (a preview's), and its height for its
+/// width from before it was scaled down; `None` where the map draws a circle. Decoded on every
+/// call: the caller keeps it.
+pub fn picture_marker_image(p: rustgis_map::Picture, side: u32) -> Option<(Pixmap, f32)> {
+    picture::marker_image(p, side)
+}
+
 /// The colour unplaced labels are drawn in.
 pub const UNPLACED: Rgba = Rgba::rgb(0xD0, 0x1C, 0x1C);
 
@@ -1136,13 +1143,13 @@ impl Ctx<'_> {
 
     /// A line drawn as its stacked strokes (`Layer::strokes`), bottom first, each
     /// shifted sideways by its offset.
-    fn stacked_line(&self, pm: &mut Canvas, parts: &[Vec<Coord>], s: &Symbol, strokes: &[LineStroke], halo: bool) {
+    fn stacked_line(&self, pm: &mut Canvas, parts: &[Vec<Coord>], s: &Symbol, strokes: &[LineStroke], pass: line_markers::Pass) {
         let (mut pb, mut starts) = (PathBuilder::new(), DashStarts::default());
         for part in parts {
             self.ring_path_at(&mut pb, part, false, &mut starts);
         }
         let Some(path) = pb.finish() else { return };
-        self.stacked_path(pm, &path, s, strokes, &starts, parts, halo);
+        self.stacked_path(pm, &path, s, strokes, &starts, parts, pass);
     }
 
     /// A stroke's dash pattern in pixels for `path`, or `None` to draw it solid: a pattern under a
@@ -1159,7 +1166,7 @@ impl Ctx<'_> {
     /// longer or shorter than the line.
     ///
     /// `parts` is the line `path` was made from: markers along it are placed along the line as a
-    /// whole ([`line_markers`]). `halo`: the strokes are a selected line's halo, drawn under it.
+    /// whole ([`line_markers`]). `pass`: the line, or its halo as selected, drawn under it.
     #[expect(clippy::too_many_arguments, reason = "a line's path, what it was made from and how it is drawn")]
     fn stacked_path(
         &self,
@@ -1169,7 +1176,7 @@ impl Ctx<'_> {
         strokes: &[LineStroke],
         starts: &DashStarts,
         parts: &[Vec<Coord>],
-        halo: bool,
+        pass: line_markers::Pass,
     ) {
         // Shifted once per offset: a casing and its core usually share one.
         let mut shifted: Vec<(f32, Option<tiny_skia::Path>)> = Vec::new();
@@ -1179,7 +1186,7 @@ impl Ctx<'_> {
             let (c, w) = st.resolve(s);
             if let Some(m) = &st.markers {
                 let runs = runs.get_or_insert_with(|| self.marker_runs(parts));
-                line_markers::draw(pm, runs, m, c, if w.is_nan() { 0.0 } else { w }, st.offset, self.ppp, halo);
+                line_markers::draw(pm, runs, m, c, if w.is_nan() { 0.0 } else { w }, st.offset, self.ppp, pass);
                 continue;
             }
             if w.is_nan() || w <= 0.0 || c.a() == 0 {
@@ -1532,8 +1539,8 @@ impl Ctx<'_> {
                         ..*st
                     })
                     .collect();
-                self.stacked_line(pm, parts, s, &halo, true);
-                self.stacked_line(pm, parts, s, strokes, false);
+                self.stacked_line(pm, parts, s, &halo, line_markers::Pass::Halo);
+                self.stacked_line(pm, parts, s, strokes, line_markers::Pass::Ink);
             }
             Geometry::Point(c) if !point_marks::plain(strokes, turn) => self.marks(pm, *c, s, strokes, turn, Some(SELECTION)),
             Geometry::MultiPoint(v) if !point_marks::plain(strokes, turn) => {
@@ -2740,7 +2747,7 @@ fn drape_terrain(
     // at 160 cells).
     type Vertex = ((f64, f64), (f64, f64), f64);
     let (pw, ph) = (f64::from(pm.width()), f64::from(pm.height()));
-    let mut grids: Vec<(usize, Vec<Option<Vertex>>, Vec<Option<u8>>)> = Vec::with_capacity(bands.len());
+    let mut grids: Vec<(usize, Vec<Option<Vertex>>, Vec<Option<u16>>)> = Vec::with_capacity(bands.len());
     let mut tris: Vec<(f64, u32, u32)> = Vec::new();
     // A block diagram (#1914): each vertex's sides of the box it lies beyond, and the stretches of
     // the box's edge the ground cut to it ends at, for the walls.
@@ -2756,7 +2763,7 @@ fn drape_terrain(
         // same map point.
         let points = (nx + 1) * (ny + 1);
         let mut grid: Vec<Option<Vertex>> = Vec::with_capacity(points);
-        let mut codes: Vec<Option<u8>> = Vec::with_capacity(if block.is_some() { points } else { 0 });
+        let mut codes: Vec<Option<u16>> = Vec::with_capacity(if block.is_some() { points } else { 0 });
         for (i, j) in (0..=ny).flat_map(|j| (0..=nx).map(move |i| (i, j))) {
             let (lx, ly) = (v.width * i as f64 / nx as f64, v.height * j as f64 / ny as f64);
             let m = v.camera.to_map(lx, ly, v.width, v.height);
@@ -2779,9 +2786,9 @@ fn drape_terrain(
                 if depth < d0 - margin || depth > d1 + margin || p.2.min(q.2).min(r.2) > far {
                     continue;
                 }
-                // Wholly beyond one side of the block's box: not drawn.
+                // Wholly beyond one side of the block's box (or a tangent of its circle): not drawn.
                 let code = codes.and_then(|c| c.get(half).copied()).unwrap_or([0; 3]);
-                if code[0] & code[1] & code[2] != 0 {
+                if code[0] & code[1] & code[2] & !block::ROUND_OFF != 0 {
                     continue;
                 }
                 // Wholly off one side of the picture: nothing to draw. Across the block's edge it
@@ -2835,7 +2842,7 @@ fn drape_terrain(
                             (w[0] * dst[0].0 + w[1] * dst[1].0 + w[2] * dst[2].0, w[0] * dst[0].1 + w[1] * dst[1].1 + w[2] * dst[2].1)
                         })
                         .collect();
-                    block::edges(&poly, &screen, depth, &mut edges);
+                    block::edges(b, &poly, &screen, depth, &mut edges);
                     (c != [0; 3]).then_some(screen)
                 }
             }
@@ -3679,6 +3686,9 @@ fn upright_markers_with(map: &mut Map, view: &View, margin: f64, env: &Env) -> V
         let layer: &rustgis_map::Layer = layer;
         let styler = layer.styler_with(env.at_scale(Some(scale)));
         let mut here: Vec<(f64, UprightMarker)> = Vec::new();
+        // Boxes in longitude/latitude for the view distance, from the dataset's own coordinates:
+        // none is drawn when they can't be converted, as `within_view_distance` draws none.
+        let to_lonlat = clip.and_then(|_| layer.dataset.lonlat_conversion().ok());
         for (row, g) in layer.projected_cache().iter().enumerate() {
             if rows.get(row) != Some(&true) {
                 continue;
@@ -3688,7 +3698,10 @@ fn upright_markers_with(map: &mut Map, view: &View, margin: f64, env: &Env) -> V
                 Some(Geometry::MultiPoint(v)) => v,
                 _ => continue,
             };
-            let lonlat = clip.and_then(|_| layer.dataset.features.get(row).and_then(|f| f.geometry.as_ref()).map(|g| g.extent()));
+            let lonlat = clip.and_then(|_| {
+                let own = layer.dataset.features.get(row).and_then(|f| f.geometry.as_ref())?.extent();
+                Some(to_lonlat.as_ref().map_or(rustgis_geom::Extent::EMPTY, |t| t.extent(&own)))
+            });
             if let (Some((centre, d)), Some(e)) = (clip, lonlat) {
                 let near = Coord::new(centre.x.clamp(e.min_x, e.max_x), centre.y.clamp(e.min_y, e.max_y));
                 if e.is_empty() || rustgis_geom::haversine_m(centre, near) > d {
@@ -4046,6 +4059,29 @@ impl Drop for TiltGlint {
     fn drop(&mut self) {
         let kept = self.0.take();
         TILT_GLINT.with(|g| g.replace(kept));
+    }
+}
+
+/// Leaves out of `rows` the features of `dataset` entirely beyond `d` metres of `centre` (the
+/// map's view distance, lon/lat): one reaching into it (its box's nearest point within the
+/// distance) is kept, one with no geometry isn't.
+pub(crate) fn within_view_distance(rows: &mut [bool], dataset: &rustgis_data::Dataset, centre: Coord, d: f64) {
+    // Each box in longitude/latitude, from the dataset's own coordinates: none is drawn when they
+    // can't be converted, as `Layer::projected_in` draws none.
+    let to = dataset.lonlat_conversion().ok();
+    for (r, keep) in rows.iter_mut().enumerate() {
+        if *keep {
+            let e = dataset
+                .features
+                .get(r)
+                .and_then(|f| f.geometry.as_ref())
+                .and_then(|g| to.as_ref().map(|t| t.extent(&g.extent())))
+                .filter(|e| !e.is_empty());
+            *keep = e.is_some_and(|e| {
+                let near = Coord::new(centre.x.clamp(e.min_x, e.max_x), centre.y.clamp(e.min_y, e.max_y));
+                rustgis_geom::haversine_m(centre, near) <= d
+            });
+        }
     }
 }
 
@@ -4659,16 +4695,7 @@ fn render_frame(
             // View clipping: features entirely beyond the distance from the view's centre are left
             // out; one reaching into it (its box's nearest point within the distance) still draws.
             if let Some((centre, d)) = clip {
-                for (r, keep) in rows.iter_mut().enumerate() {
-                    if *keep {
-                        let e =
-                            layer.dataset.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| g.extent()).filter(|e| !e.is_empty());
-                        *keep = e.is_some_and(|e| {
-                            let near = Coord::new(centre.x.clamp(e.min_x, e.max_x), centre.y.clamp(e.min_y, e.max_y));
-                            rustgis_geom::haversine_m(centre, near) <= d
-                        });
-                    }
-                }
+                within_view_distance(&mut rows, &layer.dataset, centre, d);
             }
             // Exact positions are needed by labels, selection and effects. Plain flat layers can
             // project only their retained display vertices, leaving interaction geometry lazy.
@@ -4865,7 +4892,8 @@ fn render_frame(
                     let mut stroke_paths = stroke_paths::Paths::default();
                     // Symbol levels: lines with stacked strokes wait, and go down a level at a time
                     // after the rest (each batch of a streamed layer on its own).
-                    let levels = layer.stroke_levels && layer.has_strokes();
+                    let has_strokes = layer.has_strokes();
+                    let levels = layer.stroke_levels && has_strokes;
                     // Polygons with stacked fills (patterns) draw them in place of their single fill.
                     let has_fills = layer.has_fills();
                     let mut stacked: Vec<(&[Vec<Coord>], Symbol, &[LineStroke])> = Vec::new();
@@ -4885,17 +4913,27 @@ fn render_frame(
                         since_look += rustgis_map::lod::vertices(g);
                         let e = extents.get(row).copied().unwrap_or_else(|| g.extent());
                         // A point's marks, shifted from it, or a tall image may show while the point is
-                        // off the view.
+                        // off the view; a line's stacked strokes, shifted sideways, or its markers too.
                         let marked_in = || {
-                            if globe.is_some() || !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+                            if globe.is_some() || matches!(g, Geometry::Polygon(_)) {
+                                return false;
+                            }
+                            // (A line layer with no stacked strokes isn't styled for it.)
+                            if matches!(g, Geometry::Line(_)) && !has_strokes {
                                 return false;
                             }
                             let (sym, strokes) = styler.style(row);
-                            let marks = styler.marks(row, strokes);
-                            let reach = match sym.marker {
-                                _ if !marks.is_empty() => point_marks::reach(&sym, &marks),
-                                Marker::Picture(_) => sym.size * marker_reach(sym.marker),
-                                _ => return false,
+                            let reach = match g {
+                                Geometry::Line(_) if strokes.is_empty() => return false,
+                                Geometry::Line(_) => line_markers::reach(strokes, sym.stroke_width),
+                                _ => {
+                                    let marks = styler.marks(row, strokes);
+                                    match sym.marker {
+                                        _ if !marks.is_empty() => point_marks::reach(&sym, &marks),
+                                        Marker::Picture(_) => sym.size * marker_reach(sym.marker),
+                                        _ => return false,
+                                    }
+                                }
                             };
                             // In the layer's pixels (`ctx` is scaled by its size factor).
                             let r = f64::from(reach * ctx.ppp) * map_per_px;
@@ -5308,23 +5346,18 @@ fn render_frame(
                                 };
                                 let (mut chars, mut advances) = measure(&text);
                                 // Fitted to its line (#2265): abbreviated when the full name can't
-                                // follow it anywhere it is tried, and set on its straightest
-                                // stretches when it takes more than a third of it. The places it
-                                // can follow, best first; none: placed as without `fit`.
+                                // follow it anywhere it is tried, set on its straightest stretches
+                                // when it takes more than a third of it, and spread (the middle
+                                // first) when the line has room to spare. The places it can
+                                // follow, best first; none: placed as without `fit`. A spread
+                                // name follows a smoother course (#2259), so it may go where the
+                                // close-set one couldn't.
                                 let mut fitted: Option<Vec<f32>> = None;
+                                // Its letter spacing, and the close-set one (its own) when spread.
+                                let close_gap = spacing * 1.33;
+                                let (mut gap, mut spread) = (close_gap, false);
                                 if class.fit == rustgis_map::symbology::LabelFit::Auto {
-                                    let gap = spacing * 1.33;
-                                    let follows = |advances: &[f32]| -> Vec<f32> {
-                                        let len = line_labels::curved_len(advances, gap);
-                                        // Where it will be placed: a repeat's places as they are.
-                                        let tried = match (locked_at, repeat) {
-                                            (Some(at), _) => vec![at],
-                                            (None, Some(_)) => {
-                                                line_labels::repeats(line.length(), repeat).into_iter().map(|(_, d)| d).collect()
-                                            }
-                                            (None, None) if 3.0 * len > line.length() => line.straightest(len, 8),
-                                            (None, None) => line_labels::positions(line.length(), len, overrun),
-                                        };
+                                    let follows = |advances: &[f32], gap: f32, tried: Vec<f32>| -> Vec<f32> {
                                         tried
                                             .into_iter()
                                             .filter(|d| {
@@ -5334,14 +5367,45 @@ fn render_frame(
                                             })
                                             .collect()
                                     };
-                                    let mut at = follows(&advances);
+                                    let close = |advances: &[f32]| -> Vec<f32> {
+                                        let len = line_labels::curved_len(advances, close_gap);
+                                        // Where it will be placed: a repeat's places as they are.
+                                        let tried = match (locked_at, repeat) {
+                                            (Some(at), _) => vec![at],
+                                            (None, Some(_)) => {
+                                                line_labels::repeats(line.length(), repeat).into_iter().map(|(_, d)| d).collect()
+                                            }
+                                            (None, None) if 3.0 * len > line.length() => line.straightest(len, 8),
+                                            (None, None) => line_labels::positions(line.length(), len, overrun),
+                                        };
+                                        follows(advances, close_gap, tried)
+                                    };
+                                    let mut at = close(&advances);
                                     if at.is_empty()
                                         && let Some(short) = line_labels::abbreviated(&text, &class.abbreviations)
                                     {
                                         let (c, a) = measure(&short);
-                                        at = follows(&a);
+                                        at = close(&a);
                                         if !at.is_empty() {
                                             (text, chars, advances) = (short, c, a);
+                                        }
+                                    }
+                                    // Spread over `stretch` of the line, the middle first; where it
+                                    // can't follow the line, close-set. With a repeat that names the
+                                    // line more than once, only on a line more than two spread names
+                                    // long, so close-set repeats still go beside it; on a shorter one
+                                    // the repeats stay close-set, as without spreading.
+                                    let stretch = class.stretch.unwrap_or(rustgis_map::symbology::DEFAULT_LABEL_STRETCH);
+                                    let repeated = line_labels::repeats(line.length(), repeat).len() > 1;
+                                    if let Some(wide) = line_labels::spread_gap(&advances, close_gap, line.length(), stretch)
+                                        && let len = line_labels::curved_len(&advances, wide)
+                                        && !(repeated && line.length() <= 2.0 * len)
+                                    {
+                                        let tried =
+                                            locked_at.map_or_else(|| line_labels::positions(line.length(), len, overrun), |at| vec![at]);
+                                        let wide_at = follows(&advances, wide, tried);
+                                        if !wide_at.is_empty() {
+                                            (at, gap, spread) = (wide_at, wide, true);
                                         }
                                     }
                                     // (A locked label keeps its own place; only its text is fitted.)
@@ -5349,7 +5413,7 @@ fn render_frame(
                                 }
                                 let first = locked_at.or_else(|| fitted.as_ref().and_then(|f| f.first().copied()));
                                 if try_others {
-                                    let width = line_labels::curved_len(&advances, spacing * 1.33);
+                                    let width = line_labels::curved_len(&advances, gap);
                                     let positions = fitted.clone().unwrap_or_else(|| positions(width));
                                     // A saved slot the curve cannot take has no truthful preview either (as for a
                                     // straight line): never draw one at the anchor or the middle.
@@ -5375,7 +5439,7 @@ fn render_frame(
                                             line: line.clone(),
                                             chars,
                                             advances,
-                                            gap: spacing * 1.33,
+                                            gap,
                                             size,
                                             overrun,
                                             off,
@@ -5384,14 +5448,26 @@ fn render_frame(
                                         locked,
                                     ));
                                 } else {
-                                    // Fitted without a repeat: on the best place it follows.
-                                    let along = match (&fitted, repeat) {
-                                        (Some(at), None) => at.first().map(|d| (0, *d)).into_iter().collect(),
-                                        _ => line_labels::repeats(line.length(), repeat),
+                                    // Fitted without a repeat: on the best place it follows. Spread
+                                    // with a repeat (a line more than two spread labels long): there,
+                                    // and close-set at the repeats clear of it.
+                                    let along: Vec<(usize, f32, f32)> = match (&fitted, repeat) {
+                                        (Some(at), None) => at.first().map(|d| (0, *d, gap)).into_iter().collect(),
+                                        (Some(at), Some(_)) if spread => {
+                                            let first = at.first().copied().unwrap_or(line.length() / 2.0);
+                                            let (wide, close) =
+                                                (line_labels::curved_len(&advances, gap), line_labels::curved_len(&advances, close_gap));
+                                            let clear = (wide + close) / 2.0 + size;
+                                            let others = line_labels::repeats_clear_of(line.length(), repeat, first, clear)
+                                                .into_iter()
+                                                .map(|(i, d)| (i, d, close_gap));
+                                            std::iter::once((0, first, gap)).chain(others).collect()
+                                        }
+                                        _ => line_labels::repeats(line.length(), repeat).into_iter().map(|(i, d)| (i, d, gap)).collect(),
                                     };
-                                    for (i, at) in along {
+                                    for (i, at, gap) in along {
                                         let Some(((cx, cy), turns)) = line
-                                            .curved(&advances, spacing * 1.33, size, overrun, Some(at))
+                                            .curved(&advances, gap, size, overrun, Some(at))
                                             .and_then(|c| line_labels::curved_off(c, off))
                                         else {
                                             continue;
@@ -9538,6 +9614,7 @@ mod tests {
         let m = export.join().unwrap();
         assert!(waited, "the export waited for the far band's cast shadows");
         let rl = m.layer(id).and_then(|l| l.raster.as_ref()).unwrap();
+        assert!(rl.cast_shadow_jobs() > 0, "completed light work remains observable");
         assert!(matches!(rl.cast_shadows(false, (0, 0), || {}), rustgis_map::raster::CastShadows::Ready(_)), "and drew them");
     }
 
@@ -9576,10 +9653,7 @@ mod tests {
             }
             render_complete(&mut m, &view).unwrap();
             let rl = m.layer(id).and_then(|l| l.raster.as_ref()).unwrap();
-            assert!(
-                matches!(rl.cast_shadows(false, (0, 0), || {}), rustgis_map::raster::CastShadows::Pending),
-                "grouped {grouped}: nothing was worked out for it"
-            );
+            assert_eq!(rl.cast_shadow_jobs(), 0, "grouped {grouped}: no light work was started");
         }
     }
 
@@ -9917,6 +9991,7 @@ mod tests {
             depth: Some(1000.0),
             walls: rustgis_map::view::BLOCK_WALLS,
             walls_layer: None,
+            shape: rustgis_map::view::BlockShape::Box,
         };
         let terrain = |block: Option<rustgis_map::view::TerrainBlock>| {
             Some(rustgis_map::view::Terrain {
@@ -9960,6 +10035,63 @@ mod tests {
     }
 
     #[test]
+    fn a_round_block_cuts_the_ground_to_its_circle_and_stands_its_wall_round_it() {
+        // #2318: the circle in a 2 km box over flat ground 500 m high, seen from the south. Below
+        // its south-west point stands a wall where the box had ground; past it, by the box's far
+        // corner, the fog shows where the box had ground.
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let camera = Camera { center: Coord::new(0.0, 0.0), res: 20.0, bearing: 0.0, pitch: 60.0 };
+        let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        let gt = GeoTransform { origin_x: -5000.0, origin_y: 5000.0, pixel_width: 20.0, pixel_height: -20.0 };
+        let dem =
+            Raster::new("dem", 500, 500, vec![vec![500.0; 500 * 500]], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        m.add_raster("dem", rustgis_map::RasterLayer::from_path(dem, "dem.tif"));
+        let mut frame = |shape| {
+            m.view.terrain = Some(rustgis_map::view::Terrain {
+                source: rustgis_map::view::TerrainSource::Layer("dem".into()),
+                exaggeration: 1.0,
+                block: Some(rustgis_map::view::TerrainBlock {
+                    extent: Some([-1000.0, -1000.0, 1000.0, 1000.0]),
+                    depth: Some(1000.0),
+                    walls: rustgis_map::view::BLOCK_WALLS,
+                    walls_layer: None,
+                    shape,
+                }),
+                water: None,
+            });
+            let g = terrain::Ground::of(&m, &camera).expect("terrain");
+            (render(&mut m, &view).expect("a frame"), g.block(&m).expect("a block"), g.per_unit(Coord::new(0.0, 0.0)))
+        };
+        let (boxed, _, _) = frame(rustgis_map::view::BlockShape::Box);
+        let (round, b, per_unit) = frame(rustgis_map::view::BlockShape::Circle { radius: None });
+        assert_eq!(b.circle, Some((Coord::new(0.0, 0.0), 1000.0)));
+        let screen = |x: f64, y: f64, metres: f64| {
+            let (u, v) = camera.ground_px(Coord::new(x, y));
+            camera.project_raised(u, v, metres / per_unit / camera.res, view.width, view.height).expect("in view")
+        };
+        let px = |r: &Rendered, p: (f64, f64)| r.pixmap.pixel(p.0 as u32, p.1 as u32).expect("in the frame").demultiply();
+        // 150 m down the wall under the circle's south-west point, where the box's ground lies.
+        let d = 1000.0 * std::f64::consts::FRAC_1_SQRT_2;
+        let mid = screen(-d, -d, 350.0);
+        let wall = px(&round, mid);
+        assert!(wall.red() > wall.green() && wall.green() > wall.blue() + 8, "{wall:?}");
+        assert_ne!(wall, px(&boxed, mid));
+        // A smaller radius makes a smaller circle; one larger than the box's takes the box's.
+        assert_eq!(frame(rustgis_map::view::BlockShape::Circle { radius: Some(400.0) }).1.circle.map(|c| c.1), Some(400.0));
+        assert_eq!(frame(rustgis_map::view::BlockShape::Circle { radius: Some(4000.0) }).1.circle.map(|c| c.1), Some(1000.0));
+        // The ground by the far corner: the box's, gone from the circle's.
+        let (_, fog) = tilt_sky(&m);
+        let corner = px(&round, screen(950.0, 950.0, 500.0));
+        assert!(
+            [(corner.red(), fog.r()), (corner.green(), fog.g()), (corner.blue(), fog.b())].iter().all(|(a, b)| a.abs_diff(*b) <= 2),
+            "{corner:?} vs {fog:?}"
+        );
+        assert_ne!(corner, px(&boxed, screen(950.0, 950.0, 500.0)));
+    }
+
+    #[test]
     fn a_block_diagrams_wall_shows_the_unit_under_its_edge() {
         // #1914: the near wall of a 2 km box, seen from the south, with a red unit over the box's
         // west half: red below the edge's west half, the walls' sandy brown below its east half.
@@ -9994,6 +10126,7 @@ mod tests {
                 depth: Some(1000.0),
                 walls: rustgis_map::view::BLOCK_WALLS,
                 walls_layer: Some("geo".into()),
+                shape: rustgis_map::view::BlockShape::Box,
             }),
             water: None,
         });
@@ -12103,6 +12236,103 @@ mod tests {
     }
 
     #[test]
+    fn a_lines_markers_and_shifted_strokes_show_while_it_is_off_the_view() {
+        use base64::Engine;
+        use rustgis_map::{LineMark, LineMarkers, LineStroke, Picture};
+        // A line 40 px above a 200 px view (140 px north of its centre), past its cull margin.
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("rail", GeometryType::Polyline, vec![]);
+        let lat = 140.0 * 1500.0 / 111_319.49;
+        d.push(Some(Geometry::Line(vec![vec![Coord::new(-1.0, lat), Coord::new(1.0, lat)]])), vec![]);
+        let id = m.add_dataset(d);
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
+        let red = |p: tiny_skia::PremultipliedColorU8| p.red() > 200 && p.green() < 60 && p.blue() < 60;
+        // A red image ten times as tall as wide: 10 pt wide along the line, it reaches 50 px down
+        // from it, 10 px into the view.
+        let mut tall = tiny_skia::Pixmap::new(4, 40).unwrap();
+        tall.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let tall = Picture::new(&base64::engine::general_purpose::STANDARD.encode(tall.encode_png().unwrap()));
+        let images = LineMarkers { mark: LineMark::Marker(Marker::Picture(tall)), size: 10.0, interval: 30.0, ..LineMarkers::default() };
+        let stroke = LineStroke { color: Some(Rgba::rgb(255, 0, 0)), width: Some(4.0), ..LineStroke::default() };
+        // Its images, and a stroke 50 pt to the right of its direction (down the screen, going
+        // east), 4 pt wide: y 8 to 12.
+        for (stroke, rows) in [(LineStroke { markers: Some(images), ..stroke }, 0..8), (LineStroke { offset: 50.0, ..stroke }, 8..12)] {
+            m.layer_mut(id).unwrap().line_strokes = vec![stroke];
+            let r = render(&mut m, &view).unwrap();
+            let shows = rows.clone().any(|y| (0..200).any(|x| r.pixmap.pixel(x, y).is_some_and(red)));
+            assert!(shows, "{stroke:?} shows in rows {rows:?}");
+        }
+    }
+
+    /// A picture marker drawn at many places, along lines and at points, is one picture to a vector
+    /// export: kept once in the frame's drawing, written once into a PDF.
+    #[test]
+    fn a_picture_marker_is_one_picture_in_a_vector_export() {
+        use base64::Engine;
+        use rustgis_map::{LineMark, LineMarkers, LineStroke, Picture};
+        // Noise, which compresses little: its pixels outweigh what placing it takes.
+        let mut noise = tiny_skia::Pixmap::new(300, 150).unwrap();
+        let mut seed = 7u32;
+        for px in noise.pixels_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let [r, g, b, _] = seed.to_le_bytes();
+            *px = tiny_skia::ColorU8::from_rgba(r, g, b, 255).premultiply();
+        }
+        let picture = Picture::new(&base64::engine::general_purpose::STANDARD.encode(noise.encode_png().unwrap()));
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("icons", GeometryType::Point, vec![]);
+        for x in [-0.5, 0.0, 0.5] {
+            d.push(Some(Geometry::Point(Coord::new(x, 0.3))), vec![]);
+        }
+        let id = m.add_dataset(d);
+        let none = Rgba::new(0, 0, 0, 0);
+        m.layer_mut(id).unwrap().renderer = rustgis_map::Renderer::Single(Symbol {
+            fill: none,
+            stroke: none,
+            stroke_width: 0.0,
+            size: 20.0,
+            marker: Marker::Picture(picture),
+        });
+        let mut d = Dataset::new("rail", GeometryType::Polyline, vec![]);
+        d.push(Some(Geometry::Line(vec![vec![Coord::new(-1.0, -0.3), Coord::new(1.0, -0.3)]])), vec![]);
+        let line = m.add_dataset(d);
+        let markers =
+            LineMarkers { mark: LineMark::Marker(Marker::Picture(picture)), size: 12.0, interval: 40.0, ..LineMarkers::default() };
+        m.layer_mut(line).unwrap().line_strokes = vec![LineStroke { markers: Some(markers), ..LineStroke::default() }];
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
+        let mut record = || render_complete_recorded(&mut m, &view, &mut None).unwrap().recorded.unwrap().into_drawing().unwrap();
+        let drawing = record();
+        let cost = drawing.cost();
+        let (_, _, items) = drawing.finish();
+        fn images(items: &[vector::Item], out: &mut Vec<std::sync::Arc<vector::Pixels>>) {
+            for i in items {
+                match i {
+                    vector::Item::Image(image) if image.shared => out.push(image.pixels.clone()),
+                    vector::Item::Image(_) => panic!("a picture marker drawn as a picture of its own"),
+                    vector::Item::Group(g) => images(&g.items, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut shared = Vec::new();
+        images(&items, &mut shared);
+        assert!(shared.len() >= 6, "three points and markers along the line: {}", shared.len());
+        assert!(shared.iter().all(|p| std::sync::Arc::ptr_eq(p, &shared[0])), "one picture");
+        let once = shared[0].cost();
+        assert!(once > 50_000 && cost < 2 * once, "its pixels counted once: {cost} for {} of {once}", shared.len());
+        let pdf = pdf::write(&[pdf::Page::drawing(record(), 50.0, 50.0)], "");
+        let objects = pdf::tests::objects(&pdf);
+        let written: Vec<&String> = objects.iter().map(|o| &o.0).filter(|dict| dict.contains("/Subtype /Image")).collect();
+        assert_eq!(written.len(), 1, "the image written once: {written:?}");
+        let placed: usize = objects.iter().map(|o| String::from_utf8_lossy(&o.1).matches(" Do\n").count()).sum();
+        assert!(placed >= shared.len(), "and placed at each: {placed}");
+    }
+
+    #[test]
     fn markers_and_hash_marks_draw_along_a_line() {
         use rustgis_map::{LineMark, LineMarkers, LineStroke, Placements};
         // A line from lon -1 to 1 at 1,500 m a pixel: x 25.8 to 174.2, along y 100.
@@ -12334,7 +12564,7 @@ mod tests {
             };
             let s = Symbol::default_for(GeometryType::Polyline, 0);
             let mut drawn = Pixmap::new(100, 20).unwrap();
-            crate::canvas::with_canvas(&mut drawn, |c| ctx.stacked_path(c, &cut, &s, &[stroke], &starts, &[], false));
+            crate::canvas::with_canvas(&mut drawn, |c| ctx.stacked_path(c, &cut, &s, &[stroke], &starts, &[], line_markers::Pass::Ink));
             let mut whole = Pixmap::new(100, 20).unwrap();
             let mut pb = PathBuilder::new();
             let (x0, y) = view.to_screen(line[0]);
@@ -12587,6 +12817,70 @@ mod tests {
         assert_eq!(texts(&mut m), ["Ribeirão"], "without a repeat, on an arm");
         m.layer_mut(id).unwrap().labels.default.repeat = Some(10_000.0);
         assert_eq!(texts(&mut m), ["R."], "repeated from its middle, on the rise");
+    }
+
+    /// Fitted to a line with room to spare (#2265): a name is spread over `stretch` of it (0.6 by
+    /// default), its letters at most three widths apart; on a much longer line with a repeat, spread at its middle and close-set at the
+    /// repeats clear of it; off, close-set.
+    #[test]
+    fn a_fitted_name_is_spread_along_a_long_line_and_repeated_close_set() {
+        let face = text::Face { bold: false, italic: false, serif: false, family: None };
+        let advances = |t: &str| t.graphemes(true).map(|c| text::measure_in(c, 12.0, face)).collect::<Vec<f32>>();
+        // How far a label's first character's centre is from its last's.
+        let span = |l: &PlacedLabel| l.glyphs.last().map_or(0.0, |g| g.dx) - l.glyphs.first().map_or(0.0, |g| g.dx);
+        let ends = |t: &str| advances(t).first().unwrap() / 2.0 + advances(t).last().unwrap() / 2.0;
+        let degrees = |points: f32| f64::from(points) / (111_320.0 / 1500.0);
+        let name = "Ribeirão Santo Antônio";
+        let room = 6.5 * line_labels::curved_len(&advances(name), 0.0);
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("rivers", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        let level = |y: f64, len: f32| Geometry::Line(vec![vec![Coord::new(-degrees(len) / 2.0, y), Coord::new(degrees(len) / 2.0, y)]]);
+        d.push(Some(level(0.5, room)), vec![Value::Text(name.into())]);
+        d.push(Some(level(-0.5, 1200.0)), vec![Value::Text("Rio Doce".into())]);
+        let id = m.add_dataset(d);
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: f64::from(room.max(1200.0) + 100.0), height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        let l = m.layer_mut(id).unwrap();
+        l.labels.enabled = true;
+        l.labels.default.field = "name".into();
+        l.labels.default.size = 12.0;
+        l.labels.default.placement = rustgis_map::LabelPlacement::Curved;
+        let r = render(&mut m, &view).unwrap();
+        let close = r.labels.iter().find(|l| l.text == name).expect("placed");
+        assert!((span(close) - (line_labels::curved_len(&advances(name), 0.0) - ends(name))).abs() < 1.0, "off: close-set");
+        m.layer_mut(id).unwrap().labels.default.fit = rustgis_map::symbology::LabelFit::Auto;
+        let r = render(&mut m, &view).unwrap();
+        let spread = r.labels.iter().find(|l| l.text == name).expect("placed");
+        // 60 % of the line, or as far as letters three widths apart reach.
+        let a = advances(name);
+        let widest = line_labels::curved_len(&a, 3.0 * a.iter().sum::<f32>() / a.len() as f32);
+        assert!((span(spread) - ((0.6 * room).min(widest) - ends(name))).abs() < 2.0, "{} of {room}", span(spread));
+        m.layer_mut(id).unwrap().labels.default.stretch = Some(0.3);
+        let r = render(&mut m, &view).unwrap();
+        let spread = r.labels.iter().find(|l| l.text == name).expect("placed");
+        assert!((span(spread) - (0.3 * room - ends(name))).abs() < 2.0, "{} of {room}", span(spread));
+        // 300 points between repeats: one spread at the middle, two close-set either side.
+        m.layer_mut(id).unwrap().labels.default.repeat = Some(300.0);
+        let r = render(&mut m, &view).unwrap();
+        let doce: Vec<&PlacedLabel> = r.labels.iter().filter(|l| l.text == "Rio Doce").collect();
+        let close = line_labels::curved_len(&advances("Rio Doce"), 0.0) - ends("Rio Doce");
+        assert_eq!(doce.len(), 3);
+        let (wide, narrow): (Vec<&PlacedLabel>, Vec<&PlacedLabel>) = doce.into_iter().partition(|l| span(l) > 2.0 * close);
+        assert_eq!(wide.len(), 1);
+        let mid = view.width as f32 / 2.0;
+        assert!((wide[0].x - mid).abs() < 1.0, "spread at the middle: {}", wide[0].x);
+        assert!(narrow.iter().all(|l| (span(l) - close).abs() < 1.0 && (l.x - mid).abs() > 390.0));
+        // At 0.6 the name's line is too short for two spread names: it keeps its repeats,
+        // close-set as without `fit`.
+        m.layer_mut(id).unwrap().labels.default.stretch = None;
+        let r = render(&mut m, &view).unwrap();
+        let fitted: Vec<&PlacedLabel> = r.labels.iter().filter(|l| l.text == name).collect();
+        let full = line_labels::curved_len(&advances(name), 0.0) - ends(name);
+        assert!(fitted.len() > 1 && fitted.iter().all(|l| (span(l) - full).abs() < 1.0), "{} labels", fitted.len());
+        m.layer_mut(id).unwrap().labels.default.fit = rustgis_map::symbology::LabelFit::Off;
+        let r = render(&mut m, &view).unwrap();
+        assert_eq!(r.labels.iter().filter(|l| l.text == name).count(), fitted.len());
     }
 
     #[test]

@@ -418,6 +418,37 @@ fn reset(s: &mut Session, p: Project) {
             false,
         ),
     }
+    // Water on a layer read a view at a time (#2305), which `map.terrain` refuses, would come
+    // from the rows the view holds (the map draws none from it): dropped and said, as the project
+    // opens.
+    let mut streamed_water: Vec<(String, String)> = Vec::new();
+    for m in s.project.maps.iter_mut() {
+        let Some(name) = m.view.terrain.as_ref().and_then(|t| t.water.as_ref()).map(|w| w.layer.clone()) else { continue };
+        if m.layer_by_name(&name).is_some_and(|l| l.is_streamed()) {
+            if let Some(t) = m.view.terrain.as_mut() {
+                t.water = None;
+            }
+            streamed_water.push((m.name.clone(), name));
+        }
+    }
+    match streamed_water.as_slice() {
+        [] => {}
+        [(map, layer)] => s.notify(
+            format!("{map}: the terrain's water layer '{layer}' is read a view at a time, so the water was dropped; load all its features and set the water again"),
+            false,
+        ),
+        _ => {
+            let maps: Vec<String> = streamed_water.iter().map(|(map, layer)| format!("{map} ('{layer}')")).collect();
+            s.notify(
+                format!(
+                    "{} maps have a terrain water layer read a view at a time, so their water was dropped: {}; load all their features and set the water again",
+                    streamed_water.len(),
+                    maps.join(", ")
+                ),
+                false,
+            );
+        }
+    }
     // A terrain saved on a DEM name two layers share draws the first of them: said, as the
     // project opens (its layers keep their names).
     let shared: Vec<(String, String)> = s
@@ -505,7 +536,8 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
         }
     };
     reset(s, proj);
-    unlink_partial_copies(s, is_field);
+    let legacy_field = is_package && legacy_field_package(&s.project);
+    unlink_partial_copies(s, is_field || legacy_field);
     // A package opens as a new, unsaved project (saving writes a plain project file).
     if !is_package {
         name_from_file(s, &path);
@@ -520,6 +552,15 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
     super::connections::resolve_project(s);
     super::connections::note_waiting(s);
     Ok(Value::Null)
+}
+
+/// Before `field_origin`, the field writer named the project after the area and put only
+/// its `<area> (offline)` map in it, without any saved offline areas. Use that signature
+/// for packages even when the extension or the archive's README is unavailable.
+fn legacy_field_package(project: &Project) -> bool {
+    project.field_origin.is_none()
+        && project.offline_areas.is_empty()
+        && matches!(project.maps.as_slice(), [map] if map.name.strip_suffix(super::field::OFFLINE) == Some(project.name.as_str()))
 }
 
 /// Unlinks the maps of the project just opened that hold only some of a table's rows from the
@@ -537,10 +578,13 @@ fn unlink_partial_copies(s: &mut Session, field: bool) {
     }
 }
 
+/// Opens project JSON, including a browser package's extracted project. Package imports skip
+/// saved secret restoration and protect legacy field copies without needing their archive.
 fn open_text(s: &mut Session, p: &Value) -> CmdResult {
     let text = super::ps(p, "text").ok_or("text is required")?;
+    let package = super::b(p, "package").unwrap_or(false);
     super::connections::clear_active();
-    let proj = if super::b(p, "package").unwrap_or(false) { Project::from_import_json(text, None) } else { Project::from_json(text) };
+    let proj = if package { Project::from_import_json(text, None) } else { Project::from_json(text) };
     let proj = match proj {
         Ok(proj) => proj,
         Err(error) => {
@@ -549,7 +593,8 @@ fn open_text(s: &mut Session, p: &Value) -> CmdResult {
         }
     };
     reset(s, proj);
-    unlink_partial_copies(s, false);
+    let legacy_field = package && legacy_field_package(&s.project);
+    unlink_partial_copies(s, legacy_field);
     // The browser opens files by name and contents: the name still names the project.
     if let Some(file) = super::ps(p, "fileName") {
         name_from_file(s, std::path::Path::new(file));

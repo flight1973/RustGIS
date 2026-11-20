@@ -83,8 +83,8 @@ dialog open for another try.
 Published pipe-delimited `.dat` files open as tables when their header and rows reveal a
 separator; otherwise give `"delimiter":"|"` to `layer.addData`, or rename a text file to `.txt`.
 Gzip-compressed UTF-8 `.csv.gz`, `.tsv.gz`, `.txt.gz` and `.dat.gz` open directly, including by
-URL or upload. Decompression streams records, checks the gzip checksum and stops at 256 MiB of
-expanded text. Table rows are still kept in memory for type inference; CSV imports also refuse
+URL or upload. Decompression streams records, checks the gzip checksum and stops at the size read into memory
+(256 MiB in the web app; on the desktop it follows the computer's memory) of expanded text. Table rows are still kept in memory for type inference; CSV imports also refuse
 a retained-table estimate above a quarter of physical memory, between 256 MiB (the browser
 budget) and 4 GiB. This estimate includes cell objects and the dataset built alongside the rows. Delimited members
 in one ZIP share this allowance, including gzip-compressed members.
@@ -111,7 +111,18 @@ That pair is used for the whole file. Automatic detection keeps X/Y and longitud
 separate. If it finds candidate names for both axes but no matching pair or WKT column,
 the file opens as a table with a notice naming the candidates so you can choose x and y.
 The published aliases `Longitude Decimal Degrees`/`Latitude Decimal Degrees` and
-`Longitutde`, `Longtitude` and `Lattitude` are recognised too. The dialog checks the first 1,000 rows
+`Longitutde`, `Longtitude` and `Lattitude` are recognised too, and so are longitude and latitude
+in other languages and scripts: Chinese (`經度`/`緯度`, `座標經度`/`座標緯度`, `经度`/`纬度`), Japanese
+(`経度`/`緯度`), Korean (`경도`/`위도`), and the words for them in Vietnamese, Thai, Indonesian, Hindi,
+Arabic, Persian, Hebrew, Russian, Ukrainian, Greek, German (`Längengrad`/`Breitengrad`), Dutch,
+Spanish (`longitud`/`latitud`), Italian, the Nordic languages, Polish, Czech, Hungarian, Turkish
+and others, in any case. A note in brackets after a name (`經度(X)`, `Longitude (WGS84)`,
+`lat [deg]`) is set aside; a name as written comes before one with a note, in English and in
+other languages. A word that is also an object's length or width (German `Länge` and `Breite`)
+isn't taken as a coordinate, nor named in the notice; Spanish `longitud`, which is also a length,
+is taken only as written and beside `latitud`. English names come first when a file has both,
+and export writes English names. A name whose accents a file saved as separate marks (as some
+Macs save Vietnamese) reads as one typed with them. The dialog checks the first 1,000 rows
 of delimited text, or every row of a spreadsheet, to pick defaults. It recomputes unchanged defaults when you
 leave the coordinate-system box or press Enter; columns you picked stay picked. With a projected
 coordinate system, defaults prefer X/Y or easting/northing columns when the file also has
@@ -189,8 +200,14 @@ GeoParquet and FlatGeobuf carry their coordinate system in the file. Rasters kee
 coordinate system and are reprojected as they draw. The map uses Web Mercator by default, but
 **View › Projection** can change it; see [Maps](maps.md).
 
-Coordinate systems are read and transformed as PROJ 9.8.1 does, through terrio-crs. ESRI `.prj`
-files without an EPSG code use their projection parameters, and their datum is recognized by
+Coordinate systems are read and transformed as PROJ 9.9.0 does, through terrio-crs. A few EPSG
+and ESRI codes PROJ 9.9.0 dropped or can't compute (EPSG:3752 and 22700, ESRI:10820 and 65162)
+keep the definitions RustGIS read them by before, so they don't follow PROJ exactly. A project
+saved by an earlier release keeps the definition it saved for a layer in an ESRI code, so that
+layer is placed as it was then (ESRI:102144 246 m from PROJ 9.9.0, for one); the same code read
+from a file now is placed as PROJ places it.
+
+ESRI `.prj` files without an EPSG code use their projection parameters, and their datum is recognized by
 the name Esri gives it (ED50, OSGB36, DHDN, `D_Philippine_Reference_System_1992`,
 `D_Pulkovo_1942`, `D_Tokyo` and others): it takes the transformation PROJ uses for that datum
 and place. In a `.prj` or other WKT:

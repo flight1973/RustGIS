@@ -159,6 +159,9 @@ pub enum Fault {
     Date,
     /// `clamp(low, x, high)` with `low` above `high`.
     ClampBounds,
+    /// `$area`, `$perimeter` or `$length` of a feature with a place its system can't give in
+    /// longitude/latitude, where it is measured.
+    Unmeasurable,
 }
 
 impl Fault {
@@ -173,6 +176,7 @@ impl Fault {
             Fault::Text => "text that isn't a number",
             Fault::Date => "a date used as a number",
             Fault::ClampBounds => "a clamp whose low bound is above its high bound",
+            Fault::Unmeasurable => "a feature with a place that can't be given in longitude/latitude",
         }
     }
 
@@ -1224,7 +1228,7 @@ impl Parser<'_> {
         if self.validate_areas
             && m == Measure::Area
             && let Some(message) =
-                self.area_check.get_or_init(|| crate::ambiguous_area_message(self.ds.features.iter().filter_map(|f| f.geometry.as_ref())))
+                self.area_check.get_or_init(|| self.ds.ambiguous_area_message(self.ds.features.iter().filter_map(|f| f.geometry.as_ref())))
         {
             return Err(format!("{}: {message}", self.ds.name));
         }
@@ -1596,6 +1600,14 @@ pub fn matches(e: &Expr, ds: &Dataset, row: usize, env: &Env) -> bool {
     Eval::new(ds, row, env).cond(e) == Some(true)
 }
 
+/// Tests a row in a chunk whose first row has `offset` preceding rows in the source.
+pub(crate) fn eval_in_chunk(e: &Expr, ds: &Dataset, row: usize, offset: usize) -> bool {
+    let env = Env::default();
+    let mut eval = Eval::new(ds, row, &env);
+    eval.row_offset = offset;
+    eval.cond(e) == Some(true)
+}
+
 /// The expression's value for one row.
 pub fn value(e: &Expr, ds: &Dataset, row: usize, env: &Env) -> Value {
     Eval::new(ds, row, env).value(e).into_owned()
@@ -1739,6 +1751,7 @@ fn channel(v: f64) -> u8 {
 struct Eval<'a> {
     ds: &'a Dataset,
     row: usize,
+    row_offset: usize,
     env: &'a Env,
     /// The steps left for the expression's `LIKE`s on this row ([`MAX_ROW_LIKE_STEPS`] in all).
     like_steps: Cell<usize>,
@@ -1748,7 +1761,7 @@ struct Eval<'a> {
 
 impl<'a> Eval<'a> {
     fn new(ds: &'a Dataset, row: usize, env: &'a Env) -> Self {
-        Eval { ds, row, env, like_steps: Cell::new(MAX_ROW_LIKE_STEPS), fault: Cell::new(None) }
+        Eval { ds, row, row_offset: 0, env, like_steps: Cell::new(MAX_ROW_LIKE_STEPS), fault: Cell::new(None) }
     }
 
     /// Null, for the error `fault`, kept when it is the row's first.
@@ -1916,18 +1929,21 @@ impl<'a> Eval<'a> {
                 }
                 Var::PageName => self.env.page.as_ref().map(|p| Value::Text(p.name.clone())).unwrap_or(Value::Null),
                 Var::PageNumber => self.env.page.as_ref().and_then(|p| i64::try_from(p.number).ok()).map(Value::Int).unwrap_or(Value::Null),
-                Var::RowNumber => i64::try_from(self.row).ok().and_then(|r| r.checked_add(1)).map(Value::Int).unwrap_or(Value::Null),
-                Var::Id => self.ds.features.get(self.row).and_then(|f| i64::try_from(f.id).ok()).map(Value::Int).unwrap_or(Value::Null),
-                Var::Measure(m, size) => self
-                    .ds
-                    .features
-                    .get(self.row)
-                    .and_then(|f| f.geometry.as_ref())
-                    .and_then(|g| g.wgs84_measure(*m))
-                    // A hole larger than its polygon measures below zero: no sensible area.
-                    .filter(|v| *v >= 0.0)
-                    .map(|v| real(v / size))
+                Var::RowNumber => i64::try_from(self.row.saturating_add(self.row_offset))
+                    .ok()
+                    .and_then(|r| r.checked_add(1))
+                    .map(Value::Int)
                     .unwrap_or(Value::Null),
+                Var::Id => self.ds.features.get(self.row).and_then(|f| i64::try_from(f.id).ok()).map(Value::Int).unwrap_or(Value::Null),
+                Var::Measure(m, size) => match self.ds.features.get(self.row).and_then(|f| f.geometry.as_ref()) {
+                    None => Value::Null,
+                    // Measured in longitude/latitude: a place that can't be converted is an error.
+                    Some(g) => match self.ds.wgs84_measure(g, *m) {
+                        Err(_) => self.fail(Fault::Unmeasurable),
+                        // A hole larger than its polygon measures below zero: no sensible area.
+                        Ok(v) => v.filter(|v| *v >= 0.0).map(|v| real(v / size)).unwrap_or(Value::Null),
+                    },
+                },
             }),
             // An operand that is missing (null without an error) makes the result null whatever
             // else failed, so an error is the result's only when no operand is missing:
