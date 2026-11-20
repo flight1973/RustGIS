@@ -6,8 +6,8 @@
 //! is only ever asked for here. The frame path may start a download (the session asks for the
 //! grids of the systems in use), but it runs on a thread of its own: a frame never waits for one.
 //!
-//! A file read on a thread of its own waits for its system's grids before its features are
-//! converted ([`crate::cmd::reads::ReadAhead::run_waiting_for_grids`]), so they land where the grid puts
+//! A file read on a thread of its own waits for its system's grids (and those of a conversion
+//! between two systems it makes) before its features are converted ([`crate::cmd::reads::ReadAhead::run_waiting_for_grids`]), so they land where the grid puts
 //! them. Elsewhere a download starts in the background, and the session says what it brought:
 //! rasters, streamed layers and the map follow at once, while a layer read whole before keeps the places
 //! it was given until it is opened again (it is held in longitude/latitude).
@@ -48,6 +48,8 @@ pub enum News {
     Got { name: String, bytes: usize },
     /// A grid couldn't be had, and why.
     Failed { name: String, error: String },
+    /// News a session asked for too late to hear, counted ([`news_since`]).
+    Missed(u64),
 }
 
 #[derive(Default)]
@@ -69,7 +71,8 @@ struct State {
     /// Times the setting was turned on ([`turns`]).
     turns: u64,
     /// What the downloads did, numbered, the last [`NEWS_KEPT`]: each session says what came
-    /// after the last it said ([`news_since`]), so every session of the process hears each.
+    /// after the last it said ([`news_since`]), so every session of the process hears each. One
+    /// that asks too late to hear some is told how many it missed.
     news: std::collections::VecDeque<(u64, News)>,
     /// The number of the last news.
     told: u64,
@@ -86,6 +89,19 @@ impl State {
         while self.news.len() > NEWS_KEPT {
             self.news.pop_front();
         }
+    }
+
+    /// [`news_since`], on this state.
+    fn news_since(&self, seen: &mut u64) -> Vec<News> {
+        let mut out = Vec::new();
+        // Those dropped before this session heard them: how many.
+        let first = self.news.front().map_or(self.told + 1, |(n, _)| *n);
+        if first > *seen + 1 {
+            out.push(News::Missed(first - *seen - 1));
+        }
+        out.extend(self.news.iter().filter(|(n, _)| *n > *seen).map(|(_, news)| news.clone()));
+        *seen = self.told;
+        out
     }
 
     /// The setting turned on: this run's failures are tried again, and the limits start over.
@@ -123,11 +139,13 @@ pub fn set_download(f: Download) {
     *download().write().unwrap_or_else(|e| e.into_inner()) = f;
 }
 
-/// Turns downloading datum grids on or off (the "Download datum grids" setting). Turning it on
-/// forgets this run's failures, so they are tried again.
+/// Turns downloading datum grids on or off (the "Download Datum Grids" setting). Turning it on
+/// from off forgets this run's failures, so they are tried again, and starts the limits over;
+/// on again while on changes nothing.
 pub fn set_enabled(on: bool) {
-    ENABLED.store(on, Ordering::SeqCst);
-    if on {
+    // Only turning it on (from off) starts the limits over: on again while on changes nothing.
+    let was = ENABLED.swap(on, Ordering::SeqCst);
+    if on && !was {
         lock().turned_on();
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -149,10 +167,13 @@ pub fn turns() -> u64 {
 /// What the downloads did after the news numbered `seen` (a session's own count, from
 /// [`news_told`] when it started), and moves `seen` to the last.
 pub fn news_since(seen: &mut u64) -> Vec<News> {
-    let s = lock();
-    let out = s.news.iter().filter(|(n, _)| *n > *seen).map(|(_, news)| news.clone()).collect();
-    *seen = s.told;
-    out
+    lock().news_since(seen)
+}
+
+/// Records news as a download would: for tests of the sessions' notices.
+#[doc(hidden)]
+pub fn tell(news: News) {
+    lock().tell(news);
 }
 
 /// The number of the last news: a session starting now says what comes after it.
@@ -178,13 +199,33 @@ pub fn want(crs: Crs) -> Vec<String> {
     want_in(crs, false)
 }
 
+/// [`want`] for the direct operation from `source` to `target`
+/// ([`crs::missing_grids_between`]): the grids a conversion between them needs beyond each one's own.
+pub fn want_between(source: Crs, target: Crs) -> Vec<String> {
+    want_between_in(source, target, false)
+}
+
+/// [`want_between`]; `first`: ahead of the grids queued before, for a read waiting for them.
+fn want_between_in(source: Crs, target: Crs, first: bool) -> Vec<String> {
+    if !enabled() {
+        return Vec::new();
+    }
+    want_grids(crs::missing_grids_between(source, target), first)
+}
+
 /// [`want`]; `first`: ahead of the grids queued before, for a read waiting for them.
 fn want_in(crs: Crs, first: bool) -> Vec<String> {
     if !enabled() {
         return Vec::new();
     }
+    want_grids(crs::missing_grids(crs), first)
+}
+
+/// Queues `grids` that aren't on their way or settled, and gives the names of those started or
+/// already on their way; `first`: ahead of the grids queued before.
+fn want_grids(grids: Vec<MissingGrid>, first: bool) -> Vec<String> {
     let mut coming = Vec::new();
-    for grid in crs::missing_grids(crs) {
+    for grid in grids {
         match claim(&grid.name) {
             Claim::Mine => {
                 coming.push(grid.name.clone());
@@ -296,6 +337,18 @@ impl State {
         }
         None
     }
+}
+
+/// What the session says of `missed` download news it asked for too late to hear: what it was
+/// isn't known (arrivals or failures), so it is said as information.
+pub(crate) fn missed_text(missed: u64) -> crate::notice_text::NoticeText {
+    use crate::notice_text::NoticeText;
+    let key = if missed == 1 {
+        "{count} notice about datum grid downloads came before it could be said, and is left out"
+    } else {
+        "{count} notices about datum grid downloads came before they could be said, and are left out"
+    };
+    NoticeText::format(key, [("count", missed.to_string().into())])
 }
 
 /// Why a grid isn't downloaded that trying again doesn't change.
@@ -523,13 +576,14 @@ fn start(grid: MissingGrid) {
     );
 }
 
-/// Gets the grids `crs` needs before a file in it is read ([`crs::set_grid_waiter`]): each one
-/// missing is downloaded on a thread of its own, or was already on its way, and the read waits for
-/// them, then asks again, as the next operation's grids come up where the first's don't reach. It
-/// waits at most [`WAIT`] in all, for all the systems of one read, and stops waiting when its read is cancelled; the downloads go
-/// on, and what they bring is said and used from then on.
+/// Gets the grids a system needs before a file in it is read, or a conversion between two systems
+/// needs before it is made ([`crs::set_grid_waiter`]): each one missing is downloaded on a thread
+/// of its own, or was already on its way, and the read waits for them, then asks again, as the
+/// next operation's grids come up where the first's don't reach. It waits at most [`WAIT`] in
+/// all, for all the systems and pairs of one read, and stops waiting when its read is cancelled;
+/// the downloads go on, and what they bring is said and used from then on.
 #[cfg(not(target_arch = "wasm32"))]
-fn wait_for(crs: Crs, read: u64) {
+fn wait_for(of: crs::GridsOf, read: u64) {
     thread_local! {
         /// The read waited for on this thread, and when its wait ends: one for all its systems.
         static DEADLINE: std::cell::Cell<Option<(u64, web_time::Instant)>> = const { std::cell::Cell::new(None) };
@@ -547,7 +601,10 @@ fn wait_for(crs: Crs, read: u64) {
     let control = rustgis_analysis::control::current();
     // A few rounds at most: each brings the grids the operation chosen after the last needs.
     for _ in 0..4 {
-        let coming = want_in(crs, true);
+        let coming = match of {
+            crs::GridsOf::System(crs) => want_in(crs, true),
+            crs::GridsOf::Pair(a, b) => want_between_in(a, b, true),
+        };
         if coming.is_empty() {
             return;
         }
@@ -573,9 +630,11 @@ pub fn news_texts(news: &[News]) -> Vec<(String, bool)> {
     let mut got = Vec::new();
     // By reason, in order: a reason given once for all its grids (the limit, for one).
     let mut why: Vec<(&str, Vec<&str>)> = Vec::new();
+    // (Missed news is the session's to say: [`missed_text`].)
     let mut count = 0;
     for n in news {
         match n {
+            News::Missed(_) => {}
             News::Got { name, bytes } => got.push(format!("{name} ({})", size_text(*bytes))),
             News::Failed { name, error } => {
                 count += 1;
@@ -670,7 +729,7 @@ mod tests {
         // A state of the test's own: the process's is the other tests' in this binary.
         let mut s = State { started: MAX_GRIDS, ..Default::default() };
         assert!(matches!(s.claim("a.tif", true), Claim::Settled));
-        let news: Vec<News> = std::mem::take(&mut s.news).into_iter().map(|(_, n)| n).collect();
+        let news = s.news_since(&mut 0);
         assert!(matches!(&news[..], [News::Failed { name, error }] if name == "a.tif" && error.contains("at most 16 grids")), "{news:?}");
         assert!(matches!(s.claim("a.tif", true), Claim::Settled), "not asked again");
         s.turned_on();
@@ -748,6 +807,18 @@ mod tests {
         // Where trying again doesn't help, it isn't offered.
         let said = news_texts(&[News::Failed { name: "c.tif".into(), error: "RustGIS has no folder to keep it in".into() }]);
         assert!(!said[0].0.contains("off and on again"), "{said:?}");
+        // News a session asked for too late to hear: counted, and said.
+        let mut log = State::default();
+        for i in 0..NEWS_KEPT + 10 {
+            log.tell(News::Got { name: format!("g{i}.tif"), bytes: 1 });
+        }
+        let mut seen = 0;
+        let heard = log.news_since(&mut seen);
+        assert_eq!((heard.first(), heard.len(), seen), (Some(&News::Missed(10)), NEWS_KEPT + 1, (NEWS_KEPT + 10) as u64));
+        assert!(log.news_since(&mut seen).is_empty(), "each once");
+        assert!(news_texts(&[News::Missed(10)]).is_empty(), "the session's to say");
+        assert!(missed_text(10).english().starts_with("10 notices about datum grid downloads came before they could be said"));
+        assert!(missed_text(1).english().starts_with("1 notice about datum grid downloads came before it could be said, and is left out"));
         // A reason given once for its grids, a few named.
         let limit: Vec<News> = (0..5).map(|i| News::Failed { name: format!("g{i}.tif"), error: limit_text() }).collect();
         let said = news_texts(&limit);

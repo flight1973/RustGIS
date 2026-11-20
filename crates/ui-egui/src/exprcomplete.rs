@@ -7,11 +7,11 @@
 
 use egui::text::{CCursor, CCursorRange};
 use egui::widgets::text_edit::{TextEditOutput, TextEditState};
-use egui::{Id, Key, Modifiers, Ui};
+use egui::{Id, Ui};
 use rustgis_engine::data::Dataset;
 use rustgis_engine::data::query::{self, Call, Completion, FuncSpec, Kw, Place, VARS};
 
-use crate::completion::{Before, GAP, Keyed, List, Offered, Tip, Worked, byte_at, char_at, pairs};
+use crate::completion::{Asked, Before, GAP, Keyed, List, Offered, Side, Tip, Worked, byte_at, char_at, pairs};
 
 /// The most fields the list holds (typing narrows them; it scrolls): a table of hundreds of
 /// columns mustn't draw hundreds of rows. The functions, variables and keywords after them are
@@ -20,7 +20,7 @@ const MAX_FIELDS: usize = 50;
 
 /// How many lines a call's signature is first guessed to take (the signature, and the
 /// description on up to three): where it goes before it's drawn once.
-const TIP_ROWS: usize = 4;
+pub(crate) const TIP_ROWS: usize = 4;
 
 /// What an item stands for.
 #[derive(Clone, Debug, PartialEq)]
@@ -145,9 +145,8 @@ struct State {
     /// The signature of the call the cursor is in, floating by it while the list is closed, for
     /// the call's `(` (where it starts).
     tip: Tip<usize>,
-    /// Where Ctrl+Space asked for the list (the text's hash and the cursor): it shows there with
-    /// no word typed, until the text or the cursor moves on.
-    asked: Option<(u64, usize)>,
+    /// Where Ctrl+Space asked for the list: it shows there with no word typed.
+    asked: Asked,
     /// Where an item was just accepted (the text's hash and the cursor): nothing is offered there
     /// (`pop` taken mustn't offer `"Pop Est"`, for Enter to take next), until the text or the
     /// cursor moves on, or Ctrl+Space asks.
@@ -172,7 +171,8 @@ pub(crate) fn offering(ui: &Ui, id: Id) -> bool {
 /// A single-line box for an expression over `ds` (none: no suggestions nor signature, as both
 /// come from reading the expression against its fields), its id `id`, styled by
 /// `style` (hint, font, width…), with the suggestion list, and the signature of the call the
-/// cursor is in floating by it while no list shows. Returns the box's response.
+/// cursor is in floating over it while no list shows, so what goes under the box (its error, its
+/// help) stays in view; under it only when there's no room over it. Returns the box's response.
 pub(crate) fn expr_edit(
     ui: &mut Ui,
     id: Id,
@@ -182,9 +182,7 @@ pub(crate) fn expr_edit(
 ) -> egui::Response {
     let mut state = load(ui, id);
     // The list's keys, taken before the box sees them: Ctrl+Space asks for the list.
-    if ui.memory(|m| m.has_focus(id)) && ui.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::Space)) {
-        let at = TextEditState::load(ui.ctx(), id).and_then(|s| s.cursor.char_range()).map(|r| r.primary.index.0);
-        state.asked = at.map(|at| (egui::util::hash(text.as_str()), at));
+    if state.asked.keys(ui, id, text) {
         state.list.reopen();
     }
     if state.worked.as_ref().is_some_and(|w| w.text != egui::util::hash(text.as_str())) {
@@ -212,11 +210,7 @@ pub(crate) fn expr_edit(
     let asked = &mut state.asked;
     let accepted = &mut state.accepted;
     let work = |at: Option<usize>| {
-        // Asked here, and still here.
-        let here = at.is_some_and(|at| *asked == Some((hash, at)));
-        if !here {
-            *asked = None;
-        }
+        let here = asked.here(hash, at);
         // Just accepted here, and not asked since.
         if at.map(|at| (hash, at)) != *accepted {
             *accepted = None;
@@ -242,8 +236,9 @@ pub(crate) fn expr_edit(
     let cursor = out.cursor_range.filter(|r| focused && r.is_empty()).map(|r| r.primary.index.0);
     let call = state.worked.as_ref().filter(|w| cursor.is_some() && w.at == cursor && w.text == hash).and_then(|w| w.value.1);
     let at = cursor.filter(|_| !state.list.is_open());
-    // Kept by its `(`, and anchored there.
-    state.tip.show(ui, id.with("expr_tip"), &out, visible, at, call.map(|c| (c.open, c.open)), TIP_ROWS, |ui, width| {
+    // Kept by its `(`, and anchored there; over the line, as under the box are its error and help.
+    let about = call.map(|c| (c.open, c.open));
+    state.tip.show(ui, id.with("expr_tip"), &out, visible, at, about, TIP_ROWS, Side::Above, |ui, width| {
         if let Some(call) = &call {
             draw_call(ui, call, width);
         }
@@ -381,7 +376,7 @@ fn signature_job(
 
 /// The signature of the function the cursor is in a call of, coloured as the list's help colours
 /// one, the argument the cursor is in marked, and what the function gives.
-fn draw_call(ui: &mut Ui, call: &Call, width: f32) {
+pub(crate) fn draw_call(ui: &mut Ui, call: &Call, width: f32) {
     let palette = crate::scriptcolor::Palette::of(&crate::theme::Tokens::get(ui.ctx()));
     let mono = egui::TextStyle::Monospace.resolve(ui.style());
     let mark = (ui.visuals().selection.bg_fill, ui.visuals().selection.stroke.color);
@@ -592,6 +587,7 @@ pub(crate) fn written(text: &str, offer: &Offer, item: &str) -> Option<(String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::{Key, Modifiers};
     use rustgis_engine::data::{Field, FieldType, GeometryType};
 
     fn ds() -> Dataset {

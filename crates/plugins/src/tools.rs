@@ -196,8 +196,9 @@ impl Host for Messages<'_> {
 fn layer_geojson(inputs: &dyn Inputs, name: &str) -> Result<Value, String> {
     let ds = inputs.dataset(name).ok_or_else(|| format!("no layer named '{name}'"))?;
     let sel = inputs.selection(name);
+    // GeoJSON is longitude/latitude, whatever system the layer holds its coordinates in.
     if sel.is_empty() {
-        return Ok(rustgis_data::io::to_geojson(ds));
+        return Ok(rustgis_data::io::to_geojson(&*ds.in_lonlat()?));
     }
     let sub = rustgis_data::Dataset {
         name: ds.name.clone(),
@@ -209,8 +210,9 @@ fn layer_geojson(inputs: &dyn Inputs, name: &str) -> Result<Value, String> {
         crs_incomplete: false,
         zm_dropped: false,
         windowed: false,
+        held_in: ds.held_in,
     };
-    Ok(rustgis_data::io::to_geojson(&sub))
+    Ok(rustgis_data::io::to_geojson(&*sub.in_lonlat()?))
 }
 
 fn run(spec: &ToolSpec, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, String> {
@@ -419,7 +421,7 @@ fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_u64).filter_map(|r| usize::try_from(r).ok()).collect())
             .unwrap_or_default();
-        return Ok(ToolResult { output: Output::Selection { layer, rows }, messages });
+        return Ok(ToolResult { losses: Vec::new(), output: Output::Selection { layer, rows }, messages });
     }
     let mut outs = Vec::new();
     for v in reply.get("layers").and_then(Value::as_array).into_iter().flatten().take(64) {
@@ -428,5 +430,5 @@ fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
     for v in reply.get("tables").and_then(Value::as_array).into_iter().flatten().take(64) {
         outs.push(OutputLayer::Table(dataset(v, tool)?));
     }
-    Ok(ToolResult { output: Output::Layers(outs), messages })
+    Ok(ToolResult { losses: Vec::new(), output: Output::Layers(outs), messages })
 }

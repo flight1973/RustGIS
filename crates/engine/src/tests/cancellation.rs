@@ -131,6 +131,7 @@ pub(super) fn long_commands(boundaries: bool) {
         ("share.exportRaster", json!({"layer": dem, "path": out("dem.tif")})),
         ("share.exportMap", json!({"path": out("map.png"), "width": 64, "height": 48})),
         ("map.exportOrbit", json!({"path": out("orbit.zip"), "frames": 3, "width": 64, "height": 64, "dpi": 48})),
+        ("map.exportBlock", json!({"path": out("block.glb"), "texture": 256})),
         ("layout.export", json!({"path": out("layout.pdf"), "dpi": 36})),
         ("report.export", json!({"path": out("report.pdf"), "dpi": 36})),
         ("source.publish", json!({"layer": "towns"})),
@@ -141,7 +142,15 @@ pub(super) fn long_commands(boundaries: bool) {
     let registered = crate::cmd::exports::IN_BACKGROUND.iter().map(|(c, ..)| *c).collect::<std::collections::BTreeSet<_>>();
     assert_eq!(listed(&exports), registered, "add a new background export here");
     for (command, p) in &exports {
+        // A block's model needs a block on the DEM, which the other exports don't draw.
+        let block = *command == "map.exportBlock";
+        if block {
+            s.run("map.terrain", &json!({"layer": dem, "block": {}})).unwrap();
+        }
         exercise(&s, command, p, Kind::Export, &dir.0, boundaries);
+        if block {
+            s.run("map.terrain", &json!({"off": true})).unwrap();
+        }
     }
 
     // The Add Service dialog replays supplied metadata off the desktop frame too.
@@ -169,6 +178,11 @@ pub(super) fn long_commands(boundaries: bool) {
         assert!(control.looked() > 0, "edit.previewShapeConversion never looks at Cancel");
         assert!(contents(&shapes.project) == before, "edit.previewShapeConversion changed the project after Cancel");
     }
+    // A PDF's page is read on the same queue: the file, then its drawing, Cancel looked at between
+    // (#2336).
+    s.run("layout.new", &json!({"page": "a4", "template": "map"})).unwrap();
+    s.run("layout.export", &json!({"path": out("page.pdf"), "dpi": 36, "allPages": false})).unwrap();
+    exercise(&s, "layer.addData", &json!({"path": out("page.pdf")}), Kind::Read, &dir.0, boundaries);
     exercise(&s, "table.statistics", &json!({"layer": "Cities", "field": "pop_max"}), Kind::Read, &dir.0, boundaries);
     // A Zarr point series is read on a thread of its own by the Time Series pane (#2282). It isn't
     // one of the queues above (it has no read-ahead), so it is run here: a local store, swept at

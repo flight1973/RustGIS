@@ -4,7 +4,7 @@
 
 use eframe::egui;
 use rustgis_engine::platform::{Event, Platform};
-use rustgis_ui_egui::{Inbox, RustGisApp, i18n, tl};
+use rustgis_ui_egui::{FolderStore, Inbox, RustGisApp, i18n, tl};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -128,7 +128,9 @@ struct App<P: Phone> {
 enum Problem {
     /// The shortcut file `name` is over `SHORTCUT_FILE_MAX_BYTES`.
     ShortcutTooLarge { name: String },
-    /// The file `name` is over the size read into memory (`rustgis_data::io::MAX_BYTES`), by
+    /// The script file `name`, picked for the Script pane's Load…, is over `SCRIPT_FILE_MAX_BYTES`.
+    ScriptTooLarge { name: String },
+    /// The file `name` is over the size a pick reads into memory ([`PICK_MAX_BYTES`]), by
     /// itself or `together` with the files picked with it and already read.
     TooLarge { name: String, together: bool },
     /// The copy of the file `name` couldn't be read.
@@ -194,6 +196,7 @@ impl<P: Phone> App<P> {
                     self.app.photos.push(path);
                 }
                 Event::Saved { name } => self.app.session.notify(i18n::fmt("Saved {name}.", &[("name", &name)]), false),
+                Event::ProjectSave(result) => self.app.complete_project_save(result),
                 Event::Position(fix) if self.locating => self.app.report_position(fix),
                 // A fix that was on its way when positioning was turned off.
                 Event::Position(_) => {}
@@ -213,8 +216,9 @@ impl<P: Phone> App<P> {
                     let limit = rustgis_ui_egui::SHORTCUT_FILE_MAX_BYTES.to_string();
                     i18n::fmt("{name} wasn't opened: a shortcut file is at most {limit} bytes.", &[("name", &name), ("limit", &limit)])
                 }
+                Problem::ScriptTooLarge { name } => i18n::fmt("{file} is larger than 1 MB", &[("file", &name)]),
                 Problem::TooLarge { name, together } => {
-                    let limit = (rustgis_engine::data::io::MAX_BYTES >> 20).to_string();
+                    let limit = (PICK_MAX_BYTES >> 20).to_string();
                     let template = if together {
                         "{name} wasn't opened: with the files picked with it, it is over {limit} MiB."
                     } else {
@@ -340,22 +344,32 @@ fn retire_unread(inbox: &Inbox, marks: Vec<String>) {
     inbox.lock().unwrap_or_else(|e| e.into_inner()).extend(marks.into_iter().map(|mark| (mark, Vec::new())));
 }
 
+/// The most a pick reads into memory, in one file or the files picked together: fixed at the
+/// size every computer reads ([`rustgis_engine::data::io::BYTES_FLOOR`]), whatever the phone's
+/// memory. A phone reports all its memory, but an app may use much less of it before the system
+/// stops it, so the desktop's share of the memory isn't a phone's (#2408).
+const PICK_MAX_BYTES: u64 = rustgis_engine::data::io::BYTES_FLOOR;
+
 /// Reads one folder's files of a pick (name, copy) into `inbox`, marked for the dialog that
 /// asked, and removes the copies: their bytes are all that was wanted of them. `held` counts the
 /// bytes the pick has read so far, across its folders.
 fn read_batch(purpose: &str, files: Vec<(String, PathBuf)>, inbox: &Inbox, problems: &Problems, held: &mut u64) {
     let mark = crate::mark(purpose);
     let say = |problem| problems.lock().unwrap_or_else(|e| e.into_inner()).push(problem);
+    let max = PICK_MAX_BYTES;
     let mut read = Vec::new();
     for (name, path) in files {
         let shortcut = mark == rustgis_ui_egui::SHORTCUT_PICK || (mark.is_empty() && name.to_ascii_lowercase().ends_with(".rgisshortcuts"));
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if shortcut && size > rustgis_ui_egui::SHORTCUT_FILE_MAX_BYTES as u64 {
             say(Problem::ShortcutTooLarge { name });
-        } else if held.saturating_add(size) > rustgis_engine::data::io::MAX_BYTES {
+        } else if mark == rustgis_ui_egui::SCRIPT_PICK && size > rustgis_ui_egui::SCRIPT_FILE_MAX_BYTES as u64 {
+            // Refused before it is read, as the pane would refuse it after.
+            say(Problem::ScriptTooLarge { name });
+        } else if held.saturating_add(size) > max {
             // Refused before it is read: no more than the cap is held in memory at once, in
             // one file or in the files picked together.
-            say(Problem::TooLarge { name, together: size <= rustgis_engine::data::io::MAX_BYTES });
+            say(Problem::TooLarge { name, together: size <= max });
         } else {
             match std::fs::read(&path) {
                 Ok(bytes) => {
@@ -438,7 +452,9 @@ fn use_picker<P: Phone + 'static>(
         }
     }));
     let saver = phone.clone();
-    app.services.download = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes)));
+    app.services.download = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes, false)));
+    let saver = phone.clone();
+    app.services.save_project = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes, true)));
     app.services.inbox = Some(inbox.clone());
     let (camera, photographing) = (phone.clone(), asked.clone());
     app.services.take_photo = Some(Box::new(move || {
@@ -450,6 +466,12 @@ fn use_picker<P: Phone + 'static>(
 }
 
 impl<P: Phone> eframe::App for App<P> {
+    /// When the event loop exits, give the recovery writer a short chance to finish the latest
+    /// edit. The next launch offers the last complete copy, if one exists.
+    fn on_exit(&mut self) {
+        self.app.finish_recovery_copy();
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // The GPU map backend draws inside egui's wgpu pass; hand over the render state.
         self.app.set_render_state(frame.wgpu_render_state().cloned());
@@ -617,17 +639,20 @@ pub fn pushed(dir: Option<PathBuf>, app: &mut RustGisApp) -> Vec<PathBuf> {
     files
 }
 
-/// Makes the front end with the sample project, ready for a phone: commands run on the window's
-/// thread don't hold it, and `folders` (whether the system gave the app a folder of its own) is
-/// said when it is false.
-pub fn front_end(folders: bool) -> RustGisApp {
-    // Datum grids: the app's own folder, where downloaded ones are kept (#2032 A4); a phone has no
-    // PROJ install to share.
-    if folders {
+/// Makes the front end with the sample project and recovery in the phone's private storage.
+pub fn front_end(root: Option<&Path>) -> RustGisApp {
+    // Datum grids: the app's own folder, where downloaded ones are kept (#2032 A4);
+    // a phone has no PROJ install to share.
+    if root.is_some() {
         rustgis_engine::data::raster::crs::use_grid_folders();
     }
     let mut app = RustGisApp::with_sample();
-    if !folders {
+    if let Some(root) = root {
+        match FolderStore::open(&root.join("recovery")) {
+            Ok(store) => app = app.with_edit_recovery(Box::new(store)),
+            Err(e) => app.session.notify(i18n::fmt("Autosave couldn't keep a recovery copy: {error}", &[("error", &e)]), true),
+        }
+    } else {
         app.session.warn(tl!("This device gives RustGIS no folder of its own: settings, the tile cache and recovery copies are off."));
     }
     // As on the desktop: commands run on the window's thread must not hold it.
@@ -709,7 +734,7 @@ mod tests {
             self.0.set(true);
             Ok(())
         }
-        fn save_file(&self, _: &str, _: Vec<u8>) -> Result<(), String> {
+        fn save_file(&self, _: &str, _: Vec<u8>, _: bool) -> Result<(), String> {
             Ok(())
         }
         fn locate(&self, _: bool) -> Result<(), String> {
@@ -763,5 +788,25 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(reading.load(Ordering::Relaxed), 0);
         assert_eq!(*inbox.lock().unwrap(), vec![(crate::mark("dxf:7"), Vec::<u8>::new())]);
+    }
+
+    /// A script picked for Load… over the pane's limit is refused before it is read, naming it; one
+    /// within it reaches the inbox marked for the pane.
+    #[test]
+    fn a_script_over_the_limit_is_refused_before_it_is_read() {
+        let dir = std::env::temp_dir().join(format!("rustgis-mobile-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (big, small) = (dir.join("big.txt"), dir.join("small.txt"));
+        std::fs::write(&big, vec![b'#'; rustgis_ui_egui::SCRIPT_FILE_MAX_BYTES + 1]).unwrap();
+        std::fs::write(&small, "map.zoomFull").unwrap();
+        let (inbox, problems) = (Inbox::default(), Problems::default());
+        let files = vec![("big.txt".to_string(), big), ("small.txt".to_string(), small)];
+        read_batch("script", files, &inbox, &problems, &mut 0);
+        let said = problems.lock().unwrap();
+        assert!(matches!(said.as_slice(), [Problem::ScriptTooLarge { name }] if name == "big.txt"));
+        let names: Vec<String> = inbox.lock().unwrap().iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, [format!("{}small.txt", rustgis_ui_egui::SCRIPT_PICK)]);
+        // The copies are gone, read or not, and their folder with them (`remove_copy`).
+        assert!(!dir.exists());
     }
 }
