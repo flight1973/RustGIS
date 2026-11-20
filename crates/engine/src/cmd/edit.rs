@@ -1046,6 +1046,19 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
         return Err(format!("the layer is bound to the time slider by '{name}': unbind it first"));
     }
     let read_before = l.renderer.expression().is_some_and(|e| rustgis_data::query::parse_fields(e, &l.dataset).is_ok());
+    // The renderer's classes by an expression, and the attribute rules, that read the field, found
+    // while it is there: one that read it would otherwise go on to read a field named the same but
+    // for case, without a word (#1955).
+    let expression_read = l.renderer.expression().is_some_and(needs);
+    let rules_read: Vec<bool> = l
+        .design
+        .rules
+        .iter()
+        .map(|r| match r.kind {
+            rustgis_map::design::RuleKind::Calculation => Calculation::parse(&r.expression, &l.dataset).is_ok_and(|c| c.reads_field(fi)),
+            rustgis_map::design::RuleKind::Constraint => needs(&r.expression),
+        })
+        .collect();
     // The symbol's expressions by feature that read the field, found while it is there (#2081).
     let by = &l.symbol_by;
     let by_read = [&by.size, &by.fill, &by.stroke, &by.stroke_width, &by.angle].map(|t| t.as_deref().is_some_and(needs));
@@ -1070,7 +1083,8 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     }
     // Nothing may keep referring to the deleted field.
     // (Classes by an expression that read until now go the same way.)
-    let unread = read_before && l.renderer.expression().is_some_and(|e| rustgis_data::query::parse_fields(e, &l.dataset).is_err());
+    let unread = expression_read
+        || read_before && l.renderer.expression().is_some_and(|e| rustgis_data::query::parse_fields(e, &l.dataset).is_err());
     let mut single = None;
     if unread || l.renderer.field().is_some_and(names_removed) {
         l.renderer = rustgis_map::Renderer::Single(l.renderer.base_symbol());
@@ -1187,8 +1201,10 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
                 rustgis_map::design::RuleKind::Constraint => rustgis_data::query::parse_fields(&r.expression, &ds).is_ok(),
             }
     };
-    let rules: Vec<String> = d.rules.iter().filter(|r| !reads_on(r)).map(|r| r.name.clone()).collect();
-    d.rules.retain(reads_on);
+    let keep: Vec<bool> = d.rules.iter().zip(&rules_read).map(|(r, read)| !read && reads_on(r)).collect();
+    let rules: Vec<String> = d.rules.iter().zip(&keep).filter(|(_, keep)| !**keep).map(|(r, _)| r.name.clone()).collect();
+    let mut kept = keep.iter();
+    d.rules.retain(|_| kept.next().copied().unwrap_or(true));
     let removed_rules = rules.len();
     if !rules.is_empty() {
         design_gone.push(format!("attribute {} {}", if rules.len() == 1 { "rule" } else { "rules" }, quoted(rules)));
@@ -1648,6 +1664,14 @@ impl Calculation {
         }
     }
 
+    /// Whether it reads field `fi` (by its index in the dataset it was parsed against).
+    pub(crate) fn reads_field(&self, fi: usize) -> bool {
+        match self {
+            Calculation::Expr(e) => rustgis_data::query::reads_field(e, fi),
+            Calculation::Calc(c) => [Some(&c.a), c.b.as_ref()].into_iter().flatten().any(|t| matches!(t, Term::Field(i) if *i == fi)),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn eval(&self, ds: &rustgis_data::Dataset, r: usize) -> Value {
         self.eval_or_fault(ds, r).0
@@ -2095,6 +2119,52 @@ mod tests {
         assert_eq!(s.map().layer(id).unwrap().labels.classes[0].field, "code");
         let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
         assert_eq!(said, ["twins: its label class Other used the deleted field Lon, so it labels field code"]);
+    }
+
+    /// An attribute rule or the renderer's class expression that read a deleted field is removed and
+    /// said, judged by the field it read before the deletion: with fields `Pop` and `pop`, `pop`
+    /// reads `Pop`, and deleting `Pop` would otherwise leave it reading `pop` (#1955). One that
+    /// read another field is kept, and nothing is said.
+    #[test]
+    fn a_deleted_case_twin_takes_the_rules_and_classes_that_read_it() {
+        for (fields, deleted, read) in [(["Pop", "pop", "n"], "Pop", true), (["Pop", "a", "n"], "a", false)] {
+            let mut s = Session::new(crate::Project::default());
+            let mut ds = Dataset::new("twins", GeometryType::Point, fields.map(|f| Field::new(f, FieldType::Double)).to_vec());
+            ds.push(
+                Some(Geometry::Point(rustgis_data::Coord::new(3.0, 4.0))),
+                vec![Value::Float(5.0), Value::Float(0.0), Value::Float(1.0)],
+            );
+            let id = s.map_mut().add_dataset(ds);
+            s.run("data.attributeRule", &json!({"layer": id, "name": "big", "kind": "constraint", "field": "n", "expression": "pop > 1"}))
+                .unwrap();
+            s.run(
+                "data.attributeRule",
+                &json!({"layer": id, "name": "twice", "kind": "calculation", "field": "n", "expression": "pop * 2"}),
+            )
+            .unwrap();
+            s.run("layer.symbology", &json!({"layer": id, "type": "unique", "expression": "pop * 2"})).unwrap();
+            let mark = s.notice_mark();
+            let reply = s.run("edit.deleteField", &json!({"layer": id, "field": deleted})).unwrap();
+            let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+            let l = s.map().layer(id).unwrap();
+            let rules: Vec<&str> = l.design.rules.iter().map(|r| r.name.as_str()).collect();
+            if read {
+                assert_eq!(reply["rulesRemoved"], 2, "{said:?}");
+                assert!(rules.is_empty(), "{rules:?}");
+                assert_eq!(l.renderer.expression(), None);
+                for part in [
+                    "its data design used the deleted field Pop, so it loses attribute rules 'big', 'twice'",
+                    "its classes read the deleted field Pop, so it is drawn with a single symbol",
+                ] {
+                    assert!(said.iter().any(|n| n.contains(part)), "{part}: {said:?}");
+                }
+            } else {
+                assert_eq!(reply["rulesRemoved"], 0, "{said:?}");
+                assert_eq!(rules, ["big", "twice"]);
+                assert_eq!(l.renderer.expression(), Some("pop * 2"));
+                assert!(said.iter().all(|n| !n.contains("deleted field")), "{said:?}");
+            }
+        }
     }
 
     /// What a layer keeps by a field's name (a diagram, a size, a report, an interpolation) is
