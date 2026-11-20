@@ -134,7 +134,7 @@ pub(crate) fn kept_field(ds: &Dataset, name: &str, what: &str) -> Result<Option<
     if ds.has_case_twin(name) {
         let twins: Vec<String> = ds.fields.iter().filter(|f| f.name.eq_ignore_ascii_case(name)).map(|f| format!("'{}'", f.name)).collect();
         return Err(format!(
-            "'{name}' names {} ignoring case, and {what} reads its field by name ignoring case, so it would use the first: rename one of them first",
+            "'{name}' names {} ignoring case, and {what} reads its field by name ignoring case, so it would use the first: copy the first into a field of another name (Add Field, then Calculate Field) and delete it, or rename one in the source data",
             twins.join(" and ")
         ));
     }
@@ -2100,7 +2100,7 @@ mod tests {
             ("data.subtypes", json!({"layer": id, "field": "code", "subtypes": [{"code": 1, "name": "one", "defaults": {"x": 2}}]})),
         ] {
             let error = s.run(command, &p).unwrap_err();
-            assert!(error.contains("so it would use the first: rename one of them first"), "{command}: {error}");
+            assert!(error.contains("so it would use the first: copy the first into a field of another name (Add Field, then Calculate Field) and delete it, or rename one in the source data"), "{command}: {error}");
         }
         let d = &s.map().layer(id).unwrap().design;
         assert!(d.rules.is_empty() && d.contingent.is_empty() && d.subtypes.is_none());
