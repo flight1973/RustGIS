@@ -140,14 +140,17 @@ pub fn commands() -> Vec<C> {
         C::new("report.autofill", "Autofill Fields", "Data › Data Design", |s, p| {
             let i = index(s, p)?;
             let ds = &layer_of(s, i)?.dataset;
-            let all = ds.fields.len();
-            let names = filled_in(ds)?;
+            let (names, twins) = filled_in(ds);
+            let all = ds.fields.len() - twins.len();
             let r = s.project.reports.get_mut(i).ok_or("no report")?;
             r.fields = names;
             let (answer, report) = (json!({"fields": r.fields}), r.name.clone());
             // A layer with more fields than a report takes: the first are filled in, and that is said (#1896).
             if all > MAX_ITEMS {
                 s.notify(format!("{report}: the first {MAX_ITEMS} of the layer's {all} fields are filled in"), false);
+            }
+            if let Some(note) = twins_left_out(&report, &twins) {
+                s.notify(note, false);
             }
             Ok(answer)
         }).inputs(layer_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
@@ -296,14 +299,21 @@ fn optional_field(input: &impl super::InputSource, p: &Value) -> Result<(usize, 
     }
 }
 
-/// The first [`MAX_ITEMS`] of a layer's fields, to fill a report with: refused, as report.field
-/// refuses one, when one of them has a case twin (#1955).
-fn filled_in(ds: &rustgis_data::Dataset) -> Result<Vec<String>, String> {
-    let names: Vec<String> = ds.fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect();
-    for n in &names {
-        super::edit::kept_field(ds, n, "a report")?;
-    }
-    Ok(names)
+/// The first [`MAX_ITEMS`] of a layer's fields, to fill a report with, and the fields left out
+/// for having a case twin, which report.field refuses (#1955).
+fn filled_in(ds: &rustgis_data::Dataset) -> (Vec<String>, Vec<String>) {
+    let (twins, names): (Vec<_>, Vec<_>) = ds.fields.iter().map(|f| f.name.clone()).partition(|n| ds.has_case_twin(n));
+    (names.into_iter().take(MAX_ITEMS).collect(), twins)
+}
+
+/// The notice for the fields [`filled_in`] left out of report `report`, if any.
+fn twins_left_out(report: &str, twins: &[String]) -> Option<String> {
+    (!twins.is_empty()).then(|| {
+        format!(
+            "{report}: fields named the same but for case are left out ({}): a report reads its field by name ignoring case, so it would use the first",
+            twins.join(", ")
+        )
+    })
 }
 
 /// The report and the field name given, to remove an entry it stored: matched against what is
@@ -497,11 +507,15 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
     };
     r.fields = fields_of("fields", "a report lists", MAX_ITEMS)?;
     // The layer's fields when none are given: the first of a wide layer, and that is said.
-    let all = ds.fields.len();
-    let first_of = r.fields.is_empty() && all > MAX_ITEMS;
-    if r.fields.is_empty() {
-        r.fields = filled_in(ds)?;
-    }
+    let mut twins = Vec::new();
+    let mut all = ds.fields.len();
+    let first_of = r.fields.is_empty() && {
+        let names;
+        (names, twins) = filled_in(ds);
+        all -= twins.len();
+        r.fields = names;
+        all > MAX_ITEMS
+    };
     r.groups = fields_of("groups", "a report groups by", MAX_GROUPS)?;
     if let Some(w) = ps(p, "where").map(str::trim).filter(|w| !w.is_empty()) {
         rustgis_data::query::parse(w, ds)?;
@@ -526,6 +540,9 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
     s.active_report = Some(i);
     if first_of {
         s.notify(format!("{name}: the report lists the first {MAX_ITEMS} of the layer's {all} fields"), false);
+    }
+    if let Some(note) = twins_left_out(&name, &twins) {
+        s.notify(note, false);
     }
     if let Some(cut) = cut {
         s.notify(cut, false);

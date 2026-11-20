@@ -2222,9 +2222,9 @@ mod tests {
         assert!(error.contains("is ambiguous: case-insensitive collision between 'Val' and 'val'"), "{error}");
     }
 
-    /// A report never takes a case twin's name: report.field, report.new (given or filled in) and
-    /// report.autofill refuse it. One stored already (by an older project) can still be removed,
-    /// matched against what is stored (#1955).
+    /// A report never takes a case twin's name: report.field and report.new refuse one given, and
+    /// report.new and report.autofill filling a report in leave twins out, said. One stored already
+    /// (by an older project) can still be removed, matched against what is stored (#1955).
     #[test]
     fn a_reports_twin_names_are_refused_but_can_be_removed() {
         let mut s = Session::new(crate::Project::default());
@@ -2233,19 +2233,26 @@ mod tests {
         ds.push(Some(Geometry::Point(rustgis_data::Coord::new(3.0, 4.0))), vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]);
         s.map_mut().add_dataset(ds);
         let twin = "ignoring case, and a report reads its field by name ignoring case";
-        for (command, p) in [
-            ("report.new", json!({"layer": "twins", "name": "A", "fields": ["name"]})),
-            ("report.new", json!({"layer": "twins", "name": "B"})),
-        ] {
-            let error = s.run(command, &p).unwrap_err();
-            assert!(error.contains(twin), "{command} {p}: {error}");
-        }
+        let error = s.run("report.new", &json!({"layer": "twins", "name": "A", "fields": ["name"]})).unwrap_err();
+        assert!(error.contains(twin), "{error}");
         assert!(s.project.reports.is_empty());
-        s.run("report.new", &json!({"layer": "twins", "name": "R", "fields": ["code"]})).unwrap();
-        for (command, p) in [("report.field", json!({"report": "R", "field": "name"})), ("report.autofill", json!({"report": "R"}))] {
-            let error = s.run(command, &p).unwrap_err();
-            assert!(error.contains(twin), "{command}: {error}");
-        }
+        let left_out = |report: &str| {
+            format!(
+                "{report}: fields named the same but for case are left out (Name, name): a report reads its field by name ignoring case, so it would use the first"
+            )
+        };
+        // Filled in: the twins left out, and said.
+        let mark = s.notice_mark();
+        s.run("report.new", &json!({"layer": "twins", "name": "R"})).unwrap();
+        assert_eq!(s.project.reports[0].fields, ["code"]);
+        assert!(s.notices_since(mark).iter().any(|n| n.text == left_out("R")), "{:?}", s.notices_since(mark));
+        s.project.reports[0].fields.clear();
+        let mark = s.notice_mark();
+        s.run("report.autofill", &json!({"report": "R"})).unwrap();
+        assert_eq!(s.project.reports[0].fields, ["code"]);
+        assert!(s.notices_since(mark).iter().any(|n| n.text == left_out("R")), "{:?}", s.notices_since(mark));
+        let error = s.run("report.field", &json!({"report": "R", "field": "name"})).unwrap_err();
+        assert!(error.contains(twin), "{error}");
         assert_eq!(s.project.reports[0].fields, ["code"]);
         // Entries an older project stored with a twin's name: removed by it.
         let r = &mut s.project.reports[0];
@@ -2257,12 +2264,14 @@ mod tests {
         s.run("report.statistics", &json!({"report": "R", "field": "name", "kind": "sum", "remove": true})).unwrap();
         let r = &s.project.reports[0];
         assert!(r.fields == ["code"] && r.groups.is_empty() && r.stats.is_empty(), "{:?} {:?} {}", r.fields, r.groups, r.stats.len());
-        // Without twins, a report fills itself in as before.
+        // Without twins, a report fills itself in as before, and says nothing of twins.
         let clean = Dataset::new("clean", GeometryType::Point, vec![Field::new("a", FieldType::Double)]);
         s.map_mut().add_dataset(clean);
+        let mark = s.notice_mark();
         s.run("report.new", &json!({"layer": "clean", "name": "C"})).unwrap();
         s.run("report.autofill", &json!({"report": "C"})).unwrap();
         assert_eq!(s.project.reports[1].fields, ["a"]);
+        assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("same but for case")), "{:?}", s.notices_since(mark));
     }
 
     /// A size by field or diagram set again over the field it already reads keeps reading it, twin
