@@ -122,6 +122,11 @@ pub(crate) enum Outcome {
     Valid,
     Repaired(Repaired),
     Gone(Gone),
+    /// No area left ([`Gone::NoArea`]) once `duplicates` duplicate rings were left out
+    /// ([`Rule::EvenOdd`]), which the tool still counts.
+    GoneAfterDuplicates {
+        duplicates: usize,
+    },
     Kept(Kept),
 }
 
@@ -375,7 +380,10 @@ fn polygon(
     if size.saturating_mul(OVERLAY_COST) > budget {
         return Outcome::Kept(Kept::Work);
     }
-    let per_vertex = if rule == Rule::EvenOdd { OVERLAY_BYTES + EVEN_ODD_BYTES } else { OVERLAY_BYTES };
+    // Even-Odd's duplicate keys only where [`distinct_rings`] makes them: not for one part with one
+    // hole or none, which can have no duplicate.
+    let keyed = !matches!(parts.as_slice(), [rings] if rings.len() < 3);
+    let per_vertex = if rule == Rule::EvenOdd && keyed { OVERLAY_BYTES + EVEN_ODD_BYTES } else { OVERLAY_BYTES };
     if !has_room(size.saturating_mul(per_vertex)) {
         return Outcome::Kept(Kept::Memory);
     }
@@ -399,7 +407,8 @@ fn polygon(
         Err(_) => return Outcome::Kept(Kept::Failed),
     };
     if polys.is_empty() {
-        return Outcome::Gone(Gone::NoArea);
+        // The duplicates left out on the way are still said.
+        return if duplicates > 0 { Outcome::GoneAfterDuplicates { duplicates } } else { Outcome::Gone(Gone::NoArea) };
     }
     for code in found {
         if !codes.contains(&code) {
@@ -1305,6 +1314,18 @@ mod tests {
         assert_eq!(hull_of(&[]), []);
     }
 
+    /// Under Even-Odd, a square with two holes covering it, one with a vertex mid-edge: one hole is
+    /// a duplicate, left out, and the other cancels the square, so no area is left, and the
+    /// duplicate left out on the way is still given to the tool to say.
+    #[test]
+    fn duplicates_left_out_before_no_area_are_still_counted() {
+        let mid: Ring = &[(0., 0.), (5., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.)];
+        let g = poly(&[SQUARE, SQUARE, mid]);
+        assert_eq!(repair_by(Some(&g), Rule::EvenOdd, &|_| true), Outcome::GoneAfterDuplicates { duplicates: 1 });
+        // With no duplicate, no area is as it was.
+        assert_eq!(repair_by(Some(&poly(&[SQUARE, SQUARE])), Rule::EvenOdd, &|_| true), Outcome::Gone(Gone::NoArea));
+    }
+
     /// Under Even-Odd, a part repeated with a vertex in the middle of a straight edge is the same
     /// part, left out as a duplicate, not a copy that cancels its twin out.
     #[test]
@@ -1378,6 +1399,21 @@ mod tests {
         });
         assert_eq!(r, Outcome::Kept(Kept::Memory));
         assert_eq!(asked.get(), (6 + 2 * 5) * OVERLAY_BYTES);
+        // Under Even-Odd, one part of one ring makes no duplicate keys, so it's asked the same; two
+        // parts, which can, are asked for the keys too.
+        let ask = |g: &Geometry| {
+            let asked = std::cell::Cell::new(0);
+            let _ = repair_by_with(Some(g), Rule::EvenOdd, validity::MAX_WORK, &|_| true, &|need| {
+                asked.set(need);
+                false
+            });
+            asked.get()
+        };
+        assert_eq!(ask(&star), (6 + 2 * 5) * OVERLAY_BYTES);
+        let Geometry::Polygon(one) = &star else { panic!("a polygon") };
+        let two = Geometry::Polygon(vec![one[0].clone(), one[0].clone()]);
+        let size = 12 + 2 * validity::check(Some(&two), validity::MAX_WORK).contacts;
+        assert_eq!(ask(&two), size * (OVERLAY_BYTES + EVEN_ODD_BYTES));
         // Without an overlay nothing is asked of the browser.
         let unclosed = poly(&[&[(0., 0.), (10., 0.), (10., 10.), (0., 10.)]]);
         assert!(matches!(repair(Some(&unclosed), &|_| false), Outcome::Repaired(_)));

@@ -1218,6 +1218,12 @@ fn even_odd_keeps_what_lies_inside_an_odd_number_of_rings() {
         let (got, repairs, _) = one_by("Even-Odd", g.clone());
         assert_eq!((got, repairs.as_str()), (None, "no_area"), "{g:?}");
     }
+    // Two holes covering the square, one with a vertex mid-edge: one is a duplicate, left out, the
+    // other cancels the square, so no area is left, and the duplicate is still said.
+    let mid: &[(f64, f64)] = &[(0., 0.), (5., 0.), (10., 0.), (10., 10.), (0., 10.), (0., 0.)];
+    let (got, repairs, messages) = one_by("Even-Odd", poly(&[SQUARE, SQUARE, mid]));
+    assert_eq!((got, repairs.as_str()), (None, "no_area"));
+    assert!(messages.iter().any(|m| m.contains("1 duplicate ring was left out")), "{messages:?}");
     // A feature valid as it is, or fixed without moving a coordinate, comes out the same under
     // either rule; one the overlay rebuilds (the bowtie) says the rule.
     for g in [poly(&[SQUARE, HOLE]), poly(&[&[(0., 0.), (10., 0.), (10., 10.), (0., 10.)]]), poly(&[BOWTIE])] {

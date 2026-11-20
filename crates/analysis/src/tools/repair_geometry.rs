@@ -160,6 +160,16 @@ fn run_with_room(
                 }
                 (joined(&[why.as_str()], "").map_err(no_memory)?, Written::Without)
             }
+            // No area left once duplicates were left out: counted as both.
+            Outcome::GoneAfterDuplicates { duplicates } => {
+                let why = Gone::NoArea;
+                if let Some(n) = Gone::ALL.iter().position(|g| *g == why).and_then(|k| tally.gone.get_mut(k)) {
+                    *n += 1;
+                }
+                tally.duplicates += duplicates;
+                tally.duplicate_features += 1;
+                (joined(&[why.as_str()], "").map_err(no_memory)?, Written::Without)
+            }
             Outcome::Kept(why) => {
                 match why {
                     Kept::Work => tally.work += 1,
