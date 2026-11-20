@@ -1067,6 +1067,10 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
         .chain(&l.labels.classes)
         .map(|c| [&c.by.text, &c.by.size, &c.by.color, &c.by.angle].map(|t| t.as_deref().is_some_and(needs)))
         .collect();
+    // And the label classes' clauses that read it: one that still parses without it would go on to
+    // read a field named the same but for case (#1955).
+    let clause_read: Vec<bool> =
+        std::iter::once(&l.labels.default).chain(&l.labels.classes).map(|c| c.where_.as_deref().is_some_and(needs)).collect();
     // A Default class still as the layer made it loses nothing by starting again: that restart isn't said.
     let default_untouched = l.labels.default == rustgis_map::LabelClass::default_for(&l.dataset);
     // What the layer keeps by a field's name (renderer, labels, design, diagram…) read the deleted
@@ -1109,6 +1113,25 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
             label_gone.push((format!("{}'s {}", c.name, and_list(&gone)), gone.len()));
         }
     }
+    // A clause that read it and would now read a field named the same but for case is removed, so
+    // the class takes the features the earlier ones leave, as with no clause; said once, naming the
+    // classes. One that no longer reads is kept to edit, taking no features, as before.
+    let mut clauses_gone = Vec::new();
+    let classes = std::iter::once(&mut l.labels.default).chain(l.labels.classes.iter_mut());
+    for (c, read) in classes.zip(&clause_read) {
+        if *read && c.where_.as_deref().is_some_and(|w| rustgis_data::query::parse_fields(w, &l.dataset).is_ok()) {
+            c.where_ = None;
+            clauses_gone.push(c.name.clone());
+        }
+    }
+    let clause_note = (!clauses_gone.is_empty()).then(|| {
+        let (classes, they) = if clauses_gone.len() == 1 { ("class", "it is") } else { ("classes", "they are") };
+        format!(
+            "{}: the clause of its label {classes} {} read the deleted field {removed}, so {they} removed",
+            l.name,
+            clauses_gone.join(", ")
+        )
+    });
     let label_note = match label_gone.as_slice() {
         [] => None,
         [(one, n)] => {
@@ -1125,7 +1148,7 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     // said; by a text expression that still reads, Default only loses the field. Another class on
     // it labels with Default's field instead. A class clause naming it no longer reads, and takes
     // no features, which go on to the next class: it is kept to edit, not dropped with its text
-    // symbol.
+    // symbol; one that would read its twin was removed above.
     let mut restart_note = None;
     if names_removed(&l.labels.default.field) {
         let by_text = l.labels.default.by.text.as_deref().is_some_and(|t| rustgis_data::query::parse_fields(t, &l.dataset).is_ok());
@@ -1287,7 +1310,9 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
             Some(format!("{}: its symbol's {} expressions read the deleted field {removed}, so they are removed", l.name, and_list(many)))
         }
     };
-    for note in [extrusion_note, rotation_note, size_note, by_note, label_note, restart_note, moved_note, design_note].into_iter().flatten()
+    for note in [extrusion_note, rotation_note, size_note, by_note, label_note, clause_note, restart_note, moved_note, design_note]
+        .into_iter()
+        .flatten()
     {
         s.notify(note, false);
     }
@@ -2278,6 +2303,46 @@ mod tests {
         }
         // Read ahead: not for a twin's name.
         assert!(crate::cmd::layer::size_by_ahead(&s, &json!({"layer": id, "field": "X"})).is_none());
+    }
+
+    /// Deleting a field removes the label class clauses that read it and would go on to read its
+    /// twin, said: with fields `Pop` and `pop`, `pop > 1` reads `Pop`, and deleting `Pop` would
+    /// otherwise leave it reading `pop`. A clause that read another field is kept, and nothing is
+    /// said; one on a deleted field without a twin stays, no longer reading, as before (#1955).
+    #[test]
+    fn a_deleted_field_takes_the_label_clauses_that_read_it() {
+        for (fields, deleted, read) in
+            [(["Pop", "pop", "n"], "Pop", true), (["Pop", "a", "n"], "a", false), (["Pop", "a", "n"], "Pop", false)]
+        {
+            let mut s = Session::new(crate::Project::default());
+            let mut ds = Dataset::new("twins", GeometryType::Point, fields.map(|f| Field::new(f, FieldType::Double)).to_vec());
+            ds.push(
+                Some(Geometry::Point(rustgis_data::Coord::new(3.0, 4.0))),
+                vec![Value::Float(5.0), Value::Float(0.0), Value::Float(1.0)],
+            );
+            let id = s.map_mut().add_dataset(ds);
+            let l = s.map_mut().layer_mut(id).unwrap();
+            l.labels.default.field = "n".into();
+            let mut big = l.labels.default.clone();
+            big.name = "Big".into();
+            big.where_ = Some("pop > 1".into());
+            l.labels.classes.push(big);
+            let mark = s.notice_mark();
+            s.run("edit.deleteField", &json!({"layer": id, "field": deleted})).unwrap();
+            let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+            let clause = s.map().layer(id).unwrap().labels.classes[0].where_.clone();
+            if read {
+                assert_eq!(clause, None);
+                assert!(
+                    said.iter().any(|n| n == "twins: the clause of its label class Big read the deleted field Pop, so it is removed"),
+                    "{said:?}"
+                );
+            } else {
+                // Kept: reading another field, or (no twin) no longer reading, as before.
+                assert_eq!(clause.as_deref(), Some("pop > 1"));
+                assert!(said.iter().all(|n| !n.contains("clause")), "{said:?}");
+            }
+        }
     }
 
     /// What a layer keeps by a field's name (a diagram, a size, a report) is
