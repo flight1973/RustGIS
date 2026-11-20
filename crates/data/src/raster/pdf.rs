@@ -16,7 +16,7 @@ use hayro::hayro_interpret::{InterpreterSettings, InterpreterWarning};
 use hayro::hayro_syntax::Pdf;
 use hayro::hayro_syntax::content::TypedIter;
 use hayro::hayro_syntax::content::ops::TypedInstruction;
-use hayro::hayro_syntax::object::{Array, Dict, Name, Stream, String as PdfString};
+use hayro::hayro_syntax::object::{Array, Dict, Name, Rect, Stream, String as PdfString};
 use hayro::hayro_syntax::page::Page;
 use hayro::kurbo::{Affine, Point};
 use hayro::vello_cpu::color::palette::css::WHITE;
@@ -275,12 +275,21 @@ impl<'a> Res<'a> {
         s.dict().get::<Dict<'a>>(b"Resources".as_slice()).map_or_else(|| self.clone(), |d| Res::of(&d))
     }
 
+    /// Which resources these are, by where their dictionaries lie ([`span`]).
+    fn key(&self) -> [(usize, usize); 4] {
+        [span(&self.fonts), span(&self.xobjects), span(&self.states), span(&self.patterns)]
+    }
+
     /// Stream `s`'s own resources, else none: a tiling pattern is drawn with its own only, as
     /// `hayro` draws it.
     fn own(s: &Stream<'a>) -> Self {
         s.dict().get::<Dict<'a>>(b"Resources".as_slice()).map(|d| Res::of(&d)).unwrap_or_default()
     }
 }
+
+/// A content stream queued for the font search: where it lies ([`span`]), and the resources it is
+/// drawn with when they aren't its own ([`Res::key`]).
+type Seen = ((usize, usize), Option<[(usize, usize); 4]>);
 
 /// Where an object's dictionary lies in the bytes it was read from: one key for an object
 /// however it is reached, with an object number or without (a dictionary written in place).
@@ -298,7 +307,7 @@ struct FontSearch<'a> {
     keys: HashSet<String>,
     stopped: bool,
     /// The streams queued, and the fonts looked at, by [`span`].
-    seen: HashSet<(usize, usize)>,
+    seen: HashSet<Seen>,
     fonts: HashSet<(usize, usize)>,
     streams: usize,
     /// The bytes content may still decode to, and the fonts chosen and annotations that may
@@ -337,6 +346,10 @@ fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> Result<F
             }
             // Hidden (bit 2) or not for the screen (NoView, bit 6): not drawn (ISO 32000-2 § 12.5.3).
             if annot.get::<u32>(b"F".as_slice()).unwrap_or(0) & (1 << 1 | 1 << 5) != 0 {
+                continue;
+            }
+            // Without a rectangle (four numbers) to draw it in, `hayro` draws none.
+            if annot.get::<Rect>(b"Rect".as_slice()).is_none() {
                 continue;
             }
             // The normal appearance is the one drawn; with states, the one `/AS` names, else `Off`.
@@ -395,9 +408,12 @@ impl<'a> FontSearch<'a> {
     /// Queues content stream `s`, drawn with `res`, `depth` forms deep: once, and not past
     /// [`FONT_SEARCH_DEPTH`].
     fn queue(&mut self, res: Res<'a>, s: Stream<'a>, depth: usize) {
+        // A stream without resources of its own is drawn with its drawer's, which may name other
+        // fonts: it is looked at once for each set it is drawn with.
+        let inherited = s.dict().get::<Dict<'a>>(b"Resources".as_slice()).is_none().then(|| res.key());
         if depth > FONT_SEARCH_DEPTH {
             self.stopped = true;
-        } else if self.seen.insert(span(s.dict())) {
+        } else if self.seen.insert((span(s.dict()), inherited)) {
             self.todo.push((s, res, depth));
         }
     }
@@ -423,12 +439,22 @@ impl<'a> FontSearch<'a> {
                     .get::<Stream<'a>>(x.0)
                     .filter(|s| s.dict().get::<Name<'_>>(b"Subtype".as_slice()).is_some_and(|n| n.as_str() == "Form"))
                     .map(inherits),
-                TypedInstruction::SetGraphicsState(g) => res
-                    .states
-                    .get::<Dict<'a>>(g.0)
-                    .and_then(|s| s.get::<Dict<'a>>(b"SMask".as_slice()))
-                    .and_then(|m| m.get::<Stream<'a>>(b"G".as_slice()))
-                    .map(inherits),
+                TypedInstruction::SetGraphicsState(g) => {
+                    let state = res.states.get::<Dict<'a>>(g.0);
+                    // A graphics state may choose the font itself (`/Font [font size]`), as `Tf` does.
+                    if let Some(font) =
+                        state.as_ref().and_then(|s| s.get::<Array<'a>>(b"Font".as_slice())).and_then(|a| a.iter::<Dict<'a>>().next())
+                    {
+                        if !self.spend() {
+                            return;
+                        }
+                        self.font_dict(&font);
+                    }
+                    state
+                        .and_then(|s| s.get::<Dict<'a>>(b"SMask".as_slice()))
+                        .and_then(|m| m.get::<Stream<'a>>(b"G".as_slice()))
+                        .map(inherits)
+                }
                 TypedInstruction::NonStrokeColorNamed(c) => c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)).map(pattern),
                 TypedInstruction::StrokeColorNamed(c) => c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)).map(pattern),
                 _ => None,
@@ -442,11 +468,17 @@ impl<'a> FontSearch<'a> {
     /// A font chosen by name in `res`: named when not in the file. Each font is looked at once,
     /// however often it is chosen; a Type 3 font is passed over ([`missing_font`]).
     fn font(&mut self, name: &Name<'_>, res: &Res<'a>) {
-        let Some(font) = res.fonts.get::<Dict<'a>>(name) else { return };
-        if !self.fonts.insert(span(&font)) {
+        if let Some(font) = res.fonts.get::<Dict<'a>>(name) {
+            self.font_dict(&font);
+        }
+    }
+
+    /// A font chosen, by `Tf` or a graphics state: named when not in the file, once.
+    fn font_dict(&mut self, font: &Dict<'a>) {
+        if !self.fonts.insert(span(font)) {
             return;
         }
-        if let Some(name) = missing_font(&font) {
+        if let Some(name) = missing_font(font) {
             if self.keys.len() >= MISSING_FONTS_COUNTED {
                 self.stopped = true;
             } else if self.keys.insert(font_key(&name)) && self.names.len() < MISSING_FONTS_KEPT {
@@ -457,10 +489,13 @@ impl<'a> FontSearch<'a> {
 }
 
 /// A font's name as a key that two spellings of one font share: its letters and digits in lower
-/// case, without an `MT` or `PS` maker's suffix ("Arial,Bold" and "Arial-BoldMT" alike).
+/// case, without an `MT` or `PS` maker's suffix, or both ("Arial,Bold" and "Arial-BoldMT" alike,
+/// "TimesNewRoman" and "TimesNewRomanPSMT").
 fn font_key(name: &str) -> String {
     let key: String = name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect();
-    ["mt", "ps"].iter().find_map(|s| key.strip_suffix(s).filter(|k| !k.is_empty())).map_or(key.clone(), str::to_string)
+    // `MT`, then `PS` (TimesNewRomanPSMT is TimesNewRoman).
+    let key = key.strip_suffix("mt").filter(|k| !k.is_empty()).map_or(key.clone(), str::to_string);
+    key.strip_suffix("ps").filter(|k| !k.is_empty()).map_or(key.clone(), str::to_string)
 }
 
 /// A font's name when its program isn't in the file (no `/FontFile`, `/FontFile2` or `/FontFile3`
@@ -1156,6 +1191,53 @@ mod tests {
         // search (a bound on its work).
         assert!(read_bytes("x", glyphs, None, true).unwrap().lost.is_empty());
         assert_eq!(font_key("Arial,Bold"), font_key("Arial-BoldMT"));
+        assert_eq!(font_key("TimesNewRomanPSMT"), font_key("TimesNewRoman"));
+        assert_eq!(font_key("TimesNewRomanPS"), font_key("TimesNewRoman"));
+        assert_ne!(font_key("Arial"), font_key("TimesNewRoman"));
+    }
+
+    /// A font a graphics state chooses (`/Font [font size]`) is named as one `Tf` chooses; a form
+    /// without resources of its own is looked at with each drawer's; an annotation without a
+    /// rectangle isn't drawn, so isn't looked at (#2352).
+    #[test]
+    fn the_font_search_follows_graphics_states_inherited_resources_and_rectangles() {
+        let notice = "fonts not in the file are drawn in a stand-in font: Arial";
+        let arial = b"<< /Type /Font /Subtype /TrueType /BaseFont /Arial /Encoding /WinAnsiEncoding >>".to_vec();
+        let helvetica = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec();
+        // Chosen by a graphics state: named; the same text by Helvetica's: nothing said.
+        let by_state = |font: Vec<u8>| {
+            pdf_of("0 0 72 36", "/Resources << /ExtGState << /GS0 << /Font [5 0 R 12] >> >> >>", b"/GS0 gs BT 5 10 Td (Hi) Tj ET", &[font])
+        };
+        assert_eq!(read_bytes("x", by_state(arial.clone()), None, true).unwrap().lost, [notice]);
+        assert!(read_bytes("x", by_state(helvetica.clone()), None, true).unwrap().lost.is_empty());
+        // Form X has no resources and chooses F1: the page's F1 is Helvetica, form Y's is Arial.
+        let x = stream("/Type /XObject /Subtype /Form /BBox [0 0 72 36]", b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET");
+        let y = stream(
+            "/Type /XObject /Subtype /Form /BBox [0 0 72 36] /Resources << /Font << /F1 8 0 R >> /XObject << /X 6 0 R >> >>",
+            b"/X Do",
+        );
+        let drawn_by_both = pdf_of(
+            "0 0 72 36",
+            "/Resources << /Font << /F1 5 0 R >> /XObject << /X 6 0 R /Y 7 0 R >> >>",
+            b"/X Do /Y Do",
+            &[helvetica.clone(), x.clone(), y, arial.clone()],
+        );
+        assert_eq!(search(drawn_by_both, 1 << 20, 1000).0, ["Arial"]);
+        // Drawn by the page alone: Helvetica only, nothing named.
+        let by_page = pdf_of("0 0 72 36", "/Resources << /Font << /F1 5 0 R >> /XObject << /X 6 0 R >> >>", b"/X Do", &[helvetica, x]);
+        assert!(search(by_page, 1 << 20, 1000).0.is_empty());
+        // An annotation's appearance choosing Arial: looked at with a rectangle, not without one.
+        let with_font =
+            stream("/Type /XObject /Subtype /Form /BBox [0 0 72 36] /Resources << /Font << /F1 6 0 R >> >>", b"BT /F1 12 Tf (Hi) Tj ET");
+        for (rect, named) in [("/Rect [0 0 72 36]", 1), ("", 0), ("/Rect [0 0 72]", 0)] {
+            let pdf = pdf_of(
+                "0 0 72 36",
+                &format!("/Annots [<< /Type /Annot /Subtype /Square {rect} /AP << /N 5 0 R >> >>]"),
+                b"",
+                &[with_font.clone(), arial.clone()],
+            );
+            assert_eq!(search(pdf, 1 << 20, 1000).0.len(), named, "{rect}");
+        }
     }
 
     /// The font search follows what `hayro` draws: not a hidden annotation or one not for the
