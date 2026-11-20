@@ -140,8 +140,7 @@ pub fn commands() -> Vec<C> {
         C::new("report.autofill", "Autofill Fields", "Data › Data Design", |s, p| {
             let i = index(s, p)?;
             let ds = &layer_of(s, i)?.dataset;
-            let (names, twins) = filled_in(ds);
-            let all = ds.fields.len() - twins.len();
+            let FilledIn { names, twins, clean: all } = filled_in(ds);
             let r = s.project.reports.get_mut(i).ok_or("no report")?;
             r.fields = names;
             let (answer, report) = (json!({"fields": r.fields}), r.name.clone());
@@ -299,19 +298,48 @@ fn optional_field(input: &impl super::InputSource, p: &Value) -> Result<(usize, 
     }
 }
 
-/// The first [`MAX_ITEMS`] of a layer's fields, to fill a report with, and the fields left out
-/// for having a case twin, which report.field refuses (#1955).
-fn filled_in(ds: &rustgis_data::Dataset) -> (Vec<String>, Vec<String>) {
-    let (twins, names): (Vec<_>, Vec<_>) = ds.fields.iter().map(|f| f.name.clone()).partition(|n| ds.has_case_twin(n));
-    (names.into_iter().take(MAX_ITEMS).collect(), twins)
+/// A layer's fields to fill a report with ([`filled_in`]).
+struct FilledIn {
+    /// The first [`MAX_ITEMS`] fields without a case twin.
+    names: Vec<String>,
+    /// The fields with a case twin among those looked at before the report was full, left out as
+    /// report.field refuses them (#1955).
+    twins: Vec<String>,
+    /// How many of the layer's fields have no case twin.
+    clean: usize,
 }
 
-/// The notice for the fields [`filled_in`] left out of report `report`, if any.
+/// The most twins a notice names; the rest are counted.
+const TWINS_NAMED: usize = 20;
+
+/// The first [`MAX_ITEMS`] of a layer's fields without a case twin, in one pass over the fields to
+/// find twins (their names in lower case) and one to pick, which stops once the report is full.
+fn filled_in(ds: &rustgis_data::Dataset) -> FilledIn {
+    let mut named: HashMap<String, usize> = HashMap::with_capacity(ds.fields.len());
+    for f in &ds.fields {
+        *named.entry(f.name.to_ascii_lowercase()).or_default() += 1;
+    }
+    let twin = |n: &str| named.get(&n.to_ascii_lowercase()).is_some_and(|c| *c > 1);
+    let clean = named.values().filter(|c| **c == 1).count();
+    let (mut names, mut twins) = (Vec::new(), Vec::new());
+    for f in &ds.fields {
+        if names.len() >= MAX_ITEMS {
+            break;
+        }
+        if twin(&f.name) { twins.push(f.name.clone()) } else { names.push(f.name.clone()) }
+    }
+    FilledIn { names, twins, clean }
+}
+
+/// The notice for the fields [`filled_in`] left out of report `report`, if any: the first
+/// [`TWINS_NAMED`] named, the rest counted.
 fn twins_left_out(report: &str, twins: &[String]) -> Option<String> {
     (!twins.is_empty()).then(|| {
+        let shown = twins.iter().take(TWINS_NAMED).map(String::as_str).collect::<Vec<_>>().join(", ");
+        let more = twins.len().saturating_sub(TWINS_NAMED);
+        let tail = if more > 0 { format!(", and {more} more") } else { String::new() };
         format!(
-            "{report}: fields named the same but for case are left out ({}): a report reads its field by name ignoring case, so it would use the first",
-            twins.join(", ")
+            "{report}: fields named the same but for case are left out ({shown}{tail}): a report reads its field by name ignoring case, so it would use the first"
         )
     })
 }
@@ -510,10 +538,9 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
     let mut twins = Vec::new();
     let mut all = ds.fields.len();
     let first_of = r.fields.is_empty() && {
-        let names;
-        (names, twins) = filled_in(ds);
-        all -= twins.len();
-        r.fields = names;
+        let filled = filled_in(ds);
+        (twins, all) = (filled.twins, filled.clean);
+        r.fields = filled.names;
         all > MAX_ITEMS
     };
     r.groups = fields_of("groups", "a report groups by", MAX_GROUPS)?;

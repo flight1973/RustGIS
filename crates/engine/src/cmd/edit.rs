@@ -2275,6 +2275,26 @@ mod tests {
         assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("same but for case")), "{:?}", s.notices_since(mark));
     }
 
+    /// A report filled in from a layer with many twins names the first 20 it leaves out and counts
+    /// the rest (#1955).
+    #[test]
+    fn a_reports_twins_left_out_are_named_up_to_a_limit() {
+        let mut s = Session::new(crate::Project::default());
+        let mut fields: Vec<Field> =
+            (0..25).flat_map(|i| [format!("T{i}"), format!("t{i}")]).map(|n| Field::new(&n, FieldType::Double)).collect();
+        fields.push(Field::new("code", FieldType::Double));
+        s.map_mut().add_dataset(Dataset::new("twins", GeometryType::Point, fields));
+        let mark = s.notice_mark();
+        s.run("report.new", &json!({"layer": "twins", "name": "R"})).unwrap();
+        assert_eq!(s.project.reports[0].fields, ["code"]);
+        let named: Vec<String> = (0..10).flat_map(|i| [format!("T{i}"), format!("t{i}")]).collect();
+        let notice = format!(
+            "R: fields named the same but for case are left out ({}, and 30 more): a report reads its field by name ignoring case, so it would use the first",
+            named.join(", ")
+        );
+        assert!(s.notices_since(mark).iter().any(|n| n.text == notice), "{:?}", s.notices_since(mark));
+    }
+
     /// A size by field or diagram set again over the field it already reads keeps reading it, twin
     /// or not; a twin's name newly given is refused (#1955).
     #[test]
