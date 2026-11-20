@@ -239,6 +239,8 @@ const FONT_SEARCH_DEPTH: usize = 32;
 const FONT_SEARCH_STREAMS: usize = 1_000;
 const FONT_SEARCH_BYTES: usize = 32 << 20;
 const FONT_SEARCH_WORK: usize = 1_000_000;
+/// The most font programs in the file loaded to see whether `hayro` can read them.
+const FONT_SEARCH_PROGRAMS: usize = 256;
 
 /// The standard 14 fonts (ISO 32000-2 § 9.6.2.2), drawn in `hayro`'s own when not in the file, as
 /// every reader draws them in its own: not a stand-in for something else.
@@ -315,6 +317,10 @@ struct FontSearch<'a> {
     /// The streams queued, and the fonts looked at, by [`span`].
     seen: HashSet<Seen>,
     fonts: HashSet<(usize, usize)>,
+    /// The font programs in the file loaded, by [`span`], and whether `hayro` rejects each.
+    programs: std::collections::HashMap<(usize, usize), bool>,
+    /// Cancel, met while loading a font program, which the search then gives back.
+    canceled: Option<DataError>,
     streams: usize,
     /// The bytes content may still decode to, and the fonts chosen and annotations that may
     /// still be looked at.
@@ -345,6 +351,9 @@ fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> Result<F
     let page_res =
         Res { fonts: res.fonts.clone(), xobjects: res.x_objects.clone(), states: res.ext_g_states.clone(), patterns: res.patterns.clone() };
     search.ops(page.typed_operations(), &page_res, 0);
+    if let Some(e) = search.canceled.take() {
+        return Err(e);
+    }
     if let Some(annots) = page.raw().get::<Array<'a>>(b"Annots".as_slice()) {
         for annot in annots.iter::<Dict<'a>>() {
             if !search.spend() {
@@ -396,6 +405,9 @@ fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> Result<F
         search.bytes_left -= data.len();
         search.decoded += data.len();
         search.ops(TypedIter::new(&data), &res, depth);
+        if let Some(e) = search.canceled.take() {
+            return Err(e);
+        }
     }
     Ok(search)
 }
@@ -490,9 +502,37 @@ impl<'a> FontSearch<'a> {
         if font.get::<Name<'_>>(b"Subtype".as_slice()).is_some_and(|n| n.as_str() == "Type3") {
             self.type3 = true;
         }
-        if let Some(name) = missing_font(font) {
-            self.named(name);
+        match missing_font(font) {
+            Some((name, None)) => self.named(name),
+            Some((name, Some(program))) if self.rejected(font, &program) => {
+                self.named(format!("{name} (its program in the file can't be read)"));
+            }
+            _ => {}
         }
+    }
+
+    /// Whether `hayro` rejects `font`'s `program` ([`program_rejected`]): each program loaded once,
+    /// at most [`FONT_SEARCH_PROGRAMS`] of them, its stored length spent from the bytes left, and
+    /// Cancel looked at first. Past those, the search stops and the program isn't loaded.
+    fn rejected(&mut self, font: &Dict<'a>, program: &Stream<'a>) -> bool {
+        let key = span(program.dict());
+        if let Some(rejected) = self.programs.get(&key) {
+            return *rejected;
+        }
+        if let Err(e) = crate::progress::check() {
+            self.canceled = Some(e);
+            self.stopped = true;
+            return false;
+        }
+        let stored = program.dict().get::<usize>(b"Length".as_slice()).unwrap_or_else(|| program.raw_data().len());
+        if self.programs.len() >= FONT_SEARCH_PROGRAMS || stored > self.bytes_left {
+            self.stopped = true;
+            return false;
+        }
+        self.bytes_left -= stored;
+        let rejected = program_rejected(font);
+        self.programs.insert(key, rejected);
+        rejected
     }
 
     /// Keeps `name`, of a font drawn in a stand-in: once for each spelling of it ([`font_key`]),
@@ -523,43 +563,44 @@ fn font_key(name: &str) -> String {
     key.strip_suffix("ps").filter(|k| !k.is_empty()).map_or(key.clone(), str::to_string)
 }
 
-/// A font's name when `hayro` draws it in a stand-in: its program isn't in the file (no
-/// `/FontFile`, `/FontFile2` or `/FontFile3` in its descriptor, or its descendant's for a
-/// composite font) and it isn't one of the [`STANDARD_FONTS`], or its program is there but
-/// `hayro` can't load it ([`program_rejected`]). One without a `/BaseFont` is "a font without a
-/// name". A Type 3 font draws its glyphs itself; one without a `/Subtype`, of a kind `hayro`
-/// can't read, or a composite font without a descendant `hayro` doesn't draw with at all, which
-/// its warnings say as a font that can't be read.
-fn missing_font(font: &Dict<'_>) -> Option<String> {
+/// A font's name when `hayro` may draw it in a stand-in, with its program when that is in the
+/// file: a font whose program isn't in the file (no `/FontFile`, `/FontFile2` or `/FontFile3`
+/// stream in its descriptor, or its descendant's for a composite font) and isn't one of the
+/// [`STANDARD_FONTS`] is drawn in one; one whose program is there is when `hayro` can't load it
+/// ([`program_rejected`]). One without a `/BaseFont` is "a font without a name". A Type 3 font
+/// draws its glyphs itself; one without a `/Subtype`, of a kind `hayro` can't read, or a
+/// composite font without a descendant `hayro` doesn't draw with at all, which its warnings say
+/// as a font that can't be read.
+fn missing_font<'a>(font: &Dict<'a>) -> Option<(String, Option<Stream<'a>>)> {
     let subtype = font.get::<Name<'_>>(b"Subtype".as_slice())?;
     if !matches!(subtype.as_str(), "Type1" | "MMType1" | "TrueType" | "Type0") {
         return None;
     }
     let described = if subtype.as_str() == "Type0" {
-        font.get::<Array<'_>>(b"DescendantFonts".as_slice()).and_then(|a| a.iter::<Dict<'_>>().next())?
+        font.get::<Array<'a>>(b"DescendantFonts".as_slice()).and_then(|a| a.iter::<Dict<'a>>().next())?
     } else {
         font.clone()
     };
-    let embedded = described
-        .get::<Dict<'_>>(b"FontDescriptor".as_slice())
-        .is_some_and(|d| [b"FontFile".as_slice(), b"FontFile2".as_slice(), b"FontFile3".as_slice()].iter().any(|k| d.contains_key(k)));
+    let program = described.get::<Dict<'a>>(b"FontDescriptor".as_slice()).and_then(|d| {
+        [b"FontFile".as_slice(), b"FontFile2".as_slice(), b"FontFile3".as_slice()].iter().find_map(|k| d.get::<Stream<'a>>(*k))
+    });
     let base = font.get::<Name<'_>>(b"BaseFont".as_slice());
     // A subset's name starts with six capitals and a plus (ISO 32000-2 § 9.6.4).
     let name = base.as_ref().map(|n| match n.as_str().split_once('+') {
         Some((tag, rest)) if tag.len() == 6 && tag.bytes().all(|b| b.is_ascii_uppercase()) => rest,
         _ => n.as_str(),
     });
-    let named = || name.unwrap_or("a font without a name").to_string();
-    if embedded {
-        return program_rejected(font).then(|| format!("{} (its program in the file can't be read)", named()));
+    let named = name.unwrap_or("a font without a name").to_string();
+    if program.is_some() {
+        return Some((named, program));
     }
-    (!name.is_some_and(|n| STANDARD_FONTS.contains(&n))).then(named)
+    (!name.is_some_and(|n| STANDARD_FONTS.contains(&n))).then_some((named, None))
 }
 
 /// Whether `hayro` loads `font`, whose program is in the file, in a stand-in: it can't read the
 /// program, and asks for a font it carries instead. Loaded as `hayro` loads it, again (the
-/// search runs only when `hayro` asked for a font it carries); a font it can't load at all is
-/// left to its warnings.
+/// search runs only when `hayro` asked for a font it carries; [`FontSearch::rejected`] bounds
+/// how often); a font it can't load at all is left to its warnings.
 fn program_rejected(font: &Dict<'_>) -> bool {
     let defaults = InterpreterSettings::default();
     let asked = Arc::new(AtomicBool::new(false));
@@ -1290,6 +1331,52 @@ mod tests {
         // Helvetica named: nothing.
         let r = read_bytes("x", page_with("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", &[]), None, true).unwrap();
         assert!(r.lost.is_empty(), "{:?}", r.lost);
+    }
+
+    /// Font programs in the file are each loaded once to see whether `hayro` reads them, at most
+    /// [`FONT_SEARCH_PROGRAMS`] and within the bytes left: past those the search stops, and says a
+    /// stand-in may be drawn (#2352).
+    #[test]
+    fn many_font_programs_stop_the_search() {
+        let (program, _) = hayro::hayro_interpret::font::StandardFont::Helvetica.get_font_data();
+        let program: &[u8] = (*program).as_ref();
+        let pdf_with = |fonts: usize| {
+            // Font i is object 5 + 2i, its program 6 + 2i; F0 is Helvetica, not in the file, so hayro
+            // asks for a font it carries and the search runs.
+            let mut objects = Vec::new();
+            let mut names = String::from("/F0 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> ");
+            let mut content = String::from("BT /F0 12 Tf (a) Tj ");
+            for i in 0..fonts {
+                let (font, file) = (5 + 2 * i, 6 + 2 * i);
+                objects.push(
+                    format!(
+                        "<< /Type /Font /Subtype /Type1 /BaseFont /Embedded{i} /FontDescriptor << /Type /FontDescriptor \
+                         /FontName /Embedded{i} /Flags 32 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 \
+                         /CapHeight 700 /StemV 80 /FontFile {file} 0 R >> >>"
+                    )
+                    .into_bytes(),
+                );
+                objects.push(stream("", program));
+                names.push_str(&format!("/E{i} {font} 0 R "));
+                content.push_str(&format!("/E{i} 12 Tf (a) Tj "));
+            }
+            content.push_str("ET");
+            pdf_of("0 0 72 36", &format!("/Resources << /Font << {names}>> >>"), content.as_bytes(), &objects)
+        };
+        // Within the limit: each loaded, none rejected, nothing said.
+        let (names, stopped, ..) = search(pdf_with(3), 1 << 30, 1_000_000);
+        assert!(names.is_empty() && !stopped, "{names:?}");
+        // Bytes for one program only: the search stops before loading the next.
+        let (_, stopped, ..) = search(pdf_with(3), program.len() + 10, 1_000_000);
+        assert!(stopped);
+        // Past the most programs loaded: stopped, and a stand-in said as maybe.
+        let many = pdf_with(FONT_SEARCH_PROGRAMS + 1);
+        let (names, stopped, ..) = search(many.clone(), 1 << 30, 1_000_000);
+        assert!(names.is_empty() && stopped, "{names:?}");
+        assert_eq!(
+            read_bytes("x", many, None, true).unwrap().lost,
+            ["fonts not in the file may be drawn in a stand-in font (the search for them stopped early)"]
+        );
     }
 
     /// An annotation appearance without a box isn't drawn, so isn't looked at; a font already
