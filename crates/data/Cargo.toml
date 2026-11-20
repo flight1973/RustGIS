@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 hayro = { workspace = true, optional = true }
+hayro-font = { workspace = true, optional = true }
 rustgis-geom = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -82,7 +83,7 @@ rustix = { version = "1.1", features = ["process", "fs"] }
 # PDF pages read as rasters, GeoPDFs placed by their coordinates (#2336): the desktop, command line
 # and Python apps turn it on; the browser and phone apps leave it off, where it would add megabytes
 # for a format seldom opened there. An app built on the engine may turn it on anywhere.
-pdf = ["dep:hayro"]
+pdf = ["dep:hayro", "dep:hayro-font"]
 # The JSON Schema of the saved types (`cargo xtask schema`).
 schema = ["dep:schemars", "rustgis-geom/schema"]
 # Marks direct uses of the row vector and of `Feature`'s fields as deprecated, so that

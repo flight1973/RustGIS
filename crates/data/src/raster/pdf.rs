@@ -202,9 +202,9 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
         }
     }
     // Only when `hayro` asked for a font it carries is the page looked through for which fonts are
-    // stand-ins. A search that stopped before naming one says one may be; one that looked at
-    // everything and named none found only standard fonts (or, unsaid, a font chosen inside a Type
-    // 3 font's glyphs, where it doesn't look).
+    // stand-ins. A search that stopped before naming one, or that met a Type 3 font whose glyphs it
+    // doesn't read, says one may be; one that looked at everything else and named none found only
+    // standard fonts.
     if asked.load(Ordering::Relaxed) {
         let found = substituted_fonts(page, FONT_SEARCH_BYTES, FONT_SEARCH_WORK)?;
         let shown: Vec<&str> = found.names.iter().take(MISSING_FONTS_NAMED).map(String::as_str).collect();
@@ -219,6 +219,10 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
             r.lost.push(format!("fonts not in the file are drawn in a stand-in font: {}{tail}", shown.join(", ")));
         } else if found.stopped {
             r.lost.push("fonts not in the file may be drawn in a stand-in font (the search for them stopped early)".into());
+        } else if found.type3 {
+            r.lost.push(
+                "fonts not in the file may be drawn in a stand-in font (inside Type 3 fonts, whose glyphs aren't looked through)".into(),
+            );
         }
     }
     Ok((r, scale))
@@ -306,6 +310,8 @@ struct FontSearch<'a> {
     names: Vec<String>,
     keys: HashSet<String>,
     stopped: bool,
+    /// Whether the page chooses a Type 3 font, whose glyphs (which may choose fonts) aren't read.
+    type3: bool,
     /// The streams queued, and the fonts looked at, by [`span`].
     seen: HashSet<Seen>,
     fonts: HashSet<(usize, usize)>,
@@ -361,7 +367,8 @@ fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> Result<F
                     .and_then(|s| states.get::<Stream<'a>>(s))
                     .or_else(|| states.get::<Stream<'a>>(b"Off".as_slice()))
             });
-            if let Some(s) = drawn {
+            // `hayro` draws an appearance only with a box (four numbers) to fit it in.
+            if let Some(s) = drawn.filter(|s| s.dict().get::<Rect>(b"BBox".as_slice()).is_some()) {
                 search.queue(page_res.within(&s), s, 1);
             }
         }
@@ -468,8 +475,10 @@ impl<'a> FontSearch<'a> {
     /// A font chosen by name in `res`: named when not in the file. Each font is looked at once,
     /// however often it is chosen; a Type 3 font is passed over ([`missing_font`]).
     fn font(&mut self, name: &Name<'_>, res: &Res<'a>) {
-        if let Some(font) = res.fonts.get::<Dict<'a>>(name) {
-            self.font_dict(&font);
+        match res.fonts.get::<Dict<'a>>(name) {
+            Some(font) => self.font_dict(&font),
+            // `hayro` draws its text in Helvetica.
+            None => self.named(format!("/{} (not in its resources)", name.as_str())),
         }
     }
 
@@ -478,10 +487,26 @@ impl<'a> FontSearch<'a> {
         if !self.fonts.insert(span(font)) {
             return;
         }
+        if font.get::<Name<'_>>(b"Subtype".as_slice()).is_some_and(|n| n.as_str() == "Type3") {
+            self.type3 = true;
+        }
         if let Some(name) = missing_font(font) {
-            if self.keys.len() >= MISSING_FONTS_COUNTED {
-                self.stopped = true;
-            } else if self.keys.insert(font_key(&name)) && self.names.len() < MISSING_FONTS_KEPT {
+            self.named(name);
+        }
+    }
+
+    /// Keeps `name`, of a font drawn in a stand-in: once for each spelling of it ([`font_key`]),
+    /// and past [`MISSING_FONTS_COUNTED`] fonts told apart, the search stopped.
+    fn named(&mut self, name: String) {
+        let key = font_key(&name);
+        if self.keys.contains(&key) {
+            return;
+        }
+        if self.keys.len() >= MISSING_FONTS_COUNTED {
+            self.stopped = true;
+        } else {
+            self.keys.insert(key);
+            if self.names.len() < MISSING_FONTS_KEPT {
                 self.names.push(name);
             }
         }
@@ -498,10 +523,13 @@ fn font_key(name: &str) -> String {
     key.strip_suffix("ps").filter(|k| !k.is_empty()).map_or(key.clone(), str::to_string)
 }
 
-/// A font's name when its program isn't in the file (no `/FontFile`, `/FontFile2` or `/FontFile3`
-/// in its descriptor, or its descendant's for a composite font) and it isn't one of the
-/// [`STANDARD_FONTS`]. A Type 3 font draws its glyphs itself; one of a kind `hayro` can't read
-/// is said as a font that can't be read.
+/// A font's name when `hayro` draws it in a stand-in: its program isn't in the file (no
+/// `/FontFile`, `/FontFile2` or `/FontFile3` in its descriptor, or its descendant's for a
+/// composite font) and it isn't one of the [`STANDARD_FONTS`], or its program is there but
+/// `hayro` can't load it ([`program_rejected`]). One without a `/BaseFont` is "a font without a
+/// name". A Type 3 font draws its glyphs itself; one without a `/Subtype`, of a kind `hayro`
+/// can't read, or a composite font without a descendant `hayro` doesn't draw with at all, which
+/// its warnings say as a font that can't be read.
 fn missing_font(font: &Dict<'_>) -> Option<String> {
     let subtype = font.get::<Name<'_>>(b"Subtype".as_slice())?;
     if !matches!(subtype.as_str(), "Type1" | "MMType1" | "TrueType" | "Type0") {
@@ -515,14 +543,33 @@ fn missing_font(font: &Dict<'_>) -> Option<String> {
     let embedded = described
         .get::<Dict<'_>>(b"FontDescriptor".as_slice())
         .is_some_and(|d| [b"FontFile".as_slice(), b"FontFile2".as_slice(), b"FontFile3".as_slice()].iter().any(|k| d.contains_key(k)));
-    let name = font.get::<Name<'_>>(b"BaseFont".as_slice())?;
+    let base = font.get::<Name<'_>>(b"BaseFont".as_slice());
     // A subset's name starts with six capitals and a plus (ISO 32000-2 § 9.6.4).
-    let name = name.as_str();
-    let name = match name.split_once('+') {
+    let name = base.as_ref().map(|n| match n.as_str().split_once('+') {
         Some((tag, rest)) if tag.len() == 6 && tag.bytes().all(|b| b.is_ascii_uppercase()) => rest,
-        _ => name,
-    };
-    (!embedded && !STANDARD_FONTS.contains(&name)).then(|| name.to_string())
+        _ => n.as_str(),
+    });
+    let named = || name.unwrap_or("a font without a name").to_string();
+    if embedded {
+        return program_rejected(font).then(|| format!("{} (its program in the file can't be read)", named()));
+    }
+    (!name.is_some_and(|n| STANDARD_FONTS.contains(&n))).then(named)
+}
+
+/// Whether `hayro` loads `font`, whose program is in the file, in a stand-in: it can't read the
+/// program, and asks for a font it carries instead. Loaded as `hayro` loads it, again (the
+/// search runs only when `hayro` asked for a font it carries); a font it can't load at all is
+/// left to its warnings.
+fn program_rejected(font: &Dict<'_>) -> bool {
+    let defaults = InterpreterSettings::default();
+    let asked = Arc::new(AtomicBool::new(false));
+    let (flag, resolve) = (Arc::clone(&asked), Arc::clone(&defaults.font_resolver));
+    let resolver: hayro_font::FontResolverFn = Arc::new(move |query: &FontQuery| {
+        flag.store(true, Ordering::Relaxed);
+        resolve(query)
+    });
+    let loaded = hayro_font::FontCache::new().font(font, &resolver, &defaults.cmap_resolver);
+    loaded.is_some() && asked.load(Ordering::Relaxed)
 }
 
 /// A GeoPDF viewport: its rectangle on the page, its control points (latitude, longitude) and
@@ -775,7 +822,9 @@ fn place_by_viewport(mut r: Raster, page: &Page<'_>, scale: f64) -> Raster {
     let (mut found, unread) = viewports(page);
     let unplaced = "it opens without coordinates";
     // The OGC's GeoPDF encoding, older than ISO 32000's viewports, isn't read: said whenever the
-    // page is left without coordinates.
+    // page is left without coordinates. Its map frames are an entry of the page object only
+    // (OGC 08-139r3, PDF Geo-registration Encoding Best Practice 2.2, § 6, Table 1), not of the
+    // document catalog.
     let lgidict = page
         .raw()
         .contains_key(b"LGIDict".as_slice())
@@ -1147,8 +1196,8 @@ mod tests {
         );
         let r = read_bytes("x", both, None, true).unwrap();
         assert_eq!(r.lost, [notice("Arial,Bold")]);
-        // Chosen only inside an annotation's appearance, a soft-mask group, a tiling pattern, or a
-        // Type 3 font's glyph: named.
+        // Chosen only inside an annotation's appearance, a soft-mask group or a tiling pattern:
+        // named.
         let text = b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET";
         let with_font =
             |kind: &str| format!("/Type /XObject /Subtype /Form /BBox [0 0 72 36] /Resources << /Font << /F1 6 0 R >> >> {kind}");
@@ -1188,12 +1237,85 @@ mod tests {
             &[type3.as_bytes().to_vec(), glyph, font],
         );
         // Chosen inside a Type 3 font's glyph: not named, as its glyphs aren't decoded for the
-        // search (a bound on its work).
-        assert!(read_bytes("x", glyphs, None, true).unwrap().lost.is_empty());
+        // search (a bound on its work), but said as maybe.
+        assert_eq!(
+            read_bytes("x", glyphs, None, true).unwrap().lost,
+            ["fonts not in the file may be drawn in a stand-in font (inside Type 3 fonts, whose glyphs aren't looked through)"]
+        );
         assert_eq!(font_key("Arial,Bold"), font_key("Arial-BoldMT"));
         assert_eq!(font_key("TimesNewRomanPSMT"), font_key("TimesNewRoman"));
         assert_eq!(font_key("TimesNewRomanPS"), font_key("TimesNewRoman"));
         assert_ne!(font_key("Arial"), font_key("TimesNewRoman"));
+    }
+
+    /// A font `hayro` draws in a stand-in is named however it comes to: its program in the file
+    /// can't be loaded, it has no name, or `Tf` names one the resources don't have. A program
+    /// `hayro` loads, a named standard font, and a Type 3 font without twins say nothing (#2352).
+    #[test]
+    fn stand_ins_without_a_missing_program_are_named() {
+        let stand_in = |names: &str| format!("fonts not in the file are drawn in a stand-in font: {names}");
+        let descriptor = |file: &str| {
+            format!(
+                "<< /Type /FontDescriptor /FontName /Arial /Flags 32 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 \
+                 /Descent -200 /CapHeight 700 /StemV 80 {file} >>"
+            )
+        };
+        let text = b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET";
+        let page_with = |font: &str, more: &[Vec<u8>]| {
+            let mut objects = vec![font.as_bytes().to_vec()];
+            objects.extend_from_slice(more);
+            pdf_of("0 0 72 36", "/Resources << /Font << /F1 5 0 R >> >>", text, &objects)
+        };
+        // A TrueType program that is junk: hayro draws a stand-in, said.
+        let junk = stream("", b"not a font program at all");
+        let font = format!("<< /Type /Font /Subtype /TrueType /BaseFont /Arial /FontDescriptor {} >>", descriptor("/FontFile2 6 0 R"));
+        let r = read_bytes("x", page_with(&font, &[junk]), None, true).unwrap();
+        assert_eq!(r.lost, [stand_in("Arial (its program in the file can't be read)")]);
+        // A Type 1 program hayro loads (its own Helvetica's): nothing said.
+        let (program, _) = hayro::hayro_interpret::font::StandardFont::Helvetica.get_font_data();
+        let program = stream("", (*program).as_ref());
+        let font = format!("<< /Type /Font /Subtype /Type1 /BaseFont /Arial /FontDescriptor {} >>", descriptor("/FontFile 6 0 R"));
+        let pdf = page_with(&font, &[program]);
+        let loaded = Pdf::new(pdf.clone()).unwrap();
+        let pages = loaded.pages();
+        let dict = pages.first().unwrap().resources().fonts.get::<Dict<'_>>(b"F1".as_slice()).unwrap();
+        assert!(!program_rejected(&dict));
+        assert!(read_bytes("x", pdf, None, true).unwrap().lost.is_empty());
+        // A TrueType font without a /BaseFont, not in the file: named as such.
+        let r = read_bytes("x", page_with("<< /Type /Font /Subtype /TrueType /Encoding /WinAnsiEncoding >>", &[]), None, true).unwrap();
+        assert_eq!(r.lost, [stand_in("a font without a name")]);
+        // Tf naming a font the resources don't have: drawn in Helvetica, said.
+        let missing = pdf_of("0 0 72 36", "/Resources << /Font << >> >>", b"BT /F9 12 Tf 5 10 Td (Hi) Tj ET", &[]);
+        assert_eq!(read_bytes("x", missing, None, true).unwrap().lost, [stand_in("/F9 (not in its resources)")]);
+        // Helvetica named: nothing.
+        let r = read_bytes("x", page_with("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>", &[]), None, true).unwrap();
+        assert!(r.lost.is_empty(), "{:?}", r.lost);
+    }
+
+    /// An annotation appearance without a box isn't drawn, so isn't looked at; a font already
+    /// counted at the limit of fonts told apart doesn't stop the search (#2352).
+    #[test]
+    fn the_font_search_skips_boxless_appearances_and_recounts_nothing() {
+        let arial = b"<< /Type /Font /Subtype /TrueType /BaseFont /Arial /Encoding /WinAnsiEncoding >>".to_vec();
+        let text = b"BT /F1 12 Tf (Hi) Tj ET";
+        for (bbox, named) in [("/BBox [0 0 72 36]", 1), ("", 0), ("/BBox [0 0 72]", 0)] {
+            let appearance = stream(&format!("/Type /XObject /Subtype /Form {bbox} /Resources << /Font << /F1 6 0 R >> >>"), text);
+            let pdf = pdf_of(
+                "0 0 72 36",
+                "/Annots [<< /Type /Annot /Subtype /Square /Rect [0 0 72 36] /AP << /N 5 0 R >> >>]",
+                b"",
+                &[appearance, arial.clone()],
+            );
+            assert_eq!(search(pdf, 1 << 20, 1000).0.len(), named, "{bbox}");
+        }
+        let mut found = FontSearch::default();
+        for i in 0..MISSING_FONTS_COUNTED {
+            found.named(format!("Font{i}"));
+        }
+        found.named("Font0".into());
+        assert!(!found.stopped);
+        found.named("Another".into());
+        assert!(found.stopped);
     }
 
     /// A font a graphics state chooses (`/Font [font size]`) is named as one `Tf` chooses; a form
@@ -1270,21 +1392,22 @@ mod tests {
             );
             assert_eq!(names(pdf).len(), usize::from(named), "{state}");
         }
-        // A tiling pattern choosing F1 without resources of its own doesn't find the page's F1.
+        // A tiling pattern choosing F1 without resources of its own doesn't find the page's F1 (Arial):
+        // hayro draws it in Helvetica, as a font not in its resources.
         let tile = |resources: &str| {
             stream(
                 &format!("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 72 36] /XStep 72 /YStep 36 {resources}"),
                 text,
             )
         };
-        for (resources, named) in [("/Resources << /Font << /F1 7 0 R >> >>", true), ("", false)] {
+        for (resources, named) in [("/Resources << /Font << /F1 7 0 R >> >>", "Arial,Bold"), ("", "/F1 (not in its resources)")] {
             let pdf = pdf_of(
                 "0 0 72 36",
                 "/Resources << /Pattern << /P0 5 0 R >> /Font << /F1 7 0 R >> >>",
                 b"/Pattern cs /P0 scn 0 0 72 36 re f",
                 &[tile(resources), stream("", b""), arial.clone()],
             );
-            assert_eq!(names(pdf).len(), usize::from(named), "{resources}");
+            assert_eq!(names(pdf), [named], "{resources}");
         }
     }
 

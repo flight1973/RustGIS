@@ -5142,6 +5142,7 @@ dependencies = [
  "geo",
  "geozero",
  "hayro",
+ "hayro-font",
  "image",
  "laz",
  "lerc-core",

@@ -64,6 +64,8 @@ unicode-segmentation = "1.13"
 tiff = "0.11"
 # Reading PDF pages (GeoPDFs, and plain PDFs as scans) on the desktop (#2336).
 hayro = "0.9"
+# The version hayro reads fonts with: to tell a font program in the file it can't load.
+hayro-font = "0.5"
 # LZW chunks the tiff crate fails on (issue #350), decoded with the version it uses.
 weezl = "0.2"
 # The tests' Zstandard-compressed GeoTIFFs (the version the tiff crate decodes with).
