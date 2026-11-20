@@ -126,9 +126,9 @@ pub fn commands() -> Vec<C> {
         .params(r#"{"report"?, "index": section number}"#),
         // Data.
         C::new("report.field", "Field", "Data › Data Design", |s, p| {
-            let (i, field) = field_of(s, p, "field")?;
-            let r = s.project.reports.get_mut(i).ok_or("no report")?;
             let remove = b(p, "remove").unwrap_or(false);
+            let (i, field) = if remove { stored(s, p)? } else { field_of(s, p, "field")? };
+            let r = s.project.reports.get_mut(i).ok_or("no report")?;
             if !remove && r.fields.len() >= MAX_ITEMS && !r.fields.iter().any(|f| f.eq_ignore_ascii_case(&field)) {
                 return Err(format!("a report lists at most {MAX_ITEMS} fields"));
             }
@@ -139,9 +139,9 @@ pub fn commands() -> Vec<C> {
         .params(r#"{"report"?, "field": name, "remove"?: bool}"#),
         C::new("report.autofill", "Autofill Fields", "Data › Data Design", |s, p| {
             let i = index(s, p)?;
-            let fields = &layer_of(s, i)?.dataset.fields;
-            let all = fields.len();
-            let names = fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect::<Vec<_>>();
+            let ds = &layer_of(s, i)?.dataset;
+            let all = ds.fields.len();
+            let names = filled_in(ds)?;
             let r = s.project.reports.get_mut(i).ok_or("no report")?;
             r.fields = names;
             let (answer, report) = (json!({"fields": r.fields}), r.name.clone());
@@ -156,10 +156,16 @@ pub fn commands() -> Vec<C> {
         C::new("report.statistics", "Statistics", "Data › Data Design", |s, p| {
             let kind = ps(p, "kind").unwrap_or("sum");
             let kind = StatKind::from_code(kind).ok_or_else(|| format!("unknown statistic '{kind}'"))?;
-            let (i, field) = field_of(s, p, "field")?;
+            let remove = b(p, "remove").unwrap_or(false);
+            let (i, field) = if remove { stored(s, p)? } else { field_of(s, p, "field")? };
             let r = s.project.reports.get_mut(i).ok_or("no report")?;
-            let at = r.stats.iter().position(|x| x.field.eq_ignore_ascii_case(&field) && x.kind == kind);
-            match (at, b(p, "remove").unwrap_or(false)) {
+            // The one named exactly so first, as `toggle` finds a field.
+            let at = r
+                .stats
+                .iter()
+                .position(|x| x.kind == kind && x.field == field)
+                .or_else(|| r.stats.iter().position(|x| x.kind == kind && x.field.eq_ignore_ascii_case(&field)));
+            match (at, remove) {
                 (Some(k), true) => {
                     r.stats.remove(k);
                 }
@@ -172,9 +178,9 @@ pub fn commands() -> Vec<C> {
         .when(need_report)
         .params(r#"{"report"?, "field": name, "kind"?: "count"|"sum"|"mean"|"min"|"max", "remove"?: bool}"#),
         C::new("report.group", "Group", "Data › Data Design", |s, p| {
-            let (i, field) = field_of(s, p, "field")?;
-            let r = s.project.reports.get_mut(i).ok_or("no report")?;
             let remove = b(p, "remove").unwrap_or(false);
+            let (i, field) = if remove { stored(s, p)? } else { field_of(s, p, "field")? };
+            let r = s.project.reports.get_mut(i).ok_or("no report")?;
             if !remove && r.groups.len() >= MAX_GROUPS && !r.groups.iter().any(|g| g.eq_ignore_ascii_case(&field)) {
                 return Err(format!("reports group by at most {MAX_GROUPS} fields"));
             }
@@ -290,8 +296,26 @@ fn optional_field(input: &impl super::InputSource, p: &Value) -> Result<(usize, 
     }
 }
 
+/// The first [`MAX_ITEMS`] of a layer's fields, to fill a report with: refused, as report.field
+/// refuses one, when one of them has a case twin (#1955).
+fn filled_in(ds: &rustgis_data::Dataset) -> Result<Vec<String>, String> {
+    let names: Vec<String> = ds.fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect();
+    for n in &names {
+        super::edit::kept_field(ds, n, "a report")?;
+    }
+    Ok(names)
+}
+
+/// The report and the field name given, to remove an entry it stored: matched against what is
+/// stored, not refused for a case twin, so an entry naming one can still be removed (#1955).
+fn stored(input: &impl super::InputSource, p: &Value) -> Result<(usize, String), String> {
+    Ok((index_input(input, p)?, ps(p, "field").ok_or("field is required")?.to_string()))
+}
+
+/// Adds `field` to `list`, or removes it: the entry named exactly so, else the first named so
+/// ignoring case.
 fn toggle(list: &mut Vec<String>, field: String, remove: bool) {
-    let at = list.iter().position(|x| x.eq_ignore_ascii_case(&field));
+    let at = list.iter().position(|x| *x == field).or_else(|| list.iter().position(|x| x.eq_ignore_ascii_case(&field)));
     match (at, remove) {
         (Some(k), true) => {
             list.remove(k);
@@ -465,7 +489,8 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
         let mut out = Vec::new();
         for v in given {
             let n = v.as_str().ok_or_else(|| format!("{key} are field names"))?;
-            let fi = ds.field_index(n).ok_or_else(|| format!("'{}' has no field '{n}'", layer.name))?;
+            // As report.field takes one: a twin's name is refused (#1955).
+            let fi = super::edit::kept_field(ds, n, "a report")?.ok_or_else(|| format!("'{}' has no field '{n}'", layer.name))?;
             out.extend(ds.fields.get(fi).map(|f| f.name.clone()));
         }
         Ok(out)
@@ -475,7 +500,7 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
     let all = ds.fields.len();
     let first_of = r.fields.is_empty() && all > MAX_ITEMS;
     if r.fields.is_empty() {
-        r.fields = ds.fields.iter().take(MAX_ITEMS).map(|f| f.name.clone()).collect();
+        r.fields = filled_in(ds)?;
     }
     r.groups = fields_of("groups", "a report groups by", MAX_GROUPS)?;
     if let Some(w) = ps(p, "where").map(str::trim).filter(|w| !w.is_empty()) {

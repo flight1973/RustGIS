@@ -2197,6 +2197,49 @@ mod tests {
         assert!(error.contains("is ambiguous: case-insensitive collision between 'Val' and 'val'"), "{error}");
     }
 
+    /// A report never takes a case twin's name: report.field, report.new (given or filled in) and
+    /// report.autofill refuse it. One stored already (by an older project) can still be removed,
+    /// matched against what is stored (#1955).
+    #[test]
+    fn a_reports_twin_names_are_refused_but_can_be_removed() {
+        let mut s = Session::new(crate::Project::default());
+        let fields = ["Name", "name", "code"].map(|f| Field::new(f, FieldType::Double)).to_vec();
+        let mut ds = Dataset::new("twins", GeometryType::Point, fields);
+        ds.push(Some(Geometry::Point(rustgis_data::Coord::new(3.0, 4.0))), vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]);
+        s.map_mut().add_dataset(ds);
+        let twin = "ignoring case, and a report reads its field by name ignoring case";
+        for (command, p) in [
+            ("report.new", json!({"layer": "twins", "name": "A", "fields": ["name"]})),
+            ("report.new", json!({"layer": "twins", "name": "B"})),
+        ] {
+            let error = s.run(command, &p).unwrap_err();
+            assert!(error.contains(twin), "{command} {p}: {error}");
+        }
+        assert!(s.project.reports.is_empty());
+        s.run("report.new", &json!({"layer": "twins", "name": "R", "fields": ["code"]})).unwrap();
+        for (command, p) in [("report.field", json!({"report": "R", "field": "name"})), ("report.autofill", json!({"report": "R"}))] {
+            let error = s.run(command, &p).unwrap_err();
+            assert!(error.contains(twin), "{command}: {error}");
+        }
+        assert_eq!(s.project.reports[0].fields, ["code"]);
+        // Entries an older project stored with a twin's name: removed by it.
+        let r = &mut s.project.reports[0];
+        r.fields.push("name".into());
+        r.groups.push("name".into());
+        r.stats.push(rustgis_map::report::Stat { field: "name".into(), kind: rustgis_map::report::StatKind::Sum });
+        s.run("report.field", &json!({"report": "R", "field": "name", "remove": true})).unwrap();
+        s.run("report.group", &json!({"report": "R", "field": "name", "remove": true})).unwrap();
+        s.run("report.statistics", &json!({"report": "R", "field": "name", "kind": "sum", "remove": true})).unwrap();
+        let r = &s.project.reports[0];
+        assert!(r.fields == ["code"] && r.groups.is_empty() && r.stats.is_empty(), "{:?} {:?} {}", r.fields, r.groups, r.stats.len());
+        // Without twins, a report fills itself in as before.
+        let clean = Dataset::new("clean", GeometryType::Point, vec![Field::new("a", FieldType::Double)]);
+        s.map_mut().add_dataset(clean);
+        s.run("report.new", &json!({"layer": "clean", "name": "C"})).unwrap();
+        s.run("report.autofill", &json!({"report": "C"})).unwrap();
+        assert_eq!(s.project.reports[1].fields, ["a"]);
+    }
+
     /// What a layer keeps by a field's name (a diagram, a size, a report) is
     /// refused on a field with a case twin; a text field with subtype defaults or a calculation rule
     /// on it doesn't become dates; deleting a field says what its data design lost; and an
