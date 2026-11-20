@@ -1562,7 +1562,9 @@ fn interpolate(s: &mut Session, p: &Value) -> CmdResult {
 fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let ds = feature_ds(s, p)?;
     let field = ps(p, "field").ok_or("field is required")?;
-    let fi = super::edit::kept_field(ds, field, "the interpolation")?.ok_or_else(|| format!("no field named '{field}'"))?;
+    // Read once, not kept by name: the field named exactly, else the only one so named ignoring
+    // case (an ambiguous name is refused).
+    let fi = super::edit::field_in(&ds.fields, field)?.ok_or_else(|| format!("no field named '{field}'"))?;
     let name = out_name(p, format!("{}_{field}_idw", ds.name))?;
     // Features without a place or a number are left out, and said (by kind, with a count).
     let (mut no_point, mut no_value) = (0usize, 0usize);

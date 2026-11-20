@@ -2167,7 +2167,37 @@ mod tests {
         }
     }
 
-    /// What a layer keeps by a field's name (a diagram, a size, a report, an interpolation) is
+    /// Interpolation reads its field once and keeps no name, so it takes the field named exactly,
+    /// else the only one so named ignoring case; a name matching twins but neither exactly is
+    /// refused (#1955).
+    #[test]
+    fn interpolation_takes_the_exact_field() {
+        let mut s = Session::new(crate::Project::default());
+        let fields = ["Val", "val", "Other"].map(|f| Field::new(f, FieldType::Double)).to_vec();
+        let mut ds = Dataset::new("twins", GeometryType::Point, fields);
+        for at in [(1.0, 1.0), (2.0, 3.0), (4.0, 2.0)] {
+            ds.push(
+                Some(Geometry::Point(rustgis_data::Coord::new(at.0, at.1))),
+                vec![Value::Float(1.0), Value::Float(7.0), Value::Float(4.0)],
+            );
+        }
+        let id = s.map_mut().add_dataset(ds);
+        let surface = |s: &mut Session, field: &str| -> Result<(f32, f32), String> {
+            let r = s.run("analysis.interpolate", &json!({"layer": id, "field": field, "cellSize": 0.5}))?;
+            let layer = r["layer"].as_u64().and_then(|l| u32::try_from(l).ok()).ok_or("no layer")?;
+            let raster = s.map().layer(layer).and_then(|l| l.raster.as_ref()).and_then(|r| r.data.clone()).ok_or("no raster")?;
+            let band = raster.bands.first().ok_or("no band")?;
+            let finite = || band.data.iter().copied().filter(|v| v.is_finite());
+            Ok((finite().fold(f32::INFINITY, f32::min), finite().fold(f32::NEG_INFINITY, f32::max)))
+        };
+        assert_eq!(surface(&mut s, "val"), Ok((7.0, 7.0)));
+        assert_eq!(surface(&mut s, "Val"), Ok((1.0, 1.0)));
+        assert_eq!(surface(&mut s, "OTHER"), Ok((4.0, 4.0)));
+        let error = surface(&mut s, "VAL").unwrap_err();
+        assert!(error.contains("is ambiguous: case-insensitive collision between 'Val' and 'val'"), "{error}");
+    }
+
+    /// What a layer keeps by a field's name (a diagram, a size, a report) is
     /// refused on a field with a case twin; a text field with subtype defaults or a calculation rule
     /// on it doesn't become dates; deleting a field says what its data design lost; and an
     /// ambiguous attribute names the fields and asks for the exact one (#1955).
@@ -2191,7 +2221,6 @@ mod tests {
         for (command, p) in [
             ("layer.diagram", json!({"layer": id, "kind": "pie", "fields": ["x", "n"]})),
             ("layer.sizeBy", json!({"layer": id, "field": "X"})),
-            ("analysis.interpolate", json!({"layer": id, "field": "x"})),
             ("report.field", json!({"field": "x"})),
         ] {
             let error = s.run(command, &p).unwrap_err();
