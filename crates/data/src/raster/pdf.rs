@@ -66,8 +66,7 @@ pub fn read_file(path: &Path, page: Option<&str>, place: bool) -> Result<Raster>
 /// The memory and time drawing takes aren't bounded by the file's size, and can't be stopped: a
 /// compressed stream can inflate to many times its size, an image can say it is far larger than
 /// its data, and forms drawn within forms multiply the work. `hayro` gives no way to bound or stop
-/// any of them; this is tracked in an issue to be filed: decoded-size and work limits need hayro
-/// support.
+/// any of them (#2482: decoded-size and work limits need hayro support).
 pub fn read_bytes(name: &str, bytes: Vec<u8>, page: Option<&str>, place: bool) -> Result<Raster> {
     read_limited(name, bytes, page, place, max_samples())
 }
@@ -139,7 +138,8 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
     }
     let settings = PixmapSettings { x_scale: scale as f32, y_scale: scale as f32, bg_color: WHITE };
     // What couldn't be drawn, counted by kind: images, fonts, annotations, and anything else; and
-    // whether `hayro` asked for a font not in the file, which it then draws in a stand-in it carries.
+    // whether `hayro` asked for a font program it carries: a standard font not in the file, or a
+    // stand-in for another font not in the file.
     let warned: Arc<[AtomicUsize; 4]> = Arc::new(Default::default());
     let asked = Arc::new(AtomicBool::new(false));
     let defaults = InterpreterSettings::default();
@@ -158,6 +158,9 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
             }
         }),
         font_resolver: Arc::new(move |query: &FontQuery| {
+            // Every query, a standard one too: `hayro` asks for a simple font not in the file (an
+            // Arial) as the standard font it picks for it, so the query alone can't tell a
+            // stand-in from one of the standard 14 drawn in its own.
             asked_by.store(true, Ordering::Relaxed);
             resolve(query)
         }),
@@ -198,21 +201,24 @@ fn draw(page: &Page<'_>, name: &str, max: usize) -> Result<(Raster, f64)> {
             n => r.lost.push(format!("{what} ({n} times)")),
         }
     }
-    // Only when `hayro` asked for a font not in the file is the page looked through for which.
+    // Only when `hayro` asked for a font it carries is the page looked through for which fonts are
+    // stand-ins. A search that stopped before naming one says one may be; one that looked at
+    // everything and named none found only standard fonts (or, unsaid, a font chosen inside a Type
+    // 3 font's glyphs, where it doesn't look).
     if asked.load(Ordering::Relaxed) {
-        let found = substituted_fonts(page, FONT_SEARCH_BYTES, FONT_SEARCH_WORK);
-        if !found.names.is_empty() || found.stopped {
-            let shown: Vec<&str> = found.names.iter().take(MISSING_FONTS_NAMED).map(String::as_str).collect();
-            let left = found.keys.len().saturating_sub(shown.len());
-            let tail = match (found.stopped, left) {
-                (false, 0) => String::new(),
-                (false, n) => format!(", and {n} more"),
-                (true, 0) => ", and perhaps others".to_string(),
-                (true, n) => format!(", and {n} more (perhaps others)"),
-            };
-            if !shown.is_empty() {
-                r.lost.push(format!("fonts not in the file are drawn in a stand-in font: {}{tail}", shown.join(", ")));
-            }
+        let found = substituted_fonts(page, FONT_SEARCH_BYTES, FONT_SEARCH_WORK)?;
+        let shown: Vec<&str> = found.names.iter().take(MISSING_FONTS_NAMED).map(String::as_str).collect();
+        let left = found.keys.len().saturating_sub(shown.len());
+        let tail = match (found.stopped, left) {
+            (false, 0) => String::new(),
+            (false, n) => format!(", and {n} more"),
+            (true, 0) => ", and perhaps others".to_string(),
+            (true, n) => format!(", and {n} more (perhaps others)"),
+        };
+        if !shown.is_empty() {
+            r.lost.push(format!("fonts not in the file are drawn in a stand-in font: {}{tail}", shown.join(", ")));
+        } else if found.stopped {
+            r.lost.push("fonts not in the file may be drawn in a stand-in font (the search for them stopped early)".into());
         }
     }
     Ok((r, scale))
@@ -268,6 +274,12 @@ impl<'a> Res<'a> {
     fn within(&self, s: &Stream<'a>) -> Self {
         s.dict().get::<Dict<'a>>(b"Resources".as_slice()).map_or_else(|| self.clone(), |d| Res::of(&d))
     }
+
+    /// Stream `s`'s own resources, else none: a tiling pattern is drawn with its own only, as
+    /// `hayro` draws it.
+    fn own(s: &Stream<'a>) -> Self {
+        s.dict().get::<Dict<'a>>(b"Resources".as_slice()).map(|d| Res::of(&d)).unwrap_or_default()
+    }
 }
 
 /// Where an object's dictionary lies in the bytes it was read from: one key for an object
@@ -302,12 +314,17 @@ struct FontSearch<'a> {
 /// [`STANDARD_FONTS`] ([`missing_font`]): `hayro` draws their text in a stand-in. The page's
 /// content is followed as `hayro` draws it, into the forms it draws, soft-mask groups, tiling
 /// patterns and its annotations' appearances, to [`FONT_SEARCH_DEPTH`] deep and
-/// [`FONT_SEARCH_STREAMS`] streams. Forms' content is decoded again for it (`hayro` doesn't keep
-/// it), at most `bytes` in all: a stream whose stored length, or what it decodes to, is more than
-/// is left stops the search. It looks at most `work` chosen fonts and annotations. A Type 3 font's
-/// glyphs aren't decoded: a font chosen inside one isn't named. Done only once `hayro` has asked
-/// for a font not in the file.
-fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> FontSearch<'a> {
+/// [`FONT_SEARCH_STREAMS`] streams. Annotations are passed over as `hayro` passes them over (hidden,
+/// or not for the screen), and of an appearance with states only the one `/AS` names (else `Off`)
+/// is followed. Forms' content is decoded again for it (`hayro` doesn't keep it), at most `bytes`
+/// in all: a stream whose stored length is more than is left isn't decoded, and one that decodes
+/// to more stops the search once it is decoded (`hayro` can't decode to a limit, so one decode
+/// isn't bounded by `bytes`). It looks at most `work` chosen fonts and annotations, and Cancel
+/// between streams ([`crate::progress::check`]). A Type 3 font's glyphs aren't decoded: a font
+/// chosen inside one isn't named. Optional content isn't looked at: a font chosen only in content
+/// turned off is named, though `hayro` (which asks for its stand-in all the same) draws none of its
+/// text. Done only once `hayro` has asked for a font it carries.
+fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> Result<FontSearch<'a>> {
     let mut search = FontSearch { bytes_left: bytes, work_left: work, ..FontSearch::default() };
     let res = page.resources();
     let page_res =
@@ -318,20 +335,31 @@ fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> FontSear
             if !search.spend() {
                 break;
             }
-            // The normal appearance is the one drawn.
+            // Hidden (bit 2) or not for the screen (NoView, bit 6): not drawn (ISO 32000-2 § 12.5.3).
+            if annot.get::<u32>(b"F".as_slice()).unwrap_or(0) & (1 << 1 | 1 << 5) != 0 {
+                continue;
+            }
+            // The normal appearance is the one drawn; with states, the one `/AS` names, else `Off`.
             let Some(ap) = annot.get::<Dict<'a>>(b"AP".as_slice()) else { continue };
-            if let Some(s) = ap.get::<Stream<'a>>(b"N".as_slice()) {
+            let drawn = ap.get::<Stream<'a>>(b"N".as_slice()).or_else(|| {
+                let states = ap.get::<Dict<'a>>(b"N".as_slice())?;
+                annot
+                    .get::<Name<'_>>(b"AS".as_slice())
+                    .and_then(|s| states.get::<Stream<'a>>(s))
+                    .or_else(|| states.get::<Stream<'a>>(b"Off".as_slice()))
+            });
+            if let Some(s) = drawn {
                 search.queue(page_res.within(&s), s, 1);
-            } else if let Some(states) = ap.get::<Dict<'a>>(b"N".as_slice()) {
-                for state in states.keys() {
-                    if let Some(s) = states.get::<Stream<'a>>(&state) {
-                        search.queue(page_res.within(&s), s, 1);
-                    }
-                }
             }
         }
     }
     while let Some((stream, res, depth)) = search.todo.pop() {
+        crate::progress::check()?;
+        // No fonts left to look at: what is left can't name one.
+        if search.work_left == 0 {
+            search.stopped = true;
+            break;
+        }
         // Its stored length first, as it decodes to at least about that (an unknown one, as much
         // as it holds).
         let stored = stream.dict().get::<usize>(b"Length".as_slice()).unwrap_or_else(|| stream.raw_data().len());
@@ -349,7 +377,7 @@ fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> FontSear
         search.decoded += data.len();
         search.ops(TypedIter::new(&data), &res, depth);
     }
-    search
+    Ok(search)
 }
 
 impl<'a> FontSearch<'a> {
@@ -378,6 +406,10 @@ impl<'a> FontSearch<'a> {
     /// groups and tiling patterns it draws.
     fn ops(&mut self, mut ops: TypedIter<'_>, res: &Res<'a>, depth: usize) {
         while let Some(op) = ops.next() {
+            // A form or soft-mask group is drawn with its own resources, else these; a pattern
+            // with its own only.
+            let inherits = |s: Stream<'a>| (res.within(&s), s);
+            let pattern = |s: Stream<'a>| (Res::own(&s), s);
             let drawn = match op {
                 TypedInstruction::TextFont(t) => {
                     if !self.spend() {
@@ -389,18 +421,20 @@ impl<'a> FontSearch<'a> {
                 TypedInstruction::XObject(x) => res
                     .xobjects
                     .get::<Stream<'a>>(x.0)
-                    .filter(|s| s.dict().get::<Name<'_>>(b"Subtype".as_slice()).is_some_and(|n| n.as_str() == "Form")),
+                    .filter(|s| s.dict().get::<Name<'_>>(b"Subtype".as_slice()).is_some_and(|n| n.as_str() == "Form"))
+                    .map(inherits),
                 TypedInstruction::SetGraphicsState(g) => res
                     .states
                     .get::<Dict<'a>>(g.0)
                     .and_then(|s| s.get::<Dict<'a>>(b"SMask".as_slice()))
-                    .and_then(|m| m.get::<Stream<'a>>(b"G".as_slice())),
-                TypedInstruction::NonStrokeColorNamed(c) => c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)),
-                TypedInstruction::StrokeColorNamed(c) => c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)),
+                    .and_then(|m| m.get::<Stream<'a>>(b"G".as_slice()))
+                    .map(inherits),
+                TypedInstruction::NonStrokeColorNamed(c) => c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)).map(pattern),
+                TypedInstruction::StrokeColorNamed(c) => c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)).map(pattern),
                 _ => None,
             };
-            if let Some(s) = drawn {
-                self.queue(res.within(&s), s, depth + 1);
+            if let Some((r, s)) = drawn {
+                self.queue(r, s, depth + 1);
             }
         }
     }
@@ -1124,12 +1158,86 @@ mod tests {
         assert_eq!(font_key("Arial,Bold"), font_key("Arial-BoldMT"));
     }
 
+    /// The font search follows what `hayro` draws: not a hidden annotation or one not for the
+    /// screen, of an appearance with states only the one `/AS` names (else `Off`), and a tiling
+    /// pattern without resources of its own with none (#2352).
+    #[test]
+    fn the_font_search_looks_only_at_what_is_drawn() {
+        let arial = b"<< /Type /Font /Subtype /TrueType /BaseFont /Arial,Bold /Encoding /WinAnsiEncoding >>".to_vec();
+        let text = b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET";
+        let form = |resources: &str| format!("/Type /XObject /Subtype /Form /BBox [0 0 72 36] {resources}");
+        let with_font = form("/Resources << /Font << /F1 7 0 R >> >>");
+        let names = |pdf: Vec<u8>| search(pdf, 1 << 20, 1000).0;
+        // Annotations: shown, hidden (F 2), not for the screen (F 32).
+        for (flags, named) in [(0, true), (2, false), (32, false)] {
+            let pdf = pdf_of(
+                "0 0 72 36",
+                &format!("/Annots [<< /Type /Annot /Subtype /Square /F {flags} /Rect [0 0 72 36] /AP << /N 5 0 R >> >>]"),
+                b"",
+                &[stream(&with_font, text), stream(&with_font, b""), arial.clone()],
+            );
+            assert_eq!(names(pdf).len(), usize::from(named), "flags {flags}");
+        }
+        // Appearance states: /On chooses Arial, /Off nothing; the one /AS names is looked at, else Off.
+        for (state, named) in [("/AS /On", true), ("/AS /Off", false), ("", false)] {
+            let pdf = pdf_of(
+                "0 0 72 36",
+                &format!("/Annots [<< /Type /Annot /Subtype /Widget /Rect [0 0 72 36] {state} /AP << /N << /On 5 0 R /Off 6 0 R >> >> >>]"),
+                b"",
+                &[stream(&with_font, text), stream(&with_font, b""), arial.clone()],
+            );
+            assert_eq!(names(pdf).len(), usize::from(named), "{state}");
+        }
+        // A tiling pattern choosing F1 without resources of its own doesn't find the page's F1.
+        let tile = |resources: &str| {
+            stream(
+                &format!("/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 72 36] /XStep 72 /YStep 36 {resources}"),
+                text,
+            )
+        };
+        for (resources, named) in [("/Resources << /Font << /F1 7 0 R >> >>", true), ("", false)] {
+            let pdf = pdf_of(
+                "0 0 72 36",
+                "/Resources << /Pattern << /P0 5 0 R >> /Font << /F1 7 0 R >> >>",
+                b"/Pattern cs /P0 scn 0 0 72 36 re f",
+                &[tile(resources), stream("", b""), arial.clone()],
+            );
+            assert_eq!(names(pdf).len(), usize::from(named), "{resources}");
+        }
+    }
+
+    /// A stand-in asked for where the search stops before naming it (a font chosen deeper in forms
+    /// than it looks) is still said (#2352).
+    #[test]
+    fn a_stand_in_is_said_when_the_search_stops_before_naming_it() {
+        let deep = FONT_SEARCH_DEPTH + 2;
+        let font = 5 + deep;
+        // Forms 5, 6, … each drawing the next; the last chooses Arial.
+        let mut objects: Vec<Vec<u8>> = (0..deep)
+            .map(|i| {
+                let obj = 5 + i;
+                let (resources, content) = if i + 1 == deep {
+                    (format!("/Font << /F1 {font} 0 R >>"), b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET".to_vec())
+                } else {
+                    (format!("/XObject << /X {} 0 R >>", obj + 1), b"/X Do".to_vec())
+                };
+                stream(&format!("/Type /XObject /Subtype /Form /BBox [0 0 72 36] /Resources << {resources} >>"), &content)
+            })
+            .collect();
+        objects.push(b"<< /Type /Font /Subtype /TrueType /BaseFont /Arial,Bold /Encoding /WinAnsiEncoding >>".to_vec());
+        let pdf = pdf_of("0 0 72 36", "/Resources << /XObject << /X 5 0 R >> >>", b"/X Do", &objects);
+        let (names, stopped, ..) = search(pdf.clone(), 1 << 20, 1000);
+        assert!(names.is_empty() && stopped, "{names:?} {stopped}");
+        let lost = read_bytes("x", pdf, None, true).unwrap().lost;
+        assert_eq!(lost, ["fonts not in the file may be drawn in a stand-in font (the search for them stopped early)"]);
+    }
+
     /// The first page of `pdf`, searched for the fonts not in the file it chooses with `bytes` to
     /// decode and `work` to spend.
     fn search(pdf: Vec<u8>, bytes: usize, work: usize) -> (Vec<String>, bool, usize, usize) {
         let pdf = Pdf::new(pdf).unwrap();
         let pages = pdf.pages();
-        let found = substituted_fonts(pages.first().unwrap(), bytes, work);
+        let found = substituted_fonts(pages.first().unwrap(), bytes, work).unwrap();
         (found.names, found.stopped, found.decoded, found.streams)
     }
 
@@ -1152,7 +1260,10 @@ mod tests {
         let (names, stopped, decoded, _) = search(pdf.clone(), 10_000, 1000);
         assert!(names.len() == 2 && !stopped && decoded == 2000, "{names:?} {stopped} {decoded}");
         // Room for one: one named, the search stopped, and nothing past the bytes decoded.
-        let (names, stopped, decoded, _) = search(pdf, 1500, 1000);
+        let (names, stopped, decoded, _) = search(pdf.clone(), 1500, 1000);
+        assert!(names.len() == 1 && stopped && decoded == 1000, "{names:?} {stopped} {decoded}");
+        // Work for one font: once it is spent, the other form isn't decoded.
+        let (names, stopped, decoded, _) = search(pdf, 10_000, 1);
         assert!(names.len() == 1 && stopped && decoded == 1000, "{names:?} {stopped} {decoded}");
         // A Type 3 font written in place (no object number) chosen 1,000 times: looked at once,
         // its glyphs not decoded; each choice spends from the work.
