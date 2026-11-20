@@ -98,8 +98,10 @@ that it cannot keep.
 Text that doesn't match becomes empty, and a notice counts those rows and shows the first
 few; undo brings the text back. Digits past the microsecond are rounded to it, and a notice
 counts those. A field with text and none of it a date is refused and stays text. A field with
-a domain, subtypes or contingent values, or one a definition query or display filter would no
-longer read as dates (comparing it with a number), is refused.
+a domain, subtypes, a subtype default, contingent values or a calculation rule, or one a
+definition query or display filter would no longer read as dates (comparing it with a number),
+is refused. Design names its field ignoring case, so with two fields named the same but for case
+it belongs to the first of them.
 
 #### Editing a standalone table
 
