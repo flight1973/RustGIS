@@ -14072,7 +14072,7 @@ fn saved_graticule_settings_are_required_by_name() {
     };
     assert_eq!(with_task(json!({"onTop": true})), Some(json!(["graticule-on-top"])));
     assert_eq!(with_task(json!({"color": "#ff000080"})), Some(json!(["graticule-color"])));
-    assert_eq!(with_task(json!({"onTop": true, "color": "#000"})), Some(json!(["graticule-on-top", "graticule-color"])));
+    assert_eq!(with_task(json!({"onTop": true, "color": "#000000"})), Some(json!(["graticule-on-top", "graticule-color"])));
     // Any value, null included: an older reader would toggle the grid where this one keeps it, even
     // for the defaults, and `onTop` reads "true" and 1 as true.
     for on_top in [json!(null), json!(false), json!("true"), json!(1)] {
