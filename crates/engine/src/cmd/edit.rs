@@ -2297,6 +2297,9 @@ mod tests {
         if let Some(d) = &mut l.diagram {
             d.categories.iter_mut().for_each(|c| c.field = "x".into());
         }
+        // The Symbology pane sends the mapping's own field back with it (which is then stored as
+        // the field it reads is named), and a change of range alone sends none.
+        s.run("layer.sizeBy", &json!({"layer": id, "field": "x", "min": 3, "max": 8})).unwrap();
         s.run("layer.sizeBy", &json!({"layer": id, "min": 2, "max": 9})).unwrap();
         s.run("layer.diagram", &json!({"layer": id, "kind": "bar", "fields": ["x"]})).unwrap();
         let l = s.map().layer(id).unwrap();
@@ -2304,13 +2307,15 @@ mod tests {
         assert_eq!(l.diagram.as_ref().map(|d| d.categories.len()), Some(1));
         // A twin's name newly given: refused.
         for (command, p) in [
-            ("layer.sizeBy", json!({"layer": id, "field": "X"})),
+            // (The mapping now stores `X`, the name of the field it reads.)
+            ("layer.sizeBy", json!({"layer": id, "field": "x"})),
             ("layer.diagram", json!({"layer": id, "kind": "pie", "fields": ["n", "X"]})),
         ] {
             let error = s.run(command, &p).unwrap_err();
             assert!(error.contains("names 'X' and 'x' ignoring case"), "{command}: {error}");
         }
-        // Read ahead: not for a twin's name.
+        // Read ahead: not for a twin's name newly given (nor the mapping's own, whose range it has).
+        assert!(crate::cmd::layer::size_by_ahead(&s, &json!({"layer": id, "field": "x"})).is_none());
         assert!(crate::cmd::layer::size_by_ahead(&s, &json!({"layer": id, "field": "X"})).is_none());
     }
 
