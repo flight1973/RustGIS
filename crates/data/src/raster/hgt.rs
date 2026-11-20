@@ -162,6 +162,7 @@ fn read_checked_limited(file_name: &str, (lat, lon, side): (i32, i32, usize), by
         // The file's own size; each cell read stands for exactly `step` samples (see `dted::read`).
         r.overview = Some((side as u32, side as u32));
         r.step = step as u32;
+        r.posts = true;
     }
     r.lost.push(vertical_note("the EGM96 geoid (mean sea level)"));
     r.lost.extend(void_note(voids, (side * side) as u64, VOID));
@@ -322,6 +323,9 @@ mod tests {
         put(7200, 7200, -4);
         let r = read_limited("N45E006.hgt", &bytes, 1_000_000).unwrap();
         assert_eq!((r.width, r.height, r.overview, r.step), (901, 901, Some((7201, 7201)), 8));
+        // Each cell is centered on its post, so the warp's file pixels start 3.5 before the
+        // first post's: cell k's center, k + 0.5, is file position 8k + 0.5, the post read.
+        assert_eq!((r.file_pixels(), r.file_origin()), ((8.0, 8.0), (-3.5, -3.5)));
         assert_eq!(r.value(0, 0, 0), Some(11.0));
         assert_eq!(r.value(0, 5, 3), Some(853.0));
         assert_eq!(r.value(0, 900, 900), Some(-4.0), "the south-east sample is kept");

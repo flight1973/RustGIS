@@ -712,6 +712,10 @@ pub struct Raster {
     /// corner (a picture too large to read whole): each then spans exactly `step` of its pixels,
     /// where an overview's span its size over the file's. 1 otherwise.
     pub(crate) step: u32,
+    /// With `step`, whether each pixel read is centered on the file pixel it was read from (a
+    /// grid of posts, SRTM and DTED: [`post_transform`]) rather than starting at it, as a
+    /// picture's does.
+    pub(crate) posts: bool,
     /// `false` for a scan (a TIFF with no GeoTIFF tags, a PNG, a JPEG): `transform` is then only
     /// a stand-in until the picture is placed or georeferenced, and says nothing about the ground.
     pub georeferenced: bool,
@@ -907,6 +911,7 @@ impl Raster {
             source: None,
             overview: None,
             step: 1,
+            posts: false,
             georeferenced: true,
             lost: Vec::new(),
             rounded: Vec::new(),
@@ -1089,6 +1094,26 @@ impl Raster {
         }
         let (full_w, full_h) = self.overview.unwrap_or((self.width, self.height));
         (f64::from(full_w) / f64::from(self.width.max(1)), f64::from(full_h) / f64::from(self.height.max(1)))
+    }
+
+    /// Where this raster's top-left corner lies in the file's pixels: the origin of
+    /// [`Raster::file_pixels`]. A grid of posts read at a step centers each cell on its post, so
+    /// the corner is `(step - 1) / 2` file pixels before the first post's own; otherwise 0.
+    pub fn file_origin(&self) -> (f64, f64) {
+        if self.posts && self.step > 1 {
+            let o = -(f64::from(self.step) - 1.0) / 2.0;
+            return (o, o);
+        }
+        (0.0, 0.0)
+    }
+
+    /// For other crates' tests: [`Raster::read_at_step`] of a grid of posts, as the SRTM and
+    /// DTED readers mark one.
+    #[doc(hidden)]
+    pub fn posts_read_at_step(self, step: u32, full: (u32, u32)) -> Raster {
+        let mut r = self.read_at_step(step, full);
+        r.posts = true;
+        r
     }
 
     /// For other crates' tests: this raster as if read at every `step`-th pixel of a file of
