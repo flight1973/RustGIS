@@ -789,6 +789,8 @@ fn size_by(s: &mut Session, p: &Value) -> CmdResult {
     if l.geometry_type() != GeometryType::Point || l.graphics {
         return Err("this works on point layers".into());
     }
+    // A field given; else the mapping's own, which keeps the field it reads.
+    let given = field.is_some();
     let field = match field {
         Some(field) => field,
         None => Some(l.size_by.as_ref().map(|b| b.field.clone()).ok_or("give a field: the layer has no size mapping to change")?),
@@ -802,7 +804,10 @@ fn size_by(s: &mut Session, p: &Value) -> CmdResult {
             "size by field goes with Unique Values or Graduated Colors; a single symbol sized by a field is Proportional Symbols".into()
         );
     }
-    let fi = super::edit::kept_field(&l.dataset, &field, "a size by field")?.ok_or_else(|| format!("no field named '{field}'"))?;
+    // A name given with a case twin is refused; the mapping's own, already there, goes on reading
+    // the field it reads (#1955).
+    let fi = if given { super::edit::kept_field(&l.dataset, &field, "a size by field")? } else { l.dataset.field_index(&field) }
+        .ok_or_else(|| format!("no field named '{field}'"))?;
     if !l.dataset.fields.get(fi).is_some_and(|fd| fd.ty.is_numeric()) {
         return Err(format!("'{field}' is not a numeric field"));
     }
@@ -901,7 +906,12 @@ fn size_range(dataset: &Dataset, field: usize) -> Result<Option<(f64, f64)>, Str
 pub(crate) fn size_by_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadWork> {
     let id = s.layer_id(p).ok()?;
     let layer = s.map().layer(id)?;
-    let field = layer.dataset.field_index(ps(p, "field")?)?;
+    let name = ps(p, "field")?;
+    // A name with a case twin, which layer.sizeBy refuses, isn't read ahead.
+    if layer.dataset.has_case_twin(name) {
+        return None;
+    }
+    let field = layer.dataset.field_index(name)?;
     if !rustgis_map::symbol_by::SizeBy::applies_to(layer) || layer.is_streamed() || !layer.dataset.fields.get(field)?.ty.is_numeric() {
         return None;
     }

@@ -2240,6 +2240,46 @@ mod tests {
         assert_eq!(s.project.reports[1].fields, ["a"]);
     }
 
+    /// A size by field or diagram set again over the field it already reads keeps reading it, twin
+    /// or not; a twin's name newly given is refused (#1955).
+    #[test]
+    fn a_mapping_set_again_keeps_its_twin_field() {
+        let mut s = Session::new(crate::Project::default());
+        let fields = ["X", "x", "n", "code"].map(|f| Field::new(f, FieldType::Double)).to_vec();
+        let mut ds = Dataset::new("twins", GeometryType::Point, fields);
+        for (i, at) in [(1.0, 1.0), (2.0, 3.0), (4.0, 2.0)].into_iter().enumerate() {
+            let v = Value::Float(i as f64 + 1.0);
+            ds.push(Some(Geometry::Point(rustgis_data::Coord::new(at.0, at.1))), vec![v.clone(), v.clone(), v.clone(), Value::Float(1.0)]);
+        }
+        let id = s.map_mut().add_dataset(ds);
+        s.run("layer.symbology", &json!({"layer": id, "type": "unique", "field": "code"})).unwrap();
+        s.run("layer.sizeBy", &json!({"layer": id, "field": "n"})).unwrap();
+        s.run("layer.diagram", &json!({"layer": id, "kind": "pie", "fields": ["n"]})).unwrap();
+        // As an older project stored them: on the twin name `x`.
+        let l = s.map_mut().layer_mut(id).unwrap();
+        if let Some(b) = &mut l.size_by {
+            b.field = "x".into();
+        }
+        if let Some(d) = &mut l.diagram {
+            d.categories.iter_mut().for_each(|c| c.field = "x".into());
+        }
+        s.run("layer.sizeBy", &json!({"layer": id, "min": 2, "max": 9})).unwrap();
+        s.run("layer.diagram", &json!({"layer": id, "kind": "bar", "fields": ["x"]})).unwrap();
+        let l = s.map().layer(id).unwrap();
+        assert_eq!(l.size_by.as_ref().map(|b| (b.min, b.max)), Some((2.0, 9.0)));
+        assert_eq!(l.diagram.as_ref().map(|d| d.categories.len()), Some(1));
+        // A twin's name newly given: refused.
+        for (command, p) in [
+            ("layer.sizeBy", json!({"layer": id, "field": "X"})),
+            ("layer.diagram", json!({"layer": id, "kind": "pie", "fields": ["n", "X"]})),
+        ] {
+            let error = s.run(command, &p).unwrap_err();
+            assert!(error.contains("names 'X' and 'x' ignoring case"), "{command}: {error}");
+        }
+        // Read ahead: not for a twin's name.
+        assert!(crate::cmd::layer::size_by_ahead(&s, &json!({"layer": id, "field": "X"})).is_none());
+    }
+
     /// What a layer keeps by a field's name (a diagram, a size, a report) is
     /// refused on a field with a case twin; a text field with subtype defaults or a calculation rule
     /// on it doesn't become dates; deleting a field says what its data design lost; and an

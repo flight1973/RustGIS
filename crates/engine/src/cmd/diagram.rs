@@ -151,9 +151,13 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
     if l.is_streamed() && matches!(size, Asked::Scaled(..)) {
         return Err("a size scaled by the sum needs all of a streamed layer: layer.loadAll first, or a fixed size".into());
     }
-    // Every field must be there, and hold numbers.
+    // Every field must be there, and hold numbers. A name with a case twin is refused unless the
+    // diagram already draws it, as set again over its own fields (#1955).
+    let current: Vec<String> = l.diagram.as_ref().map(|d| d.categories.iter().map(|c| c.field.clone()).collect()).unwrap_or_default();
     for (field, _) in &asked {
-        let fi = super::edit::kept_field(&l.dataset, field, "a diagram")?.ok_or_else(|| format!("no field named '{field}'"))?;
+        let fi =
+            if current.contains(field) { l.dataset.field_index(field) } else { super::edit::kept_field(&l.dataset, field, "a diagram")? }
+                .ok_or_else(|| format!("no field named '{field}'"))?;
         if !l.dataset.fields.get(fi).is_some_and(|fd| fd.ty.is_numeric()) {
             return Err(format!("'{field}' is not a numeric field"));
         }
