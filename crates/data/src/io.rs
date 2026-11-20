@@ -7,8 +7,128 @@ use serde_json::{Map, Value as Json, json};
 use crate::raster::{Crs, planetary};
 use crate::{Coord, DataError, Dataset, Field, FieldType, Geometry, GeometryType, ReadReport, Result, Value};
 
-/// Largest file read into memory (256 MiB). Parsing JSON can take several times the file size.
-pub const MAX_BYTES: u64 = 256 << 20;
+/// Largest file read into memory in the browser, on a 32-bit build, or on a computer whose memory
+/// isn't known (256 MiB): the floor of [`max_bytes`]. Also where a file stops being read whole and
+/// is read in place instead (a GeoJSON file, a Shapefile), or handed to GDAL (an OpenStreetMap
+/// extract), whatever the memory: those readers don't need it in memory.
+pub const BYTES_FLOOR: u64 = 256 << 20;
+
+/// The most [`max_bytes`] grows to, however much memory the computer has (4 GiB).
+pub const BYTES_CEILING: u64 = 4 << 30;
+
+/// The memory a file read whole takes for each byte of it, at its peak, as measured adding files
+/// of about 200 MiB from the command line (#2408):
+/// - CityGML, LoD 2 buildings of seven surfaces: about 1.7;
+/// - GeoJSON polygons of 40 vertices and 8 attributes, read whole: about 2.8;
+/// - KML polygons of 40 vertices and 2 attributes: about 5.7;
+/// - GeoJSON points with 30 one-letter attributes, read whole, about the most a byte costs: about
+///   7.75.
+///
+/// Planned at 8: at the limit, even the costliest measured takes about a quarter of the memory.
+const MEMORY_PER_BYTE: u64 = 8;
+
+/// Largest file read into memory on this computer (#2408): on the desktop as much as a quarter of
+/// its memory holds at [`MEMORY_PER_BYTE`] a byte, from [`BYTES_FLOOR`] up to [`BYTES_CEILING`],
+/// as the other memory limits follow it (#1291 step 2); [`BYTES_FLOOR`] in the browser. Less once
+/// RustGIS holds more than half the memory, or the computer has less free ([`crate::memory::share`],
+/// #2431), never below the floor.
+pub fn max_bytes() -> u64 {
+    if let Some(max) = TEST_MAX.with(std::cell::Cell::get) {
+        return max;
+    }
+    max_bytes_within(crate::memory::share(crate::memory::physical(), crate::memory::held(), crate::memory::available()))
+}
+
+/// [`max_bytes`] on a computer with `memory` bytes (`None`: not known) with nothing held. The
+/// formula is [`crate::memory::scaled`]'s, worked out here in `u64`, as that one counts in `usize`,
+/// which doesn't hold 4 GiB on a 32-bit build.
+fn max_bytes_for(memory: Option<u64>) -> u64 {
+    max_bytes_within(memory.map(|m| m / crate::memory::SHARE))
+}
+
+/// [`max_bytes`] when a job plans for `share` bytes ([`crate::memory::share`]; `None`: not known):
+/// less once RustGIS holds more than half the memory (#2431), never below [`BYTES_FLOOR`].
+fn max_bytes_within(share: Option<u64>) -> u64 {
+    share.map_or(BYTES_FLOOR, |share| (share / MEMORY_PER_BYTE).clamp(BYTES_FLOOR, bytes_ceiling()))
+}
+
+/// The most [`max_bytes`] grows to in this build: [`BYTES_CEILING`] on a 64-bit desktop build. A
+/// 32-bit build stays at [`BYTES_FLOOR`] whatever the memory: a file read whole takes several
+/// times its size in address space, which 4 GiB doesn't hold for a larger one. So does a phone:
+/// it reports all its memory, but an app may use much less of it before the system stops it.
+fn bytes_ceiling() -> u64 {
+    if usize::BITS >= 64 && !cfg!(any(target_os = "android", target_os = "ios")) { BYTES_CEILING } else { BYTES_FLOOR }
+}
+
+/// The refusal of a file of `len` bytes, past [`max_bytes`]: its size, and the limit, saying
+/// where it follows the computer's memory, so a file refused here and opened elsewhere is
+/// understood.
+pub fn too_large(len: u64) -> String {
+    too_large_said(len, max_bytes())
+}
+
+/// [`too_large`] against the limit `max` taken when the read started. What is held and free is
+/// read again here: it may have moved since `max` was taken, so the figures said are the ones now,
+/// beside the limit the read was held to.
+fn too_large_said(len: u64, max: u64) -> String {
+    let memory = crate::memory::physical().filter(|_| bytes_ceiling() > BYTES_FLOOR);
+    // A test's own limit isn't lowered by what is held or free.
+    let (held, free) =
+        if TEST_MAX.with(std::cell::Cell::get).is_some() { (0, None) } else { (crate::memory::held(), crate::memory::available()) };
+    too_large_held(len, max, memory, held, free)
+}
+
+/// [`too_large_said`] on a computer with `memory` bytes (`None`: the limit doesn't follow it)
+/// while RustGIS holds `held` and `free` is free (`None`: not known): when the limit is below the
+/// one with nothing else in use, it says what is held and free, that limit, and what to do (#2431).
+fn too_large_held(len: u64, max: u64, memory: Option<u64>, held: u64, free: Option<u64>) -> String {
+    let file = size_said(len, true);
+    let Some(memory) = memory else {
+        return format!("file is too large ({file}; the most read into memory is {})", size_said(max, false));
+    };
+    let full = max_bytes_for(Some(memory));
+    if max >= full || (held == 0 && free.is_none()) {
+        return format!(
+            "file is too large ({file}; the most read into memory is {} on this computer, a limit that follows its memory)",
+            size_said(max, false)
+        );
+    }
+    let free = free.map(|free| format!(" and {} free", size_said(free, false))).unwrap_or_default();
+    format!(
+        "file is too large ({file}; the most read into memory is {} on this computer now, with RustGIS holding {}{free}, {} otherwise): free memory by removing layers or tables you no longer need (save and reopen the project to let go of what Undo keeps of them) or closing other programs, then try again",
+        size_said(max, false),
+        size_said(held, true),
+        size_said(full, false)
+    )
+}
+
+/// A size in MiB, rounded `up` (a file's, so it never looks within the limit) or down (the
+/// limit's), or in bytes below one.
+pub(crate) fn size_said(bytes: u64, up: bool) -> String {
+    let mib = if up { bytes.div_ceil(1 << 20) } else { bytes >> 20 };
+    if bytes < 1 << 20 { format!("{bytes} bytes") } else { format!("{mib} MiB") }
+}
+
+thread_local! {
+    /// A smaller [`max_bytes`] for the tests on this thread ([`with_max_bytes`]), so a test of the
+    /// limit doesn't build a file of gigabytes.
+    static TEST_MAX: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with [`max_bytes`] at `max` on the calling thread only (work `f` hands to another
+/// thread sees the real limit); the limit is restored even if `f` panics. For tests, here and in
+/// the crates above.
+#[doc(hidden)]
+pub fn with_max_bytes<T>(max: u64, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_MAX.with(|m| m.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_MAX.with(|m| m.replace(Some(max))));
+    f()
+}
 
 const FILE_SIZE_LIMIT_START: &str = " is too large to open (limit ";
 const VECTOR_SIZE_LIMIT_END: &str =
@@ -156,12 +276,20 @@ fn read_city_member(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<V
 
 /// Reads every layer of a file held in memory: the Shapefiles and other files of a zip, a KML or
 /// KMZ's points, lines and polygons (with their styles), or a GPX's waypoints, routes, tracks and
-/// track points. Other files give their one layer.
+/// track points. Other files give their one layer. A file read as it is added (KML and KMZ,
+/// LandXML, RSS, Atom, GeoRSS, XML that isn't a city model) stays within [`BYTES_FLOOR`], as
+/// before #2408; the others take [`max_bytes`].
 pub fn read_layers(file_name: &str, bytes: &[u8]) -> Result<Vec<LayerRead>> {
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(DataError::Format(file_size_error(file_name, MAX_BYTES)));
-    }
     let ext = Path::new(file_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    // KML and KMZ, LandXML, RSS, Atom, GeoRSS and other XML that isn't a city model are read as
+    // they are added, on the desktop's UI thread, never ahead: within [`BYTES_FLOOR`] whatever the
+    // memory (#2408), wherever they come from.
+    let as_added = matches!(ext.as_str(), "kml" | "kmz" | "rss" | "atom" | "georss" | "landxml")
+        || (ext == "xml" && !crate::citygml::looks_like_citygml(bytes));
+    let max = if as_added { BYTES_FLOOR } else { max_bytes() };
+    if bytes.len() as u64 > max {
+        return Err(DataError::Format(file_size_error(file_name, max)));
+    }
     let plain =
         |v: Vec<(Dataset, ReadReport)>| v.into_iter().map(|(dataset, report)| LayerRead { dataset, report, styles: Vec::new() }).collect();
     let mut out: Vec<LayerRead> = match ext.as_str() {
@@ -300,8 +428,9 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<(Dataset, ReadReport)
     let path = Path::new(file_name);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("layer").to_string();
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(DataError::Format(file_size_error(file_name, MAX_BYTES)));
+    let max = max_bytes();
+    if bytes.len() as u64 > max {
+        return Err(DataError::Format(file_size_error(file_name, max)));
     }
     let text = || std::str::from_utf8(bytes).map_err(|_| DataError::Format(format!("{file_name} is not UTF-8 text")));
     let mut out = match ext.as_str() {
@@ -342,8 +471,9 @@ pub fn read_owned(file_name: &str, bytes: Vec<u8>) -> Result<(Dataset, ReadRepor
     if !crate::source::is_source_name(file_name) {
         return read_bytes(file_name, &bytes);
     }
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(DataError::Format(file_size_error(file_name, MAX_BYTES)));
+    let max = max_bytes();
+    if bytes.len() as u64 > max {
+        return Err(DataError::Format(file_size_error(file_name, max)));
     }
     let mut out = if crate::lidar::is_lidar_name(file_name) {
         let name = Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or("layer");
@@ -434,8 +564,9 @@ fn check_size(path: &Path) -> Result<()> {
 /// Refuses an oversized file with advice supplied by its reader.
 fn check_size_with(path: &Path, message: impl FnOnce(&str, u64) -> String) -> Result<()> {
     let len = std::fs::metadata(path)?.len();
-    if len > MAX_BYTES {
-        return Err(DataError::Format(message(&path.to_string_lossy(), MAX_BYTES)));
+    let max = max_bytes();
+    if len > max {
+        return Err(DataError::Format(message(&path.to_string_lossy(), max)));
     }
     Ok(())
 }
@@ -493,22 +624,21 @@ pub fn project(ds: &Dataset, crs: Crs) -> Result<Dataset> {
         return Ok(ds.clone());
     }
     let mut out = ds.clone();
-    let t = crs.transformer().map_err(DataError::Format)?;
-    project_features(&mut out.features, &t, crs)?;
+    let to = Crs::LonLat.to(crs).map_err(DataError::Format)?;
+    project_features(&mut out.features, &to)?;
     Ok(out)
 }
 
-/// Converts features' longitude/latitude geometry in place to the coordinates of `crs`, through
-/// its transformer `t`, as a step of the progress. Fails on a coordinate the system can't hold,
-/// naming its feature.
-pub(crate) fn project_features(features: &mut [crate::Feature], t: &crate::raster::Transformer, crs: Crs) -> Result<()> {
+/// Converts features' geometry in place from `to`'s source system to its target, as a step of the
+/// progress. Fails on a coordinate the target can't hold, naming its feature.
+pub(crate) fn project_features(features: &mut [crate::Feature], to: &crate::raster::Reprojection) -> Result<()> {
     crate::progress::begin(features.len());
-    project_each(features, t, crs, true)
+    project_each(features, to, true)
 }
 
 /// [`project_features`] without a step of its own: it counts each feature in the step under way
 /// when `count` is set, and otherwise only stops once the run is cancelled.
-pub(crate) fn project_each(features: &mut [crate::Feature], t: &crate::raster::Transformer, crs: Crs, count: bool) -> Result<()> {
+pub(crate) fn project_each(features: &mut [crate::Feature], to: &crate::raster::Reprojection, count: bool) -> Result<()> {
     for f in features {
         if count {
             crate::progress::step(1)?;
@@ -516,12 +646,9 @@ pub(crate) fn project_each(features: &mut [crate::Feature], t: &crate::raster::T
             crate::progress::check()?;
         }
         if let Some(g) = f.geometry.take() {
-            let mut ok = true;
-            let p = g.map_coords(&|c| t.from_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
-            p.for_each_coord(|c| ok &= c.is_finite());
-            if !ok {
-                return Err(DataError::Format(format!("feature {} can't be placed in {}", f.id, crs.label())));
-            }
+            let Some(p) = to.whole_geometry(&g) else {
+                return Err(DataError::Format(format!("feature {} can't be placed in {}", f.id, to.target().label())));
+            };
             f.geometry = Some(p);
         }
     }
@@ -538,11 +665,11 @@ pub fn define_projection(ds: &Dataset, crs: Crs) -> Result<Dataset> {
     }
     let from = ds.crs.unwrap_or(Crs::LonLat);
     let native = project(ds, from)?;
-    let to = crs.transformer().map_err(DataError::Format)?;
+    let to = crs.to(Crs::LonLat).map_err(DataError::Format)?;
     let mut out = native;
     for f in &mut out.features {
         if let Some(g) = f.geometry.take() {
-            let g = g.map_coords(&|c| to.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
+            let g = to.geometry(&g);
             let mut valid = true;
             g.for_each_coord(|c| valid &= c.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0);
             if !valid {
@@ -1441,7 +1568,25 @@ impl Collector {
     /// The dataset; `root` is the document's top level (for its `crs`, see [`declared_crs`]).
     fn finish(self, name: &str, root: &Map<String, Json>) -> Result<(Dataset, ReadReport)> {
         let mut report = ReadReport { skipped: self.skipped, ..ReadReport::default() };
-        let mut ds = Dataset::new(name, GeometryType::None, self.schema.fields());
+        let fields = self.schema.fields();
+        // Every feature gets a cell for every field, those it lacks too: many features with
+        // properties spread over many fields would take far more than the file. Refused when the
+        // table alone takes more than a file at the limit is planned to ([`MEMORY_PER_BYTE`]). In
+        // the browser that plan is 2 GiB, more than its memory may hold beside the document: this
+        // guards the desktop, and the browser no less than before #2408.
+        let cells = (self.features.len() as u64).saturating_mul(fields.len() as u64);
+        let table = cells.saturating_mul(std::mem::size_of::<Value>() as u64);
+        let planned = max_bytes().saturating_mul(MEMORY_PER_BYTE);
+        if table > planned {
+            return Err(DataError::Format(format!(
+                "{name}: its attribute table would take {} MiB ({} features × {} fields), more than the {} MiB planned for a file read into memory; a file with fewer fields, or split into parts, would fit",
+                table.div_ceil(1 << 20),
+                self.features.len(),
+                fields.len(),
+                planned >> 20
+            )));
+        }
+        let mut ds = Dataset::new(name, GeometryType::None, fields);
         ds.features.reserve(self.features.len());
         if report.skipped > 0 {
             report.messages.push(format!("{} features had unreadable geometry", report.skipped));
@@ -1637,6 +1782,135 @@ const LAT_NAMES: &[&str] = &["latitude", "lat", "lat_dd", "latitude_dd", "stop_l
 /// Further spellings seen in published files, recognised on reading but never written.
 const LON_ALIASES: &[&str] = &["longitude decimal degrees", "longitutde", "longtitude"];
 const LAT_ALIASES: &[&str] = &["latitude decimal degrees", "lattitude"];
+/// Longitude in other languages and scripts, lower-cased, recognised on reading but never
+/// written (#2385). Only words that name the coordinate: one that is also an object's length
+/// (German `Länge`, Arabic `الطول`, Greek `μήκος`) isn't taken on its own, so a table of
+/// measurements doesn't open as points. Spanish and Catalan `longitud` also means length: it is
+/// only taken as written (no note in brackets) and beside `latitud` ([`AMBIGUOUS_LON`]).
+const LON_WORLD: &[&str] = &[
+    // Chinese (traditional, simplified), Japanese, Korean; east longitude.
+    "經度",
+    "座標經度",
+    "坐標經度",
+    "经度",
+    "坐标经度",
+    "座标经度",
+    "経度",
+    "경도",
+    "東經",
+    "东经",
+    "東経",
+    // Vietnamese, Thai, Indonesian and Malay, Filipino.
+    "kinh độ",
+    "kinh do",
+    "ลองจิจูด",
+    "ลองติจูด",
+    "bujur",
+    "garis bujur",
+    "longhitud",
+    // Hindi and Marathi, Bengali, Tamil, Urdu, Persian (both yehs), Arabic, Hebrew.
+    "देशांतर",
+    "देशान्तर",
+    "रेखांश",
+    "দ্রাঘিমাংশ",
+    "தீர்க்கரேகை",
+    "طول بلد",
+    "طول جغرافیایی",
+    "طول جغرافيايي",
+    "خط الطول",
+    "קו אורך",
+    // Russian, Ukrainian, Bulgarian, Serbian, Kazakh, Mongolian, Greek (and as upper case loses
+    // its accents).
+    "долгота",
+    "довгота",
+    "географска дължина",
+    "географска дужина",
+    "бойлық",
+    "уртраг",
+    "γεωγραφικό μήκος",
+    "γεωγραφικο μηκος",
+    // Germanic, Romance, Baltic and Slavic languages in Latin script (German also as ASCII).
+    "längengrad",
+    "laengengrad",
+    "geographische länge",
+    "geographische laenge",
+    "geografische länge",
+    "geografische laenge",
+    "lengtegraad",
+    "longitud",
+    "longitudine",
+    "lonxitude",
+    "longitudea",
+    "längdgrad",
+    "længdegrad",
+    "lengdegrad",
+    "lengdargráða",
+    "pituusaste",
+    "pikkuskraad",
+    "ilguma",
+    "boylam",
+    "długość geograficzna",
+    "zeměpisná délka",
+    "zemepisná dĺžka",
+    "földrajzi hosszúság",
+    "geografska dužina",
+    "zemljepisna dolžina",
+    "ģeogrāfiskais garums",
+];
+/// Words of [`LON_WORLD`] that also mean length, each with the latitude it is only taken beside.
+const AMBIGUOUS_LON: &[(&str, &str)] = &[("longitud", "latitud")];
+/// Latitude likewise ([`LON_WORLD`]).
+const LAT_WORLD: &[&str] = &[
+    "緯度",
+    "座標緯度",
+    "坐標緯度",
+    "纬度",
+    "坐标纬度",
+    "座标纬度",
+    "위도",
+    "北緯",
+    "北纬",
+    "vĩ độ",
+    "vi do",
+    "ละติจูด",
+    "ละติดจูด",
+    "lintang",
+    "garis lintang",
+    "latitud",
+    "अक्षांश",
+    "অক্ষাংশ",
+    "அட்சரேகை",
+    "عرض بلد",
+    "عرض جغرافیایی",
+    "عرض جغرافيايي",
+    "خط العرض",
+    "קו רוחב",
+    "широта",
+    "географска ширина",
+    "ендік",
+    "өргөрөг",
+    "γεωγραφικό πλάτος",
+    "γεωγραφικο πλατος",
+    "breitengrad",
+    "geographische breite",
+    "geografische breite",
+    "breedtegraad",
+    "latitudine",
+    "latitudea",
+    "breddegrad",
+    "breiddargráða",
+    "leveysaste",
+    "laiuskraad",
+    "platuma",
+    "enlem",
+    "szerokość geograficzna",
+    "zeměpisná šířka",
+    "zemepisná šírka",
+    "földrajzi szélesség",
+    "geografska širina",
+    "zemljepisna širina",
+    "ģeogrāfiskais platums",
+];
 
 /// Projected coordinate columns, recognised as well as longitude/latitude ones.
 const X_NAMES: &[&str] = &["easting", "point_x", "xcoord", "x_coord"];
@@ -1723,10 +1997,85 @@ fn found_planar_xy(headers: &[String]) -> Option<(usize, usize)> {
     find(X_NAMES, "x").zip(find(Y_NAMES, "y"))
 }
 
-/// A complete longitude/latitude pair, including published aliases.
+/// A header as longitude and latitude names are looked up ([`folded`]), with a note in brackets
+/// at its end set aside (`經度(X)`, `Longitude (WGS84)`, `緯度（度）`, `lat [deg]`).
+fn geographic_key(header: &str) -> String {
+    let folded = folded(header);
+    let mut name = folded.as_str();
+    for (open, close) in [('(', ')'), ('（', '）'), ('[', ']')] {
+        if let Some(rest) = name.strip_suffix(close)
+            && let Some(at) = rest.rfind(open)
+            && let Some(head) = rest.get(..at).map(str::trim_end)
+            && !head.is_empty()
+        {
+            name = head;
+            break;
+        }
+    }
+    name.to_string()
+}
+
+/// A header as it is compared with longitude and latitude names: trimmed, in Unicode's composed
+/// form (a name whose accents a file saved as separate marks, as some Macs save Vietnamese, reads
+/// as one typed with them), lower-cased in any script.
+fn folded(header: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    header.trim().nfc().collect::<String>().to_lowercase()
+}
+
+/// Whether a header is, as written, a longitude word that also means length ([`AMBIGUOUS_LON`]).
+fn ambiguous_lon(header: &str) -> bool {
+    let name = folded(header);
+    AMBIGUOUS_LON.iter().any(|(word, _)| *word == name)
+}
+
+/// How well a header names longitude (`lat`: latitude), best first: an English name as written
+/// (0), a published misspelling as written (1), either with a note in brackets set aside (2, 3),
+/// a name in another language as written (4), then one with a note set aside (5); its words may
+/// be joined by `_`. `None`: not a name of it. So `Longitude` wins over `Longitude (DMS)`, and
+/// `經度` over `經度(DMS)`, wherever they stand.
+fn geographic_tier(header: &str, lat: bool) -> Option<usize> {
+    let exact = folded(header);
+    let key = geographic_key(header);
+    let (names, aliases, world) = if lat { (LAT_NAMES, LAT_ALIASES, LAT_WORLD) } else { (LON_NAMES, LON_ALIASES, LON_WORLD) };
+    let in_world = |k: &str| world.contains(&k) || world.contains(&k.replace('_', " ").as_str());
+    // A word that also means length counts only as written ([`AMBIGUOUS_LON`]).
+    let ambiguous = AMBIGUOUS_LON.iter().any(|(w, _)| *w == key);
+    let hits = [
+        names.contains(&exact.as_str()),
+        aliases.contains(&exact.as_str()),
+        names.contains(&key.as_str()),
+        aliases.contains(&key.as_str()),
+        in_world(&exact),
+        !ambiguous && in_world(&key),
+    ];
+    hits.iter().position(|hit| *hit)
+}
+
+/// The number of [`geographic_tier`]s.
+const GEOGRAPHIC_TIERS: usize = 6;
+
+/// A complete longitude/latitude pair: for each, the first column of the best tier of names
+/// that has one ([`geographic_tier`]). A longitude that also means length ([`AMBIGUOUS_LON`])
+/// is taken only when there is no other, beside its own language's latitude (with or without a
+/// note), whatever other latitude the file has.
 fn found_geographic_xy(headers: &[String]) -> Option<(usize, usize)> {
-    let find = |names: &[&str]| headers.iter().position(|h| names.iter().any(|name| h.trim().eq_ignore_ascii_case(name)));
-    find(LON_NAMES).or_else(|| find(LON_ALIASES)).zip(find(LAT_NAMES).or_else(|| find(LAT_ALIASES)))
+    let best = |lat: bool, keep: &dyn Fn(&str) -> bool| {
+        let tiers: Vec<Option<usize>> = headers.iter().map(|h| geographic_tier(h, lat)).collect();
+        (0..GEOGRAPHIC_TIERS)
+            .find_map(|tier| (0..tiers.len()).find(|&i| tiers.get(i) == Some(&Some(tier)) && headers.get(i).is_some_and(|h| keep(h))))
+    };
+    let lat = best(true, &|_| true);
+    if let (Some(lon), Some(lat)) = (best(false, &|h| !ambiguous_lon(h)), lat) {
+        return Some((lon, lat));
+    }
+    AMBIGUOUS_LON.iter().find_map(|(word, partner)| {
+        let lon = headers.iter().position(|h| folded(h) == *word)?;
+        // Its latitude as written first, then one with a note.
+        let lat =
+            headers.iter().position(|h| folded(h) == *partner).or_else(|| headers.iter().position(|h| geographic_key(h) == *partner))?;
+        Some((lon, lat))
+    })
 }
 
 /// Names candidate columns when both axes are present without a matching pair.
@@ -1736,8 +2085,9 @@ fn unmatched_coordinates_note(headers: &[String]) -> Option<String> {
     let mut has_y = false;
     for header in headers.iter().map(|h| h.trim()) {
         let name = header.to_ascii_lowercase();
-        let x = name == "x" || [LON_NAMES, LON_ALIASES, X_NAMES].iter().any(|names| names.contains(&name.as_str()));
-        let y = name == "y" || [LAT_NAMES, LAT_ALIASES, Y_NAMES].iter().any(|names| names.contains(&name.as_str()));
+        // (A word that also means length isn't named on its own.)
+        let x = name == "x" || X_NAMES.contains(&name.as_str()) || (geographic_tier(header, false).is_some() && !ambiguous_lon(header));
+        let y = name == "y" || Y_NAMES.contains(&name.as_str()) || geographic_tier(header, true).is_some();
         if x || y {
             candidates.push(header);
             has_x |= x;
@@ -1893,12 +2243,15 @@ pub fn is_delimited_name(name: &str) -> bool {
 struct GzipText<R: std::io::Read> {
     decoder: flate2::read::MultiGzDecoder<R>,
     left: u64,
+    /// The limit it started with, for the refusal.
+    limit: u64,
 }
 
 impl<R: std::io::Read> GzipText<R> {
     /// Starts a streaming decode; callers still check cancellation at record boundaries.
     fn new(reader: R) -> Self {
-        Self { decoder: flate2::read::MultiGzDecoder::new(reader), left: MAX_BYTES }
+        let limit = max_bytes();
+        Self { decoder: flate2::read::MultiGzDecoder::new(reader), left: limit, limit }
     }
 }
 
@@ -1909,7 +2262,13 @@ impl<R: std::io::Read> std::io::Read for GzipText<R> {
         let size = buf.len().min(usize::try_from(self.left.saturating_add(1)).unwrap_or(usize::MAX));
         let n = self.decoder.read(buf.get_mut(..size).unwrap_or_default())?;
         if n as u64 > self.left {
-            return Err(std::io::Error::other(format!("expanded delimited text exceeds the {MAX_BYTES}-byte limit")));
+            // At least this much expanded: what was read before and this read.
+            let expanded = (self.limit - self.left).saturating_add(n as u64);
+            return Err(std::io::Error::other(format!(
+                "expanded to more than the limit, at least {}: {}",
+                size_said(expanded, true),
+                too_large_said(expanded, self.limit)
+            )));
         }
         self.left -= n as u64;
         Ok(n)
@@ -1921,7 +2280,7 @@ impl<R: std::io::Read> std::io::Read for GzipText<R> {
 pub fn gzip_text_prefix(reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut bytes = Vec::new();
-    let result = GzipText::new(reader).take(limit.min(MAX_BYTES as usize) as u64).read_to_end(&mut bytes);
+    let result = GzipText::new(reader).take(limit.min(usize::try_from(max_bytes()).unwrap_or(usize::MAX)) as u64).read_to_end(&mut bytes);
     crate::progress::check()?;
     result.map_err(|e| DataError::Format(format!("gzip delimited text: {e}")))?;
     Ok(bytes)
@@ -1990,30 +2349,38 @@ fn read_gzip_text_budget(
             )));
         }
     }
-    let result = read_csv_records(&mut rdr, name, opts, budget);
+    // The encoding hint only on text that isn't UTF-8 (told by the reader), not past the size
+    // limit or the memory budget.
+    let result = read_csv_records(&mut rdr, name, opts, budget, Some("; if not UTF-8, decompress and add as .txt"));
     crate::progress::check()?;
-    let (mut dataset, report) =
-        result.map_err(|e| DataError::Format(format!("{file_name}: {e}; if not UTF-8, decompress and add as .txt")))?;
+    let (mut dataset, report) = result.map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
     dataset.source = Some(file_name.to_string());
     Ok((dataset, report))
 }
 
 /// Estimated memory for retained CSV rows and the dataset built alongside them: a quarter
 /// of physical memory, between 256 MiB (also the browser limit) and 4 GiB.
+/// Less once RustGIS holds more than half the memory, never below the floor ([`crate::memory::planned`], #2431).
 fn csv_memory_budget() -> usize {
     let ceiling = usize::try_from(4u64 << 30).unwrap_or(usize::MAX);
-    crate::memory::scaled(crate::memory::physical(), 256 << 20, ceiling, 1)
+    crate::memory::planned(256 << 20, ceiling, 1)
 }
 
 /// Collects records for type inference, charging text and row/cell objects before copying.
 /// The estimate includes the dataset built while these rows remain alive and room for vector
-/// capacity. Reader failures and a spent memory budget refuse the whole import.
+/// capacity. Reader failures and a spent memory budget refuse the whole import; text that isn't
+/// UTF-8 is refused with `utf8_hint` after the reader's error, where given.
 fn read_csv_records(
     reader: &mut csv::Reader<impl std::io::Read>,
     name: &str,
     opts: &CsvOptions,
     budget: &mut usize,
+    utf8_hint: Option<&str>,
 ) -> Result<(Dataset, ReadReport)> {
+    let refused = |e: csv::Error| {
+        let hint = if matches!(e.kind(), csv::ErrorKind::Utf8 { .. }) { utf8_hint.unwrap_or("") } else { "" };
+        DataError::Format(format!("CSV: {e}{hint}"))
+    };
     let cost = |r: &csv::StringRecord, columns: usize| {
         r.as_slice()
             .len()
@@ -2025,7 +2392,7 @@ fn read_csv_records(
     let allowance = *budget;
     let too_large =
         || DataError::Format(format!("CSV retained table exceeds the {allowance}-byte remaining memory budget; import a smaller file"));
-    let header = reader.headers().map_err(|e| DataError::Format(format!("CSV: {e}")))?;
+    let header = reader.headers().map_err(refused)?;
     let mut left = budget.checked_sub(cost(header, header.len())).ok_or_else(too_large)?;
     let headers: Vec<String> = header.iter().map(str::to_string).collect();
     let mut malformed = 0;
@@ -2037,9 +2404,7 @@ fn read_csv_records(
                 left = left.checked_sub(cost(&r, headers.len())).ok_or_else(too_large)?;
                 rows.push(r.iter().map(str::to_string).collect());
             }
-            Err(e) if e.is_io_error() || matches!(e.kind(), csv::ErrorKind::Utf8 { .. }) => {
-                return Err(DataError::Format(format!("CSV: {e}")));
-            }
+            Err(e) if e.is_io_error() || matches!(e.kind(), csv::ErrorKind::Utf8 { .. }) => return Err(refused(e)),
             Err(_) => malformed += 1,
         }
     }
@@ -2056,8 +2421,9 @@ pub fn read_delimited_bytes(file_name: &str, bytes: &[u8], opts: &CsvOptions) ->
 
 /// Reads an archive member without resetting the retained-table allowance.
 fn read_delimited_bytes_budget(file_name: &str, bytes: &[u8], opts: &CsvOptions, budget: &mut usize) -> Result<(Dataset, ReadReport)> {
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(DataError::Format(file_size_error(file_name, MAX_BYTES)));
+    let max = max_bytes();
+    if bytes.len() as u64 > max {
+        return Err(DataError::Format(file_size_error(file_name, max)));
     }
     if is_gzip_text_name(file_name) {
         return read_gzip_text_budget(bytes, file_name, opts, budget);
@@ -2092,7 +2458,7 @@ fn read_csv_with_budget(text: &str, name: &str, opts: &CsvOptions, budget: &mut 
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let delimiter = opts.delimiter.unwrap_or_else(|| sniff_delimiter(text));
     let mut rdr = csv::ReaderBuilder::new().flexible(true).delimiter(delimiter).from_reader(text.as_bytes());
-    read_csv_records(&mut rdr, name, opts, budget)
+    read_csv_records(&mut rdr, name, opts, budget, None)
 }
 
 /// Rows of text cells under a header row (delimited text, a spreadsheet's sheet) as a dataset, as
@@ -2586,7 +2952,7 @@ const SHAPEFILE_SIDECARS: [&str; 4] = ["dbf", "shx", "prj", "cpg"];
 /// same base name, ignoring case, and its `.shx`, `.prj` and `.cpg` when they are there. The zip,
 /// named after the `.shp`, takes its place; its parts go. Other files, and a `.shp` without its
 /// `.dbf`, pass through as they came. A standalone `.dbf` with a `.cpg` is zipped with it too.
-/// Files whose parts are too large to read together (more than [`MAX_BYTES`], or the zip
+/// Files whose parts are too large to read together (more than [`max_bytes`], or the zip
 /// reader's limit) are left out, with an explanation in the messages returned with the files.
 pub fn gather_shapefiles(files: Vec<(String, Vec<u8>)>) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
     let ext_of = |n: &str| Path::new(n).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).unwrap_or_default();
@@ -2628,7 +2994,9 @@ pub fn gather_shapefiles(files: Vec<(String, Vec<u8>)>) -> (Vec<(String, Vec<u8>
         }
     }
     // The zip must open again: within the read size and the zip reader's inflated total.
-    let limit = crate::zip::MAX_TOTAL.min(usize::try_from(MAX_BYTES).unwrap_or(usize::MAX));
+    // Read once for the whole run: it reads what the computer has free (#2431).
+    let max = max_bytes();
+    let limit = crate::zip::MAX_TOTAL.min(usize::try_from(max).unwrap_or(usize::MAX));
     let (mut out, mut problems) = (Vec::new(), Vec::new());
     for (file, parts) in files.into_iter().zip(zips) {
         out.extend(file);
@@ -2638,14 +3006,24 @@ pub fn gather_shapefiles(files: Vec<(String, Vec<u8>)>) -> (Vec<(String, Vec<u8>
         let shp = parts.first().map(|(n, _)| n.clone()).unwrap_or_else(|| "layer.shp".into());
         let zip_name = format!("{}.zip", Path::new(&shp).file_stem().and_then(|s| s.to_str()).unwrap_or("layer"));
         let total = parts.iter().fold(0usize, |sum, (_, b)| sum.saturating_add(b.len()));
-        let too_large = || format!("{shp}: its data files hold {} MB in all; at most {} MB can be read together", total >> 20, limit >> 20);
+        // Said by the limit it passed: the size read into memory (which follows the computer's
+        // memory), or the most a zip expands to.
+        if total as u64 > max {
+            problems.push(format!("{shp}: its data files together: {}", too_large_said(total as u64, max)));
+            continue;
+        }
         if total > limit {
-            problems.push(too_large());
+            problems.push(format!(
+                "{shp}: its data files hold {} MiB in all; at most {} MiB is expanded from a zip",
+                total.div_ceil(1 << 20),
+                limit >> 20
+            ));
             continue;
         }
         match crate::zip::write(&parts) {
-            Ok(zip) if zip.len() as u64 <= MAX_BYTES => out.push((zip_name, zip)),
-            _ => problems.push(too_large()),
+            Ok(zip) if zip.len() as u64 <= max => out.push((zip_name, zip)),
+            Ok(zip) => problems.push(format!("{shp}: zipped together: {}", too_large_said(zip.len() as u64, max))),
+            Err(e) => problems.push(format!("{shp}: its data files couldn't be zipped together: {e}")),
         }
     }
     (out, problems)
@@ -2782,8 +3160,9 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
 
 /// Delimited members share one allowance, including gzip members whose text is nested in ZIP.
 fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut usize) -> Result<Vec<(Dataset, ReadReport)>> {
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(DataError::Format(file_size_error(file_name, MAX_BYTES)));
+    let max = max_bytes();
+    if bytes.len() as u64 > max {
+        return Err(DataError::Format(file_size_error(file_name, max)));
     }
     if let Some(c) = crs {
         c.transformer().map_err(DataError::Format)?;
@@ -4442,6 +4821,126 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// A file refused because RustGIS holds much of the memory says so, with the limit when nothing
+    /// is held and what to do; refused at the full limit, or where the limit doesn't follow the
+    /// memory, it says what it said before (#2431).
+    #[test]
+    fn a_file_refused_while_memory_is_held_says_so() {
+        const GIB: u64 = 1 << 30;
+        if bytes_ceiling() == BYTES_FLOOR {
+            return; // A phone or a 32-bit build: the limit doesn't follow the memory.
+        }
+        let lowered = too_large_held(2 * GIB, GIB, Some(64 * GIB), 40 * GIB, None);
+        assert_eq!(
+            lowered,
+            "file is too large (2048 MiB; the most read into memory is 1024 MiB on this computer now, with RustGIS holding 40960 MiB, 2048 MiB otherwise): free memory by removing layers or tables you no longer need (save and reopen the project to let go of what Undo keeps of them) or closing other programs, then try again"
+        );
+        let busy = too_large_held(GIB, 512 << 20, Some(64 * GIB), GIB, Some(5 * GIB));
+        assert!(busy.contains("with RustGIS holding 1024 MiB and 5120 MiB free, 2048 MiB otherwise"), "{busy}");
+        let full = too_large_held(3 * GIB, 2 * GIB, Some(64 * GIB), GIB, Some(60 * GIB));
+        assert_eq!(
+            full,
+            "file is too large (3072 MiB; the most read into memory is 2048 MiB on this computer, a limit that follows its memory)"
+        );
+        assert_eq!(too_large_held(3 * GIB, 2 * GIB, Some(64 * GIB), 0, None), full);
+        assert_eq!(
+            too_large_held(GIB, 256 << 20, None, 40 * GIB, None),
+            "file is too large (1024 MiB; the most read into memory is 256 MiB)"
+        );
+    }
+
+    /// The size read into memory follows the computer's memory between its floor and ceiling,
+    /// and stays at the floor where the memory isn't known (the browser) (#2408).
+    #[test]
+    fn the_size_read_into_memory_follows_the_memory() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(max_bytes_for(None), BYTES_FLOOR);
+        assert_eq!(max_bytes_for(Some(4 * GIB)), BYTES_FLOOR, "never below the floor");
+        assert_eq!(max_bytes_for(Some(8 * GIB)), BYTES_FLOOR, "8 GiB plans for 2 GiB, 256 MiB of file");
+        if bytes_ceiling() > BYTES_FLOOR {
+            assert_eq!(max_bytes_for(Some(16 * GIB)), 512 << 20);
+            assert_eq!(max_bytes_for(Some(64 * GIB)), 2 * GIB);
+            assert_eq!(max_bytes_for(Some(1024 * GIB)), BYTES_CEILING, "never above the ceiling");
+        } else {
+            // A phone or a 32-bit build: the floor, whatever the memory.
+            assert_eq!(max_bytes_for(Some(16 * GIB)), BYTES_FLOOR);
+            assert_eq!(max_bytes_for(Some(1024 * GIB)), BYTES_FLOOR);
+        }
+        // Holding more than half the memory lowers it, never below the floor (#2431).
+        if bytes_ceiling() > BYTES_FLOOR {
+            assert_eq!(max_bytes_within(crate::memory::share(Some(16 * GIB), 8 * GIB, None)), 512 << 20, "half held: unchanged");
+            assert_eq!(max_bytes_within(crate::memory::share(Some(64 * GIB), 40 * GIB, None)), GIB);
+            assert_eq!(max_bytes_within(crate::memory::share(Some(16 * GIB), 12 * GIB, None)), BYTES_FLOOR);
+        }
+        // The test limit is the calling thread's, and comes back after it, nested too. The real one
+        // follows what is free now (#2431), so it is only compared with its floor.
+        with_max_bytes(10, || {
+            assert_eq!(max_bytes(), 10);
+            with_max_bytes(20, || assert_eq!(max_bytes(), 20));
+            assert_eq!(max_bytes(), 10);
+            assert!(std::thread::spawn(max_bytes).join().unwrap() >= BYTES_FLOOR);
+        });
+        assert!(max_bytes() >= BYTES_FLOOR);
+        let said = with_max_bytes(1 << 20, || too_large(3 << 20));
+        assert!(said.starts_with("file is too large (3 MiB;") && said.contains("is 1 MiB"), "{said}");
+    }
+
+    /// A file past the limit is refused before it is parsed, by each reader that takes it whole,
+    /// saying its size and the limit; one within it is read.
+    #[test]
+    fn a_file_past_the_size_read_into_memory_is_refused_saying_the_limit() {
+        let geojson = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
+        let max = geojson.len() as u64 - 1;
+        let e = with_max_bytes(max, || read_bytes("a.geojson", geojson)).unwrap_err().to_string();
+        assert_eq!(e, file_size_error("a.geojson", max));
+        assert!(with_max_bytes(max + 1, || read_bytes("a.geojson", geojson)).is_ok());
+        let e = with_max_bytes(max, || read_layers("a.geojson", geojson)).err().map(|e| e.to_string()).unwrap_or_default();
+        assert_eq!(e, file_size_error("a.geojson", max));
+        // A KML stays within the floor with the limit raised; a GPX, read ahead, doesn't.
+        let past_floor = vec![b' '; BYTES_FLOOR as usize + 1];
+        let (kml, gpx) =
+            with_max_bytes(2 * BYTES_FLOOR, || (read_layers("a.kml", &past_floor).err(), read_layers("a.gpx", &past_floor).err()));
+        assert_eq!(kml.map(|e| e.to_string()), Some(file_size_error("a.kml", BYTES_FLOOR)));
+        assert!(gpx.is_some_and(|e| file_size_error_args(&e.to_string()).is_none()), "a GPX is parsed, not refused by its size");
+        let csv = b"x,y\n1,2\n";
+        let e = with_max_bytes(4, || read_bytes("a.csv", csv)).unwrap_err().to_string();
+        assert_eq!(e, file_size_error("a.csv", 4));
+        // Compressed text within the size but expanding past it: refused by the size, without
+        // the hint about its encoding.
+        let gz = {
+            use std::io::Write;
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            encoder.write_all(&b"1,2\n".repeat(10_000)).unwrap();
+            encoder.finish().unwrap()
+        };
+        let e = with_max_bytes(1000.max(gz.len() as u64), || read_bytes("a.csv.gz", &gz)).unwrap_err().to_string();
+        assert!(e.contains("expanded to more than the limit") && e.contains("is 1000 bytes") && !e.contains("UTF-8"), "{e}");
+        // The delimited reader's own guard, for callers that don't come through `read_bytes`.
+        let e = with_max_bytes(4, || read_delimited_bytes("a.csv", csv, &CsvOptions::default())).unwrap_err().to_string();
+        assert_eq!(e, file_size_error("a.csv", 4));
+        // The encoding hint on compressed text that isn't UTF-8 only, not on one past the memory
+        // budget.
+        let latin1 = gzip_csv(b"name,x,y\nZ\xfcrich,1,2\n");
+        let e = read_gzip_text_budget(latin1.as_slice(), "a.csv.gz", &CsvOptions::default(), &mut (1 << 20)).unwrap_err().to_string();
+        assert!(e.contains("if not UTF-8, decompress"), "{e}");
+        let utf8 = gzip_csv(&b"1,2\n".repeat(10_000));
+        let e = read_gzip_text_budget(utf8.as_slice(), "a.csv.gz", &CsvOptions::default(), &mut 4096).unwrap_err().to_string();
+        assert!(e.contains("memory budget") && !e.contains("UTF-8"), "{e}");
+        // Within the size, but forty features each with a field of its own: a table of 1,600
+        // cells, more than a file at the limit is planned to take.
+        let sparse: Vec<String> = (0..40).map(|i| format!(r#"{{"type":"Feature","properties":{{"f{i}":1}},"geometry":null}}"#)).collect();
+        let sparse = format!(r#"{{"type":"FeatureCollection","features":[{}]}}"#, sparse.join(","));
+        let cells = 1600 * std::mem::size_of::<Value>() as u64;
+        let max = (cells / MEMORY_PER_BYTE - 1).max(sparse.len() as u64);
+        assert!(max * MEMORY_PER_BYTE < cells, "the test's file is too large for its table");
+        let e = with_max_bytes(max, || read_bytes("a.geojson", sparse.as_bytes())).unwrap_err().to_string();
+        assert!(e.contains("attribute table would take") && e.contains("40 features × 40 fields"), "{e}");
+        assert!(with_max_bytes(cells, || read_bytes("a.geojson", sparse.as_bytes())).is_ok());
+        let city = br#"<core:CityModel xmlns:core="http://www.opengis.net/citygml/2.0"></core:CityModel>"#;
+        let e = with_max_bytes(8, || crate::citygml::read("a.gml", city, None)).unwrap_err().to_string();
+        assert_eq!(e, file_size_error("a.gml", 8));
+    }
+
     /// A whole-valued Double is read as Integer only when the header declares no decimals for it;
     /// when the header doesn't give its decimals at all, it stays Double.
     #[test]
@@ -5604,6 +6103,105 @@ mod tests {
         }
     }
 
+    /// Longitude and latitude named in other languages and scripts place the points, as the
+    /// English names do, with no notice (#2385): Taiwan's open data as data.gov.tw publishes it,
+    /// with a note in brackets after the name, and each language's own pair.
+    #[test]
+    fn csv_coordinates_named_in_other_languages_place_the_points() {
+        let taiwan = [
+            ("經度", "緯度"),
+            ("座標經度", "座標緯度"),
+            ("經度(X)", "緯度(Y)"),
+            ("经度", "纬度"),
+            ("経度", "緯度"),
+            ("경도", "위도"),
+            ("Kinh độ", "Vĩ độ"),
+            ("ДОЛГОТА", "ШИРОТА"),
+            ("Längengrad", "Breitengrad"),
+            ("zeměpisná_délka", "zeměpisná_šířka"),
+            ("Longitude (WGS84)", "Latitude (WGS84)"),
+            ("經度（度）", "緯度（度）"),
+            ("lon [deg]", "lat [deg]"),
+            ("Longitud", "Latitud"),
+            ("東經", "北緯"),
+            ("Laengengrad", "Breitengrad"),
+        ];
+        // Every name of either list, with the other axis in English.
+        let each = LON_WORLD
+            .iter()
+            .filter(|x| !AMBIGUOUS_LON.iter().any(|(w, _)| w == *x))
+            .map(|x| (x.to_string(), "latitude".to_string()))
+            .chain(LAT_WORLD.iter().map(|y| ("longitude".to_string(), y.to_string())));
+        for (x, y) in taiwan.iter().map(|(x, y)| (x.to_string(), y.to_string())).chain(each) {
+            // Latitude first, as the Kaohsiung camera list has it, and a column besides.
+            let text = format!("名稱,{y},{x}\nA,22.99,120.21\n");
+            let (ds, report) = read_csv(&text, "places").unwrap();
+            assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(120.21, 22.99))), "{x}, {y}");
+            assert!(report.messages.is_empty(), "{x}, {y}: {:?}", report.messages);
+            let columns = csv_columns(&text, None, None).unwrap();
+            assert_eq!((columns.x.as_deref(), columns.y.as_deref()), (Some(x.as_str()), Some(y.as_str())));
+        }
+    }
+
+    /// Words that are also an object's length or width aren't coordinates on their own, and an
+    /// English pair wins over another language's, so a table of measurements stays a table and
+    /// exports read back as written.
+    #[test]
+    fn csv_lengths_and_widths_stay_a_table() {
+        for text in [
+            "id,Länge,Breite\n1,3,4\n",
+            "id,Longitud,Ancho\n1,3,4\n",
+            "id,μήκος,πλάτος\n1,3,4\n",
+            "id,الطول,العرض\n1,3,4\n",
+            "id,經度\n1,120\n",
+        ] {
+            let (ds, report) = read_csv(text, "measures").unwrap();
+            assert_eq!(ds.geometry_type, GeometryType::None, "{text}");
+            assert!(report.messages.is_empty(), "{text}: {:?}", report.messages);
+        }
+        // English names first: a point layer with fields 經度 and 緯度 reads back from its own
+        // longitude and latitude columns.
+        let text = "經度,緯度,longitude,latitude\n1,2,120.21,22.99\n";
+        let (ds, _) = read_csv(text, "both").unwrap();
+        assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(120.21, 22.99))));
+        // Spanish `longitud` (also length) only beside `latitud`, and only as written; on its
+        // own it isn't named in a notice either.
+        for text in ["Tramo,Lat,Longitud\nA,22.99,3\n", "Tramo,Latitud,Longitud (km)\nA,22.99,3\n"] {
+            let (ds, report) = read_csv(text, "tramos").unwrap();
+            assert_eq!(ds.geometry_type, GeometryType::None, "{text}");
+            assert!(report.messages.is_empty(), "{text}: {:?}", report.messages);
+        }
+        // Beside `latitud` (with a note, or with another latitude before it), it pairs with it.
+        for text in [
+            "Longitud,Latitud (WGS84)\n121.5,25\n",
+            "Lat,Longitud,Latitud\n1,121.5,25\n",
+            "Longitud,Latitud (DMS),Latitud\n121.5,\"25°N\",25\n",
+        ] {
+            let (ds, report) = read_csv(text, "pares").unwrap();
+            assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(121.5, 25.0))), "{text}");
+            assert!(report.messages.is_empty(), "{text}: {:?}", report.messages);
+        }
+        // Another language's name as written wins over one with a note, as English names do.
+        let text = "經度(DMS),緯度(DMS),經度,緯度\n\"E121°30'\",\"N25°\",121.5,25.0\n";
+        let columns = csv_columns(text, None, None).unwrap();
+        assert_eq!((columns.x.as_deref(), columns.y.as_deref()), (Some("經度"), Some("緯度")));
+        // A name saved with its accents as separate marks (NFD) reads as one typed with them.
+        use unicode_normalization::UnicodeNormalization;
+        let (x, y): (String, String) = ("Kinh độ".nfd().collect(), "Vĩ độ".nfd().collect());
+        assert_ne!(x, "Kinh độ");
+        let (ds, _) = read_csv(&format!("{x},{y}\n105.8,21.0\n"), "hanoi").unwrap();
+        assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(105.8, 21.0))));
+        // A name as written wins over one with a note set aside, wherever it stands: decimal
+        // degrees, not the DMS text before them.
+        let text = "Longitude (DMS),Latitude (DMS),Longitude,Latitude\n\"121°30'E\",\"25°N\",121.5,25.0\n";
+        let columns = csv_columns(text, None, None).unwrap();
+        assert_eq!((columns.x.as_deref(), columns.y.as_deref()), (Some("Longitude"), Some("Latitude")));
+        // Half a pair in another language beside an X names both in the notice.
+        let (ds, report) = read_csv("X,緯度\n570000,22.99\n", "half").unwrap();
+        assert_eq!(ds.geometry_type, GeometryType::None);
+        assert!(report.messages.first().is_some_and(|m| m.contains("X, 緯度")), "{:?}", report.messages);
+    }
+
     /// A plain table with only one candidate axis opens without a coordinate notice.
     #[test]
     fn csv_lone_coordinate_like_headers_do_not_warn() {
@@ -6451,17 +7049,17 @@ mod tests {
         let bytes = gzip_csv(format!("a,b,c,d\n{}", ",,,\n".repeat(1000)).as_bytes());
         assert!(bytes.len() < 100);
         let mut reader = csv::ReaderBuilder::new().from_reader(GzipText::new(bytes.as_slice()));
-        let error = read_csv_records(&mut reader, "small", &CsvOptions::default(), &mut 4096).unwrap_err();
+        let error = read_csv_records(&mut reader, "small", &CsvOptions::default(), &mut 4096, None).unwrap_err();
         assert!(error.to_string().contains("memory budget"), "{error}");
         let mut reader = csv::ReaderBuilder::new().from_reader(GzipText::new(bytes.as_slice()));
-        let (table, report) = read_csv_records(&mut reader, "small", &CsvOptions::default(), &mut (1 << 20)).unwrap();
+        let (table, report) = read_csv_records(&mut reader, "small", &CsvOptions::default(), &mut (1 << 20), None).unwrap();
         assert_eq!(table.features.len(), 1000);
         assert!(report.messages.is_empty());
         // Missing fields still become dataset attributes, so charge the complete header width.
         let header = (0..100).map(|i| format!("f{i}")).collect::<Vec<_>>().join(",");
         let bytes = gzip_csv(format!("{header}\n{}", "x\n".repeat(100)).as_bytes());
         let mut reader = csv::ReaderBuilder::new().flexible(true).from_reader(GzipText::new(bytes.as_slice()));
-        let error = read_csv_records(&mut reader, "short", &CsvOptions::default(), &mut (64 << 10)).unwrap_err();
+        let error = read_csv_records(&mut reader, "short", &CsvOptions::default(), &mut (64 << 10), None).unwrap_err();
         assert!(error.to_string().contains("memory budget"), "{error}");
     }
 
@@ -6676,11 +7274,11 @@ mod tests {
         let path = dir.path().join("roads.shp");
         std::fs::File::create(&path).unwrap();
         std::fs::File::create(path.with_extension("dbf")).unwrap();
-        let limit = (MAX_BYTES >> 20).to_string();
+        let limit = (max_bytes() >> 20).to_string();
         for ext in ["shp", "dbf", "shx"] {
             let sidecar = path.with_extension(ext);
             let file = std::fs::File::create(&sidecar).unwrap();
-            file.set_len(MAX_BYTES + 1).unwrap();
+            file.set_len(max_bytes() + 1).unwrap();
             for result in [read_path(&path), read_shapefile_in(&path, "roads", Some(Crs::LonLat))] {
                 let error = result.unwrap_err().to_string();
                 assert_eq!(file_size_error_args(&error), Some((sidecar.to_str().unwrap(), limit.as_str(), FileSizeAdvice::Shapefile)));
@@ -6695,10 +7293,10 @@ mod tests {
         // A sparse file exercises the production cap without allocating or reading its contents.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("communities.DBF");
-        std::fs::File::create(&path).unwrap().set_len(MAX_BYTES + 1).unwrap();
+        std::fs::File::create(&path).unwrap().set_len(max_bytes() + 1).unwrap();
 
         let error = read_path(&path).unwrap_err().to_string();
-        let limit = (MAX_BYTES >> 20).to_string();
+        let limit = (max_bytes() >> 20).to_string();
         assert_eq!(file_size_error_args(&error), Some((path.to_str().unwrap(), limit.as_str(), FileSizeAdvice::Split)));
         assert!(error.contains("Split the data into smaller files"), "{error}");
     }
@@ -6938,11 +7536,13 @@ mod tests {
         // One too large to read together is left out and said why; the others still come.
         let mut big = rivers.clone();
         big.push(("huge.shp".to_string(), vec![0; 1 << 20]));
-        big.push(("huge.dbf".to_string(), vec![0; MAX_BYTES as usize]));
-        let (out, problems) = gather_shapefiles(big);
+        big.push(("huge.dbf".to_string(), vec![0; BYTES_FLOOR as usize]));
+        let (out, problems) = with_max_bytes(BYTES_FLOOR, || gather_shapefiles(big));
         assert_eq!(names(&out), ["rivers.zip"]);
         assert_eq!(problems.len(), 1);
-        assert!(problems[0].starts_with("huge.shp:") && problems[0].contains("MB"), "{problems:?}");
+        // Its size and the limit it passed, the size read into memory.
+        assert!(problems[0].starts_with("huge.shp: its data files together: file is too large (257 MiB;"), "{problems:?}");
+        assert!(problems[0].contains("the most read into memory is 256 MiB"), "{problems:?}");
     }
 
     /// A Shapefile's parts by the address of its `.shp` (#1238): beside it, in its case, the query
