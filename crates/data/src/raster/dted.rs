@@ -438,6 +438,7 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
         // rather than this over the size read, since `step` needn't divide the posts).
         r.overview = Some((cols as u32, rows as u32));
         r.step = step as u32;
+        r.posts = true;
     }
     r.lost = lost;
     Ok(r)
@@ -914,7 +915,7 @@ mod tests {
         // The layer says the file's own size; the scale is the step, exactly, though 9 and 13
         // aren't multiples of the size read (the warp and world files take `file_pixels`).
         assert_eq!(r.overview, Some((cols as u32, rows as u32)));
-        assert_eq!(r.file_pixels(), (2.0, 2.0));
+        assert_eq!((r.file_pixels(), r.file_origin()), ((2.0, 2.0), (-0.5, -0.5)));
         // The kept posts are columns 0, 2, …, 8 and points 12, 10, …, 0, 0.05° apart: the extent
         // reaches one post (half a cell) past the outer ones on every side.
         let e = r.extent();
