@@ -17,6 +17,7 @@ pub(crate) mod external;
 pub mod fgb;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gdal;
+pub mod geodatabase;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod geojson;
 #[cfg(not(target_arch = "wasm32"))]
@@ -34,6 +35,7 @@ pub mod pgconn;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod postgis;
 pub mod remote;
+pub mod sdefile;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod shp;
 #[cfg(not(target_arch = "wasm32"))]
@@ -667,6 +669,7 @@ fn materialize_within(src: &dyn FeatureSource, budget: u64) -> Result<(Dataset, 
         unread_dates: unread_dates.clone(),
         rounded_dates: rounded.clone(),
         extrusion: None,
+        losses: Vec::new(),
     };
     let null_text = null_text_note(&info.fields, &null_text);
     report.messages.extend(unread_dates.into_iter().chain(rounded).chain(null_text).chain(notes).map(|n| format!("{}: {n}", info.name)));

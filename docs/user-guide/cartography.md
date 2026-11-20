@@ -91,13 +91,14 @@ draws a circle, so the point still shows. By command:
 layer.marker={"layer":"Peaks","char":"▲","font":"DejaVu Sans","size":12}
 ```
 
-A marker can also be an **image**: a PNG or JPEG, given by command as base64 (at most 2 MiB).
+A marker can also be an **image**: a PNG or JPEG, given by command as base64 (at most 2 MiB of base64 text, an image of about 1.5 MiB). Other formats, such as GIF, aren't taken.
 Its size is its width, and it is as tall as its proportions make it, as QGIS draws a raster image
 marker; the symbol's fill and outline don't show. It turns with **Rotation**, is ringed when
 selected, and is kept in the project file. A project that has one opens only in a RustGIS that
 draws them. An image that doesn't decode draws a circle, so the point still shows; opening a
 project, map file or layer file, or adding styles, says which layers and styles have such an image,
-or one too large to keep:
+or one too large to keep. The **Layers** pane, its legend and the editors' previews (the symbol's,
+the strokes' and the fills') show the image too, whole within their patch and not turned:
 
 ```text
 layer.marker={"layer":"Schools","image":"iVBORw0KGgo…","size":16}
@@ -336,7 +337,7 @@ its start), at its vertices or its inner ones, at either end or both, or in its 
 line** turns each mark with the line's direction; the **Angle** turns it further, clockwise. Marks
 take the stroke's colour, its width as a hash mark's line (or a marker's outline, by command), and
 its offset to either side. Stack them with line strokes: a casing, a core and ticks across it. A
-marker can also be an image, by command (`"image"`, a PNG or JPEG as base64, at most 2 MiB): as
+marker can also be an image, by command (`"image"`, a PNG or JPEG as base64 of at most 2 MiB): as
 wide as its **Size** and as tall as its proportions make it, turned with the line, the stroke's
 colour and outline left out; selected, each is framed. An image a file gave that can't be drawn
 (too large to keep, or one that doesn't decode) shows as a circle; changing the strokes in the
@@ -684,10 +685,20 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   own `"abbreviations"`, which go first) and tried again; still too long, it is left out. A name
   that takes more than a third of the line goes on its straightest stretch rather than at the
   middle: the stretch whose ends are farthest apart for its length. With other places along the
-  line on, the next straightest stretches are its other places. Text size by a stream's
-  importance (a Strahler order or a class field) comes from label classes or `labels.by` `"size"`
-  (`labels.placement={"layer": "Rivers", "position": "curved", "fit": "auto", "abbreviations":
-  {"Creek": "Ck"}}`).
+  line on, the next straightest stretches are its other places. On a line with room to spare
+  (more than three times the name), the letters are spread, more as the room grows, toward
+  `"stretch"` of the line (`labels.style`, 0.1 to 1; 0.6 by default), which they reach on a line
+  six times the name or longer (a `"stretch"` under a sixth spreads only once the line is more
+  than 1/`"stretch"` times the name). They are never more than three letters' widths apart, so on
+  a much longer line the name covers less. A spread name is tried at the middle first, then
+  farther along; where it can't follow the line, it is set close. A spread name follows a
+  smoother course, so it can also go where the close-set name was too bent to follow. With a
+  `repeat`, a line more than two spread names long gets the spread name at its middle and the
+  close-set name at the repeats clear of it, as a river is named along its valley and again
+  toward its ends; a shorter line keeps its repeats close-set.
+  Text size by a stream's importance (a Strahler order or a class field) comes from label classes
+  or `labels.by` `"size"` (`labels.placement={"layer": "Rivers", "position": "curved", "fit":
+  "auto", "abbreviations": {"Creek": "Ck"}}`).
 - **Lock** keeps the labelled features fixed while you pan and zoom; **Pause** stops drawing
   labels for faster navigation; **View Unplaced** draws the labels that didn't fit in red. They
   apply to the whole map, so they are on the ribbon (Labeling › Map Labeling), not in the pane.

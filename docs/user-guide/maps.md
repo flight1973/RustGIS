@@ -132,6 +132,14 @@ features (not one read a view at a time), with a name of its own; it follows the
 and when it is removed, or a project opens without it, the walls are `color` (said) until a
 polygon layer of that name comes back. A plain `"walls": "#RRGGBB"` takes the layer off.
 
+`"shape": "circle"` cuts a round block: the largest circle inside the box (the DEM's extent or
+`"extent"`), centred in it, or a smaller one with `"radius"` (map units; one larger than the
+box's circle takes the box's). It reads the same at any bearing, which suits a figure that
+turns or an orbit. Only the ground inside the circle is drawn and sets the base, and the wall
+runs round its near half, with everything a box's walls have: colour, a walls layer's units and
+their patterns (which run on round the wall), light and fog. `"shape": "box"` (the default)
+takes it back to the box.
+
 **Water** on the terrain lies flat: `map.terrain` with `{"water": {"layer": "Lakes"}}` names a
 polygon layer of water bodies, and inside each polygon the ground is level, at the lowest height
 of the DEM along its shore, instead of rising and falling with a surface model that is noisy or
@@ -684,8 +692,10 @@ System** dialog, which also takes a projected EPSG code (such as `3035`, `32633`
 33N or `2056` for Switzerland) or an ESRI code, the one `.prj` files and ArcGIS name (such as
 `ESRI:102033` for South America Albers Equal Area Conic, or `ESRI:54030` for World Robinson). A
 code whose projection method RustGIS can't compute is refused with the reason, rather than drawn
-in another projection. Projections and datum transformations are computed by
-[terrio-crs](https://github.com/opengeos/terrio), as PROJ 9.8 computes them. On the desktop, the
+in another projection. The codes are those of the EPSG registry v13.102 and PROJ 9.9.0's ESRI
+codes, so a system added to EPSG recently (such as `11476`, SIRGAS-Chile 2025 / UTM zone 19S) is
+there too. Projections and datum transformations are computed by
+[terrio-crs](https://github.com/opengeos/terrio), as PROJ 9.9.0 computes them. On the desktop, the
 command line, Python and the phone apps, datum shift grids are read from RustGIS's own grid folder
 (`datum-grids` in its app data), then from those PROJ and terrio use on the computer
 (`TERRIO_GRID_DIR`, `PROJ_DATA`, `PROJ_LIB`, PROJ's user folder, terrio's download cache), so grids
@@ -760,6 +770,31 @@ so EPSG:8857 (Equal Earth) works too. So is the sinusoidal projection, on a sphe
 ellipsoid: MODIS rasters, whose GeoTIFFs give it as their own projection, open and draw, and
 World, Sphere and Africa Sinusoidal (`ESRI:54008`, `53008`, `102011`) can be the map's.
 
+### Finding a coordinate system
+
+The coordinate system boxes of the Coordinate System dialog, Define Projection, the Shapefile, DXF
+and CSV imports, the measured grid, **Settings › Start-up › Projection** and the analysis
+environment search as you type. A box finds a system by its code (`3035`, `EPSG:3035`,
+`esri:102033`), by words of its name (`lv95`, `utm 32n wgs`), by its projection method (`albers`,
+`oblique mercator`) or by its area of use (`switzerland`), and lists the matches under the box: the
+systems you used last first (the ten last applied, kept between sessions), the map's own
+projections by name where the box sets the map (`robinson`), then the EPSG and ESRI systems. Among
+equal matches, names whose words begin with the words typed come first (`lambert 93` finds
+Lambert-93 before ISN93 / Lambert 1993), then WGS 84 and ETRS89 systems, and a plain system before
+its axis-order variants.
+
+↑/↓ move through the list, Enter or a click takes a system, and Escape closes the list. In a
+dialog, taking a system fills the box, and Apply or OK confirms the dialog; Enter on a code typed in
+full, such as `2263` or `EPSG:2263`, takes it and confirms the dialog at once. In the graticule and
+start-up menus a system taken applies at once; in the analysis environment, **Set Coordinate
+System** applies it.
+
+Enter in an empty box leaves it empty (no system, or the map's own for the measured grid) unless ↑
+or ↓ chose a row. A box for the map, the measured grid or the analysis environment lists projected
+systems only. Text the list doesn't hold, such as WKT or a PROJ string, is used as typed. A system
+is remembered once it is applied or its import starts; **Clear** beside **Recently used** in the
+Coordinate System dialog forgets them all.
+
 ## Globe
 
 <figure markdown="span">
@@ -802,7 +837,8 @@ picking one shows it:
 - **Latitude and Longitude** (the default): parallels and meridians, more of them as you zoom in.
 - **Measured Grid**: eastings and northings in a projected coordinate system, at a round interval
   that suits the scale (about eight lines across the view), as a layout's measured grid draws them.
-  The system is the one typed under **Measured grid's coordinate system** (an EPSG code such as
+  The system is the one chosen under **Measured grid's coordinate system** (found by name or
+  code, see [Finding a coordinate system](#finding-a-coordinate-system); an EPSG code such as
   `2056`, WKT or a PROJ string; `"crs"` in the command); left empty, it is the map's own when the
   map is projected, else the WGS 84 UTM zone at the centre of the view. A system that can't be read
   or is geographic is refused, with a message naming it.
