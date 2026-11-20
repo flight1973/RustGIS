@@ -306,7 +306,7 @@ fn reads_a_feature_class_with_fields_nulls_and_holes() {
 fn a_field_name_that_isnt_utf16_is_said() {
     let fields = [F::Oid, F::Text("Qname")];
     let rows = vec![vec![V::Text(Some("a"))]];
-    let notice = "of its field names, aliases or coordinate system couldn't be read";
+    let notice = "of its field names or aliases couldn't be read";
     // A clean name: nothing said.
     let files = geodatabase(vec![("Clean", table(0, &fields, &rows))]);
     let layers = read_files(&files).unwrap();
@@ -319,6 +319,25 @@ fn a_field_name_that_isnt_utf16_is_said() {
     let (ds, report) = &layers[0];
     assert_eq!(ds.fields[1].name, "\u{FFFD}name");
     assert!(report.messages.iter().any(|m| m == &format!("1 character {notice}: replaced or left out")), "{:?}", report.messages);
+}
+
+/// A coordinate system's WKT that isn't all UTF-16 is said only when the WKT places the layer:
+/// a code (WKID 4326) placing it instead leaves it unread, and nothing is said.
+#[test]
+fn a_coordinate_systems_unreadable_wkt_is_said_only_when_it_is_read() {
+    let fields = [F::Oid, F::Shape { z: false, wkt: LONLAT }];
+    let rows = vec![vec![V::Blob(polygon(&square(20.0, 20.0, 5.0)))]];
+    let notice = "1 character of its coordinate system (WKT) couldn't be read: replaced or left out";
+    let (clean, x) = table(4, &fields, &rows);
+    // The first letter of its name, GCS_WGS_1984, made a lone surrogate (D800).
+    let mut t = clean.clone();
+    let at = t.windows(8).position(|w| w == utf16_bytes("GCS_").as_slice()).unwrap();
+    t[at..at + 2].copy_from_slice(&[0x00, 0xD8]);
+    let said = |wkid: Option<u32>, t: &[u8]| read_table("places", t, &x, wkid).unwrap().unwrap().1.messages;
+    assert!(said(None, &t).iter().any(|m| m == notice), "{:?}", said(None, &t));
+    assert!(said(Some(4326), &t).iter().all(|m| !m.contains("couldn't be read")), "{:?}", said(Some(4326), &t));
+    // A clean WKT: nothing said either way.
+    assert!(said(None, &clean).iter().all(|m| !m.contains("couldn't be read")), "{:?}", said(None, &clean));
 }
 
 #[test]

@@ -222,15 +222,7 @@ pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadRe
     use crate::raster::planetary;
     // By its code, unless the WKT is read in its place ([`esri_wkt_over_code`]); else from the WKT.
     let over_code = esri_wkt_over_code(code, wkt);
-    let by_code = if over_code.is_some() {
-        None
-    } else {
-        code.and_then(crs_of_code).and_then(|c| match c.transformer() {
-            Ok(t) if c != Crs::LonLat => Some((Some(c), Some(t))),
-            Ok(_) => Some((None, None)),
-            Err(_) => None,
-        })
-    };
+    let by_code = if over_code.is_some() { None } else { code_crs(code) };
     Ok(match (by_code, wkt) {
         (Some(by_code), _) => {
             // A grid the WKT gives isn't applied by the code, which is said for any code (as for a
@@ -278,6 +270,21 @@ pub(crate) fn esri_crs(code: Option<u32>, wkt: Option<&str>, report: &mut ReadRe
     })
 }
 
+/// The coordinate system `code` gives and its transformer (`None`, `None` for longitude/latitude),
+/// or `None` when it gives none that can be used.
+fn code_crs(code: Option<u32>) -> Option<(Option<Crs>, Option<Transformer>)> {
+    code.and_then(crs_of_code).and_then(|c| match c.transformer() {
+        Ok(t) if c != Crs::LonLat => Some((Some(c), Some(t))),
+        Ok(_) => Some((None, None)),
+        Err(_) => None,
+    })
+}
+
+/// Whether [`esri_crs`] places data by `code` rather than by reading `wkt`.
+fn placed_by_code(code: Option<u32>, wkt: Option<&str>) -> bool {
+    esri_wkt_over_code(code, wkt).is_none() && code_crs(code).is_some()
+}
+
 /// Esri data's `wkt` read in place of its `code`, as a `.prj` is read in place of its own
 /// `AUTHORITY` ([`read_wkt_over_code`](crate::raster::wkt::read_wkt_over_code), which gives the
 /// three cases): when it gives another shift to WGS 84 than an EPSG code's, or is another body's
@@ -305,9 +312,9 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
     let table = Table::parse(t)?;
     let rows = row_offsets(x)?;
     let mut report = ReadReport::default();
+    let chars = |n: usize| if n == 1 { "1 character".to_string() } else { format!("{n} characters") };
     if table.unreadable > 0 {
-        let chars = if table.unreadable == 1 { "1 character".to_string() } else { format!("{} characters", table.unreadable) };
-        report.messages.push(format!("{chars} of its field names, aliases or coordinate system couldn't be read: replaced or left out"));
+        report.messages.push(format!("{} of its field names or aliases couldn't be read: replaced or left out", chars(table.unreadable)));
     }
     let layer_type = match table.shape {
         _ if table.geometry.is_none() => GeometryType::None,
@@ -318,7 +325,14 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
         Shape::Other(code) => return Err(DataError::Unsupported(format!("geometry type {code}"))),
     };
     let wkt = table.geometry.as_ref().map(|g| g.wkt.as_str()).filter(|w| !w.is_empty() && !w.starts_with('{'));
-    let (crs, to_lonlat) = esri_crs(wkid.filter(|_| table.geometry.is_some()), wkt, &mut report)?;
+    let code = wkid.filter(|_| table.geometry.is_some());
+    // What of the kept geometry field's WKT couldn't be read matters only when the WKT, not the
+    // code, places the layer.
+    let wkt_unreadable = table.geometry.as_ref().map_or(0, |g| g.wkt_unreadable);
+    if wkt_unreadable > 0 && wkt.is_some() && !placed_by_code(code, wkt) {
+        report.messages.push(format!("{} of its coordinate system (WKT) couldn't be read: replaced or left out", chars(wkt_unreadable)));
+    }
+    let (crs, to_lonlat) = esri_crs(code, wkt, &mut report)?;
     // The attribute fields: every field but the geometry, and the object ID first.
     let mut fields: Vec<Field> = Vec::new();
     let mut columns: Vec<usize> = Vec::new();
@@ -627,6 +641,8 @@ struct FieldDef {
 #[derive(Clone, Debug)]
 struct GeomDef {
     wkt: String,
+    /// Characters of `wkt` that couldn't be read.
+    wkt_unreadable: usize,
     x0: f64,
     y0: f64,
     xy_scale: f64,
@@ -654,7 +670,7 @@ struct Table {
     utf8: bool,
     /// How many fields have a bit in each row's null flags.
     nullable: usize,
-    /// Characters of its field names, aliases and coordinate system that couldn't be read.
+    /// Characters of its field names and aliases that couldn't be read.
     unreadable: usize,
     /// The geometries carry Z values (which reading drops, but a multipatch keeps as fields).
     has_z: bool,
@@ -728,7 +744,8 @@ impl Table {
                         c.skip(1)?;
                         let flag = c.u8()?;
                         let n = usize::try_from(c.i16()?).ok()?;
-                        let wkt = text16(c.bytes(n)?);
+                        // Counted apart: said only if the WKT is what places the layer.
+                        let (wkt, wkt_unreadable) = crate::io::utf16_text(c.bytes(n)?, false);
                         let g = c.u8()?;
                         let (z, m) = (g & 2 != 0, g & 4 != 0);
                         let (x0, y0, xy_scale) = (c.f64()?, c.f64()?, c.f64()?);
@@ -752,7 +769,7 @@ impl Table {
                         if !usable(xy_scale) || !x0.is_finite() || !y0.is_finite() || (z && (!usable(z_scale) || !z0.is_finite())) {
                             return None;
                         }
-                        geom = Some(GeomDef { wkt, x0, y0, xy_scale, z0, z_scale });
+                        geom = Some(GeomDef { wkt, wkt_unreadable, x0, y0, xy_scale, z0, z_scale });
                         flag
                     }
                     Kind::Binary | Kind::Guid | Kind::GlobalId | Kind::Xml => {
