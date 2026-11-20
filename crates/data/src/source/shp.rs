@@ -331,8 +331,9 @@ impl FeatureSource for ShpSource {
             unread_dates,
             rounded_dates: Vec::new(),
             null_text,
-            // A sampled read visits only some of the matches, so its count is of those.
-            notes: boxed_off_note(boxed_off, !late && !complete),
+            // A sampled read visits only some of the matches, so its count is of those; a late one
+            // visits the whole layer, so its count is of the layer.
+            notes: boxed_off_note(boxed_off, !late && !complete, late),
         })
     }
     fn streams_chunks(&self) -> bool {
@@ -349,6 +350,8 @@ impl FeatureSource for ShpSource {
             return Ok(Batch { complete: true, ..Batch::default() });
         }
         let bounds = extent.map(|e| [e.min_x as f32, e.min_y as f32, e.max_x as f32, e.max_y as f32]);
+        // As in `read`, an extent the file's system couldn't bound (#1925) visits every record.
+        let late = req.extent.is_some() && bounds.is_none();
         let mut shp = Cursor::open(&self.shp)?;
         let mut dbf = Cursor::open(&self.dbf)?;
         let mut buf = Vec::new();
@@ -423,7 +426,7 @@ impl FeatureSource for ShpSource {
             unread_dates,
             rounded_dates: Vec::new(),
             null_text,
-            notes: boxed_off_note(boxed_off, false),
+            notes: boxed_off_note(boxed_off, false, late),
         })
     }
 }
@@ -433,13 +436,20 @@ impl FeatureSource for ShpSource {
 /// the points, so the layer's extent and its index still take in those boxes. A backwards stored
 /// box over such a point isn't counted here: the index can't frame it from the points, so it's
 /// left out of the extent and counted with the shapes that have no usable box. A `sampled` read visited only some of the matches, so its count is of
-/// the shapes it read, not of the layer.
-fn boxed_off_note(n: u64, sampled: bool) -> Vec<String> {
+/// the shapes it read, not of the layer. A `late` read (an area the layer's system couldn't bound,
+/// #1925) visited every record and can't place a NaN shape's stored box in the area, so its count
+/// is of the whole layer, and says so.
+fn boxed_off_note(n: u64, sampled: bool, late: bool) -> Vec<String> {
     if n == 0 {
         return Vec::new();
     }
-    let what =
-        if sampled { format!("{n} of the shapes read (a sample of the layer, which may hold more)") } else { format!("{n} shape(s)") };
+    let what = if sampled {
+        format!("{n} of the shapes read (a sample of the layer, which may hold more)")
+    } else if late {
+        format!("{n} shape(s) in the layer (a count of the whole layer, as the area couldn't be placed in its coordinates)")
+    } else {
+        format!("{n} shape(s)")
+    };
     vec![format!(
         "{what} have a coordinate that isn't a number under a bounding box that is one: they're left out of the read, but the layer's extent and its index still take in their stored boxes"
     )]

@@ -644,6 +644,65 @@ fn shapefile_record_past_the_cap_is_skipped_not_allocated() {
     std::fs::remove_dir_all(fixture).unwrap();
 }
 
+/// An area the layer's system can't bound (#1925) visits every record, so a NaN shape's stored box
+/// can't be placed in it: the note on such a read counts the whole layer and says so, rather than
+/// claiming the shapes for the area. Here, a UTM zone 17 layer of three lines near 40° N, two with
+/// a NaN point, read by a view reaching past 90° from the zone's meridian that holds none of them;
+/// the same file without the NaN points says nothing.
+#[test]
+fn a_nan_shape_outside_an_area_its_system_cant_bound_is_counted_as_of_the_layer() {
+    let fixture = dir();
+    cache::with_index_dir(fixture.join("cache"), || {
+        let crs = crate::source::Crs::from_epsg(32617).unwrap();
+        let write = |name: &str| {
+            let mut ds = Dataset::new("roads", GeometryType::Polyline, vec![]);
+            for k in 0..3 {
+                let k = f64::from(k);
+                ds.push(Some(Geometry::Line(vec![vec![Coord::new(-82.0 + k, 40.0 + k), Coord::new(-81.5 + k, 40.5 + k)]])), vec![]);
+            }
+            let p = fixture.join(name);
+            crate::io::write_path_in(&ds, &p, crs).unwrap();
+            p
+        };
+        let view = Extent::new(-120.0, -30.0, 10.0, 30.0);
+        let r = Reproject::from_crs(crs, &mut Vec::new());
+        assert!(r.extent_from_lonlat(&view).is_none(), "the view's edge is refused");
+        const SAID: &str = "have a coordinate that isn't a number under a bounding box that is one";
+        let said = |notes: &[String]| notes.iter().filter(|n| n.contains(SAID)).cloned().collect::<Vec<_>>();
+        let reads = |src: &dyn FeatureSource| {
+            let read = src.read(&Request { extent: Some(view), ..Request::all() }).unwrap();
+            let mut kept = 0;
+            let chunked = src
+                .visit_chunks(Some(view), 1 << 20, &mut |f| {
+                    kept += f.len();
+                    Ok(())
+                })
+                .unwrap();
+            ((read.features.len(), read.skipped, said(&read.notes)), (kept, chunked.skipped, said(&chunked.notes)))
+        };
+        let clean = open_path(&write("clean.shp"), None).unwrap();
+        assert_eq!(reads(clean.as_ref()), ((0, 0, Vec::new()), (0, 0, Vec::new())));
+        // The first two records' first x (each record 8 + 80 bytes; content at 108 + 88k, its
+        // first x 48 bytes in), their stored boxes left as they are.
+        let p = write("nan.shp");
+        let mut b = std::fs::read(&p).unwrap();
+        for at in [156, 244] {
+            b[at..at + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+        }
+        std::fs::write(&p, b).unwrap();
+        let src = open_path(&p, None).unwrap();
+        // Every record is visited, so the NaN shapes can't be ruled out of the area: both reads
+        // skip them, and the note says its count is of the layer, not of the area.
+        let layer = vec![format!(
+            "2 shape(s) in the layer (a count of the whole layer, as the area couldn't be placed in its coordinates) {SAID}: they're left out of the read, but the layer's extent and its index still take in their stored boxes"
+        )];
+        assert_eq!(reads(src.as_ref()), ((0, 2, layer.clone()), (0, 2, layer)));
+        // A whole read keeps its plain count.
+        assert_eq!(said(&src.read(&Request::all()).unwrap().notes).first().map(|n| n.starts_with("2 shape(s) have")), Some(true));
+    });
+    std::fs::remove_dir_all(fixture).unwrap();
+}
+
 /// A line with a coordinate that isn't a number under a stored box that is one: the index takes
 /// the stored box (the points aren't read to build it), and a read leaves the line out. Both
 /// reads, sampled and in chunks, count it and say so, once with its count, whole or by area; a
