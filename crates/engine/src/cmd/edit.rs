@@ -802,9 +802,10 @@ fn add_field(s: &mut Session, p: &Json) -> CmdResult {
 /// `2026-03-05T14:30:00+02:00`, or with a space for the `T`). A date field
 /// also takes a date-time at midnight without a zone. Values that aren't dates become null, said
 /// with their count and the first few, and undo brings them back; digits past the microsecond are
-/// rounded off, and said. A field with text and none of it a date is refused and stays text. Refused while a data design
-/// (domain, subtype, contingent values) names the field or a definition query or display filter
-/// would stop reading with it. Layer and table conversions run on the desktop worker
+/// rounded off, and said. A field with text and none of it a date is refused and stays text.
+/// Refused while a data design (a domain, subtypes, a subtype default, contingent values or a
+/// calculation rule) names the field, judged by the field the name reads (the first so named
+/// ignoring case), or a definition query or display filter would stop reading with it. Layer and table conversions run on the desktop worker
 /// ([`table_ahead`]), with progress and Cancel; a layer read in place is refused as every
 /// `edit.*` command is. The shared rows' first copy cannot be interrupted.
 fn convert_field(s: &mut Session, p: &Json) -> CmdResult {
