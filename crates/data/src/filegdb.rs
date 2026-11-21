@@ -383,6 +383,8 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
     let mut decoded = 0usize;
     let mut unread_dates = Vec::new();
     let mut rounded_dates = Vec::new();
+    // Characters of the text values kept that couldn't be read.
+    let mut bad_text = 0usize;
     let mut budget = MAX_TABLE_FACES;
     for (row, offset) in rows {
         crate::progress::step(1)?;
@@ -398,6 +400,7 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
             if values.get(c).is_some_and(|v| v.rounded_date) {
                 crate::source::unread_date(&mut rounded_dates, k);
             }
+            bad_text += values.get(c).map_or(0, |v| v.bad_chars);
             attrs.push(match table.fields.get(c).map(|f| f.kind) {
                 Some(Kind::ObjectId) => Value::Int(i64::try_from(row).unwrap_or(i64::MAX)),
                 // Taken, not cloned: each column is read once, and the geometry's blob stays.
@@ -436,6 +439,10 @@ fn read_table(name: &str, t: &[u8], x: &[u8], wkid: Option<u32>) -> Result<Optio
             (g, _) => g,
         };
         ds.push_next(geometry, attrs);
+    }
+    if bad_text > 0 {
+        let chars = if bad_text == 1 { "1 character".to_string() } else { format!("{bad_text} characters") };
+        report.messages.push(format!("{chars} of its text values couldn't be read: replaced"));
     }
     let rounded: usize = rounded_dates.iter().sum();
     if rounded > 0 {
@@ -577,8 +584,17 @@ impl<'a> Cur<'a> {
     }
 }
 
-fn utf16(b: &[u8]) -> String {
-    crate::io::utf16_text(b, false).0
+/// UTF-8 text, and how many runs of bytes that aren't UTF-8 were each replaced (U+FFFD).
+fn utf8_text(b: &[u8]) -> (String, usize) {
+    let (mut text, mut bad) = (String::with_capacity(b.len()), 0);
+    for chunk in b.utf8_chunks() {
+        text.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            text.push(char::REPLACEMENT_CHARACTER);
+            bad += 1;
+        }
+    }
+    (text, bad)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -686,6 +702,8 @@ struct Table {
 struct Cell<'a> {
     /// A stored, non-null date was invalid; the table read counts it by field.
     invalid_date: bool,
+    /// Characters of a text value that couldn't be read (replaced).
+    bad_chars: usize,
     rounded_date: bool,
     value: Value,
     blob: Option<&'a [u8]>,
@@ -825,11 +843,13 @@ impl Table {
         for f in &self.fields {
             let null = f.null_bit.is_some_and(|bit| nulls.get(bit / 8).is_some_and(|b| b >> (bit % 8) & 1 == 1));
             if null || f.kind == Kind::ObjectId {
-                out.push(Cell { value: Value::Null, blob: None, invalid_date: false, rounded_date: false });
+                out.push(Cell { value: Value::Null, blob: None, invalid_date: false, rounded_date: false, bad_chars: 0 });
                 continue;
             }
-            let text = |b: &[u8]| if self.utf8 { String::from_utf8_lossy(b).into_owned() } else { utf16(b) };
-            let cell = |value: Value| Cell { value, blob: None, invalid_date: false, rounded_date: false };
+            // Text and how many of its characters couldn't be read: UTF-16, or UTF-8 in a table
+            // that says so.
+            let text = |b: &[u8]| if self.utf8 { utf8_text(b) } else { crate::io::utf16_text(b, false) };
+            let cell = |value: Value| Cell { value, blob: None, invalid_date: false, rounded_date: false, bad_chars: 0 };
             let date_cell = |days: f64, offset: Option<i16>, only: bool| {
                 let value = match gdb_datetime(days, offset) {
                     Value::DateTime(t) if only && t.is_date() => Value::Date(t.date()),
@@ -837,7 +857,7 @@ impl Table {
                     v => v,
                 };
                 let rounded_date = !value.is_null() && serial_rounds(days);
-                Cell { invalid_date: value.is_null(), rounded_date, value, blob: None }
+                Cell { invalid_date: value.is_null(), rounded_date, value, blob: None, bad_chars: 0 }
             };
             out.push(match f.kind {
                 Kind::Int16 => cell(Value::Int(i64::from(c.i16()?))),
@@ -847,7 +867,8 @@ impl Table {
                 Kind::Float64 => cell(float(c.f64()?)),
                 Kind::Text | Kind::Xml => {
                     let n = usize::try_from(c.varuint()?).ok()?;
-                    cell(Value::Text(text(c.bytes(n)?)))
+                    let (value, bad_chars) = text(c.bytes(n)?);
+                    Cell { bad_chars, ..cell(Value::Text(value)) }
                 }
                 Kind::Date => date_cell(c.f64()?, None, false),
                 Kind::DateOnly => date_cell(c.f64()?, None, true),
@@ -860,7 +881,7 @@ impl Table {
                 Kind::Guid | Kind::GlobalId => cell(Value::Text(guid(c.bytes(16)?))),
                 Kind::Geometry => {
                     let n = usize::try_from(c.varuint()?).ok()?;
-                    Cell { value: Value::Null, blob: Some(c.bytes(n)?), invalid_date: false, rounded_date: false }
+                    Cell { value: Value::Null, blob: Some(c.bytes(n)?), invalid_date: false, rounded_date: false, bad_chars: 0 }
                 }
                 Kind::Binary => {
                     let n = usize::try_from(c.varuint()?).ok()?;

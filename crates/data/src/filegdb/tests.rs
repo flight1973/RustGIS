@@ -321,6 +321,26 @@ fn a_field_name_that_isnt_utf16_is_said() {
     assert!(report.messages.iter().any(|m| m == &format!("1 character {notice}: replaced or left out")), "{:?}", report.messages);
 }
 
+/// A text value with bytes that aren't its encoding (UTF-8 in this table) is read with them
+/// replaced and said, once for the layer with the count; clean values say nothing.
+#[test]
+fn text_values_that_cant_be_read_are_said() {
+    let fields = [F::Oid, F::Text("name")];
+    let rows = vec![vec![V::Text(Some("Qval"))], vec![V::Text(Some("Qval"))]];
+    let notice = "of its text values couldn't be read: replaced";
+    let (clean, x) = table(0, &fields, &rows);
+    let said = |t: &[u8]| read_table("places", t, &x, None).unwrap().unwrap().1.messages;
+    assert!(said(&clean).iter().all(|m| !m.contains(notice)), "{:?}", said(&clean));
+    let mut t = clean.clone();
+    let mut from = 0;
+    for _ in 0..2 {
+        let at = from + t[from..].windows(4).position(|w| w == b"Qval").unwrap();
+        t[at] = 0xFF;
+        from = at + 4;
+    }
+    assert!(said(&t).iter().any(|m| m == &format!("2 characters {notice}")), "{:?}", said(&t));
+}
+
 /// The geometry field's name isn't kept as a field, so a character of it that can't be read isn't
 /// said; one of a field kept is.
 #[test]
