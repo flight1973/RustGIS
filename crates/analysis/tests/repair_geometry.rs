@@ -1284,7 +1284,7 @@ fn even_odd_says_what_it_did() {
     let (_, repairs, messages) = one_by("Even-Odd", poly(&[SQUARE, OUTSIDE]));
     assert_eq!(repairs, "hole_outside_shell, even_odd");
     let said = "holes not inside their exterior ring in 1 feature were combined by the Even-Odd rule";
-    assert!(messages.iter().any(|m| m.contains(said) && m.contains("is now area")), "{messages:?}");
+    assert!(messages.iter().any(|m| m.contains(said) && m.contains("is area, as a part, where no other ring covers it")), "{messages:?}");
     // A bowtie part with a square overlapping one lobe: the overlap is left out and said.
     let lobes: Ring = &[(0., 0.), (4., 4.), (4., 0.), (0., 4.), (0., 0.)];
     let (got, repairs, _) = one_by("Even-Odd", multi(&[&[lobes], &[&[(3., 1.), (6., 1.), (6., 3.), (3., 3.), (3., 1.)]]]));

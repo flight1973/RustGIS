@@ -319,7 +319,7 @@ fn notices(t: &Tally, field: &str, rule: Rule) -> Vec<String> {
     }
     if holes > 0 && rule == Rule::EvenOdd {
         messages.push(format!(
-            "{TOOL}: holes not inside their exterior ring in {} were combined by the Even-Odd rule: what of a hole lies outside its exterior ring is now area, as a part; what lies inside stays a hole",
+            "{TOOL}: holes not inside their exterior ring in {} were combined by the Even-Odd rule: what of a hole lies outside its exterior ring is area, as a part, where no other ring covers it too; what lies inside stays a hole",
             features(holes)
         ));
     }
