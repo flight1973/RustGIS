@@ -130,3 +130,39 @@ fn a_crs_or_subdataset_given_for_srtm_or_dted_is_said_and_ignored() {
     assert!(s.notices.iter().any(|n| n.text.ends_with(crs)), "{:?}", s.notices);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A project saved when SRTM and DTED went through GDAL keeps the coordinate system given then:
+/// reopened, it is said to be ignored once and isn't kept, so the project saved again opens
+/// without saying it.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_saved_crs_for_srtm_is_said_once_and_not_kept() {
+    let dir = std::env::temp_dir().join(format!("rustgis-elevation-saved-crs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let hgt = dir.join("N37W122.hgt");
+    std::fs::write(&hgt, hgt_tile()).unwrap();
+    let dt1 = dir.join("S45E006.dt1");
+    std::fs::write(&dt1, dt1_cell()).unwrap();
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema/fixtures/elevation_tiles.rgis");
+    let text = std::fs::read_to_string(fixture).unwrap();
+    assert!(text.contains(r#""crs":"EPSG:4326""#), "the fixture keeps a crs for the SRTM layer");
+    let text = text
+        .replace(r#""path":"N37W122.hgt""#, &format!("\"path\":{}", json!(hgt.display().to_string())))
+        .replace(r#""path":"S45E006.dt1""#, &format!("\"path\":{}", json!(dt1.display().to_string())));
+    let ignored = |s: &Session| s.notices.iter().filter(|n| n.text.contains("\"crs\" given is ignored")).count();
+    let crs = |s: &Session, name: &str| s.map().layer_by_name(name).and_then(|l| l.raster.as_ref()).map(|r| r.crs.clone());
+
+    let mut s = Session::new(Project::default());
+    s.run("project.openText", &json!({"text": text})).unwrap();
+    assert_eq!(ignored(&s), 1, "{:?}", s.notices);
+    assert_eq!(crs(&s, "N37W122"), Some(None));
+    assert_eq!(crs(&s, "S45E006"), Some(None));
+
+    // Saved again and reopened: nothing to say.
+    let saved = serde_json::to_string(&s.project).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.openText", &json!({"text": saved})).unwrap();
+    assert_eq!(ignored(&t), 0, "{:?}", t.notices);
+    assert!(t.map().layer_by_name("N37W122").and_then(|l| l.raster.as_ref()).and_then(|r| r.data.as_ref()).is_some());
+    std::fs::remove_dir_all(dir).unwrap();
+}
