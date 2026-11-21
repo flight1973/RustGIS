@@ -706,7 +706,9 @@ fn by_parity(parts: &[Vec<Vec<Coord>>], crossing: &[(usize, usize)], room: Room)
         if all.is_empty() {
             return Ok(Rebuilt { polys: Vec::new(), no_area, narrow, found, duplicates });
         }
-        on_grid(rings_of(&all))?;
+        // The overlay rounds the parts left to their own grid, finer where a distant sliver was
+        // dropped: that step, not the first, bounds what rounding can take from their area.
+        let step = on_grid(rings_of(&all))?;
         let given = all.len();
         let each: f64 = all.iter().map(Area::unsigned_area).sum();
         let length: f64 = rings_of(&all).map(|r| Euclidean.length(r)).sum();
@@ -879,8 +881,9 @@ const EXACT_SPAN: f64 = 1e100;
 /// The test is exact only where its products neither overflow nor underflow (Shewchuk's own
 /// condition; past it, an overflow's NaN reads as collinear and an underflow's 0 as on the line):
 /// so only within [`EXACT_SPAN`] of 0, and with no two coordinates closer than its inverse but
-/// equal, is a vertex taken for one mid-edge. Elsewhere it stays a corner. Real coordinates, in
-/// degrees, meters or feet, are well inside.
+/// equal, is a vertex on a slanted edge taken for one mid-edge. Elsewhere it stays a corner. Real
+/// coordinates, in degrees, meters or feet, are well inside. A horizontal or vertical edge needs no
+/// such test: its vertices share one coordinate exactly, at any size.
 fn straight_through(a: Coord, b: Coord, c: Coord) -> bool {
     use geo::kernels::{Kernel, Orientation, RobustKernel};
     let g = |p: Coord| geo::Coord { x: p.x, y: p.y };
@@ -892,12 +895,11 @@ fn straight_through(a: Coord, b: Coord, c: Coord) -> bool {
         && small(b)
         && small(c)
         && [(a.x, b.x), (a.x, c.x), (b.x, c.x), (a.y, b.y), (a.y, c.y), (b.y, c.y)].iter().all(|&(u, v)| apart(u, v));
-    exact
-        && b != a
-        && b != c
-        && within(a.x, b.x, c.x)
-        && within(a.y, b.y, c.y)
-        && RobustKernel::orient2d(g(a), g(b), g(c)) == Orientation::Collinear
+    let between = b != a && b != c && within(a.x, b.x, c.x) && within(a.y, b.y, c.y);
+    // On a horizontal or vertical edge, being on the line is the shared coordinate being equal:
+    // exact at any size, so the range above isn't needed there.
+    let level = (a.x == b.x && b.x == c.x) || (a.y == b.y && b.y == c.y);
+    between && (level || (exact && RobustKernel::orient2d(g(a), g(b), g(c)) == Orientation::Collinear))
 }
 
 /// The corners of an open ring: its vertices but those in the middle of a straight edge
@@ -1141,6 +1143,10 @@ mod tests {
         // A tiny coordinate beside ordinary ones, where the test's later stages would underflow: off
         // the line by 1e-400, which the test would read as 0.
         assert!(!straight_through(c(1e-200, -1.), c(0.5, -1e-200), c(1., 1.)), "a tiny coordinate");
+        // A horizontal or vertical edge is exact at any size: a midpoint at y = 1e-101, or far out.
+        assert!(straight_through(c(0., 1e-101), c(5., 1e-101), c(10., 1e-101)), "a tiny level edge");
+        assert!(straight_through(c(1e200, 0.), c(1e200, 5.), c(1e200, 10.)), "a far vertical edge");
+        assert!(!straight_through(c(0., 1e-101), c(12., 1e-101), c(10., 1e-101)), "past the end still counts");
         // Ordinary data, floating-point noise near 0 included, is within the test's range.
         assert!(straight_through(c(0., 0.), c(6e-17, 6e-17), c(1., 1.)));
         assert!(straight_through(c(-1e100, -1e100), c(0., 0.), c(1e100, 1e100)));

@@ -309,12 +309,17 @@ fn notices(t: &Tally, field: &str, rule: Rule) -> Vec<String> {
             Gone::NoArea.as_str()
         ));
     }
-    // What Shells Minus Holes does with a hole outside its ring and with overlapping parts; Even-Odd
-    // does otherwise, and its own notice says what.
+    // What each rule does with a hole outside its ring and with overlapping parts.
     let holes = t.count(Code::HoleOutsideShell);
     if holes > 0 && rule == Rule::ShellsMinusHoles {
         messages.push(format!(
             "{TOOL}: holes not inside their exterior ring were taken out of {}; what of a hole is inside its exterior ring stays a hole",
+            features(holes)
+        ));
+    }
+    if holes > 0 && rule == Rule::EvenOdd {
+        messages.push(format!(
+            "{TOOL}: holes not inside their exterior ring in {} were combined by the Even-Odd rule: what of a hole lies outside its exterior ring is now area, as a part; what lies inside stays a hole",
             features(holes)
         ));
     }
@@ -324,7 +329,7 @@ fn notices(t: &Tally, field: &str, rule: Rule) -> Vec<String> {
     }
     if merged > 0 && rule == Rule::EvenOdd {
         messages.push(format!(
-            "{TOOL}: the parts that overlapped or touched along a line in {} were combined by the Even-Odd rule, which leaves out where parts overlap, keeps a part repeated whole once, and joins parts that meet along a line",
+            "{TOOL}: the parts that overlapped or touched along a line in {} were combined by the Even-Odd rule, which keeps what an odd number of parts cover and leaves out what an even number cover, keeps a part repeated whole once, and joins parts that meet along a line",
             features(merged)
         ));
     }

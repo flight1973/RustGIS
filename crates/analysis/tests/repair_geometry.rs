@@ -1263,7 +1263,9 @@ fn an_unknown_rule_is_refused() {
     add(&mut l, Some(poly(&[BOWTIE])), "x");
     let e = rustgis_analysis::run("repairGeometry", &l, &json!({"input": "input", "rule": "Odd-Even"})).unwrap_err();
     assert!(e.contains("Shells Minus Holes") && e.contains("Even-Odd"), "{e}");
-    assert!(rustgis_analysis::run("repairGeometry", &l, &json!({"input": "input", "rule": "even-odd"})).is_ok());
+    // Lowercase picks Even-Odd itself, not a quiet fall back to the default: its notice says so.
+    let r = rustgis_analysis::run("repairGeometry", &l, &json!({"input": "input", "rule": "even-odd"})).unwrap();
+    assert!(r.messages.iter().any(|m| m.contains("rebuilt by the Even-Odd rule")), "{:?}", r.messages);
 }
 
 /// Under Even-Odd the notices say what Even-Odd did: not the default's "merged" or "taken out";
@@ -1274,6 +1276,15 @@ fn even_odd_says_what_it_did() {
     let (_, repairs, messages) = one_by("Even-Odd", multi(&[&[SQUARE], &[OVERLAPPING]]));
     assert_eq!(repairs, "parts_overlap, even_odd");
     assert!(!messages.iter().any(|m| m.contains("were merged") || m.contains("were taken out")), "{messages:?}");
+    // The overlap is said by parity: what an even number of parts cover is left out.
+    assert!(messages.iter().any(|m| m.contains("keeps what an odd number of parts cover")), "{messages:?}");
+    // No hole outside its ring here, so no notice of one; a hole outside its ring gets its own,
+    // counted, saying it became area.
+    assert!(!messages.iter().any(|m| m.contains("holes not inside their exterior ring")), "{messages:?}");
+    let (_, repairs, messages) = one_by("Even-Odd", poly(&[SQUARE, OUTSIDE]));
+    assert_eq!(repairs, "hole_outside_shell, even_odd");
+    let said = "holes not inside their exterior ring in 1 feature were combined by the Even-Odd rule";
+    assert!(messages.iter().any(|m| m.contains(said) && m.contains("is now area")), "{messages:?}");
     // A bowtie part with a square overlapping one lobe: the overlap is left out and said.
     let lobes: Ring = &[(0., 0.), (4., 4.), (4., 0.), (0., 4.), (0., 0.)];
     let (got, repairs, _) = one_by("Even-Odd", multi(&[&[lobes], &[&[(3., 1.), (6., 1.), (6., 3.), (3., 3.), (3., 1.)]]]));
