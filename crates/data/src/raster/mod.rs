@@ -1619,7 +1619,7 @@ fn read_scan_limited<R: std::io::BufRead + std::io::Seek>(name: &str, mut source
     };
     let (w, h) = (img.width(), img.height());
     let ch = usize::from(img.color().channel_count());
-    // The step an elevation tile is read at, the budget shared by the channels: a × ch > max
+    // The step a picture is read at to fit the budget, shared by its channels: a × ch > max
     // exactly when a > ⌊max / ch⌋.
     let k = step_within(w as usize, h as usize, max / ch.max(1)).and_then(|k| u32::try_from(k).ok()).ok_or_else(too_large)?;
     let (bands, color, data_type) = match &img {
