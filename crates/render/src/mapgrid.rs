@@ -257,8 +257,9 @@ fn zones(center: Coord, shown: &[Coord], around: &[Coord], mgrs: bool) -> GridLi
 /// another type. Zoomed out, or while the 100 km squares are too small on the screen to name, each
 /// grid zone designation in view is named (`33U`) at the middle of what shows of it; zoomed in,
 /// each 100 km square of each one, by its letters (`VP`), with its grid zone designation (`33U VP`)
-/// when more than one is in view. A label goes only where all of it stays within its zone and
-/// square and the view, so a zone or square cut too small isn't named. Nothing is named in the polar
+/// when more than one is in view. A label goes only where its corners, edge middles and center all
+/// stay within its zone and square and the view (a sample, [`label_fits`]), so a zone or square cut
+/// too small isn't named. Nothing is named in the polar
 /// areas (UPS). `width` measures a text across in points at [`LABEL_PT`].
 pub(crate) fn labels(map: &Map, view: &View, width: impl Fn(&str) -> f32) -> Vec<(String, f32, f32)> {
     if map.graticule_type != GraticuleType::Mgrs {
