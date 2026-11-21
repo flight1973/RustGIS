@@ -132,7 +132,7 @@ pub fn commands() -> Vec<C> {
             if !remove && r.fields.len() >= MAX_ITEMS && !r.fields.iter().any(|f| f.eq_ignore_ascii_case(&field)) {
                 return Err(format!("a report lists at most {MAX_ITEMS} fields"));
             }
-            toggle(&mut r.fields, field, remove);
+            toggle(&mut r.fields, field, remove, "field")?;
             Ok(json!({"fields": r.fields}))
         }).inputs(layer_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_report)
@@ -140,12 +140,15 @@ pub fn commands() -> Vec<C> {
         C::new("report.autofill", "Autofill Fields", "Data › Data Design", |s, p| {
             let i = index(s, p)?;
             let ds = &layer_of(s, i)?.dataset;
-            let FilledIn { names, twins, clean: all } = filled_in(ds);
+            let all = ds.fields.len();
+            let FilledIn { names, twins } = filled_in(ds);
+            let full = names.len() >= MAX_ITEMS && all > MAX_ITEMS;
             let r = s.project.reports.get_mut(i).ok_or("no report")?;
             r.fields = names;
             let (answer, report) = (json!({"fields": r.fields}), r.name.clone());
-            // A layer with more fields than a report takes: the first are filled in, and that is said (#1896).
-            if all > MAX_ITEMS {
+            // A layer with more fields than a report takes: the first are filled in, and that is
+            // said (#1896), with the layer's own count of fields.
+            if full {
                 s.notify(format!("{report}: the first {MAX_ITEMS} of the layer's {all} fields are filled in"), false);
             }
             if let Some(note) = twins_left_out(&report, &twins) {
@@ -173,6 +176,7 @@ pub fn commands() -> Vec<C> {
                 }
                 (None, false) if r.stats.len() < MAX_ITEMS => r.stats.push(Stat { field, kind }),
                 (None, false) => return Err("the report has too many statistics".into()),
+                (None, true) => return Err(format!("the report has no {} statistic of '{field}'", kind.label().to_lowercase())),
                 _ => {}
             }
             Ok(json!({"stats": r.stats.len()}))
@@ -186,7 +190,7 @@ pub fn commands() -> Vec<C> {
             if !remove && r.groups.len() >= MAX_GROUPS && !r.groups.iter().any(|g| g.eq_ignore_ascii_case(&field)) {
                 return Err(format!("reports group by at most {MAX_GROUPS} fields"));
             }
-            toggle(&mut r.groups, field, remove);
+            toggle(&mut r.groups, field, remove, "group")?;
             Ok(json!({"groups": r.groups}))
         }).inputs(layer_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .when(need_report)
@@ -302,33 +306,30 @@ fn optional_field(input: &impl super::InputSource, p: &Value) -> Result<(usize, 
 struct FilledIn {
     /// The first [`MAX_ITEMS`] fields without a case twin.
     names: Vec<String>,
-    /// The fields with a case twin among those looked at before the report was full, left out as
-    /// report.field refuses them (#1955).
+    /// The fields with a case twin, all of them, left out as report.field refuses them (#1955).
     twins: Vec<String>,
-    /// How many of the layer's fields have no case twin.
-    clean: usize,
 }
 
 /// The most twins a notice names; the rest are counted.
 const TWINS_NAMED: usize = 20;
 
-/// The first [`MAX_ITEMS`] of a layer's fields without a case twin, in one pass over the fields to
-/// find twins (their names in lower case) and one to pick, which stops once the report is full.
+/// The first [`MAX_ITEMS`] of a layer's fields without a case twin, and every field with one: in
+/// one pass over the fields to find twins (their names in lower case), and one to pick.
 fn filled_in(ds: &rustgis_data::Dataset) -> FilledIn {
     let mut named: HashMap<String, usize> = HashMap::with_capacity(ds.fields.len());
     for f in &ds.fields {
         *named.entry(f.name.to_ascii_lowercase()).or_default() += 1;
     }
     let twin = |n: &str| named.get(&n.to_ascii_lowercase()).is_some_and(|c| *c > 1);
-    let clean = named.values().filter(|c| **c == 1).count();
     let (mut names, mut twins) = (Vec::new(), Vec::new());
     for f in &ds.fields {
-        if names.len() >= MAX_ITEMS {
-            break;
+        if twin(&f.name) {
+            twins.push(f.name.clone());
+        } else if names.len() < MAX_ITEMS {
+            names.push(f.name.clone());
         }
-        if twin(&f.name) { twins.push(f.name.clone()) } else { names.push(f.name.clone()) }
     }
-    FilledIn { names, twins, clean }
+    FilledIn { names, twins }
 }
 
 /// The notice for the fields [`filled_in`] left out of report `report`, if any: the first
@@ -352,15 +353,18 @@ fn stored(input: &impl super::InputSource, p: &Value) -> Result<(usize, String),
 
 /// Adds `field` to `list`, or removes it: the entry named exactly so, else the first named so
 /// ignoring case.
-fn toggle(list: &mut Vec<String>, field: String, remove: bool) {
+/// Removing one the list doesn't hold is an error naming it, `what` saying which list.
+fn toggle(list: &mut Vec<String>, field: String, remove: bool, what: &str) -> Result<(), String> {
     let at = list.iter().position(|x| *x == field).or_else(|| list.iter().position(|x| x.eq_ignore_ascii_case(&field)));
     match (at, remove) {
         (Some(k), true) => {
             list.remove(k);
         }
+        (None, true) => return Err(format!("the report has no {what} '{field}'")),
         (None, false) if list.len() < MAX_ITEMS => list.push(field),
         _ => {}
     }
+    Ok(())
 }
 
 fn add_section(s: &mut Session, p: &Value, sec: Section) -> CmdResult {
@@ -536,12 +540,12 @@ fn new_report(s: &mut Session, p: &Value) -> CmdResult {
     r.fields = fields_of("fields", "a report lists", MAX_ITEMS)?;
     // The layer's fields when none are given: the first of a wide layer, and that is said.
     let mut twins = Vec::new();
-    let mut all = ds.fields.len();
+    let all = ds.fields.len();
     let first_of = r.fields.is_empty() && {
         let filled = filled_in(ds);
-        (twins, all) = (filled.twins, filled.clean);
+        twins = filled.twins;
         r.fields = filled.names;
-        all > MAX_ITEMS
+        r.fields.len() >= MAX_ITEMS && all > MAX_ITEMS
     };
     r.groups = fields_of("groups", "a report groups by", MAX_GROUPS)?;
     if let Some(w) = ps(p, "where").map(str::trim).filter(|w| !w.is_empty()) {

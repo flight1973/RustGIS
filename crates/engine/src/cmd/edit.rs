@@ -2295,6 +2295,42 @@ mod tests {
         assert!(s.notices_since(mark).iter().any(|n| n.text == notice), "{:?}", s.notices_since(mark));
     }
 
+    /// A layer of 64 fields without twins and `Pop`, `pop`: the report lists the 64, says it lists
+    /// the first 64 of the layer's 66, and that the twins are left out. Removing an entry the report
+    /// doesn't hold is an error naming it (#1955).
+    #[test]
+    fn a_full_report_says_both_what_it_cut_and_its_twins() {
+        let mut s = Session::new(crate::Project::default());
+        let mut fields: Vec<Field> = (0..64).map(|i| Field::new(format!("f{i}"), FieldType::Double)).collect();
+        fields.extend(["Pop", "pop"].map(|n| Field::new(n, FieldType::Double)));
+        s.map_mut().add_dataset(Dataset::new("wide", GeometryType::Point, fields));
+        let mark = s.notice_mark();
+        s.run("report.new", &json!({"layer": "wide", "name": "R"})).unwrap();
+        assert_eq!(s.project.reports[0].fields.len(), 64);
+        let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|n| n == "R: the report lists the first 64 of the layer's 66 fields"), "{said:?}");
+        assert!(said.iter().any(|n| n.starts_with("R: fields named the same but for case are left out (Pop, pop)")), "{said:?}");
+        let mark = s.notice_mark();
+        s.run("report.autofill", &json!({"report": "R"})).unwrap();
+        let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(said.iter().any(|n| n == "R: the first 64 of the layer's 66 fields are filled in"), "{said:?}");
+        assert!(said.iter().any(|n| n.contains("(Pop, pop)")), "{said:?}");
+        // Nothing to remove: refused, naming it; there to remove: removed.
+        for (command, extra, error) in [
+            ("report.field", json!({}), "the report has no field 'nope'"),
+            ("report.group", json!({}), "the report has no group 'nope'"),
+            ("report.statistics", json!({"kind": "sum"}), "the report has no sum statistic of 'nope'"),
+        ] {
+            let mut p = json!({"report": "R", "field": "nope", "remove": true});
+            for (k, v) in extra.as_object().unwrap() {
+                p[k] = v.clone();
+            }
+            assert_eq!(s.run(command, &p).unwrap_err(), error);
+        }
+        s.run("report.field", &json!({"report": "R", "field": "f0", "remove": true})).unwrap();
+        assert_eq!(s.project.reports[0].fields.len(), 63);
+    }
+
     /// A size by field or diagram set again over the field it already reads keeps reading it, twin
     /// or not; a twin's name newly given is refused (#1955).
     #[test]
