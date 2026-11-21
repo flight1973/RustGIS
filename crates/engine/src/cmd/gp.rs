@@ -1986,12 +1986,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     }
                     Err(e) => {
                         let err_str = e.to_string();
+                        let rec_params = batch_item_params(spec, &base_params, batch_param, target);
                         let spec = rustgis_analysis::tool(tool_id);
                         let name = spec.map(|t| t.name).unwrap_or("Tool").to_string();
-                        let mut rec_params = base_params.clone();
-                        if let Value::Object(ref mut map) = rec_params {
-                            map.insert(batch_param.to_string(), json!(target));
-                        }
                         let mut record_json = json!({
                             "tool": tool_id,
                             "inputs": [target],
@@ -2069,23 +2066,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             }
         }
 
-        // A tool reading the input under another name (Join Field's `input` for `target`) mustn't
-        // take a static value given under it in place of each batch input, nor keep the tool
-        // dialog's name of the table it replaced (`input_name`, `target_name`).
         let item = |input: &str| {
-            let mut p = base_params.clone();
-            if let Value::Object(ref mut map) = p {
-                let names = rustgis_analysis::param_aliases(spec, batch_param);
-                for name in names.iter().copied().chain([batch_param]) {
-                    if name != batch_param {
-                        map.remove(name);
-                    }
-                    map.remove(&format!("{name}_name"));
-                }
-                map.insert(batch_param.to_string(), json!(input));
-                if tool_has_output {
-                    map.insert("output".to_string(), json!(final_out_name));
-                }
+            let mut p = batch_item_params(spec, &base_params, batch_param, input);
+            if tool_has_output && let Value::Object(ref mut map) = p {
+                map.insert("output".to_string(), json!(final_out_name));
             }
             p
         };
@@ -2531,6 +2515,25 @@ fn spatial_join(s: &mut Session, p: &Value) -> CmdResult {
 /// Calculates raster summary statistics for polygon zones.
 fn zonal_stats(s: &mut Session, p: &Value) -> CmdResult {
     run_tool(s, "zonalStats", p)
+}
+
+/// A `gp.batch` item's parameters: `base` with `batch_param` set to `input`. A tool reading the
+/// input under another name (Join Field's `input` for `target`) mustn't take a static value given
+/// under it in place of each batch input, nor keep the tool dialog's name of the table it replaced
+/// (`input_name`, `target_name`), so those go; a key the tool declares itself never does.
+fn batch_item_params(spec: &rustgis_analysis::ToolSpec, base: &Value, batch_param: &str, input: &str) -> Value {
+    let mut p = base.clone();
+    if let Value::Object(ref mut map) = p {
+        for name in rustgis_analysis::param_aliases(spec, batch_param).iter().copied().chain([batch_param]) {
+            for key in [name.to_string(), format!("{name}_name")] {
+                if key != batch_param && (key == name || !rustgis_analysis::is_accepted_param(spec, &key)) {
+                    map.remove(&key);
+                }
+            }
+        }
+        map.insert(batch_param.to_string(), json!(input));
+    }
+    p
 }
 
 /// What a tool says of the keys in `params` it doesn't read (#2307), as `Session::run` says it of a
@@ -6117,11 +6120,14 @@ mod batch_tests {
         let mut s = test_session();
         let before = s.project.gp_history.len();
         // A name that is neither a layer, a table nor a file: the tool's input can't be mapped.
-        let res = s.run("gp.batch", &json!({"tool": "buffer", "inputs": ["Cities", "Nowhere"], "params": {"distance": 1}})).unwrap();
+        let params = json!({"input": 7, "input_name": "Old", "distance": 1});
+        let res = s.run("gp.batch", &json!({"tool": "buffer", "inputs": ["Cities", "Nowhere"], "params": params})).unwrap();
         assert_eq!(res["failed"], 1, "{res}");
         let failed: Vec<_> = s.project.gp_history[before..].iter().filter(|r| !r.ok).collect();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].params["input"], "Nowhere");
+        // It doesn't keep the tool dialog's name of the table it replaced either.
+        assert!(failed[0].params.get("input_name").is_none(), "{:?}", failed[0].params);
     }
 
     #[test]
