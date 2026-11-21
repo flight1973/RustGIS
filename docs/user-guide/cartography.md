@@ -47,7 +47,10 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
   while those stay under 40% of the values they were taken from: for a few very large values among
   many small ones (city sizes, incomes). It sets its own number of classes, at most the number
   asked. Manual keeps the bounds you type: each class's upper bound is a number to edit or take out, **Split the widest
-  class** adds one, and the field's largest value closes the last class. If no field is
+  class** adds one, and the field's largest value closes the last class. On a layer read in
+  place, whose values aren't all at hand, the field's range is unknown: the first class takes
+  every value up to its bound, and one more class takes every value past the last bound, shown
+  as "up to 4" and "more than 25" in the legend. If no field is
   chosen, the current renderer's field is kept when it is numeric; otherwise the first numeric
   field is used. If the layer has no numeric field, or the
   switch fails for another reason, the pane shows why and keeps the current renderer. When numeric
@@ -97,8 +100,10 @@ marker; the symbol's fill and outline don't show. It turns with **Rotation**, is
 selected, and is kept in the project file. A project that has one opens only in a RustGIS that
 draws them. An image that doesn't decode draws a circle, so the point still shows; opening a
 project, map file or layer file, or adding styles, says which layers and styles have such an image,
-or one too large to keep. The **Layers** pane, its legend and the editors' previews (the symbol's,
-the strokes' and the fills') show the image too, whole within their patch and not turned:
+or one too large to keep. A PDF or SVG export keeps the image once, however many points and lines
+draw it (in an SVG each place is a `<use>` of it, a clone in a vector editor). The **Layers**
+pane, its legend and the editors' previews (the symbol's, the strokes' and the fills') show the
+image too, whole within their patch and not turned:
 
 ```text
 layer.marker={"layer":"Schools","image":"iVBORw0KGgo…","size":16}
@@ -282,7 +287,8 @@ Widths and offsets are in points: they keep their size on screen at every scale,
 keep their coordinates. A positive offset shifts the stroke to the right of the line's direction
 (the order of its vertices) and a negative one to the left, so two copies of an edge drawn in
 opposite directions land on opposite sides of it. Strokes are saved with the project and drawn in
-exports. By command, bottom stroke first (`[]` goes back to the single stroke):
+exports, in a layout legend's swatch, and in the patches of the Layers and Symbology panes (along
+a straight line). By command, bottom stroke first (`[]` goes back to the single stroke):
 
 ```text
 layer.lineStrokes={"layer":"Rivers","strokes":[{"color":"#000000","width":11.5,"offset":8.5},{"color":"#FF8C00","width":7,"offset":8.5,"cap":"round","join":"round"}]}
@@ -393,8 +399,8 @@ A gradient's `from` and `to` are places in the feature's box (`[across, down]`, 
 (`[[0.5, "#RRGGBB"], …]`), held rather than blended with `"discrete": true`.
 
 `[]` goes back to the single fill (for a class, to the layer's fills). Fills draw on the CPU (on the
-globe, patterns keep to the screen rather than the map as it turns); the
-legend shows the symbol's colour.
+globe, patterns keep to the screen rather than the map as it turns). A layout legend draws
+them in the polygon's swatch, and the Layers and Symbology panes in its patch.
 
 **Hatch only flagged polygons.** Use an overlay to hatch unreliable estimates while keeping
 the choropleth's colours visible.
@@ -406,7 +412,7 @@ the choropleth's colours visible.
    colour and spacing so the choropleth shows through. Set **Outline width** to 0 if the
    choropleth already draws the boundaries.
 3. Include both layers in the [layout legend](layouts.md#layouts). The overlay's swatch
-   uses a solid colour, so keep “(hatched)” in its name or legend label to explain the pattern.
+   shows its hatch lines, as does its patch in the Layers pane.
 
 The new layer contains a copy of the selected features. Recreate it if the flag values change.
 

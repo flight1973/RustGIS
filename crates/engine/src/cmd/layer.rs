@@ -150,7 +150,7 @@ pub fn commands() -> Vec<C> {
         .when(need_layer),
         C::new("layer.symbology", "Symbology", "Style › Drawing", symbology).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_feature_layer)
-            .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "expression"?: expression|null (unique: class by this expression's values instead of a field; blank or null: by a field; with neither key, Unique Values keep the layer's expression), "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile"|"geometricInterval"|"standardDeviation"|"arithmeticProgression"|"headTailBreaks"|"manual", "breaks"?: [numbers] (manual: the classes' upper bounds, closed by the field's largest value), "ramp"?: string}"#),
+            .params(r#"{"layer"?, "type": "single"|"unique"|"graduated"|"proportional", "field"?, "expression"?: expression|null (unique: class by this expression's values instead of a field; blank or null: by a field; with neither key, Unique Values keep the layer's expression), "classes"?: 1..12, "method"?: "naturalBreaks"|"equalInterval"|"quantile"|"geometricInterval"|"standardDeviation"|"arithmeticProgression"|"headTailBreaks"|"manual", "breaks"?: [numbers] (manual: the classes' upper bounds, closed by the field's largest value; on a layer read in place, the first class takes every value up to its bound and one more class every value past the last), "ramp"?: string}"#),
         C::new("layer.ramp", "Color Scheme", "Style › Drawing", |s, p| {
             let r = s.ramp(s_req(p, "ramp")?)?;
             let mut dropped = None;
@@ -1831,8 +1831,14 @@ pub(crate) fn add_photos_to(s: &mut Session, name: &str, zoom: Option<bool>, fee
     let id = match existing {
         Some(id) => {
             let l = s.map_mut().layer_mut(id).ok_or("no such layer")?;
+            // Read in longitude/latitude, held in the layer's system.
+            let mut photos = Vec::new();
             for f in ds.features.into_iter().take(added) {
-                l.dataset.push(f.geometry, f.attrs);
+                let g = f.geometry.map(|g| l.dataset.geometry_from_lonlat(g)).transpose().map_err(|e| format!("{}: {e}", l.name))?;
+                photos.push((g, f.attrs));
+            }
+            for (g, attrs) in photos {
+                l.dataset.push(g, attrs);
             }
             l.touch_geometry();
             s.active_layer = Some(id);
@@ -2647,6 +2653,7 @@ fn add_picked(
         for (source, said) in file_wide {
             if let Some(kept) = reads.iter_mut().find(|r| r.dataset.source == source) {
                 kept.report.messages.extend(said.messages);
+                kept.report.losses.extend(said.losses);
                 kept.report.skipped += said.skipped;
             }
         }
@@ -4586,6 +4593,15 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
     // probe, a download) is left to the app, which does it off the frame, as in the browser.
     #[cfg(not(target_arch = "wasm32"))]
     if s.leave_downloads {
+        // A data cube's GeoTIFF (`"cube"`, as `stac.addCube` adds them) is a tile layer whose
+        // tiles are read in place on later frames: nothing waits, so it is added now, its header
+        // unread, as in the browser (#2418). Left to the app, no tile layer would come. One that
+        // isn't cloud-optimised says so as the map draws it (its header's error, as any tile
+        // layer's). The address is a web one (`web_address` above).
+        let tiff = is_tiff_url(url) || b(p, "cog").unwrap_or(false);
+        if b(p, "cube") == Some(true) && tiff && !scan && !b(p, "whole").unwrap_or(false) {
+            return add_cog(s, p, url, false);
+        }
         // The address as the app downloads it (trimmed): the request, its download and the
         // command run again all name it the same.
         let mut asked = p.clone();
@@ -6090,6 +6106,9 @@ pub(crate) fn add_read(
     for m in report.messages {
         s.notify(m, false);
     }
+    for loss in report.losses {
+        s.notify_loss(loss.code, loss.text.into());
+    }
     if ds.geometry_type == GeometryType::None {
         let name = ds.name.clone();
         let id = s.project.add_table(ds);
@@ -6761,11 +6780,39 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
             // Manual with no bounds keeps the layer's current ones on the same field, so switching
             // to it changes nothing.
             let kept = match &l.renderer {
-                Renderer::Graduated { field: f, breaks, .. } if *f == field => Some(breaks.clone()),
+                Renderer::Graduated { field: f, breaks, .. } if *f == field => {
+                    let mut b = breaks.clone();
+                    // On a layer read in place, the last bound closed the classes at the largest
+                    // value read: the open class takes its place, so the classes keep their number.
+                    let open = rustgis_map::symbology::OPEN_ABOVE;
+                    if l.is_streamed() && b.last().is_some_and(|v| *v < open) {
+                        b.pop();
+                        if b.is_empty() {
+                            b.push(open);
+                        }
+                    }
+                    Some(b)
+                }
                 _ => None,
             };
             match (method, typed.or(kept)) {
+                // A layer read in place holds only the features of the last view read, so its
+                // range is unknown: the classes take every value up to the first bound and past
+                // the last.
+                (ClassMethod::Manual, Some(b)) if l.is_streamed() => Renderer::graduated_manual_open(&l.dataset, &field, &b, ramp, base)?,
                 (ClassMethod::Manual, Some(b)) => Renderer::graduated_manual(&l.dataset, &rows()?, &field, &b, ramp, base)?,
+                // Manual with nothing to keep starts from the view's classes, open at both ends.
+                (ClassMethod::Manual, None) if l.is_streamed() => {
+                    let r = Renderer::graduated(&l.dataset, &rows()?, &field, classes, method, ramp, base).map_err(|e| {
+                        // The file has values; the view read so far holds none.
+                        if e == format!("'{field}' has no numeric values") {
+                            format!("'{field}' has no values in the view read so far: give manual breaks, or read a view where it has some")
+                        } else {
+                            e
+                        }
+                    })?;
+                    r.opened().unwrap_or(r)
+                }
                 _ => Renderer::graduated(&l.dataset, &rows()?, &field, classes, method, ramp, base)?,
             }
         }
@@ -6778,8 +6825,15 @@ fn symbology(s: &mut Session, p: &Value) -> CmdResult {
         other => return Err(format!("unknown symbology '{other}'")),
     };
     // Applied again on the same field, the classes keep the labels set by hand, and the colours
-    // and outlines set by hand too while the colour scheme stays (#314).
-    r.carry_edits_from(&l.renderer, g);
+    // and outlines set by hand too while the colour scheme stays (#314). Closed classes made open
+    // on a layer read in place class every feature as before, so their edits carry over too.
+    let opened = match &r {
+        Renderer::Graduated { breaks, .. } if l.is_streamed() && breaks.last() == Some(&rustgis_map::symbology::OPEN_ABOVE) => {
+            l.renderer.opened()
+        }
+        _ => None,
+    };
+    r.carry_edits_from(opened.as_ref().unwrap_or(&l.renderer), g);
     // The same field and scheme again carry the classes' alpha, which No Fill made 0.
     if hidden == Some(NoFill::Symbols) {
         r.map_symbols(show_fill);

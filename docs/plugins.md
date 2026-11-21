@@ -203,11 +203,16 @@ cargo build --release --target wasm32-unknown-unknown
 - `commands[].form` (optional) gives the command a dialog of its own: its ribbon button (tab
   entry, panel button, Command Search entry, shortcut) opens a window with these fields instead of
   running it, and **Run** runs the command with their values as its parameters, by their `name`s.
-  Fields are declared like tool parameters (below), with `rasterLayer` added and `file` left out
-  (a command that reads a file asks for it with host calls, behind the `files` permission); a
-  `field` or `numericField` lists the fields of the nearest layer field above it, which must be a
-  vector one (`vectorLayer`, `polygonLayer` or `pointLayer`), and required when the field is. A
-  required layer starts at the active layer when it is of the kind, an optional one offers `—` to
+  Fields are declared like tool parameters (below), with `rasterLayer` and `table` added and
+  `file` left out (a command that reads a file asks for it with host calls, behind the `files`
+  permission). A `table` offers the standalone tables (a CSV or a spreadsheet without
+  coordinates comes in as one, not as a layer) after the layers a `vectorLayer` offers, and sends
+  the name picked; a table named like a layer, which the name would find instead, isn't offered.
+  `host.features` reads layers only. RustGIS versions before `table` refuse a plugin with one, so
+  set `minRustgisVersion` to the first version with it. A `field` or `numericField` lists the
+  fields of the nearest layer or table field above it, which must be a `vectorLayer`,
+  `polygonLayer`, `pointLayer` or `table`, and required when the field is. A required layer
+  starts at the active layer when it is of the kind, an optional one offers `—` to
   leave it out (a `choice` with a `default` counts as required and offers no `—`), and **Run**
   waits until the required fields are filled in. An optional number left empty, or an optional
   checkbox without a `default` never ticked, is left out of the parameters; a required checkbox is
@@ -227,6 +232,14 @@ cargo build --release --target wasm32-unknown-unknown
   thread, which can't draw or cancel until a command answers, so there a command still stops
   after 120 seconds and its error says so. Long work such as downloading a dataset belongs in a
   tool, which the desktop app runs in the background with progress and Cancel.
+- `commands[].login`: the sign-in the command's data needs, one RustGIS keeps for the user:
+  `earthdata` (an Earthdata Login token), `copernicus` (a Copernicus Data Space sign-in) or
+  `arcgis` (an ArcGIS session). On the plugin's tab, the command's button and menu row show a key
+  over their icon: green while that sign-in is kept (an Earthdata token or an ArcGIS session that
+  hasn't expired or renews itself, a sign-in remembered on this computer included), red and
+  struck through while it is missing; the tooltip says which sign-in and where to give it. The
+  command still runs either way, so it should still say what's missing. Any other value refuses
+  the plugin; RustGIS versions before it ignore the field.
 - Tool parameter `kind`s: `layer`, `vectorLayer`, `polygonLayer`, `pointLayer`, `field`,
   `numericField`, `number`, `text`, `choice` (with 1 to 64 `choices`), `bool` and `file` (see
   [File parameters](#file-parameters)). Each has `name`, `label`, optional `help`, `required`

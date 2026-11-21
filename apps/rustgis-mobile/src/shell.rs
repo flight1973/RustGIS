@@ -4,7 +4,7 @@
 
 use eframe::egui;
 use rustgis_engine::platform::{Event, Platform};
-use rustgis_ui_egui::{Inbox, RustGisApp, i18n, tl};
+use rustgis_ui_egui::{FolderStore, Inbox, RustGisApp, i18n, tl};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -196,6 +196,7 @@ impl<P: Phone> App<P> {
                     self.app.photos.push(path);
                 }
                 Event::Saved { name } => self.app.session.notify(i18n::fmt("Saved {name}.", &[("name", &name)]), false),
+                Event::ProjectSave(result) => self.app.complete_project_save(result),
                 Event::Position(fix) if self.locating => self.app.report_position(fix),
                 // A fix that was on its way when positioning was turned off.
                 Event::Position(_) => {}
@@ -451,7 +452,9 @@ fn use_picker<P: Phone + 'static>(
         }
     }));
     let saver = phone.clone();
-    app.services.download = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes)));
+    app.services.download = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes, false)));
+    let saver = phone.clone();
+    app.services.save_project = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes, true)));
     app.services.inbox = Some(inbox.clone());
     let (camera, photographing) = (phone.clone(), asked.clone());
     app.services.take_photo = Some(Box::new(move || {
@@ -463,6 +466,12 @@ fn use_picker<P: Phone + 'static>(
 }
 
 impl<P: Phone> eframe::App for App<P> {
+    /// When the event loop exits, give the recovery writer a short chance to finish the latest
+    /// edit. The next launch offers the last complete copy, if one exists.
+    fn on_exit(&mut self) {
+        self.app.finish_recovery_copy();
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // The GPU map backend draws inside egui's wgpu pass; hand over the render state.
         self.app.set_render_state(frame.wgpu_render_state().cloned());
@@ -630,17 +639,20 @@ pub fn pushed(dir: Option<PathBuf>, app: &mut RustGisApp) -> Vec<PathBuf> {
     files
 }
 
-/// Makes the front end with the sample project, ready for a phone: commands run on the window's
-/// thread don't hold it, and `folders` (whether the system gave the app a folder of its own) is
-/// said when it is false.
-pub fn front_end(folders: bool) -> RustGisApp {
-    // Datum grids: the app's own folder, where downloaded ones are kept (#2032 A4); a phone has no
-    // PROJ install to share.
-    if folders {
+/// Makes the front end with the sample project and recovery in the phone's private storage.
+pub fn front_end(root: Option<&Path>) -> RustGisApp {
+    // Datum grids: the app's own folder, where downloaded ones are kept (#2032 A4);
+    // a phone has no PROJ install to share.
+    if root.is_some() {
         rustgis_engine::data::raster::crs::use_grid_folders();
     }
     let mut app = RustGisApp::with_sample();
-    if !folders {
+    if let Some(root) = root {
+        match FolderStore::open(&root.join("recovery")) {
+            Ok(store) => app = app.with_edit_recovery(Box::new(store)),
+            Err(e) => app.session.notify(i18n::fmt("Autosave couldn't keep a recovery copy: {error}", &[("error", &e)]), true),
+        }
+    } else {
         app.session.warn(tl!("This device gives RustGIS no folder of its own: settings, the tile cache and recovery copies are off."));
     }
     // As on the desktop: commands run on the window's thread must not hold it.
@@ -722,7 +734,7 @@ mod tests {
             self.0.set(true);
             Ok(())
         }
-        fn save_file(&self, _: &str, _: Vec<u8>) -> Result<(), String> {
+        fn save_file(&self, _: &str, _: Vec<u8>, _: bool) -> Result<(), String> {
             Ok(())
         }
         fn locate(&self, _: bool) -> Result<(), String> {

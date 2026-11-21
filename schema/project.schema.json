@@ -1071,6 +1071,7 @@
           "terrain-block-shape",
           "terrain-water",
           "terrain-water-shore",
+          "terrain-block-water",
           "shaded-relief-effects",
           "normalized-legend-urls",
           "field-origin",
@@ -1084,9 +1085,14 @@
           "picture-markers",
           "layout-element-ink",
           "layout-element-wrap",
+          "layout-chart-data",
+          "layout-chart-look",
           "field-generation",
+          "offline-map-area-id",
           "crs-wkt",
-          "zarr-window"
+          "zarr-window",
+          "blank-paper",
+          "layout-frame-border"
         ],
         "type": "string"
       },
@@ -1155,6 +1161,7 @@
     "terrain-block-shape",
     "terrain-water",
     "terrain-water-shore",
+    "terrain-block-water",
     "shaded-relief-effects",
     "normalized-legend-urls",
     "field-origin",
@@ -1168,9 +1175,14 @@
     "picture-markers",
     "layout-element-ink",
     "layout-element-wrap",
+    "layout-chart-data",
+    "layout-chart-look",
     "field-generation",
+    "offline-map-area-id",
     "crs-wkt",
-    "zarr-window"
+    "zarr-window",
+    "blank-paper",
+    "layout-frame-border"
   ],
   "x-rustgis-reads-format": 2,
   "x-rustgis-writes-format": 2

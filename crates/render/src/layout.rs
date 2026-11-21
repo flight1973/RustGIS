@@ -8,8 +8,8 @@ use rustgis_data::GeometryType;
 use rustgis_data::query::{Env, SeriesPage};
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
-    ArrowStyle, ColorScale, ElementKind, FrameShape, Grid, GridKind, INK, Layout, LineHead, MAX_LEGEND_COLUMNS, Orientation, PT_PER_MM,
-    ScaleBarStyle, ScaleUnits, TextAlign, TickSide, frame_camera,
+    ArrowStyle, ChartLook, ColorScale, ElementKind, FrameShape, Grid, GridKind, INK, Layout, LineHead, MAX_LEGEND_COLUMNS, Orientation,
+    PT_PER_MM, ScaleBarStyle, ScaleUnits, TextAlign, TickSide, frame_camera,
 };
 use rustgis_map::symbology::LegendEntry;
 use rustgis_map::{Map, Rgba};
@@ -186,6 +186,42 @@ pub(crate) fn page_geometry(layout: &Layout, dpi: f64) -> (u32, u32, f64) {
 /// text uses this page and its first frame, rotated text is checked after its turn, and a
 /// wrapped text by the lines it is broken into.
 pub fn clipped_text(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo) -> Vec<(u32, String)> {
+    text_losses(layout, maps, dpi, info).into_iter().map(|l| (l.id, l.name)).collect()
+}
+
+/// A text element (or a legend's title) [`clipped_text`] finds cut off, with the lines of it
+/// left out of the page (#2346).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextLoss {
+    pub id: u32,
+    pub name: String,
+    /// Its lines with ink that aren't drawn: below its box, or past the 200 a text draws. 0 when
+    /// only its ink crosses the page's edge.
+    pub left_out: usize,
+    /// It has more lines left out than `left_out` counts: a wrapped text is broken only up to
+    /// the line past the 200 drawn ([`wrapped`]).
+    pub at_least: bool,
+    /// Some of them are left out below its box, among the first 200: a taller box or a smaller
+    /// text draws them.
+    pub below_box: bool,
+    /// Some of them come past the 200 lines a text draws, whatever its box: only splitting the
+    /// text draws them.
+    pub past_limit: bool,
+}
+
+/// [`clipped_text`], with how many of each text's lines are left out of its box ([`TextLoss`]):
+/// what the layout view, an export and the commands say, so they never tell it apart.
+pub fn text_losses(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo) -> Vec<TextLoss> {
+    losses(layout, maps, dpi, info, None)
+}
+
+/// [`text_losses`] for the element `id` alone, measuring no other: `None` when it isn't cut off.
+pub fn text_loss(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo, id: u32) -> Option<TextLoss> {
+    losses(layout, maps, dpi, info, Some(id)).pop()
+}
+
+/// The texts cut off, of the whole page or of the element `only`.
+fn losses(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo, only: Option<u32>) -> Vec<TextLoss> {
     let (w, h, k) = page_geometry(layout, dpi);
     let ppp = (k / PT_PER_MM) as f32;
     let first = layout.first_frame().and_then(|id| layout.element(id)).and_then(|e| {
@@ -196,10 +232,11 @@ pub fn clipped_text(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo) ->
     layout
         .elements
         .iter()
-        .filter(|e| e.visible)
+        .filter(|e| e.visible && only.is_none_or(|id| id == e.id))
         .filter_map(|e| {
-            let r = Rect::from_xywh((e.x * k) as f32, (e.y * k) as f32, (e.w * k) as f32, (e.h * k) as f32)?;
-            let (s, size, face, align, spacing, rotation, title) = match &e.kind {
+            // At least a pixel each way, as the page draws it.
+            let r = Rect::from_xywh((e.x * k) as f32, (e.y * k) as f32, ((e.w * k) as f32).max(1.0), ((e.h * k) as f32).max(1.0))?;
+            let (s, size, face, align, spacing, rotation, title, broken) = match &e.kind {
                 ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation, wrap }
                     if color.a() > 0 =>
                 {
@@ -207,12 +244,12 @@ pub fn clipped_text(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo) ->
                     let s = expand(t, layout, info, first);
                     // Its lines as they are drawn: a wrapped text's, broken to its box.
                     let s = if *wrap { wrapped(&s, e.w, *size, style) } else { s };
-                    (s, *size as f32, style.face, *align, *letter_spacing as f32, *rotation as f32, false)
+                    (s, *size as f32, style.face, *align, *letter_spacing as f32, *rotation as f32, false, *wrap)
                 }
                 ElementKind::Legend { title, frame, .. } => {
                     let ElementKind::MapFrame { map, .. } = &layout.element(*frame)?.kind else { return None };
                     map_index(maps, map)?;
-                    (title.clone(), 12.0, text::Face { bold: true, ..Default::default() }, TextAlign::Left, 0.0, 0.0, true)
+                    (title.clone(), 12.0, text::Face { bold: true, ..Default::default() }, TextAlign::Left, 0.0, 0.0, true, false)
                 }
                 _ => return None,
             };
@@ -221,13 +258,24 @@ pub fn clipped_text(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo) ->
             let turn = Transform::from_rotate_at(rotation, r.x() + r.width() / 2.0, r.y() + r.height() / 2.0);
             // Legend titles are drawn on one line, unlike text elements' explicit line breaks.
             let lines = std::iter::once(s.as_str()).filter(|_| title).chain(s.lines().filter(|_| !title));
-            let cut = lines.enumerate().any(|(i, line)| {
-                let ink = text::styled_bounds(line, px, face, spacing * 1.33 * ppp);
+            let (mut cut, mut left_out, mut below_box, mut past_limit) = (false, 0, false, false);
+            for (i, line) in lines.enumerate() {
                 let drawn = i < 200 && (title || cy <= r.bottom() + px);
-                let cut = ink.is_some_and(|ink| {
-                    if !drawn {
-                        return true;
+                // A line not drawn is only looked at for a letter, as a wrapped text tells its
+                // ink ([`crate::report::wrap_lines`]): a long text isn't shaped past its box.
+                if !drawn {
+                    if line.chars().any(|c| !c.is_whitespace()) {
+                        (cut, left_out) = (true, left_out + 1);
+                        if i < 200 {
+                            below_box = true;
+                        } else {
+                            past_limit = true;
+                        }
                     }
+                    continue;
+                }
+                let ink = text::styled_bounds(line, px, face, spacing * 1.33 * ppp);
+                cut |= ink.is_some_and(|ink| {
                     let left = match align {
                         TextAlign::Left => r.x(),
                         TextAlign::Center => r.x() + (r.width() - ink.width()) / 2.0 - ink.left(),
@@ -243,17 +291,21 @@ pub fn clipped_text(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo) ->
                     corners.iter().any(|p| p.x < 0.0 || p.y < 0.0 || p.x > w as f32 || p.y > h as f32)
                 });
                 cy += px * 1.25;
-                cut
-            });
-            cut.then(|| (e.id, e.name.clone()))
+            }
+            // A wrapped text ends at the line past the 200 drawn ([`wrapped`]): it may go on.
+            let at_least = broken && s.lines().nth(200).is_some();
+            cut.then(|| TextLoss { id: e.id, name: e.name.clone(), left_out, at_least, below_box, past_limit })
         })
         .collect()
 }
 
 /// One counted notice per kind, naming the affected elements by their stable address. Exports
 /// can merge repeated element IDs across series pages before calling this, so a PDF's fallback
-/// rendering and repeated pages never multiply the count.
-pub fn clipped_text_notice(clipped: &[(u32, String)]) -> Option<String> {
+/// rendering and repeated pages never multiply the count. Its advice fits the texts of `layout`
+/// named: breaking lines by hand or wrapping them for a text not wrapped (#2346), only the box or
+/// the size when all are wrapped to their boxes, and line breaks without the wrap for a legend's
+/// title, which has none.
+pub fn clipped_text_notice(layout: &Layout, clipped: &[(u32, String)]) -> Option<String> {
     if clipped.is_empty() {
         return None;
     }
@@ -261,10 +313,52 @@ pub fn clipped_text_notice(clipped: &[(u32, String)]) -> Option<String> {
     if clipped.len() > 10 {
         names.push_str(&format!(" and {} more", clipped.len() - 10));
     }
-    Some(format!(
-        "Text is cut off in {} layout element(s): {names}; resize or move the text, reduce its size, or add line breaks",
-        clipped.len()
-    ))
+    // Each text's wrap; `None` for a legend's title or an element gone since, which keep the
+    // advice they always had.
+    let wraps = clipped
+        .iter()
+        .map(|(id, _)| match layout.element(*id).map(|e| &e.kind) {
+            Some(ElementKind::Text { wrap, .. }) => Some(*wrap),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let advice = if wraps.contains(&Some(false)) {
+        "resize or move the text, reduce its size, add line breaks, or turn on Wrap to the box"
+    } else if wraps.iter().all(|w| *w == Some(true)) {
+        "resize or move the text, or reduce its size"
+    } else {
+        "resize or move the text, reduce its size, or add line breaks"
+    };
+    Some(format!("Text is cut off in {} layout element(s): {names}; {advice}", clipped.len()))
+}
+
+/// What a text that loses lines is told (#2346), from its [`TextLoss`]: `None` when none of its
+/// lines is left out. Lines below its box want a taller box or a smaller text; lines past the 200
+/// a text draws, splitting the text, as no box draws them.
+pub fn lines_left_out_notice(loss: &TextLoss) -> Option<String> {
+    let n = loss.left_out;
+    if n == 0 && !loss.at_least {
+        return None;
+    }
+    let (count, one) = match (n, loss.at_least) {
+        (1, false) => ("1 line".to_string(), true),
+        (n, false) => (format!("{n} lines"), false),
+        (n, true) => (format!("{} or more lines", n.max(1)), false),
+    };
+    let said = match (loss.below_box, loss.past_limit) {
+        (_, false) => {
+            let verbs = if one { "doesn't fit its box and isn't" } else { "don't fit its box and aren't" };
+            format!("{verbs} drawn; make the box taller or the text smaller")
+        }
+        (false, true) => {
+            format!("{} drawn: a text draws at most 200 lines; split it into more than one text", if one { "isn't" } else { "aren't" })
+        }
+        (true, true) => format!(
+            "{} drawn: make the box taller or the text smaller, and split it, as a text draws at most 200 lines",
+            if one { "isn't" } else { "aren't" }
+        ),
+    };
+    Some(format!("{count} of the text \"{}\" ({}) {said}", loss.name, loss.id))
 }
 
 /// One element on transparency, allocating only its on-page pixel bounds.
@@ -388,7 +482,7 @@ fn draw_page(
             ((e.x * k - f64::from(bounds.x())) as f32, (e.y * k - f64::from(bounds.y())) as f32, (e.w * k) as f32, (e.h * k) as f32);
         let Some(r) = Rect::from_xywh(x, y, ew.max(1.0), eh.max(1.0)) else { continue };
         match &e.kind {
-            ElementKind::MapFrame { shape, grid, extent_of, extent_color, extent_width, .. } => {
+            ElementKind::MapFrame { shape, grid, extent_of, extent_color, extent_width, border_color, border_width, .. } => {
                 let Some(&(_, mi, cam, fw, fh)) = frame(e.id) else {
                     placeholder(&mut pm, r, "Missing map", ppp);
                     continue;
@@ -463,11 +557,15 @@ fn draw_page(
                         None,
                     );
                 }
-                if let Some(p) = &path {
+                // Its border along its shape (#2557); a width of 0 or a clear colour draws none.
+                if let Some(p) = &path
+                    && *border_width > 0.0
+                    && border_color.0[3] > 0
+                {
                     pm.stroke_path(
                         p,
-                        &paint(Rgba::rgb(0x30, 0x30, 0x30), 1.0),
-                        &Stroke { width: 0.8 * ppp as f32, ..Stroke::default() },
+                        &paint(*border_color, 1.0),
+                        &Stroke { width: *border_width as f32 * ppp as f32, ..Stroke::default() },
                         Transform::identity(),
                         None,
                     );
@@ -582,10 +680,13 @@ fn draw_page(
                     None => placeholder(&mut pm, r, "Table", ppp),
                 }
             }
-            ElementKind::Chart { frame: f, layer, field, label, color } => {
+            ElementKind::Chart { frame: f, layer, color, .. } => {
                 let ds = frame(*f).and_then(|fr| maps.get(fr.1)).and_then(|m| m.layer_by_name(layer)).map(|l| &l.dataset);
-                match ds {
-                    Some(ds) => chart(&mut pm, r, ds, field, label.as_deref(), color.unwrap_or(INK), ppp),
+                match ds.and_then(|ds| e.kind.chart_data(ds)) {
+                    Some(data) => {
+                        let look = e.kind.chart_look().unwrap_or_default();
+                        chart(&mut pm, r, &data, &look, color.unwrap_or(INK), ppp, layout.decimal_comma)
+                    }
                     None => placeholder(&mut pm, r, "Chart", ppp),
                 }
             }
@@ -1266,22 +1367,18 @@ fn outline_lonlat(pm: &mut Canvas, map: &Map, view: &View, ring: &[Option<Coord>
             &placed[..]
         }
     };
+    let project = |c: Coord| match &globe {
+        Some(g) => g.forward(c),
+        // A tilted frame's outline breaks where it passes behind the eye, and any frame's where
+        // its projection can't show the place (#2369).
+        None => map.to_map(c).and_then(|m| view.camera.try_to_screen(m, view.width, view.height)),
+    };
     let mut pb = PathBuilder::new();
     let mut first = true;
-    for c in ring {
-        let Some(c) = c else {
-            first = true;
-            continue;
-        };
-        let at = match &globe {
-            Some(g) => g.forward(*c),
-            // A tilted frame's outline breaks where it passes behind the eye, and any frame's where
-            // its projection can't show the place (#2369).
-            None => map.to_map(*c).and_then(|m| view.camera.try_to_screen(m, view.width, view.height)),
-        };
+    let mut push = |at: Option<(f64, f64)>| {
         let Some((x, y)) = at else {
             first = true;
-            continue;
+            return;
         };
         let (x, y) = (x as f32 * ppp, y as f32 * ppp);
         if first {
@@ -1290,6 +1387,32 @@ fn outline_lonlat(pm: &mut Canvas, map: &Map, view: &View, ring: &[Option<Coord>
         } else {
             pb.line_to(x, y);
         }
+    };
+    let mut previous: Option<(Coord, Option<(f64, f64)>)> = None;
+    for &c in ring {
+        let at = c.and_then(project);
+        if globe.is_none()
+            && let (Some((last, last_at)), Some(c)) = (previous, c)
+            && last_at.is_some() != at.is_some()
+        {
+            // Reach the overview's projection boundary, rather than stop at the last sample
+            // inside it (#2433). Keep the valid side of 24 halvings, as frame_outline_lonlat
+            // does for the source frame's boundary. An explicit gap never enters this search.
+            let (mut inside, mut outside, mut found) = if last_at.is_some() { (last, c, last_at) } else { (c, last, at) };
+            for _ in 0..24 {
+                // Samples can straddle ±180° on a regional projection without a wrapping edge:
+                // follow their short arc rather than bisect across the other side of the map.
+                let lon = inside.x + ((outside.x - inside.x + 540.0).rem_euclid(360.0) - 180.0) / 2.0;
+                let mid = Coord::new(lon, (inside.y + outside.y) / 2.0);
+                match project(mid) {
+                    Some(point) => (inside, found) = (mid, Some(point)),
+                    None => outside = mid,
+                }
+            }
+            push(found);
+        }
+        push(at);
+        previous = c.map(|c| (c, at));
     }
     if let Some(p) = pb.finish() {
         pm.stroke_path(&p, &paint(color, 1.0), &Stroke { width: width * ppp, ..Stroke::default() }, Transform::identity(), None);
@@ -2056,12 +2179,7 @@ fn layer_shown(l: &rustgis_map::Layer, scale: f64, show_no_data: bool, env: &Env
 fn raster_classes(l: &rustgis_map::Layer, all_classes: bool) -> Option<Vec<LegendEntry>> {
     let classes = l.raster.as_ref()?.legend_classes(all_classes)?;
     let symbol = |fill| rustgis_map::Symbol { fill, stroke: RASTER_SWATCH_EDGE, stroke_width: 0.5, size: 0.0, marker: Default::default() };
-    Some(
-        classes
-            .into_iter()
-            .map(|(fill, label)| LegendEntry { label, symbol: symbol(fill), strokes: Vec::new(), fallback: false })
-            .collect(),
-    )
+    Some(classes.into_iter().map(|(fill, label)| LegendEntry::plain(label, symbol(fill))).collect())
 }
 
 /// Names only the source whose read stopped this page, leaving unrelated failures generic.
@@ -2287,6 +2405,12 @@ fn widest(rows: &[LegendRow], scale: f64) -> f32 {
 /// [`rustgis_map::Layer::strokes`] finds them for a feature.
 fn row_strokes<'a>(l: &'a rustgis_map::Layer, en: &'a LegendEntry) -> &'a [rustgis_map::LineStroke] {
     if en.strokes.is_empty() { &l.line_strokes } else { &en.strokes }
+}
+
+/// The stacked fills a legend's class row draws: its class's own, else its layer's, as
+/// [`rustgis_map::Layer::fills`] finds them for a feature.
+fn row_fills<'a>(l: &'a rustgis_map::Layer, en: &'a LegendEntry) -> &'a [rustgis_map::fills::FillLayer] {
+    if en.fills.is_empty() { &l.fill_layers } else { &en.fills }
 }
 
 /// The width of a legend's column of swatches at 1:`scale`, in points: it grows to hold the widest
@@ -2526,7 +2650,7 @@ fn legend_rows_missing<'a>(
         }
         // A layer with a diagram lists its categories under its classes.
         if let Some(d) = &l.diagram {
-            entries.extend(d.legend(l.geometry_type() == GeometryType::Polyline));
+            entries.extend(d.legend(l.geometry_type()));
         }
         if entries.is_empty() {
             // A Unique Values layer that lists nothing draws nothing visible (#207); a raster has
@@ -2646,14 +2770,22 @@ fn legend_column(
         match row {
             LegendRow::Plain(l, name) => {
                 let s = l.renderer.symbol_for(&l.dataset, 0);
-                swatch(pm, (r.x(), y, sw, height), l, (&s, l.line_strokes.as_slice()), map.layer_opacity(l), opts.scale, ppp);
+                swatch(pm, (r.x(), y, sw, height), l, (&s, &l.line_strokes, &l.fill_layers), map.layer_opacity(l), opts.scale, ppp);
                 text::text_at(pm, name, r.x() + sw + 6.0 * ppp, y + height / 2.0, 9.0 * 1.33 * ppp, dark, false, text::Align::Left, false);
             }
             LegendRow::Head(name) => {
                 text::text_at(pm, name, r.x(), y + line / 2.0, 9.0 * 1.33 * ppp, dark, true, text::Align::Left, false);
             }
             LegendRow::Class(l, en) => {
-                swatch(pm, (r.x() + 6.0 * ppp, y, sw, height), l, (&en.symbol, row_strokes(l, en)), map.layer_opacity(l), opts.scale, ppp);
+                swatch(
+                    pm,
+                    (r.x() + 6.0 * ppp, y, sw, height),
+                    l,
+                    (&en.symbol, row_strokes(l, en), row_fills(l, en)),
+                    map.layer_opacity(l),
+                    opts.scale,
+                    ppp,
+                );
                 text::text_at(
                     pm,
                     &en.label,
@@ -2852,6 +2984,7 @@ pub fn frame_coverage_judged_on(
     // Put back when this ends, a panic in the drawing included.
     struct Aside<'a> {
         basemap: rustgis_map::Basemap,
+        paper: Option<rustgis_map::Rgba>,
         tiles: Vec<rustgis_map::TileLayer>,
         graticule: bool,
         lock: Option<Vec<(rustgis_map::LabelKey, rustgis_map::LockedPlace)>>,
@@ -2865,6 +2998,7 @@ pub fn frame_coverage_judged_on(
                 l.visible = true;
             }
             self.map.basemap = self.basemap;
+            self.map.paper = self.paper;
             self.map.tiles = std::mem::take(&mut self.tiles);
             self.map.graticule = self.graticule;
             self.map.label_lock = self.lock.take();
@@ -2880,6 +3014,8 @@ pub fn frame_coverage_judged_on(
     let aside = Aside {
         outlines,
         basemap: std::mem::replace(&mut map.basemap, rustgis_map::Basemap::Blank),
+        // Judged on white paper: a blank basemap's paper colour (#2532) would count as drawn.
+        paper: map.paper.take(),
         tiles: std::mem::take(&mut map.tiles),
         graticule: std::mem::replace(&mut map.graticule, false),
         lock: map.label_lock.take(),
@@ -2965,54 +3101,132 @@ pub fn frame_plain_under(
     background && seen.all(|p| rgba(p) == first)
 }
 
-/// A legend entry's symbol `s` of the layer `l` in the box (`x`, `y`, `w`, `h`): a point as
-/// [`point_swatch`] draws it with `strokes`, or a line or a filled box a swatch wide, in the middle
-/// of the box.
+/// A legend entry's symbol `s` of the layer `l` in the box (`x`, `y`, `w`, `h`), with its stacked
+/// `strokes` and `fills` (#2490): a point as [`point_swatch`] draws it, or a line or a filled box a
+/// swatch wide in the middle of the box, by the paths the map draws its features with. See-through
+/// (`opacity`) or grown with the layer's reference scale at 1:`scale`, it is composited as one and
+/// cut to the box, as a point's is.
 fn swatch(
     pm: &mut Canvas,
     (x, y, w, h): (f32, f32, f32, f32),
     l: &rustgis_map::Layer,
-    (s, strokes): (&rustgis_map::Symbol, &[rustgis_map::LineStroke]),
+    (s, strokes, fills): (&rustgis_map::Symbol, &[rustgis_map::LineStroke], &[rustgis_map::fills::FillLayer]),
     opacity: f32,
     scale: f64,
     ppp: f32,
 ) {
     let gt = l.geometry_type();
+    let k = l.size_factor(scale);
     if gt == GeometryType::Point {
-        point_swatch(pm, (x, y, w, h), (s, strokes), opacity, ppp * l.size_factor(scale));
+        point_swatch(pm, (x, y, w, h), (s, strokes), opacity, ppp * k);
         return;
     }
-    let (x, w) = (x + (w - LEGEND_SWATCH * ppp) / 2.0, LEGEND_SWATCH * ppp);
+    // A layer with no stack keeps the swatch it always had; any stack is drawn as the map draws
+    // it, cut to the box.
+    let plain = if gt == GeometryType::Polyline { strokes.is_empty() } else { fills.is_empty() };
+    if plain && opacity >= 0.999 && k == 1.0 {
+        flat_swatch(pm, (x, y, w, h), gt, s, (ppp, ppp));
+    } else if plain {
+        composited(pm, (x, y, w, h), opacity, |c, (left, top)| flat_swatch(c, (x - left, y - top, w, h), gt, s, (ppp, ppp * k)));
+    } else {
+        composited(pm, (x, y, w, h), opacity, |c, (left, top)| {
+            stacked_swatch(c, (x - left, y - top, w, h), l, (s, strokes, fills), ppp, k)
+        });
+    }
+}
+
+/// The part of the box (`x`, `w`) a line or polygon swatch takes: [`LEGEND_SWATCH`] across, in its
+/// middle.
+fn swatch_across(x: f32, w: f32, ppp: f32) -> (f32, f32) {
+    (x + (w - LEGEND_SWATCH * ppp) / 2.0, LEGEND_SWATCH * ppp)
+}
+
+/// The three points of a line swatch in the box, in pixels.
+fn swatch_line((x, y, w, h): (f32, f32, f32, f32), ppp: f32) -> [(f32, f32); 3] {
+    let (x, w) = swatch_across(x, w, ppp);
     let cy = y + h / 2.0;
-    match gt {
-        GeometryType::Polyline => {
-            let mut pb = PathBuilder::new();
-            pb.move_to(x, cy + h * 0.2);
-            pb.line_to(x + w * 0.4, cy - h * 0.2);
-            pb.line_to(x + w, cy + h * 0.1);
-            if let Some(p) = pb.finish() {
-                pm.stroke_path(
-                    &p,
-                    &paint(s.stroke, 1.0),
-                    &Stroke { width: s.stroke_width.max(1.0) * ppp, ..Stroke::default() },
-                    Transform::identity(),
-                    None,
-                );
-            }
+    [(x, cy + h * 0.2), (x + w * 0.4, cy - h * 0.2), (x + w, cy + h * 0.1)]
+}
+
+/// A polygon swatch's box in the box, in pixels.
+fn swatch_box((x, y, w, h): (f32, f32, f32, f32), ppp: f32) -> Option<Rect> {
+    let (x, w) = swatch_across(x, w, ppp);
+    Rect::from_xywh(x, y + h * 0.2, w, h * 0.6)
+}
+
+/// A line or polygon swatch of the symbol `s` alone, its shape at `ppp` and its widths at `wppp`.
+fn flat_swatch(pm: &mut Canvas, cell: (f32, f32, f32, f32), gt: GeometryType, s: &rustgis_map::Symbol, (ppp, wppp): (f32, f32)) {
+    if gt == GeometryType::Polyline {
+        let [a, b, c] = swatch_line(cell, ppp);
+        let mut pb = PathBuilder::new();
+        pb.move_to(a.0, a.1);
+        pb.line_to(b.0, b.1);
+        pb.line_to(c.0, c.1);
+        if let Some(p) = pb.finish() {
+            pm.stroke_path(
+                &p,
+                &paint(s.stroke, 1.0),
+                &Stroke { width: s.stroke_width.max(1.0) * wppp, ..Stroke::default() },
+                Transform::identity(),
+                None,
+            );
         }
-        _ => {
-            if let Some(b) = Rect::from_xywh(x, y + h * 0.2, w, h * 0.6) {
-                pm.fill_rect(b, &paint(s.fill, 1.0), Transform::identity(), None);
-                let p = PathBuilder::from_rect(b);
-                pm.stroke_path(
-                    &p,
-                    &paint(s.stroke, 1.0),
-                    &Stroke { width: s.stroke_width.max(0.5) * ppp, ..Stroke::default() },
-                    Transform::identity(),
-                    None,
-                );
-            }
+    } else if let Some(b) = swatch_box(cell, ppp) {
+        pm.fill_rect(b, &paint(s.fill, 1.0), Transform::identity(), None);
+        let p = PathBuilder::from_rect(b);
+        pm.stroke_path(
+            &p,
+            &paint(s.stroke, 1.0),
+            &Stroke { width: s.stroke_width.max(0.5) * wppp, ..Stroke::default() },
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
+/// A line or polygon swatch with its stacked `strokes` or `fills`, drawn by the map's own paths
+/// for a feature of that shape: [`crate::stroke_paths::Paths`] and [`crate::Ctx::filled`], at
+/// `ppp` and the layer's reference scale `k`. The canvas stands for a view whose map units are
+/// its points, y up, so the shape's pixels are its coordinates.
+fn stacked_swatch(
+    pm: &mut Canvas,
+    cell: (f32, f32, f32, f32),
+    l: &rustgis_map::Layer,
+    (s, strokes, fills): (&rustgis_map::Symbol, &[rustgis_map::LineStroke], &[rustgis_map::fills::FillLayer]),
+    ppp: f32,
+    k: f32,
+) {
+    let (w, h) = (f64::from(pm.width()) / f64::from(ppp), f64::from(pm.height()) / f64::from(ppp));
+    let camera = rustgis_map::Camera::new(Coord::new(w / 2.0, -h / 2.0), 1.0);
+    let view = View { width: w, height: h, pixels_per_point: f64::from(ppp), camera, sky: false };
+    let ctx = crate::Ctx {
+        view: &view,
+        ppp: ppp * k,
+        wireframe: false,
+        // (The swatch's own view: the stroke and fill paths don't cull today, and one that does
+        // still keeps the swatch, where an empty extent would drop it.)
+        cull: crate::cull_extent(&view, crate::CULL_MARGIN),
+        globe: None,
+        sprites: Default::default(),
+        bursts: Default::default(),
+    };
+    let at = |(x, y): (f32, f32)| Coord::new(f64::from(x / ppp), -f64::from(y / ppp));
+    if l.geometry_type() == GeometryType::Polyline {
+        // Drawn level by level, as the map draws a feature's strokes with symbol levels on.
+        let mut ordered: Vec<(usize, rustgis_map::LineStroke)> = strokes.iter().copied().enumerate().collect();
+        if l.stroke_levels {
+            ordered.sort_by_key(|(i, st)| st.level_at(*i));
         }
+        let ordered: Vec<rustgis_map::LineStroke> = ordered.into_iter().map(|(_, st)| st).collect();
+        let part: Vec<Coord> = swatch_line(cell, ppp).into_iter().map(at).collect();
+        crate::stroke_paths::Paths::default().draw(&ctx, pm, &[part], s, &ordered);
+    } else if let Some(b) = swatch_box(cell, ppp) {
+        let ring: Vec<Coord> =
+            [(b.left(), b.top()), (b.right(), b.top()), (b.right(), b.bottom()), (b.left(), b.bottom()), (b.left(), b.top())]
+                .into_iter()
+                .map(at)
+                .collect();
+        ctx.filled(pm, &[vec![ring]], s, fills);
     }
 }
 
@@ -3045,18 +3259,31 @@ fn point_swatch(
         draw_point(pm, (cx, cy), s, strokes, ppp);
         return;
     }
+    composited(pm, (x, y, w, h), opacity, |c, (left, top)| draw_point(c, (cx - left, cy - top), s, strokes, ppp));
+}
+
+/// Draws by `draw` into a picture of the box (`x`, `y`, `w`, `h`), no larger than the page, and
+/// composites it as one at `opacity`, cut to the box. `draw` gets the picture and where its corner
+/// sits on the canvas, in pixels.
+fn composited(pm: &mut Canvas, (x, y, w, h): (f32, f32, f32, f32), opacity: f32, draw: impl FnOnce(&mut Canvas, (f32, f32))) {
     // Kept on the canvas: a picture as large as the canvas then covers all of it that shows.
     let (left, top) = (x.floor().max(0.0), y.floor().max(0.0));
     let (cw, ch) = (((x + w).ceil() - left) as u32, ((y + h).ceil() - top) as u32);
     let (cw, ch) = (cw.min(pm.width()), ch.min(pm.height()));
     if let Some(mut picture) = pm.sub(cw, ch) {
-        draw_point(&mut picture, (cx - left, cy - top), s, strokes, ppp);
-        // A recording keeps what lies past its picture's edge, so it is cut here, at the box.
-        let clip = Rect::from_xywh(x, y, w, h).map(|r| crate::vector::Clip {
-            path: PathBuilder::from_rect(r),
-            rule: FillRule::Winding,
-            transform: Transform::identity(),
-        });
+        draw(&mut picture, (left, top));
+        let Some(r) = Rect::from_xywh(x, y, w, h) else { return };
+        let clip = if picture.is_recording() {
+            // A recording keeps what lies past its picture's edge, so it is cut here, at the box.
+            Some(crate::vector::Clip { path: PathBuilder::from_rect(r), rule: FillRule::Winding, transform: Transform::identity() })
+        } else {
+            // Pixels are cut in the picture, by a mask its size rather than the page's.
+            if let Some(mut m) = Mask::new(cw, ch) {
+                m.fill_path(&PathBuilder::from_rect(r), FillRule::Winding, true, Transform::from_translate(-left, -top));
+                picture.pixels().apply_mask(&m);
+            }
+            None
+        };
         pm.place(picture, Transform::from_translate(left, top), opacity, rustgis_map::effects::Blend::Normal, clip);
     }
 }
@@ -3259,7 +3486,8 @@ pub(crate) fn wrapped(s: &str, width: f64, size: f64, style: TextStyle) -> Strin
         let (lo, hi) = text::styled_extent(t, px, style.face, spacing);
         f64::from(if style.align == TextAlign::Left { hi } else { hi - lo })
     };
-    // Lines past the 200 a text draws aren't broken: one more tells the cut-off check it goes on.
+    // Lines past the 200 a text draws aren't broken: one more, with text, tells the cut-off check
+    // it goes on.
     crate::report::wrap_lines(s, width * WRAP_PX_PER_MM, measure, 200).join("\n")
 }
 
@@ -3429,44 +3657,174 @@ fn table(pm: &mut Canvas, r: Rect, ds: &rustgis_data::Dataset, rows: usize, ink:
     }
 }
 
-/// A bar chart of a field's values, largest first (up to 20 bars): its title and labels in `dark`.
-fn chart(pm: &mut Canvas, r: Rect, ds: &rustgis_data::Dataset, field: &str, label: Option<&str>, dark: Rgba, ppp: f64) {
+/// A bar chart of `data`'s bars ([`ElementKind::chart_data`]) drawn as `look` says, its title,
+/// labels and values in `dark`, its values with a decimal comma when `comma`. With a negative
+/// value, bars run either way from a zero line (#2487).
+fn chart(pm: &mut Canvas, r: Rect, data: &rustgis_map::layout::ChartData, look: &ChartLook, dark: Rgba, ppp: f64, comma: bool) {
     let ppp = ppp as f32;
-    let Some(fi) = ds.field_index(field) else {
-        placeholder(pm, r, "Chart", ppp as f64);
-        return;
-    };
-    let li = label.and_then(|l| ds.field_index(l));
-    let mut vals: Vec<(f64, String)> = (0..ds.features.len())
-        .filter_map(|row| {
-            ds.value(row, fi).as_f64().filter(|v| v.is_finite()).map(|v| (v, li.map(|i| ds.value(row, i).to_string()).unwrap_or_default()))
-        })
-        .collect();
-    vals.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    vals.truncate(20);
+    let vals = &data.bars;
     let max = vals.iter().map(|v| v.0).fold(0.0_f64, f64::max);
-    if vals.is_empty() || max <= 0.0 {
+    let min = vals.iter().map(|v| v.0).fold(0.0_f64, f64::min);
+    if vals.is_empty() || (max <= 0.0 && min >= 0.0) {
         placeholder(pm, r, "Chart", ppp as f64);
         return;
     }
     let px = 7.5 * 1.33 * ppp;
-    let title_h = px * 1.6;
-    text::text_at(pm, field, r.x(), r.y() + title_h / 2.0, px * 1.15, dark, true, text::Align::Left, false);
-    let label_w = if li.is_some() { r.width() * 0.32 } else { 0.0 };
-    let bar_area = r.width() - label_w - 4.0;
-    let bh = ((r.height() - title_h) / vals.len() as f32).min(18.0 * ppp);
-    for (i, (v, name)) in vals.iter().enumerate() {
-        let y = r.y() + title_h + bh * i as f32;
-        let w = (bar_area * (*v / max) as f32).max(1.0);
-        if let Some(b) = Rect::from_xywh(r.x() + label_w, y + bh * 0.15, w, bh * 0.7) {
-            pm.fill_rect(b, &paint(Rgba::rgb(0x3B, 0x82, 0xC4), 1.0), Transform::identity(), None);
+    // No title leaves its room to the bars.
+    let title_h = if data.title.is_empty() { 0.0 } else { px * 1.6 };
+    if !data.title.is_empty() {
+        text::text_at(pm, &data.title, r.x(), r.y() + title_h / 2.0, px * 1.15, dark, true, text::Align::Left, false);
+    }
+    // Each bar's value as written past its end, when it has them.
+    let values: Vec<String> = if look.values {
+        vals.iter().map(|(v, _)| decimal(rustgis_map::layout::chart_value_text(*v, look.decimals), comma)).collect()
+    } else {
+        Vec::new()
+    };
+    let bars = ChartBars { r, title_h, vals, values: &values, min, max, px, ppp, dark, look };
+    match look.orientation {
+        Orientation::Horizontal => bars.across(pm, data.labelled),
+        Orientation::Vertical => bars.columns(pm, data.labelled),
+    }
+}
+
+/// `name`'s first 30 characters, cut from their end while `too_wide` says they don't fit.
+fn fit_label(name: &str, too_wide: impl Fn(&str) -> bool) -> String {
+    let mut t: String = name.chars().take(30).collect();
+    while !t.is_empty() && too_wide(&t) {
+        t.pop();
+    }
+    t
+}
+
+/// What [`chart`] draws its bars from: its box, the height of its title over the bars, the bars
+/// and their values written out (none without), the least and greatest value (0 among them), its
+/// text size and pixels per point.
+struct ChartBars<'a> {
+    r: Rect,
+    title_h: f32,
+    vals: &'a [(f64, String)],
+    values: &'a [String],
+    min: f64,
+    max: f64,
+    px: f32,
+    ppp: f32,
+    dark: Rgba,
+    look: &'a ChartLook,
+}
+
+impl ChartBars<'_> {
+    fn bar(&self, pm: &mut Canvas, x: f32, y: f32, w: f32, h: f32) {
+        if let Some(b) = Rect::from_xywh(x, y, w, h) {
+            pm.fill_rect(b, &paint(self.look.bar_color, 1.0), Transform::identity(), None);
         }
-        if li.is_some() {
-            let mut t: String = name.chars().take(30).collect();
-            while !t.is_empty() && text::measure(&t, 7.5, false) * ppp > label_w - 4.0 * ppp {
-                t.pop();
+    }
+
+    /// What part `v` is of the span from the lowest value (or zero) to the highest (or zero). A span
+    /// past a number's range (the largest number and its opposite) is taken by halves.
+    fn share(&self, v: f64) -> f32 {
+        let span = self.max - self.min;
+        (if span.is_finite() { v / span } else { (v / 2.0) / (self.max / 2.0 - self.min / 2.0) }) as f32
+    }
+
+    /// The widest of the values written at `size` pixels past the bars running one way:
+    /// positive ones, or negative ones (`negative`); 0 without values.
+    fn widest(&self, size: f32, negative: bool) -> f32 {
+        self.vals
+            .iter()
+            .zip(self.values)
+            .filter(|((v, _), _)| (*v < 0.0) == negative)
+            .map(|(_, t)| text::measure(t, size / 1.33, false))
+            .fold(0.0, f32::max)
+    }
+
+    /// Bars running across, labels in a column at their left, each value past its bar's end with
+    /// room kept for it at the side its bar runs to.
+    fn across(&self, pm: &mut Canvas, labelled: bool) {
+        let (r, ppp, px) = (self.r, self.ppp, self.px);
+        let label_w = if labelled { r.width() * 0.32 } else { 0.0 };
+        let bh = ((r.height() - self.title_h) / self.vals.len() as f32).min(18.0 * ppp);
+        let size = px.min(bh * 0.9);
+        let gap = 2.0 * ppp;
+        let room = |negative: bool, size: f32| {
+            let w = self.widest(size, negative);
+            if w > 0.0 { w + gap } else { 0.0 }
+        };
+        // Values take at most half the width beside the labels, written smaller past that.
+        let beside = r.width() - label_w - 4.0;
+        let mut value_size = size;
+        let (mut room_lo, mut room_hi) = (room(true, size), room(false, size));
+        if room_lo + room_hi > beside * 0.5 {
+            // Only the text grows smaller: the gaps beside it stay as they are.
+            let gaps = [room_lo, room_hi].iter().filter(|w| **w > 0.0).count() as f32 * gap;
+            let text = room_lo + room_hi - gaps;
+            value_size = (size * (beside * 0.5 - gaps) / text).max(0.0);
+            (room_lo, room_hi) = (room(true, value_size), room(false, value_size));
+        }
+        let bar_area = beside - room_lo - room_hi;
+        // Where the bars start: the left of the bar area when none is negative.
+        let zero = r.x() + label_w + room_lo + bar_area * self.share(-self.min);
+        let right = self.look.label_align == TextAlign::Right;
+        for (i, (v, name)) in self.vals.iter().enumerate() {
+            let y = r.y() + self.title_h + bh * i as f32;
+            let w = (bar_area * self.share(v.abs())).max(1.0);
+            let x = if *v < 0.0 { zero - w } else { zero };
+            self.bar(pm, x, y + bh * 0.15, w, bh * 0.7);
+            if labelled {
+                let t = fit_label(name, |t| text::measure(t, 7.5, false) * ppp > label_w - 4.0 * ppp);
+                // At the column's right, the label ends where the bars' side begins.
+                let (lx, align) = if right { (r.x() + label_w - 2.0 * ppp, text::Align::Right) } else { (r.x(), text::Align::Left) };
+                text::text_at(pm, &t, lx, y + bh / 2.0, size, self.dark, false, align, false);
             }
-            text::text_at(pm, &t, r.x(), y + bh / 2.0, px.min(bh * 0.9), dark, false, text::Align::Left, false);
+            if let Some(t) = self.values.get(i) {
+                let (vx, align) = if *v < 0.0 { (x - gap, text::Align::Right) } else { (x + w + gap, text::Align::Left) };
+                text::text_at(pm, t, vx, y + bh / 2.0, value_size, self.dark, false, align, false);
+            }
+        }
+        if self.min < 0.0
+            && let Some(line) = Rect::from_xywh(zero - 0.375 * ppp, r.y() + self.title_h, 0.75 * ppp, bh * self.vals.len() as f32)
+        {
+            pm.fill_rect(line, &paint(self.dark, 1.0), Transform::identity(), None);
+        }
+    }
+
+    /// Columns standing on a zero line, each label centred under its column and cut to its width,
+    /// each value over a column (under one going down), made smaller to fit a narrow column.
+    fn columns(&self, pm: &mut Canvas, labelled: bool) {
+        let (r, ppp, px) = (self.r, self.ppp, self.px);
+        let slot = r.width() / self.vals.len() as f32;
+        let widest = self.widest(px, false).max(self.widest(px, true));
+        let value_px = if widest > slot * 0.95 { px * slot * 0.95 / widest } else { px };
+        let value_h = value_px * 1.4;
+        let room_hi = if self.max > 0.0 && !self.values.is_empty() { value_h } else { 0.0 };
+        let room_lo = if self.min < 0.0 && !self.values.is_empty() { value_h } else { 0.0 };
+        let label_h = if labelled { px * 1.4 } else { 0.0 };
+        let top = r.y() + self.title_h + room_hi;
+        let plot_h = r.bottom() - label_h - room_lo - top;
+        if plot_h <= 0.0 {
+            placeholder(pm, r, "Chart", ppp as f64);
+            return;
+        }
+        // Where the columns stand: the bottom of the plot when none is negative.
+        let zero = top + plot_h * self.share(self.max);
+        for (i, (v, name)) in self.vals.iter().enumerate() {
+            let cx = r.x() + slot * (i as f32 + 0.5);
+            let h = (plot_h * self.share(v.abs())).max(1.0);
+            let y = if *v < 0.0 { zero } else { zero - h };
+            self.bar(pm, cx - slot * 0.35, y, slot * 0.7, h);
+            if let Some(t) = self.values.get(i) {
+                let vy = if *v < 0.0 { zero + h + value_h / 2.0 } else { zero - h - value_h / 2.0 };
+                text::text_at(pm, t, cx, vy, value_px, self.dark, false, text::Align::Center, false);
+            }
+            if labelled {
+                let t = fit_label(name, |t| text::measure(t, px / 1.33, false) > slot - 2.0 * ppp);
+                text::text_at(pm, &t, cx, r.bottom() - label_h / 2.0, px, self.dark, false, text::Align::Center, false);
+            }
+        }
+        if self.min < 0.0
+            && let Some(line) = Rect::from_xywh(r.x(), zero - 0.375 * ppp, r.width(), 0.75 * ppp)
+        {
+            pm.fill_rect(line, &paint(self.dark, 1.0), Transform::identity(), None);
         }
     }
 }
@@ -3479,6 +3837,221 @@ pub fn map_index(maps: &[rustgis_map::Map], name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chart element of layer "t" on frame 1, with `extra` keys (its field among them).
+    fn chart_kind(extra: serde_json::Value) -> ElementKind {
+        let mut chart = serde_json::json!({"frame": 1, "layer": "t"});
+        if let (Some(c), Some(e)) = (chart.as_object_mut(), extra.as_object()) {
+            c.extend(e.clone());
+        }
+        serde_json::from_value(serde_json::json!({ "Chart": chart })).unwrap()
+    }
+
+    /// The chart as it was drawn before charts were grouped, ordered or cut by choice, kept to
+    /// show a chart saved then still draws to the same pixels.
+    fn chart_before(pm: &mut Canvas, r: Rect, ds: &rustgis_data::Dataset, field: &str, label: Option<&str>, dark: Rgba, ppp: f64) {
+        let ppp = ppp as f32;
+        let Some(fi) = ds.field_index(field) else {
+            placeholder(pm, r, "Chart", ppp as f64);
+            return;
+        };
+        let li = label.and_then(|l| ds.field_index(l));
+        let mut vals: Vec<(f64, String)> = (0..ds.features.len())
+            .filter_map(|row| {
+                ds.value(row, fi)
+                    .as_f64()
+                    .filter(|v| v.is_finite())
+                    .map(|v| (v, li.map(|i| ds.value(row, i).to_string()).unwrap_or_default()))
+            })
+            .collect();
+        vals.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        vals.truncate(20);
+        let max = vals.iter().map(|v| v.0).fold(0.0_f64, f64::max);
+        if vals.is_empty() || max <= 0.0 {
+            placeholder(pm, r, "Chart", ppp as f64);
+            return;
+        }
+        let px = 7.5 * 1.33 * ppp;
+        let title_h = px * 1.6;
+        text::text_at(pm, field, r.x(), r.y() + title_h / 2.0, px * 1.15, dark, true, text::Align::Left, false);
+        let label_w = if li.is_some() { r.width() * 0.32 } else { 0.0 };
+        let bar_area = r.width() - label_w - 4.0;
+        let bh = ((r.height() - title_h) / vals.len() as f32).min(18.0 * ppp);
+        for (i, (v, name)) in vals.iter().enumerate() {
+            let y = r.y() + title_h + bh * i as f32;
+            let w = (bar_area * (*v / max) as f32).max(1.0);
+            if let Some(b) = Rect::from_xywh(r.x() + label_w, y + bh * 0.15, w, bh * 0.7) {
+                pm.fill_rect(b, &paint(Rgba::rgb(0x3B, 0x82, 0xC4), 1.0), Transform::identity(), None);
+            }
+            if li.is_some() {
+                let mut t: String = name.chars().take(30).collect();
+                while !t.is_empty() && text::measure(&t, 7.5, false) * ppp > label_w - 4.0 * ppp {
+                    t.pop();
+                }
+                text::text_at(pm, &t, r.x(), y + bh / 2.0, px.min(bh * 0.9), dark, false, text::Align::Left, false);
+            }
+        }
+    }
+
+    /// A chart saved before grouping, order and limits draws to the same pixels: with labels or
+    /// without, past 20 features, with rows with no number, a missing label field, all zero.
+    #[test]
+    fn a_chart_saved_before_draws_to_the_same_pixels() {
+        use rustgis_data::{Dataset, Field, FieldType, Geometry, Value};
+        let mut ds = Dataset::new("t", GeometryType::Point, vec![Field::new("name", FieldType::Text), Field::new("n", FieldType::Double)]);
+        for i in 0..27 {
+            let n = match i {
+                3 => Value::Null,
+                5 => Value::Float(f64::NAN),
+                _ => Value::Float(((i * 37) % 23) as f64 + 0.5),
+            };
+            ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text(format!("Place {i}")), n]);
+        }
+        let mut zeros = Dataset::new("t", GeometryType::Point, vec![Field::new("n", FieldType::Double)]);
+        zeros.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Float(0.0)]);
+        let r = Rect::from_xywh(7.0, 5.0, 230.0, 170.0).unwrap();
+        for (ds, label, ppp) in [(&ds, Some("name"), 1.0), (&ds, None, 2.0), (&ds, Some("gone"), 1.5), (&zeros, None, 1.0)] {
+            let draw = |f: &dyn Fn(&mut Canvas)| {
+                let mut c = Canvas::new(480, 360).unwrap();
+                f(&mut c);
+                c
+            };
+            let before = draw(&|c| chart_before(c, r, ds, "n", label, INK, ppp));
+            let kind = chart_kind(serde_json::json!({"field": "n", "label": label}));
+            let now = draw(&|c| match kind.chart_data(ds) {
+                Some(data) => chart(c, r, &data, &ChartLook::default(), INK, ppp, false),
+                None => placeholder(c, r, "Chart", ppp),
+            });
+            assert!(before.pixmap().data() == now.pixmap().data(), "{label:?} at {ppp}");
+        }
+    }
+
+    /// A negative value runs left of a zero line in the ink; a positive one right of it.
+    #[test]
+    fn a_chart_with_a_negative_value_draws_from_a_zero_line() {
+        use rustgis_data::{Dataset, Field, FieldType, Geometry, Value};
+        let mut ds = Dataset::new("t", GeometryType::Point, vec![Field::new("n", FieldType::Double)]);
+        for n in [3.0, -1.0] {
+            ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Float(n)]);
+        }
+        let data = chart_kind(serde_json::json!({"field": "n"})).chart_data(&ds).unwrap();
+        let mut c = Canvas::new(200, 120).unwrap();
+        let r = Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap();
+        chart(&mut c, r, &data, &ChartLook::default(), INK, 1.0, false);
+        // Bar area 196 px over a span of 4: zero at 49 px. Rows of 18 px under a 16 px title,
+        // their bars from 18.7 to 30.6 px and from 36.7 to 48.6 px down.
+        assert!(bar_blue(&c, 150, 25) && !bar_blue(&c, 30, 25), "3 runs right of zero");
+        assert!(bar_blue(&c, 30, 43) && !bar_blue(&c, 70, 43), "-1 runs left of zero");
+        // Between the bars, the zero line (0.75 px wide, so partly covering its pixel).
+        let line = c.pixmap().pixel(49, 34).unwrap();
+        assert!(line.alpha() > 60 && line.blue() < 60, "the zero line: {line:?}");
+    }
+
+    /// A chart of `vals` (value and name, labelled by the name) drawn with the keys `extra` on a
+    /// 200 × 120 canvas filling it.
+    fn chart_drawn(vals: &[(f64, &str)], extra: serde_json::Value) -> Canvas {
+        use rustgis_data::{Dataset, Field, FieldType, Geometry, Value};
+        let mut ds = Dataset::new("t", GeometryType::Point, vec![Field::new("name", FieldType::Text), Field::new("n", FieldType::Double)]);
+        for (n, name) in vals {
+            ds.push(Some(Geometry::Point(Coord::new(0.0, 0.0))), vec![Value::Text((*name).into()), Value::Float(*n)]);
+        }
+        let mut keys = serde_json::json!({"field": "n", "order": "layer"});
+        if let (Some(k), Some(e)) = (keys.as_object_mut(), extra.as_object()) {
+            k.extend(e.clone());
+        }
+        let kind = chart_kind(keys);
+        let data = kind.chart_data(&ds).unwrap();
+        let mut c = Canvas::new(200, 120).unwrap();
+        let r = Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap();
+        chart(&mut c, r, &data, &kind.chart_look().unwrap(), INK, 1.0, false);
+        c
+    }
+
+    fn bar_blue(c: &Canvas, x: u32, y: u32) -> bool {
+        c.pixmap().pixel(x, y).is_some_and(|p| p.blue() > 150 && p.red() < 100)
+    }
+
+    /// Ink (dark, opaque enough) in the pixels `xs` × `ys`, read unpremultiplied: a bar's
+    /// half-covered edge is its own colour, not a dark one.
+    fn chart_inked(c: &Canvas, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>) -> bool {
+        xs.flat_map(|x| ys.clone().map(move |y| (x, y)))
+            .any(|(x, y)| c.pixmap().pixel(x, y).map(|p| p.demultiply()).is_some_and(|p| p.alpha() > 80 && p.blue() < 90 && p.red() < 90))
+    }
+
+    /// Columns stand on the bottom, a slot each, 70 % of it wide; with no title they take its room.
+    #[test]
+    fn a_vertical_chart_draws_columns() {
+        let c = chart_drawn(&[(3.0, "a"), (1.0, "b")], serde_json::json!({"orientation": "Vertical", "title": ""}));
+        // Slots of 100 px, columns from 15 to 85 and 115 to 185; 3 fills the 120 px, 1 a third.
+        assert!(bar_blue(&c, 50, 10) && bar_blue(&c, 50, 110), "3 fills its slot's height");
+        assert!(!bar_blue(&c, 150, 60) && bar_blue(&c, 150, 100), "1 stands a third as high");
+        assert!(!bar_blue(&c, 100, 110) && !bar_blue(&c, 5, 110), "gaps between and beside the columns");
+        // A negative one hangs from a zero line in the ink.
+        let c = chart_drawn(&[(3.0, "a"), (-1.0, "b")], serde_json::json!({"orientation": "Vertical", "title": ""}));
+        assert!(bar_blue(&c, 50, 60) && !bar_blue(&c, 50, 100), "3 stands above zero at 90 px");
+        assert!(bar_blue(&c, 150, 105) && !bar_blue(&c, 150, 60), "-1 hangs below it");
+        // Labelled, the labels sit under the columns, centred on them.
+        let c = chart_drawn(&[(3.0, "a"), (1.0, "b")], serde_json::json!({"orientation": "Vertical", "label": "name", "title": ""}));
+        assert!(chart_inked(&c, 40..60, 108..120) && chart_inked(&c, 140..160, 108..120) && !bar_blue(&c, 50, 112));
+    }
+
+    /// Values are written past each bar's end, the bars kept short enough to leave them room;
+    /// a negative one's past its left end.
+    #[test]
+    fn a_charts_values_are_written_past_its_bars() {
+        let plain = chart_drawn(&[(3.0, "a")], serde_json::json!({}));
+        let valued = chart_drawn(&[(3.0, "a")], serde_json::json!({"values": true}));
+        // One row of 18 px under a 16 px title: the bar from 18.7 to 30.6 px down.
+        assert!(bar_blue(&plain, 194, 25) && !chart_inked(&plain, 150..200, 18..32));
+        assert!(!bar_blue(&valued, 194, 25) && bar_blue(&valued, 150, 25) && chart_inked(&valued, 185..200, 18..32), "3 at the bar's end");
+        let negative = chart_drawn(&[(3.0, "a"), (-1.0, "b")], serde_json::json!({"values": true}));
+        assert!(chart_inked(&negative, 0..40, 36..50), "-1 left of its bar");
+    }
+
+    /// Values too wide for the chart are written smaller, leaving the bars half its width.
+    #[test]
+    fn a_charts_wide_values_leave_its_bars_room() {
+        let c = chart_drawn(&[(1e12, "a"), (-1e12, "b")], serde_json::json!({"values": true}));
+        // The bars of 1e12 and -1e12 take the bar area between them: at least half of the 196 px.
+        let blue = (0..200).filter(|x| bar_blue(&c, *x, 25) || bar_blue(&c, *x, 43)).count();
+        assert!(blue >= 97, "{blue} px of bar");
+        assert!(chart_inked(&c, 150..200, 18..32), "its value beside it");
+    }
+
+    /// The largest number and its opposite span past a number's range: each bar still takes its
+    /// half of the chart, across or as columns.
+    #[test]
+    fn a_charts_bars_past_a_numbers_range_take_their_half() {
+        let across = chart_drawn(&[(f64::MAX, "a"), (-f64::MAX, "b")], serde_json::json!({}));
+        let row = |y: u32| (0..200).filter(|x| bar_blue(&across, *x, y)).count();
+        assert!(row(25) > 50 && row(43) > 50, "{} and {} px", row(25), row(43));
+        let columns = chart_drawn(&[(f64::MAX, "a"), (-f64::MAX, "b")], serde_json::json!({"orientation": "Vertical"}));
+        let up = (0..120).filter(|y| bar_blue(&columns, 50, *y)).count();
+        let down = (0..120).filter(|y| bar_blue(&columns, 150, *y)).count();
+        assert!(up > 30 && down > 30, "{up} and {down} px");
+    }
+
+    /// No title gives its room to the bars; a bar colour is drawn as given.
+    #[test]
+    fn a_chart_without_a_title_and_with_a_bar_colour() {
+        let titled = chart_drawn(&[(3.0, "a")], serde_json::json!({}));
+        let untitled = chart_drawn(&[(3.0, "a")], serde_json::json!({"title": ""}));
+        assert!(!bar_blue(&titled, 150, 8) && bar_blue(&untitled, 150, 8));
+        assert!(chart_inked(&titled, 0..20, 0..16) && !chart_inked(&untitled, 0..20, 0..16), "the title, or none");
+        let rose = chart_drawn(&[(3.0, "a")], serde_json::json!({"bar_color": [194, 24, 91, 255]}));
+        let p = rose.pixmap().pixel(150, 25).unwrap();
+        assert!(p.red() > 180 && p.green() < 40 && p.blue() > 80 && p.blue() < 100, "{p:?}");
+    }
+
+    /// Labels at the right of their column end against the bars; at its left, from its edge.
+    #[test]
+    fn a_charts_labels_sit_left_or_against_the_bars() {
+        let left = chart_drawn(&[(3.0, "Madrid")], serde_json::json!({"label": "name"}));
+        let right = chart_drawn(&[(3.0, "Madrid")], serde_json::json!({"label": "name", "label_align": "Right"}));
+        // The labels' column is 64 px wide.
+        assert!(chart_inked(&left, 0..6, 18..32) && !chart_inked(&left, 56..63, 18..32));
+        assert!(!chart_inked(&right, 0..6, 18..32) && chart_inked(&right, 50..63, 18..32));
+    }
 
     /// Both map frames share the index feature, even though the locator draws a different map.
     /// A page using expressions draws exactly like the same page with its values written inline.
@@ -3603,7 +4176,8 @@ mod tests {
             assert_eq!(reddish(&legend), expected, "legend {ink:?}");
             assert_eq!(reddish(&draw(&|c| colorbar(c, r, &grey, &bar(ink), 1.0))), expected, "colorbar {ink:?}");
             // Its bars keep their blue.
-            assert_eq!(reddish(&draw(&|c| chart(c, r, &ds, "n", Some("name"), ink, 1.0))), expected, "chart {ink:?}");
+            let data = chart_kind(serde_json::json!({"field": "n", "label": "name"})).chart_data(&ds).unwrap();
+            assert_eq!(reddish(&draw(&|c| chart(c, r, &data, &ChartLook::default(), ink, 1.0, false))), expected, "chart {ink:?}");
         }
         // Two columns 90 px wide, a header and two rows 17 px high: (175, 25) is in the first
         // row's empty right end, (175, 8) in the header's.
@@ -4260,6 +4834,13 @@ mod tests {
         // A 100 mm frame at 1:1,000,000 shows about 0.9° across: the square sits in its middle.
         let plain = |map: &mut Map, under| frame_plain_under(map, Coord::new(0.0, 0.0), 1_000_000.0, (100.0, 100.0), under, 128);
         assert!(plain(&mut map, (2.0, 70.0, 25.0, 25.0)), "a corner is the blank paper");
+        // A paper colour (#2532) is the background too, and coverage still finds only the data.
+        let white = frame_coverage(&mut map, Coord::new(0.0, 0.0), 1_000_000.0, 100.0, 100.0, 64);
+        map.paper = Some(Rgba::rgb(0xF1, 0xEA, 0xDF));
+        assert!(plain(&mut map, (2.0, 70.0, 25.0, 25.0)), "a corner is the coloured paper");
+        assert_eq!(frame_coverage(&mut map, Coord::new(0.0, 0.0), 1_000_000.0, 100.0, 100.0, 64), white);
+        assert_eq!(map.paper, Some(Rgba::rgb(0xF1, 0xEA, 0xDF)), "put back after coverage");
+        map.paper = None;
         assert!(!plain(&mut map, (40.0, 40.0, 20.0, 20.0)), "the data in the middle");
         assert!(!plain(&mut map, (48.0, 48.0, 4.0, 4.0)), "one colour all over, but the data's, not the background");
         map.graticule = true;
@@ -4856,6 +5437,8 @@ mod tests {
                 extent_of: None,
                 extent_color: rustgis_map::layout::INDICATOR_COLOR,
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+                border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
             },
@@ -4958,6 +5541,8 @@ mod tests {
                 extent_of: None,
                 extent_color: rustgis_map::layout::INDICATOR_COLOR,
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+                border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
             };
@@ -5104,6 +5689,8 @@ mod tests {
             extent_of,
             extent_color: color,
             extent_width: width,
+            border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+            border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
         };
@@ -5364,6 +5951,120 @@ mod tests {
         assert_eq!(clipped_text(&l, &[], 96.0, &info), vec![(id, "Note".into())]);
     }
 
+    /// A wrapped text past the 200 lines a text draws is reported cut, even when its 201st line is
+    /// blank and the text goes on after it (#2346); one followed only by blank lines loses nothing
+    /// and isn't.
+    #[test]
+    fn a_wrapped_text_past_its_last_drawn_line_is_reported_cut() {
+        let info = PageInfo::default();
+        let page = |tail: &str| {
+            let mut l = Layout::new("L", 100.0, 1500.0);
+            let mut kind = ElementKind::text(format!("{}{tail}", vec!["a"; 200].join("\n")), 12.0, Rgba::rgb(0, 0, 0), false);
+            if let ElementKind::Text { wrap, .. } = &mut kind {
+                *wrap = true;
+            }
+            let id = l.add("Note", (10.0, 10.0, 40.0, 1400.0), kind);
+            (l, id)
+        };
+        let (l, id) = page("\n\u{a0}\nZ");
+        assert_eq!(clipped_text(&l, &[], 96.0, &info), vec![(id, "Note".into())]);
+        let (l, _) = page("\n\n\n");
+        assert!(clipped_text(&l, &[], 96.0, &info).is_empty(), "only blank lines past it");
+        // Counted as more than the one line seen: the wrapped text was broken no further.
+        let (l, id) = page("\nZ");
+        let loss = text_losses(&l, &[], 96.0, &info);
+        assert_eq!(loss, vec![TextLoss { id, name: "Note".into(), left_out: 1, at_least: true, below_box: false, past_limit: true }]);
+        let said = lines_left_out_notice(&loss[0]).unwrap();
+        assert!(said.starts_with("1 or more lines of the text \"Note\""), "{said}");
+        assert!(said.ends_with("aren't drawn: a text draws at most 200 lines; split it into more than one text"), "{said}");
+    }
+
+    /// The lines of a text left out below its box are counted, blank ones not, and said in the
+    /// singular or the plural; a text whose lines all fit says nothing (#2346).
+    #[test]
+    fn a_text_counts_the_lines_left_out_of_its_box() {
+        let info = PageInfo::default();
+        let mut l = note_page("one\ntwo\n\nfour\nfive", false, TextAlign::Left, 0.0);
+        let id = l.elements[0].id;
+        let losses = |l: &Layout| text_losses(l, &[], 96.0, &info);
+        assert!(losses(&l).is_empty(), "all fit");
+        l.element_mut(id).unwrap().h = 2.0;
+        let loss = losses(&l);
+        assert_eq!(loss, vec![TextLoss { id, name: "Note".into(), left_out: 3, at_least: false, below_box: true, past_limit: false }]);
+        // The element alone is measured the same, and another id finds nothing.
+        assert_eq!(text_loss(&l, &[], 96.0, &info, id).as_ref(), loss.first());
+        assert_eq!(text_loss(&l, &[], 96.0, &info, id + 1), None);
+        let said = lines_left_out_notice(&loss[0]).unwrap();
+        assert!(said.starts_with(&format!("3 lines of the text \"Note\" ({id}) don't fit its box and aren't drawn")), "{said}");
+        if let ElementKind::Text { text, .. } = &mut l.element_mut(id).unwrap().kind {
+            *text = "one\ntwo".into();
+        }
+        let said = lines_left_out_notice(&losses(&l)[0]).unwrap();
+        assert!(said.starts_with(&format!("1 line of the text \"Note\" ({id}) doesn't fit its box and isn't drawn")), "{said}");
+        // Off the page but all drawn: cut, with no line left out to count.
+        let e = l.element_mut(id).unwrap();
+        (e.h, e.x) = (60.0, 99.0);
+        let loss = losses(&l);
+        assert_eq!(loss.len(), 1);
+        assert_eq!(lines_left_out_notice(&loss[0]), None);
+    }
+
+    /// A long text counts every line left out below its box, each only looked at for a letter
+    /// past the box: none is shaped there (#2346).
+    #[test]
+    fn a_long_text_counts_every_line_left_out() {
+        let info = PageInfo::default();
+        let mut l = note_page(&vec!["x"; 3000].join("\n"), false, TextAlign::Left, 0.0);
+        let id = l.elements[0].id;
+        l.element_mut(id).unwrap().h = 2.0;
+        let loss = text_losses(&l, &[], 96.0, &info);
+        assert_eq!(loss, vec![TextLoss { id, name: "Note".into(), left_out: 2999, at_least: false, below_box: true, past_limit: true }]);
+        let said = lines_left_out_notice(&loss[0]).unwrap();
+        assert!(said.ends_with("make the box taller or the text smaller, and split it, as a text draws at most 200 lines"), "{said}");
+        // A box tall enough for 200 lines: the rest are past the limit, which no box draws (#2346).
+        let mut tall = note_page(&vec!["x"; 250].join("\n"), false, TextAlign::Left, 0.0);
+        tall.height = 2000.0;
+        tall.element_mut(id).unwrap().h = 1900.0;
+        let loss = text_losses(&tall, &[], 96.0, &info);
+        assert_eq!(loss, vec![TextLoss { id, name: "Note".into(), left_out: 50, at_least: false, below_box: false, past_limit: true }]);
+        let said = lines_left_out_notice(&loss[0]).unwrap();
+        assert_eq!(
+            said,
+            format!("50 lines of the text \"Note\" ({id}) aren't drawn: a text draws at most 200 lines; split it into more than one text")
+        );
+        // Blank lines below the box and then one letter: that one line is left out.
+        let mut l = note_page(&format!("x{}\nZ", "\n".repeat(2000)), false, TextAlign::Left, 0.0);
+        l.element_mut(id).unwrap().h = 2.0;
+        assert_eq!(
+            text_losses(&l, &[], 96.0, &info),
+            vec![TextLoss { id, name: "Note".into(), left_out: 1, at_least: false, below_box: false, past_limit: true }]
+        );
+    }
+
+    /// The cut-off notice suggests breaking lines or wrapping them for a text not wrapped, and
+    /// only the box or the size when every text it names is wrapped already (#2346).
+    #[test]
+    fn the_cut_off_notice_suggests_wrapping_a_text_not_wrapped() {
+        let info = PageInfo::default();
+        for wrap in [false, true] {
+            let mut l = note_page(NOTE, wrap, TextAlign::Left, 0.0);
+            let id = l.elements[0].id;
+            l.element_mut(id).unwrap().h = 2.0;
+            let note = clipped_text_notice(&l, &clipped_text(&l, &[], 96.0, &info)).unwrap();
+            assert!(note.starts_with(&format!("Text is cut off in 1 layout element(s): Note ({id}); ")), "{note}");
+            assert_eq!(note.contains("Wrap to the box"), !wrap, "{note}");
+            assert_eq!(note.contains("add line breaks"), !wrap, "{note}");
+            assert!(note.contains("reduce its size"), "{note}");
+        }
+        // A legend's title, or an element gone since, has no wrap to turn on: line breaks, as before.
+        let l = note_page(NOTE, true, TextAlign::Left, 0.0);
+        let note = clipped_text_notice(&l, &[(999, "Gone".into())]).unwrap();
+        assert!(note.ends_with("resize or move the text, reduce its size, or add line breaks"), "{note}");
+        let both = clipped_text_notice(&l, &[(l.elements[0].id, "Note".into()), (999, "Gone".into())]).unwrap();
+        assert!(!both.contains("Wrap to the box") && both.contains("add line breaks"), "{both}");
+        assert_eq!(clipped_text_notice(&Layout::new("L", 10.0, 10.0), &[]), None);
+    }
+
     /// The same lines at every resolution: they are measured at one (#2346), so the layout view,
     /// an image export and a print break a text alike.
     #[test]
@@ -5577,6 +6278,71 @@ Elaboração: RustGIS",
         assert!(t > 0 && w > 3 * t, "a wider outline covers more: {t} at 1 pt, {w} at 6 pt");
     }
 
+    /// A map frame's border (#2557): dark grey and 0.8 pt by default, in its own colour and width
+    /// once set, none at a width of 0, and along the frame's shape, a round frame's leaving the
+    /// corners of its box clear.
+    #[test]
+    fn a_map_frame_border_takes_its_colour_and_width_or_none() {
+        use rustgis_map::layout::{FRAME_BORDER_COLOR, FRAME_BORDER_WIDTH, INDICATOR_COLOR, INDICATOR_WIDTH};
+        let page = |shape: FrameShape, border_color: Rgba, border_width: f64| {
+            let mut map = Map::new("m");
+            (map.basemap, map.graticule) = (rustgis_map::Basemap::Blank, false);
+            let mut l = Layout::new("Layout", 100.0, 100.0);
+            l.add(
+                "Frame",
+                (20.0, 20.0, 60.0, 60.0),
+                ElementKind::MapFrame {
+                    map: "m".into(),
+                    center: Coord::new(0.0, 0.0),
+                    scale: 1e7,
+                    shape,
+                    grid: None,
+                    extent_of: None,
+                    extent_color: INDICATOR_COLOR,
+                    extent_width: INDICATOR_WIDTH,
+                    border_color,
+                    border_width,
+                    bearing: 0.0,
+                    pitch: 0.0,
+                },
+            );
+            render(&l, &mut [map], 96.0, &PageInfo::default()).unwrap()
+        };
+        // Pixels of a tone (a line this thin is blended with the white page), over the whole page
+        // or in the frame box's top-left corner.
+        let count = |pm: &Pixmap, tone: fn(u8, u8, u8) -> bool, corner: bool| {
+            let edge = (20.0 * PT_PER_MM + 6.0) as u32;
+            let (w, h) = if corner { (edge, edge) } else { (pm.width(), pm.height()) };
+            (0..h)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let (r, g, b) = rgb(pm, x, y);
+                    tone(r, g, b)
+                })
+                .count()
+        };
+        let grey: fn(u8, u8, u8) -> bool = |r, g, b| r.max(g).max(b) - r.min(g).min(b) < 12 && r < 240;
+        let bluish: fn(u8, u8, u8) -> bool = |r, _, b| i32::from(b) - i32::from(r) > 30;
+        let inked: fn(u8, u8, u8) -> bool = |r, g, b| r.min(g).min(b) < 240;
+        let blue = Rgba::rgb(0x1F, 0x4E, 0x9A);
+        let default = page(FrameShape::Rectangle, FRAME_BORDER_COLOR, FRAME_BORDER_WIDTH);
+        assert!(count(&default, grey, false) > 0, "dark grey by default");
+        assert_eq!(count(&default, bluish, false), 0);
+        let thin = page(FrameShape::Rectangle, blue, 1.0);
+        let thick = page(FrameShape::Rectangle, blue, 6.0);
+        assert_eq!(count(&thin, grey, false), 0, "no grey once recoloured");
+        let (t, w) = (count(&thin, bluish, false), count(&thick, bluish, false));
+        assert!(t > 0 && w > 3 * t, "a wider border covers more: {t} at 1 pt, {w} at 6 pt");
+        let none = page(FrameShape::Rectangle, blue, 0.0);
+        assert_eq!(count(&none, inked, false), 0, "no border at 0");
+        let clear = page(FrameShape::Rectangle, Rgba::new(0x1F, 0x4E, 0x9A, 0), 3.0);
+        assert_eq!(count(&clear, inked, false), 0, "none in a clear colour");
+        let round = page(FrameShape::Circle, blue, 3.0);
+        assert!(count(&round, bluish, false) > 0, "a round frame has its border too");
+        assert_eq!(count(&round, bluish, true), 0, "along the circle, not the box's corner");
+        assert!(count(&thick, bluish, true) > 0, "a rectangle's border reaches its corner");
+    }
+
     /// On a globe, the extent indicator is drawn where the globe shows the area, also away from
     /// the disc's centre (#2348): through the flat camera, Svalbard 18° north of the centre came out
     /// half as far again up, nearly 5 mm off on a 50 mm locator.
@@ -5596,6 +6362,8 @@ Elaboração: RustGIS",
             extent_of,
             extent_color: INDICATOR_COLOR,
             extent_width: INDICATOR_WIDTH,
+            border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+            border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
         };
@@ -5643,6 +6411,8 @@ Elaboração: RustGIS",
             extent_of,
             extent_color: INDICATOR_COLOR,
             extent_width: INDICATOR_WIDTH,
+            border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+            border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
         };
@@ -5695,6 +6465,8 @@ Elaboração: RustGIS",
             extent_of,
             extent_color: INDICATOR_COLOR,
             extent_width: INDICATOR_WIDTH,
+            border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+            border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
         };
@@ -5766,6 +6538,8 @@ Elaboração: RustGIS",
             extent_of,
             extent_color: INDICATOR_COLOR,
             extent_width: INDICATOR_WIDTH,
+            border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+            border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
         };
@@ -5809,6 +6583,8 @@ Elaboração: RustGIS",
             extent_of,
             extent_color: INDICATOR_COLOR,
             extent_width: INDICATOR_WIDTH,
+            border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+            border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
         };
@@ -5848,6 +6624,74 @@ Elaboração: RustGIS",
         // The equator's row is crossed only by a line joining the top edge to the bottom one.
         let across: Vec<_> = red.iter().filter(|p| p.1.abs() < 1.0).collect();
         assert!(across.is_empty(), "the outline crosses the equator at {across:?}");
+    }
+
+    #[test]
+    fn an_extent_indicator_reaches_its_locators_projection_boundary() {
+        let source = Map::new("s");
+        let mut locator = Map::new("m");
+        locator.set_projection(rustgis_map::Projection::Custom("EPSG:32631".into()));
+        let center = Coord::new(3.0, 0.0);
+        let camera = rustgis_map::layout::frame_camera(&source, center, 1.75e8, 0.0, 0.0);
+        let top = source.to_lonlat(camera.to_map(40.0 * PT_PER_MM, 0.0, 80.0 * PT_PER_MM, 20.0 * PT_PER_MM)).unwrap().y;
+        let red = outline_on(source, (center, 1.75e8, 80.0, 20.0), locator.clone(), (center, 1.5e8));
+        // UTM's forward transform accepts 30 degrees on either side of its central meridian.
+        // All four ends reach that boundary, whether entering or leaving the visible area.
+        for lon in [-27.0 + 1e-7, 33.0 - 1e-7] {
+            for lat in [-top, top] {
+                let edge = locator.to_map(Coord::new(lon, lat)).unwrap();
+                let middle = locator.to_map(center).unwrap();
+                let expected = ((edge.x - middle.x) / 150_000.0, (middle.y - edge.y) / 150_000.0);
+                let distance = red.iter().map(|p| (p.0 - expected.0).hypot(p.1 - expected.1)).fold(f64::INFINITY, f64::min);
+                assert!(distance < 0.6, "the outline stops {distance:.2} mm short of ({lon}, {lat})");
+            }
+        }
+    }
+
+    /// A boundary search on either side of the date line follows the short arc, in either
+    /// direction, rather than drawing a chord across the UTM overview (#2433).
+    #[test]
+    fn an_overviews_boundary_search_crosses_the_date_line_on_the_short_arc() {
+        for (code, center, inside, outside, edge) in
+            [("EPSG:32655", 147.0, 176.0, -179.0, 177.0 - 1e-7), ("EPSG:32606", -147.0, -176.0, 179.0, -177.0 + 1e-7)]
+        {
+            let mut map = Map::new("overview");
+            map.set_projection(rustgis_map::Projection::Custom(code.into()));
+            let camera = rustgis_map::layout::frame_camera(&map, Coord::new(center, 0.0), 1e8, 0.0, 0.0);
+            let view = View { width: 600.0, height: 400.0, pixels_per_point: 1.0, camera, sky: false };
+            let screen = |lon| {
+                let p = map.to_map(Coord::new(lon, 10.0)).unwrap();
+                camera.try_to_screen(p, view.width, view.height).unwrap()
+            };
+            let start = screen(inside);
+            let end = screen(edge);
+            for reverse in [false, true] {
+                let mut ring = [Some(Coord::new(inside, 10.0)), Some(Coord::new(outside, 10.0))];
+                if reverse {
+                    ring.reverse();
+                }
+                let mut canvas = Canvas::new(600, 400).unwrap();
+                outline_lonlat(&mut canvas, &map, &view, &ring, false, Rgba::rgb(255, 0, 0), 2.0);
+                let pm = canvas.into_pixmap();
+                let red: Vec<_> = (0..400)
+                    .flat_map(|y| (0..600).map(move |x| (x, y)))
+                    .filter(|&(x, y)| {
+                        let (r, g, b) = rgb(&pm, x, y);
+                        r > 180 && g < 90 && b < 90
+                    })
+                    .map(|(x, y)| (f64::from(x), f64::from(y)))
+                    .collect();
+                assert!(!red.is_empty(), "{code}, reverse {reverse}: no outline");
+                assert!(
+                    red.iter().all(|p| p.0 >= start.0.min(end.0) - 2.0 && p.0 <= start.0.max(end.0) + 2.0),
+                    "{code}, reverse {reverse}: a chord across the overview"
+                );
+                assert!(
+                    red.iter().any(|p| (p.0 - end.0).hypot(p.1 - end.1) < 2.0),
+                    "{code}, reverse {reverse}: the outline does not reach the boundary"
+                );
+            }
+        }
     }
 
     /// A flat frame on a custom projection whose edges run off its world (Mollweide, zoomed out
@@ -5938,6 +6782,8 @@ Elaboração: RustGIS",
             extent_of,
             extent_color: INDICATOR_COLOR,
             extent_width: INDICATOR_WIDTH,
+            border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+            border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
         };
@@ -6031,6 +6877,8 @@ Elaboração: RustGIS",
                 extent_of: None,
                 extent_color: rustgis_map::layout::INDICATOR_COLOR,
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+                border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
             },
@@ -6155,6 +7003,8 @@ Elaboração: RustGIS",
                 extent_of: None,
                 extent_color: rustgis_map::layout::INDICATOR_COLOR,
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+                border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
             },
@@ -6194,6 +7044,8 @@ Elaboração: RustGIS",
                 extent_of: None,
                 extent_color: rustgis_map::layout::INDICATOR_COLOR,
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+                border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
             },
@@ -6450,6 +7302,8 @@ Elaboração: RustGIS",
                 extent_of: None,
                 extent_color: rustgis_map::layout::INDICATOR_COLOR,
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+                border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
             },
@@ -6482,6 +7336,8 @@ Elaboração: RustGIS",
                 extent_of: None,
                 extent_color: rustgis_map::layout::INDICATOR_COLOR,
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+                border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
             },
@@ -6856,6 +7712,8 @@ Elaboração: RustGIS",
                 extent_of: None,
                 extent_color: rustgis_map::layout::INDICATOR_COLOR,
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+                border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
             },
@@ -7241,6 +8099,272 @@ Elaboração: RustGIS",
         // The layer's name, then a row each, the swatch 6 points in.
         assert_eq!(at(14, 22), Some((255, 0, 0)));
         assert_eq!(at(14, 37), Some((0, 255, 0)));
+    }
+
+    /// A one-feature line or polygon layer, edited by `edit`.
+    fn shape_legend_map(gt: GeometryType, edit: impl FnOnce(&mut rustgis_map::Layer)) -> Map {
+        use rustgis_data::{Dataset, Geometry};
+        let mut map = Map::new("m");
+        let mut d = Dataset::new("shapes", gt, vec![]);
+        let (a, b, c) = (Coord::new(0.0, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0));
+        let g = match gt {
+            GeometryType::Polyline => Geometry::Line(vec![vec![a, c]]),
+            _ => Geometry::Polygon(vec![vec![vec![a, b, c, a]]]),
+        };
+        d.push(Some(g), vec![]);
+        map.add_dataset(d);
+        if let Some(l) = map.layers.last_mut() {
+            edit(l);
+        }
+        map
+    }
+
+    /// How many pixels in `xs` × `ys` are within 40 of `c` in every channel.
+    fn inked(pm: &Pixmap, xs: std::ops::Range<u32>, ys: std::ops::Range<u32>, c: Rgba) -> usize {
+        let near = |a: u8, b: u8| a.abs_diff(b) <= 40;
+        ys.flat_map(|y| xs.clone().map(move |x| (x, y)))
+            .filter(|(x, y)| pm.pixel(*x, *y).is_some_and(|p| near(p.red(), c.r()) && near(p.green(), c.g()) && near(p.blue(), c.b())))
+            .count()
+    }
+
+    /// A stacked stroke `width` points wide in `color`.
+    fn plain_stroke(color: Rgba, width: f32) -> rustgis_map::LineStroke {
+        rustgis_map::LineStroke { color: Some(color), width: Some(width), ..rustgis_map::LineStroke::default() }
+    }
+
+    /// Hatch lines `spacing` points apart, a point wide, across.
+    fn hatch(color: Rgba, spacing: f32) -> rustgis_map::fills::FillLayer {
+        rustgis_map::fills::FillLayer {
+            color: Some(color),
+            pattern: rustgis_map::fills::FillPattern::Hatch { angle: 0.0, spacing, width: 1.0, offset: 0.0 },
+        }
+    }
+
+    /// A line or polygon layer with no stacked strokes or fills keeps the swatch it always had,
+    /// pixel for pixel (#2490): a line through three points, or a box with its outline.
+    #[test]
+    fn a_plain_line_or_polygon_keeps_its_swatch() {
+        let s = rustgis_map::Symbol {
+            fill: Rgba::rgb(255, 0, 0),
+            stroke: Rgba::rgb(0, 0, 255),
+            stroke_width: 2.0,
+            ..rustgis_map::Symbol::default_for(GeometryType::Polygon, 0)
+        };
+        for gt in [GeometryType::Polyline, GeometryType::Polygon] {
+            let map = shape_legend_map(gt, |l| l.renderer = rustgis_map::Renderer::Single(s));
+            let mut want = Pixmap::new(200, 200).unwrap();
+            want.fill(tiny_skia::Color::WHITE);
+            let stroke = Stroke { width: 2.0, ..Stroke::default() };
+            crate::canvas::with_canvas(&mut want, |c| {
+                if gt == GeometryType::Polyline {
+                    let mut pb = PathBuilder::new();
+                    pb.move_to(0.0, 10.5);
+                    pb.line_to(6.4, 4.5);
+                    pb.line_to(16.0, 9.0);
+                    c.stroke_path(&pb.finish().unwrap(), &paint(s.stroke, 1.0), &stroke, Transform::identity(), None);
+                } else {
+                    let b = Rect::from_xywh(0.0, 3.0, 16.0, 9.0).unwrap();
+                    c.fill_rect(b, &paint(s.fill, 1.0), Transform::identity(), None);
+                    c.stroke_path(&PathBuilder::from_rect(b), &paint(s.stroke, 1.0), &stroke, Transform::identity(), None);
+                }
+            });
+            assert!(same_corner(&point_legend(&map), &want, 16, 15), "{gt:?}");
+        }
+    }
+
+    /// A line's stacked strokes show in its swatch as on the map: a casing under its core, and
+    /// dashes (#2490).
+    #[test]
+    fn a_legend_draws_a_lines_casing_and_dashes() {
+        let (black, red) = (Rgba::rgb(0, 0, 0), Rgba::rgb(255, 0, 0));
+        let drawn =
+            |strokes: Vec<rustgis_map::LineStroke>| point_legend(&shape_legend_map(GeometryType::Polyline, |l| l.line_strokes = strokes));
+        let cased = drawn(vec![plain_stroke(black, 8.0), plain_stroke(red, 2.0)]);
+        assert!(inked(&cased, 0..16, 0..15, black) > 20, "the casing");
+        assert!(inked(&cased, 0..16, 0..15, red) > 5, "the core over it");
+        let dashed = rustgis_map::LineStroke {
+            dash: rustgis_map::symbology::Dash::new(&[2.0, 4.0]),
+            cap: rustgis_map::LineCap::Butt,
+            ..plain_stroke(red, 2.0)
+        };
+        let dashed = drawn(vec![plain_stroke(black, 8.0), dashed]);
+        assert!(inked(&dashed, 0..16, 0..15, red) * 3 < inked(&cased, 0..16, 0..15, red) * 2, "a dashed core shows less of it");
+        // One plain stroke draws in its own colour alone.
+        assert_eq!(inked(&drawn(vec![plain_stroke(red, 2.0)]), 0..16, 0..15, black), 0);
+    }
+
+    /// Markers along a line show in its swatch (#2490).
+    #[test]
+    fn a_legend_draws_markers_along_a_line() {
+        let blue = Rgba::rgb(0, 0, 255);
+        let map = shape_legend_map(GeometryType::Polyline, |l| {
+            l.line_strokes = vec![plain_stroke(Rgba::rgb(128, 128, 128), 1.0), square_mark(blue, 6.0)];
+        });
+        assert!(inked(&point_legend(&map), 0..16, 0..15, blue) > 10);
+    }
+
+    /// With symbol levels on, a line's swatch draws its strokes level by level, as the map does.
+    #[test]
+    fn a_legend_draws_a_lines_strokes_by_level() {
+        let (black, red) = (Rgba::rgb(0, 0, 0), Rgba::rgb(255, 0, 0));
+        let drawn = |levels: bool| {
+            let map = shape_legend_map(GeometryType::Polyline, |l| {
+                l.line_strokes = vec![
+                    rustgis_map::LineStroke { level: Some(1), ..plain_stroke(red, 2.0) },
+                    rustgis_map::LineStroke { level: Some(0), ..plain_stroke(black, 8.0) },
+                ];
+                l.stroke_levels = levels;
+            });
+            inked(&point_legend(&map), 0..16, 0..15, red)
+        };
+        assert!(drawn(true) > 5, "the core's level is above the casing's");
+        assert_eq!(drawn(false), 0, "in their order, the casing covers the core");
+    }
+
+    /// A stroke shifted past its row is cut at the swatch's box, not drawn over the next row.
+    #[test]
+    fn a_legend_cuts_a_shifted_stroke_at_its_box() {
+        let red = Rgba::rgb(255, 0, 0);
+        for (offset, shows) in [(4.0, true), (30.0, false)] {
+            let map = shape_legend_map(GeometryType::Polyline, |l| {
+                l.line_strokes = vec![rustgis_map::LineStroke { offset, ..plain_stroke(red, 3.0) }];
+            });
+            let pm = point_legend(&map);
+            assert_eq!(inked(&pm, 0..16, 0..15, red) > 0, shows, "offset {offset}");
+            assert_eq!(inked(&pm, 0..200, 15..200, red), 0, "offset {offset}: nothing below its row");
+        }
+        // One plain stroke wider than the row is cut at it too.
+        let map = shape_legend_map(GeometryType::Polyline, |l| l.line_strokes = vec![plain_stroke(red, 30.0)]);
+        let pm = point_legend(&map);
+        assert!(inked(&pm, 0..16, 0..15, red) > 50);
+        assert_eq!(inked(&pm, 0..200, 15..200, red), 0, "a wide stroke: nothing below its row");
+    }
+
+    /// A polygon's stacked fills show in its swatch: a hatch over a fill, and a class's own fills
+    /// in its row, the other classes' plain (#2490).
+    #[test]
+    fn a_legend_draws_a_polygons_stacked_fills() {
+        let (black, red, white) = (Rgba::rgb(0, 0, 0), Rgba::rgb(255, 0, 0), Rgba::rgb(255, 255, 255));
+        let solid = rustgis_map::fills::FillLayer { color: Some(Rgba::rgb(0, 200, 0)), pattern: rustgis_map::fills::FillPattern::Solid };
+        let map = shape_legend_map(GeometryType::Polygon, |l| l.fill_layers = vec![solid, hatch(black, 3.0)]);
+        let pm = point_legend(&map);
+        assert!(inked(&pm, 1..15, 4..11, black) > 5, "the hatch");
+        assert!(inked(&pm, 1..15, 4..11, Rgba::rgb(0, 200, 0)) > 5, "the fill under it");
+        // Classes: only the first has fills of its own, and the layer none.
+        let s = rustgis_map::Symbol { fill: red, stroke_width: 0.0, ..rustgis_map::Symbol::default_for(GeometryType::Polygon, 0) };
+        let map = shape_legend_map(GeometryType::Polygon, |l| {
+            l.renderer = rustgis_map::Renderer::Unique {
+                field: "g".into(),
+                classes: vec![("a".to_string(), s), ("b".to_string(), s)],
+                other: s,
+                ramp: rustgis_map::Ramp::Ember,
+                class_labels: Default::default(),
+                other_label: None,
+                class_strokes: Default::default(),
+                other_strokes: Vec::new(),
+                class_fills: [("a".to_string(), vec![hatch(black, 3.0)])].into_iter().collect(),
+                other_fills: Vec::new(),
+                expression: None,
+            };
+        });
+        let pm = point_legend(&map);
+        // The layer's name, then a row a class, the swatch 6 points in.
+        assert!(inked(&pm, 7..21, 19..26, black) > 5, "class a's hatch");
+        assert_eq!(inked(&pm, 7..21, 19..26, red), 0, "a hatch with no fill under it leaves the paper");
+        assert!(inked(&pm, 7..21, 19..26, white) > 5);
+        assert_eq!(inked(&pm, 7..21, 34..41, black), 0, "class b has none");
+        assert!(inked(&pm, 7..21, 34..41, red) > 50, "its symbol's fill");
+    }
+
+    /// A polygon's outline is drawn over its stacked fills, as on the map (#2490).
+    #[test]
+    fn a_legend_draws_a_polygons_outline_over_its_fills() {
+        let (blue, green) = (Rgba::rgb(0, 0, 255), Rgba::rgb(0, 200, 0));
+        let s = rustgis_map::Symbol { stroke: blue, stroke_width: 2.0, ..rustgis_map::Symbol::default_for(GeometryType::Polygon, 0) };
+        let solid = rustgis_map::fills::FillLayer { color: Some(green), pattern: rustgis_map::fills::FillPattern::Solid };
+        let map = shape_legend_map(GeometryType::Polygon, |l| {
+            l.renderer = rustgis_map::Renderer::Single(s);
+            l.fill_layers = vec![solid];
+        });
+        let pm = point_legend(&map);
+        // The box's top edge, 3 points down, under the 2-point outline; its inside, the fill.
+        assert!(inked(&pm, 1..15, 3..4, blue) > 10, "the outline");
+        assert_eq!(inked(&pm, 1..15, 3..4, green), 0, "no fill over it");
+        assert!(inked(&pm, 2..14, 5..10, green) > 50, "the fill inside");
+    }
+
+    /// A diagram's categories keep their own colour on a layer with stacked strokes or fills.
+    #[test]
+    fn a_diagrams_rows_keep_their_colour_on_lines_and_polygons() {
+        let (black, red, green) = (Rgba::rgb(0, 0, 0), Rgba::rgb(255, 0, 0), Rgba::rgb(0, 255, 0));
+        let category = |field: &str, colour| rustgis_map::DiagramCategory { field: field.into(), colour };
+        for gt in [GeometryType::Polyline, GeometryType::Polygon] {
+            let map = shape_legend_map(gt, |l| {
+                l.line_strokes = vec![plain_stroke(black, 8.0)];
+                l.fill_layers = vec![hatch(black, 3.0)];
+                l.diagram = Some(rustgis_map::DiagramSettings {
+                    kind: rustgis_map::DiagramKind::Pie,
+                    categories: vec![category("a", red), category("b", green)],
+                    size: rustgis_map::DiagramSize::Fixed(12.0),
+                    start_angle: 0.0,
+                    background: None,
+                    stroke: rustgis_map::DiagramSettings::default_stroke(),
+                    stroke_width: 0.75,
+                    labels: rustgis_map::DiagramLabel::None,
+                });
+            });
+            let pm = point_legend(&map);
+            assert_eq!(inked(&pm, 6..22, 15..45, black), 0, "{gt:?}: not the layer's stack");
+            // A one-point line is mostly part-covered pixels: its hue tells it.
+            let tinted = |ys: std::ops::Range<u32>, hue: fn(tiny_skia::PremultipliedColorU8) -> bool| {
+                ys.flat_map(|y| (6..22).map(move |x| (x, y))).filter(|(x, y)| pm.pixel(*x, *y).is_some_and(hue)).count()
+            };
+            assert!(tinted(15..30, |p| p.red() > p.green().saturating_add(60)) > 5, "{gt:?}: red");
+            assert!(tinted(30..45, |p| p.green() > p.red().saturating_add(60)) > 5, "{gt:?}: green");
+        }
+    }
+
+    /// A see-through line or polygon layer's swatch is see-through too, as its points' are.
+    #[test]
+    fn a_legend_draws_a_see_through_polygon_see_through() {
+        let s = rustgis_map::Symbol {
+            fill: Rgba::rgb(255, 0, 0),
+            stroke_width: 0.0,
+            ..rustgis_map::Symbol::default_for(GeometryType::Polygon, 0)
+        };
+        let map = shape_legend_map(GeometryType::Polygon, |l| {
+            l.renderer = rustgis_map::Renderer::Single(s);
+            l.transparency = 50.0;
+        });
+        let p = point_legend(&map).pixel(8, 7).unwrap();
+        assert_eq!(p.red(), 255);
+        assert!((100..160).contains(&p.green()), "{}", p.green());
+    }
+
+    /// A line grows with its layer's reference scale in the swatch, as on the map.
+    #[test]
+    fn a_legend_scales_a_line_with_its_reference_scale() {
+        let blue = Rgba::rgb(0, 0, 255);
+        let drawn = |reference: Option<f64>| {
+            let map = shape_legend_map(GeometryType::Polyline, |l| {
+                l.line_strokes = vec![plain_stroke(blue, 2.0)];
+                l.reference_scale = reference;
+            });
+            inked(&point_legend(&map), 0..16, 0..15, blue)
+        };
+        // Drawn at 1:1e6: a reference of 1:2e6 makes it twice as wide.
+        assert!(drawn(Some(2e6)) * 2 > drawn(None) * 3, "{} against {}", drawn(Some(2e6)), drawn(None));
+    }
+
+    /// A vector export draws the stacked fills and strokes a raster one does.
+    #[test]
+    fn a_recorded_legend_draws_stacked_fills_and_strokes() {
+        let (black, red) = (Rgba::rgb(0, 0, 0), Rgba::rgb(255, 0, 0));
+        let map = shape_legend_map(GeometryType::Polygon, |l| l.fill_layers = vec![hatch(black, 3.0)]);
+        assert!(inked(&recorded_legend(&map, 200), 1..15, 4..11, black) > 5);
+        let map = shape_legend_map(GeometryType::Polyline, |l| l.line_strokes = vec![plain_stroke(black, 8.0), plain_stroke(red, 2.0)]);
+        let pm = recorded_legend(&map, 200);
+        assert!(inked(&pm, 0..16, 0..15, black) > 20 && inked(&pm, 0..16, 0..15, red) > 5);
     }
 
     /// A box off the pixel grid: a recording cuts its symbol at the box, not at the whole pixels
