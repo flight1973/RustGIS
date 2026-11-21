@@ -2355,6 +2355,10 @@ impl Session {
                         layer.name
                     ));
                 }
+                // What else the map's reads of it lost or assumed, each kind once for its opening.
+                for note in layer.source.as_mut().map(|source| source.take_read_notes()).unwrap_or_default() {
+                    dates.push(format!("{}: {note}", layer.name));
+                }
                 if layer.source.as_mut().is_some_and(|source| source.take_display_window()) {
                     landed.push(&*layer);
                 }

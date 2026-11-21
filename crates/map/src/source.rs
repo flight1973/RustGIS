@@ -39,6 +39,28 @@ pub const REPAIR_SOURCE: &str = "if the file was moved or deleted, restore it or
 
 const RECONNECT_REQUIRED: &str = "this database source came from a peer; reconnect explicitly before reading it";
 
+/// The kinds of read note one opening of a source says at most ([`SourceLayer::saw_read_notes`]).
+const READ_NOTE_KINDS: usize = 32;
+
+/// A read note's kind: its text with each run of digits as one `#`, so the same note with another
+/// count (a view read of another sample) is the same kind.
+fn note_kind(note: &str) -> String {
+    let mut kind = String::with_capacity(note.len());
+    let mut digits = false;
+    for c in note.chars() {
+        if c.is_ascii_digit() {
+            if !digits {
+                kind.push('#');
+            }
+            digits = true;
+        } else {
+            kind.push(c);
+            digits = false;
+        }
+    }
+    kind
+}
+
 /// Ambiguous polygon areas among decoded features, including rows an area query could not keep.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AmbiguousAreas {
@@ -111,6 +133,14 @@ pub struct SourceLayer {
     null_text: Option<Vec<usize>>,
     #[serde(skip)]
     null_text_said: bool,
+    /// What else view reads lost or assumed ([`Batch::notes`]), until said by
+    /// [`SourceLayer::take_read_notes`].
+    #[serde(skip)]
+    read_notes: Vec<String>,
+    /// The kinds of note view reads of this opening have given ([`note_kind`]): each is said once,
+    /// with the count of the read that first gave it, not again on each redraw.
+    #[serde(skip)]
+    read_note_kinds: Vec<String>,
     #[serde(skip)]
     window: Option<Window>,
     /// Whole-source thinning decisions shared by render snapshots, independent of view rows.
@@ -770,6 +800,44 @@ impl SourceLayer {
         let counts = self.null_text.take()?;
         self.null_text_said = true;
         rustgis_data::source::null_text_note(&fields, &counts)
+    }
+
+    /// Keeps what view reads said they lost or assumed ([`Batch::notes`]) until
+    /// [`SourceLayer::take_read_notes`] says it: each kind of note once for the opening, as the
+    /// next redraw reads the same features again. Past [`READ_NOTE_KINDS`] kinds, one last note
+    /// says there are more.
+    pub fn saw_read_notes(&mut self, notes: &[String]) {
+        for note in notes.iter().filter(|n| !n.trim().is_empty()) {
+            let kind = note_kind(note);
+            if self.read_note_kinds.contains(&kind) {
+                continue;
+            }
+            if self.read_note_kinds.len() >= READ_NOTE_KINDS {
+                if !self.read_note_kinds.iter().any(String::is_empty) {
+                    // The empty kind marks the overflow note said: no note kept has an empty kind.
+                    self.read_note_kinds.push(String::new());
+                    self.read_notes.push(format!(
+                        "reading it for the map gave more than {READ_NOTE_KINDS} kinds of note; Load All Features lists them all"
+                    ));
+                }
+                return;
+            }
+            self.read_note_kinds.push(kind);
+            self.read_notes.push(note.clone());
+        }
+    }
+
+    /// What view reads said they lost or assumed ([`Batch::notes`]) and haven't said yet, each
+    /// kind once for the opening ([`SourceLayer::saw_read_notes`]).
+    pub fn take_read_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.read_notes)
+    }
+
+    /// Forgets which read notes were said, so the next view read says them again: the source was
+    /// opened anew or its file written.
+    pub fn forget_read_notes(&mut self) {
+        self.read_notes.clear();
+        self.read_note_kinds.clear();
     }
 
     /// Whether another installed window needs its retained display expressions checked.
@@ -1503,6 +1571,7 @@ impl SourceLayer {
         self.rounded_dates_said = false;
         self.null_text = None;
         self.null_text_said = false;
+        self.forget_read_notes();
         self.reset();
         self.open()
     }
@@ -1831,6 +1900,8 @@ impl SourceLayer {
             rounded_dates_said: _,
             null_text: _,
             null_text_said: _,
+            read_notes: _,
+            read_note_kinds: _,
             gdal,
             duckdb,
             postgis,
@@ -1979,6 +2050,33 @@ mod tests {
             assert_eq!((said.0.is_some(), said.1.is_some()), (!unread_first, unread_first), "unread first: {unread_first}");
             assert_eq!(source.take_unread_dates(), (None, None));
         }
+    }
+
+    /// A view read's notes are said once for each kind, whatever count a later read of another
+    /// sample gives; a new kind is still said; too many kinds end in one note saying so; a source
+    /// opened anew says them again.
+    #[test]
+    fn view_read_notes_are_said_once_for_each_kind() {
+        let mut source = super::SourceLayer::default();
+        let note = |n: usize| format!("{n} of the shapes read (a sample of the layer, which may hold more) have a NaN");
+        source.saw_read_notes(&[note(3), String::new(), " ".into()]);
+        source.saw_read_notes(&[note(5)]);
+        assert_eq!(source.take_read_notes(), [note(3)]);
+        source.saw_read_notes(&[note(12), "7 values cut".into()]);
+        assert_eq!(source.take_read_notes(), ["7 values cut"]);
+        assert!(source.take_read_notes().is_empty());
+        // A source with endless kinds of note says the first ones, then one note that there are more.
+        let many: Vec<String> = (0..2 * super::READ_NOTE_KINDS)
+            .map(|k| format!("kind {}: 1", char::from(b'a' + (k % 26) as u8).to_string().repeat(k / 26 + 1)))
+            .collect();
+        source.saw_read_notes(&many);
+        source.saw_read_notes(&many);
+        let said = source.take_read_notes();
+        assert_eq!(said.len(), super::READ_NOTE_KINDS - 1, "{said:?}");
+        assert!(said.last().is_some_and(|n| n.contains("Load All Features lists them all")), "{said:?}");
+        source.forget_read_notes();
+        source.saw_read_notes(&[note(4)]);
+        assert_eq!(source.take_read_notes(), [note(4)]);
     }
 
     /// A paused schema worker reports real progress; Cancel wins for every source copy and
