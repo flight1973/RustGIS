@@ -78,6 +78,12 @@ pub fn tile_corner(file_name: &str) -> Option<(i32, i32)> {
 /// read-ahead, off the UI thread, and a Cancel takes effect when it returns. It stays on one
 /// thread: turning big-endian words into numbers is about 0.12 s for the largest (7201 × 7201)
 /// tile in a release build, less than reading its 104 MB from disk, so threads would add little.
+///
+/// Memory: the grid it gives, 4 bytes a height kept (`f32`), which at full resolution is twice the
+/// file (a 7201 × 7201 tile: 104 MB on disk, 207 MB as the grid), and at a step no more than
+/// [`max_samples`] heights; beside it one row of the file (14 KB at most). Read from `bytes` (an
+/// upload, the browser), the file is held too, about 3× the file in all; [`read_checked_from`],
+/// which the desktop reads a path with, holds about 2×.
 pub fn read(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     read_limited(file_name, bytes, max_samples())
 }
@@ -129,7 +135,8 @@ pub fn read_checked(file_name: &str, checked: (i32, i32, usize), bytes: &[u8]) -
 }
 
 /// [`read_checked`] from a reader, a row at a time, so the file's bytes are never held whole:
-/// only the heights kept. It must give exactly the tile's size, as `bytes` must.
+/// only the heights kept. It must give exactly the tile's size, as `bytes` must. Its peak is the
+/// grid and one row: about twice the file at full resolution (see [`read`]).
 pub fn read_checked_from(file_name: &str, checked: (i32, i32, usize), source: impl std::io::Read) -> Result<Raster> {
     read_checked_limited(file_name, checked, source, max_samples())
 }
@@ -151,6 +158,7 @@ fn read_checked_limited(
     let wrong_size = |len: u64| bad(format!("the file is {len} bytes now, not the {side} × {side} tile's it was"));
     let step = step_within(side, side, max).ok_or_else(|| bad("the tile is too large to open".into()))?;
     let out = side.div_ceil(step);
+    // The grid is what the read holds (twice the file at step 1); the rest is one row.
     let mut data = super::grid::<f32>(out, out)?;
     // One pass, a row at a time: every sample's void counted, every `step`-th kept.
     let row_bytes = side * 2;

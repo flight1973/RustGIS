@@ -192,13 +192,21 @@ fn placement(counts: &[Option<i64>], cols: usize) -> std::result::Result<(), (us
 /// ([`read_from`] streams a file the same way). On the desktop it runs in Add Data's read-ahead,
 /// off the UI thread, and a Cancel takes effect when it returns. It stays on one thread, as
 /// [`super::hgt::read`] does: a cell is at most a quarter of the largest SRTM tile's size.
+///
+/// Memory: the grid it gives, 4 bytes a height kept (`f32`), which at full resolution is about
+/// twice the file (a record stores 2 bytes a height; a level 2 cell of 3601 × 3601: 26 MB on disk,
+/// 52 MB as the grid), and at a step no more than [`max_samples`] heights; beside it the headers,
+/// one record and one column (7 KB each at most) and each record's count (58 KB at most). Read
+/// from `bytes` (an upload, the browser), the file is held too, about 3× the file in all;
+/// [`read_from`], which the desktop reads a path with, holds about 2×.
 pub fn read(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     read_limited(file_name, bytes, max_samples())
 }
 
 /// [`read`] from a reader: the headers, then one record at a time, so the file's bytes are never
 /// held whole, only the heights kept. Every check is made as [`read`] makes it on the same bytes;
-/// those that need the file's length are made once the records are read.
+/// those that need the file's length are made once the records are read. Its peak is the grid
+/// and one record: about twice the file at full resolution (see [`read`]).
 pub fn read_from(file_name: &str, source: impl std::io::Read) -> Result<Raster> {
     read_from_limited(file_name, source, max_samples())
 }
