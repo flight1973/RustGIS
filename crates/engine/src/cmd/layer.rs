@@ -789,9 +789,10 @@ fn size_by(s: &mut Session, p: &Value) -> CmdResult {
     if l.geometry_type() != GeometryType::Point || l.graphics {
         return Err("this works on point layers".into());
     }
-    // A field given other than the mapping's own (which the Symbology pane sends back unchanged);
-    // else the mapping's own, which keeps the field it reads.
-    let given = matches!(&field, Some(Some(f)) if l.size_by.as_ref().is_none_or(|b| b.field != *f));
+    // A field given other than the one the mapping reads (which the Symbology pane sends back,
+    // in any spelling); else the mapping's own, which keeps the field it reads.
+    let reads = |name: &str| l.dataset.field_index(name);
+    let given = matches!(&field, Some(Some(f)) if l.size_by.as_ref().is_none_or(|b| reads(&b.field) != reads(f)));
     let field = match field {
         Some(field) => field,
         None => Some(l.size_by.as_ref().map(|b| b.field.clone()).ok_or("give a field: the layer has no size mapping to change")?),
@@ -910,7 +911,8 @@ pub(crate) fn size_by_ahead(s: &Session, p: &Value) -> Option<super::reads::Read
     let name = ps(p, "field")?;
     // A name with a case twin, which layer.sizeBy refuses unless it is the mapping's own, isn't
     // read ahead.
-    if layer.dataset.has_case_twin(name) && layer.size_by.as_ref().is_none_or(|b| b.field != name) {
+    let reads = |n: &str| layer.dataset.field_index(n);
+    if layer.dataset.has_case_twin(name) && layer.size_by.as_ref().is_none_or(|b| reads(&b.field) != reads(name)) {
         return None;
     }
     let field = layer.dataset.field_index(name)?;

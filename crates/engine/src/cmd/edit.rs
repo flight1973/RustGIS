@@ -2362,16 +2362,18 @@ mod tests {
         let l = s.map().layer(id).unwrap();
         assert_eq!(l.size_by.as_ref().map(|b| (b.min, b.max)), Some((2.0, 9.0)));
         assert_eq!(l.diagram.as_ref().map(|d| d.categories.len()), Some(1));
-        // A twin's name newly given: refused.
+        // Given in either spelling, a twin's name reads the field the mapping reads (`X`): taken.
+        s.run("layer.sizeBy", &json!({"layer": id, "field": "x", "min": 2, "max": 9})).unwrap();
+        // A twin's name newly given, the mapping on another field: refused.
+        s.run("layer.sizeBy", &json!({"layer": id, "field": "n"})).unwrap();
         for (command, p) in [
-            // (The mapping now stores `X`, the name of the field it reads.)
             ("layer.sizeBy", json!({"layer": id, "field": "x"})),
             ("layer.diagram", json!({"layer": id, "kind": "pie", "fields": ["n", "X"]})),
         ] {
             let error = s.run(command, &p).unwrap_err();
             assert!(error.contains("names 'X' and 'x' ignoring case"), "{command}: {error}");
         }
-        // Read ahead: not for a twin's name newly given (nor the mapping's own, whose range it has).
+        // Read ahead: not for a twin's name newly given.
         assert!(crate::cmd::layer::size_by_ahead(&s, &json!({"layer": id, "field": "x"})).is_none());
         assert!(crate::cmd::layer::size_by_ahead(&s, &json!({"layer": id, "field": "X"})).is_none());
     }
