@@ -42,22 +42,25 @@ const RECONNECT_REQUIRED: &str = "this database source came from a peer; reconne
 /// The kinds of read note one opening of a source says at most ([`SourceLayer::saw_read_notes`]).
 const READ_NOTE_KINDS: usize = 32;
 
-/// A read note's kind: its text with each run of digits as one `#`, so the same note with another
-/// count (a view read of another sample) is the same kind.
+/// A read note's kind: its text with each count as `#`, so the same note with another count (a view
+/// read of another sample) is the same kind. A count is a number that starts the note or a clause
+/// (after `: `, `, `, `; ` or `(`) and is followed by a space, as notes put their counts ("3 of the
+/// shapes read …", "so far, 2 values …"). Any other number (an EPSG code, a column's place, a
+/// count written mid-clause) is kept, so notes that differ in it are kinds of their own.
 fn note_kind(note: &str) -> String {
     let mut kind = String::with_capacity(note.len());
-    let mut digits = false;
-    for c in note.chars() {
-        if c.is_ascii_digit() {
-            if !digits {
-                kind.push('#');
-            }
-            digits = true;
-        } else {
-            kind.push(c);
-            digits = false;
-        }
+    let mut rest = note;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+        let (before, from) = rest.split_at(start);
+        let len = from.find(|c: char| !c.is_ascii_digit()).unwrap_or(from.len());
+        let (digits, after) = from.split_at(len);
+        // A run of digits is whole, so only the note's first can have nothing before it.
+        let opens = (kind.is_empty() && before.is_empty()) || [": ", ", ", "; ", "("].iter().any(|p| before.ends_with(p));
+        kind.push_str(before);
+        kind.push_str(if opens && after.starts_with(' ') { "#" } else { digits });
+        rest = after;
     }
+    kind.push_str(rest);
     kind
 }
 
@@ -804,8 +807,10 @@ impl SourceLayer {
 
     /// Keeps what view reads said they lost or assumed ([`Batch::notes`]) until
     /// [`SourceLayer::take_read_notes`] says it: each kind of note once for the opening, as the
-    /// next redraw reads the same features again. Past [`READ_NOTE_KINDS`] kinds, one last note
-    /// says there are more.
+    /// next redraw reads the same features again. Two notes are one kind when they differ only in
+    /// their counts ([`note_kind`]: a number starting the note or a clause, before a space); notes
+    /// that differ in any other number or word are kinds of their own. Past [`READ_NOTE_KINDS`]
+    /// kinds, one last note says there are more.
     pub fn saw_read_notes(&mut self, notes: &[String]) {
         for note in notes.iter().filter(|n| !n.trim().is_empty()) {
             let kind = note_kind(note);
@@ -838,6 +843,22 @@ impl SourceLayer {
     pub fn forget_read_notes(&mut self) {
         self.read_notes.clear();
         self.read_note_kinds.clear();
+    }
+
+    /// For an undo snapshot: drops the notes not yet said, which the live layer says, and keeps
+    /// the kinds, so a snapshot of another opening restored later doesn't say them again.
+    pub fn hold_read_notes(&mut self) {
+        self.read_notes.clear();
+    }
+
+    /// After undo, redo or a rollback restores this layer: the same opening as `live` (the layer
+    /// it replaces) keeps what `live` has said and has still to say, as restoring the project
+    /// doesn't read the source again. Another opening keeps its own.
+    pub fn keep_read_notes(&mut self, live: &SourceLayer) {
+        if self.same_opening(live) {
+            self.read_notes.clone_from(&live.read_notes);
+            self.read_note_kinds.clone_from(&live.read_note_kinds);
+        }
     }
 
     /// Whether another installed window needs its retained display expressions checked.
@@ -2077,6 +2098,52 @@ mod tests {
         source.forget_read_notes();
         source.saw_read_notes(&[note(4)]);
         assert_eq!(source.take_read_notes(), [note(4)]);
+    }
+
+    /// Only counts make two notes one kind: notes differing in another number stay apart.
+    #[test]
+    fn a_read_note_kind_folds_counts_only() {
+        let mut source = super::SourceLayer::default();
+        let epsg = |code: u32| format!("rows in EPSG {code} are read as longitude/latitude");
+        let column = |at: u32| format!("values cut in column {at}");
+        let notes = [
+            "3 of the shapes read have a NaN".to_string(),
+            "5 of the shapes read have a NaN".into(),
+            "roads: so far, 2 values cut (4 fields)".into(),
+            "roads: so far, 7 values cut (1 fields)".into(),
+            epsg(4326),
+            epsg(3857),
+            column(2),
+            column(3),
+            "EPSG:4326: 3 shape(s) left out".into(),
+            "EPSG:3857: 3 shape(s) left out".into(),
+        ];
+        source.saw_read_notes(&notes);
+        let said = source.take_read_notes();
+        let expected = [&notes[0], &notes[2], &notes[4], &notes[5], &notes[6], &notes[7], &notes[8], &notes[9]];
+        assert_eq!(said.iter().collect::<Vec<_>>(), expected);
+        assert_eq!(super::note_kind("12 of 40 read; 3 left"), "# of 40 read; # left");
+    }
+
+    /// A layer brought back by undo keeps what its live opening said; another opening keeps its own.
+    #[test]
+    fn a_restored_layer_keeps_the_live_openings_read_notes() {
+        let mut live = super::SourceLayer::default();
+        live.saw_read_notes(&["2 shape(s) left out".into()]);
+        let mut snapshot = live.clone();
+        snapshot.hold_read_notes();
+        assert!(snapshot.take_read_notes().is_empty(), "the snapshot leaves the unsaid note to the live layer");
+        assert_eq!(live.take_read_notes(), ["2 shape(s) left out"]);
+        let mut restored = live.clone();
+        restored.forget_read_notes();
+        restored.keep_read_notes(&live);
+        restored.saw_read_notes(&["4 shape(s) left out".into()]);
+        assert!(restored.take_read_notes().is_empty(), "said by the live layer");
+        let other = super::SourceLayer { path: Some("other.shp".into()), ..Default::default() };
+        let mut kept = other.clone();
+        kept.keep_read_notes(&live);
+        kept.saw_read_notes(&["4 shape(s) left out".into()]);
+        assert_eq!(kept.take_read_notes(), ["4 shape(s) left out"], "another opening");
     }
 
     /// A paused schema worker reports real progress; Cancel wins for every source copy and

@@ -780,7 +780,11 @@ fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
         assert_eq!(said(&src.read(&Request::all()).unwrap().notes), one);
         // The second record's stored box made backwards, (2, 2, 1, 1) at 200..232, over the same
         // NaN point: the index can't frame it from the points, so it's left out of the extent and
-        // said as having no usable box, and the read doesn't claim the index took it in.
+        // said as having no usable box, and the read doesn't claim the index took it in. Reads by
+        // area (the map's) don't visit it, so no read note counts it: the source's open-time note
+        // ("1 shape(s) have no usable bounding box", `SourceInfo::notes`) says it, which Add Data
+        // gives as a notice when it adds the layer read in place, once (the engine's
+        // `a_streamed_shapefile_says_a_shape_without_a_usable_box_once_as_it_is_added`).
         let p = write("nan_backwards.shp");
         let mut b = std::fs::read(&p).unwrap();
         for (at, v) in [(200, 2.0), (208, 2.0), (216, 1.0), (224, 1.0)] {

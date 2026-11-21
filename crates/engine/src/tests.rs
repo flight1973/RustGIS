@@ -1406,7 +1406,85 @@ fn a_streamed_layer_says_its_view_reads_notes_once() {
         s.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap().reopen().unwrap();
         reads(&mut s);
         assert_eq!(notes(&s, mark), expected, "{name}: reopened");
+        // Undo and redo bring back the same opening, not what it had said then: a snapshot taken
+        // before the note was read, and one taken while it was read but not yet said, each leave
+        // it said once, by the live layer.
+        let mark = s.notice_mark();
+        let source = s.map_mut().layer_mut(id).unwrap().source.as_mut().unwrap();
+        source.forget_read_notes();
+        source.reset();
+        s.run("layer.rename", &json!({"layer": id, "name": format!("{name} 1")})).unwrap();
+        s.map_mut().sync_sources(&rustgis_geom::Extent::new(-180.0, -90.0, 180.0, 90.0), 1000.0, true);
+        s.run("layer.rename", &json!({"layer": id, "name": format!("{name} 2")})).unwrap();
+        s.notice_landed_rasters();
+        for step in ["edit.undo", "edit.redo", "edit.undo", "edit.undo"] {
+            s.run(step, &Value::Null).unwrap();
+            reads(&mut s);
+        }
+        assert_eq!(s.map().layer(id).unwrap().name, name, "undone");
+        assert_eq!(notes(&s, mark).len(), expected.len(), "{name}: undo and redo: {:?}", notes(&s, mark));
     }
+}
+
+/// A Shapefile with a NaN point under a backwards stored box: the index can't frame the shape, so
+/// reads by area (the map's) never visit it and no read note counts it. The source's open-time note
+/// says it, "1 shape(s) have no usable bounding box", as Add Data adds the layer read in place:
+/// once, however often the map reads it. The same file with its box in order says nothing of it.
+#[test]
+fn a_streamed_shapefile_says_a_shape_without_a_usable_box_once_as_it_is_added() {
+    use rustgis_data::{Dataset, Geometry, GeometryType};
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let dir = Dir(std::env::temp_dir().join(format!("rustgis-streamed-unboxed-{}-{nanos}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    const UNBOXED: &str = "1 shape(s) have no usable bounding box";
+    let mut ds = Dataset::new("roads", GeometryType::Polyline, vec![]);
+    for k in 0..3 {
+        let k = f64::from(k);
+        ds.push(Some(Geometry::Line(vec![vec![rustgis_geom::Coord::new(k, k), rustgis_geom::Coord::new(k + 1.0, k + 1.0)]])), vec![]);
+    }
+    let clean = dir.0.join("clean.shp");
+    rustgis_data::io::write_path(&ds, &clean).unwrap();
+    let shp = dir.0.join("roads.shp");
+    rustgis_data::io::write_path(&ds, &shp).unwrap();
+    // The second record's stored box made backwards, (2, 2, 1, 1) at 200..232, and its first x
+    // (at 244) NaN.
+    let mut b = std::fs::read(&shp).unwrap();
+    for (at, v) in [(200, 2.0), (208, 2.0), (216, 1.0), (224, 1.0)] {
+        b[at..at + 8].copy_from_slice(&f64::to_le_bytes(v));
+    }
+    b[244..252].copy_from_slice(&f64::NAN.to_le_bytes());
+    std::fs::write(&shp, b).unwrap();
+    let unboxed = |s: &Session, mark| -> Vec<String> {
+        s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains(UNBOXED)).collect()
+    };
+    let reads = |s: &mut Session| {
+        for _ in 0..3 {
+            for l in s.map_mut().layers.iter_mut() {
+                if let Some(source) = l.source.as_mut() {
+                    source.reset();
+                }
+            }
+            s.map_mut().sync_sources(&rustgis_geom::Extent::new(-180.0, -90.0, 180.0, 90.0), 1000.0, true);
+            s.notice_landed_rasters();
+        }
+    };
+    let mut s = Session::new(Project::default());
+    let mark = s.notice_mark();
+    s.run("layer.addData", &json!({"path": shp.display().to_string(), "stream": true})).unwrap();
+    reads(&mut s);
+    assert!(s.map().layers.iter().any(|l| l.is_streamed()), "read in place");
+    assert_eq!(unboxed(&s, mark).len(), 1, "added: {:?}", s.notices_since(mark));
+    let mut s = Session::new(Project::default());
+    let mark = s.notice_mark();
+    s.run("layer.addData", &json!({"path": clean.display().to_string(), "stream": true})).unwrap();
+    reads(&mut s);
+    assert!(s.notices_since(mark).iter().all(|n| !n.text.contains("no usable bounding box")), "{:?}", s.notices_since(mark));
 }
 
 /// Load All Features of a GeoPackage read in place says the date-times it read rounded to the
