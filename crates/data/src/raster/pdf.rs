@@ -239,6 +239,8 @@ const FONT_SEARCH_DEPTH: usize = 32;
 const FONT_SEARCH_STREAMS: usize = 1_000;
 const FONT_SEARCH_BYTES: usize = 32 << 20;
 const FONT_SEARCH_WORK: usize = 1_000_000;
+/// How many of a content stream's operators the font search reads between looks at Cancel.
+const OPS_BETWEEN_CHECKS: usize = 4096;
 /// The most font programs in the file loaded to see whether `hayro` can read them.
 const FONT_SEARCH_PROGRAMS: usize = 256;
 
@@ -291,6 +293,31 @@ impl<'a> Res<'a> {
     fn own(s: &Stream<'a>) -> Self {
         s.dict().get::<Dict<'a>>(b"Resources".as_slice()).map(|d| Res::of(&d)).unwrap_or_default()
     }
+}
+
+/// Whether `hayro` draws form `s` at all: it needs a box (four numbers) to fit it in.
+fn drawn_form(s: &Stream<'_>) -> bool {
+    s.dict().get::<[f32; 4]>(b"BBox".as_slice()).is_some()
+}
+
+/// Whether `hayro` draws soft mask `mask`'s group `group`: a form it draws, and a mask of
+/// luminosity (whose group says its color space) or of alpha.
+fn drawn_soft_mask(mask: &Dict<'_>, group: &Stream<'_>) -> bool {
+    drawn_form(group)
+        && match mask.get::<Name<'_>>(b"S".as_slice()).as_deref() {
+            Some(b"Luminosity") => group.dict().get::<Dict<'_>>(b"Group".as_slice()).is_some_and(|g| g.contains_key(b"CS".as_slice())),
+            Some(b"Alpha") => true,
+            _ => false,
+        }
+}
+
+/// Whether `hayro` draws tiling pattern `s`: a box with an area, steps across and up that
+/// aren't zero, and how it is painted.
+fn drawn_tiling(s: &Stream<'_>) -> bool {
+    let d = s.dict();
+    let area = d.get::<[f32; 4]>(b"BBox".as_slice()).is_some_and(|[x0, y0, x1, y1]| (x1 - x0) * (y1 - y0) != 0.0);
+    let step = |k: &[u8]| d.get::<f32>(k).is_some_and(|v| v.abs() > f32::EPSILON);
+    area && step(b"XStep".as_slice()) && step(b"YStep".as_slice()) && d.get::<u8>(b"PaintType".as_slice()).is_some()
 }
 
 /// A content stream queued for the font search: where it lies ([`span`]), and the resources it is
@@ -377,7 +404,7 @@ fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> Result<F
                     .or_else(|| states.get::<Stream<'a>>(b"Off".as_slice()))
             });
             // `hayro` draws an appearance only with a box (four numbers) to fit it in.
-            if let Some(s) = drawn.filter(|s| s.dict().get::<Rect>(b"BBox".as_slice()).is_some()) {
+            if let Some(s) = drawn.filter(drawn_form) {
                 search.queue(page_res.within(&s), s, 1);
             }
         }
@@ -389,9 +416,8 @@ fn substituted_fonts<'a>(page: &Page<'a>, bytes: usize, work: usize) -> Result<F
             search.stopped = true;
             break;
         }
-        // Its stored length first, as it decodes to at least about that (an unknown one, as much
-        // as it holds).
-        let stored = stream.dict().get::<usize>(b"Length".as_slice()).unwrap_or_else(|| stream.raw_data().len());
+        // Its stored size first, as it decodes to at least about that.
+        let stored = stream.raw_data().len();
         if search.streams >= FONT_SEARCH_STREAMS || stored > search.bytes_left {
             search.stopped = true;
             break;
@@ -440,7 +466,17 @@ impl<'a> FontSearch<'a> {
     /// Follows a content stream drawn with `res`: the fonts it chooses, and the forms, soft-mask
     /// groups and tiling patterns it draws.
     fn ops(&mut self, mut ops: TypedIter<'_>, res: &Res<'a>, depth: usize) {
+        let mut read = 0usize;
         while let Some(op) = ops.next() {
+            // Cancel, looked at every so many operators of a long stream.
+            read += 1;
+            if read.is_multiple_of(OPS_BETWEEN_CHECKS)
+                && let Err(e) = crate::progress::check()
+            {
+                self.canceled = Some(e);
+                self.stopped = true;
+                return;
+            }
             // A form or soft-mask group is drawn with its own resources, else these; a pattern
             // with its own only.
             let inherits = |s: Stream<'a>| (res.within(&s), s);
@@ -456,7 +492,7 @@ impl<'a> FontSearch<'a> {
                 TypedInstruction::XObject(x) => res
                     .xobjects
                     .get::<Stream<'a>>(x.0)
-                    .filter(|s| s.dict().get::<Name<'_>>(b"Subtype".as_slice()).is_some_and(|n| n.as_str() == "Form"))
+                    .filter(|s| s.dict().get::<Name<'_>>(b"Subtype".as_slice()).is_some_and(|n| n.as_str() == "Form") && drawn_form(s))
                     .map(inherits),
                 TypedInstruction::SetGraphicsState(g) => {
                     let state = res.states.get::<Dict<'a>>(g.0);
@@ -471,11 +507,15 @@ impl<'a> FontSearch<'a> {
                     }
                     state
                         .and_then(|s| s.get::<Dict<'a>>(b"SMask".as_slice()))
-                        .and_then(|m| m.get::<Stream<'a>>(b"G".as_slice()))
+                        .and_then(|m| m.get::<Stream<'a>>(b"G".as_slice()).filter(|g| drawn_soft_mask(&m, g)))
                         .map(inherits)
                 }
-                TypedInstruction::NonStrokeColorNamed(c) => c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)).map(pattern),
-                TypedInstruction::StrokeColorNamed(c) => c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)).map(pattern),
+                TypedInstruction::NonStrokeColorNamed(c) => {
+                    c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)).filter(drawn_tiling).map(pattern)
+                }
+                TypedInstruction::StrokeColorNamed(c) => {
+                    c.1.and_then(|p| res.patterns.get::<Stream<'a>>(p)).filter(drawn_tiling).map(pattern)
+                }
                 _ => None,
             };
             if let Some((r, s)) = drawn {
@@ -512,7 +552,8 @@ impl<'a> FontSearch<'a> {
     }
 
     /// Whether `hayro` rejects `font`'s `program` ([`program_rejected`]): each program loaded once,
-    /// at most [`FONT_SEARCH_PROGRAMS`] of them, its stored length spent from the bytes left, and
+    /// at most [`FONT_SEARCH_PROGRAMS`] of them, its stored size spent from the bytes left (what it
+    /// decodes to isn't known before `hayro` loads it, so the bytes left bound what is stored), and
     /// Cancel looked at first. Past those, the search stops and the program isn't loaded.
     fn rejected(&mut self, font: &Dict<'a>, program: &Stream<'a>) -> bool {
         let key = span(program.dict());
@@ -524,7 +565,7 @@ impl<'a> FontSearch<'a> {
             self.stopped = true;
             return false;
         }
-        let stored = program.dict().get::<usize>(b"Length".as_slice()).unwrap_or_else(|| program.raw_data().len());
+        let stored = program.raw_data().len();
         if self.programs.len() >= FONT_SEARCH_PROGRAMS || stored > self.bytes_left {
             self.stopped = true;
             return false;
@@ -555,12 +596,14 @@ impl<'a> FontSearch<'a> {
 
 /// A font's name as a key that two spellings of one font share: its letters and digits in lower
 /// case, without an `MT` or `PS` maker's suffix, or both ("Arial,Bold" and "Arial-BoldMT" alike,
-/// "TimesNewRoman" and "TimesNewRomanPSMT").
+/// "TimesNewRoman" and "TimesNewRomanPSMT"). Names in other scripts, or not text, stay apart.
 fn font_key(name: &str) -> String {
-    let key: String = name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect();
-    // `MT`, then `PS` (TimesNewRomanPSMT is TimesNewRoman).
-    let key = key.strip_suffix("mt").filter(|k| !k.is_empty()).map_or(key.clone(), str::to_string);
-    key.strip_suffix("ps").filter(|k| !k.is_empty()).map_or(key.clone(), str::to_string)
+    // `MT`, then `PS`, in capitals as makers write them (TimesNewRomanPSMT is TimesNewRoman; a
+    // name ending in a lower-case "mt" keeps it).
+    let name = name.strip_suffix("MT").filter(|n| !n.is_empty()).unwrap_or(name);
+    let name = name.strip_suffix("PS").filter(|n| !n.is_empty()).unwrap_or(name);
+    // Letters and digits in any script, and the `#` of a byte that isn't text ([`name_text`]).
+    name.chars().filter(|c| c.is_alphanumeric() || *c == '#').flat_map(char::to_lowercase).collect()
 }
 
 /// A font's name when `hayro` may draw it in a stand-in, with its program when that is in the
@@ -584,17 +627,31 @@ fn missing_font<'a>(font: &Dict<'a>) -> Option<(String, Option<Stream<'a>>)> {
     let program = described.get::<Dict<'a>>(b"FontDescriptor".as_slice()).and_then(|d| {
         [b"FontFile".as_slice(), b"FontFile2".as_slice(), b"FontFile3".as_slice()].iter().find_map(|k| d.get::<Stream<'a>>(*k))
     });
-    let base = font.get::<Name<'_>>(b"BaseFont".as_slice());
+    // A composite font's own name is its descendant's joined to its CMap's: named as its
+    // descendant, when that has one.
+    let base = described.get::<Name<'_>>(b"BaseFont".as_slice()).or_else(|| font.get::<Name<'_>>(b"BaseFont".as_slice()));
+    let text = base.as_deref().map(name_text);
     // A subset's name starts with six capitals and a plus (ISO 32000-2 § 9.6.4).
-    let name = base.as_ref().map(|n| match n.as_str().split_once('+') {
+    let name = text.as_deref().map(|n| match n.split_once('+') {
         Some((tag, rest)) if tag.len() == 6 && tag.bytes().all(|b| b.is_ascii_uppercase()) => rest,
-        _ => n.as_str(),
+        _ => n,
     });
     let named = name.unwrap_or("a font without a name").to_string();
     if program.is_some() {
         return Some((named, program));
     }
     (!name.is_some_and(|n| STANDARD_FONTS.contains(&n))).then_some((named, None))
+}
+
+/// A name's text: UTF-8 where its bytes are that; else its ASCII as it is and each other byte as
+/// `#` and two hex digits, as a PDF name writes it, so names that differ stay apart.
+fn name_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            bytes.iter().map(|&b| if b.is_ascii_graphic() && b != b'#' { char::from(b).to_string() } else { format!("#{b:02X}") }).collect()
+        }
+    }
 }
 
 /// Whether `hayro` loads `font`, whose program is in the file, in a stand-in: it can't read the
@@ -1377,6 +1434,76 @@ mod tests {
             read_bytes("x", many, None, true).unwrap().lost,
             ["fonts not in the file may be drawn in a stand-in font (the search for them stopped early)"]
         );
+    }
+
+    /// A form, soft mask or tiling pattern `hayro` wouldn't draw isn't looked through: a form
+    /// without a box, a soft mask of neither luminosity nor alpha (or of luminosity without a
+    /// color space for its group), a pattern without steps (#2352).
+    #[test]
+    fn the_font_search_skips_what_hayro_wont_draw() {
+        let arial = b"<< /Type /Font /Subtype /TrueType /BaseFont /Arial /Encoding /WinAnsiEncoding >>".to_vec();
+        let text = b"BT /F1 12 Tf 5 10 Td (Hi) Tj ET";
+        let names = |pdf: Vec<u8>| search(pdf, 1 << 20, 1000).0.len();
+        for (bbox, named) in [("/BBox [0 0 72 36]", 1), ("", 0)] {
+            let form = stream(&format!("/Type /XObject /Subtype /Form {bbox} /Resources << /Font << /F1 6 0 R >> >>"), text);
+            let pdf = pdf_of("0 0 72 36", "/Resources << /XObject << /X 5 0 R >> >>", b"/X Do", &[form, arial.clone()]);
+            assert_eq!(names(pdf), named, "form {bbox}");
+        }
+        let group = |extra: &str| {
+            stream(&format!("/Type /XObject /Subtype /Form /BBox [0 0 72 36] /Resources << /Font << /F1 6 0 R >> >> {extra}"), text)
+        };
+        for (kind, extra, named) in [
+            ("/Luminosity", "/Group << /S /Transparency /CS /DeviceGray >>", 1),
+            ("/Luminosity", "/Group << /S /Transparency >>", 0),
+            ("/Alpha", "", 1),
+            ("/Other", "", 0),
+        ] {
+            let pdf = pdf_of(
+                "0 0 72 36",
+                &format!("/Resources << /ExtGState << /G0 << /SMask << /S {kind} /G 5 0 R >> >> >> >>"),
+                b"/G0 gs 0 0 1 rg 0 0 10 10 re f",
+                &[group(extra), arial.clone()],
+            );
+            assert_eq!(names(pdf), named, "soft mask {kind} {extra}");
+        }
+        for (steps, named) in [("/XStep 72 /YStep 36", 1), ("/XStep 0 /YStep 36", 0), ("", 0)] {
+            let tile = stream(
+                &format!(
+                    "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 72 36] {steps} /Resources << /Font << /F1 6 0 R >> >>"
+                ),
+                text,
+            );
+            let pdf = pdf_of(
+                "0 0 72 36",
+                "/Resources << /Pattern << /P0 5 0 R >> >>",
+                b"/Pattern cs /P0 scn 0 0 72 36 re f",
+                &[tile, arial.clone()],
+            );
+            assert_eq!(names(pdf), named, "pattern {steps}");
+        }
+    }
+
+    /// Names that aren't UTF-8 (Shift-JIS) stay apart, written with `#` and hex as a PDF name
+    /// writes them; a composite font is named as its descendant; `MT` comes off only in capitals
+    /// (#2352).
+    #[test]
+    fn font_names_in_other_encodings_and_composites_are_named_apart() {
+        let font = |name: &str| format!("<< /Type /Font /Subtype /TrueType /BaseFont /{name} /Encoding /WinAnsiEncoding >>").into_bytes();
+        let pdf = pdf_of(
+            "0 0 72 36",
+            "/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >>",
+            b"BT /F1 12 Tf (a) Tj /F2 12 Tf (b) Tj ET",
+            &[font("#82#A0Gothic"), font("#82#A2Mincho")],
+        );
+        assert_eq!(search(pdf, 1 << 20, 1000).0, ["#82#A0Gothic", "#82#A2Mincho"]);
+        let composite =
+            b"<< /Type /Font /Subtype /Type0 /BaseFont /Arial-Identity-H /Encoding /Identity-H /DescendantFonts [6 0 R] >>".to_vec();
+        let descendant = b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Arial /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor << /Type /FontDescriptor /FontName /Arial /Flags 32 /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 >> >>".to_vec();
+        let pdf = pdf_of("0 0 72 36", "/Resources << /Font << /F1 5 0 R >> >>", b"BT /F1 12 Tf <0001> Tj ET", &[composite, descendant]);
+        assert_eq!(search(pdf, 1 << 20, 1000).0, ["Arial"]);
+        assert_eq!(font_key("ArialMT"), font_key("Arial"));
+        assert_ne!(font_key("FooMt"), font_key("Foo"));
+        assert_ne!(font_key("#82#A0Gothic"), font_key("#82#A2Gothic"));
     }
 
     /// An annotation appearance without a box isn't drawn, so isn't looked at; a font already
