@@ -73,11 +73,11 @@ pub fn tile_corner(file_name: &str) -> Option<(i32, i32)> {
 
 /// Reads an SRTM tile: `bytes` are the file, `file_name` its name (which places it).
 ///
-/// One step that doesn't look at Cancel: the file is already in memory and is read in a single
-/// pass over it. On the desktop it runs in Add Data's read-ahead, off the UI thread, and a Cancel
-/// takes effect when it returns. It stays on one thread: turning big-endian words into numbers is
-/// about 0.12 s for the largest (7201 × 7201) tile in a release build, less than reading its
-/// 104 MB from disk, so threads would add little.
+/// One step that doesn't look at Cancel: the tile is read in a single pass, a row at a time
+/// ([`read_checked_from`] streams a file the same way). On the desktop it runs in Add Data's
+/// read-ahead, off the UI thread, and a Cancel takes effect when it returns. It stays on one
+/// thread: turning big-endian words into numbers is about 0.12 s for the largest (7201 × 7201)
+/// tile in a release build, less than reading its 104 MB from disk, so threads would add little.
 pub fn read(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     read_limited(file_name, bytes, max_samples())
 }
@@ -128,30 +128,54 @@ pub fn read_checked(file_name: &str, checked: (i32, i32, usize), bytes: &[u8]) -
     read_checked_limited(file_name, checked, bytes, max_samples())
 }
 
+/// [`read_checked`] from a reader, a row at a time, so the file's bytes are never held whole:
+/// only the heights kept. It must give exactly the tile's size, as `bytes` must.
+pub fn read_checked_from(file_name: &str, checked: (i32, i32, usize), source: impl std::io::Read) -> Result<Raster> {
+    read_checked_limited(file_name, checked, source, max_samples())
+}
+
 /// [`read`], holding at most `max` samples (the tests' small limit exercises the reduction).
 fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     let checked = check(file_name, bytes.len() as u64)?;
     read_checked_limited(file_name, checked, bytes, max)
 }
 
-/// [`read_checked`], holding at most `max` samples.
-fn read_checked_limited(file_name: &str, (lat, lon, side): (i32, i32, usize), bytes: &[u8], max: usize) -> Result<Raster> {
-    if bytes.len() as u64 != (side * side * 2) as u64 {
-        return Err(bad(format!("the file is {} bytes now, not the {side} × {side} tile's it was", bytes.len())));
-    }
+/// [`read_checked_from`], holding at most `max` samples.
+fn read_checked_limited(
+    file_name: &str,
+    (lat, lon, side): (i32, i32, usize),
+    mut source: impl std::io::Read,
+    max: usize,
+) -> Result<Raster> {
+    use std::io::Read;
+    let wrong_size = |len: u64| bad(format!("the file is {len} bytes now, not the {side} × {side} tile's it was"));
     let step = step_within(side, side, max).ok_or_else(|| bad("the tile is too large to open".into()))?;
     let out = side.div_ceil(step);
     let mut data = super::grid::<f32>(out, out)?;
-    // One pass: every sample's void counted, every `step`-th kept.
+    // One pass, a row at a time: every sample's void counted, every `step`-th kept.
+    let row_bytes = side * 2;
+    let mut line = Vec::with_capacity(row_bytes);
+    let mut read = 0u64;
     let mut voids = 0u64;
-    for (row, line) in bytes.as_chunks::<2>().0.chunks(side).enumerate() {
+    for row in 0..side {
+        line.clear();
+        let n = source.by_ref().take(row_bytes as u64).read_to_end(&mut line)?;
+        read += n as u64;
+        if n < row_bytes {
+            return Err(wrong_size(read));
+        }
         let keep = row % step == 0;
-        for (col, raw) in line.iter().enumerate() {
+        for (col, raw) in line.as_chunks::<2>().0.iter().enumerate() {
             voids += u64::from(*raw == VOID.to_be_bytes());
             if keep && col % step == 0 {
                 data.push(f32::from(i16::from_be_bytes(*raw)));
             }
         }
+    }
+    // Bytes past the tile's size: the file grew since it was checked.
+    let rest = std::io::copy(&mut source, &mut std::io::sink())?;
+    if rest > 0 {
+        return Err(wrong_size(read + rest));
     }
     let d = 1.0 / (side - 1) as f64;
     let transform = post_transform(f64::from(lon), f64::from(lat), side, d, d, step);
@@ -350,6 +374,51 @@ mod tests {
         // Bytes that no longer match the size checked are refused.
         let e = read_checked("N37W122.hgt", checked, &bytes[..bytes.len() - 2]).unwrap_err().to_string();
         assert!(e.contains("not the 1201 × 1201 tile's it was"), "{e}");
+    }
+
+    /// A reader that gives at most `n` bytes a call, as a slow file or a pipe may.
+    struct Trickle<'a>(&'a [u8], usize);
+
+    impl std::io::Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.1.min(buf.len()).min(self.0.len());
+            let (now, rest) = self.0.split_at(n);
+            buf[..n].copy_from_slice(now);
+            self.0 = rest;
+            Ok(n)
+        }
+    }
+
+    /// What a read gave, for comparing two reads bit for bit.
+    fn same(a: &Raster, b: &Raster) {
+        assert_eq!(
+            (a.width, a.height, a.transform, a.overview, a.step, a.posts),
+            (b.width, b.height, b.transform, b.overview, b.step, b.posts)
+        );
+        assert_eq!(a.lost, b.lost);
+        let bits = |r: &Raster| r.bands.iter().map(|b| b.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(bits(a), bits(b));
+    }
+
+    #[test]
+    fn a_tile_streamed_in_small_pieces_reads_as_its_bytes_do() {
+        let bytes = tile(|row, col| if (row + col) % 97 == 0 { VOID } else { (row * 3 + col % 11) as i16 - 40 });
+        let checked = check("N37W122.hgt", bytes.len() as u64).unwrap();
+        for max in [max_samples(), 1201 * 1201 - 1] {
+            let whole = read_limited("N37W122.hgt", &bytes, max).unwrap();
+            for n in [1, 3, 4096] {
+                let streamed = read_checked_limited("N37W122.hgt", checked, Trickle(&bytes, n), max).unwrap();
+                same(&whole, &streamed);
+            }
+        }
+        // A stream cut short, or longer than the tile, is refused as the same bytes are.
+        for wrong in [&bytes[..bytes.len() - 3], &[bytes.as_slice(), &[0; 5]].concat()] {
+            let from_bytes = read_checked("N37W122.hgt", checked, wrong).unwrap_err().to_string();
+            let streamed = read_checked_from("N37W122.hgt", checked, Trickle(wrong, 7)).unwrap_err().to_string();
+            assert_eq!(from_bytes, streamed);
+        }
+        let e = read_checked_from("N37W122.hgt", checked, Trickle(&bytes[..bytes.len() - 3], 7)).unwrap_err().to_string();
+        assert!(e.contains("the file is 2884799 bytes now, not the 1201 × 1201 tile's it was"), "{e}");
     }
 
     #[test]

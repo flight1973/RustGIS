@@ -188,17 +188,33 @@ fn placement(counts: &[Option<i64>], cols: usize) -> std::result::Result<(), (us
 /// Reads a DTED file: `bytes` are the file, `file_name` its name (its extension gives the level
 /// the spacing is checked against when the DSI doesn't name one).
 ///
-/// One step that doesn't look at Cancel: the file is already in memory and is read in a single
-/// pass over its records. On the desktop it runs in Add Data's read-ahead, off the UI thread, and
-/// a Cancel takes effect when it returns. It stays on one thread, as [`super::hgt::read`] does: a
-/// cell is at most a quarter of the largest SRTM tile's size.
+/// One step that doesn't look at Cancel: the file is read in a single pass, a record at a time
+/// ([`read_from`] streams a file the same way). On the desktop it runs in Add Data's read-ahead,
+/// off the UI thread, and a Cancel takes effect when it returns. It stays on one thread, as
+/// [`super::hgt::read`] does: a cell is at most a quarter of the largest SRTM tile's size.
 pub fn read(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     read_limited(file_name, bytes, max_samples())
 }
 
+/// [`read`] from a reader: the headers, then one record at a time, so the file's bytes are never
+/// held whole, only the heights kept. Every check is made as [`read`] makes it on the same bytes;
+/// those that need the file's length are made once the records are read.
+pub fn read_from(file_name: &str, source: impl std::io::Read) -> Result<Raster> {
+    read_from_limited(file_name, source, max_samples())
+}
+
 /// [`read`], holding at most `max` samples (the tests' small limit exercises the reduction).
 fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
+    read_from_limited(file_name, bytes, max)
+}
+
+/// [`read_from`], holding at most `max` samples.
+fn read_from_limited(file_name: &str, mut source: impl std::io::Read, max: usize) -> Result<Raster> {
+    use std::io::Read;
     let bad = |m: &str| DataError::Format(format!("DTED: {m}"));
+    let mut head = Vec::with_capacity(HEADERS);
+    source.by_ref().take(HEADERS as u64).read_to_end(&mut head)?;
+    let bytes = head.as_slice();
     if bytes.len() < HEADERS {
         return Err(bad(if bytes.starts_with(b"UHL") { "the headers are cut short" } else { "not a DTED file (no UHL header)" }));
     }
@@ -243,21 +259,16 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     // cell with a height on every line counts the whole cell in its DSI too, but leaving posts out
     // makes its file shorter than the full grid's: refused as well, said as cut short or tape.
     let (dsi_rows, dsi_cols) = (dsi[2].0.map(|n| n as usize), dsi[3].0.map(|n| n as usize));
-    if let Some(percent) = digits(bytes, DSI + 289, 2).filter(|p| (1..=99).contains(p)) {
-        if dsi_cols.is_some_and(|n| n < cols) || dsi_rows.is_some_and(|n| n < rows) {
-            return Err(bad(&format!(
-                "a partial cell ({percent}% coverage) in the magnetic-tape layout, whose DSI counts only the {} of {cols} longitude lines and {} of {rows} latitude points with heights and whose records leave missing posts out; only the full-grid layout, as on CD-ROM, is read",
-                dsi_cols.unwrap_or(cols),
-                dsi_rows.unwrap_or(rows)
-            )));
-        }
-        let full = HEADERS.saturating_add(cols.saturating_mul(12 + 2 * rows));
-        if bytes.len() < full {
-            return Err(bad(&format!(
-                "a partial cell ({percent}% coverage) whose file is {} bytes shorter than its full grid of {cols} × {rows} posts: cut short, or in the magnetic-tape layout, which leaves missing posts out. A partial cell is read only whole, in the full-grid layout as on CD-ROM, since the two can't be told apart",
-                full - bytes.len()
-            )));
-        }
+    // The full grid's length is checked once the records are read.
+    let partial = digits(bytes, DSI + 289, 2).filter(|p| (1..=99).contains(p));
+    if let Some(percent) = partial
+        && (dsi_cols.is_some_and(|n| n < cols) || dsi_rows.is_some_and(|n| n < rows))
+    {
+        return Err(bad(&format!(
+            "a partial cell ({percent}% coverage) in the magnetic-tape layout, whose DSI counts only the {} of {cols} longitude lines and {} of {rows} latitude points with heights and whose records leave missing posts out; only the full-grid layout, as on CD-ROM, is read",
+            dsi_cols.unwrap_or(cols),
+            dsi_rows.unwrap_or(rows)
+        )));
     }
     // The level: the DSI's series designator (3.12 d), or the extension when it names none.
     let ext = std::path::Path::new(file_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -309,43 +320,39 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     };
     lost.push(vertical_note(&surface));
 
-    // The data records, one a longitude line, west to east (3.10.5, 3.12 f).
+    // The data records, one a longitude line, west to east (3.10.5, 3.12 f), read one at a time;
+    // the checks on them all are made once they are read, in the order they were made on the
+    // whole file, so a stream gives the error the same bytes would.
     let record = 12 + 2 * rows;
-    let body = bytes.get(HEADERS..).unwrap_or_default();
-    let present = (body.len() / record).min(cols);
-    if present == 0 {
-        return Err(bad("the file is cut short: it has no whole data record"));
-    }
-    // A record's longitude count is its line's number from the origin (3.12 f), so the record at
-    // place `i` should count `i`. Records are read by place, which is right only when the counts
-    // can't mean the heights belong to another column (see [`placement`]).
-    let lon_counts: Vec<Option<i64>> = body
-        .chunks_exact(record)
-        .take(cols)
-        .map(|rec| (rec.first() == Some(&SENTINEL)).then(|| signed_magnitude(rec.get(4..6).unwrap_or_default())))
-        .collect();
-    placement(&lon_counts, cols).map_err(|(place, count)| {
-        bad(&format!(
-            "{file_name}: the record at column {place} counts itself as column {count}, not {place}: its heights may belong to another column (columns left out, or counts offset), so the file is refused rather than read with heights in the wrong columns. Only a whole cell numbered from 1 is read by place"
-        ))
-    })?;
-    // A full-grid record's first height is latitude point 0 (3.12 f); one counting another point
-    // would place every height in its column north or south of where it belongs, so it is refused.
-    let shifted = body.chunks_exact(record).take(cols).enumerate().find_map(|(i, rec)| {
-        let count = signed_magnitude(rec.get(6..8).unwrap_or_default());
-        (rec.first() == Some(&SENTINEL) && count != 0).then_some((i, count))
-    });
-    if let Some((place, count)) = shifted {
-        return Err(bad(&format!(
-            "{file_name}: the record at column {place} counts its first height as latitude point {count}, not 0, where every full-grid record starts: its heights would be placed {count} points from where they belong, so the file is refused"
-        )));
-    }
-    let step = step_within(cols, rows, max).ok_or_else(|| bad("the cell is too large to open"))?;
-    let (w, h) = (cols.div_ceil(step), rows.div_ceil(step));
+    let step = step_within(cols, rows, max);
+    let (w, h) = step.map_or((0, 0), |step| (cols.div_ceil(step), rows.div_ceil(step)));
     let mut data = super::filled(w, h, f32::from(VOID))?;
     let (mut damaged, mut misnumbered, mut mismatched, mut voids, mut twos) = (0usize, 0usize, 0usize, 0u64, 0u64);
     let mut column = Vec::with_capacity(rows);
-    for (i, rec) in body.chunks_exact(record).take(cols).enumerate() {
+    // A record's longitude count is its line's number from the origin (3.12 f), so the record at
+    // place `i` should count `i`. Records are read by place, which is right only when the counts
+    // can't mean the heights belong to another column (see [`placement`]).
+    let mut lon_counts: Vec<Option<i64>> = Vec::with_capacity(cols);
+    // A full-grid record's first height is latitude point 0 (3.12 f); the first counting another.
+    let mut shifted = None;
+    let (mut present, mut body_len) = (0usize, 0u64);
+    let mut rec = Vec::with_capacity(record);
+    for i in 0..cols {
+        rec.clear();
+        let n = source.by_ref().take(record as u64).read_to_end(&mut rec)?;
+        body_len += n as u64;
+        if n < record {
+            break;
+        }
+        present += 1;
+        let sentinel = rec.first() == Some(&SENTINEL);
+        lon_counts.push(sentinel.then(|| signed_magnitude(rec.get(4..6).unwrap_or_default())));
+        let lat_count = signed_magnitude(rec.get(6..8).unwrap_or_default());
+        if shifted.is_none() && sentinel && lat_count != 0 {
+            shifted = Some((i, lat_count));
+        }
+        // Too large a cell is refused below; its records are still read for the earlier checks.
+        let Some(step) = step else { continue };
         let Some((head, (heights, sum))) =
             rec.split_at_checked(8).and_then(|(head, rest)| Some((head, rest.split_at_checked(rest.len().checked_sub(4)?)?)))
         else {
@@ -358,7 +365,7 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
             continue;
         }
         // A whole cell numbered from 1 is read by place, and said (any other longitude count that
-        // isn't the record's place, and any latitude count other than 0, was refused above).
+        // isn't the record's place, and any latitude count other than 0, is refused below).
         if lon_count != i as i64 {
             misnumbered += 1;
         }
@@ -390,13 +397,43 @@ fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
             }
         }
     }
+    // Bytes after the last column, counted and not kept.
+    if present == cols {
+        body_len += std::io::copy(&mut source, &mut std::io::sink())?;
+    }
+    if let Some(percent) = partial {
+        let full = (HEADERS as u64).saturating_add((cols as u64).saturating_mul(record as u64));
+        let len = (HEADERS as u64).saturating_add(body_len);
+        if len < full {
+            return Err(bad(&format!(
+                "a partial cell ({percent}% coverage) whose file is {} bytes shorter than its full grid of {cols} × {rows} posts: cut short, or in the magnetic-tape layout, which leaves missing posts out. A partial cell is read only whole, in the full-grid layout as on CD-ROM, since the two can't be told apart",
+                full - len
+            )));
+        }
+    }
+    if present == 0 {
+        return Err(bad("the file is cut short: it has no whole data record"));
+    }
+    placement(&lon_counts, cols).map_err(|(place, count)| {
+        bad(&format!(
+            "{file_name}: the record at column {place} counts itself as column {count}, not {place}: its heights may belong to another column (columns left out, or counts offset), so the file is refused rather than read with heights in the wrong columns. Only a whole cell numbered from 1 is read by place"
+        ))
+    })?;
+    // One counting another latitude point would place every height in its column north or south
+    // of where it belongs, so it is refused.
+    if let Some((place, count)) = shifted {
+        return Err(bad(&format!(
+            "{file_name}: the record at column {place} counts its first height as latitude point {count}, not 0, where every full-grid record starts: its heights would be placed {count} points from where they belong, so the file is refused"
+        )));
+    }
+    let step = step.ok_or_else(|| bad("the cell is too large to open"))?;
     if damaged == present {
         return Err(bad("no data record is whole: none starts with the 0xAA sentinel"));
     }
     let count = |n: usize| if n == 1 { format!("1 of its {cols} columns has") } else { format!("{n} of its {cols} columns have") };
     if present < cols {
         lost.push(format!("the file is cut short: {} no heights, read as no data", count(cols - present)));
-    } else if let Some(extra) = body.len().checked_sub(cols * record).filter(|n| *n > 0) {
+    } else if let Some(extra) = body_len.checked_sub((cols * record) as u64).filter(|n| *n > 0) {
         lost.push(format!("{extra} bytes after its last column are ignored"));
     }
     if damaged > 0 {
@@ -1029,6 +1066,60 @@ mod tests {
                 flipped[at] = next() as u8;
             }
             let _ = read("x.dt1", &flipped);
+        }
+    }
+
+    /// A reader that gives at most `n` bytes a call, as a slow file or a pipe may.
+    struct Trickle<'a>(&'a [u8], usize);
+
+    impl std::io::Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.1.min(buf.len()).min(self.0.len());
+            let (now, rest) = self.0.split_at(n);
+            buf[..n].copy_from_slice(now);
+            self.0 = rest;
+            Ok(n)
+        }
+    }
+
+    /// What a read gave, for comparing two reads bit for bit.
+    fn same(a: &Raster, b: &Raster) {
+        assert_eq!(
+            (a.width, a.height, a.transform, a.overview, a.step, a.posts),
+            (b.width, b.height, b.transform, b.overview, b.step, b.posts)
+        );
+        assert_eq!(a.lost, b.lost);
+        let bits = |r: &Raster| r.bands.iter().map(|b| b.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(bits(a), bits(b));
+    }
+
+    #[test]
+    fn a_cell_streamed_in_small_pieces_reads_as_its_bytes_do() {
+        let bytes = dted("0060000E", "0450000N", (30, 30), (121, 121), |i, j| match (i + j) % 53 {
+            0 => None,
+            1 => Some(-12),
+            _ => Some((i * 7 + j) as i16),
+        });
+        let mut longer = bytes.clone();
+        longer.extend_from_slice(&[1, 2, 3]);
+        let cut = &bytes[..at(100, 121) + 9];
+        for (b, max) in [(&bytes[..], max_samples()), (&bytes[..], 100), (&longer[..], max_samples()), (cut, max_samples())] {
+            let whole = read_limited("x.dt1", b, max).unwrap();
+            for n in [1, 5, 4096] {
+                same(&whole, &read_from_limited("x.dt1", Trickle(b, n), max).unwrap());
+            }
+        }
+        // Every refusal is the one the same bytes give: headers or records cut short, a record
+        // counting another column or latitude point, a partial cell cut short.
+        let mut offset = bytes.clone();
+        offset[at(3, 121) + 5] = 9;
+        let mut shifted = bytes.clone();
+        shifted[at(4, 121) + 7] = 2;
+        let mut partial = bytes.clone();
+        partial[DSI + 289..DSI + 291].copy_from_slice(b"50");
+        for b in [&bytes[..100], &bytes[..HEADERS + 20], &offset[..], &shifted[..], &partial[..partial.len() - 3], &[][..]] {
+            let from_bytes = read("x.dt1", b).unwrap_err().to_string();
+            assert_eq!(from_bytes, read_from("x.dt1", Trickle(b, 3)).unwrap_err().to_string());
         }
     }
 }
