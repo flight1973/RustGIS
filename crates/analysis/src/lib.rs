@@ -502,17 +502,18 @@ fn params_for(spec: &ToolSpec, params: &Value, built_in: bool) -> Result<Value, 
         // The built-in tools' choices are the whole list. An external tool's (GeoLibre's, a
         // plugin's) can be looser, such as GeoLibre's comma-separated lists of options: its own
         // runner checks them.
+        // A refused value's error names the keys it doesn't read too, as a missing one's does.
         if let ParamKind::Choice(choices) = ps.kind
             && built_in
             && let Some(v) = p.get_mut(ps.name)
         {
-            *v = choice(spec, ps, choices, v)?;
+            *v = choice(spec, ps, choices, v).map_err(|e| format!("{e}{}", unread(spec, params)))?;
         }
         if ps.kind == ParamKind::Bool
             && built_in
             && let Some(v) = p.get_mut(ps.name)
         {
-            *v = boolean(spec, ps, v)?;
+            *v = boolean(spec, ps, v).map_err(|e| format!("{e}{}", unread(spec, params)))?;
         }
     }
     Ok(Value::Object(p))
@@ -520,12 +521,16 @@ fn params_for(spec: &ToolSpec, params: &Value, built_in: bool) -> Result<Value, 
 
 pub use tools::JOIN_FIELD_ALIASES;
 
-/// Whether a parameter key is declared by `spec` or accepted as a valid parameter alias.
+/// Whether a parameter key is declared by `spec` or accepted as a valid parameter alias. A layer
+/// parameter's `<name>_name` counts too: the app's tool dialog puts a table's name there beside
+/// its id, for the run's history, and no tool reads it.
 pub fn is_accepted_param(spec: &ToolSpec, key: &str) -> bool {
     if spec.params.iter().any(|p| p.name == key) {
         return true;
     }
-    if spec.id == "joinField" { JOIN_FIELD_ALIASES.contains(&key) } else { false }
+    let names_a_table =
+        key.strip_suffix("_name").is_some_and(|base| spec.params.iter().any(|p| p.name == base && matches!(p.kind, ParamKind::Layer)));
+    names_a_table || (spec.id == "joinField" && JOIN_FIELD_ALIASES.contains(&key))
 }
 
 /// The names a tool reads one of its parameters under, `key` among them, or none when it has no

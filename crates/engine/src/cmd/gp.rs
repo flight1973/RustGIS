@@ -2564,11 +2564,31 @@ pub(crate) fn admitted_saying(
 }
 
 /// [`run_tool`] for parameters a caller wrote (`gp.run`, a model's step), saying first which of
-/// them the tool ignores ([`admitted_saying`]).
+/// them the tool ignores ([`admitted_saying`]). A failed run takes that warning back, so its
+/// error says the keys too, whatever the failure.
 pub(crate) fn run_tool_saying(s: &mut Session, tool: &str, params: &Value) -> CmdResult {
     let control = run_control(s);
     let op = admitted_saying(s, tool, params)?;
-    s.invoke_tool(op, &control)
+    let spec = op.op().pin.spec();
+    s.invoke_tool(op, &control).map_err(|e| saying_unread(spec, params, e))
+}
+
+/// `error` with the keys of `params` that `spec` doesn't read after it — " (given 'unit', which
+/// Buffer doesn't read)" — unless it says them already (a refused parameter's does).
+fn saying_unread(spec: &rustgis_analysis::ToolSpec, params: &Value, error: String) -> String {
+    if error.ends_with("doesn't read)") {
+        return error;
+    }
+    let unknown: Vec<&str> = params
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.keys().map(String::as_str))
+        .filter(|k| !rustgis_analysis::is_accepted_param(spec, k))
+        .collect();
+    if unknown.is_empty() {
+        return error;
+    }
+    format!("{error} (given {}, which {} doesn't read)", rustgis_analysis::quoted_keys(unknown), spec.name)
 }
 
 /// The control a tool run in the session takes: where a person at a terminal can stop it with
@@ -5771,6 +5791,12 @@ mod batch_tests {
         let mark = s.notices.len() as u64;
         s.run("gp.run", &json!({"tool": "buffer", "params": {"input": "Cities", "distance": 100, "units": "Miles"}})).unwrap();
         assert!(said(&s, mark).is_empty(), "{:?}", said(&s, mark));
+        // The name the tool dialog puts beside a table's id (`input_name`) isn't taken for a stray;
+        // `_name` beside a parameter that isn't a layer is.
+        let buffer_spec = resolve_tool("buffer").unwrap();
+        assert_eq!(ignored_params(buffer_spec, &json!({"input": "Cities", "distance": 1, "input_name": "Cities"})), None);
+        let stray = ignored_params(buffer_spec, &json!({"input": "Cities", "distance": 1, "distance_name": "x"})).unwrap();
+        assert!(stray.starts_with("Buffer ignores 'distance_name'"), "{stray}");
         // Many keys: the first five, sorted, each cut to 40 characters, then how many more.
         let mark = s.notices.len() as u64;
         let long = "x".repeat(60);
@@ -5787,6 +5813,15 @@ mod batch_tests {
         // in its error: a failed command takes its warnings back.
         let e = s.run("gp.run", &json!({"tool": "clip", "params": {"input": "Cities", "clips": "Parks"}})).unwrap_err();
         assert!(e.ends_with("'Clip Features' is required (given 'clips', which Clip doesn't read)"), "{e}");
+        // Any failed run says them, not only one missing a required parameter.
+        let e = s
+            .run("gp.run", &json!({"tool": "buffer", "params": {"input": "Cities", "distance": 1, "dissolve": "maybe", "unit": "Miles"}}))
+            .unwrap_err();
+        assert!(e.ends_with(" (given 'unit', which Buffer doesn't read)"), "{e}");
+        assert_eq!(e.matches("doesn't read").count(), 1, "{e}");
+        let e =
+            s.run("gp.run", &json!({"tool": "buffer", "params": {"input": "No Such Layer", "distance": 1, "unit": "Miles"}})).unwrap_err();
+        assert!(e.ends_with(" (given 'unit', which Buffer doesn't read)"), "{e}");
         // So does a model's step that fails for it.
         s.run("model.new", &json!({"name": "Clips", "steps": [{"tool": "clip", "params": {"input": "Cities", "clips": "Parks"}}]}))
             .unwrap();
@@ -5802,12 +5837,14 @@ mod batch_tests {
         let join = json!({"target": "Cities", "join": "Parks", "match": "Within a distance", "distance": 5000, "units": "Miles", "distanceField": "d"});
         s.run("gp.spatialJoin", &join).unwrap();
         assert!(said(&s, mark).is_empty(), "{:?}", said(&s, mark));
-        let command = s.registry.get("gp.spatialJoin").and_then(|c| c.param_keys()).unwrap();
-        let tool = resolve_tool("spatialJoin").unwrap();
-        let missing: Vec<&str> = tool.params.iter().map(|p| p.name).filter(|k| !command.contains(k)).collect();
-        assert!(missing.is_empty(), "gp.spatialJoin doesn't declare {missing:?}");
-        // Zonal Statistics' old `layer` for its raster is never read: `raster` is required, so a
-        // run given only `layer` is refused first, and the error names the key it was given.
+        for (cmd, tool) in [("gp.spatialJoin", "spatialJoin"), ("gp.zonalStats", "zonalStats")] {
+            let command = s.registry.get(cmd).and_then(|c| c.param_keys()).unwrap();
+            let tool = resolve_tool(tool).unwrap();
+            let missing: Vec<&str> = tool.params.iter().map(|p| p.name).filter(|k| !command.contains(k)).collect();
+            assert!(missing.is_empty(), "{cmd} doesn't declare {missing:?}");
+        }
+        // Zonal Statistics reads its raster only as `raster`: a run given the old `layer` is
+        // refused, and the error names the key it was given.
         let e = s.run("gp.run", &json!({"tool": "zonalStats", "params": {"layer": "Cities", "polygons": "Parks"}})).unwrap_err();
         assert!(e.ends_with("'Input Raster' is required (given 'layer', which Zonal Statistics doesn't read)"), "{e}");
         // A run started in the background says it too, before its work.
