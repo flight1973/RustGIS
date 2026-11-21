@@ -41,16 +41,17 @@ is out of scope.
   without a count is fine; Cancel is not optional.
 - A command that must run on the UI thread says why in its doc comment.
 - A new background raster command or export, or a tool whose work grows with its input, goes in
-  the lists in `crates/engine/src/tests.rs` (`cancel_rasters`, `cancel_exports`, `cancel_tools`);
-  `cancel_rasters` and `cancel_exports` must match the background registries. A read-ahead command
-  (`reads::prepare`, such as `service.layers` or `edit.previewShapeConversion`) has no list: add
-  its call to `long_commands_stop_when_cancelled_while_they_run` by hand.
+  the lists in `long_commands` (`crates/engine/src/tests/cancellation.rs`), which both cancel tests
+  run; the raster and export lists must match the background registries. A read-ahead command
+  (`reads::prepare`, such as `service.layers` or `edit.previewShapeConversion`) has no registry:
+  add its call to `long_commands` by hand.
   `long_commands_stop_when_cancelled_while_they_run` fails one that never looks at Cancel;
-  `cancelling_at_each_check_leaves_nothing_behind` cancels each command of the three lists at its
-  first three checks and its last, and fails one that leaves the project, its undo steps or the
-  files changed, or can't run again (read-aheads and commands that read from the network are left
-  out). Passing shows the work looks, not that
-  it looks often: a long step without a check (one union, one read) is said in its doc comment.
+  `cancelling_at_each_check_leaves_nothing_behind` cancels at every check in turn until the command
+  finishes before reaching it, on small fixtures, failing if one needs 256 or more checks. It
+  checks project data, Undo/Redo, files and an immediate retry. Network-bound cases keep only
+  first-check coverage.
+  Passing shows the work looks, not that it looks often: a long step without a check (one union,
+  one read) is said in its doc comment.
 
 ## Use the threads
 Work that splits into independent parts runs on several threads where practical:
@@ -59,6 +60,19 @@ Work that splits into independent parts runs on several threads where practical:
   everywhere, the thread count from `rustgis_data::threads` (it follows the user's setting), never
   `available_parallelism` or a fixed number, and scratch memory within `memory::thread_scratch`;
 - a thread the OS refuses costs speed, not the run (`Builder::spawn_scoped`).
+
+## Size for real data
+Real data dwarfs the sample project: a parcel layer of half a million rows and a hundred fields
+loads at about 2.5 GB, national layers run to tens of millions of rows and more, and a 1 m
+elevation model of 1,000 km² is a billion cells. When a change stores, copies or compares layer
+data, give in the pull request what it holds as a multiple of the layer, as `cargo xtask memory`
+measures.
+- Memory follows what an operation changes or produces: an Undo step, a version, a sync base or a
+  cache holds only the changed rows or shares storage with the original. New work adds no second
+  full copy of a layer or raster; #2431 measured what one costs.
+- Work that grows with its input goes in pieces (chunks, tiles, slices) that it doesn't keep, or
+  sizes its limit with `memory::planned` and refuses past it with a way out, such as filtering or
+  clipping first. Running out of memory partway counts as a crash.
 
 ## Architecture
 | Layer | Crate | Job |
@@ -104,6 +118,10 @@ Work that splits into independent parts runs on several threads where practical:
   the catalogs in `crates/data/src/query.rs` (`Func::spec`, `VARS`, `Kw`), which the parser
   reads, and in `docs/user-guide/expressions.md`; the `query` tests fail when the guide misses
   a signature, unit, variable or keyword, or names a function that doesn't exist.
+- **A parameter that takes an expression says so**: a command's key gives its type as `sql` or
+  `expression` in its params (`"where": sql`, `"size"?: expression|null`), and a tool's
+  parameter is `ParamKind::Expression`, so it can be told from plain text. Another language (a
+  database's, a service's) is described in quoted prose instead.
 
 ## Reach every surface
 A change that works where you tried it is often missing elsewhere. Before calling it done, say in
@@ -129,6 +147,14 @@ the pull request which of these it reaches and why the rest don't apply:
 `cargo xtask ci` (fmt, clippy -D warnings, tests, layers) before every commit.
 `cargo xtask test-hygiene` (also in CI) requires `// test-wait: reason` on timer waits in tests and
 `#[ignore = "reason"]` on ignored tests; prefer completion or progress signals.
+`cargo xtask memory` (in CI on Linux) fails when a command line workflow's peak memory grows past
+its limit in `xtask/memory-limits.txt`; a change that lowers one commits the lower limit with it.
+`cargo xtask rows` (also in CI) fails when code outside `rustgis-data` uses a layer's rows directly
+(`Feature` fields, the row vector) more often than `xtask/row-uses.txt` allows: use the accessors on
+`Features` (`row`, `rows`, `value`, `set_value`, …), and `--update` when you lower the count (#2431).
+It counts only the libraries and programs built for the host, not tests, examples, benches or code
+built only for other targets, nor a row indexed without reading a field (`features[i]` alone); use
+the accessors there too.
 While you work, `cargo xtask changed` runs the same checks on only the packages your branch changes
 and those that depend on them (and `test-hygiene` on the whole workspace), or everything when a
 changed file such as `Cargo.lock` is outside every package and nothing includes it.

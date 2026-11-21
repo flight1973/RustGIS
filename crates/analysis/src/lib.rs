@@ -86,6 +86,9 @@ pub enum ParamKind {
     },
     Number,
     Text,
+    /// An expression in the language of queries (`pop_est > 1000000`), read against the
+    /// associated input: text, marked apart from plain text for whoever completes it.
+    Expression,
     /// One of a fixed list of choices.
     Choice(&'static [&'static str]),
     /// A raster layer.
@@ -161,11 +164,17 @@ pub struct RasterInput<'a> {
 #[derive(Clone, Debug)]
 pub struct ToolResult {
     pub output: Output,
+    /// Ordinary messages. Classified losses appear in `losses` only.
     pub messages: Vec<String>,
+    /// Losses identified by the producer. Consumers that display plain text read both
+    /// `messages` and the text of these losses.
+    pub losses: Vec<rustgis_data::loss::LossMessage>,
 }
 
 /// Access to the map's layers by name.
 pub trait Inputs {
+    /// A vector layer or table by name, in longitude/latitude: the space every tool reads its
+    /// inputs in and writes its outputs in.
     fn dataset(&self, layer: &str) -> Option<&Dataset>;
     /// A standalone table by its id: an input given as a number, which no name is taken for.
     fn table(&self, _id: u32) -> Option<&Dataset> {

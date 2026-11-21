@@ -210,6 +210,25 @@ impl Value {
         }
     }
 
+    /// Whether a file's text is `<Null>` (any case, spaces around it allowed), which files exported
+    /// from other programs hold for a missing value.
+    pub fn is_null_marker(text: &str) -> bool {
+        text.trim().eq_ignore_ascii_case("<null>")
+    }
+
+    /// A value read from a file's text, as [`parse_source`](Value::parse_source) but for a text
+    /// field, which keeps the text as the file has it: spaces around it are kept, and all-space
+    /// text is text. Empty text and [`<Null>`](Value::is_null_marker) are null, in any field; a
+    /// reader counts the `<Null>`s it reads ([`crate::source::null_text_note`]). Text typed into the
+    /// table goes through [`parse`](Value::parse), which trims.
+    pub fn parse_file(text: &str, ty: FieldType) -> Value {
+        match ty {
+            _ if text.is_empty() || Self::is_null_marker(text) => Value::Null,
+            FieldType::Text => Value::Text(text.to_string()),
+            _ => Self::parse_source(text, ty),
+        }
+    }
+
     /// Parses user text into a value of `ty` (empty → Null). Text a number field can't hold,
     /// including a non-finite Double (`NaN`, `inf`), is Null. Dates are ISO 8601: `YYYY-MM-DD`
     /// for a date; that, a time and an optional zone for a date-time. Text that isn't one is Null.
@@ -262,8 +281,27 @@ impl PartialOrd for Value {
         if let Some((a, b)) = self.temporal_keys(other) {
             return Some(a.cmp(&b));
         }
+        // Whole numbers order exactly: through f64, neighbours above 2^53 would tie. A whole
+        // number against any other number is exact too, so equal values stay transitive and a
+        // sort by this order stays total.
+        if let (Value::Int(a), Value::Int(b)) = (self, other) {
+            return Some(a.cmp(b));
+        }
         match (self.as_f64(), other.as_f64()) {
-            (Some(a), Some(b)) if !matches!(self, Value::Text(_)) || !matches!(other, Value::Text(_)) => a.partial_cmp(&b),
+            (Some(a), Some(b)) if !matches!(self, Value::Text(_)) || !matches!(other, Value::Text(_)) => match (self, other) {
+                // Whole-number text against a whole number reads as the integer it spells.
+                (Value::Int(i), Value::Text(t)) => match t.trim().parse::<i64>() {
+                    Ok(j) => Some(i.cmp(&j)),
+                    Err(_) => int_cmp_f64(*i, b),
+                },
+                (Value::Text(t), Value::Int(i)) => match t.trim().parse::<i64>() {
+                    Ok(j) => Some(j.cmp(i)),
+                    Err(_) => int_cmp_f64(*i, a).map(Ordering::reverse),
+                },
+                (Value::Int(i), _) => int_cmp_f64(*i, b),
+                (_, Value::Int(i)) => int_cmp_f64(*i, a).map(Ordering::reverse),
+                _ => a.partial_cmp(&b),
+            },
             _ => match (self, other) {
                 (Value::Null, Value::Null) => Some(Ordering::Equal),
                 (Value::Null, _) => Some(Ordering::Less),
@@ -272,6 +310,28 @@ impl PartialOrd for Value {
             },
         }
     }
+}
+
+/// `i` against `f` exactly, without rounding `i` to the nearest f64: unknown for NaN.
+fn int_cmp_f64(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return None;
+    }
+    // 2^63 is exactly representable; every whole f64 below it in magnitude fits in an i64.
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if f >= TWO_63 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_63 {
+        return Some(Ordering::Greater);
+    }
+    let whole = f.trunc();
+    let w = whole as i64;
+    Some(match i.cmp(&w) {
+        Ordering::Equal => 0.0_f64.partial_cmp(&(f - whole)).unwrap_or(Ordering::Equal),
+        o => o,
+    })
 }
 
 /// A Unique Values class's value, given as its text, read as a number exactly as written: any
@@ -523,6 +583,29 @@ pub fn sort_class_values(values: &mut Vec<String>) {
 mod tests {
     use super::*;
 
+    /// Whole numbers order exactly against whole numbers and against decimals, so values equal to
+    /// one another stay equal to the same things: a sort by this order never sees a contradiction.
+    #[test]
+    fn whole_numbers_order_exactly_and_transitively() {
+        use std::cmp::Ordering;
+        let two_53 = 1_i64 << 53;
+        let (a, f, b) = (Value::Int(two_53), Value::Float(9_007_199_254_740_992.0), Value::Int(two_53 + 1));
+        assert_eq!(a.partial_cmp(&f), Some(Ordering::Equal));
+        assert_eq!(b.partial_cmp(&f), Some(Ordering::Greater));
+        assert_eq!(f.partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(Value::Int(2).partial_cmp(&Value::Float(2.5)), Some(Ordering::Less));
+        assert_eq!(Value::Int(-2).partial_cmp(&Value::Float(-2.5)), Some(Ordering::Greater));
+        assert_eq!(Value::Int(i64::MAX).partial_cmp(&Value::Float(9.3e18)), Some(Ordering::Less));
+        // The same integer written as text compares as that integer, both ways round.
+        let text = Value::Text(" 9007199254740993".into());
+        assert_eq!(b.partial_cmp(&text), Some(Ordering::Equal));
+        assert_eq!(text.partial_cmp(&a), Some(Ordering::Greater));
+        let mut v = vec![b.clone(), f.clone(), a.clone(), Value::Float(1.5), Value::Int(1)];
+        v.sort_by(|x, y| x.partial_cmp(y).unwrap_or(Ordering::Equal));
+        assert_eq!(v, [Value::Int(1), Value::Float(1.5), f, a, b]);
+    }
+
     #[test]
     fn values_stay_small() {
         assert_eq!(std::mem::size_of::<Value>(), 24);
@@ -563,6 +646,20 @@ mod tests {
         assert_eq!(json, r#"[{"Date":"2026-03-05"},{"DateTime":"2026-03-05T14:30:00+02:00"}]"#);
         assert_eq!(serde_json::from_str::<Vec<Value>>(&json).ok(), Some(vals));
         assert!(serde_json::from_str::<Value>(r#"{"Date":"2026-02-30"}"#).is_err());
+    }
+
+    /// File text keeps its spaces in a text field (#2059); empty and `<Null>` are null in any
+    /// field, numbers read past spaces, and text typed into the table is still trimmed.
+    #[test]
+    fn file_text_is_kept_as_it_is_and_typed_text_is_trimmed() {
+        for (text, kept) in
+            [(" 2535", Value::Text(" 2535".into())), ("   ", Value::Text("   ".into())), ("", Value::Null), (" <null> ", Value::Null)]
+        {
+            assert_eq!(Value::parse_file(text, FieldType::Text), kept, "{text:?}");
+        }
+        assert_eq!(Value::parse_file(" 2535 ", FieldType::Integer), Value::Int(2535));
+        assert_eq!(Value::parse_file("<Null>", FieldType::Double), Value::Null);
+        assert_eq!(Value::parse(" 2535", FieldType::Text), Value::Text("2535".into()), "typed text is trimmed");
     }
 
     /// Interactive Double text rejects non-finite numbers, while source parsing preserves them

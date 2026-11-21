@@ -73,14 +73,22 @@ A result is right, or RustGIS says what it lost or assumed
   nodes or ways the file doesn't hold, and inner rings outside every outer one; and the text
   readers' losses listed as `Silent` in `crates/engine/tests/never_silent_reading.rs`, among them
   each vertex's Z in DXF and unreadable coordinates, holes and parts in KML, GeoRSS, MapInfo and
-  DXF. A fix makes its case `Said` _(open)_.
-- Lossy sample files in `never_silent_reading.rs` for the readers it doesn't cover yet: CityJSON,
-  CityGML and the binary formats (Shapefile, GeoPackage, FlatGeobuf, GeoParquet, OSM PBF, KMZ,
-  spreadsheets). It covers GeoJSON, TopoJSON, CSV, KML, GPX, GML, GeoRSS, DXF, LandXML and MapInfo;
-  exports are checked by `never_silent_roundtrip.rs` _(open)_.
-- A `--strict` option for `rustgis-cli run` that exits non-zero when a loss is reported, for
-  scheduled jobs. Notices carry a severity but not a kind today (`Notice` in
-  `crates/engine/src/lib.rs`): start with an issue on which notices count as a loss.
+  DXF, plus geometry-collection members in XLSX/ODS/XLS/XLSB, error-valued attribute cells in XLSX,
+  and attribute fields/values in XLSB short-cell workbooks (the original SheetJS 0.18.5 clean
+  workbook retains its point but no attributes, without a notice). A fix makes
+  its case `Said` _(open)_.
+- Lossy sample files in `never_silent_reading.rs` for the readers it doesn't cover yet:
+  remaining distinct loss families and parser paths (see the finite
+  [coverage inventory](crates/engine/testdata/reading-losses/README.md#coverage-boundaries)). It covers GeoJSON, TopoJSON, CSV,
+  KML, KMZ, GPX, GML, GeoRSS,
+  DXF, LandXML and MapInfo, with height-loss cases for CityJSON, CityGML, GeoPackage,
+  FlatGeobuf, GeoParquet and FileGDB, Z/M-loss cases for Shapefile, and ring-loss cases for
+  OSM PBF, WKT height/member losses for XLSX, ODS, XLS and XLSB, and error-cell losses for XLSX; other loss kinds remain.
+  XLSM shares the XLSX parser; macros are untested.
+  Exports are checked by `never_silent_roundtrip.rs` _(open)_.
+- Classify existing loss notices so scheduled jobs can detect them by code. Then add
+  `rustgis-cli run --strict`, which exits non-zero on a disallowed loss, and expose the codes
+  to Python and MCP ([#2371](https://github.com/opengeos/RustGIS/issues/2371)).
 - Grid datum shifts (NTv2 and GeoTIFF grids) for NAD27, NAD83(HARN), GDA94↔GDA2020 and OSGB36
   without the GDAL program (a layer read without its shift says so today). _Coordinate first_
   (needs an issue).
@@ -239,11 +247,13 @@ And alongside it:
 Before adding a tool, check whether the GeoLibre suite already has it (`gp.tools`); a built-in
 version must justify itself: no runner download, the selection honoured, geodesic distances and
 attributes kept.
-- Network analysis: service areas, isochrones (also from a point on the map, through its
-  right-click menu) and an origin–destination matrix over a line layer, in a guided workflow over
-  the GeoLibre suite's network tools, once their results are checked against known answers
-  (today: shortest path over a line layer, and online Directions). Follow the
-  [ribbon guidelines](docs/contributing.md#ribbon-guidelines) for where it goes.
+- Network analysis over a line layer (#2344). Built in today: shortest path, Service Area (lines)
+  and OD Cost Matrix, and online Directions. Still to come: one-way travel and travel time,
+  closest facility, service-area polygons and isochrones (also from a point on the map, through its
+  right-click menu), barriers and turns; location-allocation and vehicle routing as a guided
+  workflow over the GeoLibre suite's network tools, once their results are checked against known
+  answers. Follow the [ribbon guidelines](docs/contributing.md#ribbon-guidelines) for where it
+  goes.
 - Hot-spot statistics (Getis-Ord Gi\*), and emerging hot spots on the time slider.
 - Kriging with a fitted variogram and leave-one-out cross-validation (the variogram is a default
   estimated from the points and extent today, not fitted; `kriging.rs`).

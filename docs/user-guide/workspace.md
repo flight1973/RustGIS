@@ -217,9 +217,10 @@ styles and field labels. The result includes `map`, `layers` and per-layer `note
 approximated presentation from skipped sources. Newer format versions are read as far as possible
 with a note. Unsupported layer kinds and project sections are reported rather than silently lost.
 
-Colour classes and proportional sizes are supported separately. Combined colour-and-size styles
-keep colour and use a fixed size; graduated colour class boundaries are retained; proportional
-sizes use RustGIS's area scaling. Label halos use RustGIS defaults. Tile overlays draw above feature
+Colour classes, proportional sizes and the two combined are supported. A combined
+colour-and-size style keeps its classes' colours and sizes each point by its field, by radius as
+GeoLibre does (**Size by** in the Symbology pane); graduated colour class boundaries are
+retained; a proportional size alone uses RustGIS's area scaling. Label halos use RustGIS defaults. Tile overlays draw above feature
 layers, and nested groups become flat folders with inherited visibility and opacity retained.
 Local data paths require a locally opened project or an explicit `dir`; URL and pasted-text imports cannot read local files without that folder.
 URL data downloaded in the browser fills its reserved layer position when it arrives; wait for
@@ -238,8 +239,40 @@ A QGIS project (`.qgs`, or a `.qgz` archive) opens as a new map of the current p
 on the desktop, or **Project › New › QGIS Project…** (`project.importQgis={"path": "…/towns.qgs"}`).
 The QGIS Project picker filters for `.qgs` and `.qgz` files on both desktop and web.
 Its layers come in the layer tree's order, each from its file (GeoPackage, Shapefile, GeoJSON,
-GeoTIFF and the other formats RustGIS reads), a CSV of
-points, XYZ tiles or a WMS layer, unchecked layers and groups hidden. The layer tree's groups come in
+GeoTIFF and the other formats RustGIS reads, a SpatiaLite table, a GPX file's waypoints, routes
+or tracks), a CSV of points or WKT geometry, XYZ tiles (raster or vector, from their address),
+an MBTiles file on this computer (raster or vector), a PMTiles archive (raster or vector, a file
+or a web address) or a web service, unchecked layers and groups hidden. A web service's layer
+comes in as **Add Web Data** adds it, from the service: a WMS or WMTS layer; a WFS feature type or
+an OGC API collection, as features in the QGIS layer's style (a filter of the form `SELECT * FROM t
+WHERE …` becomes its definition query; another query is noted); an ArcGIS feature layer (of a
+feature or map service) as features, a map service's map or one of its layers drawn alone (the whole
+map, noted, when the service doesn't list that layer), an image service's image, or a vector tile
+service's tiles in the service's own style; a WCS coverage, read once over the view the project was
+saved with (all the way round a pole it holds), or whole when the project has no saved view RustGIS
+can use (or no coordinate system its view could be read in), noted either way (QGIS asks for each
+view). A WMTS layer is drawn from the service's Web Mercator tile matrix set where it has one, else
+from one in its own system, noted, as QGIS's choice of set isn't read. An OGC API collection its
+service answers with tiles comes in as tiles, its filter and style noted; one that offers only
+tiles, which a QGIS OGC API Features layer can't name, is left out, noted. Two layers on the same tiles (two map service layers drawn
+as its whole map, say) come in once, noted. A login the layer used (a user name and password, a
+token or key, or QGIS's saved authentication) isn't carried over and is noted: the service is asked
+with the login saved in RustGIS for it, if there is one. Other source settings RustGIS doesn't read
+(a WMS layer's own style, say) are noted by name (the first 32, the rest counted); one with no
+value, which may be a key written on its own, is taken as a login, never named. A service that
+doesn't answer, or doesn't list the layer, leaves that layer out, noted. In the web app, a web
+service's layer is left out, noted: add it with **Home › Add › Add Data › From Service**. On the
+desktop, the import waits for each service in turn. A memory
+layer comes in empty with its fields, as QGIS opens it (QGIS doesn't save its features). A
+virtual layer that selects every column of one file's layer (`SELECT * FROM t`, with or without
+a `WHERE` clause, its fields named with or without the table, or no query) comes in as that
+layer, the clause its filter; another query, or one on a layer that isn't a file's (a memory,
+CSV, database or web layer), is noted. Vector tiles are drawn in RustGIS's colours, noted: QGIS's own vector tile style (and a
+MapLibre style it was made from) isn't read. A PostGIS or SQL Server table isn't connected to on
+import. On the desktop, the notes name a saved connection to its database to log in to and add
+the table from: one already saved, else one made from the project's (without its password, at
+most 16 an import). Undo leaves it saved. A connection by service name, or with values an
+address would have to escape, is noted without one. The layer tree's groups come in
 as [layer groups](index.md), nested as in QGIS (to eight levels and 2,000 groups; the layers of
 groups past that go in the group holding them), open or closed, each layer in its group with its
 own box; a group drawn as one (a QGIS group layer) takes its visibility range and its
@@ -365,7 +398,7 @@ before, the rest (functions, arithmetic, `CASE`, `@map_scale`) as they are, for 
 lacks, a field the layer hasn't) is noted and left out, as is one measuring with `$area`,
 `$perimeter` or `$length`, which QGIS gives in the project's units. What RustGIS doesn't draw as QGIS does is drawn as
 near as it can, or left out, and said: the import's notes list, layer by layer, what was
-approximated (gradient and shapeburst fills' offsets left out and colour ramps other than gradients drawn from their first colour to their last, SVG, raster and random fills and dense brushes as a tint of their colour, SVG markers as circles,
+approximated (vector tile styles, a memory layer's fields of kinds RustGIS hasn't as text, gradient and shapeburst fills' offsets left out and colour ramps other than gradients drawn from their first colour to their last, SVG, raster and random fills and dense brushes as a tint of their colour, SVG markers as circles,
 dashed polygon outlines solid, label halos with sharp corners drawn round and blended ones drawn
 over the map, label backgrounds of other shapes drawn as rectangles, label distances from lines
 and polygons, a distance around points moved straight up, labels wrapped at a shortest line
@@ -375,8 +408,8 @@ a group layer's opacity applied to each of its layers and its blending mode draw
 relation on several pairs of fields related by the first, features shown over time from a start date
 alone, events lasting a fixed time shown at their date, a layer accumulating its features over time, features at the very end of a time step) and what was skipped (arrow lines, group layers' draw effects, other data-defined
 settings, draw effects, label callouts, contours and other raster
-renderers RustGIS has no match for, PostGIS, WFS
-and other sources RustGIS doesn't read, histogram, stacked bar and text diagrams, joins, virtual fields, a layer's other styles,
+renderers RustGIS has no match for, PostGIS and SQL Server tables, WFS and other sources
+RustGIS doesn't read, virtual layers with other queries, histogram, stacked bar and text diagrams, joins, virtual fields, a layer's other styles,
 time from an expression, a fixed range or redrawn as the time changes, a raster's or a service's time, and the project's print layouts, QGIS 3's older annotation balloons, map themes,
 bookmark groups and bookmarks the map's projection doesn't reach, polymorphic relations and its time span and steps). A database
 password in a project never reaches the notes.
@@ -605,10 +638,11 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
 - **Start-up**: **Settings › Start-up** sets what RustGIS opens with: **Start With** the World Atlas
   sample or a blank map, or, in the desktop app, **Last Project** (the `.rgis` project last opened
   or saved) or **Choose Project…** (one you pick once), the **Projection** the map opens in (a
-  preset or a supported projected EPSG or ESRI code, such as `3010` or `ESRI:102033`), and the **Extent** it opens on (the
-  full extent, or **Use Current View** to keep the view you are looking at). A project opened at
-  start keeps its own projection and view; the Projection and Extent settings apply to the sample
-  and a blank map. If the project no longer opens (moved or deleted), RustGIS starts with the sample
+  preset or a supported projected EPSG or ESRI code, such as `3010` or `ESRI:102033`, found by
+  name or code as in [Finding a coordinate system](maps.md#finding-a-coordinate-system)), and the
+  **Extent** it opens on (the full extent, or **Use Current View** to keep the view you are looking
+  at). A project opened at start keeps its own projection and view; the Projection and Extent
+  settings apply to the sample and a blank map. If the project no longer opens (moved or deleted), RustGIS starts with the sample
   and says why. After a crash it starts with the sample too, in case the project is what crashed, and offers
   back the [recovery copy](#autosave-and-recovery) autosave kept of unsaved work, if any;
   starting `rustgis --sample` also skips the start-up project. The choices are remembered on this

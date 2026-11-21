@@ -24,11 +24,15 @@ area('ac') BETWEEN 1 AND 5 AND zoning = 'R-1'
 ```
 
 In Select By Attributes, the Layer Properties Query tab and a label class's SQL query, the
-**Functions** and **Variables** menus list the language's catalog. Hover over an item to see its
-help beside the list (below it in a narrow window): a function's signature, description and
-example, or a variable's description. Clicking appends it to the expression; a function opens
-its argument list, or inserts the complete call when it takes no arguments.
-In short windows, scroll the menu to reach the help below the list.
+**Functions** and **Variables** menus list the language's catalog in the same list the
+expression box suggests from. The highlighted item's help shows beside the list (below it in a
+narrow window), or the help of the item under the pointer: a function's signature, description
+and example, or a variable's description. The list shows ten items at a time and scrolls to the
+rest. Up and Down move the highlight, Enter or a click appends the item to the expression, and
+Escape, Tab or a click elsewhere closes the list; from the keyboard, Tab to the menu and press
+Enter or Space to open it (Space again closes it). While the list is open, shortcuts with Ctrl
+(⌘) still work. A function opens its argument list, or inserts the complete call when it takes
+no arguments.
 
 ## Grammar
 
@@ -80,10 +84,19 @@ operator: write `a < b AND b < c`, not `a < b < c`.
 | `TRUE`, `FALSE`, `NULL` | Booleans and the missing value |
 | `pop_est`, `"Pop Est"`, `!Pop Est!` | A field, by name, ignoring letter case; quote a name with spaces, punctuation or the name of a keyword (`"OR"`, `"null"`) |
 | `@map_scale`, `$scale` | The scale denominator of the map being drawn: set in [symbols](cartography.md#symbols-by-expression), [labels](cartography.md#labeling) and Unique Values classes by expression, null in queries and Calculate Field |
+| `@page_feature_id` | Integer id of the current [Map Series](layouts.md#map-series) index feature |
+| `@page_name` | Text shown as the current Map Series page name, with the same fallback as `{pageName}` |
+| `@page_number` | Current Map Series page number as an integer, starting at 1 |
 | `@row_number` | The feature's position in the layer, from 1 |
 | `$id` | The feature's id |
 | `$area`, `$perimeter` | A polygon's area in square metres (holes subtract) and the length of its rings in metres |
 | `$length` | A line's length in metres |
+
+The three page variables are available to symbols, labels, definition queries and display filters
+in every map frame on a series page. They are null outside a series page, including in the map
+view, tools and Calculate Field, so `$id = @page_feature_id` matches no feature there. A definition
+query such as `$id = @page_feature_id` therefore hides every feature in the map view and the
+Layers pane; to mark a page's feature, style it with Symbols by Expression instead.
 
 An unknown field, variable or function is an error that names it.
 
@@ -91,9 +104,9 @@ An unknown field, variable or function is an error that names it.
 
 | Operator | Result |
 | --- | --- |
-| `+ - * /` | Arithmetic; `/` always divides exactly (`7 / 2` is 3.5) |
-| `%` | Remainder |
-| `^` | Power |
+| `+ - * /` | Arithmetic; `/` always divides exactly (`7 / 2` is 3.5); null for a division by zero |
+| `%` | Remainder; null for a division by zero |
+| `^` | Power; null for a division by zero (`0 ^ -1`) or a result that isn't a finite number (`(-8) ^ 0.5`) |
 | `\|\|` | Joins the two values as text; null when either is null |
 | `= <> < <= > >=` | Comparison; `==` and `!=` are also accepted |
 | `LIKE`, `ILIKE` | Text pattern: `%` matches any run of characters, `_` one character |
@@ -127,8 +140,12 @@ Rules shared by all of them:
 - **Nulls.** Arithmetic with a null gives null. A comparison with a null is *unknown*: it
   matches neither `pop > 100` nor `NOT pop > 100`; `IS NULL` tests for it. `AND` is false when
   either side is false and `OR` true when either side is true, whatever the other side is.
-- **Errors give null**: a division by zero, the square root of a negative number, a result too
-  large to represent.
+- **Errors give null**: a division by zero, the square root of a negative number, the logarithm
+  of zero or a negative number, a result too large to represent, a value that isn't a finite
+  number, text that isn't a number in `-`, `*`, `/`, `%` or `^` or as a number argument, a clamp
+  whose low bound is above its high bound. Where the result is stored (Calculate Field,
+  calculation attribute rules), a notice says how many rows an error made null, which error,
+  and the first three of those rows.
 - **`IN`** compares with each value as `=` does; a `NULL` in the list matches nothing, so
   `x NOT IN (1, NULL)` is true for 2.
 - **As a condition**, a value that isn't true or false counts as true when it is a non-zero
@@ -144,12 +161,12 @@ Rules shared by all of them:
 | `abs(x)` | Absolute value |
 | `round(x[, places])` | Rounded half away from zero to `places` decimals (0 by default; negative rounds to tens, hundreds…) |
 | `floor(x)`, `ceil(x)` | Rounded down, up |
-| `sqrt(x)`, `exp(x)`, `ln(x)`, `log10(x)` | Square root, eˣ, natural and base-10 logarithm |
+| `sqrt(x)`, `exp(x)`, `ln(x)`, `log10(x)` | Square root, eˣ, natural and base-10 logarithm; null for a negative number (`sqrt`), when too large to represent (`exp`), for zero or a negative number (`ln`, `log10`) |
 | `pi()` | π |
 | `min(a, b, …)`, `max(a, b, …)` | The smallest, largest number; values that aren't numbers are skipped |
 | `clamp(low, x, high)` | `x` kept within `low`…`high`; null when `low` is above `high` |
 | `scale_linear(x, d0, d1, r0, r1)` | `x` mapped from the domain `d0`…`d1` to the range `r0`…`r1`, clamped to the domain |
-| `scale_exp(x, d0, d1, r0, r1, exponent)` | As `scale_linear`, along a curve: 0.5 grows fast then slowly, 2 slowly then fast |
+| `scale_exp(x, d0, d1, r0, r1, exponent)` | As `scale_linear`, along a curve: 0.5 grows fast then slowly, 2 slowly then fast; null with a negative exponent at the domain's start |
 | `to_string(x)` | `x` as text |
 | `to_int(x)`, `to_real(x)` | `x` as a whole number (cut toward zero), as a decimal number; null if it isn't a number |
 | `length(s)` | Number of characters |
@@ -223,6 +240,20 @@ argument being typed marked (`round(x[, places])`) and what the function gives. 
 opens hides it, and it comes back when the list closes; Escape with no list open closes it until
 the cursor leaves that call.
 
+The same list, signature and closing brackets help in the other one-line expression boxes: the
+**By Expression** boxes of a layer's symbol and of a label class, Unique Values' **Expression**,
+a report's **Where** and an attribute rule's expression. Apart from the rule's, which **Add**
+applies, those boxes apply what's written when they lose focus, and a click in the list keeps the
+focus, so a field taken from it isn't applied half written; while the list is open Escape closes
+it, not the box.
+
+They help too in the clause boxes of several lines: Select By Attributes' **Where**, the Layer
+Properties **Query** tab and a label class's SQL query. There the list shows under the cursor's
+line and the signature over the line of its call. While the list is open, Enter takes its item
+rather than break the line or apply the clause, and Escape closes it, not the dialog. In the Query
+tab, Escape with the list or a signature shown closes that and keeps the clause typed; the next
+Escape drops the clause.
+
 A number goes into a number field as it is: a decimal field keeps every digit of `1 / 3` (a
 whole number past 2^53 becomes the nearest decimal, as a decimal field holds it). A whole-number
 field holds whole numbers, so a decimal result, or text written as one, loses its fraction toward
@@ -231,6 +262,22 @@ left empty. Calculate Field, and a calculation attribute rule on each edit it ap
 many results lost their fraction, how many were past the range and how many weren't numbers. Text
 that doesn't read as a number at all (`n/a`) is left empty too, for now without a notice. A
 number into a text field is written as RustGIS shows it, to six decimal places.
+
+**Compare codes with different spellings.** With zoning codes in the `current` and `proposed`
+fields of the same parcel layer, add a **Text** field named `changed` and turn editing on.
+Use this expression in **Calculate Field** for `changed`.
+
+```sql
+CASE
+  WHEN current IS NULL OR proposed IS NULL THEN 'Unknown'
+  WHEN replace(current, '-', '') = replace(proposed, '-', '') THEN 'No'
+  ELSE 'Yes'
+END
+```
+
+Here `N-1` and `N1` both compare as `N1`, while `N-1` and `N2` give `Yes`.
+Strip hyphens only when they have no meaning in the coding schemes. Select `changed = 'Yes'`
+to find parcels with a different proposed code.
 
 Calculate Field also takes the forms its earlier calculator took: a field name with spaces
 written bare (`Pop Est * 2`) still works when the text isn't a valid expression, and on a layer

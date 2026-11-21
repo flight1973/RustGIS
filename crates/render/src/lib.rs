@@ -6,6 +6,8 @@
 //! the labels too, for export and the command line.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod area_labels;
+mod bands;
 mod block;
 pub mod cancel;
 mod canvas;
@@ -376,6 +378,7 @@ pub mod sample_data {
 use std::sync::OnceLock;
 
 pub(crate) use canvas::Canvas;
+use rustgis_data::query::Env;
 use rustgis_data::{Dataset, Geometry, GeometryType};
 use rustgis_geom::{Coord, Extent, extent_to_merc, lonlat_to_merc};
 use rustgis_map::globe::{V3, densify};
@@ -599,6 +602,13 @@ pub fn picture_marker_readable(b64: &str) -> bool {
 /// decoded into this thread's cache of markers, where drawing on it finds it.
 pub fn picture_marker_draws(p: rustgis_map::Picture) -> bool {
     picture::marker_aspect(p).is_some()
+}
+
+/// Picture marker `p`'s image at most `side` pixels per side (a preview's), and its height for its
+/// width from before it was scaled down; `None` where the map draws a circle. Decoded on every
+/// call: the caller keeps it.
+pub fn picture_marker_image(p: rustgis_map::Picture, side: u32) -> Option<(Pixmap, f32)> {
+    picture::marker_image(p, side)
 }
 
 /// The colour unplaced labels are drawn in.
@@ -872,7 +882,7 @@ struct Ctx<'a> {
     /// Set when drawing the globe; coordinates are then longitude/latitude, not Web Mercator.
     globe: Option<Globe>,
     /// Point marker sprites drawn so far, by symbol and quarter-pixel offset.
-    sprites: std::cell::RefCell<std::collections::HashMap<SpriteKey, Option<Pixmap>>>,
+    sprites: std::cell::RefCell<std::collections::HashMap<SpriteKey, Option<std::sync::Arc<Pixmap>>>>,
     /// The pixels the frame's shapeburst fills have worked on (`gradient_fill::FRAME_BURST_PX`),
     /// shared by a layer's scaled context (a reference scale's) with the frame's.
     bursts: std::rc::Rc<std::cell::Cell<f32>>,
@@ -1134,13 +1144,13 @@ impl Ctx<'_> {
 
     /// A line drawn as its stacked strokes (`Layer::strokes`), bottom first, each
     /// shifted sideways by its offset.
-    fn stacked_line(&self, pm: &mut Canvas, parts: &[Vec<Coord>], s: &Symbol, strokes: &[LineStroke]) {
+    fn stacked_line(&self, pm: &mut Canvas, parts: &[Vec<Coord>], s: &Symbol, strokes: &[LineStroke], pass: line_markers::Pass) {
         let (mut pb, mut starts) = (PathBuilder::new(), DashStarts::default());
         for part in parts {
             self.ring_path_at(&mut pb, part, false, &mut starts);
         }
         let Some(path) = pb.finish() else { return };
-        self.stacked_path(pm, &path, s, strokes, &starts, parts);
+        self.stacked_path(pm, &path, s, strokes, &starts, parts, pass);
     }
 
     /// A stroke's dash pattern in pixels for `path`, or `None` to draw it solid: a pattern under a
@@ -1157,7 +1167,8 @@ impl Ctx<'_> {
     /// longer or shorter than the line.
     ///
     /// `parts` is the line `path` was made from: markers along it are placed along the line as a
-    /// whole ([`line_markers`]).
+    /// whole ([`line_markers`]). `pass`: the line, or its halo as selected, drawn under it.
+    #[expect(clippy::too_many_arguments, reason = "a line's path, what it was made from and how it is drawn")]
     fn stacked_path(
         &self,
         pm: &mut Canvas,
@@ -1166,6 +1177,7 @@ impl Ctx<'_> {
         strokes: &[LineStroke],
         starts: &DashStarts,
         parts: &[Vec<Coord>],
+        pass: line_markers::Pass,
     ) {
         // Shifted once per offset: a casing and its core usually share one.
         let mut shifted: Vec<(f32, Option<tiny_skia::Path>)> = Vec::new();
@@ -1175,7 +1187,7 @@ impl Ctx<'_> {
             let (c, w) = st.resolve(s);
             if let Some(m) = &st.markers {
                 let runs = runs.get_or_insert_with(|| self.marker_runs(parts));
-                line_markers::draw(pm, runs, m, c, if w.is_nan() { 0.0 } else { w }, st.offset, self.ppp);
+                line_markers::draw(pm, runs, m, c, if w.is_nan() { 0.0 } else { w }, st.offset, self.ppp, pass);
                 continue;
             }
             if w.is_nan() || w <= 0.0 || c.a() == 0 {
@@ -1318,12 +1330,12 @@ impl Ctx<'_> {
                 let c = reach as f32 + qx as f32 / 4.0;
                 let d = reach as f32 + qy as f32 / 4.0;
                 draw_marker(&mut sp, c, d, s, 1.0, None, self.ppp);
-                sp.into_pixmap()
+                std::sync::Arc::new(sp.into_pixmap())
             });
             sprites.insert(key, sprite);
         }
         if let Some(Some(sp)) = sprites.get(&key) {
-            blend_over(pm.pixels(), sp, ix - reach, iy - reach);
+            pm.pixel_op(bands::PixelOp::Sprite { pixmap: sp.clone(), x: ix - reach, y: iy - reach });
         }
     }
 
@@ -1386,10 +1398,10 @@ impl Ctx<'_> {
         };
         if let Some(f) = fill {
             let area = if width > 0.0 { inner } else { sx * sy };
-            splat_color(pm.pixels(), cx, cy, f, area);
+            pm.pixel_op(bands::PixelOp::Splat { cx, cy, color: f, coverage: area });
         }
         if width > 0.0 {
-            splat_color(pm.pixels(), cx, cy, stroke, outer - inner);
+            pm.pixel_op(bands::PixelOp::Splat { cx, cy, color: stroke, coverage: outer - inner });
         }
         true
     }
@@ -1483,7 +1495,8 @@ impl Ctx<'_> {
         if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
             return false;
         }
-        small_polygon_pixels(pm.pixels(), [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)], width, s.fill, s.stroke, share as f32);
+        let b = [x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)];
+        pm.pixel_op(bands::PixelOp::SmallPolygon { b, width, fill: s.fill, stroke: s.stroke, share: share as f32 });
         true
     }
 
@@ -1514,7 +1527,10 @@ impl Ctx<'_> {
                             && st
                                 .markers
                                 .is_some_and(|m| !matches!(m.mark, rustgis_map::LineMark::Hash) && m.outline.is_some_and(|o| o.a() > 0));
-                        (w > 0.0 || st.markers.is_some_and(|m| !matches!(m.mark, rustgis_map::LineMark::Hash))) && (c.a() > 0 || outlined)
+                        // An image shows whatever its colour.
+                        let image = st.markers.is_some_and(|m| line_markers::drawn_picture(&m).is_some());
+                        let shown = w > 0.0 || st.markers.is_some_and(|m| !matches!(m.mark, rustgis_map::LineMark::Hash));
+                        image || (shown && (c.a() > 0 || outlined))
                     })
                     .map(|st| LineStroke {
                         // A hollow marker's halo is its outline alone, so it stays hollow.
@@ -1525,8 +1541,8 @@ impl Ctx<'_> {
                         ..*st
                     })
                     .collect();
-                self.stacked_line(pm, parts, s, &halo);
-                self.stacked_line(pm, parts, s, strokes);
+                self.stacked_line(pm, parts, s, &halo, line_markers::Pass::Halo);
+                self.stacked_line(pm, parts, s, strokes, line_markers::Pass::Ink);
             }
             Geometry::Point(c) if !point_marks::plain(strokes, turn) => self.marks(pm, *c, s, strokes, turn, Some(SELECTION)),
             Geometry::MultiPoint(v) if !point_marks::plain(strokes, turn) => {
@@ -1824,7 +1840,7 @@ fn contours(path: &tiny_skia::Path) -> Vec<tiny_skia::Path> {
 }
 
 /// Blends `color` at `coverage` (in pixels, spread bilinearly) around (`cx`, `cy`) device pixels.
-fn splat_color(pm: &mut Pixmap, cx: f32, cy: f32, color: Rgba, coverage: f32) {
+fn splat_color(pm: &mut tiny_skia::PixmapMut, cx: f32, cy: f32, color: Rgba, coverage: f32) {
     if color.a() == 0 || coverage.is_nan() || coverage <= 0.0 || !cx.is_finite() || !cy.is_finite() {
         return;
     }
@@ -1853,9 +1869,12 @@ fn splat_color(pm: &mut Pixmap, cx: f32, cy: f32, color: Rgba, coverage: f32) {
     }
 }
 
-/// Coverage of a tiny box and its mitred outline in each touched device pixel.
-fn small_polygon_pixels(pm: &mut Pixmap, b: [f32; 4], width: f32, fill: Rgba, stroke: Rgba, share: f32) {
-    if b[2] + width < 0.0 || b[3] + width < 0.0 || b[0] - width >= pm.width() as f32 || b[1] - width >= pm.height() as f32 {
+/// Coverage of a tiny box and its mitred outline in each touched device pixel, on `pm` whose first
+/// row is the frame's row `top` (a band, [`bands`]). Snapped in the frame's own coordinates, then
+/// moved up: a band's pixels are the whole frame's.
+fn small_polygon_pixels(pm: &mut tiny_skia::PixmapMut, top: u32, b: [f32; 4], width: f32, fill: Rgba, stroke: Rgba, share: f32) {
+    let t = top as f32;
+    if b[2] + width < 0.0 || b[3] + width < t || b[0] - width >= pm.width() as f32 || b[1] - width >= t + pm.height() as f32 {
         return;
     }
     // tiny-skia's path rasterizer samples at quarter-pixel intervals.
@@ -1873,10 +1892,12 @@ fn small_polygon_pixels(pm: &mut Pixmap, b: [f32; 4], width: f32, fill: Rgba, st
         }
         d[3] = (a + (d[3] as u16 * inv + 127) / 255).min(255) as u8;
     }
+    // Quarter pixels, moved by whole rows: exact.
+    let up = |b: [f32; 4]| [b[0], b[1] - t, b[2], b[3] - t];
     let hw = width / 2.0;
-    let outer = snap([b[0] - hw, b[1] - hw, b[2] + hw, b[3] + hw]);
-    let inner = snap([b[0] + hw, b[1] + hw, b[2] - hw, b[3] - hw]);
-    let b = snap(b);
+    let outer = up(snap([b[0] - hw, b[1] - hw, b[2] + hw, b[3] + hw]));
+    let inner = up(snap([b[0] + hw, b[1] + hw, b[2] - hw, b[3] - hw]));
+    let b = up(snap(b));
     let (w, h) = (pm.width() as i64, pm.height() as i64);
     let (x0, y0) = ((outer[0].floor() as i64).clamp(0, w), (outer[1].floor() as i64).clamp(0, h));
     let (x1, y1) = ((outer[2].ceil() as i64).clamp(0, w), (outer[3].ceil() as i64).clamp(0, h));
@@ -2009,7 +2030,7 @@ fn draw_marker(pm: &mut Canvas, x: f32, y: f32, s: &Symbol, opacity: f32, halo: 
 }
 
 /// Composites premultiplied `src` over `dst` with its top left corner at (`x`, `y`).
-fn blend_over(dst: &mut Pixmap, src: &Pixmap, x: i64, y: i64) {
+fn blend_over(dst: &mut tiny_skia::PixmapMut, src: &Pixmap, x: i64, y: i64) {
     let (dw, dh) = (dst.width() as i64, dst.height() as i64);
     let (sw, sh) = (src.width() as i64, src.height() as i64);
     let (x0, x1) = (x.max(0), (x + sw).min(dw));
@@ -2124,13 +2145,20 @@ pub fn render(map: &mut Map, view: &View) -> Option<Rendered> {
 
 /// [`render_with_backend`] on the CPU, as pixels.
 fn render_with(map: &mut Map, view: &View, full_res_rasters: bool) -> Option<Rendered> {
-    render_cpu(map, view, full_res_rasters, false, &mut None)
+    render_cpu(map, view, full_res_rasters, false, &mut None, &Env::default())
 }
 
 /// [`render_with`] on the CPU, kept as vectors where it can be (`record`, see
 /// [`render_frame`]).
-fn render_cpu(map: &mut Map, view: &View, full_res_rasters: bool, record: bool, failed_source: &mut Option<u64>) -> Option<Rendered> {
-    match render_any(map, view, full_res_rasters, Backend::Cpu, record, failed_source) {
+fn render_cpu(
+    map: &mut Map,
+    view: &View,
+    full_res_rasters: bool,
+    record: bool,
+    failed_source: &mut Option<u64>,
+    env: &Env,
+) -> Option<Rendered> {
+    match render_any(map, view, full_res_rasters, Backend::Cpu, record, failed_source, env) {
         Some(RenderOutput::Cpu(r)) => Some(r),
         // The Cpu backend never produces RenderOutput::Gpu.
         Some(RenderOutput::Gpu(_)) | None => None,
@@ -2155,7 +2183,7 @@ pub(crate) fn flush_acc(pm: &mut Pixmap, cmds: &mut Vec<gpu_scene::DrawCmd>, dir
 /// `full_res_rasters` renders rasters at full resolution (exports); `backend` selects the CPU
 /// pixmap or a GPU scene (see [`Backend`]).
 fn render_with_backend(map: &mut Map, view: &View, full_res_rasters: bool, backend: Backend) -> Option<RenderOutput> {
-    render_any(map, view, full_res_rasters, backend, false, &mut None)
+    render_any(map, view, full_res_rasters, backend, false, &mut None, &Env::default())
 }
 
 /// [`render_with_backend`], `record` keeping a flat, north-up frame as vectors where it can
@@ -2168,9 +2196,10 @@ fn render_any(
     backend: Backend,
     record: bool,
     failed_source: &mut Option<u64>,
+    env: &Env,
 ) -> Option<RenderOutput> {
     let revisions = archive_revisions([&*map]);
-    let output = render_pass(map, view, full_res_rasters, backend, record, failed_source);
+    let output = render_pass(map, view, full_res_rasters, backend, record, failed_source, env);
     // A frame stopped part-way (see `cancel`) is no frame.
     if cancel::requested() {
         return None;
@@ -2196,6 +2225,7 @@ fn render_pass(
     backend: Backend,
     record: bool,
     failed_source: &mut Option<u64>,
+    env: &Env,
 ) -> Option<RenderOutput> {
     *failed_source = None;
     // A bearing or pitch set directly on the camera may be unnormalised (or no number, which
@@ -2254,7 +2284,7 @@ fn render_pass(
     {
         // Keep asynchronous windows and pending work on their owner, never a disposable copy.
         let bands = camera.tilt_bands(view.width, view.height);
-        let data_pending = sync_tilted(map, &View { camera, ..*view }, &bands, full_res_rasters);
+        let data_pending = sync_tilted(map, &View { camera, ..*view }, &bands, full_res_rasters, env);
         let mut snapshot = map.clone();
         let mut snapshot_budget = SnapshotBudget::new(complete_snapshot_limit());
         for layer in &mut snapshot.layers {
@@ -2292,11 +2322,11 @@ fn render_pass(
         // Owner synchronization has already run. Repeating it on the copy could consume a
         // shared pending result before its owner installs it, even for a plain chunk source.
         let mut output = if backend.is_gpu() {
-            gpu_turned(&mut snapshot, &view, full_res_rasters, true, failed_source)
+            gpu_turned(&mut snapshot, &view, full_res_rasters, true, failed_source, env)
                 .map(RenderOutput::Gpu)
-                .or_else(|| render_tilted(&mut snapshot, &view, full_res_rasters, true, failed_source).map(RenderOutput::Cpu))
+                .or_else(|| render_tilted(&mut snapshot, &view, full_res_rasters, true, failed_source, env).map(RenderOutput::Cpu))
         } else {
-            render_tilted(&mut snapshot, &view, full_res_rasters, true, failed_source).map(RenderOutput::Cpu)
+            render_tilted(&mut snapshot, &view, full_res_rasters, true, failed_source, env).map(RenderOutput::Cpu)
         };
         map.adopt_caches(&snapshot);
         if let Some(output) = &mut output {
@@ -2310,24 +2340,24 @@ fn render_pass(
     // The globe turns and tilts itself (`Globe`): one frame.
     if map.projection.is_globe() {
         let view = View { camera, ..*view };
-        return render_frame(map, &view, full_res_rasters, backend, Labels::Own, false, failed_source);
+        return render_frame(map, &view, full_res_rasters, backend, Labels::Own, false, failed_source, env);
     }
     {
         let view = View { camera, ..*view };
         if backend.is_gpu()
             && (camera.pitch != 0.0 || camera.bearing != 0.0)
-            && let Some(scene) = gpu_turned(map, &view, full_res_rasters, false, failed_source)
+            && let Some(scene) = gpu_turned(map, &view, full_res_rasters, false, failed_source, env)
         {
             return Some(RenderOutput::Gpu(scene));
         }
         if camera.pitch != 0.0 {
-            return render_tilted(map, &view, full_res_rasters, false, failed_source).map(RenderOutput::Cpu);
+            return render_tilted(map, &view, full_res_rasters, false, failed_source, env).map(RenderOutput::Cpu);
         }
         if camera.bearing != 0.0 {
-            return render_turned(map, &view, full_res_rasters, record, failed_source).map(RenderOutput::Cpu);
+            return render_turned(map, &view, full_res_rasters, record, failed_source, env).map(RenderOutput::Cpu);
         }
     }
-    render_frame(map, view, full_res_rasters, backend, Labels::Own, record, failed_source)
+    render_frame(map, view, full_res_rasters, backend, Labels::Own, record, failed_source, env)
 }
 
 /// Persisted local Shapefiles can require complete traversal before a handle is opened.
@@ -2358,6 +2388,13 @@ fn needs_tilted_snapshot(map: &Map, layer: &rustgis_map::Layer, complete_layers:
 const COMPLETE_SNAPSHOT_BYTES: usize = rustgis_map::source::VIEW_BYTES * 4;
 /// Owned-storage target for a complete traversal; distinct from interaction and depth budgets.
 const COMPLETE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// The layers meshed on this test thread, in order (`mesh::collect_layer`), and whether each
+    /// came back too dense to mesh.
+    pub(crate) static MESHED: std::cell::RefCell<Vec<(String, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 #[cfg(test)]
 thread_local! {
@@ -2551,10 +2588,11 @@ fn render_tilted(
     full_res_rasters: bool,
     sources_ready: bool,
     failed_source: &mut Option<u64>,
+    env: &Env,
 ) -> Option<Rendered> {
     *failed_source = None;
     let bands_of = view.camera.tilt_bands(view.width, view.height);
-    let data_pending = !sources_ready && sync_tilted(map, view, &bands_of, full_res_rasters);
+    let data_pending = !sources_ready && sync_tilted(map, view, &bands_of, full_res_rasters, env);
     // Labels are placed in the tilted view: a lock on a flat view's labels doesn't apply.
     let mut candidates = Vec::new();
     let (w, h) = view.pixel_size();
@@ -2582,7 +2620,7 @@ fn render_tilted(
         }
         let v = band_view(view, &b);
         let Some(RenderOutput::Cpu(r)) =
-            render_frame(map, &v, full_res_rasters, Backend::Cpu, Labels::Tilted(view, &mut candidates), false, failed_source)
+            render_frame(map, &v, full_res_rasters, Backend::Cpu, Labels::Tilted(view, &mut candidates), false, failed_source, env)
         else {
             let scale = map.ground_res_at(&v.camera) / rustgis_geom::PIXEL_M;
             let complete = sources_ready
@@ -2642,7 +2680,7 @@ fn render_tilted(
     match &ground {
         Some(g) => {
             // Cut short by Cancel, the frame isn't handed on: half its ground would be missing.
-            if !drape_terrain(pm.pixels(), view, map, &kept, g) {
+            if !drape_terrain(pm.pixels(), view, map, &kept, g, env) {
                 return None;
             }
             tiles_pending |= g.pending();
@@ -2650,8 +2688,8 @@ fn render_tilted(
         None => warp.finish(pm.pixels()),
     }
     drop(kept);
-    extrusions_tilted(map, view, pm.pixels())?;
-    markers_tilted(map, view, &mut pm);
+    extrusions_tilted(map, view, pm.pixels(), env)?;
+    markers_tilted(map, view, &mut pm, env);
     let placed = place_tilted_labels(map, view, candidates, ground.as_ref());
     for l in &placed.labels {
         if let Some(icon) = &l.icon {
@@ -2686,7 +2724,14 @@ fn render_tilted(
 /// A block diagram (#1914, [`terrain::Ground::block`]) keeps only the ground inside its box,
 /// triangles across its edge cut there (`block::clip`), and stands the walls facing the eye over
 /// it.
-fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, f64), Pixmap)], ground: &terrain::Ground) -> bool {
+fn drape_terrain(
+    pm: &mut Pixmap,
+    view: &View,
+    map: &Map,
+    bands: &[(View, (f64, f64), Pixmap)],
+    ground: &terrain::Ground,
+    env: &Env,
+) -> bool {
     let (sky, fog) = tilt_sky(map);
     let cam = view.camera;
     let (w, h) = (view.width, view.height);
@@ -2716,7 +2761,7 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
     // at 160 cells).
     type Vertex = ((f64, f64), (f64, f64), f64);
     let (pw, ph) = (f64::from(pm.width()), f64::from(pm.height()));
-    let mut grids: Vec<(usize, Vec<Option<Vertex>>, Vec<Option<u8>>)> = Vec::with_capacity(bands.len());
+    let mut grids: Vec<(usize, Vec<Option<Vertex>>, Vec<Option<u16>>)> = Vec::with_capacity(bands.len());
     let mut tris: Vec<(f64, u32, u32)> = Vec::new();
     // A block diagram (#1914): each vertex's sides of the box it lies beyond, and the stretches of
     // the box's edge the ground cut to it ends at, for the walls.
@@ -2732,7 +2777,7 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
         // same map point.
         let points = (nx + 1) * (ny + 1);
         let mut grid: Vec<Option<Vertex>> = Vec::with_capacity(points);
-        let mut codes: Vec<Option<u8>> = Vec::with_capacity(if block.is_some() { points } else { 0 });
+        let mut codes: Vec<Option<u16>> = Vec::with_capacity(if block.is_some() { points } else { 0 });
         for (i, j) in (0..=ny).flat_map(|j| (0..=nx).map(move |i| (i, j))) {
             let (lx, ly) = (v.width * i as f64 / nx as f64, v.height * j as f64 / ny as f64);
             let m = v.camera.to_map(lx, ly, v.width, v.height);
@@ -2755,9 +2800,9 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
                 if depth < d0 - margin || depth > d1 + margin || p.2.min(q.2).min(r.2) > far {
                     continue;
                 }
-                // Wholly beyond one side of the block's box: not drawn.
+                // Wholly beyond one side of the block's box (or a tangent of its circle): not drawn.
                 let code = codes.and_then(|c| c.get(half).copied()).unwrap_or([0; 3]);
-                if code[0] & code[1] & code[2] != 0 {
+                if code[0] & code[1] & code[2] & !block::ROUND_OFF != 0 {
                     continue;
                 }
                 // Wholly off one side of the picture: nothing to draw. Across the block's edge it
@@ -2811,7 +2856,7 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
                             (w[0] * dst[0].0 + w[1] * dst[1].0 + w[2] * dst[2].0, w[0] * dst[0].1 + w[1] * dst[1].1 + w[2] * dst[2].1)
                         })
                         .collect();
-                    block::edges(&poly, &screen, depth, &mut edges);
+                    block::edges(b, &poly, &screen, depth, &mut edges);
                     (c != [0; 3]).then_some(screen)
                 }
             }
@@ -2837,7 +2882,8 @@ fn drape_terrain(pm: &mut Pixmap, view: &View, map: &Map, bands: &[(View, (f64, 
     // each tile (the frame is drawn again when they arrive, `Ground::pending`).
     if let Some(b) = block.as_ref().filter(|b| b.walls_stand(ground)) {
         let scale = map.ground_res_at(&view.camera) / rustgis_geom::PIXEL_M;
-        block::draw_walls(pm, view, ground, b, &edges, &block::runs(map, b, scale), fog, far);
+        let water = block::water_runs(map, b, ground, cam.res, scale, env);
+        block::draw_walls(pm, view, ground, b, &edges, &block::runs(map, b, scale, env), &water, fog, far);
     }
     true
 }
@@ -3005,6 +3051,7 @@ fn gpu_turned(
     full_res_rasters: bool,
     sources_ready: bool,
     failed_source: &mut Option<u64>,
+    env: &Env,
 ) -> Option<gpu_scene::GpuScene> {
     use gpu_scene::{CmdClip, DrawCmd, GpuScene, SceneTilt};
     if !gpu_may_turn(map, view) {
@@ -3017,7 +3064,7 @@ fn gpu_turned(
         let (bw, bh) = view.camera.rotated_size(view.width, view.height);
         let north = View { width: bw.ceil() + 2.0, height: bh.ceil() + 2.0, camera: Camera { bearing: 0.0, ..view.camera }, ..*view };
         let Some(RenderOutput::Gpu(scene)) =
-            render_frame(map, &north, full_res_rasters, Backend::Gpu, Labels::Turned(view), false, failed_source)
+            render_frame(map, &north, full_res_rasters, Backend::Gpu, Labels::Turned(view), false, failed_source, env)
         else {
             return None;
         };
@@ -3027,7 +3074,7 @@ fn gpu_turned(
         return Some(GpuScene { tilt, ..scene });
     }
     let bands = view.camera.tilt_bands(view.width, view.height);
-    let data_pending = !sources_ready && sync_tilted(map, view, &bands, full_res_rasters);
+    let data_pending = !sources_ready && sync_tilted(map, view, &bands, full_res_rasters, env);
     let lock = map.label_lock.take();
     let mut candidates = Vec::new();
     let (mut cmds, mut clips) = (Vec::new(), Vec::new());
@@ -3043,7 +3090,7 @@ fn gpu_turned(
         }
         let v = band_view(view, b);
         let Some(RenderOutput::Gpu(scene)) =
-            render_frame(map, &v, full_res_rasters, Backend::Gpu, Labels::Tilted(view, &mut candidates), false, failed_source)
+            render_frame(map, &v, full_res_rasters, Backend::Gpu, Labels::Tilted(view, &mut candidates), false, failed_source, env)
         else {
             if cancel::requested() {
                 map.label_lock = lock;
@@ -3118,12 +3165,12 @@ fn gpu_turned(
     let origin = [view.camera.center.x, view.camera.center.y];
     // Extruded features stand up over the ground, their shadows under them; more than the GPU
     // budget takes, and the view is drawn on the CPU.
-    for cmd in extrusion_cmds(&extruded_shapes(map, view), origin)? {
+    for cmd in extrusion_cmds(&extruded_shapes_with(map, view, env), origin)? {
         cmds.push(cmd);
         clips.push(CmdClip::ALL);
     }
     let ppp = view.pixels_per_point as f32;
-    let instances: Vec<gpu_scene::PointInstance> = upright_markers(map, view, 0.0)
+    let instances: Vec<gpu_scene::PointInstance> = upright_markers_with(map, view, 0.0, env)
         .iter()
         .flat_map(|m| mesh::marker_instances(m.at, origin, &m.symbol, ppp, m.selected.then_some(SELECTION)))
         .collect();
@@ -3226,6 +3273,7 @@ pub fn gpu_may_turn(map: &Map, view: &View) -> bool {
             && !l.has_fills()
             && l.marker_rotation.is_none()
             && l.symbol_by.is_empty()
+            && !(l.size_by.is_some() && rustgis_map::symbol_by::SizeBy::applies_to(l))
             && l.renderer.expression().is_none()
             && (l.extrusion.is_none() || view.camera.pitch != 0.0)
             && !(view.camera.pitch != 0.0 && l.renderer.has_char_or_picture_markers() && stands_up(map, l))
@@ -3234,8 +3282,12 @@ pub fn gpu_may_turn(map: &Map, view: &View) -> bool {
 
 /// The colours of a tilted view's sky (at the top) and of the fog it fades into at the
 /// horizon, from the basemap. A body without the Earth's atmosphere has neither: the ground
-/// fades into the black of space (#223).
+/// fades into the black of space (#223). A blank basemap's paper colour is both, as it is (#2532):
+/// the block stands on the page's own colour.
 pub fn tilt_sky(map: &Map) -> (Rgba, Rgba) {
+    if let Some(paper) = map.blank_paper() {
+        return (paper, paper);
+    }
     if !map.body().is_earth() {
         let space = globe_space(true);
         return (space, space);
@@ -3338,6 +3390,11 @@ pub struct ExtrudedShape {
 /// The extruded features of a tilted `view` of `map`, tessellated for [`ExtrudedShape`]s, from
 /// geometry thinned for the view's scale, bottom layer first.
 pub fn extruded_shapes(map: &mut Map, view: &View) -> Vec<ExtrudedShape> {
+    extruded_shapes_with(map, view, &Env::default())
+}
+
+/// The tilted view's extrusions with their page-dependent styling and filters.
+fn extruded_shapes_with(map: &mut Map, view: &View, env: &Env) -> Vec<ExtrudedShape> {
     let scale = map.ground_res_at(&view.camera) / rustgis_geom::PIXEL_M;
     // Layers a hidden or out-of-scale group holds aren't drawn, as in `render_frame`.
     let held = map.held_by_group(scale);
@@ -3370,10 +3427,10 @@ pub fn extruded_shapes(map: &mut Map, view: &View) -> Vec<ExtrudedShape> {
         if alpha == 0 {
             continue;
         }
-        let rows = layer.drawn_rows(scale);
+        let rows = layer.drawn_rows_with(scale, env);
         layer.thinned_in(&flat, &key, tol);
         let layer: &rustgis_map::Layer = layer;
-        let styler = layer.styler(Some(scale));
+        let styler = layer.styler_with(env.at_scale(Some(scale)));
         let extents = layer.projected_extents();
         let columns = x.columns(&layer.dataset);
         for (row, g) in layer.thinned_cache(tol).iter().enumerate() {
@@ -3614,6 +3671,11 @@ pub fn marker_outline(marker: Marker, x: f32, y: f32, r: f32) -> Vec<(f32, f32)>
 /// first and each layer's far to near, so nearer markers draw over farther ones. Those on the
 /// ground it shows, grown by `margin` of its size on every side (for a view that moves).
 pub fn upright_markers(map: &mut Map, view: &View, margin: f64) -> Vec<UprightMarker> {
+    upright_markers_with(map, view, margin, &Env::default())
+}
+
+/// The tilted view's point markers with their page-dependent styling and filters.
+fn upright_markers_with(map: &mut Map, view: &View, margin: f64, env: &Env) -> Vec<UprightMarker> {
     if map.projection.is_globe() {
         return Vec::new();
     }
@@ -3637,12 +3699,15 @@ pub fn upright_markers(map: &mut Map, view: &View, margin: f64) -> Vec<UprightMa
         let opacity = layer.opacity() * group_opacity.get(&layer.id).copied().unwrap_or(1.0);
         // Markers sized for a reference scale grow and shrink with the map.
         let size_factor = layer.size_factor(scale);
-        let rows = layer.drawn_rows(scale);
+        let rows = layer.drawn_rows_with(scale, env);
         // Refreshes the projected copy for this projection.
         layer.projected_in(&flat, &key);
         let layer: &rustgis_map::Layer = layer;
-        let styler = layer.styler(Some(scale));
+        let styler = layer.styler_with(env.at_scale(Some(scale)));
         let mut here: Vec<(f64, UprightMarker)> = Vec::new();
+        // Boxes in longitude/latitude for the view distance, from the dataset's own coordinates:
+        // none is drawn when they can't be converted, as `within_view_distance` draws none.
+        let to_lonlat = clip.and_then(|_| layer.dataset.lonlat_conversion().ok());
         for (row, g) in layer.projected_cache().iter().enumerate() {
             if rows.get(row) != Some(&true) {
                 continue;
@@ -3652,7 +3717,10 @@ pub fn upright_markers(map: &mut Map, view: &View, margin: f64) -> Vec<UprightMa
                 Some(Geometry::MultiPoint(v)) => v,
                 _ => continue,
             };
-            let lonlat = clip.and_then(|_| layer.dataset.features.get(row).and_then(|f| f.geometry.as_ref()).map(|g| g.extent()));
+            let lonlat = clip.and_then(|_| {
+                let own = layer.dataset.features.get(row).and_then(|f| f.geometry.as_ref())?.extent();
+                Some(to_lonlat.as_ref().map_or(rustgis_geom::Extent::EMPTY, |t| t.extent(&own)))
+            });
             if let (Some((centre, d)), Some(e)) = (clip, lonlat) {
                 let near = Coord::new(centre.x.clamp(e.min_x, e.max_x), centre.y.clamp(e.min_y, e.max_y));
                 if e.is_empty() || rustgis_geom::haversine_m(centre, near) > d {
@@ -3680,11 +3748,11 @@ pub fn upright_markers(map: &mut Map, view: &View, margin: f64) -> Vec<UprightMa
 }
 
 /// The point markers of a tilted view, stood up over its ground and extrusions.
-fn markers_tilted(map: &mut Map, view: &View, pm: &mut Canvas) {
+fn markers_tilted(map: &mut Map, view: &View, pm: &mut Canvas, env: &Env) {
     let (_, fog) = tilt_sky(map);
     let ppp = (f64::from(pm.width()) / view.width.max(1e-9)) as f32;
     let (pw, ph) = (pm.width() as f32, pm.height() as f32);
-    for m in upright_markers(map, view, 0.0) {
+    for m in upright_markers_with(map, view, 0.0, env) {
         let Some((x, y, k, t)) = m.place(&view.camera, view.width, view.height) else { continue };
         let s = m.look(k, fog, t);
         let (x, y) = (x as f32 * ppp, y as f32 * ppp);
@@ -3706,7 +3774,7 @@ fn markers_tilted(map: &mut Map, view: &View, pm: &mut Canvas) {
 /// The extruded layers of a tilted view, stood up in perspective over its ground, bottom layer
 /// first (a drape of the moving view shows them flat). `None` when a see-through layer's own
 /// pixmap can't be allocated, as the flat map's offscreen layers fail the render.
-fn extrusions_tilted(map: &mut Map, view: &View, pm: &mut Pixmap) -> Option<()> {
+fn extrusions_tilted(map: &mut Map, view: &View, pm: &mut Pixmap, env: &Env) -> Option<()> {
     let scale = map.ground_res_at(&view.camera) / rustgis_geom::PIXEL_M;
     // Layers a hidden or out-of-scale group holds aren't drawn, as in `render_frame`.
     let held = map.held_by_group(scale);
@@ -3733,11 +3801,11 @@ fn extrusions_tilted(map: &mut Map, view: &View, pm: &mut Pixmap) -> Option<()> 
         if opacity <= 0.0 {
             continue;
         }
-        let rows = layer.drawn_rows(scale);
+        let rows = layer.drawn_rows_with(scale, env);
         // Refreshes the projected copy for this projection.
         layer.projected_in(&flat, &key);
         let layer: &rustgis_map::Layer = layer;
-        let styler = layer.styler(Some(scale));
+        let styler = layer.styler_with(env.at_scale(Some(scale)));
         let geoms: Vec<Option<&Geometry>> = layer.projected_cache().iter().map(Option::as_ref).collect();
         let draw = |target: &mut Pixmap| {
             effects::extrude_tilted(
@@ -3782,19 +3850,19 @@ fn band_view(view: &View, b: &rustgis_map::camera::Band) -> View {
 /// map itself holds what the view shows. True while reads are still on their way.
 pub fn sync_tilted_view(map: &mut Map, view: &View) -> bool {
     let bands = view.camera.tilt_bands(view.width, view.height);
-    sync_tilted(map, view, &bands, false)
+    sync_tilted(map, view, &bands, false, &Env::default())
 }
 
 /// Reads the streamed layers once for a tilted `view`: every layer drawn in one of its `bands`
 /// (each drawn at its own scale, coarser far away). Reads are kept per extent, so a layer drawn
 /// in two bands asks for the same extent twice and reads once. Returns whether a read is still
 /// running.
-fn sync_tilted(map: &mut Map, view: &View, bands: &[rustgis_map::camera::Band], block: bool) -> bool {
+fn sync_tilted(map: &mut Map, view: &View, bands: &[rustgis_map::camera::Band], block: bool, env: &Env) -> bool {
     let lonlat = view_lonlat(map, view);
     let mut pending = false;
     for b in bands {
         let scale = map.ground_res_at(&b.camera) / rustgis_geom::PIXEL_M;
-        pending |= map.sync_sources(&lonlat, scale, block);
+        pending |= map.sync_sources_with(&lonlat, scale, block, env);
     }
     pending
 }
@@ -3914,11 +3982,18 @@ fn sample_band(v: &View, pm: &Pixmap, m: Coord) -> Option<[f32; 4]> {
 /// A view turned to a bearing, on the CPU: the map is drawn facing north over the box around
 /// the turned view, then turned into place. Labels are placed in the turned view and drawn
 /// upright, as MapLibre keeps them.
-fn render_turned(map: &mut Map, view: &View, full_res_rasters: bool, record: bool, failed_source: &mut Option<u64>) -> Option<Rendered> {
+fn render_turned(
+    map: &mut Map,
+    view: &View,
+    full_res_rasters: bool,
+    record: bool,
+    failed_source: &mut Option<u64>,
+    env: &Env,
+) -> Option<Rendered> {
     let (bw, bh) = view.camera.rotated_size(view.width, view.height);
     let north = View { width: bw.ceil() + 2.0, height: bh.ceil() + 2.0, camera: Camera { bearing: 0.0, ..view.camera }, ..*view };
     let Some(RenderOutput::Cpu(mut r)) =
-        render_frame(map, &north, full_res_rasters, Backend::Cpu, Labels::Turned(view), record, failed_source)
+        render_frame(map, &north, full_res_rasters, Backend::Cpu, Labels::Turned(view), record, failed_source, env)
     else {
         return None;
     };
@@ -4006,6 +4081,29 @@ impl Drop for TiltGlint {
     }
 }
 
+/// Leaves out of `rows` the features of `dataset` entirely beyond `d` metres of `centre` (the
+/// map's view distance, lon/lat): one reaching into it (its box's nearest point within the
+/// distance) is kept, one with no geometry isn't.
+pub(crate) fn within_view_distance(rows: &mut [bool], dataset: &rustgis_data::Dataset, centre: Coord, d: f64) {
+    // Each box in longitude/latitude, from the dataset's own coordinates: none is drawn when they
+    // can't be converted, as `Layer::projected_in` draws none.
+    let to = dataset.lonlat_conversion().ok();
+    for (r, keep) in rows.iter_mut().enumerate() {
+        if *keep {
+            let e = dataset
+                .features
+                .get(r)
+                .and_then(|f| f.geometry.as_ref())
+                .and_then(|g| to.as_ref().map(|t| t.extent(&g.extent())))
+                .filter(|e| !e.is_empty());
+            *keep = e.is_some_and(|e| {
+                let near = Coord::new(centre.x.clamp(e.min_x, e.max_x), centre.y.clamp(e.min_y, e.max_y));
+                rustgis_geom::haversine_m(centre, near) <= d
+            });
+        }
+    }
+}
+
 /// The terrain's water a frame's Shaded Relief layers draw flat at its level with the even light
 /// of flat ground (#1915), and whether shore tiles it was read from are still on their way (see
 /// [`frame_water`]). `None` without water or with no Shaded Relief layer drawn at `scale`.
@@ -4042,6 +4140,11 @@ fn frame_water(map: &Map, view: &View, labels_to: &Labels) -> Option<(std::sync:
     ground.water().cloned().map(|w| (w, pending))
 }
 
+/// Whether a GPU scene's commands hold a picture drawn on the CPU.
+fn holds_picture(cmds: &[gpu_scene::DrawCmd]) -> bool {
+    cmds.iter().any(|c| matches!(c, gpu_scene::DrawCmd::Image { .. }))
+}
+
 /// Draws one north-up frame. `labels_to` says where its labels go: a turned or tilted view the
 /// frame stands in for places them itself (and draws their icons). `full_res_rasters` marks an
 /// export, which draws everything as it will stay: rasters at full resolution, and labels in
@@ -4056,6 +4159,7 @@ fn render_frame(
     mut labels_to: Labels<'_>,
     record: bool,
     failed_source: &mut Option<u64>,
+    env: &Env,
 ) -> Option<RenderOutput> {
     *failed_source = None;
     let (w, h) = view.pixel_size();
@@ -4081,9 +4185,11 @@ fn render_frame(
         Labels::Tilted(to, _) => map.ground_res_at(&to.camera) / rustgis_geom::PIXEL_M,
         _ => scale,
     };
+    let style_env = env.at_scale(Some(scale));
+    let label_env = env.at_scale(Some(label_scale));
     let data_pending = match labels_to {
         Labels::Tilted(..) | Labels::Shared => false,
-        _ => map.sync_sources(&view_lonlat(map, view), scale, full_res_rasters),
+        _ => map.sync_sources_with(&view_lonlat(map, view), scale, full_res_rasters, env),
     };
     let globe = map.projection.is_globe().then(|| Globe::new(&view.camera, view.width, view.height));
     let (flat, key) = (map.flat(), map.projection.code());
@@ -4135,6 +4241,12 @@ fn render_frame(
     }
     // Set when tiny-skia actually rasterizes into the accumulator.
     let mut cpu_dirty = false;
+    // A GPU frame standing in for a turned or tilted view ([`gpu_turned`]) is of no use with a
+    // picture in it: that view is then drawn on the CPU whole. So it stops at the first layer
+    // that would leave one, rather than draw the rest (#2540).
+    let pictureless = backend.is_gpu() && matches!(labels_to, Labels::Turned(_) | Labels::Tilted(..));
+    // Set when such a frame stops that way.
+    let mut declined = false;
     if map.draws_world_outline() {
         let fill = paint(land, 1.0);
         let stroke = (outline.a() > 0).then(|| (paint(outline, 1.0), 0.6));
@@ -4380,6 +4492,11 @@ fn render_frame(
         if cancel::requested() {
             break;
         }
+        // What is drawn so far already leaves a picture, waiting or in the scene (see
+        // `pictureless`).
+        if pictureless && (cpu_dirty || holds_picture(&cmds)) {
+            return None;
+        }
         if let Some(id) = below.take() {
             draw_tiles!(Some(id));
         }
@@ -4609,20 +4726,11 @@ fn render_frame(
             }
             // The definition query and the display filters that apply at this scale (a feature draws
             // only if it matches all of them).
-            let mut rows = layer.drawn_rows(scale);
+            let mut rows = layer.drawn_rows_with(scale, env);
             // View clipping: features entirely beyond the distance from the view's centre are left
             // out; one reaching into it (its box's nearest point within the distance) still draws.
             if let Some((centre, d)) = clip {
-                for (r, keep) in rows.iter_mut().enumerate() {
-                    if *keep {
-                        let e =
-                            layer.dataset.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| g.extent()).filter(|e| !e.is_empty());
-                        *keep = e.is_some_and(|e| {
-                            let near = Coord::new(centre.x.clamp(e.min_x, e.max_x), centre.y.clamp(e.min_y, e.max_y));
-                            rustgis_geom::haversine_m(centre, near) <= d
-                        });
-                    }
-                }
+                within_view_distance(&mut rows, &layer.dataset, centre, d);
             }
             // Exact positions are needed by labels, selection and effects. Plain flat layers can
             // project only their retained display vertices, leaving interaction geometry lazy.
@@ -4635,6 +4743,10 @@ fn render_frame(
                 && (!complete_source || thin_complete)
                 && layer.diagram.is_none()
                 && layer.prepare_display(&flat, thin_tol, complete_source);
+            if globe.is_some() {
+                // In longitude/latitude, which the globe draws (none for a layer held there).
+                layer.lonlat_in();
+            }
             if globe.is_none() && !display_only {
                 if complete_source {
                     layer.projected_in(&flat, &key);
@@ -4651,13 +4763,16 @@ fn render_frame(
             // Everything below only reads the layer: borrow rather than copy its data each frame.
             let layer: &rustgis_map::Layer = layer;
             // Its symbol by expression, compiled once for the drawing (none: the layer's own).
-            let styler = layer.styler(Some(scale));
+            let styler = layer.styler_with(style_env.clone());
             // A label is named by its feature's id, not its row: a lock holds through edits that
             // move rows (#1046).
             let label_id = |row: usize| layer.dataset.features.get(row).map_or(row as u64, |f| f.id);
             let (labels, selection, ds_ptr) = (&layer.labels, &layer.selection, &layer.dataset);
-            // The globe draws the lon/lat geometry itself; the flat map its Web Mercator copy.
-            let geoms: Vec<Option<&Geometry>> = if globe.is_some() {
+            // The globe draws the lon/lat geometry itself (a layer held in another system, its
+            // copy in longitude/latitude); the flat map its Web Mercator copy.
+            let geoms: Vec<Option<&Geometry>> = if globe.is_some() && ds_ptr.coord_crs() != rustgis_data::raster::Crs::LonLat {
+                layer.lonlat_cache().iter().map(Option::as_ref).collect()
+            } else if globe.is_some() {
                 ds_ptr.features.iter().map(|f| f.geometry.as_ref()).collect()
             } else if display_only {
                 layer.display_cache().map_or(&[][..], |(g, _)| g).iter().map(Option::as_ref).collect()
@@ -4711,6 +4826,7 @@ fn render_frame(
                 && layer.diagram.is_none()
                 // Symbols and classes by expression are styled per feature on the CPU.
                 && layer.symbol_by.is_empty()
+                && !(layer.size_by.is_some() && rustgis_map::symbol_by::SizeBy::applies_to(layer))
                 && layer.renderer.expression().is_none()
                 && !upright.contains(&layer.id);
             // Lyon refuses degenerate geometry tiny-skia draws fine, a layer too dense to mesh
@@ -4744,6 +4860,16 @@ fn render_frame(
                     Err(mesh::TessError::Refused | mesh::TessError::Imprecise) => mesh_room,
                 };
                 gpu_done = collected.is_ok();
+                #[cfg(test)]
+                MESHED.with(|m| m.borrow_mut().push((layer.name.clone(), collected == Err(mesh::TessError::TooDense))));
+                // Too dense to mesh, the layer's features in view would be drawn as a picture
+                // (see `pictureless`): not drawn at all.
+                if pictureless && collected == Err(mesh::TessError::TooDense) {
+                    declined = true;
+                    // Only to stop drawing: `declined` turns it into this frame's `None` before
+                    // it is reported or kept as the layer's error.
+                    return Err(rustgis_data::DataError::Cancelled);
+                }
             }
             // The layer's diagram, its fields, and how far a chart reaches past its feature (map
             // units). Graphics take none (`layer.diagram` refuses them).
@@ -4815,10 +4941,14 @@ fn render_frame(
                         draw_diagrams(dest);
                     }
                 } else {
+                    // Drawn in bands on several threads on a large frame (#1067), from here to the
+                    // layer's diagrams.
+                    dest.begin_bands();
                     let mut stroke_paths = stroke_paths::Paths::default();
                     // Symbol levels: lines with stacked strokes wait, and go down a level at a time
                     // after the rest (each batch of a streamed layer on its own).
-                    let levels = layer.stroke_levels && layer.has_strokes();
+                    let has_strokes = layer.has_strokes();
+                    let levels = layer.stroke_levels && has_strokes;
                     // Polygons with stacked fills (patterns) draw them in place of their single fill.
                     let has_fills = layer.has_fills();
                     let mut stacked: Vec<(&[Vec<Coord>], Symbol, &[LineStroke])> = Vec::new();
@@ -4838,17 +4968,27 @@ fn render_frame(
                         since_look += rustgis_map::lod::vertices(g);
                         let e = extents.get(row).copied().unwrap_or_else(|| g.extent());
                         // A point's marks, shifted from it, or a tall image may show while the point is
-                        // off the view.
+                        // off the view; a line's stacked strokes, shifted sideways, or its markers too.
                         let marked_in = || {
-                            if globe.is_some() || !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+                            if globe.is_some() || matches!(g, Geometry::Polygon(_)) {
+                                return false;
+                            }
+                            // (A line layer with no stacked strokes isn't styled for it.)
+                            if matches!(g, Geometry::Line(_)) && !has_strokes {
                                 return false;
                             }
                             let (sym, strokes) = styler.style(row);
-                            let marks = styler.marks(row, strokes);
-                            let reach = match sym.marker {
-                                _ if !marks.is_empty() => point_marks::reach(&sym, &marks),
-                                Marker::Picture(_) => sym.size * marker_reach(sym.marker),
-                                _ => return false,
+                            let reach = match g {
+                                Geometry::Line(_) if strokes.is_empty() => return false,
+                                Geometry::Line(_) => line_markers::reach(strokes, sym.stroke_width),
+                                _ => {
+                                    let marks = styler.marks(row, strokes);
+                                    match sym.marker {
+                                        _ if !marks.is_empty() => point_marks::reach(&sym, &marks),
+                                        Marker::Picture(_) => sym.size * marker_reach(sym.marker),
+                                        _ => return false,
+                                    }
+                                }
                             };
                             // In the layer's pixels (`ctx` is scaled by its size factor).
                             let r = f64::from(reach * ctx.ppp) * map_per_px;
@@ -4934,6 +5074,7 @@ fn render_frame(
                     if !tilted_extrusion {
                         draw_diagrams(dest);
                     }
+                    dest.end_bands();
                 }
                 cpu_dirty |= drawn_here;
             }
@@ -5022,7 +5163,7 @@ fn render_frame(
             // shown, in range and on a field the layer has (#618) or by a text expression. Its
             // expressions are compiled once for the drawing.
             let label_exprs: Vec<Option<rustgis_map::label_by::LabelExprs>> = if labels.enabled && !display.paused {
-                labels.in_order().map(|c| rustgis_map::label_by::LabelExprs::new(&c.by, ds_ptr, Some(label_scale))).collect()
+                labels.in_order().map(|c| rustgis_map::label_by::LabelExprs::with_env(&c.by, ds_ptr, label_env.clone())).collect()
             } else {
                 Vec::new()
             };
@@ -5050,7 +5191,7 @@ fn render_frame(
                 // `render_frame`'s contract) waits for the font index; a frame on screen doesn't.
                 let find = if full_res_rasters { families::find } else { families::find_ready };
                 let class_fonts: Vec<Option<u16>> = labels.in_order().map(|c| c.font.as_deref().and_then(find)).collect();
-                let classes = rustgis_map::LabelMatcher::new(labels, ds_ptr, Some(label_scale));
+                let classes = rustgis_map::LabelMatcher::with_env(labels, ds_ptr, label_env.clone());
                 let lid = layer.id;
                 // Whether a class labels lines along them: those take the stretch of a line in
                 // view, wherever its label point is.
@@ -5167,6 +5308,14 @@ fn render_frame(
                         let curving = class.placement == LabelPlacement::Curved
                             && matches!(g, Geometry::Line(_))
                             && raw.graphemes(true).nth(line_labels::MAX_CURVED_CHARS).is_none();
+                        // A polygon's label curved along its centre line (#2262): its text unwrapped,
+                        // kept for that; where it doesn't fit, placed and wrapped as `Auto`.
+                        let mut unwrapped = (class.placement == LabelPlacement::Curved
+                            && matches!(g, Geometry::Polygon(_))
+                            && point.is_some()
+                            && moved.is_none()
+                            && raw.graphemes(true).nth(line_labels::MAX_CURVED_CHARS).is_none())
+                        .then(|| raw.clone());
                         let mut text =
                             if curving || (class.wrap_char.is_none() && class.wrap_length == 0) { raw } else { class.wrap(&raw) };
                         // Placed as at its own size, then that much farther out: the gap between
@@ -5246,11 +5395,82 @@ fn render_frame(
                                     .collect()
                             };
                             if curving {
-                                let chars: Vec<String> = text.graphemes(true).map(String::from).collect();
-                                let advances: Vec<f32> = chars.iter().map(|c| text::measure_in(c, size, face)).collect();
+                                let measure = |t: &str| -> (Vec<String>, Vec<f32>) {
+                                    let chars: Vec<String> = t.graphemes(true).map(String::from).collect();
+                                    let advances = chars.iter().map(|c| text::measure_in(c, size, face)).collect();
+                                    (chars, advances)
+                                };
+                                let (mut chars, mut advances) = measure(&text);
+                                // Fitted to its line (#2265): abbreviated when the full name can't
+                                // follow it anywhere it is tried, set on its straightest stretches
+                                // when it takes more than a third of it, and spread (the middle
+                                // first) when the line has room to spare. The places it can
+                                // follow, best first; none: placed as without `fit`. A spread
+                                // name follows a smoother course (#2259), so it may go where the
+                                // close-set one couldn't.
+                                let mut fitted: Option<Vec<f32>> = None;
+                                // Its letter spacing, and the close-set one (its own) when spread.
+                                let close_gap = spacing * 1.33;
+                                let (mut gap, mut spread) = (close_gap, false);
+                                if class.fit == rustgis_map::symbology::LabelFit::Auto {
+                                    let follows = |advances: &[f32], gap: f32, tried: Vec<f32>| -> Vec<f32> {
+                                        tried
+                                            .into_iter()
+                                            .filter(|d| {
+                                                line.curved(advances, gap, size, overrun, Some(*d))
+                                                    .and_then(|c| line_labels::curved_off(c, off))
+                                                    .is_some()
+                                            })
+                                            .collect()
+                                    };
+                                    let close = |advances: &[f32]| -> Vec<f32> {
+                                        let len = line_labels::curved_len(advances, close_gap);
+                                        // Where it will be placed: a repeat's places as they are.
+                                        let tried = match (locked_at, repeat) {
+                                            (Some(at), _) => vec![at],
+                                            (None, Some(_)) => {
+                                                line_labels::repeats(line.length(), repeat).into_iter().map(|(_, d)| d).collect()
+                                            }
+                                            (None, None) if 3.0 * len > line.length() => line.straightest(len, 8),
+                                            (None, None) => line_labels::positions(line.length(), len, overrun),
+                                        };
+                                        follows(advances, close_gap, tried)
+                                    };
+                                    let mut at = close(&advances);
+                                    if at.is_empty()
+                                        && let Some(short) = line_labels::abbreviated(&text, &class.abbreviations)
+                                    {
+                                        let (c, a) = measure(&short);
+                                        at = close(&a);
+                                        if !at.is_empty() {
+                                            (text, chars, advances) = (short, c, a);
+                                        }
+                                    }
+                                    // Spread over `stretch` of the line, the middle first; where it
+                                    // can't follow the line, close-set. With a repeat that names the
+                                    // line more than once, only on a line more than two spread names
+                                    // long, so close-set repeats still go beside it; on a shorter one
+                                    // the repeats stay close-set, as without spreading.
+                                    let stretch = class.stretch.unwrap_or(rustgis_map::symbology::DEFAULT_LABEL_STRETCH);
+                                    let repeated = line_labels::repeats(line.length(), repeat).len() > 1;
+                                    if let Some(wide) = line_labels::spread_gap(&advances, close_gap, line.length(), stretch)
+                                        && let len = line_labels::curved_len(&advances, wide)
+                                        && !(repeated && line.length() <= 2.0 * len)
+                                    {
+                                        let tried =
+                                            locked_at.map_or_else(|| line_labels::positions(line.length(), len, overrun), |at| vec![at]);
+                                        let wide_at = follows(&advances, wide, tried);
+                                        if !wide_at.is_empty() {
+                                            (at, gap, spread) = (wide_at, wide, true);
+                                        }
+                                    }
+                                    // (A locked label keeps its own place; only its text is fitted.)
+                                    fitted = Some(at).filter(|at| !at.is_empty() && locked_at.is_none());
+                                }
+                                let first = locked_at.or_else(|| fitted.as_ref().and_then(|f| f.first().copied()));
                                 if try_others {
-                                    let width = line_labels::curved_len(&advances, spacing * 1.33);
-                                    let positions = positions(width);
+                                    let width = line_labels::curved_len(&advances, gap);
+                                    let positions = fitted.clone().unwrap_or_else(|| positions(width));
                                     // A saved slot the curve cannot take has no truthful preview either (as for a
                                     // straight line): never draw one at the anchor or the middle.
                                     if lock.as_ref().and_then(|k| k.get(&key)).is_some_and(|won| usize::from(won.place) >= positions.len())
@@ -5258,12 +5478,12 @@ fn render_frame(
                                         continue;
                                     }
                                     line_places = Some(LinePlaces { anchors: anchors(&positions), ..Default::default() });
-                                    let Some((cx, cy)) = line.anchor(locked_at.unwrap_or(line.length() / 2.0)) else { continue };
-                                    let angle = line.parallel(width, overrun, locked_at).map(|(_, _, a)| a);
+                                    let Some((cx, cy)) = line.anchor(first.unwrap_or(line.length() / 2.0)) else { continue };
+                                    let angle = line.parallel(width, overrun, first).map(|(_, _, a)| a);
                                     // Off the line as its curves will be (by the line's direction
                                     // where the text can't fit, as a tilted view's preview is).
                                     let (cx, cy) =
-                                        angle.or_else(|| line.direction(locked_at.unwrap_or(line.length() / 2.0))).map_or((cx, cy), |a| {
+                                        angle.or_else(|| line.direction(first.unwrap_or(line.length() / 2.0))).map_or((cx, cy), |a| {
                                             let (x, y, _) = line_labels::parallel_off((cx, cy, a), off);
                                             (x, y)
                                         });
@@ -5275,7 +5495,7 @@ fn render_frame(
                                             line: line.clone(),
                                             chars,
                                             advances,
-                                            gap: spacing * 1.33,
+                                            gap,
                                             size,
                                             overrun,
                                             off,
@@ -5284,9 +5504,26 @@ fn render_frame(
                                         locked,
                                     ));
                                 } else {
-                                    for (i, at) in line_labels::repeats(line.length(), repeat) {
+                                    // Fitted without a repeat: on the best place it follows. Spread
+                                    // with a repeat (a line more than two spread labels long): there,
+                                    // and close-set at the repeats clear of it.
+                                    let along: Vec<(usize, f32, f32)> = match (&fitted, repeat) {
+                                        (Some(at), None) => at.first().map(|d| (0, *d, gap)).into_iter().collect(),
+                                        (Some(at), Some(_)) if spread => {
+                                            let first = at.first().copied().unwrap_or(line.length() / 2.0);
+                                            let (wide, close) =
+                                                (line_labels::curved_len(&advances, gap), line_labels::curved_len(&advances, close_gap));
+                                            let clear = (wide + close) / 2.0 + size;
+                                            let others = line_labels::repeats_clear_of(line.length(), repeat, first, clear)
+                                                .into_iter()
+                                                .map(|(i, d)| (i, d, close_gap));
+                                            std::iter::once((0, first, gap)).chain(others).collect()
+                                        }
+                                        _ => line_labels::repeats(line.length(), repeat).into_iter().map(|(i, d)| (i, d, gap)).collect(),
+                                    };
+                                    for (i, at, gap) in along {
                                         let Some(((cx, cy), turns)) = line
-                                            .curved(&advances, spacing * 1.33, size, overrun, Some(at))
+                                            .curved(&advances, gap, size, overrun, Some(at))
                                             .and_then(|c| line_labels::curved_off(c, off))
                                         else {
                                             continue;
@@ -5349,6 +5586,12 @@ fn render_frame(
                         {
                             squared = true;
                             places.push((0, lx, ly, Some(angle), Vec::new()));
+                        } else if let (Some(line_text), Geometry::Polygon(polys)) = (unwrapped.as_deref(), g)
+                            && let Some(((cx, cy), glyphs)) =
+                                area_labels::glyphs(ctx, polys, line_text, |c| text::measure_in(c, size, face), spacing * 1.33, size)
+                        {
+                            places.push((0, cx, cy, None, glyphs));
+                            text = unwrapped.take().unwrap_or_default();
                         } else {
                             let (lx, ly) = place(class.placement);
                             // Turned by its angle expression (degrees clockwise), about its centre,
@@ -5486,6 +5729,10 @@ fn render_frame(
                 chunk.dataset.features = Vec::new().into();
                 Ok(())
             });
+            // Declined (`pictureless`): no frame, whatever the source made of the stop.
+            if declined {
+                return None;
+            }
             if let Err(e) = result {
                 // Stopped, not failed: the source is fine.
                 if cancel::requested() {
@@ -5501,7 +5748,9 @@ fn render_frame(
                 source.clear_error();
             }
         } else if let Err(e) = draw_chunk(layer) {
-            log::warn!("cannot render layer '{}': {e}", layer.name);
+            if !declined {
+                log::warn!("cannot render layer '{}': {e}", layer.name);
+            }
             return None;
         }
         if let (Some(spool), Some(x)) = (&mut extrusions, &layer.extrusion)
@@ -5542,8 +5791,8 @@ fn render_frame(
     }
     pm.layer(None);
     // A frame stopped part-way (see `cancel`) is no frame: its tiles, labels and effects aren't
-    // worth working out.
-    if cancel::requested() {
+    // worth working out. Nor is one the last layer left a picture in (see `pictureless`).
+    if cancel::requested() || (pictureless && (cpu_dirty || holds_picture(&cmds))) {
         return None;
     }
     if let Some(id) = below {
@@ -5681,7 +5930,7 @@ fn render_frame(
             // layer) costs more full-screen uploads than a plain CPU rasterization.
             let images = cmds.iter().filter(|c| matches!(c, gpu_scene::DrawCmd::Image { .. })).count();
             if images > 4 {
-                return render_frame(map, view, full_res_rasters, Backend::Cpu, labels_to, record, failed_source);
+                return render_frame(map, view, full_res_rasters, Backend::Cpu, labels_to, record, failed_source, env);
             }
             Some(RenderOutput::Gpu(gpu_scene::GpuScene {
                 clear: mesh::premul(water),
@@ -5798,7 +6047,12 @@ fn layer_masks(
                         }
                     } else if let Some(ml) = map.layers.get_mut(mi) {
                         if ctx.globe.is_some() {
-                            ml.dataset.features.iter().filter_map(|f| f.geometry.as_ref()).for_each(&mut add);
+                            // In longitude/latitude: its copy there when it is held in another system.
+                            if ml.lonlat_in().is_empty() {
+                                ml.dataset.features.iter().filter_map(|f| f.geometry.as_ref()).for_each(&mut add);
+                            } else {
+                                ml.lonlat_cache().iter().flatten().for_each(&mut add);
+                            }
                         } else {
                             ml.projected_in(flat, key).iter().flatten().for_each(&mut add);
                         }
@@ -5838,13 +6092,17 @@ struct Space {
     stars: bool,
     /// The glow of an atmosphere around the disc: the Earth's (#223).
     atmosphere: bool,
+    /// A blank basemap's paper colour (#2532), which the light space takes, so a globe frame
+    /// sits on the page's colour.
+    paper: Option<Rgba>,
 }
 
 /// The space around the globe for `view`: the interactive view's starry sky, or for exports a
-/// light space (dark on the Midnight basemap) without stars.
+/// light space (a blank basemap's paper colour; dark on the Midnight basemap) without stars.
 fn space(view: &View, map: &Map) -> Space {
     let dark = view.sky || map.basemap == rustgis_map::Basemap::Midnight;
-    Space { dark, stars: view.sky && map.view.effects.stars, atmosphere: map.body().is_earth() }
+    let paper = map.blank_paper().filter(|_| !dark);
+    Space { dark, stars: view.sky && map.view.effects.stars, atmosphere: map.body().is_earth(), paper }
 }
 
 /// Side of the starfield tile in logical points: the stars repeat this far apart.
@@ -5967,7 +6225,7 @@ fn globe_shading(pm: &mut Pixmap, g: &Globe, water: Rgba, space: Space, ppp: f32
 /// The globe's surroundings and ocean: space (dark or light, starry when it says so), an
 /// atmosphere glow, and the ocean disc.
 fn draw_globe_backdrop(pm: &mut Pixmap, g: &Globe, water: Rgba, space: Space, ppp: f32) {
-    let bg = globe_space(space.dark);
+    let bg = space.paper.unwrap_or_else(|| globe_space(space.dark));
     pm.fill(tiny_skia::Color::from_rgba8(bg.r(), bg.g(), bg.b(), 255));
     if space.stars {
         draw_stars(pm, ppp);
@@ -6159,7 +6417,7 @@ pub fn render_tilt_drape(map: &mut Map, view: &View, margin: f64, max_side: u32)
         Some(band) => vec![band],
         None => cam.tilt_bands(view.width, view.height),
     };
-    sync_tilted(map, view, &bands, false);
+    sync_tilted(map, view, &bands, false, &Env::default());
     let (display, lock) = (map.label_display, map.label_lock.take());
     let anchors = std::mem::take(&mut map.label_lock_line_anchors);
     map.label_display.paused = true;
@@ -6180,7 +6438,7 @@ pub fn render_tilt_drape(map: &mut Map, view: &View, margin: f64, max_side: u32)
         (w, h) = (fw, fh);
         let v = View { width: w, height: h, pixels_per_point: ppp, camera, sky: false };
         // The bands share the read above.
-        if let Some(RenderOutput::Cpu(r)) = render_frame(map, &v, false, Backend::Cpu, Labels::Shared, false, &mut None) {
+        if let Some(RenderOutput::Cpu(r)) = render_frame(map, &v, false, Backend::Cpu, Labels::Shared, false, &mut None, &Env::default()) {
             out.push(TiltPatch { pixmap: r.pixmap, band: rustgis_map::camera::Band { camera, width: w, height: h, depth: b.depth } });
         }
     }
@@ -6231,8 +6489,12 @@ fn square_lines(
         }
         let Some(layer) = map.layer_by_name(&name) else { continue };
         let mut runs = Vec::new();
-        for g in layer.dataset.features.iter().filter_map(|f| f.geometry.as_ref()) {
-            let (parts, rings): (Vec<&Vec<Coord>>, bool) = match g {
+        // Read in longitude/latitude, whatever system the layer holds its coordinates in; a
+        // feature that can't be given there squares nothing (nor any, in a system that can't be
+        // converted), as the map draws none of it.
+        let Ok(to) = layer.dataset.lonlat_conversion() else { continue };
+        for g in layer.dataset.features.iter().filter_map(|f| rustgis_data::Dataset::converted_to_lonlat(&to, f.geometry.as_ref()?)) {
+            let (parts, rings): (Vec<&Vec<Coord>>, bool) = match &*g {
                 Geometry::Line(parts) => (parts.iter().collect(), false),
                 Geometry::Polygon(polys) => (polys.iter().flatten().collect(), true),
                 _ => continue,
@@ -7005,17 +7267,17 @@ const IDLE_PASSES: usize = 6;
 /// Pixel regressions use this convenience wrapper without retaining a fatal source identity.
 #[cfg(test)]
 pub(crate) fn render_complete(map: &mut Map, view: &View) -> Option<Rendered> {
-    complete(map, view, false, &mut None)
+    complete(map, view, false, &mut None, &Env::default())
 }
 
 /// [`complete`] kept as vectors where the frame can be (flat, north up, without view
 /// effects): its `recorded` canvas; anything else as pixels.
 pub(crate) fn render_complete_recorded(map: &mut Map, view: &View, failed_source: &mut Option<u64>) -> Option<Rendered> {
-    complete(map, view, true, failed_source)
+    complete(map, view, true, failed_source, &Env::default())
 }
 
 /// Full-resolution passes, each recorded when `record`, carrying a fatal source's identity.
-fn complete(map: &mut Map, view: &View, record: bool, failed_source: &mut Option<u64>) -> Option<Rendered> {
+fn complete(map: &mut Map, view: &View, record: bool, failed_source: &mut Option<u64>, env: &Env) -> Option<Rendered> {
     // Cast shadows still being worked out are waited for first, unless this draws on the
     // interface's thread (see `on_the_interface_thread`).
     if !NO_SHADOW_WAIT.with(std::cell::Cell::get) {
@@ -7025,7 +7287,7 @@ fn complete(map: &mut Map, view: &View, record: bool, failed_source: &mut Option
     // to say: an earlier one's may have been drawn again with them. What frames before it said
     // is kept (see `shadows_said`).
     let before = (SHADOWS_TO_COME.with(|c| c.replace(false)), take_shadow_notices());
-    let r = complete_passes(map, view, record, failed_source);
+    let r = complete_passes(map, view, record, failed_source, env);
     SHADOWS_TO_COME.with(|c| c.set(before.0 || c.get()));
     let mut notices = before.1;
     for e in take_shadow_notices() {
@@ -7038,10 +7300,10 @@ fn complete(map: &mut Map, view: &View, record: bool, failed_source: &mut Option
 }
 
 /// [`complete`]'s passes, each saying afresh what it drew of cast shadows.
-fn complete_passes(map: &mut Map, view: &View, record: bool, failed_source: &mut Option<u64>) -> Option<Rendered> {
+fn complete_passes(map: &mut Map, view: &View, record: bool, failed_source: &mut Option<u64>, env: &Env) -> Option<Rendered> {
     // What had come when it drew: what lands meanwhile is news to the wait.
     let mut drawn_at = rustgis_tiles::cache::generation();
-    let mut r = render_cpu(map, view, true, record, failed_source)?;
+    let mut r = render_cpu(map, view, true, record, failed_source, env)?;
     let start = web_time::Instant::now();
     let budget = web_time::Duration::from_secs(60);
     let mut idle = 0;
@@ -7062,7 +7324,7 @@ fn complete_passes(map: &mut Map, view: &View, record: bool, failed_source: &mut
         drawn_at = now;
         SHADOWS_TO_COME.with(|c| c.set(false));
         take_shadow_notices();
-        r = render_cpu(map, view, true, record, failed_source)?;
+        r = render_cpu(map, view, true, record, failed_source, env)?;
     }
     Some(r)
 }
@@ -7208,7 +7470,7 @@ pub fn render_placed(map: &mut Map, view: &View) -> Result<Placed, String> {
 fn render_exported(map: &mut Map, view: &View) -> Result<Rendered, String> {
     let revisions = archive_revisions([&*map]);
     let mut failed_source = None;
-    let result = complete(map, view, false, &mut failed_source);
+    let result = complete(map, view, false, &mut failed_source, &Env::default());
     let r = revisions.finish(map, failed_source, result, "could not draw the map")?;
     // A raster read in place drawn from less than the view needs isn't written: its tiles still
     // on their way (the browser can't wait; natively the wait ran out), or a coarser level or
@@ -8888,6 +9150,52 @@ mod tests {
         assert_eq!(h, 0x89e2_f6ec_5589_a46e, "golden pixmap hash changed: {h:#x}");
     }
 
+    /// #1067: a frame large enough to draw its layers in bands comes out the same, byte for byte,
+    /// whatever the user's thread setting: countries, rivers and lakes crossing bands, city
+    /// markers stamped from sprites, and a dense layer of tiny squares drawn as pixels.
+    #[test]
+    fn a_large_frame_is_the_same_on_one_thread_or_many() {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = rustgis_data::threads::set_max(None);
+            }
+        }
+        let _restore = Restore;
+        let mut m = sample_world();
+        let mut d = Dataset::new("dense", GeometryType::Polygon, vec![]);
+        for i in 0..20_000 {
+            let (x, y, s) = (-10.0 + f64::from(i % 200) * 0.2, 35.0 + f64::from(i / 200) * 0.2, 0.05 + f64::from(i % 7) * 0.03);
+            d.push(
+                Some(Geometry::Polygon(vec![vec![vec![
+                    Coord::new(x, y),
+                    Coord::new(x + s, y),
+                    Coord::new(x + s, y + s),
+                    Coord::new(x, y + s),
+                    Coord::new(x, y),
+                ]]])),
+                vec![],
+            );
+        }
+        m.add_dataset(d);
+        let europe = lonlat_to_merc(Coord::new(10.0, 48.0));
+        let view = View {
+            width: 1200.0,
+            height: 1000.0,
+            pixels_per_point: 1.0,
+            camera: Camera { center: europe, res: 2500.0, bearing: 0.0, pitch: 0.0 },
+            sky: false,
+        };
+        assert!(bands::applies(1200, 1000));
+        let mut draw = |threads: usize| {
+            rustgis_data::threads::set_max(Some(threads)).unwrap();
+            render(&mut m, &view).expect("render").pixmap
+        };
+        // (On a machine with one core both are one thread; `bands::tests` draws on several anyway.)
+        let one = draw(1);
+        assert!(one.data() == draw(6).data(), "six threads drew other pixels than one");
+    }
+
     fn square_layer(m: &mut Map, name: &str, x: f64, y: f64, s: f64) -> u32 {
         let mut d = Dataset::new(name, GeometryType::Polygon, vec![]);
         d.push(
@@ -8964,6 +9272,74 @@ mod tests {
             if let gpu_scene::DrawCmd::Mesh { vertices, .. } = c {
                 assert!(vertices.len() <= mesh::MAX_LAYER_VERTICES, "{} vertices", vertices.len());
             }
+        }
+    }
+
+    /// A turned or tilted view with a layer too dense to mesh is drawn on the CPU, as the CPU
+    /// backend draws it, and the GPU frame tried first stops at that layer: the one above it is
+    /// never meshed (#2540). Without it, the view stays a GPU scene.
+    #[test]
+    fn a_turned_or_tilted_view_stops_trying_the_gpu_at_a_layer_too_dense_to_mesh() {
+        let mut m = Map::new("Map");
+        let mut d = Dataset::new("dense", GeometryType::Polygon, vec![]);
+        for i in 0..270 {
+            for j in 0..270 {
+                let (x, y) = (i as f64 * 0.01, j as f64 * 0.01);
+                let ring = vec![Coord::new(x, y), Coord::new(x + 0.008, y), Coord::new(x, y + 0.008)];
+                d.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+            }
+        }
+        let dense = m.add_dataset(d);
+        // Added last, so on top: drawn after the dense layer.
+        square_layer(&mut m, "sparse", 1.0, 0.2, 0.4);
+        let at = lonlat_to_merc(Coord::new(1.35, 0.5));
+        for (bearing, pitch) in [(30.0, 0.0), (0.0, 50.0), (20.0, 60.0)] {
+            let camera = Camera { center: at, res: 1000.0, bearing, pitch };
+            let view = View { width: 400.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+            MESHED.with(|m| m.borrow_mut().clear());
+            let Some(RenderOutput::Cpu(gpu)) = render_backend(&mut m, &view, Backend::Gpu) else {
+                panic!("turned {bearing}°, tilted {pitch}°: drawn on the CPU")
+            };
+            let meshed = MESHED.with(|m| m.borrow().clone());
+            assert!(meshed.contains(&("dense".into(), true)), "turned {bearing}°, tilted {pitch}°: too dense: {meshed:?}");
+            assert!(!meshed.iter().any(|(n, _)| n == "sparse"), "turned {bearing}°, tilted {pitch}°: went on: {meshed:?}");
+            let cpu = render(&mut m, &view).expect("cpu");
+            assert!(gpu.pixmap.data() == cpu.pixmap.data(), "turned {bearing}°, tilted {pitch}°: as the CPU draws it");
+            // Without the dense layer, the view is a GPU scene with the sparse layer meshed.
+            m.layer_mut(dense).expect("dense").visible = false;
+            MESHED.with(|m| m.borrow_mut().clear());
+            assert!(
+                matches!(render_backend(&mut m, &view, Backend::Gpu), Some(RenderOutput::Gpu(_))),
+                "turned {bearing}°, tilted {pitch}°: a GPU scene"
+            );
+            assert!(MESHED.with(|m| m.borrow().iter().any(|(n, _)| n == "sparse")));
+            m.layer_mut(dense).expect("dense").visible = true;
+        }
+    }
+
+    /// So does one with a layer drawn on the CPU for another reason: a polygon reaching too far
+    /// from its origin for f32, zoomed in all the way. The layer above it is never meshed.
+    #[test]
+    fn a_turned_or_tilted_view_stops_trying_the_gpu_after_a_layer_drawn_on_the_cpu() {
+        let mut m = Map::new("Map");
+        // The world's outline is too far for f32 this far in as well: none.
+        m.basemap = rustgis_map::Basemap::Blank;
+        // About 5 km across, over a view of a few centimetres.
+        square_layer(&mut m, "far", 1.0 - 0.025, 0.5 - 0.025, 0.05);
+        square_layer(&mut m, "near", 1.0, 0.5, 1e-7);
+        let at = lonlat_to_merc(Coord::new(1.0, 0.5));
+        for (bearing, pitch) in [(30.0, 0.0), (0.0, 50.0)] {
+            let camera = Camera { center: at, res: rustgis_map::camera::MIN_RES, bearing, pitch };
+            let view = View { width: 400.0, height: 600.0, pixels_per_point: 1.0, camera, sky: false };
+            MESHED.with(|m| m.borrow_mut().clear());
+            let Some(RenderOutput::Cpu(gpu)) = render_backend(&mut m, &view, Backend::Gpu) else {
+                panic!("turned {bearing}°, tilted {pitch}°: drawn on the CPU")
+            };
+            let meshed = MESHED.with(|m| m.borrow().clone());
+            assert!(meshed.contains(&("far".into(), false)), "turned {bearing}°, tilted {pitch}°: tried: {meshed:?}");
+            assert!(!meshed.iter().any(|(n, _)| n == "near"), "turned {bearing}°, tilted {pitch}°: went on: {meshed:?}");
+            let cpu = render(&mut m, &view).expect("cpu");
+            assert!(gpu.pixmap.data() == cpu.pixmap.data(), "turned {bearing}°, tilted {pitch}°: as the CPU draws it");
         }
     }
 
@@ -9102,6 +9478,44 @@ mod tests {
         );
         let (water, ..) = m.basemap.palette();
         assert_eq!(scene.clear, mesh::premul(water), "the clear colour is the basemap's water");
+    }
+
+    /// A blank basemap's paper colour (#2532) is the flat view's canvas on the CPU and the GPU's
+    /// clear colour, a tilted view's sky and fog as it is, and the light space around a globe;
+    /// another basemap leaves it unused.
+    #[test]
+    fn a_blank_paper_colour_is_the_canvas_the_clear_colour_and_the_sky() {
+        let cream = Rgba::rgb(0xF1, 0xEA, 0xDF);
+        let mut m = Map::new("Map");
+        (m.basemap, m.graticule, m.paper) = (rustgis_map::Basemap::Blank, false, Some(cream));
+        let view = View { width: 200.0, height: 120.0, pixels_per_point: 1.0, camera: Camera::world(), sky: false };
+        let pm = render(&mut m, &view).unwrap().pixmap;
+        let p = pm.pixel(5, 5).unwrap();
+        assert_eq!((p.red(), p.green(), p.blue(), p.alpha()), (0xF1, 0xEA, 0xDF, 255));
+        let Some(RenderOutput::Gpu(scene)) = render_backend(&mut m, &view, Backend::Gpu) else { panic!("gpu scene") };
+        assert_eq!(scene.clear, mesh::premul(cream));
+        assert_eq!(tilt_sky(&m), (cream, cream), "no white mixed in");
+        // A globe's light space (exports, a publication's locator) is the paper too; the
+        // interactive view keeps its dark sky.
+        m.projection = rustgis_map::Projection::Globe;
+        let camera = Camera { center: Coord::new(0.0, 0.0), res: 200_000.0, bearing: 0.0, pitch: 0.0 };
+        let corner = |m: &mut Map, sky: bool| {
+            let pm = render(m, &View { camera, sky, ..view }).unwrap().pixmap;
+            let p = pm.pixel(2, 2).unwrap();
+            Rgba::rgb(p.red(), p.green(), p.blue())
+        };
+        assert_eq!(corner(&mut m, false), cream, "a globe on the paper");
+        assert_eq!(corner(&mut m, true), globe_space(true), "the view's sky");
+        m.projection = rustgis_map::Projection::default();
+        m.paper = Some(Rgba::new(0xF1, 0xEA, 0xDF, 0));
+        assert_eq!((m.palette().0, tilt_sky(&m).0), (cream, cream), "a file's translucent paper is drawn opaque");
+        m.paper = None;
+        let white = Rgba::rgb(0xFF, 0xFF, 0xFF);
+        assert_eq!(m.palette().0, white, "without a colour, blank stays white");
+        m.paper = Some(cream);
+        m.basemap = rustgis_map::Basemap::Paper;
+        assert_eq!(m.palette(), m.basemap.palette(), "another basemap keeps its own colours");
+        assert_ne!(tilt_sky(&m).0, cream);
     }
 
     #[test]
@@ -9427,6 +9841,7 @@ mod tests {
         let m = export.join().unwrap();
         assert!(waited, "the export waited for the far band's cast shadows");
         let rl = m.layer(id).and_then(|l| l.raster.as_ref()).unwrap();
+        assert!(rl.cast_shadow_jobs() > 0, "completed light work remains observable");
         assert!(matches!(rl.cast_shadows(false, (0, 0), || {}), rustgis_map::raster::CastShadows::Ready(_)), "and drew them");
     }
 
@@ -9465,10 +9880,7 @@ mod tests {
             }
             render_complete(&mut m, &view).unwrap();
             let rl = m.layer(id).and_then(|l| l.raster.as_ref()).unwrap();
-            assert!(
-                matches!(rl.cast_shadows(false, (0, 0), || {}), rustgis_map::raster::CastShadows::Pending),
-                "grouped {grouped}: nothing was worked out for it"
-            );
+            assert_eq!(rl.cast_shadow_jobs(), 0, "grouped {grouped}: no light work was started");
         }
     }
 
@@ -9806,6 +10218,8 @@ mod tests {
             depth: Some(1000.0),
             walls: rustgis_map::view::BLOCK_WALLS,
             walls_layer: None,
+            water: None,
+            shape: rustgis_map::view::BlockShape::Box,
         };
         let terrain = |block: Option<rustgis_map::view::TerrainBlock>| {
             Some(rustgis_map::view::Terrain {
@@ -9849,6 +10263,64 @@ mod tests {
     }
 
     #[test]
+    fn a_round_block_cuts_the_ground_to_its_circle_and_stands_its_wall_round_it() {
+        // #2318: the circle in a 2 km box over flat ground 500 m high, seen from the south. Below
+        // its south-west point stands a wall where the box had ground; past it, by the box's far
+        // corner, the fog shows where the box had ground.
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let camera = Camera { center: Coord::new(0.0, 0.0), res: 20.0, bearing: 0.0, pitch: 60.0 };
+        let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        let gt = GeoTransform { origin_x: -5000.0, origin_y: 5000.0, pixel_width: 20.0, pixel_height: -20.0 };
+        let dem =
+            Raster::new("dem", 500, 500, vec![vec![500.0; 500 * 500]], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        m.add_raster("dem", rustgis_map::RasterLayer::from_path(dem, "dem.tif"));
+        let mut frame = |shape| {
+            m.view.terrain = Some(rustgis_map::view::Terrain {
+                source: rustgis_map::view::TerrainSource::Layer("dem".into()),
+                exaggeration: 1.0,
+                block: Some(rustgis_map::view::TerrainBlock {
+                    extent: Some([-1000.0, -1000.0, 1000.0, 1000.0]),
+                    depth: Some(1000.0),
+                    walls: rustgis_map::view::BLOCK_WALLS,
+                    walls_layer: None,
+                    shape,
+                    water: None,
+                }),
+                water: None,
+            });
+            let g = terrain::Ground::of(&m, &camera).expect("terrain");
+            (render(&mut m, &view).expect("a frame"), g.block(&m).expect("a block"), g.per_unit(Coord::new(0.0, 0.0)))
+        };
+        let (boxed, _, _) = frame(rustgis_map::view::BlockShape::Box);
+        let (round, b, per_unit) = frame(rustgis_map::view::BlockShape::Circle { radius: None });
+        assert_eq!(b.circle, Some((Coord::new(0.0, 0.0), 1000.0)));
+        let screen = |x: f64, y: f64, metres: f64| {
+            let (u, v) = camera.ground_px(Coord::new(x, y));
+            camera.project_raised(u, v, metres / per_unit / camera.res, view.width, view.height).expect("in view")
+        };
+        let px = |r: &Rendered, p: (f64, f64)| r.pixmap.pixel(p.0 as u32, p.1 as u32).expect("in the frame").demultiply();
+        // 150 m down the wall under the circle's south-west point, where the box's ground lies.
+        let d = 1000.0 * std::f64::consts::FRAC_1_SQRT_2;
+        let mid = screen(-d, -d, 350.0);
+        let wall = px(&round, mid);
+        assert!(wall.red() > wall.green() && wall.green() > wall.blue() + 8, "{wall:?}");
+        assert_ne!(wall, px(&boxed, mid));
+        // A smaller radius makes a smaller circle; one larger than the box's takes the box's.
+        assert_eq!(frame(rustgis_map::view::BlockShape::Circle { radius: Some(400.0) }).1.circle.map(|c| c.1), Some(400.0));
+        assert_eq!(frame(rustgis_map::view::BlockShape::Circle { radius: Some(4000.0) }).1.circle.map(|c| c.1), Some(1000.0));
+        // The ground by the far corner: the box's, gone from the circle's.
+        let (_, fog) = tilt_sky(&m);
+        let corner = px(&round, screen(950.0, 950.0, 500.0));
+        assert!(
+            [(corner.red(), fog.r()), (corner.green(), fog.g()), (corner.blue(), fog.b())].iter().all(|(a, b)| a.abs_diff(*b) <= 2),
+            "{corner:?} vs {fog:?}"
+        );
+        assert_ne!(corner, px(&boxed, screen(950.0, 950.0, 500.0)));
+    }
+
+    #[test]
     fn a_block_diagrams_wall_shows_the_unit_under_its_edge() {
         // #1914: the near wall of a 2 km box, seen from the south, with a red unit over the box's
         // west half: red below the edge's west half, the walls' sandy brown below its east half.
@@ -9883,6 +10355,8 @@ mod tests {
                 depth: Some(1000.0),
                 walls: rustgis_map::view::BLOCK_WALLS,
                 walls_layer: Some("geo".into()),
+                water: None,
+                shape: rustgis_map::view::BlockShape::Box,
             }),
             water: None,
         });
@@ -9931,6 +10405,69 @@ mod tests {
         let (blues, reds) = striped(&column(-500.0));
         assert!(blues >= 3 && reds >= 3, "west: {blues} blue, {reds} red");
         assert_eq!(striped(&column(500.0)).0, 0, "east");
+    }
+
+    #[test]
+    fn a_block_diagrams_wall_shows_the_water_its_edge_cuts() {
+        // #2317: the near wall of a 2 km box, seen from the south, crosses a blue lake over its
+        // east half, 300 m deep: blue from the lake's level down to its floor there, the walls'
+        // sandy brown below the floor and beside the lake.
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        use rustgis_data::{Dataset, Geometry, GeometryType};
+        let camera = Camera { center: Coord::new(0.0, 0.0), res: 20.0, bearing: 0.0, pitch: 60.0 };
+        let view = View { width: 400.0, height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        let gt = GeoTransform { origin_x: -5000.0, origin_y: 5000.0, pixel_width: 20.0, pixel_height: -20.0 };
+        let dem =
+            Raster::new("dem", 500, 500, vec![vec![500.0; 500 * 500]], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        m.add_raster("dem", rustgis_map::RasterLayer::from_path(dem, "dem.tif"));
+        let deg = |x: f64, y: f64| rustgis_geom::merc_to_lonlat(Coord::new(x, y));
+        let lake = vec![deg(0.0, -3000.0), deg(3000.0, -3000.0), deg(3000.0, 0.0), deg(0.0, 0.0), deg(0.0, -3000.0)];
+        let mut d = Dataset::new("lagos", GeometryType::Polygon, Vec::new());
+        d.push(Some(Geometry::Polygon(vec![vec![lake]])), Vec::new());
+        m.add_dataset(d);
+        let blue = Rgba::rgb(40, 90, 220);
+        if let Some(l) = m.layers.iter_mut().find(|l| l.name == "lagos") {
+            l.renderer = rustgis_map::Renderer::Single(rustgis_map::Symbol {
+                fill: blue,
+                ..rustgis_map::Symbol::default_for(GeometryType::Polygon, 0)
+            });
+        }
+        let block = |water| rustgis_map::view::TerrainBlock {
+            extent: Some([-1000.0, -1000.0, 1000.0, 1000.0]),
+            depth: Some(1000.0),
+            walls: rustgis_map::view::BLOCK_WALLS,
+            walls_layer: None,
+            shape: rustgis_map::view::BlockShape::Box,
+            water,
+        };
+        m.view.terrain = Some(rustgis_map::view::Terrain {
+            source: rustgis_map::view::TerrainSource::Layer("dem".into()),
+            exaggeration: 1.0,
+            block: Some(block(Some(rustgis_map::view::BlockWater { depth: Some(300.0), field: None }))),
+            water: Some(rustgis_map::view::TerrainWater { layer: "lagos".into(), level: None, glint: 0.0, shore: 0.35 }),
+        });
+        let frame = render(&mut m, &view).expect("a frame");
+        let g = terrain::Ground::of(&m, &camera).expect("terrain");
+        // On the near wall at `x`, `metres` high.
+        let at = |frame: &Rendered, x: f64, metres: f64| {
+            let edge = Coord::new(x, -1000.0);
+            let (u, v) = camera.ground_px(edge);
+            let (px, py) = camera.project_raised(u, v, metres / g.per_unit(edge) / camera.res, view.width, view.height).expect("in view");
+            frame.pixmap.pixel(px as u32, py as u32).expect("in the frame").demultiply()
+        };
+        let bluish = |c: tiny_skia::ColorU8| c.blue() > c.red() + 60 && c.blue() > c.green() + 30;
+        let water = at(&frame, 500.0, 350.0);
+        assert!(bluish(water), "in the lake's section: {water:?}");
+        for (x, metres) in [(500.0, 0.0), (-500.0, 350.0)] {
+            let c = at(&frame, x, metres);
+            assert!(!bluish(c) && c.red() > c.blue(), "({x}, {metres}): {c:?}");
+        }
+        // Without water in the block the wall is ground there too.
+        m.view.terrain.as_mut().unwrap().block = Some(block(None));
+        let dry = at(&render(&mut m, &view).expect("a frame"), 500.0, 350.0);
+        assert!(!bluish(dry) && dry.red() > dry.blue(), "{dry:?}");
     }
 
     #[test]
@@ -10059,10 +10596,10 @@ mod tests {
             })
             .collect();
         let mut pm = Pixmap::new(400, 300).expect("a pixmap");
-        assert!(drape_terrain(&mut pm, &view, &m, &bands, &ground));
+        assert!(drape_terrain(&mut pm, &view, &m, &bands, &ground, &Env::default()));
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let _stop = cancel::install(flag);
-        assert!(!drape_terrain(&mut pm, &view, &m, &bands, &ground));
+        assert!(!drape_terrain(&mut pm, &view, &m, &bands, &ground, &Env::default()));
     }
 
     #[test]
@@ -11299,6 +11836,43 @@ mod tests {
         assert_eq!(p, vec![(0.0, 1.0), (5.0, 1.0)]);
     }
 
+    /// A dot fill whose marker is an image draws it in a feature of no fill, as a point's image
+    /// shows whatever its colour; a circle there has no colour to show.
+    #[test]
+    fn an_image_dot_fill_draws_in_a_feature_of_no_fill() {
+        use rustgis_map::fills::{FillLayer, FillPattern};
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("fields", GeometryType::Polygon, vec![]);
+        let ring = vec![Coord::new(-0.6, -0.5), Coord::new(0.6, -0.5), Coord::new(0.6, 0.5), Coord::new(-0.6, 0.5), Coord::new(-0.6, -0.5)];
+        d.push(Some(Geometry::Polygon(vec![vec![ring]])), vec![]);
+        let id = m.add_dataset(d);
+        let none = Rgba::new(0, 0, 0, 0);
+        m.layer_mut(id).unwrap().renderer =
+            rustgis_map::Renderer::Single(Symbol { fill: none, stroke: none, stroke_width: 0.0, size: 1.0, marker: Marker::Circle });
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
+        let dots = |marker| FillLayer {
+            color: None,
+            pattern: FillPattern::Dots {
+                marker,
+                size: 12.0,
+                outline: None,
+                outline_width: 0.0,
+                spacing: [20.0, 20.0],
+                displacement: [0.0, 0.0],
+                offset: [0.0, 0.0],
+            },
+        };
+        let inked = |m: &mut Map, marker| {
+            m.layer_mut(id).unwrap().fill_layers = vec![dots(marker)];
+            let r = render(m, &view).unwrap();
+            r.pixmap.pixels().iter().filter(|p| (p.red() > 200 || p.blue() > 200) && p.green() < 60).count()
+        };
+        assert!(inked(&mut m, Marker::Picture(rustgis_map::Picture::new(&picture_png()))) > 50, "the image's red and blue");
+        assert_eq!(inked(&mut m, Marker::Circle), 0, "a circle in no colour");
+    }
+
     #[test]
     fn stacked_fills_hatch_and_dot_polygons_anchored_to_the_map() {
         use rustgis_map::fills::{FillLayer, FillPattern};
@@ -11955,6 +12529,103 @@ mod tests {
     }
 
     #[test]
+    fn a_lines_markers_and_shifted_strokes_show_while_it_is_off_the_view() {
+        use base64::Engine;
+        use rustgis_map::{LineMark, LineMarkers, LineStroke, Picture};
+        // A line 40 px above a 200 px view (140 px north of its centre), past its cull margin.
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("rail", GeometryType::Polyline, vec![]);
+        let lat = 140.0 * 1500.0 / 111_319.49;
+        d.push(Some(Geometry::Line(vec![vec![Coord::new(-1.0, lat), Coord::new(1.0, lat)]])), vec![]);
+        let id = m.add_dataset(d);
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
+        let red = |p: tiny_skia::PremultipliedColorU8| p.red() > 200 && p.green() < 60 && p.blue() < 60;
+        // A red image ten times as tall as wide: 10 pt wide along the line, it reaches 50 px down
+        // from it, 10 px into the view.
+        let mut tall = tiny_skia::Pixmap::new(4, 40).unwrap();
+        tall.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let tall = Picture::new(&base64::engine::general_purpose::STANDARD.encode(tall.encode_png().unwrap()));
+        let images = LineMarkers { mark: LineMark::Marker(Marker::Picture(tall)), size: 10.0, interval: 30.0, ..LineMarkers::default() };
+        let stroke = LineStroke { color: Some(Rgba::rgb(255, 0, 0)), width: Some(4.0), ..LineStroke::default() };
+        // Its images, and a stroke 50 pt to the right of its direction (down the screen, going
+        // east), 4 pt wide: y 8 to 12.
+        for (stroke, rows) in [(LineStroke { markers: Some(images), ..stroke }, 0..8), (LineStroke { offset: 50.0, ..stroke }, 8..12)] {
+            m.layer_mut(id).unwrap().line_strokes = vec![stroke];
+            let r = render(&mut m, &view).unwrap();
+            let shows = rows.clone().any(|y| (0..200).any(|x| r.pixmap.pixel(x, y).is_some_and(red)));
+            assert!(shows, "{stroke:?} shows in rows {rows:?}");
+        }
+    }
+
+    /// A picture marker drawn at many places, along lines and at points, is one picture to a vector
+    /// export: kept once in the frame's drawing, written once into a PDF.
+    #[test]
+    fn a_picture_marker_is_one_picture_in_a_vector_export() {
+        use base64::Engine;
+        use rustgis_map::{LineMark, LineMarkers, LineStroke, Picture};
+        // Noise, which compresses little: its pixels outweigh what placing it takes.
+        let mut noise = tiny_skia::Pixmap::new(300, 150).unwrap();
+        let mut seed = 7u32;
+        for px in noise.pixels_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let [r, g, b, _] = seed.to_le_bytes();
+            *px = tiny_skia::ColorU8::from_rgba(r, g, b, 255).premultiply();
+        }
+        let picture = Picture::new(&base64::engine::general_purpose::STANDARD.encode(noise.encode_png().unwrap()));
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("icons", GeometryType::Point, vec![]);
+        for x in [-0.5, 0.0, 0.5] {
+            d.push(Some(Geometry::Point(Coord::new(x, 0.3))), vec![]);
+        }
+        let id = m.add_dataset(d);
+        let none = Rgba::new(0, 0, 0, 0);
+        m.layer_mut(id).unwrap().renderer = rustgis_map::Renderer::Single(Symbol {
+            fill: none,
+            stroke: none,
+            stroke_width: 0.0,
+            size: 20.0,
+            marker: Marker::Picture(picture),
+        });
+        let mut d = Dataset::new("rail", GeometryType::Polyline, vec![]);
+        d.push(Some(Geometry::Line(vec![vec![Coord::new(-1.0, -0.3), Coord::new(1.0, -0.3)]])), vec![]);
+        let line = m.add_dataset(d);
+        let markers =
+            LineMarkers { mark: LineMark::Marker(Marker::Picture(picture)), size: 12.0, interval: 40.0, ..LineMarkers::default() };
+        m.layer_mut(line).unwrap().line_strokes = vec![LineStroke { markers: Some(markers), ..LineStroke::default() }];
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
+        let mut record = || render_complete_recorded(&mut m, &view, &mut None).unwrap().recorded.unwrap().into_drawing().unwrap();
+        let drawing = record();
+        let cost = drawing.cost();
+        let (_, _, items) = drawing.finish();
+        fn images(items: &[vector::Item], out: &mut Vec<std::sync::Arc<vector::Pixels>>) {
+            for i in items {
+                match i {
+                    vector::Item::Image(image) if image.shared => out.push(image.pixels.clone()),
+                    vector::Item::Image(_) => panic!("a picture marker drawn as a picture of its own"),
+                    vector::Item::Group(g) => images(&g.items, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut shared = Vec::new();
+        images(&items, &mut shared);
+        assert!(shared.len() >= 6, "three points and markers along the line: {}", shared.len());
+        assert!(shared.iter().all(|p| std::sync::Arc::ptr_eq(p, &shared[0])), "one picture");
+        let once = shared[0].cost();
+        assert!(once > 50_000 && cost < 2 * once, "its pixels counted once: {cost} for {} of {once}", shared.len());
+        let pdf = pdf::write(&[pdf::Page::drawing(record(), 50.0, 50.0)], "");
+        let objects = pdf::tests::objects(&pdf);
+        let written: Vec<&String> = objects.iter().map(|o| &o.0).filter(|dict| dict.contains("/Subtype /Image")).collect();
+        assert_eq!(written.len(), 1, "the image written once: {written:?}");
+        let placed: usize = objects.iter().map(|o| String::from_utf8_lossy(&o.1).matches(" Do\n").count()).sum();
+        assert!(placed >= shared.len(), "and placed at each: {placed}");
+    }
+
+    #[test]
     fn markers_and_hash_marks_draw_along_a_line() {
         use rustgis_map::{LineMark, LineMarkers, LineStroke, Placements};
         // A line from lon -1 to 1 at 1,500 m a pixel: x 25.8 to 174.2, along y 100.
@@ -12009,6 +12680,36 @@ mod tests {
         let near = View { camera: Camera { res: 0.001, ..camera }, ..view };
         let r = render(&mut m, &near).unwrap();
         assert!((0..200).any(|x| r.pixmap.pixel(x, 100).unwrap().red() > 0), "marks show");
+    }
+
+    /// Images along a line draw whatever the stroke's colour, as a point's image does; a circle
+    /// of no colour shows nothing. Selected, each image is framed in the selection colour.
+    #[test]
+    fn image_markers_draw_along_a_line() {
+        use rustgis_map::{LineMark, LineMarkers, LineStroke, Picture};
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("rail", GeometryType::Polyline, vec![]);
+        d.push(Some(Geometry::Line(vec![vec![Coord::new(-1.0, 0.0), Coord::new(1.0, 0.0)]])), vec![]);
+        let id = m.add_dataset(d);
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
+        let marks = |mark| LineMarkers { mark: LineMark::Marker(mark), size: 20.0, interval: 40.0, ..LineMarkers::default() };
+        let none = Rgba::new(0, 0, 0, 0);
+        let drawn = |m: &mut Map, mark| {
+            m.layer_mut(id).unwrap().line_strokes =
+                vec![LineStroke { color: Some(none), width: Some(1.0), markers: Some(marks(mark)), ..Default::default() }];
+            render(m, &view).unwrap()
+        };
+        let image = |r: &Rendered| r.pixmap.pixels().iter().filter(|p| (p.red() > 200 || p.blue() > 200) && p.green() < 60).count();
+        let picture = Marker::Picture(Picture::new(&picture_png()));
+        assert!(image(&drawn(&mut m, picture)) > 200, "the image's red and blue at each mark");
+        assert_eq!(image(&drawn(&mut m, Marker::Circle)), 0, "a circle in no colour");
+        // Selected: framed in the selection colour, the image still on top.
+        m.layer_mut(id).unwrap().selection = vec![0];
+        let r = drawn(&mut m, picture);
+        let cyan = r.pixmap.pixels().iter().filter(|p| p.red() < 60 && p.green() > 200 && p.blue() > 200).count();
+        assert!(cyan > 20 && image(&r) > 200, "{cyan} framed");
     }
 
     #[test]
@@ -12156,7 +12857,7 @@ mod tests {
             };
             let s = Symbol::default_for(GeometryType::Polyline, 0);
             let mut drawn = Pixmap::new(100, 20).unwrap();
-            crate::canvas::with_canvas(&mut drawn, |c| ctx.stacked_path(c, &cut, &s, &[stroke], &starts, &[]));
+            crate::canvas::with_canvas(&mut drawn, |c| ctx.stacked_path(c, &cut, &s, &[stroke], &starts, &[], line_markers::Pass::Ink));
             let mut whole = Pixmap::new(100, 20).unwrap();
             let mut pb = PathBuilder::new();
             let (x0, y) = view.to_screen(line[0]);
@@ -12334,6 +13035,145 @@ mod tests {
         let dark = pm.pixels().iter().filter(|p| p.alpha() > 200 && p.red() < 120).count();
         assert!(dark > 30, "{dark} text pixels");
         assert_eq!(label_boxes(curved).0.len(), 10);
+    }
+
+    /// Fitted to its line (#2265): a name too long for a short line is abbreviated, one too long
+    /// even then is left out, and on a line half zigzag, half straight, a long name goes on the
+    /// straight half; off, each is placed as before.
+    #[test]
+    fn a_fitted_river_name_is_abbreviated_or_set_on_the_straightest_stretch() {
+        let face = text::Face { bold: false, italic: false, serif: false, family: None };
+        let width = |t: &str| t.graphemes(true).map(|c| text::measure_in(c, 12.0, face)).sum::<f32>();
+        // 1° of longitude is about 74 points at this scale; a line between the full name's length
+        // and its abbreviation's, less the overrun (the text's size) at each end.
+        let degrees = |points: f32| points / (111_320.0 / 1500.0);
+        let short_line = degrees((width("Ribeirão das Pedras") + width("Rib. das Pedras")) / 2.0 - 24.0);
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("rivers", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        let level = |y: f64, len: f32| Geometry::Line(vec![vec![Coord::new(-1.0, y), Coord::new(-1.0 + f64::from(len), y)]]);
+        d.push(Some(level(1.0, short_line)), vec![Value::Text("Ribeirão das Pedras".into())]);
+        d.push(Some(level(0.5, degrees(20.0))), vec![Value::Text("Córrego Fundo".into())]);
+        // A zigzag from -1.5° to 0°, then straight to 1.5°.
+        let mut bent: Vec<Coord> =
+            (0..=15).map(|i| Coord::new(-1.5 + f64::from(i) * 0.1, -1.0 + if i % 2 == 1 { 0.08 } else { 0.0 })).collect();
+        bent.push(Coord::new(1.5, -1.0));
+        d.push(Some(Geometry::Line(vec![bent])), vec![Value::Text("Rio Doce do Norte".into())]);
+        let id = m.add_dataset(d);
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 400.0, height: 400.0, pixels_per_point: 1.0, camera, sky: false };
+        let l = m.layer_mut(id).unwrap();
+        l.labels.enabled = true;
+        l.labels.default.field = "name".into();
+        l.labels.default.size = 12.0;
+        l.labels.default.placement = rustgis_map::LabelPlacement::Curved;
+        let r = render(&mut m, &view).unwrap();
+        assert!(r.labels.iter().all(|l| !l.text.starts_with("Rib")), "off: too long for its line");
+        m.layer_mut(id).unwrap().labels.default.fit = rustgis_map::symbology::LabelFit::Auto;
+        let r = render(&mut m, &view).unwrap();
+        let texts: Vec<&str> = r.labels.iter().map(|l| l.text.as_str()).collect();
+        assert!(texts.contains(&"Rib. das Pedras"), "{texts:?}");
+        let short = r.labels.iter().find(|l| l.text == "Rib. das Pedras").unwrap();
+        assert_eq!(short.glyphs.iter().map(|g| g.text.as_str()).collect::<String>(), "Rib. das Pedras");
+        assert!(texts.iter().all(|t| !t.starts_with("Cór")), "too short even abbreviated: {texts:?}");
+        let doce = r.labels.iter().find(|l| l.text == "Rio Doce do Norte").expect("placed");
+        assert!(doce.x > 220.0, "on the straight half: {}", doce.x);
+        // A class's own word list goes first.
+        m.layer_mut(id).unwrap().labels.default.abbreviations = [("Ribeirão".to_owned(), "Rb.".to_owned())].into();
+        let r = render(&mut m, &view).unwrap();
+        assert!(r.labels.iter().any(|l| l.text == "Rb. das Pedras"));
+    }
+
+    /// With a repeat, a fitted label's text is chosen where the repeats go: a name that fits only
+    /// on the line's straight arms, away from its middle, is abbreviated to fit there (#2265).
+    #[test]
+    fn a_fitted_label_with_a_repeat_is_abbreviated_where_it_repeats() {
+        let degrees = |points: f64| points / (111_320.0 / 1500.0);
+        let (arm, rise) = (degrees(200.0), degrees(40.0));
+        // Two level arms 200 points long, joined by a rise of 40 points: its middle on the rise.
+        let steps = vec![Coord::new(-arm, 0.0), Coord::new(0.0, 0.0), Coord::new(0.0, rise), Coord::new(arm, rise)];
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("rivers", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        d.push(Some(Geometry::Line(vec![steps])), vec![Value::Text("Ribeirão".into())]);
+        let id = m.add_dataset(d);
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, rise / 2.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: 600.0, height: 400.0, pixels_per_point: 1.0, camera, sky: false };
+        let l = m.layer_mut(id).unwrap();
+        l.labels.enabled = true;
+        l.labels.default.field = "name".into();
+        l.labels.default.size = 12.0;
+        l.labels.default.placement = rustgis_map::LabelPlacement::Curved;
+        l.labels.default.abbreviations = [("Ribeirão".to_owned(), "R.".to_owned())].into();
+        l.labels.default.fit = rustgis_map::symbology::LabelFit::Auto;
+        let texts = |m: &mut Map| render(m, &view).unwrap().labels.into_iter().map(|l| l.text).collect::<Vec<_>>();
+        assert_eq!(texts(&mut m), ["Ribeirão"], "without a repeat, on an arm");
+        m.layer_mut(id).unwrap().labels.default.repeat = Some(10_000.0);
+        assert_eq!(texts(&mut m), ["R."], "repeated from its middle, on the rise");
+    }
+
+    /// Fitted to a line with room to spare (#2265): a name is spread over `stretch` of it (0.6 by
+    /// default), its letters at most three widths apart; on a much longer line with a repeat, spread at its middle and close-set at the
+    /// repeats clear of it; off, close-set.
+    #[test]
+    fn a_fitted_name_is_spread_along_a_long_line_and_repeated_close_set() {
+        let face = text::Face { bold: false, italic: false, serif: false, family: None };
+        let advances = |t: &str| t.graphemes(true).map(|c| text::measure_in(c, 12.0, face)).collect::<Vec<f32>>();
+        // How far a label's first character's centre is from its last's.
+        let span = |l: &PlacedLabel| l.glyphs.last().map_or(0.0, |g| g.dx) - l.glyphs.first().map_or(0.0, |g| g.dx);
+        let ends = |t: &str| advances(t).first().unwrap() / 2.0 + advances(t).last().unwrap() / 2.0;
+        let degrees = |points: f32| f64::from(points) / (111_320.0 / 1500.0);
+        let name = "Ribeirão Santo Antônio";
+        let room = 6.5 * line_labels::curved_len(&advances(name), 0.0);
+        let mut m = Map::new("Map");
+        m.basemap = rustgis_map::Basemap::Blank;
+        let mut d = Dataset::new("rivers", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        let level = |y: f64, len: f32| Geometry::Line(vec![vec![Coord::new(-degrees(len) / 2.0, y), Coord::new(degrees(len) / 2.0, y)]]);
+        d.push(Some(level(0.5, room)), vec![Value::Text(name.into())]);
+        d.push(Some(level(-0.5, 1200.0)), vec![Value::Text("Rio Doce".into())]);
+        let id = m.add_dataset(d);
+        let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = View { width: f64::from(room.max(1200.0) + 100.0), height: 300.0, pixels_per_point: 1.0, camera, sky: false };
+        let l = m.layer_mut(id).unwrap();
+        l.labels.enabled = true;
+        l.labels.default.field = "name".into();
+        l.labels.default.size = 12.0;
+        l.labels.default.placement = rustgis_map::LabelPlacement::Curved;
+        let r = render(&mut m, &view).unwrap();
+        let close = r.labels.iter().find(|l| l.text == name).expect("placed");
+        assert!((span(close) - (line_labels::curved_len(&advances(name), 0.0) - ends(name))).abs() < 1.0, "off: close-set");
+        m.layer_mut(id).unwrap().labels.default.fit = rustgis_map::symbology::LabelFit::Auto;
+        let r = render(&mut m, &view).unwrap();
+        let spread = r.labels.iter().find(|l| l.text == name).expect("placed");
+        // 60 % of the line, or as far as letters three widths apart reach.
+        let a = advances(name);
+        let widest = line_labels::curved_len(&a, 3.0 * a.iter().sum::<f32>() / a.len() as f32);
+        assert!((span(spread) - ((0.6 * room).min(widest) - ends(name))).abs() < 2.0, "{} of {room}", span(spread));
+        m.layer_mut(id).unwrap().labels.default.stretch = Some(0.3);
+        let r = render(&mut m, &view).unwrap();
+        let spread = r.labels.iter().find(|l| l.text == name).expect("placed");
+        assert!((span(spread) - (0.3 * room - ends(name))).abs() < 2.0, "{} of {room}", span(spread));
+        // 300 points between repeats: one spread at the middle, two close-set either side.
+        m.layer_mut(id).unwrap().labels.default.repeat = Some(300.0);
+        let r = render(&mut m, &view).unwrap();
+        let doce: Vec<&PlacedLabel> = r.labels.iter().filter(|l| l.text == "Rio Doce").collect();
+        let close = line_labels::curved_len(&advances("Rio Doce"), 0.0) - ends("Rio Doce");
+        assert_eq!(doce.len(), 3);
+        let (wide, narrow): (Vec<&PlacedLabel>, Vec<&PlacedLabel>) = doce.into_iter().partition(|l| span(l) > 2.0 * close);
+        assert_eq!(wide.len(), 1);
+        let mid = view.width as f32 / 2.0;
+        assert!((wide[0].x - mid).abs() < 1.0, "spread at the middle: {}", wide[0].x);
+        assert!(narrow.iter().all(|l| (span(l) - close).abs() < 1.0 && (l.x - mid).abs() > 390.0));
+        // At 0.6 the name's line is too short for two spread names: it keeps its repeats,
+        // close-set as without `fit`.
+        m.layer_mut(id).unwrap().labels.default.stretch = None;
+        let r = render(&mut m, &view).unwrap();
+        let fitted: Vec<&PlacedLabel> = r.labels.iter().filter(|l| l.text == name).collect();
+        let full = line_labels::curved_len(&advances(name), 0.0) - ends(name);
+        assert!(fitted.len() > 1 && fitted.iter().all(|l| (span(l) - full).abs() < 1.0), "{} labels", fitted.len());
+        m.layer_mut(id).unwrap().labels.default.fit = rustgis_map::symbology::LabelFit::Off;
+        let r = render(&mut m, &view).unwrap();
+        assert_eq!(r.labels.iter().filter(|l| l.text == name).count(), fitted.len());
     }
 
     #[test]

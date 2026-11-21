@@ -38,21 +38,27 @@ fn home(temp: &Temp) -> Session {
 /// Opens the package on a "phone": unpacked into a folder of its own, as `project.open` does.
 fn phone(temp: &Temp, bytes: &[u8], name: &str) -> Session {
     let dir = temp.0.join(name);
-    let text = unpack_into(bytes, &dir).unwrap();
+    let (text, _) = unpack_into(bytes, &dir).unwrap();
     let mut s = Session::new(project_in(&text, &dir).unwrap());
     s.opened_package = Some(temp.0.join(format!("{name}.rgisfield")));
     s
 }
 
-/// Sends the phone's map back and brings it back at home, returning the result and notices.
-fn bring_back(temp: &Temp, field: &mut Session, home: &mut Session, name: &str) -> (Value, Vec<String>) {
+/// Sends the phone's map back and tries to bring it back at home: the result and the notices.
+fn try_bring_back(temp: &Temp, field: &mut Session, home: &mut Session, name: &str) -> (Result<Value, String>, Vec<String>) {
     let (_, back) = package(field, &Value::Null).unwrap();
     let path = temp.0.join(format!("{name}-back.rgisfield"));
     std::fs::write(&path, &back).unwrap();
     let mark = home.notice_mark();
-    let done = home.run("offline.bringBack", &json!({"path": path.display().to_string()})).unwrap();
+    let done = home.run("offline.bringBack", &json!({"path": path.display().to_string()}));
     let said = home.notices_since(mark).iter().map(|n| n.text.clone()).collect();
     (done, said)
+}
+
+/// [`try_bring_back`] for a return that is accepted.
+fn bring_back(temp: &Temp, field: &mut Session, home: &mut Session, name: &str) -> (Value, Vec<String>) {
+    let (done, said) = try_bring_back(temp, field, home, name);
+    (done.unwrap(), said)
 }
 
 fn layer(s: &Session, name: &str) -> u32 {
@@ -87,123 +93,234 @@ fn with_label(s: &Session, id: u32, field: &str, label: &str) -> usize {
 
 const AREA: [f64; 4] = [-20.0, -40.0, 60.0, 40.0];
 
-/// One package, copied to two phones (emailed to a crew, AirDropped to a second device).
-/// Phone A fixes a city's name; phone B never touches it. B is brought back after A.
+/// A map imported from another project under an offline title is renamed, so an area of the
+/// same name here doesn't take it for its offline copy (and sync it as the area's edits).
 #[test]
-#[ignore = "repro of a known field-sync bug (mobile offline audit); run with --ignored"]
-fn audit_second_phone_with_same_package_reverts_first_phones_edit() {
-    let temp = Temp::new("two-phones-edit");
+fn an_imported_offline_titled_map_is_not_taken_for_an_area_copy() {
+    let temp = Temp::new("import-offline-title");
     let mut home = home(&temp);
+    package(&mut home, &json!({"name": "Crew", "extent": AREA})).unwrap();
+    let maps = home.project.maps.len();
+    let mut other = crate::Project::default();
+    // Another project's offline copy, saved before maps carried their area's ID.
+    other.maps[0].name = "Crew (offline)".into();
+    home.run("map.import", &json!({"text": serde_json::to_string(&other).unwrap()})).unwrap();
+    assert!(home.project.maps.iter().any(|m| m.name == "Crew (imported)" && m.offline_area_id.is_none()));
+    assert!(home.notices.iter().any(|n| n.text.contains("renamed")), "{:?}", home.notices);
+    home.run("offline.open", &json!({"name": "Crew"})).unwrap();
+    assert_eq!(home.map().name, "Crew (offline)");
+    assert_eq!(home.project.maps.len(), maps + 2);
+}
+
+/// A map imported with its area's ID loses it, and says so; an ordinary map imports with neither
+/// notice.
+#[test]
+fn importing_maps_says_when_an_area_association_is_dropped() {
+    let temp = Temp::new("import-detach");
+    let mut home = home(&temp);
+    package(&mut home, &json!({"name": "Crew", "extent": AREA})).unwrap();
+    home.run("offline.open", &json!({"name": "Crew"})).unwrap();
+    let path = temp.0.join("with-area.rgis");
+    home.run("project.save", &json!({"path": path})).unwrap();
+
+    let mut other = Session::new(crate::Project::default());
+    let mark = other.notice_mark();
+    other.run("map.import", &json!({"path": path})).unwrap();
+    let texts: Vec<_> = other.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(texts.iter().any(|t| t.starts_with("1 imported map(s) were detached")), "{texts:?}");
+    assert!(other.project.maps.iter().all(|m| m.offline_area_id.is_none()));
+
+    let mark = other.notice_mark();
+    other.run("map.import", &json!({"text": serde_json::to_string(&crate::Project::default()).unwrap()})).unwrap();
+    let texts: Vec<_> = other.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+    assert!(!texts.iter().any(|t| t.contains("detached") || t.contains("renamed")), "{texts:?}");
+}
+
+/// Removing an area whose copy is the only map keeps the map but not its association, so the
+/// project still saves and reopens.
+#[test]
+fn removing_an_area_clears_the_association_of_the_copy_it_keeps() {
+    let temp = Temp::new("remove-only-copy");
+    let mut home = home(&temp);
+    package(&mut home, &json!({"name": "Crew", "extent": AREA})).unwrap();
+    home.run("offline.open", &json!({"name": "Crew"})).unwrap();
+    home.project.maps.retain(|m| m.offline_area_id.is_some());
+    home.project.active_map = 0;
+    home.run("offline.remove", &json!({"name": "Crew"})).unwrap();
+    assert_eq!(home.project.maps.len(), 1);
+    assert!(home.project.maps[0].offline_area_id.is_none());
+    // Nor does its title still name the area's copy.
+    assert_eq!(home.project.maps[0].name, "Crew (kept)");
+    assert!(home.notices.iter().any(|n| n.text.contains("kept as 'Crew (kept)'")), "{:?}", home.notices);
+    let path = temp.0.join("removed.rgis");
+    home.run("project.save", &json!({"path": path})).unwrap();
+    home.run("project.open", &json!({"path": path})).unwrap();
+}
+
+/// A legacy home tab gains its association on rename, so callers still find it after save and reopen.
+#[test]
+fn bring_back_refreshes_a_renamed_home_offline_map() {
+    let temp = Temp::new("rename-home-offline");
+    let mut home = home(&temp);
+    let source = home.map().name.clone();
+    let (_, out) = package(&mut home, &json!({"name": "Crew", "extent": AREA})).unwrap();
+    home.run("offline.open", &json!({"name": "Crew"})).unwrap();
+    // A home project saved before maps carried their area ID.
+    home.map_mut().offline_area_id = None;
+    home.run("map.rename", &json!({"name": "Renamed at home"})).unwrap();
+    let path = temp.0.join("home.rgis");
+    home.run("project.save", &json!({"path": path})).unwrap();
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(saved["requires"].as_array().unwrap().contains(&json!("offline-map-area-id")));
+    home.run("project.open", &json!({"path": path})).unwrap();
+    assert_eq!(home.map().name, "Renamed at home");
+
+    let mut field = phone(&temp, &out, "phone");
+    let cities = layer(&field, "Cities");
+    let name = text_field(&field, cities);
+    let count = |s: &Session, label| with_label(s, layer(s, "Cities"), &name, label);
+    add_point(&mut field, cities, &name, "Captured after rename", [10.0, 5.0]);
+    let (done, _) = bring_back(&temp, &mut field, &mut home, "phone");
+    assert_eq!(done["area"], "Crew");
+    assert_eq!(done["added"], 1);
+    assert_eq!(count(&home, "Captured after rename"), 1);
+
+    home.run("map.activate", &json!({"name": source})).unwrap();
+    assert_eq!(count(&home, "Captured after rename"), 1);
+    home.run("offline.open", &json!({"name": "Crew"})).unwrap();
+    assert_eq!(home.map().name, "Renamed at home");
+    assert_eq!(home.project.maps.len(), 2);
+
+    // Reusing the old title for another map must not redirect Sync, Package or Remove.
+    home.run("map.new", &json!({"name": "Crew (offline)"})).unwrap();
+    home.run("offline.open", &json!({"name": "Crew"})).unwrap();
+    assert_eq!(home.map().name, "Renamed at home");
+    add_point(&mut home, cities, &name, "Edited at home", [11.0, 5.0]);
+    let (area, bytes) = package(&mut home, &Value::Null).unwrap();
+    assert_eq!(area, "Crew");
+    assert_eq!(home.project.offline_areas.len(), 1);
+    let repacked = phone(&temp, &bytes, "repacked");
+    assert_eq!(repacked.map().name, "Crew (offline)");
+    assert_eq!(count(&repacked, "Edited at home"), 1);
+    assert_eq!(repacked.project.field_origin.as_ref().unwrap().area, home.project.offline_areas[0].id);
+
+    home.run("offline.sync", &json!({"name": "Crew"})).unwrap();
+    home.run("map.activate", &json!({"name": source})).unwrap();
+    assert_eq!(count(&home, "Edited at home"), 1);
+    home.run("offline.remove", &json!({"name": "Crew"})).unwrap();
+    assert!(home.project.maps.iter().all(|map| map.name != "Renamed at home"));
+    assert!(home.project.maps.iter().any(|map| map.name == "Crew (offline)"));
+}
+
+/// One package, copied to two phones (emailed to a crew, AirDropped to a second device). Each fixes
+/// a city and captures a point. A is brought back first. B's copy is of a state the area has left:
+/// bringing it back would undo A's fix and delete A's point (B's copy lacks it), so it is refused
+/// and nothing of B's comes home. A new package from the area's offline map is how B's work goes
+/// on: its edits are redone on it and come back, beside A's.
+#[test]
+fn a_second_phone_with_the_same_package_is_refused_and_the_first_phones_work_stays() {
+    let temp = Temp::new("two-phones");
+    let mut home = home(&temp);
+    let source = home.map().name.clone();
     let (_, out) = package(&mut home, &json!({"name": "Crew", "extent": AREA})).unwrap();
     let mut a = phone(&temp, &out, "a");
     let mut b = phone(&temp, &out, "b");
     let cities = layer(&a, "Cities");
     let name = text_field(&a, cities);
     let fixed = a.map().layer(cities).unwrap().dataset.features[0].id;
+    let other = a.map().layer(cities).unwrap().dataset.features[1].id;
     a.run("edit.setValue", &json!({"layer": cities, "row": 0, "field": name, "value": "Fixed by A"})).unwrap();
-    // B edits a different city.
-    b.run("edit.setValue", &json!({"layer": cities, "row": 1, "field": name, "value": "Fixed by B"})).unwrap();
-    bring_back(&temp, &mut a, &mut home, "a");
-    let hc = layer(&home, "Cities");
-    assert_eq!(value_of(&home, hc, fixed, &name).as_deref(), Some("Fixed by A"));
-    let (done, said) = bring_back(&temp, &mut b, &mut home, "b");
-    eprintln!("B: {done}\nnotices: {said:#?}");
-    assert_eq!(
-        value_of(&home, hc, fixed, &name).as_deref(),
-        Some("Fixed by A"),
-        "A's edit was reverted by B's untouched copy; notices: {said:?}"
-    );
-}
-
-/// The same two phones each capture a new point. A is brought back, then B.
-#[test]
-#[ignore = "repro of a known field-sync bug (mobile offline audit); run with --ignored"]
-fn audit_second_phone_with_same_package_loses_first_phones_new_features() {
-    let temp = Temp::new("two-phones-add");
-    let mut home = home(&temp);
-    let (_, out) = package(&mut home, &json!({"name": "Crew", "extent": AREA})).unwrap();
-    let mut a = phone(&temp, &out, "a");
-    let mut b = phone(&temp, &out, "b");
-    let cities = layer(&a, "Cities");
-    let name = text_field(&a, cities);
-    let ida = add_point(&mut a, cities, &name, "Well from A", [10.0, 5.0]);
-    let idb = add_point(&mut b, cities, &name, "Well from B", [11.0, 6.0]);
-    eprintln!("phone ids: A {ida}, B {idb}");
-    bring_back(&temp, &mut a, &mut home, "a");
-    let hc = layer(&home, "Cities");
-    let (done, said) = bring_back(&temp, &mut b, &mut home, "b");
-    eprintln!("B: {done}\nnotices: {said:#?}");
-    let a_kept = with_label(&home, hc, &name, "Well from A");
-    let b_kept = with_label(&home, hc, &name, "Well from B");
-    assert_eq!((a_kept, b_kept), (1, 1), "both crews' new wells should be at home; notices: {said:?}");
-}
-
-/// Phone B captures nothing new at all; it only brings back after A did.
-#[test]
-#[ignore = "repro of a known field-sync bug (mobile offline audit); run with --ignored"]
-fn audit_idle_second_phone_deletes_first_phones_new_features() {
-    let temp = Temp::new("two-phones-idle");
-    let mut home = home(&temp);
-    let (_, out) = package(&mut home, &json!({"name": "Crew", "extent": AREA})).unwrap();
-    let mut a = phone(&temp, &out, "a");
-    let mut b = phone(&temp, &out, "b");
-    let cities = layer(&a, "Cities");
-    let name = text_field(&a, cities);
     add_point(&mut a, cities, &name, "Well from A", [10.0, 5.0]);
-    let row1 = 1;
-    b.run("edit.setValue", &json!({"layer": cities, "row": row1, "field": name, "value": "Touched by B"})).unwrap();
+    b.run("edit.setValue", &json!({"layer": cities, "row": 1, "field": name, "value": "Fixed by B"})).unwrap();
+    add_point(&mut b, cities, &name, "Well from B", [11.0, 6.0]);
     bring_back(&temp, &mut a, &mut home, "a");
     let hc = layer(&home, "Cities");
-    let (done, said) = bring_back(&temp, &mut b, &mut home, "b");
-    eprintln!("B: {done}\nnotices: {said:#?}");
-    assert_eq!(with_label(&home, hc, &name, "Well from A"), 1, "A's new well was deleted by B; notices: {said:?}");
+    let at_home = count(&home, hc);
+
+    let (refused, said) = try_bring_back(&temp, &mut b, &mut home, "b");
+    let error = refused.unwrap_err();
+    assert!(error.contains("out of date") && error.contains("Crew"), "{error}");
+    assert!(said.iter().all(|t| !t.contains("Brought the field's edits back")), "{said:?}");
+    assert_eq!(value_of(&home, hc, fixed, &name).as_deref(), Some("Fixed by A"));
+    assert_ne!(value_of(&home, hc, other, &name).as_deref(), Some("Fixed by B"));
+    assert_eq!((with_label(&home, hc, &name, "Well from A"), with_label(&home, hc, &name, "Well from B")), (1, 0));
+    assert_eq!(count(&home, hc), at_home);
+
+    // B's work, redone on a package of the area as it is now, comes back beside A's.
+    home.run("offline.open", &json!({"name": "Crew"})).unwrap();
+    let (_, again) = package(&mut home, &Value::Null).unwrap();
+    home.run("map.activate", &json!({"name": source})).unwrap();
+    let mut b2 = phone(&temp, &again, "b2");
+    b2.run("edit.setValue", &json!({"layer": cities, "row": 1, "field": name, "value": "Fixed by B"})).unwrap();
+    add_point(&mut b2, cities, &name, "Well from B", [11.0, 6.0]);
+    bring_back(&temp, &mut b2, &mut home, "b2");
+    assert_eq!(value_of(&home, hc, fixed, &name).as_deref(), Some("Fixed by A"));
+    assert_eq!(value_of(&home, hc, other, &name).as_deref(), Some("Fixed by B"));
+    assert_eq!((with_label(&home, hc, &name, "Well from A"), with_label(&home, hc, &name, "Well from B")), (1, 1));
 }
 
-/// One phone, two trips: the crew brings back at lunch, keeps working on the same phone, brings
-/// back again at the end of the day. In the morning they captured a point past the packaged extent.
+/// One phone, two trips with the same package: the crew brings back at lunch, keeps working, and
+/// sends the same map again in the evening. The second return would add the first's new points a
+/// second time (those it captured past the packaged extent come back as new every time, and an id
+/// taken at home is given a new one), so it is refused; every feature of the first return is at
+/// home once.
 #[test]
-#[ignore = "repro of a known field-sync bug (mobile offline audit); run with --ignored"]
-fn audit_incremental_return_duplicates_features_captured_outside_the_extent() {
-    let temp = Temp::new("outside");
+fn a_second_return_of_one_package_is_refused_and_leaves_nothing_twice() {
+    let temp = Temp::new("repeat");
     let mut home = home(&temp);
     let (_, out) = package(&mut home, &json!({"name": "Day", "extent": AREA})).unwrap();
     let mut a = phone(&temp, &out, "a");
     let cities = layer(&a, "Cities");
     let name = text_field(&a, cities);
-    // Walked a little past the edge of the area.
+    // One past the edge of the area, one inside.
     add_point(&mut a, cities, &name, "Past the edge", [65.0, 5.0]);
-    let (first, _) = bring_back(&temp, &mut a, &mut home, "lunch");
-    eprintln!("lunch: {first}");
-    // Afternoon: one more point, well inside.
-    add_point(&mut a, cities, &name, "Afternoon", [10.0, 5.0]);
-    let (second, said) = bring_back(&temp, &mut a, &mut home, "evening");
-    eprintln!("evening: {second}\nnotices: {said:#?}");
+    add_point(&mut a, cities, &name, "Inside", [10.0, 5.0]);
+    bring_back(&temp, &mut a, &mut home, "lunch");
+    add_point(&mut a, cities, &name, "Afternoon", [11.0, 5.0]);
+    let (second, said) = try_bring_back(&temp, &mut a, &mut home, "evening");
+    assert!(second.unwrap_err().contains("out of date"), "{said:?}");
     let hc = layer(&home, "Cities");
-    assert_eq!(with_label(&home, hc, &name, "Past the edge"), 1, "captured once, at home twice; notices: {said:?}");
+    let at = |label: &str| with_label(&home, hc, &name, label);
+    assert_eq!((at("Past the edge"), at("Inside"), at("Afternoon")), (1, 1, 0));
 }
 
-/// The same, for an existing feature the crew moved out of the extent (a mislocated asset corrected).
+/// Desktop Sync of the area's offline map, between packaging and the return, moves the area on as
+/// a Bring Back does: the phone's copy lacks what the office put in the map before it, so its return
+/// would undo that.
 #[test]
-#[ignore = "repro of a known field-sync bug (mobile offline audit); run with --ignored"]
-fn audit_incremental_return_duplicates_features_moved_outside_the_extent() {
-    let temp = Temp::new("moved-out");
+fn a_package_made_before_a_sync_of_its_area_is_refused() {
+    let temp = Temp::new("synced");
     let mut home = home(&temp);
     let (_, out) = package(&mut home, &json!({"name": "Day", "extent": AREA})).unwrap();
     let mut a = phone(&temp, &out, "a");
     let cities = layer(&a, "Cities");
     let name = text_field(&a, cities);
-    let moved = a.map().layer(cities).unwrap().dataset.features[0].id;
-    a.run("edit.setValue", &json!({"layer": cities, "row": 0, "field": name, "value": "Relocated"})).unwrap();
-    a.map_mut().layer_mut(cities).unwrap().dataset.features[0].geometry =
-        Some(rustgis_data::Geometry::Point(rustgis_geom::Coord { x: 70.0, y: 5.0 }));
-    a.map_mut().layer_mut(cities).unwrap().touch_geometry();
-    bring_back(&temp, &mut a, &mut home, "lunch");
-    add_point(&mut a, cities, &name, "Afternoon", [10.0, 5.0]);
-    let (second, said) = bring_back(&temp, &mut a, &mut home, "evening");
-    eprintln!("evening: {second}\nnotices: {said:#?}");
-    let hc = layer(&home, "Cities");
-    let _ = moved;
-    assert_eq!(with_label(&home, hc, &name, "Relocated"), 1, "moved once, at home twice; notices: {said:?}");
+    add_point(&mut a, cities, &name, "Captured", [10.0, 5.0]);
+    home.run("offline.sync", &json!({"name": "Day"})).unwrap();
+    let (back, _) = try_bring_back(&temp, &mut a, &mut home, "a");
+    assert!(back.unwrap_err().contains("out of date"));
+}
+
+/// A package made before packages carried a return check has none to compare: it is brought back as
+/// it was, and the notice says it can't be told from a copy of one already returned.
+#[test]
+fn a_package_without_a_return_check_comes_back_with_a_notice() {
+    let temp = Temp::new("no-check");
+    let mut home = home(&temp);
+    let (_, out) = package(&mut home, &json!({"name": "Day", "extent": AREA})).unwrap();
+    let mut a = phone(&temp, &out, "a");
+    a.project.field_origin.as_mut().unwrap().generation.clear();
+    let cities = layer(&a, "Cities");
+    let name = text_field(&a, cities);
+    add_point(&mut a, cities, &name, "Captured", [10.0, 5.0]);
+    let (done, said) = bring_back(&temp, &mut a, &mut home, "a");
+    assert_eq!(done["added"].as_u64(), Some(1), "{done}");
+    assert!(said.iter().any(|t| t.contains("return check") && t.contains("Day")), "{said:?}");
+    // A package with one comes back without it.
+    let (_, out) = package(&mut home, &json!({"name": "Clean", "extent": AREA})).unwrap();
+    let mut b = phone(&temp, &out, "b");
+    let (_, said) = bring_back(&temp, &mut b, &mut home, "b");
+    assert!(said.iter().all(|t| !t.contains("return check")), "{said:?}");
 }
 
 /// Two crews, each with their own package of overlapping areas (the documented way), edit the
@@ -329,6 +446,113 @@ fn roads(gpkg: &Path) -> i64 {
     rusqlite::Connection::open(gpkg).unwrap().query_row("SELECT count(*) FROM roads", [], |r| r.get(0)).unwrap()
 }
 
+/// A pre-origin field archive retains full-table descriptors on its clipped copies. Opening
+/// the same archive as a field or project package must disable both write-back paths.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn pre_origin_field_package_never_saves_to_its_home_tables() {
+    use rustgis_map::source::{PostgisEdit, PostgisOrigin};
+
+    let temp = Temp::new("pre-origin-extension");
+    let gpkg = roads_gpkg(&temp.0);
+    let mut home = Session::new(Project::new("Home"));
+    home.run("gpkg.addLayer", &json!({"path": gpkg, "table": "roads", "name": "R"})).unwrap();
+    let link = home.map().layers[0].gpkg.clone().unwrap();
+    // Give the fixture both edit descriptors so the test needs only one local table.
+    let postgis = PostgisEdit {
+        origin: PostgisOrigin {
+            database: "postgres:host=127.0.0.1 port=1 dbname=gis".into(),
+            table: "roads".into(),
+            family: None,
+            crs: None,
+        },
+        key: "fid".into(),
+        srid: 4326,
+        writable: true,
+        condition: None,
+        limit: 0,
+        versions: link.versions.clone(),
+    };
+    let (_, out) = package(&mut home, &json!({"name": "Site", "extent": [0.5, 19.0, 3.5, 21.0]})).unwrap();
+
+    // Model the old writer's one-map project, without an origin and with the stale links.
+    let mut legacy = phone(&temp, &out, "fixture").project;
+    legacy.field_origin = None;
+    legacy.maps[0].layers[0].gpkg = Some(link);
+    legacy.maps[0].layers[0].postgis = Some(postgis);
+    let text = serde_json::to_string(&legacy).unwrap();
+    let raw: Value = serde_json::from_str(&text).unwrap();
+    assert!(raw.get("field_origin").is_none() && raw.get("origin_id").is_none());
+    let bytes = rustgis_data::zip::write(&[
+        ("Site.rgis".into(), text.as_bytes().to_vec()),
+        ("README.txt".into(), b"Site: a RustGIS field package.\n".to_vec()),
+    ])
+    .unwrap();
+
+    let stem = temp.0.file_name().unwrap().to_str().unwrap();
+    let _unpacked = Temp(unpack_dir(stem).unwrap());
+    let field = temp.0.join(format!("{stem}.rgisfield"));
+    let renamed = field.with_extension("rgispkg");
+    std::fs::write(&field, &bytes).unwrap();
+    std::fs::write(&renamed, &bytes).unwrap();
+    let check = |command, params: Value| {
+        let mut opened = Session::new(Project::default());
+        let mark = opened.notice_mark();
+        opened.run(command, &params).unwrap();
+        let layer = &opened.map().layers[0];
+        assert_eq!(layer.dataset.features.len(), 3);
+        assert!(layer.gpkg.is_none());
+        assert!(layer.postgis.is_none());
+        let notices: Vec<_> = opened
+            .notices_since(mark)
+            .iter()
+            .filter(|notice| notice.text.contains("doesn't save to the table"))
+            .map(|notice| notice.text.clone())
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("1 layer(s) of this field project"));
+        for (cmd, provider) in [("gpkg.saveEdits", "GeoPackage"), ("pg.saveEdits", "PostGIS")] {
+            let error = opened.run(cmd, &json!({"layer": "R"})).unwrap_err();
+            assert!(error.contains(&format!("not a {provider} layer loaded for editing")), "{error}");
+        }
+        assert_eq!(roads(&gpkg), 10);
+        notices
+    };
+    let expected = check("project.open", json!({"path": field}));
+    assert_eq!(check("project.open", json!({"path": renamed})), expected);
+    let text = crate::cmd::items::package_text(&bytes).unwrap();
+    assert_eq!(check("project.openText", json!({"text": text, "package": true})), expected);
+}
+
+/// A full table stays editable from both a saved project and an ordinary project package,
+/// even when its map's name ends in the same suffix as a field map.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn ordinary_projects_and_packages_keep_full_table_edit_links() {
+    let temp = Temp::new("full-table");
+    let gpkg = roads_gpkg(&temp.0);
+    let mut home = Session::new(Project::new("Home"));
+    home.map_mut().name = "Home (offline)".into();
+    home.run("gpkg.addLayer", &json!({"path": gpkg, "table": "roads", "name": "R"})).unwrap();
+    let project = temp.0.join("Home.rgis");
+    home.run("project.saveAs", &json!({"path": project})).unwrap();
+    // An offline suffix alone is not the signature of a field package.
+    home.project.name = "Survey".into();
+    let package = temp.0.join("Survey.rgispkg");
+    home.run("project.package", &json!({"path": package})).unwrap();
+
+    for path in [project, package] {
+        let mut opened = Session::new(Project::default());
+        let mark = opened.notice_mark();
+        opened.run("project.open", &json!({"path": path})).unwrap();
+        let layer = &opened.map().layers[0];
+        assert_eq!(layer.dataset.features.len(), 10);
+        let link = layer.gpkg.as_ref().unwrap();
+        assert!(link.versions.changes(&layer.dataset.features).is_empty());
+        assert!(!opened.notices_since(mark).iter().any(|notice| notice.text.contains("doesn't save to the table")));
+    }
+}
+
 /// A GeoPackage layer loaded for editing goes to the field. Its copy holds only the roads in the
 /// area: it mustn't save to the table, where the roads it lacks would be deleted. Its edits come
 /// back by Bring Back, and the table is saved from the home map, whole.
@@ -419,8 +643,11 @@ fn a_field_project_saved_with_a_table_link_opens_without_it() {
     let gpkg = roads_gpkg(&temp.0);
     let mut s = Session::new(crate::project::Project::default());
     s.run("gpkg.addLayer", &json!({"path": gpkg, "table": "roads", "name": "R"})).unwrap();
-    s.project.field_origin =
-        Some(crate::project::FieldOrigin { project: crate::project::field_id().unwrap(), area: crate::project::field_id().unwrap() });
+    s.project.field_origin = Some(crate::project::FieldOrigin {
+        project: crate::project::field_id().unwrap(),
+        area: crate::project::field_id().unwrap(),
+        generation: String::new(),
+    });
     let path = temp.0.join("field.rgis");
     s.project.save(&path).unwrap();
     let mut opened = Session::new(crate::project::Project::default());

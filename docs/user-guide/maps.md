@@ -132,6 +132,34 @@ features (not one read a view at a time), with a name of its own; it follows the
 and when it is removed, or a project opens without it, the walls are `color` (said) until a
 polygon layer of that name comes back. A plain `"walls": "#RRGGBB"` takes the layer off.
 
+`"shape": "circle"` cuts a round block: the largest circle inside the box (the DEM's extent or
+`"extent"`), centred in it, or a smaller one with `"radius"` (map units; one larger than the
+box's circle takes the box's). It reads the same at any bearing, which suits a figure that
+turns or an orbit. Only the ground inside the circle is drawn and sets the base, and the wall
+runs round its near half, with everything a box's walls have: colour, a walls layer's units and
+their patterns (which run on round the wall), light and fog. `"shape": "box"` (the default)
+takes it back to the box.
+
+With water on the terrain (below), `"block": {"water": {"depth": 12}}` shows it in the walls'
+section: where the block's edge (a round block's circle too) runs inside a water polygon (the first in the layer's rows where
+they overlap, among the features its definition query keeps), the wall shows a band of water from
+the water's level down to its floor, over the walls' colours, in the water layer's solid fill (the
+topmost of its fill layers; one partly transparent laid over a light blue, as a section is opaque),
+lit as the wall is and darker with depth, half as bright at the full
+depth, with a line at the level and one along the floor as dark as the shore band. A DEM holds the
+water's surface, not its bed, so the depth is given: `"depth"` in metres for every water body, or
+`"field": "prof"` names a numeric field of the water layer holding each one's depth (`"depth"` then
+serves the rows with no value, empty or 0). Both are stretched by the exaggeration, and the floor
+goes no lower than the base. The floor follows the shore: no depth at the shoreline, the full depth
+from about the shore band's width in (a few pixels at the view's centre), so the section shows a
+basin, not a cliff. A water body with no depth, or no level, shows none, and setting the block or
+the water says how many of those its definition query keeps have no value in the field. These depths
+are schematic unless they come from a field: say so in the figure's caption. `"water": false` in the
+block takes the water out of the walls (give the block whole again: a `"block"` object sets all of
+it, its extent, depth and walls too); while it is there, taking the terrain's water off, or giving
+it a layer without the depth field, is refused. Deleting the depth field keeps the water's own
+`depth` for all the water, or takes the water out of the walls when there is none, and says so.
+
 **Water** on the terrain lies flat: `map.terrain` with `{"water": {"layer": "Lakes"}}` names a
 polygon layer of water bodies, and inside each polygon the ground is level, at the lowest height
 of the DEM along its shore, instead of rising and falling with a surface model that is noisy or
@@ -184,6 +212,27 @@ answers:
 
 ```bash
 rustgis-cli run --cmd 'project.open={"path":"massif.rgis"}' --cmd 'map.setPitch={"pitch":60}' --cmd 'map.exportOrbit={"path":"massif.gif","frames":72,"width":800,"height":500}'
+```
+
+**Export Block** (`map.exportBlock`, on desktop) writes a map's block diagram as a 3D model, for
+Blender, a web viewer or a 3D printer's slicer: `{"path": "block.glb"}` gives binary glTF, one
+file; a path ending in `.gltf` gives the same model as glTF's JSON with everything embedded. The
+model has three meshes: **Ground**, the ground inside the block's box on the grid the settled view
+lays it on, with the map drawn top down over the box as its texture (its layers, symbology and
+labels, without the scale bar or the credits, at `"texture"` pixels on the box's longer side,
+default 4096, 256 to 8192); **Walls**, the box's four sides from the ground's edge down to the
+base, in the walls' colour; and **Base**, flat at the block's base. The texture holds no light:
+the 3D viewer lights the model, so a hillshade layer shown on the map is the one light baked in.
+Units are metres east (x), up (y) and south (z) of the box's south-west corner, scaled as at the
+box's centre, with heights above sea level times the exaggeration; the file's `extras` give the
+corner's longitude and latitude. The view's sky, fog and shadows aren't in the model, and walls
+coloured by a polygon layer come in their plain colour for now (said). In the desktop app it
+runs in the background, with the export and **Cancel** in the status bar (elevation tiles are
+waited for, up to a minute); from a script or the command line it runs to its end before it
+answers:
+
+```bash
+rustgis-cli run --cmd 'project.open={"path":"massif.rgis"}' --cmd 'map.exportBlock={"path":"massif.glb","texture":4096}'
 ```
 
 MapLibre map links carry a view in their address, as
@@ -268,6 +317,27 @@ itself is UTM. On the map of another body than the Earth the readout shows *No U
 `ui.coordinateFormat={"format":"utm"}` (`decimal`, `dms`, `utm` or `mgrs`); without `format`
 it steps to the next one. A saved format this version doesn't know, say from a newer RustGIS,
 reads as decimal degrees with a notice, and stays saved until you pick a format.
+
+`map.convertPosition` gives a place in all of these forms at once, without moving the map, for
+scripts, Python and the AI Assistant. It takes the place as `map.goToXY` does: `lon` and `lat`
+(numbers, or degrees, minutes and seconds), or a `position` written in any form the search box
+reads, and says what it assumed the same way. It answers with `lon` and `lat`, `decimal` and
+`dms` as the readout writes them, `grid` (`utm`, or `ups` in the polar areas), the reference in
+`utm` or `ups` (whichever `grid` names; the other is `null`), the UTM `zone` and latitude `band`
+(`null` in UPS), `hemisphere`, `easting` and `northing` in meters, and `mgrs` spaced as the
+readout writes it and `mgrsCompact` in one word. `digits` (0 to 5, 5 by default) sets the MGRS
+precision, from 100 km to 1 m. As in the readouts, the `utm` and `ups` text round to the meter
+while MGRS truncates, so the two can differ by a meter; `easting` and `northing` give the place
+to the millimeter (truncated). Every key is always there, `null` where it has no value; on
+another body's map the grids are `null`, and `note` says why.
+
+```
+rustgis-cli run --cmd 'map.convertPosition={"position":"18TWL8395907350"}'
+```
+
+```python
+s.run("map.convertPosition", {"lon": -74.006, "lat": 40.7128})["utm"]  # '18north 583959 4507351'
+```
 
 The [search box](#navigating) takes the same grid references, in any case (polar references have
 their own rules, below):
@@ -358,7 +428,11 @@ place names there. On the desktop, its optional `url` selects another Valhalla s
 </figure>
 
 **Home › Add › Basemap** offers five built-in basemaps drawn from a world outline (Paper, Midnight,
-Ocean, Atlas, Blank), which need no network, and web tile layers over them:
+Ocean, Atlas, Blank), which need no network, and web tile layers over them. On Blank, **Paper
+color** under the basemaps sets the colour the map draws where it would draw white, a tilted view's
+sky included, so a map frame sits on a coloured layout page without a white box around it
+(`map.basemap {"name": "blank", "color": "#F1EADF"}`). Choosing another basemap takes the paper
+colour off, as that basemap draws its own colours:
 
 - **Raster tiles** from an XYZ or TMS template (`https://…/{z}/{x}/{y}.png`; `{-y}` for rows
   from the south, `{s}` for subdomains, `{q}` for Bing-style quadkeys) or a WMS through
@@ -465,7 +539,9 @@ A blend mode (Multiply, Screen, Overlay, Darken, Lighten, Difference) combines a
 what is drawn beneath it (tile layers, the basemap, and map layers when it's placed over them): stack imagery over a hillshade and set it to Multiply to
 let the terrain show through. Overlays stay over the basemaps; choosing a built-in basemap
 removes the web basemaps but keeps the overlays. Tile layers are saved with the project, and
-their credits are shown in the corner of the map and drawn on exports.
+their credits are shown in the corner of the map and drawn on exports. A layer's own credit
+(`attribution`) stands in place of its tiles' (a TileJSON's or an archive's), which show when it
+names none; a MapLibre style keeps its sources' credits beside it.
 
 Use Explore to click features in vector PMTiles, MBTiles or MVT layers added as data and see
 their source-layer names and attributes in a pop-up. This works with **Topmost Layer** or
@@ -640,11 +716,36 @@ System** dialog, which also takes a projected EPSG code (such as `3035`, `32633`
 33N or `2056` for Switzerland) or an ESRI code, the one `.prj` files and ArcGIS name (such as
 `ESRI:102033` for South America Albers Equal Area Conic, or `ESRI:54030` for World Robinson). A
 code whose projection method RustGIS can't compute is refused with the reason, rather than drawn
-in another projection. Projections and datum transformations are computed by
-[terrio-crs](https://github.com/opengeos/terrio), as PROJ 9.8 computes them. Datum shift grids
-aren't used yet, neither those installed for PROJ nor downloaded: a datum whose most accurate
-transformation needs one takes the next PROJ lists (a NAD27 code: NAD27 to WGS 84 (4), about
-10 m), and says so once.
+in another projection. The codes are those of the EPSG registry v13.102 and PROJ 9.9.0's ESRI
+codes, so a system added to EPSG recently (such as `11476`, SIRGAS-Chile 2025 / UTM zone 19S) is
+there too. Projections and datum transformations are computed by
+[terrio-crs](https://github.com/opengeos/terrio), as PROJ 9.9.0 computes them. On the desktop, the
+command line, Python and the phone apps, datum shift grids are read from RustGIS's own grid folder
+(`datum-grids` in its app data), then from those PROJ and terrio use on the computer
+(`TERRIO_GRID_DIR`, `PROJ_DATA`, `PROJ_LIB`, PROJ's user folder, terrio's download cache), so grids
+installed for PROJ count; a grid a definition names by its path is never read. A datum whose most
+accurate transformation needs a grid that isn't there takes the next PROJ lists (a NAD27 code
+without `us_noaa_conus.tif`: up to about 10 m off), and says so once.
+
+**Settings › Datum Grids › Download Datum Grids** (off by default, in the desktop and web apps)
+downloads such grids from PROJ's grid server (`cdn.proj.org`; only PROJ's openly licensed GeoTIFF
+grids, not the server's other files such as deformation models):
+
+- On the desktop, a file read then waits for its systems' grids before its features are placed, up
+  to two minutes in all, and stops waiting when you cancel it; the download goes on. In the web
+  app a read doesn't wait: a layer read before its grid arrives keeps its places until it is
+  opened again.
+- Rasters, streamed layers and the map follow a grid as soon as it arrives. A layer opened before
+  keeps its places until it is opened again.
+- Each download is said, with its size, and so is each that fails (not tried again until the
+  setting is turned off and on). An answer that isn't a grid file is refused.
+- Turned off, grids already downloaded stay in use, and downloads already under way finish. On a
+  computer, delete the `datum-grids` folder and start RustGIS again to stop using them (grids
+  installed for PROJ are still used). The web app keeps a grid for the session only.
+- Grids are downloaded three at a time, those a file read waits for first: at most 16 each time
+  the setting is turned on, and none is started once 2 GB of grids have been kept; past that, the grid is said
+  to be not downloaded. Turning the setting off drops those not started yet.
+
 RustGIS supports a subset of Esri's projected systems, checked against
 PROJ at representative points; unsupported codes such as World Miller (`ESRI:54003`) and the
 two-point oblique Mercators (`ESRI:53025`, `ESRI:54025`) are refused as unknown codes. The presets:
@@ -693,6 +794,31 @@ so EPSG:8857 (Equal Earth) works too. So is the sinusoidal projection, on a sphe
 ellipsoid: MODIS rasters, whose GeoTIFFs give it as their own projection, open and draw, and
 World, Sphere and Africa Sinusoidal (`ESRI:54008`, `53008`, `102011`) can be the map's.
 
+### Finding a coordinate system
+
+The coordinate system boxes of the Coordinate System dialog, Define Projection, the Shapefile, DXF
+and CSV imports, the measured grid, **Settings › Start-up › Projection** and the analysis
+environment search as you type. A box finds a system by its code (`3035`, `EPSG:3035`,
+`esri:102033`), by words of its name (`lv95`, `utm 32n wgs`), by its projection method (`albers`,
+`oblique mercator`) or by its area of use (`switzerland`), and lists the matches under the box: the
+systems you used last first (the ten last applied, kept between sessions), the map's own
+projections by name where the box sets the map (`robinson`), then the EPSG and ESRI systems. Among
+equal matches, names whose words begin with the words typed come first (`lambert 93` finds
+Lambert-93 before ISN93 / Lambert 1993), then WGS 84 and ETRS89 systems, and a plain system before
+its axis-order variants.
+
+↑/↓ move through the list, Enter or a click takes a system, and Escape closes the list. In a
+dialog, taking a system fills the box, and Apply or OK confirms the dialog; Enter on a code typed in
+full, such as `2263` or `EPSG:2263`, takes it and confirms the dialog at once. In the graticule and
+start-up menus a system taken applies at once; in the analysis environment, **Set Coordinate
+System** applies it.
+
+Enter in an empty box leaves it empty (no system, or the map's own for the measured grid) unless ↑
+or ↓ chose a row. A box for the map, the measured grid or the analysis environment lists projected
+systems only. Text the list doesn't hold, such as WKT or a PROJ string, is used as typed. A system
+is remembered once it is applied or its import starts; **Clear** beside **Recently used** in the
+Coordinate System dialog forgets them all.
+
 ## Globe
 
 <figure markdown="span">
@@ -735,7 +861,8 @@ picking one shows it:
 - **Latitude and Longitude** (the default): parallels and meridians, more of them as you zoom in.
 - **Measured Grid**: eastings and northings in a projected coordinate system, at a round interval
   that suits the scale (about eight lines across the view), as a layout's measured grid draws them.
-  The system is the one typed under **Measured grid's coordinate system** (an EPSG code such as
+  The system is the one chosen under **Measured grid's coordinate system** (found by name or
+  code, see [Finding a coordinate system](#finding-a-coordinate-system); an EPSG code such as
   `2056`, WKT or a PROJ string; `"crs"` in the command); left empty, it is the map's own when the
   map is projected, else the WGS 84 UTM zone at the centre of the view. A system that can't be read
   or is geographic is refused, with a message naming it.

@@ -79,6 +79,7 @@ fn elements(
     source_error: &mut Option<String>,
 ) -> Option<String> {
     let ppp = page_geometry(layout, dpi).2 / PT_PER_MM;
+    let env = crate::layout::series_env(layout, maps);
     let mut s = String::new();
     // The elements drawn as pictures (past the budget): their places, filled in at the end at
     // the resolution they share.
@@ -92,7 +93,7 @@ fn elements(
         background(&mut s, e);
         let (x, y, w, h) = (e.x, e.y, e.w, e.h);
         match &e.kind {
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation } => {
+            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation, wrap } => {
                 let first = layout.first_frame().and_then(|id| layout.element(id)).and_then(|f| match &f.kind {
                     ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } => {
                         let m = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
@@ -101,6 +102,13 @@ fn elements(
                     _ => None,
                 });
                 let text = expand(t, layout, info, first);
+                // A wrapped text in the lines the page breaks it into (#2346), each its own line.
+                let text = if *wrap {
+                    let style = crate::layout::text_style(*bold, *italic, *font, font_name.as_deref(), *align, *letter_spacing);
+                    crate::layout::wrapped(&text, w, *size, style)
+                } else {
+                    text
+                };
                 // As the page draws it: the size in points, lines 1.25 apart, the first baseline
                 // 0.6 of the size below the top, lines past the frame left out.
                 let em = size.clamp(2.0, 400.0) * 1.33 / PT_PER_MM;
@@ -185,7 +193,8 @@ fn elements(
                 // bounds; past the budget (its own, or the page's with the elements before it), a
                 // picture of it at the pictures' resolution.
                 let mut frames = Vec::new();
-                if let Some((drawing, [ix, iy, ..], k)) = record_element(layout, e.id, maps, dpi, info, &mut frames, source_error)? {
+                if let Some((drawing, [ix, iy, ..], k)) = record_element(layout, e.id, maps, dpi, (info, &env), &mut frames, source_error)?
+                {
                     let total = written.saturating_add(drawing.cost());
                     if !drawing.overflowed() && total <= crate::vector::max_cost() {
                         written = total;
@@ -210,7 +219,7 @@ fn elements(
     let picture_dpi = picture_dpi(layout, dpi, |e| as_pictures.contains(&e.id));
     for id in as_pictures {
         let mut image_tag = String::new();
-        if let Some((image, [ix, iy, iw, ih])) = render_element(layout, id, maps, picture_dpi, info, source_error)? {
+        if let Some((image, [ix, iy, iw, ih])) = render_element(layout, id, maps, picture_dpi, (info, &env), source_error)? {
             let png = image.encode_png().ok()?;
             let _ = writeln!(
                 image_tag,
@@ -519,13 +528,14 @@ mod tests {
         assert!(key.contains(r#"aria-label="Map legend""#) && key.contains("<use xlink:href=\"#glyph"));
         assert!(svg.contains("<defs>") && svg.find("<defs>") < svg.find("<g id=\"element-"));
         // A surround drawn as a picture (past the budget) keeps its page context and transparency.
-        let (pm, _) = render_element(&layout, legend, &mut maps, 72.0, &info, &mut None).unwrap().unwrap();
+        let (pm, _) = render_element(&layout, legend, &mut maps, 72.0, (&info, &Default::default()), &mut None).unwrap().unwrap();
         assert!(pm.pixels().iter().any(|p| p.alpha() == 0), "no opaque page behind the legend");
         assert!(pm.pixels().iter().any(|p| p.alpha() > 0), "the title still uses the frame context");
         let (mut base, mut maps, _) = page();
         let mut expected = crate::layout::render(&base, &mut maps, 72.0, &info).unwrap();
         assert!(pm.width() < expected.width() / 2 && pm.height() < expected.height() / 2, "only the surround's bounds are allocated");
-        let (image, [x, y, ..]) = render_element(&layout, legend, &mut maps, 72.0, &info, &mut None).unwrap().unwrap();
+        let (image, [x, y, ..]) =
+            render_element(&layout, legend, &mut maps, 72.0, (&info, &Default::default()), &mut None).unwrap().unwrap();
         let k = PT_PER_MM * 72.0 / 96.0;
         expected.draw_pixmap(
             (x * k).round() as i32,
@@ -560,7 +570,7 @@ mod tests {
         let (mut layout, mut maps, _) = page();
         let id = layout.add("Picture", (-5.3, 70.2, 20.7, 20.0), ElementKind::Picture { image: String::new() });
         let info = PageInfo::default();
-        let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, &info, &mut None).unwrap().unwrap();
+        let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, (&info, &Default::default()), &mut None).unwrap().unwrap();
         let [x, y, w, h] = bounds;
         let k = PT_PER_MM * 36.0 / 96.0;
         assert_eq!(x, 0.0);
@@ -571,7 +581,7 @@ mod tests {
         // Placed at its pixel bounds, as its picture would be.
         assert!(svg.contains(&format!(r#"<g transform="translate({} {}) scale("#, num(x), num(y))), "{svg}");
         layout.element_mut(id).unwrap().x = 110.0;
-        assert!(render_element(&layout, id, &mut maps, 36.0, &info, &mut None).unwrap().is_none());
+        assert!(render_element(&layout, id, &mut maps, 36.0, (&info, &Default::default()), &mut None).unwrap().is_none());
         assert!(layout_svg(&layout, &mut maps, 36.0, &info).is_ok(), "an off-page image is harmless");
     }
 
@@ -627,6 +637,33 @@ mod tests {
         assert_eq!(esc("valid\u{fffe}\u{ffff}\t🙂"), "valid\t🙂");
         assert_eq!(paint("fill", rustgis_map::Rgba::new(255, 0, 16, 128)), r##" fill="#ff0010" fill-opacity="0.502""##);
         assert_eq!(stroke(rustgis_map::Rgba::rgb(0, 0, 0), 0.0, None), r#" stroke="none""#);
+    }
+
+    /// A wrapped text (#2346) is written in the lines the page draws it in, one `<tspan>` each,
+    /// placed as the page places them; unwrapped, it is written on its own line breaks.
+    #[test]
+    fn a_wrapped_text_is_written_in_its_drawn_lines() {
+        use rustgis_map::layout::{ElementKind, TextAlign};
+        let note = "Population counts from the 2020 census; boundaries simplified for print";
+        let svg = |wrap: bool| {
+            let mut layout = Layout::new("L", 100.0, 100.0);
+            let mut kind = ElementKind::text(note, 12.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+            if let ElementKind::Text { wrap: w, .. } = &mut kind {
+                *w = wrap;
+            }
+            layout.add("Note", (10.0, 10.0, 40.0, 60.0), kind);
+            layout_svg(&layout, &mut [], 96.0, &PageInfo::default()).unwrap().0
+        };
+        let plain = svg(false);
+        assert!(!plain.contains("<tspan") && plain.contains(note), "one line: {plain}");
+        let style = crate::layout::TextStyle { face: crate::text::Face::default(), align: TextAlign::Left, spacing: 0.0 };
+        let lines = crate::layout::wrapped(note, 40.0, 12.0, style);
+        let wrapped = svg(true);
+        assert!(lines.lines().count() > 3, "{lines}");
+        assert_eq!(wrapped.matches("<tspan").count(), lines.lines().count(), "{wrapped}");
+        for line in lines.lines() {
+            assert!(wrapped.contains(&format!(">{}</tspan>", esc(line))), "{line}: {wrapped}");
+        }
     }
 
     /// An element's background (#2257) is a `<rect>` of its own under the element, its box grown

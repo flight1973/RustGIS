@@ -1485,6 +1485,7 @@ fn decode_with(
             b,
             Box::new(move |r| {
                 settle(match r {
+                    // The browser read it as a picture: a failure here isn't a document.
                     Ok(raw) => decode_image(&raw).map(Payload::Image),
                     Err(b) => decode(&b, want),
                 })
@@ -1562,7 +1563,7 @@ pub fn gives_up_when_stalled(url: &str, ceiling: crate::address::Reach) -> bool 
     split_download_limit(url).1.is_none() || ceiling == crate::address::Reach::Public
 }
 
-fn download_address(url: &str, max: usize) -> String {
+pub(crate) fn download_address(url: &str, max: usize) -> String {
     if max >= MAX_DOWNLOAD { format!("{DOWNLOAD}{url}") } else { format!("{LIMITED_DOWNLOAD}{max}:{url}") }
 }
 
@@ -2117,8 +2118,15 @@ pub(crate) fn head_with_ceiling(url: &str, ceiling: crate::address::Reach, done:
 /// to anonymous access or ambient S3 credentials.
 pub fn prepare_get(url: &str) -> Result<crate::s3::Prepared, String> {
     crate::logins::check(url).map_err(str::to_string)?;
+    // A login is never bound to an anonymous address (`login_address::bind` takes only a web
+    // address), so a bound one is never anonymous.
     if rustgis_data::login_address::is_wrapper(url) {
-        return Ok(crate::s3::Prepared { url: crate::logins::inner(url).to_string(), headers: Vec::new(), signed: false });
+        return Ok(crate::s3::Prepared {
+            url: crate::logins::inner(url).to_string(),
+            headers: Vec::new(),
+            signed: false,
+            anonymous: false,
+        });
     }
     crate::s3::prepare(url)
 }
@@ -2363,6 +2371,9 @@ fn payload_bytes(p: &Payload) -> usize {
     }
 }
 
+/// What an image fetch whose answer is in no picture format fails with first (then why).
+pub const NOT_A_PICTURE: &str = "not a picture";
+
 /// Decodes fetched bytes.
 pub fn decode(bytes: &[u8], want: Want) -> Result<Payload, String> {
     if bytes.is_empty() {
@@ -2372,7 +2383,11 @@ pub fn decode(bytes: &[u8], want: Want) -> Result<Payload, String> {
         return Err(format!("{} bytes is too large for a tile", bytes.len()));
     }
     match want {
-        Want::Image => decode_image(bytes).map(Payload::Image),
+        // An answer in no picture format (a WMS exception document) is said as such, so it is
+        // told from a failed fetch and from a picture that couldn't be read (one too large).
+        Want::Image => decode_image(bytes)
+            .map(Payload::Image)
+            .map_err(|e| if bytes.starts_with(RAW) || image::guess_format(bytes).is_ok() { e } else { format!("{NOT_A_PICTURE}: {e}") }),
         Want::Vector => mvt::decode(bytes).map(Payload::Vector),
         Want::Json => serde_json::from_slice(bytes).map(Payload::Json).map_err(|e| format!("not JSON: {e}")),
     }
@@ -2975,7 +2990,8 @@ mod native {
             for redirects in 0..=5 {
                 // The login goes to its own origin only: once a redirect leaves it, never again.
                 let bound = crate::logins::inherit(url, &at);
-                let login = if same_origin { crate::logins::apply(&bound)? } else { None };
+                // An anonymous request carries no login (only an explicitly bound one applies).
+                let login = if same_origin && !prepared.anonymous { crate::logins::apply(&bound)? } else { None };
                 carried_login |= login.is_some();
                 let sending = if ceiling == Reach::Public { public } else { agent };
                 let mut req = sending.head(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
@@ -2994,6 +3010,7 @@ mod native {
                 } else {
                     req.config().timeout_global(agent.config().timeouts().global).build()
                 };
+                crate::logins::check(url).map_err(str::to_string)?;
                 let (resp, reached) = connected(|| req.call()).map_err(unanswered)?;
                 ceiling = ceiling.min(reached);
                 diagnostics.answered(resp.status().as_u16());
@@ -3076,7 +3093,7 @@ mod native {
                 return Err("S3 signed JSON POST requests are not supported.".into());
             }
             let bound = crate::logins::inherit(url, &prepared.url);
-            let login = crate::logins::apply(&bound)?;
+            let login = if prepared.anonymous { None } else { crate::logins::apply(&bound)? };
             carried_login = login.is_some();
             let target = login.as_ref().map_or(prepared.url.as_str(), |a| a.url.as_str());
             crate::address::check_reach(target, ceiling)?;
@@ -3085,6 +3102,7 @@ mod native {
                 req = req.header(name.as_str(), value.as_str());
             }
             super::check_current()?;
+            crate::logins::check(url).map_err(str::to_string)?;
             let (mut resp, reached) = connected(|| req.send(body)).map_err(unanswered)?;
             let status = resp.status().as_u16();
             diagnostics.answered(status);
@@ -3343,6 +3361,45 @@ mod native {
         len.trim().parse::<u64>().ok().filter(|len| *len > 0)
     }
 
+    /// The sign-ins' tokens a hop to `at` carries, as (header, value, whether a refusal must be
+    /// status-only): none for a `bare` request (signed for S3, or read anonymously, as a plugin's
+    /// `host.fetch` is), at any hop.
+    /// - An Earthdata Login token goes to NASA's Earthdata data hosts only, asked for at each hop:
+    ///   a redirect that leaves them (to a presigned address) goes without it.
+    /// - A Copernicus Data Space sign-in's token goes to its data hosts only, asked for at each hop
+    ///   like Earthdata's (and renewed first when it is about to expire). A hop carrying it makes a
+    ///   refusal status-only: a server may echo the token back.
+    /// - An ArcGIS sign-in's token goes to the portal and the servers it covers, asked for at each
+    ///   hop like Earthdata's, unless the connection's own ArcGIS token applies ([`implicit_arcgis`]).
+    pub(super) fn sign_ins(bare: bool, login: Option<&crate::logins::Applied>, at: &str) -> Vec<(&'static str, String, bool)> {
+        let mut out = Vec::new();
+        if bare {
+            return out;
+        }
+        if let Some(auth) = crate::earthdata::authorization(at) {
+            out.push(("Authorization", auth, false));
+        }
+        if let Some(auth) = crate::copernicus::authorization_fresh(at) {
+            out.push(("Authorization", auth, true));
+        }
+        if let Some(auth) = implicit_arcgis(bare, login, at) {
+            out.push(("X-Esri-Authorization", auth, false));
+        }
+        out
+    }
+
+    /// The portal sign-in's `X-Esri-Authorization` value for a hop to `at` (renewed first when it
+    /// is about to expire), or `None`. A connection's own ArcGIS token outranks it: with one
+    /// applied (already in the address) the sign-in's token is neither added nor renewed, and a
+    /// refused or expired connection token never falls back to it. A `bare` request (signed for
+    /// S3, or read anonymously) has none.
+    pub(super) fn implicit_arcgis(bare: bool, login: Option<&crate::logins::Applied>, at: &str) -> Option<String> {
+        if bare || login.is_some_and(|applied| applied.arcgis) {
+            return None;
+        }
+        crate::arcgis_auth::authorization_fresh(at)
+    }
+
     /// The answer to `url`; a refusal keeps the server's answer only when `detail` asks for it,
     /// as tiles a server doesn't have are routine and only their status is read. A status in
     /// `omit` is an expected answer: its failure isn't recorded, only noted once per server. A
@@ -3394,6 +3451,7 @@ mod native {
             let mut measuring: Option<u64> = None;
             // Explicit service logins outrank implicit S3 endpoint signing.
             let prepared = super::prepare_get(url)?;
+            let bare = prepared.bare();
             Origin { url: prepared.url.clone(), reach: initial }.check(&prepared.url)?;
             let mut at = prepared.url.clone();
             let mut ceiling = initial;
@@ -3403,7 +3461,7 @@ mod native {
             let mut resp = loop {
                 // The login goes to its own origin only: once a redirect leaves it, never again.
                 let bound = crate::logins::inherit(url, &at);
-                let login = if !prepared.signed && same_origin { crate::logins::apply(&bound)? } else { None };
+                let login = if !bare && same_origin { crate::logins::apply(&bound)? } else { None };
                 carried_login |= login.is_some();
                 let sending = if ceiling == Reach::Public && initial != Reach::Public { public } else { agent };
                 let mut req = sending.get(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
@@ -3425,28 +3483,10 @@ mod native {
                         req = req.header(k.as_str(), v.as_str());
                     }
                 }
-                // An Earthdata Login token goes to NASA's Earthdata data hosts only, asked for at
-                // each hop: a redirect that leaves them (to a presigned address) goes without it.
-                if !prepared.signed
-                    && let Some(auth) = crate::earthdata::authorization(&at)
-                {
-                    req = req.header("Authorization", &auth);
-                }
-                // A Copernicus Data Space sign-in's token goes to its data hosts only, asked for at
-                // each hop like Earthdata's (and renewed first when it is about to expire). A hop
-                // carrying it makes a refusal status-only: a server may echo the token back.
-                if !prepared.signed
-                    && let Some(auth) = crate::copernicus::authorization_fresh(&at)
-                {
-                    carried_login = true;
-                    req = req.header("Authorization", &auth);
-                }
-                // An ArcGIS sign-in's token goes to the portal and the servers it covers, asked for at
-                // each hop like Earthdata's.
-                if !prepared.signed
-                    && let Some(auth) = crate::arcgis_auth::authorization_fresh(&at)
-                {
-                    req = req.header("X-Esri-Authorization", &auth);
+                // `echo`: the token may come back in a refusal, which is then status-only.
+                for (name, auth, echo) in sign_ins(bare, login.as_ref(), &at) {
+                    carried_login |= echo;
+                    req = req.header(name, &auth);
                 }
                 diagnostics.sending();
                 super::check_current()?;
@@ -3456,15 +3496,19 @@ mod native {
                 } else {
                     req.config().timeout_global(agent.config().timeouts().global).build()
                 };
+                // Recheck the original binding even after redirects dropped its credentials.
+                crate::logins::check(url).map_err(str::to_string)?;
                 let (mut resp, reached) = connected(|| req.call()).map_err(unanswered)?;
                 ceiling = ceiling.min(reached);
                 let status = resp.status().as_u16();
                 diagnostics.answered(status);
-                // A data host refusing the request (or the token): say what to do.
-                if status == 401 && crate::earthdata::is_data_host(&at) {
+                // A data host refusing the request (or the token): say what to do. Not to an anonymous
+                // request, which carried no token: signing in again wouldn't change its answer, a
+                // plain refusal (below).
+                if status == 401 && !prepared.anonymous && crate::earthdata::is_data_host(&at) {
                     return Err(Failure::without_answer("", crate::earthdata::refused_message(url), Reason::Status(status)));
                 }
-                if status == 401 && crate::copernicus::is_data_host(&at) {
+                if status == 401 && !prepared.anonymous && crate::copernicus::is_data_host(&at) {
                     return Err(Failure::without_answer("", crate::copernicus::refused_message(url), Reason::Status(status)));
                 }
                 // A store that serves ranges but not the last bytes by their count (GitHub's release
@@ -3519,7 +3563,15 @@ mod native {
                 let next = crate::template::join(&at, location);
                 // An Earthdata data host sends a request it didn't accept to Earthdata Login.
                 if crate::earthdata::is_data_host(&at) && crate::earthdata::is_login(&next) {
-                    return Err(Failure::without_answer("", crate::earthdata::refused_message(url), Reason::Status(401)));
+                    let message = if prepared.anonymous {
+                        rustgis_data::diagnostics::message_with_address(
+                            crate::s3::split_anonymous(url).0,
+                            "the data host asks for a sign-in, which an anonymous read doesn't carry",
+                        )
+                    } else {
+                        crate::earthdata::refused_message(url)
+                    };
+                    return Err(Failure::without_answer("", message, Reason::Status(401)));
                 }
                 // Where a redirect leads is the server's choice, not the user's. A server can echo
                 // a login in its chosen destination, even after revocation.
@@ -4701,7 +4753,9 @@ mod tests {
         assert_eq!((back.width(), back.height()), (2, 2));
         assert!(matches!(decode(b"{\"a\": 1}", Want::Json), Ok(Payload::Json(_))));
         assert!(matches!(decode(b"", Want::Image), Ok(Payload::Empty)));
-        assert!(decode(b"not a picture", Want::Image).is_err());
+        assert!(decode(b"not a picture", Want::Image).is_err_and(|e| e.starts_with(NOT_A_PICTURE)));
+        // A picture that can't be read (here, cut short) is no document: said as it is.
+        assert!(decode(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR", Want::Image).is_err_and(|e| !e.starts_with(NOT_A_PICTURE)));
         assert!(decode(b"{", Want::Json).is_err());
     }
 
@@ -5039,6 +5093,97 @@ Connection: close
         copernicus::logout();
     }
 
+    /// An anonymous request (a plugin's `host.fetch`) carries no sign-in's token: Copernicus Data
+    /// Space's and an ArcGIS portal's apply to the same address read plainly, and none to it read
+    /// anonymously. (Earthdata's token is global state another test owns, and goes through the
+    /// same gate.)
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_anonymous_request_carries_no_sign_in() {
+        let _turn = crate::cache::turn();
+        use crate::{arcgis_auth, copernicus};
+        let grant = r#"{"access_token":"synthetic-cdse-access","expires_in":1800,"refresh_expires_in":3600,"refresh_token":"synthetic-cdse-refresh"}"#;
+        let keycloak = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{grant}",
+            grant.len()
+        );
+        let (identity, _) = serve_recorded(vec![keycloak.into_bytes()]);
+        let (cdse, _) = serve_recorded(Vec::new());
+        copernicus::TEST_HOSTS.lock().unwrap_or_else(|e| e.into_inner()).push(cdse.clone());
+        copernicus::login_at(&identity, "synthetic.user@example.invalid", "synthetic-password", None).unwrap();
+        let portal = "https://anonymous-sign-in.example/portal";
+        let soon = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
+        let grant =
+            arcgis_auth::Grant { access_token: "portal-token".into(), refresh_token: None, expires_at: soon, username: "ana".into() };
+        arcgis_auth::sign_in(portal, "client", grant, arcgis_auth::scopes_for(portal, None, &[]));
+        for (url, header) in [
+            (format!("{cdse}/odata/v1/Products(abc)/$value"), "Authorization"),
+            ("https://anonymous-sign-in.example/portal/sharing/rest/content/items/a/data".to_string(), "X-Esri-Authorization"),
+        ] {
+            let plain = native::sign_ins(false, None, &url);
+            assert!(plain.iter().any(|(name, _, _)| *name == header), "{url}: {plain:?}");
+            let prepared = crate::s3::prepare(&crate::s3::anonymous(&url)).unwrap();
+            assert!(prepared.anonymous && !prepared.signed, "{url}");
+            assert_eq!(prepared.url, url);
+            assert!(prepared.bare() && native::sign_ins(prepared.bare(), None, &url).is_empty(), "{url}");
+            assert!(!crate::s3::prepare(&url).unwrap().anonymous, "{url}");
+        }
+        arcgis_auth::sign_out(Some(portal));
+        copernicus::TEST_HOSTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| *h != cdse);
+        copernicus::logout();
+    }
+
+    /// A native GET of an anonymous address sends no sign-in's token, there or where a redirect
+    /// leads, while the same address read plainly carries it: a Copernicus Data Space sign-in and
+    /// fake data hosts on this computer.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_anonymous_get_sends_no_token_at_any_hop() {
+        let _turn = crate::cache::turn();
+        use crate::copernicus;
+        let grant = r#"{"access_token":"synthetic-cdse-access","expires_in":1800,"refresh_expires_in":3600,"refresh_token":"synthetic-cdse-refresh"}"#;
+        let keycloak = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{grant}",
+            grant.len()
+        );
+        let (identity, _) = serve_recorded(vec![keycloak.into_bytes()]);
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata".to_vec();
+        let refused = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (data, data_asked) = serve_recorded(vec![ok.clone(), ok.clone(), ok, refused]);
+        let to_data = format!("HTTP/1.1 302 Found\r\nLocation: {data}/hop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes();
+        let (start, start_asked) = serve_recorded(vec![to_data]);
+        copernicus::TEST_HOSTS.lock().unwrap_or_else(|e| e.into_inner()).push(data.clone());
+        copernicus::login_at(&identity, "synthetic.user@example.invalid", "synthetic-password", None).unwrap();
+        let agent = native::agent();
+        let timeout = Duration::from_secs(5);
+
+        // Read plainly, the data host gets the token.
+        assert_eq!(native::get(&agent, &format!("{data}/plain"), &[]).unwrap(), b"data");
+        let asked = data_asked.recv_timeout(timeout).unwrap().to_ascii_lowercase();
+        assert!(asked.contains("authorization: bearer synthetic-cdse-access\r\n"), "{asked}");
+
+        // Read anonymously, it doesn't, nor where a redirect leads.
+        assert_eq!(native::get(&agent, &crate::s3::anonymous(&format!("{data}/direct")), &[]).unwrap(), b"data");
+        let asked = data_asked.recv_timeout(timeout).unwrap().to_ascii_lowercase();
+        assert!(asked.starts_with("get /direct http/1.1\r\n"), "{asked}");
+        assert!(!asked.contains("authorization") && !asked.contains("synthetic-cdse"), "{asked}");
+        assert_eq!(native::get(&agent, &crate::s3::anonymous(&format!("{start}/start")), &[]).unwrap(), b"data");
+        let first = start_asked.recv_timeout(timeout).unwrap().to_ascii_lowercase();
+        let hop = data_asked.recv_timeout(timeout).unwrap().to_ascii_lowercase();
+        assert!(hop.starts_with("get /hop http/1.1\r\n"), "{hop}");
+        for text in [&first, &hop] {
+            assert!(!text.contains("authorization") && !text.contains("synthetic-cdse"), "{text}");
+        }
+
+        // Refused, it says so plainly: no token went, so signing in again wouldn't help.
+        let e = native::get(&agent, &crate::s3::anonymous(&format!("{data}/refused")), &[]).unwrap_err();
+        assert!(!e.contains("Copernicus Data Space") && !e.contains("copernicus.login"), "{e}");
+        assert!(e.contains("401"), "{e}");
+
+        copernicus::TEST_HOSTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| *h != data);
+        copernicus::logout();
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn explicit_service_login_beats_ambient_s3_on_native_get_and_redirect() {
@@ -5162,6 +5307,169 @@ Connection: close
         assert!(!foreign.contains(encoded) && !foreign.contains(secret));
         assert!(logins::deactivate(&first));
         assert!(logins::deactivate(&second));
+    }
+
+    /// A connection's ArcGIS token goes in the address as its one `token`, on every hop at its
+    /// own origin (replacing a stale copy, any case or escaping), never to a redirect's other
+    /// origin, and with no portal sign-in header beside it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn arcgis_token_goes_once_to_its_origin_and_never_a_redirect_target() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        let (other, other_asked) = serve_recorded(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile".to_vec()]);
+        let (base, asked) = serve_recorded(vec![
+            b"HTTP/1.1 302 Found\r\nLocation: /next?%54oken=stale-two&y=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            format!("HTTP/1.1 302 Found\r\nLocation: {other}/tile?token=foreign\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .into_bytes(),
+        ]);
+        let token = "connection-token/+=";
+        let encoded = "connection-token%2F%2B%3D";
+        let first = logins::activate(&base, "arcgis-first", Method::Arcgis { expires_at: None }, token, true).unwrap();
+        let second = logins::activate(&other, "arcgis-second", Method::Arcgis { expires_at: None }, "second-token", true).unwrap();
+        let url = logins::bind(&first, &format!("{base}/start?x=1&ToKeN=stale-one")).unwrap();
+        assert_eq!(native::get(&native::agent(), &url, &[]).unwrap(), b"tile");
+        let timeout = std::time::Duration::from_secs(5);
+        let one = asked.recv_timeout(timeout).unwrap();
+        let two = asked.recv_timeout(timeout).unwrap();
+        assert!(one.starts_with(&format!("GET /start?x=1&token={encoded} HTTP/1.1\r\n")), "{one}");
+        assert!(two.starts_with(&format!("GET /next?y=2&token={encoded} HTTP/1.1\r\n")), "{two}");
+        let foreign = other_asked.recv_timeout(timeout).unwrap();
+        assert!(foreign.starts_with("GET /tile?token=foreign HTTP/1.1\r\n"), "{foreign}");
+        for text in [&one, &two, &foreign] {
+            assert!(!text.contains("stale") && !text.contains("second-token"), "{text}");
+            assert!(!text.to_ascii_lowercase().contains("x-esri-authorization"), "{text}");
+        }
+        assert!(!foreign.contains(encoded) && !foreign.contains(token));
+        assert!(logins::deactivate(&first));
+        assert!(logins::deactivate(&second));
+    }
+
+    /// With a portal sign-in covering the address and the connection's own token applied, only the
+    /// connection's is used: the sign-in's is neither sent nor renewed. Another kind of login, or
+    /// none, still gets the sign-in's.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn arcgis_token_outranks_the_portal_sign_in() {
+        let _turn = crate::cache::turn();
+        use crate::{
+            arcgis_auth::{self, Grant},
+            logins::{self, Method},
+        };
+        let portal = "https://explicit-over-portal.example/portal";
+        let origin = "https://explicit-over-portal.example";
+        let url = "https://explicit-over-portal.example/server/rest/services/A/MapServer";
+        let soon = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
+        let grant = Grant { access_token: "portal-token".into(), refresh_token: None, expires_at: soon, username: "ana".into() };
+        arcgis_auth::sign_in(portal, "client", grant, arcgis_auth::scopes_for(portal, None, &[]));
+        let token = logins::activate(origin, "outranks-token", Method::Arcgis { expires_at: None }, "connection-token", false).unwrap();
+        let key = logins::activate(origin, "outranks-key", Method::Header("X-Key".into()), "connection-key", false).unwrap();
+        let explicit = logins::apply(&logins::bind(&token, url).unwrap()).unwrap().unwrap();
+        let keyed = logins::apply(&logins::bind(&key, url).unwrap()).unwrap().unwrap();
+        assert_eq!(explicit.url, format!("{url}?token=connection-token"));
+        assert_eq!(native::implicit_arcgis(false, None, url).as_deref(), Some("Bearer portal-token"));
+        assert_eq!(native::implicit_arcgis(false, Some(&keyed), url).as_deref(), Some("Bearer portal-token"));
+        assert_eq!(native::implicit_arcgis(false, Some(&explicit), url), None);
+        assert_eq!(native::implicit_arcgis(true, None, url), None);
+        assert!(logins::deactivate(&token));
+        assert!(logins::deactivate(&key));
+        arcgis_auth::sign_out(Some(portal));
+    }
+
+    /// Expiry during request preparation prevents the send, not just accepting its answer.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn arcgis_token_expiry_during_preparation_blocks_native_sends() {
+        if isolate_cache_fixture("cache::tests::arcgis_token_expiry_during_preparation_blocks_native_sends") {
+            return;
+        }
+        let _turn = crate::cache::turn();
+        use crate::{
+            arcgis_token,
+            logins::{self, Method},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let agent = native::download_agent(std::time::Duration::from_secs(1));
+        for (method, final_check) in [("GET", 2), ("HEAD", 1), ("POST", 1)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let now = arcgis_token::now_millis().unwrap();
+            let expires = now + 60_000;
+            let binding =
+                logins::activate(&base, method, Method::Arcgis { expires_at: Some(expires) }, "preparation-expiry-token", true).unwrap();
+            let clock = logins::clock_for_test(&binding, now).unwrap();
+            let url = logins::bind(&binding, &format!("{base}/prepared")).unwrap();
+            let checks = Arc::new(AtomicUsize::new(0));
+            let observed = checks.clone();
+            let result = with_still(
+                Arc::new(move || {
+                    // GET also checks its continuation before preparing or applying the login.
+                    if observed.fetch_add(1, Ordering::SeqCst) + 1 == final_check {
+                        clock.store(expires, Ordering::SeqCst);
+                    }
+                    true
+                }),
+                || match method {
+                    "GET" => native::get(&agent, &url, &[]).map(|_| ()),
+                    "HEAD" => native::head_with(&agent, &url).map(|_| ()),
+                    _ => native::post_with(&agent, &url, "{}").map(|_| ()),
+                },
+            );
+            assert_eq!(result.unwrap_err(), arcgis_token::EXPIRED, "{method}");
+            assert_eq!(checks.load(Ordering::SeqCst), final_check, "{method}");
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "{method}");
+            assert!(logins::deactivate(&binding));
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn arcgis_token_expiry_blocks_cached_and_in_flight_bytes() {
+        if isolate_cache_fixture("cache::tests::arcgis_token_expiry_blocks_cached_and_in_flight_bytes") {
+            return;
+        }
+        let _turn = crate::cache::turn();
+        use crate::{
+            arcgis_token,
+            logins::{self, Method},
+        };
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let now = arcgis_token::now_millis().unwrap();
+        let expires = now + 60_000;
+        let binding =
+            logins::activate(&base, "expiry-cache-session", Method::Arcgis { expires_at: Some(expires) }, "expiry-cache-token", true)
+                .unwrap();
+        let clock = logins::clock_for_test(&binding, now).unwrap();
+        let cached = logins::bind(&binding, &format!("{base}/cached")).unwrap();
+        store(&cached, Entry::Ready(Arc::new(Payload::Json(serde_json::json!({"private": true}))), 64, None));
+        assert!(peek(&cached).is_some());
+        let pending = logins::bind(&binding, &format!("{base}/pending")).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap();
+            assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /pending?token=expiry-cache-token HTTP/1.1"));
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nold-body").unwrap();
+            listener
+        });
+        let worker = std::thread::spawn(move || native::get(&native::agent(), &pending, &[]));
+        started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        clock.store(expires, std::sync::atomic::Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap_err(), arcgis_token::EXPIRED);
+        let listener = server.join().unwrap();
+        assert!(peek(&cached).is_none());
+        assert!(matches!(get(&cached, Want::Json), State::Failed(_)));
+        assert_eq!(native::get(&native::agent(), &cached, &[]).unwrap_err(), arcgis_token::EXPIRED);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(logins::deactivate(&binding));
     }
 
     /// A HEAD and a POST carry the query key too, to the address the caller named.

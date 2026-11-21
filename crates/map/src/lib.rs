@@ -18,6 +18,7 @@ pub mod graticule;
 pub mod label_by;
 pub mod layout;
 pub mod lod;
+pub mod look;
 pub mod palette;
 pub mod paths;
 pub mod planets;
@@ -26,6 +27,7 @@ pub mod projection;
 pub mod qgis;
 pub mod raster;
 pub mod report;
+pub mod rows;
 pub mod shadow;
 pub mod slots;
 pub mod source;
@@ -57,6 +59,7 @@ pub struct LockedPlace {
     pub callout: Option<[f32; 2]>,
 }
 
+use rustgis_data::raster::Crs;
 use rustgis_data::{Dataset, Geometry, GeometryType};
 use rustgis_geom::{Coord, Extent};
 use serde::{Deserialize, Serialize};
@@ -267,6 +270,11 @@ pub struct Layer {
     /// expression (none set: the renderer's symbol alone); drawn through [`Layer::styler`].
     #[serde(default, skip_serializing_if = "symbol_by::SymbolBy::is_empty", deserialize_with = "symbol_by::de_symbol_by")]
     pub symbol_by: symbol_by::SymbolBy,
+    /// A point layer's marker size from a numeric field, beside the colours of its Unique Values
+    /// or Graduated Colors classes; drawn through [`Layer::styler`], before [`Layer::symbol_by`]'s
+    /// size expression (which wins where it gives a size). Kept, unused, under another renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "symbol_by::de_size_by")]
+    pub size_by: Option<symbol_by::SizeBy>,
     /// The scale (1:N) its symbol and label sizes are set for: drawn at another scale they grow
     /// and shrink with the map, as on paper (QGIS's reference scale). `None`: they keep their
     /// size on screen.
@@ -340,6 +348,14 @@ pub struct Layer {
     /// The projection the cache is in.
     #[serde(skip)]
     projected_for: String,
+    /// The coordinate system the cache was projected from ([`Dataset::coord_crs`]).
+    #[serde(skip)]
+    projected_crs: Option<Crs>,
+    /// Its geometry in longitude/latitude for the globe, when held in another system
+    /// ([`Layer::lonlat_in`]): a slot of its own, so the globe and a flat projection (hit-testing,
+    /// snapping) don't evict each other.
+    #[serde(skip)]
+    lonlat: LonLatCopy,
     /// Allocation identities and byte totals, shared with render snapshots without retaining rows.
     #[serde(skip)]
     view_memory: view_memory::Cache,
@@ -524,6 +540,7 @@ impl Layer {
             marker_rotation: None,
             diagram: None,
             symbol_by: Default::default(),
+            size_by: None,
             reference_scale: None,
             priority: 0,
             design: design::Design::default(),
@@ -543,6 +560,8 @@ impl Layer {
             thinned: Default::default(),
             projected_rev: u64::MAX,
             projected_for: String::new(),
+            projected_crs: None,
+            lonlat: LonLatCopy::default(),
             geometry_rev: 0,
             view_memory: Default::default(),
             geometry_kinds: Default::default(),
@@ -596,6 +615,11 @@ impl Layer {
     /// read, and starts one when the view has moved beyond what was read. With `block`, reads in
     /// place and waits (for exports). Returns whether a read is still running.
     pub fn sync_source(&mut self, view: &Extent, block: bool) -> bool {
+        self.sync_source_with(view, block, &rustgis_data::query::Env::default())
+    }
+
+    /// Updates the source window, using the page when its definition query depends on it.
+    fn sync_source_with(&mut self, view: &Extent, block: bool, env: &rustgis_data::query::Env) -> bool {
         let Some(src) = &mut self.source else { return false };
         if !src.is_open() {
             // Opened once after a project loads; a failure is kept, not retried every frame.
@@ -637,12 +661,13 @@ impl Layer {
         let Some(src) = &mut self.source else { return false };
         src.window_fields = Some(self.dataset.fields.len());
         // The view keeps up to its limit of the features the query keeps (#1456).
-        src.set_query(self.definition_query.as_deref(), &self.dataset.fields);
+        src.set_query(self.definition_query.as_deref(), &self.dataset.fields, env);
         // A failed read leaves nothing drawn for it (its error shows in Layers), not the
         // previous view's features.
         match src.poll(block) {
             source::Polled::Done(_, batch) => {
                 src.saw_unread_dates(&batch.unread_dates, &batch.rounded_dates);
+                src.saw_null_text(&batch.null_text);
                 self.install(batch.features)
             }
             source::Polled::Failed(_) => self.install(Vec::new()),
@@ -654,6 +679,7 @@ impl Layer {
             match src.poll(block) {
                 source::Polled::Done(_, batch) => {
                     src.saw_unread_dates(&batch.unread_dates, &batch.rounded_dates);
+                    src.saw_null_text(&batch.null_text);
                     self.install(batch.features)
                 }
                 source::Polled::Failed(_) => self.install(Vec::new()),
@@ -707,6 +733,8 @@ impl Layer {
             self.projected_extents = cache.extents;
             self.projected_vertices = cache.vertices;
             self.projected_for = cache.key;
+            // A source reads its window in longitude/latitude, and its read projects from there.
+            self.projected_crs = Some(Crs::LonLat);
             self.projected_rev = self.geometry_rev;
             let feature_bytes =
                 if padded { rustgis_data::source::memory::features_bytes(&self.dataset.features) } else { cache.feature_bytes };
@@ -726,6 +754,8 @@ impl Layer {
         self.view_memory
             .total(&self.dataset.features, &self.projected, &self.projected_extents, &self.thinned)
             .saturating_add(self.display_levels.iter().map(|d| d.bytes).sum::<usize>())
+            // The globe's copy of a held layer, kept beside the flat projection.
+            .saturating_add(if self.lonlat.fits(self) { self.lonlat.bytes } else { 0 })
     }
 
     /// Every feature of a streamed layer's source (up to the read limit), for tools and for
@@ -870,8 +900,23 @@ impl Layer {
     /// features naming them as [`Layer::load_all`] would. `None` for a layer not
     /// read in place, or whose source can't be read so (one by its web address).
     pub fn chunk_export(&self) -> Result<Option<(std::sync::Arc<dyn rustgis_data::source::FeatureSource>, Dataset)>, String> {
+        self.chunk_copy(source::SourceLayer::visit_source)
+    }
+
+    /// A streamed layer's complete reader for a geographic extent, and a dataset describing
+    /// its rows. A reader that can visit an extent may still only sample its interactive views.
+    pub fn chunk_in_extent(&self) -> Result<Option<(std::sync::Arc<dyn rustgis_data::source::FeatureSource>, Dataset)>, String> {
+        self.chunk_copy(source::SourceLayer::visit_extent_source)
+    }
+
+    /// Opens the source and prepares an empty dataset with the layer's fields. The caller
+    /// selects the traversal contract it needs and decides which rows to retain.
+    fn chunk_copy(
+        &self,
+        visit: impl FnOnce(&source::SourceLayer) -> Option<std::sync::Arc<dyn rustgis_data::source::FeatureSource>>,
+    ) -> Result<Option<(std::sync::Arc<dyn rustgis_data::source::FeatureSource>, Dataset)>, String> {
         let Some(copy) = self.open_source()? else { return Ok(None) };
-        let Some(src) = copy.visit_source() else { return Ok(None) };
+        let Some(src) = visit(&copy) else { return Ok(None) };
         let info = src.info();
         // (A reload that read no rows leaves the reader without a type: the layer's declared one
         // stands, as in `load_all_counted`.)
@@ -931,7 +976,12 @@ impl Layer {
     /// export of the features): [`Layer::symbol`] and the rest with [`Layer::symbol_by`]'s
     /// expressions applied, compiled once here.
     pub fn styler(&self, map_scale: Option<f64>) -> symbol_by::Styler<'_> {
-        symbol_by::Styler::new(self, map_scale)
+        self.styler_with(rustgis_data::query::Env::default().at_scale(map_scale))
+    }
+
+    /// Per-row styling with the drawing scale and series page available to expressions.
+    pub fn styler_with(&self, env: rustgis_data::query::Env) -> symbol_by::Styler<'_> {
+        symbol_by::Styler::new(self, env)
     }
 
     /// The stacked strokes a line feature row is drawn with: its class's own
@@ -1054,23 +1104,60 @@ impl Layer {
     /// the projection can't use breaks a line): hit-testing and snapping use the shape, never a
     /// vertex index, which only the source geometry has.
     pub fn projected_in(&mut self, flat: &projection::Flat, key: &str) -> &[Option<Geometry>] {
-        if self.projected_rev != self.geometry_rev || self.projected.len() != self.dataset.features.len() || self.projected_for != key {
-            self.display = None;
+        if !self.is_cached(key) {
             if !matches!(flat, projection::Flat::Mercator) {
                 self.display_levels.clear();
             }
-            let projected: Vec<Option<Geometry>> =
-                self.dataset.features.iter().map(|ft| ft.geometry.as_ref().map(|g| flat.project(g))).collect();
-            self.projected_extents =
-                std::sync::Arc::new(projected.iter().map(|g| g.as_ref().map_or(Extent::EMPTY, Geometry::extent)).collect());
-            self.projected_vertices = projected.iter().flatten().map(lod::thinnable).sum();
-            self.projected = std::sync::Arc::new(projected);
-            self.thinned = Default::default();
-            self.projected_rev = self.geometry_rev;
-            self.projected_for = key.to_string();
-            self.trim_display_levels(self.lod_budget());
+            self.fill_projected(key, |to_lonlat, g| flat.project_from(to_lonlat, g));
         }
         &self.projected
+    }
+
+    /// Its geometry in longitude/latitude, for the globe, which draws there: kept in a cache of
+    /// its own beside the projected one ([`Layer::projected_cache`]), so it is converted once, not
+    /// every frame, and a flat projection made meanwhile (hit-testing, snapping) doesn't evict it.
+    /// Empty while its coordinates are longitude/latitude, as every layer's are unless held in
+    /// another system: the geometry is then drawn as it is.
+    pub fn lonlat_in(&mut self) -> &[Option<Geometry>] {
+        let crs = self.dataset.coord_crs();
+        if crs == Crs::LonLat {
+            return &[];
+        }
+        if !self.lonlat.fits(self) {
+            // A system that can't be converted draws nothing, as on a flat map.
+            let to_lonlat = crs.to(Crs::LonLat).ok();
+            let geoms: Vec<Option<Geometry>> =
+                self.dataset.features.rows().map(|r| Some(to_lonlat.as_ref()?.geometry(r.geometry()?))).collect();
+            let bytes = lod::cache_bytes(&geoms);
+            self.lonlat = LonLatCopy { geoms: std::sync::Arc::new(geoms), bytes, rev: self.geometry_rev, crs: Some(crs) };
+        }
+        &self.lonlat.geoms
+    }
+
+    /// Its copy in longitude/latitude as [`Layer::lonlat_in`] last made it: empty when none is.
+    pub fn lonlat_cache(&self) -> &[Option<Geometry>] {
+        if self.lonlat.fits(self) { &self.lonlat.geoms } else { &[] }
+    }
+
+    /// Fills the projected geometry cache for `key` with `project` of each geometry, given the
+    /// conversion of the layer's own coordinate system to longitude/latitude. Longitude/latitude,
+    /// every layer's unless held in another, can't fail; a system that can't be converted draws
+    /// nothing (a layer read in one is converted as it is read, which says why it can't be).
+    fn fill_projected(&mut self, key: &str, project: impl Fn(&rustgis_data::raster::Reprojection, &Geometry) -> Option<Geometry>) {
+        self.display = None;
+        let crs = self.dataset.coord_crs();
+        let to_lonlat = crs.to(Crs::LonLat).ok();
+        let projected: Vec<Option<Geometry>> =
+            self.dataset.features.iter().map(|ft| project(to_lonlat.as_ref()?, ft.geometry.as_ref()?)).collect();
+        self.projected_extents =
+            std::sync::Arc::new(projected.iter().map(|g| g.as_ref().map_or(Extent::EMPTY, Geometry::extent)).collect());
+        self.projected_vertices = projected.iter().flatten().map(lod::thinnable).sum();
+        self.projected = std::sync::Arc::new(projected);
+        self.thinned = Default::default();
+        self.projected_rev = self.geometry_rev;
+        self.projected_for = key.to_string();
+        self.projected_crs = Some(crs);
+        self.trim_display_levels(self.lod_budget());
     }
 
     /// Web Mercator copies of every geometry (see [`Layer::projected_in`]).
@@ -1085,7 +1172,9 @@ impl Layer {
     /// Every failure clears the active display; recent reusable levels may remain cached.
     pub fn prepare_display(&mut self, flat: &projection::Flat, tol: f64, whole_layer_eligible: bool) -> bool {
         self.display = None;
-        let Some(level) = lod::level(tol).filter(|_| matches!(flat, projection::Flat::Mercator)) else { return false };
+        // The display copies are made from longitude/latitude rows ([`lod::display`]).
+        let lonlat = self.dataset.coord_crs() == Crs::LonLat;
+        let Some(level) = lod::level(tol).filter(|_| lonlat && matches!(flat, projection::Flat::Mercator)) else { return false };
         self.trim_thinned_levels(self.lod_budget());
         let used: usize = self.thinned.iter().filter_map(|(_, c)| c.as_ref()).map(|c| lod::cache_bytes(c)).sum();
         let budget = self.lod_budget().saturating_sub(used);
@@ -1183,7 +1272,9 @@ impl Layer {
             }
             None => {
                 let t = lod::tolerance(level);
-                let copy = if matches!(flat, projection::Flat::Mercator) {
+                // Projected and thinned at once from longitude/latitude rows; from any other
+                // system, the projected geometry is thinned.
+                let copy = if matches!(flat, projection::Flat::Mercator) && self.dataset.coord_crs() == Crs::LonLat {
                     lod::project_budgeted(&self.dataset.features, level, budget)
                 } else {
                     lod::thin_budgeted(&self.projected, t, budget)
@@ -1234,6 +1325,8 @@ impl Layer {
         self.thinned = Default::default();
         self.projected_rev = u64::MAX;
         self.projected_for.clear();
+        self.projected_crs = None;
+        self.lonlat = LonLatCopy::default();
     }
 
     /// Takes the projected geometry cache `other` (a copy of this layer, such as one drawn off
@@ -1241,6 +1334,11 @@ impl Layer {
     /// a pointer. Display-only results preserve this layer's exact cache; optional copies are
     /// trimmed to its remaining budget. False when the rows or source settings don't match.
     pub fn adopt_cache(&mut self, other: &Layer) -> bool {
+        // The globe's copy goes with the rows and geometry alone: a frame drawn only on the globe
+        // has no flat projection to share.
+        if other.dataset.features.shares(&self.dataset.features) && other.geometry_rev == self.geometry_rev && other.lonlat.fits(other) {
+            self.lonlat = other.lonlat.clone();
+        }
         let fits = other.dataset.features.shares(&self.dataset.features)
             && other.geometry_rev == self.geometry_rev
             && (other.is_cached(&other.projected_for) || other.display_cache().is_some())
@@ -1261,6 +1359,7 @@ impl Layer {
                 self.thinned = other.thinned.clone();
                 self.projected_rev = other.projected_rev;
                 self.projected_for.clone_from(&other.projected_for);
+                self.projected_crs = other.projected_crs;
             }
             let budget = self.lod_budget();
             self.trim_thinned_levels(budget);
@@ -1271,9 +1370,19 @@ impl Layer {
         fits
     }
 
-    /// Whether the projected geometry cache is filled for a projection.
+    /// Whether the projected geometry cache is filled for a projection, from the layer's current
+    /// rows and its coordinate system ([`Dataset::coord_crs`]).
     pub fn is_cached(&self, key: &str) -> bool {
-        self.projected_for == key && self.projected_rev == self.geometry_rev && self.projected.len() == self.dataset.features.len()
+        self.projected_for == key
+            && self.projected_rev == self.geometry_rev
+            && self.projected.len() == self.dataset.features.len()
+            && self.projected_crs == Some(self.dataset.coord_crs())
+    }
+
+    /// Its geometry's revision, bumped by [`Layer::touch_geometry`]: what a check made once per
+    /// version of the geometry is keyed by.
+    pub fn geometry_rev(&self) -> u64 {
+        self.geometry_rev
     }
 
     /// Marks geometry as changed.
@@ -1300,7 +1409,12 @@ impl Layer {
     /// window and every display filter that applies at that scale (a filter that no longer reads
     /// is skipped).
     pub fn drawn_rows(&self, scale: f64) -> Vec<bool> {
-        let mut rows = self.visible_rows();
+        self.drawn_rows_with(scale, &rustgis_data::query::Env::default())
+    }
+
+    /// Filters drawn rows with the layout page available to both kinds of query.
+    pub fn drawn_rows_with(&self, scale: f64, env: &rustgis_data::query::Env) -> Vec<bool> {
+        let mut rows = self.query_rows_with(&self.dataset, env).unwrap_or_else(|| vec![true; self.dataset.features.len()]);
         if let Some(keep) = self.time.as_ref().and_then(|t| t.keeps(&self.dataset)) {
             for (r, k) in rows.iter_mut().zip(keep.iter()) {
                 *r = *r && *k;
@@ -1309,7 +1423,7 @@ impl Layer {
         for f in self.display_filters.iter().filter(|f| f.applies(scale)) {
             if let Ok(e) = rustgis_data::query::parse_fields(&f.where_, &self.dataset) {
                 for (r, keep) in rows.iter_mut().enumerate() {
-                    *keep = *keep && rustgis_data::query::eval(&e, &self.dataset, r);
+                    *keep = *keep && rustgis_data::query::matches(&e, &self.dataset, r, env);
                 }
             }
         }
@@ -1320,6 +1434,11 @@ impl Layer {
     /// features its definition query and display filters keep. `None` when it draws nothing there
     /// (out of its scale range, or no feature kept, as in an empty layer), so a legend can leave it out.
     pub fn shown_legend(&self, scale: f64) -> Option<Vec<symbology::LegendEntry>> {
+        self.shown_legend_with(scale, &rustgis_data::query::Env::default())
+    }
+
+    /// Legend classes present in the drawn rows, using the page for filtering and classing.
+    pub fn shown_legend_with(&self, scale: f64, env: &rustgis_data::query::Env) -> Option<Vec<symbology::LegendEntry>> {
         if !self.in_scale_range(scale) {
             return None;
         }
@@ -1327,10 +1446,32 @@ impl Layer {
         let query = self.definition_query.as_deref().is_some_and(|q| !q.trim().is_empty());
         let timed = self.time.as_ref().is_some_and(|t| t.window.is_some());
         if !query && !timed && self.display_filters.is_empty() {
-            return (!self.dataset.features.is_empty()).then(|| self.renderer.legend_at(&self.dataset, &[], Some(scale)));
+            return (!self.dataset.features.is_empty())
+                .then(|| self.with_size_legend(self.renderer.legend_with(&self.dataset, &[], env.at_scale(Some(scale)))));
         }
-        let rows = self.drawn_rows(scale);
-        rows.contains(&true).then(|| self.renderer.legend_at(&self.dataset, &rows, Some(scale)))
+        let rows = self.drawn_rows_with(scale, env);
+        rows.contains(&true).then(|| self.with_size_legend(self.renderer.legend_with(&self.dataset, &rows, env.at_scale(Some(scale)))))
+    }
+
+    /// A legend's colour classes with the sizes of [`Layer::size_by`] after them, where it applies:
+    /// the smallest, middle and largest value, drawn as the first class is. No size rows for a field
+    /// the layer doesn't have, which the map can't size by either, under a Size expression, or while
+    /// its points are aggregated into bins, which are drawn instead of them.
+    pub fn with_size_legend(&self, mut entries: Vec<symbology::LegendEntry>) -> Vec<symbology::LegendEntry> {
+        // Not under a Size expression either: where it gives a value it wins, so the rows would
+        // show sizes the map doesn't draw.
+        let sized = self.size_by.as_ref().filter(|s| {
+            symbol_by::SizeBy::applies_to(self)
+                && self.aggregation.is_none()
+                && self.dataset.field_index(&s.field).is_some()
+                && self.symbol_by.size.is_none()
+        });
+        if let Some(s) = sized {
+            let like = entries.first().map_or_else(|| self.renderer.base_symbol(), |e| e.symbol);
+            let strokes = entries.first().map(|e| e.strokes.as_slice()).filter(|s| !s.is_empty()).unwrap_or(&self.line_strokes);
+            entries.extend(s.legend(like, strokes));
+        }
+        entries
     }
 
     /// Rows passing the definition query (all rows when none or invalid).
@@ -1342,9 +1483,13 @@ impl Layer {
     /// definition query keeps. `None` when it has no query, or one that doesn't read: every feature
     /// is drawn then.
     pub fn query_rows(&self, dataset: &Dataset) -> Option<Vec<bool>> {
-        let query = self.definition_query.as_deref().filter(|q| !q.trim().is_empty())?;
-        let expr = rustgis_data::query::parse_fields(query, dataset).ok()?;
-        Some((0..dataset.features.len()).map(|r| rustgis_data::query::eval(&expr, dataset, r)).collect())
+        self.query_rows_with(dataset, &rustgis_data::query::Env::default())
+    }
+
+    /// Applies the definition query in the supplied drawing context.
+    pub fn query_rows_with(&self, dataset: &Dataset, env: &rustgis_data::query::Env) -> Option<Vec<bool>> {
+        let query = rustgis_data::rows::Query::compile(self.definition_query.as_deref(), dataset).ok()?;
+        query.is_filtered().then(|| (0..dataset.features.len()).map(|row| query.matches(dataset, row, env)).collect())
     }
 
     /// Extent in longitude/latitude.
@@ -1352,8 +1497,8 @@ impl Layer {
         match (&self.raster, &self.source) {
             (Some(r), _) => r.data.as_ref().map(|d| d.extent()).unwrap_or(Extent::EMPTY),
             // A streamed layer's whole extent, not just the part read.
-            (None, Some(s)) => s.info().map(|i| i.extent).filter(|e| !e.is_empty()).unwrap_or_else(|| self.dataset.extent()),
-            (None, None) => self.dataset.extent(),
+            (None, Some(s)) => s.info().map(|i| i.extent).filter(|e| !e.is_empty()).unwrap_or_else(|| self.dataset.lonlat_extent()),
+            (None, None) => self.dataset.lonlat_extent(),
         }
     }
 
@@ -1364,20 +1509,25 @@ impl Layer {
         if !query || self.raster.is_some() || self.source.is_some() {
             return self.extent();
         }
-        self.visible_rows()
-            .iter()
-            .zip(&self.dataset.features)
-            .filter(|(v, _)| **v)
-            .filter_map(|(_, f)| f.geometry.as_ref())
-            .fold(Extent::EMPTY, |e, g| e.union(&g.extent()))
+        let shown = self.visible_rows();
+        self.rows_extent(shown.iter().enumerate().filter_map(|(r, v)| v.then_some(r)))
     }
 
+    /// Extent in longitude/latitude of its selected features.
     pub fn selection_extent(&self) -> Extent {
-        self.selection
-            .iter()
-            .filter_map(|r| self.dataset.features.get(*r))
+        self.rows_extent(self.selection.iter().copied())
+    }
+
+    /// Extent in longitude/latitude of the features in `rows` (rows past the last and features
+    /// without geometry left out): the box around them in the dataset's own coordinates, converted
+    /// ([`Dataset::extent_to_lonlat`]).
+    pub fn rows_extent(&self, rows: impl IntoIterator<Item = usize>) -> Extent {
+        let own = rows
+            .into_iter()
+            .filter_map(|r| self.dataset.features.get(r))
             .filter_map(|f| f.geometry.as_ref())
-            .fold(Extent::EMPTY, |e, g| e.union(&g.extent()))
+            .fold(Extent::EMPTY, |e, g| e.union(&g.extent()));
+        self.dataset.extent_to_lonlat(&own)
     }
 
     pub fn opacity(&self) -> f32 {
@@ -1514,6 +1664,9 @@ pub enum Drawn {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Map {
     pub name: String,
+    /// The home project's offline area this map edits, independent of the tab title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_area_id: Option<String>,
     pub layers: Vec<Layer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_groups: Vec<ServiceGroup>,
@@ -1521,6 +1674,11 @@ pub struct Map {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<LayerGroup>,
     pub basemap: Basemap,
+    /// The blank basemap's paper (#2532): its colour where a blank map would draw white, so a
+    /// map frame can sit on a coloured page. Drawn opaque ([`Map::blank_paper`]); only kept with
+    /// [`Basemap::Blank`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper: Option<Rgba>,
     /// Web tile basemaps and overlays (index 0 on top), each drawn over the map layer it names
     /// (`TileLayer::over`), or under all of them; see [`Map::stack`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1666,10 +1824,12 @@ impl Map {
     pub fn new(name: impl Into<String>) -> Self {
         Map {
             name: name.into(),
+            offline_area_id: None,
             layers: Vec::new(),
             service_groups: Vec::new(),
             groups: Vec::new(),
             basemap: Basemap::Paper,
+            paper: None,
             tiles: Vec::new(),
             camera: Camera::world(),
             bookmarks: Vec::new(),
@@ -2696,6 +2856,11 @@ impl Map {
     /// scale denominator. Only layers drawn there read: visible and in their zoom range. Returns
     /// whether a read is still running.
     pub fn sync_sources(&mut self, view: &Extent, scale: f64, block: bool) -> bool {
+        self.sync_sources_with(view, scale, block, &rustgis_data::query::Env::default())
+    }
+
+    /// Syncs drawing windows with the current page for source-side definition queries.
+    pub fn sync_sources_with(&mut self, view: &Extent, scale: f64, block: bool, env: &rustgis_data::query::Env) -> bool {
         let mut pending = false;
         let held = self.held_by_group(scale);
         // Hidden resident layers share the budget too; toggling visibility cannot multiply it.
@@ -2706,7 +2871,12 @@ impl Map {
                 pending |= raster.poll_reload();
             }
             if let Some(src) = &mut layer.source {
-                let changed = src.projection.as_ref().is_some_and(|p| p != &self.projection);
+                // Its features are held in longitude/latitude: a datum grid that arrived since
+                // they were read places them otherwise.
+                let grids = rustgis_data::raster::crs::grid_generation();
+                let new_grids = src.grids.is_some_and(|g| g != grids);
+                src.grids = Some(grids);
+                let changed = src.projection.as_ref().is_some_and(|p| p != &self.projection) || new_grids;
                 let mode_changed = src.full_read != block;
                 let budget_changed = src.byte_budget != bytes;
                 src.projection = Some(self.projection.clone());
@@ -2732,7 +2902,7 @@ impl Map {
             }
         }
         for l in self.layers.iter_mut().filter(|l| l.is_streamed() && l.visible && l.in_scale_range(scale) && !held.contains(&l.id)) {
-            pending |= l.sync_source(view, block);
+            pending |= l.sync_source_with(view, block, env);
         }
         pending
     }
@@ -2820,15 +2990,25 @@ impl Map {
 
     /// The built-in basemap's (background, land, land outline, graticule) colours. The world
     /// outline is the Earth's, so on another body the background is plain: the land's grey, with
-    /// no land drawn on it (#223).
+    /// no land drawn on it (#223). A blank basemap's paper colour (#2532) is its background and its
+    /// land, on any body.
     pub fn palette(&self) -> (Rgba, Rgba, Rgba, Rgba) {
         let (water, land, outline, grat) = self.basemap.palette();
+        if let Some(paper) = self.blank_paper() {
+            return (paper, paper, outline, grat);
+        }
         if self.body().is_earth() {
             return (water, land, outline, grat);
         }
         let l = ((u16::from(land.r()) * 3 + u16::from(land.g()) * 6 + u16::from(land.b())) / 10) as u8;
         let grey = Rgba::rgb(l, l, l);
         (grey, grey, Rgba::new(0, 0, 0, 0), grat)
+    }
+
+    /// The blank basemap's paper colour, when the map is on the blank basemap and has one: always
+    /// opaque, a file's translucent one included (the paper is the backdrop: nothing shows through).
+    pub fn blank_paper(&self) -> Option<Rgba> {
+        self.paper.filter(|_| self.basemap == Basemap::Blank).map(|c| Rgba::rgb(c.r(), c.g(), c.b()))
     }
 
     /// Whether the built-in world outline is drawn: where the palette's land and water differ, so
@@ -3053,10 +3233,12 @@ impl Map {
     pub fn slots(&self) -> Vec<Slot<'_>> {
         let Map {
             name: _,
+            offline_area_id: _,
             layers,
             service_groups,
             groups: _,
             basemap: _,
+            paper: _,
             tiles,
             camera: _,
             bookmarks: _,
@@ -3175,6 +3357,7 @@ impl Layer {
             stroke_levels: _,
             marker_rotation: _,
             symbol_by: _,
+            size_by: _,
             reference_scale: _,
             priority: _,
             design: _,
@@ -3195,6 +3378,8 @@ impl Layer {
             thinned: _,
             projected_rev: _,
             projected_for: _,
+            projected_crs: _,
+            lonlat: _,
             view_memory: _,
             geometry_kinds: _,
             geometry_rev: _,
@@ -3212,6 +3397,7 @@ impl Layer {
             crs_incomplete: _,
             zm_dropped: _,
             windowed: _,
+            held_in: _,
         } = dataset;
         if let Some(v) = provenance {
             out.push((LayerRole::Dataset, v.as_str(), true, paths::is_local(v)));
@@ -3246,6 +3432,24 @@ impl Layer {
             LayerRole::GpkgPath => Some(&mut self.gpkg.as_mut()?.path),
             LayerRole::PostgisEditDatabase => Some(&mut self.postgis.as_mut()?.origin.database),
         }
+    }
+}
+
+/// A layer's geometry in longitude/latitude, made from its rows at a geometry revision in a
+/// coordinate system ([`Layer::lonlat_in`]).
+#[derive(Clone, Debug, Default)]
+struct LonLatCopy {
+    geoms: std::sync::Arc<Vec<Option<Geometry>>>,
+    /// Its size, counted once when it is made ([`Layer::view_cache_bytes`]).
+    bytes: usize,
+    rev: u64,
+    crs: Option<Crs>,
+}
+
+impl LonLatCopy {
+    /// Whether it is of `layer`'s rows as they are now.
+    fn fits(&self, layer: &Layer) -> bool {
+        self.crs == Some(layer.dataset.coord_crs()) && self.rev == layer.geometry_rev && self.geoms.len() == layer.dataset.features.len()
     }
 }
 
@@ -3933,6 +4137,21 @@ mod tests {
         l.definition_query = Some(format!("!n! = {left_out} and (@row_number >= 1 or 'it''s' = '')"));
         l.sync_source(&view, true);
         assert!(!l.source.as_ref().unwrap().sampled_matches());
+        // One view on two series pages: a sampled-out match must arrive on each page,
+        // and the map view afterwards must evaluate the same query with null page variables.
+        l.definition_query = Some("n = @page_number - 1".into());
+        for number in [left_out as usize + 1, (left_out as usize + 1) % 5 + 1] {
+            let env = rustgis_data::query::Env {
+                page: Some(std::sync::Arc::new(rustgis_data::query::SeriesPage { feature_id: 1, name: number.to_string(), number })),
+                ..Default::default()
+            };
+            l.sync_source_with(&view, true, &env);
+            assert_eq!(l.dataset.features.len(), 1);
+            assert_eq!(l.dataset.value(0, 0), &Value::Int(number as i64 - 1));
+            assert_eq!(l.drawn_rows_with(1e6, &env), [true]);
+        }
+        l.sync_source(&view, true);
+        assert!(l.dataset.features.is_empty());
         // A query that doesn't parse leaves the view as read without one, as for loaded layers.
         l.definition_query = Some("n = = 1".into());
         l.sync_source(&view, true);
@@ -4064,6 +4283,39 @@ mod tests {
         l.touch_geometry();
         assert!(!l.prepare_display(&flat, 0.001, false));
         assert_eq!(lod::DISPLAY_BUILDS.get(), before + 4);
+    }
+
+    /// A layer held in another system keeps its globe copy in longitude/latitude beside a flat
+    /// projection: hit-testing or snapping in Web Mercator doesn't make the globe convert it again.
+    #[test]
+    fn a_held_layers_globe_copy_and_flat_projection_are_kept_apart() {
+        let mut d = Dataset::new("held", GeometryType::Point, vec![]);
+        d.push(Some(Geometry::Point(Coord::new(11.5, 48.7))), vec![]);
+        d.hold_in(Crs::Epsg(32632)).unwrap();
+        let mut l = Layer::new(1, d);
+        let before = l.view_cache_bytes();
+        let globe = l.lonlat_in().as_ptr();
+        assert!(l.view_cache_bytes() > before, "the globe copy is counted in the layer's cache memory");
+        // A copy drawn only on the globe hands its copy back, with no flat projection to share.
+        let mut receiver = l.clone();
+        receiver.clear_cache();
+        receiver.adopt_cache(&l);
+        assert_eq!(receiver.lonlat_cache().as_ptr(), globe, "the globe copy wasn't adopted");
+        let Some(Geometry::Point(c)) = &l.lonlat_cache()[0] else { panic!("a point") };
+        assert!((c.x - 11.5).abs() < 1e-9 && (c.y - 48.7).abs() < 1e-9, "{c:?}");
+        l.projected();
+        assert!(l.is_cached("mercator"));
+        assert_eq!(l.lonlat_in().as_ptr(), globe, "the flat projection evicted the globe copy");
+        assert!(l.is_cached("mercator"), "the globe copy evicted the flat projection");
+        // An edit makes both again; clearing the caches drops both.
+        l.touch_geometry();
+        assert!(l.lonlat_cache().is_empty());
+        assert!(!l.lonlat_in().is_empty());
+        l.clear_cache();
+        assert!(l.lonlat_cache().is_empty());
+        // A layer in longitude/latitude has none: the globe draws its rows.
+        let mut plain = long_line(10);
+        assert!(plain.lonlat_in().is_empty());
     }
 
     #[test]
@@ -4234,6 +4486,26 @@ mod tests {
         m.layers[0].definition_query = Some("n = 2".into());
         assert_eq!(m.shown_extent(), Extent::new(10.0, 10.0, 10.0, 10.0));
         assert_eq!(m.full_extent(), Extent::new(0.0, 0.0, 10.0, 10.0));
+    }
+
+    /// A layer's extents are in longitude/latitude, converted from its dataset's own coordinates
+    /// (`Dataset::coord_crs`). That is longitude/latitude for every dataset today, whatever system
+    /// it records, so this covers the identity: the boxes are its geometry's. Rows past the last
+    /// are left out.
+    #[test]
+    fn a_layers_extents_are_identity_converted_to_lonlat() {
+        let mut m = Map::new("Map");
+        let mut ds = points();
+        ds.crs = Some(Crs::Epsg(2056));
+        m.add_dataset(ds);
+        let l = &mut m.layers[0];
+        assert_eq!(l.extent(), Extent::new(0.0, 0.0, 10.0, 10.0));
+        assert_eq!(l.extent(), l.dataset.lonlat_extent());
+        assert_eq!(l.rows_extent([1, 99]), Extent::new(10.0, 10.0, 10.0, 10.0));
+        assert!(l.rows_extent([99]).is_empty());
+        l.selection = vec![0];
+        assert_eq!(l.selection_extent(), Extent::new(0.0, 0.0, 0.0, 0.0));
+        assert_eq!(m.selection_extent(), Extent::new(0.0, 0.0, 0.0, 0.0));
     }
 
     #[test]

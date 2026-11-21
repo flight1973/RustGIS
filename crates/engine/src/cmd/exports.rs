@@ -39,8 +39,8 @@ impl Wrote {
     }
 }
 
-/// What an export does to the session once its file is written, and adds to its answer; or the
-/// failure it says once what came before it was said (a layout's warnings, then its error).
+/// Completes an export on the live session and may update its answer. A field package's finalizer
+/// checks that its home still accepts the new area or identity before installing the staged file.
 pub(crate) type Then = Box<dyn FnOnce(&mut Session, &mut Value) -> Result<(), String> + Send>;
 
 /// The writing of an export, its inputs read: it needs no session.
@@ -58,9 +58,12 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str, Start)] = &[
     ("share.exportRaster", "Export Raster", super::raster::export_work),
     ("share.exportMap", "Export Map", super::share::map_work),
     ("map.exportOrbit", "Export Orbit", super::view::orbit_work),
+    ("map.exportBlock", "Export Block", super::block_model::export_work),
     ("layout.export", "Export Layout", super::layout::export_work),
     ("report.export", "Export Report", super::report::export_work),
     ("source.publish", "Publish to Source", super::publish::publish_work),
+    #[cfg(not(target_arch = "wasm32"))]
+    ("offline.package", "Package for the Field", super::field::export_work),
 ];
 
 /// `command` and what it is called, when the app writes its file on another thread (see
@@ -297,9 +300,9 @@ impl ExportRun {
         self.started.clone()
     }
 
-    /// Writes the file, blocking until it's written; `control` stops it and counts its progress
-    /// (see [`rustgis_analysis::control`]). A cancelled export leaves no file, or the one there
-    /// before.
+    /// Writes the file, or stages it if installing it needs the live session. `control` stops the
+    /// work and counts its progress (see [`rustgis_analysis::control`]). A cancelled export leaves
+    /// no file, or the one there before.
     pub fn run(self, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> Result<Wrote, String> {
         let inputs = self.started.capture_inputs.then(rustgis_data::provenance::Capture::start);
         let ExportRun { name, work, started } = self;

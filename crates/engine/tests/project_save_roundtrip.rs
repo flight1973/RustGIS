@@ -98,6 +98,8 @@ fn step() -> impl Strategy<Value = (&'static str, Value)> {
         (layer.clone(), color())
             .prop_map(|(l, c)| ("layer.fillLayers", json!({"layer": l, "fills": [{"color": c}, {"pattern": "hatch", "angle": 135}]}))),
         layer.clone().prop_map(|l| ("layer.markerRotation", json!({"layer": l, "field": "pop", "counterclockwise": true}))),
+        (layer.clone(), prop::sample::select(vec!["area", "radius"]))
+            .prop_map(|(l, k)| ("layer.sizeBy", json!({"layer": l, "field": "pop", "minSize": 2, "maxSize": 30, "scaling": k}))),
         (layer.clone(), -5i32..6).prop_map(|(l, v)| ("layer.priority", json!({"layer": l, "value": v}))),
         (layer.clone(), number()).prop_map(|(l, v)| ("layer.referenceScale", json!({"layer": l, "scale": v * 1e4}))),
         layer.clone().prop_map(|l| ("layer.symbolBy", json!({"layer": l, "size": "pop / 10", "fill": "if(pop > 5, '#ff0000', NULL)"}))),
@@ -120,6 +122,7 @@ fn step() -> impl Strategy<Value = (&'static str, Value)> {
         (prop::sample::select(vec!["legend", "scaleBar", "northArrow", "text", "rectangle", "grid", "colorbar"]), name())
             .prop_map(|(k, t)| ("layout.addElement", json!({"kind": k, "text": t}))),
         prop::sample::select(vec!["paper", "midnight", "ocean", "atlas", "blank"]).prop_map(|n| ("map.basemap", json!({"name": n}))),
+        prop::sample::select(vec!["#F1EADF", "#101820"]).prop_map(|c| ("map.basemap", json!({"name": "blank", "color": c}))),
         prop::sample::select(vec!["Albers Equal Area Conic +lat_1=29.5 +lat_2=45.5", "EPSG:3857", "EPSG:4326"])
             .prop_map(|t| ("map.projection", json!({"type": t}))),
         (-180.0..180.0f64).prop_map(|b| ("map.setBearing", json!({"bearing": b}))),

@@ -19,7 +19,7 @@ pub fn commands() -> Vec<C> {
     let mut commands = vec![
         C::new("select.byAttributes", "Select By Attributes", "Home › Selection", by_attributes).roles(&[]).effects(crate::policy::Effects::NONE)
             .when(need_layers)
-            .params(r#"{"layer"?, "where": "SQL clause", "mode"?: "new"|"add"|"remove"|"subset"}"#),
+            .params(r#"{"layer"?, "where": sql, "mode"?: "new"|"add"|"remove"|"subset"}"#),
         C::new("select.byRect", "Select (rectangle)", "Home › Selection", by_rect).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"minLon", "minLat", "maxLon", "maxLat", "mode"?: "new"|"add"|"remove"}"#),
         C::new("select.byPolygon", "Select by Polygon", "Home › Selection", by_polygon).roles(&[]).effects(crate::policy::Effects::NONE)
@@ -75,6 +75,8 @@ pub fn commands() -> Vec<C> {
                 return Err("nothing is selected in this layer".into());
             }
             let mut ds = rustgis_data::Dataset::new(format!("{} selection", l.name), l.geometry_type(), l.dataset.fields.clone());
+            // Its coordinates as they are, held in the layer's system.
+            ds.held_in = l.dataset.held_in;
             for r in &l.selection {
                 if let Some(f) = l.dataset.features.get(*r) {
                     ds.push(f.geometry.clone(), f.attrs.clone());
@@ -185,7 +187,9 @@ fn by_rect(s: &mut Session, p: &Value) -> CmdResult {
     if !matches!(s.map().flat(), rustgis_map::projection::Flat::Mercator) {
         for (id, rows) in &mut hits {
             if let Some(l) = s.map().layer(*id) {
-                rows.retain(|r| l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| g.extent().intersects(&ll)));
+                // The rectangle in the layer's own coordinates, as its features' boxes are.
+                let own = l.dataset.extent_from_lonlat(&ll);
+                rows.retain(|r| l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| g.extent().intersects(&own)));
             }
         }
         hits.retain(|(_, rows)| !rows.is_empty());

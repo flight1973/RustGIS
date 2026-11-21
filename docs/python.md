@@ -230,6 +230,7 @@ s.set_center(114.1, 22.4, scale=2_000_000)          # bearing= and pitch= tilt a
 s.zoom_to(s["Cities"])                              # or a box: (west, south, east, north)
 s.bounds                                            # what the map shows now
 s.set_basemap("paper")                              # paper, midnight, ocean, atlas, blank
+s.set_basemap("blank", color="#F1EADF")             # blank on a coloured page
 s.add_tiles("https://tile.openstreetmap.org/{z}/{x}/{y}.png", name="OpenStreetMap")
 ```
 
@@ -276,6 +277,11 @@ OS store. If saving fails, the session login still works and a warning says it w
 login usable. `connection.logout` retains the saved login but blocks automatic reuse for the
 rest of the session until an explicit `connection.login`. See
 [Web-service logins](user-guide/data.md#web-service-logins) for matching and HTTP confirmation.
+
+An ArcGIS-token connection (`auth="arcgis"`) takes `s.run("connection.login", id="c1", token="…")`, or
+`s.run("connection.generateToken", id="c1", tokenEndpoint="https://host/arcgis/tokens/generateToken", password="…")`
+and then `s.run("connection.tokenStatus", id="c1")` until its `pending` is false (`connection.cancelToken`
+stops it); the password is sent in that one request and kept nowhere.
 
 ## Data in and out
 

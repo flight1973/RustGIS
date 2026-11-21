@@ -7,7 +7,8 @@
 //! for that long, `{"click": label}` clicks the first widget whose label contains the text (with
 //! `"exact": true`, whose whole label is the text), `{"combo": text}` opens the combo box showing
 //! that text, `{"type": text}` types into the focused box,
-//! `{"key": "Enter"}` presses a key (egui's key names), `{"dark": true}` switches theme,
+//! `{"key": "Enter"}` presses a key (egui's key names; `"ctrl": true` holds Ctrl, `{"key": "Space",
+//! "ctrl": true}`), `{"dark": true}` switches theme,
 //! `{"drag": [x, y, dx, dy]}` presses the pointer at (x, y) and moves it by (dx, dy), holding
 //! it (shots then catch the map mid-drag; `{"release": true}` lets go; `"button": "secondary"`; `"ctrl": true` holds Ctrl
 //! drags with the right button),
@@ -33,6 +34,12 @@
 //! renamed over it) and `{"remove": path}` deletes a file, as another program would.
 //! `"recovery": "/abs/dir"` on the first line gives the run that recovery folder, as the desktop
 //! app has one (Settings › Autosave; a copy left there is offered by the recovery dialog).
+//! `"touch": true` on the first line gives the run a stand-in for a phone's touch interface (the
+//! map alone), kept as a phone's shell keeps it: the View tab then has Touch Interface.
+//! The phone's foreground recovery policy requires both `"recovery"` and `"touch": true`.
+//! A recovery folder without touch uses the desktop interval.
+//! `"gridFolders": true` on the first line reads and keeps datum grids in RustGIS's grid folder, as
+//! the desktop app does (Settings › Datum Grids; set `RUSTGIS_APP_DATA_DIR` for a run's own).
 //! `"memorySecrets": true` on the first line supplies an isolated in-memory credential store for
 //! Remember/Forget screenshots. It never opens the OS keychain or writes credentials to disk.
 //!
@@ -55,6 +62,11 @@ struct RibbonSplitShowcase {
     long_labels: bool,
     fonts_installed: bool,
     applied_look: Option<(String, bool, u64)>,
+}
+
+/// Stands in for a phone's touch interface (`"touch": true`): the map alone.
+fn touch_stand_in(app: &mut RustGisApp, ui: &mut egui::Ui) {
+    app.map_view(ui);
 }
 
 fn split_tool_menu(ui: &mut egui::Ui, app: &mut RustGisApp) {
@@ -157,14 +169,27 @@ fn main() {
     let dt = lines.iter().find_map(|l| l.get("dt").and_then(|v| v.as_f64())).unwrap_or(0.25) as f32;
     let ribbon_split = lines.first().and_then(|l| l.get("ribbonSplit")).and_then(Value::as_bool).unwrap_or(false);
     let mut split_showcase = RibbonSplitShowcase::default();
+    // `"gridFolders": true`: datum grids read from and downloaded into RustGIS's grid folder, as the
+    // desktop app does (`RUSTGIS_APP_DATA_DIR` keeps a run's own).
+    if lines.first().and_then(|l| l.get("gridFolders")).and_then(Value::as_bool).unwrap_or(false) {
+        rustgis_ui_egui::rustgis_engine::data::raster::crs::use_grid_folders();
+    }
     let mut app = RustGisApp::with_sample();
     // As the desktop app does: Add Data, Load All, models and scripts run on a thread of their own.
     app.reads_off_frame = lines.first().and_then(|l| l.get("readsOffFrame")).and_then(Value::as_bool).unwrap_or(false);
+    let touch = lines.first().and_then(|l| l.get("touch")).and_then(Value::as_bool) == Some(true);
+    if touch {
+        app.touch = Some(touch_stand_in);
+    }
     // As the desktop app does: linked files changed on disk are reported (#1477).
     app.watch_files = lines.first().and_then(|l| l.get("watchFiles")).and_then(Value::as_bool).unwrap_or(false);
     if let Some(dir) = lines.first().and_then(|l| l.get("recovery")).and_then(Value::as_str) {
         let store = rustgis_ui_egui::FolderStore::open(std::path::Path::new(dir)).expect("recovery folder");
-        app = app.with_services(rustgis_ui_egui::Services { recovery: Some(Box::new(store)), ..Default::default() });
+        app = if touch {
+            app.with_edit_recovery(Box::new(store))
+        } else {
+            app.with_services(rustgis_ui_egui::Services { recovery: Some(Box::new(store)), ..Default::default() })
+        };
     }
     if lines.first().and_then(|l| l.get("memorySecrets")).and_then(Value::as_bool) == Some(true) {
         app.session.database_logins.set_store(Some(std::sync::Arc::new(rustgis_engine::data::secrets::MemorySecrets::new())));
@@ -437,8 +462,9 @@ fn main() {
                 harness.step();
             }
         } else if let Some(k) = l.get("key").and_then(|v| v.as_str()) {
+            let mods = if l.get("ctrl").and_then(Value::as_bool).unwrap_or(false) { egui::Modifiers::CTRL } else { egui::Modifiers::NONE };
             match egui::Key::from_name(k) {
-                Some(key) => harness.key_press(key),
+                Some(key) => harness.key_press_modifiers(mods, key),
                 None => eprintln!("no key named '{k}'"),
             }
             for _ in 0..3 {

@@ -24,7 +24,8 @@ A phone opens in the touch interface: the map, with a bar of four large buttons 
 | **More** | Full Extent, the project, Undo and Redo, the position, tracks and the rest |
 
 Each button opens a sheet that rises over the map. **Use the Desktop Interface**, in the More
-sheet, brings back the ribbon and panes until the app is started again.
+sheet, brings back the ribbon and panes; **Touch Interface**, on the View tab (or Use the Touch
+Interface in Command Search), returns to the phone's interface.
 
 ## Opening data
 
@@ -145,9 +146,12 @@ A field package (`.rgisfield`) carries a map to the phone and its edits back.
 1. **On the computer**, with the map in view, **Data › Offline › Package for the Field** makes
    the package: a project of that map, the features in view, and the MBTiles and PMTiles
    archives its tile layers use. The package records the area it was made from in your project,
-   so save the project after packaging. Raster layers are left out, and the package says so.
+   so save the project after packaging. A layer read in place from a supported local file is
+   copied within the area while it fits the package budget. The copy is for reference, and
+   Bring Back skips edits to it. The sender gets a notice about anything left behind, including
+   rasters and streamed layers that could not be copied.
 2. **On the phone**, open the package with **Open Project** (or **Add Data**). It is unpacked into
-   a folder of its own and its map opens.
+   a folder of its own and its map opens. Any notices about what stayed behind appear as it opens.
 3. **In the field**, capture and edit as above.
 4. **Back from the field**, **Send Field Package**, in the More sheet, saves the map as a field
    package again, with the photos its features name, wherever you choose (a cloud drive, email,
@@ -157,9 +161,13 @@ A field package (`.rgisfield`) carries a map to the phone and its edits back.
    in a folder beside the project. A feature also changed on the computer takes the field's
    version, and the summary names it; **Undo** brings the computer's versions back.
 
-Give one package to one phone at a time, and make a new package after each Bring Back: a second
-phone's edits to the same package, brought back after the first's, would undo the first's where
-they differ. A package for an area the project doesn't have is refused.
+Give one package to one phone, and make a new package after each Bring Back or Sync of its area:
+from the area's offline map, **Package for the Field** again. A package comes back once, and only
+while its area is as it was when the package was made. A second phone's copy of the same package, or
+the same phone's second return, would undo or repeat what the first brought home, so Bring Back
+refuses it and changes nothing; redo that phone's edits on a new package. A package made before
+packages carried this check comes back as before, with a notice. A package for an area the project
+doesn't have is refused.
 
 ### Origin identities and older field copies
 
@@ -172,6 +180,8 @@ newly created area and identities too.
 Saving a project with these identities declares the `field-origin` capability, even when the
 offline area has never been sent as a field package. Earlier RustGIS releases that do not
 support this capability refuse the saved project rather than discard its return association.
+A project whose area has been packaged also declares `field-generation`, for the return check
+described above, so a release without it can't save the project and then accept any copy.
 
 A field copy made before these identities were introduced still opens, and Send Field Package
 preserves its edits and photos as an unverified legacy return. Ordinary Bring Back refuses to
@@ -209,6 +219,13 @@ after packaging; legacy recovery cannot change that association.
   download code that adds to what it does.
 - **Choosing a folder** is not possible with the phone's picker; the app says so where one is
   asked for.
-- **Preferences, saved passwords and autosave** are not available on a phone yet.
+- **Recovery** keeps a copy of completed edits in the app's private storage. On the next launch,
+  the app offers to recover unsaved work if a complete copy is available. The first edit submits
+  a copy immediately. Edits made within two seconds of a submission are grouped into another copy
+  due at the end of that interval. When the exit hook runs, it submits any waiting edit and gives
+  the writer up to two seconds to finish. The system can stop the app without running that hook.
+  If a copy is still waiting or being written when the process ends, recovery uses the most recent
+  completed copy, if one exists. Recovered field packages can still be sent back with their photos.
+- **Preferences and saved passwords** are not available on a phone yet.
 - **HTTPS** on Android is checked against a bundled list of trusted roots rather than the
   device's own, and the app says so once. An iPhone or iPad uses the device's own.

@@ -2294,10 +2294,13 @@ pub(crate) fn text_graphic_at(app: &RustGisApp, ctx: &egui::Context, rect: Rect,
     let clip = map.view.clip_distance.map(|d| (map.camera.center_lonlat(), d));
     map.layers.iter().filter(|l| l.graphics && l.selectable && map.draws_at(l, scale) && map.layer_opacity(l) > 0.0).find_map(|l| {
         let drawn = l.drawn_rows(scale);
+        // Boxes in longitude/latitude, as the view distance is measured there: none when the
+        // layer's coordinates can't be converted, as none of it is drawn then.
+        let to_lonlat = l.dataset.lonlat_conversion().ok()?;
         (0..l.dataset.features.len()).rev().filter(|r| drawn.get(*r) == Some(&true)).find_map(|row| {
             let g = l.dataset.features.get(row)?.geometry.as_ref()?;
             if let Some((centre, d)) = clip {
-                let e = g.extent();
+                let e = to_lonlat.extent(&g.extent());
                 let near = Coord::new(centre.x.clamp(e.min_x, e.max_x), centre.y.clamp(e.min_y, e.max_y));
                 if e.is_empty() || rustgis_engine::geom::haversine_m(centre, near) > d {
                     return None;
@@ -2322,7 +2325,11 @@ fn text_shown(
     use rustgis_engine::map::graphics;
     let ds = &l.dataset;
     let text = graphics::expand(graphics::label(ds, row)?, tokens);
-    let at = lonlat_to_screen(app, rect, ds.features.get(row)?.geometry.as_ref()?.label_point()?)?;
+    // Its place in longitude/latitude, from the layer's own coordinates (the identity today).
+    let place = ds.features.get(row)?.geometry.as_ref()?.label_point()?;
+    let to_lonlat = ds.lonlat_conversion().ok()?;
+    let place = if to_lonlat.is_identity() { place } else { to_lonlat.point(place)? };
+    let at = lonlat_to_screen(app, rect, place)?;
     let job = label_job(
         &text,
         graphics::font_size(ds, row),
@@ -3540,7 +3547,10 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         let mut verts: Vec<Coord> = Vec::new();
         for l in app.session.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster() && !l.graphics) {
             for r in &l.selection {
-                if let Some(g) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()) {
+                // In longitude/latitude, from the layer's own coordinates, as they are drawn.
+                if let Some(g) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref())
+                    && let Ok(g) = l.dataset.geometry_to_lonlat(g)
+                {
                     g.for_each_coord(|c| {
                         if verts.len() < 4000 {
                             verts.push(c);
@@ -4378,13 +4388,8 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     // Zooms to the feature shown, found by its id, as Zoom To Selection does: the selection and
     // the undo history are left as they are.
     if let (true, Some((id, fid))) = (zoom, shown) {
-        let extent = app
-            .session
-            .map()
-            .layer(id)
-            .and_then(|l| l.dataset.features.iter().find(|f| f.id == fid))
-            .and_then(|f| f.geometry.as_ref())
-            .map(|g| g.extent());
+        let extent =
+            app.session.map().layer(id).and_then(|l| l.dataset.features.iter().position(|f| f.id == fid).map(|row| l.rows_extent([row])));
         if let Some(e) = extent.filter(|e| !e.is_empty()) {
             app.session.zoom_to(&e);
         }
@@ -4803,7 +4808,17 @@ fn shown_layers(session: &rustgis_engine::Session) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     let project = &session.project;
     let map = project.map();
-    (&session.path, &project.name, project.active_map, &map.name, map.basemap, map.graticule, map.graticule_type, &map.graticule_crs)
+    (
+        &session.path,
+        &project.name,
+        project.active_map,
+        &map.name,
+        map.basemap,
+        map.paper,
+        map.graticule,
+        map.graticule_type,
+        &map.graticule_crs,
+    )
         .hash(&mut h);
     for l in &map.layers {
         (l.id, l.visible).hash(&mut h);
