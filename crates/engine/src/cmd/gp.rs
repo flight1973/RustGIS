@@ -5806,6 +5806,10 @@ mod batch_tests {
         let tool = resolve_tool("spatialJoin").unwrap();
         let missing: Vec<&str> = tool.params.iter().map(|p| p.name).filter(|k| !command.contains(k)).collect();
         assert!(missing.is_empty(), "gp.spatialJoin doesn't declare {missing:?}");
+        // Zonal Statistics' old `layer` for its raster is never read: `raster` is required, so a
+        // run given only `layer` is refused first, and the error names the key it was given.
+        let e = s.run("gp.run", &json!({"tool": "zonalStats", "params": {"layer": "Cities", "polygons": "Parks"}})).unwrap_err();
+        assert!(e.ends_with("'Input Raster' is required (given 'layer', which Zonal Statistics doesn't read)"), "{e}");
         // A run started in the background says it too, before its work.
         let mark = s.notices.len() as u64;
         let _run = tool_start(&mut s, "buffer", &json!({"input": "Cities", "distance": 100, "unit": "Miles"})).unwrap();
