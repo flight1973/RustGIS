@@ -463,7 +463,7 @@ pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> 
 /// none. Bounded as [`quoted_keys`] bounds them.
 fn unread(spec: &ToolSpec, params: &Value) -> String {
     let Some(given) = params.as_object() else { return String::new() };
-    let unknown: Vec<&str> = given.keys().map(String::as_str).filter(|k| !is_accepted_param(spec, k)).collect();
+    let unknown: Vec<&str> = given.keys().map(String::as_str).filter(|k| !is_expected_key(spec, k)).collect();
     if unknown.is_empty() {
         return String::new();
     }
@@ -521,16 +521,17 @@ fn params_for(spec: &ToolSpec, params: &Value, built_in: bool) -> Result<Value, 
 
 pub use tools::JOIN_FIELD_ALIASES;
 
-/// Whether a parameter key is declared by `spec` or accepted as a valid parameter alias. A layer
-/// parameter's `<name>_name` counts too: the app's tool dialog puts a table's name there beside
-/// its id, for the run's history, and no tool reads it.
+/// Whether a parameter key is declared by `spec` or accepted as a valid parameter alias.
 pub fn is_accepted_param(spec: &ToolSpec, key: &str) -> bool {
-    if spec.params.iter().any(|p| p.name == key) {
-        return true;
-    }
-    let names_a_table =
-        key.strip_suffix("_name").is_some_and(|base| spec.params.iter().any(|p| p.name == base && matches!(p.kind, ParamKind::Layer)));
-    names_a_table || (spec.id == "joinField" && JOIN_FIELD_ALIASES.contains(&key))
+    spec.params.iter().any(|p| p.name == key) || (spec.id == "joinField" && JOIN_FIELD_ALIASES.contains(&key))
+}
+
+/// Whether a key given with a run isn't one to warn of (#2307): one [`is_accepted_param`] accepts,
+/// or a layer parameter's `<name>_name`, where the app's tool dialog puts a table's name beside its
+/// id for the run's history. No tool reads that one, so it isn't a parameter to run over either.
+pub fn is_expected_key(spec: &ToolSpec, key: &str) -> bool {
+    is_accepted_param(spec, key)
+        || key.strip_suffix("_name").is_some_and(|base| spec.params.iter().any(|p| p.name == base && matches!(p.kind, ParamKind::Layer)))
 }
 
 /// The names a tool reads one of its parameters under, `key` among them, or none when it has no

@@ -1728,7 +1728,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         .as_object()
         .into_iter()
         .flat_map(|map| map.keys().map(String::as_str))
-        .filter(|key| !rustgis_analysis::is_accepted_param(spec, key) && *key != batch_param)
+        .filter(|key| !rustgis_analysis::is_expected_key(spec, key) && *key != batch_param)
         .collect();
     if !unknown.is_empty() {
         unknown.sort();
@@ -2540,7 +2540,11 @@ fn zonal_stats(s: &mut Session, p: &Value) -> CmdResult {
 /// would otherwise leave the tool at its default without a word: `"unit": "Miles"` buffers in
 /// kilometers.
 pub(crate) fn ignored_params(spec: &rustgis_analysis::ToolSpec, params: &Value) -> Option<String> {
-    let unknown = params.as_object()?.keys().map(String::as_str).filter(|k| !rustgis_analysis::is_accepted_param(spec, k)).collect();
+    let unknown: Vec<&str> =
+        params.as_object()?.keys().map(String::as_str).filter(|k| !rustgis_analysis::is_expected_key(spec, k)).collect();
+    if unknown.is_empty() {
+        return None;
+    }
     let reads: Vec<&str> = spec.params.iter().map(|p| p.name).collect();
     crate::ignored_keys(spec.name, unknown, &reads)
 }
@@ -2565,7 +2569,8 @@ pub(crate) fn admitted_saying(
 
 /// [`run_tool`] for parameters a caller wrote (`gp.run`, a model's step), saying first which of
 /// them the tool ignores ([`admitted_saying`]). A failed run takes that warning back, so its
-/// error says the keys too, whatever the failure.
+/// error says the keys too when the run fails over its parameters or inside the tool (a run the
+/// policy refuses is refused for who asked, not for what it was given).
 pub(crate) fn run_tool_saying(s: &mut Session, tool: &str, params: &Value) -> CmdResult {
     let control = run_control(s);
     let op = admitted_saying(s, tool, params)?;
@@ -2583,7 +2588,7 @@ fn saying_unread(spec: &rustgis_analysis::ToolSpec, params: &Value, error: Strin
         .as_object()
         .into_iter()
         .flat_map(|m| m.keys().map(String::as_str))
-        .filter(|k| !rustgis_analysis::is_accepted_param(spec, k))
+        .filter(|k| !rustgis_analysis::is_expected_key(spec, k))
         .collect();
     if unknown.is_empty() {
         return error;
@@ -4789,6 +4794,12 @@ mod batch_tests {
         );
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("tool 'buffer' has no parameter 'imput'"));
+        // The tool dialog's `input_name` isn't warned of, but nor is it a parameter to run over.
+        let res = s.run(
+            "gp.batch",
+            &json!({"tool": "buffer", "inputs": ["Cities"], "param": "input_name", "params": {"input": "Cities", "distance": 10}}),
+        );
+        assert!(res.is_err_and(|e| e.contains("tool 'buffer' has no parameter 'input_name'")));
     }
 
     #[test]
