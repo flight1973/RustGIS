@@ -1728,7 +1728,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         .as_object()
         .into_iter()
         .flat_map(|map| map.keys().map(String::as_str))
-        .filter(|key| !rustgis_analysis::is_expected_key(spec, key) && *key != batch_param)
+        .filter(|key| !rustgis_analysis::is_expected_key(spec, &base_params, key) && *key != batch_param)
         .collect();
     if !unknown.is_empty() {
         unknown.sort();
@@ -2076,6 +2076,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             for alias in rustgis_analysis::param_aliases(spec, batch_param).iter().filter(|a| **a != batch_param) {
                 map.remove(*alias);
             }
+            // Nor keep the tool dialog's name of the table it replaced (`input_name`).
+            map.remove(&format!("{batch_param}_name"));
             map.insert(batch_param.to_string(), json!(target_layer_name));
             if tool_has_output {
                 map.insert("output".to_string(), json!(final_out_name));
@@ -2087,6 +2089,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             for alias in rustgis_analysis::param_aliases(spec, batch_param).iter().filter(|a| **a != batch_param) {
                 map.remove(*alias);
             }
+            map.remove(&format!("{batch_param}_name"));
             map.insert(batch_param.to_string(), json!(target));
             if tool_has_output {
                 map.insert("output".to_string(), json!(final_out_name));
@@ -2541,7 +2544,7 @@ fn zonal_stats(s: &mut Session, p: &Value) -> CmdResult {
 /// kilometers.
 pub(crate) fn ignored_params(spec: &rustgis_analysis::ToolSpec, params: &Value) -> Option<String> {
     let unknown: Vec<&str> =
-        params.as_object()?.keys().map(String::as_str).filter(|k| !rustgis_analysis::is_expected_key(spec, k)).collect();
+        params.as_object()?.keys().map(String::as_str).filter(|k| !rustgis_analysis::is_expected_key(spec, params, k)).collect();
     if unknown.is_empty() {
         return None;
     }
@@ -2588,7 +2591,7 @@ fn saying_unread(spec: &rustgis_analysis::ToolSpec, params: &Value, error: Strin
         .as_object()
         .into_iter()
         .flat_map(|m| m.keys().map(String::as_str))
-        .filter(|k| !rustgis_analysis::is_expected_key(spec, k))
+        .filter(|k| !rustgis_analysis::is_expected_key(spec, params, k))
         .collect();
     if unknown.is_empty() {
         return error;
@@ -4800,6 +4803,13 @@ mod batch_tests {
             &json!({"tool": "buffer", "inputs": ["Cities"], "param": "input_name", "params": {"input": "Cities", "distance": 10}}),
         );
         assert!(res.is_err_and(|e| e.contains("tool 'buffer' has no parameter 'input_name'")));
+        // Each item drops the dialog's name of the table it replaces, so its history doesn't name
+        // the wrong one.
+        let n = s.project.gp_history.len();
+        s.run("gp.batch", &json!({"tool": "buffer", "inputs": ["Cities"], "params": {"input": 7, "input_name": "Old", "distance": 10}}))
+            .unwrap();
+        let recorded = &s.project.gp_history[n..];
+        assert!(!recorded.is_empty() && recorded.iter().all(|h| h.params.get("input_name").is_none()), "{recorded:?}");
     }
 
     #[test]
@@ -5805,7 +5815,13 @@ mod batch_tests {
         // The name the tool dialog puts beside a table's id (`input_name`) isn't taken for a stray;
         // `_name` beside a parameter that isn't a layer is.
         let buffer_spec = resolve_tool("buffer").unwrap();
-        assert_eq!(ignored_params(buffer_spec, &json!({"input": "Cities", "distance": 1, "input_name": "Cities"})), None);
+        assert_eq!(ignored_params(buffer_spec, &json!({"input": 7, "distance": 1, "input_name": "Cities"})), None);
+        assert_eq!(ignored_params(buffer_spec, &json!({"input": "7", "distance": 1, "input_name": "Cities"})), None);
+        // Beside a layer's name, or with no table id at all, it's a stray: no tool reads it.
+        for params in [json!({"input": "Cities", "distance": 1, "input_name": "Rivers"}), json!({"distance": 1, "input_name": "Rivers"})] {
+            let said = ignored_params(buffer_spec, &params).unwrap();
+            assert!(said.starts_with("Buffer ignores 'input_name'"), "{said}");
+        }
         let stray = ignored_params(buffer_spec, &json!({"input": "Cities", "distance": 1, "distance_name": "x"})).unwrap();
         assert!(stray.starts_with("Buffer ignores 'distance_name'"), "{stray}");
         // Many keys: the first five, sorted, each cut to 40 characters, then how many more.

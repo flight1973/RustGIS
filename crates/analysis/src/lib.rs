@@ -463,7 +463,7 @@ pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> 
 /// none. Bounded as [`quoted_keys`] bounds them.
 fn unread(spec: &ToolSpec, params: &Value) -> String {
     let Some(given) = params.as_object() else { return String::new() };
-    let unknown: Vec<&str> = given.keys().map(String::as_str).filter(|k| !is_expected_key(spec, k)).collect();
+    let unknown: Vec<&str> = given.keys().map(String::as_str).filter(|k| !is_expected_key(spec, params, k)).collect();
     if unknown.is_empty() {
         return String::new();
     }
@@ -527,11 +527,18 @@ pub fn is_accepted_param(spec: &ToolSpec, key: &str) -> bool {
 }
 
 /// Whether a key given with a run isn't one to warn of (#2307): one [`is_accepted_param`] accepts,
-/// or a layer parameter's `<name>_name`, where the app's tool dialog puts a table's name beside its
-/// id for the run's history. No tool reads that one, so it isn't a parameter to run over either.
-pub fn is_expected_key(spec: &ToolSpec, key: &str) -> bool {
+/// or the name the app's tool dialog puts beside a table's id for the run's history: `<name>_name`
+/// beside a layer parameter `<name>` that holds a table id (a number, or its digits as text for a
+/// tool that isn't built in). No tool reads it, so it isn't a parameter to run over either; given
+/// without the id, it's taken for a stray.
+pub fn is_expected_key(spec: &ToolSpec, params: &Value, key: &str) -> bool {
     is_accepted_param(spec, key)
-        || key.strip_suffix("_name").is_some_and(|base| spec.params.iter().any(|p| p.name == base && matches!(p.kind, ParamKind::Layer)))
+        || key.strip_suffix("_name").is_some_and(|base| {
+            spec.params.iter().any(|p| p.name == base && matches!(p.kind, ParamKind::Layer))
+                && params
+                    .get(base)
+                    .is_some_and(|id| id.is_u64() || id.as_str().is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())))
+        })
 }
 
 /// The names a tool reads one of its parameters under, `key` among them, or none when it has no
