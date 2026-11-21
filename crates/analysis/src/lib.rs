@@ -529,15 +529,14 @@ pub fn is_accepted_param(spec: &ToolSpec, key: &str) -> bool {
 /// Whether a key given with a run isn't one to warn of (#2307): one [`is_accepted_param`] accepts,
 /// or the name the app's tool dialog puts beside a table's id for the run's history: `<name>_name`
 /// beside a layer parameter `<name>` that holds a table id (a number, or its digits as text for a
-/// tool that isn't built in). No tool reads it, so it isn't a parameter to run over either; given
-/// without the id, it's taken for a stray.
+/// tool that isn't built in, read as a table id is read). No tool reads it, so it isn't a
+/// parameter to run over either; given without the id, it's taken for a stray.
 pub fn is_expected_key(spec: &ToolSpec, params: &Value, key: &str) -> bool {
+    let table_id =
+        |id: &Value| id.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) || id.as_str().is_some_and(|t| t.trim().parse::<u32>().is_ok());
     is_accepted_param(spec, key)
         || key.strip_suffix("_name").is_some_and(|base| {
-            spec.params.iter().any(|p| p.name == base && matches!(p.kind, ParamKind::Layer))
-                && params
-                    .get(base)
-                    .is_some_and(|id| id.is_u64() || id.as_str().is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())))
+            spec.params.iter().any(|p| p.name == base && matches!(p.kind, ParamKind::Layer)) && params.get(base).is_some_and(table_id)
         })
 }
 

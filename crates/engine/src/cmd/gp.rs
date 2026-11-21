@@ -2069,32 +2069,28 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             }
         }
 
-        let mut item_params = base_params.clone();
-        if let Value::Object(ref mut map) = item_params {
-            // A tool reading the input under another name (Join Field's `input` for `target`) mustn't
-            // take a static value given under it in place of each batch input.
-            for alias in rustgis_analysis::param_aliases(spec, batch_param).iter().filter(|a| **a != batch_param) {
-                map.remove(*alias);
+        // A tool reading the input under another name (Join Field's `input` for `target`) mustn't
+        // take a static value given under it in place of each batch input, nor keep the tool
+        // dialog's name of the table it replaced (`input_name`, `target_name`).
+        let item = |input: &str| {
+            let mut p = base_params.clone();
+            if let Value::Object(ref mut map) = p {
+                let names = rustgis_analysis::param_aliases(spec, batch_param);
+                for name in names.iter().copied().chain([batch_param]) {
+                    if name != batch_param {
+                        map.remove(name);
+                    }
+                    map.remove(&format!("{name}_name"));
+                }
+                map.insert(batch_param.to_string(), json!(input));
+                if tool_has_output {
+                    map.insert("output".to_string(), json!(final_out_name));
+                }
             }
-            // Nor keep the tool dialog's name of the table it replaced (`input_name`).
-            map.remove(&format!("{batch_param}_name"));
-            map.insert(batch_param.to_string(), json!(target_layer_name));
-            if tool_has_output {
-                map.insert("output".to_string(), json!(final_out_name));
-            }
-        }
-
-        let mut record_params = base_params.clone();
-        if let Value::Object(ref mut map) = record_params {
-            for alias in rustgis_analysis::param_aliases(spec, batch_param).iter().filter(|a| **a != batch_param) {
-                map.remove(*alias);
-            }
-            map.remove(&format!("{batch_param}_name"));
-            map.insert(batch_param.to_string(), json!(target));
-            if tool_has_output {
-                map.insert("output".to_string(), json!(final_out_name));
-            }
-        }
+            p
+        };
+        let item_params = item(&target_layer_name);
+        let record_params = item(target);
 
         let cmd_record = if is_file_input {
             let mut record_json = json!({
@@ -6102,15 +6098,16 @@ mod batch_tests {
                     "tool": "joinField",
                     "inputs": ["Tracts", "Blocks"],
                     "param": "target_layer",
-                    // `input` names Join Field's target too: it must not stand in for each batch input.
-                    "params": {"input": "Other", "targetField": "GEOID", "joinTable": "Census", "joinField": "FIPS"}
+                    // `input` names Join Field's target too: it must not stand in for each batch input,
+                    // nor its dialog-given name (`input_name`) stay beside each.
+                    "params": {"input": "Other", "input_name": "Other", "targetField": "GEOID", "joinTable": "Census", "joinField": "FIPS"}
                 }),
             )
             .unwrap();
         assert_eq!(res["succeeded"], 2, "{res}");
         let targets: Vec<_> = s.project.gp_history[before..].iter().map(|r| r.params["target_layer"].clone()).collect();
         assert_eq!(targets, [json!("Tracts"), json!("Blocks")]);
-        assert!(s.project.gp_history[before..].iter().all(|r| r.params.get("input").is_none()));
+        assert!(s.project.gp_history[before..].iter().all(|r| r.params.get("input").is_none() && r.params.get("input_name").is_none()));
         let other = s.map().layer_by_name("Other").unwrap();
         assert!(!other.dataset.fields.iter().any(|f| f.name == "FIPS"), "the static alias's layer was joined");
     }
