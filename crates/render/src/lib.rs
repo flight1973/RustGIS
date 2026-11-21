@@ -5975,6 +5975,11 @@ fn render_frame(
     }
     if map.graticule_on_top {
         draw_graticule!();
+        // The grid's lines left as a picture (Lyon refused them) spoil a turned or tilted
+        // stand-in as a layer's would.
+        if pictureless && (cpu_dirty || holds_picture(&cmds)) {
+            return None;
+        }
     }
     if let Some(plan) = cached.take() {
         frame_cache::keep(plan, captured, captured_alone);
