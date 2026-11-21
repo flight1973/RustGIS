@@ -123,6 +123,7 @@ const COMMAND_CAPABILITIES: &[(&str, CommandCheck)] = &[
     ("layout-element-wrap", command_uses_element_wrap),
     ("layout-chart-data", command_uses_chart_data),
     ("layout-chart-look", command_uses_chart_look),
+    ("blank-paper", command_uses_blank_paper),
 ];
 
 /// A saved `map.graticule` that switches to the MGRS grid, its type read as the command reads it:
@@ -157,6 +158,19 @@ fn command_colors_graticule(id: &str, params: &Value) -> bool {
     match id {
         "map.graticule" => params.get("color").is_some(),
         "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_colors_graticule)),
+        _ => false,
+    }
+}
+
+/// A `map.basemap` command that gives the blank basemap a paper colour (#2532): an older reader
+/// ignores `color` and draws white. White, `null` or another basemap leaves no paper to keep.
+fn command_uses_blank_paper(id: &str, params: &Value) -> bool {
+    match id {
+        "map.basemap" => {
+            params.get("name").and_then(Value::as_str).is_some_and(|n| n.trim().eq_ignore_ascii_case("blank"))
+                && params.get("color").and_then(Value::as_str).is_some_and(|c| !c.trim().eq_ignore_ascii_case("#FFFFFF"))
+        }
+        "script.run" => params.get("script").and_then(Value::as_str).is_some_and(|s| script_uses(s, command_uses_blank_paper)),
         _ => false,
     }
 }
@@ -416,9 +430,11 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         mut on_top,
         mut grid_color,
     ) = (false, false, false, false, false, false, false, false, false, false, false, false, false, false);
-    let mut offline_area_id = false;
+    let (mut offline_area_id, mut paper) = (false, false);
     for map in maps {
         offline_area_id |= map.offline_area_id.is_some();
+        // A blank basemap's paper colour (#2532), which an older reader would draw and save white.
+        paper |= map.paper.is_some();
         // An older reader doesn't know the MGRS graticule (#1042 piece 8): it refuses the
         // project by name rather than failing to read the type.
         mgrs |= map.graticule_type == rustgis_map::graticule::GraticuleType::Mgrs;
@@ -457,6 +473,7 @@ fn map_capabilities<'a>(maps: impl IntoIterator<Item = &'a Map>) -> Vec<&'static
         (pictures, "picture-markers"),
         (zarr, "zarr-window"),
         (offline_area_id, "offline-map-area-id"),
+        (paper, "blank-paper"),
         (mgrs, "graticule-mgrs"),
         (on_top, "graticule-on-top"),
         (grid_color, "graticule-color"),
@@ -1149,6 +1166,54 @@ mod tests {
         let mut unknown = saved;
         unknown["requires"] = json!(["zarr-window", "future-zarr"]);
         assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-zarr"));
+    }
+
+    /// A blank basemap's paper colour (#2532) is required by name in a project and a map file: an
+    /// older reader would draw the paper white and save the colour away. White paper needs nothing.
+    #[test]
+    fn a_blank_paper_colour_is_required_where_it_is_saved() {
+        let mut p = Project::from_json(include_str!("../../../schema/fixtures/blank_paper.rgis")).unwrap();
+        assert_eq!(p.map().blank_paper(), Some(rustgis_map::Rgba::rgb(241, 234, 223)));
+        let saved = serde_json::to_value(&p).unwrap();
+        assert_eq!(saved["requires"], json!(["blank-paper"]));
+        assert_eq!(saved["maps"][0]["paper"], json!([241, 234, 223, 255]));
+        assert_eq!(json_bytes(&map_file_bytes(p.map()).unwrap())["requires"], saved["requires"]);
+        p.maps[0].paper = None;
+        let clean = serde_json::to_value(&p).unwrap();
+        assert!(clean.get("requires").is_none());
+        assert!(clean["maps"][0].get("paper").is_none());
+        // A saved command that gives the blank basemap a colour needs it too; white, null or
+        // another basemap doesn't.
+        for (params, required) in [
+            (json!({"name": "blank", "color": "#F1EADF"}), true),
+            (json!({"name": "Blank", "color": "#101820"}), true),
+            (json!({"name": "blank", "color": "#ffffff"}), false),
+            (json!({"name": "blank", "color": null}), false),
+            (json!({"name": "blank"}), false),
+            (json!({"name": "paper", "color": "#F1EADF"}), false),
+        ] {
+            let script = format!("# Paper\nmap.basemap= {params}");
+            for (field, value) in [
+                ("tasks", json!([{"name": "Task", "steps": [{"title": "Paper", "command": "map.basemap", "params": params}]}])),
+                (
+                    "tasks",
+                    json!([{"name": "Script", "steps": [{"title": "Paper", "command": "script.run", "params": {"script": script}}]}]),
+                ),
+                ("notebooks", json!([{"name": "Notebook", "cells": [{"kind": "code", "source": script}]}])),
+            ] {
+                let mut document = clean.clone();
+                document[field] = value;
+                let saved = serde_json::to_value(Project::from_json(&document.to_string()).unwrap()).unwrap();
+                if required {
+                    assert_eq!(saved["requires"], json!(["blank-paper"]), "{field} {params}");
+                } else {
+                    assert!(saved.get("requires").is_none(), "{field} {params}");
+                }
+            }
+        }
+        let mut unknown = saved;
+        unknown["requires"] = json!(["blank-paper", "future-paper"]);
+        assert!(Project::from_json(&unknown.to_string()).unwrap_err().contains("future-paper"));
     }
 
     /// Nondefault relief effects survive project, map and layer files; ordinary relief needs none.
