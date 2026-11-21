@@ -94,6 +94,7 @@ pub const CAPABILITIES: &[&str] = &[
     "layout-element-wrap",
     "layout-chart-data",
     "layout-chart-look",
+    "layout-chart-classes",
     "field-generation",
     "offline-map-area-id",
     "crs-wkt",
@@ -538,6 +539,7 @@ impl From<TableFile> for Table {
                 windowed: false,
                 // Saved in longitude/latitude, as `Dataset`'s own saving writes them.
                 held_in: rustgis_data::raster::Crs::LonLat,
+                shown_in: None,
             },
         }
     }
@@ -2471,6 +2473,7 @@ impl Durable for Table {
             zm_dropped: _,
             windowed: _,
             held_in: _,
+            shown_in: _,
         } = dataset;
         if let Some(v) = provenance {
             p.string(Leaf::Table, v, true, rustgis_map::paths::is_local(v));

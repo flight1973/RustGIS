@@ -588,15 +588,18 @@ fn copy_stream(
     let (mut used, mut inside, mut outside) = (0usize, 0usize, 0usize);
     let mut fits = true;
     let info = src.info();
+    // Its rows come in the source's own system, held there in the copy; the area is compared in
+    // longitude/latitude.
+    let to_lonlat = src.coord_crs().to(rustgis_data::raster::Crs::LonLat).map_err(|e| format!("{}: {e}", layer.name))?;
     let batch = src
         .visit_chunks(Some(extent), 1 << 20, &mut |chunk| {
             progress::check()?;
             for row in chunk {
                 // Only a row the copy keeps is reshaped; one past the budget is just counted.
                 let Some((row, bytes)) = (if fits {
-                    source::chunk_memory::clip_row(row, &extent, dataset.fields.len())?
+                    source::chunk_memory::clip_row(row, &extent, dataset.fields.len(), &to_lonlat)?
                 } else {
-                    source::chunk_memory::clip_row(row, &extent, 0)?
+                    source::chunk_memory::clip_row(row, &extent, 0, &to_lonlat)?
                 }) else {
                     outside += 1;
                     continue;
@@ -1002,14 +1005,21 @@ pub(crate) fn bring_back(s: &mut Session, p: &Value) -> Result<Value, String> {
         ));
     }
     let mut reference = Vec::new();
+    // A layer the area has no copy of (one added in the field) isn't the area's: matched by id
+    // alone, it could reach a home layer of the same id. Left out, and said.
+    let mut unowned = Vec::new();
     edited.layers.retain(|l| {
+        if !l.is_raster() && !baseline.layers.iter().any(|b| b.id == l.id) {
+            unowned.push(l.name.clone());
+            return false;
+        }
         let keep = !baseline.layers.iter().any(|b| b.id == l.id && b.is_streamed());
         if !keep {
             reference.push(l.name.clone());
         }
         keep
     });
-    let skipped_photos = if !reference.is_empty() && !photos.is_empty() {
+    let skipped_photos = if (!reference.is_empty() || !unowned.is_empty()) && !photos.is_empty() {
         let before = photos.len();
         // An entry may be shared by a kept feature and a dropped one. Only discard entries
         // left without a reference among the layers passed to Sync.
@@ -1146,6 +1156,16 @@ pub(crate) fn bring_back(s: &mut Session, p: &Value) -> Result<Value, String> {
             false,
         );
     }
+    if !unowned.is_empty() {
+        s.notify(
+            format!(
+                "Bring Back skipped {} layer(s) that aren't in offline area '{area}' (added in the field). Their features stay in the field project: {}",
+                unowned.len(),
+                unowned.join(", ")
+            ),
+            false,
+        );
+    }
     if skipped_photos > 0 {
         s.notify(format!("Bring Back skipped {skipped_photos} photo(s) without a feature in the layers being brought back"), false);
     }
@@ -1165,42 +1185,36 @@ pub(crate) fn bring_back(s: &mut Session, p: &Value) -> Result<Value, String> {
 }
 
 /// Adds to offline area `ai`'s source layers, and to the area's own copy of them (so features
-/// aren't all taken as edited for lacking it), the fields `edited`'s layers have after theirs: a
-/// field the field added. Only fields added after all of the layer's own, of names it hasn't;
-/// fields that differ otherwise are left for the sync to refuse. Returns them as `layer: field`.
+/// aren't all taken as edited for lacking it), the fields `edited`'s layers have that neither has:
+/// a field the field added (a layer's photos field, made with its first photo). A field the area's
+/// copy has and the source hasn't was removed at home, and isn't put back. Returns them as
+/// `layer: field`.
 fn take_new_fields(s: &mut Session, ai: usize, edited: &rustgis_map::Map) -> Vec<String> {
     let Some(area) = s.project.offline_areas.get(ai) else { return Vec::new() };
     let source = area.map.clone();
-    let same = |a: &[rustgis_data::Field], b: &[rustgis_data::Field]| {
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name.eq_ignore_ascii_case(&y.name) && x.ty == y.ty)
-    };
+    let Some(si) = s.project.maps.iter().position(|m| m.name.eq_ignore_ascii_case(&source)) else { return Vec::new() };
     let mut added = Vec::new();
     for ol in edited.layers.iter().filter(|l| !l.is_raster()) {
-        let fields = &ol.dataset.fields;
-        let Some(si) = s.project.maps.iter().position(|m| m.name.eq_ignore_ascii_case(&source)) else { break };
         let Some(sl) = s.project.maps.get(si).and_then(|m| m.layers.iter().find(|l| l.id == ol.id && !l.is_raster())) else { continue };
-        let had = sl.dataset.fields.len();
-        let base_same = s
-            .project
-            .offline_areas
-            .get(ai)
-            .and_then(|a| a.data.layers.iter().find(|l| l.id == ol.id))
-            .is_none_or(|b| same(&b.dataset.fields, &sl.dataset.fields));
-        let Some(extra) = fields.get(had..).filter(|e| !e.is_empty()) else { continue };
-        if !base_same || !fields.get(..had).is_some_and(|own| same(own, &sl.dataset.fields)) {
-            continue;
-        }
-        if extra.iter().any(|f| sl.dataset.field_index(&f.name).is_some()) {
+        let base = s.project.offline_areas.get(ai).and_then(|a| a.data.layers.iter().find(|l| l.id == ol.id));
+        let extra: Vec<rustgis_data::Field> = ol
+            .dataset
+            .fields
+            .iter()
+            .filter(|f| sl.dataset.field_index(&f.name).is_none() && base.is_none_or(|b| b.dataset.field_index(&f.name).is_none()))
+            .cloned()
+            .collect();
+        if extra.is_empty() {
             continue;
         }
         let name = sl.name.clone();
         if let Some(l) = s.project.maps.get_mut(si).and_then(|m| m.layers.iter_mut().find(|l| l.id == ol.id)) {
-            for f in extra {
+            for f in &extra {
                 l.dataset.ensure_field(&f.name, f.ty);
             }
         }
         if let Some(b) = s.project.offline_areas.get_mut(ai).and_then(|a| a.data.layers.iter_mut().find(|l| l.id == ol.id)) {
-            for f in extra {
+            for f in &extra {
                 b.dataset.ensure_field(&f.name, f.ty);
             }
         }
@@ -1892,19 +1906,31 @@ mod tests {
         let mut project = project_in(&text, &unpacked).unwrap();
         assert!(photo_notices(&mut project).is_empty());
         let photo = unpacked.join(relative);
-        assert_eq!(value(&Session::new(project), "Sites", 0, "photos"), photo.display().to_string());
+        assert_eq!(Path::new(&value(&Session::new(project), "Sites", 0, "photos")), photo.as_path());
         assert_eq!(std::fs::read(photo).unwrap(), b"photo bytes");
 
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt as _;
             let unpacked = temp.path().join(std::ffi::OsStr::from_bytes(b"non-utf8-\xff"));
-            let (text, _) = unpack_into(&archive, &unpacked).unwrap();
-            let mut project = project_in(&text, &unpacked).unwrap();
-            let notices = photo_notices(&mut project);
-            assert_eq!(notices.len(), 1);
-            assert!(notices[0].starts_with("1 unpacked field photo reference"));
-            assert_eq!(value(&Session::new(project), "Sites", 0, "photos"), relative);
+            // Where the file system allows such a name: macOS's refuses one that isn't UTF-8
+            // (EILSEQ, 92 there). Any other failure to make or remove the folder fails the test.
+            let allowed = match std::fs::create_dir(&unpacked) {
+                Ok(()) => {
+                    std::fs::remove_dir(&unpacked).unwrap();
+                    true
+                }
+                Err(e) if cfg!(target_os = "macos") && e.raw_os_error() == Some(92) => false,
+                Err(e) => panic!("{}: {e}", unpacked.display()),
+            };
+            if allowed {
+                let (text, _) = unpack_into(&archive, &unpacked).unwrap();
+                let mut project = project_in(&text, &unpacked).unwrap();
+                let notices = photo_notices(&mut project);
+                assert_eq!(notices.len(), 1);
+                assert!(notices[0].starts_with("1 unpacked field photo reference"));
+                assert_eq!(value(&Session::new(project), "Sites", 0, "photos"), relative);
+            }
         }
     }
 
@@ -2357,13 +2383,16 @@ mod tests {
         field.run("edit.setValue", &json!({"layer": cities, "row": 0, "field": "photos", "value": photo.display().to_string()})).unwrap();
         let (_, back) = package(&mut field, &Value::Null).unwrap();
         std::fs::remove_file(&photo).unwrap();
-        // At home meanwhile, a field the field doesn't have: the sync is refused.
+        // At home meanwhile, a field the field has is removed: the sync is refused.
         let home_cities = layer(&home, "Cities");
-        home.run("edit.addField", &json!({"layer": home_cities, "name": "extra", "type": "text"})).unwrap();
+        let gone = home.map().layer(home_cities).unwrap().dataset.fields[0].name.clone();
+        home.run("edit.deleteField", &json!({"layer": home_cities, "field": gone})).unwrap();
         let path = temp.path().join("back.rgisfield");
         std::fs::write(&path, &back).unwrap();
         assert!(home.run("offline.bringBack", &json!({"path": path.display().to_string()})).is_err());
         assert!(!temp.path().join("Back photos").exists());
+        // Nor the photos field it would have added.
+        assert!(home.map().layer(home_cities).unwrap().dataset.field_index("photos").is_none());
         // A file holds bytes only as a file of their size: a folder, or another size, doesn't.
         let file = temp.path().join("same.jpg");
         std::fs::write(&file, b"abc").unwrap();

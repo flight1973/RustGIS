@@ -565,8 +565,12 @@ polygon split there), measured as the meridian it runs along. A ring winding aro
 measured as the region it traces by the attribute table
 and the Measure tools (a ring that goes all the way round at 60° N gives the larger region),
 while **Calculate Geometry Attributes** gives the smaller polar cap. On the Moon or another body, the Measure tools measure on
-that body's sphere. The Radius tools still measure a local Mercator distance, and **Mensuration
-Tools** (`raster.measure`) still measure on the sphere, so those can differ from the numbers above.
+that body's sphere. **Mensuration Tools** (`raster.measure`) measure distances, areas and perimeters
+the same way, on the ellipsoid on the Earth and on the body's sphere elsewhere. A distance along the
+surface spaces its height samples along the path on the sphere and takes each step's ground run
+from the leg it lies on at that leg's length on the ellipsoid, so over level ground it equals the
+distance. A volume still takes one cell size for the whole raster, at its centre's latitude. The
+Radius tools still measure a local Mercator distance, so those can differ from the numbers above.
 
 For an ambiguous area, the `raster.measure` command with `kind: "area"` returns an error without a measurement object. To request its finite closed-ring perimeter, use `kind: "distance"` and repeat the first point at the end. The on-map Measure overlay continues to show perimeter alongside the area refusal.
 
@@ -799,7 +803,7 @@ gp.run={"tool":"near","params":{"input":"addresses","near":"hydrants","units":"F
 
 **Spatial Join** (`spatialJoin`, also `gp.spatialJoin`) copies attributes from `join` features
 to `target` features. Layers may have different source coordinate systems: their geometry is
-stored in longitude/latitude before the join. `match` is one of:
+converted to longitude/latitude for the join. `match` is one of:
 
 - **Intersects** (default), **Contains** (target contains join) or **Within** (target lies within
   join).
@@ -1203,7 +1207,8 @@ CRS metadata. Coordinates are used directly, without projection or snapping.
   output memory, including repeated text attributes, before building the segments; unavailable
   memory returns an error.
 - **Feature Envelope To Polygon** (`featureEnvelopeToPolygon`) writes one axis-aligned rectangle
-  around all coordinates of each feature in stored longitude/latitude axes. Point features and
+  around all coordinates of each feature in longitude/latitude axes (converted from the layer's
+  own system). Point features and
   horizontal or vertical lines have zero-area envelopes and are skipped with a count. Longitude
   bounds are literal, including for features spanning the antimeridian.
 - **Unsplit Line** (`unsplitLine`) joins line parts at exactly equal endpoints where precisely
