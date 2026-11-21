@@ -1114,21 +1114,21 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
             label_gone.push((format!("{}'s {}", c.name, and_list(&gone)), gone.len()));
         }
     }
-    // A clause that read it and would now read a field named the same but for case is removed, so
-    // the class takes the features the earlier ones leave, as with no clause; said once, naming the
-    // classes. One that no longer reads is kept to edit, taking no features, as before.
+    // A class whose clause read it and would now read a field named the same but for case is
+    // turned off, so it labels nothing, as a class whose clause no longer reads labels nothing; its
+    // clause is kept to edit. Said once, naming the classes.
     let mut clauses_gone = Vec::new();
     let classes = std::iter::once(&mut l.labels.default).chain(l.labels.classes.iter_mut());
     for (c, read) in classes.zip(&clause_read) {
         if *read && c.where_.as_deref().is_some_and(|w| rustgis_data::query::parse_fields(w, &l.dataset).is_ok()) {
-            c.where_ = None;
+            c.visible = false;
             clauses_gone.push(c.name.clone());
         }
     }
     let clause_note = (!clauses_gone.is_empty()).then(|| {
-        let (classes, they) = if clauses_gone.len() == 1 { ("class", "it is") } else { ("classes", "they are") };
+        let (classes, they) = if clauses_gone.len() == 1 { ("class", "the class is") } else { ("classes", "the classes are") };
         format!(
-            "{}: the clause of its label {classes} {} read the deleted field {removed}, so {they} removed",
+            "{}: the clause of its label {classes} {} read the deleted field {removed}, so {they} turned off",
             l.name,
             clauses_gone.join(", ")
         )
@@ -1149,7 +1149,7 @@ fn delete_field(s: &mut Session, p: &Json) -> CmdResult {
     // said; by a text expression that still reads, Default only loses the field. Another class on
     // it labels with Default's field instead. A class clause naming it no longer reads, and takes
     // no features, which go on to the next class: it is kept to edit, not dropped with its text
-    // symbol; one that would read its twin was removed above.
+    // symbol; a class whose clause would read its twin was turned off above.
     let mut restart_note = None;
     if names_removed(&l.labels.default.field) {
         let by_text = l.labels.default.by.text.as_deref().is_some_and(|t| rustgis_data::query::parse_fields(t, &l.dataset).is_ok());
@@ -2403,16 +2403,18 @@ mod tests {
             let mark = s.notice_mark();
             s.run("edit.deleteField", &json!({"layer": id, "field": deleted})).unwrap();
             let said: Vec<String> = s.notices_since(mark).iter().map(|n| n.text.clone()).collect();
-            let clause = s.map().layer(id).unwrap().labels.classes[0].where_.clone();
+            let class = &s.map().layer(id).unwrap().labels.classes[0];
+            let (clause, visible) = (class.where_.clone(), class.visible);
             if read {
-                assert_eq!(clause, None);
+                assert_eq!((clause.as_deref(), visible), (Some("pop > 1"), false));
                 assert!(
-                    said.iter().any(|n| n == "twins: the clause of its label class Big read the deleted field Pop, so it is removed"),
+                    said.iter()
+                        .any(|n| n == "twins: the clause of its label class Big read the deleted field Pop, so the class is turned off"),
                     "{said:?}"
                 );
             } else {
                 // Kept: reading another field, or (no twin) no longer reading, as before.
-                assert_eq!(clause.as_deref(), Some("pop > 1"));
+                assert_eq!((clause.as_deref(), visible), (Some("pop > 1"), true));
                 assert!(said.iter().all(|n| !n.contains("clause")), "{said:?}");
             }
         }
