@@ -42,6 +42,22 @@ pub fn series_env(layout: &Layout, maps: &[Map]) -> Env {
     Env { page: page(), ..Env::default() }
 }
 
+/// The environment a map frame's features are styled in on the page: `env` (the series page) at
+/// the scale the frame draws at, its map's ground resolution in screen pixels.
+pub fn frame_style_env(map: &Map, camera: &rustgis_map::Camera, env: &Env) -> Env {
+    env.at_scale(Some(map.ground_res_at(camera) / rustgis_geom::PIXEL_M))
+}
+
+/// Map frame `frame`'s map and the environment its features are styled in on `layout`'s current
+/// page ([`series_env`] at [`frame_style_env`]'s scale): what a chart coloured by classes reads its
+/// bars' colours in, so what is said of them matches what is drawn.
+pub fn frame_page_env<'a>(layout: &Layout, maps: &'a [Map], frame: u32) -> Option<(&'a Map, Env)> {
+    let ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } = &layout.element(frame)?.kind else { return None };
+    let m = maps.get(map_index(maps, map)?)?;
+    let camera = frame_camera(m, *center, *scale, *bearing, *pitch);
+    Some((m, frame_style_env(m, &camera, &series_env(layout, maps))))
+}
+
 /// Largest page drawn, in pixels per side and in all (less in the browser, where memory is
 /// tighter): a larger page is drawn at a lower resolution.
 pub const MAX_SIDE: f64 = 12_000.0;
@@ -180,11 +196,11 @@ pub(crate) fn page_geometry(layout: &Layout, dpi: f64) -> (u32, u32, f64) {
     (w as u32, h as u32, k.min(w / layout.width).min(h / layout.height))
 }
 
-/// Visible text elements (and legend titles) whose ink crosses the page boundary, or whose
-/// lines the text renderer omits at its box's vertical limit or its 200-line limit. Text is not
-/// clipped horizontally to its element: a line wider than its box alone is not a loss. Dynamic
-/// text uses this page and its first frame, rotated text is checked after its turn, and a
-/// wrapped text by the lines it is broken into.
+/// Visible text elements (and legend and colorbar titles) whose ink crosses the page boundary,
+/// or whose lines the text renderer omits at its box's vertical limit or its 200-line limit.
+/// Text is not clipped horizontally to its element: a line wider than its box alone is not a
+/// loss. Dynamic text uses this page and its first frame, rotated text is checked after its
+/// turn, and a wrapped text (a colorbar's title too) by the lines it is broken into.
 pub fn clipped_text(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo) -> Vec<(u32, String)> {
     text_losses(layout, maps, dpi, info).into_iter().map(|l| (l.id, l.name)).collect()
 }
@@ -251,6 +267,17 @@ fn losses(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo, only: Option
                     map_index(maps, map)?;
                     (title.clone(), 12.0, text::Face { bold: true, ..Default::default() }, TextAlign::Left, 0.0, 0.0, true, false)
                 }
+                // A colorbar's title in the lines it is drawn in (#2493), when it draws one: its
+                // frame's map has a raster with a colour scale (else it draws a placeholder).
+                ElementKind::Colorbar { frame, layer, title, .. } if !title.is_empty() => {
+                    let ElementKind::MapFrame { map, .. } = &layout.element(*frame)?.kind else { return None };
+                    let m = maps.get(map_index(maps, map)?)?;
+                    rustgis_map::layout::colorbar_layer(m, layer.as_deref())
+                        .and_then(|l| l.raster.as_ref())
+                        .and_then(rustgis_map::layout::color_scale)?;
+                    let s = colorbar_title_lines(title, e.w).join("\n");
+                    (s, COLORBAR_TITLE_PT as f32, colorbar_title_style().face, TextAlign::Left, 0.0, 0.0, false, true)
+                }
                 _ => return None,
             };
             let px = size.clamp(2.0, 400.0) * 1.33 * ppp;
@@ -313,8 +340,8 @@ pub fn clipped_text_notice(layout: &Layout, clipped: &[(u32, String)]) -> Option
     if clipped.len() > 10 {
         names.push_str(&format!(" and {} more", clipped.len() - 10));
     }
-    // Each text's wrap; `None` for a legend's title or an element gone since, which keep the
-    // advice they always had.
+    // Each text's wrap; `None` for a legend's or a colorbar's title, or an element gone since,
+    // which keep the advice they always had.
     let wraps = clipped
         .iter()
         .map(|(id, _)| match layout.element(*id).map(|e| &e.kind) {
@@ -681,8 +708,13 @@ fn draw_page(
                 }
             }
             ElementKind::Chart { frame: f, layer, color, .. } => {
-                let ds = frame(*f).and_then(|fr| maps.get(fr.1)).and_then(|m| m.layer_by_name(layer)).map(|l| &l.dataset);
-                match ds.and_then(|ds| e.kind.chart_data(ds)) {
+                // Coloured by classes, its bars read their features' colours at the frame's scale
+                // and on this page, as the frame draws them.
+                let data = frame(*f).and_then(|&(_, mi, cam, _, _)| {
+                    let m = maps.get(mi)?;
+                    e.kind.chart_data_of(m.layer_by_name(layer)?, &frame_style_env(m, &cam, env))
+                });
+                match data {
                     Some(data) => {
                         let look = e.kind.chart_look().unwrap_or_default();
                         chart(&mut pm, r, &data, &look, color.unwrap_or(INK), ppp, layout.decimal_comma)
@@ -2234,6 +2266,8 @@ fn complete_shown_legends(
         let mut no_data = None;
         let mut chunk = layer.clone();
         chunk.source = None;
+        // Its chunks come in the source's own system.
+        chunk.dataset.held_in = source.coord_crs();
         chunk.clear_cache();
         let result = crate::visit_complete(source.as_ref(), &mut |features| {
             chunk.dataset.features = features.into();
@@ -3333,9 +3367,17 @@ fn colorbar(pm: &mut Canvas, r: Rect, scale: &ColorScale, bar: &Bar, ppp: f64) {
     let width = |s: &str| text::measure(s, px / 1.33, false);
     let (mut top, bottom) = (r.y(), r.y() + r.height());
     if !bar.title.is_empty() {
-        let tpx = 9.0 * 1.33 * ppp;
-        text::text_at(pm, bar.title, r.x(), top + tpx * 0.6, tpx, dark, true, text::Align::Left, false);
-        top += tpx * 1.4;
+        let tpx = COLORBAR_TITLE_PT as f32 * 1.33 * ppp;
+        // Wrapped to the element's width (#2493), its lines drawn as a text element's are: while
+        // a line's middle is within a line of the element's bottom, and at most 200. Those left
+        // out are said with the page's cut-off texts ([`text_losses`]).
+        let lines = colorbar_title_lines(bar.title, f64::from(r.width()) / (f64::from(ppp) * PT_PER_MM));
+        let line_y = |i: usize| top + tpx * (0.6 + 1.25 * i as f32);
+        let drawn = lines.iter().take(200).enumerate().take_while(|(i, _)| line_y(*i) <= bottom + tpx).count();
+        for (i, line) in lines.iter().take(drawn).enumerate() {
+            text::text_at(pm, line, r.x(), line_y(i), tpx, dark, true, text::Align::Left, false);
+        }
+        top += tpx * (1.4 + 1.25 * drawn.saturating_sub(1) as f32);
     }
     // Where each block or sample sits along the bar (0 low to 1 high), and the labels with theirs.
     let (blocks, labels): (Vec<Rgba>, Vec<(f32, String)>) = match scale {
@@ -3489,6 +3531,39 @@ pub(crate) fn wrapped(s: &str, width: f64, size: f64, style: TextStyle) -> Strin
     // Lines past the 200 a text draws aren't broken: one more, with text, tells the cut-off check
     // it goes on.
     crate::report::wrap_lines(s, width * WRAP_PX_PER_MM, measure, 200).join("\n")
+}
+
+/// A colorbar's title's size in points; it is drawn bold.
+pub const COLORBAR_TITLE_PT: f64 = 9.0;
+
+/// A colorbar's title's style, as [`colorbar_title_lines`] measures it: bold, from the left edge.
+fn colorbar_title_style() -> TextStyle {
+    TextStyle { face: text::Face { bold: true, ..Default::default() }, align: TextAlign::Left, spacing: 0.0 }
+}
+
+/// A colorbar's title's width in mm, its widest line, measured as [`colorbar_title_lines`] breaks
+/// it.
+pub fn colorbar_title_width_mm(title: &str) -> f64 {
+    let px = (COLORBAR_TITLE_PT * 1.33 * WRAP_PX_PER_MM / PT_PER_MM) as f32;
+    let face = colorbar_title_style().face;
+    title.lines().map(|line| f64::from(text::styled_extent(line, px, face, 0.0).1)).fold(0.0, f64::max) / WRAP_PX_PER_MM
+}
+
+/// The slack a colorbar's title gets on its width, in mm: a box made exactly as wide as the title
+/// still takes it on one line once its width is rounded, or laid out in whole pixels.
+const COLORBAR_TITLE_SLACK_MM: f64 = 0.01;
+
+/// A colorbar's title as the lines it is drawn in (#2493): broken at spaces to fit `width` mm, a
+/// word wider than that across lines, as a wrapped text is ([`wrapped`]), at one resolution
+/// whatever it is drawn at, so the page, each export and a publication's sizing break it alike. A
+/// title of one line that fits is that line, as it is. Past 200 lines, one more line with text
+/// says it goes on, as for a wrapped text.
+pub fn colorbar_title_lines(title: &str, width: f64) -> Vec<String> {
+    let width = width + COLORBAR_TITLE_SLACK_MM;
+    if !title.contains('\n') && colorbar_title_width_mm(title) <= width {
+        return vec![title.to_string()];
+    }
+    wrapped(title, width, COLORBAR_TITLE_PT, colorbar_title_style()).lines().map(str::to_string).collect()
 }
 
 /// The distance between two lines of text at `size` points, in mm, as [`text_block`] sets them.
@@ -3659,33 +3734,126 @@ fn table(pm: &mut Canvas, r: Rect, ds: &rustgis_data::Dataset, rows: usize, ink:
 
 /// A bar chart of `data`'s bars ([`ElementKind::chart_data`]) drawn as `look` says, its title,
 /// labels and values in `dark`, its values with a decimal comma when `comma`. With a negative
-/// value, bars run either way from a zero line (#2487).
+/// value, bars run either way from a zero line (#2487). Stacked, each bar is drawn as its
+/// stretches in the colours of the key under the title, those above zero from it on and those
+/// below from it back, its value past the end of the side it ends on.
 fn chart(pm: &mut Canvas, r: Rect, data: &rustgis_map::layout::ChartData, look: &ChartLook, dark: Rgba, ppp: f64, comma: bool) {
     let ppp = ppp as f32;
     let vals = &data.bars;
-    let max = vals.iter().map(|v| v.0).fold(0.0_f64, f64::max);
-    let min = vals.iter().map(|v| v.0).fold(0.0_f64, f64::min);
+    let (min, max) = chart_span(data);
     if vals.is_empty() || (max <= 0.0 && min >= 0.0) {
         placeholder(pm, r, "Chart", ppp as f64);
         return;
     }
     let px = 7.5 * 1.33 * ppp;
-    // No title leaves its room to the bars.
-    let title_h = if data.title.is_empty() { 0.0 } else { px * 1.6 };
+    let Some((title_h, key_h)) = chart_head(r, data, look, px, ppp) else {
+        placeholder(pm, r, "Chart", ppp as f64);
+        return;
+    };
     if !data.title.is_empty() {
         text::text_at(pm, &data.title, r.x(), r.y() + title_h / 2.0, px * 1.15, dark, true, text::Align::Left, false);
     }
+    chart_key(Some(pm), r, r.y() + title_h, &data.key, px, ppp, dark);
     // Each bar's value as written past its end, when it has them.
     let values: Vec<String> = if look.values {
         vals.iter().map(|(v, _)| decimal(rustgis_map::layout::chart_value_text(*v, look.decimals), comma)).collect()
     } else {
         Vec::new()
     };
-    let bars = ChartBars { r, title_h, vals, values: &values, min, max, px, ppp, dark, look };
+    let bars = ChartBars {
+        r,
+        title_h: title_h + key_h,
+        vals,
+        values: &values,
+        colors: &data.colors,
+        stretches: &data.stretches,
+        key: &data.key,
+        min,
+        max,
+        px,
+        ppp,
+        dark,
+        look,
+    };
     match look.orientation {
         Orientation::Horizontal => bars.across(pm, data.labelled),
         Orientation::Vertical => bars.columns(pm, data.labelled),
     }
+}
+
+/// The span a chart's bars run over: from the most a bar reaches below zero to the most above,
+/// stacked its stretches below zero added up and those above.
+fn chart_span(data: &rustgis_map::layout::ChartData) -> (f64, f64) {
+    data.bars
+        .iter()
+        .enumerate()
+        .map(|(i, (v, _))| data.stretches.get(i).filter(|s| !s.is_empty()).map_or_else(|| reach(&[*v]), |s| reach(s)))
+        .fold((0.0_f64, 0.0_f64), |(lo, hi), (l, h)| (lo.min(l), hi.max(h)))
+}
+
+/// The heights of a chart's title and key over its bars in `r`, its text `px` high: no title
+/// leaves its room to the bars. Stacked, a box too short to leave the bars a line under its title
+/// and key has none (it draws its placeholder rather than a key past its bottom and bars with no
+/// room); as columns, the bars' line is past the room their labels and values may take (written
+/// at most `px` high, [`ChartBars::columns`]), so they always have it. Not stacked, it draws as
+/// before.
+fn chart_head(r: Rect, data: &rustgis_map::layout::ChartData, look: &ChartLook, px: f32, ppp: f32) -> Option<(f32, f32)> {
+    let title_h = if data.title.is_empty() { 0.0 } else { px * 1.6 };
+    let key_h = chart_key(None, r, 0.0, &data.key, px, ppp, INK);
+    let line = px * 1.4;
+    let below = match look.orientation {
+        Orientation::Horizontal => 0.0,
+        Orientation::Vertical => {
+            let (min, max) = chart_span(data);
+            let values = |on: bool| if look.values && on { line } else { 0.0 };
+            (if data.labelled { line } else { 0.0 }) + values(max > 0.0) + values(min < 0.0)
+        }
+    };
+    (data.key.is_empty() || title_h + key_h + line + below <= r.height()).then_some((title_h, key_h))
+}
+
+/// Whether a chart with bars to draw, `w` × `h` mm in its look, draws its placeholder instead as
+/// its title and key leave the bars no room ([`chart_head`]): what the commands warn of, so the page and the commands
+/// never tell it apart.
+pub fn chart_crowded(data: &rustgis_map::layout::ChartData, look: &ChartLook, w: f64, h: f64) -> bool {
+    let Some(r) = Rect::from_xywh(0.0, 0.0, (w * PT_PER_MM).max(1.0) as f32, (h * PT_PER_MM).max(1.0) as f32) else { return false };
+    !data.bars.is_empty() && chart_head(r, data, look, 7.5 * 1.33, 1.0).is_none()
+}
+
+/// How far a bar's stretches reach below zero (its negative ones added up) and above it.
+fn reach(stretches: &[f64]) -> (f64, f64) {
+    stretches.iter().fold((0.0, 0.0), |(lo, hi), v| if *v < 0.0 { (lo + v, hi) } else { (lo, hi + v) })
+}
+
+/// A stacked chart's key from `top`: a swatch in each value's colour and its name, in rows as
+/// wide as the box, a name cut to fit one; the height it takes, 0 without a key, infinite in a
+/// box narrower than a swatch. Without a canvas it only measures.
+fn chart_key(mut pm: Option<&mut Canvas>, r: Rect, top: f32, key: &[(String, Rgba)], px: f32, ppp: f32, dark: Rgba) -> f32 {
+    if key.is_empty() {
+        return 0.0;
+    }
+    let size = px * 0.9;
+    let line_h = px * 1.4;
+    let (sw, gap) = (size * 0.8, 2.0 * ppp);
+    // A box narrower than a swatch has no room for the key at all.
+    if r.width() < sw + gap {
+        return f32::INFINITY;
+    }
+    let (mut x, mut y) = (r.x(), top);
+    for (name, colour) in key {
+        let t = fit_label(name, |t| sw + gap + text::measure(t, size / 1.33, false) > r.width());
+        let w = sw + gap + text::measure(&t, size / 1.33, false);
+        // A name that doesn't fit after the others starts a row of its own.
+        if x > r.x() && x + w > r.right() {
+            (x, y) = (r.x(), y + line_h);
+        }
+        if let Some(pm) = pm.as_deref_mut() {
+            fill(pm, *colour, x, y + (line_h - sw) / 2.0, sw, sw);
+            text::text_at(pm, &t, x + sw + gap, y + line_h / 2.0, size, dark, false, text::Align::Left, false);
+        }
+        x += w + 3.0 * gap;
+    }
+    y + line_h - top
 }
 
 /// `name`'s first 30 characters, cut from their end while `too_wide` says they don't fit.
@@ -3697,14 +3865,18 @@ fn fit_label(name: &str, too_wide: impl Fn(&str) -> bool) -> String {
     t
 }
 
-/// What [`chart`] draws its bars from: its box, the height of its title over the bars, the bars
-/// and their values written out (none without), the least and greatest value (0 among them), its
-/// text size and pixels per point.
+/// What [`chart`] draws its bars from: its box, the height of its title (and key) over the bars,
+/// the bars and their values written out (none without), each bar's own colour (none: the look's
+/// bar colour), stacked each bar's stretches and the key that colours them, the least and
+/// greatest a bar reaches (0 among them), its text size and pixels per point.
 struct ChartBars<'a> {
     r: Rect,
     title_h: f32,
     vals: &'a [(f64, String)],
     values: &'a [String],
+    colors: &'a [Option<Rgba>],
+    stretches: &'a [Vec<f64>],
+    key: &'a [(String, Rgba)],
     min: f64,
     max: f64,
     px: f32,
@@ -3714,10 +3886,26 @@ struct ChartBars<'a> {
 }
 
 impl ChartBars<'_> {
-    fn bar(&self, pm: &mut Canvas, x: f32, y: f32, w: f32, h: f32) {
-        if let Some(b) = Rect::from_xywh(x, y, w, h) {
-            pm.fill_rect(b, &paint(self.look.bar_color, 1.0), Transform::identity(), None);
-        }
+    /// Bar `i` (of value `v`) as the stretches it is drawn in, each with the share of the span
+    /// ([`ChartBars::share`]) where it starts from zero, its own share (negative running back) and
+    /// its colour. A whole bar (none stacked, or no stretches) is one stretch, in its own colour or
+    /// the look's; a stacked one a stretch per value of the key, those above zero on from it and
+    /// those below back from it, one of 0 not drawn.
+    fn stretches(&self, i: usize, v: f64) -> Vec<(f32, f32, Rgba)> {
+        let Some(s) = self.stretches.get(i).filter(|s| !s.is_empty()) else {
+            return vec![(0.0, self.share(v), self.colors.get(i).copied().flatten().unwrap_or(self.look.bar_color))];
+        };
+        let (mut lo, mut hi) = (0.0_f64, 0.0_f64);
+        s.iter()
+            .zip(self.key)
+            .filter(|(v, _)| **v != 0.0)
+            .map(|(v, (_, c))| {
+                let end = if *v < 0.0 { &mut lo } else { &mut hi };
+                let from = *end;
+                *end += v;
+                (self.share(from), self.share(*v), *c)
+            })
+            .collect()
     }
 
     /// What part `v` is of the span from the lowest value (or zero) to the highest (or zero). A span
@@ -3767,9 +3955,15 @@ impl ChartBars<'_> {
         let right = self.look.label_align == TextAlign::Right;
         for (i, (v, name)) in self.vals.iter().enumerate() {
             let y = r.y() + self.title_h + bh * i as f32;
-            let w = (bar_area * self.share(v.abs())).max(1.0);
-            let x = if *v < 0.0 { zero - w } else { zero };
-            self.bar(pm, x, y + bh * 0.15, w, bh * 0.7);
+            // Each stretch at least a pixel wide, running back from its start below zero; where the
+            // bar ends at its left and at its right.
+            let (mut left, mut right_end) = (zero, zero);
+            for (start, share, colour) in self.stretches(i, *v) {
+                let w = (bar_area * share.abs()).max(1.0);
+                let x = zero + bar_area * start - if share < 0.0 { w } else { 0.0 };
+                fill(pm, colour, x, y + bh * 0.15, w, bh * 0.7);
+                (left, right_end) = (left.min(x), right_end.max(x + w));
+            }
             if labelled {
                 let t = fit_label(name, |t| text::measure(t, 7.5, false) * ppp > label_w - 4.0 * ppp);
                 // At the column's right, the label ends where the bars' side begins.
@@ -3777,7 +3971,7 @@ impl ChartBars<'_> {
                 text::text_at(pm, &t, lx, y + bh / 2.0, size, self.dark, false, align, false);
             }
             if let Some(t) = self.values.get(i) {
-                let (vx, align) = if *v < 0.0 { (x - gap, text::Align::Right) } else { (x + w + gap, text::Align::Left) };
+                let (vx, align) = if *v < 0.0 { (left - gap, text::Align::Right) } else { (right_end + gap, text::Align::Left) };
                 text::text_at(pm, t, vx, y + bh / 2.0, value_size, self.dark, false, align, false);
             }
         }
@@ -3809,11 +4003,17 @@ impl ChartBars<'_> {
         let zero = top + plot_h * self.share(self.max);
         for (i, (v, name)) in self.vals.iter().enumerate() {
             let cx = r.x() + slot * (i as f32 + 0.5);
-            let h = (plot_h * self.share(v.abs())).max(1.0);
-            let y = if *v < 0.0 { zero } else { zero - h };
-            self.bar(pm, cx - slot * 0.35, y, slot * 0.7, h);
+            // Each stretch at least a pixel high, standing up from its start above zero and hanging
+            // down below it; where the column ends at its top and at its bottom.
+            let (mut top_end, mut bottom) = (zero, zero);
+            for (start, share, colour) in self.stretches(i, *v) {
+                let h = (plot_h * share.abs()).max(1.0);
+                let y = zero - plot_h * start - if share < 0.0 { 0.0 } else { h };
+                fill(pm, colour, cx - slot * 0.35, y, slot * 0.7, h);
+                (top_end, bottom) = (top_end.min(y), bottom.max(y + h));
+            }
             if let Some(t) = self.values.get(i) {
-                let vy = if *v < 0.0 { zero + h + value_h / 2.0 } else { zero - h - value_h / 2.0 };
+                let vy = if *v < 0.0 { bottom + value_h / 2.0 } else { top_end - value_h / 2.0 };
                 text::text_at(pm, t, cx, vy, value_px, self.dark, false, text::Align::Center, false);
             }
             if labelled {
@@ -3826,6 +4026,13 @@ impl ChartBars<'_> {
         {
             pm.fill_rect(line, &paint(self.dark, 1.0), Transform::identity(), None);
         }
+    }
+}
+
+/// A box filled with `colour`; none where it has no size.
+fn fill(pm: &mut Canvas, colour: Rgba, x: f32, y: f32, w: f32, h: f32) {
+    if let Some(b) = Rect::from_xywh(x, y, w, h) {
+        pm.fill_rect(b, &paint(colour, 1.0), Transform::identity(), None);
     }
 }
 
@@ -3965,6 +4172,106 @@ mod tests {
         let r = Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap();
         chart(&mut c, r, &data, &kind.chart_look().unwrap(), INK, 1.0, false);
         c
+    }
+
+    /// Each bar in its own colour (#2487 part 3), a bar without one in the look's: across and as
+    /// columns.
+    #[test]
+    fn chart_bars_take_their_own_colours() {
+        let red = Rgba::rgb(0xD0, 0x10, 0x10);
+        let data = rustgis_map::layout::ChartData {
+            bars: vec![(10.0, String::new()), (10.0, String::new())],
+            labelled: false,
+            left_out: 0,
+            out_of_range: 0,
+            no_number: 0,
+            title: String::new(),
+            colors: vec![Some(red), None],
+            ..Default::default()
+        };
+        let is_red = |c: &Canvas, x: u32, y: u32| c.pixmap().pixel(x, y).is_some_and(|p| p.red() > 150 && p.blue() < 60);
+        for orientation in [Orientation::Horizontal, Orientation::Vertical] {
+            let look = ChartLook { orientation, ..ChartLook::default() };
+            let mut c = Canvas::new(200, 120).unwrap();
+            chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &data, &look, INK, 1.0, false);
+            // Across, two rows 18 px high from the top; as columns, two slots 100 px wide.
+            let ((x0, y0), (x1, y1)) = match orientation {
+                Orientation::Horizontal => ((20, 9), (20, 27)),
+                Orientation::Vertical => ((50, 100), (150, 100)),
+            };
+            assert!(is_red(&c, x0, y0), "{orientation:?}: the first bar in its own colour");
+            assert!(bar_blue(&c, x1, y1) && !is_red(&c, x1, y1), "{orientation:?}: the second in the look's");
+        }
+    }
+
+    /// Stacked (#2487 part 3b), a bar is drawn as its stretches in the key's colours, those above
+    /// zero from it on and those below from it back, with the key over the bars: across and as
+    /// columns.
+    #[test]
+    fn stacked_bars_draw_their_stretches_and_key() {
+        let (red, green) = (Rgba::rgb(0xD0, 0x10, 0x10), Rgba::rgb(0x10, 0xC0, 0x10));
+        let is = |c: &Canvas, x: u32, y: u32, want: Rgba| {
+            c.pixmap().pixel(x, y).is_some_and(|p| {
+                p.red().abs_diff(want.0[0]) < 30 && p.green().abs_diff(want.0[1]) < 30 && p.blue().abs_diff(want.0[2]) < 30
+            })
+        };
+        let stacked = |stretches: Vec<f64>| rustgis_map::layout::ChartData {
+            bars: vec![(stretches.iter().sum(), String::new())],
+            key: vec![("a".into(), red), ("b".into(), green)],
+            stretches: vec![stretches],
+            ..Default::default()
+        };
+        let draw = |data: &rustgis_map::layout::ChartData, orientation: Orientation| {
+            let mut c = Canvas::new(200, 120).unwrap();
+            let look = ChartLook { orientation, ..ChartLook::default() };
+            chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), data, &look, INK, 1.0, false);
+            c
+        };
+        // The key's row (14 px) over a bar 18 px high: 6 of 10 in red from the left, 4 in green.
+        let c = draw(&stacked(vec![6.0, 4.0]), Orientation::Horizontal);
+        assert!(is(&c, 3, 7, red), "the key's first swatch");
+        assert!(is(&c, 50, 23, red) && is(&c, 150, 23, green), "the stretches along the bar");
+        assert!(!is(&c, 50, 7, red), "the bar starts under the key");
+        // As a column from the bottom up: red at its foot, green over it.
+        let c = draw(&stacked(vec![6.0, 4.0]), Orientation::Vertical);
+        assert!(is(&c, 100, 100, red) && is(&c, 100, 30, green), "the stretches up the column");
+        // A negative stretch runs back from zero: 2 of a span of 8 left of it, 6 right.
+        let c = draw(&stacked(vec![6.0, -2.0]), Orientation::Horizontal);
+        assert!(is(&c, 20, 23, green) && is(&c, 100, 23, red), "either way from zero");
+        // A bar with no stretches (they add up past the largest number) is drawn whole.
+        let mut whole = stacked(vec![6.0, 4.0]);
+        whole.stretches = vec![Vec::new()];
+        let c = draw(&whole, Orientation::Horizontal);
+        assert!(is(&c, 50, 23, ChartLook::default().bar_color) && is(&c, 150, 23, ChartLook::default().bar_color), "whole");
+        // A key of a row a value, taller than a short box leaves the bars, draws neither: the
+        // placeholder instead, nothing past the box.
+        let mut long = stacked(vec![6.0, 4.0]);
+        long.key = (0..8).map(|k| (format!("{k} a value with a long name to fill a row"), red)).collect();
+        long.stretches = vec![vec![1.0; 8]];
+        for orientation in [Orientation::Horizontal, Orientation::Vertical] {
+            let mut c = Canvas::new(200, 120).unwrap();
+            let look = ChartLook { orientation, ..ChartLook::default() };
+            chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 60.0).unwrap(), &long, &look, INK, 1.0, false);
+            assert!(is(&c, 100, 50, Rgba::rgb(0xF0, 0xF1, 0xF3)) && !is(&c, 5, 50, red), "the placeholder");
+            assert!(c.pixmap().pixel(5, 90).is_some_and(|p| p.alpha() == 0), "nothing under the box");
+        }
+        // As columns, the head leaves the bars a line past their labels and values: 40 pt high,
+        // one key row, labelled and valued, is crowded so, not across; and the commands say so as
+        // the page draws it.
+        let mut short = stacked(vec![6.0, 4.0]);
+        short.key.truncate(1);
+        short.stretches = vec![vec![10.0]];
+        short.labelled = true;
+        let (w, h) = (200.0 / PT_PER_MM, 40.0 / PT_PER_MM);
+        let valued = |orientation| ChartLook { orientation, values: true, ..ChartLook::default() };
+        assert!(chart_crowded(&short, &valued(Orientation::Vertical), w, h));
+        assert!(!chart_crowded(&short, &valued(Orientation::Horizontal), w, h));
+        assert!(!chart_crowded(&stacked(vec![6.0, 4.0]), &ChartLook::default(), w, 120.0 / PT_PER_MM));
+        // A box narrower than a swatch draws the placeholder too, nothing past its right.
+        // Sample above the centered "Chart" label so system font glyph shapes at y=60 don't mask the fill.
+        let mut c = Canvas::new(200, 120).unwrap();
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 5.0, 120.0).unwrap(), &stacked(vec![6.0, 4.0]), &ChartLook::default(), INK, 1.0, false);
+        assert!(is(&c, 2, 10, Rgba::rgb(0xF0, 0xF1, 0xF3)) && (6..20).all(|x| c.pixmap().pixel(x, 7).is_some_and(|p| p.alpha() == 0)));
     }
 
     fn bar_blue(c: &Canvas, x: u32, y: u32) -> bool {
@@ -6808,6 +7115,77 @@ Elaboração: RustGIS",
 
     fn rgb(pm: &Pixmap, x: u32, y: u32) -> (u8, u8, u8) {
         pm.pixel(x, y).map(|p| (p.red(), p.green(), p.blue())).unwrap_or((255, 255, 255))
+    }
+
+    /// A colorbar's title longer than the element is wide wraps inside it (#2493), every word kept;
+    /// the bar goes under its lines.
+    #[test]
+    fn a_colorbars_long_title_wraps_inside_it() {
+        let scale = ColorScale::Ramp { lo: 0.0, hi: 10.0, colors: vec![Rgba::rgb(200, 200, 200), Rgba::rgb(230, 230, 230)] };
+        let title = "Precipitação média mensal JAXA GSMaP (mm/mês), jan–mar 2025";
+        let bar =
+            Bar { title, orientation: Orientation::Horizontal, ticks: 3, side: TickSide::End, reverse: false, comma: false, ink: INK };
+        // A canvas wider than the element, so ink past its right edge shows.
+        let mut c = Canvas::new(600, 200).unwrap();
+        let r = Rect::from_xywh(10.0, 10.0, 200.0, 150.0).unwrap();
+        colorbar(&mut c, r, &scale, &bar, 1.0);
+        let dark = |x: u32, y: u32| c.pixmap().pixel(x, y).is_some_and(|p| p.alpha() > 128 && p.red() < 120);
+        let past = (r.right().ceil() as u32 + 1..600).find(|x| (0..200).any(|y| dark(*x, y)));
+        assert_eq!(past, None, "the title's ink past the element's right edge");
+        let lines = colorbar_title_lines(title, 200.0 / PT_PER_MM);
+        assert!(lines.len() >= 2, "{lines:?}");
+        assert_eq!(lines.concat().replace(' ', ""), title.replace(' ', ""), "every word is kept");
+        // The second line is inked, under the first.
+        let pitch = (COLORBAR_TITLE_PT * 1.33 * 1.25) as u32;
+        let line = |y0: u32| (y0..y0 + 8).any(|y| (10..210).any(|x| dark(x, y)));
+        assert!(line(10 + pitch + 3), "a second line of title");
+    }
+
+    /// A colorbar too short for its title's lines draws those that fit, as a text element does,
+    /// not lines spilling down the page, and the page's cut-off check says the rest are left out;
+    /// one tall enough says nothing (#2493).
+    #[test]
+    fn a_colorbars_title_lines_past_its_bottom_are_left_out_and_said() {
+        let scale = ColorScale::Ramp { lo: 0.0, hi: 10.0, colors: vec![Rgba::rgb(200, 200, 200), Rgba::rgb(230, 230, 230)] };
+        let title = "Precipitação média mensal JAXA GSMaP (mm/mês), jan–mar 2025";
+        let bar =
+            Bar { title, orientation: Orientation::Horizontal, ticks: 3, side: TickSide::End, reverse: false, comma: false, ink: INK };
+        // 100 px wide, four lines or more; 20 px high, two of them centred within a line of its
+        // bottom. A third would be centred at 10 + 12 × (0.6 + 2 × 1.25) = 47.
+        assert!(colorbar_title_lines(title, 100.0 / PT_PER_MM).len() >= 4);
+        let mut c = Canvas::new(300, 200).unwrap();
+        colorbar(&mut c, Rect::from_xywh(10.0, 10.0, 100.0, 20.0).unwrap(), &scale, &bar, 1.0);
+        let dark = |x: u32, y: u32| c.pixmap().pixel(x, y).is_some_and(|p| p.alpha() > 128 && p.red() < 120);
+        let lowest = (0..200).rev().find(|y| (0..300).any(|x| dark(x, *y)));
+        assert!(lowest.is_some_and(|y| y < 45), "ink down to {lowest:?}");
+        // On a page, in a frame whose map has a raster on a ramp.
+        let map = ramp_map(
+            rustgis_map::raster::RasterRenderer::Stretch { band: 0, ramp: rustgis_map::Ramp::Thermal, invert: false },
+            rustgis_map::raster::Stretch::MinMax,
+        );
+        let mut l = Layout::new("Page", 120.0, 90.0);
+        let frame = l.add(
+            "Frame",
+            (60.0, 60.0, 50.0, 25.0),
+            serde_json::from_value(serde_json::json!({"MapFrame":{"map":"m", "center":{"x":0,"y":0}, "scale":1000000}})).unwrap(),
+        );
+        let kind = ElementKind::Colorbar {
+            frame,
+            layer: None,
+            title: title.into(),
+            orientation: Orientation::Horizontal,
+            ticks: 5,
+            tick_side: TickSide::End,
+            reverse: false,
+            color: None,
+        };
+        let id = l.add("Colorbar", (5.0, 5.0, 25.0, 6.0), kind);
+        let info = PageInfo::default();
+        let losses = text_losses(&l, std::slice::from_ref(&map), 96.0, &info);
+        assert_eq!(losses.len(), 1, "the short colorbar's title is cut");
+        assert!(losses[0].id == id && losses[0].left_out >= 2 && losses[0].below_box, "{} left out", losses[0].left_out);
+        l.element_mut(id).unwrap().h = 40.0;
+        assert!(text_losses(&l, std::slice::from_ref(&map), 96.0, &info).is_empty(), "tall enough for every line");
     }
 
     #[test]

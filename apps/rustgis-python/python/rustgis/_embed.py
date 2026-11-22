@@ -34,7 +34,7 @@ EMBED_LIMIT = 2 << 20
 _EMBEDDABLE = {
     ".tif", ".tiff", ".asc", ".dt0", ".dt1", ".geojson", ".json", ".csv", ".tsv", ".txt", ".zip",
     ".kml", ".kmz", ".gpx", ".parquet", ".geoparquet", ".fgb", ".gpkg", ".mbtiles", ".xlsx",
-    ".xls", ".ods",
+    ".xls", ".ods", ".grb", ".grib", ".grb2", ".grib2",
 }
 
 #: The page script that frames the app: an anywidget module, also run by the Qt host page.

@@ -14,6 +14,7 @@ pub mod durable;
 pub mod extensions;
 pub mod geometry_calc;
 pub mod grids;
+pub mod image_grid;
 pub mod model;
 mod notice_text;
 #[cfg(not(target_arch = "wasm32"))]
@@ -852,10 +853,10 @@ pub struct Session {
     pub(crate) crs_used_elsewhere: Vec<(String, String)>,
     /// When the frame path last looked for missing datum grids ([`Session::say_grid_notes`]).
     grid_notes_checked: Option<web_time::Instant>,
-    /// Each layer held in another system (by instance) and the geometry revision and system whose
-    /// places were last counted for [`Session::say_unplaced`], so a version of a layer is looked at
-    /// once.
-    unplaced_checked: std::collections::HashMap<u64, (u64, rustgis_data::raster::Crs)>,
+    /// Each layer held in another system (by instance): the geometry revision and system whose
+    /// places were last counted for [`Session::say_unplaced`], and the most it said of them, so a
+    /// version of a layer is said once, and again only for a count above it.
+    unplaced_checked: std::collections::HashMap<u64, (u64, rustgis_data::raster::Crs, Result<usize, String>)>,
     /// The datum grids the map's layers were last projected with
     /// ([`rustgis_data::raster::crs::grid_generation`]).
     grid_generation: u64,
@@ -984,6 +985,9 @@ pub struct Session {
     /// them (it keeps nothing between calls). Not saved with the project: a plugin's state
     /// command reads what it needs from the map when the panel opens.
     pub plugin_panels: std::collections::BTreeMap<String, rustgis_plugins::PanelState>,
+    /// Plugins whose panel state was made again from a changed declaration (the plugin updated)
+    /// since their state command last ran: the panel in view runs it again (#2550).
+    panels_to_refresh: std::collections::BTreeSet<String>,
     /// What running session plugins were last told of the map, to send them events.
     #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "session plugins run on the desktop only"))]
     pub(crate) plugin_watch: cmd::plugins::Watch,
@@ -1085,6 +1089,9 @@ pub struct Session {
     /// ([`cmd::gp::FilesAhead`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) files_ahead: Option<cmd::gp::FilesAhead>,
+    /// Original grids read by a script worker and consumed at landing without file I/O.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) grids_ahead: Option<image_grid::Ahead>,
     /// The zones' spectral means a script read on that copy, which its run here takes
     /// ([`cmd::imagery::ZonesAhead`]).
     #[cfg(not(target_arch = "wasm32"))]
@@ -1130,6 +1137,7 @@ fn strip_windows(p: &mut Project) {
     for l in p.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
         if let Some(src) = &mut l.source {
             src.reset();
+            src.hold_read_notes();
             l.dataset.features = Vec::new().into();
             l.selection.clear();
             l.touch_geometry();
@@ -1403,6 +1411,7 @@ impl Session {
             started: Vec::new(),
             plugin_runs: Vec::new(),
             plugin_panels: std::collections::BTreeMap::new(),
+            panels_to_refresh: std::collections::BTreeSet::new(),
             plugin_watch: Default::default(),
             downloading: Vec::new(),
             downloaded: Vec::new(),
@@ -1446,6 +1455,8 @@ impl Session {
             tools_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
             files_ahead: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            grids_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
             zones_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1705,7 +1716,14 @@ impl Session {
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
         self.command_epilogue(id, params, |s| {
             let native_maintenance = s.depth == 0 && s.policy_ingress_idle();
+            // Before every command, a script's or task's too: one before it in the same script may
+            // have changed a map's projection.
+            s.note_shown_systems();
             let result = s.run_command(id, params);
+            // A command may change a map's projection, or add layers to it.
+            if s.depth == 0 {
+                s.note_shown_systems();
+            }
             // Native sessions without a drawing loop recover their own failed overviews.
             // Named callers and sealed completions do not initiate unrelated maintenance.
             if native_maintenance && s.read_in_place_again() {
@@ -2168,6 +2186,8 @@ impl Session {
         // The project's generation rolls back with it: a project opened part way (a task's step)
         // and then undone is the one before, still open.
         let opened = self.opened;
+        // The layer chosen before the command comes back with the project when it fails.
+        let open_layer = self.active_layer;
         let files = mutates.then(|| ProjectFiles {
             identity: self.file_identity,
             path: self.path.clone(),
@@ -2273,9 +2293,11 @@ impl Session {
                 // The project as it was before the command, so the layout open then, whatever
                 // the command opened on the way (a task's steps).
                 let committed = std::mem::replace(&mut self.project, snap);
+                self.keep_read_notes(&committed);
                 let sync_changed = self.keep_synced(&committed);
                 (self.trusted_tasks, self.trusted_models, self.trusted_notebooks) = trust;
                 self.active_layout = open_layout;
+                self.active_layer = open_layer;
                 // Replaced during the command: what it held beside itself (its undo history, its
                 // trust, its unsaved state) comes back with it.
                 if self.opened != opened {
@@ -2605,6 +2627,10 @@ impl Session {
                         "{}: some text values written as Null in it show as empty (Load All Features counts them all); so far, {note}",
                         layer.name
                     ));
+                }
+                // What else the map's reads of it lost or assumed, each kind once for its opening.
+                for note in layer.source.as_mut().map(|source| source.take_read_notes()).unwrap_or_default() {
+                    dates.push(format!("{}: {note}", layer.name));
                 }
                 if layer.source.as_mut().is_some_and(|source| source.take_display_window()) {
                     landed.push(&*layer);
@@ -3070,14 +3096,24 @@ impl Session {
         }
     }
 
-    /// Says, once for each version of a layer's geometry, that a layer held in another system
-    /// has features with a place that can't be given in longitude/latitude, which the map and
-    /// the globe draw from: they draw such a feature without that place (a line broken there, a
-    /// point not at all), and labels' lines, block diagrams and terrain water leave it out. Or
-    /// that none of the layer is drawn, when its system can't be converted.
-    /// Layers in longitude/latitude, every layer read today, are passed over at no cost. A held
-    /// layer's count reads each of its places through the conversion, on the UI thread with no
-    /// Cancel, once per version of its geometry: as long as converting it for the map takes.
+    /// Tells every map's layers the system their map draws them straight into
+    /// ([`rustgis_map::Map::note_shown_system`]): before and after each command, and each frame
+    /// of the app, which also covers layers landing from a background read.
+    pub fn note_shown_systems(&mut self) {
+        for m in &mut self.project.maps {
+            m.note_shown_system();
+        }
+    }
+
+    /// Says, once for each version of a layer's geometry (and again for a larger count, as when the
+    /// globe leaves out what a map in the layer's own system drew), that a layer held in another
+    /// system has features with a place that can't be given in longitude/latitude, which the map
+    /// and the globe draw from: they draw such a feature without that place (a line broken there, a
+    /// point not at all), and labels' lines, block diagrams and terrain water leave it out. Or that
+    /// none of the layer is drawn, when its system can't be converted. The map counts them as it
+    /// converts the layer for drawing ([`rustgis_map::Layer::unplaced`]), so it costs nothing more,
+    /// and it is said once the layer was drawn. Layers in longitude/latitude, every layer read
+    /// today, have nothing to say.
     fn say_unplaced(&mut self) {
         // One notice per kind, with the count and the layers it is about.
         let (mut features, mut partly, mut undrawn) = (0usize, Vec::new(), Vec::new());
@@ -3085,17 +3121,30 @@ impl Session {
         for map in &self.project.maps {
             for l in map.layers.iter().filter(|l| !l.is_raster() && l.dataset.coord_crs() != rustgis_data::raster::Crs::LonLat) {
                 seen.insert(l.instance_id());
-                let version = (l.geometry_rev(), l.dataset.coord_crs());
-                if self.unplaced_checked.insert(l.instance_id(), version) == Some(version) {
-                    continue;
+                let Some(count) = l.unplaced() else { continue };
+                // Said again at the same version only for a larger count: a drawing that leaves out
+                // what an earlier one drew (the globe after the layer's own system), not each time
+                // a map's projection goes back to one already said.
+                let (rev, crs) = (l.geometry_rev(), l.dataset.coord_crs());
+                let above = |said: &Result<usize, String>| match (count, said) {
+                    (Err(_), Ok(_)) => true,
+                    (Ok(n), Ok(m)) => n > m,
+                    _ => false,
+                };
+                match self.unplaced_checked.get(&l.instance_id()) {
+                    Some((r, c, said)) if (*r, *c) == (rev, crs) && !above(said) => continue,
+                    _ => {
+                        self.unplaced_checked.insert(l.instance_id(), (rev, crs, count.clone()));
+                    }
                 }
-                match l.dataset.unplaced_in_lonlat() {
+                let named = format!("map '{}', layer '{}'", map.name, l.name);
+                match count {
                     Ok(0) => {}
                     Ok(n) => {
                         features += n;
-                        partly.push(format!("map '{}', layer '{}' ({n})", map.name, l.name));
+                        partly.push(format!("{named} ({n})"));
                     }
-                    Err(e) => undrawn.push(format!("map '{}', layer '{}': {e}", map.name, l.name)),
+                    Err(e) => undrawn.push(format!("{named}: {e}")),
                 }
             }
         }
@@ -3426,6 +3475,7 @@ impl Session {
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
         self.keep_headers_said(&cur);
+        self.keep_read_notes(&cur);
         self.keep_synced(&cur);
         let allocations = undo_memory::allocations(&cur);
         self.redo.push((
@@ -3465,6 +3515,7 @@ impl Session {
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
         self.keep_headers_said(&cur);
+        self.keep_read_notes(&cur);
         self.keep_synced(&cur);
         let allocations = undo_memory::allocations(&cur);
         self.undo.push((
@@ -3596,6 +3647,20 @@ impl Session {
                         t.headers_shown.push(address.clone());
                     }
                 }
+            }
+        }
+    }
+
+    /// After undo, redo or a rollback swaps the project: a streamed layer still on the same opening
+    /// of its source keeps what its reads have said ([`SourceLayer::keep_read_notes`]), so a note
+    /// isn't said again because a project from before it was said came back.
+    ///
+    /// [`SourceLayer::keep_read_notes`]: rustgis_map::source::SourceLayer::keep_read_notes
+    fn keep_read_notes(&mut self, before: &Project) {
+        for l in self.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
+            let live = before.maps.iter().flat_map(|m| &m.layers).find(|o| o.instance_id() == l.instance_id());
+            if let (Some(source), Some(live)) = (l.source.as_mut(), live.and_then(|o| o.source.as_ref())) {
+                source.keep_read_notes(live);
             }
         }
     }

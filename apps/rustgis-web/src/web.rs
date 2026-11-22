@@ -57,6 +57,10 @@ const DATA_EXTS: &[&str] = &[
     "tif",
     "tiff",
     "asc",
+    "grb",
+    "grib",
+    "grb2",
+    "grib2",
     // SRTM height tiles and DTED are added below (`ELEVATION_EXTENSIONS`).
 ];
 const CANVAS_ID: &str = "rustgis_canvas";
@@ -511,12 +515,18 @@ async fn read_together(files: Vec<web_sys::File>, mark: &str, inbox: &Inbox, not
             notes.lock().unwrap_or_else(|e| e.into_inner()).push((text, true));
             continue;
         }
+        if mark.starts_with(rustgis_ui_egui::MARKER_PICK) && file.size() > rustgis_ui_egui::MARKER_FILE_MAX_BYTES as f64 {
+            notes.lock().unwrap_or_else(|e| e.into_inner()).push((rustgis_ui_egui::marker_file_too_large().into(), true));
+            continue;
+        }
         if let Some(bytes) = crate::parts::read_file(file, notes.clone()).await {
             read.push((name, bytes));
-        } else if mark.starts_with(rustgis_ui_egui::DXF_PICK) {
-            // A failed read completes this request just like cancelling its picker.
-            inbox.lock().unwrap_or_else(|e| e.into_inner()).push((mark.to_string(), Vec::new()));
         }
+    }
+    // A request something waits on (Import DXF, a marker's «Image…») with nothing read, its
+    // picker cancelled or its file refused or unread, is answered empty: it stops waiting.
+    if (mark.starts_with(rustgis_ui_egui::DXF_PICK) || mark.starts_with(rustgis_ui_egui::MARKER_PICK)) && read.is_empty() {
+        inbox.lock().unwrap_or_else(|e| e.into_inner()).push((mark.to_string(), Vec::new()));
     }
     let (read, problems) = rustgis_ui_egui::rustgis_engine::data::io::gather_shapefiles(read);
     notes.lock().unwrap_or_else(|e| e.into_inner()).extend(problems.into_iter().map(|p| (p, true)));
@@ -1299,8 +1309,11 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             // So does a file picked for a tool's file parameter, which goes to the Tools pane.
             let tool_exts = purpose.strip_prefix(rustgis_ui_egui::TOOL_FILE_PURPOSE);
             let dxf = purpose.strip_prefix("dxf:");
+            let marker = purpose.strip_prefix("marker:");
             let mark = if let Some(id) = dxf {
                 format!("{}{id}:", rustgis_ui_egui::DXF_PICK)
+            } else if let Some(id) = marker {
+                format!("{}{id}:", rustgis_ui_egui::MARKER_PICK)
             } else {
                 match (purpose, tool_exts) {
                     ("shortcuts", _) => rustgis_ui_egui::SHORTCUT_PICK,
@@ -1358,8 +1371,8 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 )
             } else if dxf.is_some() {
                 rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("DXF drawing"), &["dxf"])
-            } else if purpose == "picture" {
-                rfd::AsyncFileDialog::new().add_filter("Pictures", &["png", "jpg", "jpeg"])
+            } else if purpose == "picture" || marker.is_some() {
+                rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("Pictures"), &["png", "jpg", "jpeg"])
             } else {
                 rfd::AsyncFileDialog::new().add_filter(
                     "Vector and raster data",
@@ -1368,13 +1381,9 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             };
             // Data may come several files at once (photos gather in one layer).
             let many = matches!(purpose, "data" | "shapefile");
-            let dxf = dxf.is_some();
             wasm_bindgen_futures::spawn_local(async move {
                 let files: Vec<rfd::FileHandle> =
                     if many { dialog.pick_files().await.unwrap_or_default() } else { dialog.pick_file().await.into_iter().collect() };
-                if dxf && files.is_empty() {
-                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((mark.clone(), Vec::new()));
-                }
                 read_together(files.iter().map(|f| f.inner().clone()).collect(), &mark, &inbox, notes).await;
                 ctx.request_repaint();
             });

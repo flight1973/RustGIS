@@ -1,6 +1,7 @@
 //! Reads the desktop app makes on a thread of its own before a command adds what they read
 //! (#1291 step 3): Add Data's whole-file reads (a raster, a raster GDAL converts, a GeoJSON,
-//! delimited text or spreadsheet read whole, a ZIP or CityJSON/CityGML model's layers), Repair/Reload Data, Load All
+//! delimited text or spreadsheet read whole, a ZIP or CityJSON/CityGML model's layers, the opening
+//! of a large Shapefile or GeoJSON file read in place, #2446), Repair/Reload Data, Load All
 //! Features, Convert To Annotation's read of a layer read in place, native models or scripts, the
 //! Error Inspector's topology check (#1291), Source File State's hashing of a layer's file and Column Statistics' count of a column. [`read_ahead`]
 //! takes what the read needs of the session, [`ReadAhead::run`] reads on the thread, and [`read_land`]
@@ -283,6 +284,7 @@ pub(crate) fn prepare(s: &mut Session, op: Authorized<CommandOp>, owner: Continu
         id if super::edit::table_edit_in_background(id).is_some() => ("Edit Table", super::edit::table_ahead(s, spec.id, params)?, None),
         "topology.validate" => ("Error Inspector", super::design::topology_ahead(s, params), None),
         "source.syncState" => ("Source File State", super::publish::sync_ahead(s, params), None),
+        "raster.imageGrid" => ("Read Original Image Grid", crate::image_grid::ahead(s, params), None),
         "edit.previewShapeConversion" => ("Preview Shape Conversion", crate::shape_conversion::ahead(s, params), None),
         "table.statistics" => ("Column Statistics", super::table_stats::stats_ahead(s, params), None),
         "layer.sizeBy" => ("Size by Field", super::layer::size_by_ahead(s, params), None),
@@ -336,6 +338,12 @@ pub(crate) fn take<T: 'static>(s: &mut Session, key: &str) -> Option<T> {
     }
     let read = s.read_ahead.take()?;
     read.value.downcast::<T>().ok().map(|v| *v)
+}
+
+/// What `read` prepared, when it is a `T`, for a test to look at before it lands.
+#[cfg(test)]
+pub(crate) fn prepared<T: 'static>(read: &Read) -> Option<&T> {
+    read.ready.as_ref()?.value.downcast_ref::<T>()
 }
 
 /// Whether a read is placed for `key`, without taking it.

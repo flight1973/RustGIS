@@ -4,6 +4,16 @@ use super::*;
 use crate::layout::TextAlign;
 use crate::symbology::{Glyph, LabelPlacement, LineCap, LineMark, Marker, Placements};
 
+/// [`super::read_project`] given no image file (the tests of raster image markers give theirs).
+fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Project, String> {
+    super::read_project(text, dir, &mut |_| Err("whose image file doesn't open"), report)
+}
+
+/// [`super::read_style`] given no image file and no folder.
+fn read_style(text: &str, layer: &str, report: &mut Report) -> Result<Style, String> {
+    super::read_style(text, layer, "", &mut |_| Err("whose image file doesn't open"), report)
+}
+
 const PROJECT: &str = r#"<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
 <qgis projectname="Towns" version="3.42.0-Münster">
   <title>Towns</title>
@@ -193,6 +203,7 @@ fn a_project_reads_into_layers_in_tree_order_with_their_styles() {
     // Its second class's line pattern fill: hatch lines of its blue line, 2 mm apart, at QGIS's
     // 45°, half see-through as the symbol is; read, not noted.
     assert!(!said("Land", NoteKind::Approximated, "line pattern"));
+    assert!(said("Land", NoteKind::Approximated, "letter case"));
     let Some(Renderer::Graduated { class_fills, .. }) = &land.style.renderer else { panic!() };
     let hatch = class_fills.get(&1).and_then(|f| f.first()).copied().unwrap();
     assert_eq!(hatch.color, Some(Rgba::new(0, 0, 255, 128)));
@@ -1078,14 +1089,32 @@ fn every_corpus_file_reads() {
     };
     // Pin the corpus sizes so a regeneration cannot silently drop fixtures.
     let styles = files("generated/qml", &["qml"]);
-    assert_eq!(styles.len(), 97, "style corpus changed: {styles:?}");
+    assert_eq!(styles.len(), 110, "style corpus changed: {styles:?}");
+    // Raster image markers' files are found from the style's folder and the project's.
+    let mut read = |source: &str| {
+        use base64::Engine;
+        let b64 = match source.strip_prefix("base64:") {
+            Some(b64) => b64.to_string(),
+            None => base64::engine::general_purpose::STANDARD.encode(std::fs::read(source).map_err(|_| "whose image file doesn't open")?),
+        };
+        Ok((b64, 0.5))
+    };
     for path in &styles {
         let text = std::fs::read_to_string(path).unwrap();
+        let dir = path.parent().unwrap().to_string_lossy().to_string();
         let mut report = Report::default();
-        read_style(&text, "layer", &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        super::read_style(&text, "layer", &dir, &mut read, &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        if path.to_string_lossy().contains("symbol-raster-marker-") {
+            assert!(
+                !report.notes.iter().any(|n| n.text.starts_with("raster image markers whose")),
+                "{}: {:?}",
+                path.display(),
+                report.notes
+            );
+        }
     }
     let projects = files("generated/qgs", &["qgs", "qgz"]);
-    assert_eq!(projects.len(), 36, "project corpus changed: {projects:?}");
+    assert_eq!(projects.len(), 37, "project corpus changed: {projects:?}");
     for path in &projects {
         let bytes = std::fs::read(path).unwrap();
         let text = if path.extension().is_some_and(|e| e == "qgz") {
@@ -1098,7 +1127,8 @@ fn every_corpus_file_reads() {
         let text = text.replace("password='secret'", &format!("password='{PASSWORD}'"));
         let dir = path.parent().unwrap().to_string_lossy().to_string();
         let mut report = Report::default();
-        let project = read_project(&text, &dir, &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let project = super::read_project(&text, &dir, &mut read, &mut report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert!(!report.notes.iter().any(|n| n.text.starts_with("raster image markers whose")), "{}: {:?}", path.display(), report.notes);
         assert!(!project.layers.is_empty(), "{}: no layers", path.display());
         // The PostGIS and SQL Server projects' made-up password reaches neither the layers nor the notes.
         assert!(!format!("{project:?} {report:?}").contains(PASSWORD), "{}: the password came through", path.display());
@@ -1329,6 +1359,158 @@ fn marker_symbols_of_several_layers_carry_over_as_marks_turned_by_their_field() 
     let mut report = Report::default();
     read_style(old, "Signs", &mut report).unwrap();
     assert!(report.notes.iter().any(|n| n.text.contains("data-defined")), "{:?}", report.notes);
+}
+
+/// A raster image marker layer showing `file`, 4 mm wide, with `extra` settings.
+fn raster_marker(file: &str, extra: &str) -> String {
+    format!(
+        r#"<layer class="RasterMarker" enabled="1"><Option type="Map"><Option name="imageFile" value="{file}"/><Option name="size" value="4"/>
+        <Option name="size_unit" value="MM"/>{extra}</Option></layer>"#
+    )
+}
+
+/// A style of one marker symbol of `layers`, at `alpha`.
+fn marker_qml(alpha: &str, layers: &str) -> String {
+    format!(
+        r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="marker" name="0" alpha="{alpha}">{layers}</symbol></symbols></renderer-v2></qgis>"#
+    )
+}
+
+#[test]
+fn raster_image_markers_draw_their_image_read_once_from_the_style_folder() {
+    use crate::symbology::Picture;
+    let mm = 96.0 / 25.4;
+    let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+    // A file relative to the style's folder; the reader gives the image and its height over width.
+    let mut asked = Vec::new();
+    let mut read = |source: &str| {
+        asked.push(source.to_string());
+        Ok((format!("image of {source}"), 0.5))
+    };
+    let mut report = Report::default();
+    let s = super::read_style(&marker_qml("1", &raster_marker("./pins/a.png", "")), "Pins", "/styles", &mut read, &mut report).unwrap();
+    assert_eq!(asked, ["/styles/pins/a.png"]);
+    let Some(Renderer::Single(sym)) = &s.renderer else { panic!("{:?}", s.renderer) };
+    assert_eq!(sym.marker, Marker::Picture(Picture::new("image of /styles/pins/a.png")));
+    assert!(near(sym.size, 4.0 * mm), "its width: {}", sym.size);
+    assert_eq!(s.line_strokes, Some(Vec::new()), "centred and upright, it is the symbol itself");
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+
+    // One file, however its path is written, is read once.
+    asked.clear();
+    let mut read = |source: &str| {
+        asked.push(source.to_string());
+        Ok((format!("image of {source}"), 0.5))
+    };
+    let twice = format!("{}{}", raster_marker("./pins/a.png", ""), raster_marker("pins/a.png", ""));
+    super::read_style(&marker_qml("1", &twice), "Pins", "/styles", &mut read, &mut Report::default()).unwrap();
+    assert_eq!(asked, ["/styles/pins/a.png"]);
+
+    // Two layers of one image read it once, and anchored at their top left they sit half their
+    // width right of the point and half their height (the image's, not their width) below it.
+    asked.clear();
+    let mut read = |source: &str| {
+        asked.push(source.to_string());
+        Ok((format!("image of {source}"), 0.5))
+    };
+    let anchored = r#"<Option name="horizontal_anchor_point" value="0"/><Option name="vertical_anchor_point" value="0"/>"#;
+    let qml = marker_qml("1", &format!("{}{}", raster_marker("base64:QUJD", ""), raster_marker("base64:QUJD", anchored)));
+    let mut report = Report::default();
+    let s = super::read_style(&qml, "Pins", "", &mut read, &mut report).unwrap();
+    assert_eq!(asked, ["base64:QUJD"], "read once, a folder or none");
+    let marks = s.line_strokes.unwrap();
+    let picture = LineMark::Marker(Marker::Picture(Picture::new("image of base64:QUJD")));
+    assert!(marks.iter().all(|m| m.markers.is_some_and(|k| k.mark == picture)), "{marks:?}");
+    let top = marks.iter().find(|m| m.offset != 0.0).unwrap();
+    assert!(near(top.offset, mm) && near(top.markers.unwrap().offset_along, 2.0 * mm), "{top:?}");
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+
+    // Along a line, the image is the mark.
+    let line = format!(
+        r#"<qgis version="4.2.3"><renderer-v2 type="singleSymbol"><symbols><symbol type="line" name="0" alpha="1">
+        <layer class="MarkerLine" enabled="1"><Option type="Map"><Option name="placements" value="Interval"/><Option name="interval" value="5"/></Option>
+        <symbol type="marker" name="@0@0" alpha="1">{}</symbol></layer></symbol></symbols></renderer-v2></qgis>"#,
+        raster_marker("base64:QUJD", "")
+    );
+    let mut read = |source: &str| Ok((format!("image of {source}"), 0.5));
+    let mut report = Report::default();
+    let s = super::read_style(&line, "Road", "", &mut read, &mut report).unwrap();
+    assert_eq!(s.line_strokes.unwrap()[0].markers.map(|m| m.mark), Some(picture));
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+    // Its marker symbol see-through: drawn opaque, noted.
+    let mut report = Report::default();
+    let faded = line.replace(r#"name="@0@0" alpha="1""#, r#"name="@0@0" alpha="0.5""#);
+    super::read_style(&faded, "Road", "", &mut read, &mut report).unwrap();
+    assert_eq!(report.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), ["see-through raster image markers, drawn opaque"]);
+    // The line see-through as well: one symbol, one note.
+    let mut report = Report::default();
+    let both = faded.replace(r#"type="line" name="0" alpha="1""#, r#"type="line" name="0" alpha="0.5""#);
+    assert_ne!(both, faded);
+    super::read_style(&both, "Road", "", &mut read, &mut report).unwrap();
+    let notes: Vec<_> = report.notes.iter().map(|n| (n.text.as_str(), n.count)).collect();
+    assert_eq!(notes, [("see-through raster image markers, drawn opaque", 1)]);
+}
+
+#[test]
+fn raster_image_markers_that_cant_be_drawn_are_circles_saying_why() {
+    // Each kind of image the reader isn't asked for, or can't give, with what the note says.
+    let mut asked = Vec::new();
+    let mut read = |source: &str| {
+        asked.push(source.to_string());
+        if source.ends_with("gone.png") { Err("whose image file doesn't open") } else { Ok(("QUJD".to_string(), 1.0)) }
+    };
+    let cases = [
+        ("", "raster image markers with no image, drawn as circles"),
+        (
+            "https://example.invalid/pin.png",
+            "raster image markers whose image is at a web address, which RustGIS doesn't fetch, drawn as circles",
+        ),
+        ("pins/a.png", "raster image markers whose image file is relative to a folder the import wasn't given, drawn as circles"),
+        (
+            "C:pins\\a.png",
+            "raster image markers whose image file is relative to a drive's working folder, which no project folder tells, drawn as circles",
+        ),
+        (
+            "attachment:///abc_a.png",
+            "raster image markers whose image is kept inside the .qgz project, which RustGIS doesn't read it from, drawn as circles",
+        ),
+        ("\\\\host\\share\\a.png", "raster image markers whose image is on a network share, which RustGIS doesn't open, drawn as circles"),
+        ("//host/share/a.png", "raster image markers whose image is on a network share, which RustGIS doesn't open, drawn as circles"),
+        ("/data/gone.png", "raster image markers whose image file doesn't open, drawn as circles"),
+    ];
+    for (file, note) in cases {
+        let mut report = Report::default();
+        let s = super::read_style(&marker_qml("1", &raster_marker(file, "")), "Pins", "", &mut read, &mut report).unwrap();
+        let Some(Renderer::Single(sym)) = &s.renderer else { panic!() };
+        assert_eq!(sym.marker, Marker::Circle, "{file}");
+        assert_eq!(report.notes.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), [note], "{file}");
+    }
+    assert_eq!(asked, ["/data/gone.png"], "neither a web address, a network share nor a relative path without a folder is looked for");
+
+    // Drawn, but not as QGIS draws it: a ratio of its own, see-through (the layer's or the symbol's).
+    let mut read = |_: &str| Ok(("QUJD".to_string(), 0.5));
+    let own = r#"<Option name="fixedAspectRatio" value="1"/><Option name="alpha" value="0.5"/>"#;
+    let mut report = Report::default();
+    super::read_style(&marker_qml("0.5", &raster_marker("base64:QUJD", own)), "Pins", "", &mut read, &mut report).unwrap();
+    let notes: Vec<_> = report.notes.iter().map(|n| (n.text.as_str(), n.count)).collect();
+    assert_eq!(
+        notes,
+        [
+            ("raster image markers of a fixed aspect ratio, drawn in their image's own", 1),
+            ("see-through raster image markers, drawn opaque", 1)
+        ]
+    );
+    // A ratio that is the image's own is no change; a switched-off layer's image isn't read.
+    let mut asked = 0;
+    let mut read = |_: &str| {
+        asked += 1;
+        Ok(("QUJD".to_string(), 0.5))
+    };
+    let off = raster_marker("/data/off.png", "").replace(r#"enabled="1""#, r#"enabled="0""#);
+    let qml = marker_qml("1", &format!("{off}{}", raster_marker("base64:QUJD", r#"<Option name="fixedAspectRatio" value="0.5"/>"#)));
+    let mut report = Report::default();
+    super::read_style(&qml, "Pins", "", &mut read, &mut report).unwrap();
+    assert_eq!((asked, report.notes.len()), (1, 0), "{:?}", report.notes);
 }
 
 /// Gradient and shapeburst fills carry over: their two colours (or their ramp's, with its stops,
@@ -1661,7 +1843,8 @@ fn a_rule_based_renderer_classes_each_feature_by_the_first_rule_it_meets() {
     assert!(e.starts_with("CASE WHEN (\"kind\" = 'a') THEN 'a' WHEN "), "{e}");
     assert!(e.contains("(length(\"name\") > 3) THEN 'fn'"), "kept as QGIS wrote it: {e}");
     assert!(e.contains("(\"value\" < 50) AND (\"kind\" = 'c') THEN 'inner'"), "the parent's filter too: {e}");
-    assert!(!report.notes.iter().any(|n| n.text.contains("rules")), "{:?}", report.notes);
+    assert!(!report.notes.iter().any(|n| n.text.contains("rules") && !n.text.contains("letter case")), "{:?}", report.notes);
+    assert_eq!(letter_case_notes(&report, "points"), 1, "{:?}", report.notes);
     assert_eq!(s.rules.len(), 4);
 
     let mut l = rule_points(&[("a", 10, "ab"), ("b", 60, "xy"), ("c", 20, "abcd"), ("c", 20, "ab"), ("z", 99, "ab")]);
@@ -2985,4 +3168,160 @@ fn a_hostile_project_is_refused_before_parsing() {
     let flood = format!("<qgis{declarations}/>");
     let refused = parse(&flood, "a QGIS project").unwrap_err();
     assert!(refused.contains("namespace declarations"), "{refused}");
+}
+
+fn letter_case_notes(report: &Report, layer: &str) -> usize {
+    report.notes.iter().filter(|n| n.layer == layer && n.kind == NoteKind::Approximated && n.text.contains("letter case")).count()
+}
+
+/// A filter that matches text ignoring case where QGIS (or the filter's own database) tells case
+/// apart is noted, once, under the rules of its dialect; one that doesn't differ is not.
+#[test]
+fn text_matched_ignoring_case_is_noted_where_qgis_tells_case_apart() {
+    for (file, subset, noted) in [
+        ("./a.gpkg", r#"&quot;kind&quot; = 'x'"#, true),
+        ("./a.gpkg", r#"&quot;kind&quot; IN ('a', 'B')"#, true),
+        ("./a.gpkg", r#"&quot;name&quot; &gt; 'M'"#, true),
+        ("./a.gpkg", r#"&quot;kind&quot; LIKE 'x%'"#, false),
+        ("./a.gpkg", r#"&quot;kind&quot; LIKE 'é%'"#, false),
+        ("./a.gpkg", r#"lower(&quot;kind&quot;) = 'x'"#, false),
+        ("./a.gpkg", r#"upper(&quot;kind&quot;) LIKE '%PARK%'"#, false),
+        ("./a.gpkg", r#"format_date(&quot;d&quot;, 'yyyy') IS NULL"#, false),
+        ("./a.shp", r#"&quot;kind&quot; = 'x'"#, false),
+        ("./a.shp", r#"&quot;kind&quot; LIKE 'x%'"#, true),
+        ("./a.shp", r#"&quot;kind&quot; ILIKE 'x%'"#, false),
+        ("./a.shp", r#"&quot;kind&quot; &gt; 'M'"#, false),
+        ("./a.shp", r#"&quot;kind&quot; &gt; 'É'"#, true),
+        ("./a.gpkg", r#"&quot;kind&quot; = '12' AND &quot;pop&quot; &gt; 5"#, false),
+        ("./a.gpkg", r#"&quot;kind&quot; = 'é'"#, false),
+    ] {
+        let project = format!(
+            r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>{file}|layername=a|subset={subset}</datasource><layername>A</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+        );
+        let mut report = Report::default();
+        read_project(&project, "/maps", &mut report).unwrap();
+        assert_eq!(letter_case_notes(&report, "A"), usize::from(noted), "{file} {subset}: {:?}", report.notes);
+    }
+    for (file, subset, noted) in [
+        ("./a.gpkg", "&quot;pop&quot; NOT IN (1, NULL)", true),
+        ("./a.gpkg", "&quot;pop&quot; NOT IN (1, 2)", false),
+        ("./a.shp", "&quot;pop&quot; NOT IN (1, NULL)", true),
+    ] {
+        let project = format!(
+            r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>{file}|layername=a|subset={subset}</datasource><layername>A</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#
+        );
+        let mut report = Report::default();
+        read_project(&project, "/maps", &mut report).unwrap();
+        let n = report.notes.iter().filter(|n| n.layer == "A" && n.text.contains("NOT IN list holds NULL")).count();
+        assert_eq!(n, usize::from(noted), "{subset}: {:?}", report.notes);
+    }
+}
+
+fn rules_layer(renderer_rules: &str, label_rules: &str) -> String {
+    format!(
+        r#"<qgis><projectlayers><maplayer type="vector"><id>a</id><datasource>./a.gpkg|layername=a</datasource><layername>A</layername><provider>ogr</provider>
+        <renderer-v2 type="RuleRenderer"><rules key="r">{renderer_rules}</rules>
+        <symbols><symbol type="marker" name="0"><layer class="SimpleMarker" enabled="1"/></symbol><symbol type="marker" name="1"><layer class="SimpleMarker" enabled="1"/></symbol></symbols></renderer-v2>
+        <labeling type="rule-based"><rules key="l">{label_rules}</rules></labeling></maplayer></projectlayers></qgis>"#
+    )
+}
+
+#[test]
+fn rules_matching_text_ignoring_case_are_noted_and_unique_values_are_not() {
+    let label = r#"<rule key="1" filter="&quot;kind&quot; = 'x'"><settings><text-style fieldName="name"/></settings></rule>"#;
+    let mut report = Report::default();
+    let rules =
+        r#"<rule key="1" filter="&quot;kind&quot; LIKE 'x%'" symbol="0"/><rule key="2" filter="&quot;kind&quot; ILIKE 'y%'" symbol="1"/>"#;
+    read_project(&rules_layer(rules, label), "/m", &mut report).unwrap();
+    let said =
+        |part: &str| report.notes.iter().filter(|n| n.layer == "A" && n.text.contains(part) && n.text.contains("letter case")).count();
+    assert_eq!((said("its rules,"), said("its label rules,")), (1, 1), "{:?}", report.notes);
+    let mut report = Report::default();
+    let rules = r#"<rule key="1" filter="&quot;kind&quot; = 'x'" symbol="0"/><rule key="2" filter="&quot;kind&quot; = 'y'" symbol="1"/>"#;
+    read_project(&rules_layer(rules, ""), "/m", &mut report).unwrap();
+    assert!(!report.notes.iter().any(|n| n.text.contains("its rules,")), "{:?}", report.notes);
+    // Only rules the import keeps are noted: one whose symbol can't be read isn't kept.
+    let mut report = Report::default();
+    let rules = r#"<rule key="1" filter="&quot;value&quot; &gt; 1" symbol="0"/><rule key="2" filter="&quot;value&quot; &gt; 2" symbol="1"/><rule key="3" filter="&quot;kind&quot; LIKE 'x%'" symbol="9"/>"#;
+    read_project(&rules_layer(rules, ""), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
+    // But an else rule takes what its siblings don't draw, so their filters count with it.
+    let mut report = Report::default();
+    let rules = r#"<rule key="1" filter="&quot;value&quot; &gt; 1" symbol="0"/><rule key="3" filter="&quot;kind&quot; LIKE 'x%'" symbol="9"/><rule key="4" filter="ELSE" symbol="1" scalemaxdenom="50000"/>"#;
+    read_project(&rules_layer(rules, ""), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 1, "{:?}", report.notes);
+    // Label rules likewise: one without settings isn't imported.
+    let mut report = Report::default();
+    let bare = r#"<rule key="1" filter="&quot;kind&quot; = 'x'"/>"#;
+    read_project(&rules_layer("", bare), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
+    // Nor one past the 64 classes read.
+    let mut report = Report::default();
+    let many: String = (0..64)
+        .map(|k| format!(r#"<rule key="n{k}" filter="&quot;n&quot; = 1"><settings><text-style fieldName="name"/></settings></rule>"#))
+        .collect::<String>()
+        + label;
+    read_project(&rules_layer("", &many), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 0, "{:?}", report.notes);
+    // A label else rule takes what its sibling labels, and that sibling's filter counts with it
+    // even where the sibling makes no class (no text style).
+    let mut report = Report::default();
+    let siblings = r#"<rule key="1" filter="&quot;kind&quot; LIKE 'x%'"><settings/></rule><rule key="2" filter="ELSE"><settings><text-style fieldName="name"/></settings></rule>"#;
+    read_project(&rules_layer("", siblings), "/m", &mut report).unwrap();
+    assert_eq!(letter_case_notes(&report, "A"), 1, "{:?}", report.notes);
+}
+
+#[test]
+fn a_virtual_layer_filter_matching_text_ignoring_case_is_noted() {
+    let layer = |id: &str, provider: &str, source: &str| {
+        format!(
+            r#"<maplayer type="vector"><id>{id}</id><datasource>{source}</datasource><layername>{id}</layername><provider>{provider}</provider></maplayer>"#
+        )
+    };
+    for (base, query, noted) in [
+        ("./a.shp|layername=a", "SELECT%20*%20FROM%20b%20WHERE%20kind%20%3D%20'x'", true),
+        ("./a.shp|layername=a|subset=kind = 'x'", "SELECT%20*%20FROM%20b", false),
+    ] {
+        let qgs = format!(
+            "<qgis><projectlayers>{}{}</projectlayers></qgis>",
+            layer("v", "virtual", &format!("?layer_ref=base:b&amp;query={query}")),
+            layer("base", "ogr", base),
+        );
+        let mut report = Report::default();
+        read_project(&qgs, "/d", &mut report).unwrap();
+        assert_eq!(letter_case_notes(&report, "v"), usize::from(noted), "{base}: {:?}", report.notes);
+    }
+    // A virtual layer on a virtual layer reads the parts of the one below under their dialects.
+    for (base, v1, noted) in [
+        ("./a.shp|layername=a", "SELECT%20*%20FROM%20b%20WHERE%20kind%20%3D%20'x'", true),
+        ("./a.gpkg|layername=a|subset=kind LIKE 'x%'", "SELECT%20*%20FROM%20b", false),
+        ("./a.shp|layername=a|subset=kind = 'x'", "SELECT%20*%20FROM%20b", false),
+    ] {
+        let qgs = format!(
+            "<qgis><projectlayers>{}{}{}</projectlayers></qgis>",
+            layer("v2", "virtual", "?layer_ref=v1:b&amp;query=SELECT%20*%20FROM%20b"),
+            layer("v1", "virtual", &format!("?layer_ref=base:b&amp;query={v1}")),
+            layer("base", "ogr", base),
+        );
+        let mut report = Report::default();
+        read_project(&qgs, "/d", &mut report).unwrap();
+        assert_eq!(letter_case_notes(&report, "v2"), usize::from(noted), "{base}: {:?}", report.notes);
+    }
+}
+
+/// A virtual layer's filter dropped for being too long to read together with its base's isn't
+/// noted for.
+#[test]
+fn a_dropped_virtual_filter_is_not_noted_for_letter_case() {
+    let max = rustgis_data::query::MAX_LEN;
+    let base = format!("value &gt; {}", "9".repeat(max - 60));
+    let qgs = format!(
+        r#"<qgis><projectlayers><maplayer type="vector"><id>v</id><datasource>?layer_ref=base:b&amp;query=SELECT%20*%20FROM%20b%20WHERE%20kind%20%3D%20'{}x'</datasource><layername>v</layername><provider>virtual</provider></maplayer>
+        <maplayer type="vector"><id>base</id><datasource>./a.shp|subset={base}</datasource><layername>base</layername><provider>ogr</provider></maplayer></projectlayers></qgis>"#,
+        "y".repeat(100)
+    );
+    let mut report = Report::default();
+    read_project(&qgs, "/d", &mut report).unwrap();
+    assert!(report.notes.iter().any(|n| n.layer == "v" && n.text.contains("too long to read together")), "{:?}", report.notes);
+    assert_eq!(letter_case_notes(&report, "v"), 0, "{:?}", report.notes);
 }

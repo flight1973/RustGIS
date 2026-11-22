@@ -104,7 +104,8 @@ in the fixtures' README and in the test's `SKIPS` when a release has no such fil
 
 New project saves and map/layer exports write format 2. Their `requires` header names only
 features present in the saved payload: `terrain-block`, `terrain-block-shape` (a block
-diagram cut to a circle), `terrain-water`,
+diagram cut to a circle or to polygons), `terrain-block-polygon` (one cut to polygons),
+`terrain-water`,
 `terrain-water-shore` (a terrain water's shore band other than the default),
 `terrain-block-water` (water in a block diagram's walls),
 `shaded-relief-effects` (cast shadows, sky visibility, fill light or rock colour),
@@ -146,6 +147,11 @@ Projects, map files and layer files with a window of a Zarr variable that follow
 reader refuses them instead of reading the whole map at each step. A saved `layer.addZarr` command
 with both needs nothing: an older RustGIS refuses it when it runs.
 
+Projects, map files and layer files with a label class curved along a guide line layer
+(`labels.placement` with a `guide`) require `label-guide`, so an older reader refuses them instead
+of placing those labels as without it and saving them again without the guide. A saved
+`labels.placement` command with a guide needs nothing: an older RustGIS refuses the key when it runs.
+
 Projects with an ink on a legend, colorbar, table or chart (`color` on those elements) require
 `layout-element-ink`, so an older reader refuses them instead of drawing those elements in dark
 grey and saving them again without it. Saved `layout.addElement` and `layout.update` commands
@@ -183,6 +189,22 @@ a colorbar's, which the command alone doesn't tell, and the project the update r
 for its chart anyway. Giving the defaults needs nothing. A saved `layout.import` whose `text` has
 such a chart requires it as well. Layout files are not covered, as for backgrounds (#2277).
 
+Projects with a layout chart coloured by its layer's classes (`classes` on a chart element)
+require `layout-chart-classes`, so an older reader refuses them instead of drawing every bar in
+the chart's bar colour and saving it again without. Saved `layout.addElement` commands for a
+chart and `layout.update` commands that set `"classes": true` require it too (only a chart takes
+the key); `false` needs nothing. A saved `layout.import` whose `text` has such a chart requires it
+as well. Layout files are not covered, as for backgrounds (#2277).
+
+Projects with a layout chart stacked by a second field (`stack` on a chart element) require
+`layout-chart-stack`, so an older reader refuses them instead of drawing each bar whole and
+saving it again without the field. It is required whenever the field is stored, even where the
+chart doesn't draw it stacked (ungrouped, or not summing or counting, which commands refuse or
+let go). Saved `layout.addElement` commands for a chart and `layout.update` commands that set a
+`stack` field require it too (only a chart takes the key); `""` needs nothing. A saved
+`layout.import` whose `text` has such a chart requires it as well. Layout files are not covered,
+as for backgrounds (#2277).
+
 Projects with a map frame whose border isn't the default dark grey 0.8 pt line (`border_color`,
 `border_width` on a map frame, a width of 0 drawing none) require `layout-frame-border`, so an
 older reader refuses them instead of drawing the default border and saving the frame again
@@ -190,6 +212,14 @@ without its own (#2557). A saved `layout.update` that gives a frame a `border` o
 too, since an older reader warns that it ignores the key; `"border": null` only gives the default
 back and needs nothing. A saved `layout.import` whose `text` has such a frame requires it as well.
 Layout files are not covered, as for backgrounds (#2277).
+
+Projects, map files and layer files with a layer or table held in a coordinate system of its own
+(`Dataset::held_in`: a file's system, kept since #2580) save its features in that system, exactly,
+with `held_in` beside them, and require `native-coordinates`: an older reader would read those
+coordinates as longitude/latitude, and one that saved the project again would lose its system and
+its exact coordinates. That holds for one with no features too (a template's layers), whose system
+an older reader would also save away. A layer or table in longitude/latitude, or a window onto a
+streamed source, is saved as before and requires nothing (#2032 C2d).
 
 A coordinate system read from WKT is saved with its PROJ definition, which older readers read,
 and its WKT beside it (`wkt`), which this release reads first. Projects, map files and layer

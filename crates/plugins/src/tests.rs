@@ -321,6 +321,29 @@ fn command_dialog_fields_are_checked() {
     assert!(Manifest::parse(&c.to_string()).is_ok());
 }
 
+/// A dialog's `choice` field may be drawn as tabs; `tabs` on another kind, on a second field of
+/// the form or on a tool parameter is refused, naming the field.
+#[test]
+fn dialog_tabs_are_one_choice_field() {
+    let tabs = json!({"name": "part", "label": "Part", "kind": "choice", "tabs": true, "choices": ["Authors", "Sources"]});
+    let mut m = json!({"id": "about", "name": "About", "version": "1.0.0",
+        "commands": [{"id": "about", "label": "About", "form": [tabs.clone(), {"name": "lang", "label": "Language", "kind": "text"}]}]});
+    let parsed = Manifest::parse(&m.to_string()).unwrap();
+    assert!(parsed.commands[0].form[0].tabs && !parsed.commands[0].form[1].tabs);
+    // Written back only where it is set, so a manifest without it reads as before.
+    assert_eq!(serde_json::to_value(&parsed.commands[0].form[1]).unwrap().get("tabs"), None);
+    let mut other = m.clone();
+    other["commands"][0]["form"][1]["tabs"] = json!(true);
+    let e = Manifest::parse(&other.to_string()).unwrap_err();
+    assert!(e.contains("About: 'lang' has tabs, which only a choice field can have"), "{e}");
+    other["commands"][0]["form"][1] = json!({"name": "more", "label": "More", "kind": "choice", "tabs": true, "choices": ["A"]});
+    let e = Manifest::parse(&other.to_string()).unwrap_err();
+    assert!(e.contains("'more' has tabs, but 'part' already has"), "{e}");
+    m["tools"] = json!([{"id": "t", "name": "Tool", "params": [tabs]}]);
+    let e = Manifest::parse(&m.to_string()).unwrap_err();
+    assert!(e.contains("Tool: 'part' has tabs, which only a command's dialog field can have"), "{e}");
+}
+
 /// A command may ask for more time than the two minutes a command normally gets.
 #[test]
 fn command_timeouts_are_bounded() {
@@ -908,7 +931,7 @@ fn plugin_panels_are_checked() {
             "1 to 32 items",
         ),
         (json!({"title": "P", "state": "nope", "items": [{"kind": "button", "command": "h"}]}), "state command"),
-        (item(json!({"kind": "dial", "id": "d"})), "isn't text, checkbox, slider, button, tree, form, choice, date, range or pick"),
+        (item(json!({"kind": "dial", "id": "d"})), "isn't text, checkbox, slider, button, tree, form, choice, tabs, date, range or pick"),
         (item(json!({"kind": "pick", "id": "p"})), "needs a label or a command"),
         (item(json!({"kind": "pick", "label": "P"})), "invalid or repeated"),
         (item(json!({"kind": "pick", "id": "p", "command": "zz"})), "isn't one of the plugin's commands"),
@@ -2289,6 +2312,38 @@ fn choice_date_range_panel() -> crate::PanelDecl {
     items.push(json!({"kind": "range", "id": "months", "label": "Months", "min": 0, "max": 11, "default": [2, 5], "steps": true}));
     items.push(json!({"kind": "range", "id": "all", "label": "All", "min": 1, "max": 4}));
     Manifest::parse(&m.to_string()).unwrap().panel.unwrap()
+}
+
+#[test]
+fn panel_tabs_hold_their_options_and_value_like_a_dropdown() {
+    // A tab row is a dropdown drawn as a row of labels: same options, same default, same value,
+    // and the plugin may replace the options at runtime. Only the drawing differs.
+    let mut m: Value = serde_json::from_str(&testing::panel_manifest("tabs-panel")).unwrap();
+    m["panel"]["items"].as_array_mut().unwrap().push(json!({"kind": "tabs", "id": "step", "command": "q",
+        "options": [{"id": "data", "label": "Data"}, {"id": "layer", "label": "Layer"}], "default": "data"}));
+    let decl = Manifest::parse(&m.to_string()).unwrap().panel.unwrap();
+    let tabs = decl.items.iter().find(|d| d.id == "step").unwrap();
+    assert!(tabs.has_value());
+    assert_eq!(tabs.options.len(), 2);
+
+    let mut state = crate::PanelState::new(&decl);
+    assert_eq!(state.chosen("step"), Some("data"));
+    // A tab the panel holds is taken; one it does not is refused, as for a dropdown.
+    state.set_values(&decl, &json!({"step": "layer"}));
+    assert_eq!(state.chosen("step"), Some("layer"));
+    state.set_values(&decl, &json!({"step": "nowhere"}));
+    assert_eq!(state.chosen("step"), Some("layer"));
+    // And the plugin can replace the row's options, dropping a value they no longer hold.
+    state.apply(&decl, &json!({"items": {"step": {"options": [{"id": "only"}]}}}));
+    assert_eq!(state.chosen("step"), None);
+}
+
+#[test]
+fn panel_tabs_take_only_an_option_id_as_their_default() {
+    let mut m: Value = serde_json::from_str(&testing::panel_manifest("tabs-bad")).unwrap();
+    m["panel"]["items"].as_array_mut().unwrap().push(json!({"kind": "tabs", "id": "step", "options": [{"id": "a"}], "default": "b"}));
+    let e = Manifest::parse(&m.to_string()).unwrap_err();
+    assert!(e.contains("one of its options"), "{e}");
 }
 
 #[test]

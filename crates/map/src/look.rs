@@ -37,6 +37,155 @@ pub struct LayerLook {
     raster: Option<RasterLook>,
 }
 
+/// `layer` without its rows, raster, caches and what else a look leaves out (see the module),
+/// copied field by field: a whole copy taken first and pared down would copy, in every frame, what
+/// grows with the data, such as an edit archive's whole features for every edit.
+fn bare(layer: &Layer) -> Layer {
+    let Layer {
+        id,
+        name,
+        visible,
+        dataset,
+        renderer,
+        labels,
+        transparency,
+        min_scale,
+        max_scale,
+        definition_query,
+        time,
+        selection,
+        expanded,
+        selectable,
+        graphics,
+        blend,
+        mask,
+        display_filters,
+        aggregation,
+        extrusion,
+        line_strokes,
+        fill_layers,
+        no_fill,
+        hidden_fills,
+        stroke_levels,
+        marker_rotation,
+        diagram,
+        symbol_by,
+        size_by,
+        reference_scale,
+        priority,
+        design,
+        // Compared by its own look.
+        raster: _,
+        source,
+        // Saving back to a database or GeoPackage keeps per-row versions, which aren't drawn.
+        postgis: _,
+        gpkg: _,
+        synced: _,
+        connection,
+        anonymous,
+        instance_id,
+        replacement_rev,
+        // Caches, emptied below.
+        projected,
+        display,
+        display_rejected: _,
+        display_levels,
+        projected_extents,
+        projected_vertices,
+        thinned,
+        projected_rev,
+        projected_for,
+        projected_crs,
+        lonlat,
+        unplaced: _,
+        flat_unplaced: _,
+        extent_cache: _,
+        drawn: _,
+        view_memory: _,
+        geometry_kinds: _,
+        geometry_rev,
+    } = layer;
+    let crate::design::Design { domains, subtypes, rules, contingent, archive, templates } = design;
+    let mut kept = Layer {
+        id: *id,
+        name: name.clone(),
+        visible: *visible,
+        // Its rows are shared, so the copy costs a pointer; dropped below.
+        dataset: dataset.clone(),
+        renderer: renderer.clone(),
+        labels: labels.clone(),
+        transparency: *transparency,
+        min_scale: *min_scale,
+        max_scale: *max_scale,
+        definition_query: definition_query.clone(),
+        // A time binding keeps the rows its dates were read from: only what it draws by.
+        time: time.as_ref().map(|t| {
+            let mut bare = crate::time::TimeBinding::new(t.field.clone());
+            bare.window = t.window;
+            bare
+        }),
+        selection: selection.clone(),
+        expanded: *expanded,
+        selectable: *selectable,
+        graphics: *graphics,
+        blend: *blend,
+        mask: mask.clone(),
+        display_filters: display_filters.clone(),
+        aggregation: *aggregation,
+        extrusion: extrusion.clone(),
+        line_strokes: line_strokes.clone(),
+        fill_layers: fill_layers.clone(),
+        no_fill: *no_fill,
+        hidden_fills: hidden_fills.clone(),
+        stroke_levels: *stroke_levels,
+        marker_rotation: marker_rotation.clone(),
+        diagram: diagram.clone(),
+        symbol_by: symbol_by.clone(),
+        size_by: size_by.clone(),
+        reference_scale: *reference_scale,
+        priority: *priority,
+        design: crate::design::Design {
+            domains: domains.clone(),
+            subtypes: subtypes.clone(),
+            rules: rules.clone(),
+            contingent: contingent.clone(),
+            // Whether edits are archived, not the whole features from before and after each.
+            archive: archive.as_ref().map(|_| Vec::new()),
+            templates: templates.clone(),
+        },
+        raster: None,
+        source: source.clone(),
+        postgis: None,
+        gpkg: None,
+        synced: None,
+        connection: connection.clone(),
+        anonymous: *anonymous,
+        instance_id: *instance_id,
+        replacement_rev: *replacement_rev,
+        projected: projected.clone(),
+        display: display.clone(),
+        display_rejected: Vec::new(),
+        display_levels: display_levels.clone(),
+        projected_extents: projected_extents.clone(),
+        projected_vertices: *projected_vertices,
+        thinned: thinned.clone(),
+        projected_rev: *projected_rev,
+        projected_for: projected_for.clone(),
+        projected_crs: *projected_crs,
+        lonlat: lonlat.clone(),
+        unplaced: Default::default(),
+        flat_unplaced: Default::default(),
+        extent_cache: Default::default(),
+        drawn: Default::default(),
+        view_memory: Default::default(),
+        geometry_kinds: Default::default(),
+        geometry_rev: *geometry_rev,
+    };
+    kept.dataset.features = Default::default();
+    kept.clear_cache();
+    kept
+}
+
 impl LayerLook {
     /// The look of `layer`; `None` for one whose drawing reads more than the layer holds, which no
     /// look can vouch for: a source read in place (its file is read again for each frame) or a
@@ -51,22 +200,7 @@ impl LayerLook {
             None => None,
         };
         let rows = layer.dataset.features.allocation_key();
-        // Saving back to a database or GeoPackage keeps per-row versions, which aren't drawn.
-        let mut kept = Layer { raster: None, postgis: None, gpkg: None, synced: None, ..layer.clone() };
-        kept.dataset.features = Default::default();
-        kept.clear_cache();
-        // What these share with the layer could hold its rows: a time binding keeps the rows its
-        // dates were read from.
-        kept.time = layer.time.as_ref().map(|t| {
-            let mut bare = crate::time::TimeBinding::new(t.field.clone());
-            bare.window = t.window;
-            bare
-        });
-        kept.view_memory = Default::default();
-        // Edit archiving keeps whole features from before and after each edit, which aren't drawn.
-        kept.design.archive = layer.design.archive.as_ref().map(|_| Vec::new());
-        kept.geometry_kinds = Default::default();
-        Some(LayerLook { layer: kept, rows, raster })
+        Some(LayerLook { layer: bare(layer), rows, raster })
     }
 
     /// How the layer `now` was taken of differs from the one this look was taken of.
@@ -136,6 +270,11 @@ impl LayerLook {
             projected_for: _,
             projected_crs: _,
             lonlat: _,
+            // What the last drawing counted and whether it drew the layer; neither is the look.
+            unplaced: _,
+            flat_unplaced: _,
+            extent_cache: _,
+            drawn: _,
             view_memory: _,
             geometry_kinds: _,
             geometry_rev,
@@ -186,6 +325,12 @@ impl LayerLook {
     pub fn id(&self) -> u32 {
         self.layer.id
     }
+
+    /// Whether the rows it was taken of are still held: once the layer is removed, its map or
+    /// project closed, or its rows edited, nothing can look as this look again.
+    pub fn rows_held(&self) -> bool {
+        self.rows.strong_count() > 0
+    }
 }
 
 /// Whether two time bindings show the same rows: the same field through the same window (what
@@ -196,7 +341,7 @@ fn same_time(a: Option<&crate::time::TimeBinding>, b: Option<&crate::time::TimeB
 
 /// Whether two datasets hold what a frame draws alike, their rows aside (compared by allocation).
 fn same_dataset(a: &Dataset, b: &Dataset) -> bool {
-    let Dataset { name, geometry_type, fields, features: _, source, crs, crs_incomplete, zm_dropped, windowed, held_in } = a;
+    let Dataset { name, geometry_type, fields, features: _, source, crs, crs_incomplete, zm_dropped, windowed, held_in, shown_in } = a;
     *name == b.name
         && *geometry_type == b.geometry_type
         && *fields == b.fields
@@ -206,6 +351,8 @@ fn same_dataset(a: &Dataset, b: &Dataset) -> bool {
         && *zm_dropped == b.zm_dropped
         && *windowed == b.windowed
         && *held_in == b.held_in
+        // Labels' lines, terrain water and block walls read its places as its map shows them.
+        && *shown_in == b.shown_in
 }
 
 /// Whether two layer groups apply alike to their layers: whether the Layers pane shows a group
@@ -248,6 +395,8 @@ impl MapLook {
             graticule,
             graticule_type,
             graticule_crs,
+            graticule_on_top,
+            graticule_color,
             projection,
             popup_mode,
             label_display,
@@ -278,6 +427,8 @@ impl MapLook {
                 graticule: *graticule,
                 graticule_type: *graticule_type,
                 graticule_crs: graticule_crs.clone(),
+                graticule_on_top: *graticule_on_top,
+                graticule_color: *graticule_color,
                 projection: projection.clone(),
                 popup_mode: *popup_mode,
                 label_display: *label_display,
@@ -316,6 +467,8 @@ impl MapLook {
             graticule,
             graticule_type,
             graticule_crs,
+            graticule_on_top,
+            graticule_color,
             projection,
             popup_mode: _,
             label_display,
@@ -342,6 +495,8 @@ impl MapLook {
             && *graticule == map.graticule
             && *graticule_type == map.graticule_type
             && *graticule_crs == map.graticule_crs
+            && *graticule_on_top == map.graticule_on_top
+            && *graticule_color == map.graticule_color
             && *projection == map.projection
             && *label_display == map.label_display
             && *label_lock == map.label_lock
@@ -506,6 +661,13 @@ mod tests {
         assert!(!grouped.same(&MapLook::of(&map)));
         map.graticule = !map.graticule;
         assert!(!before.same(&MapLook::of(&map)));
+        // The grid drawn over the layers, or in a color of its own, draws differently too.
+        let gridded = MapLook::of(&map);
+        map.graticule_on_top = !map.graticule_on_top;
+        assert!(!gridded.same(&MapLook::of(&map)), "the grid over the layers");
+        let on_top = MapLook::of(&map);
+        map.graticule_color = Some(crate::Rgba::rgb(51, 102, 153));
+        assert!(!on_top.same(&MapLook::of(&map)), "the grid's own color");
         // The blank basemap's paper colour (#2532) is the map's background.
         let white = MapLook::of(&map);
         map.paper = Some(Rgba([241, 234, 223, 255]));
