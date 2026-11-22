@@ -211,6 +211,17 @@ pub fn read_from(file_name: &str, source: impl std::io::Read) -> Result<Raster> 
     read_from_limited(file_name, source, max_samples())
 }
 
+/// [`read_from`] for a file read by its path, `len` its size when it was checked: one larger than
+/// [`MAX_BYTES`] is refused. It is read to its end, so bytes written after the check are counted
+/// with any others past the last column and said, not left unread; they go to a sink, so memory
+/// stays as [`read_from`]'s.
+pub fn read_file(file_name: &str, len: u64, source: impl std::io::Read) -> Result<Raster> {
+    if len > MAX_BYTES {
+        return Err(DataError::Format("DTED: the file is larger than any DTED cell".into()));
+    }
+    read_from(file_name, source)
+}
+
 /// [`read`], holding at most `max` samples (the tests' small limit exercises the reduction).
 fn read_limited(file_name: &str, bytes: &[u8], max: usize) -> Result<Raster> {
     read_from_limited(file_name, bytes, max)
@@ -751,6 +762,22 @@ mod tests {
         none[at(0, rows)] = 0;
         none[at(1, rows)] = 0;
         assert!(read("x.dt2", &none).unwrap_err().to_string().contains("none starts with the 0xAA sentinel"));
+    }
+
+    #[test]
+    fn a_file_that_grows_after_its_size_is_checked_says_so() {
+        let clean = dted("0000000E", "0000000N", (3600, 3600), (11, 11), |_, _| Some(1));
+        let len = clean.len() as u64;
+        let after = |r: &Raster| r.lost.iter().filter(|l| l.contains("after its last column")).cloned().collect::<Vec<_>>();
+        // Read as checked: nothing past the last column.
+        assert!(after(&read_file("x.dt2", len, clean.as_slice()).unwrap()).is_empty());
+        // 9 bytes written after the size was checked are read and said.
+        let mut grown = clean.clone();
+        grown.extend([0; 9]);
+        assert_eq!(after(&read_file("x.dt2", len, grown.as_slice()).unwrap()), ["9 bytes after its last column are ignored"]);
+        // A file larger than any cell is refused before it is read.
+        let e = read_file("x.dt2", MAX_BYTES + 1, clean.as_slice()).unwrap_err().to_string();
+        assert!(e.contains("larger than any DTED cell"), "{e}");
     }
 
     #[test]

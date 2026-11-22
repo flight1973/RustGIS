@@ -1356,7 +1356,7 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
         }
         // Elevation, streamed a row or record at a time once its name and size are checked, so the
         // file's bytes are never held whole: an SRTM tile's size says its grid, and a DTED file is
-        // no larger than its largest cell (read only to the size checked).
+        // no larger than its largest cell when checked (bytes past its last column are counted).
         e if ELEVATION_EXTENSIONS.contains(&e) => {
             let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
             let source = std::io::BufReader::new(crate::provenance::open(path)?);
@@ -1364,10 +1364,7 @@ fn read_path_placing(path: &Path, world: bool) -> Result<Raster> {
                 let checked = hgt::check(file_name, meta.len())?;
                 hgt::read_checked_from(file_name, checked, source)?
             } else {
-                if meta.len() > dted::MAX_BYTES {
-                    return Err(DataError::Format("DTED: the file is larger than any DTED cell".into()));
-                }
-                dted::read_from(file_name, std::io::Read::take(source, meta.len()))?
+                dted::read_file(file_name, meta.len(), source)?
             }
         }
         #[cfg(not(target_arch = "wasm32"))]

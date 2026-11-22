@@ -84,6 +84,25 @@ fn srtm_and_dted_are_added_by_path_with_their_extent() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn bytes_past_a_dted_files_last_column_are_said_when_read_by_path() {
+    let dir = std::env::temp_dir().join(format!("rustgis-dted-trailing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("S45E006.dt1");
+    for (extra, said) in [(0, false), (7, true)] {
+        let mut bytes = dt1_cell();
+        bytes.extend(std::iter::repeat_n(0, extra));
+        std::fs::write(&path, bytes).unwrap();
+        let mut s = Session::new(Project::default());
+        s.run("layer.addData", &json!({"path": path})).unwrap();
+        let notice = s.notices.iter().any(|n| n.text.contains("7 bytes after its last column are ignored"));
+        let any = s.notices.iter().any(|n| n.text.contains("after its last column"));
+        assert_eq!((notice, any), (said, said), "{extra}: {:?}", s.notices);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn an_srtm_upload_keeps_its_name_and_place() {
     use base64::Engine;
