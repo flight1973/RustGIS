@@ -1059,14 +1059,35 @@ fn run_steps(s: &mut Session, model: Model) -> CmdResult {
             st.tool
         ));
     }
+    // The parameters the steps ignore are said once for the run, as a graph's run says them
+    // (#2307). A failed run's error carries them, as its notices go back with its changes.
+    let mut ignored = Vec::new();
+    let res = run_step_list(s, &model, &mut ignored);
+    let said = crate::model::ignored_summary(&ignored);
+    match res {
+        Err(e) if !said.is_empty() => Err(format!("{e}; {said}")),
+        res => {
+            if !said.is_empty() {
+                s.warn(said);
+            }
+            res
+        }
+    }
+}
+
+/// Runs each of a model's steps in order ([`run_steps`]), collecting into `ignored` what each
+/// step's tool ignores ([`super::gp::ignored_params`]).
+fn run_step_list(s: &mut Session, model: &Model, ignored: &mut Vec<String>) -> CmdResult {
     let mut outputs: Vec<String> = Vec::new();
     let mut ran = Vec::new();
     for (i, st) in model.steps.iter().enumerate() {
         let mut params = st.params.clone();
         wire(&mut params, &outputs, i, 0)?;
         let before = s.project.gp_history.len();
-        // As gp.run runs it, saying which of its parameters the tool ignores (#2307).
-        let r = super::gp::run_tool_saying(s, &st.tool, &params).map_err(|e| format!("step {} ({}): {e}", i + 1, st.tool))?;
+        if let Some(said) = rustgis_analysis::resolve_published(&st.tool).and_then(|r| super::gp::ignored_params(r.spec(), &params)) {
+            ignored.push(said);
+        }
+        let r = super::gp::run_step(s, &st.tool, &params).map_err(|e| format!("step {} ({}): {e}", i + 1, st.tool))?;
         // A step that made no layer leaves nothing for a later %n to use.
         let out =
             (s.project.gp_history.len() > before).then(|| s.project.gp_history.last().and_then(|h| h.outputs.first().cloned())).flatten();

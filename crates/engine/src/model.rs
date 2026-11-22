@@ -685,9 +685,13 @@ pub(crate) fn run(s: &mut Session, op: crate::policy::Authorized<crate::policy::
     out
 }
 
+/// The most kinds of parameter warning a run lists (the rest counted), so a model of many steps
+/// that each ignore something stays within what a notice keeps.
+const IGNORED_KINDS_SAID: usize = 5;
+
 /// The parameter warnings of a run's steps, one per kind with how many steps give it: "Buffer
 /// ignores 'unit' (…) (in 3 steps)". Empty when no step ignores any.
-fn ignored_summary(said: &[String]) -> String {
+pub(crate) fn ignored_summary(said: &[String]) -> String {
     let mut kinds: Vec<(&str, usize)> = Vec::new();
     for text in said {
         let text = text.as_str();
@@ -696,8 +700,15 @@ fn ignored_summary(said: &[String]) -> String {
             None => kinds.push((text, 1)),
         }
     }
-    let parts: Vec<String> = kinds.into_iter().map(|(k, n)| if n > 1 { format!("{k} (in {n} steps)") } else { k.to_string() }).collect();
-    parts.join("; ")
+    let parts: Vec<String> = kinds
+        .iter()
+        .take(IGNORED_KINDS_SAID)
+        .map(|&(k, n)| if n > 1 { format!("{k} (in {n} steps)") } else { k.to_string() })
+        .collect();
+    match kinds.len().saturating_sub(IGNORED_KINDS_SAID) {
+        0 => parts.join("; "),
+        more => format!("{}; {more} more kinds", parts.join("; ")),
+    }
 }
 
 /// Validate the graph and reject an imported graph's external tools before executing any node.
@@ -1051,6 +1062,19 @@ pub(crate) fn to_web_tool_file(name: &str, steps: &[ModelStep]) -> Value {
 mod tests {
     use super::*;
     use crate::Project;
+
+    /// A run's ignored-parameter warning lists at most five kinds, and counts the rest, so a long
+    /// model's warning still fits a notice; a kind given by several steps says how many.
+    #[test]
+    fn ignored_summary_lists_five_kinds_and_counts_the_rest() {
+        assert_eq!(ignored_summary(&[]), "");
+        let mut said: Vec<String> = (0..7).map(|i| format!("Tool{i} ignores 'x'")).collect();
+        said.push("Tool0 ignores 'x'".to_string());
+        let text = ignored_summary(&said);
+        assert!(text.starts_with("Tool0 ignores 'x' (in 2 steps); Tool1 ignores 'x'; "), "{text}");
+        assert!(text.ends_with("Tool4 ignores 'x'; 2 more kinds"), "{text}");
+        assert!(!text.contains("Tool5"), "{text}");
+    }
 
     /// Graph and web-tool envelopes reflect only their saved executable payload, and default
     /// km² remains readable without the capability even if the omitted representation needs it.

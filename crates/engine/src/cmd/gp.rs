@@ -5909,6 +5909,38 @@ mod batch_tests {
         assert_eq!(v["warnings"], json!([]), "{v}");
     }
 
+    /// A model saved as steps says each kind of ignored parameter once for its run, with the
+    /// steps that give it, and a failed run carries it in its error instead of a notice that
+    /// would go back with the run's changes.
+    #[test]
+    fn a_model_of_steps_says_ignored_parameters_once() {
+        let said = |s: &Session, mark: u64| -> Vec<String> {
+            s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains(" ignores ")).collect()
+        };
+        let buffer = "Buffer ignores 'unit' (it reads input, distance, units, dissolve, output)";
+        let mut s = test_session();
+        let twice = json!([
+            {"tool": "buffer", "params": {"input": "Cities", "distance": 100, "unit": "Miles"}},
+            {"tool": "buffer", "params": {"input": "%1", "distance": 10, "unit": "Miles"}}
+        ]);
+        s.run("model.new", &json!({"name": "Twice", "steps": twice})).unwrap();
+        let mark = s.notices.len() as u64;
+        s.run("model.run", &json!({"name": "Twice"})).unwrap();
+        assert_eq!(said(&s, mark), [format!("{buffer} (in 2 steps)")]);
+        // A failing step after an ignoring one: the error carries the warning, and no notice
+        // is left behind for the run that failed.
+        let stops = json!([
+            {"tool": "buffer", "params": {"input": "Cities", "distance": 100, "unit": "Miles"}},
+            {"tool": "buffer", "params": {"distance": 10}}
+        ]);
+        s.run("model.new", &json!({"name": "Stops", "steps": stops})).unwrap();
+        let mark = s.notices.len() as u64;
+        let e = s.run("model.run", &json!({"name": "Stops"})).unwrap_err();
+        assert!(e.starts_with("step 2 (buffer)"), "{e}");
+        assert!(e.ends_with(&format!("; {buffer}")), "{e}");
+        assert!(said(&s, mark).is_empty(), "{:?}", said(&s, mark));
+    }
+
     #[test]
     fn batch_run_params_batch_param_overwritten_notified() {
         let mut s = test_session();
