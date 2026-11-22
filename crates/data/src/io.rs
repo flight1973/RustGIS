@@ -360,7 +360,7 @@ pub fn read_layers(file_name: &str, bytes: &[u8]) -> Result<Vec<LayerRead>> {
 
 /// The extension of a file from its first bytes, for a download whose address doesn't say:
 /// GeoParquet, FlatGeobuf, GeoTIFF, a zip, a GeoPackage, an ArcGIS feature service's protocol
-/// buffer answer (`pbf`), KML, GPX, GeoJSON, delimited text, JPEG 2000 or a PDF (`None` for
+/// buffer answer (`pbf`), KML, GPX, GeoJSON, delimited text, JPEG 2000, a PDF or GRIB (`None` for
 /// anything else, such as a web page).
 pub fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
     if let Some(ext) = crate::raster::jpeg2000_extension(bytes) {
@@ -386,6 +386,8 @@ pub fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
         [b'P', b'K', 3, 4, ..] => "zip",
         _ if bytes.starts_with(b"SQLite format 3\0") => "gpkg",
         _ if bytes.starts_with(b"%PDF-") => "pdf",
+        // A GRIB message of edition 1 or 2 (a byte range of a model's file starts with one).
+        [b'G', b'R', b'I', b'B', _, _, _, 1 | 2, ..] => "grb",
         // LiDAR: LAZ marks its point format's top bits.
         _ if crate::lidar::looks_like_las(bytes) => {
             if bytes.get(104).is_some_and(|f| f & 0xC0 != 0) {
@@ -617,15 +619,18 @@ pub fn default_export_note(ds: &Dataset, path: &str) -> Option<String> {
     })
 }
 
-/// The dataset (in longitude/latitude, as every dataset is) in `crs`'s coordinates. Fails on a
-/// coordinate the system can't hold, naming its feature.
+/// The dataset in `crs`'s coordinates, from the system it holds them in ([`Dataset::coord_crs`]),
+/// by the direct operation between the two ([`Crs::to`]). A copy as it is when it holds them in
+/// `crs`. Fails on a coordinate the system can't hold, naming its feature.
 pub fn project(ds: &Dataset, crs: Crs) -> Result<Dataset> {
-    if crs == Crs::LonLat {
+    let from = ds.coord_crs();
+    if crs == from {
         return Ok(ds.clone());
     }
     let mut out = ds.clone();
-    let to = Crs::LonLat.to(crs).map_err(DataError::Format)?;
+    let to = from.to(crs).map_err(DataError::Format)?;
     project_features(&mut out.features, &to)?;
+    out.held_in = crs;
     Ok(out)
 }
 
@@ -655,23 +660,31 @@ pub(crate) fn project_each(features: &mut [crate::Feature], to: &crate::raster::
     Ok(())
 }
 
-/// Defines the CRS of the dataset's native coordinates without changing those numeric values.
-/// Geometry stored in longitude/latitude is converted back through the previous CRS, then
-/// interpreted in the new one. Builds a copy so failed transformations leave the input intact.
+/// Defines the CRS of the dataset's native coordinates without changing those numeric values: a
+/// relabel. Its coordinates as the file held them (in the system it is held in, else the one it was
+/// read in, [`Dataset::crs`], or longitude/latitude without one) are held in `crs` as they are; a
+/// dataset held in longitude/latitude while it says another system (a project saved by an older
+/// release) has its coordinates brought back to that system first. Refused when a place can't be
+/// given in longitude/latitude from `crs`. Builds a copy so a refusal leaves the input intact.
 /// Source geometry discarded during import cannot be recovered this way.
 pub fn define_projection(ds: &Dataset, crs: Crs) -> Result<Dataset> {
     if ds.crs_incomplete {
         return Err(DataError::Format("geometry was lost during import; import the original file again with a crs override".into()));
     }
-    let from = ds.crs.unwrap_or(Crs::LonLat);
-    let native = project(ds, from)?;
+    // The system its numbers are in: the one it is held in, or, for a layer held in
+    // longitude/latitude, the one it was read in (a project saved by an older release).
+    let from = match ds.coord_crs() {
+        Crs::LonLat => ds.crs.unwrap_or(Crs::LonLat),
+        held => held,
+    };
+    // As they are while held in the system it was read in, as a file read now is.
+    let mut out = project(ds, from)?;
     let to = crs.to(Crs::LonLat).map_err(DataError::Format)?;
-    let mut out = native;
-    for f in &mut out.features {
-        if let Some(g) = f.geometry.take() {
-            let g = to.geometry(&g);
+    for f in &out.features {
+        if let Some(g) = &f.geometry {
+            let lonlat = to.geometry(g);
             let mut valid = true;
-            g.for_each_coord(|c| valid &= c.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0);
+            lonlat.for_each_coord(|c| valid &= c.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0);
             if !valid {
                 return Err(DataError::Format(format!(
                     "feature {} can't be interpreted in {}; import the original file with a crs override",
@@ -679,9 +692,9 @@ pub fn define_projection(ds: &Dataset, crs: Crs) -> Result<Dataset> {
                     crs.label()
                 )));
             }
-            f.geometry = Some(g);
         }
     }
+    out.held_in = crs;
     out.crs = Some(crs);
     Ok(out)
 }
@@ -708,9 +721,12 @@ pub fn write_bytes_in(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usi
             return Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())));
         }
         check_projected(&ext, crs)?;
-        return projected_bytes(&project(ds, crs)?, &ext, crs);
     }
-    projected_bytes(ds, &ext, crs)
+    // From the system the dataset holds its coordinates in: as they are when that is `crs`.
+    if crs == ds.coord_crs() {
+        return projected_bytes(ds, &ext, crs);
+    }
+    projected_bytes(&project(ds, crs)?, &ext, crs)
 }
 
 /// [`write_bytes_in`] for a dataset already in `crs`'s coordinates.
@@ -790,11 +806,15 @@ pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
 /// also returns the table written.
 pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> Result<(usize, Option<GpkgWritten>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if crs != Crs::LonLat && PROJECTED_FORMATS.contains(&ext.as_str()) {
+        check_projected(&ext, crs)?;
+    }
     let projected;
-    let ds = if crs == Crs::LonLat || !PROJECTED_FORMATS.contains(&ext.as_str()) {
+    // From the system the dataset holds its coordinates in ([`project`]): as they are when that
+    // is `crs`, and when `crs` is one the format can't hold, which is refused below.
+    let ds = if crs == ds.coord_crs() || (crs != Crs::LonLat && !PROJECTED_FORMATS.contains(&ext.as_str())) {
         ds
     } else {
-        check_projected(&ext, crs)?;
         projected = project(ds, crs)?;
         &projected
     };
@@ -1056,7 +1076,7 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
     write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
     let path = link_target(path)?;
-    atomic_write_at(&path, write)
+    atomic_write_at(path, write)
 }
 
 /// Atomically replaces an app-managed file, replacing a final symbolic link rather than
@@ -1064,25 +1084,50 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
 /// regular files keep their permissions; a replaced link uses a new file's permissions.
 pub fn replace_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    atomic_write_at(path, |out| out.write_all(bytes))
+    replace_atomic_with(path, |out| out.write_all(bytes))
 }
 
-/// Stages content beside the chosen destination; errors and cancellation retain the old file.
-fn atomic_write_at<T, E: From<std::io::Error>>(
+/// [`replace_atomic`] with the content written through a buffer, without concatenating it first.
+pub fn replace_atomic_with<T, E: From<std::io::Error>>(
     path: &Path,
     write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
+    atomic_write_at(path.to_path_buf(), write)
+}
+
+/// Writes and syncs bytes beside the destination, preserving the destination until
+/// [`StagedWrite::commit`] installs them. Dropping the result discards the staged file.
+pub fn stage_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<StagedWrite> {
     use std::io::Write;
-    let tmp = temp_beside(path)?;
+    stage_at(link_target(path)?, |w| w.write_all(bytes)).map(|(staged, ())| staged)
+}
+
+/// Stages and installs a write, retaining the old file on error or cancellation.
+fn atomic_write_at<T, E: From<std::io::Error>>(
+    path: std::path::PathBuf,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let (staged, value) = stage_at(path, write)?;
+    staged.commit()?;
+    Ok(value)
+}
+
+/// Syncs the temporary file on the writing thread, so installation only needs a rename
+/// and a directory sync.
+fn stage_at<T, E: From<std::io::Error>>(
+    path: std::path::PathBuf,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
+) -> std::result::Result<(StagedWrite, T), E> {
+    use std::io::Write;
+    let tmp = temp_beside(&path)?;
     // Opened before the guard, so a name already taken is never removed.
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-    // Removes the file on an error and on a panic in `write` alike, unless it was moved into place.
-    let staged = Staged(&tmp);
+    let staged = StagedWrite { path, tmp: Some(tmp) };
     // The new file takes the old one's mode before any content is written, so a private file
     // (0600) never becomes readable by others. On Windows a new file inherits its folder's access
     // rules, and copying a read-only flag would only make the rename fail.
     #[cfg(unix)]
-    match std::fs::symlink_metadata(path) {
+    match std::fs::symlink_metadata(&staged.path) {
         Ok(old) if !old.file_type().is_symlink() => {
             use std::os::unix::fs::PermissionsExt;
             let permissions = old.permissions();
@@ -1102,15 +1147,42 @@ fn atomic_write_at<T, E: From<std::io::Error>>(
     out.get_ref().sync_all()?;
     // Closed before the rename, including on Windows.
     drop(out);
-    // A cancel that came while it was written leaves the file there before as it was. This is
-    // the last look: the rename commits the file, and a Cancel after it finds it written.
-    if crate::progress::check().is_err() {
-        return Err(std::io::Error::other(DataError::Cancelled).into());
+    Ok((staged, value))
+}
+
+/// An atomic write awaiting installation. An error or drop removes its temporary file.
+pub struct StagedWrite {
+    path: std::path::PathBuf,
+    tmp: Option<std::path::PathBuf>,
+}
+
+impl StagedWrite {
+    /// The destination resolved at staging time, after following any symbolic links.
+    pub fn destination(&self) -> &Path {
+        &self.path
     }
-    std::fs::rename(&tmp, path)?;
-    std::mem::forget(staged);
-    sync_folder(path);
-    Ok(value)
+
+    /// Installs the staged file, checking Cancel just before the rename. The previous file
+    /// remains in place if installation fails.
+    pub fn commit(mut self) -> std::io::Result<()> {
+        if crate::progress::check().is_err() {
+            return Err(std::io::Error::other(DataError::Cancelled));
+        }
+        if let Some(tmp) = &self.tmp {
+            std::fs::rename(tmp, &self.path)?;
+            self.tmp = None;
+            sync_folder(&self.path);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        if let Some(tmp) = &self.tmp {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
 }
 
 /// The file a write to `path` replaces: `path` itself, or, when it is a symbolic link, the file
@@ -1138,16 +1210,6 @@ fn link_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
 
 /// How many symbolic links in a row [`link_target`] follows, as many as Linux does.
 const MAX_LINKS: usize = 40;
-
-/// A file being written beside its destination: removed when dropped, as an export that
-/// failed or panicked leaves it. A finished export forgets it once the file is renamed.
-struct Staged<'a>(&'a Path);
-
-impl Drop for Staged<'_> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.0);
-    }
-}
 
 // ---------------------------------------------------------------------------------------------
 // GeoJSON (RFC 7946)
@@ -1354,10 +1416,46 @@ fn is_epsg_or_crs84_name(name: &str) -> bool {
 /// A geometry in longitude/latitude from the coordinates `t` converts: `None` when a coordinate
 /// can't be converted or comes out beyond longitude/latitude (a declared system that doesn't match
 /// the coordinates).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn geometry_to_lonlat(g: &Geometry, t: &crate::raster::Transformer) -> Option<Geometry> {
     let mut ok = true;
     let out = g.map_coords(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
     out.for_each_coord(|c: Coord| ok &= c.is_finite() && c.x.abs() <= 180.5 && c.y.abs() <= 90.5);
+    ok.then_some(out)
+}
+
+/// Whether every coordinate of `g`, in the system `t` converts, has a place in longitude/latitude
+/// (a finite one): a reader keeps the geometry as the file holds it, held in its system
+/// ([`Dataset::held_in`]), when it does, and leaves the feature's geometry out when it doesn't,
+/// as one it couldn't convert. Each coordinate is converted to be checked, none is kept.
+pub(crate) fn places_in_lonlat(g: &Geometry, t: &crate::raster::Transformer) -> bool {
+    places_lonlat_extent(g, t).is_some()
+}
+
+/// [`places_in_lonlat`] with the box of the places in longitude/latitude, for a reader that says
+/// when they come out beyond it (a `.prj` that doesn't match the coordinates): `None` when one of
+/// them has no place there.
+pub(crate) fn places_lonlat_extent(g: &Geometry, t: &crate::raster::Transformer) -> Option<rustgis_geom::Extent> {
+    let mut ok = true;
+    let mut e = rustgis_geom::Extent::EMPTY;
+    g.for_each_coord(|c: Coord| match t.to_lonlat(c).filter(|l| l.is_finite()) {
+        Some(l) => e.expand(l),
+        None => ok = false,
+    });
+    ok.then_some(e)
+}
+
+/// The box in longitude/latitude of a geometry in the coordinates `t` converts, for a reader that
+/// keeps the geometry as the file holds it: `None` where [`geometry_to_lonlat`] refuses it (a
+/// coordinate that can't be converted, or comes out beyond longitude/latitude). Each coordinate
+/// is converted to be checked, none is kept.
+pub(crate) fn lonlat_box(g: &Geometry, t: &crate::raster::Transformer) -> Option<rustgis_geom::Extent> {
+    let mut ok = true;
+    let mut out = rustgis_geom::Extent::EMPTY;
+    g.for_each_coord(|c: Coord| match t.to_lonlat(c) {
+        Some(l) if l.is_finite() && l.x.abs() <= 180.5 && l.y.abs() <= 90.5 => out.expand(l),
+        _ => ok = false,
+    });
     ok.then_some(out)
 }
 
@@ -1367,6 +1465,10 @@ pub(crate) trait FeatureSink {
     fn restart(&mut self);
     /// One element of `"features"`, as its text.
     fn feature(&mut self, raw: &str);
+    /// Whether the read is to stop now (Cancel pressed): it then ends with an error.
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 /// Reads a GeoJSON document's top level, handing each element of `"features"` to `sink` as it is
@@ -1435,9 +1537,13 @@ impl<'de> serde::de::Visitor<'de> for Features<'_> {
         f.write_str("an array of features")
     }
 
+    /// Hands each element to the sink as its text, ending with an error once the sink is stopped.
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(), A::Error> {
         while let Some(raw) = seq.next_element::<&'de serde_json::value::RawValue>()? {
             self.sink.feature(raw.get());
+            if self.sink.stopped() {
+                return Err(serde::de::Error::custom("cancelled"));
+            }
         }
         Ok(())
     }
@@ -1600,9 +1706,11 @@ impl Collector {
         for (n, (geom, values, had_z)) in self.features.into_iter().enumerate() {
             // A feature that can't be converted is dropped, and its id is not reused, as when the
             // file is read in place.
+            // Kept as the file holds it, in its declared system, when it has a place in
+            // longitude/latitude (as [`geometry_to_lonlat`] would give it).
             let geom = match (&declared, geom) {
-                (Some((_, t)), Some(g)) => match geometry_to_lonlat(&g, t) {
-                    Some(g) => Some(g),
+                (Some((_, t)), Some(g)) => match lonlat_box(&g, t) {
+                    Some(_) => Some(g),
                     None => {
                         unconverted += 1;
                         continue;
@@ -1625,6 +1733,7 @@ impl Collector {
         ds.geometry_type = dominant_type(&ds);
         if let Some((crs, _)) = &declared {
             ds.crs = Some(*crs);
+            ds.held_in = *crs;
             if unconverted > 0 {
                 report.skipped += unconverted;
                 report.messages.push(format!(
@@ -1713,13 +1822,17 @@ pub(crate) fn dominant_type(ds: &Dataset) -> GeometryType {
     }
 }
 
-/// A dataset as a GeoJSON FeatureCollection value, in longitude/latitude.
+/// A dataset as a GeoJSON FeatureCollection value, of its coordinates as they are. GeoJSON is in
+/// longitude/latitude, so a dataset held in another system ([`Dataset::coord_crs`]) is converted
+/// first, by [`Dataset::in_lonlat`], which refuses, naming the feature, a place that can't be
+/// given there; a writer that adds a legacy `crs` member passes its own system's coordinates.
 pub fn to_geojson(ds: &Dataset) -> Json {
     let features: Vec<Json> = ds.features.iter().map(|f| feature_to_geojson(&ds.fields, f)).collect();
     json!({"type": "FeatureCollection", "name": ds.name, "features": features})
 }
 
-/// A GeoJSON text conversion with per-feature progress and cancellation.
+/// A GeoJSON text conversion with per-feature progress and cancellation, of `ds`'s coordinates as
+/// they are: the caller converts a dataset held in another system first ([`Dataset::in_lonlat`]).
 pub fn to_geojson_text(ds: &Dataset) -> Result<String> {
     let mut writer = GeoJsonWriter::new(Vec::new(), &ds.name, &ds.fields)?;
     writer.write(&ds.features)?;
@@ -2608,14 +2721,13 @@ pub(crate) fn read_rows(
     if let Some(c) = crs.filter(|c| *c != crate::raster::Crs::LonLat) {
         let t = c.transformer().map_err(DataError::Format)?;
         ds.crs = Some(c);
+        // Kept as the file holds them, in its system, where they have a place in longitude/latitude.
+        ds.held_in = c;
         let mut lost = 0usize;
         for f in &mut ds.features {
             if let Some(g) = f.geometry.take() {
-                let out = g.map_coords(&|p| t.to_lonlat(p).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
-                let mut ok = true;
-                out.for_each_coord(|c| ok &= c.is_finite());
-                if ok {
-                    f.geometry = Some(out);
+                if places_in_lonlat(&g, &t) {
+                    f.geometry = Some(g);
                 } else {
                     lost += 1;
                 }
@@ -3564,6 +3676,9 @@ pub(crate) fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Optio
         }),
     };
     let (mut converted, mut unconverted, mut zm_shapes, mut not_numbers) = (0usize, 0usize, 0usize, 0usize);
+    // The box of the converted places in longitude/latitude, for the notice of a `.prj` that
+    // doesn't match the coordinates.
+    let mut lonlat_extent = rustgis_geom::Extent::EMPTY;
     let mut counts = DbfCounts::new(ds.fields.len());
     let mut source_kind = GeometryType::None;
     let pt = |x: f64, y: f64| Coord::new(x, y);
@@ -3616,14 +3731,16 @@ pub(crate) fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Optio
             }
             g => g,
         };
+        // Kept as the file holds it, in its own system, when it has a place in longitude/latitude.
         let geom = match (&to_lonlat, geom) {
             (Some(t), Some(g)) => {
-                let mut ok = true;
-                let out = g.map_coords(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
-                out.for_each_coord(|c| ok &= c.is_finite());
-                converted += usize::from(ok);
-                unconverted += usize::from(!ok);
-                ok.then_some(out)
+                let placed = places_lonlat_extent(&g, t);
+                if let Some(e) = &placed {
+                    lonlat_extent = lonlat_extent.union(e);
+                }
+                converted += usize::from(placed.is_some());
+                unconverted += usize::from(placed.is_none());
+                placed.map(|_| g)
             }
             (_, g) => g,
         };
@@ -3639,9 +3756,20 @@ pub(crate) fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Optio
         ds.geometry_type = source_kind;
     }
     integral_numeric_to_integer(&mut ds, &decimals);
-    let e = ds.extent();
+    // Held in its own system when it has one RustGIS converts; only coordinates read as
+    // longitude/latitude are checked for being so.
+    if let Some(c) = ds.crs.filter(|_| to_lonlat.is_some()) {
+        ds.held_in = c;
+    }
+    // In longitude/latitude, as the file's places come out there (beyond it: a `.prj` that
+    // doesn't match the coordinates), or as they are without a system to convert from.
+    let e = if to_lonlat.is_some() { lonlat_extent } else { ds.extent() };
     if !e.is_empty() && (e.min_x < -180.5 || e.max_x > 180.5 || e.min_y < -90.5 || e.max_y > 90.5) {
-        report.messages.push("coordinates are not longitude/latitude; RustGIS reads them as WGS 84 and they may draw out of place".into());
+        report.messages.push(if to_lonlat.is_some() {
+            "coordinates are not longitude/latitude once converted from the .prj's coordinate system; the .prj may not match them, and they may draw out of place".into()
+        } else {
+            "coordinates are not longitude/latitude; RustGIS reads them as WGS 84 and they may draw out of place".into()
+        });
     }
     if report.skipped > 0 {
         report.messages.push(format!("{} shapes were unreadable or unsupported", report.skipped));
@@ -4609,6 +4737,8 @@ impl std::ops::AddAssign for TextLosses {
 pub fn export_losses_notes(ds: &Dataset, ext: &str, name_field: Option<usize>, target: &str) -> Result<Vec<String>> {
     let mut notes = match ext {
         "csv" => {
+            // Of the longitude/latitude the file is written in.
+            let ds = ds.in_lonlat().map_err(DataError::of_conversion)?;
             let losses = CsvLosses::of(&ds.features, ds.geometry_type, &ds.fields)?;
             let mut notes = losses.notes(&ds.fields, target);
             notes.extend(losses.coordinates_note(&ds.fields, target));
@@ -4787,13 +4917,16 @@ fn shapefile_geometry_losses(g: Option<&Geometry>, gt: GeometryType, drawable: f
 /// What an export to a Shapefile in `crs` says it leaves out of the geometry it writes, one
 /// notice per kind with a count, or none: vertices with a missing (NaN) or infinite coordinate,
 /// and the line parts or polygon rings without enough vertices to draw. Features left out whole
-/// are [`left_out_note`]'s. In another system than longitude/latitude, the export writes the
-/// projected copy and refuses a coordinate that doesn't project to a finite one ([`project`]), so
-/// every vertex it writes is drawable (an infinite latitude in Web Mercator is written at
-/// 85.05°), and only parts too short to draw are left out. `target` names what was written; line
+/// are [`left_out_note`]'s. In another system than the one the layer holds its coordinates in
+/// ([`Dataset::coord_crs`]), the export writes the projected copy and
+/// refuses a coordinate that doesn't project to a finite one ([`project`]), so every vertex it
+/// writes is drawable (an infinite latitude in Web Mercator is written at 85.05°), and only parts
+/// too short to draw are left out. `target` names what was written; line
 /// breaks and other control characters in it show as spaces.
 pub fn shapefile_geometry_notes(ds: &Dataset, target: &str, crs: Crs) -> Vec<String> {
-    let drawable: fn(&Coord) -> bool = if crs == Crs::LonLat { |c| c.x.is_finite() && c.y.is_finite() } else { |_| true };
+    // Written as held when `crs` is the system the layer holds its coordinates in; otherwise a
+    // converted copy, which refused every vertex that isn't a place.
+    let drawable: fn(&Coord) -> bool = if crs == ds.coord_crs() { |c| c.x.is_finite() && c.y.is_finite() } else { |_| true };
     let (mut vertices, mut parts) = (0usize, 0usize);
     for f in &ds.features {
         let Some((v, p)) = shapefile_geometry_losses(f.geometry.as_ref(), ds.geometry_type, drawable) else { continue };
@@ -5851,6 +5984,9 @@ mod tests {
             CsvOptions { x: Some("e".into()), y: Some("N".into()), crs: Some(Crs::parse("EPSG:2263").unwrap()), ..CsvOptions::default() };
         let (ds, rep) = read_csv_with(text, "t", &opts).unwrap();
         assert_eq!(ds.geometry_type, GeometryType::Point);
+        // Held in the file's system; placed in longitude/latitude.
+        assert_eq!(ds.held_in, Crs::parse("EPSG:2263").unwrap());
+        let ds = ds.in_lonlat().unwrap().into_owned();
         let Some(Geometry::Point(c)) = &ds.features[0].geometry else { panic!() };
         assert!((c.x + 73.96).abs() < 0.05 && (c.y - 40.78).abs() < 0.05, "{c:?}");
         assert_eq!(rep.messages, ["1 rows had no usable coordinates"]);
@@ -5871,7 +6007,7 @@ mod tests {
         let (ds, rep) = read_csv(text, "t").unwrap();
         assert_eq!(ds.geometry_type, GeometryType::Polyline);
         assert_eq!(ds.fields.len(), 1);
-        let e = ds.features[0].geometry.as_ref().unwrap().extent();
+        let e = ds.in_lonlat().unwrap().features[0].geometry.as_ref().unwrap().extent();
         assert!((e.min_x - 15.0).abs() < 0.01 && (e.min_y - 42.0).abs() < 0.05, "{e:?}");
         assert!(ds.features[3].geometry.is_none());
         assert_eq!(
@@ -6181,6 +6317,7 @@ mod tests {
             let (zip, _) = write_bytes_in(ds, "shp", Crs::WebMercator).unwrap();
             let mut at_edge = 0;
             for (back, _) in read_zip(&format!("{name}.zip"), &zip).unwrap() {
+                let back = back.in_lonlat().unwrap();
                 for g in back.features.iter().filter_map(|f| f.geometry.as_ref()) {
                     g.for_each_coord(|c| at_edge += usize::from((c.y.abs() - MAX_LAT).abs() < 1e-6));
                 }
@@ -6322,7 +6459,7 @@ mod tests {
         let text = "X,Y,Longitude,Latitude\n1000,2000,-89.9,35.1\n";
         let opts = CsvOptions { crs: Some(Crs::WebMercator), ..Default::default() };
         let (ds, report) = read_csv_with(text, "projected", &opts).unwrap();
-        let Some(Geometry::Point(p)) = ds.features[0].geometry else { panic!("point") };
+        let Some(Geometry::Point(p)) = ds.in_lonlat().unwrap().features[0].geometry else { panic!("point") };
         assert!((p.x - 0.00898315).abs() < 1e-7 && (p.y - 0.0179663).abs() < 1e-7);
         assert!(report.messages.is_empty());
         for crs in [Crs::WebMercator, Crs::parse("EPSG:2263").unwrap(), Crs::parse("+proj=merc +datum=WGS84 +units=m").unwrap()] {
@@ -6510,13 +6647,13 @@ mod tests {
                 assert_eq!((columns.x.as_deref(), columns.y.as_deref()), (Some(x), Some(y)));
                 let opts = CsvOptions { crs: Some(Crs::WebMercator), ..Default::default() };
                 let (dataset, report) = read_csv_with(&text, "projected", &opts).unwrap();
-                let Some(Geometry::Point(point)) = dataset.features[0].geometry else { panic!("point") };
+                let Some(Geometry::Point(point)) = dataset.in_lonlat().unwrap().features[0].geometry else { panic!("point") };
                 assert!((point.x - 1.0).abs() < 1e-10 && (point.y - 2.0).abs() < 1e-10, "{point:?}");
                 assert_eq!(report.skipped, 0);
                 assert!(report.messages.is_empty(), "{:?}", report.messages);
                 let opts = CsvOptions { x: Some("Longitude".into()), y: Some("Latitude".into()), ..opts };
                 let (explicit, _) = read_csv_with(&text, "explicit", &opts).unwrap();
-                let Some(Geometry::Point(point)) = explicit.features[0].geometry else { panic!("point") };
+                let Some(Geometry::Point(point)) = explicit.in_lonlat().unwrap().features[0].geometry else { panic!("point") };
                 assert!(point.x.abs() < 0.001 && point.y.abs() < 0.001, "explicit selection must win: {point:?}");
             }
         }
@@ -7490,6 +7627,51 @@ mod tests {
         assert!(rep.messages.iter().any(|m| m.contains("1 number isn't finite") && m.contains("'lat'")), "{:?}", rep.messages);
     }
 
+    /// A GeoJSON read in the system its legacy `crs` member names is written back in
+    /// longitude/latitude, converted through WGS 84 first, as the format is: UTM 32N, Ingolstadt.
+    #[test]
+    fn a_held_geojson_is_written_in_lonlat() {
+        let at = Coord::new(11.5, 48.7);
+        let utm = Crs::Epsg(32632).transformer().unwrap().from_lonlat(at).unwrap();
+        let text = format!(
+            r#"{{"type":"FeatureCollection","crs":{{"type":"name","properties":{{"name":"urn:ogc:def:crs:EPSG::32632"}}}},"features":[{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[{},{}]}}}}]}}"#,
+            utm.x, utm.y
+        );
+        let (ds, _) = read_geojson(&text, "held").unwrap();
+        assert_eq!(ds.coord_crs(), Crs::Epsg(32632));
+        let out = to_geojson(&ds.in_lonlat().unwrap());
+        let c = &out["features"][0]["geometry"]["coordinates"];
+        let (x, y) = (c[0].as_f64().unwrap(), c[1].as_f64().unwrap());
+        assert!((x - at.x).abs() < 1e-9 && (y - at.y).abs() < 1e-9, "{c}");
+        assert!(out.get("crs").is_none());
+    }
+
+    /// A `.prj` that doesn't match the coordinates (a geographic system for numbers past 180°) is
+    /// said, though the file is held in its system as it is, as it was when it was converted.
+    #[test]
+    fn a_shapefile_whose_prj_doesnt_fit_is_said() {
+        use shapefile::dbase::{FieldValue, Record, TableWriterBuilder};
+        let dir = std::env::temp_dir().join(format!("rustgis-shp-prj-misfit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shp = dir.join("misfit.shp");
+        {
+            let table = TableWriterBuilder::new().add_character_field("name".try_into().unwrap(), 10);
+            let mut w = shapefile::Writer::from_path(&shp, table).unwrap();
+            let mut r = Record::default();
+            r.insert("name".into(), FieldValue::Character(Some("far".into())));
+            w.write_shape_and_record(&shapefile::Point::new(500.0, 10.0), &r).unwrap();
+        }
+        let prj = r#"GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
+        std::fs::write(dir.join("misfit.prj"), prj).unwrap();
+        let (_, rep) = read_path(&shp).unwrap();
+        assert!(
+            rep.messages.iter().any(|m| m.contains("not longitude/latitude") || m.contains("couldn't be converted")),
+            "{:?}",
+            rep.messages
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A projected Shapefile is converted to longitude/latitude by its `.prj` (issue #84).
     #[test]
     fn shapefile_prj_reprojects() {
@@ -7505,7 +7687,8 @@ mod tests {
             // Paris in UTM zone 31N.
             w.write_shape_and_record(&shapefile::Point::new(451_219.33, 5_411_550.20), &r).unwrap();
         }
-        let at = |ds: &Dataset| ds.features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
+        // In longitude/latitude, from the system the read holds it in.
+        let at = |ds: &Dataset| ds.in_lonlat().unwrap().features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
 
         // As ArcGIS and GDAL write it: Esri WKT with no EPSG authority.
         let prj = r#"PROJCS["WGS_1984_UTM_Zone_31N",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",3.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]"#;
@@ -7604,7 +7787,7 @@ mod tests {
             }
             std::fs::write(shp.with_extension("prj"), f[5]).unwrap();
             let (ds, report) = read_path(&shp).unwrap();
-            let c = ds.features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
+            let c = ds.in_lonlat().unwrap().features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
             assert!((c.x - lon).abs() < 1e-7 && (c.y - lat).abs() < 1e-7, "EPSG:{code}: {c:?}");
             assert!(report.messages.is_empty(), "EPSG:{code}: {:?}", report.messages);
         }
@@ -7793,7 +7976,7 @@ mod tests {
         let layers = read_zip_in("projected.zip", &zip, Some(crs)).unwrap();
         assert_eq!(layers.len(), 2);
         for (table, report) in layers {
-            let point = table.features[0].geometry.as_ref().unwrap().label_point().unwrap();
+            let point = table.in_lonlat().unwrap().features[0].geometry.as_ref().unwrap().label_point().unwrap();
             assert!((point.x - 15.0).abs() < 1e-6 && (point.y - 42.0).abs() < 1e-6, "{point:?}");
             assert_eq!(table.crs, Some(crs));
             assert!(report.messages.is_empty(), "{:?}", report.messages);
@@ -8031,7 +8214,7 @@ mod tests {
         assert_eq!(layers.len(), 2);
         let (ds, rep) = &layers[0];
         assert_eq!(ds.name, "Paris");
-        let c = ds.features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
+        let c = ds.in_lonlat().unwrap().features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
         assert!((c.x - 2.335).abs() < 1e-6 && (c.y - 48.855).abs() < 1e-6, "{c:?}");
         assert!(rep.messages.iter().any(|m| m.contains("ne_VERSION.txt")), "{:?}", rep.messages);
         assert_eq!(ds.value(0, 0), &Value::Text("paris".into()));
@@ -8501,5 +8684,72 @@ mod tests {
         assert_eq!(read_back.features[0].attrs[0], Value::Float(10.0));
         assert_eq!(read_back.fields[1].ty, FieldType::Integer);
         assert_eq!(read_back.features[0].attrs[1], Value::Int(1));
+    }
+
+    /// A layer held in its own system (UTM 32N here; every layer's is longitude/latitude until
+    /// #2032 C2) is written from it: in longitude/latitude for a format that holds only those, in
+    /// another system by the direct operation between the two, and in its own as it is.
+    #[test]
+    fn a_layer_is_written_from_the_system_it_holds() {
+        let (utm, etrs) = (Crs::Epsg(32632), Crs::Epsg(25832));
+        let lonlat = Coord::new(9.0, 48.7);
+        let at = utm.transformer().unwrap().from_lonlat(lonlat).unwrap();
+        let mut ds = Dataset::new("held", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(at)), vec![]);
+        ds.held_in = utm;
+        assert_eq!(ds.coord_crs(), utm);
+        // GeoJSON: longitude/latitude.
+        let (bytes, _) = write_bytes_in(&ds, "geojson", Crs::LonLat).unwrap();
+        let read = read_bytes("held.geojson", &bytes).unwrap().0;
+        let Some(Geometry::Point(p)) = read.features[0].geometry.clone() else { panic!("a point") };
+        assert!((p.x - lonlat.x).abs() < 1e-9 && (p.y - lonlat.y).abs() < 1e-9, "{p:?}");
+        // Its own system: the coordinates as they are.
+        let same = project(&ds, utm).unwrap();
+        assert_eq!(same.features[0].geometry, ds.features[0].geometry);
+        // Another: by the direct operation from it.
+        let other = project(&ds, etrs).unwrap();
+        let want = utm.to(etrs).unwrap().point(at).unwrap();
+        assert_eq!(other.features[0].geometry, Some(Geometry::Point(want)));
+        // A file written whole, in the layer's own system, and in longitude/latitude.
+        let d = std::env::temp_dir().join(format!("rustgis-held-writes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write_path_in(&ds, &d.join("own.fgb"), utm).unwrap();
+        write_path_in(&ds, &d.join("lonlat.csv"), Crs::LonLat).unwrap();
+        for name in ["own.fgb", "lonlat.csv"] {
+            let read = read_path(&d.join(name)).unwrap().0.in_lonlat().unwrap().into_owned();
+            let Some(Geometry::Point(p)) = read.features[0].geometry.clone() else { panic!("{name}: a point") };
+            assert!((p.x - lonlat.x).abs() < 1e-9 && (p.y - lonlat.y).abs() < 1e-9, "{name}: {p:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The notes of an export of a layer held in its own system (UTM 32N here) are those of what
+    /// is written: a CSV's of the longitude/latitude it writes (as for the same layer held in
+    /// them), and a Shapefile's vertices left out only when it is written as held.
+    #[test]
+    fn an_exports_notes_are_of_what_it_writes() {
+        let utm = Crs::Epsg(32632);
+        // With x and y fields, which a CSV reader could take for the position: a point the file
+        // can't give a longitude/latitude would be said.
+        let fields = vec![Field::new("x", FieldType::Double), Field::new("y", FieldType::Double)];
+        let mut lonlat = Dataset::new("held", GeometryType::Point, fields);
+        for (lon, lat) in [(9.0, 48.7), (10.0, 50.0)] {
+            lonlat.push(Some(Geometry::Point(Coord::new(lon, lat))), vec![Value::Float(1.0), Value::Float(2.0)]);
+        }
+        let want = export_losses_notes(&lonlat, "csv", None, "out.csv").unwrap();
+        let held = project(&lonlat, utm).unwrap();
+        assert_eq!(held.coord_crs(), utm);
+        assert_eq!(export_losses_notes(&held, "csv", None, "out.csv").unwrap(), want);
+        // A line with a missing coordinate: its vertex is left out of a Shapefile written as
+        // held, and noted; in any other system the export's conversion refuses the line instead
+        // (`project`), so there is nothing to note.
+        let mut line = Dataset::new("line", GeometryType::Polyline, vec![]);
+        let parts = vec![vec![Coord::new(500_000.0, 5_400_000.0), Coord::new(f64::NAN, 5_400_100.0), Coord::new(500_100.0, 5_400_200.0)]];
+        line.push(Some(Geometry::Line(parts)), vec![]);
+        line.held_in = utm;
+        let own = shapefile_geometry_notes(&line, "out.shp", utm);
+        assert!(own.iter().any(|n| n.contains("1 vertex with a missing or infinite coordinate")), "{own:?}");
+        assert!(shapefile_geometry_notes(&line, "out.shp", Crs::Epsg(25832)).is_empty());
     }
 }

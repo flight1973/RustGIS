@@ -140,6 +140,39 @@ runs round its near half, with everything a box's walls have: colour, a walls la
 their patterns (which run on round the wall), light and fog. `"shape": "box"` (the default)
 takes it back to the box.
 
+`"shape": {"layer": "Bacias", "where": "nome = 'Rio Doce'"}` cuts the block to a study area: the
+polygons of a polygon layer that the expression picks (written as a definition query, among the
+rows the layer's own definition query keeps; all of them without `"where"`). Only the ground
+inside their outer rings is drawn and sets the base, the block's box is the one round them (so
+no `"extent"`), and it works over elevation tiles too. The walls stand along the outline where
+it faces you, a concave outline's hidden where nearer ground or walls stand in front of them,
+with everything a box's walls have; a wall's corner is outlined where the outline turns by more
+than 45°. A `"where"` that picks no polygon is refused. Holes are not cut: the ground inside
+them is drawn, and a notice says how many. Several polygons each stand as their own block on the
+same base (dissolve touching ones first for one outline). The outline follows the polygons to about a third of the
+finest mesh cell (a ring narrower than that is left out, and said), and is read again when the
+layer is edited.
+
+With water on the terrain (below), `"block": {"water": {"depth": 12}}` shows it in the walls'
+section: where the block's edge (a round block's circle too) runs inside a water polygon (the first in the layer's rows where
+they overlap, among the features its definition query keeps), the wall shows a band of water from
+the water's level down to its floor, over the walls' colours, in the water layer's solid fill (the
+topmost of its fill layers; one partly transparent laid over a light blue, as a section is opaque),
+lit as the wall is and darker with depth, half as bright at the full
+depth, with a line at the level and one along the floor as dark as the shore band. A DEM holds the
+water's surface, not its bed, so the depth is given: `"depth"` in metres for every water body, or
+`"field": "prof"` names a numeric field of the water layer holding each one's depth (`"depth"` then
+serves the rows with no value, empty or 0). Both are stretched by the exaggeration, and the floor
+goes no lower than the base. The floor follows the shore: no depth at the shoreline, the full depth
+from about the shore band's width in (a few pixels at the view's centre), so the section shows a
+basin, not a cliff. A water body with no depth, or no level, shows none, and setting the block or
+the water says how many of those its definition query keeps have no value in the field. These depths
+are schematic unless they come from a field: say so in the figure's caption. `"water": false` in the
+block takes the water out of the walls (give the block whole again: a `"block"` object sets all of
+it, its extent, depth and walls too); while it is there, taking the terrain's water off, or giving
+it a layer without the depth field, is refused. Deleting the depth field keeps the water's own
+`depth` for all the water, or takes the water out of the walls when there is none, and says so.
+
 **Water** on the terrain lies flat: `map.terrain` with `{"water": {"layer": "Lakes"}}` names a
 polygon layer of water bodies, and inside each polygon the ground is level, at the lowest height
 of the DEM along its shore, instead of rising and falling with a surface model that is noisy or
@@ -151,7 +184,12 @@ to about 4 million heights in all (and one a ring); when the water layer's shore
 longer, all of them are read at one wider step, and a notice says how
 many polygons were. A layer read a view at a time (in chunks, by range) can't be the water. `{"water": false}` takes the water off;
 left out (or `null`), it stays as it was. The water layer is kept by name, follows its renames, and can stay
-hidden; its own symbology still draws it. Rivers stay lines. Over elevation tiles, the levels are
+hidden; its own symbology still draws it. A project that opens with a water layer that no longer holds
+its `"level"` field as a number (the layer's data replaced outside RustGIS, a field renamed other than
+only in case, or turned to text) clears it, as deleting the field does, and says so: its lakes lie at
+their shores' lowest heights.
+So does the block's water `"field"`: its walls show all the water at the block water's `"depth"`, or no
+water without one. Rivers stay lines. Over elevation tiles, the levels are
 read again until the tiles along the shores have come. A Shaded Relief layer draws the water's
 cells at their level with the even light of flat ground, flat or tilted: no hillshade, cast
 shadow, sky, fill light or rock on the water, so a semi-transparent water fill over it shows one
@@ -408,7 +446,11 @@ place names there. On the desktop, its optional `url` selects another Valhalla s
 </figure>
 
 **Home › Add › Basemap** offers five built-in basemaps drawn from a world outline (Paper, Midnight,
-Ocean, Atlas, Blank), which need no network, and web tile layers over them:
+Ocean, Atlas, Blank), which need no network, and web tile layers over them. On Blank, **Paper
+color** under the basemaps sets the colour the map draws where it would draw white, a tilted view's
+sky included, so a map frame sits on a coloured layout page without a white box around it
+(`map.basemap {"name": "blank", "color": "#F1EADF"}`). Choosing another basemap takes the paper
+colour off, as that basemap draws its own colours:
 
 - **Raster tiles** from an XYZ or TMS template (`https://…/{z}/{x}/{y}.png`; `{-y}` for rows
   from the south, `{s}` for subdomains, `{q}` for Bing-style quadkeys) or a WMS through
@@ -763,7 +805,12 @@ both sides of the map. Each projection has an area of use: polar projections sho
 their hemisphere poleward of 30°, regional ones their region, transverse Mercator (UTM) zones
 30° either side of their meridian, and data outside it isn't drawn. Switching keeps the centre
 and scale, and the choice is saved with the map (`map.projection` from the command line). A
-raster already in the map's coordinate system draws without being reprojected. To open every new
+raster already in the map's coordinate system draws without being reprojected, and so does a
+vector layer read from a file in it. On a map in another EPSG or ESRI system limited to an area of
+use, a layer is drawn into it by the direct transformation between the two systems (the datum
+shift PROJ picks for the pair, not one through WGS 84), and its vertices are edited and snapped
+where they are drawn; Web Mercator, the globe and world projections draw through
+longitude/latitude. To open every new
 session in a projection, set it in **Settings › Start-up › Projection**. Robinson, Equal
 Earth, Natural Earth, Winkel Tripel and Eckert IV are computed by RustGIS itself on a sphere,
 so EPSG:8857 (Equal Earth) works too. So is the sinusoidal projection, on a sphere or an
@@ -846,12 +893,39 @@ picking one shows it:
   southern Norway's and Svalbard's wider zones. Once no more than eight zone-and-band areas are in
   view, each also gets its own eastings and northings, at the same interval in all of them and
   cut at the zone's edges.
+- **MGRS**: the Military Grid Reference System's grid (`"mgrs"` in the command): the same zones
+  and bands as grid zone designations, drawn heavier. Once no more than eight are in view, each gets
+  its own grid at a power of ten that suits the scale, between three and thirty lines across the
+  view: 100 km, then 10 km, 1 km and, zoomed in closest, 100 m (100 km while more than four grid
+  zone designations show). The 100 km lines, the edges of the 100 km squares, stay heavier than the
+  finer ones. Zoomed out, each grid zone designation is named (`33U`); once the 100 km squares are
+  large enough on the screen, each is named by its letters (`VP`), with its grid zone designation
+  (`33U VP`) when more than one is in view. A zone or square cut too small for its name isn't
+  named, and the names aren't drawn on a tilted view. Nothing is drawn yet north of 84° N or south
+  of 80° S, where MGRS uses UPS.
 
-The grids have no labels on the map; the status bar reads coordinates in UTM or MGRS. Like the
+Only the MGRS grid is labeled on the map; the status bar reads coordinates in UTM or MGRS. Like the
 latitudes and longitudes, they aren't drawn on the copies of the world a flat map shows past
 ±180°. The type and system are saved with the map; a project whose measured grid names a system
 this version can't use (one in degrees, or a PROJ string the web app can't read) opens without it,
 and says so.
+
+Two more settings in the same menu apply to every type, and are saved with the map:
+
+- **Draw on top of layers** (`"onTop"` in the command; off by default, and `null` goes back to
+  it): by default the grid lines are drawn with the basemap, under the map's layers and web tile
+  layers, so a filled layer hides them. With it on, they are drawn over every layer and tile
+  layer, still under the labels. They then also draw over the highlights of selected features.
+  The MGRS names are labels, so they're drawn over the layers either way, as the layers' own
+  labels are: a filled layer can hide the lines under a name but not the name. They go with the
+  lines when the grid's opacity is 0, and pause with the labels.
+- **Grid color** (`"color"`: `"#RRGGBB"` or `"#RRGGBBAA"`, with its opacity): the lines' color. By
+  default it is the basemap's own grid color, which is faint; **Default** (`null` or `""` in the
+  command) goes back to it. The MGRS names take the same color, fully opaque. Major and minor
+  lines keep their widths.
+
+Neither setting shows or hides the grid. A project that uses either needs a RustGIS that knows
+it: an older one refuses to open it rather than drop the setting.
 
 **Global** shows a globe; **Local** a flat view centred where you are (azimuthal equidistant;
 not in the web app, which doesn't include that projection).

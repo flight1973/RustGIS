@@ -7,11 +7,12 @@ use std::sync::LazyLock;
 
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
-    Arrange, ArrowStyle, Background, CoordFormat, ElementKind, FontFamily, FrameShape, Grid, GridEdges, GridKind, GridStyle, Guides,
-    Layout, LineDir, LineHead, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_GUIDES, MAX_LEGEND_COLUMNS, MAX_LEGEND_LABEL_CHARS,
-    MAX_LEGEND_LABELS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries, Orientation, PAGES, ScaleBarStyle, ScaleUnits,
-    TextAlign, TickSide, fit_scale, line_angle, line_at_angle, line_length,
+    Arrange, ArrowStyle, Background, CHART_BAR, CHART_BARS, ChartOrder, CoordFormat, ElementKind, FontFamily, FrameShape, Grid, GridEdges,
+    GridKind, GridStyle, Guides, Layout, LineDir, LineHead, MAX_CHART_BARS, MAX_CHART_DECIMALS, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH,
+    MAX_GUIDES, MAX_LEGEND_COLUMNS, MAX_LEGEND_LABEL_CHARS, MAX_LEGEND_LABELS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries,
+    Orientation, PAGES, ScaleBarStyle, ScaleUnits, TextAlign, TickSide, fit_scale, line_angle, line_at_angle, line_length,
 };
+use rustgis_map::report::StatKind;
 use rustgis_map::symbology::{Dash, MAX_DASH_STEP, MAX_DASH_STEPS};
 use rustgis_map::{Map, Rgba};
 use serde_json::{Value, json};
@@ -96,10 +97,10 @@ pub fn commands() -> Vec<C> {
             r#"{"layout"?, "shape"?: "rectangle"|"circle"|"ellipse"|"polygon"|"lasso", "points"?: [[u, v], …] (polygon/lasso, 0..1 across the frame), "map"?: name, "x"?, "y"?, "w"?, "h"?: mm}"#,
         ),
         C::new("layout.addElement", "Add Element", "Publish › Map Surrounds", add_element).inputs(element_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
-            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA" (text, dynamicText, line, arrow, rectangle, ellipse, circle: its outline; extentIndicator; grid; scaleBar; legend, colorbar, table, chart: the ink of its text and lines, default #222222, a chart's bars and a colorbar's colours keeping theirs, and a table drawn without its white cells; refused for other kinds), "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "rotation"?: degrees clockwise about the box's centre, 90 reading top to bottom and -90 bottom to top, kept within -180 to 180 (text, dynamicText; refused for other kinds), "wrap"?: bool (text, dynamicText: broken into lines at spaces to fit the box's width when drawn, after its dynamic text is filled in, a word wider than the box broken across lines; default false, lines breaking only at the text's own line breaks; refused for other kinds), "font"?: "sans"|"serif"|an installed font family's name, as labels.fonts lists them (text, dynamicText; a family not installed here is drawn in its fallback, and a serif where none is installed in the sans, with a warning; refused for other kinds), "fallback"?: "sans"|"serif" (a named font's, where it isn't installed; default its own class, else sans), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "showNoData"?: bool (legend: include Graduated Colors’ missing-value symbol; default false), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "columns"?: 1..3 (legend: the columns its rows are laid in; default 1), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow; scaleBar: the alternating bar's light divisions, default white; refused for other kinds), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "radius"?: mm, 0 to 50 (rectangle: rounded corners), "dash"?: [points, …] (line, arrow, and a rectangle's, ellipse's or circle's outline: dash, gap, … in turn, as layer.lineStrokes takes it, at most 8, each 0 to 500; an arrow's heads stay solid; [] or null for solid; refused, null too, for other kinds), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page unless x or y is given (line, arrow; it sets the box and the direction, so w, h and dir are not used with it), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible raster with a colour scale, not drawn by classes, which a legend lists), "field"?, "label"?, "rows"?, "step"?: degrees, or a measured grid's units (metres) (0 picks one), "type"?: "graticule" (latitudes and longitudes, default) | "measured" (eastings and northings in a projected system), "crs"?: a measured grid's coordinate system: EPSG:25832, WKT or a PROJ string ("" or none: the map's when projected, else the UTM zone at the frame's centre), "short"?: bool (a measured grid's labels as their kilometres' last two digits, 43 for 543000), "mgrs"?: bool (a measured grid labelled as MGRS: each 100 km square named with its grid zone designation, 32T MT, and the lines by their kilometres' last two digits; its crs a WGS 84 UTM zone by EPSG code, EPSG:32601–32660 or 32701–32760, or none: the map's when it is one, else the zone at the frame's centre), "labels"?: bool (grid) | {"<layer>": "<label>"} (legend: what it shows instead of a layer's name, as in layout.update; a layer the map hasn't is refused), "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow, or a rectangle's, ellipse's or circle's outline instead of color; refused for other kinds), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar, whose "color" is its lines, dark divisions and labels, default #222222), "x"?, "y"?, "w"?, "h"?: mm, "background"?: {"fill"?: "#RRGGBB"|"#RRGGBBAA" (default white), "outline"?: colour (default #222222), "width"?: the outline's points (default 0, none), "radius"?: mm, its corners (0 to 50), "padding"?: mm it reaches past the box on every side (0 to 50)} | null (a box drawn behind the element, turned with a turned text; none by default; a map frame takes none, so it is refused for grid and extentIndicator)}"##,
+            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA" (text, dynamicText, line, arrow, rectangle, ellipse, circle: its outline; extentIndicator; grid; scaleBar; legend, colorbar, table, chart: the ink of its text and lines, default #222222, a chart's bars and a colorbar's colours keeping theirs, and a table drawn without its white cells; refused for other kinds), "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "rotation"?: degrees clockwise about the box's centre, 90 reading top to bottom and -90 bottom to top, kept within -180 to 180 (text, dynamicText; refused for other kinds), "wrap"?: bool (text, dynamicText: broken into lines at spaces to fit the box's width when drawn, after its dynamic text is filled in, a word wider than the box broken across lines; default false, lines breaking only at the text's own line breaks; refused for other kinds), "font"?: "sans"|"serif"|an installed font family's name, as labels.fonts lists them (text, dynamicText; a family not installed here is drawn in its fallback, and a serif where none is installed in the sans, with a warning; refused for other kinds), "fallback"?: "sans"|"serif" (a named font's, where it isn't installed; default its own class, else sans), "title"?: legend title (default "Legend"); chart: its own title ("" for none; default: its field, or the statistic of its field by the group), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "showNoData"?: bool (legend: include Graduated Colors’ missing-value symbol; default false), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "columns"?: 1..3 (legend: the columns its rows are laid in; default 1), "orientation"?: "horizontal"|"vertical" (colorbar; chart: bars running across, the default, or columns standing up, each label centred under its column), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow; scaleBar: the alternating bar's light divisions, default white; refused for other kinds), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "radius"?: mm, 0 to 50 (rectangle: rounded corners), "dash"?: [points, …] (line, arrow, and a rectangle's, ellipse's or circle's outline: dash, gap, … in turn, as layer.lineStrokes takes it, at most 8, each 0 to 500; an arrow's heads stay solid; [] or null for solid; refused, null too, for other kinds), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page unless x or y is given (line, arrow; it sets the box and the direction, so w, h and dir are not used with it), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible raster with a colour scale, not drawn by classes, which a legend lists), "field"?: (chart: a numeric field, default the layer's first; any field when it groups and counts, default then the field it groups by), "label"?: a field (chart: each bar's label when not grouped), "group"?: a field (chart: a bar per value of this field, its statistic of field over that value's features; blank values make one "(blank)" bar; default none, a bar per feature), "statistic"?: "sum" (the default)|"count" (features, numbers or not)|"mean"|"min"|"max" (chart, grouped), "order"?: "descending" (the default: largest first)|"ascending"|"category" (by label, A to Z)|"layer" (as the features come) (chart), "bars"?: 1..100 (chart: the most bars drawn, default 20), "other"?: bool (chart: the bars past "bars" gathered in a last Other bar, its statistic over their features, their sum when not grouped, last whatever the order; default false: left out, which a warning says, as it says features with no number left out), "stack"?: a field (chart, grouped by another field, summing or counting: each bar split by this field's values, a stretch per value in the key over the bars, the values its bars show by their total, largest first (A to Z when ordered by category), past 8 values 7 and a grey Other, which a warning counts; in the palette diagrams take, or with classes in the colour each value's features share on the map, a value with several keeping its palette colour, which a warning counts; values written are the bar's total; default none), "values"?: bool (chart: each bar's value written past its end, its thousands apart with commas; default false), "decimals"?: "auto" (the default: up to 2, the zeros they end in dropped)|0..6 (chart: its values' decimals), "barColor"?: "#RRGGBB"|"#RRGGBBAA" (chart: its bars' colour, default #3B82C4), "classes"?: bool (chart: each bar in the colour its features have on the map, by the layer's symbology classes: a bar per feature its feature's, a grouped bar the colour its features share; a bar whose features have several, which a warning counts, and an Other bar keep barColor; default false), "labelAlign"?: "left" (the default)|"right" (chart: bars running across have their labels at the left of their column, or at its right against the bars) (label, group, statistic, order, bars, other, stack, values, decimals, barColor, classes and labelAlign refused for other kinds), "rows"?, "step"?: degrees, or a measured grid's units (metres) (0 picks one), "type"?: "graticule" (latitudes and longitudes, default) | "measured" (eastings and northings in a projected system), "crs"?: a measured grid's coordinate system: EPSG:25832, WKT or a PROJ string ("" or none: the map's when projected, else the UTM zone at the frame's centre), "short"?: bool (a measured grid's labels as their kilometres' last two digits, 43 for 543000), "mgrs"?: bool (a measured grid labelled as MGRS: each 100 km square named with its grid zone designation, 32T MT, and the lines by their kilometres' last two digits; its crs a WGS 84 UTM zone by EPSG code, EPSG:32601–32660 or 32701–32760, or none: the map's when it is one, else the zone at the frame's centre), "labels"?: bool (grid) | {"<layer>": "<label>"} (legend: what it shows instead of a layer's name, as in layout.update; a layer the map hasn't is refused), "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow, or a rectangle's, ellipse's or circle's outline instead of color; refused for other kinds), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar, whose "color" is its lines, dark divisions and labels, default #222222), "x"?, "y"?, "w"?, "h"?: mm, "background"?: {"fill"?: "#RRGGBB"|"#RRGGBBAA" (default white), "outline"?: colour (default #222222), "width"?: the outline's points (default 0, none), "radius"?: mm, its corners (0 to 50), "padding"?: mm it reaches past the box on every side (0 to 50)} | null (a box drawn behind the element, turned with a turned text; none by default; a map frame takes none, so it is refused for grid and extentIndicator)}"##,
         ),
         C::new("layout.update", "Element Properties", "Publish › Element", update).inputs(update_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
-            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line, rectangle, ellipse: its outline; scaleBar: its lines, dark divisions and labels; legend, colorbar, table, chart: its ink, as in layout.addElement, null giving it the default again; refused for other elements), "bold"?, "italic"?, "align"?, "letterSpacing"?, "rotation"?: degrees clockwise (text, as in layout.addElement; refused for other elements), "wrap"?: bool (text, as in layout.addElement; refused for other elements), "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "showNoData"?: bool (legend; default false), "exclude"?: [layer names] (legend; [] lists every layer again), "labels"?: {"<layer>": "<label>"|null} (legend: what it shows instead of a layer's name, up to 200 characters, a longer one is refused; each entry replaces that layer's label, null or "" shows its name again, {} every layer's; a layer the map hasn't is refused), "columns"?: 1..3 (legend), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse, and a scaleBar's fill; refused for other elements; for a rectangle or ellipse, color sets it when outline is not given; a scaleBar's fill is the alternating bar's light divisions), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dash"?: [points, …]|[]|null (line, rectangle, ellipse, as in layout.addElement; [] or null makes it solid; refused, null too, for other elements), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster with a colour scale, not drawn by classes), "field"?, "rows"?, "background"?: {"fill"?, "outline"?, "width"?, "radius"?, "padding"?, as in layout.addElement, the keys not given keeping theirs} | null (removes it); a map frame takes none}"##,
+            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line, rectangle, ellipse: its outline; scaleBar: its lines, dark divisions and labels; legend, colorbar, table, chart: its ink, as in layout.addElement, null giving it the default again; refused for other elements), "bold"?, "italic"?, "align"?, "letterSpacing"?, "rotation"?: degrees clockwise (text, as in layout.addElement; refused for other elements), "wrap"?: bool (text, as in layout.addElement; refused for other elements), "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"? (legend, colorbar; chart: its own title ("" for none; null giving it the title it is given again)), "allClasses"?: bool (legend), "hideOther"?: bool (legend), "showNoData"?: bool (legend; default false), "exclude"?: [layer names] (legend; [] lists every layer again), "labels"?: {"<layer>": "<label>"|null} (legend: what it shows instead of a layer's name, up to 200 characters, a longer one is refused; each entry replaces that layer's label, null or "" shows its name again, {} every layer's; a layer the map hasn't is refused), "columns"?: 1..3 (legend), "orientation"? (colorbar, chart), "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse, and a scaleBar's fill; refused for other elements; for a rectangle or ellipse, color sets it when outline is not given; a scaleBar's fill is the alternating bar's light divisions), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dash"?: [points, …]|[]|null (line, rectangle, ellipse, as in layout.addElement; [] or null makes it solid; refused, null too, for other elements), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "border"?: {"color"?: "#RRGGBB"|"#RRGGBBAA", "width"?: points, 0 to 20, 0 for none} | null (map frame: the outline along its shape, default #303030 and 0.8, the keys not given keeping theirs; null gives the default back; refused for other elements), "layer"?: (colorbar: "" for the top visible raster with a colour scale, not drawn by classes), "field"?, "label"?, "group"?, "statistic"?, "order"?, "bars"?, "other"?, "stack"? (chart, as in layout.addElement: "" for a label, group or stack takes it away; on a new layer a label, group or stack field it hasn't is let go, a stack the chart can no longer draw (ungrouped, grouped by the stack field, or not summing or counting) too, and a field not named that it no longer measures gives way to the first numeric field, which warnings say; refused for other elements), "values"?: bool, "decimals"?: 0..6|"auto", "barColor"? (null giving the default again), "classes"?: bool, "labelAlign"?: "left"|"right" (chart, as in layout.addElement: null leaves each as it is; refused for other elements), "rows"?, "background"?: {"fill"?, "outline"?, "width"?, "radius"?, "padding"?, as in layout.addElement, the keys not given keeping theirs} | null (removes it); a map frame takes none}"##,
         ),
         C::new("layout.guides", "Guides", "Publish › Page Setup", guides).inputs(object_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layout"?, "x"?: [mm] (vertical guides, from the page's left edge), "y"?: [mm] (horizontal guides, from its top edge), "clear"?: bool (remove every guide first)}"#,
@@ -282,6 +283,8 @@ fn frame_kind(s: &Session, map: &str, w: f64, shape: FrameShape) -> ElementKind 
         extent_of: None,
         extent_color: rustgis_map::layout::INDICATOR_COLOR,
         extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+        border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+        border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
         bearing,
         pitch,
     }
@@ -782,8 +785,16 @@ pub(crate) fn veil_panel(
     ))
 }
 
-/// A publication layout's colorbar's height, in mm: its title, the bar and its labels.
+/// A publication layout's colorbar's height, in mm, with a title of one line: its title, the bar and
+/// its labels.
 const COLORBAR_MM: f64 = 15.0;
+
+/// A publication layout's colorbar's height, in mm, `width` mm wide: [`COLORBAR_MM`] and a line's
+/// pitch more for each line its title wraps to past the first (#2493).
+fn colorbar_mm(title: &str, width: f64) -> f64 {
+    let lines = crate::render::layout::colorbar_title_lines(title, width).len();
+    COLORBAR_MM + lines.saturating_sub(1) as f64 * crate::render::layout::line_pitch_mm(crate::render::layout::COLORBAR_TITLE_PT)
+}
 
 /// The share of what the map draws a surround may cover before the layout warns about it, when a
 /// corner freer by at least as much went to another surround.
@@ -1899,6 +1910,8 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             extent_of: None,
             extent_color: rustgis_map::layout::INDICATOR_COLOR,
             extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+            border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+            border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
             bearing: 0.0,
             pitch: 0.0,
         },
@@ -1952,7 +1965,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             // Not its web tiles (fetched and drawn over the basemap on the disc), swipe, time
             // slider, layer groups (their hidden layers left out here), bookmarks or animation.
             let mut m = rustgis_map::Map::new(name);
-            m.basemap = src.basemap;
+            (m.basemap, m.paper) = (src.basemap, src.paper);
             m.graticule = src.graticule;
             m.body = src.body.clone();
             m.set_projection(rustgis_map::Projection::Globe);
@@ -2031,8 +2044,11 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                     layer.gpkg = None;
                     layer.postgis = None;
                     layer.synced = None;
-                    layer.dataset.features = l
-                        .dataset
+                    // Sketched in longitude/latitude, whatever system the layer holds its
+                    // coordinates in.
+                    let lonlat = l.dataset.in_lonlat()?;
+                    layer.dataset.held_in = rustgis_data::raster::Crs::LonLat;
+                    layer.dataset.features = lonlat
                         .features
                         .iter()
                         .map(|f| {
@@ -2044,9 +2060,9 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                     layer.touch_geometry();
                     layer.selection.clear();
                     layer.labels.enabled = false;
-                    layer
+                    Ok(layer)
                 })
-                .collect();
+                .collect::<Result<_, String>>()?;
             // All but reaching beyond 85.05°, which any world map does (`without_polar`).
             warnings.extend(notes.get().without_polar().messages("the globe locator, simplifying its polygons"));
             let name = m.name.clone();
@@ -2159,7 +2175,20 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     // A colour table whose values can't be known (too many to list) gives the legend no class, and
     // the sheet no key for it; classes from an overview may miss a rare one: said, not left out.
     warnings.extend(raster_key_notices(s.map(), &[], false));
-    let (bar_w, bar_h) = (if sheet { 50.0 * k } else { 40.0 }, COLORBAR_MM);
+    // A page of cards gives the locator in its column a card of the column's width, and the legend
+    // under it one as wide.
+    let card = style == Style::Modular && column.is_some();
+    let (card_r, card_pad) = (3.0 * k, 2.5 * k);
+    // The colorbar's title is the raster's name, over the bar. The box is as wide as the title, up
+    // to the legend's cap (in a side column, the column's width); a longer title wraps there, each
+    // line past the first making the colorbar taller (#2493).
+    let title_room = match column {
+        Some(c) => c.w + if card { 2.0 * card_pad } else { 0.0 } - 2.0 * pad,
+        None => fw * 0.45 - 2.0 * pad,
+    };
+    let base_w = if sheet { 50.0 * k } else { 40.0 };
+    let bar_w = base_w.max(bar.as_deref().map_or(0.0, crate::render::layout::colorbar_title_width_mm).min(title_room));
+    let bar_h = bar.as_deref().map_or(COLORBAR_MM, |title| colorbar_mm(title, bar_w.min(title_room)));
     let bar_part = if bar.is_some() { bar_h + if ch > 0.0 { 2.0 } else { 0.0 } } else { 0.0 };
     let (content_w, content_h) = (if bar.is_some() { cw.max(bar_w) } else { cw }, ch + bar_part);
     let legend_in_column = column.is_some();
@@ -2726,9 +2755,6 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         Some(c) => Some((c.x + (c.w - side) / 2.0, c.y, side, side)),
         None => spot_of(Surround::Locator).inspect(|&r| placed.push(("locator", r))),
     };
-    // A page of cards gives the locator in its column a card of the column's width.
-    let card = style == Style::Modular && column.is_some();
-    let (card_r, card_pad) = (3.0 * k, 2.5 * k);
     let surround_box = |fill: Rgba| if style.cards() { pub_card(fill, clear, 0.0, 2.0 * k) } else { pub_box(fill, clear, 0.0) };
     if let (Some((map, locator_scale, shape, locator_center)), Some(r)) = (&locator_map, locator_rect) {
         if let (true, Some(c)) = (card, column) {
@@ -2750,6 +2776,8 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
                 extent_of: Some(frame),
                 extent_color: rustgis_map::layout::INDICATOR_COLOR,
                 extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+                border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+                border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
             },
@@ -2799,13 +2827,17 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         );
         // The colorbar at the bottom of the box, as tall as the box allows; the legend's rows in
         // what is left above it. Each says when it doesn't fit, rather than one blaming the other.
+        // The colorbar's title wraps to the box as it is drawn (#2493), which may be wider than
+        // the colorbar asked for (the rows in more columns): fewer lines leave the rows more room.
         let (ix, iy, iw, ih) = (r.0 + pad, r.1 + pad, lw - 2.0 * pad, lh - 2.0 * pad);
-        let bar_fit = if bar.is_some() { bar_h.min(ih) } else { 0.0 };
+        let bar_need = bar.as_deref().map_or(0.0, |title| colorbar_mm(title, iw));
+        let bar_fit = bar_need.min(ih);
         let rows_h = (ih - bar_fit - if bar.is_some() { bar_part - bar_h } else { 0.0 }).max(0.0);
         warnings.extend(legend_fit_warnings(legend_cols, (cw, ch), (iw, rows_h)).into_iter().map(String::from));
         // In a column the colorbar takes the column's width, as its rows do.
-        if bar.is_some() && ((bar_w > iw + LEGEND_FIT_MM && !legend_in_column) || bar_h > ih + LEGEND_FIT_MM) {
-            warnings.push("the legend's box is smaller than the colorbar: it is drawn narrower or shorter".into());
+        if let Some(layer) = bar.as_deref().filter(|_| (base_w > iw + LEGEND_FIT_MM && !legend_in_column) || bar_need > ih + LEGEND_FIT_MM)
+        {
+            warnings.push(format!("the legend's box is smaller than the colorbar of '{layer}': it is drawn narrower or shorter"));
         }
         if ch > 0.0 && rows_h >= 1.0 {
             l.add(
@@ -3371,6 +3403,35 @@ fn say_legend_fit(s: &mut Session, li: usize, id: u32) {
     }
 }
 
+/// Says how many lines of the text `id` of the layout `li` don't fit its box (#2346), as the
+/// layout view and an export count them: on the series' current page, measured at 300 dpi as a
+/// wrapped text is broken.
+fn say_text_fit(s: &mut Session, li: usize, id: u32) {
+    let Some(l) = s.project.layouts.get(li) else { return };
+    if !matches!(l.element(id).map(|e| &e.kind), Some(ElementKind::Text { .. })) {
+        return;
+    }
+    let page = l.series.as_ref().map_or(0, |sr| sr.page);
+    let series = series_info(s, li, page);
+    let info = rustgis_render::layout::PageInfo {
+        page: page + 1,
+        pages: series.as_ref().map_or(1, |i| i.0),
+        page_name: series.map(|i| i.1).unwrap_or_default(),
+    };
+    let said = rustgis_render::layout::text_loss(l, &s.project.maps, 300.0, &info, id)
+        .as_ref()
+        .and_then(rustgis_render::layout::lines_left_out_notice);
+    if let Some(said) = said {
+        s.warn(said);
+    }
+}
+
+/// What a text is given that changes the lines it breaks into or the room they have, or shows it
+/// (#2346): a move or a turn doesn't, nor a colour (the Format pane sets one at each step of a
+/// pick), except one that shows a text without ink, which `update` tells apart.
+const TEXT_FIT_KEYS: [&str; 12] =
+    ["text", "size", "w", "h", "wrap", "font", "fallback", "bold", "italic", "letterSpacing", "align", "visible"];
+
 /// The `"columns"` a legend is given, refused outside 1 to [`MAX_LEGEND_COLUMNS`].
 fn legend_columns_param(p: &Value) -> Result<Option<usize>, String> {
     let Some(v) = p.get("columns").filter(|v| !v.is_null()) else { return Ok(None) };
@@ -3416,6 +3477,9 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
     }
     if !matches!(kind, "text" | "dynamicText") && gives(p, "wrap") {
         return Err(ONLY_TEXT_WRAP.into());
+    }
+    if kind != "chart" && gives_chart_options(p) {
+        return Err(ONLY_CHART_OPTIONS.into());
     }
     if !matches!(
         kind,
@@ -3549,24 +3613,46 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
         "chart" => {
             let frame = frame_of(l, p)?;
             let layer = frame_layer_name(s, l, frame, p)?;
-            let (_, m) = chart_field_layer(s, &layer).ok_or("no such layer")?;
+            let ds = frame_dataset(s, l, frame, &layer).ok_or("no such layer")?;
+            let mut o = chart_options(p, ChartOptions::default(), ds)?;
+            // A new chart's stack is the one given, so one it can't draw is refused, never let go.
+            if let Some(said) = stack_or_refuse(p, &mut o)? {
+                return Err(said);
+            }
+            // Not given: the first numeric field, or for a count the field it groups by.
             let field = match ps(p, "field") {
-                Some(fl) => m
-                    .dataset
-                    .field_index(fl)
-                    .and_then(|i| m.dataset.fields.get(i))
-                    .map(|f| f.name.clone())
-                    .ok_or_else(|| format!("no field '{fl}'"))?,
-                None => {
-                    m.dataset.fields.iter().find(|f| f.ty.is_numeric()).map(|f| f.name.clone()).ok_or("the layer has no numeric field")?
-                }
+                Some(fl) => ds.field_index(fl).and_then(|i| ds.fields.get(i)).ok_or_else(|| format!("no field '{fl}'"))?,
+                None => ds
+                    .fields
+                    .iter()
+                    .find(|f| f.ty.is_numeric())
+                    .or_else(|| {
+                        o.group.as_deref().filter(|_| o.statistic == StatKind::Count).and_then(|g| ds.fields.iter().find(|f| f.name == g))
+                    })
+                    .ok_or("the layer has no numeric field")?,
             };
-            let label = ps(p, "label").and_then(|n| m.dataset.field_index(n)).and_then(|i| m.dataset.fields.get(i)).map(|f| f.name.clone());
-            (
-                "Chart Frame",
-                place(p, l, (pw * 0.55, ph * 0.6, pw * 0.4, ph * 0.35))?,
-                ElementKind::Chart { frame, layer, field, label, color: ink },
-            )
+            chart_measures(field, &o)?;
+            let k = ElementKind::Chart {
+                frame,
+                layer,
+                field: field.name.clone(),
+                label: o.label,
+                color: ink,
+                group: o.group,
+                statistic: o.statistic,
+                order: o.order,
+                bars: o.bars,
+                other: o.other,
+                orientation: o.orientation,
+                values: o.values,
+                decimals: o.decimals,
+                title: o.title,
+                bar_color: o.bar_color,
+                label_align: o.label_align,
+                classes: o.classes,
+                stack: o.stack,
+            };
+            ("Chart Frame", place(p, l, (pw * 0.55, ph * 0.6, pw * 0.4, ph * 0.35))?, k)
         }
         "rectangle" => {
             let k = ElementKind::Rectangle {
@@ -3700,6 +3786,10 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
     if kind == "legend" {
         say_raster_keys(s, i, id);
     }
+    if kind == "chart" {
+        say_chart_losses(s, i, id);
+    }
+    say_text_fit(s, i, id);
     if let Some(said) = empty_colorbar {
         s.warn(said);
     }
@@ -3795,13 +3885,29 @@ fn ticks(p: &Value) -> Option<usize> {
 /// keeping the frame's (`kind`) when not given; one given but not a colour or a number is an
 /// error, not left as it was.
 fn indicator_style(p: &Value, kind: Option<&ElementKind>) -> Result<(Rgba, f64), String> {
-    let (c, w) = match kind {
+    let current = match kind {
         Some(ElementKind::MapFrame { extent_color, extent_width, .. }) => (*extent_color, *extent_width),
         _ => (rustgis_map::layout::INDICATOR_COLOR, rustgis_map::layout::INDICATOR_WIDTH),
     };
+    outline_style(p, current, (rustgis_map::layout::MIN_INDICATOR_WIDTH, rustgis_map::layout::MAX_INDICATOR_WIDTH))
+}
+
+/// A map frame's border colour and width (points, 0 for none) from `color` and `width` in `p`,
+/// each keeping the frame's when not given (#2557), as [`indicator_style`] reads them.
+fn border_style(p: &Value, kind: &ElementKind) -> Result<(Rgba, f64), String> {
+    let current = match kind {
+        ElementKind::MapFrame { border_color, border_width, .. } => (*border_color, *border_width),
+        _ => (rustgis_map::layout::FRAME_BORDER_COLOR, rustgis_map::layout::FRAME_BORDER_WIDTH),
+    };
+    outline_style(p, current, (0.0, rustgis_map::layout::MAX_FRAME_BORDER_WIDTH))
+}
+
+/// An outline's colour and width (points, kept within `range`) from `color` and `width` in `p`,
+/// each keeping `current`'s when not given.
+fn outline_style(p: &Value, (c, w): (Rgba, f64), range: (f64, f64)) -> Result<(Rgba, f64), String> {
     let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
     let width = match (given("width"), f(p, "width")) {
-        (_, Some(v)) => v.clamp(rustgis_map::layout::MIN_INDICATOR_WIDTH, rustgis_map::layout::MAX_INDICATOR_WIDTH),
+        (_, Some(v)) => v.clamp(range.0, range.1),
         (true, None) => return Err("width must be a number of points".into()),
         (false, None) => w,
     };
@@ -3965,6 +4071,413 @@ fn text_wrap(p: &Value) -> Result<Option<bool>, String> {
         None => Ok(None),
         Some(v) => super::bool_value(v).map(Some).ok_or_else(|| "wrap must be true or false".into()),
     }
+}
+
+/// What a chart's options given for another element are told.
+const ONLY_CHART_OPTIONS: &str =
+    "only charts take a label, group, statistic, order, bars, other, stack, values, decimals, barColor, classes or labelAlign";
+
+/// The keys only a chart takes: what it draws, then how it draws it.
+const CHART_DATA_KEYS: [&str; 7] = ["label", "group", "statistic", "order", "bars", "other", "stack"];
+/// What a chart is given that changes the room its title and key leave its bars, beside its size.
+const CHART_ROOM_KEYS: [&str; 3] = ["orientation", "title", "values"];
+const CHART_LOOK_KEYS: [&str; 5] = ["values", "decimals", "barColor", "classes", "labelAlign"];
+
+fn gives_chart_options(p: &Value) -> bool {
+    gives_chart_data(p) || CHART_LOOK_KEYS.iter().any(|k| gives(p, k))
+}
+
+/// Whether `p` tells a chart what to draw, which it says its losses of again.
+fn gives_chart_data(p: &Value) -> bool {
+    CHART_DATA_KEYS.iter().any(|k| gives(p, k))
+}
+
+/// Whether `p` changes a chart's look: with a colorbar's and a legend's `orientation` and
+/// `title`, and `null` too, which gives a chart's title or bar colour its default again.
+fn changes_chart_look(p: &Value) -> bool {
+    ["orientation", "title"].iter().chain(CHART_LOOK_KEYS.iter()).any(|k| p.get(*k).is_some())
+}
+
+/// A chart's options beyond its layer and field ([`ElementKind::Chart`], #2487).
+struct ChartOptions {
+    label: Option<String>,
+    group: Option<String>,
+    statistic: StatKind,
+    order: ChartOrder,
+    bars: usize,
+    other: bool,
+    orientation: Orientation,
+    values: bool,
+    decimals: Option<u8>,
+    title: Option<String>,
+    bar_color: Option<Rgba>,
+    label_align: TextAlign,
+    classes: bool,
+    stack: Option<String>,
+}
+
+impl Default for ChartOptions {
+    fn default() -> Self {
+        ChartOptions {
+            label: None,
+            group: None,
+            statistic: StatKind::default(),
+            order: ChartOrder::default(),
+            bars: CHART_BARS,
+            other: false,
+            orientation: Orientation::default(),
+            values: false,
+            decimals: None,
+            title: None,
+            bar_color: None,
+            label_align: TextAlign::Left,
+            classes: false,
+            stack: None,
+        }
+    }
+}
+
+/// The chart options `p` gives over `base`, for a chart of `ds`: a label, group or stack field the
+/// layer has (named as the layer names it; "" for none), a statistic, an order, a number of bars
+/// and whether the rest go in an Other bar. Each one that isn't valid is refused, not dropped;
+/// whether the chart can stack is [`stack_or_refuse`]'s.
+fn chart_options(p: &Value, base: ChartOptions, ds: &rustgis_data::Dataset) -> Result<ChartOptions, String> {
+    let field = |key: &str, what: &str| -> Result<Option<Option<String>>, String> {
+        match p.get(key).filter(|v| !v.is_null()) {
+            None => Ok(None),
+            Some(v) => match v.as_str().map(str::trim) {
+                Some("") => Ok(Some(None)),
+                Some(n) => ds
+                    .field_index(n)
+                    .and_then(|i| ds.fields.get(i))
+                    .map(|f| Some(Some(f.name.clone())))
+                    .ok_or_else(|| format!("the layer has no field '{n}' to {what}")),
+                None => Err(format!("{key} is a field's name, or \"\" for none")),
+            },
+        }
+    };
+    let label = field("label", "label the bars with")?.unwrap_or(base.label);
+    let group = field("group", "group by")?.unwrap_or(base.group);
+    let stack = field("stack", "stack by")?.unwrap_or(base.stack);
+    let statistic = match p.get("statistic").filter(|v| !v.is_null()) {
+        None => base.statistic,
+        Some(v) => v.as_str().and_then(StatKind::from_code).ok_or("statistic is count, sum, mean, min or max")?,
+    };
+    let order = match p.get("order").filter(|v| !v.is_null()) {
+        None => base.order,
+        Some(v) => v.as_str().and_then(ChartOrder::from_code).ok_or("order is descending, ascending, category or layer")?,
+    };
+    let bars = match p.get("bars").filter(|v| !v.is_null()) {
+        None => base.bars,
+        Some(v) => v
+            .as_u64()
+            .filter(|n| (1..=MAX_CHART_BARS as u64).contains(n))
+            .map(|n| n as usize)
+            .ok_or_else(|| format!("bars is a whole number from 1 to {MAX_CHART_BARS}"))?,
+    };
+    let other = match p.get("other").filter(|v| !v.is_null()) {
+        None => base.other,
+        Some(v) => super::bool_value(v).ok_or("other must be true or false")?,
+    };
+    chart_look_options(p, ChartOptions { label, group, statistic, order, bars, other, stack, ..base })
+}
+
+/// The look options `p` gives a chart over `base` (#2487): none reads its layer, so a chart
+/// whose layer is gone still takes them. Each one that isn't valid is refused, not dropped.
+fn chart_look_options(p: &Value, base: ChartOptions) -> Result<ChartOptions, String> {
+    let orientation = orientation(p)?.unwrap_or(base.orientation);
+    let values = match p.get("values").filter(|v| !v.is_null()) {
+        None => base.values,
+        Some(v) => super::bool_value(v).ok_or("values must be true or false")?,
+    };
+    let decimals = match p.get("decimals").filter(|v| !v.is_null()) {
+        None => base.decimals,
+        Some(v) if v.as_str().is_some_and(|t| t.trim().eq_ignore_ascii_case("auto")) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .filter(|n| *n <= MAX_CHART_DECIMALS as u64)
+                .map(|n| n as u8)
+                .ok_or_else(|| format!("decimals is \"auto\" or a whole number from 0 to {MAX_CHART_DECIMALS}"))?,
+        ),
+    };
+    // Null gives it back the title it is given, as it gives the bars their default colour.
+    let title = match p.get("title") {
+        None => base.title,
+        Some(Value::Null) => None,
+        Some(v) => Some(super::within(
+            "title",
+            "a chart's title",
+            v.as_str().ok_or("a chart's title is a text, \"\" for none, or null for the title it is given")?,
+            200,
+        )?),
+    };
+    let bar_color = match p.get("barColor") {
+        None => base.bar_color,
+        Some(Value::Null) => None,
+        Some(_) => Some(color(p, "barColor", CHART_BAR)?),
+    };
+    // Columns centre their labels whatever it says, so a centre has nothing to set.
+    let label_align = match p.get("labelAlign").filter(|v| !v.is_null()) {
+        None => base.label_align,
+        Some(v) => v.as_str().and_then(TextAlign::from_name).filter(|a| *a != TextAlign::Center).ok_or("labelAlign is left or right")?,
+    };
+    // Coloured by classes, it reads its layer's colours when drawn, not now.
+    let classes = match p.get("classes").filter(|v| !v.is_null()) {
+        None => base.classes,
+        Some(v) => super::bool_value(v).ok_or("classes must be true or false")?,
+    };
+    Ok(ChartOptions { orientation, values, decimals, title, bar_color, label_align, classes, ..base })
+}
+
+/// A stack field a chart of `o` can't draw ([`rustgis_map::layout::chart_stack_refusal`], #2487
+/// part 3b): refused when `p` gives it, let go when it is kept from before and `p` changes what it
+/// needs, which is returned to be said.
+fn stack_or_refuse(p: &Value, o: &mut ChartOptions) -> Result<Option<String>, String> {
+    let Some(st) = o.stack.as_deref() else { return Ok(None) };
+    let Some(why) = rustgis_map::layout::chart_stack_refusal(o.group.as_deref(), o.statistic, st) else { return Ok(None) };
+    if gives(p, "stack") {
+        return Err(format!("the chart can't stack by '{st}': {why} (it stacks grouped by another field, summing or counting)"));
+    }
+    let said = format!("the chart no longer stacks by '{st}': {why}");
+    o.stack = None;
+    Ok(Some(said))
+}
+
+/// Whether a chart of these options charts `field`: a number, or any field when it groups and
+/// counts, which reads none (ungrouped, its statistic isn't read).
+fn chart_takes(field: &rustgis_data::Field, o: &ChartOptions) -> bool {
+    field.ty.is_numeric() || o.group.is_some() && o.statistic == StatKind::Count
+}
+
+/// Refuses a chart field that [`chart_takes`] doesn't.
+fn chart_measures(field: &rustgis_data::Field, o: &ChartOptions) -> Result<(), String> {
+    if chart_takes(field, o) {
+        return Ok(());
+    }
+    Err(format!("'{}' isn't a numeric field: a chart measures a number, unless it groups and counts", field.name))
+}
+
+/// The features of `layer` in the map of the frame `frame`, as a chart on it draws them.
+fn frame_dataset<'a>(s: &'a Session, l: &Layout, frame: u32, layer: &str) -> Option<&'a rustgis_data::Dataset> {
+    frame_layer(s, l, frame, layer).map(|l| &l.dataset)
+}
+
+/// The layer `layer` in the map of the frame `frame`, with its symbology for a chart coloured by it.
+fn frame_layer<'a>(s: &'a Session, l: &Layout, frame: u32, layer: &str) -> Option<&'a rustgis_map::Layer> {
+    let Some(ElementKind::MapFrame { map, .. }) = l.element(frame).map(|e| &e.kind) else { return None };
+    s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?.layer_by_name(layer)
+}
+
+fn is_chart(s: &Session, li: usize, id: u32) -> bool {
+    matches!(s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind), Some(ElementKind::Chart { .. }))
+}
+
+/// A chart's options after `layout.update`, the field it now measures when it changes, and what it
+/// says.
+type ChartChange = (ChartOptions, Option<String>, Vec<String>);
+
+/// A chart's options after `layout.update` (`p`) with the layer and field it will chart
+/// (`checked`, from [`checked_update`]), and what it says of the label or group it loses on a
+/// new layer without them; `None` when `p` changes neither. A field `p` doesn't name that the
+/// chart no longer measures (ungrouped, or no longer counting) gives way to the layer's first
+/// numeric field, which is said and returned. Look options alone read nothing of its layer.
+/// Chart options given for another element are refused.
+fn chart_update(
+    s: &Session,
+    p: &Value,
+    li: usize,
+    id: u32,
+    checked: Option<&(String, Option<String>)>,
+) -> Result<Option<ChartChange>, String> {
+    let l = s.project.layouts.get(li).ok_or("no layout")?;
+    let e = l.element(id).ok_or_else(|| format!("no element {id}"))?;
+    let ElementKind::Chart {
+        frame,
+        layer,
+        field,
+        label,
+        group,
+        statistic,
+        order,
+        bars,
+        other,
+        orientation,
+        values,
+        decimals,
+        title,
+        bar_color,
+        label_align,
+        classes,
+        stack,
+        ..
+    } = &e.kind
+    else {
+        return if gives_chart_options(p) { Err(ONLY_CHART_OPTIONS.into()) } else { Ok(None) };
+    };
+    if checked.is_none() && !gives_chart_options(p) && !changes_chart_look(p) {
+        return Ok(None);
+    }
+    let look = ChartOptions {
+        label: label.clone(),
+        group: group.clone(),
+        statistic: *statistic,
+        order: *order,
+        bars: *bars,
+        other: *other,
+        orientation: *orientation,
+        values: *values,
+        decimals: *decimals,
+        title: title.clone(),
+        bar_color: *bar_color,
+        label_align: *label_align,
+        classes: *classes,
+        stack: stack.clone(),
+    };
+    // Told only how to draw, it reads nothing of its layer, which may be gone.
+    if checked.is_none() && !gives_chart_data(p) {
+        return Ok(Some((chart_look_options(p, look)?, None, Vec::new())));
+    }
+    let stored = field.as_str();
+    let (layer, field) = match checked {
+        Some((name, f)) => (name.as_str(), f.as_deref().unwrap_or(stored)),
+        None => (layer.as_str(), stored),
+    };
+    let ds = frame_dataset(s, l, *frame, layer).ok_or_else(|| format!("no feature layer '{layer}' in the frame's map"))?;
+    // On a new layer, a label, group or stack field it hasn't is let go, and said.
+    let mut said = Vec::new();
+    let mut keep = |name: &Option<String>, what: &str| {
+        let n = name.as_deref()?;
+        let kept = ds.field_index(n).and_then(|i| ds.fields.get(i)).map(|f| f.name.clone());
+        if kept.is_none() {
+            said.push(format!("{layer} has no field '{n}': the chart no longer {what}"));
+        }
+        kept
+    };
+    // A label, group or stack the update itself sets or takes away isn't said to be lost.
+    let base = ChartOptions {
+        label: if gives(p, "label") { None } else { keep(label, "labels its bars with it") },
+        group: if gives(p, "group") { None } else { keep(group, "groups by it") },
+        stack: if gives(p, "stack") { None } else { keep(stack, "stacks by it") },
+        ..look
+    };
+    let mut o = chart_options(p, base, ds)?;
+    said.extend(stack_or_refuse(p, &mut o)?);
+    let f = ds.field_index(field).and_then(|i| ds.fields.get(i)).ok_or_else(|| format!("no field '{field}' in {layer}"))?;
+    if gives(p, "field") || chart_takes(f, &o) {
+        chart_measures(f, &o)?;
+        // A field picked for it (on a new layer without one it can measure) is said too.
+        if !gives(p, "field") && field != stored {
+            said.push(format!("{layer} has no field '{stored}' the chart can measure: it now measures {field}"));
+        }
+        return Ok(Some((o, None, said)));
+    }
+    let to = ds.fields.iter().find(|f| f.ty.is_numeric()).ok_or_else(|| {
+        format!("'{field}' isn't a numeric field and {layer} has none: a chart measures a number, unless it groups and counts")
+    })?;
+    said.push(format!("'{field}' isn't a number: the chart now measures {}", to.name));
+    Ok(Some((o, Some(to.name.clone()), said)))
+}
+
+/// What a chart leaves out of what it is told to draw (an existing loss made said): the bars
+/// past its limit, and the features with no number in its field; coloured by classes, the bars
+/// that keep its bar colour, their features having several, and stacked, the values of its key
+/// gathered in its Other or keeping their palette colour. It reads each feature of the
+/// chart's layer once, on the command's thread, as drawing the chart does on every draw of the
+/// page: run only when a chart is added, told what to draw or coloured by classes, not when it
+/// is moved; resized or restyled, a stacked chart reads it for [`say_chart_crowded`] alone.
+fn say_chart_losses(s: &mut Session, li: usize, id: u32) {
+    say_chart(s, li, id, false);
+}
+
+/// [`say_chart_losses`]' warning of a chart whose title and key leave its bars no room, alone.
+fn say_chart_crowded(s: &mut Session, li: usize, id: u32) {
+    say_chart(s, li, id, true);
+}
+
+/// [`say_chart_losses`], or `crowded_only` [`say_chart_crowded`].
+fn say_chart(s: &mut Session, li: usize, id: u32, crowded_only: bool) {
+    let said = {
+        let Some(l) = s.project.layouts.get(li) else { return };
+        let Some(e) = l.element(id) else { return };
+        let ElementKind::Chart { frame, layer, field, .. } = &e.kind else { return };
+        // Only a stacked chart can be crowded, so for that alone an unstacked one reads nothing.
+        if crowded_only && e.kind.chart_stack().is_none() {
+            return;
+        }
+        // Read as the page draws it: at the frame's scale and on the series page shown.
+        let Some((m, env)) = rustgis_render::layout::frame_page_env(l, &s.project.maps, *frame) else { return };
+        let Some(data) = m.layer_by_name(layer).and_then(|fl| e.kind.chart_data_of(fl, &env)) else { return };
+        let mut said = if crowded_only { Vec::new() } else { chart_losses(&e.kind, &data, layer, field) };
+        if rustgis_render::layout::chart_crowded(&data, &e.kind.chart_look().unwrap_or_default(), e.w, e.h) {
+            said.push("the chart's title and key leave its bars no room: it draws as a placeholder until its box is taller".to_string());
+        }
+        said
+    };
+    for w in said {
+        s.warn(w);
+    }
+}
+
+/// What [`say_chart_losses`] says of the chart `kind` of `layer` and `field`, drawing `data`.
+fn chart_losses(kind: &ElementKind, data: &rustgis_map::layout::ChartData, layer: &str, field: &str) -> Vec<String> {
+    let mut said = Vec::new();
+    if data.left_out > 0 {
+        let drawn = data.bars.len();
+        said.push(format!(
+            "the chart draws {drawn} of {} bars: {} left out (\"bars\" draws up to {MAX_CHART_BARS}, \"other\": true gathers the rest in an Other bar)",
+            drawn + data.left_out,
+            data.left_out
+        ));
+    }
+    if data.out_of_range > 0 {
+        let n = data.out_of_range;
+        said.push(format!(
+            "{n} bar{} of the chart left out: {} statistic is past a number's range",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "its" } else { "their" }
+        ));
+    }
+    if data.no_number > 0 {
+        let n = data.no_number;
+        said.push(format!("{n} feature{} of {layer} with no number in {field} left out of the chart", if n == 1 { "" } else { "s" }));
+    }
+    // Coloured by classes, the bars that keep the bar colour all the same.
+    for (n, why) in [(data.mixed, "have several colours"), (data.unshown, "show no colour")] {
+        if n > 0 {
+            let (plural, its) = if n == 1 { ("", "its") } else { ("s", "their") };
+            let keep = if n == 1 { "keeps" } else { "keep" };
+            said.push(format!("{n} bar{plural} {keep} the chart's bar colour: {its} features {why} on the map"));
+        }
+    }
+    // Stacked, the values gathered in its key's Other, and coloured by classes, those that keep
+    // their palette colour.
+    if data.key_gathered > 0 {
+        let n = data.key_gathered;
+        let named = data.key.len().saturating_sub(1);
+        let stack = kind.chart_stack().unwrap_or_default();
+        said.push(format!(
+            "the chart's key names {named} of the {} values of {stack} on its bars: {n} {} gathered in its grey Other",
+            named + n,
+            if n == 1 { "is" } else { "are" }
+        ));
+    }
+    if data.key_kept > 0 {
+        let n = data.key_kept;
+        let (plural, its, keep) = if n == 1 { ("", "its", "keeps") } else { ("s", "their", "keep") };
+        said.push(format!(
+            "{n} value{plural} of the chart's key {keep} {its} palette colour: {its} features have several colours on the map, or show none"
+        ));
+    }
+    if data.stack_gone {
+        let stack = kind.chart_stack().unwrap_or_default();
+        said.push(format!("the chart draws its bars whole: {layer} has no field '{stack}' to stack them by"));
+    }
+    if data.whole > 0 {
+        let n = data.whole;
+        let (plural, is, its) = if n == 1 { ("", "is", "its") } else { ("s", "are", "their") };
+        said.push(format!("{n} bar{plural} of the chart {is} drawn whole, not stacked: {its} stretches add up past the largest number"));
+    }
+    said
 }
 
 /// What a `font` given for an element that isn't a text is told.
@@ -4307,15 +4820,18 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     // A name, text or title over its limit is refused, not cut.
     let new_name = super::name_given(p, "an element's name", 200)?;
     let new_text = ps(p, "text").map(|t| super::within("text", "a text element's text", t, 5000)).transpose()?;
-    let new_title = ps(p, "title").map(|t| super::within("title", "a legend or colorbar's title", t, 200)).transpose()?;
+    let new_title = ps(p, "title").map(|t| super::within("title", "a legend's, colorbar's or chart's title", t, 200)).transpose()?;
     let li = index(s, p)?;
     // What a publication's scale bar box was measured from, before this change.
     let basis = scale_box_basis(s, li);
     // Locked, it takes no change but being unlocked, which may come with other changes.
     // "dash": null makes a line solid, "background": null takes the background away, and
-    // "color": null gives a legend, colorbar, table or chart its default ink, so they are changes too.
-    let inked = s.project.layouts.get(li).and_then(|l| l.element(id)).is_some_and(|e| e.kind.takes_ink());
-    let null_changes = |k: &str| matches!(k, "dash" | "background") || (inked && k == "color");
+    // "border": null gives a map frame its default border,
+    // "color": null gives a legend, colorbar, table or chart its default ink, and "title" or
+    // "barColor": null a chart its given title or default bars ([`ElementKind::null_resets`]), so
+    // they are changes too.
+    let current = s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind);
+    let null_changes = |k: &str| matches!(k, "dash" | "background" | "border") || current.is_some_and(|kind| kind.null_resets(k));
     let changes = p.as_object().is_some_and(|o| {
         o.iter().any(|(k, v)| (!v.is_null() || null_changes(k.as_str())) && !matches!(k.as_str(), "layout" | "element" | "locked"))
     });
@@ -4324,6 +4840,11 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     }
     // A new layer (tables and charts) or field (charts) must exist in the frame's map.
     let checked = checked_update(s, p, li, id)?;
+    // A chart's options, read over its own on the layer it will chart.
+    let (new_chart, chart_field, chart_said) = match chart_update(s, p, li, id, checked.as_ref())? {
+        Some((o, f, said)) => (Some(o), f, said),
+        None => (None, None, Vec::new()),
+    };
     // A colorbar's new layer must be a raster in its frame's map; empty follows the top visible
     // raster with a colour scale, not drawn by classes.
     let colorbar = {
@@ -4345,7 +4866,7 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     // A north arrow's or scale bar's new look, and a map frame's grid: `"grid": false` removes it,
     // `true` adds the default one, an object changes the options it names, and null (not set)
     // leaves it as it is.
-    let (restyled, new_grid, new_indicator) = {
+    let (restyled, new_grid, new_indicator, new_border) = {
         let l = s.project.layouts.get(li).ok_or("no layout")?;
         let kind = &l.element(id).ok_or_else(|| format!("no element {id}"))?.kind;
         // `"extentIndicator": false` takes the frame's indicator away; an object restyles it.
@@ -4359,6 +4880,19 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
             (_, Some(_)) => return Err("only map frames have an extent indicator".into()),
             _ => None,
         };
+        // `"border": null` gives the frame the default border back; an object changes the colour
+        // and width it names, a width of 0 drawing none (#2557).
+        let border = match (kind, p.get("border")) {
+            (_, None) => None,
+            (ElementKind::MapFrame { .. }, Some(Value::Null)) => {
+                Some((rustgis_map::layout::FRAME_BORDER_COLOR, rustgis_map::layout::FRAME_BORDER_WIDTH))
+            }
+            (ElementKind::MapFrame { .. }, Some(v @ Value::Object(_))) => Some(border_style(v, kind)?),
+            (ElementKind::MapFrame { .. }, Some(_)) => {
+                return Err("border is an object of color and width (points, 0 for none), or null for the default".into());
+            }
+            (_, Some(_)) => return Err("only map frames have a border".into()),
+        };
         let grid = match (kind, p.get("grid").filter(|v| !v.is_null())) {
             (ElementKind::MapFrame { grid, .. }, Some(v)) => Some(match v {
                 Value::Bool(false) => None,
@@ -4369,7 +4903,7 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
             (_, Some(_)) => return Err("only map frames have a grid".into()),
             _ => None,
         };
-        (restyle(kind, p)?, grid, indicator)
+        (restyle(kind, p)?, grid, indicator, border)
     };
     // A line turned to an "angle" or made a "length" long, about its centre: its new box,
     // direction and heads.
@@ -4526,6 +5060,8 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     }
     let l = active(s, p)?;
     let e = l.element_mut(id).ok_or_else(|| format!("no element {id}"))?;
+    // A text with no ink isn't measured: given a colour that shows it, it is told (#2346).
+    let shown = col.is_some_and(|c| c.a() > 0) && matches!(&e.kind, ElementKind::Text { color, .. } if color.a() == 0);
     let num = |k: &str, lo: f64, hi: f64| f(p, k).map(|v| v.clamp(lo, hi));
     if let Some(v) = num("x", -5000.0, 5000.0) {
         e.x = v;
@@ -4644,11 +5180,27 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
                 *reverse = v;
             }
         }
-        ElementKind::MapFrame { map, center, scale, grid, bearing, pitch, extent_of, extent_color, extent_width, .. } => {
+        ElementKind::MapFrame {
+            map,
+            center,
+            scale,
+            grid,
+            bearing,
+            pitch,
+            extent_of,
+            extent_color,
+            extent_width,
+            border_color,
+            border_width,
+            ..
+        } => {
             match new_indicator {
                 Some(None) => *extent_of = None,
                 Some(Some((c, w))) => (*extent_color, *extent_width) = (c, w),
                 None => {}
+            }
+            if let Some((c, w)) = new_border {
+                (*border_color, *border_width) = (c, w);
             }
             if let Some(m) = map_name {
                 *map = m;
@@ -4677,12 +5229,39 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
                 *layer = l.clone();
             }
         }
-        ElementKind::Chart { field, layer, .. } => {
+        ElementKind::Chart {
+            field,
+            layer,
+            label,
+            group,
+            statistic,
+            order,
+            bars,
+            other,
+            orientation,
+            values,
+            decimals,
+            title,
+            bar_color,
+            label_align,
+            classes,
+            stack,
+            ..
+        } => {
             if let Some((l, f)) = &checked {
                 *layer = l.clone();
                 if let Some(f) = f {
                     *field = f.clone();
                 }
+            }
+            if let Some(o) = new_chart {
+                (*label, *group, *statistic, *order, *bars, *other) = (o.label, o.group, o.statistic, o.order, o.bars, o.other);
+                (*orientation, *values, *decimals, *title, *bar_color, *label_align) =
+                    (o.orientation, o.values, o.decimals, o.title, o.bar_color, o.label_align);
+                (*classes, *stack) = (o.classes, o.stack);
+            }
+            if let Some(f) = chart_field {
+                *field = f;
             }
         }
         _ => {}
@@ -4708,6 +5287,17 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
     if excluding {
         say_raster_keys(s, li, id);
     }
+    // A chart told what to draw, or coloured by classes, says what it leaves out of it.
+    if !chart_said.is_empty() || ((checked.is_some() || gives_chart_data(p) || b(p, "classes") == Some(true)) && is_chart(s, li, id)) {
+        for said in chart_said {
+            s.warn(said);
+        }
+        say_chart_losses(s, li, id);
+    } else if (gives(p, "w") || gives(p, "h") || CHART_ROOM_KEYS.iter().any(|k| p.get(*k).is_some())) && is_chart(s, li, id) {
+        // Resized, retitled (`null` too, its given title back), turned or given values, it says
+        // only whether its bars still have room.
+        say_chart_crowded(s, li, id);
+    }
     if emptied_colorbar {
         let frame = s.project.layouts.get(li).and_then(|l| match l.element(id).map(|e| &e.kind) {
             Some(ElementKind::Colorbar { frame, layer: None, .. }) => Some(*frame),
@@ -4728,6 +5318,10 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         if (id == basis.frame && given(&["scale", "w"])) || (id == basis.text_id && given(&["text", "size", "bold"])) || restyled {
             refit_scale_box(s, li, &basis);
         }
+    }
+    // After the scale box is refitted: a text is measured in the box it is saved with.
+    if shown || TEXT_FIT_KEYS.iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+        say_text_fit(s, li, id);
     }
     if let Some(w) = font_told {
         return Ok(json!({"warning": w}));
@@ -5215,7 +5809,7 @@ fn layout_bytes_inner(
         *cur = saved.clone();
     }
     let (pages, png) = result?;
-    if let Some(note) = rustgis_render::layout::clipped_text_notice(&clipped.into_iter().collect::<Vec<_>>()) {
+    if let Some(note) = rustgis_render::layout::clipped_text_notice(&saved, &clipped.into_iter().collect::<Vec<_>>()) {
         s.warn(note);
     }
     pictured_notices(s, &frames_pictured, &pages_pictured);
@@ -5438,8 +6032,9 @@ fn layout_svg(s: &mut Session, li: usize, dpi: f64) -> Result<String, String> {
     // Rendering borrows the current layout; it does not step or modify the series page.
     let layout = s.project.layouts.get(li).ok_or("no layout")?;
     let clipped = rustgis_render::layout::clipped_text(layout, &s.project.maps, dpi, &info);
+    let note = rustgis_render::layout::clipped_text_notice(layout, &clipped);
     let (text, pictured) = rustgis_render::svg::layout_svg(layout, &mut s.project.maps, dpi, &info)?;
-    if let Some(note) = rustgis_render::layout::clipped_text_notice(&clipped) {
+    if let Some(note) = note {
         s.warn(note);
     }
     pictured_notices(s, &pictured, &[]);
@@ -5450,6 +6045,9 @@ pub(crate) fn import(s: &mut Session, text: &str) -> CmdResult {
     if text.len() as u64 > MAX_LAYOUT {
         return Err("the layout file is too large".into());
     }
+    // A newer format, or a capability this release doesn't know, is refused by name rather than
+    // read without what it adds (#2277). A file without a header is a legacy layout.
+    crate::project::check_format(text, "layout")?;
     let mut l: Layout = serde_json::from_str(text).map_err(|e| format!("not a RustGIS layout: {e}"))?;
     // Refused before anything is said of it.
     if s.project.layouts.len() >= crate::project::MAX_LAYOUTS {
@@ -5583,11 +6181,6 @@ fn element_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::I
     if matches!(kind, "table" | "chart") {
         let name = frame_layer_name(input, layout, frame, p)?;
         inputs.extend(super::Inputs::named(map, [name.as_str()])?);
-        if kind == "chart"
-            && let Some((m, l)) = chart_field_layer(input, &name)
-        {
-            inputs.layers.push((m.instance_id(), l.id));
-        }
     } else if kind == "colorbar" {
         if let Some(name) = colorbar_layer(input, layout, frame, ps(p, "layer"))? {
             inputs.extend(super::Inputs::named(map, [name.as_str()])?);
@@ -5619,13 +6212,6 @@ pub(crate) fn render_inputs_at(input: &impl super::InputSource, li: usize) -> su
     }
     inputs.state = json!({"layout":li,"name":layout.name,"selectors":layout.elements.iter().filter_map(|e| element_selectors(&e.kind).map(|v|(e.id,v))).collect::<Vec<_>>(),"series":layout.series,"tiles":inputs.state});
     inputs
-}
-
-/// Charts find fields in the first matching project layer, separately from the frame's layer.
-fn chart_field_layer<'a>(input: &'a impl super::InputSource, name: &str) -> Option<(&'a rustgis_map::Map, &'a rustgis_map::Layer)> {
-    let context = input.input_context();
-    let s = &context;
-    s.project.maps.iter().find_map(|map| map.layer_by_name(name).map(|layer| (map, layer)))
 }
 
 /// Finds only the generated, unreferenced globe map that publication may replace.
@@ -5792,18 +6378,34 @@ fn drawable_globe_center(map: &Map, view: Coord, scale: f64) -> Coord {
     Coord::new(view.x, fit.copysign(view.y))
 }
 
-/// Where a globe locator `side_mm` across at 1:`scale` centres the globe, and whether it shows it
-/// whole: as near `area` as the camera draws a globe that small ([`drawable_globe_center`], the
-/// equator when it draws it that small nowhere), the disc within the circle and the area on it.
-/// A locator too small for the globe even on the equator (under about 20 mm), or one whose nearest
-/// centre leaves the area behind the globe's rim, keeps the area in the middle, its circle
-/// clipping the globe (#2348). Whether it is whole is measured on the disc drawn, not on the
-/// camera's limit: a circle a little over the smallest globe holds it at that limit.
+/// Centres the globe locator as close to the area as its circle can hold the rendered disc.
+/// If even the equator does not fit, or the area would be behind the rim, keep the locator
+/// centred on the area and let its circle clip the globe (#2394).
 pub(crate) fn globe_locator_center(map: &Map, area: Coord, scale: f64, side_mm: f64) -> (Coord, bool) {
     let side = side_mm * rustgis_map::layout::PT_PER_MM;
-    let at = drawable_globe_center(map, area, scale);
-    let g = rustgis_map::globe::Globe::new(&rustgis_map::layout::frame_camera(map, at, scale, 0.0, 0.0), side, side);
-    if 2.0 * g.disc_radius() <= side && g.forward(area).is_some() { (at, true) } else { (area, false) }
+    let globe = |at| {
+        let camera = rustgis_map::layout::frame_camera(map, at, scale, 0.0, 0.0);
+        rustgis_map::globe::Globe::new(&camera, side, side)
+    };
+    let fits = |at| 2.0 * globe(at).disc_radius() <= side;
+    if fits(area) {
+        return (area, true);
+    }
+    let equator = Coord::new(area.x, 0.0);
+    if !fits(equator) {
+        return (area, false);
+    }
+    // At a fixed scale the disc only grows towards the pole, even after resolution is clamped.
+    let (mut inside, mut outside) = (equator, area);
+    for _ in 0..40 {
+        let mid = Coord::new(area.x, (inside.y + outside.y) / 2.0);
+        if fits(mid) {
+            inside = mid;
+        } else {
+            outside = mid;
+        }
+    }
+    if globe(inside).forward(area).is_some() { (inside, true) } else { (area, false) }
 }
 
 /// Parses the publication's locator choice with its default: a globe on a sheet, none on a figure
@@ -5884,6 +6486,15 @@ fn checked_update(input: &impl super::InputSource, p: &Value, li: usize, id: u32
                     .layer_by_name(nl.unwrap_or(layer))
                     .filter(|l| !l.is_raster())
                     .ok_or_else(|| format!("no feature layer '{}' in {map}", nl.unwrap_or(layer)))?;
+                // A chart that groups and counts (or is told to) charts any field; the others a
+                // number.
+                let count = match ps(p, "statistic") {
+                    Some(st) => StatKind::from_code(st) == Some(StatKind::Count),
+                    None => matches!(e.kind, ElementKind::Chart { statistic: StatKind::Count, .. }),
+                } && match p.get("group").filter(|v| !v.is_null()) {
+                    Some(g) => g.as_str().is_some_and(|g| !g.trim().is_empty()),
+                    None => matches!(e.kind, ElementKind::Chart { group: Some(_), .. }),
+                };
                 // Only charts have a field.
                 let field = match nf.filter(|_| matches!(e.kind, ElementKind::Chart { .. })) {
                     Some(fl) => Some(
@@ -5891,18 +6502,20 @@ fn checked_update(input: &impl super::InputSource, p: &Value, li: usize, id: u32
                             .dataset
                             .field_index(fl)
                             .and_then(|i| target.dataset.fields.get(i))
-                            .filter(|f| f.ty.is_numeric())
+                            .filter(|f| count || f.ty.is_numeric())
                             .map(|f| f.name.clone())
                             .ok_or_else(|| format!("no numeric field '{fl}' in {}", target.name))?,
                     ),
                     // A chart moved to another layer keeps its field only if that layer has it as a
-                    // number; otherwise it charts the layer's first numeric field.
+                    // number (any field, counting); otherwise it charts the layer's first numeric field,
+                    // or, counting a layer without one, its first field.
                     None => match &e.kind {
                         ElementKind::Chart { field, .. } if nl.is_some() => {
-                            let numeric = |f: &&rustgis_data::Field| f.ty.is_numeric();
+                            let numeric = |f: &&rustgis_data::Field| count || f.ty.is_numeric();
                             let keep = target.dataset.field_index(field).and_then(|i| target.dataset.fields.get(i)).filter(numeric);
                             let f = keep
-                                .or_else(|| target.dataset.fields.iter().find(numeric))
+                                .or_else(|| target.dataset.fields.iter().find(|f| f.ty.is_numeric()))
+                                .or_else(|| target.dataset.fields.first().filter(|_| count))
                                 .ok_or_else(|| format!("{} has no numeric field to chart", target.name))?;
                             Some(f.name.clone())
                         }
@@ -6005,7 +6618,9 @@ fn element_selectors(kind: &ElementKind) -> Option<Value> {
     Some(match kind {
         ElementKind::MapFrame { map, extent_of, .. } => json!({"map":map,"extentOf":extent_of}),
         ElementKind::Table { frame, layer, .. } => json!({"frame":frame,"layer":layer}),
-        ElementKind::Chart { frame, layer, field, label, .. } => json!({"frame":frame,"layer":layer,"field":field,"label":label}),
+        ElementKind::Chart { frame, layer, field, label, group, stack, .. } => {
+            json!({"frame":frame,"layer":layer,"field":field,"label":label,"group":group,"stack":stack})
+        }
         ElementKind::Legend { frame, exclude, labels, .. } => json!({"frame":frame,"exclude":exclude,"labels":labels}),
         ElementKind::Colorbar { frame, layer, .. } => json!({"frame":frame,"layer":layer}),
         ElementKind::NorthArrow { frame, .. } | ElementKind::ScaleBar { frame, .. } => json!({"frame":frame}),

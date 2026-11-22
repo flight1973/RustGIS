@@ -14,6 +14,7 @@ pub mod durable;
 pub mod extensions;
 pub mod geometry_calc;
 pub mod grids;
+pub mod image_grid;
 pub mod model;
 mod notice_text;
 #[cfg(not(target_arch = "wasm32"))]
@@ -755,6 +756,9 @@ pub struct Session {
     /// The state last saved, or opened from its file; `None` when no state of the open project is
     /// (recovered work). The project has unsaved changes while another is open ([`Session::dirty`]).
     saved: Option<u64>,
+    /// How many times [`Session::mark_unsaved`] has run, so a save that finishes later can tell
+    /// whether a change outside undo came after the state it wrote.
+    unsaved_marks: u64,
     /// Favourite, recent and saved data sources (kept with the app's preferences, not the
     /// project).
     pub sources: sources::Sources,
@@ -840,11 +844,19 @@ pub struct Session {
     /// The definitions of the systems whose datum grid note this session has said
     /// ([`Session::say_grid_notes`]).
     crs_notes_said: Vec<String>,
+    /// The pairs of systems whose direct operation's grid note this session has said, so their
+    /// grids are asked for again when downloads are turned on ([`Session::want_grids_in_use`]),
+    /// as the systems in use are.
+    grid_pairs: Vec<(rustgis_data::raster::Crs, rustgis_data::raster::Crs)>,
     /// The coordinate systems a background export used on its worker thread, as (definition,
     /// label), for [`Session::say_grid_notes`].
     pub(crate) crs_used_elsewhere: Vec<(String, String)>,
     /// When the frame path last looked for missing datum grids ([`Session::say_grid_notes`]).
     grid_notes_checked: Option<web_time::Instant>,
+    /// Each layer held in another system (by instance): the geometry revision and system whose
+    /// places were last counted for [`Session::say_unplaced`], and the most it said of them, so a
+    /// version of a layer is said once, and again only for a count above it.
+    unplaced_checked: std::collections::HashMap<u64, (u64, rustgis_data::raster::Crs, Result<usize, String>)>,
     /// The datum grids the map's layers were last projected with
     /// ([`rustgis_data::raster::crs::grid_generation`]).
     grid_generation: u64,
@@ -973,6 +985,9 @@ pub struct Session {
     /// them (it keeps nothing between calls). Not saved with the project: a plugin's state
     /// command reads what it needs from the map when the panel opens.
     pub plugin_panels: std::collections::BTreeMap<String, rustgis_plugins::PanelState>,
+    /// Plugins whose panel state was made again from a changed declaration (the plugin updated)
+    /// since their state command last ran: the panel in view runs it again (#2550).
+    panels_to_refresh: std::collections::BTreeSet<String>,
     /// What running session plugins were last told of the map, to send them events.
     #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "session plugins run on the desktop only"))]
     pub(crate) plugin_watch: cmd::plugins::Watch,
@@ -1074,6 +1089,9 @@ pub struct Session {
     /// ([`cmd::gp::FilesAhead`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) files_ahead: Option<cmd::gp::FilesAhead>,
+    /// Original grids read by a script worker and consumed at landing without file I/O.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) grids_ahead: Option<image_grid::Ahead>,
     /// The zones' spectral means a script read on that copy, which its run here takes
     /// ([`cmd::imagery::ZonesAhead`]).
     #[cfg(not(target_arch = "wasm32"))]
@@ -1119,6 +1137,7 @@ fn strip_windows(p: &mut Project) {
     for l in p.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
         if let Some(src) = &mut l.source {
             src.reset();
+            src.hold_read_notes();
             l.dataset.features = Vec::new().into();
             l.selection.clear();
             l.touch_geometry();
@@ -1295,6 +1314,7 @@ impl Session {
             state: 0,
             states: 0,
             saved: Some(0),
+            unsaved_marks: 0,
             sources: sources::Sources::default(),
             extensions: extensions::State::default(),
             connections: connections::Connections::default(),
@@ -1326,8 +1346,10 @@ impl Session {
             notices_given: 0,
             beyond_said: None,
             crs_notes_said: Vec::new(),
+            grid_pairs: Vec::new(),
             crs_used_elsewhere: Vec::new(),
             grid_notes_checked: None,
+            unplaced_checked: Default::default(),
             grid_generation: rustgis_data::raster::crs::grid_generation(),
             grid_downloads_said: Default::default(),
             grid_turns: 0,
@@ -1389,6 +1411,7 @@ impl Session {
             started: Vec::new(),
             plugin_runs: Vec::new(),
             plugin_panels: std::collections::BTreeMap::new(),
+            panels_to_refresh: std::collections::BTreeSet::new(),
             plugin_watch: Default::default(),
             downloading: Vec::new(),
             downloaded: Vec::new(),
@@ -1432,6 +1455,8 @@ impl Session {
             tools_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
             files_ahead: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            grids_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
             zones_ahead: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1691,7 +1716,14 @@ impl Session {
     pub fn run(&mut self, id: &str, params: &Value) -> CmdResult {
         self.command_epilogue(id, params, |s| {
             let native_maintenance = s.depth == 0 && s.policy_ingress_idle();
+            // Before every command, a script's or task's too: one before it in the same script may
+            // have changed a map's projection.
+            s.note_shown_systems();
             let result = s.run_command(id, params);
+            // A command may change a map's projection, or add layers to it.
+            if s.depth == 0 {
+                s.note_shown_systems();
+            }
             // Native sessions without a drawing loop recover their own failed overviews.
             // Named callers and sealed completions do not initiate unrelated maintenance.
             if native_maintenance && s.read_in_place_again() {
@@ -1758,6 +1790,7 @@ impl Session {
             self.undo_memory.publish(&self.project, &self.undo, &self.redo);
             // And the coordinate systems that needed a missing datum grid, after every command.
             self.say_grid_notes();
+            self.say_unplaced();
             // A plugin's command waiting for its fetches answers `pending` and runs again when they
             // land: logged then, once. (Another command's `pending`, a download the web app makes, is
             // logged as it is asked for: nothing runs it again.)
@@ -2153,6 +2186,8 @@ impl Session {
         // The project's generation rolls back with it: a project opened part way (a task's step)
         // and then undone is the one before, still open.
         let opened = self.opened;
+        // The layer chosen before the command comes back with the project when it fails.
+        let open_layer = self.active_layer;
         let files = mutates.then(|| ProjectFiles {
             identity: self.file_identity,
             path: self.path.clone(),
@@ -2258,9 +2293,11 @@ impl Session {
                 // The project as it was before the command, so the layout open then, whatever
                 // the command opened on the way (a task's steps).
                 let committed = std::mem::replace(&mut self.project, snap);
+                self.keep_read_notes(&committed);
                 let sync_changed = self.keep_synced(&committed);
                 (self.trusted_tasks, self.trusted_models, self.trusted_notebooks) = trust;
                 self.active_layout = open_layout;
+                self.active_layer = open_layer;
                 // Replaced during the command: what it held beside itself (its undo history, its
                 // trust, its unsaved state) comes back with it.
                 if self.opened != opened {
@@ -2591,6 +2628,10 @@ impl Session {
                         layer.name
                     ));
                 }
+                // What else the map's reads of it lost or assumed, each kind once for its opening.
+                for note in layer.source.as_mut().map(|source| source.take_read_notes()).unwrap_or_default() {
+                    dates.push(format!("{}: {note}", layer.name));
+                }
                 if layer.source.as_mut().is_some_and(|source| source.take_display_window()) {
                     landed.push(&*layer);
                 }
@@ -2890,12 +2931,24 @@ impl Session {
             // else where to turn them on, where this front end has the setting.
             // The systems behind them, by definition, for downloading the grids a note says are missing.
             let behind = self.systems_in_use();
+            // And the direct operations between two systems a command converted between (an
+            // export from a layer's system to another), whose grids are their own.
+            let pairs: Vec<(&str, (rustgis_data::raster::Crs, rustgis_data::raster::Crs))> =
+                found.iter().filter_map(|(d, _)| Some((d.as_str(), rustgis_data::raster::crs::pair_systems(d)?))).collect();
+            for (_, pair) in &pairs {
+                if !self.grid_pairs.contains(pair) {
+                    self.grid_pairs.push(*pair);
+                }
+            }
             let mut coming: Vec<String> = Vec::new();
-            for (_, crs) in behind.iter().filter(|(def, _)| found.iter().any(|(d, _)| d == def)) {
-                for name in crate::grids::want(*crs) {
-                    if !coming.contains(&name) {
-                        coming.push(name);
-                    }
+            let wanted = behind
+                .iter()
+                .filter(|(def, _)| found.iter().any(|(d, _)| d == def))
+                .flat_map(|(_, crs)| crate::grids::want(*crs))
+                .chain(pairs.iter().flat_map(|(_, (a, b))| crate::grids::want_between(*a, *b)));
+            for name in wanted {
+                if !coming.contains(&name) {
+                    coming.push(name);
                 }
             }
             let tail = if !self.offers_grid_downloads {
@@ -2905,7 +2958,9 @@ impl Session {
                 self.sync_grid_turns();
                 self.grid_downloads_said.extend(coming.iter().cloned());
                 format!(". RustGIS is downloading {}", names_said(&coming))
-            } else if crate::grids::enabled() && found.iter().all(|(d, _)| behind.iter().any(|(b, _)| b == d)) {
+            } else if crate::grids::enabled()
+                && found.iter().all(|(d, _)| behind.iter().any(|(b, _)| b == d) || pairs.iter().any(|(p, _)| p == d))
+            {
                 ". None of the grids they need can be downloaded from PROJ's grid server now".to_string()
             } else if crate::grids::enabled() {
                 // A system only a command used (an export's target): its grids aren't asked for
@@ -2914,6 +2969,7 @@ impl Session {
             } else if behind
                 .iter()
                 .any(|(d, crs)| found.iter().any(|(f, _)| f == d) && !rustgis_data::raster::crs::missing_grids(*crs).is_empty())
+                || pairs.iter().any(|(_, (a, b))| !rustgis_data::raster::crs::missing_grids_between(*a, *b).is_empty())
             {
                 ". Settings › Datum Grids › Download Datum Grids gets them from PROJ's grid server".to_string()
             } else {
@@ -3005,16 +3061,18 @@ impl Session {
         out
     }
 
-    /// Starts downloading the datum grids the systems in use need, when downloads are on (the
+    /// Starts downloading the datum grids the systems in use need, and those of the conversions
+    /// between two systems a grid note named, when downloads are on (the
     /// setting turned on, a grid that arrived and brings up the next), and says which: the names of
     /// those on their way.
     pub fn want_grids_in_use(&mut self) -> Vec<String> {
         let mut coming: Vec<String> = Vec::new();
-        for (_, crs) in self.systems_in_use() {
-            for name in crate::grids::want(crs) {
-                if !coming.contains(&name) {
-                    coming.push(name);
-                }
+        let systems = self.systems_in_use().into_iter().flat_map(|(_, crs)| crate::grids::want(crs));
+        // And those of the conversions between two systems a note named.
+        let pairs = self.grid_pairs.iter().flat_map(|(a, b)| crate::grids::want_between(*a, *b));
+        for name in systems.chain(pairs).collect::<Vec<_>>() {
+            if !coming.contains(&name) {
+                coming.push(name);
             }
         }
         // Each grid's download said once: a later ask finds those still coming.
@@ -3034,6 +3092,83 @@ impl Session {
         if due {
             self.grid_notes_checked = Some(web_time::Instant::now());
             self.say_grid_notes();
+            self.say_unplaced();
+        }
+    }
+
+    /// Tells every map's layers the system their map draws them straight into
+    /// ([`rustgis_map::Map::note_shown_system`]): before and after each command, and each frame
+    /// of the app, which also covers layers landing from a background read.
+    pub fn note_shown_systems(&mut self) {
+        for m in &mut self.project.maps {
+            m.note_shown_system();
+        }
+    }
+
+    /// Says, once for each version of a layer's geometry (and again for a larger count, as when the
+    /// globe leaves out what a map in the layer's own system drew), that a layer held in another
+    /// system has features with a place that can't be given in longitude/latitude, which the map
+    /// and the globe draw from: they draw such a feature without that place (a line broken there, a
+    /// point not at all), and labels' lines, block diagrams and terrain water leave it out. Or that
+    /// none of the layer is drawn, when its system can't be converted. The map counts them as it
+    /// converts the layer for drawing ([`rustgis_map::Layer::unplaced`]), so it costs nothing more,
+    /// and it is said once the layer was drawn. Layers in longitude/latitude, every layer read
+    /// today, have nothing to say.
+    fn say_unplaced(&mut self) {
+        // One notice per kind, with the count and the layers it is about.
+        let (mut features, mut partly, mut undrawn) = (0usize, Vec::new(), Vec::new());
+        let mut seen = std::collections::HashSet::new();
+        for map in &self.project.maps {
+            for l in map.layers.iter().filter(|l| !l.is_raster() && l.dataset.coord_crs() != rustgis_data::raster::Crs::LonLat) {
+                seen.insert(l.instance_id());
+                let Some(count) = l.unplaced() else { continue };
+                // Said again at the same version only for a larger count: a drawing that leaves out
+                // what an earlier one drew (the globe after the layer's own system), not each time
+                // a map's projection goes back to one already said.
+                let (rev, crs) = (l.geometry_rev(), l.dataset.coord_crs());
+                let above = |said: &Result<usize, String>| match (count, said) {
+                    (Err(_), Ok(_)) => true,
+                    (Ok(n), Ok(m)) => n > m,
+                    _ => false,
+                };
+                match self.unplaced_checked.get(&l.instance_id()) {
+                    Some((r, c, said)) if (*r, *c) == (rev, crs) && !above(said) => continue,
+                    _ => {
+                        self.unplaced_checked.insert(l.instance_id(), (rev, crs, count.clone()));
+                    }
+                }
+                let named = format!("map '{}', layer '{}'", map.name, l.name);
+                match count {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        features += n;
+                        partly.push(format!("{named} ({n})"));
+                    }
+                    Err(e) => undrawn.push(format!("{named}: {e}")),
+                }
+            }
+        }
+        // Layers gone are forgotten, so the map stays as small as the project.
+        self.unplaced_checked.retain(|id, _| seen.contains(id));
+        let listed = |v: &[String]| {
+            let more = v.len().saturating_sub(10);
+            let shown = v.iter().take(10).cloned().collect::<Vec<_>>().join("; ");
+            if more > 0 { format!("{shown}; and {more} more") } else { shown }
+        };
+        if features > 0 {
+            let text = format!(
+                "{features} feature(s) have a place that can't be given in longitude/latitude: the map and the globe draw them without it, and labels' lines, block diagrams and terrain water leave them out ({})",
+                listed(&partly)
+            );
+            self.notice(text, rustgis_data::diagnostics::Severity::Warning);
+        }
+        if !undrawn.is_empty() {
+            let text = format!(
+                "{} layer(s) aren't drawn, as their system can't be given in longitude/latitude: {}",
+                undrawn.len(),
+                listed(&undrawn)
+            );
+            self.notice(text, rustgis_data::diagnostics::Severity::Warning);
         }
     }
 
@@ -3272,6 +3407,19 @@ impl Session {
         self.saved != Some(self.state)
     }
 
+    /// The archive an open project came from. This is distinct from the file Save writes.
+    pub fn opened_package(&self) -> Option<&std::path::Path> {
+        self.opened_package.as_deref()
+    }
+
+    /// Restores file provenance after the shell has opened its own private recovery copy.
+    /// The restored project has unsaved work, even when its original file still exists.
+    pub fn restore_recovery_paths(&mut self, path: Option<PathBuf>, package: Option<PathBuf>) {
+        self.path = path;
+        self.opened_package = package;
+        self.mark_unsaved();
+    }
+
     /// Which state the project is in: another after each change, an earlier one after undo. A
     /// front end compares it to tell whether the project changed since it last looked.
     pub fn state(&self) -> u64 {
@@ -3288,6 +3436,7 @@ impl Session {
     /// crash: no state of it is in a file).
     pub fn mark_unsaved(&mut self) {
         self.saved = None;
+        self.unsaved_marks = self.unsaved_marks.wrapping_add(1);
     }
 
     /// A state of the project not given before in this session, for a change just made.
@@ -3326,6 +3475,7 @@ impl Session {
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
         self.keep_headers_said(&cur);
+        self.keep_read_notes(&cur);
         self.keep_synced(&cur);
         let allocations = undo_memory::allocations(&cur);
         self.redo.push((
@@ -3365,6 +3515,7 @@ impl Session {
         self.keep_time_position(&cur);
         self.keep_tile_pick(&cur);
         self.keep_headers_said(&cur);
+        self.keep_read_notes(&cur);
         self.keep_synced(&cur);
         let allocations = undo_memory::allocations(&cur);
         self.undo.push((
@@ -3496,6 +3647,20 @@ impl Session {
                         t.headers_shown.push(address.clone());
                     }
                 }
+            }
+        }
+    }
+
+    /// After undo, redo or a rollback swaps the project: a streamed layer still on the same opening
+    /// of its source keeps what its reads have said ([`SourceLayer::keep_read_notes`]), so a note
+    /// isn't said again because a project from before it was said came back.
+    ///
+    /// [`SourceLayer::keep_read_notes`]: rustgis_map::source::SourceLayer::keep_read_notes
+    fn keep_read_notes(&mut self, before: &Project) {
+        for l in self.project.maps.iter_mut().flat_map(|m| m.layers.iter_mut()) {
+            let live = before.maps.iter().flat_map(|m| &m.layers).find(|o| o.instance_id() == l.instance_id());
+            if let (Some(source), Some(live)) = (l.source.as_mut(), live.and_then(|o| o.source.as_ref())) {
+                source.keep_read_notes(live);
             }
         }
     }

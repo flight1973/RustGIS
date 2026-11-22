@@ -839,6 +839,7 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
         copy.sync_policy_generation();
         copy.tools_ahead = Some(super::gp::Ahead::Recording(Vec::new()));
         copy.files_ahead = Some(super::gp::FilesAhead::Recording(Vec::new()));
+        copy.grids_ahead = Some(crate::image_grid::Ahead::Recording(Vec::new()));
         copy.zones_ahead = Some(super::imagery::ZonesAhead::Recording(Vec::new()));
         let _ = copy.run(command, &p);
         super::gp::ran_ahead(&mut copy)
@@ -846,34 +847,33 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// Prepares a native script's replayable prefix. Every table write must fit within that prefix;
-/// otherwise refuse before any line runs, so a desktop table edit never falls back to the frame.
-/// Restricted callers keep their existing authority and must dispatch table writes individually.
+/// Prepares a native script's replayable prefix. Grid queries and table writes must fit within it;
+/// otherwise refuse before any line runs, so neither header reads nor table edits reach the UI thread.
+/// Restricted callers keep their existing authority and dispatch those operations individually.
 pub(crate) fn script_ahead(s: &Session, p: &Value, native: bool) -> Result<Option<super::reads::ReadWork>, String> {
     let Some(script) = ps(p, "script") else { return Ok(None) };
     let Ok(lines) = script_commands(script) else { return Ok(None) };
     let table = |id: &str, p: &Value| super::edit::table_edit_in_background(id).is_some() && p.get("table").is_some_and(|t| !t.is_null());
-    if lines.iter().any(|(_, id, p)| table(id, p)) {
+    if lines.iter().any(|(_, id, p)| table(id, p) || id == "raster.imageGrid") {
         if !native {
             return Err(
-                "this script cannot prepare table writes under its current permissions: run the table edit commands directly".into()
+                "this script cannot prepare queries or table writes under its current permissions: run those commands directly".into()
             );
         }
-        check_table_prefix(s, &lines)?;
+        check_prepared_prefix(s, &lines)?;
     }
     let Some((_, id, params)) = lines.first() else { return Ok(None) };
     Ok((native && runs_on_a_copy(s, id, params)).then(|| ahead_on_copy(s, SCRIPT_AHEAD, p)))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// Refuses an unrecordable prefix before any live line can run ahead of a table write. Inspect
+/// Refuses an unrecordable prefix before live lines can precede a grid query or table write. Inspect
 /// model tool metadata too: their command id alone does not reveal file-producing or plugin steps.
 /// Recheck at landing, since a named model may have changed while the script worker ran.
-fn check_table_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Result<(), String> {
-    let Some(last) = lines
-        .iter()
-        .rposition(|(_, id, p)| super::edit::table_edit_in_background(id).is_some() && p.get("table").is_some_and(|t| !t.is_null()))
-    else {
+fn check_prepared_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Result<(), String> {
+    let Some(last) = lines.iter().rposition(|(_, id, p)| {
+        id == "raster.imageGrid" || (super::edit::table_edit_in_background(id).is_some() && p.get("table").is_some_and(|t| !t.is_null()))
+    }) else {
         return Ok(());
     };
     let recordable_tool = |id: &str| {
@@ -894,7 +894,7 @@ fn check_table_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Result<(
         };
         if !nested || !runs_on_a_copy(s, id, p) {
             return Err(format!(
-                "line {n} ({id}) cannot be prepared before the table writes: run the setup and table writes as separate scripts"
+                "line {n} ({id}) cannot be prepared before the queries or table writes: run the setup and prepared commands as separate scripts"
             ));
         }
     }
@@ -944,6 +944,9 @@ pub(crate) const ON_A_COPY: &[&str] = &[
 /// other line stops the copy there, Add Data and Load All among them (they would read their
 /// files and servers twice).
 fn runs_on_a_copy(s: &Session, id: &str, params: &Value) -> bool {
+    if id == "raster.imageGrid" {
+        return true; // Header results are recorded on the worker and consumed once at landing.
+    }
     if super::edit::table_edit_in_background(id).is_some() {
         return params.get("table").is_some_and(|t| !t.is_null()) && params.get("layer").is_none_or(Value::is_null);
     }
@@ -1109,7 +1112,7 @@ fn run_script_here(s: &mut Session, p: &Value, prepared: bool) -> CmdResult {
     let lines = script_commands(script)?;
     #[cfg(not(target_arch = "wasm32"))]
     if prepared {
-        check_table_prefix(s, &lines)?;
+        check_prepared_prefix(s, &lines)?;
     }
     let mut out = Vec::new();
     for (n, id, params) in lines {
@@ -1567,8 +1570,21 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     // Features without a place or a number are left out, and said (by kind, with a count).
     let (mut no_point, mut no_value) = (0usize, 0usize);
     let mut pts: Vec<(Coord, f64)> = Vec::with_capacity(ds.features.len());
+    // Each place in longitude/latitude, whatever system the layer holds its coordinates in; one
+    // that can't be given there has no place. A point is converted alone; any other shape is
+    // converted first, so its label point (a polygon's centroid) is the one it has in
+    // longitude/latitude, not the one in the layer's own system. A shape with a place that can't
+    // be converted gives its label point in its own system, converted, as long as that converts.
+    let to = ds.lonlat_conversion()?;
+    let place = |g: &Geometry| match g {
+        Geometry::Point(c) => to.point(*c),
+        g => match Dataset::converted_to_lonlat(&to, g) {
+            Some(g) => g.label_point(),
+            None => g.label_point().and_then(|c| to.point(c)),
+        },
+    };
     for (r, ft) in ds.features.iter().enumerate() {
-        let Some(c) = ft.geometry.as_ref().and_then(|g| g.label_point()).filter(|c| c.is_finite()) else {
+        let Some(c) = ft.geometry.as_ref().and_then(place).filter(|c| c.is_finite()) else {
             no_point += 1;
             continue;
         };
@@ -1704,8 +1720,13 @@ fn route(s: &mut Session, p: &Value) -> CmdResult {
         rustgis_map::rows::Rows::All => (0..l.dataset.features.len()).collect(),
         rustgis_map::rows::Rows::Subset(rows) => rows,
     };
-    let r = network::shortest_route(
+    // The network in longitude/latitude, as `from` and `to` are, whatever system the layer holds
+    // its coordinates in: converted only when its graph is built, which is kept for the layer's
+    // rows, so routes over a held network reuse it as they do over one in longitude/latitude.
+    let system = (l.dataset.coord_crs(), l.dataset.crs);
+    let r = network::shortest_route_held(
         &l.dataset,
+        || l.dataset.in_lonlat(),
         &rows,
         point(p, "from")?,
         point(p, "to")?,
@@ -1716,6 +1737,7 @@ fn route(s: &mut Session, p: &Value) -> CmdResult {
     let mut ds =
         Dataset::new(name, GeometryType::Polyline, vec![Field::new("length_km", FieldType::Double), Field::new("cost", FieldType::Double)]);
     ds.push(Some(Geometry::Line(vec![r.path.clone()])), vec![Attr::Float(r.length_m / 1000.0), Attr::Float(r.cost)]);
+    hold_as(s, &mut ds, system)?;
     let nid = super::layer::add_dataset(s, ds);
     if let Some(notice) = query_notice {
         s.notify_text(notice, false);
@@ -1830,6 +1852,10 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
         rustgis_map::rows::Rows::All => (0..l.dataset.features.len()).collect(),
         rustgis_map::rows::Rows::Subset(rows) => rows,
     };
+    // Placed in longitude/latitude, whatever system the polygons' layer holds its coordinates in,
+    // then held in that system, as the polygons are.
+    let polygons = l.dataset.in_lonlat()?;
+    let system = (l.dataset.coord_crs(), l.dataset.crs);
     let seed = f(p, "seed").map_or(42, |v| v.max(0.0) as u64);
     let pts: Vec<(usize, Coord)> = match ps(p, "field") {
         Some(fname) => {
@@ -1839,7 +1865,7 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
             let mut out = Vec::new();
             for r in &rows {
                 let n = (l.dataset.value(*r, fi).as_f64().unwrap_or(0.0) * rate).round().clamp(0.0, 100_000.0) as usize;
-                out.extend(network::random_points(&l.dataset, &[*r], n, seed.wrapping_add(*r as u64)));
+                out.extend(network::random_points(&polygons, &[*r], n, seed.wrapping_add(*r as u64)));
                 if out.len() > 1_000_000 {
                     return Err("that would make more than a million points; lower the rate".into());
                 }
@@ -1851,7 +1877,7 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
             if rows.len().saturating_mul(per) > 1_000_000 {
                 return Err("that would make more than a million points; lower the count".into());
             }
-            network::random_points(&l.dataset, &rows, per, seed)
+            network::random_points(&polygons, &rows, per, seed)
         }
     };
     let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new("polygon", FieldType::Integer)]);
@@ -1859,11 +1885,31 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
         ds.push(Some(Geometry::Point(*c)), vec![Attr::Int(*r as i64)]);
     }
     let n = ds.features.len();
+    hold_as(s, &mut ds, system)?;
     if let Some(notice) = query_notice {
         s.notify_text(notice, false);
     }
     let nid = super::layer::add_dataset(s, ds);
     Ok(json!({"layer": nid, "points": n}))
+}
+
+/// Holds `ds`, a layer made in longitude/latitude from another, as that layer is
+/// ([`Dataset::hold_as`]; `system` is its [`Dataset::coord_crs`] and [`Dataset::crs`]), and says
+/// so when it can't be: it stays in longitude/latitude then, as it was made. A cancel stops the
+/// command, which adds nothing.
+pub(crate) fn hold_as(
+    s: &mut Session,
+    ds: &mut Dataset,
+    (held, crs): (rustgis_data::raster::Crs, Option<rustgis_data::raster::Crs>),
+) -> Result<(), String> {
+    match ds.hold_as(held, crs) {
+        Err(e) if matches!(rustgis_data::DataError::of_conversion(e.clone()), rustgis_data::DataError::Cancelled) => Err(e),
+        Err(e) => {
+            s.notify(format!("{}: kept in longitude/latitude, as it was made, not in {}: {e}", ds.name, held.label()), false);
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
@@ -2091,14 +2137,16 @@ fn converted(ds: &Dataset, p: &Value) -> Result<(String, Vec<String>), String> {
     let name_field =
         ps(p, "nameField").and_then(|n| ds.field_index(n)).or_else(|| ds.fields.iter().position(|f| f.name.eq_ignore_ascii_case("name")));
     let format = conversion_format(p)?;
+    // Every format here is longitude/latitude, whatever system the layer holds its coordinates
+    // in; the notes below read the layer itself, converting as they need.
+    let lonlat = ds.in_lonlat()?;
     let text = match format {
-        "geojson" => rustgis_data::io::to_geojson_text(ds).map_err(|e| e.to_string())?,
-        "csv" => rustgis_data::io::to_csv(ds).map_err(|e| e.to_string())?,
-        "kml" => rustgis_data::interop::to_kml(ds, name_field).map_err(|e| e.to_string())?,
-        "gpx" => rustgis_data::interop::to_gpx(ds, name_field).map_err(|e| e.to_string())?,
-        _ => rustgis_data::interop::to_wkt_csv(ds).map_err(|e| e.to_string())?,
+        "geojson" => rustgis_data::io::to_geojson_text(&lonlat).map_err(|e| e.to_string())?,
+        "csv" => rustgis_data::io::to_csv(&lonlat).map_err(|e| e.to_string())?,
+        "kml" => rustgis_data::interop::to_kml(&lonlat, name_field).map_err(|e| e.to_string())?,
+        "gpx" => rustgis_data::interop::to_gpx(&lonlat, name_field).map_err(|e| e.to_string())?,
+        _ => rustgis_data::interop::to_wkt_csv(&lonlat).map_err(|e| e.to_string())?,
     };
-    // Every format here is longitude/latitude.
     let target = ps(p, "path").unwrap_or(&ds.name);
     let mut notes = rustgis_data::export_notes([(ds, ds.lonlat_extent())], target, rustgis_data::raster::Crs::LonLat);
     // CSV holds a point a row, GPX a name for each feature and no areas; reading text back trims it or reads blanks as null.

@@ -18,7 +18,7 @@ use egui::{Id, Ui};
 use rustgis_engine::Quotes;
 use rustgis_engine::cmd::workflows::refused_in_script;
 
-use crate::completion::{Asked, Before, GAP, Keyed, List, Offered, Tip, Worked, byte_at, char_at, pairs};
+use crate::completion::{Asked, Before, GAP, Keyed, List, Offered, Side, Tip, Worked, byte_at, char_at, pairs};
 
 /// The fewest characters typed before ids are offered (one would offer most of them).
 const MIN_TYPED: usize = 2;
@@ -1535,7 +1535,7 @@ pub fn hint(ui: &Ui, box_id: Id, out: &TextEditOutput, visible: egui::Rect, scri
     if call.is_none() {
         let rows = help.as_ref().map_or(0, |(_, help)| help.params.len() + 3);
         let about = help.as_ref().map(|(h, _)| (h.clone(), h.brace));
-        state.hint.tip.show(ui, box_id.with("complete_hint"), out, visible, at, about, rows, |ui, width| {
+        state.hint.tip.show(ui, box_id.with("complete_hint"), out, visible, at, about, rows, Side::Below, |ui, width| {
             if let Some((_, help)) = &help {
                 draw_help(ui, help, width);
             }
@@ -1543,7 +1543,7 @@ pub fn hint(ui: &Ui, box_id: Id, out: &TextEditOutput, visible: egui::Rect, scri
     }
     let about = call.as_ref().map(|(open, _)| (*open, *open));
     let rows = crate::exprcomplete::TIP_ROWS;
-    state.hint.call.show(ui, box_id.with("complete_call"), out, visible, at, about, rows, |ui, width| {
+    state.hint.call.show(ui, box_id.with("complete_call"), out, visible, at, about, rows, Side::Below, |ui, width| {
         if let Some((_, call)) = &call {
             crate::exprcomplete::draw_call(ui, call, width);
         }
@@ -2889,6 +2889,38 @@ mod tests {
         let offer = unasked(&s, head.chars().count() + 5, &[], &app.session).unwrap();
         let (new, _) = super::accepted(&s, &offer, "pop_est", &app.session).unwrap();
         assert_eq!(new, format!(r#"{head}"pop_est > 1", "mode": "new"}}"#), "mid string: the rest is left");
+    }
+
+    /// In the string of an expression, a text compared with a field of the line's layer lists
+    /// that field's values, as an expression box does, and the one taken goes in with its quotes.
+    #[test]
+    fn a_fields_values_are_offered_in_an_expressions_string() {
+        let app = crate::RustGisApp::with_sample();
+        let layer = app.session.map().layer_by_name("Countries").unwrap();
+        let ds = &layer.dataset;
+        let (i, field) = ds.fields.iter().enumerate().find(|(_, f)| f.ty == rustgis_engine::data::FieldType::Text).unwrap();
+        let value = rustgis_engine::data::query::field_values(ds, i, 100)
+            .values
+            .into_iter()
+            .find(|v| v.text.chars().all(char::is_alphanumeric))
+            .unwrap();
+        let (value, name) = (value.text, crate::exprcomplete::field_ref(&field.name).replace('"', "\\\""));
+        let typed: String = value.chars().take(1).collect();
+        let s = format!(r#"select.byAttributes {{"layer": "Countries", "where": "{name} = '{typed}"#);
+        let offer = unasked(&s, s.chars().count(), &[], &app.session).unwrap();
+        assert!(offer.items.iter().any(|v| *v == format!("'{value}'")), "{:?}", offer.items);
+        let (new, _) = super::accepted(&s, &offer, &format!("'{value}'"), &app.session).unwrap();
+        assert_eq!(new, format!(r#"select.byAttributes {{"layer": "Countries", "where": "{name} = '{value}'"#));
+        // A value holding a `"` and a `'` goes in escaped as the string's text.
+        let field = field.name.clone();
+        let mut app = app;
+        app.run("edit.setValue", serde_json::json!({"layer": "Countries", "row": 0, "field": field, "value": "Say \"hi\" o'k"})).unwrap();
+        let s = format!(r#"select.byAttributes {{"layer": "Countries", "where": "{name} = 'Say"#);
+        let offer = unasked(&s, s.chars().count(), &[], &app.session).unwrap();
+        let item = "'Say \"hi\" o''k'";
+        assert!(offer.items.iter().any(|v| v == item), "{:?}", offer.items);
+        let (new, _) = super::accepted(&s, &offer, item, &app.session).unwrap();
+        assert_eq!(new, format!(r#"select.byAttributes {{"layer": "Countries", "where": "{name} = 'Say \"hi\" o''k'"#));
     }
 
     /// In a `gp.run` line's `"params"`, the keys of the tool it runs (by id or name, case aside,

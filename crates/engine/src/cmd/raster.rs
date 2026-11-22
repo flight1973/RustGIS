@@ -33,8 +33,11 @@ pub(crate) fn need_raster(s: &Session) -> Option<&'static str> {
 
 pub fn commands() -> Vec<C> {
     vec![
+        C::new("raster.imageGrid", "Original Image Grid", "Analyze › Annotate", crate::image_grid::query)
+            .inputs(crate::cmd::Inputs::single_layer).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view()
+            .params(r#"{"layer"?:name|id}"#),
         C::new("layer.addDataBytes", "Add Data (from file contents)", "Home › Add", add_bytes::<MAX_UPLOAD_BYTES>).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"fileName": "name.tif|.tiff|.asc|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k|.dxf|.pdf (JPEG 2000: desktop, through GDAL; PDF: desktop, command line and Python)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name, or a PDF's page number (the first when left out or blank)", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "blocks"?, "stream"?, "as"? (as layer.addData)}"#),
+            .params(r#"{"fileName": "name.tif|.tiff|.asc|.grb|.grib|.grb2|.grib2 (GRIB)|.geojson|.csv|.zip|.kml|.kmz|.gpx|.parquet|.fgb|.gpkg|.mbtiles|.jp2|.j2k|.dxf|.pdf (JPEG 2000: desktop, through GDAL; PDF: desktop, command line and Python)", "data": base64, "zoom"?: bool, "layer"?: "one layer of a zip, KML or GPX by name, or a PDF's page number (the first when left out or blank)", "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"?, "paperSpace"?, "blocks"?, "stream"?, "as"? (as layer.addData)}"#),
         C::new("raster.symbology", "Symbology", "Style › Rendering", symbology).when(need_raster).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layer"?, "type": "stretch"|"rgb"|"classify"|"unique"|"colormap"|"shadedRelief", "band"?: 1.., "ramp"?, "invert"?: bool, "classes"?: 1..32, "method"?, "azimuth"?, "altitude"?, "zFactor"?, "shadow"?: 0..1 (shadedRelief: how dark the shadows the terrain casts are; left out, kept; 0 casts none), "sky"?: 0..1 (shadedRelief: how much the share of the sky each cell sees dims its ambient light; left out, kept; 0 leaves it whole), "fill"?: 0..1 (shadedRelief: a fill light from the side opposite the sun that lightens the slopes turned toward it; left out, kept; 0 has none), "ambient"?: 0..1|null (shadedRelief: the share of the colour a slope turned fully from the sun keeps; left out, kept; null, the default: 0.25, or 0.5 balanced), "balanced"?: bool (shadedRelief: flat ground keeps the ramp's colour and slopes facing the sun brighten, up to 1.3; left out, kept; false, the default, lights as before), "rock"?: {"from"?: 0..90, "to"?: 0..90, "color"?: #RRGGBB} | false (shadedRelief: steep slopes tinted toward a rock colour before the light, from the ground's own slope in degrees, without the Z factor: the ramp below from, the colour above to, blended between; left out, kept; an object's missing keys keep the current rock's, or 25, 40 and #B2ACA4; false or null removes it), "grey"?: bool (shadedRelief without its colour ramp)}"#,
         ),
@@ -598,26 +601,29 @@ pub(crate) fn pdf_page(path: &str, p: &Value) -> Result<Option<String>, String> 
     }
 }
 
-/// Whether a whole file downloaded from `url` is a PDF page to draw off the frame before it is
-/// added (`layer.addDownload` with `p`): its file name, page and whether it is placed by its
-/// coordinates (not `"as": "scan"`). `None` for anything else, or a page that can't be read here,
-/// which `layer.addDownload` reads (or refuses) as it adds it.
+/// Whether a whole file downloaded from `url` is read off the frame before it is added
+/// (`layer.addDownload` with `p`): a PDF's page to draw, or a GRIB file (whose fields can be
+/// many). Its file name, page and whether it is placed by its coordinates (not `"as": "scan"`).
+/// `None` for anything else, or a page that can't be read here, which `layer.addDownload` reads
+/// (or refuses) as it adds it.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn download_page(url: &str, p: &Value, bytes: &[u8]) -> Option<(String, Option<String>, bool)> {
     let plain = ["service", "coverage", "geolibreProject", "geolibreLayer"]
         .iter()
         .all(|k| p.get(k).is_none_or(|v| v.is_null() || v.as_bool() == Some(false)));
-    if !raster::PDF_PAGES || !plain {
+    if !plain {
         return None;
     }
-    let name = super::layer::url_file_name(url, bytes).ok().filter(|n| raster::is_pdf_name(n))?;
+    let name = super::layer::url_file_name(url, bytes)
+        .ok()
+        .filter(|n| (raster::PDF_PAGES && raster::is_pdf_name(n)) || raster::grib::is_grib_name(n))?;
     let page = pdf_page(&name, p).ok()?;
     let scan = wants_scan(p, &name).ok()?;
     Some((name, page, !scan))
 }
 
-/// Draws a downloaded PDF's page off the frame ([`download_page`]), for
-/// [`crate::Session::download_landed_page`].
+/// Draws a downloaded PDF's page, or reads a downloaded GRIB file, off the frame
+/// ([`download_page`]), for [`crate::Session::download_landed_page`].
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_download_page(name: &str, bytes: &[u8], page: Option<&str>, place: bool) -> Result<Raster, String> {
     raster::read_bytes_page(name, bytes, page, place).map_err(|e| format!("{name}: {e}"))
@@ -1235,9 +1241,22 @@ fn geotiff_note(r: &Raster, bi: usize, cog: bool, band_hint: &str) -> Result<Str
 
 /// Pixel values of the topmost visible raster under a longitude/latitude point.
 pub fn identify(s: &Session, lon: f64, lat: f64) -> Option<Value> {
+    pixels_at(s, lon, lat, |_| true, true).into_iter().next().map(|(_, v)| v)
+}
+
+/// The pixel values under a longitude/latitude point of each visible raster `keep` takes that has
+/// a value there, with the raster's index in the map's layers, the one drawn on top first (the
+/// map's drawing order, a higher depth priority above whatever the order); with `first`, the
+/// topmost raster's alone. Identify ranks them with the features by that order (#2488).
+pub fn pixels_at(s: &Session, lon: f64, lat: f64, keep: impl Fn(&rustgis_map::Layer) -> bool, first: bool) -> Vec<(usize, Value)> {
     let scale = s.scale();
     let c = rustgis_geom::Coord::new(lon, lat);
-    s.map().layers.iter().filter(|l| s.map().draws_at(l, scale)).find_map(|l| {
+    let map = s.map();
+    let drawn = map.draw_order().into_iter().filter_map(|d| match d {
+        rustgis_map::Drawn::Layer(i) => Some((i, map.layers.get(i)?)),
+        rustgis_map::Drawn::Tile(_) => None,
+    });
+    let pixels = drawn.filter(|(_, l)| l.is_raster() && keep(l) && map.draws_at(l, scale)).filter_map(|(i, l)| {
         let r = l.raster.as_ref()?.data.as_ref()?;
         let (col, row) = r.pixel_at(c)?;
         let vals: Vec<Option<f32>> = (0..r.band_count()).map(|b| r.value(b, col, row)).collect();
@@ -1249,8 +1268,9 @@ pub fn identify(s: &Session, lon: f64, lat: f64) -> Option<Value> {
             attrs.insert(b.name.clone(), json!(v.map(|v| rustgis_map::symbology::fmt_num(v as f64)).unwrap_or_else(|| "NoData".into())));
         }
         attrs.insert("Pixel".into(), json!(format!("{col}, {row}")));
-        Some(json!({"layer": l.name, "layerId": l.id, "raster": true, "attributes": attrs}))
-    })
+        Some((i, json!({"layer": l.name, "layerId": l.id, "raster": true, "attributes": attrs})))
+    });
+    if first { pixels.take(1).collect() } else { pixels.collect() }
 }
 
 /// Binds the primary raster and optional actual like raster without copying pixel data.

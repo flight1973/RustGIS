@@ -13,9 +13,11 @@ use rustgis_map::{Camera, Map, Rgba};
 use rustgis_tiles::cache::{self, Payload, State, Want};
 use rustgis_tiles::template::{self, TileId};
 
+mod outline;
 mod water;
 
-pub(crate) use water::{Glint, Water, paint_shore};
+pub use outline::Outline;
+pub(crate) use water::{Glint, SHORE_PX, Water, paint_shore};
 
 /// Cells along each side of a tilted view's band laid over the relief while the map moves (the
 /// drape, `tilt_drape` in the app): few enough to lay out every frame.
@@ -97,7 +99,7 @@ enum Heights {
 
 /// A map's block diagram as a frame draws it (#1914, `TerrainBlock`): the box the ground is cut
 /// to (Web Mercator) and the height of its base.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Block {
     pub x0: f64,
     pub y0: f64,
@@ -113,6 +115,9 @@ pub struct Block {
     /// A round block (#2318): its circle's centre and radius (Web Mercator), the box above being
     /// the one round it. None: the box.
     pub circle: Option<(Coord, f64)>,
+    /// A block cut to polygons (#2318): their outline, the box above being the one round it.
+    /// None: the box, or the circle.
+    pub outline: Option<Arc<Outline>>,
 }
 
 impl Block {
@@ -165,6 +170,12 @@ impl Ground {
     /// their shapes alone: nothing is read, no elevation tile asked for. 0 without water.
     pub fn water_coarse_unread(map: &Map, camera: &Camera) -> usize {
         Ground::heights_of(map, camera).map_or(0, |g| water::coarse_shores(map, camera, &g))
+    }
+
+    /// Whether a view of `camera` has terrain on `map` ([`Ground::of`] is `Some`), without reading
+    /// its water.
+    pub(crate) fn has_heights(map: &Map, camera: &Camera) -> bool {
+        Ground::heights_of(map, camera).is_some()
     }
 
     /// [`Ground::of`] without its water.
@@ -259,6 +270,11 @@ impl Ground {
         per_unit(m, self.body)
     }
 
+    /// How much the heights are stretched (`Terrain::exaggeration`, as read).
+    pub(crate) fn exaggeration(&self) -> f64 {
+        self.exaggeration
+    }
+
     /// Where the Web Mercator point `m` falls on the ground's grid, in its cells (column, row):
     /// a DEM's pixels; elevation tiles' pixels at the zoom read. `None` off the DEM's plane.
     pub fn grid_point(&self, m: Coord) -> Option<(f64, f64)> {
@@ -337,9 +353,11 @@ impl Ground {
     }
 
     /// The block diagram `map`'s terrain is cut to, when it has one: its box (the DEM's extent
-    /// when none is given; none over elevation tiles then) or the circle in it, and its base
-    /// `depth` metres below the lowest ground read in it (on a grid of [`BLOCK_SAMPLES`] cells a
-    /// side, inside the circle for a round block; where a DEM has no
+    /// when none is given; none over elevation tiles then) or the circle in it, or the outline of
+    /// its polygons ([`Outline::of`]; none when they can't be read) and the box round it, and its
+    /// base `depth` metres below the lowest ground read in it (on a grid of [`BLOCK_SAMPLES`]
+    /// cells a side, inside the circle or the outline, and at the outline's corners; where a DEM
+    /// has no
     /// height, 0, as the ground is drawn there; while elevation tiles are on their way, not
     /// [`Block::settled`]), or
     /// half its relief, at least `BLOCK_MIN_DEPTH`, both exaggerated as the heights are.
@@ -349,7 +367,11 @@ impl Ground {
     /// base, which a coarser tile serves.
     pub fn block(&self, map: &Map) -> Option<Block> {
         let b = map.view.terrain.as_ref()?.block.as_ref()?;
-        let [x0, y0, x1, y1] = match (b.extent, &self.heights) {
+        let outline = match &b.shape {
+            rustgis_map::view::BlockShape::Polygon { layer, filter } => Some(Outline::of(map, layer, filter.as_deref())?),
+            _ => None,
+        };
+        let [x0, y0, x1, y1] = match (b.extent.or(outline.as_ref().map(|o| o.extent())), &self.heights) {
             (Some(e), _) => e,
             (None, Heights::Raster { raster, .. }) => raster_box(raster)?,
             (None, Heights::Tiles { .. }) => return None,
@@ -357,7 +379,7 @@ impl Ground {
         // A round block (#2318): the largest circle in the box, or a smaller one, centred in it;
         // the box is then the one round the circle.
         let circle = match b.shape {
-            rustgis_map::view::BlockShape::Box => None,
+            rustgis_map::view::BlockShape::Box | rustgis_map::view::BlockShape::Polygon { .. } => None,
             rustgis_map::view::BlockShape::Circle { radius } => {
                 let r = (x1 - x0).min(y1 - y0) / 2.0;
                 Some((Coord::new((x0 + x1) / 2.0, (y0 + y1) / 2.0), radius.map_or(r, |q| q.min(r))))
@@ -383,10 +405,21 @@ impl Ground {
         };
         let n = BLOCK_SAMPLES as f64;
         let (mut lo, mut hi, mut missing) = (f64::INFINITY, f64::NEG_INFINITY, false);
-        for (i, j) in (0..=BLOCK_SAMPLES).flat_map(|j| (0..=BLOCK_SAMPLES).map(move |i| (i as f64, j as f64))) {
-            let m = Coord::new(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * j / n);
-            // A round block's ground off its circle isn't drawn, so doesn't set its base.
+        // A thin polygon can slip between the grid's points: its corners count too (a few
+        // hundred of them, and each ring's first, so a small ring is never left out).
+        let corners = outline.iter().flat_map(|o| {
+            let step = (o.sides().len() / (4 * BLOCK_SAMPLES)).max(1);
+            o.sides().iter().enumerate().filter(move |(i, s)| i % step == 0 || s.along == 0.0).map(|(_, s)| s.a)
+        });
+        let grid = (0..=BLOCK_SAMPLES).flat_map(|j| (0..=BLOCK_SAMPLES).map(move |i| (i as f64, j as f64)));
+        let grid = grid.map(|(i, j)| (Coord::new(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * j / n), false));
+        for (m, on_outline) in grid.chain(corners.map(|m| (m, true))) {
+            // A round block's ground off its circle isn't drawn, so doesn't set its base; nor
+            // ground off a polygon block's outline.
             if circle.is_some_and(|(c, r)| (m.x - c.x).hypot(m.y - c.y) > r * (1.0 + 1e-9)) {
+                continue;
+            }
+            if !on_outline && outline.as_ref().is_some_and(|o| !o.contains(m)) {
                 continue;
             }
             match sample(m) {
@@ -409,7 +442,7 @@ impl Ground {
             Some(d) => d * self.exaggeration,
             None => (0.5 * (hi - lo)).max(rustgis_map::view::BLOCK_MIN_DEPTH * self.exaggeration),
         };
-        Some(Block { x0, y0, x1, y1, base: lo - depth, settled, walls: b.walls, circle })
+        Some(Block { x0, y0, x1, y1, base: lo - depth, settled, walls: b.walls, circle, outline })
     }
 
     /// Whether elevation tiles are still on their way (drawing again later shows more).
@@ -648,6 +681,7 @@ mod tests {
             depth: Some(1000.0),
             walls: rustgis_map::view::BLOCK_WALLS,
             walls_layer: None,
+            water: None,
             shape: rustgis_map::view::BlockShape::Box,
         };
         m.view.terrain = Some(rustgis_map::view::Terrain {
@@ -692,6 +726,7 @@ mod tests {
             depth: Some(300.0),
             walls: rustgis_map::view::BLOCK_WALLS,
             walls_layer: None,
+            water: None,
             shape: rustgis_map::view::BlockShape::Box,
         };
         m.view.terrain = Some(rustgis_map::view::Terrain {

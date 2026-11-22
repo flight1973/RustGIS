@@ -28,10 +28,10 @@ use serde::Serialize;
 
 use crate::Rgba;
 use crate::effects::Blend;
-use crate::symbology::{Labeling, LineStroke, MarkerRotation, Renderer};
+use crate::symbology::{Labeling, LineStroke, MarkerRotation, Picture, Renderer};
 pub use annotation::{Annotation, MAX_ITEMS as MAX_ANNOTATIONS};
 pub use expr::{reads_measure, to_sql};
-pub use source::{MAX_MEMORY_FIELDS, Source, VirtualFrom, is_drive_relative, is_relative};
+pub use source::{MAX_MEMORY_FIELDS, Source, VirtualFrom, WebOptions, is_drive_relative, is_relative};
 pub use structure::{MAX_BOOKMARKS, MAX_RELATIONS, ProjectBookmark, ProjectRelation};
 
 /// The most XML nodes a project or style is read with (a large project's file is some hundred
@@ -56,7 +56,19 @@ pub struct Report {
     /// thousands of different notes, and a repeat is found without going through them all.
     #[serde(skip)]
     index: HashMap<(String, NoteKind, String), usize>,
+    /// Raster image markers' images by their `imageFile`, read before the symbols showing them
+    /// (`symbol::read_images`): each kept picture with its height over its width, or why it isn't
+    /// drawn. Carried here because every symbol reader already takes the report; passing them
+    /// beside it would add a parameter to each reader and to each of their callers.
+    #[serde(skip)]
+    images: HashMap<String, Result<(Picture, f32), String>>,
 }
+
+/// Reads a raster image marker's image for the importer, which opens no file itself: given its
+/// `base64:` text or its file's path (made absolute from the project's folder), the image as
+/// base64 and its height over its width, or why it isn't drawn, as the end of a note's
+/// "raster image markers …, drawn as circles" (such as "whose file doesn't open").
+pub type ReadImage<'a> = dyn FnMut(&str) -> Result<(String, f32), &'static str> + 'a;
 
 /// One thing an import couldn't carry over as QGIS has it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -97,6 +109,12 @@ impl Report {
 
     pub fn skipped(&mut self, layer: &str, text: impl Into<String>) {
         self.note(layer, NoteKind::Skipped, text);
+    }
+
+    /// How many times `text` was noted for `layer`.
+    fn noted(&self, layer: &str, kind: NoteKind, text: &str) -> usize {
+        let key = (layer.to_string(), kind, text.to_string());
+        self.index.get(&key).and_then(|&i| self.notes.get(i)).map_or(0, |n| n.count)
     }
 
     /// Withdraws a provisional note once checking against the destination fields disproves it.
@@ -493,13 +511,15 @@ pub struct ProjectLayer {
 }
 
 /// Reads a QGIS project. `dir` is the folder the project is in, which its relative paths start
-/// from. Notes on what can't be carried over go to `report`.
-pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Project, String> {
+/// from; `images` reads its raster image markers' images. Notes on what can't be carried over go
+/// to `report`.
+pub fn read_project(text: &str, dir: &str, images: &mut ReadImage, report: &mut Report) -> Result<Project, String> {
     let doc = parse(text, "a QGIS project")?;
     let root = doc.root_element();
     if !root.has_tag_name("qgis") {
         return Err("not a QGIS project (.qgs): its root element isn't <qgis>".into());
     }
+    symbol::read_images(root, dir, images, report);
     // The main map canvas: its view, and (before QGIS 3) the project's coordinate system.
     let canvas = root.children().find(|c| c.has_tag_name("mapcanvas") && c.attribute("name").is_none_or(|n| n == "theMapCanvas"));
     let crs = child(root, "projectCrs")
@@ -602,6 +622,11 @@ pub fn read_project(text: &str, dir: &str, report: &mut Report) -> Result<Projec
         let kind = ml.attribute("type").unwrap_or_default().to_string();
         let vector = kind == "vector";
         let definition_query = definition_query(&source, &name, "subset string", report);
+        if definition_query.is_some()
+            && let Source::File { path, subset: Some(q), .. } = &source
+        {
+            note_matching(&name, "its filter (subset string)", &[(q, dialect(path, &provider))], report);
+        }
         let style = read_style_node(ml, &name, report);
         let annotations = if kind == "annotation" { annotation::read(ml, dir, &name, report) } else { Vec::new() };
         layers.push((
@@ -659,12 +684,40 @@ fn definition_query(source: &Source, name: &str, what: &str, report: &mut Report
     }
 }
 
+/// The dialect of a file's filter: SQLite's for the `spatialite` provider, a GeoPackage or a
+/// SQLite database, OGR SQL's for the rest.
+fn dialect(path: &str, provider: &str) -> expr::Dialect {
+    // An `ogr` SpatiaLite file is told by its extension; one named otherwise reads as OGR SQL's.
+    let ext = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    if provider == "spatialite" || matches!(ext.as_str(), "gpkg" | "sqlite" | "sqlite3" | "db" | "spatialite") {
+        expr::Dialect::Sqlite
+    } else {
+        expr::Dialect::Ogr
+    }
+}
+
+/// Notes, once for `layer`, where `filters` (each read under its dialect) match otherwise in
+/// RustGIS than in QGIS. `what` names them: "its filter (subset string)", "its rules".
+fn note_matching(layer: &str, what: &str, filters: &[(&str, expr::Dialect)], report: &mut Report) {
+    if filters.iter().any(|(f, d)| expr::case_differs(f, *d)) {
+        report.approximated(layer, format!("{what}, matching text ignoring letter case where QGIS tells case apart"));
+    }
+    if filters.iter().any(|(f, _)| expr::null_in_not_in(f)) {
+        report.approximated(
+            layer,
+            format!("{what}, whose NOT IN list holds NULL: RustGIS skips the NULL, so it matches the features QGIS takes as unknown"),
+        );
+    }
+}
+
 /// Virtual layers that select every column of one layer, with or without a `WHERE` clause, read
 /// as that layer's file with the clause as its filter (with the layer's own filter too, when it
 /// is another of the project's layers). A virtual layer on another such one is read once that
 /// one is, whatever their order, up to [`MAX_VIRTUAL_CHAIN`] deep. The rest are left as they are,
 /// for the import to note.
 fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
+    // The parts (filter, dialect) of each virtual layer read so far, by id, for one on it to carry.
+    let mut chained: std::collections::HashMap<String, Vec<(String, expr::Dialect)>> = std::collections::HashMap::new();
     for _ in 0..MAX_VIRTUAL_CHAIN {
         let mut changed = false;
         for i in 0..layers.len() {
@@ -694,6 +747,17 @@ fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
                 q => (q.clone(), false),
             };
             let filter = filter.clone();
+            // The parts of the layer below, when it is a virtual one read before; else its filter.
+            let below = match from {
+                source::VirtualFrom::Layer(id) => chained.get(id).cloned(),
+                _ => None,
+            };
+            let provider = match from {
+                source::VirtualFrom::Layer(id) => layers.iter().find(|l| &l.id == id).map(|l| l.provider.clone()),
+                _ => None,
+            }
+            .unwrap_or_default();
+            let base_parts = |a: &String| below.clone().unwrap_or_else(|| vec![(a.clone(), dialect(&path, &provider))]);
             let Some(l) = layers.get_mut(i) else { continue };
             if base_too_long {
                 report.skipped(&l.name, "the filter of the layer its virtual layer selects from, which is too long to read");
@@ -706,17 +770,36 @@ fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
                 }
                 f => f,
             };
+            // What the combined filter holds, each part under its own dialect.
+            let mut parts: Vec<(String, expr::Dialect)> = Vec::new();
             let subset = match (subset, filter) {
                 (Some(a), Some(b)) if a.len() + b.len() + 11 > max => {
                     report.skipped(&l.name, "its filter (from its virtual layer's query) with that of the layer it selects from, too long to read together: the latter alone kept");
+                    parts.extend(base_parts(&a));
                     Some(a)
                 }
-                (Some(a), Some(b)) => Some(format!("({a}) AND ({b})")),
-                (a, b) => a.or(b),
+                (Some(a), Some(b)) => {
+                    parts.extend(base_parts(&a));
+                    parts.push((b.clone(), expr::Dialect::Sqlite));
+                    Some(format!("({a}) AND ({b})"))
+                }
+                (Some(a), None) => {
+                    parts.extend(base_parts(&a));
+                    Some(a)
+                }
+                (None, b) => {
+                    parts.extend(b.iter().map(|f| (f.clone(), expr::Dialect::Sqlite)));
+                    b
+                }
             };
             let resolved = Source::File { path, layer, subset, ignored };
             l.definition_query =
                 definition_query(&resolved, &l.name, "from its virtual layer's query and the layer it selects from", report);
+            if l.definition_query.is_some() {
+                let seen: Vec<(&str, expr::Dialect)> = parts.iter().map(|(q, d)| (q.as_str(), *d)).collect();
+                note_matching(&l.name, "its filter (from its virtual layer's query and the layer it selects from)", &seen, report);
+            }
+            chained.insert(l.id.clone(), parts);
             l.source = resolved;
             changed = true;
         }
@@ -798,12 +881,15 @@ fn resolve_virtual_layers(layers: &mut [ProjectLayer], report: &mut Report) {
 const MAX_VIRTUAL_CHAIN: usize = 8;
 
 /// Reads a QGIS layer style (a `.qml` file's text) for the layer named `layer` (for the notes).
-pub fn read_style(text: &str, layer: &str, report: &mut Report) -> Result<Style, String> {
+/// `dir` is the folder relative image paths start from (empty: none); `images` reads its raster
+/// image markers' images.
+pub fn read_style(text: &str, layer: &str, dir: &str, images: &mut ReadImage, report: &mut Report) -> Result<Style, String> {
     let doc = parse(text, "a QGIS layer style")?;
     let root = doc.root_element();
     if !root.has_tag_name("qgis") {
         return Err("not a QGIS layer style (.qml): its root element isn't <qgis>".into());
     }
+    symbol::read_images(root, dir, images, report);
     Ok(read_style_node(root, layer, report))
 }
 

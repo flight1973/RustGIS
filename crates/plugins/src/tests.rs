@@ -226,8 +226,8 @@ fn plugin_tool_and_parameter_limits_stay_bounded() {
     assert!(e.contains("more than 64 parameters"), "{e}");
 }
 
-/// A command's dialog fields are checked like a tool's parameters, take raster layers, and
-/// refuse files; a command without one still parses.
+/// A command's dialog fields are checked like a tool's parameters, take raster layers and
+/// tables, and refuse files; a command without one still parses.
 #[test]
 fn command_dialog_fields_are_checked() {
     let mut m = json!({"id": "dialogs", "name": "Dialogs", "version": "1.0.0", "permissions": ["files"],
@@ -293,7 +293,22 @@ fn command_dialog_fields_are_checked() {
         c["commands"][0]["form"] = form;
         let e = Manifest::parse(&c.to_string()).unwrap_err();
         assert!(e.contains("'col' lists the fields of a layer"), "{e}");
+        // It names the kinds that fit, `table` among them (#2334).
+        assert!(e.contains("needs a vectorLayer, polygonLayer, pointLayer or table field above it"), "{e}");
     }
+    // A `table` picks a standalone table or a layer that isn't a raster, so a field below it
+    // lists a table's columns (#2334): the issue's event table and its route field.
+    let mut c = m.clone();
+    c["commands"][0]["form"] = json!([
+        {"kind": "table", "name": "events", "label": "Event table (layer, CSV, Excel)", "required": true},
+        {"kind": "field", "name": "ev_route", "label": "Events: route ID field"}
+    ]);
+    assert!(Manifest::parse(&c.to_string()).is_ok());
+    // A tool's parameters are features handed over, which a table has none of.
+    let mut t = tool.clone();
+    t["tools"][0]["params"][0]["kind"] = json!("table");
+    let e = Manifest::parse(&t.to_string()).unwrap_err();
+    assert!(e.contains("unknown parameter kind 'table'"), "{e}");
     // A required field lists those of a layer that must be picked too.
     let mut c = m.clone();
     c["commands"][0]["form"] = json!([
@@ -304,6 +319,29 @@ fn command_dialog_fields_are_checked() {
     assert!(e.contains("'col' is required, so the layer field above it must be too"), "{e}");
     c["commands"][0]["form"][0]["required"] = json!(true);
     assert!(Manifest::parse(&c.to_string()).is_ok());
+}
+
+/// A dialog's `choice` field may be drawn as tabs; `tabs` on another kind, on a second field of
+/// the form or on a tool parameter is refused, naming the field.
+#[test]
+fn dialog_tabs_are_one_choice_field() {
+    let tabs = json!({"name": "part", "label": "Part", "kind": "choice", "tabs": true, "choices": ["Authors", "Sources"]});
+    let mut m = json!({"id": "about", "name": "About", "version": "1.0.0",
+        "commands": [{"id": "about", "label": "About", "form": [tabs.clone(), {"name": "lang", "label": "Language", "kind": "text"}]}]});
+    let parsed = Manifest::parse(&m.to_string()).unwrap();
+    assert!(parsed.commands[0].form[0].tabs && !parsed.commands[0].form[1].tabs);
+    // Written back only where it is set, so a manifest without it reads as before.
+    assert_eq!(serde_json::to_value(&parsed.commands[0].form[1]).unwrap().get("tabs"), None);
+    let mut other = m.clone();
+    other["commands"][0]["form"][1]["tabs"] = json!(true);
+    let e = Manifest::parse(&other.to_string()).unwrap_err();
+    assert!(e.contains("About: 'lang' has tabs, which only a choice field can have"), "{e}");
+    other["commands"][0]["form"][1] = json!({"name": "more", "label": "More", "kind": "choice", "tabs": true, "choices": ["A"]});
+    let e = Manifest::parse(&other.to_string()).unwrap_err();
+    assert!(e.contains("'more' has tabs, but 'part' already has"), "{e}");
+    m["tools"] = json!([{"id": "t", "name": "Tool", "params": [tabs]}]);
+    let e = Manifest::parse(&m.to_string()).unwrap_err();
+    assert!(e.contains("Tool: 'part' has tabs, which only a command's dialog field can have"), "{e}");
 }
 
 /// A command may ask for more time than the two minutes a command normally gets.
@@ -320,6 +358,31 @@ fn command_timeouts_are_bounded() {
     assert!(e.contains("timeout of 0 seconds"), "{e}");
     let e = Manifest::parse(&manifest(json!(86_401)).to_string()).unwrap_err();
     assert!(e.contains("timeout of 86401 seconds"), "{e}");
+}
+
+/// A command names the sign-in its data needs (#2378): one RustGIS keeps, or none.
+#[test]
+fn command_login_is_one_rustgis_keeps() {
+    use crate::Login;
+    let manifest = |login: Option<Value>| {
+        let mut c = json!({"id": "c", "label": "C"});
+        if let Some(l) = login {
+            c["login"] = l;
+        }
+        json!({"id": "signed", "name": "Signed", "version": "1.0.0", "commands": [c]})
+    };
+    for (text, login) in [("earthdata", Login::Earthdata), ("copernicus", Login::Copernicus), ("arcgis", Login::Arcgis)] {
+        let m = Manifest::parse(&manifest(Some(json!(text))).to_string()).unwrap();
+        assert_eq!(m.commands[0].login, Some(login));
+        // Written back as given.
+        assert_eq!(serde_json::to_value(&m.commands[0]).unwrap()["login"], json!(text));
+    }
+    // Left out: none, and not written back.
+    let m = Manifest::parse(&manifest(None).to_string()).unwrap();
+    assert_eq!(m.commands[0].login, None);
+    assert!(serde_json::to_value(&m.commands[0]).unwrap().get("login").is_none());
+    let e = Manifest::parse(&manifest(Some(json!("dropbox"))).to_string()).unwrap_err();
+    assert!(e.contains("dropbox") && e.contains("earthdata"), "{e}");
 }
 
 /// A WebAssembly command's host requests are refused once its time limit has passed.
@@ -868,7 +931,7 @@ fn plugin_panels_are_checked() {
             "1 to 32 items",
         ),
         (json!({"title": "P", "state": "nope", "items": [{"kind": "button", "command": "h"}]}), "state command"),
-        (item(json!({"kind": "dial", "id": "d"})), "isn't text, checkbox, slider, button, tree, form, choice, date, range or pick"),
+        (item(json!({"kind": "dial", "id": "d"})), "isn't text, checkbox, slider, button, tree, form, choice, tabs, date, range or pick"),
         (item(json!({"kind": "pick", "id": "p"})), "needs a label or a command"),
         (item(json!({"kind": "pick", "label": "P"})), "invalid or repeated"),
         (item(json!({"kind": "pick", "id": "p", "command": "zz"})), "isn't one of the plugin's commands"),
@@ -2249,6 +2312,38 @@ fn choice_date_range_panel() -> crate::PanelDecl {
     items.push(json!({"kind": "range", "id": "months", "label": "Months", "min": 0, "max": 11, "default": [2, 5], "steps": true}));
     items.push(json!({"kind": "range", "id": "all", "label": "All", "min": 1, "max": 4}));
     Manifest::parse(&m.to_string()).unwrap().panel.unwrap()
+}
+
+#[test]
+fn panel_tabs_hold_their_options_and_value_like_a_dropdown() {
+    // A tab row is a dropdown drawn as a row of labels: same options, same default, same value,
+    // and the plugin may replace the options at runtime. Only the drawing differs.
+    let mut m: Value = serde_json::from_str(&testing::panel_manifest("tabs-panel")).unwrap();
+    m["panel"]["items"].as_array_mut().unwrap().push(json!({"kind": "tabs", "id": "step", "command": "q",
+        "options": [{"id": "data", "label": "Data"}, {"id": "layer", "label": "Layer"}], "default": "data"}));
+    let decl = Manifest::parse(&m.to_string()).unwrap().panel.unwrap();
+    let tabs = decl.items.iter().find(|d| d.id == "step").unwrap();
+    assert!(tabs.has_value());
+    assert_eq!(tabs.options.len(), 2);
+
+    let mut state = crate::PanelState::new(&decl);
+    assert_eq!(state.chosen("step"), Some("data"));
+    // A tab the panel holds is taken; one it does not is refused, as for a dropdown.
+    state.set_values(&decl, &json!({"step": "layer"}));
+    assert_eq!(state.chosen("step"), Some("layer"));
+    state.set_values(&decl, &json!({"step": "nowhere"}));
+    assert_eq!(state.chosen("step"), Some("layer"));
+    // And the plugin can replace the row's options, dropping a value they no longer hold.
+    state.apply(&decl, &json!({"items": {"step": {"options": [{"id": "only"}]}}}));
+    assert_eq!(state.chosen("step"), None);
+}
+
+#[test]
+fn panel_tabs_take_only_an_option_id_as_their_default() {
+    let mut m: Value = serde_json::from_str(&testing::panel_manifest("tabs-bad")).unwrap();
+    m["panel"]["items"].as_array_mut().unwrap().push(json!({"kind": "tabs", "id": "step", "options": [{"id": "a"}], "default": "b"}));
+    let e = Manifest::parse(&m.to_string()).unwrap_err();
+    assert!(e.contains("one of its options"), "{e}");
 }
 
 #[test]

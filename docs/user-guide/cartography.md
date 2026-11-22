@@ -47,7 +47,10 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
   while those stay under 40% of the values they were taken from: for a few very large values among
   many small ones (city sizes, incomes). It sets its own number of classes, at most the number
   asked. Manual keeps the bounds you type: each class's upper bound is a number to edit or take out, **Split the widest
-  class** adds one, and the field's largest value closes the last class. If no field is
+  class** adds one, and the field's largest value closes the last class. On a layer read in
+  place, whose values aren't all at hand, the field's range is unknown: the first class takes
+  every value up to its bound, and one more class takes every value past the last bound, shown
+  as "up to 4" and "more than 25" in the legend. If no field is
   chosen, the current renderer's field is kept when it is numeric; otherwise the first numeric
   field is used. If the layer has no numeric field, or the
   switch fails for another reason, the pane shows why and keeps the current renderer. When numeric
@@ -91,14 +94,19 @@ draws a circle, so the point still shows. By command:
 layer.marker={"layer":"Peaks","char":"▲","font":"DejaVu Sans","size":12}
 ```
 
-A marker can also be an **image**: a PNG or JPEG, given by command as base64 (at most 2 MiB of base64 text, an image of about 1.5 MiB). Other formats, such as GIF, aren't taken.
+A marker can also be an **image**: a PNG or JPEG, picked with **Image…** at the end of **Shape**
+(choose it again for another image), or given by command as base64 (at most 2 MiB of base64 text,
+an image of about 1.5 MiB). Other formats, such as GIF, aren't taken: a file in another format,
+one too large, or one that doesn't decode is said in a notice and leaves the marker as it was.
 Its size is its width, and it is as tall as its proportions make it, as QGIS draws a raster image
 marker; the symbol's fill and outline don't show. It turns with **Rotation**, is ringed when
 selected, and is kept in the project file. A project that has one opens only in a RustGIS that
 draws them. An image that doesn't decode draws a circle, so the point still shows; opening a
 project, map file or layer file, or adding styles, says which layers and styles have such an image,
-or one too large to keep. The **Layers** pane, its legend and the editors' previews (the symbol's,
-the strokes' and the fills') show the image too, whole within their patch and not turned:
+or one too large to keep. A PDF or SVG export keeps the image once, however many points and lines
+draw it (in an SVG each place is a `<use>` of it, a clone in a vector editor). The **Layers**
+pane, its legend and the editors' previews (the symbol's, the strokes' and the fills') show the
+image too, whole within their patch and not turned:
 
 ```text
 layer.marker={"layer":"Schools","image":"iVBORw0KGgo…","size":16}
@@ -111,8 +119,9 @@ symbol's: a white disc under a sign, say, so it reads on any background. Each ma
 colour, outline, shape, size and angle, and is shifted right (**Offset right**) and down
 (**Offset down**); its offset turns with its angle, as QGIS turns it. **With the field** turns a
 mark by the rotation field too, or keeps it still. A layer with classes can have marks for one
-class of its own, as line strokes can. A mark can be an image too, by command, as along a line
-(below). By command, `layer.markerRotation` and the point layer's strokes of markers:
+class of its own, as line strokes can. A mark can be an image too, with **Image…** under its
+**Shape** or by command, as along a line (below). By command, `layer.markerRotation` and the
+point layer's strokes of markers:
 
 ```text
 layer.markerRotation={"layer":"Signs","field":"angle","counterclockwise":true}
@@ -282,7 +291,8 @@ Widths and offsets are in points: they keep their size on screen at every scale,
 keep their coordinates. A positive offset shifts the stroke to the right of the line's direction
 (the order of its vertices) and a negative one to the left, so two copies of an edge drawn in
 opposite directions land on opposite sides of it. Strokes are saved with the project and drawn in
-exports. By command, bottom stroke first (`[]` goes back to the single stroke):
+exports, in a layout legend's swatch, and in the patches of the Layers and Symbology panes (along
+a straight line). By command, bottom stroke first (`[]` goes back to the single stroke):
 
 ```text
 layer.lineStrokes={"layer":"Rivers","strokes":[{"color":"#000000","width":11.5,"offset":8.5},{"color":"#FF8C00","width":7,"offset":8.5,"cap":"round","join":"round"}]}
@@ -337,9 +347,10 @@ its start), at its vertices or its inner ones, at either end or both, or in its 
 line** turns each mark with the line's direction; the **Angle** turns it further, clockwise. Marks
 take the stroke's colour, its width as a hash mark's line (or a marker's outline, by command), and
 its offset to either side. Stack them with line strokes: a casing, a core and ticks across it. A
-marker can also be an image, by command (`"image"`, a PNG or JPEG as base64 of at most 2 MiB): as
-wide as its **Size** and as tall as its proportions make it, turned with the line, the stroke's
-colour and outline left out; selected, each is framed. An image a file gave that can't be drawn
+marker can also be an image, with **Image…** under **Shape** or by command (`"image"`, a PNG or
+JPEG as base64 of at most 2 MiB): as wide as its **Size** and as tall as its proportions make
+it, turned with the line, the stroke's colour and outline left out; selected, each is framed. An
+image a file gave that can't be drawn
 (too large to keep, or one that doesn't decode) shows as a circle; changing the strokes in the
 pane makes it the circle, and says so. By command, `"markers"` on a stroke:
 
@@ -365,10 +376,10 @@ arrows move one up or down and the cross removes it; the top fill is listed firs
 **Solid**, **Hatch lines** (parallel lines at an **Angle**, anticlockwise from east, **Spacing**
 apart, of a **Line width**, shifted across by an **Offset**), **Markers** (a **Marker** shape
 of a **Size** on a grid **Spacing across** and **Spacing down** apart, **Rows shifted** to
-stagger them; by command the marker can be an image, `"image"`, as along a line), **Gradient** or
-**Shapeburst**. A gradient shades each feature from its colour to
-a **Second color**: by default top to bottom, of a **Type** that runs **Linear** (straight
-across), **Radial** (in rings from its first point) or **Conical** (round its first point),
+stagger them; the marker can be an image, with **Image…** under **Marker** or by command,
+`"image"`, as along a line), **Gradient** or **Shapeburst**. A gradient shades each feature from
+its colour to a **Second color**: by default top to bottom, of a **Type** that runs **Linear**
+(straight across), **Radial** (in rings from its first point) or **Conical** (round its first point),
 turned by an **Angle** (anticlockwise), and past its points a **Spread** of **Pad** (its end
 colours), **Reflect** or **Repeat**. A shapeburst shades from its colour at the polygon's edge to
 the second colour inside, a **Distance** in, or over the **Whole shape** to the point deepest
@@ -393,8 +404,8 @@ A gradient's `from` and `to` are places in the feature's box (`[across, down]`, 
 (`[[0.5, "#RRGGBB"], …]`), held rather than blended with `"discrete": true`.
 
 `[]` goes back to the single fill (for a class, to the layer's fills). Fills draw on the CPU (on the
-globe, patterns keep to the screen rather than the map as it turns); the
-legend shows the symbol's colour.
+globe, patterns keep to the screen rather than the map as it turns). A layout legend draws
+them in the polygon's swatch, and the Layers and Symbology panes in its patch.
 
 **Hatch only flagged polygons.** Use an overlay to hatch unreliable estimates while keeping
 the choropleth's colours visible.
@@ -406,7 +417,7 @@ the choropleth's colours visible.
    colour and spacing so the choropleth shows through. Set **Outline width** to 0 if the
    choropleth already draws the boundaries.
 3. Include both layers in the [layout legend](layouts.md#layouts). The overlay's swatch
-   uses a solid colour, so keep “(hatched)” in its name or legend label to explain the pattern.
+   shows its hatch lines, as does its patch in the Layers pane.
 
 The new layer contains a copy of the selected features. Recreate it if the flag values change.
 
@@ -661,6 +672,17 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   the text fits, with the polygon at least half the text's height either side and the centre
   line trimmed short of its tips. A polygon too short, narrow or sharply bent for its text is
   labelled as automatic (`labels.placement={"layer": "Lakes", "position": "curved"}`).
+- **Guide lines**: a point's or a polygon's label can be curved along a line of another layer,
+  as a range's name follows its ridge (ridge and valley lines from GeoLibre's
+  `ridge_and_valley_vectors`, or lines drawn by hand; the guide layer needn't be shown). Each
+  label follows the guide line with the same value in the given field as its feature has: a
+  polygon's wherever that line runs in view, a point's only when it is within the text's width.
+  With no field, or no such line the text fits along, a polygon's goes on the longest guide line
+  in view whose stretch under the text is inside it, and a point's on the nearest guide line
+  within the text's width.
+  A feature with no guide line its text fits along is labelled as without a guide
+  (`labels.placement={"layer": "Serras", "guide": {"layer": "Cumeadas", "field": "nome"}}`;
+  `"guide": null` removes it).
 - **Other places round points**: a point's label whose place another label takes tries the
   other places round the point, corners first (above right, above left, below right, below left,
   right, left, above, below, leaving out its own), and goes to the first where

@@ -2,6 +2,7 @@
 
 use rustgis_analysis::{Inputs, Output, OutputLayer, RasterInput};
 use rustgis_data::Dataset;
+use rustgis_data::loss::{LossCode, LossMessage};
 use serde_json::{Value, json};
 
 use super::{need_layers, ps};
@@ -710,6 +711,7 @@ impl ToolRun {
                 let mut result = pin.run(&inputs, &params, control, &|| continuation.check());
                 if let Ok(r) = &mut result {
                     r.messages.extend(inputs.messages.iter().cloned());
+                    r.losses.extend(inputs.losses.iter().cloned());
                 }
                 ToolDone { inputs: Vec::new(), result, full_ids: full_ids(&inputs.loaded) }
             })
@@ -801,6 +803,8 @@ pub(crate) struct ToolAhead {
     result: Result<rustgis_analysis::ToolResult, String>,
     full_ids: FullIds,
     millis: u64,
+    /// Runtime identities of successfully installed outputs on the worker, in return order.
+    grid_outputs: Vec<rustgis_map::Layer>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -862,6 +866,7 @@ pub(crate) struct RanAheads {
     tools: Vec<RanAhead>,
     files: Vec<FileAhead>,
     zones: Vec<super::imagery::ZoneMeans>,
+    grids: Vec<crate::image_grid::Prepared>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -872,11 +877,13 @@ pub(crate) struct RanAheads {
 pub(crate) fn taking<T>(s: &mut Session, ran: RanAheads, run: impl FnOnce(&mut Session) -> T) -> T {
     s.tools_ahead = Some(Ahead::Taking(ran.tools.into()));
     s.files_ahead = Some(FilesAhead::Taking(ran.files.into()));
+    s.grids_ahead = Some(crate::image_grid::Ahead::taking(ran.grids));
     s.zones_ahead = Some(super::imagery::ZonesAhead::Taking(ran.zones.into()));
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(s)));
     s.tools_ahead = None;
     s.files_ahead = None;
     s.zones_ahead = None;
+    s.grids_ahead = None;
     r.unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
@@ -895,7 +902,11 @@ pub(crate) fn ran_ahead(s: &mut Session) -> RanAheads {
         Some(super::imagery::ZonesAhead::Recording(read)) => read,
         _ => Vec::new(),
     };
-    RanAheads { tools, files, zones }
+    let grids = match s.grids_ahead.take() {
+        Some(crate::image_grid::Ahead::Recording(read)) => read,
+        _ => Vec::new(),
+    };
+    RanAheads { tools, files, zones, grids }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -922,15 +933,19 @@ fn read_batch_file(s: &mut Session, path: &std::path::Path) -> Result<(Dataset, 
 #[cfg(not(target_arch = "wasm32"))]
 /// The next tool run ahead, if it is this one on the same inputs: its result, the streamed rows
 /// it read whole and how long it took. Any other drops the rest, which came after it.
-fn take_ahead(
-    s: &mut Session,
-    pin: &crate::policy::ToolPin,
-    params: &Value,
-) -> Option<(Result<rustgis_analysis::ToolResult, String>, FullIds, u64)> {
-    let Some(Ahead::Taking(ran)) = &mut s.tools_ahead else { return None };
-    let next = ran.pop_front()?;
+fn take_ahead(s: &mut Session, pin: &crate::policy::ToolPin, params: &Value) -> Option<Box<ToolAhead>> {
+    let Some(Ahead::Taking(ran)) = &mut s.tools_ahead else {
+        crate::image_grid::invalidate_script_grids(s);
+        return None;
+    };
+    let Some(next) = ran.pop_front() else {
+        s.tools_ahead = None;
+        crate::image_grid::invalidate_script_grids(s);
+        return None;
+    };
     let RanAhead::Tool(next) = next else {
         s.tools_ahead = None;
+        crate::image_grid::invalidate_script_grids(s);
         return None;
     };
     let now = Snapshot::of(s);
@@ -940,9 +955,10 @@ fn take_ahead(
         {
             s.tools_taken += 1;
         }
-        return Some((next.result, next.full_ids, next.millis));
+        return Some(next);
     }
     s.tools_ahead = None;
+    crate::image_grid::invalidate_script_grids(s);
     None
 }
 
@@ -1216,6 +1232,7 @@ struct MapInputs<'a> {
     loaded: std::collections::HashMap<String, Dataset>,
     /// Import warnings from local file inputs, kept in the tool result and history.
     messages: Vec<String>,
+    losses: Vec<LossMessage>,
     /// The flat map's projection (its name, the projection and its unit in metres), built the
     /// first time a tool asks for it (Tissot's indicatrix does), once for the run; `None` on the
     /// globe.
@@ -1253,8 +1270,9 @@ fn map_inputs<'a>(s: &'a Session, spec: Option<&rustgis_analysis::ToolSpec>, par
 /// thread.
 fn inputs_of<'a>(snap: Snapshot<'a>, spec: Option<&rustgis_analysis::ToolSpec>, params: &Value) -> Result<MapInputs<'a>, String> {
     let (full, mut messages) = streamed_inputs(&snap.map, spec, params)?;
+    let losses = Vec::new();
     #[cfg(not(target_arch = "wasm32"))]
-    let mut full = full;
+    let (mut full, mut losses) = (full, losses);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(spec) = spec.filter(|t| rustgis_analysis::TOOLS.iter().any(|builtin| std::ptr::eq(builtin, *t))) {
         for parameter in spec.params.iter().filter(|p| p.kind == rustgis_analysis::ParamKind::VectorLayers) {
@@ -1262,6 +1280,9 @@ fn inputs_of<'a>(snap: Snapshot<'a>, spec: Option<&rustgis_analysis::ToolSpec>, 
                 if vector_file_input(spec, &snap.map, name) && !full.contains_key(name) {
                     let (dataset, report) = rustgis_data::io::read_path(std::path::Path::new(name)).map_err(|e| format!("{name}: {e}"))?;
                     messages.extend(report.messages.into_iter().map(|message| format!("{name}: {message}")));
+                    losses.extend(
+                        report.losses.into_iter().map(|loss| LossMessage { code: loss.code, text: format!("{name}: {}", loss.text) }),
+                    );
                     full.insert(name.to_string(), dataset);
                 }
             }
@@ -1272,7 +1293,7 @@ fn inputs_of<'a>(snap: Snapshot<'a>, spec: Option<&rustgis_analysis::ToolSpec>, 
     lonlat_inputs(&snap.map, spec, params, &mut full)?;
     let mut rows = env_inputs(&snap.map, &full, &snap.env, params)?;
     narrow_to_queries(&snap.map, spec, params, &full, &mut rows, &mut messages)?;
-    Ok(MapInputs { snap, rows, loaded: full, messages, flat: std::cell::OnceCell::new(), view: std::cell::OnceCell::new() })
+    Ok(MapInputs { snap, rows, loaded: full, messages, losses, flat: std::cell::OnceCell::new(), view: std::cell::OnceCell::new() })
 }
 
 /// Narrows the rows a tool reads of each layer to the features its definition query keeps, as the
@@ -1390,7 +1411,7 @@ fn streamed_inputs(
 /// The layers a tool reads, in longitude/latitude, the space analysis tools work in
 /// ([`Inputs::dataset`]): those read whole (streamed layers, files) converted where they are, and
 /// a converted copy of each other layer it names whose coordinates are in another system. Nothing
-/// is copied while every dataset is in longitude/latitude, as every one is today.
+/// is copied for a layer held in longitude/latitude.
 fn lonlat_inputs(
     map: &rustgis_map::Map,
     spec: Option<&rustgis_analysis::ToolSpec>,
@@ -1933,9 +1954,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let mut collisions = 0;
     let mut first_collision = None;
     #[cfg_attr(target_arch = "wasm32", expect(unused_mut, reason = "batch inputs are read from files on the desktop only"))]
-    let mut reader_warnings: Vec<(String, String)> = Vec::new();
+    let mut reader_warnings: Vec<(String, String, Option<LossCode>)> = Vec::new();
     let mut items_reporting_messages = 0;
-    let mut distinct_tool_messages: Vec<(String, usize)> = Vec::new();
+    let mut distinct_tool_messages: Vec<(String, Option<LossCode>, usize)> = Vec::new();
     let mut cancelled_after = None;
     let mut next_suffix: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     #[cfg(not(target_arch = "wasm32"))]
@@ -1969,9 +1990,11 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 }
                 match read_batch_file(s, path) {
                     Ok((dataset, report)) => {
-                        for msg in report.messages {
+                        let messages = report.messages.into_iter().map(|text| (text, None));
+                        let losses = report.losses.into_iter().map(|loss| (loss.text, Some(loss.code)));
+                        for (msg, code) in messages.chain(losses) {
                             item_reader_warnings.push(format!("{target}: {msg}"));
-                            reader_warnings.push((target.clone(), msg));
+                            reader_warnings.push((target.clone(), msg, code));
                         }
                         Some(super::layer::add_dataset(s, dataset))
                     }
@@ -2106,12 +2129,12 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             Ok((res, messages)) => {
                 succeeded.push(target.clone());
                 if !messages.is_empty() {
-                    items_reporting_messages += 1;
-                    for msg in &messages {
-                        if let Some(entry) = distinct_tool_messages.iter_mut().find(|(m, _)| m == msg) {
-                            entry.1 += 1;
+                    items_reporting_messages += usize::from(messages.iter().any(|(_, code)| code.is_none()));
+                    for (text, code) in &messages {
+                        if let Some(entry) = distinct_tool_messages.iter_mut().find(|(m, c, _)| m == text && c == code) {
+                            entry.2 += 1;
                         } else {
-                            distinct_tool_messages.push((msg.clone(), 1));
+                            distinct_tool_messages.push((text.clone(), *code, 1));
                         }
                     }
                 }
@@ -2217,7 +2240,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     }
                 } else {
                     succeeded.pop();
-                    let err = messages.last().cloned().unwrap_or_else(|| "tool produced no output".into());
+                    let err = messages.last().map(|(text, _)| text.clone()).unwrap_or_else(|| "tool produced no output".into());
                     if let Some(last) = s.project.gp_history.last_mut() {
                         let matches_item = last.id == tool_id
                             && (last.params.get(batch_param).and_then(Value::as_str) == Some(target)
@@ -2238,7 +2261,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     failed.push(json!({"input": target, "error": err.clone()}));
                     let mut err_obj = json!({"input": target, "error": err});
                     if messages.len() > 1 {
-                        err_obj["messages"] = json!(messages);
+                        err_obj["messages"] = json!(messages.iter().map(|(text, _)| text).collect::<Vec<_>>());
                     }
                     errors.push(err_obj);
                     #[cfg(not(target_arch = "wasm32"))]
@@ -2339,18 +2362,17 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     // Every distinct message is named (a loss reported by the fourth kind must not be hidden),
     // up to a bound a hostile run can't flood; all of them are in the result's `messages`.
     const NAMED: usize = 50;
+    let mut losses = BatchLosses::default();
+    for (text, code, count) in &distinct_tool_messages {
+        if let Some(code) = code {
+            losses.add(*code, text, *count);
+        }
+    }
     if items_reporting_messages > 0 {
-        let sample = distinct_tool_messages
-            .iter()
-            .take(NAMED)
-            .map(|(m, c)| if *c > 1 { format!("{m} (×{c})") } else { m.clone() })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let more = if distinct_tool_messages.len() > NAMED {
-            format!(" and {} more, in the result", distinct_tool_messages.len() - NAMED)
-        } else {
-            String::new()
-        };
+        let plain = || distinct_tool_messages.iter().filter(|(_, code, _)| code.is_none());
+        let sample = plain().take(NAMED).map(|(text, _, count)| batch_message(text, *count)).collect::<Vec<_>>().join("; ");
+        let total = plain().count();
+        let more = if total > NAMED { format!(" and {} more, in the result", total - NAMED) } else { String::new() };
         s.notify(format!("gp.batch: {items_reporting_messages} item(s) reported messages ({sample}{more})"), false);
     }
 
@@ -2371,23 +2393,29 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
     #[cfg(not(target_arch = "wasm32"))]
     if !reader_warnings.is_empty() {
-        let mut aggregated: Vec<(&str, Vec<&str>)> = Vec::new();
-        for (target, msg) in &reader_warnings {
-            if let Some((_, inputs)) = aggregated.iter_mut().find(|(m, _)| *m == msg.as_str()) {
+        let mut aggregated: Vec<(&str, Option<LossCode>, Vec<&str>)> = Vec::new();
+        for (target, msg, code) in &reader_warnings {
+            if let Some((_, _, inputs)) = aggregated.iter_mut().find(|(m, c, _)| *m == msg.as_str() && c == code) {
                 if !inputs.contains(&target.as_str()) {
                     inputs.push(target.as_str());
                 }
             } else {
-                aggregated.push((msg.as_str(), vec![target.as_str()]));
+                aggregated.push((msg.as_str(), *code, vec![target.as_str()]));
             }
         }
-        for (msg, inputs) in aggregated {
+        for (msg, code, inputs) in aggregated {
             let count = inputs.len();
             let inputs_list = inputs.join(", ");
             let label = if count == 1 { "input" } else { "inputs" };
-            s.notify(format!("gp.batch: {count} {label} ({inputs_list}): {msg}"), false);
+            let text = format!("gp.batch: {count} {label} ({inputs_list}): {msg}");
+            if let Some(code) = code {
+                losses.add(code, &text, count);
+            } else {
+                s.notify(text, false);
+            }
         }
     }
+    losses.say(s);
 
     if !failed.is_empty() {
         let sample = failed.iter().take(3).filter_map(|v| v.get("input").and_then(Value::as_str)).collect::<Vec<_>>().join(", ");
@@ -2413,7 +2441,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     };
     s.notify(summary_msg, num_err > 0 || is_cancelled);
 
-    let warnings: Vec<Value> = reader_warnings.iter().map(|(input, msg)| json!({"input": input, "warning": msg})).collect();
+    let warnings: Vec<Value> = reader_warnings.iter().map(|(input, msg, _)| json!({"input": input, "warning": msg})).collect();
 
     let mut ret = json!({
         "tool": tool_id,
@@ -2424,7 +2452,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         "outputs": output_names,
         "errors": errors,
         "warnings": warnings,
-        "messages": distinct_tool_messages.iter().map(|(m, c)| json!({"message": m, "items": c})).collect::<Vec<_>>(),
+        "messages": distinct_tool_messages.iter().map(|(m, _, c)| json!({"message": m, "items": c})).collect::<Vec<_>>(),
     });
     if is_cancelled {
         ret["cancelled"] = json!(true);
@@ -2548,7 +2576,7 @@ pub(crate) fn execute(
     op: crate::policy::Authorized<crate::policy::ToolOp>,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
     opts: &RunOpts,
-) -> Result<(Value, Vec<String>), String> {
+) -> Result<(Value, ToolMessages), String> {
     let crate::policy::ToolOp { pin, params } = op.op();
     pin.current()?;
     let spec = pin.spec();
@@ -2567,7 +2595,20 @@ pub(crate) fn execute(
     }
     let continuation = s.tool_continuation(&op)?;
     #[cfg(not(target_arch = "wasm32"))]
-    let ran = take_ahead(s, pin, params);
+    let output_slot = match &s.tools_ahead {
+        Some(Ahead::Recording(recorded)) => Some(recorded.len()),
+        _ => None,
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut ran = take_ahead(s, pin, params);
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::image_grid::script_grids_invalidated(s) {
+        return Err("the script inputs changed; run the script again".into());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let replayed_outputs = ran.as_mut().map(|tool| std::mem::take(&mut tool.grid_outputs));
+    #[cfg(not(target_arch = "wasm32"))]
+    let ran = ran.map(|tool| (tool.result, tool.full_ids, tool.millis));
     #[cfg(target_arch = "wasm32")]
     let ran = None;
     let (mut res, ids, millis) = match ran {
@@ -2596,6 +2637,7 @@ pub(crate) fn execute(
             };
             if let Ok(result) = &mut res {
                 result.messages.extend(inputs.messages.iter().cloned());
+                result.losses.extend(inputs.losses.iter().cloned());
             }
             let ids = full_ids(&inputs.loaded);
             #[cfg(not(target_arch = "wasm32"))]
@@ -2617,6 +2659,7 @@ pub(crate) fn execute(
                     result: res.clone(),
                     full_ids: ids.clone(),
                     millis,
+                    grid_outputs: Vec::new(),
                 })));
             }
             (res, ids, millis)
@@ -2625,8 +2668,71 @@ pub(crate) fn execute(
     pin.current()?;
     continuation.check()?;
     fit_to_windows(s, &mut res, &ids);
-    apply_with(s, run_of(t0), kept(), res, millis, opts)
+    let applied = apply_with(s, run_of(t0), kept(), res, millis, opts);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Ok((out, _)) = &applied
+        && (recording || replayed_outputs.is_some())
+    {
+        let outputs = output_layers(s, out);
+        if let Some(recorded) = replayed_outputs {
+            crate::image_grid::replay_tool_outputs(s, &recorded, &outputs)?;
+        } else if let Some(index) = output_slot
+            && let Some(Ahead::Recording(recorded)) = &mut s.tools_ahead
+            && let Some(RanAhead::Tool(tool)) = recorded.get_mut(index)
+        {
+            tool.grid_outputs = outputs;
+        }
+    }
+    applied
 }
+
+/// The exact layers just installed by a tool, rather than similarly named layers in the map.
+#[cfg(not(target_arch = "wasm32"))]
+fn output_layers(s: &Session, out: &Value) -> Vec<rustgis_map::Layer> {
+    let ids = out.get("layer").into_iter().chain(out.get("layers").and_then(Value::as_array).into_iter().flatten());
+    ids.filter_map(Value::as_u64).filter_map(|id| u32::try_from(id).ok()).filter_map(|id| s.map().layer(id).cloned()).collect()
+}
+
+/// Counts classified reports across a batch and keeps a bounded sample for each code.
+#[derive(Default)]
+struct BatchLosses(std::collections::BTreeMap<&'static str, BatchLoss>);
+
+struct BatchLoss {
+    code: LossCode,
+    reports: usize,
+    examples: Vec<String>,
+    omitted: usize,
+}
+
+impl BatchLosses {
+    /// Counts every report, even when its text is beyond the sample.
+    fn add(&mut self, code: LossCode, text: &str, count: usize) {
+        let entry = self.0.entry(code.spec().id).or_insert_with(|| BatchLoss { code, reports: 0, examples: Vec::new(), omitted: 0 });
+        entry.reports = entry.reports.saturating_add(count);
+        if entry.examples.len() < 3 {
+            entry.examples.push(batch_message(text, count));
+        } else {
+            entry.omitted += 1;
+        }
+    }
+
+    /// Publishes one warning per code. Full messages are in the batch result.
+    fn say(self, s: &mut Session) {
+        for loss in self.0.into_values() {
+            let sample = loss.examples.join("; ");
+            let more = if loss.omitted == 0 { String::new() } else { format!(" and {} more, in the result", loss.omitted) };
+            s.notify_loss(loss.code, format!("gp.batch: {} loss report(s) ({sample}{more})", loss.reports).into());
+        }
+    }
+}
+
+/// The text of a distinct batch notice, with its repetition count when it appeared more than once.
+fn batch_message(text: &str, count: usize) -> String {
+    if count > 1 { format!("{text} (×{count})") } else { text.to_string() }
+}
+
+/// Text and optional loss code from a tool that has run.
+pub(crate) type ToolMessages = Vec<(String, Option<LossCode>)>;
 
 /// How [`execute`] applies a run: by default as `gp.run` does. A batch item keeps the
 /// parameters and command it is replayed with, leaves its messages to the batch's one notice
@@ -2648,7 +2754,7 @@ pub(crate) fn run_tool_quiet(
     record_params: Option<&Value>,
     command: Option<(String, Value)>,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
-) -> Result<(Value, Vec<String>), String> {
+) -> Result<(Value, ToolMessages), String> {
     let op = s.authorize_tool(tool, params)?;
     let opts = RunOpts { record: record_params.cloned(), command, quiet: true, keep_tables: true };
     s.invoke_tool_with(op, control, &opts)
@@ -2671,10 +2777,11 @@ pub(crate) struct PendingFile {
     pub(crate) file_name: String,
     pub(crate) bytes: Option<Vec<u8>>,
     record: GpRecord,
+    losses: Vec<LossMessage>,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-fn queue_file(s: &mut Session, file_name: String, bytes: Vec<u8>, record: GpRecord) -> CmdResult {
+fn queue_file(s: &mut Session, file_name: String, bytes: Vec<u8>, record: GpRecord, losses: Vec<LossMessage>) -> CmdResult {
     let file_name =
         record.params.get("output").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).unwrap_or(&file_name).to_string();
     if file_name.is_empty() || file_name.contains(['/', '\\']) {
@@ -2687,7 +2794,14 @@ fn queue_file(s: &mut Session, file_name: String, bytes: Vec<u8>, record: GpReco
     }
     s.next_pending = s.next_pending.wrapping_add(1);
     let id = s.next_pending;
-    s.file_outputs.push(PendingFile { id, file_name: file_name.clone(), bytes: Some(bytes), record, continuation: s.continuation()? });
+    s.file_outputs.push(PendingFile {
+        id,
+        file_name: file_name.clone(),
+        bytes: Some(bytes),
+        record,
+        losses,
+        continuation: s.continuation()?,
+    });
     s.request_only = true;
     Ok(json!({"pending": true, "download": id, "file": file_name}))
 }
@@ -2715,6 +2829,14 @@ fn file_delivered(s: &mut Session, p: &Value) -> CmdResult {
         } else {
             s.notify(message.clone(), true);
         }
+    }
+    for loss in file.losses {
+        if file.record.ok {
+            publish_tool_loss(s, loss.code, &loss.text, true);
+        } else {
+            s.notify(loss.text.clone(), true);
+        }
+        file.record.messages.push(loss.text);
     }
     let out = json!({"file": file.file_name, "delivered": file.record.ok, "messages": file.record.messages});
     s.push_gp_record(file.record);
@@ -2839,7 +2961,7 @@ fn apply_with(
     res: Result<rustgis_analysis::ToolResult, String>,
     millis: u64,
     opts: &RunOpts,
-) -> Result<(Value, Vec<String>), String> {
+) -> Result<(Value, ToolMessages), String> {
     let continuation = s.continuation()?;
     s.check_continuation(&continuation)?;
     let Ran { name, id, command, started } = ran;
@@ -2868,12 +2990,13 @@ fn apply_with(
         Output::File { file_name, bytes } => {
             #[cfg(test)]
             if s.queue_gp_files {
-                let msgs = result.messages.clone();
+                let msgs = result.messages.iter().cloned().map(|m| (m, None)).collect();
                 return queue_file(
                     s,
                     file_name,
                     bytes,
                     GpRecord { tool: name, id, params, command, at, ok: false, messages: result.messages, millis, outputs: Vec::new() },
+                    result.losses,
                 )
                 .map(|v| (v, msgs));
             }
@@ -2882,6 +3005,7 @@ fn apply_with(
                 let path = params.get("output").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).unwrap_or(&file_name);
                 if let Err(error) = write_file_output(s, std::path::Path::new(path), &bytes) {
                     let error = format!("{path}: {error}");
+                    result.messages.extend(result.losses.into_iter().map(|loss| loss.text));
                     result.messages.push(error.clone());
                     s.push_gp_record(GpRecord {
                         tool: name,
@@ -2900,12 +3024,13 @@ fn apply_with(
             }
             #[cfg(target_arch = "wasm32")]
             {
-                let msgs = result.messages.clone();
+                let msgs = result.messages.iter().cloned().map(|m| (m, None)).collect();
                 return queue_file(
                     s,
                     file_name,
                     bytes,
                     GpRecord { tool: name, id, params, command, at, ok: false, messages: result.messages, millis, outputs: Vec::new() },
+                    result.losses,
                 )
                 .map(|v| (v, msgs));
             }
@@ -2974,16 +3099,25 @@ fn apply_with(
             ret
         }
     };
-    let messages = result.messages.clone();
+    let messages: ToolMessages = result
+        .messages
+        .iter()
+        .cloned()
+        .map(|m| (m, None))
+        .chain(result.losses.iter().map(|loss| (loss.text.clone(), Some(loss.code))))
+        .collect();
     if !opts.quiet {
-        for m in &messages {
-            if wrote_file {
-                s.notify_written(m.clone(), false);
+        for (message, code) in &messages {
+            if let Some(code) = code {
+                publish_tool_loss(s, *code, message, wrote_file);
+            } else if wrote_file {
+                s.notify_written(message.clone(), false);
             } else {
-                s.notify(m.clone(), false);
+                s.notify(message.clone(), false);
             }
         }
     }
+    result.messages.extend(result.losses.into_iter().map(|loss| loss.text));
     let ids: Vec<u32> = match (out.get("layer"), out.get("layers")) {
         (Some(id), _) => id.as_u64().into_iter().filter_map(|v| u32::try_from(v).ok()).collect(),
         (None, Some(Value::Array(v))) => v.iter().filter_map(Value::as_u64).filter_map(|v| u32::try_from(v).ok()).collect(),
@@ -2995,6 +3129,15 @@ fn apply_with(
         s.project.gp_history.remove(0);
     }
     Ok((out, messages))
+}
+
+/// Publishes a typed loss, retaining it through rollback when a file has already been delivered.
+fn publish_tool_loss(s: &mut Session, code: LossCode, text: &str, written: bool) {
+    let mark = s.notice_mark();
+    s.notify_loss(code, text.to_string().into());
+    if written {
+        s.retain_written_notices(mark);
+    }
 }
 
 #[cfg(test)]
@@ -3053,7 +3196,7 @@ mod file_tests {
             s.registry.commands.push(C::new("test.queueFile", "File export", "Test", |s, p| {
                 let record = serde_json::from_value(p["record"].clone()).unwrap();
                 let bytes = serde_json::from_value(p["bytes"].clone()).unwrap();
-                super::queue_file(s, p["name"].as_str().unwrap().into(), bytes, record)
+                super::queue_file(s, p["name"].as_str().unwrap().into(), bytes, record, Vec::new())
             }));
         }
         s.run("test.queueFile", &json!({"name":name,"bytes":bytes,"record":record}))
@@ -3827,6 +3970,7 @@ mod file_tests {
                 Ran { name: "File export".into(), id: "vectorToPmtiles".into(), command: None, started: 1000 },
                 p.clone(),
                 Ok(rustgis_analysis::ToolResult {
+                    losses: Vec::new(),
                     output: Output::File { file_name: "cities.pmtiles".into(), bytes: b"archive".to_vec() },
                     messages: vec!["Exported data".into()],
                 }),
@@ -4271,7 +4415,8 @@ mod batch_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    // Apple's APFS refuses a file name that isn't UTF-8 ("Illegal byte sequence").
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     #[test]
     fn batch_run_folder_skips_non_utf8_filename() {
         use std::os::unix::ffi::OsStrExt;
@@ -4548,6 +4693,7 @@ mod batch_tests {
                     vec![rustgis_data::Field::new("col", rustgis_data::FieldType::Integer)],
                 );
                 Ok(rustgis_analysis::ToolResult {
+                    losses: Vec::new(),
                     output: rustgis_analysis::Output::Layers(vec![rustgis_analysis::OutputLayer::Table(table)]),
                     messages: Vec::new(),
                 })
@@ -4903,6 +5049,7 @@ mod batch_tests {
         _params: &serde_json::Value,
     ) -> Result<rustgis_analysis::ToolResult, String> {
         Ok(rustgis_analysis::ToolResult {
+            losses: Vec::new(),
             output: rustgis_analysis::Output::Layers(Vec::new()),
             messages: vec!["custom message from empty tool".to_string()],
         })
@@ -4956,6 +5103,7 @@ mod batch_tests {
         _params: &serde_json::Value,
     ) -> Result<rustgis_analysis::ToolResult, String> {
         Ok(rustgis_analysis::ToolResult {
+            losses: Vec::new(),
             output: rustgis_analysis::Output::Layers(Vec::new()),
             messages: vec!["Processed 10 features".to_string(), "0 features matched criteria".to_string()],
         })
@@ -6679,4 +6827,70 @@ pub(crate) fn project_input<'a>(
 /// Builtin VectorLayers reads absent map names as files before MapInputs' table fallback.
 pub(crate) fn vector_file_input(spec: &rustgis_analysis::ToolSpec, map: &rustgis_map::Map, name: &str) -> bool {
     rustgis_analysis::TOOLS.iter().any(|t| std::ptr::eq(t, spec)) && map.layer_by_name(name).is_none()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod replay_rollback_tests {
+    use super::*;
+    use rustgis_data::{Field, FieldType, Geometry, GeometryType, Value as Cell};
+    fn prepare(s: &Session, params: &Value) -> Result<RanAheads, String> {
+        let mut worker = Session::new(s.project.clone());
+        worker.active_layer = s.active_layer;
+        worker.opened = s.opened;
+        worker.view_size = s.view_size;
+        worker.set_extensions(s.extensions().clone());
+        worker.tools_ahead = Some(Ahead::Recording(Vec::new()));
+        worker.grids_ahead = Some(crate::image_grid::Ahead::Recording(Vec::new()));
+        worker.run("script.run", params)?;
+        Ok(ran_ahead(&mut worker))
+    }
+    #[test]
+    fn annotation_grid_post_apply_replay_error_rolls_back_outputs_history_and_undo() {
+        let mut s = Session::new(crate::Project::default());
+        let mut samples = Dataset::new("Samples", GeometryType::Point, vec![Field::new("v", FieldType::Double)]);
+        for (x, y, v) in [(0., 0., 1.), (2., 0., 2.), (0., 2., 3.), (2., 2., 4.)] {
+            samples.push(Some(Geometry::Point(rustgis_geom::Coord::new(x, y))), vec![Cell::Float(v)]);
+        }
+        // Another layer first, so a rollback that forgets the chosen one would pick it instead.
+        s.map_mut().add_dataset(Dataset::new("Other", GeometryType::Point, vec![]));
+        let chosen = s.map_mut().add_dataset(samples);
+        s.active_layer = Some(chosen);
+        s.run("project.rename", &json!({"name":"Before"})).unwrap();
+        s.run("project.rename", &json!({"name":"Future"})).unwrap();
+        s.run("edit.undo", &json!({})).unwrap();
+        s.mark_saved();
+        let params = json!({"script":format!("gp.run {}\nraster.imageGrid {}", json!({"tool":"idwInterpolation","params":{"input":"Samples","field":"v","extent":"0,0,2,2","pixelSize":0.5,"output":"Surface"}}), json!({"layer":"Surface"}))});
+        let before = serde_json::to_value(&s.project).unwrap();
+        let history = (s.undo_depth(), s.undo_label(), s.redo_label(), s.dirty());
+        let mut ran = prepare(&s, &params).unwrap();
+        // Corrupt only the recorded output identity: the tool's input snapshot and actual
+        // output still match, so replay accepts and applies it before binding fails.
+        let Some(RanAhead::Tool(tool)) = ran.tools.first_mut() else { panic!("expected prepared tool") };
+        tool.grid_outputs[0].name = "Injected output identity mismatch".into();
+        s.statistics_need_read_ahead(true);
+        let error = super::super::reads::taking(&mut s, "script.run", ran, |s| s.run("script.run", &params)).unwrap_err();
+        assert!(error.contains("tool outputs changed"), "{error}");
+        assert_eq!(s.tools_taken, 1, "the error must occur after the prepared tool was taken and applied");
+        assert_eq!(serde_json::to_value(&s.project).unwrap(), before, "outputs and successful GP history must roll back");
+        assert_eq!(s.active_layer, Some(chosen), "the layer chosen before the script must stay chosen");
+        assert_eq!((s.undo_depth(), s.undo_label(), s.redo_label(), s.dirty()), history);
+        assert!(s.map().layer_by_name("Surface").is_none());
+        assert!(s.grids_ahead.is_none() && s.tools_ahead.is_none());
+        s.run("edit.redo", &json!({})).unwrap();
+        assert_eq!(s.project.name, "Future", "a failed replay must preserve the prior Redo entry");
+        s.run("edit.undo", &json!({})).unwrap();
+        let ran = prepare(&s, &params).unwrap();
+        let answer = super::super::reads::taking(&mut s, "script.run", ran, |s| s.run("script.run", &params)).unwrap();
+        assert_eq!(answer["ran"][1]["result"]["width"], 4);
+        assert_eq!(s.map().layers.iter().filter(|layer| layer.name == "Surface").count(), 1);
+        assert!(s.map().layer_by_name("Surface (2)").is_none());
+        assert_eq!(s.undo_depth(), history.0 + 1);
+        s.run("edit.undo", &json!({})).unwrap();
+        // Undo deliberately bumps geometry revisions to invalidate rendering caches.
+        assert!(s.map().layer_by_name("Surface").is_none());
+        assert_eq!(s.map().layers.len(), 2);
+        assert_eq!(serde_json::to_value(&s.map().layers[0].dataset).unwrap(), before["maps"][0]["layers"][0]["dataset"]);
+        assert!(s.project.gp_history.is_empty());
+        assert_eq!(s.undo_depth(), history.0);
+    }
 }

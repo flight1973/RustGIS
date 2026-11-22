@@ -485,11 +485,20 @@ fn still_good(water: &Water, read_at: web_time::Instant) -> bool {
 fn polygons(layer: &rustgis_map::Layer, level: Option<&str>, drawn: Option<&[bool]>) -> Vec<(Vec<Vec<Coord>>, Option<f64>)> {
     let field = level.and_then(|f| layer.dataset.field_index(f));
     let mut polygons = Vec::new();
+    // Its conversion to longitude/latitude, made once for its polygons (none: a system that can't
+    // be converted, of which the map draws nothing either).
+    let to = layer.dataset.shown_conversion().ok();
     for (row, ft) in layer.dataset.features.iter().enumerate() {
         if drawn.is_some_and(|d| !d.get(row).copied().unwrap_or(false)) {
             continue;
         }
-        let Some(Geometry::Polygon(parts)) = &ft.geometry else { continue };
+        // In longitude/latitude, whatever system the layer holds its coordinates in; a polygon
+        // that can't be given there holds no water, as the map draws none of it.
+        let Some(lonlat) = ft.geometry.as_ref().zip(to.as_ref()).and_then(|(g, to)| rustgis_data::Dataset::converted_to_lonlat(to, g))
+        else {
+            continue;
+        };
+        let Geometry::Polygon(parts) = &*lonlat else { continue };
         let given = field.and_then(|i| ft.attrs.get(i)).and_then(rustgis_data::Value::as_f64).filter(|v| v.is_finite());
         for rings in parts {
             let rings: Vec<Vec<Coord>> = rings.iter().map(|r| r.iter().map(|c| lonlat_to_merc(*c)).collect()).collect();
@@ -601,6 +610,7 @@ fn shores(polygons: &[(Vec<Vec<Coord>>, Option<f64>)]) -> (f64, usize) {
 /// of `camera`, when it names a polygon layer there: the polygons that view draws.
 pub(super) fn of(map: &Map, camera: &Camera, ground: &Ground) -> Option<Arc<Water>> {
     let (layer, level) = water_layer(map)?;
+    crate::note_held_read(layer);
     let key = Key {
         rows: layer.dataset.features.allocation_key(),
         drawn: drawn_rows(map, layer, camera),
@@ -738,7 +748,7 @@ impl Glint {
 
 /// How far inside the water's outline its shore band reaches, in logical pixels (#1915): a few,
 /// as relief artists draw it.
-const SHORE_PX: f32 = 4.0;
+pub(crate) const SHORE_PX: f32 = 4.0;
 
 /// The strokes the shore band is drawn with, each narrower than the one before, so it fades from
 /// the outline inward in as many steps.
@@ -816,6 +826,30 @@ pub(crate) fn paint_shore(pm: &mut crate::Canvas, water: &Water, frame: &crate::
 mod tests {
     use super::*;
 
+    /// A water layer held in another system holds its water where the same layer held in
+    /// longitude/latitude does (#2032 C2).
+    #[test]
+    fn a_held_water_layer_gives_the_same_polygons() {
+        use rustgis_data::{Dataset, GeometryType};
+        let ring = |x: f64, y: f64| {
+            vec![Coord::new(x, y), Coord::new(x + 0.01, y), Coord::new(x + 0.01, y + 0.01), Coord::new(x, y + 0.01), Coord::new(x, y)]
+        };
+        let mut d = Dataset::new("lake", GeometryType::Polygon, vec![]);
+        d.push(Some(Geometry::Polygon(vec![vec![ring(11.5, 48.7)], vec![ring(11.52, 48.71)]])), vec![]);
+        let plain = rustgis_map::Layer::new(1, d.clone());
+        d.hold_in(rustgis_data::raster::Crs::Epsg(32632)).unwrap();
+        let held = rustgis_map::Layer::new(2, d);
+        let (a, b) = (polygons(&plain, None, None), polygons(&held, None, None));
+        assert_eq!(a.len(), 2);
+        assert_eq!(a.len(), b.len());
+        for ((ra, _), (rb, _)) in a.iter().zip(&b) {
+            assert_eq!(ra.len(), rb.len());
+            for (x, y) in ra.iter().flatten().zip(rb.iter().flatten()) {
+                assert!((x.x - y.x).abs() < 1e-3 && (x.y - y.y).abs() < 1e-3, "{x:?} vs {y:?}");
+            }
+        }
+    }
+
     fn square(x0: f64, y0: f64, side: f64) -> Vec<Coord> {
         vec![Coord::new(x0, y0), Coord::new(x0 + side, y0), Coord::new(x0 + side, y0 + side), Coord::new(x0, y0 + side)]
     }
@@ -885,6 +919,7 @@ mod tests {
                 depth: Some(300.0),
                 walls: rustgis_map::view::BLOCK_WALLS,
                 walls_layer: None,
+                water: None,
                 shape: rustgis_map::view::BlockShape::Box,
             }),
             water: None,

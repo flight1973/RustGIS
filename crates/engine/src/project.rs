@@ -73,8 +73,10 @@ pub const READ_FORMAT: u32 = 2;
 pub const CAPABILITIES: &[&str] = &[
     "terrain-block",
     "terrain-block-shape",
+    "terrain-block-polygon",
     "terrain-water",
     "terrain-water-shore",
+    "terrain-block-water",
     "shaded-relief-effects",
     "normalized-legend-urls",
     "field-origin",
@@ -86,12 +88,27 @@ pub const CAPABILITIES: &[&str] = &[
     "layout-element-background",
     SIZE_BY_CAPABILITY,
     "picture-markers",
+    "graticule-mgrs",
+    "graticule-on-top",
+    "graticule-color",
     "layout-element-ink",
     "layout-element-wrap",
+    "layout-chart-data",
+    "layout-chart-look",
+    "layout-chart-classes",
+    "layout-chart-stack",
     "field-generation",
+    "offline-map-area-id",
     "crs-wkt",
     "zarr-window",
+    "blank-paper",
+    "layout-frame-border",
+    NATIVE_COORDINATES,
+    "label-guide",
 ];
+/// A layer or table saved in a coordinate system of its own, not longitude/latitude
+/// (`Dataset::held_in`, #2032 C2d): an older reader would read its coordinates as degrees.
+pub(crate) const NATIVE_COORDINATES: &str = "native-coordinates";
 /// Independent marker sizes alongside classified point colours (`Layer::size_by`).
 pub(crate) const SIZE_BY_CAPABILITY: &str = "classified-point-size";
 /// The most entries a document's `requires` may list: past it the document is refused without
@@ -508,12 +525,15 @@ struct TableFile {
     crs_incomplete: bool,
     #[serde(default)]
     zm_dropped: bool,
+    /// The system its features are in, when not longitude/latitude (`Dataset::held_in`).
+    #[serde(default)]
+    held_in: Option<rustgis_data::raster::Crs>,
 }
 
 impl From<TableFile> for Table {
     /// Loads stored data under a fresh runtime identity, never one supplied by the file.
     fn from(t: TableFile) -> Self {
-        let TableFile { id, name, geometry_type, fields, features, source, crs, crs_incomplete, zm_dropped } = t;
+        let TableFile { id, name, geometry_type, fields, features, source, crs, crs_incomplete, zm_dropped, held_in } = t;
         Table {
             id,
             instance_id: next_table_instance(),
@@ -527,6 +547,9 @@ impl From<TableFile> for Table {
                 crs_incomplete,
                 zm_dropped,
                 windowed: false,
+                // As `Dataset`'s own saving writes them.
+                held_in: held_in.unwrap_or(rustgis_data::raster::Crs::LonLat),
+                shown_in: None,
             },
         }
     }
@@ -1702,6 +1725,7 @@ impl Project {
             }
         })?;
         let mut area_ids = std::collections::HashSet::new();
+        let mut offline_map_ids = std::collections::HashSet::new();
         if (!p.origin_id.is_empty() && !valid_field_id(&p.origin_id))
             || p.field_origin.as_ref().is_some_and(|origin| {
                 !valid_field_id(&origin.project)
@@ -1712,6 +1736,7 @@ impl Project {
                 (!area.id.is_empty() && (!valid_field_id(&area.id) || !area_ids.insert(area.id.as_str())))
                     || (!area.generation.is_empty() && !valid_field_id(&area.generation))
             })
+            || p.maps.iter().any(|map| map.offline_area_id.as_deref().is_some_and(|id| !valid_field_id(id) || !offline_map_ids.insert(id)))
         {
             return Err("not a RustGIS project: an offline field identity is invalid or duplicated".into());
         }
@@ -2457,6 +2482,8 @@ impl Durable for Table {
             crs_incomplete: _,
             zm_dropped: _,
             windowed: _,
+            held_in: _,
+            shown_in: _,
         } = dataset;
         if let Some(v) = provenance {
             p.string(Leaf::Table, v, true, rustgis_map::paths::is_local(v));

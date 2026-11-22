@@ -304,6 +304,8 @@ fn is_gpkg_target_error(error: &str) -> bool {
 
 /// Draws the active dialog and leaves it open on validation failure or a newly opened dialog.
 pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
+    // From the app's first frame, so a dialog's first frame has the focus it began with.
+    record_focus_at_pass_start(ctx);
     let Some(which) = app.dialogs.open else { return };
     if which == "calculateGeometry" {
         crate::geometrycalc::show(app, ctx);
@@ -375,24 +377,43 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         state.set_open(true);
         state.store(ctx);
         app.dialogs.reset_collapse = false;
+        // Opened, it starts with nothing focused (#2599): the ribbon button or another pane's box
+        // that had the focus would otherwise keep Enter from running it, and take that Enter too.
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
     }
 
-    // Opens centred and can be moved; each dialog remembers where it was put.
-    let window = egui::Window::new(tl!(title))
-        .id(window_id)
-        .open(&mut open)
-        .collapsible(is_add_service)
-        .resizable(false)
-        .pivot(Align2::CENTER_CENTER)
-        .default_pos(ctx.content_rect().center() + vec2(0.0, -40.0));
-    let window = if is_add_service { window.auto_sized() } else { window };
-    window.show(ctx, |ui| {
-        ui.set_width(match which {
-            "coordinateSystem" | "zarr" => 660.0,
-            "addTiles" | "addUrl" | "addService" | "s3" => 560.0,
-            "newConnection" | "editConnection" | "chooseConnection" | "s3Connections" => 520.0,
-            _ => 440.0,
-        });
+    let preferred_width = match which {
+        "coordinateSystem" | "zarr" => 660.0,
+        "addTiles" | "addUrl" | "addService" | "s3" => 560.0,
+        "newConnection" | "editConnection" | "chooseConnection" | "s3Connections" => 520.0,
+        _ => 440.0,
+    };
+    let frame = egui::Frame::window(&ctx.global_style());
+    let width = crate::widgets::dialog_width(ctx, preferred_width, frame);
+    let touch = app.touch.is_some();
+    let compact = touch || width < preferred_width;
+    let window = egui::Window::new(tl!(title)).id(window_id).frame(frame).open(&mut open).collapsible(is_add_service).resizable(false);
+    let window = if compact {
+        let outer_width = width + frame.total_margin().sum().x;
+        window.min_width(outer_width).max_width(outer_width)
+    } else if is_add_service {
+        window.auto_sized()
+    } else {
+        window
+    };
+    let window = if touch {
+        // Recenter after a rotation or keyboard resize.
+        window.anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    } else {
+        // Even a compact desktop dialog remembers where it was moved.
+        window.pivot(Align2::CENTER_CENTER).default_pos(ctx.content_rect().center() + vec2(0.0, -40.0))
+    };
+    let mut contents = |ui: &mut egui::Ui| {
+        ui.set_width(width);
         ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
         match which {
             "selectByAttributes" => close = select_by_attributes(app, ui, &t),
@@ -403,21 +424,32 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 let by_grid = earth && !app.dialogs.text.trim().is_empty();
                 egui::Grid::new("xy").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
                     let input_label = ui.label(tl!("Longitude (X)"));
-                    ui.add_enabled(!by_grid, egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("-74.006 · 74°0′22″W").desired_width(300.0))
-                        .labelled_by(input_label.id);
+                    ui.add_enabled(
+                        !by_grid,
+                        egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("-74.006 · 74°0′22″W").desired_width(300.0),
+                    )
+                    .labelled_by(input_label.id);
                     ui.end_row();
                     let input_label = ui.label(tl!("Latitude (Y)"));
-                    ui.add_enabled(!by_grid, egui::TextEdit::singleline(&mut app.dialogs.b).hint_text("40.7128 · 40°42′46″N").desired_width(300.0))
-                        .labelled_by(input_label.id);
+                    ui.add_enabled(
+                        !by_grid,
+                        egui::TextEdit::singleline(&mut app.dialogs.b).hint_text("40.7128 · 40°42′46″N").desired_width(300.0),
+                    )
+                    .labelled_by(input_label.id);
                     ui.end_row();
                     if earth {
                         let input_label = ui.label(tl!("Or grid reference"));
-                        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("18TWL8395907350 · 18north 583959 4507351").desired_width(300.0))
-                            .labelled_by(input_label.id);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut app.dialogs.text)
+                                .hint_text("18TWL8395907350 · 18north 583959 4507351")
+                                .desired_width(300.0),
+                        )
+                        .labelled_by(input_label.id);
                         ui.end_row();
                     }
                     let input_label = ui.label(tl!("Scale 1:"));
-                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("keep current")).desired_width(300.0)).labelled_by(input_label.id);
+                    ui.add(egui::TextEdit::singleline(&mut app.dialogs.c).hint_text(tl!("keep current")).desired_width(300.0))
+                        .labelled_by(input_label.id);
                     ui.end_row();
                 });
                 // Below the boxes, wrapped to the dialog's width rather than widening it.
@@ -449,7 +481,16 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 let input_label = ui.label(tl!("Source coordinate system"));
                 let recent = app.ui.recent_crs.clone();
                 let width = ui.available_width();
-                let (response, _) = crate::crspicker::crs_box(ui, "addShapefile", &mut app.dialogs.text, &recent, crate::crspicker::Offer::All, width, "EPSG:2263", &t);
+                let (response, _) = crate::crspicker::crs_box(
+                    ui,
+                    "addShapefile",
+                    &mut app.dialogs.text,
+                    &recent,
+                    crate::crspicker::Offer::All,
+                    width,
+                    "EPSG:2263",
+                    &t,
+                );
                 let response = response.labelled_by(input_label.id);
                 response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Source coordinate system")));
                 ui.label(tl!("In the browser, pick the .shp and .dbf together, with any sidecars, or pick a ZIP. The override applies to every Shapefile in the ZIP."));
@@ -466,7 +507,16 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 let input_label = ui.label(tl!("Source coordinate system"));
                 let recent = app.ui.recent_crs.clone();
                 let width = ui.available_width();
-                let (label, _) = crate::crspicker::crs_box(ui, "defineProjection", &mut app.dialogs.text, &recent, crate::crspicker::Offer::All, width, "EPSG:2263", &t);
+                let (label, _) = crate::crspicker::crs_box(
+                    ui,
+                    "defineProjection",
+                    &mut app.dialogs.text,
+                    &recent,
+                    crate::crspicker::Offer::All,
+                    width,
+                    "EPSG:2263",
+                    &t,
+                );
                 let label = label.labelled_by(input_label.id);
                 label.widget_info(|| egui::WidgetInfo::labeled(egui::Role::TextInput, true, tl!("Source coordinate system")));
                 ui.label(egui::RichText::new(tl!("Geometry lost during import cannot be recovered here. Use Import Original File to choose its coordinate system before reading it. Streamed layers must first be loaded into memory.")).weak());
@@ -542,7 +592,9 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "exportLayer" => close = export_layer(app, ui),
             "camera" => {
                 egui::Grid::new("cam").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
-                    for (label, v) in [("Longitude", &mut app.dialogs.a), ("Latitude", &mut app.dialogs.b), ("Scale 1:", &mut app.dialogs.c)] {
+                    for (label, v) in
+                        [("Longitude", &mut app.dialogs.a), ("Latitude", &mut app.dialogs.b), ("Scale 1:", &mut app.dialogs.c)]
+                    {
                         let input_label = ui.label(tl!(label));
                         ui.add(egui::TextEdit::singleline(v).desired_width(160.0)).labelled_by(input_label.id);
                         ui.end_row();
@@ -558,7 +610,11 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                         if s.is_empty() {
                             return Ok(None);
                         }
-                        s.parse::<f64>().ok().filter(|v| v.is_finite()).map(Some).ok_or_else(|| crate::i18n::fmt("{what} must be a number", &[("what", tl_raw!(what))]))
+                        s.parse::<f64>()
+                            .ok()
+                            .filter(|v| v.is_finite())
+                            .map(Some)
+                            .ok_or_else(|| crate::i18n::fmt("{what} must be a number", &[("what", tl_raw!(what))]))
                     };
                     let (lon, lat, scale) = (n(&app.dialogs.a, "Longitude")?, n(&app.dialogs.b, "Latitude")?, n(&app.dialogs.c, "Scale")?);
                     app.run("map.camera", json!({"lon": lon, "lat": lat, "scale": scale})).map(|_| ())
@@ -588,7 +644,13 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     // the command checks against its range.
                     let mut p = json!({});
                     let d = &app.dialogs;
-                    for (key, label, v) in [("frames", "Frames", &d.a), ("turn", "Turn", &d.b), ("width", "Width", &d.c), ("height", "Height", &d.d), ("speed", "Frame time", &d.e)] {
+                    for (key, label, v) in [
+                        ("frames", "Frames", &d.a),
+                        ("turn", "Turn", &d.b),
+                        ("width", "Width", &d.c),
+                        ("height", "Height", &d.d),
+                        ("speed", "Frame time", &d.e),
+                    ] {
                         let v = v.trim();
                         if !v.is_empty() {
                             let n = v.parse::<f64>().ok().filter(|n| n.is_finite());
@@ -617,14 +679,27 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     ui.end_row();
                     let input_label = ui.label(tl!("Data type"));
                     // Each type as the command names it, and as the interface shows it.
-                    let types =
-                        [("Long", tl!("Long")), ("Double", tl!("Double")), ("Text", tl!("Text")), ("Boolean", tl!("Boolean")), ("Date", tl!("Date")), ("DateTime", tl!("Date and time"))];
-                    let shown = types.iter().find(|(ty, _)| *ty == app.dialogs.b).map_or_else(|| app.dialogs.b.clone(), |(_, label)| label.to_string());
-                    egui::ComboBox::from_id_salt("af_type").selected_text(shown).show_ui(ui, |ui| {
-                        for (ty, label) in &types {
-                            ui.selectable_value(&mut app.dialogs.b, ty.to_string(), label.to_string());
-                        }
-                    }).response.labelled_by(input_label.id);
+                    let types = [
+                        ("Long", tl!("Long")),
+                        ("Double", tl!("Double")),
+                        ("Text", tl!("Text")),
+                        ("Boolean", tl!("Boolean")),
+                        ("Date", tl!("Date")),
+                        ("DateTime", tl!("Date and time")),
+                    ];
+                    let shown = types
+                        .iter()
+                        .find(|(ty, _)| *ty == app.dialogs.b)
+                        .map_or_else(|| app.dialogs.b.clone(), |(_, label)| label.to_string());
+                    egui::ComboBox::from_id_salt("af_type")
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            for (ty, label) in &types {
+                                ui.selectable_value(&mut app.dialogs.b, ty.to_string(), label.to_string());
+                            }
+                        })
+                        .response
+                        .labelled_by(input_label.id);
                     ui.end_row();
                 });
                 close = buttons(app, ui, "Add", |app| {
@@ -639,10 +714,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 }
                 /// The same, from the dialog's table and the session apart, so the box can be
                 /// written while it's read.
-                fn data_of(
-                    table: Option<(u64, u32)>,
-                    session: &rustgis_engine::Session,
-                ) -> Option<&rustgis_engine::data::Dataset> {
+                fn data_of(table: Option<(u64, u32)>, session: &rustgis_engine::Session) -> Option<&rustgis_engine::data::Dataset> {
                     match table {
                         Some((opened, id)) => session.project.table(id).filter(|_| opened == session.opened).map(|t| &t.dataset),
                         None => session.active_layer.and_then(|id| session.map().layer(id)).map(|l| &l.dataset),
@@ -651,11 +723,16 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 let fields: Vec<String> = data(app).map(|d| calculation_fields(d).map(|f| f.name.clone()).collect()).unwrap_or_default();
                 ui.horizontal(|ui| {
                     let input_label = ui.label(tl!("Field"));
-                    egui::ComboBox::from_id_salt("cf_field").selected_text(app.dialogs.a.clone()).width(220.0).show_ui(ui, |ui| {
-                        for f in &fields {
-                            ui.selectable_value(&mut app.dialogs.a, f.clone(), f);
-                        }
-                    }).response.labelled_by(input_label.id);
+                    egui::ComboBox::from_id_salt("cf_field")
+                        .selected_text(app.dialogs.a.clone())
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for f in &fields {
+                                ui.selectable_value(&mut app.dialogs.a, f.clone(), f);
+                            }
+                        })
+                        .response
+                        .labelled_by(input_label.id);
                 });
                 let input_label = ui.label(format!("{} =", app.dialogs.a));
                 // Suggestions as it's typed: the fields, functions, variables and keywords (#1240).
@@ -670,16 +747,22 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                 crate::exprcomplete::expr_edit(ui, id, &mut app.dialogs.text, ds, style).labelled_by(input_label.id);
                 // Read once no suggestion is offered: a word still being chosen isn't an error yet.
                 let text = app.dialogs.text.trim();
-                let reads = data(app).filter(|_| !text.is_empty() && !crate::exprcomplete::offering(ui, id)).map(|d| rustgis_engine::cmd::edit::check_calculation(text, d));
+                let reads = data(app)
+                    .filter(|_| !text.is_empty() && !crate::exprcomplete::offering(ui, id))
+                    .map(|d| rustgis_engine::cmd::edit::check_calculation(text, d));
                 if let Some(Err(e)) = reads {
                     let t = Tokens::get(ui.ctx());
                     ui.label(egui::RichText::new(crate::i18n::fmt("Invalid: {error}", &[("error", &e)])).small().color(t.red));
                 }
                 // A standalone table has no selection: every row.
                 let help = if app.dialogs.table.is_some() {
-                    tl!("Fields, numbers, 'text', + - * / % ^, || to join text, comparisons, CASE and functions such as round(), upper(), if() or scale_linear(). Applies to every row of the table.")
+                    tl!(
+                        "Fields, numbers, 'text', + - * / % ^, || to join text, comparisons, CASE and functions such as round(), upper(), if() or scale_linear(). Applies to every row of the table."
+                    )
                 } else {
-                    tl!("Fields, numbers, 'text', + - * / % ^, || to join text, comparisons, CASE and functions such as round(), upper(), if() or scale_linear(). Applies to the selected rows, or every row when none is selected.")
+                    tl!(
+                        "Fields, numbers, 'text', + - * / % ^, || to join text, comparisons, CASE and functions such as round(), upper(), if() or scale_linear(). Applies to the selected rows, or every row when none is selected."
+                    )
                 };
                 ui.label(egui::RichText::new(help).small().weak());
                 close = buttons(app, ui, "Calculate", |app| {
@@ -737,6 +820,22 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         if let Some(i) = &app.dialogs.info {
             ui.label(egui::RichText::new(i).color(t.green));
         }
+    };
+    window.show(ctx, |ui| {
+        if which == "coordinateSystem" {
+            // The fixed-height panes can overflow even at full width. Reserve the title bar
+            // and frame, then let the body shrink to the form when it fits.
+            let heading = egui::TextStyle::Heading.resolve(ui.style());
+            let title_height = ui.fonts_mut(|fonts| fonts.row_height(&heading)) + frame.inner_margin.sum().y + frame.stroke.width;
+            let body_height = (ctx.content_rect().height() - frame.total_margin().sum().y - title_height).max(0.0);
+            ui.set_max_height(body_height);
+            egui::ScrollArea::new([compact, true]).min_scrolled_height(0.0).auto_shrink([false, true]).show(ui, contents);
+        } else if compact {
+            // Keep tall forms and rows with minimum widths reachable in compact dialogs.
+            egui::ScrollArea::both().auto_shrink([false, true]).show(ui, contents);
+        } else {
+            contents(ui);
+        }
     });
     if (!open || close) && app.dialogs.open == Some(which) {
         app.dialogs.open = None;
@@ -766,11 +865,7 @@ fn save_project(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         edit.state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(end))));
         edit.state.store(ui.ctx(), edit.response.id);
     }
-    let place = if cfg!(any(target_os = "android", target_os = "ios")) {
-        tl!("You choose where the project is saved next.")
-    } else {
-        tl!("The project downloads as this file, to the folder your browser saves downloads in.")
-    };
+    let place = tl!("The project downloads as this file, to the folder your browser saves downloads in.");
     ui.label(egui::RichText::new(place).small().weak());
     buttons(app, ui, "Save", |app| {
         let file = app.dialogs.text.clone();
@@ -2339,10 +2434,10 @@ pub(crate) fn buttons_enabled(
     f: impl FnOnce(&mut RustGisApp) -> Result<(), String>,
 ) -> bool {
     let mut close = false;
+    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) && enter_is_the_dialogs(ui);
     ui.add_space(4.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
         let t = Tokens::get(ui.ctx());
-        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
         let submit = ui.add_enabled_ui(enabled, |ui| crate::widgets::dialog_button(ui, tl!(ok), Some(t.accent), vec2(84.0, 28.0))).inner;
         if enabled && (submit.clicked() || enter) {
             match f(app) {
@@ -2355,6 +2450,53 @@ pub(crate) fn buttons_enabled(
         }
     });
     close
+}
+
+/// Whether an Enter pressed this frame is the dialog's (drawn in `ui`) to run it: nothing had the
+/// keyboard focus as the frame began, or one of the dialog's own text boxes had it (#2599). Enter
+/// on a focused button, drop-down or check box is that widget's click (egui takes it so), so
+/// Cancel cancels and a field button adds its field without the dialog running too; nor does a
+/// box in another pane (dialogs aren't modal) run it. The focus as the frame began, not now: a
+/// one-line box gives it up in the frame it takes Enter, before this runs, and a Shift+Tab into a
+/// box moves it only as the next frame begins.
+fn enter_is_the_dialogs(ui: &egui::Ui) -> bool {
+    let ctx = ui.ctx();
+    // None only before the recorder's first pass (the app's first frame): no Enter of the dialog's
+    // then, as the focus it began with isn't known.
+    let Some(FocusAtStart(start)) = ctx.data(|d| d.get_temp::<FocusAtStart>(focus_at_start_key())) else { return false };
+    let Some(id) = start else { return true };
+    egui::text_edit::TextEditState::load(ctx, id).is_some() && ctx.read_response(id).is_some_and(|r| r.layer_id == ui.layer_id())
+}
+
+/// The widget that had the keyboard focus as the pass began, before any widget took its keys.
+#[derive(Clone, Copy)]
+struct FocusAtStart(Option<egui::Id>);
+
+fn focus_at_start_key() -> egui::Id {
+    egui::Id::unique("dialog_focus_at_pass_start")
+}
+
+/// Sets up [`FocusAtPassStart`], once (until its first pass records, egui adding a plugin type
+/// once); it records from the next pass on, as egui takes a pass's plugins as it begins.
+fn record_focus_at_pass_start(ctx: &egui::Context) {
+    if ctx.data(|d| d.get_temp::<FocusAtStart>(focus_at_start_key())).is_none() {
+        ctx.add_plugin(FocusAtPassStart);
+    }
+}
+
+/// Records [`FocusAtStart`] as every pass begins: egui runs a plugin's `on_begin_pass` after its
+/// own focus bookkeeping (a Shift+Tab's move applied), before the pass's widgets.
+struct FocusAtPassStart;
+
+impl egui::plugin::Plugin for FocusAtPassStart {
+    fn debug_name(&self) -> &'static str {
+        "FocusAtPassStart"
+    }
+
+    fn on_begin_pass(&mut self, ui: &mut egui::Ui) {
+        let focused = ui.ctx().memory(|m| m.focused());
+        ui.ctx().data_mut(|d| d.insert_temp(focus_at_start_key(), FocusAtStart(focused)));
+    }
 }
 
 /// Adds `word` to the end of the clause `text`, set apart from what the clause ends with, so a
@@ -2439,19 +2581,28 @@ fn select_by_attributes(app: &mut RustGisApp, ui: &mut egui::Ui, t: &Tokens) -> 
             .labelled_by(input_label.id);
         ui.end_row();
     });
-    ui.label(egui::RichText::new(tl!("Where")).font(semibold(12.5)));
-    ui.add(
-        text_box(&mut app.dialogs.text)
+    let input_label = ui.label(egui::RichText::new(tl!("Where")).font(semibold(12.5)));
+    // Suggestions as it's typed: the fields, functions, variables and keywords (#1240).
+    let ds = app.session.map().layer_by_name(&app.dialogs.layer).map(|l| &l.dataset);
+    let id = egui::Id::unique("sba_where");
+    crate::exprcomplete::expr_edit_lines(ui, id, &mut app.dialogs.text, ds, |text| {
+        text_box(text)
             .hint_text(tl!("e.g. pop_est > 100000000 AND continent = 'Asia'"))
             .desired_rows(3)
             .desired_width(f32::INFINITY)
-            .font(egui::TextStyle::Monospace),
-    );
-    let fields = app.session.map().layer_by_name(&app.dialogs.layer).map(|l| l.dataset.fields.as_slice()).unwrap_or_default();
+            .font(egui::TextStyle::Monospace)
+    })
+    .labelled_by(input_label.id);
+    let fields = ds.map(|d| d.fields.as_slice()).unwrap_or_default();
     field_chips(ui, fields, &mut app.dialogs.text);
-    // Live validation.
-    let check =
-        app.session.map().layer_by_name(&app.dialogs.layer).map(|l| rustgis_engine::data::query::select(&app.dialogs.text, &l.dataset));
+    // Live validation, once no suggestion is offered: a word still being chosen isn't an error yet.
+    let offering = crate::exprcomplete::offering(ui, id);
+    let check = app
+        .session
+        .map()
+        .layer_by_name(&app.dialogs.layer)
+        .filter(|_| !offering)
+        .map(|l| rustgis_engine::data::query::select(&app.dialogs.text, &l.dataset));
     match (&check, app.dialogs.text.trim().is_empty()) {
         (_, true) => {}
         (Some(Ok(rows)), _) => {
@@ -2871,6 +3022,76 @@ fn calculation_fields(dataset: &rustgis_engine::data::Dataset) -> impl Iterator<
 mod tests {
     use super::*;
 
+    #[test]
+    fn narrow_desktop_dialog_remembers_its_dragged_position() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = RustGisApp::with_sample();
+        app.dialogs.open("addUrl", &app.session).unwrap();
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(480.0, 720.0))
+            .allow_missing_glyphs()
+            .build_ui_state(|ui, app| show(app, ui.ctx()), app);
+        h.run();
+        let title = |h: &egui_kittest::Harness<'_, RustGisApp>| {
+            let window = h.get_by_role_and_label(Role::Window, "Add Data From URL").rect();
+            egui::pos2(window.center().x, window.top() + 12.0)
+        };
+        let start = title(&h);
+        let end = start + vec2(0.0, -100.0);
+        h.hover_at(start);
+        h.run();
+        h.drag_at(start);
+        h.run();
+        h.hover_at(end);
+        h.run();
+        h.drop_at(end);
+        h.run();
+        let moved = title(&h);
+        assert!(moved.y < start.y - 80.0, "title moved from {start:?} to {moved:?}");
+
+        h.state_mut().dialogs.open = None;
+        h.run();
+        let app = h.state_mut();
+        app.dialogs.open("addUrl", &app.session).unwrap();
+        h.run();
+        assert_eq!(title(&h), moved);
+    }
+
+    #[test]
+    fn coordinate_system_actions_are_reachable_in_a_short_desktop_window() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = RustGisApp::with_sample();
+        app.dialogs.open("coordinateSystem", &app.session).unwrap();
+        app.dialogs.text = "robinson".into();
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(1000.0, 360.0))
+            .allow_missing_glyphs()
+            .with_context_setup(|ctx| crate::theme::install_fonts(ctx, &[], None))
+            .build_ui_state(|ui, app| show(app, ui.ctx()), app);
+        h.run();
+        h.hover_at(egui::pos2(790.0, 240.0));
+        h.run();
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, -1000.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+        });
+        h.run();
+
+        let apply = h.get_by_role_and_label(Role::Button, "Apply");
+        assert!(h.ctx.content_rect().contains_rect(apply.rect()), "Apply is outside the viewport");
+        apply.click();
+        h.run();
+        assert_eq!(h.state().session.map().projection.code(), "robinson");
+        assert_eq!(h.state().dialogs.open, None);
+    }
+
     /// A clause's buttons add a field as the expression names it (`"Pop Est"` in quotes, a plain
     /// name as it is), and every operator, `>=` and `NOT` among them; at most `MAX_FIELD_CHIPS`
     /// fields are offered, and none an earlier one shadows (`POP` after `pop`), which takes no
@@ -3030,6 +3251,246 @@ mod tests {
         assert!(h.query_by_role_and_label(Role::Button, &first).is_some(), "the list opened");
         assert_eq!(h.state().dialogs.open, Some("selectByAttributes"), "the dialog is still open");
         assert_eq!(h.state().dialogs.error, None, "and didn't run");
+    }
+
+    /// Select By Attributes on Countries with a clause that matches, in the app harness.
+    fn sba_ready() -> egui_kittest::Harness<'static, RustGisApp> {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.dialog", json!({"name": "selectByAttributes"})).unwrap();
+        app.dialogs.layer = "Countries".into();
+        app.dialogs.text = "pop_est > 100000000".into();
+        let mut h = app_harness(app);
+        h.run_steps(3);
+        h
+    }
+
+    fn selected(app: &RustGisApp) -> usize {
+        app.session.map().layer_by_name("Countries").map_or(0, |l| l.selection.len())
+    }
+
+    /// Enter on a focused Cancel cancels: the dialog closes and selects nothing (#2599).
+    #[test]
+    fn enter_on_cancel_cancels() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = sba_ready();
+        h.get_by_role_and_label(Role::Button, "Cancel").focus();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.open, None, "Cancel closed it");
+        assert_eq!(selected(h.state()), 0, "and nothing was selected");
+    }
+
+    /// Enter on a focused field button adds the field, and the clause isn't run with it (#2599).
+    #[test]
+    fn enter_on_a_field_button_adds_it_only() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = sba_ready();
+        h.state_mut().dialogs.text = "pop_est > 1 AND".into();
+        h.run();
+        h.get_by_role_and_label(Role::Button, "continent").focus();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.text, "pop_est > 1 AND continent ", "the field added");
+        assert_eq!(h.state().dialogs.open, Some("selectByAttributes"), "the dialog is still open");
+        assert_eq!(h.state().dialogs.error, None, "and didn't run");
+        assert_eq!(selected(h.state()), 0);
+    }
+
+    /// Enter in the dialog's own box runs it (Shift+Enter breaks the line there, #419), and so
+    /// does Enter on its focused Apply, or with nothing focused.
+    #[test]
+    fn enter_in_the_box_or_on_apply_runs_the_dialog() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = sba_ready();
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("sba_where")));
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.open, None, "the box's Enter applied");
+        let n = selected(h.state());
+        assert!(n > 0, "and selected");
+        let mut h = sba_ready();
+        h.get_by_role_and_label(Role::Button, "Apply").focus();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.open, None, "Apply's Enter applied");
+        assert_eq!(h.state().dialogs.error, None);
+        assert_eq!(selected(h.state()), n);
+        let mut h = sba_ready();
+        assert_eq!(h.ctx.memory(|m| m.focused()), None, "nothing focused");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.open, None, "Enter with nothing focused applied");
+        assert_eq!(selected(h.state()), n);
+    }
+
+    /// A one-line box gives the focus up in the frame it takes Enter: the dialog's own (Rename)
+    /// still runs it; one in another pane drawn before the dialog doesn't (#2599).
+    #[test]
+    fn enter_in_a_one_line_box_runs_only_its_own_dialog() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        let id = app.session.map().layers.first().map(|l| l.id).unwrap();
+        app.run("layer.select", json!({"layer": id})).unwrap();
+        app.run("ui.dialog", json!({"name": "renameLayer"})).unwrap();
+        app.dialogs.text = "Renamed".into();
+        let (mut fonts, mut other) = (false, String::new());
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                // Another pane's box, drawn before the dialog as the app's panes are.
+                egui::Area::new(egui::Id::unique("other_pane")).fixed_pos(egui::pos2(10.0, 850.0)).show(&ctx, |ui| {
+                    let label = ui.label("Other");
+                    ui.add(egui::TextEdit::singleline(&mut other).id(egui::Id::unique("other_box"))).labelled_by(label.id);
+                });
+                super::show(app, &ctx);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("other_box")));
+        h.run();
+        assert_eq!(h.ctx.memory(|m| m.focused()), Some(egui::Id::unique("other_box")), "the other box focused");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.open, Some("renameLayer"), "the other pane's Enter didn't run it");
+        assert_ne!(h.state().session.map().layer(id).unwrap().name, "Renamed");
+        h.get_by_role_and_label(Role::TextInput, "Name").focus();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.open, None, "its own box's Enter ran it");
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, "Renamed");
+    }
+
+    /// A dialog opened from the keyboard (Enter on a focused ribbon button) starts with nothing
+    /// focused: the next Enter runs it, rather than pressing the button again (#2599).
+    #[test]
+    fn a_dialog_opened_from_the_keyboard_takes_the_next_enter() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        let id = app.session.map().layers.first().map(|l| l.id).unwrap();
+        app.run("layer.select", json!({"layer": id})).unwrap();
+        let old = app.session.map().layer(id).unwrap().name.clone();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let ctx = ui.ctx().clone();
+                // The ribbon's button, drawn before the dialog as the ribbon is.
+                egui::Area::new(egui::Id::unique("ribbon")).fixed_pos(egui::pos2(10.0, 850.0)).show(&ctx, |ui| {
+                    if ui.button("Rename…").clicked() {
+                        app.run("ui.dialog", json!({"name": "renameLayer"})).unwrap();
+                        app.dialogs.text = "Renamed".into();
+                    }
+                });
+                super::show(app, &ctx);
+            },
+            app,
+        );
+        h.run_steps(3);
+        h.get_by_role_and_label(Role::Button, "Rename…").focus();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.open, Some("renameLayer"), "Enter on the button opened it");
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, old, "and didn't run it");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.open, None, "the next Enter ran it");
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, "Renamed");
+    }
+
+    /// Enter that another pane's one-line box takes in the very first frame drawing a dialog,
+    /// before the focus recorder has run once, doesn't run the dialog (#2599).
+    #[test]
+    fn enter_before_the_focus_is_recorded_does_not_run_the_dialog() {
+        let mut app = RustGisApp::with_sample();
+        let id = app.session.map().layers.first().map(|l| l.id).unwrap();
+        app.run("layer.select", json!({"layer": id})).unwrap();
+        let old = app.session.map().layer(id).unwrap().name.clone();
+        app.run("ui.dialog", json!({"name": "renameLayer"})).unwrap();
+        app.dialogs.text = "Renamed".into();
+        let ctx = egui::Context::default();
+        let (mut other, other_id) = (String::new(), egui::Id::unique("cold_other_box"));
+        ctx.memory_mut(|m| m.request_focus(other_id));
+        let enter =
+            egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 900.0)));
+        let input = egui::RawInput { screen_rect, events: vec![enter], ..Default::default() };
+        ctx.run_ui(input, |ui| {
+            egui::Area::new(egui::Id::unique("cold_other_pane")).show(ui.ctx(), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut other).id(other_id));
+            });
+            super::show(&mut app, ui.ctx());
+        })
+        // Nothing renders this pass: its textures are dropped.
+        .textures_delta
+        .clear();
+        assert_eq!(ctx.memory(|m| m.focused()), None, "the box took the Enter");
+        assert_eq!(app.dialogs.open, Some("renameLayer"), "the dialog didn't run");
+        assert_eq!(app.session.map().layer(id).unwrap().name, old);
+    }
+
+    /// Enter on a focused drop-down opens it, and the dialog doesn't run (#2599).
+    #[test]
+    fn enter_on_a_drop_down_opens_it_only() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut h = sba_ready();
+        h.get_by_role_and_label(Role::ComboBox, "Selection Type").focus();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.query_by_label("Add To Current Selection").is_some(), "the drop-down opened");
+        assert_eq!(h.state().dialogs.open, Some("selectByAttributes"), "the dialog is still open");
+        assert_eq!(selected(h.state()), 0, "and didn't run");
+    }
+
+    /// Shift+Tab from Rename's button into its box moves the focus as the next frame begins; Enter
+    /// in that very frame, the box taking it, runs the dialog.
+    #[test]
+    fn enter_right_after_shift_tab_into_the_box_runs_the_dialog() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        let id = app.session.map().layers.first().map(|l| l.id).unwrap();
+        app.run("layer.select", json!({"layer": id})).unwrap();
+        app.run("ui.dialog", json!({"name": "renameLayer"})).unwrap();
+        app.dialogs.text = "Renamed".into();
+        let mut h = app_harness(app);
+        h.run_steps(3);
+        h.get_by_role_and_label(Role::Button, "Rename").focus();
+        h.run();
+        // Two passes in a row, by hand: the harness runs one more between its steps, by which the
+        // focus has moved already.
+        let ctx = h.ctx.clone();
+        let screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1200.0, 900.0)));
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        for event in [key(egui::Key::Tab, egui::Modifiers::SHIFT), key(egui::Key::Enter, egui::Modifiers::NONE)] {
+            let input = egui::RawInput { screen_rect, events: vec![event], ..Default::default() };
+            // Nothing renders these passes: their textures are dropped.
+            ctx.run_ui(input, |ui| super::show(h.state_mut(), ui.ctx())).textures_delta.clear();
+        }
+        assert_eq!(h.state().dialogs.open, None, "the box's Enter ran it");
+        assert_eq!(h.state().session.map().layer(id).unwrap().name, "Renamed");
     }
 
     /// In the app (its whole frame, shortcuts included), Escape closes a clause's Functions list:
@@ -3327,6 +3788,68 @@ mod tests {
         assert_eq!(shown(&h) + 1, offered, "the list closed");
         assert!(h.query_by_label_contains("no field named 'pop_'").is_some(), "the error once the list is closed");
         assert_eq!(h.state().dialogs.open, Some("calculateField"), "Escape took the list, not the dialog");
+    }
+
+    /// A call's signature floats over the box, so the error under it stays in view: `sqrt()`
+    /// shows both, apart.
+    #[test]
+    fn calculate_field_keeps_the_error_in_view_under_a_signature() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::new(Session::new(rustgis_engine::Project::default()));
+        app.run("layer.addDataText", json!({"fileName": "pops.csv", "text": "pop_est,name\n1,a\n"})).unwrap();
+        app.run("edit.enable", json!({"on": true})).unwrap();
+        let id = app.session.project.tables[0].id;
+        app.run("ui.dialog", json!({"name": "calculateField", "table": id})).unwrap();
+        let mut h = app_harness(app);
+        h.run_steps(3);
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("cf_expression")));
+        h.run();
+        h.event(egui::Event::Text("sqrt()".into()));
+        h.run();
+        h.key_press(egui::Key::ArrowLeft);
+        h.run_steps(3);
+        let signature = h.get_by_role_and_label(Role::Label, "sqrt(x)").rect();
+        let error = h.get_by_label_contains("Invalid:").rect();
+        let input = h.get_by_role(Role::TextInput).rect();
+        assert!(!signature.intersects(error), "the signature {signature:?} covers the error {error:?}");
+        assert!(signature.bottom() <= input.top(), "the signature {signature:?} floats over the box {input:?}");
+    }
+
+    /// Select By Attributes' box of several lines suggests as it is typed: Enter takes the field
+    /// offered, not Apply; no error while a word is still being chosen; Escape closes the list,
+    /// not the dialog.
+    #[test]
+    fn select_by_attributes_suggests_as_its_clause_is_typed() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.dialog", json!({"name": "selectByAttributes"})).unwrap();
+        app.dialogs.layer = "Countries".into();
+        let mut h = app_harness(app);
+        h.run_steps(3);
+        // Counted, as the field buttons under the box name them too.
+        let shown = |h: &egui_kittest::Harness<'static, RustGisApp>, name: &str| h.query_all_by_role_and_label(Role::Button, name).count();
+        let (pop, continent) = (shown(&h, "pop_est"), shown(&h, "continent"));
+        h.ctx.memory_mut(|m| m.request_focus(egui::Id::unique("sba_where")));
+        h.run();
+        h.event(egui::Event::Text("pop_e".into()));
+        h.run();
+        assert_eq!(shown(&h, "pop_est"), pop + 1, "the field offered");
+        assert!(h.query_by_label_contains("Invalid:").is_none(), "no error while it is offered");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().dialogs.text, "pop_est");
+        assert_eq!(h.state().dialogs.open, Some("selectByAttributes"), "Enter took the field, not Apply");
+        assert_eq!(h.state().dialogs.error, None, "and didn't run");
+        h.event(egui::Event::Text(" > 1 AND cont".into()));
+        h.run();
+        assert_eq!(shown(&h, "continent"), continent + 1, "offered on");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert_eq!(shown(&h, "continent"), continent, "the list closed");
+        assert_eq!(h.state().dialogs.open, Some("selectByAttributes"), "Escape took the list, not the dialog");
+        assert!(h.query_by_label_contains("Invalid:").is_some(), "the error once the list is closed");
     }
 
     /// The app in a harness, its fonts installed on the first pass (the dialog draws on the next).

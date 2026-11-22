@@ -39,6 +39,31 @@ pub const REPAIR_SOURCE: &str = "if the file was moved or deleted, restore it or
 
 const RECONNECT_REQUIRED: &str = "this database source came from a peer; reconnect explicitly before reading it";
 
+/// The kinds of read note one opening of a source says at most ([`SourceLayer::saw_read_notes`]).
+const READ_NOTE_KINDS: usize = 32;
+
+/// A read note's kind: its text with each count as `#`, so the same note with another count (a view
+/// read of another sample) is the same kind. A count is a number that starts the note or a clause
+/// (after `: `, `, `, `; ` or `(`) and is followed by a space, as notes put their counts ("3 of the
+/// shapes read …", "so far, 2 values …"). Any other number (an EPSG code, a column's place, a
+/// count written mid-clause) is kept, so notes that differ in it are kinds of their own.
+fn note_kind(note: &str) -> String {
+    let mut kind = String::with_capacity(note.len());
+    let mut rest = note;
+    while let Some(start) = rest.find(|c: char| c.is_ascii_digit()) {
+        let (before, from) = rest.split_at(start);
+        let len = from.find(|c: char| !c.is_ascii_digit()).unwrap_or(from.len());
+        let (digits, after) = from.split_at(len);
+        // A run of digits is whole, so only the note's first can have nothing before it.
+        let opens = (kind.is_empty() && before.is_empty()) || [": ", ", ", "; ", "("].iter().any(|p| before.ends_with(p));
+        kind.push_str(before);
+        kind.push_str(if opens && after.starts_with(' ') { "#" } else { digits });
+        rest = after;
+    }
+    kind.push_str(rest);
+    kind
+}
+
 /// Ambiguous polygon areas among decoded features, including rows an area query could not keep.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AmbiguousAreas {
@@ -49,8 +74,27 @@ pub struct AmbiguousAreas {
 impl AmbiguousAreas {
     /// Count each affected feature once and all of its ambiguous rings.
     pub fn from_features(features: &[rustgis_data::Feature]) -> Self {
+        Self::from_geometries(features.iter().filter_map(|feature| feature.geometry.as_ref()))
+    }
+
+    /// [`AmbiguousAreas::from_features`] of features given in `crs`, read in longitude/latitude
+    /// (a place that can't be given there is left out of its ring).
+    pub fn from_features_in(features: &[rustgis_data::Feature], crs: rustgis_data::raster::Crs) -> Self {
+        if crs == rustgis_data::raster::Crs::LonLat {
+            return Self::from_features(features);
+        }
+        let Ok(to) = crs.to(rustgis_data::raster::Crs::LonLat) else { return Self::default() };
+        // One converted geometry at a time, not a copy of the layer.
         let mut counts = Self::default();
-        for geometry in features.iter().filter_map(|feature| feature.geometry.as_ref()) {
+        for g in features.iter().filter_map(|f| f.geometry.as_ref()) {
+            counts.include(Self::from_geometries(std::iter::once(&to.geometry(g))));
+        }
+        counts
+    }
+
+    fn from_geometries<'a>(geometries: impl Iterator<Item = &'a rustgis_data::Geometry>) -> Self {
+        let mut counts = Self::default();
+        for geometry in geometries {
             let rings = geometry.ambiguous_area_rings();
             if rings > 0 {
                 counts.rings = counts.rings.saturating_add(rings);
@@ -111,6 +155,14 @@ pub struct SourceLayer {
     null_text: Option<Vec<usize>>,
     #[serde(skip)]
     null_text_said: bool,
+    /// What else view reads lost or assumed ([`Batch::notes`]), until said by
+    /// [`SourceLayer::take_read_notes`].
+    #[serde(skip)]
+    read_notes: Vec<String>,
+    /// The kinds of note view reads of this opening have given ([`note_kind`]): each is said once,
+    /// with the count of the read that first gave it, not again on each redraw.
+    #[serde(skip)]
+    read_note_kinds: Vec<String>,
     #[serde(skip)]
     window: Option<Window>,
     /// Whole-source thinning decisions shared by render snapshots, independent of view rows.
@@ -772,6 +824,62 @@ impl SourceLayer {
         rustgis_data::source::null_text_note(&fields, &counts)
     }
 
+    /// Keeps what view reads said they lost or assumed ([`Batch::notes`]) until
+    /// [`SourceLayer::take_read_notes`] says it: each kind of note once for the opening, as the
+    /// next redraw reads the same features again. Two notes are one kind when they differ only in
+    /// their counts ([`note_kind`]: a number starting the note or a clause, before a space); notes
+    /// that differ in any other number or word are kinds of their own. Past [`READ_NOTE_KINDS`]
+    /// kinds, one last note says there are more.
+    pub fn saw_read_notes(&mut self, notes: &[String]) {
+        for note in notes.iter().filter(|n| !n.trim().is_empty()) {
+            let kind = note_kind(note);
+            if self.read_note_kinds.contains(&kind) {
+                continue;
+            }
+            if self.read_note_kinds.len() >= READ_NOTE_KINDS {
+                if !self.read_note_kinds.iter().any(String::is_empty) {
+                    // The empty kind marks the overflow note said: no note kept has an empty kind.
+                    self.read_note_kinds.push(String::new());
+                    self.read_notes.push(format!(
+                        "reading it for the map gave more than {READ_NOTE_KINDS} kinds of note; Load All Features lists them all"
+                    ));
+                }
+                return;
+            }
+            self.read_note_kinds.push(kind);
+            self.read_notes.push(note.clone());
+        }
+    }
+
+    /// What view reads said they lost or assumed ([`Batch::notes`]) and haven't said yet, each
+    /// kind once for the opening ([`SourceLayer::saw_read_notes`]).
+    pub fn take_read_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.read_notes)
+    }
+
+    /// Forgets which read notes were said, so the next view read says them again: the source was
+    /// opened anew or its file written.
+    pub fn forget_read_notes(&mut self) {
+        self.read_notes.clear();
+        self.read_note_kinds.clear();
+    }
+
+    /// For an undo snapshot: drops the notes not yet said, which the live layer says, and keeps
+    /// the kinds, so a snapshot of another opening restored later doesn't say them again.
+    pub fn hold_read_notes(&mut self) {
+        self.read_notes.clear();
+    }
+
+    /// After undo, redo or a rollback restores this layer: the same opening as `live` (the layer
+    /// it replaces) keeps what `live` has said and has still to say, as restoring the project
+    /// doesn't read the source again. Another opening keeps its own.
+    pub fn keep_read_notes(&mut self, live: &SourceLayer) {
+        if self.same_opening(live) {
+            self.read_notes.clone_from(&live.read_notes);
+            self.read_note_kinds.clone_from(&live.read_note_kinds);
+        }
+    }
+
     /// Whether another installed window needs its retained display expressions checked.
     pub fn take_display_window(&mut self) -> bool {
         if self.reads == self.display_read_said {
@@ -962,9 +1070,20 @@ impl SourceLayer {
         Ok(new)
     }
 
+    /// The system its features are given in ([`FeatureSource::coord_crs`]): the file's own for a
+    /// file read in place; longitude/latitude until it is open.
+    pub fn coord_crs(&self) -> rustgis_data::raster::Crs {
+        self.handle.as_ref().map_or(rustgis_data::raster::Crs::LonLat, |h| h.coord_crs())
+    }
+
     /// A source that can be read whole a chunk at a time, for an export.
     pub fn visit_source(&self) -> Option<Arc<dyn FeatureSource>> {
         self.handle.as_ref().filter(|h| h.visits_chunks()).cloned()
+    }
+
+    /// A source that can provide all features in an extent a chunk at a time.
+    pub(super) fn visit_extent_source(&self) -> Option<Arc<dyn FeatureSource>> {
+        self.handle.as_ref().filter(|h| h.visits_extent_chunks()).cloned()
     }
 
     /// A source capable of a complete, ordered render traversal.
@@ -1503,6 +1622,7 @@ impl SourceLayer {
         self.rounded_dates_said = false;
         self.null_text = None;
         self.null_text_said = false;
+        self.forget_read_notes();
         self.reset();
         self.open()
     }
@@ -1831,6 +1951,8 @@ impl SourceLayer {
             rounded_dates_said: _,
             null_text: _,
             null_text_said: _,
+            read_notes: _,
+            read_note_kinds: _,
             gdal,
             duckdb,
             postgis,
@@ -1979,6 +2101,79 @@ mod tests {
             assert_eq!((said.0.is_some(), said.1.is_some()), (!unread_first, unread_first), "unread first: {unread_first}");
             assert_eq!(source.take_unread_dates(), (None, None));
         }
+    }
+
+    /// A view read's notes are said once for each kind, whatever count a later read of another
+    /// sample gives; a new kind is still said; too many kinds end in one note saying so; a source
+    /// opened anew says them again.
+    #[test]
+    fn view_read_notes_are_said_once_for_each_kind() {
+        let mut source = super::SourceLayer::default();
+        let note = |n: usize| format!("{n} of the shapes read (a sample of the layer, which may hold more) have a NaN");
+        source.saw_read_notes(&[note(3), String::new(), " ".into()]);
+        source.saw_read_notes(&[note(5)]);
+        assert_eq!(source.take_read_notes(), [note(3)]);
+        source.saw_read_notes(&[note(12), "7 values cut".into()]);
+        assert_eq!(source.take_read_notes(), ["7 values cut"]);
+        assert!(source.take_read_notes().is_empty());
+        // A source with endless kinds of note says the first ones, then one note that there are more.
+        let many: Vec<String> = (0..2 * super::READ_NOTE_KINDS)
+            .map(|k| format!("kind {}: 1", char::from(b'a' + (k % 26) as u8).to_string().repeat(k / 26 + 1)))
+            .collect();
+        source.saw_read_notes(&many);
+        source.saw_read_notes(&many);
+        let said = source.take_read_notes();
+        assert_eq!(said.len(), super::READ_NOTE_KINDS - 1, "{said:?}");
+        assert!(said.last().is_some_and(|n| n.contains("Load All Features lists them all")), "{said:?}");
+        source.forget_read_notes();
+        source.saw_read_notes(&[note(4)]);
+        assert_eq!(source.take_read_notes(), [note(4)]);
+    }
+
+    /// Only counts make two notes one kind: notes differing in another number stay apart.
+    #[test]
+    fn a_read_note_kind_folds_counts_only() {
+        let mut source = super::SourceLayer::default();
+        let epsg = |code: u32| format!("rows in EPSG {code} are read as longitude/latitude");
+        let column = |at: u32| format!("values cut in column {at}");
+        let notes = [
+            "3 of the shapes read have a NaN".to_string(),
+            "5 of the shapes read have a NaN".into(),
+            "roads: so far, 2 values cut (4 fields)".into(),
+            "roads: so far, 7 values cut (1 fields)".into(),
+            epsg(4326),
+            epsg(3857),
+            column(2),
+            column(3),
+            "EPSG:4326: 3 shape(s) left out".into(),
+            "EPSG:3857: 3 shape(s) left out".into(),
+        ];
+        source.saw_read_notes(&notes);
+        let said = source.take_read_notes();
+        let expected = [&notes[0], &notes[2], &notes[4], &notes[5], &notes[6], &notes[7], &notes[8], &notes[9]];
+        assert_eq!(said.iter().collect::<Vec<_>>(), expected);
+        assert_eq!(super::note_kind("12 of 40 read; 3 left"), "# of 40 read; # left");
+    }
+
+    /// A layer brought back by undo keeps what its live opening said; another opening keeps its own.
+    #[test]
+    fn a_restored_layer_keeps_the_live_openings_read_notes() {
+        let mut live = super::SourceLayer::default();
+        live.saw_read_notes(&["2 shape(s) left out".into()]);
+        let mut snapshot = live.clone();
+        snapshot.hold_read_notes();
+        assert!(snapshot.take_read_notes().is_empty(), "the snapshot leaves the unsaid note to the live layer");
+        assert_eq!(live.take_read_notes(), ["2 shape(s) left out"]);
+        let mut restored = live.clone();
+        restored.forget_read_notes();
+        restored.keep_read_notes(&live);
+        restored.saw_read_notes(&["4 shape(s) left out".into()]);
+        assert!(restored.take_read_notes().is_empty(), "said by the live layer");
+        let other = super::SourceLayer { path: Some("other.shp".into()), ..Default::default() };
+        let mut kept = other.clone();
+        kept.keep_read_notes(&live);
+        kept.saw_read_notes(&["4 shape(s) left out".into()]);
+        assert_eq!(kept.take_read_notes(), ["4 shape(s) left out"], "another opening");
     }
 
     /// A paused schema worker reports real progress; Cancel wins for every source copy and

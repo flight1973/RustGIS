@@ -68,6 +68,8 @@ mod mapgpu;
 mod mapmenu;
 mod mapview;
 mod markerimages;
+mod markerpick;
+pub use markerpick::{MarkerImage, marker_file_too_large};
 mod measure_units;
 mod modelbuilder;
 mod navui;
@@ -92,6 +94,7 @@ pub enum Landed {
     Ran(Result<Value, String>),
     NotRun(String),
 }
+mod annotation;
 mod boxedit;
 mod circleedit;
 #[cfg(not(target_arch = "wasm32"))]
@@ -201,6 +204,16 @@ pub const SHORTCUT_PICK: &str = "\u{1}shortcuts:";
 /// Script pane's Load….
 pub const SCRIPT_PICK: &str = "\u{1}script:";
 
+/// Starts the name of an image the shell's `"marker:<id>"` picker put in the inbox, followed by
+/// `<id>:`: it goes to the marker whose «Image…» asked for it, and only a file so marked, for the
+/// request still waiting, does.
+pub const MARKER_PICK: &str = "\u{1}marker:";
+
+/// The largest image file a marker takes: one whose base64 fits the engine's limit
+/// ([`rustgis_engine::map::symbology::MAX_PICTURE_BYTES`]). The browser's and the phone's shells
+/// refuse a larger one before reading it.
+pub const MARKER_FILE_MAX_BYTES: usize = rustgis_engine::map::symbology::MAX_PICTURE_BYTES / 4 * 3;
+
 /// The largest script file the Script pane's Load… reads, as the assistant's command file; the
 /// browser's shell refuses a larger one before reading it.
 pub const SCRIPT_FILE_MAX_BYTES: usize = 1024 * 1024;
@@ -285,6 +298,27 @@ fn window_turn(left: &std::sync::atomic::AtomicBool) -> Option<std::sync::MutexG
             Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     }
+}
+
+/// Reads a downloaded PDF's page or GRIB file ([`read_download_page`]) on the calling thread, with
+/// `left` as its Cancel: the reader's progress checks look at it there, between messages and
+/// before each band is laid out, so a GRIB file's read stops once the message or band under way
+/// is done (one message's decode, of at most `max_samples` values, isn't stopped) and gives up
+/// its turn. A bug is said, not left to end the
+/// thread (no command's catch reaches it).
+///
+/// [`read_download_page`]: rustgis_engine::cmd::raster::read_download_page
+#[cfg(not(target_arch = "wasm32"))]
+fn read_download(
+    name: &str,
+    bytes: &[u8],
+    page: Option<&str>,
+    place: bool,
+    left: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<rustgis_engine::data::raster::Raster, String> {
+    let _probe = rustgis_engine::data::progress::install(Some(std::sync::Arc::new(syncmark::Stop(left.clone()))));
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rustgis_engine::cmd::raster::read_download_page(name, bytes, page, place)))
+        .unwrap_or_else(|_| Err(tl!("Reading the download failed unexpectedly").to_string()))
 }
 
 /// A shell's overrides of the Settings › Start-up preferences for one launch.
@@ -396,6 +430,9 @@ pub struct Services {
     /// Offers bytes as a download named `file_name`; success means submission to the host's
     /// download mechanism. Browsers do not expose confirmation that the file was saved.
     pub download: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
+    /// Starts saving a project through the phone's native picker. The shell reports the
+    /// eventual result through [`RustGisApp::complete_project_save`].
+    pub save_project: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
     pub inbox: Option<Inbox>,
     /// Reads a saved preference (`language`, …).
     pub load_pref: Option<Box<dyn Fn(&str) -> Option<String>>>,
@@ -417,7 +454,7 @@ pub struct Services {
     /// Makes an HTTP request (the AI assistant's calls to its model) and puts the response, of any
     /// status, in the slot (the browser's fetch; the desktop sends it on a thread).
     pub http: Option<Box<dyn Fn(rustgis_assistant::HttpRequest, Slot<Result<rustgis_assistant::HttpResponse, rustgis_assistant::Error>>)>>,
-    /// Where autosave keeps the recovery copy of unsaved work (the desktop's recovery folder).
+    /// Where autosave keeps the recovery copy of unsaved work (the native app's recovery folder).
     /// `None` turns autosave off: the browser for now, and a second copy of the desktop app
     /// running alongside the first, which mustn't touch its copy.
     pub recovery: Option<Box<dyn RecoveryStore>>,
@@ -674,6 +711,7 @@ pub enum RightPane {
     Symbology,
     History,
     Editing,
+    Annotation,
     Design,
     Workflows,
     Script,
@@ -990,6 +1028,9 @@ pub struct UiState {
     pub pending_layout_picture: bool,
     /// The corners of a picture graphic waiting for its image file.
     pub pending_picture: Option<Vec<rustgis_engine::geom::Coord>>,
+    /// A marker whose «Image…» waits for its file (web and phone), which comes back marked
+    /// ([`MARKER_PICK`]).
+    pub pending_marker_image: Option<MarkerImage>,
     /// The value picked under Edit › Dynamic Text (a token such as `{scale}`): the text tool's
     /// dialog starts with it. Cleared when the tool changes.
     pub dynamic_text: Option<&'static str>,
@@ -1088,6 +1129,7 @@ impl Default for UiState {
             open_url: None,
             copy_image: None,
             pending_picture: None,
+            pending_marker_image: None,
             pending_layout_picture: false,
             pending_open: None,
             web_file: None,
@@ -1197,11 +1239,12 @@ const CAPTURE_MIN_DPI: f64 = 36.0;
 pub const FIXES_KEPT: usize = 200_000;
 
 impl RustGisApp {
-    /// Keeps a position the shell reported: the last one in [`RustGisApp::position`], and each in
-    /// [`RustGisApp::fixes`] until an interface takes them (the oldest dropped past
-    /// [`FIXES_KEPT`]).
+    /// Updates the live position if this fix is recent and accurate enough. Queues every fix
+    /// for tracking and averaging (the oldest dropped past [`FIXES_KEPT`]).
     pub fn report_position(&mut self, fix: rustgis_engine::platform::Fix) {
-        self.position = Some(fix);
+        if self.position.is_none_or(|current| replaces_live_position(current, fix)) {
+            self.position = Some(fix);
+        }
         if self.fixes.len() >= FIXES_KEPT {
             self.fixes.pop_front();
             self.fixes_dropped += 1;
@@ -1210,11 +1253,44 @@ impl RustGisApp {
     }
 }
 
+/// Whether `fix` replaces the shown position: not when it is older, nor when it is much less
+/// accurate and the shown one is recent. Android compares its monotonic time, which a change to
+/// the wall clock doesn't move. iOS has only the fix's UTC timestamp: a fix a little behind the
+/// shown one is a late one and is dropped, while one further behind than the hold means the clock
+/// was set back, and it is taken rather than freezing the position until the clock catches up.
+fn replaces_live_position(current: rustgis_engine::platform::Fix, fix: rustgis_engine::platform::Fix) -> bool {
+    use std::time::Duration;
+    const HOLD: Duration = Duration::from_secs(5);
+
+    let age = match (current.elapsed_realtime_nanos, fix.elapsed_realtime_nanos) {
+        (Some(current), Some(new)) => match new.checked_sub(current) {
+            Some(age) => Duration::from_nanos(age),
+            None => return false,
+        },
+        (None, None) => match current.time.zip(fix.time) {
+            Some((current, new)) if new >= current => Duration::from_millis(new.abs_diff(current)),
+            Some((current, new)) => return Duration::from_millis(new.abs_diff(current)) >= HOLD,
+            None => return true,
+        },
+        _ => return true,
+    };
+    // At the usual one fix per second this bridges a brief GPS dropout. After five seconds a
+    // walking crew may already be outside the old fix's accuracy radius.
+    if age >= HOLD {
+        return true;
+    }
+    // Held back only when much worse (a network fix after a GPS one), so the usual jitter of a
+    // few metres in GPS accuracy still moves the marker with every fix.
+    let shown = current.accuracy.unwrap_or(f64::INFINITY);
+    fix.accuracy.unwrap_or(f64::INFINITY) <= shown * 2.0
+}
+
 pub struct RustGisApp {
     pub session: Session,
     pub(crate) boxes: boxedit::State,
     pub(crate) circles: circleedit::State,
     pub(crate) conversion: shapeconvert::State,
+    pub(crate) annotation: annotation::State,
     pub ui: UiState,
     pub map: mapview::MapView,
     pub dialogs: dialogs::Dialogs,
@@ -1244,13 +1320,12 @@ pub struct RustGisApp {
     /// Whether the user wants the device's position shown: a shell that can report one (a
     /// phone's) starts and stops its positioning by this, and fills in [`RustGisApp::position`].
     pub locate: bool,
-    /// Where the device is, as the shell last reported it; `None` until it has, and again once
-    /// positioning is off. An interface draws it on the map and can capture at it.
+    /// The selected live fix for the marker and capture cross, if positioning is on and a fix
+    /// has arrived.
     pub position: Option<rustgis_engine::platform::Fix>,
-    /// Every position the shell reported since an interface last took them, oldest first (at most
-    /// [`FIXES_KEPT`]: the oldest go first). [`RustGisApp::position`] is only the last: a track
-    /// or an average needs each, including those that arrived together after the app was out of
-    /// sight.
+    /// Every fix the shell reported since an interface last took them, in arrival order (at most
+    /// [`FIXES_KEPT`]). A track or average needs each, including those that arrived together after
+    /// the app was out of sight.
     pub fixes: std::collections::VecDeque<rustgis_engine::platform::Fix>,
     /// Whether the interface wants positions while the app is out of sight too (a track being
     /// recorded): a phone's shell keeps them coming then, with the notice its system requires.
@@ -1530,6 +1605,7 @@ impl RustGisApp {
             boxes: boxedit::State::default(),
             circles: circleedit::State::default(),
             conversion: shapeconvert::State::default(),
+            annotation: annotation::State::default(),
             ui,
             map: mapview::MapView::default(),
             dialogs: dialogs::Dialogs::default(),
@@ -2059,8 +2135,8 @@ impl RustGisApp {
     /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
     /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`];
     /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview; script picks
-    /// carry [`SCRIPT_PICK`] and open in the Script pane; DXF picks
-    /// carry [`DXF_PICK`] and open Import DXF.
+    /// carry [`SCRIPT_PICK`] and open in the Script pane; marker picks carry [`MARKER_PICK`] and
+    /// become the waiting marker's image; DXF picks carry [`DXF_PICK`] and open Import DXF.
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
         if name.starts_with(SHORTCUT_PICK) {
             return shortcutfile::picked(self, bytes);
@@ -2068,6 +2144,22 @@ impl RustGisApp {
         if let Some(name) = name.strip_prefix(SCRIPT_PICK) {
             // An answer with no name is a cancelled picker.
             return if name.is_empty() { Ok(Value::Null) } else { analysispane::script_picked(self, name, bytes) };
+        }
+        if let Some(picked) = name.strip_prefix(MARKER_PICK) {
+            // Only the request still waiting takes its answer: an earlier one's file, still on its
+            // way when another «Image…» was clicked, is dropped, and said. An answer with no name
+            // is a cancelled picker, which ends the wait.
+            let (id, name) = picked.split_once(':').unwrap_or_default();
+            if self.ui.pending_marker_image.as_ref().is_none_or(|m| m.request.to_string() != id) {
+                if !name.is_empty() {
+                    self.session.notify(tl!("An image picked for an earlier Image… was dropped: pick it again for that marker"), true);
+                }
+                return Ok(Value::Null);
+            }
+            return match self.ui.pending_marker_image.take() {
+                Some(marker) if !name.is_empty() => marker.apply(self, bytes),
+                _ => Ok(Value::Null),
+            };
         }
         if let Some(name) = name.strip_prefix(TOOL_FILE_PICK) {
             panes::received_file(self, name, bytes);
@@ -2310,13 +2402,7 @@ impl RustGisApp {
             self.session.mark_unsaved();
             self.ui.history_jump = None;
         }
-        // On Android the file is written once the user has chosen its place, and the shell
-        // says then whether it was.
-        let offered = if cfg!(any(target_os = "android", target_os = "ios")) {
-            crate::i18n::fmt("Choose where to save {name}.", &[("name", &file)])
-        } else {
-            crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)])
-        };
+        let offered = crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)]);
         self.session.notify(offered, false);
         report.notify(&mut self.session);
         for note in construction_notes {
@@ -2714,10 +2800,26 @@ impl RustGisApp {
         }
     }
 
+    /// Enables foreground recovery for a phone. The store must be in the app's private storage
+    /// and must be installed before the first frame, so it can offer the last run's copy.
+    /// Call this after [`Self::with_services`], which replaces the entire service bundle.
+    pub fn with_edit_recovery(mut self, store: Box<dyn RecoveryStore>) -> Self {
+        self.services.recovery = Some(store);
+        self.autosave.phone = true;
+        autosave::next_offer(&mut self);
+        self
+    }
+
     /// A clean exit (the desktop app's `on_exit`): the recovery copy of this run's unsaved work
     /// is removed, as recovery is for a run that didn't close. Call it once, as the app closes.
     pub fn end_autosave(&mut self) {
         autosave::end(self);
+    }
+
+    /// The phone's activity ending (Back): submit the latest edit and give the writer a short
+    /// chance to finish. The last complete copy stays available for the next launch.
+    pub fn finish_recovery_copy(&mut self) {
+        autosave::finish(self);
     }
 
     /// The app closing (the desktop app's `on_exit`): an export still writing is cancelled and
@@ -2799,6 +2901,15 @@ impl RustGisApp {
         }
         if id.starts_with(rustgis_engine::plugins::PREFIX) {
             return self.ask_plugin(id, params).map(|()| Value::Null);
+        }
+        if id == "raster.imageGrid" {
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.reads_off_frame {
+                return readjob::run_then(self, "raster.imageGrid", params, Some(annotation::show_grid_result));
+            }
+            let result = self.run(id, params);
+            annotation::show_grid_result(self, Landed::Ran(result.clone()));
+            return result;
         }
         self.run(id, params)
     }
@@ -2884,11 +2995,15 @@ impl RustGisApp {
             if id == "source.syncState" {
                 return readjob::run_then(self, "source.syncState", params, Some(sync_state_said));
             }
-            // Counting a column goes over every row of the layer: on a thread of its own, and the
-            // answer shown once it lands (the table's Statistics window).
+            // Direct desktop callers receive a queue acknowledgement; callbacks receive the frame.
+            // Script lines use engine dispatch and consume their prepared worker results instead.
+            if id == "raster.imageGrid" {
+                return readjob::run(self, "raster.imageGrid", params);
+            }
             if id == "edit.previewShapeConversion" {
                 return readjob::run_shape_conversion(self, params);
             }
+            // Counting a column goes over every row: the Statistics window shows the landed answer.
             if id == "table.statistics" {
                 return readjob::run_then(self, "table.statistics", params, Some(table::statistics_landed));
             }
@@ -2909,10 +3024,11 @@ impl RustGisApp {
                 let mark = self.session.notice_mark();
                 return exportjob::start(self, "map.exportBlock", params).inspect_err(|e| self.command_failed(id, e, mark));
             }
-            // Ordering and writing a standalone table grows with its rows, like Export Features.
-            if id == "share.exportTable" {
+            // Table exports and field packages can both read and write large inputs.
+            if matches!(id, "share.exportTable" | "offline.package") {
+                let command = if id == "offline.package" { "offline.package" } else { "share.exportTable" };
                 let mark = self.session.notice_mark();
-                return exportjob::start(self, "share.exportTable", params).inspect_err(|e| self.command_failed(id, e, mark));
+                return exportjob::start(self, command, params).inspect_err(|e| self.command_failed(id, e, mark));
             }
             // Converting the labels of a layer read in place reads all of its source first, on a
             // thread of its own, whoever asks (a click, the assistant).
@@ -3020,6 +3136,7 @@ impl RustGisApp {
         // Nested commands (including scripts) can replace rows too; never retarget a chosen
         // vertex or held gesture to the replacement feature at the same row.
         crate::vertexedit::cancel_stale_drag(self);
+        annotation::sync(self);
         crate::boxedit::cancel_stale(self);
         crate::circleedit::cancel_stale(self);
         if let Err(e) = &r {
@@ -3481,6 +3598,23 @@ impl RustGisApp {
                     return self.run_ui("ui.pane.layerProperties", &json!({"tab": "source", "layer": layer}));
                 }
             }
+            "ui.pane.annotation" => {
+                if self.ui.right == Some(RightPane::Annotation) {
+                    self.ui.close_right(RightPane::Annotation);
+                } else {
+                    annotation::open(self)?;
+                }
+            }
+            "ui.annotationImage" => annotation::select_image(self, p)?,
+            "ui.annotationFilename" => {
+                annotation::filename_option(self, p.get("on").and_then(Value::as_bool).ok_or_else(|| tl!("on is required").to_string())?)
+            }
+            "ui.annotationGrid" => annotation::select_grid(
+                self,
+                p.get("pixels").and_then(Value::as_bool).ok_or_else(|| tl!("pixels is required").to_string())?,
+            )?,
+            "ui.annotationCancel" => annotation::cancel_read(self),
+            "ui.annotationLayer" => annotation::select_layer(self, p)?,
             "ui.pane.editing" => toggle_right(&mut self.ui, RightPane::Editing),
             "ui.pane.design" => toggle_right(&mut self.ui, RightPane::Design),
             "ui.pane.script" => toggle_right(&mut self.ui, RightPane::Script),
@@ -4298,6 +4432,11 @@ impl RustGisApp {
                             "tif",
                             "tiff",
                             "asc",
+                            // GRIB weather and climate model output.
+                            "grb",
+                            "grib",
+                            "grb2",
+                            "grib2",
                         ][..],
                         // Rasters GDAL reads (every one it is asked to read).
                         #[cfg(not(target_arch = "wasm32"))]
@@ -4342,6 +4481,9 @@ impl RustGisApp {
                     }
                     return r;
                 }
+            }
+            "ui.save" | "ui.saveAs" if self.services.save_project.is_some() => {
+                saveprompt::start_project_save(self)?;
             }
             // The browser can't write a file in place: Save downloads the project again under the
             // file name it was saved or opened as, and Save As (or a first Save) asks for one.
@@ -4498,6 +4640,20 @@ impl RustGisApp {
             }
             "ui.saveItem" => {
                 let kind = p.get("kind").and_then(Value::as_str).ok_or("kind is required")?;
+                #[cfg(not(target_arch = "wasm32"))]
+                if kind == "fieldPackage" && self.reads_off_frame && self.services.download.is_none() {
+                    exportjob::idle(self)?;
+                    let name = rustgis_engine::cmd::field::suggested_name(&self.session, p);
+                    let Some(path) = dialogs::pick_save(&name, &["rgisfield"], tl!("RustGIS field package")) else {
+                        return Ok(Value::Null);
+                    };
+                    let mut params = p.clone();
+                    if let Some(fields) = params.as_object_mut() {
+                        fields.remove("kind");
+                        fields.insert("path".into(), json!(path));
+                    }
+                    return self.run("offline.package", params);
+                }
                 // A field package makes an offline area first: one not saved after all goes again.
                 let areas = self.session.project.offline_areas.len();
                 let session = &mut self.session;
@@ -4970,13 +5126,16 @@ impl RustGisApp {
             "ui.exportLayer" if p.get("format").and_then(Value::as_str).is_none() => {
                 self.dialogs.open("exportLayer", &self.session)?;
             }
-            "ui.exportLayer" if self.services.download.is_some() => {
+            "ui.exportLayer" | "ui.annotationExport" if self.services.download.is_some() => {
+                let annotation_export = id == "ui.annotationExport";
                 let id = self.export_target(p)?;
                 let construction_notes = self.session.layer_construction_output_notes(id)?;
                 let l = self.session.map().layer(id).ok_or_else(|| tl!("select a layer in the Layers pane first").to_string())?;
                 // Any format the dialog offers here (`dialogs::export_formats`): not GeoPackage or
                 // FlatGeobuf, which the data crate refuses in the browser.
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
+                let download_ext = if ext == "shp" { "zip".to_string() } else { ext.clone() };
+                let name = annotation::export_name(self, id, &download_ext, annotation_export)?;
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
                 use std::borrow::Cow;
@@ -5000,8 +5159,7 @@ impl RustGisApp {
                         return Err(e);
                     }
                 };
-                let ext = if ext == "shp" { "zip".to_string() } else { ext };
-                let name = format!("{}.{ext}", l.name);
+                let ext = download_ext;
                 // The features written, read whole, give their own extent, in longitude/latitude
                 // (not a raster's, or the one a streamed layer's source declares).
                 let mut notes = rustgis_engine::data::export_notes([(ds.as_ref(), ds.lonlat_extent())], &name, crs);
@@ -5120,7 +5278,8 @@ impl RustGisApp {
                     return self.run("share.exportMap", args);
                 }
             }
-            "ui.exportLayer" => {
+            "ui.exportLayer" | "ui.annotationExport" => {
+                let annotation_export = id == "ui.annotationExport";
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 let label = dialogs::EXPORT_FORMATS
                     .iter()
@@ -5131,6 +5290,7 @@ impl RustGisApp {
                 // Checked as the command checks them, before a file is asked for; then passed on.
                 let gpkg = rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 let id = self.export_target(p)?;
+                let name = annotation::export_name(self, id, &ext, annotation_export)?;
                 let with_table = |mut args: Value| {
                     for key in ["mode", "tableName"] {
                         if let Some(v) = p.get(key) {
@@ -5149,7 +5309,6 @@ impl RustGisApp {
                     }
                     return Ok(Value::Null);
                 }
-                let name = self.session.map().layer(id).map(|l| format!("{}.{ext}", l.name)).unwrap_or_default();
                 if let Some(path) = dialogs::pick_save(&name, &[ext.as_str()], label) {
                     // The format chosen decides: its extension is added unless it was typed (a dot
                     // in the name, as in "U.S. Cities", isn't taken for one).
@@ -5720,7 +5879,8 @@ impl RustGisApp {
             match r {
                 Ok(bytes) => {
                     let landed = serviceui::Landed { id, url, params: p, origin };
-                    // A PDF's page is drawn on a thread first, so a large one doesn't hold the window.
+                    // A PDF's page is drawn, and a GRIB file read, on a thread first, so a large one
+                    // doesn't hold the window.
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(page) = rustgis_engine::cmd::raster::download_page(&landed.url, &landed.params, &bytes) {
                         self.draw_page(landed, bytes, page);
@@ -5731,7 +5891,7 @@ impl RustGisApp {
                 Err(e) => self.landed_failed(id, &url, &p, e),
             }
         }
-        // PDF pages drawn on threads, added with their downloads' bytes.
+        // PDF pages drawn (and GRIB files read) on threads, added with their downloads' bytes.
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut drawn = Vec::new();
@@ -5760,7 +5920,7 @@ impl RustGisApp {
                 std::mem::take(&mut self.ui.page_queue).into_iter().partition(|(l, ..)| self.session.download_under_way(l.id));
             self.ui.page_queue = waiting;
             for (landed, ..) in gone {
-                let why = tl!("given up before its page was drawn: its project was closed, or more than 64 downloads started after it");
+                let why = tl!("given up before it was read: its project was closed, or more than 64 downloads started after it");
                 self.landed_failed(landed.id, &landed.url, &landed.params, why.to_string());
             }
             // Those waiting take the places freed, oldest first.
@@ -5835,8 +5995,9 @@ impl RustGisApp {
             left.store(true, std::sync::atomic::Ordering::Relaxed);
             Some((url, p))
         });
-        // A PDF page waiting for its turn gives it up; one being drawn is left to finish, its
-        // page dropped (drawing a page is one step that can't be stopped).
+        // A PDF page or GRIB file waiting for its turn gives it up; a GRIB file being read stops
+        // once the message or band under way is done ([`read_download`]), and a page being drawn
+        // is left to finish, its page dropped (drawing a page is one step that can't be stopped).
         #[cfg(not(target_arch = "wasm32"))]
         let cancelled = cancelled.or_else(|| {
             let i = self.ui.page_reads.iter().position(|(l, ..)| l.id == id)?;
@@ -5965,15 +6126,17 @@ impl RustGisApp {
         Ok(Value::Null)
     }
 
-    /// Draws a downloaded PDF's page on a thread ([`rustgis_engine::cmd::raster::read_download_page`]),
+    /// Draws a downloaded PDF's page, or reads a downloaded GRIB file, on a thread
+    /// ([`rustgis_engine::cmd::raster::read_download_page`]),
     /// to be added with its bytes once drawn ([`UiState::page_reads`]). `page`: its file name, page
     /// and whether it is placed ([`download_page`]). Drawn one at a time with the windows' reads;
     /// past [`MAX_WINDOW_READS`] under way, or where the OS gives no thread, it waits in
     /// [`UiState::page_queue`] and is tried again each frame: held, listed under way and
     /// cancellable, until a thread can be had (never drawn on the frame, and the download isn't
     /// lost). Whether it started now. Cancel takes it
-    /// off the list and gives up its turn; a drawing under way (one step the renderer can't stop)
-    /// finishes, its page dropped.
+    /// off the list and gives up its turn; a GRIB file's read under way stops once the message or
+    /// band it is on is done ([`read_download`]), and a drawing under way (one step the renderer
+    /// can't stop) finishes, its page dropped.
     ///
     /// [`download_page`]: rustgis_engine::cmd::raster::download_page
     #[cfg(not(target_arch = "wasm32"))]
@@ -5990,17 +6153,21 @@ impl RustGisApp {
         // Kept here too, so a thread the OS refuses doesn't take the download with it.
         let bytes = std::sync::Arc::new(bytes);
         let mine = bytes.clone();
-        let spawned = std::thread::Builder::new().name("pdf-page".into()).spawn(move || {
-            let read = match window_turn(&leaving) {
+        let spawned = std::thread::Builder::new().name("download-read".into()).spawn(move || {
+            let turn = window_turn(&leaving);
+            let read = match turn {
                 // On a thread no command's catch reaches: a bug must not leave it running forever.
-                Some(_turn) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    rustgis_engine::cmd::raster::read_download_page(&name, &bytes, page.as_deref(), place)
-                }))
-                .unwrap_or_else(|_| Err(tl!("Drawing the PDF's page failed unexpectedly").to_string())),
-                None => Err(tl!("given up before its page was drawn: it was cancelled, or its project was closed").to_string()),
+                Some(_) => read_download(&name, &bytes, page.as_deref(), place, &leaving),
+                None => Err(tl!("given up before it was read: it was cancelled, or its project was closed").to_string()),
             };
             let bytes = std::sync::Arc::try_unwrap(bytes).unwrap_or_else(|shared| (*shared).clone());
             *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(read.map(|r| (bytes, r)));
+            // As a window's read: the next read waits for the frame to take this one (or for it to
+            // be cancelled, or the app to be gone), so one read raster at most waits to be added.
+            while std::sync::Arc::strong_count(&land) > 1 && land.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(turn);
         });
         match spawned {
             Ok(_) => {
@@ -6312,6 +6479,7 @@ impl RustGisApp {
 
     /// Per-frame work that doesn't draw (theme, fonts, files that arrived).
     pub fn logic(&mut self, ctx: &egui::Context) {
+        annotation::sync(self);
         #[cfg(not(target_arch = "wasm32"))]
         self.session.statistics_need_read_ahead(self.reads_off_frame);
         let _diagnostics = self.session.diagnostics.enter();
@@ -6319,6 +6487,8 @@ impl RustGisApp {
         // never waits for cast shadows still being worked out: it says they were (Never hold the
         // window). Exports drawn off it wait for them.
         rustgis_engine::render::on_the_interface_thread();
+        // Layers landed from a background read meanwhile learn their map's system too.
+        self.session.note_shown_systems();
         // A pass egui asks to repeat is the same frame: `ui` sets the delay once, from the first pass.
         if ctx.current_pass_index() == 0 {
             self.frame_start = Some(web_time::Instant::now());
@@ -6483,7 +6653,9 @@ impl RustGisApp {
         // reach.
         self.note_last_project();
         saveprompt::close_requested(self, ctx);
-        autosave::tick(self, ctx);
+        if !self.autosave.phone {
+            autosave::tick(self, ctx);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if self.watch_files {
             diskwatch::tick(self, ctx);
@@ -6819,6 +6991,11 @@ impl RustGisApp {
         pluginstart::frame_drawn(self, &ctx);
         // Cancel, save prompts and any project changes from UI controls take effect first.
         chrome::advance_history_jump(self, &ctx);
+        // Capture and photo attachment land during UI handling. Submit a due checkpoint
+        // in the same frame, after those edits.
+        if self.autosave.phone {
+            autosave::tick(self, &ctx);
+        }
         // CJK text this frame drew with no face for it: the next frame's `logic` deals with it
         // (`ensure_data_cjk_font`), so there must be a next frame, though no input comes.
         if rustgis_engine::render::fonts::peek_missing_cjk().iter().any(|s| !self.cjk_scripts_handled.contains(s)) {
@@ -7691,6 +7868,24 @@ mod record_tests {
         held.lock().unwrap().pop().unwrap()(Ok(br#"{"type":"Point","coordinates":[1,2]}"#.to_vec()));
         app.poll_data_downloads();
         assert!(app.session.map().layer_by_name("Cancelled download").is_none());
+    }
+
+    /// A GRIB download's read looks at its Cancel as it goes: once cancelled, it stops and says so
+    /// rather than reading on to its end with the turn held.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn a_cancelled_grib_read_stops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // A GRIB2 message whose length runs past these bytes: read through, it is cut short.
+        let mut bytes = b"GRIB\0\0\0\x02".to_vec();
+        bytes.extend(1000u64.to_be_bytes());
+        bytes.resize(64, 0);
+        let left = std::sync::Arc::new(AtomicBool::new(false));
+        let read = crate::read_download("t.grb", &bytes, None, true, &left).unwrap_err();
+        assert!(!read.contains("cancel"), "{read}");
+        left.store(true, Ordering::Relaxed);
+        let cancelled = crate::read_download("t.grb", &bytes, None, true, &left).unwrap_err();
+        assert!(cancelled.to_lowercase().contains("cancel"), "{cancelled}");
     }
 
     /// A PDF download's page waiting for its turn to be drawn is cancelled like a download: taken

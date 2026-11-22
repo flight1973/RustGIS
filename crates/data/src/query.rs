@@ -35,7 +35,7 @@ mod complete;
 #[cfg(test)]
 mod legacy;
 
-pub use complete::{Call, Completion, Place, complete_at};
+pub use complete::{Call, Completion, FieldValue, FieldValues, Place, VALUES_READ, complete_at, field_values, literal};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -392,10 +392,10 @@ impl Func {
             ),
             Func::Floor => ("floor", 1, 1, "floor(x)", "Rounded down", "floor(2.7)"),
             Func::Ceil => ("ceil", 1, 1, "ceil(x)", "Rounded up", "ceil(2.1)"),
-            Func::Sqrt => ("sqrt", 1, 1, "sqrt(x)", "Square root", "sqrt(16)"),
-            Func::Exp => ("exp", 1, 1, "exp(x)", "e to the power x", "exp(1)"),
-            Func::Ln => ("ln", 1, 1, "ln(x)", "Natural logarithm", "ln(10)"),
-            Func::Log10 => ("log10", 1, 1, "log10(x)", "Base-10 logarithm", "log10(1000)"),
+            Func::Sqrt => ("sqrt", 1, 1, "sqrt(x)", "Square root; null for a negative number", "sqrt(16)"),
+            Func::Exp => ("exp", 1, 1, "exp(x)", "e to the power x; null when too large to represent", "exp(1)"),
+            Func::Ln => ("ln", 1, 1, "ln(x)", "Natural logarithm; null for zero or a negative number", "ln(10)"),
+            Func::Log10 => ("log10", 1, 1, "log10(x)", "Base-10 logarithm; null for zero or a negative number", "log10(1000)"),
             Func::Pi => ("pi", 0, 0, "pi()", "π", "pi()"),
             Func::Min => {
                 ("min", 1, MAX_ARGS, "min(a, b, …)", "The smallest number; values that aren't numbers are skipped", "min(3, 1, 2)")
@@ -417,7 +417,7 @@ impl Func {
                 6,
                 6,
                 "scale_exp(x, d0, d1, r0, r1, exponent)",
-                "As scale_linear, along a curve: 0.5 grows fast then slowly, 2 slowly then fast",
+                "As scale_linear, along a curve: 0.5 grows fast then slowly, 2 slowly then fast; null with a negative exponent at the domain's start",
                 "scale_exp(50, 0, 100, 2, 12, 0.5)",
             ),
             Func::ToString => ("to_string", 1, 1, "to_string(x)", "x as text", "to_string(42)"),
@@ -819,6 +819,8 @@ struct Probe {
     call: Option<(Option<Func>, usize, usize)>,
     /// The field a value at the end is compared with (`name = ▮`, `name IN (▮`).
     field: Option<usize>,
+    /// Whether that value is a `LIKE` / `ILIKE` pattern (`name LIKE ▮`).
+    pattern: bool,
 }
 
 /// How a token is written, for the symbols [`Probe`] notes.
@@ -864,8 +866,15 @@ impl Parser<'_> {
     }
     /// Notes that a value at the end would be compared with `l`, when `l` is a field.
     fn note_compared(&self, l: &Expr) {
+        self.note_compared_as(l, false);
+    }
+    /// As [`note_compared`](Self::note_compared), the value a `LIKE` pattern when `pattern`.
+    fn note_compared_as(&self, l: &Expr, pattern: bool) {
         if let Expr::Field(f) = l {
-            self.note(self.pos, |p| p.field = Some(*f));
+            self.note(self.pos, |p| {
+                p.field = Some(*f);
+                p.pattern = pattern;
+            });
         }
     }
     fn probing(&self) -> bool {
@@ -971,7 +980,7 @@ impl Parser<'_> {
         }
         let negate = self.eat_kw(Kw::Not);
         if self.eat_kw(Kw::Like) || self.eat_kw(Kw::Ilike) {
-            self.note_compared(&l);
+            self.note_compared_as(&l, true);
             let p = self.concat()?;
             return Ok(match (l, p) {
                 (Expr::Field(field), Expr::Lit(Value::Text(pattern))) => Expr::Like { field, pattern, negate },

@@ -61,6 +61,8 @@ fn panel(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     if b(p, "refresh").unwrap_or(false) && !decl.state.is_empty() {
+        // Refreshed, whether it works or not: a failure is said, not run again on every frame.
+        s.panels_to_refresh.remove(id);
         // A failed refresh leaves the values as they were, as a failed command does.
         if let Err(e) = s.run(&rustgis_plugins::command_id(id, &decl.state), &json!({})) {
             *s.panel_state(id, &decl) = before;
@@ -587,16 +589,38 @@ impl Bridge<'_> {
         let target = asked_crs(self.s.map(), l, p)?;
         let limit = uint(p, "limit").and_then(|n| usize::try_from(n).ok()).unwrap_or(usize::MAX);
         let rows: Vec<usize> = if b(p, "selected") == Some(true) { l.selection.clone() } else { (0..l.dataset.features.len()).collect() };
+        // In longitude/latitude, which a response holds unless `crs` asks for another system,
+        // whatever system the layer holds its coordinates in.
+        let mut features = rustgis_data::Features::default();
+        // Made at the first feature with a geometry, once for the layer.
+        let mut conversion = None;
+        for r in rows.iter().take(limit).filter_map(|&i| l.dataset.features.row(i)) {
+            let n = features.len();
+            features.push_row(r.to_feature());
+            let Some(g) = r.geometry() else { continue };
+            let failed = |e: String| format!("{}: feature {}: {e}", l.name, r.id());
+            let to = match &mut conversion {
+                Some(to) => &*to,
+                slot @ None => slot.insert(l.dataset.lonlat_conversion().map_err(failed)?),
+            };
+            if let std::borrow::Cow::Owned(g) = rustgis_data::Dataset::geometry_to_lonlat_by(to, g).map_err(failed)? {
+                features.set_geometry(n, Some(g));
+            }
+        }
+        // Its geometry is longitude/latitude (above); `crs` stays the layer's, as the system it
+        // was read in, which `export_error` reads.
         let ds = rustgis_data::Dataset {
             name: l.name.clone(),
             geometry_type: l.dataset.geometry_type,
             fields: l.dataset.fields.clone(),
-            features: rows.iter().take(limit).filter_map(|&i| l.dataset.features.get(i).cloned()).collect(),
+            features,
             source: None,
             crs: l.dataset.crs,
             crs_incomplete: false,
             zm_dropped: false,
             windowed: false,
+            held_in: rustgis_data::raster::Crs::LonLat,
+            shown_in: None,
         };
         let mut ds = ds;
         let mut member = None;
@@ -983,18 +1007,31 @@ impl Session {
         // A plugin uninstalled, disabled or updated without a panel leaves no state behind.
         let Some(p) = rustgis_plugins::get(plugin).filter(|p| p.enabled && p.manifest.panel.is_some()) else {
             self.plugin_panels.remove(plugin);
+            self.panels_to_refresh.remove(plugin);
             return None;
         };
         let decl = p.manifest.panel.as_ref()?;
         Some(self.panel_state(plugin, decl))
     }
 
+    /// Whether `plugin`'s panel state was made again from a changed declaration (the plugin was
+    /// updated) since its state command last ran, which then needs to run again to fill it
+    /// (#2550). Asking clears it: the caller runs `plugin.panel` with `"refresh": true`.
+    pub fn take_panel_refresh(&mut self, plugin: &str) -> bool {
+        self.panels_to_refresh.remove(plugin)
+    }
+
     /// The kept state of `plugin`'s panel `decl`: made from the declaration the first time, and
-    /// made again when the plugin was updated with other widgets since.
+    /// made again when the plugin was updated with other widgets since. Made again, it has lost
+    /// what the state command set, so the panel is marked for a refresh (opening a panel runs
+    /// the command anyway, so a state made the first time isn't).
     fn panel_state(&mut self, plugin: &str, decl: &rustgis_plugins::PanelDecl) -> &mut rustgis_plugins::PanelState {
         let state = self.plugin_panels.entry(plugin.to_string()).or_insert_with(|| rustgis_plugins::PanelState::new(decl));
         if !state.matches(decl) {
             *state = rustgis_plugins::PanelState::new(decl);
+            if !decl.state.is_empty() {
+                self.panels_to_refresh.insert(plugin.to_string());
+            }
         }
         state
     }

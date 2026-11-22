@@ -6,7 +6,7 @@
 //! position, the camera. `shell` is what both share. See `README.md` for how to build and install
 //! them.
 //!
-//! Not here yet: preferences and the keychain; autosave.
+//! Not here yet: preferences and the keychain.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(any(target_os = "android", target_os = "ios", test))]
@@ -52,6 +52,9 @@ fn without_sidecars(picked: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> 
 fn mark(purpose: &str) -> String {
     if let Some(id) = purpose.strip_prefix("dxf:") {
         return format!("{}{id}:", rustgis_ui_egui::DXF_PICK);
+    }
+    if let Some(id) = purpose.strip_prefix("marker:") {
+        return format!("{}{id}:", rustgis_ui_egui::MARKER_PICK);
     }
     match purpose {
         "shortcuts" => rustgis_ui_egui::SHORTCUT_PICK,
@@ -242,13 +245,14 @@ mod tests {
         assert_eq!(super::mark("dxf:7"), format!("{}7:", rustgis_ui_egui::DXF_PICK));
         assert_eq!(super::mark("shapefile"), rustgis_ui_egui::SHAPEFILE_PICK);
         assert_eq!(super::mark("script"), rustgis_ui_egui::SCRIPT_PICK);
+        assert_eq!(super::mark("marker:4"), format!("{}4:", rustgis_ui_egui::MARKER_PICK));
         assert_eq!(super::mark("data"), "");
     }
 
     #[test]
     fn the_oldest_positions_go_past_the_limit_and_are_counted() {
         use rustgis_engine::platform::{Event, Fix};
-        let at = |lon: f64| Event::Position(Fix { lon, lat: 0.0, accuracy: None, time: None });
+        let at = |lon: f64| Event::Position(Fix { lon, lat: 0.0, accuracy: None, time: None, elapsed_realtime_nanos: None });
         let mut queue = super::Queue::new(2);
         queue.add(Event::Cancelled);
         for lon in [1.0, 2.0, 3.0] {

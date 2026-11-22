@@ -203,11 +203,16 @@ cargo build --release --target wasm32-unknown-unknown
 - `commands[].form` (optional) gives the command a dialog of its own: its ribbon button (tab
   entry, panel button, Command Search entry, shortcut) opens a window with these fields instead of
   running it, and **Run** runs the command with their values as its parameters, by their `name`s.
-  Fields are declared like tool parameters (below), with `rasterLayer` added and `file` left out
-  (a command that reads a file asks for it with host calls, behind the `files` permission); a
-  `field` or `numericField` lists the fields of the nearest layer field above it, which must be a
-  vector one (`vectorLayer`, `polygonLayer` or `pointLayer`), and required when the field is. A
-  required layer starts at the active layer when it is of the kind, an optional one offers `—` to
+  Fields are declared like tool parameters (below), with `rasterLayer` and `table` added and
+  `file` left out (a command that reads a file asks for it with host calls, behind the `files`
+  permission). A `table` offers the standalone tables (a CSV or a spreadsheet without
+  coordinates comes in as one, not as a layer) after the layers a `vectorLayer` offers, and sends
+  the name picked; a table named like a layer, which the name would find instead, isn't offered.
+  `host.features` reads layers only. RustGIS versions before `table` refuse a plugin with one, so
+  set `minRustgisVersion` to the first version with it. A `field` or `numericField` lists the
+  fields of the nearest layer or table field above it, which must be a `vectorLayer`,
+  `polygonLayer`, `pointLayer` or `table`, and required when the field is. A required layer
+  starts at the active layer when it is of the kind, an optional one offers `—` to
   leave it out (a `choice` with a `default` counts as required and offers no `—`), and **Run**
   waits until the required fields are filled in. An optional number left empty, or an optional
   checkbox without a `default` never ticked, is left out of the parameters; a required checkbox is
@@ -222,11 +227,39 @@ cargo build --release --target wasm32-unknown-unknown
   dialogs ignore `form` and run the command when its button is clicked, without these parameters:
   set `minRustgisVersion` to the first version with them, or have the command answer what it needs
   then.
+- `"tabs": true` on a `choice` field of `commands[].form` draws it as a row of tabs at the top of
+  the dialog instead of a drop-down, for a dialog that shows a few parts of something, such as an
+  About window's authors, data sources and how to contribute. The field's label isn't shown (its
+  `help` is each tab's hover text), and one tab is always selected: the one kept from the last
+  opening, else the `default`, else the first choice. Clicking a tab, the selected one too, runs
+  the command with the dialog's values and shows its answer, so such a dialog has no **Run**;
+  while required fields are empty, a click only selects the tab and the dialog says what to fill
+  in, and a tab clicked while a run is going runs once that run has answered. On opening, a
+  dialog with tabs runs once when its required fields have values (a dialog without tabs runs
+  only from **Run**), so give tabs only to a command that shows something, not one that changes
+  the project or writes files. A form has at most one field with tabs, and only a `choice` may
+  have them; tool parameters can't, or the plugin is refused.
+  RustGIS versions before tabs ignore the key and show the drop-down and **Run**.
+
+  ```json
+  {"id": "about", "label": "About", "form": [
+    {"name": "part", "label": "Part", "kind": "choice", "tabs": true,
+     "choices": ["Authors", "Data sources", "How to contribute"]}
+  ]}
+  ```
 - `commands[].timeout`: seconds the command may run, from 1 to 86400; unset is 120. It holds on
   the command line, in Python and in scripts. The desktop app runs commands on its window's own
   thread, which can't draw or cancel until a command answers, so there a command still stops
   after 120 seconds and its error says so. Long work such as downloading a dataset belongs in a
   tool, which the desktop app runs in the background with progress and Cancel.
+- `commands[].login`: the sign-in the command's data needs, one RustGIS keeps for the user:
+  `earthdata` (an Earthdata Login token), `copernicus` (a Copernicus Data Space sign-in) or
+  `arcgis` (an ArcGIS session). On the plugin's tab, the command's button and menu row show a key
+  over their icon: green while that sign-in is kept (an Earthdata token or an ArcGIS session that
+  hasn't expired or renews itself, a sign-in remembered on this computer included), red and
+  struck through while it is missing; the tooltip says which sign-in and where to give it. The
+  command still runs either way, so it should still say what's missing. Any other value refuses
+  the plugin; RustGIS versions before it ignore the field.
 - Tool parameter `kind`s: `layer`, `vectorLayer`, `polygonLayer`, `pointLayer`, `field`,
   `numericField`, `number`, `text`, `choice` (with 1 to 64 `choices`), `bool` and `file` (see
   [File parameters](#file-parameters)). Each has `name`, `label`, optional `help`, `required`
@@ -378,8 +411,8 @@ an example.
 ### A panel
 
 A plugin can have a panel: a pane on the right of the map with texts, checkboxes, sliders,
-buttons, trees, forms, dropdowns, date pickers, range sliders and picks on the map bound to its
-commands. Declare it in `plugin.json`:
+buttons, trees, forms, dropdowns, tab rows, date pickers, range sliders and picks on the map bound
+to its commands. Declare it in `plugin.json`:
 
 ```json
 "panel": {
@@ -417,6 +450,10 @@ commands. Declare it in `plugin.json`:
       those of one declared in `plugin.json` shows its label translated with its `i18n` (whether
       the declaration or the plugin's answer gave it); any other label is shown as the plugin
       words it. Only the first 1,000 options given are looked at.
+    - `tabs`: a tab row, the same as a `choice` (its `options`, `default`, value and
+      translation) drawn as a row of labels with the chosen one marked, wrapping onto more rows
+      when the pane is narrow. Every option is in view and switching is one click, so keep it to
+      a few options and use a `choice` for a long list. Clicking the chosen tab does nothing.
     - `date`: a box for a date written `YYYY-MM-DD`, with a calendar button beside it. `default`
       is a date. Its value is the date, or `null`. A date typed runs the command when it is
       confirmed (Enter, or leaving the box); one that isn't a real date is put back.
@@ -439,7 +476,7 @@ commands. Declare it in `plugin.json`:
       a point, or with `"shape": "box"` a box. Its `label` is its command's unless given.
 - A checkbox runs its `command` when it changes, a slider or a range when it is let go, or
   stepped (never while it is dragged, while the pane shows the label of the value it would take),
-  a tree or a dropdown when a node or an option is chosen, a form's text and number fields when
+  a tree, a dropdown or a tab row when a node or an option is chosen, a form's text and number fields when
   they lose focus (so the plugin is not run on every keystroke), its other fields at once, a date
   when one is picked, and a pick when the place is picked. Without a `command`, a widget's value
   just goes with the plugin's next request.
@@ -458,7 +495,7 @@ button, a script or the command line):
 ```
 
 `values` has each checkbox (`true` or `false`), slider (a whole number), range (`[low, high]`),
-tree and dropdown (the chosen node's or option's id, or `null`), date (`"YYYY-MM-DD"`, or `null`),
+tree, dropdown and tab row (the chosen node's or option's id, or `null`), date (`"YYYY-MM-DD"`, or `null`),
 form (an object of its fields' values, by field id) and pick (the place picked last, or `null`),
 and `changed` the ones this call set: the widget the user just moved. A widget's command is run
 with `{"panel": {"release": 196}}` as its parameters, which sets the values before the call and is
@@ -486,10 +523,10 @@ Any command can answer the panel's new state, beside the rest of its answer:
 
 - An item can set `label` (`null` brings back the declared one), `enabled` and `visible`; a text
   its `text`; a slider or a range its `min`, `max` and `labels`, one per value from `min` (the
-  numbers when there are none); a tree its `nodes`; a dropdown its `options`; a form its `fields`.
+  numbers when there are none); a tree its `nodes`; a dropdown or a tab row its `options`; a form its `fields`.
   What an answer leaves out stays as it was. Fields belonging to another widget kind are ignored
   and reported: `text` outside a text widget, `min`/`max`/`labels` outside a slider or range,
-  `nodes` outside a tree, `options` outside a dropdown, and `fields` outside a form. Unknown item
+  `nodes` outside a tree, `options` outside a dropdown or a tab row, and `fields` outside a form. Unknown item
   ids and field names are also ignored and reported. Unknown panel-answer keys are reported too;
   echoed `changed` request metadata is accepted.
 - A tree's `nodes` are `[{"id": "env", "label": "Environment", "count": 67, "children": [...]}]`:
@@ -541,7 +578,7 @@ Any command can answer the panel's new state, beside the rest of its answer:
   has no panes, the commands still run with the values given.
 - RustGIS versions before panels ignore `panel` (and refuse a tab that names it): keep the
   commands usable from the ribbon too, or set `minRustgisVersion`. Versions before dropdowns,
-  dates and ranges refuse a panel that has one, so set `minRustgisVersion` to the first version
+  tab rows, dates and ranges refuse a panel that has one, so set `minRustgisVersion` to the first version
   with them.
 
 #### Picking a place on the map
