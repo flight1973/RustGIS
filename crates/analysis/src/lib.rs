@@ -475,7 +475,11 @@ fn unread(spec: &ToolSpec, params: &Value) -> String {
 /// the first five, sorted, each cut to 40 characters, then how many more.
 pub fn quoted_keys(mut unknown: Vec<&str>) -> String {
     unknown.sort_unstable();
-    let clip = |k: &str| if k.chars().count() > 40 { k.chars().take(40).chain(['…']).collect() } else { k.to_string() };
+    // A control character (a newline, an escape) would reach a terminal as it is: shown as `?`.
+    let clip = |k: &str| {
+        let safe = k.chars().map(|c| if c.is_control() { '?' } else { c });
+        if k.chars().count() > 40 { safe.take(40).chain(['…']).collect() } else { safe.collect::<String>() }
+    };
     let mut said: Vec<String> = unknown.iter().take(5).map(|k| format!("'{}'", clip(k))).collect();
     if unknown.len() > 5 {
         said.push(format!("{} more", unknown.len() - 5));
@@ -532,8 +536,11 @@ pub fn is_accepted_param(spec: &ToolSpec, key: &str) -> bool {
 /// tool that isn't built in, read as a table id is read). No tool reads it, so it isn't a
 /// parameter to run over either; given without the id, it's taken for a stray.
 pub fn is_expected_key(spec: &ToolSpec, params: &Value, key: &str) -> bool {
-    let table_id =
-        |id: &Value| id.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) || id.as_str().is_some_and(|t| t.trim().parse::<u32>().is_ok());
+    // A built-in tool reads digit text as a name, not a table id.
+    let table_id = |id: &Value| {
+        id.as_u64().is_some_and(|n| u32::try_from(n).is_ok())
+            || (source_of(spec).is_some() && id.as_str().is_some_and(|t| t.trim().parse::<u32>().is_ok()))
+    };
     is_accepted_param(spec, key)
         || key.strip_suffix("_name").is_some_and(|base| {
             spec.params.iter().any(|p| p.name == base && matches!(p.kind, ParamKind::Layer)) && params.get(base).is_some_and(table_id)

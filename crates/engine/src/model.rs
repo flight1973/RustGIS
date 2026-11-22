@@ -700,11 +700,8 @@ pub(crate) fn ignored_summary(said: &[String]) -> String {
             None => kinds.push((text, 1)),
         }
     }
-    let parts: Vec<String> = kinds
-        .iter()
-        .take(IGNORED_KINDS_SAID)
-        .map(|&(k, n)| if n > 1 { format!("{k} (in {n} steps)") } else { k.to_string() })
-        .collect();
+    let parts: Vec<String> =
+        kinds.iter().take(IGNORED_KINDS_SAID).map(|&(k, n)| if n > 1 { format!("{k} (in {n} steps)") } else { k.to_string() }).collect();
     match kinds.len().saturating_sub(IGNORED_KINDS_SAID) {
         0 => parts.join("; "),
         more => format!("{}; {more} more kinds", parts.join("; ")),
@@ -758,12 +755,13 @@ fn run_into(s: &mut Session, g: &ModelGraph, report: &mut RunReport) -> Result<V
                 let params = Value::Object(params);
                 let before: HashSet<u32> = s.map().layers.iter().map(|l| l.id).collect();
                 let history = s.project.gp_history.len();
-                // Which of its parameters the tool ignores is said by `run`, once for the model (#2307).
-                if let Some(said) = tool_of(n).and_then(|spec| crate::cmd::gp::ignored_params(spec, &params)) {
-                    report.ignored.push(said);
-                }
                 match crate::cmd::gp::run_step(s, tool, &params) {
                     Ok(r) => {
+                        // Which of its parameters the tool ignores is said by `run`, once for the
+                        // model (#2307). A failing step's error names its own keys already.
+                        if let Some(said) = tool_of(n).and_then(|spec| crate::cmd::gp::ignored_params(spec, &params)) {
+                            report.ignored.push(said);
+                        }
                         let ids: Vec<u32> = s.map().layers.iter().filter(|l| !before.contains(&l.id)).map(|l| l.id).collect();
                         // The first layer it added (else the first output it recorded: a table).
                         let first_id = ids.iter().rev().copied().find(|id| s.map().layer(*id).is_some());

@@ -5826,9 +5826,13 @@ mod batch_tests {
         // `_name` beside a parameter that isn't a layer is.
         let buffer_spec = resolve_tool("buffer").unwrap();
         assert_eq!(ignored_params(buffer_spec, &json!({"input": 7, "distance": 1, "input_name": "Cities"})), None);
-        assert_eq!(ignored_params(buffer_spec, &json!({"input": "7", "distance": 1, "input_name": "Cities"})), None);
-        // Beside a layer's name, or with no table id at all, it's a stray: no tool reads it.
-        for params in [json!({"input": "Cities", "distance": 1, "input_name": "Rivers"}), json!({"distance": 1, "input_name": "Rivers"})] {
+        // Beside a layer's name (a built-in tool reads digit text as one), or with no table id at
+        // all, it's a stray: no tool reads it.
+        for params in [
+            json!({"input": "Cities", "distance": 1, "input_name": "Rivers"}),
+            json!({"input": "7", "distance": 1, "input_name": "Rivers"}),
+            json!({"distance": 1, "input_name": "Rivers"}),
+        ] {
             let said = ignored_params(buffer_spec, &params).unwrap();
             assert!(said.starts_with("Buffer ignores 'input_name'"), "{said}");
         }
@@ -5846,6 +5850,10 @@ mod batch_tests {
         let mark = s.notices.len() as u64;
         s.run("gp.run", &json!({"tool": "buffer", "params": {"input": "Cities", "distance": 1, &long: 1}})).unwrap();
         assert!(said(&s, mark)[0].contains(&format!("'{}…'", "x".repeat(40))), "{:?}", said(&s, mark));
+        // A control character in a key reaches no terminal as it is.
+        let mark = s.notices.len() as u64;
+        s.run("gp.run", &json!({"tool": "buffer", "params": {"input": "Cities", "distance": 1, "a\n\u{1b}[31mb": 1}})).unwrap();
+        assert!(said(&s, mark)[0].starts_with("Buffer ignores 'a??[31mb'"), "{:?}", said(&s, mark));
         // A run refused for want of a parameter that was misspelled says which key it didn't read,
         // in its error: a failed command takes its warnings back.
         let e = s.run("gp.run", &json!({"tool": "clip", "params": {"input": "Cities", "clips": "Parks"}})).unwrap_err();
@@ -5864,6 +5872,7 @@ mod batch_tests {
             .unwrap();
         let e = s.run("model.run", &json!({"name": "Clips"})).unwrap_err();
         assert!(e.contains("(given 'clips', which Clip doesn't read)"), "{e}");
+        assert_eq!(e.matches("'clips'").count(), 1, "said once: {e}");
         // A command that runs a tool for its own parameters says a stray key once, as a command.
         let mark = s.notices.len() as u64;
         s.run("gp.spatialJoin", &json!({"target": "Cities", "join": "Parks", "prefx": "j_"})).unwrap();
@@ -5916,7 +5925,7 @@ mod batch_tests {
     #[test]
     fn a_model_of_steps_says_ignored_parameters_once() {
         let said = |s: &Session, mark: u64| -> Vec<String> {
-            s.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.contains(" ignores ")).collect()
+            s.notices_since(mark).iter().filter(|n| !n.error).map(|n| n.text.clone()).filter(|t| t.contains(" ignores ")).collect()
         };
         let buffer = "Buffer ignores 'unit' (it reads input, distance, units, dissolve, output)";
         let mut s = test_session();
@@ -5928,8 +5937,8 @@ mod batch_tests {
         let mark = s.notices.len() as u64;
         s.run("model.run", &json!({"name": "Twice"})).unwrap();
         assert_eq!(said(&s, mark), [format!("{buffer} (in 2 steps)")]);
-        // A failing step after an ignoring one: the error carries the warning, and no notice
-        // is left behind for the run that failed.
+        // A failing step after an ignoring one: the error carries the warning, and no warning
+        // is left behind for the run that failed (its error is posted as one, as any is).
         let stops = json!([
             {"tool": "buffer", "params": {"input": "Cities", "distance": 100, "unit": "Miles"}},
             {"tool": "buffer", "params": {"distance": 10}}
