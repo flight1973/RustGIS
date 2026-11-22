@@ -2580,6 +2580,16 @@ pub(crate) fn run_tool_saying(s: &mut Session, tool: &str, params: &Value) -> Cm
     s.invoke_tool(op, &control).map_err(|e| saying_unread(spec, params, e))
 }
 
+/// [`run_tool_saying`] without the warning about ignored parameters: a model's run says them once
+/// for all its steps ([`crate::model::run`]), beside its result or its error, so a run that fails
+/// later keeps them. The error still says the keys it doesn't read.
+pub(crate) fn run_step(s: &mut Session, tool: &str, params: &Value) -> CmdResult {
+    let control = run_control(s);
+    let op = s.authorize_tool(tool, params)?;
+    let spec = op.op().pin.spec();
+    s.invoke_tool(op, &control).map_err(|e| saying_unread(spec, params, e))
+}
+
 /// `error` with the keys of `params` that `spec` doesn't read after it — " (given 'unit', which
 /// Buffer doesn't read)" — unless it says them already (a refused parameter's does).
 fn saying_unread(spec: &rustgis_analysis::ToolSpec, params: &Value, error: String) -> String {

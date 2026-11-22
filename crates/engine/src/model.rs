@@ -630,6 +630,9 @@ pub struct RunReport {
     /// Correlates browser acknowledgements with this run only, never a newer report.
     #[serde(skip)]
     pending_files: HashMap<u64, String>,
+    /// What each step's tool ignores, one line per step (#2307): [`run`] says them once per kind.
+    #[serde(skip)]
+    ignored: Vec<String>,
 }
 
 impl RunReport {
@@ -656,6 +659,18 @@ pub(crate) fn run(s: &mut Session, op: crate::policy::Authorized<crate::policy::
     let crate::policy::ModelOp { name, graph: g } = op.op();
     let mut report = RunReport { model: name.to_string(), ..Default::default() };
     let res = run_into(s, g, &mut report);
+    // The parameters the steps ignore are said once for the run. A failed run's notices go back
+    // with its changes, so its error carries them instead.
+    let ignored = ignored_summary(&std::mem::take(&mut report.ignored));
+    let res = match res {
+        Err(e) if !ignored.is_empty() => Err(format!("{e}; {ignored}")),
+        res => {
+            if !ignored.is_empty() {
+                s.warn(ignored);
+            }
+            res
+        }
+    };
     if res.is_err() {
         for node in report.nodes.iter_mut().filter(|node| node.status == "pending") {
             node.status = "error";
@@ -668,6 +683,21 @@ pub(crate) fn run(s: &mut Session, op: crate::policy::Authorized<crate::policy::
     let out = res.map(|ran| json!({"model": name, "ran": ran, "outputs": report.outputs}));
     s.model_run = Some(report);
     out
+}
+
+/// The parameter warnings of a run's steps, one per kind with how many steps give it: "Buffer
+/// ignores 'unit' (…) (in 3 steps)". Empty when no step ignores any.
+fn ignored_summary(said: &[String]) -> String {
+    let mut kinds: Vec<(&str, usize)> = Vec::new();
+    for text in said {
+        let text = text.as_str();
+        match kinds.iter_mut().find(|(k, _)| *k == text) {
+            Some((_, n)) => *n += 1,
+            None => kinds.push((text, 1)),
+        }
+    }
+    let parts: Vec<String> = kinds.into_iter().map(|(k, n)| if n > 1 { format!("{k} (in {n} steps)") } else { k.to_string() }).collect();
+    parts.join("; ")
 }
 
 /// Validate the graph and reject an imported graph's external tools before executing any node.
@@ -717,8 +747,11 @@ fn run_into(s: &mut Session, g: &ModelGraph, report: &mut RunReport) -> Result<V
                 let params = Value::Object(params);
                 let before: HashSet<u32> = s.map().layers.iter().map(|l| l.id).collect();
                 let history = s.project.gp_history.len();
-                // As gp.run runs it, saying which of its parameters the tool ignores (#2307).
-                match crate::cmd::gp::run_tool_saying(s, tool, &params) {
+                // Which of its parameters the tool ignores is said by `run`, once for the model (#2307).
+                if let Some(said) = tool_of(n).and_then(|spec| crate::cmd::gp::ignored_params(spec, &params)) {
+                    report.ignored.push(said);
+                }
+                match crate::cmd::gp::run_step(s, tool, &params) {
                     Ok(r) => {
                         let ids: Vec<u32> = s.map().layers.iter().filter(|l| !before.contains(&l.id)).map(|l| l.id).collect();
                         // The first layer it added (else the first output it recorded: a table).
