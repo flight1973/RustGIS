@@ -2520,7 +2520,8 @@ fn zonal_stats(s: &mut Session, p: &Value) -> CmdResult {
 /// A `gp.batch` item's parameters: `base` with `batch_param` set to `input`. A tool reading the
 /// input under another name (Join Field's `input` for `target`) mustn't take a static value given
 /// under it in place of each batch input, nor keep the tool dialog's name of the table it replaced
-/// (`input_name`, `target_name`), so those go; a key the tool declares itself never does.
+/// (`input_name`, `target_name`), so those go. An alias the tool declares itself goes too (Join
+/// Field's `target` beside a `target_layer` batch): `gp.batch` says which names it replaced.
 fn batch_item_params(spec: &rustgis_analysis::ToolSpec, base: &Value, batch_param: &str, input: &str) -> Value {
     let mut p = base.clone();
     if let Value::Object(ref mut map) = p {
