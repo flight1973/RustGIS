@@ -1008,3 +1008,43 @@ fn route_segments_whose_points_are_elsewhere_are_kept_as_a_table() {
     assert_eq!(value(ds, 0, "length"), Value::Int(12));
     assert_eq!(value(ds, 0, "start_pointChoice_fixDesignatedPoint"), Value::Text("not-here".into()));
 }
+
+#[test]
+fn a_structure_whose_parts_are_all_references_keeps_its_values() {
+    let body = r#"<aixm:name>MAST</aixm:name><aixm:part xlink:href="urn:uuid:p1" xlink:title="MAST PART"/>"#;
+    let vs =
+        feature("VerticalStructure", "v", &[slice("VerticalStructure", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), body)]);
+    let point = point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "A")]);
+    // A kind with nothing to draw is counted; its values reach the notice's count, not a table.
+    let out = read("t.xml", &message(&(vs + &point)), &at("2026-01-15")).unwrap();
+    assert!(
+        said(&out).iter().any(|m| m.contains("1 feature of kinds with nothing to draw left out (VerticalStructure)")),
+        "{:?}",
+        said(&out)
+    );
+    // With a drawn part beside it, the structure's row keeps its name and the part's link.
+    let located = r#"<aixm:part><aixm:VerticalStructurePart gml:id="a"><aixm:horizontalProjection_location><aixm:ElevatedPoint srsName="urn:ogc:def:crs:EPSG::4326" gml:id="p"><gml:pos>47 -27</gml:pos></aixm:ElevatedPoint></aixm:horizontalProjection_location></aixm:VerticalStructurePart></aixm:part>"#;
+    let body = format!("{body}{located}");
+    let vs =
+        feature("VerticalStructure", "v", &[slice("VerticalStructure", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+    let out = read("t.xml", &message(&vs), &at("2026-01-15")).unwrap();
+    let ds = layer(&out, "t VerticalStructure");
+    assert_eq!(value(ds, 0, "name"), Value::Text("MAST".into()));
+    assert_eq!(value(ds, 0, "part"), Value::Text("p1".into()));
+    assert_eq!(value(ds, 0, "part_title"), Value::Text("MAST PART".into()));
+}
+
+#[test]
+fn a_route_segment_end_written_in_place_says_what_its_reading_finds() {
+    let end = |name: &str, lat: f64| {
+        format!(
+            r#"<aixm:{name}><aixm:EnRouteSegmentPoint gml:id="{name}"><aixm:pointChoice_position><aixm:Point gml:id="g{name}" srsName="urn:ogc:def:crs:OGC:1.3:CRS83"><gml:pos>-97 {lat}</gml:pos></aixm:Point></aixm:pointChoice_position></aixm:EnRouteSegmentPoint></aixm:{name}>"#
+        )
+    };
+    let body = end("start", 32.0) + &end("end", 33.0);
+    let seg = feature("RouteSegment", "rs", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+    let out = read("t.xml", &message(&seg), &at("2026-01-15")).unwrap();
+    let ds = layer(&out, "t RouteSegment");
+    assert!(matches!(ds.features[0].geometry, Some(Geometry::Line(_))));
+    assert!(said(&out).iter().any(|m| m.contains("2 geometries in a geographic system other than WGS 84")), "{:?}", said(&out));
+}
