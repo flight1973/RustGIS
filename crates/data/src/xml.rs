@@ -362,6 +362,18 @@ mod tests {
         assert!(crate::georss::read("a.rss", &flood("rss")).is_err_and(|e| said(e.to_string())));
         assert!(crate::landxml::read("a.xml", &flood("LandXML"), None).is_err_and(|e| said(e.to_string())));
         assert!(crate::ogc::parse("https://x.example/wms", &flood("WMS_Capabilities")).is_err_and(|e| said(e.to_string())));
+        // AIXM parses its members one at a time: each past the budget is counted, and with none
+        // read, nothing is added.
+        let aixm = format!(
+            "<?xml version=\"1.0\"?><m:AIXMBasicMessage xmlns:m=\"http://www.aixm.aero/schema/5.1.1/message\"{}>{}</m:AIXMBasicMessage>",
+            declarations(20_000),
+            "<m:hasMember><x/></m:hasMember>".repeat(50)
+        );
+        let opts = crate::aixm::Options { at: Some(0.0) };
+        assert!(
+            crate::aixm::read("a.xml", aixm.as_bytes(), &opts)
+                .is_err_and(|e| e.to_string().contains("couldn't be read") || e.to_string().contains("limits"))
+        );
     }
 
     /// Every XML reader refuses a deeply nested document instead of overflowing the stack, run on
@@ -386,6 +398,12 @@ mod tests {
                 assert!(crate::georss::read("a.rss", &deep("rss", "channel")).is_err());
                 assert!(crate::landxml::read("a.xml", &deep("LandXML", "Parcels"), None).is_err());
                 assert!(crate::ogc::parse("https://x.example/wms", &deep("WMS_Capabilities", "Layer")).is_err());
+                let aixm = String::from_utf8(deep("message:AIXMBasicMessage", "message:hasMember")).unwrap_or_default().replacen(
+                    "<message:AIXMBasicMessage>",
+                    "<message:AIXMBasicMessage xmlns:message=\"http://www.aixm.aero/schema/5.1.1/message\">",
+                    1,
+                );
+                assert!(crate::aixm::read("a.xml", aixm.as_bytes(), &crate::aixm::Options { at: Some(0.0) }).is_err());
                 true
             })
             .unwrap()

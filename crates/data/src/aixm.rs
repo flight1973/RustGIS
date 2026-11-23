@@ -301,9 +301,10 @@ enum Interpretation {
 /// What a slice says of itself, and where it is.
 #[derive(Clone, Debug)]
 struct Slice {
-    member: usize,
-    feature: usize,
-    slice: usize,
+    /// Where it is written in the text.
+    range: (usize, usize),
+    /// The namespaces in scope there: an index into the read's scopes (0, the root's).
+    scope: usize,
     kind: Interpretation,
     sequence: u64,
     correction: u64,
@@ -411,7 +412,7 @@ struct SliceTrouble {
 }
 
 /// A slice's own properties.
-fn slice_of(s: Node, at: (usize, usize, usize), trouble: &mut SliceTrouble) -> Option<Slice> {
+fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTrouble) -> Option<Slice> {
     let kind = match child(s, "interpretation").map(|n| text_of(&n)).as_deref() {
         Some("BASELINE") => Interpretation::Baseline,
         Some("PERMDELTA") => Interpretation::PermDelta,
@@ -464,9 +465,8 @@ fn slice_of(s: Node, at: (usize, usize, usize), trouble: &mut SliceTrouble) -> O
         return None;
     }
     Some(Slice {
-        member: at.0,
-        feature: at.1,
-        slice: at.2,
+        range,
+        scope,
         kind,
         sequence: number("sequenceNumber"),
         correction: number("correctionNumber"),
@@ -927,6 +927,7 @@ struct Layer {
     kind: String,
     label: String,
     columns: Vec<String>,
+    named: HashSet<String>,
     rows: Vec<(Option<Geometry>, Attrs)>,
     /// Properties not read (nested records): how many features had them, and the first names.
     nested: usize,
@@ -955,13 +956,14 @@ struct Layer {
 
 impl Layer {
     fn column(&mut self, name: &str) -> bool {
-        if self.columns.iter().any(|c| c == name) {
+        if self.named.contains(name) {
             return true;
         }
         if self.columns.len() >= MAX_COLUMNS {
             self.capped += 1;
             return false;
         }
+        self.named.insert(name.to_string());
         self.columns.push(name.to_string());
         true
     }
@@ -985,16 +987,22 @@ impl Layer {
 #[derive(Default, Clone)]
 struct Row {
     attrs: Attrs,
-    /// Every column named, null or not, in order.
+    /// Every column named, null or not, in order, and the same as a set.
     columns: Vec<String>,
+    named: HashSet<String>,
     nested: Vec<String>,
+    nested_named: HashSet<String>,
 }
 
 impl Row {
-    fn set(&mut self, key: &str, value: String) {
-        if !self.columns.iter().any(|c| c == key) {
+    fn name(&mut self, key: &str) {
+        if self.named.insert(key.to_string()) {
             self.columns.push(key.to_string());
         }
+    }
+
+    fn set(&mut self, key: &str, value: String) {
+        self.name(key);
         match self.attrs.get_mut(key) {
             // A property given more than once keeps every value.
             Some(v) if !value.is_empty() => {
@@ -1009,9 +1017,7 @@ impl Row {
     }
 
     fn null(&mut self, key: &str) {
-        if !self.columns.iter().any(|c| c == key) {
-            self.columns.push(key.to_string());
-        }
+        self.name(key);
     }
 
     /// A property's simple value as attributes, under `prefix`.
@@ -1031,7 +1037,7 @@ impl Row {
             return;
         }
         if elements(p).next().is_some() {
-            if !self.nested.contains(&name) {
+            if self.nested_named.insert(name.clone()) {
                 self.nested.push(name);
             }
             return;
@@ -1047,7 +1053,7 @@ impl Row {
     /// property's.
     fn shape_values(&mut self, g: Node, property: &str) {
         for c in elements(g).filter(is_aixm) {
-            let prefix = if self.columns.iter().any(|k| k == local(&c)) { format!("{property}_") } else { String::new() };
+            let prefix = if self.named.contains(local(&c)) { format!("{property}_") } else { String::new() };
             self.property(c, &prefix);
         }
     }
@@ -1057,6 +1063,11 @@ impl Row {
 #[derive(Default)]
 struct Layers {
     by_key: HashMap<(String, String), usize>,
+    /// Values rows may still hold: rows copied for a feature's parts or shapes are bounded by the
+    /// file's size, not by how many times a feature repeats them.
+    cells_left: usize,
+    /// Rows left out past that.
+    rows_over: usize,
     list: Vec<Layer>,
     /// Features of kinds past [`MAX_LAYERS`].
     over: usize,
@@ -1085,6 +1096,12 @@ impl Layers {
     }
 
     fn push(&mut self, kind: &str, label: &str, geometry: Option<Geometry>, row: Row, notes: Option<&ShapeNotes>) {
+        let cells = row.columns.len().max(1);
+        if cells > self.cells_left {
+            self.rows_over += 1;
+            return;
+        }
+        self.cells_left -= cells;
         let Some(layer) = self.get(kind, label) else { return };
         let mut attrs = Attrs::new();
         for c in &row.columns {
@@ -1146,6 +1163,56 @@ fn merged(gs: Vec<Geometry>) -> Option<Geometry> {
     }))
 }
 
+/// Attribute values the layers may hold whatever the file's size.
+const MIN_CELLS: usize = 4_000_000;
+
+/// Bytes wrapping slices may add whatever the file's size.
+const MIN_WRAP_BYTES: usize = 16 << 20;
+
+/// The scope (an index into `scopes`) of the namespaces in force where slice `sl` is written: the
+/// root's (0) unless its member, feature, time slice or itself declares more, when they are
+/// written out once for every slice like it. `None` when writing them would pass `wrap_left`.
+fn scope_of(
+    sl: Node,
+    text: &str,
+    start: usize,
+    prefix: usize,
+    scopes: &mut Vec<String>,
+    ids: &mut HashMap<String, usize>,
+    wrap_left: &mut usize,
+) -> Option<usize> {
+    // The start tags between the member and the slice's first child, looked at for declarations.
+    let declares = sl.ancestors().take_while(|a| a.parent_element().is_some()).any(|a| {
+        let r = a.range();
+        let tag_end = a.first_child().map_or(r.end, |c| c.range().start);
+        r.start
+            .checked_sub(prefix)
+            .zip(tag_end.checked_sub(prefix))
+            .and_then(|(x, y)| text.get(start + x..start + y))
+            .is_some_and(|t| t.contains("xmlns"))
+    });
+    if !declares {
+        return Some(0);
+    }
+    // Each in-scope namespace costs its writing; paid before it is written.
+    let cost = sl.namespaces().map(|n| n.uri().len() + n.name().map_or(0, str::len) + 10).sum::<usize>();
+    *wrap_left = wrap_left.checked_sub(cost)?;
+    let mut decls = String::with_capacity(cost);
+    for n in sl.namespaces().filter(|n| n.name() != Some("xml")) {
+        let uri = n.uri().replace('&', "&amp;").replace('<', "&lt;").replace('"', "&quot;");
+        match n.name() {
+            Some(name) => decls.push_str(&format!(" xmlns:{name}=\"{uri}\"")),
+            None => decls.push_str(&format!(" xmlns=\"{uri}\"")),
+        }
+    }
+    if let Some(&i) = ids.get(&decls) {
+        return Some(i);
+    }
+    scopes.push(decls.clone());
+    ids.insert(decls, scopes.len() - 1);
+    Some(scopes.len() - 1)
+}
+
 /// How each member is parsed: no DTD, and the node limit every XML reader has.
 fn options<'a>() -> ParsingOptions<'a> {
     ParsingOptions { allow_dtd: false, nodes_limit: crate::io::XML_NODES, ..ParsingOptions::default() }
@@ -1164,6 +1231,8 @@ fn projection<'a, 'i>(v: Option<Node<'a, 'i>>) -> Option<Node<'a, 'i>> {
 /// What the read says of the file as a whole.
 #[derive(Default)]
 struct FileNotes {
+    /// Slices not read: wrapping or parsing them would pass the file's limits.
+    past_limits: usize,
     not_in_force: usize,
     outside_lifetime: usize,
     no_state: usize,
@@ -1215,6 +1284,13 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     let mut features: HashMap<String, Feature> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     let mut trouble = SliceTrouble::default();
+    // The namespace declarations slices are parsed with in the second pass: the root's, and any a
+    // slice has in scope besides (declared on its member, feature or itself), each written once.
+    let mut scopes: Vec<String> = vec![index.namespaces.clone()];
+    let mut scope_ids: HashMap<String, usize> = HashMap::new();
+    // What wrapping slices may add to the text parsed, whatever namespaces they declare.
+    let mut wrap_left = text.len().saturating_mul(4).max(MIN_WRAP_BYTES);
+    let prefix = "<m".len() + index.namespaces.len() + ">".len();
     crate::progress::begin(index.members.len() * 2);
     for (m, &(start, end)) in index.members.iter().enumerate() {
         crate::progress::step(1)?;
@@ -1222,6 +1298,14 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             notes.unreadable_members += 1;
             continue;
         };
+        // Each member is parsed in a copy of the root's declarations: paid before it is written, so
+        // a root declaring thousands can't make the copies outgrow the file.
+        let extra = index.namespaces.len() + "<m></m>".len();
+        if extra > wrap_left {
+            notes.past_limits += 1;
+            continue;
+        }
+        wrap_left -= extra;
         let mut wrapped = String::new();
         wrap(member, &mut wrapped);
         let Ok(doc) = crate::xml::parse_within(&wrapped, options(), &mut work_left) else {
@@ -1230,8 +1314,19 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         };
         for (fi, f) in features_of(doc.root_element()).into_iter().enumerate() {
             let id = identifier(f).unwrap_or_else(|| format!("#{m}.{fi}"));
-            let slices: Vec<Slice> =
-                slices_of(f).into_iter().enumerate().filter_map(|(si, s)| slice_of(s, (m, fi, si), &mut trouble)).collect();
+            let mut slices = Vec::new();
+            for sl in slices_of(f) {
+                let r = sl.range();
+                let Some(range) = r.start.checked_sub(prefix).zip(r.end.checked_sub(prefix)).map(|(a, b)| (start + a, start + b)) else {
+                    notes.unreadable_members += 1;
+                    continue;
+                };
+                let Some(scope) = scope_of(sl, text, start, prefix, &mut scopes, &mut scope_ids, &mut wrap_left) else {
+                    notes.past_limits += 1;
+                    continue;
+                };
+                slices.extend(slice_of(sl, range, scope, &mut trouble));
+            }
             let entry = features.entry(id.clone()).or_insert_with(|| {
                 order.push(id.clone());
                 Feature { kind: local(&f).to_string(), slices: Vec::new() }
@@ -1242,7 +1337,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.unknown_interpretation = trouble.unknown;
     notes.bad_dates = trouble.dates;
     // Second pass: each feature in force at the date, from its slices.
-    let mut layers = Layers::default();
+    let mut layers = Layers { cells_left: (text.len() / 4).max(MIN_CELLS), ..Layers::default() };
     let mut shapes = Shapes { budget: text.len().max(MIN_ADDED_POINTS), other_system: None, assumed_system: 0, as_wgs84: None };
     // Rows of features with nothing to draw, by kind, kept until it is known whether the kind has
     // a layer to hold them.
@@ -1275,44 +1370,50 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
                 continue;
             }
         };
-        // The members holding its slices, each parsed again.
-        let mut wanted: Vec<usize> = std::iter::once(base.member).chain(changes.iter().map(|s| s.member)).collect();
-        wanted.sort_unstable();
-        wanted.dedup();
-        let texts: Vec<(usize, String)> = wanted
-            .iter()
-            .filter_map(|&m| {
-                let (s, e) = *index.members.get(m)?;
-                let mut w = String::new();
-                wrap(text.get(s..e)?, &mut w);
-                Some((m, w))
-            })
-            .collect();
-        let mut docs: Vec<(usize, Document)> = Vec::new();
-        for (m, w) in &texts {
-            match crate::xml::parse_within(w, options(), &mut work_left) {
-                Ok(d) => docs.push((*m, d)),
-                Err(_) => notes.unreadable_members += 1,
+        // Its slices in force, each parsed on its own with the namespaces in scope where it is
+        // written: the text parsed again is the slices', not their members'.
+        let wanted: Vec<&Slice> = std::iter::once(&base).chain(changes.iter()).collect();
+        let mut texts: Vec<String> = Vec::with_capacity(wanted.len());
+        for sl in &wanted {
+            let decls = scopes.get(sl.scope).map_or("", String::as_str);
+            let body = text.get(sl.range.0..sl.range.1).unwrap_or_default();
+            let extra = decls.len() + "<m></m>".len();
+            if extra > wrap_left {
+                texts.push(String::new());
+                continue;
             }
+            wrap_left -= extra;
+            texts.push(format!("<m{decls}>{body}</m>"));
         }
-        let find = |s: &Slice| -> Option<Node> {
-            let (_, doc) = docs.iter().find(|(m, _)| *m == s.member)?;
-            let f = *features_of(doc.root_element()).get(s.feature)?;
-            slices_of(f).get(s.slice).copied()
-        };
-        let Some(base_node) = find(&base) else {
-            notes.unreadable_members += 1;
+        let docs: Vec<Option<Document>> =
+            texts.iter().map(|t| if t.is_empty() { None } else { crate::xml::parse_within(t, options(), &mut work_left).ok() }).collect();
+        let node = |i: usize| docs.get(i).and_then(Option::as_ref).and_then(|d| elements(d.root_element()).next());
+        let Some(base_node) = node(0) else {
+            notes.past_limits += 1;
             continue;
         };
-        // The state's properties, each change's replacing all values of the properties it holds.
-        let mut props = own(base_node);
-        for c in &changes {
-            let Some(n) = find(c) else { continue };
-            let theirs = own(n);
-            let names: HashSet<&str> = theirs.iter().map(|p| local(p)).collect();
-            props.retain(|p| !names.contains(local(p)));
-            props.extend(theirs);
+        // The state's properties, each change's replacing all values of the properties it holds:
+        // the last change holding a name gives that name's values (worked out in one pass, however
+        // many changes there are).
+        let mut layers_of: Vec<Vec<Node>> = vec![own(base_node)];
+        for i in 1..wanted.len() {
+            match node(i) {
+                Some(n) => layers_of.push(own(n)),
+                None => {
+                    notes.past_limits += 1;
+                    layers_of.push(Vec::new());
+                }
+            }
         }
+        let mut last: HashMap<&str, usize> = HashMap::new();
+        for (i, ps) in layers_of.iter().enumerate() {
+            for p in ps {
+                last.insert(local(p), i);
+            }
+        }
+        let last = &last;
+        let props: Vec<Node> =
+            layers_of.iter().enumerate().flat_map(|(i, ps)| ps.iter().copied().filter(move |p| last.get(local(p)) == Some(&i))).collect();
         let mut row = Row::default();
         row.set("identifier", id.trim_start_matches("urn:uuid:").to_string());
         let valid = |t: Option<f64>| t.map(|t| crate::time::format(t, "YYYY-MM-DDTHH:mm:ss") + "Z");
@@ -1459,7 +1560,7 @@ fn airspace(
     // The BASE volume's limits and width, as written.
     if let Some((_, _, Some(v))) = components.iter().find(|(_, op, _)| op == "BASE").or(components.first()) {
         for p in elements(*v).filter(|p| !matches!(local(p), "horizontalProjection" | "centreline" | "contributorAirspace")) {
-            let prefix = if row.columns.iter().any(|c| c == local(&p)) { "volume_" } else { "" };
+            let prefix = if row.named.contains(local(&p)) { "volume_" } else { "" };
             row.property(p, prefix);
         }
     }
@@ -1599,6 +1700,14 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
         "members",
         "of the message couldn't be read (not well-formed XML, or past the reading limits)",
     );
+    say(
+        &mut file,
+        notes.past_limits,
+        "member or time slice",
+        "members or time slices",
+        "not read: reading them would pass the limits the file's size sets",
+    );
+    say(&mut file, layers.rows_over, "row", "rows", "past the memory the file's size allows left out");
     say(&mut file, index.links, "member", "members", "of the message only point elsewhere (xlink:href) and weren't followed");
     if notes.nothing_to_draw > 0 {
         file.messages.push(format!(

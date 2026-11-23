@@ -6047,7 +6047,7 @@ impl RustGisApp {
             };
             // The request receipt is correlation only; its admitted claim stays outside JSON.
             let mut q = json!({"url": url});
-            for k in ["name", "layer", "crs", "connection", "from"] {
+            for k in ["name", "layer", "crs", "connection", "from", "at"] {
                 if let Some(v) = p.get(k).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
                     q[k] = v.clone();
                 }

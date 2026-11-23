@@ -471,7 +471,7 @@ fn asked_by(asked: &Value, params: &Value) -> bool {
     // `cog`, `dates`, a `name` that isn't text…) it leaves out. `zoom` it passes on, but may change
     // (a link's data, once zoomed to), so it isn't compared.
     let passed_on = |k: &str, v: &Value| match k {
-        "name" | "layer" | "crs" | "connection" => v.as_str().is_some_and(|s| !s.trim().is_empty()),
+        "name" | "layer" | "crs" | "connection" | "at" => v.as_str().is_some_and(|s| !s.trim().is_empty()),
         "x" | "y" | "wkt" | "delimiter" | "paperSpace" | "blocks" | "stream" | "as" => !v.is_null(),
         "service" | "coverage" | "anonymous" => v == &json!(true),
         "bounds" => v.is_array(),

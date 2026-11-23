@@ -24125,6 +24125,35 @@ fn spreadsheets_feeds_landxml_and_polylines() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// An AIXM message through the commands: a layer per kind at the effective date asked, from a
+/// path and from text, an "at" that isn't a date refused, and "at" refused for any other file.
+#[test]
+fn aixm_messages_are_added_at_the_date_asked() {
+    let donlon = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../data/tests/data/donlon-aixm.xml"));
+    let dir = std::env::temp_dir().join(format!("rustgis-aixm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("donlon.xml");
+    std::fs::write(&path, donlon).unwrap();
+    let mut s = Session::new(Project::default());
+    s.run("layer.addData", &json!({"path": path.display().to_string(), "at": "2026-01-15"})).unwrap();
+    for name in ["donlon Airspace", "donlon DesignatedPoint", "donlon RouteSegment", "donlon AirportHeliport ARP"] {
+        assert!(s.map().layer_by_name(name).is_some(), "no {name}");
+    }
+    // Runways have no geometry of their own: a table of the project.
+    assert!(s.project.tables.iter().any(|t| t.dataset.name == "donlon Runway"));
+    // The same as text, before every feature began: nothing to add, and why.
+    let text = String::from_utf8(donlon.to_vec()).unwrap();
+    let e = s.run("layer.addDataText", &json!({"fileName": "early.xml", "text": text, "at": "2000-01-01"})).unwrap_err();
+    assert!(e.contains("not in force"), "{e}");
+    let e = s.run("layer.addData", &json!({"path": path.display().to_string(), "at": "someday"})).unwrap_err();
+    assert!(e.contains("isn't a date"), "{e}");
+    let gpx = dir.join("track.gpx");
+    std::fs::write(&gpx, r#"<gpx version="1.1"><wpt lat="1" lon="2"><name>W</name></wpt></gpx>"#).unwrap();
+    let e = s.run("layer.addData", &json!({"path": gpx.display().to_string(), "at": "2026-01-15"})).unwrap_err();
+    assert!(e.contains("isn't one"), "{e}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A raster GDAL reads, added with a coordinate system: the project names the file and the
 /// choice, and opens it again after the conversion cache is cleared. (Runs where GDAL is.)
 #[cfg(not(target_arch = "wasm32"))]

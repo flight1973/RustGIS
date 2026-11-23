@@ -252,6 +252,12 @@ pub fn is_citygml(file_name: &str, bytes: &[u8]) -> bool {
     matches!(ext.as_str(), "gml" | "xml") && crate::citygml::looks_like_citygml(bytes)
 }
 
+/// Whether a `.gml` or `.xml` file is an AIXM message (aeronautical information), by its root.
+pub fn is_aixm(file_name: &str, bytes: &[u8]) -> bool {
+    let ext = Path::new(file_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "gml" | "xml") && crate::aixm::looks_like_aixm(bytes)
+}
+
 /// Whether a file is a city model, CityJSON or CityGML: its layers all come from one reading, which
 /// takes the coordinate system a caller gives ([`read_city_model`]).
 pub fn is_city_model(file_name: &str, bytes: &[u8]) -> bool {
@@ -285,7 +291,7 @@ pub fn read_layers(file_name: &str, bytes: &[u8]) -> Result<Vec<LayerRead>> {
     // they are added, on the desktop's UI thread, never ahead: within [`BYTES_FLOOR`] whatever the
     // memory (#2408), wherever they come from.
     let as_added = matches!(ext.as_str(), "kml" | "kmz" | "rss" | "atom" | "georss" | "landxml")
-        || (ext == "xml" && !crate::citygml::looks_like_citygml(bytes));
+        || (ext == "xml" && !crate::citygml::looks_like_citygml(bytes) && !crate::aixm::looks_like_aixm(bytes));
     let max = if as_added { BYTES_FLOOR } else { max_bytes() };
     if bytes.len() as u64 > max {
         return Err(DataError::Format(file_size_error(file_name, max)));
@@ -306,6 +312,8 @@ pub fn read_layers(file_name: &str, bytes: &[u8]) -> Result<Vec<LayerRead>> {
             let text = String::from_utf8_lossy(bytes.get(..bytes.len().min(8192)).unwrap_or(bytes));
             if crate::citygml::looks_like_citygml(bytes) {
                 plain(crate::citygml::read(file_name, bytes, None)?)
+            } else if crate::aixm::looks_like_aixm(bytes) {
+                plain(crate::aixm::read(file_name, bytes, &crate::aixm::Options::default())?)
             } else if crate::landxml::looks_like_landxml(&text) {
                 plain(crate::landxml::read(file_name, bytes, None)?)
             } else if crate::georss::looks_like_georss(&text) {
@@ -319,12 +327,13 @@ pub fn read_layers(file_name: &str, bytes: &[u8]) -> Result<Vec<LayerRead>> {
                     .collect()
             } else {
                 return Err(DataError::Format(format!(
-                    "{file_name}: an XML file RustGIS doesn't read (it reads GeoRSS, LandXML, CityGML, KML and GPX)"
+                    "{file_name}: an XML file RustGIS doesn't read (it reads AIXM, GeoRSS, LandXML, CityGML, KML and GPX)"
                 )));
             }
         }
         // A CityGML city model, or the features of a collection.
         "gml" if crate::citygml::looks_like_citygml(bytes) => plain(crate::citygml::read(file_name, bytes, None)?),
+        "gml" if crate::aixm::looks_like_aixm(bytes) => plain(crate::aixm::read(file_name, bytes, &crate::aixm::Options::default())?),
         "gml" => plain(crate::gml::read(file_name, bytes)?),
         "dxf" => plain(crate::dxf::read(file_name, bytes, &crate::dxf::Options::default())?),
         // OpenStreetMap PBF, not a vector tile (`.pbf` too).
@@ -360,7 +369,7 @@ pub fn read_layers(file_name: &str, bytes: &[u8]) -> Result<Vec<LayerRead>> {
 
 /// The extension of a file from its first bytes, for a download whose address doesn't say:
 /// GeoParquet, FlatGeobuf, GeoTIFF, a zip, a GeoPackage, an ArcGIS feature service's protocol
-/// buffer answer (`pbf`), KML, GPX, GeoJSON, delimited text, JPEG 2000, a PDF or GRIB (`None` for
+/// buffer answer (`pbf`), KML, GPX, an AIXM message (`xml`), GeoJSON, delimited text, JPEG 2000, a PDF or GRIB (`None` for
 /// anything else, such as a web page).
 pub fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
     if let Some(ext) = crate::raster::jpeg2000_extension(bytes) {
@@ -402,6 +411,8 @@ pub fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
         _ if start.starts_with('{') || start.starts_with('[') => "geojson",
         // A CityGML city model, by its root.
         _ if start.starts_with('<') && crate::citygml::looks_like_citygml(bytes) => "gml",
+        // An AIXM message, by its root.
+        _ if start.starts_with('<') && crate::aixm::looks_like_aixm(bytes) => "xml",
         _ if start.starts_with('<') && text.contains("<kml") => "kml",
         _ if start.starts_with('<') && text.contains("<gpx") => "gpx",
         // Text whose first two lines a separator splits alike, and no control characters.
@@ -456,7 +467,7 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<(Dataset, ReadReport)
             return Err(DataError::Unsupported(format!("{ext} on its own: it is part of a Shapefile; add it together with its .shp")));
         }
         // The first layer (`read_layers` reads them all), saying what else the file holds.
-        "xml" if is_citygml(file_name, bytes) => return first_layer(file_name, bytes),
+        "xml" if is_citygml(file_name, bytes) || is_aixm(file_name, bytes) => return first_layer(file_name, bytes),
         "zip" | "kml" | "kmz" | "gpx" | "gml" | "dxf" | "pbf" | "topojson" => return first_layer(file_name, bytes),
         "las" | "laz" => crate::lidar::read_bytes(bytes, &name, None)?,
         // A copy, since only borrowed bytes are given; `read_owned` takes them without one.
@@ -531,7 +542,7 @@ pub fn read_path(path: &Path) -> Result<(Dataset, ReadReport)> {
         "xml" => {
             check_size(path)?;
             let bytes = crate::provenance::read(path)?;
-            if !is_citygml(&path.display().to_string(), &bytes) {
+            if !is_citygml(&path.display().to_string(), &bytes) && !is_aixm(&path.display().to_string(), &bytes) {
                 return Err(DataError::Unsupported("xml".into()));
             }
             read_bytes(&path.display().to_string(), &bytes)?
@@ -6275,8 +6286,9 @@ mod tests {
 
     #[test]
     fn formats_by_contents() {
-        let cases: [(&[u8], Option<&str>); 11] = [
+        let cases: [(&[u8], Option<&str>); 12] = [
             (b"PAR1\0\0", Some("parquet")),
+            (b"<message:AIXMBasicMessage xmlns:message=\"http://www.aixm.aero/schema/5.1.1/message\"/>", Some("xml")),
             (b"fgb\x03fgb\0", Some("fgb")),
             (b"II*\0\x08\0", Some("tif")),
             (b"PK\x03\x04", Some("zip")),
