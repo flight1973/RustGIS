@@ -899,3 +899,27 @@ fn faa_route_segments_are_drawn_between_their_points_in_nad83() {
         assert!(notes.iter().any(|m| m.contains(want)), "{want}: {notes:?}");
     }
 }
+
+const DFS: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/dfs-airspace-aixm.xml"));
+
+#[test]
+fn dfs_airspace_follows_the_state_border_it_names() {
+    let out = read("dfs-airspace-aixm.xml", DFS, &at("2026-11-23")).unwrap();
+    let asp = layer(&out, "dfs-airspace-aixm Airspace");
+    let i = row_where(asp, "name", "MASKIRCHEN B AREA");
+    let ring = ring(asp.features[i].geometry.as_ref().unwrap());
+    // From the written point at 51.0875 N 6.005 E, along the Dutch border, back to 50.92 N 6.06 E:
+    // the stretch of border between them, not all of it (which runs to the North Sea).
+    assert!(ring.len() > 10, "{ring:?}");
+    assert!(ring.iter().all(|c| (5.8..6.3).contains(&c.x) && (50.85..51.15).contains(&c.y)), "{ring:?}");
+    assert_eq!(ring.first(), ring.last());
+    assert_eq!(value(asp, i, "geometryComponent_theAirspaceVolume_lowerLimit"), Value::Int(95));
+    assert_eq!(value(asp, i, "lowerLimit_uom"), Value::Text("FL".into()));
+    // BERLIN X is drawn from its arcs.
+    assert!(asp.features[row_where(asp, "name", "BERLIN X")].geometry.is_some());
+    let notes = said(&out);
+    for want in ["1 border given by reference is drawn along the GeoBorder", "1 feature has arcs or circles", "SNAPSHOT"] {
+        assert!(notes.iter().any(|m| m.contains(want)), "{want}: {notes:?}");
+    }
+    assert!(!notes.iter().any(|m| m.contains("more than 50 m")), "{notes:?}");
+}

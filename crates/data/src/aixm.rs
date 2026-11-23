@@ -2096,7 +2096,8 @@ fn feature_rows(
             // reference point and its boundary); a kind with one is one layer, titled by its kind.
             // A shape whose positions are all empty (`<gml:pos></gml:pos>`, as the FAA writes a
             // position it doesn't have) gives none: said as no geometry, not as unreadable.
-            let empty = !g.descendants().any(|d| d.is_element() && is_gml(&d) && matches!(local(&d), "pos" | "posList") && !text_of(&d).is_empty());
+            let empty =
+                !g.descendants().any(|d| d.is_element() && is_gml(&d) && matches!(local(&d), "pos" | "posList") && !text_of(&d).is_empty());
             let bad = geom.is_none() && !empty;
             let i = layers.push(kind, &name, geom, r, Some(&notes), change);
             first = first.or(i);
