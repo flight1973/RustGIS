@@ -229,10 +229,10 @@ fn declarations(e: &BytesStart) -> String {
             let value = &a.value;
             let quote = if value.contains('"') { '\'' } else { '"' };
             out.push(' ');
-            out.push_str(&key);
+            out.push_str(key);
             out.push('=');
             out.push(quote);
-            out.push_str(&value);
+            out.push_str(value);
             out.push(quote);
         }
     }
@@ -331,7 +331,7 @@ enum State {
     /// Withdrawn by the date, or not yet created (`featureLifetime`).
     OutsideLifetime,
     /// Only changes (PERMDELTA, TEMPDELTA) and no state to apply them to.
-    NoState,
+    OnlyChanges,
     /// Every slice canceled.
     Canceled,
 }
@@ -356,7 +356,7 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     }
     let live: Vec<&Slice> = held.values().copied().filter(|s| !s.canceled).collect();
     if live.is_empty() {
-        return if slices.is_empty() { State::NoState } else { State::Canceled };
+        return if slices.is_empty() { State::OnlyChanges } else { State::Canceled };
     }
     let of = |k: Interpretation| live.iter().copied().filter(move |s| s.kind == k);
     // The BASELINE in force; of several (which the concept doesn't allow), the latest started.
@@ -378,7 +378,7 @@ fn state_at(slices: &[Slice], t: f64) -> State {
             match snap {
                 Some(s) if baselines == 0 => (s, true),
                 _ if baselines > 0 => return State::NotInForce,
-                _ => return State::NoState,
+                _ => return State::OnlyChanges,
             }
         }
     };
@@ -1195,7 +1195,20 @@ fn scope_of(
         return Some(0);
     }
     // Each in-scope namespace costs its writing; paid before it is written.
-    let cost = sl.namespaces().map(|n| n.uri().len() + n.name().map_or(0, str::len) + 10).sum::<usize>();
+    // Charged as written: escaping can make a URI six times longer (`"` as `&quot;`).
+    let escaped = |u: &str| {
+        u.len()
+            + u.bytes()
+                .map(|b| match b {
+                    b'&' => 4,
+                    b'<' => 3,
+                    b'"' => 5,
+                    _ => 0,
+                })
+                .sum::<usize>()
+    };
+    let cost =
+        sl.namespaces().filter(|n| n.name() != Some("xml")).map(|n| escaped(n.uri()) + n.name().map_or(0, str::len) + 10).sum::<usize>();
     *wrap_left = wrap_left.checked_sub(cost)?;
     let mut decls = String::with_capacity(cost);
     for n in sl.namespaces().filter(|n| n.name() != Some("xml")) {
@@ -1361,7 +1374,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
                 notes.outside_lifetime += 1;
                 continue;
             }
-            State::NoState => {
+            State::OnlyChanges => {
                 notes.no_state += 1;
                 continue;
             }
@@ -1527,7 +1540,7 @@ fn mark(layers: &mut Layers, kind: &str, label: &str, temporary: usize, snapshot
 }
 
 /// An airspace: its volumes' operations decide what is drawn. Its limits are its BASE volume's.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "an airspace reads into the row, the shapes, the layers and its notes at once")]
 fn airspace(
     props: &[Node],
     row: &mut Row,
