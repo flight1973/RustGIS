@@ -1379,8 +1379,8 @@
           <!-- AIXM v5.1.1 lacks the property 'aixm:designator' for the entire vertical structure. As a workaround, in order to align the static data coding
           with the Digital NOTAM coding, 'aixm:name' is used for encoding the alphanumerical designator (the equivalent of 'obstacle identification'
           in the OBS.NEW scenario).
-          If the obstacle has a name besides the alphanumerical designator, such as the name of the area in which it is situated, it will be encoded 
-          using an annotation with propertyName='horizontalProjection_location' and purpose='REMARK' (the equivalent of 'location remarks' in the 
+          If the obstacle has a name besides the alphanumerical designator, such as the name of the area in which it is situated, it will be encoded
+          using an annotation with propertyName='horizontalProjection_location' and purpose='REMARK' (the equivalent of 'location remarks' in the
           OBS.NEW scenario). This annotation is also used in the NOTAM text generation for OBL.UNS scenarion. -->
           <aixm:hostedPassengerService xsi:nil="true"/>
           <aixm:supportedGroundLight xsi:nil="true"/>
