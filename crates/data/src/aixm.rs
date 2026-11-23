@@ -103,18 +103,35 @@ impl Options {
     }
 }
 
-/// Whether a file is an AIXM message, by its root: an `AIXMBasicMessage` in an AIXM 5 namespace.
+/// Whether a file is an AIXM message, by its root: an `AIXMBasicMessage` in an AIXM 5 namespace,
+/// or an FAA NASR subscriber file of AIXM 5 features ([`is_root`]).
 pub fn looks_like_aixm(bytes: &[u8]) -> bool {
     let head = String::from_utf8_lossy(bytes.get(..HEAD_BYTES).unwrap_or(bytes));
     let mut reader = Reader::from_str(head.trim_start_matches('\u{feff}'));
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e) | Event::Empty(e)) => {
-                return e.local_name().into_inner() == "AIXMBasicMessage" && namespace_of(&e).is_some_and(|ns| ns.starts_with(AIXM));
-            }
+            Ok(Event::Start(e) | Event::Empty(e)) => return is_root(&e),
             Ok(Event::Eof) | Err(_) => return false,
             Ok(_) => {}
         }
+    }
+}
+
+/// The FAA's namespaces for its NASR subscriber files.
+const FAA: &str = "http://www.faa.gov/aixm5";
+
+/// Whether an element is the root of a message RustGIS reads: an `AIXMBasicMessage` in an AIXM 5
+/// namespace, or the FAA's `SubscriberFile` (its 28-day NASR data) saying it holds AIXM 5
+/// (`AIXMVersion="AIXM5.1"`), whose `Member`s hold AIXM features as `hasMember`s do.
+fn is_root(e: &BytesStart) -> bool {
+    let ns = namespace_of(e);
+    match e.local_name().into_inner() {
+        "AIXMBasicMessage" => ns.is_some_and(|ns| ns.starts_with(AIXM)),
+        "SubscriberFile" => {
+            ns.is_some_and(|ns| ns.starts_with(FAA))
+                && e.attributes().flatten().any(|a| a.key.local_name().into_inner() == "AIXMVersion" && a.value.trim().starts_with("AIXM5"))
+        }
+        _ => false,
     }
 }
 
@@ -177,9 +194,9 @@ impl Index {
             match event {
                 Event::Start(ref e) | Event::Empty(ref e) if depth == 0 => {
                     rooted = true;
-                    if e.local_name().into_inner() != "AIXMBasicMessage" || !namespace_of(e).is_some_and(|ns| ns.starts_with(AIXM)) {
+                    if !is_root(e) {
                         return Err(DataError::Format(format!(
-                            "{file_name}: not an AIXM message (an AIXMBasicMessage in an AIXM 5 namespace)"
+                            "{file_name}: not an AIXM message (an AIXMBasicMessage in an AIXM 5 namespace, or an FAA NASR subscriber file of AIXM 5)"
                         )));
                     }
                     index.namespaces = declarations(e);
@@ -190,7 +207,7 @@ impl Index {
                     depth = 1;
                 }
                 Event::Start(e) => {
-                    if depth == 1 && e.local_name().into_inner() == "hasMember" {
+                    if depth == 1 && is_member(&e) {
                         member = Some((start, has_href(&e), false));
                     } else if depth == 2
                         && let Some(m) = member.as_mut()
@@ -200,7 +217,7 @@ impl Index {
                     depth += 1;
                 }
                 Event::Empty(e) => {
-                    if depth == 1 && e.local_name().into_inner() == "hasMember" {
+                    if depth == 1 && is_member(&e) {
                         if has_href(&e) {
                             index.links += 1;
                         } else {
@@ -241,6 +258,12 @@ impl Index {
         }
         Ok(index)
     }
+}
+
+/// Whether an element under the root holds a feature: a message's `hasMember`, a subscriber
+/// file's `Member`.
+fn is_member(e: &BytesStart) -> bool {
+    matches!(e.local_name().into_inner(), "hasMember" | "Member")
 }
 
 /// Whether an element points elsewhere (`xlink:href`).
@@ -551,8 +574,12 @@ struct ShapeNotes {
     unread_segments: Vec<String>,
     /// Rings or patches left out (too few points, unreadable, a border given by reference).
     rings_lost: usize,
-    /// Of those, borders given by a reference to another feature's curve.
+    /// Of those, borders given by a reference to a curve not in the file (or not in force).
     referenced: usize,
+    /// Borders given by reference, followed along the GeoBorder they name; of those, ones whose
+    /// ends lie more than [`FAR_FROM_BORDER_M`] from it.
+    followed: usize,
+    far: usize,
 }
 
 /// Reads shapes, adding at most `budget` points to the file's positions.
@@ -571,6 +598,8 @@ struct Shapes {
     as_wgs84: Option<String>,
     as_wgs84_count: usize,
     as_wgs84_now: bool,
+    /// The borders references may follow, by [`border_key`]: each GeoBorder's at the date.
+    borders: HashMap<String, Vec<Coord>>,
 }
 
 fn wrap180(d: f64) -> f64 {
@@ -596,6 +625,8 @@ impl ShapeNotes {
         }
         self.rings_lost += o.rings_lost;
         self.referenced += o.referenced;
+        self.followed += o.followed;
+        self.far += o.far;
     }
 }
 
@@ -880,17 +911,43 @@ impl Shapes {
                 Self::positions(r, axes, notes)?
             }
             "Ring" => {
-                let mut out: Vec<Coord> = Vec::new();
+                // Its members: curves written out, and borders given by reference, which are cut
+                // once the points either side of them are known.
+                let mut members: Vec<std::result::Result<Vec<Coord>, String>> = Vec::new();
                 for m in elements(r).filter(|c| local(c) == "curveMember") {
-                    let Some(c) = elements(m).next() else {
-                        // Said as a border by reference by the ring's patch, not also as a ring
-                        // left out.
-                        if m.attribute((XLINK, "href")).is_some() {
-                            notes.referenced += 1;
+                    match elements(m).next() {
+                        Some(c) => members.push(Ok(self.curve(c, notes)?)),
+                        None => match m.attribute((XLINK, "href")) {
+                            Some(h) => members.push(Err(border_key(h))),
+                            None => return None,
+                        },
+                    }
+                }
+                let mut out: Vec<Coord> = Vec::new();
+                let n = members.len();
+                for i in 0..n {
+                    let mut part = match members.get(i) {
+                        Some(Ok(c)) => c.clone(),
+                        Some(Err(key)) => {
+                            // The written points before and after it, round the ring.
+                            let before = (1..n).find_map(|k| match members.get((i + n - k) % n) {
+                                Some(Ok(c)) => c.last().copied(),
+                                _ => None,
+                            });
+                            let after = (1..n).find_map(|k| match members.get((i + k) % n) {
+                                Some(Ok(c)) => c.first().copied(),
+                                _ => None,
+                            });
+                            // Said as a border by reference by the ring's patch, not also as a
+                            // ring left out.
+                            let Some(part) = self.follow(key, before, after, notes) else {
+                                notes.referenced += 1;
+                                return None;
+                            };
+                            part
                         }
-                        return None;
+                        None => return None,
                     };
-                    let mut part = self.curve(c, notes)?;
                     if let Some(last) = out.last().copied() {
                         part = part.into_iter().map(|p| next_to(p, last.x)).collect();
                         if part.first().is_some_and(|f| (f.x - last.x).abs() < 1e-12 && (f.y - last.y).abs() < 1e-12) {
@@ -910,6 +967,30 @@ impl Shapes {
             *l = first;
         }
         (pts.len() >= 4).then_some(pts)
+    }
+
+    /// The part of a border given by reference (`key`, [`border_key`]) a ring follows: from the
+    /// point on it nearest `before` (the end of the member before) to the one nearest `after` (the
+    /// start of the next), the shorter way round a border that closes; the whole border when the
+    /// ring has no other points. AIXM leaves this cut to the reader (its coding guidance, "Geoborder
+    /// for Airspace Border"), so each is counted, and those whose ends lie far from the border.
+    fn follow(&mut self, key: &str, before: Option<Coord>, after: Option<Coord>, notes: &mut ShapeNotes) -> Option<Vec<Coord>> {
+        let border = self.borders.get(key)?;
+        let part = match (before, after) {
+            (Some(a), Some(b)) => {
+                let (part, off) = cut(border, a, b)?;
+                notes.far += usize::from(off > FAR_FROM_BORDER_M);
+                part
+            }
+            _ => border.clone(),
+        };
+        // Its points are paid for as a curve's added points are.
+        let n = part.len();
+        if self.take(n, notes) < n {
+            return None;
+        }
+        notes.followed += 1;
+        Some(part)
     }
 
     /// A surface's polygon patches (or a polygon): each its exterior and interiors.
@@ -959,6 +1040,79 @@ impl Shapes {
             _ => None,
         }
     }
+}
+
+/// How far from a border the ends of a part cut from it may lie before that is said, in meters.
+const FAR_FROM_BORDER_M: f64 = 50.0;
+
+/// What a reference names a border by: `#` and a curve's `gml:id`, or its feature's identifier.
+fn border_key(href: &str) -> String {
+    let h = href.trim();
+    match h.strip_prefix('#') {
+        Some(id) => format!("#{id}"),
+        None => format!("uuid:{}", h.strip_prefix("urn:uuid:").unwrap_or(h)),
+    }
+}
+
+/// Where on `line` a point is nearest `p`: the segment, how far along it (0 to 1), the point, and
+/// its distance from `p` in meters. Worked out in a plane around `p` (longitude scaled by the
+/// cosine of its latitude), fine at the scale of a border's segments.
+fn nearest_on(line: &[Coord], p: Coord) -> Option<(usize, f64, Coord, f64)> {
+    let k = p.y.to_radians().cos().max(1e-6);
+    let mut best: Option<(usize, f64, Coord, f64)> = None;
+    for (i, w) in line.windows(2).enumerate() {
+        let (Some(&a), Some(&b)) = (w.first(), w.get(1)) else { continue };
+        let (a, b) = (next_to(a, p.x), next_to(b, p.x));
+        let (dx, dy) = ((b.x - a.x) * k, b.y - a.y);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 0.0 { (((p.x - a.x) * k * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let q = Coord::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+        let d2 = ((q.x - p.x) * k).powi(2) + (q.y - p.y).powi(2);
+        if best.is_none_or(|(_, _, _, bd)| d2 < bd) {
+            best = Some((i, t, q, d2));
+        }
+    }
+    best.map(|(i, t, q, _)| (i, t, q, rustgis_geom::wgs84_distance_m(q, p)))
+}
+
+/// The part of `line` from the point nearest `a` to the one nearest `b`, and the farther of the
+/// two ends from its point. Along the line either way; on a line that closes (an island's
+/// coast), the shorter way round.
+fn cut(line: &[Coord], a: Coord, b: Coord) -> Option<(Vec<Coord>, f64)> {
+    let (ia, ta, pa, da) = nearest_on(line, a)?;
+    let (ib, tb, pb, db) = nearest_on(line, b)?;
+    let at = |i: usize| line.get(i).copied();
+    let forward = (ia as f64 + ta) <= (ib as f64 + tb);
+    // Along the line: the vertices between the two points, in the order traveled.
+    let mut direct = vec![pa];
+    if forward {
+        direct.extend((ia + 1..=ib).filter_map(at));
+    } else {
+        direct.extend((ib + 1..=ia).rev().filter_map(at));
+    }
+    direct.push(pb);
+    let closes = match (line.first(), line.last()) {
+        (Some(f), Some(l)) => line.len() > 3 && (f.x - l.x).abs() < 1e-9 && (f.y - l.y).abs() < 1e-9,
+        _ => false,
+    };
+    let part = if closes {
+        // The other way round, through where the line closes (its last point is its first).
+        let last = line.len() - 1;
+        let mut round = vec![pa];
+        if forward {
+            round.extend((0..=ia).rev().filter_map(at));
+            round.extend((ib + 1..last).rev().filter_map(at));
+        } else {
+            round.extend((ia + 1..last).filter_map(at));
+            round.extend((0..=ib).filter_map(at));
+        }
+        round.push(pb);
+        let length = |l: &[Coord]| l.windows(2).map(|w| rustgis_geom::wgs84_distance_m(w[0], w[1])).sum::<f64>();
+        if length(&round) < length(&direct) { round } else { direct }
+    } else {
+        direct
+    };
+    Some((part, da.max(db)))
 }
 
 /// Meters in one of a length's units: UCUM's (`m`, `km`, `[nmi_i]`, `[ft_i]`, `[mi_i]`) and AIXM's
@@ -1012,8 +1166,10 @@ struct Layer {
     kind: String,
     label: String,
     columns: Vec<String>,
-    named: HashSet<String>,
-    rows: Vec<(Option<Geometry>, Attrs, Nested)>,
+    /// Each column's number.
+    named: HashMap<String, usize>,
+    /// Its rows: their shape, their simple values by column number, their nested ones by path.
+    rows: Vec<(Option<Geometry>, Vec<(usize, String)>, Nested)>,
     /// Values of properties past the column cap, or nested past [`MAX_PATH`].
     capped: usize,
     /// Features kept without a shape: no geometry, or one that couldn't be read.
@@ -1031,6 +1187,9 @@ struct Layer {
     derived_names: Names,
     /// Airspaces drawn as the parts of BASE and UNION volumes.
     unions: usize,
+    /// Borders given by reference followed along a GeoBorder, and those with ends far from it.
+    followed: usize,
+    far: usize,
     /// Shapes in the records of features drawn from their own shapes, not drawn.
     shapes_in_records: usize,
     /// Features as a TEMPDELTA changed them.
@@ -1039,17 +1198,19 @@ struct Layer {
 }
 
 impl Layer {
-    fn column(&mut self, name: &str) -> bool {
-        if self.named.contains(name) {
-            return true;
+    /// A column's number, made when there is room for another; `None` (counted) past
+    /// [`MAX_COLUMNS`].
+    fn column(&mut self, name: &str) -> Option<usize> {
+        if let Some(&i) = self.named.get(name) {
+            return Some(i);
         }
         if self.columns.len() >= MAX_COLUMNS {
             self.capped += 1;
-            return false;
+            return None;
         }
-        self.named.insert(name.to_string());
+        self.named.insert(name.to_string(), self.columns.len());
         self.columns.push(name.to_string());
-        true
+        Some(self.columns.len() - 1)
     }
 
     fn take_notes(&mut self, n: &ShapeNotes) {
@@ -1064,13 +1225,29 @@ impl Layer {
         }
         self.rings_lost += n.rings_lost;
         self.referenced += n.referenced;
+        self.followed += n.followed;
+        self.far += n.far;
     }
 }
 
-/// A row's values nested in records, each by its path: every step a property's name and which of
-/// its kind among its siblings it is (from 1). `None` is a value given as missing (`nil`). They are
-/// named as columns once the layer's rows are all read ([`path_columns`]).
-type Nested = Vec<(Vec<(String, usize)>, Option<String>)>;
+/// A path to a nested value: every step a property's name and which of its kind among its
+/// siblings it is (from 1).
+type Path = Vec<(String, usize)>;
+
+/// Every path a read meets, each kept once: a value holds its path's number, not a copy of it.
+#[derive(Default)]
+struct Paths {
+    ids: HashMap<Path, usize>,
+    list: Vec<Path>,
+}
+
+/// The paths of a read, shared by its rows.
+type SharedPaths = std::rc::Rc<std::cell::RefCell<Paths>>;
+
+/// A row's values nested in records, each by its path's number ([`Paths`]). `None` is a value
+/// given as missing (`nil`). They are named as columns once the layer's rows are all read
+/// ([`path_columns`]).
+type Nested = Vec<(usize, Option<String>)>;
 
 /// A row being built: its values, simple ones by column and nested ones by path.
 #[derive(Default, Clone)]
@@ -1079,8 +1256,9 @@ struct Row {
     /// Every column named, null or not, in order, and the same as a set.
     columns: Vec<String>,
     named: HashSet<String>,
-    /// Values in records, by path.
+    /// Values in records, by path, and the read's paths.
     paths: Nested,
+    interned: SharedPaths,
     /// How many records of each property the feature has had so far.
     records: HashMap<String, usize>,
     /// Values of names past [`MAX_COLUMNS`], nested past [`MAX_PATH`], or past `limit`, not kept.
@@ -1115,6 +1293,26 @@ impl Row {
         }
         self.bytes += cost;
         true
+    }
+
+    /// The number of a path, kept once for the read: a path met for the first time is paid for in
+    /// bytes, so the paths together can't outgrow what the file's size allows.
+    fn path_id(&mut self, at: Path) -> Option<usize> {
+        let shared = std::rc::Rc::clone(&self.interned);
+        let Ok(mut paths) = shared.try_borrow_mut() else {
+            self.capped += 1;
+            return None;
+        };
+        if let Some(&id) = paths.ids.get(&at) {
+            return Some(id);
+        }
+        if !self.afford(at.iter().map(|(n, _)| n.len() + VALUE_OVERHEAD).sum()) {
+            return None;
+        }
+        let id = paths.list.len();
+        paths.list.push(at.clone());
+        paths.ids.insert(at, id);
+        Some(id)
     }
 
     /// What the row holds, in bytes: what keeping it, or a copy of it, costs.
@@ -1196,18 +1394,17 @@ impl Row {
             if elements(c).next().is_some() && c.attribute((XLINK, "href")).is_none() {
                 self.record_at(c, path, false, depth + 1);
             } else if let Some((last, _)) = path.last().cloned() {
-                // Each value keeps its own copy of its path: paid for in bytes, so deep paths
-                // can't make the copies outgrow what the file's size allows.
-                let path_bytes: usize = path.iter().map(|(n, _)| n.len() + VALUE_OVERHEAD).sum();
                 for (key, value) in leaf_values(c, &last) {
-                    if !self.afford(path_bytes + key.len() + value.as_ref().map_or(0, String::len)) {
+                    if !self.afford(value.as_ref().map_or(0, String::len)) {
                         continue;
                     }
                     let mut at = path.clone();
                     if let Some(step) = at.last_mut() {
                         step.0 = key;
                     }
-                    self.paths.push((at, value));
+                    if let Some(id) = self.path_id(at) {
+                        self.paths.push((id, value));
+                    }
                 }
             }
             path.pop();
@@ -1225,6 +1422,21 @@ impl Row {
     }
 }
 
+/// The identifier a reference names: a UUID (`urn:uuid:` left off), a local `#id`, or the
+/// `gml:id` an XPath picks (the FAA's `#/faa:SubscriberFile/faa:Member/aixm:Navaid[@gml:id='N1']`,
+/// brackets written as `%5B`/`%5D` or not): what the feature it names is known by in its columns.
+fn reference(href: &str) -> String {
+    let h = href.trim();
+    if let Some(at) = h.find("@gml:id") {
+        let rest = h.get(at..).unwrap_or_default();
+        let mut quoted = rest.split(['\'', '"']);
+        if let (Some(_), Some(id)) = (quoted.next(), quoted.next()) {
+            return id.trim().to_string();
+        }
+    }
+    h.strip_prefix("urn:uuid:").or_else(|| h.strip_prefix('#')).unwrap_or(h).to_string()
+}
+
 /// A property's value and those written on it, each under its own name from `name`: its text (or
 /// `None` when given as missing), the identifier a reference names (`urn:uuid:` left off) with its
 /// title (`_title`), its unit (`_uom`), why it is missing (`_nilReason`), its language (`_lang`)
@@ -1234,9 +1446,7 @@ fn leaf_values(p: Node, name: &str) -> Vec<(String, Option<String>)> {
     if is_nil(&p) {
         out.push((name.to_string(), None));
     } else if let Some(href) = p.attribute((XLINK, "href")) {
-        let id = href.trim();
-        let id = id.strip_prefix("urn:uuid:").or_else(|| id.strip_prefix('#')).unwrap_or(id);
-        out.push((name.to_string(), Some(id.to_string())));
+        out.push((name.to_string(), Some(reference(href))));
     } else {
         out.push((name.to_string(), Some(text_of(&p))));
     }
@@ -1254,10 +1464,12 @@ fn leaf_values(p: Node, name: &str) -> Vec<(String, Option<String>)> {
 /// The column of each nested value of a layer's rows: its path's names joined by `_`, each step
 /// numbered (`authority_1_type`) when its record repeats anywhere in the layer, so every row's
 /// values of one record share their columns.
-fn path_columns(rows: &[(Option<Geometry>, Attrs, Nested)]) -> HashSet<String> {
+fn path_columns(rows: &[(Option<Geometry>, Vec<(usize, String)>, Nested)], paths: &Paths) -> HashSet<String> {
+    let used: HashSet<usize> = rows.iter().flat_map(|(_, _, nested)| nested.iter().map(|(id, _)| *id)).collect();
     let mut repeating = HashSet::new();
-    for (_, _, nested) in rows {
-        for (path, _) in nested {
+    for id in used {
+        let Some(path) = paths.list.get(id) else { continue };
+        {
             let mut key = String::new();
             for (name, n) in path {
                 key.push('/');
@@ -1351,12 +1563,12 @@ impl Layers {
         layer.capped += row.capped;
         layer.temporary += usize::from(change.0);
         layer.snapshots += usize::from(change.1);
-        let mut attrs = Attrs::new();
+        let mut attrs = Vec::with_capacity(row.attrs.len());
         for c in &row.columns {
-            if layer.column(c)
+            if let Some(k) = layer.column(c)
                 && let Some(v) = row.attrs.get(c)
             {
-                attrs.insert(c.clone(), v.clone());
+                attrs.push((k, v.clone()));
             }
         }
         if let Some(n) = notes {
@@ -1606,11 +1818,18 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.unknown_interpretation = trouble.unknown;
     notes.bad_dates = trouble.dates;
     // Second pass: each feature in force at the date, from its slices.
+    // The nested paths of every row, each kept once.
+    let paths: SharedPaths = SharedPaths::default();
     let mut layers = Layers { bytes_left: text.len().saturating_mul(4).max(MIN_ROW_BYTES), ..Layers::default() };
     let mut shapes = Shapes { budget: text.len().max(MIN_ADDED_POINTS), ..Shapes::default() };
     // Rows of features with nothing to draw, by kind, kept until it is known whether the kind has
     // a layer to hold them.
     let mut shapeless: Vec<(String, Row, usize, bool)> = Vec::new();
+    // GeoBorders first: airspace borders follow them by reference.
+    let (mut first, rest): (Vec<String>, Vec<String>) =
+        order.into_iter().partition(|id| features.get(id).is_some_and(|f| f.kind == "GeoBorder"));
+    first.extend(rest);
+    let order = first;
     crate::progress::begin(index.members.len() + order.len());
     crate::progress::step(index.members.len())?;
     for id in &order {
@@ -1684,7 +1903,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         let props: Vec<Node> =
             layers_of.iter().enumerate().flat_map(|(i, ps)| ps.iter().copied().filter(move |p| last.get(local(p)) == Some(&i))).collect();
         // A row being read keeps no more than the layers still may.
-        let mut row = Row { limit: Some(layers.bytes_left), ..Row::default() };
+        let mut row = Row { limit: Some(layers.bytes_left), interned: std::rc::Rc::clone(&paths), ..Row::default() };
         row.set("identifier", id.trim_start_matches("urn:uuid:").to_string());
         let valid = |t: Option<f64>| t.map(|t| crate::time::format(t, "YYYY-MM-DDTHH:mm:ss") + "Z");
         match valid(base.begin) {
@@ -1696,6 +1915,18 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             None => row.null("validTo"),
         }
         let kind = feature.kind.as_str();
+        // A GeoBorder's line, at the date, for the borders that follow it by reference: by its
+        // identifier and its curve's id.
+        if kind == "GeoBorder"
+            && let Some(g) = props.iter().filter(|p| local(p) == "border").find_map(|p| shape_in(*p))
+            && let Some(Geometry::Line(parts)) = shapes.shape(g, &mut ShapeNotes::default())
+        {
+            let line: Vec<Coord> = parts.concat();
+            if let Some(gid) = g.attribute((GML, "id")) {
+                shapes.borders.insert(format!("#{}", gid.trim()), line.clone());
+            }
+            shapes.borders.insert(border_key(id), line);
+        }
         let mut fnotes = ShapeNotes::default();
         let placed = match kind {
             "Airspace" => airspace(&props, &mut row, &mut shapes, &mut fnotes, &mut layers, kind, temporary, snapshot),
@@ -1726,7 +1957,8 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.other_system = shapes.other_system.take().map(|s| (s, shapes.other_count));
     notes.as_wgs84 = shapes.as_wgs84.take().map(|s| (s, shapes.as_wgs84_count));
     notes.assumed_system = shapes.assumed_system;
-    finish(&stem, at, layers, notes, &index, shapes.budget == 0)
+    let paths = std::mem::take(&mut *paths.borrow_mut());
+    finish(&stem, at, layers, notes, &index, shapes.budget == 0, &paths)
 }
 
 /// The family a shape element draws as, by its name (what a layer of its shapes is labeled).
@@ -1999,7 +2231,15 @@ fn vertical_structure(
 }
 
 /// The layers as datasets, with what the read says.
-fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, budget_spent: bool) -> Result<Vec<(Dataset, ReadReport)>> {
+fn finish(
+    stem: &str,
+    at: f64,
+    layers: Layers,
+    notes: FileNotes,
+    index: &Index,
+    budget_spent: bool,
+    paths: &Paths,
+) -> Result<Vec<(Dataset, ReadReport)>> {
     let mut file = ReadReport::default();
     let say = |r: &mut ReadReport, n: usize, one: &str, many: &str, rest: &str| {
         if n > 0 {
@@ -2090,44 +2330,64 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
         } else {
             format!("{stem} {} {}", layer.kind, layer.label)
         };
-        // Nested values as columns, named by their paths across the whole layer.
+        // Nested values as columns, named by their paths across the whole layer; each path's
+        // column worked out once.
         let mut layer = layer;
-        let repeating = path_columns(&layer.rows);
-        let mut rows = Vec::with_capacity(layer.rows.len());
+        let repeating = path_columns(&layer.rows, paths);
+        let mut column_of: HashMap<usize, Option<usize>> = HashMap::new();
+        let mut rows: Vec<(Option<Geometry>, Vec<(usize, String)>)> = Vec::with_capacity(layer.rows.len());
         for (g, mut attrs, nested) in std::mem::take(&mut layer.rows) {
-            for (path, value) in nested {
-                let column = path_column(&path, &repeating);
-                if !layer.column(&column) {
-                    continue;
+            for (id, value) in nested {
+                let k = match column_of.get(&id) {
+                    Some(k) => *k,
+                    None => {
+                        let k = paths.list.get(id).and_then(|p| layer.column(&path_column(p, &repeating)));
+                        column_of.insert(id, k);
+                        k
+                    }
+                };
+                if let (Some(k), Some(v)) = (k, value) {
+                    attrs.push((k, v));
                 }
-                if let Some(v) = value {
-                    match attrs.get_mut(&column) {
-                        Some(old) if !v.is_empty() => {
+            }
+            // A column given more than once keeps every value, in order.
+            attrs.sort_by_key(|(k, _)| *k);
+            let mut merged: Vec<(usize, String)> = Vec::with_capacity(attrs.len());
+            for (k, v) in attrs {
+                match merged.last_mut() {
+                    Some((last, old)) if *last == k => {
+                        if !v.is_empty() {
                             old.push_str("; ");
                             old.push_str(&v);
                         }
-                        Some(_) => {}
-                        None => {
-                            attrs.insert(column, v);
-                        }
                     }
+                    _ => merged.push((k, v)),
                 }
             }
-            rows.push((g, attrs));
+            rows.push((g, merged));
         }
-        let fields: Vec<Field> = layer
-            .columns
-            .iter()
-            .map(|c| {
-                Field::new(
-                    c.clone(),
-                    crate::io::text_type(rows.iter().filter_map(|(_, a)| a.get(c)).map(String::as_str).filter(|v| !v.is_empty())),
-                )
-            })
-            .collect();
+        // Each column typed from its values, looked at where they are.
+        let mut values: Vec<Vec<&str>> = vec![Vec::new(); layer.columns.len()];
+        for (_, attrs) in &rows {
+            for (k, v) in attrs {
+                if let Some(col) = values.get_mut(*k)
+                    && !v.is_empty()
+                {
+                    col.push(v);
+                }
+            }
+        }
+        let fields: Vec<Field> =
+            layer.columns.iter().zip(&values).map(|(c, vs)| Field::new(c.clone(), crate::io::text_type(vs.iter().copied()))).collect();
+        drop(values);
         let mut ds = Dataset::new(title, GeometryType::None, fields);
         for (g, attrs) in rows {
-            let row = ds.fields.iter().map(|f| attrs.get(&f.name).map_or(Value::Null, |v| Value::parse_file(v, f.ty))).collect();
+            let mut row = vec![Value::Null; ds.fields.len()];
+            for (k, v) in attrs {
+                if let (Some(slot), Some(f)) = (row.get_mut(k), ds.fields.get(k)) {
+                    *slot = Value::parse_file(&v, f.ty);
+                }
+            }
             ds.push_next(g, row);
         }
         ds.geometry_type = crate::io::dominant_type(&ds);
@@ -2190,8 +2450,18 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
         );
         say(
             layer.referenced,
-            "border is given by reference to another feature's curve, which isn't followed",
-            "borders are given by reference to another feature's curve, which isn't followed",
+            "border is given by reference to a curve that isn't in the file (or not in force then), so it can't be followed",
+            "borders are given by reference to curves that aren't in the file (or not in force then), so they can't be followed",
+        );
+        say(
+            layer.followed,
+            "border given by reference is drawn along the GeoBorder it names, between the points on it nearest those either side (AIXM leaves this cut to the reader)",
+            "borders given by reference are drawn along the GeoBorders they name, between the points on them nearest those either side (AIXM leaves this cut to the reader)",
+        );
+        say(
+            layer.far,
+            &format!("border followed by reference starts or ends more than {FAR_FROM_BORDER_M} m from the GeoBorder"),
+            &format!("borders followed by reference start or end more than {FAR_FROM_BORDER_M} m from the GeoBorder"),
         );
         say(
             layer.temporary,

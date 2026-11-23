@@ -783,3 +783,64 @@ fn a_long_value_copied_onto_many_rows_stays_within_the_files_allowance() {
     assert!(rows < 1000, "{rows} rows of a megabyte each");
     assert!(said(&out).iter().any(|m| m.contains("past the memory the file's size allows")), "{:?}", said(&out));
 }
+
+#[test]
+fn a_border_given_by_reference_is_followed_between_the_points_either_side() {
+    let border = r#"<aixm:name>NORTH-SOUTH</aixm:name><aixm:border><aixm:Curve gml:id="B1" srsName="urn:ogc:def:crs:EPSG::4326"><gml:segments><gml:LineStringSegment><gml:posList>50 9 50 10.5 50 12</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></aixm:border>"#;
+    let geo = feature("GeoBorder", "border-1", &[slice("GeoBorder", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), border)]);
+    let ring_xml = r#"<gml:Ring><gml:curveMember xlink:href="urn:uuid:border-1"/><gml:curveMember><aixm:Curve gml:id="c"><gml:segments><gml:LineStringSegment><gml:posList>50 11 50.5 11 50.5 10 50 10</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></gml:curveMember></gml:Ring>"#;
+    let body = format!(
+        r#"<aixm:name>FOLLOWS</aixm:name><aixm:geometryComponent><aixm:AirspaceGeometryComponent gml:id="g"><aixm:operation>BASE</aixm:operation><aixm:operationSequence>1</aixm:operationSequence><aixm:theAirspaceVolume><aixm:AirspaceVolume gml:id="v"><aixm:horizontalProjection><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior>{ring_xml}</gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:horizontalProjection></aixm:AirspaceVolume></aixm:theAirspaceVolume></aixm:AirspaceGeometryComponent></aixm:geometryComponent>"#
+    );
+    // The airspace comes first in the file: the border it follows is read first all the same.
+    let asp = feature("Airspace", "a", &[slice("Airspace", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+    let out = read("t.xml", &message(&(asp + &geo)), &at("2026-01-15")).unwrap();
+    let ring = ring(layer(&out, "t Airspace").features[0].geometry.as_ref().unwrap());
+    // From the point before (10, 50) along the border through its vertex at 10.5 to the next (11, 50).
+    assert!(ring.iter().any(|c| (c.x - 10.5).abs() < 1e-9 && (c.y - 50.0).abs() < 1e-9), "{ring:?}");
+    assert!(!ring.iter().any(|c| c.x < 9.99 || c.x > 11.01), "{ring:?}");
+    assert_eq!(ring.first(), ring.last());
+    let notes = said(&out);
+    assert!(notes.iter().any(|m| m.contains("1 border given by reference is drawn along the GeoBorder")), "{notes:?}");
+    assert!(!notes.iter().any(|m| m.contains("can't be followed") || m.contains("more than")), "{notes:?}");
+}
+
+#[test]
+fn a_closed_border_is_cut_the_shorter_way_round() {
+    let square = [Coord::new(0.0, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 1.0), Coord::new(0.0, 1.0), Coord::new(0.0, 0.0)];
+    let (part, off) = cut(&square, Coord::new(0.5, 0.0), Coord::new(1.0, 0.5)).unwrap();
+    assert_eq!(part, [Coord::new(0.5, 0.0), Coord::new(1.0, 0.0), Coord::new(1.0, 0.5)]);
+    assert!(off < 1e-6);
+    let (part, _) = cut(&square, Coord::new(1.0, 0.5), Coord::new(0.5, 0.0)).unwrap();
+    assert_eq!(part, [Coord::new(1.0, 0.5), Coord::new(1.0, 0.0), Coord::new(0.5, 0.0)]);
+}
+
+#[test]
+fn an_faa_subscriber_file_is_read_and_its_references_name_the_features() {
+    let file = r##"<?xml version="1.0" encoding="UTF-8"?>
+<faa:SubscriberFile gml:id="Subscriber-0000000" AIXMVersion="AIXM5.1" SubscriberFileType="NAV" xmlns:faa="http://www.faa.gov/aixm5.1" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:aixm="http://www.aixm.aero/schema/5.1" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <faa:Member>
+    <aixm:Navaid gml:id="NAVAID_0000001">
+      <aixm:timeSlice>
+        <aixm:NavaidTimeSlice gml:id="NAVAID_TIME_SLICE_0000001">
+          <gml:validTime><gml:TimePeriod gml:id="p1"><gml:beginPosition>2026-10-29T00:00:00.000-04:00</gml:beginPosition><gml:endPosition indeterminatePosition="unknown"/></gml:TimePeriod></gml:validTime>
+          <aixm:interpretation>BASELINE</aixm:interpretation>
+          <aixm:designator>ABC</aixm:designator>
+          <aixm:location><aixm:ElevatedPoint gml:id="e1" srsName="urn:ogc:def:crs:EPSG::4326"><gml:pos>32.9 -97.0</gml:pos></aixm:ElevatedPoint></aixm:location>
+          <aixm:navaidEquipment><aixm:NavaidComponent gml:id="c1"><aixm:theNavaidEquipment xlink:href="#/faa:SubscriberFile/faa:Member/aixm:TACAN%5B@gml:id='TACAN_0000001'%5D"/></aixm:NavaidComponent></aixm:navaidEquipment>
+        </aixm:NavaidTimeSlice>
+      </aixm:timeSlice>
+    </aixm:Navaid>
+  </faa:Member>
+</faa:SubscriberFile>
+"##;
+    assert!(looks_like_aixm(file.as_bytes()));
+    let out = read("NAV_AIXM.xml", file.as_bytes(), &at("2026-11-23")).unwrap();
+    let ds = layer(&out, "NAV_AIXM Navaid");
+    assert_eq!(value(ds, 0, "identifier"), Value::Text("NAVAID_0000001".into()));
+    assert_eq!(value(ds, 0, "designator"), Value::Text("ABC".into()));
+    assert_eq!(value(ds, 0, "navaidEquipment_theNavaidEquipment"), Value::Text("TACAN_0000001".into()));
+    assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(-97.0, 32.9))));
+    // A subscriber file not of AIXM 5 isn't taken for one.
+    assert!(!looks_like_aixm(file.replace("AIXM5.1\"", "AIXM4.5\"").as_bytes()));
+}
