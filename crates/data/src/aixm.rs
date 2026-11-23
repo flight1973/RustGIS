@@ -2193,7 +2193,6 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.as_wgs84 = shapes.as_wgs84.take().map(|s| (s, shapes.as_wgs84_count));
     notes.assumed_system = shapes.assumed_system;
     let paths = paths.try_borrow_mut().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default();
-    let mut layers = layers;
     layers.list.sort_by_key(|l| kind_rank.get(&l.kind).copied().unwrap_or(usize::MAX));
     finish(&stem, at, layers, notes, &index, shapes.budget == 0, &paths)
 }
