@@ -948,7 +948,12 @@ fn a_chain_of_borders_meets_where_they_join_and_a_repeated_one_is_followed_once(
     assert!(ring.iter().all(|c| (8.999..=10.001).contains(&c.x) && (49.999..=51.001).contains(&c.y)), "{ring:?}");
     let a: f64 = ring.windows(2).map(|w| (w[1].x - w[0].x) * (w[1].y + w[0].y) / 2.0).sum::<f64>().abs();
     assert!((a - 1.0).abs() < 1e-6, "area {a}: {ring:?}");
-    assert!(said(&out).iter().any(|m| m.contains("2 borders given by reference are drawn")), "{:?}", said(&out));
+    let notes = said(&out);
+    assert!(
+        notes.iter().any(|m| m.contains("2 borders given by reference are drawn along the GeoBorders they name, between")),
+        "{notes:?}"
+    );
+    assert!(!notes.iter().any(|m| m.contains("drawn whole")), "{notes:?}");
 }
 
 #[test]
@@ -970,7 +975,9 @@ fn a_ring_of_two_borders_follows_each_whole() {
     let ring = ring(layer(&out, "t WorkArea").features[0].geometry.as_ref().unwrap());
     let a: f64 = ring.windows(2).map(|w| (w[1].x - w[0].x) * (w[1].y + w[0].y) / 2.0).sum::<f64>().abs();
     assert!((a - 1.25).abs() < 1e-6, "area {a}: {ring:?}");
-    assert!(!said(&out).iter().any(|m| m.contains("has no geometry") || m.contains("left out")), "{:?}", said(&out));
+    let notes = said(&out);
+    assert!(!notes.iter().any(|m| m.contains("has no geometry") || m.contains("left out")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.contains("2 borders given by reference are drawn whole along the GeoBorders they name")), "{notes:?}");
 }
 
 #[test]
@@ -1047,4 +1054,17 @@ fn a_route_segment_end_written_in_place_says_what_its_reading_finds() {
     let ds = layer(&out, "t RouteSegment");
     assert!(matches!(ds.features[0].geometry, Some(Geometry::Line(_))));
     assert!(said(&out).iter().any(|m| m.contains("2 geometries in a geographic system other than WGS 84")), "{:?}", said(&out));
+}
+
+#[test]
+fn an_empty_object_that_says_something_is_kept() {
+    let body = format!("{}<aixm:record><aixm:Thing gml:id=\"t\" xsi:nil=\"true\" nilReason=\"unknown\"/></aixm:record>", named_point("N"));
+    let out = read(
+        "t.xml",
+        &message(&point("a", &[slice("DesignatedPoint", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+        &at("2026-01-15"),
+    )
+    .unwrap();
+    let ds = layer(&out, "t DesignatedPoint");
+    assert_eq!(value(ds, 0, "record_Thing_nilReason"), Value::Text("unknown".into()));
 }
