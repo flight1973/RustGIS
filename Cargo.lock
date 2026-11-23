@@ -5269,6 +5269,7 @@ dependencies = [
  "unicode-normalization",
  "ureq",
  "url",
+ "web-time",
  "webpki-roots",
  "weezl 0.2.1",
  "zstd 0.14.4",

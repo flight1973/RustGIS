@@ -49,7 +49,7 @@ fn without_layout(t: &str) -> &str {
 }
 
 /// A coordinate system named by `srsName`, and whether its axes are latitude first.
-fn srs(name: &str) -> Option<(Crs, bool)> {
+pub(crate) fn srs(name: &str) -> Option<(Crs, bool)> {
     let n = name.trim();
     let up = n.to_ascii_uppercase();
     if up.ends_with("CRS84") {

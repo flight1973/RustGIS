@@ -30,6 +30,8 @@ terrio-crs = { workspace = true }
 miniz_oxide = { workspace = true }
 roxmltree = { workspace = true }
 quick-xml = { workspace = true }
+# The effective date of an AIXM message when none is given: today, in the browser too.
+web-time = { workspace = true }
 # zstd, the usual compression of GeoParquet, compiles to WebAssembly like the GeoTIFF one above.
 parquet = { workspace = true, features = ["zstd"] }
 url = { workspace = true }
