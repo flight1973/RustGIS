@@ -1175,11 +1175,12 @@ impl Shapes {
     }
 
     /// A shape read a second time (a border or point kept for the features that name it): what
-    /// it costs and what it finds are counted by its own reading, not again.
+    /// it finds is said by its own reading, not again; the points it adds are paid for all the
+    /// same, so reading again can't add points past the allowance.
     fn quietly(&mut self, g: Node) -> Option<Geometry> {
-        let kept = (self.budget, self.assumed_system, self.other_count, self.as_wgs84_count);
+        let kept = (self.assumed_system, self.other_count, self.as_wgs84_count);
         let shape = self.shape(g, &mut ShapeNotes::default());
-        (self.budget, self.assumed_system, self.other_count, self.as_wgs84_count) = kept;
+        (self.assumed_system, self.other_count, self.as_wgs84_count) = kept;
         shape
     }
 
@@ -2206,7 +2207,7 @@ fn between(props: &[Node], shapes: &mut Shapes) -> Option<(Vec<Coord>, ShapeNote
         match choice.attribute((XLINK, "href")) {
             Some(h) => shapes.points.get(&reference(h)).copied(),
             // A position written in place (`pointChoice_position`).
-            None => match shape_in(choice).and_then(|g| shapes.quietly(g)) {
+            None => match shape_in(choice).filter(|g| matches!(local(g), "Point" | "ElevatedPoint")).and_then(|g| shapes.quietly(g)) {
                 Some(Geometry::Point(c)) => Some(c),
                 _ => None,
             },
