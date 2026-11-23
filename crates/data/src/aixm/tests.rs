@@ -865,7 +865,7 @@ fn many_references_to_a_long_border_stay_within_the_files_allowance() {
     let area = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
     let out = read("t.xml", &message(&(area + &geo)), &at("2026-01-15")).unwrap();
     // 20,000 cuts of a 5,000-point border would be 100 million steps; the allowance stops them.
-    assert!(said(&out).iter().any(|m| m.contains("can't be followed")), "{:?}", said(&out));
+    assert!(said(&out).iter().any(|m| m.contains("would pass the work the file's size allows")), "{:?}", said(&out));
 }
 
 #[test]
@@ -896,7 +896,7 @@ fn faa_route_segments_are_drawn_between_their_points_in_nad83() {
     let notes = said(&out);
     for want in [
         "1 route segment with no curve is drawn as a geodesic between the points its start and end name",
-        "read as WGS 84 longitude/latitude",
+        "2 geometries in a geographic system other than WGS 84",
         "2 time positions left empty (not said to be unknown) read as open",
     ] {
         assert!(notes.iter().any(|m| m.contains(want)), "{want}: {notes:?}");
@@ -949,4 +949,62 @@ fn a_chain_of_borders_meets_where_they_join_and_a_repeated_one_is_followed_once(
     let a: f64 = ring.windows(2).map(|w| (w[1].x - w[0].x) * (w[1].y + w[0].y) / 2.0).sum::<f64>().abs();
     assert!((a - 1.0).abs() < 1e-6, "area {a}: {ring:?}");
     assert!(said(&out).iter().any(|m| m.contains("2 borders given by reference are drawn")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_ring_of_two_borders_follows_each_whole() {
+    let geo = |id: &str, pos: &str| {
+        let body = format!(
+            r#"<aixm:name>{id}</aixm:name><aixm:border><aixm:Curve gml:id="c{id}" srsName="urn:ogc:def:crs:EPSG::4326"><gml:segments><gml:LineStringSegment><gml:posList>{pos}</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></aixm:border>"#
+        );
+        feature("GeoBorder", id, &[slice("GeoBorder", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])
+    };
+    // A land border from (50 N, 9 E) round by the east to (51 N, 9 E), and a coast back by the west.
+    let borders = geo("land", "50 9 50 10 51 10 51 9") + &geo("coast", "50 9 50.5 8.5 51 9");
+    let ring_xml = r#"<gml:Ring><gml:curveMember xlink:href="urn:uuid:land"/><gml:curveMember xlink:href="urn:uuid:coast"/></gml:Ring>"#;
+    let body = format!(
+        r#"<aixm:name>ISLAND</aixm:name><aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior>{ring_xml}</gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#
+    );
+    let area = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+    let out = read("t.xml", &message(&(area + &borders)), &at("2026-01-15")).unwrap();
+    let ring = ring(layer(&out, "t WorkArea").features[0].geometry.as_ref().unwrap());
+    let a: f64 = ring.windows(2).map(|w| (w[1].x - w[0].x) * (w[1].y + w[0].y) / 2.0).sum::<f64>().abs();
+    assert!((a - 1.25).abs() < 1e-6, "area {a}: {ring:?}");
+    assert!(!said(&out).iter().any(|m| m.contains("has no geometry") || m.contains("left out")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_point_named_by_its_gml_id_is_found_though_it_has_an_identifier() {
+    let point = |gid: &str, uuid: &str, lat: f64| {
+        format!(
+            r#"<message:hasMember><aixm:DesignatedPoint gml:id="{gid}"><gml:identifier codeSpace="urn:uuid:">{uuid}</gml:identifier>{}</aixm:DesignatedPoint></message:hasMember>"#,
+            slice(
+                "DesignatedPoint",
+                "BASELINE",
+                1,
+                0,
+                &period("2025-01-01T00:00:00Z", None),
+                &format!(
+                    r#"<aixm:location><aixm:Point srsName="urn:ogc:def:crs:EPSG::4326" gml:id="g{gid}"><gml:pos>{lat} 10</gml:pos></aixm:Point></aixm:location>"#
+                )
+            )
+        )
+    };
+    let body = r##"<aixm:start><aixm:EnRouteSegmentPoint gml:id="s"><aixm:pointChoice_fixDesignatedPoint xlink:href="#P1"/></aixm:EnRouteSegmentPoint></aixm:start><aixm:end><aixm:EnRouteSegmentPoint gml:id="e"><aixm:pointChoice_fixDesignatedPoint xlink:href="urn:uuid:u2"/></aixm:EnRouteSegmentPoint></aixm:end>"##;
+    let seg = feature("RouteSegment", "rs", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), body)]);
+    let out = read("t.xml", &message(&(seg + &point("P1", "u1", 50.0) + &point("P2", "u2", 51.0))), &at("2026-01-15")).unwrap();
+    let Some(Geometry::Line(parts)) = &layer(&out, "t RouteSegment").features[0].geometry else { panic!("not drawn") };
+    assert_eq!(parts[0].first(), Some(&Coord::new(10.0, 50.0)));
+    assert_eq!(parts[0].last(), Some(&Coord::new(10.0, 51.0)));
+}
+
+#[test]
+fn route_segments_whose_points_are_elsewhere_are_kept_as_a_table() {
+    let body = r#"<aixm:length uom="NM">12</aixm:length><aixm:start><aixm:EnRouteSegmentPoint gml:id="s"><aixm:pointChoice_fixDesignatedPoint xlink:href="urn:uuid:not-here"/></aixm:EnRouteSegmentPoint></aixm:start>"#;
+    let seg = feature("RouteSegment", "rs", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), body)]);
+    let out = read("t.xml", &message(&seg), &at("2026-01-15")).unwrap();
+    let ds = layer(&out, "t RouteSegment");
+    assert_eq!(ds.geometry_type, GeometryType::None);
+    assert_eq!(value(ds, 0, "length"), Value::Int(12));
+    assert_eq!(value(ds, 0, "start_pointChoice_fixDesignatedPoint"), Value::Text("not-here".into()));
 }

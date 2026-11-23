@@ -77,7 +77,7 @@ const MIN_ADDED_POINTS: usize = 1_000_000;
 const MAX_RADIUS_M: f64 = 10_000_000.0;
 
 /// Kinds with no geometry of their own read as tables.
-const TABLE_KINDS: &[&str] = &["Runway", "RunwayDirection", "Route"];
+const TABLE_KINDS: &[&str] = &["Runway", "RunwayDirection", "Route", "RouteSegment"];
 
 /// Time-slice properties that describe the slice, not the feature.
 const SLICE_PROPERTIES: &[&str] =
@@ -375,6 +375,8 @@ struct Slice {
 /// A feature's slices, read from any number of members.
 struct Feature {
     kind: String,
+    /// Its own `gml:id`: what a local link (`#id`) or the FAA's XPath names it by.
+    gml_id: Option<String>,
     slices: Vec<Slice>,
 }
 
@@ -591,6 +593,9 @@ struct ShapeNotes {
     far: usize,
     /// A route segment drawn between the points it names, having no curve.
     between: bool,
+    /// Borders by reference not followed: past the work allowed, or too short to cut.
+    border_allowance: usize,
+    border_unusable: usize,
 }
 
 /// Reads shapes, adding at most `budget` points to the file's positions.
@@ -611,6 +616,8 @@ struct Shapes {
     as_wgs84_now: bool,
     /// The borders references may follow, by [`border_key`]: each GeoBorder's at the date.
     borders: HashMap<String, Vec<Coord>>,
+    /// Steps of looking along borders still allowed ([`Shapes::scan`]).
+    scan_left: usize,
     /// Where each point feature is (a navaid, a designated point), by its identifier: the ends of
     /// route segments that name them.
     points: HashMap<String, Coord>,
@@ -641,6 +648,9 @@ impl ShapeNotes {
         self.referenced += o.referenced;
         self.followed += o.followed;
         self.far += o.far;
+        self.border_allowance += o.border_allowance;
+        self.border_unusable += o.border_unusable;
+        self.between |= o.between;
     }
 }
 
@@ -666,7 +676,7 @@ impl Shapes {
         }
         // OGC's CRS83: NAD83 longitude/latitude, as the FAA writes it; within a couple of meters
         // of WGS 84 in North America, read as it and said.
-        if name.trim().to_ascii_uppercase().ends_with(":CRS83") {
+        if name.trim().to_ascii_uppercase().ends_with(":CRS83") || name.trim().to_ascii_uppercase().ends_with("/CRS83") {
             self.as_wgs84.get_or_insert_with(|| name.to_string());
             self.as_wgs84_now = true;
             return Some(Axes { swap: false });
@@ -952,6 +962,8 @@ impl Shapes {
                     members.pop();
                 }
                 let mut out: Vec<Coord> = Vec::new();
+                // Borders followed, counted once the ring is drawn.
+                let mut followed = 0;
                 let n = members.len();
                 // Each member's nearest written points before and after it, round the ring: two
                 // passes, however many members are references.
@@ -990,19 +1002,41 @@ impl Shapes {
                                 Some(Err(other)) if other != key && n > 1 => Some(other.clone()),
                                 _ => None,
                             };
-                            let before = neighbor(i + n - 1)
-                                .and_then(|other| self.junction(key, &other, notes))
-                                .or_else(|| befores.get(i).copied().flatten());
-                            let after = neighbor(i + 1)
-                                .and_then(|other| self.junction(key, &other, notes))
-                                .or_else(|| afters.get(i).copied().flatten());
-                            // Said as a border by reference by the ring's patch, not also as a
-                            // ring left out.
-                            let Some(part) = self.follow(key, before, after, notes) else {
-                                notes.referenced += 1;
-                                return None;
+                            let (prev, next) = (neighbor(i + n - 1), neighbor(i + 1));
+                            // The same border either side (a ring of two borders): they meet at
+                            // both its ends, so it is followed whole, turned to meet the line.
+                            let (before, after) = if prev.is_some() && prev == next {
+                                (None, None)
+                            } else {
+                                (
+                                    prev.and_then(|other| self.junction(key, &other, notes)).or_else(|| befores.get(i).copied().flatten()),
+                                    next.and_then(|other| self.junction(key, &other, notes)).or_else(|| afters.get(i).copied().flatten()),
+                                )
                             };
-                            part
+                            // Said as a border by reference by the ring's patch, not also as a
+                            // ring left out; each why in its own notice.
+                            match self.follow(key, before, after, notes) {
+                                Ok(part) => {
+                                    followed += 1;
+                                    match out.last() {
+                                        // A whole border turned to start where the line is.
+                                        Some(&end) if before.is_none() && after.is_none() => {
+                                            let gap =
+                                                |c: Option<&Coord>| c.map_or(f64::INFINITY, |c| rustgis_geom::wgs84_distance_m(*c, end));
+                                            if gap(part.last()) < gap(part.first()) { part.into_iter().rev().collect() } else { part }
+                                        }
+                                        _ => part,
+                                    }
+                                }
+                                Err(why) => {
+                                    match why {
+                                        Unfollowed::Missing => notes.referenced += 1,
+                                        Unfollowed::Allowance => notes.border_allowance += 1,
+                                        Unfollowed::Unusable => notes.border_unusable += 1,
+                                    }
+                                    return None;
+                                }
+                            }
                         }
                         None => return None,
                     };
@@ -1013,6 +1047,9 @@ impl Shapes {
                         }
                     }
                     out.extend(part);
+                }
+                if out.len() >= 3 {
+                    notes.followed += followed;
                 }
                 out
             }
@@ -1032,17 +1069,26 @@ impl Shapes {
     /// start of the next), the shorter way round a border that closes; the whole border when the
     /// ring has no other points. AIXM leaves this cut to the reader (its coding guidance, "Geoborder
     /// for Airspace Border"), so each is counted, and those whose ends lie far from the border.
-    fn follow(&mut self, key: &str, before: Option<Coord>, after: Option<Coord>, notes: &mut ShapeNotes) -> Option<Vec<Coord>> {
-        let scan = self.borders.get(key)?.len();
-        // Looking along the border is paid for as points are, so references can't make the
-        // looking outgrow what the file's size allows.
-        if self.take(scan, notes) < scan {
-            return None;
+    fn follow(
+        &mut self,
+        key: &str,
+        before: Option<Coord>,
+        after: Option<Coord>,
+        notes: &mut ShapeNotes,
+    ) -> std::result::Result<Vec<Coord>, Unfollowed> {
+        let scan = self.borders.get(key).ok_or(Unfollowed::Missing)?.len();
+        if scan < 2 {
+            return Err(Unfollowed::Unusable);
         }
-        let border = self.borders.get(key)?;
+        // Looking along borders has an allowance of its own, set by the file's size, so
+        // references can't make the looking outgrow it, nor take the points arcs are drawn with.
+        if !self.scan(scan) {
+            return Err(Unfollowed::Allowance);
+        }
+        let border = self.borders.get(key).ok_or(Unfollowed::Missing)?;
         let part = match (before, after) {
             (Some(a), Some(b)) => {
-                let (part, off) = cut(border, a, b)?;
+                let (part, off) = cut(border, a, b).ok_or(Unfollowed::Unusable)?;
                 notes.far += usize::from(off > FAR_FROM_BORDER_M);
                 part
             }
@@ -1051,10 +1097,20 @@ impl Shapes {
         // Its points are paid for as a curve's added points are.
         let n = part.len();
         if self.take(n, notes) < n {
-            return None;
+            return Err(Unfollowed::Allowance);
         }
-        notes.followed += 1;
-        Some(part)
+        Ok(part)
+    }
+
+    /// Takes `n` steps of looking along borders from their allowance: false when it is spent.
+    fn scan(&mut self, n: usize) -> bool {
+        match self.scan_left.checked_sub(n) {
+            Some(left) => {
+                self.scan_left = left;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Where the border `key` meets the border `other` next to it in a ring: the point of `key`
@@ -1063,7 +1119,7 @@ impl Shapes {
     /// both is paid for as points are.
     fn junction(&mut self, key: &str, other: &str, notes: &mut ShapeNotes) -> Option<Coord> {
         let scan = self.borders.get(other)?.len() + self.borders.get(key)?.len();
-        if self.take(scan, notes) < scan {
+        if !self.scan(scan) {
             return None;
         }
         let (line, them) = (self.borders.get(key)?, self.borders.get(other)?);
@@ -1083,7 +1139,10 @@ impl Shapes {
                 consider(d, on);
             }
         }
-        best.map(|(_, c)| c)
+        // Borders that don't meet (a gap between them) are joined across it, and that is said.
+        let (d, c) = best?;
+        notes.far += usize::from(d > FAR_FROM_BORDER_M);
+        Some(c)
     }
 
     /// A surface's polygon patches (or a polygon): each its exterior and interiors.
@@ -1115,6 +1174,15 @@ impl Shapes {
         (!polys.is_empty()).then_some(Geometry::Polygon(polys))
     }
 
+    /// A shape read a second time (a border or point kept for the features that name it): what
+    /// it costs and what it finds are counted by its own reading, not again.
+    fn quietly(&mut self, g: Node) -> Option<Geometry> {
+        let kept = (self.budget, self.assumed_system, self.other_count, self.as_wgs84_count);
+        let shape = self.shape(g, &mut ShapeNotes::default());
+        (self.budget, self.assumed_system, self.other_count, self.as_wgs84_count) = kept;
+        shape
+    }
+
     /// A geometry element (AIXM's or GML's) as a geometry.
     fn shape(&mut self, g: Node, notes: &mut ShapeNotes) -> Option<Geometry> {
         (self.assumed_now, self.other_now, self.as_wgs84_now) = (false, false, false);
@@ -1133,6 +1201,17 @@ impl Shapes {
             _ => None,
         }
     }
+}
+
+/// Why a border given by reference wasn't followed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Unfollowed {
+    /// No GeoBorder by that name in the file, in force at the date.
+    Missing,
+    /// Following it would pass the work the file's size allows.
+    Allowance,
+    /// A border too short to cut (fewer than two points).
+    Unusable,
 }
 
 /// How far from a border the ends of a part cut from it may lie before that is said, in meters.
@@ -1200,7 +1279,7 @@ fn cut(line: &[Coord], a: Coord, b: Coord) -> Option<(Vec<Coord>, f64)> {
             round.extend((0..=ib).filter_map(at));
         }
         round.push(pb);
-        let length = |l: &[Coord]| l.windows(2).map(|w| rustgis_geom::wgs84_distance_m(w[0], w[1])).sum::<f64>();
+        let length = |l: &[Coord]| l.windows(2).filter_map(|w| Some(rustgis_geom::wgs84_distance_m(*w.first()?, *w.get(1)?))).sum::<f64>();
         if length(&round) < length(&direct) { round } else { direct }
     } else {
         direct
@@ -1263,6 +1342,8 @@ struct Layer {
     named: HashMap<String, usize>,
     /// Its rows: their shape, their simple values by column number, their nested ones by path.
     rows: Vec<(Option<Geometry>, Vec<(usize, String)>, Nested)>,
+    /// Values not kept: past the memory the file's size allows.
+    over_bytes: usize,
     /// Values of properties past the column cap, or nested past [`MAX_PATH`].
     capped: usize,
     /// Features kept without a shape: no geometry, or one that couldn't be read.
@@ -1285,6 +1366,9 @@ struct Layer {
     far: usize,
     /// Route segments drawn between the points they name.
     between: usize,
+    /// Borders by reference not followed: past the work allowed, or too short to cut.
+    border_allowance: usize,
+    border_unusable: usize,
     /// Shapes in the records of features drawn from their own shapes, not drawn.
     shapes_in_records: usize,
     /// Features as a TEMPDELTA changed them.
@@ -1323,6 +1407,8 @@ impl Layer {
         self.followed += n.followed;
         self.far += n.far;
         self.between += usize::from(n.between);
+        self.border_allowance += n.border_allowance;
+        self.border_unusable += n.border_unusable;
     }
 }
 
@@ -1335,6 +1421,9 @@ type Path = Vec<(String, usize)>;
 struct Paths {
     ids: HashMap<Path, usize>,
     list: Vec<Path>,
+    /// The bytes the paths hold, and the most they may: one allowance for the whole read.
+    bytes: usize,
+    limit: usize,
 }
 
 /// The paths of a read, shared by its rows.
@@ -1363,6 +1452,8 @@ struct Row {
     /// set: a row being read stops keeping values past what the file's size allows).
     bytes: usize,
     limit: Option<usize>,
+    /// Values not kept: past the memory the file's size allows.
+    over_bytes: usize,
 }
 
 impl Row {
@@ -1384,7 +1475,7 @@ impl Row {
     fn afford(&mut self, cost: usize) -> bool {
         let cost = cost + VALUE_OVERHEAD;
         if self.limit.is_some_and(|l| self.bytes + cost > l) {
-            self.capped += 1;
+            self.over_bytes += 1;
             return false;
         }
         self.bytes += cost;
@@ -1402,9 +1493,14 @@ impl Row {
         if let Some(&id) = paths.ids.get(&at) {
             return Some(id);
         }
-        if !self.afford(at.iter().map(|(n, _)| n.len() + VALUE_OVERHEAD).sum()) {
+        // A new path is kept twice (in the list and as its key): charged so to the read's
+        // allowance for paths, whichever row meets it first, kept or not.
+        let cost = 2 * at.iter().map(|(n, _)| n.len() + VALUE_OVERHEAD).sum::<usize>() + 4 * VALUE_OVERHEAD;
+        if paths.bytes + cost > paths.limit {
+            self.over_bytes += 1;
             return None;
         }
+        paths.bytes += cost;
         let id = paths.list.len();
         paths.list.push(at.clone());
         paths.ids.insert(at, id);
@@ -1479,7 +1575,7 @@ impl Row {
             }
             let name = local(&c);
             // AIXM and GML name objects with a capital, properties without.
-            if name.starts_with(|ch: char| ch.is_ascii_uppercase()) {
+            if name.starts_with(|ch: char| ch.is_ascii_uppercase()) && elements(c).next().is_some() {
                 let shape = SHAPES.contains(&name) && (is_aixm(&c) || is_gml(&c));
                 self.record_at(c, path, shape, depth + 1);
                 continue;
@@ -1657,6 +1753,7 @@ impl Layers {
         self.bytes_left -= cells;
         let layer = self.list.get_mut(i)?;
         layer.capped += row.capped;
+        layer.over_bytes += row.over_bytes;
         layer.temporary += usize::from(change.0);
         layer.snapshots += usize::from(change.1);
         let mut attrs = Vec::with_capacity(row.attrs.len());
@@ -1846,7 +1943,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             why.push(format!("the file stops being well-formed XML at byte {at}"));
         }
         let why = if why.is_empty() { String::new() } else { format!(": {}", why.join("; ")) };
-        return Err(DataError::Format(format!("{file_name}: no features (hasMember elements) in the AIXM message{why}")));
+        return Err(DataError::Format(format!("{file_name}: no features (hasMember or Member elements) in the AIXM message{why}")));
     }
     let mut work_left = crate::xml::namespace_budget(text.len());
     let wrap = |member: &str, out: &mut String| {
@@ -1908,7 +2005,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             }
             let entry = features.entry(id.clone()).or_insert_with(|| {
                 order.push(id.clone());
-                Feature { kind: local(&f).to_string(), slices: Vec::new() }
+                Feature { kind: local(&f).to_string(), gml_id: f.attribute((GML, "id")).map(|g| g.trim().to_string()), slices: Vec::new() }
             });
             entry.slices.extend(slices);
         }
@@ -1918,9 +2015,14 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.empty_dates = trouble.empty;
     // Second pass: each feature in force at the date, from its slices.
     // The nested paths of every row, each kept once.
-    let paths: SharedPaths = SharedPaths::default();
+    let paths: SharedPaths =
+        std::rc::Rc::new(std::cell::RefCell::new(Paths { limit: text.len().saturating_mul(2).max(MIN_ROW_BYTES), ..Paths::default() }));
     let mut layers = Layers { bytes_left: text.len().saturating_mul(4).max(MIN_ROW_BYTES), ..Layers::default() };
-    let mut shapes = Shapes { budget: text.len().max(MIN_ADDED_POINTS), ..Shapes::default() };
+    let mut shapes = Shapes {
+        budget: text.len().max(MIN_ADDED_POINTS),
+        scan_left: text.len().saturating_mul(8).max(MIN_ADDED_POINTS * 8),
+        ..Shapes::default()
+    };
     // Rows of features with nothing to draw, by kind, kept until it is known whether the kind has
     // a layer to hold them.
     let mut shapeless: Vec<(String, Row, usize, bool)> = Vec::new();
@@ -1931,6 +2033,14 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         Some("RouteSegment") => 2,
         _ => 1,
     };
+    // The layers still come in the order their kinds are first met in the file.
+    let mut kind_rank: HashMap<String, usize> = HashMap::new();
+    for id in &order {
+        if let Some(f) = features.get(id) {
+            let next = kind_rank.len();
+            kind_rank.entry(f.kind.clone()).or_insert(next);
+        }
+    }
     order.sort_by_key(rank);
     crate::progress::begin(index.members.len() + order.len());
     crate::progress::step(index.members.len())?;
@@ -2021,18 +2131,25 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         // identifier and its curve's id.
         if kind == "GeoBorder"
             && let Some(g) = props.iter().filter(|p| local(p) == "border").find_map(|p| shape_in(*p))
-            && let Some(Geometry::Line(parts)) = shapes.shape(g, &mut ShapeNotes::default())
+            && let Some(Geometry::Line(parts)) = shapes.quietly(g)
         {
             let line: Vec<Coord> = parts.concat();
             if let Some(gid) = g.attribute((GML, "id")) {
                 shapes.borders.insert(format!("#{}", gid.trim()), line.clone());
             }
+            if let Some(gid) = &feature.gml_id {
+                shapes.borders.insert(format!("#{gid}"), line.clone());
+            }
             shapes.borders.insert(border_key(id), line);
         }
-        // Where a point feature is, for route segments that name it.
+        // Where a point feature is, for route segments that name it: by its identifier and its
+        // own gml:id (a local link's or an XPath's).
         if let Some(g) = props.iter().find_map(|p| shape_in(*p).filter(|g| matches!(local(g), "Point" | "ElevatedPoint")))
-            && let Some(Geometry::Point(c)) = shapes.shape(g, &mut ShapeNotes::default())
+            && let Some(Geometry::Point(c)) = shapes.quietly(g)
         {
+            if let Some(gid) = &feature.gml_id {
+                shapes.points.insert(gid.clone(), c);
+            }
             shapes.points.insert(id.trim_start_matches("urn:uuid:").to_string(), c);
         }
         let mut fnotes = ShapeNotes::default();
@@ -2042,21 +2159,30 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             _ => feature_rows(&props, &mut row, &mut shapes, &mut layers, kind, temporary, snapshot),
         };
         if !placed {
-            shapeless.push((kind.to_string(), row, temporary, snapshot));
+            // Held until it is known whether its kind has a layer: its bytes reserved now.
+            let w = row.weight();
+            if w > layers.bytes_left {
+                layers.rows_over += 1;
+            } else {
+                layers.bytes_left -= w;
+                shapeless.push((kind.to_string(), row, temporary, snapshot));
+            }
         }
     }
     // Features with nothing to draw: in their kind's layer when it has one, as a table for the
     // kinds that are tables, else counted.
     for (kind, row, temporary, snapshot) in shapeless {
         let change = (temporary > 0, snapshot);
-        if TABLE_KINDS.contains(&kind.as_str()) {
-            layers.push(&kind, "", None, row, None, change);
-        } else if layers.has_kind(&kind) {
+        // What was reserved for it, given back to be taken as it is added.
+        layers.bytes_left += row.weight();
+        if layers.has_kind(&kind) {
             let label = layers.list.iter().find(|l| l.kind == kind).map(|l| l.label.clone()).unwrap_or_default();
             let i = layers.push(&kind, &label, None, row, None, change);
             if let Some(l) = layers.at(i) {
                 l.shapeless += 1;
             }
+        } else if TABLE_KINDS.contains(&kind.as_str()) {
+            layers.push(&kind, "", None, row, None, change);
         } else {
             notes.nothing_to_draw += 1;
             notes.nothing_names.add(&kind);
@@ -2065,22 +2191,31 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.other_system = shapes.other_system.take().map(|s| (s, shapes.other_count));
     notes.as_wgs84 = shapes.as_wgs84.take().map(|s| (s, shapes.as_wgs84_count));
     notes.assumed_system = shapes.assumed_system;
-    let paths = std::mem::take(&mut *paths.borrow_mut());
+    let paths = paths.try_borrow_mut().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default();
+    let mut layers = layers;
+    layers.list.sort_by_key(|l| kind_rank.get(&l.kind).copied().unwrap_or(usize::MAX));
     finish(&stem, at, layers, notes, &index, shapes.budget == 0, &paths)
 }
 
 /// A route segment's line from the points its `start` and `end` name (their `pointChoice_…`
 /// references): a geodesic between them, as AIXM's default path, when both are in the file.
-fn between(props: &[Node], shapes: &mut Shapes) -> Option<Vec<Coord>> {
-    let end = |name: &str| -> Option<Coord> {
+fn between(props: &[Node], shapes: &mut Shapes) -> Option<(Vec<Coord>, ShapeNotes)> {
+    let mut end = |name: &str| -> Option<Coord> {
         let p = props.iter().find(|p| local(p) == name)?;
-        let r =
-            p.descendants().find(|d| d.is_element() && local(d).starts_with("pointChoice_") && d.attribute((XLINK, "href")).is_some())?;
-        shapes.points.get(&reference(r.attribute((XLINK, "href"))?)).copied()
+        let choice = p.descendants().find(|d| d.is_element() && local(d).starts_with("pointChoice_"))?;
+        match choice.attribute((XLINK, "href")) {
+            Some(h) => shapes.points.get(&reference(h)).copied(),
+            // A position written in place (`pointChoice_position`).
+            None => match shape_in(choice).and_then(|g| shapes.quietly(g)) {
+                Some(Geometry::Point(c)) => Some(c),
+                _ => None,
+            },
+        }
     };
     let (a, b) = (end("start")?, end("end")?);
-    let mut notes = ShapeNotes::default();
-    Some(shapes.geodesic(&[a, b], &mut notes))
+    let mut notes = ShapeNotes { between: true, ..ShapeNotes::default() };
+    let line = shapes.geodesic(&[a, b], &mut notes);
+    Some((line, notes))
 }
 
 /// The family a shape element draws as, by its name (what a layer of its shapes is labeled).
@@ -2144,6 +2279,7 @@ fn feature_rows(
             // position it doesn't have) gives none: said as no geometry, not as unreadable.
             let empty =
                 !g.descendants().any(|d| d.is_element() && is_gml(&d) && matches!(local(&d), "pos" | "posList") && !text_of(&d).is_empty());
+            let empty = empty && geom.is_none();
             let bad = geom.is_none() && !empty;
             let i = layers.push(kind, &name, geom, r, Some(&notes), change);
             first = first.or(i);
@@ -2157,12 +2293,14 @@ fn feature_rows(
         }
         return true;
     }
-    // A route segment with no curve: a geodesic between the points its start and end name.
-    if parts.is_empty()
-        && kind == "RouteSegment"
-        && let Some(line) = between(props, shapes)
+    // A route segment with no curve: a geodesic between the points its start and end name (or
+    // hold), its start and end kept as records.
+    if kind == "RouteSegment"
+        && let Some((line, notes)) = between(props, shapes)
     {
-        let notes = ShapeNotes { between: true, ..ShapeNotes::default() };
+        for p in &parts {
+            row.property(*p, "");
+        }
         layers.push(kind, "curveExtent", Some(Geometry::Line(vec![line])), row.clone(), Some(&notes), change);
         return true;
     }
@@ -2220,6 +2358,7 @@ fn airspace(
     for p in props {
         if local(p) == "geometryComponent" {
             if is_nil(p) {
+                row.property(*p, "");
                 continue;
             }
             // A volume given by reference to another feature's isn't followed: the airspace isn't
@@ -2228,6 +2367,7 @@ fn airspace(
                 if p.attribute((XLINK, "href")).is_some() {
                     components.push((u64::MAX, "REFERENCE".to_string(), None));
                 }
+                row.property(*p, "");
                 continue;
             };
             // Every component's values as its record (its operation, its volume's limits, the
@@ -2313,8 +2453,10 @@ fn vertical_structure(
     let mut parts = Vec::new();
     for p in props {
         if local(p) == "part" && !is_nil(p) {
-            if let Some(vp) = elements(*p).find(|c| local(c) == "VerticalStructurePart") {
-                parts.push(vp);
+            match elements(*p).find(|c| local(c) == "VerticalStructurePart") {
+                Some(vp) => parts.push(vp),
+                // A part given by reference: its link kept.
+                None => row.property(*p, ""),
             }
         } else {
             row.property(*p, "");
@@ -2482,6 +2624,11 @@ fn finish(
         for (g, mut attrs, nested) in std::mem::take(&mut layer.rows) {
             for (id, value) in nested {
                 let k = match column_of.get(&id) {
+                    // A path past the cap: each of its values not kept is counted.
+                    Some(None) => {
+                        layer.capped += 1;
+                        None
+                    }
                     Some(k) => *k,
                     None => {
                         let k = paths.list.get(id).and_then(|p| layer.column(&path_column(p, &repeating)));
@@ -2499,7 +2646,9 @@ fn finish(
             for (k, v) in attrs {
                 match merged.last_mut() {
                     Some((last, old)) if *last == k => {
-                        if !v.is_empty() {
+                        if old.is_empty() {
+                            *old = v;
+                        } else if !v.is_empty() {
                             old.push_str("; ");
                             old.push_str(&v);
                         }
@@ -2597,6 +2746,16 @@ fn finish(
             "borders are given by reference to curves that aren't in the file (or not in force then), so they can't be followed",
         );
         say(
+            layer.border_allowance,
+            "border given by reference isn't followed: following it would pass the work the file's size allows",
+            "borders given by reference aren't followed: following them would pass the work the file's size allows",
+        );
+        say(
+            layer.border_unusable,
+            "border given by reference isn't followed: the GeoBorder it names has too few points to cut",
+            "borders given by reference aren't followed: the GeoBorders they name have too few points to cut",
+        );
+        say(
             layer.between,
             "route segment with no curve is drawn as a geodesic between the points its start and end name",
             "route segments with no curve are drawn as geodesics between the points their start and end name",
@@ -2620,6 +2779,11 @@ fn finish(
             layer.snapshots,
             "feature is a SNAPSHOT: its state at its own instant, which may not be its state on the date asked",
             "features are SNAPSHOTs: their state at their own instant, which may not be their state on the date asked",
+        );
+        say(
+            layer.over_bytes,
+            "value wasn't kept: past the memory the file's size allows",
+            "values weren't kept: past the memory the file's size allows",
         );
         say(
             layer.capped,
