@@ -938,10 +938,7 @@ impl Shapes {
                 for m in elements(r).filter(|c| local(c) == "curveMember") {
                     match elements(m).next() {
                         Some(c) => members.push(Ok(self.curve(c, notes)?)),
-                        None => match m.attribute((XLINK, "href")) {
-                            Some(h) => members.push(Err(border_key(h))),
-                            None => return None,
-                        },
+                        None => members.push(Err(border_key(m.attribute((XLINK, "href"))?))),
                     }
                 }
                 let mut out: Vec<Coord> = Vec::new();
@@ -1884,7 +1881,6 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         Some("RouteSegment") => 2,
         _ => 1,
     };
-    let mut order = order;
     order.sort_by_key(rank);
     crate::progress::begin(index.members.len() + order.len());
     crate::progress::step(index.members.len())?;
