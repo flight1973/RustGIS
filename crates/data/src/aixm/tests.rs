@@ -1083,6 +1083,20 @@ fn an_empty_object_that_says_something_is_kept() {
     )
     .unwrap();
     assert_eq!(value(layer(&out, "t DesignatedPoint"), 0, "record_Linked"), Value::Text("abc".into()));
+    // One that links and holds values keeps both.
+    let body = format!(
+        "{}<aixm:record><aixm:Linked gml:id=\"l\" xlink:href=\"urn:uuid:abc\"><aixm:note>x</aixm:note></aixm:Linked></aixm:record>",
+        named_point("N")
+    );
+    let out = read(
+        "t.xml",
+        &message(&point("d", &[slice("DesignatedPoint", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+        &at("2026-01-15"),
+    )
+    .unwrap();
+    let ds = layer(&out, "t DesignatedPoint");
+    assert_eq!(value(ds, 0, "record_Linked"), Value::Text("abc".into()));
+    assert_eq!(value(ds, 0, "record_note"), Value::Text("x".into()));
     // One carrying only XML plumbing gives no column.
     let body = format!("{}<aixm:record><aixm:Plumbing gml:id=\"q\" xlink:type=\"simple\"/></aixm:record>", named_point("N"));
     let out = read(
@@ -1110,9 +1124,14 @@ fn a_ring_whose_borders_cant_be_joined_within_the_allowance_isnt_drawn_and_says_
     let mut notes = ShapeNotes::default();
     assert!(shapes.ring(boundary, &mut notes).is_some());
     assert_eq!((notes.followed, notes.border_allowance), (2, 0));
-    // Without: not drawn, and said as past the work allowed, once.
+    // Without: not drawn, and said as past the work allowed, once: not also as a ring left out.
+    let surface = format!(
+        r#"<aixm:Surface {NS} gml:id="s" srsName="urn:ogc:def:crs:EPSG::4326"><gml:patches><gml:PolygonPatch>{}</gml:PolygonPatch></gml:patches></aixm:Surface>"#,
+        &doc.input_text()[boundary.range()]
+    );
+    let surface = roxmltree::Document::parse(&surface).unwrap();
     shapes.scan_left = 4;
     let mut notes = ShapeNotes::default();
-    assert!(shapes.ring(boundary, &mut notes).is_none());
+    assert!(shapes.surface(surface.root_element(), &mut notes).is_none());
     assert_eq!((notes.followed, notes.border_allowance, notes.rings_lost), (0, 1, 0));
 }

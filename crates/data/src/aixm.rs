@@ -1205,9 +1205,9 @@ impl Shapes {
     /// route segment's ends). The points it adds are paid for all the same, so reading again can't
     /// add points past the allowance.
     fn quietly(&mut self, g: Node) -> Option<Geometry> {
-        let kept = (self.assumed_system, self.other_count, self.as_wgs84_count);
+        let kept = (self.assumed_system, self.other_count, self.as_wgs84_count, self.other_system.clone(), self.as_wgs84.clone());
         let shape = self.shape(g, &mut ShapeNotes::default());
-        (self.assumed_system, self.other_count, self.as_wgs84_count) = kept;
+        (self.assumed_system, self.other_count, self.as_wgs84_count, self.other_system, self.as_wgs84) = kept;
         shape
     }
 
@@ -1616,16 +1616,33 @@ impl Row {
             let name = local(&c);
             // AIXM and GML name objects with a capital, properties without.
             if name.starts_with(|ch: char| ch.is_ascii_uppercase()) {
+                let shape = SHAPES.contains(&name) && (is_aixm(&c) || is_gml(&c));
+                let links = c.attribute((XLINK, "href")).is_some_and(|h| !h.trim().is_empty());
                 if elements(c).next().is_some() {
-                    let shape = SHAPES.contains(&name) && (is_aixm(&c) || is_gml(&c));
+                    // An object that links elsewhere and holds values too keeps both.
+                    if links && !shape {
+                        path.push((name.to_string(), 1));
+                        for (key, value) in leaf_values(c, name).into_iter().filter(|(k, _)| k == name || k.ends_with("_title")) {
+                            let mut at = path.clone();
+                            if let Some(step) = at.last_mut() {
+                                step.0 = key;
+                            }
+                            let cost = value.as_ref().map_or(0, String::len);
+                            if self.afford(cost) {
+                                match self.path_id(at) {
+                                    Some(id) => self.paths.push((id, value)),
+                                    None => self.bytes = self.bytes.saturating_sub(cost + VALUE_OVERHEAD),
+                                }
+                            }
+                        }
+                        path.pop();
+                    }
                     self.record_at(c, path, shape, depth + 1);
                     continue;
                 }
                 // An object with nothing in it holds no value; one with text, or what an attribute
                 // says (a link, why it is missing, a unit), is a value.
-                let shape = SHAPES.contains(&name) && (is_aixm(&c) || is_gml(&c));
-                let says = !shape
-                    && (is_nil(&c) || c.attribute((XLINK, "href")).is_some() || c.attributes().any(|a| value_attribute(&a).is_some()));
+                let says = !shape && (is_nil(&c) || links || c.attributes().any(|a| value_attribute(&a).is_some()));
                 if text_of(&c).is_empty() && !says {
                     continue;
                 }
