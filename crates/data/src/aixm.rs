@@ -938,8 +938,18 @@ impl Shapes {
                 for m in elements(r).filter(|c| local(c) == "curveMember") {
                     match elements(m).next() {
                         Some(c) => members.push(Ok(self.curve(c, notes)?)),
-                        None => members.push(Err(border_key(m.attribute((XLINK, "href"))?))),
+                        None => {
+                            // The same border named again straight after is the same stretch of
+                            // it (DFS writes a border's members so), followed once.
+                            let key = border_key(m.attribute((XLINK, "href"))?);
+                            if !matches!(members.last(), Some(Err(k)) if *k == key) {
+                                members.push(Err(key));
+                            }
+                        }
                     }
+                }
+                if members.len() > 1 && matches!((members.first(), members.last()), (Some(Err(a)), Some(Err(b))) if a == b) {
+                    members.pop();
                 }
                 let mut out: Vec<Coord> = Vec::new();
                 let n = members.len();
@@ -973,8 +983,19 @@ impl Shapes {
                     let mut part = match members.get(i) {
                         Some(Ok(c)) => c.clone(),
                         Some(Err(key)) => {
-                            let before = befores.get(i).copied().flatten();
-                            let after = afters.get(i).copied().flatten();
+                            // Next to another border (a state's outline is a chain of them), the
+                            // stretch starts or ends where the two meet: this border's end nearest
+                            // that one. Next to written points, at the nearest of those.
+                            let neighbor = |k: usize| match members.get(k % n) {
+                                Some(Err(other)) if other != key && n > 1 => Some(other.clone()),
+                                _ => None,
+                            };
+                            let before = neighbor(i + n - 1)
+                                .and_then(|other| self.junction(key, &other, notes))
+                                .or_else(|| befores.get(i).copied().flatten());
+                            let after = neighbor(i + 1)
+                                .and_then(|other| self.junction(key, &other, notes))
+                                .or_else(|| afters.get(i).copied().flatten());
                             // Said as a border by reference by the ring's patch, not also as a
                             // ring left out.
                             let Some(part) = self.follow(key, before, after, notes) else {
@@ -1034,6 +1055,35 @@ impl Shapes {
         }
         notes.followed += 1;
         Some(part)
+    }
+
+    /// Where the border `key` meets the border `other` next to it in a ring: the point of `key`
+    /// nearest `other`, of those an end of either gives (its own ends, or the point on it nearest
+    /// one of `other`'s, where `other` runs on past where they meet or stops short). Looking along
+    /// both is paid for as points are.
+    fn junction(&mut self, key: &str, other: &str, notes: &mut ShapeNotes) -> Option<Coord> {
+        let scan = self.borders.get(other)?.len() + self.borders.get(key)?.len();
+        if self.take(scan, notes) < scan {
+            return None;
+        }
+        let (line, them) = (self.borders.get(key)?, self.borders.get(other)?);
+        let mut best: Option<(f64, Coord)> = None;
+        let mut consider = |d: f64, c: Coord| {
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, c));
+            }
+        };
+        for end in [line.first(), line.last()].into_iter().flatten() {
+            if let Some((.., d)) = nearest_on(them, *end) {
+                consider(d, *end);
+            }
+        }
+        for end in [them.first(), them.last()].into_iter().flatten() {
+            if let Some((_, _, on, d)) = nearest_on(line, *end) {
+                consider(d, on);
+            }
+        }
+        best.map(|(_, c)| c)
     }
 
     /// A surface's polygon patches (or a polygon): each its exterior and interiors.

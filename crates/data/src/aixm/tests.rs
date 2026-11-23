@@ -852,7 +852,10 @@ fn many_references_to_a_long_border_stay_within_the_files_allowance() {
         r#"<aixm:name>LONG</aixm:name><aixm:border><aixm:Curve gml:id="B1" srsName="urn:ogc:def:crs:EPSG::4326"><gml:segments><gml:LineStringSegment><gml:posList>{line}</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></aixm:border>"#
     );
     let geo = feature("GeoBorder", "border-1", &[slice("GeoBorder", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &border)]);
-    let refs = r#"<gml:curveMember xlink:href="urn:uuid:border-1"/>"#.repeat(20_000);
+    // Two borders named in turn: a repeated one is followed once, so each of these is a cut.
+    let geo2 = geo.replace("border-1", "border-2");
+    let geo = geo + &geo2;
+    let refs = r#"<gml:curveMember xlink:href="urn:uuid:border-1"/><gml:curveMember xlink:href="urn:uuid:border-2"/>"#.repeat(10_000);
     let ring_xml = format!(
         r#"<gml:Ring>{refs}<gml:curveMember><aixm:Curve gml:id="c"><gml:segments><gml:LineStringSegment><gml:posList>50 11 50.5 11 50.5 10 50 10</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></gml:curveMember></gml:Ring>"#
     );
@@ -922,4 +925,28 @@ fn dfs_airspace_follows_the_state_border_it_names() {
         assert!(notes.iter().any(|m| m.contains(want)), "{want}: {notes:?}");
     }
     assert!(!notes.iter().any(|m| m.contains("more than 50 m")), "{notes:?}");
+}
+
+#[test]
+fn a_chain_of_borders_meets_where_they_join_and_a_repeated_one_is_followed_once() {
+    let geo = |id: &str, pos: &str| {
+        let body = format!(
+            r#"<aixm:name>{id}</aixm:name><aixm:border><aixm:Curve gml:id="c{id}" srsName="urn:ogc:def:crs:EPSG::4326"><gml:segments><gml:LineStringSegment><gml:posList>{pos}</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></aixm:border>"#
+        );
+        feature("GeoBorder", id, &[slice("GeoBorder", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])
+    };
+    // A runs west to east along 50 N beyond the corner at 10 E; B runs north from that corner.
+    let borders = geo("south", "50 8.5 50 9 50 9.5 50 10 50 10.5") + &geo("east", "50 10 50.5 10 51 10");
+    let ring_xml = r#"<gml:Ring><gml:curveMember xlink:href="urn:uuid:south"/><gml:curveMember xlink:href="urn:uuid:south"/><gml:curveMember xlink:href="urn:uuid:east"/><gml:curveMember><aixm:Curve gml:id="w"><gml:segments><gml:LineStringSegment><gml:posList>51 10 51 9 50 9</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></gml:curveMember></gml:Ring>"#;
+    let body = format!(
+        r#"<aixm:name>CORNER</aixm:name><aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior>{ring_xml}</gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#
+    );
+    let area = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+    let out = read("t.xml", &message(&(area + &borders)), &at("2026-01-15")).unwrap();
+    let ring = ring(layer(&out, "t WorkArea").features[0].geometry.as_ref().unwrap());
+    // The square from 9 to 10 E, 50 to 51 N: south border from 9 to the corner, east border up.
+    assert!(ring.iter().all(|c| (8.999..=10.001).contains(&c.x) && (49.999..=51.001).contains(&c.y)), "{ring:?}");
+    let a: f64 = ring.windows(2).map(|w| (w[1].x - w[0].x) * (w[1].y + w[0].y) / 2.0).sum::<f64>().abs();
+    assert!((a - 1.0).abs() < 1e-6, "area {a}: {ring:?}");
+    assert!(said(&out).iter().any(|m| m.contains("2 borders given by reference are drawn")), "{:?}", said(&out));
 }
