@@ -1053,7 +1053,14 @@ fn a_route_segment_end_written_in_place_says_what_its_reading_finds() {
     let out = read("t.xml", &message(&seg), &at("2026-01-15")).unwrap();
     let ds = layer(&out, "t RouteSegment");
     assert!(matches!(ds.features[0].geometry, Some(Geometry::Line(_))));
-    assert!(said(&out).iter().any(|m| m.contains("2 geometries in a geographic system other than WGS 84")), "{:?}", said(&out));
+    assert!(said(&out).iter().any(|m| m.starts_with("2 geometries in a geographic system other than WGS 84")), "{:?}", said(&out));
+    // One end good and the other in a projected system: not drawn, and each end said once.
+    let bad = end("end", 33.0).replace("urn:ogc:def:crs:OGC:1.3:CRS83", "urn:ogc:def:crs:EPSG::32614");
+    let body = end("start", 32.0) + &bad;
+    let seg = feature("RouteSegment", "rs", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+    let notes = said(&read("t.xml", &message(&seg), &at("2026-01-15")).unwrap());
+    assert!(notes.iter().any(|m| m.starts_with("1 geometry in a geographic system other than WGS 84")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.starts_with("1 geometry in a system other than longitude/latitude")), "{notes:?}");
 }
 
 #[test]
@@ -1067,6 +1074,15 @@ fn an_empty_object_that_says_something_is_kept() {
     .unwrap();
     let ds = layer(&out, "t DesignatedPoint");
     assert_eq!(value(ds, 0, "record_Thing_nilReason"), Value::Text("unknown".into()));
+    // One that only points elsewhere keeps its link.
+    let body = format!("{}<aixm:record><aixm:Linked gml:id=\"l\" xlink:href=\"urn:uuid:abc\"/></aixm:record>", named_point("N"));
+    let out = read(
+        "t.xml",
+        &message(&point("c", &[slice("DesignatedPoint", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+        &at("2026-01-15"),
+    )
+    .unwrap();
+    assert_eq!(value(layer(&out, "t DesignatedPoint"), 0, "record_Linked"), Value::Text("abc".into()));
     // One carrying only XML plumbing gives no column.
     let body = format!("{}<aixm:record><aixm:Plumbing gml:id=\"q\" xlink:type=\"simple\"/></aixm:record>", named_point("N"));
     let out = read(
@@ -1076,4 +1092,27 @@ fn an_empty_object_that_says_something_is_kept() {
     )
     .unwrap();
     assert!(!layer(&out, "t DesignatedPoint").fields.iter().any(|f| f.name.starts_with("record_Plumbing")));
+}
+
+#[test]
+fn a_ring_whose_borders_cant_be_joined_within_the_allowance_isnt_drawn_and_says_why() {
+    let doc = format!(
+        r#"<r {NS}><gml:exterior><gml:Ring><gml:curveMember xlink:href="urn:uuid:a"/><gml:curveMember xlink:href="urn:uuid:b"/><gml:curveMember><aixm:Curve gml:id="c" srsName="urn:ogc:def:crs:EPSG::4326"><gml:segments><gml:LineStringSegment><gml:posList>51 10 51 9 50 9</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></gml:curveMember></gml:Ring></gml:exterior></r>"#
+    );
+    let doc = roxmltree::Document::parse(&doc).unwrap();
+    let boundary = doc.root_element().first_element_child().unwrap();
+    let line = |pts: &[(f64, f64)]| pts.iter().map(|&(x, y)| Coord::new(x, y)).collect::<Vec<_>>();
+    let mut shapes = Shapes { budget: 1_000_000, ..Shapes::default() };
+    shapes.borders.insert("uuid:a".into(), line(&[(9.0, 50.0), (9.5, 50.0), (10.0, 50.0)]));
+    shapes.borders.insert("uuid:b".into(), line(&[(10.0, 50.0), (10.0, 50.5), (10.0, 51.0)]));
+    // With room to look along both borders where they meet: drawn.
+    shapes.scan_left = 1000;
+    let mut notes = ShapeNotes::default();
+    assert!(shapes.ring(boundary, &mut notes).is_some());
+    assert_eq!((notes.followed, notes.border_allowance), (2, 0));
+    // Without: not drawn, and said as past the work allowed, once.
+    shapes.scan_left = 4;
+    let mut notes = ShapeNotes::default();
+    assert!(shapes.ring(boundary, &mut notes).is_none());
+    assert_eq!((notes.followed, notes.border_allowance, notes.rings_lost), (0, 1, 0));
 }

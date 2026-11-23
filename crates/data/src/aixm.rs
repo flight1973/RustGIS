@@ -1200,9 +1200,10 @@ impl Shapes {
         (!polys.is_empty()).then_some(Geometry::Polygon(polys))
     }
 
-    /// A shape read a second time (a border or point kept for the features that name it): what
-    /// it finds is said by its own reading, not again; the points it adds are paid for all the
-    /// same, so reading again can't add points past the allowance.
+    /// A shape read without saying what it finds: one read again elsewhere (a border or point kept
+    /// for the features that name it), or before its feature is known to be drawn from it (a
+    /// route segment's ends). The points it adds are paid for all the same, so reading again can't
+    /// add points past the allowance.
     fn quietly(&mut self, g: Node) -> Option<Geometry> {
         let kept = (self.assumed_system, self.other_count, self.as_wgs84_count);
         let shape = self.shape(g, &mut ShapeNotes::default());
@@ -1622,7 +1623,9 @@ impl Row {
                 }
                 // An object with nothing in it holds no value; one with text, or what an attribute
                 // says (a link, why it is missing, a unit), is a value.
-                let says = !SHAPES.contains(&name) && (is_nil(&c) || c.attributes().any(|a| value_attribute(&a).is_some()));
+                let shape = SHAPES.contains(&name) && (is_aixm(&c) || is_gml(&c));
+                let says = !shape
+                    && (is_nil(&c) || c.attribute((XLINK, "href")).is_some() || c.attributes().any(|a| value_attribute(&a).is_some()));
                 if text_of(&c).is_empty() && !says {
                     continue;
                 }
