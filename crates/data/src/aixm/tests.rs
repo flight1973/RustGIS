@@ -531,7 +531,7 @@ fn a_structure_of_many_parts_and_values_stays_within_the_files_allowance() {
     assert!(rows < 10_000 && cells <= MIN_CELLS, "{rows} rows, {cells} cells");
     let notes = said(&out);
     assert!(notes.iter().any(|m| m.contains("past the memory the file's size allows")), "{notes:?}");
-    assert!(notes.iter().any(|m| m.contains(&format!("past the first {MAX_COLUMNS} names"))), "{notes:?}");
+    assert!(notes.iter().any(|m| m.contains(&format!("past the first {MAX_COLUMNS} columns"))), "{notes:?}");
 }
 
 #[test]
@@ -654,4 +654,102 @@ fn a_layers_z_note_comes_first() {
     let first = &out[0].1.messages;
     assert!(first.first().is_some_and(|m| m.text.contains("Z or M")), "{:?}", first.iter().map(|m| &m.text).collect::<Vec<_>>());
     assert!(first.iter().any(|m| m.text.contains("not in force")));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Every value kept: nested records as path columns.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn records_are_kept_as_path_columns_numbered_alike_on_every_row() {
+    let authority = |t: &str, org: &str| {
+        format!(
+            r#"<aixm:authority><aixm:AuthorityForNavaidEquipment gml:id="a"><aixm:type>{t}</aixm:type><aixm:theOrganisationAuthority xlink:href="urn:uuid:{org}" xlink:title="ORG {org}" xlink:type="simple"/></aixm:AuthorityForNavaidEquipment></aixm:authority>"#
+        )
+    };
+    let note = r#"<aixm:annotation><aixm:Note gml:id="n"><aixm:purpose>REMARK</aixm:purpose><aixm:translatedNote><aixm:LinguisticNote gml:id="l"><aixm:note lang="ENG">Coverage: 250 KM</aixm:note></aixm:LinguisticNote></aixm:translatedNote></aixm:Note></aixm:annotation>"#;
+    let body =
+        |name: &str, auths: &str| format!("{}{auths}{note}<aixm:class xsi:nil=\"true\" nilReason=\"inapplicable\"/>", named_point(name));
+    let two = slice(
+        "DesignatedPoint",
+        "BASELINE",
+        1,
+        0,
+        &period("2025-01-01T00:00:00Z", None),
+        &body("TWO", &(authority("OWN", "o1") + &authority("OPERATE", "o2"))),
+    );
+    let one = slice("DesignatedPoint", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body("ONE", &authority("OWN", "o3")));
+    let bytes = message(&(point("two", &[two]) + &point("one", &[one])));
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    let ds = layer(&out, "t DesignatedPoint");
+    let (two, one) = (row_where(ds, "name", "TWO"), row_where(ds, "name", "ONE"));
+    let text = |row: usize, field: &str| value(ds, row, field);
+    // Repeating on one row, so numbered on both.
+    assert_eq!(text(two, "authority_1_type"), Value::Text("OWN".into()));
+    assert_eq!(text(two, "authority_2_type"), Value::Text("OPERATE".into()));
+    assert_eq!(text(two, "authority_2_theOrganisationAuthority"), Value::Text("o2".into()));
+    assert_eq!(text(two, "authority_2_theOrganisationAuthority_title"), Value::Text("ORG o2".into()));
+    assert_eq!(text(one, "authority_1_type"), Value::Text("OWN".into()));
+    assert_eq!(text(one, "authority_2_type"), Value::Null);
+    // Never repeating: no numbers. A note's language and a missing value's reason are kept.
+    assert_eq!(text(one, "annotation_translatedNote_note"), Value::Text("Coverage: 250 KM".into()));
+    assert_eq!(text(one, "annotation_translatedNote_note_lang"), Value::Text("ENG".into()));
+    assert_eq!(text(one, "annotation_purpose"), Value::Text("REMARK".into()));
+    assert_eq!(text(one, "class"), Value::Null);
+    assert_eq!(text(one, "class_nilReason"), Value::Text("inapplicable".into()));
+    // Nothing is left out, so nothing is said.
+    assert!(said(&out).is_empty(), "{:?}", said(&out));
+}
+
+#[test]
+fn donlon_keeps_every_value_of_its_features() {
+    let out = read("donlon-aixm.xml", DONLON, &at("2026-01-15")).unwrap();
+    let asp = layer(&out, "donlon-aixm Airspace");
+    let i = row_where(asp, "name", "BRAVO");
+    let has = |want: &str| {
+        asp.fields.iter().enumerate().any(|(k, f)| f.name.starts_with("activation") && asp.features[i].attrs[k] == Value::Text(want.into()))
+    };
+    assert!(has("Activity periods to be published by NOTAM"));
+    assert!(has("SHOOTING") && has("AVBL_FOR_ACTIVATION"));
+    let op = asp.fields.iter().position(|f| f.name.starts_with("geometryComponent") && f.name.ends_with("operation")).unwrap();
+    assert_eq!(asp.features[i].attrs[op], Value::Text("BASE".into()));
+    assert_eq!(value(asp, i, "class_nilReason"), Value::Text("inapplicable".into()));
+    // The route segment's start and end points, by reference.
+    let rs = layer(&out, "donlon-aixm RouteSegment");
+    assert!(
+        rs.fields.iter().any(|f| f.name.starts_with("start_") && f.name.ends_with("pointChoice_fixDesignatedPoint")),
+        "{:?}",
+        rs.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+    // Nothing the features hold is said as not read.
+    assert!(!said(&out).iter().any(|m| m.contains("not read as attributes") || m.contains("columns")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_light_system_gives_a_row_per_light_with_its_own_values() {
+    let light = |color: &str, lat: &str| {
+        format!(
+            r#"<aixm:element><aixm:GroundLightingElement gml:id="e"><aixm:type>LIGHT</aixm:type><aixm:colour>{color}</aixm:colour><aixm:location><aixm:ElevatedPoint srsName="urn:ogc:def:crs:EPSG::4326" gml:id="p"><gml:pos>{lat} -32.0</gml:pos><aixm:elevation uom="M">29</aixm:elevation></aixm:ElevatedPoint></aixm:location></aixm:GroundLightingElement></aixm:element>"#
+        )
+    };
+    let body = format!(
+        "<aixm:emergencyLighting>YES</aixm:emergencyLighting>{}{}{}",
+        light("WHITE", "52.1"),
+        light("RED", "52.2"),
+        light("GREEN", "52.3")
+    );
+    let bytes = message(&feature(
+        "RunwayDirectionLightSystem",
+        "l",
+        &[slice("RunwayDirectionLightSystem", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)],
+    ));
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    let ds = layer(&out, "t RunwayDirectionLightSystem");
+    assert_eq!(ds.features.len(), 3);
+    let colors: Vec<Value> = (0..3).map(|i| value(ds, i, "element_colour")).collect();
+    assert_eq!(colors, ["WHITE", "RED", "GREEN"].map(|c| Value::Text(c.into())));
+    assert!((0..3).all(|i| value(ds, i, "emergencyLighting") == Value::Text("YES".into())));
+    assert_eq!(value(ds, 1, "element_location_elevation"), Value::Int(29));
+    assert_eq!(ds.features[2].geometry, Some(Geometry::Point(Coord::new(-32.0, 52.3))));
+    assert!(said(&out).is_empty(), "{:?}", said(&out));
 }

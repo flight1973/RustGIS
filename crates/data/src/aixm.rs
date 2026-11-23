@@ -21,9 +21,13 @@
 //! clockwise from true north, the arc running from the start angle to the end angle (clockwise when
 //! the start is the smaller); in a longitude-first one (CRS84), counter-clockwise from east.
 //!
-//! A property's simple value is an attribute, with its unit (`_uom`) and, for a reference to
-//! another feature, the identifier it names (`urn:uuid:` left off) and its title (`_title`). A
-//! nested record isn't, and is counted. An airspace is drawn from its single BASE volume, or from
+//! Every value a feature holds is kept on its rows. A property's simple value is a column, with its
+//! unit (`_uom`), why it is missing (`_nilReason`) and its other attributes, and for a reference to
+//! another feature the identifier it names (`urn:uuid:` left off) and its title (`_title`). A
+//! value nested in records is a column named by its path (`authority_1_type`,
+//! `availability_usage_selection_timeInterval_day`), each record numbered when it repeats anywhere
+//! in the layer, so the values of one record share their columns on every row. The values written
+//! on a shape (elevation, accuracy, datum) are kept wherever the shape is. An airspace is drawn from its single BASE volume, or from
 //! BASE and UNION volumes as the parts of one shape; one built by subtraction, intersection or from
 //! other airspaces is kept without a shape and counted, not drawn wrong. A vertical structure gives a
 //! row per part. Runways, runway directions and routes, which have no geometry of their own, are
@@ -55,7 +59,9 @@ const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 /// Most layers read from one file.
 const MAX_LAYERS: usize = 64;
 /// Most attribute columns of a layer.
-const MAX_COLUMNS: usize = 500;
+const MAX_COLUMNS: usize = 2000;
+/// Deepest a nested value is read: past it a record's values are counted, not kept.
+const MAX_PATH: usize = 64;
 /// The farthest a drawn arc strays from the curve, in meters.
 const ARC_TOLERANCE_M: f64 = 1.0;
 /// Most points one arc or circle is drawn with.
@@ -1007,11 +1013,8 @@ struct Layer {
     label: String,
     columns: Vec<String>,
     named: HashSet<String>,
-    rows: Vec<(Option<Geometry>, Attrs)>,
-    /// Properties not read (nested records): how many features had them, and the first names.
-    nested: usize,
-    nested_names: Names,
-    /// Values of properties past the column cap.
+    rows: Vec<(Option<Geometry>, Attrs, Nested)>,
+    /// Values of properties past the column cap, or nested past [`MAX_PATH`].
     capped: usize,
     /// Features kept without a shape: no geometry, or one that couldn't be read.
     shapeless: usize,
@@ -1028,6 +1031,8 @@ struct Layer {
     derived_names: Names,
     /// Airspaces drawn as the parts of BASE and UNION volumes.
     unions: usize,
+    /// Shapes in the records of features drawn from their own shapes, not drawn.
+    shapes_in_records: usize,
     /// Features as a TEMPDELTA changed them.
     temporary: usize,
     snapshots: usize,
@@ -1062,16 +1067,23 @@ impl Layer {
     }
 }
 
-/// A row being built: its values, and the nested properties not read.
+/// A row's values nested in records, each by its path: every step a property's name and which of
+/// its kind among its siblings it is (from 1). `None` is a value given as missing (`nil`). They are
+/// named as columns once the layer's rows are all read ([`path_columns`]).
+type Nested = Vec<(Vec<(String, usize)>, Option<String>)>;
+
+/// A row being built: its values, simple ones by column and nested ones by path.
 #[derive(Default, Clone)]
 struct Row {
     attrs: Attrs,
     /// Every column named, null or not, in order, and the same as a set.
     columns: Vec<String>,
     named: HashSet<String>,
-    nested: Vec<String>,
-    nested_named: HashSet<String>,
-    /// Values of names past [`MAX_COLUMNS`], not kept.
+    /// Values in records, by path.
+    paths: Nested,
+    /// How many records of each property the feature has had so far.
+    records: HashMap<String, usize>,
+    /// Values of names past [`MAX_COLUMNS`], or nested past [`MAX_PATH`], not kept.
     capped: usize,
 }
 
@@ -1114,28 +1126,59 @@ impl Row {
     /// A property's simple value as attributes, under `prefix`.
     fn property(&mut self, p: Node, prefix: &str) {
         let name = format!("{prefix}{}", local(&p));
-        if is_nil(&p) {
-            self.null(&name);
+        if !is_nil(&p) && elements(p).next().is_some() && p.attribute((XLINK, "href")).is_none() {
+            // A record: each of its values under its path, numbered by which record it is.
+            let n = self.records.entry(name.clone()).or_default();
+            *n += 1;
+            let mut path = vec![(name, *n)];
+            self.record(p, &mut path, false);
             return;
         }
-        if let Some(href) = p.attribute((XLINK, "href")) {
-            let id = href.trim();
-            let id = id.strip_prefix("urn:uuid:").or_else(|| id.strip_prefix('#')).unwrap_or(id);
-            self.set(&name, id.to_string());
-            if let Some(t) = p.attribute((XLINK, "title")) {
-                self.set(&format!("{name}_title"), t.trim().to_string());
+        for (key, value) in leaf_values(p, &name) {
+            match value {
+                Some(v) => self.set(&key, v),
+                None => self.null(&key),
             }
+        }
+    }
+
+    /// The values in a record (a property holding an object, or the object), each under `path`
+    /// and its own name. An object (`AuthorityForNavaidEquipment`, `gml:TimePeriod`) adds no step:
+    /// its properties are the record's. A shape's GML isn't a value (it is the feature's shape, or
+    /// one drawn with it); the values AIXM writes on it (elevation, accuracy) are. With
+    /// `aixm_only`, only AIXM's properties are read.
+    fn record(&mut self, node: Node, path: &mut Vec<(String, usize)>, aixm_only: bool) {
+        if path.len() > MAX_PATH {
+            self.capped += 1;
             return;
         }
-        if elements(p).next().is_some() {
-            if self.nested_named.insert(name.clone()) {
-                self.nested.push(name);
+        let mut seen: HashMap<&str, usize> = HashMap::new();
+        for c in elements(node) {
+            if aixm_only && !is_aixm(&c) {
+                continue;
             }
-            return;
-        }
-        self.set(&name, text_of(&p));
-        if let Some(u) = p.attribute("uom") {
-            self.set(&format!("{name}_uom"), u.trim().to_string());
+            let name = local(&c);
+            // AIXM and GML name objects with a capital, properties without.
+            if name.starts_with(|ch: char| ch.is_ascii_uppercase()) {
+                let shape = SHAPES.contains(&name) && (is_aixm(&c) || is_gml(&c));
+                self.record(c, path, shape);
+                continue;
+            }
+            let n = seen.entry(name).or_default();
+            *n += 1;
+            path.push((name.to_string(), *n));
+            if elements(c).next().is_some() && c.attribute((XLINK, "href")).is_none() {
+                self.record(c, path, false);
+            } else if let Some((last, _)) = path.last().cloned() {
+                for (key, value) in leaf_values(c, &last) {
+                    let mut at = path.clone();
+                    if let Some(step) = at.last_mut() {
+                        step.0 = key;
+                    }
+                    self.paths.push((at, value));
+                }
+            }
+            path.pop();
         }
     }
 
@@ -1148,6 +1191,69 @@ impl Row {
             self.property(c, &prefix);
         }
     }
+}
+
+/// A property's value and those written on it, each under its own name from `name`: its text (or
+/// `None` when given as missing), the identifier a reference names (`urn:uuid:` left off) with its
+/// title (`_title`), its unit (`_uom`), why it is missing (`_nilReason`), its language (`_lang`)
+/// and any other attribute (`_` and its name). An element's id and the XML plumbing aren't values.
+fn leaf_values(p: Node, name: &str) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    if is_nil(&p) {
+        out.push((name.to_string(), None));
+    } else if let Some(href) = p.attribute((XLINK, "href")) {
+        let id = href.trim();
+        let id = id.strip_prefix("urn:uuid:").or_else(|| id.strip_prefix('#')).unwrap_or(id);
+        out.push((name.to_string(), Some(id.to_string())));
+    } else {
+        out.push((name.to_string(), Some(text_of(&p))));
+    }
+    for a in p.attributes() {
+        let key = match (a.namespace(), a.name()) {
+            (Some(XLINK), "title") => "title",
+            (Some(XLINK) | Some(XSI), _) | (Some(GML), "id") | (None, "id") => continue,
+            (_, other) => other,
+        };
+        out.push((format!("{name}_{key}"), Some(a.value().trim().to_string())));
+    }
+    out
+}
+
+/// The column of each nested value of a layer's rows: its path's names joined by `_`, each step
+/// numbered (`authority_1_type`) when its record repeats anywhere in the layer, so every row's
+/// values of one record share their columns.
+fn path_columns(rows: &[(Option<Geometry>, Attrs, Nested)]) -> HashSet<String> {
+    let mut repeating = HashSet::new();
+    for (_, _, nested) in rows {
+        for (path, _) in nested {
+            let mut key = String::new();
+            for (name, n) in path {
+                key.push('/');
+                key.push_str(name);
+                if *n > 1 {
+                    repeating.insert(key.clone());
+                }
+            }
+        }
+    }
+    repeating
+}
+
+/// A nested value's column, as [`path_columns`] numbers it.
+fn path_column(path: &[(String, usize)], repeating: &HashSet<String>) -> String {
+    let (mut key, mut column) = (String::new(), String::new());
+    for (name, n) in path {
+        key.push('/');
+        key.push_str(name);
+        if !column.is_empty() {
+            column.push('_');
+        }
+        column.push_str(name);
+        if repeating.contains(&key) {
+            column.push_str(&format!("_{n}"));
+        }
+    }
+    column
 }
 
 /// The layers of a file in the order their kinds were first met.
@@ -1199,7 +1305,7 @@ impl Layers {
         notes: Option<&ShapeNotes>,
         change: (bool, bool),
     ) -> Option<usize> {
-        let cells = row.columns.len().max(1);
+        let cells = (row.columns.len() + row.paths.len()).max(1);
         if cells > self.cells_left {
             self.rows_over += 1;
             return None;
@@ -1221,16 +1327,10 @@ impl Layers {
                 attrs.insert(c.clone(), v.clone());
             }
         }
-        if !row.nested.is_empty() {
-            layer.nested += 1;
-            for n in &row.nested {
-                layer.nested_names.add(n);
-            }
-        }
         if let Some(n) = notes {
             layer.take_notes(n);
         }
-        layer.rows.push((geometry, attrs));
+        layer.rows.push((geometry, attrs, row.paths));
         Some(i)
     }
 }
@@ -1594,8 +1694,28 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     finish(&stem, at, layers, notes, &index, shapes.budget == 0)
 }
 
-/// Adds a feature's rows: a row in a layer for each property holding a shape, or, when none does,
-/// one of the shapes nested in its records by family. False when it has nothing to draw.
+/// The family a shape element draws as, by its name (what a layer of its shapes is labeled).
+fn element_family(name: &str) -> &'static str {
+    match name {
+        "Point" | "ElevatedPoint" => "points",
+        "Curve" | "ElevatedCurve" | "LineString" => "lines",
+        _ => "polygons",
+    }
+}
+
+/// The shapes nested in a record (not those inside another shape, such as a surface's curves).
+fn nested_shapes<'a, 'i>(p: Node<'a, 'i>) -> Vec<Node<'a, 'i>> {
+    p.descendants()
+        .skip(1)
+        .filter(|d| d.is_element() && (is_aixm(d) || is_gml(d)) && SHAPES.contains(&local(d)))
+        .filter(|g| !g.ancestors().skip(1).take_while(|a| *a != p).any(|a| SHAPES.contains(&local(&a))))
+        .collect()
+}
+
+/// Adds a feature's rows: a row in a layer for each property holding a shape; or, when none does,
+/// a row for each record holding shapes (a light system's lights, a marking's elements), with the
+/// feature's other values and the record's own (`element_style`), its shapes its geometry. False
+/// when it has nothing to draw.
 fn feature_rows(
     props: &[Node],
     row: &mut Row,
@@ -1606,56 +1726,76 @@ fn feature_rows(
     snapshot: bool,
 ) -> bool {
     let mut shaped: Vec<(String, Node)> = Vec::new();
+    let mut parts: Vec<Node> = Vec::new();
     for p in props {
         match shape_in(*p) {
             Some(g) if !is_nil(p) => shaped.push((local(p).to_string(), g)),
+            _ if !is_nil(p) && p.attribute((XLINK, "href")).is_none() && !nested_shapes(*p).is_empty() => parts.push(*p),
             _ => row.property(*p, ""),
         }
     }
     let change = (temporary > 0, snapshot);
-    if shaped.is_empty() {
-        // Shapes nested in records (a marking's elements, a light system's lights): by family,
-        // each family with what its own shapes' reading found.
-        let mut by_family: BTreeMap<&'static str, (Vec<Geometry>, ShapeNotes)> = BTreeMap::new();
-        let mut lost = ShapeNotes::default();
-        for p in props.iter().filter(|p| elements(**p).next().is_some()) {
-            let nested = p.descendants().skip(1).filter(|d| d.is_element() && (is_aixm(d) || is_gml(d)) && SHAPES.contains(&local(d)));
-            // Not those inside another shape (a surface's curves).
-            for g in nested.filter(|g| !g.ancestors().skip(1).take_while(|a| a != p).any(|a| SHAPES.contains(&local(&a)))) {
-                let mut notes = ShapeNotes::default();
-                match shapes.shape(g, &mut notes) {
-                    Some(geom) => {
-                        let (gs, n) = by_family.entry(family(&geom)).or_default();
-                        gs.push(geom);
-                        n.absorb(notes);
-                    }
-                    None => lost.absorb(notes),
-                }
+    if !shaped.is_empty() {
+        // A feature drawn from its own shapes: its records' values are kept as columns, and the
+        // shapes in them (not drawn) are counted.
+        let mut in_records = 0;
+        for p in &parts {
+            in_records += nested_shapes(*p).len();
+            row.property(*p, "");
+        }
+        let mut first = None;
+        for (name, g) in shaped {
+            let mut notes = ShapeNotes::default();
+            let geom = shapes.shape(g, &mut notes);
+            let mut r = row.clone();
+            r.shape_values(g, &name);
+            // A kind's shapes under different properties are different layers (an airport's
+            // reference point and its boundary); a kind with one is one layer, titled by its kind.
+            let bad = geom.is_none();
+            let i = layers.push(kind, &name, geom, r, Some(&notes), change);
+            first = first.or(i);
+            if let Some(l) = layers.at(i) {
+                l.unreadable += usize::from(bad);
             }
         }
-        if by_family.is_empty() {
-            return false;
-        }
-        let mut first = true;
-        for (label, (gs, mut notes)) in by_family {
-            if std::mem::take(&mut first) {
-                notes.absorb(std::mem::take(&mut lost));
-            }
-            layers.push(kind, label, merged(gs), row.clone(), Some(&notes), change);
+        if let Some(l) = layers.at(first) {
+            l.shapes_in_records += in_records;
         }
         return true;
     }
-    for (name, g) in shaped {
-        let mut notes = ShapeNotes::default();
-        let geom = shapes.shape(g, &mut notes);
+    if parts.is_empty() {
+        return false;
+    }
+    // Rows copied for the records stay within what the file's size allows: checked before each
+    // copy, as a vertical structure's parts are.
+    let mut room = layers.cells_left;
+    let count = parts.len();
+    for (k, p) in parts.into_iter().enumerate() {
+        if (row.columns.len() + row.paths.len()).max(1) > room {
+            layers.rows_over += count - k;
+            break;
+        }
         let mut r = row.clone();
-        r.shape_values(g, &name);
-        // A kind's shapes under different properties are different layers (an airport's reference
-        // point and its boundary); a kind with one is one layer, titled by its kind alone.
-        let bad = geom.is_none();
-        let i = layers.push(kind, &name, geom, r, Some(&notes), change);
-        if let Some(l) = layers.at(i) {
-            l.unreadable += usize::from(bad);
+        let mut path = vec![(local(&p).to_string(), 1)];
+        r.record(p, &mut path, false);
+        room = room.saturating_sub((r.columns.len() + r.paths.len()).max(1));
+        // The record's shapes by family, each family a row of its own (most records have one).
+        let mut by_family: BTreeMap<&'static str, (Vec<Geometry>, ShapeNotes)> = BTreeMap::new();
+        for g in nested_shapes(p) {
+            let mut notes = ShapeNotes::default();
+            let geom = shapes.shape(g, &mut notes);
+            let (gs, n) = by_family.entry(element_family(local(&g))).or_default();
+            gs.extend(geom);
+            n.absorb(notes);
+        }
+        // What the feature was is said once for it, with its first row.
+        let change = if k == 0 { change } else { (false, false) };
+        for (label, (gs, notes)) in by_family {
+            let bad = gs.is_empty();
+            let i = layers.push(kind, label, merged(gs), r.clone(), Some(&notes), change);
+            if let Some(l) = layers.at(i) {
+                l.unreadable += usize::from(bad);
+            }
         }
     }
     true
@@ -1687,6 +1827,9 @@ fn airspace(
                 }
                 continue;
             };
+            // Every component's values as its record (its operation, its volume's limits, the
+            // airspaces it is built from), besides the BASE volume's limits below.
+            row.property(*p, "");
             let op = child(c, "operation").map(|n| text_of(&n)).unwrap_or_default();
             let seq = child(c, "operationSequence").and_then(|n| text_of(&n).parse().ok()).unwrap_or(u64::MAX);
             let volume = child(c, "theAirspaceVolume").and_then(|v| child(v, "AirspaceVolume"));
@@ -1784,16 +1927,11 @@ fn vertical_structure(
     let mut room = layers.cells_left;
     let count = parts.len();
     for (k, vp) in parts.into_iter().enumerate() {
-        if row.columns.len().max(1) > room {
+        if (row.columns.len() + row.paths.len()).max(1) > room {
             layers.rows_over += count - k;
             break;
         }
         let mut r = row.clone();
-        // What the structure lacks is said once for it, not for each part.
-        if k > 0 {
-            r.nested.clear();
-            r.nested_named.clear();
-        }
         let mut notes = ShapeNotes::default();
         let mut geom = None;
         let mut bad = false;
@@ -1807,7 +1945,7 @@ fn vertical_structure(
                 _ => r.property(p, "part_"),
             }
         }
-        room = room.saturating_sub(r.columns.len().max(1));
+        room = room.saturating_sub((r.columns.len() + r.paths.len()).max(1));
         rows.push((geom, r, notes, bad));
     }
     // A part with no shape goes with the structure's first family of parts.
@@ -1917,19 +2055,43 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
         } else {
             format!("{stem} {} {}", layer.kind, layer.label)
         };
+        // Nested values as columns, named by their paths across the whole layer.
+        let mut layer = layer;
+        let repeating = path_columns(&layer.rows);
+        let mut rows = Vec::with_capacity(layer.rows.len());
+        for (g, mut attrs, nested) in std::mem::take(&mut layer.rows) {
+            for (path, value) in nested {
+                let column = path_column(&path, &repeating);
+                if !layer.column(&column) {
+                    continue;
+                }
+                if let Some(v) = value {
+                    match attrs.get_mut(&column) {
+                        Some(old) if !v.is_empty() => {
+                            old.push_str("; ");
+                            old.push_str(&v);
+                        }
+                        Some(_) => {}
+                        None => {
+                            attrs.insert(column, v);
+                        }
+                    }
+                }
+            }
+            rows.push((g, attrs));
+        }
         let fields: Vec<Field> = layer
             .columns
             .iter()
             .map(|c| {
                 Field::new(
                     c.clone(),
-                    crate::io::text_type(layer.rows.iter().filter_map(|(_, a)| a.get(c)).map(String::as_str).filter(|v| !v.is_empty())),
+                    crate::io::text_type(rows.iter().filter_map(|(_, a)| a.get(c)).map(String::as_str).filter(|v| !v.is_empty())),
                 )
             })
             .collect();
         let mut ds = Dataset::new(title, GeometryType::None, fields);
-        let mut layer = layer;
-        for (g, attrs) in std::mem::take(&mut layer.rows) {
+        for (g, attrs) in rows {
             let row = ds.fields.iter().map(|f| attrs.get(&f.name).map_or(Value::Null, |v| Value::parse_file(v, f.ty))).collect();
             ds.push_next(g, row);
         }
@@ -1964,6 +2126,11 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
             layer.unions,
             "airspace is drawn as the parts of its BASE and UNION volumes, not merged into one outline; its limits are its BASE volume's",
             "airspaces are drawn as the parts of their BASE and UNION volumes, not merged into one outline; their limits are their BASE volume's",
+        );
+        say(
+            layer.shapes_in_records,
+            "shape in the records of features drawn from their own shape isn't drawn (its record's values are kept)",
+            "shapes in the records of features drawn from their own shapes aren't drawn (their records' values are kept)",
         );
         say(
             layer.arcs,
@@ -2001,16 +2168,10 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
             "feature is a SNAPSHOT: its state at its own instant, which may not be its state on the date asked",
             "features are SNAPSHOTs: their state at their own instant, which may not be their state on the date asked",
         );
-        let nested = layer.nested_names.said();
-        say(
-            layer.nested,
-            &format!("feature has nested records not read as attributes ({nested})"),
-            &format!("features have nested records not read as attributes ({nested})"),
-        );
         say(
             layer.capped,
-            &format!("value of properties past the first {MAX_COLUMNS} names wasn't read"),
-            &format!("values of properties past the first {MAX_COLUMNS} names weren't read"),
+            &format!("value past the first {MAX_COLUMNS} columns, or nested deeper than {MAX_PATH} records, wasn't read"),
+            &format!("values past the first {MAX_COLUMNS} columns, or nested deeper than {MAX_PATH} records, weren't read"),
         );
         if layer.zm > 0 {
             ds.zm_dropped = true;
