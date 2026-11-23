@@ -1067,4 +1067,13 @@ fn an_empty_object_that_says_something_is_kept() {
     .unwrap();
     let ds = layer(&out, "t DesignatedPoint");
     assert_eq!(value(ds, 0, "record_Thing_nilReason"), Value::Text("unknown".into()));
+    // One carrying only XML plumbing gives no column.
+    let body = format!("{}<aixm:record><aixm:Plumbing gml:id=\"q\" xlink:type=\"simple\"/></aixm:record>", named_point("N"));
+    let out = read(
+        "t.xml",
+        &message(&point("b", &[slice("DesignatedPoint", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+        &at("2026-01-15"),
+    )
+    .unwrap();
+    assert!(!layer(&out, "t DesignatedPoint").fields.iter().any(|f| f.name.starts_with("record_Plumbing")));
 }

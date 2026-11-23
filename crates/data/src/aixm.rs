@@ -596,9 +596,6 @@ struct ShapeNotes {
     far: usize,
     /// Borders by reference followed whole (a ring of two borders: no points to cut them at).
     followed_whole: usize,
-    /// Borders cut at the written points, not where they meet the next border: working that out
-    /// would pass the work the file's size allows.
-    cut_at_points: usize,
     /// A route segment drawn between the points it names, having no curve.
     between: bool,
     /// Borders by reference not followed: past the work allowed, or too short to cut.
@@ -656,7 +653,6 @@ impl ShapeNotes {
         self.referenced += o.referenced;
         self.followed += o.followed;
         self.followed_whole += o.followed_whole;
-        self.cut_at_points += o.cut_at_points;
         self.far += o.far;
         self.border_allowance += o.border_allowance;
         self.border_unusable += o.border_unusable;
@@ -948,7 +944,7 @@ impl Shapes {
         let r = elements(boundary).next()?;
         // Borders followed (cut, or whole) and those far from where they meet, counted once the
         // ring is drawn.
-        let (mut followed, mut whole, mut far, mut fallback) = (0, 0, 0, 0);
+        let (mut followed, mut whole, mut far) = (0, 0, 0);
         let mut pts: Vec<Coord> = match local(&r) {
             "LinearRing" => {
                 let axes = self.axes(r)?;
@@ -1022,22 +1018,21 @@ impl Shapes {
                                 // Where it meets the borders either side; a gap between two is
                                 // counted once, from the first of them.
                                 // One that can't be worked out (past the work allowed, or a
-                                // border not there to meet) is cut at the written points instead.
+                                // border not there to meet) leaves the ring undrawn, and why is said.
                                 let mut meet = |s: &mut Self, other: Option<String>, count_gap: bool| match other {
-                                    Some(other) => match s.junction(key, &other) {
-                                        Ok((c, gap)) => {
-                                            far += usize::from(gap && count_gap);
-                                            Some(c)
-                                        }
-                                        Err(why) => {
-                                            fallback += usize::from(why == Unfollowed::Allowance);
-                                            None
-                                        }
-                                    },
-                                    None => None,
+                                    Some(other) => s.junction(key, &other).map(|(c, gap)| {
+                                        far += usize::from(gap && count_gap);
+                                        Some(c)
+                                    }),
+                                    None => Ok(None),
                                 };
-                                let before = meet(self, prev, false);
-                                let after = meet(self, next, true);
+                                let (before, after) = match (meet(self, prev, false), meet(self, next, true)) {
+                                    (Ok(b), Ok(a)) => (b, a),
+                                    (Err(why), _) | (_, Err(why)) => {
+                                        say_unfollowed(why, notes);
+                                        return None;
+                                    }
+                                };
                                 (before.or_else(|| befores.get(i).copied().flatten()), after.or_else(|| afters.get(i).copied().flatten()))
                             };
                             // Said as a border by reference by the ring's patch, not also as a
@@ -1092,7 +1087,6 @@ impl Shapes {
         notes.followed += followed;
         notes.followed_whole += whole;
         notes.far += far;
-        notes.cut_at_points += fallback;
         Some(pts)
     }
 
@@ -1410,8 +1404,6 @@ struct Layer {
     between: usize,
     /// Borders by reference followed whole.
     followed_whole: usize,
-    /// Borders cut at the written points, the work of meeting the next border past the allowance.
-    cut_at_points: usize,
     /// Borders by reference not followed: past the work allowed, or too short to cut.
     border_allowance: usize,
     border_unusable: usize,
@@ -1452,7 +1444,6 @@ impl Layer {
         self.referenced += n.referenced;
         self.followed += n.followed;
         self.followed_whole += n.followed_whole;
-        self.cut_at_points += n.cut_at_points;
         self.far += n.far;
         self.between += usize::from(n.between);
         self.border_allowance += n.border_allowance;
@@ -1631,7 +1622,7 @@ impl Row {
                 }
                 // An object with nothing in it holds no value; one with text, or what an attribute
                 // says (a link, why it is missing, a unit), is a value.
-                let says = c.attributes().any(|a| !(a.namespace() == Some(GML) && a.name() == "id"));
+                let says = !SHAPES.contains(&name) && (is_nil(&c) || c.attributes().any(|a| value_attribute(&a).is_some()));
                 if text_of(&c).is_empty() && !says {
                     continue;
                 }
@@ -1702,14 +1693,22 @@ fn leaf_values(p: Node, name: &str) -> Vec<(String, Option<String>)> {
         out.push((name.to_string(), Some(text_of(&p))));
     }
     for a in p.attributes() {
-        let key = match (a.namespace(), a.name()) {
-            (Some(XLINK), "title") => "title",
-            (Some(XLINK) | Some(XSI), _) | (Some(GML), "id") | (None, "id") => continue,
-            (_, other) => other,
-        };
-        out.push((format!("{name}_{key}"), Some(a.value().trim().to_string())));
+        if let Some(key) = value_attribute(&a) {
+            out.push((format!("{name}_{key}"), Some(a.value().trim().to_string())));
+        }
     }
     out
+}
+
+/// The name an attribute is kept under, when it holds a value: a reference's title, a unit, why
+/// a value is missing, a language, any other; not an element's id or the XML plumbing (other
+/// XLink and XML Schema attributes).
+fn value_attribute<'a>(a: &roxmltree::Attribute<'a, '_>) -> Option<&'a str> {
+    match (a.namespace(), a.name()) {
+        (Some(XLINK), "title") => Some("title"),
+        (Some(XLINK) | Some(XSI), _) | (Some(GML), "id") | (None, "id") => None,
+        (_, other) => Some(other),
+    }
 }
 
 /// The column of each nested value of a layer's rows: its path's names joined by `_`, each step
@@ -2261,15 +2260,21 @@ fn between(props: &[Node], shapes: &mut Shapes) -> Option<(Vec<Coord>, ShapeNote
     // Both ends found first: a segment drawn neither way reads its ends' shapes once, as records.
     let (a, b) = (segment_end(props, "start", shapes)?, segment_end(props, "end", shapes)?);
     let mut notes = ShapeNotes { between: true, ..ShapeNotes::default() };
-    let at = |end: End, shapes: &mut Shapes, notes: &mut ShapeNotes| match end {
-        End::Named(c) => Some(c),
-        End::Written(g) => match shapes.shape(g, notes) {
+    let quiet = |end: &End, shapes: &mut Shapes| match end {
+        End::Named(c) => Some(*c),
+        End::Written(g) => match shapes.quietly(*g) {
             Some(Geometry::Point(c)) => Some(c),
             _ => None,
         },
     };
-    let a = at(a, shapes, &mut notes)?;
-    let b = at(b, shapes, &mut notes)?;
+    let (ca, cb) = (quiet(&a, shapes)?, quiet(&b, shapes)?);
+    // Drawn from them: what the ends written in place find is said with the segment.
+    for end in [&a, &b] {
+        if let End::Written(g) = end {
+            let _ = shapes.shape(*g, &mut notes);
+        }
+    }
+    let (a, b) = (ca, cb);
     let line = shapes.geodesic(&[a, b], &mut notes);
     Some((line, notes))
 }
@@ -2816,11 +2821,6 @@ fn finish(
             layer.referenced,
             "border is given by reference to a curve that isn't in the file (or not in force then), so it can't be followed",
             "borders are given by reference to curves that aren't in the file (or not in force then), so they can't be followed",
-        );
-        say(
-            layer.cut_at_points,
-            "border given by reference is cut at the written points nearest it, not where it meets the next border: working that out would pass the work the file's size allows",
-            "borders given by reference are cut at the written points nearest them, not where they meet the next border: working that out would pass the work the file's size allows",
         );
         say(
             layer.followed_whole,
