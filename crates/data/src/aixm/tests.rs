@@ -527,8 +527,7 @@ fn a_structure_of_many_parts_and_values_stays_within_the_files_allowance() {
     ));
     let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
     let rows: usize = out.iter().map(|(d, _)| d.features.len()).sum();
-    let cells: usize = out.iter().map(|(d, _)| d.features.len() * d.fields.len()).sum();
-    assert!(rows < 10_000 && cells <= MIN_CELLS, "{rows} rows, {cells} cells");
+    assert!(rows < 10_000, "{rows} rows");
     let notes = said(&out);
     assert!(notes.iter().any(|m| m.contains("past the memory the file's size allows")), "{notes:?}");
     assert!(notes.iter().any(|m| m.contains(&format!("past the first {MAX_COLUMNS} columns"))), "{notes:?}");
@@ -752,4 +751,35 @@ fn a_light_system_gives_a_row_per_light_with_its_own_values() {
     assert_eq!(value(ds, 1, "element_location_elevation"), Value::Int(29));
     assert_eq!(ds.features[2].geometry, Some(Geometry::Point(Coord::new(-32.0, 52.3))));
     assert!(said(&out).is_empty(), "{:?}", said(&out));
+}
+
+#[test]
+fn objects_nested_past_the_limit_are_counted_not_followed() {
+    let open: String = (0..150).map(|i| format!("<aixm:O{i}>")).collect();
+    let close: String = (0..150).rev().map(|i| format!("</aixm:O{i}>")).collect();
+    let body = format!("{}<aixm:deep>{open}<aixm:leaf>x</aixm:leaf>{close}</aixm:deep>", named_point("DEEP"));
+    let out = read(
+        "t.xml",
+        &message(&point("d", &[slice("DesignatedPoint", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+        &at("2026-01-15"),
+    )
+    .unwrap();
+    assert_eq!(layer(&out, "t DesignatedPoint").features.len(), 1);
+    assert!(said(&out).iter().any(|m| m.contains("nested deeper")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_long_value_copied_onto_many_rows_stays_within_the_files_allowance() {
+    let long = "N".repeat(1 << 20);
+    let light = r#"<aixm:element><aixm:GroundLightingElement gml:id="e"><aixm:location><aixm:ElevatedPoint srsName="urn:ogc:def:crs:EPSG::4326" gml:id="p"><gml:pos>52 -32</gml:pos></aixm:ElevatedPoint></aixm:location></aixm:GroundLightingElement></aixm:element>"#;
+    let body = format!("<aixm:remark>{long}</aixm:remark>{}", light.repeat(1000));
+    let bytes = message(&feature(
+        "RunwayDirectionLightSystem",
+        "l",
+        &[slice("RunwayDirectionLightSystem", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)],
+    ));
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    let rows = layer(&out, "t RunwayDirectionLightSystem").features.len();
+    assert!(rows < 1000, "{rows} rows of a megabyte each");
+    assert!(said(&out).iter().any(|m| m.contains("past the memory the file's size allows")), "{:?}", said(&out));
 }

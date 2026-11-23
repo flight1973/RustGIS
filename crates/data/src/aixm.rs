@@ -1083,8 +1083,12 @@ struct Row {
     paths: Nested,
     /// How many records of each property the feature has had so far.
     records: HashMap<String, usize>,
-    /// Values of names past [`MAX_COLUMNS`], or nested past [`MAX_PATH`], not kept.
+    /// Values of names past [`MAX_COLUMNS`], nested past [`MAX_PATH`], or past `limit`, not kept.
     capped: usize,
+    /// The bytes its values and their names and paths hold, and the most they may (none until
+    /// set: a row being read stops keeping values past what the file's size allows).
+    bytes: usize,
+    limit: Option<usize>,
 }
 
 impl Row {
@@ -1102,8 +1106,24 @@ impl Row {
         true
     }
 
+    /// Takes `cost` bytes for a value, or counts it as not kept past the row's limit.
+    fn afford(&mut self, cost: usize) -> bool {
+        let cost = cost + VALUE_OVERHEAD;
+        if self.limit.is_some_and(|l| self.bytes + cost > l) {
+            self.capped += 1;
+            return false;
+        }
+        self.bytes += cost;
+        true
+    }
+
+    /// What the row holds, in bytes: what keeping it, or a copy of it, costs.
+    fn weight(&self) -> usize {
+        self.bytes.max(1)
+    }
+
     fn set(&mut self, key: &str, value: String) {
-        if !self.name(key) {
+        if !self.name(key) || !self.afford(key.len() + value.len()) {
             return;
         }
         match self.attrs.get_mut(key) {
@@ -1148,7 +1168,13 @@ impl Row {
     /// one drawn with it); the values AIXM writes on it (elevation, accuracy) are. With
     /// `aixm_only`, only AIXM's properties are read.
     fn record(&mut self, node: Node, path: &mut Vec<(String, usize)>, aixm_only: bool) {
-        if path.len() > MAX_PATH {
+        self.record_at(node, path, aixm_only, 0);
+    }
+
+    /// As [`Row::record`], `depth` records and objects down: bounded whether the depth is in
+    /// properties (the path) or in objects (which add no step to it).
+    fn record_at(&mut self, node: Node, path: &mut Vec<(String, usize)>, aixm_only: bool, depth: usize) {
+        if path.len() > MAX_PATH || depth > 2 * MAX_PATH {
             self.capped += 1;
             return;
         }
@@ -1161,16 +1187,22 @@ impl Row {
             // AIXM and GML name objects with a capital, properties without.
             if name.starts_with(|ch: char| ch.is_ascii_uppercase()) {
                 let shape = SHAPES.contains(&name) && (is_aixm(&c) || is_gml(&c));
-                self.record(c, path, shape);
+                self.record_at(c, path, shape, depth + 1);
                 continue;
             }
             let n = seen.entry(name).or_default();
             *n += 1;
             path.push((name.to_string(), *n));
             if elements(c).next().is_some() && c.attribute((XLINK, "href")).is_none() {
-                self.record(c, path, false);
+                self.record_at(c, path, false, depth + 1);
             } else if let Some((last, _)) = path.last().cloned() {
+                // Each value keeps its own copy of its path: paid for in bytes, so deep paths
+                // can't make the copies outgrow what the file's size allows.
+                let path_bytes: usize = path.iter().map(|(n, _)| n.len() + VALUE_OVERHEAD).sum();
                 for (key, value) in leaf_values(c, &last) {
+                    if !self.afford(path_bytes + key.len() + value.as_ref().map_or(0, String::len)) {
+                        continue;
+                    }
                     let mut at = path.clone();
                     if let Some(step) = at.last_mut() {
                         step.0 = key;
@@ -1260,9 +1292,9 @@ fn path_column(path: &[(String, usize)], repeating: &HashSet<String>) -> String 
 #[derive(Default)]
 struct Layers {
     by_key: HashMap<(String, String), usize>,
-    /// Values rows may still hold: rows copied for a feature's parts or shapes are bounded by the
-    /// file's size, not by how many times a feature repeats them.
-    cells_left: usize,
+    /// Bytes rows may still hold: rows copied for a feature's parts or records are bounded by the
+    /// file's size, not by how many times a feature repeats them or how long its values are.
+    bytes_left: usize,
     /// Rows left out past that.
     rows_over: usize,
     list: Vec<Layer>,
@@ -1305,8 +1337,8 @@ impl Layers {
         notes: Option<&ShapeNotes>,
         change: (bool, bool),
     ) -> Option<usize> {
-        let cells = (row.columns.len() + row.paths.len()).max(1);
-        if cells > self.cells_left {
+        let cells = row.weight();
+        if cells > self.bytes_left {
             self.rows_over += 1;
             return None;
         }
@@ -1314,7 +1346,7 @@ impl Layers {
             self.over.insert(row.attrs.get("identifier").cloned().unwrap_or_default());
             return None;
         };
-        self.cells_left -= cells;
+        self.bytes_left -= cells;
         let layer = self.list.get_mut(i)?;
         layer.capped += row.capped;
         layer.temporary += usize::from(change.0);
@@ -1374,8 +1406,10 @@ fn merged(gs: Vec<Geometry>) -> Option<Geometry> {
     }))
 }
 
-/// Attribute values the layers may hold whatever the file's size.
-const MIN_CELLS: usize = 4_000_000;
+/// Bytes the layers' values may hold whatever the file's size.
+const MIN_ROW_BYTES: usize = 64 << 20;
+/// What keeping one value costs besides its text: its slot, its column's or path step's slot.
+const VALUE_OVERHEAD: usize = 24;
 
 /// Bytes wrapping slices may add whatever the file's size.
 const MIN_WRAP_BYTES: usize = 16 << 20;
@@ -1572,7 +1606,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.unknown_interpretation = trouble.unknown;
     notes.bad_dates = trouble.dates;
     // Second pass: each feature in force at the date, from its slices.
-    let mut layers = Layers { cells_left: (text.len() / 4).max(MIN_CELLS), ..Layers::default() };
+    let mut layers = Layers { bytes_left: text.len().saturating_mul(4).max(MIN_ROW_BYTES), ..Layers::default() };
     let mut shapes = Shapes { budget: text.len().max(MIN_ADDED_POINTS), ..Shapes::default() };
     // Rows of features with nothing to draw, by kind, kept until it is known whether the kind has
     // a layer to hold them.
@@ -1649,7 +1683,8 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         let last = &last;
         let props: Vec<Node> =
             layers_of.iter().enumerate().flat_map(|(i, ps)| ps.iter().copied().filter(move |p| last.get(local(p)) == Some(&i))).collect();
-        let mut row = Row::default();
+        // A row being read keeps no more than the layers still may.
+        let mut row = Row { limit: Some(layers.bytes_left), ..Row::default() };
         row.set("identifier", id.trim_start_matches("urn:uuid:").to_string());
         let valid = |t: Option<f64>| t.map(|t| crate::time::format(t, "YYYY-MM-DDTHH:mm:ss") + "Z");
         match valid(base.begin) {
@@ -1768,17 +1803,17 @@ fn feature_rows(
     }
     // Rows copied for the records stay within what the file's size allows: checked before each
     // copy, as a vertical structure's parts are.
-    let mut room = layers.cells_left;
+    let mut room = layers.bytes_left;
     let count = parts.len();
     for (k, p) in parts.into_iter().enumerate() {
-        if (row.columns.len() + row.paths.len()).max(1) > room {
+        if row.weight() > room {
             layers.rows_over += count - k;
             break;
         }
         let mut r = row.clone();
         let mut path = vec![(local(&p).to_string(), 1)];
         r.record(p, &mut path, false);
-        room = room.saturating_sub((r.columns.len() + r.paths.len()).max(1));
+        room = room.saturating_sub(r.weight());
         // The record's shapes by family, each family a row of its own (most records have one).
         let mut by_family: BTreeMap<&'static str, (Vec<Geometry>, ShapeNotes)> = BTreeMap::new();
         for g in nested_shapes(p) {
@@ -1924,10 +1959,10 @@ fn vertical_structure(
     let mut rows = Vec::new();
     // Rows copied for the parts stay within what the file's size allows: checked before each copy,
     // so a structure of many parts and many values can't outgrow it.
-    let mut room = layers.cells_left;
+    let mut room = layers.bytes_left;
     let count = parts.len();
     for (k, vp) in parts.into_iter().enumerate() {
-        if (row.columns.len() + row.paths.len()).max(1) > room {
+        if row.weight() > room {
             layers.rows_over += count - k;
             break;
         }
@@ -1945,7 +1980,7 @@ fn vertical_structure(
                 _ => r.property(p, "part_"),
             }
         }
-        room = room.saturating_sub((r.columns.len() + r.paths.len()).max(1));
+        room = room.saturating_sub(r.weight());
         rows.push((geom, r, notes, bad));
     }
     // A part with no shape goes with the structure's first family of parts.
