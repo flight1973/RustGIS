@@ -2012,6 +2012,8 @@ fn add_geodatabase(s: &mut Session, p: &Value, path: &str) -> CmdResult {
 /// DBF picks with geometry follow the full Shapefile import path.
 fn add_data(s: &mut Session, p: &Value) -> CmdResult {
     let path = s_req(p, "path")?;
+    // An effective date is for an AIXM message only: refused for any other file, not ignored.
+    check_at(p, path, || may_be_aixm_path(path))?;
     #[cfg(not(target_arch = "wasm32"))]
     if Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("dbf")) {
         if let Some(read) = super::reads::take::<WholeRead>(s, &dbf_shapefile_key(path)) {
@@ -2222,10 +2224,10 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
                 super::say_crs_note(s, crs);
             }
             let (full, reads) = read?;
-            // City models and OSM keep the file-wide report on their first layer. A feature-service
+            // City models, AIXM messages and OSM keep the file-wide report on their first layer. A feature-service
             // PBF has only one layer, so this flag does not transfer any report for it.
             #[cfg(not(target_arch = "wasm32"))]
-            let whole = is_city_model_path(path) || path.to_ascii_lowercase().ends_with(".pbf");
+            let whole = is_city_model_path(path) || is_aixm_path(path) || path.to_ascii_lowercase().ends_with(".pbf");
             #[cfg(target_arch = "wasm32")]
             let whole = !path.to_ascii_lowercase().ends_with(".zip");
             return add_picked(s, p, &full, reads, whole, Vec::new(), None);
@@ -2306,16 +2308,48 @@ fn past_read_as_added(path: &str, len: u64) -> Option<String> {
 /// An AIXM message's layers at the effective date `"at"` asks (today when it doesn't), or `None`
 /// for a file that isn't one. `"at"` given for any other file is refused, not ignored.
 fn aixm_reads(p: &Value, file_name: &str, bytes: &[u8]) -> Result<Option<Vec<rustgis_data::io::LayerRead>>, String> {
-    let at = ps(p, "at").map(str::trim).filter(|t| !t.is_empty());
-    if !rustgis_data::io::is_aixm(file_name, bytes) {
-        return match at {
-            Some(_) => Err(format!("\"at\" is the effective date of an AIXM message, and {file_name} isn't one")),
-            None => Ok(None),
-        };
+    let aixm = rustgis_data::io::is_aixm(file_name, bytes);
+    let opts = check_at(p, file_name, || aixm)?;
+    if !aixm {
+        return Ok(None);
     }
-    let opts = at.map(rustgis_data::aixm::Options::at_text).transpose()?.unwrap_or_default();
+    if ps(p, "crs").is_some_and(|c| !c.trim().is_empty()) {
+        return Err(format!("\"crs\" doesn't apply to {file_name}: an AIXM message names its own system (srsName)"));
+    }
     let reads = rustgis_data::aixm::read(file_name, bytes, &opts).map_err(|e| e.to_string())?;
     Ok(Some(reads.into_iter().map(|(dataset, report)| rustgis_data::io::LayerRead { dataset, report, styles: Vec::new() }).collect()))
+}
+
+/// The effective date `"at"` asks of an AIXM message, read as `aixm` says whether the file is
+/// one: refused when it isn't text, isn't a date, or is given for any other file, never ignored.
+pub(crate) fn check_at(p: &Value, file_name: &str, aixm: impl FnOnce() -> bool) -> Result<rustgis_data::aixm::Options, String> {
+    let at = match p.get("at") {
+        None | Some(Value::Null) => return Ok(rustgis_data::aixm::Options::default()),
+        Some(Value::String(t)) if t.trim().is_empty() => return Ok(rustgis_data::aixm::Options::default()),
+        Some(Value::String(t)) => t.trim(),
+        Some(_) => return Err("\"at\" is a date written as text, such as 2026-01-15 or 2026-01-15T12:00Z".to_string()),
+    };
+    if !aixm() {
+        let zipped = if file_name.to_ascii_lowercase().ends_with(".zip") {
+            " (an AIXM message in a zip is read as it is today: unzip it to choose a date)"
+        } else {
+            ""
+        };
+        return Err(format!("\"at\" is the effective date of an AIXM message, and {file_name} isn't one{zipped}"));
+    }
+    rustgis_data::aixm::Options::at_text(at)
+}
+
+/// Whether a file named `path` may be an AIXM message: by its first bytes on the desktop, by its
+/// name in the browser (where its contents are checked when read).
+fn may_be_aixm_path(path: &str) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    return is_aixm_path(path);
+    #[cfg(target_arch = "wasm32")]
+    {
+        let lower = path.to_ascii_lowercase();
+        lower.ends_with(".xml") || lower.ends_with(".gml")
+    }
 }
 
 /// Whether the desktop app reads a file of several layers whole ahead, off the UI thread
@@ -2784,11 +2818,13 @@ pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u
     let lower = file_name.to_ascii_lowercase();
     let kml = lower.ends_with(".kml") || lower.ends_with(".kmz");
     // A KML's ground overlays (pictures) are raster layers, added after its placemarks.
+    // An AIXM message, at the effective date asked (today when none is); "at" for any other file
+    // is refused before anything else is read of it.
+    let aixm = aixm_reads(p, file_name, bytes)?;
     let overlays = if kml && ps(p, "layer").is_none() { ground_overlays(s, file_name, bytes, local_file) } else { Vec::new() };
     // A DXF drawing: its coordinate system (it never says) and one of its own layers.
     let dxf = rustgis_data::dxf::is_dxf_name(file_name);
-    // An AIXM message, at the effective date asked (today when none is).
-    let aixm = aixm_reads(p, file_name, bytes)?;
+    let whole_aixm = aixm.is_some();
     let reads = match crs.filter(|_| landxml) {
         _ if aixm.is_some() => aixm.unwrap_or_default(),
         _ if lower.ends_with(".zip") && crs.is_some() => {
@@ -2824,7 +2860,7 @@ pub(crate) fn add_layers(s: &mut Session, p: &Value, file_name: &str, bytes: &[u
     if dxf {
         return add_reads(s, p, file_name, reads, overlays, zoom);
     }
-    let whole = rustgis_data::io::is_city_model(file_name, bytes) || rustgis_data::osm::looks_like_osm_pbf(bytes);
+    let whole = whole_aixm || rustgis_data::io::is_city_model(file_name, bytes) || rustgis_data::osm::looks_like_osm_pbf(bytes);
     add_picked(s, p, file_name, reads, whole, overlays, zoom)
 }
 

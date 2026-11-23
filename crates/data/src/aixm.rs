@@ -144,6 +144,8 @@ struct Index {
     namespaces: String,
     /// `hasMember`s that only point elsewhere (`xlink:href`), not followed.
     links: usize,
+    /// `hasMember`s holding nothing.
+    empty: usize,
     /// Where the text stops being XML, when it does before the root ends.
     broken_at: Option<usize>,
 }
@@ -153,7 +155,9 @@ impl Index {
         let mut reader = Reader::from_str(text);
         let mut index = Index::default();
         let (mut depth, mut rooted) = (0usize, false);
-        let mut member: Option<usize> = None;
+        // The member being read: where it starts, whether it points elsewhere, and whether it
+        // holds an element.
+        let mut member: Option<(usize, bool, bool)> = None;
         loop {
             let start = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
             let event = match reader.read_event() {
@@ -166,9 +170,6 @@ impl Index {
             let end = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
             match event {
                 Event::Start(ref e) | Event::Empty(ref e) if depth == 0 => {
-                    if rooted {
-                        return Err(DataError::Format(format!("{file_name}: more than one root element")));
-                    }
                     rooted = true;
                     if e.local_name().into_inner() != "AIXMBasicMessage" || !namespace_of(e).is_some_and(|ns| ns.starts_with(AIXM)) {
                         return Err(DataError::Format(format!(
@@ -184,21 +185,37 @@ impl Index {
                 }
                 Event::Start(e) => {
                     if depth == 1 && e.local_name().into_inner() == "hasMember" {
-                        member = Some(start);
+                        member = Some((start, has_href(&e), false));
+                    } else if depth == 2
+                        && let Some(m) = member.as_mut()
+                    {
+                        m.2 = true;
                     }
                     depth += 1;
                 }
                 Event::Empty(e) => {
                     if depth == 1 && e.local_name().into_inner() == "hasMember" {
-                        index.links += usize::from(e.attributes().flatten().any(|a| a.key.local_name().into_inner() == "href"));
+                        if has_href(&e) {
+                            index.links += 1;
+                        } else {
+                            index.empty += 1;
+                        }
+                    } else if depth == 2
+                        && let Some(m) = member.as_mut()
+                    {
+                        m.2 = true;
                     }
                 }
                 Event::End(_) => {
                     depth = depth.saturating_sub(1);
                     if depth == 1
-                        && let Some(s) = member.take()
+                        && let Some((s, href, held)) = member.take()
                     {
-                        index.members.push((s, end));
+                        match (held, href) {
+                            (true, _) => index.members.push((s, end)),
+                            (false, true) => index.links += 1,
+                            (false, false) => index.empty += 1,
+                        }
                     }
                     if depth == 0 {
                         break;
@@ -218,6 +235,11 @@ impl Index {
         }
         Ok(index)
     }
+}
+
+/// Whether an element points elsewhere (`xlink:href`).
+fn has_href(e: &BytesStart) -> bool {
+    e.attributes().flatten().any(|a| a.key.local_name().into_inner() == "href")
 }
 
 /// An element's namespace declarations, as attributes to write on a wrapper.
@@ -482,6 +504,11 @@ fn features_of<'a, 'i>(wrapper: Node<'a, 'i>) -> Vec<Node<'a, 'i>> {
     elements(wrapper).next().map(|m| elements(m).filter(is_aixm).collect()).unwrap_or_default()
 }
 
+/// The elements of a member that aren't AIXM features (another schema's), not read.
+fn foreign_in(wrapper: Node) -> usize {
+    elements(wrapper).next().map_or(0, |m| elements(m).filter(|c| !is_aixm(c)).count())
+}
+
 /// A feature's time slices, in order.
 fn slices_of<'a, 'i>(feature: Node<'a, 'i>) -> Vec<Node<'a, 'i>> {
     elements(feature).filter(|c| local(c) == "timeSlice").filter_map(|t| elements(t).next()).collect()
@@ -523,12 +550,15 @@ struct ShapeNotes {
 }
 
 /// Reads shapes, adding at most `budget` points to the file's positions.
+#[derive(Default)]
 struct Shapes {
     budget: usize,
     /// A system other than longitude/latitude a geometry was in (not read).
     other_system: Option<String>,
     /// Geometries with no `srsName`, read as `urn:ogc:def:crs:EPSG::4326`.
     assumed_system: usize,
+    /// Whether the shape being read had one.
+    assumed_now: bool,
     /// A geographic system other than WGS 84 a geometry was read in as if it were.
     as_wgs84: Option<String>,
 }
@@ -541,6 +571,22 @@ fn wrap180(d: f64) -> f64 {
 /// `c` moved by whole turns of longitude to lie next to `near`.
 fn next_to(c: Coord, near: f64) -> Coord {
     Coord::new(near + wrap180(c.x - near), c.y)
+}
+
+impl ShapeNotes {
+    /// Adds what another shape's reading found.
+    fn absorb(&mut self, o: ShapeNotes) {
+        self.arcs |= o.arcs;
+        self.coarse |= o.coarse;
+        self.zm |= o.zm;
+        for n in o.unread_segments {
+            if !self.unread_segments.contains(&n) {
+                self.unread_segments.push(n);
+            }
+        }
+        self.rings_lost += o.rings_lost;
+        self.referenced += o.referenced;
+    }
 }
 
 impl Shapes {
@@ -557,7 +603,7 @@ impl Shapes {
     /// The system a geometry is in: its own `srsName` or its nearest ancestor's.
     fn axes(&mut self, g: Node) -> Option<Axes> {
         let Some(name) = g.ancestors().find_map(|a| a.attribute("srsName")).map(str::trim) else {
-            self.assumed_system += 1;
+            self.assumed_now = true;
             return Some(Axes { swap: true });
         };
         if crate::ogc::warp::is_crs84(name) {
@@ -598,10 +644,11 @@ impl Shapes {
             for p in v.chunks(dim) {
                 let (a, b) = (*p.first()?, *p.get(1)?);
                 let c = if axes.swap { Coord::new(b, a) } else { Coord::new(a, b) };
-                if !c.is_finite() || c.y.abs() > 90.0 {
+                if !c.is_finite() || c.y.abs() > 90.0 || c.x.abs() > 540.0 {
                     return None;
                 }
-                out.push(c);
+                // Next to the position before, so a line across the antimeridian stays continuous.
+                out.push(out.last().map_or(c, |l: &Coord| next_to(c, l.x)));
             }
         }
         Some(out)
@@ -673,7 +720,9 @@ impl Shapes {
             }
             let (d, az, _) = rustgis_geom::wgs84_inverse(a, b);
             if d.is_finite() && d > GEODESIC_STEP_M {
-                let want = ((d / GEODESIC_STEP_M).ceil() as usize).min(MAX_GEODESIC_POINTS);
+                let need = (d / GEODESIC_STEP_M).ceil() as usize;
+                notes.coarse |= need > MAX_GEODESIC_POINTS;
+                let want = need.min(MAX_GEODESIC_POINTS);
                 let n = self.take(want.saturating_sub(1), notes) + 1;
                 for k in 1..n {
                     let (p, _) = rustgis_geom::wgs84_direct(a, az, d * k as f64 / n as f64);
@@ -695,7 +744,9 @@ impl Shapes {
     /// How many pieces an arc of `radius_m` turning `sweep_deg` is drawn with.
     fn pieces(&mut self, radius_m: f64, sweep_deg: f64, notes: &mut ShapeNotes) -> usize {
         let step = if radius_m <= ARC_TOLERANCE_M { 90.0 } else { (2.0 * (1.0 - ARC_TOLERANCE_M / radius_m).acos()).to_degrees() };
-        let want = ((sweep_deg.abs() / step.max(1e-6)).ceil() as usize).clamp(4, MAX_ARC_POINTS);
+        let need = (sweep_deg.abs() / step.max(1e-6)).ceil() as usize;
+        notes.coarse |= need > MAX_ARC_POINTS;
+        let want = need.clamp(4, MAX_ARC_POINTS);
         self.take(want - 1, notes) + 1
     }
 
@@ -726,7 +777,7 @@ impl Shapes {
         // they grow; in a longitude-first one from east, counter-clockwise.
         let (bearing0, sweep) = match (local(&s), end) {
             ("CircleByCenterPoint", _) => (if axes.swap { start } else { 90.0 - start }, 360.0),
-            (_, Some(end)) if (end - start).abs() < 360.0 => {
+            (_, Some(end)) if (end - start).abs() <= 360.0 => {
                 let d = end - start;
                 if axes.swap { (start, d) } else { (90.0 - start, -d) }
             }
@@ -760,6 +811,13 @@ impl Shapes {
                 break;
             }
             i += 2;
+        }
+        // An odd position past the last arc: joined straight, and said.
+        if !circle && i + 1 < c.len() {
+            out.extend(c.iter().skip(i + 1).copied());
+            if !notes.unread_segments.iter().any(|n| n == "ArcString") {
+                notes.unread_segments.push("ArcString".to_string());
+            }
         }
         out
     }
@@ -813,8 +871,10 @@ impl Shapes {
                 let mut out: Vec<Coord> = Vec::new();
                 for m in elements(r).filter(|c| local(c) == "curveMember") {
                     let Some(c) = elements(m).next() else {
+                        // Said as a border by reference, not also as a ring left out.
                         if m.attribute((XLINK, "href")).is_some() {
                             notes.referenced += 1;
+                            notes.rings_lost = notes.rings_lost.saturating_sub(1);
                         }
                         return None;
                     };
@@ -868,6 +928,13 @@ impl Shapes {
 
     /// A geometry element (AIXM's or GML's) as a geometry.
     fn shape(&mut self, g: Node, notes: &mut ShapeNotes) -> Option<Geometry> {
+        self.assumed_now = false;
+        let shape = self.read_shape(g, notes);
+        self.assumed_system += usize::from(self.assumed_now);
+        shape
+    }
+
+    fn read_shape(&mut self, g: Node, notes: &mut ShapeNotes) -> Option<Geometry> {
         match local(&g) {
             "Point" | "ElevatedPoint" => self.point(g, notes),
             "Curve" | "ElevatedCurve" | "LineString" => self.curve(g, notes).map(|c| Geometry::Line(vec![c])),
@@ -877,11 +944,12 @@ impl Shapes {
     }
 }
 
-/// Metres in one of a length's units: UCUM's (`m`, `km`, `[nmi_i]`, `[ft_i]`, `[mi_i]`) and AIXM's
+/// Meters in one of a length's units: UCUM's (`m`, `km`, `[nmi_i]`, `[ft_i]`, `[mi_i]`) and AIXM's
 /// (`M`, `KM`, `NM`, `FT`, `MI`).
 fn meters_per(uom: &str) -> Option<f64> {
     Some(match uom.trim() {
         "m" | "M" => 1.0,
+        "cm" | "CM" => 0.01,
         "km" | "KM" => 1000.0,
         "[nmi_i]" | "NM" | "nmi" => 1852.0,
         "[ft_i]" | "FT" | "ft" => 0.3048,
@@ -992,17 +1060,29 @@ struct Row {
     named: HashSet<String>,
     nested: Vec<String>,
     nested_named: HashSet<String>,
+    /// Values of names past [`MAX_COLUMNS`], not kept.
+    capped: usize,
 }
 
 impl Row {
-    fn name(&mut self, key: &str) {
-        if self.named.insert(key.to_string()) {
-            self.columns.push(key.to_string());
+    /// Names a column; false past [`MAX_COLUMNS`] names, when its value isn't kept (counted).
+    fn name(&mut self, key: &str) -> bool {
+        if self.named.contains(key) {
+            return true;
         }
+        if self.columns.len() >= MAX_COLUMNS {
+            self.capped += 1;
+            return false;
+        }
+        self.named.insert(key.to_string());
+        self.columns.push(key.to_string());
+        true
     }
 
     fn set(&mut self, key: &str, value: String) {
-        self.name(key);
+        if !self.name(key) {
+            return;
+        }
         match self.attrs.get_mut(key) {
             // A property given more than once keeps every value.
             Some(v) if !value.is_empty() => {
@@ -1017,7 +1097,7 @@ impl Row {
     }
 
     fn null(&mut self, key: &str) {
-        self.name(key);
+        let _ = self.name(key);
     }
 
     /// A property's simple value as attributes, under `prefix`.
@@ -1069,40 +1149,59 @@ struct Layers {
     /// Rows left out past that.
     rows_over: usize,
     list: Vec<Layer>,
-    /// Features of kinds past [`MAX_LAYERS`].
-    over: usize,
+    /// Features of kinds past [`MAX_LAYERS`], by identifier.
+    over: HashSet<String>,
 }
 
 impl Layers {
-    fn get(&mut self, kind: &str, label: &str) -> Option<&mut Layer> {
+    /// The layer of a kind and label, made when there is room for another.
+    fn index_of(&mut self, kind: &str, label: &str) -> Option<usize> {
         let key = (kind.to_string(), label.to_string());
-        let i = match self.by_key.get(&key) {
-            Some(&i) => i,
-            None if self.list.len() >= MAX_LAYERS => {
-                self.over += 1;
-                return None;
-            }
+        match self.by_key.get(&key) {
+            Some(&i) => Some(i),
+            None if self.list.len() >= MAX_LAYERS => None,
             None => {
                 self.list.push(Layer { kind: kind.to_string(), label: label.to_string(), ..Layer::default() });
                 self.by_key.insert(key, self.list.len() - 1);
-                self.list.len() - 1
+                Some(self.list.len() - 1)
             }
-        };
-        self.list.get_mut(i)
+        }
+    }
+
+    fn at(&mut self, i: Option<usize>) -> Option<&mut Layer> {
+        i.and_then(|i| self.list.get_mut(i))
     }
 
     fn has_kind(&self, kind: &str) -> bool {
         self.list.iter().any(|l| l.kind == kind)
     }
 
-    fn push(&mut self, kind: &str, label: &str, geometry: Option<Geometry>, row: Row, notes: Option<&ShapeNotes>) {
+    /// Adds a row to the layer of `kind` and `label`, which it returns; `None` when it is left out
+    /// (counted): past the values the file's size allows, or a kind past [`MAX_LAYERS`].
+    /// `change` says whether the feature is as a TEMPDELTA has it, or a SNAPSHOT.
+    fn push(
+        &mut self,
+        kind: &str,
+        label: &str,
+        geometry: Option<Geometry>,
+        row: Row,
+        notes: Option<&ShapeNotes>,
+        change: (bool, bool),
+    ) -> Option<usize> {
         let cells = row.columns.len().max(1);
         if cells > self.cells_left {
             self.rows_over += 1;
-            return;
+            return None;
         }
+        let Some(i) = self.index_of(kind, label) else {
+            self.over.insert(row.attrs.get("identifier").cloned().unwrap_or_default());
+            return None;
+        };
         self.cells_left -= cells;
-        let Some(layer) = self.get(kind, label) else { return };
+        let layer = self.list.get_mut(i)?;
+        layer.capped += row.capped;
+        layer.temporary += usize::from(change.0);
+        layer.snapshots += usize::from(change.1);
         let mut attrs = Attrs::new();
         for c in &row.columns {
             if layer.column(c)
@@ -1121,6 +1220,7 @@ impl Layers {
             layer.take_notes(n);
         }
         layer.rows.push((geometry, attrs));
+        Some(i)
     }
 }
 
@@ -1244,6 +1344,8 @@ fn projection<'a, 'i>(v: Option<Node<'a, 'i>>) -> Option<Node<'a, 'i>> {
 /// What the read says of the file as a whole.
 #[derive(Default)]
 struct FileNotes {
+    /// Elements of members that aren't AIXM features.
+    foreign: usize,
     /// Slices not read: wrapping or parsing them would pass the file's limits.
     past_limits: usize,
     not_in_force: usize,
@@ -1281,7 +1383,15 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     let at = opts.at.filter(|t| t.is_finite()).unwrap_or_else(now_ms);
     let index = Index::of(file_name, text)?;
     if index.members.is_empty() {
-        return Err(DataError::Format(format!("{file_name}: no features (hasMember elements) in the AIXM message")));
+        let mut why = Vec::new();
+        if index.links > 0 {
+            why.push(format!("{} only point elsewhere (xlink:href)", index.links));
+        }
+        if let Some(at) = index.broken_at {
+            why.push(format!("the file stops being well-formed XML at byte {at}"));
+        }
+        let why = if why.is_empty() { String::new() } else { format!(": {}", why.join("; ")) };
+        return Err(DataError::Format(format!("{file_name}: no features (hasMember elements) in the AIXM message{why}")));
     }
     let mut work_left = crate::xml::namespace_budget(text.len());
     let wrap = |member: &str, out: &mut String| {
@@ -1325,6 +1435,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             notes.unreadable_members += 1;
             continue;
         };
+        notes.foreign += foreign_in(doc.root_element());
         for (fi, f) in features_of(doc.root_element()).into_iter().enumerate() {
             let id = identifier(f).unwrap_or_else(|| format!("#{m}.{fi}"));
             let mut slices = Vec::new();
@@ -1351,7 +1462,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.bad_dates = trouble.dates;
     // Second pass: each feature in force at the date, from its slices.
     let mut layers = Layers { cells_left: (text.len() / 4).max(MIN_CELLS), ..Layers::default() };
-    let mut shapes = Shapes { budget: text.len().max(MIN_ADDED_POINTS), other_system: None, assumed_system: 0, as_wgs84: None };
+    let mut shapes = Shapes { budget: text.len().max(MIN_ADDED_POINTS), ..Shapes::default() };
     // Rows of features with nothing to draw, by kind, kept until it is known whether the kind has
     // a layer to hold them.
     let mut shapeless: Vec<(String, Row, usize, bool)> = Vec::new();
@@ -1452,16 +1563,14 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     // Features with nothing to draw: in their kind's layer when it has one, as a table for the
     // kinds that are tables, else counted.
     for (kind, row, temporary, snapshot) in shapeless {
+        let change = (temporary > 0, snapshot);
         if TABLE_KINDS.contains(&kind.as_str()) {
-            layers.push(&kind, "", None, row, None);
-            mark(&mut layers, &kind, "", temporary, snapshot);
+            layers.push(&kind, "", None, row, None, change);
         } else if layers.has_kind(&kind) {
             let label = layers.list.iter().find(|l| l.kind == kind).map(|l| l.label.clone()).unwrap_or_default();
-            layers.push(&kind, &label, None, row, None);
-            if let Some(l) = layers.get(&kind, &label) {
+            let i = layers.push(&kind, &label, None, row, None, change);
+            if let Some(l) = layers.at(i) {
                 l.shapeless += 1;
-                l.temporary += usize::from(temporary > 0);
-                l.snapshots += usize::from(snapshot);
             }
         } else {
             notes.nothing_to_draw += 1;
@@ -1492,25 +1601,36 @@ fn feature_rows(
             _ => row.property(*p, ""),
         }
     }
+    let change = (temporary > 0, snapshot);
     if shaped.is_empty() {
-        // Shapes nested in records (a marking's elements, a light system's lights): by family.
-        let mut by_family: BTreeMap<&'static str, Vec<Geometry>> = BTreeMap::new();
-        let mut notes = ShapeNotes::default();
+        // Shapes nested in records (a marking's elements, a light system's lights): by family,
+        // each family with what its own shapes' reading found.
+        let mut by_family: BTreeMap<&'static str, (Vec<Geometry>, ShapeNotes)> = BTreeMap::new();
+        let mut lost = ShapeNotes::default();
         for p in props.iter().filter(|p| elements(**p).next().is_some()) {
             let nested = p.descendants().skip(1).filter(|d| d.is_element() && (is_aixm(d) || is_gml(d)) && SHAPES.contains(&local(d)));
             // Not those inside another shape (a surface's curves).
             for g in nested.filter(|g| !g.ancestors().skip(1).take_while(|a| a != p).any(|a| SHAPES.contains(&local(&a)))) {
-                if let Some(geom) = shapes.shape(g, &mut notes) {
-                    by_family.entry(family(&geom)).or_default().push(geom);
+                let mut notes = ShapeNotes::default();
+                match shapes.shape(g, &mut notes) {
+                    Some(geom) => {
+                        let (gs, n) = by_family.entry(family(&geom)).or_default();
+                        gs.push(geom);
+                        n.absorb(notes);
+                    }
+                    None => lost.absorb(notes),
                 }
             }
         }
         if by_family.is_empty() {
             return false;
         }
-        for (label, gs) in by_family {
-            layers.push(kind, label, merged(gs), row.clone(), Some(&notes));
-            mark(layers, kind, label, temporary, snapshot);
+        let mut first = true;
+        for (label, (gs, mut notes)) in by_family {
+            if std::mem::take(&mut first) {
+                notes.absorb(std::mem::take(&mut lost));
+            }
+            layers.push(kind, label, merged(gs), row.clone(), Some(&notes), change);
         }
         return true;
     }
@@ -1521,22 +1641,13 @@ fn feature_rows(
         r.shape_values(g, &name);
         // A kind's shapes under different properties are different layers (an airport's reference
         // point and its boundary); a kind with one is one layer, titled by its kind alone.
-        let label = name.as_str();
         let bad = geom.is_none();
-        layers.push(kind, label, geom, r, Some(&notes));
-        if let Some(l) = layers.get(kind, label) {
+        let i = layers.push(kind, &name, geom, r, Some(&notes), change);
+        if let Some(l) = layers.at(i) {
             l.unreadable += usize::from(bad);
         }
-        mark(layers, kind, label, temporary, snapshot);
     }
     true
-}
-
-fn mark(layers: &mut Layers, kind: &str, label: &str, temporary: usize, snapshot: bool) {
-    if let Some(l) = layers.get(kind, label) {
-        l.temporary += usize::from(temporary > 0);
-        l.snapshots += usize::from(snapshot);
-    }
 }
 
 /// An airspace: its volumes' operations decide what is drawn. Its limits are its BASE volume's.
@@ -1592,8 +1703,8 @@ fn airspace(
             geom = merged(parts);
         }
     }
-    layers.push(kind, "", geom, row.clone(), Some(notes));
-    if let Some(l) = layers.get(kind, "") {
+    let i = layers.push(kind, "", geom, row.clone(), Some(notes), (temporary > 0, snapshot));
+    if let Some(l) = layers.at(i) {
         if !drawable {
             l.derived += 1;
             for (_, op, v) in &components {
@@ -1611,7 +1722,6 @@ fn airspace(
             l.unions += 1;
         }
     }
-    mark(layers, kind, "", temporary, snapshot);
     true
 }
 
@@ -1641,8 +1751,21 @@ fn vertical_structure(
         return false;
     }
     let mut rows = Vec::new();
-    for vp in parts {
+    // Rows copied for the parts stay within what the file's size allows: checked before each copy,
+    // so a structure of many parts and many values can't outgrow it.
+    let mut room = layers.cells_left;
+    let count = parts.len();
+    for (k, vp) in parts.into_iter().enumerate() {
+        if row.columns.len().max(1) > room {
+            layers.rows_over += count - k;
+            break;
+        }
         let mut r = row.clone();
+        // What the structure lacks is said once for it, not for each part.
+        if k > 0 {
+            r.nested.clear();
+            r.nested_named.clear();
+        }
         let mut notes = ShapeNotes::default();
         let mut geom = None;
         let mut bad = false;
@@ -1656,17 +1779,18 @@ fn vertical_structure(
                 _ => r.property(p, "part_"),
             }
         }
+        room = room.saturating_sub(r.columns.len().max(1));
         rows.push((geom, r, notes, bad));
     }
     // A part with no shape goes with the structure's first family of parts.
     let first = rows.iter().find_map(|(g, ..)| g.as_ref().map(family)).unwrap_or("points");
-    for (geom, r, notes, bad) in rows {
+    for (k, (geom, r, notes, bad)) in rows.into_iter().enumerate() {
         let label = geom.as_ref().map_or(first, family);
-        layers.push(kind, label, geom, r, Some(&notes));
-        if let Some(l) = layers.get(kind, label) {
+        let change = if k == 0 { (temporary > 0, snapshot) } else { (false, false) };
+        let i = layers.push(kind, label, geom, r, Some(&notes), change);
+        if let Some(l) = layers.at(i) {
             l.unreadable += usize::from(bad);
         }
-        mark(layers, kind, label, temporary, snapshot);
     }
     true
 }
@@ -1722,19 +1846,14 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
     );
     say(&mut file, layers.rows_over, "row", "rows", "past the memory the file's size allows left out");
     say(&mut file, index.links, "member", "members", "of the message only point elsewhere (xlink:href) and weren't followed");
-    if notes.nothing_to_draw > 0 {
-        file.messages.push(format!(
-            "{} features of kinds with nothing to draw left out ({})",
-            notes.nothing_to_draw,
-            notes.nothing_names.said()
-        ));
-    }
+    let nothing = format!("of kinds with nothing to draw left out ({})", notes.nothing_names.said());
+    say(&mut file, notes.nothing_to_draw, "feature", "features", &nothing);
+    say(&mut file, notes.foreign, "element", "elements", "of members that aren't AIXM features (another schema's) not read");
+    say(&mut file, index.empty, "member", "members", "of the message hold nothing");
     if let Some(at) = index.broken_at {
         file.messages.push(format!("the file stops being well-formed XML at byte {at}: features after it weren't read"));
     }
-    if layers.over > 0 {
-        file.messages.push(format!("{} features of more than {MAX_LAYERS} kinds were left out", layers.over));
-    }
+    say(&mut file, layers.over.len(), "feature", "features", &format!("of kinds past the first {MAX_LAYERS} left out"));
     if let Some(s) = &notes.other_system {
         file.messages.push(format!("geometry in '{s}', not longitude/latitude, wasn't read"));
     }
@@ -1773,9 +1892,10 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
             })
             .collect();
         let mut ds = Dataset::new(title, GeometryType::None, fields);
-        for (g, attrs) in &layer.rows {
+        let mut layer = layer;
+        for (g, attrs) in std::mem::take(&mut layer.rows) {
             let row = ds.fields.iter().map(|f| attrs.get(&f.name).map_or(Value::Null, |v| Value::parse_file(v, f.ty))).collect();
-            ds.push_next(g.clone(), row);
+            ds.push_next(g, row);
         }
         ds.geometry_type = crate::io::dominant_type(&ds);
         let mut rep = if out.is_empty() { std::mem::take(&mut file) } else { ReadReport::default() };
@@ -1816,8 +1936,8 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
         );
         say(
             layer.coarse,
-            "feature has arcs or geodesics drawn with fewer points than that needs: the file's point allowance ran out",
-            "features have arcs or geodesics drawn with fewer points than that needs: the file's point allowance ran out",
+            "feature has arcs or geodesics drawn with fewer points than that needs (a curve's most points, or the file's point allowance, ran out)",
+            "features have arcs or geodesics drawn with fewer points than that needs (a curve's most points, or the file's point allowance, ran out)",
         );
         let segments = layer.unread_segments.said();
         say(
@@ -1827,8 +1947,8 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
         );
         say(
             layer.rings_lost,
-            "ring or surface patch was left out: too few points, unreadable, or a border given by reference",
-            "rings or surface patches were left out: too few points, unreadable, or borders given by reference",
+            "ring or surface patch was left out: too few points, or unreadable",
+            "rings or surface patches were left out: too few points, or unreadable",
         );
         say(
             layer.referenced,

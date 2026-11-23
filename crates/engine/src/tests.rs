@@ -24151,6 +24151,23 @@ fn aixm_messages_are_added_at_the_date_asked() {
     std::fs::write(&gpx, r#"<gpx version="1.1"><wpt lat="1" lon="2"><name>W</name></wpt></gpx>"#).unwrap();
     let e = s.run("layer.addData", &json!({"path": gpx.display().to_string(), "at": "2026-01-15"})).unwrap_err();
     assert!(e.contains("isn't one"), "{e}");
+    // A single-layer file too, and the bytes of one: refused, never ignored.
+    let geojson = dir.join("roads.geojson");
+    std::fs::write(&geojson, r#"{"type":"FeatureCollection","features":[]}"#).unwrap();
+    let e = s.run("layer.addData", &json!({"path": geojson.display().to_string(), "at": "2026-01-15"})).unwrap_err();
+    assert!(e.contains("isn't one"), "{e}");
+    let e = s.run("layer.addData", &json!({"path": path.display().to_string(), "at": 20260115})).unwrap_err();
+    assert!(e.contains("written as text"), "{e}");
+    let e = s.run("layer.addData", &json!({"path": path.display().to_string(), "crs": "EPSG:3857"})).unwrap_err();
+    assert!(e.contains("names its own system"), "{e}");
+    // A layer picked that isn't the first still gets what the file as a whole says.
+    let later = r#"<message:hasMember><aixm:DesignatedPoint gml:id="f"><gml:identifier codeSpace="urn:uuid:">late</gml:identifier><aixm:timeSlice><aixm:DesignatedPointTimeSlice gml:id="s"><gml:validTime><gml:TimePeriod gml:id="t"><gml:beginPosition>2030-01-01T00:00:00Z</gml:beginPosition><gml:endPosition indeterminatePosition="unknown"/></gml:TimePeriod></gml:validTime><aixm:interpretation>BASELINE</aixm:interpretation><aixm:sequenceNumber>1</aixm:sequenceNumber><aixm:correctionNumber>0</aixm:correctionNumber><aixm:name>LATER</aixm:name></aixm:DesignatedPointTimeSlice></aixm:timeSlice></aixm:DesignatedPoint></message:hasMember>"#;
+    let text = String::from_utf8(donlon.to_vec()).unwrap().replacen("<message:hasMember>", &format!("{later}<message:hasMember>"), 1);
+    let picked = dir.join("picked.xml");
+    std::fs::write(&picked, text).unwrap();
+    s.notices.clear();
+    s.run("layer.addData", &json!({"path": picked.display().to_string(), "layer": "picked Runway", "at": "2026-01-15"})).unwrap();
+    assert!(s.notices.iter().any(|n| n.text.contains("1 feature not in force")), "{:?}", s.notices);
     let _ = std::fs::remove_dir_all(dir);
 }
 

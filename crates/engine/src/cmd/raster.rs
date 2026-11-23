@@ -787,6 +787,8 @@ pub(crate) fn add_named_bytes_read(
     drawn: Option<Raster>,
     asked: Option<rustgis_data::raster::Crs>,
 ) -> CmdResult {
+    // An effective date is for an AIXM message only: refused for any other file, not ignored.
+    super::layer::check_at(p, &name, || rustgis_data::io::is_aixm(&name, &bytes))?;
     // A geotagged photo (an upload, a drop): a point in the photo layer, so several uploads
     // gather in one.
     let scan = wants_scan(p, &name)?;

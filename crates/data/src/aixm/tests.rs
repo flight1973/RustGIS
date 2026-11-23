@@ -375,7 +375,7 @@ fn an_arc_in_a_longitude_first_system_is_the_same_arc() {
 
 #[test]
 fn an_arc_through_three_points_passes_through_them() {
-    let mut shapes = Shapes { budget: 1_000_000, other_system: None, assumed_system: 0, as_wgs84: None };
+    let mut shapes = Shapes { budget: 1_000_000, ..Shapes::default() };
     let mut notes = ShapeNotes::default();
     let (a, m, b) = (Coord::new(10.0, 50.0), Coord::new(10.1, 50.07), Coord::new(10.2, 50.0));
     let arc = shapes.arc_through(a, m, b, false, &mut notes);
@@ -387,7 +387,7 @@ fn an_arc_through_three_points_passes_through_them() {
 
 #[test]
 fn arcs_past_the_point_allowance_are_drawn_coarser_and_said() {
-    let mut shapes = Shapes { budget: 0, other_system: None, assumed_system: 0, as_wgs84: None };
+    let mut shapes = Shapes::default();
     let mut notes = ShapeNotes::default();
     let n = shapes.pieces(50_000.0, 180.0, &mut notes);
     assert_eq!(n, 1);
@@ -509,4 +509,80 @@ fn junk_never_panics() {
 fn an_effective_date_is_read_from_text() {
     assert_eq!(Options::at_text("2026-01-15").unwrap(), at("2026-01-15"));
     assert!(Options::at_text("next tuesday").unwrap_err().contains("isn't a date"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Bounds and counts from review.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_structure_of_many_parts_and_values_stays_within_the_files_allowance() {
+    let values: String = (0..2000).map(|i| format!("<aixm:p{i}>x</aixm:p{i}>")).collect();
+    let parts = "<aixm:part><aixm:VerticalStructurePart gml:id=\"q\"/></aixm:part>".repeat(10_000);
+    let body = format!("<aixm:name>MANY</aixm:name>{values}{parts}");
+    let bytes = message(&feature(
+        "VerticalStructure",
+        "v",
+        &[slice("VerticalStructure", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)],
+    ));
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    let rows: usize = out.iter().map(|(d, _)| d.features.len()).sum();
+    let cells: usize = out.iter().map(|(d, _)| d.features.len() * d.fields.len()).sum();
+    assert!(rows < 10_000 && cells <= MIN_CELLS, "{rows} rows, {cells} cells");
+    let notes = said(&out);
+    assert!(notes.iter().any(|m| m.contains("past the memory the file's size allows")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.contains(&format!("past the first {MAX_COLUMNS} names"))), "{notes:?}");
+}
+
+#[test]
+fn kinds_past_the_layer_limit_are_counted_once_a_feature() {
+    let members: String = (0..70)
+        .map(|k| {
+            let kind = format!("Kind{k}");
+            feature(&kind, &format!("id{k}"), &[slice(&kind, "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &named_point("P"))])
+        })
+        .collect();
+    let out = read("t.xml", &message(&members), &at("2026-01-15")).unwrap();
+    assert_eq!(out.len(), MAX_LAYERS);
+    let notes = said(&out);
+    assert!(notes.iter().any(|m| m == &format!("6 features of kinds past the first {MAX_LAYERS} left out")), "{notes:?}");
+}
+
+#[test]
+fn members_with_no_aixm_feature_are_counted() {
+    let foreign = r#"<message:hasMember><ext:Thing xmlns:ext="http://example.org/ext"/></message:hasMember>"#;
+    let only_link = r#"<message:hasMember xlink:href="urn:uuid:x"></message:hasMember>"#;
+    let empty = "<message:hasMember></message:hasMember>";
+    let members = point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "A")]) + foreign + only_link + empty;
+    let notes = names(&message(&members), "2026-01-15").1;
+    for want in [
+        "1 element of members that aren't AIXM features (another schema's) not read",
+        "1 member of the message only point elsewhere (xlink:href) and weren't followed",
+        "1 member of the message hold nothing",
+    ] {
+        assert!(notes.iter().any(|m| m == want), "{want}: {notes:?}");
+    }
+}
+
+#[test]
+fn an_arc_from_0_to_360_is_a_full_circle() {
+    let bytes = String::from_utf8(arc_airspace(true)).unwrap().replace(
+        r#"<gml:startAngle uom="deg">-90.0</gml:startAngle><gml:endAngle uom="deg">137.0</gml:endAngle>"#,
+        r#"<gml:startAngle uom="deg">0</gml:startAngle><gml:endAngle uom="deg">360</gml:endAngle>"#,
+    );
+    let out = read("t.xml", bytes.as_bytes(), &at("2026-01-15")).unwrap();
+    let ring = ring(layer(&out, "t Airspace").features[0].geometry.as_ref().unwrap());
+    let center = Coord::new(-36.16666667, 55.23333333);
+    let south = ring.iter().filter(|c| (meters_between(**c, center) - 46_300.0).abs() < 1.0).map(|c| c.y).fold(f64::MAX, f64::min);
+    assert!(south < 54.82, "the circle reaches south of its center: {south}");
+}
+
+#[test]
+fn a_ring_across_the_antimeridian_stays_continuous() {
+    let body = r#"<aixm:name>PACIFIC</aixm:name><aixm:location><aixm:Point srsName="urn:ogc:def:crs:EPSG::4326" gml:id="g"><gml:pos>0 179.5</gml:pos></aixm:Point></aixm:location><aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>0 179 0 -179 1 -179 1 179 0 179</gml:posList></gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#;
+    let bytes = message(&feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), body)]));
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    let ds = layer(&out, "t WorkArea extent");
+    let ring = ring(ds.features[0].geometry.as_ref().unwrap());
+    assert!(ring.windows(2).all(|w| (w[0].x - w[1].x).abs() < 3.0), "{ring:?}");
 }

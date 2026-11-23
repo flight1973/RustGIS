@@ -3600,6 +3600,9 @@ fn read_zip_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budget: &mut
             read_dbf(b, cpg.as_deref(), name, budget).map(|r| vec![r])
         } else if is_city_model(leaf, &b) {
             read_city_member(leaf, &b, crs)
+        } else if is_aixm(leaf, &b) {
+            // An AIXM message: all its layers, as it is today.
+            crate::aixm::read(leaf, &b, &crate::aixm::Options::default())
         } else if is_delimited_name(leaf) {
             read_delimited_bytes_budget(leaf, &b, &CsvOptions { crs, ..Default::default() }, budget).map(|r| vec![r])
         } else {
