@@ -328,11 +328,16 @@ fn is_nil(n: &Node) -> bool {
 
 /// A date of a `gml:beginPosition`/`endPosition`/`timePosition`: `Ok(None)` for an open end
 /// (`indeterminatePosition`, or empty), `Err` for one that isn't a date.
-fn position(n: Option<Node>) -> std::result::Result<Option<f64>, ()> {
+fn position(n: Option<Node>, empty: &std::cell::Cell<usize>) -> std::result::Result<Option<f64>, ()> {
     let Some(n) = n else { return Ok(None) };
     let t = text_of(&n);
     if t.is_empty() {
-        return if n.attribute("indeterminatePosition").is_some() { Ok(None) } else { Err(()) };
+        // An empty position that doesn't say it is unknown (the FAA's `<gml:endPosition/>`) is
+        // read as open too, and counted.
+        if n.attribute("indeterminatePosition").is_none() {
+            empty.set(empty.get() + 1);
+        }
+        return Ok(None);
     }
     crate::time::parse_text(&t).map(Some).ok_or(())
 }
@@ -460,6 +465,8 @@ struct SliceTrouble {
     unknown: usize,
     /// Slices with dates that aren't dates.
     dates: usize,
+    /// Validity or lifetime ends left empty without saying they are unknown, read as open.
+    empty: usize,
 }
 
 /// A slice's own properties.
@@ -475,22 +482,23 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
         }
     };
     let number = |name: &str| child(s, name).and_then(|n| text_of(&n).parse::<u64>().ok()).unwrap_or(0);
+    let empty = std::cell::Cell::new(0);
     let (mut begin, mut end, mut canceled) = (None, None, false);
     let mut bad = false;
     if let Some(v) = child(s, "validTime") {
         match elements(v).next() {
             Some(p) if local(&p) == "TimePeriod" => {
-                begin = position(child(p, "beginPosition")).unwrap_or_else(|()| {
+                begin = position(child(p, "beginPosition"), &empty).unwrap_or_else(|()| {
                     bad = true;
                     None
                 });
-                end = position(child(p, "endPosition")).unwrap_or_else(|()| {
+                end = position(child(p, "endPosition"), &empty).unwrap_or_else(|()| {
                     bad = true;
                     None
                 });
             }
             Some(i) if local(&i) == "TimeInstant" => {
-                begin = position(child(i, "timePosition")).unwrap_or_else(|()| {
+                begin = position(child(i, "timePosition"), &empty).unwrap_or_else(|()| {
                     bad = true;
                     None
                 });
@@ -501,16 +509,17 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
         }
     }
     let lifetime = child(s, "featureLifetime").and_then(|l| elements(l).find(|p| local(p) == "TimePeriod")).map(|p| {
-        let from = position(child(p, "beginPosition")).unwrap_or_else(|()| {
+        let from = position(child(p, "beginPosition"), &empty).unwrap_or_else(|()| {
             bad = true;
             None
         });
-        let until = position(child(p, "endPosition")).unwrap_or_else(|()| {
+        let until = position(child(p, "endPosition"), &empty).unwrap_or_else(|()| {
             bad = true;
             None
         });
         (from, until)
     });
+    trouble.empty += empty.get();
     if bad {
         trouble.dates += 1;
         return None;
@@ -580,6 +589,8 @@ struct ShapeNotes {
     /// ends lie more than [`FAR_FROM_BORDER_M`] from it.
     followed: usize,
     far: usize,
+    /// A route segment drawn between the points it names, having no curve.
+    between: bool,
 }
 
 /// Reads shapes, adding at most `budget` points to the file's positions.
@@ -600,6 +611,9 @@ struct Shapes {
     as_wgs84_now: bool,
     /// The borders references may follow, by [`border_key`]: each GeoBorder's at the date.
     borders: HashMap<String, Vec<Coord>>,
+    /// Where each point feature is (a navaid, a designated point), by its identifier: the ends of
+    /// route segments that name them.
+    points: HashMap<String, Coord>,
 }
 
 fn wrap180(d: f64) -> f64 {
@@ -648,6 +662,13 @@ impl Shapes {
             return Some(Axes { swap: true });
         };
         if crate::ogc::warp::is_crs84(name) {
+            return Some(Axes { swap: false });
+        }
+        // OGC's CRS83: NAD83 longitude/latitude, as the FAA writes it; within a couple of meters
+        // of WGS 84 in North America, read as it and said.
+        if name.trim().to_ascii_uppercase().ends_with(":CRS83") {
+            self.as_wgs84.get_or_insert_with(|| name.to_string());
+            self.as_wgs84_now = true;
             return Some(Axes { swap: false });
         }
         match crate::gml::srs(name).map(|(c, _)| c) {
@@ -925,19 +946,38 @@ impl Shapes {
                 }
                 let mut out: Vec<Coord> = Vec::new();
                 let n = members.len();
+                // Each member's nearest written points before and after it, round the ring: two
+                // passes, however many members are references.
+                let end_of = |m: Option<&std::result::Result<Vec<Coord>, String>>| match m {
+                    Some(Ok(c)) => c.last().copied(),
+                    _ => None,
+                };
+                let start_of = |m: Option<&std::result::Result<Vec<Coord>, String>>| match m {
+                    Some(Ok(c)) => c.first().copied(),
+                    _ => None,
+                };
+                let mut befores: Vec<Option<Coord>> = vec![None; n];
+                let mut carry = (0..n).rev().find_map(|k| end_of(members.get(k)));
+                for i in 0..n {
+                    if let Some(b) = befores.get_mut(i) {
+                        *b = carry;
+                    }
+                    carry = end_of(members.get(i)).or(carry);
+                }
+                let mut afters: Vec<Option<Coord>> = vec![None; n];
+                let mut carry = (0..n).find_map(|k| start_of(members.get(k)));
+                for i in (0..n).rev() {
+                    if let Some(a) = afters.get_mut(i) {
+                        *a = carry;
+                    }
+                    carry = start_of(members.get(i)).or(carry);
+                }
                 for i in 0..n {
                     let mut part = match members.get(i) {
                         Some(Ok(c)) => c.clone(),
                         Some(Err(key)) => {
-                            // The written points before and after it, round the ring.
-                            let before = (1..n).find_map(|k| match members.get((i + n - k) % n) {
-                                Some(Ok(c)) => c.last().copied(),
-                                _ => None,
-                            });
-                            let after = (1..n).find_map(|k| match members.get((i + k) % n) {
-                                Some(Ok(c)) => c.first().copied(),
-                                _ => None,
-                            });
+                            let before = befores.get(i).copied().flatten();
+                            let after = afters.get(i).copied().flatten();
                             // Said as a border by reference by the ring's patch, not also as a
                             // ring left out.
                             let Some(part) = self.follow(key, before, after, notes) else {
@@ -975,6 +1015,12 @@ impl Shapes {
     /// ring has no other points. AIXM leaves this cut to the reader (its coding guidance, "Geoborder
     /// for Airspace Border"), so each is counted, and those whose ends lie far from the border.
     fn follow(&mut self, key: &str, before: Option<Coord>, after: Option<Coord>, notes: &mut ShapeNotes) -> Option<Vec<Coord>> {
+        let scan = self.borders.get(key)?.len();
+        // Looking along the border is paid for as points are, so references can't make the
+        // looking outgrow what the file's size allows.
+        if self.take(scan, notes) < scan {
+            return None;
+        }
         let border = self.borders.get(key)?;
         let part = match (before, after) {
             (Some(a), Some(b)) => {
@@ -1190,6 +1236,8 @@ struct Layer {
     /// Borders given by reference followed along a GeoBorder, and those with ends far from it.
     followed: usize,
     far: usize,
+    /// Route segments drawn between the points they name.
+    between: usize,
     /// Shapes in the records of features drawn from their own shapes, not drawn.
     shapes_in_records: usize,
     /// Features as a TEMPDELTA changed them.
@@ -1227,6 +1275,7 @@ impl Layer {
         self.referenced += n.referenced;
         self.followed += n.followed;
         self.far += n.far;
+        self.between += usize::from(n.between);
     }
 }
 
@@ -1701,6 +1750,8 @@ fn projection<'a, 'i>(v: Option<Node<'a, 'i>>) -> Option<Node<'a, 'i>> {
 /// What the read says of the file as a whole.
 #[derive(Default)]
 struct FileNotes {
+    /// Time positions left empty without saying they are unknown, read as open.
+    empty_dates: usize,
     /// Elements of members that aren't AIXM features.
     foreign: usize,
     /// Slices not read: wrapping or parsing them would pass the file's limits.
@@ -1817,6 +1868,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     }
     notes.unknown_interpretation = trouble.unknown;
     notes.bad_dates = trouble.dates;
+    notes.empty_dates = trouble.empty;
     // Second pass: each feature in force at the date, from its slices.
     // The nested paths of every row, each kept once.
     let paths: SharedPaths = SharedPaths::default();
@@ -1825,11 +1877,15 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     // Rows of features with nothing to draw, by kind, kept until it is known whether the kind has
     // a layer to hold them.
     let mut shapeless: Vec<(String, Row, usize, bool)> = Vec::new();
-    // GeoBorders first: airspace borders follow them by reference.
-    let (mut first, rest): (Vec<String>, Vec<String>) =
-        order.into_iter().partition(|id| features.get(id).is_some_and(|f| f.kind == "GeoBorder"));
-    first.extend(rest);
-    let order = first;
+    // GeoBorders first: airspace borders follow them by reference; route segments last: one with
+    // no curve is drawn between the points it names.
+    let rank = |id: &String| match features.get(id).map(|f| f.kind.as_str()) {
+        Some("GeoBorder") => 0,
+        Some("RouteSegment") => 2,
+        _ => 1,
+    };
+    let mut order = order;
+    order.sort_by_key(rank);
     crate::progress::begin(index.members.len() + order.len());
     crate::progress::step(index.members.len())?;
     for id in &order {
@@ -1927,6 +1983,12 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             }
             shapes.borders.insert(border_key(id), line);
         }
+        // Where a point feature is, for route segments that name it.
+        if let Some(g) = props.iter().find_map(|p| shape_in(*p).filter(|g| matches!(local(g), "Point" | "ElevatedPoint")))
+            && let Some(Geometry::Point(c)) = shapes.shape(g, &mut ShapeNotes::default())
+        {
+            shapes.points.insert(id.trim_start_matches("urn:uuid:").to_string(), c);
+        }
         let mut fnotes = ShapeNotes::default();
         let placed = match kind {
             "Airspace" => airspace(&props, &mut row, &mut shapes, &mut fnotes, &mut layers, kind, temporary, snapshot),
@@ -1959,6 +2021,20 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.assumed_system = shapes.assumed_system;
     let paths = std::mem::take(&mut *paths.borrow_mut());
     finish(&stem, at, layers, notes, &index, shapes.budget == 0, &paths)
+}
+
+/// A route segment's line from the points its `start` and `end` name (their `pointChoice_…`
+/// references): a geodesic between them, as AIXM's default path, when both are in the file.
+fn between(props: &[Node], shapes: &mut Shapes) -> Option<Vec<Coord>> {
+    let end = |name: &str| -> Option<Coord> {
+        let p = props.iter().find(|p| local(p) == name)?;
+        let r =
+            p.descendants().find(|d| d.is_element() && local(d).starts_with("pointChoice_") && d.attribute((XLINK, "href")).is_some())?;
+        shapes.points.get(&reference(r.attribute((XLINK, "href"))?)).copied()
+    };
+    let (a, b) = (end("start")?, end("end")?);
+    let mut notes = ShapeNotes::default();
+    Some(shapes.geodesic(&[a, b], &mut notes))
 }
 
 /// The family a shape element draws as, by its name (what a layer of its shapes is labeled).
@@ -2028,6 +2104,15 @@ fn feature_rows(
         if let Some(l) = layers.at(first) {
             l.shapes_in_records += in_records;
         }
+        return true;
+    }
+    // A route segment with no curve: a geodesic between the points its start and end name.
+    if parts.is_empty()
+        && kind == "RouteSegment"
+        && let Some(line) = between(props, shapes)
+    {
+        let notes = ShapeNotes { between: true, ..ShapeNotes::default() };
+        layers.push(kind, "curveExtent", Some(Geometry::Line(vec![line])), row.clone(), Some(&notes), change);
         return true;
     }
     if parts.is_empty() {
@@ -2272,6 +2357,13 @@ fn finish(
         "time slices",
         "with no interpretation RustGIS knows (BASELINE, PERMDELTA, TEMPDELTA, SNAPSHOT) not read",
     );
+    say(
+        &mut file,
+        notes.empty_dates,
+        "time position",
+        "time positions",
+        "left empty (not said to be unknown) read as open: no start or no end",
+    );
     say(&mut file, notes.bad_dates, "time slice", "time slices", "with a validTime or featureLifetime that isn't a date not read");
     say(
         &mut file,
@@ -2452,6 +2544,11 @@ fn finish(
             layer.referenced,
             "border is given by reference to a curve that isn't in the file (or not in force then), so it can't be followed",
             "borders are given by reference to curves that aren't in the file (or not in force then), so they can't be followed",
+        );
+        say(
+            layer.between,
+            "route segment with no curve is drawn as a geodesic between the points its start and end name",
+            "route segments with no curve are drawn as geodesics between the points their start and end name",
         );
         say(
             layer.followed,

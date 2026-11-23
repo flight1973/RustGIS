@@ -844,3 +844,58 @@ fn an_faa_subscriber_file_is_read_and_its_references_name_the_features() {
     // A subscriber file not of AIXM 5 isn't taken for one.
     assert!(!looks_like_aixm(file.replace("AIXM5.1\"", "AIXM4.5\"").as_bytes()));
 }
+
+#[test]
+fn many_references_to_a_long_border_stay_within_the_files_allowance() {
+    let line: String = (0..5000).map(|i| format!("50 {} ", 9.0 + f64::from(i) * 0.0005)).collect();
+    let border = format!(
+        r#"<aixm:name>LONG</aixm:name><aixm:border><aixm:Curve gml:id="B1" srsName="urn:ogc:def:crs:EPSG::4326"><gml:segments><gml:LineStringSegment><gml:posList>{line}</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></aixm:border>"#
+    );
+    let geo = feature("GeoBorder", "border-1", &[slice("GeoBorder", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &border)]);
+    let refs = r#"<gml:curveMember xlink:href="urn:uuid:border-1"/>"#.repeat(20_000);
+    let ring_xml = format!(
+        r#"<gml:Ring>{refs}<gml:curveMember><aixm:Curve gml:id="c"><gml:segments><gml:LineStringSegment><gml:posList>50 11 50.5 11 50.5 10 50 10</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></gml:curveMember></gml:Ring>"#
+    );
+    let body = format!(
+        r#"<aixm:name>MANY</aixm:name><aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior>{ring_xml}</gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#
+    );
+    let area = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+    let out = read("t.xml", &message(&(area + &geo)), &at("2026-01-15")).unwrap();
+    // 20,000 cuts of a 5,000-point border would be 100 million steps; the allowance stops them.
+    assert!(said(&out).iter().any(|m| m.contains("can't be followed")), "{:?}", said(&out));
+}
+
+#[test]
+fn faa_route_segments_are_drawn_between_their_points_in_nad83() {
+    let point = |id: &str, lat: f64, lon: f64| {
+        format!(
+            r#"<faa:Member><aixm:DesignatedPoint gml:id="{id}"><aixm:timeSlice><aixm:DesignatedPointTimeSlice gml:id="t{id}"><gml:validTime><gml:TimePeriod gml:id="p{id}"><gml:beginPosition>2026-10-29T00:00:00.000-04:00</gml:beginPosition><gml:endPosition/></gml:TimePeriod></gml:validTime><aixm:interpretation>BASELINE</aixm:interpretation><aixm:designator>{id}</aixm:designator><aixm:location><aixm:Point gml:id="g{id}" srsName="urn:ogc:def:crs:OGC:1.3:CRS83"><gml:pos>{lon} {lat}</gml:pos></aixm:Point></aixm:location></aixm:DesignatedPointTimeSlice></aixm:timeSlice></aixm:DesignatedPoint></faa:Member>"#
+        )
+    };
+    let xpath = |id: &str| format!("#/faa:SubscriberFile/faa:Member/aixm:DesignatedPoint%5B@gml:id='{id}'%5D");
+    let segment = format!(
+        r#"<faa:Member><aixm:RouteSegment gml:id="RS1"><aixm:timeSlice><aixm:RouteSegmentTimeSlice gml:id="tRS1"><gml:validTime><gml:TimePeriod gml:id="pRS1"><gml:beginPosition>2026-10-29T00:00:00.000-04:00</gml:beginPosition><gml:endPosition indeterminatePosition="unknown"/></gml:TimePeriod></gml:validTime><aixm:interpretation>BASELINE</aixm:interpretation><aixm:start><aixm:EnRouteSegmentPoint gml:id="s1"><aixm:pointChoice_fixDesignatedPoint xlink:href="{}"/></aixm:EnRouteSegmentPoint></aixm:start><aixm:end><aixm:EnRouteSegmentPoint gml:id="e1"><aixm:pointChoice_fixDesignatedPoint xlink:href="{}"/></aixm:EnRouteSegmentPoint></aixm:end></aixm:RouteSegmentTimeSlice></aixm:timeSlice></aixm:RouteSegment></faa:Member>"#,
+        xpath("A"),
+        xpath("B")
+    );
+    // The segment comes before the points it names.
+    let file = format!(
+        r#"<faa:SubscriberFile gml:id="S" AIXMVersion="AIXM5.1" xmlns:faa="http://www.faa.gov/aixm5.1" xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:aixm="http://www.aixm.aero/schema/5.1" xmlns:xlink="http://www.w3.org/1999/xlink">{segment}{}{}</faa:SubscriberFile>"#,
+        point("A", 32.0, -97.0),
+        point("B", 33.0, -96.0)
+    );
+    let out = read("AWY_AIXM.xml", file.as_bytes(), &at("2026-11-23")).unwrap();
+    let rs = layer(&out, "AWY_AIXM RouteSegment");
+    let Some(Geometry::Line(parts)) = &rs.features[0].geometry else { panic!("{:?}", rs.features[0].geometry) };
+    assert_eq!(parts[0].first(), Some(&Coord::new(-97.0, 32.0)));
+    assert_eq!(parts[0].last(), Some(&Coord::new(-96.0, 33.0)));
+    assert!(parts[0].len() > 10, "drawn along the geodesic");
+    let notes = said(&out);
+    for want in [
+        "1 route segment with no curve is drawn as a geodesic between the points its start and end name",
+        "read as WGS 84 longitude/latitude",
+        "2 time positions left empty (not said to be unknown) read as open",
+    ] {
+        assert!(notes.iter().any(|m| m.contains(want)), "{want}: {notes:?}");
+    }
+}
