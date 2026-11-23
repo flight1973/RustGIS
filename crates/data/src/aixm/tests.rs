@@ -586,3 +586,72 @@ fn a_ring_across_the_antimeridian_stays_continuous() {
     let ring = ring(ds.features[0].geometry.as_ref().unwrap());
     assert!(ring.windows(2).all(|w| (w[0].x - w[1].x).abs() < 3.0), "{ring:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// From /code-review.
+// ---------------------------------------------------------------------------------------------
+
+/// An airspace of one volume, its component written as `component` around the volume.
+fn one_volume(component: &str) -> Vec<u8> {
+    let volume = r#"<aixm:theAirspaceVolume><aixm:AirspaceVolume gml:id="v"><aixm:horizontalProjection><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>50 10 50 11 51 11 51 10 50 10</gml:posList></gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:horizontalProjection></aixm:AirspaceVolume></aixm:theAirspaceVolume>"#;
+    let body = format!("<aixm:name>ONE</aixm:name>{}", component.replace("VOLUME", volume));
+    message(&feature("Airspace", "one", &[slice("Airspace", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]))
+}
+
+#[test]
+fn a_lone_volume_with_no_operation_is_drawn() {
+    let bytes = one_volume(
+        r#"<aixm:geometryComponent><aixm:AirspaceGeometryComponent gml:id="c">VOLUME</aixm:AirspaceGeometryComponent></aixm:geometryComponent>"#,
+    );
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    assert!(layer(&out, "t Airspace").features[0].geometry.is_some());
+    assert!(said(&out).is_empty(), "{:?}", said(&out));
+}
+
+#[test]
+fn a_volume_given_by_reference_keeps_the_airspace_from_being_drawn_partly() {
+    let bytes = one_volume(
+        r#"<aixm:geometryComponent><aixm:AirspaceGeometryComponent gml:id="c"><aixm:operation>BASE</aixm:operation><aixm:operationSequence>1</aixm:operationSequence>VOLUME</aixm:AirspaceGeometryComponent></aixm:geometryComponent><aixm:geometryComponent xlink:href="urn:uuid:elsewhere"/>"#,
+    );
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    assert_eq!(layer(&out, "t Airspace").features[0].geometry, None);
+    assert!(said(&out).iter().any(|m| m.contains("a volume given by reference")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_border_given_by_reference_is_said_once() {
+    let body = r#"<aixm:name>REF</aixm:name><aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember xlink:href="urn:uuid:border"/></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#;
+    let bytes = message(&feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), body)]));
+    let notes = said(&read("t.xml", &bytes, &at("2026-01-15")).unwrap());
+    assert!(notes.iter().any(|m| m.contains("1 border is given by reference")), "{notes:?}");
+    assert!(!notes.iter().any(|m| m.contains("ring or surface patch was left out")), "{notes:?}");
+}
+
+#[test]
+fn a_part_with_no_shape_is_counted() {
+    let located = r#"<aixm:part><aixm:VerticalStructurePart gml:id="a"><aixm:designator>A</aixm:designator><aixm:horizontalProjection_location><aixm:ElevatedPoint srsName="urn:ogc:def:crs:EPSG::4326" gml:id="p"><gml:pos>47 -27</gml:pos></aixm:ElevatedPoint></aixm:horizontalProjection_location></aixm:VerticalStructurePart></aixm:part>"#;
+    let bare = r#"<aixm:part><aixm:VerticalStructurePart gml:id="b"><aixm:designator>B</aixm:designator></aixm:VerticalStructurePart></aixm:part>"#;
+    let body = format!("<aixm:name>VS</aixm:name>{located}{bare}");
+    let bytes = message(&feature(
+        "VerticalStructure",
+        "v",
+        &[slice("VerticalStructure", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)],
+    ));
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    assert_eq!(layer(&out, "t VerticalStructure").features.len(), 2);
+    assert!(said(&out).iter().any(|m| m.contains("1 feature has no geometry")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_layers_z_note_comes_first() {
+    let bytes = String::from_utf8(message(&point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "Z")])))
+        .unwrap()
+        .replace("<gml:pos>45.71 -35.17</gml:pos>", "<gml:pos>45.71 -35.17 12</gml:pos>")
+        + "";
+    let later = point("late", &[baseline(1, 0, "2030-01-01T00:00:00Z", None, "LATER")]);
+    let bytes = bytes.replacen("</message:AIXMBasicMessage>", &format!("{later}</message:AIXMBasicMessage>"), 1);
+    let out = read("t.xml", bytes.as_bytes(), &at("2026-01-15")).unwrap();
+    let first = &out[0].1.messages;
+    assert!(first.first().is_some_and(|m| m.text.contains("Z or M")), "{:?}", first.iter().map(|m| &m.text).collect::<Vec<_>>());
+    assert!(first.iter().any(|m| m.text.contains("not in force")));
+}

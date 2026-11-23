@@ -186,7 +186,7 @@ info.commands
 info.databaseTables database password?
 info.diagnostics
 info.fileColumns path delimiter? layer? crs?
-info.fileLayers path crs?
+info.fileLayers path crs? at?
 info.infographic layer?
 info.project nameFilter? includeFields?
 job.new name description? assigned? viewExtent?
@@ -212,17 +212,17 @@ labels.resetMoved layer? class? all?
 labels.scaleRange layer? class? min? max? clear?
 labels.style layer? class? size? color? halo? haloColor? haloWidth? spacing? stretch? bold? italic? font? background? wrapChar? wrapLength? lineAlign?
 labels.viewUnplaced on?
-layer.addData path name? layer? paperSpace? blocks? stream? as? crs? x? y? wkt? delimiter?
-layer.addDataBytes fileName data zoom? layer? name? x? y? wkt? crs? delimiter? paperSpace? blocks? stream? as?
-layer.addDataText fileName text name? x? y? wkt? crs? delimiter? layer? paperSpace? blocks?
+layer.addData path name? layer? paperSpace? blocks? stream? as? crs? x? y? wkt? delimiter? at?
+layer.addDataBytes fileName data zoom? layer? name? x? y? wkt? crs? delimiter? paperSpace? blocks? stream? as? at?
+layer.addDataText fileName text name? x? y? wkt? crs? delimiter? layer? paperSpace? blocks? at?
 layer.addDatabase database password? layer? crs? name? stream?
-layer.addDownload id url name? layer? zoom? x? y? wkt? crs? delimiter? paperSpace? blocks? stream? as? service? bounds? coverage? coverageCrs? drawingInfo? geolibreProject? geolibreLayer? geolibreZarr? connection? anonymous? request? window?
+layer.addDownload id url name? layer? zoom? x? y? wkt? crs? delimiter? paperSpace? blocks? stream? as? at? service? bounds? coverage? coverageCrs? drawingInfo? geolibreProject? geolibreLayer? geolibreZarr? connection? anonymous? request? window?
 layer.addEncodedPolyline polyline precision? name?
 layer.addLayerFile path? text? data?
 layer.addPhotos paths? folder? name?
 layer.addSample name
 layer.addSql sql name? database? password? crs? stream? ran?
-layer.addUrl url bytes? format? name? layer? zoom? x? y? wkt? crs? delimiter? paperSpace? blocks? stream? as? whole? cog? bbox? cellSize? cube? start? end? unit? interval? dates? connection? service? bounds? from? fromDocument? anonymous? coverage? coverageCrs? request?
+layer.addUrl url bytes? format? name? layer? zoom? x? y? wkt? crs? delimiter? paperSpace? blocks? stream? as? at? whole? cog? bbox? cellSize? cube? start? end? unit? interval? dates? connection? service? bounds? from? fromDocument? anonymous? coverage? coverageCrs? request?
 layer.addZarr path url variable? index? cells? bbox? crs? name? time? start? end? ran? summary?
 layer.aggregation layer? shape size?
 layer.blend layer? mode

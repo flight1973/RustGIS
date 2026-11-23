@@ -553,14 +553,18 @@ struct ShapeNotes {
 #[derive(Default)]
 struct Shapes {
     budget: usize,
-    /// A system other than longitude/latitude a geometry was in (not read).
+    /// A system other than longitude/latitude a geometry was in (not read), and how many were.
     other_system: Option<String>,
+    other_count: usize,
+    other_now: bool,
     /// Geometries with no `srsName`, read as `urn:ogc:def:crs:EPSG::4326`.
     assumed_system: usize,
     /// Whether the shape being read had one.
     assumed_now: bool,
-    /// A geographic system other than WGS 84 a geometry was read in as if it were.
+    /// A geographic system other than WGS 84 a geometry was read in as if it were, and how many.
     as_wgs84: Option<String>,
+    as_wgs84_count: usize,
+    as_wgs84_now: bool,
 }
 
 fn wrap180(d: f64) -> f64 {
@@ -613,11 +617,13 @@ impl Shapes {
             Some(c) if c.is_geographic() => {
                 if c.epsg() != 4326 {
                     self.as_wgs84.get_or_insert_with(|| name.to_string());
+                    self.as_wgs84_now = true;
                 }
                 Some(Axes { swap: crate::gml::lat_first(name, c) })
             }
             _ => {
                 self.other_system.get_or_insert_with(|| name.to_string());
+                self.other_now = true;
                 None
             }
         }
@@ -871,10 +877,10 @@ impl Shapes {
                 let mut out: Vec<Coord> = Vec::new();
                 for m in elements(r).filter(|c| local(c) == "curveMember") {
                     let Some(c) = elements(m).next() else {
-                        // Said as a border by reference, not also as a ring left out.
+                        // Said as a border by reference by the ring's patch, not also as a ring
+                        // left out.
                         if m.attribute((XLINK, "href")).is_some() {
                             notes.referenced += 1;
-                            notes.rings_lost = notes.rings_lost.saturating_sub(1);
                         }
                         return None;
                     };
@@ -909,16 +915,19 @@ impl Shapes {
         };
         let mut polys = Vec::new();
         for p in patches {
+            // A ring lost to a border by reference is said as that, once.
+            let before = notes.referenced;
             let outer = elements(p).find(|c| local(c) == "exterior").and_then(|b| self.ring(b, notes));
             let Some(outer) = outer else {
-                notes.rings_lost += 1;
+                notes.rings_lost += usize::from(notes.referenced == before);
                 continue;
             };
             let mut rings = vec![outer];
             for b in elements(p).filter(|c| local(c) == "interior") {
+                let before = notes.referenced;
                 match self.ring(b, notes) {
                     Some(r) => rings.push(r),
-                    None => notes.rings_lost += 1,
+                    None => notes.rings_lost += usize::from(notes.referenced == before),
                 }
             }
             polys.push(rings);
@@ -928,9 +937,11 @@ impl Shapes {
 
     /// A geometry element (AIXM's or GML's) as a geometry.
     fn shape(&mut self, g: Node, notes: &mut ShapeNotes) -> Option<Geometry> {
-        self.assumed_now = false;
+        (self.assumed_now, self.other_now, self.as_wgs84_now) = (false, false, false);
         let shape = self.read_shape(g, notes);
         self.assumed_system += usize::from(self.assumed_now);
+        self.other_count += usize::from(self.other_now);
+        self.as_wgs84_count += usize::from(self.as_wgs84_now);
         shape
     }
 
@@ -1359,9 +1370,9 @@ struct FileNotes {
     /// Features of kinds with nothing to draw, left out.
     nothing_to_draw: usize,
     nothing_names: Names,
-    other_system: Option<String>,
+    other_system: Option<(String, usize)>,
     assumed_system: usize,
-    as_wgs84: Option<String>,
+    as_wgs84: Option<(String, usize)>,
 }
 
 /// Reads an AIXM message into a layer per feature kind (and per geometry property, for kinds with
@@ -1577,8 +1588,8 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             notes.nothing_names.add(&kind);
         }
     }
-    notes.other_system = shapes.other_system.take();
-    notes.as_wgs84 = shapes.as_wgs84.take();
+    notes.other_system = shapes.other_system.take().map(|s| (s, shapes.other_count));
+    notes.as_wgs84 = shapes.as_wgs84.take().map(|s| (s, shapes.as_wgs84_count));
     notes.assumed_system = shapes.assumed_system;
     finish(&stem, at, layers, notes, &index, shapes.budget == 0)
 }
@@ -1668,7 +1679,14 @@ fn airspace(
             if is_nil(p) {
                 continue;
             }
-            let Some(c) = elements(*p).find(|c| local(c) == "AirspaceGeometryComponent") else { continue };
+            // A volume given by reference to another feature's isn't followed: the airspace isn't
+            // drawn from the rest as if it were whole.
+            let Some(c) = elements(*p).find(|c| local(c) == "AirspaceGeometryComponent") else {
+                if p.attribute((XLINK, "href")).is_some() {
+                    components.push((u64::MAX, "REFERENCE".to_string(), None));
+                }
+                continue;
+            };
             let op = child(c, "operation").map(|n| text_of(&n)).unwrap_or_default();
             let seq = child(c, "operationSequence").and_then(|n| text_of(&n).parse().ok()).unwrap_or(u64::MAX);
             let volume = child(c, "theAirspaceVolume").and_then(|v| child(v, "AirspaceVolume"));
@@ -1681,6 +1699,12 @@ fn airspace(
         return false;
     }
     components.sort_by_key(|(s, ..)| *s);
+    // One volume with no operation written is the airspace's own (the element is optional).
+    if let [(_, op, _)] = components.as_mut_slice()
+        && op.is_empty()
+    {
+        *op = "BASE".to_string();
+    }
     // The BASE volume's limits and width, as written.
     if let Some((_, _, Some(v))) = components.iter().find(|(_, op, _)| op == "BASE").or(components.first()) {
         for p in elements(*v).filter(|p| !matches!(local(p), "horizontalProjection" | "centreline" | "contributorAirspace")) {
@@ -1708,8 +1732,12 @@ fn airspace(
         if !drawable {
             l.derived += 1;
             for (_, op, v) in &components {
-                if v.is_some_and(|v| child(v, "contributorAirspace").is_some()) {
+                if op == "REFERENCE" {
+                    l.derived_names.add("a volume given by reference");
+                } else if v.is_some_and(|v| child(v, "contributorAirspace").is_some()) {
                     l.derived_names.add("contributorAirspace");
+                } else if op.is_empty() {
+                    l.derived_names.add("a volume with no operation");
                 } else if projection(*v).is_none() {
                     l.derived_names.add("a volume without horizontalProjection");
                 } else if !matches!(op.as_str(), "BASE" | "UNION") {
@@ -1787,9 +1815,11 @@ fn vertical_structure(
     for (k, (geom, r, notes, bad)) in rows.into_iter().enumerate() {
         let label = geom.as_ref().map_or(first, family);
         let change = if k == 0 { (temporary > 0, snapshot) } else { (false, false) };
+        let shapeless = geom.is_none() && !bad;
         let i = layers.push(kind, label, geom, r, Some(&notes), change);
         if let Some(l) = layers.at(i) {
             l.unreadable += usize::from(bad);
+            l.shapeless += usize::from(shapeless);
         }
     }
     true
@@ -1854,11 +1884,17 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
         file.messages.push(format!("the file stops being well-formed XML at byte {at}: features after it weren't read"));
     }
     say(&mut file, layers.over.len(), "feature", "features", &format!("of kinds past the first {MAX_LAYERS} left out"));
-    if let Some(s) = &notes.other_system {
-        file.messages.push(format!("geometry in '{s}', not longitude/latitude, wasn't read"));
+    if let Some((s, n)) = &notes.other_system {
+        say(&mut file, *n, "geometry", "geometries", &format!("in a system other than longitude/latitude ('{s}', or another) not read"));
     }
-    if let Some(s) = &notes.as_wgs84 {
-        file.messages.push(format!("geometry in '{s}' was read as WGS 84 longitude/latitude"));
+    if let Some((s, n)) = &notes.as_wgs84 {
+        say(
+            &mut file,
+            *n,
+            "geometry",
+            "geometries",
+            &format!("in a geographic system other than WGS 84 ('{s}', or another) read as WGS 84 longitude/latitude"),
+        );
     }
     say(
         &mut file,
@@ -1978,7 +2014,8 @@ fn finish(stem: &str, at: f64, layers: Layers, notes: FileNotes, index: &Index, 
         );
         if layer.zm > 0 {
             ds.zm_dropped = true;
-            rep.messages.push(format!("{name}: {}", crate::zm_note(Some(layer.zm as u64))));
+            // First, as every reader's: a layer picked from the file says it, the others don't.
+            rep.messages.insert(0, format!("{name}: {}", crate::zm_note(Some(layer.zm as u64))));
         }
         out.push((ds, rep));
     }

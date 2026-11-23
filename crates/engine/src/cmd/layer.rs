@@ -27,7 +27,7 @@ pub fn commands() -> Vec<C> {
         ),
         C::new("info.fileLayers", "List Layers in File", "Home › Add › Add Data", file_layers).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
-            .params(r#"{"path": string, "crs"?: "EPSG:… for a CityJSON model (.city.json, a .json, or in a zip) or a CityGML model (.gml, .xml, or in a zip): it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows (as layer.addData)"}"#),
+            .params(r#"{"path": string, "crs"?: "EPSG:… for a CityJSON model (.city.json, a .json, or in a zip) or a CityGML model (.gml, .xml, or in a zip): it replaces the system a model file names; in a zip, it is used for a model naming none RustGIS knows (as layer.addData)", "at"?: "an AIXM message's effective date: its layers then (as layer.addData)"}"#),
         C::new("info.fileColumns", "List Columns in File", "Home › Add › Add Data › Delimited Text", file_columns).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).view().params(
             r#"{"path": "a delimited text file (CSV, TSV, TXT, DAT, or gzip-compressed text) or a spreadsheet", "delimiter"?: ","|";"|"\\t"|"|", "layer"?: "a spreadsheet's sheet (the first by default)", "crs"?: "EPSG:… (or WKT), as layer.addData: a projected system keeps the columns found by name"}"#,
         ),
@@ -2317,7 +2317,15 @@ fn aixm_reads(p: &Value, file_name: &str, bytes: &[u8]) -> Result<Option<Vec<rus
         return Err(format!("\"crs\" doesn't apply to {file_name}: an AIXM message names its own system (srsName)"));
     }
     let reads = rustgis_data::aixm::read(file_name, bytes, &opts).map_err(|e| e.to_string())?;
-    Ok(Some(reads.into_iter().map(|(dataset, report)| rustgis_data::io::LayerRead { dataset, report, styles: Vec::new() }).collect()))
+    Ok(Some(
+        reads
+            .into_iter()
+            .map(|(mut dataset, report)| {
+                dataset.source.get_or_insert_with(|| file_name.to_string());
+                rustgis_data::io::LayerRead { dataset, report, styles: Vec::new() }
+            })
+            .collect(),
+    ))
 }
 
 /// The effective date `"at"` asks of an AIXM message, read as `aixm` says whether the file is
@@ -2899,6 +2907,10 @@ fn add_picked(
                 if r.dataset.zm_dropped && said.messages.first().is_some_and(|n| n.loss.is_none()) {
                     said.messages.drain(..1);
                 }
+                // Notes a reader writes about the layer itself (an AIXM message's, each named by
+                // it) stay with it too: only what the file as a whole says travels.
+                let own = format!("{}: ", r.dataset.name);
+                said.messages.retain(|n| !n.text.starts_with(&own));
                 (r.dataset.source.clone(), said)
             })
             .collect();
@@ -3218,6 +3230,11 @@ fn file_layers(s: &mut Session, p: &Value) -> CmdResult {
             return Err(rustgis_data::io::file_size_error(path, max));
         }
         let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
+        // An AIXM message's layers at the date asked, as Add Data would add them.
+        if let Some(reads) = aixm_reads(p, path, &bytes)? {
+            let layers: Vec<String> = reads.into_iter().map(|l| l.dataset.name).collect();
+            return Ok(json!({"count": layers.len(), "layers": layers}));
+        }
         let zip = path.to_ascii_lowercase().ends_with(".zip");
         let layers: Vec<String> = match crs.filter(|_| zip || rustgis_data::io::is_city_model(path, &bytes)) {
             Some(crs) => {
@@ -6942,7 +6959,7 @@ pub(crate) fn add_data_text_after(s: &mut Session, p: &Value, zoom: Option<bool>
         // An AIXM message: all its layers, at the date asked; an effective date given for any
         // other text is refused there.
         || rustgis_data::io::is_aixm(name, text.as_bytes())
-        || ps(p, "at").is_some_and(|t| !t.trim().is_empty())
+        || p.get("at").is_some_and(|v| v.as_str().map_or(!v.is_null(), |t| !t.trim().is_empty()))
         || (["crs", "layer"].iter().any(|k| ps(p, k).is_some_and(|c| !c.trim().is_empty()))
             && rustgis_data::io::is_cityjson(name, text.as_bytes()))
     {
