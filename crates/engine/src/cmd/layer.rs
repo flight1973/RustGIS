@@ -5913,6 +5913,8 @@ pub(crate) fn add_cog(s: &mut Session, p: &Value, url: &str, probed: bool) -> Cm
 /// [`add_cog`], a GeoTIFF that can't be read now added all the same (unless `strict`), showing
 /// why: a project being imported keeps its layers.
 pub(crate) fn add_cog_with(s: &mut Session, p: &Value, url: &str, strict: bool, probed: bool) -> CmdResult {
+    // An effective date is for an AIXM message: a GeoTIFF found at an address refuses it.
+    check_at(p, url, || false)?;
     let stem = cog_name(url);
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&stem);
     let empty_before = super::map_is_empty(s);

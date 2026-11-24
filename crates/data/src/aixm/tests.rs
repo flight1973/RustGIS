@@ -1502,3 +1502,147 @@ fn a_chain_of_arcs_across_180_degrees_stays_whole() {
     let line = shapes.arcs_through(&c, "ArcString", &mut notes);
     assert!(line.windows(2).all(|w| (w[1].x - w[0].x).abs() < 1.0), "{line:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// From the second review of PR #2819.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_snapshot_is_taken_as_it_is_without_changes_over_it() {
+    let temp = slice(
+        "DesignatedPoint",
+        "TEMPDELTA",
+        1,
+        0,
+        &period("2026-01-10T00:00:00Z", Some("2026-01-20T00:00:00Z")),
+        "<aixm:name>TEMP</aixm:name>",
+    );
+    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "SNAP"), temp]));
+    assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("SNAP".into())]);
+}
+
+#[test]
+fn a_correction_that_cant_be_read_withholds_its_feature() {
+    let unknown = slice("DesignatedPoint", "BASELINE", 1, 1, r#"<gml:validTime nilReason="unknown"/>"#, &named_point("CORRECTED"));
+    let bytes = message(
+        &(point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "OLD"), unknown])
+            + &point("b", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")])),
+    );
+    let (got, notes) = names(&bytes, "2026-01-15");
+    assert_eq!(got, [Value::Text("KEPT".into())]);
+    assert!(notes.iter().any(|m| m.contains("1 feature left out: the time slice that holds")), "{notes:?}");
+    // A clean file says nothing of it.
+    let notes = names(&message(&point("b", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")])), "2026-01-15").1;
+    assert!(!notes.iter().any(|m| m.contains("the time slice that holds")), "{notes:?}");
+}
+
+fn structure(parts: &str) -> Vec<u8> {
+    message(&feature(
+        "VerticalStructure",
+        "v",
+        &[slice(
+            "VerticalStructure",
+            "BASELINE",
+            1,
+            0,
+            &period("2025-01-01T00:00:00Z", None),
+            &format!("<aixm:name>MAST</aixm:name>{parts}"),
+        )],
+    ))
+}
+
+fn part(id: &str, shapes: &str) -> String {
+    format!(
+        r#"<aixm:part><aixm:VerticalStructurePart gml:id="{id}"><aixm:designator>{id}</aixm:designator>{shapes}</aixm:VerticalStructurePart></aixm:part>"#
+    )
+}
+
+const PART_POINT: &str = r#"<aixm:horizontalProjection_location><aixm:ElevatedPoint srsName="urn:ogc:def:crs:EPSG::4326" gml:id="p"><gml:pos>52 -32</gml:pos></aixm:ElevatedPoint></aixm:horizontalProjection_location>"#;
+
+#[test]
+fn listing_names_gives_what_a_read_gives_for_a_structure_with_a_part_that_cant_be_drawn() {
+    let bad_curve = r#"<aixm:horizontalProjection_linearExtent><aixm:ElevatedCurve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="c"><gml:segments><gml:LineStringSegment><gml:posList>52 -32</gml:posList></gml:LineStringSegment></gml:segments></aixm:ElevatedCurve></aixm:horizontalProjection_linearExtent>"#;
+    let good_curve = r#"<aixm:horizontalProjection_linearExtent><aixm:ElevatedCurve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="c"><gml:segments><gml:LineStringSegment><gml:posList>52 -32 52.1 -32</gml:posList></gml:LineStringSegment></gml:segments></aixm:ElevatedCurve></aixm:horizontalProjection_linearExtent>"#;
+    for bytes in [structure(&(part("A", PART_POINT) + &part("B", bad_curve))), structure(&(part("A", PART_POINT) + &part("B", good_curve)))]
+    {
+        let opts = at("2026-01-15");
+        let mut read_names: Vec<String> = read("t.xml", &bytes, &opts).unwrap().into_iter().map(|(d, _)| d.name).collect();
+        let mut listed = layer_names("t.xml", &bytes, &opts).unwrap();
+        read_names.sort();
+        listed.sort();
+        assert_eq!(listed, read_names);
+    }
+}
+
+#[test]
+fn a_structure_part_with_two_shapes_draws_the_first_and_says_so() {
+    let line = r#"<aixm:horizontalProjection_linearExtent><aixm:ElevatedCurve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="c"><gml:segments><gml:LineStringSegment><gml:posList>52 -32 52.1 -32</gml:posList></gml:LineStringSegment></gml:segments></aixm:ElevatedCurve></aixm:horizontalProjection_linearExtent>"#;
+    let out = read("t.xml", &structure(&part("A", &format!("{PART_POINT}{line}"))), &at("2026-01-15")).unwrap();
+    assert!(said(&out).iter().any(|m| m.contains("1 structure part holds more than one shape")), "{:?}", said(&out));
+    let out = read("t.xml", &structure(&part("A", PART_POINT)), &at("2026-01-15")).unwrap();
+    assert!(!said(&out).iter().any(|m| m.contains("more than one shape")), "{:?}", said(&out));
+}
+
+fn named_at(kind: &str, id: &str, lat: f64, lon: f64) -> String {
+    let body = format!(
+        r#"<aixm:name>{kind}</aixm:name><aixm:location><aixm:Point srsName="urn:ogc:def:crs:EPSG::4326" gml:id="g{kind}"><gml:pos>{lat} {lon}</gml:pos></aixm:Point></aixm:location>"#
+    );
+    feature(kind, id, &[slice(kind, "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])
+}
+
+fn route_to(choice: &str, start_id: &str) -> String {
+    let end = |name: &str, href: &str| {
+        format!(
+            r#"<aixm:{name}><aixm:EnRouteSegmentPoint gml:id="{name}"><aixm:{choice} xlink:href="urn:uuid:{href}"/></aixm:EnRouteSegmentPoint></aixm:{name}>"#
+        )
+    };
+    let body = format!("{}{}", end("start", start_id), end("end", "far"));
+    feature("RouteSegment", "rs", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])
+}
+
+#[test]
+fn a_route_end_is_the_point_of_the_kind_it_names() {
+    let members = named_at("DesignatedPoint", "same", 50.0, 10.0)
+        + &named_at("Navaid", "same", 55.0, 20.0)
+        + &named_at("DesignatedPoint", "far", 50.0, 12.0);
+    let out = read("t.xml", &message(&(members + &route_to("pointChoice_fixDesignatedPoint", "same"))), &at("2026-01-15")).unwrap();
+    let Some(Geometry::Line(l)) = &layer(&out, "t RouteSegment").features[0].geometry else { panic!("not drawn") };
+    assert_eq!(l[0].first(), Some(&Coord::new(10.0, 50.0)));
+}
+
+#[test]
+fn a_route_segment_whose_ends_arent_in_the_file_is_kept_and_said() {
+    let out = read("t.xml", &message(&route_to("pointChoice_fixDesignatedPoint", "missing")), &at("2026-01-15")).unwrap();
+    let rs = layer(&out, "t RouteSegment");
+    assert_eq!(rs.features.len(), 1);
+    assert_eq!(rs.features[0].geometry, None);
+    assert!(said(&out).iter().any(|m| m.contains("1 route segment is kept without a line")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_patch_left_out_says_nothing_of_how_it_was_drawn() {
+    let circle_with_hole = r#"<gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember><gml:Curve gml:id="k1"><gml:segments><gml:CircleByCenterPoint numArc="1"><gml:pos>50 10</gml:pos><gml:radius uom="km">10</gml:radius></gml:CircleByCenterPoint></gml:segments></gml:Curve></gml:curveMember></gml:Ring></gml:exterior><gml:interior><gml:Ring><gml:curveMember xlink:href="urn:uuid:missing"/></gml:Ring></gml:interior></gml:PolygonPatch>"#;
+    let square = r#"<gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>52 9 52 11 54 11 54 9 52 9</gml:posList></gml:LinearRing></gml:exterior></gml:PolygonPatch>"#;
+    let body = format!(
+        r#"<aixm:name>TWO</aixm:name><aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches>{circle_with_hole}{square}</gml:patches></aixm:Surface></aixm:extent>"#
+    );
+    let out = read(
+        "t.xml",
+        &message(&feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+        &at("2026-01-15"),
+    )
+    .unwrap();
+    assert!(layer(&out, "t WorkArea").features[0].geometry.is_some());
+    let notes = said(&out);
+    assert!(notes.iter().any(|m| m.contains("1 ring or surface patch was left out")), "{notes:?}");
+    assert!(!notes.iter().any(|m| m.contains("arcs or circles")), "{notes:?}");
+}
+
+#[test]
+fn a_long_edge_ending_near_180_degrees_is_near_a_point_across_it() {
+    let line = [Coord::new(0.0, 0.0), Coord::new(179.999755859375, 0.0)];
+    let (.., d) = nearest_on(&line, Coord::new(-180.0, 0.0)).unwrap();
+    assert!(d < 50.0, "{d}");
+    let (.., d) = nearest_on(&[Coord::new(179.0, 0.0), Coord::new(-179.0, 0.0)], Coord::new(0.0, 0.0)).unwrap();
+    assert!(d > 19_000_000.0, "{d}");
+}
