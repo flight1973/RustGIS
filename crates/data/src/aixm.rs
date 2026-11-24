@@ -383,8 +383,8 @@ struct Slice {
     canceled: bool,
     /// The feature's lifetime, when the slice says it.
     lifetime: Option<(Option<f64>, Option<f64>)>,
-    /// Its validity or lifetime isn't a date: it keeps its place among its corrections. A
-    /// BASELINE's that holds leaves the feature out; a change's is left out itself (counted).
+    /// Its validity or lifetime isn't a date: it keeps its place among its corrections, and
+    /// the feature is left out when it is the latest of them.
     unreadable: bool,
 }
 
@@ -410,7 +410,7 @@ enum State {
     OnlyChanges,
     /// Every slice canceled.
     Canceled,
-    /// The state's latest correction (or every slice) has a validity that isn't a date.
+    /// A slice that may hold (the latest correction) has a validity that isn't a date.
     Unreadable,
 }
 
@@ -441,15 +441,16 @@ fn state_at(slices: &[Slice], t: f64) -> State {
             }
         }
     }
-    // The state's latest correction isn't a date: what it is then can't be known.
-    if held.values().any(|s| s.unreadable && s.kind == Interpretation::Baseline) {
+    // A state or change whose latest correction isn't a date may hold at any date: what the
+    // feature is then can't be known, and showing it without that would be wrong.
+    if held.values().any(|s| s.unreadable) {
         return State::Unreadable;
     }
     let live: Vec<&Slice> = held.values().copied().chain(snapshots).filter(|s| !s.canceled && !s.unreadable).collect();
     if live.is_empty() {
         return if slices.is_empty() {
             State::OnlyChanges
-        } else if slices.iter().all(|s| s.unreadable) {
+        } else if slices.iter().any(|s| s.unreadable) {
             State::Unreadable
         } else {
             State::Canceled
@@ -492,10 +493,8 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     {
         return State::OutsideLifetime;
     }
-    // A SNAPSHOT already holds the changes in force at its instant: only those begun since go
-    // over it.
-    let since = |s: &Slice| !snapshot || s.begin.is_some_and(|b| base.begin.is_none_or(|bb| b > bb));
-    let mut temps: Vec<Slice> = of(Interpretation::TempDelta).filter(|s| in_force(s.begin, s.end, t) && since(s)).cloned().collect();
+    // Over a SNAPSHOT too: one it already holds is put back over any PERMDELTA since.
+    let mut temps: Vec<Slice> = of(Interpretation::TempDelta).filter(|s| in_force(s.begin, s.end, t)).cloned().collect();
     temps.sort_by(|a, b| a.begin.unwrap_or(f64::MIN).total_cmp(&b.begin.unwrap_or(f64::MIN)).then(a.sequence.cmp(&b.sequence)));
     let temporary = temps.len();
     changes.extend(temps);
@@ -2969,7 +2968,7 @@ fn finish(
         notes.unreadable_state,
         "feature",
         "features",
-        "left out: the time slice that holds its state (the latest correction) has a validity that isn't a date",
+        "left out: a time slice of it that may apply (the latest correction) has a validity that isn't a date",
     );
     say(&mut file, notes.no_slices, "feature", "features", "with no time slice RustGIS reads left out");
     say(
@@ -3237,8 +3236,8 @@ fn finish(
         );
         say(
             layer.route_unlocated,
-            "route segment is kept without a line: a point its start or end names isn't in the file",
-            "route segments are kept without a line: a point their start or end names isn't in the file",
+            "route segment is kept without a line: a point its start or end names isn't in the file, or has no position on the date asked",
+            "route segments are kept without a line: a point their start or end names isn't in the file, or has no position on the date asked",
         );
         say(
             layer.extra_shapes,
@@ -3267,8 +3266,8 @@ fn finish(
         );
         say(
             layer.snapshots,
-            "feature is a SNAPSHOT: its state at its own instant, which may not be its state on the date asked",
-            "features are SNAPSHOTs: their state at their own instant, which may not be their state on the date asked",
+            "feature is a SNAPSHOT: its state at its own instant, with any changes the file gives since, which may not be its state on the date asked",
+            "features are SNAPSHOTs: their state at their own instant, with any changes the file gives since, which may not be their state on the date asked",
         );
         say(
             layer.over_bytes,

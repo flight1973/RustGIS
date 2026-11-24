@@ -1508,29 +1508,43 @@ fn a_chain_of_arcs_across_180_degrees_stays_whole() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn a_snapshot_takes_only_the_changes_begun_since_its_instant() {
-    let temp = |begin: &str| {
-        slice("DesignatedPoint", "TEMPDELTA", 1, 0, &period(begin, Some("2026-01-20T00:00:00Z")), "<aixm:name>TEMP</aixm:name>")
-    };
-    // In force at the snapshot's instant: already in it.
-    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "SNAP"), temp("2025-12-20T00:00:00Z")]));
-    assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("SNAP".into())]);
-    // Begun since: over it.
-    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "SNAP"), temp("2026-01-10T00:00:00Z")]));
+fn a_snapshot_keeps_a_temporary_change_over_a_permanent_one_since() {
+    let temp = slice(
+        "DesignatedPoint",
+        "TEMPDELTA",
+        1,
+        0,
+        &period("2025-12-20T00:00:00Z", Some("2026-01-20T00:00:00Z")),
+        "<aixm:name>TEMP</aixm:name>",
+    );
+    let valid = r#"<gml:validTime><gml:TimeInstant gml:id="i"><gml:timePosition>2026-01-10T00:00:00Z</gml:timePosition></gml:TimeInstant></gml:validTime>"#;
+    let perm = slice("DesignatedPoint", "PERMDELTA", 2, 0, valid, "<aixm:name>PERM</aixm:name>");
+    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "TEMP"), temp, perm]));
     assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("TEMP".into())]);
+    let (got, notes) = names(&bytes, "2026-02-15");
+    assert_eq!(got, [Value::Text("PERM".into())]);
+    assert!(notes.iter().any(|m| m.contains("with any changes the file gives since")), "{notes:?}");
 }
 
 #[test]
-fn a_change_that_cant_be_read_is_left_out_and_a_snapshot_that_cant_is_unreadable() {
-    let bad_temp = slice("DesignatedPoint", "TEMPDELTA", 2, 0, r#"<gml:validTime nilReason="unknown"/>"#, "<aixm:name>TEMP</aixm:name>");
-    let (got, notes) = names(&message(&point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "BASE"), bad_temp])), "2026-01-15");
-    assert_eq!(got, [Value::Text("BASE".into())]);
-    assert!(notes.iter().any(|m| m.contains("1 time slice with a validTime or featureLifetime that isn't a date not read")), "{notes:?}");
-    let bad_snap = snapshot_at("not-a-date", "SNAP");
-    let bytes = message(&(point("s", &[bad_snap]) + &point("b", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")])));
-    let notes = names(&bytes, "2026-01-15").1;
-    assert!(notes.iter().any(|m| m.contains("1 feature left out: the time slice that holds its state")), "{notes:?}");
-    assert!(!notes.iter().any(|m| m.contains("canceled")), "{notes:?}");
+fn a_change_or_snapshot_that_cant_be_read_withholds_its_feature() {
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let temp = |corr, valid: &str| slice("DesignatedPoint", "TEMPDELTA", 2, corr, valid, "<aixm:name>TEMP</aixm:name>");
+    let unknown = r#"<gml:validTime nilReason="unknown"/>"#;
+    let base = baseline(1, 0, "2025-01-01T00:00:00Z", None, "BASE");
+    for slices in [
+        vec![base.clone(), temp(0, unknown)],
+        vec![base.clone(), temp(0, &period("2026-01-01T00:00:00Z", None)), temp(1, unknown)],
+        vec![snapshot_at("not-a-date", "SNAP")],
+    ] {
+        let (got, notes) = names(&message(&(point("a", &slices) + &kept)), "2026-01-15");
+        assert_eq!(got, [Value::Text("KEPT".into())]);
+        assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice of it that may apply")), "{notes:?}");
+        assert!(!notes.iter().any(|m| m.contains("canceled")), "{notes:?}");
+    }
+    // One superseded by a correction that can be read withholds nothing.
+    let (got, _) = names(&message(&point("a", &[base, temp(0, unknown), temp(1, &period("2026-01-01T00:00:00Z", None))])), "2026-01-15");
+    assert_eq!(got, [Value::Text("TEMP".into())]);
 }
 
 #[test]
@@ -1542,10 +1556,10 @@ fn a_correction_that_cant_be_read_withholds_its_feature() {
     );
     let (got, notes) = names(&bytes, "2026-01-15");
     assert_eq!(got, [Value::Text("KEPT".into())]);
-    assert!(notes.iter().any(|m| m.contains("1 feature left out: the time slice that holds")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice of it that may apply")), "{notes:?}");
     // A clean file says nothing of it.
     let notes = names(&message(&point("b", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")])), "2026-01-15").1;
-    assert!(!notes.iter().any(|m| m.contains("the time slice that holds")), "{notes:?}");
+    assert!(!notes.iter().any(|m| m.contains("a time slice of it that may apply")), "{notes:?}");
 }
 
 fn structure(parts: &str) -> Vec<u8> {

@@ -2353,7 +2353,7 @@ pub(crate) fn check_at(p: &Value, file_name: &str, aixm: impl FnOnce() -> bool) 
 /// own way of adding an address.
 pub fn check_url_at(p: &Value) -> Result<(), String> {
     let url = ps(p, "url").map(str::trim).unwrap_or("");
-    check_at(p, url, || address_extension(url).is_none_or(|e| e == "xml" || e == "gml")).map(|_| ())
+    check_at(p, "the file at that address", || address_extension(url).is_none_or(|e| e == "xml" || e == "gml")).map(|_| ())
 }
 
 /// Whether a file named `path` may be an AIXM message: by its first bytes on the desktop, by its
@@ -5055,7 +5055,7 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
     // An effective date is for an AIXM message only (`.xml`, `.gml`, or an address that doesn't
     // say, whose contents are checked once fetched): refused for any other address, before it is
     // opened in place or downloaded.
-    check_at(p, url, || address_extension(url).is_none_or(|e| e == "xml" || e == "gml"))?;
+    check_at(p, "the file at that address", || address_extension(url).is_none_or(|e| e == "xml" || e == "gml"))?;
     let out = add_url_as_given(s, p).map_err(|e| crate::sources::message_with_address(url, &e))?;
     s.check_continuation(&owner)?;
     Ok(out)
@@ -5913,9 +5913,9 @@ pub(crate) fn add_cog(s: &mut Session, p: &Value, url: &str, probed: bool) -> Cm
 /// [`add_cog`], a GeoTIFF that can't be read now added all the same (unless `strict`), showing
 /// why: a project being imported keeps its layers.
 pub(crate) fn add_cog_with(s: &mut Session, p: &Value, url: &str, strict: bool, probed: bool) -> CmdResult {
-    // An effective date is for an AIXM message: a GeoTIFF found at an address refuses it (named by
-    // its file name, so no key in the address is quoted).
-    check_at(p, &cog_name(url), || false)?;
+    // An effective date is for an AIXM message: a GeoTIFF found at an address refuses it (the
+    // address isn't quoted: it can hold a key).
+    check_at(p, "the file at that address", || false)?;
     let stem = cog_name(url);
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&stem);
     let empty_before = super::map_is_empty(s);
