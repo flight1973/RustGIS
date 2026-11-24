@@ -621,11 +621,13 @@ struct ShapeNotes {
     followed_whole: usize,
     /// A route segment drawn between the points it names, having no curve.
     between: bool,
-    /// An arc or circle not given the three positions it needs (fewer, or a circle given more):
-    /// drawn through the positions it has, or the first three.
+    /// An arc or circle not given the three positions it needs (fewer, or an Arc or Circle given
+    /// more): drawn through the positions it has, or the first three.
     short_arcs: bool,
     /// An arc or circle whose points are in a line, or past the largest radius: drawn straight.
     straight_arcs: bool,
+    /// An arc or circle with no positions: left out, the line joined straight across it.
+    empty_arcs: bool,
     /// A route segment with no curve and a `pathType` RustGIS doesn't draw.
     path_unread: bool,
     /// Borders by reference not followed: past the work allowed, or too short to cut.
@@ -691,6 +693,7 @@ impl ShapeNotes {
         self.between |= o.between;
         self.short_arcs |= o.short_arcs;
         self.straight_arcs |= o.straight_arcs;
+        self.empty_arcs |= o.empty_arcs;
         self.path_unread |= o.path_unread;
     }
 }
@@ -811,8 +814,17 @@ impl Shapes {
                 self.arc_by_center(s, axes, notes)
             }
             "Arc" | "ArcString" | "Circle" => {
+                let mut c = Self::positions(s, axes, notes)?;
+                if c.is_empty() {
+                    notes.empty_arcs = true;
+                    return Some(Vec::new());
+                }
                 notes.arcs = true;
-                let c = Self::positions(s, axes, notes)?;
+                // An Arc is one arc, through three positions: any more are said.
+                if local(&s) == "Arc" && c.len() > 3 {
+                    notes.short_arcs = true;
+                    c.truncate(3);
+                }
                 Some(self.arcs_through(&c, local(&s) == "Circle", notes))
             }
             other => {
@@ -887,12 +899,12 @@ impl Shapes {
         let need = (sweep_deg.abs() / step.max(1e-6)).ceil() as usize;
         notes.coarse |= need > MAX_ARC_POINTS;
         let want = need.clamp(4, MAX_ARC_POINTS);
-        // A full circle keeps at least 8 pieces past the allowance (said as coarse): each circle
-        // in the text is far longer than 8 points, so the extra stays bounded by the file's size.
+        // A full circle keeps at least 8 pieces (or what it needs, if fewer) when the allowance has
+        // run out, said as coarse: each circle in the text is far longer than 8 points, so the
+        // extra stays bounded by the file's size.
         let n = self.take(want - 1, notes) + 1;
         let floor = want.min(8);
         if sweep_deg.abs() >= 360.0 && n < floor {
-            self.budget = self.budget.saturating_sub(floor - n);
             return floor;
         }
         n
@@ -1296,7 +1308,12 @@ impl Shapes {
     /// A geometry element (AIXM's or GML's) as a geometry.
     fn shape(&mut self, g: Node, notes: &mut ShapeNotes) -> Option<Geometry> {
         (self.assumed_now, self.other_now, self.as_wgs84_now) = (false, false, false);
+        // A shape that gives nothing says nothing of how its arcs were drawn.
+        let arcs = (notes.arcs, notes.short_arcs, notes.empty_arcs, notes.straight_arcs);
         let shape = self.read_shape(g, notes);
+        if shape.is_none() {
+            (notes.arcs, notes.short_arcs, notes.empty_arcs, notes.straight_arcs) = arcs;
+        }
         self.assumed_system += usize::from(self.assumed_now);
         self.other_count += usize::from(self.other_now);
         self.as_wgs84_count += usize::from(self.as_wgs84_now);
@@ -1499,6 +1516,8 @@ struct Layer {
     short_arcs: usize,
     /// Features with an arc or circle drawn straight: its points in a line, or too far apart.
     straight_arcs: usize,
+    /// Features with an arc or circle with no positions, left out.
+    empty_arcs: usize,
     /// Route segments with no curve and a `pathType` RustGIS doesn't draw.
     path_unread: usize,
     /// Rows left out: the table they'd make passes the memory the file's size allows.
@@ -1552,6 +1571,7 @@ impl Layer {
         self.between += usize::from(n.between);
         self.short_arcs += usize::from(n.short_arcs);
         self.straight_arcs += usize::from(n.straight_arcs);
+        self.empty_arcs += usize::from(n.empty_arcs);
         self.path_unread += usize::from(n.path_unread);
         self.border_allowance += n.border_allowance;
         self.border_unusable += n.border_unusable;
@@ -2386,7 +2406,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         if !placed {
             // Held until it is known whether its kind has a layer, within an allowance of their
             // own: rows held and then let go can't crowd out rows that are drawn.
-            let w = row.weight();
+            let w = row.weight() + layers.feature.len();
             if w > held_left {
                 layers.rows_over += 1;
             } else {
@@ -3069,13 +3089,18 @@ fn finish(
         );
         say(
             layer.short_arcs,
-            "feature has an arc or circle not given the three positions it needs, drawn through the positions it has (a circle through its first three)",
-            "features have an arc or circle not given the three positions it needs, drawn through the positions they have (a circle through its first three)",
+            "feature has an arc or circle not given the three positions it needs, drawn through the positions it has (or its first three)",
+            "features have an arc or circle not given the three positions it needs, drawn through the positions they have (or their first three)",
         );
         say(
             layer.straight_arcs,
             "feature has an arc or circle drawn straight: its points are in a line, or too far apart to be one",
             "features have an arc or circle drawn straight: their points are in a line, or too far apart to be one",
+        );
+        say(
+            layer.empty_arcs,
+            "feature has an arc or circle with no positions, left out: its line is joined straight across it",
+            "features have an arc or circle with no positions, left out: their lines are joined straight across them",
         );
         say(
             layer.path_unread,

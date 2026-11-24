@@ -1364,7 +1364,7 @@ fn a_three_point_circle_past_the_allowance_keeps_eight_points_and_says_so() {
 }
 
 #[test]
-fn an_arc_with_too_few_positions_is_drawn_straight_and_said_and_none_is_unreadable() {
+fn an_arc_with_too_few_positions_is_drawn_through_them_and_an_empty_one_is_skipped_both_said() {
     let curve = |arc: &str| {
         format!(
             r#"<aixm:name>C</aixm:name><aixm:curveExtent><aixm:Curve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="k"><gml:segments><gml:LineStringSegment><gml:posList>50 10 50 11</gml:posList></gml:LineStringSegment><gml:Arc><gml:posList>{arc}</gml:posList></gml:Arc></gml:segments></aixm:Curve></aixm:curveExtent>"#
@@ -1385,7 +1385,27 @@ fn an_arc_with_too_few_positions_is_drawn_straight_and_said_and_none_is_unreadab
     assert!(!said(&out).iter().any(|m| m.contains("not given the three positions")), "{:?}", said(&out));
     let out = run("");
     assert!(layer(&out, "t RouteSegment").features[0].geometry.is_some());
-    assert!(said(&out).iter().any(|m| m.contains("1 feature has an arc or circle not given the three positions")), "{:?}", said(&out));
+    let notes = said(&out);
+    assert!(notes.iter().any(|m| m.contains("1 feature has an arc or circle with no positions, left out")), "{notes:?}");
+    assert!(!notes.iter().any(|m| m.contains("not given the three positions") || m.contains("drawn as points along them")), "{notes:?}");
+    // In a line straight (along a meridian), drawn straight and said; a real arc says nothing of it.
+    let out = run("50 11 50.5 11 51 11");
+    assert!(said(&out).iter().any(|m| m.contains("1 feature has an arc or circle drawn straight")), "{:?}", said(&out));
+    let out = run("50 11 50.5 11.5 51 11");
+    assert!(!said(&out).iter().any(|m| m.contains("drawn straight:")), "{:?}", said(&out));
+    // An Arc of five positions: through the first three, and said.
+    let out = run("50 11 50.5 11.5 51 11 51.5 10.5 52 11");
+    assert!(said(&out).iter().any(|m| m.contains("not given the three positions")), "{:?}", said(&out));
+}
+
+#[test]
+fn an_empty_arc_that_is_the_whole_line_says_nothing_of_arcs() {
+    let body = r#"<aixm:name>E</aixm:name><aixm:curveExtent><aixm:Curve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="k"><gml:segments><gml:Arc><gml:posList></gml:posList></gml:Arc></gml:segments></aixm:Curve></aixm:curveExtent>"#;
+    let bytes =
+        message(&feature("RouteSegment", "r", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), body)]));
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    assert_eq!(layer(&out, "t RouteSegment").features[0].geometry, None);
+    assert!(!said(&out).iter().any(|m| m.contains("arc")), "{:?}", said(&out));
 }
 
 #[test]
