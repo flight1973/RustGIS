@@ -1296,15 +1296,16 @@ fn an_unlocated_record_beside_located_ones_is_a_row_of_its_own() {
 }
 
 #[test]
-fn a_circle_past_the_point_allowance_isnt_drawn_and_says_so() {
+fn a_circle_past_the_point_allowance_keeps_eight_points_and_says_so() {
     let doc = format!(
         r#"<r {NS}><aixm:Curve gml:id="c" srsName="urn:ogc:def:crs:EPSG::4326"><gml:segments><gml:CircleByCenterPoint numArc="1"><gml:pos>50 10</gml:pos><gml:radius uom="km">10</gml:radius></gml:CircleByCenterPoint></gml:segments></aixm:Curve></r>"#
     );
     let doc = roxmltree::Document::parse(&doc).unwrap();
     let mut shapes = Shapes::default();
     let mut notes = ShapeNotes::default();
-    assert!(shapes.shape(doc.root_element().first_element_child().unwrap(), &mut notes).is_none());
-    assert_eq!(notes.past_allowance, 1);
+    let Some(Geometry::Line(l)) = shapes.shape(doc.root_element().first_element_child().unwrap(), &mut notes) else { panic!("not drawn") };
+    assert_eq!(l[0].len(), 9);
+    assert!(notes.coarse);
 }
 
 #[test]
@@ -1354,12 +1355,36 @@ fn a_rhumb_line_near_a_pole_ends_at_its_points() {
 }
 
 #[test]
-fn a_three_point_circle_past_the_allowance_isnt_drawn_and_says_so() {
+fn a_three_point_circle_past_the_allowance_keeps_eight_points_and_says_so() {
     let mut shapes = Shapes::default();
     let mut notes = ShapeNotes::default();
     let drawn = shapes.arcs_through(&[Coord::new(10.0, 50.0), Coord::new(10.1, 50.1), Coord::new(10.2, 50.0)], true, &mut notes);
-    assert!(drawn.is_empty());
-    assert_eq!(notes.past_allowance, 1);
+    assert_eq!(drawn.len(), 9);
+    assert!(notes.coarse);
+}
+
+#[test]
+fn an_arc_with_too_few_positions_is_drawn_straight_and_said_and_none_is_unreadable() {
+    let curve = |arc: &str| {
+        format!(
+            r#"<aixm:name>C</aixm:name><aixm:curveExtent><aixm:Curve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="k"><gml:segments><gml:LineStringSegment><gml:posList>50 10 50 11</gml:posList></gml:LineStringSegment><gml:Arc><gml:posList>{arc}</gml:posList></gml:Arc></gml:segments></aixm:Curve></aixm:curveExtent>"#
+        )
+    };
+    let run = |arc: &str| {
+        let bytes = message(&feature(
+            "RouteSegment",
+            "r",
+            &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &curve(arc))],
+        ));
+        read("t.xml", &bytes, &at("2026-01-15")).unwrap()
+    };
+    let out = run("50 11 51 11");
+    assert!(layer(&out, "t RouteSegment").features[0].geometry.is_some());
+    assert!(said(&out).iter().any(|m| m.contains("1 feature has an arc given fewer than the three positions")), "{:?}", said(&out));
+    let out = run("50 11 50.5 11.5 51 11");
+    assert!(!said(&out).iter().any(|m| m.contains("fewer than the three positions")), "{:?}", said(&out));
+    let out = run("");
+    assert_eq!(layer(&out, "t RouteSegment").features[0].geometry, None);
 }
 
 #[test]

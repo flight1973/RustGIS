@@ -621,9 +621,8 @@ struct ShapeNotes {
     followed_whole: usize,
     /// A route segment drawn between the points it names, having no curve.
     between: bool,
-    /// Arcs or circles not drawn: the file's point allowance ran out (a count, so each part read
-    /// can tell whether it was one of them).
-    past_allowance: usize,
+    /// An arc given fewer than the three positions it needs, drawn straight between them.
+    short_arcs: bool,
     /// A route segment with no curve and a `pathType` RustGIS doesn't draw.
     path_unread: bool,
     /// Borders by reference not followed: past the work allowed, or too short to cut.
@@ -687,7 +686,7 @@ impl ShapeNotes {
         self.border_allowance += o.border_allowance;
         self.border_unusable += o.border_unusable;
         self.between |= o.between;
-        self.past_allowance += o.past_allowance;
+        self.short_arcs |= o.short_arcs;
         self.path_unread |= o.path_unread;
     }
 }
@@ -810,9 +809,10 @@ impl Shapes {
             "Arc" | "ArcString" | "Circle" => {
                 notes.arcs = true;
                 let c = Self::positions(s, axes, notes)?;
-                let before = notes.past_allowance;
-                let drawn = self.arcs_through(&c, local(&s) == "Circle", notes);
-                (notes.past_allowance == before).then_some(drawn)
+                if c.is_empty() {
+                    return None;
+                }
+                Some(self.arcs_through(&c, local(&s) == "Circle", notes))
             }
             other => {
                 if !notes.unread_segments.iter().any(|n| n == other) {
@@ -886,7 +886,10 @@ impl Shapes {
         let need = (sweep_deg.abs() / step.max(1e-6)).ceil() as usize;
         notes.coarse |= need > MAX_ARC_POINTS;
         let want = need.clamp(4, MAX_ARC_POINTS);
-        self.take(want - 1, notes) + 1
+        // A full circle keeps at least 8 pieces past the allowance (said as coarse): each circle
+        // in the text is far longer than 8 points, so the extra stays bounded by the file's size.
+        let floor = if sweep_deg.abs() >= 360.0 { 8 } else { 1 };
+        (self.take(want - 1, notes) + 1).max(floor)
     }
 
     /// An `ArcByCenterPoint` or `CircleByCenterPoint`.
@@ -923,11 +926,6 @@ impl Shapes {
             _ => return None,
         };
         let n = self.pieces(radius, sweep, notes);
-        // A full circle in fewer than three pieces isn't one: not drawn, and said.
-        if sweep.abs() >= 360.0 && n < 3 {
-            notes.past_allowance += 1;
-            return None;
-        }
         let mut out = Vec::with_capacity(n + 1);
         for k in 0..=n {
             let (p, _) = rustgis_geom::wgs84_direct(center, bearing0 + sweep * k as f64 / n as f64, radius);
@@ -943,6 +941,7 @@ impl Shapes {
     /// starting at the last's end), or a full circle through three (`Circle`).
     fn arcs_through(&mut self, c: &[Coord], circle: bool, notes: &mut ShapeNotes) -> Vec<Coord> {
         if c.len() < 3 {
+            notes.short_arcs = true;
             return c.to_vec();
         }
         let mut out: Vec<Coord> = Vec::new();
@@ -995,11 +994,6 @@ impl Shapes {
             if ccw { s } else { s - tau }
         };
         let n = self.pieces(r, sweep.to_degrees(), notes);
-        // A full circle in fewer than three pieces isn't one: not drawn, and said.
-        if circle && n < 3 {
-            notes.past_allowance += 1;
-            return Vec::new();
-        }
         (0..=n)
             .map(|k| {
                 let t = a0 + sweep * k as f64 / n as f64;
@@ -1249,7 +1243,7 @@ impl Shapes {
         let mut polys = Vec::new();
         for p in patches {
             // A ring lost to a border by reference is said as that, once.
-            let said = |n: &ShapeNotes| n.referenced + n.border_allowance + n.border_unusable + n.past_allowance;
+            let said = |n: &ShapeNotes| n.referenced + n.border_allowance + n.border_unusable;
             let before = said(notes);
             let outer = elements(p).find(|c| local(c) == "exterior").and_then(|b| self.ring(b, notes));
             let Some(outer) = outer else {
@@ -1490,7 +1484,7 @@ struct Layer {
     /// Route segments drawn between the points they name.
     between: usize,
     /// Features with an arc or circle not drawn: the point allowance ran out.
-    past_allowance: usize,
+    short_arcs: usize,
     /// Route segments with no curve and a `pathType` RustGIS doesn't draw.
     path_unread: usize,
     /// Rows left out: the table they'd make passes the memory the file's size allows.
@@ -1542,7 +1536,7 @@ impl Layer {
         self.followed_whole += n.followed_whole;
         self.far += n.far;
         self.between += usize::from(n.between);
-        self.past_allowance += usize::from(n.past_allowance > 0);
+        self.short_arcs += usize::from(n.short_arcs);
         self.path_unread += usize::from(n.path_unread);
         self.border_allowance += n.border_allowance;
         self.border_unusable += n.border_unusable;
@@ -1879,6 +1873,8 @@ struct Layers {
     list: Vec<Layer>,
     /// Features of kinds past [`MAX_LAYERS`], by identifier.
     over: HashSet<String>,
+    /// The feature being read (its kind and identifier): what `over` counts.
+    feature: String,
     /// Only the layers' names are wanted: rows aren't kept.
     names_only: bool,
 }
@@ -1924,11 +1920,7 @@ impl Layers {
             return None;
         }
         let Some(i) = self.index_of(kind, label) else {
-            let next = self.over.len();
-            match row.attrs.get("identifier").filter(|i| !i.is_empty()) {
-                Some(id) => self.over.insert(format!("{kind}\u{1}{id}")),
-                None => self.over.insert(format!("{kind}\u{1}#{next}")),
-            };
+            self.over.insert(self.feature.clone());
             return None;
         };
         self.bytes_left -= cells;
@@ -2252,9 +2244,10 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     order.sort_by_key(rank);
     crate::progress::begin(index.members.len() + order.len());
     crate::progress::step(index.members.len())?;
-    for id in &order {
+    for key in &order {
         crate::progress::step(1)?;
-        let Some(feature) = features.get(id) else { continue };
+        let Some(feature) = features.get(key) else { continue };
+        layers.feature.clone_from(key);
         let id = &feature.id;
         if feature.slices.is_empty() {
             notes.no_slices += 1;
@@ -2530,7 +2523,6 @@ fn feature_rows(
         for (name, g) in shaped {
             let mut notes = ShapeNotes::default();
             let geom = shapes.shape(g, &mut notes);
-            let refused = notes.past_allowance > 0;
             let mut r = row.clone();
             r.shape_values(g, &name);
             // A kind's shapes under different properties are different layers (an airport's
@@ -2540,7 +2532,7 @@ fn feature_rows(
             let empty =
                 !g.descendants().any(|d| d.is_element() && is_gml(&d) && matches!(local(&d), "pos" | "posList") && !text_of(&d).is_empty());
             let empty = empty && geom.is_none();
-            let bad = geom.is_none() && !empty && !refused;
+            let bad = geom.is_none() && !empty;
             let i = layers.push(kind, &name, geom, r, Some(&notes), change);
             first = first.or(i);
             if let Some(l) = layers.at(i) {
@@ -2608,8 +2600,7 @@ fn feature_rows(
         // What the feature was is said once for it, with its first row.
         let change = if k == 0 { change } else { (false, false) };
         for (label, (gs, notes)) in by_family {
-            // Lost to the point allowance is said as that, not as unreadable.
-            let bad = gs.is_empty() && notes.past_allowance == 0;
+            let bad = gs.is_empty();
             let i = layers.push(kind, label, merged(gs), r.clone(), Some(&notes), change);
             if let Some(l) = layers.at(i) {
                 l.unreadable += usize::from(bad);
@@ -2677,15 +2668,12 @@ fn airspace(
     }
     let drawable = components.iter().all(|(_, op, v)| matches!(op.as_str(), "BASE" | "UNION") && projection(*v).is_some());
     let mut geom = None;
-    // A part not drawn: unreadable, or lost to the point allowance (said as that).
-    let (mut unreadable, mut refused) = (false, false);
+    let mut unreadable = false;
     if drawable {
         let mut parts = Vec::new();
         for (_, _, v) in &components {
-            let before = notes.past_allowance;
             match projection(*v).and_then(|g| shapes.shape(g, notes)) {
                 Some(g) => parts.push(g),
-                None if notes.past_allowance > before => refused = true,
                 None => unreadable = true,
             }
         }
@@ -2693,7 +2681,7 @@ fn airspace(
         if parts.first().is_some_and(|f| parts.iter().any(|g| family(g) != family(f))) {
             unreadable = true;
         }
-        if !unreadable && !refused {
+        if !unreadable {
             geom = merged(parts);
         }
     }
@@ -2716,8 +2704,6 @@ fn airspace(
             }
         } else if unreadable {
             l.unreadable += 1;
-        } else if refused {
-            // Said by the allowance's own notice.
         } else if components.len() > 1 {
             l.unions += 1;
         }
@@ -3066,9 +3052,9 @@ fn finish(
             "borders given by reference aren't followed: the GeoBorders they name have too few points to cut",
         );
         say(
-            layer.past_allowance,
-            "feature has an arc or circle that isn't drawn, nor the ring or patch it bounds: the file's point allowance ran out",
-            "features have an arc or circle that isn't drawn, nor the ring or patch it bounds: the file's point allowance ran out",
+            layer.short_arcs,
+            "feature has an arc given fewer than the three positions it needs, drawn straight between them",
+            "features have an arc given fewer than the three positions it needs, drawn straight between them",
         );
         say(
             layer.path_unread,
