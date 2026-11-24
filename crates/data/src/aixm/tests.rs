@@ -1163,7 +1163,7 @@ fn an_empty_valid_time_cancels_only_when_it_says_so() {
     let members = point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]) + &point("b", &[unknown]);
     let (got, notes) = names(&message(&members), "2026-01-15");
     assert_eq!(got, [Value::Text("KEPT".into())]);
-    assert!(notes.iter().any(|m| m.starts_with("1 time slice with a validTime or featureLifetime that isn't a date")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.starts_with("1 time slice with no validTime, or with one")), "{notes:?}");
     assert!(!notes.iter().any(|m| m.contains("canceled")), "{notes:?}");
 }
 
@@ -1507,38 +1507,96 @@ fn a_chain_of_arcs_across_180_degrees_stays_whole() {
 // From the second review of PR #2819.
 // ---------------------------------------------------------------------------------------------
 
-#[test]
-fn a_snapshot_keeps_a_temporary_change_over_a_permanent_one_since() {
-    let temp = slice(
-        "DesignatedPoint",
-        "TEMPDELTA",
-        1,
-        0,
-        &period("2025-12-20T00:00:00Z", Some("2026-01-20T00:00:00Z")),
-        "<aixm:name>TEMP</aixm:name>",
-    );
-    let valid = r#"<gml:validTime><gml:TimeInstant gml:id="i"><gml:timePosition>2026-01-10T00:00:00Z</gml:timePosition></gml:TimeInstant></gml:validTime>"#;
-    let perm = slice("DesignatedPoint", "PERMDELTA", 2, 0, valid, "<aixm:name>PERM</aixm:name>");
-    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "TEMP"), temp, perm]));
-    assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("TEMP".into())]);
-    let (got, notes) = names(&bytes, "2026-02-15");
-    assert_eq!(got, [Value::Text("PERM".into())]);
-    assert!(notes.iter().any(|m| m.contains("with the changes the file gives for the date asked")), "{notes:?}");
+fn change(kind: &str, seq: u32, valid: &str, body: &str) -> String {
+    slice("DesignatedPoint", kind, seq, 0, valid, body)
+}
+
+fn instant(date: &str) -> String {
+    format!(r#"<gml:validTime><gml:TimeInstant gml:id="i"><gml:timePosition>{date}</gml:timePosition></gml:TimeInstant></gml:validTime>"#)
 }
 
 #[test]
-fn a_temporary_change_begun_after_a_snapshot_goes_over_it() {
-    let temp = slice(
-        "DesignatedPoint",
-        "TEMPDELTA",
-        1,
-        0,
-        &period("2026-01-10T00:00:00Z", Some("2026-01-20T00:00:00Z")),
-        "<aixm:name>TEMP</aixm:name>",
+fn a_snapshot_is_shown_as_it_is_and_changes_since_are_said() {
+    let snap = snapshot_at("2026-01-01T00:00:00Z", "SNAP");
+    let temp = |from: &str| change("TEMPDELTA", 1, &period(from, Some("2026-01-20T00:00:00Z")), "<aixm:name>TEMP</aixm:name>");
+    let perm = change("PERMDELTA", 1, &instant("2026-01-10T00:00:00Z"), "<aixm:name>PERM</aixm:name>");
+    for (slices, said) in [
+        (vec![snap.clone()], false),
+        // In force at its instant: it holds it already.
+        (vec![snap.clone(), temp("2025-12-20T00:00:00Z")], false),
+        (vec![snap.clone(), temp("2026-01-10T00:00:00Z")], true),
+        (vec![snap.clone(), perm], true),
+    ] {
+        let (got, notes) = names(&message(&point("s", &slices)), "2026-01-15");
+        assert_eq!(got, [Value::Text("SNAP".into())]);
+        assert_eq!(notes.iter().any(|m| m.contains("1 feature shown as a SNAPSHOT without the changes")), said, "{notes:?}");
+    }
+    // Withdrawn since: not shown.
+    let end = r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>2020-01-01T00:00:00Z</gml:beginPosition><gml:endPosition>2026-01-10T00:00:00Z</gml:endPosition></gml:TimePeriod></aixm:featureLifetime>"#;
+    let bytes = message(&point("s", &[snap, change("PERMDELTA", 1, &instant("2026-01-10T00:00:00Z"), end)]));
+    assert!(read("t.xml", &bytes, &at("2026-01-15")).is_err());
+}
+
+#[test]
+fn a_slice_whose_period_isnt_said_withholds_its_feature_while_it_may_apply() {
+    let base = baseline(1, 0, "2025-01-01T00:00:00Z", None, "BASE");
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let temp = |valid: &str| change("TEMPDELTA", 1, valid, "<aixm:name>TEMP</aixm:name>");
+    let run = |t: String, date| names(&message(&(point("a", &[base.clone(), t]) + &kept)), date).0;
+    assert_eq!(run(temp(""), "2026-01-15"), [Value::Text("KEPT".into())]);
+    // An instant where a period is required: not before it, at least.
+    let t = temp(&instant("2026-01-01T00:00:00Z"));
+    assert_eq!(run(t.clone(), "2026-01-15"), [Value::Text("KEPT".into())]);
+    assert_eq!(run(t, "2025-12-15").len(), 2);
+    // A lifetime on a temporary change isn't used, read or not.
+    let lifetime = r#"<aixm:name>TEMP</aixm:name><aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>bad</gml:beginPosition><gml:endPosition/></gml:TimePeriod></aixm:featureLifetime>"#;
+    let t = change("TEMPDELTA", 1, &period("2026-01-01T00:00:00Z", None), lifetime);
+    assert!(run(t, "2026-01-15").contains(&Value::Text("TEMP".into())));
+}
+
+#[test]
+fn a_route_segment_is_never_drawn_as_a_point() {
+    let written = r#"<aixm:end><aixm:EnRouteSegmentPoint gml:id="e"><aixm:pointChoice_position><aixm:Point gml:id="ge" srsName="urn:ogc:def:crs:EPSG::4326"><gml:pos>50 10</gml:pos></aixm:Point></aixm:pointChoice_position></aixm:EnRouteSegmentPoint></aixm:end>"#;
+    let missing = r#"<aixm:start><aixm:EnRouteSegmentPoint gml:id="s"><aixm:pointChoice_fixDesignatedPoint xlink:href="urn:uuid:no"/></aixm:EnRouteSegmentPoint></aixm:start>"#;
+    let nil = r#"<aixm:start xsi:nil="true" nilReason="unknown"/>"#;
+    for (start, why) in [(missing, "names isn't in the file"), (nil, "start or end isn't given")] {
+        let body = format!("{start}{written}");
+        let seg = feature("RouteSegment", "rs", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+        let out = read("t.xml", &message(&seg), &at("2026-01-15")).unwrap();
+        assert_eq!(layer(&out, "t RouteSegment").features[0].geometry, None);
+        assert!(said(&out).iter().any(|m| m.contains(why)), "{:?}", said(&out));
+    }
+}
+
+#[test]
+fn a_shape_lost_beside_one_drawn_is_counted() {
+    let light = |pos: &str| {
+        format!(r#"<aixm:ElevatedPoint srsName="urn:ogc:def:crs:EPSG::4326" gml:id="p"><gml:pos>{pos}</gml:pos></aixm:ElevatedPoint>"#)
+    };
+    let run = |second: &str| {
+        let body = format!(
+            "<aixm:element><aixm:Group gml:id=\"g\"><aixm:a>{}</aixm:a><aixm:b>{}</aixm:b></aixm:Group></aixm:element>",
+            light("52 -32"),
+            light(second)
+        );
+        let f = feature("LightSystem", "l", &[slice("LightSystem", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+        said(&read("t.xml", &message(&f), &at("2026-01-15")).unwrap())
+    };
+    assert!(run("abc def").iter().any(|m| m.contains("1 shape couldn't be read and is left out")));
+    assert!(!run("52.1 -32").iter().any(|m| m.contains("left out")));
+    assert!(!run("").iter().any(|m| m.contains("left out")));
+}
+
+#[test]
+fn a_patch_lost_to_a_border_beside_one_drawn_is_counted() {
+    let lost = r#"<gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember xlink:href="urn:uuid:no"/></gml:Ring></gml:exterior></gml:PolygonPatch>"#;
+    let square = r#"<gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>52 9 52 11 54 11 54 9 52 9</gml:posList></gml:LinearRing></gml:exterior></gml:PolygonPatch>"#;
+    let body = format!(
+        r#"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches>{lost}{square}</gml:patches></aixm:Surface></aixm:extent>"#
     );
-    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "SNAP"), temp]));
-    assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("TEMP".into())]);
-    assert_eq!(names(&bytes, "2026-01-25").0, [Value::Text("SNAP".into())]);
+    let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+    let notes = said(&read("t.xml", &message(&f), &at("2026-01-15")).unwrap());
+    assert!(notes.iter().any(|m| m.contains("1 ring or surface patch was left out")), "{notes:?}");
 }
 
 #[test]
@@ -1563,7 +1621,10 @@ fn a_canceled_correction_of_one_that_cant_be_read_is_canceled() {
     let canceled = slice("DesignatedPoint", "BASELINE", 1, 1, r#"<gml:validTime nilReason="inapplicable"/>"#, "");
     let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
     let notes = names(&message(&(point("a", &[bad, canceled]) + &kept)), "2026-01-15").1;
-    assert!(notes.iter().any(|m| m.contains("canceled")) && !notes.iter().any(|m| m.contains("may apply")), "{notes:?}");
+    assert!(
+        notes.iter().any(|m| m.contains("canceled")) && !notes.iter().any(|m| m.contains("feature left out: a time slice")),
+        "{notes:?}"
+    );
 }
 
 #[test]
@@ -1700,7 +1761,7 @@ fn a_structure_part_is_drawn_from_its_first_shape_that_can_be() {
     let out = read("t.xml", &structure(&part("A", &format!("{bad_point}{line}"))), &at("2026-01-15")).unwrap();
     let vs = &out.iter().find(|(d, _)| d.name.starts_with("t VerticalStructure")).unwrap().0;
     assert!(matches!(vs.features[0].geometry, Some(Geometry::Line(_))));
-    assert!(said(&out).iter().any(|m| m.contains("more than one shape")), "{:?}", said(&out));
+    assert!(said(&out).iter().any(|m| m.contains("1 shape couldn't be read and is left out")), "{:?}", said(&out));
 }
 
 #[test]

@@ -10,7 +10,9 @@
 //! the date overlay it, each property they hold replacing all of that property's values (`nil`
 //! removing them). A validity period includes its start and excludes its end. Features not in force
 //! at the date, withdrawn before it (`featureLifetime`) or with only changes and no state are left
-//! out and counted.
+//! out and counted, as are those with a slice that may apply then whose validity can't be read. A
+//! feature with no BASELINE is shown as its nearest SNAPSHOT, without changes over it (it already
+//! holds those of its instant), and said.
 //!
 //! Geometry is the GML 3.2 the AIXM profile allows (OGC 12-028r1): points, curves of
 //! `GeodesicString`, `Geodesic`, `LineStringSegment`, `Arc`, `ArcString`, `Circle`,
@@ -400,8 +402,9 @@ struct Feature {
 
 /// What a feature is at the date.
 enum State {
-    /// Built from these slices: the state, then the changes over it in order.
-    Use { base: Slice, changes: Vec<Slice>, snapshot: bool, temporary: usize },
+    /// Built from these slices: the state, then the changes over it in order. `skipped`: a
+    /// SNAPSHOT the file gives changes since, not applied to it.
+    Use { base: Slice, changes: Vec<Slice>, snapshot: bool, temporary: usize, skipped: bool },
     /// Not in force at the date: its validity is all before or after it.
     NotInForce,
     /// Withdrawn by the date, or not yet created (`featureLifetime`).
@@ -444,50 +447,43 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     let (unread, live): (Vec<&Slice>, Vec<&Slice>) =
         held.values().copied().chain(snapshots).filter(|s| !s.canceled).partition(|s| s.unreadable);
     let unread_of = |k: Interpretation| unread.iter().copied().filter(move |s| s.kind == k);
+    let of = |k: Interpretation| live.iter().copied().filter(move |s| s.kind == k);
     if unread_of(Interpretation::Baseline).any(|s| in_force(s.begin, s.end, t)) {
         return State::Unreadable;
     }
-    if live.is_empty() {
-        let state = unread_of(Interpretation::Baseline).chain(unread_of(Interpretation::Snapshot)).next();
-        return match (state, unread.is_empty()) {
-            (Some(_), _) => State::Unreadable,
-            (None, false) => State::OnlyChanges,
-            _ if slices.is_empty() => State::OnlyChanges,
-            _ => State::Canceled,
-        };
-    }
-    let of = |k: Interpretation| live.iter().copied().filter(move |s| s.kind == k);
-    // The BASELINE in force; of several (which the concept doesn't allow), the latest started.
+    // The BASELINE in force; of several (which the concept doesn't allow, TS_009), the latest
+    // started, the later in the file on a tie (sequence numbers give no order, 3.6).
+    let started = |s: &Slice| s.begin.unwrap_or(f64::NEG_INFINITY);
     let base = of(Interpretation::Baseline)
         .filter(|s| in_force(s.begin, s.end, t))
-        .max_by(|a, b| a.begin.unwrap_or(f64::MIN).total_cmp(&b.begin.unwrap_or(f64::MIN)).then(a.sequence.cmp(&b.sequence)));
+        .max_by(|a, b| started(a).total_cmp(&started(b)).then(a.range.0.cmp(&b.range.0)));
     let (base, snapshot) = match base {
         Some(b) => (b, false),
+        None if of(Interpretation::Baseline).chain(unread_of(Interpretation::Baseline)).next().is_some() => return State::NotInForce,
+        // A snapshot that can't be placed may be the nearest.
+        None if unread_of(Interpretation::Snapshot).next().is_some() => return State::Unreadable,
         None => {
-            let baselines = of(Interpretation::Baseline).count();
             // A SNAPSHOT is a state at its own instant: the one nearest before the date, else the
             // earliest after it.
             let snap = of(Interpretation::Snapshot)
                 .filter(|s| s.begin.is_none_or(|b| b <= t))
-                .max_by(|a, b| a.begin.unwrap_or(f64::MIN).total_cmp(&b.begin.unwrap_or(f64::MIN)))
-                .or_else(|| {
-                    of(Interpretation::Snapshot).min_by(|a, b| a.begin.unwrap_or(f64::MAX).total_cmp(&b.begin.unwrap_or(f64::MAX)))
-                });
+                .max_by(|a, b| started(a).total_cmp(&started(b)))
+                .or_else(|| of(Interpretation::Snapshot).min_by(|a, b| started(a).total_cmp(&started(b))));
             match snap {
-                _ if baselines > 0 => return State::NotInForce,
-                // Another that can't be placed may be the nearer.
-                _ if unread_of(Interpretation::Snapshot).next().is_some() => return State::Unreadable,
                 Some(s) => (s, true),
+                None if live.is_empty() && unread.is_empty() && !slices.is_empty() => return State::Canceled,
                 None => return State::OnlyChanges,
             }
         }
     };
     // PERMDELTAs since the state began, up to the date, in order.
-    let mut changes: Vec<Slice> = of(Interpretation::PermDelta)
-        .filter(|s| s.begin.is_none_or(|b| b <= t) && s.begin.is_some_and(|b| base.begin.is_none_or(|bb| b > bb)))
-        .cloned()
-        .collect();
-    changes.sort_by(|a, b| a.begin.unwrap_or(f64::MIN).total_cmp(&b.begin.unwrap_or(f64::MIN)).then(a.sequence.cmp(&b.sequence)));
+    let since = |s: &Slice| s.begin.is_none_or(|b| b <= t && base.begin.is_none_or(|bb| b > bb));
+    if unread_of(Interpretation::PermDelta).any(since) {
+        return State::Unreadable;
+    }
+    let by_start = |a: &Slice, b: &Slice| started(a).total_cmp(&started(b)).then(a.range.0.cmp(&b.range.0));
+    let mut changes: Vec<Slice> = of(Interpretation::PermDelta).filter(|s| since(s)).cloned().collect();
+    changes.sort_by(by_start);
     // The feature's lifetime: the latest a slice in force says.
     let lifetime = changes.iter().rev().find_map(|s| s.lifetime).or(base.lifetime);
     if let Some((from, until)) = lifetime
@@ -495,17 +491,22 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     {
         return State::OutsideLifetime;
     }
-    let perm_may_apply = |s: &Slice| s.begin.is_none_or(|b| b <= t && base.begin.is_none_or(|bb| b > bb));
-    if unread_of(Interpretation::PermDelta).any(perm_may_apply) || unread_of(Interpretation::TempDelta).any(|s| in_force(s.begin, s.end, t))
-    {
+    let unread_temps = unread_of(Interpretation::TempDelta).filter(|s| in_force(s.begin, s.end, t)).count();
+    let mut temps: Vec<Slice> = of(Interpretation::TempDelta).filter(|s| in_force(s.begin, s.end, t)).cloned().collect();
+    if snapshot {
+        // A SNAPSHOT is a baseline and its temporary changes already merged (3.4), and changes are
+        // defined over a baseline: it is shown as it is, and changes it can't hold are said.
+        let begun_since = temps.iter().filter(|s| base.begin.is_none_or(|bb| s.begin.is_none_or(|b| b > bb))).count();
+        let skipped = !changes.is_empty() || begun_since > 0 || unread_temps > 0;
+        return State::Use { base: base.clone(), changes: Vec::new(), snapshot, temporary: 0, skipped };
+    }
+    if unread_temps > 0 {
         return State::Unreadable;
     }
-    // Over a SNAPSHOT too: one it already holds is put back over any PERMDELTA since.
-    let mut temps: Vec<Slice> = of(Interpretation::TempDelta).filter(|s| in_force(s.begin, s.end, t)).cloned().collect();
-    temps.sort_by(|a, b| a.begin.unwrap_or(f64::MIN).total_cmp(&b.begin.unwrap_or(f64::MIN)).then(a.sequence.cmp(&b.sequence)));
+    temps.sort_by(by_start);
     let temporary = temps.len();
     changes.extend(temps);
-    State::Use { base: base.clone(), changes, snapshot, temporary }
+    State::Use { base: base.clone(), changes, snapshot, temporary, skipped: false }
 }
 
 /// What the first pass found wrong with a slice.
@@ -545,6 +546,8 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
     let empty = std::cell::Cell::new(0);
     let (mut begin, mut end, mut canceled) = (None, None, false);
     let mut bad = false;
+    // One without a validTime (which every slice has, if only empty) could apply at any date.
+    bad |= child(s, "validTime").is_none();
     if let Some(v) = child(s, "validTime") {
         match elements(v).next() {
             Some(p) if local(&p) == "TimePeriod" => {
@@ -558,6 +561,8 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
                 });
             }
             Some(i) if local(&i) == "TimeInstant" => {
+                // A BASELINE and a TEMPDELTA have a period (TS_001, TS_003): until when isn't said.
+                bad |= matches!(kind, Interpretation::Baseline | Interpretation::TempDelta);
                 begin = position(child(i, "timePosition"), &empty).unwrap_or_else(|()| {
                     bad = true;
                     None
@@ -572,17 +577,21 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
             },
         }
     }
-    let lifetime = child(s, "featureLifetime").and_then(|l| elements(l).find(|p| local(p) == "TimePeriod")).map(|p| {
-        let from = position(child(p, "beginPosition"), &empty).unwrap_or_else(|()| {
-            bad = true;
-            None
+    // A TEMPDELTA has no lifetime (TS_016): one it gives isn't used.
+    let lifetime = child(s, "featureLifetime")
+        .filter(|_| kind != Interpretation::TempDelta)
+        .and_then(|l| elements(l).find(|p| local(p) == "TimePeriod"))
+        .map(|p| {
+            let from = position(child(p, "beginPosition"), &empty).unwrap_or_else(|()| {
+                bad = true;
+                None
+            });
+            let until = position(child(p, "endPosition"), &empty).unwrap_or_else(|()| {
+                bad = true;
+                None
+            });
+            (from, until)
         });
-        let until = position(child(p, "endPosition"), &empty).unwrap_or_else(|()| {
-            bad = true;
-            None
-        });
-        (from, until)
-    });
     let (sequence, correction) = (number("sequenceNumber"), number("correctionNumber"));
     if bad {
         trouble.dates += 1;
@@ -631,6 +640,10 @@ struct Axes {
 struct ShapeNotes {
     /// A route segment with no curve whose start or end names a point that isn't in the file.
     route_unlocated: bool,
+    /// A route segment with no curve and an end that isn't given or can't be read.
+    route_no_ends: bool,
+    /// Shapes that couldn't be read beside one of the same row that is drawn.
+    parts_lost: usize,
     /// A vertical structure part holding more than one shape: the first that can be is drawn.
     extra_shapes: bool,
     /// Features drawn with arcs or circles as points along them.
@@ -709,6 +722,8 @@ impl ShapeNotes {
         ShapeNotes {
             route_unlocated: self.route_unlocated,
             extra_shapes: self.extra_shapes,
+            route_no_ends: self.route_no_ends,
+            parts_lost: self.parts_lost,
             rings_lost: self.rings_lost,
             referenced: self.referenced,
             border_allowance: self.border_allowance,
@@ -722,6 +737,8 @@ impl ShapeNotes {
     fn absorb(&mut self, o: ShapeNotes) {
         self.route_unlocated |= o.route_unlocated;
         self.extra_shapes |= o.extra_shapes;
+        self.route_no_ends |= o.route_no_ends;
+        self.parts_lost += o.parts_lost;
         self.arcs |= o.arcs;
         self.coarse |= o.coarse;
         self.zm |= o.zm;
@@ -1317,14 +1334,18 @@ impl Shapes {
             g.descendants().filter(|d| d.is_element() && is_gml(d) && matches!(local(d), "PolygonPatch" | "Polygon")).collect()
         };
         let mut polys = Vec::new();
+        let mut lost_to_border = 0;
         for p in patches {
             // Each patch's notes its own: how it was drawn is said only when it is kept.
             let mut pn = ShapeNotes::default();
-            // A ring lost to a border by reference is said as that, once.
-            let said = |n: &ShapeNotes| n.referenced + n.border_allowance + n.border_unusable;
+            // A patch lost to a border by reference is said as that; beside one drawn, counted too.
             let outer = elements(p).find(|c| local(c) == "exterior").and_then(|b| self.ring(b, &mut pn));
             let Some(outer) = outer else {
-                pn.rings_lost += usize::from(said(&pn) == 0);
+                if pn.referenced + pn.border_allowance + pn.border_unusable == 0 {
+                    pn.rings_lost += 1;
+                } else {
+                    lost_to_border += 1;
+                }
                 notes.absorb(pn.losses_only());
                 continue;
             };
@@ -1347,7 +1368,11 @@ impl Shapes {
                 polys.push(rings);
             }
         }
-        (!polys.is_empty()).then_some(Geometry::Polygon(polys))
+        if polys.is_empty() {
+            return None;
+        }
+        notes.rings_lost += lost_to_border;
+        Some(Geometry::Polygon(polys))
     }
 
     /// A shape read without saying what it finds: one read again elsewhere (a border or point kept
@@ -1573,6 +1598,10 @@ struct Layer {
     unlocated: usize,
     /// Route segments whose start or end names a point not in the file: kept without a line.
     route_unlocated: usize,
+    /// Route segments with an end that isn't given or can't be read: kept without a line.
+    route_no_ends: usize,
+    /// Shapes that couldn't be read beside one of the same row that is drawn.
+    parts_lost: usize,
     /// Vertical structure parts holding more than one shape: the first that can be is drawn.
     extra_shapes: usize,
     /// Borders by reference followed whole.
@@ -1630,6 +1659,8 @@ impl Layer {
         self.path_unread += usize::from(n.path_unread);
         self.route_unlocated += usize::from(n.route_unlocated);
         self.extra_shapes += usize::from(n.extra_shapes);
+        self.route_no_ends += usize::from(n.route_no_ends);
+        self.parts_lost += n.parts_lost;
         self.border_allowance += n.border_allowance;
         self.border_unusable += n.border_unusable;
     }
@@ -2184,7 +2215,9 @@ struct FileNotes {
     not_in_force: usize,
     outside_lifetime: usize,
     no_state: usize,
-    /// Features whose slice that holds has a validity that isn't a date: left out.
+    /// Features shown as a SNAPSHOT that the file gives changes since, not applied.
+    snapshot_changes: usize,
+    /// Features with a slice that may apply whose validity isn't a date: left out.
     unreadable_state: usize,
     canceled: usize,
     unreadable_members: usize,
@@ -2347,7 +2380,10 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             continue;
         }
         let (base, changes, snapshot, temporary) = match state_at(&feature.slices, at) {
-            State::Use { base, changes, snapshot, temporary } => (base, changes, snapshot, temporary),
+            State::Use { base, changes, snapshot, temporary, skipped } => {
+                notes.snapshot_changes += usize::from(skipped);
+                (base, changes, snapshot, temporary)
+            }
             State::NotInForce => {
                 notes.not_in_force += 1;
                 continue;
@@ -2573,6 +2609,15 @@ fn named_point(shapes: &Shapes, choice: Node, href: &str) -> Option<Coord> {
     }
 }
 
+/// Whether a shape gives no positions: empty ones (as the FAA writes a position it doesn't have),
+/// and no border or point by reference.
+fn no_positions(g: Node) -> bool {
+    !g.descendants().any(|d| {
+        d.is_element()
+            && ((is_gml(&d) && matches!(local(&d), "pos" | "posList") && !text_of(&d).is_empty()) || d.attribute((XLINK, "href")).is_some())
+    })
+}
+
 /// Whether a route segment's start or end links to a point that isn't in the file.
 fn names_a_missing_point(props: &[Node], shapes: &Shapes) -> bool {
     props.iter().filter(|p| matches!(local(p), "start" | "end")).any(|p| {
@@ -2667,9 +2712,7 @@ fn feature_rows(
             // reference point and its boundary); a kind with one is one layer, titled by its kind.
             // A shape whose positions are all empty (`<gml:pos></gml:pos>`, as the FAA writes a
             // position it doesn't have) gives none: said as no geometry, not as unreadable.
-            let empty =
-                !g.descendants().any(|d| d.is_element() && is_gml(&d) && matches!(local(&d), "pos" | "posList") && !text_of(&d).is_empty());
-            let empty = empty && geom.is_none();
+            let empty = geom.is_none() && no_positions(g);
             let bad = geom.is_none() && !empty;
             let i = layers.push(kind, &name, geom, r, Some(&notes), change);
             first = first.or(i);
@@ -2695,13 +2738,30 @@ fn feature_rows(
         layers.push(kind, "curveExtent", line.map(Geometry::Line), row.clone(), Some(&notes), change);
         return true;
     }
-    if parts.is_empty() {
-        // A route segment naming ends that aren't in the file: in its layer without a line.
-        if kind == "RouteSegment" && names_a_missing_point(props, shapes) {
-            let notes = ShapeNotes { route_unlocated: true, ..ShapeNotes::default() };
-            layers.push(kind, "curveExtent", None, row.clone(), Some(&notes), change);
-            return true;
+    // One that can't be drawn between its ends is in its layer without a line, an end written in
+    // place kept as its values: it isn't a point.
+    if kind == "RouteSegment" {
+        let missing = names_a_missing_point(props, shapes);
+        let mut in_records = 0;
+        for p in parts.iter().chain(&unlocated) {
+            if matches!(local(p), "start" | "end") {
+                // Read for what it finds (its system): it isn't drawn.
+                for g in nested_shapes(*p) {
+                    let _ = shapes.shape(g, &mut ShapeNotes::default());
+                }
+            } else {
+                in_records += nested_shapes(*p).len();
+            }
+            row.property(*p, "");
         }
+        let notes = ShapeNotes { route_unlocated: missing, route_no_ends: !missing, ..ShapeNotes::default() };
+        let i = layers.push(kind, "curveExtent", None, row.clone(), Some(&notes), change);
+        if let Some(l) = layers.at(i) {
+            l.shapes_in_records += in_records;
+        }
+        return true;
+    }
+    if parts.is_empty() {
         return false;
     }
     // Rows copied for the records stay within what the file's size allows: checked before each
@@ -2737,17 +2797,24 @@ fn feature_rows(
         for g in nested_shapes(p) {
             let mut notes = ShapeNotes::default();
             let geom = shapes.shape(g, &mut notes);
+            notes.parts_lost += usize::from(geom.is_none() && !no_positions(g));
             let (gs, n) = by_family.entry(element_family(local(&g))).or_default();
             n.absorb(if geom.is_some() { notes } else { notes.losses_only() });
             gs.extend(geom);
         }
         // What the feature was is said once for it, with its first row.
         let change = if k == 0 { change } else { (false, false) };
-        for (label, (gs, notes)) in by_family {
-            let bad = gs.is_empty();
+        for (label, (gs, mut notes)) in by_family {
+            // None drawn: the row is said to be without a shape, not its shapes one by one.
+            let bad = gs.is_empty() && notes.parts_lost > 0;
+            let empty = gs.is_empty() && !bad;
+            if bad {
+                notes.parts_lost = 0;
+            }
             let i = layers.push(kind, label, merged(gs), r.clone(), Some(&notes), change);
             if let Some(l) = layers.at(i) {
                 l.unreadable += usize::from(bad);
+                l.shapeless += usize::from(empty);
             }
         }
     }
@@ -2894,25 +2961,27 @@ fn vertical_structure(
         let mut r = row.clone();
         let mut notes = ShapeNotes::default();
         let mut geom = None;
-        let (mut bad, mut seen) = (false, false);
+        let mut unreadable = 0;
         for p in elements(vp) {
             match shape_in(p) {
                 Some(g) if !is_nil(&p) => {
                     if geom.is_some() {
-                        notes.extra_shapes = true;
+                        notes.extra_shapes |= !no_positions(g);
                     } else {
                         let mut own = ShapeNotes::default();
                         geom = shapes.shape(g, &mut own);
-                        // One that can't be read beside one drawn: not drawn, and said.
-                        notes.extra_shapes |= seen && geom.is_some();
-                        seen = true;
-                        bad = geom.is_none();
-                        notes.absorb(if bad { own.losses_only() } else { own });
+                        unreadable += usize::from(geom.is_none() && !no_positions(g));
+                        notes.absorb(if geom.is_some() { own } else { own.losses_only() });
                     }
                     r.shape_values(g, &format!("part_{}", local(&p)));
                 }
                 _ => r.property(p, "part_"),
             }
+        }
+        // Beside one drawn, those that couldn't be read are counted one by one.
+        let bad = geom.is_none() && unreadable > 0;
+        if geom.is_some() {
+            notes.parts_lost += unreadable;
         }
         room = room.saturating_sub(r.weight());
         rows.push((geom, r, notes, bad));
@@ -2977,6 +3046,13 @@ fn finish(
         "features",
         "left out: a time slice of it that may apply (the latest correction) has a validity that isn't a date",
     );
+    say(
+        &mut file,
+        notes.snapshot_changes,
+        "feature",
+        "features",
+        "shown as a SNAPSHOT without the changes the file gives since its instant: changes apply to a BASELINE",
+    );
     say(&mut file, notes.no_slices, "feature", "features", "with no time slice RustGIS reads left out");
     say(
         &mut file,
@@ -3000,7 +3076,13 @@ fn finish(
         "features",
         "left out: a change to it in force then couldn't be read within the limits the file's size sets",
     );
-    say(&mut file, notes.bad_dates, "time slice", "time slices", "with a validTime or featureLifetime that isn't a date not read");
+    say(
+        &mut file,
+        notes.bad_dates,
+        "time slice",
+        "time slices",
+        "with no validTime, or with one or a featureLifetime that can't be read (a feature it may apply to is left out)",
+    );
     say(
         &mut file,
         notes.unreadable_members,
@@ -3247,6 +3329,16 @@ fn finish(
             "route segments are kept without a line: a point their start or end names isn't in the file, or has no position on the date asked",
         );
         say(
+            layer.route_no_ends,
+            "route segment is kept without a line: its start or end isn't given, or can't be read",
+            "route segments are kept without a line: their start or end isn't given, or can't be read",
+        );
+        say(
+            layer.parts_lost,
+            "shape couldn't be read and is left out: its row is drawn from its other shapes",
+            "shapes couldn't be read and are left out: their rows are drawn from their other shapes",
+        );
+        say(
             layer.extra_shapes,
             "structure part holds more than one shape: one is drawn (the first that can be), the others' values kept",
             "structure parts hold more than one shape: one is drawn (the first that can be), the others' values kept",
@@ -3273,8 +3365,8 @@ fn finish(
         );
         say(
             layer.snapshots,
-            "feature is a SNAPSHOT: its state at its own instant, with the changes the file gives for the date asked, which may not be its state on the date asked",
-            "features are SNAPSHOTs: their state at their own instant, with the changes the file gives for the date asked, which may not be their state on the date asked",
+            "feature is a SNAPSHOT: its state at its own instant, which may not be its state on the date asked",
+            "features are SNAPSHOTs: their state at their own instant, which may not be their state on the date asked",
         );
         say(
             layer.over_bytes,
