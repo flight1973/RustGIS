@@ -1392,10 +1392,34 @@ fn an_arc_with_too_few_positions_is_drawn_through_them_and_an_empty_one_is_skipp
     let out = run("50 11 50.5 11 51 11");
     assert!(said(&out).iter().any(|m| m.contains("1 feature has an arc or circle drawn straight")), "{:?}", said(&out));
     let out = run("50 11 50.5 11.5 51 11");
-    assert!(!said(&out).iter().any(|m| m.contains("drawn straight:")), "{:?}", said(&out));
-    // An Arc of five positions: through the first three, and said.
+    assert!(!said(&out).iter().any(|m| m.contains("drawn straight:") || m.contains("with no positions")), "{:?}", said(&out));
+    // An Arc of five positions: all of them drawn, as an ArcString would be, and said.
     let out = run("50 11 50.5 11.5 51 11 51.5 10.5 52 11");
     assert!(said(&out).iter().any(|m| m.contains("not given the three positions")), "{:?}", said(&out));
+    let Some(Geometry::Line(l)) = &layer(&out, "t RouteSegment").features[0].geometry else { panic!("not drawn") };
+    assert!(l[0].last().is_some_and(|c| (c.x - 11.0).abs() < 1e-9 && (c.y - 52.0).abs() < 1e-9), "{:?}", l[0].last());
+}
+
+#[test]
+fn an_airspace_not_drawn_says_nothing_of_how_its_parts_were_drawn() {
+    let volume = |op: &str, seq: u32, shape: &str| {
+        format!(
+            r#"<aixm:geometryComponent><aixm:AirspaceGeometryComponent gml:id="c{seq}"><aixm:operation>{op}</aixm:operation><aixm:operationSequence>{seq}</aixm:operationSequence><aixm:theAirspaceVolume><aixm:AirspaceVolume gml:id="v{seq}"><aixm:horizontalProjection>{shape}</aixm:horizontalProjection></aixm:AirspaceVolume></aixm:theAirspaceVolume></aixm:AirspaceGeometryComponent></aixm:geometryComponent>"#
+        )
+    };
+    let circle = r#"<aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s1"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember><gml:Curve gml:id="k1"><gml:segments><gml:CircleByCenterPoint numArc="1"><gml:pos>50 10</gml:pos><gml:radius uom="km">10</gml:radius></gml:CircleByCenterPoint></gml:segments></gml:Curve></gml:curveMember></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface>"#;
+    let bad = r#"<aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s2"><gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>not numbers</gml:posList></gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface>"#;
+    let body = format!("<aixm:name>HALF</aixm:name>{}{}", volume("BASE", 1, circle), volume("UNION", 2, bad));
+    let out = read(
+        "t.xml",
+        &message(&feature("Airspace", "a", &[slice("Airspace", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+        &at("2026-01-15"),
+    )
+    .unwrap();
+    assert_eq!(layer(&out, "t Airspace").features[0].geometry, None);
+    let notes = said(&out);
+    assert!(notes.iter().any(|m| m.contains("couldn't be read")), "{notes:?}");
+    assert!(!notes.iter().any(|m| m.contains("arcs or circles")), "{notes:?}");
 }
 
 #[test]

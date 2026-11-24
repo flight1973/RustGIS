@@ -622,11 +622,11 @@ struct ShapeNotes {
     /// A route segment drawn between the points it names, having no curve.
     between: bool,
     /// An arc or circle not given the three positions it needs (fewer, or an Arc or Circle given
-    /// more): drawn through the positions it has, or the first three.
+    /// more): drawn through the positions it has (a circle through its first three).
     short_arcs: bool,
     /// An arc or circle whose points are in a line, or past the largest radius: drawn straight.
     straight_arcs: bool,
-    /// An arc or circle with no positions: left out, the line joined straight across it.
+    /// An arc or circle with no positions: left out, the line going on without it.
     empty_arcs: bool,
     /// A route segment with no curve and a `pathType` RustGIS doesn't draw.
     path_unread: bool,
@@ -814,16 +814,16 @@ impl Shapes {
                 self.arc_by_center(s, axes, notes)
             }
             "Arc" | "ArcString" | "Circle" => {
-                let mut c = Self::positions(s, axes, notes)?;
+                let c = Self::positions(s, axes, notes)?;
                 if c.is_empty() {
                     notes.empty_arcs = true;
                     return Some(Vec::new());
                 }
                 notes.arcs = true;
-                // An Arc is one arc, through three positions: any more are said.
+                // An Arc is one arc, through three positions: any more are drawn as an ArcString
+                // would be, and said.
                 if local(&s) == "Arc" && c.len() > 3 {
                     notes.short_arcs = true;
-                    c.truncate(3);
                 }
                 Some(self.arcs_through(&c, local(&s) == "Circle", notes))
             }
@@ -1308,12 +1308,7 @@ impl Shapes {
     /// A geometry element (AIXM's or GML's) as a geometry.
     fn shape(&mut self, g: Node, notes: &mut ShapeNotes) -> Option<Geometry> {
         (self.assumed_now, self.other_now, self.as_wgs84_now) = (false, false, false);
-        // A shape that gives nothing says nothing of how its arcs were drawn.
-        let arcs = (notes.arcs, notes.short_arcs, notes.empty_arcs, notes.straight_arcs);
         let shape = self.read_shape(g, notes);
-        if shape.is_none() {
-            (notes.arcs, notes.short_arcs, notes.empty_arcs, notes.straight_arcs) = arcs;
-        }
         self.assumed_system += usize::from(self.assumed_now);
         self.other_count += usize::from(self.other_now);
         self.as_wgs84_count += usize::from(self.as_wgs84_now);
@@ -1553,25 +1548,29 @@ impl Layer {
         Some(self.columns.len() - 1)
     }
 
-    fn take_notes(&mut self, n: &ShapeNotes) {
-        self.arcs += usize::from(n.arcs);
-        self.coarse += usize::from(n.coarse);
-        self.zm += usize::from(n.zm);
-        if !n.unread_segments.is_empty() {
-            self.approximated += 1;
-            for s in &n.unread_segments {
-                self.unread_segments.add(s);
+    /// The notes of a row's shapes. How a shape was drawn is said only for a row that is drawn;
+    /// why something wasn't is said either way.
+    fn take_notes(&mut self, n: &ShapeNotes, drawn: bool) {
+        if drawn {
+            self.arcs += usize::from(n.arcs);
+            self.coarse += usize::from(n.coarse);
+            self.zm += usize::from(n.zm);
+            if !n.unread_segments.is_empty() {
+                self.approximated += 1;
+                for s in &n.unread_segments {
+                    self.unread_segments.add(s);
+                }
             }
+            self.followed += n.followed;
+            self.followed_whole += n.followed_whole;
+            self.far += n.far;
+            self.between += usize::from(n.between);
+            self.short_arcs += usize::from(n.short_arcs);
+            self.straight_arcs += usize::from(n.straight_arcs);
+            self.empty_arcs += usize::from(n.empty_arcs);
         }
         self.rings_lost += n.rings_lost;
         self.referenced += n.referenced;
-        self.followed += n.followed;
-        self.followed_whole += n.followed_whole;
-        self.far += n.far;
-        self.between += usize::from(n.between);
-        self.short_arcs += usize::from(n.short_arcs);
-        self.straight_arcs += usize::from(n.straight_arcs);
-        self.empty_arcs += usize::from(n.empty_arcs);
         self.path_unread += usize::from(n.path_unread);
         self.border_allowance += n.border_allowance;
         self.border_unusable += n.border_unusable;
@@ -1973,7 +1972,7 @@ impl Layers {
             }
         }
         if let Some(n) = notes {
-            layer.take_notes(n);
+            layer.take_notes(n, geometry.is_some());
         }
         if self.names_only {
             return Some(i);
@@ -2406,7 +2405,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         if !placed {
             // Held until it is known whether its kind has a layer, within an allowance of their
             // own: rows held and then let go can't crowd out rows that are drawn.
-            let w = row.weight() + layers.feature.len();
+            let w = row.weight() + layers.feature.len() + kind.len();
             if w > held_left {
                 layers.rows_over += 1;
             } else {
@@ -3089,8 +3088,8 @@ fn finish(
         );
         say(
             layer.short_arcs,
-            "feature has an arc or circle not given the three positions it needs, drawn through the positions it has (or its first three)",
-            "features have an arc or circle not given the three positions it needs, drawn through the positions they have (or their first three)",
+            "feature has an arc or circle not given the three positions it needs, drawn through the positions it has (a circle through its first three)",
+            "features have an arc or circle not given the three positions it needs, drawn through the positions they have (a circle through its first three)",
         );
         say(
             layer.straight_arcs,
@@ -3099,8 +3098,8 @@ fn finish(
         );
         say(
             layer.empty_arcs,
-            "feature has an arc or circle with no positions, left out: its line is joined straight across it",
-            "features have an arc or circle with no positions, left out: their lines are joined straight across them",
+            "feature has an arc or circle with no positions, left out: its line goes on without it",
+            "features have an arc or circle with no positions, left out: their lines go on without them",
         );
         say(
             layer.path_unread,
