@@ -626,7 +626,7 @@ struct ShapeNotes {
     short_arcs: bool,
     /// An arc or circle whose points are in a line, or past the largest radius: drawn straight.
     straight_arcs: bool,
-    /// An arc or circle with no positions: left out, the line going on without it.
+    /// An arc or circle with no positions: left out, the line going on from the positions around it.
     empty_arcs: bool,
     /// A route segment with no curve and a `pathType` RustGIS doesn't draw.
     path_unread: bool,
@@ -3115,8 +3115,8 @@ fn finish(
         );
         say(
             layer.empty_arcs,
-            "feature has an arc or circle with no positions, left out: its line is joined straight from the positions either side",
-            "features have an arc or circle with no positions, left out: their lines are joined straight from the positions either side",
+            "feature has an arc or circle with no positions, left out: its line goes on from the positions around it",
+            "features have an arc or circle with no positions, left out: their lines go on from the positions around them",
         );
         say(
             layer.path_unread,
