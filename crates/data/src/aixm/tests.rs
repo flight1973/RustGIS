@@ -6,7 +6,7 @@ use super::*;
 const DONLON: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/donlon-aixm.xml"));
 
 fn at(date: &str) -> Options {
-    Options { at: crate::time::parse_text(date) }
+    Options { at: crate::time::parse_text(date), ..Options::default() }
 }
 
 fn layer<'a>(out: &'a [(Dataset, ReadReport)], name: &str) -> &'a Dataset {
@@ -895,7 +895,7 @@ fn faa_route_segments_are_drawn_between_their_points_in_nad83() {
     assert!(parts[0].len() > 10, "drawn along the geodesic");
     let notes = said(&out);
     for want in [
-        "1 route segment with no curve is drawn as a geodesic between the points its start and end name",
+        "1 route segment with no curve is drawn between the points its start and end name",
         "2 geometries in a geographic system other than WGS 84",
         "2 time positions left empty (not said to be unknown) read as open",
     ] {
@@ -1134,4 +1134,211 @@ fn a_ring_whose_borders_cant_be_joined_within_the_allowance_isnt_drawn_and_says_
     let mut notes = ShapeNotes::default();
     assert!(shapes.surface(surface.root_element(), &mut notes).is_none());
     assert_eq!((notes.followed, notes.border_allowance, notes.rings_lost), (0, 1, 0));
+}
+
+// ---------------------------------------------------------------------------------------------
+// From the review of PR #2819.
+// ---------------------------------------------------------------------------------------------
+
+fn snapshot_at(date: &str, name: &str) -> String {
+    let valid = format!(
+        r#"<gml:validTime><gml:TimeInstant gml:id="i"><gml:timePosition>{date}</gml:timePosition></gml:TimeInstant></gml:validTime>"#
+    );
+    format!(
+        r#"<aixm:timeSlice><aixm:DesignatedPointTimeSlice gml:id="s">{valid}<aixm:interpretation>SNAPSHOT</aixm:interpretation>{}</aixm:DesignatedPointTimeSlice></aixm:timeSlice>"#,
+        named_point(name)
+    )
+}
+
+#[test]
+fn snapshots_at_different_instants_are_all_kept() {
+    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "JANUARY"), snapshot_at("2026-02-01T00:00:00Z", "FEBRUARY")]));
+    assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("JANUARY".into())]);
+    assert_eq!(names(&bytes, "2026-02-15").0, [Value::Text("FEBRUARY".into())]);
+}
+
+#[test]
+fn an_empty_valid_time_cancels_only_when_it_says_so() {
+    let unknown = slice("DesignatedPoint", "BASELINE", 1, 1, r#"<gml:validTime nilReason="unknown"/>"#, &named_point("UNKNOWN"));
+    let members = point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]) + &point("b", &[unknown]);
+    let (got, notes) = names(&message(&members), "2026-01-15");
+    assert_eq!(got, [Value::Text("KEPT".into())]);
+    assert!(notes.iter().any(|m| m.starts_with("1 time slice with a validTime or featureLifetime that isn't a date")), "{notes:?}");
+    assert!(!notes.iter().any(|m| m.contains("canceled")), "{notes:?}");
+}
+
+#[test]
+fn a_sequence_number_that_isnt_one_is_said() {
+    let s = baseline(1, 0, "2025-01-01T00:00:00Z", None, "A")
+        .replace("<aixm:sequenceNumber>1</aixm:sequenceNumber>", "<aixm:sequenceNumber>one</aixm:sequenceNumber>");
+    let notes = names(&message(&point("a", &[s])), "2026-01-15").1;
+    assert!(
+        notes.iter().any(|m| m.starts_with("1 time slice with a sequence or correction number that isn't a number read as 0")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn features_of_two_kinds_sharing_an_identifier_are_both_read() {
+    let navaid =
+        feature("Navaid", "same", &[slice("Navaid", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &named_point("NAV"))]);
+    let out =
+        read("t.xml", &message(&(point("same", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "POINT")]) + &navaid)), &at("2026-01-15"))
+            .unwrap();
+    assert_eq!(layer(&out, "t DesignatedPoint").features.len(), 1);
+    assert_eq!(layer(&out, "t Navaid").features.len(), 1);
+}
+
+#[test]
+fn a_permdelta_changes_an_open_baseline_from_its_instant() {
+    let valid = r#"<gml:validTime><gml:TimeInstant gml:id="i"><gml:timePosition>2026-02-01T00:00:00Z</gml:timePosition></gml:TimeInstant></gml:validTime>"#;
+    let perm = slice("DesignatedPoint", "PERMDELTA", 2, 0, valid, "<aixm:name>RENAMED</aixm:name>");
+    let bytes = message(&point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "ORIGINAL"), perm]));
+    assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("ORIGINAL".into())]);
+    let out = read("t.xml", &bytes, &at("2026-02-01")).unwrap();
+    let ds = layer(&out, "t DesignatedPoint");
+    assert_eq!(value(ds, 0, "name"), Value::Text("RENAMED".into()));
+    assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(-35.17, 45.71))));
+}
+
+#[test]
+fn an_airspace_hole_that_cant_be_read_leaves_the_airspace_undrawn() {
+    let body = r#"<aixm:name>HOLED</aixm:name><aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>50 9 50 11 52 11 52 9 50 9</gml:posList></gml:LinearRing></gml:exterior><gml:interior><gml:Ring><gml:curveMember xlink:href="urn:uuid:missing"/></gml:Ring></gml:interior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#;
+    let bytes = message(&feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), body)]));
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    assert_eq!(layer(&out, "t WorkArea").features[0].geometry, None);
+    assert!(said(&out).iter().any(|m| m.contains("1 border is given by reference")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_border_segment_across_180_degrees_stays_whole() {
+    // An edge from 179 E to 179 W, and a point at Greenwich: nowhere near it.
+    let line = [Coord::new(179.0, 0.0), Coord::new(-179.0, 0.0)];
+    let (.., d) = nearest_on(&line, Coord::new(0.0, 0.0)).unwrap();
+    assert!(d > 19_000_000.0, "{d}");
+    // And a point on it is on it.
+    let (.., d) = nearest_on(&line, Coord::new(180.0, 0.0)).unwrap();
+    assert!(d < 1.0, "{d}");
+}
+
+#[test]
+fn a_tempdelta_replaces_extensions_within_their_namespace() {
+    let ext = |ns: &str, value: &str| {
+        format!(r#"<aixm:extension><x:Ext xmlns:x="urn:{ns}" gml:id="e{ns}"><x:v>{value}</x:v></x:Ext></aixm:extension>"#)
+    };
+    let base = slice(
+        "DesignatedPoint",
+        "BASELINE",
+        1,
+        0,
+        &period("2025-01-01T00:00:00Z", None),
+        &(named_point("P") + &ext("a", "A1") + &ext("b", "B1")),
+    );
+    let temp = slice("DesignatedPoint", "TEMPDELTA", 1, 0, &period("2026-01-01T00:00:00Z", None), &ext("a", "A2"));
+    let out = read("t.xml", &message(&point("p", &[base, temp])), &at("2026-01-15")).unwrap();
+    let ds = layer(&out, "t DesignatedPoint");
+    let all: Vec<String> =
+        (0..ds.fields.len()).filter(|&k| ds.fields[k].name.starts_with("extension")).map(|k| ds.features[0].attrs[k].to_string()).collect();
+    assert!(
+        all.iter().any(|v| v.contains("A2")) && all.iter().any(|v| v.contains("B1")) && !all.iter().any(|v| v.contains("A1")),
+        "{all:?}"
+    );
+}
+
+#[test]
+fn a_route_segment_follows_its_path_type() {
+    let end = |name: &str, lat: f64, lon: f64| {
+        format!(
+            r#"<aixm:{name}><aixm:EnRouteSegmentPoint gml:id="{name}"><aixm:pointChoice_position><aixm:Point gml:id="g{name}" srsName="urn:ogc:def:crs:EPSG::4326"><gml:pos>{lat} {lon}</gml:pos></aixm:Point></aixm:pointChoice_position></aixm:EnRouteSegmentPoint></aixm:{name}>"#
+        )
+    };
+    let segment = |path: &str| {
+        let body = format!("<aixm:pathType>{path}</aixm:pathType>{}{}", end("start", 60.0, 0.0), end("end", 60.0, 40.0));
+        message(&feature("RouteSegment", "rs", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]))
+    };
+    let line = |path: &str| {
+        let out = read("t.xml", &segment(path), &at("2026-01-15")).unwrap();
+        layer(&out, "t RouteSegment").features[0].geometry.clone()
+    };
+    // A rhumb line along 60 N stays on it; a geodesic between the same points bows north.
+    let Some(Geometry::Line(rhl)) = line("RHL") else { panic!() };
+    assert!(rhl[0].iter().all(|c| (c.y - 60.0).abs() < 1e-9));
+    let Some(Geometry::Line(gds)) = line("GDS") else { panic!() };
+    assert!(gds[0].iter().any(|c| c.y > 61.0));
+    // A path type RustGIS doesn't draw: kept without a shape, and said.
+    let out = read("t.xml", &segment("OTHER"), &at("2026-01-15")).unwrap();
+    assert_eq!(layer(&out, "t RouteSegment").features[0].geometry, None);
+    assert!(said(&out).iter().any(|m| m.contains("1 route segment with no curve isn't drawn: its pathType")), "{:?}", said(&out));
+}
+
+#[test]
+fn an_unlocated_record_beside_located_ones_is_a_row_of_its_own() {
+    let light = |color: &str, at: &str| {
+        format!(
+            r#"<aixm:element><aixm:GroundLightingElement gml:id="e{color}"><aixm:colour>{color}</aixm:colour>{at}</aixm:GroundLightingElement></aixm:element>"#
+        )
+    };
+    let located = r#"<aixm:location><aixm:ElevatedPoint srsName="urn:ogc:def:crs:EPSG::4326" gml:id="p"><gml:pos>52 -32</gml:pos></aixm:ElevatedPoint></aixm:location>"#;
+    let body = light("RED", "") + &light("GREEN", located);
+    let bytes = message(&feature(
+        "RunwayDirectionLightSystem",
+        "l",
+        &[slice("RunwayDirectionLightSystem", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)],
+    ));
+    let out = read("t.xml", &bytes, &at("2026-01-15")).unwrap();
+    let ds = layer(&out, "t RunwayDirectionLightSystem");
+    assert_eq!(ds.features.len(), 2);
+    let green = row_where(ds, "element_colour", "GREEN");
+    assert!(ds.features[green].geometry.is_some());
+    let red = row_where(ds, "element_colour", "RED");
+    assert_eq!(ds.features[red].geometry, None);
+    assert!(said(&out).iter().any(|m| m.contains("1 record with no shape")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_circle_past_the_point_allowance_isnt_drawn_and_says_so() {
+    let doc = format!(
+        r#"<r {NS}><aixm:Curve gml:id="c" srsName="urn:ogc:def:crs:EPSG::4326"><gml:segments><gml:CircleByCenterPoint numArc="1"><gml:pos>50 10</gml:pos><gml:radius uom="km">10</gml:radius></gml:CircleByCenterPoint></gml:segments></aixm:Curve></r>"#
+    );
+    let doc = roxmltree::Document::parse(&doc).unwrap();
+    let mut shapes = Shapes::default();
+    let mut notes = ShapeNotes::default();
+    assert!(shapes.shape(doc.root_element().first_element_child().unwrap(), &mut notes).is_none());
+    assert!(notes.past_allowance);
+}
+
+#[test]
+fn an_airspace_of_a_surface_and_a_line_isnt_merged() {
+    let volume = |op: &str, seq: u32, shape: &str| {
+        format!(
+            r#"<aixm:geometryComponent><aixm:AirspaceGeometryComponent gml:id="c"><aixm:operation>{op}</aixm:operation><aixm:operationSequence>{seq}</aixm:operationSequence><aixm:theAirspaceVolume><aixm:AirspaceVolume gml:id="v"><aixm:horizontalProjection>{shape}</aixm:horizontalProjection></aixm:AirspaceVolume></aixm:theAirspaceVolume></aixm:AirspaceGeometryComponent></aixm:geometryComponent>"#
+        )
+    };
+    let surface = r#"<aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>50 10 50 11 51 11 51 10 50 10</gml:posList></gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface>"#;
+    let curve = r#"<aixm:Curve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="k"><gml:segments><gml:LineStringSegment><gml:posList>52 10 52 11</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve>"#;
+    let body = format!("<aixm:name>MIXED</aixm:name>{}{}", volume("BASE", 1, surface), volume("UNION", 2, curve));
+    let out = read(
+        "t.xml",
+        &message(&feature("Airspace", "a", &[slice("Airspace", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+        &at("2026-01-15"),
+    )
+    .unwrap();
+    assert_eq!(layer(&out, "t Airspace").features[0].geometry, None);
+    assert!(said(&out).iter().any(|m| m.contains("couldn't be read")), "{:?}", said(&out));
+}
+
+#[test]
+fn an_effective_date_with_an_offset_past_a_day_is_refused() {
+    assert!(Options::at_text("2026-01-15T12:00+99:99").is_err());
+    assert!(Options::at_text("2026-01-15T12:00+05:30").is_ok());
+}
+
+#[test]
+fn layer_names_match_the_layers_read() {
+    let opts = at("2026-01-15");
+    let mut read_names: Vec<String> = read("donlon-aixm.xml", DONLON, &opts).unwrap().into_iter().map(|(d, _)| d.name).collect();
+    let mut listed = layer_names("donlon-aixm.xml", DONLON, &opts).unwrap();
+    read_names.sort();
+    listed.sort();
+    assert_eq!(listed, read_names);
 }

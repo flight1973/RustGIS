@@ -6052,6 +6052,11 @@ impl RustGisApp {
                     q[k] = v.clone();
                 }
             }
+            // An effective date given as anything but text is passed on, for the command to refuse
+            // rather than the import to go on without it.
+            if let Some(v) = p.get("at").filter(|v| !v.is_null() && !v.is_string()) {
+                q["at"] = v.clone();
+            }
             // A PDF's page may be given as a number too (#2336): any other value is passed on as
             // given, for `layer.addDownload` to refuse rather than open the first page.
             if let Some(v) = p.get("layer").filter(|v| !v.is_null() && !v.is_string()) {

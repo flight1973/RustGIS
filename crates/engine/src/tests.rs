@@ -24168,6 +24168,17 @@ fn aixm_messages_are_added_at_the_date_asked() {
     s.notices.clear();
     s.run("layer.addData", &json!({"path": picked.display().to_string(), "layer": "picked Runway", "at": "2026-01-15"})).unwrap();
     assert!(s.notices.iter().any(|n| n.text.contains("1 feature not in force")), "{:?}", s.notices);
+    // Listed by name at the date asked, as Add Data would add them; "at" refused for any other file
+    // listed, and for an address that can't be a message, before it is opened.
+    let listed = s.run("info.fileLayers", &json!({"path": path.display().to_string(), "at": "2026-01-15"})).unwrap();
+    let names: Vec<&str> = listed["layers"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+    assert!(names.contains(&"donlon Airspace") && names.contains(&"donlon Runway"), "{names:?}");
+    let csv = dir.join("points.csv");
+    std::fs::write(&csv, "x,y\n1,2\n").unwrap();
+    let e = s.run("info.fileLayers", &json!({"path": csv.display().to_string(), "at": "2026-01-15"})).unwrap_err();
+    assert!(e.contains("isn't one"), "{e}");
+    let e = s.run("layer.addUrl", &json!({"url": "https://example.com/roads.fgb", "at": "2026-01-15"})).unwrap_err();
+    assert!(e.contains("isn't one"), "{e}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

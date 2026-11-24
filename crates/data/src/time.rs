@@ -287,6 +287,10 @@ pub fn parse_text(s: &str) -> Option<f64> {
             let sign = if zone.starts_with('-') { -1 } else { 1 };
             let z = zone.get(1..)?.replace(':', "");
             let (hh, mm) = (digits(z.get(..2)?, 2, 2)?, z.get(2..).filter(|r| !r.is_empty()).map(|r| digits(r, 2, 2)).unwrap_or(Some(0))?);
+            // An offset is at most 23:59 (real ones are within ±14:00): `+99:99` isn't one.
+            if hh > 23 || mm > 59 {
+                return None;
+            }
             offset_min = sign * (hh * 60 + mm);
         }
     }

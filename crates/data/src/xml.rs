@@ -362,18 +362,27 @@ mod tests {
         assert!(crate::georss::read("a.rss", &flood("rss")).is_err_and(|e| said(e.to_string())));
         assert!(crate::landxml::read("a.xml", &flood("LandXML"), None).is_err_and(|e| said(e.to_string())));
         assert!(crate::ogc::parse("https://x.example/wms", &flood("WMS_Capabilities")).is_err_and(|e| said(e.to_string())));
-        // AIXM parses its members one at a time: each past the budget is counted, and with none
-        // read, nothing is added.
-        let aixm = format!(
-            "<?xml version=\"1.0\"?><m:AIXMBasicMessage xmlns:m=\"http://www.aixm.aero/schema/5.1.1/message\"{}>{}</m:AIXMBasicMessage>",
-            declarations(20_000),
-            "<m:hasMember><x/></m:hasMember>".repeat(50)
-        );
-        let opts = crate::aixm::Options { at: Some(0.0) };
-        assert!(
-            crate::aixm::read("a.xml", aixm.as_bytes(), &opts)
-                .is_err_and(|e| e.to_string().contains("couldn't be read") || e.to_string().contains("limits"))
-        );
+        // AIXM parses its members one at a time: members that would be read are refused for their
+        // namespace work (counted as members that couldn't be read), not for running out of room
+        // to wrap them (which is said otherwise), and with none read, nothing is added.
+        let aixm = |declared: usize| {
+            format!(
+                "<?xml version=\"1.0\"?><m:AIXMBasicMessage xmlns:m=\"http://www.aixm.aero/schema/5.1.1/message\"{}>{}</m:AIXMBasicMessage>",
+                declarations(declared),
+                aixm_point("").repeat(5)
+            )
+        };
+        let opts = crate::aixm::Options { at: Some(0.0), ..Default::default() };
+        assert!(crate::aixm::read("a.xml", aixm(0).as_bytes(), &opts).is_ok(), "the same members read without the flood");
+        let e = crate::aixm::read("a.xml", aixm(20_000).as_bytes(), &opts).unwrap_err().to_string();
+        assert!(e.contains("5 members of the message couldn't be read") && !e.contains("would pass the limits"), "{e}");
+    }
+
+    /// An AIXM message of one designated point (valid from 1960), `inner` in its time slice.
+    fn aixm_point(inner: &str) -> String {
+        format!(
+            r#"<m:hasMember><aixm:DesignatedPoint xmlns:aixm="http://www.aixm.aero/schema/5.1.1" xmlns:gml="http://www.opengis.net/gml/3.2" gml:id="f"><gml:identifier codeSpace="urn:uuid:">p</gml:identifier><aixm:timeSlice><aixm:DesignatedPointTimeSlice gml:id="s"><gml:validTime><gml:TimePeriod gml:id="t"><gml:beginPosition>1960-01-01T00:00:00Z</gml:beginPosition><gml:endPosition indeterminatePosition="unknown"/></gml:TimePeriod></gml:validTime><aixm:interpretation>BASELINE</aixm:interpretation><aixm:location><aixm:Point srsName="urn:ogc:def:crs:EPSG::4326" gml:id="g"><gml:pos>50 10</gml:pos></aixm:Point></aixm:location>{inner}</aixm:DesignatedPointTimeSlice></aixm:timeSlice></aixm:DesignatedPoint></m:hasMember>"#
+        )
     }
 
     /// Every XML reader refuses a deeply nested document instead of overflowing the stack, run on
@@ -398,12 +407,19 @@ mod tests {
                 assert!(crate::georss::read("a.rss", &deep("rss", "channel")).is_err());
                 assert!(crate::landxml::read("a.xml", &deep("LandXML", "Parcels"), None).is_err());
                 assert!(crate::ogc::parse("https://x.example/wms", &deep("WMS_Capabilities", "Layer")).is_err());
-                let aixm = String::from_utf8(deep("message:AIXMBasicMessage", "message:hasMember")).unwrap_or_default().replacen(
-                    "<message:AIXMBasicMessage>",
-                    "<message:AIXMBasicMessage xmlns:message=\"http://www.aixm.aero/schema/5.1.1/message\">",
-                    1,
-                );
-                assert!(crate::aixm::read("a.xml", aixm.as_bytes(), &crate::aixm::Options { at: Some(0.0) }).is_err());
+                // A point that reads with a few nested records is refused with ten thousand: the
+                // depth, not anything else, stops it.
+                let aixm = |depth: usize| {
+                    let nested = format!("{}{}", "<aixm:x>".repeat(depth), "</aixm:x>".repeat(depth));
+                    format!(
+                        "<?xml version=\"1.0\"?><m:AIXMBasicMessage xmlns:m=\"http://www.aixm.aero/schema/5.1.1/message\">{}</m:AIXMBasicMessage>",
+                        aixm_point(&nested)
+                    )
+                };
+                let opts = crate::aixm::Options { at: Some(0.0), ..Default::default() };
+                assert!(crate::aixm::read("a.xml", aixm(5).as_bytes(), &opts).is_ok());
+                let e = crate::aixm::read("a.xml", aixm(10_000).as_bytes(), &opts).unwrap_err().to_string();
+                assert!(e.contains("couldn't be read"), "{e}");
                 true
             })
             .unwrap()

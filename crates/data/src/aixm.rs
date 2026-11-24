@@ -94,6 +94,8 @@ const SHAPES: &[&str] = &["Point", "ElevatedPoint", "Curve", "ElevatedCurve", "S
 pub struct Options {
     /// The effective date: milliseconds since 1970-01-01 UTC. Today when `None`.
     pub at: Option<f64>,
+    /// Only the layers' names are wanted (`info.fileLayers`): no shape is drawn and no value kept.
+    pub names_only: bool,
 }
 
 impl Options {
@@ -101,9 +103,16 @@ impl Options {
     /// says its zone.
     pub fn at_text(text: &str) -> std::result::Result<Self, String> {
         crate::time::parse_text(text)
-            .map(|t| Options { at: Some(t) })
+            .map(|t| Options { at: Some(t), ..Options::default() })
             .ok_or_else(|| format!("'{text}' isn't a date (an AIXM effective date is written like 2026-01-15 or 2026-01-15T12:00Z)"))
     }
+}
+
+/// The names of the layers [`read`] gives a message at `opts.at`, worked out without drawing
+/// their shapes or keeping their values: what listing a file's layers needs.
+pub fn layer_names(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<String>> {
+    let opts = Options { names_only: true, ..*opts };
+    Ok(read(file_name, bytes, &opts)?.into_iter().map(|(d, _)| d.name).collect())
 }
 
 /// Whether a file is an AIXM message, by its root: an `AIXMBasicMessage` in an AIXM 5 namespace,
@@ -377,6 +386,8 @@ struct Slice {
 
 /// A feature's slices, read from any number of members.
 struct Feature {
+    /// Its identifier (`gml:identifier`, else its `gml:id`).
+    id: String,
     kind: String,
     /// Its own `gml:id`: what a local link (`#id`) or the FAA's XPath names it by.
     gml_id: Option<String>,
@@ -406,7 +417,13 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     // Of slices alike in interpretation and sequence number, the highest correction holds (the
     // later in the file on a tie).
     let mut held: BTreeMap<(u8, u64), &Slice> = BTreeMap::new();
+    // SNAPSHOTs have no sequence or correction number: each is its own instant, all kept.
+    let mut snapshots: Vec<&Slice> = Vec::new();
     for s in slices {
+        if s.kind == Interpretation::Snapshot {
+            snapshots.push(s);
+            continue;
+        }
         let key = (s.kind as u8, s.sequence);
         match held.get(&key) {
             Some(h) if h.correction > s.correction => {}
@@ -415,7 +432,7 @@ fn state_at(slices: &[Slice], t: f64) -> State {
             }
         }
     }
-    let live: Vec<&Slice> = held.values().copied().filter(|s| !s.canceled).collect();
+    let live: Vec<&Slice> = held.values().copied().chain(snapshots).filter(|s| !s.canceled).collect();
     if live.is_empty() {
         return if slices.is_empty() { State::OnlyChanges } else { State::Canceled };
     }
@@ -472,6 +489,8 @@ struct SliceTrouble {
     dates: usize,
     /// Validity or lifetime ends left empty without saying they are unknown, read as open.
     empty: usize,
+    /// Slices with a sequence or correction number that isn't a number, read as 0.
+    numbers: usize,
 }
 
 /// A slice's own properties.
@@ -486,7 +505,15 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
             return None;
         }
     };
-    let number = |name: &str| child(s, name).and_then(|n| text_of(&n).parse::<u64>().ok()).unwrap_or(0);
+    // A number that isn't one is read as 0 and counted.
+    let unread_number = std::cell::Cell::new(false);
+    let number = |name: &str| match child(s, name).map(|n| text_of(&n)) {
+        Some(t) if !t.is_empty() => t.parse::<u64>().unwrap_or_else(|_| {
+            unread_number.set(true);
+            0
+        }),
+        _ => 0,
+    };
     let empty = std::cell::Cell::new(0);
     let (mut begin, mut end, mut canceled) = (None, None, false);
     let mut bad = false;
@@ -509,8 +536,12 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
                 });
             }
             Some(_) => bad = true,
-            // An empty validTime cancels the slice (`nilReason="inapplicable"`).
-            None => canceled = true,
+            // An empty validTime cancels the slice only when it says so
+            // (`nilReason="inapplicable"`); any other is a validity RustGIS can't read.
+            None => match v.attribute("nilReason").map(str::trim) {
+                Some("inapplicable") => canceled = true,
+                _ => bad = true,
+            },
         }
     }
     let lifetime = child(s, "featureLifetime").and_then(|l| elements(l).find(|p| local(p) == "TimePeriod")).map(|p| {
@@ -525,21 +556,13 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
         (from, until)
     });
     trouble.empty += empty.get();
+    let (sequence, correction) = (number("sequenceNumber"), number("correctionNumber"));
+    trouble.numbers += usize::from(unread_number.get());
     if bad {
         trouble.dates += 1;
         return None;
     }
-    Some(Slice {
-        range,
-        scope,
-        kind,
-        sequence: number("sequenceNumber"),
-        correction: number("correctionNumber"),
-        begin,
-        end,
-        canceled,
-        lifetime,
-    })
+    Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled, lifetime })
 }
 
 /// The features of a member (an `AIXMBasicMessage`'s `hasMember` holds one).
@@ -598,6 +621,10 @@ struct ShapeNotes {
     followed_whole: usize,
     /// A route segment drawn between the points it names, having no curve.
     between: bool,
+    /// An arc or circle not drawn: the file's point allowance ran out.
+    past_allowance: bool,
+    /// A route segment with no curve and a `pathType` RustGIS doesn't draw.
+    path_unread: bool,
     /// Borders by reference not followed: past the work allowed, or too short to cut.
     border_allowance: usize,
     border_unusable: usize,
@@ -623,6 +650,8 @@ struct Shapes {
     borders: HashMap<String, Vec<Coord>>,
     /// Steps of looking along borders still allowed ([`Shapes::scan`]).
     scan_left: usize,
+    /// Only the layers' names are wanted: a shape is its family's placeholder, not drawn.
+    names_only: bool,
     /// Where each point feature is (a navaid, a designated point), by its identifier: the ends of
     /// route segments that name them.
     points: HashMap<String, Coord>,
@@ -657,6 +686,8 @@ impl ShapeNotes {
         self.border_allowance += o.border_allowance;
         self.border_unusable += o.border_unusable;
         self.between |= o.between;
+        self.past_allowance |= o.past_allowance;
+        self.path_unread |= o.path_unread;
     }
 }
 
@@ -821,6 +852,25 @@ impl Shapes {
         out
     }
 
+    /// A rhumb line (loxodrome) from `a` to `b`: straight on a Mercator map, a point every
+    /// [`GEODESIC_STEP_M`] at most, from the same allowance as geodesics.
+    fn rhumb(&mut self, a: Coord, b: Coord, notes: &mut ShapeNotes) -> Vec<Coord> {
+        let b = next_to(b, a.x);
+        let merc = |lat: f64| (std::f64::consts::FRAC_PI_4 + lat.to_radians().clamp(-1.5, 1.5) / 2.0).tan().ln();
+        let (ya, yb) = (merc(a.y), merc(b.y));
+        let d = rustgis_geom::wgs84_distance_m(a, b);
+        let need = if d.is_finite() { (d / GEODESIC_STEP_M).ceil() as usize } else { 1 };
+        notes.coarse |= need > MAX_GEODESIC_POINTS;
+        let n = self.take(need.clamp(1, MAX_GEODESIC_POINTS).saturating_sub(1), notes) + 1;
+        (0..=n)
+            .map(|k| {
+                let t = k as f64 / n as f64;
+                let y = ya + (yb - ya) * t;
+                Coord::new(a.x + (b.x - a.x) * t, (2.0 * y.exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees())
+            })
+            .collect()
+    }
+
     /// How many pieces an arc of `radius_m` turning `sweep_deg` is drawn with.
     fn pieces(&mut self, radius_m: f64, sweep_deg: f64, notes: &mut ShapeNotes) -> usize {
         let step = if radius_m <= ARC_TOLERANCE_M { 90.0 } else { (2.0 * (1.0 - ARC_TOLERANCE_M / radius_m).acos()).to_degrees() };
@@ -864,6 +914,11 @@ impl Shapes {
             _ => return None,
         };
         let n = self.pieces(radius, sweep, notes);
+        // A full circle in fewer than three pieces isn't one: not drawn, and said.
+        if sweep.abs() >= 360.0 && n < 3 {
+            notes.past_allowance = true;
+            return None;
+        }
         let mut out = Vec::with_capacity(n + 1);
         for k in 0..=n {
             let (p, _) = rustgis_geom::wgs84_direct(center, bearing0 + sweep * k as f64 / n as f64, radius);
@@ -1187,15 +1242,23 @@ impl Shapes {
                 notes.rings_lost += usize::from(said(notes) == before);
                 continue;
             };
+            // A hole that can't be read leaves the patch out: drawn without it, the patch would
+            // cover what the hole excludes.
             let mut rings = vec![outer];
+            let mut hole_lost = false;
             for b in elements(p).filter(|c| local(c) == "interior") {
                 let before = said(notes);
                 match self.ring(b, notes) {
                     Some(r) => rings.push(r),
-                    None => notes.rings_lost += usize::from(said(notes) == before),
+                    None => {
+                        notes.rings_lost += usize::from(said(notes) == before);
+                        hole_lost = true;
+                    }
                 }
             }
-            polys.push(rings);
+            if !hole_lost {
+                polys.push(rings);
+            }
         }
         (!polys.is_empty()).then_some(Geometry::Polygon(polys))
     }
@@ -1222,6 +1285,14 @@ impl Shapes {
     }
 
     fn read_shape(&mut self, g: Node, notes: &mut ShapeNotes) -> Option<Geometry> {
+        if self.names_only {
+            let o = Coord::new(0.0, 0.0);
+            return Some(match element_family(local(&g)) {
+                "points" => Geometry::Point(o),
+                "lines" => Geometry::Line(vec![vec![o, o]]),
+                _ => Geometry::Polygon(vec![vec![vec![o, o, o, o]]]),
+            });
+        }
         match local(&g) {
             "Point" | "ElevatedPoint" => self.point(g, notes),
             "Curve" | "ElevatedCurve" | "LineString" => self.curve(g, notes).map(|c| Geometry::Line(vec![c])),
@@ -1271,7 +1342,9 @@ fn nearest_on(line: &[Coord], p: Coord) -> Option<(usize, f64, Coord, f64)> {
     let mut best: Option<(usize, f64, Coord, f64)> = None;
     for (i, w) in line.windows(2).enumerate() {
         let (Some(&a), Some(&b)) = (w.first(), w.get(1)) else { continue };
-        let (a, b) = (next_to(a, p.x), next_to(b, p.x));
+        // The segment moved as one next to the point: its ends keep their short span across 180°.
+        let a = next_to(a, p.x);
+        let b = next_to(b, a.x);
         let (dx, dy) = ((b.x - a.x) * k, b.y - a.y);
         let len2 = dx * dx + dy * dy;
         let t = if len2 > 0.0 { (((p.x - a.x) * k * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
@@ -1403,6 +1476,14 @@ struct Layer {
     far: usize,
     /// Route segments drawn between the points they name.
     between: usize,
+    /// Features with an arc or circle not drawn: the point allowance ran out.
+    past_allowance: usize,
+    /// Route segments with no curve and a `pathType` RustGIS doesn't draw.
+    path_unread: usize,
+    /// Rows left out: the table they'd make passes the memory the file's size allows.
+    dense_over: usize,
+    /// Records holding no shape beside records of the same property that do: rows of their own.
+    unlocated: usize,
     /// Borders by reference followed whole.
     followed_whole: usize,
     /// Borders by reference not followed: past the work allowed, or too short to cut.
@@ -1418,12 +1499,13 @@ struct Layer {
 impl Layer {
     /// A column's number, made when there is room for another; `None` (counted) past
     /// [`MAX_COLUMNS`].
-    fn column(&mut self, name: &str) -> Option<usize> {
+    fn column(&mut self, name: &str, value: bool) -> Option<usize> {
         if let Some(&i) = self.named.get(name) {
             return Some(i);
         }
+        // Only a value past the cap is one not kept.
         if self.columns.len() >= MAX_COLUMNS {
-            self.capped += 1;
+            self.capped += usize::from(value);
             return None;
         }
         self.named.insert(name.to_string(), self.columns.len());
@@ -1447,6 +1529,8 @@ impl Layer {
         self.followed_whole += n.followed_whole;
         self.far += n.far;
         self.between += usize::from(n.between);
+        self.past_allowance += usize::from(n.past_allowance);
+        self.path_unread += usize::from(n.path_unread);
         self.border_allowance += n.border_allowance;
         self.border_unusable += n.border_unusable;
     }
@@ -1498,12 +1582,12 @@ struct Row {
 
 impl Row {
     /// Names a column; false past [`MAX_COLUMNS`] names, when its value isn't kept (counted).
-    fn name(&mut self, key: &str) -> bool {
+    fn name(&mut self, key: &str, value: bool) -> bool {
         if self.named.contains(key) {
             return true;
         }
         if self.columns.len() >= MAX_COLUMNS {
-            self.capped += 1;
+            self.capped += usize::from(value);
             return false;
         }
         self.named.insert(key.to_string());
@@ -1553,7 +1637,7 @@ impl Row {
     }
 
     fn set(&mut self, key: &str, value: String) {
-        if !self.name(key) || !self.afford(key.len() + value.len()) {
+        if !self.name(key, true) || !self.afford(key.len() + value.len()) {
             return;
         }
         match self.attrs.get_mut(key) {
@@ -1570,7 +1654,7 @@ impl Row {
     }
 
     fn null(&mut self, key: &str) {
-        let _ = self.name(key);
+        let _ = self.name(key, false);
     }
 
     /// A property's simple value as attributes, under `prefix`.
@@ -1782,6 +1866,8 @@ struct Layers {
     list: Vec<Layer>,
     /// Features of kinds past [`MAX_LAYERS`], by identifier.
     over: HashSet<String>,
+    /// Only the layers' names are wanted: rows aren't kept.
+    names_only: bool,
 }
 
 impl Layers {
@@ -1836,7 +1922,7 @@ impl Layers {
         layer.snapshots += usize::from(change.1);
         let mut attrs = Vec::with_capacity(row.attrs.len());
         for c in &row.columns {
-            if let Some(k) = layer.column(c)
+            if let Some(k) = layer.column(c, row.attrs.contains_key(c))
                 && let Some(v) = row.attrs.get(c)
             {
                 attrs.push((k, v.clone()));
@@ -1844,6 +1930,9 @@ impl Layers {
         }
         if let Some(n) = notes {
             layer.take_notes(n);
+        }
+        if self.names_only {
+            return Some(i);
         }
         layer.rows.push((geometry, attrs, row.paths));
         Some(i)
@@ -1954,6 +2043,15 @@ fn scope_of(
     Some(scopes.len() - 1)
 }
 
+/// What a change replaces a property by: its name, or for an `extension`, its name and the
+/// namespace of the extension it holds (AIXM replaces extensions within their namespace).
+fn property_key(p: Node) -> String {
+    match (local(&p), elements(p).next().and_then(|e| e.tag_name().namespace())) {
+        ("extension", Some(ns)) => format!("extension {ns}"),
+        (name, _) => name.to_string(),
+    }
+}
+
 /// How each member is parsed: no DTD, and the node limit every XML reader has.
 fn options<'a>() -> ParsingOptions<'a> {
     ParsingOptions { allow_dtd: false, nodes_limit: crate::io::XML_NODES, ..ParsingOptions::default() }
@@ -1972,6 +2070,10 @@ fn projection<'a, 'i>(v: Option<Node<'a, 'i>>) -> Option<Node<'a, 'i>> {
 /// What the read says of the file as a whole.
 #[derive(Default)]
 struct FileNotes {
+    /// Slices with a sequence or correction number that isn't a number, read as 0.
+    bad_numbers: usize,
+    /// Features left out because a change in force at the date couldn't be read.
+    incomplete: usize,
     /// Time positions left empty without saying they are unknown, read as open.
     empty_dates: usize,
     /// Elements of members that aren't AIXM features.
@@ -2081,9 +2183,16 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
                 };
                 slices.extend(slice_of(sl, range, scope, &mut trouble));
             }
-            let entry = features.entry(id.clone()).or_insert_with(|| {
-                order.push(id.clone());
-                Feature { kind: local(&f).to_string(), gml_id: f.attribute((GML, "id")).map(|g| g.trim().to_string()), slices: Vec::new() }
+            // A feature is its kind and identifier: two kinds sharing one aren't put together.
+            let key = format!("{}\u{1}{id}", local(&f));
+            let entry = features.entry(key.clone()).or_insert_with(|| {
+                order.push(key.clone());
+                Feature {
+                    id: id.clone(),
+                    kind: local(&f).to_string(),
+                    gml_id: f.attribute((GML, "id")).map(|g| g.trim().to_string()),
+                    slices: Vec::new(),
+                }
             });
             entry.slices.extend(slices);
         }
@@ -2091,12 +2200,15 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.unknown_interpretation = trouble.unknown;
     notes.bad_dates = trouble.dates;
     notes.empty_dates = trouble.empty;
+    notes.bad_numbers = trouble.numbers;
     // Second pass: each feature in force at the date, from its slices.
     // The nested paths of every row, each kept once.
     let paths: SharedPaths =
         std::rc::Rc::new(std::cell::RefCell::new(Paths { limit: text.len().saturating_mul(2).max(MIN_ROW_BYTES), ..Paths::default() }));
-    let mut layers = Layers { bytes_left: text.len().saturating_mul(4).max(MIN_ROW_BYTES), ..Layers::default() };
+    let mut layers =
+        Layers { names_only: opts.names_only, bytes_left: text.len().saturating_mul(4).max(MIN_ROW_BYTES), ..Layers::default() };
     let mut shapes = Shapes {
+        names_only: opts.names_only,
         budget: text.len().max(MIN_ADDED_POINTS),
         scan_left: text.len().saturating_mul(8).max(MIN_ADDED_POINTS * 8),
         ..Shapes::default()
@@ -2126,6 +2238,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     for id in &order {
         crate::progress::step(1)?;
         let Some(feature) = features.get(id) else { continue };
+        let id = &feature.id;
         if feature.slices.is_empty() {
             notes.no_slices += 1;
             continue;
@@ -2174,25 +2287,33 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         // The state's properties, each change's replacing all values of the properties it holds:
         // the last change holding a name gives that name's values (worked out in one pass, however
         // many changes there are).
+        // A change in force that can't be read leaves the feature out (counted): its state
+        // without the change isn't its state then.
         let mut layers_of: Vec<Vec<Node>> = vec![own(base_node)];
+        let mut incomplete = false;
         for i in 1..wanted.len() {
             match node(i) {
                 Some(n) => layers_of.push(own(n)),
-                None => {
-                    notes.past_limits += 1;
-                    layers_of.push(Vec::new());
-                }
+                None => incomplete = true,
             }
         }
-        let mut last: HashMap<&str, usize> = HashMap::new();
+        if incomplete {
+            notes.incomplete += 1;
+            continue;
+        }
+        // Extensions are replaced within their own namespace (each its own key).
+        let mut last: HashMap<String, usize> = HashMap::new();
         for (i, ps) in layers_of.iter().enumerate() {
             for p in ps {
-                last.insert(local(p), i);
+                last.insert(property_key(*p), i);
             }
         }
         let last = &last;
-        let props: Vec<Node> =
-            layers_of.iter().enumerate().flat_map(|(i, ps)| ps.iter().copied().filter(move |p| last.get(local(p)) == Some(&i))).collect();
+        let props: Vec<Node> = layers_of
+            .iter()
+            .enumerate()
+            .flat_map(|(i, ps)| ps.iter().copied().filter(move |p| last.get(&property_key(*p)) == Some(&i)))
+            .collect();
         // A row being read keeps no more than the layers still may.
         let mut row = Row { limit: Some(layers.bytes_left), interned: std::rc::Rc::clone(&paths), ..Row::default() };
         row.set("identifier", id.trim_start_matches("urn:uuid:").to_string());
@@ -2271,15 +2392,15 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.assumed_system = shapes.assumed_system;
     let paths = paths.try_borrow_mut().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default();
     layers.list.sort_by_key(|l| kind_rank.get(&l.kind).copied().unwrap_or(usize::MAX));
-    finish(&stem, at, layers, notes, &index, shapes.budget == 0, &paths)
+    let mut dense_left = text.len().saturating_mul(8).max(MIN_ROW_BYTES * 4);
+    finish(&stem, at, layers, notes, &index, shapes.budget == 0, &paths, &mut dense_left)
 }
 
 /// A route segment's line from the points its `start` and `end` name (their `pointChoice_…`
 /// references): a geodesic between them, as AIXM's default path, when both are in the file.
-fn between(props: &[Node], shapes: &mut Shapes) -> Option<(Vec<Coord>, ShapeNotes)> {
+fn between(props: &[Node], shapes: &mut Shapes) -> Option<(Option<Vec<Coord>>, ShapeNotes)> {
     // Both ends found first: a segment drawn neither way reads its ends' shapes once, as records.
     let (a, b) = (segment_end(props, "start", shapes)?, segment_end(props, "end", shapes)?);
-    let mut notes = ShapeNotes { between: true, ..ShapeNotes::default() };
     let quiet = |end: &End, shapes: &mut Shapes| match end {
         End::Named(c) => Some(*c),
         End::Written(g) => match shapes.quietly(*g) {
@@ -2288,14 +2409,25 @@ fn between(props: &[Node], shapes: &mut Shapes) -> Option<(Vec<Coord>, ShapeNote
         },
     };
     let (ca, cb) = (quiet(&a, shapes)?, quiet(&b, shapes)?);
+    let mut notes = ShapeNotes { between: true, ..ShapeNotes::default() };
     // Drawn from them: what the ends written in place find is said with the segment.
     for end in [&a, &b] {
         if let End::Written(g) = end {
             let _ = shapes.shape(*g, &mut notes);
         }
     }
-    let (a, b) = (ca, cb);
-    let line = shapes.geodesic(&[a, b], &mut notes);
+    // The path its pathType says: a geodesic (GDS, or a great circle, GRC, which the ellipsoid's
+    // geodesic is) by default, a rhumb line (RHL); another isn't drawn, and that is said.
+    let path = props.iter().find(|p| local(p) == "pathType").map(|p| text_of(p)).unwrap_or_default();
+    let line = match path.as_str() {
+        "" | "GDS" | "GRC" => Some(shapes.geodesic(&[ca, cb], &mut notes)),
+        "RHL" => Some(shapes.rhumb(ca, cb, &mut notes)),
+        _ => {
+            notes.between = false;
+            notes.path_unread = true;
+            None
+        }
+    };
     Some((line, notes))
 }
 
@@ -2349,11 +2481,23 @@ fn feature_rows(
 ) -> bool {
     let mut shaped: Vec<(String, Node)> = Vec::new();
     let mut parts: Vec<Node> = Vec::new();
+    let mut others: Vec<Node> = Vec::new();
     for p in props {
         match shape_in(*p) {
             Some(g) if !is_nil(p) => shaped.push((local(p).to_string(), g)),
             _ if !is_nil(p) && p.attribute((XLINK, "href")).is_none() && !nested_shapes(*p).is_empty() => parts.push(*p),
-            _ => row.property(*p, ""),
+            _ => others.push(*p),
+        }
+    }
+    // A record with no shape of a property whose other records hold one (an unlocated light
+    // beside located ones) is a row of its own, not values on every located one's row.
+    let record_names: HashSet<&str> = if shaped.is_empty() { parts.iter().map(|p| local(p)).collect() } else { HashSet::new() };
+    let mut unlocated: Vec<Node> = Vec::new();
+    for p in others {
+        if record_names.contains(local(&p)) && !is_nil(&p) && elements(p).next().is_some() {
+            unlocated.push(p);
+        } else {
+            row.property(p, "");
         }
     }
     let change = (temporary > 0, snapshot);
@@ -2399,7 +2543,8 @@ fn feature_rows(
         for p in &parts {
             row.property(*p, "");
         }
-        layers.push(kind, "curveExtent", Some(Geometry::Line(vec![line])), row.clone(), Some(&notes), change);
+        let line = line.map(|l| vec![l]);
+        layers.push(kind, "curveExtent", line.map(Geometry::Line), row.clone(), Some(&notes), change);
         return true;
     }
     if parts.is_empty() {
@@ -2408,6 +2553,21 @@ fn feature_rows(
     // Rows copied for the records stay within what the file's size allows: checked before each
     // copy, as a vertical structure's parts are.
     let mut room = layers.bytes_left;
+    let first_label = parts.iter().flat_map(|p| nested_shapes(*p)).next().map_or("points", |g| element_family(local(&g)));
+    for p in unlocated {
+        if row.weight() > room {
+            layers.rows_over += 1;
+            continue;
+        }
+        let mut r = row.clone();
+        let mut path = vec![(local(&p).to_string(), 1)];
+        r.record(p, &mut path, false);
+        room = room.saturating_sub(r.weight());
+        let i = layers.push(kind, first_label, None, r, None, (false, false));
+        if let Some(l) = layers.at(i) {
+            l.unlocated += 1;
+        }
+    }
     let count = parts.len();
     for (k, p) in parts.into_iter().enumerate() {
         if row.weight() > room {
@@ -2506,6 +2666,10 @@ fn airspace(
                 Some(g) => parts.push(g),
                 None => unreadable = true,
             }
+        }
+        // Parts of different kinds (a line where a surface is meant) aren't one shape.
+        if parts.first().is_some_and(|f| parts.iter().any(|g| family(g) != family(f))) {
+            unreadable = true;
         }
         if !unreadable {
             geom = merged(parts);
@@ -2606,6 +2770,9 @@ fn vertical_structure(
 }
 
 /// The layers as datasets, with what the read says.
+/// What a row of a table holds besides its values (its shape's slot, its bookkeeping), in bytes.
+const DENSE_ROW_OVERHEAD: usize = 64;
+
 fn finish(
     stem: &str,
     at: f64,
@@ -2614,6 +2781,7 @@ fn finish(
     index: &Index,
     budget_spent: bool,
     paths: &Paths,
+    dense_left: &mut usize,
 ) -> Result<Vec<(Dataset, ReadReport)>> {
     let mut file = ReadReport::default();
     let say = |r: &mut ReadReport, n: usize, one: &str, many: &str, rest: &str| {
@@ -2653,6 +2821,14 @@ fn finish(
         "time position",
         "time positions",
         "left empty (not said to be unknown) read as open: no start or no end",
+    );
+    say(&mut file, notes.bad_numbers, "time slice", "time slices", "with a sequence or correction number that isn't a number read as 0");
+    say(
+        &mut file,
+        notes.incomplete,
+        "feature",
+        "features",
+        "left out: a change to it in force then couldn't be read within the limits the file's size sets",
     );
     say(&mut file, notes.bad_dates, "time slice", "time slices", "with a validTime or featureLifetime that isn't a date not read");
     say(
@@ -2721,18 +2897,17 @@ fn finish(
         for (g, mut attrs, nested) in std::mem::take(&mut layer.rows) {
             for (id, value) in nested {
                 let k = match column_of.get(&id) {
-                    // A path past the cap: each of its values not kept is counted.
-                    Some(None) => {
-                        layer.capped += 1;
-                        None
-                    }
                     Some(k) => *k,
                     None => {
-                        let k = paths.list.get(id).and_then(|p| layer.column(&path_column(p, &repeating)));
+                        let k = paths.list.get(id).and_then(|p| layer.column(&path_column(p, &repeating), false));
                         column_of.insert(id, k);
                         k
                     }
                 };
+                // A value past the cap is counted, each one; a missing one isn't a loss.
+                if k.is_none() && value.is_some() {
+                    layer.capped += 1;
+                }
                 if let (Some(k), Some(v)) = (k, value) {
                     attrs.push((k, v));
                 }
@@ -2770,6 +2945,15 @@ fn finish(
             layer.columns.iter().zip(&values).map(|(c, vs)| Field::new(c.clone(), crate::io::text_type(vs.iter().copied()))).collect();
         drop(values);
         let mut ds = Dataset::new(title, GeometryType::None, fields);
+        // The table holds a value for every column of every row: the rows that fit the memory the
+        // file's size allows are kept, and the rest counted.
+        let per_row = (ds.fields.len() * std::mem::size_of::<Value>()).max(1) + DENSE_ROW_OVERHEAD;
+        let fit = *dense_left / per_row;
+        if rows.len() > fit {
+            layer.dense_over += rows.len() - fit;
+            rows.truncate(fit);
+        }
+        *dense_left -= rows.len() * per_row;
         for (g, attrs) in rows {
             let mut row = vec![Value::Null; ds.fields.len()];
             for (k, v) in attrs {
@@ -2834,8 +3018,8 @@ fn finish(
         );
         say(
             layer.rings_lost,
-            "ring or surface patch was left out: too few points, or unreadable",
-            "rings or surface patches were left out: too few points, or unreadable",
+            "ring or surface patch was left out (with the patch it is a hole of): too few points, or unreadable",
+            "rings or surface patches were left out (with the patches they are holes of): too few points, or unreadable",
         );
         say(
             layer.referenced,
@@ -2858,9 +3042,29 @@ fn finish(
             "borders given by reference aren't followed: the GeoBorders they name have too few points to cut",
         );
         say(
+            layer.past_allowance,
+            "feature has an arc or circle that isn't drawn: the file's point allowance ran out",
+            "features have an arc or circle that isn't drawn: the file's point allowance ran out",
+        );
+        say(
+            layer.path_unread,
+            "route segment with no curve isn't drawn: its pathType is one RustGIS doesn't draw",
+            "route segments with no curve aren't drawn: their pathType is one RustGIS doesn't draw",
+        );
+        say(
+            layer.dense_over,
+            "row is left out: the table would pass the memory the file's size allows",
+            "rows are left out: the table would pass the memory the file's size allows",
+        );
+        say(
+            layer.unlocated,
+            "record with no shape (beside ones of the same property that have one) is a row without a shape",
+            "records with no shape (beside ones of the same property that have one) are rows without a shape",
+        );
+        say(
             layer.between,
-            "route segment with no curve is drawn as a geodesic between the points its start and end name",
-            "route segments with no curve are drawn as geodesics between the points their start and end name",
+            "route segment with no curve is drawn between the points its start and end name, as its pathType says (a geodesic, or a rhumb line)",
+            "route segments with no curve are drawn between the points their start and end name, as their pathType says (geodesics, or rhumb lines)",
         );
         say(
             layer.followed,

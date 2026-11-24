@@ -3160,6 +3160,8 @@ fn apply_styles(s: &mut Session, id: u32, styles: &[(String, rustgis_data::kml::
 /// layers, or the one layer of other files. `layer.addData` takes a name with `"layer"`.
 fn file_layers(s: &mut Session, p: &Value) -> CmdResult {
     let path = s_req(p, "path")?;
+    // An effective date is for an AIXM message only: refused for any other file, not ignored.
+    check_at(p, path, || may_be_aixm_path(path))?;
     let path = &*gdb_path(path);
     let err = |e: rustgis_data::DataError| format!("{path}: {e}");
     // A geodatabase read without GDAL; through GDAL if it can't be and GDAL is installed.
@@ -3230,9 +3232,14 @@ fn file_layers(s: &mut Session, p: &Value) -> CmdResult {
             return Err(rustgis_data::io::file_size_error(path, max));
         }
         let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
-        // An AIXM message's layers at the date asked, as Add Data would add them.
-        if let Some(reads) = aixm_reads(p, path, &bytes)? {
-            let layers: Vec<String> = reads.into_iter().map(|l| l.dataset.name).collect();
+        // An AIXM message's layers at the date asked, as Add Data would add them: their names
+        // only, without drawing their shapes or keeping their values.
+        if rustgis_data::io::is_aixm(path, &bytes) {
+            if ps(p, "crs").is_some_and(|c| !c.trim().is_empty()) {
+                return Err(format!("\"crs\" doesn't apply to {path}: an AIXM message names its own system (srsName)"));
+            }
+            let opts = check_at(p, path, || true)?;
+            let layers = rustgis_data::aixm::layer_names(path, &bytes, &opts).map_err(err)?;
             return Ok(json!({"count": layers.len(), "layers": layers}));
         }
         let zip = path.to_ascii_lowercase().ends_with(".zip");
@@ -5035,6 +5042,10 @@ pub(crate) fn fixed_download_urls(p: &Value) -> Option<Vec<String>> {
 pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
     let owner = s.continuation()?;
     let url = ps(p, "url").map(str::trim).unwrap_or("");
+    // An effective date is for an AIXM message only (`.xml`, `.gml`, or an address that doesn't
+    // say, whose contents are checked once fetched): refused for any other address, before it is
+    // opened in place or downloaded.
+    check_at(p, url, || address_extension(url).is_none_or(|e| e == "xml" || e == "gml"))?;
     let out = add_url_as_given(s, p).map_err(|e| crate::sources::message_with_address(url, &e))?;
     s.check_continuation(&owner)?;
     Ok(out)
