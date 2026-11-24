@@ -510,10 +510,15 @@ fn state_at(slices: &[Slice], t: f64) -> State {
         // defined over a baseline: it is shown as it is, and changes it can't hold are said.
         // A temporary change in force at its instant or on the date, not both, isn't reflected.
         let differs = |s: &Slice| in_force(s.begin, s.end, t) != base.begin.is_some_and(|bb| in_force(s.begin, s.end, bb));
+        // A snapshot after the date holds the PERMDELTAs up to its instant.
+        let ahead = |s: &Slice| s.begin.is_none_or(|b| t < b && base.begin.is_some_and(|bb| b <= bb));
+        let perm_ahead = of(Interpretation::PermDelta).chain(unread_of(Interpretation::PermDelta)).any(ahead);
         // One that can't be read may be either, unless the dates it has rule it out on both.
         let may_differ = |s: &Slice| in_force(s.begin, s.end, t) || base.begin.is_none_or(|bb| in_force(s.begin, s.end, bb));
-        let skipped =
-            !changes.is_empty() || of(Interpretation::TempDelta).any(differs) || unread_of(Interpretation::TempDelta).any(may_differ);
+        let skipped = !changes.is_empty()
+            || perm_ahead
+            || of(Interpretation::TempDelta).any(differs)
+            || unread_of(Interpretation::TempDelta).any(may_differ);
         return State::Use { base: base.clone(), changes: Vec::new(), snapshot, temporary: 0, skipped };
     }
     if unread_temp {
@@ -2633,7 +2638,8 @@ fn named_point(shapes: &Shapes, choice: Node, href: &str) -> Option<Coord> {
 fn no_positions(g: Node) -> bool {
     !g.descendants().any(|d| {
         d.is_element()
-            && ((is_gml(&d) && matches!(local(&d), "pos" | "posList") && !text_of(&d).is_empty()) || d.attribute((XLINK, "href")).is_some())
+            && ((is_gml(&d) && matches!(local(&d), "pos" | "posList" | "coordinates" | "coord" | "X") && !text_of(&d).is_empty())
+                || d.attribute((XLINK, "href")).is_some())
     })
 }
 
@@ -2726,7 +2732,7 @@ fn feature_rows(
         // shapes in them (not drawn) are counted.
         let mut in_records = 0;
         for p in &parts {
-            in_records += nested_shapes(*p).len();
+            in_records += undrawn_shapes(*p, false);
             row.property(*p, "");
         }
         let mut first = None;
@@ -3075,14 +3081,14 @@ fn finish(
         notes.unreadable_state,
         "feature",
         "features",
-        "left out: a time slice of it that may apply (the latest correction) has no validTime, period or instant, or a validTime or featureLifetime that can't be read",
+        "left out: a time slice of it that may apply (the latest correction) has no validTime of the kind it needs (a period, or a PERMDELTA's instant), or a validTime or featureLifetime that can't be read",
     );
     say(
         &mut file,
         notes.snapshot_changes,
         "feature",
         "features",
-        "shown as a SNAPSHOT without changes the file gives (or may give) between its instant and the date asked: changes apply to a BASELINE",
+        "shown as a SNAPSHOT that doesn't reflect changes begun or ended (or that may have) between its instant and the date asked",
     );
     say(&mut file, notes.no_slices, "feature", "features", "with no time slice RustGIS reads left out");
     say(
@@ -3112,7 +3118,7 @@ fn finish(
         notes.bad_dates,
         "time slice",
         "time slices",
-        "with no validTime, period or instant, or with a validTime or featureLifetime that can't be read (a feature it may apply to is left out, or shown as its SNAPSHOT)",
+        "with no validTime of the kind it needs (a period, or a PERMDELTA's instant), or with a validTime or featureLifetime that can't be read (a feature it may apply to is left out, or shown as its SNAPSHOT)",
     );
     say(
         &mut file,

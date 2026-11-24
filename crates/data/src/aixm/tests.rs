@@ -1163,7 +1163,7 @@ fn an_empty_valid_time_cancels_only_when_it_says_so() {
     let members = point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]) + &point("b", &[unknown]);
     let (got, notes) = names(&message(&members), "2026-01-15");
     assert_eq!(got, [Value::Text("KEPT".into())]);
-    assert!(notes.iter().any(|m| m.starts_with("1 time slice with no validTime, period or instant")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.starts_with("1 time slice with no validTime of the kind it needs")), "{notes:?}");
     assert!(!notes.iter().any(|m| m.contains("canceled")), "{notes:?}");
 }
 
@@ -1535,8 +1535,12 @@ fn a_snapshot_is_shown_as_it_is_and_changes_since_are_said() {
     ] {
         let (got, notes) = names(&message(&point("s", &slices)), "2026-01-15");
         assert_eq!(got, [Value::Text("SNAP".into())]);
-        assert_eq!(notes.iter().any(|m| m.contains("1 feature shown as a SNAPSHOT without changes")), said, "{notes:?}");
+        assert_eq!(notes.iter().any(|m| m.contains("1 feature shown as a SNAPSHOT that doesn't reflect changes")), said, "{notes:?}");
     }
+    // One after the date, holding a permanent change not in force yet.
+    let ahead = change("PERMDELTA", 1, &instant("2025-12-10T00:00:00Z"), "<aixm:name>SNAP</aixm:name>");
+    let notes = names(&message(&point("s", &[snap.clone(), ahead])), "2025-12-01").1;
+    assert!(notes.iter().any(|m| m.contains("SNAPSHOT that doesn't reflect")), "{notes:?}");
     // Withdrawn since: not shown.
     let end = r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>2020-01-01T00:00:00Z</gml:beginPosition><gml:endPosition>2026-01-10T00:00:00Z</gml:endPosition></gml:TimePeriod></aixm:featureLifetime>"#;
     let bytes = message(&point("s", &[snap, change("PERMDELTA", 1, &instant("2026-01-10T00:00:00Z"), end)]));
