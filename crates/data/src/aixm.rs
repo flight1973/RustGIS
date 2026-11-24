@@ -555,13 +555,13 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
         });
         (from, until)
     });
-    trouble.empty += empty.get();
     let (sequence, correction) = (number("sequenceNumber"), number("correctionNumber"));
     if bad {
         trouble.dates += 1;
         return None;
     }
     trouble.numbers += usize::from(unread_number.get());
+    trouble.empty += empty.get();
     Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled, lifetime })
 }
 
@@ -621,8 +621,9 @@ struct ShapeNotes {
     followed_whole: usize,
     /// A route segment drawn between the points it names, having no curve.
     between: bool,
-    /// An arc or circle not drawn: the file's point allowance ran out.
-    past_allowance: bool,
+    /// Arcs or circles not drawn: the file's point allowance ran out (a count, so each part read
+    /// can tell whether it was one of them).
+    past_allowance: usize,
     /// A route segment with no curve and a `pathType` RustGIS doesn't draw.
     path_unread: bool,
     /// Borders by reference not followed: past the work allowed, or too short to cut.
@@ -686,7 +687,7 @@ impl ShapeNotes {
         self.border_allowance += o.border_allowance;
         self.border_unusable += o.border_unusable;
         self.between |= o.between;
-        self.past_allowance |= o.past_allowance;
+        self.past_allowance += o.past_allowance;
         self.path_unread |= o.path_unread;
     }
 }
@@ -809,8 +810,9 @@ impl Shapes {
             "Arc" | "ArcString" | "Circle" => {
                 notes.arcs = true;
                 let c = Self::positions(s, axes, notes)?;
+                let before = notes.past_allowance;
                 let drawn = self.arcs_through(&c, local(&s) == "Circle", notes);
-                (!drawn.is_empty()).then_some(drawn)
+                (notes.past_allowance == before).then_some(drawn)
             }
             other => {
                 if !notes.unread_segments.iter().any(|n| n == other) {
@@ -923,7 +925,7 @@ impl Shapes {
         let n = self.pieces(radius, sweep, notes);
         // A full circle in fewer than three pieces isn't one: not drawn, and said.
         if sweep.abs() >= 360.0 && n < 3 {
-            notes.past_allowance = true;
+            notes.past_allowance += 1;
             return None;
         }
         let mut out = Vec::with_capacity(n + 1);
@@ -995,7 +997,7 @@ impl Shapes {
         let n = self.pieces(r, sweep.to_degrees(), notes);
         // A full circle in fewer than three pieces isn't one: not drawn, and said.
         if circle && n < 3 {
-            notes.past_allowance = true;
+            notes.past_allowance += 1;
             return Vec::new();
         }
         (0..=n)
@@ -1247,7 +1249,7 @@ impl Shapes {
         let mut polys = Vec::new();
         for p in patches {
             // A ring lost to a border by reference is said as that, once.
-            let said = |n: &ShapeNotes| n.referenced + n.border_allowance + n.border_unusable + usize::from(n.past_allowance);
+            let said = |n: &ShapeNotes| n.referenced + n.border_allowance + n.border_unusable + n.past_allowance;
             let before = said(notes);
             let outer = elements(p).find(|c| local(c) == "exterior").and_then(|b| self.ring(b, notes));
             let Some(outer) = outer else {
@@ -1525,9 +1527,8 @@ impl Layer {
     }
 
     fn take_notes(&mut self, n: &ShapeNotes) {
-        // A circle not drawn for the point allowance is said as that alone.
-        self.arcs += usize::from(n.arcs && !n.past_allowance);
-        self.coarse += usize::from(n.coarse && !n.past_allowance);
+        self.arcs += usize::from(n.arcs);
+        self.coarse += usize::from(n.coarse);
         self.zm += usize::from(n.zm);
         if !n.unread_segments.is_empty() {
             self.approximated += 1;
@@ -1541,7 +1542,7 @@ impl Layer {
         self.followed_whole += n.followed_whole;
         self.far += n.far;
         self.between += usize::from(n.between);
-        self.past_allowance += usize::from(n.past_allowance);
+        self.past_allowance += usize::from(n.past_allowance > 0);
         self.path_unread += usize::from(n.path_unread);
         self.border_allowance += n.border_allowance;
         self.border_unusable += n.border_unusable;
@@ -1923,7 +1924,11 @@ impl Layers {
             return None;
         }
         let Some(i) = self.index_of(kind, label) else {
-            self.over.insert(format!("{kind}\u{1}{}", row.attrs.get("identifier").map_or("", String::as_str)));
+            let next = self.over.len();
+            match row.attrs.get("identifier").filter(|i| !i.is_empty()) {
+                Some(id) => self.over.insert(format!("{kind}\u{1}{id}")),
+                None => self.over.insert(format!("{kind}\u{1}#{next}")),
+            };
             return None;
         };
         self.bytes_left -= cells;
@@ -2525,6 +2530,7 @@ fn feature_rows(
         for (name, g) in shaped {
             let mut notes = ShapeNotes::default();
             let geom = shapes.shape(g, &mut notes);
+            let refused = notes.past_allowance > 0;
             let mut r = row.clone();
             r.shape_values(g, &name);
             // A kind's shapes under different properties are different layers (an airport's
@@ -2534,7 +2540,7 @@ fn feature_rows(
             let empty =
                 !g.descendants().any(|d| d.is_element() && is_gml(&d) && matches!(local(&d), "pos" | "posList") && !text_of(&d).is_empty());
             let empty = empty && geom.is_none();
-            let bad = geom.is_none() && !empty && !notes.past_allowance;
+            let bad = geom.is_none() && !empty && !refused;
             let i = layers.push(kind, &name, geom, r, Some(&notes), change);
             first = first.or(i);
             if let Some(l) = layers.at(i) {
@@ -2602,7 +2608,8 @@ fn feature_rows(
         // What the feature was is said once for it, with its first row.
         let change = if k == 0 { change } else { (false, false) };
         for (label, (gs, notes)) in by_family {
-            let bad = gs.is_empty();
+            // Lost to the point allowance is said as that, not as unreadable.
+            let bad = gs.is_empty() && notes.past_allowance == 0;
             let i = layers.push(kind, label, merged(gs), r.clone(), Some(&notes), change);
             if let Some(l) = layers.at(i) {
                 l.unreadable += usize::from(bad);
@@ -2670,12 +2677,15 @@ fn airspace(
     }
     let drawable = components.iter().all(|(_, op, v)| matches!(op.as_str(), "BASE" | "UNION") && projection(*v).is_some());
     let mut geom = None;
-    let mut unreadable = false;
+    // A part not drawn: unreadable, or lost to the point allowance (said as that).
+    let (mut unreadable, mut refused) = (false, false);
     if drawable {
         let mut parts = Vec::new();
         for (_, _, v) in &components {
+            let before = notes.past_allowance;
             match projection(*v).and_then(|g| shapes.shape(g, notes)) {
                 Some(g) => parts.push(g),
+                None if notes.past_allowance > before => refused = true,
                 None => unreadable = true,
             }
         }
@@ -2683,7 +2693,7 @@ fn airspace(
         if parts.first().is_some_and(|f| parts.iter().any(|g| family(g) != family(f))) {
             unreadable = true;
         }
-        if !unreadable {
+        if !unreadable && !refused {
             geom = merged(parts);
         }
     }
@@ -2704,8 +2714,10 @@ fn airspace(
                     l.derived_names.add(op);
                 }
             }
-        } else if unreadable && !notes.past_allowance {
+        } else if unreadable {
             l.unreadable += 1;
+        } else if refused {
+            // Said by the allowance's own notice.
         } else if components.len() > 1 {
             l.unions += 1;
         }
@@ -3055,8 +3067,8 @@ fn finish(
         );
         say(
             layer.past_allowance,
-            "feature has an arc or circle that isn't drawn: the file's point allowance ran out",
-            "features have an arc or circle that isn't drawn: the file's point allowance ran out",
+            "feature has an arc or circle that isn't drawn, nor the ring or patch it bounds: the file's point allowance ran out",
+            "features have an arc or circle that isn't drawn, nor the ring or patch it bounds: the file's point allowance ran out",
         );
         say(
             layer.path_unread,

@@ -1304,7 +1304,7 @@ fn a_circle_past_the_point_allowance_isnt_drawn_and_says_so() {
     let mut shapes = Shapes::default();
     let mut notes = ShapeNotes::default();
     assert!(shapes.shape(doc.root_element().first_element_child().unwrap(), &mut notes).is_none());
-    assert!(notes.past_allowance);
+    assert_eq!(notes.past_allowance, 1);
 }
 
 #[test]
@@ -1359,7 +1359,7 @@ fn a_three_point_circle_past_the_allowance_isnt_drawn_and_says_so() {
     let mut notes = ShapeNotes::default();
     let drawn = shapes.arcs_through(&[Coord::new(10.0, 50.0), Coord::new(10.1, 50.1), Coord::new(10.2, 50.0)], true, &mut notes);
     assert!(drawn.is_empty());
-    assert!(notes.past_allowance);
+    assert_eq!(notes.past_allowance, 1);
 }
 
 #[test]
