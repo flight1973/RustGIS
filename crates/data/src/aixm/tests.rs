@@ -1358,7 +1358,7 @@ fn a_rhumb_line_near_a_pole_ends_at_its_points() {
 fn a_three_point_circle_past_the_allowance_keeps_eight_points_and_says_so() {
     let mut shapes = Shapes::default();
     let mut notes = ShapeNotes::default();
-    let drawn = shapes.arcs_through(&[Coord::new(10.0, 50.0), Coord::new(10.1, 50.1), Coord::new(10.2, 50.0)], true, &mut notes);
+    let drawn = shapes.arcs_through(&[Coord::new(10.0, 50.0), Coord::new(10.1, 50.1), Coord::new(10.2, 50.0)], "Circle", &mut notes);
     assert_eq!(drawn.len(), 9);
     assert!(notes.coarse);
 }
@@ -1393,11 +1393,17 @@ fn an_arc_with_too_few_positions_is_drawn_through_them_and_an_empty_one_is_skipp
     assert!(said(&out).iter().any(|m| m.contains("1 feature has an arc or circle drawn straight")), "{:?}", said(&out));
     let out = run("50 11 50.5 11.5 51 11");
     assert!(!said(&out).iter().any(|m| m.contains("drawn straight:") || m.contains("with no positions")), "{:?}", said(&out));
-    // An Arc of five positions: all of them drawn, as an ArcString would be, and said.
+    // An Arc of five positions: all of them drawn, as an ArcString would be.
     let out = run("50 11 50.5 11.5 51 11 51.5 10.5 52 11");
-    assert!(said(&out).iter().any(|m| m.contains("not given the three positions")), "{:?}", said(&out));
+    assert!(!said(&out).iter().any(|m| m.contains("not given the three positions") || m.contains("straight between")), "{:?}", said(&out));
     let Some(Geometry::Line(l)) = &layer(&out, "t RouteSegment").features[0].geometry else { panic!("not drawn") };
     assert!(l[0].last().is_some_and(|c| (c.x - 11.0).abs() < 1e-9 && (c.y - 52.0).abs() < 1e-9), "{:?}", l[0].last());
+    // Of four: the last joined straight, said under its own name.
+    let out = run("50 11 50.5 11.5 51 11 51.5 10.5");
+    assert!(said(&out).iter().any(|m| m.contains("drawn straight between their positions (Arc)")), "{:?}", said(&out));
+    // Two positions: no arc drawn, so none said.
+    let out = run("50 11 51 11");
+    assert!(!said(&out).iter().any(|m| m.contains("drawn as points along them")), "{:?}", said(&out));
 }
 
 #[test]
@@ -1437,13 +1443,13 @@ fn a_circle_given_more_than_three_positions_or_in_a_line_is_said() {
     let mut shapes = Shapes { budget: 1_000_000, ..Shapes::default() };
     let mut notes = ShapeNotes::default();
     let c = [Coord::new(10.0, 50.0), Coord::new(10.1, 50.1), Coord::new(10.2, 50.0), Coord::new(10.1, 49.9)];
-    shapes.arcs_through(&c, true, &mut notes);
+    shapes.arcs_through(&c, "Circle", &mut notes);
     assert!(notes.short_arcs && !notes.straight_arcs);
     let mut notes = ShapeNotes::default();
-    shapes.arcs_through(&[Coord::new(10.0, 50.0), Coord::new(10.0, 50.1), Coord::new(10.0, 50.2)], false, &mut notes);
+    shapes.arcs_through(&[Coord::new(10.0, 50.0), Coord::new(10.0, 50.1), Coord::new(10.0, 50.2)], "Arc", &mut notes);
     assert!(notes.straight_arcs && !notes.short_arcs);
     let mut notes = ShapeNotes::default();
-    shapes.arcs_through(&c[..3], true, &mut notes);
+    shapes.arcs_through(&c[..3], "Circle", &mut notes);
     assert!(!notes.straight_arcs && !notes.short_arcs);
 }
 
@@ -1480,4 +1486,19 @@ fn a_patch_left_out_for_its_hole_is_counted_beside_the_holes_reason() {
     let notes = said(&out);
     assert!(notes.iter().any(|m| m.contains("1 ring or surface patch was left out")), "{notes:?}");
     assert!(notes.iter().any(|m| m.contains("1 border is given by reference")), "{notes:?}");
+}
+
+#[test]
+fn a_chain_of_arcs_across_180_degrees_stays_whole() {
+    let mut shapes = Shapes { budget: 1_000_000, ..Shapes::default() };
+    let mut notes = ShapeNotes::default();
+    let c = [
+        Coord::new(179.90, 10.0),
+        Coord::new(179.95, 10.02),
+        Coord::new(179.98, 10.0),
+        Coord::new(-179.97, 9.98),
+        Coord::new(-179.92, 10.0),
+    ];
+    let line = shapes.arcs_through(&c, "ArcString", &mut notes);
+    assert!(line.windows(2).all(|w| (w[1].x - w[0].x).abs() < 1.0), "{line:?}");
 }

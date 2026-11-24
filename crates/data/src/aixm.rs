@@ -621,8 +621,8 @@ struct ShapeNotes {
     followed_whole: usize,
     /// A route segment drawn between the points it names, having no curve.
     between: bool,
-    /// An arc or circle not given the three positions it needs (fewer, or an Arc or Circle given
-    /// more): drawn through the positions it has (a circle through its first three).
+    /// An arc or circle not given the three positions it needs (fewer, or a circle given more):
+    /// drawn through the positions it has (a circle through its first three).
     short_arcs: bool,
     /// An arc or circle whose points are in a line, or past the largest radius: drawn straight.
     straight_arcs: bool,
@@ -673,6 +673,18 @@ fn next_to(c: Coord, near: f64) -> Coord {
 }
 
 impl ShapeNotes {
+    /// What a shape that wasn't drawn found: why, not how it was drawn.
+    fn losses_only(self) -> ShapeNotes {
+        ShapeNotes {
+            rings_lost: self.rings_lost,
+            referenced: self.referenced,
+            border_allowance: self.border_allowance,
+            border_unusable: self.border_unusable,
+            path_unread: self.path_unread,
+            ..ShapeNotes::default()
+        }
+    }
+
     /// Adds what another shape's reading found.
     fn absorb(&mut self, o: ShapeNotes) {
         self.arcs |= o.arcs;
@@ -819,13 +831,7 @@ impl Shapes {
                     notes.empty_arcs = true;
                     return Some(Vec::new());
                 }
-                notes.arcs = true;
-                // An Arc is one arc, through three positions: any more are drawn as an ArcString
-                // would be, and said.
-                if local(&s) == "Arc" && c.len() > 3 {
-                    notes.short_arcs = true;
-                }
-                Some(self.arcs_through(&c, local(&s) == "Circle", notes))
+                Some(self.arcs_through(&c, local(&s), notes))
             }
             other => {
                 if !notes.unread_segments.iter().any(|n| n == other) {
@@ -957,17 +963,25 @@ impl Shapes {
 
     /// Arcs through each three points (`Arc`, `ArcString`: start, a point on it, end; the next arc
     /// starting at the last's end), or a full circle through three (`Circle`).
-    fn arcs_through(&mut self, c: &[Coord], circle: bool, notes: &mut ShapeNotes) -> Vec<Coord> {
+    fn arcs_through(&mut self, c: &[Coord], name: &str, notes: &mut ShapeNotes) -> Vec<Coord> {
+        let circle = name == "Circle";
         if c.len() < 3 {
             notes.short_arcs = true;
             return c.to_vec();
         }
         let mut out: Vec<Coord> = Vec::new();
+        // Each point next to the one before it, so a chain of arcs across 180 degrees stays whole.
+        let put = |out: &mut Vec<Coord>, p: Coord| {
+            let p = out.last().map_or(p, |l| next_to(p, l.x));
+            out.push(p);
+        };
         let mut i = 0;
         while let (Some(&a), Some(&m), Some(&b)) = (c.get(i), c.get(i + 1), c.get(i + 2)) {
             let arc = self.arc_through(a, m, b, circle, notes);
             let skip = usize::from(!out.is_empty());
-            out.extend(arc.into_iter().skip(skip));
+            for p in arc.into_iter().skip(skip) {
+                put(&mut out, p);
+            }
             if circle {
                 break;
             }
@@ -979,9 +993,11 @@ impl Shapes {
         }
         // An odd position past the last arc: joined straight, and said.
         if !circle && i + 1 < c.len() {
-            out.extend(c.iter().skip(i + 1).copied());
-            if !notes.unread_segments.iter().any(|n| n == "ArcString") {
-                notes.unread_segments.push("ArcString".to_string());
+            for &p in c.iter().skip(i + 1) {
+                put(&mut out, p);
+            }
+            if !notes.unread_segments.iter().any(|n| n == name) {
+                notes.unread_segments.push(name.to_string());
             }
         }
         out
@@ -1006,6 +1022,7 @@ impl Shapes {
             notes.straight_arcs = true;
             return straight;
         }
+        notes.arcs = true;
         let ang = |p: Coord| (p.y - uy).atan2(p.x - ux);
         // Counter-clockwise when a → m → b turns left.
         let ccw = (pm.x - pa.x) * (pb.y - pm.y) - (pm.y - pa.y) * (pb.x - pm.x) > 0.0;
@@ -2629,8 +2646,8 @@ fn feature_rows(
             let mut notes = ShapeNotes::default();
             let geom = shapes.shape(g, &mut notes);
             let (gs, n) = by_family.entry(element_family(local(&g))).or_default();
+            n.absorb(if geom.is_some() { notes } else { notes.losses_only() });
             gs.extend(geom);
-            n.absorb(notes);
         }
         // What the feature was is said once for it, with its first row.
         let change = if k == 0 { change } else { (false, false) };
@@ -3089,7 +3106,7 @@ fn finish(
         say(
             layer.short_arcs,
             "feature has an arc or circle not given the three positions it needs, drawn through the positions it has (a circle through its first three)",
-            "features have an arc or circle not given the three positions it needs, drawn through the positions they have (a circle through its first three)",
+            "features have an arc or circle not given the three positions it needs, drawn through the positions they have (circles through their first three)",
         );
         say(
             layer.straight_arcs,
@@ -3098,8 +3115,8 @@ fn finish(
         );
         say(
             layer.empty_arcs,
-            "feature has an arc or circle with no positions, left out: its line goes on without it",
-            "features have an arc or circle with no positions, left out: their lines go on without them",
+            "feature has an arc or circle with no positions, left out: its line is joined straight from the positions either side",
+            "features have an arc or circle with no positions, left out: their lines are joined straight from the positions either side",
         );
         say(
             layer.path_unread,
