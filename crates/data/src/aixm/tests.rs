@@ -1380,11 +1380,36 @@ fn an_arc_with_too_few_positions_is_drawn_straight_and_said_and_none_is_unreadab
     };
     let out = run("50 11 51 11");
     assert!(layer(&out, "t RouteSegment").features[0].geometry.is_some());
-    assert!(said(&out).iter().any(|m| m.contains("1 feature has an arc given fewer than the three positions")), "{:?}", said(&out));
+    assert!(said(&out).iter().any(|m| m.contains("1 feature has an arc or circle not given the three positions")), "{:?}", said(&out));
     let out = run("50 11 50.5 11.5 51 11");
-    assert!(!said(&out).iter().any(|m| m.contains("fewer than the three positions")), "{:?}", said(&out));
+    assert!(!said(&out).iter().any(|m| m.contains("not given the three positions")), "{:?}", said(&out));
     let out = run("");
-    assert_eq!(layer(&out, "t RouteSegment").features[0].geometry, None);
+    assert!(layer(&out, "t RouteSegment").features[0].geometry.is_some());
+    assert!(said(&out).iter().any(|m| m.contains("1 feature has an arc or circle not given the three positions")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_circle_given_more_than_three_positions_or_in_a_line_is_said() {
+    let mut shapes = Shapes { budget: 1_000_000, ..Shapes::default() };
+    let mut notes = ShapeNotes::default();
+    let c = [Coord::new(10.0, 50.0), Coord::new(10.1, 50.1), Coord::new(10.2, 50.0), Coord::new(10.1, 49.9)];
+    shapes.arcs_through(&c, true, &mut notes);
+    assert!(notes.short_arcs && !notes.straight_arcs);
+    let mut notes = ShapeNotes::default();
+    shapes.arcs_through(&[Coord::new(10.0, 50.0), Coord::new(10.0, 50.1), Coord::new(10.0, 50.2)], false, &mut notes);
+    assert!(notes.straight_arcs && !notes.short_arcs);
+    let mut notes = ShapeNotes::default();
+    shapes.arcs_through(&c[..3], true, &mut notes);
+    assert!(!notes.straight_arcs && !notes.short_arcs);
+}
+
+#[test]
+fn a_small_circle_with_points_to_spare_keeps_what_it_needs() {
+    let mut shapes = Shapes { budget: 1_000_000, ..Shapes::default() };
+    let mut notes = ShapeNotes::default();
+    let n = shapes.pieces(0.5, 360.0, &mut notes);
+    assert_eq!(n, 4);
+    assert!(!notes.coarse);
 }
 
 #[test]

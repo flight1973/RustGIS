@@ -621,8 +621,11 @@ struct ShapeNotes {
     followed_whole: usize,
     /// A route segment drawn between the points it names, having no curve.
     between: bool,
-    /// An arc given fewer than the three positions it needs, drawn straight between them.
+    /// An arc or circle not given the three positions it needs (fewer, or a circle given more):
+    /// drawn through the positions it has, or the first three.
     short_arcs: bool,
+    /// An arc or circle whose points are in a line, or past the largest radius: drawn straight.
+    straight_arcs: bool,
     /// A route segment with no curve and a `pathType` RustGIS doesn't draw.
     path_unread: bool,
     /// Borders by reference not followed: past the work allowed, or too short to cut.
@@ -687,6 +690,7 @@ impl ShapeNotes {
         self.border_unusable += o.border_unusable;
         self.between |= o.between;
         self.short_arcs |= o.short_arcs;
+        self.straight_arcs |= o.straight_arcs;
         self.path_unread |= o.path_unread;
     }
 }
@@ -809,9 +813,6 @@ impl Shapes {
             "Arc" | "ArcString" | "Circle" => {
                 notes.arcs = true;
                 let c = Self::positions(s, axes, notes)?;
-                if c.is_empty() {
-                    return None;
-                }
                 Some(self.arcs_through(&c, local(&s) == "Circle", notes))
             }
             other => {
@@ -888,8 +889,13 @@ impl Shapes {
         let want = need.clamp(4, MAX_ARC_POINTS);
         // A full circle keeps at least 8 pieces past the allowance (said as coarse): each circle
         // in the text is far longer than 8 points, so the extra stays bounded by the file's size.
-        let floor = if sweep_deg.abs() >= 360.0 { 8 } else { 1 };
-        (self.take(want - 1, notes) + 1).max(floor)
+        let n = self.take(want - 1, notes) + 1;
+        let floor = want.min(8);
+        if sweep_deg.abs() >= 360.0 && n < floor {
+            self.budget = self.budget.saturating_sub(floor - n);
+            return floor;
+        }
+        n
     }
 
     /// An `ArcByCenterPoint` or `CircleByCenterPoint`.
@@ -955,6 +961,10 @@ impl Shapes {
             }
             i += 2;
         }
+        // A circle is through its first three positions: any more are said.
+        if circle && c.len() > 3 {
+            notes.short_arcs = true;
+        }
         // An odd position past the last arc: joined straight, and said.
         if !circle && i + 1 < c.len() {
             out.extend(c.iter().skip(i + 1).copied());
@@ -973,6 +983,7 @@ impl Shapes {
         let d = 2.0 * (pa.x * (pm.y - pb.y) + pm.x * (pb.y - pa.y) + pb.x * (pa.y - pm.y));
         let straight = vec![a, m, b];
         if !d.is_finite() || d.abs() < 1e-9 {
+            notes.straight_arcs = true;
             return straight;
         }
         let sq = |p: Coord| p.x * p.x + p.y * p.y;
@@ -980,6 +991,7 @@ impl Shapes {
         let uy = (sq(pa) * (pb.x - pm.x) + sq(pm) * (pa.x - pb.x) + sq(pb) * (pm.x - pa.x)) / d;
         let r = (pa.x - ux).hypot(pa.y - uy);
         if !r.is_finite() || r > MAX_RADIUS_M {
+            notes.straight_arcs = true;
             return straight;
         }
         let ang = |p: Coord| (p.y - uy).atan2(p.x - ux);
@@ -1483,8 +1495,10 @@ struct Layer {
     far: usize,
     /// Route segments drawn between the points they name.
     between: usize,
-    /// Features with an arc or circle not drawn: the point allowance ran out.
+    /// Features with an arc or circle not given the three positions it needs.
     short_arcs: usize,
+    /// Features with an arc or circle drawn straight: its points in a line, or too far apart.
+    straight_arcs: usize,
     /// Route segments with no curve and a `pathType` RustGIS doesn't draw.
     path_unread: usize,
     /// Rows left out: the table they'd make passes the memory the file's size allows.
@@ -1537,6 +1551,7 @@ impl Layer {
         self.far += n.far;
         self.between += usize::from(n.between);
         self.short_arcs += usize::from(n.short_arcs);
+        self.straight_arcs += usize::from(n.straight_arcs);
         self.path_unread += usize::from(n.path_unread);
         self.border_allowance += n.border_allowance;
         self.border_unusable += n.border_unusable;
@@ -1871,7 +1886,7 @@ struct Layers {
     /// Rows left out past that.
     rows_over: usize,
     list: Vec<Layer>,
-    /// Features of kinds past [`MAX_LAYERS`], by identifier.
+    /// Features of kinds past [`MAX_LAYERS`], by kind and identifier.
     over: HashSet<String>,
     /// The feature being read (its kind and identifier): what `over` counts.
     feature: String,
@@ -2224,7 +2239,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     };
     // Rows of features with nothing to draw, by kind, kept until it is known whether the kind has
     // a layer to hold them.
-    let mut shapeless: Vec<(String, Row, usize, bool)> = Vec::new();
+    let mut shapeless: Vec<(String, Row, usize, bool, String)> = Vec::new();
     let mut held_left = text.len().saturating_mul(2).max(MIN_ROW_BYTES);
     // GeoBorders first: airspace borders follow them by reference; route segments last: one with
     // no curve is drawn between the points it names.
@@ -2376,13 +2391,14 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
                 layers.rows_over += 1;
             } else {
                 held_left -= w;
-                shapeless.push((kind.to_string(), row, temporary, snapshot));
+                shapeless.push((kind.to_string(), row, temporary, snapshot, layers.feature.clone()));
             }
         }
     }
     // Features with nothing to draw: in their kind's layer when it has one, as a table for the
     // kinds that are tables, else counted.
-    for (kind, row, temporary, snapshot) in shapeless {
+    for (kind, row, temporary, snapshot, feature) in shapeless {
+        layers.feature = feature;
         let change = (temporary > 0, snapshot);
         if layers.has_kind(&kind) {
             let label = layers.list.iter().find(|l| l.kind == kind).map(|l| l.label.clone()).unwrap_or_default();
@@ -3053,8 +3069,13 @@ fn finish(
         );
         say(
             layer.short_arcs,
-            "feature has an arc given fewer than the three positions it needs, drawn straight between them",
-            "features have an arc given fewer than the three positions it needs, drawn straight between them",
+            "feature has an arc or circle not given the three positions it needs, drawn through the positions it has (a circle through its first three)",
+            "features have an arc or circle not given the three positions it needs, drawn through the positions they have (a circle through its first three)",
+        );
+        say(
+            layer.straight_arcs,
+            "feature has an arc or circle drawn straight: its points are in a line, or too far apart to be one",
+            "features have an arc or circle drawn straight: their points are in a line, or too far apart to be one",
         );
         say(
             layer.path_unread,
