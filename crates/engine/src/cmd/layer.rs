@@ -2348,12 +2348,17 @@ pub(crate) fn check_at(p: &Value, file_name: &str, aixm: impl FnOnce() -> bool) 
     rustgis_data::aixm::Options::at_text(at)
 }
 
+/// How a refusal names an address: not quoted, since it can hold a key, but a zip said as one.
+fn unquoted(url: &str) -> &'static str {
+    if address_extension(url).as_deref() == Some("zip") { "that address's .zip" } else { "the file at that address" }
+}
+
 /// Refuses an effective date (`"at"`) for an address that can't be an AIXM message (one naming
 /// another kind of file), before anything is downloaded: what `layer.addUrl` does, for the app's
 /// own way of adding an address.
 pub fn check_url_at(p: &Value) -> Result<(), String> {
     let url = ps(p, "url").map(str::trim).unwrap_or("");
-    check_at(p, "the file at that address", || address_extension(url).is_none_or(|e| e == "xml" || e == "gml")).map(|_| ())
+    check_at(p, unquoted(url), || address_extension(url).is_none_or(|e| e == "xml" || e == "gml")).map(|_| ())
 }
 
 /// Whether a file named `path` may be an AIXM message: by its first bytes on the desktop, by its
@@ -5055,7 +5060,7 @@ pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
     // An effective date is for an AIXM message only (`.xml`, `.gml`, or an address that doesn't
     // say, whose contents are checked once fetched): refused for any other address, before it is
     // opened in place or downloaded.
-    check_at(p, "the file at that address", || address_extension(url).is_none_or(|e| e == "xml" || e == "gml"))?;
+    check_at(p, unquoted(url), || address_extension(url).is_none_or(|e| e == "xml" || e == "gml"))?;
     let out = add_url_as_given(s, p).map_err(|e| crate::sources::message_with_address(url, &e))?;
     s.check_continuation(&owner)?;
     Ok(out)

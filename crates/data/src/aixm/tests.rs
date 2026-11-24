@@ -1523,7 +1523,47 @@ fn a_snapshot_keeps_a_temporary_change_over_a_permanent_one_since() {
     assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("TEMP".into())]);
     let (got, notes) = names(&bytes, "2026-02-15");
     assert_eq!(got, [Value::Text("PERM".into())]);
-    assert!(notes.iter().any(|m| m.contains("with any changes the file gives since")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.contains("with the changes the file gives for the date asked")), "{notes:?}");
+}
+
+#[test]
+fn a_temporary_change_begun_after_a_snapshot_goes_over_it() {
+    let temp = slice(
+        "DesignatedPoint",
+        "TEMPDELTA",
+        1,
+        0,
+        &period("2026-01-10T00:00:00Z", Some("2026-01-20T00:00:00Z")),
+        "<aixm:name>TEMP</aixm:name>",
+    );
+    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "SNAP"), temp]));
+    assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("TEMP".into())]);
+    assert_eq!(names(&bytes, "2026-01-25").0, [Value::Text("SNAP".into())]);
+}
+
+#[test]
+fn a_slice_that_cant_be_read_hides_nothing_it_cant_apply_to() {
+    let base = baseline(1, 0, "2025-01-01T00:00:00Z", None, "BASE");
+    // A change that begins after the date, its end not a date.
+    let later = slice("DesignatedPoint", "TEMPDELTA", 2, 0, &period("2030-01-01T00:00:00Z", Some("bad")), "<aixm:name>X</aixm:name>");
+    let bytes = message(&point("a", &[base.clone(), later]));
+    assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("BASE".into())]);
+    let e = read("t.xml", &bytes, &at("2031-01-15")).unwrap_err().to_string();
+    assert!(e.contains("may apply"), "{e}");
+    // A permanent change begun before the state on the date, its lifetime not a date.
+    let instant = r#"<gml:validTime><gml:TimeInstant gml:id="i"><gml:timePosition>2024-01-01T00:00:00Z</gml:timePosition></gml:TimeInstant></gml:validTime>"#;
+    let lifetime = r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>bad</gml:beginPosition><gml:endPosition/></gml:TimePeriod></aixm:featureLifetime>"#;
+    let old = slice("DesignatedPoint", "PERMDELTA", 2, 0, instant, lifetime);
+    assert_eq!(names(&message(&point("a", &[base, old])), "2026-01-15").0, [Value::Text("BASE".into())]);
+}
+
+#[test]
+fn a_canceled_correction_of_one_that_cant_be_read_is_canceled() {
+    let bad = slice("DesignatedPoint", "BASELINE", 1, 0, &period("bad", None), &named_point("A"));
+    let canceled = slice("DesignatedPoint", "BASELINE", 1, 1, r#"<gml:validTime nilReason="inapplicable"/>"#, "");
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let notes = names(&message(&(point("a", &[bad, canceled]) + &kept)), "2026-01-15").1;
+    assert!(notes.iter().any(|m| m.contains("canceled")) && !notes.iter().any(|m| m.contains("may apply")), "{notes:?}");
 }
 
 #[test]
@@ -1536,6 +1576,7 @@ fn a_change_or_snapshot_that_cant_be_read_withholds_its_feature() {
         vec![base.clone(), temp(0, unknown)],
         vec![base.clone(), temp(0, &period("2026-01-01T00:00:00Z", None)), temp(1, unknown)],
         vec![snapshot_at("not-a-date", "SNAP")],
+        vec![snapshot_at("2025-01-01T00:00:00Z", "OLD"), snapshot_at("not-a-date", "NEW")],
     ] {
         let (got, notes) = names(&message(&(point("a", &slices) + &kept)), "2026-01-15");
         assert_eq!(got, [Value::Text("KEPT".into())]);

@@ -384,7 +384,7 @@ struct Slice {
     /// The feature's lifetime, when the slice says it.
     lifetime: Option<(Option<f64>, Option<f64>)>,
     /// Its validity or lifetime isn't a date: it keeps its place among its corrections, and
-    /// the feature is left out when it is the latest of them.
+    /// the feature is left out when it is the latest of them and may apply on the date.
     unreadable: bool,
 }
 
@@ -427,10 +427,7 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     let mut snapshots: Vec<&Slice> = Vec::new();
     for s in slices {
         if s.kind == Interpretation::Snapshot {
-            // A snapshot whose instant isn't a date can't be placed: not read (counted).
-            if !s.unreadable {
-                snapshots.push(s);
-            }
+            snapshots.push(s);
             continue;
         }
         let key = (s.kind as u8, s.sequence);
@@ -441,19 +438,22 @@ fn state_at(slices: &[Slice], t: f64) -> State {
             }
         }
     }
-    // A state or change whose latest correction isn't a date may hold at any date: what the
-    // feature is then can't be known, and showing it without that would be wrong.
-    if held.values().any(|s| s.unreadable) {
+    // Slices with a date that isn't one are judged by the dates they do have (one missing is
+    // open): where one may apply, what the feature is then can't be known, and showing it without
+    // that would be wrong.
+    let (unread, live): (Vec<&Slice>, Vec<&Slice>) =
+        held.values().copied().chain(snapshots).filter(|s| !s.canceled).partition(|s| s.unreadable);
+    let unread_of = |k: Interpretation| unread.iter().copied().filter(move |s| s.kind == k);
+    if unread_of(Interpretation::Baseline).any(|s| in_force(s.begin, s.end, t)) {
         return State::Unreadable;
     }
-    let live: Vec<&Slice> = held.values().copied().chain(snapshots).filter(|s| !s.canceled && !s.unreadable).collect();
     if live.is_empty() {
-        return if slices.is_empty() {
-            State::OnlyChanges
-        } else if slices.iter().any(|s| s.unreadable) {
-            State::Unreadable
-        } else {
-            State::Canceled
+        let state = unread_of(Interpretation::Baseline).chain(unread_of(Interpretation::Snapshot)).next();
+        return match (state, unread.is_empty()) {
+            (Some(_), _) => State::Unreadable,
+            (None, false) => State::OnlyChanges,
+            _ if slices.is_empty() => State::OnlyChanges,
+            _ => State::Canceled,
         };
     }
     let of = |k: Interpretation| live.iter().copied().filter(move |s| s.kind == k);
@@ -474,9 +474,11 @@ fn state_at(slices: &[Slice], t: f64) -> State {
                     of(Interpretation::Snapshot).min_by(|a, b| a.begin.unwrap_or(f64::MAX).total_cmp(&b.begin.unwrap_or(f64::MAX)))
                 });
             match snap {
-                Some(s) if baselines == 0 => (s, true),
                 _ if baselines > 0 => return State::NotInForce,
-                _ => return State::OnlyChanges,
+                // Another that can't be placed may be the nearer.
+                _ if unread_of(Interpretation::Snapshot).next().is_some() => return State::Unreadable,
+                Some(s) => (s, true),
+                None => return State::OnlyChanges,
             }
         }
     };
@@ -492,6 +494,11 @@ fn state_at(slices: &[Slice], t: f64) -> State {
         && !in_force(from, until, t)
     {
         return State::OutsideLifetime;
+    }
+    let perm_may_apply = |s: &Slice| s.begin.is_none_or(|b| b <= t && base.begin.is_none_or(|bb| b > bb));
+    if unread_of(Interpretation::PermDelta).any(perm_may_apply) || unread_of(Interpretation::TempDelta).any(|s| in_force(s.begin, s.end, t))
+    {
+        return State::Unreadable;
     }
     // Over a SNAPSHOT too: one it already holds is put back over any PERMDELTA since.
     let mut temps: Vec<Slice> = of(Interpretation::TempDelta).filter(|s| in_force(s.begin, s.end, t)).cloned().collect();
@@ -579,8 +586,8 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
     let (sequence, correction) = (number("sequenceNumber"), number("correctionNumber"));
     if bad {
         trouble.dates += 1;
-        let (begin, end, canceled, lifetime) = (None, None, false, None);
-        return Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled, lifetime, unreadable: true });
+        // The dates that are dates are kept: they say when it can't apply.
+        return Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled: false, lifetime: None, unreadable: true });
     }
     trouble.numbers += usize::from(unread_number.get());
     trouble.empty += empty.get();
@@ -3266,8 +3273,8 @@ fn finish(
         );
         say(
             layer.snapshots,
-            "feature is a SNAPSHOT: its state at its own instant, with any changes the file gives since, which may not be its state on the date asked",
-            "features are SNAPSHOTs: their state at their own instant, with any changes the file gives since, which may not be their state on the date asked",
+            "feature is a SNAPSHOT: its state at its own instant, with the changes the file gives for the date asked, which may not be its state on the date asked",
+            "features are SNAPSHOTs: their state at their own instant, with the changes the file gives for the date asked, which may not be their state on the date asked",
         );
         say(
             layer.over_bytes,

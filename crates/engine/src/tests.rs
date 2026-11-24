@@ -24179,6 +24179,8 @@ fn aixm_messages_are_added_at_the_date_asked() {
     assert!(e.contains("isn't one"), "{e}");
     let e = s.run("layer.addUrl", &json!({"url": "https://example.com/roads.fgb?token=SECRET", "at": "2026-01-15"})).unwrap_err();
     assert!(!e.contains("SECRET"), "{e}");
+    let z = s.run("layer.addUrl", &json!({"url": "https://example.com/a.zip?token=SECRET", "at": "2026-01-15"})).unwrap_err();
+    assert!(z.contains("unzip it") && !z.contains("SECRET"), "{z}");
     assert!(e.contains("isn't one"), "{e}");
     // An address with no extension found to be a GeoTIFF refuses it too, before it is added.
     let e = crate::cmd::layer::add_cog(&mut s, &json!({"at": "2026-01-15"}), "https://example.test/download", true).unwrap_err();
