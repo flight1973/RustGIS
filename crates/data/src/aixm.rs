@@ -489,6 +489,7 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     };
     // PERMDELTAs since the state began, up to the date, in order.
     let since = |s: &Slice| s.begin.is_none_or(|b| b <= t && base.begin.is_none_or(|bb| b > bb));
+    // One that can't be read may be a withdrawal: its feature is left out, a SNAPSHOT's too.
     if unread_of(Interpretation::PermDelta).any(since) {
         return State::Unreadable;
     }
@@ -509,7 +510,10 @@ fn state_at(slices: &[Slice], t: f64) -> State {
         // defined over a baseline: it is shown as it is, and changes it can't hold are said.
         // A temporary change in force at its instant or on the date, not both, isn't reflected.
         let differs = |s: &Slice| in_force(s.begin, s.end, t) != base.begin.is_some_and(|bb| in_force(s.begin, s.end, bb));
-        let skipped = !changes.is_empty() || of(Interpretation::TempDelta).chain(unread_of(Interpretation::TempDelta)).any(differs);
+        // One that can't be read may be either, unless the dates it has rule it out on both.
+        let may_differ = |s: &Slice| in_force(s.begin, s.end, t) || base.begin.is_none_or(|bb| in_force(s.begin, s.end, bb));
+        let skipped =
+            !changes.is_empty() || of(Interpretation::TempDelta).any(differs) || unread_of(Interpretation::TempDelta).any(may_differ);
         return State::Use { base: base.clone(), changes: Vec::new(), snapshot, temporary: 0, skipped };
     }
     if unread_temp {
@@ -606,7 +610,6 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
         });
     let (sequence, correction) = (number("sequenceNumber"), number("correctionNumber"));
     trouble.numbers += usize::from(unread_number.get());
-    trouble.empty += empty.get();
     // A PERMDELTA applies from its instant: one without can't be placed.
     bad |= kind == Interpretation::PermDelta && begin.is_none();
     // A canceled slice is off the timeline, whatever else it holds.
@@ -615,6 +618,7 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
         // The dates that are dates are kept: they say when it can't apply.
         return Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled: false, lifetime: None, unreadable: true });
     }
+    trouble.empty += empty.get();
     Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled, lifetime, unreadable: false })
 }
 
@@ -2633,6 +2637,14 @@ fn no_positions(g: Node) -> bool {
     })
 }
 
+/// How many shapes of a route segment's record aren't drawn: those with positions, but for the
+/// points its line is `drawn` between.
+fn undrawn_shapes(p: Node, drawn: bool) -> usize {
+    let end = drawn && matches!(local(&p), "start" | "end");
+    let in_line = |g: &Node| end && g.parent_element().is_some_and(|c| local(&c) == "pointChoice_position");
+    nested_shapes(p).into_iter().filter(|g| !no_positions(*g) && !in_line(g)).count()
+}
+
 /// Whether a route segment's start or end links to a point that isn't in the file.
 fn names_a_missing_point(props: &[Node], shapes: &Shapes) -> bool {
     props.iter().filter(|p| matches!(local(p), "start" | "end")).any(|p| {
@@ -2748,10 +2760,7 @@ fn feature_rows(
     {
         let mut in_records = 0;
         for p in parts.iter().chain(&unlocated) {
-            // Its ends are in its line.
-            if line.is_none() || !matches!(local(p), "start" | "end") {
-                in_records += nested_shapes(*p).len();
-            }
+            in_records += undrawn_shapes(*p, line.is_some());
             row.property(*p, "");
         }
         let line = line.map(|l| vec![l]);
@@ -2773,7 +2782,7 @@ fn feature_rows(
                     let _ = shapes.shape(g, &mut ShapeNotes::default());
                 }
             }
-            in_records += nested_shapes(*p).len();
+            in_records += undrawn_shapes(*p, false);
             row.property(*p, "");
         }
         let notes = ShapeNotes { route_unlocated: missing, route_no_ends: !missing, ..ShapeNotes::default() };
@@ -3066,14 +3075,14 @@ fn finish(
         notes.unreadable_state,
         "feature",
         "features",
-        "left out: a time slice of it that may apply (the latest correction) has no validTime or period, or a validTime or featureLifetime that can't be read",
+        "left out: a time slice of it that may apply (the latest correction) has no validTime, period or instant, or a validTime or featureLifetime that can't be read",
     );
     say(
         &mut file,
         notes.snapshot_changes,
         "feature",
         "features",
-        "shown as a SNAPSHOT without the changes the file gives since its instant (begun or ended): changes apply to a BASELINE",
+        "shown as a SNAPSHOT without changes the file gives (or may give) between its instant and the date asked: changes apply to a BASELINE",
     );
     say(&mut file, notes.no_slices, "feature", "features", "with no time slice RustGIS reads left out");
     say(
@@ -3103,7 +3112,7 @@ fn finish(
         notes.bad_dates,
         "time slice",
         "time slices",
-        "with no validTime or period, or with a validTime or featureLifetime that can't be read (a feature it may apply to is left out)",
+        "with no validTime, period or instant, or with a validTime or featureLifetime that can't be read (a feature it may apply to is left out, or shown as its SNAPSHOT)",
     );
     say(
         &mut file,
@@ -3271,8 +3280,8 @@ fn finish(
         );
         say(
             layer.shapes_in_records,
-            "shape in the records of features drawn from their own shape isn't drawn (its record's values are kept)",
-            "shapes in the records of features drawn from their own shapes aren't drawn (their records' values are kept)",
+            "shape in the records of features drawn from their own shape, or of route segments, isn't drawn (its record's values are kept)",
+            "shapes in the records of features drawn from their own shapes, or of route segments, aren't drawn (their records' values are kept)",
         );
         say(
             layer.arcs,

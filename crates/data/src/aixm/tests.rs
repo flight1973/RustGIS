@@ -1163,7 +1163,7 @@ fn an_empty_valid_time_cancels_only_when_it_says_so() {
     let members = point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]) + &point("b", &[unknown]);
     let (got, notes) = names(&message(&members), "2026-01-15");
     assert_eq!(got, [Value::Text("KEPT".into())]);
-    assert!(notes.iter().any(|m| m.starts_with("1 time slice with no validTime or period")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.starts_with("1 time slice with no validTime, period or instant")), "{notes:?}");
     assert!(!notes.iter().any(|m| m.contains("canceled")), "{notes:?}");
 }
 
@@ -1528,12 +1528,14 @@ fn a_snapshot_is_shown_as_it_is_and_changes_since_are_said() {
         (vec![snap.clone(), perm], true),
         // In force at its instant, ended since.
         (vec![snap.clone(), change("TEMPDELTA", 1, &period("2025-12-20T00:00:00Z", Some("2026-01-10T00:00:00Z")), "")], true),
-        // Not read to its end, but begun before it and may still hold: as any it holds already.
-        (vec![snap.clone(), change("TEMPDELTA", 1, &period("2025-12-20T00:00:00Z", Some("bad")), "")], false),
+        // An end that isn't a date may be between the two; a begin after both rules it out.
+        (vec![snap.clone(), change("TEMPDELTA", 1, &period("2025-12-20T00:00:00Z", Some("bad")), "")], true),
+        (vec![snap.clone(), change("TEMPDELTA", 1, "", "")], true),
+        (vec![snap.clone(), change("TEMPDELTA", 1, &period("2027-01-01T00:00:00Z", Some("bad")), "")], false),
     ] {
         let (got, notes) = names(&message(&point("s", &slices)), "2026-01-15");
         assert_eq!(got, [Value::Text("SNAP".into())]);
-        assert_eq!(notes.iter().any(|m| m.contains("1 feature shown as a SNAPSHOT without the changes")), said, "{notes:?}");
+        assert_eq!(notes.iter().any(|m| m.contains("1 feature shown as a SNAPSHOT without changes")), said, "{notes:?}");
     }
     // Withdrawn since: not shown.
     let end = r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>2020-01-01T00:00:00Z</gml:beginPosition><gml:endPosition>2026-01-10T00:00:00Z</gml:endPosition></gml:TimePeriod></aixm:featureLifetime>"#;
@@ -1830,9 +1832,31 @@ fn a_drawn_route_segment_says_the_other_shapes_of_its_records() {
     let area = r#"<aixm:evaluationArea><aixm:Area gml:id="a"><aixm:surface><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>52 9 52 11 54 11 52 9</gml:posList></gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:surface></aixm:Area></aixm:evaluationArea>"#;
     let members = named_at("DesignatedPoint", "near", 50.0, 10.0) + &named_at("DesignatedPoint", "far", 50.0, 12.0);
     let plain = route_to("pointChoice_fixDesignatedPoint", "near");
-    for (route, count) in [(plain.clone(), 0), (plain.replace("<aixm:start>", &format!("{area}<aixm:start>")), 1)] {
+    for (route, count) in [
+        (plain.clone(), 0),
+        (plain.replace("<aixm:start>", &format!("{area}<aixm:start>")), 1),
+        (plain.replace("<aixm:end>", &format!("<aixm:end>{area}")), 1),
+    ] {
         let out = read("t.xml", &message(&(members.clone() + &route)), &at("2026-01-15")).unwrap();
         assert!(layer(&out, "t RouteSegment").features[0].geometry.is_some());
         assert_eq!(said(&out).iter().filter(|m| m.contains("1 shape")).count(), count, "{:?}", said(&out));
     }
+}
+
+#[test]
+fn an_empty_route_end_isnt_a_shape_that_isnt_drawn() {
+    let empty = r#"<aixm:end><aixm:EnRouteSegmentPoint gml:id="e"><aixm:pointChoice_position><aixm:Point gml:id="ge" srsName="urn:ogc:def:crs:EPSG::4326"><gml:pos></gml:pos></aixm:Point></aixm:pointChoice_position></aixm:EnRouteSegmentPoint></aixm:end>"#;
+    let seg = feature("RouteSegment", "rs", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), empty)]);
+    let notes = said(&read("t.xml", &message(&seg), &at("2026-01-15")).unwrap());
+    assert!(!notes.iter().any(|m| m.contains("1 shape")), "{notes:?}");
+}
+
+#[test]
+fn an_empty_instant_is_said_once() {
+    let perm =
+        change("PERMDELTA", 1, r#"<gml:validTime><gml:TimeInstant gml:id="i"><gml:timePosition/></gml:TimeInstant></gml:validTime>"#, "");
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let notes = names(&message(&(point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "A"), perm]) + &kept)), "2026-01-15").1;
+    assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice")), "{notes:?}");
+    assert!(!notes.iter().any(|m| m.contains("read as open")), "{notes:?}");
 }
