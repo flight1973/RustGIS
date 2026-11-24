@@ -1163,7 +1163,7 @@ fn an_empty_valid_time_cancels_only_when_it_says_so() {
     let members = point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]) + &point("b", &[unknown]);
     let (got, notes) = names(&message(&members), "2026-01-15");
     assert_eq!(got, [Value::Text("KEPT".into())]);
-    assert!(notes.iter().any(|m| m.starts_with("1 time slice with no validTime, or with one")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.starts_with("1 time slice with no validTime or period")), "{notes:?}");
     assert!(!notes.iter().any(|m| m.contains("canceled")), "{notes:?}");
 }
 
@@ -1526,6 +1526,10 @@ fn a_snapshot_is_shown_as_it_is_and_changes_since_are_said() {
         (vec![snap.clone(), temp("2025-12-20T00:00:00Z")], false),
         (vec![snap.clone(), temp("2026-01-10T00:00:00Z")], true),
         (vec![snap.clone(), perm], true),
+        // In force at its instant, ended since.
+        (vec![snap.clone(), change("TEMPDELTA", 1, &period("2025-12-20T00:00:00Z", Some("2026-01-10T00:00:00Z")), "")], true),
+        // Not read to its end, but begun before it and may still hold: as any it holds already.
+        (vec![snap.clone(), change("TEMPDELTA", 1, &period("2025-12-20T00:00:00Z", Some("bad")), "")], false),
     ] {
         let (got, notes) = names(&message(&point("s", &slices)), "2026-01-15");
         assert_eq!(got, [Value::Text("SNAP".into())]);
@@ -1565,6 +1569,7 @@ fn a_route_segment_is_never_drawn_as_a_point() {
         let out = read("t.xml", &message(&seg), &at("2026-01-15")).unwrap();
         assert_eq!(layer(&out, "t RouteSegment").features[0].geometry, None);
         assert!(said(&out).iter().any(|m| m.contains(why)), "{:?}", said(&out));
+        assert!(said(&out).iter().any(|m| m.contains("1 shape")), "{:?}", said(&out));
     }
 }
 
@@ -1790,4 +1795,44 @@ fn a_long_edge_ending_near_180_degrees_is_near_a_point_across_it() {
     assert!(d < 50.0, "{d}");
     let (.., d) = nearest_on(&[Coord::new(179.0, 0.0), Coord::new(-179.0, 0.0)], Coord::new(0.0, 0.0)).unwrap();
     assert!(d > 19_000_000.0, "{d}");
+}
+
+#[test]
+fn slices_that_cant_be_read_are_judged_by_the_dates_they_have() {
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let run = |slices: &[String]| names(&message(&(point("a", slices) + &kept)), "2026-01-15");
+    let shown = |slices: &[String], name: &str| run(slices).0.contains(&Value::Text(name.into()));
+    let base = baseline(2, 0, "2025-01-01T00:00:00Z", None, "BASE");
+    // A permanent change with no instant: not applied, and its feature withheld.
+    let unplaced = r#"<gml:validTime><gml:TimeInstant gml:id="i"><gml:timePosition indeterminatePosition="unknown"/></gml:TimeInstant></gml:validTime>"#;
+    assert_eq!(run(&[base.clone(), change("PERMDELTA", 1, unplaced, "<aixm:name>OTHER</aixm:name>")]).0, [Value::Text("KEPT".into())]);
+    // A baseline that began before the one that holds, its end unread; and one that began after.
+    assert!(shown(&[baseline(1, 0, "2020-01-01T00:00:00Z", Some("bad"), "OLD"), base.clone()], "BASE"));
+    assert!(!shown(&[baseline(1, 0, "2025-06-01T00:00:00Z", Some("bad"), "NEW"), base.clone()], "BASE"));
+    // A snapshot that isn't the nearest, its lifetime unread; and one that is.
+    let lifetime = r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>bad</gml:beginPosition><gml:endPosition/></gml:TimePeriod></aixm:featureLifetime>"#;
+    let unread = |date: &str| snapshot_at(date, "UNREAD").replace("<aixm:interpretation>", &format!("{lifetime}<aixm:interpretation>"));
+    let snap = snapshot_at("2026-01-01T00:00:00Z", "SNAP");
+    assert!(shown(&[unread("2024-01-01T00:00:00Z"), snap.clone()], "SNAP"));
+    assert!(shown(&[unread("2027-01-01T00:00:00Z"), snap.clone()], "SNAP"));
+    assert!(!shown(&[unread("2026-01-10T00:00:00Z"), snap], "SNAP"));
+    // A canceled change is canceled, whatever its lifetime says.
+    let canceled = change("PERMDELTA", 1, r#"<gml:validTime nilReason="inapplicable"/>"#, lifetime);
+    assert!(shown(&[base.clone(), canceled], "BASE"));
+    // A number that isn't one is said on a slice that can't be read too.
+    let odd = baseline(7, 0, "bad", None, "X").replace("<aixm:sequenceNumber>7<", "<aixm:sequenceNumber>abc<");
+    let notes = run(&[base, odd]).1;
+    assert!(notes.iter().any(|m| m.contains("number that isn't a number read as 0")), "{notes:?}");
+}
+
+#[test]
+fn a_drawn_route_segment_says_the_other_shapes_of_its_records() {
+    let area = r#"<aixm:evaluationArea><aixm:Area gml:id="a"><aixm:surface><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>52 9 52 11 54 11 52 9</gml:posList></gml:LinearRing></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:surface></aixm:Area></aixm:evaluationArea>"#;
+    let members = named_at("DesignatedPoint", "near", 50.0, 10.0) + &named_at("DesignatedPoint", "far", 50.0, 12.0);
+    let plain = route_to("pointChoice_fixDesignatedPoint", "near");
+    for (route, count) in [(plain.clone(), 0), (plain.replace("<aixm:start>", &format!("{area}<aixm:start>")), 1)] {
+        let out = read("t.xml", &message(&(members.clone() + &route)), &at("2026-01-15")).unwrap();
+        assert!(layer(&out, "t RouteSegment").features[0].geometry.is_some());
+        assert_eq!(said(&out).iter().filter(|m| m.contains("1 shape")).count(), count, "{:?}", said(&out));
+    }
 }

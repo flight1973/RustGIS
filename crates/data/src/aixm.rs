@@ -448,20 +448,21 @@ fn state_at(slices: &[Slice], t: f64) -> State {
         held.values().copied().chain(snapshots).filter(|s| !s.canceled).partition(|s| s.unreadable);
     let unread_of = |k: Interpretation| unread.iter().copied().filter(move |s| s.kind == k);
     let of = |k: Interpretation| live.iter().copied().filter(move |s| s.kind == k);
-    if unread_of(Interpretation::Baseline).any(|s| in_force(s.begin, s.end, t)) {
-        return State::Unreadable;
-    }
     // The BASELINE in force; of several (which the concept doesn't allow, TS_009), the latest
     // started, the later in the file on a tie (sequence numbers give no order, 3.6).
     let started = |s: &Slice| s.begin.unwrap_or(f64::NEG_INFINITY);
     let base = of(Interpretation::Baseline)
         .filter(|s| in_force(s.begin, s.end, t))
         .max_by(|a, b| started(a).total_cmp(&started(b)).then(a.range.0.cmp(&b.range.0)));
+    // One that can't be read may hold instead, unless it began before the one that does.
+    if unread_of(Interpretation::Baseline)
+        .any(|s| in_force(s.begin, s.end, t) && !s.begin.is_some_and(|b| base.is_some_and(|base| b < started(base))))
+    {
+        return State::Unreadable;
+    }
     let (base, snapshot) = match base {
         Some(b) => (b, false),
         None if of(Interpretation::Baseline).chain(unread_of(Interpretation::Baseline)).next().is_some() => return State::NotInForce,
-        // A snapshot that can't be placed may be the nearest.
-        None if unread_of(Interpretation::Snapshot).next().is_some() => return State::Unreadable,
         None => {
             // A SNAPSHOT is a state at its own instant: the one nearest before the date, else the
             // earliest after it.
@@ -469,6 +470,16 @@ fn state_at(slices: &[Slice], t: f64) -> State {
                 .filter(|s| s.begin.is_none_or(|b| b <= t))
                 .max_by(|a, b| started(a).total_cmp(&started(b)))
                 .or_else(|| of(Interpretation::Snapshot).min_by(|a, b| started(a).total_cmp(&started(b))));
+            // One that can't be read may be the one shown: nearer before the date, or (with none
+            // before it) earlier after.
+            let nearer = |u: &Slice| match (u.begin, snap) {
+                (Some(b), Some(s)) if started(s) <= t => b <= t && b >= started(s),
+                (Some(b), Some(s)) => b <= started(s),
+                _ => true,
+            };
+            if unread_of(Interpretation::Snapshot).any(nearer) {
+                return State::Unreadable;
+            }
             match snap {
                 Some(s) => (s, true),
                 None if live.is_empty() && unread.is_empty() && !slices.is_empty() => return State::Canceled,
@@ -491,16 +502,17 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     {
         return State::OutsideLifetime;
     }
-    let unread_temps = unread_of(Interpretation::TempDelta).filter(|s| in_force(s.begin, s.end, t)).count();
+    let unread_temp = unread_of(Interpretation::TempDelta).any(|s| in_force(s.begin, s.end, t));
     let mut temps: Vec<Slice> = of(Interpretation::TempDelta).filter(|s| in_force(s.begin, s.end, t)).cloned().collect();
     if snapshot {
         // A SNAPSHOT is a baseline and its temporary changes already merged (3.4), and changes are
         // defined over a baseline: it is shown as it is, and changes it can't hold are said.
-        let begun_since = temps.iter().filter(|s| base.begin.is_none_or(|bb| s.begin.is_none_or(|b| b > bb))).count();
-        let skipped = !changes.is_empty() || begun_since > 0 || unread_temps > 0;
+        // A temporary change in force at its instant or on the date, not both, isn't reflected.
+        let differs = |s: &Slice| in_force(s.begin, s.end, t) != base.begin.is_some_and(|bb| in_force(s.begin, s.end, bb));
+        let skipped = !changes.is_empty() || of(Interpretation::TempDelta).chain(unread_of(Interpretation::TempDelta)).any(differs);
         return State::Use { base: base.clone(), changes: Vec::new(), snapshot, temporary: 0, skipped };
     }
-    if unread_temps > 0 {
+    if unread_temp {
         return State::Unreadable;
     }
     temps.sort_by(by_start);
@@ -593,13 +605,16 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
             (from, until)
         });
     let (sequence, correction) = (number("sequenceNumber"), number("correctionNumber"));
-    if bad {
+    trouble.numbers += usize::from(unread_number.get());
+    trouble.empty += empty.get();
+    // A PERMDELTA applies from its instant: one without can't be placed.
+    bad |= kind == Interpretation::PermDelta && begin.is_none();
+    // A canceled slice is off the timeline, whatever else it holds.
+    if bad && !canceled {
         trouble.dates += 1;
         // The dates that are dates are kept: they say when it can't apply.
         return Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled: false, lifetime: None, unreadable: true });
     }
-    trouble.numbers += usize::from(unread_number.get());
-    trouble.empty += empty.get();
     Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled, lifetime, unreadable: false })
 }
 
@@ -2731,15 +2746,23 @@ fn feature_rows(
     if kind == "RouteSegment"
         && let Some((line, notes)) = between(props, shapes)
     {
+        let mut in_records = 0;
         for p in parts.iter().chain(&unlocated) {
+            // Its ends are in its line.
+            if line.is_none() || !matches!(local(p), "start" | "end") {
+                in_records += nested_shapes(*p).len();
+            }
             row.property(*p, "");
         }
         let line = line.map(|l| vec![l]);
-        layers.push(kind, "curveExtent", line.map(Geometry::Line), row.clone(), Some(&notes), change);
+        let i = layers.push(kind, "curveExtent", line.map(Geometry::Line), row.clone(), Some(&notes), change);
+        if let Some(l) = layers.at(i) {
+            l.shapes_in_records += in_records;
+        }
         return true;
     }
-    // One that can't be drawn between its ends is in its layer without a line, an end written in
-    // place kept as its values: it isn't a point.
+    // One that can't be drawn between its ends is in its layer without a line: the shapes of its
+    // records (an end written in place) are counted as not drawn.
     if kind == "RouteSegment" {
         let missing = names_a_missing_point(props, shapes);
         let mut in_records = 0;
@@ -2749,9 +2772,8 @@ fn feature_rows(
                 for g in nested_shapes(*p) {
                     let _ = shapes.shape(g, &mut ShapeNotes::default());
                 }
-            } else {
-                in_records += nested_shapes(*p).len();
             }
+            in_records += nested_shapes(*p).len();
             row.property(*p, "");
         }
         let notes = ShapeNotes { route_unlocated: missing, route_no_ends: !missing, ..ShapeNotes::default() };
@@ -3044,14 +3066,14 @@ fn finish(
         notes.unreadable_state,
         "feature",
         "features",
-        "left out: a time slice of it that may apply (the latest correction) has a validity that isn't a date",
+        "left out: a time slice of it that may apply (the latest correction) has no validTime or period, or a validTime or featureLifetime that can't be read",
     );
     say(
         &mut file,
         notes.snapshot_changes,
         "feature",
         "features",
-        "shown as a SNAPSHOT without the changes the file gives since its instant: changes apply to a BASELINE",
+        "shown as a SNAPSHOT without the changes the file gives since its instant (begun or ended): changes apply to a BASELINE",
     );
     say(&mut file, notes.no_slices, "feature", "features", "with no time slice RustGIS reads left out");
     say(
@@ -3081,7 +3103,7 @@ fn finish(
         notes.bad_dates,
         "time slice",
         "time slices",
-        "with no validTime, or with one or a featureLifetime that can't be read (a feature it may apply to is left out)",
+        "with no validTime or period, or with a validTime or featureLifetime that can't be read (a feature it may apply to is left out)",
     );
     say(
         &mut file,
