@@ -1342,3 +1342,48 @@ fn layer_names_match_the_layers_read() {
     listed.sort();
     assert_eq!(listed, read_names);
 }
+
+#[test]
+fn a_rhumb_line_near_a_pole_ends_at_its_points() {
+    let mut shapes = Shapes { budget: 1_000_000, ..Shapes::default() };
+    let mut notes = ShapeNotes::default();
+    let (a, b) = (Coord::new(0.0, 88.0), Coord::new(20.0, 88.0));
+    let line = shapes.rhumb(a, b, &mut notes);
+    assert_eq!((line.first(), line.last()), (Some(&a), Some(&b)));
+    assert!(line.iter().all(|c| (c.y - 88.0).abs() < 1e-6), "{line:?}");
+}
+
+#[test]
+fn a_three_point_circle_past_the_allowance_isnt_drawn_and_says_so() {
+    let mut shapes = Shapes::default();
+    let mut notes = ShapeNotes::default();
+    let drawn = shapes.arcs_through(&[Coord::new(10.0, 50.0), Coord::new(10.1, 50.1), Coord::new(10.2, 50.0)], true, &mut notes);
+    assert!(drawn.is_empty());
+    assert!(notes.past_allowance);
+}
+
+#[test]
+fn a_patch_left_out_for_its_hole_is_counted_beside_the_holes_reason() {
+    let patch = |hole: &str| {
+        format!(
+            r#"<gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>50 9 50 11 52 11 52 9 50 9</gml:posList></gml:LinearRing></gml:exterior>{hole}</gml:PolygonPatch>"#
+        )
+    };
+    let hole = r#"<gml:interior><gml:Ring><gml:curveMember xlink:href="urn:uuid:missing"/></gml:Ring></gml:interior>"#;
+    let body = format!(
+        r#"<aixm:name>TWO</aixm:name><aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches>{}{}</gml:patches></aixm:Surface></aixm:extent>"#,
+        patch(hole),
+        patch("")
+    );
+    let out = read(
+        "t.xml",
+        &message(&feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+        &at("2026-01-15"),
+    )
+    .unwrap();
+    let Some(Geometry::Polygon(parts)) = &layer(&out, "t WorkArea").features[0].geometry else { panic!("not drawn") };
+    assert_eq!(parts.len(), 1);
+    let notes = said(&out);
+    assert!(notes.iter().any(|m| m.contains("1 ring or surface patch was left out")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.contains("1 border is given by reference")), "{notes:?}");
+}

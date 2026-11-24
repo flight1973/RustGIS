@@ -557,11 +557,11 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
     });
     trouble.empty += empty.get();
     let (sequence, correction) = (number("sequenceNumber"), number("correctionNumber"));
-    trouble.numbers += usize::from(unread_number.get());
     if bad {
         trouble.dates += 1;
         return None;
     }
+    trouble.numbers += usize::from(unread_number.get());
     Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled, lifetime })
 }
 
@@ -809,7 +809,8 @@ impl Shapes {
             "Arc" | "ArcString" | "Circle" => {
                 notes.arcs = true;
                 let c = Self::positions(s, axes, notes)?;
-                Some(self.arcs_through(&c, local(&s) == "Circle", notes))
+                let drawn = self.arcs_through(&c, local(&s) == "Circle", notes);
+                (!drawn.is_empty()).then_some(drawn)
             }
             other => {
                 if !notes.unread_segments.iter().any(|n| n == other) {
@@ -856,17 +857,23 @@ impl Shapes {
     /// [`GEODESIC_STEP_M`] at most, from the same allowance as geodesics.
     fn rhumb(&mut self, a: Coord, b: Coord, notes: &mut ShapeNotes) -> Vec<Coord> {
         let b = next_to(b, a.x);
-        let merc = |lat: f64| (std::f64::consts::FRAC_PI_4 + lat.to_radians().clamp(-1.5, 1.5) / 2.0).tan().ln();
+        let pole = std::f64::consts::FRAC_PI_2 - 1e-9;
+        let merc = |lat: f64| (std::f64::consts::FRAC_PI_4 + lat.to_radians().clamp(-pole, pole) / 2.0).tan().ln();
         let (ya, yb) = (merc(a.y), merc(b.y));
         let d = rustgis_geom::wgs84_distance_m(a, b);
         let need = if d.is_finite() { (d / GEODESIC_STEP_M).ceil() as usize } else { 1 };
         notes.coarse |= need > MAX_GEODESIC_POINTS;
         let n = self.take(need.clamp(1, MAX_GEODESIC_POINTS).saturating_sub(1), notes) + 1;
+        // Its ends are the points named, exactly; the points between are on the rhumb line.
         (0..=n)
-            .map(|k| {
-                let t = k as f64 / n as f64;
-                let y = ya + (yb - ya) * t;
-                Coord::new(a.x + (b.x - a.x) * t, (2.0 * y.exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees())
+            .map(|k| match k {
+                0 => a,
+                _ if k == n => b,
+                _ => {
+                    let t = k as f64 / n as f64;
+                    let y = ya + (yb - ya) * t;
+                    Coord::new(a.x + (b.x - a.x) * t, (2.0 * y.exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees())
+                }
             })
             .collect()
     }
@@ -986,6 +993,11 @@ impl Shapes {
             if ccw { s } else { s - tau }
         };
         let n = self.pieces(r, sweep.to_degrees(), notes);
+        // A full circle in fewer than three pieces isn't one: not drawn, and said.
+        if circle && n < 3 {
+            notes.past_allowance = true;
+            return Vec::new();
+        }
         (0..=n)
             .map(|k| {
                 let t = a0 + sweep * k as f64 / n as f64;
@@ -1235,7 +1247,7 @@ impl Shapes {
         let mut polys = Vec::new();
         for p in patches {
             // A ring lost to a border by reference is said as that, once.
-            let said = |n: &ShapeNotes| n.referenced + n.border_allowance + n.border_unusable;
+            let said = |n: &ShapeNotes| n.referenced + n.border_allowance + n.border_unusable + usize::from(n.past_allowance);
             let before = said(notes);
             let outer = elements(p).find(|c| local(c) == "exterior").and_then(|b| self.ring(b, notes));
             let Some(outer) = outer else {
@@ -1247,16 +1259,15 @@ impl Shapes {
             let mut rings = vec![outer];
             let mut hole_lost = false;
             for b in elements(p).filter(|c| local(c) == "interior") {
-                let before = said(notes);
                 match self.ring(b, notes) {
                     Some(r) => rings.push(r),
-                    None => {
-                        notes.rings_lost += usize::from(said(notes) == before);
-                        hole_lost = true;
-                    }
+                    None => hole_lost = true,
                 }
             }
-            if !hole_lost {
+            // The patch left out for its hole is counted, whatever lost the hole (said too).
+            if hole_lost {
+                notes.rings_lost += 1;
+            } else {
                 polys.push(rings);
             }
         }
@@ -1514,8 +1525,9 @@ impl Layer {
     }
 
     fn take_notes(&mut self, n: &ShapeNotes) {
-        self.arcs += usize::from(n.arcs);
-        self.coarse += usize::from(n.coarse);
+        // A circle not drawn for the point allowance is said as that alone.
+        self.arcs += usize::from(n.arcs && !n.past_allowance);
+        self.coarse += usize::from(n.coarse && !n.past_allowance);
         self.zm += usize::from(n.zm);
         if !n.unread_segments.is_empty() {
             self.approximated += 1;
@@ -1911,7 +1923,7 @@ impl Layers {
             return None;
         }
         let Some(i) = self.index_of(kind, label) else {
-            self.over.insert(row.attrs.get("identifier").cloned().unwrap_or_default());
+            self.over.insert(format!("{kind}\u{1}{}", row.attrs.get("identifier").map_or("", String::as_str)));
             return None;
         };
         self.bytes_left -= cells;
@@ -2522,7 +2534,7 @@ fn feature_rows(
             let empty =
                 !g.descendants().any(|d| d.is_element() && is_gml(&d) && matches!(local(&d), "pos" | "posList") && !text_of(&d).is_empty());
             let empty = empty && geom.is_none();
-            let bad = geom.is_none() && !empty;
+            let bad = geom.is_none() && !empty && !notes.past_allowance;
             let i = layers.push(kind, &name, geom, r, Some(&notes), change);
             first = first.or(i);
             if let Some(l) = layers.at(i) {
@@ -2540,7 +2552,7 @@ fn feature_rows(
     if kind == "RouteSegment"
         && let Some((line, notes)) = between(props, shapes)
     {
-        for p in &parts {
+        for p in parts.iter().chain(&unlocated) {
             row.property(*p, "");
         }
         let line = line.map(|l| vec![l]);
@@ -2692,7 +2704,7 @@ fn airspace(
                     l.derived_names.add(op);
                 }
             }
-        } else if unreadable {
+        } else if unreadable && !notes.past_allowance {
             l.unreadable += 1;
         } else if components.len() > 1 {
             l.unions += 1;

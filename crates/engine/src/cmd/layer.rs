@@ -2348,6 +2348,14 @@ pub(crate) fn check_at(p: &Value, file_name: &str, aixm: impl FnOnce() -> bool) 
     rustgis_data::aixm::Options::at_text(at)
 }
 
+/// Refuses an effective date (`"at"`) for an address that can't be an AIXM message (one naming
+/// another kind of file), before anything is downloaded: what `layer.addUrl` does, for the app's
+/// own way of adding an address.
+pub fn check_url_at(p: &Value) -> Result<(), String> {
+    let url = ps(p, "url").map(str::trim).unwrap_or("");
+    check_at(p, url, || address_extension(url).is_none_or(|e| e == "xml" || e == "gml")).map(|_| ())
+}
+
 /// Whether a file named `path` may be an AIXM message: by its first bytes on the desktop, by its
 /// name in the browser (where its contents are checked when read).
 fn may_be_aixm_path(path: &str) -> bool {
@@ -3234,6 +3242,8 @@ fn file_layers(s: &mut Session, p: &Value) -> CmdResult {
         let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         // An AIXM message's layers at the date asked, as Add Data would add them: their names
         // only, without drawing their shapes or keeping their values.
+        // Told by its name before it was read (in the browser): now by its contents.
+        check_at(p, path, || rustgis_data::io::is_aixm(path, &bytes))?;
         if rustgis_data::io::is_aixm(path, &bytes) {
             if ps(p, "crs").is_some_and(|c| !c.trim().is_empty()) {
                 return Err(format!("\"crs\" doesn't apply to {path}: an AIXM message names its own system (srsName)"));

@@ -5913,6 +5913,14 @@ impl RustGisApp {
         if let Some(id) = claim {
             self.session.download_continues(id)?;
         }
+        // An effective date for an address that can't be an AIXM message is refused before the
+        // download, not after it.
+        if let Err(e) = rustgis_engine::cmd::layer::check_url_at(p) {
+            if let Some(id) = claim {
+                self.session.download_failed(id);
+            }
+            return Err(e);
+        }
         let still = claim.and_then(|id| self.session.download_still(id));
         rustgis_engine::render::rustgis_tiles::cache::with_optional_still(still, || {
             if p.get("geolibreZarr").and_then(Value::as_bool) == Some(true) {
