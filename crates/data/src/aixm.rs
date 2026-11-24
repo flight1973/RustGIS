@@ -94,7 +94,8 @@ const SHAPES: &[&str] = &["Point", "ElevatedPoint", "Curve", "ElevatedCurve", "S
 pub struct Options {
     /// The effective date: milliseconds since 1970-01-01 UTC. Today when `None`.
     pub at: Option<f64>,
-    /// Only the layers' names are wanted (`info.fileLayers`): no shape is drawn and no value kept.
+    /// Only the layers' names are wanted (`info.fileLayers`): shapes are read as a full read reads
+    /// them (so the names are the same), but no row or value is kept.
     pub names_only: bool,
 }
 
@@ -108,8 +109,8 @@ impl Options {
     }
 }
 
-/// The names of the layers [`read`] gives a message at `opts.at`, worked out without drawing
-/// their shapes or keeping their values: what listing a file's layers needs.
+/// The names of the layers [`read`] gives a message at `opts.at`: its shapes read as a read reads
+/// them, its rows and values not kept. What listing a file's layers needs.
 pub fn layer_names(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<String>> {
     let opts = Options { names_only: true, ..*opts };
     Ok(read(file_name, bytes, &opts)?.into_iter().map(|(d, _)| d.name).collect())
@@ -382,8 +383,8 @@ struct Slice {
     canceled: bool,
     /// The feature's lifetime, when the slice says it.
     lifetime: Option<(Option<f64>, Option<f64>)>,
-    /// Its validity or lifetime isn't a date: it keeps its place among its corrections, and the
-    /// feature is left out when it is the one that holds.
+    /// Its validity or lifetime isn't a date: it keeps its place among its corrections. A
+    /// BASELINE's that holds leaves the feature out; a change's is left out itself (counted).
     unreadable: bool,
 }
 
@@ -409,7 +410,7 @@ enum State {
     OnlyChanges,
     /// Every slice canceled.
     Canceled,
-    /// The slice that holds (the latest correction) has a validity that isn't a date.
+    /// The state's latest correction (or every slice) has a validity that isn't a date.
     Unreadable,
 }
 
@@ -440,12 +441,19 @@ fn state_at(slices: &[Slice], t: f64) -> State {
             }
         }
     }
-    if held.values().any(|s| s.unreadable) {
+    // The state's latest correction isn't a date: what it is then can't be known.
+    if held.values().any(|s| s.unreadable && s.kind == Interpretation::Baseline) {
         return State::Unreadable;
     }
-    let live: Vec<&Slice> = held.values().copied().chain(snapshots).filter(|s| !s.canceled).collect();
+    let live: Vec<&Slice> = held.values().copied().chain(snapshots).filter(|s| !s.canceled && !s.unreadable).collect();
     if live.is_empty() {
-        return if slices.is_empty() { State::OnlyChanges } else { State::Canceled };
+        return if slices.is_empty() {
+            State::OnlyChanges
+        } else if slices.iter().all(|s| s.unreadable) {
+            State::Unreadable
+        } else {
+            State::Canceled
+        };
     }
     let of = |k: Interpretation| live.iter().copied().filter(move |s| s.kind == k);
     // The BASELINE in force; of several (which the concept doesn't allow), the latest started.
@@ -465,13 +473,7 @@ fn state_at(slices: &[Slice], t: f64) -> State {
                     of(Interpretation::Snapshot).min_by(|a, b| a.begin.unwrap_or(f64::MAX).total_cmp(&b.begin.unwrap_or(f64::MAX)))
                 });
             match snap {
-                // Taken as it is: a SNAPSHOT already holds the changes in force at its instant.
-                Some(s) if baselines == 0 => {
-                    return match s.lifetime {
-                        Some((from, until)) if !in_force(from, until, t) => State::OutsideLifetime,
-                        _ => State::Use { base: s.clone(), changes: Vec::new(), snapshot: true, temporary: 0 },
-                    };
-                }
+                Some(s) if baselines == 0 => (s, true),
                 _ if baselines > 0 => return State::NotInForce,
                 _ => return State::OnlyChanges,
             }
@@ -490,7 +492,10 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     {
         return State::OutsideLifetime;
     }
-    let mut temps: Vec<Slice> = of(Interpretation::TempDelta).filter(|s| in_force(s.begin, s.end, t)).cloned().collect();
+    // A SNAPSHOT already holds the changes in force at its instant: only those begun since go
+    // over it.
+    let since = |s: &Slice| !snapshot || s.begin.is_some_and(|b| base.begin.is_none_or(|bb| b > bb));
+    let mut temps: Vec<Slice> = of(Interpretation::TempDelta).filter(|s| in_force(s.begin, s.end, t) && since(s)).cloned().collect();
     temps.sort_by(|a, b| a.begin.unwrap_or(f64::MIN).total_cmp(&b.begin.unwrap_or(f64::MIN)).then(a.sequence.cmp(&b.sequence)));
     let temporary = temps.len();
     changes.extend(temps);
@@ -620,7 +625,7 @@ struct Axes {
 struct ShapeNotes {
     /// A route segment with no curve whose start or end names a point that isn't in the file.
     route_unlocated: bool,
-    /// A vertical structure part holding more than one shape: the first drawn.
+    /// A vertical structure part holding more than one shape: the first that can be is drawn.
     extra_shapes: bool,
     /// Features drawn with arcs or circles as points along them.
     arcs: bool,
@@ -1562,7 +1567,7 @@ struct Layer {
     unlocated: usize,
     /// Route segments whose start or end names a point not in the file: kept without a line.
     route_unlocated: usize,
-    /// Vertical structure parts holding more than one shape: the first drawn.
+    /// Vertical structure parts holding more than one shape: the first that can be is drawn.
     extra_shapes: usize,
     /// Borders by reference followed whole.
     followed_whole: usize,
@@ -2544,21 +2549,32 @@ fn segment_end<'a, 'i>(props: &[Node<'a, 'i>], name: &str, shapes: &Shapes) -> O
     let p = props.iter().find(|p| local(p) == name)?;
     let choice = p.descendants().find(|d| d.is_element() && local(d).starts_with("pointChoice_"))?;
     match choice.attribute((XLINK, "href")) {
-        Some(h) => {
-            let target = reference(h);
-            let local_link = h.trim().starts_with('#') || h.contains("@gml:id");
-            let found = if local_link {
-                shapes.points.get(&format!("#{target}"))
-            } else {
-                // The kind the choice names, then any point so named.
-                point_kind(local(&choice))
-                    .and_then(|k| shapes.points.get(&format!("{k}\u{1}{target}")))
-                    .or_else(|| shapes.points.get(&target))
-            };
-            found.copied().map(End::Named)
-        }
+        Some(h) => named_point(shapes, choice, h).map(End::Named),
         None => shape_in(choice).filter(|g| matches!(local(g), "Point" | "ElevatedPoint")).map(End::Written),
     }
+}
+
+/// Where the point a route end's choice links to is: by its gml:id for a local link; else of the
+/// kind the choice names, or (a choice of no known kind) any point of that identifier.
+fn named_point(shapes: &Shapes, choice: Node, href: &str) -> Option<Coord> {
+    let target = reference(href);
+    if href.trim().starts_with('#') || href.contains("@gml:id") {
+        return shapes.points.get(&format!("#{target}")).copied();
+    }
+    match point_kind(local(&choice)) {
+        Some(k) => shapes.points.get(&format!("{k}\u{1}{target}")).copied(),
+        None => shapes.points.get(&target).copied(),
+    }
+}
+
+/// Whether a route segment's start or end links to a point that isn't in the file.
+fn names_a_missing_point(props: &[Node], shapes: &Shapes) -> bool {
+    props.iter().filter(|p| matches!(local(p), "start" | "end")).any(|p| {
+        p.descendants()
+            .find(|d| d.is_element() && local(d).starts_with("pointChoice_"))
+            .and_then(|c| c.attribute((XLINK, "href")).map(|h| named_point(shapes, c, h).is_none()))
+            .unwrap_or(false)
+    })
 }
 
 /// The kind of feature a route end's choice names (`pointChoice_fixDesignatedPoint`: a
@@ -2675,7 +2691,7 @@ fn feature_rows(
     }
     if parts.is_empty() {
         // A route segment naming ends that aren't in the file: in its layer without a line.
-        if kind == "RouteSegment" && props.iter().any(|p| matches!(local(p), "start" | "end")) {
+        if kind == "RouteSegment" && names_a_missing_point(props, shapes) {
             let notes = ShapeNotes { route_unlocated: true, ..ShapeNotes::default() };
             layers.push(kind, "curveExtent", None, row.clone(), Some(&notes), change);
             return true;
@@ -2876,12 +2892,14 @@ fn vertical_structure(
         for p in elements(vp) {
             match shape_in(p) {
                 Some(g) if !is_nil(&p) => {
-                    if seen {
+                    if geom.is_some() {
                         notes.extra_shapes = true;
                     } else {
-                        seen = true;
                         let mut own = ShapeNotes::default();
                         geom = shapes.shape(g, &mut own);
+                        // One that can't be read beside one drawn: not drawn, and said.
+                        notes.extra_shapes |= seen && geom.is_some();
+                        seen = true;
                         bad = geom.is_none();
                         notes.absorb(if bad { own.losses_only() } else { own });
                     }
@@ -2951,7 +2969,7 @@ fn finish(
         notes.unreadable_state,
         "feature",
         "features",
-        "left out: the time slice that holds (its latest correction) has a validity that isn't a date",
+        "left out: the time slice that holds its state (the latest correction) has a validity that isn't a date",
     );
     say(&mut file, notes.no_slices, "feature", "features", "with no time slice RustGIS reads left out");
     say(
@@ -3224,8 +3242,8 @@ fn finish(
         );
         say(
             layer.extra_shapes,
-            "structure part holds more than one shape: the first is drawn, the others' values kept",
-            "structure parts hold more than one shape: the first is drawn, the others' values kept",
+            "structure part holds more than one shape: one is drawn (the first that can be), the others' values kept",
+            "structure parts hold more than one shape: one is drawn (the first that can be), the others' values kept",
         );
         say(
             layer.between,

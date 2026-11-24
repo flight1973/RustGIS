@@ -1508,17 +1508,29 @@ fn a_chain_of_arcs_across_180_degrees_stays_whole() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn a_snapshot_is_taken_as_it_is_without_changes_over_it() {
-    let temp = slice(
-        "DesignatedPoint",
-        "TEMPDELTA",
-        1,
-        0,
-        &period("2026-01-10T00:00:00Z", Some("2026-01-20T00:00:00Z")),
-        "<aixm:name>TEMP</aixm:name>",
-    );
-    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "SNAP"), temp]));
+fn a_snapshot_takes_only_the_changes_begun_since_its_instant() {
+    let temp = |begin: &str| {
+        slice("DesignatedPoint", "TEMPDELTA", 1, 0, &period(begin, Some("2026-01-20T00:00:00Z")), "<aixm:name>TEMP</aixm:name>")
+    };
+    // In force at the snapshot's instant: already in it.
+    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "SNAP"), temp("2025-12-20T00:00:00Z")]));
     assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("SNAP".into())]);
+    // Begun since: over it.
+    let bytes = message(&point("s", &[snapshot_at("2026-01-01T00:00:00Z", "SNAP"), temp("2026-01-10T00:00:00Z")]));
+    assert_eq!(names(&bytes, "2026-01-15").0, [Value::Text("TEMP".into())]);
+}
+
+#[test]
+fn a_change_that_cant_be_read_is_left_out_and_a_snapshot_that_cant_is_unreadable() {
+    let bad_temp = slice("DesignatedPoint", "TEMPDELTA", 2, 0, r#"<gml:validTime nilReason="unknown"/>"#, "<aixm:name>TEMP</aixm:name>");
+    let (got, notes) = names(&message(&point("a", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "BASE"), bad_temp])), "2026-01-15");
+    assert_eq!(got, [Value::Text("BASE".into())]);
+    assert!(notes.iter().any(|m| m.contains("1 time slice with a validTime or featureLifetime that isn't a date not read")), "{notes:?}");
+    let bad_snap = snapshot_at("not-a-date", "SNAP");
+    let bytes = message(&(point("s", &[bad_snap]) + &point("b", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")])));
+    let notes = names(&bytes, "2026-01-15").1;
+    assert!(notes.iter().any(|m| m.contains("1 feature left out: the time slice that holds its state")), "{notes:?}");
+    assert!(!notes.iter().any(|m| m.contains("canceled")), "{notes:?}");
 }
 
 #[test]
@@ -1617,6 +1629,23 @@ fn a_route_segment_whose_ends_arent_in_the_file_is_kept_and_said() {
     assert_eq!(rs.features.len(), 1);
     assert_eq!(rs.features[0].geometry, None);
     assert!(said(&out).iter().any(|m| m.contains("1 route segment is kept without a line")), "{:?}", said(&out));
+    // The kind named and not in the file: not drawn to a point of another kind.
+    let members = named_at("DesignatedPoint", "same", 50.0, 10.0) + &named_at("DesignatedPoint", "far", 50.0, 12.0);
+    let out = read("t.xml", &message(&(members.clone() + &route_to("pointChoice_navaidSystem", "same"))), &at("2026-01-15")).unwrap();
+    assert_eq!(layer(&out, "t RouteSegment").features[0].geometry, None);
+    // Both ends found: nothing said of it.
+    let out = read("t.xml", &message(&(members + &route_to("pointChoice_fixDesignatedPoint", "same"))), &at("2026-01-15")).unwrap();
+    assert!(!said(&out).iter().any(|m| m.contains("kept without a line")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_structure_part_is_drawn_from_its_first_shape_that_can_be() {
+    let bad_point = r#"<aixm:horizontalProjection_location><aixm:ElevatedPoint srsName="urn:ogc:def:crs:EPSG::4326" gml:id="p"><gml:pos>abc def</gml:pos></aixm:ElevatedPoint></aixm:horizontalProjection_location>"#;
+    let line = r#"<aixm:horizontalProjection_linearExtent><aixm:ElevatedCurve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="c"><gml:segments><gml:LineStringSegment><gml:posList>52 -32 52.1 -32</gml:posList></gml:LineStringSegment></gml:segments></aixm:ElevatedCurve></aixm:horizontalProjection_linearExtent>"#;
+    let out = read("t.xml", &structure(&part("A", &format!("{bad_point}{line}"))), &at("2026-01-15")).unwrap();
+    let vs = &out.iter().find(|(d, _)| d.name.starts_with("t VerticalStructure")).unwrap().0;
+    assert!(matches!(vs.features[0].geometry, Some(Geometry::Line(_))));
+    assert!(said(&out).iter().any(|m| m.contains("more than one shape")), "{:?}", said(&out));
 }
 
 #[test]

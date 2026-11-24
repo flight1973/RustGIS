@@ -3241,7 +3241,7 @@ fn file_layers(s: &mut Session, p: &Value) -> CmdResult {
         }
         let bytes = rustgis_data::provenance::read(path).map_err(|e| format!("{path}: {e}"))?;
         // An AIXM message's layers at the date asked, as Add Data would add them: their names
-        // only, without drawing their shapes or keeping their values.
+        // only, its rows and values not kept.
         // Told by its name before it was read (in the browser): now by its contents.
         check_at(p, path, || rustgis_data::io::is_aixm(path, &bytes))?;
         if rustgis_data::io::is_aixm(path, &bytes) {
@@ -5913,8 +5913,9 @@ pub(crate) fn add_cog(s: &mut Session, p: &Value, url: &str, probed: bool) -> Cm
 /// [`add_cog`], a GeoTIFF that can't be read now added all the same (unless `strict`), showing
 /// why: a project being imported keeps its layers.
 pub(crate) fn add_cog_with(s: &mut Session, p: &Value, url: &str, strict: bool, probed: bool) -> CmdResult {
-    // An effective date is for an AIXM message: a GeoTIFF found at an address refuses it.
-    check_at(p, url, || false)?;
+    // An effective date is for an AIXM message: a GeoTIFF found at an address refuses it (named by
+    // its file name, so no key in the address is quoted).
+    check_at(p, &cog_name(url), || false)?;
     let stem = cog_name(url);
     let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&stem);
     let empty_before = super::map_is_empty(s);
