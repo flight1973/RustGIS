@@ -24178,7 +24178,7 @@ fn aixm_messages_are_added_at_the_date_asked() {
     let e = s.run("info.fileLayers", &json!({"path": csv.display().to_string(), "at": "2026-01-15"})).unwrap_err();
     assert!(e.contains("isn't one"), "{e}");
     let e = s.run("layer.addUrl", &json!({"url": "https://example.com/roads.fgb?token=SECRET", "at": "2026-01-15"})).unwrap_err();
-    assert!(!e.contains("SECRET"), "{e}");
+    assert!(e.contains("isn't one") && !e.contains("SECRET"), "{e}");
     let z = s.run("layer.addUrl", &json!({"url": "https://example.com/a.zip?token=SECRET", "at": "2026-01-15"})).unwrap_err();
     assert!(z.contains("unzip it") && !z.contains("SECRET"), "{z}");
     // A window of a GeoTIFF, before it is read.
@@ -24199,8 +24199,9 @@ fn aixm_messages_are_added_at_the_date_asked() {
         7,
         Box::new((rustgis_data::Dataset::new("pbf", rustgis_data::GeometryType::Point, Vec::new()), rustgis_data::ReadReport::default())),
     ));
+    let layers = s.map().layers.len();
     s.run("layer.addDownload", &asked).unwrap();
-    assert!(e.contains("isn't one"), "{e}");
+    assert!(s.landed_reads.is_empty() && s.map().layers.len() == layers + 1);
     // An address with no extension found to be a GeoTIFF refuses it too, before it is added.
     let e = crate::cmd::layer::add_cog(&mut s, &json!({"at": "2026-01-15"}), "https://example.test/download", true).unwrap_err();
     assert!(e.contains("isn't one"), "{e}");
