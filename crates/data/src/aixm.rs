@@ -1390,7 +1390,8 @@ impl Shapes {
     fn border_named(&self, href: &str) -> Option<usize> {
         let h = href.trim();
         let by = |name: &str| self.border_names.get(name).copied();
-        let named = if h.contains("@gml:id") {
+        // A link into another document (`file.xml#…`) names nothing of this one.
+        let named = if h.starts_with('#') && h.contains("@gml:id") {
             by(&format!("#{}", reference(h)))
         } else if h.starts_with('#') {
             by(h)
@@ -1511,7 +1512,7 @@ impl Shapes {
     /// route segment's ends). The points it adds are paid for all the same, so reading again can't
     /// add points past the allowance.
     fn quietly(&mut self, g: Node) -> Option<Geometry> {
-        let kept = (self.assumed_system, self.other_count, self.as_wgs84_count, self.other_system.clone(), self.as_wgs84.clone());
+        let kept = (self.assumed_system, self.other_count, self.as_wgs84_count, self.other_system.take(), self.as_wgs84.take());
         let shape = self.shape(g, &mut ShapeNotes::default());
         (self.assumed_system, self.other_count, self.as_wgs84_count, self.other_system, self.as_wgs84) = kept;
         shape
@@ -2739,13 +2740,14 @@ fn segment_end<'a, 'i>(props: &[Node<'a, 'i>], name: &str, shapes: &Shapes) -> O
 /// Where the point a route end's choice links to is: by its gml:id for a local link; else of the
 /// kind the choice names, or (a choice of no known kind) any point of that identifier.
 fn named_point(shapes: &Shapes, choice: Node, href: &str) -> Option<Coord> {
-    let target = reference(href);
+    let h = href.trim();
     let by = |name: String| shapes.point_names.get(&name).copied();
-    let named = if href.trim().starts_with('#') || href.contains("@gml:id") {
-        by(format!("#{target}"))
+    // A link into another document (`file.xml#…`) names nothing of this one.
+    let named = if h.starts_with('#') {
+        by(format!("#{}", reference(h)))
     } else {
         let k = point_kind(local(&choice)).unwrap_or("*");
-        by(format!("{k}\u{1}id:{}", href.trim())).or_else(|| by(format!("{k}\u{1}uuid:{target}")))
+        by(format!("{k}\u{1}id:{h}")).or_else(|| by(format!("{k}\u{1}uuid:{}", h.strip_prefix("urn:uuid:").unwrap_or(h))))
     };
     named.flatten().and_then(|n| shapes.points.get(n).copied().flatten())
 }

@@ -2163,6 +2163,10 @@ fn borders_of_alike_identifiers_are_told_apart_by_their_gml_ids() {
         assert_eq!(lats, None, "{name}");
         assert!(notes.iter().any(|m| m.contains("not in force then")), "{notes:?}");
     }
+    // Nor one of another document.
+    for name in ["other.xml#//aixm:GeoBorder[@gml:id='b1']", "other.xml#b1"] {
+        assert_eq!(drawn(name, &members).0, None, "{name}");
+    }
     assert!(drawn("X", &past).0.is_some_and(|l| l.contains(&40)));
     let odd = members.clone() + &border("#b1", "b3", "c3", 40.0);
     assert!(drawn("#b1", &odd).0.is_some_and(|l| l.contains(&50)));
@@ -2242,6 +2246,11 @@ fn a_route_end_named_as_two_points_are_is_neither() {
     let unknown = by_id.replace("pointChoice_fixDesignatedPoint xlink:href=\"urn:uuid:X", "pointChoice_other xlink:href=\"urn:uuid:X");
     assert_eq!(start(&kinds, &unknown), None);
     assert_eq!(start(&kinds, &by_id), Some(Coord::new(10.0, 50.0)));
+    // One of another document is none of this one's; an XPath into this one is.
+    let here = named_at("DesignatedPoint", "X", 50.0, 10.0).replace(r#"gml:id="f""#, r#"gml:id="p""#);
+    let xpath = "#/m/aixm:DesignatedPoint[@gml:id='p']";
+    assert_eq!(start(&here, &by_gid.replace("#p", xpath)), Some(Coord::new(10.0, 50.0)));
+    assert_eq!(start(&here, &by_gid.replace("#p", &format!("other.xml{xpath}"))), None);
     // Any feature with a position, by its gml:id.
     let vor = named_at("VOR", "V", 50.0, 10.0).replace(r#"gml:id="f""#, r#"gml:id="p""#);
     assert_eq!(start(&vor, &by_gid), Some(Coord::new(10.0, 50.0)));
