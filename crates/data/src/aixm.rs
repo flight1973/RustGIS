@@ -382,7 +382,8 @@ struct Slice {
     kind: Interpretation,
     sequence: u64,
     correction: u64,
-    /// Valid from (included) and until (excluded); an instant for a PERMDELTA or SNAPSHOT.
+    /// Valid from (included) and until (excluded). An instant for a PERMDELTA or SNAPSHOT, which has no
+    /// end; but a PERMDELTA wrongly given a period has one, infinite when it is open or can't be read.
     begin: Option<f64>,
     end: Option<f64>,
     canceled: bool,
@@ -423,6 +424,16 @@ enum State {
 
 fn in_force(begin: Option<f64>, end: Option<f64>, t: f64) -> bool {
     begin.is_none_or(|b| b <= t) && end.is_none_or(|e| t < e)
+}
+
+/// Whether a PERMDELTA that can't be read may be made after `from` and by `to`: at its instant,
+/// anywhere in its period (which includes its start and not its end), or, with neither, at any time.
+fn may_be_made(s: &Slice, from: f64, to: f64) -> bool {
+    let (first, last) = match (s.begin, s.end) {
+        (Some(b), None) => (b, b),
+        (b, e) => (b.unwrap_or(f64::NEG_INFINITY), e.unwrap_or(f64::INFINITY)),
+    };
+    from < to && first <= to && last > from
 }
 
 /// Each feature's state at `t`.
@@ -494,9 +505,7 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     // PERMDELTAs since the state began, up to the date, in order.
     let since = |s: &Slice| s.begin.is_none_or(|b| b <= t && base.begin.is_none_or(|bb| b > bb));
     // One that can't be read may be a withdrawal: its feature is left out, a SNAPSHOT's too.
-    // One given a period (only it has an end) may be made anywhere in it.
-    let may_since = |s: &Slice| since(s) || s.begin.is_some_and(|b| b <= t) && s.end.is_some_and(|e| base.begin.is_some_and(|bb| e > bb));
-    if unread_of(Interpretation::PermDelta).any(may_since) {
+    if unread_of(Interpretation::PermDelta).any(|s| may_be_made(s, started(base), t)) {
         return State::Unreadable;
     }
     let by_start = |a: &Slice, b: &Slice| started(a).total_cmp(&started(b)).then(a.range.0.cmp(&b.range.0));
@@ -519,9 +528,8 @@ fn state_at(slices: &[Slice], t: f64) -> State {
         // A snapshot after the date holds the PERMDELTAs up to its instant, its creation maybe among
         // them: that isn't worked back (the concept has no rule for it), and is said.
         let ahead = |s: &Slice| s.begin.is_none_or(|b| t < b && base.begin.is_some_and(|bb| b <= bb));
-        let may_ahead =
-            |s: &Slice| ahead(s) || s.end.is_some_and(|e| e > t) && s.begin.is_some_and(|b| base.begin.is_some_and(|bb| b <= bb));
-        let perm_ahead = of(Interpretation::PermDelta).any(ahead) || unread_of(Interpretation::PermDelta).any(may_ahead);
+        let perm_ahead =
+            of(Interpretation::PermDelta).any(ahead) || unread_of(Interpretation::PermDelta).any(|s| may_be_made(s, t, started(base)));
         // One that can't be read may be either, unless the dates it has rule it out on both.
         let may_differ = |s: &Slice| in_force(s.begin, s.end, t) || base.begin.is_none_or(|bb| in_force(s.begin, s.end, bb));
         let skipped = !changes.is_empty()
@@ -747,9 +755,10 @@ struct Shapes {
     as_wgs84: Option<String>,
     as_wgs84_count: usize,
     as_wgs84_now: bool,
-    /// The borders references may follow, by [`border_key`] and by `gml:id`: each GeoBorder's at the
-    /// date, its points shared by every name it has (a file can give one any number).
-    borders: HashMap<String, std::rc::Rc<[Coord]>>,
+    /// The borders references may follow, by [`border_key`]: each GeoBorder's at the date, held once.
+    borders: HashMap<String, Vec<Coord>>,
+    /// The key of the border a `gml:id` (its curve's, or any of its members') names.
+    border_names: HashMap<String, String>,
     /// Steps of looking along borders still allowed ([`Shapes::scan`]).
     scan_left: usize,
     /// Where each point feature is (a navaid, a designated point), by its identifier: the ends of
@@ -1168,6 +1177,7 @@ impl Shapes {
                             // The same border named again straight after is the same stretch of
                             // it (DFS writes a border's members so), followed once.
                             let key = border_key(m.attribute((XLINK, "href"))?);
+                            let key = self.border_names.get(&key).cloned().unwrap_or(key);
                             if !matches!(members.last(), Some(Err(k)) if *k == key) {
                                 members.push(Err(key));
                             }
@@ -1324,7 +1334,7 @@ impl Shapes {
                 let (part, off) = cut(border, a, b).ok_or(Unfollowed::Unusable)?;
                 (part, off > FAR_FROM_BORDER_M)
             }
-            _ => (border.to_vec(), false),
+            _ => (border.clone(), false),
         };
         // Its points are paid for as a curve's added points are; one that can't be takes none.
         let n = part.len();
@@ -2532,14 +2542,11 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
             && let Some(g) = props.iter().filter(|p| local(p) == "border").find_map(|p| shape_in(*p))
             && let Some(Geometry::Line(parts)) = shapes.quietly(g)
         {
-            let line: std::rc::Rc<[Coord]> = parts.concat().into();
-            if let Some(gid) = g.attribute((GML, "id")) {
-                shapes.borders.insert(format!("#{}", gid.trim()), line.clone());
+            let key = border_key(id);
+            for gid in g.attribute((GML, "id")).map(str::trim).into_iter().chain(feature.gml_ids.iter().map(String::as_str)) {
+                shapes.border_names.insert(format!("#{gid}"), key.clone());
             }
-            for gid in &feature.gml_ids {
-                shapes.borders.insert(format!("#{gid}"), line.clone());
-            }
-            shapes.borders.insert(border_key(id), line);
+            shapes.borders.insert(key, parts.concat());
         }
         // Where a point feature is, for route segments that name it: by its identifier and its
         // own gml:id (a local link's or an XPath's).
