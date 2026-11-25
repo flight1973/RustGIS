@@ -1,7 +1,8 @@
 //! AIXM 5.1, 5.1.1 and 5.2: aeronautical information (airports, navaids, designated points, routes,
 //! airspace, obstacles…) in an `AIXMBasicMessage`, read into a layer per feature kind.
 //!
-//! An AIXM feature is a series of time slices, each valid for a period. The reader builds each
+//! A feature is its kind and identifier, a UUID being the same in either case, with `urn:uuid:` or
+//! not. An AIXM feature is a series of time slices, each valid for a period. The reader builds each
 //! feature's state at one effective date (today unless one is given), following the AIXM
 //! Temporality Concept (EUROCONTROL/FAA, version 1.1, on the AIXM wiki): of the slices with the same
 //! interpretation and sequence number, the highest correction number holds; a slice whose
@@ -1378,8 +1379,7 @@ impl Shapes {
     fn add_border<'a>(&mut self, id: &str, gids: impl IntoIterator<Item = &'a str>, line: Vec<Coord>) {
         let n = self.borders.len();
         self.borders.push(line);
-        let id = id.trim();
-        let names = [format!("id:{id}"), format!("uuid:{}", bare_id(id))];
+        let names = [format!("id:{}", as_written(id)), format!("uuid:{}", bare_id(id))];
         for name in names.into_iter().chain(gids.into_iter().map(|g| format!("#{}", g.trim()))) {
             self.border_names.entry(name).and_modify(|k| *k = k.filter(|k| *k == n)).or_insert(Some(n));
         }
@@ -1409,7 +1409,7 @@ impl Shapes {
             let name = if h.contains("@gml:id") { format!("#{}", reference(h)) } else { h.to_string() };
             by(&name).filter(|_| self.border_curves.get(&name).copied().unwrap_or(true))
         } else {
-            by(&format!("id:{h}")).or_else(|| by(&format!("uuid:{}", bare_id(h))))
+            by(&format!("id:{}", as_written(h))).or_else(|| by(&format!("uuid:{}", bare_id(h))))
         };
         named.flatten().filter(|n| self.borders.get(*n).is_some_and(|l| !l.is_empty()))
     }
@@ -1420,8 +1420,7 @@ impl Shapes {
     fn add_point(&mut self, f: &Feature) {
         let n = self.points.len();
         self.points.push(None);
-        let id = f.id.trim();
-        let bare = bare_id(id);
+        let (id, bare) = (as_written(&f.id), bare_id(&f.id));
         let kinds = if POINT_KINDS.iter().any(|(_, k)| *k == f.kind) { vec![f.kind.as_str(), "*"] } else { Vec::new() };
         let ids = kinds.into_iter().flat_map(|k| [format!("{k}\u{1}id:{id}"), format!("{k}\u{1}uuid:{bare}")]);
         for name in f.gml_ids.iter().map(|g| format!("#{g}")).chain(ids) {
@@ -2772,6 +2771,12 @@ fn bare_id(id: &str) -> std::borrow::Cow<'_, str> {
     if is_uuid(id) { id.to_ascii_lowercase().into() } else { id.into() }
 }
 
+/// An identifier as it is written; a UUID, which is the same however it is, bare.
+fn as_written(id: &str) -> std::borrow::Cow<'_, str> {
+    let bare = bare_id(id);
+    if is_uuid(&bare) { bare } else { id.trim().into() }
+}
+
 fn is_uuid(id: &str) -> bool {
     id.len() == 36 && id.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() })
 }
@@ -2786,7 +2791,7 @@ fn named_point(shapes: &Shapes, choice: Node, href: &str) -> Option<Coord> {
         by(format!("#{}", reference(h)))
     } else {
         let k = point_kind(local(&choice)).unwrap_or("*");
-        by(format!("{k}\u{1}id:{h}")).or_else(|| by(format!("{k}\u{1}uuid:{}", bare_id(h))))
+        by(format!("{k}\u{1}id:{}", as_written(h))).or_else(|| by(format!("{k}\u{1}uuid:{}", bare_id(h))))
     };
     named.flatten().and_then(|n| shapes.points.get(n).copied().flatten())
 }

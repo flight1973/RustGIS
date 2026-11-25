@@ -2096,12 +2096,20 @@ fn a_border_is_followed_by_the_gml_id_of_any_of_its_members() {
     let members = border("b-old", 1, "2020-01-01T00:00:00Z", Some("2025-01-01T00:00:00Z"), 50.2)
         + &border("b-new", 2, "2025-01-01T00:00:00Z", None, 50.7);
     // Its line then is the one in force, whichever member is named; a past line's own name isn't it.
-    for (id, drawn) in [("b-old", true), ("b-new", true), ("c-b-new", true), ("c-b-old", false)] {
+    for (date, id, drawn) in [
+        ("2026-01-15", "b-old", true),
+        ("2026-01-15", "b-new", true),
+        ("2026-01-15", "c-b-new", true),
+        ("2026-01-15", "c-b-old", false),
+        ("2022-01-15", "b-new", true),
+        ("2022-01-15", "c-b-old", true),
+        ("2022-01-15", "c-b-new", false),
+    ] {
         let area = format!(
             r##"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember xlink:href="#{id}"/><gml:curveMember><gml:Curve gml:id="k"><gml:segments><gml:LineStringSegment><gml:posList>51 10 51 9 50 9</gml:posList></gml:LineStringSegment></gml:segments></gml:Curve></gml:curveMember></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"##
         );
-        let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &area)]);
-        let out = read("t.xml", &message(&(members.clone() + &f)), &at("2026-01-15")).unwrap();
+        let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2020-01-01T00:00:00Z", None), &area)]);
+        let out = read("t.xml", &message(&(members.clone() + &f)), &at(date)).unwrap();
         let g = layer(&out, "t WorkArea").features[0].geometry.as_ref();
         assert_eq!(g.is_some(), drawn, "{id}");
         if !drawn {
@@ -2110,7 +2118,8 @@ fn a_border_is_followed_by_the_gml_id_of_any_of_its_members() {
         }
         let r = ring(g.unwrap_or_else(|| panic!("{id}: {:?}", said(&out))));
         let by = |lat: f64| r.iter().any(|c| (c.x - 10.0).abs() < 1e-9 && (c.y - lat).abs() < 1e-9);
-        assert!(by(50.7) && !by(50.2), "{id}: {r:?}");
+        let now = date.starts_with("2026");
+        assert!(by(50.7) == now && by(50.2) != now, "{date} {id}: {r:?}");
     }
 }
 
@@ -2300,6 +2309,12 @@ fn a_route_end_named_as_two_points_are_is_neither() {
     let xpath = "#/m/aixm:DesignatedPoint[@gml:id='p']";
     assert_eq!(start(&here, &by_gid.replace("#p", xpath)), Some(Coord::new(10.0, 50.0)));
     assert_eq!(start(&here, &by_gid.replace("#p", &format!("other.xml{xpath}"))), None);
+    // Two kinds that write one UUID differently: a choice of no known kind is neither's.
+    let both = named_at("DesignatedPoint", &uuid.to_uppercase(), 50.0, 10.0) + &named_at("Navaid", uuid, 40.0, 10.0);
+    for name in [uuid.to_string(), uuid.to_uppercase(), format!("urn:uuid:{uuid}")] {
+        assert_eq!(start(&both, &unknown.replace("urn:uuid:X", &name)), None, "{name}");
+        assert_eq!(start(&both, &by_id.replace("urn:uuid:X", &name)), Some(Coord::new(10.0, 50.0)), "{name}");
+    }
     // Any feature with a position, by its gml:id.
     let vor = named_at("VOR", "V", 50.0, 10.0).replace(r#"gml:id="f""#, r#"gml:id="p""#);
     assert_eq!(start(&vor, &by_gid), Some(Coord::new(10.0, 50.0)));
