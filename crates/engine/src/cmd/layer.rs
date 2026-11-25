@@ -6865,6 +6865,7 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(i) = s.landed_windows.iter().position(|(d, _)| *d == id) {
         let (_, read) = s.landed_windows.remove(i);
+        check_at(p, "a window of a GeoTIFF", || false)?;
         let r = add_window(s, p, read)?;
         return added_download(s, p, r, false, &url);
     }
@@ -6876,8 +6877,9 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     // A download read already (an ArcGIS layer's protocol buffer pages, joined): added as read,
     // with no axes to check against bounds.
     if let Some(i) = s.landed_reads.iter().position(|(d, _)| *d == id) {
-        check_at(p, "the service's answer", || false)?;
+        // Taken first, as bytes are: the app doesn't ask for it again, and it would be held.
         let (_, read) = s.landed_reads.remove(i);
+        check_at(p, "the service's answer", || false)?;
         let r = add_read(s, p, *read, b(p, "zoom"))?;
         return added_download(s, p, r, service || coverage, &url);
     }

@@ -24181,7 +24181,10 @@ fn aixm_messages_are_added_at_the_date_asked() {
     assert!(!e.contains("SECRET"), "{e}");
     let z = s.run("layer.addUrl", &json!({"url": "https://example.com/a.zip?token=SECRET", "at": "2026-01-15"})).unwrap_err();
     assert!(z.contains("unzip it") && !z.contains("SECRET"), "{z}");
-    // A service's answer read already: refused and kept, to be added without it.
+    // A window of a GeoTIFF, before it is read.
+    let w = s.run("layer.addUrl", &json!({"url": "https://example.test/download", "bbox": [0, 0, 1, 1], "at": "2026-01-15"})).unwrap_err();
+    assert!(w.contains("doesn't read at"), "{w}");
+    // A service's answer read already: refused, and not held.
     s.landed_reads.push((
         7,
         Box::new((rustgis_data::Dataset::new("pbf", rustgis_data::GeometryType::Point, Vec::new()), rustgis_data::ReadReport::default())),
@@ -24191,6 +24194,11 @@ fn aixm_messages_are_added_at_the_date_asked() {
     dated["at"] = json!("2026-01-15");
     let e2 = s.run("layer.addDownload", &dated).unwrap_err();
     assert!(e2.contains("the service's answer isn't one"), "{e2}");
+    assert!(s.landed_reads.is_empty());
+    s.landed_reads.push((
+        7,
+        Box::new((rustgis_data::Dataset::new("pbf", rustgis_data::GeometryType::Point, Vec::new()), rustgis_data::ReadReport::default())),
+    ));
     s.run("layer.addDownload", &asked).unwrap();
     assert!(e.contains("isn't one"), "{e}");
     // An address with no extension found to be a GeoTIFF refuses it too, before it is added.

@@ -1901,8 +1901,24 @@ fn a_snapshot_after_its_features_creation_isnt_shown_before_it() {
     let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
     let slices = [snapshot_at("2026-01-01T00:00:00Z", "SNAP"), change("PERMDELTA", 1, &instant("2025-12-10T00:00:00Z"), life)];
     let bytes = message(&(point("s", &slices) + &kept));
-    assert_eq!(names(&bytes, "2025-12-01").0, [Value::Text("KEPT".into())]);
+    let (got, notes) = names(&bytes, "2025-12-01");
+    assert_eq!(got, [Value::Text("KEPT".into())]);
+    assert!(notes.iter().any(|m| m.contains("featureLifetime") && !m.contains("can't be read")), "{notes:?}");
     assert_eq!(names(&bytes, "2025-12-20").0.len(), 2);
+    // One that can't be read may be its creation.
+    let run = |slices: &[String]| names(&message(&(point("s", slices) + &kept)), "2025-12-01");
+    let unread = change("PERMDELTA", 1, &instant("2025-12-10T00:00:00Z"), &life.replace("2025-12-10T00:00:00Z", "bad"));
+    let snap = snapshot_at("2026-01-01T00:00:00Z", "SNAP");
+    let (got, notes) = run(&[snap.clone(), unread.clone()]);
+    assert_eq!(got, [Value::Text("KEPT".into())]);
+    assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice")), "{notes:?}");
+    // Not where the snapshot's own lifetime says it existed, nor a later change that does.
+    let since = life.replace("2025-12-10", "2020-01-01");
+    let lived = snap.replace("<aixm:interpretation>", &format!("{since}<aixm:interpretation>"));
+    assert_eq!(run(&[lived.clone(), unread]).0.len(), 2);
+    assert_eq!(run(&[lived, change("PERMDELTA", 1, &instant("2025-12-10T00:00:00Z"), life)]).0.len(), 2);
+    let restated = change("PERMDELTA", 2, &instant("2025-12-20T00:00:00Z"), &since);
+    assert_eq!(run(&[snap, change("PERMDELTA", 1, &instant("2025-12-10T00:00:00Z"), life), restated]).0.len(), 2);
 }
 
 #[test]

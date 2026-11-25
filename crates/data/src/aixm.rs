@@ -513,15 +513,21 @@ fn state_at(slices: &[Slice], t: f64) -> State {
         let differs = |s: &Slice| in_force(s.begin, s.end, t) != base.begin.is_some_and(|bb| in_force(s.begin, s.end, bb));
         // A snapshot after the date holds the PERMDELTAs up to its instant.
         let ahead = |s: &Slice| s.begin.is_none_or(|b| t < b && base.begin.is_some_and(|bb| b <= bb));
-        // One of those may be the feature's creation.
-        if unread_of(Interpretation::PermDelta).any(ahead) {
-            return State::Unreadable;
+        // One of those may be the feature's creation, unless the snapshot's lifetime (in force on
+        // the date, above) or a change by then says it existed. Of those read, the latest to give a
+        // lifetime says.
+        let known =
+            base.lifetime.is_some_and(|(from, _)| from.is_some()) || of(Interpretation::PermDelta).any(|s| s.begin.is_some_and(|b| b <= t));
+        if !known {
+            if unread_of(Interpretation::PermDelta).any(ahead) {
+                return State::Unreadable;
+            }
+            let last = of(Interpretation::PermDelta).filter(|s| ahead(s) && s.lifetime.is_some()).max_by(|a, b| by_start(a, b));
+            if last.and_then(|s| s.lifetime).is_some_and(|(from, _)| from.is_some_and(|f| t < f)) {
+                return State::OutsideLifetime;
+            }
         }
-        let created = |s: &Slice| s.lifetime.is_some_and(|(from, _)| from.is_some_and(|f| t < f));
-        if of(Interpretation::PermDelta).any(|s| ahead(s) && created(s)) {
-            return State::OutsideLifetime;
-        }
-        let perm_ahead = of(Interpretation::PermDelta).any(ahead);
+        let perm_ahead = of(Interpretation::PermDelta).chain(unread_of(Interpretation::PermDelta)).any(ahead);
         // One that can't be read may be either, unless the dates it has rule it out on both.
         let may_differ = |s: &Slice| in_force(s.begin, s.end, t) || base.begin.is_none_or(|bb| in_force(s.begin, s.end, bb));
         let skipped = !changes.is_empty()
