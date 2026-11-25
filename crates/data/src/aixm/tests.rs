@@ -1117,8 +1117,8 @@ fn a_ring_whose_borders_cant_be_joined_within_the_allowance_isnt_drawn_and_says_
     let boundary = doc.root_element().first_element_child().unwrap();
     let line = |pts: &[(f64, f64)]| pts.iter().map(|&(x, y)| Coord::new(x, y)).collect::<Vec<_>>();
     let mut shapes = Shapes { budget: 1_000_000, ..Shapes::default() };
-    shapes.borders.insert("uuid:a".into(), line(&[(9.0, 50.0), (9.5, 50.0), (10.0, 50.0)]));
-    shapes.borders.insert("uuid:b".into(), line(&[(10.0, 50.0), (10.0, 50.5), (10.0, 51.0)]));
+    shapes.borders.insert("uuid:a".into(), line(&[(9.0, 50.0), (9.5, 50.0), (10.0, 50.0)]).into());
+    shapes.borders.insert("uuid:b".into(), line(&[(10.0, 50.0), (10.0, 50.5), (10.0, 51.0)]).into());
     // With room to look along both borders where they meet: drawn.
     shapes.scan_left = 1000;
     let mut notes = ShapeNotes::default();
@@ -1920,7 +1920,7 @@ fn a_snapshot_after_the_date_is_judged_by_its_own_lifetime() {
         let perm = change("PERMDELTA", 1, &instant("2025-12-10T00:00:00Z"), &created);
         let (got, notes) = names(&message(&(point("s", &[snap.clone(), perm]) + &kept)), "2025-12-01");
         assert_eq!(got.len(), 2);
-        assert!(notes.iter().any(|m| m.contains("may not have existed then")), "{notes:?}");
+        assert!(notes.iter().any(|m| m.contains("may not have existed on it")), "{notes:?}");
         assert!(notes.iter().any(|m| m.contains("SNAPSHOT that doesn't reflect changes")), "{notes:?}");
     }
     for s in [life("2020-01-01T00:00:00Z"), snap.clone()] {
@@ -1961,7 +1961,23 @@ fn a_change_given_a_period_is_withheld_and_a_snapshot_is_read_at_its_start_and_s
         assert_eq!(got, [Value::Text("KEPT".into())]);
         assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice")), "{notes:?}");
     }
+    // One whose period spans the state's start may be made after it; one that ended by then isn't.
+    let spans = |end| change("PERMDELTA", 1, &period("2024-12-01T00:00:00Z", end), "<aixm:name>PERM</aixm:name>");
+    for (end, count) in [(Some("2025-06-01T00:00:00Z"), 1), (None, 1), (Some("bad"), 1), (Some("2025-01-01T00:00:00Z"), 2)] {
+        assert_eq!(run(&[base.clone(), spans(end)], "2026-01-15").0.len(), count, "{end:?}");
+    }
+    // And before a later snapshot: said.
+    let later = run(&[snapshot_at("2026-03-01T00:00:00Z", "SNAP"), perm], "2026-01-15").1;
+    assert!(later.iter().any(|m| m.contains("doesn't reflect changes")), "{later:?}");
     let said = |notes: &[String]| notes.iter().any(|m| m.contains("1 SNAPSHOT given a period"));
+    // Its end isn't used, read or not.
+    for end in ["PERM", ""] {
+        let valid = format!(
+            r#"<gml:validTime><gml:TimePeriod gml:id="t"><gml:beginPosition>2026-01-01T00:00:00Z</gml:beginPosition><gml:endPosition>{end}</gml:endPosition></gml:TimePeriod></gml:validTime>"#
+        );
+        let (got, notes) = run(&[slice("DesignatedPoint", "SNAPSHOT", 1, 0, &valid, &named_point("SNAP"))], "2026-01-15");
+        assert!(got.len() == 2 && said(&notes) && !notes.iter().any(|m| m.contains("read as open")), "{got:?} {notes:?}");
+    }
     let (got, notes) = run(&[slice("DesignatedPoint", "SNAPSHOT", 1, 0, &valid, &named_point("SNAP"))], "2026-01-15");
     assert!(got.len() == 2 && said(&notes), "{got:?} {notes:?}");
     assert!(!said(&run(&[snapshot_at("2026-01-01T00:00:00Z", "SNAP")], "2026-01-15").1));
@@ -2024,5 +2040,24 @@ fn rows_past_the_tables_memory_are_left_out_and_said() {
     for (n, notes) in [run(&sparse, 1 << 30), run(&narrow, 0)] {
         assert_eq!(n, rows);
         assert!(!notes.iter().any(|m| m.contains("left out")), "{notes:?}");
+    }
+}
+
+#[test]
+fn a_border_is_followed_by_the_gml_id_of_any_of_its_members() {
+    let border = |gid: &str, seq: u32, from: &str, to: Option<&str>| {
+        let b = r#"<aixm:border><aixm:Curve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="c"><gml:segments><gml:LineStringSegment><gml:posList>50 9 50 10 51 10</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></aixm:border>"#;
+        feature("GeoBorder", "line", &[slice("GeoBorder", "BASELINE", seq, 0, &period(from, to), b)])
+            .replace(r#"gml:id="f""#, &format!(r#"gml:id="{gid}""#))
+    };
+    let members =
+        border("b-old", 1, "2020-01-01T00:00:00Z", Some("2025-01-01T00:00:00Z")) + &border("b-new", 2, "2025-01-01T00:00:00Z", None);
+    for id in ["b-old", "b-new"] {
+        let area = format!(
+            r##"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember xlink:href="#{id}"/><gml:curveMember><gml:Curve gml:id="k"><gml:segments><gml:LineStringSegment><gml:posList>51 10 51 9 50 9</gml:posList></gml:LineStringSegment></gml:segments></gml:Curve></gml:curveMember></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"##
+        );
+        let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &area)]);
+        let out = read("t.xml", &message(&(members.clone() + &f)), &at("2026-01-15")).unwrap();
+        assert!(layer(&out, "t WorkArea").features[0].geometry.is_some(), "{id}: {:?}", said(&out));
     }
 }

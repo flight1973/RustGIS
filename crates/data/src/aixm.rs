@@ -12,7 +12,8 @@
 //! at the date, withdrawn before it (`featureLifetime`) or with only changes and no state are left
 //! out and counted, as are those with a slice that may apply then whose validity can't be read. A
 //! feature with no BASELINE is shown as its nearest SNAPSHOT, without changes over it (it already
-//! holds those of its instant), and said.
+//! holds those of its instant), and said; one given a period is read at its start, and said. A
+//! PERMDELTA given a period can't be placed, and withholds its feature while it may apply.
 //!
 //! Geometry is the GML 3.2 the AIXM profile allows (OGC 12-028r1): points, curves of
 //! `GeodesicString`, `Geodesic`, `LineStringSegment`, `Arc`, `ArcString`, `Circle`,
@@ -493,7 +494,9 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     // PERMDELTAs since the state began, up to the date, in order.
     let since = |s: &Slice| s.begin.is_none_or(|b| b <= t && base.begin.is_none_or(|bb| b > bb));
     // One that can't be read may be a withdrawal: its feature is left out, a SNAPSHOT's too.
-    if unread_of(Interpretation::PermDelta).any(since) {
+    // One given a period (only it has an end) may be made anywhere in it.
+    let may_since = |s: &Slice| since(s) || s.begin.is_some_and(|b| b <= t) && s.end.is_some_and(|e| base.begin.is_some_and(|bb| e > bb));
+    if unread_of(Interpretation::PermDelta).any(may_since) {
         return State::Unreadable;
     }
     let by_start = |a: &Slice, b: &Slice| started(a).total_cmp(&started(b)).then(a.range.0.cmp(&b.range.0));
@@ -516,7 +519,9 @@ fn state_at(slices: &[Slice], t: f64) -> State {
         // A snapshot after the date holds the PERMDELTAs up to its instant, its creation maybe among
         // them: that isn't worked back (the concept has no rule for it), and is said.
         let ahead = |s: &Slice| s.begin.is_none_or(|b| t < b && base.begin.is_some_and(|bb| b <= bb));
-        let perm_ahead = of(Interpretation::PermDelta).chain(unread_of(Interpretation::PermDelta)).any(ahead);
+        let may_ahead =
+            |s: &Slice| ahead(s) || s.end.is_some_and(|e| e > t) && s.begin.is_some_and(|b| base.begin.is_some_and(|bb| b <= bb));
+        let perm_ahead = of(Interpretation::PermDelta).any(ahead) || unread_of(Interpretation::PermDelta).any(may_ahead);
         // One that can't be read may be either, unless the dates it has rule it out on both.
         let may_differ = |s: &Slice| in_force(s.begin, s.end, t) || base.begin.is_none_or(|bb| in_force(s.begin, s.end, bb));
         let skipped = !changes.is_empty()
@@ -588,10 +593,17 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
                     bad = true;
                     None
                 });
-                end = position(child(p, "endPosition"), &empty).unwrap_or_else(|()| {
-                    bad = true;
-                    None
-                });
+                // A SNAPSHOT's end isn't used.
+                if !period {
+                    end = position(child(p, "endPosition"), &empty).unwrap_or_else(|()| {
+                        bad = true;
+                        None
+                    });
+                }
+                // An open PERMDELTA period has an end for `state_at` to tell it from an instant.
+                if kind == Interpretation::PermDelta {
+                    end = end.or(Some(f64::INFINITY));
+                }
             }
             Some(i) if local(&i) == "TimeInstant" => {
                 // A BASELINE and a TEMPDELTA have a period (TS_001, TS_003): until when isn't said.
@@ -735,8 +747,9 @@ struct Shapes {
     as_wgs84: Option<String>,
     as_wgs84_count: usize,
     as_wgs84_now: bool,
-    /// The borders references may follow, by [`border_key`]: each GeoBorder's at the date.
-    borders: HashMap<String, Vec<Coord>>,
+    /// The borders references may follow, by [`border_key`] and by `gml:id`: each GeoBorder's at the
+    /// date, its points shared by every name it has (a file can give one any number).
+    borders: HashMap<String, std::rc::Rc<[Coord]>>,
     /// Steps of looking along borders still allowed ([`Shapes::scan`]).
     scan_left: usize,
     /// Where each point feature is (a navaid, a designated point), by its identifier: the ends of
@@ -1311,7 +1324,7 @@ impl Shapes {
                 let (part, off) = cut(border, a, b).ok_or(Unfollowed::Unusable)?;
                 (part, off > FAR_FROM_BORDER_M)
             }
-            _ => (border.clone(), false),
+            _ => (border.to_vec(), false),
         };
         // Its points are paid for as a curve's added points are; one that can't be takes none.
         let n = part.len();
@@ -2519,7 +2532,7 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
             && let Some(g) = props.iter().filter(|p| local(p) == "border").find_map(|p| shape_in(*p))
             && let Some(Geometry::Line(parts)) = shapes.quietly(g)
         {
-            let line: Vec<Coord> = parts.concat();
+            let line: std::rc::Rc<[Coord]> = parts.concat().into();
             if let Some(gid) = g.attribute((GML, "id")) {
                 shapes.borders.insert(format!("#{}", gid.trim()), line.clone());
             }
@@ -3111,7 +3124,7 @@ fn finish(
         notes.unreadable_state,
         "feature",
         "features",
-        "left out: a time slice of it that may apply (the latest correction) has no validTime of the kind it needs (a period, or an instant for a PERMDELTA or SNAPSHOT), or a validTime or featureLifetime that can't be read",
+        "left out: a time slice of it that may apply (the latest correction) has no validTime of the kind it needs (a period, an instant for a PERMDELTA, or for a SNAPSHOT an instant or a period with a start), or a validTime or featureLifetime that can't be read",
     );
     say(
         &mut file,
@@ -3149,7 +3162,7 @@ fn finish(
         notes.bad_dates,
         "time slice",
         "time slices",
-        "with no validTime of the kind it needs (a period, or an instant for a PERMDELTA or SNAPSHOT), or with a validTime or featureLifetime that can't be read (a feature it may apply to is left out, or shown as its SNAPSHOT)",
+        "with no validTime of the kind it needs (a period, an instant for a PERMDELTA, or for a SNAPSHOT an instant or a period with a start), or with a validTime or featureLifetime that can't be read (a feature it may apply to is left out, or shown as its SNAPSHOT)",
     );
     say(
         &mut file,
@@ -3433,8 +3446,8 @@ fn finish(
         );
         say(
             layer.snapshots,
-            "feature is a SNAPSHOT: its state at its own instant, which may not be its state on the date asked (it may not have existed then)",
-            "features are SNAPSHOTs: their state at their own instant, which may not be their state on the date asked (they may not have existed then)",
+            "feature is a SNAPSHOT: its state at its own instant, which may not be its state on the date asked (one later than that date may not have existed on it)",
+            "features are SNAPSHOTs: their state at their own instant, which may not be their state on the date asked (those later than that date may not have existed on it)",
         );
         say(
             layer.over_bytes,
