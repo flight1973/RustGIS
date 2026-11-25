@@ -17,7 +17,8 @@
 //! Geometry is the GML 3.2 the AIXM profile allows (OGC 12-028r1): points, curves of
 //! `GeodesicString`, `Geodesic`, `LineStringSegment`, `Arc`, `ArcString`, `Circle`,
 //! `ArcByCenterPoint` and `CircleByCenterPoint` segments, and surfaces of polygon patches. Arcs are
-//! drawn as points along them on the WGS 84 ellipsoid, within a meter of the curve; a geodesic edge
+//! drawn as points along them on the WGS 84 ellipsoid, within a meter of the curve (coarser, and
+//! said, once the points the file's size allows run out); a geodesic edge
 //! longer than 10 km is drawn as points along the geodesic. `ArcByCenterPoint` angles follow the
 //! AIXM coding guidance: in a latitude-first system (`urn:ogc:def:crs:EPSG::4326`) bearings
 //! clockwise from true north, the arc running from the start angle to the end angle (clockwise when
@@ -396,8 +397,9 @@ struct Feature {
     /// Its identifier (`gml:identifier`, else its `gml:id`).
     id: String,
     kind: String,
-    /// Its own `gml:id`: what a local link (`#id`) or the FAA's XPath names it by.
-    gml_id: Option<String>,
+    /// Its own `gml:id`s, one for each member that gives it: what a local link (`#id`) or the FAA's
+    /// XPath names it by.
+    gml_ids: HashSet<String>,
     slices: Vec<Slice>,
 }
 
@@ -474,8 +476,8 @@ fn state_at(slices: &[Slice], t: f64) -> State {
             // One that can't be read may be the one shown: nearer before the date, or (with none
             // before it) earlier after.
             let nearer = |u: &Slice| match (u.begin, snap) {
-                (Some(b), Some(s)) if started(s) <= t => b <= t && b >= started(s),
-                (Some(b), Some(s)) => b <= started(s),
+                (Some(b), Some(s)) if started(s) <= t => b <= t && (b > started(s) || b == started(s) && u.range.0 > s.range.0),
+                (Some(b), Some(s)) => b < started(s) || b == started(s) && u.range.0 > s.range.0,
                 _ => true,
             };
             if unread_of(Interpretation::Snapshot).any(nearer) {
@@ -543,6 +545,8 @@ struct SliceTrouble {
     empty: usize,
     /// Slices with a sequence or correction number that isn't a number, read as 0.
     numbers: usize,
+    /// SNAPSHOTs given a period, read at its start.
+    periods: usize,
 }
 
 /// A slice's own properties.
@@ -568,12 +572,18 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
     };
     let empty = std::cell::Cell::new(0);
     let (mut begin, mut end, mut canceled) = (None, None, false);
+    let mut period = false;
     let mut bad = false;
     // One without a validTime (which every slice has, if only empty) could apply at any date.
     bad |= child(s, "validTime").is_none();
     if let Some(v) = child(s, "validTime") {
         match elements(v).next() {
             Some(p) if local(&p) == "TimePeriod" => {
+                // A PERMDELTA has an instant (TS_002): when its change is made isn't said. A
+                // SNAPSHOT has too, but some systems work one out for a period (TS_004's note): it
+                // is read at its start, and said.
+                bad |= kind == Interpretation::PermDelta;
+                period = kind == Interpretation::Snapshot;
                 begin = position(child(p, "beginPosition"), &empty).unwrap_or_else(|()| {
                     bad = true;
                     None
@@ -627,6 +637,7 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
         return Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled: false, lifetime: None, unreadable: true });
     }
     trouble.empty += empty.get();
+    trouble.periods += usize::from(period);
     Some(Slice { range, scope, kind, sequence, correction, begin, end, canceled, lifetime, unreadable: false })
 }
 
@@ -2231,6 +2242,8 @@ fn projection<'a, 'i>(v: Option<Node<'a, 'i>>) -> Option<Node<'a, 'i>> {
 struct FileNotes {
     /// Slices with a sequence or correction number that isn't a number, read as 0.
     bad_numbers: usize,
+    /// SNAPSHOT slices given a period, read at its start.
+    snapshot_periods: usize,
     /// Features left out because a change in force at the date couldn't be read.
     incomplete: usize,
     /// Time positions left empty without saying they are unknown, read as open.
@@ -2263,6 +2276,12 @@ struct FileNotes {
 /// several), at the effective date `opts.at` (today when not given). Cancel is looked at between
 /// members; finding them first is one pass over the text without a look.
 pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Dataset, ReadReport)>> {
+    read_within(file_name, bytes, opts, MIN_ROW_BYTES * 4)
+}
+
+/// [`read`], its tables of at most eight times the file's size, or `dense_floor` bytes when that is
+/// more.
+fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize) -> Result<Vec<(Dataset, ReadReport)>> {
     let max = crate::io::max_bytes();
     if bytes.len() as u64 > max {
         return Err(DataError::Format(crate::io::file_size_error(file_name, max)));
@@ -2350,13 +2369,9 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             let key = format!("{}\u{1}{id}", local(&f));
             let entry = features.entry(key.clone()).or_insert_with(|| {
                 order.push(key.clone());
-                Feature {
-                    id: id.clone(),
-                    kind: local(&f).to_string(),
-                    gml_id: f.attribute((GML, "id")).map(|g| g.trim().to_string()),
-                    slices: Vec::new(),
-                }
+                Feature { id: id.clone(), kind: local(&f).to_string(), gml_ids: HashSet::new(), slices: Vec::new() }
             });
+            entry.gml_ids.extend(f.attribute((GML, "id")).map(|g| g.trim().to_string()));
             entry.slices.extend(slices);
         }
     }
@@ -2364,6 +2379,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.bad_dates = trouble.dates;
     notes.empty_dates = trouble.empty;
     notes.bad_numbers = trouble.numbers;
+    notes.snapshot_periods = trouble.periods;
     // Second pass: each feature in force at the date, from its slices.
     // The nested paths of every row, each kept once.
     let paths: SharedPaths =
@@ -2507,7 +2523,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
             if let Some(gid) = g.attribute((GML, "id")) {
                 shapes.borders.insert(format!("#{}", gid.trim()), line.clone());
             }
-            if let Some(gid) = &feature.gml_id {
+            for gid in &feature.gml_ids {
                 shapes.borders.insert(format!("#{gid}"), line.clone());
             }
             shapes.borders.insert(border_key(id), line);
@@ -2519,7 +2535,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
         {
             // By its own gml:id (a local link or an XPath), by its kind and identifier, and by
             // its identifier alone for a link whose kind isn't known (the first so named).
-            if let Some(gid) = &feature.gml_id {
+            for gid in &feature.gml_ids {
                 shapes.points.insert(format!("#{gid}"), c);
             }
             let uuid = id.trim_start_matches("urn:uuid:");
@@ -2567,7 +2583,7 @@ pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Datase
     notes.assumed_system = shapes.assumed_system;
     let paths = paths.try_borrow_mut().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default();
     layers.list.sort_by_key(|l| kind_rank.get(&l.kind).copied().unwrap_or(usize::MAX));
-    let mut dense_left = text.len().saturating_mul(8).max(MIN_ROW_BYTES * 4);
+    let mut dense_left = text.len().saturating_mul(8).max(dense_floor);
     finish(&stem, at, layers, notes, &index, shapes.budget == 0, &paths, &mut dense_left)
 }
 
@@ -3119,6 +3135,7 @@ fn finish(
         "time positions",
         "left empty (not said to be unknown) read as open: no start or no end",
     );
+    say(&mut file, notes.snapshot_periods, "SNAPSHOT", "SNAPSHOTs", "given a period, not an instant, read at its start");
     say(&mut file, notes.bad_numbers, "time slice", "time slices", "with a sequence or correction number that isn't a number read as 0");
     say(
         &mut file,

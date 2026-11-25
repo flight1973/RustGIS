@@ -24184,6 +24184,10 @@ fn aixm_messages_are_added_at_the_date_asked() {
     // A window of a GeoTIFF, before it is read.
     let w = s.run("layer.addUrl", &json!({"url": "https://example.test/download", "bbox": [0, 0, 1, 1], "at": "2026-01-15"})).unwrap_err();
     assert!(w.contains("doesn't read at"), "{w}");
+    for blank in ["", "  "] {
+        let p = json!({"url": "https://example.test/download", "bbox": [0, 0, 1, 1], "at": blank});
+        assert!(crate::cmd::layer::window_asked(&s, &p).is_ok(), "{blank:?}");
+    }
     // A service's answer read already: refused, and not held.
     s.landed_reads.push((
         7,

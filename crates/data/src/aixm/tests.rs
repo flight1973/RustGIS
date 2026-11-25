@@ -1947,3 +1947,82 @@ fn an_empty_instant_is_said_once() {
     assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice")), "{notes:?}");
     assert!(!notes.iter().any(|m| m.contains("read as open")), "{notes:?}");
 }
+
+#[test]
+fn a_change_given_a_period_is_withheld_and_a_snapshot_is_read_at_its_start_and_said() {
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let base = baseline(1, 0, "2025-01-01T00:00:00Z", None, "BASE");
+    let valid = period("2026-01-01T00:00:00Z", Some("2026-02-01T00:00:00Z"));
+    let run = |s: &[String], d| names(&message(&(point("a", s) + &kept)), d);
+    let perm = change("PERMDELTA", 1, &valid, "<aixm:name>PERM</aixm:name>");
+    assert_eq!(run(&[base.clone(), perm.clone()], "2025-12-15").0, [Value::Text("BASE".into()), Value::Text("KEPT".into())]);
+    for d in ["2026-01-15", "2026-06-15"] {
+        let (got, notes) = run(&[base.clone(), perm.clone()], d);
+        assert_eq!(got, [Value::Text("KEPT".into())]);
+        assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice")), "{notes:?}");
+    }
+    let said = |notes: &[String]| notes.iter().any(|m| m.contains("1 SNAPSHOT given a period"));
+    let (got, notes) = run(&[slice("DesignatedPoint", "SNAPSHOT", 1, 0, &valid, &named_point("SNAP"))], "2026-01-15");
+    assert!(got.len() == 2 && said(&notes), "{got:?} {notes:?}");
+    assert!(!said(&run(&[snapshot_at("2026-01-01T00:00:00Z", "SNAP")], "2026-01-15").1));
+}
+
+#[test]
+fn a_later_snapshot_wins_a_tie_read_or_not() {
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let lifetime = r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>bad</gml:beginPosition><gml:endPosition/></gml:TimePeriod></aixm:featureLifetime>"#;
+    let snap = snapshot_at("2026-01-01T00:00:00Z", "SNAP");
+    let unread = snap.replace("<aixm:interpretation>", &format!("{lifetime}<aixm:interpretation>"));
+    for d in ["2025-12-15", "2026-01-15"] {
+        let run = |s: &[String]| names(&message(&(point("a", s) + &kept)), d).0;
+        assert_eq!(run(&[unread.clone(), snap.clone()]), [Value::Text("SNAP".into()), Value::Text("KEPT".into())]);
+        assert_eq!(run(&[snap.clone(), unread.clone()]), [Value::Text("KEPT".into())]);
+    }
+}
+
+#[test]
+fn a_feature_is_found_by_the_gml_id_of_any_of_its_members() {
+    let member = |gid: &str, seq: u32, from: &str, to: Option<&str>, pos: &str| {
+        let b = format!(
+            r#"<aixm:location><aixm:Point srsName="urn:ogc:def:crs:EPSG::4326" gml:id="g"><gml:pos>{pos}</gml:pos></aixm:Point></aixm:location>"#
+        );
+        feature("DesignatedPoint", "near", &[slice("DesignatedPoint", "BASELINE", seq, 0, &period(from, to), &b)])
+            .replace(r#"gml:id="f""#, &format!(r#"gml:id="{gid}""#))
+    };
+    let members = member("p-old", 1, "2020-01-01T00:00:00Z", Some("2025-01-01T00:00:00Z"), "40 10")
+        + &member("p-new", 2, "2025-01-01T00:00:00Z", None, "50 10")
+        + &named_at("DesignatedPoint", "far", 50.0, 12.0);
+    for id in ["p-old", "p-new"] {
+        let route = route_to("pointChoice_fixDesignatedPoint", "X").replace("urn:uuid:X", &format!("#{id}"));
+        let out = read("t.xml", &message(&(members.clone() + &route)), &at("2026-01-15")).unwrap();
+        let Some(Geometry::Line(l)) = &layer(&out, "t RouteSegment").features[0].geometry else { panic!("{id} not drawn") };
+        assert_eq!(l[0].first(), Some(&Coord::new(10.0, 50.0)));
+    }
+}
+
+#[test]
+fn rows_past_the_tables_memory_are_left_out_and_said() {
+    let wide: String = (0..1500).map(|i| format!("<aixm:p{i}>1</aixm:p{i}>")).collect();
+    let one = |i: usize, more: &str| {
+        point(
+            &format!("p{i}"),
+            &[slice("DesignatedPoint", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &(named_point("N") + more))],
+        )
+    };
+    let rows = 400;
+    let sparse = message(&(0..rows).map(|i| one(i, if i == 0 { &wide } else { "" })).collect::<String>());
+    let narrow = message(&(0..rows).map(|i| one(i, "")).collect::<String>());
+    let run = |bytes: &[u8], floor| {
+        let out = read_within("t.xml", bytes, &at("2026-01-15"), floor).unwrap();
+        (layer(&out, "t DesignatedPoint").features.len(), said(&out))
+    };
+    // Sparse and wide: what eight times the file allows, the rest said.
+    let (kept, notes) = run(&sparse, 0);
+    assert!(kept > 0 && kept < rows, "{kept}");
+    assert!(notes.iter().any(|m| m.contains(&format!("{} rows are left out", rows - kept))), "{notes:?}");
+    // The same within the floor, and tall and narrow without it: all kept, nothing said.
+    for (n, notes) in [run(&sparse, 1 << 30), run(&narrow, 0)] {
+        assert_eq!(n, rows);
+        assert!(!notes.iter().any(|m| m.contains("left out")), "{notes:?}");
+    }
+}
