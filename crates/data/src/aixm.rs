@@ -771,9 +771,11 @@ struct Shapes {
     border_names: HashMap<String, Option<usize>>,
     /// Steps of looking along borders still allowed ([`Shapes::scan`]).
     scan_left: usize,
-    /// Where each point feature is (a navaid, a designated point), by its identifier: the ends of
-    /// route segments that name them.
-    points: HashMap<String, Option<Coord>>,
+    /// Where each feature a route segment's end can name ([`POINT_KINDS`]) is at the date, if
+    /// anywhere.
+    points: Vec<Option<Coord>>,
+    /// Which of them a name names (`None`, more than one).
+    point_names: HashMap<String, Option<usize>>,
 }
 
 fn wrap180(d: f64) -> f64 {
@@ -1180,8 +1182,9 @@ impl Shapes {
                 // Its members: curves written out, and borders given by reference, which are cut
                 // once the points either side of them are known.
                 // A border not in the file leaves the ring undrawn, before work is spent on it.
-                let missing =
-                    |m: &Node| elements(*m).next().is_none() && m.attribute((XLINK, "href")).and_then(|h| self.border_named(h)).is_none();
+                let missing = |m: &Node| {
+                    elements(*m).next().is_none() && m.attribute((XLINK, "href")).is_some_and(|h| self.border_named(h).is_none())
+                };
                 if elements(r).filter(|c| local(c) == "curveMember").any(|m| missing(&m)) {
                     say_unfollowed(Unfollowed::Missing, notes);
                     return None;
@@ -1389,6 +1392,20 @@ impl Shapes {
             by(&format!("id:{h}")).or_else(|| by(&format!("uuid:{}", h.strip_prefix("urn:uuid:").unwrap_or(h))))
         };
         named.flatten().filter(|n| self.borders.get(*n).is_some_and(|l| !l.is_empty()))
+    }
+
+    /// Keeps a point feature under its names, its place not known yet: its `gml:id`s, and its
+    /// identifier as written and without `urn:uuid:`, of its kind and of any. A name two have is
+    /// neither's.
+    fn add_point(&mut self, f: &Feature) {
+        let n = self.points.len();
+        self.points.push(None);
+        let id = f.id.trim();
+        let bare = id.strip_prefix("urn:uuid:").unwrap_or(id);
+        let ids = [f.kind.as_str(), "*"].into_iter().flat_map(|k| [format!("{k}\u{1}id:{id}"), format!("{k}\u{1}uuid:{bare}")]);
+        for name in f.gml_ids.iter().map(|g| format!("#{g}")).chain(ids) {
+            self.point_names.entry(name).and_modify(|k| *k = k.filter(|k| *k == n)).or_insert(Some(n));
+        }
     }
 
     /// Takes `n` steps of looking along borders from their allowance: false when it is spent.
@@ -2471,12 +2488,23 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
         }
     }
     order.sort_by_key(rank);
-    // Every GeoBorder's names first, in force or not: a reference names that one and no other.
+    // Every GeoBorder's identifiers and gml:ids first, in force or not: a reference to one names it
+    // and no other (its curve's gml:id is known once it is read).
     let mut border_of: HashMap<String, usize> = HashMap::new();
     for key in &order {
         if let Some(f) = features.get(key).filter(|f| f.kind == "GeoBorder") {
             border_of.insert(key.clone(), shapes.borders.len());
             shapes.add_border(&f.id, f.gml_ids.iter().map(String::as_str), Vec::new());
+        }
+    }
+    // And those of the points route segments name, in a file that has any.
+    let mut point_of: HashMap<String, usize> = HashMap::new();
+    if features.values().any(|f| f.kind == "RouteSegment") {
+        for key in &order {
+            if let Some(f) = features.get(key).filter(|f| POINT_KINDS.iter().any(|(_, k)| *k == f.kind)) {
+                point_of.insert(key.clone(), shapes.points.len());
+                shapes.add_point(f);
+            }
         }
     }
     crate::progress::begin(index.members.len() + order.len());
@@ -2594,19 +2622,13 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
                 *line = parts.concat();
             }
         }
-        // Where a point feature is, for route segments that name it: by its identifier and its
-        // own gml:id (a local link's or an XPath's).
-        if let Some(g) = props.iter().find_map(|p| shape_in(*p).filter(|g| matches!(local(g), "Point" | "ElevatedPoint")))
+        // Where a point feature is, for route segments that name it.
+        if let Some(&n) = point_of.get(key)
+            && let Some(g) = props.iter().find_map(|p| shape_in(*p).filter(|g| matches!(local(g), "Point" | "ElevatedPoint")))
             && let Some(Geometry::Point(c)) = shapes.quietly(g)
+            && let Some(p) = shapes.points.get_mut(n)
         {
-            // By its own gml:id (a local link or an XPath), by its kind and identifier, and by
-            // its identifier alone for a link whose kind isn't known.
-            // A name of features in more than one place is none's.
-            let uuid = id.trim_start_matches("urn:uuid:");
-            let names = [format!("{kind}\u{1}{uuid}"), uuid.to_string()];
-            for name in feature.gml_ids.iter().map(|g| format!("#{g}")).chain(names) {
-                shapes.points.entry(name).and_modify(|p| *p = p.filter(|p| *p == c)).or_insert(Some(c));
-            }
+            *p = Some(c);
         }
         let mut fnotes = ShapeNotes::default();
         let placed = match kind {
@@ -2709,13 +2731,14 @@ fn segment_end<'a, 'i>(props: &[Node<'a, 'i>], name: &str, shapes: &Shapes) -> O
 /// kind the choice names, or (a choice of no known kind) any point of that identifier.
 fn named_point(shapes: &Shapes, choice: Node, href: &str) -> Option<Coord> {
     let target = reference(href);
-    if href.trim().starts_with('#') || href.contains("@gml:id") {
-        return shapes.points.get(&format!("#{target}")).copied().flatten();
-    }
-    match point_kind(local(&choice)) {
-        Some(k) => shapes.points.get(&format!("{k}\u{1}{target}")).copied().flatten(),
-        None => shapes.points.get(&target).copied().flatten(),
-    }
+    let by = |name: String| shapes.point_names.get(&name).copied();
+    let named = if href.trim().starts_with('#') || href.contains("@gml:id") {
+        by(format!("#{target}"))
+    } else {
+        let k = point_kind(local(&choice)).unwrap_or("*");
+        by(format!("{k}\u{1}id:{}", href.trim())).or_else(|| by(format!("{k}\u{1}uuid:{target}")))
+    };
+    named.flatten().and_then(|n| shapes.points.get(n).copied().flatten())
 }
 
 /// Whether a shape gives no positions: empty ones (as the FAA writes a position it doesn't have),
@@ -2759,15 +2782,18 @@ fn names_a_missing_point(props: &[Node], shapes: &Shapes) -> bool {
 /// The kind of feature a route end's choice names (`pointChoice_fixDesignatedPoint`: a
 /// DesignatedPoint).
 fn point_kind(choice: &str) -> Option<&'static str> {
-    Some(match choice.strip_prefix("pointChoice_")? {
-        "fixDesignatedPoint" => "DesignatedPoint",
-        "navaidSystem" => "Navaid",
-        "aimingPoint" => "TouchDownLiftOff",
-        "runwayPoint" => "RunwayCentrelinePoint",
-        "airportReferencePoint" => "AirportHeliport",
-        _ => return None,
-    })
+    let name = choice.strip_prefix("pointChoice_")?;
+    POINT_KINDS.iter().find(|(c, _)| *c == name).map(|(_, k)| *k)
 }
+
+/// What a route segment's end can name, by its choice (the AIXM 5.1.1 schema's SegmentPoint).
+const POINT_KINDS: [(&str, &str); 5] = [
+    ("fixDesignatedPoint", "DesignatedPoint"),
+    ("navaidSystem", "Navaid"),
+    ("aimingPoint", "TouchDownLiftOff"),
+    ("runwayPoint", "RunwayCentrelinePoint"),
+    ("airportReferencePoint", "AirportHeliport"),
+];
 
 /// The family a shape element draws as, by its name (what a layer of its shapes is labeled).
 fn element_family(name: &str) -> &'static str {
@@ -3409,8 +3435,8 @@ fn finish(
         );
         say(
             layer.referenced,
-            "border is given by reference to a curve that isn't in the file (or not in force then, or of a name more than one has), so it can't be followed",
-            "borders are given by reference to curves that aren't in the file (or not in force then, or of a name more than one has), so they can't be followed",
+            "border is given by reference to a curve that isn't in the file (or not in force then, can't be read, or has a name others share), so it can't be followed",
+            "borders are given by reference to curves that aren't in the file (or not in force then, can't be read, or have a name others share), so they can't be followed",
         );
         say(
             layer.followed_whole,

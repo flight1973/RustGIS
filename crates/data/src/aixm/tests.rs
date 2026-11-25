@@ -2153,7 +2153,7 @@ fn borders_of_alike_identifiers_are_told_apart_by_their_gml_ids() {
     let shared = members.replace("c2", "c1");
     let (lats, notes) = drawn("#c1", &shared);
     assert_eq!(lats, None);
-    assert!(notes.iter().any(|m| m.contains("of a name more than one has")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.contains("has a name others share")), "{notes:?}");
     // One not in force is no other: not drawn along the one whose identifier is alike.
     let past = members.replacen("2025-01-01T00:00:00Z", "2030-01-01T00:00:00Z", 1);
     for name in ["urn:uuid:X", "#b1"] {
@@ -2221,12 +2221,39 @@ fn a_route_end_named_as_two_points_are_is_neither() {
         (named_at("DesignatedPoint", "X", 50.0, 10.0) + &named_at("DesignatedPoint", "urn:uuid:X", lat, 10.0))
             .replace(r#"gml:id="f""#, r#"gml:id="p""#)
     };
-    for route in [&by_id, &by_gid] {
-        let (drawn, notes) = run(&two(40.0), route);
-        assert!(!drawn && notes.iter().any(|m| m.contains("has a name others share")), "{notes:?}");
-        // In one place, they are as one.
-        assert!(run(&two(50.0), route).0);
-    }
+    let (drawn, notes) = run(&two(40.0), &by_gid);
+    assert!(!drawn && notes.iter().any(|m| m.contains("has a name others share")), "{notes:?}");
+    // One written exactly so is that one.
+    let start = |points: &str, route: &str| {
+        let out = read("t.xml", &message(&(points.to_string() + &far + route)), &at("2026-01-15")).unwrap();
+        match &layer(&out, "t RouteSegment").features[0].geometry {
+            Some(Geometry::Line(l)) => l[0].first().copied(),
+            _ => None,
+        }
+    };
+    assert_eq!(start(&two(40.0), &by_id), Some(Coord::new(10.0, 40.0)));
+    assert_eq!(start(&two(40.0), &by_id.replace("urn:uuid:X", "X")), Some(Coord::new(10.0, 50.0)));
+    // Two with neither written so: neither.
+    let alike = named_at("DesignatedPoint", "X", 50.0, 10.0) + &named_at("DesignatedPoint", "urn:uuid:X", 40.0, 10.0);
+    assert_eq!(start(&alike.replace("urn:uuid:X", "urn:uuid:Y"), &by_id), Some(Coord::new(10.0, 50.0)));
+    // One not in force is no other of an alike identifier.
+    let past =
+        two(40.0).replace("2025-01-01T00:00:00Z", "2030-01-01T00:00:00Z").replacen("2030-01-01T00:00:00Z", "2025-01-01T00:00:00Z", 1);
+    assert_eq!(start(&past, &by_id), None);
+    assert_eq!(start(&past, &by_id.replace("urn:uuid:X", "X")), Some(Coord::new(10.0, 50.0)));
+    // An identifier that looks like a gml:id isn't one.
+    let odd = named_at("DesignatedPoint", "A", 50.0, 10.0).replace(r#"gml:id="f""#, r#"gml:id="p""#)
+        + &named_at("DesignatedPoint", "#p", 40.0, 10.0);
+    assert_eq!(start(&odd, &by_gid), Some(Coord::new(10.0, 50.0)));
+}
+
+#[test]
+fn a_ring_member_that_names_nothing_isnt_a_missing_border() {
+    let area = r#"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember/></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#;
+    let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), area)]);
+    let notes = said(&read("t.xml", &message(&f), &at("2026-01-15")).unwrap());
+    assert!(!notes.iter().any(|m| m.contains("border is given by reference")), "{notes:?}");
+    assert!(notes.iter().any(|m| m.contains("1 ring or surface patch was left out")), "{notes:?}");
 }
 
 #[test]
