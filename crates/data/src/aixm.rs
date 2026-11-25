@@ -431,8 +431,6 @@ fn in_force(begin: Option<f64>, end: Option<f64>, t: f64) -> bool {
 fn may_be_made(s: &Slice, from: f64, to: f64) -> bool {
     let (first, last) = match (s.begin, s.end) {
         (Some(b), None) => (b, b),
-        // One that ends before it begins is wrong in one of them: its end isn't known.
-        (Some(b), Some(e)) if e < b => (b, f64::INFINITY),
         (b, e) => (b.unwrap_or(f64::NEG_INFINITY), e.unwrap_or(f64::INFINITY)),
     };
     from < to && first <= to && last > from
@@ -648,6 +646,12 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
             });
             (from, until)
         });
+    // A period that ends before it begins is wrong in one of them: neither says when it applies.
+    if begin.zip(end).is_some_and(|(b, e)| e < b) {
+        bad = true;
+        begin = None;
+        end = (kind == Interpretation::PermDelta).then_some(f64::INFINITY);
+    }
     let (sequence, correction) = (number("sequenceNumber"), number("correctionNumber"));
     trouble.numbers += usize::from(unread_number.get());
     // A PERMDELTA applies from its instant and a SNAPSHOT is a state at its: one without can't be
@@ -760,9 +764,9 @@ struct Shapes {
     as_wgs84_now: bool,
     /// The borders references may follow: each GeoBorder's at the date, held once.
     borders: Vec<Vec<Coord>>,
-    /// Which border a name names ([`border_key`]): its identifier, its curve's `gml:id`, and its
-    /// members'. A reference holds the number, which no identifier's length makes larger.
-    border_names: HashMap<String, usize>,
+    /// Which border a name names (`None`, more than one): its identifier, its curve's `gml:id`, and
+    /// its members'. A reference holds the number, which no identifier's length makes larger.
+    border_names: HashMap<String, Option<usize>>,
     /// Steps of looking along borders still allowed ([`Shapes::scan`]).
     scan_left: usize,
     /// Where each point feature is (a navaid, a designated point), by its identifier: the ends of
@@ -1180,8 +1184,12 @@ impl Shapes {
                         None => {
                             // The same border named again straight after is the same stretch of
                             // it (DFS writes a border's members so), followed once.
-                            let key = border_key(m.attribute((XLINK, "href"))?);
-                            let key = self.border_names.get(&key).copied().unwrap_or(NO_BORDER);
+                            // One not in the file leaves the ring undrawn, before work is spent
+                            // on the rest of it.
+                            let Some(key) = self.border_named(m.attribute((XLINK, "href"))?) else {
+                                say_unfollowed(Unfollowed::Missing, notes);
+                                return None;
+                            };
                             if !matches!(members.last(), Some(Err(k)) if *k == key) {
                                 members.push(Err(key));
                             }
@@ -1349,10 +1357,26 @@ impl Shapes {
         Ok((part, far))
     }
 
-    /// Keeps a border under its names.
-    fn add_border(&mut self, names: impl IntoIterator<Item = String>, line: Vec<Coord>) {
-        self.border_names.extend(names.into_iter().map(|n| (n, self.borders.len())));
+    /// Keeps a border under its names: its identifier as written, and without `urn:uuid:`, and its
+    /// `gml:id`s. A name two borders have is neither's.
+    fn add_border<'a>(&mut self, id: &str, gids: impl IntoIterator<Item = &'a str>, line: Vec<Coord>) {
+        let n = self.borders.len();
         self.borders.push(line);
+        let id = id.trim();
+        let names = [format!("id:{id}"), format!("uuid:{}", id.strip_prefix("urn:uuid:").unwrap_or(id))];
+        for name in names.into_iter().chain(gids.into_iter().map(|g| format!("#{}", g.trim()))) {
+            self.border_names.entry(name).and_modify(|k| *k = if *k == Some(n) { Some(n) } else { None }).or_insert(Some(n));
+        }
+    }
+
+    /// The border a reference names: by a `gml:id` (`#id`), or by its identifier, as written first.
+    fn border_named(&self, href: &str) -> Option<usize> {
+        let h = href.trim();
+        if h.starts_with('#') {
+            return self.border_names.get(h).copied().flatten();
+        }
+        let by = |name: String| self.border_names.get(&name).copied().flatten();
+        by(format!("id:{h}")).or_else(|| by(format!("uuid:{}", h.strip_prefix("urn:uuid:").unwrap_or(h))))
     }
 
     /// Takes `n` steps of looking along borders from their allowance: false when it is spent.
@@ -1499,19 +1523,6 @@ fn say_unfollowed(why: Unfollowed, notes: &mut ShapeNotes) {
 
 /// How far from a border the ends of a part cut from it may lie before that is said, in meters.
 const FAR_FROM_BORDER_M: f64 = 50.0;
-
-/// The number of a border that isn't in the file.
-const NO_BORDER: usize = usize::MAX;
-
-/// What a reference names a border by: `#` and a `gml:id`, or its feature's identifier. Which border
-/// that is, `Shapes::border_names` says.
-fn border_key(href: &str) -> String {
-    let h = href.trim();
-    match h.strip_prefix('#') {
-        Some(id) => format!("#{id}"),
-        None => format!("uuid:{}", h.strip_prefix("urn:uuid:").unwrap_or(h)),
-    }
-}
 
 /// Where on `line` a point is nearest `p`: the segment, how far along it (0 to 1), the point, and
 /// its distance from `p` in meters. Worked out in a plane around `p` (longitude scaled by the
@@ -2556,8 +2567,8 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
             && let Some(g) = props.iter().filter(|p| local(p) == "border").find_map(|p| shape_in(*p))
             && let Some(Geometry::Line(parts)) = shapes.quietly(g)
         {
-            let gids = g.attribute((GML, "id")).map(str::trim).into_iter().chain(feature.gml_ids.iter().map(String::as_str));
-            shapes.add_border(gids.map(|gid| format!("#{gid}")).chain([border_key(id)]), parts.concat());
+            let gids = g.attribute((GML, "id")).into_iter().chain(feature.gml_ids.iter().map(String::as_str));
+            shapes.add_border(id, gids, parts.concat());
         }
         // Where a point feature is, for route segments that name it: by its identifier and its
         // own gml:id (a local link's or an XPath's).
@@ -3374,8 +3385,8 @@ fn finish(
         );
         say(
             layer.referenced,
-            "border is given by reference to a curve that isn't in the file (or not in force then), so it can't be followed",
-            "borders are given by reference to curves that aren't in the file (or not in force then), so they can't be followed",
+            "border is given by reference to a curve that isn't in the file (or not in force then, or of a name more than one has), so it can't be followed",
+            "borders are given by reference to curves that aren't in the file (or not in force then, or of a name more than one has), so they can't be followed",
         );
         say(
             layer.followed_whole,

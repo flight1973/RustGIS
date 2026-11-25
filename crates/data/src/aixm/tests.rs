@@ -1117,8 +1117,8 @@ fn a_ring_whose_borders_cant_be_joined_within_the_allowance_isnt_drawn_and_says_
     let boundary = doc.root_element().first_element_child().unwrap();
     let line = |pts: &[(f64, f64)]| pts.iter().map(|&(x, y)| Coord::new(x, y)).collect::<Vec<_>>();
     let mut shapes = Shapes { budget: 1_000_000, ..Shapes::default() };
-    shapes.add_border(["uuid:a".to_string()], line(&[(9.0, 50.0), (9.5, 50.0), (10.0, 50.0)]));
-    shapes.add_border(["uuid:b".to_string()], line(&[(10.0, 50.0), (10.0, 50.5), (10.0, 51.0)]));
+    shapes.add_border("a", [], line(&[(9.0, 50.0), (9.5, 50.0), (10.0, 50.0)]));
+    shapes.add_border("b", [], line(&[(10.0, 50.0), (10.0, 50.5), (10.0, 51.0)]));
     // With room to look along both borders where they meet: drawn.
     shapes.scan_left = 1000;
     let mut notes = ShapeNotes::default();
@@ -2129,15 +2129,66 @@ fn borders_of_alike_identifiers_are_told_apart_by_their_gml_ids() {
             .replace(r#"gml:id="f""#, &format!(r#"gml:id="{gid}""#))
     };
     let members = border("urn:uuid:X", "b1", "c1", 50.0) + &border("X", "b2", "c2", 40.0);
-    for (name, lat) in [("#b1", 50.0), ("#c1", 50.0), ("#b2", 40.0), ("#c2", 40.0)] {
+    let drawn = |name: &str, members: &str| {
         let area = format!(
-            r#"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember xlink:href="{name}"/><gml:curveMember><gml:Curve gml:id="k"><gml:segments><gml:LineStringSegment><gml:posList>{lat} 10 51 10 51 9 {lat} 9</gml:posList></gml:LineStringSegment></gml:segments></gml:Curve></gml:curveMember></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#
+            r#"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember xlink:href="{name}"/><gml:curveMember><gml:Curve gml:id="k"><gml:segments><gml:LineStringSegment><gml:posList>45 10 45 9</gml:posList></gml:LineStringSegment></gml:segments></gml:Curve></gml:curveMember></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#
         );
         let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &area)]);
-        let out = read("t.xml", &message(&(members.clone() + &f)), &at("2026-01-15")).unwrap();
-        let r = ring(layer(&out, "t WorkArea").features[0].geometry.as_ref().unwrap()).to_vec();
-        assert!(r.iter().all(|c| (c.y - lat).abs() < 1e-6 || (c.y - 51.0).abs() < 0.1 || c.y > lat), "{name}: {r:?}");
-        assert!(r.iter().filter(|c| (c.y - lat).abs() < 1e-9).count() >= 2, "{name}: {r:?}");
-        assert!(lat == 40.0 || r.iter().all(|c| c.y > 49.0), "{name}: {r:?}");
+        let out = read("t.xml", &message(&(members.to_string() + &f)), &at("2026-01-15")).unwrap();
+        let lats = layer(&out, "t WorkArea").features[0].geometry.as_ref().map(|g| {
+            let mut l: Vec<i64> = ring(g).iter().map(|c| c.y.round() as i64).collect();
+            l.sort_unstable();
+            l.dedup();
+            l
+        });
+        (lats, said(&out))
+    };
+    // Each by its own gml:ids, and by its identifier as it is written.
+    for (name, lat) in [("#b1", 50), ("#c1", 50), ("urn:uuid:X", 50), ("#b2", 40), ("#c2", 40), ("X", 40)] {
+        let (lats, _) = drawn(name, &members);
+        let lats = lats.unwrap_or_else(|| panic!("{name} not drawn"));
+        assert!(lats.contains(&lat) && !lats.contains(&(90 - lat)), "{name}: {lats:?}");
     }
+    // A name two have is neither's, and that is said; an identifier that looks like a gml:id isn't one.
+    let shared = members.replace("c2", "c1");
+    let (lats, notes) = drawn("#c1", &shared);
+    assert_eq!(lats, None);
+    assert!(notes.iter().any(|m| m.contains("of a name more than one has")), "{notes:?}");
+    let odd = members.clone() + &border("#b1", "b3", "c3", 40.0);
+    assert!(drawn("#b1", &odd).0.is_some_and(|l| l.contains(&50)));
+}
+
+#[test]
+fn a_border_not_in_the_file_spends_nothing_of_those_that_are() {
+    let doc = format!(
+        r#"<r {NS}><gml:exterior><gml:Ring><gml:curveMember xlink:href="urn:uuid:v"/><gml:curveMember xlink:href="urn:uuid:no1"/><gml:curveMember xlink:href="urn:uuid:no2"/></gml:Ring></gml:exterior></r>"#
+    );
+    let doc = roxmltree::Document::parse(&doc).unwrap();
+    let mut shapes = Shapes { budget: 1000, scan_left: 1000, ..Shapes::default() };
+    shapes.add_border("v", [], vec![Coord::new(9.0, 50.0), Coord::new(10.0, 50.0)]);
+    let mut notes = ShapeNotes::default();
+    assert!(shapes.ring(doc.root_element().first_element_child().unwrap(), &mut notes).is_none());
+    assert_eq!((notes.referenced, notes.border_allowance, shapes.budget, shapes.scan_left), (1, 0, 1000, 1000));
+}
+
+#[test]
+fn a_period_that_ends_before_it_begins_withholds_its_feature() {
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let base = baseline(1, 0, "2025-01-01T00:00:00Z", None, "BASE");
+    for (begin, end) in [("2026-01-10T00:00:00Z", "2025-01-20T00:00:00Z"), ("2027-01-01T00:00:00Z", "2025-06-01T00:00:00Z")] {
+        let valid = period(begin, Some(end));
+        for kind in ["TEMPDELTA", "PERMDELTA"] {
+            let (got, notes) =
+                names(&message(&(point("a", &[base.clone(), change(kind, 1, &valid, "<aixm:name>X</aixm:name>")]) + &kept)), "2026-01-15");
+            assert_eq!(got, [Value::Text("KEPT".into())], "{kind} {begin}");
+            assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice")), "{notes:?}");
+        }
+        let (got, notes) = names(&message(&(point("a", &[baseline(1, 0, begin, Some(end), "BASE")]) + &kept)), "2026-01-15");
+        assert_eq!(got, [Value::Text("KEPT".into())], "{begin}");
+        assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice")), "{notes:?}");
+    }
+    // Before a later snapshot: shown, and said.
+    let perm = change("PERMDELTA", 1, &period("2026-04-01T00:00:00Z", Some("2026-02-01T00:00:00Z")), "<aixm:name>X</aixm:name>");
+    let (got, notes) = names(&message(&(point("a", &[snapshot_at("2026-03-01T00:00:00Z", "SNAP"), perm]) + &kept)), "2026-01-15");
+    assert!(got.len() == 2 && notes.iter().any(|m| m.contains("doesn't reflect changes")), "{notes:?}");
 }
