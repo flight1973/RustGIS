@@ -2154,6 +2154,14 @@ fn borders_of_alike_identifiers_are_told_apart_by_their_gml_ids() {
     let (lats, notes) = drawn("#c1", &shared);
     assert_eq!(lats, None);
     assert!(notes.iter().any(|m| m.contains("of a name more than one has")), "{notes:?}");
+    // One not in force is no other: not drawn along the one whose identifier is alike.
+    let past = members.replacen("2025-01-01T00:00:00Z", "2030-01-01T00:00:00Z", 1);
+    for name in ["urn:uuid:X", "#b1"] {
+        let (lats, notes) = drawn(name, &past);
+        assert_eq!(lats, None, "{name}");
+        assert!(notes.iter().any(|m| m.contains("not in force then")), "{notes:?}");
+    }
+    assert!(drawn("X", &past).0.is_some_and(|l| l.contains(&40)));
     let odd = members.clone() + &border("#b1", "b3", "c3", 40.0);
     assert!(drawn("#b1", &odd).0.is_some_and(|l| l.contains(&50)));
 }
@@ -2169,6 +2177,13 @@ fn a_border_not_in_the_file_spends_nothing_of_those_that_are() {
     let mut notes = ShapeNotes::default();
     assert!(shapes.ring(doc.root_element().first_element_child().unwrap(), &mut notes).is_none());
     assert_eq!((notes.referenced, notes.border_allowance, shapes.budget, shapes.scan_left), (1, 0, 1000, 1000));
+    // Nor the curves written before it.
+    let doc = format!(
+        r#"<r {NS}><gml:exterior><gml:Ring><gml:curveMember><gml:Curve gml:id="k" srsName="urn:ogc:def:crs:EPSG::4326"><gml:segments><gml:CircleByCenterPoint numArc="1"><gml:pos>50 10</gml:pos><gml:radius uom="km">10</gml:radius></gml:CircleByCenterPoint></gml:segments></gml:Curve></gml:curveMember><gml:curveMember xlink:href="urn:uuid:no"/></gml:Ring></gml:exterior></r>"#
+    );
+    let doc = roxmltree::Document::parse(&doc).unwrap();
+    assert!(shapes.ring(doc.root_element().first_element_child().unwrap(), &mut notes).is_none());
+    assert_eq!((shapes.budget, shapes.scan_left), (1000, 1000));
 }
 
 #[test]
@@ -2191,4 +2206,36 @@ fn a_period_that_ends_before_it_begins_withholds_its_feature() {
     let perm = change("PERMDELTA", 1, &period("2026-04-01T00:00:00Z", Some("2026-02-01T00:00:00Z")), "<aixm:name>X</aixm:name>");
     let (got, notes) = names(&message(&(point("a", &[snapshot_at("2026-03-01T00:00:00Z", "SNAP"), perm]) + &kept)), "2026-01-15");
     assert!(got.len() == 2 && notes.iter().any(|m| m.contains("doesn't reflect changes")), "{notes:?}");
+}
+
+#[test]
+fn a_route_end_named_as_two_points_are_is_neither() {
+    let far = named_at("DesignatedPoint", "far", 50.0, 12.0);
+    let run = |points: &str, route: &str| {
+        let out = read("t.xml", &message(&(points.to_string() + &far + route)), &at("2026-01-15")).unwrap();
+        (layer(&out, "t RouteSegment").features[0].geometry.is_some(), said(&out))
+    };
+    let by_id = route_to("pointChoice_fixDesignatedPoint", "X");
+    let by_gid = by_id.replace("urn:uuid:X", "#p");
+    let two = |lat: f64| {
+        (named_at("DesignatedPoint", "X", 50.0, 10.0) + &named_at("DesignatedPoint", "urn:uuid:X", lat, 10.0))
+            .replace(r#"gml:id="f""#, r#"gml:id="p""#)
+    };
+    for route in [&by_id, &by_gid] {
+        let (drawn, notes) = run(&two(40.0), route);
+        assert!(!drawn && notes.iter().any(|m| m.contains("has a name others share")), "{notes:?}");
+        // In one place, they are as one.
+        assert!(run(&two(50.0), route).0);
+    }
+}
+
+#[test]
+fn a_lifetime_that_ends_before_it_begins_withholds_its_feature_and_says_so() {
+    let life = r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>2020-06-01T00:00:00Z</gml:beginPosition><gml:endPosition>2020-03-01T00:00:00Z</gml:endPosition></gml:TimePeriod></aixm:featureLifetime>"#;
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let body = named_point("A") + life;
+    let a = point("a", &[slice("DesignatedPoint", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+    let (got, notes) = names(&message(&(a + &kept)), "2026-01-15");
+    assert_eq!(got, [Value::Text("KEPT".into())]);
+    assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice") && m.contains("ends before it begins")), "{notes:?}");
 }

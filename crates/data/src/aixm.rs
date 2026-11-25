@@ -644,9 +644,11 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
                 bad = true;
                 None
             });
+            bad |= from.zip(until).is_some_and(|(f, u)| u < f);
             (from, until)
         });
-    // A period that ends before it begins is wrong in one of them: neither says when it applies.
+    // A period that ends before it begins has either date wrong, or the two swapped: neither says
+    // when it applies.
     if begin.zip(end).is_some_and(|(b, e)| e < b) {
         bad = true;
         begin = None;
@@ -771,7 +773,7 @@ struct Shapes {
     scan_left: usize,
     /// Where each point feature is (a navaid, a designated point), by its identifier: the ends of
     /// route segments that name them.
-    points: HashMap<String, Coord>,
+    points: HashMap<String, Option<Coord>>,
 }
 
 fn wrap180(d: f64) -> f64 {
@@ -1177,6 +1179,13 @@ impl Shapes {
             "Ring" => {
                 // Its members: curves written out, and borders given by reference, which are cut
                 // once the points either side of them are known.
+                // A border not in the file leaves the ring undrawn, before work is spent on it.
+                let missing =
+                    |m: &Node| elements(*m).next().is_none() && m.attribute((XLINK, "href")).and_then(|h| self.border_named(h)).is_none();
+                if elements(r).filter(|c| local(c) == "curveMember").any(|m| missing(&m)) {
+                    say_unfollowed(Unfollowed::Missing, notes);
+                    return None;
+                }
                 let mut members: Vec<std::result::Result<Vec<Coord>, usize>> = Vec::new();
                 for m in elements(r).filter(|c| local(c) == "curveMember") {
                     match elements(m).next() {
@@ -1184,12 +1193,7 @@ impl Shapes {
                         None => {
                             // The same border named again straight after is the same stretch of
                             // it (DFS writes a border's members so), followed once.
-                            // One not in the file leaves the ring undrawn, before work is spent
-                            // on the rest of it.
-                            let Some(key) = self.border_named(m.attribute((XLINK, "href"))?) else {
-                                say_unfollowed(Unfollowed::Missing, notes);
-                                return None;
-                            };
+                            let key = self.border_named(m.attribute((XLINK, "href"))?)?;
                             if !matches!(members.last(), Some(Err(k)) if *k == key) {
                                 members.push(Err(key));
                             }
@@ -1358,25 +1362,33 @@ impl Shapes {
     }
 
     /// Keeps a border under its names: its identifier as written, and without `urn:uuid:`, and its
-    /// `gml:id`s. A name two borders have is neither's.
+    /// `gml:id`s. A name two borders have is neither's, and one with no `line` (not in force, or that
+    /// can't be read) keeps its names from another's.
     fn add_border<'a>(&mut self, id: &str, gids: impl IntoIterator<Item = &'a str>, line: Vec<Coord>) {
         let n = self.borders.len();
         self.borders.push(line);
         let id = id.trim();
         let names = [format!("id:{id}"), format!("uuid:{}", id.strip_prefix("urn:uuid:").unwrap_or(id))];
         for name in names.into_iter().chain(gids.into_iter().map(|g| format!("#{}", g.trim()))) {
-            self.border_names.entry(name).and_modify(|k| *k = if *k == Some(n) { Some(n) } else { None }).or_insert(Some(n));
+            self.name_border(n, name);
         }
+    }
+
+    /// Gives border `n` one more name.
+    fn name_border(&mut self, n: usize, name: String) {
+        self.border_names.entry(name).and_modify(|k| *k = k.filter(|k| *k == n)).or_insert(Some(n));
     }
 
     /// The border a reference names: by a `gml:id` (`#id`), or by its identifier, as written first.
     fn border_named(&self, href: &str) -> Option<usize> {
         let h = href.trim();
-        if h.starts_with('#') {
-            return self.border_names.get(h).copied().flatten();
-        }
-        let by = |name: String| self.border_names.get(&name).copied().flatten();
-        by(format!("id:{h}")).or_else(|| by(format!("uuid:{}", h.strip_prefix("urn:uuid:").unwrap_or(h))))
+        let by = |name: &str| self.border_names.get(name).copied();
+        let named = if h.starts_with('#') {
+            by(h)
+        } else {
+            by(&format!("id:{h}")).or_else(|| by(&format!("uuid:{}", h.strip_prefix("urn:uuid:").unwrap_or(h))))
+        };
+        named.flatten().filter(|n| self.borders.get(*n).is_some_and(|l| !l.is_empty()))
     }
 
     /// Takes `n` steps of looking along borders from their allowance: false when it is spent.
@@ -2459,6 +2471,14 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
         }
     }
     order.sort_by_key(rank);
+    // Every GeoBorder's names first, in force or not: a reference names that one and no other.
+    let mut border_of: HashMap<String, usize> = HashMap::new();
+    for key in &order {
+        if let Some(f) = features.get(key).filter(|f| f.kind == "GeoBorder") {
+            border_of.insert(key.clone(), shapes.borders.len());
+            shapes.add_border(&f.id, f.gml_ids.iter().map(String::as_str), Vec::new());
+        }
+    }
     crate::progress::begin(index.members.len() + order.len());
     crate::progress::step(index.members.len())?;
     for key in &order {
@@ -2563,12 +2583,16 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
         let kind = feature.kind.as_str();
         // A GeoBorder's line, at the date, for the borders that follow it by reference: by its
         // identifier, its curve's id and its members'.
-        if kind == "GeoBorder"
+        if let Some(&n) = border_of.get(key)
             && let Some(g) = props.iter().filter(|p| local(p) == "border").find_map(|p| shape_in(*p))
             && let Some(Geometry::Line(parts)) = shapes.quietly(g)
         {
-            let gids = g.attribute((GML, "id")).into_iter().chain(feature.gml_ids.iter().map(String::as_str));
-            shapes.add_border(id, gids, parts.concat());
+            if let Some(gid) = g.attribute((GML, "id")) {
+                shapes.name_border(n, format!("#{}", gid.trim()));
+            }
+            if let Some(line) = shapes.borders.get_mut(n) {
+                *line = parts.concat();
+            }
         }
         // Where a point feature is, for route segments that name it: by its identifier and its
         // own gml:id (a local link's or an XPath's).
@@ -2576,13 +2600,13 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
             && let Some(Geometry::Point(c)) = shapes.quietly(g)
         {
             // By its own gml:id (a local link or an XPath), by its kind and identifier, and by
-            // its identifier alone for a link whose kind isn't known (the first so named).
-            for gid in &feature.gml_ids {
-                shapes.points.insert(format!("#{gid}"), c);
-            }
+            // its identifier alone for a link whose kind isn't known.
+            // A name of features in more than one place is none's.
             let uuid = id.trim_start_matches("urn:uuid:");
-            shapes.points.insert(format!("{kind}\u{1}{uuid}"), c);
-            shapes.points.entry(uuid.to_string()).or_insert(c);
+            let names = [format!("{kind}\u{1}{uuid}"), uuid.to_string()];
+            for name in feature.gml_ids.iter().map(|g| format!("#{g}")).chain(names) {
+                shapes.points.entry(name).and_modify(|p| *p = p.filter(|p| *p == c)).or_insert(Some(c));
+            }
         }
         let mut fnotes = ShapeNotes::default();
         let placed = match kind {
@@ -2686,11 +2710,11 @@ fn segment_end<'a, 'i>(props: &[Node<'a, 'i>], name: &str, shapes: &Shapes) -> O
 fn named_point(shapes: &Shapes, choice: Node, href: &str) -> Option<Coord> {
     let target = reference(href);
     if href.trim().starts_with('#') || href.contains("@gml:id") {
-        return shapes.points.get(&format!("#{target}")).copied();
+        return shapes.points.get(&format!("#{target}")).copied().flatten();
     }
     match point_kind(local(&choice)) {
-        Some(k) => shapes.points.get(&format!("{k}\u{1}{target}")).copied(),
-        None => shapes.points.get(&target).copied(),
+        Some(k) => shapes.points.get(&format!("{k}\u{1}{target}")).copied().flatten(),
+        None => shapes.points.get(&target).copied().flatten(),
     }
 }
 
@@ -3153,7 +3177,7 @@ fn finish(
         notes.unreadable_state,
         "feature",
         "features",
-        "left out: a time slice of it that may apply (the latest correction) has no validTime of the kind it needs (a period, an instant for a PERMDELTA, or for a SNAPSHOT an instant or a period with a start), or a validTime or featureLifetime that can't be read",
+        "left out: a time slice of it that may apply (the latest correction) has no validTime of the kind it needs (a period, an instant for a PERMDELTA, or for a SNAPSHOT an instant or a period with a start), or a validTime or featureLifetime that can't be read or ends before it begins",
     );
     say(
         &mut file,
@@ -3191,7 +3215,7 @@ fn finish(
         notes.bad_dates,
         "time slice",
         "time slices",
-        "with no validTime of the kind it needs (a period, an instant for a PERMDELTA, or for a SNAPSHOT an instant or a period with a start), or with a validTime or featureLifetime that can't be read (a feature it may apply to is left out, or shown as its SNAPSHOT)",
+        "with no validTime of the kind it needs (a period, an instant for a PERMDELTA, or for a SNAPSHOT an instant or a period with a start), or with a validTime or featureLifetime that can't be read or ends before it begins (a feature it may apply to is left out, or shown as its SNAPSHOT)",
     );
     say(
         &mut file,
@@ -3435,8 +3459,8 @@ fn finish(
         );
         say(
             layer.route_unlocated,
-            "route segment is kept without a line: a point its start or end names isn't in the file, or has no position on the date asked",
-            "route segments are kept without a line: a point their start or end names isn't in the file, or has no position on the date asked",
+            "route segment is kept without a line: a point its start or end names isn't in the file, has no position on the date asked, or has a name others share",
+            "route segments are kept without a line: a point their start or end names isn't in the file, has no position on the date asked, or has a name others share",
         );
         say(
             layer.route_no_ends,
