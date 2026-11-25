@@ -2144,7 +2144,9 @@ fn borders_of_alike_identifiers_are_told_apart_by_their_gml_ids() {
         (lats, said(&out))
     };
     // Each by its own gml:ids, and by its identifier as it is written.
-    for (name, lat) in [("#b1", 50), ("#c1", 50), ("urn:uuid:X", 50), ("#b2", 40), ("#c2", 40), ("X", 40)] {
+    for (name, lat) in
+        [("#b1", 50), ("#c1", 50), ("urn:uuid:X", 50), ("#//aixm:GeoBorder[@gml:id='b1']", 50), ("#b2", 40), ("#c2", 40), ("X", 40)]
+    {
         let (lats, _) = drawn(name, &members);
         let lats = lats.unwrap_or_else(|| panic!("{name} not drawn"));
         assert!(lats.contains(&lat) && !lats.contains(&(90 - lat)), "{name}: {lats:?}");
@@ -2233,9 +2235,16 @@ fn a_route_end_named_as_two_points_are_is_neither() {
     };
     assert_eq!(start(&two(40.0), &by_id), Some(Coord::new(10.0, 40.0)));
     assert_eq!(start(&two(40.0), &by_id.replace("urn:uuid:X", "X")), Some(Coord::new(10.0, 50.0)));
-    // Two with neither written so: neither.
-    let alike = named_at("DesignatedPoint", "X", 50.0, 10.0) + &named_at("DesignatedPoint", "urn:uuid:X", 40.0, 10.0);
-    assert_eq!(start(&alike.replace("urn:uuid:X", "urn:uuid:Y"), &by_id), Some(Coord::new(10.0, 50.0)));
+    // One written without its prefix is found with it.
+    assert_eq!(start(&named_at("DesignatedPoint", "X", 50.0, 10.0), &by_id), Some(Coord::new(10.0, 50.0)));
+    // A choice of no known kind naming an identifier two kinds share: neither.
+    let kinds = named_at("DesignatedPoint", "X", 50.0, 10.0) + &named_at("Navaid", "X", 40.0, 10.0);
+    let unknown = by_id.replace("pointChoice_fixDesignatedPoint xlink:href=\"urn:uuid:X", "pointChoice_other xlink:href=\"urn:uuid:X");
+    assert_eq!(start(&kinds, &unknown), None);
+    assert_eq!(start(&kinds, &by_id), Some(Coord::new(10.0, 50.0)));
+    // Any feature with a position, by its gml:id.
+    let vor = named_at("VOR", "V", 50.0, 10.0).replace(r#"gml:id="f""#, r#"gml:id="p""#);
+    assert_eq!(start(&vor, &by_gid), Some(Coord::new(10.0, 50.0)));
     // One not in force is no other of an alike identifier.
     let past =
         two(40.0).replace("2025-01-01T00:00:00Z", "2030-01-01T00:00:00Z").replacen("2030-01-01T00:00:00Z", "2025-01-01T00:00:00Z", 1);
@@ -2249,11 +2258,23 @@ fn a_route_end_named_as_two_points_are_is_neither() {
 
 #[test]
 fn a_ring_member_that_names_nothing_isnt_a_missing_border() {
-    let area = r#"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember/></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#;
-    let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), area)]);
-    let notes = said(&read("t.xml", &message(&f), &at("2026-01-15")).unwrap());
-    assert!(!notes.iter().any(|m| m.contains("border is given by reference")), "{notes:?}");
-    assert!(notes.iter().any(|m| m.contains("1 ring or surface patch was left out")), "{notes:?}");
+    for member in ["<gml:curveMember/>", r#"<gml:curveMember xlink:href=" "/>"#] {
+        let area = format!(
+            r#"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring>{member}</gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#
+        );
+        let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &area)]);
+        let notes = said(&read("t.xml", &message(&f), &at("2026-01-15")).unwrap());
+        assert!(!notes.iter().any(|m| m.contains("border is given by reference")), "{notes:?}");
+        assert!(notes.iter().any(|m| m.contains("1 ring or surface patch was left out")), "{notes:?}");
+        // And spends nothing.
+        let doc = format!(
+            r#"<r {NS}><gml:exterior><gml:Ring><gml:curveMember><gml:Curve gml:id="k" srsName="urn:ogc:def:crs:EPSG::4326"><gml:segments><gml:CircleByCenterPoint numArc="1"><gml:pos>50 10</gml:pos><gml:radius uom="km">10</gml:radius></gml:CircleByCenterPoint></gml:segments></gml:Curve></gml:curveMember>{member}</gml:Ring></gml:exterior></r>"#
+        );
+        let doc = roxmltree::Document::parse(&doc).unwrap();
+        let mut shapes = Shapes { budget: 1000, ..Shapes::default() };
+        assert!(shapes.ring(doc.root_element().first_element_child().unwrap(), &mut ShapeNotes::default()).is_none());
+        assert_eq!(shapes.budget, 1000);
+    }
 }
 
 #[test]

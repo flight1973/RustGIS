@@ -771,8 +771,7 @@ struct Shapes {
     border_names: HashMap<String, Option<usize>>,
     /// Steps of looking along borders still allowed ([`Shapes::scan`]).
     scan_left: usize,
-    /// Where each feature a route segment's end can name ([`POINT_KINDS`]) is at the date, if
-    /// anywhere.
+    /// Where each feature a route segment's end can name is at the date, if anywhere.
     points: Vec<Option<Coord>>,
     /// Which of them a name names (`None`, more than one).
     point_names: HashMap<String, Option<usize>>,
@@ -1181,7 +1180,12 @@ impl Shapes {
             "Ring" => {
                 // Its members: curves written out, and borders given by reference, which are cut
                 // once the points either side of them are known.
-                // A border not in the file leaves the ring undrawn, before work is spent on it.
+                // A member that gives nothing, or a border not in the file, leaves the ring undrawn
+                // before work is spent on it.
+                let named = |m: &Node| m.attribute((XLINK, "href")).is_some_and(|h| !h.trim().is_empty());
+                if elements(r).filter(|c| local(c) == "curveMember").any(|m| elements(m).next().is_none() && !named(&m)) {
+                    return None;
+                }
                 let missing = |m: &Node| {
                     elements(*m).next().is_none() && m.attribute((XLINK, "href")).is_some_and(|h| self.border_named(h).is_none())
                 };
@@ -1386,7 +1390,9 @@ impl Shapes {
     fn border_named(&self, href: &str) -> Option<usize> {
         let h = href.trim();
         let by = |name: &str| self.border_names.get(name).copied();
-        let named = if h.starts_with('#') {
+        let named = if h.contains("@gml:id") {
+            by(&format!("#{}", reference(h)))
+        } else if h.starts_with('#') {
             by(h)
         } else {
             by(&format!("id:{h}")).or_else(|| by(&format!("uuid:{}", h.strip_prefix("urn:uuid:").unwrap_or(h))))
@@ -1402,7 +1408,8 @@ impl Shapes {
         self.points.push(None);
         let id = f.id.trim();
         let bare = id.strip_prefix("urn:uuid:").unwrap_or(id);
-        let ids = [f.kind.as_str(), "*"].into_iter().flat_map(|k| [format!("{k}\u{1}id:{id}"), format!("{k}\u{1}uuid:{bare}")]);
+        let kinds = if POINT_KINDS.iter().any(|(_, k)| *k == f.kind) { vec![f.kind.as_str(), "*"] } else { Vec::new() };
+        let ids = kinds.into_iter().flat_map(|k| [format!("{k}\u{1}id:{id}"), format!("{k}\u{1}uuid:{bare}")]);
         for name in f.gml_ids.iter().map(|g| format!("#{g}")).chain(ids) {
             self.point_names.entry(name).and_modify(|k| *k = k.filter(|k| *k == n)).or_insert(Some(n));
         }
@@ -2497,11 +2504,13 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
             shapes.add_border(&f.id, f.gml_ids.iter().map(String::as_str), Vec::new());
         }
     }
-    // And those of the points route segments name, in a file that has any.
+    // And those of the points route segments name, in a file that has any: any feature by its
+    // gml:id, and one of a kind their ends can name by its identifier.
     let mut point_of: HashMap<String, usize> = HashMap::new();
     if features.values().any(|f| f.kind == "RouteSegment") {
         for key in &order {
-            if let Some(f) = features.get(key).filter(|f| POINT_KINDS.iter().any(|(_, k)| *k == f.kind)) {
+            crate::progress::check()?;
+            if let Some(f) = features.get(key).filter(|f| f.kind != "RouteSegment") {
                 point_of.insert(key.clone(), shapes.points.len());
                 shapes.add_point(f);
             }
