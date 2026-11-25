@@ -1543,8 +1543,12 @@ fn a_snapshot_is_shown_as_it_is_and_changes_since_are_said() {
     assert!(notes.iter().any(|m| m.contains("SNAPSHOT that doesn't reflect")), "{notes:?}");
     // Withdrawn since: not shown.
     let end = r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>2020-01-01T00:00:00Z</gml:beginPosition><gml:endPosition>2026-01-10T00:00:00Z</gml:endPosition></gml:TimePeriod></aixm:featureLifetime>"#;
-    let bytes = message(&point("s", &[snap, change("PERMDELTA", 1, &instant("2026-01-10T00:00:00Z"), end)]));
-    assert!(read("t.xml", &bytes, &at("2026-01-15")).is_err());
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let bytes = message(&(point("s", &[snap, change("PERMDELTA", 1, &instant("2026-01-10T00:00:00Z"), end)]) + &kept));
+    assert_eq!(names(&bytes, "2026-01-05").0.len(), 2);
+    let (got, notes) = names(&bytes, "2026-01-15");
+    assert_eq!(got, [Value::Text("KEPT".into())]);
+    assert!(notes.iter().any(|m| m.contains("featureLifetime") && !m.contains("can't be read")), "{notes:?}");
 }
 
 #[test]
@@ -1814,14 +1818,23 @@ fn slices_that_cant_be_read_are_judged_by_the_dates_they_have() {
     assert_eq!(run(&[base.clone(), change("PERMDELTA", 1, unplaced, "<aixm:name>OTHER</aixm:name>")]).0, [Value::Text("KEPT".into())]);
     // A baseline that began before the one that holds, its end unread; and one that began after.
     assert!(shown(&[baseline(1, 0, "2020-01-01T00:00:00Z", Some("bad"), "OLD"), base.clone()], "BASE"));
-    assert!(!shown(&[baseline(1, 0, "2025-06-01T00:00:00Z", Some("bad"), "NEW"), base.clone()], "BASE"));
+    assert_eq!(run(&[baseline(1, 0, "2025-06-01T00:00:00Z", Some("bad"), "NEW"), base.clone()]).0, [Value::Text("KEPT".into())]);
     // A snapshot that isn't the nearest, its lifetime unread; and one that is.
     let lifetime = r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>bad</gml:beginPosition><gml:endPosition/></gml:TimePeriod></aixm:featureLifetime>"#;
     let unread = |date: &str| snapshot_at(date, "UNREAD").replace("<aixm:interpretation>", &format!("{lifetime}<aixm:interpretation>"));
     let snap = snapshot_at("2026-01-01T00:00:00Z", "SNAP");
     assert!(shown(&[unread("2024-01-01T00:00:00Z"), snap.clone()], "SNAP"));
     assert!(shown(&[unread("2027-01-01T00:00:00Z"), snap.clone()], "SNAP"));
-    assert!(!shown(&[unread("2026-01-10T00:00:00Z"), snap], "SNAP"));
+    assert_eq!(run(&[unread("2026-01-10T00:00:00Z"), snap.clone()]).0, [Value::Text("KEPT".into())]);
+    // A snapshot with no instant can't be placed, so it isn't chosen over one that can.
+    for date in ["", "\" indeterminatePosition=\"unknown"] {
+        let dated = snapshot_at("2026-06-01T00:00:00Z", "LATER");
+        let undated = snapshot_at("X", "UNDATED").replace(
+            "<gml:timePosition>X</gml:timePosition>",
+            if date.is_empty() { "<gml:timePosition/>" } else { r#"<gml:timePosition indeterminatePosition="unknown"/>"# },
+        );
+        assert_eq!(run(&[undated, dated]).0, [Value::Text("KEPT".into())]);
+    }
     // A canceled change is canceled, whatever its lifetime says.
     let canceled = change("PERMDELTA", 1, r#"<gml:validTime nilReason="inapplicable"/>"#, lifetime);
     assert!(shown(&[base.clone(), canceled], "BASE"));
@@ -1842,6 +1855,25 @@ fn a_drawn_route_segment_says_the_other_shapes_of_its_records() {
         (plain.replace("<aixm:end>", &format!("<aixm:end>{area}")), 1),
     ] {
         let out = read("t.xml", &message(&(members.clone() + &route)), &at("2026-01-15")).unwrap();
+        assert!(layer(&out, "t RouteSegment").features[0].geometry.is_some());
+        assert_eq!(said(&out).iter().filter(|m| m.contains("1 shape")).count(), count, "{:?}", said(&out));
+    }
+}
+
+#[test]
+fn a_second_position_in_a_route_end_is_counted() {
+    let point = |id: &str, pos: &str| {
+        format!(
+            r#"<aixm:pointChoice_position><aixm:Point gml:id="{id}" srsName="urn:ogc:def:crs:EPSG::4326"><gml:pos>{pos}</gml:pos></aixm:Point></aixm:pointChoice_position>"#
+        )
+    };
+    let end = |name: &str, inner: &str| {
+        format!(r#"<aixm:{name}><aixm:EnRouteSegmentPoint gml:id="{name}">{inner}</aixm:EnRouteSegmentPoint></aixm:{name}>"#)
+    };
+    for (second, count) in [("", 0), (point("g3", "40 10").as_str(), 1)] {
+        let body = end("start", &format!("{}{second}", point("g1", "50 10"))) + &end("end", &point("g2", "50 12"));
+        let seg = feature("RouteSegment", "rs", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)]);
+        let out = read("t.xml", &message(&seg), &at("2026-01-15")).unwrap();
         assert!(layer(&out, "t RouteSegment").features[0].geometry.is_some());
         assert_eq!(said(&out).iter().filter(|m| m.contains("1 shape")).count(), count, "{:?}", said(&out));
     }

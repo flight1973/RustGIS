@@ -6227,6 +6227,8 @@ fn no_geolibre_state(p: &Value) -> Result<(), String> {
 
 /// Refuses what can't be a window of `url`, before anything is fetched.
 fn window_checks(p: &Value, url: &str, scan: bool) -> Result<(), String> {
+    // A window is of a GeoTIFF: an effective date, which is for an AIXM message, is refused.
+    check_at(p, "a window of a GeoTIFF", || false)?;
     no_geolibre_state(p)?;
     if scan || b(p, "whole") == Some(true) || rustgis_data::time::is_template(url) {
         return Err(format!(
@@ -6877,6 +6879,7 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     // with no axes to check against bounds.
     if let Some(i) = s.landed_reads.iter().position(|(d, _)| *d == id) {
         let (_, read) = s.landed_reads.remove(i);
+        check_at(p, "the service's answer", || false)?;
         let r = add_read(s, p, *read, b(p, "zoom"))?;
         return added_download(s, p, r, service || coverage, &url);
     }

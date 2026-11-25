@@ -23,7 +23,8 @@
 //! clockwise from true north, the arc running from the start angle to the end angle (clockwise when
 //! the start is the smaller); in a longitude-first one (CRS84), counter-clockwise from east.
 //!
-//! Every value a feature holds is kept on its rows. A property's simple value is a column, with its
+//! Every value a feature holds is kept on its rows, within limits on columns, nesting and memory (those
+//! past them are counted). A property's simple value is a column, with its
 //! unit (`_uom`), why it is missing (`_nilReason`) and its other attributes, and for a reference to
 //! another feature the identifier it names (`urn:uuid:` left off) and its title (`_title`). A
 //! value nested in records is a column named by its path (`authority_1_type`,
@@ -615,8 +616,9 @@ fn slice_of(s: Node, range: (usize, usize), scope: usize, trouble: &mut SliceTro
         });
     let (sequence, correction) = (number("sequenceNumber"), number("correctionNumber"));
     trouble.numbers += usize::from(unread_number.get());
-    // A PERMDELTA applies from its instant: one without can't be placed.
-    bad |= kind == Interpretation::PermDelta && begin.is_none();
+    // A PERMDELTA applies from its instant and a SNAPSHOT is a state at its: one without can't be
+    // placed (TS_002, TS_004).
+    bad |= matches!(kind, Interpretation::PermDelta | Interpretation::Snapshot) && begin.is_none();
     // A canceled slice is off the timeline, whatever else it holds.
     if bad && !canceled {
         trouble.dates += 1;
@@ -2644,11 +2646,20 @@ fn no_positions(g: Node) -> bool {
 }
 
 /// How many shapes of a route segment's record aren't drawn: those with positions, but for the
-/// points its line is `drawn` between.
-fn undrawn_shapes(p: Node, drawn: bool) -> usize {
-    let end = drawn && matches!(local(&p), "start" | "end");
-    let in_line = |g: &Node| end && g.parent_element().is_some_and(|c| local(&c) == "pointChoice_position");
-    nested_shapes(p).into_iter().filter(|g| !no_positions(*g) && !in_line(g)).count()
+/// ones its line is drawn between (`in_line`).
+fn undrawn_shapes(p: Node, in_line: &[roxmltree::NodeId]) -> usize {
+    nested_shapes(p).into_iter().filter(|g| !no_positions(*g) && !in_line.contains(&g.id())).count()
+}
+
+/// The shapes of a route segment's ends written in place: those [`between`] draws its line between.
+fn written_ends(props: &[Node], shapes: &Shapes) -> Vec<roxmltree::NodeId> {
+    ["start", "end"]
+        .iter()
+        .filter_map(|name| match segment_end(props, name, shapes)? {
+            End::Written(g) => Some(g.id()),
+            End::Named(_) => None,
+        })
+        .collect()
 }
 
 /// Whether a route segment's start or end links to a point that isn't in the file.
@@ -2732,7 +2743,7 @@ fn feature_rows(
         // shapes in them (not drawn) are counted.
         let mut in_records = 0;
         for p in &parts {
-            in_records += undrawn_shapes(*p, false);
+            in_records += undrawn_shapes(*p, &[]);
             row.property(*p, "");
         }
         let mut first = None;
@@ -2764,9 +2775,10 @@ fn feature_rows(
     if kind == "RouteSegment"
         && let Some((line, notes)) = between(props, shapes)
     {
+        let in_line = if line.is_some() { written_ends(props, shapes) } else { Vec::new() };
         let mut in_records = 0;
         for p in parts.iter().chain(&unlocated) {
-            in_records += undrawn_shapes(*p, line.is_some());
+            in_records += undrawn_shapes(*p, &in_line);
             row.property(*p, "");
         }
         let line = line.map(|l| vec![l]);
@@ -2788,7 +2800,7 @@ fn feature_rows(
                     let _ = shapes.shape(g, &mut ShapeNotes::default());
                 }
             }
-            in_records += undrawn_shapes(*p, false);
+            in_records += undrawn_shapes(*p, &[]);
             row.property(*p, "");
         }
         let notes = ShapeNotes { route_unlocated: missing, route_no_ends: !missing, ..ShapeNotes::default() };
@@ -3081,7 +3093,7 @@ fn finish(
         notes.unreadable_state,
         "feature",
         "features",
-        "left out: a time slice of it that may apply (the latest correction) has no validTime of the kind it needs (a period, or a PERMDELTA's instant), or a validTime or featureLifetime that can't be read",
+        "left out: a time slice of it that may apply (the latest correction) has no validTime of the kind it needs (a period, or an instant for a PERMDELTA or SNAPSHOT), or a validTime or featureLifetime that can't be read",
     );
     say(
         &mut file,
@@ -3118,7 +3130,7 @@ fn finish(
         notes.bad_dates,
         "time slice",
         "time slices",
-        "with no validTime of the kind it needs (a period, or a PERMDELTA's instant), or with a validTime or featureLifetime that can't be read (a feature it may apply to is left out, or shown as its SNAPSHOT)",
+        "with no validTime of the kind it needs (a period, or an instant for a PERMDELTA or SNAPSHOT), or with a validTime or featureLifetime that can't be read (a feature it may apply to is left out, or shown as its SNAPSHOT)",
     );
     say(
         &mut file,
