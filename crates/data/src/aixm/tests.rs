@@ -2095,13 +2095,19 @@ fn a_border_is_followed_by_the_gml_id_of_any_of_its_members() {
     };
     let members = border("b-old", 1, "2020-01-01T00:00:00Z", Some("2025-01-01T00:00:00Z"), 50.2)
         + &border("b-new", 2, "2025-01-01T00:00:00Z", None, 50.7);
-    for id in ["b-old", "b-new", "c-b-old", "c-b-new"] {
+    // Its line then is the one in force, whichever member is named; a past line's own name isn't it.
+    for (id, drawn) in [("b-old", true), ("b-new", true), ("c-b-new", true), ("c-b-old", false)] {
         let area = format!(
             r##"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember xlink:href="#{id}"/><gml:curveMember><gml:Curve gml:id="k"><gml:segments><gml:LineStringSegment><gml:posList>51 10 51 9 50 9</gml:posList></gml:LineStringSegment></gml:segments></gml:Curve></gml:curveMember></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"##
         );
         let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &area)]);
         let out = read("t.xml", &message(&(members.clone() + &f)), &at("2026-01-15")).unwrap();
         let g = layer(&out, "t WorkArea").features[0].geometry.as_ref();
+        assert_eq!(g.is_some(), drawn, "{id}");
+        if !drawn {
+            assert!(said(&out).iter().any(|m| m.contains("not in force then")), "{:?}", said(&out));
+            continue;
+        }
         let r = ring(g.unwrap_or_else(|| panic!("{id}: {:?}", said(&out))));
         let by = |lat: f64| r.iter().any(|c| (c.x - 10.0).abs() < 1e-9 && (c.y - lat).abs() < 1e-9);
         assert!(by(50.7) && !by(50.2), "{id}: {r:?}");
@@ -2176,7 +2182,7 @@ fn borders_of_alike_identifiers_are_told_apart_by_their_gml_ids() {
     // A UUID is the same in either case; another identifier isn't.
     let uuid = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
     let one = border(uuid, "u", "cu", 50.0) + &border("Abc", "a", "ca", 40.0);
-    for name in [uuid.to_string(), format!("urn:uuid:{}", uuid.to_uppercase())] {
+    for name in [uuid.to_string(), format!("urn:uuid:{}", uuid.to_uppercase()), format!("URN:UUID:{}", uuid.to_uppercase())] {
         assert!(drawn(&name, &one).0.is_some_and(|l| l.contains(&50)), "{name}");
     }
     assert_eq!(drawn("ABC", &one).0, None);
@@ -2274,6 +2280,21 @@ fn a_route_end_named_as_two_points_are_is_neither() {
     let uuid = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
     let upper = by_id.replace("urn:uuid:X", &format!("urn:uuid:{}", uuid.to_uppercase()));
     assert_eq!(start(&named_at("DesignatedPoint", uuid, 50.0, 10.0), &upper), Some(Coord::new(10.0, 50.0)));
+    // A border's curve of the same gml:id as a point is no point.
+    let curve = feature(
+        "GeoBorder",
+        "line",
+        &[slice(
+            "GeoBorder",
+            "BASELINE",
+            1,
+            0,
+            &period("2025-01-01T00:00:00Z", None),
+            r#"<aixm:border><aixm:Curve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="p"><gml:segments><gml:LineStringSegment><gml:posList>50 9 50 10</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></aixm:border>"#,
+        )],
+    );
+    let p = named_at("DesignatedPoint", "X", 50.0, 10.0).replace(r#"gml:id="f""#, r#"gml:id="p""#);
+    assert_eq!(start(&(curve + &p), &by_gid), Some(Coord::new(10.0, 50.0)));
     // One of another document is none of this one's; an XPath into this one is.
     let here = named_at("DesignatedPoint", "X", 50.0, 10.0).replace(r#"gml:id="f""#, r#"gml:id="p""#);
     let xpath = "#/m/aixm:DesignatedPoint[@gml:id='p']";
@@ -2323,4 +2344,23 @@ fn a_lifetime_that_ends_before_it_begins_withholds_its_feature_and_says_so() {
     let (got, notes) = names(&message(&(a + &kept)), "2026-01-15");
     assert_eq!(got, [Value::Text("KEPT".into())]);
     assert!(notes.iter().any(|m| m.contains("1 feature left out: a time slice") && m.contains("ends before it begins")), "{notes:?}");
+}
+
+#[test]
+fn a_feature_whose_members_write_its_uuid_differently_is_one() {
+    let uuid = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+    let base = point(uuid, &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "OLD")]);
+    for other in [uuid.to_uppercase(), format!("urn:uuid:{uuid}"), format!("URN:UUID:{}", uuid.to_uppercase())] {
+        let perm = point(&other, &[change("PERMDELTA", 1, &instant("2025-06-01T00:00:00Z"), "<aixm:name>NEW</aixm:name>")]);
+        assert_eq!(names(&message(&(base.clone() + &perm)), "2026-01-15").0, [Value::Text("NEW".into())], "{other}");
+        // And a route finds it.
+        let far = named_at("DesignatedPoint", "far", 50.0, 12.0);
+        let route = route_to("pointChoice_fixDesignatedPoint", uuid);
+        let out = read("t.xml", &message(&(base.clone() + &perm + &far + &route)), &at("2026-01-15")).unwrap();
+        assert!(layer(&out, "t RouteSegment").features[0].geometry.is_some(), "{other}");
+    }
+    // Identifiers that aren't UUIDs are as they are written.
+    let two = point("abc", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "A")])
+        + &point("ABC", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "B")]);
+    assert_eq!(names(&message(&two), "2026-01-15").0.len(), 2);
 }

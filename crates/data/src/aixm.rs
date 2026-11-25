@@ -399,9 +399,11 @@ struct Feature {
     /// Its identifier (`gml:identifier`, else its `gml:id`).
     id: String,
     kind: String,
-    /// Its own `gml:id`s, one for each member that gives it (and a GeoBorder's curves'): what a local
-    /// link (`#id`) or the FAA's XPath names it by.
+    /// Its own `gml:id`s, one for each member that gives it: what a local link (`#id`) or the FAA's
+    /// XPath names it by.
     gml_ids: HashSet<String>,
+    /// A GeoBorder's curves' `gml:id`s, at every date.
+    curve_ids: HashSet<String>,
     slices: Vec<Slice>,
 }
 
@@ -769,6 +771,8 @@ struct Shapes {
     /// Which border a name names (`None`, more than one): its identifier, its curve's `gml:id`, and
     /// its members'. A reference holds the number, which no identifier's length makes larger.
     border_names: HashMap<String, Option<usize>>,
+    /// The names that are curves': whether each is its border's line at the date.
+    border_curves: HashMap<String, bool>,
     /// Steps of looking along borders still allowed ([`Shapes::scan`]).
     scan_left: usize,
     /// Where each feature a route segment's end can name is at the date, if anywhere.
@@ -1368,7 +1372,7 @@ impl Shapes {
         Ok((part, far))
     }
 
-    /// Keeps a border under its names: its identifier as written, and without `urn:uuid:`, and its
+    /// Keeps a border under its names: its identifier as written, and bare ([`bare_id`]), and its
     /// `gml:id`s. A name two borders have is neither's, and one with no `line` (not in force, or that
     /// can't be read) keeps its names from another's.
     fn add_border<'a>(&mut self, id: &str, gids: impl IntoIterator<Item = &'a str>, line: Vec<Coord>) {
@@ -1381,15 +1385,29 @@ impl Shapes {
         }
     }
 
+    /// Keeps the names of the curves of the border last added, at every date, from other borders:
+    /// one is followed by its curve's name only at the date that curve is its line.
+    fn reserve_curves<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>) {
+        let Some(n) = self.borders.len().checked_sub(1) else { return };
+        for id in ids {
+            let name = format!("#{}", id.trim());
+            // A curve and its feature of one name are one border either way.
+            let known = self.border_names.entry(name.clone()).and_modify(|k| *k = k.filter(|k| *k == n));
+            if let std::collections::hash_map::Entry::Vacant(e) = known {
+                e.insert(Some(n));
+                self.border_curves.insert(name, false);
+            }
+        }
+    }
+
     /// The border a reference names: by a `gml:id` (`#id`), or by its identifier, as written first.
     fn border_named(&self, href: &str) -> Option<usize> {
         let h = href.trim();
         let by = |name: &str| self.border_names.get(name).copied();
         // A link into another document (`file.xml#…`) names nothing of this one.
-        let named = if h.starts_with('#') && h.contains("@gml:id") {
-            by(&format!("#{}", reference(h)))
-        } else if h.starts_with('#') {
-            by(h)
+        let named = if h.starts_with('#') {
+            let name = if h.contains("@gml:id") { format!("#{}", reference(h)) } else { h.to_string() };
+            by(&name).filter(|_| self.border_curves.get(&name).copied().unwrap_or(true))
         } else {
             by(&format!("id:{h}")).or_else(|| by(&format!("uuid:{}", bare_id(h))))
         };
@@ -1397,7 +1415,7 @@ impl Shapes {
     }
 
     /// Keeps a point feature under its names, its place not known yet: its `gml:id`s, and its
-    /// identifier as written and without `urn:uuid:`, of its kind and of any. A name two have is
+    /// identifier as written and bare ([`bare_id`]), of its kind and of any. A name two have is
     /// neither's.
     fn add_point(&mut self, f: &Feature) {
         let n = self.points.len();
@@ -2445,17 +2463,24 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
                 };
                 slices.extend(slice_of(sl, range, scope, &mut trouble));
             }
-            // A feature is its kind and identifier: two kinds sharing one aren't put together.
-            let key = format!("{}\u{1}{id}", local(&f));
+            // A feature is its kind and identifier (a UUID however it is written): two kinds sharing
+            // one aren't put together.
+            let bare = bare_id(&id);
+            let key = format!("{}\u{1}{}", local(&f), if is_uuid(&bare) { &*bare } else { id.as_str() });
             let entry = features.entry(key.clone()).or_insert_with(|| {
                 order.push(key.clone());
-                Feature { id: id.clone(), kind: local(&f).to_string(), gml_ids: HashSet::new(), slices: Vec::new() }
+                Feature {
+                    id: id.clone(),
+                    kind: local(&f).to_string(),
+                    gml_ids: HashSet::new(),
+                    curve_ids: HashSet::new(),
+                    slices: Vec::new(),
+                }
             });
             entry.gml_ids.extend(f.attribute((GML, "id")).map(|g| g.trim().to_string()));
-            // A GeoBorder is named by its curve's too, at any date.
             if local(&f) == "GeoBorder" {
                 let curves = slices_of(f).into_iter().flat_map(elements).filter(|p| local(p) == "border").filter_map(shape_in);
-                entry.gml_ids.extend(curves.filter_map(|g| g.attribute((GML, "id"))).map(|g| g.trim().to_string()));
+                entry.curve_ids.extend(curves.filter_map(|g| g.attribute((GML, "id"))).map(|g| g.trim().to_string()));
             }
             entry.slices.extend(slices);
         }
@@ -2503,6 +2528,7 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
         if let Some(f) = features.get(key).filter(|f| f.kind == "GeoBorder") {
             border_of.insert(key.clone(), shapes.borders.len());
             shapes.add_border(&f.id, f.gml_ids.iter().map(String::as_str), Vec::new());
+            shapes.reserve_curves(f.curve_ids.iter().map(String::as_str));
         }
     }
     // And those of the points route segments name, in a file that has any: any feature by its
@@ -2619,14 +2645,16 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
             None => row.null("validTo"),
         }
         let kind = feature.kind.as_str();
-        // A GeoBorder's line, at the date, for the borders that follow it by reference: by its
-        // identifier, its curve's id and its members'.
+        // A GeoBorder's line, at the date, for the borders that follow it by reference.
         if let Some(&n) = border_of.get(key)
             && let Some(g) = props.iter().filter(|p| local(p) == "border").find_map(|p| shape_in(*p))
             && let Some(Geometry::Line(parts)) = shapes.quietly(g)
             && let Some(line) = shapes.borders.get_mut(n)
         {
             *line = parts.concat();
+            if let Some(drawn) = g.attribute((GML, "id")).and_then(|c| shapes.border_curves.get_mut(&format!("#{}", c.trim()))) {
+                *drawn = true;
+            }
         }
         // Where a point feature is, for route segments that name it.
         if let Some(&n) = point_of.get(key)
@@ -2733,13 +2761,19 @@ fn segment_end<'a, 'i>(props: &[Node<'a, 'i>], name: &str, shapes: &Shapes) -> O
     }
 }
 
-/// An identifier without `urn:uuid:`, and a UUID in lower case (its hexadecimal digits are the same
-/// in either, RFC 4122 section 3).
+/// An identifier without `urn:uuid:` (in either case, RFC 8141 section 3.1), and a UUID in lower case
+/// (its hexadecimal digits are the same in either, RFC 4122 section 3).
 fn bare_id(id: &str) -> std::borrow::Cow<'_, str> {
-    let id = id.strip_prefix("urn:uuid:").unwrap_or(id);
-    let uuid = id.len() == 36
-        && id.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() });
-    if uuid { id.to_ascii_lowercase().into() } else { id.into() }
+    let id = id.trim();
+    let id = match id.split_at_checked("urn:uuid:".len()) {
+        Some((urn, rest)) if urn.eq_ignore_ascii_case("urn:uuid:") => rest,
+        _ => id,
+    };
+    if is_uuid(id) { id.to_ascii_lowercase().into() } else { id.into() }
+}
+
+fn is_uuid(id: &str) -> bool {
+    id.len() == 36 && id.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() })
 }
 
 /// Where the point a route end's choice links to is: by its gml:id for a local link; else of the
