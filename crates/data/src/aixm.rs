@@ -469,8 +469,8 @@ fn state_at(slices: &[Slice], t: f64) -> State {
             // earliest after it.
             let snap = of(Interpretation::Snapshot)
                 .filter(|s| s.begin.is_none_or(|b| b <= t))
-                .max_by(|a, b| started(a).total_cmp(&started(b)))
-                .or_else(|| of(Interpretation::Snapshot).min_by(|a, b| started(a).total_cmp(&started(b))));
+                .max_by(|a, b| started(a).total_cmp(&started(b)).then(a.range.0.cmp(&b.range.0)))
+                .or_else(|| of(Interpretation::Snapshot).min_by(|a, b| started(a).total_cmp(&started(b)).then(b.range.0.cmp(&a.range.0))));
             // One that can't be read may be the one shown: nearer before the date, or (with none
             // before it) earlier after.
             let nearer = |u: &Slice| match (u.begin, snap) {
@@ -511,7 +511,8 @@ fn state_at(slices: &[Slice], t: f64) -> State {
         // defined over a baseline: it is shown as it is, and changes it can't hold are said.
         // A temporary change in force at its instant or on the date, not both, isn't reflected.
         let differs = |s: &Slice| in_force(s.begin, s.end, t) != base.begin.is_some_and(|bb| in_force(s.begin, s.end, bb));
-        // A snapshot after the date holds the PERMDELTAs up to its instant.
+        // A snapshot after the date holds the PERMDELTAs up to its instant, its creation maybe among
+        // them: that isn't worked back (the concept has no rule for it), and is said.
         let ahead = |s: &Slice| s.begin.is_none_or(|b| t < b && base.begin.is_some_and(|bb| b <= bb));
         let perm_ahead = of(Interpretation::PermDelta).chain(unread_of(Interpretation::PermDelta)).any(ahead);
         // One that can't be read may be either, unless the dates it has rule it out on both.
@@ -3415,8 +3416,8 @@ fn finish(
         );
         say(
             layer.snapshots,
-            "feature is a SNAPSHOT: its state at its own instant, which may not be its state on the date asked",
-            "features are SNAPSHOTs: their state at their own instant, which may not be their state on the date asked",
+            "feature is a SNAPSHOT: its state at its own instant, which may not be its state on the date asked (it may not have existed then)",
+            "features are SNAPSHOTs: their state at their own instant, which may not be their state on the date asked (they may not have existed then)",
         );
         say(
             layer.over_bytes,

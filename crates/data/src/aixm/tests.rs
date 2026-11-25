@@ -1907,6 +1907,22 @@ fn a_snapshot_after_the_date_is_judged_by_its_own_lifetime() {
     };
     let run = |s: String| names(&message(&(point("s", &[s]) + &kept)), "2025-12-01");
     assert_eq!(run(life("2025-12-10T00:00:00Z")).0, [Value::Text("KEPT".into())]);
+    // Two at one instant: the later in the file, on either date.
+    let two = message(&point("s", &[snap.clone(), snapshot_at("2026-01-01T00:00:00Z", "SECOND")]));
+    for date in ["2025-12-01", "2026-01-15"] {
+        assert_eq!(names(&two, date).0, [Value::Text("SECOND".into())]);
+    }
+    // A creation given by a change before it, read or not, isn't worked back: said.
+    for from in ["2025-12-10T00:00:00Z", "bad"] {
+        let created = format!(
+            r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>{from}</gml:beginPosition><gml:endPosition indeterminatePosition="unknown"/></gml:TimePeriod></aixm:featureLifetime>"#
+        );
+        let perm = change("PERMDELTA", 1, &instant("2025-12-10T00:00:00Z"), &created);
+        let (got, notes) = names(&message(&(point("s", &[snap.clone(), perm]) + &kept)), "2025-12-01");
+        assert_eq!(got.len(), 2);
+        assert!(notes.iter().any(|m| m.contains("may not have existed then")), "{notes:?}");
+        assert!(notes.iter().any(|m| m.contains("SNAPSHOT that doesn't reflect changes")), "{notes:?}");
+    }
     for s in [life("2020-01-01T00:00:00Z"), snap.clone()] {
         let (got, notes) = run(s);
         assert_eq!(got.len(), 2);
