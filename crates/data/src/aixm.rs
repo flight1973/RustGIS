@@ -18,8 +18,8 @@
 //! Geometry is the GML 3.2 the AIXM profile allows (OGC 12-028r1): points, curves of
 //! `GeodesicString`, `Geodesic`, `LineStringSegment`, `Arc`, `ArcString`, `Circle`,
 //! `ArcByCenterPoint` and `CircleByCenterPoint` segments, and surfaces of polygon patches. Arcs are
-//! drawn as points along them on the WGS 84 ellipsoid, within a meter of the curve (coarser, and
-//! said, once the points the file's size allows run out); a geodesic edge
+//! drawn as points along them on the WGS 84 ellipsoid, to within a meter of the curve (coarser, and
+//! said, past 3,600 points on one or the points the file's size allows); a geodesic edge
 //! longer than 10 km is drawn as points along the geodesic. `ArcByCenterPoint` angles follow the
 //! AIXM coding guidance: in a latitude-first system (`urn:ogc:def:crs:EPSG::4326`) bearings
 //! clockwise from true north, the arc running from the start angle to the end angle (clockwise when
@@ -399,8 +399,8 @@ struct Feature {
     /// Its identifier (`gml:identifier`, else its `gml:id`).
     id: String,
     kind: String,
-    /// Its own `gml:id`s, one for each member that gives it: what a local link (`#id`) or the FAA's
-    /// XPath names it by.
+    /// Its own `gml:id`s, one for each member that gives it (and a GeoBorder's curves'): what a local
+    /// link (`#id`) or the FAA's XPath names it by.
     gml_ids: HashSet<String>,
     slices: Vec<Slice>,
 }
@@ -1375,15 +1375,10 @@ impl Shapes {
         let n = self.borders.len();
         self.borders.push(line);
         let id = id.trim();
-        let names = [format!("id:{id}"), format!("uuid:{}", id.strip_prefix("urn:uuid:").unwrap_or(id))];
+        let names = [format!("id:{id}"), format!("uuid:{}", bare_id(id))];
         for name in names.into_iter().chain(gids.into_iter().map(|g| format!("#{}", g.trim()))) {
-            self.name_border(n, name);
+            self.border_names.entry(name).and_modify(|k| *k = k.filter(|k| *k == n)).or_insert(Some(n));
         }
-    }
-
-    /// Gives border `n` one more name.
-    fn name_border(&mut self, n: usize, name: String) {
-        self.border_names.entry(name).and_modify(|k| *k = k.filter(|k| *k == n)).or_insert(Some(n));
     }
 
     /// The border a reference names: by a `gml:id` (`#id`), or by its identifier, as written first.
@@ -1396,7 +1391,7 @@ impl Shapes {
         } else if h.starts_with('#') {
             by(h)
         } else {
-            by(&format!("id:{h}")).or_else(|| by(&format!("uuid:{}", h.strip_prefix("urn:uuid:").unwrap_or(h))))
+            by(&format!("id:{h}")).or_else(|| by(&format!("uuid:{}", bare_id(h))))
         };
         named.flatten().filter(|n| self.borders.get(*n).is_some_and(|l| !l.is_empty()))
     }
@@ -1408,7 +1403,7 @@ impl Shapes {
         let n = self.points.len();
         self.points.push(None);
         let id = f.id.trim();
-        let bare = id.strip_prefix("urn:uuid:").unwrap_or(id);
+        let bare = bare_id(id);
         let kinds = if POINT_KINDS.iter().any(|(_, k)| *k == f.kind) { vec![f.kind.as_str(), "*"] } else { Vec::new() };
         let ids = kinds.into_iter().flat_map(|k| [format!("{k}\u{1}id:{id}"), format!("{k}\u{1}uuid:{bare}")]);
         for name in f.gml_ids.iter().map(|g| format!("#{g}")).chain(ids) {
@@ -2457,6 +2452,11 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
                 Feature { id: id.clone(), kind: local(&f).to_string(), gml_ids: HashSet::new(), slices: Vec::new() }
             });
             entry.gml_ids.extend(f.attribute((GML, "id")).map(|g| g.trim().to_string()));
+            // A GeoBorder is named by its curve's too, at any date.
+            if local(&f) == "GeoBorder" {
+                let curves = slices_of(f).into_iter().flat_map(elements).filter(|p| local(p) == "border").filter_map(shape_in);
+                entry.gml_ids.extend(curves.filter_map(|g| g.attribute((GML, "id"))).map(|g| g.trim().to_string()));
+            }
             entry.slices.extend(slices);
         }
     }
@@ -2497,7 +2497,7 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
     }
     order.sort_by_key(rank);
     // Every GeoBorder's identifiers and gml:ids first, in force or not: a reference to one names it
-    // and no other (its curve's gml:id is known once it is read).
+    // and no other.
     let mut border_of: HashMap<String, usize> = HashMap::new();
     for key in &order {
         if let Some(f) = features.get(key).filter(|f| f.kind == "GeoBorder") {
@@ -2624,13 +2624,9 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
         if let Some(&n) = border_of.get(key)
             && let Some(g) = props.iter().filter(|p| local(p) == "border").find_map(|p| shape_in(*p))
             && let Some(Geometry::Line(parts)) = shapes.quietly(g)
+            && let Some(line) = shapes.borders.get_mut(n)
         {
-            if let Some(gid) = g.attribute((GML, "id")) {
-                shapes.name_border(n, format!("#{}", gid.trim()));
-            }
-            if let Some(line) = shapes.borders.get_mut(n) {
-                *line = parts.concat();
-            }
+            *line = parts.concat();
         }
         // Where a point feature is, for route segments that name it.
         if let Some(&n) = point_of.get(key)
@@ -2737,6 +2733,15 @@ fn segment_end<'a, 'i>(props: &[Node<'a, 'i>], name: &str, shapes: &Shapes) -> O
     }
 }
 
+/// An identifier without `urn:uuid:`, and a UUID in lower case (its hexadecimal digits are the same
+/// in either, RFC 4122 section 3).
+fn bare_id(id: &str) -> std::borrow::Cow<'_, str> {
+    let id = id.strip_prefix("urn:uuid:").unwrap_or(id);
+    let uuid = id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() });
+    if uuid { id.to_ascii_lowercase().into() } else { id.into() }
+}
+
 /// Where the point a route end's choice links to is: by its gml:id for a local link; else of the
 /// kind the choice names, or (a choice of no known kind) any point of that identifier.
 fn named_point(shapes: &Shapes, choice: Node, href: &str) -> Option<Coord> {
@@ -2747,7 +2752,7 @@ fn named_point(shapes: &Shapes, choice: Node, href: &str) -> Option<Coord> {
         by(format!("#{}", reference(h)))
     } else {
         let k = point_kind(local(&choice)).unwrap_or("*");
-        by(format!("{k}\u{1}id:{h}")).or_else(|| by(format!("{k}\u{1}uuid:{}", h.strip_prefix("urn:uuid:").unwrap_or(h))))
+        by(format!("{k}\u{1}id:{h}")).or_else(|| by(format!("{k}\u{1}uuid:{}", bare_id(h))))
     };
     named.flatten().and_then(|n| shapes.points.get(n).copied().flatten())
 }

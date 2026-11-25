@@ -2010,6 +2010,14 @@ fn a_change_given_a_period_is_withheld_and_a_snapshot_is_read_at_its_start_and_s
         let (got, notes) = run(&[slice("DesignatedPoint", "SNAPSHOT", 1, 0, &valid, &named_point("SNAP"))], "2026-01-15");
         assert!(got.len() == 2 && said(&notes) && !notes.iter().any(|m| m.contains("read as open")), "{got:?} {notes:?}");
     }
+    // Its instant is its start, as one given that instant.
+    let from = |s: String| {
+        let out = read("t.xml", &message(&point("a", &[s])), &at("2026-01-15")).unwrap();
+        value(layer(&out, "t DesignatedPoint"), 0, "validFrom")
+    };
+    let given = from(snapshot_at("2026-01-01T00:00:00Z", "SNAP"));
+    assert_ne!(given, Value::Null);
+    assert_eq!(from(slice("DesignatedPoint", "SNAPSHOT", 1, 0, &valid, &named_point("SNAP"))), given);
     let (got, notes) = run(&[slice("DesignatedPoint", "SNAPSHOT", 1, 0, &valid, &named_point("SNAP"))], "2026-01-15");
     assert!(got.len() == 2 && said(&notes), "{got:?} {notes:?}");
     assert!(!said(&run(&[snapshot_at("2026-01-01T00:00:00Z", "SNAP")], "2026-01-15").1));
@@ -2077,20 +2085,26 @@ fn rows_past_the_tables_memory_are_left_out_and_said() {
 
 #[test]
 fn a_border_is_followed_by_the_gml_id_of_any_of_its_members() {
-    let border = |gid: &str, seq: u32, from: &str, to: Option<&str>| {
-        let b = r#"<aixm:border><aixm:Curve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="c"><gml:segments><gml:LineStringSegment><gml:posList>50 9 50 10 51 10</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></aixm:border>"#;
-        feature("GeoBorder", "line", &[slice("GeoBorder", "BASELINE", seq, 0, &period(from, to), b)])
+    // The past line goes by 50.2, the one in force by 50.7.
+    let border = |gid: &str, seq: u32, from: &str, to: Option<&str>, mid: f64| {
+        let b = format!(
+            r#"<aixm:border><aixm:Curve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="c-{gid}"><gml:segments><gml:LineStringSegment><gml:posList>50 9 {mid} 10 51 10</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></aixm:border>"#
+        );
+        feature("GeoBorder", "line", &[slice("GeoBorder", "BASELINE", seq, 0, &period(from, to), &b)])
             .replace(r#"gml:id="f""#, &format!(r#"gml:id="{gid}""#))
     };
-    let members =
-        border("b-old", 1, "2020-01-01T00:00:00Z", Some("2025-01-01T00:00:00Z")) + &border("b-new", 2, "2025-01-01T00:00:00Z", None);
-    for id in ["b-old", "b-new"] {
+    let members = border("b-old", 1, "2020-01-01T00:00:00Z", Some("2025-01-01T00:00:00Z"), 50.2)
+        + &border("b-new", 2, "2025-01-01T00:00:00Z", None, 50.7);
+    for id in ["b-old", "b-new", "c-b-old", "c-b-new"] {
         let area = format!(
             r##"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember xlink:href="#{id}"/><gml:curveMember><gml:Curve gml:id="k"><gml:segments><gml:LineStringSegment><gml:posList>51 10 51 9 50 9</gml:posList></gml:LineStringSegment></gml:segments></gml:Curve></gml:curveMember></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"##
         );
         let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &area)]);
         let out = read("t.xml", &message(&(members.clone() + &f)), &at("2026-01-15")).unwrap();
-        assert!(layer(&out, "t WorkArea").features[0].geometry.is_some(), "{id}: {:?}", said(&out));
+        let g = layer(&out, "t WorkArea").features[0].geometry.as_ref();
+        let r = ring(g.unwrap_or_else(|| panic!("{id}: {:?}", said(&out))));
+        let by = |lat: f64| r.iter().any(|c| (c.x - 10.0).abs() < 1e-9 && (c.y - lat).abs() < 1e-9);
+        assert!(by(50.7) && !by(50.2), "{id}: {r:?}");
     }
 }
 
@@ -2156,6 +2170,16 @@ fn borders_of_alike_identifiers_are_told_apart_by_their_gml_ids() {
     let (lats, notes) = drawn("#c1", &shared);
     assert_eq!(lats, None);
     assert!(notes.iter().any(|m| m.contains("has a name others share")), "{notes:?}");
+    // Nor when one of the two isn't in force.
+    let later = shared.replacen("2025-01-01T00:00:00Z", "2030-01-01T00:00:00Z", 1);
+    assert_eq!(drawn("#c1", &later).0, None);
+    // A UUID is the same in either case; another identifier isn't.
+    let uuid = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+    let one = border(uuid, "u", "cu", 50.0) + &border("Abc", "a", "ca", 40.0);
+    for name in [uuid.to_string(), format!("urn:uuid:{}", uuid.to_uppercase())] {
+        assert!(drawn(&name, &one).0.is_some_and(|l| l.contains(&50)), "{name}");
+    }
+    assert_eq!(drawn("ABC", &one).0, None);
     // One not in force is no other: not drawn along the one whose identifier is alike.
     let past = members.replacen("2025-01-01T00:00:00Z", "2030-01-01T00:00:00Z", 1);
     for name in ["urn:uuid:X", "#b1"] {
@@ -2246,6 +2270,10 @@ fn a_route_end_named_as_two_points_are_is_neither() {
     let unknown = by_id.replace("pointChoice_fixDesignatedPoint xlink:href=\"urn:uuid:X", "pointChoice_other xlink:href=\"urn:uuid:X");
     assert_eq!(start(&kinds, &unknown), None);
     assert_eq!(start(&kinds, &by_id), Some(Coord::new(10.0, 50.0)));
+    // A UUID is the same in either case.
+    let uuid = "f81d4fae-7dec-11d0-a765-00a0c91e6bf6";
+    let upper = by_id.replace("urn:uuid:X", &format!("urn:uuid:{}", uuid.to_uppercase()));
+    assert_eq!(start(&named_at("DesignatedPoint", uuid, 50.0, 10.0), &upper), Some(Coord::new(10.0, 50.0)));
     // One of another document is none of this one's; an XPath into this one is.
     let here = named_at("DesignatedPoint", "X", 50.0, 10.0).replace(r#"gml:id="f""#, r#"gml:id="p""#);
     let xpath = "#/m/aixm:DesignatedPoint[@gml:id='p']";
