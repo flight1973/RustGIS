@@ -431,6 +431,8 @@ fn in_force(begin: Option<f64>, end: Option<f64>, t: f64) -> bool {
 fn may_be_made(s: &Slice, from: f64, to: f64) -> bool {
     let (first, last) = match (s.begin, s.end) {
         (Some(b), None) => (b, b),
+        // One that ends before it begins is wrong in one of them: its end isn't known.
+        (Some(b), Some(e)) if e < b => (b, f64::INFINITY),
         (b, e) => (b.unwrap_or(f64::NEG_INFINITY), e.unwrap_or(f64::INFINITY)),
     };
     from < to && first <= to && last > from
@@ -504,7 +506,8 @@ fn state_at(slices: &[Slice], t: f64) -> State {
     };
     // PERMDELTAs since the state began, up to the date, in order.
     let since = |s: &Slice| s.begin.is_none_or(|b| b <= t && base.begin.is_none_or(|bb| b > bb));
-    // One that can't be read may be a withdrawal: its feature is left out, a SNAPSHOT's too.
+    // One that can't be read and may be made between the state and the date may be a withdrawal: its
+    // feature is left out, a SNAPSHOT's too (one later than the date is shown, and the change said).
     if unread_of(Interpretation::PermDelta).any(|s| may_be_made(s, started(base), t)) {
         return State::Unreadable;
     }
@@ -755,10 +758,11 @@ struct Shapes {
     as_wgs84: Option<String>,
     as_wgs84_count: usize,
     as_wgs84_now: bool,
-    /// The borders references may follow, by [`border_key`]: each GeoBorder's at the date, held once.
-    borders: HashMap<String, Vec<Coord>>,
-    /// The key of the border a `gml:id` (its curve's, or any of its members') names.
-    border_names: HashMap<String, String>,
+    /// The borders references may follow: each GeoBorder's at the date, held once.
+    borders: Vec<Vec<Coord>>,
+    /// Which border a name names ([`border_key`]): its identifier, its curve's `gml:id`, and its
+    /// members'. A reference holds the number, which no identifier's length makes larger.
+    border_names: HashMap<String, usize>,
     /// Steps of looking along borders still allowed ([`Shapes::scan`]).
     scan_left: usize,
     /// Where each point feature is (a navaid, a designated point), by its identifier: the ends of
@@ -1169,7 +1173,7 @@ impl Shapes {
             "Ring" => {
                 // Its members: curves written out, and borders given by reference, which are cut
                 // once the points either side of them are known.
-                let mut members: Vec<std::result::Result<Vec<Coord>, String>> = Vec::new();
+                let mut members: Vec<std::result::Result<Vec<Coord>, usize>> = Vec::new();
                 for m in elements(r).filter(|c| local(c) == "curveMember") {
                     match elements(m).next() {
                         Some(c) => members.push(Ok(self.curve(c, notes)?)),
@@ -1177,7 +1181,7 @@ impl Shapes {
                             // The same border named again straight after is the same stretch of
                             // it (DFS writes a border's members so), followed once.
                             let key = border_key(m.attribute((XLINK, "href"))?);
-                            let key = self.border_names.get(&key).cloned().unwrap_or(key);
+                            let key = self.border_names.get(&key).copied().unwrap_or(NO_BORDER);
                             if !matches!(members.last(), Some(Err(k)) if *k == key) {
                                 members.push(Err(key));
                             }
@@ -1191,11 +1195,11 @@ impl Shapes {
                 let n = members.len();
                 // Each member's nearest written points before and after it, round the ring: two
                 // passes, however many members are references.
-                let end_of = |m: Option<&std::result::Result<Vec<Coord>, String>>| match m {
+                let end_of = |m: Option<&std::result::Result<Vec<Coord>, usize>>| match m {
                     Some(Ok(c)) => c.last().copied(),
                     _ => None,
                 };
-                let start_of = |m: Option<&std::result::Result<Vec<Coord>, String>>| match m {
+                let start_of = |m: Option<&std::result::Result<Vec<Coord>, usize>>| match m {
                     Some(Ok(c)) => c.first().copied(),
                     _ => None,
                 };
@@ -1218,12 +1222,12 @@ impl Shapes {
                 for i in 0..n {
                     let mut part = match members.get(i) {
                         Some(Ok(c)) => c.clone(),
-                        Some(Err(key)) => {
+                        Some(&Err(key)) => {
                             // Next to another border (a state's outline is a chain of them), the
                             // stretch starts or ends where the two meet: this border's end nearest
                             // that one. Next to written points, at the nearest of those.
                             let neighbor = |k: usize| match members.get(k % n) {
-                                Some(Err(other)) if other != key && n > 1 => Some(other.clone()),
+                                Some(&Err(other)) if other != key && n > 1 => Some(other),
                                 _ => None,
                             };
                             let (prev, next) = (neighbor(i + n - 1), neighbor(i + 1));
@@ -1236,8 +1240,8 @@ impl Shapes {
                                 // counted once, from the first of them.
                                 // One that can't be worked out (past the work allowed, or a
                                 // border not there to meet) leaves the ring undrawn, and why is said.
-                                let mut meet = |s: &mut Self, other: Option<String>, count_gap: bool| match other {
-                                    Some(other) => s.junction(key, &other).map(|(c, gap)| {
+                                let mut meet = |s: &mut Self, other: Option<usize>, count_gap: bool| match other {
+                                    Some(other) => s.junction(key, other).map(|(c, gap)| {
                                         far += usize::from(gap && count_gap);
                                         Some(c)
                                     }),
@@ -1307,14 +1311,14 @@ impl Shapes {
         Some(pts)
     }
 
-    /// The part of a border given by reference (`key`, [`border_key`]) a ring follows: from the
+    /// The part of a border given by reference (`key`, its number) a ring follows: from the
     /// point on it nearest `before` (the end of the member before) to the one nearest `after` (the
     /// start of the next), the shorter way round a border that closes; the whole border when the
     /// ring has no other points. AIXM leaves this cut to the reader (its coding guidance, "Geoborder
     /// for Airspace Border"), so each is counted, and those whose ends lie far from the border.
     fn follow(
         &mut self,
-        key: &str,
+        key: usize,
         before: Option<Coord>,
         after: Option<Coord>,
         notes: &mut ShapeNotes,
@@ -1345,6 +1349,12 @@ impl Shapes {
         Ok((part, far))
     }
 
+    /// Keeps a border under its names.
+    fn add_border(&mut self, names: impl IntoIterator<Item = String>, line: Vec<Coord>) {
+        self.border_names.extend(names.into_iter().map(|n| (n, self.borders.len())));
+        self.borders.push(line);
+    }
+
     /// Takes `n` steps of looking along borders from their allowance: false when it is spent.
     fn scan(&mut self, n: usize) -> bool {
         match self.scan_left.checked_sub(n) {
@@ -1360,7 +1370,7 @@ impl Shapes {
     /// nearest `other`, of those an end of either gives (its own ends, or the point on it nearest
     /// one of `other`'s, where `other` runs on past where they meet or stops short). Looking along
     /// both is paid for as points are.
-    fn junction(&mut self, key: &str, other: &str) -> std::result::Result<(Coord, bool), Unfollowed> {
+    fn junction(&mut self, key: usize, other: usize) -> std::result::Result<(Coord, bool), Unfollowed> {
         let scan = self.borders.get(other).ok_or(Unfollowed::Missing)?.len() + self.borders.get(key).ok_or(Unfollowed::Missing)?.len();
         if !self.scan(scan) {
             return Err(Unfollowed::Allowance);
@@ -1490,7 +1500,11 @@ fn say_unfollowed(why: Unfollowed, notes: &mut ShapeNotes) {
 /// How far from a border the ends of a part cut from it may lie before that is said, in meters.
 const FAR_FROM_BORDER_M: f64 = 50.0;
 
-/// What a reference names a border by: `#` and a curve's `gml:id`, or its feature's identifier.
+/// The number of a border that isn't in the file.
+const NO_BORDER: usize = usize::MAX;
+
+/// What a reference names a border by: `#` and a `gml:id`, or its feature's identifier. Which border
+/// that is, `Shapes::border_names` says.
 fn border_key(href: &str) -> String {
     let h = href.trim();
     match h.strip_prefix('#') {
@@ -2537,16 +2551,13 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
         }
         let kind = feature.kind.as_str();
         // A GeoBorder's line, at the date, for the borders that follow it by reference: by its
-        // identifier and its curve's id.
+        // identifier, its curve's id and its members'.
         if kind == "GeoBorder"
             && let Some(g) = props.iter().filter(|p| local(p) == "border").find_map(|p| shape_in(*p))
             && let Some(Geometry::Line(parts)) = shapes.quietly(g)
         {
-            let key = border_key(id);
-            for gid in g.attribute((GML, "id")).map(str::trim).into_iter().chain(feature.gml_ids.iter().map(String::as_str)) {
-                shapes.border_names.insert(format!("#{gid}"), key.clone());
-            }
-            shapes.borders.insert(key, parts.concat());
+            let gids = g.attribute((GML, "id")).map(str::trim).into_iter().chain(feature.gml_ids.iter().map(String::as_str));
+            shapes.add_border(gids.map(|gid| format!("#{gid}")).chain([border_key(id)]), parts.concat());
         }
         // Where a point feature is, for route segments that name it: by its identifier and its
         // own gml:id (a local link's or an XPath's).

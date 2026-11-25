@@ -1117,8 +1117,8 @@ fn a_ring_whose_borders_cant_be_joined_within_the_allowance_isnt_drawn_and_says_
     let boundary = doc.root_element().first_element_child().unwrap();
     let line = |pts: &[(f64, f64)]| pts.iter().map(|&(x, y)| Coord::new(x, y)).collect::<Vec<_>>();
     let mut shapes = Shapes { budget: 1_000_000, ..Shapes::default() };
-    shapes.borders.insert("uuid:a".into(), line(&[(9.0, 50.0), (9.5, 50.0), (10.0, 50.0)]));
-    shapes.borders.insert("uuid:b".into(), line(&[(10.0, 50.0), (10.0, 50.5), (10.0, 51.0)]));
+    shapes.add_border(["uuid:a".to_string()], line(&[(9.0, 50.0), (9.5, 50.0), (10.0, 50.0)]));
+    shapes.add_border(["uuid:b".to_string()], line(&[(10.0, 50.0), (10.0, 50.5), (10.0, 51.0)]));
     // With room to look along both borders where they meet: drawn.
     shapes.scan_left = 1000;
     let mut notes = ShapeNotes::default();
@@ -1977,6 +1977,18 @@ fn a_change_given_a_period_is_withheld_and_a_snapshot_is_read_at_its_start_and_s
     };
     assert_eq!(run(&[base.clone(), ended("2020-01-01T00:00:00Z")], "2026-01-15").0.len(), 2);
     assert_eq!(run(&[base.clone(), ended("2025-06-01T00:00:00Z")], "2026-01-15").0.len(), 1);
+    // One that ends before it begins, whichever date is wrong.
+    let reversed = change("PERMDELTA", 1, &period("2026-01-01T00:00:00Z", Some("2024-02-01T00:00:00Z")), "<aixm:name>PERM</aixm:name>");
+    assert_eq!(run(&[base.clone(), reversed], "2026-01-15").0.len(), 1);
+    let reversed = change("PERMDELTA", 1, &period("2026-02-01T00:00:00Z", Some("2024-02-01T00:00:00Z")), "<aixm:name>PERM</aixm:name>");
+    let notes = run(&[snapshot_at("2026-03-01T00:00:00Z", "SNAP"), reversed], "2026-01-15").1;
+    assert!(notes.iter().any(|m| m.contains("doesn't reflect changes")), "{notes:?}");
+    // One with no date at all: withheld since the state, shown and said before a later snapshot.
+    let undated = change("PERMDELTA", 1, &instant("bad"), "<aixm:name>PERM</aixm:name>");
+    assert_eq!(run(&[base.clone(), undated.clone()], "2026-01-15").0.len(), 1);
+    assert_eq!(run(&[base.clone(), undated.clone()], "2025-01-01").0.len(), 2);
+    let (got, notes) = run(&[snapshot_at("2026-03-01T00:00:00Z", "SNAP"), undated], "2026-01-15");
+    assert!(got.len() == 2 && notes.iter().any(|m| m.contains("doesn't reflect changes")), "{got:?} {notes:?}");
     // Past a snapshot's instant, or open, and before one later than the date: shown, and said.
     for end in [Some("2026-04-01T00:00:00Z"), None, Some("bad")] {
         let p = change("PERMDELTA", 1, &period("2026-01-01T00:00:00Z", end), "<aixm:name>PERM</aixm:name>");
@@ -2104,5 +2116,28 @@ fn a_border_named_two_ways_in_a_row_is_one_border() {
     assert!(once.iter().all(|c| (8.999..=10.001).contains(&c.x)), "{once:?}");
     for refs in [["#b-old", "#b-new"], ["#c", "#b-new"], ["urn:uuid:line", "#b-old"]] {
         assert_eq!(drawn(&refs), once, "{refs:?}");
+    }
+}
+
+#[test]
+fn borders_of_alike_identifiers_are_told_apart_by_their_gml_ids() {
+    let border = |id: &str, gid: &str, curve: &str, lat: f64| {
+        let b = format!(
+            r#"<aixm:border><aixm:Curve srsName="urn:ogc:def:crs:EPSG::4326" gml:id="{curve}"><gml:segments><gml:LineStringSegment><gml:posList>{lat} 9 {lat} 10</gml:posList></gml:LineStringSegment></gml:segments></aixm:Curve></aixm:border>"#
+        );
+        feature("GeoBorder", id, &[slice("GeoBorder", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &b)])
+            .replace(r#"gml:id="f""#, &format!(r#"gml:id="{gid}""#))
+    };
+    let members = border("urn:uuid:X", "b1", "c1", 50.0) + &border("X", "b2", "c2", 40.0);
+    for (name, lat) in [("#b1", 50.0), ("#c1", 50.0), ("#b2", 40.0), ("#c2", 40.0)] {
+        let area = format!(
+            r#"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:Ring><gml:curveMember xlink:href="{name}"/><gml:curveMember><gml:Curve gml:id="k"><gml:segments><gml:LineStringSegment><gml:posList>{lat} 10 51 10 51 9 {lat} 9</gml:posList></gml:LineStringSegment></gml:segments></gml:Curve></gml:curveMember></gml:Ring></gml:exterior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#
+        );
+        let f = feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &area)]);
+        let out = read("t.xml", &message(&(members.clone() + &f)), &at("2026-01-15")).unwrap();
+        let r = ring(layer(&out, "t WorkArea").features[0].geometry.as_ref().unwrap()).to_vec();
+        assert!(r.iter().all(|c| (c.y - lat).abs() < 1e-6 || (c.y - 51.0).abs() < 0.1 || c.y > lat), "{name}: {r:?}");
+        assert!(r.iter().filter(|c| (c.y - lat).abs() < 1e-9).count() >= 2, "{name}: {r:?}");
+        assert!(lat == 40.0 || r.iter().all(|c| c.y > 49.0), "{name}: {r:?}");
     }
 }
