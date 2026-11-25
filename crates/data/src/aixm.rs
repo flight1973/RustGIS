@@ -513,7 +513,15 @@ fn state_at(slices: &[Slice], t: f64) -> State {
         let differs = |s: &Slice| in_force(s.begin, s.end, t) != base.begin.is_some_and(|bb| in_force(s.begin, s.end, bb));
         // A snapshot after the date holds the PERMDELTAs up to its instant.
         let ahead = |s: &Slice| s.begin.is_none_or(|b| t < b && base.begin.is_some_and(|bb| b <= bb));
-        let perm_ahead = of(Interpretation::PermDelta).chain(unread_of(Interpretation::PermDelta)).any(ahead);
+        // One of those may be the feature's creation.
+        if unread_of(Interpretation::PermDelta).any(ahead) {
+            return State::Unreadable;
+        }
+        let created = |s: &Slice| s.lifetime.is_some_and(|(from, _)| from.is_some_and(|f| t < f));
+        if of(Interpretation::PermDelta).any(|s| ahead(s) && created(s)) {
+            return State::OutsideLifetime;
+        }
+        let perm_ahead = of(Interpretation::PermDelta).any(ahead);
         // One that can't be read may be either, unless the dates it has rule it out on both.
         let may_differ = |s: &Slice| in_force(s.begin, s.end, t) || base.begin.is_none_or(|bb| in_force(s.begin, s.end, bb));
         let skipped = !changes.is_empty()
@@ -2647,16 +2655,17 @@ fn no_positions(g: Node) -> bool {
 
 /// How many shapes of a route segment's record aren't drawn: those with positions, but for the
 /// ones its line is drawn between (`in_line`).
-fn undrawn_shapes(p: Node, in_line: &[roxmltree::NodeId]) -> usize {
-    nested_shapes(p).into_iter().filter(|g| !no_positions(*g) && !in_line.contains(&g.id())).count()
+fn undrawn_shapes(p: Node, in_line: &[Node]) -> usize {
+    nested_shapes(p).into_iter().filter(|g| !no_positions(*g) && !in_line.contains(g)).count()
 }
 
-/// The shapes of a route segment's ends written in place: those [`between`] draws its line between.
-fn written_ends(props: &[Node], shapes: &Shapes) -> Vec<roxmltree::NodeId> {
+/// The shapes of a route segment's ends written in place: those [`between`] draws its line between
+/// (nodes, not their ids: each slice is a document of its own).
+fn written_ends<'a, 'i>(props: &[Node<'a, 'i>], shapes: &Shapes) -> Vec<Node<'a, 'i>> {
     ["start", "end"]
         .iter()
         .filter_map(|name| match segment_end(props, name, shapes)? {
-            End::Written(g) => Some(g.id()),
+            End::Written(g) => Some(g),
             End::Named(_) => None,
         })
         .collect()

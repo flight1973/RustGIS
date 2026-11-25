@@ -1880,6 +1880,32 @@ fn a_second_position_in_a_route_end_is_counted() {
 }
 
 #[test]
+fn a_route_segments_shapes_are_told_apart_across_time_slices() {
+    // The same node of two documents: the change's start, in the line, and the state's area, not.
+    let written = |name: &str, pos: &str| {
+        format!(
+            r#"<aixm:{name}><aixm:EnRouteSegmentPoint gml:id="{name}"><aixm:pointChoice_position><aixm:Point gml:id="g{name}" srsName="urn:ogc:def:crs:EPSG::4326"><gml:pos>{pos}</gml:pos></aixm:Point></aixm:pointChoice_position></aixm:EnRouteSegmentPoint></aixm:{name}>"#
+        )
+    };
+    let body = written("area", "40 10") + &written("end", "50 12");
+    let base = slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body);
+    let temp = slice("RouteSegment", "TEMPDELTA", 1, 0, &period("2026-01-01T00:00:00Z", None), &written("start", "50 10"));
+    let out = read("t.xml", &message(&feature("RouteSegment", "rs", &[base, temp])), &at("2026-01-15")).unwrap();
+    assert!(layer(&out, "t RouteSegment").features[0].geometry.is_some());
+    assert!(said(&out).iter().any(|m| m.contains("1 shape")), "{:?}", said(&out));
+}
+
+#[test]
+fn a_snapshot_after_its_features_creation_isnt_shown_before_it() {
+    let life = r#"<aixm:featureLifetime><gml:TimePeriod gml:id="l"><gml:beginPosition>2025-12-10T00:00:00Z</gml:beginPosition><gml:endPosition indeterminatePosition="unknown"/></gml:TimePeriod></aixm:featureLifetime>"#;
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let slices = [snapshot_at("2026-01-01T00:00:00Z", "SNAP"), change("PERMDELTA", 1, &instant("2025-12-10T00:00:00Z"), life)];
+    let bytes = message(&(point("s", &slices) + &kept));
+    assert_eq!(names(&bytes, "2025-12-01").0, [Value::Text("KEPT".into())]);
+    assert_eq!(names(&bytes, "2025-12-20").0.len(), 2);
+}
+
+#[test]
 fn an_empty_route_end_isnt_a_shape_that_isnt_drawn() {
     let empty = r#"<aixm:end><aixm:EnRouteSegmentPoint gml:id="e"><aixm:pointChoice_position><aixm:Point gml:id="ge" srsName="urn:ogc:def:crs:EPSG::4326"><gml:pos></gml:pos></aixm:Point></aixm:pointChoice_position></aixm:EnRouteSegmentPoint></aixm:end>"#;
     let seg = feature("RouteSegment", "rs", &[slice("RouteSegment", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), empty)]);

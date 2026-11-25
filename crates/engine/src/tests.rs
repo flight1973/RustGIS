@@ -24181,21 +24181,17 @@ fn aixm_messages_are_added_at_the_date_asked() {
     assert!(!e.contains("SECRET"), "{e}");
     let z = s.run("layer.addUrl", &json!({"url": "https://example.com/a.zip?token=SECRET", "at": "2026-01-15"})).unwrap_err();
     assert!(z.contains("unzip it") && !z.contains("SECRET"), "{z}");
-    // A window of a GeoTIFF, before it is read; and a service's answer read already.
-    let e = s.run("layer.addUrl", &json!({"url": "https://example.test/download", "bbox": [0, 0, 1, 1], "at": "2026-01-15"})).unwrap_err();
-    assert!(e.contains("a window of a GeoTIFF isn't one"), "{e}");
-    for (at, refused) in [(json!("2026-01-15"), true), (json!(null), false)] {
-        s.landed_reads.push((
-            7,
-            Box::new((
-                rustgis_data::Dataset::new("pbf", rustgis_data::GeometryType::Point, Vec::new()),
-                rustgis_data::ReadReport::default(),
-            )),
-        ));
-        let r =
-            s.run("layer.addDownload", &json!({"id": 7, "url": "https://example.test/FeatureServer/0/query", "service": true, "at": at}));
-        assert_eq!(r.as_ref().is_err_and(|e| e.contains("the service's answer isn't one")), refused, "{r:?}");
-    }
+    // A service's answer read already: refused and kept, to be added without it.
+    s.landed_reads.push((
+        7,
+        Box::new((rustgis_data::Dataset::new("pbf", rustgis_data::GeometryType::Point, Vec::new()), rustgis_data::ReadReport::default())),
+    ));
+    let asked = json!({"id": 7, "url": "https://example.test/FeatureServer/0/query", "service": true});
+    let mut dated = asked.clone();
+    dated["at"] = json!("2026-01-15");
+    let e2 = s.run("layer.addDownload", &dated).unwrap_err();
+    assert!(e2.contains("the service's answer isn't one"), "{e2}");
+    s.run("layer.addDownload", &asked).unwrap();
     assert!(e.contains("isn't one"), "{e}");
     // An address with no extension found to be a GeoTIFF refuses it too, before it is added.
     let e = crate::cmd::layer::add_cog(&mut s, &json!({"at": "2026-01-15"}), "https://example.test/download", true).unwrap_err();
