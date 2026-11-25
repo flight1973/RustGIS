@@ -6855,7 +6855,8 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     let p = bound.as_ref();
     let id = f(p, "id").filter(|v| *v >= 0.0 && v.fract() == 0.0).map(|v| v as u64).ok_or("id is required")?;
     let url = ps(p, "url").unwrap_or("data").to_string();
-    // Read before the download is taken, so a bad one leaves it to be added again.
+    // Read before the download is taken, so a bad one leaves it to be added again (a refused "at",
+    // judged by what landed, doesn't).
     let service = super::b(p, "service").unwrap_or(false);
     let coverage = super::b(p, "coverage").unwrap_or(false);
     if (service || coverage) && ps(p, "url").is_none_or(|url| url.trim().is_empty()) {

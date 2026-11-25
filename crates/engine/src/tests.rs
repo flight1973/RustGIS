@@ -48703,6 +48703,13 @@ fn a_cog_windows_read_is_apart_from_adding_it() {
     let layers = s.map().layers.len();
     let read = std::thread::spawn(move || read_cog_window(&asked)).join().unwrap().unwrap();
     assert_eq!(s.map().layers.len(), layers, "nothing added yet");
+    // An effective date is for an AIXM message: refused, and not held.
+    let dated = read_cog_window(&window_asked(&s, &p).unwrap()).unwrap();
+    let id = s.download_started();
+    assert!(s.download_landed_window(id, dated));
+    let e = s.run("layer.addDownload", &json!({"id": id, "url": url, "at": "2026-01-15"})).unwrap_err();
+    assert!(e.contains("a window of a GeoTIFF isn't one"), "{e}");
+    assert!(s.landed_windows.is_empty() && s.map().layers.len() == layers);
     let id = s.download_started();
     assert!(s.download_landed_window(id, read));
     let mark = s.notice_mark();
