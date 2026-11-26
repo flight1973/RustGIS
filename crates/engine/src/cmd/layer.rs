@@ -2385,7 +2385,7 @@ fn read_ahead_whole(path: &str) -> bool {
 /// Whether Add Data reads `path` as an AIXM message: a `.gml` or `.xml` file whose root (in its
 /// first bytes, read here) is an `AIXMBasicMessage`.
 #[cfg(not(target_arch = "wasm32"))]
-fn is_aixm_path(path: &str) -> bool {
+pub fn is_aixm_path(path: &str) -> bool {
     use std::io::Read;
     let lower = path.to_ascii_lowercase();
     if !(lower.ends_with(".gml") || lower.ends_with(".xml")) {

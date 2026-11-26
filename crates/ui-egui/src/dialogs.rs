@@ -2495,7 +2495,21 @@ fn gpkg_add_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     };
     #[cfg(target_arch = "wasm32")]
     let too_large = || false;
-    if list && too_large() {
+    // An AIXM message is read whole, its shapes too, to list it: not on the frame. Add Data lists
+    // it off the frame, with progress and Cancel.
+    #[cfg(not(target_arch = "wasm32"))]
+    let aixm = || rustgis_engine::cmd::layer::is_aixm_path(&path);
+    #[cfg(target_arch = "wasm32")]
+    let aixm = || false;
+    if list && aixm() {
+        app.dialogs.listed = None;
+        app.dialogs.list.clear();
+        app.dialogs.c.clear();
+        app.dialogs.info = None;
+        app.dialogs.error = Some(
+            tl!("List Tables doesn't read an AIXM message: add it with Add Data, which lists its layers as it reads them").to_string(),
+        );
+    } else if list && too_large() {
         app.dialogs.listed = None;
         app.dialogs.list.clear();
         app.dialogs.c.clear();
