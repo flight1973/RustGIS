@@ -1,4 +1,4 @@
-//! Tests of the AIXM reader: the Donlon 2025 sample (BSD-2-Clause, EUROCONTROL & FAA) and small
+//! Tests of the AIXM reader: the Donlon 2025 sample (BSD-3-Clause, EUROCONTROL & FAA) and small
 //! messages written here for each rule of the time slices, the arcs and hostile input.
 
 use super::*;
@@ -170,6 +170,12 @@ fn the_vaardnor_circle_stays_within_a_meter_of_its_radius() {
     for c in ring {
         let d = meters_between(*c, center);
         assert!((d - 15.0 * 1852.0).abs() < 0.01, "{d}");
+    }
+    // And between them: each edge's middle within a meter of the circle.
+    for w in ring.windows(2) {
+        let (len, azimuth, _) = rustgis_geom::wgs84_inverse(w[0], w[1]);
+        let mid = rustgis_geom::wgs84_direct(w[0], azimuth, len / 2.0).0;
+        assert!((meters_between(mid, center) - 15.0 * 1852.0).abs() < 1.0, "{mid:?}");
     }
 }
 
@@ -2378,4 +2384,38 @@ fn a_feature_whose_members_write_its_uuid_differently_is_one() {
     let two = point("abc", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "A")])
         + &point("ABC", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "B")]);
     assert_eq!(names(&message(&two), "2026-01-15").0.len(), 2);
+}
+
+#[test]
+fn a_unit_is_numbered_as_its_value_is() {
+    let rec = |limits: &str| {
+        let body = format!("{}<aixm:annotation><aixm:Note gml:id=\"n\">{limits}</aixm:Note></aixm:annotation>", named_point("P"));
+        let out = read(
+            "t.xml",
+            &message(&point("p", &[slice("DesignatedPoint", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+            &at("2026-01-15"),
+        )
+        .unwrap();
+        let ds = layer(&out, "t DesignatedPoint");
+        ds.fields.iter().map(|f| f.name.clone()).filter(|n| n.contains("limit")).collect::<Vec<_>>()
+    };
+    let two = rec(r#"<aixm:limit uom="FT">100</aixm:limit><aixm:limit>200</aixm:limit>"#);
+    assert!(two.contains(&"annotation_limit_1_uom".to_string()) && !two.iter().any(|n| n == "annotation_limit_uom"), "{two:?}");
+    let one = rec(r#"<aixm:limit uom="FT">100</aixm:limit>"#);
+    assert!(one.contains(&"annotation_limit_uom".to_string()), "{one:?}");
+}
+
+#[test]
+fn a_hole_across_180_degrees_is_inside_its_exterior() {
+    let body = r#"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>-10 178 -10 -178 10 -178 10 178 -10 178</gml:posList></gml:LinearRing></gml:exterior><gml:interior><gml:LinearRing><gml:posList>-5 -179 -5 179 5 179 5 -179 -5 -179</gml:posList></gml:LinearRing></gml:interior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#;
+    let out = read(
+        "t.xml",
+        &message(&feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), body)])),
+        &at("2026-01-15"),
+    )
+    .unwrap();
+    let Some(Geometry::Polygon(p)) = &layer(&out, "t WorkArea").features[0].geometry else { panic!() };
+    let span = |r: &[Coord]| (r.iter().map(|c| c.x).fold(f64::MAX, f64::min), r.iter().map(|c| c.x).fold(f64::MIN, f64::max));
+    let ((a, b), (c, d)) = (span(&p[0][0]), span(&p[0][1]));
+    assert!(a <= c && d <= b, "{:?} {:?}", p[0][0], p[0][1]);
 }

@@ -1497,9 +1497,15 @@ impl Shapes {
             // cover what the hole excludes.
             let mut rings = vec![outer];
             let mut hole_lost = false;
+            let middle = |r: &[Coord]| r.iter().map(|c| c.x).sum::<f64>() / r.len().max(1) as f64;
+            let outer_middle = middle(&rings[0]);
             for b in elements(p).filter(|c| local(c) == "interior") {
                 match self.ring(b, &mut pn) {
-                    Some(r) => rings.push(r),
+                    // Its longitudes in the exterior's run: a hole across 180° is where it is.
+                    Some(r) => {
+                        let turn = ((outer_middle - middle(&r)) / 360.0).round() * 360.0;
+                        rings.push(if turn == 0.0 { r } else { r.into_iter().map(|c| Coord::new(c.x + turn, c.y)).collect() });
+                    }
                     None => hole_lost = true,
                 }
             }
@@ -1919,6 +1925,12 @@ impl Row {
     }
 
     fn null(&mut self, key: &str) {
+        // Its name is paid for as a value would be, though nothing is lost past the limit.
+        let cost = key.len() + VALUE_OVERHEAD;
+        if self.named.contains(key) || self.limit.is_some_and(|l| self.bytes + cost > l) {
+            return;
+        }
+        self.bytes += cost;
         let _ = self.name(key, false);
     }
 
@@ -2003,9 +2015,16 @@ impl Row {
                 self.record_at(c, path, false, depth + 1);
             } else if let Some((last, _)) = path.last().cloned() {
                 for (key, value) in leaf_values(c, &last) {
+                    // A unit and the like are a step under the property, so they are numbered as it
+                    // is (`limit_1_uom` beside `limit_1`).
                     let mut at = path.clone();
-                    if let Some(step) = at.last_mut() {
-                        step.0 = key;
+                    match key.strip_prefix(last.as_str()).and_then(|q| q.strip_prefix('_')) {
+                        Some(q) if !q.is_empty() => at.push((q.to_string(), 1)),
+                        _ => {
+                            if let Some(step) = at.last_mut() {
+                                step.0 = key;
+                            }
+                        }
                     }
                     // Paid for first; given back when its path can't be kept.
                     let cost = value.as_ref().map_or(0, String::len);
@@ -2426,6 +2445,8 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
     let mut wrap_left = text.len().saturating_mul(4).max(MIN_WRAP_BYTES);
     let prefix = "<m".len() + index.namespaces.len() + ">".len();
     crate::progress::begin(index.members.len() * 2);
+    // Features with a slice the limits left unread: what they are then can't be known.
+    let mut withheld: HashSet<String> = HashSet::new();
     for (m, &(start, end)) in index.members.iter().enumerate() {
         crate::progress::step(1)?;
         let Some(member) = text.get(start..end) else {
@@ -2450,6 +2471,7 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
         for (fi, f) in features_of(doc.root_element()).into_iter().enumerate() {
             let id = identifier(f).unwrap_or_else(|| format!("#{m}.{fi}"));
             let mut slices = Vec::new();
+            let mut cut = false;
             for sl in slices_of(f) {
                 let r = sl.range();
                 let Some(range) = r.start.checked_sub(prefix).zip(r.end.checked_sub(prefix)).map(|(a, b)| (start + a, start + b)) else {
@@ -2457,7 +2479,9 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
                     continue;
                 };
                 let Some(scope) = scope_of(sl, text, start, prefix, &mut scopes, &mut scope_ids, &mut wrap_left) else {
+                    // Its feature is left out: what it was then may be this slice.
                     notes.past_limits += 1;
+                    cut = true;
                     continue;
                 };
                 slices.extend(slice_of(sl, range, scope, &mut trouble));
@@ -2482,6 +2506,9 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
                 entry.curve_ids.extend(curves.filter_map(|g| g.attribute((GML, "id"))).map(|g| g.trim().to_string()));
             }
             entry.slices.extend(slices);
+            if cut {
+                withheld.insert(key.clone());
+            }
         }
     }
     notes.unknown_interpretation = trouble.unknown;
@@ -2547,6 +2574,10 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
     for key in &order {
         crate::progress::step(1)?;
         let Some(feature) = features.get(key) else { continue };
+        if withheld.contains(key) {
+            notes.incomplete += 1;
+            continue;
+        }
         layers.feature.clone_from(key);
         let id = &feature.id;
         if feature.slices.is_empty() {
@@ -3289,7 +3320,7 @@ fn finish(
         notes.incomplete,
         "feature",
         "features",
-        "left out: a change to it in force then couldn't be read within the limits the file's size sets",
+        "left out: a time slice of it couldn't be read within the limits the file's size sets",
     );
     say(
         &mut file,

@@ -4001,16 +4001,22 @@ fn read_zip_layers_budget(file_name: &str, bytes: &[u8], crs: Option<Crs>, budge
         } else if is_aixm(leaf, &b) {
             // An AIXM message: all its layers, as it is today. It names its own system, so a
             // system given for the zip isn't used for it, and that is said.
-            crate::aixm::read(leaf, &b, &crate::aixm::Options::default()).map(|mut layers| {
-                if crs.is_some()
-                    && let Some((_, report)) = layers.first_mut()
-                {
-                    report
-                        .messages
-                        .push(format!("{leaf}: the coordinate system given isn't used for an AIXM message, which names its own"));
-                }
-                plain(layers)
-            })
+            crate::aixm::read(leaf, &b, &crate::aixm::Options::default())
+                .and_then(|layers| {
+                    // Kept while the rest are read: charged to what the zip may hold.
+                    charge_retained(layers.iter().map(|(d, _)| d), leaf, budget)?;
+                    Ok(layers)
+                })
+                .map(|mut layers| {
+                    if crs.is_some()
+                        && let Some((_, report)) = layers.first_mut()
+                    {
+                        report
+                            .messages
+                            .push(format!("{leaf}: the coordinate system given isn't used for an AIXM message, which names its own"));
+                    }
+                    plain(layers)
+                })
         } else if is_delimited_name(leaf) {
             read_delimited_bytes_budget(leaf, &b, &CsvOptions { crs, ..Default::default() }, budget).map(|r| plain(vec![r]))
         } else if crate::sheets::is_sheet_name(leaf) {
