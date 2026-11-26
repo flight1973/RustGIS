@@ -45,7 +45,7 @@ const CROWDED_ROWS: f32 = 7.0;
 /// The room above and below a sheet's rows.
 const SHEET_MARGIN: f32 = 4.0;
 /// The More sheet's rows with the position hidden.
-const MORE_ROWS: usize = 8;
+const MORE_ROWS: usize = 9;
 /// The More sheet's rows shown only with the position on: Go to My Position, and the track.
 const MORE_POSITION_ROWS: usize = 2;
 
@@ -1389,7 +1389,13 @@ fn edit_sheet(
     };
     // The shape is borrowed for each look at it, not copied each frame: the buttons change it.
     let Some(status) = edit::shape_ref(app, target.id, row).map(|shape| edit::status(target.kind, &shape, editing.vertex)) else {
+        // A feature with a place that can't be given in longitude/latitude (#2032 C2f-4b): drawn
+        // on a map in its layer's own system, but shapes are edited here in longitude/latitude.
+        // Said, as editing it ends.
         state.editing = None;
+        if let Some(why) = edit::unplaced(app, target.id, row) {
+            app.session.notify(why, true);
+        }
         return;
     };
     ui.label(RichText::new(status).size(14.0).color(t.text));
@@ -1456,10 +1462,12 @@ fn edit_sheet(
 /// The More sheet: what is done now and then, each a row as tall as a finger.
 fn more(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     heading(ui, t, tl!("More"));
-    let rows: [(&str, &str, &str); 6] = [
+    let rows: [(&str, &str, &str); 7] = [
         ("zoom_full", tl!("Full Extent"), "map.zoomFull"),
         ("open", tl!("Open Project"), "ui.open"),
         ("save", tl!("Save Project"), "ui.save"),
+        // Save writes back where the project came from: this asks where.
+        ("save", tl!("Save Project As…"), "ui.saveAs"),
         ("new", tl!("New Project"), "project.new"),
         ("undo", tl!("Undo"), "edit.undo"),
         ("redo", tl!("Redo"), "edit.redo"),
@@ -2452,6 +2460,24 @@ mod tests {
         assert_eq!(last.checked(Some(&abc)).vertex, None);
         // A vertex the shape doesn't have isn't picked at all.
         assert_eq!(edit::Editing::feature(7).picking(Some(VertexId::new(0, 0, 9)), Some(&abc)).vertex, None);
+    }
+
+    /// A feature with a place that can't be given in longitude/latitude (#2032 C2f-4b) has no
+    /// shape to edit here, and why is said, naming it; a placed one has.
+    #[test]
+    fn a_feature_with_no_place_in_longitude_latitude_says_why_it_cant_be_edited() {
+        use rustgis_ui_egui::rustgis_engine::data::{Coord, Geometry, raster::Crs};
+        let mut app = RustGisApp::with_sample();
+        let cities = target(&mut app, GeometryType::Point);
+        let layer = app.session.map_mut().layer_mut(cities.id).unwrap();
+        layer.dataset.hold_in(Crs::from_epsg(8857).unwrap()).unwrap();
+        let id = layer.dataset.features[0].id;
+        layer.dataset.features[0].geometry = Some(Geometry::Point(Coord::new(1e9, 0.0)));
+        assert!(edit::shape_ref(&app, cities.id, 0).is_none());
+        let why = edit::unplaced(&app, cities.id, 0).unwrap();
+        assert!(why.contains(&format!("feature {id} has a place")) && why.contains("can't be edited there"), "{why}");
+        assert!(edit::shape_ref(&app, cities.id, 1).is_some());
+        assert_eq!(edit::unplaced(&app, cities.id, 1), None);
     }
 
     #[test]

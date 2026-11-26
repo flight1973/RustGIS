@@ -240,7 +240,21 @@ them when it takes no arguments).
 While the list is open the expression isn't checked: `pop_`, with `pop_est` suggested, is a word
 still being chosen. It is checked once the list closes (an item taken, Escape, the cursor moved
 away, the box left, or nothing matching what's typed), and its error shown then if it's still
-invalid (`pop_x`: no field named 'pop_x').
+invalid (`pop_x`: no field named 'pop_x'). Once it reads, a line under the box previews what the
+expression gives in the first three selected rows, or the first three rows when none is selected,
+as the chosen field holds it and the attribute table shows it, with what writing it loses:
+`Preview: 2 (fraction dropped) · <Null> (a division by zero) · 6`. Only those rows are evaluated,
+and nothing changes until **Calculate** is clicked. On a layer, each previewed row also runs the
+layer's calculation rules and checks (domains, allowed combinations of values, constraint rules) as
+Calculate would. A calculation rule that writes the chosen field overwrites Calculate's result, so
+the preview shows the rule's result, as the field holds it, with what writing that loses (the later
+of two rules wins; what Calculate's own result lost isn't shown then, though Calculate says it; a
+rule that no longer reads is skipped, as Calculate skips it and says so). A
+row the checks would refuse says so in Calculate's words:
+`Preview: 15 · 30 · 45 (refused: 45 isn't allowed in v (its domain))`. Calculate refuses the whole
+edit when any of its rows is refused, so rows the preview doesn't show can still refuse it. An area
+the edit reads that is ambiguous refuses it too, and the preview doesn't say so, even for a row it
+shows.
 
 A `(` typed closes itself, the cursor inside, unless text follows it or it's in a text or a field
 name; so does a `'` or `"` where a value can start (at the start, after a space, `(`, `,` or an

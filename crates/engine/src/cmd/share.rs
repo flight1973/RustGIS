@@ -641,9 +641,9 @@ pub(crate) fn layer_work(s: &Session, p: &Value) -> Result<Work, String> {
 /// empty because they weren't dates, and date-times rounded to the microsecond
 /// ([`rustgis_map::Unreadable`]). Every export of a layer read in place says them, the browser's
 /// download too.
-pub fn read_date_notes(file: &str, layer: &str, lost: &rustgis_map::Unreadable) -> Vec<String> {
-    let empty = lost.dates.iter().map(|n| format!("{file}: {layer}: {n} (empty in the export)"));
-    empty.chain(lost.rounded.iter().map(|n| format!("{file}: {layer}: {n} when read for the export"))).collect()
+pub fn read_date_notes(file: &str, layer: &str, lost: &rustgis_map::Unreadable) -> Vec<rustgis_data::loss::Note> {
+    let empty = lost.dates.iter().map(|n| n.clone().map_text(|n| format!("{file}: {layer}: {n} (empty in the export)")));
+    empty.chain(lost.rounded.iter().map(|n| n.clone().map_text(|n| format!("{file}: {layer}: {n} when read for the export")))).collect()
 }
 
 /// The complete diagnostics from a whole read made for an export, including metadata losses
@@ -660,17 +660,18 @@ pub fn coalesce_read_zm(notes: &mut rustgis_data::loss::Notes, file: &str, ds: &
     if lost.zm_noted
         && let Some(generic) = rustgis_data::zm_export_note([ds], file)
     {
-        notes.retain(|note| note.text != generic);
+        notes.retain(|note| *note != generic);
     }
 }
 
 /// What a GeoPackage export of `ds` says of its dates: date-times written in UTC, and text in
 /// date fields that isn't a date, and rounded to the millisecond; for a FlatGeobuf, its date fields with no values. Nothing for
 /// another format, or when there was none.
-pub fn gpkg_dates_note(ds: &rustgis_data::Dataset, ext: &str, path: &str) -> Vec<String> {
+pub fn gpkg_dates_note(ds: &rustgis_data::Dataset, ext: &str, path: &str) -> Vec<rustgis_data::loss::Note> {
     use rustgis_data::io::{fine_dates, fine_dates_note, offset_dates, text_in_dates, text_in_dates_note, utc_dates_note};
     if ext == "fgb" {
         return rustgis_data::io::fgb_empty_dates_note(&ds.fields, &rustgis_data::io::written_values(ds.features.iter(), &ds.fields), path)
+            .map(rustgis_data::loss::Note::plain)
             .into_iter()
             .collect();
     }
@@ -722,6 +723,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, project: 
     // Whether a CSV has coordinate columns: a streamed layer that declares no type takes its
     // first geometry's, which the chunks written say.
     let mut csv_points = ds.geometry_type == rustgis_data::GeometryType::Point;
+    let mut lonlat_extent = None;
     let (written, left_out, skipped, table, unfit, null_numbers, moved, format_notes, dates) = match &chunks {
         Some((src, layer)) => {
             let (e, table) = rustgis_data::export::write_source_filtered(src.as_ref(), layer, Path::new(&path), crs, &gpkg, query)
@@ -732,32 +734,33 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, project: 
             let unfit = rustgis_data::source::parquet::unfit_note(&layer.fields, &e.unfit, path);
             let moved = rustgis_data::web_mercator_moved_note(path, &layer.name, e.beyond_web_mercator);
             let mut dates: rustgis_data::loss::Notes = rustgis_data::source::unread_dates_note(&layer.fields, &e.unread_dates)
-                .map(|n| format!("{path}: {}: {n} (empty in the export)", layer.name))
+                .map(|n| n.map_text(|n| format!("{path}: {}: {n} (empty in the export)", layer.name)))
                 .into_iter()
                 .collect();
             dates.extend(
                 rustgis_data::source::rounded_dates_note(&layer.fields, &e.rounded_dates)
-                    .map(|n| format!("{path}: {}: {n} when read for the export", layer.name)),
+                    .map(|n| n.map_text(|n| format!("{path}: {}: {n} when read for the export", layer.name))),
             );
             dates.extend(
                 rustgis_data::source::null_text_note(&layer.fields, &e.null_text)
-                    .map(|n| format!("{path}: {}: {n} (empty in the export)", layer.name)),
+                    .map(|n| n.map_text(|n| format!("{path}: {}: {n} (empty in the export)", layer.name))),
             );
             dates.extend(
                 rustgis_data::source::not_utf8_note(&layer.fields, &e.not_utf8, e.not_utf8_in)
-                    .map(|n| format!("{path}: {}: {n}", layer.name)),
+                    .map(|n| n.prefixed(&format!("{path}: {}", layer.name))),
             );
             dates.extend(rustgis_data::io::utc_dates_note(&layer.fields, &e.utc_dates, path));
             dates.extend(rustgis_data::io::fine_dates_note(&layer.fields, &e.fine_dates, path));
             if ext == "fgb" {
                 dates.extend(rustgis_data::io::fgb_empty_dates_note(&layer.fields, &e.written_values, path));
             }
-            dates.extend(e.date_messages.iter().map(|n| format!("{path}: {n}")));
+            dates.extend(e.date_messages.iter().map(|n| n.clone().map_text(|t| format!("{path}: {t}"))));
             dates.extend(
                 e.read_notes.iter().map(|n| n.clone().map_text(|t| format!("{path}: {}: {t} when read for the export", layer.name))),
             );
-            let mut format_notes = e.csv.notes(&ds.fields, path);
+            let mut format_notes: rustgis_data::loss::Notes = e.csv.notes(&ds.fields, path).into();
             format_notes.extend(e.csv.coordinates_note_in(&ds.fields, path, crs));
+            format_notes.extend(rustgis_data::io::unplaced_export_note(path, &layer.name, e.unplaced, crs));
             // Text that reading the file back changes: CSV reads a blank cell as null; KML and GPX trim
             // their values.
             format_notes.extend(e.text.notes(&ds.fields, path));
@@ -766,7 +769,11 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, project: 
         None => {
             let mut format_notes = rustgis_data::io::export_losses_notes_in(ds, &ext, rustgis_data::io::name_field(ds), path, crs)
                 .map_err(|e| e.to_string())?;
-            let (left_out, table, placed) = rustgis_data::io::write_path_to(ds, Path::new(&path), crs, &gpkg).map_err(|e| e.to_string())?;
+            // The layer's box in longitude/latitude comes back with the write, taken from the places
+            // converted for the file when it is written there, so each is converted once.
+            let (left_out, table, placed, lonlat) =
+                rustgis_data::io::write_path_placed(ds, Path::new(&path), crs, &gpkg).map_err(|e| e.to_string())?;
+            lonlat_extent = Some(lonlat);
             // Old parts of a Shapefile written over that couldn't be removed.
             format_notes.extend(placed);
             let unfit = if parquet { rustgis_data::source::parquet::values_note(ds, path) } else { None };
@@ -780,8 +787,8 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, project: 
     // a chunk at a time has none at hand: its vertices beyond 85.05° in Web Mercator are counted
     // as they're written (`e.beyond_web_mercator`), and its source's extent only serves the
     // out-of-place check. A raster layer's extent is its raster's, which the file doesn't hold.
-    let extent = if chunks.is_some() { l.extent() } else { ds.lonlat_extent() };
-    let mut notes: rustgis_data::loss::Notes = rustgis_data::export_notes([(ds, extent)], path, crs).into();
+    let extent = lonlat_extent.unwrap_or_else(|| l.extent());
+    let mut notes: rustgis_data::loss::Notes = rustgis_data::export_notes([(ds, extent)], path, crs);
     coalesce_read_zm(&mut notes, path, ds, &unreadable);
     notes.extend(default_note);
     let csv_type = if csv_points { rustgis_data::GeometryType::Point } else { ds.geometry_type };
@@ -789,7 +796,7 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, project: 
     notes.extend(moved);
     // A Shapefile (`.shp`, or zipped to `.zip`) cuts field names to dBase's.
     let shapefile = matches!(ext.as_str(), "shp" | "zip");
-    let mut dbf_notes = Vec::new();
+    let mut dbf_notes = rustgis_data::loss::Notes::new();
     if shapefile {
         dbf_notes.extend(rustgis_data::io::shapefile_names_note(&ds.fields, path));
         dbf_notes.extend(rustgis_data::io::shapefile_values_notes(ds, path));
@@ -805,14 +812,17 @@ fn write_layer(l: &rustgis_map::Layer, path: &str, asked: Option<Crs>, project: 
     said.extend(rustgis_data::io::left_out_note(path, &ext, left_out));
     said.extend(format_notes);
     if skipped > 0 {
-        said.push(format!("{path}: {skipped} rows couldn't be read and were left out"));
+        said.push(super::whole::unread_note(path, skipped));
     }
     said.extend(notes);
     said.extend(dbf_notes);
     said.extend(unfit);
     said.extend(dates);
     if shapefile && rustgis_data::raster::wkt::to_wkt(crs).is_none() {
-        said.push(format!("{path}: no .prj written, as {} has no WKT form", crs.label()));
+        said.push(rustgis_data::loss::Note::loss(
+            rustgis_data::loss::LossCode::DroppedCrsName,
+            format!("{path}: no .prj written, as {} has no WKT form", crs.label()),
+        ));
     }
     said.push(format!("Exported {path}"));
     let answer = json!({"path": path, "features": written, "leftOut": left_out, "crs": crs.label()});
@@ -892,10 +902,11 @@ pub(crate) fn query_export_note(
 
 /// Reports numeric loss after the file has been written, keeping the output path literal in
 /// translated interface text. A clean export emits no loss notice.
-pub(crate) fn notify_null_numbers(s: &mut Session, path: &str, count: usize) {
+pub fn notify_null_numbers(s: &mut Session, path: &str, count: usize) {
     if let Some(note) = null_numbers_note(path, count) {
         let mark = s.notice_mark();
-        s.notify_text(note, false);
+        // Each such value is lost from the file.
+        s.notify_loss(rustgis_data::loss::LossCode::DroppedValue, note);
         s.retain_written_notices(mark);
     }
 }

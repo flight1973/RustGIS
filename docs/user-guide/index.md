@@ -99,7 +99,7 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
   and closes it when it is. **Pane Sets** keep the tabs open.
 - **Status bar**: the scale (type one, or pick from the list), the zoom level, bearing and pitch
   (click them to face north and look straight down again), the pointer's coordinates (click them
-  to step through map coordinates (the map's own system, the default), decimal degrees, DMS, UTM and MGRS; see [Coordinate readouts](maps.md#coordinate-readouts)),
+  to step through map coordinates (the map's own system, the default), decimal degrees, DMS, UTM, MGRS and layer coordinates (the active layer's projected system); see [Coordinate readouts](maps.md#coordinate-readouts)),
   the coordinate system (click it to change the
   projection), the selection count (with a button to clear it), the latest notice (click to open
   **Messages**), a **Messages** button, the last draw time, the frame rate and a **GPU**/**CPU**
@@ -162,7 +162,7 @@ Review copied diagnostics for private layer names or file paths before sharing t
 | **Style** | For the layer selected in Layers. A feature layer: Visibility Range, Effects, Drawing, Drawing Effects, Extrusion for polygons (with Faces and Light and Shadow once on) and Layer. A raster layer: Visibility Range, Effects, Compare, Raster Effects, Rendering, Enhancement and Layer. Both: Styles |
 | **Labeling** | For the feature layer selected in Layers: Labels (Label, Properties), Label Class (Class, Field), Text Symbol (Size, Color, Bold, Halo), Label Placement and Label Range. Whatever is selected: Map Labeling (Lock, Pause, View Unplaced, Convert) |
 | **Edit** | Manage Edits (Edit, Save, Undo, Redo, Status, Save to PostGIS and Discard PostGIS Edits on the desktop while a [PostGIS layer is loaded for editing](data.md#editing-postgis-tables), Settings, Templates, Topology), Snapping, Features (Create, Delete, Edit Vertices, Modify), Tools, Elevation, Corrections, Graphics, Graphics and Text, Clipboard |
-| **Analyze** | Geoprocessing (History, Tools, Model Builder, Script, SQL, Environments), Tasks (the Tasks pane; Task: Record Task, New Task From History, Import Task, run a task), AI (AI Assistant), Portal (Feature Analysis, Raster Analysis), Workflows, Raster (Raster Functions, Function Editor), Tools (the tool gallery), Selection, Notebook |
+| **Analyze** | Geoprocessing (History, Tools, Model Builder, Script, SQL, Environments), Tasks (the Tasks pane; Task: Record Task, New Task From History, Import Task, run a task), AI (AI Assistant), Portal (Feature Analysis, Raster Analysis), Workflows, Raster (Raster Functions, Function Editor, Process), Tools (the tool gallery), Selection, Notebook |
 | **View** | Display (Graticule, GPU Rendering), View (Globe, Projection, Global; Local on the desktop), Effects, Scene, Windows, Navigation, Link, Workspace, Animation, Time (Time Slider), Profile (Profile; Time Series on the desktop) |
 | **Publish** | While a layout is open, its groups first (Page, Map Frames, Map Surrounds, Shapes, Text, Export); then Report, Presentation, Output (Export Map, Export Features, Print Map, Capture To Clipboard, Report, Presentation, Export To 3D), Package, Share As, Layout, Save As, Thumbnail |
 | **Plugins** | Plugins (Plugin Manager, Install From File, Browse Plugins), Extensions (the [Extensions](#extensions) window), plus a group for each enabled [plugin](../plugins.md) with commands or tools; a plugin with its own tab adds that tab instead |
@@ -182,7 +182,7 @@ what it adds and where it shows. An extension with a tab of its own adds that ta
 
 | Extension | Default | Adds |
 | --- | --- | --- |
-| **Imagery** (`imagery`) | Off | The Imagery tab: Ortho Mapping, Reality Mapping, Alignment (Georeference), Image Analysis, Image Classification (with Deep Learning Tools), Imagery Sharing, Mensuration and Imagery Tools, and their commands (`imagery.*`, `dl.*`, and the `raster.*` commands those groups run) |
+| **Imagery** (`imagery`) | Off | The Imagery tab: Ortho Mapping, Reality Mapping, Alignment (Georeference), Image Analysis, Image Classification (with Deep Learning Tools), Imagery Sharing, Mensuration and Imagery Tools (Indices, Pixel Editor), and their commands (`imagery.*`, `dl.*`, and the `raster.*` commands those groups run). Process (clip and resample a raster), Mosaic Rasters, Project Raster and Polygons to Raster aren't part of it and always run |
 
 While an extension is off, its tab, its buttons, its Workflows pane sections and its commands in
 Command Search and the AI Assistant's command search are hidden. Its commands are refused with a

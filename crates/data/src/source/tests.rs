@@ -63,7 +63,7 @@ fn explicit_method_1028_warns_for_known_geopackage_authorities() {
     let sphere = wkt.replace("298.257223563", "0");
     let wkt1 = crate::raster::wkt::to_wkt(Crs::from_epsg(4087).unwrap()).unwrap();
     for (definition, code, warned) in [(wkt, 4087, true), (&sphere, 4087, false), (&wkt1, 4087, false), (wkt, 3857, false)] {
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         let row =
             GpkgSrs { organization: Some("EPSG".into()), code: Some(code), definition: Some(definition.into()), definition_12_063: None };
         let read = gpkg_reproject(100001, Some(row), &mut notes).unwrap();
@@ -86,7 +86,7 @@ fn explicit_method_1028_warns_for_known_geopackage_authorities() {
         [("GEOGCRS[", true), (r#"ENGCRS["site",EDATUM["site"]]"#, true), (&wkt.replace(r#",ID["EPSG",1028]"#, ""), true), (&sphere, false)]
     {
         assert_ne!(wkt2, wkt);
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         let row = GpkgSrs {
             organization: Some("EPSG".into()),
             code: Some(4087),
@@ -124,7 +124,7 @@ fn a_geopackage_row_read_by_its_code_says_its_definitions_grid() {
     let xy = Coord::new(430_000.0, 4_580_000.0);
     let by_code = Crs::from_epsg(23031).unwrap().transformer().unwrap().to_lonlat(xy).unwrap();
     for (definition, wkt2, notice) in [(bound.as_str(), false, true), (bound.as_str(), true, true), (ED50_UTM31, false, false)] {
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         let row = GpkgSrs {
             organization: Some("EPSG".into()),
             code: Some(23031),
@@ -158,7 +158,7 @@ fn a_geopackage_rows_code_gives_way_to_its_definitions_shift() {
         definition_12_063: wkt2.map(Into::into),
     };
     let read = |row: GpkgSrs| {
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         let read = gpkg_reproject(100001, Some(row), &mut notes).unwrap();
         (read, notes)
     };
@@ -243,7 +243,7 @@ fn a_geopackage_rows_unread_wkt2_is_said_beside_its_code() {
         definition_12_063: Some(wkt2.into()),
     };
     let read = |row: GpkgSrs| {
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         let read = gpkg_reproject(100001, Some(row), &mut notes).unwrap();
         (read, notes)
     };
@@ -261,7 +261,7 @@ fn a_geopackage_rows_unread_wkt2_is_said_beside_its_code() {
     // The same notice as without a code.
     assert_eq!(read(row(None, &other, "PROJCRS[")).1, notes);
     // And when the code is used: the WKT1 gives the code's own shift, or none, or there is none.
-    let by_code = notes[0].replace("so its WKT1 definition is used", "so EPSG:27700 is used");
+    let by_code = notes[0].as_str().replace("so its WKT1 definition is used", "so EPSG:27700 is used");
     let bng = crate::raster::wkt::tests::bng_wkt1();
     for wkt1 in [Some(bng.clone()), Some(bng.replace(&format!(",{BNG_SHIFT}"), "")), None] {
         let (r, used) = read(GpkgSrs { definition: wkt1, ..row(Some(27700), "", "PROJCRS[") });
@@ -307,7 +307,7 @@ fn a_geopackage_rows_unread_bound_definition_is_said_beside_its_code() {
         definition_12_063: wkt2.map(Into::into),
     };
     let read = |row: GpkgSrs| {
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         let read = gpkg_reproject(100001, Some(row), &mut notes).unwrap();
         (read, notes)
     };
@@ -321,7 +321,7 @@ fn a_geopackage_rows_unread_bound_definition_is_said_beside_its_code() {
         let (r, notes) = read(row(None, definition, wkt2));
         assert_eq!(r.crs, Crs::LonLat);
         assert_eq!(
-            notes,
+            notes.texts().collect::<Vec<_>>(),
             [
                 "its coordinate system (srs_id 100001) can't be read (the shift from NAD27 to WGS 84 isn't known); read as longitude/latitude"
             ]
@@ -398,13 +398,13 @@ fn geopackage_provenance_excludes_temporary_copies() {
     let upload = gpkg::GpkgUpload::new(&bytes).unwrap();
     assert!(upload.unsupported_table_counts().unwrap().is_empty());
     let source = upload.open(None).unwrap();
-    assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
+    assert!(!source.read(&Request { extent: None, limit: 1, own: None }).unwrap().features.is_empty());
     assert_eq!(captured.inputs().len(), 1);
     assert_eq!(captured.inputs()[0].path, path.display().to_string());
     assert!(captured.inputs()[0].sha256.is_some());
     drop(captured);
     let captured = crate::provenance::Capture::start();
-    assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
+    assert!(!source.read(&Request { extent: None, limit: 1, own: None }).unwrap().features.is_empty());
     let mut count = 0;
     source
         .visit_chunks(None, 1 << 20, &mut |features| {
@@ -425,13 +425,13 @@ fn geopackage_provenance_skips_a_replaced_path() {
     write_gpkg(&path, true);
     let source = open_path(&path, None).unwrap();
     let captured = crate::provenance::Capture::start();
-    source.read(&Request { extent: None, limit: 1 }).unwrap();
+    source.read(&Request { extent: None, limit: 1, own: None }).unwrap();
     assert!(captured.inputs().iter().any(|i| i.path == path.display().to_string()));
     drop(captured);
     std::fs::rename(&path, folder.path().join("retained.gpkg")).unwrap();
     std::fs::write(&path, b"replacement").unwrap();
     let captured = crate::provenance::Capture::start();
-    assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
+    assert!(!source.read(&Request { extent: None, limit: 1, own: None }).unwrap().features.is_empty());
     assert!(captured.inputs().is_empty());
 }
 
@@ -450,7 +450,7 @@ fn geopackage_provenance_keeps_a_linked_path() {
     let inputs = |path: &Path| {
         let source = open_path(path, None).unwrap();
         let captured = crate::provenance::Capture::start();
-        assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
+        assert!(!source.read(&Request { extent: None, limit: 1, own: None }).unwrap().features.is_empty());
         captured.inputs().into_iter().map(|i| i.path).collect::<Vec<String>>()
     };
     let resolved = std::fs::canonicalize(&target).unwrap();
@@ -482,7 +482,7 @@ fn a_conversion_names_its_original_as_it_was_when_opened() {
     let source = super::fgb::FgbSource::open_converted_path(&converted, "grid", &original, None).unwrap();
     let inputs = || {
         let captured = Capture::start();
-        assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
+        assert!(!source.read(&Request { extent: None, limit: 1, own: None }).unwrap().features.is_empty());
         captured.inputs()
     };
     let before = inputs();
@@ -498,7 +498,7 @@ fn a_conversion_names_its_original_as_it_was_when_opened() {
     let source = super::parquet::ParquetSource::open_converted_path(&parquet, "grid", Some(&db), None).unwrap();
     let inputs = || {
         let captured = Capture::start();
-        assert!(!source.read(&Request { extent: None, limit: 1 }).unwrap().features.is_empty());
+        assert!(!source.read(&Request { extent: None, limit: 1, own: None }).unwrap().features.is_empty());
         captured.inputs()
     };
     let before: Vec<Fingerprint> = inputs();
@@ -670,13 +670,14 @@ fn check(src: &dyn FeatureSource, expect_indexed: bool) {
     assert!((c.x - (-138.0)).abs() < 1e-4 && (c.y - (-44.0)).abs() < 1e-4, "{c:?} in {}", info.format);
     assert_eq!(f.attrs[vi], Value::Int(64));
     // Ids stay put between reads.
-    let near = in_lonlat(src, src.read(&Request { extent: Some(Extent::new(-140.0, -46.0, -130.0, -40.0)), limit: 100 }).unwrap());
+    let near =
+        in_lonlat(src, src.read(&Request { extent: Some(Extent::new(-140.0, -46.0, -130.0, -40.0)), limit: 100, own: None }).unwrap());
     let g = near.features.iter().find(|g| g.attrs.contains(&Value::Text("p3_4".into()))).unwrap();
     assert_eq!(g.id, f.id, "{}", info.format);
 
     // An extent: exactly the points in it.
     let e = Extent::new(-60.0, -10.0, 40.0, 50.0);
-    let got = in_lonlat(src, src.read(&Request { extent: Some(e), limit: 10_000 }).unwrap());
+    let got = in_lonlat(src, src.read(&Request { extent: Some(e), limit: 10_000, own: None }).unwrap());
     assert_eq!(got.features.len(), in_box(&e), "{}", info.format);
     assert!(got.complete);
     assert!(got.features.iter().all(|f| f.geometry.as_ref().is_some_and(|g| e.contains(g.extent().center()))));
@@ -688,7 +689,7 @@ fn check(src: &dyn FeatureSource, expect_indexed: bool) {
     }
 
     // A limit: a sample spread over the whole extent, not the first rows.
-    let s = in_lonlat(src, src.read(&Request { extent: None, limit: 60 }).unwrap());
+    let s = in_lonlat(src, src.read(&Request { extent: None, limit: 60, own: None }).unwrap());
     assert!(!s.complete);
     assert!(s.features.len() <= 60 && s.features.len() >= 50, "{} of {}", s.features.len(), info.format);
     let xs: Vec<f64> = s.features.iter().filter_map(|f| f.geometry.as_ref()).map(|g| g.extent().min_x).collect();
@@ -696,7 +697,7 @@ fn check(src: &dyn FeatureSource, expect_indexed: bool) {
     assert!(s.matched >= 600);
 
     // An extent outside the data.
-    let none = in_lonlat(src, src.read(&Request { extent: Some(Extent::new(-179.9, 80.0, -179.0, 84.0)), limit: 100 }).unwrap());
+    let none = in_lonlat(src, src.read(&Request { extent: Some(Extent::new(-179.9, 80.0, -179.0, 84.0)), limit: 100, own: None }).unwrap());
     assert!(none.features.is_empty());
 
     // A whole read into a dataset.
@@ -1711,7 +1712,7 @@ fn hostile_files_are_errors_not_panics() {
         for name in ["x.parquet", "x.fgb", "x.gpkg"] {
             if let Ok(s) = open_bytes(name, bytes.clone(), None) {
                 let _ = s.read(&Request::all());
-                let _ = s.read(&Request { extent: Some(Extent::new(-10.0, -10.0, 10.0, 10.0)), limit: 3 });
+                let _ = s.read(&Request { extent: Some(Extent::new(-10.0, -10.0, 10.0, 10.0)), limit: 3, own: None });
             }
         }
     }
@@ -1755,7 +1756,7 @@ fn vector_samples() {
                 e.center().y + e.height() / 8.0,
             );
             let t2 = std::time::Instant::now();
-            let b = match src.read(&Request { extent: Some(view), limit: 200_000 }) {
+            let b = match src.read(&Request { extent: Some(view), limit: 200_000, own: None }) {
                 Ok(b) => b,
                 Err(e) => {
                     println!("{} [{layer}]: {e}", p.display());
@@ -1853,7 +1854,7 @@ fn writes_geopackage_geoparquet_and_shapefile() {
     for ext in ["gpkg", "parquet"] {
         let s = open_path(&d.join(format!("parcels.{ext}")), None).unwrap();
         assert_eq!(s.info().count, Some(3), "{ext}");
-        let b = s.read(&Request { extent: Some(Extent::new(15.0, 15.0, 25.0, 25.0)), limit: 100 }).unwrap();
+        let b = s.read(&Request { extent: Some(Extent::new(15.0, 15.0, 25.0, 25.0)), limit: 100, own: None }).unwrap();
         assert_eq!(b.features.len(), 1, "{ext}");
         if ext == "gpkg" {
             assert_eq!(b.features[0].id, 2);
@@ -1908,7 +1909,7 @@ fn geoparquet_exports_keep_exact_values_and_remote_extent_reads() {
     // Null rows must not consume a sample slot, whether the group is partly or wholly inside.
     for (extent, matched) in [(Extent::new(-90.0, 36.0, -89.0, 37.0), 1), (Extent::new(-180.0, -90.0, 180.0, 90.0), 2)] {
         for limit in [1, 10] {
-            let req = Request { extent: Some(extent), limit };
+            let req = Request { extent: Some(extent), limit, own: None };
             let remote = source.read(&req).unwrap();
             let local_batch = local.read(&req).unwrap();
             assert_eq!(remote.features.len(), matched.min(limit));
@@ -1959,7 +1960,7 @@ fn geoparquet_inferred_covering_nulls_fall_back_to_geometry() {
     let remote = open_driven(url);
     for extent in [Extent::new(-90.0, 36.0, -89.0, 37.0), Extent::new(-180.0, -90.0, 180.0, 90.0)] {
         for limit in [1, 10] {
-            let req = Request { extent: Some(extent), limit };
+            let req = Request { extent: Some(extent), limit, own: None };
             let expected = local.read(&req).unwrap();
             assert_eq!(expected.features.len(), 1);
             assert_eq!((expected.matched, expected.complete, expected.skipped), (1, true, 0));
@@ -2145,7 +2146,7 @@ fn writes_points_lines_kmz_and_zipped_shapefiles() {
     // And the export says so, as the file has it; names kept (an id or geometry column moves
     // aside for a field) say nothing.
     assert_eq!(
-        crate::io::geopackage_names_note(&cased.fields, "c.gpkg").as_deref(),
+        crate::io::geopackage_names_note(&cased.fields, "c.gpkg").as_ref().map(crate::loss::Note::as_str),
         Some("c.gpkg: 1 field name was changed to fit a GeoPackage (unique ignoring case): 'a' → 'a_1'")
     );
     let kept: Vec<Field> = ["fid", "geom", "a"].iter().map(|n| Field::new(*n, FieldType::Integer)).collect();
@@ -2153,7 +2154,7 @@ fn writes_points_lines_kmz_and_zipped_shapefiles() {
     // A long name shows its start and the ending that makes it unique.
     let long: Vec<Field> =
         ["Ab", "ab", "Bb", "bb"].iter().map(|n| Field::new(format!("{n}{}", "x".repeat(50)), FieldType::Integer)).collect();
-    let note = crate::io::geopackage_names_note(&long, "l.gpkg").unwrap();
+    let note = crate::io::geopackage_names_note(&long, "l.gpkg").unwrap().text;
     let x = |n| "x".repeat(n);
     assert!(
         note.ends_with(&format!(
@@ -2171,7 +2172,7 @@ fn writes_points_lines_kmz_and_zipped_shapefiles() {
     );
     // So does one that fits until it is made unique.
     let edge: Vec<Field> = ["A".repeat(40), "a".repeat(40)].iter().map(|n| Field::new(n, FieldType::Integer)).collect();
-    let note = crate::io::geopackage_names_note(&edge, "e.gpkg").unwrap();
+    let note = crate::io::geopackage_names_note(&edge, "e.gpkg").unwrap().text;
     assert!(note.ends_with(&format!("'{}' → '{}…{}_1'", "a".repeat(40), "a".repeat(20), "a".repeat(18))), "{note}");
     // An empty layer writes too.
     let empty = Dataset::new("e", GeometryType::Point, vec![]);
@@ -2320,7 +2321,7 @@ fn flatgeobuf_and_geoparquet_by_address() {
         let src = open_driven(&url);
         assert_eq!(src.info().count, Some(160_000), "{name}");
         let e = Extent::new(10.0, 10.0, 12.0, 12.0);
-        let req = Request { extent: Some(e), limit: 10_000 };
+        let req = Request { extent: Some(e), limit: 10_000, own: None };
         let got = src.read(&req).unwrap();
         let local = open_bytes(name, bytes, None).unwrap().read(&req).unwrap();
         let ids = |b: &Batch| b.features.iter().map(|f| f.id).collect::<std::collections::BTreeSet<_>>();
@@ -2332,7 +2333,7 @@ fn flatgeobuf_and_geoparquet_by_address() {
         let fetched = sent.load(std::sync::atomic::Ordering::Relaxed);
         assert!(fetched < total / 4, "{name}: fetched {fetched} of {total} bytes");
         // A sample of the whole file, spread over it.
-        let s = src.read(&Request { extent: None, limit: 500 }).unwrap();
+        let s = src.read(&Request { extent: None, limit: 500, own: None }).unwrap();
         assert!(!s.complete && s.features.len() <= 500 && s.features.len() >= 250, "{name}: {}", s.features.len());
     }
 
@@ -2479,8 +2480,16 @@ fn shapefile_text_keeps_its_leading_spaces_and_counts_null_markers() {
     assert_eq!(values, [Value::Text(" 2535".into()), Value::Null, Value::Text("plain".into()), Value::Null]);
     assert_eq!(inplace.features, whole.features);
     let said = "codes: 2 values written as Null were read as empty, in 'code'";
-    assert!(whole_report.messages.iter().any(|m| m == said), "{:?}", whole_report.messages);
-    assert!(report.messages.iter().any(|m| m == said), "{:?}", report.messages);
+    assert!(
+        whole_report.messages.iter().any(|m| m.as_str() == said && m.loss == Some(crate::loss::LossCode::AssumedNullMarker)),
+        "{:?}",
+        whole_report.messages
+    );
+    assert!(
+        report.messages.iter().any(|m| m.as_str() == said && m.loss == Some(crate::loss::LossCode::AssumedNullMarker)),
+        "{:?}",
+        report.messages
+    );
 
     // Text without the marker says nothing.
     let mut clean = Dataset::new("clean", GeometryType::Point, vec![Field::new("code", FieldType::Text)]);
@@ -2490,6 +2499,54 @@ fn shapefile_text_keeps_its_leading_spaces_and_counts_null_markers() {
     let (_, whole_report) = crate::io::read_path(&p).unwrap();
     let (_, report) = materialize(open_path(&p, None).unwrap().as_ref()).unwrap();
     assert!(whole_report.messages.iter().chain(&report.messages).all(|m| !m.contains("written as Null")), "{:?}", report.messages);
+}
+
+/// A `.dbf` number that isn't finite (nan or inf) is read as empty in place as it is whole, and
+/// said as `dropped.value` both ways; a blank one isn't counted.
+#[test]
+fn shapefile_in_place_says_numbers_that_arent_finite() {
+    let d = dir().join("shp-nonfinite");
+    std::fs::create_dir_all(&d).unwrap();
+    let mut ds = Dataset::new("depths", GeometryType::Point, vec![Field::new("depth", FieldType::Double)]);
+    for (i, v) in [Value::Float(1_234_567.0), Value::Float(2.5), Value::Null].into_iter().enumerate() {
+        ds.push(Some(Geometry::Point(Coord::new(i as f64, 0.0))), vec![v]);
+    }
+    let p = d.join("depths.shp");
+    write_shapefile(&ds, &p);
+    let dbf = p.with_extension("dbf");
+    let mut bytes = std::fs::read(&dbf).unwrap();
+    // The whole number as written (`1234567.000…`), replaced by `nan` in the same width.
+    let at = bytes.windows(7).position(|w| w == b"1234567").unwrap();
+    let end = at + bytes[at..].iter().position(|c| *c == b' ' || *c == 0x1A).unwrap_or(bytes.len() - at);
+    bytes[at..end].fill(b' ');
+    bytes[end - 3..end].copy_from_slice(b"nan");
+    std::fs::write(&dbf, bytes).unwrap();
+    let (whole, whole_report) = crate::io::read_path(&p).unwrap();
+    let (inplace, report) = materialize(open_path(&p, None).unwrap().as_ref()).unwrap();
+    let values: Vec<&Value> = whole.features.iter().map(|f| &f.attrs[0]).collect();
+    assert_eq!(values.iter().filter(|v| ***v == Value::Null).count(), 2, "{values:?}");
+    assert!(values.contains(&&Value::Float(2.5)), "{values:?}");
+    assert_eq!(inplace.features, whole.features);
+    let said = "1 number isn't finite (nan or inf) and was read as empty, in 'depth'";
+    for messages in [&whole_report.messages, &report.messages] {
+        let notes: Vec<_> = messages.iter().filter(|m| m.contains("finite")).collect();
+        assert_eq!(notes.len(), 1, "{messages:?}");
+        assert!(notes[0].as_str().ends_with(said), "{messages:?}");
+        assert_eq!(notes[0].loss, Some(crate::loss::LossCode::DroppedValue));
+    }
+    // A read of a sample (here the first and third records) counts only what it read, and says so.
+    let some = open_path(&p, None).unwrap().read(&Request { limit: 2, ..Request::all() }).unwrap();
+    assert!(!some.complete);
+    let sampled: Vec<_> = some.notes.iter().filter(|m| m.contains("finite")).collect();
+    assert_eq!(sampled.len(), 1, "{:?}", some.notes);
+    assert_eq!(sampled[0].as_str(), format!("in the records read (a sample of the layer, which may hold more), {said}"));
+    assert_eq!(sampled[0].loss, Some(crate::loss::LossCode::DroppedValue));
+    // Finite numbers and a blank one say nothing, in place or whole.
+    let p = d.join("clean.shp");
+    write_shapefile(&ds, &p);
+    let (_, whole_report) = crate::io::read_path(&p).unwrap();
+    let (_, report) = materialize(open_path(&p, None).unwrap().as_ref()).unwrap();
+    assert!(whole_report.messages.iter().chain(&report.messages).all(|m| !m.contains("finite")), "{:?}", report.messages);
 }
 
 #[test]
@@ -2508,14 +2565,31 @@ fn shapefile_in_place_reprojects_from_its_prj() {
     assert!((e.min_x - 2.335).abs() < 1e-6 && (e.min_y - 48.855).abs() < 1e-6, "{e:?}");
     assert!(src.info().notes.is_empty(), "{:?}", src.info().notes);
     // A longitude/latitude extent finds it; one beside it doesn't.
-    let near = in_lonlat(src.as_ref(), src.read(&Request { extent: Some(Extent::new(2.0, 48.5, 2.5, 49.0)), limit: 10 }).unwrap());
+    let near =
+        in_lonlat(src.as_ref(), src.read(&Request { extent: Some(Extent::new(2.0, 48.5, 2.5, 49.0)), limit: 10, own: None }).unwrap());
     let c = near.features.first().and_then(|f| f.geometry.as_ref()).and_then(Geometry::label_point).unwrap();
     assert!((c.x - 2.335).abs() < 1e-6 && (c.y - 48.855).abs() < 1e-6, "{c:?}");
-    assert!(src.read(&Request { extent: Some(Extent::new(3.0, 48.5, 3.5, 49.0)), limit: 10 }).unwrap().features.is_empty());
+    assert!(src.read(&Request { extent: Some(Extent::new(3.0, 48.5, 3.5, 49.0)), limit: 10, own: None }).unwrap().features.is_empty());
     // Without the .prj the coordinates are taken as they are, and that's said.
     std::fs::remove_file(p.with_extension("prj")).unwrap();
     let src = open_path(&p, None).unwrap();
-    assert!(src.info().notes.iter().any(|n| n.contains("not longitude/latitude")), "{:?}", src.info().notes);
+    let said: Vec<_> = src.info().notes.iter().filter(|n| n.contains("not longitude/latitude")).collect();
+    assert_eq!(said.len(), 1, "{:?}", src.info().notes);
+    assert_eq!(said[0].loss, Some(crate::loss::LossCode::AssumedCrs), "assumed without a .prj");
+    let (_, whole) = crate::io::read_path(&p).unwrap();
+    let said: Vec<_> = whole.messages.iter().filter(|n| n.contains("not longitude/latitude")).collect();
+    assert_eq!((said.len(), said.first().and_then(|n| n.loss)), (1, Some(crate::loss::LossCode::AssumedCrs)), "{:?}", whole.messages);
+    // A .prj that says WGS 84 gives the system, so nothing is assumed: the same note, uncoded,
+    // as a whole read says it.
+    let wgs84 = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
+    std::fs::write(p.with_extension("prj"), wgs84).unwrap();
+    let src = open_path(&p, None).unwrap();
+    let said: Vec<_> = src.info().notes.iter().filter(|n| n.contains("not longitude/latitude")).collect();
+    assert_eq!(said.len(), 1, "{:?}", src.info().notes);
+    assert_eq!(said[0].loss, None, "declared in the .prj");
+    let (_, whole) = crate::io::read_path(&p).unwrap();
+    let said: Vec<_> = whole.messages.iter().filter(|n| n.contains("not longitude/latitude")).collect();
+    assert_eq!((said.len(), said.first().and_then(|n| n.loss)), (1, None), "{:?}", whole.messages);
 }
 
 #[test]
@@ -2530,7 +2604,7 @@ fn damaged_shapefiles_are_errors_or_skips_not_panics() {
         let read = || {
             if let Ok(s) = open_path(p, None) {
                 let _ = s.read(&Request::all());
-                let _ = s.read(&Request { extent: Some(Extent::new(-10.0, -10.0, 10.0, 10.0)), limit: 1 });
+                let _ = s.read(&Request { extent: Some(Extent::new(-10.0, -10.0, 10.0, 10.0)), limit: 1, own: None });
             }
         };
         #[cfg(not(target_arch = "wasm32"))]
@@ -2673,7 +2747,7 @@ fn geojson_in_place_rejects_partial_collections_with_a_notice() {
         let src = geojson::GeoJsonSource::open_with(&p, "x", in_memory).unwrap();
         assert_eq!(src.info().count, Some(1));
         assert_eq!(src.skipped_at_open(), 1);
-        assert_eq!(src.info().notes, ["1 features had unreadable geometry"]);
+        assert_eq!(src.info().notes.texts().collect::<Vec<_>>(), ["1 features had unreadable geometry"]);
         let (ds, streamed_report) = materialize(&src).unwrap();
         assert_eq!(ds.features, whole.features);
         assert_eq!(streamed_report.skipped, report.skipped);
@@ -2710,7 +2784,7 @@ fn geojson_in_place_matches_one_read_whole() {
         assert_eq!(inplace.features, whole.features, "{file}");
         assert_eq!(report.messages.len(), whole_report.messages.len(), "{file}: {:?}", report.messages);
         // Extent reads skip features without geometry, and find each by its box.
-        let b = src.read(&Request { extent: Some(Extent::new(0.5, 0.5, 1.5, 2.5)), limit: 100 }).unwrap();
+        let b = src.read(&Request { extent: Some(Extent::new(0.5, 0.5, 1.5, 2.5)), limit: 100, own: None }).unwrap();
         assert!(b.features.iter().all(|f| f.geometry.is_some()), "{file}");
     }
     // Not a FeatureCollection, or not GeoJSON: not read in place.
@@ -2769,8 +2843,8 @@ fn geojson_paths(file: &str, text: &str) -> (Dataset, Vec<String>, String) {
     }
     let src = geojson::GeoJsonSource::open_with(&p, "x", crate::io::BYTES_FLOOR).unwrap();
     // In longitude/latitude, for the tests to say where its features are: it holds them in its
-    // declared system, as the file does.
-    (whole.in_lonlat().unwrap().into_owned(), report.messages.texts().map(str::to_string).collect(), src.info().crs.clone())
+    // declared system, as the file does. One with no place there is without geometry in this copy.
+    (whole.in_lonlat_leaving_out().unwrap().0.into_owned(), report.messages.texts().map(str::to_string).collect(), src.info().crs.clone())
 }
 
 fn in_arnhem(e: &Extent) -> bool {
@@ -2800,7 +2874,7 @@ fn geojson_legacy_crs_is_honoured_by_both_paths() {
     let p = dir().join("geojson-crs").join("rd.geojson");
     for in_memory in [crate::io::BYTES_FLOOR, 0] {
         let src = geojson::GeoJsonSource::open_with(&p, "x", in_memory).unwrap();
-        let at = |e: Extent| src.read(&Request { extent: Some(e), limit: 100 }).unwrap().features.len();
+        let at = |e: Extent| src.read(&Request { extent: Some(e), limit: 100, own: None }).unwrap().features.len();
         assert_eq!(at(Extent::new(5.85, 51.95, 5.86, 51.96)), 1, "the polygon only");
         assert_eq!(at(Extent::new(5.95, 52.02, 5.96, 52.03)), 1, "the polygon only");
         assert_eq!(at(Extent::new(5.8, 51.9, 6.0, 52.1)), 2);
@@ -2931,8 +3005,9 @@ fn geojson_crs_is_read_only_from_the_feature_collection() {
 #[test]
 fn geojson_features_that_cant_be_converted_are_skipped_and_counted() {
     // A coordinate the declared system can't convert (UTM 1e9 m east), or converts to beyond
-    // longitude/latitude (Web Mercator 1e9 m east is longitude 8983°): the feature is dropped, and
-    // its height with it (no Z notice for the 2D features kept).
+    // longitude/latitude (Web Mercator 1e9 m east is longitude 8983°): the feature is kept as the
+    // file holds it, said, and doesn't draw; nothing was lost, so a projection can still be
+    // defined (#2032 C2f-4b).
     for (crs, good, bad) in [("EPSG:32617", "[500000,4649776]", "[1e9,0,30]"), ("EPSG:3857", "[1000000,6000000]", "[1e9,0,30]")] {
         let text = format!(
             r#"{{"type":"FeatureCollection","crs":{},"features":[
@@ -2942,13 +3017,17 @@ fn geojson_features_that_cant_be_converted_are_skipped_and_counted() {
             named(crs)
         );
         let (ds, messages, info_crs) = geojson_paths("far.geojson", &text);
-        assert_eq!(ds.features.len(), 2, "{crs}");
-        assert_eq!(ds.features.iter().map(|f| f.id).collect::<Vec<_>>(), [1, 3], "{crs}: ids are the features' places in the file");
-        assert_eq!(messages.len(), 1, "{crs}: {messages:?}");
-        assert!(messages[0].contains(&format!("1 features couldn't be converted from {crs}")), "{}", messages[0]);
+        assert_eq!(ds.features.iter().map(|f| f.id).collect::<Vec<_>>(), [1, 2, 3], "{crs}: ids are the features' places in the file");
+        // UTM can't convert it; Web Mercator converts it to beyond longitude/latitude, where it
+        // draws out of place, and says that.
+        let expected = if crs == "EPSG:32617" {
+            format!("one of the features has a place in {crs} that can't be given in longitude/latitude: it is kept as the file holds it")
+        } else {
+            format!("coordinates that come out beyond longitude/latitude once converted from {crs}")
+        };
+        assert!(messages.iter().any(|m| m.contains(&expected)), "{crs}: {messages:?}");
         assert_eq!(info_crs, crs);
-        assert!(ds.crs_incomplete, "{crs}: a projection can't be defined again over lost features");
-        assert!(!ds.zm_dropped, "{crs}");
+        assert!(!ds.crs_incomplete, "{crs}: nothing was lost");
         let Some(Geometry::Point(c)) = ds.features.first().and_then(|f| f.geometry.clone()) else { panic!("a point") };
         assert!(c.x.abs() < 180.0 && c.y.abs() < 90.0, "{crs}: {c:?}");
         if crs == "EPSG:32617" {
@@ -2967,36 +3046,66 @@ fn merc_collection(features: &[&str]) -> String {
 }
 
 #[test]
-fn geojson_dropped_features_do_not_set_the_geometry_type() {
-    // Two points that can't be placed and one polygon that can: a polygon layer, as read whole.
+fn geojson_kept_unplaced_features_set_the_geometry_type() {
+    // Features kept with no place in longitude/latitude are the file's: they count toward its
+    // geometry type, the same both ways.
     let (ds, _, _) = geojson_paths("kinds.geojson", &merc_collection(&[MERC_BAD, MERC_POLY, MERC_BAD]));
-    assert_eq!(ds.geometry_type, GeometryType::Polygon);
-    assert_eq!(ds.features.len(), 1);
-    // Nothing that can be placed: no geometry type at all, both ways.
+    assert_eq!(ds.geometry_type, GeometryType::Point);
+    assert_eq!(ds.features.len(), 3);
+    // Nothing in its place: kept, said as coordinates its system puts beyond longitude/latitude,
+    // and a projection can still be defined.
     let (ds, messages, _) = geojson_paths("none.geojson", &merc_collection(&[MERC_BAD, MERC_BAD]));
-    assert_eq!(ds.geometry_type, GeometryType::None);
-    assert!(ds.features.is_empty() && ds.crs_incomplete);
+    assert_eq!(ds.geometry_type, GeometryType::Point);
+    assert!(ds.features.len() == 2 && !ds.crs_incomplete);
     assert_eq!(messages.len(), 1, "{messages:?}");
+    assert!(messages[0].contains("coordinates that come out beyond longitude/latitude once converted from EPSG:3857"), "{}", messages[0]);
 }
 
 #[test]
-fn geojson_sampling_skips_dropped_features() {
-    // Unplaceable features at every other place must not use up the sample: a read asking for
-    // two of the three placeable ones gets two, and says it matched three.
+fn geojson_reads_in_longitude_latitude_leave_out_unplaced_features() {
+    // Unplaceable features at every other place are in a whole read; a read of a box in
+    // longitude/latitude leaves them out, as they meet none.
     let text = merc_collection(&[MERC_BAD, MERC_OK, MERC_BAD, MERC_OK, MERC_BAD, MERC_OK]);
     let p = dir().join("geojson-crs").join("alternating.geojson");
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(&p, &text).unwrap();
     for in_memory in [crate::io::BYTES_FLOOR, 0] {
         let src = geojson::GeoJsonSource::open_with(&p, "x", in_memory).unwrap();
-        assert_eq!(src.info().count, Some(3));
-        let all = src.read(&Request { extent: None, limit: 100 }).unwrap();
-        assert_eq!((all.features.len(), all.matched, all.skipped, all.complete), (3, 3, 0, true));
-        let some = src.read(&Request { extent: None, limit: 2 }).unwrap();
-        assert_eq!((some.features.len(), some.matched, some.skipped, some.complete), (2, 3, 0, false));
-        assert!(some.features.iter().all(|f| f.geometry.is_some()));
-        let ids: Vec<u64> = all.features.iter().map(|f| f.id).collect();
+        assert_eq!(src.info().count, Some(6));
+        let all = src.read(&Request { extent: None, limit: 100, own: None }).unwrap();
+        assert_eq!((all.features.len(), all.matched, all.skipped, all.complete), (6, 6, 0, true));
+        // Around the placeable ones (about 9°E, 47°N): those alone, and a sample of two of them
+        // says it matched three.
+        let around = Some(Extent { min_x: 8.0, min_y: 46.0, max_x: 10.0, max_y: 48.0 });
+        let near = src.read(&Request { extent: around, limit: 100, own: None }).unwrap();
+        assert_eq!((near.features.len(), near.matched, near.skipped, near.complete), (3, 3, 0, true));
+        let ids: Vec<u64> = near.features.iter().map(|f| f.id).collect();
         assert_eq!(ids, [2, 4, 6]);
+        let some = src.read(&Request { extent: around, limit: 2, own: None }).unwrap();
+        assert_eq!((some.features.len(), some.matched, some.skipped, some.complete), (2, 3, 0, false));
+    }
+}
+
+#[test]
+fn geojson_a_kept_unplaced_feature_does_not_use_up_a_sample() {
+    // A line with no place in longitude/latitude whose own box meets the view, ahead of a point
+    // in it: a read of one feature there gets the point, and counts one match (#2032 C2f-4b).
+    let text = format!(
+        r#"{{"type":"FeatureCollection","crs":{},"features":[
+        {{"type":"Feature","properties":{{}},"geometry":{{"type":"LineString","coordinates":[[451500,5411500],[1e9,5411500]]}}}},
+        {{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[451500,5411500]}}}}]}}"#,
+        named("EPSG:32631")
+    );
+    let p = dir().join("geojson-crs").join("ahead.geojson");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, &text).unwrap();
+    let paris = Some(Extent { min_x: 2.0, min_y: 48.5, max_x: 2.7, max_y: 49.2 });
+    for in_memory in [crate::io::BYTES_FLOOR, 0] {
+        let src = geojson::GeoJsonSource::open_with(&p, "x", in_memory).unwrap();
+        let one = src.read(&Request { extent: paris, limit: 1, own: None }).unwrap();
+        assert_eq!((one.features.len(), one.matched), (1, 1));
+        assert!(matches!(one.features[0].geometry, Some(Geometry::Point(_))));
+        assert_eq!(src.read(&Request::all()).unwrap().features.len(), 2, "a whole read keeps both");
     }
 }
 
@@ -3227,7 +3336,7 @@ fn a_csv_export_takes_x_and_y_in_a_system_asked_for() {
     };
     assert!((pt(&back_lonlat).x - pt(&ds_lonlat).x).abs() < 1e-9 && (pt(&back_lonlat).y - pt(&ds_lonlat).y).abs() < 1e-9);
     // The file can't say its system, so that is said.
-    let note = crate::io::csv_system_note("pts.csv", ds.geometry_type, lv95).unwrap();
+    let note = crate::io::csv_system_note("pts.csv", ds.geometry_type, lv95).unwrap().text;
     assert!(note.contains("EPSG:2056") && note.contains("can't say"), "{note}");
     assert_eq!(crate::io::csv_system_note("pts.gpkg", ds.geometry_type, lv95), None);
     // Fields named x and y push the columns to easting and northing; every name taken is said.
@@ -3332,7 +3441,8 @@ fn nested_columns_and_vectors_by_address() {
     let e = Extent::new(10.0, 10.0, 40.0, 30.0);
     // The rows in the extent, with the nested column as a field.
     let (fields, batch) =
-        query_url_blocking(url, vec!["assets.data.href".into(), "no.such".into()], Request { extent: Some(e), limit: 1000 }).unwrap();
+        query_url_blocking(url, vec!["assets.data.href".into(), "no.such".into()], Request { extent: Some(e), limit: 1000, own: None })
+            .unwrap();
     let k = fields.iter().position(|f| f.name == "assets.data.href").unwrap();
     assert!(!fields.iter().any(|f| f.name == "no.such"));
     assert_eq!(batch.features.len(), in_box(&e));
@@ -3427,7 +3537,7 @@ fn shapefile_complete_chunks_keep_all_rows_order_attributes_and_budget() {
     let empty = shp::ShpSource::open_path(&empty_path, "empty").unwrap();
     assert!(empty.visit_chunks(None, 0, &mut |_| panic!("zero budget must not emit")).is_err());
     let extent = Some(Extent::new(0.02, 0.0, 0.1, 2.0));
-    let expected = source.read(&Request { extent, limit: 1000 }).unwrap();
+    let expected = source.read(&Request { extent, limit: 1000, own: None }).unwrap();
     let mut rows = Vec::new();
     source
         .visit_chunks(extent, 256, &mut |chunk| {
@@ -3474,7 +3584,7 @@ fn geopackage_keeps_rows_without_geometry() {
         let (rows, summary, _) = visit_all(src.as_ref(), None, 1024);
         assert_eq!((rows, summary.matched, summary.skipped), (whole.features, 602, 4), "{format}");
         let world = Extent::new(-180.0, -85.0, 180.0, 85.0);
-        let part = src.read(&Request { extent: Some(world), limit: 10_000 }).unwrap();
+        let part = src.read(&Request { extent: Some(world), limit: 10_000, own: None }).unwrap();
         assert_eq!(part.features.len(), 600, "{format}");
         assert_eq!(visit_all(src.as_ref(), Some(world), 1024).0.len(), 600, "{format}");
     }
@@ -3541,7 +3651,7 @@ fn geopackage_flatgeobuf_and_geoparquet_visit_what_a_whole_read_gives() {
         // Each row alone when none fits the budget.
         assert_eq!(visit_all(src.as_ref(), None, 1).0, whole.features, "{format}");
         // An extent: the features a complete read of it gives (the R-tree's order may differ).
-        let part = src.read(&Request { extent: Some(extent), limit: 10_000 }).unwrap();
+        let part = src.read(&Request { extent: Some(extent), limit: 10_000, own: None }).unwrap();
         assert!(part.complete && part.features.len() == in_box(&extent), "{format}");
         let (rows, summary, _) = visit_all(src.as_ref(), Some(extent), 1024);
         assert!(summary.complete && summary.features.is_empty() && summary.matched == rows.len() as u64, "{format}");
@@ -3561,7 +3671,7 @@ fn geopackage_flatgeobuf_and_geoparquet_visit_what_a_whole_read_gives() {
         assert!(src.visit_chunks(None, 0, &mut |_| panic!("a zero budget must not emit")).is_err(), "{format}");
         // The map's reads of the layer go on while a traversal waits on its visitor.
         src.visit_chunks(None, 256, &mut |_| {
-            assert_eq!(src.read(&Request { extent: None, limit: 1 }).unwrap().features.len(), 1, "{format}");
+            assert_eq!(src.read(&Request { extent: None, limit: 1, own: None }).unwrap().features.len(), 1, "{format}");
             Ok(())
         })
         .unwrap();
@@ -3707,12 +3817,12 @@ fn geoparquet_columns_not_kept_or_read_as_numbers_are_said() {
     // Read in place: the source's notes, which adding the layer gives as notices.
     let src = open_path(&path, None).unwrap();
     let info = src.info();
-    assert_eq!(info.notes, vec![left_out.to_string()]);
+    assert_eq!(info.notes.texts().collect::<Vec<_>>(), vec![left_out.to_string()]);
     let names: Vec<&str> = info.fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["name", "seen", "logged", "day"]);
     // Read whole: the same, in the read's report, and the values as said.
     let (ds, report) = materialize(src.as_ref()).unwrap();
-    assert_eq!(report.messages, vec![format!("columns: {left_out}")]);
+    assert_eq!(report.messages.texts().collect::<Vec<_>>(), vec![format!("columns: {left_out}")]);
     assert_eq!(
         ds.features[0].attrs,
         vec![
@@ -3754,11 +3864,11 @@ fn flatgeobuf_binary_columns_are_said_and_left_out() {
 
     let note = "1 column of a type RustGIS has no field for was left out: blob (binary)";
     let src = open_path(&path, None).unwrap();
-    assert_eq!(src.info().notes, vec![note.to_string()]);
+    assert_eq!(src.info().notes.texts().collect::<Vec<_>>(), vec![note.to_string()]);
     let names: Vec<&str> = src.info().fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(names, ["name", "value"]);
     let (ds, report) = materialize(src.as_ref()).unwrap();
-    assert_eq!(report.messages, vec![format!("blobs: {note}")]);
+    assert_eq!(report.messages.texts().collect::<Vec<_>>(), vec![format!("blobs: {note}")]);
     assert_eq!(ds.features[0].attrs, vec![Value::Text("a".into()), Value::Int(42)]);
 
     let clean = d.path().join("clean.fgb");
@@ -3772,6 +3882,98 @@ fn gpkg_tables(path: &Path) -> Vec<String> {
     let c = rusqlite::Connection::open(path).unwrap();
     let mut st = c.prepare("SELECT table_name FROM gpkg_contents ORDER BY table_name").unwrap();
     st.query_map([], |r| r.get(0)).unwrap().collect::<std::result::Result<_, _>>().unwrap()
+}
+
+/// A table's count is the one GDAL keeps in `gpkg_ogr_contents`, when it keeps one with the
+/// triggers that keep it up to date, so a large table isn't scanned to count it (#2849); else its
+/// rows are counted, as before. A table with Z or M on every geometry is still scanned, as that
+/// scan also counts its geometries.
+#[test]
+fn geopackage_count_is_the_one_gdal_keeps_when_it_keeps_one() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut parcels = Dataset::new("parcels", GeometryType::Point, vec![Field::new("apn", FieldType::Text)]);
+    for i in 0..3 {
+        parcels.push(Some(Geometry::Point(Coord::new(f64::from(i), 2.0))), vec![Value::Text(format!("00{i}"))]);
+    }
+    // The table of counts and the triggers GDAL keeps it with, as GDAL writes them.
+    let kept = "DROP TABLE IF EXISTS gpkg_ogr_contents;
+                CREATE TABLE gpkg_ogr_contents (table_name TEXT NOT NULL PRIMARY KEY, feature_count INTEGER DEFAULT NULL);
+                CREATE TRIGGER \"trigger_insert_feature_count_parcels\" AFTER INSERT ON \"parcels\" BEGIN UPDATE gpkg_ogr_contents
+                  SET feature_count = feature_count + 1 WHERE lower(table_name) = lower('parcels'); END;
+                CREATE TRIGGER \"trigger_delete_feature_count_parcels\" AFTER DELETE ON \"parcels\" BEGIN UPDATE gpkg_ogr_contents
+                  SET feature_count = feature_count - 1 WHERE lower(table_name) = lower('parcels'); END;";
+    // The file's three rows, against what the table of counts says, and whether the count is kept.
+    let cases = [
+        ("kept", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', 250000);"), 250_000, true),
+        ("kept zero", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', 0);"), 0, true),
+        ("upper-case name", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('PARCELS', 7);"), 7, true),
+        // Names differing in case are two rows (the key is case-sensitive): the table's own is taken.
+        ("a row for each case", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('PARCELS', 7), ('parcels', 250000);"), 250_000, true),
+        // The table's own row says no count: it is counted, whatever another row says.
+        ("own row null", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('PARCELS', 250000), ('parcels', NULL);"), 3, false),
+        // The column's INTEGER affinity stores text digits as a number.
+        ("digits as text", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', '250000');"), 250_000, true),
+        // Without either trigger nothing kept it up to date (GDAL drops them while it writes).
+        (
+            "no insert trigger",
+            format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', 250000); DROP TRIGGER trigger_insert_feature_count_parcels;"),
+            3,
+            false,
+        ),
+        (
+            "no delete trigger",
+            format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', 250000); DROP TRIGGER trigger_delete_feature_count_parcels;"),
+            3,
+            false,
+        ),
+        (
+            "triggers on another table",
+            format!(
+                "{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', 250000);
+                 DROP TRIGGER trigger_insert_feature_count_parcels; DROP TRIGGER trigger_delete_feature_count_parcels;
+                 CREATE TABLE other (v); CREATE TRIGGER trigger_insert_feature_count_parcels AFTER INSERT ON other BEGIN SELECT 1; END;
+                 CREATE TRIGGER trigger_delete_feature_count_parcels AFTER DELETE ON other BEGIN SELECT 1; END;"
+            ),
+            3,
+            false,
+        ),
+        ("null", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', NULL);"), 3, false),
+        ("no table", "DROP TABLE IF EXISTS gpkg_ogr_contents;".to_string(), 3, false),
+        ("no row", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('roads', 9);"), 3, false),
+        ("negative", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', -5);"), 3, false),
+        ("text", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', 'many');"), 3, false),
+        ("fraction", format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', 2.5);"), 3, false),
+        (
+            "z on every geometry",
+            format!("{kept} INSERT INTO gpkg_ogr_contents VALUES ('parcels', 250000); UPDATE gpkg_geometry_columns SET z = 1;"),
+            3,
+            false,
+        ),
+    ];
+    for (case, sql, count, is_kept) in cases {
+        let path = workspace.path().join(format!("{}.gpkg", case.replace(' ', "-")));
+        crate::io::write_path(&parcels, &path).unwrap();
+        rusqlite::Connection::open(&path).unwrap().execute_batch(&sql).unwrap();
+        let src = open_path(&path, Some("parcels")).unwrap();
+        assert_eq!(src.info().count, Some(count), "{case}");
+        // A preview gets the rows there are, whatever the count says: a count past them (an
+        // `INSERT OR REPLACE` leaves it high, a file may say any number) doesn't thin it.
+        // Its progress, and a whole read's (Load All), has the rows counted as its total, or none
+        // (unknown) for a kept count.
+        let total = if is_kept { 0 } else { 3 };
+        let watched = |read: &dyn Fn() -> usize| {
+            let probe = std::sync::Arc::new(crate::progress::tests::Counted::default());
+            let _watched = crate::progress::install(Some(probe.clone()));
+            (read(), probe.total.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        let preview = || {
+            let batch = src.read(&Request { extent: None, limit: 100, own: None }).unwrap();
+            if batch.complete { batch.features.len() } else { 0 }
+        };
+        assert_eq!(watched(&preview), (3, total), "{case}: preview");
+        let whole = || materialize(src.as_ref()).unwrap().0.features.len();
+        assert_eq!(watched(&whole), (3, total), "{case}: whole read");
+    }
 }
 
 /// Text in a date-time field with digits past the microsecond is written as a read takes it: as
@@ -3816,7 +4018,8 @@ fn geopackage_dates_are_written_and_read_as_dates() {
     crate::io::write_path(&permits, &path).unwrap();
     assert_eq!(
         crate::io::utc_dates_note(&permits.fields, &crate::io::offset_dates(permits.features.iter(), &permits.fields), "permits.gpkg")
-            .as_deref(),
+            .as_ref()
+            .map(crate::loss::Note::as_str),
         Some("permits.gpkg: 1 date-time was written in UTC, as GeoPackage stores them, without their own offsets, in 'seen'")
     );
     // Milliseconds are all a DATETIME holds: finer digits are rounded, and said; none lost, none said.
@@ -3826,7 +4029,9 @@ fn geopackage_dates_are_written_and_read_as_dates() {
         fine.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Null, at(t)]);
     }
     assert_eq!(
-        crate::io::fine_dates_note(&fine.fields, &crate::io::fine_dates(fine.features.iter(), &fine.fields), "fine.gpkg").as_deref(),
+        crate::io::fine_dates_note(&fine.fields, &crate::io::fine_dates(fine.features.iter(), &fine.fields), "fine.gpkg")
+            .as_ref()
+            .map(crate::loss::Note::as_str),
         Some("fine.gpkg: 3 date-times were rounded to the millisecond, as GeoPackage stores them, in 'seen'")
     );
     let rounded = workspace.path().join("fine.gpkg");
@@ -3881,7 +4086,7 @@ fn geopackage_dates_are_written_and_read_as_dates() {
     assert_eq!(crate::io::text_in_dates(moment.features.iter(), &moment.fields), [1, 1]);
     let text = crate::io::text_in_dates(permits.features.iter(), &permits.fields);
     assert_eq!(
-        crate::io::text_in_dates_note(&permits.fields, &text, "permits.gpkg").as_deref(),
+        crate::io::text_in_dates_note(&permits.fields, &text, "permits.gpkg").as_ref().map(crate::loss::Note::as_str),
         Some("permits.gpkg: 2 values aren't dates and were written as they are, and read back empty, in 'issued', 'seen'")
     );
     // Dates by a declared type's own name, not a part of another.
@@ -3940,7 +4145,7 @@ fn geopackage_export_adds_and_replaces_tables_and_keeps_the_others() {
     let owners =
         |p: &Path| rusqlite::Connection::open(p).unwrap().query_row("SELECT count(*) FROM owners", [], |r| r.get::<_, i64>(0)).unwrap();
     assert_eq!(owners(&path), 1);
-    let read = |t: &str, extent| open_path(&path, Some(t)).unwrap().read(&Request { extent, limit: 100 }).unwrap().features;
+    let read = |t: &str, extent| open_path(&path, Some(t)).unwrap().read(&Request { extent, limit: 100, own: None }).unwrap().features;
     assert_eq!(read("permits", None).len(), 3);
     // Its spatial index answers an extent query.
     assert_eq!(read("permits", Some(Extent::new(10.5, 19.0, 11.5, 21.0))).len(), 1);
@@ -4229,6 +4434,9 @@ fn native_file_dates_preserve_zone_policy_and_fractional_seconds() {
     assert_eq!(back.features[0].attrs[2].to_string(), "2026-03-05T12:30:00.123456Z");
     assert_eq!(back.features[1].attrs[3], Value::Text("2026-01-01T00:00:00Z".into()));
     let note = parquet::values_note(&ds, "out.parquet").unwrap();
+    // No value is unfit, but the offsets left out are lost.
+    assert_eq!(note.loss, Some(crate::loss::LossCode::DroppedValue));
+    let note = note.text;
     assert!(note.contains("2 date-times were written in UTC") && note.contains("2 date-times were written as ISO text"), "{note}");
     // A replayable source feed chooses the same schema as an in-memory export.
     let input = fgb::write(&ds).unwrap();
@@ -4239,17 +4447,17 @@ fn native_file_dates_preserve_zone_policy_and_fractional_seconds() {
     assert_eq!(summary.written, 2);
     // Without a label of their own: the export adds its path once.
     assert_eq!(
-        summary.date_messages,
+        summary.date_messages.iter().map(|n| (n.text.as_str(), n.loss)).collect::<Vec<_>>(),
         [
-            "2 date-times were written in UTC without their original offsets, in 'instant'",
-            "2 date-times were written as ISO text because their column mixes zoned and unzoned values, in 'mixed'"
+            ("2 date-times were written in UTC without their original offsets, in 'instant'", Some(crate::loss::LossCode::DroppedValue)),
+            ("2 date-times were written as ISO text because their column mixes zoned and unzoned values, in 'mixed'", None)
         ]
     );
     let (streamed, _) = crate::io::read_path(&path).unwrap();
     assert_eq!(streamed.fields, back.fields);
     ds.features[0].attrs[0] = Value::Text("2026-02-30".into());
     assert!(fgb::write(&ds).unwrap_err().to_string().contains("invalid date"));
-    let note = parquet::values_note(&ds, "bad.parquet").unwrap();
+    let note = parquet::values_note(&ds, "bad.parquet").unwrap().text;
     assert!(note.contains("1 value couldn't be written"));
     let (bad, _) = crate::io::read_bytes("bad.parquet", &parquet::write(&ds).unwrap()).unwrap();
     assert!(bad.features[0].attrs[0].is_null());
@@ -4297,7 +4505,9 @@ fn flatgeobuf_classifies_local_dates_and_preserves_remote_text() {
     assert_eq!(batch.unread_dates, [1, 1]);
     assert!(batch.features.iter().any(|f| f.attrs[2].to_string() == "12:30:00.123456789"));
     let (_, report) = materialize(local.as_ref()).unwrap();
-    assert!(report.unread_dates.unwrap().contains("2 values"));
+    let note = report.unread_dates.unwrap();
+    assert!(note.contains("2 values"));
+    assert_eq!(note.loss, Some(crate::loss::LossCode::DroppedValue));
     let mut rows = Vec::new();
     let streamed = local
         .visit_chunks(None, 256, &mut |chunk| {
@@ -4421,6 +4631,98 @@ fn flatgeobuf_property_lengths_past_the_end_skip_the_feature() {
     assert_eq!((rows, streamed.skipped), (2, 1));
 }
 
+/// A polygon's ring ends that run past its coordinates, or go back, skip that feature as
+/// unreadable, whole and streamed, instead of panicking in the reader; the features around it are
+/// read. Found by fuzzing `read_layers` (#3006).
+#[test]
+fn flatgeobuf_ring_ends_past_the_coordinates_skip_the_feature() {
+    let square = |x: f64, size: f64| {
+        vec![Coord::new(x, 0.0), Coord::new(x + size, 0.0), Coord::new(x + size, size), Coord::new(x, size), Coord::new(x, 0.0)]
+    };
+    let mut ds = Dataset::new("parcels", GeometryType::Polygon, vec![Field::new("n", FieldType::Integer)]);
+    ds.push(Some(Geometry::Polygon(vec![vec![square(0.0, 1.0)]])), vec![Value::Int(1)]);
+    // Two rings: its ends are written as [5, 10].
+    ds.push(Some(Geometry::Polygon(vec![vec![square(10.0, 4.0), square(11.0, 1.0)]])), vec![Value::Int(2)]);
+    ds.push(Some(Geometry::Polygon(vec![vec![square(20.0, 1.0)]])), vec![Value::Int(3)]);
+    let written = fgb::write(&ds).unwrap();
+    // The file as written reads whole: the check refuses no ring that fits.
+    let clean = open_bytes("parcels.fgb", written.clone(), None).unwrap().read(&Request::all()).unwrap();
+    assert_eq!((clean.features.len(), clean.skipped), (3, 0));
+    let at = written.windows(12).position(|w| w == [2, 0, 0, 0, 5, 0, 0, 0, 10, 0, 0, 0]).unwrap();
+    for (first, second) in [(5u32, 11u32), (5, 0x7fff_ffff), (7, 6)] {
+        let mut bytes = written.clone();
+        bytes[at + 4..at + 8].copy_from_slice(&first.to_le_bytes());
+        bytes[at + 8..at + 12].copy_from_slice(&second.to_le_bytes());
+        let src = open_bytes("parcels.fgb", bytes, None).unwrap();
+        let batch = src.read(&Request::all()).unwrap();
+        assert_eq!(batch.skipped, 1, "ends {first}, {second}");
+        let mut kept: Vec<String> = batch.features.iter().map(|f| f.attrs[0].to_string()).collect();
+        kept.sort();
+        assert_eq!(kept, ["1", "3"], "ends {first}, {second}");
+        let mut rows = 0;
+        let streamed = src
+            .visit_chunks(None, 256, &mut |chunk| {
+                rows += chunk.len();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!((rows, streamed.skipped), (2, 1), "ends {first}, {second}");
+    }
+}
+
+/// A point whose coordinates are empty is skipped as unreadable, whole and streamed, instead of
+/// panicking in the reader, which reads a point's first coordinate whatever its length (#3006).
+#[test]
+fn flatgeobuf_a_point_without_its_coordinate_skips_the_feature() {
+    let mut ds = Dataset::new("places", GeometryType::Point, vec![]);
+    for x in [1.0, 1234.5, 3.0] {
+        ds.push(Some(Geometry::Point(Coord::new(x, 0.0))), vec![]);
+    }
+    let written = fgb::write(&ds).unwrap();
+    let clean = open_bytes("places.fgb", written.clone(), None).unwrap().read(&Request::all()).unwrap();
+    assert_eq!((clean.features.len(), clean.skipped), (3, 0));
+    // The middle point's xy vector (its length, 2, then x) made empty.
+    let mut needle = 2u32.to_le_bytes().to_vec();
+    needle.extend_from_slice(&1234.5f64.to_le_bytes());
+    let mut bytes = written;
+    let at = bytes.windows(needle.len()).position(|w| w == needle.as_slice()).unwrap();
+    bytes[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+    let src = open_bytes("places.fgb", bytes, None).unwrap();
+    let batch = src.read(&Request::all()).unwrap();
+    assert_eq!((batch.features.len(), batch.skipped), (2, 1));
+    let mut rows = 0;
+    let streamed = src
+        .visit_chunks(None, 256, &mut |chunk| {
+            rows += chunk.len();
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((rows, streamed.skipped), (2, 1));
+}
+
+/// A feature skipped for its geometry doesn't decide a column's date type either: its time of day
+/// would otherwise make an all-date column text (#3006).
+#[test]
+fn flatgeobuf_dates_skip_features_with_unreadable_geometry() {
+    let mut ds = Dataset::new("dates", GeometryType::Point, vec![Field::new("day", FieldType::Date)]);
+    ds.push(Some(Geometry::Point(Coord::new(1.0, 0.0))), vec![Value::parse("2001-01-01", FieldType::Date)]);
+    ds.push(Some(Geometry::Point(Coord::new(1234.5, 0.0))), vec![Value::parse("2002-02-02", FieldType::Date)]);
+    let mut bytes = fgb::write(&ds).unwrap();
+    // Its day made a time of day, the same length, which would make the column text.
+    let day = bytes.windows(10).position(|w| w == b"2002-02-02").unwrap();
+    bytes[day..day + 10].copy_from_slice(b"10:30:00.5");
+    // The second point's xy vector (its length, 2, then x) made empty.
+    let mut needle = 2u32.to_le_bytes().to_vec();
+    needle.extend_from_slice(&1234.5f64.to_le_bytes());
+    let at = bytes.windows(needle.len()).position(|w| w == needle.as_slice()).unwrap();
+    bytes[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+    let source = open_bytes("dates.fgb", bytes, None).unwrap();
+    assert_eq!(source.info().fields[0].ty, FieldType::Date);
+    let read = source.read(&Request::all()).unwrap();
+    assert_eq!((read.features.len(), read.skipped), (1, 1));
+    assert_eq!(read.features[0].attrs[0].to_string(), "2001-01-01");
+}
+
 /// A readable size prefix can contain invalid UTF-8 properties. Classification ignores
 /// that row just as whole and streamed reads do, and the read reports the skipped feature.
 #[test]
@@ -4482,7 +4784,7 @@ fn parquet_date_units_invalid_values_and_nulls() {
     assert_eq!(batch.features[1].attrs[3].to_string(), "1970-01-01T00:00:00.000001");
     assert!(batch.features[2].attrs.iter().all(Value::is_null));
     let extent = Extent::new(-0.1, -0.1, 0.1, 0.1);
-    let filtered = source.read(&Request { extent: Some(extent), limit: usize::MAX }).unwrap();
+    let filtered = source.read(&Request { extent: Some(extent), limit: usize::MAX, own: None }).unwrap();
     assert_eq!(filtered.features.len(), 1);
     assert!(filtered.unread_dates.is_empty(), "invalid dates in filtered-out rows aren't read losses");
     let filtered = source.visit_chunks(Some(extent), 256, &mut |_| Ok(())).unwrap();
@@ -4564,7 +4866,7 @@ fn a_feature_just_outside_an_extent_is_left_out_of_its_read() {
     let mut ds = Dataset::new("edge", GeometryType::Point, vec![]);
     ds.push(Some(Geometry::Point(Coord::new(0.0, 0.999_999_999))), vec![]);
     let extent = Some(Extent::new(-1.0, 1.0, 1.0, 2.0));
-    let req = Request { extent, limit: 1000 };
+    let req = Request { extent, limit: 1000, own: None };
     let (shp_path, geojson_path) = (d.join("edge.shp"), d.join("edge.geojson"));
     crate::io::write_path(&ds, &shp_path).unwrap();
     crate::io::write_path(&ds, &geojson_path).unwrap();
@@ -4588,7 +4890,7 @@ fn a_feature_just_outside_an_extent_is_left_out_of_its_read() {
 /// from its meridian, where transverse Mercator refuses places: such a view isn't bounded.
 #[test]
 fn a_query_box_leaves_out_nothing_in_view_when_its_edge_is_refused() {
-    let r = Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut Vec::new());
+    let r = Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut crate::loss::Notes::new());
     let t = r.transformer().unwrap();
     for view in [
         Extent::new(-120.0, -30.0, 10.0, 30.0),
@@ -4656,7 +4958,7 @@ fn a_view_its_system_cant_bound_reads_what_is_in_view() {
     }
     ds.push(None, vec![Value::Int(-1)]);
     let view = Extent::new(-120.0, -30.0, 10.0, 30.0);
-    let r = Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut Vec::new());
+    let r = Reproject::from_crs(Crs::from_epsg(32617).unwrap(), &mut crate::loss::Notes::new());
     assert!(r.extent_from_lonlat(&view).is_none(), "the view's edge is refused");
     for ext in ["shp", "fgb", "gpkg", "parquet", "geojson"] {
         let p = d.join(format!("pts.{ext}"));
@@ -4687,12 +4989,12 @@ fn a_view_its_system_cant_bound_reads_what_is_in_view() {
                 // A zero limit cannot give a count for a view requiring a complete geometry scan.
                 let probe = crate::progress::tests::Counted::cancelling_after(0);
                 let _guard = crate::progress::install(Some(probe.clone()));
-                let error = source.read(&Request { extent: Some(view), limit: 0 }).unwrap_err().to_string();
+                let error = source.read(&Request { extent: Some(view), limit: 0, own: None }).unwrap_err().to_string();
                 assert!(error.contains("zero-limit") && error.contains("count"), "{ext}: {error}");
                 assert_eq!(probe.done.load(std::sync::atomic::Ordering::Relaxed), 0, "{ext}");
             }
             for limit in [10, 2201] {
-                let read = in_lonlat(source, source.read(&Request { extent: Some(view), limit }).unwrap());
+                let read = in_lonlat(source, source.read(&Request { extent: Some(view), limit, own: None }).unwrap());
                 assert_eq!(read.matched, 200, "{ext}: count only view matches before sampling");
                 if limit == 10 {
                     // Adaptive sampling keeps between half the limit and the limit.
@@ -4711,7 +5013,7 @@ fn a_view_its_system_cant_bound_reads_what_is_in_view() {
                 // Cancel while scanning, not before the read starts; the view needs a complete scan.
                 let probe = crate::progress::tests::Counted::cancelling_after(3);
                 let _guard = crate::progress::install(Some(probe.clone()));
-                assert!(matches!(source.read(&Request { extent: Some(view), limit: 10 }), Err(DataError::Cancelled)), "{ext}");
+                assert!(matches!(source.read(&Request { extent: Some(view), limit: 10, own: None }), Err(DataError::Cancelled)), "{ext}");
                 assert_eq!(probe.done.load(std::sync::atomic::Ordering::Relaxed), 3, "{ext}");
             }
             if source.visits_chunks() {
@@ -4733,7 +5035,7 @@ fn unbounded_parquet_view_refuses_a_capped_group() {
     ds.push(Some(Geometry::Point(Coord::new(-81.0, 0.0))), vec![Value::Int(1)]);
     write_unbounded_view_fixture(&ds, &p);
     let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_group_rows(1);
-    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10, own: None };
     let error = source.read(&req).unwrap_err().to_string();
     assert!(error.contains("more than the 1 read from one"), "{error}");
 }
@@ -4748,12 +5050,12 @@ fn unbounded_parquet_view_refuses_decoded_columns_over_budget() {
     }
     write_unbounded_view_fixture(&ds, &p);
     let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_scan_bytes(16 << 10);
-    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 1 };
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 1, own: None };
     let error = source.read(&req).unwrap_err().to_string();
     assert!(error.contains("decoded-column budget"), "{error}");
     let error = source.visit_chunks(req.extent, 4096, &mut |_| Ok(())).unwrap_err().to_string();
     assert!(error.contains("decoded-column budget"), "{error}");
-    let clean = Request { extent: Some(Extent::new(-84.0, -1.0, -78.0, 1.0)), limit: 1 };
+    let clean = Request { extent: Some(Extent::new(-84.0, -1.0, -78.0, 1.0)), limit: 1, own: None };
     assert_eq!(source.read(&clean).unwrap().features.len(), 1);
     let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
     let batch = source.read(&req).unwrap();
@@ -4771,7 +5073,7 @@ fn unbounded_parquet_scan_accepts_two_thousand_distinct_points() {
     }
     write_projected_parquet_fixture(&ds, &p, 2000, true);
     let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
-    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10, own: None };
     let batch = source.read(&req).unwrap();
     assert_eq!(batch.matched, 2000);
     assert!((5..=10).contains(&batch.features.len()));
@@ -4825,7 +5127,7 @@ fn unbounded_parquet_view_bounds_aggregate_row_masks() {
         (0..40_000).map(|id| crate::Feature { id, geometry: Some(Geometry::Point(Coord::new(-81.0, 0.0))), attrs: vec![] }).collect();
     write_projected_parquet_fixture(&ds, &p, 100, true);
     let source = parquet::ParquetSource::open_path(&p, "pts").unwrap().with_scan_bytes(32 << 10);
-    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10 };
+    let req = Request { extent: Some(Extent::new(-120.0, -30.0, 10.0, 30.0)), limit: 10, own: None };
     let error = source.read(&req).unwrap_err().to_string();
     assert!(error.contains("row-mask budget"), "{error}");
     let source = parquet::ParquetSource::open_path(&p, "pts").unwrap();
@@ -4897,4 +5199,263 @@ fn write_projected_parquet_fixture(ds: &Dataset, path: &Path, rows: usize, dicti
     let mut writer = ::parquet::arrow::ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, Some(props)).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
+}
+
+/// A GeoParquet field's range comes from its column statistics; text, missing and all-null
+/// fields have none (#2497).
+#[test]
+fn geoparquet_field_range_comes_from_column_statistics() {
+    let fields = vec![
+        Field::new("height", FieldType::Double),
+        Field::new("floors", FieldType::Integer),
+        Field::new("name", FieldType::Text),
+        Field::new("empty", FieldType::Double),
+    ];
+    let mut ds = Dataset::new("b", crate::GeometryType::Point, fields);
+    for (i, h) in [3.5, -2.0, 41.25].into_iter().enumerate() {
+        let floors = if i == 1 { Value::Null } else { Value::Int(i as i64 * 7 - 3) };
+        ds.push(Some(Geometry::Point(Coord::new(i as f64, 0.0))), vec![Value::Float(h), floors, Value::Text("x".into()), Value::Null]);
+    }
+    let source = parquet::ParquetSource::open_bytes(parquet::write(&ds).unwrap(), "b").unwrap();
+    assert_eq!(source.field_range("height"), Some((-2.0, 41.25)));
+    assert_eq!(source.field_range("floors"), Some((-3.0, 11.0)));
+    for none in ["name", "empty", "nope"] {
+        assert_eq!(source.field_range(none), None, "{none}");
+    }
+    // A wrapper says the same.
+    #[cfg(not(target_arch = "wasm32"))]
+    assert_eq!(Fetching(Arc::new(source)).field_range("height"), Some((-2.0, 41.25)));
+}
+
+/// The column statistics that can't give a field's range, and the ones scaled or rounded to
+/// hold every value: unsigned integers, a column without statistics, decimals, and Int64 past
+/// 2^53 (#2497).
+#[test]
+fn geoparquet_field_range_refuses_unsigned_and_missing_statistics() {
+    use ::parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
+    use ::parquet::file::properties::{EnabledStatistics, WriterProperties};
+    use ::parquet::file::writer::SerializedFileWriter;
+    use ::parquet::schema::types::ColumnPath;
+    let schema = ::parquet::schema::parser::parse_message_type(
+        "message m { REQUIRED BINARY geometry; OPTIONAL INT32 count (UINT_32); OPTIONAL INT64 price (DECIMAL(10,2));          OPTIONAL INT64 big; OPTIONAL DOUBLE bare; }",
+    )
+    .unwrap();
+    let props = WriterProperties::builder().set_column_statistics_enabled(ColumnPath::from("bare"), EnabledStatistics::None).build();
+    let mut bytes = Vec::new();
+    let mut w = SerializedFileWriter::new(&mut bytes, Arc::new(schema), Arc::new(props)).unwrap();
+    let mut rg = w.next_row_group().unwrap();
+    let geom = ByteArray::from(wkb::encode(&Geometry::Point(Coord::new(0.0, 0.0))));
+    let mut col = rg.next_column().unwrap().unwrap();
+    col.typed::<ByteArrayType>().write_batch(&[geom.clone(), geom], None, None).unwrap();
+    col.close().unwrap();
+    let mut col = rg.next_column().unwrap().unwrap();
+    col.typed::<Int32Type>().write_batch(&[1, -1], Some(&[1, 1]), None).unwrap();
+    col.close().unwrap();
+    let big = (1i64 << 53) + 1;
+    for values in [[12_345, -50], [-big, big]] {
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<Int64Type>().write_batch(&values, Some(&[1, 1]), None).unwrap();
+        col.close().unwrap();
+    }
+    let mut col = rg.next_column().unwrap().unwrap();
+    col.typed::<DoubleType>().write_batch(&[1.0, 2.0], Some(&[1, 1]), None).unwrap();
+    col.close().unwrap();
+    rg.close().unwrap();
+    w.close().unwrap();
+    let source = parquet::ParquetSource::open_bytes(bytes, "m").unwrap();
+    let kinds: Vec<_> = source.info().fields.iter().map(|f| (f.name.as_str(), f.ty)).collect();
+    assert!(kinds.contains(&("count", FieldType::Integer)) && kinds.contains(&("bare", FieldType::Double)), "{kinds:?}");
+    assert_eq!(source.field_range("count"), None);
+    assert_eq!(source.field_range("bare"), None);
+    assert_eq!(source.field_range("price"), Some((-50.0 * 10f64.powi(-2), 12_345.0 * 10f64.powi(-2))));
+    let (lo, hi) = source.field_range("big").unwrap();
+    assert!(i128::from(big) <= hi as i128 && lo as i128 <= -i128::from(big), "{lo} {hi}");
+}
+
+/// Row groups whose statistics hold their smallest and largest value in order are joined; one that
+/// gives them reversed leaves the range unknown, whatever the others give.
+#[test]
+fn geoparquet_field_range_checks_each_row_group() {
+    use ::parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
+    use ::parquet::file::statistics::Statistics;
+    use ::parquet::file::writer::SerializedFileWriter;
+    let schema = ::parquet::schema::parser::parse_message_type(
+        "message m { REQUIRED BINARY geometry; REQUIRED INT64 whole; REQUIRED DOUBLE real; }",
+    )
+    .unwrap();
+    let mut bytes = Vec::new();
+    let mut w = SerializedFileWriter::new(&mut bytes, Arc::new(schema), Arc::default()).unwrap();
+    let geom = ByteArray::from(wkb::encode(&Geometry::Point(Coord::new(0.0, 0.0))));
+    for (lo, hi) in [(10, 20), (40, 50)] {
+        let mut rg = w.next_row_group().unwrap();
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<ByteArrayType>().write_batch(&[geom.clone(), geom.clone()], None, None).unwrap();
+        col.close().unwrap();
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<Int64Type>().write_batch(&[lo, hi], None, None).unwrap();
+        col.close().unwrap();
+        let mut col = rg.next_column().unwrap().unwrap();
+        col.typed::<DoubleType>().write_batch(&[lo as f64, hi as f64], None, None).unwrap();
+        col.close().unwrap();
+        rg.close().unwrap();
+    }
+    w.close().unwrap();
+    let open = |bytes| parquet::ParquetSource::open_bytes(bytes, "m").unwrap();
+    let source = open(bytes.clone());
+    assert_eq!((source.field_range("whole"), source.field_range("real")), (Some((10.0, 50.0)), Some((10.0, 50.0))));
+    // The second group's bounds, swapped where the footer holds them.
+    let len = u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap()) as usize;
+    let footer = bytes.len() - 8 - len;
+    for (a, b) in [(40i64.to_le_bytes(), 50i64.to_le_bytes()), (40f64.to_le_bytes(), 50f64.to_le_bytes())] {
+        for at in footer..bytes.len() - 8 {
+            if bytes[at..at + 8] == a {
+                bytes[at..at + 8].copy_from_slice(&b);
+            } else if bytes[at..at + 8] == b {
+                bytes[at..at + 8].copy_from_slice(&a);
+            }
+        }
+    }
+    let md = ::parquet::file::metadata::ParquetMetaDataReader::new().parse_and_finish(&bytes::Bytes::from(bytes.clone())).unwrap();
+    let Some(Statistics::Int64(st)) = md.row_group(1).column(1).statistics() else { panic!() };
+    assert_eq!((st.min_opt(), st.max_opt()), (Some(&50), Some(&40)));
+    let source = open(bytes);
+    assert_eq!((source.field_range("whole"), source.field_range("real")), (None, None));
+}
+
+/// The spatial index, loaded after the rows in Hilbert order, holds one entry with the box of
+/// each feature that has a place (none for one without), and the same layer gives the same index
+/// nodes each time.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_index_holds_each_placed_feature_and_repeats() {
+    let folder = tempfile::tempdir().unwrap();
+    let mut ds = Dataset::new("scatter", GeometryType::Point, vec![]);
+    let mut seed = 12345u64;
+    let mut next = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as f64 / f64::from(1u32 << 31)
+    };
+    let mut places = Vec::new();
+    for _ in 0..3000 {
+        let c = Coord::new(next() * 360.0 - 180.0, next() * 170.0 - 85.0);
+        places.push(c);
+        ds.push(Some(Geometry::Point(c)), vec![]);
+    }
+    ds.push(None, vec![]);
+    let mut nodes = Vec::new();
+    for name in ["a.gpkg", "b.gpkg"] {
+        let path = folder.path().join(name);
+        gpkg::write(&ds, &path).unwrap();
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let mut st = c.prepare("SELECT id, minx, maxx, miny, maxy FROM rtree_scatter_geom ORDER BY id").unwrap();
+        let rows: Vec<(i64, [f64; 4])> =
+            st.query_map([], |r| Ok((r.get(0)?, [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?]))).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(rows.len(), places.len(), "one entry for each feature with a place");
+        for ((id, [x0, x1, y0, y1]), p) in rows.iter().zip(&places) {
+            let sane = (*x0 as f32 as f64 - p.x).abs() < 1e-4 && (*x1 as f32 as f64 - p.x).abs() < 1e-4;
+            assert!(sane && (*y0 as f32 as f64 - p.y).abs() < 1e-4 && (*y1 as f32 as f64 - p.y).abs() < 1e-4, "box of {id}");
+        }
+        let nodes_of: Vec<(i64, Vec<u8>)> = c
+            .prepare("SELECT nodeno, data FROM rtree_scatter_geom_node ORDER BY nodeno")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        nodes.push(nodes_of);
+        let triggers: i64 = c
+            .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'rtree_scatter_geom_%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(triggers, 7, "the index's triggers exist when the write ends");
+    }
+    assert_eq!(nodes[0], nodes[1], "the same layer builds the same index");
+}
+
+/// The spatial index of a GeoPackage lists exactly the features with a place, for a layer with
+/// none, one of only null and empty geometries, a table added to a file that has another, and one
+/// replaced there (and a point layer that turns out to hold multipoints, which restarts the export).
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn geopackage_index_lists_only_features_with_a_place() {
+    use crate::io::{GpkgMode, GpkgTable};
+    let folder = tempfile::tempdir().unwrap();
+    let indexed = |path: &Path, table: &str| -> Vec<i64> {
+        let c = rusqlite::Connection::open(path).unwrap();
+        let mut st = c.prepare(&format!("SELECT id FROM rtree_{table}_geom ORDER BY id")).unwrap();
+        st.query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+    };
+    let layer = |name: &str, geoms: Vec<Option<Geometry>>| {
+        let mut ds = Dataset::new(name, GeometryType::Point, vec![]);
+        for g in geoms {
+            ds.push(g, vec![]);
+        }
+        ds
+    };
+    let at = |x: f64| Some(Geometry::Point(Coord::new(x, -x)));
+    for (name, geoms, want) in [
+        ("empty", vec![], vec![]),
+        ("none", vec![None, None], vec![]),
+        ("empty_multi", vec![None, Some(Geometry::MultiPoint(vec![]))], vec![]),
+        ("some", vec![at(3.0), None, at(1.0), Some(Geometry::MultiPoint(vec![])), at(2.0)], vec![1, 3, 5]),
+        (
+            "multi",
+            vec![at(3.0), None, Some(Geometry::MultiPoint(vec![Coord::new(1.0, 1.0), Coord::new(2.0, 2.0)])), at(2.0)],
+            vec![1, 3, 4],
+        ),
+    ] {
+        let path = folder.path().join(format!("{name}.gpkg"));
+        gpkg::write(&layer(name, geoms), &path).unwrap();
+        assert_eq!(indexed(&path, name), want, "{name}");
+    }
+    // A table added to a file that has another, then replaced by one with fewer features.
+    let path = folder.path().join("two.gpkg");
+    let to = |mode, name: &str| GpkgTable { mode, name: Some(name.into()) };
+    gpkg::write(&layer("first", vec![at(5.0), at(4.0)]), &path).unwrap();
+    gpkg::write_table_in(&layer("x", vec![at(9.0), None, at(8.0), at(7.0)]), &path, Crs::LonLat, &to(GpkgMode::AddTable, "second"))
+        .unwrap();
+    assert_eq!((indexed(&path, "first"), indexed(&path, "second")), (vec![1, 2], vec![1, 3, 4]));
+    gpkg::write_table_in(&layer("x", vec![None, at(6.0)]), &path, Crs::LonLat, &to(GpkgMode::ReplaceTable, "second")).unwrap();
+    assert_eq!((indexed(&path, "first"), indexed(&path, "second")), (vec![1, 2], vec![2]));
+}
+
+/// A streamed export loads the spatial index in several runs once it holds enough boxes: every
+/// feature with a place is still indexed with its box, and the same layer builds the same index.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_streamed_geopackage_loads_its_index_in_runs() {
+    let folder = tempfile::tempdir().unwrap();
+    let mut ds = Dataset::new("runs", GeometryType::Point, vec![]);
+    for i in 0..2500 {
+        let (x, y) = (f64::from((i * 7919) % 360) - 180.0, f64::from((i * 104_729) % 170) - 85.0);
+        ds.push((i % 10 != 0).then(|| Geometry::Point(Coord::new(x, y))), vec![]);
+    }
+    let mut files = Vec::new();
+    for name in ["a.gpkg", "b.gpkg"] {
+        let path = folder.path().join(name);
+        let mut feed = |put: &mut dyn FnMut(&[crate::Feature]) -> crate::Result<()>| ds.features.chunks(400).try_for_each(&mut *put);
+        gpkg::write_features_in("runs", GeometryType::Point, &[], &path, Crs::LonLat, &crate::io::GpkgTable::default(), &mut feed).unwrap();
+        files.push(path);
+    }
+    let read = |path: &Path| -> (Vec<(i64, [f64; 4])>, Vec<(i64, Vec<u8>)>) {
+        let c = rusqlite::Connection::open(path).unwrap();
+        let rows = c
+            .prepare("SELECT id, minx, maxx, miny, maxy FROM rtree_runs_geom ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, [r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?])))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let nodes = c
+            .prepare("SELECT nodeno, data FROM rtree_runs_geom_node ORDER BY nodeno")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        (rows, nodes)
+    };
+    let (rows, nodes) = read(&files[0]);
+    let placed: Vec<i64> = (1..=2500).filter(|i| (i - 1) % 10 != 0).collect();
+    assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), placed, "one entry for each feature with a place");
+    assert_eq!(nodes, read(&files[1]).1, "the same layer builds the same index");
 }

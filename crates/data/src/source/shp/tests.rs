@@ -333,7 +333,7 @@ fn shapefile_disk_index_reopens_and_invalidates_without_changing_source() {
         let p = fixture.join("indexed-grid.shp");
         points_shapefile(&p);
         let original = std::fs::read(&p).unwrap();
-        let req = Request { extent: Some(Extent::new(10.0, 10.0, 40.0, 30.0)), limit: 1000 };
+        let req = Request { extent: Some(Extent::new(10.0, 10.0, 40.0, 30.0)), limit: 1000, own: None };
         let src = open_path(&p, None).unwrap();
         let expected = src.read(&req).unwrap();
         let reopened = open_path(&p, None).unwrap();
@@ -371,14 +371,14 @@ fn shapefile_disk_index_keeps_file_order_and_query_boundaries() {
         }
         std::fs::write(&p, bytes).unwrap();
         let src = open_path(&p, None).unwrap();
-        let batch = src.read(&Request { extent: Some(Extent::new(1.0, -1.0, 2.0, 1.0)), limit: 1000 }).unwrap();
+        let batch = src.read(&Request { extent: Some(Extent::new(1.0, -1.0, 2.0, 1.0)), limit: 1000, own: None }).unwrap();
         assert_eq!(batch.matched, 101);
         assert_eq!(batch.features.len(), 101);
         assert!(batch.complete);
         assert!(batch.features.windows(2).all(|p| p[0].id < p[1].id));
         assert_eq!(batch.features.first().unwrap().geometry, Some(Geometry::Point(Coord::new(2.0, 0.0))));
         assert_eq!(batch.features.last().unwrap().geometry, Some(Geometry::Point(Coord::new(1.0, 0.0))));
-        let sample = src.read(&Request { extent: None, limit: 10 }).unwrap();
+        let sample = src.read(&Request { extent: None, limit: 10, own: None }).unwrap();
         assert_eq!(sample.matched, 1000);
         assert_eq!(sample.features.len(), 10);
         assert!(!sample.complete);
@@ -404,7 +404,7 @@ fn shapefile_overview_index_shortcut_does_not_include_null_shapes() {
         std::fs::write(&p, bytes).unwrap();
         let src = open_path(&p, None).unwrap();
         assert_eq!(src.read(&Request::all()).unwrap().features.len(), 2);
-        let view = src.read(&Request { extent: Some(Extent::new(-10.0, -10.0, 10.0, 10.0)), limit: 100 }).unwrap();
+        let view = src.read(&Request { extent: Some(Extent::new(-10.0, -10.0, 10.0, 10.0)), limit: 100, own: None }).unwrap();
         assert_eq!(view.matched, 1);
         assert_eq!(view.features.len(), 1);
         assert!(view.features.iter().all(|f| f.geometry.is_some()));
@@ -506,7 +506,7 @@ fn disk_queries_match_legacy_scan_sampling_and_edges() {
             for limit in [0, 1, 7, 29, 1000] {
                 let step = crate::source::stride(ids.len() as u64, limit).max(1) as usize;
                 let expected: Vec<_> = ids.iter().copied().step_by(step).take(limit).collect();
-                let batch = src.read(&Request { extent, limit }).unwrap();
+                let batch = src.read(&Request { extent, limit, own: None }).unwrap();
                 assert_eq!(batch.matched, ids.len() as u64);
                 assert_eq!(batch.complete, step == 1);
                 assert_eq!(batch.features.iter().map(|f| f.id).collect::<Vec<_>>(), expected);
@@ -534,7 +534,7 @@ fn shapefile_disk_index_benchmark() {
         let clock = std::time::Instant::now();
         let source = ShpSource::open_path(&path, "benchmark").unwrap();
         let warm = clock.elapsed();
-        let request = Request { extent: Some(Extent::new(-1.0, -1.0, 1.0, 1.0)), limit: 1000 };
+        let request = Request { extent: Some(Extent::new(-1.0, -1.0, 1.0, 1.0)), limit: 1000, own: None };
         let clock = std::time::Instant::now();
         let indexed = source.read(&request).unwrap();
         let query = clock.elapsed();
@@ -564,7 +564,7 @@ fn shapefile_disk_index_complete_chunks_preserve_full_reads_and_file_order() {
         points_shapefile(&path);
         let source = open_path(&path, None).unwrap();
         assert!(source.info().indexed);
-        assert_eq!(source.read(&Request { extent: None, limit: 1 }).unwrap().features.len(), 1);
+        assert_eq!(source.read(&Request { extent: None, limit: 1, own: None }).unwrap().features.len(), 1);
         for extent in [None, Some(Extent::new(10.0, 5.0, 15.0, 10.0)), Some(Extent::EMPTY)] {
             let expected = source.read(&Request { extent, ..Request::all() }).unwrap();
             for budget in [1, 256, 8192] {
@@ -590,7 +590,7 @@ fn shapefile_disk_index_complete_chunks_preserve_full_reads_and_file_order() {
         source
             .visit_chunks(None, 256, &mut |_| {
                 if !reentrant {
-                    assert_eq!(source.read(&Request { extent: None, limit: 1 })?.features.len(), 1);
+                    assert_eq!(source.read(&Request { extent: None, limit: 1, own: None })?.features.len(), 1);
                     reentrant = true;
                 }
                 Ok(())
@@ -665,7 +665,7 @@ fn a_nan_shape_outside_an_area_its_system_cant_bound_is_counted_as_of_the_layer(
             p
         };
         let view = Extent::new(-120.0, -30.0, 10.0, 30.0);
-        let r = Reproject::from_crs(crs, &mut Vec::new());
+        let r = Reproject::from_crs(crs, &mut crate::loss::Notes::new());
         assert!(r.extent_from_lonlat(&view).is_none(), "the view's edge is refused");
         const SAID: &str = "have a coordinate that isn't a number under a bounding box that is one";
         let said = |notes: &[crate::loss::Note]| notes.iter().filter(|n| n.contains(SAID)).map(|n| n.text.clone()).collect::<Vec<_>>();
@@ -722,7 +722,15 @@ fn a_nan_shape_under_a_finite_box_is_said_when_left_out() {
             p
         };
         const SAID: &str = "have a coordinate that isn't a number under a bounding box that is one";
-        let said = |notes: &[crate::loss::Note]| notes.iter().filter(|n| n.contains(SAID)).map(|n| n.text.clone()).collect::<Vec<_>>();
+        // Each read says the shapes it left out as dropped features, which the checks below see.
+        let said = |notes: &[crate::loss::Note]| {
+            notes
+                .iter()
+                .filter(|n| n.contains(SAID))
+                .inspect(|n| assert_eq!(n.loss, Some(crate::loss::LossCode::DroppedFeature), "{n:?}"))
+                .map(|n| n.text.clone())
+                .collect::<Vec<_>>()
+        };
         let chunk_notes = |src: &dyn FeatureSource, extent| {
             let batch = src.visit_chunks(extent, 1 << 20, &mut |_| Ok(())).unwrap();
             (batch.skipped, said(&batch.notes))
@@ -915,5 +923,95 @@ fn a_shapefile_says_whether_it_is_as_it_was_opened() {
         assert!(!s.same_as_opened().unwrap(), "written again");
         std::fs::remove_file(&path).unwrap();
         assert!(s.same_as_opened().is_err(), "gone");
+    });
+}
+
+/// The ids a complete read with this own box (no longitude/latitude extent) gives.
+fn without_shape(s: &ShpSource, own: Option<(crate::raster::Crs, Extent)>) -> Vec<u64> {
+    let mut ids = Vec::new();
+    s.visit_request_chunks(&Request { extent: None, limit: usize::MAX, own }, 4096, &mut |chunk| {
+        ids.extend(chunk.iter().map(|f| f.id));
+        Ok(())
+    })
+    .unwrap();
+    ids
+}
+
+/// A complete read by a box in the file's own system (#2788) gives the shapes meeting it and no
+/// row without a shape, as a read by area in longitude/latitude does, also when it gives no
+/// longitude/latitude extent beside the box.
+#[test]
+fn a_complete_read_by_its_own_box_leaves_out_rows_without_a_shape() {
+    let utm = crate::raster::Crs::from_epsg(32631).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pts.shp");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    for (i, p) in
+        [Some((450_000.0, 5_410_000.0)), None, Some((460_000.0, 5_420_000.0)), Some((900_000.0, 5_000_000.0))].into_iter().enumerate()
+    {
+        ds.push(p.map(|(x, y)| Geometry::Point(Coord::new(x, y))), vec![Value::Int(i as i64)]);
+    }
+    ds.held_in = utm;
+    crate::io::write_path_in(&ds, &path, utm).unwrap();
+    // The first record made a shape of no geometry (its type, at 108, 0), as other writers give
+    // a feature without one.
+    let mut b = std::fs::read(&path).unwrap();
+    b[108..112].copy_from_slice(&0i32.to_le_bytes());
+    std::fs::write(&path, b).unwrap();
+    cache::with_index_dir(tmp.path().join("cache"), || {
+        let s = ShpSource::open_path(&path, "pts").unwrap();
+        let own = Extent::new(440_000.0, 5_400_000.0, 470_000.0, 5_430_000.0);
+        let mut got = Vec::new();
+        s.visit_request_chunks(&Request { extent: None, limit: usize::MAX, own: Some((utm, own)) }, 4096, &mut |chunk| {
+            got.extend(chunk.iter().map(|f| f.id));
+            Ok(())
+        })
+        .unwrap();
+        // What a whole read gives, the features with a shape in the box.
+        let mut expected = Vec::new();
+        let mut rows = 0;
+        s.visit_chunks(None, 4096, &mut |chunk| {
+            rows += chunk.len();
+            expected.extend(chunk.iter().filter(|f| f.geometry.as_ref().is_some_and(|g| g.extent().intersects(&own))).map(|f| f.id));
+            Ok(())
+        })
+        .unwrap();
+        assert!(rows > expected.len() && !expected.is_empty(), "{rows} rows, {expected:?} in the box");
+        assert_eq!(got, expected, "the points in the box, not a row without a shape or the far point");
+        assert!(without_shape(&s, None).contains(&1), "a whole read gives the row without a shape");
+        // A box in another system is read as if absent: every row, the one without a shape too.
+        let lonlat = Some((crate::raster::Crs::LonLat, own));
+        assert_eq!(without_shape(&s, lonlat), without_shape(&s, None), "a box in another system reads everything");
+        // A box over the whole plane reads everything too, as a whole read does.
+        assert_eq!(without_shape(&s, Some((utm, super::super::whole_plane()))), without_shape(&s, None));
+    });
+}
+
+/// A read by feature ids gives exactly those features, in file order whatever order they are
+/// asked in, leaves out ids the file doesn't hold, and doesn't count as the whole read that looks
+/// at the stored boxes (#2788).
+#[test]
+fn a_read_by_ids_gives_those_features_in_file_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pts.shp");
+    let mut ds = Dataset::new("pts", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+    for i in 0..300 {
+        ds.push(Some(Geometry::Point(Coord::new(f64::from(i % 20), f64::from(i / 20)))), vec![Value::Int(i64::from(i))]);
+    }
+    write_shapefile(&ds, &path);
+    cache::with_index_dir(tmp.path().join("cache"), || {
+        let s = ShpSource::open_path(&path, "pts").unwrap();
+        assert!(s.visits_ids());
+        let mut got = Vec::new();
+        let batch = s
+            .visit_ids_chunks(&[250, 3, 0, 120, 3, 9_999], 4096, &mut |chunk| {
+                got.extend(chunk.iter().map(|f| (f.id, f.attrs.first().cloned())));
+                Ok(())
+            })
+            .unwrap();
+        assert!(batch.complete);
+        // Ids from 1: 0 and 9,999 aren't records of this file.
+        assert_eq!(got, [(3, Some(Value::Int(2))), (120, Some(Value::Int(119))), (250, Some(Value::Int(249)))]);
+        assert!(!s.finds_all_by_area(), "a read by ids isn't the whole read that looks at the boxes");
     });
 }

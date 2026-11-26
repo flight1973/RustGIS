@@ -108,10 +108,10 @@ fn add_layer(s: &mut Session, p: &Value) -> CmdResult {
             );
         }
         if let Some(note) = rustgis_data::source::unread_dates_note(&info.fields, &editable.unread_dates) {
-            s.notify(format!("{name}: {note}; saving leaves them as they are unless they're edited"), false);
+            s.say(note.map_text(|note| format!("{name}: {note}; saving leaves them as they are unless they're edited")));
         }
         if let Some(note) = rustgis_data::source::rounded_dates_note(&info.fields, &editable.rounded_dates) {
-            s.notify(format!("{name}: {note}"), false);
+            s.say(note.prefixed(&name));
         }
         if !editable.writable {
             s.notify(format!("{name}: the file is read-only, so edits can't be saved to it"), false);
@@ -323,19 +323,23 @@ fn save_edits(s: &mut Session, p: &Value) -> CmdResult {
             false,
         );
         if !saved.skipped_fields.is_empty() {
-            s.notify(format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")), false);
+            // Their values aren't in the table: lost from the save.
+            s.say(rustgis_data::loss::Note::loss(
+                rustgis_data::loss::LossCode::DroppedValue,
+                format!("{name}: {table} has no column for {}, so it wasn't saved", saved.skipped_fields.join(", ")),
+            ));
         }
         if let Some(note) = rustgis_data::io::fine_dates_note(&fields, &fine_dates, &super::saved_target(&name, table)) {
-            s.notify(note, false);
+            s.say(note);
         }
         if let Some(note) = rustgis_data::source::unread_dates_note(&fields, &unread_dates) {
-            s.notify(format!("{}: {note}, when read back after the save", super::saved_target(&name, table)), false);
+            s.say(note.map_text(|note| format!("{}: {note}, when read back after the save", super::saved_target(&name, table))));
         }
         if let Some(note) = rustgis_data::source::rounded_dates_note(&fields, &rounded_dates) {
-            s.notify(format!("{}: {note}, when read back after the save", super::saved_target(&name, table)), false);
+            s.say(note.map_text(|note| format!("{}: {note}, when read back after the save", super::saved_target(&name, table))));
         }
         if let Some(note) = rustgis_data::io::utc_dates_note(&fields, &utc_dates, &super::saved_target(&name, table)) {
-            s.notify(note, false);
+            s.say(note);
         }
         s.retain_written_notices(written);
         Ok(json!({"saved": true, "inserted": saved.inserted.len(), "updated": saved.updated, "deleted": saved.deleted,
@@ -392,7 +396,7 @@ pub(super) fn read_candidate(name: &str, edit: &rustgis_map::source::GpkgEdit) -
         notes.push(format!("{} rows with a geometry RustGIS can't read weren't loaded; saving leaves them as they are", editable.skipped));
     }
     if let Some(note) = rustgis_data::source::unread_dates_note(&info.fields, &editable.unread_dates) {
-        notes.push(format!("{note}; saving leaves them as they are unless they're edited"));
+        notes.push(note.map_text(|note| format!("{note}; saving leaves them as they are unless they're edited")));
     }
     if let Some(note) = rustgis_data::source::rounded_dates_note(&info.fields, &editable.rounded_dates) {
         notes.push(note);

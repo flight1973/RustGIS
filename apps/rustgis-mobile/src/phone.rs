@@ -4,17 +4,19 @@
 //! Rust calls Java and never the other way: what happened is collected with `takeEvents`, so the
 //! library exports nothing but `android_main`.
 
+use crate::shell;
 use jni::objects::{JObject, JString};
 use jni::refs::Global;
 use jni::{JValue, JavaVM, jni_sig, jni_str};
 use rustgis_engine::platform::{Event, Platform};
 use rustgis_ui_egui::i18n;
 use std::cell::RefCell;
+use std::sync::Arc;
 use winit::platform::android::activity::AndroidApp;
 
 /// The phone, through its activity.
 pub struct Phone {
-    activity: Global<JObject<'static>>,
+    activity: Arc<Global<JObject<'static>>>,
     /// Why the activity last couldn't be asked what happened, until it can be again: said once,
     /// not every frame.
     unreachable: RefCell<Option<String>>,
@@ -40,13 +42,26 @@ impl Phone {
                 })
             })
             .map_err(|e| i18n::fmt("Android's Java side can't be reached: {error}", &[("error", &e.to_string())]))?;
-        let phone = Phone { activity, unreachable: RefCell::new(None) };
+        let phone = Phone { activity: Arc::new(activity), unreachable: RefCell::new(None) };
         let owner = phone.java(|env, activity| {
             let token = env.call_method(activity, jni_str!("copyOwner"), jni_sig!(() -> JString), &[])?.l()?;
             env.cast_local::<JString>(token)?.try_to_string(env)
         })?;
         rustgis_ui_touch::set_copy_owner(owner)?;
         Ok(phone)
+    }
+
+    /// Tells the engine what Android allows (`rustgis_data::memory::set_phone`): the memory it
+    /// has, and, asked again each time a job plans, what is free of it. Where Android doesn't say
+    /// at start, [`shell::MEMORY_UNSAID`] stands in. Returns whether Android said.
+    pub fn plan_memory(&self) -> bool {
+        let activity = self.activity.clone();
+        let total = memory(&activity).map(|(total, _)| total).filter(|total| *total > 0);
+        let free = move || memory(&activity).map(|(_, free)| free);
+        if !rustgis_engine::data::memory::set_phone(total.unwrap_or(shell::MEMORY_UNSAID), free) {
+            log::warn!("the memory limits were read before Android's were set");
+        }
+        total.is_some()
     }
 
     /// Runs `call` with the Java environment and the activity, on this thread.
@@ -96,6 +111,21 @@ impl Phone {
     }
 }
 
+/// The memory Android has and what is free of it (`MainActivity.memory`), from any thread; `None`
+/// when it can't say.
+fn memory(activity: &JObject) -> Option<(u64, u64)> {
+    let text = JavaVM::singleton()
+        .and_then(|vm| {
+            vm.attach_current_thread(|env| -> jni::errors::Result<String> {
+                let said = env.call_method(activity, jni_str!("memory"), jni_sig!(() -> JString), &[])?.l()?;
+                env.cast_local::<JString>(said)?.try_to_string(env)
+            })
+        })
+        .ok()?;
+    let (total, free) = text.split_once(' ')?;
+    Some((total.parse().ok()?, free.parse().ok()?))
+}
+
 impl Platform for Phone {
     fn pick_files(&self, purpose: &str) -> Result<(), String> {
         self.java(|env, activity| {
@@ -113,6 +143,21 @@ impl Platform for Phone {
                 jni_str!("save"),
                 jni_sig!((name: JString, bytes: [jbyte], project: boolean) -> void),
                 &[JValue::Object(&name), JValue::Object(&bytes), JValue::Bool(project)],
+            )?
+            .v()
+        })
+    }
+
+    fn write_back(&self, document: &str, name: &str, bytes: Vec<u8>) -> Result<(), String> {
+        self.java(|env, activity| {
+            let document = env.new_string(document)?;
+            let name = env.new_string(name)?;
+            let bytes = env.byte_array_from_slice(&bytes)?;
+            env.call_method(
+                activity,
+                jni_str!("writeBack"),
+                jni_sig!((document: JString, name: JString, bytes: [jbyte]) -> void),
+                &[JValue::Object(&document), JValue::Object(&name), JValue::Object(&bytes)],
             )?
             .v()
         })

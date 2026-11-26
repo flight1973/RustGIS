@@ -60,7 +60,7 @@ macro_rules! loss_codes {
 
 loss_codes! {
     DroppedLegend => ("dropped.legend", Dropped, "Use a service with short HTTP or HTTPS addresses for its legend pictures."),
-    DroppedRing => ("dropped.ring", Dropped, "Correct the unreadable polygon ring in the source."),
+    DroppedRing => ("dropped.ring", Dropped, "Correct the unreadable polygon ring in the source, or write to a format that holds holes, such as GeoPackage."),
     DroppedExtraAttributes => (
         "dropped.extra-attributes",
         Dropped,
@@ -73,7 +73,83 @@ loss_codes! {
         Dropped,
         "Correct the expression or check the input rows named in the notice."
     ),
+    DroppedZm => (
+        "dropped.zm",
+        Dropped,
+        "Keep the source file where heights or measures matter: RustGIS keeps x and y only."
+    ),
+    DroppedCrsName => (
+        "dropped.crs-name",
+        Dropped,
+        "Keep the source file's coordinate system definition with the export, or export in WGS 84, which every format can name."
+    ),
+    DroppedFeature => (
+        "dropped.feature",
+        Dropped,
+        "Correct those features in the source, or read the source in the way the notice suggests."
+    ),
+    DroppedGeometry => (
+        "dropped.geometry",
+        Dropped,
+        "Correct the geometry in the source, or give the coordinate system its coordinates are in."
+    ),
+    DroppedOverLimit => (
+        "dropped.over-limit",
+        Dropped,
+        "Read less at once, such as by filtering or clipping the source first."
+    ),
     ChangedTruncated => ("changed.truncated", Changed, "Use a decimal field to keep the fractional part."),
+    ChangedFieldName => (
+        "changed.field-name",
+        Changed,
+        "Use field names the format holds: at most 10 bytes and unique ignoring case for a Shapefile, unique ignoring case for a GeoPackage."
+    ),
+    ChangedCut => (
+        "changed.cut",
+        Changed,
+        "Shorten the text to what the format holds (254 bytes for a Shapefile; nothing past a NUL character), or write to a format without the limit, such as GeoPackage."
+    ),
+    ChangedBody => ("changed.body", Changed, "Export in the layer's own coordinate system, which keeps its body."),
+    ChangedEncoding => (
+        "changed.encoding",
+        Changed,
+        "Put a .cpg file naming the file's own encoding beside it."
+    ),
+    ChangedRounded => (
+        "changed.rounded",
+        Changed,
+        "Keep the source file where finer values matter, or write to a format that holds them (times finer than the format keeps, numbers past a dBase field's precision, or whole numbers past 2^53 in a decimal field)."
+    ),
+    ChangedPosition => (
+        "changed.position",
+        Changed,
+        "Export in a coordinate system that holds the positions, such as WGS 84."
+    ),
+    ApproximatedDatum => (
+        "approximated.datum",
+        Approximated,
+        "Export in the layer's own coordinate system, or give that system with a known transformation to WGS 84."
+    ),
+    ApproximatedCurve => (
+        "approximated.curve",
+        Approximated,
+        "Keep the source file where exact curves matter: RustGIS draws curves as straight segments."
+    ),
+    AssumedNullMarker => (
+        "assumed.null-marker",
+        Assumed,
+        "Write the value another way if the text Null is meant as text, not as an empty value."
+    ),
+    AssumedCrs => (
+        "assumed.crs",
+        Assumed,
+        "Give the coordinate system the coordinates are in (\"crs\" when adding the data, or Define Projection)."
+    ),
+    AssumedEncoding => (
+        "assumed.encoding",
+        Assumed,
+        "Give the file's encoding in a form RustGIS reads: a .cpg beside a Shapefile or dBASE file naming UTF-8 or its Windows code page, or a DXF saved as UTF-8."
+    ),
 }
 
 impl LossCode {

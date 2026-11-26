@@ -8,8 +8,9 @@ use egui::{Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke,
 use rustgis_engine::map::layout::{
     Arrange, ArrowStyle, Background, ChartOrder, CoordFormat, Element, ElementKind, Grid, GridKind, GridStyle, INK, LAYOUT_TEXT_SIZE,
     Layout, LineHead, MAX_BACKGROUND_PADDING, MAX_BACKGROUND_RADIUS, MAX_BACKGROUND_WIDTH, MAX_CHART_BARS, MAX_CHART_DECIMALS,
-    MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE,
-    Orientation, PT_PER_MM, ScaleBarStyle, ScaleUnits, TextAlign, TickSide, chart_stack_refusal, frame_camera, line_angle, line_length,
+    MAX_COLORBAR_TICKS, MAX_FRAME_SCALE, MAX_GRID_WIDTH, MAX_LEGEND_COLUMNS, MAX_SCALE_BEFORE_ZERO, MAX_SCALE_DECIMALS,
+    MAX_SCALE_DIVISIONS, MAX_SCALE_SUBDIVISIONS, MAX_TICK_MM, MIN_FRAME_SCALE, Orientation, PT_PER_MM, ScaleBarFit, ScaleBarStyle,
+    ScaleLabelPosition, ScaleUnits, TextAlign, TickSide, UnitLabelPosition, chart_stack_refusal, frame_camera, line_angle, line_length,
 };
 use rustgis_engine::map::report::StatKind;
 use rustgis_engine::map::symbology::Dash;
@@ -158,6 +159,9 @@ pub struct LayoutView {
     /// Text being typed into the element properties, by (layout, element, field): kept here so
     /// keystrokes survive the frame, and saved when the field loses focus or stops being shown.
     typing: std::collections::HashMap<(usize, u32, &'static str), String>,
+    /// The layouts (their [`Layout::instance_id`]), in their order, when `typing` last followed
+    /// them ([`follow_project`]).
+    typing_order: Vec<u64>,
     /// The layout shown, shared between frames until the project changes (layouts can hold
     /// megabytes of pictures, too much to copy every frame), keyed by layout and revision.
     shown: Option<(usize, u64, std::rc::Rc<Layout>)>,
@@ -228,6 +232,18 @@ pub(crate) fn follow_project(app: &mut RustGisApp) {
     app.layout.views.retain(|name, _| named(name));
     if app.layout.viewed.as_deref().is_some_and(|name| !named(name)) {
         app.layout.viewed = None;
+    }
+    // Text being typed is kept by its layout's place: when the layouts change places (a move, a
+    // removal, a copy, an undo, from the app, an agent or a script), it follows its layout, renamed
+    // or not (#2802). With its layout gone it goes too, even for a new layout given its name.
+    if !app.layout.typing_order.iter().copied().eq(layouts.iter().map(Layout::instance_id)) {
+        let was = std::mem::replace(&mut app.layout.typing_order, layouts.iter().map(Layout::instance_id).collect());
+        let now = &app.layout.typing_order;
+        let typing = std::mem::take(&mut app.layout.typing);
+        app.layout.typing = typing
+            .into_iter()
+            .filter_map(|((l, id, field), text)| Some(((now.iter().position(|m| Some(m) == was.get(l))?, id, field), text)))
+            .collect();
     }
 }
 
@@ -693,6 +709,9 @@ fn shown_layout(app: &mut RustGisApp, li: usize) -> Option<std::rc::Rc<Layout>> 
     }
 }
 
+/// The layout view: the active layout's page with its elements, rulers and guides, drawn from a
+/// texture rendered at screen resolution and redrawn when the layout changes. Clicks, drags and
+/// keys go through `interact`; the selected element's right-click menu is `element_menu`.
 pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     let Some(li) = app.session.active_layout else { return };
     let Some(layout) = shown_layout(app, li) else { return };
@@ -720,8 +739,16 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     painter.rect_filled(area, 0.0, if t.dark { Color32::from_gray(38) } else { Color32::from_rgb(0xD9, 0xDD, 0xE3) });
     let (page, s) = page_rect(&app.layout, area, &layout);
     interact(app, ui, &resp, &layout, li, page, s);
-    // The properties or a drag may have just changed the layout: draw the page as it is now,
-    // or the texture would be keyed to the new revision but show the old layout (#325).
+    // The right-click menu of the selected element: a right-click on empty page cleared the
+    // selection, so none opens there, nor while a drawing tool is picked. Before the page is
+    // drawn, as its rows change the layout.
+    if app.layout.tool.is_none()
+        && let Some(id) = app.layout.selected.filter(|&id| layout.element(id).is_some())
+    {
+        resp.context_menu(|ui| element_menu(app, ui, &layout, li, id));
+    }
+    // The properties, a drag or the menu may have just changed the layout: draw the page as it is
+    // now, or the texture would be keyed to the new revision but show the old layout (#325).
     let Some(layout) = shown_layout(app, li) else { return };
     let (page, s) = page_rect(&app.layout, area, &layout);
 
@@ -795,7 +822,8 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     }
     // Shadow, page, elements.
     painter.rect_filled(page.translate(vec2(3.0, 4.0)), 2.0, Color32::from_black_alpha(50));
-    painter.rect_filled(page, 0.0, Color32::WHITE);
+    // The page's colour (#2855), shown until the page's texture is drawn over it.
+    painter.rect_filled(page, 0.0, layout.paper.map_or(Color32::WHITE, crate::theme::c32));
     let pointer = ui.input(|i| i.pointer.latest_pos());
     if let Some(tex) = &app.layout.texture {
         painter.image(tex.id(), page, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
@@ -1007,6 +1035,9 @@ fn locked(layout: &Layout, id: u32) -> bool {
     layout.element(id).is_some_and(|e| e.locked)
 }
 
+/// What the pointer does on the page `resp` covers: the wheel zooms the page or a map frame's map,
+/// a click or right-click selects the element under it, a drag moves, resizes, rotates or pans
+/// one (or drags a guide out of a ruler), and a tool picked from the ribbon draws a frame.
 fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &Layout, li: usize, page: Rect, s: f32) {
     // A map frame's wheel zoom is applied once the wheel has stopped.
     let now = ui.input(|i| i.time);
@@ -1146,7 +1177,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
     // A click on a ruler, or on the selected element's handle (which can stick out over another
     // element), keeps the selection: where the click started, as the pointer may have moved a
     // little by the release. A press serves one click or drag, never a later one.
-    let pressed = if resp.clicked() || resp.drag_started() { app.layout.pressed.take() } else { None };
+    let pressed = if resp.clicked() || resp.secondary_clicked() || resp.drag_started() { app.layout.pressed.take() } else { None };
     if resp.clicked()
         && let Some(p) = pointer_mm
         && pressed.or(resp.interact_pointer_pos()).is_none_or(|pos| {
@@ -1159,6 +1190,23 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, layout: &L
         // A click on the element already selected brings back the pane closed over it.
         if app.layout.selected.is_some_and(|id| app.layout.formatted == Some((li, id))) {
             app.ui.open_right(crate::RightPane::Format);
+        }
+    }
+    // A right-click selects what is under it, unless that is selected already, and so opens the
+    // element's menu (see `show`); on empty page it clears the selection, as a click does. Pressed
+    // on a ruler, or on the selected element's handle or rotation knob, it keeps the selection, as
+    // a click does there.
+    if resp.secondary_clicked()
+        && let Some(p) = pointer_mm
+        && pressed.or(resp.interact_pointer_pos()).is_none_or(|pos| {
+            ruler_at(&app.layout, resp.rect, pos).is_none()
+                && handle_at(app, layout, page, s, pos).is_none()
+                && rotate_at(app, layout, page, s, pos).is_none()
+        })
+    {
+        let hit = layout.hit(p.0, p.1);
+        if hit != app.layout.selected {
+            app.layout.selected = hit;
         }
     }
     if resp.double_clicked()
@@ -1346,10 +1394,13 @@ pub(crate) fn save_drafts(app: &mut RustGisApp) {
             ("text", ElementKind::Text { text, .. }) => Some(text.clone()),
             ("title", ElementKind::Legend { title, .. } | ElementKind::Colorbar { title, .. }) => Some(title.clone()),
             ("title", ElementKind::Chart { title, .. }) => title.clone(),
+            ("unitLabel", ElementKind::ScaleBar { unit_label, .. }) => Some(unit_label.clone().unwrap_or_default()),
             _ => None,
         });
         if current.is_some_and(|c| c != text) {
-            let _ = app.run("layout.update", json!({"layout": l, "element": id, field: text}));
+            // An emptied unit label gives the unit's abbreviation back, as the field does.
+            let value = if field == "unitLabel" && text.is_empty() { Value::Null } else { json!(text) };
+            let _ = app.run("layout.update", json!({"layout": l, "element": id, field: value}));
         }
     }
 }
@@ -1386,12 +1437,28 @@ fn text_field(
     multiline: bool,
     label_id: egui::Id,
 ) -> Option<String> {
+    hinted_text_field(app, ui, key, current, multiline, None, label_id)
+}
+
+/// [`text_field`] showing `hint` while it's empty.
+fn hinted_text_field(
+    app: &mut RustGisApp,
+    ui: &mut Ui,
+    key: (usize, u32, &'static str),
+    current: &str,
+    multiline: bool,
+    hint: Option<&str>,
+    label_id: egui::Id,
+) -> Option<String> {
     let mut buf = app.layout.typing.remove(&key).unwrap_or_else(|| current.to_string());
-    let edit = if multiline {
+    let mut edit = if multiline {
         egui::TextEdit::multiline(&mut buf).desired_rows(3).desired_width(240.0)
     } else {
         egui::TextEdit::singleline(&mut buf)
     };
+    if let Some(hint) = hint {
+        edit = edit.hint_text(hint);
+    }
     let r = ui.add(edit).labelled_by(label_id);
     if r.lost_focus() {
         return (buf != current).then_some(buf);
@@ -2004,7 +2071,22 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             ui.end_row();
                         }
                     }
-                    ElementKind::ScaleBar { units, divisions, style, color, fill, text_size, .. } => {
+                    ElementKind::ScaleBar {
+                        units,
+                        divisions,
+                        style,
+                        color,
+                        fill,
+                        text_size,
+                        subdivisions,
+                        divisions_before_zero,
+                        label_position,
+                        unit_label,
+                        unit_label_position,
+                        decimals,
+                        fit,
+                        ..
+                    } => {
                         let input_label = ui.label(tl!("Style"));
                         egui::ComboBox::from_id_salt(("scale_style", id))
                             .selected_text(tl!(style.label()))
@@ -2035,7 +2117,11 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let mut n = *divisions as u64;
                         let drag = Dragged::lend(ui, drag_key("divisions"), &mut n);
                         let r = ui
-                            .add(egui::DragValue::new(&mut n).update_while_editing(false).range(1..=MAX_SCALE_DIVISIONS as u64))
+                            .add(
+                                egui::DragValue::new(&mut n)
+                                    .update_while_editing(false)
+                                    .range(1..=MAX_SCALE_DIVISIONS.saturating_sub(*divisions_before_zero).max(1) as u64),
+                            )
                             .labelled_by(input_label.id);
                         if drag.settled(ui, &r, &mut n) && n as usize != *divisions {
                             update(app, json!({"divisions": n}));
@@ -2044,6 +2130,132 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         // Its labels' points; their room follows, the bar keeping its size (#2581).
                         if let Some(pt) = text_size_row(ui, tl!("Text size"), drag_key("textSize"), *text_size) {
                             update(app, json!({"textSize": pt}));
+                        }
+                        // Each division split into parts, and divisions left of zero.
+                        for (label, key, current, max) in [
+                            (tl!("Subdivisions"), "subdivisions", *subdivisions, MAX_SCALE_SUBDIVISIONS),
+                            (
+                                tl!("Divisions before zero"),
+                                "divisionsBeforeZero",
+                                *divisions_before_zero,
+                                MAX_SCALE_BEFORE_ZERO.min(MAX_SCALE_DIVISIONS.saturating_sub(*divisions)),
+                            ),
+                        ] {
+                            let input_label = ui.label(label);
+                            let mut n = current as u64;
+                            let drag = Dragged::lend(ui, drag_key(key), &mut n);
+                            let r = ui
+                                .add(egui::DragValue::new(&mut n).update_while_editing(false).range(0..=max as u64))
+                                .labelled_by(input_label.id);
+                            let settled = drag.settled(ui, &r, &mut n);
+                            // One subdivision is none: the bar keeps 0, so 1 changes nothing.
+                            if key == "subdivisions" && n == 1 {
+                                n = 0;
+                            }
+                            if settled && n as usize != current {
+                                update(app, json!({key: n}));
+                            }
+                            ui.end_row();
+                        }
+                        // The numbers' decimal places, as a chart's: automatic, as each label needs, or fixed.
+                        let input_label = ui.label(tl!("Decimals"));
+                        let auto = tl!("Automatic");
+                        let mut items = vec![(auto.to_string(), decimals.is_none(), json!("auto"))];
+                        items.extend((0..=MAX_SCALE_DECIMALS as u8).map(|d| (d.to_string(), *decimals == Some(d), json!(d))));
+                        let current = decimals.map_or(auto.to_string(), |d| d.to_string());
+                        if let Some(v) = choice(ui, ("scale_decimals", id), input_label.id, &current, &items) {
+                            update(app, json!({"decimals": v}));
+                        }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Label position"));
+                        egui::ComboBox::from_id_salt(("scale_labels", id))
+                            .selected_text(tl!(label_position.label()))
+                            .show_ui(ui, |ui| {
+                                for v in ScaleLabelPosition::ALL {
+                                    if ui.selectable_label(*label_position == v, tl!(v.label())).clicked() && *label_position != v {
+                                        update(app, json!({"labelPosition": v.code()}));
+                                    }
+                                }
+                            })
+                            .response
+                            .labelled_by(input_label.id);
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Fit"));
+                        egui::ComboBox::from_id_salt(("scale_fit", id))
+                            .selected_text(tl!(fit.label()))
+                            .show_ui(ui, |ui| {
+                                for v in ScaleBarFit::ALL {
+                                    if ui.selectable_label(*fit == v, tl!(v.label())).clicked() && *fit != v {
+                                        update(app, json!({"fit": v.code()}));
+                                    }
+                                }
+                            })
+                            .response
+                            .labelled_by(input_label.id);
+                        ui.end_row();
+                        // Unticked, the bar prints no unit; ticked again, the label typed before
+                        // it was hidden (kept for the session), else the unit's abbreviation.
+                        let input_label = ui.label(tl!("Show unit label"));
+                        let shows_unit = unit_label.as_deref() != Some("");
+                        let mut on = shows_unit;
+                        if ui.checkbox(&mut on, "").labelled_by(input_label.id).changed() {
+                            // Kept per project and per layout name too, so another project's
+                            // bar, or another layout's once a layout before it is deleted, never
+                            // gets this one's text; a renamed layout forgets it.
+                            let kept = egui::Id::unique(("scale_unit_label_kept", app.session.opened, li, layout.name.as_str(), id));
+                            // The label being typed is dropped, so the field losing its focus
+                            // doesn't write it back; hidden, it is the text kept.
+                            let draft = app.layout.typing.remove(&(li, id, "unitLabel"));
+                            if on {
+                                // Read, not taken: a show that is undone can be shown again.
+                                let typed = ui.ctx().data(|d| d.get_temp::<String>(kept)).filter(|t| !t.is_empty());
+                                update(app, json!({"unitLabel": typed.map_or(Value::Null, Value::String)}));
+                            } else {
+                                // Every hide keeps the text hidden now, and forgets an older one
+                                // once the label is back to the abbreviation.
+                                match draft.or_else(|| unit_label.clone()).filter(|t| !t.is_empty()) {
+                                    Some(text) => {
+                                        ui.ctx().data_mut(|d| d.insert_temp(kept, text));
+                                    }
+                                    None => {
+                                        ui.ctx().data_mut(|d| d.remove_temp::<String>(kept));
+                                    }
+                                }
+                                update(app, json!({"unitLabel": ""}));
+                            }
+                        }
+                        ui.end_row();
+                        if shows_unit {
+                            let input_label = ui.label(tl!("Unit label"));
+                            let current = unit_label.as_deref().unwrap_or("");
+                            // Left empty, the bar prints the unit's abbreviation; an automatic
+                            // unit's depends on the frame's scale.
+                            let hint = match *units {
+                                ScaleUnits::Auto => tl!("Unit's abbreviation"),
+                                fixed => fixed.resolve(0.0).1,
+                            };
+                            if let Some(text) =
+                                hinted_text_field(app, ui, (li, id, "unitLabel"), current, false, Some(hint), input_label.id)
+                            {
+                                // Emptied, the field gives the unit's abbreviation back.
+                                update(app, json!({"unitLabel": if text.is_empty() { Value::Null } else { json!(text) }}));
+                            }
+                            ui.end_row();
+                            let input_label = ui.label(tl!("Unit label position"));
+                            egui::ComboBox::from_id_salt(("scale_unit_label", id))
+                                .selected_text(tl!(unit_label_position.label()))
+                                .show_ui(ui, |ui| {
+                                    for v in UnitLabelPosition::ALL {
+                                        if ui.selectable_label(*unit_label_position == v, tl!(v.label())).clicked()
+                                            && *unit_label_position != v
+                                        {
+                                            update(app, json!({"unitLabelPosition": v.code()}));
+                                        }
+                                    }
+                                })
+                                .response
+                                .labelled_by(input_label.id);
+                            ui.end_row();
                         }
                         // The fill is the alternating bar's light divisions: the other styles draw none.
                         let colors = [("Color", "color", *color), ("Fill", "fill", *fill)];
@@ -2076,6 +2288,10 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         label_align,
                         classes,
                         stack,
+                        mirror,
+                        max,
+                        hide_labels,
+                        bar_outline,
                         ..
                     } => {
                         // The feature layers of the frame's map, and the fields of the chart's layer (#2487).
@@ -2243,8 +2459,89 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                             update(app, json!({"barColor": crate::theme::rgba(c).hex()}));
                         }
                         ui.end_row();
+                        // Facing another chart (#2487 part 4): its labels left out, its bars the other
+                        // way round, on a scale it shares.
+                        let input_label = ui.label(tl!("Hide labels"));
+                        let mut on = *hide_labels;
+                        if ui.checkbox(&mut on, "").labelled_by(input_label.id).changed() {
+                            update(app, json!({"hideLabels": on}));
+                        }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Mirror"));
+                        let mut on = *mirror;
+                        if ui.checkbox(&mut on, "").labelled_by(input_label.id).changed() {
+                            update(app, json!({"mirror": on}));
+                        }
+                        ui.end_row();
+                        let input_label = ui.label(tl!("Maximum"));
+                        ui.horizontal(|ui| {
+                            // As the chart reads it: a maximum not above 0, from a file, isn't used.
+                            let fixed = rustgis_engine::map::layout::chart_max(*max);
+                            let mut auto = fixed.is_none();
+                            if ui.checkbox(&mut auto, tl!("Automatic")).labelled_by(input_label.id).changed() {
+                                // Fixed, it starts from where its bars reach, so none runs past it yet.
+                                let reach = || {
+                                    let (m, env) =
+                                        rustgis_engine::render::layout::frame_page_env(layout, &app.session.project.maps, *frame)?;
+                                    let data = e.kind.chart_data_of(m.layer_by_name(layer)?, &env)?;
+                                    Some(rustgis_engine::render::layout::chart_span(&data).1).filter(|v| *v > 0.0)
+                                };
+                                let to = if auto { json!("auto") } else { json!(reach().unwrap_or(100.0)) };
+                                update(app, json!({"max": to}));
+                            }
+                            if let Some(m) = fixed {
+                                let mut v = m;
+                                let drag = Dragged::lend(ui, drag_key("chart_max"), &mut v);
+                                let r = ui
+                                    .add(egui::DragValue::new(&mut v).update_while_editing(false).range(1e-6..=1e15).speed(m * 0.01))
+                                    .labelled_by(input_label.id);
+                                if drag.settled(ui, &r, &mut v) && v != m {
+                                    update(app, json!({"max": v}));
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        // A line round each bar (#2487 part 4b): its colour and width once drawn.
+                        let input_label = ui.label(tl!("Bar outline"));
+                        ui.horizontal(|ui| {
+                            let shown = rustgis_engine::map::layout::chart_outline(*bar_outline);
+                            let mut on = shown.is_some();
+                            if ui.checkbox(&mut on, "").labelled_by(input_label.id).changed() {
+                                update(app, json!({"barOutline": if on { json!({}) } else { Value::Null }}));
+                            }
+                            if let Some(o) = shown {
+                                let mut c = crate::theme::c32(o.color);
+                                let resp = crate::widgets::color_button(ui, &mut c);
+                                if resp.changed() {
+                                    crate::widgets::one_step_per_press(app, &resp);
+                                    update(app, json!({"barOutline": {"color": crate::theme::rgba(c).hex()}}));
+                                }
+                                let mut w = o.width;
+                                let drag = Dragged::lend(ui, drag_key("barOutline"), &mut w);
+                                let max = rustgis_engine::map::layout::MAX_CHART_OUTLINE_WIDTH;
+                                let r = ui
+                                    .add(
+                                        egui::DragValue::new(&mut w)
+                                            .update_while_editing(false)
+                                            // From 0, as the commands take it: any saved width
+                                            // shows as it is, and 0 takes the outline off.
+                                            .range(0.0..=max)
+                                            .speed(0.05)
+                                            .max_decimals(2)
+                                            .suffix(" pt"),
+                                    )
+                                    .labelled_by(input_label.id);
+                                // A width typed and left as the box is turned off in the same
+                                // frame is let go: sent after the null, it would bring the outline
+                                // back. `settled` still runs, so the edit is cleared.
+                                if drag.settled(ui, &r, &mut w) && on && (w - o.width).abs() > 1e-6 {
+                                    update(app, json!({"barOutline": {"width": w}}));
+                                }
+                            }
+                        });
+                        ui.end_row();
                         // Columns have their labels centred under them.
-                        if !vertical {
+                        if !vertical && !*hide_labels {
                             ui.label(tl!("Labels"));
                             ui.horizontal(|ui| {
                                 let right = *label_align == TextAlign::Right;
@@ -2380,7 +2677,8 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
                         let mut on = ink.is_some();
                         let hint = tl!("Its own colour for its text and lines; off, the default dark grey");
                         if ui.checkbox(&mut on, "").labelled_by(input_label.id).on_hover_text(hint).changed() {
-                            update(app, json!({"color": on.then(|| first_ink(e.background.as_ref()).hex())}));
+                            let page = layout.paper.unwrap_or(rustgis_engine::map::Rgba::rgb(0xFF, 0xFF, 0xFF));
+                            update(app, json!({"color": on.then(|| first_ink(e.background.as_ref(), page).hex())}));
                         }
                         let Some(current) = ink else { return };
                         let mut c = crate::theme::c32(current);
@@ -2396,12 +2694,28 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         );
     });
     // A layout's text: the form a text graphic has too (#516, #535), with the page's dynamic text.
-    if let ElementKind::Text { text, size, color, bold, italic, align, letter_spacing, font, font_name, wrap, .. } = &e.kind {
+    if let ElementKind::Text {
+        text,
+        size,
+        color,
+        bold,
+        italic,
+        align,
+        letter_spacing,
+        font,
+        font_name,
+        wrap,
+        valign,
+        line_spacing,
+        case,
+        ..
+    } = &e.kind
+    {
         let key = (li, id, "text");
         let mut buf = app.layout.typing.remove(&key).unwrap_or_else(|| text.clone());
         let (mut sz, mut c, mut bb) = (*size, crate::theme::c32(*color), *bold);
         let (mut it, mut al, mut ls, mut fam, mut named) = (*italic, *align, *letter_spacing, *font, font_name.clone());
-        let mut wr = *wrap;
+        let (mut wr, mut va, mut line_sp, mut cs) = (*wrap, valign.kept(), *line_spacing, case.kept());
         let tokens = [rustgis_engine::map::graphics::TOKENS, rustgis_engine::map::layout::PAGE_TOKENS];
         let warning = app
             .layout
@@ -2419,6 +2733,9 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
             align: Some(&mut al),
             wrap: Some(&mut wr),
             warning,
+            valign: Some(&mut va),
+            line_spacing: Some(&mut line_sp),
+            case: Some(&mut cs),
             letter_spacing: Some(&mut ls),
             font: Some(&mut fam),
             font_name: Some(&mut named),
@@ -2450,6 +2767,15 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
         }
         if settled.wrap {
             update(app, json!({"wrap": wr}));
+        }
+        if settled.valign {
+            update(app, json!({"valign": va.code()}));
+        }
+        if settled.line_spacing {
+            update(app, json!({"lineSpacing": line_sp}));
+        }
+        if settled.case {
+            update(app, json!({"case": cs.code()}));
         }
         if settled.letter_spacing {
             update(app, json!({"letterSpacing": ls}));
@@ -2614,10 +2940,8 @@ fn properties(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize) {
 fn element_actions(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize, id: u32) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if ui.button(tl!("Duplicate")).on_hover_text(tl!("Copy this element (Ctrl+D, ⌘D on a Mac)")).clicked()
-            && let Ok(v) = app.run("layout.duplicateElement", json!({"layout": li, "element": id}))
-        {
-            app.layout.selected = v["element"].as_u64().and_then(|v| u32::try_from(v).ok());
+        if ui.button(tl!("Duplicate")).on_hover_text(tl!("Copy this element (Ctrl+D, ⌘D on a Mac)")).clicked() {
+            duplicate_element(app, li, id);
         }
         if ui
             .add_enabled(layout.locked_in_removal(id).is_none(), egui::Button::new(tl!("Delete Element")))
@@ -2625,31 +2949,94 @@ fn element_actions(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize
             .on_disabled_hover_text(locked_delete())
             .clicked()
         {
-            let _ = app.run("layout.removeElement", json!({"layout": li, "element": id}));
-            app.layout.selected = None;
+            delete_element(app, li, id);
         }
     });
     // The drawing order: a legend brought to the front is drawn over the map frame under it.
-    // A step it can't take (already on top, or at the bottom) is greyed, as is a locked element.
-    let Some((at, n)) = layout.draw_order(id) else { return };
-    let locked = layout.element(id).is_some_and(|e| e.locked);
     ui.horizontal_wrapped(|ui| {
         for to in Arrange::ALL {
-            let can = match to {
-                Arrange::Front | Arrange::Forward => at + 1 < n,
-                Arrange::Backward | Arrange::Back => at > 0,
-            };
-            let tip = match to {
-                Arrange::Front => "Draw it over every other element",
-                Arrange::Forward => "Draw it over the element above it",
-                Arrange::Backward => "Draw it under the element below it",
-                Arrange::Back => "Draw it under every other element",
-            };
-            if ui.add_enabled(can && !locked, egui::Button::new(tl!(to.label()))).on_hover_text(tl!(tip)).clicked() {
-                let _ = app.run("layout.arrange", json!({"layout": li, "element": id, "to": to.code()}));
+            if ui.add_enabled(can_arrange(layout, id, to), egui::Button::new(tl!(to.label()))).on_hover_text(tl!(arrange_tip(to))).clicked()
+            {
+                arrange_element(app, li, id, to);
             }
         }
     });
+}
+
+/// Copies an element and selects the copy (the Format pane's Duplicate and the right-click menu's).
+fn duplicate_element(app: &mut RustGisApp, li: usize, id: u32) {
+    if let Ok(v) = app.run("layout.duplicateElement", json!({"layout": li, "element": id})) {
+        app.layout.selected = v["element"].as_u64().and_then(|v| u32::try_from(v).ok());
+    }
+}
+
+/// Deletes an element (the Format pane's Delete Element and the right-click menu's). The caller
+/// offers it only where [`Layout::locked_in_removal`] allows it; the command refuses otherwise.
+fn delete_element(app: &mut RustGisApp, li: usize, id: u32) {
+    let _ = app.run("layout.removeElement", json!({"layout": li, "element": id}));
+    app.layout.selected = None;
+}
+
+/// Moves an element in the drawing order (the Format pane's buttons and the right-click menu's).
+fn arrange_element(app: &mut RustGisApp, li: usize, id: u32, to: Arrange) {
+    let _ = app.run("layout.arrange", json!({"layout": li, "element": id, "to": to.code()}));
+}
+
+/// Whether the step `to` in the drawing order moves element `id`: not one it can't take (already
+/// on top, or at the bottom), and not a locked element's.
+fn can_arrange(layout: &Layout, id: u32, to: Arrange) -> bool {
+    let Some((at, n)) = layout.draw_order(id) else { return false };
+    let locked = layout.element(id).is_some_and(|e| e.locked);
+    let step = match to {
+        Arrange::Front | Arrange::Forward => at + 1 < n,
+        Arrange::Backward | Arrange::Back => at > 0,
+    };
+    step && !locked
+}
+
+/// What an arrange step does, for its tooltip.
+fn arrange_tip(to: Arrange) -> &'static str {
+    match to {
+        Arrange::Front => "Draw it over every other element",
+        Arrange::Forward => "Draw it over the element above it",
+        Arrange::Backward => "Draw it under the element below it",
+        Arrange::Back => "Draw it under every other element",
+    }
+}
+
+/// The menu right-clicking element `id` opens: Duplicate and Delete (with their keys), the four
+/// drawing-order steps, and for a map frame Zoom Frame. The rules are the Format pane's: a locked
+/// element can be duplicated but not deleted, and an arrange step it can't take is greyed. Each
+/// row runs the command the pane's button runs, so one Undo takes it back.
+fn element_menu(app: &mut RustGisApp, ui: &mut Ui, layout: &Layout, li: usize, id: u32) {
+    use crate::widgets::{menu_row, shortcut_text};
+    let duplicate = shortcut_text(ui.ctx(), app, "layout.duplicateElement");
+    if menu_row(ui, "", tl!("Duplicate"), &duplicate, true).on_hover_text(tl!("Copy this element")).clicked() {
+        duplicate_element(app, li, id);
+        ui.close();
+    }
+    let delete = shortcut_text(ui.ctx(), app, "edit.delete");
+    let can_delete = layout.locked_in_removal(id).is_none();
+    if menu_row(ui, "", tl!("Delete Element"), &delete, can_delete).on_disabled_hover_text(locked_delete()).clicked() {
+        delete_element(app, li, id);
+        ui.close();
+    }
+    ui.separator();
+    for to in Arrange::ALL {
+        if menu_row(ui, "", tl!(to.label()), "", can_arrange(layout, id, to)).on_hover_text(tl!(arrange_tip(to))).clicked() {
+            arrange_element(app, li, id, to);
+            ui.close();
+        }
+    }
+    if layout.element(id).is_some_and(|e| matches!(e.kind, ElementKind::MapFrame { .. })) {
+        ui.separator();
+        // As double-clicking the frame does: its map follows the map view.
+        let tip = tl!("Show the map view's extent in this frame");
+        if menu_row(ui, "", tl!("Zoom Frame"), "", true).on_hover_text(tip).clicked() {
+            let _ = app.run("layout.frameZoom", json!({"layout": li, "element": id, "to": "view"}));
+            ui.close();
+        }
+    }
 }
 
 /// The dash pattern of a layout line or outline `width` points wide, picked from the Symbology
@@ -2702,13 +3089,15 @@ fn choice(ui: &mut Ui, salt: (&str, u32), label: egui::Id, current: &str, items:
     picked
 }
 
-/// The ink an element starts with when Ink is turned on (#2257): white over a background that is
-/// dark once drawn on the white page, else the default dark grey, so its text never disappears.
-fn first_ink(background: Option<&Background>) -> rustgis_engine::map::Rgba {
-    let Some(fill) = background.map(|b| b.fill) else { return INK };
+/// The ink an element starts with when Ink is turned on (#2257): white over what shows under its
+/// text, its background drawn on the page (`page`, the page's colour, #2855), when that is dark,
+/// else the default dark grey, so its text never disappears.
+fn first_ink(background: Option<&Background>, page: rustgis_engine::map::Rgba) -> rustgis_engine::map::Rgba {
+    // No background: nothing drawn over the page, so the page itself shows under the text.
+    let fill = background.map_or(rustgis_engine::map::Rgba::new(0, 0, 0, 0), |b| b.fill);
     let a = u16::from(fill.a());
-    let over = |c: u8| u8::try_from((u16::from(c) * a + 255 * (255 - a)) / 255).unwrap_or(u8::MAX);
-    let shown = Color32::from_rgb(over(fill.r()), over(fill.g()), over(fill.b()));
+    let over = |c: u8, under: u8| u8::try_from((u16::from(c) * a + u16::from(under) * (255 - a)) / 255).unwrap_or(u8::MAX);
+    let shown = Color32::from_rgb(over(fill.r(), page.r()), over(fill.g(), page.g()), over(fill.b(), page.b()));
     let white = rustgis_engine::map::Rgba::rgb(0xFF, 0xFF, 0xFF);
     if crate::theme::contrast(shown, Color32::WHITE) > crate::theme::contrast(shown, crate::theme::c32(INK)) { white } else { INK }
 }
@@ -2760,14 +3149,21 @@ mod tests {
     fn ink_starts_readable_on_its_background() {
         use rustgis_engine::map::Rgba;
         use rustgis_engine::map::layout::{Background, INK};
-        let on = |fill: Rgba| first_ink(Some(&Background { fill, ..serde_json::from_value(json!({})).unwrap() }));
         let white = Rgba::rgb(0xFF, 0xFF, 0xFF);
-        assert_eq!(first_ink(None), INK);
+        let on = |fill: Rgba| first_ink(Some(&Background { fill, ..serde_json::from_value(json!({})).unwrap() }), white);
+        assert_eq!(first_ink(None, white), INK);
         assert_eq!(on(white), INK);
         assert_eq!(on(Rgba::rgb(0x1E, 0x29, 0x3B)), white);
         // A dark fill seen through mostly: the page shows, so it reads as light.
         assert_eq!(on(Rgba::new(0x1E, 0x29, 0x3B, 0x20)), INK);
         assert_eq!(on(Rgba::new(0x1E, 0x29, 0x3B, 0xE0)), white);
+        // On a dark page (#2855): white with no background, or over a fill the page shows through;
+        // dark grey over a light fill.
+        let navy = Rgba::rgb(0x0B, 0x1B, 0x2B);
+        let on_navy = |fill: Rgba| first_ink(Some(&Background { fill, ..serde_json::from_value(json!({})).unwrap() }), navy);
+        assert_eq!(first_ink(None, navy), white);
+        assert_eq!(on_navy(Rgba::new(0xFF, 0xFF, 0xFF, 0x20)), white);
+        assert_eq!(on_navy(white), INK);
     }
 
     /// In the browser, a page drawn while its frames' tiles were on their way is drawn again as
@@ -3530,6 +3926,165 @@ mod tests {
         assert_eq!(app.layout.selected, None);
     }
 
+    /// A right-click on the selected element's handle, where it sticks out over another element,
+    /// keeps the selection and opens the menu of the element the handle belongs to, as a click
+    /// there keeps it, also when the pointer moves off the handle before the release.
+    #[test]
+    fn right_clicking_a_handle_keeps_the_selection() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Handles"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let start = app.session.project.layouts[li].clone();
+        let title = start.elements.iter().find(|e| e.name == "Title").unwrap().id;
+        let frame = start.first_frame().unwrap();
+        let top = start.element(frame).unwrap().y;
+        let h_mm = start.element(title).unwrap().h;
+        // The title's lower edge on the frame's upper one, so its lower handles stick out over the map.
+        app.run("layout.update", json!({"layout": li, "element": title, "y": top - h_mm})).unwrap();
+        app.layout.selected = Some(title);
+        let layout = app.session.project.layouts[li].clone();
+        let area = Rc::new(Cell::new(Rect::NOTHING));
+        let shown = area.clone();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                shown.set(ui.available_rect_before_wrap());
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+        let e = layout.element(title).unwrap();
+        // Just below the lower middle handle: on the map frame, off the title, within the handle's reach.
+        let at = to_screen(page, s, (e.x + e.w / 2.0, e.y + e.h)) + vec2(0.0, 4.0);
+        let (x, y) = super::to_mm(page, s, at);
+        assert_eq!(layout.hit(x, y), Some(frame), "the point is on the map frame");
+        assert!(handle_at(h.state(), &layout, page, s, at).is_some(), "and on the title's handle");
+        let secondary =
+            |pos: Pos2, pressed| Event::PointerButton { pos, button: PointerButton::Secondary, pressed, modifiers: Modifiers::NONE };
+        h.event(Event::PointerMoved(at));
+        h.step();
+        h.event(secondary(at, true));
+        h.step();
+        h.event(secondary(at, false));
+        h.run_steps(3);
+        assert_eq!(h.state().layout.selected, Some(title), "the title stays selected");
+        assert!(h.query_by_label_contains("Duplicate").is_some(), "its menu opens");
+        assert!(h.query_by_label("Zoom Frame").is_none(), "the title's menu, not the frame's");
+
+        // Pressed on the handle, released a little off it (still a click): where it was pressed
+        // decides, as for a click.
+        h.event(Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+        h.run_steps(2);
+        let handle = to_screen(page, s, (e.x + e.w / 2.0, e.y + e.h));
+        let (press, release) = (handle + vec2(0.0, 10.0), handle + vec2(0.0, 15.0));
+        assert!(handle_at(h.state(), &layout, page, s, press).is_some(), "pressed on the handle");
+        assert!(handle_at(h.state(), &layout, page, s, release).is_none(), "released off it");
+        let (x, y) = super::to_mm(page, s, release);
+        assert_eq!(layout.hit(x, y), Some(frame), "on the map frame");
+        h.event(Event::PointerMoved(press));
+        h.step();
+        h.event(secondary(press, true));
+        h.step();
+        h.event(Event::PointerMoved(release));
+        h.step();
+        h.event(secondary(release, false));
+        h.run_steps(3);
+        assert_eq!(h.state().layout.selected, Some(title), "the title stays selected after the drift");
+    }
+
+    /// Right-clicking an element selects it and opens its menu: Send Backward moves it down the
+    /// drawing order in one Undo step, a locked element's Delete row is greyed, and a right-click
+    /// on empty page opens no menu.
+    #[test]
+    fn right_clicking_an_element_opens_its_menu() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Menu"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let layout = app.session.project.layouts[li].clone();
+        let title = layout.elements.iter().find(|e| e.name == "Title").unwrap().clone();
+        let frame = layout.first_frame().unwrap();
+        app.layout.selected = Some(frame);
+        let area = Rc::new(Cell::new(Rect::NOTHING));
+        let shown = area.clone();
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 760.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                shown.set(ui.available_rect_before_wrap());
+                super::show(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let (page, s) = page_rect(&h.state().layout, area.get(), &layout);
+        let (cx, cy) = (title.x + title.w / 2.0, title.y + title.h / 2.0);
+        assert_eq!(layout.hit(cx, cy), Some(title.id), "the point is on the title");
+        let at = to_screen(page, s, (cx, cy));
+        let secondary =
+            |pos: Pos2, pressed| Event::PointerButton { pos, button: PointerButton::Secondary, pressed, modifiers: Modifiers::NONE };
+        let order = |h: &egui_kittest::Harness<'_, RustGisApp>| h.state().session.project.layouts[li].draw_order(title.id).unwrap().0;
+        let right_click = |h: &mut egui_kittest::Harness<'_, RustGisApp>, pos: Pos2| {
+            h.event(Event::PointerMoved(pos));
+            h.step();
+            h.event(secondary(pos, true));
+            h.step();
+            h.event(secondary(pos, false));
+            h.run_steps(3);
+        };
+
+        right_click(&mut h, at);
+        assert_eq!(h.state().layout.selected, Some(title.id), "the right-click selected the title");
+        let before = order(&h);
+        assert!(before > 0, "the title has an element under it to go behind");
+        for row in ["Duplicate", "Delete Element", "Bring to Front", "Bring Forward", "Send Backward", "Send to Back"] {
+            assert!(h.query_by_label_contains(row).is_some(), "{row} is in the menu");
+        }
+        assert!(h.query_by_label("Zoom Frame").is_none(), "Zoom Frame is for a map frame");
+        assert!(!h.get_by_label_contains("Delete Element").accesskit_node().is_disabled());
+        h.get_by_label("Send Backward").click();
+        h.step();
+        // The page is drawn, in the frame the row changed the layout, from the layout as it is
+        // now: a snapshot taken before would be keyed to the new revision but show the old order.
+        assert_eq!(
+            h.state().layout.shown.as_ref().map(|(_, rev, _)| *rev),
+            Some(h.state().session.revision),
+            "the page drawn after the menu's change is the changed layout"
+        );
+        h.run_steps(2);
+        assert_eq!(order(&h), before - 1, "Send Backward moved it one step down");
+        assert!(h.query_by_label("Send Backward").is_none(), "choosing a row closes the menu");
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        assert_eq!(order(&h), before, "one Undo restores the order");
+
+        // A locked element can be copied but not deleted.
+        h.state_mut().run("layout.update", json!({"layout": li, "element": title.id, "locked": true})).unwrap();
+        h.run_steps(2);
+        right_click(&mut h, at);
+        assert!(h.get_by_label_contains("Delete Element").accesskit_node().is_disabled(), "a locked element isn't deleted");
+        assert!(!h.get_by_label_contains("Duplicate").accesskit_node().is_disabled());
+        assert!(h.get_by_label("Send Backward").accesskit_node().is_disabled(), "nor moved in the order");
+
+        // On empty page, the selection is cleared and no menu opens.
+        let bare = to_screen(page, s, (layout.width - 1.0, layout.height - 1.0));
+        assert_eq!(layout.hit(layout.width - 1.0, layout.height - 1.0), None, "the corner is empty page");
+        right_click(&mut h, bare);
+        assert_eq!(h.state().layout.selected, None);
+        assert!(h.query_by_label_contains("Duplicate").is_none(), "no menu on empty page");
+    }
+
     /// A locked element is selected, but a drag from inside it or from where its corner handle
     /// would be doesn't move or resize it, and Delete keeps it and says why (#536).
     #[test]
@@ -3684,6 +4239,81 @@ mod tests {
         assert!(!wraps(h.state()));
     }
 
+    /// A text element's Vertical alignment, Line spacing and Case in the Format pane: shown at their
+    /// defaults on opening, each change one undo step, the same value picked again none, a spacing
+    /// past the widest set at the widest.
+    #[test]
+    fn a_texts_block_alignment_line_spacing_and_case_are_one_undo_step_each() {
+        use egui::accesskit::{Action, ActionData, ActionRequest, Role};
+        use egui_kittest::kittest::{NodeT, Queryable};
+        use rustgis_engine::map::layout::{ElementKind, TextCase, TextVAlign};
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Notes"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let title = app.session.project.layouts[li].elements.iter().find(|e| e.name == "Title").unwrap().id;
+        app.layout.selected = Some(title);
+        let block = |app: &RustGisApp| match &app.session.project.layouts[li].element(title).unwrap().kind {
+            ElementKind::Text { valign, line_spacing, case, .. } => (*valign, *line_spacing, *case),
+            other => panic!("{other:?}"),
+        };
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        let depth = h.state().session.undo_depth();
+        h.run_steps(3);
+        // Opening the pane sends nothing, and shows a plain text's defaults.
+        assert_eq!(h.state().session.undo_depth(), depth, "opening the pane changed nothing");
+        assert_eq!(block(h.state()), (TextVAlign::Top, 1.0, TextCase::None));
+        assert_eq!(h.get_by_role_and_label(Role::ComboBox, "Vertical alignment").value().as_deref(), Some("Top"));
+        assert_eq!(h.get_by_role_and_label(Role::ComboBox, "Case").value().as_deref(), Some("As typed"));
+        assert_eq!(h.get_by_role_and_label(Role::SpinButton, "Line spacing").accesskit_node().numeric_value(), Some(1.0));
+        let pick = |h: &mut egui_kittest::Harness<'_, RustGisApp>, list: &str, item: &str| {
+            h.get_by_role_and_label(Role::ComboBox, list).click();
+            h.run_steps(2);
+            h.get_by_label(item).click();
+            h.run_steps(3);
+        };
+        pick(&mut h, "Vertical alignment", "Middle");
+        assert_eq!(block(h.state()).0, TextVAlign::Middle);
+        assert_eq!(h.state().session.undo_depth(), depth + 1, "one step");
+        pick(&mut h, "Vertical alignment", "Middle");
+        assert_eq!(h.state().session.undo_depth(), depth + 1, "the same item again is no step");
+        pick(&mut h, "Case", "Lower case");
+        assert_eq!(block(h.state()).2, TextCase::Lower);
+        assert_eq!(h.state().session.undo_depth(), depth + 2);
+        // The spacing set as assistive technology does.
+        let set_spacing = |h: &mut egui_kittest::Harness<'_, RustGisApp>, v: f64| {
+            let (node, tree) = h.get_by_role_and_label(Role::SpinButton, "Line spacing").accesskit_node().locate();
+            h.event(egui::Event::AccessKitActionRequest(ActionRequest {
+                action: Action::SetValue,
+                target_tree: tree,
+                target_node: node,
+                data: Some(ActionData::NumericValue(v)),
+            }));
+            h.run_steps(3);
+        };
+        set_spacing(&mut h, 1.5);
+        assert_eq!(block(h.state()), (TextVAlign::Middle, 1.5, TextCase::Lower));
+        assert_eq!(h.state().session.undo_depth(), depth + 3);
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        assert_eq!(block(h.state()), (TextVAlign::Middle, 1.0, TextCase::Lower), "one step undoes the spacing alone");
+        // Past the widest: set at the widest, in one step.
+        h.run_steps(3);
+        let before = h.state().session.undo_depth();
+        set_spacing(&mut h, 5.0);
+        assert_eq!(block(h.state()), (TextVAlign::Middle, 3.0, TextCase::Lower));
+        assert_eq!(h.state().session.undo_depth(), before + 1, "one step");
+    }
+
     /// The Format pane tells lines below a text's box from lines past the 200 a text draws, and
     /// says both when it loses both, as the command's notice does (#2346).
     #[test]
@@ -3698,6 +4328,7 @@ mod tests {
             below_box,
             past_limit,
             off_page: false,
+            unit_label: None,
         };
         assert_eq!(lines_left_out_label(&loss(0, false, false)), None);
         assert_eq!(lines_left_out_label(&loss(3, true, false)).as_deref(), Some("3 lines don't fit the box"));
@@ -3734,6 +4365,163 @@ mod tests {
         h.state_mut().run("layout.update", json!({"element": id, "h": 40})).unwrap();
         h.run_steps(3);
         assert!(h.query_by_label("2 lines don't fit the box").is_none(), "they fit");
+    }
+
+    /// A scale bar's details are set in the Format pane through layout.update, each one undo step.
+    #[test]
+    fn a_scale_bar_takes_its_details_in_the_format_pane() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::{NodeT, Queryable};
+        use rustgis_engine::map::layout::{ElementKind, ScaleBarFit, ScaleLabelPosition};
+        let mut app = RustGisApp::with_sample();
+        app.run("layout.new", json!({"name": "Bar", "template": "map"})).unwrap();
+        let li = app.session.active_layout.unwrap();
+        let bar = app.session.project.layouts[li].elements.iter().find(|e| matches!(e.kind, ElementKind::ScaleBar { .. })).unwrap().id;
+        app.layout.selected = Some(bar);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                with_format(app, ui);
+            },
+            app,
+        );
+        h.run_steps(3);
+        let set = |h: &egui_kittest::Harness<'_, RustGisApp>| match &h.state().session.project.layouts[li].element(bar).unwrap().kind {
+            ElementKind::ScaleBar { label_position, unit_label, fit, .. } => (*label_position, unit_label.clone(), *fit),
+            _ => panic!("a scale bar"),
+        };
+        assert_eq!(set(&h), (ScaleLabelPosition::Above, None, ScaleBarFit::AdjustDivisionValue));
+        for label in
+            ["Subdivisions", "Divisions before zero", "Decimals", "Text size", "Label position", "Unit label", "Unit label position", "Fit"]
+        {
+            assert!(h.query_by_label(label).is_some(), "{label}");
+        }
+        // Left empty, the field shows what the bar prints: an automatic unit's abbreviation
+        // depends on the frame's scale, a fixed unit's is its own.
+        let hint =
+            |h: &egui_kittest::Harness<'_, RustGisApp>| h.get_by_label("Unit label").accesskit_node().placeholder().map(str::to_owned);
+        assert_eq!(hint(&h).as_deref(), Some("Unit's abbreviation"));
+        h.state_mut().run("layout.update", json!({"element": bar, "units": "kilometers"})).unwrap();
+        h.run_steps(2);
+        assert_eq!(hint(&h).as_deref(), Some("km"));
+        h.get_by_label("Label position").click();
+        h.run_steps(2);
+        h.get_by_label("Below the bar").click();
+        h.run_steps(2);
+        assert_eq!(set(&h).0, ScaleLabelPosition::Below);
+        h.get_by_label("Fit").click();
+        h.run_steps(2);
+        h.get_by_label("Adjust width").click();
+        h.run_steps(2);
+        assert_eq!(set(&h).2, ScaleBarFit::AdjustWidth);
+        // Decimals as a chart's: automatic at first, fixed when picked, automatic again.
+        let decimals = |h: &egui_kittest::Harness<'_, RustGisApp>| match &h.state().session.project.layouts[li].element(bar).unwrap().kind {
+            ElementKind::ScaleBar { decimals, .. } => *decimals,
+            _ => panic!("a scale bar"),
+        };
+        assert_eq!(decimals(&h), None);
+        h.get_by_label("Decimals").click();
+        h.run_steps(2);
+        h.get_by_role_and_label(Role::Button, "2").click();
+        h.run_steps(2);
+        assert_eq!(decimals(&h), Some(2));
+        h.get_by_label("Decimals").click();
+        h.run_steps(2);
+        h.get_by_role_and_label(Role::Button, "Automatic").click();
+        h.run_steps(2);
+        assert_eq!(decimals(&h), None);
+        // Typed, the unit label is set once left.
+        h.get_by_label("Unit label").focus();
+        h.run_steps(2);
+        h.get_by_label("Unit label").type_text("Feet");
+        h.run_steps(2);
+        h.get_by_label("Subdivisions").focus();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some("Feet"));
+        // Unticked, no unit label prints; one undo step brings the text back.
+        h.get_by_role_and_label(Role::CheckBox, "Show unit label").click();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some(""));
+        assert!(h.query_by_label("Unit label position").is_none());
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some("Feet"));
+        // Hidden and shown again, the typed label comes back, not the abbreviation; one undo
+        // step hides it again.
+        h.get_by_role_and_label(Role::CheckBox, "Show unit label").click();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some(""));
+        h.get_by_role_and_label(Role::CheckBox, "Show unit label").click();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some("Feet"));
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some(""));
+        // A show that was undone can be shown again: the kept text is read, not taken.
+        h.get_by_role_and_label(Role::CheckBox, "Show unit label").click();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some("Feet"));
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some(""));
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some("Feet"));
+        // Back to the abbreviation, then hidden and shown: the old "Feet" is forgotten.
+        h.state_mut().run("layout.update", json!({"layout": li, "element": bar, "unitLabel": null})).unwrap();
+        h.run_steps(3);
+        assert_eq!(set(&h).1, None);
+        h.get_by_role_and_label(Role::CheckBox, "Show unit label").click();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some(""));
+        h.get_by_role_and_label(Role::CheckBox, "Show unit label").click();
+        h.run_steps(3);
+        assert_eq!(set(&h).1, None);
+        // Hidden while it is being typed, the label isn't written back as the field loses its
+        // focus; the typed text is the one kept.
+        h.get_by_label("Unit label").focus();
+        h.run_steps(2);
+        h.get_by_label("Unit label").type_text("Yards");
+        h.run_steps(2);
+        h.get_by_role_and_label(Role::CheckBox, "Show unit label").click();
+        h.run_steps(3);
+        assert_eq!(set(&h).1.as_deref(), Some(""));
+        assert!(h.state().layout.typing.is_empty());
+        h.get_by_role_and_label(Role::CheckBox, "Show unit label").click();
+        h.run_steps(3);
+        assert!(set(&h).1.is_some_and(|t| t.ends_with("Yards")), "{:?}", set(&h).1);
+        // One subdivision is none, as the bar already has: no change, no undo step.
+        let subdivisions =
+            |h: &egui_kittest::Harness<'_, RustGisApp>| match &h.state().session.project.layouts[li].element(bar).unwrap().kind {
+                ElementKind::ScaleBar { subdivisions, .. } => *subdivisions,
+                _ => panic!("a scale bar"),
+            };
+        let depth = h.state().session.undo_depth();
+        for (typed, expected, steps) in [("1", 0, 0), ("3", 3, 1)] {
+            h.get_by_label("Subdivisions").focus();
+            h.run_steps(2);
+            h.get_by_label("Subdivisions").type_text(typed);
+            h.key_press(egui::Key::Enter);
+            h.run_steps(3);
+            assert_eq!(subdivisions(&h), expected, "{typed}");
+            assert_eq!(h.state().session.undo_depth(), depth + steps, "{typed}");
+        }
+        // A unit label being typed when the bar is no longer shown is saved, and an emptied one
+        // gives the abbreviation back.
+        for (draft, expected) in [("Miles", Some("Miles")), ("", None)] {
+            h.state_mut().layout.selected = Some(bar);
+            h.run_steps(2);
+            h.state_mut().layout.typing.insert((li, bar, "unitLabel"), draft.into());
+            h.state_mut().layout.selected = None;
+            h.run_steps(3);
+            assert!(h.state().layout.typing.is_empty(), "{draft:?}");
+            assert_eq!(set(&h).1.as_deref(), expected, "{draft:?}");
+        }
     }
 
     /// A number dragged in the Format pane and let go is applied (#607): X moves the element by
@@ -4372,6 +5160,99 @@ mod tests {
             _ => String::new(),
         };
         assert_eq!(text, "Typed");
+    }
+
+    /// Text being typed for a layout's element stays that layout's when the layouts change places
+    /// (a move, a removal, a copy, an undo), however that came (the app, an agent through the
+    /// session itself, a script): it never reaches the element of the same id in the layout now
+    /// at its old place (#2802).
+    #[test]
+    fn a_draft_follows_its_layout_when_the_layouts_change_places() {
+        let title_of = |app: &RustGisApp, name: &str| {
+            let l = app.session.project.layouts.iter().find(|l| l.name == name).unwrap();
+            let e = l.elements.iter().find(|e| e.name == "Title").unwrap();
+            match &e.kind {
+                super::ElementKind::Text { text, .. } => (e.id, text.clone()),
+                _ => (e.id, String::new()),
+            }
+        };
+        let place = |app: &RustGisApp, name: &str| app.session.project.layouts.iter().position(|l| l.name == name).unwrap();
+        for by_agent in [false, true] {
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            for n in ["A", "B", "C"] {
+                app.run("layout.new", json!({"name": n})).unwrap();
+            }
+            let (title, before) = title_of(&app, "A");
+            assert_eq!(title, title_of(&app, "C").0, "the same id in both layouts");
+            super::follow_project(&mut app);
+            app.layout.typing.insert((place(&app, "A"), title, "text"), "Typed for A".into());
+            let to_front = json!({"name": "C", "to": 0});
+            if by_agent {
+                app.session.run("layout.move", &to_front).unwrap();
+            } else {
+                app.run("layout.move", to_front).unwrap();
+            }
+            // The end of the frame: the pane no longer shows the field.
+            super::save_drafts(&mut app);
+            assert_eq!(title_of(&app, "A").1, "Typed for A", "agent: {by_agent}");
+            assert_eq!(title_of(&app, "C").1, before, "agent: {by_agent}");
+        }
+        // A layout removed with its draft: the draft goes with it.
+        let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+        for n in ["A", "B"] {
+            app.run("layout.new", json!({"name": n})).unwrap();
+        }
+        let (title, before) = title_of(&app, "B");
+        super::follow_project(&mut app);
+        app.layout.typing.insert((place(&app, "A"), title, "text"), "Typed for A".into());
+        app.session.run("layout.remove", &json!({"name": "A"})).unwrap();
+        super::save_drafts(&mut app);
+        assert_eq!(title_of(&app, "B").1, before);
+        assert!(app.layout.typing.is_empty());
+        // Removed and another made in its stead within one frame (an agent's two commands): as
+        // many layouts as before, but the draft's is gone, and so is the draft.
+        app.run("layout.new", json!({"name": "C"})).unwrap();
+        let (_, before_c) = title_of(&app, "C");
+        super::follow_project(&mut app);
+        app.layout.typing.insert((place(&app, "B"), title, "text"), "Typed for B".into());
+        app.session.run("layout.remove", &json!({"name": "B"})).unwrap();
+        app.session.run("layout.new", &json!({"name": "D"})).unwrap();
+        super::save_drafts(&mut app);
+        assert_eq!((title_of(&app, "C").1, title_of(&app, "D").1), (before_c.clone(), before_c.clone()));
+        assert!(app.layout.typing.is_empty());
+        // Removed and another made at its place within one frame, under another name or its own:
+        // the draft is dropped, never written into the new layout.
+        for name in ["F", "E"] {
+            app.run("layout.new", json!({"name": "E"})).unwrap();
+            super::follow_project(&mut app);
+            app.layout.typing.insert((place(&app, "E"), title, "text"), "Typed for E".into());
+            app.session.run("layout.remove", &json!({"name": "E"})).unwrap();
+            app.session.run("layout.new", &json!({"name": name})).unwrap();
+            super::save_drafts(&mut app);
+            assert_eq!(title_of(&app, name).1, before_c, "{name}");
+            assert!(app.layout.typing.is_empty(), "{name}");
+            app.session.run("layout.remove", &json!({"name": name})).unwrap();
+        }
+        // Renamed, by an agent between frames: the draft stays with it.
+        super::follow_project(&mut app);
+        app.layout.typing.insert((place(&app, "C"), title, "text"), "Typed for C".into());
+        app.session.run("layout.rename", &json!({"name": "C", "newName": "X"})).unwrap();
+        super::save_drafts(&mut app);
+        assert_eq!(title_of(&app, "X").1, "Typed for C");
+        // Renamed, and its old name given to another, in one go: the draft stays with its own
+        // layout, not the one now called what it was.
+        super::follow_project(&mut app);
+        app.layout.typing.insert((place(&app, "D"), title, "text"), "Typed for D".into());
+        app.session.run("layout.rename", &json!({"name": "D", "newName": "Q"})).unwrap();
+        app.session.run("layout.rename", &json!({"name": "X", "newName": "D"})).unwrap();
+        super::save_drafts(&mut app);
+        assert_eq!((title_of(&app, "Q").1, title_of(&app, "D").1), ("Typed for D".to_string(), "Typed for C".to_string()));
+        // Copied: the draft is the original's, not the copy's.
+        super::follow_project(&mut app);
+        app.layout.typing.insert((place(&app, "Q"), title, "text"), "Typed again".into());
+        app.session.run("layout.duplicate", &json!({"name": "Q", "newName": "Q2"})).unwrap();
+        super::save_drafts(&mut app);
+        assert_eq!((title_of(&app, "Q").1, title_of(&app, "Q2").1), ("Typed again".to_string(), "Typed for D".to_string()));
     }
 
     /// Text being typed when another project opens is for the old one: it never reaches the

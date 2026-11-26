@@ -497,6 +497,204 @@ fn is_left(a: &TextAlign) -> bool {
     *a == TextAlign::Left
 }
 
+/// Where a text element's block of lines sits down its box.
+///
+/// `Invalid` is what a file's unknown name or wrong kind of value is read as; it is never kept:
+/// [`Layout::clamp`] sends it to the default and counts the element, and a save writes the
+/// default's name for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextVAlign {
+    /// From the top of the box.
+    #[default]
+    Top,
+    /// Centred in the box.
+    Middle,
+    /// Down to the bottom of the box.
+    Bottom,
+    /// A value read from a file that is not a name; repaired to the default on load.
+    #[doc(hidden)]
+    Invalid,
+}
+
+impl TextVAlign {
+    pub const ALL: [TextVAlign; 3] = [TextVAlign::Top, TextVAlign::Middle, TextVAlign::Bottom];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            TextVAlign::Top | TextVAlign::Invalid => "top",
+            TextVAlign::Middle => "middle",
+            TextVAlign::Bottom => "bottom",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TextVAlign::Top | TextVAlign::Invalid => "Top",
+            TextVAlign::Middle => "Middle",
+            TextVAlign::Bottom => "Bottom",
+        }
+    }
+
+    /// `top`, `middle` or `bottom` in any case, trimmed; `center` and `centre` read as middle.
+    pub fn from_name(s: &str) -> Option<TextVAlign> {
+        let s = s.trim();
+        TextVAlign::ALL
+            .into_iter()
+            .find(|v| v.code().eq_ignore_ascii_case(s))
+            .or((s.eq_ignore_ascii_case("centre") || s.eq_ignore_ascii_case("center")).then_some(TextVAlign::Middle))
+    }
+
+    /// This value, or the default where it is [`TextVAlign::Invalid`].
+    pub fn kept(self) -> TextVAlign {
+        if self == TextVAlign::Invalid { TextVAlign::default() } else { self }
+    }
+}
+
+impl Serialize for TextVAlign {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.kept().code())
+    }
+}
+
+impl<'de> Deserialize<'de> for TextVAlign {
+    /// A name as [`TextVAlign::from_name`] reads it; null as the default; anything else (an
+    /// unknown name, a number, a list) as `Invalid`, so the read never fails and `Layout::clamp`
+    /// repairs and counts it.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<TextVAlign, D::Error> {
+        let v: Option<serde_json::Value> = Deserialize::deserialize(d)?;
+        Ok(match v {
+            None | Some(serde_json::Value::Null) => TextVAlign::default(),
+            Some(serde_json::Value::String(s)) => TextVAlign::from_name(&s).unwrap_or(TextVAlign::Invalid),
+            Some(_) => TextVAlign::Invalid,
+        })
+    }
+}
+
+/// Whether a save leaves a text's block alignment out: the top, or a value that is not a name
+/// ([`TextVAlign::kept`]), which reads back as the top.
+fn is_top(v: &TextVAlign) -> bool {
+    v.kept() == TextVAlign::Top
+}
+
+/// The case a text element is drawn in.
+///
+/// `Invalid` is what a file's unknown name or wrong kind of value is read as; it is never kept:
+/// [`Layout::clamp`] sends it to the default and counts the element, and a save writes the
+/// default's name for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextCase {
+    /// As typed.
+    #[default]
+    None,
+    /// All upper case.
+    Upper,
+    /// All lower case.
+    Lower,
+    /// A value read from a file that is not a name; repaired to the default on load.
+    #[doc(hidden)]
+    Invalid,
+}
+
+impl TextCase {
+    pub const ALL: [TextCase; 3] = [TextCase::None, TextCase::Upper, TextCase::Lower];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            TextCase::None | TextCase::Invalid => "none",
+            TextCase::Upper => "upper",
+            TextCase::Lower => "lower",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TextCase::None | TextCase::Invalid => "As typed",
+            TextCase::Upper => "Upper case",
+            TextCase::Lower => "Lower case",
+        }
+    }
+
+    /// `none`, `upper` or `lower` in any case, trimmed.
+    pub fn from_name(s: &str) -> Option<TextCase> {
+        let s = s.trim();
+        TextCase::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s))
+    }
+
+    /// This value, or the default where it is [`TextCase::Invalid`].
+    pub fn kept(self) -> TextCase {
+        if self == TextCase::Invalid { TextCase::default() } else { self }
+    }
+
+    /// `s` in this case (full Unicode case mapping: `ß` is `SS` in upper case).
+    pub fn apply(self, s: String) -> String {
+        match self.kept() {
+            TextCase::Upper => s.to_uppercase(),
+            TextCase::Lower => s.to_lowercase(),
+            _ => s,
+        }
+    }
+}
+
+impl Serialize for TextCase {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.kept().code())
+    }
+}
+
+impl<'de> Deserialize<'de> for TextCase {
+    /// A name as [`TextCase::from_name`] reads it; null as the default; anything else as
+    /// `Invalid`, so the read never fails and `Layout::clamp` repairs and counts it.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<TextCase, D::Error> {
+        let v: Option<serde_json::Value> = Deserialize::deserialize(d)?;
+        Ok(match v {
+            None | Some(serde_json::Value::Null) => TextCase::default(),
+            Some(serde_json::Value::String(s)) => TextCase::from_name(&s).unwrap_or(TextCase::Invalid),
+            Some(_) => TextCase::Invalid,
+        })
+    }
+}
+
+/// Whether a save leaves a text's case out: as typed, or a value that is not a name
+/// ([`TextCase::kept`]), which reads back as typed.
+fn is_no_case(v: &TextCase) -> bool {
+    v.kept() == TextCase::None
+}
+
+/// The usual spacing between a text's lines, as a multiple of it.
+pub const LINE_SPACING: f64 = 1.0;
+/// The tightest and widest a text's line spacing may be, as multiples of the usual.
+pub const MIN_LINE_SPACING: f64 = 0.5;
+pub const MAX_LINE_SPACING: f64 = 3.0;
+
+fn line_spacing() -> f64 {
+    LINE_SPACING
+}
+
+/// Whether a save leaves a text's line spacing out: the usual, or one not finite, which
+/// [`line_spacing_in_range`] reads as the usual.
+fn is_line_spacing(v: &f64) -> bool {
+    !v.is_finite() || *v == LINE_SPACING
+}
+
+/// A text's line spacing as it is drawn and kept: the usual one ([`LINE_SPACING`]) when it is not
+/// a finite number, else clamped to [`MIN_LINE_SPACING`]..=[`MAX_LINE_SPACING`]. The one reader
+/// for the range, so a layout's repair, its capability check and the page agree.
+pub fn line_spacing_in_range(v: f64) -> f64 {
+    finite_or(v, LINE_SPACING).clamp(MIN_LINE_SPACING, MAX_LINE_SPACING)
+}
+
+/// A text's line spacing as a file holds it: a number as it is (out of range is for
+/// `Layout::clamp`), null as the usual, anything else (a string, a flag, a list, an object) as NaN,
+/// which `Layout::clamp` brings back to the usual and counts.
+fn de_line_spacing<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let v: Option<serde_json::Value> = Deserialize::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => LINE_SPACING,
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(f64::NAN),
+        Some(_) => f64::NAN,
+    })
+}
+
 /// The most layers a legend leaves out.
 pub const MAX_LEGEND_EXCLUDED: usize = 1000;
 
@@ -837,6 +1035,130 @@ fn divisions() -> usize {
     4
 }
 
+/// The most subdivisions the first division after zero of a scale bar is split into.
+pub const MAX_SCALE_SUBDIVISIONS: usize = 10;
+
+/// The most divisions a scale bar draws to the left of its zero.
+pub const MAX_SCALE_BEFORE_ZERO: usize = 2;
+
+/// The most decimal places a scale bar's numbers show.
+pub const MAX_SCALE_DECIMALS: usize = 3;
+
+/// The most characters a scale bar's unit label has.
+pub const MAX_UNIT_LABEL_CHARS: usize = 100;
+
+/// Where a scale bar's numbers sit against the bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScaleLabelPosition {
+    /// Over the bar.
+    #[default]
+    Above,
+    /// Under the bar.
+    Below,
+}
+
+impl ScaleLabelPosition {
+    pub const ALL: [ScaleLabelPosition; 2] = [ScaleLabelPosition::Above, ScaleLabelPosition::Below];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            ScaleLabelPosition::Above => "above",
+            ScaleLabelPosition::Below => "below",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScaleLabelPosition::Above => "Above the bar",
+            ScaleLabelPosition::Below => "Below the bar",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<ScaleLabelPosition> {
+        ScaleLabelPosition::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// Where a scale bar's unit label sits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UnitLabelPosition {
+    /// After the last number, on the same line.
+    #[default]
+    AfterLabels,
+    /// Beside the end of the bar.
+    AfterBar,
+    /// Over the bar.
+    Above,
+    /// Under the bar.
+    Below,
+}
+
+impl UnitLabelPosition {
+    pub const ALL: [UnitLabelPosition; 4] =
+        [UnitLabelPosition::AfterLabels, UnitLabelPosition::AfterBar, UnitLabelPosition::Above, UnitLabelPosition::Below];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            UnitLabelPosition::AfterLabels => "afterLabels",
+            UnitLabelPosition::AfterBar => "afterBar",
+            UnitLabelPosition::Above => "above",
+            UnitLabelPosition::Below => "below",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UnitLabelPosition::AfterLabels => "After the labels",
+            UnitLabelPosition::AfterBar => "After the bar",
+            UnitLabelPosition::Above => "Above the bar",
+            UnitLabelPosition::Below => "Below the bar",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<UnitLabelPosition> {
+        UnitLabelPosition::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// What a scale bar gives way on when its length does not fit its box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScaleBarFit {
+    /// Keep the number of divisions and the bar's width; the value of a division changes.
+    #[default]
+    AdjustDivisionValue,
+    /// Keep the value of a division and the bar's width; the number of divisions changes.
+    AdjustDivision,
+    /// Keep the value and the number of divisions; the bar's width changes.
+    AdjustWidth,
+}
+
+impl ScaleBarFit {
+    pub const ALL: [ScaleBarFit; 3] = [ScaleBarFit::AdjustDivisionValue, ScaleBarFit::AdjustDivision, ScaleBarFit::AdjustWidth];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            ScaleBarFit::AdjustDivisionValue => "adjustDivisionValue",
+            ScaleBarFit::AdjustDivision => "adjustDivision",
+            ScaleBarFit::AdjustWidth => "adjustWidth",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ScaleBarFit::AdjustDivisionValue => "Adjust division value",
+            ScaleBarFit::AdjustDivision => "Adjust number of divisions",
+            ScaleBarFit::AdjustWidth => "Adjust width",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<ScaleBarFit> {
+        ScaleBarFit::ALL.into_iter().find(|v| v.code().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
 /// The most columns a legend lays its rows in.
 pub const MAX_LEGEND_COLUMNS: usize = 3;
 
@@ -1016,6 +1338,29 @@ pub enum ElementKind {
         /// bytes.
         #[serde(default = "scale_bar_text_pt", skip_serializing_if = "is_scale_bar_text_pt")]
         text_size: f64,
+        /// Parts the first division after zero is split into, 0 (none) to [`MAX_SCALE_SUBDIVISIONS`].
+        #[serde(default, skip_serializing_if = "is_default")]
+        subdivisions: usize,
+        /// Divisions drawn left of zero, 0 to [`MAX_SCALE_BEFORE_ZERO`].
+        #[serde(default, skip_serializing_if = "is_default")]
+        divisions_before_zero: usize,
+        /// Where the numbers sit against the bar.
+        #[serde(default, skip_serializing_if = "is_default")]
+        label_position: ScaleLabelPosition,
+        /// Text printed in place of the units' abbreviation. `None` prints the abbreviation and
+        /// `Some("")` prints nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit_label: Option<String>,
+        /// Where the unit label sits.
+        #[serde(default, skip_serializing_if = "is_default")]
+        unit_label_position: UnitLabelPosition,
+        /// Decimal places in the numbers, 0 to [`MAX_SCALE_DECIMALS`], their thousands set apart;
+        /// none (auto), the decimals each label needs, as bars always printed.
+        #[serde(default, deserialize_with = "de_scale_decimals", skip_serializing_if = "Option::is_none")]
+        decimals: Option<u8>,
+        /// What gives way when the bar's length does not fit its box.
+        #[serde(default, skip_serializing_if = "is_default")]
+        fit: ScaleBarFit,
     },
     Legend {
         frame: u32,
@@ -1120,6 +1465,18 @@ pub enum ElementKind {
         /// line break. Left out when off, so layouts saved before keep their bytes.
         #[serde(default, skip_serializing_if = "is_false")]
         wrap: bool,
+        /// Where its block of lines sits down the (unturned) box. Left out when top, so layouts
+        /// saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "is_top")]
+        valign: TextVAlign,
+        /// The space between its lines, as a multiple of the usual ([`MIN_LINE_SPACING`] to
+        /// [`MAX_LINE_SPACING`]). Left out when usual, so layouts saved before keep their bytes.
+        #[serde(default = "line_spacing", skip_serializing_if = "is_line_spacing", deserialize_with = "de_line_spacing")]
+        line_spacing: f64,
+        /// Its words in upper or lower case when drawn, after its dynamic text is filled in. Left
+        /// out when as typed, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "is_no_case")]
+        case: TextCase,
     },
     Picture {
         /// Base64 PNG or JPEG.
@@ -1198,6 +1555,22 @@ pub enum ElementKind {
         /// counts, so that its stretches add up to their bar ([`ElementKind::chart_stack`]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stack: Option<String>,
+        /// Drawn as its mirror image, its text reading as ever (#2487 part 4): bars running across
+        /// from the right, their labels at the right; columns hanging from the top, their labels
+        /// over them. Beside a chart drawn the usual way, the two face each other.
+        #[serde(default, skip_serializing_if = "is_false")]
+        mirror: bool,
+        /// The value at the far end of its bars' room, so that charts given the same one share a
+        /// scale; a bar past it runs to that end. None, or one not above 0 (not read), its bars'
+        /// own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<f64>,
+        /// Its labels left out, their room given to the bars.
+        #[serde(default, skip_serializing_if = "is_false")]
+        hide_labels: bool,
+        /// A line round each bar, or each stretch of a stacked one; none by default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bar_outline: Option<ChartOutline>,
     },
     /// A rectangle drawn on the page (a neatline or a backdrop). `width` is the outline's, in
     /// points (0: none).
@@ -1256,6 +1629,38 @@ fn is_chart_bars(n: &usize) -> bool {
     *n == CHART_BARS
 }
 
+/// What a file's scale bar decimals that are no count at all (negative, fractional, not a number)
+/// read as: read from a file only, never kept. `Layout::clamp` sends it back to automatic and
+/// counts it.
+const SCALE_DECIMALS_INVALID: u8 = u8::MAX;
+
+/// A scale bar's decimals as a file holds them, of whatever JSON kind: null or the word "auto"
+/// (any case, trimmed) as automatic, a whole number from 0 to 253 as it is, a whole number past
+/// that as 254 (more than any count, so `Layout::clamp` cuts it to the most), and anything else
+/// (negative, fractional, another word, a flag, a list, an object) as
+/// [`SCALE_DECIMALS_INVALID`]. So `Layout::clamp` brings every invalid value into range and says
+/// so, rather than the whole layout failing to load or a bad value passing as a good one.
+fn de_scale_decimals<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u8>, D::Error> {
+    let v: Option<serde_json::Value> = serde::Deserialize::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if s.trim().eq_ignore_ascii_case("auto") => None,
+        Some(serde_json::Value::Number(n)) => {
+            if let Some(whole) = n.as_u64() {
+                // 254 is the cap.
+                Some(whole.min(254) as u8)
+            } else {
+                match n.as_f64() {
+                    // Whole and not negative (a float such as 2.0 or 1e30): 254 is the cap.
+                    Some(f) if f.fract() == 0.0 && f >= 0.0 => Some(f.min(254.0) as u8),
+                    _ => Some(SCALE_DECIMALS_INVALID),
+                }
+            }
+        }
+        Some(_) => Some(SCALE_DECIMALS_INVALID),
+    })
+}
+
 fn is_default<T: Default + PartialEq>(v: &T) -> bool {
     *v == T::default()
 }
@@ -1312,6 +1717,41 @@ pub struct ChartLook {
     pub decimals: Option<u8>,
     pub bar_color: Rgba,
     pub label_align: TextAlign,
+    /// Drawn as its mirror image ([`ElementKind::Chart`]'s `mirror`).
+    pub mirror: bool,
+    /// The value at the far end of its bars' room, above 0; none, its bars' own.
+    pub max: Option<f64>,
+    pub hide_labels: bool,
+    /// The line round each bar, as it is read ([`chart_outline`]); none, no line.
+    pub bar_outline: Option<ChartOutline>,
+}
+
+/// A chart's bar outline (#2487 part 4b): its colour and width in points. A key left out of a
+/// hand-edited file takes the one it is first given ([`CHART_OUTLINE`]).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChartOutline {
+    #[serde(default = "chart_outline_color")]
+    pub color: Rgba,
+    #[serde(default = "chart_outline_width")]
+    pub width: f64,
+}
+
+fn chart_outline_color() -> Rgba {
+    CHART_OUTLINE.color
+}
+
+fn chart_outline_width() -> f64 {
+    CHART_OUTLINE.width
+}
+
+/// A bar outline's colour and width when first given, and the widest it is drawn.
+pub const CHART_OUTLINE: ChartOutline = ChartOutline { color: Rgba::rgb(0x22, 0x22, 0x22), width: 0.5 };
+pub const MAX_CHART_OUTLINE_WIDTH: f64 = 5.0;
+
+/// A chart's bar outline as it is read: a width above 0 and finite, drawn at most
+/// [`MAX_CHART_OUTLINE_WIDTH`]; else none.
+pub fn chart_outline(o: Option<ChartOutline>) -> Option<ChartOutline> {
+    o.filter(|o| o.width.is_finite() && o.width > 0.0).map(|o| ChartOutline { width: o.width.min(MAX_CHART_OUTLINE_WIDTH), ..o })
 }
 
 impl Default for ChartLook {
@@ -1322,8 +1762,17 @@ impl Default for ChartLook {
             decimals: None,
             bar_color: CHART_BAR,
             label_align: TextAlign::Left,
+            mirror: false,
+            max: None,
+            hide_labels: false,
+            bar_outline: None,
         }
     }
+}
+
+/// A chart's fixed maximum as it is read: above 0 and finite, else none (its bars' own).
+pub fn chart_max(max: Option<f64>) -> Option<f64> {
+    max.filter(|m| m.is_finite() && *m > 0.0)
 }
 
 /// A chart's value as written on its bar: its thousands apart with commas, with `decimals`
@@ -1419,6 +1868,9 @@ impl ElementKind {
             font_name: None,
             rotation: 0.0,
             wrap: false,
+            valign: TextVAlign::Top,
+            line_spacing: LINE_SPACING,
+            case: TextCase::None,
         }
     }
 
@@ -1437,7 +1889,61 @@ impl ElementKind {
             color: ink(),
             fill: white(),
             text_size: SCALE_BAR_TEXT_PT,
+            subdivisions: 0,
+            divisions_before_zero: 0,
+            label_position: ScaleLabelPosition::default(),
+            unit_label: None,
+            unit_label_position: UnitLabelPosition::default(),
+            decimals: None,
+            fit: ScaleBarFit::default(),
         }
+    }
+
+    /// Whether this is a text whose block alignment, line spacing or case is not the default, once
+    /// brought into range as [`Layout::clamp`] does: what a layout file needs a newer reader for.
+    pub fn text_uses_block(&self) -> bool {
+        let ElementKind::Text { valign, line_spacing, case, .. } = self else {
+            return false;
+        };
+        valign.kept() != TextVAlign::Top || case.kept() != TextCase::None || line_spacing_in_range(*line_spacing) != LINE_SPACING
+    }
+
+    /// Whether this is a scale bar with any of the details set: subdivisions, divisions before
+    /// zero, a label or unit label placement, a unit label, decimals or a fit. Its text size
+    /// isn't one: [`ElementKind::has_custom_text_size`] tells that.
+    pub fn scale_bar_uses_details(&self) -> bool {
+        let ElementKind::ScaleBar {
+            frame,
+            subdivisions,
+            divisions_before_zero,
+            label_position,
+            unit_label,
+            unit_label_position,
+            decimals,
+            fit,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let ElementKind::ScaleBar {
+            subdivisions: s0,
+            divisions_before_zero: z0,
+            label_position: lp0,
+            unit_label: u0,
+            unit_label_position: up0,
+            decimals: d0,
+            fit: f0,
+            ..
+        } = ElementKind::scale_bar(*frame)
+        else {
+            return false;
+        };
+        // One subdivision is none: it clamps to 0, and an imported text is checked before that.
+        // Before clamp a file's invalid decimals read as 255 (a detail): over-requires for an invalid file only.
+        let subdivisions = if *subdivisions == 1 { 0 } else { *subdivisions };
+        (subdivisions, *divisions_before_zero, *label_position, unit_label, *unit_label_position, *decimals, *fit)
+            != (s0, z0, lp0, &u0, up0, d0, f0)
     }
 
     pub fn code(&self) -> &'static str {
@@ -1485,12 +1991,14 @@ impl ElementKind {
     }
 
     /// Whether `key` given as null changes an element of this kind, giving it back its default:
-    /// an ink's `color`, a chart's `title` (the title it is given) and `barColor`, and a legend's
-    /// or scale bar's `textSize` (#2581).
+    /// an ink's `color`, a chart's `title` (the title it is given), `barColor`, `max` (its bars'
+    /// own scale) and `barOutline` (none), a legend's or scale bar's `textSize` (#2581), and a
+    /// scale bar's `unitLabel` (its unit's abbreviation).
     pub fn null_resets(&self, key: &str) -> bool {
         (self.takes_ink() && key == "color")
-            || (matches!(self, ElementKind::Chart { .. }) && matches!(key, "title" | "barColor"))
+            || (matches!(self, ElementKind::Chart { .. }) && matches!(key, "title" | "barColor" | "max" | "barOutline"))
             || (matches!(self, ElementKind::Legend { .. } | ElementKind::ScaleBar { .. }) && key == "textSize")
+            || (matches!(self, ElementKind::ScaleBar { .. }) && key == "unitLabel")
     }
 
     /// Its ink, when it [takes one](ElementKind::takes_ink) and has one; `None` draws in [`INK`].
@@ -1841,7 +2349,9 @@ impl ElementKind {
     /// older reader would draw it as bars running across in the default blue, with the title it
     /// is given, and save it again without them.
     pub fn chart_uses_look_options(&self) -> bool {
-        matches!(self, ElementKind::Chart { title: Some(_), .. }) || self.chart_look().is_some_and(|l| l != ChartLook::default())
+        // Only part 2's options: facing another chart is its own capability ([`Self::chart_uses_facing`]).
+        let part_two = |l: ChartLook| ChartLook { mirror: false, max: None, hide_labels: false, bar_outline: None, ..l };
+        matches!(self, ElementKind::Chart { title: Some(_), .. }) || self.chart_look().is_some_and(|l| part_two(l) != ChartLook::default())
     }
 
     /// Whether a chart colours its bars by its layer's classes, which a chart had no way to before
@@ -1873,14 +2383,35 @@ impl ElementKind {
 
     /// How a chart draws its bars; `None` for another kind.
     pub fn chart_look(&self) -> Option<ChartLook> {
-        let ElementKind::Chart { orientation, values, decimals, bar_color, label_align, .. } = self else { return None };
+        let ElementKind::Chart { orientation, values, decimals, bar_color, label_align, mirror, max, hide_labels, bar_outline, .. } = self
+        else {
+            return None;
+        };
         Some(ChartLook {
             orientation: *orientation,
             values: *values,
             decimals: *decimals,
             bar_color: bar_color.unwrap_or(CHART_BAR),
             label_align: *label_align,
+            mirror: *mirror,
+            max: chart_max(*max),
+            hide_labels: *hide_labels,
+            bar_outline: chart_outline(*bar_outline),
         })
+    }
+
+    /// Whether a chart faces another: mirrored, given a maximum or with its labels hidden, which a
+    /// chart had no way to before #2487 part 4: an older reader would draw it the usual way round,
+    /// on its bars' own scale, labelled, and save it again without. A maximum not above 0 is let go
+    /// when the layout is read ([`Layout::clamp`]), so a stored one is always drawn to.
+    pub fn chart_uses_facing(&self) -> bool {
+        matches!(self, ElementKind::Chart { mirror, max, hide_labels, .. } if *mirror || *hide_labels || max.is_some())
+    }
+
+    /// Whether a chart draws a line round its bars, which a chart had no way to before #2487 part
+    /// 4b: an older reader would draw them without, and save it again without.
+    pub fn chart_uses_outline(&self) -> bool {
+        matches!(self, ElementKind::Chart { bar_outline, .. } if chart_outline(*bar_outline).is_some())
     }
 }
 
@@ -2103,6 +2634,166 @@ impl GroupKey {
             _ => None,
         }
     }
+}
+
+/// The most characters a layout text holds: a longer one is cut when a layout is read.
+pub const MAX_TEXT_CHARS: usize = 5000;
+
+/// A layer's figure in a layout text (#2853): `{count:<layer>}`, or `{sum:<layer>:<field>}` and
+/// the same with `mean`, `min` and `max`. The layer is everything between the first colon and the
+/// field's (the last), so a layer named with a colon still reads; a count's, everything after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatToken<'a> {
+    /// The token as written, braces included.
+    pub token: &'a str,
+    pub stat: StatKind,
+    pub layer: &'a str,
+    /// None for a count.
+    pub field: Option<&'a str>,
+}
+
+/// The [`StatToken`]s in `text`, in the order they come; other braces (`{scale}`, `{foo}`,
+/// `{sum:}`) are not among them.
+pub fn stat_tokens(text: &str) -> Vec<StatToken<'_>> {
+    scan_stat_tokens(text, false)
+}
+
+/// [`stat_tokens`] and also the `{sum:Layer}`, `{mean:Layer}`, `{min:Layer}` and `{max:Layer}` written
+/// without their field, which are no tokens to draw but a figure the writer meant: for a notice.
+pub fn stat_tokens_and_gaps(text: &str) -> Vec<StatToken<'_>> {
+    scan_stat_tokens(text, true)
+}
+
+fn scan_stat_tokens(text: &str, gaps: bool) -> Vec<StatToken<'_>> {
+    let mut out = Vec::new();
+    for (open, _) in text.match_indices('{') {
+        let Some(after) = text.get(open + 1..) else { continue };
+        // The first brace after it ends the token; another opening one means this isn't one.
+        let Some(len) = after.find(['{', '}']).filter(|&i| after.get(i..).is_some_and(|r| r.starts_with('}'))) else { continue };
+        let (Some(inner), Some(token)) = (after.get(..len), text.get(open..open + len + 2)) else { continue };
+        let Some((code, rest)) = inner.split_once(':') else { continue };
+        let stat = match code {
+            "count" => StatKind::Count,
+            "sum" => StatKind::Sum,
+            "mean" => StatKind::Mean,
+            "min" => StatKind::Min,
+            "max" => StatKind::Max,
+            _ => continue,
+        };
+        let (layer, field) = match stat {
+            StatKind::Count => (rest, None),
+            _ => match rest.rsplit_once(':') {
+                Some((layer, field)) if !field.is_empty() => (layer, Some(field)),
+                // No field, or an empty one: only a notice reads it.
+                Some((layer, _)) if gaps => (layer, None),
+                None if gaps => (rest, None),
+                _ => continue,
+            },
+        };
+        if !layer.is_empty() {
+            out.push(StatToken { token, stat, layer, field });
+        }
+    }
+    out
+}
+
+/// `text` with the layer of each statistic token put in another name by `rename` (given the layer's
+/// name, and the name to write in its place, or none to leave it): none when no token changes. The
+/// layer a token names is read as [`stat_tokens`] reads it.
+pub fn rename_stat_layers(text: &str, mut rename: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    let mut out = text.to_string();
+    let mut changed = false;
+    let mut done: Vec<&str> = Vec::new();
+    for t in stat_tokens(text) {
+        if done.contains(&t.token) {
+            continue;
+        }
+        done.push(t.token);
+        let Some(layer) = rename(t.layer) else { continue };
+        let code = t.stat.code();
+        let new = match t.field {
+            Some(field) => format!("{{{code}:{layer}:{field}}}"),
+            None => format!("{{{code}:{layer}}}"),
+        };
+        if new != t.token {
+            out = out.replace(t.token, &new);
+            changed = true;
+        }
+    }
+    changed.then_some(out)
+}
+
+/// Why a [`StatToken`] has no figure: drawn as written instead, and said when the text is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatMissing {
+    /// The layer has no such field (or a sum, mean, least or greatest names none).
+    Field,
+    /// The field holds no numbers to add up.
+    NotNumeric,
+    /// A raster layer, which has no features to count.
+    Raster,
+    /// None of the features the layer's definition query keeps has a number in the field, or the
+    /// statistic is past a number's range.
+    NoValue,
+}
+
+/// `stat` of `layer`'s `field` (none for a count) over the features its definition query keeps
+/// ([`crate::Layer::visible_rows`]), its numbers read as a chart's are (finite, nulls skipped).
+pub fn layer_statistic(layer: &crate::Layer, stat: StatKind, field: Option<&str>) -> Result<f64, StatMissing> {
+    layer_statistics(layer, &[(stat, field)]).into_iter().next().unwrap_or(Err(StatMissing::NoValue))
+}
+
+/// [`layer_statistic`] for each of `wanted` (a statistic and its field), in one pass over the layer's
+/// rows: the rows its definition query keeps are worked out once, and every field wanted is tallied
+/// in that pass, so a text with many figures of one layer costs one pass, not one for each.
+pub fn layer_statistics(layer: &crate::Layer, wanted: &[(StatKind, Option<&str>)]) -> Vec<Result<f64, StatMissing>> {
+    if layer.raster.is_some() {
+        return wanted.iter().map(|_| Err(StatMissing::Raster)).collect();
+    }
+    let ds = &layer.dataset;
+    // Each statistic's field as a column, or why it has none; the columns, once each.
+    let mut columns: Vec<usize> = Vec::new();
+    let slots: Vec<Result<Option<usize>, StatMissing>> = wanted
+        .iter()
+        .map(|(stat, field)| {
+            let fi = match (stat, field) {
+                (StatKind::Count, _) => return Ok(None),
+                (_, Some(f)) => ds.field_index(f).ok_or(StatMissing::Field)?,
+                (_, None) => return Err(StatMissing::Field),
+            };
+            if !ds.fields.get(fi).is_some_and(|f| f.ty.is_numeric()) {
+                return Err(StatMissing::NotNumeric);
+            }
+            let slot = columns.iter().position(|c| *c == fi).unwrap_or_else(|| {
+                columns.push(fi);
+                columns.len() - 1
+            });
+            Ok(Some(slot))
+        })
+        .collect();
+    let mut records = 0usize;
+    let mut tallies = vec![Tally::default(); columns.len()];
+    if slots.iter().any(Result::is_ok) {
+        for (row, kept) in layer.visible_rows().into_iter().enumerate() {
+            if !kept {
+                continue;
+            }
+            records += 1;
+            for (tally, fi) in tallies.iter_mut().zip(&columns) {
+                if let Some(n) = ds.value(row, *fi).as_f64().filter(|v| v.is_finite()) {
+                    tally.add(n, true);
+                }
+            }
+        }
+    }
+    wanted
+        .iter()
+        .zip(slots)
+        .map(|((stat, _), slot)| match slot? {
+            None => Tally { records, ..Tally::default() }.value(*stat).ok_or(StatMissing::NoValue),
+            Some(slot) => Tally { records, ..tallies[slot] }.value(*stat).ok_or(StatMissing::NoValue),
+        })
+        .collect()
 }
 
 /// A chart bar's features as its statistic reads them: how many, and their numbers' sum, mean,
@@ -2366,11 +3057,46 @@ pub struct Layout {
     /// Spanish, French or German do; off, the other way round.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub decimal_comma: bool,
+    /// The page's colour, painted under every element (#2855); none, white. Always opaque: a
+    /// page has nothing under it to show through, so a translucent one in a hand-edited file is
+    /// read as it looks on white paper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper: Option<Rgba>,
     #[serde(default)]
     next_id: u32,
+    /// Process-local identity, kept by undo snapshots but never stored in a project.
+    #[serde(skip)]
+    instance: Instance,
+}
+
+/// Identifies a live layout, whatever its name or place among the project's layouts (#2802). Not
+/// part of the layout's value: layouts that differ only by it are equal.
+#[derive(Clone, Copy, Debug)]
+struct Instance(u64);
+
+impl Default for Instance {
+    fn default() -> Self {
+        Instance(crate::next_layer_instance())
+    }
+}
+
+impl PartialEq for Instance {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 impl Layout {
+    /// Identifies this live layout, whatever its name or place among the project's layouts.
+    pub fn instance_id(&self) -> u64 {
+        self.instance.0
+    }
+
+    /// Starts a distinct live layout after copying one. Undo snapshots keep the original identity.
+    pub fn renew_instance_id(&mut self) {
+        self.instance = Instance::default();
+    }
+
     /// Resolves a series' index layer from its frame and the optional page-name column.
     pub fn series_index<'a>(&self, maps: &'a [Map]) -> Option<(&'a Layer, Option<usize>)> {
         let series = self.series.as_ref()?;
@@ -2388,7 +3114,9 @@ impl Layout {
             series: None,
             guides: Guides::default(),
             decimal_comma: false,
+            paper: None,
             next_id: 1,
+            instance: Instance::default(),
         }
     }
 
@@ -2472,6 +3200,12 @@ impl Layout {
         let count = self.elements.len();
         self.width = finite_or(self.width, 210.0).clamp(20.0, 5000.0);
         self.height = finite_or(self.height, 297.0).clamp(20.0, 5000.0);
+        // A page colour is opaque (a page has nothing under it to show through) and white is the
+        // page's own (#2855): a hand-edited translucent one is read as it looks on white paper,
+        // and said.
+        let white = Rgba::rgb(255, 255, 255);
+        let translucent = self.paper.is_some_and(|c| c.a() != 255);
+        self.paper = self.paper.map(|c| white.lerp(c.with_alpha(255), f64::from(c.a()) / 255.0)).filter(|c| *c != white);
         // The same limits `layout.guides` sets: the view walks these lists every frame.
         for list in [&mut self.guides.x, &mut self.guides.y] {
             list.retain(|v| v.is_finite() && v.abs() <= 5000.0);
@@ -2501,6 +3235,19 @@ impl Layout {
                 if (0.0..1e-6).contains(pitch) {
                     *pitch = 0.0;
                 }
+            }
+            // One subdivision is the division whole, as none: it draws the same.
+            if let ElementKind::ScaleBar { subdivisions, .. } = &mut before.kind
+                && *subdivisions == 1
+            {
+                *subdivisions = 0;
+            }
+            // A bar outline of width 0 draws none, as the commands take it: letting it go is no
+            // change.
+            if let ElementKind::Chart { bar_outline, .. } = &mut before.kind
+                && bar_outline.is_some_and(|o| o.width == 0.0)
+            {
+                *bar_outline = None;
             }
             // Ids stay well below u32::MAX so new elements never run out of numbers. A repeated id
             // (only a hand-edited file has one) is renumbered; references to it keep meaning the
@@ -2591,18 +3338,47 @@ impl Layout {
                         label.truncate(end);
                     }
                 }
-                ElementKind::Text { text, size, letter_spacing, rotation: turn, .. } => {
+                ElementKind::Text { text, size, letter_spacing, rotation: turn, valign, line_spacing, case, .. } => {
                     *turn = rotation(*turn);
+                    // A file's unknown name or wrong kind of value is read as a marker: back to the
+                    // default.
+                    *valign = valign.kept();
+                    *case = case.kept();
+                    *line_spacing = line_spacing_in_range(*line_spacing);
                     *size = finite_or(*size, 12.0).clamp(*crate::graphics::FONT_SIZE.start(), *crate::graphics::FONT_SIZE.end());
                     *letter_spacing = finite_or(*letter_spacing, 0.0).clamp(MIN_LETTER_SPACING, MAX_LETTER_SPACING);
-                    let end = text.char_indices().nth(5000).map_or(text.len(), |(i, _)| i);
+                    let end = text.char_indices().nth(MAX_TEXT_CHARS).map_or(text.len(), |(i, _)| i);
                     cut |= end < text.len();
                     text.truncate(end);
                 }
                 ElementKind::Table { rows, .. } => *rows = (*rows).clamp(1, 500),
-                ElementKind::ScaleBar { divisions, text_size, .. } => {
+                // A maximum the chart can't draw to (only a hand-edited file has one) gives it its
+                // bars' own scale back, counted with the values out of range (#2487 part 4); a bar
+                // outline's width past 5 points is held to them, and one below 0 let go (part 4b).
+                ElementKind::Chart { max, bar_outline, .. } => {
+                    *max = chart_max(*max);
+                    *bar_outline = chart_outline(*bar_outline);
+                }
+                ElementKind::ScaleBar { divisions, text_size, subdivisions, divisions_before_zero, decimals, unit_label, .. } => {
                     *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS);
                     *text_size = layout_text_in_range(*text_size, SCALE_BAR_TEXT_PT);
+                    // One part is the whole division: saved as none, it asks for no details.
+                    *subdivisions = if *subdivisions == 1 { 0 } else { (*subdivisions).min(MAX_SCALE_SUBDIVISIONS) };
+                    *divisions_before_zero = (*divisions_before_zero).min(MAX_SCALE_BEFORE_ZERO);
+                    // The two together are drawn as at most ten: the ones before zero give way.
+                    *divisions_before_zero = (*divisions_before_zero).min(MAX_SCALE_DIVISIONS.saturating_sub(*divisions));
+                    // A file's invalid count (negative, fractional) is read as a marker: back to automatic.
+                    *decimals = match *decimals {
+                        Some(SCALE_DECIMALS_INVALID) => None,
+                        d => d.map(|d| d.min(MAX_SCALE_DECIMALS as u8)),
+                    };
+                    // The label is one line: a break in a hand-edited file is a space.
+                    if let Some(label) = unit_label {
+                        *label = label.replace("\r\n", " ").replace(['\n', '\r'], " ");
+                        let end = label.char_indices().nth(MAX_UNIT_LABEL_CHARS).map_or(label.len(), |(i, _)| i);
+                        cut |= end < label.len();
+                        label.truncate(end);
+                    }
                 }
                 ElementKind::Rectangle { width, .. } | ElementKind::Ellipse { width, .. } => {
                     *width = finite_or(*width, 1.0).clamp(0.0, 50.0)
@@ -2652,7 +3428,7 @@ impl Layout {
             }
         }
         let series_adjusted = !series_removed && self.series != page.3;
-        let page_adjusted = series_adjusted || (self.width, self.height, &self.guides) != (page.0, page.1, &page.2);
+        let page_adjusted = series_adjusted || translucent || (self.width, self.height, &self.guides) != (page.0, page.1, &page.2);
         LayoutRepairs {
             elements_adjusted: adjusted,
             elements_cut: cut_count,
@@ -2667,14 +3443,15 @@ impl Layout {
 /// What [`Layout::clamp`] changed in a layout.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayoutRepairs {
-    /// Elements kept with a value brought into range, a new id, or a reference cleared.
+    /// Elements kept with a value brought into range, a new id, a reference cleared, or a unit
+    /// label's line breaks replaced.
     pub elements_adjusted: usize,
-    /// Elements with a name, text, polygon points, legend exclusions or legend labels cut to their
-    /// limits (the same element may count as adjusted too).
+    /// Elements with a name, text, polygon points, legend exclusions, scale bar unit labels or
+    /// legend labels cut to their limits (the same element may count as adjusted too).
     pub elements_cut: usize,
     /// Elements removed: beyond the 500 a layout holds, or tied to a map frame it doesn't have.
     pub elements_removed: usize,
-    /// Whether the page size, guides or map series margin changed (0 or 1).
+    /// Whether the page size, guides, page colour or map series margin changed (0 or 1).
     pub page_adjusted: usize,
     /// Whether the map series was removed, its map frame missing (0 or 1).
     pub series_removed: usize,
@@ -2909,6 +3686,137 @@ pub fn color_scale(rl: &RasterLayer) -> Option<ColorScale> {
 mod tests {
     use super::*;
     use crate::symbology::MAX_DASH_STEP;
+
+    /// Several figures of one layer, worked out in one pass over its rows, are the figures worked out
+    /// one by one, errors included (#2853).
+    #[test]
+    fn a_layers_figures_in_one_pass_are_the_figures_one_by_one() {
+        use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value};
+        let fields = vec![Field::new("n", FieldType::Double), Field::new("m", FieldType::Integer), Field::new("name", FieldType::Text)];
+        let mut ds = Dataset::new("sites", GeometryType::None, fields);
+        for (n, m) in
+            [(Value::Float(2.5), 3), (Value::Float(-1.0), 4), (Value::Null, 5), (Value::Float(f64::NAN), 6), (Value::Float(100.0), 7)]
+        {
+            ds.push(None, vec![n, Value::Int(m), Value::Text("x".into())]);
+        }
+        let mut layer = crate::Layer::new(1, ds);
+        let wanted = [
+            (StatKind::Count, None),
+            (StatKind::Sum, Some("n")),
+            (StatKind::Mean, Some("n")),
+            (StatKind::Min, Some("m")),
+            (StatKind::Max, Some("m")),
+            (StatKind::Sum, Some("name")),
+            (StatKind::Sum, Some("nosuch")),
+            (StatKind::Sum, None),
+            (StatKind::Mean, Some("n")),
+        ];
+        for query in [None, Some("m > 3")] {
+            layer.definition_query = query.map(String::from);
+            let one_by_one: Vec<_> = wanted.iter().map(|(stat, field)| layer_statistic(&layer, *stat, *field)).collect();
+            assert_eq!(layer_statistics(&layer, &wanted), one_by_one, "{query:?}");
+        }
+    }
+
+    /// A layer renamed is renamed in the tokens that name it, whatever their statistic or field, and
+    /// a text none of them names is left as it is (#2853).
+    #[test]
+    fn statistic_tokens_follow_a_renamed_layer() {
+        let to_z = |l: &str| (l == "A").then(|| "Z".to_string());
+        assert_eq!(
+            rename_stat_layers("{count:A} {sum:A:f} {count:A} {max:B:A} {scale}", to_z).as_deref(),
+            Some("{count:Z} {sum:Z:f} {count:Z} {max:B:A} {scale}")
+        );
+        assert_eq!(rename_stat_layers("{count:B} {sum:B:A} A", to_z), None);
+    }
+
+    /// The tokens a notice reads also include the figure kinds written without their field, which
+    /// are no tokens to draw or to require a capability for (#2853).
+    #[test]
+    fn statistic_tokens_and_gaps_include_a_figure_without_its_field() {
+        fn read(t: &str) -> Vec<(&str, StatKind, &str, Option<&str>)> {
+            stat_tokens_and_gaps(t).into_iter().map(|s| (s.token, s.stat, s.layer, s.field)).collect()
+        }
+        assert_eq!(
+            read("{sum:A} {sum:A:b} {count:C} {mean:Zone: north} {max:} {sum::x} {min:A:} {foo:A}"),
+            vec![
+                ("{sum:A}", StatKind::Sum, "A", None),
+                ("{sum:A:b}", StatKind::Sum, "A", Some("b")),
+                ("{count:C}", StatKind::Count, "C", None),
+                ("{mean:Zone: north}", StatKind::Mean, "Zone", Some(" north")),
+                ("{min:A:}", StatKind::Min, "A", None),
+            ]
+        );
+        assert_eq!(stat_tokens("{sum:A} {sum:A:b}").len(), 1, "a figure without its field is no token");
+    }
+
+    /// A text's statistic tokens (#2853): each kind, a layer named with a colon, and braces that
+    /// aren't one left alone.
+    #[test]
+    fn statistic_tokens_are_read_from_a_text() {
+        fn read(t: &str) -> Vec<(&str, StatKind, &str, Option<&str>)> {
+            stat_tokens(t).into_iter().map(|s| (s.token, s.stat, s.layer, s.field)).collect()
+        }
+        assert_eq!(
+            read("{count:Houses} houses, {sum:Plants:mw} MW at {scale}"),
+            vec![("{count:Houses}", StatKind::Count, "Houses", None), ("{sum:Plants:mw}", StatKind::Sum, "Plants", Some("mw")),]
+        );
+        assert_eq!(
+            read("{mean:Zone: north:pop}{min:A:b}{max:A:b}{count:Zone: north}"),
+            vec![
+                ("{mean:Zone: north:pop}", StatKind::Mean, "Zone: north", Some("pop")),
+                ("{min:A:b}", StatKind::Min, "A", Some("b")),
+                ("{max:A:b}", StatKind::Max, "A", Some("b")),
+                ("{count:Zone: north}", StatKind::Count, "Zone: north", None),
+            ]
+        );
+        // Not tokens: other names, an empty layer or field, a sum without its field, an alias the
+        // chart's codes take, a brace left open, a brace inside.
+        for t in ["{foo}", "{sum:}", "{count:}", "{sum:A}", "{sum::b}", "{sum:A:}", "{average:A:b}", "{Count:A}", "{count:A", "{count:{A}}"]
+        {
+            assert_eq!(read(t), vec![], "{t}");
+        }
+    }
+
+    /// A layer's statistic (#2853) over the features its definition query keeps, its numbers read
+    /// as a chart's: nulls and non-finite values skipped; a field it lacks, one with no numbers, or
+    /// no number among the kept features, none.
+    #[test]
+    fn layer_statistics_read_the_features_the_definition_query_keeps() {
+        use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value};
+        let fields = vec![Field::new("n", FieldType::Double), Field::new("name", FieldType::Text), Field::new("keep", FieldType::Integer)];
+        let mut ds = Dataset::new("sites", GeometryType::None, fields);
+        for (n, keep) in
+            [(Value::Float(2.5), 1), (Value::Float(-1.0), 1), (Value::Null, 1), (Value::Float(f64::NAN), 1), (Value::Float(100.0), 0)]
+        {
+            ds.push(None, vec![n, Value::Text("x".into()), Value::Int(keep)]);
+        }
+        let mut layer = crate::Layer::new(1, ds);
+        let stat = layer_statistic;
+        // Every feature: five, and the 100 counted.
+        assert_eq!(stat(&layer, StatKind::Count, None), Ok(5.0));
+        assert_eq!(stat(&layer, StatKind::Max, Some("n")), Ok(100.0));
+        layer.definition_query = Some("keep = 1".into());
+        assert_eq!(stat(&layer, StatKind::Count, None), Ok(4.0));
+        assert_eq!(stat(&layer, StatKind::Sum, Some("n")), Ok(1.5));
+        assert_eq!(stat(&layer, StatKind::Mean, Some("n")), Ok(0.75));
+        assert_eq!(stat(&layer, StatKind::Min, Some("n")), Ok(-1.0));
+        assert_eq!(stat(&layer, StatKind::Max, Some("n")), Ok(2.5));
+        assert_eq!(stat(&layer, StatKind::Sum, Some("nosuch")), Err(StatMissing::Field));
+        assert_eq!(stat(&layer, StatKind::Sum, None), Err(StatMissing::Field));
+        assert_eq!(stat(&layer, StatKind::Sum, Some("name")), Err(StatMissing::NotNumeric));
+        // A figure is over the whole layer, so a query that reads the series page's values (`@page_number`)
+        // is read with no page: the values are null and it keeps nothing.
+        layer.definition_query = Some("@page_number > 0".into());
+        assert_eq!(stat(&layer, StatKind::Count, None), Ok(0.0));
+        // A query keeping none: a count of 0, no sum.
+        layer.definition_query = Some("keep = 7".into());
+        assert_eq!(stat(&layer, StatKind::Count, None), Ok(0.0));
+        assert_eq!(stat(&layer, StatKind::Sum, Some("n")), Err(StatMissing::NoValue));
+        // A query that doesn't read keeps every feature, as the map draws them all.
+        layer.definition_query = Some("keep = = 1".into());
+        assert_eq!(stat(&layer, StatKind::Count, None), Ok(5.0));
+    }
 
     /// A chart of layer "t" with `extra` keys (its field among them).
     fn chart(extra: serde_json::Value) -> ElementKind {
@@ -3999,6 +4907,91 @@ mod tests {
         assert_eq!(frame(None, GridKind::Graticule), (false, 1, 0));
     }
 
+    /// A chart's maximum not above 0, which only a hand-edited file holds and the chart can't
+    /// draw to, is let go on read (the chart on its bars' own scale) and counted as a value out of
+    /// range, so the project says so (#2487 part 4); one above 0 is kept.
+    #[test]
+    fn a_charts_maximum_not_above_zero_is_repaired_and_counted() {
+        for (max, kept, adjusted) in [(-5.0, None, 1), (0.0, None, 1), (40.0, Some(40.0), 0)] {
+            let mut l: Layout = serde_json::from_value(serde_json::json!({
+                "name": "L", "width": 120, "height": 90, "elements": [
+                    {"id": 1, "name": "Frame", "x": 10, "y": 10, "w": 60, "h": 70,
+                     "kind": {"MapFrame": {"map": "Map", "center": {"x": 0, "y": 0}, "scale": 1000000}}},
+                    {"id": 2, "name": "Chart", "x": 75, "y": 10, "w": 35, "h": 40,
+                     "kind": {"Chart": {"frame": 1, "layer": "Places", "field": "people", "max": max}}}
+                ]
+            }))
+            .unwrap();
+            let r = l.clamp();
+            let ElementKind::Chart { max: m, .. } = &l.elements[1].kind else { panic!("a chart") };
+            assert_eq!((*m, r.elements_adjusted), (kept, adjusted), "{max}");
+        }
+    }
+
+    /// A bar outline's keys left out of a hand-edited file take those it is first given, as a
+    /// background's do, rather than leaving the layout unreadable (#2487 part 4b).
+    #[test]
+    fn a_charts_bar_outline_takes_its_defaults_for_keys_left_out() {
+        let read = |outline: serde_json::Value| {
+            let kind: ElementKind = serde_json::from_value(serde_json::json!(
+                {"Chart": {"frame": 1, "layer": "Places", "field": "people", "bar_outline": outline}}
+            ))
+            .unwrap();
+            let ElementKind::Chart { bar_outline, .. } = kind else { panic!("a chart") };
+            bar_outline
+        };
+        let red = Rgba::rgb(0xD0, 0x10, 0x10);
+        assert_eq!(read(serde_json::json!({"width": 2.0})), Some(ChartOutline { width: 2.0, ..CHART_OUTLINE }));
+        assert_eq!(read(serde_json::json!({"color": [208, 16, 16, 255]})), Some(ChartOutline { color: red, ..CHART_OUTLINE }));
+        assert_eq!(read(serde_json::json!({})), Some(CHART_OUTLINE));
+    }
+
+    /// A bar outline's width out of range, which only a hand-edited file holds, is repaired on
+    /// read and counted as a value out of range, so the project says so (#2487 part 4b): past 5
+    /// points it is held to 5, below 0 the outline is let go. A width of 0 draws none, as the
+    /// commands take it, so it is let go without a word; one in range is kept.
+    #[test]
+    fn a_charts_bar_outline_out_of_range_is_repaired_and_counted() {
+        let ink = Rgba::rgb(0x22, 0x22, 0x22);
+        for (width, kept, adjusted) in [(8.0, Some(5.0), 1), (-1.0, None, 1), (0.0, None, 0), (2.0, Some(2.0), 0)] {
+            let mut l: Layout = serde_json::from_value(serde_json::json!({
+                "name": "L", "width": 120, "height": 90, "elements": [
+                    {"id": 1, "name": "Frame", "x": 10, "y": 10, "w": 60, "h": 70,
+                     "kind": {"MapFrame": {"map": "Map", "center": {"x": 0, "y": 0}, "scale": 1000000}}},
+                    {"id": 2, "name": "Chart", "x": 75, "y": 10, "w": 35, "h": 40,
+                     "kind": {"Chart": {"frame": 1, "layer": "Places", "field": "people",
+                                        "bar_outline": {"color": [34, 34, 34, 255], "width": width}}}}
+                ]
+            }))
+            .unwrap();
+            let r = l.clamp();
+            let ElementKind::Chart { bar_outline, .. } = &l.elements[1].kind else { panic!("a chart") };
+            let expected = kept.map(|w| ChartOutline { color: ink, width: w });
+            assert_eq!((*bar_outline, r.elements_adjusted), (expected, adjusted), "{width}");
+        }
+    }
+
+    /// A page colour with alpha, which only a hand-edited file holds, is read as it looks on white
+    /// paper (a page has nothing else under it), so a clear one is the white page, and every one
+    /// is counted as a page repaired (#2855). An opaque one is kept, and opaque white is the page's
+    /// own, so it is let go without a word.
+    #[test]
+    fn a_translucent_page_colour_is_made_opaque_and_counted() {
+        for (paper, kept, adjusted) in [
+            (serde_json::json!([11, 27, 43, 128]), Some(Rgba::rgb(133, 141, 149)), 1),
+            (serde_json::json!([11, 27, 43, 0]), None, 1),
+            (serde_json::json!([11, 27, 43, 255]), Some(Rgba::rgb(11, 27, 43)), 0),
+            (serde_json::json!([255, 255, 255, 255]), None, 0),
+            (serde_json::json!([255, 255, 255, 128]), None, 1),
+        ] {
+            let mut l: Layout =
+                serde_json::from_value(serde_json::json!({"name": "L", "width": 120, "height": 90, "elements": [], "paper": paper}))
+                    .unwrap();
+            let r = l.clamp();
+            assert_eq!((l.paper, r.page_adjusted), (kept, adjusted), "{paper}");
+        }
+    }
+
     #[test]
     fn grid_labels_follow_the_format() {
         let g = Grid::default();
@@ -4256,5 +5249,268 @@ mod tests {
         assert_eq!(back, l);
         let mut text = ElementKind::text("t", 12.0, Rgba::rgb(0, 0, 0), false);
         assert!(!text.takes_ink() && text.ink_mut().is_none(), "a text's colour is its own option");
+    }
+
+    /// A text's block alignment, line spacing and case: left out of the file at their defaults, so a
+    /// text saved before saves byte for byte; written and read back when set; and a hand-edited value
+    /// out of range, of the wrong kind or not a name loads, brought into range and counted.
+    #[test]
+    fn text_block_settings_save_only_when_set_and_load_into_range() {
+        use serde_json::json;
+        for plain in [
+            r#"{"Text":{"text":"a","size":10.0,"color":[0,0,0,255],"bold":false}}"#,
+            r#"{"Text":{"text":"a\nb","size":12.0,"color":[31,41,55,255],"bold":true,"italic":true,"align":"Center","letter_spacing":2.0,"font":"Serif","font_name":"Georgia","rotation":90.0,"wrap":true}}"#,
+        ] {
+            let k: ElementKind = serde_json::from_str(plain).unwrap();
+            assert_eq!(serde_json::to_string(&k).unwrap(), plain);
+            assert!(!k.text_uses_block());
+        }
+        let mut set = ElementKind::text("a", 10.0, Rgba::rgb(0, 0, 0), false);
+        if let ElementKind::Text { valign, line_spacing, case, .. } = &mut set {
+            (*valign, *line_spacing, *case) = (TextVAlign::Bottom, 1.5, TextCase::Upper);
+        }
+        let s = serde_json::to_string(&set).unwrap();
+        assert!(s.ends_with(r#""bold":false,"valign":"bottom","line_spacing":1.5,"case":"upper"}}"#), "{s}");
+        assert_eq!(serde_json::from_str::<ElementKind>(&s).unwrap(), set);
+        assert!(set.text_uses_block());
+        // Unclamped, a value that is not a name or not a finite number saves as the default does:
+        // nothing, never "top" or a null spacing.
+        let plain = ElementKind::text("a", 10.0, Rgba::rgb(0, 0, 0), false);
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        for (v, ls, c) in [
+            (TextVAlign::Invalid, f64::NAN, TextCase::Invalid),
+            (TextVAlign::Invalid, LINE_SPACING, TextCase::None),
+            (TextVAlign::Top, f64::NAN, TextCase::None),
+            (TextVAlign::Top, f64::INFINITY, TextCase::None),
+            (TextVAlign::Top, f64::NEG_INFINITY, TextCase::Invalid),
+        ] {
+            let mut odd = plain.clone();
+            if let ElementKind::Text { valign, line_spacing, case, .. } = &mut odd {
+                (*valign, *line_spacing, *case) = (v, ls, c);
+            }
+            assert_eq!(serde_json::to_string(&odd).unwrap(), plain_json, "{v:?} {ls} {c:?}");
+            assert!(!odd.text_uses_block(), "{v:?} {ls} {c:?}");
+        }
+        // One reader for the range: not finite is the usual spacing, else the nearer limit.
+        for (ls, want) in [(f64::NAN, 1.0), (f64::INFINITY, 1.0), (f64::NEG_INFINITY, 1.0), (9.0, 3.0), (0.1, 0.5), (1.5, 1.5), (3.0, 3.0)]
+        {
+            assert_eq!(line_spacing_in_range(ls), want, "{ls}");
+        }
+        for (name, v) in [
+            (" MIDDLE ", TextVAlign::Middle),
+            ("centre", TextVAlign::Middle),
+            ("Center", TextVAlign::Middle),
+            ("Top", TextVAlign::Top),
+            ("bottom", TextVAlign::Bottom),
+        ] {
+            assert_eq!(TextVAlign::from_name(name), Some(v), "{name}");
+        }
+        assert_eq!((TextVAlign::from_name("baseline"), TextCase::from_name("title")), (None, None));
+        assert_eq!(TextCase::from_name(" Upper "), Some(TextCase::Upper));
+        assert_eq!(TextCase::Upper.apply("Straße {9}".into()), "STRASSE {9}");
+        assert_eq!(TextCase::Lower.apply("ÉTÉ".into()), "été");
+        assert_eq!(TextCase::None.apply("As Typed".into()), "As Typed");
+        // A hand-edited layout.
+        let extras = [
+            json!({"line_spacing": 9}),                                      // 2: to 3, said
+            json!({"line_spacing": 0.1}),                                    // 3: to 0.5, said
+            json!({"line_spacing": "1.5"}),                                  // 4: no number: 1, said
+            json!({"line_spacing": [2]}),                                    // 5: 1, said
+            json!({"valign": "sideways"}),                                   // 6: top, said
+            json!({"valign": 7}),                                            // 7: top, said
+            json!({"case": "title"}),                                        // 8: none, said
+            json!({"case": {"x": 1}}),                                       // 9: none, said
+            json!({"valign": "Middle", "case": "UPPER", "line_spacing": 2}), // 10: kept, not said
+            json!({"valign": null, "case": null, "line_spacing": null}),     // 11: defaults, not said
+            json!({"valign": "centre", "line_spacing": 3.0}),                // 12: kept, not said
+        ];
+        let elements: Vec<_> = extras
+            .iter()
+            .enumerate()
+            .map(|(i, extra)| {
+                let mut t = json!({"text": "a", "size": 10.0, "color": [0, 0, 0, 255], "bold": false});
+                t.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                json!({"id": i + 2, "name": "t", "x": 0, "y": 0, "w": 10, "h": 10, "kind": {"Text": t}})
+            })
+            .collect();
+        let mut l: Layout = serde_json::from_value(json!({"name": "x", "width": 100, "height": 100, "elements": elements})).unwrap();
+        let repairs = l.clamp();
+        let block = |id| match &l.element(id).unwrap().kind {
+            ElementKind::Text { valign, line_spacing, case, .. } => (*valign, *line_spacing, *case),
+            k => panic!("{k:?}"),
+        };
+        use {TextCase as C, TextVAlign as V};
+        let want = [
+            (2, (V::Top, 3.0, C::None)),
+            (3, (V::Top, 0.5, C::None)),
+            (4, (V::Top, 1.0, C::None)),
+            (5, (V::Top, 1.0, C::None)),
+            (6, (V::Top, 1.0, C::None)),
+            (7, (V::Top, 1.0, C::None)),
+            (8, (V::Top, 1.0, C::None)),
+            (9, (V::Top, 1.0, C::None)),
+            (10, (V::Middle, 2.0, C::Upper)),
+            (11, (V::Top, 1.0, C::None)),
+            (12, (V::Middle, 3.0, C::None)),
+        ];
+        for (id, b) in want {
+            assert_eq!(block(id), b, "{id}");
+        }
+        assert_eq!((repairs.elements_adjusted, repairs.elements_cut), (8, 0));
+        // Repaired to the defaults, they save nothing; no marker is ever written.
+        let saved = serde_json::to_string(&l).unwrap();
+        assert!(!saved.contains("sideways") && !saved.contains("title") && saved.matches("\"valign\"").count() == 2, "{saved}");
+    }
+
+    #[test]
+    fn scale_bars_without_details_save_as_before() {
+        // As main writes a plain bar: colour and fill always, nothing new.
+        let plain = r#"{"ScaleBar":{"frame":2,"units":"Auto","divisions":4,"style":"Alternating","color":[34,34,34,255],"fill":[255,255,255,255]}}"#;
+        let bar: ElementKind = serde_json::from_str(plain).unwrap();
+        assert_eq!(serde_json::to_string(&bar).unwrap(), plain);
+        assert_eq!(bar, ElementKind::scale_bar(2));
+        assert!(!bar.scale_bar_uses_details());
+        let ElementKind::ScaleBar {
+            subdivisions,
+            divisions_before_zero,
+            label_position,
+            unit_label,
+            unit_label_position,
+            decimals,
+            text_size,
+            fit,
+            ..
+        } = &bar
+        else {
+            panic!("a scale bar")
+        };
+        assert_eq!((*subdivisions, *divisions_before_zero, *decimals, *text_size), (0, 0, None, SCALE_BAR_TEXT_PT));
+        assert_eq!(
+            (*label_position, unit_label.clone(), *unit_label_position, *fit),
+            (ScaleLabelPosition::Above, None, UnitLabelPosition::AfterLabels, ScaleBarFit::AdjustDivisionValue)
+        );
+        // Every setting, saved under its own key and read back equal.
+        let mut all = bar.clone();
+        if let ElementKind::ScaleBar {
+            subdivisions,
+            divisions_before_zero,
+            label_position,
+            unit_label,
+            unit_label_position,
+            decimals,
+            text_size,
+            fit,
+            ..
+        } = &mut all
+        {
+            (*subdivisions, *divisions_before_zero, *label_position) = (4, 1, ScaleLabelPosition::Below);
+            (*unit_label, *unit_label_position) = (Some("Kilometres".into()), UnitLabelPosition::AfterBar);
+            (*decimals, *text_size, *fit) = (Some(2), 10.5, ScaleBarFit::AdjustWidth);
+        }
+        assert!(all.scale_bar_uses_details());
+        // Its text size alone is no detail: the text size capability covers it.
+        let mut sized = bar.clone();
+        if let ElementKind::ScaleBar { text_size, .. } = &mut sized {
+            *text_size = 16.0;
+        }
+        assert!(!sized.scale_bar_uses_details() && sized.has_custom_text_size());
+        let s = serde_json::to_string(&all).unwrap();
+        // The middle fit saves as the camelCase of its variant.
+        let mut middle = all.clone();
+        if let ElementKind::ScaleBar { fit, .. } = &mut middle {
+            *fit = ScaleBarFit::AdjustDivision;
+        }
+        assert!(serde_json::to_string(&middle).unwrap().contains(r#""fit":"adjustDivision""#));
+        assert!(s.starts_with(r#"{"ScaleBar":{"frame":2,"units":"Auto","divisions":4,"style":"Alternating","color":[34,34,34,255],"fill":[255,255,255,255],"#), "{s}");
+        for part in [
+            r#""subdivisions":4"#,
+            r#""divisions_before_zero":1"#,
+            r#""label_position":"below""#,
+            r#""unit_label":"Kilometres""#,
+            r#""unit_label_position":"afterBar""#,
+            r#""decimals":2"#,
+            r#""text_size":10.5"#,
+            r#""fit":"adjustWidth""#,
+        ] {
+            assert!(s.contains(part), "{part} in {s}");
+        }
+        assert_eq!(serde_json::from_str::<ElementKind>(&s).unwrap(), all);
+        // An empty unit label is a setting too: it prints none.
+        let mut blank = bar.clone();
+        if let ElementKind::ScaleBar { unit_label, .. } = &mut blank {
+            *unit_label = Some(String::new());
+        }
+        assert!(blank.scale_bar_uses_details());
+        assert!(serde_json::to_string(&blank).unwrap().contains(r#""unit_label":"""#));
+        // Fixed at no decimals is a setting too, apart from auto: its thousands are set apart.
+        let mut whole = bar.clone();
+        if let ElementKind::ScaleBar { decimals, .. } = &mut whole {
+            *decimals = Some(0);
+        }
+        assert!(whole.scale_bar_uses_details());
+        assert!(serde_json::to_string(&whole).unwrap().contains(r#""decimals":0"#));
+        // A loaded layout's out-of-range values are brought into range, and said.
+        let text = format!(
+            r#"{{"name":"x","width":200,"height":100,"elements":[
+            {{"id":1,"name":"a","x":0,"y":0,"w":10,"h":10,"kind":{{"MapFrame":{{"map":"m","center":{{"x":0,"y":0}},"scale":1000}}}}}},
+            {{"id":2,"name":"b","x":0,"y":0,"w":10,"h":10,"kind":{{"ScaleBar":{{"frame":1,"subdivisions":99,"divisions_before_zero":9,"decimals":9,"text_size":1e9,"unit_label":"{}"}}}}}},
+            {{"id":3,"name":"c","x":0,"y":0,"w":10,"h":10,"kind":{{"ScaleBar":{{"frame":1,"text_size":-4,"unit_label":"a\r\nb\rc\nd"}}}}}},
+            {{"id":4,"name":"d","x":0,"y":0,"w":10,"h":10,"kind":{{"ScaleBar":{{"frame":1,"subdivisions":1}}}}}},
+            {{"id":5,"name":"e","x":0,"y":0,"w":10,"h":10,"kind":{{"ScaleBar":{{"frame":1,"decimals":300}}}}}},
+            {{"id":6,"name":"f","x":0,"y":0,"w":10,"h":10,"kind":{{"ScaleBar":{{"frame":1,"decimals":-1}}}}}},
+            {{"id":7,"name":"g","x":0,"y":0,"w":10,"h":10,"kind":{{"ScaleBar":{{"frame":1,"decimals":2.5}}}}}},
+            {{"id":8,"name":"h","x":0,"y":0,"w":10,"h":10,"kind":{{"ScaleBar":{{"frame":1,"decimals":" Auto "}}}}}},
+            {{"id":9,"name":"i","x":0,"y":0,"w":10,"h":10,"kind":{{"ScaleBar":{{"frame":1,"decimals":"two"}}}}}},
+            {{"id":10,"name":"j","x":0,"y":0,"w":10,"h":10,"kind":{{"ScaleBar":{{"frame":1,"decimals":[2]}}}}}},
+            {{"id":11,"name":"k","x":0,"y":0,"w":10,"h":10,"kind":{{"ScaleBar":{{"frame":1,"divisions":10,"divisions_before_zero":2}}}}}}]}}"#,
+            "x".repeat(150)
+        );
+        let mut l: Layout = serde_json::from_str(&text).unwrap();
+        let repairs = l.clamp();
+        let got = |id| match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::ScaleBar { subdivisions, divisions_before_zero, decimals, text_size, unit_label, .. }) => {
+                (*subdivisions, *divisions_before_zero, *decimals, *text_size, unit_label.clone().unwrap_or_default())
+            }
+            _ => (0, 0, None, 0.0, String::new()),
+        };
+        assert_eq!(
+            got(2),
+            (
+                MAX_SCALE_SUBDIVISIONS,
+                MAX_SCALE_BEFORE_ZERO,
+                Some(MAX_SCALE_DECIMALS as u8),
+                *LAYOUT_TEXT_SIZE.end(),
+                "x".repeat(MAX_UNIT_LABEL_CHARS)
+            )
+        );
+        assert_eq!(got(3), (0, 0, None, *LAYOUT_TEXT_SIZE.start(), "a b c d".to_string()));
+        // One subdivision is the division whole: it loads as none, quietly, and asks for no details.
+        assert_eq!(got(4), (0, 0, None, SCALE_BAR_TEXT_PT, String::new()));
+        assert!(l.element(4).is_some_and(|e| !e.kind.scale_bar_uses_details()));
+        // A count past 255 loads too (it would not fit a byte) and ends at the most, said.
+        assert_eq!(got(5), (0, 0, Some(MAX_SCALE_DECIMALS as u8), SCALE_BAR_TEXT_PT, String::new()));
+        // A negative or fractional count is no count: it goes back to automatic, and is said too.
+        assert_eq!(got(6), (0, 0, None, SCALE_BAR_TEXT_PT, String::new()));
+        assert_eq!(got(7), (0, 0, None, SCALE_BAR_TEXT_PT, String::new()));
+        // Any JSON kind loads: the word "auto" is automatic and no repair; other words and lists
+        // are no count, so they go back to automatic and are said too.
+        for id in [8, 9, 10] {
+            assert_eq!(got(id), (0, 0, None, SCALE_BAR_TEXT_PT, String::new()), "{id}");
+        }
+        // Ten divisions with two before zero are more than the ten a bar draws: the ones before zero
+        // give way, and it is said.
+        assert_eq!(got(11), (0, 0, None, SCALE_BAR_TEXT_PT, String::new()));
+        assert!(matches!(l.element(11).map(|e| &e.kind), Some(ElementKind::ScaleBar { divisions: 10, .. })));
+        assert_eq!((repairs.elements_adjusted, repairs.elements_cut), (8, 1));
+        for v in ScaleLabelPosition::ALL {
+            assert_eq!(ScaleLabelPosition::from_name(&format!(" {} ", v.code().to_uppercase())), Some(v));
+        }
+        for v in UnitLabelPosition::ALL {
+            assert_eq!(UnitLabelPosition::from_name(v.code()), Some(v));
+        }
+        for v in ScaleBarFit::ALL {
+            assert_eq!(ScaleBarFit::from_name(v.code()), Some(v));
+        }
+        assert_eq!(ScaleBarFit::from_name("manual"), None);
     }
 }

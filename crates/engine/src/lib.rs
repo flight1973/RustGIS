@@ -31,7 +31,8 @@ pub use peer::Peer;
 pub(crate) use roles::{Document, ParamRole, Role};
 mod parameters;
 pub mod project_log;
-pub use parameters::{params_envelope, script_line};
+mod received;
+pub use parameters::{params_envelope, script_line, split_script_id};
 pub use project_log::{LogCopy, log_identifier, log_params};
 pub mod s3_connections;
 pub mod s3_keys;
@@ -421,13 +422,21 @@ fn names_said(names: &[String]) -> String {
 }
 
 /// What a raster layer read in place holds for its statistics and tools, when it holds an
-/// overview of the image the map draws.
-pub(crate) fn in_place_overview(d: &rustgis_data::raster::Raster) -> Option<String> {
+/// overview of the image the map draws. A file on this computer (`tools_read_file`) is read again
+/// by each geoprocessing tool and each command that makes a raster in the background, at the
+/// finest level it can hold ([`crate::cmd::gp`], [`crate::cmd::workflows::Input`]).
+pub(crate) fn in_place_overview(d: &rustgis_data::raster::Raster, tools_read_file: bool) -> Option<String> {
     let (fw, fh) = d.overview?;
-    Some(format!(
-        "read in place: the map draws its {fw} × {fh} pixels as it needs them, while statistics, histograms and raster tools read a {} × {} overview",
-        d.width, d.height
-    ))
+    let (w, h) = (d.width, d.height);
+    Some(if tools_read_file {
+        format!(
+            "read in place: the map draws its {fw} × {fh} pixels as it needs them, and geoprocessing tools and the commands that make a raster read the file (at the finest level they can hold, GeoLibre tools whole), while statistics, histograms, plugin tools, Build Mosaic, Train Deep Learning Model and other raster commands read a {w} × {h} overview"
+        )
+    } else {
+        format!(
+            "read in place: the map draws its {fw} × {fh} pixels as it needs them, while statistics, histograms and raster tools read a {w} × {h} overview"
+        )
+    })
 }
 
 pub struct Registry {
@@ -741,6 +750,7 @@ struct PutAside {
     plugin_runs: Vec<cmd::gp::StartedRun>,
     downloading: Vec<u64>,
     downloaded: Vec<(u64, Vec<u8>)>,
+    downloaded_reach: Vec<(u64, render::rustgis_tiles::address::Reach)>,
     url_requests: Vec<UrlRequest>,
     policy_work: policy::downloads::Work,
     landed_reads: Vec<(u64, LandedRead)>,
@@ -1073,6 +1083,8 @@ pub struct Session {
     downloading: Vec<u64>,
     /// Downloads that landed, waiting for `layer.addDownload`.
     pub(crate) downloaded: Vec<(u64, Vec<u8>)>,
+    /// Where downloads connected, as the front end saw it ([`Session::download_read_at`]).
+    pub(crate) downloaded_reach: Vec<(u64, render::rustgis_tiles::address::Reach)>,
     /// Downloads that landed already read (an ArcGIS layer's protocol buffer pages, joined),
     /// waiting for `layer.addDownload` too.
     pub(crate) landed_reads: Vec<(u64, LandedRead)>,
@@ -1092,6 +1104,8 @@ pub struct Session {
     /// Set by [`Session::request_url`] for [`Session::guarded`]: the command running changed
     /// nothing, it only left a request (a plugin's own answer can't claim that). Also set by a move
     /// that left everything where it was (`layout.arrange`, `layer.move`): no step to undo.
+    /// Each command has its own: [`Session::guarded`] clears it on entry and puts the enclosing
+    /// command's back on exit.
     request_only: bool,
     /// What the commands run as steps of the transaction running now did ([`Session::shared_step`]):
     /// the one account scripts, tasks and plugins decide their undo step from.
@@ -1099,6 +1113,10 @@ pub struct Session {
     /// Set by [`Session::run_leaving_downloads`]: `layer.addUrl` leaves what it would wait for
     /// to the front end ([`Session::request_url`]), as in the browser.
     leave_downloads: bool,
+    /// Set by [`Session::receiving`]: the files the commands run now open were downloaded from an
+    /// address reached at this reach, which what they name is held within
+    /// ([`Session::file_reach`]).
+    received: Option<crate::render::rustgis_tiles::address::Reach>,
     /// Set by [`prefs::opt_in`]: the command line and Python read the remembered Earthdata token
     /// for a command that names a data host, before it binds its accounts.
     saved_secrets_opted_in: bool,
@@ -1228,10 +1246,12 @@ fn strip_windows(p: &mut Project) {
 }
 
 /// The first streamed layer whose features or fields differ between two versions of a project
-/// for a reason other than a read of its source.
+/// for a reason other than a read of its source. Each map is compared with its own earlier
+/// version, wherever it now is among the maps (`map.move`, #2802).
 fn edited_streamed(before: &Project, after: &Project) -> Option<String> {
     let schema = |l: &rustgis_map::Layer| l.dataset.fields.iter().map(|f| (f.name.clone(), f.ty)).collect::<Vec<_>>();
-    for (mb, ma) in before.maps.iter().zip(&after.maps) {
+    let earlier = |ma: &rustgis_map::Map| before.maps.iter().find(|mb| mb.instance_id() == ma.instance_id());
+    for (mb, ma) in after.maps.iter().filter_map(|ma| Some((earlier(ma)?, ma))) {
         for la in ma.layers.iter().filter(|l| l.is_streamed()) {
             let Some(lb) = mb.layers.iter().find(|l| l.id == la.id && l.is_streamed()) else { continue };
             let reads = |l: &rustgis_map::Layer| l.source.as_ref().map(|s| s.reads);
@@ -1249,8 +1269,10 @@ fn edited_streamed(before: &Project, after: &Project) -> Option<String> {
 /// the command (their versions replaced) are left alone. Session-only constructions follow the
 /// final ID; a full destination cache shard rejects the command through the usual rollback.
 fn fresh_source_ids(before: &Project, after: &mut Project, constructions: &mut construction::Cache) -> Result<(), String> {
-    for (mb, ma) in before.maps.iter().zip(after.maps.iter_mut()) {
+    // Each map with its own earlier version, wherever it now is (`map.move`, #2802).
+    for ma in after.maps.iter_mut() {
         let map = ma.instance_id();
+        let Some(mb) = before.maps.iter().find(|mb| mb.instance_id() == map) else { continue };
         for la in ma.layers.iter_mut() {
             let Some(versions) = la.edit_versions() else { continue };
             let Some(lb) = mb.layers.iter().find(|l| l.id == la.id) else { continue };
@@ -1416,6 +1438,9 @@ impl Session {
         // cloud-optimised GeoTIFFs' overviews for raster layers read in place.
         render::rustgis_tiles::remote::install();
         map::raster::set_in_place_reader(render::rustgis_tiles::cog::raster::overview);
+        // A large tiled GeoTIFF on this computer is read in place too, on the desktop (#2761).
+        #[cfg(not(target_arch = "wasm32"))]
+        map::raster::set_tiled_probe(crate::cmd::raster::tiled_in_place);
         rustgis_data::diagnostics::set_clock(|| {
             web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
         });
@@ -1538,6 +1563,7 @@ impl Session {
             plugin_watch: Default::default(),
             downloading: Vec::new(),
             downloaded: Vec::new(),
+            downloaded_reach: Vec::new(),
             landed_reads: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             landed_windows: Vec::new(),
@@ -1551,6 +1577,7 @@ impl Session {
             request_only: false,
             shared_steps: StepTally::default(),
             leave_downloads: false,
+            received: None,
             saved_secrets_opted_in: false,
             plugin_retries: Vec::new(),
             url_waits: cmd::plugins::fetch::UrlWaits::default(),
@@ -1636,6 +1663,20 @@ impl Session {
             self.downloaded.push((id, bytes));
         }
         landed
+    }
+
+    /// Says where a download under way connected (`cache::Fetched::origin`), before its bytes are
+    /// handed over: a GeoLibre project downloaded so is read within that reach
+    /// (`layer.addDownload`), and one handed over without it reaches only the internet.
+    pub fn download_read_at(&mut self, id: u64, reach: render::rustgis_tiles::address::Reach) {
+        if !self.downloading.contains(&id) {
+            return;
+        }
+        // As many as downloads under way can be: past that, the oldest are forgotten.
+        if self.downloaded_reach.len() >= 64 {
+            self.downloaded_reach.remove(0);
+        }
+        self.downloaded_reach.push((id, reach));
     }
 
     /// Hands over a download read already (an ArcGIS layer's protocol buffer pages, joined, see
@@ -1800,6 +1841,17 @@ impl Session {
         self.project.map_mut()
     }
 
+    /// Drops what is kept only to draw again sooner, for a system short of memory (a phone says
+    /// so): the tile and drawing caches ([`render::release_memory`]), and the drawing copies of
+    /// the layers switched off. Each is made or fetched again when next wanted; layers, results
+    /// and Undo history are kept.
+    pub fn release_memory(&mut self) {
+        crate::render::release_memory();
+        for layer in self.project.maps.iter_mut().flat_map(|map| &mut map.layers).filter(|layer| !layer.visible) {
+            layer.clear_cache();
+        }
+    }
+
     /// Whether a Zarr layer on the active map that follows the time slider is waiting for its
     /// step to be read off the frame ([`Session::zarr_off_frame`]): playing holds its next step.
     pub fn zarr_waiting(&self) -> bool {
@@ -1917,6 +1969,7 @@ impl Session {
             // And the coordinate systems that needed a missing datum grid, after every command.
             self.say_grid_notes();
             self.say_unplaced();
+            self.say_public_only_full();
             // A plugin's command waiting for its fetches answers `pending` and runs again when they
             // land: logged then, once. (Another command's `pending`, a download the web app makes, is
             // logged as it is asked for: nothing runs it again.)
@@ -2356,7 +2409,8 @@ impl Session {
         self.restorable += u32::from(mutates);
         // Edit counts roll back with the project when a command fails part way.
         let counts = mutates.then(|| self.edit_counts.clone());
-        self.request_only = false;
+        // Its flag is its own: the enclosing command's comes back after it, whatever it left.
+        let outer_request_only = std::mem::take(&mut self.request_only);
         // Its steps' account is its own: an enclosing command's comes back after it.
         let outer_steps = std::mem::take(&mut self.shared_steps);
         self.quiet_failure = false;
@@ -2513,6 +2567,7 @@ impl Session {
             }
             _ => {}
         }
+        self.request_only = outer_request_only;
         if res.is_err() {
             self.restore_url_request_checkpoint(requests);
             (self.plugin_retries, self.url_waits) = retry_state;
@@ -2598,6 +2653,7 @@ impl Session {
             plugin_runs: take(&mut self.plugin_runs),
             downloading: take(&mut self.downloading),
             downloaded: take(&mut self.downloaded),
+            downloaded_reach: take(&mut self.downloaded_reach),
             landed_reads: take(&mut self.landed_reads),
             #[cfg(not(target_arch = "wasm32"))]
             landed_windows: take(&mut self.landed_windows),
@@ -2656,6 +2712,7 @@ impl Session {
             plugin_runs,
             downloading,
             downloaded,
+            downloaded_reach,
             landed_reads,
             #[cfg(not(target_arch = "wasm32"))]
             landed_windows,
@@ -2688,6 +2745,7 @@ impl Session {
         (self.pending, self.plugin_runs, self.plugin_retries, self.url_waits) = (pending, plugin_runs, plugin_retries, url_waits);
         self.file_outputs = file_outputs;
         (self.downloading, self.downloaded, self.url_requests) = (downloading, downloaded, url_requests);
+        self.downloaded_reach = downloaded_reach;
         self.restore_policy_work(policy_work);
         self.landed_reads = landed_reads;
         #[cfg(not(target_arch = "wasm32"))]
@@ -2777,28 +2835,35 @@ impl Session {
                 // Values in date fields that weren't dates, once for a layer read in place.
                 let (unread, rounded) = layer.source.as_mut().map(|source| source.take_unread_dates()).unwrap_or_default();
                 if let Some(note) = unread {
-                    dates.push(rustgis_data::loss::Note::plain(format!(
-                        "{}: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, {note}",
-                        layer.name
-                    )));
+                    dates.push(note.map_text(|note| {
+                        format!(
+                            "{}: some values in its date fields aren't dates and show as empty (Load All Features counts them all); so far, {note}",
+                            layer.name
+                        )
+                    }));
                 }
                 if let Some(note) = rounded {
-                    dates.push(rustgis_data::loss::Note::plain(format!(
-                        "{}: some date-times in it have digits past the microsecond and are rounded (Load All Features counts them all); so far, {note}",
-                        layer.name
-                    )));
+                    dates.push(note.map_text(|note| {
+                        format!(
+                            "{}: some date-times in it have digits past the microsecond and are rounded (Load All Features counts them all); so far, {note}",
+                            layer.name
+                        )
+                    }));
                 }
                 if let Some(note) = layer.source.as_mut().and_then(|source| source.take_null_text()) {
-                    dates.push(rustgis_data::loss::Note::plain(format!(
-                        "{}: some text values written as Null in it show as empty (Load All Features counts them all); so far, {note}",
-                        layer.name
-                    )));
+                    dates.push(note.map_text(|note| {
+                        format!(
+                            "{}: some text values written as Null in it show as empty (Load All Features counts them all); so far, {note}",
+                            layer.name
+                        )
+                    }));
                 }
                 if let Some(note) = layer.source.as_mut().and_then(|source| source.take_not_utf8()) {
-                    not_utf8.push(notice_text::NoticeText::format(
+                    let text = notice_text::NoticeText::format(
                         "{name}: so far, {note} (Load All Features counts them all)",
-                        [("name", layer.name.clone().into()), ("note", note.into())],
-                    ));
+                        [("name", layer.name.clone().into()), ("note", note.text.into())],
+                    );
+                    not_utf8.push((note.loss, text));
                 }
                 // What else the map's reads of it lost or assumed, each kind once for its opening.
                 for note in layer.source.as_mut().map(|source| source.take_read_notes()).unwrap_or_default() {
@@ -2815,8 +2880,11 @@ impl Session {
         for note in dates {
             self.say(note);
         }
-        for note in not_utf8 {
-            self.notify_text(note, false);
+        for (loss, note) in not_utf8 {
+            match loss {
+                Some(code) => self.notify_loss(code, note),
+                None => self.notify_text(note, false),
+            }
         }
         if let Some(message) = notice_text::NoticeText::source_errors(source_error_count, source_errors, source_error_count) {
             self.notify_text(message, true);
@@ -2832,10 +2900,10 @@ impl Session {
                 if !dropped_here.is_empty() {
                     dropped.push((l.name.clone(), dropped_here));
                 }
-                let in_place = rl.in_place;
+                let (in_place, tiled) = (rl.reads_in_place(), rl.tiled);
                 lost.extend(rl.lost_unsaid().into_iter().map(|what| (l.name.clone(), what)));
                 let Some(d) = rl.pixels_unsaid() else { continue };
-                if let Some(what) = in_place.then(|| in_place_overview(&d)).flatten() {
+                if let Some(what) = in_place.then(|| in_place_overview(&d, tiled)).flatten() {
                     held.push((l.name.clone(), what));
                 }
             }
@@ -2977,7 +3045,7 @@ impl Session {
             .filter_map(|l| {
                 let name = l.name.clone();
                 let rl = l.raster.as_mut()?;
-                rl.in_place.then_some((name, rl))
+                rl.reads_in_place().then_some((name, rl))
             })
             .collect();
         let mut layers: Vec<&mut rustgis_map::raster::RasterLayer> = named.iter_mut().map(|(_, rl)| &mut **rl).collect();
@@ -3267,6 +3335,7 @@ impl Session {
             self.grid_notes_checked = Some(web_time::Instant::now());
             self.say_grid_notes();
             self.say_unplaced();
+            self.say_public_only_full();
         }
     }
 
@@ -3276,6 +3345,24 @@ impl Session {
     pub fn note_shown_systems(&mut self) {
         for m in &mut self.project.maps {
             m.note_shown_system();
+        }
+    }
+
+    /// Says once that the table of web addresses held to the internet is full
+    /// ([`render::rustgis_tiles::cache::take_public_only_full`]): from then on, until RustGIS
+    /// restarts, an address it has no record of is read only from the internet, so the user's own
+    /// on this computer or the local network is refused.
+    fn say_public_only_full(&mut self) {
+        // A copy run ahead (`requests_into`, desktop only) leaves it for the session that takes
+        // its results.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.requests_into.is_some() {
+            return;
+        }
+        if render::rustgis_tiles::cache::take_public_only_full() {
+            self.warn(
+                "web addresses: RustGIS has recorded as many addresses that may reach only the internet as it can hold, so until it restarts an address it hasn't seen before is read only from the internet, not this computer or the local network",
+            );
         }
     }
 
@@ -4152,6 +4239,47 @@ impl Session {
         }
         self.record_extent();
         true
+    }
+
+    /// Fits the camera to the layers `ids` ([`rustgis_map::ExtentOf`] says which of their
+    /// features): on a flat map in a coordinate system that holds one of them in its own
+    /// coordinates ([`rustgis_map::Layer::in_map_units`]), around their places in map coordinates,
+    /// those layers' exactly as held, with nothing converted; else as [`Session::zoom_to`] does,
+    /// around their longitude/latitude extent. `None` when they have nothing to zoom to; else
+    /// whether it did.
+    pub fn zoom_to_layers(&mut self, ids: &[u32], of: rustgis_map::ExtentOf) -> Option<bool> {
+        let m = self.map();
+        let layers: Vec<&rustgis_map::Layer> = ids.iter().filter_map(|id| m.layer(*id)).collect();
+        // In map coordinates first, where a layer's are its own: its longitude/latitude extent,
+        // which converts every place, isn't worked out for it then.
+        if !m.projection.is_globe() {
+            let flat = m.flat();
+            if layers.iter().any(|l| l.in_map_units(&flat)) {
+                let boxed = layers.iter().fold(rustgis_geom::Extent::EMPTY, |e, l| e.union(&l.extent_on(&flat, of)));
+                // None of it on this map (a layer in its system with nothing to frame, another
+                // wholly beyond the map), or a single point, which has no size to fit: framed in
+                // longitude/latitude, which says when the map can't show it.
+                if boxed.width() > 0.0 || boxed.height() > 0.0 {
+                    let (w, h) = self.view_size;
+                    if !self.map_mut().fit_map_extent(&boxed, w, h) {
+                        return Some(false);
+                    }
+                    self.record_extent();
+                    return Some(true);
+                }
+            }
+        }
+        let lonlat = layers.iter().fold(rustgis_geom::Extent::EMPTY, |e, l| e.union(&l.extent_of(of)));
+        if lonlat.is_empty() {
+            return None;
+        }
+        Some(self.zoom_to(&lonlat))
+    }
+
+    /// The layers on the active map it shows, by id, top first: what Full Extent zooms to.
+    pub fn shown_layer_ids(&self) -> Vec<u32> {
+        let m = self.map();
+        m.layers.iter().filter(|l| m.shows(l)).map(|l| l.id).collect()
     }
 
     pub fn title(&self) -> String {

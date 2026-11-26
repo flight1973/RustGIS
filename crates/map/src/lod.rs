@@ -57,10 +57,23 @@ pub(crate) struct Rejected {
     pub whole_layer_eligible: bool,
 }
 
+/// Why [`display`] made no level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// Too few vertices to thin, or past the budget.
+    Unfit,
+    /// Built from rows on the map as `Rows` has them, and found to drop fewer than
+    /// [`MIN_SAVING`] of the vertices: a copy built the same way, by [`project_budgeted`], would
+    /// too.
+    SavesTooLittle(Rows),
+}
+
 #[cfg(test)]
 thread_local! {
     /// Counts display construction on this test thread, including candidates later rejected.
     pub(crate) static DISPLAY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts the levels [`project_budgeted`] builds on this test thread, kept or not.
+    pub(crate) static LEVEL_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// One bounded display level, independent of the full geometry used for interaction.
@@ -90,35 +103,49 @@ pub fn project_thinned(g: &Geometry, flat: &crate::projection::Flat, tol: f64) -
     simplify_mapped(g, tol, Some(&|c: Coord| flat.forward_checked(c).unwrap_or(Coord::new(f64::NAN, f64::NAN))))
 }
 
-/// Builds a Mercator display level without ever constructing the full projected geometry.
-/// Original extents are transformed separately so thinning cannot change culling or splats.
-/// Both the geometry and its extent table fit in the optional display-cache budget.
+/// Where a display level's rows are on the map ([`display`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Rows {
+    /// In longitude/latitude, on a Web Mercator map: projected as they are simplified.
+    LonLat,
+    /// In the map's own coordinates (a layer held in the system the map is drawn in): simplified
+    /// as they are, with nothing converted.
+    MapUnits,
+}
+
+/// Builds a display level without ever constructing the full projected geometry: from rows in
+/// longitude/latitude on a Web Mercator map, or from rows already in the map's coordinates
+/// ([`Rows`]). Original extents are transformed separately so thinning cannot change culling or
+/// splats. Both the geometry and its extent table fit in the optional display-cache budget.
 pub(crate) fn display(
     features: &[rustgis_data::Feature],
+    rows: Rows,
     revision: u64,
     level: i32,
     budget: usize,
     whole_layer_eligible: bool,
-) -> Option<Display> {
+) -> Result<Display, Refused> {
     #[cfg(test)]
     DISPLAY_BUILDS.set(DISPLAY_BUILDS.get() + 1);
     let eligible: usize = features.iter().filter_map(|f| f.geometry.as_ref()).map(thinnable).sum();
     if !whole_layer_eligible && eligible <= THIN_ABOVE {
-        return None;
+        return Err(Refused::Unfit);
     }
-    let extent_bytes = features.len().checked_mul(std::mem::size_of::<rustgis_geom::Extent>())?;
-    let geometries = project_budgeted(features, level, budget.checked_sub(extent_bytes)?)?;
+    let extent_bytes = features.len().checked_mul(std::mem::size_of::<rustgis_geom::Extent>()).ok_or(Refused::Unfit)?;
+    let budget = budget.checked_sub(extent_bytes).ok_or(Refused::Unfit)?;
+    let geometries = project_budgeted(features, rows, level, budget).ok_or(Refused::Unfit)?;
     let all: usize = features.iter().filter_map(|f| f.geometry.as_ref()).map(vertices).sum();
     let kept: usize = geometries.iter().flatten().map(vertices).sum();
     if !whole_layer_eligible && kept as f64 > all as f64 * (1.0 - MIN_SAVING) {
-        return None;
+        return Err(Refused::SavesTooLittle(rows));
     }
-    // Mercator is monotone in both axes; two opposite corners bound every source vertex.
+    // Mercator is monotone in both axes; two opposite corners bound every source vertex. Rows in
+    // map coordinates already have their extents there.
     let extents = features
         .iter()
         .map(|f| {
             let e = f.geometry.as_ref().map_or(rustgis_geom::Extent::EMPTY, Geometry::extent);
-            if e.is_empty() {
+            if e.is_empty() || rows == Rows::MapUnits {
                 e
             } else {
                 rustgis_geom::Extent::from_points(
@@ -128,15 +155,27 @@ pub(crate) fn display(
             }
         })
         .collect();
-    let bytes = cache_bytes(&geometries).checked_add(extent_bytes)?;
-    Some(Display { revision, level, whole_layer_eligible, geometries, extents, bytes })
+    let bytes = cache_bytes(&geometries).checked_add(extent_bytes).ok_or(Refused::Unfit)?;
+    Ok(Display { revision, level, whole_layer_eligible, geometries, extents, bytes })
 }
 
-/// Builds only Mercator display geometry within `budget`. Callers apply their own eligibility
-/// and saving rules; exact consumers already have extents and need no second extent table.
-pub(crate) fn project_budgeted(features: &[rustgis_data::Feature], level: i32, budget: usize) -> Option<Vec<Option<Geometry>>> {
+/// Builds only display geometry within `budget`: Mercator from rows in longitude/latitude, the
+/// rows simplified as they are when they are in the map's coordinates ([`Rows`]). Callers apply
+/// their own eligibility and saving rules; exact consumers already have extents and need no second
+/// extent table.
+pub(crate) fn project_budgeted(features: &[rustgis_data::Feature], rows: Rows, level: i32, budget: usize) -> Option<Vec<Option<Geometry>>> {
+    #[cfg(test)]
+    LEVEL_BUILDS.set(LEVEL_BUILDS.get() + 1);
     let tol = tolerance(level);
-    map_budgeted(features, budget, |f| f.geometry.as_ref(), |g| project_thinned(g, &crate::projection::Flat::Mercator, tol))
+    map_budgeted(
+        features,
+        budget,
+        |f| f.geometry.as_ref(),
+        |g| match rows {
+            Rows::LonLat => project_thinned(g, &crate::projection::Flat::Mercator, tol),
+            Rows::MapUnits => simplify(g, tol),
+        },
+    )
 }
 
 /// Heap allocation held by a geometry's vectors (the enum itself is in its containing array).

@@ -13,6 +13,7 @@ mod agentthreads;
 mod analysispane;
 mod approvalcard;
 mod arcgisui;
+pub mod assistant;
 #[cfg(not(target_arch = "wasm32"))]
 mod assistantkeys;
 mod assistantpane;
@@ -86,6 +87,7 @@ mod pluginstart;
 mod pluginsui;
 mod popupmedia;
 mod portalsui;
+mod publicationwizard;
 #[cfg(not(target_arch = "wasm32"))]
 mod readjob;
 #[cfg(not(target_arch = "wasm32"))]
@@ -154,6 +156,7 @@ pub use chrome::{DoubleClick, TitlebarMetrics};
 pub use coordreadout::{CoordReadout, MapSystem};
 pub use rustgis_assistant;
 pub use rustgis_engine;
+pub use vertexedit::unplaced_feature_notice;
 pub use widgets::big_split_menu;
 
 /// Reconciles only command-result wrappers, not parameters or other arbitrary JSON.
@@ -226,6 +229,10 @@ pub const ASSISTANT_FILE_MAX_BYTES: usize = rustgis_assistant::attach::MAX_FILE_
 /// ([`rustgis_engine::map::symbology::MAX_PICTURE_BYTES`]). The browser's and the phone's shells
 /// refuse a larger one before reading it.
 pub const MARKER_FILE_MAX_BYTES: usize = rustgis_engine::map::symbology::MAX_PICTURE_BYTES / 4 * 3;
+
+/// The files «Image…» lists for a marker, on the computer and in the browser (the phone's picker
+/// lists every file).
+pub const MARKER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "svg"];
 
 /// The largest script file the Script pane's Load… reads, as the assistant's command file; the
 /// browser's shell refuses a larger one before reading it.
@@ -310,6 +317,8 @@ pub struct Download {
     pub slot: Slot<Result<Vec<u8>, String>>,
     /// How far it has come (the status bar's).
     pub progress: std::sync::Arc<rustgis_engine::render::rustgis_tiles::cache::Progress>,
+    /// Where it connected, for a GeoLibre project ([`rustgis_engine::Session::download_read_at`]).
+    pub reach: Slot<Reach>,
 }
 
 /// A download or a window's read under way, for the status bar ([`RustGisApp::downloads_under_way`]).
@@ -483,9 +492,12 @@ pub struct Services {
     /// Offers bytes as a download named `file_name`; success means submission to the host's
     /// download mechanism. Browsers do not expose confirmation that the file was saved.
     pub download: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
-    /// Starts saving a project through the phone's native picker. The shell reports the
-    /// eventual result through [`RustGisApp::complete_project_save`].
-    pub save_project: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
+    /// Starts saving a project on a phone: written back to the document given (one the project
+    /// was opened from or last saved as, with leave to write it), or through the native picker
+    /// when there is none. The shell reports the eventual result through
+    /// [`RustGisApp::complete_project_save`], and a document a picker save may write back to later
+    /// through [`RustGisApp::project_document`] before it.
+    pub save_project: Option<Box<dyn Fn(&str, Vec<u8>, Option<&str>) -> Result<(), String>>>,
     pub inbox: Option<Inbox>,
     /// Reads a saved preference (`language`, …).
     pub load_pref: Option<Box<dyn Fn(&str) -> Option<String>>>,
@@ -666,7 +678,9 @@ pub struct TilesResolve {
     pub vector: bool,
     /// The usual-path template, when the advertised one can't be read.
     pub fallback: String,
-    pub slot: Slot<Result<Vec<u8>, String>>,
+    /// The document's answer, with the reach it was read at: what it names is judged by that,
+    /// whatever the address's record says by the time it lands.
+    pub slot: Slot<Result<(Vec<u8>, Reach), String>>,
 }
 
 /// A service layer waiting on a document before it is added. `dialog` tells whether the add came
@@ -678,7 +692,14 @@ pub enum ServiceStep {
     Tiles { resolve: TilesResolve, dialog: bool, origin: Option<String>, opened: u64 },
     /// A WCS coverage whose description is being read before it is asked for: `service.coverage`'s
     /// parameters and the description on its way.
-    Coverage { params: Value, slot: Slot<Result<Vec<u8>, String>>, dialog: bool, origin: Option<String>, opened: u64 },
+    Coverage {
+        params: Value,
+        describe: String,
+        slot: Slot<Result<(Vec<u8>, Reach), String>>,
+        dialog: bool,
+        origin: Option<String>,
+        opened: u64,
+    },
 }
 
 impl ServiceStep {
@@ -728,6 +749,52 @@ fn fetch_document_as<E: Send + 'static>(url: &str, told: fn(Failure) -> E) -> Sl
                     cache::restrict_to_public(&asked);
                 }
                 fetched.bytes
+            });
+            *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+        }),
+    );
+    slot
+}
+
+/// Fetches an address off the frame, connecting no wider than `ceiling`: the reach of the
+/// document that named it, as that document's fetch observed it (`Reach::Local` for the user's own
+/// address). It lands with the bytes and the reach it was read at, which the addresses it names in
+/// turn are fetched within. Nothing is recorded for its address, so a long chain of reads (a
+/// service's feature pages, a catalogue's results) adds nothing to the restricted addresses
+/// ([`cache::restrict_to_public`]). Native downloads end at `timeout`, if it has one (the usual
+/// download's otherwise); the browser's late answer is discarded by the polling read.
+pub(crate) fn fetch_within(
+    url: &str,
+    max: usize,
+    timeout: Option<std::time::Duration>,
+    ceiling: Reach,
+) -> Slot<Result<(Vec<u8>, Reach), String>> {
+    let slot: Slot<Result<(Vec<u8>, Reach), String>> = Slot::default();
+    let land = slot.clone();
+    let done: cache::FetchedDone = Box::new(move |r| {
+        let r = r.map(|fetched| (fetched.bytes, fetched.origin.reach()));
+        *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+    });
+    cache::download_limited_reaching_with_origin(url, max, timeout, ceiling, done);
+    slot
+}
+
+/// [`fetch_document_into`], landing with the reach the document was read at (recorded too, if
+/// from the internet), for a step that judges what the document names when it lands.
+pub(crate) fn fetch_document_reaching(url: &str) -> Slot<Result<(Vec<u8>, Reach), String>> {
+    let slot: Slot<Result<(Vec<u8>, Reach), String>> = Slot::default();
+    let land = slot.clone();
+    let asked = url.to_string();
+    cache::download_detailed_with_origin(
+        url,
+        cache::MAX_DOWNLOAD,
+        Box::new(move |r| {
+            let r = r.map_err(|failure| failure.message).map(|fetched| {
+                let reach = fetched.origin.reach();
+                if reach == Reach::Public {
+                    cache::restrict_to_public(&asked);
+                }
+                (fetched.bytes, reach)
             });
             *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         }),
@@ -986,9 +1053,9 @@ pub struct UiState {
     /// Data downloading from web addresses (Home › Add › Add Data › From URL).
     pub downloads: Vec<Download>,
     /// A project downloading from its web address (`ui.openUrl`, a `?project=` link): the
-    /// session's download id, the address and where the download lands. A later one replaces it;
-    /// opening another project meanwhile drops it.
-    pub project_download: Option<(u64, String, Slot<Result<Vec<u8>, String>>)>,
+    /// session's download id, the address and where the download lands, with the reach it was
+    /// read at. A later one replaces it; opening another project meanwhile drops it.
+    pub project_download: Option<(u64, String, Slot<Result<(Vec<u8>, Reach), String>>)>,
     /// The SQL pane's editor, results and history.
     pub sql: sqlpane::State,
     /// GeoTIFFs, FlatGeobufs and GeoParquets by address whose headers are being read: those
@@ -1326,6 +1393,20 @@ impl RustGisApp {
         }
         self.fixes.push_back(fix);
     }
+
+    /// The system is short of memory (a phone says so): drops what is kept only to draw again
+    /// sooner ([`Session::release_memory`], the map's drapes, and its textures and buffers on the
+    /// graphics card), and says so the first time.
+    pub fn release_memory(&mut self) {
+        // The map first: it stops the frames being drawn, which would keep more.
+        self.map.release_memory();
+        self.session.release_memory();
+        if !std::mem::replace(&mut self.said_low_memory, true) {
+            self.session.warn(tl!(
+                "The device is low on memory: RustGIS dropped the map tiles and drawings it kept to draw faster. They are made or downloaded again when needed."
+            ));
+        }
+    }
 }
 
 /// Whether `fix` replaces the shown position: not when it is older, nor when it is much less
@@ -1411,6 +1492,8 @@ pub struct RustGisApp {
     /// How many positions were dropped from [`RustGisApp::fixes`] past [`FIXES_KEPT`] since an
     /// interface last took them: the interface says so when a track or an average missed them.
     pub fixes_dropped: usize,
+    /// Whether [`RustGisApp::release_memory`] has said so, which it does once.
+    said_low_memory: bool,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1435,7 +1518,7 @@ pub struct RustGisApp {
     pub reports: reportpane::ReportState,
     pub docs: docpanes::DocState,
     /// The AI Assistant's conversation and settings.
-    pub assistant: assistantpane::AssistantState,
+    pub assistant: assistant::AssistantState,
     /// "Let your Agents Control RustGIS" (desktop).
     #[cfg(not(target_arch = "wasm32"))]
     pub connect: connectui::ConnectState,
@@ -1717,6 +1800,7 @@ impl RustGisApp {
             keep_locating: false,
             photos: Vec::new(),
             fixes_dropped: 0,
+            said_low_memory: false,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1731,7 +1815,7 @@ impl RustGisApp {
             update: update::UpdateState::default(),
             reports: reportpane::ReportState::default(),
             docs: docpanes::DocState::default(),
-            assistant: assistantpane::AssistantState::default(),
+            assistant: assistant::AssistantState::default(),
             fonts_frames: 0,
             frame_start: None,
             applied_theme: None,
@@ -2680,7 +2764,7 @@ impl RustGisApp {
         self.session.notify(offered, false);
         report.notify(&mut self.session);
         for note in construction_notes {
-            self.session.notify(note, false);
+            self.session.say(note);
         }
         self.ui.web_file = Some(file);
         Ok(())
@@ -3198,7 +3282,7 @@ impl RustGisApp {
     /// Imports a peer's project without going through User command dispatch or restore memory.
     pub fn open_peer_text(&mut self, text: &str) -> Result<(), String> {
         let report = self.session.open_peer_text(rustgis_engine::Peer::Embedder, text)?;
-        assistantpane::peer_replaced(self);
+        assistant::peer_replaced(self);
         self.ui.web_file = None;
         self.map.deleting = None;
         // A spectral profile's points were read on the old project's rasters.
@@ -3607,6 +3691,17 @@ impl RustGisApp {
         // An edit of a standalone table acts on the table, not the active layer: a step naming
         // both would be refused when it runs again.
         if id.starts_with("edit.") && params.get("table").is_some_and(|t| !t.is_null()) {
+            return None;
+        }
+        // Coordinate entry uses only a loaded point layer; a fallback must not record the
+        // incompatible selection as an explicit target that replay would refuse.
+        if id == "edit.addPoint"
+            && !self
+                .session
+                .active_layer
+                .and_then(|id| self.session.map().layer(id))
+                .is_some_and(rustgis_engine::cmd::edit::accepts_coordinate_point)
+        {
             return None;
         }
         let spec = self.session.registry.get(id).filter(|c| c.mutates && params.get("layer").is_none_or(Value::is_null)).copied()?;
@@ -4315,8 +4410,8 @@ impl RustGisApp {
                 let format = match p.get("format") {
                     None | Some(Value::Null) => self.map.coord_format.next(),
                     Some(Value::String(v)) => CoordReadout::from_code(v)
-                        .ok_or_else(|| tl!("The coordinate format must be map, decimal, dms, utm or mgrs").to_string())?,
-                    _ => return Err(tl!("The coordinate format must be map, decimal, dms, utm or mgrs").into()),
+                        .ok_or_else(|| tl!("The coordinate format must be map, layer, decimal, dms, utm or mgrs").to_string())?,
+                    _ => return Err(tl!("The coordinate format must be map, layer, decimal, dms, utm or mgrs").into()),
                 };
                 self.map.coord_format = format;
                 self.save_pref(coordreadout::PREF, format.code());
@@ -4547,16 +4642,20 @@ impl RustGisApp {
                 let url = p.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
                 let url = rustgis_engine::map::geolibre::download_url(url);
                 let url = url.as_str();
-                let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
+                let slot: Slot<Result<(Vec<u8>, Reach), String>> = Slot::default();
                 let land = slot.clone();
-                rustgis_engine::render::rustgis_tiles::cache::download_limited(
+                // With where it was read: what the project names reaches no wider.
+                rustgis_engine::render::rustgis_tiles::cache::download_detailed_with_origin(
                     url,
                     if rustgis_engine::map::geolibre::is_project_file(url) {
                         rustgis_engine::map::geolibre::MAX_TEXT
                     } else {
                         rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD
                     },
-                    Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
+                    Box::new(move |r| {
+                        let r = r.map(|fetched| (fetched.bytes, fetched.origin.reach())).map_err(|failure| failure.message);
+                        *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                    }),
                 );
                 self.session.notify(i18n::fmt("Opening {url}…", &[("url", &rustgis_engine::sources::address_in_message(url))]), false);
                 let id = self.session.download_started();
@@ -4593,6 +4692,19 @@ impl RustGisApp {
                 } else {
                     connectionui::open_new(self, p.get("kind").and_then(Value::as_str).unwrap_or("service"))?;
                 }
+                // An enterprise geodatabase: SQL Server's form (server, sign-in, database), filled
+                // with what is given, or from a .sde file. A file that is refused says why in the
+                // form, which stays open to enter the connection by hand.
+                if p.get("form").and_then(Value::as_bool) == Some(true) && self.ui.connection.kind == "sqlserver" {
+                    let text = |key: &str| p.get(key).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty());
+                    if let Err(e) = connectionui::use_form(&mut self.ui.connection, text("server"), text("database")) {
+                        self.dialogs.error = Some(e);
+                    } else if let Some(file) = text("sdeFile")
+                        && let Err(e) = connectionui::fill_from_sde(self, file)
+                    {
+                        self.dialogs.error = Some(e);
+                    }
+                }
                 if p.get("test").and_then(Value::as_bool) == Some(true) {
                     connectionui::start_test(self);
                 }
@@ -4608,6 +4720,13 @@ impl RustGisApp {
                 let Some(url) = p.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()) else {
                     return self.run("ui.dialog", json!({"name": "addService"}));
                 };
+                // An address a document read from the internet named (`fromDocument`, below) may not
+                // point into the local network: refused before anything opens.
+                let from_document = p.get("fromDocument").and_then(Value::as_bool) == Some(true);
+                if from_document {
+                    rustgis_engine::render::rustgis_tiles::address::check_reach(url, Reach::Public)
+                        .map_err(|e| connectionui::translated(&e))?;
+                }
                 let connection = p
                     .get("connection")
                     .and_then(Value::as_str)
@@ -4620,6 +4739,11 @@ impl RustGisApp {
                     }
                     self.dialogs.mode = "csw";
                     self.dialogs.connection = connection;
+                    // A catalogue a document read from the internet named is searched only there
+                    // (its requests follow its record, `cswui::search`).
+                    if from_document {
+                        cache::restrict_to_public(url);
+                    }
                     self.ui.csw.url = url.to_string();
                     self.ui.csw.query = p.get("query").and_then(Value::as_str).unwrap_or("").to_string();
                     self.ui.csw.use_view = p.get("bbox").and_then(Value::as_str) == Some("view");
@@ -4653,6 +4777,14 @@ impl RustGisApp {
                 let resolved_connection = bound.get("connection").and_then(Value::as_str).map(str::to_string);
                 let url = bound.get("url").and_then(Value::as_str).unwrap_or(url);
                 let caps = rustgis_engine::data::ogc::capabilities_url(url, (kind != "auto").then_some(kind));
+                // An address a document read from the internet named (a catalogue's or a portal's
+                // entry, `fromDocument`) leads only there: its capabilities, the documents they
+                // link to and the layers they list (`service.layers` reads the address's record).
+                // It can only narrow what the address may reach.
+                if from_document {
+                    cache::restrict_to_public(url);
+                    cache::restrict_to_public(&caps);
+                }
                 // A refusal is told with what the server said (#509).
                 let slot = fetch_detailed_into(&caps);
                 // The dialog shows the address connected to, however the connection was asked for.
@@ -4812,8 +4944,10 @@ impl RustGisApp {
                     return r;
                 }
             }
+            // Save writes back to the document the project came from, where the phone allows it;
+            // Save As, and a project with no such document, ask where.
             "ui.save" | "ui.saveAs" if self.services.save_project.is_some() => {
-                saveprompt::start_project_save(self)?;
+                saveprompt::start_project_save(self, id == "ui.save")?;
             }
             // The browser can't write a file in place: Save downloads the project again under the
             // file name it was saved or opened as, and Save As (or a first Save) asks for one.
@@ -4917,8 +5051,8 @@ impl RustGisApp {
                 let li = self.session.active_layout.ok_or("open a layout first")?;
                 let l = self.session.project.layouts.get(li).cloned().ok_or("open a layout first")?;
                 if self.services.download.is_some() {
-                    let text = serde_json::to_string_pretty(&l).map_err(|e| e.to_string())?;
-                    self.download(&format!("{}.rgislayout", l.name), text.into_bytes());
+                    let bytes = rustgis_engine::project::layout_file_bytes(&l)?;
+                    self.download(&format!("{}.rgislayout", l.name), bytes);
                 } else if let Some(path) = dialogs::pick_save(&format!("{}.rgislayout", l.name), &["rgislayout"], tl!("RustGIS layout")) {
                     return self.run("layout.save", json!({"layout": li, "path": path}));
                 }
@@ -5212,7 +5346,10 @@ impl RustGisApp {
             "ui.pane.assistant" => match p.get("ask").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
                 Some(text) => {
                     self.ui.open_right(RightPane::Assistant);
+                    // A message still waiting isn't lost to this one: it goes back to the box.
+                    assistant::unqueue(&mut self.assistant);
                     self.assistant.queued = Some(text.to_string());
+                    self.assistant.queued_from_box = false;
                 }
                 None => toggle_right(&mut self.ui, RightPane::Assistant),
             },
@@ -5481,8 +5618,8 @@ impl RustGisApp {
                 // In the layer's own coordinate system, as share.exportLayer writes a file.
                 use rustgis_engine::data::io;
                 let (crs, default_note) = io::default_export_in(&ds, &name, self.session.project.coordinate_system);
-                let written = io::write_bytes_in(&ds, &ext, crs).map_err(|e| e.to_string());
-                let (bytes, left_out) = match written {
+                let written = io::write_bytes_noted(&ds, &ext, crs, &name).map_err(|e| e.to_string());
+                let (bytes, left_out, unplaced, extent) = match written {
                     Ok(w) => w,
                     Err(e) => {
                         self.session.notify(e.clone(), true);
@@ -5491,10 +5628,11 @@ impl RustGisApp {
                 };
                 let ext = download_ext;
                 // The features written, read whole, give their own extent, in longitude/latitude
-                // (not a raster's, or the one a streamed layer's source declares).
-                let mut notes: rustgis_engine::data::loss::Notes =
-                    rustgis_engine::data::export_notes([(ds.as_ref(), ds.lonlat_extent())], &name, crs).into();
+                // (not a raster's, or the one a streamed layer's source declares), taken from the
+                // places converted for the download when it is written there.
+                let mut notes: rustgis_engine::data::loss::Notes = rustgis_engine::data::export_notes([(ds.as_ref(), extent)], &name, crs);
                 rustgis_engine::cmd::share::coalesce_read_zm(&mut notes, &name, &ds, &lost);
+                notes.extend(unplaced);
                 // Which system it is written in, where that isn't the layer's own, as share.exportLayer says.
                 notes.extend(default_note);
                 let mut dbf_notes = rustgis_engine::data::loss::Notes::new();
@@ -5509,25 +5647,26 @@ impl RustGisApp {
                 dbf_notes.extend(io::dates_as_text_note(&ds.fields, &name));
                 dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(&ds, &ext, &name));
                 if lost.rows > 0 {
-                    dbf_notes.push(rustgis_engine::cmd::whole::unread_notice(&name, lost.rows));
+                    dbf_notes.push(rustgis_engine::cmd::whole::unread_note(&name, lost.rows));
                 }
                 dbf_notes.extend(rustgis_engine::cmd::share::read_notes(&name, &l.name, &lost));
                 // CSV holds a point a row, GPX a name for each feature and no areas; reading text back, CSV reads blanks as null and KML and GPX trim it.
                 dbf_notes.extend(io::export_losses_notes(&ds, &ext, io::name_field(&ds), &name).map_err(|e| e.to_string())?);
+                // NaN and infinities, which GeoJSON can't hold, written as null.
+                let null_numbers = rustgis_engine::data::export::numbers_written_as_null(&ds.features, &ds.fields, &ext);
                 drop(ds);
-                if let Some(note) = io::left_out_note(&name, &ext, left_out) {
-                    self.session.notify(note, false);
-                }
+                // Said only once the download is taken, as the other notes are.
+                dbf_notes.extend(io::left_out_note(&name, &ext, left_out));
                 if ext == "zip" && rustgis_engine::data::raster::wkt::to_wkt(crs).is_none() {
-                    self.session.notify(format!("{name}: no .prj written, as {} has no WKT form", crs.label()), false);
+                    dbf_notes.push(rustgis_engine::data::loss::Note::loss(
+                        rustgis_engine::data::loss::LossCode::DroppedCrsName,
+                        format!("{name}: no .prj written, as {} has no WKT form", crs.label()),
+                    ));
                 }
                 if self.download(&name, bytes) {
                     rustgis_engine::cmd::share::notify_export_query(&mut self.session, &name, &layer_name, &query_report);
-                    for note in notes
-                        .into_iter()
-                        .chain(dbf_notes)
-                        .chain(construction_notes.into_iter().map(rustgis_engine::data::loss::Note::plain))
-                    {
+                    rustgis_engine::cmd::share::notify_null_numbers(&mut self.session, &name, null_numbers);
+                    for note in notes.into_iter().chain(dbf_notes).chain(construction_notes) {
                         self.session.say(note);
                     }
                 }
@@ -5704,6 +5843,14 @@ impl RustGisApp {
                     self.dialogs = dialogs::Dialogs { open: Some("calculateGeometry"), geometry: Some(form), ..Default::default() };
                     return Ok(Value::Null);
                 }
+                if which == "publicationWizard" {
+                    // Opened again while open, it keeps what was entered.
+                    if self.dialogs.open != Some("publicationWizard") || self.dialogs.publication.is_none() {
+                        let draft = publicationwizard::Draft::new(&self.session);
+                        self.dialogs = dialogs::Dialogs { open: Some("publicationWizard"), publication: Some(draft), ..Default::default() };
+                    }
+                    return Ok(Value::Null);
+                }
                 if which == "offlineConflicts" {
                     let area = p.get("area").and_then(Value::as_str).ok_or_else(|| tl!("Name the offline area.").to_string())?;
                     let form = conflictsui::Form::new(&self.session, area)?;
@@ -5853,7 +6000,13 @@ impl RustGisApp {
                 }
                 return self.poll_data_downloads();
             }
-            if let Err(e) = r.and_then(|bytes| self.open_project_bytes(project_file_name(&url), &bytes)) {
+            // Opened as received from where it was read: what it names reaches no wider.
+            if let Err(e) = r.and_then(|(bytes, reach)| {
+                let was = self.session.receiving(Some(reach));
+                let r = self.open_project_bytes(project_file_name(&url), &bytes);
+                self.session.receiving(was);
+                r
+            }) {
                 self.session.notify(rustgis_engine::sources::message_with_address(&url, &e), true);
             }
         }
@@ -6136,9 +6289,31 @@ impl RustGisApp {
             let watch = std::sync::Arc::downgrade(&slot);
             let wanted: rustgis_engine::render::rustgis_tiles::cache::Still = std::sync::Arc::new(move || watch.strong_count() > 1);
             let progress = std::sync::Arc::<rustgis_engine::render::rustgis_tiles::cache::Progress>::default();
+            let reach: Slot<Reach> = Slot::default();
+            let read_at = reach.clone();
+            let project = q.get("geolibreProject").and_then(Value::as_bool) == Some(true);
             // A Shapefile address brings its companion parts under the same download owner.
             rustgis_engine::render::rustgis_tiles::cache::with_still(wanted, || {
                 rustgis_engine::render::rustgis_tiles::cache::with_progress(Some(progress.clone()), || {
+                    // A GeoLibre project, with where it was read: what it names reaches no wider.
+                    if project && !public {
+                        return rustgis_engine::render::rustgis_tiles::cache::download_detailed_with_origin(
+                            &url,
+                            rustgis_engine::map::geolibre::MAX_TEXT,
+                            Box::new(move |r| {
+                                let r = r
+                                    .map(|fetched| {
+                                        *read_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(fetched.origin.reach());
+                                        fetched.bytes
+                                    })
+                                    .map_err(|failure| failure.message);
+                                *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                            }),
+                        );
+                    }
+                    if project {
+                        *read_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Reach::Public);
+                    }
                     rustgis_engine::cmd::layer::download_data_from(
                         &url,
                         public,
@@ -6154,7 +6329,7 @@ impl RustGisApp {
                     )
                 })
             });
-            self.ui.downloads.push(Download { id, url, params: q, slot, progress });
+            self.ui.downloads.push(Download { id, url, params: q, slot, progress, reach });
 
             Ok(Value::Null)
         })
@@ -6237,13 +6412,20 @@ impl RustGisApp {
             }
         }
         let mut landed = Vec::new();
+        let mut read_at = Vec::new();
         self.ui.downloads.retain(|d| match d.slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
             Some(r) => {
                 landed.push((d.id, d.url.clone(), d.params.clone(), r));
+                if let Some(reach) = d.reach.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    read_at.push((d.id, reach));
+                }
                 false
             }
             None => true,
         });
+        for (id, reach) in read_at {
+            self.session.download_read_at(id, reach);
+        }
         for (id, url, mut p, r) in landed {
             let origin = connectiontree::take_origin_key(&mut p);
             // A range's answer shorter than the range is refused, never read as the record.
@@ -6705,7 +6887,14 @@ impl RustGisApp {
                         self.ui.service_steps.push(ServiceStep::Tiles { resolve, dialog, origin, opened });
                         continue;
                     };
-                    let next = r.ok().and_then(|body| resolve_tiles(&resolve.list, &resolve.doc, &body, resolve.vector));
+                    // Where the document was read, as its fetch observed it (one that failed: what
+                    // it was asked within). Recorded again for one read from the internet, so
+                    // `service.add` sees it whatever the record says by now.
+                    let read_at = r.as_ref().map_or_else(|_| cache::ceiling_for(&resolve.doc), |(_, reach)| *reach);
+                    if read_at == Reach::Public {
+                        cache::restrict_to_public(&resolve.doc);
+                    }
+                    let next = r.ok().and_then(|(body, _)| resolve_tiles(&resolve.list, &resolve.doc, &body, resolve.vector));
                     let next = next.map(|resolved| {
                         resolve.withheld_addresses = resolve.withheld_addresses.saturating_add(resolved.withheld_addresses);
                         resolved.step
@@ -6715,16 +6904,18 @@ impl RustGisApp {
                             resolve.read += 1;
                             // The resolver already carried the current document's binding, or
                             // its absence. A saved connection must not restore it after a hop.
-                            match rustgis_engine::render::rustgis_tiles::address::check(&next, Some(&resolve.doc)) {
+                            // Judged by where the list was read (its record), not by how its
+                            // address is spelled: a public-looking name may connect on the local network.
+                            match rustgis_engine::render::rustgis_tiles::address::check_reach(&next, read_at) {
                                 Ok(()) => {
                                     resolve.crossed_origin |= rustgis_engine::render::rustgis_tiles::logins::origin(&resolve.doc)
                                         != rustgis_engine::render::rustgis_tiles::logins::origin(&next);
                                     // A tile set document read from the internet leads only there.
-                                    if cache::ceiling_for(&resolve.doc) == Reach::Public {
+                                    if read_at == Reach::Public {
                                         cache::restrict_to_public(&next);
                                     }
                                     resolve.doc = next;
-                                    resolve.slot = fetch_document_into(&resolve.doc);
+                                    resolve.slot = fetch_document_reaching(&resolve.doc);
                                 }
                                 Err(e) => {
                                     self.notice_service_query_loss(resolve.withheld_addresses);
@@ -6743,7 +6934,7 @@ impl RustGisApp {
                     };
                     // After a tile set document read from the internet, the tiles come only from
                     // there: the template it names, or the usual one in its place.
-                    if cache::ceiling_for(&resolve.doc) == Reach::Public {
+                    if read_at == Reach::Public {
                         cache::restrict_to_public(&template);
                     }
                     resolve.crossed_origin |= rustgis_engine::render::rustgis_tiles::logins::origin(&resolve.doc)
@@ -6765,7 +6956,7 @@ impl RustGisApp {
                     self.report_step(dialog, pending.as_deref(), r);
                     self.map.invalidate();
                 }
-                ServiceStep::Coverage { mut params, slot, dialog, origin, opened } => {
+                ServiceStep::Coverage { mut params, describe, slot, dialog, origin, opened } => {
                     if !self.service_read_current(
                         opened,
                         params.get("url").and_then(Value::as_str).unwrap_or(""),
@@ -6774,11 +6965,16 @@ impl RustGisApp {
                         continue;
                     }
                     let Some(r) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
-                        self.ui.service_steps.push(ServiceStep::Coverage { params, slot, dialog, origin, opened });
+                        self.ui.service_steps.push(ServiceStep::Coverage { params, describe, slot, dialog, origin, opened });
                         continue;
                     };
                     let title = params["name"].as_str().unwrap_or("").to_string();
-                    let r = r.and_then(|bytes| {
+                    let r = r.and_then(|(bytes, reach)| {
+                        // Recorded again for one read from the internet, so `service.coverage`
+                        // holds the request built from it there whatever the record says by now.
+                        if reach == Reach::Public {
+                            cache::restrict_to_public(&describe);
+                        }
                         params["describe"] = json!(String::from_utf8_lossy(&bytes));
                         // Not `self.run`: an error belongs where the step reports, not the notices.
                         let c = self.session.run("service.coverage", &params)?;
@@ -7047,7 +7243,7 @@ impl RustGisApp {
         geolibreui::poll(self, ctx);
         pluginsui::poll(self, ctx);
         extensionsui::persist(self);
-        assistantpane::poll(self, ctx);
+        assistant::poll(self, ctx);
         // A project the MCP relay, the assistant or a plugin opened or saved this frame (they run
         // on the session directly) becomes Last Project now, not a frame later the app may not
         // reach.
@@ -8277,6 +8473,7 @@ const MAX_STEP_BYTES: usize = 4 << 20;
 /// an optional `layer` that defaults to the active layer goes here, so a recorded step names it;
 /// `record_tests::every_optional_layer_is_classified` fails until it is placed here or there.
 const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
+    "edit.addPoint",
     "select.byAttributes",
     "stac.search",
     "select.rows",
@@ -9241,7 +9438,7 @@ mod download_service_tests {
                 withheld_addresses: 0,
                 vector: false,
                 fallback: "https://h.invalid/svc/tiles/{z}/{y}/{x}".into(),
-                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(body)))),
+                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok((body, super::Reach::Local))))),
             };
             app.ui.service_steps.push(super::ServiceStep::Tiles { resolve, dialog: true, origin: None, opened: app.session.opened });
             app.poll_service_steps();
@@ -9263,6 +9460,8 @@ mod download_service_tests {
         for (query, count) in [("collections=roads", 0), ("token=RGSYNTH_ui_refused&collections=roads", 1)] {
             let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
             let list = format!("https://h.invalid/svc/tiles?{query}");
+            // The list was read from the internet, as its fetch observed it; its record may since
+            // have been cleared (a direct add of the same address), which changes nothing.
             let body = json!({"tilesets":[{"tileMatrixSetId":"WebMercatorQuad",
                 "links":[{"rel":"self", "href":"http://127.0.0.1/tiles"}]}]})
             .to_string()
@@ -9276,7 +9475,7 @@ mod download_service_tests {
                 withheld_addresses: 0,
                 vector: false,
                 fallback: "https://h.invalid/svc/tiles/{z}/{y}/{x}".into(),
-                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(body)))),
+                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok((body, super::Reach::Public))))),
             };
             app.ui.service_steps.push(super::ServiceStep::Tiles { resolve, dialog: false, origin: None, opened: app.session.opened });
             app.poll_service_steps();
@@ -9487,7 +9686,14 @@ mod download_service_tests {
             let params = json!({"url":"https://h.invalid/wcs", "name":"Heights"});
             let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(Err("the server is down".to_string()))));
             let opened = app.session.opened;
-            app.ui.service_steps.push(super::ServiceStep::Coverage { params, slot, dialog: true, origin: None, opened });
+            app.ui.service_steps.push(super::ServiceStep::Coverage {
+                params,
+                describe: String::new(),
+                slot,
+                dialog: true,
+                origin: None,
+                opened,
+            });
             app.dialogs.info = Some(if newer { "Reading the tileset of Roads" } else { "Describing Heights" }.into());
             app.dialogs.open = open.then_some("addService");
             app.poll_service_steps();
@@ -9514,9 +9720,16 @@ mod download_service_tests {
                 let opened = app.session.opened;
                 let params = json!({"url":"https://retired.invalid/service", "name":"Old read"});
                 let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let step = |opened, slot: std::sync::Arc<std::sync::Mutex<Option<Result<Vec<u8>, String>>>>| {
+                let step = |opened, slot: std::sync::Arc<std::sync::Mutex<Option<Result<(Vec<u8>, super::Reach), String>>>>| {
                     if coverage {
-                        super::ServiceStep::Coverage { params: params.clone(), slot, dialog: true, origin: None, opened }
+                        super::ServiceStep::Coverage {
+                            params: params.clone(),
+                            describe: String::new(),
+                            slot,
+                            dialog: true,
+                            origin: None,
+                            opened,
+                        }
                     } else {
                         super::ServiceStep::Tiles {
                             resolve: super::TilesResolve {
@@ -9543,7 +9756,7 @@ mod download_service_tests {
                     app.ui.service_steps.push(step(app.session.opened, Default::default()));
                 }
                 app.dialogs.info = Some(if newer == 1 { "New operation" } else { pending }.into());
-                *slot.lock().unwrap() = Some(Ok(b"late completion".to_vec()));
+                *slot.lock().unwrap() = Some(Ok((b"late completion".to_vec(), super::Reach::Local)));
                 app.poll_service_steps();
                 assert_eq!(app.ui.service_steps.len(), usize::from(newer == 2));
                 assert!(app.session.map().tiles.is_empty() && app.session.map().layers.is_empty());
@@ -9575,6 +9788,32 @@ mod download_service_tests {
         assert!(!app.session.notices.iter().any(|n| n.text.contains("Download offered")));
     }
 
+    /// The browser's Save Layout File downloads what `layout.save` writes, its header included, so
+    /// an older RustGIS refuses what the layout uses that it can't keep (#2277).
+    #[test]
+    fn layout_download_is_the_saved_layout_file() {
+        let file = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let downloaded = file.clone();
+        let mut app = RustGisApp::with_sample().with_services(Services {
+            download: Some(Box::new(move |_, bytes| {
+                *downloaded.lock().unwrap() = bytes;
+                Ok(())
+            })),
+            ..Default::default()
+        });
+        app.run("layout.new", json!({"page": "a4", "template": "map"})).unwrap();
+        app.run("layout.addElement", json!({"kind": "text", "text": "A", "background": {}})).unwrap();
+        app.run("ui.saveLayout", serde_json::Value::Null).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saved.rgislayout");
+        app.run("layout.save", json!({"path": path.display().to_string()})).unwrap();
+        let downloaded = file.lock().unwrap().clone();
+        assert_eq!(downloaded, std::fs::read(&path).unwrap());
+        let header: serde_json::Value = serde_json::from_slice(&downloaded).unwrap();
+        assert_eq!(header["format"], json!(rustgis_engine::project::FORMAT));
+        assert_eq!(header["requires"], json!(["layout-element-background"]));
+    }
+
     /// The web download encodes the filtered rows and reports the count once the bytes are accepted.
     #[test]
     fn feature_download_respects_the_definition_query() {
@@ -9603,6 +9842,33 @@ mod download_service_tests {
                     format!("Cities.geojson: the definition query on Cities left out {} of the source features", total - 1)
                 );
             }
+        }
+    }
+
+    /// The web download says the numbers GeoJSON can't hold, written as null, with their code, once
+    /// the browser takes the file; a refused download says nothing of them.
+    #[test]
+    fn feature_download_says_numbers_written_as_null() {
+        use rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+        use rustgis_engine::geom::Coord;
+        // A NaN accepted, a NaN refused, and finite numbers only (nothing to say).
+        for (accept, first) in [(true, f64::NAN), (false, f64::NAN), (true, 2.5)] {
+            let download: Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>> =
+                if accept { Box::new(|_, _| Ok(())) } else { Box::new(|_, _| Err("browser rejected download".into())) };
+            let mut app = RustGisApp::with_sample().with_services(Services { download: Some(download), ..Default::default() });
+            let mut ds = Dataset::new("Gauges", GeometryType::Point, vec![Field::new("level", FieldType::Double)]);
+            ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Float(first)]);
+            ds.push(Some(Geometry::Point(Coord::new(3.0, 4.0))), vec![Value::Float(1.5)]);
+            let id = app.session.map_mut().add_dataset(ds);
+            let mark = app.session.notice_mark();
+            let run = app.run("ui.exportLayer", json!({"layer": id, "format": "geojson"}));
+            if accept {
+                run.unwrap();
+            }
+            let said: Vec<_> =
+                app.session.notices_since(mark).iter().filter(|n| n.text.contains("written as null")).map(|n| n.loss()).collect();
+            let expected = if accept && first.is_nan() { vec![Some(rustgis_engine::data::loss::LossCode::DroppedValue)] } else { vec![] };
+            assert_eq!(said, expected, "accepted: {accept}, first: {first}");
         }
     }
 

@@ -9,7 +9,8 @@ use rustgis_data::query::{Env, SeriesPage};
 use rustgis_geom::{Coord, Extent};
 use rustgis_map::layout::{
     ArrowStyle, ChartLook, ColorScale, ElementKind, FrameShape, GRID_LABEL_PT, Grid, GridKind, INK, Layout, LineHead, MAX_LEGEND_COLUMNS,
-    Orientation, PT_PER_MM, SCALE_BAR_TEXT_PT, ScaleBarStyle, ScaleUnits, TextAlign, TickSide, frame_camera, layout_text_scale,
+    Orientation, PT_PER_MM, SCALE_BAR_TEXT_PT, ScaleBarFit, ScaleBarStyle, ScaleLabelPosition, ScaleUnits, TextAlign, TextCase, TextVAlign,
+    TickSide, UnitLabelPosition, frame_camera, layout_text_scale,
 };
 use rustgis_map::symbology::LegendEntry;
 use rustgis_map::{Map, Rgba};
@@ -282,6 +283,18 @@ pub struct TextLoss {
     pub past_limit: bool,
     /// Some of its ink crosses the page's edge: a text's drawn lines, or a scale bar's labels.
     pub off_page: bool,
+    /// A scale bar's unit label shortened with an ellipsis to fit its room, or left out with no
+    /// room for even its first character; `None` for a text, or a unit label drawn whole.
+    pub unit_label: Option<UnitLabelCut>,
+}
+
+/// How a scale bar's unit label is cut to fit its room ([`TextLoss::unit_label`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitLabelCut {
+    /// Shortened with an ellipsis.
+    Shortened,
+    /// Left out: not even its first character fits.
+    LeftOut,
 }
 
 /// [`clipped_text`], with how many of each text's lines are left out of its box ([`TextLoss`]):
@@ -298,7 +311,8 @@ pub fn text_loss(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo, id: u
 /// Whether a scale bar `e` drawn in `r` puts a label's ink past the page's `size` in pixels, and
 /// whether its box is too small for its labels and bar ([`BarLayout::cramped`]), its labels placed
 /// by [`bar_layout`] as the drawing places them: their line's middle at `label_y`, each centred on
-/// its advance as `text_at` draws it. `None` when it draws no bar.
+/// its advance as `text_at` draws it, and its unit label where it is drawn; and whether that unit
+/// label is shortened or left out to fit ([`BarLayout::unit_cut`]). `None` when it draws no bar.
 fn bar_labels_cut(
     layout: &Layout,
     maps: &[Map],
@@ -306,23 +320,29 @@ fn bar_labels_cut(
     r: Rect,
     ppp: f32,
     size: (f32, f32),
-) -> Option<(bool, bool)> {
-    let ElementKind::ScaleBar { frame, units, divisions, text_size, .. } = &e.kind else { return None };
+) -> Option<(bool, bool, Option<UnitLabelCut>)> {
+    let ElementKind::ScaleBar { frame, .. } = &e.kind else { return None };
     let ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } = &layout.element(*frame)?.kind else { return None };
     let m = maps.get(map_index(maps, map)?)?;
     let ground = m.ground_res_at(&frame_camera(m, *center, *scale, *bearing, *pitch));
-    let bar = bar_layout(r, ground, (*units, *divisions, *text_size), f64::from(ppp), layout.decimal_comma)?;
+    let bar = bar_layout(r, ground, &BarOptions::of(&e.kind)?, f64::from(ppp), layout.decimal_comma)?;
     let (w, h) = size;
-    let off_page = bar.labels.iter().any(|(x, s)| {
-        let pen = x - text::measure(s, bar.px / 1.33, false) / 2.0;
-        text::styled_bounds(s, bar.px, text::Face::default(), 0.0).is_some_and(|ink| {
-            pen + ink.left() < 0.0 || bar.label_y + ink.top() < 0.0 || pen + ink.right() > w || bar.label_y + ink.bottom() > h
-        })
+    // Its labels, centred on their divisions, and its unit label where it is drawn.
+    let unit = bar.unit.as_ref().map(|u| (u.x, u.y, u.text.as_str(), matches!(u.align, text::Align::Center)));
+    let drawn = bar.labels.iter().map(|(x, s)| (*x, bar.label_y, s.as_str(), true)).chain(unit);
+    let off_page = drawn.into_iter().any(|(x, y, s, centred)| {
+        let pen = if centred { x - text::measure(s, bar.px / 1.33, false) / 2.0 } else { x };
+        text::styled_bounds(s, bar.px, text::Face::default(), 0.0)
+            .is_some_and(|ink| pen + ink.left() < 0.0 || y + ink.top() < 0.0 || pen + ink.right() > w || y + ink.bottom() > h)
     });
-    Some((off_page, bar.cramped))
+    Some((off_page, bar.cramped, bar.unit_cut))
 }
 
-/// The texts cut off, of the whole page or of the element `only`.
+/// The texts cut off, of the whole page or of the element `only`. A text's lines are the ones the
+/// page draws ([`drawn_text`]), placed as [`text_block`] places them: its block shifted down its
+/// box by its alignment and stepped by its spaced pitch. A block taller than its box starts at its
+/// top whatever its alignment, so the same trailing lines are left out and counted as for a text
+/// at the top.
 fn losses(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo, only: Option<u32>) -> Vec<TextLoss> {
     let (w, h, k) = page_geometry(layout, dpi);
     let ppp = (k / PT_PER_MM) as f32;
@@ -344,8 +364,8 @@ fn losses(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo, only: Option
                 if color.a() == 0 {
                     return None;
                 }
-                let (off_page, cramped) = bar_labels_cut(layout, maps, e, r, ppp, (w as f32, h as f32))?;
-                return (off_page || cramped).then(|| TextLoss {
+                let (off_page, cramped, unit_label) = bar_labels_cut(layout, maps, e, r, ppp, (w as f32, h as f32))?;
+                return (off_page || cramped || unit_label.is_some()).then(|| TextLoss {
                     id: e.id,
                     name: e.name.clone(),
                     left_out: 0,
@@ -353,27 +373,64 @@ fn losses(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo, only: Option
                     below_box: cramped,
                     past_limit: false,
                     off_page,
+                    unit_label,
                 });
             }
             // A colorbar's labels left out for want of height, said with its title (#2638).
             let mut labels_cut = false;
             // `fits`: how many of its lines the element draws, when it decides that itself.
-            let (s, size, face, align, spacing, rotation, title, broken, fits) = match &e.kind {
-                ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation, wrap }
-                    if color.a() > 0 =>
-                {
-                    let style = text_style(*bold, *italic, *font, font_name.as_deref(), *align, *letter_spacing);
-                    let s = expand(t, layout, info, first);
-                    // Its lines as they are drawn: a wrapped text's, broken to its box.
-                    let s = if *wrap { wrapped(&s, e.w, *size, style) } else { s };
-                    (s, *size as f32, style.face, *align, *letter_spacing as f32, *rotation as f32, false, *wrap, None)
+            let (s, size, face, align, spacing, rotation, title, broken, fits, block) = match &e.kind {
+                ElementKind::Text {
+                    text: t,
+                    size,
+                    color,
+                    bold,
+                    italic,
+                    align,
+                    letter_spacing,
+                    font,
+                    font_name,
+                    rotation,
+                    wrap,
+                    valign,
+                    line_spacing,
+                    case,
+                    ..
+                } if color.a() > 0 => {
+                    let style =
+                        text_style(*bold, *italic, *font, font_name.as_deref(), *align, *letter_spacing).with_block(*valign, *line_spacing);
+                    // Its lines as they are drawn: in its case, a wrapped text's broken to its box.
+                    let s = drawn_text(expand(t, layout, info, first), *case, *wrap, e.w, *size, style);
+                    (
+                        s,
+                        *size as f32,
+                        style.face,
+                        *align,
+                        *letter_spacing as f32,
+                        *rotation as f32,
+                        false,
+                        *wrap,
+                        None,
+                        (style.valign, style.line_spacing),
+                    )
                 }
                 // Its title at the size it is drawn at, its legend's text size (#2581).
                 ElementKind::Legend { title, frame, text_size, .. } => {
                     let ElementKind::MapFrame { map, .. } = &layout.element(*frame)?.kind else { return None };
                     map_index(maps, map)?;
                     let size = LEGEND_TITLE_PT * legend_size(*text_size);
-                    (title.clone(), size, text::Face { bold: true, ..Default::default() }, TextAlign::Left, 0.0, 0.0, true, false, None)
+                    (
+                        title.clone(),
+                        size,
+                        text::Face { bold: true, ..Default::default() },
+                        TextAlign::Left,
+                        0.0,
+                        0.0,
+                        true,
+                        false,
+                        None,
+                        (TextVAlign::Top, USUAL_LINE_SPACING),
+                    )
                 }
                 // A colorbar's title in the lines it is drawn in (#2493), when it draws one: its
                 // frame's map has a raster with a colour scale (else it draws a placeholder).
@@ -402,13 +459,30 @@ fn losses(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo, only: Option
                         return None;
                     }
                     let s = lines.join("\n");
-                    (s, COLORBAR_TITLE_PT as f32, colorbar_title_style().face, TextAlign::Left, 0.0, 0.0, false, true, Some(fits))
+                    (
+                        s,
+                        COLORBAR_TITLE_PT as f32,
+                        colorbar_title_style().face,
+                        TextAlign::Left,
+                        0.0,
+                        0.0,
+                        false,
+                        true,
+                        Some(fits),
+                        (TextVAlign::Top, USUAL_LINE_SPACING),
+                    )
                 }
                 _ => return None,
             };
             let px = size.clamp(2.0, 400.0) * 1.33 * ppp;
             // A legend's title sits in the middle of its first row, which grows with its size.
-            let mut cy = r.y() + if title { LEGEND_ROW * (size / LEGEND_TITLE_PT) * ppp / 2.0 } else { px * 0.6 };
+            // A text's first line, where its block alignment puts it ([`block_shift`]).
+            let mut cy = if title {
+                r.y() + LEGEND_ROW * (size / LEGEND_TITLE_PT) * ppp / 2.0
+            } else {
+                let shift = text_shift(block.0, f64::from(r.height()), f64::from(px), &s, f64::from(block.1)) as f32;
+                r.y() + shift + px * 0.6
+            };
             let turn = Transform::from_rotate_at(rotation, r.x() + r.width() / 2.0, r.y() + r.height() / 2.0);
             // Legend titles are drawn on one line, unlike text elements' explicit line breaks.
             let lines = std::iter::once(s.as_str()).filter(|_| title).chain(s.lines().filter(|_| !title));
@@ -447,7 +521,7 @@ fn losses(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo, only: Option
                     turn.map_points(&mut corners);
                     corners.iter().any(|p| p.x < 0.0 || p.y < 0.0 || p.x > w as f32 || p.y > h as f32)
                 });
-                cy += px * 1.25;
+                cy += px * 1.25 * block.1;
             }
             // A wrapped text ends at the line past the 200 drawn ([`wrapped`]): it may go on.
             let at_least = broken && s.lines().nth(200).is_some();
@@ -460,6 +534,7 @@ fn losses(layout: &Layout, maps: &[Map], dpi: f64, info: &PageInfo, only: Option
                 below_box,
                 past_limit,
                 off_page,
+                unit_label: None,
             })
         })
         .collect()
@@ -511,8 +586,8 @@ pub fn clipped_text_notice(layout: &Layout, clipped: &[(u32, String)]) -> Option
 
 /// What scale bars whose labels don't fit are told (#2581), from their [`TextLoss`]es: one notice
 /// a kind, with the bars' count and names. Their boxes too small for their labels and bars (a bar
-/// drawn below its box, or an end label past its side), and a label off the page, each said of
-/// every bar it is true of.
+/// drawn below its box, or an end label past its side), a label off the page, and a unit label
+/// shortened or left out to fit ([`UnitLabelCut`]), each said of every bar it is true of.
 pub fn scale_bar_fit_notices(losses: &[TextLoss]) -> Vec<String> {
     let said = |small: bool| {
         let kind = |l: &&TextLoss| if small { l.below_box } else { l.off_page };
@@ -532,7 +607,27 @@ pub fn scale_bar_fit_notices(losses: &[TextLoss]) -> Vec<String> {
             }
         }
     };
-    [said(true), said(false)].into_iter().flatten().collect()
+    // A unit label shortened to fit, or left out with no room for it.
+    let unit_said = |cut: UnitLabelCut| {
+        let names: Vec<String> = losses.iter().filter(|l| l.unit_label == Some(cut)).map(|l| format!("\"{}\"", l.name)).collect();
+        let (n, names) = (names.len(), names.join(", "));
+        match (n, cut) {
+            (0, _) => None,
+            (1, UnitLabelCut::Shortened) => Some(format!(
+                "Scale bar {names}: its unit label is shortened to fit; make its box larger, reduce its text size or shorten the unit label"
+            )),
+            (1, UnitLabelCut::LeftOut) => Some(format!(
+                "Scale bar {names}: its unit label is left out, as there is no room for it; make its box larger, reduce its text size or shorten the unit label"
+            )),
+            (_, UnitLabelCut::Shortened) => Some(format!(
+                "{n} scale bars ({names}): their unit labels are shortened to fit; make their boxes larger, reduce their text size or shorten the unit labels"
+            )),
+            (_, UnitLabelCut::LeftOut) => Some(format!(
+                "{n} scale bars ({names}): their unit labels are left out, as there is no room for them; make their boxes larger, reduce their text size or shorten the unit labels"
+            )),
+        }
+    };
+    [said(true), said(false), unit_said(UnitLabelCut::Shortened), unit_said(UnitLabelCut::LeftOut)].into_iter().flatten().collect()
 }
 
 /// What a text that loses lines is told (#2346), from its [`TextLoss`]: `None` when none of its
@@ -562,6 +657,18 @@ pub fn lines_left_out_notice(loss: &TextLoss) -> Option<String> {
         ),
     };
     Some(format!("{count} of the text \"{}\" ({}) {said}", loss.name, loss.id))
+}
+
+/// What a text whose ink crosses the page's edge is told (#2703), from its [`TextLoss`]: `None`
+/// when none does. Its lines left out below its box are [`lines_left_out_notice`]'s: a text can
+/// have both, and each is said.
+pub fn off_page_notice(loss: &TextLoss) -> Option<String> {
+    loss.off_page.then(|| {
+        format!(
+            "The text \"{}\" ({}) runs off the page, so part of it isn't drawn; move it inside the page, resize it or reduce its size",
+            loss.name, loss.id
+        )
+    })
 }
 
 /// One element on transparency, allocating only its on-page pixel bounds.
@@ -633,7 +740,9 @@ fn draw_page(
     let mut pm =
         if record.is_some() { Canvas::recording(bounds.width(), bounds.height())? } else { Canvas::new(bounds.width(), bounds.height())? };
     if element.is_none() {
-        pm.fill(tiny_skia::Color::WHITE);
+        // The page's colour (#2855), white unless given.
+        let paper = layout.paper.unwrap_or(Rgba::rgb(0xFF, 0xFF, 0xFF));
+        pm.fill(tiny_skia::Color::from_rgba8(paper.r(), paper.g(), paper.b(), 255));
     }
     let visible = |e: &&rustgis_map::layout::Element| e.visible && element.is_none_or(|id| e.id == id);
     // Frame cameras first: surrounds and extent indicators read them.
@@ -662,8 +771,9 @@ fn draw_page(
         {
             let view = View { width: fw, height: fh, pixels_per_point: 1.0, camera: cam, sky: false };
             let lonlat = crate::view_lonlat(map, &view);
+            let own = crate::view_own(map, &view);
             let scale = map.ground_res_at(&cam) / rustgis_geom::PIXEL_M;
-            map.sync_sources_with(&lonlat, scale, true, env);
+            map.sync_sources_in(&lonlat, own.as_ref(), scale, true, env);
             let mut failed_source = None;
             let Some(entries) = complete_shown_legends(map, scale, *show_no_data, &mut failed_source, env) else {
                 *source_error = failed_source_error(map, failed_source);
@@ -779,12 +889,12 @@ fn draw_page(
                 let bearing = frame(*f).map_or(0.0, |fr| fr.2.bearing);
                 north_arrow(&mut pm, r, *style, *fill, *outline, ppp, bearing)
             }
-            ElementKind::ScaleBar { frame: f, units, divisions, style, color, fill, text_size } => {
+            ElementKind::ScaleBar { frame: f, color, fill, .. } => {
                 if let Some(&(_, mi, cam, _, _)) = frame(*f)
                     && let Some(map) = maps.get(mi)
+                    && let Some(bar) = BarOptions::of(&e.kind)
                 {
-                    let bar = (*units, *divisions, *style, *text_size);
-                    scale_bar(&mut pm, r, map.ground_res_at(&cam), bar, (*color, *fill), ppp, layout.decimal_comma);
+                    scale_bar(&mut pm, r, map.ground_res_at(&cam), &bar, (*color, *fill), ppp, layout.decimal_comma);
                 }
             }
             ElementKind::Legend { frame: f, title, all_classes, hide_other, show_no_data, exclude, columns, labels, color, text_size } => {
@@ -846,11 +956,29 @@ fn draw_page(
                     None => placeholder(&mut pm, r, "Colorbar", ppp),
                 }
             }
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation, wrap } => {
+            ElementKind::Text {
+                text: t,
+                size,
+                color,
+                bold,
+                italic,
+                align,
+                letter_spacing,
+                font,
+                font_name,
+                rotation,
+                wrap,
+                valign,
+                line_spacing,
+                case,
+                ..
+            } => {
                 let first = layout.first_frame().and_then(frame);
+                let style =
+                    text_style(*bold, *italic, *font, font_name.as_deref(), *align, *letter_spacing).with_block(*valign, *line_spacing);
+                // Its tokens filled in, then its case, then its wrap ([`drawn_text`]).
                 let s = expand(t, layout, info, first.and_then(|f| maps.get(f.1).map(|m| (m, f.2))));
-                let style = text_style(*bold, *italic, *font, font_name.as_deref(), *align, *letter_spacing);
-                let s = if *wrap { wrapped(&s, e.w, *size, style) } else { s };
+                let s = drawn_text(s, *case, *wrap, e.w, *size, style);
                 if *rotation == 0.0 {
                     text_block(&mut pm, r, &s, *size as f32, *color, style, ppp);
                 } else if let Some(area) = text_area(r, &s, *size as f32, style, ppp) {
@@ -1082,11 +1210,14 @@ pub fn scale_ratio_text(scale: f64, comma: bool) -> String {
 pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, rustgis_map::Camera)>) -> String {
     // The frame's scale, worked out once for both its forms below.
     let scale = frame.map(|(m, cam)| m.ground_res_at(&cam) / rustgis_map::layout::PAPER_M_PER_PT);
+    // The layer statistics first, read from the text as written: a page or layout name put in
+    // below isn't read as one.
+    let t = statistics(t, layout.decimal_comma, frame.map(|(m, _)| m));
     // A layout with a decimal comma prints its scale with points between thousands: put in first,
     // so a page or layout name holding "{scale}" isn't read as the token.
     let t = match scale {
         Some(scale) if layout.decimal_comma => t.replace("{scale}", &scale_ratio_text(scale, true)),
-        _ => t.to_string(),
+        _ => t,
     };
     let t = t
         .replace("{page}", &info.page.max(1).to_string())
@@ -1113,6 +1244,128 @@ pub fn expand(t: &str, layout: &Layout, info: &PageInfo, frame: Option<(&Map, ru
         },
     };
     rustgis_map::graphics::expand(&t, &v)
+}
+
+/// What the layer statistics in `text` (#2853) are missing, one line per token, each once: no map
+/// frame, the first frame's map not in the project, no such layer in it, or what
+/// [`rustgis_map::layout::layer_statistic`] finds missing (each drawn as written by [`expand`]); and
+/// a figure over a layer read in place, which covers only the features loaded, has a line for that
+/// as well.
+pub fn statistic_notices(layout: &Layout, maps: &[Map], text: &str) -> Vec<String> {
+    use rustgis_map::layout::StatMissing;
+    let map = layout.first_frame().and_then(|f| match &layout.element(f)?.kind {
+        ElementKind::MapFrame { map, .. } => maps.get(map_index(maps, map)?),
+        _ => None,
+    });
+    let mut said: Vec<String> = Vec::new();
+    let tokens = distinct_stat_tokens(text, true);
+    // Each layer's figures in one pass, whatever their number.
+    let figures: Vec<Option<Option<(bool, Result<f64, StatMissing>)>>> = match map {
+        Some(m) => figures_of(m, &tokens).into_iter().map(Some).collect(),
+        None => vec![None; tokens.len()],
+    };
+    for (t, found) in tokens.iter().zip(figures) {
+        let (layer, field) = (t.layer, t.field.unwrap_or_default());
+        // A layer read in place holds only what is loaded, so its figure is partial, and one with
+        // no number yet gets some as more is loaded.
+        if let Some(Some((true, Ok(_) | Err(StatMissing::NoValue)))) = found {
+            said.push(format!("{} covers only the features of '{layer}' that are loaded: it is read in place", t.token));
+        }
+        let why = match found.map(|l| l.map(|(_, figure)| figure)) {
+            None if layout.first_frame().is_some() => "the map of the layout's first frame is not in the project".to_string(),
+            None => "the layout has no map frame whose map it would read".to_string(),
+            Some(None) => format!("the map of the layout's first frame has no layer named '{layer}'"),
+            Some(Some(Ok(_))) => continue,
+            Some(Some(Err(StatMissing::Raster))) => format!("'{layer}' is a raster layer, which has no features"),
+            Some(Some(Err(StatMissing::Field))) if t.field.is_none() => {
+                format!("a {} takes a field: write {{{}:{layer}:field}}", t.stat.code(), t.stat.code())
+            }
+            Some(Some(Err(StatMissing::Field))) => format!("'{layer}' has no field named '{field}'"),
+            Some(Some(Err(StatMissing::NotNumeric))) => format!("'{field}' of '{layer}' holds no numbers"),
+            Some(Some(Err(StatMissing::NoValue))) => {
+                format!(
+                    "no feature of '{layer}' its definition query keeps has a number in '{field}', or the figure is past a number's range"
+                )
+            }
+        };
+        said.push(format!("{} shows as written: {why}", t.token));
+    }
+    said
+}
+
+/// `t` with its layer statistics (#2853) from `map`, the first frame's, written as a chart writes
+/// its values ([`rustgis_map::layout::chart_value_text`]) with `comma` the decimal mark; a token
+/// with no figure stays as written ([`statistic_notices`] says why).
+fn statistics(t: &str, comma: bool, map: Option<&Map>) -> String {
+    let Some(m) = map else { return t.to_string() };
+    let mut out = t.to_string();
+    // `replace` below puts in every occurrence, so a repeated token is worked out once, and the
+    // figures of one layer in one pass over it.
+    let tokens = distinct_stat_tokens(t, false);
+    for (s, figure) in tokens.iter().zip(figures_of(m, &tokens)) {
+        if let Some((_, Ok(v))) = figure {
+            out = out.replace(s.token, &decimal(rustgis_map::layout::chart_value_text(v, None), comma));
+        }
+    }
+    out
+}
+
+/// The layer statistics of `texts` (#2853) as the page draws them from `map`, as (token, figure)
+/// pairs for the tokens that have a figure, each token once: what a publication measures its texts
+/// with, so a box is sized for the figures it will show, not for the tokens written.
+pub fn statistic_figures(map: &Map, comma: bool, texts: &[&str]) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for text in texts {
+        let tokens = distinct_stat_tokens(text, false);
+        for (s, figure) in tokens.iter().zip(figures_of(map, &tokens)) {
+            if let Some((_, Ok(v))) = figure
+                && !pairs.iter().any(|(token, _)| token == s.token)
+            {
+                pairs.push((s.token.to_string(), decimal(rustgis_map::layout::chart_value_text(v, None), comma)));
+            }
+        }
+    }
+    pairs
+}
+
+/// The statistic tokens of `text`, each once, in the order they come; with `gaps`, the figures
+/// written without their field too.
+fn distinct_stat_tokens(text: &str, gaps: bool) -> Vec<rustgis_map::layout::StatToken<'_>> {
+    let mut tokens: Vec<rustgis_map::layout::StatToken<'_>> = Vec::new();
+    let read = if gaps { rustgis_map::layout::stat_tokens_and_gaps(text) } else { rustgis_map::layout::stat_tokens(text) };
+    for t in read {
+        if !tokens.iter().any(|seen| seen.token == t.token) {
+            tokens.push(t);
+        }
+    }
+    tokens
+}
+
+/// The figure of each of `tokens` in `map`, with whether its layer is read in place; none for a token
+/// whose layer the map lacks. The figures of one layer are worked out in one pass over its rows
+/// ([`rustgis_map::layout::layer_statistics`]), so a text with many figures costs a pass for each
+/// layer, not for each figure.
+fn figures_of(
+    map: &Map,
+    tokens: &[rustgis_map::layout::StatToken<'_>],
+) -> Vec<Option<(bool, Result<f64, rustgis_map::layout::StatMissing>)>> {
+    let mut out = vec![None; tokens.len()];
+    let mut done = vec![false; tokens.len()];
+    for i in 0..tokens.len() {
+        if done[i] {
+            continue;
+        }
+        let same: Vec<usize> = (i..tokens.len()).filter(|j| !done[*j] && tokens[*j].layer.eq_ignore_ascii_case(tokens[i].layer)).collect();
+        for j in &same {
+            done[*j] = true;
+        }
+        let Some(layer) = map.layer_by_name(tokens[i].layer) else { continue };
+        let wanted: Vec<_> = same.iter().map(|j| (tokens[*j].stat, tokens[*j].field)).collect();
+        for (j, figure) in same.iter().zip(rustgis_map::layout::layer_statistics(layer, &wanted)) {
+            out[*j] = Some((layer.is_streamed(), figure));
+        }
+    }
+    out
 }
 
 /// `stroke` dashed along `path` by an element's pattern (points, at `ppp` pixels a point), as a
@@ -2238,6 +2491,26 @@ fn scale_number(v: f64, step: f64) -> String {
     if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
 }
 
+/// A scale bar's number for `v`, a multiple of `step`, with a decimal comma when `comma`. With no
+/// `decimals` (auto), as [`scale_number`] prints it and no thousands separators, as bars always
+/// printed; with 0 to [`MAX_SCALE_DECIMALS`](rustgis_map::layout::MAX_SCALE_DECIMALS), that many
+/// places and the thousands apart. A minus only in front of a digit other than zero; NaN and
+/// infinity print 0.
+fn bar_number(v: f64, step: f64, decimals: Option<usize>, comma: bool) -> String {
+    let v = if v.is_finite() { v } else { 0.0 };
+    let body = match decimals {
+        None => decimal(scale_number(v.abs(), step), comma),
+        Some(d) => {
+            let places = d.min(rustgis_map::layout::MAX_SCALE_DECIMALS);
+            let s = format!("{:.*}", places, v.abs());
+            let (whole, part) = s.split_once('.').unwrap_or((s.as_str(), ""));
+            let whole = rustgis_map::graphics::thousands(whole.parse().unwrap_or(0.0));
+            if part.is_empty() { decimal(whole, comma) } else { decimal(format!("{whole}.{part}"), comma) }
+        }
+    };
+    if v < 0.0 && body.chars().any(|c| matches!(c, '1'..='9')) { format!("-{body}") } else { body }
+}
+
 /// The share of its element's width a scale bar's length may take.
 const BAR_SHARE: f64 = 0.85;
 /// How far a scale bar starts in from the element's left edge at its labels' default size, in
@@ -2297,6 +2570,53 @@ pub fn scale_bar_width_pt(ground_per_pt: f64, width_pt: f64, bar: (ScaleUnits, u
     Some(if w < width_pt && bar_plan(ground_per_pt, w, units) == Some(plan) { w } else { width_pt })
 }
 
+/// [`scale_bar_width_pt`] for the scale bar `bar` as it is set: the narrowest element, in points,
+/// in which it draws the same bar as in one `width_pt` wide, with every setting it has (its
+/// subdivisions, divisions before zero, labels, unit label and where it sits, decimals, fit and
+/// text size), its ink and `pad_pt` after it included, as [`bar_layout`] places it for the
+/// drawing. A bar without the details is measured as [`scale_bar_width_pt`] measures it, so its
+/// box is the one it always had. `width_pt` when no narrower one draws that bar; `None` when it
+/// draws none, or `bar` is no scale bar.
+pub fn scale_bar_box_width_pt(ground_per_pt: f64, width_pt: f64, bar: &ElementKind, comma: bool, pad_pt: f64) -> Option<f64> {
+    let options = BarOptions::of(bar)?;
+    if !bar.scale_bar_uses_details() {
+        return scale_bar_width_pt(ground_per_pt, width_pt, (options.units, options.divisions, options.text_size), comma, pad_pt);
+    }
+    // At a point a pixel; the height leaves the width as it is.
+    let place = |w: f64| Rect::from_xywh(0.0, 0.0, w as f32, 60.0).and_then(|r| bar_layout(r, ground_per_pt, &options, 1.0, comma));
+    let wide = place(width_pt)?;
+    let unit = |b: &BarLayout| b.unit.as_ref().map(|u| u.text.clone());
+    let labels = |b: &BarLayout| b.labels.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>();
+    // The same bar: its length and divisions, each label and its unit label written in full as
+    // they are in the wider box, and its ink and padding inside the box.
+    let same = |w: f64| {
+        place(w).is_some_and(|b| {
+            b.total == wide.total
+                && b.divs == wide.divs
+                && labels(&b) == labels(&wide)
+                && unit(&b) == unit(&wide)
+                && f64::from(b.right) + pad_pt <= w
+        })
+    };
+    if !same(width_pt) {
+        return Some(width_pt);
+    }
+    // A narrower box draws a bar no longer: the narrowest one that draws this one, halved for, to
+    // a hundredth of a point: a frame dragged measures its box on every move, so no further.
+    let (mut lo, mut hi) = (0.0, width_pt);
+    for _ in 0..48 {
+        if hi - lo <= 0.01 {
+            break;
+        }
+        let mid = (lo + hi) / 2.0;
+        if same(mid) { hi = mid } else { lo = mid }
+    }
+    // A little over, as for a plain bar, so the f32 rectangle an export rebuilds the width from
+    // doesn't pick the next shorter length.
+    let w = hi * (1.0 + 1e-4);
+    Some(if w < width_pt && same(w) { w } else { width_pt })
+}
+
 /// How far a scale bar starts in from its box's left side, in pixels, for its first label `first`
 /// at `k` times the default size (#2581): [`BAR_INSET`] in proportion, or more, so that label
 /// reaches no further past the side than it does at the default size, as the bar moves down to
@@ -2305,6 +2625,107 @@ pub fn scale_bar_width_pt(ground_per_pt: f64, width_pt: f64, bar: (ScaleUnits, u
 fn bar_inset(first: &str, k: f32, ppp: f32) -> f32 {
     let half = |k: f32| text::measure(first, SCALE_BAR_TEXT_PT as f32 * k * ppp, false) / 2.0;
     (BAR_INSET * k).max(half(k) - (half(1.0) - BAR_INSET).max(0.0))
+}
+
+/// A scale bar's look: the fields of [`ElementKind::ScaleBar`] but its frame and colours.
+#[derive(Clone, Copy, Debug)]
+struct BarOptions<'a> {
+    units: ScaleUnits,
+    divisions: usize,
+    style: ScaleBarStyle,
+    subdivisions: usize,
+    divisions_before_zero: usize,
+    label_position: ScaleLabelPosition,
+    unit_label: Option<&'a str>,
+    unit_label_position: UnitLabelPosition,
+    decimals: Option<u8>,
+    text_size: f64,
+    fit: ScaleBarFit,
+}
+
+impl<'a> BarOptions<'a> {
+    /// A scale bar element's look; `None` for any other element.
+    fn of(kind: &'a ElementKind) -> Option<BarOptions<'a>> {
+        let ElementKind::ScaleBar {
+            units,
+            divisions,
+            style,
+            subdivisions,
+            divisions_before_zero,
+            label_position,
+            unit_label,
+            unit_label_position,
+            decimals,
+            text_size,
+            fit,
+            ..
+        } = kind
+        else {
+            return None;
+        };
+        Some(BarOptions {
+            units: *units,
+            divisions: *divisions,
+            style: *style,
+            subdivisions: *subdivisions,
+            divisions_before_zero: *divisions_before_zero,
+            label_position: *label_position,
+            unit_label: unit_label.as_deref(),
+            unit_label_position: *unit_label_position,
+            decimals: *decimals,
+            text_size: *text_size,
+            fit: *fit,
+        })
+    }
+}
+
+/// A new scale bar's look.
+#[cfg(test)]
+impl Default for BarOptions<'_> {
+    fn default() -> Self {
+        static PLAIN: std::sync::LazyLock<ElementKind> = std::sync::LazyLock::new(|| ElementKind::scale_bar(0));
+        BarOptions::of(&PLAIN).expect("a scale bar")
+    }
+}
+
+/// How long a scale bar is and how it divides: its whole length in its unit, any divisions before
+/// zero included, and its divisions after zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarFit {
+    total: f64,
+    after: usize,
+}
+
+/// A scale bar of `before` divisions before zero and `after` after it, counting in a unit `unit_m`
+/// metres long, fitted to `room_m` ground metres by `fit`: the roundest length divided as asked
+/// (`AdjustDivisionValue`, the length [`bar_plan`] takes), as many round divisions as fit
+/// (`AdjustDivision`), or the asked divisions each a round length (`AdjustWidth`); under every fit
+/// at most ten in all, the divisions before zero included. `None` when it draws none.
+fn bar_fit(room_m: f64, unit_m: f64, fit: ScaleBarFit, before: usize, after: usize) -> Option<BarFit> {
+    // Ten in all under every fit, the divisions before zero among them, and at least one after zero.
+    let most = rustgis_map::layout::MAX_SCALE_DIVISIONS.saturating_sub(before).max(1);
+    let after = after.clamp(1, most);
+    let count = (before + after) as f64;
+    let (total, after) = match fit {
+        ScaleBarFit::AdjustDivisionValue => (rustgis_geom::nice_distance(room_m / unit_m), after),
+        ScaleBarFit::AdjustDivision => {
+            let most = most as f64;
+            let fits = |value: f64| (room_m / unit_m / value + 1e-9).floor() - before as f64;
+            // More than ten would fit: the next round division (1, 2, 5, 10 …) until ten do, so
+            // the bar fills its room as far as a round value allows rather than stopping short.
+            let mut value = rustgis_geom::nice_distance(room_m / unit_m / count);
+            for _ in 0..64 {
+                if !(fits(value) > most && value.is_finite() && value > 0.0) {
+                    break;
+                }
+                value = rustgis_geom::nice_distance(value * 2.5);
+            }
+            let after = fits(value).clamp(1.0, most) as usize;
+            (value * (before + after) as f64, after)
+        }
+        ScaleBarFit::AdjustWidth => (rustgis_geom::nice_distance(room_m / unit_m / count) * count, after),
+    };
+    (total.is_finite() && total > 0.0).then_some(BarFit { total, after })
 }
 
 /// Where a scale bar draws its bar and labels, from [`bar_layout`].
@@ -2319,58 +2740,225 @@ struct BarLayout {
     px: f32,
     label_y: f32,
     labels: Vec<(f32, String)>,
-    /// Its box is too small for its labels and bar: too short, the bar drawn below it, or too
-    /// narrow, an end label reaching past its side further than the default size's does or, above
-    /// the default size, over its first label.
+    /// Its divisions before zero, all its divisions, the parts the first after zero is cut
+    /// into, and its whole length in its unit: what it draws.
+    before: usize,
+    divs: usize,
+    parts: usize,
+    total: f64,
+    /// Its unit label when it isn't the last label's: after the bar or on a line of its own.
+    unit: Option<BarUnit>,
+    /// The furthest right its ink reaches, in pixels: its bar, its last label or its unit label.
+    right: f32,
+    /// Its unit label shortened with an ellipsis or left out to fit its room: said, as a cut text.
+    unit_cut: Option<UnitLabelCut>,
+    /// Its box is too small for its labels and bar: too short, the bar drawn below it or its
+    /// lines below the bar past its foot, or too narrow, an end label reaching past its side
+    /// further than the default size's does or, above the default size, over its first label.
     cramped: bool,
 }
 
-/// Where a scale bar in `r` draws, at `ground_per_pt` ground metres a point of paper, in `units`
-/// with `divisions` steps and its labels at `text_size` points: the drawing and the text-cut check
-/// ([`losses`]) take the same, so they agree. `None` when it draws no bar. A label that would
-/// touch its neighbour is left out, as on any map: the ends always show, and the user guide says
-/// each step is labelled where there is room. That is thinning, not a loss to report.
-fn bar_layout(r: Rect, ground_per_pt: f64, bar: (ScaleUnits, usize, f64), ppp: f64, comma: bool) -> Option<BarLayout> {
-    let (units, divisions, text_size) = bar;
-    let k = layout_text_scale(text_size, SCALE_BAR_TEXT_PT) as f32;
-    let divisions = divisions.clamp(1, rustgis_map::layout::MAX_SCALE_DIVISIONS);
-    let BarPlan { total, unit_m, abbr } = bar_plan(ground_per_pt, f64::from(r.width()) / ppp, units)?;
+/// A scale bar's unit label on a line of its own or after the bar: the middle of its line, its
+/// place across (its start or its centre, as `align` says) and its text.
+struct BarUnit {
+    x: f32,
+    y: f32,
+    text: String,
+    align: text::Align,
+}
+
+/// Where a scale bar in `r` draws as `bar` asks, at `ground_per_pt` ground metres a point of
+/// paper: the drawing and the text-cut check ([`losses`]) take the same, so they agree. `None`
+/// when it draws no bar. A label that would touch its neighbour is left out, as on any map: the
+/// ends always show, and the user guide says each step is labelled where there is room. That is
+/// thinning, not a loss to report.
+///
+/// Its labels, their room and its unit label follow its text size (#2581). Its lines above the
+/// bar reach no higher than the box's top, or than a plain bar's labels reach at the default size
+/// when that is higher (a publication's short box): the bar moves down to give them room. Its
+/// lines below the bar reach no lower than the box's foot, the bar moving up as far as its lines
+/// above leave it room. A box too short for its lines and bar is [`BarLayout::cramped`], which is
+/// said, rather than any line drawn smaller. A bar with none of the details draws where it always
+/// was at the default size.
+fn bar_layout(r: Rect, ground_per_pt: f64, bar: &BarOptions<'_>, ppp: f64, comma: bool) -> Option<BarLayout> {
+    use rustgis_map::layout::{
+        MAX_SCALE_BEFORE_ZERO, MAX_SCALE_DECIMALS, MAX_SCALE_DIVISIONS, MAX_SCALE_SUBDIVISIONS, MAX_UNIT_LABEL_CHARS,
+    };
+    if !(ground_per_pt.is_finite() && ground_per_pt > 0.0 && ppp.is_finite() && ppp > 0.0) {
+        return None;
+    }
+    let p = ppp as f32;
+    let k = layout_text_scale(bar.text_size, SCALE_BAR_TEXT_PT) as f32;
+    let after = bar.divisions.clamp(1, MAX_SCALE_DIVISIONS);
+    let before = bar.divisions_before_zero.min(MAX_SCALE_BEFORE_ZERO);
+    // One part is the division whole.
+    let parts = bar.subdivisions.clamp(1, MAX_SCALE_SUBDIVISIONS);
+    let width_pt = f64::from(r.width()) / ppp;
+    let BarPlan { unit_m, abbr, .. } = bar_plan(ground_per_pt, width_pt, bar.units)?;
+    let decimals = bar.decimals.map(|d| usize::from(d).min(MAX_SCALE_DECIMALS));
+    // The unit's words: its abbreviation unless the bar names it, on one line.
+    let unit: String = match bar.unit_label {
+        None => abbr.to_string(),
+        Some(t) => t.chars().take(MAX_UNIT_LABEL_CHARS).map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c }).collect(),
+    };
+    let has_unit = !unit.trim().is_empty();
+    let unit_at = bar.unit_label_position;
+    let rows = bar_rows(bar.label_position, unit_at, has_unit);
+    let bar_h = (r.height() * 0.28).min(6.0 * p);
+    // Its labels' size, and the default's, in pixels.
+    let (px, px8) = (SCALE_BAR_TEXT_PT as f32 * k * 1.33 * p, SCALE_BAR_TEXT_PT as f32 * 1.33 * p);
+    let measure_at = |s: &str, px: f32| text::measure(s, px / 1.33, false);
+    let measure = |s: &str| measure_at(s, px);
+    let half = |s: &str| measure(s) / 2.0;
+    let gap = 3.0 * k * p;
+    // The pixels a unit after the bar takes from it, at most half the bar's room.
+    let beside = if has_unit && unit_at == UnitLabelPosition::AfterBar {
+        (measure(&unit) + gap + p).min(r.width() * BAR_SHARE as f32 * 0.5)
+    } else {
+        0.0
+    };
+    // Division `k` from zero of a bar `total` long in `divs` divisions.
+    let number = |total: f64, divs: usize, k: isize| bar_number(total * k as f64 / divs as f64, total / divs as f64, decimals, comma);
+    // Left of zero the first label is a negative one, centred on the bar's end: the bar starts far
+    // enough in for it, at labels `px` high and `k` times the default. It takes at most half the
+    // bar's room, as a unit after the bar does: a wider one reaches left of the box rather than
+    // leave the bar a sliver.
+    let most_pad = ((r.width() * BAR_SHARE as f32 - beside) * 0.5).max(0.0);
+    let pad_at = |f: &BarFit, px: f32, k: f32| {
+        if before > 0 {
+            let first = number(f.total, before + f.after, -(before as isize));
+            (measure_at(&first, px) / 2.0 - BAR_INSET * k).clamp(0.0, most_pad)
+        } else {
+            0.0
+        }
+    };
+    let pad_of = |f: &BarFit| pad_at(f, px, k);
+    // The bar in what's left of its room once `taken` pixels of the box are its labels'.
+    let fitted = |taken: f32| {
+        let taken_pt = f64::from(taken) / ppp;
+        let room_m = ground_per_pt * width_pt * BAR_SHARE - ground_per_pt * taken_pt;
+        bar_fit(room_m, unit_m, bar.fit, before, after)
+    };
+    let first = fitted(beside)?;
+    // The room left of zero follows the bar's length: fitted again with the first label's, and once
+    // more if the shorter bar's first label is wider ("-1.25" for "-1"). Where a refit leaves no
+    // room, the fit before it draws, its first label perhaps starting a little left of the box.
+    let (fit, pad) = if before > 0 {
+        let reserved = pad_of(&first);
+        match fitted(beside + reserved) {
+            Some(f) if pad_of(&f) > reserved => match fitted(beside + pad_of(&f)) {
+                // A refit whose own first label is wider still would start past the room it was
+                // fitted to: the fit before it draws instead.
+                Some(g) if pad_of(&g) <= pad_of(&f) => (g, pad_of(&g)),
+                _ => (f, reserved),
+            },
+            Some(f) => (f, pad_of(&f)),
+            None => (first, 0.0),
+        }
+    } else {
+        (first, 0.0)
+    };
+    let BarFit { total, after } = fit;
+    let divs = before + after;
     let len = (total * unit_m / ground_per_pt * ppp) as f32;
-    let bar_h = (r.height() * 0.28).min(6.0 * ppp as f32);
-    // Labels at the divisions, the last with the unit, over the bar; their room follows their size
-    // (#2581). They reach no higher than the box's top, or than the default size's reach when that
-    // is higher (a publication's short box): the bar moves down to give them room, and a box too
-    // short for both has the bar below it ([`BarLayout::cramped`]). At the default size the bar is
-    // where it always was.
-    let px = SCALE_BAR_TEXT_PT as f32 * k * 1.33 * ppp as f32;
-    let rise = |px: f32| px * (BAR_LABEL_MID + BAR_LABEL_RISE);
-    let at = r.y() + r.height() * 0.62 - bar_h / 2.0;
-    let top = r.y().min(at - rise(SCALE_BAR_TEXT_PT as f32 * 1.33 * ppp as f32));
-    let first = bar_label(total, divisions, 0, abbr, comma);
-    let (x0, y0) = (r.x() + bar_inset(&first, k, ppp as f32), at.max(top + rise(px)));
-    let seg = len / divisions as f32;
-    let label_y = y0 - px * BAR_LABEL_MID;
-    let gap = 3.0 * k * ppp as f32;
-    let all: Vec<(f32, String)> = (0..=divisions).map(|i| (x0 + seg * i as f32, bar_label(total, divisions, i, abbr, comma))).collect();
-    let half = |s: &str| text::measure(s, px / 1.33, false) / 2.0;
+    // How far in the bar starts for labels `k` times the default size: past a first label before
+    // zero, or as far as the first label at zero needs ([`bar_inset`]).
+    let zero = number(total, divs, 0);
+    let inset_at = |k: f32, pad: f32| if before > 0 { BAR_INSET * k + pad } else { bar_inset(&zero, k, p) };
+    let x0 = r.x() + inset_at(k, pad);
+    // The box less the insets the bar keeps.
+    let (inner_left, inner_right) = (r.x() + BAR_INSET, r.right() - BAR_INSET);
+    // Division `j` counts `j - before` from zero. Its label, the last with the unit when it follows
+    // the labels: a unit the bar names shortened so the label, centred on the bar's end, ends
+    // inside the box, and left out when not even a letter of it fits. The abbreviation, short,
+    // follows the number as it always has.
+    let label = |j: usize| {
+        let v = number(total, divs, j as isize - before as isize);
+        if j == divs && has_unit && unit_at == UnitLabelPosition::AfterLabels {
+            // Centred on the bar's end: half of it each side, inside the nearer edge.
+            let room = 2.0 * (inner_right - (x0 + len)).min((x0 + len) - inner_left);
+            if bar.unit_label.is_some() { last_label(&v, &unit, room, measure) } else { (format!("{v} {unit}"), None) }
+        } else {
+            (v, None)
+        }
+    };
+    // Each line above the bar moves it down, each below up; labels over it alone leave it where it
+    // always was.
+    let centre = 0.62 + 0.12 * (rows.up as f32 - 1.0 - rows.down as f32);
+    let at = r.y() + r.height() * centre - bar_h / 2.0;
+    // How far `n` lines of labels `px` high reach out from the bar: the middle of the last, and
+    // its digits past it.
+    let reach = |n: usize, px: f32| if n == 0 { 0.0 } else { px * (BAR_LABEL_MID + 1.25 * (n - 1) as f32 + BAR_LABEL_RISE) };
+    // The highest its lines may reach: the box's top, or where a plain bar's labels reach at the
+    // default size when that is higher (a publication's short box), as they always have. Below
+    // the bar, the box's foot.
+    let plain_at = r.y() + r.height() * 0.62 - bar_h / 2.0;
+    let (top, foot) = (r.y().min(plain_at - reach(1, px8)), r.bottom());
+    let highest = top + reach(rows.up, px);
+    let mut y0 = at.max(highest);
+    if rows.down > 0 {
+        y0 = y0.min(foot - bar_h - reach(rows.down, px)).max(highest);
+    }
+    // The middle of text line `n` out from the bar.
+    let row = |n: usize| (BAR_LABEL_MID + 1.25 * n as f32) * px;
+    let seg = len / divs as f32;
+    let label_y = if bar.label_position == ScaleLabelPosition::Below { y0 + bar_h + row(0) } else { y0 - row(0) };
+    // The last label's unit, cut to fit or not.
+    let mut unit_cut = None;
+    let all: Vec<(f32, String)> = (0..=divs)
+        .map(|j| {
+            let (s, cut) = label(j);
+            unit_cut = unit_cut.or(cut);
+            (x0 + seg * j as f32, s)
+        })
+        .collect();
     let last = all.last().map(|(x, s)| x - half(s)).unwrap_or(f32::MAX);
-    let mut right = f32::MIN;
+    let mut right_label = f32::MIN;
     let mut labels = Vec::new();
     for (i, (x, s)) in all.into_iter().enumerate() {
-        let end = i == divisions;
-        if !end && (x - half(&s) < right + gap || x + half(&s) + gap > last) && i != 0 {
+        let end = i == divs;
+        if !end && (x - half(&s) < right_label + gap || x + half(&s) + gap > last) && i != 0 {
             continue;
         }
-        right = x + half(&s);
+        right_label = x + half(&s);
         labels.push((x, s));
     }
+    // The unit after the bar, level with its middle, or centred over or under it on a line of its
+    // own: after the bar in the room kept for it; on a line of its own in the box's width, moved
+    // in as far as it must be to stay inside it. Shortened with an ellipsis, or left out when not
+    // even its first character fits.
+    let place_unit = || {
+        let mid = x0 + len / 2.0;
+        let (x, y, align) = match unit_at {
+            UnitLabelPosition::AfterLabels => return (None, None),
+            UnitLabelPosition::AfterBar => (x0 + len + gap + p, y0 + bar_h / 2.0, text::Align::Left),
+            UnitLabelPosition::Above => (mid, y0 - row(rows.unit_row), text::Align::Center),
+            UnitLabelPosition::Below => (mid, y0 + bar_h + row(rows.unit_row), text::Align::Center),
+        };
+        let room = if unit_at == UnitLabelPosition::AfterBar { beside - gap - p } else { inner_right - inner_left };
+        let Some(text) = shortened(&unit, room, measure) else { return (None, Some(UnitLabelCut::LeftOut)) };
+        let cut = (text != unit).then_some(UnitLabelCut::Shortened);
+        let x = if matches!(align, text::Align::Center) {
+            let w = measure(&text) / 2.0;
+            x.min(inner_right - w).max(inner_left + w)
+        } else {
+            x
+        };
+        (Some(BarUnit { x, y, text, align }), cut)
+    };
+    let (unit, placed_cut) = if has_unit { place_unit() } else { (None, None) };
+    let unit_cut = unit_cut.or(placed_cut);
+    let unit_right =
+        unit.as_ref().map_or(f32::MIN, |u| if matches!(u.align, text::Align::Left) { u.x + measure(&u.text) } else { u.x + half(&u.text) });
+    let right = (x0 + len).max(right_label).max(unit_right);
     // Sideways the bar keeps its length: its first label is kept within its reach by the inset,
     // and its last reaches no further past the box's right side than the default size's does, or
     // than the side itself; further out, the box is too narrow for it, as it is too short when the
     // bar is below it.
-    let half8 = |s: &str| text::measure(s, SCALE_BAR_TEXT_PT as f32 * ppp as f32, false) / 2.0;
-    let x8 = r.x() + bar_inset(&first, 1.0, ppp as f32);
+    let half8 = |s: &str| measure_at(s, px8) / 2.0;
+    let x8 = r.x() + inset_at(1.0, pad_at(&fit, px8, 1.0));
     let past_side = labels.last().is_some_and(|(x, s)| x + half(s) > r.right().max(x8 + (x - x0) + half8(s)) + 0.01);
+    let low = y0 + bar_h + reach(rows.down, px) > foot + 0.01;
     // Its end label is drawn as its first is, whatever the room: above the default size, running
     // into the first, the box is too narrow for them too.
     let clash = k > 1.0
@@ -2378,32 +2966,29 @@ fn bar_layout(r: Rect, ground_per_pt: f64, bar: (ScaleUnits, usize, f64), ppp: f
             (Some((fx, fs)), Some((ex, es))) if labels.len() > 1 => ex - half(es) < fx + half(fs),
             _ => false,
         };
-    let cramped = y0 + bar_h > r.bottom() + 0.01 || past_side || clash;
-    Some(BarLayout { x0, y0, len, bar_h, px, label_y, labels, cramped })
+    let cramped = low || past_side || clash;
+    Some(BarLayout { x0, y0, len, bar_h, px, label_y, labels, before, divs, parts, total, unit, right, unit_cut, cramped })
 }
 
-/// A scale bar filling most of the element's width, in `units`, with `divisions` labelled steps,
-/// its labels at `text_size` points ([`bar_layout`]). `ground_per_pt` is ground metres per logical
-/// point of paper; `colors` are its lines, dark divisions and labels, then the alternating bar's
-/// light divisions.
-fn scale_bar(
-    pm: &mut Canvas,
-    r: Rect,
-    ground_per_pt: f64,
-    bar: (ScaleUnits, usize, ScaleBarStyle, f64),
-    colors: (Rgba, Rgba),
-    ppp: f64,
-    comma: bool,
-) {
-    let (units, divisions, style, text_size) = bar;
-    let (dark, light) = colors;
-    let Some(BarLayout { x0, y0, len, bar_h, px, label_y, labels, .. }) =
-        bar_layout(r, ground_per_pt, (units, divisions, text_size), ppp, comma)
+/// A scale bar filling most of the element's width as `bar` asks, placed by [`bar_layout`]: its
+/// divisions after zero (and any before it) labelled, the first after zero split into its
+/// subdivisions. `ground_per_pt` is ground metres per logical point of paper; `colors` are its
+/// lines, dark divisions and labels, then the alternating bar's light divisions.
+fn scale_bar(pm: &mut Canvas, r: Rect, ground_per_pt: f64, bar: &BarOptions<'_>, colors: (Rgba, Rgba), ppp: f64, comma: bool) {
+    let Some(BarLayout { x0, y0, len, bar_h, px, label_y, labels, before, divs, parts, unit, .. }) =
+        bar_layout(r, ground_per_pt, bar, ppp, comma)
     else {
         return;
     };
-    let divisions = divisions.clamp(1, rustgis_map::layout::MAX_SCALE_DIVISIONS);
-    let seg = len / divisions as f32;
+    let (dark, light) = colors;
+    let seg = len / divs as f32;
+    let zero_x = x0 + seg * before as f32;
+    // Where the first division after zero is cut into its subdivisions.
+    let cuts: Vec<f32> = (1..parts).map(|p| zero_x + seg * p as f32 / parts as f32).collect();
+    let dark_at = |j: usize| (j as isize - before as isize).rem_euclid(2) == 0;
+    // An alternating bar's fills alternate from zero, the cut division's parts counted one by one:
+    // the first part dark, the divisions after them going on from the last part.
+    let filled_dark = |j: usize| if j < before { dark_at(j) } else { (parts - 1 + (j - before)).is_multiple_of(2) };
     let line = Stroke { width: 0.6 * ppp as f32, ..Stroke::default() };
     let stroke = |pm: &mut Canvas, pts: &[(f32, f32)], w: &Stroke| {
         let mut pb = PathBuilder::new();
@@ -2414,11 +2999,21 @@ fn scale_bar(
             pm.stroke_path(&p, &paint(dark, 1.0), w, Transform::identity(), None);
         }
     };
-    match style {
+    match bar.style {
         ScaleBarStyle::Alternating => {
-            for i in 0..divisions {
-                let c = if i % 2 == 0 { dark } else { light };
-                if let Some(b) = Rect::from_xywh(x0 + seg * i as f32, y0, seg, bar_h) {
+            for j in 0..divs {
+                let x = x0 + seg * j as f32;
+                if j == before && parts > 1 {
+                    // Alternating parts from zero, the first dark.
+                    let part = seg / parts as f32;
+                    for p in 0..parts {
+                        let c = if p.is_multiple_of(2) { dark } else { light };
+                        if let Some(b) = Rect::from_xywh(x + part * p as f32, y0, part, bar_h) {
+                            pm.fill_rect(b, &paint(c, 1.0), Transform::identity(), None);
+                        }
+                    }
+                } else if let Some(b) = Rect::from_xywh(x, y0, seg, bar_h) {
+                    let c = if filled_dark(j) { dark } else { light };
                     pm.fill_rect(b, &paint(c, 1.0), Transform::identity(), None);
                 }
             }
@@ -2428,26 +3023,97 @@ fn scale_bar(
         }
         ScaleBarStyle::Stepped => {
             let mut pts = vec![(x0, y0 + bar_h)];
-            for i in 0..divisions {
-                let y = if i % 2 == 0 { y0 } else { y0 + bar_h };
-                let (a, b) = (x0 + seg * i as f32, x0 + seg * (i + 1) as f32);
+            // Its upper steps are an alternating bar's dark divisions; the cut division is upper.
+            for j in 0..divs {
+                let y = if j == before || filled_dark(j) { y0 } else { y0 + bar_h };
+                let (a, b) = (x0 + seg * j as f32, x0 + seg * (j + 1) as f32);
                 pts.extend([(a, y), (b, y)]);
             }
             pts.push((x0 + len, y0 + bar_h));
             stroke(pm, &pts, &Stroke { width: 1.0 * ppp as f32, ..Stroke::default() });
+            // The first division after zero is on the upper step: its ticks hang from it.
+            for &x in &cuts {
+                stroke(pm, &[(x, y0), (x, y0 + bar_h * 0.5)], &line);
+            }
         }
         ScaleBarStyle::Line => {
             let base = y0 + bar_h;
             stroke(pm, &[(x0, base), (x0 + len, base)], &Stroke { width: 1.0 * ppp as f32, ..Stroke::default() });
-            for i in 0..=divisions {
-                let tall = if i == 0 || i == divisions { bar_h } else { bar_h * 0.6 };
-                let x = x0 + seg * i as f32;
+            // Tall ticks at the ends and at zero.
+            for j in 0..=divs {
+                let tall = if j == 0 || j == divs || j == before { bar_h } else { bar_h * 0.6 };
+                let x = x0 + seg * j as f32;
                 stroke(pm, &[(x, base), (x, base - tall)], &line);
+            }
+            for &x in &cuts {
+                stroke(pm, &[(x, base), (x, base - bar_h * 0.3)], &line);
             }
         }
     }
+    // Labels at the divisions, over or under the bar, and the unit label where it is asked.
     for (x, s) in &labels {
         text::text_at(pm, s, *x, label_y, px, dark, false, text::Align::Center, false);
+    }
+    if let Some(BarUnit { x, y, text: shown, align }) = unit {
+        text::text_at(pm, &shown, x, y, px, dark, false, align, false);
+    }
+}
+
+/// The last label of a scale bar, its number `v` followed by `unit`, as it fits `room` pixels
+/// measured by `measure`: the unit shortened with an ellipsis, never the number, and left out when
+/// not even its first character fits, with how it was cut.
+fn last_label(v: &str, unit: &str, room: f32, measure: impl Fn(&str) -> f32) -> (String, Option<UnitLabelCut>) {
+    let whole = format!("{v} {unit}");
+    if measure(&whole) <= room {
+        return (whole, None);
+    }
+    let after = measure(&format!("{v} "));
+    match shortened(unit, room - after, &measure) {
+        Some(u) => (format!("{v} {u}"), Some(UnitLabelCut::Shortened)),
+        None => (v.to_string(), Some(UnitLabelCut::LeftOut)),
+    }
+}
+
+/// `t` as it fits `room` pixels measured by `measure`: whole, or cut a character at a time and
+/// ended with an ellipsis, keeping at least one character. `None` when not even that fits. A
+/// longer prefix measures no less, so the longest that fits is found by halving.
+fn shortened(t: &str, room: f32, measure: impl Fn(&str) -> f32) -> Option<String> {
+    if measure(t) <= room {
+        return Some(t.to_string());
+    }
+    let chars: Vec<char> = t.chars().collect();
+    let cut = |n: usize| format!("{}…", chars.iter().take(n).collect::<String>().trim_end());
+    // The fewest characters, from 1, that don't fit: `chars.len()` when all shorter ones do.
+    let (mut lo, mut hi) = (1, chars.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if measure(&cut(mid)) <= room { lo = mid + 1 } else { hi = mid }
+    }
+    (lo > 1).then(|| cut(lo - 1))
+}
+
+/// The text lines a scale bar has above and below it, and the line its unit takes on its side
+/// (0 next to the bar, 1 past its labels).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarRows {
+    up: usize,
+    down: usize,
+    unit_row: usize,
+}
+
+/// The lines of a scale bar with its labels at `labels` and its unit (if `has_unit`) at `unit`.
+fn bar_rows(labels: ScaleLabelPosition, unit: UnitLabelPosition, has_unit: bool) -> BarRows {
+    let labels_up = labels == ScaleLabelPosition::Above;
+    // The side the unit has a line of its own on: true above.
+    let unit_up = match unit {
+        UnitLabelPosition::Above if has_unit => Some(true),
+        UnitLabelPosition::Below if has_unit => Some(false),
+        _ => None,
+    };
+    BarRows {
+        up: usize::from(labels_up) + usize::from(unit_up == Some(true)),
+        down: usize::from(!labels_up) + usize::from(unit_up == Some(false)),
+        unit_row: usize::from(unit_up == Some(labels_up)),
     }
 }
 
@@ -3925,6 +4591,21 @@ pub(crate) struct TextStyle {
     pub(crate) align: TextAlign,
     /// Letter spacing in points.
     pub(crate) spacing: f32,
+    /// Where its block of lines sits down its box ([`block_shift`]).
+    pub(crate) valign: TextVAlign,
+    /// The distance between its lines, a multiple of the usual (0.5 to 3).
+    pub(crate) line_spacing: f32,
+}
+
+impl TextStyle {
+    /// This style with a text's block alignment and line spacing, brought into range here, so every
+    /// reader of `line_spacing` may trust it: an unknown alignment is the top, and the spacing is
+    /// as [`rustgis_map::layout::line_spacing_in_range`] reads it (not finite is the usual one, one
+    /// outside 0.5..=3 the nearer limit). The usual spacing is exactly 1, so a plain text is placed
+    /// as it always was.
+    pub(crate) fn with_block(self, valign: TextVAlign, line_spacing: f64) -> TextStyle {
+        TextStyle { valign: valign.kept(), line_spacing: rustgis_map::layout::line_spacing_in_range(line_spacing) as f32, ..self }
+    }
 }
 
 /// A text element's style: its face in an installed family by name (#762), else its generic one.
@@ -3941,7 +4622,7 @@ pub(crate) fn text_style(
 ) -> TextStyle {
     let family = font_name.and_then(crate::families::find_ready);
     let face = text::Face { bold, italic, serif: font == rustgis_map::layout::FontFamily::Serif, family };
-    TextStyle { face, align, spacing: letter_spacing as f32 }
+    TextStyle { face, align, spacing: letter_spacing as f32, valign: TextVAlign::Top, line_spacing: USUAL_LINE_SPACING }
 }
 
 /// Pixels per millimetre a wrapped text's lines are measured at (300 dpi), whatever the
@@ -3965,12 +4646,69 @@ pub(crate) fn wrapped(s: &str, width: f64, size: f64, style: TextStyle) -> Strin
     crate::report::wrap_lines(s, width * WRAP_PX_PER_MM, measure, 200).join("\n")
 }
 
+/// A text element's lines as they are drawn, from its text with its tokens filled in ([`expand`]):
+/// in its case, then, when it wraps, broken to its box `width_mm` wide ([`wrapped`]), so an upper
+/// case text breaks at its own, wider, width. One for the page, its cut-off check and the SVG, so
+/// they draw and count the same lines. Those that don't fit its box are left out from the bottom
+/// whatever its block alignment: a block taller than its box starts at its top ([`block_shift`]).
+pub(crate) fn drawn_text(expanded: String, case: TextCase, wrap: bool, width_mm: f64, size: f64, style: TextStyle) -> String {
+    let s = case.kept().apply(expanded);
+    if wrap { wrapped(&s, width_mm, size, style) } else { s }
+}
+
+/// The most lines a text draws.
+const MAX_TEXT_LINES: usize = 200;
+
+/// [`block_shift`] for the text `s` as it is drawn ([`drawn_text`]), by its lines. A text of more
+/// lines than a text draws is cut at them, so it starts at the top like any block that doesn't fit
+/// its box, though the lines kept would: one rule for the page, its cut-off check, a turned text's
+/// picture and the SVG.
+pub(crate) fn text_shift(valign: TextVAlign, box_h: f64, px: f64, s: &str, line_spacing: f64) -> f64 {
+    let lines = s.lines().take(MAX_TEXT_LINES + 1).count();
+    if lines > MAX_TEXT_LINES { 0.0 } else { block_shift(valign, box_h, px, lines, line_spacing) }
+}
+
+/// How far down its box of `box_h` pixels a text's block of `lines` lines at `px` pixels, spaced
+/// `line_spacing` times the usual, starts: 0 at the top; half the room it leaves in the middle;
+/// all of it at the bottom, its last line's pitch ending on the box's bottom edge. A block taller
+/// than its box (or with no line) starts at its top whatever its alignment, so its first lines are
+/// the ones kept and none is drawn above the box.
+pub(crate) fn block_shift(valign: TextVAlign, box_h: f64, px: f64, lines: usize, line_spacing: f64) -> f64 {
+    if lines == 0 || valign.kept() == TextVAlign::Top {
+        return 0.0;
+    }
+    let block = px * 1.25 * (1.0 + (lines - 1) as f64 * line_spacing);
+    let free = box_h - block;
+    // A measure not a number, or past any page, is no room.
+    if !free.is_finite() || free <= 0.0 {
+        return 0.0;
+    }
+    match valign.kept() {
+        TextVAlign::Middle => free / 2.0,
+        TextVAlign::Bottom => free,
+        _ => 0.0,
+    }
+}
+
+/// The lines a wrapped text element (#2346), upright and without letter spacing or a named family,
+/// is drawn in: `s`, its text with the dynamic text filled in, in a box `width` mm wide. For a
+/// caller that sizes the box around the text.
+pub fn wrapped_lines(s: &str, width: f64, size: f64, bold: bool, font: rustgis_map::layout::FontFamily, align: TextAlign) -> Vec<String> {
+    wrapped(s, width, size, text_style(bold, false, font, None, align, 0.0)).lines().map(str::to_string).collect()
+}
+
 /// A colorbar's title's size in points; it is drawn bold.
 pub const COLORBAR_TITLE_PT: f64 = 9.0;
 
 /// A colorbar's title's style, as [`colorbar_title_lines`] measures it: bold, from the left edge.
 fn colorbar_title_style() -> TextStyle {
-    TextStyle { face: text::Face { bold: true, ..Default::default() }, align: TextAlign::Left, spacing: 0.0 }
+    TextStyle {
+        face: text::Face { bold: true, ..Default::default() },
+        align: TextAlign::Left,
+        spacing: 0.0,
+        valign: TextVAlign::Top,
+        line_spacing: USUAL_LINE_SPACING,
+    }
 }
 
 /// A colorbar's title's width in mm, its widest line, measured as [`colorbar_title_lines`] breaks
@@ -4019,15 +4757,19 @@ fn colorbar_bar_room(ppp: f32, orientation: Orientation) -> f32 {
     }
 }
 
-/// The distance between two lines of text at `size` points, in mm, as [`text_block`] sets them.
+/// The usual line spacing ([`rustgis_map::layout::LINE_SPACING`]) as the drawing holds it.
+const USUAL_LINE_SPACING: f32 = rustgis_map::layout::LINE_SPACING as f32;
+
+/// The distance between two lines of text at `size` points, in mm, at the usual line spacing (1),
+/// as [`text_block`] sets them there; a text's line spacing multiplies it.
 pub fn line_pitch_mm(size: f64) -> f64 {
     size.clamp(2.0, 400.0) * 1.33 * 1.25 * 25.4 / 96.0
 }
 
 /// The part of a text element's box (pixels, from its top-left corner) [`text_block`] inks, a line's
 /// height more each way: across, its lines as each is aligned (past the box where one overruns
-/// it); down, its lines, or the box and the line [`text_block`] still draws past it. `None` when
-/// it has no line.
+/// it); down, its lines from where its block starts ([`block_shift`]), or the box and the line
+/// [`text_block`] still draws past it. `None` when it has no line.
 fn text_area(r: Rect, s: &str, size: f32, style: TextStyle, ppp: f64) -> Option<Rect> {
     let px = size.clamp(2.0, 400.0) * 1.33 * ppp as f32;
     let spacing = style.spacing * 1.33 * ppp as f32;
@@ -4043,8 +4785,11 @@ fn text_area(r: Rect, s: &str, size: f32, style: TextStyle, ppp: f64) -> Option<
         };
         (x0, x1, lines) = (x0.min(a), x1.max(b), lines + 1);
     }
-    let down = (r.height() + px).min(f32::from(lines) * px * 1.25);
-    (lines > 0).then(|| Rect::from_ltrb(x0 - px, -px, x1 + px, down + px)).flatten()
+    // Down to its last line, where its block alignment and line spacing put it.
+    let shift = text_shift(style.valign, f64::from(r.height()), f64::from(px), s, f64::from(style.line_spacing)) as f32;
+    let block = (1.0 + (f32::from(lines) - 1.0) * style.line_spacing) * px * 1.25;
+    let down = (r.height() + px).min(shift + block);
+    (lines > 0).then(|| Rect::from_ltrb(x0 - px, shift - px, x1 + px, down + px)).flatten()
 }
 
 /// Draws with `draw` (given the box to draw in and how many of the page's pixels one of its own
@@ -4089,14 +4834,18 @@ fn draw_turned_box(pm: &mut Canvas, r: Rect, degrees: f32, area: Rect, draw: imp
     pm.draw_pixmap(0, 0, pic.pixmap().as_ref(), &paint, place, None);
 }
 
-/// Text in an element: lines split at `\n` from the top, each placed by the style's alignment. A
-/// centred or right-aligned line wider than the element runs out past its left edge, as a
-/// left-aligned one runs past its right.
+/// Text in an element: lines split at `\n`, the block of them at the top, middle or bottom of the
+/// box ([`block_shift`]) and spaced by the style's line spacing, each placed by the style's
+/// alignment. A block taller than its box starts at its top whatever its alignment, so its first
+/// lines are drawn and the ones past the box left out ([`text_losses`] counts them). A centred or
+/// right-aligned line wider than the element runs out past its left edge, as a left-aligned one
+/// runs past its right.
 fn text_block(pm: &mut Canvas, r: Rect, s: &str, size: f32, color: Rgba, style: TextStyle, ppp: f64) {
     let px = size.clamp(2.0, 400.0) * 1.33 * ppp as f32;
     // Letter spacing is in points, as the size is.
     let spacing = style.spacing * 1.33 * ppp as f32;
-    let mut y = r.y() + px * 0.6;
+    let shift = text_shift(style.valign, f64::from(r.height()), f64::from(px), s, f64::from(style.line_spacing)) as f32;
+    let mut y = r.y() + shift + px * 0.6;
     for line in s.lines().take(200) {
         if y > r.y() + r.height() + px {
             break;
@@ -4113,7 +4862,7 @@ fn text_block(pm: &mut Canvas, r: Rect, s: &str, size: f32, color: Rgba, style: 
             }
         };
         text::styled_at(pm, line, left, y, px, color, style.face, spacing);
-        y += px * 1.25;
+        y += px * 1.25 * style.line_spacing;
     }
 }
 
@@ -4193,8 +4942,10 @@ fn table(pm: &mut Canvas, r: Rect, ds: &rustgis_data::Dataset, rows: usize, ink:
 fn chart(pm: &mut Canvas, r: Rect, data: &rustgis_map::layout::ChartData, look: &ChartLook, dark: Rgba, ppp: f64, comma: bool) {
     let ppp = ppp as f32;
     let vals = &data.bars;
-    let (min, max) = chart_span(data);
-    if vals.is_empty() || (max <= 0.0 && min >= 0.0) {
+    let (min, reach) = chart_span(data);
+    // A fixed maximum is the far end of the bars' room, whatever they reach (#2487 part 4).
+    let max = look.max.unwrap_or(reach);
+    if vals.is_empty() || (reach <= 0.0 && min >= 0.0) {
         placeholder(pm, r, "Chart", ppp as f64);
         return;
     }
@@ -4228,15 +4979,16 @@ fn chart(pm: &mut Canvas, r: Rect, data: &rustgis_map::layout::ChartData, look: 
         dark,
         look,
     };
+    let labelled = data.labelled && !look.hide_labels;
     match look.orientation {
-        Orientation::Horizontal => bars.across(pm, data.labelled),
-        Orientation::Vertical => bars.columns(pm, data.labelled),
+        Orientation::Horizontal => bars.across(pm, labelled),
+        Orientation::Vertical => bars.columns(pm, labelled),
     }
 }
 
 /// The span a chart's bars run over: from the most a bar reaches below zero to the most above,
 /// stacked its stretches below zero added up and those above.
-fn chart_span(data: &rustgis_map::layout::ChartData) -> (f64, f64) {
+pub fn chart_span(data: &rustgis_map::layout::ChartData) -> (f64, f64) {
     data.bars
         .iter()
         .enumerate()
@@ -4259,7 +5011,7 @@ fn chart_head(r: Rect, data: &rustgis_map::layout::ChartData, look: &ChartLook, 
         Orientation::Vertical => {
             let (min, max) = chart_span(data);
             let values = |on: bool| if look.values && on { line } else { 0.0 };
-            (if data.labelled { line } else { 0.0 }) + values(max > 0.0) + values(min < 0.0)
+            (if data.labelled && !look.hide_labels { line } else { 0.0 }) + values(max > 0.0) + values(min < 0.0)
         }
     };
     (data.key.is_empty() || title_h + key_h + line + below <= r.height()).then_some((title_h, key_h))
@@ -4320,8 +5072,9 @@ fn fit_label(name: &str, too_wide: impl Fn(&str) -> bool) -> String {
 
 /// What [`chart`] draws its bars from: its box, the height of its title (and key) over the bars,
 /// the bars and their values written out (none without), each bar's own colour (none: the look's
-/// bar colour), stacked each bar's stretches and the key that colours them, the least and
-/// greatest a bar reaches (0 among them), its text size and pixels per point.
+/// bar colour), stacked each bar's stretches and the key that colours them, the least a bar
+/// reaches and the value at the far end of the bars' room (the greatest a bar reaches, or a fixed
+/// maximum in its place; 0 among them), its text size and pixels per point.
 struct ChartBars<'a> {
     r: Rect,
     title_h: f32,
@@ -4346,17 +5099,23 @@ impl ChartBars<'_> {
     /// those below back from it, one of 0 not drawn.
     fn stretches(&self, i: usize, v: f64) -> Vec<(f32, f32, Rgba)> {
         let Some(s) = self.stretches.get(i).filter(|s| !s.is_empty()) else {
-            return vec![(0.0, self.share(v), self.colors.get(i).copied().flatten().unwrap_or(self.look.bar_color))];
+            return vec![(0.0, self.share(v.min(self.max)), self.colors.get(i).copied().flatten().unwrap_or(self.look.bar_color))];
         };
         let (mut lo, mut hi) = (0.0_f64, 0.0_f64);
+        // Past a fixed maximum a stretch above zero is cut at it, and one wholly past it isn't
+        // drawn; one running back from zero is drawn whole.
         s.iter()
             .zip(self.key)
             .filter(|(v, _)| **v != 0.0)
-            .map(|(v, (_, c))| {
+            .filter_map(|(v, (_, c))| {
                 let end = if *v < 0.0 { &mut lo } else { &mut hi };
                 let from = *end;
                 *end += v;
-                (self.share(from), self.share(*v), *c)
+                if *v < 0.0 {
+                    return Some((self.share(from), self.share(*v), *c));
+                }
+                let len = (from + v).min(self.max) - from;
+                (len > 0.0).then(|| (self.share(from), self.share(len), *c))
             })
             .collect()
     }
@@ -4406,30 +5165,40 @@ impl ChartBars<'_> {
         // Where the bars start: the left of the bar area when none is negative.
         let zero = r.x() + label_w + room_lo + bar_area * self.share(-self.min);
         let right = self.look.label_align == TextAlign::Right;
+        // Laid out the usual way, then placed as its mirror image when mirrored: a box from `x`,
+        // `w` wide, and a text written from `x`, the text itself reading as ever.
+        let edges = r.x() + r.right();
+        let place = |x: f32, w: f32| if self.look.mirror { edges - x - w } else { x };
+        let write = |x: f32, align: text::Align| if self.look.mirror { (edges - x, mirrored(align)) } else { (x, align) };
         for (i, (v, name)) in self.vals.iter().enumerate() {
             let y = r.y() + self.title_h + bh * i as f32;
             // Each stretch at least a pixel wide, running back from its start below zero; where the
             // bar ends at its left and at its right.
             let (mut left, mut right_end) = (zero, zero);
+            let mut drawn = Vec::new();
             for (start, share, colour) in self.stretches(i, *v) {
                 let w = (bar_area * share.abs()).max(1.0);
                 let x = zero + bar_area * start - if share < 0.0 { w } else { 0.0 };
-                fill(pm, colour, x, y + bh * 0.15, w, bh * 0.7);
+                drawn.push((place(x, w), w, colour));
                 (left, right_end) = (left.min(x), right_end.max(x + w));
             }
+            self.bar(pm, &drawn, (y + bh * 0.15, bh * 0.7), true);
             if labelled {
                 let t = fit_label(name, |t| text::measure(t, 7.5, false) * ppp > label_w - 4.0 * ppp);
                 // At the column's right, the label ends where the bars' side begins.
                 let (lx, align) = if right { (r.x() + label_w - 2.0 * ppp, text::Align::Right) } else { (r.x(), text::Align::Left) };
+                let (lx, align) = write(lx, align);
                 text::text_at(pm, &t, lx, y + bh / 2.0, size, self.dark, false, align, false);
             }
             if let Some(t) = self.values.get(i) {
                 let (vx, align) = if *v < 0.0 { (left - gap, text::Align::Right) } else { (right_end + gap, text::Align::Left) };
+                let (vx, align) = write(vx, align);
                 text::text_at(pm, t, vx, y + bh / 2.0, value_size, self.dark, false, align, false);
             }
         }
         if self.min < 0.0
-            && let Some(line) = Rect::from_xywh(zero - 0.375 * ppp, r.y() + self.title_h, 0.75 * ppp, bh * self.vals.len() as f32)
+            && let Some(line) =
+                Rect::from_xywh(place(zero - 0.375 * ppp, 0.75 * ppp), r.y() + self.title_h, 0.75 * ppp, bh * self.vals.len() as f32)
         {
             pm.fill_rect(line, &paint(self.dark, 1.0), Transform::identity(), None);
         }
@@ -4454,30 +5223,105 @@ impl ChartBars<'_> {
         }
         // Where the columns stand: the bottom of the plot when none is negative.
         let zero = top + plot_h * self.share(self.max);
+        // Laid out the usual way under its title, then placed upside down there when mirrored: a box
+        // from `y`, `h` high, and a text centred on `y`, the text itself reading as ever.
+        let edges = r.y() + self.title_h + r.bottom();
+        let place = |y: f32, h: f32| if self.look.mirror { edges - y - h } else { y };
+        let write = |y: f32| if self.look.mirror { edges - y } else { y };
         for (i, (v, name)) in self.vals.iter().enumerate() {
             let cx = r.x() + slot * (i as f32 + 0.5);
             // Each stretch at least a pixel high, standing up from its start above zero and hanging
             // down below it; where the column ends at its top and at its bottom.
             let (mut top_end, mut bottom) = (zero, zero);
+            let mut drawn = Vec::new();
             for (start, share, colour) in self.stretches(i, *v) {
                 let h = (plot_h * share.abs()).max(1.0);
                 let y = zero - plot_h * start - if share < 0.0 { 0.0 } else { h };
-                fill(pm, colour, cx - slot * 0.35, y, slot * 0.7, h);
+                drawn.push((place(y, h), h, colour));
                 (top_end, bottom) = (top_end.min(y), bottom.max(y + h));
             }
+            self.bar(pm, &drawn, (cx - slot * 0.35, slot * 0.7), false);
             if let Some(t) = self.values.get(i) {
                 let vy = if *v < 0.0 { bottom + value_h / 2.0 } else { top_end - value_h / 2.0 };
-                text::text_at(pm, t, cx, vy, value_px, self.dark, false, text::Align::Center, false);
+                text::text_at(pm, t, cx, write(vy), value_px, self.dark, false, text::Align::Center, false);
             }
             if labelled {
                 let t = fit_label(name, |t| text::measure(t, px / 1.33, false) > slot - 2.0 * ppp);
-                text::text_at(pm, &t, cx, r.bottom() - label_h / 2.0, px, self.dark, false, text::Align::Center, false);
+                text::text_at(pm, &t, cx, write(r.bottom() - label_h / 2.0), px, self.dark, false, text::Align::Center, false);
             }
         }
         if self.min < 0.0
-            && let Some(line) = Rect::from_xywh(r.x(), zero - 0.375 * ppp, r.width(), 0.75 * ppp)
+            && let Some(line) = Rect::from_xywh(r.x(), place(zero - 0.375 * ppp, 0.75 * ppp), r.width(), 0.75 * ppp)
         {
             pm.fill_rect(line, &paint(self.dark, 1.0), Transform::identity(), None);
+        }
+    }
+}
+
+/// A text's alignment in a chart's mirror image: from the right where it was from the left.
+fn mirrored(align: text::Align) -> text::Align {
+    match align {
+        text::Align::Left => text::Align::Right,
+        text::Align::Right => text::Align::Left,
+        other => other,
+    }
+}
+
+impl ChartBars<'_> {
+    /// A bar, filled stretch by stretch, with the look's outline round it (#2487 part 4b). Each
+    /// stretch is its start and length along the bar and its colour; `cross` is where the bar
+    /// starts across its run and how thick it is, and `across` says it runs across (else down).
+    /// The line runs just inside the bar's edge, so it takes no room the bars leave to their
+    /// values, labels and title, and is laid once between two stretches, centred where they meet,
+    /// so a see-through one reads the same everywhere. So that every stretch keeps its colour, the
+    /// edge's line narrows to a third of the bar's thickness, across each end to a third of the
+    /// stretch there too, and each line between two stretches to a third of either, kept within
+    /// the edge's line.
+    fn bar(&self, pm: &mut Canvas, stretches: &[(f32, f32, Rgba)], cross: (f32, f32), across: bool) {
+        // A box from where it starts and how long it is along the run, and across it.
+        let rect = |along: f32, run: f32, across_at: f32, thick: f32| {
+            if across { (along, across_at, run, thick) } else { (across_at, along, thick, run) }
+        };
+        for (at, len, colour) in stretches {
+            let (x, y, w, h) = rect(*at, *len, cross.0, cross.1);
+            fill(pm, *colour, x, y, w, h);
+        }
+        let Some(o) = self.look.bar_outline else { return };
+        let mut order: Vec<_> = stretches.iter().map(|(at, len, _)| (*at, *len)).collect();
+        order.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (Some(first), Some(last)) = (order.first(), order.last()) else { return };
+        let (lo, hi) = (first.0, last.0 + last.1);
+        let line = (o.width as f32 * self.ppp).min(cross.1 / 3.0);
+        if line <= 0.0 {
+            return;
+        }
+        // Across the ends, narrowed only there by the stretch it would cover.
+        let (start, end) = (line.min(first.1 / 3.0), line.min(last.1 / 3.0));
+        // The whole line, round the bar and between its stretches, is one shape filled once: boxes
+        // filled each on its own would cover a pixel they share in part twice over, leaving a
+        // lighter seam where they meet and a darker spot where they overlap. Boxes, not a stroke:
+        // a stroke thinner than a pixel is drawn a pixel wide, past the bar's end.
+        let mut shape = PathBuilder::new();
+        let mut boxed = |(x, y, w, h): (f32, f32, f32, f32)| {
+            if let Some(b) = Rect::from_xywh(x, y, w, h) {
+                shape.push_rect(b);
+            }
+        };
+        boxed(rect(lo, hi - lo, cross.0, line));
+        boxed(rect(lo, hi - lo, cross.0 + cross.1 - line, line));
+        boxed(rect(lo, start, cross.0 + line, cross.1 - 2.0 * line));
+        boxed(rect(hi - end, end, cross.0 + line, cross.1 - 2.0 * line));
+        // Between two stretches, inside the edge's line, and kept there along the bar too: a
+        // stretch drawn a pixel long though its share is shorter has the next start inside it,
+        // near the bar's end.
+        for pair in order.windows(2) {
+            let &[(_, a), (at, b)] = pair else { continue };
+            let d = line.min(a / 3.0).min(b / 3.0);
+            let (from, to) = ((at - d / 2.0).max(lo + start), (at + d / 2.0).min(hi - end));
+            boxed(rect(from, to - from, cross.0 + line, cross.1 - 2.0 * line));
+        }
+        if let Some(shape) = shape.finish() {
+            pm.fill_path(&shape, &paint(o.color, 1.0), FillRule::Winding, Transform::identity(), None);
         }
     }
 }
@@ -4492,6 +5336,42 @@ fn fill(pm: &mut Canvas, colour: Rgba, x: f32, y: f32, w: f32, h: f32) {
 /// The first case-insensitive frame-map name match; a missing reference renders no map.
 pub fn map_index(maps: &[rustgis_map::Map], name: &str) -> Option<usize> {
     maps.iter().position(|map| map.name.eq_ignore_ascii_case(name))
+}
+
+/// Pages of one text each with none of the block settings, in the combinations main draws: each
+/// alignment, wrapped or not, turned 0, 90, -90 or 33 degrees, spaced 0 or 3 points (bold, and
+/// italic when turned 33), in a box that holds its lines and one that cuts them; and two texts
+/// across the page's right and bottom edges.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn plain_text_pages() -> Vec<Layout> {
+    let text = "Population counts\nfrom the 2020 census; boundaries simplified for print\nPage {page} of {pages}";
+    let page = |at: (f64, f64, f64, f64), f: &dyn Fn(&mut ElementKind)| {
+        let mut l = Layout::new("Plain", 120.0, 80.0);
+        let mut kind = ElementKind::text(text, 11.0, Rgba::rgb(0, 0, 0), false);
+        f(&mut kind);
+        l.add("Note", at, kind);
+        l
+    };
+    let mut pages = Vec::new();
+    for align in TextAlign::ALL {
+        for wrap in [false, true] {
+            for turn in [0.0, 90.0, -90.0, 33.0] {
+                for spacing in [0.0, 3.0] {
+                    for h in [40.0, 9.0] {
+                        pages.push(page((10.0, 10.0, 60.0, h), &|k| {
+                            if let ElementKind::Text { align: a, wrap: w, rotation, letter_spacing, italic, bold, .. } = k {
+                                (*a, *w, *rotation, *letter_spacing) = (align, wrap, turn, spacing);
+                                (*italic, *bold) = (turn == 33.0, spacing > 0.0);
+                            }
+                        }));
+                    }
+                }
+            }
+        }
+    }
+    pages.push(page((90.0, 10.0, 60.0, 30.0), &|_| {}));
+    pages.push(page((10.0, 74.0, 60.0, 30.0), &|_| {}));
+    pages
 }
 
 #[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
@@ -4689,6 +5569,32 @@ mod tests {
         // As a column from the bottom up: red at its foot, green over it.
         let c = draw(&stacked(vec![6.0, 4.0]), Orientation::Vertical);
         assert!(is(&c, 100, 100, red) && is(&c, 100, 30, green), "the stretches up the column");
+        // Mirrored (#2487 part 4), the stretches run from the right, the key staying where it is.
+        let mut c = Canvas::new(200, 120).unwrap();
+        let look = ChartLook { mirror: true, ..ChartLook::default() };
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &stacked(vec![6.0, 4.0]), &look, INK, 1.0, false);
+        assert!(is(&c, 3, 7, red) && is(&c, 150, 23, red) && is(&c, 50, 23, green), "red from the right, green past it");
+        // On a fixed maximum a stretch past it is cut at it, and one wholly past it isn't drawn.
+        for (max, far) in [(8.0, green), (5.0, red)] {
+            let mut c = Canvas::new(200, 120).unwrap();
+            let look = ChartLook { max: Some(max), ..ChartLook::default() };
+            chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &stacked(vec![6.0, 4.0]), &look, INK, 1.0, false);
+            assert!(is(&c, 190, 23, far) && !is(&c, 199, 23, far), "{max}: the bar ends at the maximum");
+        }
+        // At 5 the green stretch, from 6 on, is wholly past it: none of it is drawn, anywhere.
+        let mut c = Canvas::new(200, 120).unwrap();
+        let look = ChartLook { max: Some(5.0), ..ChartLook::default() };
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &stacked(vec![6.0, 4.0]), &look, INK, 1.0, false);
+        assert!((0..200).all(|x| !is(&c, x, 23, green)), "no green along the bar");
+        // One running back from zero is drawn whole on a fixed maximum too: 2 of a span of 7 (from
+        // -2 to 5) left of zero, red cut at 5 on the right.
+        let mut c = Canvas::new(200, 120).unwrap();
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &stacked(vec![6.0, -2.0]), &look, INK, 1.0, false);
+        assert!(is(&c, 30, 23, green) && is(&c, 150, 23, red) && !is(&c, 199, 23, red), "back from zero, cut at the maximum");
+        // Stretches all below zero run back from it, the first one too: red 6 of 10 from the
+        // right, green past it.
+        let c = draw(&stacked(vec![-6.0, -4.0]), Orientation::Horizontal);
+        assert!(is(&c, 150, 23, red) && is(&c, 50, 23, green), "both stretches back from zero");
         // A negative stretch runs back from zero: 2 of a span of 8 left of it, 6 right.
         let c = draw(&stacked(vec![6.0, -2.0]), Orientation::Horizontal);
         assert!(is(&c, 20, 23, green) && is(&c, 100, 23, red), "either way from zero");
@@ -4812,6 +5718,226 @@ mod tests {
         // The labels' column is 64 px wide.
         assert!(chart_inked(&left, 0..6, 18..32) && !chart_inked(&left, 56..63, 18..32));
         assert!(!chart_inked(&right, 0..6, 18..32) && chart_inked(&right, 50..63, 18..32));
+    }
+
+    /// Mirrored (#2487 part 4), a chart is drawn as its mirror image, its text read as ever: bars
+    /// run from the right, their labels' column at the right, values past the bars' left ends, a
+    /// negative bar to the right of zero; columns hang from the top, their labels over them.
+    #[test]
+    fn a_mirrored_chart_runs_the_other_way() {
+        use serde_json::json;
+        let plain = chart_drawn(&[(3.0, "a"), (1.0, "b")], json!({}));
+        let mirrored = chart_drawn(&[(3.0, "a"), (1.0, "b")], json!({"mirror": true}));
+        // Rows of 18 px under a 16 px title. The bar area is 196 px, kept 4 px from the left when
+        // mirrored; 1 takes a third of it.
+        assert!(bar_blue(&plain, 20, 43) && !bar_blue(&plain, 180, 43), "1 runs right from the left");
+        assert!(bar_blue(&mirrored, 180, 43) && !bar_blue(&mirrored, 20, 43), "1 runs left from the right");
+        assert!(bar_blue(&mirrored, 10, 25) && !bar_blue(&mirrored, 1, 25), "3 fills the bar area");
+        // Labelled, the 64 px column is at the right; the label at its outer edge, the right.
+        let labelled = chart_drawn(&[(3.0, "Madrid")], json!({"label": "name", "mirror": true}));
+        assert!(bar_blue(&labelled, 10, 25) && !bar_blue(&labelled, 140, 25), "the bars left of the labels");
+        assert!(chart_inked(&labelled, 190..200, 18..32) && !chart_inked(&labelled, 0..40, 18..32), "the label at the right");
+        // Values past the bar's left end.
+        let valued = chart_drawn(&[(3.0, "a")], json!({"values": true, "mirror": true}));
+        assert!(chart_inked(&valued, 0..15, 18..32) && !chart_inked(&valued, 185..200, 18..32));
+        // Zero 49 px from the right: 3 runs left of it, -1 right.
+        let negative = chart_drawn(&[(3.0, "a"), (-1.0, "b")], json!({"mirror": true}));
+        assert!(bar_blue(&negative, 50, 25) && !bar_blue(&negative, 170, 25), "3 left of zero");
+        assert!(bar_blue(&negative, 170, 43) && !bar_blue(&negative, 50, 43), "-1 right of zero");
+        // Columns hang from the top: 1 a third of the 120 px down.
+        let columns = chart_drawn(&[(3.0, "a"), (1.0, "b")], json!({"orientation": "Vertical", "title": "", "mirror": true}));
+        assert!(bar_blue(&columns, 150, 10) && !bar_blue(&columns, 150, 100), "1 hangs from the top");
+        assert!(bar_blue(&columns, 50, 110), "3 fills its slot");
+        let labelled =
+            chart_drawn(&[(3.0, "a"), (1.0, "b")], json!({"orientation": "Vertical", "title": "", "label": "name", "mirror": true}));
+        assert!(chart_inked(&labelled, 40..60, 0..12) && !chart_inked(&labelled, 40..60, 108..120), "labels over the columns");
+    }
+
+    /// A fixed maximum is the far end of the bar area, so charts given the same one share a
+    /// scale; a bar past it runs to that end. A maximum not above zero isn't read.
+    #[test]
+    fn a_charts_maximum_sets_its_scale() {
+        use serde_json::json;
+        let own = chart_drawn(&[(50.0, "a")], json!({}));
+        let shared = chart_drawn(&[(50.0, "a")], json!({"max": 100.0}));
+        assert!(bar_blue(&own, 150, 25), "50 fills the 196 px on its own");
+        assert!(bar_blue(&shared, 90, 25) && !bar_blue(&shared, 110, 25), "50 of 100 takes half of them");
+        let past = chart_drawn(&[(150.0, "a"), (50.0, "b")], json!({"max": 100.0}));
+        assert!(bar_blue(&past, 194, 25) && !bar_blue(&past, 198, 25), "150 runs to the end, no further");
+        assert!(bar_blue(&past, 90, 43) && !bar_blue(&past, 110, 43), "50 still half");
+        // A column of one 140 px slot, 120 px high: 50 of 100 stands half as high.
+        let columns = chart_drawn(&[(50.0, "a")], json!({"orientation": "Vertical", "title": "", "max": 100.0}));
+        assert!(bar_blue(&columns, 100, 100) && !bar_blue(&columns, 100, 40));
+        for bad in [json!(0.0), json!(-5.0)] {
+            assert!(bar_blue(&chart_drawn(&[(50.0, "a")], json!({"max": bad})), 150, 25), "{bad}");
+        }
+        // Bars all at zero still draw the placeholder, as they do on their own scale.
+        let zeros = |extra| chart_drawn(&[(0.0, "a"), (0.0, "b")], extra).pixmap().data().to_vec();
+        assert_eq!(zeros(json!({"max": 100.0})), zeros(json!({})));
+    }
+
+    /// A bar outline (#2487 part 4b) runs round each bar, across, mirrored and as columns, and
+    /// round each stretch of a stacked bar; none where it isn't given.
+    #[test]
+    fn a_charts_bar_outline_runs_round_each_bar() {
+        use serde_json::json;
+        let red = |c: &Canvas, x: u32, y: u32| c.pixmap().pixel(x, y).is_some_and(|p| p.red() > 150 && p.blue() < 100);
+        let outline = json!({"bar_outline": {"color": [208, 16, 16, 255], "width": 2.0}});
+        let plain = chart_drawn(&[(50.0, "a")], json!({}));
+        assert!(!red(&plain, 100, 19) && bar_blue(&plain, 100, 25), "no outline unless given");
+        let c = chart_drawn(&[(50.0, "a")], outline.clone());
+        assert!(red(&c, 100, 19) && red(&c, 100, 30) && bar_blue(&c, 100, 25), "inside its top and bottom, filled within");
+        let mut mirrored = outline.clone();
+        mirrored["mirror"] = json!(true);
+        let c = chart_drawn(&[(50.0, "a"), (25.0, "b")], mirrored);
+        assert!(red(&c, 199, 25) && red(&c, 150, 37) && bar_blue(&c, 150, 43), "round the bars from the right");
+        assert!(red(&c, 102, 43) && !bar_blue(&c, 50, 43), "the shorter bar's line where it ends, on the left");
+        // Within each bar: a wide line paints nothing the bars leave blank, so it never runs into
+        // their values, labels or title, nor past the chart's room.
+        let blank = |c: &Canvas, x: u32, y: u32| c.pixmap().pixel(x, y).is_some_and(|p| p.alpha() < 16);
+        for look in [json!({"values": true}), json!({"mirror": true}), json!({"orientation": "Vertical", "values": true})] {
+            let vals = [(50.0, "a"), (25.0, "b"), (0.5, "c")];
+            let plain = chart_drawn(&vals, look.clone());
+            let mut wide = look.clone();
+            wide["bar_outline"] = json!({"color": [208, 16, 16, 255], "width": 5.0});
+            let c = chart_drawn(&vals, wide);
+            let spilt =
+                (0..200).flat_map(|x| (0..120).map(move |y| (x, y))).filter(|(x, y)| blank(&plain, *x, *y) && red(&c, *x, *y)).count();
+            assert_eq!(spilt, 0, "{look}");
+        }
+        let mut columns = outline.clone();
+        (columns["orientation"], columns["title"]) = (json!("Vertical"), json!(""));
+        let c = chart_drawn(&[(50.0, "a")], columns);
+        assert!(red(&c, 100, 0) && red(&c, 30, 60) && red(&c, 169, 60) && bar_blue(&c, 100, 60), "round the column");
+        // Round each stretch: a line between the two of a bar split 6 to 4.
+        let stacked = rustgis_map::layout::ChartData {
+            bars: vec![(10.0, String::new())],
+            key: vec![("a".into(), Rgba::rgb(0x10, 0x10, 0xD0)), ("b".into(), Rgba::rgb(0x10, 0x10, 0xD0))],
+            stretches: vec![vec![6.0, 4.0]],
+            ..Default::default()
+        };
+        let look = ChartLook {
+            bar_outline: Some(rustgis_map::layout::ChartOutline { color: Rgba::rgb(0xD0, 0x10, 0x10), width: 2.0 }),
+            ..ChartLook::default()
+        };
+        let mut c = Canvas::new(200, 120).unwrap();
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &stacked, &look, INK, 1.0, false);
+        // The divider's footprint: what isn't the bars' blue where the two stretches meet. One
+        // line of the outline's width, 2 px off the pixel grid touching 3, not one from each
+        // stretch (5).
+        let divider = (100..140).filter(|x| !bar_blue(&c, *x, 23)).count();
+        assert_eq!(divider, 3, "one line of the outline's width between the stretches");
+        // A see-through line is laid once everywhere: as red between the stretches as along the
+        // bar's edge, not twice over on one side of the divider.
+        let half_red = ChartLook {
+            bar_outline: Some(rustgis_map::layout::ChartOutline { color: Rgba([208, 16, 16, 128]), width: 3.0 }),
+            ..ChartLook::default()
+        };
+        let mut c = Canvas::new(200, 120).unwrap();
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &stacked, &half_red, INK, 1.0, false);
+        let reddest = |xs: std::ops::Range<u32>, y: u32| xs.filter_map(|x| c.pixmap().pixel(x, y)).map(|p| p.red()).max().unwrap_or(0);
+        let (edge, between) = (reddest(0..8, 25), reddest(100..140, 25));
+        assert!(edge > 60 && between.abs_diff(edge) <= 3, "edge {edge}, between {between}");
+        // Bars thinner than the line, and a stretch thinner than it, keep their colour: the line
+        // narrows to a third of them rather than covering them.
+        let thin = json!({"bar_outline": {"color": [208, 16, 16, 255], "width": 5.0}});
+        let c = chart_drawn(&[(50.0, "a"); 20], thin);
+        // Down the bars' middle, blue outweighs red at least once a bar (none when the line
+        // covered them).
+        let blue = (0..120).filter(|y| c.pixmap().pixel(100, *y).is_some_and(|p| p.alpha() > 0 && p.blue() > p.red())).count();
+        assert!(blue >= 20, "every bar keeps its blue, {blue} px");
+        let green = Rgba::rgb(0x10, 0xC0, 0x10);
+        let sliver = rustgis_map::layout::ChartData {
+            bars: vec![(10.0, String::new())],
+            key: vec![("a".into(), Rgba::rgb(0x10, 0x10, 0xD0)), ("b".into(), green)],
+            stretches: vec![vec![9.85, 0.15]],
+            ..Default::default()
+        };
+        let look = ChartLook {
+            bar_outline: Some(rustgis_map::layout::ChartOutline { color: Rgba::rgb(0xD0, 0x10, 0x10), width: 5.0 }),
+            ..ChartLook::default()
+        };
+        let mut c = Canvas::new(200, 120).unwrap();
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &sliver, &look, INK, 1.0, false);
+        // In the bar's rows, those it paints down its middle, which the key's green swatch is not in.
+        let rows: Vec<u32> = (0..120).filter(|y| c.pixmap().pixel(100, *y).is_some_and(|p| p.alpha() > 0)).collect();
+        assert!(rows.len() > 5, "the bar's rows, {rows:?}");
+        let greens = (0..200)
+            .flat_map(|x| rows.iter().map(move |y| (x, *y)))
+            .filter(|(x, y)| c.pixmap().pixel(*x, *y).is_some_and(|p| p.green() > 150 && p.red() < 100))
+            .count();
+        assert!(greens > 0, "the thin stretch keeps its green");
+        // A first stretch drawn a pixel long though its share is far shorter: the next starts
+        // inside it, and the line, a third of a pixel, still stays inside the bar, between the
+        // stretches and round them (a stroke that thin is drawn a pixel wide), across and as
+        // columns.
+        let tiny = rustgis_map::layout::ChartData { stretches: vec![vec![0.001, 9.999]], ..sliver };
+        for orientation in [rustgis_map::layout::Orientation::Horizontal, rustgis_map::layout::Orientation::Vertical] {
+            let mut plain = Canvas::new(200, 120).unwrap();
+            let bare = ChartLook { bar_outline: None, orientation, ..look };
+            chart(&mut plain, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &tiny, &bare, INK, 1.0, false);
+            let mut lined = Canvas::new(200, 120).unwrap();
+            chart(&mut lined, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &tiny, &ChartLook { orientation, ..look }, INK, 1.0, false);
+            // Nothing where the bar itself paints nothing.
+            let spilt = (0..200)
+                .flat_map(|x| (0..120).map(move |y| (x, y)))
+                .filter(|(x, y)| plain.pixmap().pixel(*x, *y).is_some_and(|p| p.alpha() == 0))
+                .filter(|(x, y)| lined.pixmap().pixel(*x, *y).is_some_and(|p| p.alpha() > 0 && p.red() > p.green()))
+                .count();
+            assert_eq!(spilt, 0, "{orientation:?}: the lines round and between the stretches stay inside the bar");
+        }
+        // Only the bar's end next to that stretch narrows: along the rest of the bar, the edge
+        // keeps its width.
+        let mut c = Canvas::new(200, 120).unwrap();
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &tiny, &look, INK, 1.0, false);
+        let lined = (0..120).filter(|y| c.pixmap().pixel(100, *y).is_some_and(|p| p.red() > 150 && p.blue() < 100)).count();
+        assert!(lined >= 6, "both edges of the bar a few pixels wide, {lined} rows");
+        // The edge is one shape: where its sides meet off the pixel grid, the shared pixel is
+        // covered once, not twice in part with the bar's blue showing through between them.
+        let one = rustgis_map::layout::ChartData {
+            bars: vec![(10.0, String::new())],
+            key: vec![("a".into(), Rgba::rgb(0x10, 0x10, 0xD0))],
+            stretches: vec![vec![10.0]],
+            ..Default::default()
+        };
+        let mut c = Canvas::new(200, 120).unwrap();
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &one, &look, INK, 1.0, false);
+        // The bar's rows, below the key's swatch: those its end's line reaches.
+        let red = |y: &u32| c.pixmap().pixel(2, *y).is_some_and(|p| p.red() > 100);
+        let (Some(top), Some(bottom)) = ((0..120).find(red), (0..120).rev().find(red)) else { panic!("no line") };
+        let seams = (top + 1..bottom).filter(|y| c.pixmap().pixel(2, *y).is_some_and(|p| p.blue() > 20)).count();
+        assert!(bottom - top > 5 && seams == 0, "inside the bar's end, all line: {seams} rows show the bar");
+        // Lines between twenty stretches too thin to part them overlap: a see-through colour
+        // covers the overlap once, never redder than along the edge.
+        let mut thin = vec![0.0005; 20];
+        thin.insert(0, 5.0);
+        thin.push(4.99);
+        let crowded = rustgis_map::layout::ChartData {
+            key: (0..thin.len()).map(|i| (i.to_string(), if i % 2 == 0 { Rgba::rgb(0x10, 0x10, 0xD0) } else { green })).collect(),
+            stretches: vec![thin],
+            ..one
+        };
+        let mut c = Canvas::new(200, 120).unwrap();
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, 120.0).unwrap(), &crowded, &half_red, INK, 1.0, false);
+        let reddest = |xs: std::ops::Range<u32>, y: u32| xs.filter_map(|x| c.pixmap().pixel(x, y)).map(|p| p.red()).max().unwrap_or(0);
+        // The middle of the bar, below the key.
+        let lined: Vec<u32> = (0..120).filter(|y| reddest(0..3, *y) > 60).collect();
+        let row = lined.get(lined.len() / 2).copied().unwrap_or(0);
+        let (edge, between) = (reddest(0..8, row), reddest(8..190, row));
+        assert!(edge > 60 && between <= edge + 3, "edge {edge}, between {between}");
+    }
+
+    /// Hidden labels leave their column, or their row under columns, to the bars.
+    #[test]
+    fn a_charts_hidden_labels_leave_their_room_to_the_bars() {
+        use serde_json::json;
+        let shown = chart_drawn(&[(3.0, "Madrid")], json!({"label": "name"}));
+        let hidden = chart_drawn(&[(3.0, "Madrid")], json!({"label": "name", "hide_labels": true}));
+        assert!(!bar_blue(&shown, 30, 25) && chart_inked(&shown, 0..6, 18..32));
+        assert!(bar_blue(&hidden, 30, 25) && !chart_inked(&hidden, 0..60, 18..32));
+        let columns =
+            chart_drawn(&[(3.0, "Madrid")], json!({"orientation": "Vertical", "title": "", "label": "name", "hide_labels": true}));
+        assert!(bar_blue(&columns, 100, 115), "the column down to the bottom");
     }
 
     /// Both map frames share the index feature, even though the locator draws a different map.
@@ -5392,6 +6518,31 @@ mod tests {
             text.clear();
         }
         assert_eq!(layers(&layout), [("Texto".to_string(), u64::from(b))]);
+    }
+
+    /// The page's colour (#2855) is the first thing the PDF's drawing fills, over the whole page;
+    /// a white page is filled white as before.
+    #[test]
+    fn a_pages_colour_is_filled_first_in_the_pdfs_drawing() {
+        use crate::vector::{Brush, Item};
+        let mut layout = Layout::new("Paper", 120.0, 90.0);
+        let first = |layout: &Layout| {
+            let (drawing, _) = render_drawing(layout, &mut [], 72.0, &PageInfo::default()).unwrap();
+            let (w, h, items) = drawing.finish();
+            match items.into_iter().next() {
+                Some(Item::Fill { path, brush: Brush::Solid(c), .. }) => {
+                    let b = path.bounds();
+                    assert!(b.left() <= 0.0 && b.top() <= 0.0 && b.right() >= w - 0.5 && b.bottom() >= h - 0.5, "{b:?}");
+                    c.to_color_u8()
+                }
+                _ => panic!("the page is not filled first"),
+            }
+        };
+        let c = first(&layout);
+        assert_eq!((c.red(), c.green(), c.blue(), c.alpha()), (255, 255, 255, 255));
+        layout.paper = Some(Rgba::rgb(0x0B, 0x1B, 0x2B));
+        let c = first(&layout);
+        assert_eq!((c.red(), c.green(), c.blue(), c.alpha()), (0x0B, 0x1B, 0x2B, 255));
     }
 
     /// A page with a frame of the built-in world and a title.
@@ -6757,7 +7908,16 @@ mod tests {
         let loss = text_losses(&l, &[], 96.0, &info);
         assert_eq!(
             loss,
-            vec![TextLoss { id, name: "Note".into(), left_out: 1, at_least: true, below_box: false, past_limit: true, off_page: false }]
+            vec![TextLoss {
+                id,
+                name: "Note".into(),
+                left_out: 1,
+                at_least: true,
+                below_box: false,
+                past_limit: true,
+                off_page: false,
+                unit_label: None
+            }]
         );
         let said = lines_left_out_notice(&loss[0]).unwrap();
         assert!(said.starts_with("1 or more lines of the text \"Note\""), "{said}");
@@ -6777,7 +7937,16 @@ mod tests {
         let loss = losses(&l);
         assert_eq!(
             loss,
-            vec![TextLoss { id, name: "Note".into(), left_out: 3, at_least: false, below_box: true, past_limit: false, off_page: false }]
+            vec![TextLoss {
+                id,
+                name: "Note".into(),
+                left_out: 3,
+                at_least: false,
+                below_box: true,
+                past_limit: false,
+                off_page: false,
+                unit_label: None
+            }]
         );
         // The element alone is measured the same, and another id finds nothing.
         assert_eq!(text_loss(&l, &[], 96.0, &info, id).as_ref(), loss.first());
@@ -6797,6 +7966,99 @@ mod tests {
         assert_eq!(lines_left_out_notice(&loss[0]), None);
     }
 
+    /// A text whose ink crosses the page's edge is told apart from its lines left out, with the
+    /// advice that fixes an edge: moved past each side it is, back inside or turned within the
+    /// page it isn't, and one cut below its box and past the edge has both (#2703).
+    #[test]
+    fn a_text_past_the_pages_edge_is_told_with_its_advice() {
+        let info = PageInfo::default();
+        let mut l = note_page("Note", false, TextAlign::Left, 0.0);
+        let id = l.elements[0].id;
+        let put = |l: &mut Layout, (x, y): (f64, f64)| {
+            if let Some(e) = l.element_mut(id) {
+                (e.x, e.y) = (x, y);
+            }
+        };
+        let turn = |l: &mut Layout, degrees: f64| {
+            if let Some(ElementKind::Text { rotation, .. }) = l.element_mut(id).map(|e| &mut e.kind) {
+                *rotation = degrees;
+            }
+        };
+        let told = |l: &Layout| text_loss(l, &[], 96.0, &info, id).and_then(|loss| off_page_notice(&loss));
+        let said = format!(
+            "The text \"Note\" ({id}) runs off the page, so part of it isn't drawn; move it inside the page, resize it or reduce its size"
+        );
+        assert_eq!(told(&l), None, "inside the page");
+        // Past each edge.
+        for at in [(98.0, 10.0), (10.0, 99.0), (-30.0, 10.0), (10.0, -5.0)] {
+            put(&mut l, at);
+            let loss = text_loss(&l, &[], 96.0, &info, id).unwrap_or_else(|| panic!("{at:?} is past an edge"));
+            assert!(loss.off_page && loss.left_out == 0 && !loss.below_box, "{at:?} {loss:?}");
+            assert_eq!(off_page_notice(&loss), Some(said.clone()), "{at:?}");
+            assert_eq!(lines_left_out_notice(&loss), None, "{at:?}: no line is left out");
+            put(&mut l, (10.0, 10.0));
+            assert_eq!(told(&l), None, "{at:?} moved back inside");
+        }
+        // A text that doesn't cross says nothing, whatever else is lost.
+        let inside = TextLoss {
+            id,
+            name: "Note".into(),
+            left_out: 1,
+            at_least: false,
+            below_box: true,
+            past_limit: false,
+            off_page: false,
+            unit_label: None,
+        };
+        assert_eq!(off_page_notice(&inside), None);
+        // Turned within the page: nothing. Turned about its box's centre past the edge: told.
+        put(&mut l, (30.0, 10.0));
+        turn(&mut l, 90.0);
+        assert_eq!(told(&l), None, "turned within the page");
+        turn(&mut l, 180.0);
+        assert_eq!(told(&l), None, "turned within the page");
+        put(&mut l, (80.0, 10.0));
+        turn(&mut l, 0.0);
+        assert_eq!(told(&l), None, "unturned, it is inside");
+        turn(&mut l, 180.0);
+        assert_eq!(told(&l), Some(said.clone()), "turned about its box's centre, past the edge");
+        // Cut below its box and past the edge: each is told, apart.
+        let mut l = note_page("one\ntwo\nthree", false, TextAlign::Left, 0.0);
+        let id = l.elements[0].id;
+        if let Some(e) = l.element_mut(id) {
+            (e.x, e.h) = (98.0, 2.0);
+        }
+        let loss = text_loss(&l, &[], 96.0, &info, id).unwrap_or_else(|| panic!("cut"));
+        assert!(loss.below_box && loss.off_page && loss.left_out == 2, "{loss:?}");
+        let (lines, edge) = (lines_left_out_notice(&loss).unwrap_or_default(), off_page_notice(&loss).unwrap_or_default());
+        assert!(lines.contains("don't fit its box") && !lines.contains("page"), "{lines}");
+        assert!(edge.contains("runs off the page") && !edge.contains("lines"), "{edge}");
+        // No ink, nothing to cut: an empty or blank text, past the edge.
+        for blank in ["", "  \n "] {
+            let mut l = note_page(blank, false, TextAlign::Left, 0.0);
+            let id = l.elements[0].id;
+            if let Some(e) = l.element_mut(id) {
+                e.x = 98.0;
+            }
+            assert_eq!(text_loss(&l, &[], 96.0, &info, id), None, "{blank:?} has no ink");
+        }
+        // A file can hold any place and size: measured without a panic, and told at most once.
+        for (x, y, size) in
+            [(1e300, -1e300, 12.0), (f64::NAN, f64::INFINITY, 12.0), (10.0, 10.0, f64::NAN), (10.0, 10.0, 1e300), (98.0, 10.0, 1e300)]
+        {
+            let mut l = note_page("Note", false, TextAlign::Left, 0.0);
+            let id = l.elements[0].id;
+            if let Some(e) = l.element_mut(id) {
+                (e.x, e.y) = (x, y);
+                if let ElementKind::Text { size: s, .. } = &mut e.kind {
+                    *s = size;
+                }
+            }
+            let losses = text_losses(&l, &[], 96.0, &info);
+            assert!(losses.len() <= 1 && losses.iter().all(|loss| off_page_notice(loss).iter().count() <= 1), "{x} {y} {size}");
+        }
+    }
+
     /// A long text counts every line left out below its box, each only looked at for a letter
     /// past the box: none is shaped there (#2346).
     #[test]
@@ -6808,7 +8070,16 @@ mod tests {
         let loss = text_losses(&l, &[], 96.0, &info);
         assert_eq!(
             loss,
-            vec![TextLoss { id, name: "Note".into(), left_out: 2999, at_least: false, below_box: true, past_limit: true, off_page: false }]
+            vec![TextLoss {
+                id,
+                name: "Note".into(),
+                left_out: 2999,
+                at_least: false,
+                below_box: true,
+                past_limit: true,
+                off_page: false,
+                unit_label: None
+            }]
         );
         let said = lines_left_out_notice(&loss[0]).unwrap();
         assert!(said.ends_with("make the box taller or the text smaller, and split it, as a text draws at most 200 lines"), "{said}");
@@ -6819,7 +8090,16 @@ mod tests {
         let loss = text_losses(&tall, &[], 96.0, &info);
         assert_eq!(
             loss,
-            vec![TextLoss { id, name: "Note".into(), left_out: 50, at_least: false, below_box: false, past_limit: true, off_page: false }]
+            vec![TextLoss {
+                id,
+                name: "Note".into(),
+                left_out: 50,
+                at_least: false,
+                below_box: false,
+                past_limit: true,
+                off_page: false,
+                unit_label: None
+            }]
         );
         let said = lines_left_out_notice(&loss[0]).unwrap();
         assert_eq!(
@@ -6831,7 +8111,16 @@ mod tests {
         l.element_mut(id).unwrap().h = 2.0;
         assert_eq!(
             text_losses(&l, &[], 96.0, &info),
-            vec![TextLoss { id, name: "Note".into(), left_out: 1, at_least: false, below_box: false, past_limit: true, off_page: false }]
+            vec![TextLoss {
+                id,
+                name: "Note".into(),
+                left_out: 1,
+                at_least: false,
+                below_box: false,
+                past_limit: true,
+                off_page: false,
+                unit_label: None
+            }]
         );
     }
 
@@ -6863,7 +8152,8 @@ mod tests {
     /// an image export and a print break a text alike.
     #[test]
     fn a_wrapped_text_breaks_alike_at_every_resolution() {
-        let style = TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0 };
+        let style =
+            TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0, valign: TextVAlign::Top, line_spacing: 1.0 };
         let lines = wrapped(NOTE, 40.0, 12.0, style);
         assert!(lines.lines().count() > 3, "{lines}");
         assert!(lines.lines().all(|l| !l.starts_with(' ') && !l.ends_with(' ')), "{lines:?}");
@@ -6923,7 +8213,8 @@ mod tests {
     #[test]
     fn a_turned_texts_picture_covers_its_lines() {
         let r = Rect::from_xywh(0.0, 0.0, 2000.0, 1000.0).unwrap();
-        let plain = TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0 };
+        let plain =
+            TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0, valign: TextVAlign::Top, line_spacing: 1.0 };
         let px = 14.0 * 1.33;
         let area = |align| text_area(r, "Fonte: IBGE", 14.0, TextStyle { align, ..plain }, 1.0).unwrap();
         let left = area(TextAlign::Left);
@@ -6998,7 +8289,8 @@ Elaboração: RustGIS",
     /// as before.
     #[test]
     fn text_takes_italic_alignment_and_letter_spacing() {
-        let plain = TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0 };
+        let plain =
+            TextStyle { face: text::Face::default(), align: TextAlign::Left, spacing: 0.0, valign: TextVAlign::Top, line_spacing: 1.0 };
         let base = styled_line(plain);
         let (l, r, ..) = text_ink(&base);
         assert!(l < 4, "left-aligned starts at the left: {l}");
@@ -7056,6 +8348,271 @@ Elaboração: RustGIS",
         });
         let (l, r, ..) = text_ink(&pm);
         assert!(r <= 300 && l < r, "inked {l}..{r}");
+    }
+
+    /// A 100 × 100 mm page with `text` at 12 pt in black in (10, 10, 40, `h`) mm, its kind changed
+    /// by `f`.
+    fn block_page(text: &str, h: f64, f: &dyn Fn(&mut ElementKind)) -> Layout {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let mut kind = ElementKind::text(text, 12.0, Rgba::rgb(0, 0, 0), false);
+        f(&mut kind);
+        l.add("Block", (10.0, 10.0, 40.0, h), kind);
+        l
+    }
+
+    /// Sets a text's block alignment, line spacing and case.
+    fn set_block(k: &mut ElementKind, v: TextVAlign, ls: f64, c: TextCase) {
+        if let ElementKind::Text { valign, line_spacing, case, .. } = k {
+            (*valign, *line_spacing, *case) = (v, ls, c);
+        }
+    }
+
+    /// The rows with a dark pixel, from the top.
+    fn ink_rows(pm: &Pixmap) -> Vec<u32> {
+        (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| rgb(pm, x, y).0 < 128)).collect()
+    }
+
+    /// How many separate runs of columns with a dark pixel there are, from the left.
+    fn ink_column_runs(pm: &Pixmap) -> usize {
+        let inked: Vec<bool> = (0..pm.width()).map(|x| (0..pm.height()).any(|y| rgb(pm, x, y).0 < 128)).collect();
+        inked.windows(2).filter(|w| !w[0] && w[1]).count() + usize::from(inked.first() == Some(&true))
+    }
+
+    /// A text's block sits at the top of its box, as texts always have, in its middle, or with its
+    /// last line on its bottom edge; the block itself is the same, moved.
+    #[test]
+    fn a_text_block_sits_at_the_top_middle_or_bottom_of_its_box() {
+        let draw = |v: TextVAlign| {
+            render(&block_page("one\ntwo\nthree", 60.0, &|k| set_block(k, v, 1.0, TextCase::None)), &mut [], 96.0, &PageInfo::default())
+                .unwrap()
+        };
+        let (top, mid, bottom) =
+            (ink_rows(&draw(TextVAlign::Top)), ink_rows(&draw(TextVAlign::Middle)), ink_rows(&draw(TextVAlign::Bottom)));
+        let plain = ink_rows(&render(&block_page("one\ntwo\nthree", 60.0, &|_| {}), &mut [], 96.0, &PageInfo::default()).unwrap());
+        assert_eq!(top, plain, "top is today's drawing");
+        let span = |r: &[u32]| r[r.len() - 1] - r[0];
+        // Moved by part of a pixel, its edge rows may shade past the threshold one row more or less.
+        for moved in [&mid, &bottom] {
+            assert!(span(moved).abs_diff(span(&top)) <= 1, "the same block, moved: {} and {}", span(moved), span(&top));
+        }
+        let (box_top, box_bottom) = ((10.0 * 96.0 / 25.4) as u32, (70.0 * 96.0 / 25.4) as u32);
+        assert!(box_bottom - bottom[bottom.len() - 1] <= 12, "bottom: last ink row {} of the box's {box_bottom}", bottom[bottom.len() - 1]);
+        let (above, below) = (mid[0] - box_top, box_bottom - mid[mid.len() - 1]);
+        assert!(above.abs_diff(below) <= 8, "middle: {above} above, {below} below");
+    }
+
+    /// Line spacing multiplies the distance between lines: twice as far apart at 2, half at 0.5.
+    #[test]
+    fn line_spacing_spreads_the_lines_by_its_multiple() {
+        let span = |ls: f64| {
+            let pm = render(
+                &block_page("one\ntwo\nthree", 60.0, &|k| set_block(k, TextVAlign::Top, ls, TextCase::None)),
+                &mut [],
+                96.0,
+                &PageInfo::default(),
+            )
+            .unwrap();
+            let r = ink_rows(&pm);
+            (r[r.len() - 1] - r[0]) as f64
+        };
+        // The usual pitch in pixels at 96 dpi, a layout point a pixel there.
+        let pitch = 12.0 * 1.33 * 1.25;
+        assert!(((span(2.0) - span(1.0)) - 2.0 * pitch).abs() <= 2.0, "{} {}", span(2.0), span(1.0));
+        assert!(((span(1.0) - span(0.5)) - pitch).abs() <= 2.0, "{} {}", span(1.0), span(0.5));
+    }
+
+    /// A block taller than its box is drawn from the top whatever its alignment: its first lines
+    /// are kept, the same lines left out and said, and none is drawn above the box.
+    #[test]
+    fn a_block_taller_than_its_box_keeps_its_first_lines_whatever_its_valign() {
+        let info = PageInfo::default();
+        let page = |v| block_page("one\ntwo\nthree\nfour\nfive", 7.0, &|k| set_block(k, v, 1.0, TextCase::None));
+        let top = page(TextVAlign::Top);
+        let loss = text_losses(&top, &[], 96.0, &info);
+        assert_eq!(loss.iter().map(|l| l.left_out).collect::<Vec<_>>(), [3]);
+        for v in [TextVAlign::Middle, TextVAlign::Bottom] {
+            let l = page(v);
+            assert_eq!(render(&l, &mut [], 96.0, &info).unwrap().data(), render(&top, &mut [], 96.0, &info).unwrap().data(), "{v:?}");
+            assert_eq!(text_losses(&l, &[], 96.0, &info), loss, "{v:?}");
+            assert_eq!(lines_left_out_notice(&text_losses(&l, &[], 96.0, &info)[0]), lines_left_out_notice(&loss[0]));
+        }
+    }
+
+    /// A text of more lines than a text draws is cut at them, so it is drawn from the top whatever
+    /// its alignment, though the lines kept would fit its box; one of exactly that many, all
+    /// drawn, is still aligned.
+    #[test]
+    fn a_text_cut_at_the_most_lines_it_draws_starts_at_the_top() {
+        let info = PageInfo::default();
+        // 2 pt lines are 0.88 mm apart: 200 of them fill 176 mm of a 200 mm box.
+        let page = |lines: usize, v| {
+            let text = (0..lines).map(|i| format!("line {i}")).collect::<Vec<_>>().join(
+                "
+",
+            );
+            let mut l = Layout::new("L", 100.0, 300.0);
+            let mut kind = ElementKind::text(&text, 2.0, Rgba::rgb(0, 0, 0), false);
+            set_block(&mut kind, v, 1.0, TextCase::None);
+            l.add("Block", (10.0, 10.0, 40.0, 200.0), kind);
+            l
+        };
+        let drawn = |l: &Layout| render(l, &mut [], 96.0, &info).unwrap();
+        let top = page(300, TextVAlign::Top);
+        for v in [TextVAlign::Middle, TextVAlign::Bottom] {
+            let l = page(300, v);
+            assert_eq!(drawn(&l).data(), drawn(&top).data(), "{v:?}");
+            assert_eq!(text_losses(&l, &[], 96.0, &info), text_losses(&top, &[], 96.0, &info), "{v:?}");
+            let svg = |l: &Layout| crate::svg::layout_svg(l, &mut [], 96.0, &info).unwrap().0;
+            assert_eq!(svg(&l), svg(&top), "{v:?}");
+            assert_ne!(drawn(&page(200, v)).data(), drawn(&page(200, TextVAlign::Top)).data(), "{v:?}: all drawn, aligned");
+        }
+        let text = |n: usize| {
+            vec!["x"; n].join(
+                "
+",
+            )
+        };
+        assert_eq!(text_shift(TextVAlign::Bottom, 5000.0, 10.0, &text(201), 1.0), 0.0);
+        assert_eq!(text_shift(TextVAlign::Bottom, 5000.0, 10.0, &text(200), 1.0), block_shift(TextVAlign::Bottom, 5000.0, 10.0, 200, 1.0));
+        assert!(text_shift(TextVAlign::Bottom, 5000.0, 10.0, &text(200), 1.0) > 0.0);
+    }
+
+    /// The cut-off check steps by the spaced pitch, as the page draws: a wider spacing leaves lines
+    /// out of a box that held them, a tighter one draws lines a box cut.
+    #[test]
+    fn line_spacing_changes_the_lines_left_out() {
+        let info = PageInfo::default();
+        let left_out = |h: f64, ls: f64| {
+            let l = block_page("one\ntwo\nthree\nfour\nfive", h, &|k| set_block(k, TextVAlign::Top, ls, TextCase::None));
+            text_losses(&l, &[], 96.0, &info).first().map_or(0, |l| l.left_out)
+        };
+        assert_eq!((left_out(25.0, 1.0), left_out(25.0, 2.0)), (0, 2));
+        assert_eq!((left_out(12.0, 1.0), left_out(12.0, 0.5)), (2, 0));
+    }
+
+    /// Case applies once the tokens are filled in, and before the wrap, which breaks the wider
+    /// words.
+    #[test]
+    fn case_applies_after_the_tokens_and_before_the_wrap() {
+        let info = PageInfo { page: 2, pages: 3, page_name: String::new() };
+        let draw = |t: &str, c| render(&block_page(t, 20.0, &|k| set_block(k, TextVAlign::Top, 1.0, c)), &mut [], 96.0, &info).unwrap();
+        assert_eq!(draw("Page {page} of {pages}", TextCase::Upper).data(), draw("PAGE 2 OF 3", TextCase::None).data());
+        assert_eq!(draw("PAGE {page} OF {pages}", TextCase::Lower).data(), draw("page 2 of 3", TextCase::None).data());
+        let style = text_style(false, false, rustgis_map::layout::FontFamily::Sans, None, TextAlign::Left, 0.0);
+        let s = "boundaries simplified for print from the census".to_string();
+        let lines = |c| drawn_text(s.clone(), c, true, 40.0, 12.0, style).lines().count();
+        assert!(lines(TextCase::Upper) > lines(TextCase::Lower), "{} {}", lines(TextCase::Upper), lines(TextCase::Lower));
+        assert_eq!(drawn_text(s.clone(), TextCase::None, false, 40.0, 12.0, style), s, "unwrapped and as typed: unchanged");
+    }
+
+    /// A turned text's picture covers its lines where its block alignment and spacing put them.
+    #[test]
+    fn a_turned_bottom_aligned_text_is_drawn_whole() {
+        let info = PageInfo::default();
+        let ink = |v, ls| {
+            let pm = render(
+                &block_page("one\ntwo\nthree", 60.0, &|k| {
+                    set_block(k, v, ls, TextCase::None);
+                    if let ElementKind::Text { rotation, .. } = k {
+                        *rotation = 90.0;
+                    }
+                }),
+                &mut [],
+                96.0,
+                &info,
+            )
+            .unwrap();
+            (ink_bounds(&pm), ink_column_runs(&pm))
+        };
+        // Spaced alike, so only the alignment differs. Turned a quarter clockwise, the box's
+        // down runs leftwards across the page: its lines are runs of inked columns.
+        let ((tl, tt, tr, tb), top_runs) = ink(TextVAlign::Top, 1.5);
+        let ((bl, bt, br, bb), bottom_runs) = ink(TextVAlign::Bottom, 1.5);
+        assert_eq!((top_runs, bottom_runs), (3, 3), "a run of columns a line, all three drawn");
+        assert!((tr - tl).abs_diff(br - bl) <= 2, "the same block across: {tl}..{tr} and {bl}..{br}");
+        assert!((tb - tt).abs_diff(bb - bt) <= 2, "the same lines along: {tt}..{tb} and {bt}..{bb}");
+        // Moved left by the room the block leaves: the box's 60 mm less three lines at 1.5,
+        // 12 pt × 1.33 × 1.25 × (1 + 2 × 1.5) = 79.8 px, of 226.8 px: 147.0 px.
+        let free = 60.0 * 96.0 / 25.4 - 12.0 * 1.33 * 1.25 * (1.0 + 2.0 * 1.5);
+        for (t, b) in [(tl, bl), (tr, br)] {
+            assert!((f64::from(t) - f64::from(b) - free).abs() <= 2.0, "moved {} px of {free:.1}", f64::from(t) - f64::from(b));
+        }
+    }
+
+    /// Where a text's block and case put its ink decides whether it runs off the page: a box
+    /// hanging past the page's bottom, its one line at the box's top, middle or bottom; and a line
+    /// near the page's right edge in upper case, its letters wider.
+    #[test]
+    fn a_text_block_and_case_are_said_off_the_page_where_they_put_the_ink() {
+        let info = PageInfo::default();
+        // The 100 mm page is 378.0 px tall at 96 dpi; the box (10, 80, 40, 30) mm runs from 302.4
+        // to 415.7 px. Its one line of 12 pt (15.96 px a line, a pitch of 19.95) has its middle
+        // 9.6 px under where the block starts, the block 19.95 px tall in a box of 113.4: at the
+        // top at 312.0 px, in the middle 46.7 px lower at 358.7, at the bottom 93.4 px lower at
+        // 405.4, below the page's 378.0 whatever the font's letters (some 8 px each way).
+        let hanging = |v| {
+            let mut l = Layout::new("L", 100.0, 100.0);
+            let mut kind = ElementKind::text("one", 12.0, Rgba::rgb(0, 0, 0), false);
+            set_block(&mut kind, v, 1.0, TextCase::None);
+            l.add("Hanging", (10.0, 80.0, 40.0, 30.0), kind);
+            text_losses(&l, &[], 96.0, &info)
+        };
+        assert_eq!(hanging(TextVAlign::Top), [], "at the top, on the page");
+        assert_eq!(hanging(TextVAlign::Middle), [], "in the middle, still on the page");
+        let bottom = hanging(TextVAlign::Bottom);
+        assert!(bottom.len() == 1 && bottom[0].off_page && bottom[0].left_out == 0, "{bottom:?}");
+        assert!(off_page_notice(&bottom[0]).is_some());
+        // The page is 378.0 px wide; the box starts at 83 mm, 313.7 px, 64.3 px from its edge.
+        // Ten letters `lflflflflf` of 12 pt (an em of 15.96 px) take some 0.25 em each as typed,
+        // about 40 px, and some 0.58 em in upper case (`LFLFLFLFLF`), about 93 px: on the page as
+        // typed with room for 1.6 times as wide letters, past its edge in upper case at 0.69 times
+        // as wide ones.
+        let near_edge = |c| {
+            let mut l = Layout::new("L", 100.0, 100.0);
+            let mut kind = ElementKind::text("lflflflflf", 12.0, Rgba::rgb(0, 0, 0), false);
+            set_block(&mut kind, TextVAlign::Top, 1.0, c);
+            l.add("Edge", (83.0, 50.0, 10.0, 10.0), kind);
+            text_losses(&l, &[], 96.0, &info)
+        };
+        assert_eq!(near_edge(TextCase::None), [], "as typed, on the page");
+        let upper = near_edge(TextCase::Upper);
+        assert!(upper.len() == 1 && upper[0].off_page && upper[0].left_out == 0, "{upper:?}");
+        assert!(off_page_notice(&upper[0]).is_some());
+    }
+
+    /// A block alignment or line spacing that reaches the page unrepaired is clamped where it is
+    /// used: an unknown alignment draws at the top, a spacing not a finite number (an infinity too)
+    /// at the usual one, one out of range at the nearer limit; none moves a line to a place not a
+    /// number.
+    #[test]
+    fn hostile_text_block_settings_draw_clamped() {
+        let style = text_style(false, false, rustgis_map::layout::FontFamily::Sans, None, TextAlign::Left, 0.0);
+        let kept = |v, ls: f64| {
+            let s = style.with_block(v, ls);
+            (s.valign, s.line_spacing)
+        };
+        assert_eq!(kept(TextVAlign::Invalid, f64::NAN), (TextVAlign::Top, 1.0));
+        assert_eq!(kept(TextVAlign::Bottom, 9.0), (TextVAlign::Bottom, 3.0));
+        assert_eq!(kept(TextVAlign::Middle, f64::INFINITY), (TextVAlign::Middle, 1.0));
+        assert_eq!(kept(TextVAlign::Middle, f64::NEG_INFINITY), (TextVAlign::Middle, 1.0));
+        assert_eq!(kept(TextVAlign::Top, 0.1), (TextVAlign::Top, 0.5));
+        for (v, box_h, px, ls) in [
+            (TextVAlign::Bottom, f64::NAN, 10.0, 1.0),
+            (TextVAlign::Middle, 100.0, f64::NAN, 1.0),
+            (TextVAlign::Bottom, 100.0, 10.0, f64::NAN),
+            (TextVAlign::Bottom, f64::INFINITY, 10.0, 1.0),
+            (TextVAlign::Invalid, 100.0, 10.0, 1.0),
+        ] {
+            assert_eq!(block_shift(v, box_h, px, 3, ls), 0.0, "{v:?} {box_h} {px} {ls}");
+        }
+        assert_eq!(block_shift(TextVAlign::Bottom, 100.0, 10.0, 0, 1.0), 0.0, "no line");
+        let info = PageInfo::default();
+        let draw =
+            |v, ls| render(&block_page("one\ntwo", 60.0, &|k| set_block(k, v, ls, TextCase::Invalid)), &mut [], 96.0, &info).unwrap();
+        assert_eq!(draw(TextVAlign::Invalid, f64::NAN).data(), draw(TextVAlign::Top, 1.0).data());
+        assert_eq!(draw(TextVAlign::Bottom, 1e300).data(), draw(TextVAlign::Bottom, 3.0).data());
+        let l = block_page("one\ntwo", 60.0, &|k| set_block(k, TextVAlign::Bottom, f64::NAN, TextCase::Invalid));
+        assert!(text_losses(&l, &[], 96.0, &info).is_empty());
     }
 
     /// The extent indicator is drawn in its own colour and width (#213): red and 2 pt until set.
@@ -8640,35 +10197,304 @@ Elaboração: RustGIS",
         assert!(x < -3.0, "{x}");
     }
 
+    /// A scale bar's default colour and fill.
+    const DEFAULT_COLORS: (Rgba, Rgba) = (Rgba::rgb(0x22, 0x22, 0x22), Rgba::rgb(0xFF, 0xFF, 0xFF));
+
+    /// A white `width` x 60 pixmap with `bar` drawn on it at 100 m of ground a point, a pixel a
+    /// point, with a decimal point, in the default colours.
+    fn draw_bar(bar: &BarOptions<'_>, width: u32) -> Pixmap {
+        let mut pm = Pixmap::new(width, 60).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        let r = Rect::from_xywh(0.0, 0.0, width as f32, 60.0).unwrap();
+        crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, 100.0, bar, DEFAULT_COLORS, 1.0, false));
+        pm
+    }
+
+    /// Dark runs along row `y`.
+    fn dark_runs(pm: &Pixmap, y: u32) -> usize {
+        let dark: Vec<bool> = (0..pm.width()).map(|x| pm.pixel(x, y).is_some_and(ink)).collect();
+        dark.windows(2).filter(|w| !w[0] && w[1]).count() + usize::from(dark.first() == Some(&true))
+    }
+
+    /// The first and last columns with anything but white on row `y`.
+    fn marked_span(pm: &Pixmap, y: u32) -> Option<(u32, u32)> {
+        let marked = |x: &u32| pm.pixel(*x, y).is_some_and(|p| p.red() < 200 || p.green() < 200 || p.blue() < 200);
+        let first = (0..pm.width()).find(marked)?;
+        let last = (0..pm.width()).rev().find(marked)?;
+        Some((first, last))
+    }
+
+    /// The rows holding ink.
+    fn bar_ink_rows(pm: &Pixmap) -> Vec<u32> {
+        (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| pm.pixel(x, y).is_some_and(ink))).collect()
+    }
+
+    /// How much darker than white the pixels in rows `from..=to` are, summed.
+    fn darkness(pm: &Pixmap, from: u32, to: u32) -> u32 {
+        (from..=to)
+            .flat_map(|y| (0..pm.width()).map(move |x| (x, y)))
+            .filter_map(|(x, y)| pm.pixel(x, y))
+            .map(|p| 255 - u32::from(p.red()))
+            .sum()
+    }
+
+    /// 64-bit FNV-1a over the pixmaps' bytes.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fnv(pms: &[Pixmap]) -> u64 {
+        pms.iter().flat_map(|p| p.data().iter()).fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// 64-bit FNV-1a over one byte slice.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fnv_bytes(b: &[u8]) -> u64 {
+        b.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// A plain scale bar on a white `w` x 60 pixmap, in the default colours.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn draw_default(style: ScaleBarStyle, units: ScaleUnits, divisions: usize, ground: f64, w: u32, ppp: f64, comma: bool) -> Pixmap {
+        let mut pm = Pixmap::new(w, 60).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        let r = Rect::from_xywh(0.0, 0.0, w as f32, 60.0).unwrap();
+        let bar = BarOptions { units, divisions, style, ..BarOptions::default() };
+        crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, ground, &bar, DEFAULT_COLORS, ppp, comma));
+        pm
+    }
+
+    /// How [`plain_texts_draw_as_before`]'s pages drew, and what their cut-off check found, before
+    /// texts had a block alignment, line spacing or case; in the built-in face.
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_TEXT_PIXELS: u64 = 0x0556_a0ef_54c0_2e87;
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_TEXT_LOSSES: u64 = 0x26af_01ce_67e5_7cfd;
+
+    /// A text with none of the block settings draws, and is measured for lines that don't fit and ink
+    /// off the page, exactly as main did: every page at 96 dpi, and the first eight (left-aligned,
+    /// unwrapped, upright and turned a quarter) at 300 dpi too, which is enough to hold the scaling
+    /// of the line pitch. In a process of its own, told to use the built-in face before any text.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn plain_texts_draw_as_before() {
+        if std::env::var_os("RUSTGIS_TEXT_PIN_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "layout::tests::plain_texts_draw_as_before", "--nocapture"])
+                .env("RUSTGIS_TEXT_PIN_CHILD", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+            return;
+        }
+        let info = PageInfo { page: 2, pages: 3, page_name: String::new() };
+        let (mut drawn, mut measured) = (Vec::new(), String::new());
+        for (i, l) in crate::layout::plain_text_pages().iter().enumerate() {
+            for dpi in if i < 8 { &[96.0, 300.0][..] } else { &[96.0][..] } {
+                drawn.push(render(l, &mut [], *dpi, &info).unwrap());
+                measured.push_str(&format!("{:?}\n", text_losses(l, &[], *dpi, &info)));
+            }
+        }
+        // The pages exercise both checks.
+        assert!(measured.contains("below_box: true") && measured.contains("off_page: true"), "{measured}");
+        let losses = fnv_bytes(measured.as_bytes());
+        assert_eq!((fnv(&drawn), losses), (PINNED_TEXT_PIXELS, PINNED_TEXT_LOSSES), "{:#x} {:#x}", fnv(&drawn), losses);
+    }
+
+    /// How [`scale_bars_without_details_draw_as_before`]'s bars drew before scale bars had details,
+    /// their labels in the built-in face.
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED: u64 = 0x3975_8d68_da45_882b;
+
+    /// A bar with none of the details draws exactly as main drew it: every style, unit, division
+    /// count, ground resolution, density and decimal mark. Its labels are drawn in the built-in
+    /// face, whatever fonts the machine has: in a process of its own, told so before any text.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn scale_bars_without_details_draw_as_before() {
+        if std::env::var_os("RUSTGIS_SCALE_BAR_PIN_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "layout::tests::scale_bars_without_details_draw_as_before", "--nocapture"])
+                .env("RUSTGIS_SCALE_BAR_PIN_CHILD", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+            return;
+        }
+        let mut drawn = Vec::new();
+        for style in ScaleBarStyle::ALL {
+            for units in [ScaleUnits::Auto, ScaleUnits::Miles, ScaleUnits::Feet, ScaleUnits::Meters] {
+                for divisions in [1, 4, 10] {
+                    for ground in [0.37, 100.0, 7.84] {
+                        for (w, ppp) in [(93u32, 1.0), (300, 1.0), (300, 300.0 / 72.0)] {
+                            for comma in [false, true] {
+                                drawn.push(draw_default(style, units, divisions, ground, w, ppp, comma));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(fnv(&drawn), PINNED, "{:#x}", fnv(&drawn));
+    }
+
     #[test]
     fn scale_bars_count_in_their_units_and_divisions() {
-        let draw_in = |bar, colors| {
-            let mut pm = Pixmap::new(300, 60).unwrap();
-            pm.fill(tiny_skia::Color::WHITE);
-            // 100 m of ground per point: about 25 km across the bar.
-            let r = Rect::from_xywh(0.0, 0.0, 300.0, 60.0).unwrap();
-            crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, 100.0, bar, colors, 1.0, false));
-            pm
-        };
-        let draw = |bar| draw_in(bar, (Rgba::rgb(0x22, 0x22, 0x22), Rgba::rgb(0xFF, 0xFF, 0xFF)));
+        // 100 m of ground per point: about 25 km across the bar.
+        let draw = |(units, divisions, style)| draw_bar(&BarOptions { units, divisions, style, ..BarOptions::default() }, 300);
         // Dark runs along the bar's middle row: one per dark division of an alternating bar.
         let runs = |pm: &Pixmap| {
             let y = (60.0 * 0.62) as u32;
             let dark: Vec<bool> = (0..pm.width()).map(|x| pm.pixel(x, y).is_some_and(ink)).collect();
             dark.windows(2).filter(|w| !w[0] && w[1]).count() + usize::from(dark.first() == Some(&true))
         };
-        let four = draw((ScaleUnits::Auto, 4, ScaleBarStyle::Alternating, SCALE_BAR_TEXT_PT));
-        let five = draw((ScaleUnits::Auto, 5, ScaleBarStyle::Alternating, SCALE_BAR_TEXT_PT));
+        let four = draw((ScaleUnits::Auto, 4, ScaleBarStyle::Alternating));
+        let five = draw((ScaleUnits::Auto, 5, ScaleBarStyle::Alternating));
         assert_eq!(runs(&four), 2, "two dark divisions");
         assert_eq!(runs(&five), 3, "three dark divisions, the last at the end");
         // Miles and kilometres give bars of different lengths and labels.
-        assert_ne!(draw((ScaleUnits::Miles, 4, ScaleBarStyle::Alternating, SCALE_BAR_TEXT_PT)).data(), four.data());
+        assert_ne!(draw((ScaleUnits::Miles, 4, ScaleBarStyle::Alternating)).data(), four.data());
         // A line or a stepped line fills no division.
         for style in [ScaleBarStyle::Line, ScaleBarStyle::Stepped] {
-            let pm = draw((ScaleUnits::Auto, 4, style, SCALE_BAR_TEXT_PT));
+            let pm = draw((ScaleUnits::Auto, 4, style));
             let dark = (0..300).filter(|&x| pm.pixel(x, 37).is_some_and(ink)).count();
             assert!(dark < 20, "{style:?}: {dark} dark pixels across the bar");
             assert_ne!(pm.data(), four.data());
+        }
+        let with = |f: &dyn Fn(&mut BarOptions<'static>)| {
+            let mut b = BarOptions::default();
+            f(&mut b);
+            draw_bar(&b, 300)
+        };
+        let runs = |pm: &Pixmap| dark_runs(pm, 37);
+        assert_eq!(runs(&with(&|_| {})), 2);
+        // The first division cut in four alternating parts from zero, the first dark, and the
+        // divisions after going on from them: parts 0 and 2, then divisions 1 and 3.
+        assert_eq!(runs(&with(&|b| b.subdivisions = 4)), 4);
+        assert_eq!(with(&|b| b.subdivisions = 1).data(), with(&|_| {}).data(), "one part is the division whole");
+        // A stepped bar's upper steps are the alternating bar's dark divisions, after the cut one too:
+        // its thin line, drawn soft, marks the bar's top row.
+        let cut4 = |style| {
+            let bar = BarOptions { style, subdivisions: 4, ..BarOptions::default() };
+            let placed = bar_layout(Rect::from_xywh(0.0, 0.0, 300.0, 60.0).unwrap(), 100.0, &bar, 1.0, false).unwrap();
+            (draw_bar(&bar, 300), placed)
+        };
+        let (alternating, placed) = cut4(ScaleBarStyle::Alternating);
+        let (stepped, _) = cut4(ScaleBarStyle::Stepped);
+        let seg = placed.len / placed.divs as f32;
+        let top = placed.y0.round() as u32;
+        let mid = |j: usize| (placed.x0 + seg * (j as f32 + 0.5)) as u32;
+        let dark: Vec<bool> = (placed.before + 1..placed.divs).map(|j| alternating.pixel(mid(j), 37).is_some_and(ink)).collect();
+        let upper: Vec<bool> = (placed.before + 1..placed.divs)
+            .map(|j| (top - 1..=top + 1).any(|y| stepped.pixel(mid(j), y).is_some_and(|p| p.red() < 200)))
+            .collect();
+        assert_eq!(dark, [true, false, true], "divisions 1 and 3 dark");
+        assert_eq!(upper, dark, "the stepped bar's upper steps");
+        // Two whole divisions before zero: six divisions, three dark.
+        assert_eq!(runs(&with(&|b| b.divisions_before_zero = 2)), 3);
+        assert_eq!(bar_ink_rows(&with(&|b| b.divisions_before_zero = 2)), bar_ink_rows(&with(&|_| {})), "the same rows, bar and labels");
+        // Across zero the light division before it meets a dark part: the bar's first ink is at
+        // zero, as on the same bar uncut, with the light division left of it.
+        let first_ink = |pm: &Pixmap| (0..pm.width()).find(|&x| pm.pixel(x, 37).is_some_and(ink));
+        let uncut = with(&|b| b.divisions_before_zero = 1);
+        let cut = with(&|b| {
+            b.divisions_before_zero = 1;
+            b.subdivisions = 4;
+        });
+        let zero = first_ink(&uncut).unwrap();
+        assert!(zero > 20, "a division before zero: {zero}");
+        assert_eq!(first_ink(&cut), Some(zero), "dark right of zero");
+        assert!(cut.pixel(zero + 1, 37).is_some_and(ink) && !cut.pixel(zero - 2, 37).is_some_and(ink), "dark right of zero, light left");
+        // A single or stepped line gets short ticks inside its first division.
+        for style in [ScaleBarStyle::Line, ScaleBarStyle::Stepped] {
+            let plain = with(&|b| b.style = style);
+            let cut = with(&|b| {
+                b.style = style;
+                b.subdivisions = 3;
+            });
+            assert!(darkness(&cut, 35, 39) > darkness(&plain, 35, 39) + 100, "{style:?}");
+        }
+    }
+
+    /// A bar whose first negative label leaves it no room still draws: the label takes at most
+    /// half the bar's room, reaching left of the box past that.
+    #[test]
+    fn a_scale_bar_before_zero_draws_where_its_first_label_leaves_no_room() {
+        let bar = BarOptions { text_size: 24.0, divisions_before_zero: 2, divisions: 10, ..BarOptions::default() };
+        let mut pm = Pixmap::new(40, 60).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        let r = Rect::from_xywh(0.0, 0.0, 40.0, 60.0).unwrap();
+        // Filled in its colour throughout, so along its middle the bar is one solid run.
+        let solid = (DEFAULT_COLORS.0, DEFAULT_COLORS.0);
+        crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, 100.0, &bar, solid, 1.0, false));
+        // Moved down so its big labels reach no higher than the box's top, the bar is drawn under
+        // them: along its middle row, one solid run, half the bar's room at least (34 px, the 1 km
+        // that fits in 17), not a sliver.
+        let placed = bar_layout(r, 100.0, &bar, 1.0, false).unwrap();
+        let middle = (placed.y0 + placed.bar_h / 2.0) as u32;
+        assert!(placed.y0 > 30.0, "moved down: {}", placed.y0);
+        assert!(dark_runs(&pm, middle) > 0, "the bar is drawn");
+        let (a, b) = marked_span(&pm, middle).unwrap();
+        assert!(b - a >= 8, "the bar keeps half its room: {a}..{b}");
+    }
+
+    #[test]
+    fn scale_bars_fit_their_box_by_the_strategy() {
+        // 79 px to use at 100 m a point: 7.9 km of ground, in kilometres.
+        let width = |fit| {
+            let bar = BarOptions { units: ScaleUnits::Kilometers, fit, ..BarOptions::default() };
+            let (a, b) = marked_span(&draw_bar(&bar, 93), 37).unwrap();
+            b - a
+        };
+        assert!((width(ScaleBarFit::AdjustDivisionValue) as i32 - 50).abs() <= 2, "a round 5 km in four 1.25 km divisions");
+        assert!((width(ScaleBarFit::AdjustDivision) as i32 - 70).abs() <= 2, "seven round 1 km divisions");
+        assert!((width(ScaleBarFit::AdjustWidth) as i32 - 40).abs() <= 2, "four 1 km divisions, narrower than the box");
+        // Ten asked: fifteen 0.5 km divisions would fit, so the division steps up to 1 km, seven.
+        let bar = BarOptions { units: ScaleUnits::Kilometers, fit: ScaleBarFit::AdjustDivision, divisions: 10, ..BarOptions::default() };
+        let (a, b) = marked_span(&draw_bar(&bar, 93), 37).unwrap();
+        assert!(((b - a) as i32 - 70).abs() <= 2, "seven 1 km divisions, not ten of 0.5 km: {}", b - a);
+        // Extreme grounds, every fit, divisions before zero: never past the box, never empty.
+        for ground in [1e-4, 0.37, 100.0, 1e5, 1e7] {
+            for fit in ScaleBarFit::ALL {
+                for before in [0, 2] {
+                    let bar = BarOptions { fit, divisions_before_zero: before, divisions: 10, ..BarOptions::default() };
+                    let mut pm = Pixmap::new(120, 60).unwrap();
+                    pm.fill(tiny_skia::Color::WHITE);
+                    let r = Rect::from_xywh(10.0, 0.0, 100.0, 60.0).unwrap();
+                    crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, ground, &bar, DEFAULT_COLORS, 1.0, false));
+                    let (a, b) = marked_span(&pm, 37).unwrap_or((0, 0));
+                    assert!(b > a && b < 110, "{ground} {fit:?} {before}: {a}..{b}");
+                }
+            }
+        }
+        // Two divisions before zero count toward the ten: in a wide room, ten in all, never twelve.
+        let bar = BarOptions {
+            units: ScaleUnits::Kilometers,
+            fit: ScaleBarFit::AdjustDivision,
+            divisions_before_zero: 2,
+            ..BarOptions::default()
+        };
+        let mut most = 0;
+        for w in (300..1400).step_by(23) {
+            let b = bar_layout(Rect::from_xywh(0.0, 0.0, w as f32, 60.0).unwrap(), 100.0, &bar, 1.0, false).unwrap();
+            assert!(b.divs <= rustgis_map::layout::MAX_SCALE_DIVISIONS && b.before == 2, "{w} px: {} divisions", b.divs);
+            let pm = draw_bar(&bar, w);
+            let middle = (b.y0 + b.bar_h / 2.0) as u32;
+            // An alternating bar's dark divisions: half of them, the first before zero dark.
+            assert_eq!(dark_runs(&pm, middle), b.divs.div_ceil(2), "{w} px");
+            let (a, z) = marked_span(&pm, middle).unwrap();
+            assert!(((z - a) as f32 - b.len).abs() <= 2.0, "{w} px: {a}..{z} for {}", b.len);
+            most = most.max(b.divs);
+        }
+        assert_eq!(most, rustgis_map::layout::MAX_SCALE_DIVISIONS, "a wide room reaches ten");
+        // Ten asked and two before zero: ten in all under every fit, not twelve.
+        for fit in ScaleBarFit::ALL {
+            let bar = BarOptions { fit, divisions: 10, divisions_before_zero: 2, ..BarOptions::default() };
+            let b = bar_layout(Rect::from_xywh(0.0, 0.0, 300.0, 60.0).unwrap(), 100.0, &bar, 1.0, false).unwrap();
+            assert!(b.divs <= rustgis_map::layout::MAX_SCALE_DIVISIONS, "{fit:?}: {} divisions", b.divs);
+            let middle = (b.y0 + b.bar_h / 2.0) as u32;
+            assert!(dark_runs(&draw_bar(&bar, 300), middle) <= 5, "{fit:?}: at most five dark of ten");
         }
     }
 
@@ -8702,10 +10528,7 @@ Elaboração: RustGIS",
             let mut pm = Pixmap::new(320, 60).unwrap();
             pm.fill(tiny_skia::Color::WHITE);
             let r = Rect::from_xywh(0.0, 0.0, width, 60.0).unwrap();
-            let colors = (Rgba::rgb(0x22, 0x22, 0x22), Rgba::rgb(0xFF, 0xFF, 0xFF));
-            crate::canvas::with_canvas(&mut pm, |c| {
-                scale_bar(c, r, ground, (ScaleUnits::Auto, 4, ScaleBarStyle::Alternating, SCALE_BAR_TEXT_PT), colors, 1.0, true)
-            });
+            crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, ground, &BarOptions::default(), DEFAULT_COLORS, 1.0, true));
             pm
         };
         // 20 km on a bar of 300 points takes two thirds of it; 10 km at 37.2 m a point, a third.
@@ -8731,9 +10554,8 @@ Elaboração: RustGIS",
         type Px = tiny_skia::PremultipliedColorU8;
         // A red colour and a blue fill.
         let colors = (Rgba::rgb(0xD0, 0x10, 0x10), Rgba::rgb(0x10, 0x10, 0xD0));
-        let bar = (ScaleUnits::Auto, 4, ScaleBarStyle::Alternating, SCALE_BAR_TEXT_PT);
         let r = Rect::from_xywh(0.0, 0.0, 300.0, 60.0).unwrap();
-        crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, 100.0, bar, colors, 1.0, false));
+        crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, 100.0, &BarOptions::default(), colors, 1.0, false));
         let count = |hit: fn(Px) -> bool, y: u32| (0..300).filter(|&x| pm.pixel(x, y).is_some_and(hit)).count();
         let y = (60.0 * 0.62) as u32;
         // Along the bar: the dark divisions in the colour, the light ones in the fill, nothing in
@@ -8747,13 +10569,43 @@ Elaboração: RustGIS",
         assert_eq!((0..y.saturating_sub(8)).map(|row| count(ink, row)).sum::<usize>(), 0, "no ink labels");
     }
 
+    /// A detailed scale bar's box (#1379) is the narrowest that draws the same bar with all it
+    /// has: its unit after the bar written in full, its label before zero, and nothing past the
+    /// box's side but its padding. A plain bar's is the one it always had.
+    #[test]
+    fn a_detailed_scale_bars_box_holds_all_it_draws() {
+        let mut bar = ElementKind::scale_bar(0);
+        if let ElementKind::ScaleBar { unit_label, unit_label_position, divisions_before_zero, .. } = &mut bar {
+            (*unit_label, *unit_label_position, *divisions_before_zero) = (Some("Kilometres".into()), UnitLabelPosition::AfterBar, 1);
+        }
+        let options = BarOptions::of(&bar).unwrap();
+        let w = scale_bar_box_width_pt(100.0, 300.0, &bar, false, 4.0).unwrap();
+        assert!(w < 300.0, "{w}");
+        let at = |w: f64| bar_layout(Rect::from_xywh(0.0, 0.0, w as f32, 60.0).unwrap(), 100.0, &options, 1.0, false).unwrap();
+        let (wide, narrow) = (at(300.0), at(w));
+        assert_eq!((narrow.total, narrow.divs, narrow.len), (wide.total, wide.divs, wide.len), "the same bar");
+        assert_eq!(narrow.unit.as_ref().map(|u| u.text.as_str()), Some("Kilometres"), "its unit in full");
+        assert!(f64::from(narrow.right) + 4.0 <= w + 1e-6, "{} in {w}", narrow.right);
+        // A little narrower, it would draw another bar or cut what it writes.
+        let less = at(w * 0.98);
+        let cut = less.total != wide.total || less.unit.as_ref().map(|u| u.text.as_str()) != Some("Kilometres");
+        assert!(cut || f64::from(less.right) + 4.0 > w * 0.98, "the narrowest");
+        let plain = ElementKind::scale_bar(0);
+        assert_eq!(
+            scale_bar_box_width_pt(100.0, 300.0, &plain, false, 4.0),
+            scale_bar_width_pt(100.0, 300.0, (ScaleUnits::Auto, 4, SCALE_BAR_TEXT_PT), false, 4.0)
+        );
+        assert_eq!(scale_bar_box_width_pt(0.0, 300.0, &bar, false, 4.0), None);
+    }
+
     /// A scale bar's labels at their text size (#2581): at 16 points their room over the bar and
     /// between them is twice the default's and the bar keeps its length and height; 8 points draws
     /// as the bar always did; the width a box needs counts its last label at that size.
     #[test]
     fn a_scale_bars_labels_take_its_text_size() {
+        let plain = |divisions: usize, text_size: f64| BarOptions { divisions, text_size, ..BarOptions::default() };
         let r = Rect::from_xywh(0.0, 0.0, 400.0, 80.0).unwrap();
-        let at = |pt: f64| bar_layout(r, 100.0, (ScaleUnits::Auto, 4, pt), 1.0, false).unwrap();
+        let at = |pt: f64| bar_layout(r, 100.0, &plain(4, pt), 1.0, false).unwrap();
         let (small, big) = (at(SCALE_BAR_TEXT_PT), at(16.0));
         assert_eq!((small.len, small.bar_h, small.y0), (big.len, big.bar_h, big.y0), "the bar keeps its size");
         assert!((big.px - 2.0 * small.px).abs() < 1e-3, "{} against {}", big.px, small.px);
@@ -8770,15 +10622,13 @@ Elaboração: RustGIS",
         assert_eq!(at(1e9).px, at(100.0).px);
         assert_eq!(at(f64::NAN).px, small.px);
         // Labels that would touch at the larger size are left out, never the ends.
-        let crowded = bar_layout(Rect::from_xywh(0.0, 0.0, 120.0, 80.0).unwrap(), 100.0, (ScaleUnits::Auto, 10, 40.0), 1.0, false).unwrap();
+        let crowded = bar_layout(Rect::from_xywh(0.0, 0.0, 120.0, 80.0).unwrap(), 100.0, &plain(10, 40.0), 1.0, false).unwrap();
         assert!(crowded.labels.len() < 11, "{} labels", crowded.labels.len());
         assert_eq!(crowded.labels.first().map(|l| l.1.as_str()), Some("0"));
         // In a box 34 pixels tall (9 mm at a point a pixel), the default leaves room over its
         // labels; at 14 points the bar moves down so they reach no higher than the box's top, and
         // at 40 the box is too short for them and the bar, which is drawn below it.
-        let in_box = |h: f32, pt: f64| {
-            bar_layout(Rect::from_xywh(0.0, 0.0, 400.0, h).unwrap(), 100.0, (ScaleUnits::Auto, 4, pt), 1.0, false).unwrap()
-        };
+        let in_box = |h: f32, pt: f64| bar_layout(Rect::from_xywh(0.0, 0.0, 400.0, h).unwrap(), 100.0, &plain(4, pt), 1.0, false).unwrap();
         let rise = |b: &BarLayout| b.label_y - b.px * BAR_LABEL_RISE;
         let (eight, fourteen, forty) = (in_box(34.0, 8.0), in_box(34.0, 14.0), in_box(34.0, 40.0));
         assert!((eight.y0 - (34.0 * 0.62 - eight.bar_h / 2.0)).abs() < 1e-4 && rise(&eight) > 0.0, "the default where it was");
@@ -8787,16 +10637,14 @@ Elaboração: RustGIS",
         assert!(!eight.cramped && !fourteen.cramped);
         // Sideways, its last label at 40 points past a narrow box's right side, its bar the same
         // length: too narrow, its box tall enough. At 8 points the same box holds it.
-        let narrow =
-            |pt: f64| bar_layout(Rect::from_xywh(0.0, 0.0, 90.0, 400.0).unwrap(), 100.0, (ScaleUnits::Auto, 4, pt), 1.0, false).unwrap();
+        let narrow = |pt: f64| bar_layout(Rect::from_xywh(0.0, 0.0, 90.0, 400.0).unwrap(), 100.0, &plain(4, pt), 1.0, false).unwrap();
         let (n8, n40) = (narrow(8.0), narrow(40.0));
         assert!(!n8.cramped && n40.cramped && n40.y0 + n40.bar_h < 400.0 && n40.len == n8.len, "{} {}", n40.y0, n40.len);
         // Its end label, always drawn as its first is, running into the first above the default
         // size reaches past the box's side too: the box is too small, and said.
         for pt in [9.0, 12.0, 20.0, 40.0, 100.0] {
             for w in (20..400).step_by(7) {
-                let Some(b) = bar_layout(Rect::from_xywh(0.0, 0.0, w as f32, 400.0).unwrap(), 100.0, (ScaleUnits::Auto, 4, pt), 1.0, false)
-                else {
+                let Some(b) = bar_layout(Rect::from_xywh(0.0, 0.0, w as f32, 400.0).unwrap(), 100.0, &plain(4, pt), 1.0, false) else {
                     continue;
                 };
                 let half = |s: &str| text::measure(s, b.px / 1.33, false) / 2.0;
@@ -8871,10 +10719,10 @@ Elaboração: RustGIS",
         assert!(clipped_text(&l, &maps, 96.0, &info).is_empty(), "a hidden bar draws nothing");
     }
 
-    /// A page draws a scale bar in its own colour and fill: the element's, through `draw_page`.
-    #[test]
-    fn a_page_draws_its_scale_bar_in_its_colours() {
-        let mut maps = vec![Map::new("m")];
+    /// A 100 x 60 mm page with a 90 x 20 mm frame at its foot showing a map at 1:10,000,000: the
+    /// map, the page and the frame's id.
+    fn colour_test_page() -> (Vec<Map>, Layout, u32) {
+        let maps = vec![Map::new("m")];
         let mut l = Layout::new("Layout", 100.0, 60.0);
         let frame = l.add(
             "Map",
@@ -8894,16 +10742,18 @@ Elaboração: RustGIS",
                 pitch: 0.0,
             },
         );
+        (maps, l, frame)
+    }
+
+    /// A page draws a scale bar in its own colour and fill: the element's, through `draw_page`.
+    #[test]
+    fn a_page_draws_its_scale_bar_in_its_colours() {
+        let (mut maps, mut l, frame) = colour_test_page();
         let (crimson, navy) = (Rgba::rgb(0xD0, 0x10, 0x10), Rgba::rgb(0x10, 0x10, 0xD0));
-        let bar = ElementKind::ScaleBar {
-            frame,
-            units: ScaleUnits::Auto,
-            divisions: 4,
-            style: ScaleBarStyle::Alternating,
-            color: crimson,
-            fill: navy,
-            text_size: SCALE_BAR_TEXT_PT,
-        };
+        let mut bar = ElementKind::scale_bar(frame);
+        if let ElementKind::ScaleBar { color, fill, .. } = &mut bar {
+            (*color, *fill) = (crimson, navy);
+        }
         l.add("Scale Bar", (5.0, 5.0, 90.0, 20.0), bar);
         let pm = render(&l, &mut maps, 96.0, &PageInfo::default()).unwrap();
         // Above the frame (30 mm of the page's 60): the bar's divisions in its colour and fill, and
@@ -8915,6 +10765,363 @@ Elaboração: RustGIS",
         assert!(count(red) > 100, "red divisions and labels");
         assert!(count(|p| p.blue() > 180 && p.red() < 90 && p.green() < 90) > 100, "blue divisions");
         assert_eq!(count(ink), 0, "no default ink");
+    }
+
+    #[test]
+    fn scale_numbers_have_decimals_and_thousands() {
+        // Auto: as each label needs, with no separators, exactly as before.
+        assert_eq!(bar_number(5000.0, 1000.0, None, false), "5000");
+        assert_eq!(bar_number(0.0125, 0.0125, None, false), "0.0125");
+        assert_eq!(bar_number(-500.0, 500.0, None, false), "-500");
+        assert_eq!(bar_number(2.5, 1.25, None, true), "2,5");
+        // Fixed decimals with their thousands apart, the marks swapped under a decimal comma.
+        assert_eq!(bar_number(5000.0, 1000.0, Some(0), false), "5,000");
+        assert_eq!(bar_number(5000.0, 1000.0, Some(0), true), "5.000");
+        assert_eq!(bar_number(3.75, 1.25, Some(0), false), "4", "fixed at none, rounded");
+        assert_eq!(bar_number(1250.0, 250.0, Some(2), false), "1,250.00");
+        assert_eq!(bar_number(1250.0, 250.0, Some(2), true), "1.250,00");
+        assert_eq!(bar_number(12500.0, 2500.0, Some(3), true), "12.500,000");
+        assert_eq!(bar_number(-1500.0, 500.0, Some(1), true), "-1.500,0");
+        assert_eq!(bar_number(0.0, 5.0, Some(2), false), "0.00");
+        assert_eq!(bar_number(-0.001, 5.0, Some(1), false), "0.0", "no sign on a zero");
+        assert_eq!(bar_number(f64::NAN, 1.0, Some(2), false), "0.00", "never a panic");
+        assert_eq!(bar_number(1250.0, 250.0, Some(9), false), "1,250.000", "at most 3");
+    }
+
+    #[test]
+    fn scale_bars_draw_subdivisions_and_place_labels_above_or_below() {
+        let with = |f: &dyn Fn(&mut BarOptions<'static>)| {
+            let mut b = BarOptions::default();
+            f(&mut b);
+            draw_bar(&b, 300)
+        };
+        let above = with(&|_| {});
+        let rows = bar_ink_rows(&above);
+        assert!(rows.iter().any(|&y| y < 32) && rows.iter().all(|&y| y < 42), "labels over the bar: {rows:?}");
+        let below = with(&|b| b.label_position = ScaleLabelPosition::Below);
+        let rows = bar_ink_rows(&below);
+        assert!(rows.iter().all(|&y| y >= 18) && rows.iter().any(|&y| y > 28), "labels under it: {rows:?}");
+        // Subdivisions aren't labelled: the first ink row stays where the labels put it.
+        let cut = with(&|b| b.subdivisions = 3);
+        assert_eq!(bar_ink_rows(&cut).first(), bar_ink_rows(&above).first());
+        // A bigger label is taller; decimals change the labels.
+        assert!(bar_ink_rows(&with(&|b| b.text_size = 16.0)).len() > rows.len() + 4);
+        assert_ne!(with(&|b| b.decimals = Some(2)).data(), above.data());
+        assert_ne!(with(&|b| b.divisions_before_zero = 1).data(), above.data());
+    }
+
+    #[test]
+    fn unit_labels_sit_after_the_bar_when_asked() {
+        let draw = |text: Option<&'static str>, at| {
+            draw_bar(&BarOptions { unit_label: text, unit_label_position: at, units: ScaleUnits::Kilometers, ..BarOptions::default() }, 300)
+        };
+        let right_of =
+            |pm: &Pixmap| (0..pm.height()).filter_map(|y| (0..pm.width()).rev().find(|&x| pm.pixel(x, y).is_some_and(ink))).max();
+        let none = draw(Some(""), UnitLabelPosition::AfterBar);
+        let feet = draw(Some("Feet"), UnitLabelPosition::AfterBar);
+        let (_, bare_end) = marked_span(&none, 37).unwrap();
+        let (_, word_end) = marked_span(&feet, 37).unwrap();
+        assert!(word_end > bare_end + 15, "level with the bar, after it: {word_end} against {bare_end}");
+        // Left out, the abbreviation follows the last label; "" prints none.
+        let default = draw(None, UnitLabelPosition::AfterLabels);
+        let blank = draw(Some(""), UnitLabelPosition::AfterLabels);
+        assert!(right_of(&default) > right_of(&blank));
+        // Above or below, on a line of its own.
+        let top = |pm: &Pixmap| bar_ink_rows(pm).first().copied().unwrap_or(0);
+        let bottom = |pm: &Pixmap| bar_ink_rows(pm).last().copied().unwrap_or(0);
+        assert!(top(&draw(Some("Feet"), UnitLabelPosition::Above)) < top(&blank));
+        assert!(bottom(&draw(Some("Feet"), UnitLabelPosition::Below)) > bottom(&blank));
+        assert_ne!(draw(Some("FEET"), UnitLabelPosition::AfterBar).data(), feet.data(), "verbatim");
+        // Other scripts and emoji draw without a panic.
+        for text in ["距離 km", "مسافة", "🚶"] {
+            for at in UnitLabelPosition::ALL {
+                let _ = draw(Some(text), at);
+            }
+        }
+        // A label of spaces prints nothing and takes no room: after the bar or on a line of its own.
+        assert_eq!(draw(Some("   "), UnitLabelPosition::AfterBar).data(), none.data());
+        assert_eq!(draw(Some("   "), UnitLabelPosition::Above).data(), draw(Some(""), UnitLabelPosition::Above).data());
+        // A 100-character unit stays inside a 93 px element wherever it is placed.
+        let long: String = "Kilometres ".repeat(10).chars().take(100).collect();
+        let narrow = |text: &str, at| {
+            draw_bar(
+                &BarOptions { unit_label: Some(text), unit_label_position: at, units: ScaleUnits::Kilometers, ..BarOptions::default() },
+                93,
+            )
+        };
+        let marked = |p: tiny_skia::PremultipliedColorU8| p.red() < 200 || p.green() < 200 || p.blue() < 200;
+        for at in UnitLabelPosition::ALL {
+            let pm = narrow(&long, at);
+            let past: Vec<(u32, u32)> = (0..pm.height())
+                .flat_map(|y| (92..pm.width()).map(move |x| (x, y)))
+                .filter(|&(x, y)| pm.pixel(x, y).is_some_and(marked))
+                .collect();
+            assert!(past.is_empty(), "{at:?}: ink past the element at {past:?}");
+            assert_ne!(pm.data(), narrow("", at).data(), "{at:?}: the unit is drawn, shortened");
+        }
+        // After the labels, the unit is shortened and the last label's number kept whole: the ink
+        // columns of the number drawn alone are all there, moved left with the label.
+        let columns = |pm: &Pixmap| -> Vec<bool> { (0..pm.width()).map(|x| (0..33).any(|y| pm.pixel(x, y).is_some_and(ink))).collect() };
+        let bare = columns(&narrow("", UnitLabelPosition::AfterLabels));
+        let long_cols = columns(&narrow(&long, UnitLabelPosition::AfterLabels));
+        let end = bare.iter().rposition(|&c| c).unwrap();
+        // The last number: back from its right edge to a 3 px gap.
+        let start = (0..end).rev().find(|&x| x >= 2 && !bare[x] && !bare[x - 1] && !bare[x - 2]).map_or(0, |x| x + 1);
+        let number = &bare[start..=end];
+        let found = (0..=start).any(|d| long_cols[start - d..=end - d] == *number);
+        assert!(found, "the last number {start}..={end} is drawn whole: {long_cols:?}");
+    }
+
+    /// A long unit after the labels of a short bar, centred on its end, stays inside both edges of
+    /// the element, the last number drawn whole.
+    #[test]
+    fn a_unit_after_the_labels_of_a_short_bar_stays_inside_both_edges() {
+        let long = "k".repeat(100);
+        // 79 px to use at 250 m a point, 19.8 km: four 2 km divisions, a 32 px bar ending nearer
+        // the left edge than the right.
+        let draw = |unit: &str| {
+            let bar = BarOptions {
+                units: ScaleUnits::Kilometers,
+                fit: ScaleBarFit::AdjustWidth,
+                unit_label: Some(unit),
+                ..BarOptions::default()
+            };
+            let mut pm = Pixmap::new(93, 60).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            let r = Rect::from_xywh(0.0, 0.0, 93.0, 60.0).unwrap();
+            crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, 250.0, &bar, DEFAULT_COLORS, 1.0, false));
+            pm
+        };
+        let (pm, bare) = (draw(&long), draw(""));
+        // The first label, "0", reaches the left edge as on every bar: the long unit adds nothing
+        // there, nor anything at the right edge.
+        let at = |pm: &Pixmap, x: u32| (0..pm.height()).map(|y| pm.pixel(x, y).is_some_and(ink)).collect::<Vec<_>>();
+        assert_eq!(at(&pm, 0), at(&bare, 0), "nothing more at the left edge");
+        assert!(at(&pm, 92).iter().all(|d| !d), "nothing at the right edge");
+        // The last number: its ink columns (rows above the bar) drawn alone are all there.
+        let columns = |pm: &Pixmap| -> Vec<bool> { (0..pm.width()).map(|x| (0..33).any(|y| pm.pixel(x, y).is_some_and(ink))).collect() };
+        let (bare, long_cols) = (columns(&bare), columns(&pm));
+        let end = bare.iter().rposition(|&c| c).unwrap();
+        let start = (0..end).rev().find(|&x| x >= 2 && !bare[x] && !bare[x - 1] && !bare[x - 2]).map_or(0, |x| x + 1);
+        let number = &bare[start..=end];
+        let found = (0..=start).any(|d| long_cols[start - d..=end - d] == *number);
+        assert!(found, "the last number {start}..={end} is drawn whole: {long_cols:?}");
+    }
+
+    #[test]
+    fn a_wide_unit_label_after_the_bar_keeps_the_bar() {
+        let long = "Kilometres of ground distance, as measured on the map ".repeat(2);
+        for width in [12u32, 40, 93, 300] {
+            for height in [8u32, 60] {
+                let bar = BarOptions {
+                    unit_label: Some(long.as_str()),
+                    unit_label_position: UnitLabelPosition::AfterBar,
+                    units: ScaleUnits::Kilometers,
+                    ..BarOptions::default()
+                };
+                let mut pm = Pixmap::new(width, height).unwrap();
+                pm.fill(tiny_skia::Color::WHITE);
+                let r = Rect::from_xywh(0.0, 0.0, width as f32, height as f32).unwrap();
+                // Filled in its colour throughout, so along its middle the bar is one solid run.
+                let solid = (DEFAULT_COLORS.0, DEFAULT_COLORS.0);
+                crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, 100.0, &bar, solid, 1.0, false));
+                if width >= 40 && height == 60 {
+                    let marked = |x: u32| pm.pixel(x, 37).is_some_and(|p| p.red() < 200 || p.green() < 200 || p.blue() < 200);
+                    let a = (0..width).find(|&x| marked(x)).unwrap_or(width);
+                    // The bar ends where the 3 px gap before its unit begins; the unit follows.
+                    let gap = (a..width).find(|&x| (x..x + 3).all(|x| !marked(x))).unwrap_or(width);
+                    let end = gap.saturating_sub(1);
+                    let unit = (gap..width).find(|&x| marked(x));
+                    // Half the 85 % room is the bar's; its round length is at least 40 % of that.
+                    let room = width as f32 * 0.85 * 0.5;
+                    let (least, most) = ((room * 0.4) as u32 - 2, (room + 2.0) as u32);
+                    assert!(end >= a + least && end <= a + most, "width {width}: the bar keeps half its room, {a}..{end}");
+                    // Shortened to the room kept for it, the unit stays inside the bar's room and
+                    // the element; at 40 px it may not fit at all and is left out.
+                    if width > 40 {
+                        assert!(unit.is_some_and(|x| x >= end + 3), "width {width}: the unit after the bar, from {unit:?}");
+                    }
+                    let inside = (BAR_INSET + width as f32 * 0.85 + 1.0).min(width as f32 - 1.0) as u32;
+                    let past = (inside..width).find(|&x| marked(x));
+                    assert!(past.is_none(), "width {width}: the unit stays in the bar's room, ink at {past:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_unit_label_after_the_bar_is_shortened_to_its_room() {
+        let measure = |s: &str| s.chars().count() as f32 * 10.0;
+        assert_eq!(shortened("Feet", 40.0, measure).as_deref(), Some("Feet"));
+        assert_eq!(shortened("Kilometres", 40.0, measure).as_deref(), Some("Kil…"));
+        assert_eq!(shortened("Kilo metres", 60.0, measure).as_deref(), Some("Kilo…"), "no space before the ellipsis");
+        assert_eq!(shortened("Kilometres", 20.0, measure).as_deref(), Some("K…"));
+        assert_eq!(shortened("Kilometres", 19.0, measure), None, "nothing when not even a letter fits");
+        assert_eq!(shortened("", -1.0, measure), None);
+        // A long unit takes a handful of measurements, not one a character.
+        let calls = std::cell::Cell::new(0);
+        let counted = |s: &str| {
+            calls.set(calls.get() + 1);
+            measure(s)
+        };
+        let long = "k".repeat(100);
+        assert_eq!(shortened(&long, 105.0, counted).as_deref(), Some("kkkkkkkkk…"));
+        assert!(calls.get() <= 9, "{} measurements", calls.get());
+        // After the last label, only the unit is shortened, never the number.
+        assert_eq!(last_label("25", "Kilometres", 130.0, measure), ("25 Kilometres".into(), None));
+        assert_eq!(last_label("25", "Kilometres", 80.0, measure), ("25 Kilo…".into(), Some(UnitLabelCut::Shortened)));
+        assert_eq!(
+            last_label("25", "Kilometres", 40.0, measure),
+            ("25".into(), Some(UnitLabelCut::LeftOut)),
+            "the number alone when not a letter fits"
+        );
+        assert_eq!(last_label("1,250", "km", 10.0, measure), ("1,250".into(), Some(UnitLabelCut::LeftOut)), "the number is never cut");
+    }
+
+    /// A unit label shortened with an ellipsis, or left out with no room for it, is said, as a cut
+    /// text is, wherever it is placed; one drawn whole, or a plain bar's abbreviation, is not.
+    #[test]
+    fn a_shortened_or_left_out_unit_label_is_said() {
+        let long = "Kilometres ".repeat(9);
+        let cut = |w: f32, unit: Option<&str>, unit_label_position| {
+            let bar = BarOptions { unit_label: unit, unit_label_position, units: ScaleUnits::Kilometers, ..BarOptions::default() };
+            bar_layout(Rect::from_xywh(0.0, 0.0, w, 60.0).unwrap(), 100.0, &bar, 1.0, false).unwrap().unit_cut
+        };
+        for at in UnitLabelPosition::ALL {
+            assert_eq!(cut(200.0, Some(&long), at), Some(UnitLabelCut::Shortened), "{at:?}");
+            assert_eq!(cut(400.0, Some("Km"), at), None, "{at:?}: drawn whole");
+            assert_eq!(cut(200.0, None, at), None, "{at:?}: the abbreviation");
+        }
+        // Not even a letter of it fits after the bar's last label in a box this narrow.
+        assert_eq!(cut(20.0, Some(&long), UnitLabelPosition::AfterLabels), Some(UnitLabelCut::LeftOut));
+        let loss = |name: &str, unit_label| TextLoss {
+            id: 1,
+            name: name.into(),
+            left_out: 0,
+            at_least: false,
+            below_box: false,
+            past_limit: false,
+            off_page: false,
+            unit_label,
+        };
+        let said = scale_bar_fit_notices(&[loss("A", Some(UnitLabelCut::Shortened))]);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].starts_with("Scale bar \"A\": its unit label is shortened to fit"), "{said:?}");
+        let said = scale_bar_fit_notices(&[loss("A", Some(UnitLabelCut::LeftOut)), loss("B", Some(UnitLabelCut::LeftOut))]);
+        assert!(said.len() == 1 && said[0].starts_with("2 scale bars (\"A\", \"B\"): their unit labels are left out"), "{said:?}");
+        assert!(scale_bar_fit_notices(&[loss("A", None)]).is_empty());
+    }
+
+    /// A bar whose lines just fit its box, so none is written smaller, still draws them all inside it.
+    #[test]
+    fn a_scale_bar_rows_stay_inside_a_box_they_just_fit() {
+        let bar = BarOptions {
+            unit_label: Some("Kilometres"),
+            unit_label_position: UnitLabelPosition::Above,
+            label_position: ScaleLabelPosition::Above,
+            text_size: 24.0,
+            units: ScaleUnits::Kilometers,
+            ..BarOptions::default()
+        };
+        // The 93 x 88 box in the middle of a taller page, so ink outside it would show.
+        let mut pm = Pixmap::new(93, 128).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        let r = Rect::from_xywh(0.0, 20.0, 93.0, 88.0).unwrap();
+        crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, 100.0, &bar, DEFAULT_COLORS, 1.0, false));
+        let marked = |p: tiny_skia::PremultipliedColorU8| p.red() < 200 || p.green() < 200 || p.blue() < 200;
+        let rows: Vec<u32> = (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| pm.pixel(x, y).is_some_and(marked))).collect();
+        assert!(!rows.is_empty() && rows.iter().all(|&y| (20..108).contains(&y)), "every line inside the box: {rows:?}");
+    }
+
+    /// A bar in a box too short for its lines draws them at their size and is said, as a bar too
+    /// short for its labels at their text size is (#2581): its labels below and its unit above
+    /// count, where a plain bar's labels alone fit. A box tall enough draws them all inside it.
+    #[test]
+    fn a_scale_bar_unit_label_row_in_a_short_box_is_said() {
+        let bar = BarOptions {
+            unit_label: Some("Kilometres"),
+            unit_label_position: UnitLabelPosition::Above,
+            label_position: ScaleLabelPosition::Below,
+            units: ScaleUnits::Kilometers,
+            ..BarOptions::default()
+        };
+        let short = Rect::from_xywh(0.0, 20.0, 300.0, 20.0).unwrap();
+        let placed = bar_layout(short, 100.0, &bar, 1.0, false).unwrap();
+        assert!(placed.cramped, "too short for its lines");
+        assert_eq!(placed.px, SCALE_BAR_TEXT_PT as f32 * 1.33, "drawn at its size, not smaller");
+        assert!(!bar_layout(short, 100.0, &BarOptions::default(), 1.0, false).unwrap().cramped, "a plain bar fits");
+        // In a box tall enough, every line inside it: the unit above and the labels under the bar.
+        let mut pm = Pixmap::new(300, 80).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        let r = Rect::from_xywh(0.0, 20.0, 300.0, 40.0).unwrap();
+        assert!(!bar_layout(r, 100.0, &bar, 1.0, false).unwrap().cramped);
+        crate::canvas::with_canvas(&mut pm, |c| scale_bar(c, r, 100.0, &bar, DEFAULT_COLORS, 1.0, false));
+        let marked = |x: u32, y: u32| pm.pixel(x, y).is_some_and(|p| p.red() < 250 || p.green() < 250 || p.blue() < 250);
+        let rows: Vec<u32> = (0..pm.height()).filter(|&y| (0..pm.width()).any(|x| marked(x, y))).collect();
+        assert!(!rows.is_empty() && rows.iter().all(|y| (20..60).contains(y)), "inside the box: {rows:?}");
+        // On a page, the short box is told as the text size's is: too small for its labels.
+        let maps = vec![Map::new("m")];
+        let mut l = Layout::new("Page", 120.0, 90.0);
+        let frame = l.add(
+            "Frame",
+            (10.0, 30.0, 100.0, 50.0),
+            serde_json::from_value(serde_json::json!({"MapFrame":{"map":"m", "center":{"x":0,"y":0}, "scale":1000000}})).unwrap(),
+        );
+        let id = l.add("Scale Bar", (10.0, 0.0, 100.0, 12.0), ElementKind::scale_bar(frame));
+        let info = PageInfo::default();
+        let set = |l: &mut Layout, size: f64, rows: bool| {
+            if let Some(ElementKind::ScaleBar { text_size, label_position, unit_label_position, .. }) =
+                l.element_mut(id).map(|e| &mut e.kind)
+            {
+                *text_size = size;
+                (*label_position, *unit_label_position) = if rows {
+                    (ScaleLabelPosition::Below, UnitLabelPosition::Above)
+                } else {
+                    (ScaleLabelPosition::Above, UnitLabelPosition::AfterLabels)
+                };
+            }
+        };
+        set(&mut l, 20.0, false);
+        assert!(text_loss(&l, &maps, 96.0, &info, id).is_none(), "a plain bar's labels at 20 points fit");
+        set(&mut l, 20.0, true);
+        let loss = text_loss(&l, &maps, 96.0, &info, id).unwrap();
+        assert!(loss.below_box && scale_bar_fit_notices(std::slice::from_ref(&loss))[0].contains("its box is too small"), "{loss:?}");
+        set(&mut l, SCALE_BAR_TEXT_PT, true);
+        assert!(text_loss(&l, &maps, 96.0, &info, id).is_none(), "its rows at 8 points fit");
+    }
+
+    /// A page draws its scale bar's details through `draw_page`: the unit label in the bar's colour.
+    #[test]
+    fn a_page_draws_a_scale_bar_with_its_details() {
+        let (mut maps, mut l, frame) = colour_test_page();
+        let mut bar = ElementKind::scale_bar(frame);
+        if let ElementKind::ScaleBar {
+            color, label_position, unit_label, unit_label_position, subdivisions, divisions_before_zero, ..
+        } = &mut bar
+        {
+            *color = Rgba::rgb(0xD0, 0x10, 0x10);
+            (*label_position, *unit_label, *unit_label_position) =
+                (ScaleLabelPosition::Below, Some("Kilometres".into()), UnitLabelPosition::Above);
+            (*subdivisions, *divisions_before_zero) = (4, 1);
+        }
+        l.add("Scale Bar", (5.0, 5.0, 90.0, 20.0), bar.clone());
+        let pm = render(&l, &mut maps, 96.0, &PageInfo::default()).unwrap();
+        let rows = |from: u32, to: u32, hit: fn(tiny_skia::PremultipliedColorU8) -> bool| {
+            (from..to).flat_map(|y| (0..pm.width()).map(move |x| (x, y))).filter(|&(x, y)| pm.pixel(x, y).is_some_and(hit)).count()
+        };
+        // The strip of the bar's 20 mm box over the bar (its middle at 15 mm, its top 4 px above)
+        // holds the unit label, in the bar's colour.
+        let mm = pm.height() as f32 / 60.0;
+        assert!(rows((5.0 * mm) as u32, (13.5 * mm) as u32, red) > 30, "the unit label over the bar, crimson");
+        assert_eq!(rows(0, pm.height() / 2, ink), 0, "no default ink");
+        // The same bar without its details draws differently on the same page.
+        let (mut maps2, mut plain, frame2) = colour_test_page();
+        let mut same = ElementKind::scale_bar(frame2);
+        if let ElementKind::ScaleBar { color, .. } = &mut same {
+            *color = Rgba::rgb(0xD0, 0x10, 0x10);
+        }
+        plain.add("Scale Bar", (5.0, 5.0, 90.0, 20.0), same);
+        assert_ne!(pm.data(), render(&plain, &mut maps2, 96.0, &PageInfo::default()).unwrap().data());
     }
 
     #[test]
@@ -8974,6 +11181,147 @@ Elaboração: RustGIS",
         let side = vec![label(Edge::Right, 200.0, "6°S", false), label(Edge::Left, 250.0, "8°S", false)];
         assert_eq!(kept_labels(side.clone(), (600.0, 500.0), (along, across), 10.0, 1.0).len(), 2, "a wide frame keeps them");
         assert!(kept_labels(side, (15.0, 500.0), (along, across), 10.0, 1.0).is_empty(), "a narrow one leaves them out");
+    }
+
+    /// A text's layer statistics (#2853) fill in from the frame's map, written as a chart's values
+    /// with the layout's decimal mark, beside `{scale}`; a token with no figure, or with no frame,
+    /// is drawn as written. What each such token is missing is said, once.
+    #[test]
+    fn a_text_shows_its_layers_statistics() {
+        use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value};
+        let mut ds =
+            Dataset::new("Plants", GeometryType::None, vec![Field::new("mw", FieldType::Double), Field::new("name", FieldType::Text)]);
+        for mw in [12_000.5, 11_553.25] {
+            ds.push(None, vec![Value::Float(mw), Value::Text("x".into())]);
+        }
+        let mut map = Map::new("m");
+        map.add_dataset(ds);
+        let cam = frame_camera(&map, Coord::new(0.0, 0.0), 6_300_000.0, 0.0, 0.0);
+        let info = PageInfo { page: 1, pages: 1, page_name: String::new() };
+        let mut layout = Layout::new("L", 100.0, 100.0);
+        let text = "{count:Plants} plants, {sum:Plants:mw} MW, mean {mean:Plants:mw}; {sum:Plants:name} {count:Nowhere}";
+        assert_eq!(
+            expand(text, &layout, &info, Some((&map, cam))),
+            "2 plants, 23,553.75 MW, mean 11,776.88; {sum:Plants:name} {count:Nowhere}"
+        );
+        layout.decimal_comma = true;
+        assert_eq!(
+            expand(text, &layout, &info, Some((&map, cam))),
+            "2 plants, 23.553,75 MW, mean 11.776,88; {sum:Plants:name} {count:Nowhere}"
+        );
+        // Without a frame, every token as written, and said so; a text without tokens says nothing.
+        assert_eq!(expand("{count:Plants} plants", &layout, &info, None), "{count:Plants} plants");
+        let maps = [map];
+        assert_eq!(
+            statistic_notices(&layout, &maps, "{count:Plants} and {count:Plants}"),
+            vec!["{count:Plants} shows as written: the layout has no map frame whose map it would read".to_string()]
+        );
+        assert_eq!(statistic_notices(&layout, &maps, "Plants at {scale}"), Vec::<String>::new());
+        let kind =
+            serde_json::from_value(serde_json::json!({"MapFrame": {"map": "m", "center": {"x": 0, "y": 0}, "scale": 6300000}})).unwrap();
+        layout.add("Frame", (0.0, 0.0, 50.0, 50.0), kind);
+        let said =
+            statistic_notices(&layout, &maps, "{sum:Plants:name} {sum:Plants:name} {count:Nowhere} {min:Plants:nosuch} {count:Plants}");
+        assert_eq!(
+            said,
+            vec![
+                "{sum:Plants:name} shows as written: 'name' of 'Plants' holds no numbers".to_string(),
+                "{count:Nowhere} shows as written: the map of the layout's first frame has no layer named 'Nowhere'".to_string(),
+                "{min:Plants:nosuch} shows as written: 'Plants' has no field named 'nosuch'".to_string(),
+            ]
+        );
+    }
+
+    /// A layer read in place holds only the features loaded, so a figure over it is partial: said
+    /// when the text is set (#2853), as is a layer that holds everything not.
+    #[test]
+    fn a_streamed_layers_statistic_says_it_covers_what_is_loaded() {
+        use rustgis_data::{Dataset, Field, FieldType, GeometryType, Value};
+        let layer = |name: &str| {
+            let fields = vec![Field::new("mw", FieldType::Double), Field::new("blank", FieldType::Double)];
+            let mut ds = Dataset::new(name, GeometryType::None, fields);
+            ds.push(None, vec![Value::Float(1.0), Value::Null]);
+            ds
+        };
+        let mut map = Map::new("m");
+        map.add_dataset(layer("Held"));
+        map.add_dataset(layer("Streamed"));
+        map.layers.iter_mut().find(|l| l.name == "Streamed").unwrap().source = Some(Default::default());
+        let mut layout = Layout::new("L", 100.0, 100.0);
+        let kind =
+            serde_json::from_value(serde_json::json!({"MapFrame": {"map": "m", "center": {"x": 0, "y": 0}, "scale": 6300000}})).unwrap();
+        layout.add("Frame", (0.0, 0.0, 50.0, 50.0), kind);
+        let maps = [map];
+        assert_eq!(
+            statistic_notices(&layout, &maps, "{count:Held} {count:Streamed} {count:Streamed} {sum:Streamed:mw} {sum:Streamed:no} {max:Streamed:blank}"),
+            vec![
+                "{count:Streamed} covers only the features of 'Streamed' that are loaded: it is read in place".to_string(),
+                "{sum:Streamed:mw} covers only the features of 'Streamed' that are loaded: it is read in place".to_string(),
+                "{sum:Streamed:no} shows as written: 'Streamed' has no field named 'no'".to_string(),
+                // No number loaded yet, but a later load may bring some: the scope is said as well.
+                "{max:Streamed:blank} covers only the features of 'Streamed' that are loaded: it is read in place".to_string(),
+                "{max:Streamed:blank} shows as written: no feature of 'Streamed' its definition query keeps has a number in 'blank', or the figure is past a number's range".to_string(),
+            ]
+        );
+    }
+
+    /// A raster layer has no features, so a figure over it has none to give: drawn as written and
+    /// said (#2853), never a 0 that reads like a count.
+    #[test]
+    fn a_raster_layers_statistic_is_drawn_as_written() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 1.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let r = Raster::new("e", 1, 1, vec![vec![1.0]], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+        let mut map = Map::new("m");
+        map.add_raster("Elevation", rustgis_map::RasterLayer::from_path(r, "e.tif"));
+        let cam = frame_camera(&map, Coord::new(0.0, 0.0), 6_300_000.0, 0.0, 0.0);
+        let info = PageInfo { page: 1, pages: 1, page_name: String::new() };
+        let mut layout = Layout::new("L", 100.0, 100.0);
+        assert_eq!(expand("{count:Elevation}", &layout, &info, Some((&map, cam))), "{count:Elevation}");
+        let kind =
+            serde_json::from_value(serde_json::json!({"MapFrame": {"map": "m", "center": {"x": 0, "y": 0}, "scale": 6300000}})).unwrap();
+        layout.add("Frame", (0.0, 0.0, 50.0, 50.0), kind);
+        assert_eq!(
+            statistic_notices(&layout, &[map], "{count:Elevation}"),
+            vec!["{count:Elevation} shows as written: 'Elevation' is a raster layer, which has no features".to_string()]
+        );
+    }
+
+    /// A frame whose map the project doesn't hold is told apart from a layout with no frame (#2853).
+    #[test]
+    fn a_statistic_names_a_frame_whose_map_is_missing() {
+        let mut layout = Layout::new("L", 100.0, 100.0);
+        let said = |layout: &Layout| statistic_notices(layout, &[Map::new("m")], "{count:Cities}");
+        assert_eq!(said(&layout), vec!["{count:Cities} shows as written: the layout has no map frame whose map it would read".to_string()]);
+        let kind =
+            serde_json::from_value(serde_json::json!({"MapFrame": {"map": "gone", "center": {"x": 0, "y": 0}, "scale": 6300000}})).unwrap();
+        layout.add("Frame", (0.0, 0.0, 50.0, 50.0), kind);
+        assert_eq!(
+            said(&layout),
+            vec!["{count:Cities} shows as written: the map of the layout's first frame is not in the project".to_string()]
+        );
+    }
+
+    /// A figure written without its field (`{sum:Plants}`) is drawn as written, which is no token for
+    /// the page, and is said (#2853), as one with a field the layer lacks is.
+    #[test]
+    fn a_statistic_without_its_field_is_said() {
+        use rustgis_data::{Dataset, Field, FieldType, GeometryType};
+        let mut map = Map::new("m");
+        map.add_dataset(Dataset::new("Plants", GeometryType::None, vec![Field::new("mw", FieldType::Double)]));
+        let mut layout = Layout::new("L", 100.0, 100.0);
+        let kind =
+            serde_json::from_value(serde_json::json!({"MapFrame": {"map": "m", "center": {"x": 0, "y": 0}, "scale": 6300000}})).unwrap();
+        layout.add("Frame", (0.0, 0.0, 50.0, 50.0), kind);
+        let maps = [map];
+        assert_eq!(
+            statistic_notices(&layout, &maps, "{sum:Plants} {count:Plants} {max:Nowhere} {mean:Plants:mw}"),
+            vec![
+                "{sum:Plants} shows as written: a sum takes a field: write {sum:Plants:field}".to_string(),
+                "{max:Nowhere} shows as written: the map of the layout's first frame has no layer named 'Nowhere'".to_string(),
+                "{mean:Plants:mw} shows as written: no feature of 'Plants' its definition query keeps has a number in 'mw', or the figure is past a number's range".to_string(),
+            ]
+        );
     }
 
     /// A layout with a decimal comma swaps the marks of the numbers it prints, `{scale}` included,

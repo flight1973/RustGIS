@@ -472,9 +472,17 @@ pub fn status_bar(app: &mut RustGisApp, ui: &mut Ui) {
                 // dimmed then, to tell it from a live one.
                 let kept = app.map.kept_pointer_lonlat(app.session.map().instance_id(), app.session.opened);
                 let live = app.map.pointer_lonlat.is_some();
+                // Layer coordinates name their system, the active layer's, which the map's beside
+                // them isn't.
+                let system = format.system(app.session.map(), app.session.active_layer);
+                let mut text = format.readout(kept, earth, system.as_ref());
+                // Named only beside a position: with none yet, the dash stands alone.
+                if let Some(s) = system.as_ref().filter(|_| format == crate::CoordReadout::Layer && kept.is_some()) {
+                    text = format!("{text}  {}", s.name());
+                }
                 let resp = ui.add(
                     egui::Label::new(
-                        egui::RichText::new(format.readout(kept, earth, crate::coordreadout::MapSystem::of(app.session.map()).as_ref())).monospace().size(11.5).color(if live { t.text_dim } else { t.text_disabled }),
+                        egui::RichText::new(text).monospace().size(11.5).color(if live { t.text_dim } else { t.text_disabled }),
                     )
                     .sense(Sense::click()),
                 );
@@ -818,6 +826,21 @@ pub fn shortcuts(app: &mut RustGisApp, ctx: &egui::Context) {
     if crate::saveprompt::waiting(app) || ctx.memory(|m| m.top_modal_layer()).is_some() || app.ui.shortcut_editor.capturing() {
         return;
     }
+    // The repeat-use form is not modal: another pane or an unfinished sketch keeps Escape.
+    let point_dialog_owns_escape = app.dialogs.open == Some("createPointXY")
+        && match ctx.memory(|m| m.focused()) {
+            Some(id) => ctx.read_response(id).is_some_and(|r| r.layer_id.id == egui::Id::unique(("dialog", "createPointXY"))),
+            None => {
+                app.map.sketch_len() == 0
+                    && !app.session.map().view.first_person
+                    && !crate::boxedit::drawing(app)
+                    && !crate::circleedit::drawing(app)
+            }
+        };
+    if point_dialog_owns_escape && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        app.dialogs.open = None;
+        return;
+    }
     if app.ui.history_jump.is_some()
         && app.dialogs.open.is_none()
         && !crate::crspicker::list_is_open(ctx)
@@ -1109,6 +1132,7 @@ fn search_action(id: &str) -> Option<SearchAction> {
         "project.coordinateSystem" => Dialog("projectProperties"),
         "map.rename" => Dialog("renameMap"),
         "map.goToXY" => Dialog("goToXY"),
+        "edit.addPoint" => Dialog("createPointXY"),
         "map.exportOrbit" => Dialog("exportOrbit"),
         "map.findPlace" => Dialog("findPlace"),
         "map.camera" | "map.setScale" => Dialog("camera"),
@@ -1759,6 +1783,21 @@ pub fn notices(app: &mut RustGisApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command and the Workflows section it opens are one extension's or no extension's, so
+    /// Command Search never offers a command whose section is refused, nor hides one whose isn't.
+    #[test]
+    fn a_command_and_its_workflows_section_are_in_one_extension() {
+        let app = RustGisApp::with_sample();
+        let mut seen = 0;
+        for c in &app.session.registry.commands {
+            let Some(SearchAction::Workflow(section)) = search_action(c.id) else { continue };
+            let owner = rustgis_engine::extensions::owner(c.id).map(|e| e.id);
+            assert_eq!(owner, crate::analysispane::section_extension(section), "{} and {section}", c.id);
+            seen += 1;
+        }
+        assert!(seen > 20, "{seen}");
+    }
 
     #[test]
     fn command_search_matches_localized_labels_and_locations() {

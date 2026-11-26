@@ -197,7 +197,14 @@ world projection (World Mercator, Plate Carrée, Robinson, Equal Earth and the l
 the antimeridian as a seam and the poles as lines, is worked on in longitude/latitude, as Web
 Mercator is. If another input has a place that system can't hold, the tool works in
 longitude/latitude instead, and its message says so. A layer in longitude/latitude, Web Mercator or
-another geographic system is worked on in longitude/latitude, as before. In a projected system a
+another geographic system is worked on in longitude/latitude, as before. There, a feature with a place
+that can't be given in longitude/latitude (one far past where its layer's own system reaches) is read
+without its geometry, and the tool's message says how many of each layer were; a tool that updates
+its input in place, as Calculate Geometry Attributes does, leaves that feature's geometry as it was.
+A layer read in place from its file (streamed) holds only the part the map shows: an update of it
+worked in longitude/latitude that read such a feature without its geometry is refused until you
+Load All Features, since that feature's stored geometry may not be in that part.
+In a projected system a
 tool works in, distances in metres (Buffer's, Simplify's tolerance, Points Along Lines' spacing,
 Near's, and the search distances of Select Layer By Location and Spatial Join) are measured flat
 there, in its unit, as distances in a projected system are: a kilometre is 1000 of its metres, or
@@ -1605,13 +1612,14 @@ click them on the map:
 | --- | --- |
 | Raster Functions | Slope in degrees or percent, aspect, hillshade (8-bit shades from 1 to 255, with 0 for no data), NDVI, band math (`(b4-b3)/(b4+b3)`), remapping, thresholds, resampling |
 | Function Editor | Chains raster functions, each on the previous output |
+| Process | Clips a raster to the view or to a polygon layer, or resamples it ([below](#zonal-statistics-and-polygon-clipping)) |
 | Suitability Modeler | Scores rasters 1–10 and adds them with weights |
 | Visibility Analysis | A viewshed from a point on an elevation raster, with the Earth's curvature and the refraction of visible light (1/7, as `gdal_viewshed`). The ground along each ray is the cell each point falls in by default; `heights: "bilinear"` (**Ground heights › Between cells (bilinear)** in the Workflows pane) reads it between the cells' centres instead. Both are estimates of the ground between cell centres; between cells is closer on ground that bulges (a hill seen from its top), where the nearest cell can hide cells just inside the horizon. With no radius, or one longer than the raster's diagonal, the viewshed covers the whole raster. The map's **Viewshed N km Here** reads the ground as the Workflows pane's **Ground heights** says. On a raster round the whole Earth the rays don't cross its east–west edge, which the analysis says when the radius reaches it and the way across is shorter: the ground just across the edge is left out, worked out the long way round where the radius reaches the far edge through the raster too (always with no radius), or partly both, near the observer's row and not farther from it. The observer's height must be from 0 to 10,000 m. Ground with no data hides nothing, and next to it bilinear heights take the nearest cell's height; the analysis says how many cells this touched, in a notice. The answer gives both counts (0 when there is nothing to say): `acrossNoData` counts the visible cells whose rays crossed ground with no data (a hidden cell stays hidden whatever that ground is, so it isn't counted, and 0 doesn't mean no ray crossed any); `readNearest` counts every cell, visible or hidden, whose ray took a nearest height next to no data in bilinear mode |
 | Exploratory 3D Analysis | A line of sight between two points, split into seen and hidden parts, with the same curvature and refraction |
 | Geostatistical Wizard | An IDW surface from feature values, using 12 nearest neighbours by default |
 | Network Analysis | The shortest (or cheapest, by a cost field) route over a line layer |
 | Neighborhood Explorer | What lies within a distance of a point, with sums of numeric fields |
-| Simulation | Random points in polygons (a fixed number, or from a field × rate), spread in the layer's own coordinates when it is held in a projected system, else in longitude/latitude (then held in the project's coordinate system when it has one, other than a geocentric one) |
+| Simulation | Random points in polygons (a fixed number, or from a field × rate), spread in the layer's own coordinates when it is held in a projected system, else in longitude/latitude (then held in the project's coordinate system when it has one, other than a geocentric one; a polygon with a place that can't be given in longitude/latitude gets no points, and a notice counts them) |
 | Data Engineering | Counts, nulls, distinct values, min, max and mean of every field |
 | Exploratory Analysis | Histograms and correlations of numeric fields |
 | Embeddings | The features most like the selected one, by their numeric attributes |
@@ -1720,11 +1728,17 @@ computer's memory, or on Linux the lowest memory limit of the control groups Rus
 own and those above it (set by a container runtime, or by systemd's `MemoryMax` for a service),
 when it is lower: each plans for a quarter of it, never below the web app's fixed limits and never
 above a ceiling. `limits.memorySource` says what they follow: `computer`, `container` (such a limit, lower than the computer's memory),
-`override` or `unknown`. For tests, or to reproduce a smaller computer, set the environment
+`phone`, `override` or `unknown`. For tests, or to reproduce a smaller computer, set the environment
 variable `RUSTGIS_MEMORY_BYTES` to the memory in bytes (such as `8589934592` for 8 GiB) before
 starting RustGIS: it replaces the memory read from the computer and any container limit, and the
 command line says so on every run. It isn't a way to go faster: a value above the computer's
 memory raises every limit past what it has, and a large job can then run out of memory.
+
+On a phone the limits plan the same way from what its system allows: on Android, the memory the
+device has, and no more than is free before Android starts ending processes; on iOS, what iOS says
+the app may still use. Where the web app's floor is lower (`rasterSamples`, `bufferBytes`), a
+phone takes it. There `undoBytes` plans for what is free too, once as RustGIS starts, and
+`threadScratchBytes` is the web app's 256 MiB (see [Memory](field-work.md#memory)).
 
 The limits below other than `threadScratchBytes`, `undoBytes` and `projectBytes` plan for less
 when memory is short, never below their floors. They plan for the smallest of three figures:
@@ -1791,7 +1805,7 @@ on a grid of any coordinate system, cell size and extent, and Polygons to Raster
 (`raster.rasterize`) burns polygons onto the same grids; Raster Functions › Resample matches a
 target raster's grid.
 
-The **Script** pane runs commands from text, one per line (`id {json}`); its box grows with the script down to the bottom of the pane,
+The **Script** pane runs commands from text, one per line (`id {json}`, or `id={json}` as on the command line); its box grows with the script down to the bottom of the pane,
 short of the buttons, and then scrolls, so **Run** stays in view; Ctrl+Enter (⌘+Enter on macOS)
 in the box runs the script too. Above a run's results, a line tells its number, how long it took
 and when it started (`Run #2 (0.84 s)`, and `14:04 UTC` on the right), so a run made again by
@@ -1977,7 +1991,10 @@ save and run models without the canvas:
 ## Imagery
 
 The Imagery tab's groups open their tools in the Workflows pane. The tab belongs to the Imagery
-[extension](index.md#extensions): turn it on in Plugins › Extensions to show the tab:
+[extension](index.md#extensions): turn it on in Plugins › Extensions to show the tab. Three
+commands described here aren't on the tab or part of the extension, and run whether or not it is on:
+**Mosaic Rasters**, **Project Raster** and **Polygons to Raster**. So does
+[Process](#zonal-statistics-and-polygon-clipping), on the Analyze tab.
 
 - **Ortho Mapping** and **Reality Mapping** workspaces mosaic georeferenced images into an
   orthomosaic, or elevation rasters into a surface model that exports as a 3D mesh (OBJ).
@@ -1990,8 +2007,23 @@ The Imagery tab's groups open their tools in the Workflows pane. The tab belongs
   images are in another geographic system (NAD83, say), the run says so. A geographic `crs` other
   than EPSG:4326 is refused.
 - **Georeference** places a raster from control points (column, row, longitude, latitude) or
-  stretches it over the map view. Those only shift and scale a north-up grid, as RustGIS's
-  geotransform has no rotation. With `transform` (`raster.georeference`) the points are fitted by any
+  stretches it over the map view (**Fit To Map View**, `"extent": "view"`). Those only shift and
+  scale a north-up grid, as RustGIS's geotransform has no rotation. Fitted to the view, the raster
+  is placed in the map's own system on a flat map of the Earth (Web Mercator's EPSG:3857, the map's
+  EPSG or ESRI code, or a preset's definition), so it fills the view as drawn; on the globe and
+  another body's map, over the longitude and latitude box the view shows. A turned or tilted map
+  is refused (Reset North first), as is a Web Mercator view wider than the world or across the
+  antimeridian; a view of a world copy past it is fitted to the same place within ±180°. Control
+  points without `transform` are longitude and latitude, and `pointsCrs` or `crs` with them is
+  refused. An `extent` of four
+  numbers is in degrees, or in `crs` when given (`{"extent": [2599000, 1199000, 2601000, 1201000],
+  "crs": "EPSG:2056"}`), and the raster is placed in that system; an entry that isn't a number is
+  refused, not passed over. An extent goes without control points, `transform` and `pointsCrs`:
+  any of them beside it is refused, as none would be used. So are `name`, `path`, `cellSize` and
+  `resampling` without `transform`, as only a warp makes a new raster; without one the layer itself
+  is placed. The `extent` it answers is in longitude/latitude, whatever system the raster is
+  placed in.
+  With `transform` (`raster.georeference`) the points are fitted by any
   of the Control Point Fit transforms and the raster is warped onto a new north-up grid covering the
   warped image: `{"layer": "scan", "transform": "spline", "points": [[column, row, x, y], …],
   "pointsCrs": "EPSG:4326", "crs": 32613, "resampling": "bilinear", "cellSize": 5, "name": "warped",
@@ -2031,19 +2063,11 @@ The Imagery tab's groups open their tools in the Workflows pane. The tab belongs
   every answer has the band names and, when the file gives any, `"wavelengths"` in nanometres.
   After GeoLibre's spectral profile.
 - **Change Detection** (difference, ratio, percent), **Indices** (NDVI, NDWI, SAVI, NBR, NDBI,
-  EVI), **Process** (clip to the view, to a box, or to a polygon layer's selected or all polygons,
-  with the cells outside them no-data; resample) and the **Pixel Editor** (set the pixels inside a
-  polygon). As in Project Raster, the cells outside the polygons are see-through instead (0, with
-  alpha 0) in an image with an alpha band, and a three-band colour image with neither alpha nor
-  no-data gains one for them, so an 8-bit image stays 8-bit when it is exported. A colour image
-  with a fourth band of data and no alpha (RGB and near-infrared) gets no-data there as before
-  (−3.4e38 when it has none). Project Raster doesn't give it an alpha band either: a colour image's
-  alpha is read from its fourth band, which holds its data. A clip that gained an alpha band has
-  four bands, so Mosaic Rasters refuses it beside three-band tiles, saying how many bands each
-  has: clip the others the same way, or mosaic first and clip the result.
+  EVI) and the **Pixel Editor** (set the pixels inside a polygon).
 - **Mosaic Rasters** (`raster.mosaic`) merges tiles of one grid, such as the 1 km tiles of a state
   elevation model, into one raster in their own coordinate system and cell size, optionally
-  written to a GeoTIFF: `{"inputs": ["dgm_1.tif", "dgm_2.tif", …], "path": "dem.tif"}`. Inputs
+  written to a GeoTIFF: `{"inputs": ["dgm_1.tif", "dgm_2.tif", …], "path": "dem.tif"}`. It has no
+  pane yet: run it from the Script pane, the AI Assistant, the command line or Python. Inputs
   are layers or file paths; where they overlap, the first one with data wins. Tiles in different
   coordinate systems or cell sizes, or opened from an overview, are refused rather than quietly
   resampled, as are tiles whose cells don't line up; the mosaic has to fit in memory (120 million
@@ -2377,12 +2401,23 @@ statistics. If a part subsequently fails projection onto the raster grid, it is 
 statistics cover the remaining valid parts. Large
 overlapping zones each require a separate pass over their raster window.
 
+**Process** (`raster.process`, Analyze › Raster) clips a raster to the view, to a box, or to a
+polygon layer's selected or all polygons, with the cells outside them no-data, or resamples it.
+As in [Project Raster](#imagery), the cells outside the polygons are see-through instead (0, with
+alpha 0) in an image with an alpha band, and a three-band colour image with neither alpha nor
+no-data gains one for them, so an 8-bit image stays 8-bit when it is exported. A colour image
+with a fourth band of data and no alpha (RGB and near-infrared) gets no-data there as before
+(−3.4e38 when it has none). Project Raster doesn't give it an alpha band either: a colour image's
+alpha is read from its fourth band, which holds its data. A clip that gained an alpha band has
+four bands, so Mosaic Rasters refuses it beside three-band tiles, saying how many bands each
+has: clip the others the same way, or mosaic first and clip the result.
+
 For `raster.process` polygon clipping, `selectedOnly: true` requires a selection,
 `selectedOnly: false` uses every polygon, and omitting it uses the selection when present.
-The Process pane initially checks Selected only when the chosen layer has a selection, and sends
-the choice explicitly. Clipping and Zonal Statistics share
-polygon transformation rules so a failed hole cannot silently enlarge the sampled area.
-A malformed ring or a failed projection rejects its complete polygon part in all raster masking
+The Process section of the Workflows pane (Analyze › Raster › Process) initially checks Selected
+only when the chosen layer has a selection, and sends the choice explicitly. Clipping and Zonal
+Statistics share polygon transformation rules so a failed hole cannot silently enlarge the sampled
+area. A malformed ring or a failed projection rejects its complete polygon part in all raster masking
 operations. Clipping skips invalid features and reports their count in the command result;
 its output bounds cover the valid polygons only.
 

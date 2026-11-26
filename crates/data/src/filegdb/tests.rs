@@ -539,7 +539,8 @@ fn a_table_with_missing_files_is_said() {
     assert_eq!(read.unread[0].1, "its file a00000003.gdbtablx is missing");
 }
 
-/// A feature whose coordinates its coordinate system can't place keeps its row, and is said.
+/// A feature whose coordinates its coordinate system can't place is kept as the file holds it, and
+/// said (#2032 C2f-4b).
 #[test]
 fn coordinates_that_cant_be_converted_are_said() {
     const LAEA: &str = r#"PROJCS["ETRS89 / LAEA Europe",GEOGCS["ETRS89",DATUM["European_Terrestrial_Reference_System_1989",SPHEROID["GRS 1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Lambert_Azimuthal_Equal_Area"],PARAMETER["latitude_of_center",52],PARAMETER["longitude_of_center",10],PARAMETER["false_easting",4321000],PARAMETER["false_northing",3210000],UNIT["metre",1],AUTHORITY["EPSG","3035"]]"#;
@@ -554,8 +555,12 @@ fn coordinates_that_cant_be_converted_are_said() {
     let (ds, report) = &layers[0];
     let rows: Vec<&crate::Feature> = ds.features.iter().collect();
     assert_eq!(rows.len(), 2);
-    assert!(rows[0].geometry.is_some() && rows[1].geometry.is_none(), "{:?}", rows[1].geometry);
-    assert!(report.messages.iter().any(|m| m.starts_with("1 features have coordinates outside")), "{report:?}");
+    assert!(rows[0].geometry.is_some() && rows[1].geometry.is_some(), "{:?}", rows[1].geometry);
+    assert!(!ds.crs_incomplete);
+    assert!(
+        report.messages.iter().any(|m| m.starts_with("one feature has a place that can't be given in longitude/latitude")),
+        "{report:?}"
+    );
 }
 
 #[test]
@@ -621,7 +626,7 @@ fn hostile_bytes_never_panic() {
 /// fields, and a TIN, which GDAL stores as a multipatch (a triangle fan).
 #[test]
 fn reads_what_gdal_writes_when_gdal_is_installed() {
-    if !crate::source::gdal::available() {
+    if !crate::source::gdal::test_runs().unwrap() {
         return;
     }
     let dir = std::env::temp_dir().join(format!("rustgis-filegdb-{}", std::process::id()));
@@ -642,7 +647,7 @@ fn reads_what_gdal_writes_when_gdal_is_installed() {
     .unwrap();
     let (gdb_s, points_s, tins_s) = (gdb.display().to_string(), points.display().to_string(), tins.display().to_string());
     run(&["-f", "OpenFileGDB", "-a_srs", "EPSG:4326", "-nlt", "POINT", "-nln", "places", "-oo", "AUTODETECT_TYPE=YES", &gdb_s, &points_s]);
-    run(&["-f", "OpenFileGDB", "-update", "-a_srs", "EPSG:2056", "-nlt", "TINZ", "-nln", "blocks", &gdb_s, &tins_s]);
+    run(&["-f", "OpenFileGDB", "-update", "-a_srs", "EPSG:2056", "-nlt", "GEOMETRYCOLLECTIONZ", "-nln", "blocks", &gdb_s, &tins_s]);
     assert!(is_geodatabase(&gdb));
     assert_eq!(layers(&gdb).unwrap(), ["places", "blocks"]);
     let read = read_dir(&gdb, None).unwrap().layers;
@@ -947,6 +952,7 @@ fn filegdb_temporal_fields_keep_days_offsets_and_null_notices() {
         assert_eq!(notices.len(), usize::from(rounded), "{serial}: {report:?}");
         if rounded {
             assert!(notices[0].contains("1 serial date") && notices[0].contains("moment"));
+            assert_eq!(notices[0].loss, Some(crate::loss::LossCode::ChangedRounded));
         }
     }
 }

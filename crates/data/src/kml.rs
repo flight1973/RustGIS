@@ -355,20 +355,23 @@ impl GeometryLosses {
 
     /// Emits one counted notice per kind, only for nonzero totals.
     fn report(&self, name: &str, report: &mut ReadReport) {
-        for (count, one, many) in [
-            (self.unreadable.get(), "unreadable KML coordinate tuple", "unreadable KML coordinate tuples"),
-            (self.holes, "unreadable KML polygon hole", "unreadable KML polygon holes"),
+        use crate::loss::LossCode::{DroppedGeometry, DroppedRing};
+        // Each is a part left out of a kept placemark's geometry.
+        for (count, one, many, code) in [
+            (self.unreadable.get(), "unreadable KML coordinate tuple", "unreadable KML coordinate tuples", DroppedGeometry),
+            (self.holes, "unreadable KML polygon hole", "unreadable KML polygon holes", DroppedRing),
             (
                 self.short_lines,
                 "KML line part with fewer than two usable coordinates",
                 "KML line parts with fewer than two usable coordinates",
+                DroppedGeometry,
             ),
-            (self.excess_points, "excess KML Point coordinate tuple", "excess KML Point coordinate tuples"),
-            (self.polygons, "KML polygon without a usable outer ring", "KML polygons without a usable outer ring"),
+            (self.excess_points, "excess KML Point coordinate tuple", "excess KML Point coordinate tuples", DroppedGeometry),
+            (self.polygons, "KML polygon without a usable outer ring", "KML polygons without a usable outer ring", DroppedGeometry),
         ] {
             if count > 0 {
                 let (subject, verb) = if count == 1 { (one, "was") } else { (many, "were") };
-                report.messages.push(format!("{name}: {count} {subject} {verb} left out"));
+                report.messages.push(crate::loss::Note::loss(code, format!("{name}: {count} {subject} {verb} left out")));
             }
         }
     }
@@ -583,7 +586,9 @@ impl Reader {
         for g in pm.children().filter(|c| c.is_element()) {
             geometry(&g, &mut parts, 0);
         }
-        self.geometry_losses.add(&parts.losses);
+        // A placemark left out whole is said as one; only a kept one's parts left out are its
+        // geometry's loss.
+        let losses = std::mem::take(&mut parts.losses);
         let mut data = Vec::new();
         let mut seen = HashSet::new();
         let mut duplicates = 0usize;
@@ -645,6 +650,9 @@ impl Reader {
         }
         if !parts.polygons.is_empty() {
             push(Geometry::Polygon(parts.polygons), &parts.zm[2], &mut self.rows);
+        }
+        if any {
+            self.geometry_losses.add(&losses);
         }
         if !any {
             self.skipped += 1;
@@ -727,16 +735,25 @@ impl Reader {
                 self.geometry_losses.report(name, &mut report);
                 report.skipped = self.skipped;
                 if self.skipped > 0 {
-                    report.messages.push(format!("{name}: {} placemarks without a geometry RustGIS draws were skipped", self.skipped));
+                    report.messages.push(crate::loss::Note::loss(
+                        crate::loss::LossCode::DroppedFeature,
+                        format!("{name}: {} placemarks without a geometry RustGIS draws were skipped", self.skipped),
+                    ));
                 }
                 if self.duplicate_entries > 0 {
-                    report.messages.push(format!(
-                        "{name}: {} repeated ExtendedData entries in {} placemarks were left out",
-                        self.duplicate_entries, self.duplicate_placemarks
+                    report.messages.push(crate::loss::Note::loss(
+                        crate::loss::LossCode::DroppedValue,
+                        format!(
+                            "{name}: {} repeated ExtendedData entries in {} placemarks were left out",
+                            self.duplicate_entries, self.duplicate_placemarks
+                        ),
                     ));
                 }
                 if self.dropped_keys > 0 {
-                    report.messages.push(format!("{name}: extended data past {MAX_KEYS} distinct names was left out"));
+                    report.messages.push(crate::loss::Note::loss(
+                        crate::loss::LossCode::DroppedOverLimit,
+                        format!("{name}: extended data past {MAX_KEYS} distinct names was left out"),
+                    ));
                 }
                 if !renamed.is_empty() {
                     let listed: Vec<String> = renamed
@@ -758,7 +775,10 @@ impl Reader {
             }
             if zm_rows > 0 {
                 ds.zm_dropped = true;
-                report.messages.push(format!("{}: {}", ds.name, crate::zm_note(Some(zm_rows as u64))));
+                report.messages.push(crate::loss::Note::loss(
+                    crate::loss::LossCode::DroppedZm,
+                    format!("{}: {}", ds.name, crate::zm_note(Some(zm_rows as u64))),
+                ));
             }
             let styles = used.into_iter().filter_map(|id| self.styles.get(&id).map(|s| (id, *s))).collect();
             out.push(Layer { dataset: ds, report, styles });
@@ -791,13 +811,16 @@ mod tests {
             assert_eq!(layers[0].dataset.features[0].attrs[0], Value::Text("kept".into()));
             assert!(!layers[0].dataset.zm_dropped, "discarded rings do not set a retained point's altitude flag");
             assert_eq!(
-                layers[0].report.messages,
+                layers[0].report.messages.texts().collect::<Vec<_>>(),
                 [
                     "a: 2 unreadable KML coordinate tuples were left out",
                     "a: 1 unreadable KML polygon hole was left out",
                     "a: 2 KML polygons without a usable outer ring were left out"
                 ]
             );
+            use crate::loss::LossCode::{DroppedGeometry, DroppedRing};
+            let codes: Vec<_> = layers[0].report.messages.iter().map(|m| m.loss).collect();
+            assert_eq!(codes, [Some(DroppedGeometry), Some(DroppedRing), Some(DroppedGeometry)]);
             for clean in [
                 "<Polygon/>",
                 "<Polygon><outerBoundaryIs><LinearRing><coordinates> </coordinates></LinearRing></outerBoundaryIs><innerBoundaryIs/><innerBoundaryIs><LinearRing><coordinates> </coordinates></LinearRing></innerBoundaryIs></Polygon>",
@@ -821,7 +844,7 @@ mod tests {
             );
             assert!(layers.iter().all(|l| !l.dataset.zm_dropped && l.dataset.features[0].attrs[0] == Value::Text("kept".into())));
             assert_eq!(
-                layers[0].report.messages,
+                layers[0].report.messages.texts().collect::<Vec<_>>(),
                 [
                     "a: 2 unreadable KML coordinate tuples were left out",
                     "a: 2 KML line parts with fewer than two usable coordinates were left out"
@@ -841,6 +864,19 @@ mod tests {
                 Some(Geometry::Line(vec![vec![Coord::new(200.0, 100.0), Coord::new(201.0, 101.0)]]))
             );
         }
+    }
+
+    /// A placemark left out whole is said once, as one: the parts of it that couldn't be read
+    /// aren't also a kept placemark's geometry loss.
+    #[test]
+    fn a_placemark_left_out_whole_is_said_once() {
+        let layers = read(
+            "a.kml",
+            br#"<kml><Placemark><LineString><coordinates>x,y 1,2</coordinates></LineString></Placemark><Placemark><Point><coordinates>1,2</coordinates></Point></Placemark></kml>"#,
+        )
+        .unwrap();
+        let said: Vec<_> = layers.iter().flat_map(|l| l.report.messages.iter().map(|m| (m.as_str(), m.loss))).collect();
+        assert_eq!(said, [("a: 1 placemarks without a geometry RustGIS draws were skipped", Some(crate::loss::LossCode::DroppedFeature))]);
     }
 
     #[test]
@@ -881,6 +917,9 @@ mod tests {
                     "a: 2 excess KML Point coordinate tuples were left out"
                 ]
             );
+            use crate::loss::LossCode::{DroppedGeometry, DroppedRing};
+            let codes: Vec<_> = layers.iter().flat_map(|l| l.report.messages.iter().map(|m| m.loss)).collect();
+            assert_eq!(codes, [Some(DroppedGeometry), Some(DroppedRing), Some(DroppedGeometry), Some(DroppedGeometry)]);
         }
         let clean = read("a.kml", br#"<kml><Placemark><MultiGeometry><Point><coordinates>1,2</coordinates></Point><LineString/><LineString><coordinates> </coordinates></LineString><Polygon><outerBoundaryIs><LinearRing><coordinates>0,0 4,0 4,4 0,0</coordinates></LinearRing></outerBoundaryIs><innerBoundaryIs/><innerBoundaryIs><LinearRing><coordinates> </coordinates></LinearRing></innerBoundaryIs></Polygon></MultiGeometry></Placemark></kml>"#).unwrap();
         assert!(clean[0].report.messages.is_empty());
@@ -940,7 +979,11 @@ mod tests {
         let layers = read("duplicates.kml", xml.as_bytes()).unwrap();
         assert_eq!(layers.len(), 2);
         let messages: Vec<_> = layers.iter().flat_map(|l| &l.report.messages).collect();
-        assert_eq!(messages, ["duplicates: 4 repeated ExtendedData entries in 2 placemarks were left out"]);
+        assert_eq!(
+            messages.iter().map(|m| m.as_str()).collect::<Vec<_>>(),
+            ["duplicates: 4 repeated ExtendedData entries in 2 placemarks were left out"]
+        );
+        assert_eq!(messages[0].loss, Some(crate::loss::LossCode::DroppedValue));
         for layer in &layers {
             let ds = &layer.dataset;
             assert_eq!(ds.value(0, ds.field_index("n").unwrap()), &Value::Int(0));

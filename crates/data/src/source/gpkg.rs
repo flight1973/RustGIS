@@ -36,6 +36,10 @@ pub struct GpkgSource {
     /// The database file and its identity when opened ([`file_identity`]), for a traversal on a
     /// connection of its own to check it reads the same file.
     file: Option<(PathBuf, Option<(u64, u64)>)>,
+    /// Whether `info.count` is the count GDAL keeps ([`kept_count`]) rather than the rows counted:
+    /// it may be past them (an `INSERT OR REPLACE` leaves it high, a file may say any number), so
+    /// a read doesn't start its sample's step from it.
+    count_kept: bool,
 }
 
 impl Drop for GpkgSource {
@@ -151,6 +155,31 @@ fn has_table(conn: &Connection, name: &str) -> Result<bool> {
     .map_err(err)
 }
 
+/// The feature count GDAL keeps for `table` in `gpkg_ogr_contents`, used as the table's count
+/// when the file also has the two triggers that keep it up to date
+/// (`trigger_insert_feature_count_<table>` and `trigger_delete_feature_count_<table>`, which add or
+/// take one per insert and delete); GDAL answers a table's count with it too, and it is as right
+/// as GDAL's: a row an `INSERT OR REPLACE` puts out fires no delete trigger (SQLite's
+/// `recursive_triggers` is off by default), so such writes leave it high. A read doesn't start
+/// its sample's step from it (`GpkgSource::count_kept`), so a preview still gets the rows there
+/// are. GDAL may drop the triggers while it writes and create them again when it saves the file,
+/// so a file without them may hold an out-of-date count. `None` then, and when there is no such
+/// table or row (a file GDAL didn't write), or when the count isn't a whole number from zero up
+/// (NULL, text, a negative): the table is counted instead.
+fn kept_count(conn: &Connection, table: &str) -> Option<i64> {
+    conn.query_row(
+        // The table's row (its own name first, then one differing in case), then whether its count holds.
+        "SELECT feature_count FROM (SELECT feature_count FROM gpkg_ogr_contents WHERE lower(table_name) = lower(?1)
+                                    ORDER BY table_name = ?1 DESC LIMIT 1)
+         WHERE typeof(feature_count) = 'integer' AND feature_count >= 0
+           AND (SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND lower(tbl_name) = lower(?1) AND lower(name) IN
+                (lower('trigger_insert_feature_count_' || ?1), lower('trigger_delete_feature_count_' || ?1))) = 2",
+        [table],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
 fn feature_tables(conn: &Connection) -> Result<Vec<String>> {
     if !has_geometry_columns(conn)? {
         if !has_table(conn, "gpkg_contents")? {
@@ -164,6 +193,12 @@ fn feature_tables(conn: &Connection) -> Result<Vec<String>> {
 }
 
 impl GpkgSource {
+    /// The total a scan of the table counts its progress against: none (unknown) for a kept count
+    /// (`count_kept`), which may be past the rows.
+    fn progress_total(&self) -> usize {
+        self.info.count.filter(|_| !self.count_kept).and_then(|n| usize::try_from(n).ok()).unwrap_or(0)
+    }
+
     pub fn open(path: &Path, layer: Option<&str>) -> Result<Self> {
         // The identity is taken before the database is opened: a file put in its place after
         // this leaves it describing the file opened, which a traversal then refuses to swap.
@@ -196,7 +231,7 @@ impl GpkgSource {
                 .ok_or_else(|| DataError::Format(format!("no feature table '{l}' (tables: {})", tables.join(", "))))?,
             None => tables.first().cloned().ok_or_else(|| DataError::Format("the GeoPackage has no feature tables".into()))?,
         };
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         if layer.is_none() && tables.len() > 1 {
             notes.push(format!("the first of {} feature tables ({})", tables.len(), tables.join(", ")));
         }
@@ -280,17 +315,25 @@ impl GpkgSource {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .ok();
-        // Rows; with Z or M declared for every geometry, also the rows with one (what the note on
-        // them counts), in the same scan. Counting geometries reads every blob, so only then.
+        // Rows: the count GDAL keeps ([`kept_count`]), so a large table isn't scanned to count it
+        // (#2849), else counted. With Z or M declared for every geometry, also the rows with one
+        // (what the note on them counts), in the same scan. Counting geometries reads every blob,
+        // so only then.
         let mandatory = zm.is_some_and(|(z, m)| z == 1 || m == 1);
         let counted = if mandatory { format!("COUNT({})", quote(&geom)) } else { "0".into() };
-        let counts = conn
-            .query_row(&format!("SELECT COUNT(*), {counted} FROM {}", quote(&table)), [], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })
-            .ok();
+        let kept = if mandatory { None } else { kept_count(&conn, &table) };
+        // The rows, and the geometries when `mandatory`.
+        let counts: Option<(i64, Option<i64>)> = match kept {
+            Some(n) => Some((n, None)),
+            None => conn
+                .query_row(&format!("SELECT COUNT(*), {counted} FROM {}", quote(&table)), [], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+                })
+                .ok()
+                .map(|(n, g)| (n, mandatory.then_some(g))),
+        };
         let count = counts.and_then(|(n, _)| u64::try_from(n).ok());
-        let geometries = counts.filter(|_| mandatory).and_then(|(_, g)| u64::try_from(g).ok());
+        let geometries = counts.and_then(|(_, g)| g).and_then(|g| u64::try_from(g).ok());
         let geometry_type = match geom_type.to_ascii_uppercase().as_str() {
             "POINT" | "MULTIPOINT" => GeometryType::Point,
             "LINESTRING" | "MULTILINESTRING" | "CURVE" | "MULTICURVE" => GeometryType::Polyline,
@@ -308,11 +351,22 @@ impl GpkgSource {
             // (`SourceInfo::coordinate_system`), as a Shapefile's .prj does (#1476).
             crs: reproject.info_crs(),
             indexed: rtree.is_some(),
-            notes: notes.into(),
+            notes,
             zm_dropped: false,
         };
         let file = Some((path.to_path_buf(), id));
-        let mut src = GpkgSource { info, conn: Mutex::new(Some(conn)), table, geom, pk, rtree, reproject, temp: None, file };
+        let mut src = GpkgSource {
+            info,
+            conn: Mutex::new(Some(conn)),
+            table,
+            geom,
+            pk,
+            rtree,
+            reproject,
+            temp: None,
+            file,
+            count_kept: kept.is_some(),
+        };
         if src.info.geometry_type == GeometryType::None {
             src.info.geometry_type = src.peek_kind();
         }
@@ -412,8 +466,8 @@ impl GpkgSource {
         {
             return Ok(Row::Skip);
         }
-        let Some(placed) = wkb::decode(body).and_then(|g| self.reproject.read(g)) else { return Ok(Row::Bad) };
-        if !placed.in_request(req) {
+        let Some(placed) = wkb::decode(body).and_then(|g| self.reproject.place(g, req)) else { return Ok(Row::Bad) };
+        if !placed.inside {
             return Ok(Row::Skip);
         }
         Ok(Row::Feature(Feature { id, geometry: Some(placed.geometry), attrs: attrs() }))
@@ -433,6 +487,10 @@ impl FeatureSource for GpkgSource {
         &self.info
     }
 
+    fn reads_own_box(&self) -> bool {
+        true
+    }
+
     /// Its own system, in which it gives its features as the file holds them.
     fn coord_crs(&self) -> crate::raster::Crs {
         self.reproject.crs()
@@ -450,7 +508,7 @@ impl FeatureSource for GpkgSource {
         let limit = clamp_limit(req.limit);
         let guard = self.conn.lock().map_err(|_| DataError::Format("GeoPackage connection poisoned".into()))?;
         let conn = guard.as_ref().ok_or_else(|| DataError::Format("GeoPackage connection closed".into()))?;
-        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        let native = self.reproject.request_box(req);
         // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
         if limit == 0 && req.extent.is_some() && native.is_none() {
             return Err(super::unbounded_count());
@@ -502,10 +560,14 @@ impl FeatureSource for GpkgSource {
                 let sql = format!("SELECT {} FROM {}", self.select_list(), quote(&self.table));
                 let mut st = conn.prepare(&sql).map_err(err)?;
                 let mut rows = st.query([]).map_err(err)?;
-                // A whole read knows its count; an extent, bounded natively or not, is matched as it goes.
-                let mut sample =
-                    if req.extent.is_none() { Sampler::with_total(limit, self.info.count.unwrap_or(0)) } else { Sampler::new(limit) };
-                crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
+                // A whole read knows its count, unless the file's own; an extent, bounded natively
+                // or not, is matched as it goes.
+                let mut sample = if req.extent.is_none() && !self.count_kept {
+                    Sampler::with_total(limit, self.info.count.unwrap_or(0))
+                } else {
+                    Sampler::new(limit)
+                };
+                crate::progress::begin(self.progress_total());
                 while let Some(r) = rows.next().map_err(err)? {
                     crate::progress::step(1)?;
                     // With an extent, the envelope in the geometry's header says whether the row
@@ -566,13 +628,13 @@ impl FeatureSource for GpkgSource {
         // An upload's SQLite copy is generated; its bytes were supplied by the caller.
         let conn = if self.temp.is_some() { crate::provenance::without(|| open_db(path)) } else { open_db(path) }?;
         same_file()?;
-        let req = Request { extent, limit: usize::MAX };
+        let req = Request { extent, limit: usize::MAX, own: None };
         let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let sql = format!("SELECT {} FROM {}", self.select_list(), quote(&self.table));
         let mut st = conn.prepare(&sql).map_err(err)?;
         let mut rows = st.query([]).map_err(err)?;
         let mut out = Batch { complete: true, ..Batch::default() };
-        crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
+        crate::progress::begin(self.progress_total());
         while let Some(r) = rows.next().map_err(err)? {
             crate::progress::step(1)?;
             match self.feature(r, native.as_ref(), &req, &mut out.unread_dates, &mut out.rounded_dates).map_err(err)? {
@@ -751,6 +813,7 @@ fn fill(
     feed: &mut dyn FnMut(&mut dyn FnMut(&[crate::Feature]) -> Result<()>) -> Result<()>,
 ) -> Result<std::result::Result<(Layout, Extent), Redo>> {
     let (mut layout, mut extent, mut redo) = (None, Extent::EMPTY, None);
+    let mut boxes = Vec::new();
     let fed = feed(&mut |features| {
         if layout.is_none() {
             let multi = multi_points.unwrap_or_else(|| features.iter().any(|f| matches!(f.geometry, Some(crate::Geometry::MultiPoint(_)))));
@@ -760,7 +823,7 @@ fn fill(
         for g in features.iter().filter_map(|f| f.geometry.as_ref()) {
             extent = extent.union(&g.extent());
         }
-        redo = insert(conn, l, features, keep_ids)?;
+        redo = insert(conn, l, features, keep_ids, &mut boxes)?;
         match redo {
             // Stops the traversal; the export starts again.
             Some(_) => Err(DataError::Format("GeoPackage: starting again".into())),
@@ -775,6 +838,7 @@ fn fill(
                 Some(l) => l,
                 None => make(multi_points.unwrap_or(false), mixed)?,
             };
+            fill_index(conn, &layout, &mut boxes)?;
             Ok(Ok((layout, extent)))
         }
     }
@@ -851,9 +915,11 @@ fn build(conn: &Connection, ds: &crate::Dataset, name: &str, crs: Crs, pinned: O
     let keep_ids = ds.features.iter().all(|f| i64::try_from(f.id).is_ok() && seen.insert(f.id));
     // The table is made for the whole layer, so nothing should need doing again; should a
     // feature not fit after all, the export fails rather than leave it out.
-    if insert(conn, &layout, &ds.features, keep_ids)?.is_some() {
+    let mut boxes = Vec::new();
+    if insert(conn, &layout, &ds.features, keep_ids, &mut boxes)?.is_some() {
         return Err(DataError::Format("GeoPackage: a feature doesn't fit the table chosen for the layer".into()));
     }
+    fill_index(conn, &layout, &mut boxes)?;
     finish(conn, &layout, ds.extent(), pinned)?;
     Ok(layout.table)
 }
@@ -1030,23 +1096,28 @@ enum Redo {
     Renumber,
 }
 
-/// Inserts features into the table [`create`] made, and their boxes into its spatial index.
-/// With `keep_ids` each keeps its id; otherwise SQLite numbers it. Stops at the first feature
-/// the table as made can't hold as the whole layer would have it (a multipoint in a POINT
-/// table, geometry of another kind, an id that doesn't fit or is taken), saying what to
-/// [`Redo`].
-fn insert(conn: &Connection, layout: &Layout, features: &[crate::Feature], keep_ids: bool) -> Result<Option<Redo>> {
+/// Inserts features into the table [`create`] made, and puts the box of each one with a place in
+/// `boxes` for [`fill_index`] to load, loading them whenever [`INDEX_BATCH`] are waiting; the
+/// caller loads the rest at the end. With `keep_ids` each keeps its id;
+/// otherwise SQLite numbers it. Stops at the first feature the table as made can't hold as the
+/// whole layer would have it (a multipoint in a POINT table, geometry of another kind, an id
+/// that doesn't fit or is taken), saying what to [`Redo`].
+fn insert(
+    conn: &Connection,
+    layout: &Layout,
+    features: &[crate::Feature],
+    keep_ids: bool,
+    boxes: &mut Vec<IndexBox>,
+) -> Result<Option<Redo>> {
     use rusqlite::types::Value as Sql;
-    let Layout { columns, fields, has_geom, multi_points, srs_id, table_q: t, geom_q: g, fid_q: i, rtree_q: rt, .. } = layout;
+    let Layout { columns, fields, has_geom, multi_points, srs_id, table_q: t, geom_q: g, fid_q: i, .. } = layout;
     let (has_geom, multi_points, srs_id) = (*has_geom, *multi_points, *srs_id);
     let names: Vec<String> =
         std::iter::once(i.clone()).chain(has_geom.then(|| g.clone())).chain(columns.iter().map(|c| quote(c))).collect();
     let marks = vec!["?"; names.len()].join(", ");
     let mut st = conn.prepare_cached(&format!("INSERT INTO {t} ({}) VALUES ({marks})", names.join(", "))).map_err(err)?;
-    // The spatial index is filled here; its triggers (which call functions only GeoPackage
-    // software defines) are created after.
-    let mut index =
-        if has_geom { Some(conn.prepare_cached(&format!("INSERT INTO {rt} VALUES (?1, ?2, ?3, ?4, ?5)")).map_err(err)?) } else { None };
+    // The spatial index is filled after the rows ([`fill_index`]); its triggers (which call
+    // functions only GeoPackage software defines) are created after that.
     for f in features {
         crate::progress::step(1)?;
         if has_geom && !layout.mixed && other_kind(f, layout.kind) {
@@ -1080,11 +1151,98 @@ fn insert(conn: &Connection, layout: &Layout, features: &[crate::Feature], keep_
             Err(e) => return Err(err(e)),
         }
         let e = f.geometry.as_ref().map(|x| x.extent()).unwrap_or(Extent::EMPTY);
-        if let (Some(ix), false) = (index.as_mut(), e.is_empty()) {
-            ix.execute(rusqlite::params![conn.last_insert_rowid(), e.min_x, e.max_x, e.min_y, e.max_y]).map_err(err)?;
+        if has_geom && !e.is_empty() {
+            boxes.push(IndexBox { key: 0, id: conn.last_insert_rowid(), bounds: [e.min_x, e.max_x, e.min_y, e.max_y] });
+            // Loaded the moment a batch fills, so `boxes` never grows past one batch and a
+            // streamed export batches exactly as a whole-layer one does.
+            if boxes.len() == INDEX_BATCH {
+                fill_index(conn, layout, boxes)?;
+            }
         }
     }
     Ok(None)
+}
+
+/// A feature's box waiting to go into the spatial index, with its place along the Hilbert curve
+/// (`key`, 0 until [`fill_index`] works it out from the whole batch's extent).
+/// It holds 48 bytes per feature that has a place, until [`fill_index`] loads it.
+struct IndexBox {
+    key: u64,
+    id: i64,
+    /// `[min_x, max_x, min_y, max_y]`, the order of the index's columns.
+    bounds: [f64; 4],
+}
+
+/// How many boxes [`fill_index`] loads between looks at Cancel.
+const INDEX_CHECK_EVERY: usize = 8192;
+
+/// How many boxes an export keeps before it loads them (96 MB at 48 bytes each), so a layer of
+/// any size needs no more; a layer of fewer features is loaded in one go at the end.
+/// Each load is in Hilbert order within itself.
+/// (1,000 in this crate's tests, so they reach a second load.)
+const INDEX_BATCH: usize = if cfg!(test) { 1000 } else { 1 << 21 };
+
+/// The distance along a Hilbert curve of 2^16 by 2^16 cells at which the cell `(x, y)` lies.
+fn hilbert(mut x: u32, mut y: u32) -> u64 {
+    const SIDE: u32 = 1 << 16;
+    let mut d = 0u64;
+    let mut s = SIDE >> 1;
+    while s > 0 {
+        let (rx, ry) = (u32::from(x & s != 0), u32::from(y & s != 0));
+        d += u64::from(s) * u64::from(s) * u64::from((3 * rx) ^ ry);
+        if ry == 0 {
+            if rx == 1 {
+                x = SIDE - 1 - x;
+                y = SIDE - 1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        s >>= 1;
+    }
+    d
+}
+
+/// Fills the table's spatial index with `boxes`, one entry for each, in Hilbert order of their
+/// centres. SQLite's R-tree picks a leaf for each entry by walking down from the root, which costs
+/// far more when consecutive entries lie all over the map than when neighbours arrive together.
+/// Ties fall back to the row id, so the same layer gives the same file each time. Empties `boxes`.
+/// Looks at Cancel as it goes, but not within one SQLite insert, nor while it works out the
+/// Hilbert places and sorts them (one pass and one sort over at most [`INDEX_BATCH`] boxes).
+fn fill_index(conn: &Connection, layout: &Layout, boxes: &mut Vec<IndexBox>) -> Result<()> {
+    if !layout.has_geom || boxes.is_empty() {
+        return Ok(());
+    }
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for b in boxes.iter() {
+        for (axis, (a, z)) in [(0, 1), (2, 3)].into_iter().enumerate() {
+            let centre = (b.bounds[a] + b.bounds[z]) / 2.0;
+            if centre.is_finite() {
+                lo[axis] = lo[axis].min(centre);
+                hi[axis] = hi[axis].max(centre);
+            }
+        }
+    }
+    let cell = |v: f64, axis: usize| {
+        let span = hi[axis] - lo[axis];
+        // A NaN or an empty span lands in the first cell.
+        if span > 0.0 { (((v - lo[axis]) / span) * 65535.0).clamp(0.0, 65535.0) as u32 } else { 0 }
+    };
+    for b in boxes.iter_mut() {
+        let [x0, x1, y0, y1] = b.bounds;
+        b.key = hilbert(cell((x0 + x1) / 2.0, 0), cell((y0 + y1) / 2.0, 1));
+    }
+    crate::progress::check()?;
+    boxes.sort_unstable_by_key(|b| (b.key, b.id));
+    let mut index = conn.prepare_cached(&format!("INSERT INTO {} VALUES (?1, ?2, ?3, ?4, ?5)", layout.rtree_q)).map_err(err)?;
+    for (n, b) in boxes.iter().enumerate() {
+        if n % INDEX_CHECK_EVERY == 0 {
+            crate::progress::check()?;
+        }
+        let [min_x, max_x, min_y, max_y] = b.bounds;
+        index.execute(rusqlite::params![b.id, min_x, max_x, min_y, max_y]).map_err(err)?;
+    }
+    boxes.clear();
+    Ok(())
 }
 
 /// [`register`]s the table, in a new file, and commits.

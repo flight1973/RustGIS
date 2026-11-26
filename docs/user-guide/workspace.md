@@ -38,10 +38,17 @@ longitude/latitude are saved as before and don't need it.
 command line. A package opens as a new, unsaved project; Save writes a plain `.rgis` file.
 Opening or creating a project clears undo history; saving does not.
 
+A project, package, template, map, layer or style file, or a field package brought back, received
+from the internet reaches only the internet: one opened by its web address (`?project=`), or given
+as text by the AI Assistant, MCP or a plugin. An address it names on this computer or the local network isn't read. A file you
+open from your own disk reaches your own servers as before. Either way, opening a file that names
+such addresses says how many, and names the first three. One that something received from the
+internet named earlier in the session stays held, and the notice says so.
+
 This version already reads format 2, a newer `.rgis` format
 ([#1853](https://github.com/opengeos/RustGIS/issues/1853)), when the file needs nothing this
-version lacks, and saves it in the format it writes today. A project, package, template, map or
-layer file that needs something this version can't read (what it lists under `requires`) is
+version lacks, and saves it in the format it writes today. A project, package, template, map,
+layer or layout file that needs something this version can't read (what it lists under `requires`) is
 refused, naming what it needs, rather than opened without it; one of a newer format still asks
 you to update RustGIS.
 
@@ -223,6 +230,8 @@ An absolute data path is tried first, then its filename under `dir` (the project
 default). A desktop project may reference files outside that folder; import projects you trust
 to select those files. Browser imports can use inline GeoJSON and web addresses; local paths need desktop.
 A web app link such as `?project=https://example.org/watershed.geolibre` imports the same map.
+A GeoLibre project read from the internet (by `url`, a link, or JSON the AI Assistant, MCP or a
+plugin gives) reaches only the internet, as other [received projects](#projects) do.
 This startup link takes precedence over other data/style links so download timing cannot change
 which map receives them.
 
@@ -337,8 +346,8 @@ Each layer keeps its look:
   lines as strokes of markers or hash marks, at their places (intervals, vertices, the ends, the
   middle), turned with the line, their markers' offsets and angles kept; font markers as
   characters of their font, on points and along lines; raster image markers as
-  [image markers](cartography.md#symbology) of their PNG, JPEG or SVG (embedded in the file, or a file
-  of their own, relative to the project's folder or, in a style, to the style's), on points
+  [image markers](cartography.md#symbology) of their PNG, JPEG or SVG (embedded in the file, or a
+  file of their own, relative to the project's folder or, in a style, to the style's), on points
   (anchored where QGIS anchors them) and along lines; a marker symbol of several layers, or one
   shifted, turned or anchored off its centre, as a point's marks; a marker angle taken from a
   field (`"field"` or `- "field"`) as the layer's rotation field; a fill symbol of several layers
@@ -423,7 +432,7 @@ holding `NULL`, which QGIS takes as unknown and RustGIS skips. What RustGIS does
 near as it can, or left out, and said: the import's notes list, layer by layer, what was
 approximated (vector tile styles, text matched ignoring letter case, a memory layer's fields of kinds RustGIS hasn't as text, gradient and shapeburst fills' offsets left out and colour ramps other than gradients drawn from their first colour to their last, SVG, raster and random fills and dense brushes as a tint of their colour, SVG markers as circles,
 raster image markers whose image RustGIS can't use as circles (one at a web address, which it
-doesn't fetch, or kept inside a `.qgz`; a file that doesn't open or isn't a PNG, JPEG or SVG; one past
+doesn't fetch, on a network share (`\\host\share`, `file://host/share`), a relative name with `://` in it, or kept inside a `.qgz`; one a field or an expression gives, which RustGIS doesn't evaluate; a file that doesn't open or isn't a PNG, JPEG or SVG; one past
 2 MiB of base64, 2048 × 2048 pixels or as much to draw, an SVG with filters, text, images, animation or links to other files, the images it keeps or the pixels or memory of marker images it decodes
 until it restarts), those of a fixed aspect ratio in their image's own,
 see-through ones opaque and those anchored off their centre along lines centred,
@@ -474,8 +483,15 @@ such as **Tools**, **Symbology**, **Labeling**, **Format** and **AI Assistant** 
 tabs: select a tab to bring it forward, or its × to close it. Right-click a tab to close it,
 the other panes or all panes; an overflow menu lists tabs that do not fit.
 
-Right-click a map or layout tab (or its entry in Browser) to **Rename**, **Duplicate** or
-**Delete** it. Deletion asks for confirmation; a project must keep at least one map.
+Right-click a map or layout tab (or its entry in Browser) to **Rename**, **Duplicate**,
+**Move Up**, **Move Down** or **Delete** it. Deletion asks for confirmation; a project must keep
+at least one map. Drag a map or layout tab to another place to change the order of the maps or
+the layouts (maps stay before layouts); near the ends of a strip whose tabs don't all fit, the
+tabs scroll. In Browser, drag a map or layout up or down its list the same way; near the
+Browser's top or bottom, the list scrolls, the row you drag is filled, and a line across the list
+shows where it will land. The map or layout in view stays in view, each move is
+one undo step, and the order is saved with the project. From scripts: `map.move` and
+`layout.move`, with the name and the new place (`"to"`: 0 for the first).
 
 Click **Command Search** at the right of the title bar or on the Help tab, or press ++ctrl+k++
 (++cmd+k++ on macOS). Search by command name, ID or ribbon location; analysis tools, workflow

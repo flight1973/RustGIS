@@ -15,6 +15,15 @@ use std::sync::{Arc, Mutex};
 /// it: long enough for the keyboard to finish closing.
 const KEYBOARD_SETTLES: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// The memory the limits plan with where a phone's system doesn't say what it allows: 1.5 GiB,
+/// what a small phone can give an app.
+pub const MEMORY_UNSAID: u64 = 1536 << 20;
+
+/// Says, in the window, that the limits plan with [`MEMORY_UNSAID`].
+pub fn say_memory_unsaid(app: &mut RustGisApp) {
+    app.session.warn(tl!("This device didn't say how much memory RustGIS may use, so its limits plan for 1.5 GiB."));
+}
+
 /// What the shell asks of a phone beyond [`Platform`].
 pub trait Phone: Platform {
     /// The room the system's bars, a camera cutout and the soft keyboard take at the window's
@@ -34,6 +43,13 @@ pub trait Phone: Platform {
     /// is for a phone that can't tell.
     fn picking(&self) -> bool {
         self.busy()
+    }
+
+    /// How often (milliseconds) a window with nothing else to look for looks again, for a phone
+    /// that reports only when asked and can't wake the window (Android's memory). `None`, the
+    /// default: the phone wakes it.
+    fn idle_look(&self) -> Option<u64> {
+        None
     }
 
     /// Whether the soft keyboard's Return was pressed since the last frame, where the system
@@ -182,7 +198,11 @@ impl<P: Phone> App<P> {
         }
         for event in events {
             match event {
-                Event::Picked { purpose, name, path } => {
+                Event::Picked { purpose, name, path, document } => {
+                    // A project the phone may write back to: Save writes there once it is open.
+                    if let Some(document) = document.filter(|_| purpose == "project") {
+                        self.app.picked_document(path.clone(), document);
+                    }
                     // A file answers its own request; one of an earlier request (still being
                     // copied when another was asked for) leaves the later one waiting.
                     self.asked.borrow_mut().picked(&purpose);
@@ -203,7 +223,25 @@ impl<P: Phone> App<P> {
                     self.app.photos.push(path);
                 }
                 Event::Saved { name } => self.app.session.notify(i18n::fmt("Saved {name}.", &[("name", &name)]), false),
+                Event::ProjectDocument(document) => self.app.project_document(document),
                 Event::ProjectSave(result) => self.app.complete_project_save(result),
+                Event::WriteBackFailed { name, reason, kept } => {
+                    // Save again only helps while the project saved is the one open.
+                    let open = self.app.saving_the_open_project();
+                    let damaged = kept.is_some();
+                    let text = write_back_failure(&name, &reason, kept.as_deref(), open);
+                    // Turned down while busy with another file: the document wasn't touched.
+                    if reason == "code:busy" {
+                        self.app.project_save_refused(text);
+                    } else {
+                        self.app.complete_project_save(Err(text));
+                    }
+                    // The file may hold part of the project: what is open no longer matches any
+                    // saved file, so it counts as unsaved (and asks before it is closed).
+                    if damaged && open {
+                        self.app.session.mark_unsaved();
+                    }
+                }
                 Event::Position(fix) if self.locating => self.app.report_position(fix),
                 // A fix that was on its way when positioning was turned off.
                 Event::Position(_) => {}
@@ -214,6 +252,7 @@ impl<P: Phone> App<P> {
                     self.locating = false;
                     self.app.position = None;
                 }
+                Event::LowMemory => self.app.release_memory(),
                 Event::Failed(text) => self.app.session.notify(text, true),
             }
         }
@@ -276,7 +315,7 @@ impl<P: Phone> App<P> {
         } else if self.locating {
             Some(1000)
         } else {
-            None
+            phone.idle_look()
         };
     }
 
@@ -457,6 +496,54 @@ fn answer_ended(inbox: &Inbox, purpose: Option<String>) {
     }
 }
 
+/// What the user is told when project `name` couldn't be written back: why ([`write_back_reason`]),
+/// whether the file was left as it was or may be damaged (the project as saved `kept` there), and,
+/// while the project is still `open`, that Save again asks where.
+fn write_back_failure(name: &str, reason: &str, kept: Option<&Path>, open: bool) -> String {
+    // Turned down while busy: nothing was touched, and Save writes back there once it is done.
+    if reason == "code:busy" {
+        let text = if open {
+            "{name} wasn't saved: another file is being chosen or saved. Save again once it is done."
+        } else {
+            "{name} wasn't saved: another file is being chosen or saved."
+        };
+        return i18n::fmt(text, &[("name", name)]);
+    }
+    let reason = write_back_reason(reason);
+    match (kept, open) {
+        (None, true) => i18n::fmt(
+            "{name} wasn't saved where it was opened from: {reason}. The file wasn't changed: Save again to choose where to save it.",
+            &[("name", name), ("reason", &reason)],
+        ),
+        (None, false) => i18n::fmt(
+            "{name} wasn't saved where it was opened from: {reason}. The file wasn't changed.",
+            &[("name", name), ("reason", &reason)],
+        ),
+        (Some(kept), true) => i18n::fmt(
+            "{name} may be damaged where it was opened from: {reason}. The project is still open: Save again to choose where to save it. A copy of it as saved is kept at {kept}.",
+            &[("name", name), ("reason", &reason), ("kept", &kept.display().to_string())],
+        ),
+        (Some(kept), false) => i18n::fmt(
+            "{name} may be damaged where it was opened from: {reason}. A copy of it as saved is kept at {kept}.",
+            &[("name", name), ("reason", &reason), ("kept", &kept.display().to_string())],
+        ),
+    }
+}
+
+/// Why a project couldn't be written back, in the user's language: the app's codes for its own
+/// reasons (`DocumentWrite.java`), or the system's text as it gave it.
+fn write_back_reason(reason: &str) -> String {
+    match reason {
+        "code:busy" => tl!("another file is being chosen or saved").to_string(),
+        "code:storage" => tl!("the app's storage can't be written to").to_string(),
+        "code:unwritable" => tl!("the file can't be written to").to_string(),
+        "code:stalled" => tl!("the file took no more bytes").to_string(),
+        "code:short" => tl!("the file doesn't hold all of the project after writing it").to_string(),
+        "code:unfinished" => tl!("the app ended before it was written").to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Gives the front end the phone's file picker, the way the browser's shell gives its own:
 /// Open and Add Data ask through `open_async`, and what is saved or exported is offered
 /// through `download`.
@@ -508,7 +595,10 @@ fn use_picker<P: Phone + 'static>(
     let saver = phone.clone();
     app.services.download = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes, false)));
     let saver = phone.clone();
-    app.services.save_project = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes, true)));
+    app.services.save_project = Some(Box::new(move |name: &str, bytes: Vec<u8>, document: Option<&str>| match document {
+        Some(document) => saver.write_back(document, name, bytes),
+        None => saver.save_file(name, bytes, true),
+    }));
     app.services.inbox = Some(inbox.clone());
     let (camera, photographing) = (phone.clone(), asked.clone());
     app.services.take_photo = Some(Box::new(move || {
@@ -555,7 +645,7 @@ impl<P: Phone> eframe::App for App<P> {
         }
         // Something of the phone's is still to arrive (a picked file, a position): look again.
         // A picker or a save asked for in this frame counts too: the poll was set before it.
-        if self.poll.is_none() && self.phone.as_ref().is_some_and(|phone| phone.busy()) {
+        if self.poll.is_none_or(|wait| wait > 250) && self.phone.as_ref().is_some_and(|phone| phone.busy()) {
             self.poll = Some(250);
         }
         if let Some(wait) = self.poll {
@@ -782,8 +872,9 @@ mod tests {
     use serde_json::{Value, json};
     use std::cell::Cell;
 
+    /// A phone that is busy once asked for a file, and reports the events put in it.
     #[derive(Default)]
-    struct FakePhone(Cell<bool>);
+    struct FakePhone(Cell<bool>, RefCell<Vec<Event>>);
     impl Platform for FakePhone {
         fn pick_files(&self, _: &str) -> Result<(), String> {
             self.0.set(true);
@@ -802,7 +893,7 @@ mod tests {
             Ok(())
         }
         fn take_events(&self) -> Vec<Event> {
-            Vec::new()
+            self.1.take()
         }
     }
     impl Phone for FakePhone {
@@ -813,6 +904,56 @@ mod tests {
         fn busy(&self) -> bool {
             self.0.get()
         }
+        fn idle_look(&self) -> Option<u64> {
+            Some(5000)
+        }
+    }
+
+    /// The phone's low-memory warnings reach the front end: the tile cache and the drawing copy
+    /// of a layer switched off go (a drawn layer's stays), it is said once however often it
+    /// comes, and an idle window looks again as often as the phone asks.
+    #[test]
+    fn a_low_memory_warning_drops_caches_and_is_said_once() {
+        use rustgis_engine::render::rustgis_tiles::cache;
+
+        let mut app = RustGisApp::with_sample();
+        let layers = &mut app.session.map_mut().layers;
+        assert!(layers.len() >= 2);
+        layers[0].visible = false;
+        layers[1].visible = true;
+        for layer in layers.iter_mut().take(2) {
+            layer.projected();
+            assert!(layer.is_cached("mercator"));
+        }
+        let (clears, mark) = (cache::clears(), app.session.notice_mark());
+        let phone = Rc::new(FakePhone::default());
+        phone.1.borrow_mut().extend([Event::LowMemory, Event::LowMemory]);
+        let mut window = App {
+            app,
+            pushed: Vec::new(),
+            poll: None,
+            locating: false,
+            keeping: false,
+            keyboard: None,
+            typing: None,
+            bars_light: None,
+            phone: Some(phone),
+            inbox: Inbox::default(),
+            refusals: Refusals::default(),
+            asked: Asked::default(),
+            kept: Rc::default(),
+            refused_picker: Rc::default(),
+            waiting: Vec::new(),
+            problems: Problems::default(),
+            reading: Arc::default(),
+        };
+        window.take_phone_events(&egui::Context::default(), &mut egui::RawInput::default());
+        assert!(cache::clears() > clears);
+        let layers = &window.app.session.map().layers;
+        assert_eq!([layers[0].is_cached("mercator"), layers[1].is_cached("mercator")], [false, true]);
+        let said = window.app.session.notices_since(mark).iter().filter(|n| n.text.contains("low on memory")).count();
+        assert_eq!(said, 1);
+        assert_eq!(window.poll, Some(5000));
     }
 
     #[test]
@@ -837,6 +978,38 @@ mod tests {
         (app.services.open_async.as_ref().unwrap())("marker:9");
         assert_eq!(inbox.lock().unwrap().last().unwrap().0, format!("{}9:", rustgis_ui_egui::MARKER_PICK));
     }
+    /// A failed write-back says whether the file was changed, and offers Save again only while the
+    /// project saved is still open; the app's own reasons are worded, the system's passed on.
+    #[test]
+    fn a_failed_write_back_is_worded_by_what_happened() {
+        let kept = Path::new("/data/saved/1/site.rgis");
+        let said = |kept: Option<&Path>, open| write_back_failure("site.rgis", "code:unwritable", kept, open);
+        assert_eq!(
+            said(None, true),
+            "site.rgis wasn't saved where it was opened from: the file can't be written to. The file wasn't changed: Save again to choose where to save it."
+        );
+        assert!(said(None, false).ends_with("The file wasn't changed.") && !said(None, false).contains("Save again"));
+        assert!(said(Some(kept), true).contains("may be damaged") && said(Some(kept), true).contains("Save again"));
+        assert!(said(Some(kept), true).ends_with("kept at /data/saved/1/site.rgis."));
+        assert!(said(Some(kept), false).contains("may be damaged") && !said(Some(kept), false).contains("Save again"));
+        let busy = write_back_failure("site.rgis", "code:busy", None, true);
+        assert_eq!(busy, "site.rgis wasn't saved: another file is being chosen or saved. Save again once it is done.");
+        assert_eq!(
+            write_back_failure("site.rgis", "code:busy", None, false),
+            "site.rgis wasn't saved: another file is being chosen or saved."
+        );
+        for (code, worded) in [
+            ("code:busy", "another file is being chosen or saved"),
+            ("code:storage", "the app's storage can't be written to"),
+            ("code:stalled", "the file took no more bytes"),
+            ("code:short", "the file doesn't hold all of the project after writing it"),
+            ("code:unfinished", "the app ended before it was written"),
+            ("Permission denied", "Permission denied"),
+        ] {
+            assert_eq!(write_back_reason(code), worded);
+        }
+    }
+
     #[test]
     fn a_worker_refused_before_reading_retires_its_dxf_answer() {
         let inbox = Inbox::default();

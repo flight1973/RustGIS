@@ -10,7 +10,10 @@ use std::sync::Arc;
 use egui::collapsing_header::CollapsingState;
 use egui::{Label, RichText, Sense, Ui};
 use rustgis_engine::connections::{Connection, DATABASE_KINDS};
-use rustgis_engine::render::rustgis_tiles::{address::Origin, cache, stac};
+use rustgis_engine::render::rustgis_tiles::{
+    address::{Origin, Reach},
+    cache, stac,
+};
 use rustgis_engine::sources::Source;
 use serde_json::{Value, json};
 
@@ -212,6 +215,12 @@ fn listing(v: &Value, first: Option<String>, documents: Vec<Value>) -> Listing {
 /// An answer arrived: asks again with it (and what came before). A service's discovery may need
 /// further documents, which are fetched in turn.
 fn advance(app: &mut RustGisApp, id: &str, mut f: Fetch, fetched: cache::Fetched) -> Entry {
+    // A document read from the internet is recorded so, as Add From Service's fetch records it:
+    // the service's discovery, which reads the answer by its address, then holds what it links to
+    // and the layers it lists there.
+    if fetched.origin.reach() == Reach::Public {
+        cache::restrict_to_public(&f.pending);
+    }
     let Ok(text) = crate::service_text(fetched.bytes) else {
         return Entry::Failed(tl!("The answer isn't UTF-8 text").to_string());
     };
@@ -423,6 +432,7 @@ fn what_label(what: &str) -> &'static str {
         "schema" => tl!("schema"),
         "table" => tl!("table"),
         "folder" => tl!("folder"),
+        "dataset" => tl!("feature dataset"),
         "service" => tl!("service"),
         "map" => tl!("map"),
         "vectorTiles" => tl!("vector tiles"),
@@ -439,6 +449,41 @@ fn what_label(what: &str) -> &'static str {
         "prefix" => tl!("folder"),
         "object" => tl!("file"),
         _ => "",
+    }
+}
+
+/// The icon a row of an enterprise geodatabase has: a feature class its kind of geometry's, a
+/// registered table and a feature dataset theirs. Other connections' rows have none.
+fn row_icon(child: &Value) -> Option<&'static str> {
+    if child["what"] == "dataset" {
+        return Some("catalog");
+    }
+    match child["item"].as_str()? {
+        "featureClass" => match child["geometry"].as_str()? {
+            "points" => Some("point_layer"),
+            "lines" => Some("line_layer"),
+            "polygons" => Some("polygon_layer"),
+            _ => None,
+        },
+        "table" => Some("table"),
+        _ => None,
+    }
+}
+
+/// A row of an enterprise geodatabase: it has an icon's slot, painted or blank, so the names of
+/// rows with and without an icon line up.
+fn has_icon_slot(child: &Value) -> bool {
+    child["what"] == "dataset" || child.get("item").is_some()
+}
+
+/// Paints a row's icon ([`row_icon`]) at the start of the row, or leaves its slot blank.
+fn paint_row_icon(ui: &mut Ui, t: &Tokens, child: &Value) {
+    if !has_icon_slot(child) {
+        return;
+    }
+    let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 16.0), Sense::hover());
+    if let Some(icon) = row_icon(child) {
+        crate::icons::paint(ui.painter(), r, icon, t.icon, t.accent);
     }
 }
 
@@ -569,6 +614,7 @@ fn level(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, c: &Connection, node: &s
 fn branch(
     app: &mut RustGisApp,
     ui: &mut Ui,
+    t: &Tokens,
     c: &Connection,
     child: &Value,
     node: Option<&str>,
@@ -580,7 +626,14 @@ fn branch(
     let open = state.is_open();
     let (mut clicked, mut refreshed) = (false, false);
     let mut header = state.show_header(ui, |ui| {
-        ui.label(RichText::new(what_label(child["what"].as_str().unwrap_or(""))).small().weak());
+        // A folder that carries its own children and no node of its own is a group a listing
+        // made up (a geodatabase's Tables): its name says what it is. A service folder, which is
+        // read when opened, says "folder".
+        let what = child["what"].as_str().unwrap_or("");
+        paint_row_icon(ui, t, child);
+        if !(what == "folder" && node.is_none()) {
+            ui.label(RichText::new(what_label(what)).small().weak());
+        }
         let r = ui.add(Label::new(child["name"].as_str().unwrap_or("")).sense(Sense::click()));
         clicked = r.clicked();
         if node.is_some() {
@@ -604,11 +657,11 @@ fn branch(
 fn children(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, c: &Connection, listing: &Listing, list: &[Value]) {
     for child in list {
         if let Some(node) = child["node"].as_str() {
-            branch(app, ui, c, child, Some(node), |app, ui| level(app, ui, t, c, node));
+            branch(app, ui, t, c, child, Some(node), |app, ui| level(app, ui, t, c, node));
             continue;
         }
         if let Some(inline) = child["children"].as_array() {
-            branch(app, ui, c, child, None, |app, ui| {
+            branch(app, ui, t, c, child, None, |app, ui| {
                 children(app, ui, t, c, listing, inline);
                 if inline.is_empty() {
                     ui.label(RichText::new(tl!("Nothing here")).small().weak());
@@ -616,16 +669,17 @@ fn children(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, c: &Connection, listi
             });
             continue;
         }
-        dataset(app, ui, c, listing, child);
+        dataset(app, ui, t, c, listing, child);
     }
 }
 
 /// A dataset: click selects it, double-click adds it, the menu adds it (with options).
-fn dataset(app: &mut RustGisApp, ui: &mut Ui, c: &Connection, listing: &Listing, child: &Value) {
+fn dataset(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, c: &Connection, listing: &Listing, child: &Value) {
     let name = child["name"].as_str().unwrap_or("");
     let is_picked = picked(app, &c.id, child["key"].as_str().unwrap_or(""));
     let r = ui
         .horizontal(|ui| {
+            paint_row_icon(ui, t, child);
             let r = ui.selectable_label(is_picked, name);
             ui.label(RichText::new(what_label(child["what"].as_str().unwrap_or(""))).small().weak());
             r
@@ -699,6 +753,29 @@ mod tests {
     use std::io::{Read, Write};
 
     type Harness = egui_kittest::Harness<'static, RustGisApp>;
+
+    /// A geodatabase's rows have icons: a feature class its kind of geometry's, a table and a
+    /// feature dataset theirs. Other rows keep none.
+    #[test]
+    fn geodatabase_rows_have_their_icons() {
+        let icon = |v: Value| row_icon(&v);
+        assert_eq!(icon(json!({"what": "table", "item": "featureClass", "geometry": "points"})), Some("point_layer"));
+        assert_eq!(icon(json!({"what": "table", "item": "featureClass", "geometry": "lines"})), Some("line_layer"));
+        assert_eq!(icon(json!({"what": "table", "item": "featureClass", "geometry": "polygons"})), Some("polygon_layer"));
+        assert_eq!(icon(json!({"what": "table", "item": "featureClass"})), None);
+        assert_eq!(icon(json!({"what": "table", "item": "table"})), Some("table"));
+        assert_eq!(icon(json!({"what": "dataset", "node": "dataset:V2F0ZXI"})), Some("catalog"));
+        assert_eq!(icon(json!({"what": "table", "detail": "MULTIPOLYGON"})), None);
+        assert_eq!(icon(json!({"what": "folder"})), None);
+        // A geodatabase's row with no icon keeps the slot, so its name lines up with the others;
+        // other connections' rows and the made-up groups have none.
+        let slot = |v: Value| has_icon_slot(&v);
+        assert!(slot(json!({"what": "table", "item": "featureClass", "geometry": null})));
+        assert!(slot(json!({"what": "table", "item": "other"})));
+        assert!(slot(json!({"what": "dataset", "node": "dataset:V2F0ZXI"})));
+        assert!(!slot(json!({"what": "table", "detail": "MULTIPOLYGON"})));
+        assert!(!slot(json!({"what": "folder"})));
+    }
 
     fn harness() -> Harness {
         egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 860.0)).with_max_steps(64).with_step_dt(0.05).build_ui_state(
@@ -1127,6 +1204,48 @@ mod tests {
         assert!(rustgis_engine::render::rustgis_tiles::logins::apply(&address).unwrap().is_none());
     }
 
+    /// A service connection's documents are recorded where they were read: one at a public-looking
+    /// name read from the internet has its link into the local network refused, naming it; read on
+    /// the local network, the link is followed.
+    #[test]
+    fn a_service_connections_documents_hold_their_links_where_they_were_read() {
+        for (n, observed) in [(1, Reach::Public), (2, Reach::Local)] {
+            let _turn = crate::fetching::turn();
+            let linked = format!("http://10.0.{n}.5/collections");
+            let landing = json!({"links":[{"rel":"data","type":"application/json","href":linked}]}).to_string();
+            let collections = json!({"collections":[]}).to_string();
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = asked.clone();
+            cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+                let clean = cache::split_download_limit(&url).0.to_string();
+                log.lock().unwrap().push((clean.clone(), ceiling));
+                let body = if clean.contains("10.0.") { &collections } else { &landing };
+                let origin = Origin::with_observed_reach(&clean, observed.min(ceiling)).unwrap();
+                done(Ok(cache::Fetched { bytes: body.clone().into_bytes(), origin }));
+            });
+            let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
+            let address = format!("https://tree-{n}.corp-looks-public.example/ogc");
+            let saved = app.run("connection.new", json!({"kind": "ogcapi", "address": address})).unwrap();
+            let c = app.session.connections.connections.iter().find(|c| c.id == saved["id"].as_str().unwrap()).unwrap().clone();
+            start(&mut app, &c, "");
+            for _ in 0..3 {
+                poll(&mut app, &egui::Context::default());
+            }
+            let asked = asked.lock().unwrap().clone();
+            let entry = app.ui.connection_tree.entries.get(&(c.id.clone(), String::new()));
+            if observed == Reach::Local {
+                assert!(asked.iter().any(|(u, r)| u.starts_with(&linked) && *r == Reach::Local), "{asked:?}");
+                assert!(matches!(entry, Some(Entry::Ready(_))), "the level was read");
+            } else {
+                assert!(!asked.iter().any(|(u, _)| u.starts_with(&linked)), "the link is not fetched: {asked:?}");
+                assert!(
+                    matches!(entry, Some(Entry::Failed(e)) if e.contains(&linked) && e.contains("local network")),
+                    "the refusal is said"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_tileset_step_names_its_layer_and_a_refused_one_is_not_recorded() {
         let _turn = crate::fetching::turn();
@@ -1134,6 +1253,9 @@ mod tests {
         let api = "https://x.org/collections";
         let tiled = r#"{"collections": [{"id": "relief", "links": [{"rel": "tilesets-map", "href": "https://x.org/relief/map/tiles"}]}]}"#;
         let opened = h.state().session.opened;
+        // The service's document was read from the internet (the dialog's fetch records it): a
+        // template into the local network is refused.
+        cache::restrict_to_public(api);
         let step = |fallback: &str, origin: Option<&str>| {
             let slot = Slot::default();
             *slot.lock().unwrap() = Some(Err("unreachable".to_string()));
