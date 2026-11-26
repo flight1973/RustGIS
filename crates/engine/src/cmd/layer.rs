@@ -7067,6 +7067,10 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     let i = s.downloaded.iter().position(|(d, _)| *d == id).ok_or("no such download (it was dropped when another project opened)")?;
     let (_, bytes) = s.downloaded.remove(i);
     let read_at = s.downloaded_reach.iter().position(|(d, _)| *d == id).map(|i| s.downloaded_reach.remove(i).1);
+    // A GeoLibre download is never an AIXM message: an effective date is refused, not dropped.
+    if ["geolibreProject", "geolibreLayer", "geolibreZarr"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null())) {
+        check_at(p, "a GeoLibre download", || false)?;
+    }
     if p.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
         if bytes.len() > rustgis_map::geolibre::MAX_TEXT {
             return Err("GeoLibre project exceeds 64 MiB".into());

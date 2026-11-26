@@ -2075,7 +2075,7 @@ fn rows_past_the_tables_memory_are_left_out_and_said() {
     let sparse = message(&(0..rows).map(|i| one(i, if i == 0 { &wide } else { "" })).collect::<String>());
     let narrow = message(&(0..rows).map(|i| one(i, "")).collect::<String>());
     let run = |bytes: &[u8], floor| {
-        let out = read_within("t.xml", bytes, &at("2026-01-15"), floor).unwrap();
+        let out = read_within("t.xml", bytes, &at("2026-01-15"), floor, usize::MAX).unwrap();
         (layer(&out, "t DesignatedPoint").features.len(), said(&out))
     };
     // Sparse and wide: what eight times the file allows, the rest said.
@@ -2418,4 +2418,12 @@ fn a_hole_across_180_degrees_is_inside_its_exterior() {
     let span = |r: &[Coord]| (r.iter().map(|c| c.x).fold(f64::MAX, f64::min), r.iter().map(|c| c.x).fold(f64::MIN, f64::max));
     let ((a, b), (c, d)) = (span(&p[0][0]), span(&p[0][1]));
     assert!(a <= c && d <= b, "{:?} {:?}", p[0][0], p[0][1]);
+}
+
+#[test]
+fn a_message_past_the_memory_the_computer_can_set_aside_is_refused_with_a_way_out() {
+    let opts = at("2026-01-15");
+    let e = read_within("donlon-aixm.xml", DONLON, &opts, 0, DONLON.len()).unwrap_err().to_string();
+    assert!(e.contains("takes about") && e.contains("read a smaller extract"), "{e}");
+    assert!(read_within("donlon-aixm.xml", DONLON, &opts, 0, DONLON.len() * HELD_PER_BYTE).is_ok());
 }

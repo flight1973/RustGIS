@@ -25889,6 +25889,15 @@ fn aixm_messages_are_added_at_the_date_asked() {
     assert!(e.contains("isn't one") && !e.contains("SECRET"), "{e}");
     let z = s.run("layer.addUrl", &json!({"url": "https://example.com/a.zip?token=SECRET", "at": "2026-01-15"})).unwrap_err();
     assert!(z.contains("unzip it") && !z.contains("SECRET"), "{z}");
+    // A GeoLibre download is never an AIXM message.
+    for key in ["geolibreProject", "geolibreLayer", "geolibreZarr"] {
+        let id = s.download_started();
+        assert!(s.download_landed(id, b"{}".to_vec()));
+        let mut q = json!({"id": id, "url": "https://example.test/project.json", "at": "2026-01-15"});
+        q[key] = json!(true);
+        let g = s.run("layer.addDownload", &q).unwrap_err();
+        assert!(g.contains("a GeoLibre download isn't one"), "{key}: {g}");
+    }
     // A window of a GeoTIFF, before it is read.
     let w = s.run("layer.addUrl", &json!({"url": "https://example.test/download", "bbox": [0, 0, 1, 1], "at": "2026-01-15"})).unwrap_err();
     assert!(w.contains("doesn't read at"), "{w}");

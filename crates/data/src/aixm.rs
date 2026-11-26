@@ -39,6 +39,9 @@
 //! row per part. Runways, runway directions and routes, which have no geometry of their own, are
 //! tables; other kinds with nothing to draw are counted.
 //!
+//! A read takes about twice the message's size in memory beside it; one past what the computer can
+//! set aside then ([`crate::memory::planned`]) is refused before it is read, saying so.
+//!
 //! The file is hostile: no DTD is read, members are parsed one at a time within the node and
 //! namespace limits every XML reader has, and the points arcs and geodesics add are bounded by the
 //! file's size.
@@ -2392,12 +2395,22 @@ struct FileNotes {
 /// several), at the effective date `opts.at` (today when not given). Cancel is looked at between
 /// members; finding them first is one pass over the text without a look.
 pub fn read(file_name: &str, bytes: &[u8], opts: &Options) -> Result<Vec<(Dataset, ReadReport)>> {
-    read_within(file_name, bytes, opts, MIN_ROW_BYTES * 4)
+    // What the read may hold beside the file: what this computer can set aside now (#2431).
+    let planned = crate::memory::planned(MIN_PLANNED, usize::MAX, 1);
+    read_within(file_name, bytes, opts, MIN_ROW_BYTES * 4, planned)
 }
+
+/// The least a read plans for, whatever the computer: a small message always reads.
+const MIN_PLANNED: usize = 256 << 20;
+
+/// What a read holds beside the file, for each byte of it: its index, rows, paths and points, as
+/// measured (about three times the file at peak, the file's own bytes included: 1.5 to 1.6 GB for a
+/// 509 MB message).
+const HELD_PER_BYTE: usize = 2;
 
 /// [`read`], its tables of at most eight times the file's size, or `dense_floor` bytes when that is
 /// more.
-fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize) -> Result<Vec<(Dataset, ReadReport)>> {
+fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize, planned: usize) -> Result<Vec<(Dataset, ReadReport)>> {
     let max = crate::io::max_bytes();
     if bytes.len() as u64 > max {
         return Err(DataError::Format(crate::io::file_size_error(file_name, max)));
@@ -2408,6 +2421,17 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
         Err(e) if e.error_len().is_none() => std::str::from_utf8(bytes.get(..e.valid_up_to()).unwrap_or_default()).unwrap_or_default(),
         Err(_) => return Err(DataError::Format(format!("{file_name} is not UTF-8 text"))),
     };
+    // What it will hold, against what it may: past that it is refused, with a way out, rather than
+    // run out of memory partway.
+    let need = text.len().saturating_mul(HELD_PER_BYTE);
+    if need > planned {
+        let mib = |b: usize| (b >> 20).max(1);
+        return Err(DataError::Format(format!(
+            "{file_name}: reading this AIXM message takes about {} MiB beside the file, more than this computer can set aside now ({} MiB): close other projects or large layers, or read a smaller extract of it",
+            mib(need),
+            mib(planned)
+        )));
+    }
     let text = text.trim_start_matches('\u{feff}');
     let stem = std::path::Path::new(file_name).file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or("AIXM").to_string();
     let at = opts.at.filter(|t| t.is_finite()).unwrap_or_else(now_ms);
@@ -2442,7 +2466,7 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
     let mut scopes: Vec<String> = vec![index.namespaces.clone()];
     let mut scope_ids: HashMap<String, usize> = HashMap::new();
     // What wrapping slices may add to the text parsed, whatever namespaces they declare.
-    let mut wrap_left = text.len().saturating_mul(4).max(MIN_WRAP_BYTES);
+    let mut wrap_left = text.len().saturating_mul(4).max(MIN_WRAP_BYTES).min(planned);
     let prefix = "<m".len() + index.namespaces.len() + ">".len();
     crate::progress::begin(index.members.len() * 2);
     // Features with a slice the limits left unread: what they are then can't be known.
@@ -2518,10 +2542,15 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
     notes.snapshot_periods = trouble.periods;
     // Second pass: each feature in force at the date, from its slices.
     // The nested paths of every row, each kept once.
-    let paths: SharedPaths =
-        std::rc::Rc::new(std::cell::RefCell::new(Paths { limit: text.len().saturating_mul(2).max(MIN_ROW_BYTES), ..Paths::default() }));
-    let mut layers =
-        Layers { names_only: opts.names_only, bytes_left: text.len().saturating_mul(4).max(MIN_ROW_BYTES), ..Layers::default() };
+    let paths: SharedPaths = std::rc::Rc::new(std::cell::RefCell::new(Paths {
+        limit: text.len().saturating_mul(2).max(MIN_ROW_BYTES).min(planned),
+        ..Paths::default()
+    }));
+    let mut layers = Layers {
+        names_only: opts.names_only,
+        bytes_left: text.len().saturating_mul(4).max(MIN_ROW_BYTES).min(planned),
+        ..Layers::default()
+    };
     let mut shapes = Shapes {
         budget: text.len().max(MIN_ADDED_POINTS),
         scan_left: text.len().saturating_mul(8).max(MIN_ADDED_POINTS * 8),
@@ -2530,7 +2559,7 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
     // Rows of features with nothing to draw, by kind, kept until it is known whether the kind has
     // a layer to hold them.
     let mut shapeless: Vec<(String, Row, usize, bool, String)> = Vec::new();
-    let mut held_left = text.len().saturating_mul(2).max(MIN_ROW_BYTES);
+    let mut held_left = text.len().saturating_mul(2).max(MIN_ROW_BYTES).min(planned);
     // GeoBorders first: airspace borders follow them by reference; route segments last: one with
     // no curve is drawn between the points it names.
     let rank = |id: &String| match features.get(id).map(|f| f.kind.as_str()) {
@@ -2735,7 +2764,7 @@ fn read_within(file_name: &str, bytes: &[u8], opts: &Options, dense_floor: usize
     notes.assumed_system = shapes.assumed_system;
     let paths = paths.try_borrow_mut().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default();
     layers.list.sort_by_key(|l| kind_rank.get(&l.kind).copied().unwrap_or(usize::MAX));
-    let mut dense_left = text.len().saturating_mul(8).max(dense_floor);
+    let mut dense_left = text.len().saturating_mul(8).max(dense_floor).min(planned);
     finish(&stem, at, layers, notes, &index, shapes.budget == 0, &paths, &mut dense_left)
 }
 
