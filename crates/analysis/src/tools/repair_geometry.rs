@@ -30,6 +30,27 @@ fn rule_of(p: &Json) -> Result<Rule, String> {
 /// never translated.
 const EVEN_ODD: &str = "even_odd";
 
+/// What a feature's repairs field says of `outcome`, its repair under `rule`: the codes of what was
+/// repaired, then `no_area` when a hole or part had none on the overlay's grid, then the rule when
+/// it isn't the default and decided the rebuild; or why it couldn't be repaired. Empty when
+/// nothing was wrong. Compare Repairs writes the same for each rule.
+pub(super) fn repairs_of(outcome: &Outcome, rule: Rule) -> Result<String, TryReserveError> {
+    match outcome {
+        Outcome::Valid => Ok(String::new()),
+        Outcome::Repaired(r) => {
+            // The Even-Odd rule decides only what the overlay rebuilds: said for those features.
+            let even_odd = rule == Rule::EvenOdd && r.moved.is_some();
+            let narrow = (r.narrow > 0).then_some(Gone::NoArea.as_str());
+            let names: Vec<&str> = r.codes.iter().map(|c| c.as_str()).chain(narrow).chain(even_odd.then_some(EVEN_ODD)).collect();
+            joined(&names, ", ")
+        }
+        Outcome::Gone(why) => joined(&[why.as_str()], ""),
+        // No area left once duplicates were left out.
+        Outcome::GoneAfterDuplicates { .. } => joined(&[Gone::NoArea.as_str()], ""),
+        Outcome::Kept(why) => joined(&[why.as_str()], ""),
+    }
+}
+
 /// A feature's geometry in the output.
 enum Written {
     /// As stored.
@@ -126,8 +147,10 @@ fn run_with_room(
         crate::control::reached(i);
         let Some(f) = ds.features.get(*row) else { continue };
         tally.extra += usize::from(f.attrs.len() > width);
-        let (repairs, geometry) = match repair(f.geometry.as_ref(), rule) {
-            Outcome::Valid => (String::new(), Written::Same),
+        let outcome = repair(f.geometry.as_ref(), rule);
+        let repairs = repairs_of(&outcome, rule).map_err(no_memory)?;
+        let geometry = match outcome {
+            Outcome::Valid => Written::Same,
             Outcome::Repaired(r) => {
                 tally.repaired += 1;
                 for code in &r.codes {
@@ -148,17 +171,13 @@ fn run_with_room(
                 tally.even_odd += usize::from(even_odd);
                 tally.duplicates += r.duplicates;
                 tally.duplicate_features += usize::from(r.duplicates > 0);
-                // A hole or part with no area on the overlay's grid is said after the codes, then the
-                // rule when it isn't the default.
-                let narrow = (r.narrow > 0).then_some(Gone::NoArea.as_str());
-                let names: Vec<&str> = r.codes.iter().map(|c| c.as_str()).chain(narrow).chain(even_odd.then_some(EVEN_ODD)).collect();
-                (joined(&names, ", ").map_err(no_memory)?, Written::Repaired(r.geometry))
+                Written::Repaired(r.geometry)
             }
             Outcome::Gone(why) => {
                 if let Some(n) = Gone::ALL.iter().position(|g| *g == why).and_then(|k| tally.gone.get_mut(k)) {
                     *n += 1;
                 }
-                (joined(&[why.as_str()], "").map_err(no_memory)?, Written::Without)
+                Written::Without
             }
             // No area left once duplicates were left out: counted as both.
             Outcome::GoneAfterDuplicates { duplicates } => {
@@ -168,7 +187,7 @@ fn run_with_room(
                 }
                 tally.duplicates += duplicates;
                 tally.duplicate_features += 1;
-                (joined(&[why.as_str()], "").map_err(no_memory)?, Written::Without)
+                Written::Without
             }
             Outcome::Kept(why) => {
                 match why {
@@ -176,7 +195,7 @@ fn run_with_room(
                     Kept::Memory => tally.memory += 1,
                     Kept::Failed => tally.failed += 1,
                 }
-                (joined(&[why.as_str()], "").map_err(no_memory)?, Written::Same)
+                Written::Same
             }
         };
         // Within the room reserved for one item a row.

@@ -1,6 +1,7 @@
 //! Consolidated integration tests (one binary per crate to cut link time in CI).
 
 mod check_geometry;
+mod compare_repairs;
 mod geometry_conversions;
 mod join_field;
 mod merge;

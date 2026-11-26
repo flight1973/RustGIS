@@ -291,6 +291,7 @@ const OWN_SYSTEM_TOOLS: &[&str] = &[
     "merge",
     "checkGeometry",
     "repairGeometry",
+    "compareRepairs",
     // Overlays and spatial relations, worked on in the system's plane (#2032 C2e-2).
     "clip",
     "erase",

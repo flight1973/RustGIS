@@ -1,6 +1,7 @@
 //! The tools.
 
 mod check_geometry;
+mod compare_repairs;
 mod geometry;
 mod network_analysis;
 mod repair_geometry;
@@ -115,6 +116,17 @@ pub static TOOLS: &[ToolSpec] = &[
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
         run: repair_geometry::run,
+    },
+    ToolSpec {
+        id: "compareRepairs",
+        name: "Compare Repairs",
+        toolbox: "Data Management › Features",
+        summary: "Writes a table of the features Repair Geometry would repair, one row each, with what it would make of them under each rule: what it would write in repairs, the area on the ground in square meters, the area Even-Odd adds to Shells Minus Holes and takes out of it, the parts and holes, and whether the two rules differ. Changes nothing, so a rule can be chosen before repairing.",
+        params: &[
+            P { name: "input", label: "Input Features", kind: K::VectorLayer, required: true, default: "", help: "" },
+            P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
+        ],
+        run: compare_repairs::run,
     },
     ToolSpec {
         id: "buffer",

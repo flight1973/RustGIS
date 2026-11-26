@@ -343,6 +343,10 @@ pub(super) fn long_commands(boundaries: bool) {
         ("update", json!({"input": "Countries", "update": "Lakes"})),
         ("split", json!({"input": "Rivers", "split": "Countries"})),
         ("simplify", json!({"input": "Countries", "tolerance": 1})),
+        // Each feature's check, and its repair or both rules' repairs and their comparison (#2003).
+        ("checkGeometry", json!({"input": "Countries"})),
+        ("repairGeometry", json!({"input": "Countries"})),
+        ("compareRepairs", json!({"input": "Countries"})),
         ("countPoints", json!({"polygons": "Countries", "points": "Cities"})),
         // Case fields alone: no statistic, so only the group loop looks at Cancel.
         ("summaryStatistics", json!({"input": "Cities", "case": "featurecla"})),

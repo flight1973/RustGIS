@@ -1076,6 +1076,86 @@ fn polygons(m: &geo::MultiPolygon<f64>, room: Room) -> Result<Vec<Vec<Vec<Coord>
     Ok(out)
 }
 
+/// Where two repairs of one feature differ (#2003): the pieces only `b` covers, then those only
+/// `a` covers, as rings in their coordinates, and how many sliver pieces were left out.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Apart {
+    pub only_b: Vec<Vec<Vec<Coord>>>,
+    pub only_a: Vec<Vec<Vec<Coord>>>,
+    /// Pieces left out as narrower than the rounding allows for: the same edge, rounded twice.
+    pub slivers: usize,
+}
+
+/// Where `a` and `b`, two valid polygon geometries [`repair_by`] made of one feature under
+/// different rules, differ: each less the other, by geo's boolean overlay, within the same work
+/// bound and memory check as a repair. `moved` is how far the coordinates of the two together may
+/// have moved in their repairs (the sum of their [`Repaired::moved`]), so an edge both mean may lie
+/// that far apart in them. A piece narrower than that and a step of this overlay's grid, in some
+/// direction ([`narrower_than`]), is such a sliver, not a difference, and is left out and counted.
+/// Valid rings don't overlap, so each is read by parity whatever its winding. A failure of the
+/// overlay, or a geometry that isn't a polygon, leaves them uncompared ([`Kept`]).
+pub(crate) fn apart(a: &Geometry, b: &Geometry, moved: f64, has_room: &dyn Fn(u64) -> bool) -> Result<Apart, Kept> {
+    apart_with(a, b, moved, validity::MAX_WORK, &|_| true, has_room)
+}
+
+/// [`apart`] with a work `budget`, asking `allow` before each reservation, as [`repair_by_with`] does.
+pub(crate) fn apart_with(
+    a: &Geometry,
+    b: &Geometry,
+    moved: f64,
+    budget: u64,
+    allow: &dyn Fn(usize) -> bool,
+    has_room: &dyn Fn(u64) -> bool,
+) -> Result<Apart, Kept> {
+    let (Geometry::Polygon(pa), Geometry::Polygon(pb)) = (a, b) else { return Err(Kept::Failed) };
+    if !(moved.is_finite() && moved >= 0.0) {
+        return Err(Kept::Failed);
+    }
+    let room = Room(allow);
+    let coords = pa.iter().chain(pb).flatten().map(Vec::len).fold(0usize, usize::saturating_add);
+    let size = u64::try_from(coords).unwrap_or(u64::MAX);
+    // Two overlays, each over both geometries.
+    if size.saturating_mul(2).saturating_mul(OVERLAY_COST) > budget {
+        return Err(Kept::Work);
+    }
+    if !has_room(size.saturating_mul(OVERLAY_BYTES)) {
+        return Err(Kept::Memory);
+    }
+    let step = grid_step(pa.iter().chain(pb).flatten().flatten().map(|c| (c.x, c.y))).ok_or(Kept::Failed)?;
+    let (ga, gb) = (multipolygon(pa, room).map_err(kept_for)?, multipolygon(pb, room).map_err(kept_for)?);
+    let differences = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (
+            gb.boolean_op_with_fill_rule(&ga, OpType::Difference, FillRule::EvenOdd),
+            ga.boolean_op_with_fill_rule(&gb, OpType::Difference, FillRule::EvenOdd),
+        )
+    }));
+    let Ok((only_b, only_a)) = differences else { return Err(Kept::Failed) };
+    let mut slivers = 0usize;
+    let tolerance = moved + step;
+    let only_b = wider(only_b.0, tolerance, &mut slivers, room)?;
+    let only_a = wider(only_a.0, tolerance, &mut slivers, room)?;
+    Ok(Apart {
+        only_b: polygons(&geo::MultiPolygon::new(only_b), room).map_err(kept_for)?,
+        only_a: polygons(&geo::MultiPolygon::new(only_a), room).map_err(kept_for)?,
+        slivers,
+    })
+}
+
+/// `parts`, rings of closed coordinates, as geo's polygons, copied fallibly.
+fn multipolygon(parts: &[Vec<Vec<Coord>>], room: Room) -> Result<geo::MultiPolygon<f64>, Limit> {
+    let ring = |r: &Vec<Coord>| room.collect(r.len(), r.iter().map(|c| geo::Coord { x: c.x, y: c.y })).map(geo::LineString);
+    let mut polys = room.vec(parts.len())?;
+    for rings in parts {
+        let Some((shell, holes)) = rings.split_first() else { continue };
+        let mut inner = room.vec(holes.len())?;
+        for hole in holes {
+            inner.push(ring(hole)?);
+        }
+        polys.push(geo::Polygon::new(ring(shell)?, inner));
+    }
+    Ok(geo::MultiPolygon::new(polys))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

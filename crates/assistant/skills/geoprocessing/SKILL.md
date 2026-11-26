@@ -34,7 +34,12 @@ Based on the RustGIS user guide, Analysis › Geoprocessing tools
      are written unchanged; optional `rule`: "Shells Minus Holes", the default, merges
      overlapping parts and fills a ring listed as a part, or "Even-Odd", which keeps what lies
      inside an odd number of rings, so overlaps are left out and a hole stored as a part stays a
-     hole)
+     hole); `compareRepairs` (`input`: a table, one row per feature `repairGeometry` would change,
+     with what each rule would write in its repairs field, the area on the ground under each
+     (fields shells_m2 and even_odd_m2), what Even-Odd adds and takes out (added_m2,
+     removed_m2), parts and holes, and a differ field; changes nothing. Run it before
+     `repairGeometry` on a layer with invalid polygons, read the rows that differ, suggest a rule
+     and say what it would change, and run `repairGeometry` with that rule only once the user agrees)
    - selection: `selectByLocation` (`input`, `select`, `distance`, `invert`), `selectByAttributes`
      (`input`, `where`)
    - statistics: `countPoints` (Summarize Within: `polygons`, `points`, `statistics`: summary

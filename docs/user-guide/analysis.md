@@ -428,6 +428,7 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Unsplit Line | `unsplitLine` | Data Management › Features |
 | Check Geometry | `checkGeometry` | Data Management › Features |
 | Repair Geometry | `repairGeometry` | Data Management › Features |
+| Compare Repairs | `compareRepairs` | Data Management › Features |
 | XY Table To Point | `xyTableToPoint` | Data Management › Features |
 | Calculate Geometry Attributes | `calculateGeometry` | Data Management › Features |
 | Simplify | `simplify` | Cartography › Generalization |
@@ -1477,6 +1478,44 @@ its work bounded and its memory asked of the browser first, as in Clip and Disso
 
 ```text
 gp.run={"tool":"repairGeometry","params":{"input":"Parcels"}}
+```
+
+### Comparing repairs
+
+**Compare Repairs** (`compareRepairs`) shows what each [rule](#repairing-geometry) of Repair
+Geometry would make of a layer before you repair it. It writes a table, `<input>_compare` unless you
+name it, with one row for each feature Repair Geometry would change (the selected features, or all);
+valid features get no row. Nothing in the layer changes.
+
+| Field | What it holds |
+| --- | --- |
+| `feature` | The feature's id |
+| `shells_repairs`, `even_odd_repairs` | What Repair Geometry would write in `repairs` under Shells Minus Holes and under Even-Odd |
+| `differ` | Whether the two rules give different results |
+| `shells_m2`, `even_odd_m2` | The area each result covers on the ground, in square meters: 0 when the feature would be written without geometry |
+| `added_m2`, `removed_m2` | The area Even-Odd adds to the Shells Minus Holes result, and the area it takes out of it |
+| `shells_parts`, `even_odd_parts`, `shells_holes`, `even_odd_holes` | The parts and holes of each result |
+
+For two overlapping squares, Even-Odd takes out the overlap, so `removed_m2` is the overlap's area and
+`differ` is true. For a hole stored as a part of its own, Even-Odd keeps the hole, so `removed_m2` is
+the hole's area. For a bowtie or an unclosed ring, both rules give the same result, so `differ` is
+false.
+
+Areas are measured on the WGS 84 ellipsoid. A layer held in a projected system is repaired in its own
+coordinates, as Repair Geometry repairs it, and each result is given in longitude/latitude to be
+measured. To tell where the results differ, the tool overlays them. Both were rounded to the
+overlay's grid, so the same edge can lie a few grid steps apart in the two results. A piece of the
+difference narrower than that rounding, in some direction, is taken for the same edge and left out,
+and the tool says how many were. Lines can't differ: only their repeated vertices and short parts
+are repaired, the same way under both rules, so their areas and holes are empty.
+
+The messages say how many features need repairs and on how many the rules differ. They also say for
+how many it isn't known: a feature left unchanged under either rule (`too_complex` or
+`repair_failed`), or whose two results were too large to compare, has an empty `differ`. A feature
+with a place that can't be given in longitude/latitude has empty areas.
+
+```text
+gp.run={"tool":"compareRepairs","params":{"input":"Parcels"}}
 ```
 
 ## GeoLibre tools
