@@ -2427,3 +2427,83 @@ fn a_message_past_the_memory_the_computer_can_set_aside_is_refused_with_a_way_ou
     assert!(e.contains("takes about") && e.contains("read a smaller extract"), "{e}");
     assert!(read_within("donlon-aixm.xml", DONLON, &opts, 0, DONLON.len() * HELD_PER_BYTE).is_ok());
 }
+
+#[test]
+fn a_hole_is_kept_in_its_exteriors_span_however_wide() {
+    let patch = |ext: &[(f64, f64)], hole: &[(f64, f64)]| {
+        let pos = |r: &[(f64, f64)]| r.iter().map(|(x, y)| format!("{y} {x}")).collect::<Vec<_>>().join(" ");
+        let body = format!(
+            r#"<aixm:extent><aixm:Surface srsName="urn:ogc:def:crs:EPSG::4326" gml:id="s"><gml:patches><gml:PolygonPatch><gml:exterior><gml:LinearRing><gml:posList>{}</gml:posList></gml:LinearRing></gml:exterior><gml:interior><gml:LinearRing><gml:posList>{}</gml:posList></gml:LinearRing></gml:interior></gml:PolygonPatch></gml:patches></aixm:Surface></aixm:extent>"#,
+            pos(ext),
+            pos(hole)
+        );
+        let out = read(
+            "t.xml",
+            &message(&feature("WorkArea", "w", &[slice("WorkArea", "BASELINE", 1, 0, &period("2025-01-01T00:00:00Z", None), &body)])),
+            &at("2026-01-15"),
+        )
+        .unwrap();
+        let Some(Geometry::Polygon(p)) = layer(&out, "t WorkArea").features[0].geometry.clone() else { panic!() };
+        let span = |r: &[Coord]| r.iter().fold((f64::MAX, f64::MIN), |(a, b), c| (a.min(c.x), b.max(c.x)));
+        let ((a, b), (c, d)) = (span(&p[0][0]), span(&p[0][1]));
+        assert!(a <= c && d <= b, "{:?} {:?}", p[0][0], p[0][1]);
+    };
+    // A wide exterior the hole's mean is far from, and one past 180 degrees.
+    let wide = [(0.0, 0.0), (125.0, 0.0), (-110.0, 0.0), (-110.0, 10.0), (125.0, 10.0), (0.0, 10.0), (0.0, 5.0), (0.0, 0.0)];
+    patch(&wide, &[(-120.0, 2.0), (-115.0, 2.0), (-115.0, 8.0), (-120.0, 8.0), (-120.0, 2.0)]);
+    let around = [(-170.0, -5.0), (0.0, -5.0), (170.0, -5.0), (170.0, 5.0), (0.0, 5.0), (-170.0, 5.0), (-170.0, -5.0)];
+    patch(&around, &[(159.0, -1.0), (161.0, -1.0), (161.0, 1.0), (159.0, 1.0), (159.0, -1.0)]);
+}
+
+#[test]
+fn a_null_past_the_column_cap_costs_nothing() {
+    let mut row = Row::default();
+    for i in 0..MAX_COLUMNS {
+        let _ = row.name(&format!("c{i}"), true);
+    }
+    let before = row.bytes;
+    for _ in 0..3 {
+        row.null("past");
+    }
+    assert_eq!(row.bytes, before);
+}
+
+#[test]
+fn a_correction_left_out_at_the_limits_withholds_its_feature() {
+    // Each slice declares its own namespace beside the feature's many: their scopes pass what the
+    // file's size allows, after the BASELINE's fits.
+    let decls: String = (0..400).map(|i| format!(r#" xmlns:n{i}="urn:a-long-namespace-name-to-pay-for-{i}""#)).collect();
+    let slice_in = |seq: u32, corr: u32, name: &str| {
+        slice("DesignatedPoint", "BASELINE", seq, corr, &period("2025-01-01T00:00:00Z", None), &named_point(name)).replacen(
+            "<aixm:DesignatedPointTimeSlice ",
+            &format!(r#"<aixm:DesignatedPointTimeSlice xmlns:s{corr}="urn:s{corr}" "#),
+            1,
+        )
+    };
+    let slices: Vec<String> = (0..12).map(|c| slice_in(1, c, &format!("C{c}"))).collect();
+    let p = point("a", &slices).replacen(r#"<aixm:DesignatedPoint "#, &format!("<aixm:DesignatedPoint{decls} "), 1);
+    let kept = point("k", &[baseline(1, 0, "2025-01-01T00:00:00Z", None, "KEPT")]);
+    let bytes = message(&(p + &kept));
+    let planned = bytes.len() * HELD_PER_BYTE;
+    let out = read_within("t.xml", &bytes, &at("2026-01-15"), 0, planned).unwrap();
+    let ds = layer(&out, "t DesignatedPoint");
+    let names: Vec<Value> = (0..ds.features.len()).map(|i| value(ds, i, "name")).collect();
+    assert_eq!(names, [Value::Text("KEPT".into())], "{:?}", said(&out));
+    assert!(
+        said(&out).iter().any(|m| m.contains("1 feature left out: a time slice of it couldn't be read within the limits")),
+        "{:?}",
+        said(&out)
+    );
+    // With room, the latest correction holds.
+    let out = read_within("t.xml", &bytes, &at("2026-01-15"), 0, usize::MAX).unwrap();
+    let ds = layer(&out, "t DesignatedPoint");
+    assert!((0..ds.features.len()).any(|i| value(ds, i, "name") == Value::Text("C11".into())), "{:?}", said(&out));
+}
+
+#[test]
+fn a_zip_holding_an_aixm_message_is_told() {
+    let zip = |name: &str, bytes: &[u8]| crate::zip::write(&[(name.to_string(), bytes.to_vec())]).unwrap();
+    assert!(crate::io::zip_holds_aixm(&zip("donlon.xml", DONLON)));
+    assert!(!crate::io::zip_holds_aixm(&zip("points.csv", b"x,y\n1,2\n")));
+    assert!(!crate::io::zip_holds_aixm(&zip("other.xml", b"<?xml version=\"1.0\"?><kml/>")));
+}

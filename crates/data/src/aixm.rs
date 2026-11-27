@@ -1500,13 +1500,18 @@ impl Shapes {
             // cover what the hole excludes.
             let mut rings = vec![outer];
             let mut hole_lost = false;
-            let middle = |r: &[Coord]| r.iter().map(|c| c.x).sum::<f64>() / r.len().max(1) as f64;
-            let outer_middle = middle(&rings[0]);
+            let span = |r: &[Coord]| r.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), c| (a.min(c.x), b.max(c.x)));
+            let outer_span = span(&rings[0]);
             for b in elements(p).filter(|c| local(c) == "interior") {
                 match self.ring(b, &mut pn) {
-                    // Its longitudes in the exterior's run: a hole across 180° is where it is.
+                    // Its longitudes in the exterior's run: a hole across 180° is where it is. Of its
+                    // images a whole turn apart, the one most inside the exterior's span, itself first.
                     Some(r) => {
-                        let turn = ((outer_middle - middle(&r)) / 360.0).round() * 360.0;
+                        let (lo, hi) = span(&r);
+                        let inside = |t: f64| (hi + t).min(outer_span.1) - (lo + t).max(outer_span.0);
+                        let turn = [0.0, -360.0, 360.0, -720.0, 720.0]
+                            .into_iter()
+                            .fold(0.0, |best, t| if inside(t) > inside(best) + 1e-9 { t } else { best });
                         rings.push(if turn == 0.0 { r } else { r.into_iter().map(|c| Coord::new(c.x + turn, c.y)).collect() });
                     }
                     None => hole_lost = true,
@@ -1930,7 +1935,7 @@ impl Row {
     fn null(&mut self, key: &str) {
         // Its name is paid for as a value would be, though nothing is lost past the limit.
         let cost = key.len() + VALUE_OVERHEAD;
-        if self.named.contains(key) || self.limit.is_some_and(|l| self.bytes + cost > l) {
+        if self.named.contains(key) || self.columns.len() >= MAX_COLUMNS || self.limit.is_some_and(|l| self.bytes + cost > l) {
             return;
         }
         self.bytes += cost;

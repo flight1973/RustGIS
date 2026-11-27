@@ -3856,6 +3856,15 @@ pub fn read_zip_in(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Ve
 }
 
 /// [`read_zip_in`] with each layer's KML styles, for adding the layers drawn as their files say.
+/// Whether a zip holds an AIXM message (a `.xml` or `.gml` member whose root says so).
+pub fn zip_holds_aixm(bytes: &[u8]) -> bool {
+    let xml = |n: &str| {
+        let n = n.to_ascii_lowercase();
+        !is_resource_fork(&n) && (n.ends_with(".xml") || n.ends_with(".gml"))
+    };
+    crate::zip::read_matching(bytes, xml).is_ok_and(|members| members.iter().any(|(n, b)| is_aixm(n, b)))
+}
+
 pub fn read_zip_layers(file_name: &str, bytes: &[u8], crs: Option<Crs>) -> Result<Vec<LayerRead>> {
     read_zip_layers_budget(file_name, bytes, crs, &mut csv_memory_budget())
 }

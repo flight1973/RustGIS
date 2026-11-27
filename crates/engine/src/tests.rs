@@ -25889,6 +25889,12 @@ fn aixm_messages_are_added_at_the_date_asked() {
     assert!(e.contains("isn't one") && !e.contains("SECRET"), "{e}");
     let z = s.run("layer.addUrl", &json!({"url": "https://example.com/a.zip?token=SECRET", "at": "2026-01-15"})).unwrap_err();
     assert!(z.contains("unzip it") && !z.contains("SECRET"), "{z}");
+    // An answer from an address with no extension is refused without naming its last segment.
+    let id = s.download_started();
+    assert!(s.download_landed(id, br#"{"type":"FeatureCollection","features":[]}"#.to_vec()));
+    let e3 =
+        s.run("layer.addDownload", &json!({"id": id, "url": "https://example.test/api/key-SECRET42", "at": "2026-01-15"})).unwrap_err();
+    assert!(e3.contains("isn't one") && !e3.contains("SECRET42"), "{e3}");
     // A GeoLibre download is never an AIXM message.
     for key in ["geolibreProject", "geolibreLayer", "geolibreZarr"] {
         let id = s.download_started();

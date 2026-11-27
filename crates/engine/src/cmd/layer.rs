@@ -2346,6 +2346,12 @@ pub(crate) fn check_at(p: &Value, file_name: &str, aixm: impl FnOnce() -> bool) 
     rustgis_data::aixm::Options::at_text(at)
 }
 
+/// Refuses an effective date for an address's answer that isn't an AIXM message, naming the
+/// address without quoting it (its last segment, which names the file, can hold a key).
+pub(crate) fn check_answer_at(p: &Value, url: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+    check_at(p, unquoted(url), || rustgis_data::io::is_aixm(name, bytes)).map(|_| ())
+}
+
 /// How a refusal names an address: not quoted, since it can hold a key, but a zip said as one.
 fn unquoted(url: &str) -> &'static str {
     if address_extension(url).as_deref() == Some("zip") { "that address's .zip" } else { "the file at that address" }
@@ -5616,6 +5622,7 @@ fn add_url_as_given(s: &mut Session, p: &Value) -> CmdResult {
             crate::render::rustgis_tiles::cache::download_blocking(url).map_err(named)?
         };
         let name = url_file_name(url, &bytes).map_err(named)?;
+        check_answer_at(p, url, &name, &bytes)?;
         let left_out = parts_left_out(url, &bytes, p);
         let cut = url_name_cut("Add Data From URL", url, p, &bytes);
         // A WCS coverage's own system it was asked for in, for an answer that doesn't say it.
@@ -5751,6 +5758,7 @@ fn add_url_range(s: &mut Session, p: &Value, url: &str, range: (u64, u64), publi
     let bytes = bytes.map_err(|e| range_failed(&ranged, e)).map_err(named)?;
     check_range_answer(&ranged, &bytes).map_err(named)?;
     let name = url_file_name(&ranged, &bytes).map_err(named)?;
+    check_answer_at(p, url, &name, &bytes)?;
     super::raster::add_named_bytes(s, p, name, bytes, b(p, "zoom")).map_err(named)
 }
 
@@ -7115,6 +7123,7 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(target_arch = "wasm32")]
     let drawn = None;
     let asked = if coverage { super::raster::coverage_system(p, &url) } else { None };
+    check_answer_at(p, &url, &name, &bytes)?;
     let r = super::raster::add_named_bytes_read(s, p, name, bytes, b(p, "zoom"), drawn, asked)?;
     if let Some(n) = left_out {
         s.notify(n, false);

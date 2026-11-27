@@ -2495,10 +2495,15 @@ fn gpkg_add_layer(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
     };
     #[cfg(target_arch = "wasm32")]
     let too_large = || false;
-    // An AIXM message is read whole, its shapes too, to list it: not on the frame. Add Data lists
-    // it off the frame, with progress and Cancel.
+    // An AIXM message is read whole, its shapes too, to list it, in a zip too: not on the frame. Add
+    // Data lists it off the frame, with progress and Cancel.
     #[cfg(not(target_arch = "wasm32"))]
-    let aixm = || rustgis_engine::cmd::layer::is_aixm_path(&path);
+    let aixm = || {
+        rustgis_engine::cmd::layer::is_aixm_path(&path)
+            || (path.to_ascii_lowercase().ends_with(".zip")
+                && !too_large()
+                && std::fs::read(&path).is_ok_and(|b| rustgis_engine::data::io::zip_holds_aixm(&b)))
+    };
     #[cfg(target_arch = "wasm32")]
     let aixm = || false;
     if list && aixm() {
